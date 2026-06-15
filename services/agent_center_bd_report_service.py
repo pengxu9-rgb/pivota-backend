@@ -63,6 +63,7 @@ from services.cited_host_classifier import (
     ROLE_RELATIVE_UNCLASSIFIED,
 )
 from services.merchant_narrative_builder import build_merchant_narrative
+from services.win_plan_builder import build_win_plan
 from services.coverage_profiles import (
     resolve_coverage_profile,
     resolve_provider_models,
@@ -8496,11 +8497,28 @@ async def run_brand_report(
             ),
         )
         brand_verify_summary = _rollup_verify_summaries(per_sku_reports)
+        # Fix 4 — per-SKU win-plan: for each losing category query, the
+        # independent hosts AI grounds on (the targets), the competitor
+        # benchmark, and the honest outreach path (incl. one-click pitch drafts
+        # for emailable targets). Re-derives the per-query host linkage
+        # authority_map aggregates away (joins each losing query's raw grounding
+        # uri back to the resolved host rows). Built BEFORE the narrative so its
+        # brand rollup can feed where_youre_losing.win_plan_summary. Best-effort:
+        # never let it sink the report.
+        try:
+            win_plan = build_win_plan(
+                per_sku_reports=per_sku_reports,
+                authority_map=authority_map,
+                merchant_name=merchant_name,
+            )
+        except Exception:  # noqa: BLE001
+            logger.warning("win_plan build failed", exc_info=True)
+            win_plan = None
         # Fix 3 — merchant-grade narrative assembled from the Fix 1 resolved
-        # hosts + Fix 2 findability/endorsement split + verify rollup. No
-        # fabrication: degrades to honest "not available" when data is missing.
-        # Best-effort like the sibling enrichments above: a malformed per-SKU
-        # report must never sink the whole brand report — degrade to no narrative.
+        # hosts + Fix 2 findability/endorsement split + verify rollup + the Fix 4
+        # win-plan rollup. No fabrication: degrades to honest "not available"
+        # when data is missing. Best-effort like the sibling enrichments above:
+        # a malformed per-SKU report must never sink the whole brand report.
         try:
             merchant_narrative = build_merchant_narrative(
                 merchant_name=merchant_name,
@@ -8512,6 +8530,7 @@ async def run_brand_report(
                 verify_providers=resolved_verify_providers,
                 pending_engine_support=coverage.get("pending_engine_support") or [],
                 coverage_profile=coverage.get("profile"),
+                win_plan=win_plan,
             )
         except Exception:  # noqa: BLE001
             logger.warning("merchant_narrative build failed", exc_info=True)
@@ -8536,6 +8555,7 @@ async def run_brand_report(
             "verify_summary": brand_verify_summary,
             "authority_map": authority_map,
             "merchant_narrative": merchant_narrative,
+            "win_plan": win_plan,
             "brand_state": brand_state,
             "brand_verdict_label": legacy_label,
             "brand_verdict_explanation": brand_verdict_explanation,

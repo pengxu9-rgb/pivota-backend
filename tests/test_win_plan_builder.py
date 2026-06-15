@@ -1,0 +1,271 @@
+"""Fix 4 — per-SKU win-plan builder.
+
+Exercises the core synthesis on a fixture mirroring the real Aruen
+"best collagen cream" shape: a losing category query whose grounded answer is
+built from independent editorial hosts the merchant isn't cited in. Asserts the
+uri-join recovers the per-query targets, the Fix-2 endorsement filter excludes
+findability, the outreach state degrades honestly off the REAL BD registry, and
+the guardrails hold (no fabrication, no inflation).
+"""
+
+from __future__ import annotations
+
+from typing import Any, Dict, List
+
+from services.win_plan_builder import (
+    OUTREACH_DRAFT_READY,
+    OUTREACH_SUBMISSION_ONLY,
+    OUTREACH_TARGET_ONLY,
+    build_win_plan,
+)
+
+
+def _host_row(host: str, role: str, uris: List[str]) -> Dict[str, Any]:
+    return {"host": host, "citation_role": role, "evidence_urls": list(uris)}
+
+
+def _src(uri: str) -> Dict[str, Any]:
+    return {"uri": uri, "title": uri}
+
+
+# --- a realistic per-SKU report + authority_map keyed by the shared raw uri ----
+
+def _aruen_fixture() -> Dict[str, Any]:
+    per_sku_reports = [
+        {
+            "sku_key": "collagen",
+            "sku_title": "Tofu Collagen Jelly Cream",
+            "failing_prompts": [
+                {
+                    "query": "best collagen cream",
+                    "axis": "category",
+                    "grounding_sources": [
+                        _src("vx://forbes-1"),
+                        _src("vx://byrdie-1"),
+                        _src("vx://gh-1"),
+                    ],
+                    "competitors_named": ["Vital Proteins", "Ancient Nutrition"],
+                },
+                {
+                    # Loses, but AI grounded it only in the merchant's own / retail
+                    # listings — no independent target to name (no inflation).
+                    "query": "best collagen for sleep",
+                    "axis": "category",
+                    "grounding_sources": [_src("vx://aruen-1"), _src("vx://ebay-1")],
+                    "competitors_named": [],
+                },
+                {
+                    # Branded axis — not a category recommendation to win; excluded.
+                    "query": "Aruen collagen review",
+                    "axis": "branded",
+                    "grounding_sources": [_src("vx://forbes-1")],
+                    "competitors_named": [],
+                },
+            ],
+        },
+        {
+            # Only a branded failing prompt -> contributes no win-plan.
+            "sku_key": "serum",
+            "sku_title": "Vitamin C Serum",
+            "failing_prompts": [
+                {
+                    "query": "Aruen serum",
+                    "axis": "branded",
+                    "grounding_sources": [_src("vx://forbes-1")],
+                    "competitors_named": [],
+                },
+            ],
+        },
+    ]
+    authority_map = {
+        "skus": [
+            {
+                "sku_key": "collagen",
+                "authority_hosts": [
+                    _host_row("forbes.com", "editorial_review", ["vx://forbes-1"]),
+                    _host_row("byrdie.com", "editorial_review", ["vx://byrdie-1"]),
+                    _host_row("goodhousekeeping.com", "editorial_review", ["vx://gh-1"]),
+                    _host_row("aruen.us", "own_domain", ["vx://aruen-1"]),
+                    _host_row("ebay.com", "marketplace_self_listing", ["vx://ebay-1"]),
+                ],
+            },
+            {"sku_key": "serum", "authority_hosts": []},
+        ]
+    }
+    return {"per_sku_reports": per_sku_reports, "authority_map": authority_map}
+
+
+def _collagen_plan(plan: Dict[str, Any]) -> Dict[str, Any]:
+    return next(p for p in plan["sku_plans"] if p["sku_key"] == "collagen")
+
+
+def _query(plan_sku: Dict[str, Any], text: str) -> Dict[str, Any]:
+    return next(q for q in plan_sku["losing_queries"] if q["query"] == text)
+
+
+def test_rederives_per_query_endorsement_targets():
+    fx = _aruen_fixture()
+    plan = build_win_plan(**fx)
+    assert plan["available"] is True
+
+    collagen = _collagen_plan(plan)
+    # Only the two category queries — the branded one is excluded.
+    assert {q["query"] for q in collagen["losing_queries"]} == {
+        "best collagen cream",
+        "best collagen for sleep",
+    }
+
+    q = _query(collagen, "best collagen cream")
+    hosts = [t["host"] for t in q["grounds_in"]]
+    # The independent endorsement hosts AI grounded the answer in — the targets.
+    assert set(hosts) == {"byrdie.com", "forbes.com", "goodhousekeeping.com"}
+    # All three are endorsement role; findability is never a target.
+    assert all(t["role"] == "editorial_review" for t in q["grounds_in"])
+
+
+def test_outreach_state_degrades_off_real_registry():
+    fx = _aruen_fixture()
+    plan = build_win_plan(**fx)
+    q = _query(_collagen_plan(plan), "best collagen cream")
+    state_by_host = {t["host"]: t["outreach"]["state"] for t in q["grounds_in"]}
+    # Honest degrade off the REAL cited-host registry (no fabrication of a path):
+    assert state_by_host["forbes.com"] == OUTREACH_DRAFT_READY          # has pitch email
+    assert state_by_host["goodhousekeeping.com"] == OUTREACH_SUBMISSION_ONLY  # form only
+    assert state_by_host["byrdie.com"] == OUTREACH_TARGET_ONLY          # no recipient yet
+    # draft_ready means a real recipient email is present.
+    forbes = next(t for t in q["grounds_in"] if t["host"] == "forbes.com")
+    assert forbes["outreach"]["recipient"]["email"]
+    byrdie = next(t for t in q["grounds_in"] if t["host"] == "byrdie.com")
+    assert byrdie["outreach"]["recipient"] is None
+
+
+def test_targets_ordered_tier_then_host():
+    fx = _aruen_fixture()
+    plan = build_win_plan(**fx)
+    q = _query(_collagen_plan(plan), "best collagen cream")
+    hosts = [t["host"] for t in q["grounds_in"]]
+    # tier-1 publishers lead (byrdie/forbes, alpha within tier), tier-3 GH last.
+    assert hosts.index("byrdie.com") < hosts.index("goodhousekeeping.com")
+    assert hosts.index("forbes.com") < hosts.index("goodhousekeeping.com")
+
+
+def test_competitor_benchmark_and_win_condition():
+    fx = _aruen_fixture()
+    plan = build_win_plan(**fx)
+    q = _query(_collagen_plan(plan), "best collagen cream")
+    assert q["competitor_benchmark"] == ["Vital Proteins", "Ancient Nutrition"]
+    assert q["win_condition"] is not None
+    assert "best collagen cream" in q["win_condition"]
+    for h in ("byrdie.com", "forbes.com"):
+        assert h in q["win_condition"]
+    assert q["limit"] is None
+
+
+def test_findability_only_query_names_no_target_no_inflation():
+    fx = _aruen_fixture()
+    plan = build_win_plan(**fx)
+    q = _query(_collagen_plan(plan), "best collagen for sleep")
+    # Own / retail listings are not a win — no target, honest limit instead.
+    assert q["grounds_in"] == []
+    assert q["win_condition"] is None
+    assert q["limit"] is not None
+    assert "aruen.us" in q["limit"] and "ebay.com" in q["limit"]
+    assert "own" in q["limit"].lower()
+
+
+def test_unresolvable_source_is_never_fabricated():
+    # A losing category query whose only source uri is absent from the authority
+    # map (the report couldn't resolve it) -> named no target, stated limit.
+    per_sku_reports = [
+        {
+            "sku_key": "x",
+            "sku_title": "X",
+            "failing_prompts": [
+                {
+                    "query": "best x",
+                    "axis": "category",
+                    "grounding_sources": [_src("vx://unknown-1")],
+                    "competitors_named": [],
+                }
+            ],
+        }
+    ]
+    authority_map = {"skus": [{"sku_key": "x", "authority_hosts": []}]}
+    plan = build_win_plan(per_sku_reports=per_sku_reports, authority_map=authority_map)
+    q = plan["sku_plans"][0]["losing_queries"][0]
+    assert q["grounds_in"] == []
+    assert q["limit"] is not None
+    assert "no resolvable independent source" in q["limit"]
+
+
+def test_coverage_and_rollup_counts():
+    fx = _aruen_fixture()
+    plan = build_win_plan(**fx)
+    collagen = _collagen_plan(plan)
+    cov = collagen["coverage"]
+    assert cov["losing_category_queries"] == 2
+    assert cov["queries_with_grounded_target"] == 1            # only the cream query
+    assert cov["queries_with_draft_ready_target"] == 1         # forbes on that query
+    roll = plan["rollup"]
+    assert roll["losing_category_queries"] == 2
+    assert roll["independent_hosts_to_win"] == [
+        "byrdie.com",
+        "forbes.com",
+        "goodhousekeeping.com",
+    ]
+    assert roll["draft_ready_hosts"] == ["forbes.com"]
+
+
+def test_pitch_draft_rendered_for_emailable_target_keyed_to_query():
+    # Phase 2: an emailable target with a matching playbook template gets a
+    # rendered one-click pitch, keyed to THIS losing query + its competitors.
+    fx = _aruen_fixture()
+    plan = build_win_plan(merchant_name="Aruen", **fx)
+    q = _query(_collagen_plan(plan), "best collagen cream")
+    by_host = {t["host"]: t["outreach"] for t in q["grounds_in"]}
+
+    forbes = by_host["forbes.com"]
+    assert forbes["state"] == OUTREACH_DRAFT_READY
+    draft = forbes["pitch_draft"]
+    assert draft is not None
+    assert draft["recipient_email"]                      # real registry email
+    assert "Vital Proteins" in draft["body"]             # this query's benchmark
+    assert "Aruen" in draft["body"]                      # the merchant
+
+    # submission_only / target_only targets honestly show NO one-click draft.
+    assert by_host["goodhousekeeping.com"]["pitch_draft"] is None
+    assert by_host["byrdie.com"]["pitch_draft"] is None
+
+
+def test_rollup_pitch_ready_distinct_from_emailable():
+    fx = _aruen_fixture()
+    plan = build_win_plan(merchant_name="Aruen", **fx)
+    roll = plan["rollup"]
+    # forbes is emailable AND renders a draft -> both lists; gh/byrdie in neither.
+    assert roll["draft_ready_hosts"] == ["forbes.com"]
+    assert roll["pitch_ready_hosts"] == ["forbes.com"]
+
+
+def test_no_losing_category_queries_is_unavailable():
+    per_sku_reports = [
+        {
+            "sku_key": "s",
+            "sku_title": "S",
+            "failing_prompts": [
+                {"query": "brand q", "axis": "branded", "grounding_sources": [], "competitors_named": []}
+            ],
+        }
+    ]
+    plan = build_win_plan(per_sku_reports=per_sku_reports, authority_map={"skus": []})
+    assert plan["available"] is False
+    assert plan["sku_plans"] == []
+    assert plan["note"]
+
+
+def test_defensive_on_garbage_input():
+    # None / wrong types must degrade, never raise.
+    assert build_win_plan(per_sku_reports=None, authority_map=None)["available"] is False
+    assert build_win_plan(
+        per_sku_reports=[None, {"sku_key": "a"}, 7],
+        authority_map={"skus": [None, 3]},
+    )["available"] is False

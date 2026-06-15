@@ -848,3 +848,34 @@ def test_non_blocked_sku_gets_no_get_indexed_action():
         per_sku_reports=[_per_sku_report_for_content_revision()],
     )
     assert not [a for a in actions if a.get("playbook_step_id") == "get_indexed"]
+
+
+def test_build_pitch_draft_for_host_renders_query_keyed_draft():
+    """Fix 4 seam: build_pitch_draft_for_host renders a one-click draft for a
+    single emailable host, keyed to a specific failing query + competitors —
+    reusing the same selection + template + recipient contract as
+    select_playbooks. Hosts without an email recipient return None."""
+    from services.audit_playbook_engine import build_pitch_draft_for_host
+    from services.cited_host_classifier import classify_host
+
+    forbes = classify_host("forbes.com", merchant_category="beauty")
+    draft = build_pitch_draft_for_host(
+        forbes,
+        merchant_name="Aruen",
+        merchant_category="beauty",
+        example_query="best collagen cream",
+        competitors_named=["Vital Proteins", "Ancient Nutrition"],
+    )
+    assert draft is not None
+    assert draft["recipient_email"] == "vetted@forbes.com"
+    assert "Aruen" in draft["body"]
+    assert "Vital Proteins" in draft["body"]
+    assert "collagen" in draft["body"].lower()           # keyed to the query
+
+    # Submission-form-only host (no email) -> no one-click draft.
+    gh = classify_host("goodhousekeeping.com", merchant_category="beauty")
+    assert build_pitch_draft_for_host(gh) is None
+
+    # Defensive: garbage entry -> None, never raises.
+    assert build_pitch_draft_for_host(None) is None
+    assert build_pitch_draft_for_host({}) is None
