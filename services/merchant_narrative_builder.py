@@ -241,16 +241,26 @@ def _whats_working(
 def _where_youre_losing(merchant_name: str, authority_map: Dict[str, Any], summary: Dict[str, Any]) -> Dict[str, Any]:
     endorsed_category = bool(summary.get("independently_recommended_for_category"))
     endorsement_hosts = list(summary.get("endorsement_category_hosts") or summary.get("endorsement_hosts") or [])
+    findable = bool(summary.get("findability_hosts"))
     if endorsed_category:
         text = (
             f"{merchant_name or 'The brand'} earns independent category "
             f"recommendation from {', '.join(endorsement_hosts[:4])}."
         )
-    else:
+    elif findable:
         text = (
             "When shoppers ask the category question, no independent source "
             f"recommends {merchant_name or 'the brand'} — only your own/retail "
             "listings appear, which is distribution, not endorsement."
+        )
+    else:
+        # Nothing surfaced at all (invisible): don't claim "only your own
+        # listings appear" when even those didn't — that would contradict the
+        # invisible headline.
+        text = (
+            "When shoppers ask the category question, "
+            f"{merchant_name or 'the brand'} doesn't surface at all — neither "
+            "your own listings nor any independent source appears."
         )
     return {
         "summary": text,

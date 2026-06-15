@@ -60,6 +60,9 @@ def test_narrative_own_listing_only_is_not_reported_as_recommended():
     assert narr["where_youre_losing"]["independently_recommended_for_category"] is False
     assert "ownist.com" in narr["whats_working"]["findability_hosts"]
     assert narr["per_sku_scorecard"][0]["surfaced_only_via_own_listing"] is True
+    # Findable-but-not-endorsed: this IS the "only your own/retail listings
+    # appear" case (the branch that must NOT fire for an invisible brand).
+    assert "only your own" in narr["where_youre_losing"]["summary"].lower()
 
 
 def test_narrative_category_endorsement_and_named_competitors():
@@ -119,6 +122,11 @@ def test_narrative_invisible_when_no_hosts():
     assert "invisible" in narr["headline_story"].lower()
     assert narr["whats_working"]["findability_hosts"] == []
     assert narr["where_youre_losing"]["independently_recommended_for_category"] is False
+    # No contradiction with the 'invisible' headline: must NOT claim own/retail
+    # listings appear when nothing surfaced at all.
+    where = narr["where_youre_losing"]["summary"].lower()
+    assert "only your own" not in where
+    assert "surface at all" in where
 
 
 def test_verify_summary_plain_language():
