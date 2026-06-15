@@ -83,6 +83,18 @@ def _build_text_match_clause(*, param_key: str, include_seed_data_text_match: bo
         f"LOWER(canonical_url) LIKE :{param_key}",
         f"LOWER(domain) LIKE :{param_key}",
         f"LOWER(title) LIKE :{param_key}",
+        # Match the recall enrichment so a product's verified actives / search
+        # aliases (e.g. "soy isoflavones", "adenosine", "korean firming cream")
+        # count toward recall — these live in derived.recall, NOT the title, so
+        # without this a product is only findable by its title words and its
+        # differentiators are unsearchable. Each path has a dedicated trigram GIN
+        # index (idx_external_product_seeds_recall_{retrieval_title,retrieval_summary,
+        # ingredient_tokens,alias_tokens}_trgm + the attached_* variants), so these
+        # LIKEs are index-backed, not a full seed_data scan.
+        f"LOWER(COALESCE(seed_data->'derived'->'recall'->>'retrieval_title', '')) LIKE :{param_key}",
+        f"LOWER(COALESCE(seed_data->'derived'->'recall'->>'retrieval_summary', '')) LIKE :{param_key}",
+        f"LOWER(COALESCE(seed_data#>>'{{derived,recall,ingredient_tokens}}', '')) LIKE :{param_key}",
+        f"LOWER(COALESCE(seed_data#>>'{{derived,recall,alias_tokens}}', '')) LIKE :{param_key}",
     ]
     if include_seed_data_text_match:
         parts.append(f"LOWER(CAST(seed_data AS TEXT)) LIKE :{param_key}")
