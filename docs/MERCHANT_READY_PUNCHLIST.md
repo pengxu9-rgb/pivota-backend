@@ -90,15 +90,21 @@ prod.
    `tests/test_audit_premium_provider_gate.py`. So free → Gemini, paid → may opt
    into ChatGPT — the gate is done.
 4. ⚠️ **The real remaining gate is COST, not the tier gate.** ChatGPT grounded is
-   ~**100× Gemini's cost** ($1.87 / 10-prompt single-SKU run). Two pieces remain:
-   - **Per-merchant cost caps** (the real blocker): cap premium $ per merchant
-     per period. Building block exists — `db.llm_probe_runs.cost_today_for_merchant`.
-     Enforce at the launch route alongside `_maybe_premium_block` (block/downgrade
-     when a paid merchant exceeds their cap). **This is the next concrete C code task.**
+   ~**100× Gemini's cost** ($1.87 / 10-prompt single-SKU run). Two pieces remain —
+   and a **cost-cap mechanism already exists** (don't rebuild it):
+   - **Per-merchant daily cost cap EXISTS** — env var
+     `AGENT_CENTER_LLM_DAILY_COST_USD_PER_MERCHANT` (default **$5/day**), summed
+     from `cost_today_for_merchant`, fail-closed. Backend LLM paths enforce it
+     (`pdp_copy_review`, `citation_draft`). **Two ops/verify gaps, not code:**
+     (i) the audit *grounded-probe* path runs in the orchestrator (PIVOTA-Agent),
+     which per the docstring honors the same env var — **confirm it actually does**;
+     (ii) the var is **unset in prod** (→ implicit $5) — set it explicitly to a
+     deliberate value on both backend + orchestrator before going wide.
    - **Tier-aware default** (NOT a blunt global flip): a global
      `pilot_gemini → us_shopper` flip would 402 every free account. Instead make
      the default profile tier-aware (free → `pilot_gemini`, paid → `us_shopper`)
-     so paid merchants get multi-engine automatically — *after* caps are in.
+     so paid merchants get multi-engine automatically — *after* the cap is
+     confirmed on the audit path. **This is the one remaining C backend code task.**
 5. *(Next)* add Claude via the `full` profile once Agent-engine support +
    metering are confirmed.
 
