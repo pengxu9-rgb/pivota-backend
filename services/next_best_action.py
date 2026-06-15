@@ -22,6 +22,7 @@ from services.buyer_path_controller_quality import (
 from services.sku_lane_priority import (
     build_sideways_wedge,
     has_lane_demand,
+    is_synthetic_probe_query,
     is_third_party_controlled_lane,
     prioritize_lanes,
 )
@@ -1086,7 +1087,12 @@ def _brand_controller_profile(evidence: Mapping[str, Any]) -> Dict[str, Any]:
 
 def _sku_query_phrase(value: Any) -> str:
     text = str(value or "").strip()
-    return f'"{text}"' if text else "the tested SKU prompt"
+    # Safety net: a synthetic placeholder ("<title> shopper question N") must
+    # never leak into merchant-facing copy. Lanes are already filtered upstream
+    # (_top_open_lanes); this guards any other caller.
+    if not text or is_synthetic_probe_query(text):
+        return "this product's category question"
+    return f'"{text}"'
 
 
 def _sku_source_route_first_move(

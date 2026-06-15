@@ -26,6 +26,21 @@ SIDEWAYS_AXES = {"attribute", "objection", "sidewalk"}
 HEAD_QUERY_CLASSES = {"category", "head"}
 HEAD_AXES = {"category", "head"}
 
+# Synthetic probe-query placeholder: when the real query generator falls short of
+# the requested prompt count it pads with `"<title> shopper question <n>"`
+# (agent_center_bd_report_service `_build_per_sku_base_query_specs`). Those are
+# scaffolding, not real shopper questions — they must never reach merchant-facing
+# copy (an action headline like "Own the answer to '… shopper question 15'") nor
+# count as a real open lane.
+_SYNTHETIC_QUERY_RE = re.compile(r"shopper question\s+\d+\s*$", re.IGNORECASE)
+
+
+def is_synthetic_probe_query(query: Any) -> bool:
+    """True for an auto-generated placeholder probe query (not a real shopper
+    question). Used to keep scaffolding out of lanes + merchant-facing copy."""
+    return bool(_SYNTHETIC_QUERY_RE.search(str(query or "").strip()))
+
+
 _WORD_RE = re.compile(r"[a-z0-9]+")
 _PHRASE_CLEAN_RE = re.compile(r"[^a-z0-9]+")
 _CONVERSION_PHRASES: Tuple[Tuple[str, float], ...] = (
