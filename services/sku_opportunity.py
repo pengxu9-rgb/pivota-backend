@@ -27,7 +27,7 @@ from services.agent_center_bd_report_service import (
 from services.brand_alias import derive_brand_aliases, text_mentions_brand
 from services.buyer_path_stable_controllers import stable_buyer_path_controllers
 from services.cited_host_classifier import classify_host
-from services.sku_lane_priority import build_lane_product_evidence
+from services.sku_lane_priority import build_lane_product_evidence, is_synthetic_probe_query
 
 
 # Ordering/fallback for per-prompt provider verdicts. _expected_providers also
@@ -1399,6 +1399,10 @@ def _top_open_lanes(per_prompt: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
         for row in per_prompt
         if row.get("open_lane")
         and row.get("query_class") in {"sidewalk", "attribute", "category", "objection"}
+        # Drop synthetic placeholder probes ("<title> shopper question N") — they
+        # are scaffolding, not real demand, and must never surface as a lane the
+        # merchant is told to "own".
+        and not is_synthetic_probe_query(row.get("query"))
     ]
     lanes.sort(
         key=lambda row: (
