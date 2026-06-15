@@ -59,22 +59,30 @@ rather than padding to `prompts_per_sku`.
 (Gemini + ChatGPT + DeepSeek verify) already exists; `OPENAI_API_KEY` is live in
 prod.
 
-1. ✅ Validation run enqueued on `us_shopper` for the Aruen scope (run
-   `cc6d1f16-44f9-4e73-91a0-e8bf3f3d6900`) — confirm ChatGPT citations appear,
-   `citation_by_provider` splits by engine, `cost_summary` meters both,
-   `honest_limits` no longer says "Gemini-only".
-2. **Confirm ChatGPT cost metering end-to-end** (`provider_credit_rates.json` +
-   #884/#885) — un-metered ChatGPT COGS was the original reason it was pulled;
-   verify before going wide.
-3. Decide the premium gate (`premium_providers` is currently empty) — which
-   merchant tier gets ChatGPT.
-4. Only then flip the active/default profile `pilot_gemini → us_shopper`
-   (`config/coverage_profiles.json`).
+1. ✅ **Validated** on `us_shopper` (run `cc6d1f16-44f9-4e73-91a0-e8bf3f3d6900`,
+   Aruen): `authority_map` providers = `['chatgpt','gemini']`;
+   `citation_by_provider` splits by engine; `honest_limits` now reads "grounded
+   on gemini, chatgpt"; `aruen.us → own_domain` cited by **both** engines (Fix 2
+   holds multi-engine).
+2. ✅ **Metering confirmed** — `cost_summary` captured per provider:
+   chatgpt **$1.87** (10 calls, 348k input tokens), gemini $0.018, deepseek
+   $0.003. The original un-metered-COGS problem is fixed.
+3. ⚠️ **The real gate is now COST, not plumbing.** ChatGPT grounded is ~**100×
+   Gemini's cost** ($1.87 for a 10-prompt single-SKU run — grounded web-search
+   context is heavy). Before any default flip: decide the premium gate
+   (`premium_providers` is currently empty) and set per-merchant cost caps.
+4. Only after the cost gate: flip the active/default profile
+   `pilot_gemini → us_shopper` (`config/coverage_profiles.json`).
 5. *(Next)* add Claude via the `full` profile once Agent-engine support +
    metering are confirmed.
 
-**Acceptance:** a run shows per-engine citations (gemini + chatgpt), both metered.
-**Effort:** S · **Risk:** med — **gate on confirming metering before the default flip.**
+**Observation to confirm:** the validation run executed ~10 prompts/engine, not
+the 40 requested — almost certainly the intentional "ChatGPT hero-SKU only" cap
+(cost control); confirm it's deliberate, not a silent prompt-count drop.
+
+**Acceptance:** ✅ per-engine citations + metering proven. Remaining = the cost
+gate (premium tier + caps), then the default flip.
+**Effort:** S · **Risk:** the economics, not the plumbing — **gate the default flip on cost caps.**
 
 ## D — Real-merchant validation sweep
 
@@ -101,6 +109,7 @@ brand + domain (Fix 2's `own_domain` depends on it; the test merchant
 
 ## Sequence
 1. **A** — start now (frontend, longest pole), against the frozen contract.
-2. **C** — quickest win; verify metering, then flip the default.
+2. **C** — ✅ multi-engine + metering proven; remaining = the **cost gate**
+   (premium tier + per-merchant caps), then the default flip.
 3. **B** — ✅ done; deeper probe-generation follow-up optional.
-4. **D** — after B + C; gates go-wide.
+4. **D** — after the C cost gate; gates go-wide.
