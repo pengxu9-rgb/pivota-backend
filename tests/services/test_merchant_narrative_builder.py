@@ -244,3 +244,41 @@ def test_builder_degrades_on_malformed_per_sku_reports():
     assert "headline_story" in narr
     assert isinstance(narr["per_sku_scorecard"], list)
     assert isinstance(narr["prioritized_actions"], list)
+
+
+def test_where_youre_losing_carries_win_plan_summary():
+    """Fix 4: the narrative's 'where you're losing' rolls up the win-plan so the
+    merchant sees the path to winning, not just the loss."""
+    win_plan = {
+        "available": True,
+        "rollup": {
+            "losing_category_queries": 3,
+            "independent_hosts_to_win": ["byrdie.com", "forbes.com", "goodhousekeeping.com"],
+            "draft_ready_hosts": ["forbes.com"],
+            "pitch_ready_hosts": ["forbes.com"],
+        },
+    }
+    narr = build_merchant_narrative(
+        merchant_name="Aruen", per_sku_reports=[], win_plan=win_plan,
+    )
+    wps = narr["where_youre_losing"]["win_plan_summary"]
+    assert wps is not None
+    assert wps["losing_category_queries"] == 3
+    assert wps["independent_hosts_to_win"] == [
+        "byrdie.com", "forbes.com", "goodhousekeeping.com",
+    ]
+    assert wps["pitch_ready_hosts"] == ["forbes.com"]
+    assert "3 category queries" in wps["summary"]
+    assert "ready-to-send pitch" in wps["summary"]
+
+
+def test_win_plan_summary_absent_when_no_plan_no_fabrication():
+    # No win_plan passed -> field present but None (never fabricated).
+    narr = build_merchant_narrative(merchant_name="Aruen", per_sku_reports=[])
+    assert narr["where_youre_losing"]["win_plan_summary"] is None
+    # Unavailable win_plan -> also None.
+    narr2 = build_merchant_narrative(
+        merchant_name="Aruen", per_sku_reports=[],
+        win_plan={"available": False, "rollup": {}},
+    )
+    assert narr2["where_youre_losing"]["win_plan_summary"] is None

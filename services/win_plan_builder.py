@@ -37,6 +37,7 @@ from __future__ import annotations
 
 from typing import Any, Dict, List, Optional
 
+from services.audit_playbook_engine import build_pitch_draft_for_host
 from services.cited_host_classifier import (
     classify_host,
     is_endorsement_role,
@@ -117,11 +118,10 @@ def _resolve_query_hosts(
     return rows
 
 
-def _outreach(host: str, merchant_category: Optional[str]) -> Dict[str, Any]:
+def _outreach_from_meta(meta: Dict[str, Any]) -> Dict[str, Any]:
     """The honest outreach path to one target host, read from the BD cited-host
     registry (`classify_host`). State degrades draft_ready -> submission_only ->
     target_only by what recipient the registry actually has — never invents one."""
-    meta = classify_host(host, merchant_category=merchant_category)
     recipient = meta.get("pitch_recipient")
     recipient = recipient if isinstance(recipient, dict) else None
     email = (recipient or {}).get("email")
@@ -141,18 +141,41 @@ def _outreach(host: str, merchant_category: Optional[str]) -> Dict[str, Any]:
             "submission_url": submission_url,
             "note": (recipient or {}).get("note"),
         } if recipient else None,
+        # Phase 2: the rendered one-click pitch, attached below for draft_ready.
+        "pitch_draft": None,
     }
 
 
-def _target(row: Dict[str, Any], merchant_category: Optional[str]) -> Dict[str, Any]:
+def _target(
+    row: Dict[str, Any],
+    *,
+    merchant_name: Optional[str],
+    merchant_category: Optional[str],
+    query: str,
+    competitors_named: List[str],
+) -> Dict[str, Any]:
     host = row.get("host")
     meta = classify_host(host, merchant_category=merchant_category)
+    outreach = _outreach_from_meta(meta)
+    # Attach the one-click pitch email when the host actually supports it (a real
+    # email recipient + a playbook pitch template). Keyed to THIS losing query +
+    # its competitor benchmark so the draft is specific, not generic. Reuses the
+    # playbook engine (no re-implementation); stays None when not renderable, so
+    # submission_only / target_only targets honestly show no draft button.
+    if outreach["state"] == OUTREACH_DRAFT_READY:
+        outreach["pitch_draft"] = build_pitch_draft_for_host(
+            meta,
+            merchant_name=merchant_name,
+            merchant_category=merchant_category,
+            example_query=query,
+            competitors_named=competitors_named,
+        )
     return {
         "host": host,
         "role": row.get("citation_role"),
         "tier": meta.get("tier"),
         "applies_to_merchant_category": meta.get("applies_to_merchant_category"),
-        "outreach": _outreach(host, merchant_category),
+        "outreach": outreach,
     }
 
 
@@ -180,23 +203,33 @@ def _win_condition(query: str, targets: List[Dict[str, Any]]) -> Optional[str]:
 def _losing_query_plan(
     failing_prompt: Dict[str, Any],
     uri_index: Dict[str, Dict[str, Any]],
+    *,
+    merchant_name: Optional[str],
     merchant_category: Optional[str],
 ) -> Dict[str, Any]:
     query = str(failing_prompt.get("query") or "").strip()
     resolved = _resolve_query_hosts(failing_prompt.get("grounding_sources") or [], uri_index)
+    competitor_benchmark = _competitor_benchmark(failing_prompt.get("competitors_named"))
 
     # The targets are the independent ENDORSEMENT hosts AI grounded this answer
     # in (editorial / review / creator / community / independent retailer).
     # Findability (own site / own listing) is never a win target (no inflation);
     # competitor storefronts and unclassified hosts are not pitchable targets.
     endorsement_rows = [r for r in resolved if is_endorsement_role(r.get("citation_role"))]
-    targets = [_target(r, merchant_category) for r in endorsement_rows]
+    targets = [
+        _target(
+            r,
+            merchant_name=merchant_name,
+            merchant_category=merchant_category,
+            query=query,
+            competitors_named=competitor_benchmark,
+        )
+        for r in endorsement_rows
+    ]
     # Tier-then-host so the highest-leverage publisher leads even at a single
     # cite (ADR-004 open Q2); unknown tier sorts last.
     targets.sort(key=lambda t: (t.get("tier") is None, t.get("tier") or 0, t.get("host") or ""))
     targets = targets[:_MAX_TARGETS_PER_QUERY]
-
-    competitor_benchmark = _competitor_benchmark(failing_prompt.get("competitors_named"))
 
     limit: Optional[str] = None
     if not targets:
@@ -239,6 +272,8 @@ def _losing_query_plan(
 def _sku_plan(
     report: Dict[str, Any],
     authority_hosts: List[Dict[str, Any]],
+    *,
+    merchant_name: Optional[str],
     merchant_category: Optional[str],
 ) -> Optional[Dict[str, Any]]:
     failing = report.get("failing_prompts")
@@ -251,7 +286,12 @@ def _sku_plan(
 
     uri_index = _uri_to_host_row(authority_hosts)
     losing_queries = [
-        _losing_query_plan(fp, uri_index, merchant_category)
+        _losing_query_plan(
+            fp,
+            uri_index,
+            merchant_name=merchant_name,
+            merchant_category=merchant_category,
+        )
         for fp in losing_category[:_MAX_LOSING_QUERIES_PER_SKU]
     ]
 
@@ -277,6 +317,7 @@ def build_win_plan(
     *,
     per_sku_reports: List[Dict[str, Any]],
     authority_map: Optional[Dict[str, Any]] = None,
+    merchant_name: Optional[str] = None,
     merchant_category: Optional[str] = None,
 ) -> Dict[str, Any]:
     """Assemble the per-SKU win-plan from already-built report data.
@@ -298,7 +339,8 @@ def build_win_plan(
         plan = _sku_plan(
             report,
             hosts_by_sku.get(report.get("sku_key")) or [],
-            merchant_category,
+            merchant_name=merchant_name,
+            merchant_category=merchant_category,
         )
         if plan:
             sku_plans.append(plan)
@@ -306,12 +348,15 @@ def build_win_plan(
     losing_total = sum(p["coverage"]["losing_category_queries"] for p in sku_plans)
     hosts_to_win: set = set()
     draft_ready_hosts: set = set()
+    pitch_ready_hosts: set = set()
     for p in sku_plans:
         for q in p["losing_queries"]:
             for t in q["grounds_in"]:
                 hosts_to_win.add(t["host"])
                 if t["outreach"]["state"] == OUTREACH_DRAFT_READY:
                     draft_ready_hosts.add(t["host"])
+                if t["outreach"].get("pitch_draft"):
+                    pitch_ready_hosts.add(t["host"])
 
     available = bool(sku_plans)
     note: Optional[str] = None
@@ -335,6 +380,10 @@ def build_win_plan(
         "rollup": {
             "losing_category_queries": losing_total,
             "independent_hosts_to_win": sorted(hosts_to_win),
+            # draft_ready_hosts = an emailable recipient exists (registry fact);
+            # pitch_ready_hosts = a one-click draft actually rendered (email +
+            # matching playbook template). The latter is the true "act now" count.
             "draft_ready_hosts": sorted(draft_ready_hosts),
+            "pitch_ready_hosts": sorted(pitch_ready_hosts),
         },
     }

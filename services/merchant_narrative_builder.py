@@ -238,7 +238,54 @@ def _whats_working(
     }
 
 
-def _where_youre_losing(merchant_name: str, authority_map: Dict[str, Any], summary: Dict[str, Any]) -> Dict[str, Any]:
+def _win_plan_summary(win_plan: Optional[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
+    """Brand-level rollup of the per-SKU win-plan (Fix 4), surfaced inside
+    "where you're losing" so the narrative names the *path to winning* the
+    category recommendation, not just the loss. None when there is no plan
+    (no losing category queries) — never fabricates a path."""
+    if not isinstance(win_plan, dict) or not win_plan.get("available"):
+        return None
+    roll = win_plan.get("rollup") if isinstance(win_plan.get("rollup"), dict) else {}
+    losing = int(roll.get("losing_category_queries") or 0)
+    if not losing:
+        return None
+    hosts = [h for h in (roll.get("independent_hosts_to_win") or []) if h]
+    # "Ready-to-send" means a one-click pitch actually rendered (email recipient
+    # + matching template), not merely an emailable host — the honest count.
+    pitch_ready = [h for h in (roll.get("pitch_ready_hosts") or []) if h]
+    q_word = "query" if losing == 1 else "queries"
+    if hosts:
+        h_word = "host" if len(hosts) == 1 else "hosts"
+        it = "it" if losing == 1 else "them"
+        tail = (
+            f" — {len(pitch_ready)} with a ready-to-send pitch."
+            if pitch_ready
+            else " — none with a ready-to-send pitch yet (target named, recipient pending)."
+        )
+        text = (
+            f"You're losing {losing} category {q_word}; AI grounds {it} in "
+            f"{len(hosts)} independent {h_word} you're not cited in" + tail
+        )
+    else:
+        text = (
+            f"You're losing {losing} category {q_word}, but the grounded answers "
+            "named no independent publisher to target — the play is to earn a "
+            "first independent category citation."
+        )
+    return {
+        "summary": text,
+        "losing_category_queries": losing,
+        "independent_hosts_to_win": hosts,
+        "pitch_ready_hosts": pitch_ready,
+    }
+
+
+def _where_youre_losing(
+    merchant_name: str,
+    authority_map: Dict[str, Any],
+    summary: Dict[str, Any],
+    win_plan: Optional[Dict[str, Any]] = None,
+) -> Dict[str, Any]:
     endorsed_category = bool(summary.get("independently_recommended_for_category"))
     endorsement_hosts = list(summary.get("endorsement_category_hosts") or summary.get("endorsement_hosts") or [])
     findable = bool(summary.get("findability_hosts"))
@@ -267,6 +314,9 @@ def _where_youre_losing(merchant_name: str, authority_map: Dict[str, Any], summa
         "independently_recommended_for_category": endorsed_category,
         "endorsement_hosts": endorsement_hosts,
         "who_ai_cites_instead": _who_ai_cites_instead(authority_map),
+        # Fix 4 — the path to winning the category recommendation back, rolled
+        # up from the per-SKU win-plan. None when there's no plan to show.
+        "win_plan_summary": _win_plan_summary(win_plan),
     }
 
 
@@ -430,6 +480,7 @@ def build_merchant_narrative(
     verify_providers: Optional[List[str]] = None,
     pending_engine_support: Optional[List[str]] = None,
     coverage_profile: Optional[str] = None,
+    win_plan: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
     """Assemble the seven merchant-facing narrative sections from already-built
     report data. Pure + defensive: every section degrades to an honest "not
@@ -439,7 +490,7 @@ def build_merchant_narrative(
     brand_rollup = brand_rollup if isinstance(brand_rollup, dict) else {}
     summary = _summary(authority_map)
 
-    where = _where_youre_losing(name, authority_map, summary)
+    where = _where_youre_losing(name, authority_map, summary, win_plan)
     verify_plain = _verify_plain(verify_summary)
     return {
         "headline_story": _headline_story(name, summary),

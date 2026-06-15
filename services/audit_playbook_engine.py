@@ -288,6 +288,57 @@ def _build_pitch_draft(
     }
 
 
+def build_pitch_draft_for_host(
+    host_entry: Dict[str, Any],
+    *,
+    merchant_name: Optional[str] = None,
+    merchant_category: Optional[str] = None,
+    example_query: Optional[str] = None,
+    competitors_named: Optional[List[str]] = None,
+) -> Optional[Dict[str, Any]]:
+    """Render the one-click pitch email for a SINGLE target host, keyed to a
+    specific failing query + its competitor benchmark.
+
+    `host_entry` is a `cited_host_classifier.classify_host` result (carries
+    `type`/`subtype` for playbook selection and `pitch_recipient` for the
+    recipient). Reuses the exact playbook selection + template rendering +
+    recipient contract `select_playbooks` uses — the per-host seam the win-plan
+    layer (Fix 4) calls instead of re-implementing the email.
+
+    Returns the pitch_draft dict (`subject`/`body`/`recipient_email`/
+    `recipient_note`) or None when the matched playbook has no `pitch_template`
+    or the host has no email recipient — the honest "no one-click draft" case
+    the caller degrades to submission_only / target_only.
+    """
+    if not isinstance(host_entry, dict):
+        return None
+    selection = _select_playbook_for_host(host_entry)
+    if not selection:
+        return None
+    _pid, pb = selection
+    timeline = pb.get("expected_timeline_weeks") or [0, 0]
+    try:
+        tl_low, tl_high = int(timeline[0]), int(timeline[1])
+    except (ValueError, TypeError, IndexError):
+        tl_low = tl_high = 0
+    comps = [c for c in (competitors_named or []) if isinstance(c, str) and c.strip()]
+    example = {"query": example_query} if example_query else None
+    ctx = {
+        "host": host_entry.get("host") or "",
+        "coverage_note": host_entry.get("coverage_note") or "",
+        "outreach_hint": host_entry.get("outreach_hint") or "",
+        "competitors_phrase": _competitors_phrase(comps),
+        "example_phrase": _example_phrase(example),
+        "timeline_low": tl_low,
+        "timeline_high": tl_high,
+        "merchant_name": (merchant_name or "[brand]").strip() or "[brand]",
+        "category": (merchant_category or "category").strip() or "category",
+        "competitors_phrase_short": _competitors_phrase_short(comps),
+        "example_phrase_short": _example_phrase_short(example),
+    }
+    return _build_pitch_draft(pb=pb, host_entry=host_entry, ctx=ctx)
+
+
 # A host cited only once in the audit's grounding sources is weak
 # evidence for any host-targeted action — a single citation could be
 # noise (one tangential mention) rather than a real capture pattern.

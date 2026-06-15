@@ -216,6 +216,36 @@ def test_coverage_and_rollup_counts():
     assert roll["draft_ready_hosts"] == ["forbes.com"]
 
 
+def test_pitch_draft_rendered_for_emailable_target_keyed_to_query():
+    # Phase 2: an emailable target with a matching playbook template gets a
+    # rendered one-click pitch, keyed to THIS losing query + its competitors.
+    fx = _aruen_fixture()
+    plan = build_win_plan(merchant_name="Aruen", **fx)
+    q = _query(_collagen_plan(plan), "best collagen cream")
+    by_host = {t["host"]: t["outreach"] for t in q["grounds_in"]}
+
+    forbes = by_host["forbes.com"]
+    assert forbes["state"] == OUTREACH_DRAFT_READY
+    draft = forbes["pitch_draft"]
+    assert draft is not None
+    assert draft["recipient_email"]                      # real registry email
+    assert "Vital Proteins" in draft["body"]             # this query's benchmark
+    assert "Aruen" in draft["body"]                      # the merchant
+
+    # submission_only / target_only targets honestly show NO one-click draft.
+    assert by_host["goodhousekeeping.com"]["pitch_draft"] is None
+    assert by_host["byrdie.com"]["pitch_draft"] is None
+
+
+def test_rollup_pitch_ready_distinct_from_emailable():
+    fx = _aruen_fixture()
+    plan = build_win_plan(merchant_name="Aruen", **fx)
+    roll = plan["rollup"]
+    # forbes is emailable AND renders a draft -> both lists; gh/byrdie in neither.
+    assert roll["draft_ready_hosts"] == ["forbes.com"]
+    assert roll["pitch_ready_hosts"] == ["forbes.com"]
+
+
 def test_no_losing_category_queries_is_unavailable():
     per_sku_reports = [
         {
