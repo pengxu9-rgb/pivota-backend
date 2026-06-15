@@ -563,6 +563,89 @@ async def _legacy_employee_login_response(normalized_email: str, password: str) 
     return None
 
 
+def _portal_reset_base_url(portal: Optional[str]) -> Optional[str]:
+    """Reset-link base URL for an explicitly-requested portal, or None.
+
+    A single email can be both an employee and a merchant, so the portal the
+    request actually came from is the only reliable signal for where to send
+    the reset link. Returns None when no (or an unknown) portal is supplied so
+    the caller can fall back to legacy role-based inference.
+    """
+    if portal == "employee":
+        return getattr(settings, "employee_portal_base_url", "https://employee.pivota.cc")
+    if portal == "agent":
+        return getattr(settings, "agent_portal_base_url", "https://developer.pivota.cc")
+    if portal == "merchant":
+        return getattr(settings, "merchant_portal_base_url", "https://merchant.pivota.cc")
+    return None
+
+
+async def _ensure_password_reset_tokens_table() -> None:
+    """Create the reset-token table if missing and ensure the portal column.
+
+    Idempotent; safe to call on every forgot/reset request. The portal column
+    records which portal minted a token so the reset can be scoped to an active
+    membership for that portal.
+    """
+    try:
+        await database.execute(
+            """
+            CREATE TABLE IF NOT EXISTS password_reset_tokens (
+                token VARCHAR(255) PRIMARY KEY,
+                user_email VARCHAR(255) NOT NULL,
+                expires_at TIMESTAMP NOT NULL,
+                used BOOLEAN DEFAULT FALSE,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            )
+            """
+        )
+    except Exception:
+        pass  # Table might already exist
+    try:
+        await database.execute(
+            "ALTER TABLE password_reset_tokens ADD COLUMN IF NOT EXISTS portal VARCHAR(32)"
+        )
+    except Exception:
+        pass  # Column might already exist
+
+
+async def _email_has_portal_membership(
+    portal: str,
+    email: str,
+    user: Optional[dict],
+    employee_identity: Optional[dict],
+) -> bool:
+    """Whether `email` has an active membership for `portal`.
+
+    Mirrors the signals the login flow trusts (canonical membership rows plus
+    the legacy employees / users.role / merchant_onboarding fallbacks) so the
+    reset flow can neither issue nor redeem a link for a portal the account
+    does not belong to.
+    """
+    membership_type = PORTAL_TO_MEMBERSHIP_TYPE.get(portal)
+    if not membership_type:
+        return False
+    if await _safe_get_active_membership(email, membership_type):
+        return True
+
+    role = ((user or {}).get("role") or "").strip().lower()
+    if membership_type == "employee":
+        return bool(employee_identity) or role in EMPLOYEE_AUTH_ROLES
+    if membership_type == "merchant":
+        if role == "merchant":
+            return True
+        merchant = await database.fetch_one(
+            "SELECT merchant_id FROM merchant_onboarding WHERE contact_email = :email LIMIT 1",
+            {"email": email},
+        )
+        return bool(merchant)
+    if membership_type == "agent":
+        if role == "agent":
+            return True
+        return bool(await _resolve_agent_id_for_email(email))
+    return False
+
+
 def _send_reset_password_email(email: str, reset_link: str) -> None:
     """
     Best-effort email sender for password reset links.
@@ -1070,6 +1153,19 @@ class ChangePasswordRequest(BaseModel):
 
 class ForgotPasswordRequest(BaseModel):
     email: EmailStr
+    portal: Optional[str] = None
+
+    @field_validator('portal')
+    @classmethod
+    def validate_portal(cls, value: Optional[str]) -> Optional[str]:
+        if value is None:
+            return None
+        portal = value.strip().lower()
+        if not portal:
+            return None
+        if portal not in SUPPORTED_LOGIN_PORTALS:
+            raise ValueError(f'Invalid portal. Must be one of: {", ".join(sorted(SUPPORTED_LOGIN_PORTALS))}')
+        return portal
 
 class ResetPasswordRequest(BaseModel):
     token: str
@@ -1174,9 +1270,33 @@ async def forgot_password(data: ForgotPasswordRequest):
             {"email": normalized_email},
         ))
         employee_identity = await _fetch_active_employee_identity(normalized_email)
-        
+
+        # Always return the same response so callers can't enumerate which
+        # emails / portals exist.
+        generic_response = MessageResponse(
+            success=True,
+            message="If the email exists, a password reset link has been sent",
+        )
+
+        # Membership guardrail: when the caller tells us which portal they're
+        # resetting from, only proceed if the account actually has an active
+        # membership for THAT portal. This stops reset links (and the merchant
+        # backfill below) from being issued for a portal the account doesn't
+        # belong to.
+        if data.portal and not await _email_has_portal_membership(
+            data.portal, normalized_email, user, employee_identity
+        ):
+            await _safe_record_identity_event(
+                event_type="password_reset_denied",
+                email=normalized_email,
+                details={"portal": data.portal, "reason": "no_active_membership"},
+            )
+            return generic_response
+
         if not user:
-            if employee_identity:
+            # Backfill a login user for a known employee so the reset has a row
+            # to write. Scoped to employee resets (or legacy portal-less calls).
+            if employee_identity and data.portal in (None, "employee"):
                 try:
                     await _sync_employee_auth_user(
                         employee=employee_identity,
@@ -1189,87 +1309,83 @@ async def forgot_password(data: ForgotPasswordRequest):
                 except Exception as exc:
                     logger.warning("[Auth] Failed to backfill employee user for reset: %s", exc)
 
-            # Legacy backfill: if this email matches a merchant contact_email but
-            # has no corresponding users row yet, create a login user on the fly
-            merchant = None if user else await database.fetch_one(
-                "SELECT merchant_id, business_name FROM merchant_onboarding WHERE contact_email = :email LIMIT 1",
-                {"email": normalized_email},
-            )
+            # Merchant bootstrap: a known merchant-onboarding contact with no
+            # users row yet. Restricted to an explicit merchant-portal reset, so
+            # forgot-password can no longer silently mint merchant accounts for
+            # other (or unspecified) portals.
+            if not user and data.portal == "merchant":
+                merchant = await database.fetch_one(
+                    "SELECT merchant_id, business_name FROM merchant_onboarding WHERE contact_email = :email LIMIT 1",
+                    {"email": normalized_email},
+                )
+                if merchant:
+                    from utils.auth import hash_password
 
-            if merchant:
-                from utils.auth import hash_password
-                import secrets
-
-                password = secrets.token_urlsafe(12)
-                password_hash = hash_password(password)
-
-                await database.execute(
-                    """
-                    INSERT INTO users (email, password_hash, full_name, role, active, merchant_id)
-                    VALUES (:email, :password_hash, :full_name, :role, :active, :merchant_id)
-                    """,
-                    {
+                    password_hash = hash_password(secrets.token_urlsafe(12))
+                    await database.execute(
+                        """
+                        INSERT INTO users (email, password_hash, full_name, role, active, merchant_id)
+                        VALUES (:email, :password_hash, :full_name, :role, :active, :merchant_id)
+                        """,
+                        {
+                            "email": normalized_email,
+                            "password_hash": password_hash,
+                            "full_name": merchant["business_name"] or normalized_email.split("@")[0],
+                            "role": "merchant",
+                            "active": True,
+                            "merchant_id": merchant["merchant_id"],
+                        },
+                    )
+                    logger.info(
+                        "[Auth] Auto-created merchant user for %s to support password reset",
+                        normalized_email,
+                    )
+                    user = {
                         "email": normalized_email,
-                        "password_hash": password_hash,
-                        "full_name": merchant["business_name"] or normalized_email.split("@")[0],
                         "role": "merchant",
-                        "active": True,
-                        "merchant_id": merchant["merchant_id"],
-                    },
-                )
-                logger.info(
-                    "[Auth] Auto-created merchant user for %s to support password reset",
-                    normalized_email,
-                )
-                user = {
-                    "email": normalized_email,
-                    "role": "merchant",
-                }
-            else:
+                    }
+
+            if not user:
                 # Don't reveal if email exists or not (security best practice)
-                return MessageResponse(
-                    success=True,
-                    message="If the email exists, a password reset link has been sent",
-                )
-        
+                return generic_response
+
         # Generate reset token (valid for 1 hour)
         reset_token = secrets.token_urlsafe(32)
         expires_at = datetime.utcnow() + timedelta(hours=1)
         
-        # Store reset token in database
-        # First, create password_reset_tokens table if needed
-        try:
-            await database.execute("""
-                CREATE TABLE IF NOT EXISTS password_reset_tokens (
-                    token VARCHAR(255) PRIMARY KEY,
-                    user_email VARCHAR(255) NOT NULL,
-                    expires_at TIMESTAMP NOT NULL,
-                    used BOOLEAN DEFAULT FALSE,
-                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-                )
-            """)
-        except:
-            pass  # Table might already exist
-        
+        # Store reset token in database, remembering which portal minted it.
+        await _ensure_password_reset_tokens_table()
         await database.execute(
             """
-            INSERT INTO password_reset_tokens (token, user_email, expires_at)
-            VALUES (:token, :email, :expires_at)
+            INSERT INTO password_reset_tokens (token, user_email, portal, expires_at)
+            VALUES (:token, :email, :portal, :expires_at)
             """,
-            {"token": reset_token, "email": normalized_email, "expires_at": expires_at}
+            {
+                "token": reset_token,
+                "email": normalized_email,
+                "portal": data.portal,
+                "expires_at": expires_at,
+            },
         )
         
-        # Build reset link. Choose portal base URL based on user role (if known).
-        base_url = getattr(settings, "merchant_portal_base_url", "https://merchant.pivota.cc").rstrip("/")
-        try:
-            role = user["role"] if user else None
-        except Exception:
-            role = None
-
-        if role in {"super_admin", "admin", "employee", "outsourced"}:
-            base_url = getattr(settings, "employee_portal_base_url", "https://employee.pivota.cc").rstrip("/")
-        elif role == "agent":
-            base_url = getattr(settings, "agent_portal_base_url", "https://developer.pivota.cc").rstrip("/")
+        # Build reset link. Prefer the portal the request actually came from;
+        # only fall back to inferring it from the user's role for legacy callers
+        # that don't send a portal. Role alone is wrong for dual-role accounts
+        # (e.g. an employee who also has a merchant users row), which would
+        # otherwise be routed to the merchant portal regardless of where they
+        # asked to reset from.
+        base_url = _portal_reset_base_url(data.portal)
+        if not base_url:
+            base_url = getattr(settings, "merchant_portal_base_url", "https://merchant.pivota.cc")
+            try:
+                role = user["role"] if user else None
+            except Exception:
+                role = None
+            if role in {"super_admin", "admin", "employee", "outsourced"}:
+                base_url = getattr(settings, "employee_portal_base_url", "https://employee.pivota.cc")
+            elif role == "agent":
+                base_url = getattr(settings, "agent_portal_base_url", "https://developer.pivota.cc")
+        base_url = base_url.rstrip("/")
 
         reset_link = f"{base_url}/reset-password?token={reset_token}"
 
@@ -1294,25 +1410,43 @@ async def reset_password(data: ResetPasswordRequest):
     Reset password using token from forgot-password flow
     """
     try:
+        await _ensure_password_reset_tokens_table()
         # Verify token exists and is valid
         token_record = await database.fetch_one(
             """
-            SELECT token, user_email, expires_at, used 
-            FROM password_reset_tokens 
+            SELECT token, user_email, portal, expires_at, used
+            FROM password_reset_tokens
             WHERE token = :token
             """,
             {"token": data.token}
         )
-        
+
         if not token_record:
             raise HTTPException(status_code=400, detail="Invalid or expired reset token")
-        
+
         if token_record["used"]:
             raise HTTPException(status_code=400, detail="Reset token has already been used")
-        
+
         if datetime.utcnow() > token_record["expires_at"]:
             raise HTTPException(status_code=400, detail="Reset token has expired")
-        
+
+        # Membership guardrail: a token minted for a specific portal may only be
+        # redeemed while the account still holds an active membership for it.
+        token_portal = (token_record["portal"] or "").strip().lower() or None
+        if token_portal:
+            token_user = _record_to_dict(await database.fetch_one(
+                "SELECT email, role FROM users WHERE email = :email",
+                {"email": token_record["user_email"]},
+            ))
+            token_employee = await _fetch_active_employee_identity(token_record["user_email"])
+            if not await _email_has_portal_membership(
+                token_portal, token_record["user_email"], token_user, token_employee
+            ):
+                raise HTTPException(
+                    status_code=403,
+                    detail=f"No active {token_portal} membership for this account",
+                )
+
         # Hash new password
         new_password_hash = hash_password(data.new_password)
         
