@@ -492,6 +492,23 @@ def build_merchant_narrative(
 
     where = _where_youre_losing(name, authority_map, summary, win_plan)
     verify_plain = _verify_plain(verify_summary)
+    honest_limits = _honest_limits(
+        summary,
+        where["who_ai_cites_instead"],
+        verify_plain,
+        providers,
+        verify_providers,
+        pending_engine_support,
+        coverage_profile,
+    )
+    # Issue #902 — when audited SKUs sit on freshly-minted Pivota canonical PDPs
+    # still inside Google's indexing window, surface that caveat here so a
+    # merchant reads zero category citations as indexing latency, not a content
+    # gap. Read from the brand indexing-arc rollup; absent -> nothing added.
+    arc = brand_rollup.get("indexing_arc") if isinstance(brand_rollup, dict) else None
+    arc_caveat = arc.get("caveat") if isinstance(arc, dict) else None
+    if arc_caveat:
+        honest_limits = list(honest_limits) + [arc_caveat]
     return {
         "headline_story": _headline_story(name, summary),
         "whats_working": _whats_working(name, summary, per_sku_reports),
@@ -499,15 +516,7 @@ def build_merchant_narrative(
         "per_sku_scorecard": _per_sku_scorecard(per_sku_reports, authority_map),
         "verify_summary_plain": verify_plain,
         "prioritized_actions": _prioritized_actions(per_sku_reports),
-        "honest_limits": _honest_limits(
-            summary,
-            where["who_ai_cites_instead"],
-            verify_plain,
-            providers,
-            verify_providers,
-            pending_engine_support,
-            coverage_profile,
-        ),
+        "honest_limits": honest_limits,
         "verdict_label": brand_rollup.get("brand_verdict_label"),
         "verdict_explanation": brand_rollup.get("brand_verdict_explanation"),
     }
