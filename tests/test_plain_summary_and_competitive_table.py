@@ -34,8 +34,11 @@ def test_plain_summary_for_invisible_says_no():
         attribution_runs_total=9, merchant_cited_runs=0,
         top_retailers=[],
     )
-    assert s.lower().startswith("no")
-    assert "indexed" in s.lower() or "google" in s.lower()
+    # Honest invisible copy: describes what we observed (URL absent from every
+    # grounded source) and deliberately does NOT speculate about root causes
+    # like Google indexing (per the builder's no-speculation rule).
+    assert "did not appear in any grounded source" in s.lower()
+    assert "9 buyer-intent queries" in s.lower()
 
 
 def test_plain_summary_for_strong_says_yes():
@@ -67,10 +70,14 @@ def test_plain_summary_for_via_retailers_says_yes_and_no():
         attribution_runs_total=9, merchant_cited_runs=3,
         top_retailers=["whowhatwear.com", "today.com", "forbes.com"],
     )
-    assert "yes and no" in s.lower()
-    assert "67%" in s
+    # The both/and case now leads with "Mixed." and quantifies as "N of M runs"
+    # (was "yes and no" / "67%"). The "brand recognition" claim is now gated on
+    # title-match evidence (none passed here), so the honest copy says the brand
+    # was "mentioned in category-level answer prose" instead — assert that.
+    assert "mixed" in s.lower()
+    assert "3 of 9 runs" in s.lower()
     assert "whowhatwear.com" in s
-    assert "brand recognition" in s.lower()
+    assert "category-level answer prose" in s.lower()
 
 
 def test_plain_summary_for_misattributed_says_partly():
@@ -226,8 +233,9 @@ def test_merchant_view_headline_carries_plain_summary():
     h = report["merchant_view"]["headline"]
     assert "plain_summary" in h
     assert h["plain_summary"]
-    # The reported scenario is VIA_RETAILERS — should say "yes and no".
-    assert "yes and no" in h["plain_summary"].lower()
+    # The reported scenario is VIA_RETAILERS — the both/and answer now leads
+    # with "Mixed." (was "yes and no").
+    assert "mixed" in h["plain_summary"].lower()
 
 
 def test_merchant_view_receipts_carries_competitive_table():

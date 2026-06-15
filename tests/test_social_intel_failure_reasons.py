@@ -261,8 +261,9 @@ def test_renderer_shows_competitive_comparison_failure_note():
         "available": True,
     })
     md = render_brand_markdown(report)
-    assert "Competitive social comparison unavailable" in md
-    assert "unparseable response" in md
+    # parse_error → the honest "returned source evidence" wording (the renderer
+    # distinguishes failure modes rather than a generic "unavailable").
+    assert "Competitive social comparison: not verified from the returned source evidence" in md
 
 
 def test_renderer_shows_own_presence_failure_note():
@@ -287,8 +288,8 @@ def test_renderer_shows_own_presence_failure_note():
         "available": True,
     })
     md = render_brand_markdown(report)
-    assert "Instagram presence unavailable" in md
-    assert "failed to reach the data source" in md
+    # transport_error → "source check did not complete".
+    assert "Instagram presence: not verified because the source check did not complete" in md
 
 
 def test_renderer_shows_kol_no_data_note():
@@ -313,8 +314,9 @@ def test_renderer_shows_kol_no_data_note():
         "available": True,
     })
     md = render_brand_markdown(report)
-    assert "creator endorsements unavailable" in md.lower()
-    assert "found nothing for this brand" in md
+    # no_data → "no live source evidence found" (checked, found nothing — NOT a
+    # transport/parse failure).
+    assert "creator endorsements: no live source evidence found for this brand" in md.lower()
 
 
 def test_renderer_no_failure_note_when_subcall_succeeded():

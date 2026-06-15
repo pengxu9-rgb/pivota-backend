@@ -78,8 +78,11 @@ def test_shopify_onboarding_deliverables_include_order_forwarding():
     assert "order forwarding" in text or "order forwarding" in text
 
 
-def test_wix_onboarding_deliverables_include_order_forwarding():
-    """Wix writeback ships through its own OAuth-backed adapter."""
+def test_wix_onboarding_is_non_writeback_pending_store_readiness():
+    """Wix is supports_platform_order_writeback=False (readiness pending), so its
+    onboarding mirrors `custom`: custom-integration scoping + manual order routing
+    until the writeback adapter ships — NOT a Shopify-style OAuth + order-forwarding
+    commitment. (Was previously asserted as an OAuth-backed writeback platform.)"""
     from services.audit_pivota_commitments_builder import build_pivota_commitments
     result = build_pivota_commitments(
         merchant_platform="wix",
@@ -88,9 +91,9 @@ def test_wix_onboarding_deliverables_include_order_forwarding():
     deliverables = result["delivers_weeks_1_to_4"]
     text = " ".join(deliverables).lower()
     assert "shopify oauth" not in text
-    assert "wix oauth" in text
-    assert "order forwarding" in text
-    assert "manual" not in text
+    assert "custom integration scoping" in text
+    assert "manual order routing" in text
+    assert "until automated writeback adapter ships" in text
 
 
 def test_onboarding_always_includes_canonical_pdp_creation():
@@ -151,7 +154,11 @@ def test_continuous_deliverables_writeback_line_only_for_writeback_platforms():
         ["delivers_continuous"]
     ).lower()
     assert "order-forwarding" in shopify_text or "order forwarding" in shopify_text
-    assert "order-forwarding" in wix_text or "order forwarding" in wix_text
+    # Wix is non-writeback (supports_platform_order_writeback=False, readiness
+    # pending), so — consistent with this test's intent — it gets the manual
+    # routing line like `custom`, NOT the continuous order-forwarding line.
+    assert "manual order routing" in wix_text
+    assert "continuous order-forwarding" not in wix_text
     assert "manual" in custom_text
 
 
