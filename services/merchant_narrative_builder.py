@@ -1,0 +1,462 @@
+"""Fix 3 — merchant-grade narrative for the per-SKU AI-readiness report.
+
+Turns the structured per-SKU audit (scores, the Fix 1 resolved cited hosts, and
+the Fix 2 findability-vs-endorsement split) into the decision-grade story a
+merchant can act on. The seven sections mirror the target report drafts:
+
+  1. one-sentence honest story (branded vs category)
+  2. what's working (branded/navigational + distribution + a real excerpt)
+  3. where you're losing (independent category recommendation) + who AI cites
+  4. per-SKU scorecard (plain-language status)
+  5. DeepSeek verify summary in plain language (reach vs accuracy)
+  6. prioritized actions mapped to merchant-growth phases
+  7. honest limits (provider coverage pending, data gaps named)
+
+Cross-cutting guardrails: **no fabrication** (never invent competitors/hosts —
+state the limit) and **no inflation** (own-listing surfacing is never reported
+as endorsement). Every field here is derived from data already computed upstream;
+this module adds no probes and reads no DB.
+"""
+
+from __future__ import annotations
+
+from typing import Any, Dict, List, Optional
+
+from services.cited_host_classifier import is_findability_role
+
+# Probe axes that name the SKU/brand (branded/navigational) vs the non-branded
+# category/discovery axis. Kept local so this module has no import cycle with
+# agent_center_bd_report_service (which imports it).
+_CATEGORY_DISCOVERY_AXES = frozenset({"category"})
+
+# Primary-gap -> merchant-growth phase. The two phases are the spec's
+# "create & distribute" (publish identity / earn independent citations) and
+# "evidence intake" (substantiate content / make it transactable).
+_GROWTH_PHASE_BY_GAP = {
+    "identity": "create_and_distribute",
+    "citation": "create_and_distribute",
+    "content": "evidence_intake",
+    "content_richness": "evidence_intake",
+    "routability": "evidence_intake",
+}
+_GROWTH_PHASE_LABEL = {
+    "create_and_distribute": "Create & distribute",
+    "evidence_intake": "Evidence intake",
+}
+
+_EXCERPT_CAP = 320
+
+
+def _excerpt(text: Optional[str]) -> Optional[str]:
+    s = str(text or "").strip()
+    if not s:
+        return None
+    return (s[: _EXCERPT_CAP - 1] + "…") if len(s) > _EXCERPT_CAP else s
+
+
+def _axis_of(run: Dict[str, Any]) -> str:
+    meta = run.get("axis_metadata") if isinstance(run.get("axis_metadata"), dict) else {}
+    return str(meta.get("axis") or "").strip().lower()
+
+
+def _is_branded_axis(axis: str) -> bool:
+    return bool(axis) and axis not in _CATEGORY_DISCOVERY_AXES
+
+
+def _summary(authority_map: Dict[str, Any]) -> Dict[str, Any]:
+    s = authority_map.get("host_attribution_summary") if isinstance(authority_map, dict) else None
+    return s if isinstance(s, dict) else {}
+
+
+def _first_branded_excerpt(per_sku_reports: List[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
+    """A real verbatim grounded excerpt from a branded/navigational query — the
+    honest 'what's working' proof. Returns None when none exists (no fabrication)."""
+    for report in per_sku_reports or []:
+        if not isinstance(report, dict):
+            continue
+        for ev in report.get("verbatim_grounding_evidence") or []:
+            if not isinstance(ev, dict):
+                continue
+            excerpt = _excerpt(ev.get("evidence_excerpt"))
+            sources = ev.get("grounding_sources") or []
+            if not excerpt or not sources:
+                continue
+            if not _is_branded_axis(_axis_of(ev)):
+                continue
+            # Only use the excerpt as "what's working" proof when the SKU was
+            # actually found in that answer — never frame a "couldn't find it"
+            # excerpt as success (no inflation). Older runs that predate this
+            # signal degrade to None rather than guessing.
+            if not ev.get("product_visible"):
+                continue
+            source_labels = [
+                (s.get("title") or s.get("uri") or "").strip()
+                for s in sources
+                if isinstance(s, dict) and (s.get("title") or s.get("uri"))
+            ]
+            return {
+                "sku_title": report.get("sku_title"),
+                "query": ev.get("query"),
+                "excerpt": excerpt,
+                "source_labels": source_labels[:4],
+            }
+    return None
+
+
+def _who_ai_cites_instead(authority_map: Dict[str, Any]) -> Dict[str, Any]:
+    """The real hosts + competitors AI cites that are NOT the merchant. Strictly
+    from grounded data — if nothing independent surfaced, says so explicitly."""
+    hosts = authority_map.get("hosts") if isinstance(authority_map, dict) else None
+    hosts = hosts if isinstance(hosts, list) else []
+    cited_hosts: List[Dict[str, Any]] = []
+    for row in hosts:
+        if not isinstance(row, dict):
+            continue
+        # Exclude the merchant's OWN findability — own site (first_party) and the
+        # merchant's own product listed on a marketplace (marketplace_self_listing).
+        # Those are the merchant's distribution; surfacing them under "who AI cites
+        # instead" would read own-listing indexing as a competitor citation (the
+        # no-inflation guardrail).
+        if row.get("first_party") or is_findability_role(row.get("citation_role")):
+            continue
+        host = row.get("host")
+        if host:
+            cited_hosts.append({
+                "host": host,
+                "citation_role": row.get("citation_role"),
+                "recommendation_class": row.get("recommendation_class"),
+                "prompts_cited_count": row.get("prompts_cited_count") or 0,
+                "cited_on_category_query": bool(row.get("cited_on_category_query")),
+            })
+    cited_hosts.sort(key=lambda h: (-(h["prompts_cited_count"] or 0), h["host"]))
+
+    # Competitor brand names live on the per-SKU authority hosts (the brand-level
+    # rollup doesn't carry them). Aggregate from there — real grounded names only.
+    # `times_named` is the honest count: distinct SKUs whose grounded answers named
+    # the competitor — NOT the per-cited-host tally (the host rollup fans
+    # `competitors_named` onto every host in a run, which would multiply it by the
+    # number of cited hosts). `_prominence` (that same host-fanned frequency) is
+    # kept only as an ordering proxy so the most-cited competitors rank first
+    # (otherwise single-SKU runs tie at 1 and sort alphabetically, burying the
+    # relevant names). It is not surfaced.
+    competitor_skus: Dict[str, set] = {}
+    competitor_prominence: Dict[str, int] = {}
+    for sku in (authority_map.get("skus") if isinstance(authority_map, dict) else None) or []:
+        sku_key = sku.get("sku_key") if isinstance(sku, dict) else None
+        for row in (sku.get("authority_hosts") if isinstance(sku, dict) else None) or []:
+            for comp in (row.get("competitors_named") if isinstance(row, dict) else None) or []:
+                name = str(comp or "").strip()
+                if name:
+                    competitor_skus.setdefault(name, set()).add(sku_key)
+                    competitor_prominence[name] = competitor_prominence.get(name, 0) + 1
+    competitors = [
+        {"name": name, "times_named": len(competitor_skus[name])}
+        for name in sorted(
+            competitor_skus,
+            key=lambda n: (-competitor_prominence.get(n, 0), n),
+        )
+    ]
+    available = bool(cited_hosts or competitors)
+    note = None
+    if not available:
+        note = (
+            "Competitor/host landscape not available: this run's grounded "
+            "sources named no third-party hosts or competitors for these queries."
+        )
+    elif not competitors:
+        note = (
+            "AI cites the hosts above for these queries; no competitor brand was "
+            "named in the grounded answers."
+        )
+    return {
+        "available": available,
+        "cited_hosts": cited_hosts[:8],
+        "competitors": competitors[:8],
+        "note": note,
+    }
+
+
+def _headline_story(merchant_name: str, summary: Dict[str, Any]) -> str:
+    name = merchant_name or "This brand"
+    findable = bool(summary.get("findability_hosts"))
+    endorsed_category = bool(summary.get("independently_recommended_for_category"))
+    endorsed = bool(summary.get("has_independent_endorsement"))
+    if not findable and not endorsed:
+        return (
+            f"{name} is invisible to AI shopping agents today — neither your own "
+            "listings nor any independent source surface when shoppers ask."
+        )
+    if endorsed_category:
+        return (
+            f"{name} is independently recommended for the category, not just "
+            "found through your own listings — the channel is working for you."
+        )
+    if endorsed:
+        return (
+            f"Independent sources cite {name}, but not yet on the category "
+            "questions new shoppers ask — recommendation is branded, not category-wide."
+        )
+    return (
+        f"Shoppers who already know {name} can find you — your listings are "
+        "indexed — but AI does not yet recommend you to new shoppers asking the "
+        "category question."
+    )
+
+
+def _whats_working(
+    merchant_name: str,
+    summary: Dict[str, Any],
+    per_sku_reports: List[Dict[str, Any]],
+) -> Dict[str, Any]:
+    findability_hosts = [str(h) for h in (summary.get("findability_hosts") or []) if h]
+    branded = 0
+    category = 0
+    for report in per_sku_reports or []:
+        if not isinstance(report, dict):
+            continue
+        cov = report.get("query_class_coverage")
+        cov = cov if isinstance(cov, dict) else {}
+        branded += int(cov.get("branded_navigational") or 0)
+        category += int(cov.get("category_discovery") or 0)
+    if findability_hosts:
+        listed = ", ".join(findability_hosts[:5])
+        text = (
+            f"{merchant_name or 'The brand'} is findable where shoppers who "
+            f"already know it look: listed across {listed}."
+        )
+    else:
+        text = (
+            "No own-site or marketplace listings surfaced in grounded answers "
+            "yet — there is no findability base to build on."
+        )
+    return {
+        "summary": text,
+        "findability_hosts": findability_hosts,
+        "branded_navigational_probes": branded,
+        "category_discovery_probes": category,
+        "evidence_excerpt": _first_branded_excerpt(per_sku_reports),
+    }
+
+
+def _where_youre_losing(merchant_name: str, authority_map: Dict[str, Any], summary: Dict[str, Any]) -> Dict[str, Any]:
+    endorsed_category = bool(summary.get("independently_recommended_for_category"))
+    endorsement_hosts = list(summary.get("endorsement_category_hosts") or summary.get("endorsement_hosts") or [])
+    findable = bool(summary.get("findability_hosts"))
+    if endorsed_category:
+        text = (
+            f"{merchant_name or 'The brand'} earns independent category "
+            f"recommendation from {', '.join(endorsement_hosts[:4])}."
+        )
+    elif findable:
+        text = (
+            "When shoppers ask the category question, no independent source "
+            f"recommends {merchant_name or 'the brand'} — only your own/retail "
+            "listings appear, which is distribution, not endorsement."
+        )
+    else:
+        # Nothing surfaced at all (invisible): don't claim "only your own
+        # listings appear" when even those didn't — that would contradict the
+        # invisible headline.
+        text = (
+            "When shoppers ask the category question, "
+            f"{merchant_name or 'the brand'} doesn't surface at all — neither "
+            "your own listings nor any independent source appears."
+        )
+    return {
+        "summary": text,
+        "independently_recommended_for_category": endorsed_category,
+        "endorsement_hosts": endorsement_hosts,
+        "who_ai_cites_instead": _who_ai_cites_instead(authority_map),
+    }
+
+
+def _per_sku_scorecard(
+    per_sku_reports: List[Dict[str, Any]],
+    authority_map: Dict[str, Any],
+) -> List[Dict[str, Any]]:
+    signals_by_sku: Dict[str, Dict[str, Any]] = {}
+    for sku in (authority_map.get("skus") if isinstance(authority_map, dict) else None) or []:
+        if isinstance(sku, dict) and sku.get("sku_key"):
+            signals_by_sku[sku["sku_key"]] = sku.get("citation_signals") or {}
+    out: List[Dict[str, Any]] = []
+    for report in per_sku_reports or []:
+        if not isinstance(report, dict):
+            continue
+        band_display = report.get("band_display")
+        band_display = band_display if isinstance(band_display, dict) else {}
+        primary_gaps = report.get("primary_gaps")
+        primary_gaps = primary_gaps if isinstance(primary_gaps, list) else []
+        top_gap = primary_gaps[0] if primary_gaps else {}
+        sig = signals_by_sku.get(report.get("sku_key"), {})
+        out.append({
+            "sku_key": report.get("sku_key"),
+            "sku_title": report.get("sku_title"),
+            "band": report.get("band"),
+            "status": band_display.get("label") or report.get("band"),
+            "what_it_means": (
+                band_display.get("meaning")
+                or (top_gap.get("meaning") if isinstance(top_gap, dict) else None)
+                or (top_gap.get("dimension") if isinstance(top_gap, dict) else None)
+            ),
+            "surfaced_only_via_own_listing": bool(sig.get("surfaced_only_via_own_listing")),
+            "independently_recommended_for_category": bool(
+                sig.get("independently_recommended_for_category")
+            ),
+        })
+    return out
+
+
+def _verify_plain(verify_summary: Optional[Dict[str, Any]]) -> Dict[str, Any]:
+    vs = verify_summary if isinstance(verify_summary, dict) else {}
+    status = vs.get("status") or "not_run"
+    verified = int(vs.get("verified") or 0)
+    flagged = int(vs.get("flagged") or 0)
+    candidates = int(vs.get("citation_positive_candidates") or 0)
+    # `verified` is the number of citations actually checked; `flagged` is a
+    # SUBSET of those (a checked citation DeepSeek flagged for accuracy). Do not
+    # add them — that double-counts and can report "checked" > candidates.
+    checked = verified
+    if status in {"completed", "partial"} and checked:
+        held = max(0, verified - flagged)
+        accuracy = (
+            "every checked citation held up"
+            if flagged == 0
+            else f"{flagged} flagged for accuracy"
+        )
+        text = (
+            f"DeepSeek answer-quality verify checked {checked} of {candidates} "
+            f"cited answers: {held} held up, {accuracy} — reach is real, "
+            "accuracy is the watch item."
+        )
+    elif status in {"completed", "partial"}:
+        text = (
+            "DeepSeek verify ran but had no positive citations to second-guess "
+            "yet — nothing to confirm on accuracy."
+        )
+    else:
+        text = (
+            "Answer-quality verify did not run for this audit "
+            f"({vs.get('reason') or status}); accuracy is unconfirmed."
+        )
+    return {
+        "status": status,
+        "verified": verified,
+        "flagged": flagged,
+        "checked": checked,
+        "candidates": candidates,
+        "text": text,
+    }
+
+
+def _prioritized_actions(per_sku_reports: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    seen = set()
+    actions: List[Dict[str, Any]] = []
+    for report in per_sku_reports or []:
+        if not isinstance(report, dict):
+            continue
+        nba = report.get("next_best_action")
+        nba = nba if isinstance(nba, dict) else {}
+        headline = (nba.get("headline") or "").strip()
+        if not headline:
+            continue
+        gap = (nba.get("primary_gap") or "").strip().lower()
+        key = (gap, headline.lower())
+        if key in seen:
+            continue
+        seen.add(key)
+        phase = _GROWTH_PHASE_BY_GAP.get(gap, "create_and_distribute")
+        actions.append({
+            "sku_title": report.get("sku_title"),
+            "primary_gap": gap or None,
+            "headline": headline,
+            "first_move": nba.get("first_move"),
+            "why_this_first": nba.get("why_this_first"),
+            "growth_phase": phase,
+            "growth_phase_label": _GROWTH_PHASE_LABEL.get(phase, phase),
+        })
+    # Create & distribute first (earning citations unblocks the rest), then
+    # evidence intake; stable within phase by SKU order.
+    phase_order = {"create_and_distribute": 0, "evidence_intake": 1}
+    actions.sort(key=lambda a: phase_order.get(a["growth_phase"], 9))
+    return actions[:5]
+
+
+def _honest_limits(
+    summary: Dict[str, Any],
+    who_cites: Dict[str, Any],
+    verify_plain: Dict[str, Any],
+    providers: Optional[List[str]],
+    verify_providers: Optional[List[str]],
+    pending_engine_support: Optional[List[str]],
+    coverage_profile: Optional[str],
+) -> List[str]:
+    limits: List[str] = []
+    provs = ", ".join(providers or []) or "none"
+    vers = ", ".join(verify_providers or []) or "none"
+    cov = f" (coverage profile: {coverage_profile})" if coverage_profile else ""
+    limits.append(
+        f"Provider coverage: grounded on {provs}; answer-quality verify on "
+        f"{vers}{cov}."
+    )
+    pending = [p for p in (pending_engine_support or []) if p]
+    if pending:
+        limits.append(
+            "Coverage pending: " + ", ".join(pending) +
+            " not yet included — citation/host counts will rise as they are added."
+        )
+    if not who_cites.get("available"):
+        limits.append(
+            "Competitor/host landscape not available from this run's grounded "
+            "sources — not shown rather than guessed."
+        )
+    elif not who_cites.get("competitors"):
+        limits.append(
+            "No competitor brand was named in the grounded answers; only cited "
+            "hosts are shown."
+        )
+    if verify_plain.get("status") not in {"completed", "partial"}:
+        limits.append("Answer-quality (DeepSeek) verification did not run for this audit.")
+    return limits
+
+
+def build_merchant_narrative(
+    *,
+    merchant_name: Optional[str],
+    per_sku_reports: List[Dict[str, Any]],
+    brand_rollup: Optional[Dict[str, Any]] = None,
+    authority_map: Optional[Dict[str, Any]] = None,
+    verify_summary: Optional[Dict[str, Any]] = None,
+    providers: Optional[List[str]] = None,
+    verify_providers: Optional[List[str]] = None,
+    pending_engine_support: Optional[List[str]] = None,
+    coverage_profile: Optional[str] = None,
+) -> Dict[str, Any]:
+    """Assemble the seven merchant-facing narrative sections from already-built
+    report data. Pure + defensive: every section degrades to an honest "not
+    available" rather than fabricating competitors, hosts, or endorsement."""
+    name = (merchant_name or "").strip()
+    authority_map = authority_map if isinstance(authority_map, dict) else {}
+    brand_rollup = brand_rollup if isinstance(brand_rollup, dict) else {}
+    summary = _summary(authority_map)
+
+    where = _where_youre_losing(name, authority_map, summary)
+    verify_plain = _verify_plain(verify_summary)
+    return {
+        "headline_story": _headline_story(name, summary),
+        "whats_working": _whats_working(name, summary, per_sku_reports),
+        "where_youre_losing": where,
+        "per_sku_scorecard": _per_sku_scorecard(per_sku_reports, authority_map),
+        "verify_summary_plain": verify_plain,
+        "prioritized_actions": _prioritized_actions(per_sku_reports),
+        "honest_limits": _honest_limits(
+            summary,
+            where["who_ai_cites_instead"],
+            verify_plain,
+            providers,
+            verify_providers,
+            pending_engine_support,
+            coverage_profile,
+        ),
+        "verdict_label": brand_rollup.get("brand_verdict_label"),
+        "verdict_explanation": brand_rollup.get("brand_verdict_explanation"),
+    }
