@@ -4317,6 +4317,14 @@ def _grounding_evidence(probe_runs: Any, cap: int = 12) -> List[Dict[str, Any]]:
             "axis_metadata": run.get("axis_metadata"),
             "grounding_sources": sources,
             "evidence_excerpt": excerpt or None,
+            # Whether the SKU was actually found in this answer — lets the
+            # narrative use an excerpt as "what's working" proof only when it is
+            # a positive result, never a "couldn't find it" line (Fix 3).
+            "product_visible": bool(
+                parsed.get("correct_sku")
+                or parsed.get("sku_mentioned")
+                or parsed.get("product_visible")
+            ),
         })
         if len(evidence) >= cap:
             break
@@ -8491,17 +8499,23 @@ async def run_brand_report(
         # Fix 3 — merchant-grade narrative assembled from the Fix 1 resolved
         # hosts + Fix 2 findability/endorsement split + verify rollup. No
         # fabrication: degrades to honest "not available" when data is missing.
-        merchant_narrative = build_merchant_narrative(
-            merchant_name=merchant_name,
-            per_sku_reports=per_sku_reports,
-            brand_rollup=brand_rollup,
-            authority_map=authority_map,
-            verify_summary=brand_verify_summary,
-            providers=profile_providers,
-            verify_providers=resolved_verify_providers,
-            pending_engine_support=coverage.get("pending_engine_support") or [],
-            coverage_profile=coverage.get("profile"),
-        )
+        # Best-effort like the sibling enrichments above: a malformed per-SKU
+        # report must never sink the whole brand report — degrade to no narrative.
+        try:
+            merchant_narrative = build_merchant_narrative(
+                merchant_name=merchant_name,
+                per_sku_reports=per_sku_reports,
+                brand_rollup=brand_rollup,
+                authority_map=authority_map,
+                verify_summary=brand_verify_summary,
+                providers=profile_providers,
+                verify_providers=resolved_verify_providers,
+                pending_engine_support=coverage.get("pending_engine_support") or [],
+                coverage_profile=coverage.get("profile"),
+            )
+        except Exception:  # noqa: BLE001
+            logger.warning("merchant_narrative build failed", exc_info=True)
+            merchant_narrative = None
         return {
             "audit_run_id": audit_run_id,
             "merchant_id": str(merchant_id),

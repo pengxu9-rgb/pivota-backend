@@ -86,8 +86,14 @@ def test_narrative_category_endorsement_and_named_competitors():
     assert who["available"] is True
     names = {c["name"] for c in who["competitors"]}
     assert names == {"Vital Proteins", "Ancient Nutrition"}
-    # own site is never listed under "who AI cites instead"
-    assert all(h["host"] != "aruen.com" for h in who["cited_hosts"])
+    cited = {h["host"] for h in who["cited_hosts"]}
+    # The merchant's OWN findability never appears under "who AI cites instead":
+    # not the own site (aruen.com, own_domain) and not the own marketplace
+    # listing (ebay.com, marketplace_self_listing) — both are findability.
+    assert "aruen.com" not in cited
+    assert "ebay.com" not in cited
+    # The independent editorial that named competitors IS surfaced.
+    assert "goodhousekeeping.com" in cited
 
 
 def test_narrative_states_limit_when_landscape_unavailable():
@@ -121,8 +127,13 @@ def test_verify_summary_plain_language():
         merchant_name="X", per_sku_reports=[], authority_map=am,
         verify_summary={"status": "completed", "verified": 8, "flagged": 2, "citation_positive_candidates": 12},
     )["verify_summary_plain"]
-    assert completed["checked"] == 10
-    assert "8 held up" in completed["text"]
+    # `verified` (8) is the number actually checked; `flagged` (2) is a subset of
+    # those, NOT additional. So checked=8, held=6 — never checked=10 (which would
+    # double-count) and never checked > candidates.
+    assert completed["checked"] == 8
+    assert completed["checked"] <= completed["candidates"]
+    assert "checked 8 of 12" in completed["text"]
+    assert "6 held up" in completed["text"]
     assert "2 flagged" in completed["text"]
 
     skipped = build_merchant_narrative(
@@ -148,20 +159,80 @@ def test_prioritized_actions_mapped_to_growth_phases():
     assert {a["headline"] for a in actions} == {"Earn a citation", "Substantiate INCI"}
 
 
-def test_evidence_excerpt_is_real_or_none():
-    """The 'what's working' excerpt is a real branded grounded excerpt or None —
-    never fabricated, and never a category-query excerpt."""
-    # Only a category-axis excerpt available -> excerpt is None (branded only).
-    per_sku_cat = [{
-        "sku_key": "a", "sku_title": "A",
-        "verbatim_grounding_evidence": [{
-            "query": "best collagen", "axis_metadata": {"axis": "category"},
-            "evidence_excerpt": "Top picks include several brands.",
-            "grounding_sources": [{"title": "goodhousekeeping.com"}],
-        }],
-    }]
+def _whats_working_excerpt(evidence_items):
     narr = build_merchant_narrative(
-        merchant_name="A", per_sku_reports=per_sku_cat,
+        merchant_name="A",
+        per_sku_reports=[{"sku_key": "a", "sku_title": "A",
+                          "verbatim_grounding_evidence": evidence_items}],
         authority_map={"skus": [], "hosts": [], "host_attribution_summary": {}},
     )
-    assert narr["whats_working"]["evidence_excerpt"] is None
+    return narr["whats_working"]["evidence_excerpt"]
+
+
+def test_evidence_excerpt_is_real_or_none():
+    """The 'what's working' excerpt is a real branded grounded excerpt where the
+    SKU was actually found — or None. Never fabricated, never a category-query
+    excerpt, and never a 'couldn't find it' line framed as success."""
+    src = [{"title": "aruen.us"}]
+    # Category-axis excerpt -> None (branded only).
+    assert _whats_working_excerpt([{
+        "query": "best collagen", "axis_metadata": {"axis": "category"},
+        "evidence_excerpt": "Top picks include several brands.",
+        "grounding_sources": src, "product_visible": True,
+    }]) is None
+    # Branded but the SKU was NOT found -> None (no inflation: a 'couldn't find
+    # it' excerpt must not be presented as what's working).
+    assert _whats_working_excerpt([{
+        "query": "buy Acme Glow", "axis_metadata": {"axis": "intent"},
+        "evidence_excerpt": "I could not find Acme Glow; consider other serums.",
+        "grounding_sources": src, "product_visible": False,
+    }]) is None
+    # Missing the signal (older runs that predate it) -> None, not guessed.
+    assert _whats_working_excerpt([{
+        "query": "buy Acme Glow", "axis_metadata": {"axis": "intent"},
+        "evidence_excerpt": "Acme Glow Serum, $29.", "grounding_sources": src,
+    }]) is None
+    # Branded AND found -> the real excerpt is used.
+    ex = _whats_working_excerpt([{
+        "query": "buy Acme Glow", "axis_metadata": {"axis": "intent"},
+        "evidence_excerpt": "Acme Glow Serum, $29. In stock.",
+        "grounding_sources": src, "product_visible": True,
+    }])
+    assert ex is not None and "Acme Glow Serum" in ex["excerpt"]
+
+
+def test_competitor_times_named_not_inflated_by_host_fanout():
+    """A competitor named in one answer that cites several hosts is counted once
+    per SKU — not once per cited host (the host rollup fans `competitors_named`
+    onto every host in the answer, which would otherwise multiply the count)."""
+    run = {
+        "query": "best collagen supplement",
+        "axis_metadata": {"axis": "category"},
+        "parsed": {"product_visible": True, "correct_sku": True,
+                   "competitors_listed": ["Vital Proteins"]},
+        "grounding_sources": [
+            {"uri": REDIR + "h1", "title": "goodhousekeeping.com"},
+            {"uri": REDIR + "h2", "title": "byrdie.com"},
+        ],
+    }
+    am = _authority_map([run], host="aruen.com", brand="Aruen")
+    who = build_merchant_narrative(
+        merchant_name="Aruen", per_sku_reports=[], authority_map=am,
+    )["where_youre_losing"]["who_ai_cites_instead"]
+    vp = [c for c in who["competitors"] if c["name"] == "Vital Proteins"]
+    assert vp and vp[0]["times_named"] == 1
+
+
+def test_builder_degrades_on_malformed_per_sku_reports():
+    """Defensive: non-dict / missing-field per-SKU entries must not raise — the
+    builder degrades rather than crashing the whole brand report."""
+    narr = build_merchant_narrative(
+        merchant_name="X",
+        per_sku_reports=[None, "garbage", {}, {"sku_key": "a", "next_best_action": None}],
+        authority_map={"skus": [], "hosts": [], "host_attribution_summary": {}},
+        verify_summary=None,
+    )
+    assert isinstance(narr, dict)
+    assert "headline_story" in narr
+    assert isinstance(narr["per_sku_scorecard"], list)
+    assert isinstance(narr["prioritized_actions"], list)

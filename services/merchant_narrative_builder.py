@@ -22,6 +22,8 @@ from __future__ import annotations
 
 from typing import Any, Dict, List, Optional
 
+from services.cited_host_classifier import is_findability_role
+
 # Probe axes that name the SKU/brand (branded/navigational) vs the non-branded
 # category/discovery axis. Kept local so this module has no import cycle with
 # agent_center_bd_report_service (which imports it).
@@ -70,6 +72,8 @@ def _first_branded_excerpt(per_sku_reports: List[Dict[str, Any]]) -> Optional[Di
     """A real verbatim grounded excerpt from a branded/navigational query — the
     honest 'what's working' proof. Returns None when none exists (no fabrication)."""
     for report in per_sku_reports or []:
+        if not isinstance(report, dict):
+            continue
         for ev in report.get("verbatim_grounding_evidence") or []:
             if not isinstance(ev, dict):
                 continue
@@ -78,6 +82,12 @@ def _first_branded_excerpt(per_sku_reports: List[Dict[str, Any]]) -> Optional[Di
             if not excerpt or not sources:
                 continue
             if not _is_branded_axis(_axis_of(ev)):
+                continue
+            # Only use the excerpt as "what's working" proof when the SKU was
+            # actually found in that answer — never frame a "couldn't find it"
+            # excerpt as success (no inflation). Older runs that predate this
+            # signal degrade to None rather than guessing.
+            if not ev.get("product_visible"):
                 continue
             source_labels = [
                 (s.get("title") or s.get("uri") or "").strip()
@@ -100,8 +110,15 @@ def _who_ai_cites_instead(authority_map: Dict[str, Any]) -> Dict[str, Any]:
     hosts = hosts if isinstance(hosts, list) else []
     cited_hosts: List[Dict[str, Any]] = []
     for row in hosts:
-        if not isinstance(row, dict) or row.get("first_party"):
-            continue  # the merchant's own site is not "who AI cites instead"
+        if not isinstance(row, dict):
+            continue
+        # Exclude the merchant's OWN findability — own site (first_party) and the
+        # merchant's own product listed on a marketplace (marketplace_self_listing).
+        # Those are the merchant's distribution; surfacing them under "who AI cites
+        # instead" would read own-listing indexing as a competitor citation (the
+        # no-inflation guardrail).
+        if row.get("first_party") or is_findability_role(row.get("citation_role")):
+            continue
         host = row.get("host")
         if host:
             cited_hosts.append({
@@ -111,20 +128,33 @@ def _who_ai_cites_instead(authority_map: Dict[str, Any]) -> Dict[str, Any]:
                 "prompts_cited_count": row.get("prompts_cited_count") or 0,
                 "cited_on_category_query": bool(row.get("cited_on_category_query")),
             })
-    cited_hosts.sort(key=lambda h: h["prompts_cited_count"], reverse=True)
+    cited_hosts.sort(key=lambda h: (-(h["prompts_cited_count"] or 0), h["host"]))
 
     # Competitor brand names live on the per-SKU authority hosts (the brand-level
     # rollup doesn't carry them). Aggregate from there — real grounded names only.
-    competitor_counts: Dict[str, int] = {}
+    # `times_named` is the honest count: distinct SKUs whose grounded answers named
+    # the competitor — NOT the per-cited-host tally (the host rollup fans
+    # `competitors_named` onto every host in a run, which would multiply it by the
+    # number of cited hosts). `_prominence` (that same host-fanned frequency) is
+    # kept only as an ordering proxy so the most-cited competitors rank first
+    # (otherwise single-SKU runs tie at 1 and sort alphabetically, burying the
+    # relevant names). It is not surfaced.
+    competitor_skus: Dict[str, set] = {}
+    competitor_prominence: Dict[str, int] = {}
     for sku in (authority_map.get("skus") if isinstance(authority_map, dict) else None) or []:
+        sku_key = sku.get("sku_key") if isinstance(sku, dict) else None
         for row in (sku.get("authority_hosts") if isinstance(sku, dict) else None) or []:
             for comp in (row.get("competitors_named") if isinstance(row, dict) else None) or []:
                 name = str(comp or "").strip()
                 if name:
-                    competitor_counts[name] = competitor_counts.get(name, 0) + 1
+                    competitor_skus.setdefault(name, set()).add(sku_key)
+                    competitor_prominence[name] = competitor_prominence.get(name, 0) + 1
     competitors = [
-        {"name": name, "times_named": n}
-        for name, n in sorted(competitor_counts.items(), key=lambda kv: (-kv[1], kv[0]))
+        {"name": name, "times_named": len(competitor_skus[name])}
+        for name in sorted(
+            competitor_skus,
+            key=lambda n: (-competitor_prominence.get(n, 0), n),
+        )
     ]
     available = bool(cited_hosts or competitors)
     note = None
@@ -178,11 +208,14 @@ def _whats_working(
     summary: Dict[str, Any],
     per_sku_reports: List[Dict[str, Any]],
 ) -> Dict[str, Any]:
-    findability_hosts = list(summary.get("findability_hosts") or [])
+    findability_hosts = [str(h) for h in (summary.get("findability_hosts") or []) if h]
     branded = 0
     category = 0
     for report in per_sku_reports or []:
-        cov = report.get("query_class_coverage") or {}
+        if not isinstance(report, dict):
+            continue
+        cov = report.get("query_class_coverage")
+        cov = cov if isinstance(cov, dict) else {}
         branded += int(cov.get("branded_navigational") or 0)
         category += int(cov.get("category_discovery") or 0)
     if findability_hosts:
@@ -237,8 +270,12 @@ def _per_sku_scorecard(
             signals_by_sku[sku["sku_key"]] = sku.get("citation_signals") or {}
     out: List[Dict[str, Any]] = []
     for report in per_sku_reports or []:
-        band_display = report.get("band_display") or {}
-        primary_gaps = report.get("primary_gaps") or []
+        if not isinstance(report, dict):
+            continue
+        band_display = report.get("band_display")
+        band_display = band_display if isinstance(band_display, dict) else {}
+        primary_gaps = report.get("primary_gaps")
+        primary_gaps = primary_gaps if isinstance(primary_gaps, list) else []
         top_gap = primary_gaps[0] if primary_gaps else {}
         sig = signals_by_sku.get(report.get("sku_key"), {})
         out.append({
@@ -265,9 +302,12 @@ def _verify_plain(verify_summary: Optional[Dict[str, Any]]) -> Dict[str, Any]:
     verified = int(vs.get("verified") or 0)
     flagged = int(vs.get("flagged") or 0)
     candidates = int(vs.get("citation_positive_candidates") or 0)
-    checked = verified + flagged
+    # `verified` is the number of citations actually checked; `flagged` is a
+    # SUBSET of those (a checked citation DeepSeek flagged for accuracy). Do not
+    # add them — that double-counts and can report "checked" > candidates.
+    checked = verified
     if status in {"completed", "partial"} and checked:
-        held = checked - flagged
+        held = max(0, verified - flagged)
         accuracy = (
             "every checked citation held up"
             if flagged == 0
@@ -302,7 +342,10 @@ def _prioritized_actions(per_sku_reports: List[Dict[str, Any]]) -> List[Dict[str
     seen = set()
     actions: List[Dict[str, Any]] = []
     for report in per_sku_reports or []:
-        nba = report.get("next_best_action") or {}
+        if not isinstance(report, dict):
+            continue
+        nba = report.get("next_best_action")
+        nba = nba if isinstance(nba, dict) else {}
         headline = (nba.get("headline") or "").strip()
         if not headline:
             continue
