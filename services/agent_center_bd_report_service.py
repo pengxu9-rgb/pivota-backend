@@ -4886,6 +4886,124 @@ def _impact_proxy_from_context(sku_ctx: Dict[str, Any]) -> float:
     return round(float(price) * math.log(1 + max(1, len(offers))), 4)
 
 
+def _coerce_minted_at(value: Any) -> Optional[datetime]:
+    """Normalize a `pivota_signature_minted_at` cell (a tz-aware datetime from
+    Postgres, or an ISO string from a re-serialized row) to a datetime."""
+    if isinstance(value, datetime):
+        return value
+    if isinstance(value, str) and value.strip():
+        try:
+            return datetime.fromisoformat(value.strip().replace("Z", "+00:00"))
+        except ValueError:
+            return None
+    return None
+
+
+def _sku_indexing_arc(product: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+    """Per-SKU Google indexing-arc state for the SKU's Pivota canonical PDP
+    (issue #902 item 1, ported from the legacy `merchant_view`). Only emitted
+    when the SKU actually has a minted Pivota canonical signature — a SKU
+    audited solely on the merchant's own indexed URL has no canonical-PDP arc
+    to report (omitted rather than shown as a generic 'unknown'). Pure: defers
+    to `compute_indexing_arc_state`."""
+    if not isinstance(product, dict):
+        return None
+    has_canonical_pdp = bool(
+        product.get("pivota_signature_id") or product.get("pivota_canonical_url")
+    )
+    if not has_canonical_pdp:
+        return None
+    return compute_indexing_arc_state(
+        _coerce_minted_at(product.get("pivota_signature_minted_at"))
+    )
+
+
+def _brand_indexing_arc(per_sku_reports: List[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
+    """Brand rollup of the per-SKU indexing arcs (issue #902 item 1): how many
+    audited SKUs sit on freshly-minted Pivota canonical PDPs still inside
+    Google's 30-90 day indexing window — so a merchant reads zero category
+    citations there as indexing latency, not a content gap. None when no audited
+    SKU has a canonical-PDP arc (i.e. nothing honest to say about indexing)."""
+    arcs = [
+        r.get("indexing_arc")
+        for r in per_sku_reports or []
+        if isinstance(r, dict) and isinstance(r.get("indexing_arc"), dict)
+    ]
+    arcs = [a for a in arcs if a.get("phase") and a.get("phase") != "unknown"]
+    if not arcs:
+        return None
+    phase_counts: Dict[str, int] = {}
+    for a in arcs:
+        phase_counts[a["phase"]] = phase_counts.get(a["phase"], 0) + 1
+    still_indexing = phase_counts.get("fresh", 0) + phase_counts.get("indexing", 0)
+    dates = [a.get("expected_first_citation_at") for a in arcs if a.get("expected_first_citation_at")]
+    recheck = max(dates) if dates else None  # ISO 8601 sorts chronologically
+    if still_indexing:
+        recheck_date = (recheck or "")[:10]
+        caveat = (
+            f"{still_indexing} of {len(arcs)} audited "
+            f"{'product is' if still_indexing == 1 else 'products are'} on a "
+            "freshly-minted Pivota canonical PDP still inside Google's 30-90 day "
+            "indexing window — zero category citations there may reflect indexing "
+            "latency, not a content gap"
+            + (f". Re-audit on or after {recheck_date} to check progress." if recheck_date else ".")
+        )
+    else:
+        caveat = (
+            f"All {len(arcs)} audited products on Pivota canonical PDPs are past "
+            "the 90-day indexing window — zero category citations now points to "
+            "content/SEO, not indexing latency."
+        )
+    return {
+        "skus_on_canonical_pdp": len(arcs),
+        "phase_counts": phase_counts,
+        "skus_still_indexing": still_indexing,
+        "recheck_on_or_after": recheck,
+        "caveat": caveat,
+    }
+
+
+async def _per_sku_integration_block(
+    merchant_id: str,
+    integration_state: Optional[Dict[str, Any]] = None,
+) -> Optional[Dict[str, Any]]:
+    """Brand-level integration status + CTA for the per-SKU report (issue #902
+    item 2). Ports the legacy `merchant_view` integration/GSC action: surface
+    the 'Complete Pivota integration' action when store/PSP onboarding is
+    incomplete, else the 'Grant GSC access' CTA when Search Console isn't
+    connected yet — the only actionable GSC surface. Best-effort: fetches the
+    integration state when the caller didn't pass one (the per-SKU path
+    historically didn't)."""
+    state = integration_state
+    if state is None:
+        try:
+            from services.merchant_integration_state import get_integration_state
+            state = await get_integration_state(merchant_id)
+        except Exception:  # noqa: BLE001
+            logger.warning("per-sku integration state fetch failed", exc_info=True)
+            return None
+    if not isinstance(state, dict):
+        return None
+    from services.merchant_integration_state import build_integration_action
+
+    actions: List[Dict[str, Any]] = []
+    integ = build_integration_action(state)
+    if integ is not None:
+        # Store/PSP onboarding still incomplete — that's the higher-priority ask.
+        actions.append(integ)
+    elif not state.get("gsc_integrated"):
+        # Onboarded but Search Console not connected — the secondary GSC CTA.
+        from services.gsc_integration import build_gsc_integration_action
+        actions.append(build_gsc_integration_action())
+    return {
+        "gsc_integrated": bool(state.get("gsc_integrated")),
+        "store_platform_integrated": bool(state.get("store_platform_integrated")),
+        "psp_integrated": bool(state.get("psp_integrated")),
+        "fully_integrated": bool(state.get("fully_integrated")),
+        "actions": actions,
+    }
+
+
 async def build_per_sku_report(
     sku_key: str,
     merchant_id: str,
@@ -5021,6 +5139,9 @@ async def build_per_sku_report(
         "axis_coverage": _axis_coverage(probe_runs),
         "query_class_coverage": _query_class_coverage(probe_runs),
         "failing_prompts": failing_prompts,
+        # Issue #902 item 1: Google indexing-arc for this SKU's Pivota canonical
+        # PDP (None when the SKU has no minted canonical signature).
+        "indexing_arc": _sku_indexing_arc(product),
         "impact_proxy": _impact_proxy_from_context(sku_ctx),
         "provider_models": provider_models,
         "model_is_override": _any_model_override(provider_models),
@@ -8404,6 +8525,10 @@ async def run_brand_report(
         # Phase 2: surface the niche-targeting the per-SKU opportunity already
         # computes as a first-class "where you can win" strategy.
         brand_rollup["where_you_can_win"] = build_where_you_can_win(per_sku_reports)
+        # Issue #902 item 1: roll the per-SKU Google indexing arcs up to the
+        # brand, so a merchant reads zero category citations on freshly-minted
+        # Pivota canonical PDPs as indexing latency, not a content gap.
+        brand_rollup["indexing_arc"] = _brand_indexing_arc(per_sku_reports)
         # Phase 2 v2: record this audit's probed niche queries (compounds the
         # cross-merchant recurrence demand signal) and attach recurrence to the
         # winnable targets so the operator can rank by it. Best-effort.
@@ -8446,6 +8571,17 @@ async def run_brand_report(
                 brand_rollup["outcomes"] = _outcomes
         except Exception:  # noqa: BLE001
             logger.warning("outcomes summary failed", exc_info=True)
+        # Issue #902 item 2: brand-level integration status + GSC-connect CTA,
+        # ported from the legacy merchant_view (the per-SKU path never carried
+        # them). Best-effort: a lookup failure must not sink the report.
+        try:
+            _integration = await _per_sku_integration_block(
+                str(merchant_id), integration_state,
+            )
+            if _integration is not None:
+                brand_rollup["integration"] = _integration
+        except Exception:  # noqa: BLE001
+            logger.warning("per-sku integration block failed", exc_info=True)
         authority_map = build_authority_map(
             per_sku_reports,
             probe_runs_by_sku,
