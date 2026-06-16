@@ -376,6 +376,52 @@ def test_every_action_has_required_fields():
 
 
 # ---------------------------------------------------------------------
+# 5b. Creator-partnership levers are suppressed from merchant output
+# ---------------------------------------------------------------------
+
+
+def test_creator_partnership_levers_are_suppressed():
+    """A video/creator host that would match the creator_partnership_video
+    or creator_partnership_social playbook emits NO action — those levers
+    carry category-agnostic boilerplate + invented rate ranges and no real
+    creator data / contact path, so they're gated out of merchant output
+    (matching the matchmaker's surface-zero-rather-than-fabricate stance)."""
+    from services.audit_playbook_engine import select_playbooks
+    actions = select_playbooks(
+        cited_hosts_detailed=[
+            # creator_partnership_video (type=video, subtype=creator_platform)
+            _cited("youtube.com", type_="video", subtype="creator_platform"),
+            # creator_partnership_social (type=video, subtype=social)
+            _cited("tiktok.com", type_="video", subtype="social"),
+        ],
+        failed_queries_detailed=[],
+    )
+    assert all(a.get("lever") != "creator_partnership" for a in actions), (
+        f"creator_partnership actions must be suppressed, got: "
+        f"{[a.get('lever') for a in actions]}"
+    )
+    # Both hosts ONLY match creator playbooks, so nothing is emitted at all.
+    assert actions == []
+
+
+def test_non_creator_levers_still_emit_alongside_creator_hosts():
+    """Suppressing creator_partnership must not drop other hosts' actions —
+    a retailer host in the same batch still produces its action."""
+    from services.audit_playbook_engine import select_playbooks
+    actions = select_playbooks(
+        cited_hosts_detailed=[
+            _cited("youtube.com", type_="video", subtype="creator_platform"),
+            _cited("nordstrom.com", type_="retailer", subtype="department_store"),
+        ],
+        failed_queries_detailed=[],
+    )
+    levers = [a.get("lever") for a in actions]
+    assert "creator_partnership" not in levers
+    assert levers == ["wholesale_onboarding"]
+    assert actions[0]["target_host"] == "nordstrom.com"
+
+
+# ---------------------------------------------------------------------
 # 6. Resilience — missing / malformed playbook file
 # ---------------------------------------------------------------------
 

@@ -52,6 +52,20 @@ _SEVERITY_RANK = {"critical": 0, "high": 1, "medium": 2, "low": 3}
 _BLOCKED_GATEWAY_PRIORITY = 1e9
 
 
+# Levers whose playbook actions are suppressed from merchant output until
+# the data / contact path behind them is real. The `creator_partnership`
+# video + social playbooks (creator_partnership_video,
+# creator_partnership_social) render category-agnostic boilerplate with
+# invented rate ranges ("$50-500/video", "$200-2000/post") and no actual
+# creator data or outreach path behind them. That's the same gap that
+# keeps the creator *matchmaker* (services/creator_matcher.py →
+# build_creator_partnership_action) emitting nothing today: with no
+# mass creator-data access, outreach isn't executable, so we surface zero
+# rather than fabricate. Drop a lever from this set once its actions carry
+# real, executable creator data + a contact path.
+_SUPPRESSED_LEVERS = frozenset({"creator_partnership"})
+
+
 def _load_playbooks() -> Dict[str, Dict[str, Any]]:
     """Lazy-load the playbook registry on first call. Returns an empty
     dict on read/parse failure so the audit never crashes because BD
@@ -723,6 +737,13 @@ def select_playbooks(
         if not selection:
             continue
         pid, pb = selection
+
+        # Suppress levers whose actions have no real data / contact path
+        # behind them (e.g. creator_partnership — see _SUPPRESSED_LEVERS).
+        # These never reach the merchant `actions` array.
+        if (pb.get("lever") or "") in _SUPPRESSED_LEVERS:
+            continue
+
         timeline = pb.get("expected_timeline_weeks") or [0, 0]
         try:
             tl_low = int(timeline[0])
