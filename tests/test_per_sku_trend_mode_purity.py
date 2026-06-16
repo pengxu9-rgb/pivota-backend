@@ -4,6 +4,9 @@ mixing them renders a misleading delta."""
 
 from __future__ import annotations
 
+import json
+
+from db.merchant_audit_runs import _run_audit_mode
 from services.agent_center_bd_report_service import _per_sku_prior_runs
 
 
@@ -22,3 +25,19 @@ def test_filters_to_per_sku_only():
 def test_empty_and_none():
     assert _per_sku_prior_runs(None) == []
     assert _per_sku_prior_runs([]) == []
+
+
+def test_run_audit_mode_decodes_jsonb_string_prod_path():
+    payload = {"launch": {"audit_mode": "per_sku", "custom_prompts": []}}
+    # asyncpg returns JSONB as a JSON STRING, not a dict — must still resolve
+    # (reading .get() on the raw string would silently empty the whole trend).
+    assert _run_audit_mode(json.dumps(payload)) == "per_sku"
+    # dict path (in-memory test fake)
+    assert _run_audit_mode(payload) == "per_sku"
+
+
+def test_run_audit_mode_none_legacy_and_garbage():
+    assert _run_audit_mode(None) is None  # legacy run (no launch options)
+    assert _run_audit_mode(json.dumps({"launch": {}})) is None  # no audit_mode
+    assert _run_audit_mode("not-json") is None  # unparseable → not a dict
+    assert _run_audit_mode({"launch": "weird"}) is None  # launch not a dict

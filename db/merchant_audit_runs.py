@@ -433,6 +433,19 @@ async def count_runs_for_merchant_by_subject(
         return 0
 
 
+def _run_audit_mode(partial_result_jsonb: Any) -> Optional[str]:
+    """audit_mode (per_sku | legacy) from a run's launch options. MUST decode the
+    JSONB column first — asyncpg returns JSONB as a JSON STRING, not a dict (see
+    _decode_jsonb_field), so reading `.get("launch")` on the raw value raises on
+    prod → recent_runs_for_merchant's try/except swallows it → the whole history
+    collapses to empty and the per_sku trend goes blank (the PR #355 masking
+    pattern). Returns None for legacy / missing / unparseable."""
+    decoded = _decode_jsonb_field(partial_result_jsonb)
+    launch = decoded.get("launch") if isinstance(decoded, dict) else None
+    mode = launch.get("audit_mode") if isinstance(launch, dict) else None
+    return mode if isinstance(mode, str) else None
+
+
 async def recent_runs_for_merchant(
     *,
     merchant_id: str,
@@ -487,10 +500,9 @@ async def recent_runs_for_merchant(
             "subject_type": d.get("subject_type"),
             # audit_mode (per_sku | legacy) lives in the launch options; surface it
             # so trend builders can keep per_sku and legacy runs from mixing (their
-            # score columns have different semantics).
-            "audit_mode": (
-                ((d.get("partial_result_jsonb") or {}).get("launch") or {}).get("audit_mode")
-            ),
+            # score columns have different semantics). Decodes the JSONB column
+            # (asyncpg returns it as a string) — see _run_audit_mode.
+            "audit_mode": _run_audit_mode(d.get("partial_result_jsonb")),
             "product_keys": list(d.get("product_keys") or []),
             "verdict_labels": list(d.get("verdict_labels") or []),
             "visibility_score_avg": d.get("visibility_score_avg"),
