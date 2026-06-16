@@ -5226,6 +5226,20 @@ def _per_sku_run_aggregate(per_sku_reports: List[Dict[str, Any]]) -> Dict[str, A
     }
 
 
+def _per_sku_prior_runs(
+    prior_runs: Optional[List[Dict[str, Any]]],
+) -> List[Dict[str, Any]]:
+    """Only prior PER_SKU runs are comparable in a per_sku trend: per_sku and legacy
+    write different score semantics into the same score columns (per_sku
+    visibility = mean weakest-dimension; legacy = mean of one dimension), so mixing
+    them would render a misleading run-over-run delta. None/unknown audit_mode is
+    excluded conservatively (better no delta than a wrong one)."""
+    return [
+        r for r in (prior_runs or [])
+        if isinstance(r, dict) and r.get("audit_mode") == "per_sku"
+    ]
+
+
 def _fixability_for(dimension: str, bucket: Optional[str] = None) -> float:
     if dimension in {"identity", "content_richness", "routability"}:
         return 1.0
@@ -8705,8 +8719,10 @@ async def run_brand_report(
         # BrandRollupCover can read them. history is None on the first audit.
         run_scores = _per_sku_run_aggregate(per_sku_reports)
         brand_rollup["run_scores"] = run_scores
+        # Mode purity: compare only against prior per_sku runs (see _per_sku_prior_runs)
+        # so the delta isn't a misleading legacy-vs-per_sku comparison.
         history = _build_history_trend(
-            prior_runs,
+            _per_sku_prior_runs(prior_runs),
             current_scores={
                 "visibility": run_scores["avg_visibility"],
                 "attribution": run_scores["avg_attribution"],
