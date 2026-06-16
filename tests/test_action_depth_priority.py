@@ -83,7 +83,12 @@ def test_concrete_next_step_renders_template_placeholders():
     assert "nordstrom.com" in cns
 
 
-def test_concrete_next_step_for_youtube_creator_partnerships():
+def test_youtube_creator_partnership_action_is_suppressed():
+    # The creator_partnership_video playbook (youtube → creator_platform)
+    # renders category-agnostic boilerplate with invented rate ranges and
+    # no real creator data / contact path, so it's gated out of merchant
+    # output — same surface-zero-rather-than-fabricate stance as the
+    # creator matchmaker (services/creator_matcher.py). See _SUPPRESSED_LEVERS.
     from services.audit_playbook_engine import select_playbooks
     actions = select_playbooks(
         cited_hosts_detailed=[
@@ -96,9 +101,7 @@ def test_concrete_next_step_for_youtube_creator_partnerships():
         ],
         failed_queries_detailed=[],
     )
-    cns = actions[0]["concrete_next_step"]
-    # The youtube playbook tells merchant to find 3-5 mid-tier creators
-    assert "10k-100k" in cns or "mid-tier" in cns
+    assert actions == []
 
 
 def test_concrete_next_step_for_unclassified_host_says_research():
