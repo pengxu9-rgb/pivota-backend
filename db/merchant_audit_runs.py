@@ -485,6 +485,12 @@ async def recent_runs_for_merchant(
             ),
             "status": d.get("status"),
             "subject_type": d.get("subject_type"),
+            # audit_mode (per_sku | legacy) lives in the launch options; surface it
+            # so trend builders can keep per_sku and legacy runs from mixing (their
+            # score columns have different semantics).
+            "audit_mode": (
+                ((d.get("partial_result_jsonb") or {}).get("launch") or {}).get("audit_mode")
+            ),
             "product_keys": list(d.get("product_keys") or []),
             "verdict_labels": list(d.get("verdict_labels") or []),
             "visibility_score_avg": d.get("visibility_score_avg"),
