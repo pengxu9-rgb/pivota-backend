@@ -437,21 +437,29 @@ async def recent_runs_for_merchant(
     *,
     merchant_id: str,
     limit: int = 5,
+    subject_type: Optional[str] = None,
 ) -> List[Dict[str, Any]]:
     """Return the most recent audit runs (any status) for this
     merchant, newest first. Used by `GET /audit/history` and
     `merchant_view.tracking` trend deltas.
+
+    `subject_type` (optional) scopes to one run kind — e.g. "merchant"
+    (per-SKU catalog audits) or "merchant_url" (the free URL-visibility
+    wedge) — so each history surface lists only the runs it can open.
+    Omitted → all kinds (back-compat).
 
     Returns trend-friendly fields only (no full report_jsonb); the
     full report is fetched separately by run_id when needed.
     """
     await ensure_merchant_audit_runs_table()
     try:
+        query = merchant_audit_runs.select().where(
+            merchant_audit_runs.c.merchant_id == merchant_id
+        )
+        if subject_type:
+            query = query.where(merchant_audit_runs.c.subject_type == subject_type)
         rows = await database.fetch_all(
-            merchant_audit_runs.select()
-            .where(merchant_audit_runs.c.merchant_id == merchant_id)
-            .order_by(merchant_audit_runs.c.requested_at.desc())
-            .limit(limit)
+            query.order_by(merchant_audit_runs.c.requested_at.desc()).limit(limit)
         )
     except Exception as exc:
         logger.warning(
@@ -476,6 +484,7 @@ async def recent_runs_for_merchant(
                 else None
             ),
             "status": d.get("status"),
+            "subject_type": d.get("subject_type"),
             "product_keys": list(d.get("product_keys") or []),
             "verdict_labels": list(d.get("verdict_labels") or []),
             "visibility_score_avg": d.get("visibility_score_avg"),
