@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import logging
 import os
 from typing import Any, Dict, Optional
 
@@ -33,6 +34,8 @@ from utils.auth import get_current_user
 
 
 router = APIRouter(prefix="/merchant/pdps", tags=["merchant-pdp-governance"])
+
+logger = logging.getLogger(__name__)
 
 
 class MerchantContributionRequest(BaseModel):
@@ -161,11 +164,62 @@ async def submit_product_evidence(
         parse_product_key(product_key)
         from services.supplier_evidence_intake import ingest_supplier_evidence
 
-        return await ingest_supplier_evidence(
+        out = await ingest_supplier_evidence(
             product_key, raw_inci=body.raw_inci, brand_url=body.brand_url
         )
+        # Record a successful Pivota-page evidence submission as a completed task,
+        # so the merchant's action lands in the one unified Action plan (the task
+        # queue is the single source of truth for "what to do" / "what's done").
+        # Best-effort: the evidence is already saved regardless of the task.
+        await _record_evidence_task(merchant_id, platform_product_id, out)
+        return out
     except Exception as exc:
         raise _map_error(exc)
+
+
+async def _record_evidence_task(merchant_id: str, label: str, out: Any) -> None:
+    """Record a successful supplier-evidence submission as a COMPLETED
+    `merchant_tasks` row so it shows in the merchant's single Action plan / task
+    queue. Only on a real grade (status 'ok' + >=1 substantiated claim) — attempts
+    that produced nothing don't pollute the queue. Never raises (the evidence is
+    already persisted). Reuses the same task path as the niche-content flow; no
+    new store. Note: one done row per successful submit (re-submits are real
+    events) — add evidence_jsonb.product_key dedup later if the queue gets noisy."""
+    try:
+        if not isinstance(out, dict) or str(out.get("status")) != "ok":
+            return
+        claims = out.get("substantiated_claims")
+        if not isinstance(claims, list) or not claims:
+            return
+        from db.merchant_tasks import record_task_created, update_task_status
+
+        n = len(claims)
+        task_id = await record_task_created(
+            merchant_id=merchant_id,
+            title=f"Add Pivota-page evidence for: {label}",
+            body=(
+                f"Submitted ingredient evidence → {n} cited "
+                f"claim{'' if n == 1 else 's'} now on your Pivota page."
+            ),
+            severity="medium",
+            lever="sku_evidence",
+            assigned_to_agent="supplier_evidence",
+            evidence={
+                "kind": "sku_evidence",
+                "product_key": out.get("product_key"),
+                "content_key": out.get("content_key"),
+                "served": out.get("served"),
+                "substantiated_claims": claims[:10],
+            },
+        )
+        if task_id:
+            await update_task_status(task_id=task_id, status="done")
+    except Exception as exc:  # noqa: BLE001
+        logger.warning(
+            "evidence task record failed for merchant=%s: %s",
+            merchant_id,
+            str(exc)[:200],
+        )
 
 
 class MerchantApproveRequest(BaseModel):
