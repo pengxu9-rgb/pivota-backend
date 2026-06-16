@@ -5240,6 +5240,19 @@ def _per_sku_prior_runs(
     ]
 
 
+def _legacy_prior_runs(
+    prior_runs: Optional[List[Dict[str, Any]]],
+) -> List[Dict[str, Any]]:
+    """The legacy-trend counterpart to _per_sku_prior_runs: exclude per_sku priors
+    from a legacy run's trend. Legacy runs are untagged (audit_mode None); per_sku
+    is the only explicitly-tagged mode, so "not per_sku" keeps legacy priors while
+    dropping per_sku runs whose different score semantics would skew the delta."""
+    return [
+        r for r in (prior_runs or [])
+        if isinstance(r, dict) and r.get("audit_mode") != "per_sku"
+    ]
+
+
 def _fixability_for(dimension: str, bucket: Optional[str] = None) -> float:
     if dimension in {"identity", "content_richness", "routability"}:
         return 1.0
@@ -8717,19 +8730,26 @@ async def run_brand_report(
         # + the run-over-run history the FE renders. Reuses _build_history_trend —
         # no new trend math, no per-SKU history table. Both ride on brand_rollup so
         # BrandRollupCover can read them. history is None on the first audit.
-        run_scores = _per_sku_run_aggregate(per_sku_reports)
-        brand_rollup["run_scores"] = run_scores
-        # Mode purity: compare only against prior per_sku runs (see _per_sku_prior_runs)
-        # so the delta isn't a misleading legacy-vs-per_sku comparison.
-        history = _build_history_trend(
-            _per_sku_prior_runs(prior_runs),
-            current_scores={
-                "visibility": run_scores["avg_visibility"],
-                "attribution": run_scores["avg_attribution"],
-                "category_visibility": run_scores["avg_category_visibility"],
-            },
-        )
-        brand_rollup["tracking"] = {"history": history} if history else None
+        # Best-effort like the win_plan / merchant_narrative siblings above: a
+        # malformed prior_run must never sink the whole per_sku report.
+        try:
+            run_scores = _per_sku_run_aggregate(per_sku_reports)
+            brand_rollup["run_scores"] = run_scores
+            # Mode purity: compare only against prior per_sku runs (see
+            # _per_sku_prior_runs) so the delta isn't a misleading legacy-vs-per_sku
+            # comparison.
+            history = _build_history_trend(
+                _per_sku_prior_runs(prior_runs),
+                current_scores={
+                    "visibility": run_scores["avg_visibility"],
+                    "attribution": run_scores["avg_attribution"],
+                    "category_visibility": run_scores["avg_category_visibility"],
+                },
+            )
+            brand_rollup["tracking"] = {"history": history} if history else None
+        except Exception:  # noqa: BLE001
+            logger.warning("per_sku trend attach failed", exc_info=True)
+            brand_rollup["tracking"] = None
         return {
             "audit_run_id": audit_run_id,
             "merchant_id": str(merchant_id),
@@ -8837,7 +8857,9 @@ async def run_brand_report(
                 # Same merchant-level history is duplicated to each
                 # per-product report so the frontend doesn't have to
                 # join across products + audit history separately.
-                prior_runs=prior_runs,
+                # Mode purity (symmetric to per_sku): exclude per_sku priors so a
+                # legacy delta isn't computed against per_sku score semantics.
+                prior_runs=_legacy_prior_runs(prior_runs),
                 # PR-D: per-product mint timestamp — when this row's
                 # Pivota canonical sig was first created. Drives
                 # merchant_view.diagnosis.indexing_arc_state's real
@@ -8881,7 +8903,7 @@ async def run_brand_report(
             await _attach_reaudit_delta(
                 structured,
                 merchant_id=merchant_id,
-                prior_runs=prior_runs,
+                prior_runs=_legacy_prior_runs(prior_runs),
             )
             return ("ok", structured)
         except Exception as exc:  # noqa: BLE001 — per-product isolation

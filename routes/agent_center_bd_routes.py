@@ -1193,6 +1193,9 @@ async def bd_list_tasks(
         status_filter=statuses,
         limit=limit,
         parent_audit_run_id=scoped_parent_audit_run_id,
+        # Mirror the merchant route: on the latest-completed view also surface
+        # standing non-audit tasks (NULL parent_audit_run_id).
+        include_unscoped=(tasks_scope == "latest_completed"),
     )
     return {
         "merchant_id": merchant_id,

@@ -29,6 +29,7 @@ from sqlalchemy import (
     Index,
     Table,
     Text,
+    or_,
 )
 from sqlalchemy.dialects.postgresql import JSONB, UUID
 
@@ -346,11 +347,19 @@ async def list_tasks_for_merchant(
     status_filter: Optional[List[str]] = None,
     limit: int = 50,
     parent_audit_run_id: Optional[str] = None,
+    include_unscoped: bool = False,
 ) -> List[Dict[str, Any]]:
     """List tasks for a merchant, newest first. Default filters to
     open work (`pending` + `in_progress`); pass empty list for all
     statuses, or pass `['superseded']` to view the audit trail of
-    tasks displaced by newer audit runs (Q-P0-2)."""
+    tasks displaced by newer audit runs (Q-P0-2).
+
+    When scoping to a run (`parent_audit_run_id`), `include_unscoped=True`
+    ALSO returns standing tasks with a NULL parent_audit_run_id — the
+    non-audit tasks (sku_evidence, niche_content) not tied to any run.
+    Without it, `parent_audit_run_id == X` silently drops them (SQL
+    `NULL = X` is never true), so a merchant's own actions would never
+    appear in their Action plan."""
     await ensure_merchant_tasks_table()
     if status_filter is None:
         # Default queue: open work only. `superseded` is excluded
@@ -366,9 +375,17 @@ async def list_tasks_for_merchant(
             merchant_tasks.c.merchant_id == merchant_id
         )
         if parent_audit_run_id is not None:
-            q = q.where(
-                merchant_tasks.c.parent_audit_run_id == parent_audit_run_id
-            )
+            if include_unscoped:
+                q = q.where(
+                    or_(
+                        merchant_tasks.c.parent_audit_run_id == parent_audit_run_id,
+                        merchant_tasks.c.parent_audit_run_id.is_(None),
+                    )
+                )
+            else:
+                q = q.where(
+                    merchant_tasks.c.parent_audit_run_id == parent_audit_run_id
+                )
         if status_filter:
             q = q.where(merchant_tasks.c.status.in_(status_filter))
         q = q.order_by(merchant_tasks.c.created_at.desc()).limit(limit)
