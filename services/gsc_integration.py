@@ -696,7 +696,12 @@ async def _get_pivota_access_token(
     if not access:
         logger.error("gsc pivota: no access_token in token response")
         return None
-    expires_in = int(body.get("expires_in") or 3600)
+    # Defensive: honor the "returns None on any failure" contract even if
+    # Google ever sends a non-numeric expires_in (it always sends an int).
+    try:
+        expires_in = int(body.get("expires_in") or 3600)
+    except (TypeError, ValueError):
+        expires_in = 3600
     _pivota_token_cache[scope] = (
         access, now + timedelta(seconds=expires_in),
     )
@@ -708,10 +713,16 @@ async def submit_pivota_canonical_url(
     *,
     merchant_id: str,
     audit_run_id: Optional[str] = None,
+    access_token: Optional[str] = None,
 ) -> Dict[str, Any]:
     """Submit a Pivota canonical PDP URL to Google's Indexing API under
     the Pivota-owned credential. `merchant_id` is kept for attribution
     (it's the gsc_url_submissions row key), NOT for auth.
+
+    Pass `access_token` to reuse a token already minted by the caller — the
+    batch helper mints once and threads it in so a fan-out makes ONE token
+    exchange, not N (Google's token-endpoint quota, ADR-006 open-question #4).
+    When omitted, mint (or reuse the cached) token here.
 
     Mirrors submit_url_to_gsc's return shape:
       {status: 'submitted' | 'error', message, last_status, last_status_at}
@@ -719,7 +730,8 @@ async def submit_pivota_canonical_url(
     returned, never raised.
     """
     _require_pivota_enabled()
-    access_token = await _get_pivota_access_token()
+    if access_token is None:
+        access_token = await _get_pivota_access_token()
     if access_token is None:
         raise GscNotConfiguredError(
             "Could not mint a Pivota service-account access token "
@@ -854,10 +866,26 @@ async def submit_pivota_canonical_urls(
     if not unique_urls:
         return []
 
+    # Mint ONCE up front and thread the token into every submit, so a batch
+    # fan-out makes a single token exchange (quota), not one per URL. None
+    # here means the credential is misconfigured — every URL would fail the
+    # same way, so short-circuit with an error result per URL.
+    try:
+        token = await _get_pivota_access_token()
+    except Exception as exc:  # noqa: BLE001
+        token = None
+        logger.warning("gsc pivota batch: token mint raised: %s", exc)
+    if token is None:
+        return [
+            {"status": "error", "url": u, "message": "no Pivota access token"}
+            for u in unique_urls
+        ]
+
     async def _safe_submit(u: str) -> Dict[str, Any]:
         try:
             return await submit_pivota_canonical_url(
                 u, merchant_id=merchant_id, audit_run_id=audit_run_id,
+                access_token=token,
             )
         except Exception as exc:  # noqa: BLE001
             logger.warning(

@@ -195,17 +195,53 @@ async def test_batch_dedupes_and_submits(monkeypatch):
     _enable_pivota(monkeypatch)
     submitted = []
 
-    async def _fake_submit(url, *, merchant_id, audit_run_id=None):
+    async def _fake_submit(url, *, merchant_id, audit_run_id=None, access_token=None):
         submitted.append(url)
         return {"status": "submitted", "url": url}
 
-    with patch.object(mod, "submit_pivota_canonical_url", AsyncMock(side_effect=_fake_submit)):
+    with patch.object(mod, "_get_pivota_access_token", AsyncMock(return_value="tok")), \
+         patch.object(mod, "submit_pivota_canonical_url", AsyncMock(side_effect=_fake_submit)):
         out = await mod.submit_pivota_canonical_urls(
             merchant_id="m1",
             urls=["https://a/sig_1", "https://a/sig_1", "https://a/sig_2", "", None],
         )
     assert sorted(submitted) == ["https://a/sig_1", "https://a/sig_2"]
     assert len(out) == 2
+
+
+@pytest.mark.asyncio
+async def test_batch_mints_token_once_for_whole_fan_out(monkeypatch):
+    """Cold cache + N URLs must trigger exactly ONE token exchange, not N
+    (ADR-006 open-question #4: token-endpoint quota)."""
+    _enable_pivota(monkeypatch, sa_json=_rsa_service_account_json())
+    counter = {"n": 0}
+    token_resp = _FakeResp(200, {"access_token": "ya29.fake", "expires_in": 3599})
+
+    async def _fake_publish(access_token, url):
+        assert access_token == "ya29.fake"  # the threaded, pre-minted token
+        return (200, "{}")
+
+    with patch("httpx.AsyncClient", lambda *a, **k: _FakeClient(token_resp, counter=counter)), \
+         patch.object(mod, "_indexing_api_publish", AsyncMock(side_effect=_fake_publish)), \
+         patch.object(mod, "_upsert_url_submission", AsyncMock()):
+        out = await mod.submit_pivota_canonical_urls(
+            merchant_id="m1",
+            urls=["https://a/sig_1", "https://a/sig_2", "https://a/sig_3"],
+        )
+    assert len(out) == 3
+    assert all(r["status"] == "submitted" for r in out)
+    assert counter["n"] == 1  # one token exchange for the whole batch
+
+
+@pytest.mark.asyncio
+async def test_batch_all_error_when_token_unavailable(monkeypatch):
+    _enable_pivota(monkeypatch)
+    with patch.object(mod, "_get_pivota_access_token", AsyncMock(return_value=None)):
+        out = await mod.submit_pivota_canonical_urls(
+            merchant_id="m1", urls=["https://a/sig_1", "https://a/sig_2"],
+        )
+    assert len(out) == 2
+    assert all(r["status"] == "error" for r in out)
 
 
 # ---- JWT-bearer token exchange ---------------------------------------------
@@ -248,3 +284,20 @@ async def test_token_is_cached_between_calls(monkeypatch):
 async def test_token_returns_none_on_bad_json(monkeypatch):
     _enable_pivota(monkeypatch, sa_json="not json{")
     assert await mod._get_pivota_access_token() is None
+
+
+@pytest.mark.asyncio
+async def test_no_secret_leak_in_logs_on_token_exchange_failure(monkeypatch, caplog):
+    """A failed token exchange must not log the signed JWT assertion or the
+    service-account private key — only Google's (token-free) error body."""
+    _enable_pivota(monkeypatch, sa_json=_rsa_service_account_json())
+    # Google rejects with a typical error body that carries NO token.
+    resp = _FakeResp(400, text='{"error":"invalid_grant"}')
+    with caplog.at_level("ERROR"), \
+         patch("httpx.AsyncClient", lambda *a, **k: _FakeClient(resp)):
+        out = await mod._get_pivota_access_token()
+    assert out is None
+    logged = "\n".join(r.getMessage() for r in caplog.records)
+    assert "PRIVATE KEY" not in logged          # no PEM body
+    assert "eyJ" not in logged                   # no JWT assertion (base64 'eyJ...')
+    assert "invalid_grant" in logged             # but the safe error IS logged
