@@ -5199,6 +5199,33 @@ def _overall_score(report: Dict[str, Any]) -> int:
     return min(values) if values else 0
 
 
+def _per_sku_run_aggregate(per_sku_reports: List[Dict[str, Any]]) -> Dict[str, Any]:
+    """Run-level scores for a per_sku audit, so the run persists non-NULL score
+    columns and the run-over-run trend works (it was permanently empty because the
+    finalize path read the legacy-only `aggregate` key, absent on per_sku runs).
+    per_sku-specific semantics, documented so the numbers stay honest:
+      - avg_visibility  = mean per-SKU _overall_score (the headline "AI-readiness"
+                          number; _overall_score = the SKU's weakest dimension).
+      - avg_attribution = mean per-SKU citation-dimension score (attribution ≈
+                          getting cited — a clean match to the column's intent).
+      - avg_category_visibility = None (no category-visibility dimension in per_sku).
+    Comparable across per_sku runs only; do NOT mix with legacy runs in one trend."""
+    reports = [r for r in (per_sku_reports or []) if isinstance(r, dict)]
+    overalls = [_overall_score(r) for r in reports]
+    citations = [
+        int((r.get("scores") or {}).get("citation", {}).get("score"))
+        for r in reports
+        if (r.get("scores") or {}).get("citation", {}).get("score") is not None
+    ]
+    return {
+        "avg_visibility": round(sum(overalls) / len(overalls), 2) if overalls else None,
+        "avg_attribution": round(sum(citations) / len(citations), 2) if citations else None,
+        "avg_category_visibility": None,
+        "products_succeeded": len(reports),
+        "products_failed": 0,
+    }
+
+
 def _fixability_for(dimension: str, bucket: Optional[str] = None) -> float:
     if dimension in {"identity", "content_richness", "routability"}:
         return 1.0
@@ -8671,6 +8698,22 @@ async def run_brand_report(
         except Exception:  # noqa: BLE001
             logger.warning("merchant_narrative build failed", exc_info=True)
             merchant_narrative = None
+        # Step 3 (performance-over-time): run-level scores (so the finalize path
+        # persists non-NULL columns instead of leaving the trend permanently empty)
+        # + the run-over-run history the FE renders. Reuses _build_history_trend —
+        # no new trend math, no per-SKU history table. Both ride on brand_rollup so
+        # BrandRollupCover can read them. history is None on the first audit.
+        run_scores = _per_sku_run_aggregate(per_sku_reports)
+        brand_rollup["run_scores"] = run_scores
+        history = _build_history_trend(
+            prior_runs,
+            current_scores={
+                "visibility": run_scores["avg_visibility"],
+                "attribution": run_scores["avg_attribution"],
+                "category_visibility": run_scores["avg_category_visibility"],
+            },
+        )
+        brand_rollup["tracking"] = {"history": history} if history else None
         return {
             "audit_run_id": audit_run_id,
             "merchant_id": str(merchant_id),

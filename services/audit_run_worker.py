@@ -1379,16 +1379,25 @@ async def _record_final_report_fields(
             ((p.get("verdict") or {}).get("label") or "")
             for p in per_product
         ]
+        # per_sku runs carry no legacy `aggregate`; their run-level scores live on
+        # brand_rollup.run_scores (set in run_brand_report). Fall back to those so
+        # the score columns aren't NULL and the run-over-run trend works. Legacy
+        # runs keep using `aggregate` unchanged.
+        run_scores = (brand_report.get("brand_rollup") or {}).get("run_scores") or {}
         await record_audit_run_completed(
             run_id=run_id,
             # transition_stage flips status='succeeded' itself; passing
             # it here too is harmless and mirrors the legacy contract.
             status="succeeded",
             verdict_labels=[v for v in verdict_labels if v],
-            visibility_score_avg=aggregate.get("avg_visibility"),
-            attribution_score_avg=aggregate.get("avg_attribution"),
+            visibility_score_avg=aggregate.get(
+                "avg_visibility", run_scores.get("avg_visibility"),
+            ),
+            attribution_score_avg=aggregate.get(
+                "avg_attribution", run_scores.get("avg_attribution"),
+            ),
             category_visibility_score_avg=aggregate.get(
-                "avg_category_visibility",
+                "avg_category_visibility", run_scores.get("avg_category_visibility"),
             ),
             audited_via_pivota_canonical=pivota_url_used,
             report_jsonb=brand_report,
