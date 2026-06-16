@@ -40,6 +40,7 @@ renders cleanly without the missing section, no crashes.
 
 from __future__ import annotations
 
+from urllib.parse import quote
 from typing import Any, Dict, List, Mapping, Optional
 
 from services.deliverability_report_view import build_deliverability_render_view
@@ -348,10 +349,19 @@ def _render_recommendations(action_items: Optional[List[Dict[str, Any]]]) -> str
         if isinstance(pitch_draft, dict) and pitch_draft.get("body"):
             recipient = pitch_draft.get("recipient_email") or ""
             subject = pitch_draft.get("subject") or ""
+            body = pitch_draft["body"]
             out.append(f"**Suggested outreach** (recipient: `{recipient}`):\n\n")
+            # A real recipient turns the "one-click" claim into a genuine
+            # mailto: link prefilled with subject + body. Only emit it when
+            # there's a recipient — never a broken/empty mailto.
+            mailto = _mailto_href(recipient, subject, body)
+            if mailto:
+                out.append(
+                    f"[✉ Open prefilled email to {recipient}]({mailto})\n\n"
+                )
             if subject:
                 out.append(f"> **Subject:** {subject}\n>\n")
-            for line in pitch_draft["body"].split("\n"):
+            for line in body.split("\n"):
                 out.append(f"> {line}\n")
             out.append("\n")
     return "".join(out)
@@ -380,6 +390,28 @@ def _table_cell(value: Any) -> str:
 
 
 _HANDOFF_LABEL_FALLBACK = "Open buyable Pivota product page"
+
+
+def _mailto_href(recipient: Any, subject: Any, body: Any) -> str:
+    """Build a `mailto:` URL prefilled with the pitch subject + body. Returns
+    "" when there's no recipient, so callers never emit a broken/empty
+    mailto. subject/body are fully percent-encoded (safe="") so any `)` in the
+    body can't break the surrounding `[label](url)` markdown link; spaces stay
+    %20 (quote, not quote_plus) so mail clients render them literally."""
+    addr = str(recipient or "").strip()
+    if not addr:
+        return ""
+    params = []
+    subj = str(subject or "").strip()
+    if subj:
+        params.append("subject=" + quote(subj, safe=""))
+    text = str(body or "")
+    if text:
+        params.append("body=" + quote(text, safe=""))
+    href = "mailto:" + quote(addr, safe="@.")
+    if params:
+        href += "?" + "&".join(params)
+    return href
 
 
 def _markdown_http_link(label: Any, url: Any) -> str:

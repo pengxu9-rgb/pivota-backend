@@ -39,6 +39,7 @@ from __future__ import annotations
 
 import html
 import logging
+from urllib.parse import quote
 from typing import Any, Dict, List, Mapping, Optional
 
 from services.deliverability_report_view import build_deliverability_render_view
@@ -87,6 +88,28 @@ def _escape_attr(text: Any) -> str:
     if text is None:
         return ""
     return html.escape(str(text), quote=True)
+
+
+def _mailto_href(recipient: Any, subject: Any, body: Any) -> str:
+    """Build a `mailto:` URL that opens the mail client prefilled with the
+    pitch subject + body. Returns "" when there's no recipient, so callers
+    never emit a broken/empty mailto. subject/body are percent-encoded as
+    query params (spaces as %20 via quote, not + via quote_plus, which mail
+    clients render literally)."""
+    addr = str(recipient or "").strip()
+    if not addr:
+        return ""
+    params = []
+    subj = str(subject or "").strip()
+    if subj:
+        params.append("subject=" + quote(subj, safe=""))
+    text = str(body or "")
+    if text:
+        params.append("body=" + quote(text, safe=""))
+    href = "mailto:" + quote(addr, safe="@.")
+    if params:
+        href += "?" + "&".join(params)
+    return href
 
 
 _HANDOFF_LABEL_FALLBACK = "Open buyable Pivota product page"
@@ -188,6 +211,16 @@ def _print_styles() -> str:
     background: #eff6ff;
     color: #1e3a5f;
     font-size: 10pt;
+  }
+  a.pitch-mailto {
+    display: inline-block;
+    padding: 6px 12px;
+    background: #2563eb;
+    color: #ffffff;
+    text-decoration: none;
+    border-radius: 4px;
+    font-size: 10pt;
+    font-weight: 600;
   }
   code {
     background: #f1f5f9;
@@ -530,14 +563,25 @@ def _render_recommendations_html(action_items: Optional[List[Dict[str, Any]]]) -
         if isinstance(pitch_draft, dict) and pitch_draft.get("body"):
             recipient = pitch_draft.get("recipient_email") or ""
             subject = pitch_draft.get("subject") or ""
+            body = pitch_draft["body"]
             out.append(
                 f'<p><strong>Suggested outreach</strong> (recipient: '
                 f"<code>{_escape(recipient)}</code>):</p>\n"
             )
+            # A real recipient email turns the "one-click" claim into a genuine
+            # mailto: link that opens the merchant's mail client prefilled with
+            # the subject + body. Only emit it when we actually have a
+            # recipient — never a broken/empty mailto.
+            mailto = _mailto_href(recipient, subject, body)
+            if mailto:
+                out.append(
+                    f'<p><a class="pitch-mailto" href="{_escape_attr(mailto)}">'
+                    f"&#9993; Open prefilled email to {_escape(recipient)}</a></p>\n"
+                )
             out.append("<blockquote>")
             if subject:
                 out.append(f"<strong>Subject:</strong> {_escape(subject)}<br><br>")
-            out.append(_escape(pitch_draft["body"]).replace("\n", "<br>"))
+            out.append(_escape(body).replace("\n", "<br>"))
             out.append("</blockquote>\n")
         out.append("</div>\n")
     return "".join(out)
