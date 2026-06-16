@@ -330,6 +330,13 @@ def build_pitch_draft_for_host(
     if not selection:
         return None
     _pid, pb = selection
+    # Defense in depth: suppressed levers (e.g. creator_partnership) must not
+    # emit a one-click pitch draft either. Today this is moot — the creator
+    # playbooks carry no pitch_template, so we'd return None below anyway — but
+    # gating here keeps select_playbooks() and this seam consistent if a
+    # pitch_template is ever added. See _SUPPRESSED_LEVERS.
+    if (pb.get("lever") or "") in _SUPPRESSED_LEVERS:
+        return None
     timeline = pb.get("expected_timeline_weeks") or [0, 0]
     try:
         tl_low, tl_high = int(timeline[0]), int(timeline[1])
