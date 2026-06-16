@@ -277,6 +277,30 @@ def json_dumps_lower(value: Any) -> str:
     return json.dumps(value, sort_keys=True, default=str).lower()
 
 
+def test_free_plan_with_credits_runs_premium_no_paywall(client, stub):
+    # ADR-005: premium providers (ChatGPT/Claude) are gated by credit BALANCE,
+    # not plan tier. A free-plan merchant with enough credits can run them — the
+    # old `premium_provider_subscription_required` paywall was removed. (Plenty
+    # of credits so the only thing that could block is the deleted plan-gate.)
+    stub.balance = {
+        **stub.balance,
+        "plan_tier": "free",
+        "credits": 1_000_000,
+        "allowance_credits": 0,
+        "purchased_credits": 1_000_000,
+    }
+    res = client.post(
+        "/api/audits",
+        json={
+            "merchant_id": "merch-A",
+            "product_keys": ["pk-1", "pk-2"],
+            "providers": ["gemini", "chatgpt"],
+        },
+    )
+    assert res.status_code == 202, res.text
+    assert "premium_provider_subscription_required" not in res.text
+
+
 def test_post_enqueues_and_returns_202(client, stub):
     res = client.post(
         "/api/audits",

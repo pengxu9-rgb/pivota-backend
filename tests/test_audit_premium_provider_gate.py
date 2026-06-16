@@ -1,19 +1,19 @@
-"""Premium-provider paywall for agent-center audits.
+"""Premium-provider labeling helpers.
 
-Tiered model: free accounts run Gemini only; ChatGPT/Claude require a paid plan.
-A free account that requests a premium provider must get a 402 (subscribe), not
-a silent downgrade. Tests the pure helpers + the route's block decision.
+ADR-005: premium providers (ChatGPT/Claude) are gated by credit BALANCE, not
+plan tier — the `_maybe_premium_block` plan-gate was removed. `premium_providers`
+/ `premium_providers_requested` now only *label* the higher-cost providers (for
+the cost preview + portal); they no longer gate access. These tests cover that
+labeling. The balance-gated launch behavior is covered in
+test_phase2_audit_runs_endpoints.py.
 """
 
 from __future__ import annotations
-
-from fastapi import HTTPException
 
 from services.coverage_profiles import (
     premium_providers,
     premium_providers_requested,
 )
-from routes.audit_runs_routes import _maybe_premium_block
 
 
 # --- premium_providers / premium_providers_requested (pure) ----------------
@@ -40,37 +40,3 @@ def test_requested_premium_detects_chatgpt_and_claude():
 
 def test_requested_premium_normalizes_case_and_dedupes():
     assert premium_providers_requested(["ChatGPT", "chatgpt", " GEMINI "]) == ["chatgpt"]
-
-
-# --- _maybe_premium_block (route decision) ---------------------------------
-
-def test_no_block_for_gemini_only_free_account():
-    assert _maybe_premium_block(
-        paid_tier=False, providers=["gemini"], verify_providers=["deepseek"],
-    ) is None
-
-
-def test_no_block_for_paid_account_even_with_premium():
-    assert _maybe_premium_block(
-        paid_tier=True, providers=["gemini", "chatgpt"], verify_providers=[],
-    ) is None
-
-
-def test_block_free_account_requesting_chatgpt():
-    block = _maybe_premium_block(
-        paid_tier=False, providers=["gemini", "chatgpt"], verify_providers=[],
-    )
-    assert isinstance(block, HTTPException)
-    assert block.status_code == 402
-    assert block.detail["code"] == "premium_provider_subscription_required"
-    assert block.detail["premium_providers_requested"] == ["chatgpt"]
-    assert block.detail["free_alternative_provider"] == "gemini"
-
-
-def test_block_free_account_when_premium_only_in_verify_providers():
-    block = _maybe_premium_block(
-        paid_tier=False, providers=["gemini"], verify_providers=["claude"],
-    )
-    assert isinstance(block, HTTPException)
-    assert block.status_code == 402
-    assert block.detail["premium_providers_requested"] == ["claude"]

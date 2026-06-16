@@ -1006,9 +1006,9 @@ class MerchantUrlAuditRequest(BaseModel):
     product_urls: List[str] = Field(
         ...,
         min_length=1,
-        max_length=5,
+        max_length=3,
         description=(
-            "1–5 product page URLs the merchant wants audited (their hero "
+            "1–3 product page URLs the merchant wants audited (their hero "
             "SKUs). We fetch each for clean title / vendor / type data."
         ),
     )
@@ -1157,7 +1157,7 @@ async def run_merchant_url_audit(
     merchant_id: str = Depends(get_current_merchant),
 ) -> Dict[str, Any]:
     """Free URL-audit wedge (Tier 1), merchant-CURATED + ASYNC. The merchant
-    gives us their brand site + up to 5 product URLs (their own hero SKUs); we
+    gives us their brand site + up to 3 product URLs (their own hero SKUs); we
     FETCH each for clean, real data and audit exactly those — NO catalog sync,
     NO auto-discovery.
 

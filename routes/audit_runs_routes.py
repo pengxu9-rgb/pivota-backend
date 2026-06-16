@@ -67,7 +67,6 @@ from services.merchant_credit_balance_service import (
 )
 from services.coverage_profiles import (
     default_coverage_profile,
-    premium_providers_requested,
     resolve_coverage_profile,
     resolve_provider_models,
 )
@@ -408,40 +407,12 @@ async def _enforce_audit_readiness(
     )
 
 
-def _maybe_premium_block(
-    *,
-    paid_tier: bool,
-    providers: List[str],
-    verify_providers: List[str],
-) -> Optional[HTTPException]:
-    """Return a 402 when a free account requests a premium provider, else None.
-
-    Tiered audit model: free accounts run Gemini only; ChatGPT/Claude require a
-    paid plan. We refuse (402) rather than silently downgrade to Gemini, so the
-    merchant's explicit model choice is honored or clearly told to subscribe —
-    the UI surfaces this as a paywall. No-op for paid accounts or Gemini/
-    DeepSeek-only runs. Pure/synchronous so it's unit-testable without the DB.
-    """
-    if paid_tier:
-        return None
-    requested_premium = premium_providers_requested(
-        list(providers) + list(verify_providers),
-    )
-    if not requested_premium:
-        return None
-    return HTTPException(
-        status_code=status.HTTP_402_PAYMENT_REQUIRED,
-        detail={
-            "code": "premium_provider_subscription_required",
-            "message": (
-                "ChatGPT and Claude audits are a premium feature. Subscribe to "
-                "a paid plan to run audits with these models — free accounts can "
-                "run Gemini audits at no charge."
-            ),
-            "premium_providers_requested": sorted(set(requested_premium)),
-            "free_alternative_provider": "gemini",
-        },
-    )
+# ADR-005: the premium-provider *plan*-gate was removed. Premium providers
+# (ChatGPT/Claude) are gated by credit BALANCE, not plan tier — they cost more
+# credits per run (config/provider_credit_rates.json), which the metering +
+# insufficient-credits gate already enforce. A free-plan merchant with enough
+# credits can run them; `premium_providers()` is retained only to label the
+# higher-cost providers for the cost preview / portal, not to block.
 
 
 # =====================================================================
@@ -988,17 +959,12 @@ async def create_audit_run(
     balance = await get_balance(body.merchant_id)
     plan_tier = str(balance.get("plan_tier") or "free").lower()
     paid_tier = plan_tier != "free"
-    # Tiered audit model: ChatGPT/Claude are premium. Free accounts may run
-    # Gemini only — refuse a premium run with 402 (do NOT silently downgrade)
-    # so the UI prompts to subscribe. Reuses the plan_tier already resolved
-    # above; runs before any credit debit / launch.
-    premium_block = _maybe_premium_block(
-        paid_tier=paid_tier,
-        providers=providers,
-        verify_providers=verify_providers,
-    )
-    if premium_block is not None:
-        raise premium_block
+    # ADR-005: providers are gated by credit BALANCE, not plan tier. ChatGPT/
+    # Claude simply cost more credits per run (per-provider rates in
+    # config/provider_credit_rates.json) and are reflected in `requirements`
+    # below — so a free-plan merchant with enough credits (e.g. a top-up) can
+    # run them, and an underfunded run is refused by the insufficient-credits
+    # gate, not a subscription paywall. (No premium plan-gate here by design.)
     if balance.get("overage_blocked_until_payment"):
         raise HTTPException(
             status_code=status.HTTP_402_PAYMENT_REQUIRED,
