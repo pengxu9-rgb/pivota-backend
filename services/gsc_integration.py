@@ -23,7 +23,7 @@ from __future__ import annotations
 
 import logging
 from datetime import datetime, timedelta, timezone
-from typing import Any, Dict, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 logger = logging.getLogger(__name__)
 
@@ -565,3 +565,372 @@ def build_gsc_integration_action(
             "gsc_integrated": False,
         },
     }
+
+
+# =================================================================
+# ADR-006 — Pivota-owned-credential submission path
+# -----------------------------------------------------------------
+# A SEPARATE principal from the per-merchant OAuth flow above. The
+# functions below submit Pivota's OWN canonical PDP URLs
+# (agent.pivota.cc/products/sig_*) under a single Pivota-owned service
+# account that is the verified owner of that property. Google's Indexing
+# API only accepts a submission from a verified owner of the URL's
+# property, so this is the only feasible "Pivota submits it" path — and
+# the only one that doesn't over-promise to index the merchant's own
+# store page (see ADR-006).
+#
+# Auth is the 2-legged service-account JWT-bearer flow (RFC 7523),
+# implemented with PyJWT + httpx so we add no google-auth dependency.
+#
+# Everything here is gated behind settings.gsc_pivota_submit_enabled
+# (default off) and stays unconsumed until the Phase-1 validation spike
+# confirms Google honors product-URL submissions under this credential.
+# =================================================================
+
+# Indexing API (publish) + Search Console (URL Inspection read-back).
+# One token carries both scopes so a single exchange serves both calls.
+_PIVOTA_SCOPES = (
+    "https://www.googleapis.com/auth/indexing "
+    "https://www.googleapis.com/auth/webmasters.readonly"
+)
+
+# Process-local access-token cache, keyed by scope string:
+#   {scope: (access_token, expires_at)}
+_pivota_token_cache: Dict[str, Tuple[str, datetime]] = {}
+
+
+def _require_pivota_enabled() -> None:
+    """Raise GscNotConfiguredError unless the Pivota-owned submit path is
+    flag-on AND both the service-account credential and the verified
+    property URL are configured. Mirrors _require_enabled()'s fail-fast
+    contract for the per-merchant path."""
+    from config.settings import settings
+    if not settings.gsc_pivota_submit_enabled:
+        raise GscNotConfiguredError(
+            "Pivota-owned GSC submit is feature-flagged off "
+            "(GSC_PIVOTA_SUBMIT_ENABLED=false)."
+        )
+    if not settings.gsc_pivota_service_account_json:
+        raise GscNotConfiguredError(
+            "GSC_PIVOTA_SERVICE_ACCOUNT_JSON not configured."
+        )
+    if not settings.gsc_pivota_property_url:
+        raise GscNotConfiguredError(
+            "GSC_PIVOTA_PROPERTY_URL not configured."
+        )
+
+
+async def _get_pivota_access_token(
+    scope: str = _PIVOTA_SCOPES,
+) -> Optional[str]:
+    """Mint (or return a cached) access token for the Pivota service
+    account via the JWT-bearer grant. Returns None on any credential /
+    network failure so callers degrade gracefully (record an error row,
+    never crash the audit)."""
+    import json as _json
+
+    from config.settings import settings
+
+    cached = _pivota_token_cache.get(scope)
+    now = datetime.now(timezone.utc)
+    if cached and cached[1] - timedelta(seconds=60) > now:
+        return cached[0]
+
+    try:
+        creds = _json.loads(settings.gsc_pivota_service_account_json)
+    except Exception as exc:  # noqa: BLE001
+        logger.error("gsc pivota: service-account JSON is not valid JSON: %s", exc)
+        return None
+
+    private_key = creds.get("private_key")
+    client_email = creds.get("client_email")
+    token_uri = creds.get("token_uri") or GOOGLE_TOKEN_URL
+    if not private_key or not client_email:
+        logger.error(
+            "gsc pivota: service-account JSON missing private_key/client_email"
+        )
+        return None
+
+    import jwt as _jwt  # PyJWT
+
+    issued = int(now.timestamp())
+    claims = {
+        "iss": client_email,
+        "scope": scope,
+        "aud": token_uri,
+        "iat": issued,
+        "exp": issued + 3600,
+    }
+    headers = {}
+    if creds.get("private_key_id"):
+        headers["kid"] = creds["private_key_id"]
+    try:
+        assertion = _jwt.encode(
+            claims, private_key, algorithm="RS256", headers=headers,
+        )
+    except Exception as exc:  # noqa: BLE001
+        logger.error("gsc pivota: failed to sign service-account JWT: %s", exc)
+        return None
+
+    import httpx
+    try:
+        async with httpx.AsyncClient(timeout=10.0) as client:
+            resp = await client.post(
+                token_uri,
+                data={
+                    "grant_type": "urn:ietf:params:oauth:grant-type:jwt-bearer",
+                    "assertion": assertion,
+                },
+            )
+    except httpx.HTTPError as exc:
+        logger.error("gsc pivota: token exchange network error: %s", exc)
+        return None
+    if resp.status_code != 200:
+        logger.error(
+            "gsc pivota: token exchange failed http_%d: %s",
+            resp.status_code, resp.text[:300],
+        )
+        return None
+    body = resp.json() or {}
+    access = body.get("access_token")
+    if not access:
+        logger.error("gsc pivota: no access_token in token response")
+        return None
+    # Defensive: honor the "returns None on any failure" contract even if
+    # Google ever sends a non-numeric expires_in (it always sends an int).
+    try:
+        expires_in = int(body.get("expires_in") or 3600)
+    except (TypeError, ValueError):
+        expires_in = 3600
+    _pivota_token_cache[scope] = (
+        access, now + timedelta(seconds=expires_in),
+    )
+    return access
+
+
+async def submit_pivota_canonical_url(
+    url: str,
+    *,
+    merchant_id: str,
+    audit_run_id: Optional[str] = None,
+    access_token: Optional[str] = None,
+) -> Dict[str, Any]:
+    """Submit a Pivota canonical PDP URL to Google's Indexing API under
+    the Pivota-owned credential. `merchant_id` is kept for attribution
+    (it's the gsc_url_submissions row key), NOT for auth.
+
+    Pass `access_token` to reuse a token already minted by the caller — the
+    batch helper mints once and threads it in so a fan-out makes ONE token
+    exchange, not N (Google's token-endpoint quota, ADR-006 open-question #4).
+    When omitted, mint (or reuse the cached) token here.
+
+    Mirrors submit_url_to_gsc's return shape:
+      {status: 'submitted' | 'error', message, last_status, last_status_at}
+    Best-effort: network / HTTP errors are recorded as an error row and
+    returned, never raised.
+    """
+    _require_pivota_enabled()
+    if access_token is None:
+        access_token = await _get_pivota_access_token()
+    if access_token is None:
+        raise GscNotConfiguredError(
+            "Could not mint a Pivota service-account access token "
+            "(check GSC_PIVOTA_SERVICE_ACCOUNT_JSON)."
+        )
+    try:
+        status_code, body_text = await _indexing_api_publish(access_token, url)
+    except Exception as exc:  # noqa: BLE001 — httpx network errors etc.
+        await _record_url_submission_error(merchant_id, url, str(exc), audit_run_id)
+        return {
+            "status": "error",
+            "message": f"Network error: {exc}",
+            "last_status": "error",
+            "last_status_at": datetime.now(timezone.utc).isoformat(),
+        }
+
+    if status_code != 200:
+        logger.error(
+            "GSC pivota publish failed: url=%s status=%d body=%s",
+            url, status_code, body_text[:300],
+        )
+        await _record_url_submission_error(
+            merchant_id, url, f"http_{status_code}: {body_text[:200]}", audit_run_id,
+        )
+        return {
+            "status": "error",
+            "message": f"Google returned {status_code}",
+            "last_status": "error",
+            "last_status_at": datetime.now(timezone.utc).isoformat(),
+        }
+
+    submitted_at = datetime.now(timezone.utc)
+    await _upsert_url_submission(
+        merchant_id=merchant_id,
+        url=url,
+        last_status="submitted",
+        submitted_at=submitted_at,
+        indexed_at=None,
+        error_message=None,
+        audit_run_id=audit_run_id,
+    )
+    return {
+        "status": "submitted",
+        "message": "Submitted to Google Indexing API (Pivota credential)",
+        "last_status": "submitted",
+        "last_status_at": submitted_at.isoformat(),
+    }
+
+
+async def get_pivota_index_status(
+    url: str,
+    *,
+    merchant_id: str,
+) -> Dict[str, Any]:
+    """Poll URL Inspection for a Pivota canonical URL under the
+    Pivota-owned property (settings.gsc_pivota_property_url). Updates
+    gsc_url_submissions. Returns {status, last_status, last_status_at}.
+    """
+    from config.settings import settings
+
+    _require_pivota_enabled()
+    access_token = await _get_pivota_access_token()
+    if access_token is None:
+        raise GscNotConfiguredError(
+            "Could not mint a Pivota service-account access token."
+        )
+    site_url = settings.gsc_pivota_property_url
+    try:
+        status_code, body = await _url_inspection(access_token, url, site_url)
+    except Exception as exc:  # noqa: BLE001
+        return {
+            "status": "error",
+            "last_status": "error",
+            "last_status_at": datetime.now(timezone.utc).isoformat(),
+            "message": f"Network error: {exc}",
+        }
+    if status_code != 200 or not isinstance(body, dict):
+        return {
+            "status": "error",
+            "last_status": "error",
+            "last_status_at": datetime.now(timezone.utc).isoformat(),
+            "message": f"Google returned {status_code}",
+        }
+    inspection = (body.get("inspectionResult") or {}).get("indexStatusResult") or {}
+    verdict = (inspection.get("verdict") or "").upper()
+    coverage_state = inspection.get("coverageState") or ""
+    indexed = verdict == "PASS"
+    indexed_at = datetime.now(timezone.utc) if indexed else None
+    last_status = "indexed" if indexed else "pending"
+    await _upsert_url_submission(
+        merchant_id=merchant_id,
+        url=url,
+        last_status=last_status,
+        submitted_at=None,
+        indexed_at=indexed_at,
+        error_message=None,
+        audit_run_id=None,
+    )
+    return {
+        "status": last_status,
+        "last_status": last_status,
+        "last_status_at": datetime.now(timezone.utc).isoformat(),
+        "verdict": verdict,
+        "coverage_state": coverage_state,
+    }
+
+
+async def submit_pivota_canonical_urls(
+    *,
+    merchant_id: str,
+    urls: List[str],
+    audit_run_id: Optional[str] = None,
+) -> List[Dict[str, Any]]:
+    """Batch-submit a merchant's Pivota canonical PDP URLs under the
+    Pivota credential, in parallel. Best-effort, never raises. Returns
+    [] when the flag is off or no URLs are given — mirroring
+    submit_audit_canonical_urls, but with NO is_gsc_integrated() gate
+    (the canonical path doesn't depend on a per-merchant grant)."""
+    import asyncio
+
+    from config.settings import settings
+    if not settings.gsc_pivota_submit_enabled:
+        return []
+
+    seen: set = set()
+    unique_urls: List[str] = []
+    for u in urls or []:
+        if not u or not isinstance(u, str) or u in seen:
+            continue
+        seen.add(u)
+        unique_urls.append(u)
+    if not unique_urls:
+        return []
+
+    # Mint ONCE up front and thread the token into every submit, so a batch
+    # fan-out makes a single token exchange (quota), not one per URL. None
+    # here means the credential is misconfigured — every URL would fail the
+    # same way, so short-circuit with an error result per URL.
+    try:
+        token = await _get_pivota_access_token()
+    except Exception as exc:  # noqa: BLE001
+        token = None
+        logger.warning("gsc pivota batch: token mint raised: %s", exc)
+    if token is None:
+        return [
+            {"status": "error", "url": u, "message": "no Pivota access token"}
+            for u in unique_urls
+        ]
+
+    async def _safe_submit(u: str) -> Dict[str, Any]:
+        try:
+            return await submit_pivota_canonical_url(
+                u, merchant_id=merchant_id, audit_run_id=audit_run_id,
+                access_token=token,
+            )
+        except Exception as exc:  # noqa: BLE001
+            logger.warning(
+                "gsc pivota auto-submit failed for url=%s: %s", u, exc,
+            )
+            return {"status": "error", "url": u, "message": str(exc)}
+
+    results = await asyncio.gather(*[_safe_submit(u) for u in unique_urls])
+    for u, result in zip(unique_urls, results):
+        if "url" not in result:
+            result["url"] = u
+    return list(results)
+
+
+async def _indexing_api_publish(access_token: str, url: str) -> Tuple[int, str]:
+    """Low-level Indexing API publish call. Returns (status_code, body_text).
+    Raises httpx.HTTPError on network failure (caller records the error)."""
+    import httpx
+    async with httpx.AsyncClient(timeout=10.0) as client:
+        resp = await client.post(
+            INDEXING_API_PUBLISH_URL,
+            json={"url": url, "type": "URL_UPDATED"},
+            headers={
+                "Authorization": f"Bearer {access_token}",
+                "Content-Type": "application/json",
+            },
+        )
+    return resp.status_code, resp.text
+
+
+async def _url_inspection(
+    access_token: str, url: str, site_url: str,
+) -> Tuple[int, Any]:
+    """Low-level URL Inspection call. Returns (status_code, parsed_json|text).
+    Raises httpx.HTTPError on network failure."""
+    import httpx
+    async with httpx.AsyncClient(timeout=10.0) as client:
+        resp = await client.post(
+            URL_INSPECTION_URL,
+            json={"inspectionUrl": url, "siteUrl": site_url},
+            headers={
+                "Authorization": f"Bearer {access_token}",
+                "Content-Type": "application/json",
+            },
+        )
+    if resp.status_code == 200:
+        return resp.status_code, (resp.json() or {})
+    return resp.status_code, resp.text
