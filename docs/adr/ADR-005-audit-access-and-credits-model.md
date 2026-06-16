@@ -26,10 +26,19 @@ The two differ by **integration depth, not price or plan**.
 
 ## Decision — the model
 
-### 1. Credit *balance* is the single gate
+### 1. Credit *balance* is the single gate (with intended paid-tier overage)
 Every run — both pages, every provider — **debits credits**. A merchant can run anything
-their balance covers. **Plan tier does not gate runs or providers.** The conceptually
-correct gate everywhere is `balance ≥ cost(run)`.
+their balance covers. **Plan tier does not gate runs or providers** — it never decides
+*whether* you can run a provider, only how the wallet is funded.
+
+The gate is `balance ≥ cost(run)`, applied as designed:
+- **Free tier:** a **hard** gate — insufficient balance refuses the run (top up or upgrade to proceed).
+- **Paid tier:** balance **plus intended metered overage** — a paid merchant may overspend
+  their balance into overage (settled via overage billing). This is by design, **not** a
+  divergence, and must be preserved.
+
+The plan-tier divergence to fix is narrow: a provider being blocked on *plan tier* rather
+than on *can-you-pay* (the premium-provider gate, below) — not the overage behavior.
 
 ### 2. The wallet has two funding sources, tracked as separate buckets
 | Bucket | Granted by | Expiry |
