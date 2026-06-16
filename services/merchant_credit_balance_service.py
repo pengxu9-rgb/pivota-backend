@@ -398,6 +398,50 @@ async def apply_subscription_allowance(
         return await _get_balance_with_conn(merchant_id, tx)
 
 
+async def expire_plan_allowance(
+    merchant_id: str,
+    *,
+    conn: Any = None,
+) -> Dict[str, Any]:
+    """Wipe the monthly plan allowance on downgrade to free, preserving the
+    persistent purchased (top-up) credits.
+
+    ADR-005 §2: plan allotment is wiped on downgrade; top-ups survive. Sets
+    `credits = purchased_credits` (drops the remaining allowance portion;
+    `credits >= purchased_credits` holds because debits drain allowance first),
+    zeroes `allowance_credits`, clears the allowance period, and flips
+    `plan_tier` to 'free'. Overage state is intentionally left untouched — a
+    downgraded merchant still owes any pending overage. No-op when the merchant
+    has no balance row (nothing to expire). Called by the Stripe
+    subscription-cancelled / downgraded webhook.
+    """
+    async with _transaction(conn) as tx:
+        row = await tx.fetch_one(
+            """
+            -- merchant_credit_balance/expire_plan_allowance (downgrade to free)
+            UPDATE merchant_credit_balance
+               SET credits = purchased_credits,
+                   allowance_credits = 0,
+                   allowance_period_start = NULL,
+                   plan_tier = 'free',
+                   updated_at = NOW(),
+                   version = version + 1
+             WHERE merchant_id = :merchant_id
+            RETURNING credits, purchased_credits, allowance_credits,
+                      overage_pending_credits, overage_charged_credits,
+                      overage_blocked_until_payment,
+                      overage_last_payment_intent_id,
+                      overage_last_failed_at,
+                      allowance_period_start, usd_cogs_internal,
+                      plan_tier, updated_at, version
+            """,
+            {"merchant_id": merchant_id},
+        )
+        if row is not None:
+            return _balance_from_row(row)
+        return await _get_balance_with_conn(merchant_id, tx)
+
+
 async def get_balance(merchant_id: str) -> Dict[str, Any]:
     """Return the merchant's internal balance, or zero balance if missing."""
     return await apply_subscription_allowance(merchant_id)

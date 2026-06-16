@@ -94,6 +94,17 @@ class FakeCreditConn:
             row["updated_at"] = datetime.now(timezone.utc)
             row["version"] = int(row["version"]) + 1
             return dict(row)
+        if "merchant_credit_balance/expire_plan_allowance" in sql:
+            row = self.balances.get(str(values["merchant_id"]))
+            if row is None:
+                return None
+            row["credits"] = int(row.get("purchased_credits") or 0)
+            row["allowance_credits"] = 0
+            row["allowance_period_start"] = None
+            row["plan_tier"] = "free"
+            row["updated_at"] = datetime.now(timezone.utc)
+            row["version"] = int(row["version"]) + 1
+            return dict(row)
         if "merchant_credit_balance/fetch_usage_replay" in sql:
             row = self.events.get(str(values["idempotency_key"]))
             return {"payload": dict(row["payload"])} if row else None
@@ -444,6 +455,43 @@ async def test_apply_subscription_allowance_rolls_month_and_keeps_topups(monkeyp
     assert balance["purchased_credits"] == 300
     assert balance["allowance_credits"] == 4000
     assert balance["allowance_period_start"] == may
+
+
+@pytest.mark.asyncio
+async def test_expire_plan_allowance_wipes_allowance_keeps_topups(monkeypatch):
+    # ADR-005 §2: downgrade wipes the monthly plan allowance; purchased top-ups
+    # survive. Growth merchant with 300 purchased + 1000 remaining allowance.
+    from services import merchant_credit_balance_service as svc
+
+    fake = FakeCreditConn()
+    fake.seed(
+        "merch-A",
+        credits=1300,            # 300 purchased + 1000 remaining allowance
+        purchased_credits=300,
+        allowance_credits=4000,
+        allowance_period_start=datetime(2026, 6, 1, tzinfo=timezone.utc),
+        plan_tier="growth",
+    )
+
+    balance = await svc.expire_plan_allowance("merch-A", conn=fake)
+
+    assert balance["credits"] == 300            # only the purchased top-up survives
+    assert balance["purchased_credits"] == 300  # preserved
+    assert balance["allowance_credits"] == 0    # allowance wiped
+    assert balance["allowance_period_start"] is None
+    assert balance["plan_tier"] == "free"
+
+
+@pytest.mark.asyncio
+async def test_expire_plan_allowance_noop_when_no_row(monkeypatch):
+    # A merchant with no balance row has nothing to expire — return zero, no crash.
+    from services import merchant_credit_balance_service as svc
+
+    fake = FakeCreditConn()
+    monkeypatch.setattr(svc, "database", fake)
+    balance = await svc.expire_plan_allowance("merch-none", conn=fake)
+    assert balance["credits"] == 0
+    assert balance["allowance_credits"] == 0
 
 
 @pytest.mark.asyncio

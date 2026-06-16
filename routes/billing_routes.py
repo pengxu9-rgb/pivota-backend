@@ -1218,6 +1218,21 @@ async def _downgrade_merchant_to_free(
         params,
     )
 
+    # ADR-005 §2: a downgrade wipes the monthly plan allowance (top-up credits
+    # persist). The merchants tier update above doesn't touch the credit wallet,
+    # so do it here. Best-effort — a balance hiccup must not fail the webhook's
+    # tier downgrade (the allowance would just linger until the next reset).
+    if merchant_id:
+        try:
+            from services.merchant_credit_balance_service import expire_plan_allowance
+            await expire_plan_allowance(merchant_id)
+        except Exception:  # noqa: BLE001
+            logger.warning(
+                "expire_plan_allowance failed on downgrade for merchant_id=%s",
+                merchant_id,
+                exc_info=True,
+            )
+
 
 async def _fetch_merchant_billing_row(
     db: Database,
