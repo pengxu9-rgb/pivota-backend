@@ -62,16 +62,17 @@ def verify_supported_providers() -> List[str]:
     return providers
 
 
-# Premium (paid-tier) providers. Free accounts may only run Gemini audits;
-# ChatGPT/Claude require an active paid subscription (see services/
-# audit_entitlements.py). Defaults to chatgpt+claude but can be overridden via
-# a `premium_providers` key in config/coverage_profiles.json without a code
-# change. Gemini/DeepSeek are intentionally NOT premium.
+# Premium (higher-cost) providers. ADR-005: these are NOT plan-gated — every
+# provider is gated by credit balance. "Premium" only labels the providers that
+# cost materially more credits per run (per-provider rates in
+# config/provider_credit_rates.json), used by the cost preview + portal to set
+# expectations. Defaults to chatgpt+claude; overridable via a `premium_providers`
+# key in config/coverage_profiles.json. Gemini/DeepSeek are the cheap baseline.
 _DEFAULT_PREMIUM_PROVIDERS = ("chatgpt", "claude")
 
 
 def premium_providers() -> List[str]:
-    """The set of providers gated behind a paid subscription."""
+    """The set of higher-cost providers (label for cost/UI; not a plan gate)."""
     data = load_coverage_profile_config()
     configured = _normalize_nonempty(data.get("premium_providers") or [])
     return configured or list(_DEFAULT_PREMIUM_PROVIDERS)
