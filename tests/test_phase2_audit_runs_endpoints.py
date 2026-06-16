@@ -85,7 +85,8 @@ class _AccessorStub:
         self.cancelled.append(run_id)
         return self.cancel_returns
 
-    async def recent(self, *, merchant_id, limit):
+    async def recent(self, *, merchant_id, limit, subject_type=None):
+        self.recent_subject_type = subject_type
         return self.list_returns
 
     async def missing_keys(self, *, merchant_id, product_keys):
@@ -1017,3 +1018,19 @@ def test_list_rejects_invalid_limit(client, stub):
     assert res.status_code == 422
     res = client.get("/api/audits?limit=0")
     assert res.status_code == 422
+
+
+def test_list_threads_subject_type_filter(client, stub):
+    # ?subject_type= scopes the history to one run kind so each surface lists
+    # only the runs it can open (per-SKU = "merchant", URL wedge = "merchant_url").
+    stub.list_returns = [{"run_id": "r-1", "status": "succeeded"}]
+    res = client.get("/api/audits?subject_type=merchant_url")
+    assert res.status_code == 200
+    assert stub.recent_subject_type == "merchant_url"
+
+
+def test_list_subject_type_defaults_to_all(client, stub):
+    stub.list_returns = []
+    res = client.get("/api/audits")
+    assert res.status_code == 200
+    assert stub.recent_subject_type is None

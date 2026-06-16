@@ -1392,17 +1392,23 @@ async def cancel_audit_run_endpoint(
 @router.get("", response_model=List[Dict[str, Any]])
 async def list_audit_runs(
     limit: int = 20,
+    subject_type: Optional[str] = None,
     auth_merchant_id: str = Depends(get_current_merchant),
 ) -> List[Dict[str, Any]]:
     """List the most recent audit runs for this merchant. Trend-
     friendly fields only — fetch a specific run via GET /api/audits/
-    {run_id} for the full report payload."""
+    {run_id} for the full report payload.
+
+    `subject_type` (optional) scopes to one run kind so each history
+    surface lists only the runs it can open: "merchant" = per-SKU
+    catalog audits (this page), "merchant_url" = the URL-visibility
+    wedge. Omitted → all kinds."""
     if limit < 1 or limit > 100:
         raise HTTPException(
             status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
             detail="limit must be between 1 and 100",
         )
     rows = await recent_runs_for_merchant(
-        merchant_id=auth_merchant_id, limit=limit,
+        merchant_id=auth_merchant_id, limit=limit, subject_type=subject_type,
     )
     return _strip_brand_facing_internal_money(rows)
