@@ -86,6 +86,67 @@ async def test_list_tasks_for_merchant_filters_parent_audit_run_id(
     assert [task["task_id"] for task in result] == ["run-a-1", "run-a-2"]
 
 
+@pytest.mark.asyncio
+async def test_include_unscoped_surfaces_null_parent_tasks(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """GAP B: standing non-audit tasks (NULL parent_audit_run_id — sku_evidence,
+    niche_content) must appear in the latest-completed Action plan alongside the
+    scoped run's tasks. Without include_unscoped they're silently filtered out
+    (SQL `parent_audit_run_id = X` never matches NULL)."""
+    from db import merchant_tasks as mt
+
+    rows = [
+        _task("scoped", "merch_self", RUN_LATEST),
+        _task("standing-evidence", "merch_self", None),  # NULL parent
+        _task("other-run", "merch_self", RUN_OLD),
+    ]
+
+    async def _noop_ensure() -> None:
+        return None
+
+    class FakeDatabase:
+        async def fetch_all(self, query: Any) -> List[Dict[str, Any]]:
+            sql = str(query.compile(dialect=postgresql.dialect()))
+            assert "IS NULL" in sql.upper()  # the OR ... IS NULL clause is present
+            return [r for r in rows if r["parent_audit_run_id"] in (RUN_LATEST, None)]
+
+    monkeypatch.setattr(mt, "ensure_merchant_tasks_table", _noop_ensure)
+    monkeypatch.setattr(mt, "database", FakeDatabase())
+
+    result = await mt.list_tasks_for_merchant(
+        merchant_id="merch_self",
+        parent_audit_run_id=RUN_LATEST,
+        include_unscoped=True,
+    )
+    ids = {task["task_id"] for task in result}
+    assert "scoped" in ids
+    assert "standing-evidence" in ids  # the GAP B fix — was filtered out before
+    assert "other-run" not in ids
+
+
+@pytest.mark.asyncio
+async def test_default_scope_stays_strict(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Without include_unscoped, scoping stays strict (== run) — no IS NULL clause,
+    behavior unchanged for callers that want a single run's tasks only."""
+    from db import merchant_tasks as mt
+
+    async def _noop_ensure() -> None:
+        return None
+
+    class FakeDatabase:
+        async def fetch_all(self, query: Any) -> List[Dict[str, Any]]:
+            assert "IS NULL" not in str(query.compile(dialect=postgresql.dialect())).upper()
+            return []
+
+    monkeypatch.setattr(mt, "ensure_merchant_tasks_table", _noop_ensure)
+    monkeypatch.setattr(mt, "database", FakeDatabase())
+    await mt.list_tasks_for_merchant(
+        merchant_id="merch_self",
+        parent_audit_run_id=RUN_LATEST,
+    )
+
+
 def _install_fake_task_accessor(
     monkeypatch: pytest.MonkeyPatch,
 ) -> List[Dict[str, Any]]:
@@ -198,6 +259,8 @@ def test_tasks_route_defaults_to_latest_completed_run(
     assert body["latest_audit_run_id"] == RUN_LATEST
     assert [task["task_id"] for task in body["tasks"]] == ["latest-1", "latest-2"]
     assert calls[-1]["parent_audit_run_id"] == RUN_LATEST
+    # GAP B: the default Action-plan view also surfaces standing non-audit tasks.
+    assert calls[-1]["include_unscoped"] is True
 
 
 @pytest.mark.parametrize("route_name", ["merchant", "bd"])

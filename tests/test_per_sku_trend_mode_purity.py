@@ -7,7 +7,21 @@ from __future__ import annotations
 import json
 
 from db.merchant_audit_runs import _run_audit_mode
-from services.agent_center_bd_report_service import _per_sku_prior_runs
+from services.agent_center_bd_report_service import (
+    _legacy_prior_runs,
+    _per_sku_prior_runs,
+)
+
+
+def test_legacy_prior_runs_excludes_per_sku():
+    runs = [
+        {"run_id": "legacy1", "audit_mode": None},  # legacy = untagged → kept
+        {"run_id": "legacy2", "audit_mode": "legacy"},  # kept
+        {"run_id": "psku", "audit_mode": "per_sku"},  # excluded
+        "not-a-dict",
+    ]
+    assert [r["run_id"] for r in _legacy_prior_runs(runs)] == ["legacy1", "legacy2"]
+    assert _legacy_prior_runs(None) == []
 
 
 def test_filters_to_per_sku_only():
