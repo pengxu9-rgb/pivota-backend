@@ -392,7 +392,27 @@ class Settings(BaseSettings):
         "GOOGLE_OAUTH_REDIRECT_URI",
         "https://web-production-fedb.up.railway.app/api/gsc/oauth/callback",
     )
-    
+
+    # ADR-006: Pivota-owned GSC indexing. Distinct principal from the
+    # per-merchant OAuth flow above — a single Pivota-owned service
+    # account that is the *verified owner* of the canonical PDP property
+    # (agent.pivota.cc), so Pivota can submit its OWN canonical URLs to
+    # the Indexing API. Flag is separate from gsc_integration_enabled so
+    # the two principals flip independently (ADR-006 open-question #2).
+    # Stays OFF until the Phase-1 validation spike proves Google honors
+    # product-URL submissions under the Pivota credential.
+    gsc_pivota_submit_enabled: bool = (
+        os.getenv("GSC_PIVOTA_SUBMIT_ENABLED", "false").lower() == "true"
+    )
+    # Raw service-account credentials JSON (the file Google hands you for
+    # a service account), passed as an env string. Empty = not configured.
+    gsc_pivota_service_account_json: str = os.getenv(
+        "GSC_PIVOTA_SERVICE_ACCOUNT_JSON", ""
+    )
+    # The verified Search Console property for the canonical PDPs, used as
+    # `siteUrl` for URL Inspection read-back (e.g. "https://agent.pivota.cc/").
+    gsc_pivota_property_url: str = os.getenv("GSC_PIVOTA_PROPERTY_URL", "")
+
     @property
     def cors_origins(self) -> list:
         """Parse comma-separated origins from environment variable"""
