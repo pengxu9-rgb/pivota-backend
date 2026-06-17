@@ -12,6 +12,7 @@ import json
 import asyncio
 import hashlib
 import secrets
+from urllib.parse import urlparse
 from pydantic import BaseModel
 from config.settings import resolve_public_api_base_url
 from utils.auth import get_current_user
@@ -63,6 +64,57 @@ def _stripe_webhook_target_url(psp_id: str) -> str:
     return f"{resolve_public_api_base_url().rstrip('/')}/webhooks/stripe/{psp_id}"
 
 
+def _stripe_webhook_psp_id_from_url(url: str) -> Optional[str]:
+    """Return the embedded psp_id for a Pivota-managed per-PSP Stripe webhook URL.
+
+    Matches ``<any-host>/webhooks/stripe/psp_stripe_<id>`` and returns the
+    ``psp_stripe_...`` segment. Host-agnostic on purpose: a Stripe account may
+    still hold orphan endpoints minted under a previous public host. Returns
+    ``None`` for the bare ``/webhooks/stripe`` platform endpoint and for any URL
+    that isn't one of our per-PSP endpoints, so neither is ever swept.
+    """
+    try:
+        path = urlparse(str(url or "").strip()).path
+    except Exception:
+        return None
+    prefix = "/webhooks/stripe/"
+    if not path.startswith(prefix):
+        return None
+    tail = path[len(prefix):].strip("/")
+    if not tail or "/" in tail or not tail.startswith("psp_stripe_"):
+        return None
+    return tail
+
+
+async def _live_stripe_psp_ids(merchant_id: Optional[str]) -> set[str]:
+    """psp_ids with a live merchant_psps row for this merchant (Stripe only).
+
+    Used to decide which per-PSP webhook endpoints are still owned by a real PSP
+    and must never be disabled by the orphan sweep. Best-effort: a lookup failure
+    yields an empty set, which only widens what the sweep treats as orphaned, so
+    we degrade conservatively by also passing the active psp_id separately.
+    """
+    if not merchant_id:
+        return set()
+    try:
+        rows = await database.fetch_all(
+            "SELECT psp_id FROM merchant_psps WHERE merchant_id = :merchant_id AND provider = 'stripe'",
+            {"merchant_id": merchant_id},
+        )
+    except Exception as exc:
+        logger.warning(
+            "stripe_live_psp_lookup_failed",
+            extra={"merchant_id": merchant_id, "error": str(exc)},
+        )
+        return set()
+    live: set[str] = set()
+    for row in rows or []:
+        psp_id = str(dict(row).get("psp_id") or "").strip()
+        if psp_id:
+            live.add(psp_id)
+    return live
+
+
 def _stripe_object_field(obj: Any, field: str) -> Any:
     if isinstance(obj, dict):
         return obj.get(field)
@@ -104,8 +156,23 @@ async def _disable_duplicate_stripe_webhook_endpoints(
     stripe_sdk: Any,
     desired_url: str,
     active_endpoint_id: str,
+    active_psp_id: str,
     stripe_kwargs: Dict[str, Any],
+    live_psp_ids: Optional[set[str]] = None,
 ) -> int:
+    """Disable stale per-PSP Stripe webhook endpoints on this account.
+
+    Two classes are disabled:
+      1. Exact-URL duplicates of the active endpoint (legacy behaviour).
+      2. Orphans — Pivota per-PSP endpoints (``/webhooks/stripe/psp_stripe_*``)
+         whose embedded psp_id is neither the active psp_id nor a live
+         merchant_psps row. These are left behind when a PSP is re-provisioned
+         under a new psp_id and otherwise linger enabled forever, returning 400
+         "Invalid signature" on every delivery (prod incident 2026-06-16).
+
+    Endpoints for OTHER live psp_ids on the same account (e.g. a sibling PSP) are
+    preserved via ``live_psp_ids``.
+    """
     list_endpoint = getattr(stripe_sdk.WebhookEndpoint, "list", None)
     if not callable(list_endpoint):
         return 0
@@ -119,13 +186,23 @@ async def _disable_duplicate_stripe_webhook_endpoints(
         )
         return 0
 
+    keep_psp_ids = set(live_psp_ids or set())
+    if active_psp_id:
+        keep_psp_ids.add(active_psp_id)
+
     disabled_count = 0
     for endpoint in endpoints:
         endpoint_id = str(_stripe_object_field(endpoint, "id") or "").strip()
         endpoint_url = str(_stripe_object_field(endpoint, "url") or "").strip()
-        if not endpoint_id or endpoint_id == active_endpoint_id or endpoint_url != desired_url:
+        if not endpoint_id or endpoint_id == active_endpoint_id:
             continue
         if _stripe_endpoint_is_disabled(endpoint):
+            continue
+
+        is_exact_duplicate = endpoint_url == desired_url
+        endpoint_psp_id = _stripe_webhook_psp_id_from_url(endpoint_url)
+        is_orphan = endpoint_psp_id is not None and endpoint_psp_id not in keep_psp_ids
+        if not (is_exact_duplicate or is_orphan):
             continue
         try:
             stripe_sdk.WebhookEndpoint.modify(endpoint_id, disabled=True, **stripe_kwargs)
@@ -154,6 +231,7 @@ async def _ensure_stripe_webhook_endpoint(
     provider_config: Dict[str, Any],
     account_id: Optional[str],
     environment: str,
+    merchant_id: Optional[str] = None,
 ) -> tuple[Dict[str, Any], bool]:
     import stripe as stripe_sdk
 
@@ -162,6 +240,7 @@ async def _ensure_stripe_webhook_endpoint(
     desired_url = _stripe_webhook_target_url(psp_id)
     desired_events = list(_STRIPE_AFTERCARE_EVENTS)
     stripe_kwargs = {"stripe_account": account_id} if account_id else {}
+    live_psp_ids = await _live_stripe_psp_ids(merchant_id)
     existing_endpoint_id = str(next_config.get("webhook_endpoint_id") or "").strip()
     existing_secret = str(next_config.get("webhook_endpoint_secret") or "").strip()
 
@@ -186,7 +265,9 @@ async def _ensure_stripe_webhook_endpoint(
                 stripe_sdk=stripe_sdk,
                 desired_url=desired_url,
                 active_endpoint_id=existing_endpoint_id,
+                active_psp_id=psp_id,
                 stripe_kwargs=stripe_kwargs,
+                live_psp_ids=live_psp_ids,
             )
             return next_config, False
         except Exception:
@@ -211,9 +292,61 @@ async def _ensure_stripe_webhook_endpoint(
         stripe_sdk=stripe_sdk,
         desired_url=desired_url,
         active_endpoint_id=created_id,
+        active_psp_id=psp_id,
         stripe_kwargs=stripe_kwargs,
+        live_psp_ids=live_psp_ids,
     )
     return next_config, True
+
+
+async def disable_stripe_webhook_endpoint_for_psp(
+    *,
+    api_key: str,
+    provider_config: Any,
+    account_id: Optional[str],
+) -> bool:
+    """Best-effort disable of the Stripe webhook endpoint bound to a PSP.
+
+    Called on PSP deletion/rotation so the endpoint does not orphan: once the
+    merchant_psps row is gone, handle_stripe_webhook can no longer load the
+    per-PSP secret and every delivery fails signature verification with 400.
+    Never raises — deletion must not be blocked by a Stripe call.
+    """
+    api_key = str(api_key or "").strip()
+    if not api_key:
+        return False
+
+    config: Dict[str, Any] = {}
+    if isinstance(provider_config, dict):
+        config = provider_config
+    elif isinstance(provider_config, str):
+        try:
+            parsed = json.loads(provider_config)
+            if isinstance(parsed, dict):
+                config = parsed
+        except Exception:
+            config = {}
+    endpoint_id = str(config.get("webhook_endpoint_id") or "").strip()
+    if not endpoint_id:
+        return False
+
+    try:
+        import stripe as stripe_sdk
+
+        stripe_sdk.api_key = api_key
+        stripe_kwargs = {"stripe_account": account_id} if account_id else {}
+        stripe_sdk.WebhookEndpoint.modify(endpoint_id, disabled=True, **stripe_kwargs)
+        logger.info(
+            "stripe_webhook_endpoint_disabled_on_psp_removal",
+            extra={"endpoint_id": endpoint_id},
+        )
+        return True
+    except Exception as exc:
+        logger.warning(
+            "stripe_webhook_endpoint_disable_on_psp_removal_failed",
+            extra={"endpoint_id": endpoint_id, "error": str(exc)},
+        )
+        return False
 
 
 class MerchantPortalPreferencesRequest(BaseModel):
@@ -811,7 +944,7 @@ async def get_merchant_analytics(
         for row in recent_orders_rows:
             recent_orders.append({
                 "order_id": row["order_id"],
-                "amount": float(row["amount"]),
+                "amount": float(row["amount"] or 0),
                 "status": row["status"],
                 "customer_name": row["customer_name"],
                 "created_at": row["created_at"].isoformat() if row["created_at"] else None
@@ -1270,6 +1403,7 @@ async def test_psp_connection(
                     provider_config=stripe_provider_config,
                     account_id=account_id,
                     environment=provider_summary.get("environment") or "live",
+                    merchant_id=psp_row.get("merchant_id"),
                 )
                 validation_message = (
                     "Stripe credentials verified and webhook endpoint provisioned"
