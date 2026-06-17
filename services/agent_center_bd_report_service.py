@@ -6137,53 +6137,60 @@ def _unbranded_category_specs(
     category = _clean_prompt_term(category)
     if not category or category in {"product", "products", "item", "items"}:
         return []
+
+    # NOTE on tags: queries keep the COARSE `axis` vocabulary every downstream
+    # consumer already handles (discovery="category", attribute-framed="attribute").
+    # Only the query SHAPES diversify here — the fine intent taxonomy
+    # (category_head / problem_jtbd / constraint) + per-axis scoring is Step 2.
+    # See PIVOTA-Agent/docs/ai_readiness_query_axes_build_plan.md.
+
+    # category_head — DEMOTED to two diagnostic head terms (was ~10 near-synonym
+    # superlatives all measuring the same "am I in the ranked list?" signal).
     specs: List[Tuple[str, str]] = [
         (f"best {category}", "category"),
-        (f"what is the best {category}", "category"),
-        (f"top {category}", "category"),
-        (f"best {category} to buy online", "category"),
-    ]
-    audiences = _graph_class_values(graph, "audience")
-    for audience in audiences[:3]:
-        specs.extend([
-            (f"best {category} for {audience}", "category"),
-            (f"{category} for {audience}", "category"),
-        ])
-
-    attrs: List[str] = []
-    for class_name in (
-        "certification_constraint",
-        "exclusion",
-        "ingredient",
-        "proof",
-        "use_case",
-    ):
-        attrs.extend(_graph_class_values(graph, class_name))
-    for attr in attrs[:6]:
-        if category in attr:
-            continue
-        specs.append((f"best {attr} {category}", "attribute"))
-
-    for topic in topics[:4]:
-        cleaned = _clean_prompt_term(topic)
-        if cleaned:
-            specs.extend([
-                (f"best {category} for {cleaned}", "category"),
-                (f"{cleaned} {category}", "attribute"),
-            ])
-    for bullet in bullets[:4]:
-        cleaned = _clean_prompt_term(bullet)
-        if cleaned:
-            specs.append((f"{cleaned} {category}", "attribute"))
-
-    specs.extend([
-        (f"recommended {category}", "category"),
-        (f"best rated {category}", "category"),
-        (f"{category} buying guide", "category"),
-        (f"compare {category} options", "category"),
-        (f"popular {category}", "category"),
         (f"what {category} should I buy", "category"),
-    ])
+    ]
+
+    use_cases = [
+        cleaned
+        for cleaned in (_clean_prompt_term(u) for u in _graph_class_values(graph, "use_case"))
+        if cleaned and cleaned not in category
+    ]
+    audiences = [
+        cleaned
+        for cleaned in (_clean_prompt_term(a) for a in _graph_class_values(graph, "audience"))
+        if cleaned
+    ]
+
+    # problem_jtbd shapes — how shoppers actually ask AI: need/problem-first. A
+    # need-framed query returns products, not a bare ingredient rundown, which also
+    # cuts the ingredient-as-competitor harvesting at the source (vs "best {cat}").
+    for use_case in use_cases[:3]:
+        specs.append((f"best {category} for {use_case}", "category"))
+        specs.append((f"what helps with {use_case}", "category"))
+    for audience in audiences[:2]:
+        specs.append((f"{category} for {audience}", "category"))
+    for topic in topics[:3]:
+        cleaned = _clean_prompt_term(topic)
+        if cleaned and cleaned not in category:
+            specs.append((f"best {category} for {cleaned}", "category"))
+
+    # constraint shapes — cert / exclusion / ingredient framed ("vegan collagen",
+    # "fragrance-free retinol", "marine collagen", "clinically tested collagen").
+    constraint_terms: List[str] = []
+    for class_name in ("certification_constraint", "exclusion", "ingredient", "proof"):
+        constraint_terms.extend(
+            cleaned
+            for cleaned in (_clean_prompt_term(v) for v in _graph_class_values(graph, class_name))
+            if cleaned and cleaned not in category
+        )
+    for bullet in bullets[:3]:
+        cleaned = _clean_prompt_term(bullet)
+        if cleaned and cleaned not in category:
+            constraint_terms.append(cleaned)
+    for attr in constraint_terms[:5]:
+        specs.append((f"{attr} {category}", "attribute"))
+
     return _dedupe_query_specs(specs)
 
 
@@ -6245,11 +6252,20 @@ def _build_per_sku_base_query_specs(
         if str(item).strip()
     ][:6]
 
+    # navigational (axis "intent") — demoted to two; "for sale" dropped as a dup.
     specs: List[Tuple[str, str]] = [
         (f"where can I buy {title}", "intent"),
         (f"shop {title} online", "intent"),
-        (f"{title} for sale", "intent"),
     ]
+    # trust shapes — validation/legitimacy. Tagged "review" (the coarse branded-
+    # consideration axis consumers + the budgeter already handle); fine "trust"
+    # tag is Step 2.
+    trust_subject = (brand or title).strip()
+    specs.extend([
+        (f"is {trust_subject} legit", "review"),
+        (f"{title} reviews", "review"),
+        (f"does {title} actually work", "review"),
+    ])
     specs.extend(
         _unbranded_category_specs(
             category=unbranded_category,
@@ -6303,19 +6319,19 @@ def _fill_per_sku_query_records(
     *,
     target: int,
     title: str,
+    filler_pool: Optional[List[Dict[str, Any]]] = None,
 ) -> List[Dict[str, Any]]:
+    # Fill toward `target` with REAL query variants from `filler_pool` (extra
+    # category permutations), never synthetic "{title} shopper question N"
+    # placeholders — those burned credits on meaningless probes and polluted
+    # results. If real variants are exhausted, return fewer real queries rather
+    # than padding with junk (honest under-fill > garbage probes).
     records = _dedupe_query_spec_records(records)
     target = max(1, int(target or 0))
     if len(records) >= target:
         return records[:target]
-
-    axes = ("intent", "review", "comparison", "price", "category")
-    idx = 1
-    while len(records) < target:
-        axis = axes[(idx - 1) % len(axes)]
-        records.append({"query": f"{title} shopper question {idx}", "axis": axis})
-        records = _dedupe_query_spec_records(records)
-        idx += 1
+    if filler_pool:
+        records = _dedupe_query_spec_records(records + list(filler_pool))
     return records[:target]
 
 
@@ -6423,6 +6439,7 @@ def _budgeted_wedge_query_records(
     sidewalk_records: List[Dict[str, Any]],
     target: int,
     title: str,
+    filler_pool: Optional[List[Dict[str, Any]]] = None,
 ) -> List[Dict[str, Any]]:
     selected: List[Dict[str, Any]] = []
     _append_records(
@@ -6478,6 +6495,7 @@ def _budgeted_wedge_query_records(
         selected + remaining_base + remaining_sidewalk,
         target=target,
         title=title,
+        filler_pool=filler_pool,
     )
 
 
@@ -6494,11 +6512,30 @@ def _build_per_sku_audit_query_records(
         product_type=product_type,
         prompts_per_sku=target,
     )
+    # Real category variants used ONLY to fill toward the budget when the SKU's
+    # attribute graph is too thin to produce enough diverse queries — replaces the
+    # old synthetic "shopper question N" junk. These are the superlatives demoted
+    # out of the primary set: real queries, lower priority, coarse "category" tag.
+    filler_cat = _clean_prompt_term(product_type)
+    filler_pool = (
+        _query_tuple_records([
+            (f"top {filler_cat}", "category"),
+            (f"recommended {filler_cat}", "category"),
+            (f"best rated {filler_cat}", "category"),
+            (f"popular {filler_cat}", "category"),
+            (f"compare {filler_cat} options", "category"),
+            (f"{filler_cat} reviews", "category"),
+            (f"best {filler_cat} to buy online", "category"),
+        ])
+        if filler_cat and filler_cat not in {"product", "products", "item", "items"}
+        else []
+    )
     if not sidewalk_records:
         return _fill_per_sku_query_records(
             base_records,
             target=target,
             title=title,
+            filler_pool=filler_pool,
         )
     if target <= 16:
         return _budgeted_wedge_query_records(
@@ -6506,11 +6543,13 @@ def _build_per_sku_audit_query_records(
             sidewalk_records=sidewalk_records,
             target=target,
             title=title,
+            filler_pool=filler_pool,
         )
     return _fill_per_sku_query_records(
         base_records + sidewalk_records,
         target=target,
         title=title,
+        filler_pool=filler_pool,
     )
 
 
