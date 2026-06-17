@@ -4300,6 +4300,76 @@ def _query_class_coverage(probe_runs: Any) -> Dict[str, int]:
     return counts
 
 
+# Fine intent-axis taxonomy (Step 2) — a per-query INTENT classification layered on
+# top of the coarse `axis`, so the report shows citation performance by the WAY
+# shoppers ask (head term vs problem/need vs constraint vs trust vs navigational),
+# not just branded-vs-category. Classified from (query, axis) at report-build time
+# — additive, no probe-pipeline change. Snapshot-only (no per-intent trend yet; see
+# PIVOTA-Agent/docs/ai_readiness_query_axes_build_plan.md).
+_INTENT_AXES = ("category_head", "problem_jtbd", "constraint", "trust", "navigational", "custom")
+
+
+def _intent_axis_for(query: Optional[str], axis: Optional[str]) -> str:
+    a = str(axis or "").strip().lower()
+    q = str(query or "").strip().lower()
+    if a in ("intent", "identity"):
+        return "navigational"
+    if a == "review":
+        return "trust"
+    if a in ("attribute", "sidewalk"):
+        return "constraint"
+    if a == "custom":
+        return "custom"
+    if a == "category":
+        # need/problem-framed ("best X for sleep", "what helps with X", "X for women")
+        # vs a bare head term ("best X", "top X", "X reviews").
+        if q.startswith("what helps") or " for " in q:
+            return "problem_jtbd"
+        return "category_head"
+    return "category_head"
+
+
+def _citation_by_intent(per_prompt: Any) -> Dict[str, Dict[str, Any]]:
+    """Per-SKU citation rate grouped by fine intent axis: for each intent, how many
+    of its probed queries cited the merchant. Surfaces WHERE the SKU wins by question
+    type (e.g. cited on trust/navigational but not problem/discovery). Snapshot-only."""
+    buckets: Dict[str, Dict[str, Any]] = {}
+    for row in per_prompt or []:
+        if not isinstance(row, dict):
+            continue
+        intent = _intent_axis_for(row.get("normalized_query") or row.get("query"), row.get("axis"))
+        bucket = buckets.setdefault(intent, {"cited": 0, "total": 0})
+        bucket["total"] += 1
+        summary = row.get("source_summary") if isinstance(row.get("source_summary"), dict) else {}
+        if int(summary.get("merchant_cited_runs") or 0) > 0:
+            bucket["cited"] += 1
+    for bucket in buckets.values():
+        bucket["rate"] = round(bucket["cited"] / bucket["total"], 3) if bucket["total"] else 0.0
+    return buckets
+
+
+def _brand_citation_by_intent(per_sku_reports: Any) -> Dict[str, Dict[str, Any]]:
+    """Brand-level roll-up of per-SKU `citation_by_intent` (sums cited/total per
+    intent across SKUs; reads the per-SKU dicts, no new probes)."""
+    buckets: Dict[str, Dict[str, Any]] = {}
+    for report in per_sku_reports or []:
+        if not isinstance(report, dict):
+            continue
+        per_sku = report.get("citation_by_intent")
+        if not isinstance(per_sku, dict):
+            continue
+        for intent, stats in per_sku.items():
+            if not isinstance(stats, dict):
+                continue
+            bucket = buckets.setdefault(intent, {"cited": 0, "total": 0, "skus": 0})
+            bucket["cited"] += int(stats.get("cited") or 0)
+            bucket["total"] += int(stats.get("total") or 0)
+            bucket["skus"] += 1
+    for bucket in buckets.values():
+        bucket["rate"] = round(bucket["cited"] / bucket["total"], 3) if bucket["total"] else 0.0
+    return buckets
+
+
 def _grounding_evidence(probe_runs: Any, cap: int = 12) -> List[Dict[str, Any]]:
     evidence: List[Dict[str, Any]] = []
     for run in _flatten_probe_runs(probe_runs):
@@ -5138,6 +5208,11 @@ async def build_per_sku_report(
         "verbatim_grounding_evidence": _grounding_evidence(probe_runs),
         "axis_coverage": _axis_coverage(probe_runs),
         "query_class_coverage": _query_class_coverage(probe_runs),
+        # Step 2 — citation rate by fine intent axis (head/problem/constraint/trust/
+        # nav). Snapshot of WHERE this SKU is cited by question type. Additive.
+        "citation_by_intent": _citation_by_intent(
+            opportunity.get("per_prompt") if isinstance(opportunity, dict) else None
+        ),
         "failing_prompts": failing_prompts,
         # Issue #902 item 1: Google indexing-arc for this SKU's Pivota canonical
         # PDP (None when the SKU has no minted canonical signature).
@@ -5575,6 +5650,9 @@ def build_brand_rollup(
         # (no new LLM calls). Single entry today (Gemini); the surface fills in
         # as more providers are enabled.
         "citation_by_provider": _brand_citation_by_provider(per_sku_reports),
+        # Step 2 — brand-level citation rate by fine intent axis (rolls up the
+        # per-SKU citation_by_intent). Snapshot-only; additive.
+        "citation_by_intent": _brand_citation_by_intent(per_sku_reports),
     }
 
 
