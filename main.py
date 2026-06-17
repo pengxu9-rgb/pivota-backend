@@ -744,6 +744,31 @@ app.add_middleware(StructuredLoggingMiddleware)
 # Add unified error handler middleware (formats errors + includes request id)
 app.add_middleware(ErrorHandlerMiddleware)
 
+# Handle CORS preflight (OPTIONS) for any path in middleware rather than via a
+# catch-all `@app.options("/{full_path:path}")` route. A catch-all OPTIONS route
+# makes every path "match" by path, so non-OPTIONS requests to unknown paths
+# (e.g. GET /robots.txt, GET /favicon.ico) return 405 Method Not Allowed instead
+# of 404 — which crawlers report as "Blocked due to other 4xx issue" and treat
+# as a site-wide crawl block. Intercepting OPTIONS before routing avoids the
+# phantom match, so unknown paths get a clean 404. Registered just before CORS
+# so CORSMiddleware stays outermost (real preflights with
+# Access-Control-Request-Method are still handled by CORSMiddleware first).
+@app.middleware("http")
+async def cors_preflight_passthrough(request: Request, call_next):
+    if request.method == "OPTIONS":
+        origin = request.headers.get("Origin", "*")
+        return Response(
+            status_code=200,
+            headers={
+                "Access-Control-Allow-Origin": origin,
+                "Access-Control-Allow-Headers": "Content-Type, Authorization, X-API-Key, X-Request-Id, X-Buyer-Issuer-Key, Idempotency-Key",
+                "Access-Control-Allow-Methods": "GET, POST, PUT, DELETE, OPTIONS, PATCH",
+                "Access-Control-Allow-Credentials": "true",
+            },
+        )
+    return await call_next(request)
+
+
 # CORS should be outermost so error responses still include headers.
 app.add_middleware(
     CORSMiddleware,
@@ -1825,21 +1850,23 @@ async def build_info():
         "timestamp": time.time(),
     }
 
-# Catch-all OPTIONS to satisfy permissive CORS preflight checks (even when Access-Control-Request-Method is missing).
-@app.options("/{full_path:path}")
-async def options_passthrough(full_path: str, request: Request):
-    origin = request.headers.get("Origin", "*")
-    allow_headers = "Content-Type, Authorization, X-API-Key, X-Request-Id, X-Buyer-Issuer-Key, Idempotency-Key"
-    allow_methods = "GET, POST, PUT, DELETE, OPTIONS, PATCH"
+@app.get("/robots.txt", include_in_schema=False)
+async def robots_txt():
+    """
+    Serve an explicit robots.txt. This is an API host with no indexable
+    content, so disallow all crawling. Without this, GET /robots.txt would 404
+    (which crawlers tolerate), but a real disallow-all response is cleaner and
+    stops crawlers from probing further. See cors_preflight_passthrough for why
+    we no longer 405 on unknown paths.
+    """
     return Response(
-        status_code=200,
-        headers={
-            "Access-Control-Allow-Origin": origin,
-            "Access-Control-Allow-Headers": allow_headers,
-            "Access-Control-Allow-Methods": allow_methods,
-            "Access-Control-Allow-Credentials": "true",
-        },
+        content="User-agent: *\nDisallow: /\n",
+        media_type="text/plain",
     )
+
+
+# Catch-all OPTIONS preflight is handled by the cors_preflight_passthrough
+# middleware above (not a route), so unknown paths return 404 instead of 405.
 
 @app.get("/operations", response_class=HTMLResponse)
 async def operations_dashboard():
