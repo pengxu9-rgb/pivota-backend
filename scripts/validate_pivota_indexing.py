@@ -84,7 +84,7 @@ async def _preflight() -> int:
         print("  - is GSC_PIVOTA_SERVICE_ACCOUNT_JSON the full SA key JSON?")
         print("  - are the Indexing API + Search Console API enabled in the project?")
         return 3
-    print(f"TOKEN OK     : minted access token ({token[:14]}...). Credential is usable.")
+    print(f"TOKEN OK     : minted a service-account access token ({len(token)} chars). Credential is usable.")
     print("Next: `submit` a few not-indexed canonical URLs, hold back a control set,")
     print("      then `status` both daily for 1-2 weeks (see ADR-006 validation step).")
     return 0
