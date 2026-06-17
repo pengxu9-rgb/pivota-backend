@@ -1925,6 +1925,55 @@ async def update_merchant_task(
     return {"task": updated}
 
 
+# ---------------------------------------------------------------------
+# ADR-006 Phase 3 — per-SKU request_indexing trigger + status read-back.
+# Consumes cta.target_sku_key from the per-SKU next_best_action and submits
+# the SKU's Pivota *canonical* PDP URL under the Pivota-owned credential.
+# Flag-gated (gsc_pivota_submit_enabled, default off) inside the service, so
+# this stays inert — and the portal keeps the self-serve checklist — until
+# ADR-006 Phase-1 validation passes and the flag is flipped (Phase 4).
+# ---------------------------------------------------------------------
+
+
+class _RequestIndexingBody(BaseModel):
+    target_sku_key: str = Field(..., min_length=1, max_length=256)
+    audit_run_id: Optional[str] = None
+
+
+@router.post("/sku/request-indexing")
+async def request_sku_indexing_endpoint(
+    body: _RequestIndexingBody,
+    merchant_id: str = Depends(get_current_merchant),
+) -> Dict[str, Any]:
+    """Submit this SKU's Pivota canonical PDP URL to Google's Indexing API
+    under the Pivota credential. Idempotent (won't re-submit an in-flight URL).
+    merchant_id comes from the token, and the canonical URL is resolved scoped
+    to that merchant, so a merchant can only act on its own SKUs."""
+    sku_key = (body.target_sku_key or "").strip()
+    if not sku_key:
+        raise HTTPException(status_code=422, detail="target_sku_key is required")
+    from services.pivota_indexing_request import request_sku_indexing
+
+    return await request_sku_indexing(
+        sku_key, merchant_id, audit_run_id=body.audit_run_id,
+    )
+
+
+@router.get("/sku/indexing-status")
+async def sku_indexing_status_endpoint(
+    target_sku_key: str,
+    merchant_id: str = Depends(get_current_merchant),
+) -> Dict[str, Any]:
+    """Per-SKU read-back of the Pivota-page indexing status
+    (submitted/pending/indexed) for the portal's status chip."""
+    sku_key = (target_sku_key or "").strip()
+    if not sku_key:
+        raise HTTPException(status_code=422, detail="target_sku_key is required")
+    from services.pivota_indexing_request import get_sku_indexing_status
+
+    return await get_sku_indexing_status(sku_key, merchant_id)
+
+
 class _NicheContentBody(BaseModel):
     query: str = Field(..., min_length=1, max_length=400)
     sku_key: Optional[str] = None
