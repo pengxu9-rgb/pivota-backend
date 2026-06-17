@@ -20,8 +20,9 @@ from services.gsc_integration import GscNotConfiguredError
 @pytest.mark.asyncio
 async def test_resolve_builds_url_from_signature():
     rows = [
-        {"product_key": "pk_1"},                                   # catalog_skus
-        {"pivota_signature_id": "sig_abc", "content_key": "ck_1"},  # catalog_products
+        {"product_key": "pk_1"},                                                  # catalog_skus
+        {"pivota_canonical_url": None, "pivota_signature_id": "sig_abc",          # catalog_products
+         "content_key": "ck_1"},
     ]
 
     async def _fetch_one(query, params):
@@ -33,11 +34,12 @@ async def test_resolve_builds_url_from_signature():
 
 
 @pytest.mark.asyncio
-async def test_resolve_falls_back_to_index_pipeline_state():
+async def test_resolve_prefers_stored_canonical_url():
+    """When catalog_products already has the canonical URL, use it directly."""
     rows = [
-        {"product_key": "pk_1"},                                       # catalog_skus
-        {"pivota_signature_id": None, "content_key": "ck_1"},          # catalog_products (no sig)
-        {"pivota_signature_id": "sig_from_ips"},                       # index_pipeline_state
+        {"product_key": "pk_1"},
+        {"pivota_canonical_url": "https://agent.pivota.cc/products/sig_stored",
+         "pivota_signature_id": "sig_other", "content_key": "ck_1"},
     ]
 
     async def _fetch_one(query, params):
@@ -45,7 +47,38 @@ async def test_resolve_falls_back_to_index_pipeline_state():
 
     with patch("db.database.database.fetch_one", AsyncMock(side_effect=_fetch_one)):
         url = await mod.resolve_canonical_pdp_url("sku_1", "m1")
+    assert url == "https://agent.pivota.cc/products/sig_stored"
+
+
+@pytest.mark.asyncio
+async def test_resolve_falls_back_to_index_pipeline_state_merchant_scoped():
+    """The index_pipeline_state fallback MUST be merchant-scoped — content_key
+    is cross-merchant, so an unscoped query could resolve another merchant's
+    sig/URL. Assert every query (incl. the fallback) binds merchant_id."""
+    rows = [
+        {"product_key": "pk_1"},                                                  # catalog_skus
+        {"pivota_canonical_url": None, "pivota_signature_id": None,               # catalog_products
+         "content_key": "ck_1"},
+        {"pivota_signature_id": "sig_from_ips"},                                  # index_pipeline_state
+    ]
+    calls = []
+
+    async def _fetch_one(query, params):
+        calls.append((query, params))
+        return rows.pop(0)
+
+    with patch("db.database.database.fetch_one", AsyncMock(side_effect=_fetch_one)):
+        url = await mod.resolve_canonical_pdp_url("sku_1", "m1")
+
     assert url == "https://agent.pivota.cc/products/sig_from_ips"
+    # 3 queries ran, and EVERY one is scoped to the caller's merchant_id.
+    assert len(calls) == 3
+    assert all(c[1].get("merchant_id") == "m1" for c in calls)
+    # specifically the fallback query hits index_pipeline_state with merchant_id
+    fallback_q, fallback_p = calls[2]
+    assert "index_pipeline_state" in fallback_q
+    assert fallback_p["merchant_id"] == "m1"
+    assert fallback_p["content_key"] == "ck_1"
 
 
 @pytest.mark.asyncio

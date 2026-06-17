@@ -22,10 +22,6 @@ from typing import Any, Dict, Optional
 
 logger = logging.getLogger(__name__)
 
-# Mirror services/agent_pdp_view_assembler.py:PDP_URL_PREFIX — the canonical PDP
-# URL is this prefix + the SKU's minted pivota_signature_id.
-PDP_URL_PREFIX = "https://agent.pivota.cc/products/"
-
 # last_status values that mean "already in flight or done" — re-submitting them
 # wastes Indexing API quota (~200/day/project, ADR-006 open-Q#4).
 _INFLIGHT_STATUSES = frozenset({"submitted", "pending", "indexed"})
@@ -56,21 +52,32 @@ async def resolve_canonical_pdp_url(
             return None
         product = await database.fetch_one(
             """
-            SELECT pivota_signature_id, content_key FROM catalog_products
+            SELECT pivota_canonical_url, pivota_signature_id, content_key
+              FROM catalog_products
              WHERE product_key = :product_key AND merchant_id = :merchant_id
              LIMIT 1
             """,
             {"product_key": sku["product_key"], "merchant_id": merchant_id},
         )
-        sig = (product["pivota_signature_id"] if product else None)
+        # Prefer the already-stored canonical URL — it's the merchant's own
+        # minted URL and stays consistent with the environment's base host.
+        stored = product["pivota_canonical_url"] if product else None
+        if stored:
+            return stored
+        sig = product["pivota_signature_id"] if product else None
         if not sig and product and product["content_key"]:
-            # Fallback: index_pipeline_state carries the signature too.
+            # Fallback: index_pipeline_state carries the signature too. MUST
+            # stay merchant-scoped — content_key is cross-merchant (one global
+            # row per physical product), but pivota_signature_id is minted
+            # per merchant. Without the merchant_id filter this could resolve
+            # (and submit) another merchant's canonical URL.
             ips = await database.fetch_one(
                 """
                 SELECT pivota_signature_id FROM index_pipeline_state
-                 WHERE content_key = :content_key LIMIT 1
+                 WHERE content_key = :content_key AND merchant_id = :merchant_id
+                 LIMIT 1
                 """,
-                {"content_key": product["content_key"]},
+                {"content_key": product["content_key"], "merchant_id": merchant_id},
             )
             sig = ips["pivota_signature_id"] if ips else None
     except Exception as exc:  # noqa: BLE001
@@ -82,7 +89,11 @@ async def resolve_canonical_pdp_url(
 
     if not sig:
         return None
-    return f"{PDP_URL_PREFIX}{sig}"
+    # Build via the shared helper so the host honors CHECKOUT_UI_BASE_URL
+    # (dev/staging stay self-consistent) instead of a hardcoded prefix.
+    from services.catalog_sync_service import pivota_canonical_pdp_url
+
+    return pivota_canonical_pdp_url(sig)
 
 
 async def _get_submission_row(
@@ -129,6 +140,11 @@ async def request_sku_indexing(
             "message": "This product has no Pivota canonical page yet.",
         }
 
+    # Read-then-submit dedupe. Not transactional: two concurrent requests for
+    # the same SKU could both pass this check and both submit (wasting one
+    # quota unit), but the gsc_url_submissions upsert is ON CONFLICT
+    # (merchant_id, url) so no row duplicates result. Acceptable for a
+    # button-triggered, flag-off path; tighten with a row lock if it matters.
     existing = await _get_submission_row(merchant_id, url)
     if existing and (existing.get("last_status") in _INFLIGHT_STATUSES):
         return {
