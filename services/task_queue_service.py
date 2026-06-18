@@ -311,6 +311,18 @@ async def materialize_tasks_from_audit(
     }
 
 
+def _norm_host(value: Any) -> str:
+    """Strip scheme/path/query and www, lowercase — robust to bare hosts AND full
+    URLs (urlparse doesn't populate hostname for a scheme-less host)."""
+    h = str(value or "").strip().lower()
+    if "://" in h:
+        h = h.split("://", 1)[1]
+    h = h.split("/", 1)[0].split("?", 1)[0]
+    if h.startswith("www."):
+        h = h[4:]
+    return h
+
+
 async def reverify_outreach_records(
     *,
     merchant_id: str,
@@ -319,24 +331,36 @@ async def reverify_outreach_records(
 ) -> Dict[str, Any]:
     """Outreach lifecycle Step 2 — close the loop. After a new audit, check each
     PENDING outreach pitch (lever='outreach_pitch', recorded by the mark-sent
-    endpoint) against THIS run's set of hosts that INDEPENDENTLY cite the merchant
-    (authority_map.host_attribution_summary.endorsement_hosts — already lowercased
-    + www-stripped). If the pitched host now cites us, flip the record to cited
-    (evidence.outreach.status='cited' + cited_run_id/verified_at) and mark the task
-    done — the honest proof the outreach worked. Best-effort: never raises into the
-    audit worker."""
+    endpoint) against THIS run's set of hosts that INDEPENDENTLY cite THE MERCHANT
+    — an endorsement-role host (editorial / creator / community, not the merchant's
+    own listing and not a competitor's store) that ALSO cited the merchant's own
+    SKU (cites_exact_sku / cites_near_variant). If the pitched host now cites us,
+    flip the record to cited (evidence.outreach.status='cited' + cited_run_id /
+    verified_at) and mark the task done — the honest proof the outreach worked.
+    Best-effort: never raises into the audit worker."""
     from datetime import datetime, timezone
 
     from db.merchant_tasks import list_tasks_for_merchant, update_task_status
+    from services.cited_host_classifier import is_endorsement_role
 
     try:
+        # Oracle: NOT the bare endorsement_hosts roster — that includes independent
+        # hosts which grounded a category answer while recommending a COMPETITOR,
+        # i.e. a false "your pitch worked". Require the host to actually NAME the
+        # merchant's SKU (cites_exact_sku / cites_near_variant) AND be an
+        # independent endorsement role. Honest proof = the host now cites the merchant.
         amap = (audit_report or {}).get("authority_map") or {}
-        summary = amap.get("host_attribution_summary") or {}
-        citing_hosts = {
-            str(h).strip().lower()
-            for h in (summary.get("endorsement_hosts") or [])
-            if h
-        }
+        citing_hosts = set()
+        for row in amap.get("hosts") or []:
+            if not isinstance(row, dict):
+                continue
+            if not is_endorsement_role(row.get("citation_role")):
+                continue
+            if not (row.get("cites_exact_sku") or row.get("cites_near_variant")):
+                continue
+            host = _norm_host(row.get("host"))
+            if host:
+                citing_hosts.add(host)
         if not citing_hosts:
             return {"checked": 0, "flipped": 0}
 
@@ -355,7 +379,7 @@ async def reverify_outreach_records(
             outreach = evidence.get("outreach")
             if not isinstance(outreach, dict):
                 continue
-            host = str(outreach.get("host") or "").strip().lower()
+            host = _norm_host(outreach.get("host"))
             if not host or host not in citing_hosts:
                 continue
             # read-modify-write: update_task_status OVERWRITES evidence_jsonb wholesale.
