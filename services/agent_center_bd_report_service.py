@@ -5358,6 +5358,24 @@ def _wycw_why_you_fit(row: Dict[str, Any]) -> Optional[str]:
     return ", ".join(basis[:4]) if basis else None
 
 
+def _wycw_evidence(row: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+    """The verbatim AI answer behind this query — the proof, forwarded from the
+    per_prompt `cited_evidence`. For a winnable target it shows what AI says today
+    (where you can slot in); for a don't-fight row it shows AI literally routing the
+    buyer to the owner. Merchant-facing: capped excerpt + the hosts AI cited."""
+    ev = row.get("cited_evidence")
+    if not isinstance(ev, dict):
+        return None
+    excerpt = str(ev.get("excerpt") or "").strip()
+    if not excerpt:
+        return None
+    return {
+        "excerpt": excerpt[:400],
+        "cited_hosts": [str(h) for h in (ev.get("cited_hosts") or []) if h][:5],
+        "provider": ev.get("provider"),
+    }
+
+
 def build_where_you_can_win(
     per_sku_reports: List[Dict[str, Any]],
     *,
@@ -5409,6 +5427,7 @@ def build_where_you_can_win(
                         "demand_state": row.get("demand_state"),
                         "opportunity_score": score,
                         "why_you_fit": _wycw_why_you_fit(row),
+                        "evidence": _wycw_evidence(row),
                         "action": "create_answer",
                     }
             elif (
@@ -5426,6 +5445,7 @@ def build_where_you_can_win(
                         "ownership_state": row.get("ownership_state"),
                         "demand_signal": demand,
                         "competitors_named": list(ev.get("competitors_named") or [])[:3],
+                        "evidence": _wycw_evidence(row),
                     }
     targets = sorted(
         targets_by_q.values(), key=lambda t: -float(t.get("opportunity_score") or 0)

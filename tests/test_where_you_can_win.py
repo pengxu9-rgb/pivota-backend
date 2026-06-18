@@ -64,6 +64,32 @@ def test_head_terms_with_demand_become_skip():
     assert s["competitors_named"] == ["BrandA", "BrandB"]
 
 
+def test_verbatim_evidence_forwarded_to_target_and_skip():
+    """The per_prompt cited_evidence excerpt (the verbatim AI answer = the proof) is
+    forwarded onto both winnable targets and don't-fight rows, not dropped."""
+    reports = [
+        _report("BB Lab", "sku_b", [
+            {"query": "collagen for sleep", "normalized_query": "collagen for sleep",
+             "open_lane": True, "opportunity_score": 80.0, "attribute_fit": 0.9,
+             "demand_state": "open-lane", "attribute_basis": ["collagen", "sleep"],
+             "cited_evidence": {"provider": "gemini", "excerpt": "AI suggests magnesium and glycine for sleep.",
+                                "cited_hosts": ["healthline.com"], "competitors_named": []}},
+            {"query": "best collagen", "normalized_query": "best collagen",
+             "open_lane": False, "ownership_state": "retailer-owned", "demand_signal": 0.9,
+             "who_owns": "sephora.com",
+             "cited_evidence": {"provider": "gemini", "excerpt": "Sephora recommends Vital Proteins.",
+                                "cited_hosts": ["sephora.com"], "competitors_named": ["Vital Proteins"]}},
+        ]),
+    ]
+    out = build_where_you_can_win(reports)
+    target = out["targets"][0]
+    assert target["evidence"]["excerpt"] == "AI suggests magnesium and glycine for sleep."
+    assert target["evidence"]["cited_hosts"] == ["healthline.com"]
+    skip = out["skip"][0]
+    assert skip["evidence"]["excerpt"] == "Sephora recommends Vital Proteins."
+    assert skip["evidence"]["cited_hosts"] == ["sephora.com"]
+
+
 def test_no_demand_losing_term_is_not_skip():
     reports = [
         _report("X", "sku_x", [
