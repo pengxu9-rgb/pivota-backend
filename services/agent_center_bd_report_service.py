@@ -5376,6 +5376,22 @@ def _wycw_evidence(row: Dict[str, Any]) -> Optional[Dict[str, Any]]:
     }
 
 
+def _wycw_factors(row: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+    """The 'why winnable' decomposition (each 0-1) behind the opportunity_score —
+    forwarded from per_prompt opportunity_factors so the merchant sees WHY a niche
+    scores high (fit / demand / low-competition / buying-intent), not just a number."""
+    f = row.get("opportunity_factors")
+    if not isinstance(f, dict):
+        return None
+    out = {
+        "attribute_fit": f.get("attribute_fit"),
+        "demand": f.get("demand_signal"),
+        "low_competition": f.get("density_inverse"),
+        "intent": f.get("intent_weight"),
+    }
+    return out if any(v is not None for v in out.values()) else None
+
+
 def build_where_you_can_win(
     per_sku_reports: List[Dict[str, Any]],
     *,
@@ -5428,6 +5444,7 @@ def build_where_you_can_win(
                         "opportunity_score": score,
                         "why_you_fit": _wycw_why_you_fit(row),
                         "evidence": _wycw_evidence(row),
+                        "opportunity_factors": _wycw_factors(row),
                         "action": "create_answer",
                     }
             elif (

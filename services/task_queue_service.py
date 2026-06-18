@@ -188,6 +188,11 @@ def _extract_action_items(audit_report: Optional[Dict[str, Any]]) -> List[Dict[s
                     "cta_label": a.get("cta_label"),
                     "target_host": target_host,
                     "product_key": product_key,
+                    # Outcome contract — the action already carries these (set by
+                    # _normalize_action); carry them onto the task so the queue can
+                    # show "expected outcome / KPI", not just a title.
+                    "expected_outcome": a.get("expected_outcome"),
+                    "kpi_to_track": a.get("kpi_to_track"),
                 },
             })
     return out
