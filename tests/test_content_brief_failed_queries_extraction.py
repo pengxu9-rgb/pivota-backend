@@ -16,7 +16,10 @@ Post-fix the function handles both shapes:
 
 from __future__ import annotations
 
+import json
+
 from services.executor_agents.content_brief import (
+    _derive_brand_from_audit,
     _extract_failed_category_queries,
 )
 
@@ -188,3 +191,107 @@ def test_no_failures_returns_empty():
         }],
     }
     assert _extract_failed_category_queries(audit_report, cap=10) == []
+
+
+# =========================================================================
+# JSONB-as-string regression (the prod AttributeError class)
+# =========================================================================
+#
+# asyncpg / the `databases` lib can hand back a JSONB column — or a JSONB
+# value nested inside one — as a raw JSON *string* instead of a parsed
+# dict/list when the JSONB codec isn't registered. Calling `.get()` on
+# that string raised AttributeError("'str' object has no attribute 'get'")
+# in the content-brief executor (FAILED rows in the merchant "Pivota Agent
+# Activity" panel). After #869's shape guards the crash became a *silent*
+# no-op: the string fell through every isinstance() check, so the merchant
+# got zero briefs and the data was never read. The fix decodes JSON-string
+# values at each JSONB boundary before .get()/iteration — mirroring
+# db.merchant_audit_runs._decode_jsonb_field.
+#
+# The unit-test-masks-prod-bug pattern: pre-existing tests above all pass
+# the report (and nested fields) as parsed dicts/lists, which is exactly
+# what prod did NOT do. These tests feed them as JSON strings.
+
+
+_BASE_REPORT = {
+    "merchant_name": "Acme Co",
+    "per_product": [{
+        "category_visibility": {
+            "queries": [
+                {"query": "best serum under $50", "cited_urls_count": 3},
+                {"query": "vitamin c face wash", "cited_urls_count": 0},
+            ],
+            "match_details": [
+                {"query": "best serum under $50", "matched": True},
+                {"query": "vitamin c face wash", "matched": False},
+            ],
+        },
+    }],
+}
+
+
+def test_whole_report_as_json_string_is_decoded():
+    """report_jsonb arrives as a JSON string → decode, don't crash or skip."""
+    out = _extract_failed_category_queries(json.dumps(_BASE_REPORT), cap=10)
+    assert out == ["vitamin c face wash"]
+
+
+def test_per_product_as_json_string_is_decoded():
+    """The per_product array nested as a JSON string is decoded."""
+    report = {
+        **_BASE_REPORT,
+        "per_product": json.dumps(_BASE_REPORT["per_product"]),
+    }
+    assert _extract_failed_category_queries(report, cap=10) == [
+        "vitamin c face wash",
+    ]
+
+
+def test_category_visibility_as_json_string_is_decoded():
+    """The prime suspect: the nested per-SKU category_visibility JSONB
+    arrives as a JSON string. Pre-fix this crashed (`str`.get); post-#869
+    it silently yielded []; now it decodes."""
+    cv = _BASE_REPORT["per_product"][0]["category_visibility"]
+    report = {"per_product": [{"category_visibility": json.dumps(cv)}]}
+    assert _extract_failed_category_queries(report, cap=10) == [
+        "vitamin c face wash",
+    ]
+
+
+def test_queries_and_match_details_as_json_strings_are_decoded():
+    """Even the innermost arrays can be string-encoded."""
+    report = {
+        "per_product": [{
+            "category_visibility": {
+                "queries": json.dumps([{"query": "q1", "cited_urls_count": 0}]),
+                "match_details": json.dumps([{"query": "q1", "matched": False}]),
+            },
+        }],
+    }
+    assert _extract_failed_category_queries(report, cap=10) == ["q1"]
+
+
+def test_list_shape_category_visibility_as_json_string_is_decoded():
+    """Legacy list-shape category_visibility, string-encoded."""
+    report = {
+        "per_product": [{
+            "category_visibility": json.dumps([
+                {"query": "qx", "matched": False},
+            ]),
+        }],
+    }
+    assert _extract_failed_category_queries(report, cap=10) == ["qx"]
+
+
+def test_non_json_string_audit_report_still_returns_empty():
+    """A non-JSON sentinel string must NOT raise — it stays a string,
+    fails the dict guard, and returns []. (Guards db invariants the
+    existing test_non_dict_audit_report_returns_empty relies on.)"""
+    assert _extract_failed_category_queries("garbage", cap=10) == []
+
+
+def test_derive_brand_from_json_string_report():
+    """Brand derivation also decodes a string report (and tolerates junk)."""
+    assert _derive_brand_from_audit(json.dumps(_BASE_REPORT)) == "Acme Co"
+    assert _derive_brand_from_audit("garbage") == "(brand)"
+    assert _derive_brand_from_audit(None) == "(brand)"

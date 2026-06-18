@@ -63,6 +63,30 @@ def _resolve_gemini_api_key() -> Optional[str]:
     return None
 
 
+def _decode_jsonb(value: Any) -> Any:
+    """Defensive JSONB reader: asyncpg / the `databases` library may hand
+    back a JSONB column — OR a JSONB value nested inside one — as a raw
+    JSON *string* instead of a parsed dict/list, depending on whether the
+    JSONB codec was registered. When that happens, calling `.get()` (or
+    iterating-as-dict) on the string raises
+    ``AttributeError("'str' object has no attribute 'get'")`` — the same
+    class of bug fixed in db.merchant_audit_runs._decode_jsonb_field for
+    the per-SKU trend reader.
+
+    Mirrors that helper but is shape-preserving: it returns parsed dicts
+    AND lists (the content-brief walk reads array fields — per_product,
+    queries, match_details — not just objects). Non-JSON strings (e.g.
+    a literal "garbage" sentinel) are returned unchanged so downstream
+    isinstance() guards still skip them rather than mis-parsing.
+    """
+    if isinstance(value, str):
+        try:
+            return json.loads(value)
+        except (json.JSONDecodeError, ValueError):
+            return value
+    return value
+
+
 def _extract_failed_category_queries(
     audit_report: Optional[Dict[str, Any]],
     *,
@@ -79,11 +103,21 @@ def _extract_failed_category_queries(
     grounded sources at all for this query — both a failure and a
     content opportunity).
     """
+    # JSONB-as-string defense: report_jsonb (and nested values) can come
+    # back as a raw JSON string under the codec-registration race. Decode
+    # before any .get()/iteration so we read the data instead of either
+    # crashing (pre-#869) or silently skipping it (post-#869: the string
+    # fell through every isinstance guard, yielding zero briefs).
+    audit_report = _decode_jsonb(audit_report)
     if not isinstance(audit_report, dict):
         return []
     seen = set()
     out: List[str] = []
-    for product in (audit_report.get("per_product") or []):
+    per_product = _decode_jsonb(audit_report.get("per_product"))
+    if not isinstance(per_product, list):
+        per_product = []
+    for product in per_product:
+        product = _decode_jsonb(product)
         if not isinstance(product, dict):
             continue
         # Q-P1-7: defensive shape handling. `category_visibility` is a
@@ -93,8 +127,9 @@ def _extract_failed_category_queries(
         #   - list: [{"query": "...", "matched": False}, ...]  (legacy
         #     / partial-probe shape; behaves like a flat queries list
         #     with match_details inlined)
-        # Pre-fix this crashed with AttributeError on the list shape.
-        cv_raw = product.get("category_visibility")
+        # Pre-fix this crashed with AttributeError on the list shape;
+        # it can also arrive as a JSON string (nested JSONB) — decode it.
+        cv_raw = _decode_jsonb(product.get("category_visibility"))
         if isinstance(cv_raw, list):
             # List shape: each entry is already a query+match record.
             # Treat the list itself as both `queries` and inline
@@ -102,10 +137,14 @@ def _extract_failed_category_queries(
             queries_iter = cv_raw
             match_details = cv_raw
         elif isinstance(cv_raw, dict):
-            queries_iter = cv_raw.get("queries") or []
-            match_details = cv_raw.get("match_details") or []
+            queries_iter = _decode_jsonb(cv_raw.get("queries"))
+            match_details = _decode_jsonb(cv_raw.get("match_details"))
         else:
             continue
+        if not isinstance(queries_iter, list):
+            queries_iter = []
+        if not isinstance(match_details, list):
+            match_details = []
         # Index match_details by query for joining.
         md_by_query = {
             (md.get("query") or ""): md
@@ -314,6 +353,7 @@ def _derive_brand_from_audit(audit_report: Optional[Dict[str, Any]]) -> str:
     """Pull the brand name from the audit_report (uses
     `merchant_name` set by run_brand_report). Fallback to '(brand)'
     so prompt construction doesn't blow up when missing."""
+    audit_report = _decode_jsonb(audit_report)
     if isinstance(audit_report, dict):
         mn = audit_report.get("merchant_name")
         if isinstance(mn, str) and mn.strip():
