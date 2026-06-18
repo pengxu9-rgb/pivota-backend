@@ -87,3 +87,27 @@ def test_small_target_still_works():
     recs = m._build_per_sku_audit_query_records(_collagen_sku_ctx(), 14)
     assert 1 <= len(recs) <= 14
     assert all("shopper question" not in r["query"] for r in recs)
+
+
+def test_budget_inversion_specific_is_majority():
+    """Win-the-specific-long-tail: the budgeter gives the SPECIFIC stacked sidewalk
+    lane the majority of the budget, behind only a thin 2-nav + 2-head + 2-trust
+    diagnostic spine. Credit-neutral (total == target). This is the real guard for
+    the inversion (un-inverted budgeter would cap sidewalk at _sidewalk_budget≈6)."""
+    from collections import Counter
+    base = m._query_tuple_records([
+        ("where can i buy X", "intent"), ("shop X online", "intent"),
+        ("is BB legit", "review"), ("X reviews", "review"), ("does X work", "review"),
+        ("best collagen", "category"), ("what collagen should i buy", "category"),
+        ("best collagen for sleep", "category"), ("collagen for women", "category"),
+        ("vegan collagen", "attribute"), ("marine collagen", "attribute"),
+        ("X 2 box", "identity"),
+    ])
+    sidewalk = m._query_tuple_records([(f"vegan low-mol collagen stack {i}", "sidewalk") for i in range(34)])
+    out = m._budgeted_wedge_query_records(base_records=base, sidewalk_records=sidewalk, target=40, title="X")
+    axes = Counter(r["axis"] for r in out)
+    assert len(out) == 40
+    assert axes["sidewalk"] >= 20
+    assert axes["sidewalk"] > (len(out) - axes["sidewalk"])
+    assert axes["intent"] == 2
+    assert axes.get("category", 0) <= 4
