@@ -5971,6 +5971,8 @@ def build_authority_map(
                     "recommendation_class": host_recommendation_class,
                     "cited_on_category_query": False,
                     "cited_on_branded_query": False,
+                    "cites_exact_sku": False,
+                    "cites_near_variant": False,
                     "skus": set(),
                     "prompts_cited_count": 0,
                     "providers": set(),
@@ -5980,6 +5982,12 @@ def build_authority_map(
                     matrix["cited_on_category_query"] = True
                 else:
                     matrix["cited_on_branded_query"] = True
+                # Aggregate the per-SKU merchant-citation flags onto the brand-level
+                # matrix row (authority_map["hosts"]) — the outreach re-verify oracle
+                # needs "this host cited THE MERCHANT'S SKU", which previously only
+                # existed on the per-SKU rows, so the loop never flipped to cited.
+                matrix["cites_exact_sku"] = bool(matrix["cites_exact_sku"] or exact)
+                matrix["cites_near_variant"] = bool(matrix["cites_near_variant"] or near)
                 matrix["skus"].add(sku_key)
                 matrix["prompts_cited_count"] += 1
                 matrix["providers"].add(provider)
@@ -6031,6 +6039,8 @@ def build_authority_map(
             "recommendation_class": row.get("recommendation_class", "unknown"),
             "cited_on_category_query": bool(row.get("cited_on_category_query")),
             "cited_on_branded_query": bool(row.get("cited_on_branded_query")),
+            "cites_exact_sku": bool(row.get("cites_exact_sku")),
+            "cites_near_variant": bool(row.get("cites_near_variant")),
             "skus": sorted(s for s in row["skus"] if s),
             "prompts_cited_count": row["prompts_cited_count"],
             "providers": sorted(row.get("providers") or []),
