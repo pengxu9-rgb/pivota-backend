@@ -6479,7 +6479,11 @@ def _sidewalk_query_records_for_sku(
         return []
 
     graph = build_sku_attribute_graph(product)
-    target = 16 if int(prompts_per_sku or 0) > 16 else 6
+    # Win-the-specific-long-tail: generate enough stacked prompts for the specific
+    # lane to be the MAJORITY of the budget (reserve ~6 for the thin diagnostic
+    # head/branded spine). Was hard-capped at 16, which starved the only lane that
+    # can produce a win.
+    target = max(8, int(prompts_per_sku or 0) - 6)
     specs = generate_sidewalk_query_specs(
         graph,
         title=title,
@@ -6566,43 +6570,29 @@ def _budgeted_wedge_query_records(
     title: str,
     filler_pool: Optional[List[Dict[str, Any]]] = None,
 ) -> List[Dict[str, Any]]:
+    # Win-the-specific-long-tail allocation (credit-neutral; same `target`):
+    #  1. a THIN diagnostic spine — 2 navigational + 2 head + 2 trust — the honest
+    #     "yes, you lose the head term, as expected for a niche brand" anchor;
+    #  2. the SPECIFIC stacked sidewalk long-tail as the MAJORITY of the budget (the
+    #     only lane _is_open_lane can turn into a win — head terms are excluded by
+    #     design, so spending the budget on them just re-confirms predictable losses);
+    #  3. mid-specific (problem_jtbd / constraint) + remainder fill what's left.
     selected: List[Dict[str, Any]] = []
-    _append_records(
-        selected,
-        _take_axis_records(
-            base_records, {"intent"}, count=3, selected=selected,
-        ),
-        limit=target,
-    )
-    _append_records(
-        selected,
-        _take_axis_records(
-            base_records, {"review", "comparison"}, count=3, selected=selected,
-        ),
-        limit=target,
-    )
-    _append_records(
-        selected,
-        _take_axis_records(
-            base_records, {"category", "attribute"}, count=4, selected=selected,
-        ),
-        limit=target,
-    )
-    _append_records(
-        selected,
-        sidewalk_records[:_sidewalk_budget(target, len(sidewalk_records))],
-        limit=target,
-    )
-    if target > 16:
+    for axis_set, count in (
+        ({"intent"}, 2),     # navigational
+        ({"category"}, 2),   # the 2 demoted head terms (first category specs)
+        ({"review"}, 2),     # trust
+    ):
         _append_records(
             selected,
-            _take_axis_records(
-                base_records, {"brand", "objection", "identity"},
-                count=2,
-                selected=selected,
-            ),
+            _take_axis_records(base_records, axis_set, count=count, selected=selected),
             limit=target,
         )
+    # Reserve a little for mid-specific base prompts, give the rest to the stacked
+    # specific long-tail.
+    mid_reserve = min(6, max(2, target // 4))
+    sidewalk_take = max(2, target - len(selected) - mid_reserve)
+    _append_records(selected, sidewalk_records[:sidewalk_take], limit=target)
 
     selected_keys = {
         str(record.get("query") or "").strip().lower()
@@ -6662,16 +6652,12 @@ def _build_per_sku_audit_query_records(
             title=title,
             filler_pool=filler_pool,
         )
-    if target <= 16:
-        return _budgeted_wedge_query_records(
-            base_records=base_records,
-            sidewalk_records=sidewalk_records,
-            target=target,
-            title=title,
-            filler_pool=filler_pool,
-        )
-    return _fill_per_sku_query_records(
-        base_records + sidewalk_records,
+    # All target sizes go through the sidewalk-majority budgeter (was: only target<=16;
+    # target>16 took an unbudgeted base+sidewalk path that let general base prompts
+    # crowd out the specific long-tail). Credit-neutral; specific is now the majority.
+    return _budgeted_wedge_query_records(
+        base_records=base_records,
+        sidewalk_records=sidewalk_records,
         target=target,
         title=title,
         filler_pool=filler_pool,
