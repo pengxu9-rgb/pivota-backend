@@ -10311,6 +10311,49 @@ def _v2_metadata_for_action(item: Dict[str, Any]) -> Dict[str, Any]:
             "Cleaner schema improves grounded retrieval scoring; "
             "reflected in next-cycle re-audit."
         )
+    # The families below previously fell through to None for both fields,
+    # leaving the merchant a task with no "what success looks like" line.
+    elif "category" in title:
+        kpi_to_track = "First-party citation rate on category-level queries"
+        expected_outcome = (
+            "Your store starts being cited for category questions "
+            "(not only branded ones) by the next re-audit."
+        )
+    elif "close the gap" in title or "inconsistent" in title or "missing" in title:
+        kpi_to_track = "Share of buyer-intent queries that cite your URL"
+        expected_outcome = (
+            "The queries where you're cited inconsistently — or not at "
+            "all — become reliable citations by the next re-audit."
+        )
+    elif "drain" in title or "competitor" in title:
+        kpi_to_track = "Competitor citation share on your overlapping queries"
+        expected_outcome = (
+            "AI cites this competitor instead of you less often on the "
+            "queries you both compete for."
+        )
+    elif "attribution" in title or "funnel" in title:
+        kpi_to_track = "Runs where an AI answer cites your URL directly"
+        expected_outcome = (
+            "Earn your first direct AI-channel citations within "
+            "60-90 days instead of losing the funnel to resellers."
+        )
+    elif "localize" in title or "market" in title:
+        kpi_to_track = "Per-market AI visibility score"
+        expected_outcome = (
+            "Close the AI-visibility gap in the target market within "
+            "a re-audit cycle."
+        )
+
+    # Fallback: never leave a task without a concrete success line. A
+    # merchant-facing task with no expected outcome reads as busywork.
+    if kpi_to_track is None or expected_outcome is None:
+        kpi_to_track = kpi_to_track or (
+            "AI citation rate on the targeted queries (re-audit)"
+        )
+        expected_outcome = expected_outcome or (
+            "Improve how often AI shopping agents recommend your store "
+            "for these queries, confirmed on the next re-audit."
+        )
 
     return {
         "owner": owner,

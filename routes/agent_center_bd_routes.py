@@ -1170,32 +1170,26 @@ async def bd_list_tasks(
         tasks_scope = "explicit_run"
         scoped_parent_audit_run_id = explicit_run_id
         latest_audit_run_id = explicit_run_id
-    elif include_history:
-        tasks_scope = "history"
-        scoped_parent_audit_run_id = None
     else:
-        tasks_scope = "latest_completed"
+        # DEFAULT = persistent cross-audit workspace (mirrors the merchant route,
+        # page-usability Step 1). The audit-completion reconciliation closes
+        # prior-run pending tasks the latest audit dropped, so this is one clean
+        # living list, not accumulating clutter. `include_history` kept as a
+        # back-compat alias (same behavior now).
+        tasks_scope = "persistent"
+        scoped_parent_audit_run_id = None
         latest_audit_run_id = await _latest_completed_audit_run_id_for_tasks(
             merchant_id
         )
-        if latest_audit_run_id is None:
-            return {
-                "merchant_id": merchant_id,
-                "count": 0,
-                "latest_audit_run_id": None,
-                "tasks_scope": tasks_scope,
-                "tasks": [],
-            }
-        scoped_parent_audit_run_id = latest_audit_run_id
 
     tasks = await list_tasks_for_merchant(
         merchant_id=merchant_id,
         status_filter=statuses,
         limit=limit,
         parent_audit_run_id=scoped_parent_audit_run_id,
-        # Mirror the merchant route: on the latest-completed view also surface
-        # standing non-audit tasks (NULL parent_audit_run_id).
-        include_unscoped=(tasks_scope == "latest_completed"),
+        # include_unscoped only matters when scoping TO a run; with parent=None
+        # the query already returns standing NULL-parent tasks.
+        include_unscoped=(scoped_parent_audit_run_id is not None),
     )
     return {
         "merchant_id": merchant_id,

@@ -245,37 +245,47 @@ def _task_route_client(
 
 
 @pytest.mark.parametrize("route_name", ["merchant", "bd"])
-def test_tasks_route_defaults_to_latest_completed_run(
+def test_tasks_route_defaults_to_persistent_cross_audit_workspace(
     monkeypatch: pytest.MonkeyPatch,
     route_name: str,
 ) -> None:
+    """Page-usability Step 1: the default view is now the PERSISTENT cross-audit
+    workspace (was `latest_completed`, which hid prior-run tasks). One living
+    list of open work across every audit; the audit-completion reconciliation —
+    not run-id scoping — keeps it from accumulating stale rows. So the default
+    returns tasks from ALL the merchant's runs, not just the latest."""
     client, path, params, calls = _task_route_client(monkeypatch, route_name)
 
     res = client.get(path, params=params)
 
     assert res.status_code == 200, res.text
     body = res.json()
-    assert body["tasks_scope"] == "latest_completed"
+    assert body["tasks_scope"] == "persistent"
+    # latest_audit_run_id still surfaced (for header/trend display), but does NOT
+    # scope the list.
     assert body["latest_audit_run_id"] == RUN_LATEST
-    assert [task["task_id"] for task in body["tasks"]] == ["latest-1", "latest-2"]
-    assert calls[-1]["parent_audit_run_id"] == RUN_LATEST
-    # GAP B: the default Action-plan view also surfaces standing non-audit tasks.
-    assert calls[-1]["include_unscoped"] is True
+    assert [task["task_id"] for task in body["tasks"]] == [
+        "latest-1",
+        "latest-2",
+        "old-1",
+    ]
+    assert calls[-1]["parent_audit_run_id"] is None
 
 
 @pytest.mark.parametrize("route_name", ["merchant", "bd"])
-def test_tasks_route_include_history_returns_flat_all_runs_list(
+def test_tasks_route_include_history_alias_still_persistent(
     monkeypatch: pytest.MonkeyPatch,
     route_name: str,
 ) -> None:
+    """`include_history` is kept as a back-compat alias and now behaves the same
+    as the default (persistent all-runs list)."""
     client, path, params, calls = _task_route_client(monkeypatch, route_name)
 
     res = client.get(path, params={**params, "include_history": "true"})
 
     assert res.status_code == 200, res.text
     body = res.json()
-    assert body["tasks_scope"] == "history"
-    assert body["latest_audit_run_id"] is None
+    assert body["tasks_scope"] == "persistent"
     assert [task["task_id"] for task in body["tasks"]] == [
         "latest-1",
         "latest-2",
@@ -323,10 +333,14 @@ def test_tasks_route_explicit_run_keeps_cross_merchant_guard(
 
 
 @pytest.mark.parametrize("route_name", ["merchant", "bd"])
-def test_tasks_route_default_returns_empty_when_no_completed_runs(
+def test_tasks_route_persistent_shows_standing_tasks_before_first_completed_run(
     monkeypatch: pytest.MonkeyPatch,
     route_name: str,
 ) -> None:
+    """With no completed audit yet, the OLD default returned an empty list (it
+    scoped to a non-existent latest run). The persistent workspace instead shows
+    whatever open tasks exist — e.g. the merchant's own standing tasks — so the
+    queue isn't dead before the first audit completes."""
     client, path, params, calls = _task_route_client(
         monkeypatch,
         route_name,
@@ -337,7 +351,7 @@ def test_tasks_route_default_returns_empty_when_no_completed_runs(
 
     assert res.status_code == 200, res.text
     body = res.json()
-    assert body["tasks_scope"] == "latest_completed"
-    assert body["latest_audit_run_id"] is None
-    assert body["tasks"] == []
-    assert calls == []
+    assert body["tasks_scope"] == "persistent"
+    assert body["latest_audit_run_id"] is None  # no completed run to display
+    # the accessor IS called (parent=None) — not short-circuited to []
+    assert calls[-1]["parent_audit_run_id"] is None

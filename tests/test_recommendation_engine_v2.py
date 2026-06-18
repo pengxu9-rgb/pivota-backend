@@ -77,6 +77,45 @@ def test_owner_falls_back_to_joint_when_no_keyword_matches():
 
 
 # ---------------------------------------------------------------------
+# Outcome / KPI coverage — page-usability Step 1: every task must carry a
+# concrete "what success looks like" line. The families below used to fall
+# through to None for both fields (a task that reads as busywork).
+# ---------------------------------------------------------------------
+
+
+def test_every_action_gets_a_concrete_outcome_and_kpi():
+    """No action — including the previously-uncovered families and a wholly
+    generic title — may render without an expected_outcome + kpi_to_track."""
+    from services.agent_center_bd_report_service import _v2_metadata_for_action
+    titles = [
+        "Index your canonical PDPs",                       # was covered
+        "Pitch editorial host example.com",                # was covered
+        "Convert category mentions into first-party cites",  # was None
+        "Win category discovery for sleep supplements",      # was None
+        "Close the gap on inconsistent queries",             # was None
+        "Top citation drain: competitor.com",                # was None
+        "Zero direct AI-channel attribution today",          # was None
+        "Specific queries where your URL was missing",       # was None
+        "Localize for the Japan market",                     # was None
+        "Some entirely generic recommendation",             # fallback
+    ]
+    for t in titles:
+        meta = _v2_metadata_for_action({"severity": "medium", "title": t})
+        assert meta["expected_outcome"], f"no expected_outcome for: {t}"
+        assert meta["kpi_to_track"], f"no kpi_to_track for: {t}"
+
+
+def test_generic_action_uses_honest_fallback_outcome():
+    from services.agent_center_bd_report_service import _v2_metadata_for_action
+    meta = _v2_metadata_for_action({
+        "severity": "low",
+        "title": "Some entirely generic recommendation",
+    })
+    assert "AI" in meta["expected_outcome"]
+    assert "re-audit" in meta["kpi_to_track"].lower()
+
+
+# ---------------------------------------------------------------------
 # Phase derivation
 # ---------------------------------------------------------------------
 
@@ -168,16 +207,24 @@ def test_kpi_for_reclaim_attribution():
     assert "first-party citation rate" in meta["kpi_to_track"].lower()
 
 
-def test_kpi_null_for_unrecognized_action_category():
-    """Catch-all when no keyword matches: kpi/outcome are null. Better
-    to omit than fabricate."""
+def test_unrecognized_action_gets_honest_generic_outcome_not_null():
+    """REVERSAL (page-usability Step 1): the old behavior left kpi/outcome
+    NULL for unrecognized actions ("better to omit than fabricate"). But in
+    production this produced inert title-only tasks the merchant couldn't act
+    on — and real action types (creator outreach, content revision, per-SKU
+    gap repair, prompt re-test) hit this catch-all. The fallback is NOT a
+    fabricated metric: it's a truthful, generic statement of what every audit
+    task is for ("improve AI citation, confirmed at re-audit"). A concrete,
+    honest success line beats a blank one."""
     from services.agent_center_bd_report_service import _v2_metadata_for_action
     meta = _v2_metadata_for_action({
         "severity": "medium",
         "title": "Some completely unfamiliar action",
     })
-    assert meta["kpi_to_track"] is None
-    assert meta["expected_outcome"] is None
+    assert meta["kpi_to_track"]  # no longer None
+    assert meta["expected_outcome"]
+    # ...but still generic, not a specific fabricated metric
+    assert "re-audit" in meta["kpi_to_track"].lower()
 
 
 # ---------------------------------------------------------------------
