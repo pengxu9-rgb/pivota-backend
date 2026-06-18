@@ -533,16 +533,53 @@ async def find_pending_supersede_candidates(
     return [_row_to_dict(r) for r in (rows or [])]
 
 
+async def list_pending_audit_tasks_excluding_run(
+    *,
+    merchant_id: str,
+    exclude_audit_run_id: str,
+) -> List[Dict[str, Any]]:
+    """Persistent-workspace reconciliation (page-usability Step 1): the prior
+    `pending` tasks that came from an audit run OTHER than the one just
+    materialized. The caller decides which to close based on whether the new
+    audit actually re-covered each task's product (scope-aware — an audit of
+    SKU-B must NOT close SKU-A's still-valid tasks).
+
+    Scope is deliberately narrow:
+      - `pending` only — never `in_progress` (don't steal in-flight work).
+      - non-NULL `parent_audit_run_id` — standing non-audit tasks
+        (niche_content / outreach_pitch / sku_evidence; NULL parent) are
+        EXEMPT, so the outreach re-verify loop + the merchant's own actions
+        survive.
+    """
+    await ensure_merchant_tasks_table()
+    try:
+        q = merchant_tasks.select().where(
+            merchant_tasks.c.merchant_id == merchant_id,
+            merchant_tasks.c.status == "pending",
+            merchant_tasks.c.parent_audit_run_id.isnot(None),
+            merchant_tasks.c.parent_audit_run_id != exclude_audit_run_id,
+        )
+        rows = await database.fetch_all(q)
+    except Exception as exc:  # noqa: BLE001
+        logger.warning(
+            "list_pending_audit_tasks_excluding_run failed merchant=%s "
+            "run=%s: %s",
+            merchant_id, exclude_audit_run_id, str(exc)[:200],
+        )
+        return []
+    return [_row_to_dict(r) for r in (rows or [])]
+
+
 async def mark_task_superseded(
     *,
     task_id: str,
-    superseded_by_task_id: str,
+    superseded_by_task_id: Optional[str] = None,
 ) -> bool:
-    """Q-P0-2: flip a pending task to `status='superseded'` and
-    point `superseded_by_task_id` at the newer task. Idempotent;
-    a no-op when the task is already terminal (done / dismissed /
-    failed / superseded). Returns True when the UPDATE matched a
-    row, False otherwise."""
+    """Q-P0-2: flip a pending task to `status='superseded'`. When a newer task
+    replaces it, `superseded_by_task_id` points at that task; for re-audit
+    reconciliation (a dropped task with no direct replacement) it stays NULL.
+    Idempotent; a no-op when the task is already terminal (done / dismissed /
+    failed / superseded). Returns True when the UPDATE matched a row."""
     await ensure_merchant_tasks_table()
     try:
         now = datetime.now(timezone.utc)

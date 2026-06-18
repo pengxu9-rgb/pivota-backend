@@ -1843,36 +1843,35 @@ async def list_merchant_tasks(
     )
     latest_audit_run_id: Optional[str] = None
     if explicit_run_id:
+        # Viewing a specific (e.g. historical) run: scope tasks to that run so a
+        # past report doesn't show today's whole queue.
         tasks_scope = "explicit_run"
         scoped_parent_audit_run_id = explicit_run_id
         latest_audit_run_id = explicit_run_id
-    elif include_history:
-        tasks_scope = "history"
-        scoped_parent_audit_run_id = None
     else:
-        tasks_scope = "latest_completed"
+        # DEFAULT = the persistent cross-audit workspace (page-usability Step 1).
+        # One living list of open work across every audit + the merchant's own
+        # standing tasks. This is now honest: the audit-completion reconciliation
+        # (materialize_tasks_from_audit) closes prior-run pending tasks the latest
+        # audit dropped, so "across all audits" no longer means "accumulating
+        # clutter". `include_history` kept as an explicit alias for back-compat.
+        tasks_scope = "persistent"
+        scoped_parent_audit_run_id = None
+        # Surface the latest completed run id for display (header/trend), without
+        # scoping the list to it.
         latest_audit_run_id = await _latest_completed_audit_run_id_for_tasks(
             merchant_id
         )
-        if latest_audit_run_id is None:
-            return {
-                "merchant_id": merchant_id,
-                "count": 0,
-                "latest_audit_run_id": None,
-                "tasks_scope": tasks_scope,
-                "tasks": [],
-            }
-        scoped_parent_audit_run_id = latest_audit_run_id
 
     tasks = await list_tasks_for_merchant(
         merchant_id=merchant_id,
         status_filter=statuses,
         limit=limit,
         parent_audit_run_id=scoped_parent_audit_run_id,
-        # On the default (latest-completed) Action-plan view, also surface standing
-        # non-audit tasks (sku_evidence / niche_content have a NULL
-        # parent_audit_run_id) so a merchant's own actions appear in the one queue.
-        include_unscoped=(tasks_scope == "latest_completed"),
+        # With no run scope (parent=None) the query already returns every task
+        # incl. standing NULL-parent ones; include_unscoped only matters when
+        # scoping TO a run.
+        include_unscoped=(scoped_parent_audit_run_id is not None),
     )
     return {
         "merchant_id": merchant_id,

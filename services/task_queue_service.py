@@ -299,16 +299,35 @@ async def materialize_tasks_from_audit(
         else:
             failures += 1
 
+    # Persistent-workspace reconciliation (page-usability Step 1): the action
+    # plan is one living cross-audit list. The loop above superseded prior
+    # pending tasks the new audit RE-EMITTED; this closes the ones it DROPPED
+    # (scope-aware), so the queue reflects current priorities instead of
+    # accumulating stale rows. in_progress + standing NULL-parent tasks survive.
+    reconciled = 0
+    try:
+        reconciled = await _reconcile_dropped_pending_tasks(
+            merchant_id=merchant_id,
+            audit_run_id=audit_run_id,
+            covered_product_keys=_covered_product_keys(audit_report),
+        )
+    except Exception as exc:  # noqa: BLE001
+        logger.warning(
+            "task_queue: reconcile dropped-pending failed audit=%s: %s",
+            audit_run_id, str(exc)[:200],
+        )
+
     logger.info(
         "task_queue: audit=%s merchant=%s materialized=%d "
-        "superseded=%d links=%d skipped_pitch=%d failures=%d",
+        "superseded=%d reconciled=%d links=%d skipped_pitch=%d failures=%d",
         audit_run_id, merchant_id, materialized, superseded_total,
-        links_established, skipped_pitch, failures,
+        reconciled, links_established, skipped_pitch, failures,
     )
     return {
         "audit_run_id": audit_run_id,
         "materialized": materialized,
         "superseded_prior_pending": superseded_total,
+        "reconciled_dropped_pending": reconciled,
         "links_established": links_established,
         "skipped_pitch_only": skipped_pitch,
         "failures": failures,
@@ -479,6 +498,62 @@ async def _supersede_prior_pending(
         if ok:
             superseded += 1
     return superseded
+
+
+def _covered_product_keys(audit_report: Dict[str, Any]) -> set:
+    """The products this audit actually assessed — used to keep reconciliation
+    scope-aware (a SKU-scoped audit must not close tasks for SKUs it never
+    looked at). Reads both the per-SKU shape (`per_sku_reports`) and the legacy
+    brand shape (`per_product`). Lowercased product/sku keys."""
+    keys: set = set()
+    rpt = audit_report or {}
+    sources = list(rpt.get("per_sku_reports") or [])
+    brand = rpt.get("brand_report") if isinstance(rpt.get("brand_report"), dict) else rpt
+    sources += list((brand or {}).get("per_product") or [])
+    for r in sources:
+        if isinstance(r, dict):
+            pk = r.get("product_key") or r.get("sku_key")
+            if pk:
+                keys.add(str(pk).lower())
+    return keys
+
+
+async def _reconcile_dropped_pending_tasks(
+    *,
+    merchant_id: str,
+    audit_run_id: str,
+    covered_product_keys: set,
+) -> int:
+    """Close prior-run `pending` tasks the latest audit no longer surfaces, so
+    the persistent cross-audit queue reflects current priorities. Scope-aware to
+    avoid false-closes:
+      - a per-product task (evidence.product_key set) is closed ONLY if this
+        audit re-covered that product — an audit of SKU-B must not close SKU-A's
+        still-valid tasks.
+      - a brand-level task (no product_key) is closed (every audit re-assesses
+        the brand).
+    in_progress + standing NULL-parent tasks are exempt (the DB fetch excludes
+    them). Recoverable: `superseded` is an audit-trail status, not a delete.
+    Returns the number of rows closed."""
+    from db.merchant_tasks import (
+        list_pending_audit_tasks_excluding_run,
+        mark_task_superseded,
+    )
+
+    stale = await list_pending_audit_tasks_excluding_run(
+        merchant_id=merchant_id,
+        exclude_audit_run_id=audit_run_id,
+    )
+    closed = 0
+    for task in stale:
+        evidence = task.get("evidence") or {}
+        product_key = str(evidence.get("product_key") or "").lower()
+        if product_key and product_key not in covered_product_keys:
+            # this audit didn't look at that product — leave its task alone
+            continue
+        if await mark_task_superseded(task_id=task["task_id"]):
+            closed += 1
+    return closed
 
 
 async def _link_task_to_canonical_action(
