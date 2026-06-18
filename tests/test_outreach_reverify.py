@@ -146,3 +146,50 @@ async def test_best_effort_swallows_errors(monkeypatch):
         audit_report=_report([_host_row("goodhousekeeping.com")]),
     )
     assert out["flipped"] == 0 and "error" in out
+
+
+@pytest.mark.asyncio
+async def test_reverify_against_REAL_authority_map_flips(monkeypatch):
+    """Integration regression for the loop-breaking bug the holistic review caught:
+    run reverify against a REAL build_authority_map output (the matrix-row shape
+    production actually feeds), not a hand-built row. Before the fix, matrix rows
+    (authority_map["hosts"]) lacked cites_exact_sku, so the oracle's set was always
+    empty and NO pitch ever flipped — yet the unit tests passed because they stubbed
+    the per-SKU row shape. This asserts both the structural fix and the flip."""
+    from services.agent_center_bd_report_service import build_authority_map
+
+    # An editorial (endorsement-role) host that cited the merchant's exact SKU
+    # (parsed.correct_sku=True drives `exact`).
+    run = {
+        "query": "best collagen for sleep",
+        "parsed": {"product_visible": True, "correct_sku": True},
+        "grounding_sources": [
+            {"uri": "https://www.goodhousekeeping.com/best-collagen", "title": "goodhousekeeping.com"}
+        ],
+        "url_match": {"in_grounding": False},
+    }
+    probe_runs = [{"provider": "gemini", "probe_run_id": "p1", "raw_runs": [run]}]
+    authority_map = build_authority_map(
+        [{"sku_key": "sku-1", "product_key": "prod-1"}], {"sku-1": probe_runs}
+    )
+    matrix = {h["host"]: h for h in authority_map["hosts"]}
+    # Structural guard (this assertion FAILS without the fix):
+    assert matrix["goodhousekeeping.com"]["cites_exact_sku"] is True
+
+    updates = []
+
+    async def fake_list(**kw):
+        return [_outreach_task("t1", "goodhousekeeping.com")]
+
+    async def fake_update(**kw):
+        updates.append(kw)
+        return True
+
+    monkeypatch.setattr("db.merchant_tasks.list_tasks_for_merchant", fake_list)
+    monkeypatch.setattr("db.merchant_tasks.update_task_status", fake_update)
+
+    out = await reverify_outreach_records(
+        merchant_id="m1", run_id="run-2", audit_report={"authority_map": authority_map}
+    )
+    assert out == {"checked": 1, "flipped": 1}
+    assert updates[0]["evidence"]["outreach"]["status"] == "cited"
