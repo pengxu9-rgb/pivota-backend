@@ -311,6 +311,75 @@ async def materialize_tasks_from_audit(
     }
 
 
+async def reverify_outreach_records(
+    *,
+    merchant_id: str,
+    run_id: str,
+    audit_report: Dict[str, Any],
+) -> Dict[str, Any]:
+    """Outreach lifecycle Step 2 — close the loop. After a new audit, check each
+    PENDING outreach pitch (lever='outreach_pitch', recorded by the mark-sent
+    endpoint) against THIS run's set of hosts that INDEPENDENTLY cite the merchant
+    (authority_map.host_attribution_summary.endorsement_hosts — already lowercased
+    + www-stripped). If the pitched host now cites us, flip the record to cited
+    (evidence.outreach.status='cited' + cited_run_id/verified_at) and mark the task
+    done — the honest proof the outreach worked. Best-effort: never raises into the
+    audit worker."""
+    from datetime import datetime, timezone
+
+    from db.merchant_tasks import list_tasks_for_merchant, update_task_status
+
+    try:
+        amap = (audit_report or {}).get("authority_map") or {}
+        summary = amap.get("host_attribution_summary") or {}
+        citing_hosts = {
+            str(h).strip().lower()
+            for h in (summary.get("endorsement_hosts") or [])
+            if h
+        }
+        if not citing_hosts:
+            return {"checked": 0, "flipped": 0}
+
+        # No lever filter on list_tasks_for_merchant + default limit 50 → raise the
+        # limit and filter lever in Python. Step-1 records are created `pending`.
+        tasks = await list_tasks_for_merchant(
+            merchant_id=merchant_id, status_filter=["pending"], limit=500,
+        )
+        pending_outreach = [t for t in tasks if t.get("lever") == "outreach_pitch"]
+
+        flipped = 0
+        for task in pending_outreach:
+            evidence = task.get("evidence_jsonb")
+            if not isinstance(evidence, dict):
+                continue
+            outreach = evidence.get("outreach")
+            if not isinstance(outreach, dict):
+                continue
+            host = str(outreach.get("host") or "").strip().lower()
+            if not host or host not in citing_hosts:
+                continue
+            # read-modify-write: update_task_status OVERWRITES evidence_jsonb wholesale.
+            outreach["status"] = "cited"
+            outreach["cited_run_id"] = run_id
+            outreach["verified_at"] = datetime.now(timezone.utc).isoformat()
+            evidence["outreach"] = outreach
+            task_id = task.get("task_id")
+            if task_id and await update_task_status(
+                task_id=task_id, status="done", evidence=evidence,
+            ):
+                flipped += 1
+
+        if flipped:
+            logger.info(
+                "outreach reverify: merchant=%s run=%s flipped %d/%d pitch(es) to cited",
+                merchant_id, run_id, flipped, len(pending_outreach),
+            )
+        return {"checked": len(pending_outreach), "flipped": flipped}
+    except Exception as exc:  # best-effort: a reverify hiccup must not sink the audit
+        logger.warning("outreach reverify failed (merchant=%s): %s", merchant_id, exc)
+        return {"checked": 0, "flipped": 0, "error": str(exc)}
+
+
 async def _supersede_prior_pending(
     *,
     merchant_id: str,
