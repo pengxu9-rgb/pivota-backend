@@ -2048,6 +2048,90 @@ async def create_niche_content_task(
     return {"status": "success", "task_id": task_id, "title": title}
 
 
+class _OutreachPitchBody(BaseModel):
+    host: str = Field(..., min_length=1, max_length=256)
+    query: str = Field(..., min_length=1, max_length=400)
+    state: str = "draft_ready"  # draft_ready | submission_only
+    tier: Optional[int] = None
+    recipient_email: Optional[str] = None
+    submission_url: Optional[str] = None
+    sku_key: Optional[str] = None
+    sku_title: Optional[str] = None
+    channel: Optional[str] = None  # mailto | submission_form
+    audit_run_id: Optional[str] = None
+
+
+@router.post("/tasks/outreach-pitch")
+async def mark_outreach_pitch_sent(
+    body: _OutreachPitchBody,
+    merchant_id: str = Depends(get_current_merchant),
+) -> Dict[str, Any]:
+    """Outreach lifecycle Step 1: a merchant marks a win-plan pitch SENT to an
+    independent host. Persists a tracked outreach record (merchant_task,
+    lever='outreach_pitch') keyed to (host, query) so the NEXT audit can
+    re-verify whether that host now cites the merchant — the closed loop that
+    proves the lift. Idempotent: a second mark on the same host+query returns the
+    existing record. merchant_id is from the token, so a merchant only records its
+    own outreach. The sent-state lives in evidence_jsonb.outreach.status (the task
+    `status` enum has no 'sent'); created as a pending tracked row."""
+    host = (body.host or "").strip().lower()
+    query = (body.query or "").strip()
+    if not host or not query:
+        raise HTTPException(status_code=422, detail="host and query are required")
+    from datetime import datetime, timezone
+
+    from db.merchant_tasks import (
+        find_pending_supersede_candidates,
+        record_task_created,
+    )
+
+    lever = "outreach_pitch"
+    title = f"Pitch sent: {host} — {query}"[:500]
+    existing = await find_pending_supersede_candidates(
+        merchant_id=merchant_id, lever=lever, title=title,
+    )
+    if existing:
+        return {"status": "exists", "task_id": existing[0].get("task_id"), "title": title}
+
+    state = (body.state or "draft_ready").strip().lower()
+    channel = body.channel or ("submission_form" if state == "submission_only" else "mailto")
+    sku = (body.sku_title or "").strip()
+    task_body = (
+        f"You pitched {host} to get cited for “{query}”"
+        + (f" (for {sku})" if sku else "")
+        + f". We'll re-check on your next audit and tell you if {host} starts "
+        "citing you for this query."
+    )
+    task_id = await record_task_created(
+        merchant_id=merchant_id,
+        title=title,
+        body=task_body,
+        severity="medium",
+        lever=lever,
+        parent_audit_run_id=body.audit_run_id,
+        assigned_to_human="merchant",
+        evidence={
+            "kind": "outreach_pitch",
+            "outreach": {
+                "host": host,
+                "tier": body.tier,
+                "recipient_email": body.recipient_email,
+                "submission_url": body.submission_url,
+                "query": query,
+                "sku_key": body.sku_key,
+                "sku_title": body.sku_title,
+                "state": state,
+                "channel": channel,
+                "status": "sent",
+                "sent_at": datetime.now(timezone.utc).isoformat(),
+            },
+        },
+    )
+    if not task_id:
+        raise HTTPException(status_code=500, detail="could not record outreach")
+    return {"status": "success", "task_id": task_id, "title": title}
+
+
 class _TaskDismissBody(BaseModel):
     reason: str = Field(..., min_length=1, max_length=2000)
 
