@@ -5223,6 +5223,15 @@ async def build_per_sku_report(
         "verify_summary": verify_summary_out,
         "verify_outputs": verify_outputs or [],
         "opportunity": opportunity,
+        # Win-the-specific-long-tail (Step 2): specific, attribute-stacked prompts
+        # the engine built from this SKU's evidenced attributes but didn't probe —
+        # the niches to test next. [] when every generated prompt already ran (no
+        # padding). Rolled up to the brand via build_suggested_prompts.
+        "suggested_prompts": _suggested_prompts_for_sku(
+            sku_ctx,
+            opportunity=opportunity if isinstance(opportunity, dict) else {},
+            attribute_graph=attribute_graph,
+        ),
         "next_best_action": next_best_action,
     }
     if checkout_handoff:
@@ -6504,6 +6513,126 @@ def _sidewalk_query_records_for_sku(
             "intent_weight": float(spec.get("intent_weight") or 0.0),
         })
     return _dedupe_query_spec_records(records)
+
+
+# Win-the-specific-long-tail (Step 2): how many specific candidate prompts to
+# generate per SKU (a generous deterministic pool) and how many to surface as
+# "test these next" suggestions per SKU / per brand. The pool exceeds the probe
+# budget so a rich SKU reliably yields an un-probed tail; thin SKUs naturally
+# yield fewer (honest under-fill).
+_SUGGESTED_PROMPT_POOL = 40
+_SUGGESTED_PROMPTS_PER_SKU = 6
+_SUGGESTED_PROMPTS_BRAND_MAX = 12
+
+
+def _suggested_prompts_for_sku(
+    sku_ctx: Dict[str, Any],
+    *,
+    opportunity: Dict[str, Any],
+    attribute_graph: Mapping[str, Any],
+    max_suggestions: int = _SUGGESTED_PROMPTS_PER_SKU,
+) -> List[Dict[str, Any]]:
+    """Step 2 of win-the-specific-long-tail: surface the specific, attribute-stacked
+    prompts the engine BUILDS from this SKU's evidenced attributes but did NOT probe
+    in this audit — the niches the merchant is positioned to own and can test next.
+
+    Deterministic, no API churn (`generate_sidewalk_query_specs` is pure). Honest:
+    we subtract every query that WAS probed (any axis), so a thin SKU whose every
+    generated prompt already ran yields [] — no synthetic padding, no re-listing
+    what the audit already measured.
+    """
+    product = _get_product(sku_ctx or {})
+    if not _product_has_attributes_raw(product):
+        return []
+    title = resolve_sku_identity(sku_ctx or {}).get("name") or (
+        _get_sku(sku_ctx or {}).get("title") or product.get("title") or ""
+    )
+    product_type = product.get("product_type") or product.get("category") or ""
+    specs = generate_sidewalk_query_specs(
+        attribute_graph if isinstance(attribute_graph, dict) else {},
+        title=str(title),
+        product_type=str(product_type),
+        n=_SUGGESTED_PROMPT_POOL,
+        sku_ctx=sku_ctx,
+    )
+    probed = {
+        str(row.get("normalized_query") or row.get("query") or "").strip().lower()
+        for row in ((opportunity or {}).get("per_prompt") or [])
+        if isinstance(row, dict)
+    }
+    probed.discard("")
+    out: List[Dict[str, Any]] = []
+    seen: set[str] = set()
+    for spec in specs:
+        query = str(spec.get("query") or "").strip()
+        key = query.lower()
+        if not query or key in probed or key in seen:
+            continue
+        seen.add(key)
+        out.append({
+            "query": query,
+            "attribute_basis": list(spec.get("attribute_basis") or []),
+            "intent_weight": float(spec.get("intent_weight") or 0.0),
+        })
+        if len(out) >= max_suggestions:
+            break
+    return out
+
+
+def build_suggested_prompts(
+    per_sku_reports: List[Dict[str, Any]],
+    *,
+    max_total: int = _SUGGESTED_PROMPTS_BRAND_MAX,
+) -> Dict[str, Any]:
+    """Brand-level rollup of the per-SKU `suggested_prompts`: the specific niches the
+    engine computed (from evidenced attributes) but didn't probe — the prompts the
+    merchant can 1-click add to test where they can win. Deduped by normalized
+    query across SKUs (highest intent_weight kept), ranked by specificity weight.
+
+    Disjoint from `where_you_can_win.targets` by construction: targets are PROBED
+    open lanes; these are UN-probed candidates (anything probed is filtered out
+    upstream in `_suggested_prompts_for_sku`).
+    """
+    by_q: Dict[str, Dict[str, Any]] = {}
+    for report in per_sku_reports or []:
+        if not isinstance(report, dict):
+            continue
+        identity = report.get("identity") or {}
+        sku_name = (
+            identity.get("name")
+            or report.get("sku_title")
+            or report.get("sku_key")
+        )
+        for s in report.get("suggested_prompts") or []:
+            if not isinstance(s, dict):
+                continue
+            q = str(s.get("query") or "").strip().lower()
+            if not q:
+                continue
+            iw = float(s.get("intent_weight") or 0.0)
+            prev = by_q.get(q)
+            if prev is None or iw > float(prev.get("intent_weight") or 0.0):
+                by_q[q] = {
+                    "query": s.get("query"),
+                    "normalized_query": q,
+                    "sku": sku_name,
+                    "sku_key": report.get("sku_key"),
+                    "attribute_basis": list(s.get("attribute_basis") or []),
+                    "intent_weight": iw,
+                    "source": "sidewalk_candidate",
+                }
+    prompts = sorted(
+        by_q.values(), key=lambda p: -float(p.get("intent_weight") or 0.0)
+    )[:max_total]
+    return {
+        "prompts": prompts,
+        "has_prompts": bool(prompts),
+        "rationale": (
+            "Specific, attribute-stacked prompts built from your product's verified "
+            "attributes that this audit didn't test yet — the niches you're positioned "
+            "to own. Add them to your prompts to measure where you can win."
+        ),
+    }
 
 
 def _append_records(
@@ -8729,6 +8858,11 @@ async def run_brand_report(
         # Phase 2: surface the niche-targeting the per-SKU opportunity already
         # computes as a first-class "where you can win" strategy.
         brand_rollup["where_you_can_win"] = build_where_you_can_win(per_sku_reports)
+        # Win-the-specific-long-tail (Step 2): surface the engine's computed-but-
+        # unprobed specific niches as suggested prompts the merchant can test (feeds
+        # the guided custom-prompt UI). Disjoint from where_you_can_win.targets
+        # (those are probed open lanes; these are un-probed candidates).
+        brand_rollup["suggested_prompts"] = build_suggested_prompts(per_sku_reports)
         # Issue #902 item 1: roll the per-SKU Google indexing arcs up to the
         # brand, so a merchant reads zero category citations on freshly-minted
         # Pivota canonical PDPs as indexing latency, not a content gap.
