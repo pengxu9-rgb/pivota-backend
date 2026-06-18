@@ -1246,6 +1246,7 @@ async def _materialize_tasks_and_executors(
     try:
         from services.task_queue_service import (
             materialize_tasks_from_audit,
+            reverify_outreach_records,
         )
         tasks_summary = await materialize_tasks_from_audit(
             merchant_id=merchant_id,
@@ -1259,6 +1260,13 @@ async def _materialize_tasks_and_executors(
                 or tasks_summary.get("count")
                 or 0
             )
+        # Outreach Step 2 — close the loop: flip any pitched host that now cites us
+        # to 'cited' (the proof). Best-effort (self-catching); never sinks the audit.
+        outreach_summary = await reverify_outreach_records(
+            merchant_id=merchant_id, run_id=run_id, audit_report=brand_report,
+        )
+        if isinstance(outreach_summary, dict) and outreach_summary.get("flipped"):
+            summary["outreach_cited"] = outreach_summary["flipped"]
     except Exception as exc:  # noqa: BLE001
         logger.warning(
             "audit_run_worker: task materialization failed "
