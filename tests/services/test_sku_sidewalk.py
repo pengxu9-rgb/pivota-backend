@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from collections import Counter
 from typing import Any, Dict, List
 
 import pytest
@@ -391,29 +392,25 @@ def test_per_sku_budget_mix():
         _build_per_sku_audit_query_specs,
     )
 
-    no_attrs_expected: List[tuple[str, str]] = [
-        ("where can I buy BB Lab Good Night Collagen", "intent"),
-        ("shop BB Lab Good Night Collagen online", "intent"),
-        ("BB Lab Good Night Collagen for sale", "intent"),
-        ("best collagen supplement", "category"),
-        ("what is the best collagen supplement", "category"),
-        ("top collagen supplement", "category"),
-        ("best collagen supplement to buy online", "category"),
-        ("best before bed collagen supplement", "attribute"),
-        ("best collagen supplement for skin routine", "category"),
-        ("skin routine collagen supplement", "attribute"),
-        ("mixed berry collagen supplement", "attribute"),
-        ("recommended collagen supplement", "category"),
-        ("best rated collagen supplement", "category"),
-        ("collagen supplement buying guide", "category"),
-    ]
-
+    # No-attributes SKU: diverse intent axes (head / problem_jtbd / trust / nav), the
+    # demoted-superlative forms gone as PRIMARY specs (only the demoted head pair +
+    # filler-pool variants remain). Budget-inversion + Step-1 reframe.
     no_attrs = _build_per_sku_audit_query_specs(_sku_ctx(attributes=False), 14)
-    assert no_attrs == no_attrs_expected
+    no_attrs_q = [q for q, _ in no_attrs]
+    assert len(no_attrs) == 14
+    assert "where can I buy BB Lab Good Night Collagen" in no_attrs_q   # navigational
+    assert "best collagen supplement" in no_attrs_q                     # head (kept)
+    assert "what collagen supplement should I buy" in no_attrs_q        # head (kept)
+    assert "what helps with before bed" in no_attrs_q                   # problem_jtbd
+    assert "is BB Lab legit" in no_attrs_q                              # trust
+    # removed-by-Step-1 superlative forms are no longer generated:
+    assert "what is the best collagen supplement" not in no_attrs_q
+    assert "collagen supplement buying guide" not in no_attrs_q
 
+    # Attributed SKU: the SPECIFIC stacked sidewalk long-tail is present + substantial.
     wedge = _build_per_sku_audit_query_specs(_sku_ctx(attributes=True), 14)
     assert len(wedge) == 14
-    assert 4 <= sum(1 for _query, axis in wedge if axis == "sidewalk") <= 6
+    assert sum(1 for _query, axis in wedge if axis == "sidewalk") >= 4
     assert any(query == "collagen stick no water travel" for query, _axis in wedge)
     assert not any("shoppers considering" in query for query, _axis in wedge)
 
@@ -421,11 +418,14 @@ def test_per_sku_budget_mix():
     assert metadata["collagen stick no water travel"]["attribute_basis"]
     assert metadata["collagen stick no water travel"]["evidence"]
 
+    # Large budget: specific stacked is the SINGLE LARGEST axis (the inversion) —
+    # capped only by how many stacks the SKU's attribute graph can produce.
     large = _build_per_sku_audit_query_specs(_sku_ctx(attributes=True), 40)
+    large_axes = Counter(axis for _q, axis in large)
     assert len(large) == 40
-    assert sum(1 for _query, axis in large if axis == "sidewalk") > 0
-    for spec in no_attrs_expected:
-        assert spec in large
+    assert large_axes["sidewalk"] >= 10
+    assert large_axes["sidewalk"] == max(large_axes.values())
+    assert any(q == "collagen stick no water travel" for q, _ in large)
 
 
 def test_per_sku_prompts_include_unbranded_multivitamin_discovery():
@@ -451,10 +451,12 @@ def test_per_sku_prompts_include_unbranded_multivitamin_discovery():
     queries = [query for query, _axis in specs]
 
     assert "best multivitamin" in queries
-    assert "best multivitamin for women" in queries
+    # Step 1 reframed the audience discovery query "best X for {aud}" → "{cat} for {aud}".
+    assert "multivitamin for women" in queries
     assert "iron-free multivitamin" in queries
     assert "vegan multivitamin" in queries
-    assert sum("Ritual" in query for query in queries) == 3
+    # 2 navigational + 3 trust prompts name the brand/identity (Step 1 added the trust axis).
+    assert sum("Ritual" in query for query in queries) == 5
 
 
 @pytest.mark.asyncio
