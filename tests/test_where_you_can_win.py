@@ -127,3 +127,23 @@ def test_caps_targets_and_skip():
     out = build_where_you_can_win([_report("A", "sku_a", rows)], max_targets=3)
     assert len(out["targets"]) == 3
     assert out["targets"][0]["query"] == "q9"  # highest score first
+
+
+def test_opportunity_factors_curated_and_forwarded():
+    """Step 4: the 'why winnable' decomposition is forwarded (curated: fit/demand/
+    low_competition/intent) so the merchant sees WHY a niche scores high."""
+    reports = [
+        _report("BB Lab", "sku_b", [
+            {"query": "collagen for sleep", "normalized_query": "collagen for sleep",
+             "open_lane": True, "opportunity_score": 82.0, "attribute_fit": 0.9,
+             "demand_state": "open-lane", "attribute_basis": ["collagen", "sleep"],
+             "opportunity_factors": {"attribute_fit": 0.9, "demand_signal": 0.7,
+                                     "density_inverse": 0.8, "intent_weight": 0.85,
+                                     "volume_proxy": 0.5, "actionability": 0.9, "confidence": 0.8}},
+        ]),
+    ]
+    t = build_where_you_can_win(reports)["targets"][0]
+    assert t["opportunity_score"] == 82.0
+    assert t["opportunity_factors"] == {
+        "attribute_fit": 0.9, "demand": 0.7, "low_competition": 0.8, "intent": 0.85,
+    }
