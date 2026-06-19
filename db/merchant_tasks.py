@@ -607,6 +607,30 @@ async def mark_task_superseded(
         return False
 
 
+# Levers whose action is ACCOUNT-WIDE, not per-product — submitting a sitemap /
+# requesting indexing / fixing attribution / completing onboarding is one job for
+# the whole store, not one per SKU. When such an action is emitted once per product
+# (each carrying that product's key + a " — {product}" title suffix), it reads as N
+# duplicates. Collapse them to one. Per-product levers (sku_enrichment,
+# content_publishing, niche_content, editorial_outreach, …) are NOT here — they stay
+# one-per-product.
+_BRAND_LEVEL_LEVERS = frozenset({
+    "indexing_acceleration",
+    "general_recommendation",
+    "pivota_integration",
+})
+
+
+def _dedup_base_title(title: str) -> str:
+    """Strip the trailing ' — {product}' disambiguation suffix so the same
+    brand-level action repeated across SKUs shares one identity. Brand-level base
+    titles don't naturally contain ' — ', so only the per-product suffix is removed."""
+    t = (title or "").strip()
+    if " — " in t:
+        t = t.rsplit(" — ", 1)[0].strip()
+    return t.lower()
+
+
 async def dedupe_pending_tasks(*, merchant_id: str) -> int:
     """Lazy, idempotent backlog cleanup (page-usability Step 1): collapse
     duplicate PENDING tasks that share a canonical identity
@@ -644,12 +668,20 @@ async def dedupe_pending_tasks(*, merchant_id: str) -> int:
     groups: Dict[tuple, List[Dict[str, Any]]] = {}
     for t in rows:
         ev = t.get("evidence") or {}
-        key = (
-            (t.get("lever") or "").lower(),
-            (t.get("title") or "").strip().lower(),
-            str(ev.get("target_host") or "").lower(),
-            str(ev.get("product_key") or "").lower(),
-        )
+        lever = (t.get("lever") or "").lower()
+        host = str(ev.get("target_host") or "").lower()
+        if lever in _BRAND_LEVEL_LEVERS:
+            # Account-wide action: collapse across products — drop product_key and
+            # the per-product title suffix so N per-SKU copies become one.
+            key = (lever, _dedup_base_title(t.get("title") or ""), host, "")
+        else:
+            # Per-product action: full identity, kept one-per-product.
+            key = (
+                lever,
+                (t.get("title") or "").strip().lower(),
+                host,
+                str(ev.get("product_key") or "").lower(),
+            )
         groups.setdefault(key, []).append(t)
 
     superseded = 0
