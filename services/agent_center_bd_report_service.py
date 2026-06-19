@@ -60,6 +60,7 @@ from services.cited_host_classifier import (
     merchant_relative_role,
     recommendation_class,
     ROLE_COMPETITOR,
+    ROLE_OWN_DOMAIN,
     ROLE_RELATIVE_UNCLASSIFIED,
 )
 from services.merchant_narrative_builder import build_merchant_narrative
@@ -5844,39 +5845,66 @@ def _citation_role(
 def _citation_signals(host_rows: List[Dict[str, Any]]) -> Dict[str, Any]:
     """Roll a set of cited-host rows into the findability-vs-endorsement split.
 
-      - findability = the merchant's own site + retail/marketplace listings —
-        the product is *findable* (its listings are indexed).
+      - findability = the merchant's own site + retail/marketplace listings where
+        the merchant's SKU is actually present — the product is *findable* there.
       - endorsement = independent sources (editorial / trade / creator /
-        community) that recommended it on their own merits.
-      - endorsement_category_hosts = the independent hosts that cited it on a
+        community) that recommended THIS MERCHANT on their own merits.
+      - endorsement_category_hosts = the independent hosts that recommended it on a
         category/discovery query — the only honest "AI recommends you for the
         category" evidence.
+
+    TRUTHFULNESS GATE (P0): endorsement and THIRD-PARTY findability require the host
+    to have actually NAMED the merchant — `cites_exact_sku` or `cites_near_variant`.
+    A host merely cited as a grounding source for a category answer (recommending
+    the category or a COMPETITOR) is NOT an endorsement of the merchant and is NOT
+    "you're listed there"; it surfaces under `cited_not_naming_hosts` ("who AI cites
+    instead"), never as "AI recommends you". The merchant's OWN domain is exempt —
+    its own cited page is genuine findability regardless. Before this gate, role
+    alone (editorial→endorsement, retailer→findability) produced false "you're
+    recommended / listed across X" claims for merchants never actually named.
 
     `surfaced_only_via_own_listing` is the acceptance flag: the SKU was cited,
     but only through own/retail listings, never independently endorsed — so it
     must never read as "AI recommends you".
 
-    `competitor_hosts` are surfaced separately and excluded from both signals: a
-    rival's storefront cited for the merchant's category is neither the merchant's
-    own findability nor an endorsement of it.
+    `competitor_hosts` are surfaced separately and excluded from both signals.
     """
     by_role: Dict[str, int] = {}
     findability_hosts: List[str] = []
     endorsement_hosts: List[str] = []
     endorsement_category_hosts: List[str] = []
     competitor_hosts: List[str] = []
+    # Cited as a grounding source but did NOT name the merchant — the honest
+    # "who AI cites instead of you" set (was previously mislabeled findability /
+    # endorsement purely on host role).
+    cited_not_naming_hosts: List[str] = []
     for row in host_rows or []:
         role = row.get("citation_role") or CITATION_ROLE_UNCLASSIFIED
         by_role[role] = by_role.get(role, 0) + 1
         host = row.get("host")
         if not host:
             continue
-        if is_findability_role(role):
+        names_merchant = bool(
+            row.get("cites_exact_sku") or row.get("cites_near_variant")
+        )
+        if role == ROLE_OWN_DOMAIN:
+            # The merchant's own cited page — genuine findability, no name-gate.
             findability_hosts.append(host)
+        elif is_findability_role(role):
+            # Retailer / marketplace — "you're listed there" only if your SKU is
+            # actually present; otherwise it's a retailer cited for the category.
+            if names_merchant:
+                findability_hosts.append(host)
+            else:
+                cited_not_naming_hosts.append(host)
         elif is_endorsement_role(role):
-            endorsement_hosts.append(host)
-            if row.get("cited_on_category_query"):
-                endorsement_category_hosts.append(host)
+            # Independent source — an endorsement of YOU only if it named you.
+            if names_merchant:
+                endorsement_hosts.append(host)
+                if row.get("cited_on_category_query"):
+                    endorsement_category_hosts.append(host)
+            else:
+                cited_not_naming_hosts.append(host)
         elif role == ROLE_COMPETITOR:
             competitor_hosts.append(host)
     return {
@@ -5885,6 +5913,7 @@ def _citation_signals(host_rows: List[Dict[str, Any]]) -> Dict[str, Any]:
         "endorsement_hosts": endorsement_hosts,
         "endorsement_category_hosts": endorsement_category_hosts,
         "competitor_hosts": competitor_hosts,
+        "cited_not_naming_hosts": cited_not_naming_hosts,
         "has_independent_endorsement": bool(endorsement_hosts),
         "independently_recommended_for_category": bool(endorsement_category_hosts),
         "surfaced_only_via_own_listing": bool(findability_hosts) and not endorsement_hosts,
@@ -6113,6 +6142,10 @@ def build_authority_map(
             "independently_recommended_for_category"
         ],
         "surfaced_only_via_own_listing": signals["surfaced_only_via_own_listing"],
+        # Hosts AI grounded answers in but that did NOT name the merchant — the
+        # honest "who AI cites instead of you" set (P0: kept out of endorsement/
+        # findability, which now require the merchant to be named).
+        "cited_not_naming_hosts": signals["cited_not_naming_hosts"],
     }
     return {
         "skus": sku_entries,
