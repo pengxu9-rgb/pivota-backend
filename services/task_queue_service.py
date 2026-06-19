@@ -117,6 +117,98 @@ def _canonical_action_identity(
     )
 
 
+def _nba_text(value: Any) -> str:
+    """A per-SKU next_best_action field may be a plain string or a {text/label}
+    mapping. Coerce to a clean string."""
+    if isinstance(value, str):
+        return value.strip()
+    if isinstance(value, dict):
+        for k in ("text", "label", "one_liner", "headline"):
+            v = value.get(k)
+            if isinstance(v, str) and v.strip():
+                return v.strip()
+    return ""
+
+
+def _nba_body(nba: Dict[str, Any]) -> Optional[str]:
+    """Merchant-facing body for a per-SKU task: why it matters + the first move."""
+    parts = [_nba_text(nba.get("why_this_first")), _nba_text(nba.get("first_move"))]
+    body = "  ".join(p for p in parts if p)
+    return body or None
+
+
+def _nba_severity(sku_report: Dict[str, Any]) -> str:
+    """Severity for a per-SKU enrichment task, from the citation score (the
+    outcome dimension): not-yet-visible SKUs are the urgent ones."""
+    cit = ((sku_report.get("scores") or {}).get("citation") or {}).get("score")
+    if not isinstance(cit, (int, float)):
+        return "high"
+    if cit < 40:
+        return "high"
+    if cit < 70:
+        return "medium"
+    return "low"
+
+
+def _per_sku_action_items(
+    audit_report: Dict[str, Any],
+    seen_keys: set,
+) -> List[Dict[str, Any]]:
+    """Bridge for per-SKU audits (audit_mode='per_sku'): their findings live under
+    `per_sku_reports` (NOT `per_product`), so the per_product walk yields nothing
+    and these audits would materialize ZERO tasks — the action plan would never
+    reflect the audits a merchant actually runs. Turn each SKU's already-computed
+    `next_best_action` (the per-product 'what to do next') into one task.
+
+    The NBA headline already names the product, so these read as distinct rows.
+    Interactive surfaces (where_you_can_win 'create the answer', win-plan pitches)
+    are intentionally NOT auto-materialized — they create tasks on click."""
+    out: List[Dict[str, Any]] = []
+    for r in (audit_report.get("per_sku_reports") or []):
+        if not isinstance(r, dict):
+            continue
+        nba = r.get("next_best_action")
+        if not isinstance(nba, dict) or nba.get("is_empty"):
+            continue
+        title = _nba_text(nba.get("headline"))
+        if not title:
+            continue
+        product_key = r.get("product_key") or r.get("sku_key")
+        key = _canonical_action_identity(
+            title=title, lever="sku_enrichment",
+            target_host=None, product_key=product_key,
+        )
+        if key in seen_keys:
+            continue
+        seen_keys.add(key)
+        tracking = [
+            t for t in (nba.get("tracking_metrics") or [])
+            if isinstance(t, str) and t.strip()
+        ]
+        cta = nba.get("cta") if isinstance(nba.get("cta"), dict) else {}
+        cta_url = cta.get("url") if (
+            isinstance(cta.get("url"), str) and cta.get("url", "").startswith("http")
+        ) else None
+        out.append({
+            "title": title,
+            "body": _nba_body(nba),
+            "severity": _nba_severity(r),
+            "lever": "sku_enrichment",
+            "evidence": {
+                "priority_order": 1,
+                "cta_url": cta_url,
+                "cta_label": (cta.get("label") if cta_url and isinstance(cta.get("label"), str) else None),
+                "target_host": None,
+                "product_key": product_key,
+                # tracking_metrics ARE the per-SKU success signal — surface them as
+                # the outcome/KPI so the task isn't a bare title.
+                "expected_outcome": (tracking[0] if tracking else None),
+                "kpi_to_track": (tracking[1] if len(tracking) > 1 else None),
+            },
+        })
+    return out
+
+
 def _extract_action_items(audit_report: Optional[Dict[str, Any]]) -> List[Dict[str, Any]]:
     """Walk per_product → merchant_view.actions (the PR-A redesign
     surface) and return the union of action items across all products.
@@ -209,6 +301,11 @@ def _extract_action_items(audit_report: Optional[Dict[str, Any]]) -> List[Dict[s
                     "kpi_to_track": a.get("kpi_to_track"),
                 },
             })
+    # Per-SKU audits carry no `per_product` (their findings are under
+    # `per_sku_reports`); bridge them so they materialize tasks too. Only when the
+    # legacy walk found nothing, so a report carrying both shapes isn't double-counted.
+    if not out:
+        out.extend(_per_sku_action_items(audit_report, seen_keys))
     return out
 
 
