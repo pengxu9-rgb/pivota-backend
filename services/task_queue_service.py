@@ -136,6 +136,12 @@ def _extract_action_items(audit_report: Optional[Dict[str, Any]]) -> List[Dict[s
         if not isinstance(product, dict):
             continue
         product_key = product.get("product_key") or product.get("merchant_pdp_url")
+        # Page-usability Step 1: the product's display name, to disambiguate
+        # per-product task titles. Brand-style actions (e.g. "Index your canonical
+        # PDPs") are emitted once PER product, so without this the queue shows N
+        # identical titles that read as duplicates (they're distinct per-SKU tasks).
+        _prod_meta = product.get("product") if isinstance(product.get("product"), dict) else {}
+        product_label = str((_prod_meta or {}).get("title") or "").strip()
         # Prefer merchant_view.actions (PR-A: data-bound, ranked)
         actions = ((product.get("merchant_view") or {}).get("actions") or [])
         if not actions:
@@ -146,6 +152,14 @@ def _extract_action_items(audit_report: Optional[Dict[str, Any]]) -> List[Dict[s
             title = a.get("title")
             if not isinstance(title, str) or not title.strip():
                 continue
+            title = title.strip()
+            # Disambiguate a per-product task whose title doesn't already name the
+            # product, so two SKUs' "Index your canonical PDPs" tasks read as the
+            # distinct tasks they are. Skip when the title already mentions the
+            # product (content-gap actions already do).
+            if product_key and product_label and product_label.lower() not in title.lower():
+                _short = product_label if len(product_label) <= 48 else f"{product_label[:45].rstrip()}…"
+                title = f"{title} — {_short}"
             lever = a.get("lever")
             # PR-codex-review-followup: derive lever from title when
             # absent (matches the same fallback in
