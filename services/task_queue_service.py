@@ -28,6 +28,7 @@ Honest scope:
 from __future__ import annotations
 
 import logging
+import re
 from typing import Any, Dict, List, Optional
 
 logger = logging.getLogger(__name__)
@@ -611,21 +612,55 @@ async def _supersede_prior_pending(
     return superseded
 
 
+_PIVOTA_SIG_RE = re.compile(r"sig_[0-9a-f]{8,}", re.IGNORECASE)
+
+
+def _product_id_variants(*values: Any) -> set:
+    """All normalized identifiers a single product may be keyed by across the
+    formats that coexist in the wild: the catalog key (`prod::merch::shopify::ID`),
+    the Pivota canonical URL (`https://agent.pivota.cc/products/sig_<hex>`), a bare
+    sku/content key, etc. Returns the lowercased raw value(s) PLUS any embedded
+    Pivota signature (`sig_<hex>`) — the one identifier the canonical-URL form and
+    the catalog form share, so a legacy task keyed by URL still matches a per-SKU
+    report keyed by catalog id (the reconciliation product_key-mismatch bug)."""
+    out: set = set()
+    for v in values:
+        if not isinstance(v, str):
+            continue
+        v = v.strip()
+        if not v:
+            continue
+        out.add(v.lower())
+        for m in _PIVOTA_SIG_RE.findall(v):
+            out.add(m.lower())
+    return out
+
+
 def _covered_product_keys(audit_report: Dict[str, Any]) -> set:
     """The products this audit actually assessed — used to keep reconciliation
-    scope-aware (a SKU-scoped audit must not close tasks for SKUs it never
-    looked at). Reads both the per-SKU shape (`per_sku_reports`) and the legacy
-    brand shape (`per_product`). Lowercased product/sku keys."""
+    scope-aware (a SKU-scoped audit must not close tasks for SKUs it never looked
+    at). Reads both the per-SKU shape (`per_sku_reports`) and the legacy brand
+    shape (`per_product`). Collects MULTIPLE normalized identifiers per product
+    (catalog key, sku/content key, canonical URL + its embedded `sig_<hex>`) so a
+    legacy task keyed by the canonical URL still matches a report keyed by the
+    catalog id."""
     keys: set = set()
     rpt = audit_report or {}
     sources = list(rpt.get("per_sku_reports") or [])
     brand = rpt.get("brand_report") if isinstance(rpt.get("brand_report"), dict) else rpt
     sources += list((brand or {}).get("per_product") or [])
     for r in sources:
-        if isinstance(r, dict):
-            pk = r.get("product_key") or r.get("sku_key")
-            if pk:
-                keys.add(str(pk).lower())
+        if not isinstance(r, dict):
+            continue
+        identity = r.get("identity") if isinstance(r.get("identity"), dict) else {}
+        prod = r.get("product") if isinstance(r.get("product"), dict) else {}
+        keys |= _product_id_variants(
+            r.get("product_key"), r.get("sku_key"), r.get("content_key"),
+            r.get("merchant_pdp_url"),
+            identity.get("canonical_url"), identity.get("content_key"),
+            prod.get("product_key"), prod.get("canonical_url"),
+            prod.get("pivota_canonical_url"), prod.get("pivota_signature_id"),
+        )
     return keys
 
 
@@ -658,8 +693,11 @@ async def _reconcile_dropped_pending_tasks(
     closed = 0
     for task in stale:
         evidence = task.get("evidence") or {}
-        product_key = str(evidence.get("product_key") or "").lower()
-        if product_key and product_key not in covered_product_keys:
+        # Match on normalized identifiers (incl. the canonical sig_<hex>), so a
+        # legacy task keyed by the canonical URL still resolves to a product the
+        # audit covered (keyed by catalog id) — the product_key-format mismatch.
+        task_ids = _product_id_variants(evidence.get("product_key"))
+        if task_ids and not (task_ids & covered_product_keys):
             # this audit didn't look at that product — leave its task alone
             continue
         if await mark_task_superseded(task_id=task["task_id"]):
