@@ -1181,6 +1181,14 @@ async def bd_list_tasks(
         latest_audit_run_id = await _latest_completed_audit_run_id_for_tasks(
             merchant_id
         )
+        # Lazy, idempotent backlog dedup (mirrors the merchant route): collapse
+        # duplicate pending tasks on read so the persistent queue self-heals.
+        try:
+            from db.merchant_tasks import dedupe_pending_tasks
+
+            await dedupe_pending_tasks(merchant_id=merchant_id)
+        except Exception:  # noqa: BLE001
+            logger.debug("dedupe_pending_tasks skipped", exc_info=True)
 
     tasks = await list_tasks_for_merchant(
         merchant_id=merchant_id,

@@ -605,3 +605,67 @@ async def mark_task_superseded(
             task_id, superseded_by_task_id, str(exc)[:200],
         )
         return False
+
+
+async def dedupe_pending_tasks(*, merchant_id: str) -> int:
+    """Lazy, idempotent backlog cleanup (page-usability Step 1): collapse
+    duplicate PENDING tasks that share a canonical identity
+    (lever, title, evidence.target_host, evidence.product_key) down to the
+    NEWEST one, superseding the older copies onto it.
+
+    Self-healing: run best-effort whenever the persistent action plan is listed,
+    so the queue de-duplicates itself without waiting for the next audit's
+    reconciliation (the old `latest_completed` scope was masking an accumulated
+    pile of identical pending tasks across runs; the persistent scope surfaced
+    them). A no-op once clean — no duplicate group → no writes. Only PENDING rows
+    are touched (in_progress / terminal rows are never collapsed). Returns the
+    number of rows superseded."""
+    await ensure_merchant_tasks_table()
+    try:
+        rows = [
+            _row_to_dict(r)
+            for r in (
+                await database.fetch_all(
+                    merchant_tasks.select().where(
+                        merchant_tasks.c.merchant_id == merchant_id,
+                        merchant_tasks.c.status == "pending",
+                    )
+                )
+                or []
+            )
+        ]
+    except Exception as exc:  # noqa: BLE001
+        logger.warning(
+            "dedupe_pending_tasks fetch failed for %s: %s",
+            merchant_id, str(exc)[:200],
+        )
+        return 0
+
+    groups: Dict[tuple, List[Dict[str, Any]]] = {}
+    for t in rows:
+        ev = t.get("evidence") or {}
+        key = (
+            (t.get("lever") or "").lower(),
+            (t.get("title") or "").strip().lower(),
+            str(ev.get("target_host") or "").lower(),
+            str(ev.get("product_key") or "").lower(),
+        )
+        groups.setdefault(key, []).append(t)
+
+    superseded = 0
+    for group in groups.values():
+        if len(group) < 2:
+            continue
+        # Keep the newest (created_at desc — ISO strings sort lexically); collapse
+        # the older identical copies onto it.
+        ordered = sorted(
+            group, key=lambda r: r.get("created_at") or "", reverse=True
+        )
+        keep = ordered[0]
+        for dup in ordered[1:]:
+            if await mark_task_superseded(
+                task_id=dup["task_id"],
+                superseded_by_task_id=keep["task_id"],
+            ):
+                superseded += 1
+    return superseded
