@@ -43,6 +43,7 @@ from services.brand_alias import (
     derive_brand_aliases,
     text_mentions_brand,
 )
+from services.competitor_brand_filter import filter_competitor_brands
 from services.buyer_path_stable_controllers import (
     stable_buyer_path_controller_hosts,
     stable_buyer_path_controllers_for_row,
@@ -4457,6 +4458,103 @@ def _store_as_destination(
         "total": total,
         "routed_to_instead": routed[:8],
     }
+
+
+_BRAND_MATCH_STOPWORDS = frozenset({
+    "co", "ltd", "inc", "llc", "gmbh", "corp", "company", "the", "of", "and",
+    "global", "official", "store", "shop",
+})
+
+
+def _brand_core_words(name: str) -> set:
+    """The significant words of a brand/product name (normalized via
+    derive_brand_aliases, legal/stop words dropped). Two names refer to the same
+    brand when their core words overlap — robust to legal suffixes + extra product
+    words ('NUTRIONE BB Lab' shares 'nutrione' with catalog brand 'NUTRIONE CO
+    LTD'). Errs toward MORE overlap, so the C3 match errs toward 'carried' — it
+    never falsely tells a merchant to stock something they already have."""
+    words: set = set()
+    for form in derive_brand_aliases(name or ""):
+        for w in str(form).split():
+            w = w.strip().lower()
+            if len(w) >= 2 and w not in _BRAND_MATCH_STOPWORDS:
+                words.add(w)
+    return words
+
+
+async def _carried_brand_words(merchant_id: str) -> frozenset:
+    """C3 — the significant brand words across every brand the merchant CARRIES
+    (its catalog brands). Best-effort: empty set on failure (caller suppresses C3
+    rather than emit false 'not carried' suggestions)."""
+    from db.database import database
+
+    try:
+        rows = await database.fetch_all(
+            "SELECT DISTINCT brand FROM catalog_products "
+            "WHERE merchant_id = :m AND brand IS NOT NULL AND brand <> '' "
+            "AND sync_status = 'live'",
+            {"m": merchant_id},
+        )
+    except Exception as exc:  # noqa: BLE001
+        logger.warning(
+            "C3 carried-brands fetch failed for %s: %s", merchant_id, str(exc)[:200]
+        )
+        return frozenset()
+    words: set = set()
+    for r in rows or []:
+        words |= _brand_core_words(r["brand"] or "")
+    return frozenset(words)
+
+
+async def _winning_products_not_carried(
+    merchant_id: str,
+    win_plan: Optional[Dict[str, Any]],
+    *,
+    cap: int = 12,
+) -> List[Dict[str, Any]]:
+    """C3 — for a RESELLER: the winning competitor products AI names that the
+    merchant does NOT carry (a stocking / sourcing signal). Collect the competitor
+    benchmark names across losing queries, drop ingredient/category noise
+    (filter_competitor_brands), and exclude any whose brand-forms the merchant
+    already carries (derive_brand_aliases vs the catalog brands). A frontier LLM
+    can't produce this — it needs the merchant's catalog x the measured winners.
+    Ranked by how often AI names each; capped. Empty when the merchant's carried
+    brands can't be loaded (never emit a false 'not carried' suggestion)."""
+    if not isinstance(win_plan, dict) or not win_plan.get("sku_plans"):
+        return []
+    agg: Dict[str, Dict[str, Any]] = {}
+    for plan in win_plan.get("sku_plans") or []:
+        if not isinstance(plan, dict):
+            continue
+        for q in plan.get("losing_queries") or []:
+            if not isinstance(q, dict):
+                continue
+            query = str(q.get("query") or "").strip()
+            for name in filter_competitor_brands(list(q.get("competitor_benchmark") or [])):
+                key = name.strip().lower()
+                if not key:
+                    continue
+                entry = agg.setdefault(
+                    key, {"name": name.strip(), "times_named": 0, "example_queries": []}
+                )
+                entry["times_named"] += 1
+                if query and query not in entry["example_queries"]:
+                    entry["example_queries"].append(query)
+    if not agg:
+        return []
+    carried_words = await _carried_brand_words(merchant_id)
+    if not carried_words:
+        # Couldn't establish what the merchant carries — suppress rather than
+        # emit every competitor as a false "you don't carry this".
+        return []
+    out: List[Dict[str, Any]] = []
+    for entry in agg.values():
+        if _brand_core_words(entry["name"]) & carried_words:
+            continue  # shares a brand word with the catalog -> treat as carried
+        entry["example_queries"] = entry["example_queries"][:3]
+        out.append(entry)
+    out.sort(key=lambda r: -r["times_named"])
+    return out[:cap]
 
 
 def _grounding_evidence(probe_runs: Any, cap: int = 12) -> List[Dict[str, Any]]:
@@ -9196,6 +9294,16 @@ async def run_brand_report(
         except Exception:  # noqa: BLE001
             logger.warning("win_plan build failed", exc_info=True)
             win_plan = None
+        # C3 — for a reseller, the winning competitor products AI names that the
+        # merchant does NOT carry (a stocking / sourcing signal; the catalog-overlap
+        # no DIY-with-a-frontier-model can produce). Best-effort + reseller-gated.
+        if _merchant_is_reseller:
+            try:
+                brand_rollup["winning_products_not_carried"] = (
+                    await _winning_products_not_carried(str(merchant_id), win_plan)
+                )
+            except Exception:  # noqa: BLE001
+                logger.warning("C3 winning_products_not_carried failed", exc_info=True)
         # Fix 3 — merchant-grade narrative assembled from the Fix 1 resolved
         # hosts + Fix 2 findability/endorsement split + verify rollup + the Fix 4
         # win-plan rollup. No fabrication: degrades to honest "not available"
