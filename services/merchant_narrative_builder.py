@@ -364,6 +364,28 @@ def _per_sku_scorecard(
     return out
 
 
+# Human-readable explanation for each answer-quality verify skip reason, so the
+# merchant report says WHY verify didn't run rather than a bare reason code (or
+# nothing at all). Distinguishes config reasons (no verifier configured/available
+# — on us to fix) from data reasons (no answer cited you — expected until
+# citations land). Keep keys in sync with `_verify_skipped_summary` reasons.
+_VERIFY_SKIP_PHRASE = {
+    "no_verify_providers_resolved": "no answer-quality verifier was configured for this run",
+    "deepseek_not_resolved_for_verify": "the configured verifier wasn't DeepSeek",
+    "missing_deepseek_api_key": "the DeepSeek verifier wasn't available",
+    "no_citation_positive_probes": "no AI answer cited you yet, so there was nothing to fact-check",
+    "verify_sample_cap_zero": "the verify sample resolved to zero citations",
+    "no_skus_audited": "no SKUs were audited",
+}
+
+
+def _verify_skip_phrase(reason: Optional[str]) -> str:
+    key = (reason or "").strip()
+    if key in _VERIFY_SKIP_PHRASE:
+        return _VERIFY_SKIP_PHRASE[key]
+    return f"reason: {key}" if key else "reason unavailable"
+
+
 def _verify_plain(verify_summary: Optional[Dict[str, Any]]) -> Dict[str, Any]:
     vs = verify_summary if isinstance(verify_summary, dict) else {}
     status = vs.get("status") or "not_run"
@@ -393,11 +415,13 @@ def _verify_plain(verify_summary: Optional[Dict[str, Any]]) -> Dict[str, Any]:
         )
     else:
         text = (
-            "Answer-quality verify did not run for this audit "
-            f"({vs.get('reason') or status}); accuracy is unconfirmed."
+            "Answer-quality verify did not run for this audit — "
+            f"{_verify_skip_phrase(vs.get('reason') or status)}; "
+            "accuracy is unconfirmed."
         )
     return {
         "status": status,
+        "reason": vs.get("reason"),
         "verified": verified,
         "flagged": flagged,
         "checked": checked,
@@ -473,7 +497,10 @@ def _honest_limits(
             "hosts are shown."
         )
     if verify_plain.get("status") not in {"completed", "partial"}:
-        limits.append("Answer-quality (DeepSeek) verification did not run for this audit.")
+        limits.append(
+            "Answer-quality (DeepSeek) verification did not run for this audit — "
+            f"{_verify_skip_phrase(verify_plain.get('reason'))}."
+        )
     return limits
 
 
