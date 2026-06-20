@@ -16,6 +16,8 @@ import pytest
 from services.executor_agents.base import ExecutorContext
 from services.executor_agents.canonical_pdp_enrichment import (
     CanonicalPdpEnrichmentAgent,
+    _audit_thin_content_keys,
+    _resolve_candidates,
 )
 
 _MOD = "services.executor_agents.canonical_pdp_enrichment"
@@ -188,3 +190,82 @@ def test_agent_registered_in_dispatcher_and_worker():
     name = CanonicalPdpEnrichmentAgent().name
     assert name in {a.name for a in _registry()}
     assert name in _agent_registry_by_name()
+
+
+# ---------------------------------------------------------------------------
+# audit-driven candidate selection (the fix: enrich what the audit flagged)
+# ---------------------------------------------------------------------------
+
+
+def test_audit_thin_content_keys_extracts_flagged_canonical_skus():
+    report = {
+        "per_sku_reports": [
+            # thin (52 < 70) + has canonical PDP -> included
+            {"content_key": "ck-thin", "indexing_arc": {"phase": "fresh"},
+             "scores": {"content_richness": {"score": 52}}},
+            # not thin (80 >= 70) -> excluded
+            {"content_key": "ck-ready", "indexing_arc": {"phase": "fresh"},
+             "scores": {"content_richness": {"score": 80}}},
+            # thin but NO canonical PDP -> excluded (E1 can't enrich it)
+            {"content_key": "ck-nopdp", "indexing_arc": None,
+             "scores": {"content_richness": {"score": 30}}},
+            # duplicate content_key -> deduped
+            {"content_key": "ck-thin", "indexing_arc": {"phase": "fresh"},
+             "scores": {"content_richness": {"score": 20}}},
+        ]
+    }
+    assert _audit_thin_content_keys(report) == ["ck-thin"]
+    # defensive: None / unparseable string -> []
+    assert _audit_thin_content_keys(None) == []
+    assert _audit_thin_content_keys("{not json") == []
+
+
+@pytest.mark.asyncio
+async def test_resolve_candidates_prioritizes_audit_then_falls_back():
+    ctx = ExecutorContext(merchant_id="m1", audit_report={"per_sku_reports": [
+        {"content_key": "ck-1", "indexing_arc": {"x": 1},
+         "scores": {"content_richness": {"score": 50}}},
+    ]})
+    audit_cand = _candidate(source_product_id="sp-audit", content_key="ck-1")
+    catalog_cand = _candidate(source_product_id="sp-catalog", content_key="ck-9")
+    with patch(f"{_MOD}._fetch_canonical_pdps_by_content_keys", new=AsyncMock(return_value=[audit_cand])), \
+         patch(f"{_MOD}._fetch_thin_canonical_pdps", new=AsyncMock(return_value=[catalog_cand])):
+        out = await _resolve_candidates(ctx, cap=5)
+    pairs = [(c["source_product_id"], c["_candidate_source"]) for c in out]
+    assert pairs[0] == ("sp-audit", "audit")  # audit-flagged SKU first
+    assert ("sp-catalog", "catalog") in pairs  # then the catalog fallback fills
+
+
+@pytest.mark.asyncio
+async def test_resolve_candidates_catalog_only_without_audit_report():
+    ctx = ExecutorContext(merchant_id="m1")  # no audit_report
+    catalog_cand = _candidate(source_product_id="sp-catalog")
+    with patch(f"{_MOD}._fetch_canonical_pdps_by_content_keys", new=AsyncMock(return_value=[])), \
+         patch(f"{_MOD}._fetch_thin_canonical_pdps", new=AsyncMock(return_value=[catalog_cand])):
+        out = await _resolve_candidates(ctx, cap=5)
+    assert len(out) == 1 and out[0]["_candidate_source"] == "catalog"
+
+
+@pytest.mark.asyncio
+async def test_execute_enriches_the_audit_flagged_sku():
+    """The fix end-to-end: an audit-flagged thin canonical SKU gets enriched +
+    tagged source=audit (not a blind newest-5 catalog pick)."""
+    agent = CanonicalPdpEnrichmentAgent()
+    ctx = ExecutorContext(merchant_id="m1", audit_report={"per_sku_reports": [
+        {"content_key": "ck-1", "indexing_arc": {"x": 1},
+         "scores": {"content_richness": {"score": 50}}},
+    ]})
+    upsert = AsyncMock()
+    refresh = AsyncMock(return_value=True)
+    with patch(f"{_MOD}._resolve_gemini_api_key", return_value="k"), \
+         patch(f"{_MOD}._fetch_canonical_pdps_by_content_keys", new=AsyncMock(return_value=[_candidate(content_key="ck-1")])), \
+         patch(f"{_MOD}._fetch_thin_canonical_pdps", new=AsyncMock(return_value=[])), \
+         patch(f"{_MOD}._generate_enrichment", new=AsyncMock(return_value=_enrichment())), \
+         patch("db.product_enrichment.upsert_enrichment", new=upsert), \
+         patch("services.agent_pdp_view_assembler.refresh_agent_pdp_view_for_content_key", new=refresh):
+        result = await agent.execute(ctx)
+    assert result.status == "succeeded"
+    assert result.evidence["enriched_count"] == 1
+    assert result.evidence["audit_driven_count"] == 1
+    assert result.evidence["enriched"][0]["source"] == "audit"
+    upsert.assert_awaited_once()
