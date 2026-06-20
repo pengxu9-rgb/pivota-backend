@@ -23,6 +23,7 @@ from __future__ import annotations
 from typing import Any, Dict, List, Optional
 
 from services.cited_host_classifier import is_findability_role
+from services.competitor_brand_filter import is_ingredient_or_category_type
 
 # Probe axes that name the SKU/brand (branded/navigational) vs the non-branded
 # category/discovery axis. Kept local so this module has no import cycle with
@@ -146,7 +147,14 @@ def _who_ai_cites_instead(authority_map: Dict[str, Any]) -> Dict[str, Any]:
         for row in (sku.get("authority_hosts") if isinstance(sku, dict) else None) or []:
             for comp in (row.get("competitors_named") if isinstance(row, dict) else None) or []:
                 name = str(comp or "").strip()
-                if name:
+                # For CATEGORY questions ("best collagen", "best magnesium") the
+                # grounded answer names ingredient/supplement TYPES, which the
+                # extractor captures verbatim as competitors. Drop those generic
+                # types — only real competitor brands belong here. No fabrication:
+                # this only ever removes a name, never invents one, and the list
+                # degrades to empty (the caller emits an honest note) if nothing
+                # brand-like remains.
+                if name and not is_ingredient_or_category_type(name):
                     competitor_skus.setdefault(name, set()).add(sku_key)
                     competitor_prominence[name] = competitor_prominence.get(name, 0) + 1
     competitors = [

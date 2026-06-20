@@ -231,6 +231,47 @@ def test_competitor_times_named_not_inflated_by_host_fanout():
     assert vp and vp[0]["times_named"] == 1
 
 
+def test_ingredient_types_dropped_real_brand_kept_in_who_ai_cites():
+    """Category questions ('best collagen') make the grounded answer name
+    ingredient/supplement TYPES (Magnesium, Ashwagandha, Vitamin D), which the
+    extractor captures as competitors. Those generic types must be filtered out;
+    only the real brand (Thorne) survives in 'who AI cites instead'."""
+    run = {
+        "query": "best supplement for energy",
+        "axis_metadata": {"axis": "category"},
+        "parsed": {"product_visible": True, "correct_sku": True,
+                   "competitors_listed": ["Magnesium", "Ashwagandha",
+                                          "Vitamin D", "Thorne"]},
+        "grounding_sources": [{"uri": REDIR + "gh", "title": "goodhousekeeping.com"}],
+    }
+    am = _authority_map([run], host="aruen.com", brand="Aruen")
+    who = build_merchant_narrative(
+        merchant_name="Aruen", per_sku_reports=[], authority_map=am,
+    )["where_youre_losing"]["who_ai_cites_instead"]
+    names = {c["name"] for c in who["competitors"]}
+    assert names == {"Thorne"}
+
+
+def test_who_ai_cites_competitors_empty_when_only_ingredient_types():
+    """No fabrication: when every named 'competitor' is a generic ingredient
+    type, the brand competitor list degrades to empty (the host is still cited)."""
+    run = {
+        "query": "best collagen",
+        "axis_metadata": {"axis": "category"},
+        "parsed": {"product_visible": True, "correct_sku": True,
+                   "competitors_listed": ["Collagen", "Magnesium", "Probiotics"]},
+        "grounding_sources": [{"uri": REDIR + "gh", "title": "goodhousekeeping.com"}],
+    }
+    am = _authority_map([run], host="aruen.com", brand="Aruen")
+    who = build_merchant_narrative(
+        merchant_name="Aruen", per_sku_reports=[], authority_map=am,
+    )["where_youre_losing"]["who_ai_cites_instead"]
+    assert who["competitors"] == []
+    # The cited host is still surfaced, and the note explains no brand was named.
+    assert any(h["host"] == "goodhousekeeping.com" for h in who["cited_hosts"])
+    assert who["note"]
+
+
 def test_builder_degrades_on_malformed_per_sku_reports():
     """Defensive: non-dict / missing-field per-SKU entries must not raise — the
     builder degrades rather than crashing the whole brand report."""
