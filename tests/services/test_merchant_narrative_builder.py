@@ -152,6 +152,43 @@ def test_verify_summary_plain_language():
     assert "did not run" in skipped["text"]
 
 
+def test_verify_skip_reason_surfaced_in_both_places():
+    """The verify skip REASON must be human-readable in both the plain summary
+    and the 'what we didn't measure' honest-limits bullet — so a merchant can
+    tell WHY verify didn't run (config gap vs. simply not cited yet), not just
+    that it didn't. Regression for the misleading bare 'did not run' bullet."""
+    am = {"skus": [], "hosts": [], "host_attribution_summary": {}}
+
+    # Data reason — uncited merchant: nothing to fact-check (expected, not a bug).
+    narr = build_merchant_narrative(
+        merchant_name="X", per_sku_reports=[], authority_map=am,
+        verify_summary={"status": "skipped", "reason": "no_citation_positive_probes"},
+    )
+    plain = narr["verify_summary_plain"]
+    assert plain["reason"] == "no_citation_positive_probes"
+    assert "nothing to fact-check" in plain["text"]
+    limit = next(l for l in narr["honest_limits"] if "verification did not run" in l)
+    assert "nothing to fact-check" in limit
+    # The bare, reasonless sentence must be gone.
+    assert limit.rstrip() != "Answer-quality (DeepSeek) verification did not run for this audit."
+
+    # Config reason — no verifier resolved: actionable on our side.
+    narr2 = build_merchant_narrative(
+        merchant_name="X", per_sku_reports=[], authority_map=am,
+        verify_summary={"status": "skipped", "reason": "no_verify_providers_resolved"},
+    )
+    limit2 = next(l for l in narr2["honest_limits"] if "verification did not run" in l)
+    assert "no answer-quality verifier was configured" in limit2
+    assert "no answer-quality verifier was configured" in narr2["verify_summary_plain"]["text"]
+
+    # Unknown reason code still degrades gracefully (keeps the code, no crash).
+    narr3 = build_merchant_narrative(
+        merchant_name="X", per_sku_reports=[], authority_map=am,
+        verify_summary={"status": "skipped", "reason": "brand_new_reason"},
+    )
+    assert "brand_new_reason" in narr3["verify_summary_plain"]["text"]
+
+
 def test_prioritized_actions_mapped_to_growth_phases():
     per_sku = [
         {"sku_key": "a", "sku_title": "A", "next_best_action": {"primary_gap": "content", "headline": "Substantiate INCI", "first_move": "Upload COA"}},
