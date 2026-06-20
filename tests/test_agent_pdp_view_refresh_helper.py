@@ -107,6 +107,37 @@ async def test_refresh_projects_evidence_into_agent_pdp_view(monkeypatch: pytest
 
 
 @pytest.mark.asyncio
+async def test_refresh_overlays_enrichment_description_markdown(monkeypatch: pytest.MonkeyPatch) -> None:
+    """E2 publish bridge: refresh fetches the product_enrichment overlay and the
+    generated description_markdown reaches the upserted agent_pdp_view.description
+    — the wire that lets enriched copy reach the served PDP AND the
+    serving-eligibility gate (which reads that stored description)."""
+    _patch_fetches(
+        monkeypatch,
+        products=[{
+            "product_key": "pk-1", "merchant_id": "m1", "platform": "shopify",
+            "source_product_id": "sp-1", "title": "Good Night Collagen",
+            "description": "thin raw storefront description",
+            "brand": "BB Lab",
+        }],
+    )
+
+    async def fake_enrichment(products: List[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
+        return {"description_markdown": "Low-molecular collagen, 30 sticks. Halal-certified."}
+
+    monkeypatch.setattr(apv, "_fetch_enrichment_for_canonical", fake_enrichment)
+    db = _FakeDB()
+    built = await apv.refresh_agent_pdp_view_for_content_key(
+        "ck-1", refresh_source="canonical_pdp_enrichment", db=db
+    )
+    assert built is True
+    assert (
+        db.executes[0]["params"]["description"]
+        == "Low-molecular collagen, 30 sticks. Halal-certified."
+    )
+
+
+@pytest.mark.asyncio
 async def test_refresh_returns_false_when_no_products(monkeypatch: pytest.MonkeyPatch) -> None:
     _patch_fetches(monkeypatch, products=[])
     db = _FakeDB()

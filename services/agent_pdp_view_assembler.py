@@ -18,12 +18,15 @@ callers still own batching and persistence.
 from __future__ import annotations
 
 import json
+import logging
 from decimal import Decimal
 from typing import Any, Dict, List, Optional, Tuple
 
 from db.database import database
 from services.catalog_identity import normalize_gtin
 from services.title_normalization import normalize_display_title
+
+logger = logging.getLogger(__name__)
 
 # Top-N offers stored per row. Schema docstring (mig 085) says <=5;
 # matches the AggregateOffer behavior on the frontend.
@@ -621,10 +624,18 @@ def assemble_row(
     external_seed: Optional[Dict[str, Any]],
     evidence: Optional[Dict[str, Any]] = None,
     refresh_source: str = BACKFILL_REFRESH_SOURCE,
+    enrichment: Optional[Dict[str, Any]] = None,
 ) -> Optional[Dict[str, Any]]:
     """Produce the agent_pdp_view row payload from raw source rows.
     Returns None when the data is too thin to be useful (no title).
     Side-effect-free: caller persists.
+
+    `enrichment` is the Pivota product_enrichment overlay row for the canonical
+    product (E2 — the enrichment publish bridge). When it carries a
+    description_markdown, that curated/generated copy takes precedence over the
+    raw storefront description so it reaches BOTH the served PDP and the
+    serving-eligibility gate (which reads agent_pdp_view.description). Optional;
+    callers that don't pass it (the maintenance scripts) keep prior behavior.
     """
     canonical = pick_canonical(products)
     title = coalesce_first(canonical.get("title"))
@@ -641,7 +652,12 @@ def assemble_row(
         except Exception:
             seed_data = {}
 
+    # E2 publish bridge: the Pivota enrichment overlay's description_markdown
+    # outranks the raw storefront description (it's the compliance-checked,
+    # citable copy generated for the canonical PDP). None/empty falls through —
+    # coalesce_first is strip-aware, so an absent overlay can't blank the field.
     description = coalesce_first(
+        (enrichment or {}).get("description_markdown"),
         canonical.get("description"),
         seed_data.get("description"),
         seed_data.get("short_description"),
@@ -830,6 +846,37 @@ def row_to_upsert_params(row: Dict[str, Any]) -> Dict[str, Any]:
     return params
 
 
+async def _fetch_enrichment_for_canonical(
+    products: List[Dict[str, Any]],
+) -> Optional[Dict[str, Any]]:
+    """Fetch the product_enrichment overlay for a content_key's canonical product
+    (E2 — the enrichment publish bridge). Keyed by the catalog identity triple
+    (merchant_id, platform, source_product_id == platform_product_id), geo
+    'default'. Best-effort: any failure (missing table, DB hiccup) degrades to no
+    overlay rather than breaking the serve-cache rebuild — agent_pdp_view is a
+    cache, never the source of truth."""
+    if not products:
+        return None
+    canonical = pick_canonical(products)
+    merchant_id = canonical.get("merchant_id")
+    platform = canonical.get("platform")
+    source_product_id = canonical.get("source_product_id")
+    if not (merchant_id and platform and source_product_id):
+        return None
+    try:
+        from db.product_enrichment import get_enrichment
+
+        return await get_enrichment(
+            str(merchant_id), str(platform), str(source_product_id)
+        )
+    except Exception as exc:  # noqa: BLE001
+        logger.warning(
+            "agent_pdp_view enrichment overlay fetch failed (best-effort): %s",
+            str(exc)[:200],
+        )
+        return None
+
+
 async def refresh_agent_pdp_view_for_content_key(
     content_key: str,
     *,
@@ -857,6 +904,10 @@ async def refresh_agent_pdp_view_for_content_key(
     offers = await fetch_offers_for_keys(product_keys, db=read_db)
     external_seed = await fetch_external_seed_for_keys(product_keys, db=read_db)
     evidence = await fetch_evidence_for_keys(product_keys, db=read_db)
+    # E2 publish bridge: overlay the Pivota enrichment (generated/curated
+    # description_markdown) so it reaches the served PDP AND the
+    # serving-eligibility gate. Best-effort; None keeps the raw description.
+    enrichment = await _fetch_enrichment_for_canonical(products)
 
     row = assemble_row(
         content_key=content_key,
@@ -866,6 +917,7 @@ async def refresh_agent_pdp_view_for_content_key(
         external_seed=external_seed,
         evidence=evidence,
         refresh_source=refresh_source,
+        enrichment=enrichment,
     )
     if row is None:
         return False

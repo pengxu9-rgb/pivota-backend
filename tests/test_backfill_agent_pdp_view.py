@@ -141,6 +141,63 @@ def test_description_truncated_to_5000_chars() -> None:
 
 
 # ---------------------------------------------------------------------------
+# E2 — enrichment publish bridge: product_enrichment.description_markdown
+# overlays the served description so the citable copy reaches the PDP + the
+# serving-eligibility gate (which reads agent_pdp_view.description).
+# ---------------------------------------------------------------------------
+
+
+def _assemble_with_raw_desc(raw, **overrides) -> Dict[str, Any]:
+    return _assemble(
+        products=[{
+            "product_key": "pk_1",
+            "merchant_id": "m_primary",
+            "platform": "shopify",
+            "source_product_id": "sp_1",
+            "title": "Hydrating Toner",
+            "description": raw,
+            "brand": "the ordinary",
+            "product_payload": {},
+            "pdp_lifecycle_stage": "published",
+            "pivota_signature_id": "sig_x",
+            "canonical_url": "https://m.example.com/p/sp_1",
+            "sync_status": "live",
+            "product_group_id": "grp_1",
+            "group_is_primary": True,
+        }],
+        **overrides,
+    )
+
+
+def test_enrichment_description_markdown_overrides_raw_description() -> None:
+    """E2: a generated/curated description_markdown on the enrichment overlay
+    outranks the raw storefront description, so the citable copy reaches the
+    served PDP (and the serving-eligibility gate that reads it)."""
+    enriched = "Low-molecular collagen, 30 sticks. Halal-certified, easy on-the-go."
+    row = _assemble_with_raw_desc(
+        "thin raw desc",
+        enrichment={"description_markdown": enriched},
+    )
+    assert row["description"] == enriched
+
+
+def test_enrichment_empty_markdown_falls_back_to_raw_description() -> None:
+    """An empty/whitespace overlay must NOT blank the description — it falls
+    through to the raw field (coalesce_first is strip-aware)."""
+    row = _assemble_with_raw_desc(
+        "raw catalog description",
+        enrichment={"description_markdown": "   "},
+    )
+    assert row["description"] == "raw catalog description"
+
+
+def test_enrichment_absent_keeps_prior_description_behavior() -> None:
+    """No enrichment arg (the maintenance-script path) = unchanged behavior."""
+    row = _assemble_with_raw_desc("raw catalog description")
+    assert row["description"] == "raw catalog description"
+
+
+# ---------------------------------------------------------------------------
 # offer aggregation
 # ---------------------------------------------------------------------------
 
