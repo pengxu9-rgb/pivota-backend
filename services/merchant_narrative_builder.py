@@ -429,6 +429,20 @@ def _verify_plain(verify_summary: Optional[Dict[str, Any]]) -> Dict[str, Any]:
             "Answer-quality verify did not run for this audit — "
             f"{reason_phrase}; accuracy is unconfirmed."
         )
+    # The actual flagged citations: which query AI answered and WHY DeepSeek
+    # flagged it (misstates facts / doesn't support recommending you, + its note).
+    # Surfaced so "N flagged" is actionable, not just a count. Merchant-safe subset
+    # of verify_summary.flagged_probes (already aggregated + capped upstream).
+    flagged_examples = [
+        {
+            "query": q,
+            "misstates_facts": bool(p.get("misstates_facts")),
+            "unsupported_recommendation": p.get("supports_recommendation") is False,
+            "note": str(p.get("note") or "").strip()[:300],
+        }
+        for p in (vs.get("flagged_probes") or [])
+        if isinstance(p, dict) and (q := str(p.get("query") or "").strip())
+    ][:8]
     return {
         "status": status,
         "reason": reason_codes[0] if reason_codes else None,
@@ -438,6 +452,7 @@ def _verify_plain(verify_summary: Optional[Dict[str, Any]]) -> Dict[str, Any]:
         "flagged": flagged,
         "checked": checked,
         "candidates": candidates,
+        "flagged_examples": flagged_examples,
         "text": text,
     }
 

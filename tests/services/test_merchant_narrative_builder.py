@@ -221,6 +221,43 @@ def test_verify_skip_reason_read_from_brand_rollup_reasons_plural():
     assert "nothing to fact-check" in t2
 
 
+def test_verify_flagged_examples_surfaced():
+    """'N flagged for accuracy' must be actionable: the actual flagged queries +
+    WHY (misstates facts / unsupported recommendation + DeepSeek's note) surface
+    in verify_summary_plain.flagged_examples, from verify_summary.flagged_probes."""
+    am = {"skus": [], "hosts": [], "host_attribution_summary": {}}
+    narr = build_merchant_narrative(
+        merchant_name="X", per_sku_reports=[], authority_map=am,
+        verify_summary={
+            "status": "completed", "verified": 4, "flagged": 2,
+            "citation_positive_candidates": 6,
+            "flagged_probes": [
+                {"query": "best low molecular weight collagen", "misstates_facts": True,
+                 "supports_recommendation": True, "note": "Overstates absorption claims."},
+                {"query": "collagen for sleep", "misstates_facts": False,
+                 "supports_recommendation": False, "note": "Recommends a competitor instead."},
+                {"query": "", "note": "dropped — no query"},
+            ],
+        },
+    )
+    ex = narr["verify_summary_plain"]["flagged_examples"]
+    assert len(ex) == 2  # the empty-query probe is dropped
+    assert ex[0]["query"] == "best low molecular weight collagen"
+    assert ex[0]["misstates_facts"] is True
+    assert ex[0]["unsupported_recommendation"] is False
+    assert "absorption" in ex[0]["note"]
+    assert ex[1]["unsupported_recommendation"] is True
+    assert ex[1]["misstates_facts"] is False
+
+    # No flagged_probes (clean run) → empty list, never missing.
+    clean = build_merchant_narrative(
+        merchant_name="X", per_sku_reports=[], authority_map=am,
+        verify_summary={"status": "completed", "verified": 5, "flagged": 0,
+                        "citation_positive_candidates": 5},
+    )["verify_summary_plain"]
+    assert clean["flagged_examples"] == []
+
+
 def test_prioritized_actions_mapped_to_growth_phases():
     per_sku = [
         {"sku_key": "a", "sku_title": "A", "next_best_action": {"primary_gap": "content", "headline": "Substantiate INCI", "first_move": "Upload COA"}},
