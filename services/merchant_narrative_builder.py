@@ -396,6 +396,17 @@ def _verify_plain(verify_summary: Optional[Dict[str, Any]]) -> Dict[str, Any]:
     # SUBSET of those (a checked citation DeepSeek flagged for accuracy). Do not
     # add them — that double-counts and can report "checked" > candidates.
     checked = verified
+    # Reason(s) the verify pass skipped. Per-SKU summaries carry `reason`
+    # (singular); the brand ROLLUP aggregates them into `reasons` (plural list).
+    # Read both — else the brand-level narrative shows a blank "reason unavailable"
+    # while the real cause sits in `reasons`.
+    reason_codes = (
+        [str(vs["reason"])] if vs.get("reason")
+        else [str(r) for r in (vs.get("reasons") or []) if r]
+    )
+    reason_phrase = "; ".join(
+        dict.fromkeys(_verify_skip_phrase(c) for c in reason_codes)
+    ) or _verify_skip_phrase(None)
     if status in {"completed", "partial"} and checked:
         held = max(0, verified - flagged)
         accuracy = (
@@ -416,12 +427,13 @@ def _verify_plain(verify_summary: Optional[Dict[str, Any]]) -> Dict[str, Any]:
     else:
         text = (
             "Answer-quality verify did not run for this audit — "
-            f"{_verify_skip_phrase(vs.get('reason') or status)}; "
-            "accuracy is unconfirmed."
+            f"{reason_phrase}; accuracy is unconfirmed."
         )
     return {
         "status": status,
-        "reason": vs.get("reason"),
+        "reason": reason_codes[0] if reason_codes else None,
+        "reasons": reason_codes,
+        "reason_phrase": reason_phrase,
         "verified": verified,
         "flagged": flagged,
         "checked": checked,
@@ -499,7 +511,7 @@ def _honest_limits(
     if verify_plain.get("status") not in {"completed", "partial"}:
         limits.append(
             "Answer-quality (DeepSeek) verification did not run for this audit — "
-            f"{_verify_skip_phrase(verify_plain.get('reason'))}."
+            f"{verify_plain.get('reason_phrase') or _verify_skip_phrase(None)}."
         )
     return limits
 

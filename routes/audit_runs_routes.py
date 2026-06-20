@@ -52,7 +52,10 @@ from db.merchant_audit_runs import (
     recent_runs_for_merchant,
 )
 from routes.merchant_audit_routes import _check_audit_rate_limit
-from services.agent_center_bd_report_service import sanitize_report_for_merchant
+from services.agent_center_bd_report_service import (
+    _resolve_audit_verify_providers,
+    sanitize_report_for_merchant,
+)
 from services.idempotency import compute_audit_idempotency_key
 from services.merchant_audit_readiness import assess_merchant_audit_readiness
 from services.merchant_credit_balance_service import (
@@ -693,8 +696,14 @@ async def _build_preview(
     coverage: Dict[str, Any],
 ) -> Dict[str, Any]:
     providers = list(coverage.get("providers") or [])
+    # Default answer-quality verify to the engine's supported verifier(s) for the
+    # explicit/single coverage paths (the "Models to run" UI's only path), which
+    # carry verify_providers=[]. Mirrors run_brand_report's audit-time resolution
+    # (_resolve_audit_verify_providers) so the cost preview AND the stored
+    # launch.verify_providers match what actually runs; _runnable_verify_providers
+    # still preflight-skips a missing DeepSeek key (no bill for work that won't run).
     verify_providers, verify_skipped = _runnable_verify_providers(
-        list(coverage.get("verify_providers") or []),
+        _resolve_audit_verify_providers(coverage, None),
     )
     verify_sample = coverage.get("verify_sample") or {}
     cache_key = _preview_cache_key(
@@ -931,8 +940,11 @@ async def create_audit_run(
             providers=body.providers,
         )
         providers = list(coverage.get("providers") or [])
+        # Default verify to the supported verifier(s) for the explicit/single
+        # coverage paths (the UI's only path), matching the audit-time resolution
+        # in run_brand_report; preflight still skips a missing DeepSeek key.
         verify_providers, verify_skipped = _runnable_verify_providers(
-            list(coverage.get("verify_providers") or []),
+            _resolve_audit_verify_providers(coverage, None),
         )
         verify_sample = coverage.get("verify_sample") or {}
         provider_models = _resolve_audit_provider_models(
