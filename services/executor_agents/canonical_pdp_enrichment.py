@@ -154,6 +154,50 @@ def _audit_thin_content_keys(audit_report: Any) -> List[str]:
     return out
 
 
+# Cap the flagged intents threaded into one SKU's enrichment prompt — keep the
+# brief focused and the prompt bounded.
+_MAX_INTENTS_PER_SKU = 6
+
+
+def _audit_flagged_intents_by_content_key(audit_report: Any) -> Dict[str, List[str]]:
+    """Per SKU, the shopper queries where AI MENTIONED the product but did NOT
+    recommend it (verify flagged `supports_recommendation is False`) — "you show
+    up, a competitor gets the rec". These are the gaps enrichment should make the
+    PDP win, factually. Keyed by content_key so it joins onto the fetched candidate
+    rows. `misstates_facts`-only probes are EXCLUDED — asserting a corrected fact is
+    a different (parked) fix, not "give AI a reason to recommend"."""
+    rep = _decode_report(audit_report)
+    out: Dict[str, List[str]] = {}
+    for r in rep.get("per_sku_reports") or []:
+        if not isinstance(r, dict):
+            continue
+        ck = r.get("content_key")
+        if not ck:
+            continue
+        probes = ((r.get("verify_summary") or {}).get("flagged_probes")) or []
+        intents: List[str] = []
+        seen: set = set()
+        for p in probes:
+            if not isinstance(p, dict):
+                continue
+            # Only the "mention, no rec" gap. supports_recommendation must be
+            # exactly False (not None/missing) — a skipped/unparsed verdict is not
+            # a recommendation gap.
+            if p.get("supports_recommendation") is not False:
+                continue
+            q = str(p.get("query") or "").strip()
+            ql = q.lower()
+            if not q or ql in seen:
+                continue
+            seen.add(ql)
+            intents.append(q)
+            if len(intents) >= _MAX_INTENTS_PER_SKU:
+                break
+        if intents:
+            out[ck] = intents
+    return out
+
+
 async def _fetch_canonical_pdps_by_content_keys(
     merchant_id: str, content_keys: List[str], *, cap: int
 ) -> List[Dict[str, Any]]:
@@ -229,6 +273,13 @@ async def _resolve_candidates(
         )
     if len(candidates) < cap:
         _add(await _fetch_thin_canonical_pdps(merchant_id, cap=cap), "catalog")
+    # Attach the verify-flagged "mention, no rec" intents per SKU (audit signal
+    # only; catalog-fallback candidates get []). The enrichment prompt uses these
+    # to make the PDP a factual answer for intents AI currently routes to
+    # competitors — the measure -> enrich -> re-measure loop.
+    intents_map = _audit_flagged_intents_by_content_key(context.audit_report)
+    for c in candidates:
+        c["_target_intents"] = intents_map.get(c.get("content_key")) or []
     return candidates[:cap]
 
 
@@ -241,7 +292,21 @@ def _build_enrichment_prompt(candidate: Dict[str, Any]) -> str:
     raw = str(candidate.get("description") or "").strip() or "(none provided)"
     by_brand = f' by {brand}' if brand else ""
     cat_line = f"\nCategory: {category}" if category else ""
-    return f"""You are writing the official product-detail-page copy for "{title}"{by_brand}, so AI shopping agents (Gemini, ChatGPT) can accurately find, understand, and recommend it.{cat_line}
+    intents = [
+        str(i).strip()
+        for i in (candidate.get("_target_intents") or [])
+        if str(i or "").strip()
+    ][:_MAX_INTENTS_PER_SKU]
+    intents_block = ""
+    if intents:
+        listed = "\n".join(f'  - "{i}"' for i in intents)
+        intents_block = (
+            "\n\nAI shopping agents currently surface this product for these shopper "
+            "intents but recommend COMPETITORS instead. Make the copy a clear, factual "
+            "answer for each — but ONLY where the product genuinely fits; never invent a "
+            "fit, certification, ingredient, or claim to match an intent:\n" + listed
+        )
+    return f"""You are writing the official product-detail-page copy for "{title}"{by_brand}, so AI shopping agents (Gemini, ChatGPT) can accurately find, understand, and recommend it.{cat_line}{intents_block}
 
 Use grounded search to confirm REAL facts about this exact product. Write accurate, specific, non-promotional copy. Do NOT invent specs, ingredients, certifications, or any medical/health/financial claims. If you cannot verify a fact, omit it.
 
@@ -482,12 +547,16 @@ class CanonicalPdpEnrichmentAgent(BaseExecutorAgent):
                 "description_chars": len(gen["description_markdown"]),
                 "published": published,
                 "source": cand.get("_candidate_source"),
+                "targeted_intents": cand.get("_target_intents") or [],
             })
 
         evidence = {
             "candidates_total": len(candidates),
             "audit_driven_count": sum(
                 1 for c in candidates if c.get("_candidate_source") == "audit"
+            ),
+            "intent_targeted_count": sum(
+                1 for c in candidates if c.get("_target_intents")
             ),
             "enriched_count": len(enriched),
             "blocked_count": len(blocked),

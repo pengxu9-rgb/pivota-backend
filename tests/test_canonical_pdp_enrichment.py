@@ -16,7 +16,9 @@ import pytest
 from services.executor_agents.base import ExecutorContext
 from services.executor_agents.canonical_pdp_enrichment import (
     CanonicalPdpEnrichmentAgent,
+    _audit_flagged_intents_by_content_key,
     _audit_thin_content_keys,
+    _build_enrichment_prompt,
     _resolve_candidates,
 )
 
@@ -269,3 +271,100 @@ async def test_execute_enriches_the_audit_flagged_sku():
     assert result.evidence["audit_driven_count"] == 1
     assert result.evidence["enriched"][0]["source"] == "audit"
     upsert.assert_awaited_once()
+
+
+# ---------------------------------------------------------------------------
+# flagged-intent -> enrichment brief (win the queries AI mentions you on but
+# recommends competitors for)
+# ---------------------------------------------------------------------------
+
+
+def test_audit_flagged_intents_extracts_only_lost_rec():
+    """content_key -> the 'mention, no rec' intents (supports_recommendation is
+    exactly False). Excludes supports-True (incl. misstates-only-but-supported),
+    empty-query, and SKUs with no flagged probes; dedups case-insensitively."""
+    report = {
+        "per_sku_reports": [
+            {"content_key": "ck-a", "verify_summary": {"flagged_probes": [
+                {"query": "halal collagen", "supports_recommendation": False,
+                 "misstates_facts": False},
+                # supported -> not a rec gap, excluded (even if misstates a fact)
+                {"query": "collagen dosage", "supports_recommendation": True,
+                 "misstates_facts": True},
+                # missing/None supports -> skipped/unparsed verdict, not a gap
+                {"query": "best collagen", "misstates_facts": False},
+                # duplicate (case-insensitive) -> deduped
+                {"query": "Halal Collagen", "supports_recommendation": False},
+                # empty query -> dropped
+                {"query": "   ", "supports_recommendation": False},
+            ]}},
+            {"content_key": "ck-b", "verify_summary": {"flagged_probes": [
+                {"query": "marine collagen", "supports_recommendation": False}]}},
+            {"content_key": "ck-c", "verify_summary": {"flagged_probes": []}},
+            {"content_key": "ck-d"},  # no verify_summary at all
+        ]
+    }
+    assert _audit_flagged_intents_by_content_key(report) == {
+        "ck-a": ["halal collagen"],
+        "ck-b": ["marine collagen"],
+    }
+    assert _audit_flagged_intents_by_content_key(None) == {}
+    assert _audit_flagged_intents_by_content_key("{bad json") == {}
+
+
+@pytest.mark.asyncio
+async def test_resolve_candidates_attaches_target_intents_no_leak():
+    """Each candidate carries ITS sku's lost-rec intents (joined by content_key);
+    a different SKU's intents don't leak; the catalog-fallback candidate gets []."""
+    ctx = ExecutorContext(merchant_id="m1", audit_report={"per_sku_reports": [
+        {"content_key": "ck-1", "indexing_arc": {"x": 1},
+         "scores": {"content_richness": {"score": 50}},
+         "verify_summary": {"flagged_probes": [
+             {"query": "halal collagen", "supports_recommendation": False}]}},
+    ]})
+    audit_cand = _candidate(source_product_id="sp-audit", content_key="ck-1")
+    catalog_cand = _candidate(source_product_id="sp-catalog", content_key="ck-9")
+    with patch(f"{_MOD}._fetch_canonical_pdps_by_content_keys", new=AsyncMock(return_value=[audit_cand])), \
+         patch(f"{_MOD}._fetch_thin_canonical_pdps", new=AsyncMock(return_value=[catalog_cand])):
+        out = await _resolve_candidates(ctx, cap=5)
+    by_sp = {c["source_product_id"]: c for c in out}
+    assert by_sp["sp-audit"]["_target_intents"] == ["halal collagen"]
+    assert by_sp["sp-catalog"]["_target_intents"] == []  # ck-9 not audited -> no leak
+
+
+def test_build_enrichment_prompt_injects_intents():
+    base = _candidate(content_key="ck-1")
+    # no intents -> no targeting block
+    p0 = _build_enrichment_prompt({**base, "_target_intents": []})
+    assert "recommend COMPETITORS" not in p0
+    # with intents -> block + each intent listed, truthfulness guard intact
+    p1 = _build_enrichment_prompt(
+        {**base, "_target_intents": ["halal collagen", "best collagen for travel"]}
+    )
+    assert "recommend COMPETITORS" in p1
+    assert '"halal collagen"' in p1 and '"best collagen for travel"' in p1
+    assert "never invent" in p1  # the in-block guard
+    assert "If you cannot verify a fact, omit it." in p1  # the standing rule
+
+
+@pytest.mark.asyncio
+async def test_execute_records_targeted_intents():
+    """Evidence carries the per-SKU targeted intents + the count, so the
+    measure -> enrich -> re-measure loop is auditable."""
+    agent = CanonicalPdpEnrichmentAgent()
+    ctx = ExecutorContext(merchant_id="m1", audit_report={"per_sku_reports": [
+        {"content_key": "ck-1", "indexing_arc": {"x": 1},
+         "scores": {"content_richness": {"score": 50}},
+         "verify_summary": {"flagged_probes": [
+             {"query": "halal collagen", "supports_recommendation": False}]}},
+    ]})
+    with patch(f"{_MOD}._resolve_gemini_api_key", return_value="k"), \
+         patch(f"{_MOD}._fetch_canonical_pdps_by_content_keys", new=AsyncMock(return_value=[_candidate(content_key="ck-1")])), \
+         patch(f"{_MOD}._fetch_thin_canonical_pdps", new=AsyncMock(return_value=[])), \
+         patch(f"{_MOD}._generate_enrichment", new=AsyncMock(return_value=_enrichment())), \
+         patch("db.product_enrichment.upsert_enrichment", new=AsyncMock()), \
+         patch("services.agent_pdp_view_assembler.refresh_agent_pdp_view_for_content_key", new=AsyncMock(return_value=True)):
+        result = await agent.execute(ctx)
+    assert result.status == "succeeded"
+    assert result.evidence["intent_targeted_count"] == 1
+    assert result.evidence["enriched"][0]["targeted_intents"] == ["halal collagen"]
