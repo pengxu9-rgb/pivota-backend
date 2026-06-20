@@ -4409,6 +4409,48 @@ def _brand_citation_by_intent(per_sku_reports: Any) -> Dict[str, Dict[str, Any]]
     return buckets
 
 
+def _store_as_destination(
+    citation_by_intent: Optional[Dict[str, Any]],
+    authority_hosts: Optional[List[Dict[str, Any]]],
+) -> Dict[str, Any]:
+    """R3 — the retailer's real win: for BUY-INTENT queries ("where to buy X", the
+    navigational axis), is the merchant's STORE the AI-routed buying destination, and
+    who does AI route buyers to INSTEAD? A retailer wins by being where AI sends the
+    buyer (vs Amazon / the brand's own site / another retailer), not by the brands it
+    carries being recommended. Reuses existing data — no new probes:
+      - rate = the navigational citation rate (the store cited on buy-intent queries;
+        merchant identity is store-only after the R1 retailer-aware fix).
+      - routed_to_instead = the hosts AI cited on branded/navigational (buy-intent)
+        queries, excluding the store — the destinations it sent buyers to instead.
+    """
+    nav = (citation_by_intent or {}).get("navigational") or {}
+    total = int(nav.get("total") or 0)
+    cited = int(nav.get("cited") or 0)
+    routed: List[Dict[str, Any]] = []
+    seen: set = set()
+    for row in authority_hosts or []:
+        if not isinstance(row, dict) or not row.get("cited_on_branded_query"):
+            continue
+        if row.get("citation_role") == ROLE_OWN_DOMAIN:
+            continue  # the store itself, not a competing destination
+        host = row.get("host")
+        if not host or host in seen:
+            continue
+        seen.add(host)
+        routed.append({
+            "host": host,
+            "role": row.get("citation_role"),
+            "times_cited": int(row.get("prompts_cited_count") or 0),
+        })
+    routed.sort(key=lambda r: -r["times_cited"])
+    return {
+        "rate": round(cited / total, 3) if total else 0.0,
+        "cited": cited,
+        "total": total,
+        "routed_to_instead": routed[:8],
+    }
+
+
 def _grounding_evidence(probe_runs: Any, cap: int = 12) -> List[Dict[str, Any]]:
     evidence: List[Dict[str, Any]] = []
     for run in _flatten_probe_runs(probe_runs):
@@ -9009,6 +9051,13 @@ async def run_brand_report(
             merchant_host=_merchant_host,
             merchant_brand=merchant_name,
             merchant_vendors=_merchant_vendors,
+        )
+        # R3 — store-as-destination (the retailer win metric): is the store the
+        # AI-routed buy path, and who does AI route to instead. Reuses the
+        # navigational citation rate + the authority hosts' buy-intent flags.
+        brand_rollup["store_as_destination"] = _store_as_destination(
+            brand_rollup.get("citation_by_intent"),
+            authority_map.get("hosts"),
         )
         median_citation = (
             (brand_rollup.get("dimensions") or {})
