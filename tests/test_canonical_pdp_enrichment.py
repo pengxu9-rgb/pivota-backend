@@ -4,6 +4,9 @@ Mocks the Gemini call, the candidate fetch, and the persistence/publish calls
 (upsert_enrichment + refresh_agent_pdp_view_for_content_key) so the test is
 pure-logic — no DB, no real LLM. The compliance guard runs for real (it's a
 pure keyword check) so the block path is exercised end-to-end.
+
+Firing tests also patch `_merchant_enabled=True` — the executor ships behind a
+safe-by-default rollout allowlist (dormant when the env var is unset).
 """
 
 from __future__ import annotations
@@ -16,6 +19,8 @@ import pytest
 from services.executor_agents.base import ExecutorContext
 from services.executor_agents.canonical_pdp_enrichment import (
     CanonicalPdpEnrichmentAgent,
+    _ALLOWLIST_ENV,
+    _merchant_enabled,
 )
 
 _MOD = "services.executor_agents.canonical_pdp_enrichment"
@@ -57,6 +62,24 @@ def _enrichment(**overrides) -> Dict[str, Any]:
 
 
 # ---------------------------------------------------------------------------
+# rollout allowlist (safe-by-default)
+# ---------------------------------------------------------------------------
+
+
+def test_merchant_enabled_semantics(monkeypatch):
+    monkeypatch.delenv(_ALLOWLIST_ENV, raising=False)
+    assert _merchant_enabled("m1") is False  # dormant by default
+    monkeypatch.setenv(_ALLOWLIST_ENV, "")
+    assert _merchant_enabled("m1") is False
+    monkeypatch.setenv(_ALLOWLIST_ENV, "*")
+    assert _merchant_enabled("m1") is True  # widen step
+    assert _merchant_enabled(None) is False
+    monkeypatch.setenv(_ALLOWLIST_ENV, "m1, m2")
+    assert _merchant_enabled("m1") is True  # staged rollout
+    assert _merchant_enabled("m3") is False
+
+
+# ---------------------------------------------------------------------------
 # should_run gating
 # ---------------------------------------------------------------------------
 
@@ -68,16 +91,28 @@ async def test_should_run_false_without_merchant_id():
 
 
 @pytest.mark.asyncio
+async def test_should_run_false_when_merchant_not_allowlisted():
+    """Even with a key + candidates, a merchant outside the allowlist is gated."""
+    agent = CanonicalPdpEnrichmentAgent()
+    with patch(f"{_MOD}._merchant_enabled", return_value=False), \
+         patch(f"{_MOD}._resolve_gemini_api_key", return_value="k"), \
+         patch(f"{_MOD}._fetch_thin_canonical_pdps", new=AsyncMock(return_value=[_candidate()])):
+        assert await agent.should_run(ExecutorContext(merchant_id="m1")) is False
+
+
+@pytest.mark.asyncio
 async def test_should_run_false_without_gemini_key():
     agent = CanonicalPdpEnrichmentAgent()
-    with patch(f"{_MOD}._resolve_gemini_api_key", return_value=None):
+    with patch(f"{_MOD}._merchant_enabled", return_value=True), \
+         patch(f"{_MOD}._resolve_gemini_api_key", return_value=None):
         assert await agent.should_run(ExecutorContext(merchant_id="m1")) is False
 
 
 @pytest.mark.asyncio
 async def test_should_run_false_when_no_candidates():
     agent = CanonicalPdpEnrichmentAgent()
-    with patch(f"{_MOD}._resolve_gemini_api_key", return_value="k"), \
+    with patch(f"{_MOD}._merchant_enabled", return_value=True), \
+         patch(f"{_MOD}._resolve_gemini_api_key", return_value="k"), \
          patch(f"{_MOD}._fetch_thin_canonical_pdps", new=AsyncMock(return_value=[])):
         assert await agent.should_run(ExecutorContext(merchant_id="m1")) is False
 
@@ -85,7 +120,8 @@ async def test_should_run_false_when_no_candidates():
 @pytest.mark.asyncio
 async def test_should_run_true_when_candidates_exist():
     agent = CanonicalPdpEnrichmentAgent()
-    with patch(f"{_MOD}._resolve_gemini_api_key", return_value="k"), \
+    with patch(f"{_MOD}._merchant_enabled", return_value=True), \
+         patch(f"{_MOD}._resolve_gemini_api_key", return_value="k"), \
          patch(f"{_MOD}._fetch_thin_canonical_pdps", new=AsyncMock(return_value=[_candidate()])):
         assert await agent.should_run(ExecutorContext(merchant_id="m1")) is True
 
@@ -96,9 +132,19 @@ async def test_should_run_true_when_candidates_exist():
 
 
 @pytest.mark.asyncio
+async def test_execute_skipped_when_not_allowlisted():
+    agent = CanonicalPdpEnrichmentAgent()
+    with patch(f"{_MOD}._merchant_enabled", return_value=False):
+        result = await agent.execute(ExecutorContext(merchant_id="m1"))
+    assert result.status == "skipped"
+    assert "allowlist" in (result.error_message or "")
+
+
+@pytest.mark.asyncio
 async def test_execute_skipped_without_key():
     agent = CanonicalPdpEnrichmentAgent()
-    with patch(f"{_MOD}._resolve_gemini_api_key", return_value=None):
+    with patch(f"{_MOD}._merchant_enabled", return_value=True), \
+         patch(f"{_MOD}._resolve_gemini_api_key", return_value=None):
         result = await agent.execute(ExecutorContext(merchant_id="m1"))
     assert result.status == "skipped"
 
@@ -106,7 +152,8 @@ async def test_execute_skipped_without_key():
 @pytest.mark.asyncio
 async def test_execute_skipped_no_candidates():
     agent = CanonicalPdpEnrichmentAgent()
-    with patch(f"{_MOD}._resolve_gemini_api_key", return_value="k"), \
+    with patch(f"{_MOD}._merchant_enabled", return_value=True), \
+         patch(f"{_MOD}._resolve_gemini_api_key", return_value="k"), \
          patch(f"{_MOD}._fetch_thin_canonical_pdps", new=AsyncMock(return_value=[])):
         result = await agent.execute(ExecutorContext(merchant_id="m1"))
     assert result.status == "skipped"
@@ -119,7 +166,8 @@ async def test_execute_enriches_and_publishes():
     agent = CanonicalPdpEnrichmentAgent()
     upsert = AsyncMock()
     refresh = AsyncMock(return_value=True)
-    with patch(f"{_MOD}._resolve_gemini_api_key", return_value="k"), \
+    with patch(f"{_MOD}._merchant_enabled", return_value=True), \
+         patch(f"{_MOD}._resolve_gemini_api_key", return_value="k"), \
          patch(f"{_MOD}._fetch_thin_canonical_pdps", new=AsyncMock(return_value=[_candidate()])), \
          patch(f"{_MOD}._generate_enrichment", new=AsyncMock(return_value=_enrichment())), \
          patch("db.product_enrichment.upsert_enrichment", new=upsert), \
@@ -130,11 +178,9 @@ async def test_execute_enriches_and_publishes():
     assert result.evidence["enriched_count"] == 1
     assert result.evidence["blocked_count"] == 0
     assert result.evidence["enriched"][0]["published"] is True
-    # persisted the long-form copy E2 publishes
     upsert.assert_awaited_once()
     upsert_data = upsert.await_args.args[4]
     assert "Low-molecular-weight collagen" in upsert_data["description_markdown"]
-    # published to the served view via the E2 bridge
     refresh.assert_awaited_once()
     assert refresh.await_args.args[0] == "ck-1"
 
@@ -153,7 +199,8 @@ async def test_execute_blocks_noncompliant_copy():
     )
     upsert = AsyncMock()
     refresh = AsyncMock(return_value=True)
-    with patch(f"{_MOD}._resolve_gemini_api_key", return_value="k"), \
+    with patch(f"{_MOD}._merchant_enabled", return_value=True), \
+         patch(f"{_MOD}._resolve_gemini_api_key", return_value="k"), \
          patch(f"{_MOD}._fetch_thin_canonical_pdps", new=AsyncMock(return_value=[_candidate()])), \
          patch(f"{_MOD}._generate_enrichment", new=AsyncMock(return_value=bad)), \
          patch("db.product_enrichment.upsert_enrichment", new=upsert), \
@@ -171,7 +218,8 @@ async def test_execute_blocks_noncompliant_copy():
 async def test_execute_failed_generation_counts_but_does_not_crash():
     """A None generation (LLM failed/unparseable) lands in `failed`, not a crash."""
     agent = CanonicalPdpEnrichmentAgent()
-    with patch(f"{_MOD}._resolve_gemini_api_key", return_value="k"), \
+    with patch(f"{_MOD}._merchant_enabled", return_value=True), \
+         patch(f"{_MOD}._resolve_gemini_api_key", return_value="k"), \
          patch(f"{_MOD}._fetch_thin_canonical_pdps", new=AsyncMock(return_value=[_candidate()])), \
          patch(f"{_MOD}._generate_enrichment", new=AsyncMock(return_value=None)):
         result = await agent.execute(ExecutorContext(merchant_id="m1"))

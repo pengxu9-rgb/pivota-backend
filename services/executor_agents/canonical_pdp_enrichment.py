@@ -32,6 +32,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import os
 import re
 from typing import Any, Dict, List, Optional
 
@@ -64,6 +65,28 @@ _MIN_GENERATED_DESCRIPTION_CHARS = 200
 _GEMINI_MODEL = "gemini-2.5-flash"
 _GEMINI_BASE_URL = "https://generativelanguage.googleapis.com/v1beta"
 _GEMINI_TIMEOUT_S = 30.0
+
+# Rollout gate (staged-rollout control for this first autonomous-write executor).
+# Ships SAFE: dormant when unset, so a deploy can't trigger broad autonomous
+# content writes before an operator explicitly opts in. Set the env var:
+#   - unset / empty  -> dormant (no merchant fires)        [default]
+#   - "id1,id2"      -> only those merchant_ids            [staged rollout]
+#   - "*"            -> all merchants (full autonomous)    [the widen step]
+_ALLOWLIST_ENV = "CANONICAL_PDP_ENRICHMENT_ALLOWLIST"
+
+
+def _merchant_enabled(merchant_id: Optional[str]) -> bool:
+    """Whether the autonomous enricher is enabled for this merchant. Safe by
+    default — empty allowlist means dormant (explicit opt-in required)."""
+    if not merchant_id:
+        return False
+    raw = (os.environ.get(_ALLOWLIST_ENV) or "").strip()
+    if not raw:
+        return False
+    if raw == "*":
+        return True
+    allow = {x.strip() for x in raw.split(",") if x.strip()}
+    return merchant_id in allow
 
 
 async def _fetch_thin_canonical_pdps(
@@ -256,6 +279,8 @@ class CanonicalPdpEnrichmentAgent(BaseExecutorAgent):
         a single capped candidate query, no LLM call."""
         if not context.merchant_id:
             return False
+        if not _merchant_enabled(context.merchant_id):
+            return False
         if not _resolve_gemini_api_key():
             return False
         candidates = await _fetch_thin_canonical_pdps(context.merchant_id, cap=1)
@@ -265,6 +290,11 @@ class CanonicalPdpEnrichmentAgent(BaseExecutorAgent):
         if not context.merchant_id:
             return ExecutorResult(
                 status="skipped", error_message="merchant_id required"
+            )
+        if not _merchant_enabled(context.merchant_id):
+            return ExecutorResult(
+                status="skipped",
+                error_message="merchant not in canonical_pdp_enrichment allowlist",
             )
         api_key = _resolve_gemini_api_key()
         if not api_key:
