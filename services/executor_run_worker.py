@@ -59,6 +59,9 @@ def _agent_registry_by_name() -> Dict[str, Any]:
     """Map agent_name → agent instance. Mirrors the registry the
     dispatcher uses; lazy-imported so this module loads without
     pulling in every agent's deps at import time."""
+    from services.executor_agents.canonical_pdp_enrichment import (
+        CanonicalPdpEnrichmentAgent,
+    )
     from services.executor_agents.content_brief import (
         ContentBriefGeneratorAgent,
     )
@@ -73,6 +76,7 @@ def _agent_registry_by_name() -> Dict[str, Any]:
             GscUrlSubmissionAgent(),
             SitemapFreshnessAgent(),
             ContentBriefGeneratorAgent(),
+            CanonicalPdpEnrichmentAgent(),
         )
     }
 

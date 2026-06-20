@@ -46,6 +46,9 @@ def _registry() -> List[BaseExecutorAgent]:
     agents here. Order matters when agents depend on each other's
     side effects (none today — all agents are independent).
     """
+    from services.executor_agents.canonical_pdp_enrichment import (
+        CanonicalPdpEnrichmentAgent,
+    )
     from services.executor_agents.content_brief import ContentBriefGeneratorAgent
     from services.executor_agents.gsc_url_submission import GscUrlSubmissionAgent
     from services.executor_agents.sitemap_freshness import SitemapFreshnessAgent
@@ -53,6 +56,7 @@ def _registry() -> List[BaseExecutorAgent]:
         GscUrlSubmissionAgent(),
         SitemapFreshnessAgent(),
         ContentBriefGeneratorAgent(),
+        CanonicalPdpEnrichmentAgent(),
     ]
 
 
@@ -68,6 +72,9 @@ _AGENT_MAX_RETRIES: Dict[str, int] = {
     # Content brief generator hits Gemini grounded search; cost per
     # retry is non-trivial but not catastrophic.
     "content_brief_generator": 3,
+    # Canonical PDP enrichment hits Gemini grounded search (1 call per SKU,
+    # capped at 5/run); a retry re-generates only the still-thin PDPs.
+    "canonical_pdp_enrichment": 3,
 }
 
 

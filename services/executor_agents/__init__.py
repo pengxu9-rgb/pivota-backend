@@ -21,6 +21,9 @@ from services.executor_agents.base import (
     ExecutorContext,
     ExecutorResult,
 )
+from services.executor_agents.canonical_pdp_enrichment import (
+    CanonicalPdpEnrichmentAgent,
+)
 from services.executor_agents.content_brief import ContentBriefGeneratorAgent
 from services.executor_agents.gsc_url_submission import GscUrlSubmissionAgent
 from services.executor_agents.sitemap_freshness import SitemapFreshnessAgent
@@ -29,6 +32,7 @@ __all__ = [
     "BaseExecutorAgent",
     "ExecutorContext",
     "ExecutorResult",
+    "CanonicalPdpEnrichmentAgent",
     "ContentBriefGeneratorAgent",
     "GscUrlSubmissionAgent",
     "SitemapFreshnessAgent",
