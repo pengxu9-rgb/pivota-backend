@@ -12,6 +12,7 @@ from fastapi import APIRouter, Depends, HTTPException, Body, BackgroundTasks, Re
 from fastapi.responses import RedirectResponse
 from pydantic import BaseModel, EmailStr, TypeAdapter, ValidationError
 from typing import Dict, Any, Optional
+from dataclasses import dataclass
 import logging
 import httpx
 import json
@@ -135,16 +136,53 @@ def _validate_myshopify_domain(value: str) -> str:
     return shop
 
 
-def _shopify_oauth_authorize_url(*, shop_domain: str, state: str) -> str:
-    client_id = (settings.shopify_client_id or "").strip()
-    redirect_uri = (settings.shopify_redirect_uri or "").strip()
-    scopes = (settings.shopify_scopes or "").strip()
-    if not client_id or not redirect_uri or not scopes:
+@dataclass(frozen=True)
+class ShopifyAppCreds:
+    client_id: str
+    client_secret: str
+    redirect_uri: str
+    scopes: str
+    label: str  # "appstore" | "headless"
+
+
+# install_source values routed to the PUBLIC App Store app (App A = "Pivota").
+_APPSTORE_INSTALL_SOURCES = {"app_store"}
+
+
+def resolve_shopify_app(install_source: Optional[str]) -> ShopifyAppCreds:
+    """Select Shopify app credentials by install source.
+
+    app_store -> App A (public, read-only merchant tool).
+    everything else (merchant_portal, public_install_link, ...) -> App B
+    (custom/headless, keeps write_orders).
+    Defaults fall back to the single SHOPIFY_CLIENT_* env, so this is a no-op
+    until the SHOPIFY_HEADLESS_* envs are configured.
+    """
+    src = (install_source or "").strip().lower()
+    if src in _APPSTORE_INSTALL_SOURCES:
+        return ShopifyAppCreds(
+            client_id=(settings.shopify_appstore_client_id or settings.shopify_client_id or "").strip(),
+            client_secret=(settings.shopify_appstore_client_secret or settings.shopify_client_secret or "").strip(),
+            redirect_uri=(settings.shopify_appstore_redirect_uri or settings.shopify_redirect_uri or "").strip(),
+            scopes=(settings.shopify_appstore_scopes or settings.shopify_scopes or "").strip(),
+            label="appstore",
+        )
+    return ShopifyAppCreds(
+        client_id=(settings.shopify_headless_client_id or settings.shopify_client_id or "").strip(),
+        client_secret=(settings.shopify_headless_client_secret or settings.shopify_client_secret or "").strip(),
+        redirect_uri=(settings.shopify_headless_redirect_uri or settings.shopify_redirect_uri or "").strip(),
+        scopes=(settings.shopify_headless_scopes or settings.shopify_scopes or "").strip(),
+        label="headless",
+    )
+
+
+def _shopify_oauth_authorize_url(*, shop_domain: str, state: str, app: ShopifyAppCreds) -> str:
+    if not app.client_id or not app.redirect_uri or not app.scopes:
         raise HTTPException(status_code=500, detail="Shopify OAuth is not configured")
     params = {
-        "client_id": client_id,
-        "scope": scopes,
-        "redirect_uri": redirect_uri,
+        "client_id": app.client_id,
+        "scope": app.scopes,
+        "redirect_uri": app.redirect_uri,
         "state": state,
     }
     return f"https://{shop_domain}/admin/oauth/authorize?{urlencode(params)}"
@@ -591,7 +629,9 @@ async def shopify_oauth_start(
         install_source="merchant_portal",
     )
 
-    url = _shopify_oauth_authorize_url(shop_domain=shop_domain, state=state)
+    url = _shopify_oauth_authorize_url(
+        shop_domain=shop_domain, state=state, app=resolve_shopify_app("merchant_portal")
+    )
     if redirect:
         return RedirectResponse(url=url, status_code=302)
     return {
@@ -750,7 +790,9 @@ async def shopify_oauth_start_public(
         install_source="public_install_link",
     )
 
-    url = _shopify_oauth_authorize_url(shop_domain=shop_domain, state=state)
+    url = _shopify_oauth_authorize_url(
+        shop_domain=shop_domain, state=state, app=resolve_shopify_app("public_install_link")
+    )
     if redirect:
         return RedirectResponse(url=url, status_code=302)
     return {
@@ -795,7 +837,12 @@ async def shopify_app_store_install(
         host=host,
     )
 
-    url = _shopify_oauth_authorize_url(shop_domain=shop_domain, state=state)
+    # App Store distribution: request the reduced, read-only / merchant-tool scope
+    # set. write_orders (PSP -> Shopify order creation) is intentionally excluded
+    # here and kept only for non-App-Store (custom/headless) installs.
+    url = _shopify_oauth_authorize_url(
+        shop_domain=shop_domain, state=state, app=resolve_shopify_app("app_store")
+    )
     if redirect:
         return RedirectResponse(url=url, status_code=302)
     return {
@@ -822,10 +869,9 @@ async def shopify_oauth_callback(request: Request):
     if not code or not state:
         raise HTTPException(status_code=400, detail="Missing required OAuth params")
 
-    app_secret = (settings.shopify_client_secret or "").strip()
-    if not _shopify_oauth_verify_hmac(request=request, secret=app_secret):
-        raise HTTPException(status_code=401, detail="Invalid Shopify OAuth signature")
-
+    # Look up the OAuth state FIRST (read-only, by state hash) so we know which
+    # Shopify app this install belongs to, then verify HMAC + exchange the token
+    # with that app's credentials (App A = public/app_store, App B = headless).
     await _ensure_shopify_oauth_tables()
     state_sha = hashlib.sha256(state.encode("utf-8")).hexdigest()
     try:
@@ -850,6 +896,16 @@ async def shopify_oauth_callback(request: Request):
     if not state_row:
         raise HTTPException(status_code=400, detail="Invalid or expired OAuth state (reason=state_not_found)")
     state_row = dict(state_row)
+
+    install_source = (state_row.get("install_source") or "").strip()
+    app = resolve_shopify_app(install_source)
+    # Fall back to the legacy single secret if the resolved app isn't configured
+    # (keeps existing installs working before SHOPIFY_HEADLESS_* is set).
+    app_secret = app.client_secret or (settings.shopify_client_secret or "").strip()
+
+    if not _shopify_oauth_verify_hmac(request=request, secret=app_secret):
+        raise HTTPException(status_code=401, detail="Invalid Shopify OAuth signature")
+
     if state_row.get("used_at"):
         raise HTTPException(status_code=400, detail="Invalid or expired OAuth state (reason=state_already_used)")
     expires_at = state_row.get("expires_at")
@@ -858,12 +914,11 @@ async def shopify_oauth_callback(request: Request):
 
     merchant_id = str(state_row["merchant_id"])
     stored_shop_domain = (state_row.get("shop_domain") or "").strip().lower()
-    install_source = (state_row.get("install_source") or "").strip()
     return_to = (state_row.get("return_to") or "").strip()
 
     token_url = f"https://{shop_domain}/admin/oauth/access_token"
     token_payload = {
-        "client_id": (settings.shopify_client_id or "").strip(),
+        "client_id": app.client_id or (settings.shopify_client_id or "").strip(),
         "client_secret": app_secret,
         "code": code,
     }
@@ -923,6 +978,9 @@ async def shopify_oauth_callback(request: Request):
         shop_name=shop_name,
         access_token=access_token,
         storefront_token=storefront_token,
+        # Persist the OWNING app's secret so webhook HMAC verification uses the
+        # right app's secret per store (App A vs App B in the dual-app setup).
+        webhook_secret=(app.client_secret or None),
         install_source=install_source or None,
     )
 

@@ -91,7 +91,44 @@ class Settings(BaseSettings):
         "SHOPIFY_SCOPES",
         "read_products,read_orders,read_fulfillments,write_orders,write_webhooks,read_discounts",
     )
-    
+    # App Store (public) distribution scope set: read-only sync + optimization +
+    # AI-readiness, plus write_webhooks for webhook/compliance subscriptions.
+    # Deliberately EXCLUDES write_orders so the public listing is a merchant tool
+    # and never registers externally-paid transactions via the Shopify API.
+    # The full `shopify_scopes` (with write_orders) stays for custom/headless installs.
+    shopify_appstore_scopes: str = os.getenv(
+        "SHOPIFY_APPSTORE_SCOPES",
+        "read_products,read_orders,read_fulfillments,read_discounts,write_webhooks",
+    )
+
+    # --- Dual Shopify app credentials -------------------------------------
+    # App A = "Pivota" (public / App Store distribution): read-only merchant tool.
+    # App B = "Pivota Merchant" (custom / headless): keeps write_orders.
+    # All default to the existing single creds, so behavior is unchanged until
+    # the SHOPIFY_HEADLESS_* envs are set and App B is repointed.
+    shopify_appstore_client_id: Optional[str] = os.getenv(
+        "SHOPIFY_APPSTORE_CLIENT_ID", os.getenv("SHOPIFY_CLIENT_ID")
+    )
+    shopify_appstore_client_secret: Optional[str] = os.getenv(
+        "SHOPIFY_APPSTORE_CLIENT_SECRET", os.getenv("SHOPIFY_CLIENT_SECRET")
+    )
+    shopify_appstore_redirect_uri: Optional[str] = os.getenv(
+        "SHOPIFY_APPSTORE_REDIRECT_URI", os.getenv("SHOPIFY_REDIRECT_URI")
+    )
+    shopify_headless_client_id: Optional[str] = os.getenv(
+        "SHOPIFY_HEADLESS_CLIENT_ID", os.getenv("SHOPIFY_CLIENT_ID")
+    )
+    shopify_headless_client_secret: Optional[str] = os.getenv(
+        "SHOPIFY_HEADLESS_CLIENT_SECRET", os.getenv("SHOPIFY_CLIENT_SECRET")
+    )
+    shopify_headless_redirect_uri: Optional[str] = os.getenv(
+        "SHOPIFY_HEADLESS_REDIRECT_URI", os.getenv("SHOPIFY_REDIRECT_URI")
+    )
+    shopify_headless_scopes: str = os.getenv(
+        "SHOPIFY_HEADLESS_SCOPES",
+        "read_products,read_orders,read_fulfillments,read_discounts,write_webhooks,write_orders",
+    )
+
     # Wix
     wix_api_key: Optional[str] = os.getenv("WIX_API_KEY")
     wix_store_url: Optional[str] = os.getenv("WIX_STORE_URL")

@@ -207,3 +207,55 @@ async def test_shopify_store_credential_upsert_handles_mapping_rows_without_get(
     assert token_blob["access_token"] == "new-admin-token"
     assert token_blob["storefront_access_token"] == "existing-storefront-token"
     assert token_blob["install_source"] == "app_store"
+
+
+def test_resolve_shopify_app_routes_by_install_source(monkeypatch: pytest.MonkeyPatch) -> None:
+    import routes.merchant_store_connections as module
+
+    s = module.settings
+    monkeypatch.setattr(s, "shopify_appstore_client_id", "A_id")
+    monkeypatch.setattr(s, "shopify_appstore_client_secret", "A_secret")
+    monkeypatch.setattr(s, "shopify_appstore_redirect_uri", "https://api.pivota.cc/cb")
+    monkeypatch.setattr(
+        s, "shopify_appstore_scopes",
+        "read_products,read_orders,read_fulfillments,read_discounts,write_webhooks",
+    )
+    monkeypatch.setattr(s, "shopify_headless_client_id", "B_id")
+    monkeypatch.setattr(s, "shopify_headless_client_secret", "B_secret")
+    monkeypatch.setattr(s, "shopify_headless_redirect_uri", "https://api.pivota.cc/cb")
+    monkeypatch.setattr(
+        s, "shopify_headless_scopes",
+        "read_products,read_orders,read_fulfillments,read_discounts,write_webhooks,write_orders",
+    )
+
+    a = module.resolve_shopify_app("app_store")
+    assert a.label == "appstore"
+    assert a.client_id == "A_id"
+    assert a.client_secret == "A_secret"
+    assert "write_orders" not in a.scopes
+
+    for src in ("merchant_portal", "public_install_link", "", None, "whatever"):
+        b = module.resolve_shopify_app(src)
+        assert b.label == "headless"
+        assert b.client_id == "B_id"
+        assert b.client_secret == "B_secret"
+        assert "write_orders" in b.scopes
+
+
+def test_resolve_shopify_app_falls_back_to_single_creds(monkeypatch: pytest.MonkeyPatch) -> None:
+    import routes.merchant_store_connections as module
+
+    s = module.settings
+    for field in (
+        "shopify_appstore_client_id", "shopify_appstore_client_secret", "shopify_appstore_redirect_uri",
+        "shopify_headless_client_id", "shopify_headless_client_secret", "shopify_headless_redirect_uri",
+    ):
+        monkeypatch.setattr(s, field, None)
+    monkeypatch.setattr(s, "shopify_client_id", "single_id")
+    monkeypatch.setattr(s, "shopify_client_secret", "single_secret")
+    monkeypatch.setattr(s, "shopify_redirect_uri", "https://api.pivota.cc/cb")
+
+    a = module.resolve_shopify_app("app_store")
+    assert a.client_id == "single_id" and a.client_secret == "single_secret"
+    b = module.resolve_shopify_app("merchant_portal")
+    assert b.client_id == "single_id" and b.client_secret == "single_secret"
