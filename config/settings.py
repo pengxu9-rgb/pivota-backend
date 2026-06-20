@@ -92,13 +92,18 @@ class Settings(BaseSettings):
         "read_products,read_orders,read_fulfillments,write_orders,write_webhooks,read_discounts",
     )
     # App Store (public) distribution scope set: read-only sync + optimization +
-    # AI-readiness, plus write_webhooks for webhook/compliance subscriptions.
-    # Deliberately EXCLUDES write_orders so the public listing is a merchant tool
-    # and never registers externally-paid transactions via the Shopify API.
-    # The full `shopify_scopes` (with write_orders) stays for custom/headless installs.
+    # AI-readiness. MUST exactly match the scopes declared in shopify.app.toml
+    # ([access_scopes] read_discounts,read_fulfillments,read_orders,read_products).
+    # Requesting any scope NOT declared in the app config (e.g. write_webhooks)
+    # makes Shopify reject the OAuth authorize request with a 400, which fails the
+    # "authenticates after install" automated review check. Compliance/GDPR
+    # webhooks are declared in the toml and managed by Shopify, so they do NOT
+    # need write_webhooks here. Deliberately EXCLUDES write_orders too, so the
+    # public listing stays a read-only merchant tool. The full `shopify_scopes`
+    # (with write_orders + write_webhooks) stays for custom/headless installs.
     shopify_appstore_scopes: str = os.getenv(
         "SHOPIFY_APPSTORE_SCOPES",
-        "read_products,read_orders,read_fulfillments,read_discounts,write_webhooks",
+        "read_products,read_orders,read_fulfillments,read_discounts",
     )
 
     # --- Dual Shopify app credentials -------------------------------------
