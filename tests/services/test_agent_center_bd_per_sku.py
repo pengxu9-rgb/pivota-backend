@@ -654,6 +654,10 @@ async def test_run_brand_report_per_sku_runs_bounded_deepseek_verify(monkeypatch
     assert len(calls) == 1
     assert calls[0]["provider"] == "deepseek"
     assert calls[0]["scan_mode"] == "answer_quality_verify"
+    # Perf fix: verify probes run concurrently (asyncio.gather) with a tighter
+    # timeout than the 30s generation default, so a slow/flaky DeepSeek can't
+    # serialize into a multi-minute (apparently-hung) audit.
+    assert calls[0]["timeout_s"] == bd._VERIFY_PROBE_TIMEOUT_S
     sku_report = report["per_sku_reports"][0]
     assert sku_report["verify_summary"]["verified"] == 1
     assert sku_report["verify_summary"]["flagged"] == 1

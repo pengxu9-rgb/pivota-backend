@@ -103,6 +103,10 @@ from services.sku_sidewalk import (
 
 _ANSWER_QUALITY_VERIFY_SCAN_MODE = "answer_quality_verify"
 _ANSWER_QUALITY_VERIFY_PROVIDER = "deepseek"
+# Verify probes run concurrently (asyncio.gather) against a slow/flaky DeepSeek,
+# so the per-call timeout is tighter than the 30s generation default — a stuck
+# verify call must not drag out (or appear to hang) the audit.
+_VERIFY_PROBE_TIMEOUT_S = 12.0
 _PER_SKU_AUDIT_PROBE_SCAN_MODE = "open_product_visibility_test"
 # PIVOTA-Agent caps one probe request at 8 runs. We deliberately chunk smaller
 # than that cap: each chunk is one grounded LLM call, and an 8-grounded-query
@@ -3472,9 +3476,9 @@ async def _run_deepseek_verify_pass(
         or sku_ctx.get("pivota_canonical_url")
     )
 
-    outputs: List[Dict[str, Any]] = []
-    errors: List[Dict[str, Any]] = []
-    for idx, run in enumerate(candidates[:sample_cap]):
+    async def _verify_one(
+        idx: int, run: Dict[str, Any]
+    ) -> Tuple[Dict[str, Any], Optional[Dict[str, Any]]]:
         query = str(run.get("query") or "").strip()
         prompt_key = _citation_prompt_key(run)
         output_base = {
@@ -3514,6 +3518,7 @@ async def _run_deepseek_verify_pass(
                 },
                 provider=_ANSWER_QUALITY_VERIFY_PROVIDER,
                 max_runs=1,
+                timeout_s=_VERIFY_PROBE_TIMEOUT_S,
             )
             verdict = _extract_verify_verdict(result)
             output = {
@@ -3522,19 +3527,28 @@ async def _run_deepseek_verify_pass(
                 "usage": result.get("usage") or {},
                 "raw_runs": result.get("raw_runs") or [],
             }
-            outputs.append(output)
-            if verdict is None:
-                errors.append({
-                    "query": query,
-                    "error": "unparseable_verify_verdict",
-                })
+            err = (
+                {"query": query, "error": "unparseable_verify_verdict"}
+                if verdict is None
+                else None
+            )
+            return output, err
         except Exception as exc:  # noqa: BLE001 - verifier must not fail audit
-            errors.append({"query": query, "error": str(exc)[:200]})
-            outputs.append({
-                **output_base,
-                "verdict": None,
-                "error": str(exc)[:200],
-            })
+            return (
+                {**output_base, "verdict": None, "error": str(exc)[:200]},
+                {"query": query, "error": str(exc)[:200]},
+            )
+
+    # Verify the citation-positive sample CONCURRENTLY — a slow/flaky DeepSeek must
+    # not serialize into a multi-minute (apparently-hung) audit. Total wall-clock
+    # is now ~= the slowest single call, not the sum of the sample.
+    verify_results = await asyncio.gather(
+        *[_verify_one(idx, run) for idx, run in enumerate(candidates[:sample_cap])]
+    )
+    outputs: List[Dict[str, Any]] = [out for out, _ in verify_results]
+    errors: List[Dict[str, Any]] = [
+        err for _, err in verify_results if err is not None
+    ]
 
     valid_outputs = [
         output for output in outputs
