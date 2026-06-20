@@ -189,6 +189,38 @@ def test_verify_skip_reason_surfaced_in_both_places():
     assert "brand_new_reason" in narr3["verify_summary_plain"]["text"]
 
 
+def test_verify_skip_reason_read_from_brand_rollup_reasons_plural():
+    """The brand-level verify_summary is a ROLLUP that emits `reasons` (plural
+    list), NOT `reason` (singular). The narrative must read it — else the
+    report shows 'reason unavailable' while the real cause sits in `reasons`.
+    Regression for the live #958 bug ('did not run — reason unavailable')."""
+    am = {"skus": [], "hosts": [], "host_attribution_summary": {}}
+
+    narr = build_merchant_narrative(
+        merchant_name="X", per_sku_reports=[], authority_map=am,
+        verify_summary={"status": "skipped", "reasons": ["no_verify_providers_resolved"]},
+    )
+    plain = narr["verify_summary_plain"]
+    assert plain["reason"] == "no_verify_providers_resolved"
+    assert "no answer-quality verifier was configured" in plain["text"]
+    assert "reason unavailable" not in plain["text"]
+    limit = next(l for l in narr["honest_limits"] if "verification did not run" in l)
+    assert "no answer-quality verifier was configured" in limit
+    assert "reason unavailable" not in limit
+
+    # Multiple distinct reasons across SKUs → each surfaced, deduped, joined.
+    narr2 = build_merchant_narrative(
+        merchant_name="X", per_sku_reports=[], authority_map=am,
+        verify_summary={
+            "status": "skipped",
+            "reasons": ["missing_deepseek_api_key", "no_citation_positive_probes"],
+        },
+    )
+    t2 = narr2["verify_summary_plain"]["text"]
+    assert "DeepSeek verifier wasn't available" in t2
+    assert "nothing to fact-check" in t2
+
+
 def test_prioritized_actions_mapped_to_growth_phases():
     per_sku = [
         {"sku_key": "a", "sku_title": "A", "next_best_action": {"primary_gap": "content", "headline": "Substantiate INCI", "first_move": "Upload COA"}},
