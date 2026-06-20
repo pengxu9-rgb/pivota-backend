@@ -483,6 +483,44 @@ def _clean_identity_tuple(values: Optional[Tuple[str, ...]]) -> Tuple[str, ...]:
     return tuple(out)
 
 
+def _vendor_is_merchant(vendor: Any, merchant_own_aliases: frozenset) -> bool:
+    """Does a product's vendor/brand refer to the MERCHANT itself (a D2C brand
+    selling its own products) vs a third-party brand the merchant RESELLS? True
+    when the vendor's brand-forms overlap the merchant's own identity (brand +
+    store domain)."""
+    if not vendor:
+        return False
+    return bool(frozenset(derive_brand_aliases(str(vendor))) & merchant_own_aliases)
+
+
+def _audit_merchant_vendors(
+    merchant_name: Optional[str],
+    merchant_host: Optional[str],
+    product_vendors: List[Any],
+) -> Tuple[Tuple[str, ...], bool]:
+    """Retailer-aware merchant identity (R1). Fold a product's vendor into the
+    merchant's identity ONLY when that vendor IS the merchant (a D2C brand selling
+    its own products). For a RETAILER/reseller, the brands it carries (e.g.
+    NUTRIONE, Ownist) are NOT folded in — so their domains (ownist.com) are not
+    mis-credited as the STORE's own findability. The old behavior folded EVERY
+    vendor, conflating resold brands with the store.
+
+    Returns (identity_tuple, is_reseller). is_reseller = the merchant carries ≥1
+    product whose brand isn't the merchant — derived from the catalog (no schema).
+    """
+    merchant_own = frozenset(derive_brand_aliases(merchant_name, merchant_host))
+    folded: List[Any] = [merchant_name]
+    saw_foreign_brand = False
+    for v in product_vendors or ():
+        if not v:
+            continue
+        if _vendor_is_merchant(v, merchant_own):
+            folded.append(v)
+        else:
+            saw_foreign_brand = True
+    return _merchant_identity_tuple(*folded), saw_foreign_brand
+
+
 def _merchant_identity_tuple(*values: Any) -> Tuple[str, ...]:
     expanded: List[str] = []
     for value in values:
@@ -8953,17 +8991,24 @@ async def run_brand_report(
                 brand_rollup["integration"] = _integration
         except Exception:  # noqa: BLE001
             logger.warning("per-sku integration block failed", exc_info=True)
+        _merchant_host = normalize_host(merchant_domain or "") or (
+            (merchant_domain or "").strip() or None
+        )
+        _merchant_vendors, _merchant_is_reseller = _audit_merchant_vendors(
+            merchant_name,
+            _merchant_host,
+            [p.get("vendor") for p in products if isinstance(p, dict)],
+        )
+        # R2 signal: carry the derived merchant type so the report can frame
+        # findability/endorsement honestly for a reseller (the brands it carries
+        # vs the store itself).
+        brand_rollup["merchant_type"] = "reseller" if _merchant_is_reseller else "brand"
         authority_map = build_authority_map(
             per_sku_reports,
             probe_runs_by_sku,
-            merchant_host=normalize_host(merchant_domain or "") or (
-                (merchant_domain or "").strip() or None
-            ),
+            merchant_host=_merchant_host,
             merchant_brand=merchant_name,
-            merchant_vendors=_merchant_identity_tuple(
-                merchant_name,
-                *[p.get("vendor") for p in products if isinstance(p, dict)],
-            ),
+            merchant_vendors=_merchant_vendors,
         )
         median_citation = (
             (brand_rollup.get("dimensions") or {})
@@ -8994,14 +9039,10 @@ async def run_brand_report(
         custom_prompt_results = build_custom_prompt_results(
             probe_runs_by_sku,
             custom_prompts,
-            merchant_host=normalize_host(merchant_domain) or (
-                (merchant_domain or "").strip() or None
-            ),
+            merchant_host=_merchant_host,
             merchant_brand=merchant_name,
-            merchant_vendors=_merchant_identity_tuple(
-                merchant_name,
-                *[p.get("vendor") for p in products if isinstance(p, dict)],
-            ),
+            # Reuse the retailer-aware identity (resold brands not folded in).
+            merchant_vendors=_merchant_vendors,
         )
         brand_verify_summary = _rollup_verify_summaries(per_sku_reports)
         # Fix 4 — per-SKU win-plan: for each losing category query, the
