@@ -60,6 +60,11 @@ from services.cited_host_classifier import (
     merchant_relative_role,
     recommendation_class,
     ROLE_COMPETITOR,
+    ROLE_CREATOR,
+    ROLE_EDITORIAL_REVIEW,
+    ROLE_FORUM,
+    ROLE_INDEPENDENT_RETAILER,
+    ROLE_MARKETPLACE_SELF_LISTING,
     ROLE_OWN_DOMAIN,
     ROLE_RELATIVE_UNCLASSIFIED,
 )
@@ -4437,10 +4442,13 @@ def _store_as_destination(
         if not host or host in seen:
             continue
         seen.add(host)
+        advice = _channel_competition_advice(row.get("citation_role"))
         routed.append({
             "host": host,
             "role": row.get("citation_role"),
+            "role_label": advice["role_label"],
             "times_cited": int(row.get("prompts_cited_count") or 0),
+            "how_to_compete": advice["how_to_compete"],
         })
     routed.sort(key=lambda r: -r["times_cited"])
     return {
@@ -5922,6 +5930,63 @@ def _citation_role(
     )
 
 
+# C1 — channel-competition advice. The merchant sees not just WHO AI cites
+# instead of them, but a per-channel display label + WHAT to do about it, keyed
+# on the cited host's merchant-relative role.
+_ROLE_DISPLAY_LABEL: Dict[str, str] = {
+    ROLE_INDEPENDENT_RETAILER: "Retailer",
+    ROLE_MARKETPLACE_SELF_LISTING: "Marketplace",
+    ROLE_COMPETITOR: "Competing store",
+    ROLE_EDITORIAL_REVIEW: "Editorial",
+    ROLE_CREATOR: "Creator",
+    ROLE_FORUM: "Community",
+}
+
+_ROLE_HOW_TO_COMPETE: Dict[str, str] = {
+    ROLE_INDEPENDENT_RETAILER: (
+        "A store AI sends buyers to. Get your product listed there, or win the "
+        "buy-path: get your Pivota canonical page cited for these queries."
+    ),
+    ROLE_MARKETPLACE_SELF_LISTING: (
+        "A marketplace AI routes buyers to. List your product there, or win the "
+        "buy-path with your Pivota canonical page."
+    ),
+    ROLE_COMPETITOR: (
+        "A competing store AI routes buyers to. Win the buy-path — get your Pivota "
+        "canonical page cited for these queries and match the offer."
+    ),
+    ROLE_EDITORIAL_REVIEW: (
+        "An independent publisher AI trusts. Earn a review — pitch their editorial "
+        "desk (see How to win the recommendation below)."
+    ),
+    ROLE_CREATOR: (
+        "A creator channel AI surfaces. Partner with or seed mid-tier reviewers in "
+        "your category."
+    ),
+    ROLE_FORUM: (
+        "A community AI cites. Build presence by answering recurring questions; "
+        "it isn't a direct placement channel."
+    ),
+}
+
+_DEFAULT_HOW_TO_COMPETE = (
+    "AI cites this source instead of you. Earn a citation, or win the buy-path "
+    "with your Pivota canonical page."
+)
+
+
+def _channel_competition_advice(role: Optional[str]) -> Dict[str, str]:
+    """C1: per-channel display label + 'how to compete' guidance, keyed on the
+    cited host's merchant-relative role — turns the bare 'who AI cites instead'
+    host list into an actionable competitive surface."""
+    r = role or CITATION_ROLE_UNCLASSIFIED
+    return {
+        "role": r,
+        "role_label": _ROLE_DISPLAY_LABEL.get(r, "Other source"),
+        "how_to_compete": _ROLE_HOW_TO_COMPETE.get(r, _DEFAULT_HOW_TO_COMPETE),
+    }
+
+
 def _citation_signals(host_rows: List[Dict[str, Any]]) -> Dict[str, Any]:
     """Roll a set of cited-host rows into the findability-vs-endorsement split.
 
@@ -5958,6 +6023,20 @@ def _citation_signals(host_rows: List[Dict[str, Any]]) -> Dict[str, Any]:
     # "who AI cites instead of you" set (was previously mislabeled findability /
     # endorsement purely on host role).
     cited_not_naming_hosts: List[str] = []
+    # C1 — the same "cited instead" hosts, enriched with a display label + a
+    # per-channel "how to compete" action (deduped by host). Additive: the bare
+    # string lists above stay unchanged for existing consumers.
+    channels_ai_cites_instead: List[Dict[str, Any]] = []
+    _channel_seen: set = set()
+
+    def _note_channel(h: Optional[str], r: str, times_cited: int) -> None:
+        if not h or h in _channel_seen:
+            return
+        _channel_seen.add(h)
+        entry: Dict[str, Any] = {"host": h, "times_cited": times_cited}
+        entry.update(_channel_competition_advice(r))
+        channels_ai_cites_instead.append(entry)
+
     for row in host_rows or []:
         role = row.get("citation_role") or CITATION_ROLE_UNCLASSIFIED
         by_role[role] = by_role.get(role, 0) + 1
@@ -5977,6 +6056,7 @@ def _citation_signals(host_rows: List[Dict[str, Any]]) -> Dict[str, Any]:
                 findability_hosts.append(host)
             else:
                 cited_not_naming_hosts.append(host)
+                _note_channel(host, role, int(row.get("prompts_cited_count") or 0))
         elif is_endorsement_role(role):
             # Independent source — an endorsement of YOU only if it named you.
             if names_merchant:
@@ -5985,8 +6065,10 @@ def _citation_signals(host_rows: List[Dict[str, Any]]) -> Dict[str, Any]:
                     endorsement_category_hosts.append(host)
             else:
                 cited_not_naming_hosts.append(host)
+                _note_channel(host, role, int(row.get("prompts_cited_count") or 0))
         elif role == ROLE_COMPETITOR:
             competitor_hosts.append(host)
+            _note_channel(host, role, int(row.get("prompts_cited_count") or 0))
     return {
         "by_role": by_role,
         "findability_hosts": findability_hosts,
@@ -5994,6 +6076,7 @@ def _citation_signals(host_rows: List[Dict[str, Any]]) -> Dict[str, Any]:
         "endorsement_category_hosts": endorsement_category_hosts,
         "competitor_hosts": competitor_hosts,
         "cited_not_naming_hosts": cited_not_naming_hosts,
+        "channels_ai_cites_instead": channels_ai_cites_instead,
         "has_independent_endorsement": bool(endorsement_hosts),
         "independently_recommended_for_category": bool(endorsement_category_hosts),
         "surfaced_only_via_own_listing": bool(findability_hosts) and not endorsement_hosts,
@@ -6226,6 +6309,8 @@ def build_authority_map(
         # honest "who AI cites instead of you" set (P0: kept out of endorsement/
         # findability, which now require the merchant to be named).
         "cited_not_naming_hosts": signals["cited_not_naming_hosts"],
+        # C1 — "who AI cites instead", enriched with role label + how-to-compete.
+        "channels_ai_cites_instead": signals["channels_ai_cites_instead"],
     }
     return {
         "skus": sku_entries,

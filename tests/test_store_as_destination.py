@@ -38,3 +38,15 @@ def test_routed_to_instead_excludes_store_and_ranks():
 def test_empty_inputs_safe():
     out = _store_as_destination(None, None)
     assert out == {"rate": 0.0, "cited": 0, "total": 0, "routed_to_instead": []}
+
+
+def test_routed_to_instead_carries_how_to_compete_advice():
+    # C1: each destination AI routes buyers to carries a display label + how-to-compete.
+    cbi = {"navigational": {"cited": 0, "total": 4}}
+    hosts = [
+        {"host": "amazon.com", "citation_role": "marketplace_self_listing",
+         "cited_on_branded_query": True, "prompts_cited_count": 5},
+    ]
+    dest = _store_as_destination(cbi, hosts)["routed_to_instead"][0]
+    assert dest["role_label"] == "Marketplace"
+    assert dest["how_to_compete"]
