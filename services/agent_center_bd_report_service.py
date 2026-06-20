@@ -74,6 +74,7 @@ from services.win_plan_builder import build_win_plan
 from services.coverage_profiles import (
     resolve_coverage_profile,
     resolve_provider_models,
+    verify_supported_providers,
 )
 from services.commerce_execution_policy import (
     SURFACE_PUBLIC_AGENT_PURCHASE,
@@ -3345,6 +3346,38 @@ def _verify_skipped_summary(
         "flagged_probes": [],
         "deweight_rule": _ANSWER_QUALITY_VERIFY_DEWEIGHT_RULE,
     }
+
+
+def _resolve_audit_verify_providers(
+    coverage: Dict[str, Any],
+    caller_verify_providers: Any,
+) -> List[str]:
+    """Which providers run the answer-quality (DeepSeek) verify pass.
+
+    The explicit / single-provider coverage paths bound the GENERATION providers
+    and return verify_providers=[] — but the merchant "Models to run" UI ALWAYS
+    sends an explicit provider list, so without a default the verify pass was
+    silently disabled on every merchant audit (the "verify on none" symptom;
+    DeepSeek was never even asked to run).
+
+    Resolution order: an explicit caller override wins (including an empty list,
+    to deliberately disable); else the coverage profile's verify providers; else
+    (the explicit-generation-path case) default to the verify-supported set.
+    Downstream still degrades honestly — _run_deepseek_verify_pass skips with
+    `missing_deepseek_api_key` / `no_citation_positive_probes` when there's no key
+    or nothing cited to verify."""
+    if caller_verify_providers is not None:
+        return [
+            str(p or "").strip().lower()
+            for p in caller_verify_providers
+            if str(p or "").strip()
+        ]
+    resolved = [
+        str(p or "").strip().lower()
+        for p in (coverage.get("verify_providers") or [])
+        if str(p or "").strip()
+    ]
+    return resolved or list(verify_supported_providers())
 
 
 async def _run_deepseek_verify_pass(
@@ -9099,13 +9132,12 @@ async def run_brand_report(
         providers=providers,
     )
     profile_providers = list(coverage.get("providers") or [])
-    resolved_verify_providers = list(coverage.get("verify_providers") or [])
-    if verify_providers is not None:
-        resolved_verify_providers = [
-            str(provider or "").strip().lower()
-            for provider in verify_providers
-            if str(provider or "").strip()
-        ]
+    # Answer-quality verify providers. The explicit/single coverage paths (which
+    # the merchant "Models to run" UI always triggers) return verify_providers=[];
+    # default to the verify-supported set so verification isn't silently disabled.
+    resolved_verify_providers = _resolve_audit_verify_providers(
+        coverage, verify_providers
+    )
     verify_sample = coverage.get("verify_sample") or {}
     provider_model_metadata = resolve_provider_models(
         profile_providers,
