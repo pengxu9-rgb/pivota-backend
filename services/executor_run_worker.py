@@ -62,6 +62,9 @@ def _agent_registry_by_name() -> Dict[str, Any]:
     from services.executor_agents.canonical_pdp_enrichment import (
         CanonicalPdpEnrichmentAgent,
     )
+    from services.executor_agents.competitor_insights import (
+        CompetitorInsightsAgent,
+    )
     from services.executor_agents.content_brief import (
         ContentBriefGeneratorAgent,
     )
@@ -77,6 +80,7 @@ def _agent_registry_by_name() -> Dict[str, Any]:
             SitemapFreshnessAgent(),
             ContentBriefGeneratorAgent(),
             CanonicalPdpEnrichmentAgent(),
+            CompetitorInsightsAgent(),
         )
     }
 

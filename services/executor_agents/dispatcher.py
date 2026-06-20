@@ -49,6 +49,9 @@ def _registry() -> List[BaseExecutorAgent]:
     from services.executor_agents.canonical_pdp_enrichment import (
         CanonicalPdpEnrichmentAgent,
     )
+    from services.executor_agents.competitor_insights import (
+        CompetitorInsightsAgent,
+    )
     from services.executor_agents.content_brief import ContentBriefGeneratorAgent
     from services.executor_agents.gsc_url_submission import GscUrlSubmissionAgent
     from services.executor_agents.sitemap_freshness import SitemapFreshnessAgent
@@ -57,6 +60,7 @@ def _registry() -> List[BaseExecutorAgent]:
         SitemapFreshnessAgent(),
         ContentBriefGeneratorAgent(),
         CanonicalPdpEnrichmentAgent(),
+        CompetitorInsightsAgent(),
     ]
 
 
@@ -75,6 +79,9 @@ _AGENT_MAX_RETRIES: Dict[str, int] = {
     # Canonical PDP enrichment hits Gemini grounded search (1 call per SKU,
     # capped at 5/run); a retry re-generates only the still-thin PDPs.
     "canonical_pdp_enrichment": 3,
+    # Competitor insights = 1 (non-grounded) Gemini call summarizing captured
+    # excerpts; cheap to retry.
+    "competitor_insights": 3,
 }
 
 
