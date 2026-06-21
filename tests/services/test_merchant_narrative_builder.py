@@ -152,6 +152,41 @@ def test_verify_summary_plain_language():
     assert "did not run" in skipped["text"]
 
 
+def test_verify_coverage_and_branded_scope_disclosed_when_run():
+    """When verify RAN, 'what we didn't measure' must disclose that only a SAMPLE
+    of citation-positive (branded) answers was checked, and that the discovery/
+    category queries were not — so a partial, branded-only check can't masquerade
+    as full accuracy coverage (the holistic-verdict honesty seam)."""
+    am = {"skus": [], "hosts": [], "host_attribution_summary": {}}
+    narr = build_merchant_narrative(
+        merchant_name="X", per_sku_reports=[], authority_map=am,
+        verify_summary={"status": "completed", "verified": 8, "flagged": 2,
+                        "citation_positive_candidates": 12},
+    )
+    limit = next((l for l in narr["honest_limits"] if "citation-positive" in l), None)
+    assert limit is not None
+    assert "8 of 12" in limit                      # actual checked / candidates
+    assert "discovery/category queries" in limit   # the branded-only scope caveat
+    assert "unmeasured" in limit
+    # the did-not-run bullet must NOT appear when verify ran
+    assert not any("did not run" in l for l in narr["honest_limits"])
+
+
+def test_verify_ran_without_positives_discloses_nothing_checked():
+    """Verify ran but had no cited answers to check -> honest-limits states accuracy
+    is unmeasured this run (not a misleading 'did not run')."""
+    am = {"skus": [], "hosts": [], "host_attribution_summary": {}}
+    narr = build_merchant_narrative(
+        merchant_name="X", per_sku_reports=[], authority_map=am,
+        verify_summary={"status": "completed", "verified": 0, "flagged": 0,
+                        "citation_positive_candidates": 0},
+    )
+    limit = next((l for l in narr["honest_limits"] if "no cited answers to" in l), None)
+    assert limit is not None
+    assert "unmeasured" in limit
+    assert not any("did not run" in l for l in narr["honest_limits"])
+
+
 def test_verify_skip_reason_surfaced_in_both_places():
     """The verify skip REASON must be human-readable in both the plain summary
     and the 'what we didn't measure' honest-limits bullet — so a merchant can
