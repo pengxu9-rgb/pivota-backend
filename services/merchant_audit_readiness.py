@@ -20,6 +20,7 @@ Maps directly to the onboarding→audit gap analysis:
 """
 from __future__ import annotations
 
+from datetime import datetime, timezone
 from typing import Any, Dict, Optional
 
 # Whitelisted dependency tables (table name is interpolated, so it must never
@@ -57,6 +58,80 @@ async def _table_count(
     except Exception:
         return 0
     return int((dict(row).get("n") if row else 0) or 0)
+
+
+def _parse_iso_utc(value: Any) -> Optional[datetime]:
+    """Parse the job table's normalized ISO strings (…Z) back to aware UTC."""
+    if not value or not isinstance(value, str):
+        return None
+    try:
+        return datetime.fromisoformat(value.replace("Z", "+00:00"))
+    except Exception:
+        return None
+
+
+def _derive_backfill_summary(
+    job: Optional[Dict[str, Any]],
+    now: datetime,
+) -> Optional[Dict[str, Any]]:
+    """Shape an active quality-backfill job into the timing/progress the portal
+    needs to replace "a few minutes" with a grounded countdown.
+
+    `eta_seconds` is best-effort: only computed once the job is running and has
+    touched at least one item (rate = touched / elapsed). It stays None while
+    the job is still queued (we can't estimate a rate yet). Pure + clock-injected
+    so the derivation is deterministic to test.
+    """
+    if not job:
+        return None
+    status = job.get("status")
+    total = int(job.get("total_candidates") or 0)
+    touched = (
+        int(job.get("processed") or 0)
+        + int(job.get("skipped") or 0)
+        + int(job.get("failed") or 0)
+    )
+    started = _parse_iso_utc(job.get("started_at"))
+
+    eta_seconds: Optional[int] = None
+    if status == "running" and started is not None and touched > 0 and total > touched:
+        elapsed = (now - started).total_seconds()
+        if elapsed > 0:
+            rate = touched / elapsed  # items per second
+            if rate > 0:
+                eta_seconds = int(min(3600, max(0, (total - touched) / rate)))
+
+    progress_pct: Optional[int] = None
+    if total > 0:
+        progress_pct = max(0, min(100, int(round(100 * touched / total))))
+
+    return {
+        "status": status,
+        "requested_at": job.get("requested_at"),
+        "started_at": job.get("started_at"),
+        "total_candidates": total,
+        "processed": touched,
+        "progress_pct": progress_pct,
+        "eta_seconds": eta_seconds,
+    }
+
+
+async def _get_active_backfill_job(merchant_id: str) -> Optional[Dict[str, Any]]:
+    """Lazy import (consistent with _table_count) so the module stays cheap to
+    import and the getter is easy to monkeypatch in tests."""
+    from db.product_quality_backfill_jobs import get_active_quality_backfill_job
+
+    return await get_active_quality_backfill_job(merchant_id)
+
+
+async def _summarize_active_backfill(merchant_id: str) -> Optional[Dict[str, Any]]:
+    """Best-effort backfill timing for the readiness verdict. Returns None when
+    there's no active job or the lookup fails — never blocks the verdict."""
+    try:
+        job = await _get_active_backfill_job(merchant_id)
+    except Exception:
+        return None
+    return _derive_backfill_summary(job, datetime.now(timezone.utc))
 
 
 async def assess_merchant_audit_readiness(
@@ -124,6 +199,10 @@ async def assess_merchant_audit_readiness(
         )
 
     ready = not blocking_gaps
+    # Active quality-backfill timing (status/progress/eta) so the portal's
+    # "Preparing your catalog" state shows a grounded countdown instead of a
+    # flat "a few minutes". None when no job is in flight; never blocks.
+    backfill = await _summarize_active_backfill(merchant_id)
     return {
         "merchant_id": merchant_id,
         "platform": platform,
@@ -131,6 +210,7 @@ async def assess_merchant_audit_readiness(
         "counts": counts,
         "blocking_gaps": blocking_gaps,
         "enhancement_gaps": enhancement_gaps,
+        "backfill": backfill,
         "recommendation": (
             "Audit-ready: scores will be real (enhancement gaps only lower the ceiling)."
             if ready else

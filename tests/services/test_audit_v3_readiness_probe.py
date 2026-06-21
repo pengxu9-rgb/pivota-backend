@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import sys
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Dict
 
@@ -106,3 +107,116 @@ async def test_count_refuses_non_whitelisted_table() -> None:
     import pytest
     with pytest.raises(ValueError):
         await mar._table_count("merchant_secrets; DROP TABLE x", "m1")
+
+
+# --- backfill timing summary (portal "Preparing your catalog" countdown) ---
+
+# 60s after the job started, deterministic clock for eta derivation.
+_NOW = datetime(2026, 1, 1, 0, 1, 0, tzinfo=timezone.utc)
+
+
+def test_derive_backfill_running_with_progress_has_eta() -> None:
+    job = {
+        "status": "running",
+        "requested_at": "2026-01-01T00:00:00Z",
+        "started_at": "2026-01-01T00:00:00Z",
+        "total_candidates": 10,
+        "processed": 2,
+        "skipped": 0,
+        "failed": 0,
+    }
+    s = mar._derive_backfill_summary(job, _NOW)
+    assert s is not None
+    assert s["status"] == "running"
+    assert s["total_candidates"] == 10
+    assert s["processed"] == 2
+    assert s["progress_pct"] == 20
+    # rate = 2 items / 60s; remaining 8 -> 8 / (2/60) = 240s
+    assert s["eta_seconds"] == 240
+
+
+def test_derive_backfill_queued_has_no_eta() -> None:
+    job = {
+        "status": "queued",
+        "requested_at": "2026-01-01T00:00:00Z",
+        "started_at": None,
+        "total_candidates": 10,
+        "processed": 0,
+    }
+    s = mar._derive_backfill_summary(job, _NOW)
+    assert s is not None
+    assert s["status"] == "queued"
+    assert s["eta_seconds"] is None  # can't estimate a rate before it starts
+    assert s["progress_pct"] == 0
+
+
+def test_derive_backfill_eta_capped_at_one_hour() -> None:
+    # Barely any progress over a long elapsed -> eta clamps to 3600.
+    job = {
+        "status": "running",
+        "started_at": "2026-01-01T00:00:00Z",
+        "total_candidates": 100000,
+        "processed": 1,
+    }
+    s = mar._derive_backfill_summary(job, _NOW)
+    assert s["eta_seconds"] == 3600
+
+
+def test_derive_backfill_none_job_returns_none() -> None:
+    assert mar._derive_backfill_summary(None, _NOW) is None
+
+
+async def test_assess_includes_backfill_when_active_job(monkeypatch) -> None:
+    _patch_counts(monkeypatch, {
+        "catalog_products": 5, "products_cache": 5,
+        "product_quality_snapshot": 0, "product_enrichment": 0,
+    })
+
+    async def _fake_job(merchant_id: str):
+        return {
+            "status": "running",
+            "requested_at": "2026-01-01T00:00:00Z",
+            "started_at": "2026-01-01T00:00:00Z",
+            "total_candidates": 5,
+            "processed": 1,
+            "skipped": 0,
+            "failed": 0,
+        }
+    monkeypatch.setattr(mar, "_get_active_backfill_job", _fake_job)
+
+    r = await mar.assess_merchant_audit_readiness("m1")
+    assert r["ready"] is False  # quality snapshot still missing
+    assert r["backfill"] is not None
+    assert r["backfill"]["status"] == "running"
+    assert r["backfill"]["progress_pct"] == 20
+
+
+async def test_assess_backfill_none_when_no_active_job(monkeypatch) -> None:
+    _patch_counts(monkeypatch, {
+        "catalog_products": 5, "products_cache": 5,
+        "product_quality_snapshot": 5, "product_enrichment": 5,
+    })
+
+    async def _none(merchant_id: str):
+        return None
+    monkeypatch.setattr(mar, "_get_active_backfill_job", _none)
+
+    r = await mar.assess_merchant_audit_readiness("m1")
+    assert r["ready"] is True
+    assert r["backfill"] is None
+
+
+async def test_assess_backfill_lookup_failure_is_soft(monkeypatch) -> None:
+    # A readiness verdict must never fail just because the backfill probe did.
+    _patch_counts(monkeypatch, {
+        "catalog_products": 5, "products_cache": 5,
+        "product_quality_snapshot": 0, "product_enrichment": 0,
+    })
+
+    async def _boom(merchant_id: str):
+        raise RuntimeError("db unavailable")
+    monkeypatch.setattr(mar, "_get_active_backfill_job", _boom)
+
+    r = await mar.assess_merchant_audit_readiness("m1")
+    assert r["backfill"] is None
+    assert r["ready"] is False
