@@ -28,6 +28,41 @@ def _parse_dt(value: Any) -> Optional[datetime]:
         return None
 
 
+def _slug_from_url(url: Optional[str]) -> Optional[str]:
+    """Last non-empty path segment of a URL, lowercased — e.g.
+    https://brand.com/products/best-seller?x=1 -> "best-seller". Used to derive
+    a Woo handle from its permalink."""
+    if not url or not isinstance(url, str):
+        return None
+    try:
+        path = url.split("?", 1)[0].split("#", 1)[0].rstrip("/")
+        seg = path.rsplit("/", 1)[-1].strip().lower()
+        return seg or None
+    except Exception:
+        return None
+
+
+def _apply_storefront_fields(sp: StandardProduct) -> StandardProduct:
+    """Fill the cross-platform handle / online_store_url from platform_metadata
+    when they aren't already set, so the portal has one reliable field to match
+    audited product URLs against (Shopify=handle, WooCommerce=permalink/slug).
+    Best-effort and in-place; leaves them None when nothing usable exists."""
+    meta = sp.platform_metadata or {}
+    if not sp.handle:
+        sp.handle = (
+            meta.get("handle")
+            or meta.get("slug")
+            or _slug_from_url(meta.get("permalink"))
+        )
+    if not sp.online_store_url:
+        sp.online_store_url = (
+            meta.get("permalink")
+            or meta.get("online_store_url")
+            or meta.get("url")
+        )
+    return sp
+
+
 def _map_cache_row_to_standard_product(
     merchant_id: str,
     platform: str,
@@ -43,7 +78,7 @@ def _map_cache_row_to_standard_product(
     """
     # Fast path: already in StandardProduct shape
     if all(k in product_data for k in ("id", "merchant_id", "platform", "price")):
-        return StandardProduct(**product_data)
+        return _apply_storefront_fields(StandardProduct(**product_data))
 
     raw = product_data.get("raw") if isinstance(product_data, dict) else None
     raw = raw if isinstance(raw, dict) else {}
@@ -174,7 +209,7 @@ def _map_cache_row_to_standard_product(
         "data_completeness_score": score,
     }
 
-    return StandardProduct(**mapped)
+    return _apply_storefront_fields(StandardProduct(**mapped))
 
 
 @router.get("/{merchant_id}", response_model=ProductListResponse)
