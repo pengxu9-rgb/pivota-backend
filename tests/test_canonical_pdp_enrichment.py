@@ -392,3 +392,63 @@ async def test_execute_records_targeted_intents():
     assert result.status == "succeeded"
     assert result.evidence["intent_targeted_count"] == 1
     assert result.evidence["enriched"][0]["targeted_intents"] == ["halal collagen"]
+
+
+@pytest.mark.asyncio
+async def test_execute_scores_and_recomputes_serving_eligibility():
+    """Phase A (R1/R2/R6): after enriching, E1 writes a fresh quality snapshot
+    (full_quality_eval) AND recomputes serving_eligibility — so the enrichment can
+    actually flip serving and reach agents, instead of sitting behind a stale/missing
+    score. Records serving_eligible in evidence."""
+    agent = CanonicalPdpEnrichmentAgent()
+    ctx = ExecutorContext(merchant_id="m1", audit_report={"per_sku_reports": [
+        {"product_key": "m1|shopify|sp-1", "indexing_arc": {"x": 1},
+         "scores": {"content_richness": {"score": 50}}},
+    ]})
+    full_eval = AsyncMock(return_value={"content_quality_score": 71.2})
+    recompute = AsyncMock(return_value=True)
+    with patch(f"{_MOD}._resolve_gemini_api_key", return_value="k"), \
+         patch(f"{_MOD}._fetch_canonical_pdps_by_product_keys", new=AsyncMock(return_value=[_candidate()])), \
+         patch(f"{_MOD}._fetch_thin_canonical_pdps", new=AsyncMock(return_value=[])), \
+         patch(f"{_MOD}._generate_enrichment", new=AsyncMock(return_value=_enrichment())), \
+         patch("db.product_enrichment.upsert_enrichment", new=AsyncMock()), \
+         patch("services.agent_pdp_view_assembler.refresh_agent_pdp_view_for_content_key", new=AsyncMock(return_value=True)), \
+         patch("db.products.get_product_cache_row", new=AsyncMock(return_value=None)), \
+         patch("services.product_quality_service.full_quality_eval", new=full_eval), \
+         patch("services.index_pipeline_state_service.recompute_serving_eligibility", new=recompute):
+        result = await agent.execute(ctx)
+    assert result.status == "succeeded"
+    # Scored + recomputed for the enriched SKU.
+    full_eval.assert_awaited_once()
+    assert full_eval.await_args.kwargs["platform_product_id"] == "sp-1"
+    assert full_eval.await_args.kwargs["geo_code"] == "default"
+    recompute.assert_awaited_once()
+    assert recompute.await_args.args[0] == "ck-1"  # the candidate's content_key
+    # serving_eligible surfaced in evidence (per-SKU + count).
+    assert result.evidence["enriched"][0]["serving_eligible"] is True
+    assert result.evidence["serving_eligible_count"] == 1
+
+
+@pytest.mark.asyncio
+async def test_execute_phase_a_failure_is_best_effort():
+    """If scoring/recompute fails, enrichment + publish still count (best-effort):
+    serving_eligible just records None — Phase A never sinks the enrichment."""
+    agent = CanonicalPdpEnrichmentAgent()
+    ctx = ExecutorContext(merchant_id="m1", audit_report={"per_sku_reports": [
+        {"product_key": "m1|shopify|sp-1", "indexing_arc": {"x": 1},
+         "scores": {"content_richness": {"score": 50}}},
+    ]})
+    boom = AsyncMock(side_effect=RuntimeError("quality service down"))
+    with patch(f"{_MOD}._resolve_gemini_api_key", return_value="k"), \
+         patch(f"{_MOD}._fetch_canonical_pdps_by_product_keys", new=AsyncMock(return_value=[_candidate()])), \
+         patch(f"{_MOD}._fetch_thin_canonical_pdps", new=AsyncMock(return_value=[])), \
+         patch(f"{_MOD}._generate_enrichment", new=AsyncMock(return_value=_enrichment())), \
+         patch("db.product_enrichment.upsert_enrichment", new=AsyncMock()), \
+         patch("services.agent_pdp_view_assembler.refresh_agent_pdp_view_for_content_key", new=AsyncMock(return_value=True)), \
+         patch("db.products.get_product_cache_row", new=AsyncMock(return_value=None)), \
+         patch("services.product_quality_service.full_quality_eval", new=boom):
+        result = await agent.execute(ctx)
+    assert result.status == "succeeded"
+    assert result.evidence["enriched_count"] == 1
+    assert result.evidence["enriched"][0]["serving_eligible"] is None
+    assert result.evidence["serving_eligible_count"] == 0

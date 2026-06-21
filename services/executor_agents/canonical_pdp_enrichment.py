@@ -502,10 +502,19 @@ class CanonicalPdpEnrichmentAgent(BaseExecutorAgent):
 
         # Lazy imports (match the executor convention; keep module import light).
         from db.product_enrichment import upsert_enrichment
+        from db.products import get_product_cache_row
+        from models.standard_product import StandardProduct
         from services.agent_pdp_view_assembler import (
             refresh_agent_pdp_view_for_content_key,
         )
+        from services.index_pipeline_state_service import (
+            recompute_serving_eligibility,
+        )
         from services.product_enrichment_pipeline import _simple_compliance_check
+        from services.product_quality_service import (
+            build_quality_payload,
+            full_quality_eval,
+        )
 
         enriched: List[Dict[str, Any]] = []
         blocked: List[Dict[str, Any]] = []
@@ -571,11 +580,53 @@ class CanonicalPdpEnrichmentAgent(BaseExecutorAgent):
                         content_key, str(exc)[:200],
                     )
 
+            # Phase A (R1/R2/R6): score + flip serving. E1 enriched + published but
+            # never (re)scored, so serving_eligible stayed stale (no quality snapshot
+            # -> blocked; or a frozen pre-enrichment score) and the enrichment never
+            # reached agents. Write a fresh product_quality_snapshot from the FULL
+            # product + this enrichment (mirrors product_enrichment_pipeline), then
+            # recompute eligibility. Best-effort: enrichment + publish already landed.
+            serving_eligible = None
+            try:
+                cache_row = await get_product_cache_row(
+                    merchant_id=cand["merchant_id"],
+                    platform=cand["platform"],
+                    platform_product_id=cand["source_product_id"],
+                    include_expired=False,
+                )
+                # Full product (price/images/brand) for an accurate score — the
+                # candidate dict lacks them. Fall back to the candidate dict if the
+                # cache row is missing or a legacy shape.
+                product_for_quality: Any = cand
+                if cache_row and cache_row.get("product_data"):
+                    try:
+                        product_for_quality = StandardProduct(**cache_row["product_data"])
+                    except Exception:  # noqa: BLE001
+                        product_for_quality = cache_row["product_data"]
+                await full_quality_eval(
+                    merchant_id=cand["merchant_id"],
+                    platform=cand["platform"],
+                    platform_product_id=cand["source_product_id"],
+                    geo_code="default",
+                    payload=build_quality_payload(product_for_quality, gen),
+                )
+                if content_key:
+                    serving_eligible = await recompute_serving_eligibility(
+                        content_key, reason=self.name,
+                    )
+            except Exception as exc:  # noqa: BLE001
+                logger.warning(
+                    "canonical_pdp_enrichment: quality/eligibility recompute failed "
+                    "for %s: %s",
+                    content_key or cand.get("source_product_id"), str(exc)[:200],
+                )
+
             enriched.append({
                 **ident,
                 "content_key": content_key,
                 "description_chars": len(gen["description_markdown"]),
                 "published": published,
+                "serving_eligible": serving_eligible,
                 "source": cand.get("_candidate_source"),
                 "targeted_intents": cand.get("_target_intents") or [],
             })
@@ -589,6 +640,9 @@ class CanonicalPdpEnrichmentAgent(BaseExecutorAgent):
                 1 for c in candidates if c.get("_target_intents")
             ),
             "enriched_count": len(enriched),
+            "serving_eligible_count": sum(
+                1 for e in enriched if e.get("serving_eligible") is True
+            ),
             "blocked_count": len(blocked),
             "failed_count": len(failed),
             "enriched": enriched,
