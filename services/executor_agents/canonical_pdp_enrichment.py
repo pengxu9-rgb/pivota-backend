@@ -32,6 +32,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import os
 import re
 from typing import Any, Dict, List, Optional
 
@@ -483,6 +484,167 @@ async def _generate_enrichment(
     return None
 
 
+# --- Factual grounding gate (SAFETY) --------------------------------------
+# E1 is the ONLY auto-mutating path to the served PDP, and _simple_compliance_check
+# (above, in the loop) is just a keyword denylist — NOT a fact check. This gate
+# fact-checks the generated copy against the candidate's grounding facts via the
+# DeepSeek answer-quality verify primitive BEFORE persist+publish, and fails
+# CLOSED (unverifiable -> block) so unverified copy never reaches the surface
+# frontier agents cite.
+_VERIFY_TIMEOUT_S = 12.0
+
+
+def _factual_gate_enabled() -> bool:
+    """Default ON (safety). Emergency disable via env E1_FACTUAL_GATE_ENABLED=0."""
+    return os.getenv("E1_FACTUAL_GATE_ENABLED", "1").strip().lower() not in (
+        "0", "false", "no", "off",
+    )
+
+
+def _generated_claim_text(gen: Dict[str, Any]) -> str:
+    """Concatenate the generated fields that carry checkable factual claims
+    (audience_tags excluded — who-it's-for tags rarely assert checkable facts)."""
+    parts = [
+        gen.get("title_override") or "",
+        gen.get("summary_short") or "",
+        gen.get("description_markdown") or "",
+        " ".join(gen.get("bullet_points") or []),
+        " ".join(gen.get("usage_scenarios") or []),
+    ]
+    return "\n".join(p for p in parts if p).strip()[:4000]
+
+
+def _grounding_facts_for_candidate(cand: Dict[str, Any]) -> Dict[str, str]:
+    """The grounding facts Pivota holds at persist time — the same thin source the
+    generation prompt was built from. Intentionally narrow: the Gemini grounding
+    citations that substantiated any NEW claim are discarded by the parser, so a
+    claim not derivable from these is unverifiable and the gate errs to the safe
+    (block) side. (Follow-up to reduce false-positives: retain Gemini
+    groundingMetadata in _parse_enrichment_response and append it here.)"""
+    intents = cand.get("_target_intents") or []
+    return {
+        "title": str(cand.get("title") or "").strip(),
+        "brand": str(cand.get("brand") or "").strip(),
+        "category": str(cand.get("category") or cand.get("product_type") or "").strip(),
+        "product_type": str(cand.get("product_type") or "").strip(),
+        "description": str(cand.get("description") or "").strip(),
+        "intent": "; ".join(str(i).strip() for i in intents if str(i or "").strip()),
+    }
+
+
+def _grounding_facts_text(g: Dict[str, str]) -> str:
+    lines: List[str] = []
+    if g.get("title"):
+        lines.append(f"Title: {g['title']}")
+    if g.get("brand"):
+        lines.append(f"Brand: {g['brand']}")
+    if g.get("category"):
+        lines.append(f"Category: {g['category']}")
+    if g.get("description"):
+        lines.append(f"Original description: {g['description']}")
+    return "\n".join(lines).strip()[:2000]
+
+
+def _gate_block(
+    reason: str,
+    *,
+    note: Optional[str] = None,
+    misstates: Optional[bool] = None,
+    supports: Optional[bool] = None,
+) -> Dict[str, Any]:
+    return {
+        "passed": False,
+        "reason": reason,
+        "misstates_facts": misstates,
+        "supports_recommendation": supports,
+        "note": note,
+    }
+
+
+async def _verify_enrichment_grounding(
+    generated: Dict[str, Any],
+    grounding: Dict[str, str],
+    *,
+    merchant_id: str,
+    timeout_s: float = _VERIFY_TIMEOUT_S,
+) -> Dict[str, Any]:
+    """Fact-check generated enrichment copy against the candidate's grounding
+    facts, reusing the DeepSeek answer-quality verify primitive (the same probe
+    the audit uses). Gates on `misstates_facts` ("the answer contradicts or
+    invents a core fact about the SKU") — NOT on `supports_recommendation`
+    (recommend-fit semantics, recorded only).
+
+    Returns {"passed", "reason", "misstates_facts", "supports_recommendation",
+    "note"}. Fail-CLOSED: missing key / error / timeout / unparseable verdict all
+    yield passed=False so unverified copy is never published. Best-effort-bounded
+    (inner probe timeout + outer wall) so it can never wedge the executor — the
+    caller treats a raise as fatal to the batch, so this MUST NOT raise."""
+    from config.settings import settings
+
+    if not getattr(settings, "deepseek_api_key", None):
+        return _gate_block("missing_deepseek_api_key")
+
+    claim_text = _generated_claim_text(generated)
+    source_facts = _grounding_facts_text(grounding)
+    sku_title = (grounding.get("title") or "").strip()
+    # No title -> the verifier can't anchor "the SKU" (the probe also requires
+    # product_title) and there's nothing to ground against. Fail closed cleanly
+    # here rather than burning a doomed, metered probe call.
+    if not claim_text or not source_facts or not sku_title:
+        return _gate_block("insufficient_grounding")
+
+    intent = grounding.get("intent") or "an accurate description of this product"
+
+    try:
+        from services.agent_center_bd_report_service import _extract_verify_verdict
+        from services.agent_center_llm_client import probe as llm_probe
+        from services.audit_telemetry_context import audit_telemetry
+
+        # audit_telemetry attributes the verify cost to this merchant.
+        async with audit_telemetry(run_id=None, merchant_id=merchant_id or None):
+            result = await asyncio.wait_for(
+                llm_probe(
+                    scan_mode="answer_quality_verify",
+                    scan_target_id=f"enrich-verify-{(sku_title or 'sku')[:40]}",
+                    merchant_id=merchant_id,
+                    store_id=f"{merchant_id}_enrich_verify",
+                    context={
+                        "product_title": sku_title,
+                        "product_type": grounding.get("product_type") or "",
+                        "merchant_brand": grounding.get("brand") or "",
+                        "verify_query": intent,
+                        "verify_intent": intent,
+                        "verify_answer_text": claim_text,
+                        "verify_evidence_excerpt": source_facts,
+                    },
+                    provider="deepseek",
+                    max_runs=1,
+                    timeout_s=timeout_s,
+                ),
+                timeout=timeout_s + 2.0,  # outer wall in case the client stalls
+            )
+    except asyncio.TimeoutError:
+        return _gate_block("verify_timeout")
+    except Exception as exc:  # noqa: BLE001 -- 4xx/5xx/network/import all fail closed
+        logger.warning(
+            "canonical_pdp_enrichment: factual verify call failed: %s", str(exc)[:200]
+        )
+        return _gate_block("verify_error", note=str(exc)[:200])
+
+    verdict = _extract_verify_verdict(result)
+    if verdict is None:
+        return _gate_block("verify_unparseable")
+
+    passed = verdict["misstates_facts"] is False
+    return {
+        "passed": passed,
+        "reason": "grounded" if passed else "misstates_facts",
+        "misstates_facts": verdict["misstates_facts"],
+        "supports_recommendation": verdict["supports_recommendation"],
+        "note": verdict["note"],
+    }
+
+
 class CanonicalPdpEnrichmentAgent(BaseExecutorAgent):
     """Auto-generate + publish citable enrichment for content-thin Pivota
     canonical PDPs (the surface Pivota owns)."""
@@ -564,6 +726,43 @@ class CanonicalPdpEnrichmentAgent(BaseExecutorAgent):
             if not compliance["allowed"]:
                 blocked.append({**ident, "reason": compliance["reason"]})
                 continue
+
+            # Factual grounding gate (SAFETY): never publish copy whose claims
+            # aren't supported by the product's grounding source. The compliance
+            # check above is only a keyword denylist; this fact-checks the copy
+            # via the DeepSeek verify primitive and fails CLOSED (unverifiable ->
+            # block). This is the only auto-mutating path to the served PDP.
+            if _factual_gate_enabled():
+                try:
+                    verdict = await _verify_enrichment_grounding(
+                        gen,
+                        _grounding_facts_for_candidate(cand),
+                        merchant_id=str(cand.get("merchant_id") or ""),
+                    )
+                except Exception as exc:  # noqa: BLE001 -- the gate must NEVER abort
+                    # the batch; an unexpected error fails CLOSED (block this SKU).
+                    logger.warning(
+                        "canonical_pdp_enrichment: factual gate errored, failing "
+                        "closed for %s/%s/%s: %s",
+                        ident["merchant_id"], ident["platform"],
+                        ident["source_product_id"], str(exc)[:200],
+                    )
+                    verdict = {"passed": False, "reason": "gate_error",
+                               "note": str(exc)[:200]}
+                if not verdict["passed"]:
+                    logger.warning(
+                        "canonical_pdp_enrichment: factual gate BLOCKED "
+                        "%s/%s/%s (reason=%s)",
+                        ident["merchant_id"], ident["platform"],
+                        ident["source_product_id"], verdict["reason"],
+                    )
+                    blocked.append({
+                        **ident,
+                        "reason": verdict["reason"],
+                        "gate": "factual_grounding",
+                        "verify_note": verdict.get("note"),
+                    })
+                    continue
 
             # Persist to the enrichment overlay (candidate filter already
             # excluded rows with existing description_markdown, so no clobber).
@@ -668,6 +867,10 @@ class CanonicalPdpEnrichmentAgent(BaseExecutorAgent):
                 1 for e in enriched if e.get("serving_eligible") is True
             ),
             "blocked_count": len(blocked),
+            "factual_gate_enabled": _factual_gate_enabled(),
+            "factual_gate_blocked_count": sum(
+                1 for b in blocked if b.get("gate") == "factual_grounding"
+            ),
             "failed_count": len(failed),
             "enriched": enriched,
             "blocked": blocked,

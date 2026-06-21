@@ -8,6 +8,7 @@ pure keyword check) so the block path is exercised end-to-end.
 
 from __future__ import annotations
 
+import asyncio
 from typing import Any, Dict, List
 from unittest.mock import AsyncMock, patch
 
@@ -19,8 +20,13 @@ from services.executor_agents.canonical_pdp_enrichment import (
     _audit_flagged_intents_by_product_key,
     _audit_thin_product_keys,
     _build_enrichment_prompt,
+    _factual_gate_enabled,
+    _generated_claim_text,
+    _grounding_facts_for_candidate,
+    _grounding_facts_text,
     _resolve_candidates,
     _source_ids_from_product_keys,
+    _verify_enrichment_grounding,
 )
 
 _MOD = "services.executor_agents.canonical_pdp_enrichment"
@@ -61,6 +67,18 @@ def _enrichment(**overrides) -> Dict[str, Any]:
     return base
 
 
+def _pass_verdict() -> Dict[str, Any]:
+    """A factual-gate verdict that PASSES (copy is grounded) — lets the
+    publish-path tests through the now-default-ON gate."""
+    return {
+        "passed": True,
+        "reason": "grounded",
+        "misstates_facts": False,
+        "supports_recommendation": True,
+        "note": "",
+    }
+
+
 # ---------------------------------------------------------------------------
 # should_run gating
 # ---------------------------------------------------------------------------
@@ -83,6 +101,7 @@ async def test_should_run_false_without_gemini_key():
 async def test_should_run_false_when_no_candidates():
     agent = CanonicalPdpEnrichmentAgent()
     with patch(f"{_MOD}._resolve_gemini_api_key", return_value="k"), \
+         patch(f"{_MOD}._verify_enrichment_grounding", new=AsyncMock(return_value=_pass_verdict())), \
          patch(f"{_MOD}._fetch_thin_canonical_pdps", new=AsyncMock(return_value=[])):
         assert await agent.should_run(ExecutorContext(merchant_id="m1")) is False
 
@@ -91,6 +110,7 @@ async def test_should_run_false_when_no_candidates():
 async def test_should_run_true_when_candidates_exist():
     agent = CanonicalPdpEnrichmentAgent()
     with patch(f"{_MOD}._resolve_gemini_api_key", return_value="k"), \
+         patch(f"{_MOD}._verify_enrichment_grounding", new=AsyncMock(return_value=_pass_verdict())), \
          patch(f"{_MOD}._fetch_thin_canonical_pdps", new=AsyncMock(return_value=[_candidate()])):
         assert await agent.should_run(ExecutorContext(merchant_id="m1")) is True
 
@@ -112,6 +132,7 @@ async def test_execute_skipped_without_key():
 async def test_execute_skipped_no_candidates():
     agent = CanonicalPdpEnrichmentAgent()
     with patch(f"{_MOD}._resolve_gemini_api_key", return_value="k"), \
+         patch(f"{_MOD}._verify_enrichment_grounding", new=AsyncMock(return_value=_pass_verdict())), \
          patch(f"{_MOD}._fetch_thin_canonical_pdps", new=AsyncMock(return_value=[])):
         result = await agent.execute(ExecutorContext(merchant_id="m1"))
     assert result.status == "skipped"
@@ -125,6 +146,7 @@ async def test_execute_enriches_and_publishes():
     upsert = AsyncMock()
     refresh = AsyncMock(return_value=True)
     with patch(f"{_MOD}._resolve_gemini_api_key", return_value="k"), \
+         patch(f"{_MOD}._verify_enrichment_grounding", new=AsyncMock(return_value=_pass_verdict())), \
          patch(f"{_MOD}._fetch_thin_canonical_pdps", new=AsyncMock(return_value=[_candidate()])), \
          patch(f"{_MOD}._generate_enrichment", new=AsyncMock(return_value=_enrichment())), \
          patch("db.product_enrichment.upsert_enrichment", new=upsert), \
@@ -157,6 +179,7 @@ async def test_execute_blocks_noncompliant_copy():
     upsert = AsyncMock()
     refresh = AsyncMock(return_value=True)
     with patch(f"{_MOD}._resolve_gemini_api_key", return_value="k"), \
+         patch(f"{_MOD}._verify_enrichment_grounding", new=AsyncMock(return_value=_pass_verdict())), \
          patch(f"{_MOD}._fetch_thin_canonical_pdps", new=AsyncMock(return_value=[_candidate()])), \
          patch(f"{_MOD}._generate_enrichment", new=AsyncMock(return_value=bad)), \
          patch("db.product_enrichment.upsert_enrichment", new=upsert), \
@@ -175,6 +198,7 @@ async def test_execute_failed_generation_counts_but_does_not_crash():
     """A None generation (LLM failed/unparseable) lands in `failed`, not a crash."""
     agent = CanonicalPdpEnrichmentAgent()
     with patch(f"{_MOD}._resolve_gemini_api_key", return_value="k"), \
+         patch(f"{_MOD}._verify_enrichment_grounding", new=AsyncMock(return_value=_pass_verdict())), \
          patch(f"{_MOD}._fetch_thin_canonical_pdps", new=AsyncMock(return_value=[_candidate()])), \
          patch(f"{_MOD}._generate_enrichment", new=AsyncMock(return_value=None)):
         result = await agent.execute(ExecutorContext(merchant_id="m1"))
@@ -283,6 +307,7 @@ async def test_execute_enriches_the_audit_flagged_sku():
     upsert = AsyncMock()
     refresh = AsyncMock(return_value=True)
     with patch(f"{_MOD}._resolve_gemini_api_key", return_value="k"), \
+         patch(f"{_MOD}._verify_enrichment_grounding", new=AsyncMock(return_value=_pass_verdict())), \
          patch(f"{_MOD}._fetch_canonical_pdps_by_product_keys", new=AsyncMock(return_value=[_candidate()])), \
          patch(f"{_MOD}._fetch_thin_canonical_pdps", new=AsyncMock(return_value=[])), \
          patch(f"{_MOD}._generate_enrichment", new=AsyncMock(return_value=_enrichment())), \
@@ -383,6 +408,7 @@ async def test_execute_records_targeted_intents():
              {"query": "halal collagen", "supports_recommendation": False}]}},
     ]})
     with patch(f"{_MOD}._resolve_gemini_api_key", return_value="k"), \
+         patch(f"{_MOD}._verify_enrichment_grounding", new=AsyncMock(return_value=_pass_verdict())), \
          patch(f"{_MOD}._fetch_canonical_pdps_by_product_keys", new=AsyncMock(return_value=[_candidate()])), \
          patch(f"{_MOD}._fetch_thin_canonical_pdps", new=AsyncMock(return_value=[])), \
          patch(f"{_MOD}._generate_enrichment", new=AsyncMock(return_value=_enrichment())), \
@@ -408,6 +434,7 @@ async def test_execute_scores_and_recomputes_serving_eligibility():
     full_eval = AsyncMock(return_value={"content_quality_score": 71.2})
     recompute = AsyncMock(return_value=True)
     with patch(f"{_MOD}._resolve_gemini_api_key", return_value="k"), \
+         patch(f"{_MOD}._verify_enrichment_grounding", new=AsyncMock(return_value=_pass_verdict())), \
          patch(f"{_MOD}._fetch_canonical_pdps_by_product_keys", new=AsyncMock(return_value=[_candidate()])), \
          patch(f"{_MOD}._fetch_thin_canonical_pdps", new=AsyncMock(return_value=[])), \
          patch(f"{_MOD}._generate_enrichment", new=AsyncMock(return_value=_enrichment())), \
@@ -440,6 +467,7 @@ async def test_execute_phase_a_failure_is_best_effort():
     ]})
     boom = AsyncMock(side_effect=RuntimeError("quality service down"))
     with patch(f"{_MOD}._resolve_gemini_api_key", return_value="k"), \
+         patch(f"{_MOD}._verify_enrichment_grounding", new=AsyncMock(return_value=_pass_verdict())), \
          patch(f"{_MOD}._fetch_canonical_pdps_by_product_keys", new=AsyncMock(return_value=[_candidate()])), \
          patch(f"{_MOD}._fetch_thin_canonical_pdps", new=AsyncMock(return_value=[])), \
          patch(f"{_MOD}._generate_enrichment", new=AsyncMock(return_value=_enrichment())), \
@@ -519,3 +547,283 @@ async def test_generate_enrichment_gives_up_after_max_attempts(monkeypatch):
     out = await mod._generate_enrichment(_candidate(), "k", timeout_s=1, max_attempts=3)
     assert out is None
     assert calls["n"] == 3  # exhausted all attempts
+
+
+# ---------------------------------------------------------------------------
+# Factual grounding gate (SAFETY) — fact-check generated copy against the
+# product's grounding source before publishing; fail CLOSED.
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_factual_gate_grounded_passes_and_publishes(monkeypatch):
+    """Gate ON + a 'grounded' verdict -> copy is persisted + published."""
+    monkeypatch.delenv("E1_FACTUAL_GATE_ENABLED", raising=False)
+    agent = CanonicalPdpEnrichmentAgent()
+    upsert = AsyncMock()
+    refresh = AsyncMock(return_value=True)
+    verify = AsyncMock(return_value=_pass_verdict())
+    with patch(f"{_MOD}._resolve_gemini_api_key", return_value="k"), \
+         patch(f"{_MOD}._fetch_thin_canonical_pdps", new=AsyncMock(return_value=[_candidate()])), \
+         patch(f"{_MOD}._generate_enrichment", new=AsyncMock(return_value=_enrichment())), \
+         patch(f"{_MOD}._verify_enrichment_grounding", new=verify), \
+         patch("db.product_enrichment.upsert_enrichment", new=upsert), \
+         patch("services.agent_pdp_view_assembler.refresh_agent_pdp_view_for_content_key", new=refresh):
+        result = await agent.execute(ExecutorContext(merchant_id="m1"))
+    assert result.status == "succeeded"
+    assert result.evidence["enriched_count"] == 1
+    assert result.evidence["factual_gate_enabled"] is True
+    assert result.evidence["factual_gate_blocked_count"] == 0
+    verify.assert_awaited_once()
+    upsert.assert_awaited_once()
+    refresh.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_factual_gate_unsupported_blocks_publish(monkeypatch):
+    """misstates_facts=True -> NOT persisted/published; recorded as a
+    factual_grounding block; status failed (nothing enriched)."""
+    monkeypatch.delenv("E1_FACTUAL_GATE_ENABLED", raising=False)
+    agent = CanonicalPdpEnrichmentAgent()
+    upsert = AsyncMock()
+    refresh = AsyncMock(return_value=True)
+    verify = AsyncMock(return_value={
+        "passed": False, "reason": "misstates_facts", "misstates_facts": True,
+        "supports_recommendation": True, "note": "invented a certification",
+    })
+    with patch(f"{_MOD}._resolve_gemini_api_key", return_value="k"), \
+         patch(f"{_MOD}._fetch_thin_canonical_pdps", new=AsyncMock(return_value=[_candidate()])), \
+         patch(f"{_MOD}._generate_enrichment", new=AsyncMock(return_value=_enrichment())), \
+         patch(f"{_MOD}._verify_enrichment_grounding", new=verify), \
+         patch("db.product_enrichment.upsert_enrichment", new=upsert), \
+         patch("services.agent_pdp_view_assembler.refresh_agent_pdp_view_for_content_key", new=refresh):
+        result = await agent.execute(ExecutorContext(merchant_id="m1"))
+    assert result.status == "failed"  # nothing enriched
+    assert result.evidence["enriched_count"] == 0
+    assert result.evidence["blocked_count"] == 1
+    assert result.evidence["factual_gate_blocked_count"] == 1
+    assert result.evidence["blocked"][0]["gate"] == "factual_grounding"
+    assert result.evidence["blocked"][0]["reason"] == "misstates_facts"
+    upsert.assert_not_awaited()
+    refresh.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_factual_gate_verify_error_fails_closed(monkeypatch):
+    """A verify-call error resolves to a fail-CLOSED block — unverifiable copy is
+    never published."""
+    monkeypatch.delenv("E1_FACTUAL_GATE_ENABLED", raising=False)
+    agent = CanonicalPdpEnrichmentAgent()
+    upsert = AsyncMock()
+    refresh = AsyncMock(return_value=True)
+    verify = AsyncMock(return_value={
+        "passed": False, "reason": "verify_error", "misstates_facts": None,
+        "supports_recommendation": None, "note": "boom",
+    })
+    with patch(f"{_MOD}._resolve_gemini_api_key", return_value="k"), \
+         patch(f"{_MOD}._fetch_thin_canonical_pdps", new=AsyncMock(return_value=[_candidate()])), \
+         patch(f"{_MOD}._generate_enrichment", new=AsyncMock(return_value=_enrichment())), \
+         patch(f"{_MOD}._verify_enrichment_grounding", new=verify), \
+         patch("db.product_enrichment.upsert_enrichment", new=upsert), \
+         patch("services.agent_pdp_view_assembler.refresh_agent_pdp_view_for_content_key", new=refresh):
+        result = await agent.execute(ExecutorContext(merchant_id="m1"))
+    assert result.evidence["enriched_count"] == 0
+    assert result.evidence["factual_gate_blocked_count"] == 1
+    assert result.evidence["blocked"][0]["reason"] == "verify_error"
+    upsert.assert_not_awaited()
+    refresh.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_factual_gate_disabled_skips_check(monkeypatch):
+    """E1_FACTUAL_GATE_ENABLED=0 -> gate skipped (verify never called); reverts to
+    compliance-only; copy publishes."""
+    monkeypatch.setenv("E1_FACTUAL_GATE_ENABLED", "0")
+    agent = CanonicalPdpEnrichmentAgent()
+    upsert = AsyncMock()
+    refresh = AsyncMock(return_value=True)
+    verify = AsyncMock(return_value=_pass_verdict())
+    with patch(f"{_MOD}._resolve_gemini_api_key", return_value="k"), \
+         patch(f"{_MOD}._fetch_thin_canonical_pdps", new=AsyncMock(return_value=[_candidate()])), \
+         patch(f"{_MOD}._generate_enrichment", new=AsyncMock(return_value=_enrichment())), \
+         patch(f"{_MOD}._verify_enrichment_grounding", new=verify), \
+         patch("db.product_enrichment.upsert_enrichment", new=upsert), \
+         patch("services.agent_pdp_view_assembler.refresh_agent_pdp_view_for_content_key", new=refresh):
+        result = await agent.execute(ExecutorContext(merchant_id="m1"))
+    assert result.status == "succeeded"
+    assert result.evidence["enriched_count"] == 1
+    assert result.evidence["factual_gate_enabled"] is False
+    verify.assert_not_awaited()  # gate off -> never called
+    upsert.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_verify_enrichment_grounding_missing_key_fails_closed():
+    """No DeepSeek key configured -> fail-closed (passed=False), no network call."""
+    with patch("config.settings.settings.deepseek_api_key", None):
+        out = await _verify_enrichment_grounding(
+            _enrichment(),
+            _grounding_facts_for_candidate(_candidate()),
+            merchant_id="m1",
+        )
+    assert out["passed"] is False
+    assert out["reason"] == "missing_deepseek_api_key"
+
+
+@pytest.mark.asyncio
+async def test_verify_enrichment_grounding_passes_through_verdict():
+    """With a key + a parseable verdict: misstates_facts False -> passed; True ->
+    blocked. Exercises the probe + _extract_verify_verdict integration on a
+    realistic raw_runs shape."""
+    def _result(misstates: bool) -> Dict[str, Any]:
+        return {"raw_runs": [{"parsed": {
+            "supports_recommendation": True, "misstates_facts": misstates, "note": "ok"}}]}
+    grounding = _grounding_facts_for_candidate(_candidate())
+    with patch("config.settings.settings.deepseek_api_key", "k"), \
+         patch("services.agent_center_llm_client.probe",
+               new=AsyncMock(return_value=_result(False))):
+        ok = await _verify_enrichment_grounding(_enrichment(), grounding, merchant_id="m1")
+    assert ok["passed"] is True and ok["reason"] == "grounded"
+    with patch("config.settings.settings.deepseek_api_key", "k"), \
+         patch("services.agent_center_llm_client.probe",
+               new=AsyncMock(return_value=_result(True))):
+        bad = await _verify_enrichment_grounding(_enrichment(), grounding, merchant_id="m1")
+    assert bad["passed"] is False and bad["reason"] == "misstates_facts"
+
+
+def test_generated_claim_text_and_grounding_facts_text():
+    """The input-mapping helpers: claim text concatenates the claim-bearing fields
+    (truncated 4000); facts text emits Title/Brand/Category/Original-desc (2000)."""
+    claim = _generated_claim_text(_enrichment())
+    assert "Good Night Collagen" in claim          # title_override
+    assert "Low-molecular-weight collagen" in claim  # description
+    assert "Halal-certified" in claim               # a bullet
+    assert len(claim) <= 4000
+    facts = _grounding_facts_text(_grounding_facts_for_candidate(_candidate()))
+    assert "Title: Good Night Collagen, 30 sticks" in facts
+    assert "Brand: BB Lab" in facts
+    assert "Original description: thin" in facts
+    assert len(facts) <= 2000
+
+
+def test_factual_gate_enabled_default_on_and_explicit_off(monkeypatch):
+    monkeypatch.delenv("E1_FACTUAL_GATE_ENABLED", raising=False)
+    assert _factual_gate_enabled() is True          # default ON (safety)
+    monkeypatch.setenv("E1_FACTUAL_GATE_ENABLED", "0")
+    assert _factual_gate_enabled() is False
+    monkeypatch.setenv("E1_FACTUAL_GATE_ENABLED", "off")
+    assert _factual_gate_enabled() is False
+
+
+@pytest.mark.asyncio
+async def test_factual_gate_helper_raise_fails_closed(monkeypatch):
+    """If the verify helper itself RAISES, execute() catches it and fails CLOSED
+    (blocks) — a gate error can never abort the batch or publish unverified copy."""
+    monkeypatch.delenv("E1_FACTUAL_GATE_ENABLED", raising=False)
+    agent = CanonicalPdpEnrichmentAgent()
+    upsert = AsyncMock()
+    refresh = AsyncMock(return_value=True)
+    verify = AsyncMock(side_effect=RuntimeError("unexpected"))
+    with patch(f"{_MOD}._resolve_gemini_api_key", return_value="k"), \
+         patch(f"{_MOD}._fetch_thin_canonical_pdps", new=AsyncMock(return_value=[_candidate()])), \
+         patch(f"{_MOD}._generate_enrichment", new=AsyncMock(return_value=_enrichment())), \
+         patch(f"{_MOD}._verify_enrichment_grounding", new=verify), \
+         patch("db.product_enrichment.upsert_enrichment", new=upsert), \
+         patch("services.agent_pdp_view_assembler.refresh_agent_pdp_view_for_content_key", new=refresh):
+        result = await agent.execute(ExecutorContext(merchant_id="m1"))
+    assert result.evidence["enriched_count"] == 0
+    assert result.evidence["factual_gate_blocked_count"] == 1
+    assert result.evidence["blocked"][0]["reason"] == "gate_error"
+    assert result.evidence["blocked"][0]["gate"] == "factual_grounding"
+    upsert.assert_not_awaited()
+    refresh.assert_not_awaited()
+
+
+# --- helper-level fail-closed branches (the real probe/verdict mapping) -----
+
+
+@pytest.mark.asyncio
+async def test_verify_enrichment_grounding_unparseable_fails_closed():
+    """A verdict that can't be parsed (missing/non-bool fields, empty/absent
+    raw_runs) -> verify_unparseable block."""
+    grounding = _grounding_facts_for_candidate(_candidate())
+    for bad in ({"raw_runs": [{"parsed": {"note": "x"}}]}, {"raw_runs": []}, {}):
+        with patch("config.settings.settings.deepseek_api_key", "k"), \
+             patch("services.agent_center_llm_client.probe",
+                   new=AsyncMock(return_value=bad)):
+            out = await _verify_enrichment_grounding(
+                _enrichment(), grounding, merchant_id="m1")
+        assert out["passed"] is False
+        assert out["reason"] == "verify_unparseable"
+
+
+@pytest.mark.asyncio
+async def test_verify_enrichment_grounding_insufficient_grounding_short_circuits():
+    """Empty grounding (no title/brand/category/desc) -> insufficient_grounding
+    BEFORE any network call (no probe, no metered cost)."""
+    probe = AsyncMock()
+    empty = _grounding_facts_for_candidate(
+        _candidate(title="", brand="", category="", product_type="", description=""))
+    with patch("config.settings.settings.deepseek_api_key", "k"), \
+         patch("services.agent_center_llm_client.probe", new=probe):
+        out = await _verify_enrichment_grounding(_enrichment(), empty, merchant_id="m1")
+    assert out["passed"] is False
+    assert out["reason"] == "insufficient_grounding"
+    probe.assert_not_awaited()  # short-circuits before the metered call
+
+
+@pytest.mark.asyncio
+async def test_verify_enrichment_grounding_timeout_fails_closed():
+    """A probe timeout -> verify_timeout block (the most operationally likely
+    failure: DeepSeek slow)."""
+    grounding = _grounding_facts_for_candidate(_candidate())
+    with patch("config.settings.settings.deepseek_api_key", "k"), \
+         patch("services.agent_center_llm_client.probe",
+               new=AsyncMock(side_effect=asyncio.TimeoutError())):
+        out = await _verify_enrichment_grounding(_enrichment(), grounding, merchant_id="m1")
+    assert out["passed"] is False
+    assert out["reason"] == "verify_timeout"
+
+
+@pytest.mark.asyncio
+async def test_verify_enrichment_grounding_probe_error_fails_closed():
+    """A probe exception (4xx/5xx/network) -> verify_error block, error in note."""
+    grounding = _grounding_facts_for_candidate(_candidate())
+    with patch("config.settings.settings.deepseek_api_key", "k"), \
+         patch("services.agent_center_llm_client.probe",
+               new=AsyncMock(side_effect=RuntimeError("boom"))):
+        out = await _verify_enrichment_grounding(_enrichment(), grounding, merchant_id="m1")
+    assert out["passed"] is False
+    assert out["reason"] == "verify_error"
+    assert "boom" in (out["note"] or "")
+
+
+@pytest.mark.asyncio
+async def test_verify_enrichment_grounding_supports_false_still_passes():
+    """Gate is on misstates_facts ONLY: supports_recommendation=False must NOT
+    block (recorded, not gated). Also pins the probe call args + claim/source
+    mapping (a regression that over-gates or inverts the mapping would fail)."""
+    grounding = _grounding_facts_for_candidate(_candidate())
+    probe = AsyncMock(return_value={"raw_runs": [{"parsed": {
+        "supports_recommendation": False, "misstates_facts": False, "note": "ok"}}]})
+    with patch("config.settings.settings.deepseek_api_key", "k"), \
+         patch("services.agent_center_llm_client.probe", new=probe):
+        out = await _verify_enrichment_grounding(_enrichment(), grounding, merchant_id="m1")
+    assert out["passed"] is True and out["reason"] == "grounded"
+    assert out["supports_recommendation"] is False
+    probe.assert_awaited_once()
+    kw = probe.await_args.kwargs
+    assert kw["provider"] == "deepseek"
+    assert kw["scan_mode"] == "answer_quality_verify"
+    assert kw["max_runs"] == 1
+    # generated copy -> answer; source facts -> evidence (mapping not inverted)
+    assert "Low-molecular-weight collagen" in kw["context"]["verify_answer_text"]
+    assert "Title: Good Night Collagen" in kw["context"]["verify_evidence_excerpt"]
+
+
+def test_grounding_facts_for_candidate_intent_join_and_category_fallback():
+    """intent joins _target_intents; category falls back to product_type."""
+    g = _grounding_facts_for_candidate(
+        _candidate(category="", _target_intents=["halal collagen", "sleep"]))
+    assert g["category"] == "supplement"   # falls back to product_type
+    assert g["intent"] == "halal collagen; sleep"
