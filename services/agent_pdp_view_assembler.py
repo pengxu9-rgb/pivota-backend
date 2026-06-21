@@ -24,6 +24,7 @@ from typing import Any, Dict, List, Optional, Tuple
 
 from db.database import database
 from services.catalog_identity import normalize_gtin
+from services.source_quarantine import build_quarantine_anti_join_sql
 from services.title_normalization import normalize_display_title
 
 logger = logging.getLogger(__name__)
@@ -44,6 +45,24 @@ PDP_URL_PREFIX = "https://agent.pivota.cc/products/"
 # incremental refreshes.
 BACKFILL_REFRESH_SOURCE = "backfill_3a_ii"
 
+# Enforce the source-quarantine overlay (mig 134) at the canonical-pick / serve
+# layer. catalog_source_quarantine is OPT-IN — readers must anti-join it, and
+# this serving assembler historically did NOT, so quarantines were silently
+# shadow here. fetch_products_for_key is the single loader feeding pick_canonical
+# (both assemble_row and the enrichment overlay fetch, via
+# refresh_agent_pdp_view_for_content_key — the only APV rebuild path, shared by
+# on-demand refresh AND catalog_sync). Anti-joining here keeps a quarantined
+# source (e.g. a duplicate App Store review account sharing a real merchant's
+# store) from winning the canonical pick and shadowing the real merchant's
+# enriched PDP. Pure SQL with hardcoded column refs — no user input.
+_SOURCE_QUARANTINE_ANTI_JOIN = build_quarantine_anti_join_sql(
+    row_domain_expr="cp.source_domain",
+    row_merchant_expr="cp.merchant_id",
+    row_platform_expr="cp.platform",
+    row_source_system_expr="cp.source_system",
+    row_source_ref_expr="cp.source_ref",
+)
+
 
 # ---------------------------------------------------------------------
 # DB fetch helpers
@@ -52,7 +71,7 @@ BACKFILL_REFRESH_SOURCE = "backfill_3a_ii"
 async def fetch_products_for_key(content_key: str, *, db: Any = None) -> List[Dict[str, Any]]:
     read_db = db or database
     rows = await read_db.fetch_all(
-        """
+        f"""
         SELECT
           cp.product_key,
           cp.merchant_id,
@@ -92,6 +111,7 @@ async def fetch_products_for_key(content_key: str, *, db: Any = None) -> List[Di
          AND pgm.platform = cp.platform
          AND pgm.platform_product_id = cp.source_product_id
         WHERE cp.content_key = :ck
+        {_SOURCE_QUARANTINE_ANTI_JOIN}
         """,
         {"ck": content_key},
     )
