@@ -536,7 +536,13 @@ class StandardProduct(BaseModel):
     
     # 简单数据完整度评分（EPIC-4，用于 MDQS 预览）
     data_completeness_score: Optional[float] = None
-    
+
+    # 店面 URL / handle — 跨平台统一字段，用于把站外（AI 可见性）审计里
+    # 粘贴的商品链接匹配回已同步的 SKU。Shopify=handle slug；
+    # WooCommerce=permalink/slug。商户端无此数据时为 None（如 Wix）。
+    handle: Optional[str] = None  # 产品 URL slug（用于匹配粘贴的商品链接）
+    online_store_url: Optional[str] = None  # 商户店面完整商品 URL（如有）
+
     # 元数据（保留原始平台特定数据）
     platform_metadata: Optional[Dict[str, Any]] = None
     # 是否可下单及校验结果（EPIC-7 准备）
