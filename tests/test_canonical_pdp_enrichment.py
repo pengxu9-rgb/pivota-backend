@@ -452,3 +452,70 @@ async def test_execute_phase_a_failure_is_best_effort():
     assert result.evidence["enriched_count"] == 1
     assert result.evidence["enriched"][0]["serving_eligible"] is None
     assert result.evidence["serving_eligible_count"] == 0
+
+
+# ---------------------------------------------------------------------------
+# R4 — generation reliability (retry + token budget)
+# ---------------------------------------------------------------------------
+
+
+def _gemini_ok_json():
+    import json as _j
+    return {"candidates": [{"content": {"parts": [{"text": _j.dumps({
+        "description_markdown": "A factual, specific product description. " * 8,
+        "summary_short": "One factual sentence.",
+        "bullet_points": ["a", "b", "c"],
+    })}]}}]}
+
+
+class _FakeResp:
+    def __init__(self, status, payload):
+        self.status_code = status
+        self._p = payload
+
+    def json(self):
+        return self._p
+
+
+@pytest.mark.asyncio
+async def test_generate_enrichment_retries_then_succeeds(monkeypatch):
+    """A first-attempt failure (the ~55% case) is retried, not given up on."""
+    from services.executor_agents import canonical_pdp_enrichment as mod
+    calls = {"n": 0, "bodies": []}
+
+    class FakeClient:
+        def __init__(self, *a, **k): pass
+        async def __aenter__(self): return self
+        async def __aexit__(self, *a): return False
+        async def post(self, url, headers=None, json=None):
+            calls["n"] += 1
+            calls["bodies"].append(json)
+            if calls["n"] == 1:
+                return _FakeResp(500, {})          # transient fail
+            return _FakeResp(200, _gemini_ok_json())  # then succeed
+
+    monkeypatch.setattr(mod.httpx, "AsyncClient", FakeClient)
+    out = await mod._generate_enrichment(_candidate(), "k", timeout_s=1, max_attempts=3)
+    assert out is not None and out["description_markdown"]
+    assert calls["n"] == 2  # retried once, then succeeded
+    # raised output cap (vs the old 2048 that truncated grounded JSON)
+    assert calls["bodies"][0]["generationConfig"]["maxOutputTokens"] == mod._GEMINI_MAX_OUTPUT_TOKENS
+
+
+@pytest.mark.asyncio
+async def test_generate_enrichment_gives_up_after_max_attempts(monkeypatch):
+    from services.executor_agents import canonical_pdp_enrichment as mod
+    calls = {"n": 0}
+
+    class FakeClient:
+        def __init__(self, *a, **k): pass
+        async def __aenter__(self): return self
+        async def __aexit__(self, *a): return False
+        async def post(self, *a, **k):
+            calls["n"] += 1
+            return _FakeResp(500, {})
+
+    monkeypatch.setattr(mod.httpx, "AsyncClient", FakeClient)
+    out = await mod._generate_enrichment(_candidate(), "k", timeout_s=1, max_attempts=3)
+    assert out is None
+    assert calls["n"] == 3  # exhausted all attempts
