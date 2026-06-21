@@ -605,6 +605,34 @@ async def get_merchant_product_detail(
     )
     agent_push = build_agent_push_projection_from_cache_row(cache_row)
 
+    # Store-admin deep-link for the copy-back rung (read-only): lets the merchant
+    # open THIS product in their own store admin and paste the enriched copy. The
+    # copy itself is already returned in `enrichment`; this just supplies the
+    # paste-target link. Best-effort — None when no matching active store / a
+    # platform without an admin URL. Pure read; no external write. Reuses the
+    # readiness builder (lazy import avoids a circular import + matches the
+    # codebase's lazy-import convention for cross-module helpers).
+    platform_admin_url: Optional[str] = None
+    try:
+        from readiness.summary import (
+            _build_platform_admin_url,
+            _load_store_domains_by_platform,
+        )
+
+        store_domains = await _load_store_domains_by_platform(merchant_id)
+        platform_admin_url = _build_platform_admin_url(
+            platform=platform,
+            platform_product_id=platform_product_id,
+            store_domains_by_platform=store_domains,
+        )
+    except Exception as exc:  # noqa: BLE001 -- the link is a nicety; never fail the detail view
+        import logging
+
+        logging.getLogger(__name__).warning(
+            "merchant_products: platform_admin_url build failed for %s/%s: %s",
+            platform, platform_product_id, str(exc)[:200],
+        )
+
     return {
         "merchant_id": merchant_id,
         "platform": platform,
@@ -613,6 +641,7 @@ async def get_merchant_product_detail(
         "enrichment": enrichment or {},
         "quality": _quality_response(projection),
         "agent_push": _agent_push_response(agent_push),
+        "platform_admin_url": platform_admin_url,
     }
 
 
