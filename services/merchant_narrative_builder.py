@@ -523,7 +523,31 @@ def _honest_limits(
             "No competitor brand was named in the grounded answers; only cited "
             "hosts are shown."
         )
-    if verify_plain.get("status") not in {"completed", "partial"}:
+    # Answer-quality verify coverage + scope. When it RAN, the report shows
+    # "checked X of Y cited answers" elsewhere, but never disclosed that (a) only
+    # a SAMPLE was checked and (b) the scope is citation-positive ("branded")
+    # answers only — verify never touches the discovery/category queries where
+    # the merchant isn't cited yet. Disclosing both keeps the headline honest
+    # (a strong-citation / low-accuracy state can't hide behind a partial,
+    # branded-only check). When it did NOT run, say so (unchanged).
+    verify_status = verify_plain.get("status")
+    if verify_status in {"completed", "partial"}:
+        checked = int(verify_plain.get("checked") or 0)
+        candidates = int(verify_plain.get("candidates") or 0)
+        if checked > 0:
+            limits.append(
+                "Answer-quality verify covers a sample of citation-positive "
+                f"answers only: it fact-checked {checked} of {candidates} answers "
+                "where an AI already cited you, and does not check the "
+                "discovery/category queries where you aren't cited yet — accuracy "
+                "outside that checked sample is unmeasured."
+            )
+        else:
+            limits.append(
+                "Answer-quality verify ran but found no cited answers to "
+                "fact-check — accuracy is unmeasured this run."
+            )
+    else:
         limits.append(
             "Answer-quality (DeepSeek) verification did not run for this audit — "
             f"{verify_plain.get('reason_phrase') or _verify_skip_phrase(None)}."
