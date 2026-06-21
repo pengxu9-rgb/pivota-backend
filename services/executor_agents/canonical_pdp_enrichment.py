@@ -70,6 +70,12 @@ _MIN_GENERATED_DESCRIPTION_CHARS = 200
 _GEMINI_MODEL = "gemini-2.5-flash"
 _GEMINI_BASE_URL = "https://generativelanguage.googleapis.com/v1beta"
 _GEMINI_TIMEOUT_S = 30.0
+# R4 reliability: ~55% of single-attempt grounded calls failed — grounded
+# gemini-2.5-flash wraps JSON in prose/citations or truncates the JSON when
+# thinking tokens eat a tight output cap, plus transient 5xx/timeouts. Raise the
+# output cap (room past thinking tokens) and retry.
+_GEMINI_MAX_OUTPUT_TOKENS = 4096
+_GEMINI_MAX_ATTEMPTS = 3
 
 async def _fetch_thin_canonical_pdps(
     merchant_id: str, *, cap: int
@@ -426,37 +432,55 @@ async def _generate_enrichment(
     api_key: str,
     *,
     timeout_s: float = _GEMINI_TIMEOUT_S,
+    max_attempts: int = _GEMINI_MAX_ATTEMPTS,
 ) -> Optional[Dict[str, Any]]:
-    """Single Gemini grounded call → parsed enrichment payload, or None on any
-    failure (HTTP error, non-200, unparseable, too-short description)."""
+    """Gemini grounded call → parsed enrichment payload, with bounded retries.
+    Returns None only after `max_attempts` all fail (HTTP error, non-200,
+    unparseable, too-short description). Retries because a single grounded
+    gemini-2.5-flash call failed ~55% of the time (prose-wrapped/truncated JSON,
+    transient errors) yet usually succeeds within a couple tries. Logs the real
+    per-attempt failure reason so the failure mode stops being opaque."""
     prompt = _build_enrichment_prompt(candidate)
     body = {
         "contents": [{"role": "user", "parts": [{"text": prompt}]}],
-        "generationConfig": {"temperature": 0.3, "maxOutputTokens": 2048},
+        "generationConfig": {
+            "temperature": 0.3,
+            "maxOutputTokens": _GEMINI_MAX_OUTPUT_TOKENS,
+        },
         "tools": [{"google_search": {}}],
     }
     url = f"{_GEMINI_BASE_URL}/models/{_GEMINI_MODEL}:generateContent"
     headers = {"Content-Type": "application/json", "x-goog-api-key": api_key}
-    try:
-        async with httpx.AsyncClient(timeout=timeout_s) as client:
-            r = await client.post(url, headers=headers, json=body)
-    except (httpx.TimeoutException, httpx.RequestError) as exc:
-        logger.warning(
-            "canonical_pdp_enrichment: HTTP error for %s: %s",
-            candidate.get("source_product_id"), exc,
+    sid = candidate.get("source_product_id")
+    last_reason = "unknown"
+    for attempt in range(1, max_attempts + 1):
+        try:
+            async with httpx.AsyncClient(timeout=timeout_s) as client:
+                r = await client.post(url, headers=headers, json=body)
+        except (httpx.TimeoutException, httpx.RequestError) as exc:
+            last_reason = f"http_error:{type(exc).__name__}"
+        else:
+            if r.status_code != 200:
+                last_reason = f"non_200:{r.status_code}"
+            else:
+                try:
+                    payload = r.json()
+                except json.JSONDecodeError:
+                    last_reason = "response_not_json"
+                else:
+                    parsed = _parse_enrichment_response(payload)
+                    if parsed is not None:
+                        return parsed
+                    last_reason = "unparseable_or_too_short"
+        logger.info(
+            "canonical_pdp_enrichment: gen attempt %d/%d for %s failed (%s)",
+            attempt, max_attempts, sid, last_reason,
         )
-        return None
-    if r.status_code != 200:
-        logger.warning(
-            "canonical_pdp_enrichment: non-200 (%s) for %s",
-            r.status_code, candidate.get("source_product_id"),
-        )
-        return None
-    try:
-        payload = r.json()
-    except json.JSONDecodeError:
-        return None
-    return _parse_enrichment_response(payload)
+    logger.warning(
+        "canonical_pdp_enrichment: generation failed for %s after %d attempts (%s)",
+        sid, max_attempts, last_reason,
+    )
+    return None
 
 
 class CanonicalPdpEnrichmentAgent(BaseExecutorAgent):
