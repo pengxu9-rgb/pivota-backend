@@ -96,7 +96,6 @@ async def _fetch_thin_canonical_pdps(
             WHERE cp.merchant_id = :merchant_id
               AND cp.pivota_signature_id IS NOT NULL
               AND cp.sync_status = 'live'
-              AND cp.content_key IS NOT NULL
               AND cp.source_product_id IS NOT NULL
               AND COALESCE(LENGTH(cp.description), 0) < :thin_chars
               AND (pe.description_markdown IS NULL OR pe.description_markdown = '')
@@ -129,28 +128,36 @@ def _decode_report(audit_report: Any) -> Dict[str, Any]:
     return audit_report if isinstance(audit_report, dict) else {}
 
 
-def _audit_thin_content_keys(audit_report: Any) -> List[str]:
-    """The content_keys of the SKUs THIS audit flagged as content-thin and that
+def _audit_thin_product_keys(audit_report: Any) -> List[str]:
+    """The product_keys of the SKUs THIS audit flagged as content-thin and that
     have a minted canonical PDP — i.e. the products the merchant just measured and
     saw "needs work". This is what E1 should enrich, instead of an unrelated
     "newest 5 in the catalog" set (the bug a live re-audit surfaced: enrichment
-    never reached the audited SKUs). Reads each per-SKU report's content_richness
-    score + indexing_arc (present iff the SKU has a canonical PDP)."""
+    never reached the audited SKUs).
+
+    Keys off `product_key` (merchant|platform|source_id — the canonical product
+    identity), NOT `content_key`. content_key is derived from brand+title and can
+    be null or mismatched (older syncs, bundles), which silently excluded such
+    SKUs from enrichment in BOTH the audit fetch and the fallback (a live PDP-status
+    check caught a thin SKU stuck on baseline_projection across every audit because
+    of this). source_product_id (carried in product_key) is always present for a
+    synced product and is the enrichment upsert key. Reads each per-SKU report's
+    content_richness score + indexing_arc (present iff the SKU has a canonical PDP)."""
     rep = _decode_report(audit_report)
     out: List[str] = []
     seen: set = set()
     for r in rep.get("per_sku_reports") or []:
         if not isinstance(r, dict):
             continue
-        ck = r.get("content_key")
-        if not ck or ck in seen:
+        pk = r.get("product_key")
+        if not pk or pk in seen:
             continue
         if not r.get("indexing_arc"):  # no canonical PDP -> E1 can't enrich it
             continue
         score = (((r.get("scores") or {}).get("content_richness") or {}).get("score"))
         if isinstance(score, (int, float)) and score < _CONTENT_THIN_SCORE:
-            seen.add(ck)
-            out.append(ck)
+            seen.add(pk)
+            out.append(pk)
     return out
 
 
@@ -159,20 +166,21 @@ def _audit_thin_content_keys(audit_report: Any) -> List[str]:
 _MAX_INTENTS_PER_SKU = 6
 
 
-def _audit_flagged_intents_by_content_key(audit_report: Any) -> Dict[str, List[str]]:
+def _audit_flagged_intents_by_product_key(audit_report: Any) -> Dict[str, List[str]]:
     """Per SKU, the shopper queries where AI MENTIONED the product but did NOT
     recommend it (verify flagged `supports_recommendation is False`) — "you show
     up, a competitor gets the rec". These are the gaps enrichment should make the
-    PDP win, factually. Keyed by content_key so it joins onto the fetched candidate
-    rows. `misstates_facts`-only probes are EXCLUDED — asserting a corrected fact is
-    a different (parked) fix, not "give AI a reason to recommend"."""
+    PDP win, factually. Keyed by product_key so it joins onto the fetched candidate
+    rows (reconstructed from merchant|platform|source_product_id). `misstates_facts`-only
+    probes are EXCLUDED — asserting a corrected fact is a different (parked) fix,
+    not "give AI a reason to recommend"."""
     rep = _decode_report(audit_report)
     out: Dict[str, List[str]] = {}
     for r in rep.get("per_sku_reports") or []:
         if not isinstance(r, dict):
             continue
-        ck = r.get("content_key")
-        if not ck:
+        pk = r.get("product_key")
+        if not pk:
             continue
         probes = ((r.get("verify_summary") or {}).get("flagged_probes")) or []
         intents: List[str] = []
@@ -194,19 +202,38 @@ def _audit_flagged_intents_by_content_key(audit_report: Any) -> Dict[str, List[s
             if len(intents) >= _MAX_INTENTS_PER_SKU:
                 break
         if intents:
-            out[ck] = intents
+            out[pk] = intents
     return out
 
 
-async def _fetch_canonical_pdps_by_content_keys(
-    merchant_id: str, content_keys: List[str], *, cap: int
+def _source_ids_from_product_keys(product_keys: List[str]) -> List[str]:
+    """Extract source_product_id (the last segment) from product_keys of the form
+    `merchant|platform|source_id`. This is the robust identity for fetching catalog
+    rows — always present for a synced product, unlike content_key."""
+    ids: List[str] = []
+    seen: set = set()
+    for pk in product_keys or []:
+        parts = str(pk or "").split("|")
+        if len(parts) == 3:
+            sid = parts[2].strip()
+            if sid and sid not in seen:
+                seen.add(sid)
+                ids.append(sid)
+    return ids
+
+
+async def _fetch_canonical_pdps_by_product_keys(
+    merchant_id: str, product_keys: List[str], *, cap: int
 ) -> List[Dict[str, Any]]:
-    """Fetch enrichable canonical PDPs for specific content_keys (the audit-flagged
-    thin SKUs). Same guards as the catalog scan (minted sig, live, has
-    source_product_id, not already enriched) but NO char-count / newest-N limit —
-    the audit already determined these need work. Best-effort."""
-    keys = [k for k in (content_keys or []) if k]
-    if not keys:
+    """Fetch enrichable canonical PDPs for the audit-flagged thin SKUs, keyed by
+    source_product_id (parsed from product_key) rather than content_key. content_key
+    can be null/mismatched and silently excluded SKUs from BOTH this fetch and the
+    fallback; source_product_id is always present and is the enrichment upsert key.
+    Same guards as the catalog scan (minted sig, live, not already enriched) but NO
+    content_key requirement and NO char-count limit — the audit already judged
+    thinness. Best-effort."""
+    source_ids = _source_ids_from_product_keys(product_keys)
+    if not source_ids:
         return []
     from db.database import database
 
@@ -223,7 +250,7 @@ async def _fetch_canonical_pdps_by_content_keys(
              AND pe.platform_product_id = cp.source_product_id
              AND pe.geo_code = 'default'
             WHERE cp.merchant_id = :merchant_id
-              AND cp.content_key = ANY(:keys)
+              AND cp.source_product_id = ANY(:ids)
               AND cp.pivota_signature_id IS NOT NULL
               AND cp.sync_status = 'live'
               AND cp.source_product_id IS NOT NULL
@@ -231,7 +258,7 @@ async def _fetch_canonical_pdps_by_content_keys(
             ORDER BY cp.created_at DESC NULLS LAST
             LIMIT :lim
             """,
-            {"merchant_id": merchant_id, "keys": keys, "lim": cap},
+            {"merchant_id": merchant_id, "ids": source_ids, "lim": cap},
         )
     except Exception as exc:  # noqa: BLE001
         logger.warning(
@@ -265,10 +292,10 @@ async def _resolve_candidates(
             r["_candidate_source"] = source
             candidates.append(r)
 
-    audit_keys = _audit_thin_content_keys(context.audit_report)
+    audit_keys = _audit_thin_product_keys(context.audit_report)
     if audit_keys:
         _add(
-            await _fetch_canonical_pdps_by_content_keys(merchant_id, audit_keys, cap=cap),
+            await _fetch_canonical_pdps_by_product_keys(merchant_id, audit_keys, cap=cap),
             "audit",
         )
     if len(candidates) < cap:
@@ -276,10 +303,13 @@ async def _resolve_candidates(
     # Attach the verify-flagged "mention, no rec" intents per SKU (audit signal
     # only; catalog-fallback candidates get []). The enrichment prompt uses these
     # to make the PDP a factual answer for intents AI currently routes to
-    # competitors — the measure -> enrich -> re-measure loop.
-    intents_map = _audit_flagged_intents_by_content_key(context.audit_report)
+    # competitors — the measure -> enrich -> re-measure loop. The intent map is
+    # keyed by product_key; reconstruct each candidate's product_key from its
+    # identity to join.
+    intents_map = _audit_flagged_intents_by_product_key(context.audit_report)
     for c in candidates:
-        c["_target_intents"] = intents_map.get(c.get("content_key")) or []
+        pk = f"{c.get('merchant_id')}|{c.get('platform')}|{c.get('source_product_id')}"
+        c["_target_intents"] = intents_map.get(pk) or []
     return candidates[:cap]
 
 

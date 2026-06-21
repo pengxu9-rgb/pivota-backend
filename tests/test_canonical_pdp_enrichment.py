@@ -16,10 +16,11 @@ import pytest
 from services.executor_agents.base import ExecutorContext
 from services.executor_agents.canonical_pdp_enrichment import (
     CanonicalPdpEnrichmentAgent,
-    _audit_flagged_intents_by_content_key,
-    _audit_thin_content_keys,
+    _audit_flagged_intents_by_product_key,
+    _audit_thin_product_keys,
     _build_enrichment_prompt,
     _resolve_candidates,
+    _source_ids_from_product_keys,
 )
 
 _MOD = "services.executor_agents.canonical_pdp_enrichment"
@@ -199,38 +200,60 @@ def test_agent_registered_in_dispatcher_and_worker():
 # ---------------------------------------------------------------------------
 
 
-def test_audit_thin_content_keys_extracts_flagged_canonical_skus():
+def test_audit_thin_product_keys_extracts_flagged_canonical_skus():
+    # Keys off product_key (not content_key) — content_key can be null/mismatched
+    # and silently excluded SKUs from enrichment (the live-caught bug).
     report = {
         "per_sku_reports": [
             # thin (52 < 70) + has canonical PDP -> included
-            {"content_key": "ck-thin", "indexing_arc": {"phase": "fresh"},
+            {"product_key": "m1|shopify|pk-thin", "indexing_arc": {"phase": "fresh"},
              "scores": {"content_richness": {"score": 52}}},
             # not thin (80 >= 70) -> excluded
-            {"content_key": "ck-ready", "indexing_arc": {"phase": "fresh"},
+            {"product_key": "m1|shopify|pk-ready", "indexing_arc": {"phase": "fresh"},
              "scores": {"content_richness": {"score": 80}}},
             # thin but NO canonical PDP -> excluded (E1 can't enrich it)
-            {"content_key": "ck-nopdp", "indexing_arc": None,
+            {"product_key": "m1|shopify|pk-nopdp", "indexing_arc": None,
              "scores": {"content_richness": {"score": 30}}},
-            # duplicate content_key -> deduped
-            {"content_key": "ck-thin", "indexing_arc": {"phase": "fresh"},
+            # null content_key but valid product_key -> STILL included (the fix)
+            {"product_key": "m1|shopify|pk-nullck", "content_key": None,
+             "indexing_arc": {"phase": "fresh"},
+             "scores": {"content_richness": {"score": 40}}},
+            # duplicate product_key -> deduped
+            {"product_key": "m1|shopify|pk-thin", "indexing_arc": {"phase": "fresh"},
              "scores": {"content_richness": {"score": 20}}},
         ]
     }
-    assert _audit_thin_content_keys(report) == ["ck-thin"]
+    assert _audit_thin_product_keys(report) == [
+        "m1|shopify|pk-thin", "m1|shopify|pk-nullck",
+    ]
     # defensive: None / unparseable string -> []
-    assert _audit_thin_content_keys(None) == []
-    assert _audit_thin_content_keys("{not json") == []
+    assert _audit_thin_product_keys(None) == []
+    assert _audit_thin_product_keys("{not json") == []
+
+
+def test_source_ids_from_product_keys():
+    # Extracts the source_product_id (3rd segment); dedups; skips malformed.
+    assert _source_ids_from_product_keys([
+        "m1|shopify|10100856914217",
+        "m1|shopify|10100856914217",  # dup -> deduped
+        "m1|shopify|sp-2",
+        "bad-key",                      # no pipes -> skipped
+        "m1|shopify|",                  # empty source id -> skipped
+        "a|b|c|d",                       # too many segments -> skipped
+        "",
+    ]) == ["10100856914217", "sp-2"]
+    assert _source_ids_from_product_keys([]) == []
 
 
 @pytest.mark.asyncio
 async def test_resolve_candidates_prioritizes_audit_then_falls_back():
     ctx = ExecutorContext(merchant_id="m1", audit_report={"per_sku_reports": [
-        {"content_key": "ck-1", "indexing_arc": {"x": 1},
+        {"product_key": "m1|shopify|sp-audit", "indexing_arc": {"x": 1},
          "scores": {"content_richness": {"score": 50}}},
     ]})
-    audit_cand = _candidate(source_product_id="sp-audit", content_key="ck-1")
-    catalog_cand = _candidate(source_product_id="sp-catalog", content_key="ck-9")
-    with patch(f"{_MOD}._fetch_canonical_pdps_by_content_keys", new=AsyncMock(return_value=[audit_cand])), \
+    audit_cand = _candidate(source_product_id="sp-audit")
+    catalog_cand = _candidate(source_product_id="sp-catalog")
+    with patch(f"{_MOD}._fetch_canonical_pdps_by_product_keys", new=AsyncMock(return_value=[audit_cand])), \
          patch(f"{_MOD}._fetch_thin_canonical_pdps", new=AsyncMock(return_value=[catalog_cand])):
         out = await _resolve_candidates(ctx, cap=5)
     pairs = [(c["source_product_id"], c["_candidate_source"]) for c in out]
@@ -242,7 +265,7 @@ async def test_resolve_candidates_prioritizes_audit_then_falls_back():
 async def test_resolve_candidates_catalog_only_without_audit_report():
     ctx = ExecutorContext(merchant_id="m1")  # no audit_report
     catalog_cand = _candidate(source_product_id="sp-catalog")
-    with patch(f"{_MOD}._fetch_canonical_pdps_by_content_keys", new=AsyncMock(return_value=[])), \
+    with patch(f"{_MOD}._fetch_canonical_pdps_by_product_keys", new=AsyncMock(return_value=[])), \
          patch(f"{_MOD}._fetch_thin_canonical_pdps", new=AsyncMock(return_value=[catalog_cand])):
         out = await _resolve_candidates(ctx, cap=5)
     assert len(out) == 1 and out[0]["_candidate_source"] == "catalog"
@@ -254,13 +277,13 @@ async def test_execute_enriches_the_audit_flagged_sku():
     tagged source=audit (not a blind newest-5 catalog pick)."""
     agent = CanonicalPdpEnrichmentAgent()
     ctx = ExecutorContext(merchant_id="m1", audit_report={"per_sku_reports": [
-        {"content_key": "ck-1", "indexing_arc": {"x": 1},
+        {"product_key": "m1|shopify|sp-1", "indexing_arc": {"x": 1},
          "scores": {"content_richness": {"score": 50}}},
     ]})
     upsert = AsyncMock()
     refresh = AsyncMock(return_value=True)
     with patch(f"{_MOD}._resolve_gemini_api_key", return_value="k"), \
-         patch(f"{_MOD}._fetch_canonical_pdps_by_content_keys", new=AsyncMock(return_value=[_candidate(content_key="ck-1")])), \
+         patch(f"{_MOD}._fetch_canonical_pdps_by_product_keys", new=AsyncMock(return_value=[_candidate()])), \
          patch(f"{_MOD}._fetch_thin_canonical_pdps", new=AsyncMock(return_value=[])), \
          patch(f"{_MOD}._generate_enrichment", new=AsyncMock(return_value=_enrichment())), \
          patch("db.product_enrichment.upsert_enrichment", new=upsert), \
@@ -280,12 +303,12 @@ async def test_execute_enriches_the_audit_flagged_sku():
 
 
 def test_audit_flagged_intents_extracts_only_lost_rec():
-    """content_key -> the 'mention, no rec' intents (supports_recommendation is
+    """product_key -> the 'mention, no rec' intents (supports_recommendation is
     exactly False). Excludes supports-True (incl. misstates-only-but-supported),
     empty-query, and SKUs with no flagged probes; dedups case-insensitively."""
     report = {
         "per_sku_reports": [
-            {"content_key": "ck-a", "verify_summary": {"flagged_probes": [
+            {"product_key": "m1|shopify|a", "verify_summary": {"flagged_probes": [
                 {"query": "halal collagen", "supports_recommendation": False,
                  "misstates_facts": False},
                 # supported -> not a rec gap, excluded (even if misstates a fact)
@@ -298,38 +321,39 @@ def test_audit_flagged_intents_extracts_only_lost_rec():
                 # empty query -> dropped
                 {"query": "   ", "supports_recommendation": False},
             ]}},
-            {"content_key": "ck-b", "verify_summary": {"flagged_probes": [
+            {"product_key": "m1|shopify|b", "verify_summary": {"flagged_probes": [
                 {"query": "marine collagen", "supports_recommendation": False}]}},
-            {"content_key": "ck-c", "verify_summary": {"flagged_probes": []}},
-            {"content_key": "ck-d"},  # no verify_summary at all
+            {"product_key": "m1|shopify|c", "verify_summary": {"flagged_probes": []}},
+            {"product_key": "m1|shopify|d"},  # no verify_summary at all
         ]
     }
-    assert _audit_flagged_intents_by_content_key(report) == {
-        "ck-a": ["halal collagen"],
-        "ck-b": ["marine collagen"],
+    assert _audit_flagged_intents_by_product_key(report) == {
+        "m1|shopify|a": ["halal collagen"],
+        "m1|shopify|b": ["marine collagen"],
     }
-    assert _audit_flagged_intents_by_content_key(None) == {}
-    assert _audit_flagged_intents_by_content_key("{bad json") == {}
+    assert _audit_flagged_intents_by_product_key(None) == {}
+    assert _audit_flagged_intents_by_product_key("{bad json") == {}
 
 
 @pytest.mark.asyncio
 async def test_resolve_candidates_attaches_target_intents_no_leak():
-    """Each candidate carries ITS sku's lost-rec intents (joined by content_key);
-    a different SKU's intents don't leak; the catalog-fallback candidate gets []."""
+    """Each candidate carries ITS sku's lost-rec intents (joined by product_key,
+    reconstructed from the candidate's identity); a different SKU's intents don't
+    leak; the catalog-fallback candidate gets []."""
     ctx = ExecutorContext(merchant_id="m1", audit_report={"per_sku_reports": [
-        {"content_key": "ck-1", "indexing_arc": {"x": 1},
+        {"product_key": "m1|shopify|sp-audit", "indexing_arc": {"x": 1},
          "scores": {"content_richness": {"score": 50}},
          "verify_summary": {"flagged_probes": [
              {"query": "halal collagen", "supports_recommendation": False}]}},
     ]})
-    audit_cand = _candidate(source_product_id="sp-audit", content_key="ck-1")
-    catalog_cand = _candidate(source_product_id="sp-catalog", content_key="ck-9")
-    with patch(f"{_MOD}._fetch_canonical_pdps_by_content_keys", new=AsyncMock(return_value=[audit_cand])), \
+    audit_cand = _candidate(source_product_id="sp-audit")
+    catalog_cand = _candidate(source_product_id="sp-catalog")
+    with patch(f"{_MOD}._fetch_canonical_pdps_by_product_keys", new=AsyncMock(return_value=[audit_cand])), \
          patch(f"{_MOD}._fetch_thin_canonical_pdps", new=AsyncMock(return_value=[catalog_cand])):
         out = await _resolve_candidates(ctx, cap=5)
     by_sp = {c["source_product_id"]: c for c in out}
     assert by_sp["sp-audit"]["_target_intents"] == ["halal collagen"]
-    assert by_sp["sp-catalog"]["_target_intents"] == []  # ck-9 not audited -> no leak
+    assert by_sp["sp-catalog"]["_target_intents"] == []  # sp-catalog not audited -> no leak
 
 
 def test_build_enrichment_prompt_injects_intents():
@@ -353,13 +377,13 @@ async def test_execute_records_targeted_intents():
     measure -> enrich -> re-measure loop is auditable."""
     agent = CanonicalPdpEnrichmentAgent()
     ctx = ExecutorContext(merchant_id="m1", audit_report={"per_sku_reports": [
-        {"content_key": "ck-1", "indexing_arc": {"x": 1},
+        {"product_key": "m1|shopify|sp-1", "indexing_arc": {"x": 1},
          "scores": {"content_richness": {"score": 50}},
          "verify_summary": {"flagged_probes": [
              {"query": "halal collagen", "supports_recommendation": False}]}},
     ]})
     with patch(f"{_MOD}._resolve_gemini_api_key", return_value="k"), \
-         patch(f"{_MOD}._fetch_canonical_pdps_by_content_keys", new=AsyncMock(return_value=[_candidate(content_key="ck-1")])), \
+         patch(f"{_MOD}._fetch_canonical_pdps_by_product_keys", new=AsyncMock(return_value=[_candidate()])), \
          patch(f"{_MOD}._fetch_thin_canonical_pdps", new=AsyncMock(return_value=[])), \
          patch(f"{_MOD}._generate_enrichment", new=AsyncMock(return_value=_enrichment())), \
          patch("db.product_enrichment.upsert_enrichment", new=AsyncMock()), \
