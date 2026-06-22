@@ -11,6 +11,7 @@ import json
 from db.database import database
 from db.merchant_onboarding import get_merchant_onboarding
 from services.platform_order_writeback_readiness import normalize_store_order_writeback_readiness
+from services.content_writeback_readiness import normalize_store_content_writeback_readiness
 
 logger = logging.getLogger(__name__)
 
@@ -108,6 +109,12 @@ async def get_merchant_active_stores(merchant_id: str) -> List[Dict[str, Any]]:
                 order_writeback_last_canary_order_id,
                 order_writeback_last_verified_at,
                 order_writeback_last_error,
+                content_writeback_status,
+                content_writeback_enabled_at,
+                content_writeback_canary_product_id,
+                content_writeback_last_canary_product_id,
+                content_writeback_last_written_at,
+                content_writeback_last_error,
                 'merchant_stores' as source
             FROM merchant_stores
             WHERE merchant_id = :merchant_id 
@@ -147,6 +154,7 @@ async def get_merchant_active_stores(merchant_id: str) -> List[Dict[str, Any]]:
             store_dict["api_credentials"] = parse_api_credentials(original_key)
             store_dict["api_key"] = parse_api_key(original_key)
             store_dict = normalize_store_order_writeback_readiness(store_dict)
+            store_dict = normalize_store_content_writeback_readiness(store_dict)
             stores.append(store_dict)
         
     except Exception as e:
@@ -175,8 +183,13 @@ async def get_merchant_active_stores(merchant_id: str) -> List[Dict[str, Any]]:
                     "is_primary": True,
                     "source": "legacy_mcp",
                     "order_writeback_status": "disabled",
+                    "content_writeback_status": "disabled",
                 }
-                stores.append(normalize_store_order_writeback_readiness(legacy_store))
+                stores.append(
+                    normalize_store_content_writeback_readiness(
+                        normalize_store_order_writeback_readiness(legacy_store)
+                    )
+                )
 
         except Exception as e:
             logger.error(f"Error fetching from merchant_onboarding: {e}")
