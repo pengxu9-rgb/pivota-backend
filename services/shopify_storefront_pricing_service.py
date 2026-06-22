@@ -306,6 +306,22 @@ def _shopify_buyer_delivery_address_preference_input(
     }
 
 
+# RFC 2606 / 6761 reserved TLDs + non-routable suffixes that Shopify's Storefront cartCreate rejects as
+# "Email is invalid". A buyer email is NOT required to PRICE a cart, so one must never 503 the whole quote.
+_NON_DELIVERABLE_EMAIL_TLDS = frozenset({"test", "example", "invalid", "localhost", "local"})
+_BASIC_EMAIL_RE = re.compile(r"^[^\s@]+@[^\s@]+\.[^\s@]+$")
+
+
+def _is_deliverable_buyer_email(email: str) -> bool:
+    """True only for an email Shopify will accept on a cart buyerIdentity (basic shape + non-reserved TLD).
+    Used to drop a bad buyer email from the PRICING cart so it can't take the whole quote down."""
+    e = str(email or "").strip()
+    if not e or not _BASIC_EMAIL_RE.match(e):
+        return False
+    tld = e.rsplit("@", 1)[-1].rsplit(".", 1)[-1].lower()
+    return tld not in _NON_DELIVERABLE_EMAIL_TLDS
+
+
 def _shopify_cart_buyer_identity_input(
     *,
     customer_email: Optional[str],
@@ -319,8 +335,16 @@ def _shopify_cart_buyer_identity_input(
 ) -> Dict[str, Any]:
     buyer_identity: Dict[str, Any] = {}
     email = str(customer_email or "").strip()
-    if email:
+    if email and _is_deliverable_buyer_email(email):
         buyer_identity["email"] = email
+    elif email:
+        # A non-deliverable buyer email (reserved .test/.example TLD, malformed, etc.) makes Shopify's
+        # Storefront cartCreate fail with "Email is invalid" -> no cart -> the WHOLE quote 503s as
+        # SHOPIFY_PRICING_UNAVAILABLE. Email is not needed to PRICE a cart, so drop it and keep the quote alive.
+        _log_shopify_warning(
+            "dropped non-deliverable buyer email from pricing cart",
+            {"email_domain": email.rsplit("@", 1)[-1] if "@" in email else None},
+        )
     if use_buyer_country_for_pricing and country:
         buyer_identity["countryCode"] = country
     if country and postal:
