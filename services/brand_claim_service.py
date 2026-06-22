@@ -109,6 +109,13 @@ _PUBLIC_SUFFIXES = frozenset({
     # treats as never-a-brand.
     "myshopify.com", "shopify.com", "wixsite.com", "bigcartel.com",
     "squarespace.com",
+    # additional long-tail multi-tenant platform / hosting suffixes (site
+    # builders, store hosts, page hosting). Same rationale — one tenant is a
+    # different org from another — but these have no _GENERIC_DOMAINS token;
+    # they live here purely to stop the suffix bind from over-matching.
+    "github.io", "webflow.io", "editorx.io",
+    "bigcommerce.com", "mybigcommerce.com", "wordpress.com",
+    "weebly.com", "storenvy.com", "ecwid.com", "shopifypreview.com",
     # common multi-label registry suffixes (a registrable domain sits one label
     # deeper than these). Covers Pivota's active markets (KR/JP/UK/AU/...).
     "co.uk", "org.uk", "me.uk", "ac.uk", "gov.uk",

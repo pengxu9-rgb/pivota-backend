@@ -92,6 +92,32 @@ def test_host_matches_known_rejects_public_suffix_widening():
     assert host_matches_known("shop.brand.co.uk", {"brand.co.uk"})  # registrable under co.uk
 
 
+def test_host_matches_known_rejects_longtail_platform_suffixes():
+    # Completeness follow-up to the guard above: the long-tail multi-tenant
+    # platform / hosting suffixes in _PUBLIC_SUFFIXES must also refuse to anchor
+    # a suffix bind, so one tenant's host can't bind another tenant's domain.
+    assert not host_matches_known("evil.github.io", {"github.io"})
+    assert not host_matches_known("shop.bigcommerce.com", {"bigcommerce.com"})
+
+    longtail = {
+        "github.io", "webflow.io", "editorx.io",
+        "bigcommerce.com", "mybigcommerce.com", "wordpress.com",
+        "weebly.com", "storenvy.com", "ecwid.com", "shopifypreview.com",
+    }
+    for suffix in longtail:
+        # forward: a tenant subdomain must not bind the bare platform suffix
+        assert not host_matches_known("anytenant." + suffix, {suffix}), suffix
+        # reverse: the bare platform suffix must not bind a tenant subdomain
+        assert not host_matches_known(suffix, {"anytenant." + suffix}), suffix
+
+    # ...while a real registrable org still binds: exact, true subdomain, and two
+    # hosts under the SAME tenant (the tenant label — not the platform suffix —
+    # is the registrable base, so the guard stays narrow).
+    assert host_matches_known("anua.com", {"anua.com"})              # exact still binds
+    assert host_matches_known("shop.anua.com", {"anua.com"})         # true subdomain
+    assert host_matches_known("cart.brand.myshopify.com", {"brand.myshopify.com"})
+
+
 def test_is_valid_public_hostname():
     assert is_valid_public_hostname("anua.com")
     assert is_valid_public_hostname("brand.co.kr")
