@@ -244,11 +244,29 @@ async def fetch_evidence_for_keys(
         """,
         {"keys": product_keys},
     )
-    if not row:
+
+    # Phase 2a: UNION the cross-vertical merchant evidence store with the beauty
+    # (ingredient-mechanism) evidence so non-beauty merchant claims land on
+    # agent_pdp_view.evidence_profile too. Beauty passed first → it wins dedupe +
+    # review_state precedence. Best-effort; a missing store yields {}.
+    from db.product_evidence import (
+        fetch_product_evidence_for_keys,
+        merge_disclaimer_lists,
+        merge_evidence_profiles,
+    )
+
+    beauty_profile = row["evidence_profile"] if row else None
+    beauty_disclaimers = row["required_disclaimers"] if row else None
+    general = await fetch_product_evidence_for_keys(product_keys, db=read_db)
+
+    merged_profile = merge_evidence_profiles(beauty_profile, general.get("evidence_profile"))
+    merged_disclaimers = merge_disclaimer_lists(beauty_disclaimers, general.get("required_disclaimers"))
+
+    if not merged_profile and not merged_disclaimers:
         return {}
     return {
-        "evidence_profile": row["evidence_profile"],
-        "required_disclaimers": row["required_disclaimers"],
+        "evidence_profile": merged_profile,
+        "required_disclaimers": merged_disclaimers,
     }
 
 
