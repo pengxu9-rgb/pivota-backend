@@ -118,9 +118,11 @@ async def publish_content_to_store(
         "written_at": datetime.now(timezone.utc).isoformat(),
     }
 
-    # 4. Resolve the Admin token. App B tokens carry write_products after the
-    #    merchant re-consents; an App A / un-re-consented token will be rejected
-    #    by Shopify at metafieldsSet (handled below as needs_write_products).
+    # 4. Resolve the Admin token. Auth-agnostic: this uses whatever Admin token
+    #    the merchant connected their store with (BYO / custom app). That token
+    #    must carry write_products; one that doesn't is rejected by Shopify at
+    #    metafieldsSet and surfaced below as needs_write_products (the merchant
+    #    enables write_products on their own app), never a partial write.
     if plat != "shopify":
         return {"status": "error", "message": f"unsupported_platform:{plat}"}
     token, _meta = await resolve_shopify_admin_access_token(

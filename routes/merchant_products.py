@@ -657,11 +657,12 @@ async def publish_store_pdp(
 
     First write to a merchant's live store, so it is fail-closed and GATED:
     default-OFF per-store content_writeback state machine + the
-    DISABLE_CONTENT_WRITEBACK global kill switch + (at the Shopify layer) the App-B
-    write_products scope. Returns a {status} envelope (200) the caller maps to a
-    UI state — `blocked` when not opted in, `needs_write_products` when the store's
-    token lacks the scope (re-consent), `written` on success. Explicit merchant
-    action only; never auto-dispatched."""
+    DISABLE_CONTENT_WRITEBACK global kill switch + (at the Shopify layer) the
+    write_products scope on the merchant's own connected (BYO / custom) app token.
+    Returns a {status} envelope (200) the caller maps to a UI state — `blocked`
+    when not opted in, `needs_write_products` when the connected app's token lacks
+    the scope (the merchant enables it on their app), `written` on success.
+    Explicit merchant action only; never auto-dispatched."""
     if current_user.get("role") != "merchant":
         raise HTTPException(status_code=403, detail="Only merchants can publish store PDP copy")
     merchant_id = current_user.get("merchant_id")
