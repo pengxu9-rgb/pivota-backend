@@ -6600,7 +6600,7 @@ def _dedupe_query_specs(specs: List[Tuple[str, str]]) -> List[Tuple[str, str]]:
     seen = set()
     for query, axis in specs:
         q = str(query or "").strip()
-        if not q:
+        if not q or not _is_well_formed_query(q):
             continue
         key = q.lower()
         if key in seen:
@@ -6610,9 +6610,51 @@ def _dedupe_query_specs(specs: List[Tuple[str, str]]) -> List[Tuple[str, str]]:
     return out
 
 
+# Punctuation a probe term should never carry into a template. Enrichment
+# topic/audience/bullet tags occasionally arrive as serialization debris (a lone
+# "[", a stray quote, a single orphan letter); interpolating those yields junk
+# prompts like "best toner for [", 'best ... set for "', or "f toner". Strip the
+# debris from both ends and drop anything that collapses to a fragment.
+_PROMPT_TERM_STRIP_CHARS = " \t\r\n,.;:/\\\"'`[]{}<>()|*#~"
+
+
 def _clean_prompt_term(value: Any) -> str:
     text = re.sub(r"\s+", " ", str(value or "").strip().lower())
-    return text.strip(" \t\r\n,.;:/")
+    text = text.strip(_PROMPT_TERM_STRIP_CHARS)
+    # A token with no real word content (a lone bracket/quote) or a single stray
+    # character is not a shopper term — emitting it leaks a query fragment.
+    if len(text) < 2 or not re.search(r"[a-z0-9]", text):
+        return ""
+    return text
+
+
+# Generated probe queries are shopper prompts, never templates, so a stray
+# bracket, an unbalanced quote/paren, a dangling connective, or a sub-minimal
+# fragment all signal a template token that resolved to empty/junk. This gate is
+# the defense-in-depth backstop at the generation dedupe chokepoints: even if a
+# generator (sidewalk, merchant tags) leaks debris that `_clean_prompt_term`
+# never saw, a malformed query never reaches a probe. Keep it conservative —
+# only reject shapes that are unambiguously broken, so well-formed queries pass.
+_QUERY_BRACKET_RE = re.compile(r"[\[\]{}<>]")
+_QUERY_DANGLING_TAIL_RE = re.compile(
+    r"\b(?:for|with|and|or|the|a|an|of|to|in|on|by|from)$"
+)
+_QUERY_MIN_LEN = 4
+
+
+def _is_well_formed_query(query: Any) -> bool:
+    q = re.sub(r"\s+", " ", str(query or "").strip())
+    if len(q) < _QUERY_MIN_LEN:
+        return False
+    if _QUERY_BRACKET_RE.search(q):
+        return False
+    if q.count("(") != q.count(")"):
+        return False
+    if q.count('"') % 2 != 0:
+        return False
+    if _QUERY_DANGLING_TAIL_RE.search(q.lower()):
+        return False
+    return True
 
 
 def _graph_class_values(graph: Mapping[str, Any], class_name: str) -> List[str]:
@@ -6855,7 +6897,7 @@ def _dedupe_query_spec_records(
         if not isinstance(record, dict):
             continue
         query = str(record.get("query") or "").strip()
-        if not query:
+        if not query or not _is_well_formed_query(query):
             continue
         key = query.lower()
         if key in seen:
