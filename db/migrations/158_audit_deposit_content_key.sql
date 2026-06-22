@@ -1,4 +1,4 @@
--- 156_audit_deposit_content_key.sql
+-- 158_audit_deposit_content_key.sql
 -- P0.2 (commerce-index keystone): stamp the canonical entity key (content_key)
 -- onto the audit DEPOSIT spine. Today an audit deposits against the
 -- storefront-shaped product_key (merchant|platform|source_product_id);

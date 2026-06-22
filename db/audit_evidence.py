@@ -412,11 +412,11 @@ _DDL_STATEMENTS = [
     "ON evidence_items (audit_run_id, created_at);",
     "CREATE INDEX IF NOT EXISTS idx_evidence_items_type "
     "ON evidence_items (evidence_type, audit_run_id);",
-    # P0.2: canonical entity key (migration 156) — backstop for fresh DBs.
+    # P0.2: canonical entity key (migration 158) — backstop for fresh DBs.
     "ALTER TABLE evidence_items ADD COLUMN IF NOT EXISTS content_key VARCHAR(40);",
     "CREATE INDEX IF NOT EXISTS idx_evidence_items_content_key "
     "ON evidence_items (content_key, evidence_type);",
-    # P0.2: citation_observations (migration 157) — backstop for fresh DBs.
+    # P0.2: citation_observations (migration 159) — backstop for fresh DBs.
     """
     CREATE TABLE IF NOT EXISTS citation_observations (
         observation_id    UUID PRIMARY KEY,

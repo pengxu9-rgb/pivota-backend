@@ -98,7 +98,7 @@ merchant_audit_runs = Table(
     Column("category_visibility_score_avg", Integer, nullable=True),
     Column("audited_via_pivota_canonical", ARRAY(Text), nullable=True),
     # P0.2 W3: the canonical entities this run deposited against + per
-    # product_key resolution basis (migration 156).
+    # product_key resolution basis (migration 158).
     Column("content_keys", ARRAY(Text), nullable=True),
     Column("content_key_basis", JSONB, nullable=True),
     Column("report_jsonb", JSONB, nullable=True),
@@ -218,7 +218,7 @@ _DDL_STATEMENTS = [
     "ADD COLUMN IF NOT EXISTS idempotency_key TEXT;",
     "ALTER TABLE merchant_audit_runs "
     "ADD COLUMN IF NOT EXISTS cancelled_at TIMESTAMPTZ;",
-    # P0.2 W3 (migration 156): canonical entity keys + per-product basis.
+    # P0.2 W3 (migration 158): canonical entity keys + per-product basis.
     "ALTER TABLE merchant_audit_runs "
     "ADD COLUMN IF NOT EXISTS content_keys TEXT[];",
     "ALTER TABLE merchant_audit_runs "

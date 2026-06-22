@@ -1,6 +1,6 @@
 """Backfill merchant_audit_runs.content_keys[] for historical audit runs.
 
-P0.2 W4. Migrations 156/157 added content_key to the audit deposit spine and
+P0.2 W4. Migrations 158/159 added content_key to the audit deposit spine and
 new audits populate it (audit_evidence_builder W1/W2/W3). This script fills the
 run-level content_keys[] for runs that predate the change.
 
