@@ -67,6 +67,31 @@ def test_host_matches_known_binds_to_merchant_domains():
     assert host_matches_known("https://www.anua.com/products/x", {"anua.com"})
 
 
+def test_host_matches_known_rejects_public_suffix_widening():
+    # B1 hardening: a junk/short host in the merchant's OWN catalog
+    # (source_domain/canonical_url) or onboarding (store_url/website) must NOT
+    # widen the bind to every org that merely shares a public/platform suffix.
+    #
+    # bare TLD known host: a stray "com"/"uk" doesn't bind an unrelated domain.
+    assert not host_matches_known("anything.com", {"com"})
+    assert not host_matches_known("brand.co.uk", {"uk"})
+    # shared storefront-platform suffix: one tenant is not another tenant.
+    assert not host_matches_known("anybrand.myshopify.com", {"myshopify.com"})
+    assert not host_matches_known("anybrand.shopify.com", {"shopify.com"})
+    # multi-label registry suffix (2 labels, but still a public suffix).
+    assert not host_matches_known("evilbrand.co.uk", {"co.uk"})
+    # the reverse direction (claimed domain is the public suffix) is guarded too.
+    assert not host_matches_known("co.uk", {"brand.co.uk"})
+    assert not host_matches_known("myshopify.com", {"shop.myshopify.com"})
+
+    # ...but legitimate exact + true-subdomain binds STILL pass, including a real
+    # registrable domain that merely sits one label under a public suffix.
+    assert host_matches_known("anua.com", {"anua.com"})             # exact
+    assert host_matches_known("shop.anua.com", {"anua.com"})        # true subdomain
+    assert host_matches_known("anua.com", {"shop.anua.com"})        # reverse subdomain
+    assert host_matches_known("shop.brand.co.uk", {"brand.co.uk"})  # registrable under co.uk
+
+
 def test_is_valid_public_hostname():
     assert is_valid_public_hostname("anua.com")
     assert is_valid_public_hostname("brand.co.kr")
