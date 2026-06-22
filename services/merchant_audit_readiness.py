@@ -134,6 +134,28 @@ async def _summarize_active_backfill(merchant_id: str) -> Optional[Dict[str, Any
     return _derive_backfill_summary(job, datetime.now(timezone.utc))
 
 
+async def _count_substantiated_evidence(merchant_id: str) -> int:
+    """Products with >=1 substantiated claim in the cross-vertical evidence store
+    (Phase 2a `product_evidence`). Best-effort — the store may be absent or the DB
+    non-Postgres; never blocks the verdict. Drives the portal's informational
+    'evidence tier' (how much citable evidence the merchant has)."""
+    from db.database import database
+
+    try:
+        row = await database.fetch_one(
+            """
+            SELECT COUNT(DISTINCT product_key) AS n
+            FROM product_evidence
+            WHERE merchant_id = :mid
+              AND claims @> '[{"substantiation_status": "substantiated"}]'
+            """,
+            {"mid": merchant_id},
+        )
+    except Exception:
+        return 0
+    return int((dict(row).get("n") if row else 0) or 0)
+
+
 async def assess_merchant_audit_readiness(
     merchant_id: str,
     platform: str = "shopify",
@@ -203,6 +225,9 @@ async def assess_merchant_audit_readiness(
     # "Preparing your catalog" state shows a grounded countdown instead of a
     # flat "a few minutes". None when no job is in flight; never blocks.
     backfill = await _summarize_active_backfill(merchant_id)
+    # Phase 2a evidence tier (informational, never blocks): how many products
+    # carry citable (substantiated) merchant evidence in the general store.
+    evidence_products = await _count_substantiated_evidence(merchant_id)
     return {
         "merchant_id": merchant_id,
         "platform": platform,
@@ -211,6 +236,7 @@ async def assess_merchant_audit_readiness(
         "blocking_gaps": blocking_gaps,
         "enhancement_gaps": enhancement_gaps,
         "backfill": backfill,
+        "evidence": {"products_with_substantiated_claims": evidence_products},
         "recommendation": (
             "Audit-ready: scores will be real (enhancement gaps only lower the ceiling)."
             if ready else
