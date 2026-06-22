@@ -324,6 +324,53 @@ async def upsert_product_evidence(
     await write_db.execute(sql, values)
 
 
+async def insert_evidence_artifact(
+    *,
+    artifact_id: str,
+    product_key: str,
+    merchant_id: Optional[str],
+    kind: str,
+    source: str = "merchant_upload",
+    url_or_blob_ref: Optional[str] = None,
+    extracted_claim_keys: Optional[List[str]] = None,
+    db: Any = None,
+) -> str:
+    """Record one source document the merchant evidence intake references (a lab
+    PDF, cert, review…). Idempotent on artifact_id (re-uploading the same file
+    re-points to the same row, preserving captured_at). Returns the artifact_id —
+    a confirmed claim's `source_ref` points here, which is what grades it. Pure
+    write; never auto-creates claims (the merchant confirms candidates separately)."""
+    await ensure_product_evidence_tables()
+    write_db = db or database
+    keys_json = json.dumps(extracted_claim_keys) if extracted_claim_keys else None
+    values = {
+        "aid": artifact_id, "pk": product_key, "mid": merchant_id,
+        "kind": kind, "source": source, "ref": url_or_blob_ref, "keys": keys_json,
+    }
+    if IS_POSTGRES:
+        j = _json_type_sql()
+        sql = f"""
+        INSERT INTO evidence_artifact
+          (artifact_id, product_key, merchant_id, kind, source, url_or_blob_ref, extracted_claim_keys)
+        VALUES (:aid, :pk, :mid, :kind, :source, :ref, CAST(:keys AS {j}))
+        ON CONFLICT (artifact_id) DO UPDATE SET
+          product_key = EXCLUDED.product_key,
+          merchant_id = EXCLUDED.merchant_id,
+          kind = EXCLUDED.kind,
+          source = EXCLUDED.source,
+          url_or_blob_ref = EXCLUDED.url_or_blob_ref,
+          extracted_claim_keys = EXCLUDED.extracted_claim_keys
+        """
+    else:
+        sql = """
+        INSERT OR REPLACE INTO evidence_artifact
+          (artifact_id, product_key, merchant_id, kind, source, url_or_blob_ref, extracted_claim_keys)
+        VALUES (:aid, :pk, :mid, :kind, :source, :ref, :keys)
+        """
+    await write_db.execute(sql, values)
+    return artifact_id
+
+
 async def fetch_product_evidence_row(
     product_key: str,
     *,
