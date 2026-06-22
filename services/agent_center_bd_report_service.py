@@ -2158,6 +2158,12 @@ def _has_claims(product: Dict[str, Any], sku_ctx: Dict[str, Any]) -> bool:
 
 
 def _has_substantiation(product: Dict[str, Any], sku_ctx: Dict[str, Any]) -> bool:
+    # Phase 2b: merchant-supplied substantiated evidence (the general
+    # product_evidence store, plumbed in by load_sku_context) satisfies
+    # substantiation exactly like a beauty-profile claim or intel source_coverage.
+    # Boolean gate → no double-counting with the other signals below.
+    if sku_ctx.get("has_substantiated_evidence"):
+        return True
     payload = _json_obj(product.get("product_payload"))
     intel = _json_obj(payload.get("product_intel") or {}).get("product_intel_core")
     if isinstance(intel, dict) and _nonempty(intel.get("source_coverage")):
@@ -4211,6 +4217,26 @@ async def load_sku_context(sku_key: str, merchant_id: str) -> Dict[str, Any]:
         """,
         {"merchant_id": merchant_id},
     ) or {}
+    # Phase 2b: does this product carry merchant-supplied SUBSTANTIATED evidence
+    # (lab / cert / third-party) in the general product_evidence store? This feeds
+    # the existing 10-pt "Substantiated claims" bucket via _has_substantiation, so
+    # a confirmed lab claim lifts the audit the same way a beauty-profile claim or
+    # an intel source_coverage does — reusing that weight, not inventing one.
+    # Best-effort: the table may be absent / non-Postgres (the JSONB containment
+    # operator is Postgres-only); _fetch_one_dict swallows errors to {} so the flag
+    # simply stays False. NULL merchant_id rows (future web-crawl writes) count too.
+    evidence_row = await _fetch_one_dict(
+        """
+        SELECT COUNT(*) AS n
+          FROM product_evidence
+         WHERE product_key = :product_key
+           AND (merchant_id = :merchant_id OR merchant_id IS NULL)
+           AND claims @> '[{"substantiation_status": "substantiated"}]'
+        """,
+        {"product_key": product_key, "merchant_id": merchant_id},
+    ) or {}
+    has_substantiated_evidence = int(evidence_row.get("n") or 0) > 0
+
     content_key = product.get("content_key")
     peers = []
     if content_key:
@@ -4251,6 +4277,7 @@ async def load_sku_context(sku_key: str, merchant_id: str) -> Dict[str, Any]:
         "pcs_shop_policies": policies,
         "merchant": merchant,
         "content_key_peers": peers,
+        "has_substantiated_evidence": has_substantiated_evidence,
     }
     _SKU_CONTEXT_CACHE[cache_key] = ctx
     return ctx

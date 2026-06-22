@@ -318,6 +318,40 @@ def test_content_richness_score_good_partial_missing():
     assert breakdown["safety_claims"]["points"] == 0
 
 
+def test_has_substantiation_via_general_evidence_flag():
+    # Phase 2b: the plumbed has_substantiated_evidence flag (general
+    # product_evidence store) substantiates on its own — even with an otherwise
+    # empty product/ctx — exactly like the existing payload/profile signals.
+    from services.agent_center_bd_report_service import _has_substantiation
+
+    assert _has_substantiation({}, {"has_substantiated_evidence": True}) is True
+    assert _has_substantiation({}, {}) is False
+    assert _has_substantiation({}, {"has_substantiated_evidence": False}) is False
+    # Existing signals still substantiate independently (no regression).
+    assert _has_substantiation({"product_payload": {"substantiation": {"study": "x"}}}, {}) is True
+
+
+def test_general_evidence_lifts_safety_claims_bucket():
+    # The product behavior the wiring buys: a merchant making claims it can't yet
+    # back scores 5/10 on "Substantiated claims"; confirming substantiated evidence
+    # lifts that bucket to the full 10 (+5) — reusing the existing weight.
+    from services.agent_center_bd_report_service import compute_content_richness_score
+
+    ctx = _base_sku_ctx()
+    # Claims PRESENT (markers in copy) but UNSUBSTANTIATED (strip every signal).
+    ctx["product"]["description"] = "Clinically tested anti-aging serum for acne-prone skin. " * 4
+    ctx["product"]["product_payload"] = {"ingredients": ["niacinamide"]}  # no substantiation/watchouts
+    ctx["beauty_product_profile"] = {}
+    ctx["product_enrichment"] = {"bullet_points": ["a", "b", "c"]}  # no blocking llm_safety_flags
+
+    _, breakdown = compute_content_richness_score(ctx)
+    assert breakdown["safety_claims"]["points"] == 5  # docked: claims w/o substantiation
+
+    ctx["has_substantiated_evidence"] = True
+    _, breakdown2 = compute_content_richness_score(ctx)
+    assert breakdown2["safety_claims"]["points"] == 10  # full once substantiated
+
+
 def test_content_richness_scores_raw_pdp_when_pivota_enrichment_absent():
     """Audit regression: a content-rich brand PDP (long description, image,
     specs, priced offer) with NO Pivota enrichment must NOT be scored as thin.
