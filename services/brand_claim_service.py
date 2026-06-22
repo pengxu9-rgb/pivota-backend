@@ -89,15 +89,70 @@ def is_valid_public_hostname(value: Optional[str]) -> bool:
     return bool(host) and len(host) <= 253 and bool(_HOSTNAME_RE.match(host))
 
 
+# Public / shared-platform suffixes under which two different registrations are
+# NOT the same organization. A host that IS one of these — or that has too few
+# labels to be a registrable domain (a bare TLD like "com") — must never anchor
+# a "same registrable org" suffix match: otherwise a junk/short host in the
+# merchant's OWN catalog (source_domain/canonical_url) or onboarding
+# (store_url/website) — e.g. a bare "myshopify.com" or "com" — would widen the
+# bind to every unrelated org that merely shares that suffix.
+#
+# The repo has no Public Suffix List dependency (cf. canonical_source_discovery's
+# curated _TLD_LABELS/_GENERIC_DOMAINS), so this is a conservative, additive
+# subset of the PSL, not an exhaustive one. The has-a-dot rule in
+# _is_registrable_base is the always-on structural backstop for bare TLDs; this
+# set extends it to the multi-label suffixes that rule can't catch on its own.
+_PUBLIC_SUFFIXES = frozenset({
+    # shared storefront platforms: one tenant (shop.myshopify.com) is a
+    # different org from another tenant of the same platform. Kept in step with
+    # the platform tokens canonical_source_discovery._GENERIC_DOMAINS already
+    # treats as never-a-brand.
+    "myshopify.com", "shopify.com", "wixsite.com", "bigcartel.com",
+    "squarespace.com",
+    # common multi-label registry suffixes (a registrable domain sits one label
+    # deeper than these). Covers Pivota's active markets (KR/JP/UK/AU/...).
+    "co.uk", "org.uk", "me.uk", "ac.uk", "gov.uk",
+    "co.kr", "or.kr", "ne.kr", "go.kr",
+    "co.jp", "or.jp", "ne.jp", "ac.jp", "go.jp",
+    "com.au", "net.au", "org.au",
+    "com.br", "com.cn", "com.hk", "com.mx", "com.my", "com.ph",
+    "com.sg", "com.tr", "com.tw",
+    "co.id", "co.il", "co.in", "co.nz", "co.th", "co.za",
+})
+
+
+def _is_registrable_base(host: str) -> bool:
+    """True iff `host` is specific enough to anchor a 'same registrable org'
+    suffix match: it has at least two labels AND is not itself a public/shared
+    suffix (a bare TLD like 'com', a registry suffix like 'co.uk', or a
+    storefront platform like 'myshopify.com'). Suffix-matching against a public
+    suffix would bind unrelated orgs that merely share it, so we refuse to."""
+    if not host or "." not in host:
+        return False  # single label / bare TLD — never a registrable domain
+    return host not in _PUBLIC_SUFFIXES
+
+
 def host_matches_known(domain: Optional[str], known_hosts: Iterable[str]) -> bool:
-    """Pure: does the claimed domain match a known merchant host? Exact match or
-    same registrable org (sub.brand.com <-> brand.com)."""
+    """Pure: does the claimed domain match a known merchant host? Exact match, or
+    same registrable org (sub.brand.com <-> brand.com) — but a subdomain match is
+    honored ONLY when the host acting as the registrable base is a real
+    registrable domain, never a public/platform suffix. That guard keeps a
+    junk/short host in the merchant's own catalog/onboarding data (e.g. a bare
+    'myshopify.com' or 'com') from widening the bind to unrelated orgs."""
     d = normalize_host(domain)
     if not d:
         return False
     for kh in known_hosts:
         k = normalize_host(kh)
-        if k and (d == k or d.endswith("." + k) or k.endswith("." + d)):
+        if not k:
+            continue
+        if d == k:
+            return True  # exact host — the strongest, unconditional bind
+        # d is a subdomain of k  -> k is the registrable base
+        if d.endswith("." + k) and _is_registrable_base(k):
+            return True
+        # k is a subdomain of d  -> d is the registrable base
+        if k.endswith("." + d) and _is_registrable_base(d):
             return True
     return False
 
