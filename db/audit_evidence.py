@@ -248,6 +248,9 @@ evidence_items = Table(
     # P5.8.1: tenancy at the column level (was: route-layer only)
     Column("merchant_id", Text, nullable=True),
     Column("product_key", Text, nullable=True),
+    # P0.2: canonical entity key — stamped on the deposit so audit exhaust
+    # accretes on the cross-merchant product entity, not just the listing.
+    Column("content_key", Text, nullable=True),
     Column("probe_run_id", UUID(as_uuid=False), nullable=True),
     Column("evidence_type", Text, nullable=False),
     Column("payload_jsonb", JSONB, nullable=False),
@@ -381,6 +384,10 @@ _DDL_STATEMENTS = [
     "ON evidence_items (audit_run_id, created_at);",
     "CREATE INDEX IF NOT EXISTS idx_evidence_items_type "
     "ON evidence_items (evidence_type, audit_run_id);",
+    # P0.2: canonical entity key (migration 156) — backstop for fresh DBs.
+    "ALTER TABLE evidence_items ADD COLUMN IF NOT EXISTS content_key VARCHAR(40);",
+    "CREATE INDEX IF NOT EXISTS idx_evidence_items_content_key "
+    "ON evidence_items (content_key, evidence_type);",
 
     # readiness_findings
     """
@@ -593,6 +600,7 @@ async def insert_evidence_item(
     payload: Dict[str, Any],
     merchant_id: Optional[str] = None,
     product_key: Optional[str] = None,
+    content_key: Optional[str] = None,
     probe_run_id: Optional[str] = None,
     confidence: Optional[int] = None,
     idempotency_key: Optional[str] = None,
@@ -628,6 +636,7 @@ async def insert_evidence_item(
                 audit_run_id=audit_run_id,
                 merchant_id=merchant_id,
                 product_key=product_key,
+                content_key=content_key,
                 probe_run_id=probe_run_id,
                 evidence_type=coerced_type,
                 payload_jsonb=safe_payload,
