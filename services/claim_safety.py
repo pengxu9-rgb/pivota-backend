@@ -22,7 +22,8 @@ authoring writer, the read path, and PR4's serving gate.
 
 from __future__ import annotations
 
-from typing import Any, List, Optional
+import json
+from typing import Any, Dict, List, Optional
 
 from models.catalog import ProductClaim, RequiredDisclaimer
 
@@ -114,4 +115,37 @@ def normalize_claims(raw_claims: Any) -> List[ProductClaim]:
         claim = _coerce_claim(raw)
         if claim is not None:
             out.append(claim)
+    return out
+
+
+def substantiated_claims(evidence_profile: Any) -> List[Dict[str, Any]]:
+    """Serve gate: return ONLY substantiated claims from an evidence_profile
+    (a dict with a "claims" list, a raw claims list, or a JSON string) as plain
+    dicts safe to emit to agents.
+
+    Unverified / flagged / rejected claims are dropped — so an unsubstantiated
+    merchant assertion can improve PDP copy but is never served to an agent as a
+    grounded, citable claim. Pure; no I/O. This is the single chokepoint every
+    agent-facing surface (PDP API, public PDP/JSON-LD, MCP, ACP) routes through.
+    """
+    raw: Any = evidence_profile
+    if isinstance(raw, str):
+        try:
+            raw = json.loads(raw)
+        except Exception:
+            return []
+    if isinstance(raw, dict):
+        raw = raw.get("claims")
+    out: List[Dict[str, Any]] = []
+    for claim in normalize_claims(raw):
+        if claim.substantiation_status != SUBSTANTIATION_SUBSTANTIATED:
+            continue
+        out.append(
+            {
+                "claim_text": claim.claim_text,
+                "source_ref": claim.source_ref,
+                "source_type": claim.source_type,
+                "evidence_grade": claim.evidence_grade,
+            }
+        )
     return out

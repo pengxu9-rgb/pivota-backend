@@ -41,6 +41,7 @@ from sqlalchemy import Boolean, DateTime, Float, String, Text, and_, column, fun
 
 from db.catalog import catalog_merchants, catalog_products
 from db.database import database
+from services.claim_safety import substantiated_claims
 from utils.logger import logger
 
 router = APIRouter(
@@ -102,6 +103,16 @@ index_pipeline_state = table(
     column("quality_scored_at", DateTime),
 )
 
+# Lightweight handle to the evidence columns (migration 152). Mirrors the local
+# index_pipeline_state pattern above rather than importing the full db.catalog
+# Table (whose Core def predates the evidence columns).
+agent_pdp_view = table(
+    "agent_pdp_view",
+    column("content_key", String),
+    column("evidence_profile"),
+    column("required_disclaimers"),
+)
+
 
 def _shape_product_for_pdp(row: Dict[str, Any]) -> Dict[str, Any]:
     """Convert a catalog_products row into the flat product object the
@@ -153,6 +164,10 @@ def _shape_product_for_pdp(row: Dict[str, Any]) -> Dict[str, Any]:
         "merchant_canonical_url": row.get("canonical_url"),
         "platform": row.get("platform"),
         "source_product_id": row.get("source_product_id"),
+        # Substantiated, attributable claims for the agent-crawled PDP + JSON-LD.
+        # Serve gate: only `substantiated` claims are emitted (never raw/unverified).
+        "evidence_claims": substantiated_claims(row.get("evidence_profile")),
+        "disclaimers": row.get("required_disclaimers") or [],
         # Carry the full upstream payload for consumers that need
         # variants / price / inventory beyond what we normalized.
         "payload": payload or None,
@@ -185,6 +200,10 @@ async def get_canonical_pdp_by_signature(sig_id: str) -> Dict[str, Any]:
             catalog_products.c.pivota_signature_id,
             catalog_products.c.pivota_canonical_url,
             catalog_products.c.updated_at,
+            # Evidence layer (migration 152) — JOINed below so the public PDP can
+            # surface substantiated, attributable claims for agents to cite.
+            agent_pdp_view.c.evidence_profile,
+            agent_pdp_view.c.required_disclaimers,
         )
         .select_from(
             catalog_products.join(
@@ -193,6 +212,9 @@ async def get_canonical_pdp_by_signature(sig_id: str) -> Dict[str, Any]:
             ).join(
                 catalog_merchants,
                 catalog_products.c.merchant_id == catalog_merchants.c.merchant_id,
+            ).outerjoin(
+                agent_pdp_view,
+                catalog_products.c.content_key == agent_pdp_view.c.content_key,
             )
         )
         .where(

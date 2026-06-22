@@ -16,6 +16,7 @@ from fastapi.encoders import jsonable_encoder
 
 from db.database import database
 from services.catalog_identity import is_content_key
+from services.claim_safety import substantiated_claims
 
 
 router = APIRouter(prefix="/api/agent/pdp", tags=["agent-pdp"])
@@ -48,6 +49,11 @@ AGENT_PDP_VIEW_COLUMNS: Tuple[str, ...] = (
     "refreshed_at",
     "refreshed_by_proposal_id",
     "refresh_source",
+    # Evidence layer (migration 152): stored in agent_pdp_view but was dropped
+    # here, so agents never saw grounded claims. Emitted (substantiated-only) in
+    # _row_as_product.
+    "evidence_profile",
+    "required_disclaimers",
 )
 
 _SELECT_COLUMNS = ",\n      ".join(AGENT_PDP_VIEW_COLUMNS)
@@ -271,6 +277,13 @@ def _row_as_product(row: Dict[str, Any]) -> Dict[str, Any]:
             "variants": row.get("variants") or [],
         }
     )
+
+    # Serve gate: never leak the raw evidence_profile (it can carry unverified
+    # claims); emit only substantiated claims + the required disclaimers.
+    product.pop("evidence_profile", None)
+    product.pop("required_disclaimers", None)
+    product["evidence_claims"] = substantiated_claims(row.get("evidence_profile"))
+    product["disclaimers"] = row.get("required_disclaimers") or []
 
     price_min = row.get("price_min")
     currency = row.get("currency")
