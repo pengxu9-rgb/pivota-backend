@@ -766,6 +766,25 @@ async def persist_canonical_evidence(
         if getattr(r, "is_depositable", False)
     )
 
+    # P0.2 W3: record the resolved canonical entities + basis on the run row.
+    try:
+        from db.merchant_audit_runs import record_audit_run_content_keys
+        depositable_cks = sorted({
+            r.content_key for r in content_key_map.values()
+            if getattr(r, "is_depositable", False) and r.content_key
+        })
+        await record_audit_run_content_keys(
+            run_id=audit_run_id,
+            content_keys=depositable_cks,
+            content_key_basis={pk: r.basis for pk, r in content_key_map.items()},
+        )
+        summary["content_keys"] = depositable_cks
+    except Exception as exc:  # noqa: BLE001
+        logger.warning(
+            "persist_canonical_evidence: content_keys write failed for "
+            "audit=%s: %s", audit_run_id, str(exc)[:200],
+        )
+
     extracted_evidence = list(
         extract_evidence_items(brand_report, content_key_map)
     )
