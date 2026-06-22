@@ -873,7 +873,13 @@ async def _fetch_canonical_search_rows(
             o.source_domain AS offer_source_domain,
             o.why_buy_direct AS offer_why_buy_direct,
             o.offer_payload,
-            c.rank_score + CASE WHEN o.catalog_track = 'internal_merchant' THEN 10 ELSE 0 END AS rank_score
+            -- P0.3 neutrality: NO first-party / ownership boost. A first-party
+            -- offer must not outrank an equally-relevant third-party offer for
+            -- the same product (was: + CASE WHEN catalog_track='internal_merchant'
+            -- THEN 10). Ownership is not a ranking signal — merit is. This is
+            -- load-bearing for the neutral-index thesis: a margin/ownership-tilted
+            -- decision layer is detectable and erodes frontier-model trust.
+            c.rank_score AS rank_score
         FROM candidate_skus c
         JOIN catalog_offers o
           ON o.sku_key = c.sku_key

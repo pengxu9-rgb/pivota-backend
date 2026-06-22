@@ -5,9 +5,11 @@ from typing import Any, Dict, List, Optional
 from db.database import metadata, database
 
 
-# Lightweight log table for agent-side ranking features.
-# This is intended purely for analytics / ML training and is not
-# referenced in any online request path.
+# Lightweight log table for agent-side ranking features. Dual purpose:
+# (1) analytics / ML (LTR) training data, and (2) the NEUTRALITY PROOF TRAIL
+# (P0.3/P0.4) — the merit feature vector + score behind each ranking decision,
+# so "was this ranking merit-based, not pay-to-win?" is auditable. Written
+# post-response (not in the online decision path).
 
 agent_ranking_log = Table(
     "agent_ranking_log",
@@ -50,10 +52,17 @@ async def log_ranking_batch(
     max_rows: int = 50,
 ) -> None:
     """
-    Persist a batch of ranking feature snapshots for later LTR / reranker training.
+    Persist a batch of ranking feature snapshots for later LTR / reranker
+    training AND as the NEUTRALITY PROOF TRAIL (P0.3/P0.4): the merit feature
+    vector + score behind each ranking decision, so "was this ranking
+    merit-based?" is auditable. Do NOT remove — only the legacy *billing
+    attribution* role moved to services.agent_decision_event_store; the
+    ranking-feature snapshot persisted here is current and load-bearing.
 
-    Deprecated legacy event sink; decision-layer billing attribution writes to
-    services.agent_decision_event_store.
+    The persisted `features` payload comes from serialize_features_for_log and
+    must contain only merit fields (locked by
+    tests/services/test_ranking_neutrality.py) — never a commercial/ownership
+    signal.
 
     - `products` are the already-ranked products returned to the caller.
     - Each product is expected to optionally contain:
