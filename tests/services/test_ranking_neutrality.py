@@ -12,6 +12,7 @@ from services.agent_ranking_service import (
     AgentRankingFeatures,
     compute_agent_ranking_score,
     get_agent_ranking_config,
+    serialize_features_for_log,
 )
 
 # Signals that must NEVER influence ranking (ownership / commercial terms).
@@ -64,3 +65,13 @@ def test_score_invariant_to_business_signal_under_neutral_config():
     low = compute_agent_ranking_score(_features(merchant_reputation=0.0), cfg)
     high = compute_agent_ranking_score(_features(merchant_reputation=1.0), cfg)
     assert low == high
+
+
+def test_persisted_log_payload_has_no_commercial_fields():
+    # P0.4: the neutrality PROOF TRAIL (agent_ranking_log.features) is built
+    # from serialize_features_for_log. Lock it at the persistence boundary so a
+    # commercial/ownership signal can't sneak into the audit record either.
+    payload = serialize_features_for_log(_features(merchant_reputation=0.5), score=0.42)
+    leaked = set(payload) & _FORBIDDEN_FEATURE_FIELDS
+    assert not leaked, f"commercial signal leaked into the logged ranking trail: {leaked}"
+    assert payload["ranking_score"] == 0.42
