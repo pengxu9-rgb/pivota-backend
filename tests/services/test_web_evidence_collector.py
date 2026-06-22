@@ -29,6 +29,16 @@ def test_classify_brand_owned_skipped() -> None:
     assert wec.classify_web_source("https://shop.glowco.com/p", merchant_host="glowco.com")[0] == "brand_owned"
 
 
+def test_classify_brand_stopwords_do_not_drop_editorial() -> None:
+    # "The Ordinary": the stopword "the" must NOT mark thecut.com as brand-owned.
+    assert wec.classify_web_source("https://www.thecut.com/best", brand="The Ordinary")[0] == "editorial_press"
+
+
+def test_classify_merchant_host_with_scheme_normalizes() -> None:
+    # A merchant_host passed WITH a scheme must still exclude the merchant's own host.
+    assert wec.classify_web_source("https://shop.glowco.com/p", merchant_host="https://glowco.com")[0] == "brand_owned"
+
+
 # --- build_web_evidence_candidates -------------------------------------------
 
 def test_build_candidates_keeps_press_review_drops_social_brand() -> None:
@@ -105,6 +115,32 @@ async def test_merge_preserves_merchant_claims_and_dedupes(monkeypatch) -> None:
     assert len(written) == 3
     assert any(c["source_type"] == "merchant_lab_report" for c in written)
     assert sum(1 for c in written if c.get("source_ref") == "https://allure.com/y") == 1
+
+
+async def test_merge_preserves_merchant_id_and_disclaimers_when_caller_unknown(monkeypatch) -> None:
+    # A crawl/job that doesn't know the merchant passes merchant_id=None. The merge
+    # must NOT null out the stored merchant_id (indexed scoping column) or disclaimers
+    # (upsert is a full-row replace). Prefer the existing non-null merchant_id.
+    monkeypatch.setattr(pe, "ensure_product_evidence_tables", _noop_ensure)
+    existing_row = {
+        "product_key": "pk1",
+        "merchant_id": "m_stored",
+        "claims": [{"claim_text": "Existing", "source_ref": "u0"}],
+        "review_state": "reviewed",
+        "required_disclaimers": [{"code": "fda_dshea_supplement", "text": "…"}],
+        "updated_at": None,
+    }
+    db = _FakeDB(row=existing_row)
+    added = await wec._merge_candidates_into_evidence(
+        "pk1", None,  # caller doesn't know the merchant
+        [{"claim_text": "New", "source_ref": "https://allure.com/y", "source_type": "editorial_press"}],
+        db=db,
+    )
+    assert added == 1
+    _, values = db.executed[0]
+    assert values["mid"] == "m_stored"              # NOT clobbered to None
+    assert values["rs"] == "reviewed"               # review_state preserved
+    assert json.loads(values["disc"]) == [{"code": "fda_dshea_supplement", "text": "…"}]  # disclaimers preserved
 
 
 async def test_merge_no_new_does_not_write(monkeypatch) -> None:

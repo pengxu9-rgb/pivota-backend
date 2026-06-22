@@ -70,8 +70,25 @@ def _host(url: Any) -> str:
         return ""
 
 
+# Common words that appear in brand names but must NOT drive host matching (else
+# "The Ordinary" would mark thecut.com as brand-owned and drop a real editorial).
+_BRAND_STOPWORDS = frozenset(
+    {"the", "and", "for", "with", "your", "our", "inc", "llc", "ltd", "co", "company", "brand"}
+)
+
+
 def _brand_tokens(brand: Optional[str]) -> List[str]:
-    return [t for t in str(brand or "").lower().replace("-", " ").split() if len(t) > 2]
+    return [
+        t
+        for t in str(brand or "").lower().replace("-", " ").split()
+        if len(t) > 2 and t not in _BRAND_STOPWORDS
+    ]
+
+
+def _normalize_host(value: Any) -> str:
+    """Host for a value that may be a bare host or a full URL (with/without scheme)."""
+    s = str(value or "").strip()
+    return _host(s if "://" in s else "http://" + s)
 
 
 def _clip(text: Any, n: int) -> str:
@@ -90,7 +107,7 @@ def classify_web_source(
     host = _host(url)
     if not host:
         return SOURCE_UNKNOWN, None
-    mh = _host("http://" + str(merchant_host)) if merchant_host else ""
+    mh = _normalize_host(merchant_host) if merchant_host else ""
     if mh and mh in host:
         return SOURCE_BRAND, None
     for tok in _brand_tokens(brand):
@@ -168,6 +185,14 @@ async def _merge_candidates_into_evidence(
     existing = await fetch_product_evidence_row(product_key, geo_code=geo_code, db=db)
     existing_claims = list((existing or {}).get("claims") or [])
     review_state = (existing or {}).get("review_state") or "observed"
+    # upsert_product_evidence does a FULL-ROW upsert (merchant_id / required_disclaimers
+    # = EXCLUDED.*), so we must carry the existing row's values forward or a crawl/job
+    # that doesn't know the merchant (merchant_id=None — the headline use case) would
+    # null out the stored merchant_id (the indexed scoping column) + disclaimers.
+    # Prefer the existing non-null merchant_id over the (possibly None) argument.
+    existing_merchant_id = (existing or {}).get("merchant_id")
+    effective_merchant_id = existing_merchant_id or merchant_id
+    existing_disclaimers = (existing or {}).get("required_disclaimers")
     seen_refs = {
         str(c.get("source_ref") or "").strip().lower()
         for c in existing_claims
@@ -191,10 +216,11 @@ async def _merge_candidates_into_evidence(
         return 0
     await upsert_product_evidence(
         product_key,
-        merchant_id=merchant_id,
+        merchant_id=effective_merchant_id,
         claims=existing_claims + added,
         geo_code=geo_code,
         review_state=review_state,
+        required_disclaimers=existing_disclaimers,
         db=db,
     )
     return len(added)
