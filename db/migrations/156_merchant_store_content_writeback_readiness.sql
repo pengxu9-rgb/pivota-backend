@@ -9,8 +9,9 @@
 --   canary                         -> only the matching canary product may write
 --   enabled                        -> active store may write normally
 -- Plus a global kill switch env DISABLE_CONTENT_WRITEBACK and, at write time,
--- the Shopify token must carry write_products (App B installs only) or the
--- metafieldsSet ACCESS_DENIED is surfaced as "needs re-consent" — no partial write.
+-- the merchant's connected (BYO / custom app) Admin token must carry
+-- write_products, or the metafieldsSet ACCESS_DENIED is surfaced as
+-- needs_write_products (enable it on your app) — no partial write.
 
 ALTER TABLE merchant_stores
   ADD COLUMN IF NOT EXISTS content_writeback_status TEXT NOT NULL DEFAULT 'disabled',
