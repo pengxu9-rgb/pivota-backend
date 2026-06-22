@@ -162,6 +162,9 @@ from routes.agent_center_bd_routes import (
 from routes.merchant_audit_routes import (
     router as merchant_audit_router,
 )
+from routes.brand_claim_routes import (
+    router as brand_claim_router,
+)
 from routes.audit_runs_routes import (
     router as audit_runs_router,
 )
@@ -814,6 +817,7 @@ app.include_router(agent_center_sku_match_router)  # Agent Center: SKU Match Age
 app.include_router(agent_center_admin_router)  # Agent Center: stuck-run inspection / force-reset (admin-only)
 app.include_router(agent_center_bd_router)  # Agent Center: BD external-merchant AI visibility report
 app.include_router(merchant_audit_router)  # Merchant self-service AI Commerce Readiness audit (legacy synchronous)
+app.include_router(brand_claim_router)  # P1: brand claim write path (claim -> verify -> brand_direct), merchant-scoped
 app.include_router(audit_runs_router)  # P2.3: async audit_runs lifecycle (POST/GET/cancel/list at /api/audits)
 
 # Operational endpoint: report APScheduler health (running? jobs registered?).
