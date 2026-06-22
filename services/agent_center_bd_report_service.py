@@ -2519,9 +2519,11 @@ def compute_content_richness_score(sku_ctx: Dict[str, Any]) -> Tuple[int, Dict[s
         safety_missing = None
     _add_bucket(breakdown, missing, "safety_claims", safety_points, 10, safety_reason, missing=safety_missing)
     # NON-SCORING evidence signal (points unchanged): annotate the safety_claims
-    # bucket with how much citable evidence the product carries, so merchants + agents
-    # see third-party backing depth without inflating the 100-pt scale. Rides the
-    # bucket's merchant-facing `reason` string + a structured sub-field.
+    # bucket with how much citable evidence the product carries, recording third-party
+    # backing depth in the stored breakdown for agent/analytics consumers without
+    # inflating the 100-pt scale. NOTE: this lives inside `breakdown`, which
+    # _strip_score_breakdowns removes from the MERCHANT-facing payload — merchants see
+    # evidence depth in the intake panel instead; this is the stored/agent surface.
     ev_count = int(sku_ctx.get("substantiated_evidence_count") or 0)
     tp_sources = int(sku_ctx.get("third_party_evidence_sources") or 0)
     if ev_count:
@@ -4238,11 +4240,17 @@ async def load_sku_context(sku_key: str, merchant_id: str) -> Dict[str, Any]:
     #   (1) has_substantiated_evidence — the boolean that feeds the existing 10-pt
     #       "Substantiated claims" bucket via _has_substantiation (reusing that
     #       weight, not inventing one).
-    #   (2) a NON-SCORING "backed by N third-party sources" signal surfaced in the
-    #       content_richness breakdown (informs merchants + agents about citable
-    #       evidence depth WITHOUT inflating or redistributing the 100-pt scale).
+    #   (2) a NON-SCORING "backed by N third-party sources" signal annotated onto the
+    #       content_richness breakdown — recorded in the stored report_jsonb and
+    #       available to agent/analytics consumers (it does NOT survive
+    #       _strip_score_breakdowns into the merchant-facing payload; merchants see
+    #       evidence depth directly in the intake panel). It never inflates or
+    #       redistributes the 100-pt scale.
     # Best-effort: absent table / non-Postgres / parse error → no evidence, no signal
     # (the scoring is unaffected). NULL merchant_id rows (web-crawl writes) count too.
+    # geo_code pinned to 'default' to match the serve model + the canonical readers
+    # (fetch_product_evidence_row / fetch_product_evidence_for_keys); the PK is
+    # (product_key, geo_code), so an unpinned LIMIT 1 would read an arbitrary geo.
     has_substantiated_evidence = False
     substantiated_evidence_count = 0
     third_party_evidence_sources = 0
@@ -4252,6 +4260,7 @@ async def load_sku_context(sku_key: str, merchant_id: str) -> Dict[str, Any]:
             SELECT claims
               FROM product_evidence
              WHERE product_key = :product_key
+               AND geo_code = 'default'
                AND (merchant_id = :merchant_id OR merchant_id IS NULL)
              LIMIT 1
             """,

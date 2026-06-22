@@ -353,27 +353,36 @@ def test_general_evidence_lifts_safety_claims_bucket():
 
 
 def test_evidence_signal_is_non_scoring():
-    # The "backed by N third-party sources" signal annotates the safety_claims
-    # bucket WITHOUT changing its points (no scale inflation / redistribution).
+    # The signal annotates the safety_claims bucket WITHOUT changing its points. To
+    # prove that meaningfully (not just "10 capped at 10"), use a ctx whose
+    # safety_claims is BELOW max — claims present + UNsubstantiated → 5/10 — and add
+    # ONLY the signal fields (not has_substantiated_evidence). The bucket must STAY 5
+    # while the annotation appears.
     from services.agent_center_bd_report_service import compute_content_richness_score
 
-    base = _base_sku_ctx()
-    score_before, bd_before = compute_content_richness_score(base)
+    def _unsubstantiated_ctx():
+        c = _base_sku_ctx()
+        c["product"]["description"] = "Clinically tested anti-aging serum for acne-prone skin. " * 4
+        c["product"]["product_payload"] = {"ingredients": ["niacinamide"]}
+        c["beauty_product_profile"] = {}
+        c["product_enrichment"] = {"bullet_points": ["a", "b", "c"]}
+        return c
 
-    ctx = _base_sku_ctx()
+    score_before, bd_before = compute_content_richness_score(_unsubstantiated_ctx())
+    assert bd_before["safety_claims"]["points"] == 5
+    assert "evidence_signal" not in bd_before["safety_claims"]
+
+    ctx = _unsubstantiated_ctx()
     ctx["substantiated_evidence_count"] = 3
     ctx["third_party_evidence_sources"] = 2
     score_after, bd_after = compute_content_richness_score(ctx)
 
-    # points + total score identical — purely informational
+    # points + total score identical — the signal is purely informational
+    assert bd_after["safety_claims"]["points"] == 5
     assert score_after == score_before
-    assert bd_after["safety_claims"]["points"] == bd_before["safety_claims"]["points"]
-    # structured signal + merchant-facing reason annotation present
-    sig = bd_after["safety_claims"]["evidence_signal"]
-    assert sig == {"substantiated_claims": 3, "third_party_sources": 2}
+    # structured signal + reason annotation present
+    assert bd_after["safety_claims"]["evidence_signal"] == {"substantiated_claims": 3, "third_party_sources": 2}
     assert "backed by 2 third-party sources" in bd_after["safety_claims"]["reason"]
-    # absent when there's no evidence
-    assert "evidence_signal" not in bd_before["safety_claims"]
 
 
 def test_evidence_signal_singular_phrasing_and_count_only():
