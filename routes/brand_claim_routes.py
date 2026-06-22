@@ -52,9 +52,12 @@ async def start_claim(
     method = (body.method or "dns").strip().lower()
     if method not in _VALID_METHODS:
         raise HTTPException(status_code=422, detail=f"unsupported claim method: {method}")
-    if method == "dns" and not (body.brand_domain or "").strip():
+    # B4: dns verification requires a well-formed public hostname (rejects empty,
+    # internal names, IPs, malformed input before we ever resolve TXT on it).
+    if method == "dns" and not svc.is_valid_public_hostname(body.brand_domain):
         raise HTTPException(
-            status_code=422, detail="brand_domain is required for dns verification"
+            status_code=422,
+            detail="brand_domain must be a valid public hostname for dns verification",
         )
     result = await svc.start_brand_claim(
         merchant_id=merchant_id,

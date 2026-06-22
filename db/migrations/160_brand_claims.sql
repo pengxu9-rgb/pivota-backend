@@ -34,4 +34,12 @@ CREATE INDEX IF NOT EXISTS idx_brand_claims_merchant
 CREATE INDEX IF NOT EXISTS idx_brand_claims_status
   ON brand_claims (verification_status, claim_method);
 
+-- B3: at most one PENDING claim per (merchant, brand_domain) — prevents
+-- pending-claim spam + ambiguity (multiple live tokens for one domain). NULL
+-- brand_domain (non-dns methods) rows are exempt (Postgres treats NULLs as
+-- distinct in a unique index).
+CREATE UNIQUE INDEX IF NOT EXISTS ux_brand_claims_pending
+  ON brand_claims (merchant_id, brand_domain)
+  WHERE verification_status = 'pending';
+
 COMMIT;

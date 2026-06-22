@@ -17,12 +17,14 @@ are unit-tested with no I/O; the DB-bound functions are best-effort.
 
 from __future__ import annotations
 
+import json
 import logging
+import re
 import secrets
 from typing import Any, Callable, Dict, Iterable, List, Optional
+from urllib.parse import urlparse
 
 from db import brand_claims as bc
-from db.catalog import catalog_merchants
 from db.database import database
 
 logger = logging.getLogger(__name__)
@@ -58,29 +60,113 @@ def dns_txt_proves_claim(expected_token: str, txt_records: Iterable[str]) -> boo
 
 
 # ---------------------------------------------------------------------------
+# Brand-identity binding (B1) + hostname validation (B4)
+# DNS control proves "I control this domain" — NOT "I am this brand". We only
+# flip brand_direct when the verified domain is also one Pivota already
+# associates with the merchant (its catalog source/canonical hosts or onboarding
+# store_url). Otherwise the claim is recorded but left for review.
+# ---------------------------------------------------------------------------
+_HOSTNAME_RE = re.compile(
+    r"^(?=.{1,253}$)([a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?\.)+[a-z]{2,}$"
+)
+
+
+def normalize_host(value: Optional[str]) -> str:
+    """Lowercase registrable host from a domain or URL: strip scheme, userinfo,
+    port, path, and a leading 'www.'."""
+    if not value or not isinstance(value, str):
+        return ""
+    v = value.strip().lower()
+    v = urlparse(v).netloc if "://" in v else v.split("/")[0]
+    v = v.split("@")[-1].split(":")[0]
+    return v[4:] if v.startswith("www.") else v
+
+
+def is_valid_public_hostname(value: Optional[str]) -> bool:
+    """B4: a well-formed public hostname (labels + a TLD). Rejects internal
+    names, IPs, and malformed input before we ever resolve TXT on it."""
+    host = normalize_host(value)
+    return bool(host) and len(host) <= 253 and bool(_HOSTNAME_RE.match(host))
+
+
+def host_matches_known(domain: Optional[str], known_hosts: Iterable[str]) -> bool:
+    """Pure: does the claimed domain match a known merchant host? Exact match or
+    same registrable org (sub.brand.com <-> brand.com)."""
+    d = normalize_host(domain)
+    if not d:
+        return False
+    for kh in known_hosts:
+        k = normalize_host(kh)
+        if k and (d == k or d.endswith("." + k) or k.endswith("." + d)):
+            return True
+    return False
+
+
+async def merchant_owned_domains(merchant_id: str) -> set:
+    """Best-effort set of hosts Pivota already associates with this merchant:
+    onboarding store_url/website + catalog product source/canonical hosts. Does
+    NOT include pivota_canonical_url (that's Pivota's host, not the brand's)."""
+    hosts: set = set()
+    if not merchant_id:
+        return hosts
+    try:
+        from db.merchant_onboarding import get_merchant_onboarding
+
+        ob = await get_merchant_onboarding(merchant_id) or {}
+        for key in ("store_url", "website"):
+            h = normalize_host(ob.get(key))
+            if h:
+                hosts.add(h)
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("merchant_owned_domains: onboarding load failed: %s", str(exc)[:200])
+    try:
+        rows = await database.fetch_all(
+            """
+            SELECT DISTINCT source_domain, canonical_url
+              FROM catalog_products
+             WHERE merchant_id = :merchant_id
+             LIMIT 500
+            """,
+            {"merchant_id": merchant_id},
+        )
+        for r in rows or []:
+            for key in ("source_domain", "canonical_url"):
+                h = normalize_host(r[key])
+                if h:
+                    hosts.add(h)
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("merchant_owned_domains: catalog load failed: %s", str(exc)[:200])
+    return hosts
+
+
+async def merchant_owns_domain(merchant_id: str, domain: str) -> bool:
+    """True iff `domain` is bound to the merchant's known brand identity."""
+    return host_matches_known(domain, await merchant_owned_domains(merchant_id))
+
+
+# ---------------------------------------------------------------------------
 # THE missing primitive: write the verified brand relationship
 # ---------------------------------------------------------------------------
 async def set_merchant_brand_direct(merchant_id: str) -> bool:
-    """Write metadata_json.brand_relationship='brand_direct' on catalog_merchants,
-    preserving existing metadata. Best-effort. This is the chokepoint that turns
-    a verified claim into decision-layer brand authority (read by
-    classify_offer_type)."""
+    """Set metadata_json.brand_relationship='brand_direct' on catalog_merchants
+    via an ATOMIC server-side JSONB merge (|| concat) — no read-modify-write, so
+    a concurrent writer to metadata_json can't be clobbered (B2). Best-effort.
+
+    CAST(:patch AS JSONB), NOT :patch::jsonb — the `::` cast-after-param form
+    breaks SQLAlchemy text() binding (guarded by the repo's meta-invariant test).
+    """
     if not merchant_id:
         return False
+    patch = json.dumps(brand_direct_metadata(None))  # {"brand_relationship": "brand_direct"}
     try:
-        row = await database.fetch_one(
-            catalog_merchants.select().where(
-                catalog_merchants.c.merchant_id == merchant_id
-            )
-        )
-        if not row:
-            logger.warning("set_merchant_brand_direct: merchant %s not found", merchant_id)
-            return False
-        existing = row["metadata_json"] if isinstance(row["metadata_json"], dict) else {}
         await database.execute(
-            catalog_merchants.update()
-            .where(catalog_merchants.c.merchant_id == merchant_id)
-            .values(metadata_json=brand_direct_metadata(existing))
+            """
+            UPDATE catalog_merchants
+               SET metadata_json = COALESCE(metadata_json, CAST('{}' AS JSONB))
+                                   || CAST(:patch AS JSONB)
+             WHERE merchant_id = :merchant_id
+            """,
+            {"patch": patch, "merchant_id": merchant_id},
         )
         return True
     except Exception as exc:  # noqa: BLE001
@@ -101,7 +187,23 @@ async def start_brand_claim(
     content_key: Optional[str] = None,
     user_id: Optional[str] = None,
 ) -> Dict[str, Any]:
-    """Begin a claim: issue a challenge token + record a pending claim row."""
+    """Begin a claim: issue a challenge token + record a pending claim row. B3:
+    reuse an existing pending claim for this (merchant, domain) rather than
+    spamming a new row (and colliding with the partial-unique index)."""
+    if brand_domain:
+        existing = await bc.get_pending_brand_claim(merchant_id, brand_domain)
+        if existing and existing.get("challenge_token"):
+            ex_method = existing.get("claim_method") or method
+            return {
+                "claim_id": existing["claim_id"],
+                "method": ex_method,
+                "challenge_token": existing["challenge_token"],
+                "instructions": _claim_instructions(
+                    ex_method, brand_domain, existing["challenge_token"]
+                ),
+                "reused": True,
+            }
+
     token = make_challenge_token()
     claim_id = await bc.insert_brand_claim(
         merchant_id=merchant_id,
@@ -111,28 +213,33 @@ async def start_brand_claim(
         challenge_token=token,
         created_by_user_id=user_id,
     )
-    instructions = (
-        f"Add a DNS TXT record to {brand_domain or 'your brand domain'} "
-        f"with value: {token}"
-        if method == "dns"
-        else f"Verification token: {token}"
-    )
     return {
         "claim_id": claim_id,
         "method": method,
         "challenge_token": token,
-        "instructions": instructions,
+        "instructions": _claim_instructions(method, brand_domain, token),
+        "reused": False,
     }
+
+
+def _claim_instructions(method: str, brand_domain: Optional[str], token: str) -> str:
+    if method == "dns":
+        return f"Add a DNS TXT record to {brand_domain or 'your brand domain'} with value: {token}"
+    return f"Verification token: {token}"
 
 
 async def verify_brand_claim(
     claim_id: str,
     *,
     txt_resolver: Optional[Callable[[str], List[str]]] = None,
+    owned_domain_check: Optional[Callable[[str, str], Any]] = None,
 ) -> Dict[str, Any]:
-    """Verify a pending claim. For DNS: resolve the brand_domain's TXT records and
-    check the challenge token; on success, write brand_relationship='brand_direct'
-    and mark the claim verified. Returns {status, brand_direct_set}."""
+    """Verify a pending claim. For DNS we resolve the brand_domain's TXT records
+    and check the challenge token. A match proves DOMAIN CONTROL — but
+    brand_direct means "verified as the brand," so we only flip the merchant when
+    the verified domain is also BOUND to the merchant's known brand identity
+    (B1). A domain-verified but unbound claim is NOT auto-granted — it returns
+    'domain_verified_unbound' for review. Returns {status, brand_direct_set}."""
     claim = await bc.get_brand_claim(claim_id)
     if not claim:
         return {"status": "not_found"}
@@ -140,27 +247,44 @@ async def verify_brand_claim(
         return {"status": "verified", "brand_direct_set": True}
 
     method = claim.get("claim_method")
-    token = claim.get("challenge_token") or ""
+    if method != "dns":
+        # email / amazon / shopify / manual: scaffolded for the next slice.
+        return {"status": "unsupported_method", "method": method}
 
-    if method == "dns":
-        domain = claim.get("brand_domain")
-        resolver = txt_resolver or _default_txt_resolver
-        try:
-            records = resolver(domain) if domain else []
-        except Exception as exc:  # noqa: BLE001
-            logger.warning(
-                "verify_brand_claim: TXT resolve failed for %s: %s",
-                domain, str(exc)[:200],
-            )
-            records = []
-        if dns_txt_proves_claim(token, records):
-            ok = await set_merchant_brand_direct(claim["merchant_id"])
-            await bc.mark_claim_verified(claim_id, proof_ref=f"dns:{domain}")
-            return {"status": "verified", "brand_direct_set": ok}
+    token = claim.get("challenge_token") or ""
+    domain = claim.get("brand_domain")
+    resolver = txt_resolver or _default_txt_resolver
+    try:
+        records = resolver(domain) if domain else []
+    except Exception as exc:  # noqa: BLE001
+        logger.warning(
+            "verify_brand_claim: TXT resolve failed for %s: %s", domain, str(exc)[:200]
+        )
+        records = []
+    if not dns_txt_proves_claim(token, records):
         return {"status": "pending", "brand_direct_set": False, "reason": "txt_not_found"}
 
-    # email / amazon / shopify / manual: scaffolded for the next slice.
-    return {"status": "unsupported_method", "method": method}
+    # Domain control proven. B1: brand_direct requires brand-identity binding —
+    # the verified domain must be one Pivota already associates with this merchant.
+    check = owned_domain_check or merchant_owns_domain
+    try:
+        bound = bool(await check(claim["merchant_id"], domain)) if domain else False
+    except Exception as exc:  # noqa: BLE001
+        logger.warning(
+            "verify_brand_claim: ownership check failed for %s: %s", domain, str(exc)[:200]
+        )
+        bound = False
+    if not bound:
+        # Record the proof, but DO NOT grant brand_direct on an unbound domain.
+        return {
+            "status": "domain_verified_unbound",
+            "brand_direct_set": False,
+            "reason": "brand_domain is not associated with this merchant; needs review before brand_direct",
+        }
+
+    ok = await set_merchant_brand_direct(claim["merchant_id"])
+    await bc.mark_claim_verified(claim_id, proof_ref=f"dns:{domain}")
+    return {"status": "verified", "brand_direct_set": ok}
 
 
 def _default_txt_resolver(domain: str) -> List[str]:

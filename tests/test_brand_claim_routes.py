@@ -97,3 +97,79 @@ def test_verify_happy_path(monkeypatch):
     body = r.json()
     assert body["status"] == "verified"
     assert body["brand_direct_set"] is True
+
+
+def test_start_claim_rejects_invalid_hostname(monkeypatch):
+    # B4: malformed / internal brand_domain rejected before any TXT resolution.
+    r = _client().post("/api/brands/claim", json={"method": "dns", "brand_domain": "localhost"})
+    assert r.status_code == 422
+
+
+def _pending_dns_claim(token):
+    async def _get(claim_id):
+        return {
+            "claim_id": claim_id,
+            "merchant_id": "merch_self",
+            "claim_method": "dns",
+            "brand_domain": "anua.com",
+            "challenge_token": token,
+            "verification_status": "pending",
+        }
+
+    return _get
+
+
+def test_verify_bound_domain_flips_brand_direct(monkeypatch):
+    # B1: domain control proven AND domain bound to merchant -> brand_direct set.
+    token = "pivota-verify=tok"
+    flipped = {"called": False}
+    monkeypatch.setattr(bc, "get_brand_claim", _pending_dns_claim(token))
+    monkeypatch.setattr(svc, "_default_txt_resolver", lambda d: [token])
+
+    async def _owns(mid, dom):
+        return True
+
+    monkeypatch.setattr(svc, "merchant_owns_domain", _owns)
+
+    async def _flip(mid):
+        flipped["called"] = True
+        return True
+
+    monkeypatch.setattr(svc, "set_merchant_brand_direct", _flip)
+
+    async def _mark(cid, **kw):
+        return True
+
+    monkeypatch.setattr(bc, "mark_claim_verified", _mark)
+
+    r = _client(merchant="merch_self").post("/api/brands/claim/verify", json={"claim_id": "c1"})
+    assert r.status_code == 200
+    assert r.json()["status"] == "verified"
+    assert r.json()["brand_direct_set"] is True
+    assert flipped["called"] is True
+
+
+def test_verify_unbound_domain_does_not_flip(monkeypatch):
+    # B1 forgery guard: domain control proven but domain NOT bound to merchant
+    # -> NO brand_direct flip; status is domain_verified_unbound.
+    token = "pivota-verify=tok"
+    flipped = {"called": False}
+    monkeypatch.setattr(bc, "get_brand_claim", _pending_dns_claim(token))
+    monkeypatch.setattr(svc, "_default_txt_resolver", lambda d: [token])
+
+    async def _owns(mid, dom):
+        return False
+
+    monkeypatch.setattr(svc, "merchant_owns_domain", _owns)
+
+    async def _flip(mid):
+        flipped["called"] = True
+        return True
+
+    monkeypatch.setattr(svc, "set_merchant_brand_direct", _flip)
+
+    r = _client(merchant="merch_self").post("/api/brands/claim/verify", json={"claim_id": "c1"})
+    assert r.status_code == 200
+    assert r.json()["status"] == "domain_verified_unbound"
+    assert r.json()["brand_direct_set"] is False
+    assert flipped["called"] is False

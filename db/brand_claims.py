@@ -70,6 +70,10 @@ _DDL_STATEMENTS = [
     "ON brand_claims (merchant_id, created_at DESC);",
     "CREATE INDEX IF NOT EXISTS idx_brand_claims_status "
     "ON brand_claims (verification_status, claim_method);",
+    # B3: at most one pending claim per (merchant, brand_domain).
+    "CREATE UNIQUE INDEX IF NOT EXISTS ux_brand_claims_pending "
+    "ON brand_claims (merchant_id, brand_domain) "
+    "WHERE verification_status = 'pending';",
 ]
 
 _ddl_ready = False
@@ -153,3 +157,25 @@ async def mark_claim_verified(claim_id: str, *, proof_ref: Optional[str] = None)
     except Exception as exc:  # noqa: BLE001
         logger.warning("mark_claim_verified failed: %s", str(exc)[:200])
         return False
+
+
+async def get_pending_brand_claim(
+    merchant_id: str, brand_domain: Optional[str]
+) -> Optional[Dict[str, Any]]:
+    """Return the existing PENDING claim for (merchant_id, brand_domain), if any
+    — so start_brand_claim reuses it instead of spamming a new pending row (B3)."""
+    await ensure_brand_claims_table()
+    if not merchant_id or not brand_domain:
+        return None
+    try:
+        row = await database.fetch_one(
+            brand_claims.select().where(
+                brand_claims.c.merchant_id == merchant_id,
+                brand_claims.c.brand_domain == brand_domain,
+                brand_claims.c.verification_status == STATUS_PENDING,
+            )
+        )
+        return dict(row) if row else None
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("get_pending_brand_claim failed: %s", str(exc)[:200])
+        return None
