@@ -21,6 +21,16 @@ async def test_publish_non_merchant_403():
 
 
 @pytest.mark.asyncio
+async def test_publish_missing_merchant_id_400():
+    import routes.merchant_products as module
+    with pytest.raises(HTTPException) as exc:
+        await module.publish_store_pdp(
+            platform="shopify", platform_product_id="p1",
+            current_user={"role": "merchant"})  # no merchant_id
+    assert exc.value.status_code == 400
+
+
+@pytest.mark.asyncio
 async def test_publish_no_copy_when_no_enrichment(monkeypatch):
     import routes.merchant_products as module
     monkeypatch.setattr(module, "get_enrichment", AsyncMock(return_value=None))
