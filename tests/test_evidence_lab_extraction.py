@@ -55,10 +55,24 @@ def test_drug_verb_blocked() -> None:
     assert not ee._is_claim_safe("Helps diagnose skin conditions")
 
 
+def test_therapeutic_verbs_blocked() -> None:
+    # Broadened screen: common therapeutic verbs + condition variants now drop.
+    for txt in (
+        "Treats high blood pressure",
+        "Relieves arthritic pain",
+        "Heals wounds overnight",
+        "Treats the flu",
+        "Antibacterial against infection",
+    ):
+        assert not ee._is_claim_safe(txt), txt
+
+
 def test_drug_verb_substring_not_falsely_blocked() -> None:
     # "secure"/"accurate" contain "cure" as a substring but aren't drug claims —
-    # the screen is word-boundary aware.
+    # the screen is word-boundary aware. Ordinary cosmetic phrasing also survives.
     assert ee._is_claim_safe("Accurate, secure batch testing on every lot")
+    assert ee._is_claim_safe("Prevents moisture loss for 24 hours")
+    assert ee._is_claim_safe("Reduces the appearance of fine lines")
 
 
 # --- _parse_candidates --------------------------------------------------------

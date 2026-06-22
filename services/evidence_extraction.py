@@ -12,9 +12,11 @@ service turns it into CANDIDATE claims for the merchant to review. It is the
 
 The LLM never self-substantiates: candidates come back unverified and only become
 citable when the merchant confirms one against the stored artifact. Extraction is
-deliberately conservative — it returns only findings the report explicitly states
-and drops anything that reads like a disease / drug claim (those need the
-category cosmetic-vs-drug modules in services.claim_safety, not an LLM guess).
+deliberately conservative — it returns only findings the report explicitly states.
+A COARSE, best-effort keyword screen then drops candidates that read like an obvious
+disease / drug claim (it is not exhaustive — defense in depth alongside the LLM
+prompt; the authoritative cosmetic-vs-drug rules live with the category modules in
+services.claim_safety, and substantiation still requires a separate merchant confirm).
 
 Pure-ish: the PDF text extraction + JSON parsing + safety screen are pure and
 unit-tested; only extract_lab_claims touches the network (via llm_synthesis).
@@ -47,10 +49,18 @@ _PROVIDER_PREFERENCE = ("deepseek", "openai", "anthropic")
 # modules; this is the intake-time guardrail.
 _DISEASE_TERMS = (
     "eczema", "psoriasis", "dermatitis", "rosacea", "acne", "cancer", "tumor",
-    "covid", "influenza", "infection", "disease", "illness", "diabetes",
-    "arthritis", "hypertension", "alzheimer", "depression",
+    "covid", "influenza", "flu", "infection", "disease", "illness", "diabetes",
+    "arthritis", "arthritic", "hypertension", "blood pressure", "alzheimer",
+    "depression", "anxiety", "fungal", "fungus", "wound", "ulcer", "asthma",
 )
-_DRUG_VERBS = ("cure", "cures", "cured", "diagnose", "diagnoses", "heal disease")
+# Therapeutic verbs that turn a measurement into a drug claim. word-boundary
+# matched (so "secure"/"accurate"/"treatment-free" don't trip), with "treatment of"
+# caught as a phrase.
+_DRUG_VERBS = (
+    "cure", "cures", "cured", "diagnose", "diagnoses", "treat", "treats", "treated",
+    "relieve", "relieves", "relieved", "heal", "heals", "healed", "alleviate",
+    "alleviates", "remedy", "remedies", "antibacterial", "antifungal", "antiviral",
+)
 
 
 class EvidenceExtractionError(RuntimeError):
