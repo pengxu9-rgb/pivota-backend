@@ -6397,6 +6397,7 @@ def build_authority_map(
                     "evidence_excerpt": None,
                     "competitors_named": [],
                     "_queries": set(),
+                    "_observations": set(),
                 })
                 if query_class == QUERY_CLASS_CATEGORY:
                     row["cited_on_category_query"] = True
@@ -6409,6 +6410,10 @@ def build_authority_map(
                 if query not in row["_queries"]:
                     row["_queries"].add(query)
                     row["prompts_cited_count"] += 1
+                # P0.2: retain per-(query, provider) linkage for
+                # citation_observations (otherwise lost at the pop below).
+                if query and provider:
+                    row["_observations"].add((query, query_class, provider))
                 if provider not in row["providers"]:
                     row["providers"].append(provider)
                 row["provider_counts"][provider] = (
@@ -6466,6 +6471,15 @@ def build_authority_map(
         authority_hosts = []
         for row in host_rows.values():
             row.pop("_queries", None)
+            # P0.2: convert the retained per-(query, provider) observations
+            # into a clean, JSON-safe field the deposit builder reads into
+            # citation_observations. Replaces the discard that killed the
+            # per-query citation matrix.
+            _obs = row.pop("_observations", set())
+            row["query_observations"] = [
+                {"query": q, "query_class": qc, "provider": p}
+                for (q, qc, p) in sorted(_obs)
+            ]
             row["providers"] = sorted(row.get("providers") or [])
             row["provider_counts"] = dict(sorted((row.get("provider_counts") or {}).items()))
             authority_hosts.append(row)
