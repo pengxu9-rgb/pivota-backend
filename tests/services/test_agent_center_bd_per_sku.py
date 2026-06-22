@@ -318,6 +318,92 @@ def test_content_richness_score_good_partial_missing():
     assert breakdown["safety_claims"]["points"] == 0
 
 
+def test_has_substantiation_via_general_evidence_flag():
+    # Phase 2b: the plumbed has_substantiated_evidence flag (general
+    # product_evidence store) substantiates on its own — even with an otherwise
+    # empty product/ctx — exactly like the existing payload/profile signals.
+    from services.agent_center_bd_report_service import _has_substantiation
+
+    assert _has_substantiation({}, {"has_substantiated_evidence": True}) is True
+    assert _has_substantiation({}, {}) is False
+    assert _has_substantiation({}, {"has_substantiated_evidence": False}) is False
+    # Existing signals still substantiate independently (no regression).
+    assert _has_substantiation({"product_payload": {"substantiation": {"study": "x"}}}, {}) is True
+
+
+def test_general_evidence_lifts_safety_claims_bucket():
+    # The product behavior the wiring buys: a merchant making claims it can't yet
+    # back scores 5/10 on "Substantiated claims"; confirming substantiated evidence
+    # lifts that bucket to the full 10 (+5) — reusing the existing weight.
+    from services.agent_center_bd_report_service import compute_content_richness_score
+
+    ctx = _base_sku_ctx()
+    # Claims PRESENT (markers in copy) but UNSUBSTANTIATED (strip every signal).
+    ctx["product"]["description"] = "Clinically tested anti-aging serum for acne-prone skin. " * 4
+    ctx["product"]["product_payload"] = {"ingredients": ["niacinamide"]}  # no substantiation/watchouts
+    ctx["beauty_product_profile"] = {}
+    ctx["product_enrichment"] = {"bullet_points": ["a", "b", "c"]}  # no blocking llm_safety_flags
+
+    _, breakdown = compute_content_richness_score(ctx)
+    assert breakdown["safety_claims"]["points"] == 5  # docked: claims w/o substantiation
+
+    ctx["has_substantiated_evidence"] = True
+    _, breakdown2 = compute_content_richness_score(ctx)
+    assert breakdown2["safety_claims"]["points"] == 10  # full once substantiated
+
+
+def test_evidence_signal_is_non_scoring():
+    # The signal annotates the safety_claims bucket WITHOUT changing its points. To
+    # prove that meaningfully (not just "10 capped at 10"), use a ctx whose
+    # safety_claims is BELOW max — claims present + UNsubstantiated → 5/10 — and add
+    # ONLY the signal fields (not has_substantiated_evidence). The bucket must STAY 5
+    # while the annotation appears.
+    from services.agent_center_bd_report_service import compute_content_richness_score
+
+    def _unsubstantiated_ctx():
+        c = _base_sku_ctx()
+        c["product"]["description"] = "Clinically tested anti-aging serum for acne-prone skin. " * 4
+        c["product"]["product_payload"] = {"ingredients": ["niacinamide"]}
+        c["beauty_product_profile"] = {}
+        c["product_enrichment"] = {"bullet_points": ["a", "b", "c"]}
+        return c
+
+    score_before, bd_before = compute_content_richness_score(_unsubstantiated_ctx())
+    assert bd_before["safety_claims"]["points"] == 5
+    assert "evidence_signal" not in bd_before["safety_claims"]
+
+    ctx = _unsubstantiated_ctx()
+    ctx["substantiated_evidence_count"] = 3
+    ctx["third_party_evidence_sources"] = 2
+    score_after, bd_after = compute_content_richness_score(ctx)
+
+    # points + total score identical — the signal is purely informational
+    assert bd_after["safety_claims"]["points"] == 5
+    assert score_after == score_before
+    # structured signal + reason annotation present
+    assert bd_after["safety_claims"]["evidence_signal"] == {"substantiated_claims": 3, "third_party_sources": 2}
+    assert "backed by 2 third-party sources" in bd_after["safety_claims"]["reason"]
+
+
+def test_evidence_signal_singular_phrasing_and_count_only():
+    from services.agent_center_bd_report_service import compute_content_richness_score
+
+    ctx = _base_sku_ctx()
+    ctx["substantiated_evidence_count"] = 1
+    ctx["third_party_evidence_sources"] = 1
+    _, bd = compute_content_richness_score(ctx)
+    assert "backed by 1 third-party source" in bd["safety_claims"]["reason"]
+
+    # substantiated claims but none third-party (e.g. merchant lab only): signal
+    # present, no third-party phrasing appended.
+    ctx2 = _base_sku_ctx()
+    ctx2["substantiated_evidence_count"] = 2
+    ctx2["third_party_evidence_sources"] = 0
+    _, bd2 = compute_content_richness_score(ctx2)
+    assert bd2["safety_claims"]["evidence_signal"] == {"substantiated_claims": 2, "third_party_sources": 0}
+    assert "third-party" not in bd2["safety_claims"]["reason"]
+
+
 def test_content_richness_scores_raw_pdp_when_pivota_enrichment_absent():
     """Audit regression: a content-rich brand PDP (long description, image,
     specs, priced offer) with NO Pivota enrichment must NOT be scored as thin.
