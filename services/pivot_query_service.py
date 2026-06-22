@@ -554,6 +554,39 @@ def _is_official_brand_source(
     return bool(src and canon and src == canon)
 
 
+def _brand_direct_reader_enabled() -> bool:
+    """P1 flag: when ON, an internal_merchant offer whose SELLER merchant is a
+    verified brand (metadata_json.brand_relationship='brand_direct', set by the
+    claim flow) is classified offer_type='brand_direct'. Default OFF — ships dark,
+    enabled per-env after canary. Does NOT affect ranking (offer_type is
+    decision/display metadata, never a rank signal)."""
+    return os.getenv("ENABLE_BRAND_DIRECT_OFFER_TYPE", "").strip().lower() in {
+        "1", "true", "yes", "on",
+    }
+
+
+def _resolve_offer_type(
+    stored_offer_type: Optional[str],
+    catalog_track: Optional[str],
+    brand_relationship: Optional[str],
+    *,
+    brand_direct_enabled: bool,
+) -> Optional[str]:
+    """Resolve an offer's type. Stored value wins. Else derive from track:
+    external_referral -> retailer; internal_merchant -> brand_direct ONLY when
+    the seller is a verified brand (classify_offer_type enforces the
+    brand_relationship check) AND the reader flag is on — else None (never
+    assumed). This is the P1 'wire the reader' step that makes a verified
+    brand_direct claim load-bearing."""
+    if stored_offer_type is not None:
+        return stored_offer_type
+    if catalog_track == "external_referral":
+        return classify_offer_type(catalog_track)
+    if brand_direct_enabled and catalog_track == "internal_merchant":
+        return classify_offer_type(catalog_track, brand_relationship)
+    return None
+
+
 def _build_canonical_offer_node(
     row: Dict[str, Any],
     incentives: List[IncentiveNode],
@@ -582,9 +615,12 @@ def _build_canonical_offer_node(
     is_first_party = row.get("offer_is_first_party")
     if is_first_party is None:
         is_first_party = is_first_party_track(catalog_track)
-    offer_type = row.get("offer_offer_type")
-    if offer_type is None and catalog_track == "external_referral":
-        offer_type = classify_offer_type(catalog_track)
+    offer_type = _resolve_offer_type(
+        row.get("offer_offer_type"),
+        catalog_track,
+        row.get("brand_relationship"),
+        brand_direct_enabled=_brand_direct_reader_enabled(),
+    )
     # official_source: the offer is served from the brand's OWN official domain
     # (offer source_domain == the product's canonical PDP host). This is the
     # authenticity/trust signal for official-brand-DTC seeds that are correctly
@@ -873,6 +909,10 @@ async def _fetch_canonical_search_rows(
             o.source_domain AS offer_source_domain,
             o.why_buy_direct AS offer_why_buy_direct,
             o.offer_payload,
+            -- P1: the SELLER merchant's verified brand relationship, so the
+            -- offer-type reader can classify brand_direct (flag-gated; NOT a
+            -- rank signal). NULL for unclaimed merchants -> offer_type stays None.
+            bm.metadata_json->>'brand_relationship' AS brand_relationship,
             -- P0.3 neutrality: NO first-party / ownership boost. A first-party
             -- offer must not outrank an equally-relevant third-party offer for
             -- the same product (was: + CASE WHEN catalog_track='internal_merchant'
@@ -884,6 +924,8 @@ async def _fetch_canonical_search_rows(
         JOIN catalog_offers o
           ON o.sku_key = c.sku_key
          AND o.suppressed_at IS NULL
+        LEFT JOIN catalog_merchants bm
+          ON bm.merchant_id = o.merchant_id
         ORDER BY rank_score DESC, c.product_updated_at DESC, o.updated_at DESC
         LIMIT :row_limit
         """,
