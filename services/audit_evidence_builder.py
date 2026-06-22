@@ -74,6 +74,7 @@ _VALID_LEVERS = frozenset({
 
 def extract_evidence_items(
     brand_report: Dict[str, Any],
+    content_key_map: Optional[Dict[str, Any]] = None,
 ) -> List[Dict[str, Any]]:
     """Return a list of evidence-item dicts ready for
     insert_evidence_item. Each dict has:
@@ -178,6 +179,18 @@ def extract_evidence_items(
                 "product_key": product_key,
                 "confidence": CONFIDENCE_EVIDENCE_HIGH,
             })
+
+    # P0.2: stamp the canonical entity key on every evidence dict that maps to
+    # a depositable (resolved) content_key. Section-agnostic final pass so new
+    # evidence sections inherit it for free. Unresolved / unmapped product_keys
+    # leave content_key unset — no regression, and no cross-contamination on
+    # the deliberately non-unique content_key (migration 083).
+    if content_key_map:
+        for ev in out:
+            pk = ev.get("product_key")
+            resolved = content_key_map.get(pk) if pk else None
+            if resolved is not None and getattr(resolved, "is_depositable", False):
+                ev["content_key"] = resolved.content_key
 
     return out
 
@@ -604,6 +617,7 @@ async def persist_canonical_evidence(
                 evidence_type=ev["evidence_type"],
                 payload=ev["payload"],
                 product_key=ev.get("product_key"),
+                content_key=ev.get("content_key"),
                 confidence=ev.get("confidence"),
                 idempotency_key=idem_key,
             )
