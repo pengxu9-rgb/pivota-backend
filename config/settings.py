@@ -129,9 +129,15 @@ class Settings(BaseSettings):
     shopify_headless_redirect_uri: Optional[str] = os.getenv(
         "SHOPIFY_HEADLESS_REDIRECT_URI", os.getenv("SHOPIFY_REDIRECT_URI")
     )
+    # NOTE: write_products is for the content-writeback rung (Pivota writes the
+    # AI-ready copy to an APP-OWNED metafield, never body_html). It lives ONLY on
+    # the headless/custom app (App B) — the public App Store app's scopes stay
+    # strictly read-only (shopify_appstore_scopes above) so its automated review
+    # is unaffected. Adding write_products here triggers a merchant re-consent
+    # (incremental authorization) for App B installs, not a Shopify re-review.
     shopify_headless_scopes: str = os.getenv(
         "SHOPIFY_HEADLESS_SCOPES",
-        "read_products,read_orders,read_fulfillments,read_discounts,write_webhooks,write_orders",
+        "read_products,read_orders,read_fulfillments,read_discounts,write_webhooks,write_orders,write_products",
     )
 
     # Wix
