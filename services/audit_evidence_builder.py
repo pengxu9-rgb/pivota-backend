@@ -195,6 +195,72 @@ def extract_evidence_items(
     return out
 
 
+def extract_citation_observations(
+    brand_report: Dict[str, Any],
+    content_key_map: Optional[Dict[str, Any]] = None,
+) -> List[Dict[str, Any]]:
+    """P0.2 — flatten the authority map into per-(content_key, host, query,
+    provider) citation observations. This is the cross-channel matrix that
+    build_authority_map otherwise drops into report_jsonb.
+
+    Gating: with a content_key_map, only DEPOSITABLE products emit, using the
+    RESOLVED content_key + basis (so unresolved/non-unique keys never
+    accrete). Without a map (pure tests), the sku-entry's own content_key is
+    used with basis 'unknown'. Rows missing a query or provider are skipped
+    (both are NOT NULL in citation_observations).
+    """
+    out: List[Dict[str, Any]] = []
+    if not isinstance(brand_report, dict):
+        return out
+    authority = brand_report.get("authority_map")
+    if not isinstance(authority, dict):
+        return out
+
+    for sku in (authority.get("skus") or []):
+        if not isinstance(sku, dict):
+            continue
+        product_key = sku.get("product_key")
+        content_key = sku.get("content_key")
+        basis = "unknown"
+        if content_key_map is not None:
+            resolved = content_key_map.get(product_key) if product_key else None
+            if resolved is None or not getattr(resolved, "is_depositable", False):
+                continue
+            content_key = resolved.content_key
+            basis = resolved.basis
+        if not content_key:
+            continue
+
+        for host in (sku.get("authority_hosts") or []):
+            if not isinstance(host, dict):
+                continue
+            evidence_urls = host.get("evidence_urls") or []
+            evidence_url = evidence_urls[0] if evidence_urls else None
+            for obs in (host.get("query_observations") or []):
+                if not isinstance(obs, dict):
+                    continue
+                q = obs.get("query")
+                provider = obs.get("provider")
+                if not q or not provider:
+                    continue
+                out.append({
+                    "content_key": content_key,
+                    "product_key": product_key,
+                    "content_key_basis": basis,
+                    "provider": provider,
+                    "query": q,
+                    "query_class": obs.get("query_class"),
+                    "axis": obs.get("axis"),
+                    "cited_host": host.get("host"),
+                    "host_type": host.get("host_type"),
+                    "citation_role": host.get("citation_role"),
+                    "first_party": host.get("first_party"),
+                    "is_competitor": host.get("is_competitor"),
+                    "evidence_url": evidence_url,
+                })
+    return out
+
+
 # =====================================================================
 # Finding extraction
 # =====================================================================
@@ -669,7 +735,8 @@ async def persist_canonical_evidence(
     """
     from db.audit_evidence import (
         compute_canonical_idempotency_key,
-        insert_action, insert_evidence_item, insert_finding,
+        insert_action, insert_citation_observation,
+        insert_evidence_item, insert_finding,
     )
 
     summary = {
@@ -817,6 +884,43 @@ async def persist_canonical_evidence(
                 summary["actions_failed"] += 1
         else:
             summary["actions_inserted"] += 1
+
+    # P0.2: citation_observations — the cross-channel matrix, content_key-keyed.
+    # Best-effort, idempotent; only depositable products emit (gated inside
+    # extract_citation_observations via content_key_map).
+    summary["citation_observations_inserted"] = 0
+    summary["citation_observations_skipped"] = 0
+    for obs in extract_citation_observations(brand_report, content_key_map):
+        idem_key = compute_canonical_idempotency_key(
+            audit_run_id=audit_run_id,
+            item_type="citation_observation",
+            item_signature="{}|{}|{}|{}".format(
+                obs.get("content_key"), obs.get("provider"),
+                obs.get("query"), obs.get("cited_host"),
+            ),
+        )
+        new_obs_id = await insert_citation_observation(
+            audit_run_id=audit_run_id,
+            merchant_id=merchant_id,
+            content_key=obs["content_key"],
+            product_key=obs.get("product_key"),
+            provider=obs["provider"],
+            query=obs["query"],
+            axis=obs.get("axis"),
+            query_class=obs.get("query_class"),
+            cited_host=obs.get("cited_host"),
+            host_type=obs.get("host_type"),
+            citation_role=obs.get("citation_role"),
+            first_party=obs.get("first_party"),
+            is_competitor=obs.get("is_competitor"),
+            evidence_url=obs.get("evidence_url"),
+            content_key_basis=obs.get("content_key_basis") or "unknown",
+            idempotency_key=idem_key,
+        )
+        if new_obs_id is None:
+            summary["citation_observations_skipped"] += 1
+        else:
+            summary["citation_observations_inserted"] += 1
 
     return summary
 
