@@ -32,6 +32,7 @@ from readiness.models import (
     OptimizationPlan,
     ProductQueueAppliedFilters,
     ProductQueuePage,
+    ProductQueueSegmentCounts,
     ProductQueueIssue,
     ProductReadinessQueueItem,
     QualityCoverageSummary,
@@ -1514,6 +1515,43 @@ def _queue_item_matches_issue_bucket(
     if any(_bucket_code_for_reason(issue.code) == normalized_bucket for issue in (item.top_issues or [])):
         return True
     return any(_bucket_code_for_reason(code) == normalized_bucket for code in (item.content_gap_codes or []))
+
+
+_VALID_QUEUE_SEGMENTS = {"all", "fix_here", "in_store", "other"}
+
+
+def _normalize_segment(value: Optional[str]) -> str:
+    normalized = str(value or "all").strip().lower()
+    return normalized if normalized in _VALID_QUEUE_SEGMENTS else "all"
+
+
+def _segment_for_queue_item(item: ProductReadinessQueueItem) -> str:
+    """Fix-location segment for a queue item.
+
+    Mirrors the frontend precedence in getProductActionLabel so the chip the
+    merchant clicks resolves to exactly one segment:
+    ``run_product_enrichment`` -> fix here, ``catalog_data`` -> in your store,
+    everything else -> other.
+    """
+    if item.recommended_action_type == "run_product_enrichment":
+        return "fix_here"
+    if item.fix_surface == "catalog_data":
+        return "in_store"
+    return "other"
+
+
+def _compute_segment_counts(
+    items: list[ProductReadinessQueueItem],
+) -> ProductQueueSegmentCounts:
+    counts = {"fix_here": 0, "in_store": 0, "other": 0}
+    for item in items:
+        counts[_segment_for_queue_item(item)] += 1
+    return ProductQueueSegmentCounts(
+        all=len(items),
+        fix_here=counts["fix_here"],
+        in_store=counts["in_store"],
+        other=counts["other"],
+    )
 
 
 def _filter_product_queue_items(
@@ -3005,14 +3043,16 @@ async def _render_readiness_optimization_payload(
     blocked_only: bool,
     low_quality_only: bool,
     sort_by: str,
+    segment: str = "all",
 ) -> MerchantReadinessOptimizationPayload:
     queue_mode = _normalize_queue_mode(queue_mode)
     page = _normalize_page(page)
     page_size = _normalize_page_size(page_size)
     push_status = _normalize_push_status(push_status)
     sort_by = _normalize_sort_by(sort_by)
+    segment = _normalize_segment(segment)
 
-    filtered_queue = _filter_product_queue_items(
+    base_filtered = _filter_product_queue_items(
         payload.product_queue,
         search=search,
         issue_bucket=issue_bucket,
@@ -3020,7 +3060,14 @@ async def _render_readiness_optimization_payload(
         blocked_only=blocked_only,
         low_quality_only=low_quality_only,
     )
-    filtered_queue = _sort_product_queue_items(filtered_queue, sort_by=sort_by)
+    # Counts are over the set matching every filter EXCEPT segment, so the chips
+    # show how the current view splits and stay stable as the merchant clicks one.
+    payload.queue_segment_counts = _compute_segment_counts(base_filtered)
+    if segment != "all":
+        base_filtered = [
+            item for item in base_filtered if _segment_for_queue_item(item) == segment
+        ]
+    filtered_queue = _sort_product_queue_items(base_filtered, sort_by=sort_by)
 
     applied_filters = ProductQueueAppliedFilters(
         search=_normalize_text(search) or None,
@@ -3029,6 +3076,7 @@ async def _render_readiness_optimization_payload(
         blocked_only=bool(blocked_only),
         low_quality_only=bool(low_quality_only),
         sort_by=sort_by,
+        segment=segment,
     )
 
     if queue_mode == "full":
@@ -3108,6 +3156,7 @@ async def build_readiness_optimization(
     blocked_only: bool = False,
     low_quality_only: bool = False,
     sort_by: str = "default",
+    segment: str = "all",
 ) -> MerchantReadinessOptimizationPayload:
     payload, _snapshot, aux_context = await get_readiness_optimization_context(
         merchant_id,
@@ -3126,6 +3175,7 @@ async def build_readiness_optimization(
         blocked_only=blocked_only,
         low_quality_only=low_quality_only,
         sort_by=sort_by,
+        segment=segment,
     )
 
 
