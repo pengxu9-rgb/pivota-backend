@@ -29,9 +29,11 @@ brand-alias map). Start simple; iterate from data.
 from __future__ import annotations
 
 import hashlib
+import os
 import re
 import unicodedata
-from typing import Optional
+from dataclasses import dataclass
+from typing import Mapping, Optional
 
 
 _KEY_PREFIX = "ck_"
@@ -162,3 +164,136 @@ def is_content_key(value: Optional[str]) -> bool:
         return False
     rest = value[len(_KEY_PREFIX):]
     return len(rest) == _KEY_HEX_LEN and all(c in "0123456789abcdef" for c in rest)
+
+
+# ---------------------------------------------------------------------------
+# P0.2 — deposit gate: which content_keys may receive an entity-scoped deposit.
+#
+# content_key is nullable + DELIBERATELY non-unique (db/migrations/083): a
+# no-GTIN SKU collides on brand+title alone, so two different physical products
+# can share one key. An audit that deposits citation_observations / claims /
+# offers against such a key cross-contaminates one brand's evidence onto
+# another's entity — and downstream lets the claim flow capture a competitor's
+# merged product. So before any entity-scoped deposit, the key must be
+# RESOLVED: GTIN-derived, high-confidence identity-resolved, or human-reviewed.
+# Unresolved subjects still record the audit run + report_jsonb (merchant /
+# product_key-scoped, no regression); they just don't accrete on the entity.
+# ---------------------------------------------------------------------------
+
+_DEPOSIT_MIN_CONFIDENCE_DEFAULT = 0.85
+
+# How a content_key earned the right to receive an entity-scoped deposit.
+DEPOSIT_BASIS_GTIN = "gtin"
+DEPOSIT_BASIS_IDENTITY = "identity_high_conf"
+DEPOSIT_BASIS_REVIEWED = "reviewed"
+DEPOSIT_BASIS_UNRESOLVED = "unresolved"
+
+
+def deposit_min_confidence() -> float:
+    """Identity-confidence threshold for the `identity_high_conf` basis.
+    Env-overridable via CONTENT_KEY_DEPOSIT_MIN_CONFIDENCE; conservative
+    default so we err toward NOT depositing on a shaky key."""
+    raw = os.getenv("CONTENT_KEY_DEPOSIT_MIN_CONFIDENCE")
+    if raw is None:
+        return _DEPOSIT_MIN_CONFIDENCE_DEFAULT
+    try:
+        return float(raw)
+    except (TypeError, ValueError):
+        return _DEPOSIT_MIN_CONFIDENCE_DEFAULT
+
+
+@dataclass(frozen=True)
+class ResolvedDepositKey:
+    """Result of the deposit gate. Callers MUST check `is_depositable` before
+    writing entity-scoped rows. `content_key` is returned even when unresolved
+    (for observability / tagging), but `is_depositable` is then False."""
+
+    content_key: Optional[str]
+    basis: str
+    confidence: float
+
+    @property
+    def is_depositable(self) -> bool:
+        return self.basis != DEPOSIT_BASIS_UNRESOLVED and bool(self.content_key)
+
+
+def resolve_deposit_content_key(
+    *,
+    brand: Optional[str] = None,
+    title: Optional[str] = None,
+    gtin: Optional[str] = None,
+    existing_content_key: Optional[str] = None,
+    identity_confidence: Optional[float] = None,
+    review_state: Optional[str] = None,
+    min_confidence: Optional[float] = None,
+) -> ResolvedDepositKey:
+    """Decide whether (and on which basis) an audit deposit may write
+    entity-scoped rows against a content_key.
+
+    Precedence, strongest first:
+      1. ``gtin``              — a real GTIN was folded into the key
+                                 (GS1-canonical; cross-merchant collision is
+                                 intended and correct).
+      2. ``identity_high_conf`` — the Node identity graph resolved this listing
+                                 to the key with confidence >= min_confidence.
+      3. ``reviewed``          — a human approved the identity.
+      4. ``unresolved``        — none of the above; do NOT deposit entity-scoped.
+
+    The returned key is ``existing_content_key`` when present — the Node
+    identity graph is authoritative, so we hang the deposit on the key it
+    already resolved rather than minting a divergent one — else a fresh mint
+    from brand/title/gtin."""
+    threshold = deposit_min_confidence() if min_confidence is None else min_confidence
+    gtin_norm = normalize_gtin(gtin)
+    key = existing_content_key or make_content_key(brand, title, gtin)
+
+    if gtin_norm and key:
+        return ResolvedDepositKey(key, DEPOSIT_BASIS_GTIN, 1.0)
+
+    if (
+        existing_content_key
+        and identity_confidence is not None
+        and identity_confidence >= threshold
+    ):
+        return ResolvedDepositKey(
+            existing_content_key, DEPOSIT_BASIS_IDENTITY, float(identity_confidence)
+        )
+
+    if existing_content_key and str(review_state or "").strip().lower() == "reviewed":
+        return ResolvedDepositKey(existing_content_key, DEPOSIT_BASIS_REVIEWED, 1.0)
+
+    return ResolvedDepositKey(
+        key, DEPOSIT_BASIS_UNRESOLVED, float(identity_confidence or 0.0)
+    )
+
+
+def resolve_deposit_content_key_for_row(
+    row: Mapping,
+    *,
+    identity_confidence: Optional[float] = None,
+    min_confidence: Optional[float] = None,
+) -> ResolvedDepositKey:
+    """Convenience wrapper over a catalog_products-style row dict. Tolerant of
+    field-name drift. `identity_confidence` is supplied by the caller (it comes
+    from the Node identity graph, not the catalog row)."""
+
+    def _get(*names: str):
+        for n in names:
+            v = row.get(n)
+            if v not in (None, ""):
+                return v
+        return None
+
+    return resolve_deposit_content_key(
+        brand=_get("brand", "brand_name", "vendor"),
+        title=_get("title", "product_title", "name"),
+        gtin=_get("gtin", "barcode", "upc", "ean"),
+        existing_content_key=_get("content_key"),
+        identity_confidence=(
+            identity_confidence
+            if identity_confidence is not None
+            else row.get("identity_confidence")
+        ),
+        review_state=_get("review_state", "identity_review_state"),
+        min_confidence=min_confidence,
+    )

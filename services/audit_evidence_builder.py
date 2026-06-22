@@ -74,6 +74,7 @@ _VALID_LEVERS = frozenset({
 
 def extract_evidence_items(
     brand_report: Dict[str, Any],
+    content_key_map: Optional[Dict[str, Any]] = None,
 ) -> List[Dict[str, Any]]:
     """Return a list of evidence-item dicts ready for
     insert_evidence_item. Each dict has:
@@ -179,6 +180,84 @@ def extract_evidence_items(
                 "confidence": CONFIDENCE_EVIDENCE_HIGH,
             })
 
+    # P0.2: stamp the canonical entity key on every evidence dict that maps to
+    # a depositable (resolved) content_key. Section-agnostic final pass so new
+    # evidence sections inherit it for free. Unresolved / unmapped product_keys
+    # leave content_key unset — no regression, and no cross-contamination on
+    # the deliberately non-unique content_key (migration 083).
+    if content_key_map:
+        for ev in out:
+            pk = ev.get("product_key")
+            resolved = content_key_map.get(pk) if pk else None
+            if resolved is not None and getattr(resolved, "is_depositable", False):
+                ev["content_key"] = resolved.content_key
+
+    return out
+
+
+def extract_citation_observations(
+    brand_report: Dict[str, Any],
+    content_key_map: Optional[Dict[str, Any]] = None,
+) -> List[Dict[str, Any]]:
+    """P0.2 — flatten the authority map into per-(content_key, host, query,
+    provider) citation observations. This is the cross-channel matrix that
+    build_authority_map otherwise drops into report_jsonb.
+
+    Gating: with a content_key_map, only DEPOSITABLE products emit, using the
+    RESOLVED content_key + basis (so unresolved/non-unique keys never
+    accrete). Without a map (pure tests), the sku-entry's own content_key is
+    used with basis 'unknown'. Rows missing a query or provider are skipped
+    (both are NOT NULL in citation_observations).
+    """
+    out: List[Dict[str, Any]] = []
+    if not isinstance(brand_report, dict):
+        return out
+    authority = brand_report.get("authority_map")
+    if not isinstance(authority, dict):
+        return out
+
+    for sku in (authority.get("skus") or []):
+        if not isinstance(sku, dict):
+            continue
+        product_key = sku.get("product_key")
+        content_key = sku.get("content_key")
+        basis = "unknown"
+        if content_key_map is not None:
+            resolved = content_key_map.get(product_key) if product_key else None
+            if resolved is None or not getattr(resolved, "is_depositable", False):
+                continue
+            content_key = resolved.content_key
+            basis = resolved.basis
+        if not content_key:
+            continue
+
+        for host in (sku.get("authority_hosts") or []):
+            if not isinstance(host, dict):
+                continue
+            evidence_urls = host.get("evidence_urls") or []
+            evidence_url = evidence_urls[0] if evidence_urls else None
+            for obs in (host.get("query_observations") or []):
+                if not isinstance(obs, dict):
+                    continue
+                q = obs.get("query")
+                provider = obs.get("provider")
+                if not q or not provider:
+                    continue
+                out.append({
+                    "content_key": content_key,
+                    "product_key": product_key,
+                    "content_key_basis": basis,
+                    "provider": provider,
+                    "query": q,
+                    "query_class": obs.get("query_class"),
+                    "axis": obs.get("axis"),
+                    "cited_host": host.get("host"),
+                    "host_type": host.get("host_type"),
+                    "citation_role": host.get("citation_role"),
+                    "first_party": host.get("first_party"),
+                    "is_competitor": host.get("is_competitor"),
+                    "evidence_url": evidence_url,
+                })
     return out
 
 
@@ -541,6 +620,94 @@ def _normalize_action(
 # =====================================================================
 
 
+async def _resolve_content_keys(
+    brand_report: Dict[str, Any],
+    merchant_id: Optional[str],
+) -> Dict[str, Any]:
+    """Build {product_key: ResolvedDepositKey} for the audited products.
+
+    P0.2 gate source: a content_key may receive entity-scoped deposits only
+    when it is RESOLVED (GTIN-backed / high-confidence identity / reviewed).
+    The canonical GTIN lives on agent_pdp_view.gtin13 — catalog_products has
+    no GTIN column — so we read brand/title/content_key from catalog_products
+    and the GTIN from the serving view, then let
+    services.catalog_identity.resolve_deposit_content_key decide the basis.
+
+    Conservative by design: products not yet in the serving view (no gtin13)
+    resolve as 'unresolved' and simply don't stamp — surfaced via the coverage
+    counts, never a cross-contamination risk on the deliberately non-unique
+    content_key (migration 083).
+
+    Best-effort: any failure returns {} so the deposit proceeds unstamped
+    rather than failing the audit lifecycle.
+    """
+    if not merchant_id or not isinstance(brand_report, dict):
+        return {}
+    try:
+        from db.database import database
+        from db.catalog import agent_pdp_view, catalog_products
+        from services.catalog_identity import resolve_deposit_content_key
+    except Exception:  # noqa: BLE001
+        return {}
+
+    product_keys: List[str] = []
+    seen = set()
+    for product in (brand_report.get("per_product") or []):
+        if not isinstance(product, dict):
+            continue
+        pk = _product_key_from_report(product)
+        if pk and pk not in seen:
+            seen.add(pk)
+            product_keys.append(pk)
+    if not product_keys:
+        return {}
+
+    try:
+        rows = await database.fetch_all(
+            catalog_products.select().where(
+                catalog_products.c.merchant_id == merchant_id,
+                catalog_products.c.product_key.in_(product_keys),
+            )
+        )
+    except Exception as exc:  # noqa: BLE001
+        logger.warning(
+            "_resolve_content_keys: catalog_products load failed: %s",
+            str(exc)[:200],
+        )
+        return {}
+    rows = rows or []
+
+    # GTIN from the serving view, keyed by content_key (best-effort; on failure
+    # we proceed with no GTIN, so products resolve 'unresolved' = safe).
+    content_keys = [r["content_key"] for r in rows if r["content_key"]]
+    gtin_by_ck: Dict[str, Any] = {}
+    if content_keys:
+        try:
+            view_rows = await database.fetch_all(
+                agent_pdp_view.select().where(
+                    agent_pdp_view.c.content_key.in_(content_keys)
+                )
+            )
+            for vr in view_rows or []:
+                gtin_by_ck[vr["content_key"]] = vr["gtin13"]
+        except Exception as exc:  # noqa: BLE001
+            logger.warning(
+                "_resolve_content_keys: agent_pdp_view load failed: %s",
+                str(exc)[:200],
+            )
+
+    out: Dict[str, Any] = {}
+    for r in rows:
+        ck = r["content_key"]
+        out[r["product_key"]] = resolve_deposit_content_key(
+            brand=r["brand"],
+            title=r["title"],
+            gtin=gtin_by_ck.get(ck) if ck else None,
+            existing_content_key=ck,
+        )
+    return out
+
+
 async def persist_canonical_evidence(
     *,
     audit_run_id: str,
@@ -568,7 +735,8 @@ async def persist_canonical_evidence(
     """
     from db.audit_evidence import (
         compute_canonical_idempotency_key,
-        insert_action, insert_evidence_item, insert_finding,
+        insert_action, insert_citation_observation,
+        insert_evidence_item, insert_finding,
     )
 
     summary = {
@@ -589,7 +757,37 @@ async def persist_canonical_evidence(
     # accessor returning None for both cases, we re-query after
     # each loop to attribute the None correctly.
 
-    extracted_evidence = list(extract_evidence_items(brand_report))
+    # P0.2: resolve content_key per audited product (the gate source) and
+    # stamp the depositable ones. Best-effort — an empty map stamps nothing.
+    content_key_map = await _resolve_content_keys(brand_report, merchant_id)
+    summary["content_keys_total"] = len(content_key_map)
+    summary["content_keys_depositable"] = sum(
+        1 for r in content_key_map.values()
+        if getattr(r, "is_depositable", False)
+    )
+
+    # P0.2 W3: record the resolved canonical entities + basis on the run row.
+    try:
+        from db.merchant_audit_runs import record_audit_run_content_keys
+        depositable_cks = sorted({
+            r.content_key for r in content_key_map.values()
+            if getattr(r, "is_depositable", False) and r.content_key
+        })
+        await record_audit_run_content_keys(
+            run_id=audit_run_id,
+            content_keys=depositable_cks,
+            content_key_basis={pk: r.basis for pk, r in content_key_map.items()},
+        )
+        summary["content_keys"] = depositable_cks
+    except Exception as exc:  # noqa: BLE001
+        logger.warning(
+            "persist_canonical_evidence: content_keys write failed for "
+            "audit=%s: %s", audit_run_id, str(exc)[:200],
+        )
+
+    extracted_evidence = list(
+        extract_evidence_items(brand_report, content_key_map)
+    )
     for ev in extracted_evidence:
         signature = _evidence_signature(ev)
         idem_key = compute_canonical_idempotency_key(
@@ -604,6 +802,7 @@ async def persist_canonical_evidence(
                 evidence_type=ev["evidence_type"],
                 payload=ev["payload"],
                 product_key=ev.get("product_key"),
+                content_key=ev.get("content_key"),
                 confidence=ev.get("confidence"),
                 idempotency_key=idem_key,
             )
@@ -704,6 +903,43 @@ async def persist_canonical_evidence(
                 summary["actions_failed"] += 1
         else:
             summary["actions_inserted"] += 1
+
+    # P0.2: citation_observations — the cross-channel matrix, content_key-keyed.
+    # Best-effort, idempotent; only depositable products emit (gated inside
+    # extract_citation_observations via content_key_map).
+    summary["citation_observations_inserted"] = 0
+    summary["citation_observations_skipped"] = 0
+    for obs in extract_citation_observations(brand_report, content_key_map):
+        idem_key = compute_canonical_idempotency_key(
+            audit_run_id=audit_run_id,
+            item_type="citation_observation",
+            item_signature="{}|{}|{}|{}".format(
+                obs.get("content_key"), obs.get("provider"),
+                obs.get("query"), obs.get("cited_host"),
+            ),
+        )
+        new_obs_id = await insert_citation_observation(
+            audit_run_id=audit_run_id,
+            merchant_id=merchant_id,
+            content_key=obs["content_key"],
+            product_key=obs.get("product_key"),
+            provider=obs["provider"],
+            query=obs["query"],
+            axis=obs.get("axis"),
+            query_class=obs.get("query_class"),
+            cited_host=obs.get("cited_host"),
+            host_type=obs.get("host_type"),
+            citation_role=obs.get("citation_role"),
+            first_party=obs.get("first_party"),
+            is_competitor=obs.get("is_competitor"),
+            evidence_url=obs.get("evidence_url"),
+            content_key_basis=obs.get("content_key_basis") or "unknown",
+            idempotency_key=idem_key,
+        )
+        if new_obs_id is None:
+            summary["citation_observations_skipped"] += 1
+        else:
+            summary["citation_observations_inserted"] += 1
 
     return summary
 

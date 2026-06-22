@@ -34,7 +34,7 @@ from typing import Any, Dict, List, Optional
 
 from sqlalchemy import (
     ARRAY,
-    Column, DateTime, Index, Integer, Table, Text,
+    Boolean, Column, DateTime, Index, Integer, Table, Text,
     UniqueConstraint,
 )
 from sqlalchemy.dialects.postgresql import JSONB, UUID
@@ -248,6 +248,9 @@ evidence_items = Table(
     # P5.8.1: tenancy at the column level (was: route-layer only)
     Column("merchant_id", Text, nullable=True),
     Column("product_key", Text, nullable=True),
+    # P0.2: canonical entity key — stamped on the deposit so audit exhaust
+    # accretes on the cross-merchant product entity, not just the listing.
+    Column("content_key", Text, nullable=True),
     Column("probe_run_id", UUID(as_uuid=False), nullable=True),
     Column("evidence_type", Text, nullable=False),
     Column("payload_jsonb", JSONB, nullable=False),
@@ -355,6 +358,34 @@ report_projections = Table(
 )
 
 
+# P0.2 — the cross-channel citation matrix (build_authority_map.hosts[]),
+# persisted relationally + content_key-keyed instead of dying in report_jsonb.
+# One row per (audit_run, content_key, provider, query, cited_host).
+citation_observations = Table(
+    "citation_observations",
+    metadata,
+    Column("observation_id", UUID(as_uuid=False), primary_key=True),
+    Column("audit_run_id", Text, nullable=False),
+    Column("merchant_id", Text, nullable=False),
+    Column("content_key", Text, nullable=False),
+    Column("product_key", Text, nullable=True),
+    Column("provider", Text, nullable=False),
+    Column("query", Text, nullable=False),
+    Column("axis", Text, nullable=True),
+    Column("query_class", Text, nullable=True),
+    Column("cited_host", Text, nullable=True),
+    Column("host_type", Text, nullable=True),
+    Column("citation_role", Text, nullable=True),
+    Column("first_party", Boolean, nullable=True),
+    Column("is_competitor", Boolean, nullable=True),
+    Column("evidence_url", Text, nullable=True),
+    Column("content_key_basis", Text, nullable=False),
+    Column("observed_at", DateTime(timezone=True), nullable=False),
+    Column("idempotency_key", Text, nullable=False),
+    extend_existing=True,
+)
+
+
 # =====================================================================
 # DDL backstop — per-statement tolerant (matches P2.1/P3.1 pattern)
 # =====================================================================
@@ -381,6 +412,39 @@ _DDL_STATEMENTS = [
     "ON evidence_items (audit_run_id, created_at);",
     "CREATE INDEX IF NOT EXISTS idx_evidence_items_type "
     "ON evidence_items (evidence_type, audit_run_id);",
+    # P0.2: canonical entity key (migration 158) — backstop for fresh DBs.
+    "ALTER TABLE evidence_items ADD COLUMN IF NOT EXISTS content_key VARCHAR(40);",
+    "CREATE INDEX IF NOT EXISTS idx_evidence_items_content_key "
+    "ON evidence_items (content_key, evidence_type);",
+    # P0.2: citation_observations (migration 159) — backstop for fresh DBs.
+    """
+    CREATE TABLE IF NOT EXISTS citation_observations (
+        observation_id    UUID PRIMARY KEY,
+        audit_run_id      TEXT NOT NULL,
+        merchant_id       TEXT NOT NULL,
+        content_key       VARCHAR(40) NOT NULL,
+        product_key       TEXT NULL,
+        provider          TEXT NOT NULL,
+        query             TEXT NOT NULL,
+        axis              TEXT NULL,
+        query_class       TEXT NULL,
+        cited_host        TEXT NULL,
+        host_type         TEXT NULL,
+        citation_role     TEXT NULL,
+        first_party       BOOLEAN NULL,
+        is_competitor     BOOLEAN NULL,
+        evidence_url      TEXT NULL,
+        content_key_basis TEXT NOT NULL,
+        observed_at       TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+        idempotency_key   TEXT NOT NULL
+    );
+    """,
+    "CREATE UNIQUE INDEX IF NOT EXISTS ux_citation_observations_idem "
+    "ON citation_observations (idempotency_key);",
+    "CREATE INDEX IF NOT EXISTS idx_citation_observations_entity "
+    "ON citation_observations (content_key, provider, observed_at DESC);",
+    "CREATE INDEX IF NOT EXISTS idx_citation_observations_run "
+    "ON citation_observations (audit_run_id);",
 
     # readiness_findings
     """
@@ -593,6 +657,7 @@ async def insert_evidence_item(
     payload: Dict[str, Any],
     merchant_id: Optional[str] = None,
     product_key: Optional[str] = None,
+    content_key: Optional[str] = None,
     probe_run_id: Optional[str] = None,
     confidence: Optional[int] = None,
     idempotency_key: Optional[str] = None,
@@ -628,6 +693,7 @@ async def insert_evidence_item(
                 audit_run_id=audit_run_id,
                 merchant_id=merchant_id,
                 product_key=product_key,
+                content_key=content_key,
                 probe_run_id=probe_run_id,
                 evidence_type=coerced_type,
                 payload_jsonb=safe_payload,
@@ -651,6 +717,65 @@ async def insert_evidence_item(
             "insert_evidence_item idempotent-skip or failed "
             "audit_run=%s type=%s key=%s: %s",
             audit_run_id, evidence_type,
+            (idempotency_key or "")[:16], str(exc)[:200],
+        )
+        return None
+
+
+async def insert_citation_observation(
+    *,
+    audit_run_id: str,
+    merchant_id: Optional[str],
+    content_key: str,
+    provider: str,
+    query: str,
+    content_key_basis: str,
+    product_key: Optional[str] = None,
+    axis: Optional[str] = None,
+    query_class: Optional[str] = None,
+    cited_host: Optional[str] = None,
+    host_type: Optional[str] = None,
+    citation_role: Optional[str] = None,
+    first_party: Optional[bool] = None,
+    is_competitor: Optional[bool] = None,
+    evidence_url: Optional[str] = None,
+    idempotency_key: Optional[str] = None,
+) -> Optional[str]:
+    """P0.2 best-effort write of one citation observation. Idempotent via the
+    unique index on idempotency_key (a re-run of the same audit collapses to
+    the same row). Returns observation_id, or None on failure / idempotent
+    skip — never raises, so it can't take down the audit lifecycle."""
+    await ensure_audit_evidence_tables()
+    observation_id = str(uuid.uuid4())
+    try:
+        await database.execute(
+            citation_observations.insert().values(
+                observation_id=observation_id,
+                audit_run_id=audit_run_id,
+                merchant_id=merchant_id,
+                content_key=content_key,
+                product_key=product_key,
+                provider=provider,
+                query=query,
+                axis=axis,
+                query_class=query_class,
+                cited_host=cited_host,
+                host_type=host_type,
+                citation_role=citation_role,
+                first_party=first_party,
+                is_competitor=is_competitor,
+                evidence_url=evidence_url,
+                content_key_basis=content_key_basis,
+                observed_at=_now_utc(),
+                idempotency_key=idempotency_key,
+            )
+        )
+        return observation_id
+    except Exception as exc:  # noqa: BLE001
+        logger.warning(
+            "insert_citation_observation idempotent-skip or failed "
+            "audit_run=%s ck=%s key=%s: %s",
+            audit_run_id, content_key,
             (idempotency_key or "")[:16], str(exc)[:200],
         )
         return None

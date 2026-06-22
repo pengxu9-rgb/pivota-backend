@@ -97,6 +97,10 @@ merchant_audit_runs = Table(
     Column("attribution_score_avg", Integer, nullable=True),
     Column("category_visibility_score_avg", Integer, nullable=True),
     Column("audited_via_pivota_canonical", ARRAY(Text), nullable=True),
+    # P0.2 W3: the canonical entities this run deposited against + per
+    # product_key resolution basis (migration 158).
+    Column("content_keys", ARRAY(Text), nullable=True),
+    Column("content_key_basis", JSONB, nullable=True),
     Column("report_jsonb", JSONB, nullable=True),
     Column("error_message", Text, nullable=True),
     # P2.1: async lifecycle columns (migration 083). See
@@ -214,6 +218,11 @@ _DDL_STATEMENTS = [
     "ADD COLUMN IF NOT EXISTS idempotency_key TEXT;",
     "ALTER TABLE merchant_audit_runs "
     "ADD COLUMN IF NOT EXISTS cancelled_at TIMESTAMPTZ;",
+    # P0.2 W3 (migration 158): canonical entity keys + per-product basis.
+    "ALTER TABLE merchant_audit_runs "
+    "ADD COLUMN IF NOT EXISTS content_keys TEXT[];",
+    "ALTER TABLE merchant_audit_runs "
+    "ADD COLUMN IF NOT EXISTS content_key_basis JSONB;",
     "ALTER TABLE merchant_audit_runs "
     "ADD COLUMN IF NOT EXISTS requested_by_user_id TEXT;",
     "ALTER TABLE merchant_audit_runs "
@@ -352,6 +361,35 @@ async def record_audit_run_completed(
     except Exception as exc:
         logger.warning(
             "record_audit_run_completed failed for run_id=%s: %s",
+            run_id, str(exc)[:200],
+        )
+
+
+async def record_audit_run_content_keys(
+    *,
+    run_id: Optional[str],
+    content_keys: List[str],
+    content_key_basis: Optional[Dict[str, Any]] = None,
+) -> None:
+    """P0.2 W3: record which canonical entities (content_keys) this run
+    deposited against, plus the per-product_key resolution basis. Best-effort;
+    no-op when run_id is None. Additive to the existing product_keys[] column —
+    product_keys stays the storefront-shaped key, content_keys is the
+    cross-merchant canonical key the index reads."""
+    if not run_id:
+        return
+    try:
+        values: Dict[str, Any] = {"content_keys": list(content_keys or [])}
+        if content_key_basis is not None:
+            values["content_key_basis"] = _json_safe(content_key_basis)
+        await database.execute(
+            merchant_audit_runs.update()
+            .where(merchant_audit_runs.c.run_id == run_id)
+            .values(**values)
+        )
+    except Exception as exc:
+        logger.warning(
+            "record_audit_run_content_keys failed for run_id=%s: %s",
             run_id, str(exc)[:200],
         )
 
