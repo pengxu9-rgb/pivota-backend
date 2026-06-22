@@ -1564,3 +1564,134 @@ async def run_product_enrichment(
         "enrichment": enrichment or {},
         "quality": _quality_response(projection),
     }
+
+
+# --- Phase 2b: merchant evidence intake --------------------------------------
+
+class EvidenceClaimIn(BaseModel):
+    claim_text: str
+    # merchant_positioning | merchant_lab_report | third_party_test | certification
+    # | third_party_review | editorial_press. Defaults to positioning (unverified).
+    source_type: Optional[str] = None
+    # Artifact id / citation url. Required for a substantiated source_type — without
+    # it the claim is honestly stored as unverified positioning.
+    source_ref: Optional[str] = None
+
+
+class ProductEvidenceBody(BaseModel):
+    claims: List[EvidenceClaimIn] = []
+    review_state: Optional[str] = "observed"
+
+
+async def _resolve_evidence_product(merchant_id: str, platform: str, platform_product_id: str):
+    """(product_key, content_key) for a merchant's product, or (None, None)."""
+    row = await database.fetch_one(
+        """
+        SELECT product_key, content_key
+        FROM catalog_products
+        WHERE merchant_id = :mid AND platform = :p AND source_product_id = :spid
+        LIMIT 1
+        """,
+        {"mid": merchant_id, "p": platform, "spid": platform_product_id},
+    )
+    if not row:
+        return None, None
+    d = dict(row)
+    return d.get("product_key"), d.get("content_key")
+
+
+@router.post("/{platform}/{platform_product_id}/evidence")
+async def upsert_product_evidence_endpoint(
+    platform: str,
+    platform_product_id: str,
+    body: ProductEvidenceBody,
+    current_user: dict = Depends(get_current_user),
+):
+    """Phase 2b: merchant evidence intake. Writes provenance-graded claims to
+    product_evidence and refreshes agent_pdp_view so they are served via the
+    agent-PDP read surfaces. Optional / never required. Positioning is stored as
+    `unverified` (improves PDP copy) until a lab/cert/third-party source
+    substantiates it — only substantiated claims are ever served to agents (the
+    serve gate is single-sourced downstream)."""
+    if current_user.get("role") != "merchant":
+        raise HTTPException(status_code=403, detail="Only merchants can author evidence")
+    merchant_id = current_user.get("merchant_id")
+    if not merchant_id:
+        raise HTTPException(status_code=400, detail="Missing merchant_id on current user")
+
+    owns = await database.fetch_one(
+        products_cache.select().where(
+            (products_cache.c.merchant_id == merchant_id)
+            & (products_cache.c.platform == platform)
+            & (products_cache.c.platform_product_id == platform_product_id)
+        )
+    )
+    if not owns:
+        raise HTTPException(status_code=404, detail="Product not found")
+
+    product_key, content_key = await _resolve_evidence_product(
+        merchant_id, platform, platform_product_id
+    )
+    if not product_key:
+        raise HTTPException(
+            status_code=404,
+            detail="Product not in the canonical catalog yet — sync your catalog first.",
+        )
+
+    from db.product_evidence import normalize_intake_claims, upsert_product_evidence
+
+    claims = normalize_intake_claims([c.model_dump() for c in body.claims])
+    await upsert_product_evidence(
+        product_key,
+        merchant_id=merchant_id,
+        claims=claims,
+        review_state=(body.review_state or "observed"),
+    )
+
+    refreshed = False
+    if content_key:
+        try:
+            from services.agent_pdp_view_assembler import refresh_agent_pdp_view_for_content_key
+            refreshed = await refresh_agent_pdp_view_for_content_key(
+                content_key, refresh_source="merchant_evidence_intake"
+            )
+        except Exception:
+            refreshed = False  # best-effort: stored now, served on the next assembly
+
+    substantiated = sum(1 for c in claims if c.get("substantiation_status") == "substantiated")
+    return {
+        "product_key": product_key,
+        "claims_written": len(claims),
+        "substantiated": substantiated,
+        "served_refresh": refreshed,
+    }
+
+
+@router.get("/{platform}/{platform_product_id}/evidence")
+async def get_product_evidence_endpoint(
+    platform: str,
+    platform_product_id: str,
+    current_user: dict = Depends(get_current_user),
+):
+    """Read a product's stored merchant evidence (for the intake UI)."""
+    if current_user.get("role") != "merchant":
+        raise HTTPException(status_code=403, detail="Only merchants can read evidence")
+    merchant_id = current_user.get("merchant_id")
+    if not merchant_id:
+        raise HTTPException(status_code=400, detail="Missing merchant_id on current user")
+
+    product_key, _ = await _resolve_evidence_product(merchant_id, platform, platform_product_id)
+    if not product_key:
+        return {"claims": [], "review_state": None}
+
+    from db.product_evidence import fetch_product_evidence_row
+    row = await fetch_product_evidence_row(product_key)
+    if not row:
+        return {"claims": [], "review_state": None}
+    updated = row.get("updated_at")
+    return {
+        "claims": row.get("claims") or [],
+        "review_state": row.get("review_state"),
+        "required_disclaimers": row.get("required_disclaimers"),
+        "updated_at": updated.isoformat() if hasattr(updated, "isoformat") else updated,
+    }

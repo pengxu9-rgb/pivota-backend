@@ -230,3 +230,124 @@ async def fetch_product_evidence_for_keys(
     if merged_disclaimers:
         out["required_disclaimers"] = merged_disclaimers
     return out
+
+
+# --- merchant intake (Phase 2b) ----------------------------------------------
+
+# Map a merchant intake source_type -> (evidence_grade, substantiation_status).
+# Converges on the SERVING gate's letter grades (PIVOTA-Agent
+# pivotaInsightsQuality PUBLIC_SAFE_CLAIM_GRADES = {a,b,c}) so a substantiated
+# merchant claim publishes with NO serving-gate change. Positioning stays
+# `unverified` (improves PDP copy; never served as a grounded claim until a lab /
+# cert / third-party source substantiates it).
+_INTAKE_SOURCE_GRADE: Dict[str, tuple] = {
+    "merchant_lab_report": ("a", "substantiated"),
+    "third_party_test": ("a", "substantiated"),
+    "certification": ("a", "substantiated"),
+    "third_party_review": ("b", "substantiated"),
+    "editorial_press": ("b", "substantiated"),
+    "merchant_positioning": (None, "unverified"),
+}
+
+
+def normalize_intake_claims(raw_claims: Any) -> List[Dict[str, Any]]:
+    """Map merchant-supplied intake claims to ProductClaim dicts with a serving-
+    compatible evidence_grade + an HONEST substantiation_status. A substantiated
+    source_type (lab/cert/third-party) requires a `source_ref` (the artifact id or
+    citation url) — without one it is honestly downgraded to unverified positioning,
+    so a merchant can't self-substantiate by just picking a label."""
+    if not isinstance(raw_claims, list):
+        return []
+    out: List[Dict[str, Any]] = []
+    for raw in raw_claims:
+        if not isinstance(raw, dict):
+            continue
+        text = str(raw.get("claim_text") or "").strip()
+        if not text:
+            continue
+        source_type = str(raw.get("source_type") or "merchant_positioning").strip().lower()
+        source_ref = (str(raw.get("source_ref")).strip() or None) if raw.get("source_ref") else None
+        grade, status = _INTAKE_SOURCE_GRADE.get(source_type, (None, "unverified"))
+        if status == "substantiated" and not source_ref:
+            grade, status, source_type = None, "unverified", "merchant_positioning"
+        claim: Dict[str, Any] = {
+            "claim_text": text,
+            "source_type": source_type,
+            "substantiation_status": status,
+        }
+        if grade:
+            claim["evidence_grade"] = grade
+        if source_ref:
+            claim["source_ref"] = source_ref
+        out.append(claim)
+    return out
+
+
+async def upsert_product_evidence(
+    product_key: str,
+    *,
+    merchant_id: Optional[str],
+    claims: List[Dict[str, Any]],
+    geo_code: str = "default",
+    review_state: str = "observed",
+    required_disclaimers: Optional[List[Dict[str, Any]]] = None,
+    db: Any = None,
+) -> None:
+    """Write/replace the merchant evidence for a product (idempotent upsert)."""
+    await ensure_product_evidence_tables()
+    write_db = db or database
+    claims_json = json.dumps(claims or [])
+    disc_json = json.dumps(required_disclaimers) if required_disclaimers else None
+    values = {
+        "pk": product_key, "geo": geo_code, "mid": merchant_id,
+        "claims": claims_json, "rs": review_state, "disc": disc_json,
+    }
+    if IS_POSTGRES:
+        j = _json_type_sql()
+        sql = f"""
+        INSERT INTO product_evidence
+          (product_key, geo_code, merchant_id, claims, review_state, required_disclaimers, updated_at)
+        VALUES (:pk, :geo, :mid, CAST(:claims AS {j}), :rs, CAST(:disc AS {j}), CURRENT_TIMESTAMP)
+        ON CONFLICT (product_key, geo_code) DO UPDATE SET
+          merchant_id = EXCLUDED.merchant_id,
+          claims = EXCLUDED.claims,
+          review_state = EXCLUDED.review_state,
+          required_disclaimers = EXCLUDED.required_disclaimers,
+          updated_at = CURRENT_TIMESTAMP
+        """
+    else:
+        sql = """
+        INSERT OR REPLACE INTO product_evidence
+          (product_key, geo_code, merchant_id, claims, review_state, required_disclaimers, updated_at)
+        VALUES (:pk, :geo, :mid, :claims, :rs, :disc, CURRENT_TIMESTAMP)
+        """
+    await write_db.execute(sql, values)
+
+
+async def fetch_product_evidence_row(
+    product_key: str,
+    *,
+    geo_code: str = "default",
+    db: Any = None,
+) -> Optional[Dict[str, Any]]:
+    """One product's stored evidence (for the merchant read endpoint). None when
+    absent; best-effort."""
+    await ensure_product_evidence_tables()
+    read_db = db or database
+    try:
+        row = await read_db.fetch_one(
+            """
+            SELECT product_key, merchant_id, claims, review_state, required_disclaimers, updated_at
+            FROM product_evidence
+            WHERE product_key = :pk AND geo_code = :geo
+            """,
+            {"pk": product_key, "geo": geo_code},
+        )
+    except Exception:
+        return None
+    if not row:
+        return None
+    data = dict(row)
+    data["claims"] = _coerce_json(data.get("claims")) or []
+    data["required_disclaimers"] = _coerce_json(data.get("required_disclaimers"))
+    return data
