@@ -554,6 +554,94 @@ def _normalize_action(
 # =====================================================================
 
 
+async def _resolve_content_keys(
+    brand_report: Dict[str, Any],
+    merchant_id: Optional[str],
+) -> Dict[str, Any]:
+    """Build {product_key: ResolvedDepositKey} for the audited products.
+
+    P0.2 gate source: a content_key may receive entity-scoped deposits only
+    when it is RESOLVED (GTIN-backed / high-confidence identity / reviewed).
+    The canonical GTIN lives on agent_pdp_view.gtin13 — catalog_products has
+    no GTIN column — so we read brand/title/content_key from catalog_products
+    and the GTIN from the serving view, then let
+    services.catalog_identity.resolve_deposit_content_key decide the basis.
+
+    Conservative by design: products not yet in the serving view (no gtin13)
+    resolve as 'unresolved' and simply don't stamp — surfaced via the coverage
+    counts, never a cross-contamination risk on the deliberately non-unique
+    content_key (migration 083).
+
+    Best-effort: any failure returns {} so the deposit proceeds unstamped
+    rather than failing the audit lifecycle.
+    """
+    if not merchant_id or not isinstance(brand_report, dict):
+        return {}
+    try:
+        from db.database import database
+        from db.catalog import agent_pdp_view, catalog_products
+        from services.catalog_identity import resolve_deposit_content_key
+    except Exception:  # noqa: BLE001
+        return {}
+
+    product_keys: List[str] = []
+    seen = set()
+    for product in (brand_report.get("per_product") or []):
+        if not isinstance(product, dict):
+            continue
+        pk = _product_key_from_report(product)
+        if pk and pk not in seen:
+            seen.add(pk)
+            product_keys.append(pk)
+    if not product_keys:
+        return {}
+
+    try:
+        rows = await database.fetch_all(
+            catalog_products.select().where(
+                catalog_products.c.merchant_id == merchant_id,
+                catalog_products.c.product_key.in_(product_keys),
+            )
+        )
+    except Exception as exc:  # noqa: BLE001
+        logger.warning(
+            "_resolve_content_keys: catalog_products load failed: %s",
+            str(exc)[:200],
+        )
+        return {}
+    rows = rows or []
+
+    # GTIN from the serving view, keyed by content_key (best-effort; on failure
+    # we proceed with no GTIN, so products resolve 'unresolved' = safe).
+    content_keys = [r["content_key"] for r in rows if r["content_key"]]
+    gtin_by_ck: Dict[str, Any] = {}
+    if content_keys:
+        try:
+            view_rows = await database.fetch_all(
+                agent_pdp_view.select().where(
+                    agent_pdp_view.c.content_key.in_(content_keys)
+                )
+            )
+            for vr in view_rows or []:
+                gtin_by_ck[vr["content_key"]] = vr["gtin13"]
+        except Exception as exc:  # noqa: BLE001
+            logger.warning(
+                "_resolve_content_keys: agent_pdp_view load failed: %s",
+                str(exc)[:200],
+            )
+
+    out: Dict[str, Any] = {}
+    for r in rows:
+        ck = r["content_key"]
+        out[r["product_key"]] = resolve_deposit_content_key(
+            brand=r["brand"],
+            title=r["title"],
+            gtin=gtin_by_ck.get(ck) if ck else None,
+            existing_content_key=ck,
+        )
+    return out
+
+
 async def persist_canonical_evidence(
     *,
     audit_run_id: str,
@@ -602,7 +690,18 @@ async def persist_canonical_evidence(
     # accessor returning None for both cases, we re-query after
     # each loop to attribute the None correctly.
 
-    extracted_evidence = list(extract_evidence_items(brand_report))
+    # P0.2: resolve content_key per audited product (the gate source) and
+    # stamp the depositable ones. Best-effort — an empty map stamps nothing.
+    content_key_map = await _resolve_content_keys(brand_report, merchant_id)
+    summary["content_keys_total"] = len(content_key_map)
+    summary["content_keys_depositable"] = sum(
+        1 for r in content_key_map.values()
+        if getattr(r, "is_depositable", False)
+    )
+
+    extracted_evidence = list(
+        extract_evidence_items(brand_report, content_key_map)
+    )
     for ev in extracted_evidence:
         signature = _evidence_signature(ev)
         idem_key = compute_canonical_idempotency_key(
