@@ -2518,6 +2518,22 @@ def compute_content_richness_score(sku_ctx: Dict[str, Any]) -> Tuple[int, Dict[s
         safety_reason = "no blocking safety flags; claims substantiated or absent"
         safety_missing = None
     _add_bucket(breakdown, missing, "safety_claims", safety_points, 10, safety_reason, missing=safety_missing)
+    # NON-SCORING evidence signal (points unchanged): annotate the safety_claims
+    # bucket with how much citable evidence the product carries, so merchants + agents
+    # see third-party backing depth without inflating the 100-pt scale. Rides the
+    # bucket's merchant-facing `reason` string + a structured sub-field.
+    ev_count = int(sku_ctx.get("substantiated_evidence_count") or 0)
+    tp_sources = int(sku_ctx.get("third_party_evidence_sources") or 0)
+    if ev_count:
+        breakdown["safety_claims"]["evidence_signal"] = {
+            "substantiated_claims": ev_count,
+            "third_party_sources": tp_sources,
+        }
+        if tp_sources:
+            breakdown["safety_claims"]["reason"] = (
+                f"{breakdown['safety_claims']['reason']}; backed by {tp_sources} "
+                f"third-party source{'s' if tp_sources != 1 else ''}"
+            )
 
     description = str(product.get("description") or enrichment.get("description_markdown") or "")
     has_description = len(description.strip()) >= 120
@@ -4217,25 +4233,48 @@ async def load_sku_context(sku_key: str, merchant_id: str) -> Dict[str, Any]:
         """,
         {"merchant_id": merchant_id},
     ) or {}
-    # Phase 2b: does this product carry merchant-supplied SUBSTANTIATED evidence
-    # (lab / cert / third-party) in the general product_evidence store? This feeds
-    # the existing 10-pt "Substantiated claims" bucket via _has_substantiation, so
-    # a confirmed lab claim lifts the audit the same way a beauty-profile claim or
-    # an intel source_coverage does — reusing that weight, not inventing one.
-    # Best-effort: the table may be absent / non-Postgres (the JSONB containment
-    # operator is Postgres-only); _fetch_one_dict swallows errors to {} so the flag
-    # simply stays False. NULL merchant_id rows (future web-crawl writes) count too.
-    evidence_row = await _fetch_one_dict(
-        """
-        SELECT COUNT(*) AS n
-          FROM product_evidence
-         WHERE product_key = :product_key
-           AND (merchant_id = :merchant_id OR merchant_id IS NULL)
-           AND claims @> '[{"substantiation_status": "substantiated"}]'
-        """,
-        {"product_key": product_key, "merchant_id": merchant_id},
-    ) or {}
-    has_substantiated_evidence = int(evidence_row.get("n") or 0) > 0
+    # Phase 2b: substantiated merchant evidence (general product_evidence store).
+    # Drives two things, both derived from the SAME read:
+    #   (1) has_substantiated_evidence — the boolean that feeds the existing 10-pt
+    #       "Substantiated claims" bucket via _has_substantiation (reusing that
+    #       weight, not inventing one).
+    #   (2) a NON-SCORING "backed by N third-party sources" signal surfaced in the
+    #       content_richness breakdown (informs merchants + agents about citable
+    #       evidence depth WITHOUT inflating or redistributing the 100-pt scale).
+    # Best-effort: absent table / non-Postgres / parse error → no evidence, no signal
+    # (the scoring is unaffected). NULL merchant_id rows (web-crawl writes) count too.
+    has_substantiated_evidence = False
+    substantiated_evidence_count = 0
+    third_party_evidence_sources = 0
+    try:
+        evidence_row = await _fetch_one_dict(
+            """
+            SELECT claims
+              FROM product_evidence
+             WHERE product_key = :product_key
+               AND (merchant_id = :merchant_id OR merchant_id IS NULL)
+             LIMIT 1
+            """,
+            {"product_key": product_key, "merchant_id": merchant_id},
+        )
+        third_party_types = {
+            "editorial_press", "third_party_review", "third_party_test", "certification",
+        }
+        third_party_refs = set()
+        for claim in _json_list((evidence_row or {}).get("claims")):
+            if not isinstance(claim, dict):
+                continue
+            if str(claim.get("substantiation_status") or "").lower() != "substantiated":
+                continue
+            substantiated_evidence_count += 1
+            if str(claim.get("source_type") or "").lower() in third_party_types:
+                ref = str(claim.get("source_ref") or "").strip().lower()
+                if ref:
+                    third_party_refs.add(ref)
+        has_substantiated_evidence = substantiated_evidence_count > 0
+        third_party_evidence_sources = len(third_party_refs)
+    except Exception:
+        pass
 
     content_key = product.get("content_key")
     peers = []
@@ -4278,6 +4317,8 @@ async def load_sku_context(sku_key: str, merchant_id: str) -> Dict[str, Any]:
         "merchant": merchant,
         "content_key_peers": peers,
         "has_substantiated_evidence": has_substantiated_evidence,
+        "substantiated_evidence_count": substantiated_evidence_count,
+        "third_party_evidence_sources": third_party_evidence_sources,
     }
     _SKU_CONTEXT_CACHE[cache_key] = ctx
     return ctx
