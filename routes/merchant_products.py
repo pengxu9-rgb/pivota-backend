@@ -12,7 +12,7 @@ experience, not the public Agent API.
 
 import json
 
-from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException, Query
+from fastapi import APIRouter, BackgroundTasks, Depends, File, Form, HTTPException, Query, UploadFile
 from typing import Any, Dict, List, Optional, Tuple, Union
 from datetime import datetime, timezone
 
@@ -1694,4 +1694,145 @@ async def get_product_evidence_endpoint(
         "review_state": row.get("review_state"),
         "required_disclaimers": row.get("required_disclaimers"),
         "updated_at": updated.isoformat() if hasattr(updated, "isoformat") else updated,
+    }
+
+
+# Lab-report upload cap — generous for a multi-page PDF, bounded to keep the
+# extraction request cheap.
+_LAB_UPLOAD_MAX_BYTES = 10 * 1024 * 1024
+
+
+def _product_title_from_cache_row(owns: Any) -> Optional[str]:
+    """Best-effort product title from a products_cache row (for the extraction
+    prompt). Never raises — the title only sharpens extraction, it isn't required."""
+    try:
+        pdata = dict(owns).get("product_data")
+        if isinstance(pdata, str):
+            pdata = json.loads(pdata)
+        if isinstance(pdata, dict):
+            return pdata.get("title") or (pdata.get("raw") or {}).get("title")
+    except Exception:
+        return None
+    return None
+
+
+@router.post("/{platform}/{platform_product_id}/evidence/lab-report")
+async def extract_lab_report_evidence_endpoint(
+    platform: str,
+    platform_product_id: str,
+    file: Optional[UploadFile] = File(default=None),
+    lab_text: Optional[str] = Form(default=None),
+    current_user: dict = Depends(get_current_user),
+):
+    """Phase 2b lab-report intake: upload a lab / third-party test report (PDF) or
+    paste its text, and get back CANDIDATE claims an LLM extracted from it plus a
+    stable `artifact_id`.
+
+    Nothing is published here. The candidates come back unverified for the merchant
+    to review; confirming one via POST `/evidence` with
+    source_type='merchant_lab_report' and source_ref=<artifact_id> is what grades
+    it 'a' / substantiated and serves it to agents. Optional, never required — a
+    suggestion to get more out of Pivota for products whose value isn't yet in the
+    catalog copy."""
+    if current_user.get("role") != "merchant":
+        raise HTTPException(status_code=403, detail="Only merchants can submit lab reports")
+    merchant_id = current_user.get("merchant_id")
+    if not merchant_id:
+        raise HTTPException(status_code=400, detail="Missing merchant_id on current user")
+
+    owns = await database.fetch_one(
+        products_cache.select().where(
+            (products_cache.c.merchant_id == merchant_id)
+            & (products_cache.c.platform == platform)
+            & (products_cache.c.platform_product_id == platform_product_id)
+        )
+    )
+    if not owns:
+        raise HTTPException(status_code=404, detail="Product not found")
+
+    product_key, _ = await _resolve_evidence_product(merchant_id, platform, platform_product_id)
+    if not product_key:
+        raise HTTPException(
+            status_code=404,
+            detail="Product not in the canonical catalog yet — sync your catalog first.",
+        )
+
+    import hashlib
+
+    from services.evidence_extraction import (
+        EvidenceExtractionError,
+        extract_lab_claims,
+        extract_pdf_text,
+    )
+
+    # Resolve report text + a content fingerprint for a stable artifact id.
+    filename: Optional[str] = None
+    if file is not None and getattr(file, "filename", None):
+        filename = file.filename
+        blob = await file.read()
+        if not blob:
+            raise HTTPException(status_code=400, detail="Uploaded file is empty")
+        if len(blob) > _LAB_UPLOAD_MAX_BYTES:
+            raise HTTPException(status_code=413, detail="File too large (max 10MB)")
+        content_type = (file.content_type or "").lower()
+        if "pdf" in content_type or (filename or "").lower().endswith(".pdf"):
+            try:
+                report_text = extract_pdf_text(blob)
+            except EvidenceExtractionError as exc:
+                raise HTTPException(status_code=422, detail=str(exc))
+        else:
+            report_text = blob.decode("utf-8", errors="replace")
+        fingerprint = hashlib.sha256(blob).hexdigest()
+    elif lab_text and lab_text.strip():
+        report_text = lab_text.strip()
+        fingerprint = hashlib.sha256(report_text.encode("utf-8")).hexdigest()
+    else:
+        raise HTTPException(status_code=400, detail="Provide a lab-report file or lab_text")
+
+    if not report_text.strip():
+        raise HTTPException(status_code=422, detail="No readable text in the report")
+
+    try:
+        candidates = await extract_lab_claims(
+            report_text, product_title=_product_title_from_cache_row(owns)
+        )
+    except EvidenceExtractionError as exc:
+        raise HTTPException(status_code=503, detail=str(exc))
+
+    artifact_id = "art_" + hashlib.sha256(
+        f"{product_key}|{fingerprint}".encode("utf-8")
+    ).hexdigest()[:24]
+
+    from db.product_evidence import insert_evidence_artifact
+    try:
+        await insert_evidence_artifact(
+            artifact_id=artifact_id,
+            product_key=product_key,
+            merchant_id=merchant_id,
+            kind="lab_report",
+            source="merchant_upload",
+            url_or_blob_ref=filename,
+            extracted_claim_keys=[c["claim_text"] for c in candidates],
+        )
+    except Exception:
+        # Artifact persistence is best-effort; the candidates are still returned so
+        # the merchant can review. (Confirming a claim requires the artifact_id, so
+        # a transient store failure just means re-uploading.)
+        pass
+
+    return {
+        "artifact_id": artifact_id,
+        "product_key": product_key,
+        "candidate_claims": candidates,
+        "candidate_count": len(candidates),
+        "next_step": {
+            "instructions": (
+                "Review each candidate. To publish one as a substantiated, citable "
+                "claim, POST it to this product's /evidence endpoint with "
+                "source_type='merchant_lab_report' and source_ref set to this artifact_id. "
+                "Nothing is published until you confirm."
+            ),
+            "source_type": "merchant_lab_report",
+            "source_ref": artifact_id,
+        },
     }
