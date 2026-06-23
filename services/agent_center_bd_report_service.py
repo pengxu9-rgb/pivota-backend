@@ -1834,10 +1834,105 @@ def _classify_provider(upstream_provider: str) -> Dict[str, Any]:
 
 _SKU_CONTEXT_CACHE: Dict[Tuple[str, str], Dict[str, Any]] = {}
 
+# URL-audit (wedge) synthetic SKU contexts. A merchant pastes product URLs
+# with NO synced catalog, so there's no catalog_skus/catalog_products row to
+# load. We build a synthetic ctx from the fetched PDP (title/vendor/type/url)
+# and register it here so load_sku_context() returns it on a catalog miss.
+#
+# This is a SEPARATE registry from _SKU_CONTEXT_CACHE on purpose:
+# run_brand_report(audit_mode="per_sku") calls reset_sku_context_cache() AFTER
+# the probe fan-out but BEFORE the report-assembly loop re-reads each ctx, so a
+# context placed only in the cache would be wiped and the assembly loop would
+# fall through to the catalog (miss) — nulling every dimension AND skipping
+# citation scoring. The registry is never auto-cleared, so the synthetic ctx
+# survives the reset and both the fan-out and the assembly loop see the same
+# context. The worker re-registers from the persisted launch.synthetic_products
+# on resume, so cross-process replay works too. Keyed by (sku_key, merchant_id),
+# with sku_key namespaced `urlwedge:*` to guarantee no collision with real keys.
+_SYNTHETIC_SKU_CONTEXTS: Dict[Tuple[str, str], Dict[str, Any]] = {}
+
 
 def reset_sku_context_cache() -> None:
-    """Test hook and audit-run boundary helper."""
+    """Test hook and audit-run boundary helper.
+
+    Clears the per-run catalog-ctx cache. Does NOT clear the synthetic
+    URL-audit registry — those contexts must survive this reset (see
+    _SYNTHETIC_SKU_CONTEXTS) so the per_sku assembly loop re-reads them.
+    """
     _SKU_CONTEXT_CACHE.clear()
+
+
+def build_synthetic_sku_context(
+    item: Dict[str, Any], merchant_id: str,
+) -> Dict[str, Any]:
+    """Build a per-SKU context for a URL-audit product with no synced catalog.
+
+    `item` is the fetched/curated product shape from fetch_curated_audit_product
+    plus the synthetic keys minted at enqueue:
+    `{sku_key, product_key, title, raw_title?, vendor?, product_type?, pdp_url,
+      attributes_raw?}`.
+
+    The shape mirrors what the per-SKU consumers read: `_get_product(ctx)`
+    returns `ctx["product"]`, the probe anchor reads `product.canonical_url`
+    (NOT pdp_url), and build_per_sku_report's null-guard only fires when
+    `missing_inputs AND not product.product_key` — so product_key MUST be set
+    for citation scoring to run. Catalog-only dimensions degrade to low scores
+    with missing_inputs=["catalog_skus"]; that's the "connect store to measure"
+    funnel, surfaced at read time.
+    """
+    title = str(item.get("title") or item.get("raw_title") or "").strip()
+    vendor = (str(item.get("vendor") or "").strip() or None)
+    product_type = (str(item.get("product_type") or "").strip() or None)
+    pdp_url = str(item.get("pdp_url") or "").strip() or None
+    product = {
+        "product_key": item.get("product_key"),
+        "title": title,
+        "vendor": vendor,
+        "brand": vendor,
+        "product_type": product_type,
+        "category": product_type,
+        # Probe anchor + next_best_action host both read canonical_url first,
+        # falling back to pdp_url — set both to the merchant's own URL so the
+        # "is your URL cited?" match has a target.
+        "canonical_url": pdp_url,
+        "pdp_url": pdp_url,
+    }
+    if item.get("attributes_raw") is not None:
+        product["attributes_raw"] = item.get("attributes_raw")
+    return {
+        "sku_key": item.get("sku_key"),
+        "merchant_id": merchant_id,
+        "sku_title": title,
+        "product": product,
+        "sku": {"sku_key": item.get("sku_key"), "title": title},
+        # Marks catalog dimensions as un-measurable (no synced catalog) without
+        # tripping the all-null guard (product_key is set above).
+        "missing_inputs": ["catalog_skus"],
+        "synthetic_url_audit": True,
+    }
+
+
+def register_synthetic_sku_contexts(
+    items: List[Dict[str, Any]], merchant_id: str,
+) -> List[str]:
+    """Register synthetic URL-audit contexts so load_sku_context() resolves
+    them. Idempotent; returns the sku_keys registered. Called by the worker at
+    discovery (and on resume) from the persisted launch.synthetic_products."""
+    keys: List[str] = []
+    for item in items or []:
+        sku_key = str((item or {}).get("sku_key") or "").strip()
+        if not sku_key:
+            continue
+        ctx = build_synthetic_sku_context(item, str(merchant_id))
+        _SYNTHETIC_SKU_CONTEXTS[(sku_key, str(merchant_id))] = ctx
+        keys.append(sku_key)
+    return keys
+
+
+def clear_synthetic_sku_contexts(sku_keys: List[str], merchant_id: str) -> None:
+    """Drop a run's synthetic contexts once it's done, to bound registry growth."""
+    for sku_key in sku_keys or []:
+        _SYNTHETIC_SKU_CONTEXTS.pop((str(sku_key or ""), str(merchant_id)), None)
 
 
 def _row_dict(row: Any) -> Optional[Dict[str, Any]]:
@@ -4040,6 +4135,15 @@ async def load_sku_context(sku_key: str, merchant_id: str) -> Dict[str, Any]:
     cache_key = (str(sku_key or ""), str(merchant_id or ""))
     if cache_key in _SKU_CONTEXT_CACHE:
         return _SKU_CONTEXT_CACHE[cache_key]
+    # URL-audit synthetic products have no catalog row — resolve from the
+    # registry (survives reset_sku_context_cache, see _SYNTHETIC_SKU_CONTEXTS).
+    # Checked before the catalog query so it's authoritative for `urlwedge:*`
+    # keys and so the per_sku assembly loop (which runs after the cache reset)
+    # sees the same context the probe fan-out used.
+    if cache_key in _SYNTHETIC_SKU_CONTEXTS:
+        ctx = _SYNTHETIC_SKU_CONTEXTS[cache_key]
+        _SKU_CONTEXT_CACHE[cache_key] = ctx
+        return ctx
     if not cache_key[0] or not cache_key[1]:
         return {"sku_key": sku_key, "merchant_id": merchant_id, "missing_inputs": ["sku_key", "merchant_id"]}
 

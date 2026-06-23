@@ -37,6 +37,7 @@ genuinely missing keys.
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import logging
 import re
 import time
@@ -59,6 +60,7 @@ from db.database import database
 from db.merchant_audit_runs import (
     count_runs_for_merchant_by_subject,
     count_runs_in_window,
+    enqueue_audit_run_with_replay,
     fetch_audit_run_by_id,
     record_audit_run_completed,
     record_audit_run_started,
@@ -997,6 +999,19 @@ _FREE_URL_AUDITS_PER_MERCHANT = int(
 _WEDGE_MAX_RUNS = int(_os.getenv("WEDGE_MAX_RUNS", "2"))
 _WEDGE_RUN_STALE_TTL_S = int(_os.getenv("WEDGE_RUN_STALE_TTL_S", "900"))
 
+# Per-product (per-SKU) URL audit: each pasted URL is audited as its own SKU
+# through the durable per-SKU pipeline. prompts_per_sku is kept LOW (vs the
+# readiness default of 40) so 5 URLs stays affordable — Gemini-only, no verify
+# pass. At 8 prompts × 5 URLs that's ~40 grounded calls, a real per-product
+# citation signal at ~1/5th the readiness cost. Tunable via env.
+_WEDGE_PROMPTS_PER_SKU = int(_os.getenv("WEDGE_PROMPTS_PER_SKU", "8"))
+_WEDGE_COVERAGE_PROFILE = _os.getenv("WEDGE_COVERAGE_PROFILE", "pilot_gemini")
+_WEDGE_PROVIDERS = [
+    p.strip()
+    for p in _os.getenv("WEDGE_PROVIDERS", "gemini").split(",")
+    if p.strip()
+]
+
 
 class MerchantUrlAuditRequest(BaseModel):
     """POST /url-readiness body — merchant-CURATED Tier-1 wedge.
@@ -1011,10 +1026,11 @@ class MerchantUrlAuditRequest(BaseModel):
     product_urls: List[str] = Field(
         ...,
         min_length=1,
-        max_length=3,
+        max_length=5,
         description=(
-            "1–3 product page URLs the merchant wants audited (their hero "
-            "SKUs). We fetch each for clean title / vendor / type data."
+            "1–5 product page URLs the merchant wants audited (their hero "
+            "SKUs). We fetch each for clean title / vendor / type data and "
+            "audit each as its own per-product report."
         ),
     )
     website: Optional[str] = Field(
@@ -1119,6 +1135,57 @@ def _brand_name_from_domain(domain: Optional[str]) -> Optional[str]:
     return label.title() or None
 
 
+def _synthetic_url_sku_key(merchant_id: str, pdp_url: str) -> str:
+    """Deterministic synthetic SKU/product key for a pasted URL (no catalog).
+
+    Namespaced `urlwedge:` so it can never collide with a real catalog key, and
+    deterministic on (merchant_id, pdp_url) so re-auditing the same URL reuses
+    the key (the per-run probe rows are still namespaced by audit_run_id, so no
+    cross-run bleed)."""
+    digest = hashlib.sha1(
+        f"{merchant_id}|{(pdp_url or '').strip().lower()}".encode("utf-8")
+    ).hexdigest()[:16]
+    return f"urlwedge:{digest}"
+
+
+def _shape_url_audit_response(row: Dict[str, Any]) -> Dict[str, Any]:
+    """Reshape a completed per_sku run row into the URL-audit response envelope.
+
+    report_jsonb is the per_sku brand_report (per_sku_reports + brand_rollup +
+    authority_map). The base payload (audited_products, methodology,
+    free_audits_*, billing) was echoed into launch.wedge_base_payload at
+    enqueue. Catalog-only dimensions are flagged unavailable so the client
+    renders the connect-store funnel rather than misleading low scores.
+    """
+    run_id = row.get("run_id")
+    report = row.get("report_jsonb")
+    report = report if isinstance(report, dict) else {}
+    partial = row.get("partial_result_jsonb")
+    launch = (partial.get("launch") or {}) if isinstance(partial, dict) else {}
+    base = launch.get("wedge_base_payload") or {}
+    brand_rollup = report.get("brand_rollup") or {}
+    out: Dict[str, Any] = {
+        "status": "succeeded",
+        "run_id": run_id,
+        "audit_run_id": run_id,
+        "tier": "url_per_sku",
+        "per_sku_reports": report.get("per_sku_reports") or [],
+        "brand_rollup": brand_rollup,
+        "authority_map": report.get("authority_map") or {},
+        "where_you_can_win": (
+            brand_rollup.get("where_you_can_win")
+            or report.get("where_you_can_win")
+        ),
+        "suggested_prompts": report.get("suggested_prompts"),
+        "brand_report": report,
+        "catalog_dimensions_available": False,
+    }
+    if isinstance(base, dict):
+        for key, value in base.items():
+            out.setdefault(key, value)
+    return out
+
+
 def _is_wedge_run_stale(requested_at: Any) -> bool:
     if not requested_at:
         return False
@@ -1177,6 +1244,7 @@ async def run_merchant_url_audit(
     synchronously, before the run is recorded.
     """
     from services.bd_cold_start_service import fetch_curated_audit_product
+    from services.idempotency import compute_audit_idempotency_key
 
     # 1. Free-allowance: the first N URL audits per merchant run free. Beyond
     #    that we do NOT hard-block a merchant who can pay — we METER the audit
@@ -1232,9 +1300,17 @@ async def run_merchant_url_audit(
     if over_free:
         from services.credit_consumption_service import estimate_probe_credits
 
-        wedge_probe_count = len(audit_products) * max(1, _WEDGE_MAX_RUNS)
+        # Per-SKU pricing: each resolved URL is probed prompts_per_sku times
+        # per provider (Gemini-only for the wedge). Price against the SAME
+        # probe count the worker will actually run so billing matches cost.
+        wedge_probe_count = (
+            len(audit_products)
+            * max(1, _WEDGE_PROMPTS_PER_SKU)
+            * max(1, len(_WEDGE_PROVIDERS))
+        )
         metered_credits, metered_cogs = estimate_probe_credits(
-            [("gemini", wedge_probe_count, True)]
+            [(prov, len(audit_products) * max(1, _WEDGE_PROMPTS_PER_SKU), True)
+             for prov in (_WEDGE_PROVIDERS or ["gemini"])]
         )
         balance = await get_balance(merchant_id)
         available = int(balance.get("credits") or 0)
@@ -1293,53 +1369,57 @@ async def run_merchant_url_audit(
         if resolved_vendor:
             p["vendor"] = resolved_vendor
 
-    # 4. Record the run; subject_type marks it for the free-allowance count.
-    run_id = await record_audit_run_started(
-        merchant_id=merchant_id,
-        product_keys=[p["pdp_url"] for p in audit_products],
-        subject_type="merchant_url",
-    )
-    if not run_id:
-        raise HTTPException(
-            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
-            detail="Could not start the audit (storage unavailable). Re-try.",
-        )
+    # 4. Mint a synthetic per-product identity per URL. URL audits have NO
+    #    synced catalog, so each pasted URL becomes a synthetic SKU (namespaced
+    #    `urlwedge:*`) that the durable per-SKU pipeline probes via a registered
+    #    synthetic context. Deterministic on (merchant_id, pdp_url) so a re-run
+    #    reuses the same key (and the dedup window catches double-submits).
+    synthetic_products: List[Dict[str, Any]] = []
+    for p in audit_products:
+        key = _synthetic_url_sku_key(merchant_id, p["pdp_url"])
+        synthetic_products.append({
+            "sku_key": key,
+            "product_key": key,
+            "title": p["title"],
+            "raw_title": p.get("raw_title"),
+            "vendor": p.get("vendor"),
+            "product_type": p.get("product_type"),
+            "pdp_url": p["pdp_url"],
+            "attributes_raw": p.get("attributes_raw"),
+        })
 
-    # 5. The result fields known immediately (no LLM yet). Stored with the
-    #    report when the background run completes, and echoed in the 202 so the
-    #    client can render "auditing N products…" right away.
+    # 5. Result fields known immediately (echoed in the 202 + persisted in the
+    #    launch so the GET reshape can echo them on completion).
     base_payload = {
-        "audit_run_id": run_id,
         "audited_url": website,
-        "tier": "url_wedge",
+        "tier": "url_per_sku",
         "audited_products": [
             {
                 "title": p["title"],
                 "raw_title": p.get("raw_title"),
                 "pdp_url": p["pdp_url"],
                 "vendor": p.get("vendor"),
+                "sku_key": sp["sku_key"],
             }
-            for p in audit_products
+            for p, sp in zip(audit_products, synthetic_products)
         ],
         "methodology": {
-            "model": "merchant_curated",
+            "model": "merchant_curated_per_sku",
             "products_audited": len(audit_products),
             "products_requested": len(body.product_urls),
-            "queries_per_product": _WEDGE_MAX_RUNS,
+            "queries_per_product": _WEDGE_PROMPTS_PER_SKU,
             "what_we_checked": (
-                "For each product URL you gave us, we ran AI shopping-agent "
-                "(Gemini grounded search) buyer-intent queries and checked "
-                "whether your own URL was cited in the answer."
+                "Each product URL you gave us is audited on its own: we run "
+                "AI shopping-agent (Gemini grounded search) buyer-intent "
+                "queries per product and check whether your URL is cited, "
+                "which competitors are cited instead, and on which sources."
             ),
             "limitations": [
-                "This is a small free sample (a few queries per product), "
-                "not an exhaustive measurement.",
-                "We have not yet verified whether the third-party sources "
-                "Gemini cited actually mention your brand — so a low score "
-                "here means 'not found in this sample', not a definitive "
-                "'invisible'.",
-                "Connect your store for a deeper, verified, full-catalog "
-                "audit with availability and serving data.",
+                "Catalog-only signals (availability, variants, structured "
+                "routing) need a connected store — connect to unlock the full "
+                "per-SKU score and execution.",
+                "Citation results reflect this grounded sample, not an "
+                "exhaustive measurement.",
             ],
             "unresolved_urls": unresolved,
         },
@@ -1347,7 +1427,6 @@ async def run_merchant_url_audit(
             _FREE_URL_AUDITS_PER_MERCHANT
             if _FREE_URL_AUDITS_PER_MERCHANT > 0 else None
         ),
-        # A credit-metered run doesn't consume a free slot.
         "free_audits_used": used if over_free else used + 1,
         "free_audits_remaining": (
             None if _FREE_URL_AUDITS_PER_MERCHANT <= 0
@@ -1356,29 +1435,33 @@ async def run_merchant_url_audit(
         ),
         "billing_mode": "credits" if over_free else "free",
         "credits_charged": metered_credits if over_free else 0,
+        "catalog_dimensions_available": False,
     }
 
-    # 6a. Debit credits for a metered run (idempotent on run_id; the free path
-    #     debits nothing). Done after the run is recorded so the debit shares
-    #     the run id; if scheduling the work then fails, we refund (below).
+    # 6. Debit credits for a metered run BEFORE enqueue, keyed on the
+    #    deterministic idempotency_key (NOT a run_id). Debiting before enqueue
+    #    avoids a race where the worker claims the queued run and starts probing
+    #    before a failed debit can mark it failed. consume() is idempotent on
+    #    the key, so a double-submit within the window charges once.
+    idempotency_key = compute_audit_idempotency_key(
+        merchant_id=merchant_id,
+        product_keys=[sp["product_key"] for sp in synthetic_products],
+        subject_type="merchant_url",
+    )
     if over_free and metered_credits > 0:
         from services import credit_consumption_service as _ccs
         try:
             await _ccs.consume(
                 merchant_id,
                 "audit",
-                idempotency_key=f"url_wedge:{run_id}",
+                idempotency_key=f"url_wedge:{idempotency_key}",
                 credits=metered_credits,
                 usd_cogs=metered_cogs,
             )
         except Exception as exc:  # noqa: BLE001 - surface as payment error
             logger.warning(
-                "url-wedge credit debit failed merchant_id=%s run_id=%s: %s",
-                merchant_id, run_id, exc,
-            )
-            await record_audit_run_completed(
-                run_id=run_id, status="failed",
-                error_message="credit_debit_failed",
+                "url-wedge credit debit failed merchant_id=%s: %s",
+                merchant_id, exc,
             )
             raise HTTPException(
                 status_code=status.HTTP_402_PAYMENT_REQUIRED,
@@ -1388,38 +1471,55 @@ async def run_merchant_url_audit(
                 },
             ) from exc
 
-    # 6b. Kick the audit off in the background; the client polls for the result.
-    try:
-        _schedule_wedge_audit(
-            _run_wedge_audit_background(
-                run_id=run_id,
-                merchant_id=merchant_id,
-                merchant_name=merchant_name,
-                merchant_domain=merchant_domain,
-                audit_products=audit_products,
-                base_payload=base_payload,
-            )
-        )
-    except Exception:
-        # Couldn't even launch the work — refund the metered debit so the
-        # merchant isn't charged for an audit that never ran.
+    # 7. Enqueue on the DURABLE per-SKU worker (not a bare asyncio task — that
+    #    was the source of orphaned runs that never completed). subject_type
+    #    keeps the free-allowance count + GET scoping; the worker builds
+    #    products from launch.synthetic_products, runs per-SKU citation probes
+    #    (Gemini-only, prompts_per_sku), and finalizes via the minimal
+    #    no-executor verify path.
+    run_id, was_existing = await enqueue_audit_run_with_replay(
+        merchant_id=merchant_id,
+        product_keys=[sp["product_key"] for sp in synthetic_products],
+        subject_type="merchant_url",
+        idempotency_key=idempotency_key,
+        request_options_jsonb={
+            "launch": {
+                "audit_mode": "per_sku",
+                "coverage_profile": _WEDGE_COVERAGE_PROFILE,
+                "providers": list(_WEDGE_PROVIDERS),
+                "verify_providers": [],
+                "prompts_per_sku": _WEDGE_PROMPTS_PER_SKU,
+                "synthetic_products": synthetic_products,
+                "merchant_name": merchant_name,
+                "merchant_domain": merchant_domain,
+                "billing_mode": "credits" if over_free else "free",
+                "estimated_audit_credits": int(metered_credits),
+                "wedge_base_payload": base_payload,
+            }
+        },
+    )
+    if not run_id:
+        # Couldn't persist the run — refund the debit so the merchant isn't
+        # charged for an audit that never started.
         if over_free and metered_credits > 0:
             from services import credit_consumption_service as _ccs
             try:
                 await _ccs.refund(
                     merchant_id, "audit", metered_credits,
-                    source_event_id=f"url_wedge_refund:{run_id}",
+                    source_event_id=f"url_wedge_refund:{idempotency_key}",
                     usd_cogs=metered_cogs,
                 )
             except Exception:  # noqa: BLE001 - best-effort refund
                 logger.warning(
-                    "url-wedge refund failed run_id=%s", run_id, exc_info=True,
+                    "url-wedge refund failed merchant_id=%s", merchant_id,
+                    exc_info=True,
                 )
-        await record_audit_run_completed(
-            run_id=run_id, status="failed", error_message="schedule_failed",
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="Could not start the audit (storage unavailable). Re-try.",
         )
-        raise
 
+    base_payload["audit_run_id"] = run_id
     return {"status": "running", "run_id": run_id, "brand_report": None, **base_payload}
 
 
@@ -1447,10 +1547,10 @@ async def get_merchant_url_audit(
         )
     run_status = row.get("status") or "running"
     if run_status == "succeeded":
-        # report_jsonb holds the full result payload assembled by the runner.
-        return sanitize_report_for_merchant(row.get("report_jsonb")) or {
-            "status": "succeeded", "run_id": run_id, "brand_report": None,
-        }
+        # report_jsonb is the per_sku brand_report (per_sku_reports + brand_rollup
+        # + authority_map). Reshape it into the URL-audit envelope the client
+        # expects (status/run_id/per_sku_reports/methodology/…).
+        return _shape_url_audit_response(row)
     if run_status == "failed":
         err = row.get("error_message") or ""
         msg = (
@@ -1459,20 +1559,11 @@ async def get_merchant_url_audit(
             else (err or "Audit failed. Please re-run.")
         )
         return {"status": "failed", "run_id": run_id, "error": msg}
-    if run_status == "running" and _is_wedge_run_stale(row.get("requested_at")):
-        try:
-            await record_audit_run_completed(
-                run_id=run_id,
-                status="failed",
-                error_message="audit_timed_out_stale",
-            )
-        except Exception:  # noqa: BLE001 — best-effort stale cleanup
-            logger.warning("Failed to mark stale wedge run failed: %s", run_id)
-        return {
-            "status": "failed",
-            "run_id": run_id,
-            "error": "This audit didn't finish in time — please re-run.",
-        }
+    # NOTE: no inline stale-timeout fail here. URL audits now run on the durable
+    # worker (per_sku), which legitimately runs several minutes; the old 15-min
+    # inline check would false-fail a healthy, actively-leased run (split-brain
+    # with the worker). Truly-abandoned runs are reaped by
+    # fail_abandoned_runs() (30-min TTL, no-live-lease) instead.
     return {"status": "running", "run_id": run_id}
 
 
