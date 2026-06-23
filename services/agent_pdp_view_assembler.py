@@ -894,32 +894,51 @@ def row_to_upsert_params(row: Dict[str, Any]) -> Dict[str, Any]:
 async def _fetch_enrichment_for_canonical(
     products: List[Dict[str, Any]],
 ) -> Optional[Dict[str, Any]]:
-    """Fetch the product_enrichment overlay for a content_key's canonical product
-    (E2 — the enrichment publish bridge). Keyed by the catalog identity triple
-    (merchant_id, platform, source_product_id == platform_product_id), geo
-    'default'. Best-effort: any failure (missing table, DB hiccup) degrades to no
-    overlay rather than breaking the serve-cache rebuild — agent_pdp_view is a
-    cache, never the source of truth."""
+    """Fetch the product_enrichment overlay for the served PDP. Prefers a
+    BRAND-ATTESTED overlay anywhere in the content_key cluster (the verified
+    brand's own copy is authoritative for the entity, even if attest keyed it to
+    a non-canonical member), else the canonical product's overlay. Keyed by the
+    catalog identity triple (merchant_id, platform, source_product_id), geo
+    'default'. Best-effort: any failure degrades to no overlay rather than
+    breaking the serve-cache rebuild — agent_pdp_view is a cache, never truth."""
     if not products:
         return None
-    canonical = pick_canonical(products)
-    merchant_id = canonical.get("merchant_id")
-    platform = canonical.get("platform")
-    source_product_id = canonical.get("source_product_id")
-    if not (merchant_id and platform and source_product_id):
-        return None
-    try:
-        from db.product_enrichment import get_enrichment
+    from db.product_enrichment import get_enrichment
 
-        return await get_enrichment(
-            str(merchant_id), str(platform), str(source_product_id)
+    canonical = pick_canonical(products)
+    canonical_key = (
+        canonical.get("merchant_id"),
+        canonical.get("platform"),
+        canonical.get("source_product_id"),
+    )
+    # Finding B: walk the content_key cluster — a brand-attested overlay wins
+    # (only the verified brand can create one, so it's safe + authoritative for
+    # the entity, even if attest keyed it to a non-canonical seed beside a synced
+    # product that wins pick_canonical), else fall back to the canonical's overlay.
+    canonical_overlay: Optional[Dict[str, Any]] = None
+    for product in products:
+        ident = (
+            product.get("merchant_id"),
+            product.get("platform"),
+            product.get("source_product_id"),
         )
-    except Exception as exc:  # noqa: BLE001
-        logger.warning(
-            "agent_pdp_view enrichment overlay fetch failed (best-effort): %s",
-            str(exc)[:200],
-        )
-        return None
+        if not all(ident):
+            continue
+        try:
+            overlay = await get_enrichment(str(ident[0]), str(ident[1]), str(ident[2]))
+        except Exception as exc:  # noqa: BLE001
+            logger.warning(
+                "agent_pdp_view enrichment overlay fetch failed (best-effort): %s",
+                str(exc)[:200],
+            )
+            continue
+        if not overlay:
+            continue
+        if overlay.get("updated_by_employee_id") == "brand_attestation":
+            return overlay  # authoritative brand copy — wins immediately
+        if ident == canonical_key:
+            canonical_overlay = overlay
+    return canonical_overlay
 
 
 async def refresh_agent_pdp_view_for_content_key(
