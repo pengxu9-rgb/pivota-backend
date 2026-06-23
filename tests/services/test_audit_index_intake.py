@@ -10,6 +10,7 @@ from services.audit_index_intake import (
     stable_source_id,
 )
 from services.catalog_identity import make_content_key
+from services.catalog_sync_service import make_catalog_product_key
 
 
 def _shopify_audit_product():
@@ -33,7 +34,12 @@ def test_maps_audit_product_to_canonical_fields():
     assert f["canonical_url"].startswith("https://www.anua.com/products/heartleaf-toner")
     assert f["source_domain"] == "anua.com"  # www + scheme stripped
     assert f["product_type"] == "Toner"
-    assert f["product_key"] == f"m_anua|{PLATFORM_URL_AUDIT}|{f['source_product_id']}"
+    # product_key is the canonical catalog key (prod::merchant::platform::source),
+    # not a bespoke pipe-joined format — so url_audit seeds parse like every other row.
+    assert f["product_key"] == make_catalog_product_key(
+        "m_anua", PLATFORM_URL_AUDIT, f["source_product_id"]
+    )
+    assert f["product_key"].startswith("prod::m_anua::")
 
 
 def test_stable_source_id_dedups_url_variants():
