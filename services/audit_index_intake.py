@@ -17,8 +17,12 @@ best-effort + flag-gated so it can never break a live audit.
 from __future__ import annotations
 
 import logging
+import os
 from typing import Any, Dict, Optional
 from urllib.parse import urlparse
+
+from sqlalchemy import func
+from sqlalchemy.dialects.postgresql import insert as _pg_insert
 
 from services.catalog_identity import make_content_key
 
@@ -82,3 +86,86 @@ def audit_product_to_index_fields(
         "raw_title": audit_product.get("raw_title"),
         "attributes_raw": audit_product.get("attributes_raw") or {},
     }
+
+
+def audit_intake_enabled() -> bool:
+    """Flag: auto-seed the commerce index from audits. Default OFF — ships dark,
+    enabled per-env after canary. (The upsert is best-effort regardless, so it
+    can never break an audit; the flag governs whether we attempt it at all.)"""
+    return os.getenv("ENABLE_AUDIT_INDEX_INTAKE", "").strip().lower() in {
+        "1", "true", "yes", "on",
+    }
+
+
+# Only the columns we set; everything else (catalog_track, truth_tier,
+# readiness_tier, pdp_scope='unverified', sync_status, created_at, …) takes its
+# server_default — and pdp_lifecycle_stage stays NULL, so a seed is NOT recalled
+# /served until it graduates or is claimed.
+_CATALOG_INSERT_COLUMNS = (
+    "product_key", "merchant_id", "platform", "source_product_id",
+    "title", "brand", "content_key", "canonical_url", "source_domain",
+    "product_type",
+)
+
+
+async def upsert_audited_sku_to_index(
+    merchant_id: str, audit_product: Dict[str, Any]
+) -> Optional[str]:
+    """Best-effort: upsert one audited product into catalog_products (the
+    canonical index entity) keyed on product_key, then refresh its agent_pdp_view
+    row. An OBSERVED, unclaimed seed. Returns the content_key (or product_key) on
+    success, None otherwise. NEVER raises — it must not break a live audit."""
+    fields = audit_product_to_index_fields(merchant_id, audit_product)
+    if not fields:
+        return None
+    try:
+        from db.catalog import catalog_products
+        from db.database import database
+
+        values = {k: fields.get(k) for k in _CATALOG_INSERT_COLUMNS}
+        stmt = _pg_insert(catalog_products).values(**values)
+        stmt = stmt.on_conflict_do_update(
+            index_elements=["product_key"],
+            set_={
+                "title": stmt.excluded.title,
+                "brand": func.coalesce(stmt.excluded.brand, catalog_products.c.brand),
+                "content_key": func.coalesce(
+                    stmt.excluded.content_key, catalog_products.c.content_key
+                ),
+                "canonical_url": func.coalesce(
+                    stmt.excluded.canonical_url, catalog_products.c.canonical_url
+                ),
+                "source_domain": func.coalesce(
+                    stmt.excluded.source_domain, catalog_products.c.source_domain
+                ),
+                "product_type": func.coalesce(
+                    stmt.excluded.product_type, catalog_products.c.product_type
+                ),
+                "updated_at": func.now(),
+                "content_changed_at": func.now(),
+            },
+        )
+        await database.execute(stmt)
+    except Exception as exc:  # noqa: BLE001 — best-effort, never break the audit
+        logger.warning(
+            "upsert_audited_sku_to_index: catalog upsert failed for %s: %s",
+            fields.get("product_key"), str(exc)[:200],
+        )
+        return None
+
+    content_key = fields.get("content_key")
+    if content_key:
+        try:
+            from services.agent_pdp_view_assembler import (
+                refresh_agent_pdp_view_for_content_key,
+            )
+
+            await refresh_agent_pdp_view_for_content_key(
+                content_key, refresh_source="url_audit_intake"
+            )
+        except Exception as exc:  # noqa: BLE001 — PDP refresh is best-effort
+            logger.warning(
+                "upsert_audited_sku_to_index: pdp refresh failed for %s: %s",
+                content_key, str(exc)[:200],
+            )
+    return content_key or fields.get("product_key")

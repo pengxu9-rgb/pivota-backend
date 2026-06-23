@@ -71,6 +71,10 @@ from services.agent_center_bd_report_service import (
     run_wedge_hero_sku_intelligence,
     sanitize_report_for_merchant,
 )
+from services.audit_index_intake import (
+    audit_intake_enabled,
+    upsert_audited_sku_to_index,
+)
 from services.catalog_identity import make_content_key
 from services.catalog_sync_service import make_pivota_canonical_fields
 from services.merchant_audit_readiness import assess_merchant_audit_readiness
@@ -1210,6 +1214,17 @@ async def run_merchant_url_audit(
                 "unresolved": unresolved,
             },
         )
+
+    # P1: auto-seed the commerce index with the audited SKUs — the audit IS the
+    # index-build motion. Best-effort + flag-gated (ENABLE_AUDIT_INDEX_INTAKE) so
+    # it can never break the audit; observed/unclaimed seeds, un-served until
+    # they graduate or are claimed.
+    if audit_intake_enabled():
+        try:
+            for _seed_product in audit_products:
+                await upsert_audited_sku_to_index(merchant_id, _seed_product)
+        except Exception:  # noqa: BLE001 — intake must never break the audit
+            logger.warning("audit_index_intake: seed loop failed", exc_info=False)
 
     # 2b. Credit metering once the free allowance is used up. Price the wedge
     #     with the shared per-probe model (the background run fans Gemini

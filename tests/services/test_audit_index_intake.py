@@ -60,3 +60,55 @@ def test_brand_optional():
     # content_key still mints from title alone? make_content_key needs brand -> None
     # (brand+title key); brandless seeds resolve via the identity gate downstream.
     assert "content_key" in f
+
+
+def test_audit_intake_flag_defaults_off(monkeypatch):
+    import services.audit_index_intake as intake
+
+    monkeypatch.delenv("ENABLE_AUDIT_INDEX_INTAKE", raising=False)
+    assert intake.audit_intake_enabled() is False
+    monkeypatch.setenv("ENABLE_AUDIT_INDEX_INTAKE", "yes")
+    assert intake.audit_intake_enabled() is True
+
+
+def test_upsert_orchestration_best_effort(monkeypatch):
+    import asyncio
+
+    import db.database
+    import services.agent_pdp_view_assembler as asm
+    import services.audit_index_intake as intake
+
+    calls = {"execute": 0, "refresh": None}
+
+    async def _fake_execute(stmt):
+        calls["execute"] += 1
+
+    async def _fake_refresh(ck, *, refresh_source, db=None):
+        calls["refresh"] = (ck, refresh_source)
+        return True
+
+    monkeypatch.setattr(db.database.database, "execute", _fake_execute)
+    monkeypatch.setattr(asm, "refresh_agent_pdp_view_for_content_key", _fake_refresh)
+
+    out = asyncio.run(
+        intake.upsert_audited_sku_to_index("m_anua", _shopify_audit_product())
+    )
+    assert calls["execute"] == 1  # catalog upsert attempted
+    assert calls["refresh"][1] == "url_audit_intake"  # pdp refresh attempted
+    assert out  # content_key returned
+
+
+def test_upsert_skips_unmappable_product(monkeypatch):
+    import asyncio
+
+    import db.database
+    import services.audit_index_intake as intake
+
+    async def _boom(stmt):
+        raise AssertionError("must not touch DB for an unmappable product")
+
+    monkeypatch.setattr(db.database.database, "execute", _boom)
+    out = asyncio.run(
+        intake.upsert_audited_sku_to_index("m1", {"pdp_url": "https://x.com/p"})
+    )
+    assert out is None  # no title -> no mapping -> no DB write
