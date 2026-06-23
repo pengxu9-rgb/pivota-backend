@@ -116,6 +116,11 @@ catalog_products = Table(
     # + plans/rosy-mixing-bengio.md. Nullable for rows predating mig
     # 083; backfilled by scripts/backfill_content_key.py.
     Column("content_key", Text, nullable=True),
+    # P1 (mig 161): claim lifecycle on the SKU —
+    # unclaimed | claimed | attested | substantiated. Audit-seed defaults
+    # 'unclaimed'; a verified brand claim promotes to 'claimed'. Drives the
+    # syndicate-after-claim gate (services/claim_state.py).
+    Column("claim_state", String(16), nullable=False, server_default="unclaimed"),
     # Stage 2a (mig 084): Path A sync hygiene. Path A's _upsert_by_pk
     # sets last_seen_in_sync_at=NOW() on every write. NULL on rows from
     # non-sync paths (external_seed mirror, enrichment agent) or rows

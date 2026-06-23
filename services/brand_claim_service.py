@@ -339,6 +339,11 @@ async def verify_brand_claim(
 
     ok = await set_merchant_brand_direct(claim["merchant_id"])
     await bc.mark_claim_verified(claim_id, proof_ref=f"dns:{domain}")
+    # P1: promote the verified brand's audit-seeded SKUs unclaimed -> claimed
+    # (the lifecycle backbone for the syndicate-after-claim gate). Best-effort.
+    from services.claim_state import promote_merchant_skus_to_claimed
+
+    await promote_merchant_skus_to_claimed(claim["merchant_id"])
     return {"status": "verified", "brand_direct_set": ok}
 
 
