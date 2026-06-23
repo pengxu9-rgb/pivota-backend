@@ -326,7 +326,13 @@ async def _active_subscription_allowance(
          WHERE us.merchant_id = :merchant_id
            AND us.status IN ('active', 'trialing')
            AND sp.status = 'active'
-         ORDER BY us.current_period_start DESC NULLS LAST,
+         -- A merchant can hold more than one active subscription row (e.g. an
+         -- upgrade where the prior plan was never cancelled, or a coupon'd
+         -- secondary plan). Prefer the richest plan so a leftover lower tier
+         -- never outranks the plan the merchant actually upgraded to — a plain
+         -- "latest period" tie-break flip-flops as each sub renews monthly.
+         ORDER BY sp.monthly_credit_allowance DESC NULLS LAST,
+                  us.current_period_start DESC NULLS LAST,
                   us.started_at DESC NULLS LAST,
                   us.created_at DESC NULLS LAST,
                   us.id DESC
