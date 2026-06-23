@@ -695,6 +695,26 @@ async def _handle_subscription_updated(event: Dict[str, Any], db: Database) -> N
                 contact_email=contact_email,
                 tier_name=_as_text(plan["name"]),
             )
+            # A mid-cycle plan change (e.g. upgrade) must refresh the credit
+            # wallet too — the merchants.current_tier UPDATE above doesn't touch
+            # it, and the wallet's plan_tier/allowance feed the AI-readiness /
+            # audit credit preview. Mirrors the downgrade path's
+            # expire_plan_allowance call. Best-effort: a wallet hiccup must not
+            # fail the webhook — the next balance read self-heals via
+            # apply_subscription_allowance.
+            try:
+                from services.merchant_credit_balance_service import (
+                    apply_subscription_allowance,
+                )
+
+                await apply_subscription_allowance(merchant_id)
+            except Exception:  # noqa: BLE001
+                logger.warning(
+                    "apply_subscription_allowance failed on plan change for "
+                    "merchant_id=%s",
+                    merchant_id,
+                    exc_info=True,
+                )
 
         await _mark_event_processed(event_id, db)
     except Exception as exc:

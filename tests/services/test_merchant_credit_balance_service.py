@@ -82,15 +82,35 @@ class FakeCreditConn:
             merchant_id = str(values["merchant_id"])
             row = self.balances[merchant_id]
             period_start = values["allowance_period_start"]
-            if row.get("allowance_period_start") == period_start:
-                return None
-            row["credits"] = (
-                int(row.get("purchased_credits") or 0)
-                + int(values["allowance_credits"])
+            new_allowance = int(values["allowance_credits"])
+            new_tier = str(values["plan_tier"])
+            # Mirror the SQL gate: grant on a new calendar month OR on an
+            # upgrade (tier changed to a larger allowance). The real SQL is
+            # "< period_start OR >= +1 month"; the fake collapses the monthly
+            # arm to "different period" which suffices for the monkeypatched
+            # single-month tests.
+            monthly_due = row.get("allowance_period_start") != period_start
+            is_upgrade = (
+                str(row.get("plan_tier")) != new_tier
+                and new_allowance > int(row.get("allowance_credits") or 0)
             )
-            row["allowance_credits"] = int(values["allowance_credits"])
+            if not (monthly_due or is_upgrade):
+                return None
+            row["credits"] = int(row.get("purchased_credits") or 0) + new_allowance
+            row["allowance_credits"] = new_allowance
             row["allowance_period_start"] = period_start
-            row["plan_tier"] = str(values["plan_tier"])
+            row["plan_tier"] = new_tier
+            row["updated_at"] = datetime.now(timezone.utc)
+            row["version"] = int(row["version"]) + 1
+            return dict(row)
+        if "merchant_credit_balance/sync_plan_tier" in sql:
+            row = self.balances.get(str(values["merchant_id"]))
+            if row is None:
+                return None
+            new_tier = str(values["plan_tier"])
+            if str(row.get("plan_tier")) == new_tier:
+                return None
+            row["plan_tier"] = new_tier
             row["updated_at"] = datetime.now(timezone.utc)
             row["version"] = int(row["version"]) + 1
             return dict(row)
@@ -455,6 +475,66 @@ async def test_apply_subscription_allowance_rolls_month_and_keeps_topups(monkeyp
     assert balance["purchased_credits"] == 300
     assert balance["allowance_credits"] == 4000
     assert balance["allowance_period_start"] == may
+
+
+@pytest.mark.asyncio
+async def test_apply_subscription_allowance_regrants_on_midcycle_upgrade(monkeypatch):
+    # Bug: a merchant who upgrades Starter->Growth mid-cycle kept seeing the
+    # stale Starter tier + Starter credits on the AI-readiness / audit preview
+    # (which reads plan_tier from this wallet) because the allowance UPDATE is
+    # gated to once per calendar month and never re-fired on upgrade. The
+    # upgrade must re-grant the larger allowance and resync the tier now.
+    from services import merchant_credit_balance_service as svc
+
+    month = datetime(2026, 6, 1, tzinfo=timezone.utc)
+    fake = FakeCreditConn()
+    fake.seed(
+        "merch-A",
+        credits=4300,            # 300 purchased + 4000 starter allowance
+        purchased_credits=300,
+        allowance_credits=4000,
+        allowance_period_start=month,   # already granted this month under Starter
+        plan_tier="starter",
+    )
+    # Live subscription is now Growth with a larger allowance.
+    fake.seed_subscription("merch-A", allowance=20000, plan_tier="growth")
+    monkeypatch.setattr(svc, "_current_month_start", lambda: month)
+
+    balance = await svc.apply_subscription_allowance("merch-A", conn=fake)
+
+    assert balance["plan_tier"] == "growth"
+    assert balance["allowance_credits"] == 20000
+    assert balance["credits"] == 20300       # 300 purchased + 20000 growth
+    assert balance["purchased_credits"] == 300
+    assert balance["allowance_period_start"] == month
+
+
+@pytest.mark.asyncio
+async def test_apply_subscription_allowance_syncs_tier_without_refill(monkeypatch):
+    # A tier change that is NOT an upgrade (same/smaller allowance — e.g. a plan
+    # rename or paid downgrade) must still resync the displayed tier so the
+    # snapshot never lags the live subscription, but it must NOT refill credits.
+    from services import merchant_credit_balance_service as svc
+
+    month = datetime(2026, 6, 1, tzinfo=timezone.utc)
+    fake = FakeCreditConn()
+    fake.seed(
+        "merch-A",
+        credits=1300,            # 300 purchased + 1000 remaining growth allowance
+        purchased_credits=300,
+        allowance_credits=4000,
+        allowance_period_start=month,
+        plan_tier="growth",
+    )
+    # Live subscription downgraded to a same-allowance (or renamed) plan.
+    fake.seed_subscription("merch-A", allowance=4000, plan_tier="starter")
+    monkeypatch.setattr(svc, "_current_month_start", lambda: month)
+
+    balance = await svc.apply_subscription_allowance("merch-A", conn=fake)
+
+    assert balance["plan_tier"] == "starter"   # label resynced
+    assert balance["credits"] == 1300          # NOT refilled
+    assert balance["allowance_credits"] == 4000
 
 
 @pytest.mark.asyncio
