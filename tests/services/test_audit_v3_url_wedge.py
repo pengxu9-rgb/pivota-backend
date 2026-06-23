@@ -219,6 +219,28 @@ def test_post_returns_running_with_run_id(client):
     assert launch["audit_mode"] == "per_sku"
     assert launch["providers"] == mar._WEDGE_PROVIDERS
     assert [s["pdp_url"] for s in launch["synthetic_products"]] == _BODY["product_urls"]
+    # No custom prompts by default.
+    assert launch["custom_prompts"] == []
+
+
+def test_custom_prompts_dedupe_into_launch(client):
+    client.state["used"] = 0
+    res = client.post(_URL, json={
+        **_BODY,
+        "custom_prompts": [
+            "best collagen jelly for glow",
+            "  best collagen jelly for glow  ",  # dup (trim/case)
+            "vitamin c gummies for travel",
+            "",  # blank dropped
+        ],
+    })
+    assert res.status_code == 200, res.text
+    launch = client.enqueued[-1]["request_options_jsonb"]["launch"]
+    # Probed once brand-level; deduped + trimmed; blanks dropped.
+    assert launch["custom_prompts"] == [
+        "best collagen jelly for glow",
+        "vitamin c gummies for travel",
+    ]
 
 
 def test_post_vendor_fallback_when_absent(client, monkeypatch):
