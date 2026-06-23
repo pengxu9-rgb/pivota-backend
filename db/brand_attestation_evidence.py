@@ -13,7 +13,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
-from typing import Optional
+from typing import Any, Dict, List, Optional
 
 from sqlalchemy import BigInteger, Column, DateTime, Index, String, Table, Text
 from sqlalchemy.sql import func
@@ -136,3 +136,67 @@ async def record_lab_evidence(
             merchant_id, product_key, str(exc)[:200],
         )
         return None
+
+
+async def get_evidence(evidence_id: int) -> Optional[Dict[str, Any]]:
+    """Fetch one evidence row by id, or None. Best-effort."""
+    try:
+        await ensure_brand_attestation_evidence_table()
+        row = await database.fetch_one(
+            brand_attestation_evidence.select().where(
+                brand_attestation_evidence.c.id == int(evidence_id)
+            )
+        )
+        return dict(row) if row else None
+    except Exception as exc:  # noqa: BLE001 — best-effort
+        logger.warning("get_evidence failed for %s: %s", evidence_id, str(exc)[:200])
+        return None
+
+
+async def update_evidence_grade(
+    evidence_id: int,
+    *,
+    grading_status: str,
+    graded_by: str,
+    notes: Optional[str] = None,
+) -> bool:
+    """Set the grade + grader + graded_at on one evidence row. Best-effort."""
+    try:
+        await ensure_brand_attestation_evidence_table()
+        await database.execute(
+            brand_attestation_evidence.update()
+            .where(brand_attestation_evidence.c.id == int(evidence_id))
+            .values(
+                grading_status=str(grading_status),
+                graded_by=str(graded_by),
+                graded_at=func.now(),
+                notes=notes,
+            )
+        )
+        return True
+    except Exception as exc:  # noqa: BLE001 — best-effort
+        logger.warning(
+            "update_evidence_grade failed for %s: %s", evidence_id, str(exc)[:200]
+        )
+        return False
+
+
+async def list_evidence_by_status(
+    status: str = GRADING_SUBMITTED, *, limit: int = 100
+) -> List[Dict[str, Any]]:
+    """List evidence rows in one grading_status (default 'submitted' = the review
+    queue), oldest first (FIFO). Best-effort -> [] on failure."""
+    try:
+        await ensure_brand_attestation_evidence_table()
+        rows = await database.fetch_all(
+            brand_attestation_evidence.select()
+            .where(brand_attestation_evidence.c.grading_status == str(status))
+            .order_by(brand_attestation_evidence.c.submitted_at.asc())
+            .limit(max(1, min(int(limit), 500)))
+        )
+        return [dict(r) for r in (rows or [])]
+    except Exception as exc:  # noqa: BLE001 — best-effort
+        logger.warning(
+            "list_evidence_by_status failed for %s: %s", status, str(exc)[:200]
+        )
+        return []
