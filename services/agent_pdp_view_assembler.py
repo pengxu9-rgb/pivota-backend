@@ -766,6 +766,9 @@ def assemble_row(
         "brand": canonical.get("brand"),
         "title": title,
         "description": (description[:5000] if isinstance(description, str) else None),
+        # Brand-attested rich content (E2 bridge) — key selling points + how-to-use.
+        "bullet_points": (enrichment or {}).get("bullet_points"),
+        "usage_scenarios": (enrichment or {}).get("usage_scenarios"),
         # Agent-decision-grade evidence (provenance-backed claims + required
         # disclaimers) — highest-precedence across the content_key cluster.
         "evidence_profile": (evidence or {}).get("evidence_profile"),
@@ -802,7 +805,8 @@ def assemble_row(
 UPSERT_SQL = """
     INSERT INTO agent_pdp_view (
       content_key, pivota_signature_id, product_group_id,
-      brand, title, description, evidence_profile, required_disclaimers,
+      brand, title, description, bullet_points, usage_scenarios,
+      evidence_profile, required_disclaimers,
       image_url, image_urls,
       currency, price_min, price_max, offer_count, offers,
       variants, variants_count, gtin13,
@@ -815,6 +819,7 @@ UPSERT_SQL = """
     ) VALUES (
       :content_key, :pivota_signature_id, :product_group_id,
       :brand, :title, :description,
+      CAST(:bullet_points AS jsonb), CAST(:usage_scenarios AS jsonb),
       CAST(:evidence_profile AS jsonb), CAST(:required_disclaimers AS jsonb),
       :image_url, CAST(:image_urls AS jsonb),
       :currency, :price_min, :price_max, :offer_count, CAST(:offers AS jsonb),
@@ -832,6 +837,8 @@ UPSERT_SQL = """
       brand = EXCLUDED.brand,
       title = EXCLUDED.title,
       description = EXCLUDED.description,
+      bullet_points = EXCLUDED.bullet_points,
+      usage_scenarios = EXCLUDED.usage_scenarios,
       evidence_profile = EXCLUDED.evidence_profile,
       required_disclaimers = EXCLUDED.required_disclaimers,
       image_url = EXCLUDED.image_url,
@@ -882,6 +889,8 @@ def row_to_upsert_params(row: Dict[str, Any]) -> Dict[str, Any]:
     params["breadcrumb"] = to_jsonb(row.get("breadcrumb"))
     params["evidence_profile"] = to_jsonb(row.get("evidence_profile"))
     params["required_disclaimers"] = to_jsonb(row.get("required_disclaimers"))
+    params["bullet_points"] = to_jsonb(row.get("bullet_points"))
+    params["usage_scenarios"] = to_jsonb(row.get("usage_scenarios"))
     # size_guide on catalog_products is already a JSONB value (stored as
     # dict by the LLM extractor / authoring path). coalesce_fashion_fields
     # passes it through verbatim. Re-encode for the SQLAlchemy bind. Other

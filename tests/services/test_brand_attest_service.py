@@ -12,17 +12,21 @@ def test_attestation_to_enrichment_maps_only_served_fields():
         {
             "title": "Anua Heartleaf Toner",
             "description": "Soothing toner",
-            "bullet_points": ["77% heartleaf"],  # not yet served -> dropped
+            "bullet_points": ["77% heartleaf"],  # now served -> maps
+            "usage_scenarios": ["AM/PM after cleansing"],  # now served -> maps
+            "audience_tags": ["sensitive skin"],  # not yet served -> dropped
             "unknown_field": "ignored",
             "summary": "",  # empty -> dropped
         }
     )
     assert out["title_override"] == "Anua Heartleaf Toner"
     assert out["description_markdown"] == "Soothing toner"
-    # Only the fields the assembler actually serves map through; non-served,
+    assert out["bullet_points"] == ["77% heartleaf"]
+    assert out["usage_scenarios"] == ["AM/PM after cleansing"]
+    # Only the fields the assembler actually serves map through; not-yet-served,
     # unknown, and empty fields are dropped so the API doesn't promise serving
     # it can't deliver.
-    assert "bullet_points" not in out
+    assert "audience_tags" not in out
     assert "unknown_field" not in out and "summary_short" not in out
     assert out["updated_by_employee_id"] == "brand_attestation"
     assert attestation_to_enrichment({}) == {}  # nothing -> no provenance stamp
