@@ -30,6 +30,8 @@ AGENT_PDP_VIEW_COLUMNS: Tuple[str, ...] = (
     "brand",
     "title",
     "description",
+    "bullet_points",
+    "usage_scenarios",
     "image_url",
     "image_urls",
     "currency",
@@ -249,13 +251,18 @@ def _row_to_dict(row: Any) -> Dict[str, Any]:
     else:
         data = dict(row)
 
-    for key in ("image_urls", "offers", "variants", "taxonomy_tags", "breadcrumb"):
+    for key in (
+        "image_urls", "offers", "variants", "taxonomy_tags", "breadcrumb",
+        "bullet_points", "usage_scenarios",
+    ):
         data[key] = _coerce_json(data.get(key))
 
     data["image_urls"] = _coerce_list(data.get("image_urls"))
     data["offers"] = _coerce_list(data.get("offers"))
     data["variants"] = _coerce_list(data.get("variants"))
     data["breadcrumb"] = _coerce_list(data.get("breadcrumb"))
+    data["bullet_points"] = _coerce_list(data.get("bullet_points"))
+    data["usage_scenarios"] = _coerce_list(data.get("usage_scenarios"))
     return data
 
 

@@ -601,6 +601,10 @@ agent_pdp_view = Table(
     Column("brand", Text, nullable=True),
     Column("title", Text, nullable=False),
     Column("description", Text, nullable=True),
+    # Brand-attested rich content (E2 bridge from product_enrichment): key
+    # selling points + how-to-use, served to agents alongside title/description.
+    Column("bullet_points", JSONB_TYPE, nullable=True),
+    Column("usage_scenarios", JSONB_TYPE, nullable=True),
     Column("image_url", Text, nullable=True),
     Column("image_urls", JSONB_TYPE, nullable=True),
     Column("currency", String(3), nullable=True),
