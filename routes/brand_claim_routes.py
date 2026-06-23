@@ -31,16 +31,26 @@ _VALID_METHODS = {"dns", "email", "amazon", "shopify", "manual"}
 
 class StartClaimBody(BaseModel):
     brand_domain: Optional[str] = Field(
-        None, description="Domain used for DNS/email verification (required for dns)"
+        None, description="Domain used for DNS/email verification (required for dns + email)"
     )
     method: str = Field("dns", description="dns | email | amazon | shopify | manual")
     content_key: Optional[str] = Field(
         None, description="Optional: scope the claim to one canonical entity"
     )
+    verification_email: Optional[str] = Field(
+        None,
+        description=(
+            "For method=email: a mailbox AT brand_domain (e.g. admin@brand.com). "
+            "We email a 6-digit code there; receiving it proves brand-domain control."
+        ),
+    )
 
 
 class VerifyClaimBody(BaseModel):
     claim_id: str = Field(..., min_length=1)
+    submitted_code: Optional[str] = Field(
+        None, description="For method=email: the 6-digit code from the verification email."
+    )
 
 
 class AttestBody(BaseModel):
@@ -67,18 +77,27 @@ async def start_claim(
     method = (body.method or "dns").strip().lower()
     if method not in _VALID_METHODS:
         raise HTTPException(status_code=422, detail=f"unsupported claim method: {method}")
-    # B4: dns verification requires a well-formed public hostname (rejects empty,
-    # internal names, IPs, malformed input before we ever resolve TXT on it).
-    if method == "dns" and not svc.is_valid_public_hostname(body.brand_domain):
+    # B4: dns + email verification require a well-formed public hostname (rejects
+    # empty, internal names, IPs, malformed input before we resolve/send on it).
+    if method in ("dns", "email") and not svc.is_valid_public_hostname(body.brand_domain):
         raise HTTPException(
             status_code=422,
-            detail="brand_domain must be a valid public hostname for dns verification",
+            detail=f"brand_domain must be a valid public hostname for {method} verification",
         )
+    if method == "email":
+        if not svc.brand_claim_email_enabled():
+            raise HTTPException(status_code=422, detail="email verification is not enabled")
+        if not svc.email_target_valid(body.verification_email, body.brand_domain):
+            raise HTTPException(
+                status_code=422,
+                detail="verification_email must be a mailbox at brand_domain",
+            )
     result = await svc.start_brand_claim(
         merchant_id=merchant_id,
         brand_domain=(body.brand_domain or "").strip() or None,
         method=method,
         content_key=body.content_key,
+        verification_email=(body.verification_email or "").strip() or None,
     )
     if not result.get("claim_id"):
         raise HTTPException(status_code=500, detail="failed to record brand claim")
@@ -96,7 +115,7 @@ async def verify_claim(
     claim = await bc.get_brand_claim(body.claim_id)
     if not claim or claim.get("merchant_id") != merchant_id:
         raise HTTPException(status_code=404, detail="brand claim not found")
-    return await svc.verify_brand_claim(body.claim_id)
+    return await svc.verify_brand_claim(body.claim_id, submitted_code=body.submitted_code)
 
 
 @router.post("/attest")
