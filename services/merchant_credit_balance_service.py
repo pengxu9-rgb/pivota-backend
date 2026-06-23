@@ -349,6 +349,16 @@ async def apply_subscription_allowance(
     tracks the paid top-up portion so the reset can replace only allowance
     credits without rolling over unused allowance. Founder policy can override
     this later without changing the partner-credit path.
+
+    Mid-cycle upgrades re-grant immediately: when the live subscription's tier
+    differs from the persisted snapshot AND carries a larger allowance, refresh
+    the allowance to the new plan now (don't wait for next month's reset). This
+    keeps the credit wallet — which the AI-readiness / audit credit preview
+    reads via plan_tier — consistent with the live subscription that billing
+    reports. Symmetric with the downgrade path (expire_plan_allowance). For a
+    tier change that is NOT an upgrade (e.g. a plan rename or a paid downgrade
+    that must not refill credits), the displayed tier is still synced so the
+    snapshot never lags the live subscription.
     """
     async with _transaction(conn) as tx:
         subscription = await _active_subscription_allowance(merchant_id, tx)
@@ -377,6 +387,10 @@ async def apply_subscription_allowance(
                    OR allowance_period_start >= (
                        :allowance_period_start + INTERVAL '1 month'
                    )
+                   OR (
+                       plan_tier IS DISTINCT FROM :plan_tier
+                       AND :allowance_credits > allowance_credits
+                   )
                )
             RETURNING credits, purchased_credits, allowance_credits,
                       overage_pending_credits, overage_charged_credits,
@@ -395,6 +409,32 @@ async def apply_subscription_allowance(
         )
         if row is not None:
             return _balance_from_row(row)
+
+        # Allowance already granted this period and this is not an upgrade, so
+        # the gated UPDATE no-oped. Still keep the displayed tier in sync with
+        # the live subscription (plan rename / paid downgrade) without touching
+        # credits, so the audit/visibility surface never shows a stale tier.
+        synced = await tx.fetch_one(
+            """
+            -- merchant_credit_balance/sync_plan_tier
+            UPDATE merchant_credit_balance
+               SET plan_tier = :plan_tier,
+                   updated_at = NOW(),
+                   version = version + 1
+             WHERE merchant_id = :merchant_id
+               AND plan_tier IS DISTINCT FROM :plan_tier
+            RETURNING credits, purchased_credits, allowance_credits,
+                      overage_pending_credits, overage_charged_credits,
+                      overage_blocked_until_payment,
+                      overage_last_payment_intent_id,
+                      overage_last_failed_at,
+                      allowance_period_start, usd_cogs_internal,
+                      plan_tier, updated_at, version
+            """,
+            {"merchant_id": merchant_id, "plan_tier": plan_tier},
+        )
+        if synced is not None:
+            return _balance_from_row(synced)
         return await _get_balance_with_conn(merchant_id, tx)
 
 
