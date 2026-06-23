@@ -472,6 +472,44 @@ def pick_gtin13(skus: List[Dict[str, Any]]) -> Optional[str]:
     return sorted(counts.items(), key=lambda kv: (-kv[1], kv[0]))[0][0]
 
 
+def evidence_safe_product_keys(
+    products: List[Dict[str, Any]], skus: List[Dict[str, Any]]
+) -> List[str]:
+    """Cluster members SAFE to draw agent-decision-grade evidence from.
+
+    A no-GTIN content_key is DELIBERATELY non-unique — it collapses to brand+title
+    (services/catalog_identity.py) — so a content_key cluster can collide two
+    DISTINCT physical products. fetch_evidence_for_keys picks ONE member's evidence
+    cluster-wide (ORDER BY external_seed DESC, updated_at DESC LIMIT 1) with no
+    record of which member; assemble_row then bakes it onto pick_canonical's row,
+    which may be a DIFFERENT product — i.e. Brand A's substantiated claim served on
+    Brand B's listing. Restrict the evidence fetch to the canonical member UNLESS
+    the cluster is provably ONE product:
+      - GTIN-resolved (a real barcode folded the cluster — the merge is intended);
+      - a single member (nothing was merged);
+      - all members share one normalized brand + title (legit multi-merchant DTC).
+    Returns the product_key list to pass to fetch_evidence_for_keys.
+    """
+    pkeys = [p["product_key"] for p in products if p.get("product_key")]
+    if len(set(pkeys)) <= 1:
+        return pkeys
+    if pick_gtin13(skus):
+        return pkeys
+    from services.catalog_identity import normalize_brand, normalize_title
+
+    brands = {normalize_brand(p.get("brand") or "") for p in products}
+    titles = {normalize_title(p.get("title") or "") for p in products}
+    if len(brands) == 1 and "" not in brands and len(titles) == 1:
+        return pkeys
+    # Collision: only the canonical member's evidence may be attributed to the
+    # served row. Scoping the fetch (rather than suppressing post-hoc) also keeps
+    # the canonical product's own required_disclaimers — the floor-safety field
+    # rides the same query — without ever pulling a colliding member's claims.
+    canonical = pick_canonical(products)
+    canon_pk = canonical.get("product_key")
+    return [canon_pk] if canon_pk else []
+
+
 def build_taxonomy_tags(canonical: Dict[str, Any]) -> Optional[Dict[str, Any]]:
     fields = {
         "price_tier": canonical.get("price_tier"),
@@ -976,7 +1014,12 @@ async def refresh_agent_pdp_view_for_content_key(
     skus = await fetch_skus_for_keys(product_keys, db=read_db)
     offers = await fetch_offers_for_keys(product_keys, db=read_db)
     external_seed = await fetch_external_seed_for_keys(product_keys, db=read_db)
-    evidence = await fetch_evidence_for_keys(product_keys, db=read_db)
+    # Identity-confidence gate: a no-GTIN content_key is deliberately non-unique
+    # (brand+title), so a cluster can collide DISTINCT products. Scope the evidence
+    # fetch to members safe to attribute to the served row, so we never bake
+    # Brand A's substantiated claim onto Brand B (see evidence_safe_product_keys).
+    evidence_keys = evidence_safe_product_keys(products, skus)
+    evidence = await fetch_evidence_for_keys(evidence_keys, db=read_db)
     # E2 publish bridge: overlay the Pivota enrichment (generated/curated
     # description_markdown) so it reaches the served PDP AND the
     # serving-eligibility gate. Best-effort; None keeps the raw description.
