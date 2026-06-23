@@ -397,7 +397,45 @@ def _claim_instructions(
             f"We emailed a 6-digit verification code to {target}. "
             "Enter it to verify your brand."
         )
+    if method == "manual":
+        return (
+            "Contact Pivota support with evidence of brand ownership (e.g. brand "
+            "registry, trademark, or authorized-representative proof). Our team "
+            "will review and verify your claim."
+        )
     return f"Verification token: {token}"
+
+
+async def approve_manual_claim(
+    claim_id: str, *, approved_by: str, evidence_ref: Optional[str] = None
+) -> Dict[str, Any]:
+    """Support-assisted verification: a Pivota EMPLOYEE, having reviewed a brand's
+    ownership evidence offline, approves a method='manual' claim. The human review
+    IS the verification — so this does NOT run the automated DNS/email proof or the
+    B1 auto-binding; it directly grants brand_direct + promotes the brand's SKUs.
+    Employee-gated at the route (approved_by is recorded in the proof). Only manual
+    claims; idempotent; best-effort writes."""
+    if not approved_by:
+        return {"status": "forbidden"}
+    claim = await bc.get_brand_claim(claim_id)
+    if not claim:
+        return {"status": "not_found"}
+    if claim.get("verification_status") == bc.STATUS_VERIFIED:
+        return {"status": "verified", "brand_direct_set": True}
+    if claim.get("claim_method") != "manual":
+        # dns / email self-verify; only the manual method is employee-approvable.
+        return {"status": "not_manual", "method": claim.get("claim_method")}
+
+    ok = await set_merchant_brand_direct(claim["merchant_id"])
+    proof = f"manual:{approved_by}"
+    if evidence_ref:
+        proof = f"{proof}:{evidence_ref}"
+    await bc.mark_claim_verified(claim_id, proof_ref=proof)
+    # Same lifecycle promotion as DNS/email: unclaimed -> claimed. Best-effort.
+    from services.claim_state import promote_merchant_skus_to_claimed
+
+    await promote_merchant_skus_to_claimed(claim["merchant_id"])
+    return {"status": "verified", "brand_direct_set": ok, "approved_by": approved_by}
 
 
 async def verify_brand_claim(

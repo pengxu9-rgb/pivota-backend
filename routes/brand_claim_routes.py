@@ -12,7 +12,7 @@ store-less brand can establish brand authority without owning a storefront.
 from __future__ import annotations
 
 import logging
-from typing import Optional
+from typing import Any, Dict, Optional
 
 from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel, Field
@@ -20,7 +20,7 @@ from pydantic import BaseModel, Field
 from db import brand_claims as bc
 from services import brand_attest_service as attest_svc
 from services import brand_claim_service as svc
-from utils.auth import get_current_merchant
+from utils.auth import get_current_employee, get_current_merchant
 
 logger = logging.getLogger(__name__)
 
@@ -144,4 +144,47 @@ async def attest(
         raise HTTPException(status_code=422, detail="no attestable fields provided")
     if status == "error":
         raise HTTPException(status_code=500, detail="failed to write attestation")
+    return result
+
+
+class ApproveClaimBody(BaseModel):
+    evidence_ref: Optional[str] = Field(
+        None,
+        description=(
+            "Reference to the ownership evidence reviewed (support ticket, brand "
+            "registry, trademark, etc.). Recorded in the claim's proof trail."
+        ),
+    )
+
+
+@router.post("/claim/{claim_id}/approve")
+async def approve_claim(
+    claim_id: str,
+    body: ApproveClaimBody,
+    employee: Dict[str, Any] = Depends(get_current_employee),
+):
+    """Support-assisted (MANUAL) verification — Pivota-employee only. A staffer who
+    has reviewed a brand's ownership evidence offline approves a method='manual'
+    claim; it flips to verified and the merchant is marked brand_direct. The
+    approving employee is recorded in the proof trail."""
+    approved_by = str(
+        employee.get("employee_id")
+        or employee.get("user_id")
+        or employee.get("sub")
+        or ""
+    )
+    if not approved_by:
+        raise HTTPException(status_code=403, detail="employee identity required")
+    result = await svc.approve_manual_claim(
+        claim_id, approved_by=approved_by, evidence_ref=body.evidence_ref
+    )
+    status = result.get("status")
+    if status == "not_found":
+        raise HTTPException(status_code=404, detail="brand claim not found")
+    if status == "not_manual":
+        raise HTTPException(
+            status_code=409, detail="only manual claims can be employee-approved"
+        )
+    if status == "forbidden":
+        raise HTTPException(status_code=403, detail="employee identity required")
     return result
