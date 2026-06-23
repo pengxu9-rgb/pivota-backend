@@ -983,13 +983,19 @@ async def _fetch_canonical_rows_for_product(product_key: str) -> List[Dict[str, 
             o.is_first_party AS offer_is_first_party,
             o.source_domain AS offer_source_domain,
             o.why_buy_direct AS offer_why_buy_direct,
-            o.offer_payload
+            o.offer_payload,
+            -- P1: the OFFER SELLER's verified brand relationship (offer-scoped,
+            -- joined on o.merchant_id exactly like the canonical search path) so
+            -- the reader classifies brand_direct on this product-scoped path too.
+            -- Flag-gated (ENABLE_BRAND_DIRECT_OFFER_TYPE); NOT a rank signal.
+            bm.metadata_json->>'brand_relationship' AS brand_relationship
         FROM catalog_products p
         JOIN catalog_skus s ON s.product_key = p.product_key
         JOIN catalog_offers o
           ON o.sku_key = s.sku_key
          AND o.suppressed_at IS NULL
         LEFT JOIN catalog_merchants m ON m.merchant_id = p.merchant_id
+        LEFT JOIN catalog_merchants bm ON bm.merchant_id = o.merchant_id
         WHERE p.product_key = :product_key
         ORDER BY o.updated_at DESC
         """,
@@ -1047,13 +1053,19 @@ async def _fetch_canonical_rows_for_sku(sku_key: str) -> List[Dict[str, Any]]:
             o.is_first_party AS offer_is_first_party,
             o.source_domain AS offer_source_domain,
             o.why_buy_direct AS offer_why_buy_direct,
-            o.offer_payload
+            o.offer_payload,
+            -- P1: the OFFER SELLER's verified brand relationship (offer-scoped,
+            -- joined on o.merchant_id exactly like the canonical search path) so
+            -- the reader classifies brand_direct on this sku-scoped path too.
+            -- Flag-gated (ENABLE_BRAND_DIRECT_OFFER_TYPE); NOT a rank signal.
+            bm.metadata_json->>'brand_relationship' AS brand_relationship
         FROM catalog_skus s
         JOIN catalog_products p ON p.product_key = s.product_key
         JOIN catalog_offers o
           ON o.sku_key = s.sku_key
          AND o.suppressed_at IS NULL
         LEFT JOIN catalog_merchants m ON m.merchant_id = p.merchant_id
+        LEFT JOIN catalog_merchants bm ON bm.merchant_id = o.merchant_id
         WHERE s.sku_key = :sku_key
         ORDER BY o.updated_at DESC
         """,

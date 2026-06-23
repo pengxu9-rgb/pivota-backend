@@ -4,11 +4,35 @@ Makes a VERIFIED brand_direct claim load-bearing at serving. Neutrality note:
 offer_type is decision/display metadata, NEVER a rank signal (P0.3).
 """
 
+import inspect
+
+import services.pivot_query_service as pqs
 from services.offer_classification import OFFER_TYPE_BRAND_DIRECT, OFFER_TYPE_RETAILER
 from services.pivot_query_service import (
     _brand_direct_reader_enabled,
     _resolve_offer_type,
 )
+
+
+def test_all_canonical_offer_paths_supply_brand_relationship():
+    """All three offer-node SQL paths must expose the OFFER SELLER's
+    brand_relationship so the shared _build_canonical_offer_node reader can
+    classify brand_direct consistently — canonical search, product-scoped, and
+    sku-scoped. The join MUST be offer-seller-scoped (o.merchant_id), not the
+    product owner (p.merchant_id), or a retailer offer on a brand's product would
+    be mis-classified."""
+    for fn in (
+        pqs._fetch_canonical_search_rows,
+        pqs._fetch_canonical_rows_for_product,
+        pqs._fetch_canonical_rows_for_sku,
+    ):
+        src = inspect.getsource(fn)
+        assert "metadata_json->>'brand_relationship'" in src, (
+            f"{fn.__name__} must SELECT the seller's brand_relationship"
+        )
+        assert "bm.merchant_id = o.merchant_id" in src, (
+            f"{fn.__name__} must join the seller merchant on o.merchant_id"
+        )
 
 
 def test_stored_offer_type_wins():
