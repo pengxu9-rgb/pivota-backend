@@ -28,6 +28,7 @@ from jobs.nightly_index_health_job import (
     _IPS_TOTAL_COUNT_QUERY,
     _ORPHAN_COUNT_QUERY,
     _ORPHAN_DELETE,
+    _REGRESSION_BLOCKER_UPDATE,
     _STALE_INVALIDATION_UPDATE,
     _BATCH_QUERY,
     _classify_product,
@@ -605,3 +606,119 @@ def test_extraction_content_hash_is_deterministic():
     assert h1 == h2
     assert h1 != h3
     assert len(h1) == 64  # sha256 hex
+
+
+# ---------------------------------------------------------------------------
+# ADR-007 SLICE 1: index_eligible (offer-free citation floor)
+# ---------------------------------------------------------------------------
+
+def test_index_eligible_true_for_offer_free_product_meeting_quality_image_identity():
+    """A product with quality+image+identity+description but NO price is
+    index_eligible (citable) yet NOT serving_eligible (no buyable offer)."""
+    state = _classify_product(_full_row(has_price=False), regression_domains=set())
+    assert state["index_eligible"] is True
+    assert state["serving_eligible"] is False
+    # The serving blocker short-circuits at no_price; index_eligible must NOT be
+    # derived from blocker_code (it ignores the price predicate).
+    assert state["blocker_code"] == "no_price"
+
+
+def test_serving_eligible_still_requires_has_price_unchanged():
+    """Regression assertion: serving_eligible MUST still require has_price.
+    ADR-007 is strictly additive — it does not relax the serving gate."""
+    with_price = _classify_product(_full_row(has_price=True), regression_domains=set())
+    without_price = _classify_product(_full_row(has_price=False), regression_domains=set())
+    assert with_price["serving_eligible"] is True
+    assert without_price["serving_eligible"] is False
+    # The only flipped input is has_price.
+    assert with_price["index_eligible"] is True
+    assert without_price["index_eligible"] is True
+
+
+def test_full_product_is_both_serving_and_index_eligible():
+    state = _classify_product(_full_row(), regression_domains=set())
+    assert state["serving_eligible"] is True
+    assert state["index_eligible"] is True
+
+
+def test_index_eligible_requires_has_image_even_offer_free():
+    state = _classify_product(
+        _full_row(has_price=False, image_url=""), regression_domains=set()
+    )
+    assert state["index_eligible"] is False
+
+
+def test_index_eligible_false_for_low_quality_offer_free():
+    state = _classify_product(
+        _full_row(has_price=False, content_quality_score=10.0),
+        regression_domains=set(),
+    )
+    assert state["index_eligible"] is False
+
+
+def test_index_eligible_false_for_unresolved_identity_independent_of_blocker_code():
+    """CRITICAL: with has_price False, the blocker ladder short-circuits at
+    no_price BEFORE entity_unresolved. index_eligible must still be False
+    because it is computed from raw predicates, not blocker_code."""
+    state = _classify_product(
+        _full_row(has_price=False, product_group_id=None, pdp_scope="unverified"),
+        regression_domains=set(),
+    )
+    assert state["blocker_code"] == "no_price"  # proves the short-circuit
+    assert state["identity_resolved"] is False
+    assert state["index_eligible"] is False
+
+
+def test_index_eligible_false_for_short_description_independent_of_blocker_code():
+    state = _classify_product(
+        _full_row(has_price=False, pdp_description="too short"),
+        regression_domains=set(),
+    )
+    assert state["blocker_code"] == "no_price"  # short-circuit masks short desc
+    assert state["index_eligible"] is False
+
+
+def test_index_eligible_false_when_not_live():
+    state = _classify_product(
+        _full_row(has_price=False, sync_status="archived"),
+        regression_domains=set(),
+    )
+    assert state["index_eligible"] is False
+
+
+def test_index_eligible_false_for_non_core_product_offer_free():
+    """A sample/gift/protection row must never become citable even with no
+    price — non-core is re-derived from the raw signal, not blocker_code."""
+    state = _classify_product(
+        _full_row(
+            has_price=False,
+            seed_data_json={"title": "Shipping Protection"},
+            seed_title="Shipping Protection",
+            pdp_title="Shipping Protection",
+            canonical_url="https://example.com/products/narvardeliveryprotection",
+        ),
+        regression_domains=set(),
+    )
+    assert state["index_eligible"] is False
+
+
+def test_index_eligible_false_on_domain_regression():
+    state = _classify_product(
+        _full_row(has_price=False, canonical_url="https://bad-domain.com/p/x"),
+        regression_domains={"bad-domain.com"},
+    )
+    assert state["index_eligible"] is False
+
+
+def test_stale_invalidation_also_clears_index_eligible():
+    """M6 lifecycle: a delisted product must lose index_eligible too, else it
+    stays citable forever."""
+    assert "index_eligible       = FALSE" in _STALE_INVALIDATION_UPDATE
+    # The guard must also fire on still-index-eligible rows.
+    assert "ips.index_eligible = TRUE" in _STALE_INVALIDATION_UPDATE
+
+
+def test_regression_blocker_update_also_clears_index_eligible():
+    """M6 lifecycle: a regressed-domain product must lose index_eligible too."""
+    assert "index_eligible   = FALSE" in _REGRESSION_BLOCKER_UPDATE
+    assert "serving_eligible = FALSE" in _REGRESSION_BLOCKER_UPDATE

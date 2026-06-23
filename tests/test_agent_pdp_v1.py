@@ -92,10 +92,12 @@ class FakeAgentPdpDatabase:
         rows: List[Dict[str, Any]],
         ext_id_to_content_key: Optional[Dict[str, str]] = None,
         serving_eligible_by_content_key: Optional[Dict[str, bool]] = None,
+        index_eligible_by_content_key: Optional[Dict[str, bool]] = None,
     ) -> None:
         self.rows = rows
         self.ext_id_to_content_key = ext_id_to_content_key or {}
         self.serving_eligible_by_content_key = serving_eligible_by_content_key
+        self.index_eligible_by_content_key = index_eligible_by_content_key or {}
         self.calls: List[Dict[str, Any]] = []
 
     def _passes_serving_eligibility(self, query: str, row: Dict[str, Any]) -> bool:
@@ -103,7 +105,15 @@ class FakeAgentPdpDatabase:
             return True
         if self.serving_eligible_by_content_key is None:
             return True
-        return self.serving_eligible_by_content_key.get(row["content_key"]) is True
+        serving_ok = (
+            self.serving_eligible_by_content_key.get(row["content_key"]) is True
+        )
+        # ADR-007 SLICE 1: when INDEX_ELIGIBLE_READ is ON the emitted SQL widens
+        # to (serving_eligible OR index_eligible). Mirror that here.
+        if "ips.index_eligible = TRUE" in query:
+            index_ok = self.index_eligible_by_content_key.get(row["content_key"]) is True
+            return serving_ok or index_ok
+        return serving_ok
 
     async def fetch_one(self, query: str, values: Optional[Dict[str, Any]] = None):
         query_text = str(query)
@@ -153,11 +163,13 @@ def _client(
     *,
     ext_id_to_content_key: Optional[Dict[str, str]] = None,
     serving_eligible_by_content_key: Optional[Dict[str, bool]] = None,
+    index_eligible_by_content_key: Optional[Dict[str, bool]] = None,
 ):
     db = FakeAgentPdpDatabase(
         rows,
         ext_id_to_content_key=ext_id_to_content_key,
         serving_eligible_by_content_key=serving_eligible_by_content_key,
+        index_eligible_by_content_key=index_eligible_by_content_key,
     )
     monkeypatch.setattr(agent_pdp_v1, "database", db)
     app = FastAPI()
@@ -421,3 +433,59 @@ def test_sql_uses_agent_pdp_view_indexed_lookup_paths() -> None:
     assert "WHERE apv.product_group_id = :id" in group_sql
     assert "CASE WHEN apv.pivota_signature_id IS NOT NULL THEN 0 ELSE 1 END" in group_sql
     assert "apv.content_key ASC" in group_sql
+
+
+# ---------------------------------------------------------------------------
+# ADR-007 SLICE 1: INDEX_ELIGIBLE_READ read-gate widening
+# ---------------------------------------------------------------------------
+
+def test_index_eligible_read_off_is_serving_only_byte_identical(monkeypatch) -> None:
+    """Flag OFF (default): an index-eligible-but-not-serving product is 404,
+    and the emitted SQL is the serving-only query (no index_eligible clause)."""
+    monkeypatch.delenv("INDEX_ELIGIBLE_READ", raising=False)
+    client, db = _client(
+        monkeypatch,
+        [_row()],
+        serving_eligible_by_content_key={CK_A: False},
+        index_eligible_by_content_key={CK_A: True},
+    )
+
+    response = client.get(f"/api/agent/pdp/{CK_A}")
+
+    assert response.status_code == 404
+    assert "ips.serving_eligible = TRUE" in db.calls[0]["query"]
+    assert "ips.index_eligible" not in db.calls[0]["query"]
+
+
+def test_index_eligible_read_on_returns_offer_free_index_eligible_product(monkeypatch) -> None:
+    """Flag ON: a product that is index_eligible (offer-free) but not
+    serving_eligible is now served, and the SQL carries the widened clause."""
+    monkeypatch.setenv("INDEX_ELIGIBLE_READ", "true")
+    client, db = _client(
+        monkeypatch,
+        [_row()],
+        serving_eligible_by_content_key={CK_A: False},
+        index_eligible_by_content_key={CK_A: True},
+    )
+
+    response = client.get(f"/api/agent/pdp/{CK_A}")
+
+    assert response.status_code == 200
+    assert _canonical_product(response.json())["content_key"] == CK_A
+    assert "ips.index_eligible = TRUE" in db.calls[0]["query"]
+    assert "ips.serving_eligible = TRUE" in db.calls[0]["query"]
+
+
+def test_index_eligible_read_on_still_blocks_when_neither_eligible(monkeypatch) -> None:
+    monkeypatch.setenv("INDEX_ELIGIBLE_READ", "on")
+    client, db = _client(
+        monkeypatch,
+        [_row()],
+        serving_eligible_by_content_key={CK_A: False},
+        index_eligible_by_content_key={CK_A: False},
+    )
+
+    response = client.get(f"/api/agent/pdp/{CK_A}")
+
+    assert response.status_code == 404
+    assert "ips.index_eligible = TRUE" in db.calls[0]["query"]

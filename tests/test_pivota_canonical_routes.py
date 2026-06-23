@@ -317,6 +317,75 @@ def test_list_canonical_pdps_uses_index_pipeline_state_join(env):
     assert "catalog_products.product_key ASC" in sql
 
 
+# ---------------------------------------------------------------------------
+# ADR-007 SLICE 1: by-signature READ vs sitemap LISTING flag separation
+# ---------------------------------------------------------------------------
+
+
+def _client_for_sql(monkeypatch: pytest.MonkeyPatch):
+    from routes import pivota_canonical_routes as pcr
+
+    db = FakeDb([_row("abc")])
+    monkeypatch.setattr(pcr, "database", db)
+    app = FastAPI()
+    app.include_router(pcr.router)
+    return TestClient(app), pcr, db
+
+
+def test_sitemap_not_widened_by_index_eligible_read_alone(monkeypatch: pytest.MonkeyPatch):
+    """INDEX_ELIGIBLE_READ widens the by-signature PDP read but MUST NOT widen
+    the public /products sitemap listing — that needs its own flag."""
+    monkeypatch.setenv("INDEX_ELIGIBLE_READ", "true")
+    monkeypatch.delenv("INDEX_ELIGIBLE_SITEMAP", raising=False)
+    client, pcr, db = _client_for_sql(monkeypatch)
+
+    # by-signature read: widened (carries index_eligible)
+    db.compiled_sql.clear()
+    client.get("/api/canonical/products/sig_abc")
+    read_sql = "\n".join(db.compiled_sql)
+    assert "index_pipeline_state.index_eligible" in read_sql
+
+    # sitemap listing: NOT widened (serving-only)
+    db.compiled_sql.clear()
+    res = client.get("/api/canonical/products")
+    assert res.status_code == 200
+    list_sql = "\n".join(db.compiled_sql)
+    assert "index_pipeline_state.index_eligible" not in list_sql
+    assert "serving_eligible IS true" in list_sql
+
+
+def test_sitemap_widened_only_by_index_eligible_sitemap(monkeypatch: pytest.MonkeyPatch):
+    monkeypatch.delenv("INDEX_ELIGIBLE_READ", raising=False)
+    monkeypatch.setenv("INDEX_ELIGIBLE_SITEMAP", "true")
+    client, pcr, db = _client_for_sql(monkeypatch)
+
+    # sitemap listing: widened
+    db.compiled_sql.clear()
+    res = client.get("/api/canonical/products")
+    assert res.status_code == 200
+    list_sql = "\n".join(db.compiled_sql)
+    assert "index_pipeline_state.index_eligible" in list_sql
+
+    # by-signature read: NOT widened (its flag is off)
+    db.compiled_sql.clear()
+    client.get("/api/canonical/products/sig_abc")
+    read_sql = "\n".join(db.compiled_sql)
+    assert "index_pipeline_state.index_eligible" not in read_sql
+
+
+def test_both_flags_off_is_serving_only_byte_identical(monkeypatch: pytest.MonkeyPatch):
+    monkeypatch.delenv("INDEX_ELIGIBLE_READ", raising=False)
+    monkeypatch.delenv("INDEX_ELIGIBLE_SITEMAP", raising=False)
+    client, pcr, db = _client_for_sql(monkeypatch)
+
+    db.compiled_sql.clear()
+    client.get("/api/canonical/products/sig_abc")
+    client.get("/api/canonical/products")
+    sql = "\n".join(db.compiled_sql)
+    assert "index_pipeline_state.index_eligible" not in sql
+    assert "serving_eligible IS true" in sql
+
+
 def test_list_canonical_pdps_rejects_oversized_limit(env):
     """Cap at 1000 to keep response sizes sane."""
     client = env

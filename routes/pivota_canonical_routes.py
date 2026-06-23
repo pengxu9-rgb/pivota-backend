@@ -37,7 +37,7 @@ from datetime import datetime
 from typing import Any, Awaitable, Dict, TypeVar
 
 from fastapi import APIRouter, HTTPException, Query, status
-from sqlalchemy import Boolean, DateTime, Float, String, Text, and_, column, func, select, table
+from sqlalchemy import Boolean, DateTime, Float, String, Text, and_, column, func, or_, select, table
 
 from db.catalog import catalog_merchants, catalog_products
 from db.database import database
@@ -97,6 +97,9 @@ index_pipeline_state = table(
     "index_pipeline_state",
     column("content_key", String),
     column("serving_eligible", Boolean),
+    # ADR-007 SLICE 1: offer-free citation floor (migration 165). Referenced by
+    # the flag-gated eligibility filters below.
+    column("index_eligible", Boolean),
     column("blocker_code", Text),
     column("blocker_detail", Text),
     column("content_quality_score", Float),
@@ -112,6 +115,30 @@ agent_pdp_view = table(
     column("evidence_profile"),
     column("required_disclaimers"),
 )
+
+
+def _flag_on(name: str) -> bool:
+    return (os.getenv(name) or "").strip().lower() in {"1", "true", "yes", "on"}
+
+
+def _eligibility_predicate(*, widen_with_index_eligible: bool):
+    """SQLAlchemy boolean for the index-pipeline serving gate.
+
+    Default: serving_eligible = TRUE (byte-identical to the pre-ADR-007 gate).
+    When ``widen_with_index_eligible`` is True (the relevant flag is ON), the
+    gate widens to (serving_eligible OR index_eligible) — the OFFER-FREE
+    citation floor from ADR-007 SLICE 1.
+
+    The by-signature PDP READ is widened by INDEX_ELIGIBLE_READ; the public
+    /products SITEMAP listing is a separate content/SEO decision gated only by
+    INDEX_ELIGIBLE_SITEMAP. The two callers pass their own flag so neither is
+    widened by the other."""
+    if widen_with_index_eligible:
+        return or_(
+            index_pipeline_state.c.serving_eligible.is_(True),
+            index_pipeline_state.c.index_eligible.is_(True),
+        )
+    return index_pipeline_state.c.serving_eligible.is_(True)
 
 
 def _shape_product_for_pdp(row: Dict[str, Any]) -> Dict[str, Any]:
@@ -221,7 +248,12 @@ async def get_canonical_pdp_by_signature(sig_id: str) -> Dict[str, Any]:
             and_(
                 catalog_products.c.pivota_signature_id == sig,
                 catalog_products.c.content_key.isnot(None),
-                index_pipeline_state.c.serving_eligible.is_(True),
+                # ADR-007 SLICE 1: by-signature PDP READ widens under
+                # INDEX_ELIGIBLE_READ (the citation read surface), NOT under
+                # the separate sitemap flag.
+                _eligibility_predicate(
+                    widen_with_index_eligible=_flag_on("INDEX_ELIGIBLE_READ")
+                ),
                 catalog_merchants.c.indexable.is_(True),
                 catalog_merchants.c.status == "active",
             )
@@ -260,11 +292,16 @@ async def list_canonical_pdp_signatures(
     when its content_key is present in index_pipeline_state with
     serving_eligible=TRUE.
     """
+    # ADR-007 SLICE 1: the public /products SITEMAP listing is a content/SEO
+    # decision distinct from the citation read surface. It is widened ONLY by
+    # INDEX_ELIGIBLE_SITEMAP — never by INDEX_ELIGIBLE_READ. Both default OFF.
     eligibility_filter = and_(
         catalog_products.c.pivota_signature_id.isnot(None),
         catalog_products.c.pivota_signature_id.like("sig_%"),
         catalog_products.c.content_key.isnot(None),
-        index_pipeline_state.c.serving_eligible.is_(True),
+        _eligibility_predicate(
+            widen_with_index_eligible=_flag_on("INDEX_ELIGIBLE_SITEMAP")
+        ),
         catalog_merchants.c.indexable.is_(True),
         catalog_merchants.c.status == "active",
     )

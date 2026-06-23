@@ -122,6 +122,7 @@ async def _ensure_schema() -> None:
             blocker_code TEXT NOT NULL DEFAULT 'none',
             blocker_detail TEXT,
             serving_eligible BOOLEAN NOT NULL DEFAULT FALSE,
+            index_eligible BOOLEAN NOT NULL DEFAULT FALSE,
             content_quality_score REAL,
             model_readiness_score REAL,
             conversion_potential_score REAL,
@@ -146,6 +147,14 @@ async def _ensure_schema() -> None:
     offer_columns = await database.fetch_all("PRAGMA table_info(catalog_offers)")
     if "suppressed_at" not in {dict(row).get("name") for row in offer_columns}:
         await database.execute("ALTER TABLE catalog_offers ADD COLUMN suppressed_at TIMESTAMP")
+    # ADR-007 SLICE 1: backstop for test DBs created before index_eligible
+    # existed (mirrors the suppressed_at backstop above).
+    ips_columns = await database.fetch_all("PRAGMA table_info(index_pipeline_state)")
+    if "index_eligible" not in {dict(row).get("name") for row in ips_columns}:
+        await database.execute(
+            "ALTER TABLE index_pipeline_state "
+            "ADD COLUMN index_eligible BOOLEAN NOT NULL DEFAULT FALSE"
+        )
 
 
 async def _cleanup() -> None:
@@ -368,7 +377,8 @@ async def _insert_product(
 async def _ips_row(content_key: str) -> Optional[Dict[str, Any]]:
     row = await database.fetch_one(
         """
-        SELECT serving_eligible, blocker_code, pipeline_stage, content_quality_score
+        SELECT serving_eligible, index_eligible, blocker_code, pipeline_stage,
+               content_quality_score
         FROM index_pipeline_state
         WHERE content_key = :content_key
         """,
@@ -679,6 +689,112 @@ async def test_fail_close_index_pipeline_state_demotes_orphan_serving_row() -> N
         row = await _ips_row("ck_vis2_orphan_ips")
         assert row is not None
         assert bool(row["serving_eligible"]) is False
+        assert row["blocker_code"] == "not_live"
+    finally:
+        await _cleanup()
+        await _disconnect_if_needed(was_connected)
+
+
+# ---------------------------------------------------------------------------
+# ADR-007 SLICE 1: index_eligible persistence + lifecycle (DB-backed)
+# ---------------------------------------------------------------------------
+
+@pytest.mark.asyncio
+async def test_recompute_persists_index_eligible_true_for_offer_free_product() -> None:
+    """An offer-free product (no catalog_offers row) meeting quality+image+
+    identity+description is index_eligible=TRUE but serving_eligible=FALSE, and
+    both flags are persisted to index_pipeline_state."""
+    was_connected = await _prepare_db()
+    try:
+        ids = await _insert_product("idx_offer_free", has_price=False)
+
+        result = await svc.recompute_serving_eligibility(
+            ids["content_key"], reason="unit"
+        )
+
+        row = await _ips_row(ids["content_key"])
+        assert result is False  # serving_eligible (the return value) stays False
+        assert row is not None
+        assert bool(row["serving_eligible"]) is False
+        assert bool(row["index_eligible"]) is True
+        assert row["blocker_code"] == "no_price"
+    finally:
+        await _cleanup()
+        await _disconnect_if_needed(was_connected)
+
+
+@pytest.mark.asyncio
+async def test_recompute_persists_index_eligible_false_when_non_price_predicate_fails() -> None:
+    was_connected = await _prepare_db()
+    try:
+        # Offer-free AND unresolved identity: blocker short-circuits at no_price,
+        # but index_eligible must still persist FALSE (raw-predicate derivation).
+        ids = await _insert_product(
+            "idx_bad_identity",
+            has_price=False,
+            identity=False,
+            pdp_scope="unverified",
+        )
+
+        await svc.recompute_serving_eligibility(ids["content_key"], reason="unit")
+
+        row = await _ips_row(ids["content_key"])
+        assert row is not None
+        assert bool(row["serving_eligible"]) is False
+        assert bool(row["index_eligible"]) is False
+        assert row["blocker_code"] == "no_price"
+    finally:
+        await _cleanup()
+        await _disconnect_if_needed(was_connected)
+
+
+@pytest.mark.asyncio
+async def test_recompute_persists_both_eligible_for_full_product() -> None:
+    was_connected = await _prepare_db()
+    try:
+        ids = await _insert_product("idx_full")
+
+        result = await svc.recompute_serving_eligibility(ids["content_key"])
+
+        row = await _ips_row(ids["content_key"])
+        assert result is True
+        assert row is not None
+        assert bool(row["serving_eligible"]) is True
+        assert bool(row["index_eligible"]) is True
+    finally:
+        await _cleanup()
+        await _disconnect_if_needed(was_connected)
+
+
+@pytest.mark.asyncio
+async def test_fail_close_also_clears_index_eligible() -> None:
+    """M6 lifecycle: when a delisted/orphaned product is failed-closed, both
+    serving_eligible and index_eligible must drop to FALSE so it stops being
+    citable."""
+    was_connected = await _prepare_db()
+    try:
+        await database.execute(
+            """
+            INSERT INTO index_pipeline_state (
+                content_key, pipeline_stage, blocker_code, serving_eligible,
+                index_eligible, identity_resolved, has_image, has_price
+            ) VALUES (
+                'ck_vis2_idx_failclose', 'public_indexed', 'none', FALSE,
+                TRUE, TRUE, TRUE, FALSE
+            )
+            """
+        )
+
+        await svc.fail_close_index_pipeline_state(
+            "ck_vis2_idx_failclose",
+            blocker_code="not_live",
+            blocker_detail="source rows gone during unit test",
+        )
+
+        row = await _ips_row("ck_vis2_idx_failclose")
+        assert row is not None
+        assert bool(row["serving_eligible"]) is False
+        assert bool(row["index_eligible"]) is False
         assert row["blocker_code"] == "not_live"
     finally:
         await _cleanup()

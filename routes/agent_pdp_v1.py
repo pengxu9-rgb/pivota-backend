@@ -61,13 +61,21 @@ AGENT_PDP_VIEW_COLUMNS: Tuple[str, ...] = (
 _SELECT_COLUMNS = ",\n      ".join(AGENT_PDP_VIEW_COLUMNS)
 _SELECT_APV_COLUMNS = ",\n      ".join(f"apv.{column}" for column in AGENT_PDP_VIEW_COLUMNS)
 
+# ADR-007 SLICE 1: the citation read surface gates on serving_eligible today.
+# When INDEX_ELIGIBLE_READ is ON the gate widens to the OFFER-FREE
+# `index_eligible` floor as well (serving_eligible OR index_eligible). The two
+# clause variants are substituted into the SELECTs below so that with the flag
+# OFF the emitted SQL is byte-identical to the pre-ADR-007 query.
+_SERVING_ELIGIBLE_CLAUSE = "ips.serving_eligible = TRUE"
+_INDEX_ELIGIBLE_CLAUSE = "(ips.serving_eligible = TRUE OR ips.index_eligible = TRUE)"
+
 SELECT_BY_CONTENT_KEY_SQL = f"""
     SELECT
       {_SELECT_APV_COLUMNS}
     FROM agent_pdp_view apv
     INNER JOIN index_pipeline_state ips ON ips.content_key = apv.content_key
     WHERE apv.content_key = :id
-      AND ips.serving_eligible = TRUE
+      AND {_SERVING_ELIGIBLE_CLAUSE}
     LIMIT 1
 """
 
@@ -77,7 +85,7 @@ SELECT_BY_SIGNATURE_SQL = f"""
     FROM agent_pdp_view apv
     INNER JOIN index_pipeline_state ips ON ips.content_key = apv.content_key
     WHERE apv.pivota_signature_id = :id
-      AND ips.serving_eligible = TRUE
+      AND {_SERVING_ELIGIBLE_CLAUSE}
     LIMIT 1
 """
 
@@ -87,12 +95,23 @@ SELECT_BY_PRODUCT_GROUP_SQL = f"""
     FROM agent_pdp_view apv
     INNER JOIN index_pipeline_state ips ON ips.content_key = apv.content_key
     WHERE apv.product_group_id = :id
-      AND ips.serving_eligible = TRUE
+      AND {_SERVING_ELIGIBLE_CLAUSE}
     ORDER BY
       CASE WHEN apv.pivota_signature_id IS NOT NULL THEN 0 ELSE 1 END,
       apv.content_key ASC
     LIMIT 1
 """
+
+# index_eligible-widened variants (used only when INDEX_ELIGIBLE_READ is ON).
+INDEX_SELECT_BY_CONTENT_KEY_SQL = SELECT_BY_CONTENT_KEY_SQL.replace(
+    _SERVING_ELIGIBLE_CLAUSE, _INDEX_ELIGIBLE_CLAUSE
+)
+INDEX_SELECT_BY_SIGNATURE_SQL = SELECT_BY_SIGNATURE_SQL.replace(
+    _SERVING_ELIGIBLE_CLAUSE, _INDEX_ELIGIBLE_CLAUSE
+)
+INDEX_SELECT_BY_PRODUCT_GROUP_SQL = SELECT_BY_PRODUCT_GROUP_SQL.replace(
+    _SERVING_ELIGIBLE_CLAUSE, _INDEX_ELIGIBLE_CLAUSE
+)
 
 BYPASS_SELECT_BY_CONTENT_KEY_SQL = f"""
     SELECT
@@ -152,6 +171,18 @@ def _bypass_serving_eligibility() -> bool:
     )
 
 
+def _index_eligible_read_enabled() -> bool:
+    """ADR-007 SLICE 1 read flag. When ON, the citation read gate widens to
+    serving_eligible OR index_eligible. Default OFF ⇒ byte-identical to today.
+
+    This is a real quality floor, distinct from the emergency
+    AGENT_PDP_V1_BYPASS_SERVING_ELIGIBILITY full bypass."""
+    return (
+        (os.getenv("INDEX_ELIGIBLE_READ") or "").strip().lower()
+        in {"1", "true", "yes", "on"}
+    )
+
+
 def _request_context(request: Request) -> Dict[str, Optional[str]]:
     request_id = (
         getattr(request.state, "request_id", None)
@@ -191,23 +222,37 @@ def _warn_serving_eligibility_bypass(request: Request, lookup_id: str) -> None:
     )
 
 
-def _query_for_id(value: str, *, bypass_serving_eligibility: bool = False) -> Optional[str]:
+def _query_for_id(
+    value: str,
+    *,
+    bypass_serving_eligibility: bool = False,
+    index_eligible_read: bool = False,
+) -> Optional[str]:
+    # bypass (emergency, no IPS join) takes precedence over the index_eligible
+    # read widening. index_eligible_read only swaps the eligibility clause on
+    # the serving-gated SELECTs; flag OFF ⇒ the original serving-only SQL.
     if is_content_key(value):
+        if bypass_serving_eligibility:
+            return BYPASS_SELECT_BY_CONTENT_KEY_SQL
         return (
-            BYPASS_SELECT_BY_CONTENT_KEY_SQL
-            if bypass_serving_eligibility
+            INDEX_SELECT_BY_CONTENT_KEY_SQL
+            if index_eligible_read
             else SELECT_BY_CONTENT_KEY_SQL
         )
     if _is_pivota_signature_id(value):
+        if bypass_serving_eligibility:
+            return BYPASS_SELECT_BY_SIGNATURE_SQL
         return (
-            BYPASS_SELECT_BY_SIGNATURE_SQL
-            if bypass_serving_eligibility
+            INDEX_SELECT_BY_SIGNATURE_SQL
+            if index_eligible_read
             else SELECT_BY_SIGNATURE_SQL
         )
     if _is_product_group_id(value):
+        if bypass_serving_eligibility:
+            return BYPASS_SELECT_BY_PRODUCT_GROUP_SQL
         return (
-            BYPASS_SELECT_BY_PRODUCT_GROUP_SQL
-            if bypass_serving_eligibility
+            INDEX_SELECT_BY_PRODUCT_GROUP_SQL
+            if index_eligible_read
             else SELECT_BY_PRODUCT_GROUP_SQL
         )
     return None
@@ -349,6 +394,7 @@ def _build_response(row: Dict[str, Any]) -> Dict[str, Any]:
 async def get_agent_pdp(id: str, request: Request) -> Dict[str, Any]:
     raw_id = str(id or "")
     bypass_serving_eligibility = _bypass_serving_eligibility()
+    index_eligible_read = _index_eligible_read_enabled()
     if bypass_serving_eligibility:
         _warn_serving_eligibility_bypass(request, raw_id)
 
@@ -365,6 +411,7 @@ async def get_agent_pdp(id: str, request: Request) -> Dict[str, Any]:
         query = _query_for_id(
             resolved_content_key,
             bypass_serving_eligibility=bypass_serving_eligibility,
+            index_eligible_read=index_eligible_read,
         )
         if query is None:
             raise HTTPException(
@@ -383,7 +430,11 @@ async def get_agent_pdp(id: str, request: Request) -> Dict[str, Any]:
         return _build_response(_row_to_dict(row))
 
     lookup_id = _strip_group_wrapper(raw_id)
-    query = _query_for_id(lookup_id, bypass_serving_eligibility=bypass_serving_eligibility)
+    query = _query_for_id(
+        lookup_id,
+        bypass_serving_eligibility=bypass_serving_eligibility,
+        index_eligible_read=index_eligible_read,
+    )
     if query is None:
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
