@@ -97,6 +97,34 @@ def audit_product_to_index_fields(
     }
 
 
+def resolve_seed_vendor(
+    *,
+    fetched_vendor: Optional[str],
+    declared_brand: Optional[str],
+    fallback_brand: Optional[str] = None,
+) -> Optional[str]:
+    """The brand to attribute to a URL-audit seed (and the audit's vendor-anchored
+    query). Precedence:
+
+      1. An EXPLICITLY-declared brand wins — a store-less brand pointing at a
+         RETAILER PDP (Amazon / Olive Young) knows its own brand, whereas that
+         page's JSON-LD `vendor` is often the retailer or marketplace seller, not
+         the brand. Letting it win is what makes "index my product from where
+         I'm listed" attribute to the right brand (and content_key).
+      2. Else the fetched vendor (authoritative for the brand's own Shopify PDP).
+      3. Else a resolved fallback brand (derived from domain / business name).
+
+    None when nothing resolves."""
+    declared = (declared_brand or "").strip()
+    if declared:
+        return declared
+    fetched = (fetched_vendor or "").strip()
+    if fetched:
+        return fetched
+    fallback = (fallback_brand or "").strip()
+    return fallback or None
+
+
 def audit_intake_enabled() -> bool:
     """Flag: auto-seed the commerce index from audits. Default OFF — ships dark,
     enabled per-env after canary. (The upsert is best-effort regardless, so it

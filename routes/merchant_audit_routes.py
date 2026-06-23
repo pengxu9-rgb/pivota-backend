@@ -73,6 +73,7 @@ from services.agent_center_bd_report_service import (
 )
 from services.audit_index_intake import (
     audit_intake_enabled,
+    resolve_seed_vendor,
     upsert_audited_sku_to_index,
 )
 from services.catalog_identity import make_content_key
@@ -1274,16 +1275,23 @@ async def run_merchant_url_audit(
     )
 
     # Ensure each product carries a brand for the upstream's vendor-anchored
-    # buyer-intent query. Prefer the fetched Shopify vendor; fall back to the
-    # resolved merchant brand when absent. Title stays clean (no brand prefix -
-    # the upstream prepends the vendor, so prefixing here double-brands).
+    # buyer-intent query AND the index seed. An explicitly-declared brand wins
+    # (a store-less brand pointing at a RETAILER PDP knows its brand; that page's
+    # JSON-LD vendor is often the retailer / marketplace seller, not the brand),
+    # else the fetched vendor, else the resolved merchant brand. Title stays clean
+    # (no brand prefix - the upstream prepends the vendor, so prefixing
+    # double-brands).
     brand_for_vendor = (
         merchant_name if merchant_name and merchant_name != "your brand" else None
     )
-    if brand_for_vendor:
-        for p in audit_products:
-            if not (p.get("vendor") or "").strip():
-                p["vendor"] = brand_for_vendor
+    for p in audit_products:
+        resolved_vendor = resolve_seed_vendor(
+            fetched_vendor=p.get("vendor"),
+            declared_brand=body.brand,
+            fallback_brand=brand_for_vendor,
+        )
+        if resolved_vendor:
+            p["vendor"] = resolved_vendor
 
     # 4. Record the run; subject_type marks it for the free-allowance count.
     run_id = await record_audit_run_started(
