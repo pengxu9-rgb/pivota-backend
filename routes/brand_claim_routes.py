@@ -18,6 +18,7 @@ from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel, Field
 
 from db import brand_claims as bc
+from services import brand_attest_service as attest_svc
 from services import brand_claim_service as svc
 from utils.auth import get_current_merchant
 
@@ -40,6 +41,20 @@ class StartClaimBody(BaseModel):
 
 class VerifyClaimBody(BaseModel):
     claim_id: str = Field(..., min_length=1)
+
+
+class AttestBody(BaseModel):
+    product_key: str = Field(..., min_length=1)
+    fields: dict = Field(
+        ...,
+        description=(
+            "Brand-attested content: any of title, summary, description, "
+            "bullet_points, usage_scenarios, audience_tags, topic_tags, disclaimer"
+        ),
+    )
+    lab_evidence_ref: Optional[str] = Field(
+        None, description="Reference to uploaded lab evidence (durable storage: next slice)"
+    )
 
 
 @router.post("/claim")
@@ -82,3 +97,32 @@ async def verify_claim(
     if not claim or claim.get("merchant_id") != merchant_id:
         raise HTTPException(status_code=404, detail="brand claim not found")
     return await svc.verify_brand_claim(body.claim_id)
+
+
+@router.post("/attest")
+async def attest(
+    body: AttestBody,
+    merchant_id: str = Depends(get_current_merchant),
+):
+    """A CLAIMED brand submits its own product content. It lands in the served
+    overlay (product_enrichment) so AGENTS read the brand's copy, and advances
+    claim_state -> attested. The SKU must be the caller's AND already claimed
+    (the syndicate-after-claim gate)."""
+    result = await attest_svc.attest_product(
+        merchant_id=merchant_id,
+        product_key=body.product_key,
+        fields=body.fields,
+        lab_evidence_ref=body.lab_evidence_ref,
+    )
+    status = result.get("status")
+    if status == "not_found":
+        raise HTTPException(status_code=404, detail="product not found")
+    if status == "not_claimed":
+        raise HTTPException(
+            status_code=409, detail="product must be claimed before attestation"
+        )
+    if status in ("no_attestable_fields", "bad_request"):
+        raise HTTPException(status_code=422, detail="no attestable fields provided")
+    if status == "error":
+        raise HTTPException(status_code=500, detail="failed to write attestation")
+    return result

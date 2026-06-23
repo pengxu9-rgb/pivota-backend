@@ -74,3 +74,37 @@ async def promote_merchant_skus_to_claimed(merchant_id: str) -> int:
             merchant_id, str(exc)[:200],
         )
         return 0
+
+
+async def advance_product_to_attested(*, merchant_id: str, product_key: str) -> bool:
+    """Best-effort: advance ONE SKU claimed -> attested (the brand submitted its
+    own content). Only advances from 'claimed' (attest requires a prior claim;
+    never from unclaimed, never downgrades substantiated). Merchant-scoped.
+    Returns True iff a row advanced; never raises."""
+    if not merchant_id or not product_key:
+        return False
+    try:
+        from db.database import database
+
+        result = await database.execute(
+            """
+            UPDATE catalog_products
+               SET claim_state = :attested, updated_at = NOW()
+             WHERE merchant_id = :merchant_id
+               AND product_key = :product_key
+               AND claim_state = :claimed
+            """,
+            {
+                "attested": CLAIM_STATE_ATTESTED,
+                "claimed": CLAIM_STATE_CLAIMED,
+                "merchant_id": merchant_id,
+                "product_key": product_key,
+            },
+        )
+        return bool(int(result)) if isinstance(result, int) else False
+    except Exception as exc:  # noqa: BLE001 — best-effort
+        logger.warning(
+            "advance_product_to_attested failed for %s/%s: %s",
+            merchant_id, product_key, str(exc)[:200],
+        )
+        return False
