@@ -180,6 +180,7 @@ async def start_scheduler() -> None:
         from services.audit_run_worker import (
             run_audit_worker_tick,
             run_stale_lease_reaper_tick,
+            run_abandoned_run_reaper_tick,
         )
         if worker_enabled:
             _add_job(
@@ -199,6 +200,21 @@ async def start_scheduler() -> None:
                 seconds=60,
                 id="audit_run_lease_reaper",
                 replace_existing=True,
+                coalesce=True,
+                max_instances=1,
+            )
+            # Terminal backstop: force-fail runs abandoned past an
+            # absolute age (no live lease). Catches the URL-audit wedge's
+            # bare-asyncio orphans and pre-lease-era runs that the
+            # lease reaper above (re-queue only) can't reach. 5-min
+            # cadence is plenty — these are a tail-cleanup, not hot path.
+            _add_job(
+                run_abandoned_run_reaper_tick,
+                "interval",
+                minutes=5,
+                id="audit_run_abandoned_reaper",
+                replace_existing=True,
+                misfire_grace_time=60,
                 coalesce=True,
                 max_instances=1,
             )

@@ -927,6 +927,25 @@ async def run_stale_lease_reaper_tick() -> None:
         logger.exception("audit_run_worker: reaper failed")
 
 
+async def run_abandoned_run_reaper_tick() -> None:
+    """APScheduler-callable terminal reaper. Force-fails runs stuck
+    status='running' past an absolute age with no live lease — the
+    abandoned-asyncio URL-audit wedge runs and pre-lease-era orphans
+    that release_stale_leases() (lease-expiry only, re-queue only)
+    can't reach. Without this a dead run sits 'running' forever (we
+    observed 10- and 40-day-old rows in prod).
+    """
+    try:
+        from db.merchant_audit_runs import fail_abandoned_runs
+        n = await fail_abandoned_runs()
+        if n > 0:
+            logger.info(
+                "audit_run_worker: reaper failed %d abandoned runs", n,
+            )
+    except Exception:  # noqa: BLE001
+        logger.exception("audit_run_worker: abandoned-run reaper failed")
+
+
 # =====================================================================
 # Internal helpers — pipeline stage implementations
 # =====================================================================

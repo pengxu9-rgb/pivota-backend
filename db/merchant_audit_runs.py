@@ -33,6 +33,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import os
 import uuid
 from datetime import datetime, timezone
 
@@ -575,6 +576,18 @@ DEFAULT_LEASE_SECONDS = 600
 # Prevents a flapping worker from stealing a lease the original holder
 # is about to renew.
 STALE_LEASE_GRACE_SECONDS = 30
+
+# Absolute-age backstop: a run still status='running' past this many
+# seconds, with NO worker holding a live lease, is considered abandoned
+# and force-failed by fail_abandoned_runs(). This is the terminal reaper
+# release_stale_leases() is NOT — it only re-queues leased rows and can't
+# see claimed_until IS NULL orphans (the URL-audit wedge never leases;
+# pre-lease-era runs were inserted without a claim). Sized well past the
+# longest legitimate run (per-SKU lease is 600s/stage, frontend polls
+# 15min max) so a live audit is never reaped.
+ABANDONED_RUN_TTL_SECONDS = int(
+    os.getenv("AUDIT_RUN_ABANDONED_TTL_S", "1800")
+)
 
 
 async def enqueue_audit_run(
@@ -1192,5 +1205,59 @@ async def release_stale_leases(
     except Exception as exc:
         logger.warning(
             "release_stale_leases failed: %s", str(exc)[:200],
+        )
+        return 0
+
+
+async def fail_abandoned_runs(
+    *, ttl_seconds: int = ABANDONED_RUN_TTL_SECONDS,
+) -> int:
+    """Terminal backstop reaper: force-fail any run still `status='running'`
+    past an absolute age when NO worker holds a live lease. Returns the count
+    failed.
+
+    Distinct from release_stale_leases(): that one only NULLs an expired lease
+    so a sibling worker re-claims and RE-RUNS the durable per-SKU pipeline —
+    and it matches only rows with `claimed_until IS NOT NULL`. Two orphan
+    classes slip through it entirely and sit `running` forever:
+
+      1. URL-audit wedge runs (subject_type='merchant_url'): launched as a
+         bare asyncio task, never enqueued/leased, so `claimed_until IS NULL`.
+         If the task dies (or the web dyno restarts) the row never reaches a
+         terminal status — the GET endpoint's stale-check only fires if the
+         merchant happens to keep polling.
+      2. Pre-lease-era durable runs inserted with no claim.
+
+    The `claimed_until IS NULL OR claimed_until < now` guard means an audit a
+    worker is actively running (lease extended each stage) is never touched —
+    only genuinely abandoned work is failed. We COALESCE error_message so an
+    existing failure reason is preserved, and set stage='failed' too so the
+    per-SKU pollers (which read `stage`) and the wedge poller (which reads
+    `status`) both see a terminal state.
+    """
+    await ensure_merchant_audit_runs_table()
+    now = _now_utc()
+    cutoff = datetime.fromtimestamp(
+        now.timestamp() - ttl_seconds, tz=timezone.utc,
+    )
+    query = """
+        UPDATE merchant_audit_runs
+           SET status = 'failed',
+               stage = 'failed',
+               completed_at = :now,
+               stage_updated_at = :now,
+               error_message = COALESCE(error_message, 'audit_abandoned_reaped')
+         WHERE status = 'running'
+           AND requested_at < :cutoff
+           AND (claimed_until IS NULL OR claimed_until < :now)
+    """
+    try:
+        result = await database.execute(query, {"now": now, "cutoff": cutoff})
+        if isinstance(result, int):
+            return result
+        return 0
+    except Exception as exc:
+        logger.warning(
+            "fail_abandoned_runs failed: %s", str(exc)[:200],
         )
         return 0
