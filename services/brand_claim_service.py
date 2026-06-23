@@ -435,7 +435,38 @@ async def approve_manual_claim(
     from services.claim_state import promote_merchant_skus_to_claimed
 
     await promote_merchant_skus_to_claimed(claim["merchant_id"])
+    # ADR-007 SLICE 2 — verify-to-serve: graduate this brand's brand-authored
+    # products to the offer-free citation floor. Flag-gated + best-effort.
+    await _graduate_storeless_brand_catalog(claim["merchant_id"])
     return {"status": "verified", "brand_direct_set": ok, "approved_by": approved_by}
+
+
+async def _graduate_storeless_brand_catalog(merchant_id: str) -> None:
+    """ADR-007 SLICE 2 — verify-to-serve. After a brand claim verifies, graduate
+    the merchant's brand-authored products to the OFFER-FREE citation floor
+    (index_eligible, NEUTRAL=merchant_owned, isolated, no offer minted).
+
+    Flag-gated by ENABLE_STORELESS_BRAND_CATALOG: with the flag OFF this is a
+    no-op, so verify behaves exactly as today. Best-effort — it must NEVER break
+    claim verification, so any failure is swallowed (the nightly index-health job
+    is the eventual-consistency safety net)."""
+    if not merchant_id:
+        return
+    try:
+        from readiness.flags import storeless_brand_catalog_enabled
+
+        if not storeless_brand_catalog_enabled():
+            return
+        from services.brand_verified_graduation import (
+            graduate_brand_authored_products,
+        )
+
+        await graduate_brand_authored_products(merchant_id)
+    except Exception as exc:  # noqa: BLE001 — best-effort; never break verify
+        logger.warning(
+            "verify-to-serve graduation failed for %s: %s",
+            merchant_id, str(exc)[:200],
+        )
 
 
 async def verify_brand_claim(
@@ -510,6 +541,10 @@ async def verify_brand_claim(
     from services.claim_state import promote_merchant_skus_to_claimed
 
     await promote_merchant_skus_to_claimed(claim["merchant_id"])
+    # ADR-007 SLICE 2 — verify-to-serve: graduate this brand's brand-authored
+    # products to the offer-free citation floor (index_eligible, NEUTRAL, no
+    # offer). Flag-gated (ENABLE_STORELESS_BRAND_CATALOG) + best-effort.
+    await _graduate_storeless_brand_catalog(claim["merchant_id"])
     return {"status": "verified", "brand_direct_set": ok}
 
 
