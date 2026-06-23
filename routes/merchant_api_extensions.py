@@ -72,6 +72,7 @@ class ReadinessRefreshRequest(BaseModel):
     blocked_only: bool = False
     low_quality_only: bool = False
     sort_by: str = "default"
+    segment: str = "all"
 
 
 class ReadinessActionPreviewRequest(BaseModel):
@@ -844,6 +845,7 @@ async def get_readiness_optimization(
     blocked_only: bool = Query(False),
     low_quality_only: bool = Query(False),
     sort_by: str = Query("default"),
+    segment: str = Query("all"),
     current_user: dict = Depends(get_current_user),
 ):
     """Get merchant-safe readiness optimization payload for the product optimization workspace."""
@@ -865,6 +867,7 @@ async def get_readiness_optimization(
             blocked_only=blocked_only,
             low_quality_only=low_quality_only,
             sort_by=sort_by,
+            segment=segment,
         )
         serialization_started = time.perf_counter()
         payload_data = payload.model_dump()
@@ -913,6 +916,7 @@ async def refresh_readiness_optimization(
             blocked_only=body.blocked_only,
             low_quality_only=body.low_quality_only,
             sort_by=body.sort_by,
+            segment=body.segment,
         )
         return {
             "status": "success",

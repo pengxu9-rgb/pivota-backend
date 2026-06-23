@@ -402,6 +402,21 @@ class ProductQueueAppliedFilters(BaseModel):
     blocked_only: bool = False
     low_quality_only: bool = False
     sort_by: str = "default"
+    segment: str = "all"
+
+
+class ProductQueueSegmentCounts(BaseModel):
+    """Per fix-location segment counts over the queue after all non-segment filters.
+
+    Segments mirror the frontend precedence in getProductActionLabel:
+    ``fix_here`` (run_product_enrichment), ``in_store`` (catalog_data source data),
+    ``other`` (anything else). ``all`` is the total across segments.
+    """
+
+    all: int = 0
+    fix_here: int = 0
+    in_store: int = 0
+    other: int = 0
 
 
 class ProductQueuePage(BaseModel):
@@ -422,6 +437,7 @@ class MerchantReadinessOptimizationPayload(BaseModel):
     merchant_actions: List[MerchantReadinessAction] = Field(default_factory=list)
     product_queue: List[ProductReadinessQueueItem] = Field(default_factory=list)
     product_queue_page: Optional[ProductQueuePage] = None
+    queue_segment_counts: ProductQueueSegmentCounts = Field(default_factory=ProductQueueSegmentCounts)
     content_opportunity_count: int = 0
     source_data_lanes: List[SourceDataLaneSummary] = Field(default_factory=list)
     quality_coverage: QualityCoverageSummary = Field(default_factory=QualityCoverageSummary)
