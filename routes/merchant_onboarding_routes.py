@@ -5,7 +5,7 @@ Handles merchant registration, KYC, PSP setup, and API key issuance
 
 from services.merchant_store_service import get_merchant_active_stores, get_primary_store
 from fastapi import APIRouter, Depends, HTTPException, BackgroundTasks, status, UploadFile, File, Form
-from pydantic import BaseModel, EmailStr
+from pydantic import BaseModel, EmailStr, validator
 from typing import Optional, Dict, Any, List, Tuple
 from datetime import datetime, timedelta
 import asyncio
@@ -42,14 +42,33 @@ PUBLIC_MERGEABLE_ACCOUNT_ROLES = {"agent"}
 # REQUEST/RESPONSE MODELS
 # ============================================================================
 
+# Declared merchant mode: 'storefront' keeps today's behavior (store_url required,
+# URL-based auto-KYB); 'store_less' onboards a brand with no storefront URL.
+VALID_OPERATING_MODES = {"storefront", "store_less"}
+DEFAULT_OPERATING_MODE = "storefront"
+# Store-less signups are lenient auto-approved at LOW confidence, WITHOUT the
+# URL-based auto-KYB. Safe because downstream serving keeps their products
+# un-served until graduated/claimed.
+STORE_LESS_APPROVAL_CONFIDENCE = 0.2
+
+
 class MerchantRegisterRequest(BaseModel):
     business_name: str
-    store_url: str  # Required for KYB and MCP integration
+    store_url: Optional[str] = None  # Required for storefront mode (app-enforced); omitted for store_less
     region: str  # US, EU, APAC
     contact_email: EmailStr
     contact_phone: Optional[str] = None
     website: Optional[str] = None  # Optional, for backward compatibility
     password: Optional[str] = None  # Password for merchant login (auto-generated if not provided)
+    operating_mode: str = DEFAULT_OPERATING_MODE  # 'storefront' (default) or 'store_less'
+
+    @validator("operating_mode", pre=True, always=True)
+    def _normalize_operating_mode(cls, v):
+        """Only accept storefront/store_less; anything else defaults to storefront."""
+        if not v or not isinstance(v, str):
+            return DEFAULT_OPERATING_MODE
+        normalized = v.strip().lower()
+        return normalized if normalized in VALID_OPERATING_MODES else DEFAULT_OPERATING_MODE
 
 class KYCUploadRequest(BaseModel):
     merchant_id: str
@@ -467,6 +486,18 @@ async def register_merchant(
                 await database.connect()
 
         normalized_email = normalize_contact_email(merchant_data.contact_email)
+        # operating_mode is normalized by the request validator to storefront/store_less.
+        operating_mode = merchant_data.operating_mode or DEFAULT_OPERATING_MODE
+        is_store_less = operating_mode == "store_less"
+
+        # Storefront still requires a store URL — enforce in the app even though
+        # the column is now nullable (store_less is the only URL-free path).
+        if not is_store_less and not (merchant_data.store_url or "").strip():
+            raise HTTPException(
+                status_code=422,
+                detail="store_url is required for storefront onboarding.",
+            )
+
         normalized_store_url = canonicalize_store_url(merchant_data.store_url)
 
         # 0. 收紧 email 绑定，避免创建无法登录的孤立 merchant 记录。
@@ -535,6 +566,37 @@ async def register_merchant(
                     else full_kyb_deadline
                 ),
             }
+        elif is_store_less:
+            # Declared store-less brand: no storefront URL to dedupe or KYB against.
+            # Lenient auto-approve at LOW confidence WITHOUT URL-based auto-KYB.
+            # Safe because downstream serving keeps store_less products un-served
+            # until graduated/claimed.
+            print("🏷️ Store-less onboarding: skipping store_url dup check + auto-KYB")
+            validation_result = {
+                "approved": True,
+                "confidence_score": STORE_LESS_APPROVAL_CONFIDENCE,
+                "validation_results": {
+                    "store_less": {
+                        "match": True,
+                        "message": (
+                            "Store-less brand auto-approved at low confidence; "
+                            "gated downstream until graduated/claimed."
+                        ),
+                    }
+                },
+                "requires_full_kyb": True,
+                "full_kyb_deadline": (datetime.utcnow() + timedelta(days=7)).isoformat(),
+            }
+
+            # 3. 创建商户记录（store_url=None, operating_mode='store_less'）
+            merchant_dict = merchant_data.dict()
+            merchant_dict["contact_email"] = normalized_email
+            merchant_dict["store_url"] = None
+            merchant_dict["operating_mode"] = "store_less"
+            # Remove password field as it's not in the merchant_onboarding table
+            merchant_dict.pop('password', None)
+            merchant_id = await create_merchant_onboarding(merchant_dict)
+            print(f"✅ Store-less merchant created: {merchant_id}")
         else:
             dup = await database.fetch_one(
                 merchant_onboarding.select().where(
@@ -555,7 +617,7 @@ async def register_merchant(
                 import traceback
                 traceback.print_exc()
                 raise
-            
+
             try:
                 # Shopify 域名快速通道：*.myshopify.com 直接视为可用平台域
                 parsed = urlparse(merchant_data.store_url if merchant_data.store_url.startswith(('http://','https://')) else ('https://' + merchant_data.store_url))
@@ -584,7 +646,7 @@ async def register_merchant(
                 traceback.print_exc()
                 # Continue without auto-approval
                 validation_result = {"approved": False, "confidence_score": 0, "validation_results": {}}
-            
+
             # 3. 创建商户记录
             merchant_dict = merchant_data.dict()
             merchant_dict["contact_email"] = normalized_email
@@ -861,6 +923,7 @@ async def get_onboarding_status(merchant_id: str):
         "merchant_id": merchant["merchant_id"],
         "business_name": merchant["business_name"],
         "kyc_status": merchant["status"],
+        "operating_mode": merchant.get("operating_mode") or "storefront",
         "psp_connected": merchant["psp_connected"],
         "psp_type": merchant.get("psp_type"),
         "api_key_issued": bool(merchant.get("api_key")),

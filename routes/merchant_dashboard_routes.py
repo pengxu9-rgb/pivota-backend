@@ -472,6 +472,7 @@ async def get_merchant_profile(current_user: dict = Depends(get_current_user)):
                 contact_email,
                 contact_phone,
                 status,
+                operating_mode,
                 created_at
             FROM merchant_onboarding
             WHERE merchant_id = :merchant_id
@@ -480,7 +481,13 @@ async def get_merchant_profile(current_user: dict = Depends(get_current_user)):
         
         if not merchant:
             raise HTTPException(status_code=404, detail="Merchant not found")
-        
+
+        # operating_mode tells the portal whether this is a store-less brand
+        # (declared merchant mode). Read defensively so a row/record without the
+        # column (e.g. pre-migration test fixtures) falls back to 'storefront'.
+        merchant_map = dict(merchant)
+        operating_mode = merchant_map.get("operating_mode") or "storefront"
+
         # Get statistics
         stats_query = """
             SELECT 
@@ -507,6 +514,7 @@ async def get_merchant_profile(current_user: dict = Depends(get_current_user)):
                 "region": merchant["region"],
                 "business_type": None,
                 "status": merchant["status"],
+                "operating_mode": operating_mode,
                 "created_at": merchant["created_at"].isoformat() if merchant["created_at"] else None,
                 "total_orders": stats["total_orders"] if stats else 0,
                 "total_revenue": float(stats["total_revenue"]) if stats else 0
