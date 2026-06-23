@@ -72,11 +72,20 @@ def audit_product_to_index_fields(
     if not source_id:
         return None
     brand = (audit_product.get("vendor") or "").strip() or None
+    # Canonical catalog product_key (prod::merchant::platform::source) — keeps
+    # url_audit seeds parseable by any tool that splits product_key on the
+    # `prod::` prefix / `::` separator, exactly like Shopify/marketplace rows.
+    # (Lazy import keeps this pure mapping module import-light, like the db.*
+    # imports in upsert_audited_sku_to_index below.)
+    from services.catalog_sync_service import make_catalog_product_key
+
     return {
         "merchant_id": merchant_id,
         "platform": PLATFORM_URL_AUDIT,
         "source_product_id": source_id,
-        "product_key": f"{merchant_id}|{PLATFORM_URL_AUDIT}|{source_id}",
+        "product_key": make_catalog_product_key(
+            merchant_id, PLATFORM_URL_AUDIT, source_id
+        ),
         "title": title,
         "brand": brand,
         "content_key": make_content_key(brand, title),

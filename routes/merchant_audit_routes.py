@@ -1215,16 +1215,10 @@ async def run_merchant_url_audit(
             },
         )
 
-    # P1: auto-seed the commerce index with the audited SKUs — the audit IS the
-    # index-build motion. Best-effort + flag-gated (ENABLE_AUDIT_INDEX_INTAKE) so
-    # it can never break the audit; observed/unclaimed seeds, un-served until
-    # they graduate or are claimed.
-    if audit_intake_enabled():
-        try:
-            for _seed_product in audit_products:
-                await upsert_audited_sku_to_index(merchant_id, _seed_product)
-        except Exception:  # noqa: BLE001 — intake must never break the audit
-            logger.warning("audit_index_intake: seed loop failed", exc_info=False)
+    # NOTE: the commerce-index auto-seed (ENABLE_AUDIT_INDEX_INTAKE) runs in the
+    # BACKGROUND task (_run_wedge_audit_background), not here, so it adds no
+    # latency to this request — each seed is a catalog upsert + agent_pdp_view
+    # refresh and they must not block the 202.
 
     # 2b. Credit metering once the free allowance is used up. Price the wedge
     #     with the shared per-probe model (the background run fans Gemini
@@ -1500,6 +1494,19 @@ async def _run_wedge_audit_background(
     """Run the wedge brand report OFF the request path and persist the full,
     client-ready result into the run's report_jsonb. Never raises — failures
     are recorded as status='failed' so the poller surfaces them cleanly."""
+    # P1: auto-seed the commerce index with the audited SKUs — the audit IS the
+    # index-build motion. Runs HERE, off the request path, so it never adds
+    # latency to POST /url-readiness. Best-effort + flag-gated
+    # (ENABLE_AUDIT_INDEX_INTAKE); observed/unclaimed seeds, un-served until they
+    # graduate or are claimed. Seeded before the report so a probe failure below
+    # still leaves the index populated.
+    if audit_intake_enabled():
+        try:
+            for _seed_product in audit_products:
+                await upsert_audited_sku_to_index(merchant_id, _seed_product)
+        except Exception:  # noqa: BLE001 — intake must never break the audit
+            logger.warning("audit_index_intake: seed loop failed", exc_info=False)
+
     from services.audit_telemetry_context import audit_telemetry
     try:
         prior_runs = await recent_runs_for_merchant(
