@@ -5484,6 +5484,15 @@ async def _handle_find_products_multi_via_pivot(
     limit = _clamp_search_limit(filters.limit, fallback=20)
     raw_limit = min(max(limit * page * PIVOT_MULTI_LIMIT_MULTIPLIER, limit), 100)
 
+    # ADR-007 SLICE 3: resolve the commerce-intent signal here (same derivation as
+    # _handle_find_products_multi / line ~6870) so the OFFER-FREE citable lane in
+    # search_pivot_catalog can be SUPPRESSED for strict/commerce-explicit shopping.
+    _commerce_surface, commerce_surface_explicit = _resolve_commerce_surface(
+        payload_surface=filters.commerce_surface,
+        request_metadata=request_metadata,
+    )
+    strict_serving_mode = bool(commerce_surface_explicit)
+
     q_ascii = _strip_accents(query.lower())
     query_semantic_class = _classify_query_semantic_class(q_ascii or query.lower())
     active_visible_category_intents = []
@@ -5665,6 +5674,8 @@ async def _handle_find_products_multi_via_pivot(
             include_external=PIVOT_MULTI_SERVE_INCLUDE_EXTERNAL,
             include_incentives=PIVOT_MULTI_SERVE_INCLUDE_INCENTIVES,
             payment_context=payload.payment_context,
+            # ADR-007 SLICE 3: suppress the citable lane for shopping intent.
+            strict_serving_mode=strict_serving_mode,
         )
     )
 
