@@ -18,7 +18,11 @@ merchant_onboarding = Table(
     Column("id", Integer, primary_key=True, autoincrement=True),
     Column("merchant_id", String(50), unique=True, index=True),  # Auto-generated
     Column("business_name", String(255), nullable=False),
-    Column("store_url", String(500), nullable=False, index=True),  # Required for KYB and MCP
+    Column("store_url", String(500), nullable=True, index=True),  # Required for storefront mode (app-enforced); NULL for store_less
+    # Declared merchant mode discriminator:
+    #   storefront (DEFAULT) — today's behavior, store_url required (enforced in app)
+    #   store_less           — brand onboarding without a storefront URL
+    Column("operating_mode", String(32), nullable=False, server_default="storefront"),
     Column("website", String(500)),  # Optional, for additional info
     Column("region", String(50)),  # e.g., US, EU, APAC
     Column("contact_email", String(255), nullable=False),
@@ -54,8 +58,40 @@ merchant_onboarding = Table(
 # MERCHANT ONBOARDING OPERATIONS
 # ============================================================================
 
+_operating_mode_backstop_done = False
+
+
+async def ensure_operating_mode_column() -> None:
+    """Backstop DDL for declared merchant mode (migration 164).
+
+    Prod skips the migration runner (applied via railway ssh / admin), so mirror
+    the repo's inline `ADD COLUMN IF NOT EXISTS` pattern (see
+    update_platform_profile) to make signup self-heal: relax store_url NOT NULL
+    and ensure the operating_mode discriminator exists. Idempotent + run-once
+    per process.
+    """
+    global _operating_mode_backstop_done
+    if _operating_mode_backstop_done:
+        return
+    try:
+        await database.execute(
+            "ALTER TABLE merchant_onboarding ALTER COLUMN store_url DROP NOT NULL"
+        )
+    except Exception as e:  # pragma: no cover - already nullable / perms
+        print(f"⚠️ operating_mode backstop (store_url DROP NOT NULL) skipped: {e}")
+    try:
+        await database.execute(
+            "ALTER TABLE merchant_onboarding "
+            "ADD COLUMN IF NOT EXISTS operating_mode VARCHAR(32) NOT NULL DEFAULT 'storefront'"
+        )
+    except Exception as e:  # pragma: no cover - already exists / perms
+        print(f"⚠️ operating_mode backstop (ADD COLUMN) skipped: {e}")
+    _operating_mode_backstop_done = True
+
+
 async def create_merchant_onboarding(merchant_data: Dict[str, Any]) -> str:
     """Create a new merchant onboarding record and return merchant_id"""
+    await ensure_operating_mode_column()
     # Generate unique merchant_id
     merchant_id = f"merch_{secrets.token_hex(8)}"
     merchant_data["merchant_id"] = merchant_id
@@ -67,6 +103,12 @@ async def create_merchant_onboarding(merchant_data: Dict[str, Any]) -> str:
     # constraint and 500'ing every public signup (broken since PR #494
     # added the column on 2026-05-13). Force a default here.
     merchant_data.setdefault("apm_enabled", False)
+    # operating_mode is NOT NULL. As with apm_enabled above, the `databases`
+    # library does not honor SQLAlchemy's Python-side `default=`/`server_default`
+    # on the compile path, so an absent key binds to NULL and 500's the insert.
+    # Default to 'storefront' (today's behavior) when the caller omits it.
+    if not merchant_data.get("operating_mode"):
+        merchant_data["operating_mode"] = "storefront"
 
     query = merchant_onboarding.insert().values(**merchant_data)
     await database.execute(query)

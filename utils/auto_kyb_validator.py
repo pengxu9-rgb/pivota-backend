@@ -15,6 +15,10 @@ async def validate_store_url(store_url: str) -> Tuple[bool, str]:
     Returns:
         (is_valid, message)
     """
+    # Defense in depth: a missing/empty URL is "not approvable", never a crash.
+    # (The store_less branch skips this path entirely, but guard anyway.)
+    if not store_url or not store_url.strip():
+        return False, "No store URL provided"
     try:
         # 1. 基本格式验证
         parsed = urlparse(store_url)
@@ -70,6 +74,9 @@ def check_name_url_match(business_name: str, store_url: str) -> Tuple[bool, str,
     Returns:
         (is_match, message, confidence_score)
     """
+    # Defense in depth: no URL (or no name) → not a match, low confidence, no crash.
+    if not store_url or not store_url.strip() or not business_name:
+        return False, "No store URL or business name to match", 0.0
     try:
         # 标准化商家名称：移除特殊字符，转小写
         normalized_name = re.sub(r'[^a-z0-9]', '', business_name.lower())
