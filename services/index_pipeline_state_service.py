@@ -318,6 +318,45 @@ def _classify_product(
         and not domain_has_regression
     )
 
+    # --- Index eligibility (ADR-007 SLICE 1: OFFER-FREE citation floor) ---
+    # `index_eligible` is the parallel trust+quality+identity gate that drives
+    # the citation READ surface. It is the FULL serving_eligible predicate set
+    # MINUS has_price — a brand can be worth citing without us carrying a
+    # buyable offer. It does NOT gate commerce/shopping/checkout.
+    #
+    # has_image is REQUIRED: a citation without a product image is not a usable
+    # PDP, so we keep the image floor even though we drop the price floor.
+    #
+    # CRITICAL: this is computed from the RAW predicates, NOT from
+    # `blocker_code == "none"`. `blocker_code` short-circuits on the first
+    # failing check, and `no_price` fires BEFORE `short_description` /
+    # `entity_unresolved` (see the blocker ladder above) — and for an
+    # offer-free row it ALSO short-circuits before the non-core and agent-
+    # decision-gate checks. Deriving from blocker_code would therefore both
+    # mark a no-price product index_eligible when its description/identity is
+    # bad, AND let a no-price sample/gift/protection row slip through. So we
+    # re-derive `non_core` from the raw signal independent of blocker_code.
+    #
+    # The agent-decision gates (no_us_offer / missing_disclaimers / etc.) are
+    # NOT part of the SLICE 1 predicate set: they are a separate, default-OFF
+    # flag and never reach the blocker ladder for an offer-free row anyway.
+    # index_eligible intentionally tracks only the listed trust/quality/identity
+    # predicates plus the non-core exclusion.
+    non_core_product = _is_non_core_product(row, seed_title=seed_title)
+    index_eligible = (
+        cp_sync_status == "live"
+        and source_document_present
+        and bool(source_title)
+        and quality_score is not None
+        and quality_score >= QUALITY_SCORE_THRESHOLD
+        and has_image
+        and description_length >= MIN_DESCRIPTION_LENGTH
+        and identity_resolved
+        and seed_audit_status in _SEED_AUDIT_OK
+        and not domain_has_regression
+        and not non_core_product
+    )
+
     # --- Stage assignment (highest satisfied stage wins) ---
     # Each stage is a strict superset of the previous:
     #   public_indexed > shadow_indexed > quality_gated > extracted > crawled > discovered
@@ -356,6 +395,7 @@ def _classify_product(
         "blocker_code": blocker_code,
         "blocker_detail": blocker_detail,
         "serving_eligible": serving_eligible,
+        "index_eligible": index_eligible,
         "content_quality_score": quality_score,
         "model_readiness_score": model_readiness,
         "conversion_potential_score": conversion_potential,
@@ -692,6 +732,7 @@ INSERT INTO index_pipeline_state (
     blocker_code,
     blocker_detail,
     serving_eligible,
+    index_eligible,
     content_quality_score,
     model_readiness_score,
     conversion_potential_score,
@@ -716,6 +757,7 @@ INSERT INTO index_pipeline_state (
     :blocker_code,
     :blocker_detail,
     :serving_eligible,
+    :index_eligible,
     :content_quality_score,
     :model_readiness_score,
     :conversion_potential_score,
@@ -740,6 +782,7 @@ ON CONFLICT (content_key) DO UPDATE SET
     blocker_code               = EXCLUDED.blocker_code,
     blocker_detail             = EXCLUDED.blocker_detail,
     serving_eligible           = EXCLUDED.serving_eligible,
+    index_eligible             = EXCLUDED.index_eligible,
     content_quality_score      = EXCLUDED.content_quality_score,
     model_readiness_score      = EXCLUDED.model_readiness_score,
     conversion_potential_score = EXCLUDED.conversion_potential_score,
@@ -786,6 +829,7 @@ _FAIL_CLOSE_QUERY = """
 UPDATE index_pipeline_state
 SET
     serving_eligible     = FALSE,
+    index_eligible       = FALSE,
     blocker_code         = :blocker_code,
     blocker_detail       = :blocker_detail,
     consolidation_version = :consolidation_version,

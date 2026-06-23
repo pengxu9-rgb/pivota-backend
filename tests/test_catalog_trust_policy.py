@@ -533,3 +533,31 @@ def test_output_row_has_all_migration_columns_and_bounded_reason_vocab():
 
     for r in trust["serving_reason_codes"]:
         assert r in REASON_CODE_VOCABULARY, f"reason code not in vocabulary: {r}"
+
+
+# ---- ADR-007 SLICE 1: INDEX_ELIGIBLE_READ widening --------------------------
+
+
+def test_index_eligible_read_off_keeps_offer_free_blocked(monkeypatch):
+    """Flag OFF (default): a row that is index_eligible but not serving_eligible
+    is still blocked (serving-only gate, byte-identical to today)."""
+    monkeypatch.delenv("INDEX_ELIGIBLE_READ", raising=False)
+    trust = call(ips=eligible_ips(serving_eligible=False, index_eligible=True))
+    assert trust["serving_decision"] == "blocked"
+    assert REASON_CODES.INDEX_NOT_SERVING_ELIGIBLE in trust["serving_reason_codes"]
+
+
+def test_index_eligible_read_on_admits_offer_free_index_eligible_row(monkeypatch):
+    """Flag ON: an index_eligible (offer-free) row is no longer blocked by the
+    index-pipeline gate."""
+    monkeypatch.setenv("INDEX_ELIGIBLE_READ", "true")
+    trust = call(ips=eligible_ips(serving_eligible=False, index_eligible=True))
+    assert trust["serving_decision"] != "blocked"
+    assert REASON_CODES.INDEX_NOT_SERVING_ELIGIBLE not in trust["serving_reason_codes"]
+
+
+def test_index_eligible_read_on_still_blocks_when_neither_eligible(monkeypatch):
+    monkeypatch.setenv("INDEX_ELIGIBLE_READ", "on")
+    trust = call(ips=eligible_ips(serving_eligible=False, index_eligible=False))
+    assert trust["serving_decision"] == "blocked"
+    assert REASON_CODES.INDEX_NOT_SERVING_ELIGIBLE in trust["serving_reason_codes"]

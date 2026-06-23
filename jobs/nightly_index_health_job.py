@@ -268,6 +268,7 @@ _STALE_INVALIDATION_UPDATE = """
 UPDATE index_pipeline_state ips
 SET
     serving_eligible     = FALSE,
+    index_eligible       = FALSE,
     blocker_code         = 'not_live',
     blocker_detail       = 'catalog_products.sync_status=' || quote_literal(cp.sync_status),
     last_consolidated_at = NOW()
@@ -280,7 +281,11 @@ WHERE cp.content_key = ips.content_key
       WHERE live_cp.content_key = ips.content_key
         AND live_cp.sync_status = 'live'
   )
-  AND (ips.serving_eligible = TRUE OR ips.blocker_code <> 'not_live')
+  AND (
+        ips.serving_eligible = TRUE
+        OR ips.index_eligible = TRUE
+        OR ips.blocker_code <> 'not_live'
+      )
 """
 
 # Second-pass UPDATE: mark index_pipeline_state rows with extractor_regression
@@ -292,6 +297,7 @@ SET
     blocker_code     = 'extractor_regression',
     blocker_detail   = 'domain extractor regression detected; fix domain template before serving',
     serving_eligible = FALSE,
+    index_eligible   = FALSE,
     last_consolidated_at = NOW()
 FROM external_product_seeds eps
 JOIN external_offer_snapshots eos
