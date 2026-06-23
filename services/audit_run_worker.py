@@ -179,6 +179,13 @@ async def _process_one_audit_run_inner(
     from db import merchant_audit_runs as mar
     launch_options = launch_options or {}
 
+    # URL-audit (wedge) runs carry synthetic products in the launch payload —
+    # pasted product URLs with no synced catalog. Discovery builds products
+    # from these instead of catalog rows, and materialize/verify are minimized
+    # (no executors, no catalog-coupled evidence/projection writes, no GSC).
+    synthetic_products = launch_options.get("synthetic_products") or []
+    is_synthetic = bool(synthetic_products)
+
     # ----- P0-2 resume rehydrate -----
     # claim_next_pending_run will hand the worker a row at ANY active
     # stage, not just queued (so the stale-lease reaper can recover a
@@ -216,15 +223,27 @@ async def _process_one_audit_run_inner(
         )
         if current_stage == mar.STAGE_PROBING:
             try:
-                (
-                    merchant_name,
-                    merchant_domain,
-                    products,
-                    pivota_url_used,
-                    integration_state,
-                ) = await _resolve_merchant_and_products(
-                    merchant_id=merchant_id, product_keys=product_keys,
-                )
+                if is_synthetic:
+                    (
+                        merchant_name,
+                        merchant_domain,
+                        products,
+                        pivota_url_used,
+                        integration_state,
+                    ) = _resolve_synthetic_url_products(
+                        launch_options=launch_options,
+                        merchant_id=merchant_id,
+                    )
+                else:
+                    (
+                        merchant_name,
+                        merchant_domain,
+                        products,
+                        pivota_url_used,
+                        integration_state,
+                    ) = await _resolve_merchant_and_products(
+                        merchant_id=merchant_id, product_keys=product_keys,
+                    )
                 logger.info(
                     "audit_run_worker: rehydrated discovery for "
                     "run_id=%s products=%d", run_id, len(products),
@@ -339,15 +358,27 @@ async def _process_one_audit_run_inner(
             ):
                 return True
             await mar.extend_lease(run_id=run_id, worker_id=WORKER_ID)
-            (
-                merchant_name,
-                merchant_domain,
-                products,
-                pivota_url_used,
-                integration_state,
-            ) = await _resolve_merchant_and_products(
-                merchant_id=merchant_id, product_keys=product_keys,
-            )
+            if is_synthetic:
+                (
+                    merchant_name,
+                    merchant_domain,
+                    products,
+                    pivota_url_used,
+                    integration_state,
+                ) = _resolve_synthetic_url_products(
+                    launch_options=launch_options,
+                    merchant_id=merchant_id,
+                )
+            else:
+                (
+                    merchant_name,
+                    merchant_domain,
+                    products,
+                    pivota_url_used,
+                    integration_state,
+                ) = await _resolve_merchant_and_products(
+                    merchant_id=merchant_id, product_keys=product_keys,
+                )
             await mar.record_partial_result(
                 run_id=run_id, worker_id=WORKER_ID,
                 partial_result_jsonb={
@@ -642,12 +673,20 @@ async def _process_one_audit_run_inner(
                 run_id=run_id, worker_id=WORKER_ID,
                 lease_seconds=LONG_STAGE_LEASE_SECONDS,
             )
-            tasks_summary = await _materialize_tasks_and_executors(
-                merchant_id=merchant_id,
-                run_id=run_id,
-                brand_report=brand_report,
-                integration_state=integration_state,
-            )
+            if is_synthetic:
+                # URL-audit: no executor dispatch. dispatch_agents would enrich
+                # /mutate the merchant's OWN catalog SKUs (canonical_pdp_enrichment
+                # falls back to thin catalog candidates) — irrelevant to a pasted
+                # URL and a side-effect the wedge never had. The advisory action
+                # plan lives in each per_sku report's next_best_action already.
+                tasks_summary = {"skipped": "url_audit_no_executors"}
+            else:
+                tasks_summary = await _materialize_tasks_and_executors(
+                    merchant_id=merchant_id,
+                    run_id=run_id,
+                    brand_report=brand_report,
+                    integration_state=integration_state,
+                )
             await mar.record_partial_result(
                 run_id=run_id, worker_id=WORKER_ID,
                 partial_result_jsonb={"materializing": tasks_summary},
@@ -668,6 +707,50 @@ async def _process_one_audit_run_inner(
             if await _check_cancellation_and_finalize(
                 at_stage=mar.STAGE_VERIFYING,
             ):
+                return True
+            if is_synthetic:
+                # URL-audit minimal completion: skip canonical-evidence,
+                # verifiers, audience projections, and verification-enqueue —
+                # all catalog-coupled, and the /url-readiness GET reads
+                # report_jsonb directly (no projection needed). Crucially, the
+                # post-processing block below FAILS the whole run if projection
+                # build or verification-enqueue raises (which they can on
+                # synthetic product_keys), so synthetic runs must not enter it.
+                await _record_final_report_fields(
+                    run_id=run_id,
+                    brand_report=brand_report,
+                    pivota_url_used=pivota_url_used,
+                )
+                cost_summary = await _aggregate_cost_summary_for_run(
+                    run_id=run_id, brand_report=brand_report,
+                )
+                await mar.record_partial_result(
+                    run_id=run_id, worker_id=WORKER_ID,
+                    partial_result_jsonb={"verifying": {"skipped": "url_audit"}},
+                )
+                ok = await mar.transition_stage(
+                    run_id=run_id,
+                    from_stage=mar.STAGE_VERIFYING,
+                    to_stage=mar.STAGE_COMPLETED,
+                    worker_id=WORKER_ID,
+                    cost_summary_jsonb=cost_summary,
+                )
+                if ok:
+                    from services.agent_center_bd_report_service import (
+                        clear_synthetic_sku_contexts,
+                    )
+                    clear_synthetic_sku_contexts(
+                        [
+                            str(p.get("sku_key") or "")
+                            for p in synthetic_products
+                        ],
+                        merchant_id,
+                    )
+                logger.info(
+                    "audit_run_worker: completed url-audit run_id=%s "
+                    "merchant=%s products=%d", run_id, merchant_id,
+                    len(synthetic_products),
+                )
                 return True
             # P4.3: derive canonical evidence + findings from the
             # brand_report and persist into the new tables. Best-
@@ -1127,6 +1210,47 @@ def _detect_mock_audit_output(brand_report: Dict[str, Any]) -> List[Dict[str, An
         seen.add(reason)
         out.append(item)
     return out
+
+
+def _resolve_synthetic_url_products(
+    *, launch_options: Dict[str, Any], merchant_id: str,
+) -> tuple:
+    """Discovery stage for URL-audit (wedge) runs: build `products` from the
+    pasted-URL products persisted in launch.synthetic_products — NO catalog
+    lookup — and register each as a synthetic SKU context so the per_sku
+    fan-out + report-assembly loop resolve it via load_sku_context().
+
+    Re-runnable on stale-lease resume: launch.synthetic_products is persisted,
+    so this re-registers the same contexts deterministically. Returns the same
+    5-tuple as _resolve_merchant_and_products. integration_state is None — the
+    materialize stage is skipped for synthetic runs anyway.
+    """
+    from services.agent_center_bd_report_service import (
+        register_synthetic_sku_contexts,
+    )
+    items = launch_options.get("synthetic_products") or []
+    register_synthetic_sku_contexts(items, merchant_id)
+    products: List[Dict[str, Any]] = []
+    for item in items:
+        sku_key = str((item or {}).get("sku_key") or "").strip()
+        if not sku_key:
+            continue
+        pdp_url = str(item.get("pdp_url") or "").strip() or None
+        products.append({
+            "product_key": item.get("product_key"),
+            "sku_key": sku_key,
+            "title": item.get("title"),
+            "vendor": item.get("vendor"),
+            "product_type": item.get("product_type"),
+            "pdp_url": pdp_url,
+            "canonical_url": pdp_url,
+            "url_source": "merchant_url",
+        })
+    merchant_name = str(
+        launch_options.get("merchant_name") or merchant_id
+    )
+    merchant_domain = launch_options.get("merchant_domain")
+    return merchant_name, merchant_domain, products, [], None
 
 
 async def _resolve_merchant_and_products(

@@ -59,6 +59,7 @@ def client(monkeypatch):
     state = {"used": 0, "balance": {"credits": 100000, "plan_tier": "growth"}}
     started: list = []
     completed: list = []
+    enqueued: list = []
     brand_calls: list = []
     sku_intel_calls: list = []
     credit_ops: list = []
@@ -104,6 +105,16 @@ def client(monkeypatch):
                         "product_keys": product_keys})
         return "run-url-1"
 
+    async def fake_enqueue(*, merchant_id, product_keys, subject_type="merchant",
+                           idempotency_key=None, requested_by_user_id=None,
+                           request_options_jsonb=None):
+        enqueued.append({
+            "merchant_id": merchant_id, "subject_type": subject_type,
+            "product_keys": product_keys, "idempotency_key": idempotency_key,
+            "request_options_jsonb": request_options_jsonb,
+        })
+        return "run-url-1", False
+
     async def fake_completed(*, run_id, status, **kw):
         completed.append({"run_id": run_id, "status": status, **kw})
 
@@ -147,6 +158,7 @@ def client(monkeypatch):
     monkeypatch.setattr(mar, "count_runs_for_merchant_by_subject", fake_count)
     monkeypatch.setattr(mar, "get_merchant_onboarding", fake_onboarding)
     monkeypatch.setattr(mar, "record_audit_run_started", fake_started)
+    monkeypatch.setattr(mar, "enqueue_audit_run_with_replay", fake_enqueue)
     monkeypatch.setattr(mar, "record_audit_run_completed", fake_completed)
     monkeypatch.setattr(mar, "run_brand_report", fake_brand_report)
     monkeypatch.setattr(mar, "run_wedge_hero_sku_intelligence", fake_sku_intelligence)
@@ -166,6 +178,7 @@ def client(monkeypatch):
         state, started, completed, brand_calls, sku_intel_calls,
     )
     c.credit_ops = credit_ops
+    c.enqueued = enqueued
     return c
 
 
@@ -187,7 +200,7 @@ def test_post_returns_running_with_run_id(client):
     assert body["status"] == "running"
     assert body["run_id"] == "run-url-1"
     assert body["brand_report"] is None  # not ready yet
-    assert body["tier"] == "url_wedge"
+    assert body["tier"] == "url_per_sku"
     # Immediately-known fields are echoed so the UI can render context.
     assert [p["pdp_url"] for p in body["audited_products"]] == _BODY["product_urls"]
     assert [p["raw_title"] for p in body["audited_products"]] == [
@@ -195,24 +208,21 @@ def test_post_returns_running_with_run_id(client):
         "[Bundle] Product B, 2 pack",
     ]
     assert body["methodology"]["products_audited"] == 2
-    assert body["methodology"]["queries_per_product"] == 2
+    assert body["methodology"]["queries_per_product"] == mar._WEDGE_PROMPTS_PER_SKU
     assert body["free_audits_remaining"] == 1
-    # Run recorded with the wedge marker + the provided URLs before kickoff.
-    assert client.started[0]["subject_type"] == "merchant_url"
-    assert client.started[0]["product_keys"] == _BODY["product_urls"]
+    # Enqueued on the durable worker (not the bare-asyncio runner) with the
+    # wedge marker + per_sku launch + synthetic products (NOT raw URLs as keys).
+    enq = client.enqueued[-1]
+    assert enq["subject_type"] == "merchant_url"
+    assert all(k.startswith("urlwedge:") for k in enq["product_keys"])
+    launch = enq["request_options_jsonb"]["launch"]
+    assert launch["audit_mode"] == "per_sku"
+    assert launch["providers"] == mar._WEDGE_PROVIDERS
+    assert [s["pdp_url"] for s in launch["synthetic_products"]] == _BODY["product_urls"]
 
 
 def test_post_vendor_fallback_when_absent(client, monkeypatch):
     client.state["used"] = 0
-    captured_runs: list = []
-
-    def capture_background_run(**kwargs):
-        captured_runs.append(kwargs)
-
-        async def noop():
-            return None
-
-        return noop()
 
     async def fetch_without_vendor(pdp_url):
         handle = pdp_url.rstrip("/").rsplit("/", 1)[-1]
@@ -224,7 +234,6 @@ def test_post_vendor_fallback_when_absent(client, monkeypatch):
             None,
         )
 
-    monkeypatch.setattr(mar, "_run_wedge_audit_background", capture_background_run)
     monkeypatch.setattr(bdcs, "fetch_curated_audit_product", fetch_without_vendor)
 
     body = client.post(_URL, json=_BODY).json()
@@ -232,10 +241,10 @@ def test_post_vendor_fallback_when_absent(client, monkeypatch):
         "Product A", "Product B",
     ]
     assert [p["vendor"] for p in body["audited_products"]] == ["Merch", "Merch"]
-    assert [p["title"] for p in captured_runs[-1]["audit_products"]] == [
-        "Product A", "Product B",
-    ]
-    assert [p["vendor"] for p in captured_runs[-1]["audit_products"]] == [
+    # The vendor fallback flows into the synthetic products handed to the worker.
+    syn = client.enqueued[-1]["request_options_jsonb"]["launch"]["synthetic_products"]
+    assert [s["title"] for s in syn] == ["Product A", "Product B"]
+    assert [s["vendor"] for s in syn] == [
         "Merch", "Merch",
     ]
 
@@ -258,7 +267,8 @@ def test_post_vendor_fallback_when_absent(client, monkeypatch):
     assert [p["vendor"] for p in body["audited_products"]] == [
         "Fetched Brand", "Fetched Brand",
     ]
-    assert [p["vendor"] for p in captured_runs[-1]["audit_products"]] == [
+    syn2 = client.enqueued[-1]["request_options_jsonb"]["launch"]["synthetic_products"]
+    assert [s["vendor"] for s in syn2] == [
         "Fetched Brand", "Fetched Brand",
     ]
 
@@ -276,11 +286,11 @@ def test_over_free_limit_meters_credits_instead_of_blocking(client):
     # Free count is NOT consumed by a credit-metered run.
     assert body["free_audits_used"] == 2
     assert body["free_audits_remaining"] == 0
-    # Exactly one debit, idempotent on the run id; no refund (run launched).
+    # Exactly one debit, idempotent on the deterministic key; no refund.
     consumes = [o for o in client.credit_ops if o["kind"] == "consume"]
     assert len(consumes) == 1
     assert consumes[0]["op"] == "audit"
-    assert consumes[0]["key"] == "url_wedge:run-url-1"
+    assert consumes[0]["key"].startswith("url_wedge:")
     assert consumes[0]["credits"] == body["credits_charged"]
     assert not [o for o in client.credit_ops if o["kind"] == "refund"]
 
@@ -528,7 +538,11 @@ def test_get_running_fresh_requested_at_not_stale(monkeypatch):
     assert c.completed == []
 
 
-def test_get_running_stale_requested_at_fails(monkeypatch):
+def test_get_running_old_request_does_NOT_inline_fail(monkeypatch):
+    # Behavior change: URL audits run on the durable worker and legitimately
+    # run several minutes. The GET no longer inline-fails an old-but-running
+    # run (that split-brained a healthy, actively-leased worker run). Truly
+    # abandoned runs are reaped by fail_abandoned_runs() instead.
     requested_at = (datetime.now(timezone.utc) - timedelta(minutes=20)).isoformat()
     c = _get_client(monkeypatch, {
         "merchant_id": "merch-A", "subject_type": "merchant_url",
@@ -536,26 +550,34 @@ def test_get_running_stale_requested_at_fails(monkeypatch):
         "requested_at": requested_at,
     })
     body = c.get(f"{_URL}/run-url-1").json()
-    assert body == {
-        "status": "failed",
-        "run_id": "run-url-1",
-        "error": "This audit didn't finish in time — please re-run.",
-    }
-    assert c.completed == [{
-        "run_id": "run-url-1",
-        "status": "failed",
-        "error_message": "audit_timed_out_stale",
-    }]
+    assert body == {"status": "running", "run_id": "run-url-1"}
+    assert c.completed == []  # GET must NOT write a terminal status
 
 
-def test_get_succeeded_returns_payload(monkeypatch):
-    payload = {"status": "succeeded", "run_id": "run-url-1",
-               "tier": "url_wedge", "brand_report": {"aggregate": {}}}
+def test_get_succeeded_reshapes_per_sku_report(monkeypatch):
+    # report_jsonb is the per_sku brand_report; the GET reshapes it into the
+    # URL-audit envelope and flags catalog dims unavailable (connect-store funnel).
+    per_sku_report = {"per_sku_reports": [{"sku_key": "urlwedge:x", "scores": {}}],
+                      "brand_rollup": {"where_you_can_win": {"targets": []}},
+                      "authority_map": {"skus": []}}
     c = _get_client(monkeypatch, {
+        "run_id": "run-url-1",
         "merchant_id": "merch-A", "subject_type": "merchant_url",
-        "status": "succeeded", "report_jsonb": payload,
+        "status": "succeeded", "report_jsonb": per_sku_report,
+        "partial_result_jsonb": {"launch": {"wedge_base_payload": {
+            "tier": "url_per_sku", "audited_url": "https://m.example",
+            "audited_products": [{"pdp_url": "https://m/p/1"}],
+        }}},
     })
-    assert c.get(f"{_URL}/run-url-1").json() == payload
+    body = c.get(f"{_URL}/run-url-1").json()
+    assert body["status"] == "succeeded"
+    assert body["run_id"] == "run-url-1"
+    assert body["tier"] == "url_per_sku"
+    assert body["catalog_dimensions_available"] is False
+    assert body["per_sku_reports"] == per_sku_report["per_sku_reports"]
+    assert body["where_you_can_win"] == {"targets": []}
+    # Echoed base-payload fields are merged through.
+    assert body["audited_url"] == "https://m.example"
 
 
 def test_get_failed_maps_mock_fallback(monkeypatch):
