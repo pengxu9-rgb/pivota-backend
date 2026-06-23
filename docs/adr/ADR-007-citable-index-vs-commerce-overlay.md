@@ -1,6 +1,6 @@
 # ADR-007: Citable Knowledge Index vs Commerce/Offers Overlay
 
-**Status:** Proposed · **Date:** 2026-06-23 · **Scope:** `pivota-backend` index/serving pipeline + agent read surfaces · **Supersedes:** the offer-minting approach in the verify-to-serve spec (`pivota-merchants-portal#117`)
+**Status:** Proposed (adversarial review 2026-06-23 → **GO-WITH-CHANGES**, corrections folded into Action Items) · **Date:** 2026-06-23 · **Scope:** `pivota-backend` index/serving pipeline + agent read surfaces · **Supersedes:** the offer-minting approach in the verify-to-serve spec (`pivota-merchants-portal#117`)
 **Deciders:** founder (positioning) + backend (index pipeline)
 
 ---
@@ -94,11 +94,28 @@ Only **A** decouples the index from commerce at the architecture level; **B** an
 
 ## Action Items
 
-1. [ ] Recast `serving_eligible` → `transact_eligible`; add `index_eligible` (trust + quality + identity, offer-free) in `index_pipeline_state_service.py`. Flag-gated; `transact_eligible` semantics unchanged.
-2. [ ] Make the canonical-recall offer-join conditional (intent/eligibility-aware) + add an offer-free citation read lane.
-3. [ ] Spec + secure the **external read/citation API contract** (fields, attribution, neutrality, limits) over `get_pdp` / `agent_pdp_view` via the MCP/UCP/ACP doors.
-4. [ ] Intent classification (shopping vs inform) → eligibility/ranking selection.
-5. [ ] Re-scope verify-to-serve (`#117`): verify → `index_eligible` (drop the minted referral offer).
-6. [ ] Keep Pivota Agent's shopping path on `transact_eligible` (regression-test unchanged).
+> **Revised after adversarial review (2026-06-23) — GO-WITH-CHANGES.** Strictly **additive** (no rename); sliced so shopping/checkout are never touched. See "Review corrections" below.
+
+**Slice 1 (safe, additive):**
+1. [ ] ADD `index_pipeline_state.index_eligible BOOLEAN NOT NULL DEFAULT FALSE` (+ partial index). Compute in `_classify_product` as the full `serving_eligible` predicate **minus `has_price`**, evaluated independently of the short-circuited `blocker_code`. Persist in the upsert, `recompute_serving_eligibility`, and the nightly job — **and clear it in the stale-invalidation / regression demotion UPDATEs**. Do **NOT** rename or alter `serving_eligible`.
+2. [ ] Behind flag `INDEX_ELIGIBLE_READ`, widen the **three read gates** to `serving_eligible OR index_eligible`: `routes/agent_pdp_v1.py` (get_pdp), `services/catalog_trust_policy.py:528`, `routes/pivota_canonical_routes.py` by-signature PDP. Hold the public **sitemap `/products`** behind its own second flag (content/SEO decision). The blunt global `AGENT_PDP_V1_BYPASS_*` stays emergency-only.
+3. [ ] Re-point verify-to-serve at `services/external_seed_servability.py` (already offer-free) to land products as `index_eligible` — drop the minted referral offer from `#117`.
+
+**Later slices (NOT slice 1):**
+4. [ ] Citable RECALL as a **separate no-OfferNode lane** — never LEFT-JOIN `catalog_offers` (`pivot_query_service.py:924` INNER JOIN stays the transact gate; null-priced rows in the offer-shaped result = "appears buyable"). Citable rows carry `buyable=false`.
+5. [ ] Intent classification (shopping vs inform) → eligibility/ranking; extend the neutrality invariance test to the **citable-vs-buyable** axis.
+6. [ ] External read/citation API contract — fields, attribution, **rate-limit/abuse**, neutrality. (No MCP/UCP/ACP product-read door exists in pivota-backend today; the surface is REST `agent_pdp_v1` / `agent_shop_gateway` — the "via MCP/UCP/ACP" framing is aspirational.)
+
+**Gates that MUST stay offer-required for checkout (untouched):** `pivot_query_service.py:924` recall offer INNER JOIN; the downstream Agent API order/payment offer/quote resolution; `serving_eligible`'s `and has_price`.
+
+## Review corrections (2026-06-23 — adversarial architecture review, GO-WITH-CHANGES)
+- **M1 Additive, not a rename.** `serving_eligible` spans 24 non-test files (raw SQL, SQLAlchemy core, upsert, nightly UPDATE, `catalog_trust_policy`, public sitemap). Keep it (= transact semantics); add `index_eligible`.
+- **M2 Recall ≠ a `serving_eligible` read** — it gates on the `catalog_offers` INNER JOIN. LEFT-joining it injects null-priced rows = un-buyable appears buyable → separate no-OfferNode lane, later.
+- **M3** The three public-read gates move together (get_pdp / trust-policy / canonical-PDP); sitemap behind its own flag.
+- **M4** `index_eligible` = `serving_eligible` − `has_price`, from the **full** predicate set (today `no_price` short-circuits before description/identity). Decide `has_image` requirement explicitly.
+- **M5** Don't collapse "un-gate" into the global `AGENT_PDP_V1_BYPASS_*` (no quality floor).
+- **M6** Lifecycle: the nightly stale-invalidation + regression demotion must also clear `index_eligible` (else delisted products stay citable).
+- **Foundation (why it's cheap):** `agent_pdp_view` rows are written for offer-less products already (read-time gate) — no assembly change.
+- **Invariants confirmed preserved:** checkout fail-closed (downstream Agent API); no-GTIN mis-merge (`index_eligible` requires identity-resolved); neutrality (extend invariance test to citable-vs-buyable).
 
 *Design-only. No code in this ADR.*
