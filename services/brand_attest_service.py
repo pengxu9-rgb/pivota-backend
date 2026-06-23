@@ -24,16 +24,15 @@ from services.claim_state import (
 
 logger = logging.getLogger(__name__)
 
-# brand-submitted field -> product_enrichment SERVED column (only these publish).
+# Only the fields the agent_pdp_view assembler actually SERVES today: the E2
+# publish bridge maps title_override -> served title and description_markdown ->
+# served description. Richer fields (summary/bullets/usage/audience/topic/
+# disclaimer) are stored in product_enrichment but NOT yet read into
+# agent_pdp_view, so accepting them here would promise serving we can't deliver.
+# They're added back as the assembler + agent_pdp_view learn to carry them.
 _ATTEST_FIELD_MAP = {
     "title": "title_override",
-    "summary": "summary_short",
     "description": "description_markdown",
-    "bullet_points": "bullet_points",
-    "usage_scenarios": "usage_scenarios",
-    "audience_tags": "audience_tags",
-    "topic_tags": "topic_tags",
-    "disclaimer": "regulatory_disclaimer_local",
 }
 
 

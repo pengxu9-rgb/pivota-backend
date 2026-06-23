@@ -676,7 +676,14 @@ def assemble_row(
     callers that don't pass it (the maintenance scripts) keep prior behavior.
     """
     canonical = pick_canonical(products)
-    title = coalesce_first(canonical.get("title"))
+    # E2 publish bridge: a brand-attested title_override outranks the raw
+    # storefront title (same precedence the description bridge below applies),
+    # so the brand's own title reaches the served PDP. coalesce_first is
+    # strip-aware, so an absent/empty override falls through.
+    title = coalesce_first(
+        (enrichment or {}).get("title_override"),
+        canonical.get("title"),
+    )
     if not title:
         return None
     # Clean storefront noise (bundle tags, legal-entity seller prefix) before

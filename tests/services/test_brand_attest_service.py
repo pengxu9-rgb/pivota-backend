@@ -7,19 +7,22 @@ import services.brand_attest_service as attest
 from services.brand_attest_service import attestation_to_enrichment
 
 
-def test_attestation_to_enrichment_maps_and_filters():
+def test_attestation_to_enrichment_maps_only_served_fields():
     out = attestation_to_enrichment(
         {
             "title": "Anua Heartleaf Toner",
             "description": "Soothing toner",
-            "bullet_points": ["77% heartleaf"],
+            "bullet_points": ["77% heartleaf"],  # not yet served -> dropped
             "unknown_field": "ignored",
             "summary": "",  # empty -> dropped
         }
     )
     assert out["title_override"] == "Anua Heartleaf Toner"
     assert out["description_markdown"] == "Soothing toner"
-    assert out["bullet_points"] == ["77% heartleaf"]
+    # Only the fields the assembler actually serves map through; non-served,
+    # unknown, and empty fields are dropped so the API doesn't promise serving
+    # it can't deliver.
+    assert "bullet_points" not in out
     assert "unknown_field" not in out and "summary_short" not in out
     assert out["updated_by_employee_id"] == "brand_attestation"
     assert attestation_to_enrichment({}) == {}  # nothing -> no provenance stamp
