@@ -482,7 +482,12 @@ async def _latest_active_subscription(
           AND us.status IN ('active', 'trialing', 'past_due')
           AND (us.current_period_start IS NULL OR us.current_period_start < :period_end)
           AND (us.current_period_end IS NULL OR us.current_period_end > :period_start)
+        -- Prefer the richest active plan when a merchant holds more than one
+        -- active subscription (leftover-after-upgrade / coupon'd secondary),
+        -- so a lower tier that merely renewed more recently can't outrank the
+        -- plan the merchant upgraded to. Mirrors _active_subscription_allowance.
         ORDER BY
+          sp.monthly_credit_allowance DESC NULLS LAST,
           us.current_period_start DESC NULLS LAST,
           us.started_at DESC NULLS LAST,
           us.updated_at DESC NULLS LAST,
