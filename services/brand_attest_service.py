@@ -63,8 +63,9 @@ async def attest_product(
     content to the served overlay (product_enrichment), advance claim_state ->
     attested, and refresh the served PDP so agents see it. Returns {status, ...}.
 
-    lab_evidence_ref is accepted + reported now; durable lab-evidence storage +
-    substantiation grading (-> 'substantiated') is the next slice.
+    A submitted lab_evidence_ref is durably stored (brand_attestation_evidence,
+    grading_status 'submitted'); it is NOT auto-graded — advancing claim_state to
+    'substantiated' is a deliberate separate grading step.
     """
     if not merchant_id or not product_key:
         return {"status": "bad_request"}
@@ -122,11 +123,32 @@ async def attest_product(
                 content_key, str(exc)[:200],
             )
 
+    # 3. Durably store any submitted substantiation evidence (lab report, cert).
+    #    grading_status starts 'submitted' — NOT graded. Submitting evidence never
+    #    auto-advances claim_state to substantiated; that's a deliberate step.
+    evidence_id: Optional[int] = None
+    if lab_evidence_ref:
+        try:
+            from db.brand_attestation_evidence import record_lab_evidence
+
+            evidence_id = await record_lab_evidence(
+                merchant_id=merchant_id,
+                product_key=product_key,
+                content_key=content_key,
+                evidence_ref=lab_evidence_ref,
+            )
+        except Exception as exc:  # noqa: BLE001
+            logger.warning(
+                "attest_product: lab-evidence store failed for %s: %s",
+                product_key, str(exc)[:200],
+            )
+
     return {
         "status": "attested",
         "content_key": content_key,
         "fields_written": sorted(
             k for k in enrichment if k != "updated_by_employee_id"
         ),
-        "lab_evidence_recorded": bool(lab_evidence_ref),
+        "lab_evidence_recorded": evidence_id is not None,
+        "lab_evidence_id": evidence_id,
     }

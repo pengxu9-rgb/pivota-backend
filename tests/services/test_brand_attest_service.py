@@ -46,9 +46,10 @@ def _row(claim_state="claimed", merchant="m1"):
 def _wire(monkeypatch, row):
     import db.database
     import db.product_enrichment
+    import db.brand_attestation_evidence as bae
     import services.agent_pdp_view_assembler as asm
 
-    calls = {"enrich": None, "advanced": False, "refreshed": False}
+    calls = {"enrich": None, "advanced": False, "refreshed": False, "evidence": None}
 
     async def _fetch_one(query):
         return row
@@ -64,10 +65,16 @@ def _wire(monkeypatch, row):
         calls["refreshed"] = True
         return True
 
+    async def _record(*, merchant_id, product_key, content_key, evidence_ref,
+                      evidence_kind="lab_report"):
+        calls["evidence"] = (merchant_id, product_key, content_key, evidence_ref)
+        return 4242
+
     monkeypatch.setattr(db.database.database, "fetch_one", _fetch_one)
     monkeypatch.setattr(db.product_enrichment, "upsert_enrichment", _upsert)
     monkeypatch.setattr(attest, "advance_product_to_attested", _advance)
     monkeypatch.setattr(asm, "refresh_agent_pdp_view_for_content_key", _refresh)
+    monkeypatch.setattr(bae, "record_lab_evidence", _record)
     return calls
 
 
@@ -86,6 +93,38 @@ def test_attest_claimed_writes_served_overlay(monkeypatch):
     assert calls["enrich"][3]["title_override"] == "Anua Toner"
     assert calls["advanced"] is True  # claim_state -> attested
     assert calls["refreshed"] is True  # served PDP refreshed so agents see it
+
+
+def test_attest_stores_lab_evidence_without_auto_substantiating(monkeypatch):
+    calls = _wire(monkeypatch, _row(claim_state="claimed"))
+    res = asyncio.run(
+        attest.attest_product(
+            merchant_id="m1",
+            product_key="m1|url_audit|anua.com/p/x",
+            fields={"description": "Brand copy"},
+            lab_evidence_ref="https://lab.example/report.pdf",
+        )
+    )
+    assert res["status"] == "attested"
+    assert res["lab_evidence_recorded"] is True
+    assert res["lab_evidence_id"] == 4242
+    assert calls["evidence"][3] == "https://lab.example/report.pdf"
+    # storing evidence advances ONLY to attested — NEVER auto to substantiated.
+    assert calls["advanced"] is True
+
+
+def test_attest_without_evidence_records_nothing(monkeypatch):
+    calls = _wire(monkeypatch, _row(claim_state="claimed"))
+    res = asyncio.run(
+        attest.attest_product(
+            merchant_id="m1",
+            product_key="m1|url_audit|anua.com/p/x",
+            fields={"description": "x"},
+        )
+    )
+    assert res["lab_evidence_recorded"] is False
+    assert res["lab_evidence_id"] is None
+    assert calls["evidence"] is None
 
 
 def test_attest_blocked_when_unclaimed(monkeypatch):

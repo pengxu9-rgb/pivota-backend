@@ -108,3 +108,40 @@ async def advance_product_to_attested(*, merchant_id: str, product_key: str) -> 
             merchant_id, product_key, str(exc)[:200],
         )
         return False
+
+
+async def advance_product_to_substantiated(
+    *, merchant_id: str, product_key: str
+) -> bool:
+    """Best-effort: advance ONE SKU attested -> substantiated. Only advances from
+    'attested' (substantiation requires prior attestation AND graded evidence).
+    This primitive is invoked by the deliberate GRADING step — never by evidence
+    submission, which only stores a record. Merchant-scoped. Returns True iff a
+    row advanced; never raises."""
+    if not merchant_id or not product_key:
+        return False
+    try:
+        from db.database import database
+
+        result = await database.execute(
+            """
+            UPDATE catalog_products
+               SET claim_state = :substantiated, updated_at = NOW()
+             WHERE merchant_id = :merchant_id
+               AND product_key = :product_key
+               AND claim_state = :attested
+            """,
+            {
+                "substantiated": CLAIM_STATE_SUBSTANTIATED,
+                "attested": CLAIM_STATE_ATTESTED,
+                "merchant_id": merchant_id,
+                "product_key": product_key,
+            },
+        )
+        return bool(int(result)) if isinstance(result, int) else False
+    except Exception as exc:  # noqa: BLE001 — best-effort
+        logger.warning(
+            "advance_product_to_substantiated failed for %s/%s: %s",
+            merchant_id, product_key, str(exc)[:200],
+        )
+        return False
