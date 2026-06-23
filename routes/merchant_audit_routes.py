@@ -73,6 +73,7 @@ from services.agent_center_bd_report_service import (
     run_wedge_hero_sku_intelligence,
     sanitize_report_for_merchant,
 )
+from services.agent_readiness_score import compute_agent_readiness_score
 from services.audit_index_intake import (
     audit_intake_enabled,
     resolve_seed_vendor,
@@ -1400,6 +1401,10 @@ async def run_merchant_url_audit(
                 "pdp_url": p["pdp_url"],
                 "vendor": p.get("vendor"),
                 "sku_key": sp["sku_key"],
+                # ARO: the merchant-facing agent-readability diagnostic + the
+                # actionable gaps (the value the brand pays to watch). Pure +
+                # compute-on-read from signals already fetched; safe on any input.
+                "agent_readiness": compute_agent_readiness_score(p),
             }
             for p, sp in zip(audit_products, synthetic_products)
         ],
