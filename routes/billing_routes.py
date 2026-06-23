@@ -622,6 +622,20 @@ async def _handle_checkout_session_completed(event: Dict[str, Any], db: Database
                 period_exc,
             )
 
+        # A new paid subscription supersedes any prior active subscription the
+        # merchant still holds. Without this, an upgrade where the old plan was
+        # never cancelled double-bills the merchant and leaves duplicate active
+        # rows that make tier resolution ambiguous (the lower plan can outrank
+        # the upgrade on renewal). Cancel the prior subscription(s) in Stripe
+        # and locally. Runs after the new subscription is committed and outside
+        # the fulfillment transaction; best-effort so cleanup never blocks the
+        # new subscription.
+        await _cancel_prior_active_subscriptions(
+            db,
+            merchant_id=merchant_id,
+            keep_stripe_subscription_id=stripe_subscription_id,
+        )
+
         await _mark_event_processed(event_id, db)
     except Exception as exc:
         await _handle_billing_handler_error(event_id, exc, db)
@@ -687,7 +701,12 @@ async def _handle_subscription_updated(event: Dict[str, Any], db: Database) -> N
         merchant_id = _as_text(existing["merchant_id"])
         contact_email = await _lookup_merchant_contact_email(db, merchant_id)
         if status_value in {"canceled", "unpaid"}:
-            await _downgrade_merchant_to_free(db, merchant_id=merchant_id, contact_email=contact_email)
+            await _reconcile_after_subscription_ended(
+                db,
+                merchant_id=merchant_id,
+                contact_email=contact_email,
+                ended_stripe_subscription_id=stripe_subscription_id,
+            )
         elif plan and int(existing["plan_id"]) != int(plan["id"]):
             await _update_merchant_tier(
                 db,
@@ -742,7 +761,12 @@ async def _handle_subscription_deleted(event: Dict[str, Any], db: Database) -> N
         if row:
             merchant_id = _as_text(row["merchant_id"])
             contact_email = await _lookup_merchant_contact_email(db, merchant_id)
-            await _downgrade_merchant_to_free(db, merchant_id=merchant_id, contact_email=contact_email)
+            await _reconcile_after_subscription_ended(
+                db,
+                merchant_id=merchant_id,
+                contact_email=contact_email,
+                ended_stripe_subscription_id=stripe_subscription_id,
+            )
         else:
             logger.warning("Subscription delete received for unknown subscription: %s", stripe_subscription_id)
 
@@ -1249,6 +1273,145 @@ async def _downgrade_merchant_to_free(
         except Exception:  # noqa: BLE001
             logger.warning(
                 "expire_plan_allowance failed on downgrade for merchant_id=%s",
+                merchant_id,
+                exc_info=True,
+            )
+
+
+async def _reconcile_after_subscription_ended(
+    db: Database,
+    *,
+    merchant_id: str,
+    contact_email: Optional[str],
+    ended_stripe_subscription_id: Optional[str],
+) -> None:
+    """Re-resolve a merchant's tier after one of their subscriptions ends.
+
+    A merchant may hold more than one active subscription (e.g. a superseded
+    plan during an upgrade window, or a coupon'd secondary plan). Cancelling or
+    ending one of them must NOT drop the merchant to free while a higher plan is
+    still active. Prefer the richest remaining active subscription; only fall
+    back to the free downgrade when none remain. Mirrors the
+    richest-plan-wins ordering used by the tier resolvers.
+    """
+    remaining = await db.fetch_one(
+        """
+        SELECT sp.name AS tier_name
+          FROM user_subscriptions us
+          JOIN subscription_plans sp ON sp.id = us.plan_id
+         WHERE us.merchant_id = :merchant_id
+           AND us.status IN ('active', 'trialing')
+           AND sp.status = 'active'
+           AND us.stripe_subscription_id IS DISTINCT FROM :ended
+         ORDER BY sp.monthly_credit_allowance DESC NULLS LAST,
+                  us.current_period_start DESC NULLS LAST,
+                  us.id DESC
+         LIMIT 1
+        """,
+        {"merchant_id": merchant_id, "ended": ended_stripe_subscription_id},
+    )
+    if not remaining:
+        await _downgrade_merchant_to_free(
+            db, merchant_id=merchant_id, contact_email=contact_email
+        )
+        return
+
+    # Another active plan remains — keep the merchant on the richest one and
+    # refresh the credit wallet to that plan rather than wiping to free.
+    await _update_merchant_tier(
+        db,
+        merchant_id=merchant_id,
+        contact_email=contact_email,
+        tier_name=_as_text(remaining["tier_name"]),
+    )
+    if merchant_id:
+        try:
+            from services.merchant_credit_balance_service import (
+                apply_subscription_allowance,
+            )
+
+            await apply_subscription_allowance(merchant_id)
+        except Exception:  # noqa: BLE001
+            logger.warning(
+                "apply_subscription_allowance failed reconciling remaining "
+                "subscription for merchant_id=%s",
+                merchant_id,
+                exc_info=True,
+            )
+
+
+async def _cancel_prior_active_subscriptions(
+    db: Database,
+    *,
+    merchant_id: str,
+    keep_stripe_subscription_id: str,
+) -> None:
+    """Cancel every active/trialing subscription for the merchant other than
+    keep_stripe_subscription_id — in Stripe (so billing stops) and locally.
+
+    Called after a new subscription checkout completes so the merchant ends up
+    with a single active plan. Best-effort and isolated per subscription: a
+    failure to cancel one prior subscription is logged and never interrupts the
+    others or the new subscription's fulfillment. The resulting
+    customer.subscription.deleted webhook is reconciled by
+    _reconcile_after_subscription_ended, which keeps the merchant on the
+    just-activated plan rather than downgrading to free.
+    """
+    if not merchant_id or not keep_stripe_subscription_id:
+        return
+    try:
+        rows = await db.fetch_all(
+            """
+            SELECT stripe_subscription_id
+              FROM user_subscriptions
+             WHERE merchant_id = :merchant_id
+               AND status IN ('active', 'trialing')
+               AND stripe_subscription_id IS DISTINCT FROM :keep
+            """,
+            {"merchant_id": merchant_id, "keep": keep_stripe_subscription_id},
+        )
+    except Exception:  # noqa: BLE001
+        logger.warning(
+            "Could not list prior subscriptions to cancel for merchant_id=%s",
+            merchant_id,
+            exc_info=True,
+        )
+        return
+
+    for row in rows or []:
+        prior_id = _as_text(dict(row).get("stripe_subscription_id"))
+        if not prior_id:
+            continue
+        try:
+            await asyncio.to_thread(
+                stripe_client.v1.subscriptions.cancel, prior_id
+            )
+        except Exception:  # noqa: BLE001
+            # Already cancelled in Stripe, or a transient API failure — mark the
+            # local row cancelled regardless so tier resolution stops counting
+            # it; the deleted webhook (if any) is idempotent.
+            logger.warning(
+                "Stripe cancel failed for prior subscription %s (merchant_id=%s); "
+                "marking local row cancelled anyway",
+                prior_id,
+                merchant_id,
+                exc_info=True,
+            )
+        try:
+            await db.execute(
+                """
+                UPDATE user_subscriptions
+                   SET status = 'canceled',
+                       canceled_at = COALESCE(canceled_at, NOW())
+                 WHERE stripe_subscription_id = :sid
+                """,
+                {"sid": prior_id},
+            )
+        except Exception:  # noqa: BLE001
+            logger.warning(
+                "Could not mark prior subscription %s cancelled locally "
+                "(merchant_id=%s)",
+                prior_id,
                 merchant_id,
                 exc_info=True,
             )
