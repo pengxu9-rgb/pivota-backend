@@ -53,6 +53,40 @@ def stable_source_id(pdp_url: Optional[str]) -> str:
     return f"{host}{path}" if host else pdp_url.strip().lower()
 
 
+def _strip_html(html: Optional[str]) -> Optional[str]:
+    """Crude tag-strip for a PDP body_html → plain description. Best-effort."""
+    if not html:
+        return None
+    import re
+
+    text = re.sub(r"<[^>]+>", " ", str(html))
+    text = re.sub(r"\s+", " ", text).strip()
+    return text or None
+
+
+def _audit_description(attrs: Dict[str, Any]) -> Optional[str]:
+    """Prefer a clean structured description; fall back to stripped body_html.
+    Capped so a giant body_html can't bloat the row."""
+    desc = (str(attrs.get("description") or "").strip() or None) or _strip_html(
+        attrs.get("body_html")
+    )
+    return desc[:5000] if desc else None
+
+
+def _audit_image_url(attrs: Dict[str, Any]) -> Optional[str]:
+    """First product image from the audit's structured-data read (dict or list)."""
+    images = attrs.get("images")
+    if isinstance(images, dict):
+        return str(images.get("first_url") or "").strip() or None
+    if isinstance(images, list) and images:
+        first = images[0]
+        if isinstance(first, str):
+            return first.strip() or None
+        if isinstance(first, dict):
+            return str(first.get("url") or first.get("src") or "").strip() or None
+    return None
+
+
 def audit_product_to_index_fields(
     merchant_id: str, audit_product: Dict[str, Any]
 ) -> Optional[Dict[str, Any]]:
@@ -92,6 +126,11 @@ def audit_product_to_index_fields(
         "canonical_url": pdp_url,
         "source_domain": _host(pdp_url) or None,
         "product_type": (audit_product.get("product_type") or "").strip() or None,
+        # OBSERVED content from the merchant-paid audit (the flywheel's exhaust):
+        # enriches the seed so it's rich WHEN claimed. Adds no serving — the row
+        # stays un-served (pdp_lifecycle_stage NULL).
+        "description": _audit_description(audit_product.get("attributes_raw") or {}),
+        "image_url": _audit_image_url(audit_product.get("attributes_raw") or {}),
         "raw_title": audit_product.get("raw_title"),
         "attributes_raw": audit_product.get("attributes_raw") or {},
     }
@@ -137,11 +176,13 @@ def audit_intake_enabled() -> bool:
 # Only the columns we set; everything else (catalog_track, truth_tier,
 # readiness_tier, pdp_scope='unverified', sync_status, created_at, …) takes its
 # server_default — and pdp_lifecycle_stage stays NULL, so a seed is NOT recalled
-# /served until it graduates or is claimed.
+# /served until it graduates or is claimed. description + image_url are OBSERVED
+# content fields (the audit's exhaust) — they enrich the seed for when it's
+# claimed and add NO serving; the lifecycle stage is still left NULL.
 _CATALOG_INSERT_COLUMNS = (
     "product_key", "merchant_id", "platform", "source_product_id",
     "title", "brand", "content_key", "canonical_url", "source_domain",
-    "product_type",
+    "product_type", "description", "image_url",
 )
 
 
@@ -177,6 +218,12 @@ async def upsert_audited_sku_to_index(
                 ),
                 "product_type": func.coalesce(
                     stmt.excluded.product_type, catalog_products.c.product_type
+                ),
+                "description": func.coalesce(
+                    stmt.excluded.description, catalog_products.c.description
+                ),
+                "image_url": func.coalesce(
+                    stmt.excluded.image_url, catalog_products.c.image_url
                 ),
                 "updated_at": func.now(),
                 "content_changed_at": func.now(),
