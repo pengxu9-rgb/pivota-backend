@@ -102,6 +102,13 @@ class PivotQueryRequest(BaseModel):
     include_external: bool = True
     include_incentives: bool = True
     payment_context: Optional[PivotPaymentContext] = None
+    # ADR-007 SLICE 3: the intent signal threaded down from the gateway. When the
+    # caller surface is strict/commerce-explicit (shopping intent), the OFFER-FREE
+    # citable lane is SUPPRESSED — citation-only rows must never appear for a
+    # buy-now request. Default False (non-strict / inform-recommend) so the citable
+    # lane MAY contribute when INDEX_ELIGIBLE_RECALL is on. The flag still gates
+    # whether the lane runs at all; this only narrows WHEN it may contribute.
+    strict_serving_mode: bool = False
 
 
 class PivotPricing(BaseModel):
@@ -294,6 +301,12 @@ class PivotResultItem(BaseModel):
     catalog_track: str
     truth_tier: str
     readiness_tier: str
+    # ADR-007 SLICE 3: buyability is now EXPLICIT on the result item. Offer-backed
+    # recall rows are buyable (default True ⇒ pre-ADR-007 behavior is unchanged).
+    # The OFFER-FREE "citable" lane (index_eligible, no catalog_offers join) emits
+    # items with buyable=False and offers=[] — citation-only, NEVER transactable.
+    # The quote/order path fails closed for these (no offer_id/sku_key to resolve).
+    buyable: bool = True
     freshness: Dict[str, Any] = Field(default_factory=dict)
     source_system: Optional[str] = None
     match_explanation: Dict[str, Any] = Field(default_factory=dict)

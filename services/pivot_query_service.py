@@ -934,6 +934,216 @@ async def _fetch_canonical_search_rows(
     return [_row_dict(row) for row in rows]
 
 
+# ---------------------------------------------------------------------------
+# ADR-007 SLICE 3 — citable recall (offer-free, NEVER buyable)
+# ---------------------------------------------------------------------------
+
+
+def _index_eligible_recall_enabled() -> bool:
+    """ADR-007 SLICE 3 flag. When ON, the OFFER-FREE citable lane runs and
+    contributes index_eligible (citation-only) products to recall for
+    inform/recommend intent. Default OFF ⇒ the lane never runs, no new SQL
+    executes, and recall is byte-identical to today (offer-backed lane only)."""
+    return (
+        (os.getenv("INDEX_ELIGIBLE_RECALL") or "").strip().lower()
+        in {"1", "true", "yes", "on"}
+    )
+
+
+async def _fetch_citable_canonical_rows(
+    *,
+    query: str,
+    merchant_id: Optional[str],
+    limit: int,
+) -> List[Dict[str, Any]]:
+    """ADR-007 SLICE 3: the OFFER-FREE citable recall lane.
+
+    Mirrors the text-match predicates of `_fetch_canonical_search_rows` but is a
+    SEPARATE lane that joins catalog_products -> index_pipeline_state (on
+    content_key) WHERE index_eligible = TRUE, and pulls display content from
+    agent_pdp_view. It has NO catalog_skus join and NO catalog_offers join, so it
+    can NEVER produce a buyable/offer-shaped row. The forbidden move — LEFT JOINing
+    catalog_offers into the existing canonical lane — is explicitly NOT what this
+    is: the canonical INNER JOIN at `_fetch_canonical_search_rows` is untouched.
+
+    Rows returned here carry an explicit `buyable=False` marker + the content_key
+    so the merge can dedupe against offer-backed results. Ranking is by MERIT only
+    (the same text-match rank terms the canonical lane uses, MINUS sku/offer
+    terms); no offer/ownership boost is applied.
+    """
+    lowered = _normalize_query(query)
+    if not lowered:
+        return []
+    normalized_limit = max(1, int(limit or 20))
+    row_limit = min(max(normalized_limit * 6, 50), 500)
+    category_prefix = category_path_prefix_for_query(query)
+    params: Dict[str, Any] = {
+        "query_exact": lowered,
+        "query_like": f"%{lowered}%",
+        "row_limit": row_limit,
+    }
+    merchant_clause = ""
+    if merchant_id:
+        merchant_clause = "AND p.merchant_id = :merchant_id"
+        params["merchant_id"] = merchant_id
+    # Mirror the canonical lane's cross-merchant live filters so the citable
+    # surface is held to the same lifecycle/sync floor for global queries.
+    lifecycle_clause = ""
+    sync_status_clause = ""
+    if not merchant_id:
+        lifecycle_clause = (
+            "AND (p.pdp_lifecycle_stage IN ('validated', 'published') "
+            "OR p.pdp_lifecycle_stage IS NULL)"
+        )
+        sync_status_clause = "AND p.sync_status = 'live'"
+    category_where = ""
+    category_score = ""
+    if category_prefix:
+        params["category_path_prefix"] = f"{category_prefix}%"
+        category_where = """
+            OR (p.category_path IS NOT NULL AND p.category_path LIKE :category_path_prefix)
+        """
+        category_score = """
+            + CASE WHEN p.category_path IS NOT NULL AND p.category_path LIKE :category_path_prefix THEN 90 ELSE 0 END
+        """
+
+    rows = await database.fetch_all(
+        f"""
+        SELECT
+            m.merchant_id AS merchant_id,
+            m.merchant_name AS merchant_name,
+            m.primary_platform AS merchant_primary_platform,
+            p.product_key,
+            p.content_key,
+            p.source_product_id,
+            p.canonical_url,
+            p.pivota_canonical_url,
+            p.catalog_track,
+            p.truth_tier,
+            p.readiness_tier,
+            p.pdp_scope,
+            p.pdp_lifecycle_stage,
+            p.source_system,
+            p.freshness_json,
+            p.updated_at AS product_updated_at,
+            -- Display content is served from the already-assembled agent_pdp_view
+            -- (the same denormalized surface the citation PDP renders from).
+            COALESCE(apv.title, p.title) AS product_title,
+            COALESCE(apv.description, p.description) AS product_description,
+            COALESCE(apv.brand, p.brand) AS brand,
+            p.product_type,
+            COALESCE(apv.category_path, p.category) AS category,
+            COALESCE(apv.image_url, p.image_url) AS product_image_url,
+            (
+                CASE WHEN LOWER(COALESCE(p.source_product_id, '')) = :query_exact THEN 105 ELSE 0 END +
+                CASE WHEN LOWER(COALESCE(COALESCE(apv.title, p.title), '')) = :query_exact THEN 100 ELSE 0 END +
+                CASE WHEN LOWER(COALESCE(m.merchant_name, '')) = :query_exact THEN 90 ELSE 0 END +
+                CASE WHEN LOWER(COALESCE(COALESCE(apv.brand, p.brand), '')) = :query_exact THEN 80 ELSE 0 END +
+                CASE WHEN p.pdp_scope = 'multi_merchant_canonical' THEN 200 ELSE 0 END +
+                CASE WHEN p.pdp_lifecycle_stage = 'published' THEN 60 ELSE 0 END +
+                CASE WHEN p.pdp_lifecycle_stage = 'validated' THEN 20 ELSE 0 END
+                {category_score}
+            ) AS rank_score
+        FROM catalog_products p
+        JOIN index_pipeline_state ips
+          ON ips.content_key = p.content_key
+         AND ips.index_eligible = TRUE
+        LEFT JOIN agent_pdp_view apv ON apv.content_key = p.content_key
+        LEFT JOIN catalog_merchants m ON m.merchant_id = p.merchant_id
+        WHERE p.content_key IS NOT NULL
+          AND (
+            LOWER(COALESCE(COALESCE(apv.title, p.title), '')) LIKE :query_like OR
+            LOWER(COALESCE(COALESCE(apv.brand, p.brand), '')) LIKE :query_like OR
+            LOWER(COALESCE(m.merchant_name, '')) LIKE :query_like OR
+            LOWER(COALESCE(p.source_product_id, '')) LIKE :query_like
+            {category_where}
+          )
+          {merchant_clause}
+          {lifecycle_clause}
+          {sync_status_clause}
+        ORDER BY rank_score DESC, p.updated_at DESC
+        LIMIT :row_limit
+        """,
+        params,
+    )
+    return [_row_dict(row) for row in rows]
+
+
+def _build_citable_items(
+    rows: List[Dict[str, Any]],
+    *,
+    query: Optional[str],
+) -> List[PivotResultItem]:
+    """Build OFFER-FREE, NON-buyable PivotResultItems from citable rows.
+
+    Each item has offers=[] and buyable=False. The product carries a canonical
+    PDP destination (the Pivota canonical URL, falling back to the product's own
+    canonical_url) so an agent can CITE it. There is NO sku_key and NO offer_id,
+    so the quote/order path resolves nothing and fails closed for these items.
+    """
+    items: List[PivotResultItem] = []
+    seen_content_keys: set[str] = set()
+    for row in rows:
+        content_key = str(row.get("content_key") or "").strip()
+        # Dedupe within the lane: agent_pdp_view is content_key-keyed, but
+        # catalog_products can fan out multiple product_keys onto one
+        # content_key — collapse to one citable item per content_key.
+        if content_key and content_key in seen_content_keys:
+            continue
+        if content_key:
+            seen_content_keys.add(content_key)
+        destination_url = (
+            str(row.get("pivota_canonical_url") or "").strip()
+            or str(row.get("canonical_url") or "").strip()
+            or None
+        )
+        match_reason = _canonical_match_reason(row, query or "")
+        match_reason["lane"] = "citable_canonical"
+        match_reason["buyable"] = False
+        match_reason["candidate_source"] = "index_eligible"
+        match_reason["content_key"] = content_key or None
+        match_reason["destination_url"] = destination_url
+        items.append(
+            PivotResultItem(
+                merchant=MerchantNode(
+                    merchant_id=row.get("merchant_id"),
+                    merchant_name=row.get("merchant_name"),
+                    primary_platform=row.get("merchant_primary_platform"),
+                ),
+                product=ProductNode(
+                    product_key=row.get("product_key"),
+                    source_product_id=row.get("source_product_id"),
+                    title=row.get("product_title"),
+                    description=row.get("product_description"),
+                    brand=row.get("brand"),
+                    product_type=row.get("product_type"),
+                    category=row.get("category"),
+                    canonical_url=destination_url,
+                    image_url=row.get("product_image_url"),
+                ),
+                # No SKU node content — there is no buyable variant to resolve.
+                sku=SkuNode(),
+                # OFFER-FREE: the lane carries no catalog_offers join, so there is
+                # never an OfferNode here. This is what makes the item un-buyable.
+                offers=[],
+                buyable=False,
+                # NOT 'internal_merchant' — that catalog_track gets an ordering
+                # boost in _sort_items. A 'citation' track keeps citable rows
+                # neutral (no ownership/offer boost; merit-only ranking).
+                catalog_track="citation",
+                truth_tier=str(row.get("truth_tier") or "primary"),
+                readiness_tier=str(row.get("readiness_tier") or "knowledge_ready"),
+                freshness=_json_dict(row.get("freshness_json")) or {
+                    "updated_at": str(row.get("product_updated_at") or ""),
+                },
+                source_system=row.get("source_system"),
+                match_explanation=match_reason,
+                verticals={},
+            )
+        )
+    return items
+
+
 async def _fetch_canonical_rows_for_product(product_key: str) -> List[Dict[str, Any]]:
     rows = await database.fetch_all(
         """
@@ -1459,7 +1669,58 @@ async def search_pivot_catalog(request: PivotQueryRequest) -> PivotQueryResponse
     ):
         external_items = await _fetch_external_fallback_items(request)
 
-    items = _sort_items((canonical_items + external_items)[: request.limit * 2])[: request.limit]
+    # ADR-007 SLICE 3: the OFFER-FREE citable lane. Contributes index_eligible
+    # (citation-only, NEVER buyable) rows for inform/recommend intent only.
+    #
+    # Hard gates (ALL must hold for the lane to even run):
+    #   (a) INDEX_ELIGIBLE_RECALL flag ON — default OFF ⇒ no new SQL, the lane
+    #       never executes, and recall is byte-identical to today.
+    #   (b) NOT strict_serving_mode — when the surface is commerce-explicit
+    #       (shopping intent), citation-only rows are SUPPRESSED.
+    #
+    # Best-effort: any failure in the citable lane is swallowed so it can never
+    # break the offer-backed recall above.
+    citable_items: List[PivotResultItem] = []
+    if _index_eligible_recall_enabled() and not request.strict_serving_mode:
+        try:
+            citable_rows = await _fetch_citable_canonical_rows(
+                query=request.query,
+                merchant_id=request.merchant_id,
+                limit=request.limit,
+            )
+            built_citable = _build_citable_items(citable_rows, query=request.query)
+            # Dedupe against the offer-backed results: if a product is already
+            # present via a buyable offer, prefer that — never double-list it as
+            # citable. Dedupe on content_key (then product_key as a fallback) of
+            # the buyable items.
+            buyable_content_keys: set[str] = set()
+            buyable_product_keys: set[str] = set()
+            for buyable_item in canonical_items + external_items:
+                bck = str(
+                    (buyable_item.match_explanation or {}).get("content_key") or ""
+                ).strip()
+                if bck:
+                    buyable_content_keys.add(bck)
+                bpk = str(buyable_item.product.product_key or "").strip()
+                if bpk:
+                    buyable_product_keys.add(bpk)
+            for citable_item in built_citable:
+                cck = str(
+                    (citable_item.match_explanation or {}).get("content_key") or ""
+                ).strip()
+                cpk = str(citable_item.product.product_key or "").strip()
+                if cck and cck in buyable_content_keys:
+                    continue
+                if cpk and cpk in buyable_product_keys:
+                    continue
+                citable_items.append(citable_item)
+        except Exception:
+            logger.warning("pivot_citable_lane_failed", exc_info=True)
+            citable_items = []
+
+    items = _sort_items(
+        (canonical_items + external_items + citable_items)[: request.limit * 2]
+    )[: request.limit]
     elapsed_ms = round((time.perf_counter() - started) * 1000.0, 1)
     if elapsed_ms >= 3000:
         logger.warning(
@@ -1471,6 +1732,7 @@ async def search_pivot_catalog(request: PivotQueryRequest) -> PivotQueryResponse
                 "canonical_rows": len(canonical_rows),
                 "canonical_items": len(canonical_items),
                 "external_items": len(external_items),
+                "citable_items": len(citable_items),
                 "limit": request.limit,
             },
         )
