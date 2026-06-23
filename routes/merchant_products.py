@@ -68,6 +68,253 @@ router = APIRouter(prefix="/merchant/products", tags=["Merchant Products"])
 QUALITY_BACKFILL_STALE_SECONDS = 15 * 60
 
 
+# ---------------------------------------------------------------------------
+# Store-less brand-authored products — manual create/edit for brands with no
+# connected store. Flag-gated (ENABLE_STORELESS_BRAND_CATALOG, default OFF):
+# with the flag OFF these endpoints return 404 and behavior is unchanged.
+# Merchant-scoped: merchant_id comes from get_current_merchant (the JWT claim),
+# NEVER from the body — cross-tenant is impossible.
+# ---------------------------------------------------------------------------
+
+
+class BrandAuthoredProductCreate(BaseModel):
+    title: str
+    brand: Optional[str] = None  # alias: vendor
+    vendor: Optional[str] = None
+    product_type: Optional[str] = None  # alias: category
+    category: Optional[str] = None
+    description: Optional[str] = None
+    image_url: Optional[str] = None
+    image_urls: Optional[List[str]] = None
+    tags: Optional[List[str]] = None
+    attributes: Optional[Dict[str, Any]] = None
+    price: Optional[float] = None
+    currency: Optional[str] = None
+    # Optional enrichment-overlay fields (written to product_enrichment).
+    summary_short: Optional[str] = None
+    bullet_points: Optional[List[str]] = None
+    usage_scenarios: Optional[List[str]] = None
+    audience_tags: Optional[List[str]] = None
+    topic_tags: Optional[List[str]] = None
+    regulatory_disclaimer_local: Optional[str] = None
+
+
+class BrandAuthoredProductEdit(BaseModel):
+    title: Optional[str] = None
+    brand: Optional[str] = None
+    vendor: Optional[str] = None
+    product_type: Optional[str] = None
+    category: Optional[str] = None
+    description: Optional[str] = None
+    image_url: Optional[str] = None
+    image_urls: Optional[List[str]] = None
+    tags: Optional[List[str]] = None
+    attributes: Optional[Dict[str, Any]] = None
+    price: Optional[float] = None
+    currency: Optional[str] = None
+    summary_short: Optional[str] = None
+    bullet_points: Optional[List[str]] = None
+    usage_scenarios: Optional[List[str]] = None
+    audience_tags: Optional[List[str]] = None
+    topic_tags: Optional[List[str]] = None
+    regulatory_disclaimer_local: Optional[str] = None
+
+
+def _require_storeless_brand_catalog() -> None:
+    from readiness.flags import storeless_brand_catalog_enabled
+
+    if not storeless_brand_catalog_enabled():
+        # 404 (not 403) — with the flag OFF the feature doesn't exist.
+        raise HTTPException(status_code=404, detail="Not found")
+
+
+def _enrichment_overlay_from_body(body: Dict[str, Any]) -> Dict[str, Any]:
+    """Map the create/edit body's overlay fields to upsert_enrichment keys."""
+    overlay: Dict[str, Any] = {}
+    if body.get("summary_short") is not None:
+        overlay["summary_short"] = body["summary_short"]
+    if body.get("description") is not None:
+        overlay["description_markdown"] = body["description"]
+    if body.get("bullet_points") is not None:
+        overlay["bullet_points"] = body["bullet_points"]
+    if body.get("usage_scenarios") is not None:
+        overlay["usage_scenarios"] = body["usage_scenarios"]
+    if body.get("audience_tags") is not None:
+        overlay["audience_tags"] = body["audience_tags"]
+    if body.get("topic_tags") is not None:
+        overlay["topic_tags"] = body["topic_tags"]
+    if body.get("regulatory_disclaimer_local") is not None:
+        overlay["regulatory_disclaimer_local"] = body["regulatory_disclaimer_local"]
+    image_urls = body.get("image_urls")
+    if image_urls:
+        # Extra images beyond the primary go into the enrichment overlay.
+        primary = body.get("image_url")
+        extras = [u for u in image_urls if u and u != primary]
+        if extras:
+            overlay["extra_images"] = extras
+    return overlay
+
+
+async def _brand_authored_detail(merchant_id: str, source_product_id: str) -> Dict[str, Any]:
+    from services.brand_authored_intake import PLATFORM_BRAND_AUTHORED
+
+    row = await database.fetch_one(
+        """
+        SELECT product_key, source_product_id, title, brand, description,
+               product_type, category, image_url, tags, content_key, pdp_scope,
+               claim_state, pdp_lifecycle_stage
+        FROM catalog_products
+        WHERE merchant_id = :mid AND platform = :platform
+          AND source_product_id = :spid
+        LIMIT 1
+        """,
+        {
+            "mid": merchant_id,
+            "platform": PLATFORM_BRAND_AUTHORED,
+            "spid": source_product_id,
+        },
+    )
+    if not row:
+        return {}
+    enrichment = await get_enrichment(
+        merchant_id=merchant_id,
+        platform=PLATFORM_BRAND_AUTHORED,
+        platform_product_id=source_product_id,
+        geo_code="default",
+    )
+    detail = dict(row)
+    detail["platform"] = PLATFORM_BRAND_AUTHORED
+    detail["enrichment"] = enrichment or {}
+    return detail
+
+
+@router.post("", status_code=201)
+async def create_brand_authored_product(
+    body: BrandAuthoredProductCreate,
+    current_user: dict = Depends(get_current_user),
+):
+    """Create a store-less brand-authored product.
+
+    Mints an OBSERVED, un-served catalog_products row (platform='brand_authored',
+    pdp_scope='unverified', pdp_lifecycle_stage NULL → not recalled/served) plus a
+    product_enrichment overlay for the merchant-supplied content. merchant_id is
+    derived from the JWT, never the body."""
+    _require_storeless_brand_catalog()
+    from utils.auth import get_current_merchant
+    from services.brand_authored_intake import (
+        PLATFORM_BRAND_AUTHORED,
+        build_catalog_fields,
+        generate_source_product_id,
+        upsert_brand_authored_catalog_row,
+    )
+
+    merchant_id = await get_current_merchant(current_user=current_user)
+
+    title = (body.title or "").strip()
+    if not title:
+        raise HTTPException(status_code=422, detail="title is required")
+
+    source_product_id = generate_source_product_id(title)
+    fields = build_catalog_fields(
+        merchant_id,
+        source_product_id,
+        title=title,
+        brand=body.brand or body.vendor,
+        product_type=body.product_type or body.category,
+        category=body.category or body.product_type,
+        description=body.description,
+        image_url=body.image_url or (body.image_urls[0] if body.image_urls else None),
+        tags=body.tags,
+    )
+    await upsert_brand_authored_catalog_row(fields)
+
+    overlay = _enrichment_overlay_from_body(body.model_dump())
+    if overlay:
+        await upsert_enrichment(
+            merchant_id=merchant_id,
+            platform=PLATFORM_BRAND_AUTHORED,
+            platform_product_id=source_product_id,
+            geo_code="default",
+            data=overlay,
+        )
+
+    detail = await _brand_authored_detail(merchant_id, source_product_id)
+    return {
+        "status": "created",
+        "product_id": source_product_id,
+        "product": detail,
+    }
+
+
+@router.put("/{product_id}")
+async def edit_brand_authored_product(
+    product_id: str,
+    body: BrandAuthoredProductEdit,
+    current_user: dict = Depends(get_current_user),
+):
+    """Edit a store-less brand-authored product. Own-merchant-only: the product
+    must belong to the caller's merchant_id (from the JWT) or it's a 404."""
+    _require_storeless_brand_catalog()
+    from utils.auth import get_current_merchant
+    from services.brand_authored_intake import (
+        PLATFORM_BRAND_AUTHORED,
+        build_catalog_fields,
+        upsert_brand_authored_catalog_row,
+    )
+
+    merchant_id = await get_current_merchant(current_user=current_user)
+
+    existing = await database.fetch_one(
+        """
+        SELECT title, brand, description, product_type, category, image_url, tags
+        FROM catalog_products
+        WHERE merchant_id = :mid AND platform = :platform
+          AND source_product_id = :spid
+        LIMIT 1
+        """,
+        {
+            "mid": merchant_id,
+            "platform": PLATFORM_BRAND_AUTHORED,
+            "spid": product_id,
+        },
+    )
+    if not existing:
+        raise HTTPException(status_code=404, detail="Product not found")
+    existing = dict(existing)
+
+    # Merge: explicitly-provided fields override; everything else is preserved.
+    title = (body.title.strip() if body.title is not None else None) or existing.get("title")
+    fields = build_catalog_fields(
+        merchant_id,
+        product_id,
+        title=title,
+        brand=(body.brand or body.vendor) if (body.brand or body.vendor) is not None else existing.get("brand"),
+        product_type=(body.product_type or body.category) if (body.product_type or body.category) is not None else existing.get("product_type"),
+        category=(body.category or body.product_type) if (body.category or body.product_type) is not None else existing.get("category"),
+        description=body.description if body.description is not None else existing.get("description"),
+        image_url=(body.image_url or (body.image_urls[0] if body.image_urls else None)) if (body.image_url or body.image_urls) is not None else existing.get("image_url"),
+        tags=body.tags if body.tags is not None else existing.get("tags"),
+    )
+    await upsert_brand_authored_catalog_row(fields)
+
+    overlay = _enrichment_overlay_from_body(body.model_dump())
+    if overlay:
+        await upsert_enrichment(
+            merchant_id=merchant_id,
+            platform=PLATFORM_BRAND_AUTHORED,
+            platform_product_id=product_id,
+            geo_code="default",
+            data=overlay,
+        )
+
+    detail = await _brand_authored_detail(merchant_id, product_id)
+    return {
+        "status": "updated",
+        "product_id": product_id,
+        "product": detail,
+    }
+
+
 class EnrichmentBackfillRequest(BaseModel):
     platform: Optional[str] = None
     limit: Optional[int] = 100

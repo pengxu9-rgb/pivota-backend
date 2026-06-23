@@ -25,6 +25,14 @@ def readiness_real_merchant_alpha_enabled() -> bool:
     return _env_flag("FEATURE_READINESS_REAL_MERCHANT_ALPHA")
 
 
+def storeless_brand_catalog_enabled() -> bool:
+    """Flag: let store-less brand-authored products flow through the readiness
+    pipeline + the manual create/edit endpoints. Default OFF — with it OFF the
+    readiness source selector preserves the existing KeyError path, so behavior
+    is byte-identical to today."""
+    return _env_flag("ENABLE_STORELESS_BRAND_CATALOG")
+
+
 def readiness_source_of_truth_enabled() -> bool:
     return _env_flag("FEATURE_READINESS_SOURCE_OF_TRUTH_V1")
 
