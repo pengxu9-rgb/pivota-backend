@@ -1,0 +1,69 @@
+"""Off-platform outreach moves derived from 'who AI cites instead'.
+
+_outreach_moves classifies each cited host and routes it to the right action
+verb + playbook lever (pitch editorial / get carried by retailer / engage
+community / partner with creators), ranks recommends-a-rival first, and skips
+hosts that aren't outreach targets. classify_host is mocked for determinism.
+"""
+
+from __future__ import annotations
+
+import services.merchant_narrative_builder as mnb
+
+
+def _patch_classifier(monkeypatch, mapping):
+    def fake_classify_host(host, merchant_category=None):
+        return mapping.get(host, {"type": "unclassified"})
+    monkeypatch.setattr(mnb, "classify_host", fake_classify_host)
+
+
+def test_routes_ranks_and_skips(monkeypatch):
+    _patch_classifier(monkeypatch, {
+        "hwahae.com": {"type": "editorial", "subtype": "review_site",
+                       "pitch_recipient": "tips@hwahae.com"},
+        "oliveyoung.com": {"type": "retailer", "subtype": "beauty_retailer"},
+        "reddit.com": {"type": "community"},
+        "cdn.shopify.com": {"type": "cdn"},  # asset host → skipped
+        "rival.com": {"type": "brand"},  # competitor's own domain → skipped
+        "someblog.kr": {"type": "unclassified"},  # unknown → investigate fallback
+    })
+    who = {"cited_hosts": [
+        {"host": "oliveyoung.com", "recommendation_class": "unknown",
+         "prompts_cited_count": 5, "cited_on_category_query": False},
+        {"host": "hwahae.com", "recommendation_class": "recommends",
+         "prompts_cited_count": 3, "cited_on_category_query": True},
+        {"host": "reddit.com", "recommendation_class": "unknown",
+         "prompts_cited_count": 1, "cited_on_category_query": False},
+        {"host": "cdn.shopify.com", "recommendation_class": "unknown",
+         "prompts_cited_count": 9, "cited_on_category_query": False},
+        {"host": "rival.com", "recommendation_class": "unknown",
+         "prompts_cited_count": 4, "cited_on_category_query": False},
+        {"host": "someblog.kr", "recommendation_class": "unknown",
+         "prompts_cited_count": 2, "cited_on_category_query": False},
+    ]}
+    moves = mnb._outreach_moves(who)
+
+    hosts = [m["host"] for m in moves]
+    assert "cdn.shopify.com" not in hosts  # asset host skipped
+    assert "rival.com" not in hosts  # competitor's own domain skipped
+    # Unknown host surfaced as an honest "investigate" move (lever=research).
+    assert "someblog.kr" in hosts
+    assert next(m for m in moves if m["host"] == "someblog.kr")["action_verb"] == "Get cited on"
+    # recommends-a-rival + category ranks first despite lower cite count.
+    assert moves[0]["host"] == "hwahae.com"
+    assert moves[0]["action_verb"] == "Pitch"
+    assert moves[0]["lever"] == "editorial_outreach"
+    assert moves[0]["pitch_recipient"] == "tips@hwahae.com"
+    assert "recommends a competitor" in moves[0]["why"]
+
+    by_host = {m["host"]: m for m in moves}
+    assert by_host["oliveyoung.com"]["lever"] == "wholesale_onboarding"
+    assert by_host["reddit.com"]["lever"] == "research"
+    assert all(m.get("first_move") for m in moves)
+    assert all("_priority" not in m for m in moves)  # internal key stripped
+
+
+def test_empty_when_no_hosts(monkeypatch):
+    _patch_classifier(monkeypatch, {})
+    assert mnb._outreach_moves({"cited_hosts": []}) == []
+    assert mnb._outreach_moves({}) == []

@@ -20,9 +20,9 @@ this module adds no probes and reads no DB.
 
 from __future__ import annotations
 
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
-from services.cited_host_classifier import is_findability_role
+from services.cited_host_classifier import classify_host, is_findability_role
 from services.competitor_brand_filter import is_ingredient_or_category_type
 
 # Probe axes that name the SKU/brand (branded/navigational) vs the non-branded
@@ -288,6 +288,109 @@ def _win_plan_summary(win_plan: Optional[Dict[str, Any]]) -> Optional[Dict[str, 
     }
 
 
+# Off-platform outreach: route a cited host (one that cites a competitor, not
+# you) to the right action verb + playbook lever by its classified type. These
+# are the "do this even without a connected store" moves — pitch the editorial
+# sites AI grounds in, get carried by the retailers it trusts, engage the
+# communities it cites, partner with creators.
+_OUTREACH_BY_TYPE: Dict[str, Tuple[str, str]] = {
+    "editorial": ("Pitch", "editorial_outreach"),
+    "review_aggregator": ("Get reviewed by", "editorial_outreach"),
+    "retailer": ("Get carried by", "wholesale_onboarding"),
+    "marketplace": ("List on", "marketplace_listing"),
+    "community": ("Engage", "research"),
+    "forum": ("Engage", "research"),
+    "reddit": ("Engage", "research"),
+    "social": ("Partner with creators on", "creator_partnership"),
+    "video": ("Partner with creators on", "creator_partnership"),
+}
+_FIRST_MOVE_BY_LEVER: Dict[str, str] = {
+    "editorial_outreach": (
+        "Send a concise product pitch (with samples or proof points) to their "
+        "editorial/tips contact — these sites shape what AI recommends."
+    ),
+    "wholesale_onboarding": (
+        "Apply to be carried, and make sure your listing's title and specs "
+        "match your own product page exactly."
+    ),
+    "marketplace_listing": (
+        "Create or claim your listing and align the title, images, and specs "
+        "with your own product page."
+    ),
+    "research": (
+        "Join the threads where buyers ask about this category and answer with "
+        "honest, useful detail — don't spam."
+    ),
+    "creator_partnership": (
+        "Reach out to creators in your niche for an honest review or collab."
+    ),
+}
+
+
+def _outreach_moves(who: Dict[str, Any]) -> List[Dict[str, Any]]:
+    """Turn the 'who AI cites instead' hosts into concrete off-platform moves —
+    no connected store required. Each host is classified (editorial / retailer /
+    marketplace / community / creator) and routed to the right verb + playbook
+    lever; hosts that aren't outreach-actionable (cdn, bare competitor domains,
+    unclassified) are skipped. Ranked: actively-recommends-a-rival first, then
+    category-query citations, then citation frequency."""
+    moves: List[Dict[str, Any]] = []
+    for h in (who.get("cited_hosts") if isinstance(who, dict) else None) or []:
+        host = str((h or {}).get("host") or "").strip()
+        if not host:
+            continue
+        cls = classify_host(host) or {}
+        htype = str(cls.get("type") or "").strip().lower()
+        subtype = str(cls.get("subtype") or "").strip().lower()
+        routed = _OUTREACH_BY_TYPE.get(htype) or _OUTREACH_BY_TYPE.get(subtype)
+        if not routed:
+            # cdn = page assets (not a destination); brand = a competitor's own
+            # domain (you don't pitch a rival's site). Skip both. Anything else
+            # the registry doesn't recognize is still a real source AI trusts —
+            # surface it honestly as one to investigate rather than drop it.
+            if htype in {"cdn", "brand"}:
+                continue
+            routed = ("Get cited on", "research")
+            cls = {**cls, "outreach_hint": (
+                "AI grounds answers in this source — look at what it covers and "
+                "how to get your product featured, listed, or reviewed there."
+            )}
+        verb, lever = routed
+        recommends = str(h.get("recommendation_class") or "").strip().lower() == "recommends"
+        cited_n = int(h.get("prompts_cited_count") or 0)
+        category = bool(h.get("cited_on_category_query"))
+        why = f"AI cites {host}"
+        if recommends:
+            why += " and it recommends a competitor over you"
+        elif cited_n:
+            why += f" in {cited_n} of your tested prompt{'s' if cited_n != 1 else ''}"
+        if category:
+            why += " on category questions"
+        why += " — getting in front of it is how you get cited there too."
+        moves.append({
+            "host": host,
+            "host_type": htype or "unclassified",
+            "host_subtype": cls.get("subtype"),
+            "action_verb": verb,
+            "lever": lever,
+            "recommendation_class": h.get("recommendation_class"),
+            "prompts_cited_count": cited_n,
+            "cited_on_category_query": category,
+            "headline": f"{verb} {host}",
+            "why": why,
+            "first_move": cls.get("outreach_hint") or _FIRST_MOVE_BY_LEVER.get(lever),
+            "pitch_recipient": cls.get("pitch_recipient"),
+            # A host that actively recommends a RIVAL is the sharpest move
+            # (you're losing the endorsement, not just absent) — weight it well
+            # above raw citation frequency.
+            "_priority": (5 if recommends else 0) + (1 if category else 0) + cited_n,
+        })
+    moves.sort(key=lambda m: -m["_priority"])
+    for m in moves:
+        m.pop("_priority", None)
+    return moves[:6]
+
+
 def _where_youre_losing(
     merchant_name: str,
     authority_map: Dict[str, Any],
@@ -317,11 +420,16 @@ def _where_youre_losing(
             f"{merchant_name or 'the brand'} doesn't surface at all — neither "
             "your own listings nor any independent source appears."
         )
+    who = _who_ai_cites_instead(authority_map)
     return {
         "summary": text,
         "independently_recommended_for_category": endorsed_category,
         "endorsement_hosts": endorsement_hosts,
-        "who_ai_cites_instead": _who_ai_cites_instead(authority_map),
+        "who_ai_cites_instead": who,
+        # Off-platform outreach moves derived from those cited hosts — pitch the
+        # editorial sites / get carried by the retailers / engage the
+        # communities AI grounds in. No connected store required.
+        "outreach_moves": _outreach_moves(who),
         # Fix 4 — the path to winning the category recommendation back, rolled
         # up from the per-SKU win-plan. None when there's no plan to show.
         "win_plan_summary": _win_plan_summary(win_plan),
