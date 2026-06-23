@@ -1050,6 +1050,16 @@ class MerchantUrlAuditRequest(BaseModel):
             "vendors when omitted."
         ),
     )
+    custom_prompts: Optional[List[str]] = Field(
+        default=None,
+        max_length=10,
+        description=(
+            "Up to 10 buyer prompts the merchant wants to test (one per "
+            "entry). Probed once (brand-level, like the readiness audit) and "
+            "surfaced as 'Your prompts' — whether AI cited you, the sources it "
+            "grounded in, and which competitors it named instead."
+        ),
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -1178,6 +1188,8 @@ def _shape_url_audit_response(row: Dict[str, Any]) -> Dict[str, Any]:
             or report.get("where_you_can_win")
         ),
         "suggested_prompts": report.get("suggested_prompts"),
+        # Merchant's own test prompts ("Your prompts"), probed once brand-level.
+        "custom_prompts": report.get("custom_prompts") or [],
         "brand_report": report,
         "catalog_dimensions_available": False,
     }
@@ -1298,19 +1310,30 @@ async def run_merchant_url_audit(
     #     actual debit happens once the run_id exists (idempotent on it).
     metered_credits = 0
     metered_cogs: Any = 0
+    # Custom prompts (max 10) are probed ONCE brand-level — like the readiness
+    # audit — and surfaced as "Your prompts". Dedupe + trim here so both the
+    # cost estimate and the launch payload use the same clean list.
+    custom_prompts_clean: List[str] = []
+    _seen_cp: set = set()
+    for _p in (body.custom_prompts or []):
+        _t = str(_p or "").strip()
+        if _t and _t.lower() not in _seen_cp:
+            _seen_cp.add(_t.lower())
+            custom_prompts_clean.append(_t)
     if over_free:
         from services.credit_consumption_service import estimate_probe_credits
 
-        # Per-SKU pricing: each resolved URL is probed prompts_per_sku times
-        # per provider (Gemini-only for the wedge). Price against the SAME
-        # probe count the worker will actually run so billing matches cost.
-        wedge_probe_count = (
-            len(audit_products)
-            * max(1, _WEDGE_PROMPTS_PER_SKU)
-            * max(1, len(_WEDGE_PROVIDERS))
+        # Per-SKU pricing: each resolved URL is probed prompts_per_sku times per
+        # provider (Gemini-only for the wedge); custom prompts add ONE probe
+        # each per provider (brand-level, not per product). Price against the
+        # SAME probe count the worker will actually run so billing matches cost.
+        per_provider_probes = (
+            len(audit_products) * max(1, _WEDGE_PROMPTS_PER_SKU)
+            + len(custom_prompts_clean)
         )
+        wedge_probe_count = per_provider_probes * max(1, len(_WEDGE_PROVIDERS))
         metered_credits, metered_cogs = estimate_probe_credits(
-            [(prov, len(audit_products) * max(1, _WEDGE_PROMPTS_PER_SKU), True)
+            [(prov, per_provider_probes, True)
              for prov in (_WEDGE_PROVIDERS or ["gemini"])]
         )
         balance = await get_balance(merchant_id)
@@ -1494,6 +1517,7 @@ async def run_merchant_url_audit(
                 "providers": list(_WEDGE_PROVIDERS),
                 "verify_providers": [],
                 "prompts_per_sku": _WEDGE_PROMPTS_PER_SKU,
+                "custom_prompts": custom_prompts_clean,
                 "synthetic_products": synthetic_products,
                 "merchant_name": merchant_name,
                 "merchant_domain": merchant_domain,
