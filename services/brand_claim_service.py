@@ -50,6 +50,69 @@ def make_challenge_token() -> str:
     return _TXT_PREFIX + secrets.token_urlsafe(24)
 
 
+def make_email_code() -> str:
+    """A short, human-enterable email verification code (6 digits). Sent to a
+    brand-domain alias; entering it proves control of that mailbox."""
+    return f"{secrets.randbelow(10 ** 6):06d}"
+
+
+def email_target_valid(email: Optional[str], brand_domain: Optional[str]) -> bool:
+    """The verification email MUST be a well-formed address AT the brand_domain —
+    receiving a code there proves control of a brand-domain mailbox (the email
+    analogue of DNS-TXT control). Case-insensitive EXACT domain match (no
+    subdomains — avoids attacker-controlled `x.brand_domain` look-alikes)."""
+    e = (email or "").strip().lower()
+    d = (brand_domain or "").strip().lower()
+    if not e or not d or e.count("@") != 1:
+        return False
+    local, _, host = e.partition("@")
+    return bool(local) and host == d
+
+
+def brand_claim_email_enabled() -> bool:
+    """Flag: accept the email claim-verification method. Default OFF — ships dark,
+    flipped per-env once the email infra is confirmed for this surface."""
+    import os
+
+    return os.getenv("ENABLE_BRAND_CLAIM_EMAIL_VERIFY", "").strip().lower() in {
+        "1", "true", "yes", "on",
+    }
+
+
+async def send_brand_claim_email(
+    to_email: str, code: str, brand_domain: Optional[str]
+) -> bool:
+    """Best-effort: email the verification code to a brand-domain alias. Never
+    raises — a send failure just leaves the pending claim (the brand re-starts).
+    Runs the sync SES sender off the event loop."""
+    import asyncio
+    import os
+
+    from utils.email_sender import send_email
+
+    subject = "Verify your Pivota brand claim"
+    text = (
+        f"Your Pivota brand verification code for {brand_domain or 'your brand'} "
+        f"is: {code}\n\nEnter it in Pivota to verify your brand. If you didn't "
+        "request this, you can ignore this email."
+    )
+    try:
+        result = await asyncio.to_thread(
+            send_email,
+            to_email=to_email,
+            subject=subject,
+            text_body=text,
+            from_email=(os.getenv("FROM_EMAIL") or "noreply@pivota.ai").strip(),
+            tags={"type": "brand_claim_verify"},
+        )
+        return bool(getattr(result, "ok", False))
+    except Exception as exc:  # noqa: BLE001 — best-effort
+        logger.warning(
+            "send_brand_claim_email failed for %s: %s", to_email, str(exc)[:200]
+        )
+        return False
+
+
 def dns_txt_proves_claim(expected_token: str, txt_records: Iterable[str]) -> bool:
     """True iff the expected 'pivota-verify=<token>' value appears verbatim among
     the domain's TXT records. Exact-match — a partial/prefix match doesn't prove
@@ -241,25 +304,37 @@ async def start_brand_claim(
     method: str = "dns",
     content_key: Optional[str] = None,
     user_id: Optional[str] = None,
+    verification_email: Optional[str] = None,
 ) -> Dict[str, Any]:
-    """Begin a claim: issue a challenge token + record a pending claim row. B3:
-    reuse an existing pending claim for this (merchant, domain) rather than
-    spamming a new row (and colliding with the partial-unique index)."""
+    """Begin a claim: issue a challenge + record a pending claim row. B3: reuse an
+    existing pending claim for this (merchant, domain) rather than spamming a new
+    row (and colliding with the partial-unique index).
+
+    For the email method the challenge is a short code emailed to a brand-domain
+    alias — it is NEVER echoed in the response (only the recipient mailbox sees
+    it); DNS still returns its TXT token, which the brand must publish."""
     if brand_domain:
         existing = await bc.get_pending_brand_claim(merchant_id, brand_domain)
         if existing and existing.get("challenge_token"):
             ex_method = existing.get("claim_method") or method
-            return {
-                "claim_id": existing["claim_id"],
-                "method": ex_method,
-                "challenge_token": existing["challenge_token"],
-                "instructions": _claim_instructions(
-                    ex_method, brand_domain, existing["challenge_token"]
-                ),
-                "reused": True,
-            }
+            existing_token = existing["challenge_token"]
+            email_sent = None
+            if ex_method == "email" and verification_email:
+                # re-send the SAME code to the (re-supplied) alias on reuse.
+                email_sent = await send_brand_claim_email(
+                    verification_email, existing_token, brand_domain
+                )
+            return _claim_response(
+                claim_id=existing["claim_id"],
+                method=ex_method,
+                token=existing_token,
+                brand_domain=brand_domain,
+                verification_email=verification_email,
+                email_sent=email_sent,
+                reused=True,
+            )
 
-    token = make_challenge_token()
+    token = make_email_code() if method == "email" else make_challenge_token()
     claim_id = await bc.insert_brand_claim(
         merchant_id=merchant_id,
         claim_method=method,
@@ -268,32 +343,76 @@ async def start_brand_claim(
         challenge_token=token,
         created_by_user_id=user_id,
     )
-    return {
+    email_sent = None
+    if method == "email" and verification_email:
+        email_sent = await send_brand_claim_email(verification_email, token, brand_domain)
+    return _claim_response(
+        claim_id=claim_id,
+        method=method,
+        token=token,
+        brand_domain=brand_domain,
+        verification_email=verification_email,
+        email_sent=email_sent,
+        reused=False,
+    )
+
+
+def _claim_response(
+    *,
+    claim_id: Any,
+    method: str,
+    token: str,
+    brand_domain: Optional[str],
+    verification_email: Optional[str],
+    email_sent: Optional[bool],
+    reused: bool,
+) -> Dict[str, Any]:
+    out: Dict[str, Any] = {
         "claim_id": claim_id,
         "method": method,
-        "challenge_token": token,
-        "instructions": _claim_instructions(method, brand_domain, token),
-        "reused": False,
+        # SECURITY: never echo the emailed code — only the mailbox holder may see
+        # it. DNS returns its TXT token (the brand must publish it to prove control).
+        "challenge_token": None if method == "email" else token,
+        "instructions": _claim_instructions(
+            method, brand_domain, token, verification_email
+        ),
+        "reused": reused,
     }
+    if method == "email":
+        out["email_sent"] = email_sent
+    return out
 
 
-def _claim_instructions(method: str, brand_domain: Optional[str], token: str) -> str:
+def _claim_instructions(
+    method: str,
+    brand_domain: Optional[str],
+    token: str,
+    verification_email: Optional[str] = None,
+) -> str:
     if method == "dns":
         return f"Add a DNS TXT record to {brand_domain or 'your brand domain'} with value: {token}"
+    if method == "email":
+        target = verification_email or f"an email at {brand_domain or 'your brand domain'}"
+        return (
+            f"We emailed a 6-digit verification code to {target}. "
+            "Enter it to verify your brand."
+        )
     return f"Verification token: {token}"
 
 
 async def verify_brand_claim(
     claim_id: str,
     *,
+    submitted_code: Optional[str] = None,
     txt_resolver: Optional[Callable[[str], List[str]]] = None,
     owned_domain_check: Optional[Callable[[str, str], Any]] = None,
 ) -> Dict[str, Any]:
-    """Verify a pending claim. For DNS we resolve the brand_domain's TXT records
-    and check the challenge token. A match proves DOMAIN CONTROL — but
-    brand_direct means "verified as the brand," so we only flip the merchant when
-    the verified domain is also BOUND to the merchant's known brand identity
-    (B1). A domain-verified but unbound claim is NOT auto-granted — it returns
+    """Verify a pending claim. DNS resolves the brand_domain's TXT records and
+    checks the challenge token; EMAIL matches `submitted_code` against the code we
+    sent to a brand-domain alias. Either proves DOMAIN CONTROL — but brand_direct
+    means "verified as the brand," so we only flip the merchant when the verified
+    domain is also BOUND to the merchant's known brand identity (B1). A
+    domain-verified but unbound claim is NOT auto-granted — it returns
     'domain_verified_unbound' for review. Returns {status, brand_direct_set}."""
     claim = await bc.get_brand_claim(claim_id)
     if not claim:
@@ -302,22 +421,31 @@ async def verify_brand_claim(
         return {"status": "verified", "brand_direct_set": True}
 
     method = claim.get("claim_method")
-    if method != "dns":
-        # email / amazon / shopify / manual: scaffolded for the next slice.
-        return {"status": "unsupported_method", "method": method}
-
     token = claim.get("challenge_token") or ""
     domain = claim.get("brand_domain")
-    resolver = txt_resolver or _default_txt_resolver
-    try:
-        records = resolver(domain) if domain else []
-    except Exception as exc:  # noqa: BLE001
-        logger.warning(
-            "verify_brand_claim: TXT resolve failed for %s: %s", domain, str(exc)[:200]
-        )
-        records = []
-    if not dns_txt_proves_claim(token, records):
-        return {"status": "pending", "brand_direct_set": False, "reason": "txt_not_found"}
+
+    if method == "dns":
+        resolver = txt_resolver or _default_txt_resolver
+        try:
+            records = resolver(domain) if domain else []
+        except Exception as exc:  # noqa: BLE001
+            logger.warning(
+                "verify_brand_claim: TXT resolve failed for %s: %s",
+                domain, str(exc)[:200],
+            )
+            records = []
+        if not dns_txt_proves_claim(token, records):
+            return {"status": "pending", "brand_direct_set": False, "reason": "txt_not_found"}
+        proof_ref = f"dns:{domain}"
+    elif method == "email":
+        submitted = (submitted_code or "").strip()
+        # Constant-time compare; a missing/blank stored token can never match.
+        if not token or not submitted or not secrets.compare_digest(submitted, token):
+            return {"status": "pending", "brand_direct_set": False, "reason": "code_mismatch"}
+        proof_ref = f"email:{domain}"
+    else:
+        # amazon / shopify / manual: not handled here (manual = employee approval).
+        return {"status": "unsupported_method", "method": method}
 
     # Domain control proven. B1: brand_direct requires brand-identity binding —
     # the verified domain must be one Pivota already associates with this merchant.
@@ -338,7 +466,7 @@ async def verify_brand_claim(
         }
 
     ok = await set_merchant_brand_direct(claim["merchant_id"])
-    await bc.mark_claim_verified(claim_id, proof_ref=f"dns:{domain}")
+    await bc.mark_claim_verified(claim_id, proof_ref=proof_ref)
     # P1: promote the verified brand's audit-seeded SKUs unclaimed -> claimed
     # (the lifecycle backbone for the syndicate-after-claim gate). Best-effort.
     from services.claim_state import promote_merchant_skus_to_claimed
