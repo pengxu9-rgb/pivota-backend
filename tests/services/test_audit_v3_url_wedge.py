@@ -659,3 +659,35 @@ def test_free_tier_stays_gemini_only(client):
     launch = client.enqueued[-1]["request_options_jsonb"]["launch"]
     assert launch["providers"] == mar._WEDGE_PROVIDERS
     assert "chatgpt" not in launch["providers"]
+
+
+def test_retail_channel_url_uses_brand_site_as_first_party(client):
+    # When the pasted URL is a retailer (different host than the brand site),
+    # first-party citation must be measured against the BRAND site, not the
+    # retailer — so canonical_url points at the brand site, pdp_url stays the
+    # pasted retailer page, and the retailer host is flagged.
+    client.state["used"] = 0
+    res = client.post(_URL, json={
+        "product_urls": ["https://global.oliveyoung.com/products/anuko-x"],
+        "website": "https://anuko.com",
+        "brand": "Anuko",
+    })
+    assert res.status_code == 200, res.text
+    syn = client.enqueued[-1]["request_options_jsonb"]["launch"]["synthetic_products"][0]
+    assert syn["pdp_url"] == "https://global.oliveyoung.com/products/anuko-x"
+    assert syn["canonical_url"] == "https://anuko.com"
+    assert syn["retail_channel_host"] == "global.oliveyoung.com"
+
+
+def test_own_site_url_keeps_product_page_as_canonical(client):
+    # When the pasted URL is on the brand's own site, canonical stays the
+    # product page (not the homepage) — no retail-channel rewrite.
+    client.state["used"] = 0
+    res = client.post(_URL, json={
+        "product_urls": ["https://merch.example/products/a"],
+        "website": "https://merch.example",
+    })
+    assert res.status_code == 200, res.text
+    syn = client.enqueued[-1]["request_options_jsonb"]["launch"]["synthetic_products"][0]
+    assert syn["canonical_url"] == "https://merch.example/products/a"
+    assert syn["retail_channel_host"] is None

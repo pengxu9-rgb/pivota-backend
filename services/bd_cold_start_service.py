@@ -349,11 +349,29 @@ def _strip_trailing_pack_descriptors(title: str) -> str:
     return cleaned
 
 
+def _strip_site_suffix(title: str) -> str:
+    """Drop a trailing ' | <site/retailer>' segment from a storefront title.
+
+    Retail-channel pages title themselves "Brand Product … | OLIVE YOUNG Global"
+    (or "… | Sephora", "… | Amazon.com"). Without stripping it, every generated
+    buyer query carries the retailer name ("where can I buy … | OLIVE YOUNG
+    Global"), which is noise. Conservative: keep the segment BEFORE the first
+    ' | ' only when it's still a real title (>=2 tokens with letters); otherwise
+    leave the title untouched."""
+    parts = re.split(r"\s+\|\s+", title or "", maxsplit=1)
+    if len(parts) > 1:
+        head = parts[0].strip()
+        if _token_count(head) >= 2 and any(ch.isalpha() for ch in head):
+            return head
+    return title or ""
+
+
 def normalize_product_title_for_search(raw_title: str) -> str:
     """Turn a noisy storefront title into a conservative search query title."""
     original = raw_title or ""
+    site_stripped = _strip_site_suffix(original)
     bracket_stripped = _clean_title_surface(
-        _LEADING_BRACKET_TAGS_RE.sub("", original)
+        _LEADING_BRACKET_TAGS_RE.sub("", site_stripped)
     )
     without_qualifiers = _clean_title_surface(
         _PARENTHETICAL_QUALIFIER_RE.sub("", bracket_stripped)
@@ -370,7 +388,7 @@ def normalize_product_title_for_search(raw_title: str) -> str:
         cleaned = pack_stripped
 
     if len(cleaned) < 3 or not any(ch.isalpha() for ch in cleaned):
-        return bracket_stripped or original
+        return bracket_stripped or site_stripped or original
     return cleaned
 
 

@@ -1436,6 +1436,20 @@ async def run_merchant_url_audit(
     synthetic_products: List[Dict[str, Any]] = []
     for p in audit_products:
         key = _synthetic_url_sku_key(merchant_id, p["pdp_url"])
+        # Retail-channel de-conflation: if the merchant gave their own brand site
+        # (website) and this pasted URL is on a DIFFERENT host, it's a retail
+        # channel (e.g. the brand's product page on oliveyoung). First-party
+        # citation ("is your OWN url cited?") must then be measured against the
+        # brand site, not the retailer — otherwise AI citing the retailer reads
+        # as first-party endorsement instead of distribution. We keep pdp_url as
+        # the pasted page (for product data) but point canonical_url at the brand
+        # site. When the pasted URL IS the brand's own site, canonical = the
+        # product page itself.
+        pdp_host = _domain_from_url(p["pdp_url"])
+        is_retail_channel = bool(
+            merchant_domain and pdp_host and pdp_host != merchant_domain
+        )
+        canonical_url = website if (is_retail_channel and website) else p["pdp_url"]
         synthetic_products.append({
             "sku_key": key,
             "product_key": key,
@@ -1444,6 +1458,8 @@ async def run_merchant_url_audit(
             "vendor": p.get("vendor"),
             "product_type": p.get("product_type"),
             "pdp_url": p["pdp_url"],
+            "canonical_url": canonical_url,
+            "retail_channel_host": pdp_host if is_retail_channel else None,
             "attributes_raw": p.get("attributes_raw"),
         })
 

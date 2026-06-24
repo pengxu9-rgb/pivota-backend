@@ -46,3 +46,19 @@ def test_normalize_product_title_for_search_keeps_specific_short_titles():
 
 def test_normalize_product_title_for_search_never_returns_empty_for_noise():
     assert normalize_product_title_for_search("[Bundle], 2box") != ""
+
+
+@pytest.mark.parametrize(
+    ("raw_title", "expected"),
+    [
+        # Retail-channel pages append "| <retailer>" — strip it so queries are
+        # about the product, not "... | OLIVE YOUNG Global".
+        ("Anuko Nourishing Hair Butter Treatment 200ml | OLIVE YOUNG Global",
+         "Anuko Nourishing Hair Butter Treatment"),
+        ("Good Night Collagen | Sephora", "Good Night Collagen"),
+        # A bare "X | Y" where the head isn't a real title -> leave untouched.
+        ("A | B", "A | B"),
+    ],
+)
+def test_strips_retailer_site_suffix(raw_title, expected):
+    assert normalize_product_title_for_search(raw_title) == expected
