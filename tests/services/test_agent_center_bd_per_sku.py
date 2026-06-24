@@ -567,10 +567,15 @@ def test_citation_score_weighted_formula_and_missing_runs():
     from services.agent_center_bd_report_service import compute_citation_score
 
     score, breakdown = compute_citation_score(_base_sku_ctx(), _probe_runs())
-    assert score == 50
+    # No verify_outputs were passed → answer_quality is unscored (unchecked
+    # claims earn 0), so the citation total is 5 lower than the old behavior,
+    # which credited deterministic answer_quality without verification.
+    assert score == 45
     assert breakdown["first_party_rate"]["numerator"] == 1
     assert breakdown["first_party_rate"]["denominator"] == 2
-    assert breakdown["answer_quality_rate"]["points"] == 5
+    assert breakdown["answer_quality_rate"]["points"] == 0
+    assert breakdown["answer_quality_rate"]["denominator"] == 0
+    assert breakdown["answer_quality_rate"]["deterministic_numerator"] == 1
 
     # No probes ran → score is None (no signal), NOT a measured 0. A 0 here
     # falsely reads as "measured, brand never cited" → false INVISIBLE verdict.
@@ -741,13 +746,19 @@ async def test_build_per_sku_report_end_to_end_with_mocked_loaders(monkeypatch):
     report = await bd.build_per_sku_report("sku-1", "m-1", "audit-1")
     assert report["sku_key"] == "sku-1"
     assert set(report["scores"]) == {"identity", "content_richness", "routability", "citation"}
-    assert report["scores"]["citation"]["score"] == 78
+    # build_per_sku_report runs no verify pass → answer_quality is unscored, so
+    # the citation total is 10 below the old behavior (which credited unverified
+    # answer_quality).
+    assert report["scores"]["citation"]["score"] == 68
+    assert report["scores"]["citation"]["breakdown"]["answer_quality_rate"]["points"] == 0
     assert report["scores"]["citation"]["breakdown"]["first_party_rate"]["numerator"] == 1
     assert report["scores"]["citation"]["breakdown"]["sku_mention_rate"]["numerator"] == 2
     assert report["scores"]["citation"]["breakdown"]["aggregation_rule"].startswith("any_profile_provider")
     assert set(report["citation_by_provider"]) == {"gemini", "chatgpt"}
-    assert report["citation_by_provider"]["gemini"]["score"] == 50
-    assert report["citation_by_provider"]["chatgpt"]["score"] == 50
+    # Per-provider citation also excludes unverified answer_quality (no verify
+    # ran in this end-to-end), so each provider is 5 below the old credit.
+    assert report["citation_by_provider"]["gemini"]["score"] == 45
+    assert report["citation_by_provider"]["chatgpt"]["score"] == 45
     assert report["deliverability"]["status"] == "transactable"
     assert report["deliverability"]["checkout"]["commerce_path"] == "pivota_direct_quote_first"
     assert report["checkout_handoff"]["status"] == "eligible"
@@ -844,7 +855,12 @@ async def test_run_brand_report_per_sku_runs_bounded_deepseek_verify(monkeypatch
     assert citation["breakdown"]["first_party_rate"]["points"] == 45
     assert citation["breakdown"]["sku_mention_rate"]["points"] == 25
     assert citation["breakdown"]["authority_near_variant_rate"]["points"] == 20
-    assert citation["breakdown"]["answer_quality_rate"]["points"] == 8
+    # The single verified prompt was flagged (supports_recommendation=false),
+    # and it's the only verified prompt → answer_quality is 0/1 = 0. (Unsampled
+    # prompts no longer earn unverified credit.)
+    assert citation["breakdown"]["answer_quality_rate"]["points"] == 0
+    assert citation["breakdown"]["answer_quality_rate"]["numerator"] == 0
+    assert citation["breakdown"]["answer_quality_rate"]["denominator"] == 1
 
 
 @pytest.mark.asyncio
@@ -886,7 +902,15 @@ async def test_run_brand_report_skips_verify_when_deepseek_key_missing(monkeypat
     assert sku_report["verify_summary"]["reason"] == "missing_deepseek_api_key"
     assert sku_report["verify_summary"]["not_verified"] == 2
     assert sku_report["verify_outputs"] == []
-    assert sku_report["scores"]["citation"]["score"] == 100
+    # Verify was skipped (no DeepSeek key) → answer_quality is unscored, so the
+    # ceiling is 90, not a verified-looking 100. This is the honesty fix: the
+    # free/no-verify path no longer awards the 10 answer-quality points it never
+    # checked.
+    assert sku_report["scores"]["citation"]["score"] == 90
+    assert (
+        sku_report["scores"]["citation"]["breakdown"]["answer_quality_rate"]["points"]
+        == 0
+    )
 
 
 @pytest.mark.asyncio
