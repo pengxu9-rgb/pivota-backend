@@ -844,6 +844,31 @@ def _detect_brand_query(query: Optional[str]) -> Dict[str, Any]:
             "scope": "category_scoped" if has_category_hint else "broad",
         }
 
+    # Dynamic: recognize a brand that ACTUALLY EXISTS in the catalog (cached set,
+    # warmed by _ensure_brand_dictionary_loaded). The static list covers 7 brands;
+    # this lights up the long tail (The Ordinary, Skin1004, Anuko, ...) so branded
+    # queries stop falling to ingredient/external-seed junk. Longest contiguous
+    # whole-token span wins. Gated by GATEWAY_DYNAMIC_BRAND_DETECT — the cache is
+    # only populated when the flag is on, and we re-check the flag so a stale set
+    # can't fire after the flag is turned off.
+    if _gateway_dynamic_brand_detect_enabled() and _DYNAMIC_BRAND_SET:
+        tokens = [t for t in normalized.split() if t]
+        for size in range(min(4, len(tokens)), 0, -1):
+            for i in range(len(tokens) - size + 1):
+                span = " ".join(tokens[i : i + size])
+                if (
+                    len(span) >= _MIN_DYNAMIC_BRAND_LEN
+                    and span not in _DYNAMIC_BRAND_STOPWORDS
+                    and span in _DYNAMIC_BRAND_SET
+                ):
+                    return {
+                        "brand_like": True,
+                        "brand_terms": [span],
+                        "mode": "catalog",
+                        "has_category_hint": has_category_hint,
+                        "scope": "category_scoped" if has_category_hint else "broad",
+                    }
+
     return {
         "brand_like": False,
         "brand_terms": [],
@@ -851,6 +876,70 @@ def _detect_brand_query(query: Optional[str]) -> Dict[str, Any]:
         "has_category_hint": has_category_hint,
         "scope": None,
     }
+
+
+# --- Dynamic brand dictionary (GATEWAY_DYNAMIC_BRAND_DETECT) ------------------
+# _detect_brand_query's static list only covers 7 brands, so real catalog brands
+# (The Ordinary, Skin1004, Anuko, ...) were missed and their branded queries fell
+# to ingredient/external-seed recall and returned off-brand junk. This caches the
+# catalog's own brand set so detection can recognize them. Flag-gated, default OFF
+# (the cache stays empty -> detection is byte-identical to today).
+_DYNAMIC_BRAND_SET: "frozenset[str]" = frozenset()
+_DYNAMIC_BRAND_LOADED_AT: float = 0.0
+_DYNAMIC_BRAND_TTL_S = float(os.getenv("GATEWAY_DYNAMIC_BRAND_TTL_S", "3600") or 3600)
+_DYNAMIC_BRAND_CAP = int(os.getenv("GATEWAY_DYNAMIC_BRAND_CAP", "5000") or 5000)
+_MIN_DYNAMIC_BRAND_LEN = 4
+_DYNAMIC_BRAND_LOCK = asyncio.Lock()
+# Generic category/beauty words excluded so a single-word brand that collides with
+# a common term can't turn an ordinary category query into a brand query.
+_DYNAMIC_BRAND_STOPWORDS = {
+    "beauty", "cosmetics", "fragrance", "perfume", "parfum", "skincare",
+    "makeup", "serum", "toner", "cleanser", "cream", "lotion", "mask",
+    "hair", "skin", "face", "body", "lip", "lips", "eye", "eyes", "sun",
+    "spf", "gel", "oil", "foam", "balm", "mist", "kids", "the", "and",
+    "for", "with", "shampoo", "conditioner", "moisturizer", "sunscreen",
+}
+
+
+def _gateway_dynamic_brand_detect_enabled() -> bool:
+    return (
+        (os.getenv("GATEWAY_DYNAMIC_BRAND_DETECT") or "").strip().lower()
+        in {"1", "true", "yes", "on"}
+    )
+
+
+async def _ensure_brand_dictionary_loaded() -> None:
+    """Warm the catalog brand cache (best-effort, TTL'd). No-op when the flag is
+    off, so brand detection stays byte-identical to today."""
+    if not _gateway_dynamic_brand_detect_enabled():
+        return
+    global _DYNAMIC_BRAND_SET, _DYNAMIC_BRAND_LOADED_AT
+    if _DYNAMIC_BRAND_SET and (time.monotonic() - _DYNAMIC_BRAND_LOADED_AT) < _DYNAMIC_BRAND_TTL_S:
+        return
+    async with _DYNAMIC_BRAND_LOCK:
+        if _DYNAMIC_BRAND_SET and (time.monotonic() - _DYNAMIC_BRAND_LOADED_AT) < _DYNAMIC_BRAND_TTL_S:
+            return
+        try:
+            rows = await database.fetch_all(
+                """
+                SELECT LOWER(TRIM(brand)) AS b, COUNT(*) AS n
+                FROM catalog_products
+                WHERE brand IS NOT NULL AND TRIM(brand) <> ''
+                GROUP BY LOWER(TRIM(brand))
+                ORDER BY n DESC
+                LIMIT :cap
+                """,
+                {"cap": _DYNAMIC_BRAND_CAP},
+            )
+        except Exception:
+            return  # leave any prior cache intact; never break recall
+        brands = set()
+        for r in rows:
+            b = _normalize_brand_query_text(dict(r).get("b") or "")
+            if b and len(b) >= _MIN_DYNAMIC_BRAND_LEN and b not in _DYNAMIC_BRAND_STOPWORDS:
+                brands.add(b)
+        _DYNAMIC_BRAND_SET = frozenset(brands)
+        _DYNAMIC_BRAND_LOADED_AT = time.monotonic()
 
 
 _FRAGRANCE_EXPANSION_TERMS = [
@@ -4799,6 +4888,9 @@ async def agent_search_products(
             )
         ):
             normalized_seed_strategy = "unified_relevance"
+        # Warm the catalog brand cache so _detect_brand_query can recognize real
+        # brands (no-op when GATEWAY_DYNAMIC_BRAND_DETECT is off).
+        await _ensure_brand_dictionary_loaded()
         brand_query = _detect_brand_query(normalized_query)
         brand_query_detected = bool(brand_query.get("brand_like"))
         brand_query_terms: List[str] = list(brand_query.get("brand_terms") or [])
