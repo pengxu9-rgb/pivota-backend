@@ -668,13 +668,24 @@ def _canonical_match_reason(row: Dict[str, Any], query: str) -> Dict[str, Any]:
         _normalize_query(row.get("source_product_id")),
     }
     raw_rank_score = row.get("rank_score")
+    # RECALL_RELEVANCE_V2: rank by TEXT relevance so the +200 canonical structural
+    # boost can't saturate candidate_score and bury precise matches. Falls back to
+    # rank_score when the lane emits no split (e.g. the citable lane, which has no
+    # structural boost, so its rank_score is already ~text).
+    score_for_candidate = raw_rank_score
+    if _recall_relevance_v2_enabled() and row.get("text_score") is not None:
+        score_for_candidate = row.get("text_score")
     try:
         normalized_candidate_score = round(
-            max(0.12, min(float(raw_rank_score or 0.0) / 100.0, 1.4)),
+            max(0.12, min(float(score_for_candidate or 0.0) / 100.0, 1.4)),
             4,
         )
     except Exception:
         normalized_candidate_score = 0.12
+    try:
+        structure_score = round(float(row.get("structure_score") or 0.0), 4)
+    except Exception:
+        structure_score = 0.0
     return {
         "lane": "exact_lookup" if exact else "catalog_discovery",
         "query": query,
@@ -687,6 +698,9 @@ def _canonical_match_reason(row: Dict[str, Any], query: str) -> Dict[str, Any]:
         "exact_match": bool(exact),
         "candidate_source": "internal",
         "candidate_score": normalized_candidate_score,
+        # Structural/scope quality, kept separate from relevance. _sort_items uses
+        # it only as a SECONDARY tie-break when v2 is on (0 / ignored otherwise).
+        "structure_score": structure_score,
         "source_boost": 0.0,
         "quality_penalties_total": 0.0,
         "price_tie_break": row.get("estimated_best_price") or row.get("merchant_effective_price") or row.get("list_price"),
@@ -839,7 +853,36 @@ async def _fetch_canonical_search_rows(
                     CASE WHEN p.pdp_lifecycle_stage = 'validated' THEN 20 ELSE 0 END
                     {category_score}
                     {vertical_score}
-                ) AS rank_score
+                ) AS rank_score,
+                -- RECALL_RELEVANCE_V2: TEXT relevance only (exact + partial LIKE
+                -- + vertical term hits), with NO structural/scope boost. Used to
+                -- order results when v2 is on so the +200 canonical boost can't
+                -- saturate relevance. rank_score above is UNCHANGED (flag-off
+                -- behaviour + candidate selection are byte-identical). The
+                -- partial-LIKE bonuses (mirroring the citable lane, #1027) give a
+                -- non-exact match a real text score instead of ~0.
+                (
+                    CASE WHEN LOWER(COALESCE(s.sku, '')) = :query_exact THEN 120 ELSE 0 END +
+                    CASE WHEN LOWER(COALESCE(s.source_variant_id, '')) = :query_exact THEN 110 ELSE 0 END +
+                    CASE WHEN LOWER(COALESCE(p.source_product_id, '')) = :query_exact THEN 105 ELSE 0 END +
+                    CASE WHEN LOWER(COALESCE(p.title, '')) = :query_exact THEN 100 ELSE 0 END +
+                    CASE WHEN LOWER(COALESCE(m.merchant_name, '')) = :query_exact THEN 90 ELSE 0 END +
+                    CASE WHEN LOWER(COALESCE(p.brand, '')) = :query_exact THEN 80 ELSE 0 END +
+                    CASE WHEN LOWER(COALESCE(p.title, '')) LIKE :query_like THEN 90 ELSE 0 END +
+                    CASE WHEN LOWER(COALESCE(p.brand, '')) LIKE :query_like THEN 70 ELSE 0 END +
+                    CASE WHEN LOWER(COALESCE(s.title, '')) LIKE :query_like THEN 60 ELSE 0 END +
+                    CASE WHEN LOWER(COALESCE(m.merchant_name, '')) LIKE :query_like THEN 50 ELSE 0 END +
+                    CASE WHEN LOWER(COALESCE(p.source_product_id, '')) LIKE :query_like THEN 40 ELSE 0 END
+                    {vertical_score}
+                ) AS text_score,
+                -- RECALL_RELEVANCE_V2: STRUCTURAL/scope quality, kept separate so
+                -- it can act as a SECONDARY tie-break (not a relevance signal).
+                (
+                    CASE WHEN p.pdp_scope = 'multi_merchant_canonical' THEN 200 ELSE 0 END +
+                    CASE WHEN p.pdp_lifecycle_stage = 'published' THEN 60 ELSE 0 END +
+                    CASE WHEN p.pdp_lifecycle_stage = 'validated' THEN 20 ELSE 0 END
+                    {category_score}
+                ) AS structure_score
             FROM catalog_products p
             JOIN catalog_skus s ON s.product_key = p.product_key
             LEFT JOIN catalog_merchants m ON m.merchant_id = p.merchant_id
@@ -919,7 +962,9 @@ async def _fetch_canonical_search_rows(
             -- THEN 10). Ownership is not a ranking signal — merit is. This is
             -- load-bearing for the neutral-index thesis: a margin/ownership-tilted
             -- decision layer is detectable and erodes frontier-model trust.
-            c.rank_score AS rank_score
+            c.rank_score AS rank_score,
+            c.text_score AS text_score,
+            c.structure_score AS structure_score
         FROM candidate_skus c
         JOIN catalog_offers o
           ON o.sku_key = c.sku_key
@@ -946,6 +991,20 @@ def _index_eligible_recall_enabled() -> bool:
     executes, and recall is byte-identical to today (offer-backed lane only)."""
     return (
         (os.getenv("INDEX_ELIGIBLE_RECALL") or "").strip().lower()
+        in {"1", "true", "yes", "on"}
+    )
+
+
+def _recall_relevance_v2_enabled() -> bool:
+    """Recall relevance v2. When ON, ranking orders by TEXT relevance first and
+    treats structural/scope boosts (multi_merchant_canonical, lifecycle,
+    category) as a SECONDARY tie-breaker — instead of letting the +200 canonical
+    boost saturate candidate_score at its 1.4 cap and bury precise matches under
+    same-category junk. Default OFF ⇒ candidate_score is computed from the
+    unchanged rank_score and the structure tie-break contributes 0, so ordering
+    is byte-identical to today. See docs/recall-relevance-saturation-fix.md."""
+    return (
+        (os.getenv("RECALL_RELEVANCE_V2") or "").strip().lower()
         in {"1", "true", "yes", "on"}
     )
 
@@ -1540,7 +1599,7 @@ def _build_external_item(row: Dict[str, Any], query: str, *, source_order: int) 
 
 
 def _sort_items(items: List[PivotResultItem]) -> List[PivotResultItem]:
-    def sort_key(item: PivotResultItem) -> tuple[int, int, float, int, Decimal]:
+    def sort_key(item: PivotResultItem) -> tuple[int, int, float, float, int, Decimal]:
         internal_boost = 1 if item.catalog_track == "internal_merchant" else 0
         exact_boost = 1 if item.match_explanation.get("exact_match") else 0
         relevance_boost = 0.0
@@ -1570,10 +1629,21 @@ def _sort_items(items: List[PivotResultItem]) -> List[PivotResultItem]:
             candidate = offer.pricing.estimated_best_price or offer.pricing.merchant_effective_price or offer.pricing.list_price
             if candidate is not None and (best_price is None or candidate < best_price):
                 best_price = candidate
+        # RECALL_RELEVANCE_V2: structure (scope/lifecycle/category) is a SECONDARY
+        # tie-break AFTER text relevance — so a multi_merchant_canonical PDP wins
+        # ties among similarly-relevant rows but can't leapfrog a more relevant
+        # one. 0 when v2 is off ⇒ this key is inert and ordering is unchanged.
+        structure_boost = 0.0
+        if _recall_relevance_v2_enabled():
+            try:
+                structure_boost = float(item.match_explanation.get("structure_score") or 0.0)
+            except Exception:
+                structure_boost = 0.0
         return (
             -exact_boost,
             -internal_boost,
             -(relevance_boost + source_boost),
+            -structure_boost,
             source_order,
             best_price if best_price is not None else Decimal("999999"),
         )
