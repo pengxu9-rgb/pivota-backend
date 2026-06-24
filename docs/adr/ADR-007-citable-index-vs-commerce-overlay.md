@@ -1,9 +1,18 @@
 # ADR-007: Citable Knowledge Index vs Commerce/Offers Overlay
 
-**Status:** Proposed (adversarial review 2026-06-23 → **GO-WITH-CHANGES**, corrections folded into Action Items) · **Date:** 2026-06-23 · **Scope:** `pivota-backend` index/serving pipeline + agent read surfaces · **Supersedes:** the offer-minting approach in the verify-to-serve spec (`pivota-merchants-portal#117`)
+**Status:** **Accepted** (2026-06-24 — both founder questions resolved, see "Founder decisions" below; slices 1–3 merged to `main`) · adversarial review 2026-06-23 → GO-WITH-CHANGES, corrections folded into Action Items · **Date:** 2026-06-23 · **Scope:** `pivota-backend` index/serving pipeline + agent read surfaces · **Supersedes:** the offer-minting approach in the verify-to-serve spec (`pivota-merchants-portal#117`)
 **Deciders:** founder (positioning) + backend (index pipeline)
 
 ---
+
+## Founder decisions (2026-06-24) — these move the ADR to Accepted
+
+Two questions gated acceptance. Both now resolved by the founder:
+
+1. **Is offer-free citation the external end-state?** → **YES.** Frontier models and external agents *should* be able to call the Pivota commerce index for **citation**, with no offer required. Offer-free `index_eligible` is the durable external read surface — not a transitional state. This confirms the Decision below and greenlights the [external read/citation API contract](https://github.com/pengxu9-rgb/pivota-merchants-portal/blob/main/docs/external-citation-api-contract.md).
+2. **Does Pivota Agent stay offer-gated while external read opens?** → **YES.** Pivota Agent (first-party shopping/checkout UX) **keeps** its offer/seed gate; the external citation read opens independently. The two are different callers on different lanes — the first-party curation requirement must never leak into the index gate (it doesn't: slice 3 threads `strict_serving_mode` only for explicit commerce surfaces).
+
+Consequence: the "MAY keep its offer/seed gate" hedge in the Decision is now a firm **DOES**. The asymmetry is intentional and permanent — open index for citation, curated gate for first-party transact.
 
 ## Context
 
@@ -36,7 +45,7 @@ Split eligibility into two **orthogonal** concepts:
 - **`index_eligible` / `citation_eligible`** (NEW) — gated on **trust + quality + identity-resolved**, **offer-independent**. Drives the external/frontier **read + cite** surface (`get_pdp` / `agent_pdp_view` via MCP/UCP/ACP). A product with **zero offers is citable**.
 - **`transact_eligible`** (RECAST of today's `serving_eligible`) — has a **buyable offer** (`has_price` + PSP-executable). Drives Pivota Agent **shopping + checkout**.
 
-An indexed product has **0..N offers**; zero offers = **citable but not buyable**. The external read API is **un-gated by `has_price`** (gated on `index_eligible`). Pivota Agent (first-party) MAY keep its offer/seed gate for a curated shopping UX — that requirement must not leak into the index.
+An indexed product has **0..N offers**; zero offers = **citable but not buyable**. The external read API is **un-gated by `has_price`** (gated on `index_eligible`). Pivota Agent (first-party) **keeps** its offer/seed gate for a curated shopping UX (founder-confirmed 2026-06-24) — that requirement must not leak into the index.
 
 **Ranking is intent-aware**, not gate-based: shopping intent → prefer `transact_eligible`; recommend/inform intent → `index_eligible`, with offer presence a *ranking signal*, not a hard filter.
 
@@ -96,15 +105,20 @@ Only **A** decouples the index from commerce at the architecture level; **B** an
 
 > **Revised after adversarial review (2026-06-23) — GO-WITH-CHANGES.** Strictly **additive** (no rename); sliced so shopping/checkout are never touched. See "Review corrections" below.
 
-**Slice 1 (safe, additive):**
-1. [ ] ADD `index_pipeline_state.index_eligible BOOLEAN NOT NULL DEFAULT FALSE` (+ partial index). Compute in `_classify_product` as the full `serving_eligible` predicate **minus `has_price`**, evaluated independently of the short-circuited `blocker_code`. Persist in the upsert, `recompute_serving_eligibility`, and the nightly job — **and clear it in the stale-invalidation / regression demotion UPDATEs**. Do **NOT** rename or alter `serving_eligible`.
-2. [ ] Behind flag `INDEX_ELIGIBLE_READ`, widen the **three read gates** to `serving_eligible OR index_eligible`: `routes/agent_pdp_v1.py` (get_pdp), `services/catalog_trust_policy.py:528`, `routes/pivota_canonical_routes.py` by-signature PDP. Hold the public **sitemap `/products`** behind its own second flag (content/SEO decision). The blunt global `AGENT_PDP_V1_BYPASS_*` stays emergency-only.
-3. [ ] Re-point verify-to-serve at `services/external_seed_servability.py` (already offer-free) to land products as `index_eligible` — drop the minted referral offer from `#117`.
+**Slice 1 (safe, additive):** — **MERGED ([#1010](https://github.com/pengxu9-rgb/pivota-backend/pull/1010))**
+1. [x] ADD `index_pipeline_state.index_eligible BOOLEAN NOT NULL DEFAULT FALSE` (+ partial index, migration `165`). Computed in `_classify_product` as the full `serving_eligible` predicate **minus `has_price`** (with `has_image` REQUIRED, from raw predicates not the short-circuited `blocker_code`). Persisted in the upsert, `recompute_serving_eligibility`, the nightly job, and **cleared in the stale-invalidation / regression demotion UPDATEs** (M6). `serving_eligible` untouched.
+2. [x] Behind flag `INDEX_ELIGIBLE_READ`, widened the **three read gates** to `serving_eligible OR index_eligible`: `routes/agent_pdp_v1.py` (get_pdp), `services/catalog_trust_policy.py`, `routes/pivota_canonical_routes.py` by-signature PDP. Public **sitemap** held behind its own `INDEX_ELIGIBLE_SITEMAP` flag.
+3. [x] verify-to-serve lands brand-authored products as `index_eligible` with **no minted offer** — shipped as slice 2 below (`graduate_brand_authored_products`), superseding the `#117` referral offer.
 
-**Later slices (NOT slice 1):**
-4. [ ] Citable RECALL as a **separate no-OfferNode lane** — never LEFT-JOIN `catalog_offers` (`pivot_query_service.py:924` INNER JOIN stays the transact gate; null-priced rows in the offer-shaped result = "appears buyable"). Citable rows carry `buyable=false`.
-5. [ ] Intent classification (shopping vs inform) → eligibility/ranking; extend the neutrality invariance test to the **citable-vs-buyable** axis.
-6. [ ] External read/citation API contract — fields, attribution, **rate-limit/abuse**, neutrality. (No MCP/UCP/ACP product-read door exists in pivota-backend today; the surface is REST `agent_pdp_v1` / `agent_shop_gateway` — the "via MCP/UCP/ACP" framing is aspirational.)
+**Slice 2 — verify-to-serve → `index_eligible`:** — **MERGED ([#1013](https://github.com/pengxu9-rgb/pivota-backend/pull/1013))**
+   `graduate_brand_authored_products(merchant_id)` on domain-verify sets `pdp_scope='merchant_owned'` (neutral, never `multi_merchant_canonical`), refreshes `agent_pdp_view`, recomputes eligibility. No `catalog_skus`/`catalog_offers` minted → `transact_eligible` stays false (checkout fail-closed by construction).
+
+**Slice 3 — citable RECALL:** — **MERGED ([#1016](https://github.com/pengxu9-rgb/pivota-backend/pull/1016))**
+4. [x] Citable RECALL as a **separate no-OfferNode lane** (`_fetch_citable_canonical_rows` / `_build_citable_items`) — never LEFT-JOINs `catalog_offers` (`pivot_query_service.py:924` INNER JOIN untouched). Citable rows carry `buyable=false`, gated on `INDEX_ELIGIBLE_RECALL` AND `not strict_serving_mode`.
+
+**Remaining:**
+5. [~] Intent classification (shopping vs inform) — **partial**: slice 3 threads `strict_serving_mode` (suppresses citable rows for explicit commerce surfaces) and the neutrality invariance test was extended to the **citable-vs-buyable** axis. A *sharper* shopping/inform classifier is future work.
+6. [x] External read/citation API contract — **spec'd**: [external-citation-api-contract.md](https://github.com/pengxu9-rgb/pivota-merchants-portal/blob/main/docs/external-citation-api-contract.md) (REST citation routes + future MCP read door; public-read + rate-limit/abuse; attribution; neutrality). Build is P0–P3 in that doc; the MCP/UCP/ACP product-read door remains unbuilt (the "via MCP/UCP/ACP" framing stays aspirational until P2).
 
 **Gates that MUST stay offer-required for checkout (untouched):** `pivot_query_service.py:924` recall offer INNER JOIN; the downstream Agent API order/payment offer/quote resolution; `serving_eligible`'s `and has_price`.
 
