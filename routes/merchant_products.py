@@ -315,6 +315,92 @@ async def edit_brand_authored_product(
     }
 
 
+@router.delete("/{product_id}")
+async def delete_brand_authored_product(
+    product_id: str,
+    current_user: dict = Depends(get_current_user),
+):
+    """Delete a store-less brand-authored product. Own-merchant-only (404 if it
+    isn't the caller's). Removes the catalog_products row + its enrichment overlay;
+    if it was the LAST row for its content_key, also tears down the served
+    agent_pdp_view + index_pipeline_state so a fully-deleted product stops being
+    citable. If a sibling row still shares the content_key, the served PDP is
+    re-assembled from the survivors instead."""
+    _require_storeless_brand_catalog()
+    from utils.auth import get_current_merchant
+    from services.brand_authored_intake import PLATFORM_BRAND_AUTHORED
+
+    merchant_id = await get_current_merchant(current_user=current_user)
+
+    row = await database.fetch_one(
+        """
+        SELECT product_key, content_key
+        FROM catalog_products
+        WHERE merchant_id = :mid AND platform = :platform
+          AND source_product_id = :spid
+        LIMIT 1
+        """,
+        {"mid": merchant_id, "platform": PLATFORM_BRAND_AUTHORED, "spid": product_id},
+    )
+    if not row:
+        raise HTTPException(status_code=404, detail="Product not found")
+    content_key = dict(row).get("content_key")
+
+    # Enrichment overlay (agent-read store), keyed by (merchant, platform, ppid, geo).
+    await database.execute(
+        """
+        DELETE FROM product_enrichment
+        WHERE merchant_id = :mid AND platform = :platform
+          AND platform_product_id = :spid
+        """,
+        {"mid": merchant_id, "platform": PLATFORM_BRAND_AUTHORED, "spid": product_id},
+    )
+    # The canonical row.
+    await database.execute(
+        """
+        DELETE FROM catalog_products
+        WHERE merchant_id = :mid AND platform = :platform
+          AND source_product_id = :spid
+        """,
+        {"mid": merchant_id, "platform": PLATFORM_BRAND_AUTHORED, "spid": product_id},
+    )
+
+    content_key_cleared = False
+    if content_key:
+        remaining = await database.fetch_one(
+            "SELECT 1 FROM catalog_products WHERE content_key = :ck LIMIT 1",
+            {"ck": content_key},
+        )
+        if not remaining:
+            # Fully gone — stop serving it (best-effort).
+            for tbl in ("agent_pdp_view", "index_pipeline_state"):
+                try:
+                    await database.execute(
+                        f"DELETE FROM {tbl} WHERE content_key = :ck", {"ck": content_key}
+                    )
+                except Exception:  # noqa: BLE001
+                    pass
+            content_key_cleared = True
+        else:
+            # A sibling row still shares the content_key — re-assemble the served
+            # PDP from the survivor(s) so it no longer reflects the deleted row.
+            try:
+                from services.agent_pdp_view_assembler import (
+                    refresh_agent_pdp_view_for_content_key,
+                )
+
+                await refresh_agent_pdp_view_for_content_key(content_key)
+            except Exception:  # noqa: BLE001
+                pass
+
+    return {
+        "status": "deleted",
+        "product_id": product_id,
+        "content_key": content_key,
+        "content_key_cleared": content_key_cleared,
+    }
+
+
 class EnrichmentBackfillRequest(BaseModel):
     platform: Optional[str] = None
     limit: Optional[int] = 100
