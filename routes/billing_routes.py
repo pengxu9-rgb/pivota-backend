@@ -10,6 +10,7 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import json
+import os
 from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, Iterable, Optional, Tuple
 
@@ -25,6 +26,7 @@ from db.database import IS_POSTGRES, database
 from db.merchant_onboarding import get_merchant_onboarding
 from routes.payment_execution_routes import verify_merchant_api_key
 from services.billing import monthly_brand_statements_service
+from services.merchant_store_service import get_primary_store, parse_api_credentials
 from utils.auth import decode_token, get_current_merchant, optional_security
 from utils.logger import logger
 
@@ -115,6 +117,40 @@ async def require_approved_merchant(
     )
 
 
+def _billing_exempt_merchant_ids() -> set[str]:
+    """Merchant ids explicitly exempt from off-platform (Stripe) billing.
+
+    Used for the Shopify App Store review account and any merchant we must not
+    charge off-platform. Set ``BILLING_EXEMPT_MERCHANT_IDS`` to a comma-separated
+    list of merchant ids.
+    """
+    raw = (os.getenv("BILLING_EXEMPT_MERCHANT_IDS") or "").strip()
+    return {x.strip() for x in raw.split(",") if x.strip()}
+
+
+async def _merchant_is_billing_free(merchant_id: str) -> bool:
+    """True when a merchant must never see / use off-platform (Stripe) billing.
+
+    Shopify App Store distribution must bill only through Shopify, and App A is
+    free, so ``app_store``-origin installs and explicitly-exempted merchants get
+    no paid plans and cannot open a Stripe checkout session. The headless / BYO
+    tier (custom-token connects) keeps Stripe billing unchanged.
+    """
+    if not merchant_id:
+        return False
+    if merchant_id in _billing_exempt_merchant_ids():
+        return True
+    try:
+        store = await get_primary_store(merchant_id)
+    except Exception:
+        store = None
+    if store:
+        creds = parse_api_credentials(str(store.get("api_key") or ""))
+        if isinstance(creds, dict) and str(creds.get("install_source") or "").strip().lower() == "app_store":
+            return True
+    return False
+
+
 @router.get("/api/billing/me/current-period")
 async def get_my_current_billing_period(
     merchant: Dict[str, Any] = Depends(require_approved_merchant),
@@ -155,6 +191,12 @@ async def list_billing_plans(
     never needs to know or ship price_ids — the upgrade UI renders whatever
     this returns and posts the chosen price_id straight back to checkout.
     """
+
+    # App Store (free) and exempt merchants must never be offered off-platform
+    # billing — return no plans so the upgrade UI hides itself.
+    merchant_id = _as_text(merchant.get("merchant_id"))
+    if await _merchant_is_billing_free(merchant_id):
+        return {"plans": []}
 
     plans = await _list_active_paid_plans(database, mode=_platform_stripe_mode())
     return {"plans": plans}
@@ -302,6 +344,10 @@ async def create_billing_checkout_session(
     cancel_url = _as_text(body.cancel_url)
     if not merchant_id:
         raise HTTPException(status_code=400, detail="Authenticated merchant is missing merchant_id")
+    # Block the off-platform charge path for App Store / exempt merchants, even if
+    # the UI is bypassed — Shopify App Store apps must not bill off-platform.
+    if await _merchant_is_billing_free(merchant_id):
+        raise HTTPException(status_code=403, detail="This merchant is not eligible for off-platform billing.")
     if not price_id or not success_url or not cancel_url:
         raise HTTPException(status_code=400, detail="price_id, success_url, and cancel_url are required")
 
@@ -419,6 +465,9 @@ async def create_credit_topup(
             status_code=403,
             detail="merchant_id in body must match the authenticated merchant.",
         )
+    # App Store / exempt merchants must not be charged off-platform.
+    if await _merchant_is_billing_free(merchant_id):
+        raise HTTPException(status_code=403, detail="This merchant is not eligible for off-platform billing.")
     if int(body.pack_credits or 0) <= 0:
         raise HTTPException(status_code=422, detail="pack_credits must be > 0")
 

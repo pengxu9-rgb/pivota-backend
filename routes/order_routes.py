@@ -1175,12 +1175,19 @@ def _build_shopify_cart_permalink_best_effort(
     shop_domain: str,
     items: List[OrderItem],
     discount_codes: Optional[List[str]] = None,
+    prefer_shop_pay: bool = True,
 ) -> Optional[str]:
     """
     Build a Shopify cart permalink checkout fallback:
-      https://{shop}/cart/{variant_id}:{qty},{variant_id}:{qty}?discount=CODE1,CODE2
+      https://{shop}/cart/{variant_id}:{qty},{variant_id}:{qty}?discount=CODE1,CODE2&payment=shop_pay
 
-    Note: this does not guarantee pricing match with our quote; final total is computed by Shopify checkout.
+    With prefer_shop_pay=True (default) we append `payment=shop_pay` so the buyer is
+    dropped straight into Shop Pay checkout. This is a plain public URL: it requires no
+    app scope and no token, and works under the read-only App Store app. Shop Pay only
+    renders if the merchant has Shopify Payments + Shop Pay enabled on their store.
+
+    Note: this does not guarantee pricing match with our quote; the final total
+    (incl. tax/shipping) is computed and shown by Shopify checkout.
     """
     domain = _normalize_shopify_domain(shop_domain)
     if not domain:
@@ -1206,14 +1213,19 @@ def _build_shopify_cart_permalink_best_effort(
 
     base = f"https://{domain}/cart/" + ",".join(parts)
 
+    query: Dict[str, str] = {}
     codes = []
     for c in (discount_codes or []):
         if isinstance(c, str) and c.strip():
             codes.append(c.strip())
     if codes:
         # Shopify supports `discount=CODE` and typically accepts comma-delimited codes.
-        q = urlencode({"discount": ",".join(codes[:5])})
-        return f"{base}?{q}"
+        query["discount"] = ",".join(codes[:5])
+    if prefer_shop_pay:
+        # Accelerated handoff into Shop Pay (Shopify-hosted checkout / Shopify Payments).
+        query["payment"] = "shop_pay"
+    if query:
+        return f"{base}?{urlencode(query)}"
     return base
 
 
