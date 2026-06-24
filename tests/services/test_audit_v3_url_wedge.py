@@ -630,3 +630,16 @@ def test_get_scoped_to_merchant_and_subject(monkeypatch):
 def test_get_missing_run_404(monkeypatch):
     c = _get_client(monkeypatch, None)
     assert c.get(f"{_URL}/run-url-1").status_code == 404
+
+
+def test_depth_config_in_launch(client):
+    # Depth: the URL audit launches with enough prompts to run the niche/longtail
+    # lanes (>=14) and an answer-quality verify pass — not the old thin 8-prompt,
+    # no-verify pass.
+    client.state["used"] = 0
+    res = client.post(_URL, json=_BODY)
+    assert res.status_code == 200, res.text
+    launch = client.enqueued[-1]["request_options_jsonb"]["launch"]
+    assert launch["prompts_per_sku"] >= 14
+    assert launch["verify_providers"] == mar._WEDGE_VERIFY_PROVIDERS
+    assert launch["verify_providers"]  # non-empty (verify enabled)

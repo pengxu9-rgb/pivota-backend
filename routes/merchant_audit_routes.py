@@ -1001,15 +1001,22 @@ _WEDGE_MAX_RUNS = int(_os.getenv("WEDGE_MAX_RUNS", "2"))
 _WEDGE_RUN_STALE_TTL_S = int(_os.getenv("WEDGE_RUN_STALE_TTL_S", "900"))
 
 # Per-product (per-SKU) URL audit: each pasted URL is audited as its own SKU
-# through the durable per-SKU pipeline. prompts_per_sku is kept LOW (vs the
-# readiness default of 40) so 5 URLs stays affordable — Gemini-only, no verify
-# pass. At 8 prompts × 5 URLs that's ~40 grounded calls, a real per-product
-# citation signal at ~1/5th the readiness cost. Tunable via env.
-_WEDGE_PROMPTS_PER_SKU = int(_os.getenv("WEDGE_PROMPTS_PER_SKU", "8"))
+# through the durable per-SKU pipeline. prompts_per_sku at 18 (vs the readiness
+# default of 40) crosses the sidewalk-lane budget threshold (>=14) so the
+# attribute-driven niche/longtail lanes — "where you can win" — actually run
+# instead of being budgeted out at 8. Verify (DeepSeek, ~25% sample) adds the
+# answer-quality signal (which cited answers actually hold up) that the
+# readiness audit has. Still Gemini-only to bound cost; all tunable via env.
+_WEDGE_PROMPTS_PER_SKU = int(_os.getenv("WEDGE_PROMPTS_PER_SKU", "18"))
 _WEDGE_COVERAGE_PROFILE = _os.getenv("WEDGE_COVERAGE_PROFILE", "pilot_gemini")
 _WEDGE_PROVIDERS = [
     p.strip()
     for p in _os.getenv("WEDGE_PROVIDERS", "gemini").split(",")
+    if p.strip()
+]
+_WEDGE_VERIFY_PROVIDERS = [
+    p.strip()
+    for p in _os.getenv("WEDGE_VERIFY_PROVIDERS", "deepseek").split(",")
     if p.strip()
 ]
 
@@ -1520,7 +1527,7 @@ async def run_merchant_url_audit(
                 "audit_mode": "per_sku",
                 "coverage_profile": _WEDGE_COVERAGE_PROFILE,
                 "providers": list(_WEDGE_PROVIDERS),
-                "verify_providers": [],
+                "verify_providers": list(_WEDGE_VERIFY_PROVIDERS),
                 "prompts_per_sku": _WEDGE_PROMPTS_PER_SKU,
                 "custom_prompts": custom_prompts_clean,
                 "synthetic_products": synthetic_products,
