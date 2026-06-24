@@ -193,13 +193,14 @@ async def list_billing_plans(
     """
 
     # App Store (free) and exempt merchants must never be offered off-platform
-    # billing — return no plans so the upgrade UI hides itself.
+    # billing — return no plans and a flag so the portal hides the entire
+    # billing UI (no Stripe references anywhere) for them.
     merchant_id = _as_text(merchant.get("merchant_id"))
     if await _merchant_is_billing_free(merchant_id):
-        return {"plans": []}
+        return {"plans": [], "off_platform_billing": False}
 
     plans = await _list_active_paid_plans(database, mode=_platform_stripe_mode())
-    return {"plans": plans}
+    return {"plans": plans, "off_platform_billing": True}
 
 
 @router.post("/webhooks/stripe/billing")
