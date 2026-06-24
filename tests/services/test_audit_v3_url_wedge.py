@@ -581,6 +581,7 @@ def test_get_succeeded_reshapes_per_sku_report(monkeypatch):
     # URL-audit envelope and flags catalog dims unavailable (connect-store funnel).
     per_sku_report = {"per_sku_reports": [{"sku_key": "urlwedge:x", "scores": {}}],
                       "brand_rollup": {"where_you_can_win": {"targets": []}},
+                      "merchant_narrative": {"headline_story": "You're findable but not recommended."},
                       "authority_map": {"skus": []}}
     c = _get_client(monkeypatch, {
         "run_id": "run-url-1",
@@ -598,6 +599,8 @@ def test_get_succeeded_reshapes_per_sku_report(monkeypatch):
     assert body["catalog_dimensions_available"] is False
     assert body["per_sku_reports"] == per_sku_report["per_sku_reports"]
     assert body["where_you_can_win"] == {"targets": []}
+    # The merchant-grade narrative (insight layer) is lifted for rendering.
+    assert body["merchant_narrative"]["headline_story"].startswith("You're findable")
     # Echoed base-payload fields are merged through.
     assert body["audited_url"] == "https://m.example"
 
