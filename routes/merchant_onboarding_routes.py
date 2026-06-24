@@ -27,7 +27,7 @@ from db.payment_router import register_merchant_psp_route
 from db.auth_identity import upsert_membership
 from db.database import database
 from readiness.summary import build_readiness_summary
-from utils.auth import ADMIN_ROLES, get_current_user, require_admin
+from utils.auth import ADMIN_ROLES, get_current_user, get_current_employee, require_admin
 from urllib.parse import urlparse
 # from utils.r2_storage import upload_file_to_r2, get_presigned_url  # R2 存储功能推迟实现
 from fastapi.responses import StreamingResponse
@@ -1014,7 +1014,7 @@ async def get_onboarding_details(
 async def admin_delete_merchant_store(
     merchant_id: str,
     store_id: str,
-    current_user: dict = Depends(require_admin),
+    current_user: dict = Depends(get_current_employee),
 ):
     """Employee/admin: hard-delete a specific store from a merchant account."""
     del current_user
