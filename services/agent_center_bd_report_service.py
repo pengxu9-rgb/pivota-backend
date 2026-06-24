@@ -157,12 +157,14 @@ _COMPETITOR_ATTRIBUTE_ALIASES: Tuple[Tuple[str, Tuple[str, ...]], ...] = (
 )
 logger = logging.getLogger(__name__)
 _ANSWER_QUALITY_VERIFY_DEWEIGHT_RULE = (
-    "Verified citation-positive prompts keep their deterministic "
-    "answer_quality hit unless DeepSeek returns "
-    "supports_recommendation=false or misstates_facts=true; flagged "
-    "verified prompts contribute 0 to answer_quality_rate. "
-    "Deterministic first_party, sku_mention, and authority buckets are "
-    "unchanged."
+    "answer_quality_rate is scored ONLY over verified prompts: of the "
+    "citation-positive answers DeepSeek actually checked, the fraction that "
+    "held up (supports_recommendation!=false and not misstates_facts). "
+    "Flagged verified prompts contribute 0; UNVERIFIED prompts are excluded "
+    "from both numerator and denominator (so a tier that runs no verify — "
+    "e.g. the free URL-wedge — scores 0 here rather than earning unchecked "
+    "answer-quality points). Deterministic first_party, sku_mention, and "
+    "authority buckets are unchanged."
 )
 _SOURCE_ROLE_COMPETITOR_TYPES = {
     "cdn",
@@ -3760,7 +3762,7 @@ def compute_citation_score(
     sku_mentions = 0
     authority_hits = 0
     quality_hits = 0
-    adjusted_quality_hits = 0
+    verified_quality_clean = 0
     verify_deweighted = 0
     verify_by_key = _verify_outputs_by_prompt_key(verify_outputs)
     for run in runs:
@@ -3851,8 +3853,12 @@ def compute_citation_score(
             verify_output = verify_by_key.get(_citation_prompt_key(run))
             if verify_output and _verify_output_flagged(verify_output):
                 verify_deweighted += 1
-            else:
-                adjusted_quality_hits += 1
+            elif verify_output:
+                verified_quality_clean += 1
+            # else: this prompt was NOT verified, so it earns no answer_quality
+            # credit. Unchecked claims must not score (a tier that runs no
+            # verify — e.g. the free URL-wedge — would otherwise report a
+            # verified-looking answer_quality it never actually checked).
 
     def _rate_bucket(name: str, numerator: int, max_points: int) -> None:
         rate = numerator / denominator if denominator else 0.0
@@ -3866,9 +3872,36 @@ def compute_citation_score(
     _rate_bucket("first_party_rate", first_party_hits, 45)
     _rate_bucket("sku_mention_rate", sku_mentions, 25)
     _rate_bucket("authority_near_variant_rate", authority_hits, 20)
-    _rate_bucket("answer_quality_rate", adjusted_quality_hits, 10)
+    # answer_quality is the ONLY bucket scored against verified prompts, not all
+    # prompts: of the citation-positive answers we actually verified, how many
+    # held up. When nothing was verified (e.g. the free URL-wedge tier passes
+    # verify_providers=[]), it contributes 0 — we no longer award answer-quality
+    # points for unchecked claims.
+    verified_quality_total = verified_quality_clean + verify_deweighted
+    answer_quality_rate = (
+        verified_quality_clean / verified_quality_total
+        if verified_quality_total
+        else 0.0
+    )
+    _add_bucket(
+        breakdown, missing, "answer_quality_rate",
+        int(round(10 * answer_quality_rate)), 10,
+        (
+            f"{verified_quality_clean}/{verified_quality_total} verified prompts held up"
+            if verified_quality_total
+            else "no prompts verified on this tier — answer quality unscored"
+        ),
+        extra={
+            "numerator": verified_quality_clean,
+            "denominator": verified_quality_total,
+            "rate": round(answer_quality_rate, 4),
+        },
+    )
     breakdown["answer_quality_rate"]["deterministic_numerator"] = quality_hits
     breakdown["answer_quality_rate"]["verify_deweighted"] = verify_deweighted
+    breakdown["answer_quality_rate"]["unverified_excluded"] = (
+        quality_hits - verified_quality_total
+    )
     breakdown["answer_quality_rate"]["verify_rule"] = (
         _ANSWER_QUALITY_VERIFY_DEWEIGHT_RULE
     )
@@ -3876,7 +3909,7 @@ def compute_citation_score(
         45 * (first_party_hits / denominator)
         + 25 * (sku_mentions / denominator)
         + 20 * (authority_hits / denominator)
-        + 10 * (adjusted_quality_hits / denominator)
+        + 10 * answer_quality_rate
     ))
     total = max(0, min(100, total))
     breakdown["total"] = total
