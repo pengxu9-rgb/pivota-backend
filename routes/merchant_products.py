@@ -568,6 +568,80 @@ async def _load_runtime_product_rows(
     return [dict(row) for row in rows], total
 
 
+async def _load_brand_authored_list_items(
+    merchant_id: str, *, page_size: int, offset: int,
+) -> Tuple[List[Dict[str, Any]], int]:
+    """Brand-authored (store-less) products live in catalog_products, NOT the
+    products cache the runtime list reads — so without this they never appear in
+    the portal catalog list (the create/detail endpoints read catalog_products,
+    the list did not). Surface them here in the same item shape. Flag-gated by
+    the caller (storeless_brand_catalog_enabled)."""
+    from services.brand_authored_intake import PLATFORM_BRAND_AUTHORED
+
+    count_row = await database.fetch_one(
+        "SELECT COUNT(*) AS n FROM catalog_products "
+        "WHERE merchant_id = :mid AND platform = :platform",
+        {"mid": merchant_id, "platform": PLATFORM_BRAND_AUTHORED},
+    )
+    total = int((dict(count_row) if count_row is not None else {}).get("n") or 0)
+    if total == 0:
+        return [], 0
+
+    rows = await database.fetch_all(
+        """
+        SELECT source_product_id, title, brand, description, product_type,
+               category, image_url, content_key, pdp_scope, claim_state,
+               pdp_lifecycle_stage, updated_at
+        FROM catalog_products
+        WHERE merchant_id = :mid AND platform = :platform
+        ORDER BY updated_at DESC
+        LIMIT :limit OFFSET :offset
+        """,
+        {"mid": merchant_id, "platform": PLATFORM_BRAND_AUTHORED,
+         "limit": page_size, "offset": offset},
+    )
+    rows = [dict(r) for r in rows]
+    if not rows:
+        return [], total
+
+    # Shape as cache-like rows (platform + platform_product_id) so the shared
+    # quality/enrichment bundle resolves them by the same product_key.
+    shaped = [
+        {**r, "platform": PLATFORM_BRAND_AUTHORED,
+         "platform_product_id": r.get("source_product_id")}
+        for r in rows
+    ]
+    quality_bundle = await _build_quality_projection_bundle(merchant_id, shaped)
+
+    items: List[Dict[str, Any]] = []
+    for r in rows:
+        spid = r.get("source_product_id")
+        product_key = make_product_key(PLATFORM_BRAND_AUTHORED, spid)
+        enrichment = quality_bundle["enrichments_by_key"].get(product_key or ("", ""), {})
+        projection = quality_bundle["projections_by_key"].get(product_key or ("", ""), {})
+        description = r.get("description")
+        items.append({
+            "merchant_id": merchant_id,
+            "platform": PLATFORM_BRAND_AUTHORED,
+            "platform_product_id": spid,
+            "standard": {
+                "title": r.get("title"),
+                "description": description,
+                "description_text": description,
+                # OBSERVED / citation-only — no offer, so no price and not orderable.
+                "price": None,
+                "main_image_url": r.get("image_url"),
+                "status": "brand_authored",
+                "orderable": False,
+                "last_synced_at": r.get("updated_at"),
+            },
+            "enrichment": enrichment or {},
+            "quality": _quality_response(projection),
+            "agent_push": _agent_push_response({}),
+        })
+    return items, total
+
+
 @router.get("")
 async def list_merchant_products(
     platform: Optional[str] = Query(None),
@@ -619,6 +693,19 @@ async def list_merchant_products(
             "quality": _quality_response(projection),
             "agent_push": _agent_push_response(agent_push),
         })
+
+    # Store-less brand-authored products live in catalog_products (not the cache),
+    # so they were invisible in this list. Merge them in when the feature is on.
+    # (For a store-less merchant the cache is empty, so this is the only source.)
+    from readiness.flags import storeless_brand_catalog_enabled
+    from services.brand_authored_intake import PLATFORM_BRAND_AUTHORED
+
+    if platform in (None, PLATFORM_BRAND_AUTHORED) and storeless_brand_catalog_enabled():
+        ba_items, ba_total = await _load_brand_authored_list_items(
+            merchant_id, page_size=page_size, offset=offset,
+        )
+        items.extend(ba_items)
+        total += ba_total
 
     return {
         "items": items,
