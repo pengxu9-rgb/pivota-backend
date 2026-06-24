@@ -772,11 +772,21 @@ async def _build_preview(
         custom_prompts=custom_prompts,
     )
     gaps = _credit_gaps(requirements=requirements, balance=balance)
+    # A PAID tier can launch on overage — the launch gate only hard-blocks the
+    # FREE tier (`if gaps and not paid_tier`, below). So the preview must report
+    # "sufficient to run" for a paid merchant even when the selected audit costs
+    # more than the current balance; otherwise the portal disables the Run
+    # button and tells a funded, paying merchant to "top up" when they're
+    # actually entitled to run on overage. `will_overage` lets the UI explain
+    # that the excess bills as overage instead of silently hiding it.
+    paid_tier = str(balance.get("plan_tier") or "free").lower() != "free"
+    will_overage = bool(gaps) and paid_tier
     return {
         **cost_part,
         "merchant_id": merchant_id,
         "current_balance": _balance_public_shape(balance),
-        "sufficient": not gaps,
+        "sufficient": (not gaps) or paid_tier,
+        "will_overage": will_overage,
         "gaps": gaps,
     }
 

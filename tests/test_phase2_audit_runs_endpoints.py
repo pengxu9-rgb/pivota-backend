@@ -720,7 +720,12 @@ def test_preview_returns_cost_balance_and_sufficiency(client, stub):
     assert stub.debits == []
 
 
-def test_preview_reports_credit_gaps(client, stub):
+def test_preview_paid_tier_can_overage_is_sufficient(client, stub):
+    # A PAID tier (default stub plan_tier='starter') can launch on overage, so
+    # a selected audit that costs more than the current balance must still
+    # report sufficient=True (mirrors the launch gate `if gaps and not paid_tier`)
+    # — otherwise the portal blocks the Run button and tells a paying merchant to
+    # top up. The gap is still surfaced + will_overage flags the overage.
     stub.preview_sku_keys = ["sku-1", "sku-2", "sku-3"]
     stub.balance.update({"credits": 100})
     res = client.post(
@@ -733,10 +738,30 @@ def test_preview_reports_credit_gaps(client, stub):
     )
     assert res.status_code == 200, res.text
     body = res.json()
-    assert body["sufficient"] is False
+    assert body["sufficient"] is True
+    assert body["will_overage"] is True
     assert body["gaps"] == [
         {"kind": "credits", "required": 529, "available": 100, "short": 429},
     ]
+
+
+def test_preview_free_tier_with_gaps_is_insufficient(client, stub):
+    # The FREE tier is genuinely hard-blocked (no overage) — sufficient=False.
+    stub.preview_sku_keys = ["sku-1", "sku-2", "sku-3"]
+    stub.balance.update({"credits": 100, "plan_tier": "free"})
+    res = client.post(
+        "/api/audits/preview",
+        json={
+            "merchant_id": "merch-A",
+            "scope": {"sku_keys": ["sku-1", "sku-2", "sku-3"]},
+            "custom_prompts": ["one"],
+        },
+    )
+    assert res.status_code == 200, res.text
+    body = res.json()
+    assert body["sufficient"] is False
+    assert body["will_overage"] is False
+    assert body["gaps"][0]["short"] == 429
 
 
 def test_preview_us_shopper_sums_gemini_and_chatgpt_per_prompt(client, stub):
