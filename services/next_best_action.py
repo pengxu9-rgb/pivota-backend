@@ -209,8 +209,17 @@ def build_sku_next_best_action(
     sku_title: Optional[str] = None,
     merchant_host: Optional[str] = None,
     sku_key: Optional[str] = None,
+    catalog_unavailable: bool = False,
 ) -> Dict[str, Any]:
-    """Build a deterministic per-SKU next-best-action prescription."""
+    """Build a deterministic per-SKU next-best-action prescription.
+
+    `catalog_unavailable=True` (URL audits — a pasted product with no synced
+    catalog) suppresses the "get indexed / serving" primary gate: serving
+    eligibility + orderability can't be measured or fixed without a connected
+    store, so leading with them would bury the URL-actionable citation insight
+    behind the connect-store funnel. With the gate off, the action leads with
+    open-lane / substitution / content moves the merchant can act on directly.
+    """
 
     opportunity_map = _as_mapping(opportunity)
     gaps = [
@@ -223,6 +232,7 @@ def build_sku_next_best_action(
         primary_gaps=gaps,
         scores=_as_mapping(scores),
         identity=_as_mapping(identity),
+        catalog_unavailable=catalog_unavailable,
     )
     evidence = _build_sku_evidence_used(
         opportunity=opportunity_map,
@@ -351,6 +361,7 @@ def _classify_sku_primary_gap(
     primary_gaps: List[Mapping[str, Any]],
     scores: Mapping[str, Any],
     identity: Mapping[str, Any],
+    catalog_unavailable: bool = False,
 ) -> str:
     # Indexing comes first — an un-indexed SKU can't be cited regardless of
     # page quality or open lanes, so this gates every other primary move.
@@ -358,7 +369,11 @@ def _classify_sku_primary_gap(
     # brand-report path surfaces the same intent via the `get_indexed`
     # playbook in audit_playbook_engine (select_playbooks); the two engines
     # serve different report surfaces.
-    if _sku_not_indexed(primary_gaps, scores):
+    #
+    # URL audits (catalog_unavailable) skip this gate: serving eligibility is
+    # un-measurable + un-fixable without a connected store, so it's the
+    # connect-store funnel, not the lead action.
+    if not catalog_unavailable and _sku_not_indexed(primary_gaps, scores):
         return PRIMARY_SKU_GET_INDEXED
 
     if _sku_top_open_lane(opportunity):

@@ -1190,6 +1190,11 @@ def _shape_url_audit_response(row: Dict[str, Any]) -> Dict[str, Any]:
         "suggested_prompts": report.get("suggested_prompts"),
         # Merchant's own test prompts ("Your prompts"), probed once brand-level.
         "custom_prompts": report.get("custom_prompts") or [],
+        # Competitive landscape + off-platform outreach moves (who AI cites
+        # instead of you, and the pitch/engage/list actions to get cited there).
+        "where_youre_losing": (
+            (report.get("merchant_narrative") or {}).get("where_youre_losing") or {}
+        ),
         "brand_report": report,
         "catalog_dimensions_available": False,
     }

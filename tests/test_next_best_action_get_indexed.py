@@ -96,3 +96,37 @@ def test_breakdown_absent_falls_back_to_gap_signal():
         sku_title="X",
     )
     assert nba["primary_gap"] == PRIMARY_SKU_GET_INDEXED
+
+
+def test_catalog_unavailable_skips_indexing_gate():
+    """URL audits (no synced catalog) must NOT lead with 'get indexed' — serving
+    eligibility is un-measurable/un-fixable without a connected store. With the
+    gate off, an open lane (or content/substitution) leads instead."""
+    nba = build_sku_next_best_action(
+        opportunity={"open_lanes": [{"query": "vitamin c collagen jelly", "why_fit": ["niche"]}]},
+        primary_gaps=[
+            {"dimension": "citation", "bucket": "first_party_rate",
+             "gap": 39, "max": 45, "label": "Cited as the source", "why": "rarely cited"},
+        ],
+        scores=_scores(0),  # serving_eligibility=0 would normally force get_indexed
+        identity={},
+        sku_title="Triple Shine Grape",
+        catalog_unavailable=True,
+    )
+    assert nba["primary_gap"] != PRIMARY_SKU_GET_INDEXED
+    assert "index" not in nba["headline"].lower()
+
+
+def test_catalog_available_still_gets_indexed():
+    """Regression guard: the default (readiness) path is unchanged."""
+    nba = build_sku_next_best_action(
+        opportunity={},
+        primary_gaps=[
+            {"dimension": "routability", "bucket": "serving_eligibility",
+             "gap": 40, "max": 40, "label": "Discoverable by AI", "why": "not live"},
+        ],
+        scores=_scores(0),
+        identity={},
+        sku_title="Good Night Collagen",
+    )
+    assert nba["primary_gap"] == PRIMARY_SKU_GET_INDEXED

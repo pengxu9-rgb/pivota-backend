@@ -5550,7 +5550,17 @@ async def build_per_sku_report(
         }
 
     identity = resolve_sku_identity(sku_ctx)
+    # URL audits (synthetic, no synced catalog): the routability dimension
+    # (serving_eligibility / offer_orderability) can't be measured or fixed
+    # without a connected store, so drop it from the surfaced gaps and skip the
+    # "get indexed" action gate — the citation/lane insight should lead, with
+    # catalog routing framed as the connect-store unlock instead.
+    catalog_unavailable = bool(sku_ctx.get("synthetic_url_audit"))
     primary_gaps = _primary_gaps(scores)
+    if catalog_unavailable:
+        primary_gaps = [
+            g for g in primary_gaps if g.get("dimension") != "routability"
+        ]
     failing_prompts = _failing_prompts(probe_runs)
     verify_summary_out = verify_summary or _verify_skipped_summary(
         reason="not_run",
@@ -5567,6 +5577,7 @@ async def build_per_sku_report(
         sku_title=(_get_sku(sku_ctx).get("title") or product.get("title")),
         merchant_host=normalize_host(product.get("canonical_url") or product.get("pdp_url")),
         sku_key=sku_key,
+        catalog_unavailable=catalog_unavailable,
     )
     next_best_action = await attach_sku_strategic_brief(
         next_best_action,
