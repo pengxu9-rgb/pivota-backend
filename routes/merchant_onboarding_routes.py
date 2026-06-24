@@ -1008,6 +1008,66 @@ async def get_onboarding_details(
     }
     return {"status": "success", "merchant": result}
 
+
+@router.delete("/{merchant_id}/stores/{store_id}", response_model=Dict[str, Any])
+async def admin_delete_merchant_store(
+    merchant_id: str,
+    store_id: str,
+    current_user: dict = Depends(require_admin),
+):
+    """Employee/admin: hard-delete a specific store from a merchant account."""
+    del current_user
+
+    store = await database.fetch_one(
+        "SELECT store_id, is_primary FROM merchant_stores WHERE store_id = :store_id AND merchant_id = :merchant_id",
+        {"store_id": store_id, "merchant_id": merchant_id},
+    )
+    if not store:
+        raise HTTPException(status_code=404, detail="Store not found for this merchant")
+
+    store_data = dict(store)
+
+    async with database.transaction():
+        await database.execute(
+            "DELETE FROM merchant_stores WHERE store_id = :store_id AND merchant_id = :merchant_id",
+            {"store_id": store_id, "merchant_id": merchant_id},
+        )
+        if store_data.get("is_primary"):
+            await database.execute(
+                """
+                WITH next_store AS (
+                    SELECT store_id FROM merchant_stores
+                    WHERE merchant_id = :merchant_id
+                      AND lower(COALESCE(status, '')) IN ('active', 'connected')
+                    ORDER BY connected_at DESC NULLS LAST, store_id DESC
+                    LIMIT 1
+                )
+                UPDATE merchant_stores SET is_primary = TRUE
+                WHERE store_id = (SELECT store_id FROM next_store)
+                """,
+                {"merchant_id": merchant_id},
+            )
+            next_primary = await database.fetch_one(
+                "SELECT store_id FROM merchant_stores WHERE merchant_id = :merchant_id AND is_primary = TRUE LIMIT 1",
+                {"merchant_id": merchant_id},
+            )
+            if not next_primary:
+                try:
+                    await database.execute(
+                        """
+                        UPDATE merchant_onboarding
+                        SET mcp_connected = FALSE, mcp_platform = NULL,
+                            mcp_shop_domain = NULL, mcp_access_token = NULL
+                        WHERE merchant_id = :merchant_id
+                        """,
+                        {"merchant_id": merchant_id},
+                    )
+                except Exception:
+                    pass
+
+    return {"status": "success", "store_id": store_id, "merchant_id": merchant_id}
+
+
 @router.get("/all", response_model=Dict[str, Any])
 async def list_all_onboardings(
     status: Optional[str] = None,
