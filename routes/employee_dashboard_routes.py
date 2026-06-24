@@ -81,6 +81,7 @@ async def _fetch_employee_merchant_stores(merchant_id: str) -> List[Dict[str, An
             CASE WHEN api_key IS NOT NULL AND api_key != '' THEN true ELSE false END as api_key_present
         FROM merchant_stores
         WHERE merchant_id = :merchant_id
+          AND lower(COALESCE(status, 'active')) NOT IN ('disconnected', 'deleted', 'inactive')
         ORDER BY connected_at DESC
         """,
         {"merchant_id": merchant_id},

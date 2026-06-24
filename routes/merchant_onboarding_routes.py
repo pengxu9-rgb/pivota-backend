@@ -28,6 +28,7 @@ from db.auth_identity import upsert_membership
 from db.database import database
 from readiness.summary import build_readiness_summary
 from utils.auth import ADMIN_ROLES, get_current_user, get_current_employee, require_admin
+from routes.manage_integrations import sync_legacy_primary_store_fields
 from urllib.parse import urlparse
 # from utils.r2_storage import upload_file_to_r2, get_presigned_url  # R2 存储功能推迟实现
 from fastapi.responses import StreamingResponse
@@ -1016,7 +1017,12 @@ async def admin_delete_merchant_store(
     store_id: str,
     current_user: dict = Depends(get_current_employee),
 ):
-    """Employee/admin: hard-delete a specific store from a merchant account."""
+    """Employee/admin: soft-delete a specific store from a merchant account.
+
+    Reversible by design: sets status='deleted' rather than removing the row, so a
+    mis-click can be undone. Soft-deleted stores are excluded from all active-store
+    reads (get_merchant_active_stores) and from the employee portal views.
+    """
     del current_user
 
     store = await database.fetch_one(
@@ -1029,8 +1035,11 @@ async def admin_delete_merchant_store(
     store_data = dict(store)
 
     async with database.transaction():
+        # Clear is_primary as we soft-delete so the partial unique index
+        # (uniq_merchant_stores_primary_per_merchant WHERE is_primary=TRUE) stays
+        # satisfiable when the next store is promoted below.
         await database.execute(
-            "DELETE FROM merchant_stores WHERE store_id = :store_id AND merchant_id = :merchant_id",
+            "UPDATE merchant_stores SET status = 'deleted', is_primary = FALSE WHERE store_id = :store_id AND merchant_id = :merchant_id",
             {"store_id": store_id, "merchant_id": merchant_id},
         )
         if store_data.get("is_primary"):
@@ -1048,25 +1057,76 @@ async def admin_delete_merchant_store(
                 """,
                 {"merchant_id": merchant_id},
             )
-            next_primary = await database.fetch_one(
-                "SELECT store_id FROM merchant_stores WHERE merchant_id = :merchant_id AND is_primary = TRUE LIMIT 1",
+
+    # After the transaction: sync legacy mcp_* fields to whichever store is now primary.
+    next_primary_full = await database.fetch_one(
+        """SELECT store_id, platform, domain, api_key
+           FROM merchant_stores
+           WHERE merchant_id = :merchant_id AND is_primary = TRUE
+           LIMIT 1""",
+        {"merchant_id": merchant_id},
+    )
+    if next_primary_full:
+        await sync_legacy_primary_store_fields(merchant_id, dict(next_primary_full))
+    else:
+        try:
+            await database.execute(
+                """UPDATE merchant_onboarding
+                   SET mcp_connected = FALSE, mcp_platform = NULL,
+                       mcp_shop_domain = NULL, mcp_access_token = NULL
+                   WHERE merchant_id = :merchant_id""",
                 {"merchant_id": merchant_id},
             )
-            if not next_primary:
-                try:
-                    await database.execute(
-                        """
-                        UPDATE merchant_onboarding
-                        SET mcp_connected = FALSE, mcp_platform = NULL,
-                            mcp_shop_domain = NULL, mcp_access_token = NULL
-                        WHERE merchant_id = :merchant_id
-                        """,
-                        {"merchant_id": merchant_id},
-                    )
-                except Exception:
-                    pass
+        except Exception:
+            pass
 
     return {"status": "success", "store_id": store_id, "merchant_id": merchant_id}
+
+
+@router.post("/{merchant_id}/stores/repair-primary", response_model=Dict[str, Any])
+async def admin_repair_primary_store(
+    merchant_id: str,
+    current_user: dict = Depends(get_current_employee),
+):
+    """Re-sync mcp_* fields on merchant_onboarding to whichever store is currently primary.
+    Use after a store deletion left the legacy fields pointing at the deleted store.
+    """
+    del current_user
+    primary = await database.fetch_one(
+        """SELECT store_id, platform, domain, api_key
+           FROM merchant_stores
+           WHERE merchant_id = :merchant_id AND is_primary = TRUE
+           LIMIT 1""",
+        {"merchant_id": merchant_id},
+    )
+    if not primary:
+        # No primary — pick the most recently connected active store and promote it.
+        primary = await database.fetch_one(
+            """SELECT store_id, platform, domain, api_key
+               FROM merchant_stores
+               WHERE merchant_id = :merchant_id
+                 AND lower(COALESCE(status, '')) IN ('active', 'connected')
+               ORDER BY connected_at DESC NULLS LAST
+               LIMIT 1""",
+            {"merchant_id": merchant_id},
+        )
+        if primary:
+            await database.execute(
+                "UPDATE merchant_stores SET is_primary = TRUE WHERE store_id = :store_id",
+                {"store_id": primary["store_id"]},
+            )
+    if primary:
+        await sync_legacy_primary_store_fields(merchant_id, dict(primary))
+        return {"status": "success", "synced_to": primary["store_id"], "platform": primary["platform"], "domain": primary["domain"]}
+    # No active stores at all — clear legacy fields.
+    await database.execute(
+        """UPDATE merchant_onboarding
+           SET mcp_connected = FALSE, mcp_platform = NULL,
+               mcp_shop_domain = NULL, mcp_access_token = NULL
+           WHERE merchant_id = :merchant_id""",
+        {"merchant_id": merchant_id},
+    )
+    return {"status": "success", "synced_to": None, "note": "no active stores remain"}
 
 
 @router.get("/all", response_model=Dict[str, Any])
