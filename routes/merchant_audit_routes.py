@@ -1019,6 +1019,14 @@ _WEDGE_VERIFY_PROVIDERS = [
     for p in _os.getenv("WEDGE_VERIFY_PROVIDERS", "deepseek").split(",")
     if p.strip()
 ]
+# Providers added for PAID-tier merchants only (cross-model divergence). The
+# free wedge stays on _WEDGE_PROVIDERS (Gemini) to bound the absorbed cost.
+# ChatGPT isn't plan-gated (ADR-005) — this is a cost choice, env-tunable.
+_WEDGE_PAID_PROVIDERS = [
+    p.strip()
+    for p in _os.getenv("WEDGE_PAID_PROVIDERS", "chatgpt").split(",")
+    if p.strip()
+]
 
 
 class MerchantUrlAuditRequest(BaseModel):
@@ -1337,25 +1345,35 @@ async def run_merchant_url_audit(
         if _t and _t.lower() not in _seen_cp:
             _seen_cp.add(_t.lower())
             custom_prompts_clean.append(_t)
+    # Multi-model for PAID tiers: paid merchants also get ChatGPT for cross-model
+    # divergence ("Gemini cites you, ChatGPT doesn't"); the free wedge stays
+    # Gemini-only to bound the absorbed cost. Resolve the balance once here and
+    # reuse it for the metering gate below.
+    balance = await get_balance(merchant_id)
+    paid_tier = str(balance.get("plan_tier") or "free").lower() != "free"
+    providers_for_launch = list(_WEDGE_PROVIDERS)
+    if paid_tier:
+        for prov in _WEDGE_PAID_PROVIDERS:
+            if prov and prov not in providers_for_launch:
+                providers_for_launch.append(prov)
+
     if over_free:
         from services.credit_consumption_service import estimate_probe_credits
 
         # Per-SKU pricing: each resolved URL is probed prompts_per_sku times per
-        # provider (Gemini-only for the wedge); custom prompts add ONE probe
-        # each per provider (brand-level, not per product). Price against the
-        # SAME probe count the worker will actually run so billing matches cost.
+        # provider; custom prompts add ONE probe each per provider (brand-level,
+        # not per product). Price against the SAME provider set + probe count the
+        # worker will actually run so billing matches cost.
         per_provider_probes = (
             len(audit_products) * max(1, _WEDGE_PROMPTS_PER_SKU)
             + len(custom_prompts_clean)
         )
-        wedge_probe_count = per_provider_probes * max(1, len(_WEDGE_PROVIDERS))
+        wedge_probe_count = per_provider_probes * max(1, len(providers_for_launch))
         metered_credits, metered_cogs = estimate_probe_credits(
             [(prov, per_provider_probes, True)
-             for prov in (_WEDGE_PROVIDERS or ["gemini"])]
+             for prov in (providers_for_launch or ["gemini"])]
         )
-        balance = await get_balance(merchant_id)
         available = int(balance.get("credits") or 0)
-        paid_tier = str(balance.get("plan_tier") or "free").lower() != "free"
         if metered_credits > available and not paid_tier:
             raise HTTPException(
                 status_code=status.HTTP_402_PAYMENT_REQUIRED,
@@ -1531,7 +1549,7 @@ async def run_merchant_url_audit(
             "launch": {
                 "audit_mode": "per_sku",
                 "coverage_profile": _WEDGE_COVERAGE_PROFILE,
-                "providers": list(_WEDGE_PROVIDERS),
+                "providers": providers_for_launch,
                 "verify_providers": list(_WEDGE_VERIFY_PROVIDERS),
                 "prompts_per_sku": _WEDGE_PROMPTS_PER_SKU,
                 "custom_prompts": custom_prompts_clean,
