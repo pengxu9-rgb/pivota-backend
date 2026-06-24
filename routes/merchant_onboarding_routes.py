@@ -954,8 +954,9 @@ async def get_onboarding_details(
     stores = []
     try:
         stores_query = """SELECT store_id, platform, name, domain, status, connected_at, product_count
-                          FROM merchant_stores 
+                          FROM merchant_stores
                           WHERE merchant_id = :merchant_id
+                            AND lower(COALESCE(status, 'active')) NOT IN ('disconnected', 'deleted', 'inactive')
                           ORDER BY connected_at DESC"""
         stores_rows = await database.fetch_all(stores_query, {"merchant_id": merchant_id})
         stores = [dict(row) for row in stores_rows]
