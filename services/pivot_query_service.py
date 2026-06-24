@@ -1039,6 +1039,17 @@ async def _fetch_citable_canonical_rows(
                 CASE WHEN LOWER(COALESCE(COALESCE(apv.title, p.title), '')) = :query_exact THEN 100 ELSE 0 END +
                 CASE WHEN LOWER(COALESCE(m.merchant_name, '')) = :query_exact THEN 90 ELSE 0 END +
                 CASE WHEN LOWER(COALESCE(COALESCE(apv.brand, p.brand), '')) = :query_exact THEN 80 ELSE 0 END +
+                -- Partial (substring) match credit. The WHERE already requires a
+                -- LIKE match on one of these columns, so without this every
+                -- non-exact citable row scored ~0 -> _canonical_match_reason
+                -- floored candidate_score at 0.12 -> _sort_items buried it beneath
+                -- every external_referral row, even for a branded query the title
+                -- plainly contains. Ranked below the exact bonuses so exact still
+                -- wins (an exact match also matches LIKE and keeps both).
+                CASE WHEN LOWER(COALESCE(COALESCE(apv.title, p.title), '')) LIKE :query_like THEN 90 ELSE 0 END +
+                CASE WHEN LOWER(COALESCE(COALESCE(apv.brand, p.brand), '')) LIKE :query_like THEN 70 ELSE 0 END +
+                CASE WHEN LOWER(COALESCE(m.merchant_name, '')) LIKE :query_like THEN 50 ELSE 0 END +
+                CASE WHEN LOWER(COALESCE(p.source_product_id, '')) LIKE :query_like THEN 40 ELSE 0 END +
                 CASE WHEN p.pdp_scope = 'multi_merchant_canonical' THEN 200 ELSE 0 END +
                 CASE WHEN p.pdp_lifecycle_stage = 'published' THEN 60 ELSE 0 END +
                 CASE WHEN p.pdp_lifecycle_stage = 'validated' THEN 20 ELSE 0 END
