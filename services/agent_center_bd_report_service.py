@@ -1922,6 +1922,12 @@ def build_synthetic_sku_context(
     vendor = (str(item.get("vendor") or "").strip() or None)
     product_type = (str(item.get("product_type") or "").strip() or None)
     pdp_url = str(item.get("pdp_url") or "").strip() or None
+    # canonical_url = the FIRST-PARTY surface ("is your own URL cited?"). For a
+    # retail-channel URL (the merchant pasted a retailer page like oliveyoung),
+    # the route sets this to the brand's OWN site so first-party citation is
+    # measured against the brand — not the retailer (which would mislabel
+    # distribution as first-party endorsement). pdp_url stays the pasted page.
+    canonical_url = (str(item.get("canonical_url") or "").strip() or pdp_url)
     product = {
         "product_key": item.get("product_key"),
         "title": title,
@@ -1929,10 +1935,7 @@ def build_synthetic_sku_context(
         "brand": vendor,
         "product_type": product_type,
         "category": product_type,
-        # Probe anchor + next_best_action host both read canonical_url first,
-        # falling back to pdp_url — set both to the merchant's own URL so the
-        # "is your URL cited?" match has a target.
-        "canonical_url": pdp_url,
+        "canonical_url": canonical_url,
         "pdp_url": pdp_url,
     }
     attrs = item.get("attributes_raw")
