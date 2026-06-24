@@ -93,3 +93,34 @@ def test_non_null_guard_path_for_synthetic():
     product = svc._get_product(ctx)
     guard_triggered = bool(ctx.get("missing_inputs")) and not product.get("product_key")
     assert guard_triggered is False
+
+
+def test_synthetic_enrichment_from_page():
+    """Lever 2: the synthetic ctx is enriched from the fetched page —
+    product.description + product_enrichment (summary_short/bullet_points/
+    topic_tags) that the base query specs + content scoring read."""
+    svc = _fresh()
+    item = {
+        "sku_key": "urlwedge:e", "product_key": "urlwedge:e",
+        "title": "Glow Serum", "pdp_url": "https://x.com/p",
+        "attributes_raw": {
+            "description": "A vitamin C serum for glowing skin. Fragrance-free and vegan.",
+            "body_html": "<ul><li>Vitamin C 10%</li><li>Fragrance-free</li></ul>",
+            "tags": ["serum", "vitamin-c", "vegan"],
+        },
+    }
+    ctx = svc.build_synthetic_sku_context(item, MID)
+    assert ctx["product"]["description"].startswith("A vitamin C serum")
+    enr = ctx["product_enrichment"]
+    assert enr["topic_tags"] == ["serum", "vitamin-c", "vegan"]
+    assert "Vitamin C 10%" in enr["bullet_points"]
+    assert "Fragrance-free" in enr["bullet_points"]
+    assert enr["summary_short"].startswith("A vitamin C serum")
+
+
+def test_synthetic_enrichment_empty_when_no_attrs():
+    svc = _fresh()
+    ctx = svc.build_synthetic_sku_context(
+        {"sku_key": "urlwedge:f", "product_key": "urlwedge:f", "title": "X",
+         "pdp_url": "https://x.com/p"}, MID)
+    assert "product_enrichment" not in ctx  # nothing to enrich -> omitted

@@ -217,7 +217,8 @@ def test_post_returns_running_with_run_id(client):
     assert all(k.startswith("urlwedge:") for k in enq["product_keys"])
     launch = enq["request_options_jsonb"]["launch"]
     assert launch["audit_mode"] == "per_sku"
-    assert launch["providers"] == mar._WEDGE_PROVIDERS
+    # Stub merchant is growth (paid) -> gets the paid provider set (gemini + chatgpt).
+    assert launch["providers"] == mar._WEDGE_PROVIDERS + mar._WEDGE_PAID_PROVIDERS
     assert [s["pdp_url"] for s in launch["synthetic_products"]] == _BODY["product_urls"]
     # No custom prompts by default.
     assert launch["custom_prompts"] == []
@@ -646,3 +647,15 @@ def test_depth_config_in_launch(client):
     assert launch["prompts_per_sku"] >= 14
     assert launch["verify_providers"] == mar._WEDGE_VERIFY_PROVIDERS
     assert launch["verify_providers"]  # non-empty (verify enabled)
+
+
+def test_free_tier_stays_gemini_only(client):
+    # A FREE-tier merchant doesn't get the paid (ChatGPT) provider — the wedge
+    # stays Gemini-only to bound the absorbed cost.
+    client.state["used"] = 0
+    client.state["balance"] = {"credits": 0, "plan_tier": "free"}
+    res = client.post(_URL, json=_BODY)
+    assert res.status_code == 200, res.text
+    launch = client.enqueued[-1]["request_options_jsonb"]["launch"]
+    assert launch["providers"] == mar._WEDGE_PROVIDERS
+    assert "chatgpt" not in launch["providers"]

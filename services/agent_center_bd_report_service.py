@@ -1864,6 +1864,42 @@ def reset_sku_context_cache() -> None:
     _SKU_CONTEXT_CACHE.clear()
 
 
+def _synthetic_enrichment_from_attrs(
+    attrs: Any,
+) -> Tuple[Dict[str, Any], Optional[str]]:
+    """Derive a lightweight product_enrichment + a plain description from the
+    fetched PDP's attributes_raw (Shopify body_html/description/tags, or JSON-LD
+    description). Deterministic, no LLM — keeps wedge latency low. Returns
+    (enrichment, description). These feed the per-SKU base query specs
+    (topic_tags/bullet_points) and content-richness scoring (summary_short/
+    bullet_points), which were empty for synthetic products before."""
+    if not isinstance(attrs, dict):
+        return {}, None
+    desc = str(attrs.get("description") or "").strip()
+    body_html = str(attrs.get("body_html") or "")
+    bullets: List[str] = []
+    if body_html:
+        for raw in re.findall(r"<li[^>]*>(.*?)</li>", body_html, flags=re.I | re.S):
+            text = re.sub(r"<[^>]+>", " ", raw)
+            text = re.sub(r"\s+", " ", text).strip()
+            if len(text) > 3:
+                bullets.append(text)
+    if not bullets and desc:
+        for sentence in re.split(r"(?<=[.!?])\s+", desc):
+            s = sentence.strip()
+            if len(s) > 20:
+                bullets.append(s)
+    tags = [str(t).strip() for t in (attrs.get("tags") or []) if str(t).strip()]
+    enrichment: Dict[str, Any] = {}
+    if desc:
+        enrichment["summary_short"] = desc[:280]
+    if bullets:
+        enrichment["bullet_points"] = bullets[:6]
+    if tags:
+        enrichment["topic_tags"] = tags[:8]
+    return enrichment, (desc or None)
+
+
 def build_synthetic_sku_context(
     item: Dict[str, Any], merchant_id: str,
 ) -> Dict[str, Any]:
@@ -1899,9 +1935,18 @@ def build_synthetic_sku_context(
         "canonical_url": pdp_url,
         "pdp_url": pdp_url,
     }
-    if item.get("attributes_raw") is not None:
-        product["attributes_raw"] = item.get("attributes_raw")
-    return {
+    attrs = item.get("attributes_raw")
+    if attrs is not None:
+        product["attributes_raw"] = attrs
+    # Deepen the synthetic ctx from the fetched page: a plain description (feeds
+    # content-richness raw-PDP fraction) + a product_enrichment block
+    # (topic_tags/bullet_points/summary_short) the base query specs + content
+    # scoring read. Without these the wedge's niche lanes + content signal were
+    # thin even though the page content was sitting in attributes_raw.
+    enrichment, description = _synthetic_enrichment_from_attrs(attrs)
+    if description:
+        product["description"] = description
+    ctx: Dict[str, Any] = {
         "sku_key": item.get("sku_key"),
         "merchant_id": merchant_id,
         "sku_title": title,
@@ -1912,6 +1957,9 @@ def build_synthetic_sku_context(
         "missing_inputs": ["catalog_skus"],
         "synthetic_url_audit": True,
     }
+    if enrichment:
+        ctx["product_enrichment"] = enrichment
+    return ctx
 
 
 def register_synthetic_sku_contexts(
