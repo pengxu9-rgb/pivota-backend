@@ -112,3 +112,64 @@ def test_canonical_search_selects_lifecycle_stage_for_observability():
         "candidate_skus CTE must include p.pdp_lifecycle_stage and the outer "
         "SELECT must pass it through"
     )
+
+
+# ---------------------------------------------------------------------------
+# RECALL_RELEVANCE_V2 — separate text-relevance from structural boosts
+# (docs/recall-relevance-saturation-fix.md)
+# ---------------------------------------------------------------------------
+
+
+def test_canonical_search_emits_text_and_structure_split():
+    """The candidate CTE must emit text_score (relevance only) and
+    structure_score (scope/lifecycle/category) as separate columns, and the
+    outer SELECT must pass both through — without changing rank_score."""
+    src = _src(pivot_query_service._fetch_canonical_search_rows)
+    assert "AS text_score" in src and "AS structure_score" in src, (
+        "v2 split columns must exist in the candidate CTE"
+    )
+    assert "c.text_score AS text_score" in src and "c.structure_score AS structure_score" in src, (
+        "outer SELECT must pass through text_score + structure_score"
+    )
+    # text_score must carry partial-match (LIKE) credit, else a non-exact match
+    # scores ~0 and v2 can't discriminate (the whole point of the fix).
+    assert "LOWER(COALESCE(p.title, '')) LIKE :query_like THEN 90" in src
+    # structure_score carries the scope boost; rank_score (unchanged) still has it too.
+    assert "AS rank_score" in src
+
+
+def test_canonical_match_reason_v2_ranks_on_text_not_structure(monkeypatch):
+    """With v2 ON, candidate_score derives from text_score (so the +200
+    structural boost can't saturate it); with v2 OFF it derives from rank_score
+    exactly as before. structure_score is always surfaced for the tie-break."""
+    # A junk same-category row: low text, high structure (the +200 case).
+    junk = {"rank_score": 290, "text_score": 0, "structure_score": 290,
+            "product_title": "Kids Hair Clips", "brand": "X", "merchant_name": "X"}
+    # A precise match: high text, no structural boost.
+    precise = {"rank_score": 90, "text_score": 90, "structure_score": 0,
+               "product_title": "Anuko Hair Butter", "brand": "Anuko", "merchant_name": "Anuko"}
+
+    monkeypatch.delenv("RECALL_RELEVANCE_V2", raising=False)
+    junk_off = pivot_query_service._canonical_match_reason(junk, "anuko hair butter")
+    precise_off = pivot_query_service._canonical_match_reason(precise, "anuko hair butter")
+    # OFF: junk's rank_score (290 -> capped 1.4) beats precise (0.90) — the bug.
+    assert junk_off["candidate_score"] > precise_off["candidate_score"]
+
+    monkeypatch.setenv("RECALL_RELEVANCE_V2", "1")
+    junk_on = pivot_query_service._canonical_match_reason(junk, "anuko hair butter")
+    precise_on = pivot_query_service._canonical_match_reason(precise, "anuko hair butter")
+    # ON: ranked by text_score — precise (0.90) now beats junk (text 0 -> 0.12 floor).
+    assert precise_on["candidate_score"] > junk_on["candidate_score"]
+    assert junk_on["candidate_score"] == 0.12
+    # structure_score is surfaced for the secondary tie-break.
+    assert junk_on["structure_score"] == 290.0 and precise_on["structure_score"] == 0.0
+
+
+def test_canonical_match_reason_v2_falls_back_to_rank_score_when_no_split(monkeypatch):
+    """The citable lane emits no text_score (it has no structural boost), so v2
+    must fall back to rank_score for candidate_score rather than flooring to 0.12."""
+    monkeypatch.setenv("RECALL_RELEVANCE_V2", "1")
+    citable_row = {"rank_score": 90, "product_title": "Anuko Hair Butter"}  # no text_score key
+    reason = pivot_query_service._canonical_match_reason(citable_row, "anuko hair butter")
+    assert reason["candidate_score"] == 0.9
+    assert reason["structure_score"] == 0.0
