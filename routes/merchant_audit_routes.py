@@ -1202,6 +1202,11 @@ def _shape_url_audit_response(row: Dict[str, Any]) -> Dict[str, Any]:
         "where_youre_losing": (
             (report.get("merchant_narrative") or {}).get("where_youre_losing") or {}
         ),
+        # The full merchant-grade narrative the pipeline already computes:
+        # headline story, what's working, where you're losing, prioritized
+        # actions, and the answer-quality (verify) summary. This is the insight
+        # layer that turns the per-product scores into a decision.
+        "merchant_narrative": report.get("merchant_narrative") or None,
         "brand_report": report,
         "catalog_dimensions_available": False,
     }
