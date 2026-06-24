@@ -390,6 +390,26 @@ async def ensure_required_schema_light() -> None:
                     """
                 )
             )
+            # Migration 164: store-less brand model — operating_mode discriminator.
+            # store_url NOT NULL was relaxed and operating_mode added in the same
+            # migration but the migration runner is skipped in prod.  Self-heal both
+            # here so the column is present before any SELECT on merchant_onboarding.
+            await database.execute(
+                text(
+                    """
+                    ALTER TABLE IF EXISTS merchant_onboarding
+                      ALTER COLUMN store_url DROP NOT NULL;
+                    """
+                )
+            )
+            await database.execute(
+                text(
+                    """
+                    ALTER TABLE IF EXISTS merchant_onboarding
+                      ADD COLUMN IF NOT EXISTS operating_mode VARCHAR(32) NOT NULL DEFAULT 'storefront';
+                    """
+                )
+            )
             # P0-3: DB-enforced audit idempotency (migration 144).
             # Partial UNIQUE index scoped to active stages closes the
             # check-then-insert race in POST /api/audits. The enqueue

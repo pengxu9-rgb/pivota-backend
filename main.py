@@ -278,6 +278,7 @@ from routes.routing_governance import router as routing_governance_router
 from routes.admin_run_migration_011 import router as admin_run_migration_011_router
 from routes.admin_creators import router as admin_creators_router
 from routes.admin_run_migration_152 import router as admin_run_migration_152_router
+from routes.admin_run_migration_164 import router as admin_run_migration_164_router
 from routes.admin_run_migration_165 import router as admin_run_migration_165_router
 from routes.admin_seed_routing_logs import router as admin_seed_routing_logs_router
 from routes.admin_cleanup_routing_test_data import router as admin_cleanup_routing_router
@@ -912,6 +913,7 @@ app.include_router(routing_governance_router)  # Routing policy management
 app.include_router(admin_run_migration_011_router)  # Run migration 011 - Phase 4++ Dual Routing
 app.include_router(admin_creators_router)  # Phase 3 — creator directory intake
 app.include_router(admin_run_migration_152_router)  # Run migration 152 - agent_pdp_view evidence columns
+app.include_router(admin_run_migration_164_router)  # Run migration 164 - merchant_onboarding.operating_mode (store-less brand)
 app.include_router(admin_run_migration_165_router)  # Run migration 165 - index_pipeline_state.index_eligible (ADR-007 SLICE 1)
 app.include_router(admin_seed_routing_logs_router)  # Seed test routing logs
 app.include_router(admin_cleanup_routing_router)  # Cleanup routing test data
