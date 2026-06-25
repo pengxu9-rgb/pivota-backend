@@ -4705,6 +4705,109 @@ def _citation_by_intent(per_prompt: Any) -> Dict[str, Dict[str, Any]]:
     return buckets
 
 
+def build_channel_appearance(
+    *,
+    per_prompt: Optional[List[Dict[str, Any]]],
+    merchant_host: Optional[str],
+    retail_channel_host: Optional[str] = None,
+) -> Dict[str, Any]:
+    """Per-product channel-by-channel appearance: across the probed queries, WHERE
+    the brand's product shows up in AI answers — the brand's own site vs each
+    retailer / marketplace / publisher AI cites instead. The SUBJECT is the
+    product; cited third-party hosts are CHANNELS (distribution), not the
+    product's identity. Reuses each per_prompt row's cited-host evidence
+    (`source_summary.top_cited_hosts` + `merchant_cited_runs`) — no new probes.
+
+    Returns {total_queries, own_site_host, own_site_cited(_count), channels[]}
+    where each channel is {host, type, type_label, is_own_site, is_your_listing,
+    cited_query_count, total_queries, times_cited, intents_cited}, sorted own-site
+    first then by how many queries cited it. The own-site row is ALWAYS present
+    (even at 0/N) so the merchant sees "your site: cited 0 of N" up front.
+    """
+    rows = [r for r in (per_prompt or []) if isinstance(r, dict)]
+    total = len(rows)
+    own = normalize_host(merchant_host) if merchant_host else None
+    retail = normalize_host(retail_channel_host) if retail_channel_host else None
+    own_cited = 0          # queries where the brand's OWN domain is a cited source
+    brand_mentioned = 0    # queries where AI named the brand (possibly via a channel)
+    agg: Dict[str, Dict[str, Any]] = {}
+    for r in rows:
+        ss = r.get("source_summary") if isinstance(r.get("source_summary"), dict) else {}
+        if int(ss.get("merchant_cited_runs") or 0) > 0:
+            brand_mentioned += 1
+        q = r.get("normalized_query") or r.get("query")
+        intent = _intent_axis_for(q, r.get("axis"))
+        # Honest own-site signal: did the brand's OWN domain appear among the
+        # actual cited source hosts for this query? (NOT merchant_cited_runs,
+        # which is the softer "brand was named somewhere" signal — a retailer
+        # page citing the brand is distribution, not the brand's own page.)
+        own_cited_here = False
+        for h in (ss.get("top_cited_hosts") or []):
+            raw = h.get("host") if isinstance(h, dict) else h
+            host = normalize_host(raw)
+            if not host:
+                continue
+            cls = classify_host(host)
+            if cls.get("type") == "cdn":
+                continue  # asset CDNs aren't a buying channel
+            if own and host == own:
+                own_cited_here = True
+                continue  # the brand's own site is its own channel row
+            bucket = agg.setdefault(host, {
+                "host": host,
+                "type": cls.get("type") or "unclassified",
+                "type_label": _cited_host_type_label(cls.get("type")),
+                "cited_queries": set(),
+                "times_cited": 0,
+                "intents": set(),
+            })
+            bucket["cited_queries"].add(q)
+            bucket["times_cited"] += int(
+                (h.get("times_cited") if isinstance(h, dict) else 1) or 1
+            )
+            if intent:
+                bucket["intents"].add(intent)
+        if own_cited_here:
+            own_cited += 1
+    channels: List[Dict[str, Any]] = []
+    if own:
+        channels.append({
+            "host": own,
+            "type": "own_site",
+            "type_label": "Your site",
+            "is_own_site": True,
+            "is_your_listing": False,
+            "cited_query_count": own_cited,
+            "total_queries": total,
+        })
+    for host, bucket in agg.items():
+        channels.append({
+            "host": host,
+            "type": bucket["type"],
+            "type_label": bucket["type_label"],
+            "is_own_site": False,
+            "is_your_listing": bool(retail and host == retail),
+            "cited_query_count": len(bucket["cited_queries"]),
+            "total_queries": total,
+            "times_cited": bucket["times_cited"],
+            "intents_cited": sorted(i for i in bucket["intents"] if i),
+        })
+    channels.sort(
+        key=lambda c: (not c["is_own_site"], -c["cited_query_count"], c["host"])
+    )
+    return {
+        "total_queries": total,
+        "own_site_host": own,
+        # Your OWN domain cited as a source (the honest "are you the answer?").
+        "own_site_cited": own_cited > 0,
+        "own_site_cited_count": own_cited,
+        # Softer signal: AI named your brand somewhere (often via a channel),
+        # even when it didn't cite your own page — kept distinct on purpose.
+        "brand_mentioned_count": brand_mentioned,
+        "channels": channels,
+    }
+
+
 def _brand_citation_by_intent(per_sku_reports: Any) -> Dict[str, Dict[str, Any]]:
     """Brand-level roll-up of per-SKU `citation_by_intent` (sums cited/total per
     intent across SKUs; reads the per-SKU dicts, no new probes)."""
@@ -5722,6 +5825,15 @@ async def build_per_sku_report(
         # nav). Snapshot of WHERE this SKU is cited by question type. Additive.
         "citation_by_intent": _citation_by_intent(
             opportunity.get("per_prompt") if isinstance(opportunity, dict) else None
+        ),
+        # Channel-by-channel appearance: across this product's probed queries,
+        # where it shows up in AI answers — the brand's own site vs each retailer
+        # AI cites instead. Leads the merchant with brand-product status +
+        # channels-as-context (not "the retailer is you"). Reuses per_prompt.
+        "channel_appearance": build_channel_appearance(
+            per_prompt=opportunity.get("per_prompt") if isinstance(opportunity, dict) else None,
+            merchant_host=normalize_host(product.get("canonical_url") or product.get("pdp_url")),
+            retail_channel_host=product.get("retail_channel_host"),
         ),
         "failing_prompts": failing_prompts,
         # Issue #902 item 1: Google indexing-arc for this SKU's Pivota canonical
