@@ -108,6 +108,20 @@ _ANSWER_QUALITY_VERIFY_PROVIDER = "deepseek"
 # verify call must not drag out (or appear to hang) the audit.
 _VERIFY_PROBE_TIMEOUT_S = 12.0
 _PER_SKU_AUDIT_PROBE_SCAN_MODE = "open_product_visibility_test"
+# Per-SKU probes route the scan mode by query INTENT so each query is measured
+# HONESTLY. A single product-centric mode over-reports discovery: a "best X"
+# query run under open_product_visibility_test (which names the product in
+# context) just retrieves the named product's own listing and reads as a
+# category "win" — that's FINDABILITY, not "the brand wins the open category".
+#   - BRANDED (navigational/trust) -> open_product_visibility_test
+#       FINDABILITY: is the NAMED product / own page retrievable when asked for.
+#   - DISCOVERY (category_head/problem_jtbd/constraint) + merchant custom
+#       prompts -> category_visibility_test
+#       ORGANIC: the query does NOT name the brand and the product is NOT the
+#       supplied answer target; the node scores a GROUNDED brand-hit (does the
+#       brand surface on its own merit), so "win" == appears organically.
+_PER_SKU_BRANDED_SCAN_MODE = _PER_SKU_AUDIT_PROBE_SCAN_MODE
+_PER_SKU_DISCOVERY_SCAN_MODE = "category_visibility_test"
 # PIVOTA-Agent caps one probe request at 8 runs. We deliberately chunk smaller
 # than that cap: each chunk is one grounded LLM call, and an 8-grounded-query
 # call runs right at the agent_center_llm_probe_timeout_s (30s) edge — so fat
@@ -4907,14 +4921,20 @@ def build_product_competitiveness(per_prompt: Optional[List[Dict[str, Any]]]) ->
     comp_counts: Dict[str, Dict[str, Any]] = {}
     for r in rows:
         intent = _intent_axis_for(r.get("normalized_query") or r.get("query"), r.get("axis"))
-        # APPEARANCE = the per-model VERDICT (win = the product appears in that
-        # model's grounded answer, often VIA A RETAILER). This is "does the
-        # product show up in AI", and is the SAME signal by_model uses, so the
-        # aggregate and per-model can't contradict. (Whether the brand's OWN
-        # page is the cited source is a separate, channel-level signal — see
-        # channel_appearance.own_site_cited — NOT this.) Grounded = at least one
-        # shopping model graded the query (win/loss); all "absent" = the AI
-        # didn't ground it (inconclusive), not "the product is invisible".
+        # APPEARANCE = the per-model VERDICT. The MEANING depends on the scan
+        # mode the query was probed under (routed by intent — see
+        # _scan_mode_for_query_spec): a DISCOVERY query ran under
+        # category_visibility_test, so win = the brand surfaced ORGANICALLY in
+        # the model's grounded answer to a category question that did NOT name
+        # it (genuine "wins the category"); a BRANDED query ran under
+        # open_product_visibility_test, so win = the NAMED product was
+        # retrievable (findability, often VIA A RETAILER). Either way it's the
+        # SAME signal by_model uses, so aggregate and per-model can't
+        # contradict. (Whether the brand's OWN page is the cited source is a
+        # separate, channel-level signal — see channel_appearance.own_site_cited
+        # — NOT this.) Grounded = at least one shopping model graded the query
+        # (win/loss); all "absent" = the AI didn't ground it (inconclusive), not
+        # "the product is invisible".
         verdicts = r.get("provider_verdicts") if isinstance(r.get("provider_verdicts"), dict) else {}
         graded = [
             m for m in _SHOPPING_MODELS
@@ -7882,6 +7902,33 @@ def _chunk_query_specs(
     return [specs[i:i + size] for i in range(0, len(specs), size)]
 
 
+def _scan_mode_for_query_spec(query: str, axis: str) -> str:
+    """Pick the scan mode that HONESTLY measures a (query, axis) spec.
+
+    Branded/navigational/trust queries name the product, so findability
+    (open_product_visibility_test) is the right test. Everything else —
+    discovery category/problem/constraint queries and merchant custom prompts —
+    must surface the brand on its own merit, so they run under organic category
+    visibility (category_visibility_test). See _PER_SKU_BRANDED_SCAN_MODE."""
+    if _intent_axis_for(query, axis) in _BRANDED_INTENTS:
+        return _PER_SKU_BRANDED_SCAN_MODE
+    return _PER_SKU_DISCOVERY_SCAN_MODE
+
+
+def _partition_query_specs_by_scan_mode(
+    specs: List[Tuple[str, str]],
+) -> List[Tuple[str, List[Tuple[str, str]]]]:
+    """Group query specs by scan mode (insertion-ordered) so each group is
+    probed under the mode that measures it correctly. The fanout makes one
+    upstream call per (provider, mode, chunk). Returns [(scan_mode, specs)...]."""
+    groups: Dict[str, List[Tuple[str, str]]] = {}
+    for query, axis in specs:
+        groups.setdefault(
+            _scan_mode_for_query_spec(query, axis), []
+        ).append((query, axis))
+    return list(groups.items())
+
+
 def _per_sku_probe_context(
     sku_ctx: Dict[str, Any],
     query_specs: List[Tuple[str, str]],
@@ -8022,12 +8069,13 @@ def _failed_per_sku_probe_payload(
     probe_run_id: str,
     error: str,
     model_info: Mapping[str, Any],
+    scan_mode: str = _PER_SKU_AUDIT_PROBE_SCAN_MODE,
 ) -> Dict[str, Any]:
     product = _get_product(sku_ctx or {})
     return {
         "probe_run_id": probe_run_id,
         "scan_mode": "per_sku_audit",
-        "upstream_scan_mode": _PER_SKU_AUDIT_PROBE_SCAN_MODE,
+        "upstream_scan_mode": scan_mode,
         "provider": provider,
         "requested_provider": provider,
         "sku_key": sku_key,
@@ -8089,59 +8137,80 @@ async def _probe_per_sku_ctx(
             sku_key, target_prompts, len(query_specs), len(provider_ids),
         )
     out: List[Dict[str, Any]] = []
+    # Branded queries probe FINDABILITY; discovery/custom queries probe ORGANIC
+    # category visibility — each under its own scan mode (one upstream call per
+    # provider/mode/chunk). The probe context is identical for both modes (the
+    # node uses product.title only for branded findability and the brand/vendor
+    # for organic detection), so no per-mode context shaping is needed.
+    mode_groups = _partition_query_specs_by_scan_mode(query_specs)
     for provider_id in provider_ids:
         model_info = provider_model_metadata.get(provider_id) or {}
         consecutive_failures = 0
-        for chunk_idx, chunk in enumerate(_chunk_query_specs(query_specs), start=1):
-            probe_run_id = (
-                f"{audit_run_id or 'adhoc'}:{sku_key}:"
-                f"{provider_id}:per_sku:{chunk_idx}"
+        for scan_mode, mode_specs in mode_groups:
+            mode_tag = (
+                "branded" if scan_mode == _PER_SKU_BRANDED_SCAN_MODE else "discovery"
             )
-            try:
-                result = await llm_client.probe(
-                    scan_mode=_PER_SKU_AUDIT_PROBE_SCAN_MODE,
-                    scan_target_id=probe_run_id,
-                    merchant_id=str(merchant_id),
-                    store_id=f"{merchant_id}_audit",
-                    context=_per_sku_probe_context(safe_ctx, chunk),
-                    provider=provider_id,
-                    max_runs=len(chunk),
-                    model=model_info.get("model"),
-                    model_is_override=bool(
-                        model_info.get("model_is_override")
-                    ),
+            for chunk_idx, chunk in enumerate(_chunk_query_specs(mode_specs), start=1):
+                probe_run_id = (
+                    f"{audit_run_id or 'adhoc'}:{sku_key}:"
+                    f"{provider_id}:per_sku:{mode_tag}:{chunk_idx}"
                 )
-                out.append(
-                    _normalize_per_sku_probe_payload(
-                        result=result,
-                        requested_provider=provider_id,
-                        sku_key=sku_key,
-                        sku_ctx=safe_ctx,
-                        query_specs=chunk,
-                        probe_run_id=probe_run_id,
-                        model_info=model_info,
-                        query_metadata=query_metadata,
-                    )
-                )
-                consecutive_failures = 0
-            except Exception as exc:  # noqa: BLE001 - isolate provider/chunk
-                out.append(
-                    _failed_per_sku_probe_payload(
+                try:
+                    result = await llm_client.probe(
+                        scan_mode=scan_mode,
+                        scan_target_id=probe_run_id,
+                        merchant_id=str(merchant_id),
+                        store_id=f"{merchant_id}_audit",
+                        context=_per_sku_probe_context(safe_ctx, chunk),
                         provider=provider_id,
-                        sku_key=sku_key,
-                        sku_ctx=safe_ctx,
-                        probe_run_id=probe_run_id,
-                        error=str(exc),
-                        model_info=model_info,
+                        max_runs=len(chunk),
+                        model=model_info.get("model"),
+                        model_is_override=bool(
+                            model_info.get("model_is_override")
+                        ),
                     )
-                )
-                consecutive_failures += 1
-                # Don't let one transient chunk timeout zero the SKU: keep
-                # probing later chunks. Only bail this (sku, provider) once
-                # failures are CONSECUTIVE (provider likely down), so we
-                # don't burn the full timeout on every remaining chunk.
-                if consecutive_failures >= _PER_SKU_AUDIT_MAX_CONSECUTIVE_CHUNK_FAILURES:
-                    break
+                    out.append(
+                        _normalize_per_sku_probe_payload(
+                            result=result,
+                            requested_provider=provider_id,
+                            sku_key=sku_key,
+                            sku_ctx=safe_ctx,
+                            query_specs=chunk,
+                            probe_run_id=probe_run_id,
+                            model_info=model_info,
+                            query_metadata=query_metadata,
+                        )
+                    )
+                    consecutive_failures = 0
+                except Exception as exc:  # noqa: BLE001 - isolate provider/chunk
+                    out.append(
+                        _failed_per_sku_probe_payload(
+                            provider=provider_id,
+                            sku_key=sku_key,
+                            sku_ctx=safe_ctx,
+                            probe_run_id=probe_run_id,
+                            error=str(exc),
+                            model_info=model_info,
+                            scan_mode=scan_mode,
+                        )
+                    )
+                    consecutive_failures += 1
+                    # Don't let one transient chunk timeout zero the SKU: keep
+                    # probing later chunks. Only bail this (sku, provider) once
+                    # failures are CONSECUTIVE (provider likely down), so we
+                    # don't burn the full timeout on every remaining chunk.
+                    if (
+                        consecutive_failures
+                        >= _PER_SKU_AUDIT_MAX_CONSECUTIVE_CHUNK_FAILURES
+                    ):
+                        break
+            else:
+                # This mode group finished without a consecutive-failure bail;
+                # continue to the next mode group for this provider.
+                continue
+            # Inner chunk loop bailed (provider likely down) -> stop probing
+            # remaining mode groups for this provider too.
+            break
     return out
 
 
