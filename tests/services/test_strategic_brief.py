@@ -1616,7 +1616,7 @@ async def test_generate_sku_strategic_brief_retries_then_returns_deterministic_f
     assert brief is not None
     assert strategic_brief.validate_grounding(brief, _evidence()) is True
     assert "first-order offer" in " ".join(brief["first_moves"])
-    assert len(calls) == 3
+    assert len(calls) == strategic_brief._STRATEGIC_BRIEF_MAX_ATTEMPTS
 
 
 @pytest.mark.asyncio
@@ -1902,3 +1902,21 @@ def test_invented_competitor_still_rejected():
     failures = strategic_brief._grounding_failures(brief, evidence)
 
     assert any(f.startswith("unknown-entity") for f in failures), failures
+
+
+def test_cited_source_reputation_and_prose_words_are_grounded():
+    # Describing the cited source as "credible/established" (grounded inference
+    # about why it out-cites you) and capitalizing plain prose ("Legitimacy",
+    # "After") must not trip the guards. Regression: these flakily blocked the
+    # LLM brief on 2 of 3 SKUs, forcing the deterministic fallback.
+    evidence = _validation_fix_evidence()
+    brief = _validation_fix_grounded_brief()
+    brief["why_you_lose"] = (
+        "AI cites Amazon because it is a credible, established retailer. "
+        "Legitimacy matters here. After the click, the buyer lands there."
+    )
+
+    failures = strategic_brief._grounding_failures(brief, evidence)
+
+    assert not any(f.startswith("unassessed-competitor-attribute") for f in failures), failures
+    assert not any(f.startswith("unknown-entity") for f in failures), failures
