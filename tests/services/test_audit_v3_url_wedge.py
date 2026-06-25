@@ -691,3 +691,27 @@ def test_own_site_url_keeps_product_page_as_canonical(client):
     syn = client.enqueued[-1]["request_options_jsonb"]["launch"]["synthetic_products"][0]
     assert syn["canonical_url"] == "https://merch.example/products/a"
     assert syn["retail_channel_host"] is None
+
+
+def test_get_succeeded_includes_merchant_context(monkeypatch):
+    # The page needs tier + connection state to stop showing the free-sample /
+    # connect-store funnel to a subscribed, connected merchant.
+    import services.merchant_integration_state as mis
+
+    async def fake_bal(mid):
+        return {"plan_tier": "growth", "credits": 5000}
+
+    async def fake_state(mid):
+        return {"store_platform_integrated": True}
+
+    monkeypatch.setattr(mar, "get_balance", fake_bal)
+    monkeypatch.setattr(mis, "get_integration_state", fake_state)
+    c = _get_client(monkeypatch, {
+        "run_id": "r", "merchant_id": "merch-A", "subject_type": "merchant_url",
+        "status": "succeeded", "report_jsonb": {"per_sku_reports": []},
+        "partial_result_jsonb": {"launch": {}},
+    })
+    mc = c.get(f"{_URL}/r").json()["merchant_context"]
+    assert mc["is_paid"] is True
+    assert mc["plan_tier"] == "growth"
+    assert mc["store_connected"] is True

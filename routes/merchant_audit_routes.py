@@ -1603,6 +1603,31 @@ async def run_merchant_url_audit(
     return {"status": "running", "run_id": run_id, "brand_report": None, **base_payload}
 
 
+async def _merchant_audit_context(merchant_id: str) -> Dict[str, Any]:
+    """Subscription tier + store-connection state, so the results page doesn't
+    push the free-sample / connect-store / buy-credits funnel at a merchant who
+    is already subscribed and connected. Best-effort; defaults are conservative
+    (treat as free + unconnected) so the funnel only HIDES on a confirmed signal."""
+    ctx: Dict[str, Any] = {
+        "plan_tier": "free", "is_paid": False, "store_connected": False,
+    }
+    try:
+        bal = await get_balance(merchant_id)
+        tier = str(bal.get("plan_tier") or "free").lower()
+        ctx["plan_tier"] = tier
+        ctx["is_paid"] = tier != "free"
+        ctx["credits"] = int(bal.get("credits") or 0)
+    except Exception:  # noqa: BLE001 - context is advisory; never block the GET
+        logger.warning("merchant_audit_context: balance lookup failed", exc_info=True)
+    try:
+        from services.merchant_integration_state import get_integration_state
+        st = await get_integration_state(merchant_id) or {}
+        ctx["store_connected"] = bool(st.get("store_platform_integrated"))
+    except Exception:  # noqa: BLE001
+        logger.warning("merchant_audit_context: integration lookup failed", exc_info=True)
+    return ctx
+
+
 @router.get("/url-readiness/{run_id}")
 async def get_merchant_url_audit(
     run_id: str,
@@ -1630,7 +1655,11 @@ async def get_merchant_url_audit(
         # report_jsonb is the per_sku brand_report (per_sku_reports + brand_rollup
         # + authority_map). Reshape it into the URL-audit envelope the client
         # expects (status/run_id/per_sku_reports/methodology/…).
-        return _shape_url_audit_response(row)
+        shaped = _shape_url_audit_response(row)
+        # merchant_context lets the page stop pushing the "free sample / connect
+        # your store / buy credits" funnel at a subscribed, connected merchant.
+        shaped["merchant_context"] = await _merchant_audit_context(merchant_id)
+        return shaped
     if run_status == "failed":
         err = row.get("error_message") or ""
         msg = (
