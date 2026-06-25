@@ -355,6 +355,19 @@ _GENERIC_COMMERCE_ENTITIES = frozenset({
     "rewards", "returns", "return", "shipping", "stock", "availability",
     "testimonial", "testimonials", "quiz", "guide", "guides", "tutorial",
 })
+# Plain prose nouns/adverbs the LLM routinely Capitalizes (mid-sentence or after
+# a colon/bullet) — "Legitimacy", "After", "Trust signals". They are common
+# English, never invented proper nouns, so they must not trip the unknown-entity
+# guard. (Distinctive product-attribute tokens still surface separately.)
+_COMMON_PROSE_NOUNS = frozenset({
+    "after", "before", "during",
+    "legitimacy", "authenticity", "trust", "trustworthiness", "credibility",
+    "purchase", "purchases", "checkout", "secure", "welcome", "satisfaction",
+    "signal", "signals", "concern", "concerns", "result", "results", "proof",
+    "awareness", "consideration", "conversion", "retention", "discovery",
+    "visibility", "exposure", "intent", "traffic", "story", "badge", "badges",
+    "customer", "customers", "shopper", "shoppers", "buyer", "buyers", "social",
+})
 _COMMON_WORDS = frozenset({
     "answer",
     "answers",
@@ -589,6 +602,27 @@ _COMPETITOR_CLAIM_COMMON_WORDS = {
     "reviews",
     "source",
     "sources",
+    # Reputation/standing descriptors. Calling the cited source "credible" or
+    # "established" is the brief's grounded inference about WHY it out-cites the
+    # merchant (it IS the cited/ranking source) — not a fabricated product
+    # feature. Product-feature tokens in the same claim still fail.
+    "credible",
+    "dominant",
+    "established",
+    "known",
+    "large",
+    "leading",
+    "legitimate",
+    "major",
+    "popular",
+    "prominent",
+    "recognized",
+    "reliable",
+    "reputable",
+    "respected",
+    "strong",
+    "trusted",
+    "well",
 }
 _ALLCAPS_FUNCTION_WORDS = _QUOTE_STOPWORDS | {
     "chase",
@@ -635,6 +669,10 @@ _SAFETY_SENSITIVE_TERMS = {
 _SAFETY_TERM_FAMILIES = (
     frozenset({"treat", "treats", "treatment", "treatments"}),
 )
+# Max LLM drafts per SKU before giving up to the deterministic fallback. The
+# grounding validator is strict, so a clean draft is found reliably only with
+# several tries; a passing draft short-circuits, so the common case stays cheap.
+_STRATEGIC_BRIEF_MAX_ATTEMPTS = 6
 
 
 def assemble_sku_brief_evidence(
@@ -768,7 +806,11 @@ async def generate_sku_strategic_brief(
     dbg["max_tokens"] = 1200
     dbg["attempts"] = []
 
-    for _attempt in range(3):
+    # The grounding validator is deliberately strict (a trust product), so a
+    # single LLM draft can trip it stochastically. Retry enough that a clean
+    # draft is reliably found — the LLM lane must work continuously, not fall
+    # back to the generic deterministic template. A clean draft short-circuits.
+    for _attempt in range(_STRATEGIC_BRIEF_MAX_ATTEMPTS):
         att: Dict[str, Any] = {}
         try:
             result = await synthesize(
@@ -2710,6 +2752,7 @@ _COMMON_WORD_SETS = (
     _ENTITY_STOPWORD_NORMALIZED,
     _INTERNAL_ALLOWED_ENTITIES,
     _GENERIC_COMMERCE_ENTITIES,
+    _COMMON_PROSE_NOUNS,
 )
 
 
