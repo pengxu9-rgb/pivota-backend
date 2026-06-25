@@ -7,18 +7,20 @@ from services.agent_center_bd_report_service import build_product_competitivenes
 
 
 def _row(query, axis, merchant_cited_runs=0, competitors=None, grounded=True):
-    # `grounded` = the AI returned real sources for this query. A grounded row
-    # carries a citation run + cited hosts so it counts toward the denominator;
-    # an ungrounded row (no sources) is inconclusive and excluded.
-    ss = {"merchant_cited_runs": merchant_cited_runs}
-    if grounded:
-        ss["runs_with_citations"] = max(1, merchant_cited_runs)
-        ss["top_cited_hosts"] = [{"host": "example.com", "times_cited": 1}]
+    # Appearance is now VERDICT-based (provider_verdicts). Map the legacy params:
+    # grounded + cited -> "win" (product appears), grounded + not cited -> "loss"
+    # (graded but didn't appear), not grounded -> "absent" (inconclusive).
+    if not grounded:
+        verdict = "absent"
+    elif merchant_cited_runs > 0:
+        verdict = "win"
+    else:
+        verdict = "loss"
     return {
         "query": query,
         "normalized_query": query,
         "axis": axis,
-        "source_summary": ss,
+        "provider_verdicts": {"gemini": verdict},
         "competitors": competitors or [],
     }
 

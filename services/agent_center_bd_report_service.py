@@ -4907,15 +4907,21 @@ def build_product_competitiveness(per_prompt: Optional[List[Dict[str, Any]]]) ->
     comp_counts: Dict[str, Dict[str, Any]] = {}
     for r in rows:
         intent = _intent_axis_for(r.get("normalized_query") or r.get("query"), r.get("axis"))
-        ss = r.get("source_summary") if isinstance(r.get("source_summary"), dict) else {}
-        appeared = int(ss.get("merchant_cited_runs") or 0) > 0
-        # Grounded = the AI returned real sources for this query (cited hosts,
-        # a citation run, or named competitors). No grounding => inconclusive.
-        grounded = bool(
-            int(ss.get("runs_with_citations") or 0) > 0
-            or ss.get("top_cited_hosts")
-            or r.get("competitors")
-        )
+        # APPEARANCE = the per-model VERDICT (win = the product appears in that
+        # model's grounded answer, often VIA A RETAILER). This is "does the
+        # product show up in AI", and is the SAME signal by_model uses, so the
+        # aggregate and per-model can't contradict. (Whether the brand's OWN
+        # page is the cited source is a separate, channel-level signal — see
+        # channel_appearance.own_site_cited — NOT this.) Grounded = at least one
+        # shopping model graded the query (win/loss); all "absent" = the AI
+        # didn't ground it (inconclusive), not "the product is invisible".
+        verdicts = r.get("provider_verdicts") if isinstance(r.get("provider_verdicts"), dict) else {}
+        graded = [
+            m for m in _SHOPPING_MODELS
+            if str(verdicts.get(m) or "absent").lower() in ("win", "loss")
+        ]
+        grounded = bool(graded)
+        appeared = any(str(verdicts.get(m) or "").lower() == "win" for m in graded)
         if intent in _DISCOVERY_INTENTS:
             if not grounded:
                 disc_ungrounded += 1
