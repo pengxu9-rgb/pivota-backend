@@ -4808,6 +4808,83 @@ def build_channel_appearance(
     }
 
 
+# Non-branded DISCOVERY intents — where a brand wins NEW demand inside frontier
+# models ("best hair oil", "best hair oil for damaged hair"). vs BRANDED intents
+# (by name / "is X legit") which are low-value: a shopper who types a product
+# name already found it elsewhere, so being cited there isn't the prize.
+_DISCOVERY_INTENTS = frozenset({"category_head", "problem_jtbd", "constraint"})
+_BRANDED_INTENTS = frozenset({"navigational", "trust"})
+
+
+def _competitor_brand_label(name: Any) -> str:
+    """Coarse brand label from a competitor product name ("Cantu, Shea Butter,
+    Coconut Curling Cream" / "Cantu Shea Butter for…" -> "Cantu"; "&honey Moist
+    Shampoo" -> "&honey") so the three Cantu SKUs AI names group into one."""
+    s = str(name or "").strip().split(",")[0].strip()
+    words = s.split()
+    return words[0] if words else ""
+
+
+def build_product_competitiveness(per_prompt: Optional[List[Dict[str, Any]]]) -> Dict[str, Any]:
+    """Product-FIRST view: does the product WIN non-branded discovery demand
+    inside frontier models — where the brand gains NEW buyers — and who does AI
+    recommend instead? Branded name queries are reported separately as low-value.
+    Reuses per_prompt cited evidence + competitors; no new probes.
+
+    Returns {has_discovery, discovery:{appeared,total,rate,missed[],
+    top_competitors[]}, branded:{appeared,total,rate}}.
+    """
+    rows = [r for r in (per_prompt or []) if isinstance(r, dict)]
+    disc_total = disc_appeared = 0
+    br_total = br_appeared = 0
+    missed: List[str] = []
+    comp_counts: Dict[str, Dict[str, Any]] = {}
+    for r in rows:
+        intent = _intent_axis_for(r.get("normalized_query") or r.get("query"), r.get("axis"))
+        ss = r.get("source_summary") if isinstance(r.get("source_summary"), dict) else {}
+        appeared = int(ss.get("merchant_cited_runs") or 0) > 0
+        if intent in _DISCOVERY_INTENTS:
+            disc_total += 1
+            if appeared:
+                disc_appeared += 1
+            else:
+                q = str(r.get("query") or "").strip()
+                if q:
+                    missed.append(q)
+            for comp in (r.get("competitors") or []):
+                label = _competitor_brand_label(comp)
+                if not label:
+                    continue
+                slot = comp_counts.setdefault(label.lower(), {"name": label, "queries": set()})
+                slot["queries"].add(r.get("normalized_query") or r.get("query"))
+        elif intent in _BRANDED_INTENTS:
+            br_total += 1
+            if appeared:
+                br_appeared += 1
+    top_competitors = sorted(
+        (
+            {"name": v["name"], "query_count": len(v["queries"])}
+            for v in comp_counts.values()
+        ),
+        key=lambda c: -c["query_count"],
+    )[:6]
+    return {
+        "has_discovery": disc_total > 0,
+        "discovery": {
+            "appeared": disc_appeared,
+            "total": disc_total,
+            "rate": round(disc_appeared / disc_total, 3) if disc_total else None,
+            "missed": missed[:8],
+            "top_competitors": top_competitors,
+        },
+        "branded": {
+            "appeared": br_appeared,
+            "total": br_total,
+            "rate": round(br_appeared / br_total, 3) if br_total else None,
+        },
+    }
+
+
 def _brand_citation_by_intent(per_sku_reports: Any) -> Dict[str, Dict[str, Any]]:
     """Brand-level roll-up of per-SKU `citation_by_intent` (sums cited/total per
     intent across SKUs; reads the per-SKU dicts, no new probes)."""
@@ -5824,6 +5901,13 @@ async def build_per_sku_report(
         # Step 2 — citation rate by fine intent axis (head/problem/constraint/trust/
         # nav). Snapshot of WHERE this SKU is cited by question type. Additive.
         "citation_by_intent": _citation_by_intent(
+            opportunity.get("per_prompt") if isinstance(opportunity, dict) else None
+        ),
+        # Product-FIRST competitiveness: does the product win NON-BRANDED
+        # discovery demand ("best hair oil for damaged hair") — where the brand
+        # gains new buyers — and who AI recommends instead. Branded name queries
+        # reported separately as low-value. Leads the card (channel is context).
+        "product_competitiveness": build_product_competitiveness(
             opportunity.get("per_prompt") if isinstance(opportunity, dict) else None
         ),
         # Channel-by-channel appearance: across this product's probed queries,
