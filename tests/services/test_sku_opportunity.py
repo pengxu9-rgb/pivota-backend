@@ -352,6 +352,46 @@ def test_substitution_requires_merchant_named_loss_but_is_axis_agnostic():
     assert branded_alternatives["substitution"]["substituted_by"] == "Native"
 
 
+def test_substitution_fires_on_unbranded_category_demand():
+    """Organic-mode signal: a NON-branded category query (the brand's own
+    category, query never names it) that comes back loss/absent with a rival
+    named IS substitution — "AI recommends <competitor> instead of you for your
+    category". Previously suppressed because the gate required the query to name
+    the merchant; discovery probes never do."""
+    from services.sku_opportunity import build_sku_opportunity
+    from services.sku_sidewalk import build_sku_attribute_graph
+
+    ctx = _freshnest_sku_ctx()
+    graph = build_sku_attribute_graph(ctx["product"])
+    competitors = ["Native", "Lume", "Myro"]
+    competitor_sources = [
+        {"uri": "https://nativecos.com/deodorant", "title": "Native deodorant"},
+        {"uri": "https://lumedeodorant.com/products", "title": "Lume deodorant"},
+    ]
+    runs = _runs_both_providers([
+        {
+            # No brand in the query — pure category demand (axis=category).
+            "query": "best natural deodorant",
+            "axis": "category",
+            "parsed": {
+                "product_visible": False,
+                "correct_sku": False,
+                "competitors_listed": competitors,
+                "competitors_appearing": competitors,
+            },
+            "sources": competitor_sources,
+            "raw": "Top natural deodorants include Native, Lume, and Myro.",
+        },
+    ])
+    opportunity = build_sku_opportunity(ctx, runs, attribute_graph=graph)
+    row = _by_query(opportunity)["best natural deodorant"]
+    assert row["substitution"]["present"] is True
+    assert row["substitution"]["kind"] == "category"
+    assert row["substitution"]["substituted_by"] in competitors
+    # And it bubbles up to the SKU-level alert.
+    assert opportunity["substitution_alert"]["present"] is True
+
+
 def test_sku_opportunity_is_deterministic():
     from services.sku_opportunity import build_sku_opportunity
     from services.sku_sidewalk import build_sku_attribute_graph

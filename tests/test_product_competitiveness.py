@@ -155,3 +155,22 @@ def test_per_model_excludes_branded_and_deepseek():
     pc = build_product_competitiveness(per_prompt)
     assert pc["by_model"] == {}          # branded not in per-model discovery
     assert pc["model_divergence"] == []
+
+
+def test_competitor_brand_label_keeps_two_word_brands():
+    """Regression: the old first-word-only rule mangled multi-word brands
+    (Wonder Curl -> Wonder). Keep them whole; still collapse product descriptors."""
+    from services.agent_center_bd_report_service import _competitor_brand_label
+    # Two-word brands stay intact.
+    assert _competitor_brand_label("Wonder Curl") == "Wonder Curl"
+    assert _competitor_brand_label("Camille Rose Curl Maker") == "Camille Rose"
+    assert _competitor_brand_label("Aunt Jackie's Curling Custard") == "Aunt Jackie's"
+    assert _competitor_brand_label("Maui Moisture Shampoo") == "Maui Moisture"
+    # Product/ingredient 2nd word is dropped so a brand's SKUs group into one.
+    assert _competitor_brand_label("Cantu Shea Butter for Natural Hair") == "Cantu"
+    assert _competitor_brand_label("Cantu, Shea Butter, Coconut Curling Cream") == "Cantu"
+    assert _competitor_brand_label("&honey Moist Shampoo") == "&honey"
+    # Single-token names unchanged.
+    assert _competitor_brand_label("SheaMoisture") == "SheaMoisture"
+    assert _competitor_brand_label("d'Alba") == "d'Alba"
+    assert _competitor_brand_label("") == ""
