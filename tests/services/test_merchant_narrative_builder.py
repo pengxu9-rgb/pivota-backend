@@ -464,3 +464,31 @@ def test_win_plan_summary_absent_when_no_plan_no_fabrication():
         win_plan={"available": False, "rollup": {}},
     )
     assert narr2["where_youre_losing"]["win_plan_summary"] is None
+
+
+def test_narrative_cited_via_retailer_is_not_invisible():
+    # Brand cited via RETAILERS on branded queries (no own-site first-party, no
+    # category endorsement) but with real per-SKU citation must NOT read as
+    # "invisible / doesn't surface at all" — that contradicts the citation data.
+    # The real run's condition: findable=False (no recognized own/marketplace
+    # host, e.g. merchant_domain was None) AND not endorsed, BUT the brand IS
+    # cited (per-SKU citation > 0). Test the branch directly with a controlled
+    # summary so it isn't masked by the classifier marking a retailer/editorial
+    # host as findable/endorsed.
+    from services.merchant_narrative_builder import _headline_story, _where_youre_losing
+    summary = {
+        "findability_hosts": [],
+        "independently_recommended_for_category": False,
+        "has_independent_endorsement": False,
+        "cited_via_hosts": True,
+    }
+    hs = _headline_story("Anuko", summary).lower()
+    assert "invisible" not in hs
+    assert "retailer" in hs or "marketplace" in hs
+    where = _where_youre_losing("Anuko", {"skus": [], "hosts": []}, summary)
+    wyl = where["summary"].lower()
+    assert "doesn't surface at all" not in wyl
+    assert "surfaces via" in wyl
+    # Inverse: a brand cited NOWHERE still reads as invisible.
+    not_cited = {**summary, "cited_via_hosts": False}
+    assert "invisible" in _headline_story("Anuko", not_cited).lower()

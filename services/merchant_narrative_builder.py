@@ -189,7 +189,18 @@ def _headline_story(merchant_name: str, summary: Dict[str, Any]) -> str:
     findable = bool(summary.get("findability_hosts"))
     endorsed_category = bool(summary.get("independently_recommended_for_category"))
     endorsed = bool(summary.get("has_independent_endorsement"))
+    cited_via_hosts = bool(summary.get("cited_via_hosts"))
     if not findable and not endorsed:
+        if cited_via_hosts:
+            # Cited via retailers/marketplaces on branded searches, but no
+            # recognized own-site and no category endorsement. NOT invisible —
+            # the citation data shows reach; the gap is own-site + category.
+            return (
+                f"AI does cite {name} — but via retailers and marketplaces on "
+                "branded searches, not through your own site, and not yet for the "
+                "category questions new shoppers ask. That's distribution, not "
+                "endorsement."
+            )
         return (
             f"{name} is invisible to AI shopping agents today — neither your own "
             "listings nor any independent source surface when shoppers ask."
@@ -411,8 +422,17 @@ def _where_youre_losing(
             f"recommends {merchant_name or 'the brand'} — only your own/retail "
             "listings appear, which is distribution, not endorsement."
         )
+    elif summary.get("cited_via_hosts"):
+        # Cited via retailers/marketplaces (no recognized own-site, no category
+        # endorsement). Don't claim "doesn't surface at all" — the citation data
+        # contradicts it; the gap is category recommendation, not presence.
+        text = (
+            f"{merchant_name or 'The brand'} surfaces via retailers and "
+            "marketplaces on branded searches, but no independent source "
+            "recommends it for the category — that's distribution, not endorsement."
+        )
     else:
-        # Nothing surfaced at all (invisible): don't claim "only your own
+        # Genuinely nothing surfaced (invisible): don't claim "only your own
         # listings appear" when even those didn't — that would contradict the
         # invisible headline.
         text = (
@@ -683,6 +703,18 @@ def build_merchant_narrative(
     authority_map = authority_map if isinstance(authority_map, dict) else {}
     brand_rollup = brand_rollup if isinstance(brand_rollup, dict) else {}
     summary = _summary(authority_map)
+    # Whether the brand is cited ANYWHERE (any product scored a citation or was
+    # cited by any model). `findable` only counts FIRST-PARTY (own-site) hosts,
+    # so a brand cited heavily via retailers/marketplaces on branded searches —
+    # but with no recognized own-site — would wrongly read as "invisible /
+    # doesn't surface at all". This flag lets the headline + where-losing copy
+    # say "cited via retailers, not own-site/category" instead of claiming an
+    # invisibility the citation data contradicts.
+    summary["cited_via_hosts"] = any(
+        (((r or {}).get("scores") or {}).get("citation") or {}).get("score")
+        or ((r or {}).get("models_cited") or {}).get("cited")
+        for r in (per_sku_reports or []) if isinstance(r, dict)
+    )
 
     where = _where_youre_losing(name, authority_map, summary, win_plan)
     verify_plain = _verify_plain(verify_summary)
