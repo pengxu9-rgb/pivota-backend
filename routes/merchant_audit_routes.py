@@ -1450,6 +1450,14 @@ async def run_merchant_url_audit(
             merchant_domain and pdp_host and pdp_host != merchant_domain
         )
         canonical_url = website if (is_retail_channel and website) else p["pdp_url"]
+        # The SUBJECT of the audit is the BRAND's product, not the retailer.
+        # When the pasted page is a retail channel, its scraped attributes are
+        # only REFERRING CONTEXT (the brand's own page is the canonical target);
+        # when it's the brand's own page, the attributes are first-party product
+        # data. Marking the source lets the report/brief/UI frame retail as "a
+        # channel where the product appears" instead of treating the retailer as
+        # the product's identity.
+        product_data_source = "retail_channel" if is_retail_channel else "own_pdp"
         synthetic_products.append({
             "sku_key": key,
             "product_key": key,
@@ -1460,6 +1468,7 @@ async def run_merchant_url_audit(
             "pdp_url": p["pdp_url"],
             "canonical_url": canonical_url,
             "retail_channel_host": pdp_host if is_retail_channel else None,
+            "product_data_source": product_data_source,
             "attributes_raw": p.get("attributes_raw"),
         })
 
@@ -1475,6 +1484,13 @@ async def run_merchant_url_audit(
                 "pdp_url": p["pdp_url"],
                 "vendor": p.get("vendor"),
                 "sku_key": sp["sku_key"],
+                # Where the product data came from: the brand's own page
+                # ("own_pdp") vs a retail listing read only as context
+                # ("retail_channel", with the channel host). Lets the UI say
+                # "read from your Olive Young listing — connect your store for
+                # brand-grounded data" instead of implying the retailer is you.
+                "data_source": sp.get("product_data_source"),
+                "retail_channel_host": sp.get("retail_channel_host"),
                 # ARO: the merchant-facing agent-readability diagnostic + the
                 # actionable gaps (the value the brand pays to watch). Pure +
                 # compute-on-read from signals already fetched; safe on any input.
