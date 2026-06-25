@@ -301,21 +301,31 @@ async def attach_sku_strategic_brief(
             merchant_host=merchant_host,
             competitor_attributes=competitor_attributes,
         )
+        brief_debug: Dict[str, Any] = {}
         brief = await generate_sku_strategic_brief(
             evidence,
             provider=provider,
             model=model,
+            debug=brief_debug,
         )
         brief_enabled = bool(getattr(settings, "strategic_brief_enabled", False))
-    except Exception:
+    except Exception as exc:
         logger.warning("strategic brief attach failed; using deterministic NBA", exc_info=True)
         # Surface the failure so a missing per-SKU brief is diagnosable rather
         # than a silent fall-through to generic NBA boilerplate.
         out["brief_status"] = "unavailable"
+        out["brief_debug"] = {"outcome": "attach_exception", "error": f"{type(exc).__name__}: {exc}"[:300]}
         return out
+    # Persist exactly why the brief did/didn't ship (outcome=="llm" means the
+    # main LLM lane worked; anything else means it fell back — diagnosable from
+    # the stored report). Keep it compact. When the feature is OFF we leave the
+    # NBA untouched (no debug noise).
+    if brief_enabled:
+        out["brief_debug"] = brief_debug
     if brief:
         out["strategic_brief"] = brief
         out["brief_status"] = "ok"
+        out["brief_source"] = "llm" if brief_debug.get("outcome") == "llm" else "deterministic"
     elif brief_enabled:
         # Feature is on but no brief was produced (e.g. grounding rejected every
         # attempt). Make it visible instead of silently dropping to boilerplate.

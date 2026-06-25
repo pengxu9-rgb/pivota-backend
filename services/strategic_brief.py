@@ -704,24 +704,43 @@ async def generate_sku_strategic_brief(
     *,
     provider: Optional[str] = None,
     model: Optional[str] = None,
+    debug: Optional[Dict[str, Any]] = None,
 ) -> Optional[Dict[str, Any]]:
-    if not getattr(settings, "strategic_brief_enabled", False):
+    # `debug` (when provided) is populated in place with exactly why a brief did
+    # or didn't ship, and persisted onto next_best_action.brief_debug so the
+    # fallback cause is diagnosable from the stored report without worker-shell
+    # access (the LLM lane must work continuously; the deterministic fallback is
+    # not acceptable as a steady state).
+    dbg: Dict[str, Any] = debug if debug is not None else {}
+    dbg["enabled"] = bool(getattr(settings, "strategic_brief_enabled", False))
+    if not dbg["enabled"]:
+        dbg["outcome"] = "none_disabled"
         return None
     try:
         selected_provider = normalize_provider(
             provider or settings.strategic_brief_provider
         )
-    except LLMSynthesisError:
+    except LLMSynthesisError as exc:
+        dbg["outcome"] = "none_bad_provider"
+        dbg["error"] = str(exc)[:200]
         return None
-    if not configured_key_for_provider(selected_provider):
+    dbg["provider"] = selected_provider
+    dbg["key_configured"] = bool(configured_key_for_provider(selected_provider))
+    if not dbg["key_configured"]:
+        dbg["outcome"] = "none_no_key"
         return None
     selected_model = (
         str(model or settings.strategic_brief_model or "").strip()
         or default_model_for_provider(selected_provider)
     )
+    dbg["model"] = selected_model
     system, user = build_sku_brief_prompt(evidence)
+    dbg["prompt_chars"] = len(system) + len(user)
+    dbg["max_tokens"] = 1200
+    dbg["attempts"] = []
 
     for _attempt in range(3):
+        att: Dict[str, Any] = {}
         try:
             result = await synthesize(
                 system=system,
@@ -730,14 +749,37 @@ async def generate_sku_strategic_brief(
                 model=selected_model,
                 max_tokens=1200,
             )
-        except LLMSynthesisError:
-            return _validated_deterministic_brief(evidence)
-        brief = _parse_brief_json(result.get("text"))
-        if not isinstance(brief, dict) or not _has_required_shape(brief):
+        except LLMSynthesisError as exc:
+            att["error"] = f"{type(exc).__name__}: {exc}"[:300]
+            dbg["attempts"].append(att)
+            dbg["outcome"] = "deterministic_after_llm_error"
+            return _validated_deterministic_brief(evidence, dbg=dbg)
+        except Exception as exc:  # noqa: BLE001 - capture any synth failure for diagnosis
+            att["error"] = f"unexpected {type(exc).__name__}: {exc}"[:300]
+            dbg["attempts"].append(att)
+            dbg["outcome"] = "deterministic_after_unexpected_error"
+            return _validated_deterministic_brief(evidence, dbg=dbg)
+        text = result.get("text") or ""
+        att["text_len"] = len(text)
+        att["finish_reason"] = result.get("finish_reason")
+        att["usage"] = result.get("usage")
+        brief = _parse_brief_json(text)
+        att["parsed"] = isinstance(brief, dict)
+        shape_ok = isinstance(brief, dict) and _has_required_shape(brief)
+        att["shape_ok"] = shape_ok
+        if not shape_ok:
+            if isinstance(brief, dict):
+                att["missing_keys"] = sorted(_REQUIRED_BRIEF_KEYS - set(brief.keys()))
+            dbg["attempts"].append(att)
             continue
-        if validate_grounding(brief, evidence):
+        gf = _grounding_failures(brief, evidence)
+        att["grounding_failures"] = gf
+        dbg["attempts"].append(att)
+        if not gf:
+            dbg["outcome"] = "llm"
             return brief
-    return _validated_deterministic_brief(evidence)
+    dbg["outcome"] = "deterministic_after_rejects"
+    return _validated_deterministic_brief(evidence, dbg=dbg)
 
 
 def validate_grounding(brief: Mapping[str, Any], evidence: Mapping[str, Any]) -> bool:
@@ -1516,10 +1558,19 @@ def _has_required_shape(brief: Mapping[str, Any]) -> bool:
     return True
 
 
-def _validated_deterministic_brief(evidence: Mapping[str, Any]) -> Optional[Dict[str, Any]]:
+def _validated_deterministic_brief(
+    evidence: Mapping[str, Any],
+    *,
+    dbg: Optional[Dict[str, Any]] = None,
+) -> Optional[Dict[str, Any]]:
     brief = _deterministic_brief(evidence)
     if brief and validate_grounding(brief, evidence):
         return brief
+    if dbg is not None:
+        dbg["deterministic_failed"] = True
+        dbg["deterministic_grounding_failures"] = (
+            _grounding_failures(brief, evidence) if brief else ["<empty deterministic brief>"]
+        )
     return None
 
 
