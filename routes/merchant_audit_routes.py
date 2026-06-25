@@ -1007,7 +1007,12 @@ _WEDGE_RUN_STALE_TTL_S = int(_os.getenv("WEDGE_RUN_STALE_TTL_S", "900"))
 # instead of being budgeted out at 8. Verify (DeepSeek, ~25% sample) adds the
 # answer-quality signal (which cited answers actually hold up) that the
 # readiness audit has. Still Gemini-only to bound cost; all tunable via env.
-_WEDGE_PROMPTS_PER_SKU = int(_os.getenv("WEDGE_PROMPTS_PER_SKU", "18"))
+# Trimmed 18 -> 14: with LLM value-prop discovery prompts now filling the set,
+# 18 padded runs with low-value generic filler and pushed runtime past the point
+# where the upstream drops grounding on later SKUs (the "0/N appears nowhere"
+# false negative). Fewer, higher-value queries = shorter runs that keep
+# grounding. Env-overridable.
+_WEDGE_PROMPTS_PER_SKU = int(_os.getenv("WEDGE_PROMPTS_PER_SKU", "14"))
 _WEDGE_COVERAGE_PROFILE = _os.getenv("WEDGE_COVERAGE_PROFILE", "pilot_gemini")
 _WEDGE_PROVIDERS = [
     p.strip()

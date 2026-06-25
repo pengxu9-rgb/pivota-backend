@@ -108,3 +108,48 @@ def test_all_discovery_ungrounded_flags_couldnt_measure():
     assert pc["grounding_unavailable"] is True
     assert pc["discovery"]["total"] == 0
     assert pc["discovery"]["ungrounded"] == 2
+
+
+def _vrow(query, axis, verdicts):
+    # row with per-model provider_verdicts (win/loss/absent) + grounding so the
+    # aggregate path counts it.
+    return {
+        "query": query,
+        "normalized_query": query,
+        "axis": axis,
+        "source_summary": {"runs_with_citations": 1,
+                           "top_cited_hosts": [{"host": "x.com", "times_cited": 1}]},
+        "provider_verdicts": verdicts,
+    }
+
+
+def test_per_model_discovery_split_and_divergence():
+    per_prompt = [
+        _vrow("best hair oil for damaged hair", "category",
+              {"gemini": "win", "chatgpt": "loss", "deepseek": "win"}),
+        _vrow("bond repair hair oil for breakage", "category",
+              {"gemini": "win", "chatgpt": "win"}),
+        _vrow("hair oil for split ends", "category",
+              {"gemini": "loss", "chatgpt": "absent"}),  # chatgpt ungrounded->skip
+    ]
+    pc = build_product_competitiveness(per_prompt)
+    bm = pc["by_model"]
+    # gemini graded all 3 (win,win,loss) -> 2/3; chatgpt graded 2 (loss,win) -> 1/2
+    assert bm["gemini"] == {"appeared": 2, "total": 3, "rate": round(2 / 3, 3)}
+    assert bm["chatgpt"] == {"appeared": 1, "total": 2, "rate": 0.5}
+    # divergence: query 1 (gemini win, chatgpt loss) — deepseek excluded (verify)
+    div_qs = [d["query"] for d in pc["model_divergence"]]
+    assert "best hair oil for damaged hair" in div_qs
+    d0 = next(d for d in pc["model_divergence"] if d["query"] == "best hair oil for damaged hair")
+    assert d0["won"] == ["gemini"] and d0["lost"] == ["chatgpt"]
+    # query 2 both win -> not divergent
+    assert "bond repair hair oil for breakage" not in div_qs
+
+
+def test_per_model_excludes_branded_and_deepseek():
+    per_prompt = [
+        _vrow("is anuko legit", "review", {"gemini": "win", "chatgpt": "win"}),  # branded
+    ]
+    pc = build_product_competitiveness(per_prompt)
+    assert pc["by_model"] == {}          # branded not in per-model discovery
+    assert pc["model_divergence"] == []
