@@ -7035,6 +7035,63 @@ def _category_for_unbranded_prompts(
         return "beauty supplement"
     if any(token in combined for token in ("supplement", "gummy", "gummies")):
         return "supplement"
+    # Last resort: derive the category from the product TITLE. Store-less brands
+    # audited by URL often have no product_type, no graph, and no catalog
+    # (product_type=None, attribute_graph=null) — without a category the per-SKU
+    # query gen emits ONLY branded name queries (low-value) and never probes the
+    # non-branded discovery demand ("best hair oil for damaged hair") that is the
+    # whole point of the audit. A descriptive title ("… Bond & Repair Hair Oil")
+    # carries the category; extract it so discovery queries generate.
+    from_title = _category_from_title(
+        product.get("title") or product.get("raw_title"),
+        brand=product.get("vendor") or product.get("brand"),
+    )
+    if from_title:
+        return from_title
+    return ""
+
+
+# Personal-care / beauty category head-nouns (Pivota's vertical) + the body-part
+# qualifiers that pair with them ("hair oil", "face cream", "lip balm"). Used to
+# extract a clean category from a product title when no structured category
+# exists. Beauty-scoped on purpose: high precision, and a non-match just falls
+# back to "" (same as today — no discovery queries, no regression).
+_CATEGORY_HEAD_NOUNS = frozenset({
+    "oil", "butter", "treatment", "mask", "shampoo", "conditioner", "serum",
+    "cream", "spray", "balm", "gel", "wax", "pomade", "tonic", "ampoule",
+    "essence", "cleanser", "moisturizer", "moisturiser", "sunscreen", "sunblock",
+    "toner", "lotion", "scrub", "peel", "mist", "foam", "wash", "soap",
+    "exfoliant", "emulsion", "patch", "stick", "lipstick", "mascara",
+    "foundation", "concealer", "primer", "powder", "blush", "supplement",
+    "gummies", "gummy", "capsule", "tablet",
+})
+_CATEGORY_MODIFIERS = frozenset({
+    "hair", "face", "facial", "skin", "body", "eye", "lip", "lips", "scalp",
+    "foot", "hand", "sun", "night", "day", "leave", "curl", "curly",
+})
+
+
+def _category_from_title(title: Any, brand: Optional[str] = None) -> str:
+    """Extract a clean buyer-facing category ("hair oil", "face cream") from a
+    product title. Strips variant noise (after '#'/'(', sizes), drops brand
+    tokens, then finds a head-noun and its body-part qualifier. Returns "" when
+    no confident category is found (caller then emits no discovery queries)."""
+    text = str(title or "").lower()
+    text = re.split(r"[#(]", text, maxsplit=1)[0]
+    text = re.sub(r"\b\d+(?:\.\d+)?\s*(?:ml|l|g|kg|oz|fl|pcs?|ct|count|x\d+)\b", " ", text)
+    brand_tokens = set(re.findall(r"[a-z0-9]+", str(brand or "").lower()))
+    tokens = [t for t in re.findall(r"[a-z0-9]+", text) if t and t not in brand_tokens]
+    for i, tok in enumerate(tokens):
+        if tok in _CATEGORY_HEAD_NOUNS:
+            modifier = (
+                tokens[i - 1]
+                if i > 0 and tokens[i - 1] in _CATEGORY_MODIFIERS
+                else None
+            )
+            candidate = f"{modifier} {tok}".strip() if modifier else tok
+            cleaned = _clean_prompt_term(candidate)
+            if cleaned and not _noisy_prompt_category(cleaned):
+                return cleaned
     return ""
 
 
