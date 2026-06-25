@@ -16,11 +16,17 @@ from services import agent_pdp_view_assembler as apv  # noqa: E402
 
 
 class _FakeDB:
-    def __init__(self) -> None:
+    def __init__(self, fetch_one_result: Optional[Dict[str, Any]] = None) -> None:
         self.executes: List[Dict[str, Any]] = []
+        self.fetch_ones: List[Dict[str, Any]] = []
+        self._fetch_one_result = fetch_one_result
 
     async def execute(self, sql: str, params: Dict[str, Any]) -> None:
         self.executes.append({"sql": sql, "params": params})
+
+    async def fetch_one(self, sql: str, params: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+        self.fetch_ones.append({"sql": sql, "params": params})
+        return self._fetch_one_result
 
 
 def _patch_fetches(
@@ -167,3 +173,80 @@ async def test_refresh_returns_false_when_row_too_thin(monkeypatch: pytest.Monke
     )
     assert built is False
     assert db.executes == []
+
+
+# ── B① write-triggered enrichment propagation ──────────────────────────────
+
+
+@pytest.mark.asyncio
+async def test_enrichment_write_refresh_noop_when_flag_off(monkeypatch: pytest.MonkeyPatch) -> None:
+    # Default OFF: no content_key resolution, no view rebuild — current behavior.
+    monkeypatch.delenv("SERVE_PDP_ENRICHMENT_ON_WRITE", raising=False)
+    db = _FakeDB(fetch_one_result={"content_key": "ck-1"})
+    out = await apv.refresh_agent_pdp_view_for_enrichment_write(
+        "m1", "shopify", "sp-1", db=db
+    )
+    assert out is False
+    assert db.fetch_ones == []  # didn't even resolve the content_key
+    assert db.executes == []
+
+
+@pytest.mark.asyncio
+async def test_enrichment_write_refresh_false_on_missing_identity(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("SERVE_PDP_ENRICHMENT_ON_WRITE", "1")
+    db = _FakeDB(fetch_one_result={"content_key": "ck-1"})
+    out = await apv.refresh_agent_pdp_view_for_enrichment_write("m1", None, "sp-1", db=db)
+    assert out is False
+    assert db.fetch_ones == []
+
+
+@pytest.mark.asyncio
+async def test_enrichment_write_refresh_false_when_no_catalog_row(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("SERVE_PDP_ENRICHMENT_ON_WRITE", "1")
+    db = _FakeDB(fetch_one_result=None)  # no catalog_products row maps to a content_key
+    out = await apv.refresh_agent_pdp_view_for_enrichment_write(
+        "m1", "shopify", "sp-1", db=db
+    )
+    assert out is False
+    assert len(db.fetch_ones) == 1  # tried to resolve
+    assert db.executes == []
+
+
+@pytest.mark.asyncio
+async def test_enrichment_write_refresh_rebuilds_view_when_flag_on(monkeypatch: pytest.MonkeyPatch) -> None:
+    # Flag on + content_key resolves → the helper rebuilds the served view via
+    # refresh_agent_pdp_view_for_content_key (one upsert with the resolved key).
+    monkeypatch.setenv("SERVE_PDP_ENRICHMENT_ON_WRITE", "1")
+    _patch_fetches(
+        monkeypatch,
+        products=[{
+            "product_key": "pk-1", "merchant_id": "m1", "platform": "shopify",
+            "source_product_id": "sp-1", "title": "Glow Serum",
+            "description": "A long enough description for the agent PDP view row.",
+            "brand": "AuraGlow",
+        }],
+    )
+    db = _FakeDB(fetch_one_result={"content_key": "ck-resolved"})
+    out = await apv.refresh_agent_pdp_view_for_enrichment_write(
+        "m1", "shopify", "sp-1", db=db
+    )
+    assert out is True
+    assert len(db.fetch_ones) == 1
+    assert len(db.executes) == 1
+    assert db.executes[0]["params"]["content_key"] == "ck-resolved"
+    assert db.executes[0]["params"]["refresh_source"] == "enrichment_write"
+
+
+@pytest.mark.asyncio
+async def test_enrichment_write_refresh_swallows_errors(monkeypatch: pytest.MonkeyPatch) -> None:
+    # Best-effort: a DB error during resolution must never raise into the writer.
+    monkeypatch.setenv("SERVE_PDP_ENRICHMENT_ON_WRITE", "1")
+
+    class _BoomDB:
+        async def fetch_one(self, sql: str, params: Dict[str, Any]):
+            raise RuntimeError("db down")
+
+    out = await apv.refresh_agent_pdp_view_for_enrichment_write(
+        "m1", "shopify", "sp-1", db=_BoomDB()
+    )
+    assert out is False

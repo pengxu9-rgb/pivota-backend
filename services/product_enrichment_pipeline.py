@@ -215,6 +215,17 @@ async def run_enrichment_for_product(
     data=enrichment_data,
   )
 
+  # B① publish bridge: propagate the just-written enrichment to the served
+  # agent_pdp_view (the overlay is applied at assembly time, but the pipeline
+  # previously didn't re-assemble on write). Flag-gated + best-effort.
+  from services.agent_pdp_view_assembler import (
+    refresh_agent_pdp_view_for_enrichment_write,
+  )
+
+  await refresh_agent_pdp_view_for_enrichment_write(
+    merchant_id, platform, platform_product_id
+  )
+
   # 6) Quality evaluation (writes snapshot)
   try:
     quality_payload = build_quality_payload(product, enrichment_data)
