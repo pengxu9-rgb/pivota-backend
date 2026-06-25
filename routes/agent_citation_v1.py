@@ -15,7 +15,7 @@ from __future__ import annotations
 import time
 from typing import Any, Dict
 
-from fastapi import APIRouter, Depends, HTTPException, Request, Response, status
+from fastapi import APIRouter, Depends, HTTPException, Query, Request, Response, status
 
 from db.database import database
 from middleware.rate_limiter import AdvancedRateLimiter
@@ -112,6 +112,74 @@ def project_citation_item(row: Dict[str, Any]) -> Dict[str, Any]:
         "offers": None,
         "usage_terms": {"attribution_required": True, "commercial_use": "cite-and-link"},
     }
+
+
+def _search_row_to_citation(row: Dict[str, Any]) -> Dict[str, Any]:
+    """Adapt a citable-recall row to the CitationItem projection.
+
+    Recall rows are lighter than a full PDP read (no graded claims / structured
+    fields), so the projection's substantiation comes back empty here — the agent
+    fetches the single-item endpoint for full substantiation. Reuses
+    project_citation_item so search + single-item emit the SAME shape.
+    """
+    return project_citation_item(
+        {
+            "content_key": row.get("content_key"),
+            "title": row.get("product_title"),
+            "description": row.get("product_description"),
+            "brand": row.get("brand"),
+            "image_url": row.get("product_image_url"),
+            "evidence_profile": None,
+            "bullet_points": None,
+            "usage_scenarios": None,
+            "taxonomy_tags": None,
+        }
+    )
+
+
+# NOTE: /search MUST be registered before /{citation_id} or FastAPI matches the
+# literal "search" as a citation_id.
+@router.get("/search")
+async def search_citations(
+    request: Request,
+    response: Response,
+    q: str = Query("", description="free-text query"),
+    intent: str = Query("inform", description="inform (cite) | shop (suppressed)"),
+    limit: int = Query(20, ge=1, le=50),
+    _rl: None = Depends(_citation_rate_limit),
+) -> Dict[str, Any]:
+    query = str(q or "").strip()
+    norm_intent = str(intent or "inform").strip().lower()
+    if not query:
+        return {"items": [], "count": 0, "query": q, "intent": norm_intent or "inform"}
+
+    # Intent gate (parity with the recall lane): shop / strict_serving_mode
+    # SUPPRESSES citation rows — an agent driving a checkout never gets a
+    # non-buyable row. Only inform-intent surfaces citations.
+    if norm_intent in ("shop", "strict", "strict_serving_mode", "transact"):
+        response.headers["Cache-Control"] = "public, max-age=120"
+        return {
+            "items": [],
+            "count": 0,
+            "query": query,
+            "intent": "shop",
+            "suppressed": "citation rows are inform-intent only",
+        }
+
+    # Same gate as the slice-3 recall lane (INDEX_ELIGIBLE_RECALL, default OFF).
+    from services.pivot_query_service import (
+        _fetch_citable_canonical_rows,
+        _index_eligible_recall_enabled,
+    )
+
+    if not _index_eligible_recall_enabled():
+        return {"items": [], "count": 0, "query": query, "intent": "inform"}
+
+    rows = await _fetch_citable_canonical_rows(query=query, merchant_id=None, limit=limit)
+    items = [_search_row_to_citation(r) for r in rows]
+    response.headers["Cache-Control"] = "public, max-age=120"
+    response.headers["X-Pivota-Citation-Source"] = "Pivota"
+    return {"items": items, "count": len(items), "query": query, "intent": "inform"}
 
 
 @router.get("/{citation_id}")

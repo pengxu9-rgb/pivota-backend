@@ -14,7 +14,30 @@ os.environ.setdefault(
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
 
+import services.pivot_query_service as pqs
 from routes import agent_citation_v1 as cite
+
+_CK_A = "ck_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+_CK_B = "ck_bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+
+
+def _citable_rows():
+    return [
+        {
+            "content_key": _CK_A,
+            "product_title": "Anuko Nourishing Hair Butter",
+            "product_description": "Shea butter treatment. For damaged hair.",
+            "brand": "Anuko",
+            "product_image_url": "https://img.example/anuko.jpg",
+        },
+        {
+            "content_key": _CK_B,
+            "product_title": "SKIN1004 Centella Ampoule",
+            "product_description": "Centella ampoule.",
+            "brand": "SKIN1004",
+            "product_image_url": None,
+        },
+    ]
 
 
 def _row(**overrides: Any) -> Dict[str, Any]:
@@ -124,3 +147,56 @@ def test_unknown_id_shape_is_404(client_for):
     # A value that isn't a content_key / sig / pg / ext resolves to no SQL → 404.
     res = client_for(_row()).get("/agent/v1/citation/not-a-real-id")
     assert res.status_code == 404
+
+
+# ── /search ─────────────────────────────────────────────────────────────────
+
+
+def test_search_inform_returns_citation_items(client_for, monkeypatch: pytest.MonkeyPatch):
+    client = client_for(_row())
+
+    async def fake_fetch(*, query, merchant_id, limit):
+        return _citable_rows()
+
+    monkeypatch.setattr(pqs, "_index_eligible_recall_enabled", lambda: True)
+    monkeypatch.setattr(pqs, "_fetch_citable_canonical_rows", fake_fetch)
+    res = client.get("/agent/v1/citation/search?q=hair+butter&intent=inform")
+    assert res.status_code == 200
+    body = res.json()
+    assert body["intent"] == "inform"
+    assert body["count"] == 2
+    item = body["items"][0]
+    # same offer-free CitationItem shape as the single-item read
+    assert item["buyable"] is False
+    assert item["offers"] is None
+    assert item["catalog_track"] == "citation"
+    assert item["attribution"]["source"] == "Pivota"
+    assert item["attribution"]["canonical_url"] == f"https://agent.pivota.cc/products/{_CK_A}"
+    assert item["title"] == "Anuko Nourishing Hair Butter"
+    assert item["brand"] == "Anuko"
+    # recall rows are light → substantiation empty (full detail via single-item)
+    assert item["substantiation"]["claims"] == []
+
+
+def test_search_shop_intent_suppresses_citations(client_for, monkeypatch: pytest.MonkeyPatch):
+    client = client_for(_row())
+    monkeypatch.setattr(pqs, "_index_eligible_recall_enabled", lambda: True)
+    res = client.get("/agent/v1/citation/search?q=hair&intent=shop")
+    assert res.status_code == 200
+    body = res.json()
+    assert body["intent"] == "shop"
+    assert body["items"] == []
+
+
+def test_search_returns_empty_when_recall_flag_off(client_for, monkeypatch: pytest.MonkeyPatch):
+    client = client_for(_row())
+    monkeypatch.setattr(pqs, "_index_eligible_recall_enabled", lambda: False)
+    res = client.get("/agent/v1/citation/search?q=hair&intent=inform")
+    assert res.status_code == 200
+    assert res.json()["items"] == []
+
+
+def test_search_empty_query_returns_empty(client_for):
+    res = client_for(_row()).get("/agent/v1/citation/search?q=")
+    assert res.status_code == 200
+    assert res.json()["items"] == []
