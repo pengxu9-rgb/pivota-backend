@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import os
 from typing import Any, Dict, Optional
 
@@ -200,3 +201,113 @@ def test_search_empty_query_returns_empty(client_for):
     res = client_for(_row()).get("/agent/v1/citation/search?q=")
     assert res.status_code == 200
     assert res.json()["items"] == []
+
+
+# ── B④-P1 attribution telemetry wiring ───────────────────────────────────────
+
+
+@pytest.fixture
+def capture_logs(monkeypatch: pytest.MonkeyPatch):
+    """Capture the fields each handler hands to telemetry, bypassing the real
+    fire-and-forget task (deterministic, no event-loop race)."""
+    calls: list[Dict[str, Any]] = []
+    monkeypatch.setattr(cite, "_spawn_log", lambda **f: calls.append(f))
+    return calls
+
+
+def test_single_read_hit_logs_telemetry(client_for, capture_logs):
+    ck = "ck_0123456789abcdef0123456789abcdef"
+    res = client_for(_row()).get(f"/agent/v1/citation/{ck}")
+    assert res.status_code == 200
+    assert len(capture_logs) == 1
+    ev = capture_logs[0]
+    assert ev["endpoint"] == "item"
+    assert ev["status"] == cite.STATUS_HIT
+    assert ev["requested_id"] == ck
+    assert ev["content_key"] == ck
+
+
+def test_single_read_miss_logs_telemetry(client_for, capture_logs):
+    ck = "ck_ffffffffffffffffffffffffffffffff"
+    res = client_for(None).get(f"/agent/v1/citation/{ck}")
+    assert res.status_code == 404
+    assert len(capture_logs) == 1
+    ev = capture_logs[0]
+    assert ev["endpoint"] == "item"
+    assert ev["status"] == cite.STATUS_MISS
+    assert ev["requested_id"] == ck
+    assert ev["content_key"] is None
+
+
+def test_agent_header_captured_in_telemetry(client_for, capture_logs):
+    client_for(_row()).get(
+        "/agent/v1/citation/ck_0123456789abcdef0123456789abcdef",
+        headers={"X-Pivota-Agent": "openai-chatgpt/1.0"},
+    )
+    assert capture_logs[-1]["agent"] == "openai-chatgpt/1.0"
+
+
+def test_search_hit_logs_result_count(client_for, capture_logs, monkeypatch: pytest.MonkeyPatch):
+    async def fake_fetch(*, query, merchant_id, limit):
+        return _citable_rows()
+
+    monkeypatch.setattr(pqs, "_index_eligible_recall_enabled", lambda: True)
+    monkeypatch.setattr(pqs, "_fetch_citable_canonical_rows", fake_fetch)
+    client_for(_row()).get("/agent/v1/citation/search?q=hair&intent=inform")
+    ev = capture_logs[-1]
+    assert ev["endpoint"] == "search"
+    assert ev["status"] == cite.STATUS_HIT
+    assert ev["result_count"] == 2
+    assert ev["query"] == "hair"
+
+
+def test_search_shop_logs_suppressed(client_for, capture_logs, monkeypatch: pytest.MonkeyPatch):
+    monkeypatch.setattr(pqs, "_index_eligible_recall_enabled", lambda: True)
+    client_for(_row()).get("/agent/v1/citation/search?q=hair&intent=shop")
+    assert capture_logs[-1]["status"] == cite.STATUS_SUPPRESSED
+
+
+def test_search_recall_off_logs_disabled(client_for, capture_logs, monkeypatch: pytest.MonkeyPatch):
+    monkeypatch.setattr(pqs, "_index_eligible_recall_enabled", lambda: False)
+    client_for(_row()).get("/agent/v1/citation/search?q=hair&intent=inform")
+    assert capture_logs[-1]["status"] == cite.STATUS_DISABLED
+
+
+def test_telemetry_disabled_by_default_spawns_no_write(client_for, monkeypatch: pytest.MonkeyPatch):
+    # Real _spawn_log with the flag OFF must never reach log_citation_read.
+    monkeypatch.delenv("CITATION_READ_TELEMETRY", raising=False)
+    reached: list = []
+    monkeypatch.setattr(cite, "log_citation_read", lambda **f: reached.append(f))
+    res = client_for(_row()).get("/agent/v1/citation/ck_0123456789abcdef0123456789abcdef")
+    assert res.status_code == 200
+    assert reached == []
+
+
+async def test_spawn_log_schedules_write_when_flag_on(monkeypatch: pytest.MonkeyPatch):
+    # Flag ON: _spawn_log schedules the best-effort write coroutine (tested
+    # directly to control the loop, avoiding a TestClient scheduling race).
+    monkeypatch.setenv("CITATION_READ_TELEMETRY", "1")
+    seen: list[Dict[str, Any]] = []
+
+    async def fake_log(**fields):
+        seen.append(fields)
+
+    monkeypatch.setattr(cite, "log_citation_read", fake_log)
+    cite._spawn_log(endpoint="item", status=cite.STATUS_HIT, content_key="ck_z")
+    await asyncio.sleep(0)  # let the scheduled task run
+    assert seen and seen[0]["endpoint"] == "item"
+    assert seen[0]["content_key"] == "ck_z"
+
+
+async def test_spawn_log_noop_when_flag_off(monkeypatch: pytest.MonkeyPatch):
+    monkeypatch.delenv("CITATION_READ_TELEMETRY", raising=False)
+    seen: list = []
+
+    async def fake_log(**fields):
+        seen.append(fields)
+
+    monkeypatch.setattr(cite, "log_citation_read", fake_log)
+    cite._spawn_log(endpoint="item", status=cite.STATUS_HIT)
+    await asyncio.sleep(0)
+    assert seen == []
+
