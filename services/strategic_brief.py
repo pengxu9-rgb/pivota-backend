@@ -107,37 +107,14 @@ CLAIM DISCIPLINE (do not let confident prose outrun the EVIDENCE — this is a t
   halal bedtime stick — worth confirming"), NOT as a caveat about what you may or may not claim. Never tell the
   merchant what you are or aren't allowed to say.
 
-HOW GENERATIVE ENGINES CHOOSE WHAT TO CITE (this is the operating model — ground every "why" and every
-move in these levers, in this order; it is how a best-in-class brand earns AI citations, not a checklist):
-1. RETRIEVABLE — a page that exists, is crawlable/indexed, and targets the EXACT evidenced lane wording.
-2. EXTRACTABLE — the answer-relevant facts (title, price, availability, ingredients, use, the question the lane
-   asks) live in machine-readable product/offer/review/FAQ structured data AND in plain page text, not locked
-   in images or marketing copy.
-3. CORROBORATED — the same SKU facts are consistent across the merchant's own page and the third-party sources
-   the engine already trusts (mismatched titles/variants/price across sources make the engine prefer the source
-   it trusts over your page).
-4. PROVEN — first-party reviews, ratings, and concrete proof (before/after, ingredient rationale, guarantees)
-   on the page give the engine something quotable; this is usually why a retailer page out-cites a thin brand
-   page even on the BRAND's own name.
-5. AUTHORITATIVE — independent sources the engine trusts (the evidenced retailers, editorial, communities)
-   carry and corroborate the product. A cited source in EVIDENCE wins a lane because it ranks higher on these
-   levers FOR THAT LANE — name WHICH lever it beats the merchant page on, given the source's type.
-Best-in-class brands win branded lanes by making their OWN page the most retrievable + extractable + proven
-source for that lane, then keeping facts corroborated across the sources the engine cites. Frame the gap as the
-specific levers the cited source has and the merchant page lacks — never as invented numbers.
-
 WRITE the brief as JSON with these fields — each must be specific to THIS product and EVIDENCE:
 - position: one honest sentence on where they really stand (e.g. "niche challenger, strong when named,
   invisible in the category").
 - core_decision: the ONE big strategic call, stated plainly and decisively (what to do, what to STOP doing,
   and why — name the real reason from evidence).
-- why_you_lose: WHY the cited sources win this lane — name the SPECIFIC lever from the operating model above
-  (retrievable / extractable / corroborated / proven / authoritative) that the evidenced cited source beats the
-  merchant page on, given that source's type (e.g. a retailer out-cites your branded page because it carries
-  proven reviews + trusted distribution the engine corroborates; an editorial wins because it's the
-  authoritative independent voice). Synthesize named winners × the sources that rank them × the moat the
-  evidenced ranking sources imply. Do not claim competitor feature gaps as fact; make any competitor
-  positioning read explicit inference.
+- why_you_lose: WHY the category winners win — synthesize the named winners × the sources that rank them ×
+  what the evidenced ranking sources imply about their moat (reviews/authority/distribution/positioning).
+  Do not claim competitor feature gaps as fact; make any competitor positioning read explicit inference.
 - your_angle: the defensible positioning wedge = the merchant's differentiating attributes that the named
   product actually has. Reframe them from "a {category}" to a category of one without saying winners lack
   those attributes as fact. Use exact EVIDENCE lane wording where their differentiation IS the answer.
@@ -148,18 +125,13 @@ WRITE the brief as JSON with these fields — each must be specific to THIS prod
   yet and why.
 - substitution_play: if a substitution is present, how to win those buyers back (comparison/positioning vs
   the named substitute), else null.
-- first_moves: 3-5 concrete actions that EXECUTE the strategy above, in priority order. Each move must name
-  (a) the exact evidenced lane it targets, (b) the operating-model lever it moves (retrievable / extractable /
-  corroborated / proven / authoritative), and (c) the expected effect on how citable the page becomes for that
-  lane — sequenced by the operating-model order (fix retrievable/extractable before chasing authority). Not a
-  generic checklist: instead of "add an FAQ", write "answer '<exact lane>' in a structured FAQ + plain text so
-  the engine can extract and quote your page for it, the way it currently quotes <cited source>". The first
-  move targets the single highest-leverage lever this product is weakest on for its evidenced lane. When
-  EVIDENCE shows weak reseller/source-route exposure, at least one move must name the exact lane and
-  source-authority repair, using the operating-model order and controller-type source route. When EVIDENCE
-  shows credible retailer/marketplace competition, at least one move must name the exact lane, the listing fix
-  (corroborate facts), the retrieval/structure layer, and the operational reason to buy from the
-  merchant-controlled page (offer, bundle, subscription, or why-buy-direct proof).
+- first_moves: 3-5 concrete actions that EXECUTE the strategy above, in priority order, each tied to a
+  strategic reason (not generic "add an FAQ" — "add the halal + bedtime story to your page so it is more
+  citable for the lane you're claiming"). When EVIDENCE shows weak reseller/source-route exposure, at
+  least one first move must name the exact lane and source-authority repair, using the mechanism order above
+  and controller-type source route. When EVIDENCE shows credible retailer/marketplace competition, at least
+  one first move must name the exact lane, listing fix, light retrieval/schema layer, and the operational reason
+  to buy from the merchant-controlled page (offer, bundle, subscription, or why-buy-direct proof).
 - diy_vs_pivota: {self_serve:[2-3 merchant-owned moves], pivota:"one honest line on what only Pivota does
   — cited+buyable canonical page, serving, monitoring"}.   # the 70/30, honest, no cold-audit hard-sell"""
 
