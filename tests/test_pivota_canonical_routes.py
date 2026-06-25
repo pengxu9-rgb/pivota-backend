@@ -34,13 +34,20 @@ def _sitemap_row_eligible(r: Dict[str, Any]) -> bool:
     }
     if not r.get("content_key"):
         return False
-    if r.get("merchant_indexable", True) is not True:
-        return False
-    if r.get("merchant_status", "active") != "active":
-        return False
+    index_elig = r.get("index_eligible") is True
+    # Merchant gate (mirrors the INNER/LEFT join). merchant_indexable=None models
+    # a row with NO catalog_merchants entry (store-less brand): allowed only when
+    # widened + index_eligible; a present-but-hidden retail merchant stays out.
+    if r.get("merchant_indexable") is None:
+        if not (widen and index_elig):
+            return False
+    else:
+        if r.get("merchant_indexable") is not True:
+            return False
+        if r.get("merchant_status", "active") != "active":
+            return False
     has_sig = str(r.get("pivota_signature_id") or "").startswith("sig_")
     serving = r.get("serving_eligible") is True
-    index_elig = r.get("index_eligible") is True
     # identity: sig-bearing, OR an index_eligible citation row when widened
     identity_ok = has_sig or (widen and index_elig)
     eligible = serving or (widen and index_elig)
@@ -170,15 +177,26 @@ def env(monkeypatch: pytest.MonkeyPatch):
         # Otherwise-eligible row whose merchant is inactive
         # (catalog_merchants.status != 'active'). Same exclusion contract.
         _row("inactive", merchant_id="merch_off", merchant_status="inactive"),
-        # Store-less brand-authored row: offer-free citation, no minted sig
-        # (index_eligible only). Excluded when the sitemap is strict; included
-        # (keyed on content_key) when INDEX_ELIGIBLE_SITEMAP widens the gate.
+        # Store-less brand-authored row: offer-free citation, no minted sig AND
+        # NO catalog_merchants row (merchant_indexable=None models the missing
+        # LEFT-JOIN row). Excluded when strict; included (keyed on content_key)
+        # when INDEX_ELIGIBLE_SITEMAP widens the gate.
         {
             **_row("storeless"),
             "pivota_signature_id": None,
             "pivota_canonical_url": None,
             "serving_eligible": False,
             "index_eligible": True,
+            "merchant_indexable": None,
+        },
+        # A PRESENT-but-hidden retail merchant (indexable=False) that is also
+        # index_eligible must STILL be excluded when widened — only MISSING
+        # merchant rows are allowed through, not explicitly-hidden ones.
+        {
+            **_row("hidden_index", merchant_id="merch_hide2"),
+            "serving_eligible": False,
+            "index_eligible": True,
+            "merchant_indexable": False,
         },
     ]
     monkeypatch.setattr(pcr, "database", FakeDb(rows))
@@ -294,6 +312,8 @@ def test_list_canonical_pdps_includes_storeless_when_sitemap_widened(
     assert body["total"] == 4
     by_ck = {i["content_key"]: i for i in body["items"]}
     assert "ck_nosig" not in by_ck  # serving but sig-less → still excluded
+    # present-but-hidden retail merchant stays out even though index_eligible
+    assert "ck_hidden_index" not in by_ck
     storeless = by_ck["ck_storeless"]
     assert storeless["sig_id"] is None
     assert storeless["serving_eligible"] is False
