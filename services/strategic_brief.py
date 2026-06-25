@@ -2202,6 +2202,43 @@ def _allowed_grounding(evidence: Mapping[str, Any]) -> Dict[str, Any]:
     grounded_words.update(_COMMON_WORDS)
     grounded_words.update(_AI_ENGINE_ENTITIES)
 
+    # A safety-sensitive term is only a fabrication risk when it isn't grounded.
+    # When it appears in the merchant's OWN product title/brand/attributes or in
+    # AI's actual queries/lanes, the brief is grounded in using it — e.g. a
+    # product literally named "...Hair Treatment" or a lane "best treatment for
+    # damaged hair". Without this, every such SKU had its whole brief rejected
+    # (brief_status "unavailable" → the merchant saw nothing). We deliberately do
+    # NOT license safety terms from competitor names/attributes or the substitute
+    # (a competitor being "clinical" doesn't let the brief call THIS product
+    # clinical), so those still fail the guard. Invented claims still fail too.
+    own_safe_parts: List[str] = [
+        _clean_str(product.get("title")),
+        _clean_str(product.get("brand")),
+    ]
+    for values in attributes.values():
+        own_safe_parts.extend(_as_str_list(values))
+    own_safe_parts.extend(_as_str_list(category_battle.get("prompts")))
+    for lane in _as_list(evidence.get("open_lanes")):
+        if isinstance(lane, Mapping):
+            own_safe_parts.append(_clean_str(lane.get("query")))
+    for lane in _as_list(evidence.get("channel_map")):
+        if isinstance(lane, Mapping):
+            own_safe_parts.append(_clean_str(lane.get("lane")))
+            own_safe_parts.append(_clean_str(lane.get("query")))
+    for opp in _as_list(evidence.get("buyer_path_opportunities")):
+        if isinstance(opp, Mapping):
+            own_safe_parts.append(_clean_str(opp.get("query")))
+    for key in ("recommended_beachhead_lane", "canonical_page_play"):
+        own_safe_parts.append(_clean_str(_as_mapping(sideways_wedge.get(key)).get("query")))
+    for key in ("head_prompt_pressure", "sideways_wedge_lanes", "do_not_chase_yet"):
+        for lane in _as_list(sideways_wedge.get(key)):
+            if isinstance(lane, Mapping):
+                own_safe_parts.append(_clean_str(lane.get("query")))
+    own_safe_words: Set[str] = set()
+    for part in own_safe_parts:
+        own_safe_words.update(re.findall(r"[a-z0-9]+", part.lower()))
+    safety_words |= {term for term in _SAFETY_SENSITIVE_TERMS if term in own_safe_words}
+
     return {
         "terms": allowed_terms,
         "domains": allowed_domains,
