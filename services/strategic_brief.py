@@ -682,6 +682,12 @@ def assemble_sku_brief_evidence(
             "brand": brand or None,
             "merchant_path": merchant_path,
             "attributes": attributes,
+            # The merchant's own canonical host. A useful brief MUST be able to
+            # name it ("make anukoofficial.com the buyable canonical page"); add
+            # it so grounding allows it instead of rejecting it as an unknown
+            # domain (which forced every brief back to the generic deterministic
+            # fallback that can only say "the official brand PDP").
+            "merchant_host": _normalize_host(merchant_host) or None,
         },
         "position": _position_from_ladder(opportunity_map),
         "category_battle": category_battle,
@@ -2091,6 +2097,10 @@ def _allowed_grounding(evidence: Mapping[str, Any]) -> Dict[str, Any]:
     product = _as_mapping(evidence.get("product"))
     add_term(product.get("title"))
     add_term(product.get("brand"))
+    # The merchant's own canonical host is grounded evidence — a brief naming it
+    # ("make anukoofficial.com the buyable canonical page") must pass, not be
+    # rejected as an unknown domain.
+    add_domain(product.get("merchant_host"))
     merchant_path = _as_mapping(product.get("merchant_path"))
     for value in merchant_path.values():
         add_term(value)
