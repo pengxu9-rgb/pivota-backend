@@ -1843,3 +1843,30 @@ def test_system_prompt_carries_generative_engine_operating_model():
     for lever in ("RETRIEVABLE", "EXTRACTABLE", "CORROBORATED", "PROVEN", "AUTHORITATIVE"):
         assert lever in p, lever
     assert "HOW GENERATIVE ENGINES CHOOSE WHAT TO CITE" in p
+
+
+def test_merchant_own_host_is_groundable():
+    # A useful brief must be able to name the merchant's own canonical site
+    # ("make bblab.com the buyable page"); it must not be rejected as an unknown
+    # domain. Regression: the brand host was missing from the allow-list, so
+    # every LLM brief naming it failed and fell back to the generic template.
+    evidence = _validation_fix_evidence()
+    evidence["product"]["merchant_host"] = "bblab.com"
+    brief = _validation_fix_grounded_brief()
+    brief["core_decision"] = "Make bblab.com the buyable canonical page for the branded lane."
+
+    failures = strategic_brief._grounding_failures(brief, evidence)
+
+    assert not any(f.startswith("unknown-domain") for f in failures), failures
+
+
+def test_unrelated_domain_still_rejected():
+    # The own-host fix must not open the door to arbitrary domains.
+    evidence = _validation_fix_evidence()
+    evidence["product"]["merchant_host"] = "bblab.com"
+    brief = _validation_fix_grounded_brief()
+    brief["core_decision"] = "Sell it on randomshop123.com instead."
+
+    failures = strategic_brief._grounding_failures(brief, evidence)
+
+    assert any(f.startswith("unknown-domain") for f in failures)
