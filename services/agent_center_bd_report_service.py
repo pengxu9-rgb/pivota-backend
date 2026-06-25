@@ -4837,6 +4837,53 @@ def _competitor_brand_label(name: Any) -> str:
     return words[0] if words else ""
 
 
+# The shopping-surface models (deepseek is the fact-check/verify pass, not a
+# place a shopper discovers products). Gemini and ChatGPT ground DIFFERENT
+# indexes/sources, so their wins diverge — and that divergence is actionable
+# signal, not noise (win Gemini but lose ChatGPT -> work the sources ChatGPT
+# leans on, which differ from Google's).
+_SHOPPING_MODELS = ("gemini", "chatgpt")
+
+
+def _per_model_discovery(
+    rows: List[Dict[str, Any]],
+) -> Tuple[Dict[str, Dict[str, Any]], List[Dict[str, Any]]]:
+    """Per-model discovery appearance from provider_verdicts (win=appeared,
+    loss=grounded-but-not, absent=ungrounded/not-found -> inconclusive), plus
+    the per-query divergence between models. Reuses existing per-row verdicts."""
+    by_model: Dict[str, Dict[str, Any]] = {}
+    divergence: List[Dict[str, Any]] = []
+    for r in rows:
+        intent = _intent_axis_for(r.get("normalized_query") or r.get("query"), r.get("axis"))
+        if intent not in _DISCOVERY_INTENTS:
+            continue
+        verdicts = r.get("provider_verdicts") if isinstance(r.get("provider_verdicts"), dict) else {}
+        q = str(r.get("query") or "").strip()
+        wins: Dict[str, bool] = {}
+        for m in _SHOPPING_MODELS:
+            v = str(verdicts.get(m) or "absent").lower()
+            if v not in ("win", "loss"):
+                continue  # ungrounded / absent — inconclusive for this model
+            slot = by_model.setdefault(m, {"appeared": 0, "total": 0})
+            slot["total"] += 1
+            won = v == "win"
+            wins[m] = won
+            if won:
+                slot["appeared"] += 1
+        graded = [m for m in _SHOPPING_MODELS if m in wins]
+        if q and len(graded) >= 2 and len({wins[m] for m in graded}) > 1:
+            divergence.append({
+                "query": q,
+                "won": [m for m in graded if wins[m]],
+                "lost": [m for m in graded if not wins[m]],
+            })
+    for slot in by_model.values():
+        slot["rate"] = (
+            round(slot["appeared"] / slot["total"], 3) if slot["total"] else None
+        )
+    return by_model, divergence[:8]
+
+
 def build_product_competitiveness(per_prompt: Optional[List[Dict[str, Any]]]) -> Dict[str, Any]:
     """Product-FIRST view: does the product WIN non-branded discovery demand
     inside frontier models — where the brand gains NEW buyers — and who does AI
@@ -4899,6 +4946,7 @@ def build_product_competitiveness(per_prompt: Optional[List[Dict[str, Any]]]) ->
         ),
         key=lambda c: -c["query_count"],
     )[:6]
+    by_model, model_divergence = _per_model_discovery(rows)
     return {
         "has_discovery": disc_total > 0,
         # Discovery queries ran but the AI grounded NONE of them -> we couldn't
@@ -4917,6 +4965,12 @@ def build_product_competitiveness(per_prompt: Optional[List[Dict[str, Any]]]) ->
             "total": br_total,
             "rate": round(br_appeared / br_total, 3) if br_total else None,
         },
+        # Per-model discovery appearance + divergence: Gemini and ChatGPT ground
+        # different indexes, so a product can win one and lose the other — the
+        # merchant should act per model (e.g. win ChatGPT by earning the
+        # editorial/Bing-indexed sources it leans on). Aggregate above stays.
+        "by_model": by_model,
+        "model_divergence": model_divergence,
     }
 
 
