@@ -6,12 +6,19 @@ from __future__ import annotations
 from services.agent_center_bd_report_service import build_product_competitiveness
 
 
-def _row(query, axis, merchant_cited_runs=0, competitors=None):
+def _row(query, axis, merchant_cited_runs=0, competitors=None, grounded=True):
+    # `grounded` = the AI returned real sources for this query. A grounded row
+    # carries a citation run + cited hosts so it counts toward the denominator;
+    # an ungrounded row (no sources) is inconclusive and excluded.
+    ss = {"merchant_cited_runs": merchant_cited_runs}
+    if grounded:
+        ss["runs_with_citations"] = max(1, merchant_cited_runs)
+        ss["top_cited_hosts"] = [{"host": "example.com", "times_cited": 1}]
     return {
         "query": query,
         "normalized_query": query,
         "axis": axis,
-        "source_summary": {"merchant_cited_runs": merchant_cited_runs},
+        "source_summary": ss,
         "competitors": competitors or [],
     }
 
@@ -71,3 +78,33 @@ def test_no_discovery_queries_flags_has_discovery_false():
     assert pc["has_discovery"] is False
     assert pc["discovery"]["total"] == 0
     assert pc["branded"]["total"] == 2
+
+
+def test_ungrounded_discovery_excluded_from_denominator():
+    # A discovery query the AI didn't ground is inconclusive — not "appeared",
+    # not "missed", and not in the total. Honest rate over grounded only.
+    per_prompt = [
+        _row("best hair oil for damaged hair", "category", merchant_cited_runs=1),
+        _row("best hair oil for split ends", "category", merchant_cited_runs=0,
+             competitors=["Olaplex"]),
+        _row("best hair oil for frizz", "category", grounded=False),  # ungrounded
+    ]
+    pc = build_product_competitiveness(per_prompt)
+    assert pc["discovery"]["total"] == 2          # ungrounded one excluded
+    assert pc["discovery"]["appeared"] == 1
+    assert pc["discovery"]["ungrounded"] == 1
+    assert pc["grounding_unavailable"] is False
+
+
+def test_all_discovery_ungrounded_flags_couldnt_measure():
+    # Discovery queries ran but the AI grounded NONE -> couldn't measure this
+    # run; must NOT report a false "appears in 0 of N".
+    per_prompt = [
+        _row("best hair oil for damaged hair", "category", grounded=False),
+        _row("bond repair hair oil for breakage", "category", grounded=False),
+    ]
+    pc = build_product_competitiveness(per_prompt)
+    assert pc["has_discovery"] is False
+    assert pc["grounding_unavailable"] is True
+    assert pc["discovery"]["total"] == 0
+    assert pc["discovery"]["ungrounded"] == 2

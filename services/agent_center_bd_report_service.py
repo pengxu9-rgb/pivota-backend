@@ -4795,9 +4795,21 @@ def build_channel_appearance(
     channels.sort(
         key=lambda c: (not c["is_own_site"], -c["cited_query_count"], c["host"])
     )
+    # No third-party hosts cited AND the brand never appeared anywhere = the AI
+    # didn't ground ANY answer this run -> we couldn't measure (transient
+    # grounding/quota failure), NOT "your product appears on no channel". The UI
+    # must say "couldn't measure, re-run" rather than show an empty channel list
+    # as if it were the truth.
+    grounding_unavailable = (
+        total > 0
+        and not agg
+        and own_cited == 0
+        and brand_mentioned == 0
+    )
     return {
         "total_queries": total,
         "own_site_host": own,
+        "grounding_unavailable": grounding_unavailable,
         # Your OWN domain cited as a source (the honest "are you the answer?").
         "own_site_cited": own_cited > 0,
         "own_site_cited_count": own_cited,
@@ -4831,11 +4843,18 @@ def build_product_competitiveness(per_prompt: Optional[List[Dict[str, Any]]]) ->
     recommend instead? Branded name queries are reported separately as low-value.
     Reuses per_prompt cited evidence + competitors; no new probes.
 
-    Returns {has_discovery, discovery:{appeared,total,rate,missed[],
-    top_competitors[]}, branded:{appeared,total,rate}}.
+    Honesty: a query only counts when the AI actually GROUNDED its answer (cited
+    sources). An ungrounded probe (the engine answered with no web sources — a
+    transient grounding/quota failure, not "the product is invisible") is
+    excluded from the denominator and tallied as `ungrounded`. When discovery
+    queries ran but NONE grounded, `grounding_unavailable` is set so the UI says
+    "couldn't measure, re-run" instead of a false "appears in 0 of N".
+
+    Returns {has_discovery, grounding_unavailable, discovery:{appeared,total,
+    rate,ungrounded,missed[],top_competitors[]}, branded:{appeared,total,rate}}.
     """
     rows = [r for r in (per_prompt or []) if isinstance(r, dict)]
-    disc_total = disc_appeared = 0
+    disc_total = disc_appeared = disc_ungrounded = 0
     br_total = br_appeared = 0
     missed: List[str] = []
     comp_counts: Dict[str, Dict[str, Any]] = {}
@@ -4843,7 +4862,17 @@ def build_product_competitiveness(per_prompt: Optional[List[Dict[str, Any]]]) ->
         intent = _intent_axis_for(r.get("normalized_query") or r.get("query"), r.get("axis"))
         ss = r.get("source_summary") if isinstance(r.get("source_summary"), dict) else {}
         appeared = int(ss.get("merchant_cited_runs") or 0) > 0
+        # Grounded = the AI returned real sources for this query (cited hosts,
+        # a citation run, or named competitors). No grounding => inconclusive.
+        grounded = bool(
+            int(ss.get("runs_with_citations") or 0) > 0
+            or ss.get("top_cited_hosts")
+            or r.get("competitors")
+        )
         if intent in _DISCOVERY_INTENTS:
+            if not grounded:
+                disc_ungrounded += 1
+                continue  # inconclusive — don't count as appeared OR missed
             disc_total += 1
             if appeared:
                 disc_appeared += 1
@@ -4858,6 +4887,8 @@ def build_product_competitiveness(per_prompt: Optional[List[Dict[str, Any]]]) ->
                 slot = comp_counts.setdefault(label.lower(), {"name": label, "queries": set()})
                 slot["queries"].add(r.get("normalized_query") or r.get("query"))
         elif intent in _BRANDED_INTENTS:
+            if not grounded:
+                continue
             br_total += 1
             if appeared:
                 br_appeared += 1
@@ -4870,10 +4901,14 @@ def build_product_competitiveness(per_prompt: Optional[List[Dict[str, Any]]]) ->
     )[:6]
     return {
         "has_discovery": disc_total > 0,
+        # Discovery queries ran but the AI grounded NONE of them -> we couldn't
+        # measure this run (vs has_discovery False = no discovery queries built).
+        "grounding_unavailable": disc_total == 0 and disc_ungrounded > 0,
         "discovery": {
             "appeared": disc_appeared,
             "total": disc_total,
             "rate": round(disc_appeared / disc_total, 3) if disc_total else None,
+            "ungrounded": disc_ungrounded,
             "missed": missed[:8],
             "top_competitors": top_competitors,
         },
