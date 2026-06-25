@@ -161,12 +161,14 @@ async def _call_openai_compatible_chat(
         provider=provider,
     )
     choices = payload.get("choices") or []
-    message = choices[0].get("message") if choices and isinstance(choices[0], Mapping) else {}
+    first_choice = choices[0] if choices and isinstance(choices[0], Mapping) else {}
+    message = first_choice.get("message") if isinstance(first_choice, Mapping) else {}
     text = str((message or {}).get("content") or "")
     usage = _openai_usage(payload.get("usage"))
     return {
         "text": text,
         "usage": usage,
+        "finish_reason": first_choice.get("finish_reason") if isinstance(first_choice, Mapping) else None,
         "provider": provider,
         "model": model,
     }
