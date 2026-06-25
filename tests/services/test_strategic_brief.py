@@ -1806,3 +1806,12 @@ def test_validate_grounding_rejects_unsupported_multiplier_claims():
     ]
 
     assert strategic_brief.validate_grounding(brief, _evidence()) is False
+
+
+def test_system_prompt_carries_generative_engine_operating_model():
+    # The brief prompt must ground "why you lose" + the moves in HOW generative
+    # engines pick what to cite (the best-practice levers), not generic advice.
+    p = strategic_brief._STRATEGIC_BRIEF_SYSTEM_PROMPT
+    for lever in ("RETRIEVABLE", "EXTRACTABLE", "CORROBORATED", "PROVEN", "AUTHORITATIVE"):
+        assert lever in p, lever
+    assert "HOW GENERATIVE ENGINES CHOOSE WHAT TO CITE" in p
