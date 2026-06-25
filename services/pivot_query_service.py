@@ -995,6 +995,45 @@ def _index_eligible_recall_enabled() -> bool:
     )
 
 
+# Generic terms dropped from the citable token-match so a single common word
+# can't loosen the gate. Mirrors the gateway's TOKEN_STOPWORDS.
+_CITABLE_TOKEN_STOPWORDS = frozenset(
+    {
+        "the", "and", "for", "with", "from", "you", "your", "our", "best",
+        "buy", "shop", "store", "review", "reviews", "vs", "top", "new",
+        "off", "all", "any", "are", "was", "has", "how", "what", "who",
+        "where", "when", "why", "this", "that", "these", "those", "into",
+    }
+)
+
+
+def _citable_token_match_enabled() -> bool:
+    """Flag for the citable token-overlap match (default OFF ⇒ byte-identical:
+    no token clauses are added to the citable SQL). When ON, sharpens citation
+    recall/search so an intent phrase whose words appear non-contiguously in a
+    title still matches — ported from the gateway's tokenMatch."""
+    return (
+        (os.getenv("CITABLE_TOKEN_MATCH") or "").strip().lower()
+        in {"1", "true", "yes", "on"}
+    )
+
+
+def _citable_query_tokens(lowered: str) -> List[str]:
+    """Significant tokens of an already-normalized query: len>=3, stopwords
+    dropped, deduped, capped at 6 (matches the gateway tokenizer)."""
+    seen: set[str] = set()
+    out: List[str] = []
+    for raw in str(lowered or "").split():
+        tok = raw.strip()
+        if len(tok) < 3 or tok in _CITABLE_TOKEN_STOPWORDS or tok in seen:
+            continue
+        seen.add(tok)
+        out.append(tok)
+        if len(out) >= 6:
+            break
+    return out
+
+
 def _recall_relevance_v2_enabled() -> bool:
     """Recall relevance v2. When ON, ranking orders by TEXT relevance first and
     treats structural/scope boosts (multi_merchant_canonical, lifecycle,
@@ -1066,6 +1105,32 @@ async def _fetch_citable_canonical_rows(
             + CASE WHEN p.category_path IS NOT NULL AND p.category_path LIKE :category_path_prefix THEN 90 ELSE 0 END
         """
 
+    # Token-overlap match (ported from the gateway). ADDITIVE: when the query has
+    # >=2 significant tokens, ALSO match a row whose title/brand contains at least
+    # ceil(n/2) (min 2) of them, ranked by overlap (×25). The whole-phrase clause
+    # is untouched, so this can only ADD matches. Flag-gated (CITABLE_TOKEN_MATCH,
+    # default OFF) ⇒ token_where/token_score stay empty ⇒ byte-identical SQL.
+    token_where = ""
+    token_score = ""
+    if _citable_token_match_enabled():
+        _tokens = _citable_query_tokens(lowered)
+        if len(_tokens) >= 2:
+            _overlap_terms = []
+            for _i, _tok in enumerate(_tokens):
+                _pname = f"ctok{_i}"
+                params[_pname] = f"%{_tok}%"
+                _overlap_terms.append(
+                    "(CASE WHEN LOWER(COALESCE(COALESCE(apv.title, p.title), '')) LIKE :"
+                    + _pname
+                    + " OR LOWER(COALESCE(COALESCE(apv.brand, p.brand), '')) LIKE :"
+                    + _pname
+                    + " THEN 1 ELSE 0 END)"
+                )
+            _overlap_expr = " + ".join(_overlap_terms)
+            params["ctok_min"] = max(2, (len(_tokens) + 1) // 2)
+            token_where = f"\n            OR (({_overlap_expr}) >= :ctok_min)\n"
+            token_score = f"\n                + (({_overlap_expr}) * 25)\n"
+
     rows = await database.fetch_all(
         f"""
         SELECT
@@ -1112,7 +1177,7 @@ async def _fetch_citable_canonical_rows(
                 CASE WHEN p.pdp_scope = 'multi_merchant_canonical' THEN 200 ELSE 0 END +
                 CASE WHEN p.pdp_lifecycle_stage = 'published' THEN 60 ELSE 0 END +
                 CASE WHEN p.pdp_lifecycle_stage = 'validated' THEN 20 ELSE 0 END
-                {category_score}
+                {category_score}{token_score}
             ) AS rank_score
         FROM catalog_products p
         JOIN index_pipeline_state ips
@@ -1126,7 +1191,7 @@ async def _fetch_citable_canonical_rows(
             LOWER(COALESCE(COALESCE(apv.brand, p.brand), '')) LIKE :query_like OR
             LOWER(COALESCE(m.merchant_name, '')) LIKE :query_like OR
             LOWER(COALESCE(p.source_product_id, '')) LIKE :query_like
-            {category_where}
+            {category_where}{token_where}
           )
           {merchant_clause}
           {lifecycle_clause}
