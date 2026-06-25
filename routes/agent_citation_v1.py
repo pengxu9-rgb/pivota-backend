@@ -7,16 +7,31 @@ resolver + `substantiated_claims`, and NEVER emits offers / price /
 merchant-private fields. Public-read, rate-limited per `X-Pivota-Agent` (else
 client IP), cacheable.
 
+B④-P1 (attribution telemetry): every inbound read is logged best-effort to
+`citation_read_log` off the response hot path (`X-Pivota-Agent` else IP + what
+was asked for + outcome) — the external half of "who cites us". Flag-gated
+`CITATION_READ_TELEMETRY`, default OFF.
+
 Contract: pivota-merchants-portal/docs/external-citation-api-contract.md
 """
 
 from __future__ import annotations
 
+import asyncio
+import os
 import time
-from typing import Any, Dict
+from typing import Any, Dict, Optional, Tuple
 
 from fastapi import APIRouter, Depends, HTTPException, Query, Request, Response, status
 
+from db.citation_read_log import (
+    STATUS_DISABLED,
+    STATUS_EMPTY,
+    STATUS_HIT,
+    STATUS_MISS,
+    STATUS_SUPPRESSED,
+    log_citation_read,
+)
 from db.database import database
 from middleware.rate_limiter import AdvancedRateLimiter
 from routes.agent_pdp_v1 import (
@@ -40,9 +55,47 @@ SUMMARY_MAX = 200
 _limiter = AdvancedRateLimiter()
 
 
+def _caller_identity(request: Request) -> Tuple[Optional[str], Optional[str]]:
+    """The caller's self-declared `X-Pivota-Agent` id (free-form UA-style, e.g.
+    `openai-chatgpt/1.0`) and client IP. Single source of truth for both the
+    rate-limit key and the B④-P1 attribution telemetry."""
+    agent = (request.headers.get("X-Pivota-Agent") or "").strip() or None
+    client_ip = request.client.host if request.client else None
+    return agent, client_ip
+
+
+def _telemetry_enabled() -> bool:
+    """B④-P1 attribution telemetry flag. Default OFF ⇒ no logging task is ever
+    spawned, so the off-path is byte-identical to today. Canary on per repo
+    rollout convention."""
+    return (os.getenv("CITATION_READ_TELEMETRY") or "").strip().lower() in {
+        "1", "true", "yes", "on",
+    }
+
+
+# Strong refs to in-flight fire-and-forget log tasks so the event loop doesn't
+# GC them mid-write (asyncio only holds weak refs to bare tasks).
+_log_tasks: "set[asyncio.Task[Any]]" = set()
+
+
+def _spawn_log(**fields: Any) -> None:
+    """Fire-and-forget the best-effort telemetry write OFF the response hot
+    path. Never raises into the handler; a flag-OFF or loop-less context is a
+    silent no-op."""
+    if not _telemetry_enabled():
+        return
+    try:
+        task = asyncio.ensure_future(log_citation_read(**fields))
+    except RuntimeError:
+        # No running loop (e.g. a sync test path) — drop quietly.
+        return
+    _log_tasks.add(task)
+    task.add_done_callback(_log_tasks.discard)
+
+
 async def _citation_rate_limit(request: Request) -> None:
-    agent = (request.headers.get("X-Pivota-Agent") or "").strip()
-    key = agent or (request.client.host if request.client else "anonymous")
+    agent, client_ip = _caller_identity(request)
+    key = agent or client_ip or "anonymous"
     allowed, meta = await _limiter.check_limit(key, tier="standard")
     if not allowed:
         retry = max(1, int(meta.get("reset", 0) - time.time()))
@@ -148,9 +201,13 @@ async def search_citations(
     limit: int = Query(20, ge=1, le=50),
     _rl: None = Depends(_citation_rate_limit),
 ) -> Dict[str, Any]:
+    agent, client_ip = _caller_identity(request)
     query = str(q or "").strip()
     norm_intent = str(intent or "inform").strip().lower()
     if not query:
+        _spawn_log(endpoint="search", status=STATUS_EMPTY, query=query,
+                   intent=norm_intent or "inform", result_count=0,
+                   agent=agent, client_ip=client_ip)
         return {"items": [], "count": 0, "query": q, "intent": norm_intent or "inform"}
 
     # Intent gate (parity with the recall lane): shop / strict_serving_mode
@@ -158,6 +215,8 @@ async def search_citations(
     # non-buyable row. Only inform-intent surfaces citations.
     if norm_intent in ("shop", "strict", "strict_serving_mode", "transact"):
         response.headers["Cache-Control"] = "public, max-age=120"
+        _spawn_log(endpoint="search", status=STATUS_SUPPRESSED, query=query,
+                   intent="shop", result_count=0, agent=agent, client_ip=client_ip)
         return {
             "items": [],
             "count": 0,
@@ -173,12 +232,17 @@ async def search_citations(
     )
 
     if not _index_eligible_recall_enabled():
+        _spawn_log(endpoint="search", status=STATUS_DISABLED, query=query,
+                   intent="inform", result_count=0, agent=agent, client_ip=client_ip)
         return {"items": [], "count": 0, "query": query, "intent": "inform"}
 
     rows = await _fetch_citable_canonical_rows(query=query, merchant_id=None, limit=limit)
     items = [_search_row_to_citation(r) for r in rows]
     response.headers["Cache-Control"] = "public, max-age=120"
     response.headers["X-Pivota-Citation-Source"] = "Pivota"
+    _spawn_log(endpoint="search", status=(STATUS_HIT if items else STATUS_EMPTY),
+               query=query, intent="inform", result_count=len(items),
+               agent=agent, client_ip=client_ip)
     return {"items": items, "count": len(items), "query": query, "intent": "inform"}
 
 
@@ -189,30 +253,52 @@ async def get_citation(
     response: Response,
     _rl: None = Depends(_citation_rate_limit),
 ) -> Dict[str, Any]:
-    raw = str(citation_id or "").strip()
-    if not raw:
+    requested_id = str(citation_id or "").strip()
+    agent, client_ip = _caller_identity(request)
+    item = await _resolve_citation_item(requested_id)
+
+    # B④-P1: log every call (hit or miss) off the response hot path. A miss is
+    # itself signal — an agent asking for a product we don't (yet) cite.
+    _spawn_log(
+        endpoint="item",
+        status=(STATUS_HIT if item else STATUS_MISS),
+        requested_id=requested_id or None,
+        content_key=(item.get("content_key") if item else None),
+        agent=agent,
+        client_ip=client_ip,
+    )
+
+    if item is None:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="not found")
 
-    # Same fail-closed gate as get_pdp: index_eligible rows are readable only
-    # when INDEX_ELIGIBLE_READ is on; flag OFF ⇒ serving-only resolution.
+    # Citation data is not real-time; cacheable + CDN-frontable.
+    response.headers["Cache-Control"] = "public, max-age=300, stale-while-revalidate=600"
+    response.headers["X-Pivota-Citation-Source"] = "Pivota"
+    return item
+
+
+async def _resolve_citation_item(raw: str) -> Optional[Dict[str, Any]]:
+    """Resolve a raw path id to a CitationItem, or None when nothing matches.
+    No raises — so the single get_citation telemetry point covers hit + miss
+    uniformly. Same fail-closed gate / resolver chain as get_pdp."""
+    if not raw:
+        return None
+
+    # index_eligible rows are readable only when INDEX_ELIGIBLE_READ is on;
+    # flag OFF ⇒ serving-only resolution.
     index_read = _index_eligible_read_enabled()
 
     # ext_* IDs resolve to a content_key first (reuses agent_pdp_v1's resolver).
     if _is_external_product_id(raw):
         resolved = await database.fetch_one(EXT_RESOLVE_SQL, {"ext_id": raw})
         if not resolved:
-            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="not found")
+            return None
         raw = str(dict(resolved).get("content_key") or "")
 
     sql = _query_for_id(raw, index_eligible_read=index_read)
     if sql is None:
-        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="not found")
+        return None
     row = await database.fetch_one(sql, {"id": raw})
     if not row:
-        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="not found")
-
-    item = project_citation_item(_row_to_dict(row))
-    # Citation data is not real-time; cacheable + CDN-frontable.
-    response.headers["Cache-Control"] = "public, max-age=300, stale-while-revalidate=600"
-    response.headers["X-Pivota-Citation-Source"] = "Pivota"
-    return item
+        return None
+    return project_citation_item(_row_to_dict(row))
