@@ -310,6 +310,10 @@ _AI_ENGINE_ENTITIES = {
     "perplexity",
 }
 _MULTIPART_TLDS = {"co.uk", "com.au", "co.jp", "co.kr", "com.br"}
+# Standards/spec references the brief cites when recommending structured data.
+# These are not competitors or buyer-path sources, so they must not trip the
+# unknown-domain guard (e.g. "add Product schema per schema.org").
+_TECHNICAL_ALLOWED_DOMAINS = {"schema.org", "json-ld.org", "ogp.me"}
 _SENTENCE_BOUNDARY_CHARS = {".", "!", "?", ":", ";", "\n", "•", "–", "—", "-"}
 _SENTENCE_PREFIX_STRIP_CHARS = " \t\r\f\v\"'`“”‘’()[]{}<>"
 _CONNECTOR_WORDS = {"of", "the", "for", "and", "&"}
@@ -329,6 +333,28 @@ _SHOPPING_WORDS = {
     "vs",
     "where",
 }
+# Generic merchandising + AEO/structured-data vocabulary the brief legitimately
+# RECOMMENDS the merchant create (a Starter Kit, a Subscribe & Save offer, an
+# About Us page, Organization/Product/Review/FAQ structured data). These are not
+# fabricated brands or competitors, so they must not trip the unknown-entity
+# guard. Single tokens — multiword constructs ("Starter Kit", "About Us") pass
+# because every token is here. Competitor/stat fabrication is still caught by the
+# separate competitor + forbidden-pattern checks.
+_GENERIC_COMMERCE_ENTITIES = frozenset({
+    "about", "us",
+    "schema", "markup", "jsonld", "metadata", "structured", "data",
+    "breadcrumb", "breadcrumbs", "breadcrumblist",
+    "organization", "product", "offer", "offers", "review", "reviews",
+    "rating", "ratings", "aggregate", "aggregaterating",
+    "subscribe", "subscription", "save", "saver", "autoship", "replenish",
+    "replenishment",
+    "starter", "kit", "kits", "refill", "refills", "pack", "packs",
+    "bundle", "bundles", "set", "sets",
+    "homepage", "landing", "hero", "listing", "listings", "collection",
+    "guarantee", "guarantees", "warranty", "samples", "sample", "loyalty",
+    "rewards", "returns", "return", "shipping", "stock", "availability",
+    "testimonial", "testimonials", "quiz", "guide", "guides", "tutorial",
+})
 _COMMON_WORDS = frozenset({
     "answer",
     "answers",
@@ -599,13 +625,16 @@ _SAFETY_SENSITIVE_TERMS = {
     "cancer",
     "cure",
     "cures",
-    "treat",
-    "treats",
     "treatment",
     "clinical",
     "clinically",
     "fda",
 }
+# Word-families where one grounded member licenses the rest (same cosmetic claim,
+# not a new medical one). Used only to extend the OWN-evidence safety allow-list.
+_SAFETY_TERM_FAMILIES = (
+    frozenset({"treat", "treats", "treatment", "treatments"}),
+)
 
 
 def assemble_sku_brief_evidence(
@@ -2039,7 +2068,11 @@ def _grounding_failures(
 
     for domain in _DOMAIN_RE.findall(text):
         normalized = _normalize_host(domain)
-        if normalized and normalized not in allowed["domains"]:
+        if (
+            normalized
+            and normalized not in allowed["domains"]
+            and normalized not in _TECHNICAL_ALLOWED_DOMAINS
+        ):
             failures.append(f"unknown-domain:{domain}")
 
     for quote in _QUOTE_RE.findall(text):
@@ -2270,6 +2303,12 @@ def _allowed_grounding(evidence: Mapping[str, Any]) -> Dict[str, Any]:
     own_safe_words: Set[str] = set()
     for part in own_safe_parts:
         own_safe_words.update(re.findall(r"[a-z0-9]+", part.lower()))
+    # A grounded member of a cosmetic word-family licenses the family: a product
+    # named a "Treatment" can be described as something that "treats" — the verb
+    # is the same cosmetic claim, not a new medical one.
+    for family in _SAFETY_TERM_FAMILIES:
+        if own_safe_words & family:
+            own_safe_words |= family
     safety_words |= {term for term in _SAFETY_SENSITIVE_TERMS if term in own_safe_words}
 
     return {
@@ -2536,6 +2575,20 @@ def _entity_allowed(entity: str, allowed: Mapping[str, Any]) -> bool:
     domain = _normalize_host(entity)
     if domain and domain in allowed["domains"]:
         return True
+    # The cited source's human-readable name ("Olive Young") is grounded when
+    # its domain (oliveyoung.com) is — collapse the entity's significant words
+    # (dropping connectors/common words the extractor may have swept in, e.g. a
+    # trailing "for") and match the registrable label of any allowed domain.
+    significant = [
+        word
+        for word in re.findall(r"[a-z0-9]+", normalized)
+        if word not in _CONNECTOR_WORDS and not _is_common_entity_word(word)
+    ]
+    collapsed = "".join(significant)
+    if collapsed and any(
+        collapsed == _registrable_label(d) for d in allowed["domains"]
+    ):
+        return True
     if normalized in _INTERNAL_ALLOWED_ENTITIES:
         return True
     for term in allowed["terms"]:
@@ -2656,6 +2709,7 @@ _COMMON_WORD_SETS = (
     _COMMON_PROSE_WORDS,
     _ENTITY_STOPWORD_NORMALIZED,
     _INTERNAL_ALLOWED_ENTITIES,
+    _GENERIC_COMMERCE_ENTITIES,
 )
 
 

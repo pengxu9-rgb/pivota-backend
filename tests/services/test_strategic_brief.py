@@ -1861,3 +1861,44 @@ def test_unrelated_domain_still_rejected():
     failures = strategic_brief._grounding_failures(brief, evidence)
 
     assert any(f.startswith("unknown-domain") for f in failures)
+
+
+def test_cited_source_spelled_name_is_grounded():
+    # The cited retailer's human name ("Amazon") must be allowed when its domain
+    # (amazon.com, via category_battle.ranked_by) is cited. Regression: "Olive
+    # Young" was rejected though oliveyoung.com was allowed, blocking the brief.
+    evidence = _validation_fix_evidence()
+    brief = _validation_fix_grounded_brief()
+    brief["why_you_lose"] = "AI cites Amazon for these lanes before your own page."
+
+    failures = strategic_brief._grounding_failures(brief, evidence)
+
+    assert not any(f.startswith("unknown-entity:Amazon") for f in failures), failures
+
+
+def test_generic_commerce_and_aeo_constructs_are_grounded():
+    # The brief RECOMMENDS generic constructs (Starter Kit, Subscribe & Save,
+    # About Us page, Organization schema per schema.org). These are not
+    # fabricated brands and must not trip the unknown-entity/-domain guards.
+    evidence = _validation_fix_evidence()
+    brief = _validation_fix_grounded_brief()
+    brief["first_moves"] = [
+        "Create a Starter Kit and a Subscribe & Save offer to reward direct buyers.",
+        "Add an About Us page plus Product, Review, and Organization structured data per schema.org.",
+    ]
+
+    failures = strategic_brief._grounding_failures(brief, evidence)
+
+    assert not any(f.startswith("unknown-entity") for f in failures), failures
+    assert not any(f.startswith("unknown-domain") for f in failures), failures
+
+
+def test_invented_competitor_still_rejected():
+    # The vocabulary loosening must not let a fabricated brand through.
+    evidence = _validation_fix_evidence()
+    brief = _validation_fix_grounded_brief()
+    brief["why_you_lose"] = "AI cites NeoGlow Laboratories as the category leader."
+
+    failures = strategic_brief._grounding_failures(brief, evidence)
+
+    assert any(f.startswith("unknown-entity") for f in failures), failures
