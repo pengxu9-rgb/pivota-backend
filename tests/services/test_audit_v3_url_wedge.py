@@ -677,6 +677,12 @@ def test_retail_channel_url_uses_brand_site_as_first_party(client):
     assert syn["pdp_url"] == "https://global.oliveyoung.com/products/anuko-x"
     assert syn["canonical_url"] == "https://anuko.com"
     assert syn["retail_channel_host"] == "global.oliveyoung.com"
+    # Retail page = referring context, not the product's own data source.
+    assert syn["product_data_source"] == "retail_channel"
+    # …and the source is surfaced per product in the response envelope.
+    ap = client.enqueued[-1]["request_options_jsonb"]["launch"]["wedge_base_payload"]["audited_products"][0]
+    assert ap["data_source"] == "retail_channel"
+    assert ap["retail_channel_host"] == "global.oliveyoung.com"
 
 
 def test_own_site_url_keeps_product_page_as_canonical(client):
@@ -691,6 +697,10 @@ def test_own_site_url_keeps_product_page_as_canonical(client):
     syn = client.enqueued[-1]["request_options_jsonb"]["launch"]["synthetic_products"][0]
     assert syn["canonical_url"] == "https://merch.example/products/a"
     assert syn["retail_channel_host"] is None
+    # Own page = first-party product data source.
+    assert syn["product_data_source"] == "own_pdp"
+    ap = client.enqueued[-1]["request_options_jsonb"]["launch"]["wedge_base_payload"]["audited_products"][0]
+    assert ap["data_source"] == "own_pdp"
 
 
 def test_get_succeeded_includes_merchant_context(monkeypatch):
