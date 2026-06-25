@@ -460,6 +460,9 @@ async def _process_one_audit_run_inner(
                         # Merchant-input prompt slots (debited as prompt credits
                         # at enqueue). Probe them so they aren't billed-but-dropped.
                         custom_prompts=launch_options.get("custom_prompts"),
+                        # Opt-in (URL audits): LLM value-prop extraction -> probe
+                        # winnable SPECIFIC discovery prompts, not just generic heads.
+                        winnable_prompts=bool(launch_options.get("winnable_prompts")),
                     )
                     await mar.record_partial_result(
                         run_id=run_id,
