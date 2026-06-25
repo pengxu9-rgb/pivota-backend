@@ -20,6 +20,33 @@ from fastapi import FastAPI
 from fastapi.testclient import TestClient
 
 
+def _sitemap_row_eligible(r: Dict[str, Any]) -> bool:
+    """Mirror routes.pivota_canonical_routes list eligibility, flag-aware.
+
+    content_key always required; canonical sig required ONLY when the sitemap
+    is not widened; serving_eligible OR (widened AND index_eligible).
+    """
+    widen = (os.getenv("INDEX_ELIGIBLE_SITEMAP") or "").strip().lower() in {
+        "1",
+        "true",
+        "yes",
+        "on",
+    }
+    if not r.get("content_key"):
+        return False
+    if r.get("merchant_indexable", True) is not True:
+        return False
+    if r.get("merchant_status", "active") != "active":
+        return False
+    has_sig = str(r.get("pivota_signature_id") or "").startswith("sig_")
+    serving = r.get("serving_eligible") is True
+    index_elig = r.get("index_eligible") is True
+    # identity: sig-bearing, OR an index_eligible citation row when widened
+    identity_ok = has_sig or (widen and index_elig)
+    eligible = serving or (widen and index_elig)
+    return identity_ok and eligible
+
+
 class FakeDb:
     """Minimal in-memory DB stub. Parses the compiled SQL loosely to
     decide which canned response to return — enough for the resolver's
@@ -52,7 +79,7 @@ class FakeDb:
         return None
 
     async def fetch_all(self, query):
-        # Used by the list endpoint; return all rows that have a sig.
+        # Used by the list endpoint; mirror the real eligibility filter.
         try:
             sql = str(query.compile(compile_kwargs={"literal_binds": True}))
         except Exception:
@@ -64,16 +91,8 @@ class FakeDb:
         m_off = re.search(r"OFFSET\s+(\d+)", sql, re.I)
         lim = int(m_lim.group(1)) if m_lim else 200
         off = int(m_off.group(1)) if m_off else 0
-        with_sig = [
-            r
-            for r in self._rows
-            if r.get("pivota_signature_id")
-            and r.get("content_key")
-            and r.get("serving_eligible") is True
-            and r.get("merchant_indexable", True) is True
-            and r.get("merchant_status", "active") == "active"
-        ]
-        return with_sig[off : off + lim]
+        eligible = [r for r in self._rows if _sitemap_row_eligible(r)]
+        return eligible[off : off + lim]
 
     async def fetch_val(self, query):
         try:
@@ -81,18 +100,8 @@ class FakeDb:
         except Exception:
             sql = ""
         self.compiled_sql.append(sql)
-        # Just used for COUNT — return total of public-serving rows with sig.
-        return len(
-            [
-                r
-                for r in self._rows
-                if r.get("pivota_signature_id")
-                and r.get("content_key")
-                and r.get("serving_eligible") is True
-                and r.get("merchant_indexable", True) is True
-                and r.get("merchant_status", "active") == "active"
-            ]
-        )
+        # COUNT — total of rows passing the (flag-aware) sitemap eligibility gate.
+        return len([r for r in self._rows if _sitemap_row_eligible(r)])
 
 
 class SlowDb:
@@ -127,6 +136,7 @@ def _row(sig_suffix: str, **overrides) -> Dict[str, Any]:
         "pivota_canonical_url": f"https://agent.pivota.cc/products/sig_{sig_suffix}",
         "content_key": f"ck_{sig_suffix}",
         "serving_eligible": True,
+        "index_eligible": False,
         "blocker_code": None,
         "blocker_detail": None,
         "content_quality_score": 91.0,
@@ -160,6 +170,16 @@ def env(monkeypatch: pytest.MonkeyPatch):
         # Otherwise-eligible row whose merchant is inactive
         # (catalog_merchants.status != 'active'). Same exclusion contract.
         _row("inactive", merchant_id="merch_off", merchant_status="inactive"),
+        # Store-less brand-authored row: offer-free citation, no minted sig
+        # (index_eligible only). Excluded when the sitemap is strict; included
+        # (keyed on content_key) when INDEX_ELIGIBLE_SITEMAP widens the gate.
+        {
+            **_row("storeless"),
+            "pivota_signature_id": None,
+            "pivota_canonical_url": None,
+            "serving_eligible": False,
+            "index_eligible": True,
+        },
     ]
     monkeypatch.setattr(pcr, "database", FakeDb(rows))
 
@@ -248,6 +268,39 @@ def test_list_canonical_pdps_returns_only_serving_eligible_rows_with_sig(env):
         assert item["blocker_code"] is None
         assert item["quality_scored_at"] == "2026-05-07T00:00:00+00:00"
         assert item["last_modified"] == "2026-05-01T00:00:00+00:00"
+
+
+def test_list_canonical_pdps_excludes_storeless_when_sitemap_strict(
+    env, monkeypatch: pytest.MonkeyPatch
+):
+    # Flag OFF (default): the offer-free brand-authored row (no sig) is NOT in
+    # the sitemap — prior behavior preserved.
+    monkeypatch.delenv("INDEX_ELIGIBLE_SITEMAP", raising=False)
+    body = env.get("/api/canonical/products").json()
+    assert body["total"] == 3
+    assert "ck_storeless" not in [i["content_key"] for i in body["items"]]
+
+
+def test_list_canonical_pdps_includes_storeless_when_sitemap_widened(
+    env, monkeypatch: pytest.MonkeyPatch
+):
+    # Flag ON: the store-less brand-authored row (index_eligible, null sig) is
+    # included, keyed on content_key; a serving row without a sig still is not.
+    monkeypatch.setenv("INDEX_ELIGIBLE_SITEMAP", "1")
+    res = env.get("/api/canonical/products")
+    assert res.status_code == 200
+    body = res.json()
+    # 3 serving+sig rows + the 1 offer-free citation row
+    assert body["total"] == 4
+    by_ck = {i["content_key"]: i for i in body["items"]}
+    assert "ck_nosig" not in by_ck  # serving but sig-less → still excluded
+    storeless = by_ck["ck_storeless"]
+    assert storeless["sig_id"] is None
+    assert storeless["serving_eligible"] is False
+    assert storeless["index_eligible"] is True
+    assert storeless["canonical_url"] == "https://agent.pivota.cc/products/ck_storeless"
+    # serving rows now also carry the index_eligible flag (False) for the UI gate
+    assert by_ck["ck_abc"]["index_eligible"] is False
 
 
 def test_list_canonical_pdps_excludes_non_indexable_merchant(env):

@@ -49,6 +49,11 @@ router = APIRouter(
     tags=["canonical-pdp"],
 )
 
+# Public PDP URL base. Used to synthesize a canonical_url for offer-free
+# brand-authored rows that have no minted sig (their pivota_canonical_url may be
+# null) — the served PDP resolves by content_key, so the sitemap points there.
+_PDP_URL_PREFIX = "https://agent.pivota.cc/products/"
+
 T = TypeVar("T")
 
 
@@ -295,13 +300,27 @@ async def list_canonical_pdp_signatures(
     # ADR-007 SLICE 1: the public /products SITEMAP listing is a content/SEO
     # decision distinct from the citation read surface. It is widened ONLY by
     # INDEX_ELIGIBLE_SITEMAP — never by INDEX_ELIGIBLE_READ. Both default OFF.
-    eligibility_filter = and_(
+    widen_sitemap = _flag_on("INDEX_ELIGIBLE_SITEMAP")
+    # content_key is the always-required identity (it keys the served PDP). A
+    # canonical sig qualifies a row as before; when widened to the offer-free
+    # citation index, store-less brand-authored rows (null pivota_signature_id,
+    # index_eligible) ALSO qualify — keyed on content_key, URL falling back to
+    # /products/{content_key}. We deliberately do NOT drop the sig requirement
+    # wholesale: a serving row without a sig still doesn't qualify; only the
+    # index_eligible citation rows are added.
+    sig_present = and_(
         catalog_products.c.pivota_signature_id.isnot(None),
         catalog_products.c.pivota_signature_id.like("sig_%"),
+    )
+    identity_term = (
+        or_(sig_present, index_pipeline_state.c.index_eligible.is_(True))
+        if widen_sitemap
+        else sig_present
+    )
+    eligibility_filter = and_(
         catalog_products.c.content_key.isnot(None),
-        _eligibility_predicate(
-            widen_with_index_eligible=_flag_on("INDEX_ELIGIBLE_SITEMAP")
-        ),
+        identity_term,
+        _eligibility_predicate(widen_with_index_eligible=widen_sitemap),
         catalog_merchants.c.indexable.is_(True),
         catalog_merchants.c.status == "active",
     )
@@ -322,19 +341,24 @@ async def list_canonical_pdp_signatures(
         await _bounded_db(database.fetch_val(total_q), "product_signature_count") or 0
     )
 
+    # index_eligible is selected ONLY when the sitemap is widened — keeps the
+    # strict (flag-OFF) query byte-identical to the pre-Tier-2 behavior.
+    select_cols = [
+        catalog_products.c.product_key,
+        catalog_products.c.pivota_signature_id,
+        catalog_products.c.content_key,
+        catalog_products.c.pivota_canonical_url,
+        catalog_products.c.content_changed_at,
+        index_pipeline_state.c.serving_eligible,
+        index_pipeline_state.c.blocker_code,
+        index_pipeline_state.c.blocker_detail,
+        index_pipeline_state.c.content_quality_score,
+        index_pipeline_state.c.quality_scored_at,
+    ]
+    if widen_sitemap:
+        select_cols.append(index_pipeline_state.c.index_eligible)
     rows_q = (
-        select(
-            catalog_products.c.product_key,
-            catalog_products.c.pivota_signature_id,
-            catalog_products.c.content_key,
-            catalog_products.c.pivota_canonical_url,
-            catalog_products.c.content_changed_at,
-            index_pipeline_state.c.serving_eligible,
-            index_pipeline_state.c.blocker_code,
-            index_pipeline_state.c.blocker_detail,
-            index_pipeline_state.c.content_quality_score,
-            index_pipeline_state.c.quality_scored_at,
-        )
+        select(*select_cols)
         .select_from(serving_join)
         .where(eligibility_filter)
         .order_by(
@@ -352,8 +376,12 @@ async def list_canonical_pdp_signatures(
         {
             "sig_id": r["pivota_signature_id"],
             "content_key": r["content_key"],
-            "canonical_url": r["pivota_canonical_url"],
+            "canonical_url": (
+                r["pivota_canonical_url"]
+                or (f"{_PDP_URL_PREFIX}{r['content_key']}" if r["content_key"] else None)
+            ),
             "serving_eligible": bool(r["serving_eligible"]),
+            "index_eligible": (bool(r["index_eligible"]) if widen_sitemap else False),
             "blocker_code": r["blocker_code"],
             "blocker_detail": r["blocker_detail"],
             "content_quality_score": r["content_quality_score"],
