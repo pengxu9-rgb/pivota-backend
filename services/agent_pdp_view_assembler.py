@@ -19,6 +19,7 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 from decimal import Decimal
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -1039,3 +1040,80 @@ async def refresh_agent_pdp_view_for_content_key(
         return False
     await read_db.execute(UPSERT_SQL, row_to_upsert_params(row))
     return True
+
+
+def _propagate_enrichment_on_write_enabled() -> bool:
+    """Canary flag for write-triggered enrichment propagation (B①).
+
+    Default OFF. When off, an enrichment write does NOT immediately rebuild the
+    served agent_pdp_view — the overlay still reaches the view on the next
+    unrelated re-assembly (catalog sync, graduation, etc.), i.e. today's
+    behavior. When on, an enrichment write propagates straight to the served PDP.
+    """
+    return (os.getenv("SERVE_PDP_ENRICHMENT_ON_WRITE") or "").strip().lower() in {
+        "1",
+        "true",
+        "yes",
+        "on",
+    }
+
+
+async def refresh_agent_pdp_view_for_enrichment_write(
+    merchant_id: Optional[str],
+    platform: Optional[str],
+    platform_product_id: Optional[str],
+    *,
+    db: Any = None,
+) -> bool:
+    """Best-effort: rebuild the served agent_pdp_view after an enrichment WRITE.
+
+    The E2 publish bridge (assemble_row) already overlays product_enrichment into
+    agent_pdp_view at assembly time — but the only writers that re-assembled on
+    write were the merchant add/edit routes. The automated enrichment pipeline +
+    the employee path wrote enrichment WITHOUT re-assembling, so generated/curated
+    copy didn't reach the served PDP until some unrelated re-assembly. This closes
+    that gap: resolve the source product's content_key and refresh.
+
+    Flag-gated (SERVE_PDP_ENRICHMENT_ON_WRITE, default OFF) so it's a canary, and
+    fully best-effort — it never raises into the enrichment writer.
+
+    Returns True iff a view row was rebuilt.
+    """
+    if not _propagate_enrichment_on_write_enabled():
+        return False
+    if not (merchant_id and platform and platform_product_id):
+        return False
+    read_db = db or database
+    try:
+        row = await read_db.fetch_one(
+            "SELECT content_key FROM catalog_products "
+            "WHERE merchant_id = :merchant_id "
+            "  AND platform = :platform "
+            "  AND platform_product_id = :platform_product_id "
+            "  AND content_key IS NOT NULL "
+            "LIMIT 1",
+            {
+                "merchant_id": str(merchant_id),
+                "platform": str(platform),
+                "platform_product_id": str(platform_product_id),
+            },
+        )
+        if not row:
+            return False
+        content_key = str(dict(row).get("content_key") or "")
+        if not content_key:
+            return False
+        return await refresh_agent_pdp_view_for_content_key(
+            content_key,
+            refresh_source="enrichment_write",
+            db=read_db,
+        )
+    except Exception as exc:  # noqa: BLE001 — best-effort; never break the writer
+        logger.warning(
+            "enrichment-write PDP refresh failed (best-effort) for %s/%s/%s: %s",
+            merchant_id,
+            platform,
+            platform_product_id,
+            str(exc)[:200],
+        )
+        return False

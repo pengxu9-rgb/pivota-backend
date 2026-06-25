@@ -5735,6 +5735,16 @@ async def update_product_enrichment(
         data=patch,
     )
 
+    # B① publish bridge: propagate the employee-curated enrichment to the served
+    # agent_pdp_view (flag-gated, best-effort — mirrors the pipeline path).
+    from services.agent_pdp_view_assembler import (
+        refresh_agent_pdp_view_for_enrichment_write,
+    )
+
+    await refresh_agent_pdp_view_for_enrichment_write(
+        merchant_id, platform, platform_product_id
+    )
+
     row = await get_enrichment(
         merchant_id=merchant_id,
         platform=platform,
