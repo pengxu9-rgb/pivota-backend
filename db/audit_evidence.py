@@ -781,6 +781,35 @@ async def insert_citation_observation(
         return None
 
 
+async def fetch_citation_observations(
+    merchant_id: str,
+    *,
+    content_key: Optional[str] = None,
+    limit: int = 200,
+) -> List[Dict[str, Any]]:
+    """Read a merchant's recorded citation observations — who cited their
+    products, for which query, mentioned vs recommended — newest first. STRICTLY
+    merchant-scoped (only their own audit observations); optional content_key
+    filter. Closes the get-cited proof loop (data was write-only, dying in
+    report_jsonb). Best-effort: returns [] on any error, never raises."""
+    if not merchant_id:
+        return []
+    capped = max(1, min(int(limit or 200), 1000))
+    try:
+        await ensure_audit_evidence_tables()
+        query = citation_observations.select().where(
+            citation_observations.c.merchant_id == merchant_id
+        )
+        if content_key:
+            query = query.where(citation_observations.c.content_key == content_key)
+        query = query.order_by(citation_observations.c.observed_at.desc()).limit(capped)
+        rows = await database.fetch_all(query)
+        return [dict(r) for r in rows or []]
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("fetch_citation_observations failed for %s: %s", merchant_id, str(exc)[:200])
+        return []
+
+
 async def insert_finding(
     *,
     audit_run_id: str,

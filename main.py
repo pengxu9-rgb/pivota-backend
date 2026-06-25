@@ -330,6 +330,7 @@ from routes.agent_keys import router as agent_keys_router
 from routes.agent_webhooks import router as agent_webhooks_router
 from routes.init_agent_key import router as init_agent_key_router
 from routes.merchant_products import router as merchant_products_router
+from routes.merchant_citations import router as merchant_citations_router
 from routes.merchant_pdp import router as merchant_pdp_router
 from routes.product_quality_routes import router as product_quality_router
 from routes.product_enrichment_routes import router as product_enrichment_router
@@ -1064,6 +1065,7 @@ app.include_router(agent_keys_router)  # Agent API key management
 app.include_router(agent_webhooks_router)  # Agent webhook management and deliveries
 app.include_router(init_agent_key_router)  # Initialize test agent key
 app.include_router(merchant_products_router)  # Merchant product optimization APIs
+app.include_router(merchant_citations_router)  # Merchant citation observations (get-cited proof loop, B⑤)
 app.include_router(merchant_pdp_router)  # Merchant PDP status and contribution APIs
 app.include_router(merchant_promotions_router)  # Merchant/agent promotions API (DB-backed)
 app.include_router(agent_promotions_router)  # Agent-facing promotions list (/agent/v1/promotions/*)
