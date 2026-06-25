@@ -45,12 +45,23 @@ def _sku_ctx() -> Dict[str, Any]:
 
 
 def _expected_chunks() -> List[List[Any]]:
-    specs = bd._build_per_sku_audit_query_specs(_sku_ctx(), PROMPTS)
-    return bd._chunk_query_specs(specs)
+    """The chunks the fanout will attempt, in order. Queries route by intent to
+    one of two scan modes (branded findability vs organic category), and EACH
+    mode group is chunked independently — so this mirrors that partition rather
+    than chunking the flat spec list."""
+    recs = bd._build_per_sku_audit_query_records(_sku_ctx(), PROMPTS)
+    specs = [
+        (str(r.get("query") or ""), str(r.get("axis") or "intent")) for r in recs
+    ]
+    chunks: List[List[Any]] = []
+    for _mode, mode_specs in bd._partition_query_specs_by_scan_mode(specs):
+        chunks.extend(bd._chunk_query_specs(mode_specs))
+    return chunks
 
 
 def _install(monkeypatch, *, fail_on):
-    """Stub the DB helpers; fake probe fails on the given 1-based chunk indices."""
+    """Stub the DB helpers; fake probe fails on the given 1-based ORDINALS (the
+    Nth chunk attempted, across both scan-mode groups for the provider)."""
     calls: List[Dict[str, Any]] = []
 
     async def _fake_sku_keys(products, merchant_id):
@@ -62,10 +73,13 @@ def _install(monkeypatch, *, fail_on):
     async def _fake_probe(*, scan_mode, scan_target_id, merchant_id, store_id,
                           context, provider, max_runs, model=None,
                           model_is_override=False):
-        chunk_idx = int(scan_target_id.rsplit(":per_sku:", 1)[1])
-        calls.append({"chunk_idx": chunk_idx, "max_runs": max_runs,
+        # probe_run_id now carries a mode tag ("...:per_sku:branded:1"), so the
+        # chunk index is no longer a bare int. Track attempt ORDER instead.
+        ordinal = len(calls) + 1
+        calls.append({"chunk_idx": ordinal, "scan_mode": scan_mode,
+                      "max_runs": max_runs,
                       "queries": list(context.get("queries") or [])})
-        if chunk_idx in fail_on:
+        if ordinal in fail_on:
             raise bd.llm_client.AgentCenterLlmClientError(
                 "llm probe transport failed after retry (ReadTimeout): ReadTimeout('')"
             )
@@ -186,6 +200,44 @@ async def test_fanout_matches_shared_probe_per_sku_ctx(monkeypatch) -> None:
     assert fanout[SKU_KEY][0]["provider"] == "gemini"
     assert fanout[SKU_KEY][0]["runs_count"] == 4
     assert len(calls) == 2
+
+
+async def test_scan_mode_routes_by_query_intent(monkeypatch) -> None:
+    """The core honesty fix: a BRANDED/navigational query (names the product)
+    is probed for FINDABILITY (open_product_visibility_test); a DISCOVERY
+    category/problem query (does NOT name the brand) is probed for ORGANIC
+    appearance (category_visibility_test). A single product-centric mode over-
+    reports discovery — "best X" just retrieves the named product's page."""
+    calls = _install(monkeypatch, fail_on=set())
+    await _run()
+
+    # Expected query -> scan_mode from the SAME partition the fanout uses (the
+    # routing key is the spec's axis, which is lost once only the query string
+    # crosses the upstream boundary — so reconstruct it from the records here).
+    recs = bd._build_per_sku_audit_query_records(_sku_ctx(), PROMPTS)
+    specs = [
+        (str(r.get("query") or ""), str(r.get("axis") or "intent")) for r in recs
+    ]
+    expected_mode: Dict[str, str] = {}
+    for mode, mode_specs in bd._partition_query_specs_by_scan_mode(specs):
+        for q, _ax in mode_specs:
+            expected_mode[q] = mode
+
+    # The 16-prompt set yields BOTH branded and discovery queries, so the split
+    # is genuinely exercised (otherwise this test would be vacuous).
+    assert set(expected_mode.values()) == {
+        bd._PER_SKU_BRANDED_SCAN_MODE,
+        bd._PER_SKU_DISCOVERY_SCAN_MODE,
+    }
+
+    # Every probed query ran under its intended mode, and no upstream call mixes
+    # modes (each call is one mode group's chunk).
+    for c in calls:
+        for q in c["queries"]:
+            assert expected_mode.get(q) == c["scan_mode"], (
+                f"{q!r} probed under {c['scan_mode']}, "
+                f"expected {expected_mode.get(q)}"
+            )
 
 
 async def test_custom_prompts_are_probed_not_billed_and_dropped(monkeypatch) -> None:
