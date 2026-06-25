@@ -1585,6 +1585,10 @@ async def run_merchant_url_audit(
                 "verify_providers": list(_WEDGE_VERIFY_PROVIDERS),
                 "prompts_per_sku": _WEDGE_PROMPTS_PER_SKU,
                 "custom_prompts": custom_prompts_clean,
+                # Probe winnable SPECIFIC discovery prompts (LLM value-prop
+                # extraction), not just generic category heads — this is the
+                # demand a store-less brand can realistically win in AI.
+                "winnable_prompts": True,
                 "synthetic_products": synthetic_products,
                 "merchant_name": merchant_name,
                 "merchant_domain": merchant_domain,

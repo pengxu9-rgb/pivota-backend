@@ -7336,6 +7336,16 @@ def _build_per_sku_base_query_specs(
             bullets=bullets,
         )
     )
+    # LLM value-prop discovery prompts (extract_winnable_prompts, stashed on
+    # sku_ctx by the async fan-out): NON-branded, SPECIFIC, value-prop-anchored
+    # queries the product can realistically win ("best shea butter hair
+    # treatment for damaged hair") — vs the generic "best hair oil" heads above,
+    # which are kept only as a benchmark. Tagged "category" so they classify as
+    # discovery (category_head / problem_jtbd) and feed product_competitiveness.
+    for winnable in sku_ctx.get("_winnable_prompts") or []:
+        text = str(winnable or "").strip()
+        if text:
+            specs.append((text, "category"))
     if variant_label and variant_label.lower() not in title.lower():
         # Use the human variant label (e.g. "14 Servings, 2-Week Routine") with
         # the full identity, not the opaque variant id.
@@ -8112,6 +8122,117 @@ def _strategic_brief_live_probe_enabled() -> bool:
     except LLMSynthesisError:
         return False
     return bool(configured_key_for_provider(provider))
+
+
+_WINNABLE_PROMPTS_SYSTEM = """You are a search-demand strategist for an AI-shopping-visibility audit.
+Given ONE product's content, distill its KEY differentiating value propositions (specific ingredients,
+target concern / use-case, audience, format, benefit) and write non-branded discovery search queries a real
+shopper would type into an AI assistant AND that THIS product could realistically WIN — because they match
+its specific differentiators, not the generic category.
+
+RULES (this is a trust product — follow exactly):
+- Use ONLY value propositions present in the PROVIDED CONTENT. NEVER invent ingredients, claims, benefits,
+  certifications, audiences, or use-cases that are not in the content.
+- Do NOT include the brand or product name — these are NON-BRANDED discovery queries.
+- Do NOT output bare category heads ("best hair oil", "best serum"); those are unwinnable. EVERY query must
+  anchor to a SPECIFIC differentiator (ingredient and/or concern and/or audience).
+- Natural shopper phrasing, lower-case, 4-9 words, no punctuation gimmicks.
+- Output ONLY a JSON array of 4-6 distinct query strings. No other text."""
+
+
+def _parse_winnable_prompts(raw: Any) -> List[str]:
+    text = str(raw or "").strip()
+    if not text:
+        return []
+    match = re.search(r"\[.*\]", text, re.DOTALL)
+    if match:
+        text = match.group(0)
+    try:
+        data = json.loads(text)
+    except (ValueError, TypeError):
+        return []
+    return [x for x in data if isinstance(x, str)] if isinstance(data, list) else []
+
+
+async def extract_winnable_prompts(
+    sku_ctx: Mapping[str, Any],
+    *,
+    max_prompts: int = 6,
+) -> List[str]:
+    """LLM (DeepSeek) value-prop extraction -> NON-branded, winnable, SPECIFIC
+    discovery prompts grounded in the product's own content (title + description
+    + tags). The audit then probes these instead of only generic category heads
+    ("best hair oil") that no brand can realistically win. Best-effort: returns
+    [] on disabled / no-key / parse / validation failure (caller falls back to
+    the deterministic specs). Non-branded + content-grounded by construction;
+    any brand-name leakage is filtered out."""
+    from config.settings import settings as app_settings
+    from services.llm_synthesis import (
+        LLMSynthesisError,
+        configured_key_for_provider,
+        default_model_for_provider,
+        normalize_provider,
+        synthesize,
+    )
+
+    product = _get_product(sku_ctx or {})
+    title = str(product.get("title") or "").strip()
+    if not title:
+        return []
+    brand = str(product.get("brand") or product.get("vendor") or "").strip()
+    attrs = product.get("attributes_raw")
+    description, tags = "", []
+    if isinstance(attrs, Mapping):
+        description = str(attrs.get("description") or "")[:1500]
+        if isinstance(attrs.get("tags"), list):
+            tags = [str(t) for t in attrs["tags"]][:20]
+    try:
+        provider = normalize_provider(
+            getattr(app_settings, "strategic_brief_provider", None) or "deepseek"
+        )
+    except LLMSynthesisError:
+        return []
+    if not configured_key_for_provider(provider):
+        return []
+    model = (
+        str(getattr(app_settings, "strategic_brief_model", "") or "").strip()
+        or default_model_for_provider(provider)
+    )
+    content = {
+        "title": title,
+        "brand": brand or None,
+        "product_type": product.get("product_type") or None,
+        "description": description or None,
+        "tags": tags or None,
+    }
+    user = "PRODUCT CONTENT:\n" + json.dumps(content, ensure_ascii=False, indent=2)
+    try:
+        result = await synthesize(
+            system=_WINNABLE_PROMPTS_SYSTEM,
+            user=user,
+            provider=provider,
+            model=model,
+            max_tokens=400,
+        )
+    except Exception:  # noqa: BLE001 - best-effort; fall back to deterministic specs
+        logger.warning("winnable-prompt extraction failed for %r", title[:60], exc_info=True)
+        return []
+    brand_tokens = set(re.findall(r"[a-z0-9]+", brand.lower())) if brand else set()
+    out: List[str] = []
+    seen: set = set()
+    for raw in _parse_winnable_prompts(result.get("text")):
+        s = re.sub(r"\s+", " ", str(raw or "").strip().lower())
+        if not s or len(s.split()) < 3:
+            continue
+        if brand_tokens & set(re.findall(r"[a-z0-9]+", s)):
+            continue  # brand leaked in -> not a non-branded discovery query
+        if s in seen:
+            continue
+        seen.add(s)
+        out.append(s)
+        if len(out) >= max_prompts:
+            break
+    return out
 
 
 def _list_value(value: Any) -> List[Any]:
@@ -9419,6 +9540,7 @@ async def run_per_sku_audit_probe_fanout(
     model_overrides: Optional[Mapping[str, Any]] = None,
     prompts_per_sku: Optional[int] = None,
     custom_prompts: Optional[List[str]] = None,
+    winnable_prompts: bool = False,
 ) -> Dict[str, List[Dict[str, Any]]]:
     """Run and shape v3 per-SKU citation probes before report assembly.
 
@@ -9451,6 +9573,14 @@ async def run_per_sku_audit_probe_fanout(
     out: Dict[str, List[Dict[str, Any]]] = {}
     for idx, sku_key in enumerate(sku_keys):
         sku_ctx = await load_sku_context(sku_key, str(merchant_id))
+        # Value-prop discovery prompts: extract from the product's content so the
+        # audit probes winnable SPECIFIC demand, not just generic category heads.
+        # Best-effort + opt-in (URL audits); stashed for the sync spec builder.
+        if winnable_prompts and isinstance(sku_ctx, dict):
+            try:
+                sku_ctx["_winnable_prompts"] = await extract_winnable_prompts(sku_ctx)
+            except Exception:  # noqa: BLE001 - never block probing on the LLM step
+                logger.warning("winnable-prompt extraction skipped", exc_info=True)
         out[sku_key] = await _probe_per_sku_ctx(
             sku_ctx=sku_ctx,
             merchant_id=str(merchant_id),
