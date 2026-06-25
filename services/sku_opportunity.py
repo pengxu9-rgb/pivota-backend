@@ -293,6 +293,7 @@ def _score_prompt_group(
     substitution = _substitution(
         query=query,
         axis=axis,
+        query_class=query_class,
         sku_ctx=sku_ctx,
         product=product,
         provider_analysis=provider_analysis,
@@ -1279,10 +1280,19 @@ def _is_open_lane(
     )
 
 
+# Non-branded category-demand classes: the brand SHOULD surface here on its own
+# merit. When it's absent/loss and a rival is named, that IS substitution — "AI
+# recommends <competitor> instead of you for your own category" — even though
+# the query never names the brand. (Branded substitution is the merchant-named
+# path below; "branded"/comparison classes route there, not here.)
+_CATEGORY_DEMAND_CLASSES = {"head", "category", "attribute", "sidewalk", "objection"}
+
+
 def _substitution(
     *,
     query: str,
     axis: str,
+    query_class: str,
     sku_ctx: Dict[str, Any],
     product: Dict[str, Any],
     provider_analysis: Dict[str, Dict[str, Any]],
@@ -1294,11 +1304,15 @@ def _substitution(
         _COMPARISON_TOKEN_RE.search(query or "")
     )
     merchant_named = _query_mentions_merchant(query, sku_ctx=sku_ctx, product=product)
+    # A non-branded category query is an organic-demand lane the brand owns by
+    # category — losing it to a named rival is substitution even with no brand
+    # mention. Discovery queries (category_visibility_test) land here.
+    category_demand = query_class in _CATEGORY_DEMAND_CLASSES
     product_absent_or_loss = not any(
         row.get("product_positive") or row.get("grounded_positive")
         for row in provider_analysis.values()
     ) and any(verdict in {"loss", "absent"} for verdict in provider_verdicts.values())
-    if merchant_named and product_absent_or_loss and competitors:
+    if (merchant_named or category_demand) and product_absent_or_loss and competitors:
         top = competitors[0]
         if competitor_counts.get(top, 0) < 2:
             top = _durable_competitor(competitor_counts) or top
@@ -1312,6 +1326,9 @@ def _substitution(
             "substituted_by": top,
             "prompt": query,
             "engines": engines,
+            # "branded" = brand named in the query but loses; "category" = the
+            # brand is displaced organically in its own category lane.
+            "kind": "branded" if merchant_named else "category",
         }
     _ = comparison_signal  # Secondary signal is intentionally not the alert gate.
     return {"present": False}

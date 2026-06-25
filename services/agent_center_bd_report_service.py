@@ -4842,13 +4842,34 @@ _DISCOVERY_INTENTS = frozenset({"category_head", "problem_jtbd", "constraint"})
 _BRANDED_INTENTS = frozenset({"navigational", "trust"})
 
 
+# Unambiguous product-form / ingredient nouns that are never a brand's second
+# word. Used to decide whether the 2nd leading token belongs to the brand
+# (keep "Camille Rose", "Wonder Curl", "Aunt Jackie's") or is the product
+# descriptor (drop it: "Cantu Shea Butter" -> "Cantu"). Deliberately excludes
+# ambiguous words like "moisture"/"curl"/"repair" that ARE real brand words
+# ("Maui Moisture", "Wonder Curl").
+_PRODUCT_FORM_WORDS = frozenset({
+    "butter", "oil", "cream", "creme", "lotion", "serum", "gel", "milk", "mask",
+    "pack", "spray", "balm", "mousse", "wax", "pomade", "shampoo", "conditioner",
+    "conditioning", "treatment", "hair", "scalp", "moist",
+    "shea", "coconut", "argan", "jojoba", "olive", "castor", "marula", "monoi",
+})
+
+
 def _competitor_brand_label(name: Any) -> str:
-    """Coarse brand label from a competitor product name ("Cantu, Shea Butter,
-    Coconut Curling Cream" / "Cantu Shea Butter for…" -> "Cantu"; "&honey Moist
-    Shampoo" -> "&honey") so the three Cantu SKUs AI names group into one."""
+    """Coarse brand label from a competitor product name so a brand's many SKUs
+    group into one ("Cantu, Shea Butter, Coconut Curling Cream" / "Cantu Shea
+    Butter for…" -> "Cantu"; "&honey Moist Shampoo" -> "&honey"). Keeps genuine
+    two-word brands intact ("Camille Rose", "Wonder Curl", "Aunt Jackie's") by
+    dropping the 2nd word ONLY when it's an unambiguous product/ingredient noun
+    — the old first-word-only rule mangled them to "Camille"/"Wonder"/"Aunt"."""
     s = str(name or "").strip().split(",")[0].strip()
     words = s.split()
-    return words[0] if words else ""
+    if not words:
+        return ""
+    if len(words) >= 2 and words[1].strip(".'").lower() not in _PRODUCT_FORM_WORDS:
+        return f"{words[0]} {words[1]}"
+    return words[0]
 
 
 # The shopping-surface models (deepseek is the fact-check/verify pass, not a
