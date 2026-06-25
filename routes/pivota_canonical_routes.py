@@ -317,19 +317,46 @@ async def list_canonical_pdp_signatures(
         if widen_sitemap
         else sig_present
     )
+    # Merchant gate. Strict (flag-OFF): retail merchants must be indexable +
+    # active (INNER JOIN) — unchanged. Widened: store-less brand-authored rows
+    # have NO retail catalog_merchants row (onboarded via brand verification, not
+    # catalog_sync), so the INNER JOIN would drop them. LEFT JOIN and allow a
+    # missing merchant row through ONLY when index_eligible (the brand passed
+    # domain verification → inherently publishable). A retail merchant that IS
+    # present but hidden/inactive is still excluded.
+    base_join = catalog_products.join(
+        index_pipeline_state,
+        catalog_products.c.content_key == index_pipeline_state.c.content_key,
+    )
+    if widen_sitemap:
+        serving_join = base_join.outerjoin(
+            catalog_merchants,
+            catalog_products.c.merchant_id == catalog_merchants.c.merchant_id,
+        )
+        merchant_gate = or_(
+            and_(
+                catalog_merchants.c.indexable.is_(True),
+                catalog_merchants.c.status == "active",
+            ),
+            and_(
+                catalog_merchants.c.merchant_id.is_(None),
+                index_pipeline_state.c.index_eligible.is_(True),
+            ),
+        )
+    else:
+        serving_join = base_join.join(
+            catalog_merchants,
+            catalog_products.c.merchant_id == catalog_merchants.c.merchant_id,
+        )
+        merchant_gate = and_(
+            catalog_merchants.c.indexable.is_(True),
+            catalog_merchants.c.status == "active",
+        )
     eligibility_filter = and_(
         catalog_products.c.content_key.isnot(None),
         identity_term,
         _eligibility_predicate(widen_with_index_eligible=widen_sitemap),
-        catalog_merchants.c.indexable.is_(True),
-        catalog_merchants.c.status == "active",
-    )
-    serving_join = catalog_products.join(
-        index_pipeline_state,
-        catalog_products.c.content_key == index_pipeline_state.c.content_key,
-    ).join(
-        catalog_merchants,
-        catalog_products.c.merchant_id == catalog_merchants.c.merchant_id,
+        merchant_gate,
     )
 
     total_q = (
