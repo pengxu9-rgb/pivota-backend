@@ -1472,6 +1472,34 @@ def test_competitor_attributes_do_not_loosen_safety_sensitive_terms():
     assert strategic_brief.validate_grounding(brief, evidence) is False
 
 
+def test_safety_term_in_product_title_is_grounded():
+    # A product literally named "...Treatment" (a cosmetic term) must not have
+    # its whole brief rejected for echoing its own name. Regression: the anuko
+    # "Damaged Hair Treatment" SKUs got brief_status "unavailable" because
+    # "treatment" was in the title but not the safety allow-list.
+    evidence = _validation_fix_evidence()
+    evidence["product"]["title"] = "BB Lab Low Molecular Collagen Treatment"
+    brief = _validation_fix_grounded_brief()
+    brief["core_decision"] = "Make your own Collagen Treatment page the buyable canonical source."
+
+    failures = strategic_brief._grounding_failures(brief, evidence)
+
+    assert not any(f.startswith("safety-sensitive") for f in failures), failures
+
+
+def test_safety_term_only_in_competitor_attrs_stays_rejected():
+    # The title fix must NOT loosen safety terms that come only from a
+    # competitor (a competitor being a "treatment" doesn't let the brief call
+    # THIS product a treatment).
+    evidence = _validation_fix_evidence_with_competitor_attributes(["collagen treatment"])
+    brief = _validation_fix_grounded_brief()
+    brief["why_you_lose"] = "Vital Proteins is known for collagen treatment."
+
+    failures = strategic_brief._grounding_failures(brief, evidence)
+
+    assert "safety-sensitive:treatment" in failures
+
+
 @pytest.mark.parametrize(
     "claim",
     [
