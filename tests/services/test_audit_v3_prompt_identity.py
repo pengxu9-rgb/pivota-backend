@@ -107,7 +107,7 @@ def test_unbranded_prompts_reject_noisy_fetched_product_type() -> None:
     assert not any("grape jelly" in q for q in qs)
     assert not any("belight grape jelly" in q for q in qs)
     assert "best collagen" in qs
-    assert "best collagen to buy online" in qs
+    assert "what collagen should I buy" in qs
 
 
 def test_missing_product_type_uses_attributes_not_literal_product_category() -> None:
@@ -130,7 +130,7 @@ def test_missing_product_type_uses_attributes_not_literal_product_category() -> 
     qs = _queries(sku_ctx, 14)
 
     assert "best collagen" in qs
-    assert "best collagen to buy online" in qs
+    assert "what collagen should I buy" in qs
     assert not any(q in {"best product", "top product", "recommended product"} for q in qs)
     assert not any("product buying guide" in q for q in qs)
     assert not any("compare product options" in q for q in qs)
