@@ -4,8 +4,8 @@
     "purpose": "BD-curated registry of hosts that frequently appear in Gemini grounded sources for D2C category queries. Each entry annotates the merchant audit's `cited_hosts_detailed` block so the report can tell merchants what they're looking at and what to do about it.",
     "owner": "BD team for content; engineering reviews schema only",
     "schema_per_host": {
-      "type": "editorial | retailer | marketplace | video | brand | unclassified",
-      "subtype": "review_site | department_store | luxury | mass_market | fashion_marketplace | beauty_retailer | wellness_retailer | regional | review_aggregator | creator_platform | social",
+      "type": "editorial | retailer | marketplace | video | community | forum | social | brand | cdn | unclassified",
+      "subtype": "review_site | magazine | community | educational | certification | diy_ingredients | department_store | luxury | mass_market | fashion_marketplace | beauty_retailer | wellness_retailer | regional | review_aggregator | creator_platform | social",
       "categories": "list of merchant categories where this host has notable AI-channel presence",
       "aliases": "optional list of Gemini/Vertex display names that should resolve to this host",
       "coverage_note": "1-2 sentences: what this host actually publishes for these categories, why it matters",
@@ -414,7 +414,7 @@
       "outreach_hint": "Creator/influencer partnerships — Lemon8 lifestyle creators; UGC seeding, not direct placement."
     },
     "reddit.com": {
-      "type": "video",
+      "type": "community",
       "subtype": "social",
       "categories": ["fashion", "sleepwear", "beauty", "home", "fitness", "electronics", "food_bev", "supplements", "health", "wellness"],
       "aliases": ["Reddit"],
@@ -514,6 +514,142 @@
       "aliases": ["Hwahae"],
       "coverage_note": "Hwahae (화해) is Korea's leading cosmetics review-and-ingredient-analysis platform (the Korean equivalent of Skinsort); AI grounds K-beauty product safety, ingredient, and 'is X good' queries in its crowd-reviewed database.",
       "outreach_hint": "Editorial / database channel — keep ingredient listings accurate and monitor user reviews; not a paid-placement surface."
+    },
+    "stylecraze.com": {
+      "type": "editorial",
+      "subtype": "review_site",
+      "categories": ["beauty", "hair", "skincare", "wellness"],
+      "aliases": ["StyleCraze"],
+      "coverage_note": "High-volume beauty/hair publisher with strong AI pickup for 'best {hair product}', ingredient, and how-to queries; routinely grounded in 'best hair butter/oil' style roundups.",
+      "outreach_hint": "Editorial pitch — get included in their product roundups and ingredient explainers; influence via expert/derm sourcing."
+    },
+    "marieclaire.com": {
+      "type": "editorial",
+      "subtype": "magazine",
+      "categories": ["beauty", "hair", "fashion", "skincare"],
+      "aliases": ["Marie Claire"],
+      "coverage_note": "Major fashion/beauty magazine whose tested product roundups AI cites for 'best {category}' beauty and hair queries.",
+      "outreach_hint": "Editorial pitch — beauty desk / product testing; PR sampling for roundup inclusion."
+    },
+    "curlynikki.com": {
+      "type": "editorial",
+      "subtype": "community",
+      "categories": ["hair", "beauty"],
+      "aliases": ["CurlyNikki"],
+      "coverage_note": "Long-running natural/curly-hair publisher and community AI grounds for textured-hair routines, butter/oil recommendations, and product comparisons.",
+      "outreach_hint": "Editorial / community pitch — product reviews and inclusion in natural-hair roundups."
+    },
+    "itscoily.com": {
+      "type": "editorial",
+      "subtype": "community",
+      "categories": ["hair"],
+      "aliases": ["ItsCoily"],
+      "coverage_note": "Coily/natural-hair blog cited for textured-hair product picks and care guides.",
+      "outreach_hint": "Editorial / community pitch — reviews and best-of inclusion for textured-hair products."
+    },
+    "joanmorais.com": {
+      "type": "editorial",
+      "subtype": "educational",
+      "categories": ["beauty", "hair"],
+      "aliases": ["Joan Morais"],
+      "coverage_note": "Cosmetic-formulation educator; cited for DIY/ingredient and formulation guidance (e.g. shea-butter hair products) rather than product reviews.",
+      "outreach_hint": "Educational channel — accurate ingredient/formulation framing; not a product-placement surface."
+    },
+    "note.com": {
+      "type": "editorial",
+      "subtype": "creator_platform",
+      "categories": ["beauty", "hair", "kbeauty"],
+      "aliases": ["note"],
+      "coverage_note": "Japanese long-form creator/blog platform whose user posts AI grounds for product reviews and routines, especially for JP/K-beauty.",
+      "outreach_hint": "Creator/community channel — seed accurate reviews via creators; not a direct paid placement."
+    },
+    "peta.org": {
+      "type": "editorial",
+      "subtype": "certification",
+      "categories": ["beauty", "hair", "skincare"],
+      "aliases": ["PETA"],
+      "coverage_note": "Cruelty-free / vegan advocacy + certification directory AI cites for 'is X cruelty-free / vegan' beauty queries.",
+      "outreach_hint": "Get cruelty-free/vegan certified and listed in their Beauty Without Bunnies database."
+    },
+    "shopee.sg": {
+      "type": "marketplace",
+      "subtype": "regional",
+      "categories": ["beauty", "hair", "fashion", "home", "electronics"],
+      "aliases": ["Shopee", "Shopee Singapore"],
+      "coverage_note": "Major Southeast-Asia marketplace; AI routes SEA buyers here for product availability and price on beauty/hair queries.",
+      "outreach_hint": "Marketplace onboarding — list (or fix the listing) on Shopee for SEA buyer-path coverage."
+    },
+    "lazada.sg": {
+      "type": "marketplace",
+      "subtype": "regional",
+      "categories": ["beauty", "hair", "fashion", "home", "electronics"],
+      "aliases": ["Lazada"],
+      "coverage_note": "Major Southeast-Asia marketplace AI cites as a buying path for beauty/hair products in the region.",
+      "outreach_hint": "Marketplace onboarding — list on Lazada for SEA buyer-path coverage."
+    },
+    "shoppinginkorea.com": {
+      "type": "retailer",
+      "subtype": "regional",
+      "categories": ["beauty", "hair", "kbeauty"],
+      "aliases": ["ShoppingInKorea"],
+      "coverage_note": "Cross-border reseller/proxy of Korean products AI cites as a buy path for K-beauty/hair items outside Korea.",
+      "outreach_hint": "Reseller channel — ensure accurate listing if you distribute through cross-border proxies."
+    },
+    "skin-seoul.com": {
+      "type": "retailer",
+      "subtype": "beauty_retailer",
+      "categories": ["beauty", "skincare", "hair", "kbeauty"],
+      "aliases": ["Skin Seoul"],
+      "coverage_note": "UK-based K-beauty specialty retailer cited as a Western buy path for Korean skincare/hair brands.",
+      "outreach_hint": "Wholesale onboarding — stock with K-beauty specialty retailers to win the cited buy path in-region."
+    },
+    "brambleberry.com": {
+      "type": "retailer",
+      "subtype": "diy_ingredients",
+      "categories": ["beauty", "hair"],
+      "aliases": ["Bramble Berry"],
+      "coverage_note": "Soapmaking/DIY cosmetic-ingredient retailer (shea/cocoa butters, oils) AI cites for ingredient-led 'shea butter / hair butter' queries; signals the query was read as DIY/ingredient rather than finished-product.",
+      "outreach_hint": "Low priority for a finished-goods brand — indicates an ingredient-DIY framing of the lane, not a finished-product channel."
+    },
+    "fekkai.com": {
+      "type": "brand",
+      "subtype": "mass_market",
+      "categories": ["hair"],
+      "aliases": ["Fekkai"],
+      "coverage_note": "Haircare brand's own D2C site; cited when AI sends category buyers to a competitor's first-party page.",
+      "outreach_hint": "Competitor brand site — not an outreach target; study how their PDP wins the cited buy path and differentiate."
+    },
+    "auntjackiescurlsandcoils.com": {
+      "type": "brand",
+      "subtype": "mass_market",
+      "categories": ["hair"],
+      "aliases": ["Aunt Jackie's", "Aunt Jackies"],
+      "coverage_note": "Aunt Jackie's textured-hair brand site; a frequent organic category winner for 'best hair butter' style queries.",
+      "outreach_hint": "Competitor brand site — study their textured-hair PDP/review depth; differentiate rather than outreach."
+    },
+    "moroccanoil.com": {
+      "type": "brand",
+      "subtype": "luxury",
+      "categories": ["hair"],
+      "aliases": ["Moroccanoil"],
+      "coverage_note": "Moroccanoil's own site; a dominant organic winner for 'best hair oil' queries.",
+      "outreach_hint": "Competitor brand site — benchmark their oil PDP/authority; not an outreach target."
+    },
+    "nuxe.com": {
+      "type": "brand",
+      "subtype": "luxury",
+      "categories": ["beauty", "hair", "skincare"],
+      "aliases": ["Nuxe"],
+      "coverage_note": "French beauty brand's own site cited for oil/multi-use product queries.",
+      "outreach_hint": "Competitor brand site — benchmark, not an outreach target."
+    },
+    "eyidaranaturals.com": {
+      "type": "brand",
+      "subtype": "mass_market",
+      "categories": ["hair"],
+      "aliases": ["Eyidara Naturals"],
+      "coverage_note": "Small natural-hair products brand site surfacing in textured-hair category answers.",
+      "outreach_hint": "Competitor brand site — not an outreach target."
     }
   }
 }

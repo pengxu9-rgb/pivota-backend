@@ -154,7 +154,8 @@ def test_display_name_aliases_resolve_to_registry_hosts():
 
     reddit = classify_host("Reddit thread", merchant_category="beauty")
     assert reddit["host"] == "reddit.com"
-    assert reddit["type"] == "video"
+    # Reddit is a community/forum, not video (was a stale mis-typing).
+    assert reddit["type"] == "community"
 
 
 def test_common_word_aliases_resolve_only_on_exact_match():
@@ -277,13 +278,44 @@ def test_checked_in_registry_loads_and_has_expected_hosts():
 def test_every_registry_entry_has_required_fields():
     from services.cited_host_classifier import _load_registry
     reg = _load_registry()
-    valid_types = {"editorial", "retailer", "marketplace", "video", "brand", "unclassified"}
+    # Mirrors the types the report layer actually handles
+    # (_SOURCE_ROLE_COMPETITOR_TYPES + brand/unclassified).
+    valid_types = {
+        "editorial", "retailer", "marketplace", "video", "community", "forum",
+        "social", "brand", "cdn", "unclassified",
+    }
     for host, entry in reg.items():
         assert "type" in entry, f"{host} missing type"
         assert entry["type"] in valid_types, f"{host} has unknown type {entry['type']}"
         # categories may be empty list but must be present + a list
         assert "categories" in entry
         assert isinstance(entry["categories"], list)
+
+
+def test_beauty_hair_cited_hosts_are_classified():
+    """Regression: hosts that appeared UNCLASSIFIED in live hair/beauty audits
+    are now registered with the right type, so the authority map can tell the
+    merchant what each cited host is and which lever applies."""
+    from services.cited_host_classifier import classify_host
+
+    expected = {
+        "stylecraze.com": "editorial",
+        "marieclaire.com": "editorial",
+        "curlynikki.com": "editorial",
+        "peta.org": "editorial",
+        "note.com": "editorial",
+        "shopee.sg": "marketplace",
+        "lazada.sg": "marketplace",
+        "shoppinginkorea.com": "retailer",
+        "skin-seoul.com": "retailer",
+        "fekkai.com": "brand",
+        "moroccanoil.com": "brand",
+        "auntjackiescurlsandcoils.com": "brand",
+        "reddit.com": "community",
+    }
+    for host, want in expected.items():
+        got = classify_host(host)
+        assert got["type"] == want, f"{host}: expected {want}, got {got['type']}"
 
 
 # ---------------------------------------------------------------------
