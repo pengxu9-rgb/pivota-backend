@@ -1352,9 +1352,18 @@ def _substitution(
         for row in provider_analysis.values()
     ) and any(verdict in {"loss", "absent"} for verdict in provider_verdicts.values())
     if (merchant_named or category_demand) and product_absent_or_loss and competitors:
-        top = competitors[0]
-        if competitor_counts.get(top, 0) < 2:
-            top = _durable_competitor(competitor_counts) or top
+        # Substitution must name a rival BRAND. The competitor list can include
+        # ingredient/category TYPES ("Shea Butter", "Castor Oil") that produce
+        # nonsense like "AI names Shea Butter, not you / publish a vs Shea
+        # Butter comparison". Drop those; if no real brand displaced the
+        # merchant, there's no brand substitution to act on.
+        from services.competitor_brand_filter import filter_competitor_brands
+
+        brand_competitors = filter_competitor_brands(competitors)
+        if not brand_competitors:
+            return {"present": False}
+        # The most-recommended rival brand (durable across the answer set).
+        top = max(brand_competitors, key=lambda b: competitor_counts.get(b, 0))
         engines = sorted(
             provider
             for provider, verdict in provider_verdicts.items()
@@ -1505,6 +1514,10 @@ def _substitution_alert(per_prompt: List[Dict[str, Any]]) -> Dict[str, Any]:
         "prompt": sub.get("prompt") or alerts[0].get("query"),
         "substituted_by": sub.get("substituted_by"),
         "engines": sub.get("engines") or [],
+        # "category" = displaced organically in its own category lane;
+        # "branded" = brand named in the query but loses. Lets the UI phrase it
+        # ("AI recommends X for <category>" vs "…when buyers search your name").
+        "kind": sub.get("kind"),
     }
 
 

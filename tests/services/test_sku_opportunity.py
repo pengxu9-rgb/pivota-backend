@@ -276,6 +276,7 @@ def test_sku_opportunity_scores_bb_lab_prompt_cases():
         "prompt": "bb lab collagen alternatives",
         "substituted_by": "Vital Proteins",
         "engines": ["deepseek", "gemini"],
+        "kind": "branded",
     }
 
     assert opportunity["top_open_lanes"][0]["query"] == "halal collagen sticks before bed"
@@ -1229,3 +1230,40 @@ def test_brand_in_grounding_titles_detects_own_listing():
     assert _brand_in_grounding_titles(independent, merchant_brand="Anuko") is False
     # No brand -> can't claim a listing.
     assert _brand_in_grounding_titles(own_listing, merchant_brand="") is False
+
+
+def test_substitution_drops_ingredient_only_competitors():
+    """#4: a category lane lost only to ingredient/material TYPES ("Shea
+    Butter") is NOT a brand substitution — don't produce 'AI names Shea Butter,
+    not you'. A real brand among them IS named."""
+    from services.sku_opportunity import build_sku_opportunity
+    from services.sku_sidewalk import build_sku_attribute_graph
+
+    ctx = _freshnest_sku_ctx()
+    graph = build_sku_attribute_graph(ctx["product"])
+    sources = [{"uri": "https://example.com/x", "title": "best hair butter"}]
+    runs = _runs_both_providers([
+        {   # all-generic competitors -> no brand substitution
+            "query": "best hair butter",
+            "axis": "category",
+            "parsed": {"product_visible": False, "correct_sku": False,
+                       "competitors_listed": ["Shea Butter", "Castor Oil"],
+                       "competitors_appearing": ["Shea Butter", "Castor Oil"]},
+            "sources": sources,
+            "raw": "Top options are shea butter and castor oil.",
+        },
+        {   # a real brand present -> it is the substitute
+            "query": "top hair butter",
+            "axis": "category",
+            "parsed": {"product_visible": False, "correct_sku": False,
+                       "competitors_listed": ["Shea Butter", "Aunt Jackie's"],
+                       "competitors_appearing": ["Shea Butter", "Aunt Jackie's"]},
+            "sources": sources,
+            "raw": "Top picks include Aunt Jackie's.",
+        },
+    ])
+    rows = _by_query(build_sku_opportunity(ctx, runs, attribute_graph=graph))
+    assert rows["best hair butter"]["substitution"]["present"] is False
+    top = rows["top hair butter"]["substitution"]
+    assert top["present"] is True
+    assert top["substituted_by"] == "Aunt Jackie's"
