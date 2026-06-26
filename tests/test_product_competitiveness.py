@@ -215,3 +215,44 @@ def test_discovery_appearance_splits_endorsement_from_own_listing():
     assert d["appeared"] == 2
     assert d["appeared_listing"] == 1
     assert d["appeared_recommended"] == 1
+
+
+def test_engine_playbook_is_per_engine_and_names_real_sources():
+    """Build A: per-engine ops. Gemini (Google index) and ChatGPT (Bing +
+    Reddit/community) get DIFFERENT moves grounded in how each cites; the weaker
+    engine is flagged as the primary gap and divergence is surfaced."""
+    from services.agent_center_bd_report_service import build_engine_playbook
+    per_prompt = [
+        {"query": "best hair oil", "normalized_query": "best hair oil",
+         "axis": "category", "provider_verdicts": {"gemini": "loss", "chatgpt": "win"}},
+        {"query": "repairing hair oil for damaged hair",
+         "normalized_query": "repairing hair oil for damaged hair",
+         "axis": "category", "provider_verdicts": {"gemini": "loss", "chatgpt": "win"}},
+    ]
+    channel = {"channels": [
+        {"host": "hwahae.com", "type": "editorial", "is_own_site": False},
+        {"host": "reddit.com", "type": "community", "is_own_site": False},
+    ]}
+    pb = build_engine_playbook(per_prompt=per_prompt, channel_appearance=channel)
+    assert pb["has_signal"] is True
+    assert pb["primary_gap"] == "gemini"          # invisible on Gemini, present on ChatGPT
+    assert pb["engines"]["gemini"]["status"] == "invisible"
+    assert pb["engines"]["chatgpt"]["status"] == "present"
+    # Per-engine moves differ and name the real cited sources.
+    gemini_moves = " ".join(pb["engines"]["gemini"]["moves"]).lower()
+    chatgpt_moves = " ".join(pb["engines"]["chatgpt"]["moves"]).lower()
+    assert "google" in gemini_moves and "hwahae.com" in gemini_moves
+    assert "reddit" in chatgpt_moves and "reddit.com" in chatgpt_moves
+    assert "google" not in chatgpt_moves  # engine-specific, not copy-paste
+    assert "gemini" in (pb["divergence_note"] or "").lower()
+
+
+def test_engine_playbook_no_signal_when_ungrounded():
+    """No graded discovery rows -> no per-engine signal (don't fabricate ops)."""
+    from services.agent_center_bd_report_service import build_engine_playbook
+    pb = build_engine_playbook(per_prompt=[
+        {"query": "best hair oil", "axis": "category",
+         "provider_verdicts": {"gemini": "absent", "chatgpt": "absent"}},
+    ], channel_appearance={})
+    assert pb["has_signal"] is False
+    assert pb["primary_gap"] is None

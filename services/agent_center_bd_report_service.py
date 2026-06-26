@@ -5075,6 +5075,151 @@ def build_product_competitiveness(per_prompt: Optional[List[Dict[str, Any]]]) ->
     }
 
 
+# How each frontier engine GROUNDS its answers — the basis for per-engine ops.
+# Gemini retrieves from Google's web index + the review/editorial sources Google
+# trusts; ChatGPT retrieves via Bing/OpenAI and leans heavily on Reddit +
+# community discussion + independent review sites. Winning each is a different
+# game, so the audit must prescribe DIFFERENT moves per engine.
+_ENGINE_PROFILES: Dict[str, Dict[str, str]] = {
+    "gemini": {
+        "label": "Gemini (Google index)",
+        "how_it_cites": (
+            "Gemini grounds answers in Google's web index and the review / "
+            "editorial sources Google trusts."
+        ),
+    },
+    "chatgpt": {
+        "label": "ChatGPT (Bing + community)",
+        "how_it_cites": (
+            "ChatGPT grounds via Bing/OpenAI search and leans heavily on Reddit, "
+            "community threads, and independent review sites."
+        ),
+    },
+}
+
+
+def _engine_appearance_status(appeared: int, total: int) -> str:
+    if not total:
+        return "couldnt_measure"
+    if appeared <= 0:
+        return "invisible"
+    return "weak" if (appeared / total) < 0.5 else "present"
+
+
+def _cited_hosts_by_type(channel_appearance: Optional[Mapping[str, Any]]) -> Dict[str, List[str]]:
+    """Group this product's cited third-party hosts by classified type (from
+    channel_appearance) so per-engine moves can name the REAL sources AI cites
+    for the category, not a generic 'pitch a publisher'."""
+    out: Dict[str, List[str]] = {}
+    ca = channel_appearance if isinstance(channel_appearance, Mapping) else {}
+    for ch in (ca.get("channels") or []):
+        if not isinstance(ch, Mapping) or ch.get("is_own_site"):
+            continue
+        host = str(ch.get("host") or "").strip()
+        htype = str(ch.get("type") or "unclassified").strip().lower()
+        if host and host not in out.setdefault(htype, []):
+            out[htype].append(host)
+    return out
+
+
+def _engine_moves(engine: str, status: str, hosts_by_type: Mapping[str, List[str]]) -> List[str]:
+    editorial = list(hosts_by_type.get("editorial") or [])
+    community = list(hosts_by_type.get("community") or []) + list(hosts_by_type.get("forum") or [])
+    if engine == "gemini":
+        moves = [
+            "Get your official product page indexed by Google and verify it in "
+            "Search Console — Gemini can only cite pages in Google's index.",
+        ]
+        if editorial:
+            moves.append(
+                "Earn a review/listing on the Google-trusted sources already "
+                f"cited for your category: {', '.join(editorial[:3])}."
+            )
+        else:
+            moves.append(
+                "Earn placement in the independent review sources Google "
+                "surfaces for your category (ingredient/efficacy explainers and "
+                "'best of' roundups)."
+            )
+        moves.append(
+            "Add product, review, and FAQ structured data so Google can extract "
+            "your product facts and claims."
+        )
+        return moves
+    # chatgpt
+    moves = [
+        "Seed accurate product info and earn authentic reviews on Reddit and "
+        "niche community threads — ChatGPT weights Reddit and community "
+        "discussion heavily."
+        + (f" (it already cites {', '.join(community[:2])} for your category)." if community else ""),
+        "Get reviewed on independent review sites and confirm your page is in "
+        "Bing's index (Bing Webmaster Tools) — ChatGPT retrieves via Bing.",
+    ]
+    if status in ("weak", "present"):
+        moves.append(
+            "ChatGPT already surfaces you (often via a retailer listing) — "
+            "convert that into a recommendation by building review depth and "
+            "community mentions, not just a buyable listing."
+        )
+    return moves
+
+
+def build_engine_playbook(
+    *,
+    per_prompt: Optional[List[Dict[str, Any]]],
+    channel_appearance: Optional[Mapping[str, Any]] = None,
+) -> Dict[str, Any]:
+    """Per-ENGINE operating plan. Gemini and ChatGPT cite different indexes, so
+    the same product can be invisible on one and findable on the other — and the
+    moves to win each differ. Reuses the per-model discovery appearance +
+    divergence (no new probes); names the real cited sources per engine where
+    available. Returns {has_signal, primary_gap, engines{gemini,chatgpt:{label,
+    how_it_cites,appeared,total,rate,status,moves[]}}, divergence[], divergence_note}.
+    """
+    rows = [r for r in (per_prompt or []) if isinstance(r, dict)]
+    by_model, divergence = _per_model_discovery(rows)
+    hosts_by_type = _cited_hosts_by_type(channel_appearance)
+    engines: Dict[str, Any] = {}
+    for engine, profile in _ENGINE_PROFILES.items():
+        slot = by_model.get(engine) or {}
+        appeared = int(slot.get("appeared") or 0)
+        total = int(slot.get("total") or 0)
+        status = _engine_appearance_status(appeared, total)
+        engines[engine] = {
+            "label": profile["label"],
+            "how_it_cites": profile["how_it_cites"],
+            "appeared": appeared,
+            "total": total,
+            "rate": (round(appeared / total, 3) if total else None),
+            "status": status,
+            "moves": _engine_moves(engine, status, hosts_by_type),
+        }
+    # Primary gap = the measured engine where the brand is weakest (most upside).
+    measured = {
+        e: v for e, v in engines.items() if v["status"] != "couldnt_measure"
+    }
+    primary_gap = None
+    if measured:
+        primary_gap = min(measured, key=lambda e: (measured[e]["rate"] or 0.0))
+    note = None
+    if divergence:
+        won = sorted({m for d in divergence for m in (d.get("won") or [])})
+        lost = sorted({m for d in divergence for m in (d.get("lost") or [])})
+        if won and lost:
+            note = (
+                f"You surface on {', '.join(won)} but not {', '.join(lost)} for "
+                f"category queries like \"{divergence[0].get('query')}\" — "
+                f"closing the {', '.join(lost)} gap is the per-engine priority."
+            )
+    return {
+        "has_signal": bool(measured),
+        "primary_gap": primary_gap,
+        "engines": engines,
+        "divergence": divergence,
+        "divergence_note": note,
+    }
+
+
 def _brand_citation_by_intent(per_sku_reports: Any) -> Dict[str, Dict[str, Any]]:
     """Brand-level roll-up of per-SKU `citation_by_intent` (sums cited/total per
     intent across SKUs; reads the per-SKU dicts, no new probes)."""
@@ -6139,6 +6284,18 @@ async def build_per_sku_report(
             per_prompt=opportunity.get("per_prompt") if isinstance(opportunity, dict) else None,
             merchant_host=normalize_host(product.get("canonical_url") or product.get("pdp_url")),
             retail_channel_host=product.get("retail_channel_host"),
+        ),
+        # Per-ENGINE operating plan: Gemini (Google index) and ChatGPT (Bing +
+        # Reddit/community) cite different sources, so the moves to win each
+        # differ. Reuses per-model appearance + divergence + the classified
+        # channel hosts (build_channel_appearance is a cheap pure fn — no probes).
+        "engine_playbook": build_engine_playbook(
+            per_prompt=opportunity.get("per_prompt") if isinstance(opportunity, dict) else None,
+            channel_appearance=build_channel_appearance(
+                per_prompt=opportunity.get("per_prompt") if isinstance(opportunity, dict) else None,
+                merchant_host=normalize_host(product.get("canonical_url") or product.get("pdp_url")),
+                retail_channel_host=product.get("retail_channel_host"),
+            ),
         ),
         "failing_prompts": failing_prompts,
         # Issue #902 item 1: Google indexing-arc for this SKU's Pivota canonical
