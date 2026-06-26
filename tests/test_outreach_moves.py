@@ -67,3 +67,27 @@ def test_empty_when_no_hosts(monkeypatch):
     _patch_classifier(monkeypatch, {})
     assert mnb._outreach_moves({"cited_hosts": []}) == []
     assert mnb._outreach_moves({}) == []
+
+
+def test_outreach_moves_are_realism_aware_for_long_tail_brands():
+    """Build B: don't tell a long-tail brand to 'pitch Vogue'. Major publishers
+    are flagged hard + reframed to the reachable path; review aggregators get
+    review-building guidance; community/Reddit is DIY. Reachable/DIY outrank
+    hard so doable moves surface first."""
+    from services.merchant_narrative_builder import _outreach_moves
+    who = {"cited_hosts": [
+        {"host": "vogue.com", "recommendation_class": "recommends",
+         "prompts_cited_count": 5, "cited_on_category_query": True},
+        {"host": "hwahae.com", "recommendation_class": "recommends",
+         "prompts_cited_count": 4, "cited_on_category_query": True},
+        {"host": "reddit.com", "prompts_cited_count": 2, "cited_on_category_query": True},
+    ]}
+    moves = {m["host"]: m for m in _outreach_moves(who)}
+    assert moves["vogue.com"]["realism"] == "hard"
+    assert "rarely cover" in moves["vogue.com"]["first_move"]  # reframed, not "pitch"
+    assert moves["hwahae.com"]["realism"] == "reachable"
+    assert "reviews" in moves["hwahae.com"]["first_move"].lower()
+    assert moves["reddit.com"]["realism"] == "diy"
+    # Reachable hwahae outranks hard vogue even though both "recommend" a rival.
+    order = [m["host"] for m in _outreach_moves(who)]
+    assert order.index("hwahae.com") < order.index("vogue.com")
