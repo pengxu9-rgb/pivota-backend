@@ -370,6 +370,11 @@ def _identify_run_sources(run: Dict[str, Any]) -> List[Dict[str, str]]:
             uri = s.get("uri") or ""
             title = (s.get("title") or "").strip()
             host = normalize_host(uri) or ""
+            # The resolved publisher DOMAIN for this source (redirector ->
+            # title/registry; real URI -> uri host). This is the canonical
+            # "what site" key for the cited-host rollup; `label` stays the
+            # human title for display + merchant-brand matching.
+            resolved_host = _grounding_source_host(s) or ""
             # Prefer title for the label/key when the URI is a redirector
             # (which it almost always is with Vertex AI grounding).
             if host in _VERTEX_REDIRECTOR_HOSTS:
@@ -377,15 +382,24 @@ def _identify_run_sources(run: Dict[str, Any]) -> List[Dict[str, str]]:
                     continue  # nothing meaningful to surface
                 label = title
                 key = title.lower()
+                # Redirector titles ARE site names — resolve to the domain when
+                # we can; keep the display name as a last resort so an
+                # unregistered Gemini citation still surfaces.
+                rollup_host = resolved_host or title
             else:
                 # Real (non-redirected) host — use the host for key and
                 # title for label when we have it.
                 label = title or host
                 key = host or title.lower()
+                # NEVER roll up by the title here: a real-URI source's title is
+                # the page headline (OpenAI web_search returns "The 15 Best Hair
+                # Butters … | Marie Claire"), which would leak into
+                # top_cited_hosts as a fake host. Use the resolved domain only.
+                rollup_host = resolved_host or host
             if not key or key in seen_keys:
                 continue
             seen_keys.add(key)
-            out.append({"key": key, "label": label})
+            out.append({"key": key, "label": label, "host": rollup_host})
         return out
     # Legacy fallback: only URI strings available.
     chunks = run.get("grounding_chunks") or []
@@ -396,7 +410,7 @@ def _identify_run_sources(run: Dict[str, Any]) -> List[Dict[str, str]]:
         if host in seen_keys:
             continue
         seen_keys.add(host)
-        out.append({"key": host, "label": host})
+        out.append({"key": host, "label": host, "host": host})
     return out
 
 
@@ -582,9 +596,12 @@ def extract_cited_hosts(
     merchant_vendors: Optional[Tuple[str, ...]] = None,
 ) -> Tuple[Counter, int, int]:
     """Walk every run's grounding sources and return:
-      - Counter of {competitor_label: occurrences} — labels are
-        Gemini's titles ("Sephora", "Olive Young Global") not the
-        redirector host
+      - Counter of {competitor_host: occurrences} — keyed by the resolved
+        publisher DOMAIN ("sephora.com", "oliveyoung.com"). Critically NOT the
+        source title: Gemini titles happen to be bare domains, but OpenAI
+        web_search titles are page headlines ("The 15 Best Hair Butters … |
+        Marie Claire"), which would otherwise leak into top_cited_hosts as
+        fake hosts. Sources whose host can't be resolved are skipped.
       - count of runs that cited the merchant
       - count of runs that cited at least one source
 
@@ -601,7 +618,7 @@ def extract_cited_hosts(
             continue
         runs_with_any_citation += 1
         merchant_in_run = False
-        run_competitor_labels = set()
+        run_competitor_hosts = set()
         for src in sources:
             if _source_matches_merchant(
                 src,
@@ -611,11 +628,14 @@ def extract_cited_hosts(
             ):
                 merchant_in_run = True
             else:
-                run_competitor_labels.add(src["label"])
+                # Roll up by the resolved domain, not the display title.
+                cited_host = (src.get("host") or "").strip()
+                if cited_host:
+                    run_competitor_hosts.add(cited_host)
         if merchant_in_run:
             merchant_cited_runs += 1
-        for label in run_competitor_labels:
-            competitors[label] += 1
+        for host in run_competitor_hosts:
+            competitors[host] += 1
     return competitors, merchant_cited_runs, runs_with_any_citation
 
 
