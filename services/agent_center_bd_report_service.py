@@ -4957,6 +4957,94 @@ def _per_model_discovery(
     return by_model, divergence[:8]
 
 
+# Efficacy / certification claims worth THIRD-PARTY proof. When a product makes
+# these but the merchant hasn't supplied evidence, AI engines can't substantiate
+# them (they cite marketing copy weakly or flag it) — the gap Pivota's commerce
+# index uniquely closes by publishing merchant-supplied evidence as grounded,
+# citable claims.
+_EFFICACY_CLAIM_TERMS = (
+    "repair", "repairs", "restore", "restores", "strengthen", "strengthens",
+    "reduce", "reduces", "improve", "improves", "treat", "treats", "treatment",
+    "clinical", "clinically", "proven", "heal", "heals", "regenerate",
+    "regenerates", "prevent", "prevents", "boost", "boosts", "firming",
+    "brightening", "anti-aging", "antiaging", "detox", "disulfide", "bond",
+)
+_CERT_CLAIM_TERMS = (
+    "vegan", "cruelty-free", "organic", "halal", "kosher", "dermatologist",
+    "dermatologist-tested", "hypoallergenic", "non-toxic", "nontoxic",
+    "gluten-free", "paraben-free", "sulfate-free", "fragrance-free", "non-gmo",
+    "clinically-tested", "fair-trade", "fairtrade", "fda", "gmp",
+)
+
+
+def _detect_claim_terms(text: str, terms: Tuple[str, ...]) -> List[str]:
+    low = (text or "").lower()
+    return [t for t in terms if re.search(rf"(?<![a-z]){re.escape(t)}(?![a-z])", low)]
+
+
+def build_evidence_play(
+    *,
+    product: Optional[Mapping[str, Any]],
+    sku_ctx: Optional[Mapping[str, Any]],
+    verify_summary: Optional[Mapping[str, Any]] = None,
+) -> Dict[str, Any]:
+    """The Pivota-moat action: supply lab reports / clinical evidence /
+    certifications so Pivota can publish them as GROUNDED, CITABLE claims on the
+    merchant's canonical PDP / commerce index. Fires when the product makes
+    substantiation-worthy claims (or AI flagged unsupported answers about it) but
+    the merchant hasn't supplied evidence yet — the one lever no retailer,
+    marketplace, or publisher can offer the brand. Deterministic; no probes."""
+    prod = product if isinstance(product, Mapping) else {}
+    ctx = sku_ctx if isinstance(sku_ctx, Mapping) else {}
+    already = _has_substantiation(dict(prod), dict(ctx))
+    text = " ".join(str(v) for v in (
+        prod.get("title"), prod.get("raw_title"), prod.get("description"),
+        prod.get("product_type"), _json_obj(prod.get("attributes_raw")),
+    ) if v)
+    efficacy = _detect_claim_terms(text, _EFFICACY_CLAIM_TERMS)
+    certs = _detect_claim_terms(text, _CERT_CLAIM_TERMS)
+    flagged = int((verify_summary or {}).get("flagged") or 0)
+    present = bool(efficacy or certs or flagged) and not already
+    moves: List[str] = []
+    if present:
+        if efficacy:
+            moves.append(
+                "Supply third-party proof (lab test, clinical study, or "
+                f"ingredient data) for your efficacy claims ({', '.join(efficacy[:4])}) "
+                "— Pivota publishes them as grounded, citable claims on your "
+                "canonical PDP so AI cites the evidence, not just marketing copy."
+            )
+        if certs:
+            moves.append(
+                f"Upload your certifications ({', '.join(certs[:4])}) for Pivota to "
+                "publish as verifiable claims AI engines can cite."
+            )
+        if flagged:
+            moves.append(
+                f"AI flagged {flagged} answer(s) about your product as unsupported — "
+                "supplying evidence is what closes the 'can't substantiate' gap "
+                "and earns the citation."
+            )
+        if not moves:
+            moves.append(
+                "Supply product evidence (specs, sourcing, test results, "
+                "certifications) for Pivota to publish as grounded claims on your "
+                "canonical PDP."
+            )
+    return {
+        "present": present,
+        "already_substantiated": already,
+        "claims_to_substantiate": efficacy[:5] + certs[:5],
+        "unsubstantiated_in_ai": flagged,
+        "moves": moves,
+        "pivota_value": (
+            "Pivota's commerce index turns merchant-supplied evidence into "
+            "grounded, citable claims — a trust signal AI engines reward and that "
+            "retailers, marketplaces, and publishers can't provide for the brand."
+        ),
+    }
+
+
 def build_product_competitiveness(per_prompt: Optional[List[Dict[str, Any]]]) -> Dict[str, Any]:
     """Product-FIRST view: does the product WIN non-branded discovery demand
     inside frontier models — where the brand gains NEW buyers — and who does AI
@@ -6145,6 +6233,15 @@ async def build_per_sku_report(
         # PDP (None when the SKU has no minted canonical signature).
         "indexing_arc": _sku_indexing_arc(product),
         "impact_proxy": _impact_proxy_from_context(sku_ctx),
+        # Pivota-moat action: supply lab reports / clinical evidence /
+        # certifications for Pivota to publish as grounded, citable claims on the
+        # canonical PDP. Fires when the product makes substantiation-worthy
+        # claims (or AI flagged unsupported answers) but no evidence is supplied.
+        "evidence_play": build_evidence_play(
+            product=product,
+            sku_ctx=sku_ctx,
+            verify_summary=verify_summary_out,
+        ),
         "provider_models": provider_models,
         "model_is_override": _any_model_override(provider_models),
         "verify_summary": verify_summary_out,
