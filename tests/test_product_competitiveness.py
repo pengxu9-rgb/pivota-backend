@@ -217,6 +217,36 @@ def test_discovery_appearance_splits_endorsement_from_own_listing():
     assert d["appeared_recommended"] == 1
 
 
+def test_evidence_play_recommends_supplying_proof_to_commerce_index():
+    """Build C: the Pivota-moat lever. A product making efficacy/cert claims with
+    no supplied evidence (and AI-flagged unsupported answers) gets a 'supply lab
+    reports/certifications -> Pivota publishes them as grounded claims' action."""
+    from services.agent_center_bd_report_service import build_evidence_play
+    product = {
+        "title": "Anuko Bond & Repair Hair Oil",
+        "description": "Bond technology repairs disulfide bonds. Clinically shown. Vegan, cruelty-free.",
+    }
+    ep = build_evidence_play(product=product, sku_ctx={}, verify_summary={"flagged": 3})
+    assert ep["present"] is True
+    assert ep["already_substantiated"] is False
+    assert "repair" in ep["claims_to_substantiate"] and "vegan" in ep["claims_to_substantiate"]
+    assert any("Pivota publishes" in m for m in ep["moves"])
+    assert any("flagged 3" in m for m in ep["moves"])  # verify gap -> evidence action
+
+
+def test_evidence_play_silent_when_substantiated_or_no_claims():
+    from services.agent_center_bd_report_service import build_evidence_play
+    product = {"title": "Anuko Bond & Repair Hair Oil", "description": "repairs, clinically shown"}
+    # Merchant already supplied evidence -> no nag.
+    assert build_evidence_play(
+        product=product, sku_ctx={"has_substantiated_evidence": True},
+        verify_summary={"flagged": 3})["present"] is False
+    # No substantiation-worthy claims and nothing flagged -> not present.
+    assert build_evidence_play(
+        product={"title": "Plain Cotton Tote Bag"}, sku_ctx={},
+        verify_summary={"flagged": 0})["present"] is False
+
+
 def test_engine_playbook_is_per_engine_and_names_real_sources():
     """Build A: per-engine ops. Gemini (Google index) and ChatGPT (Bing +
     Reddit/community) get DIFFERENT moves grounded in how each cites; the weaker
