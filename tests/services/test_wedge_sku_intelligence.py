@@ -307,6 +307,42 @@ def test_competitor_attribute_extraction_prefers_parsed_evidence_over_noisy_raw(
     assert "skin" not in attributes
 
 
+def test_competitor_attribute_extraction_is_category_agnostic_for_hair():
+    """Regression (#2): the alias taxonomy is collagen-specific, so for a hair
+    competitor it matched nothing and the whole probe came back not_assessed.
+    Now the grounded 'known for' answer is captured verbatim for ANY category."""
+    run = {
+        "parsed": {
+            "evidence_excerpt": (
+                "SheaMoisture is known for raw shea butter, sulfate-free "
+                "formulas, and curly/textured-hair care, widely recommended in "
+                "natural-hair roundups."
+            )
+        },
+        "grounding_sources": [
+            {"uri": "https://example.com/sheamoisture", "title": "SheaMoisture"}
+        ],
+    }
+    rows = bd._extract_competitor_attribute_evidence(run, provider="chatgpt")
+    merged = bd._merge_competitor_attribute_evidence(
+        competitor="SheaMoisture", evidence_rows=rows
+    )
+    assert merged != "not_assessed"
+    assert merged["status"] == "assessed"
+    assert merged["competitor"] == "SheaMoisture"
+    # No collagen aliases matched, but the verbatim "known for" is captured...
+    assert "shea butter" in (merged["known_for"] or "").lower()
+    # ...and the sentinel never leaks into the typed competitor attributes.
+    assert bd._COMPETITOR_KNOWN_FOR_KEY not in (merged.get("attributes_present") or [])
+
+
+def test_competitor_attribute_extraction_ungrounded_still_fails_closed():
+    """No grounding sources => no capture (don't surface ungrounded competitor
+    claims), even with the new category-agnostic path."""
+    run = {"parsed": {"evidence_excerpt": "SheaMoisture is known for shea butter."}}
+    assert bd._extract_competitor_attribute_evidence(run, provider="chatgpt") == []
+
+
 @pytest.mark.asyncio
 async def test_competitor_attribute_probe_mock_or_ungrounded_fails_closed(monkeypatch):
     async def fake_probe(**kwargs):
