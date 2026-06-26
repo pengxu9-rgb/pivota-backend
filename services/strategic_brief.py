@@ -83,6 +83,12 @@ CLAIM DISCIPLINE (do not let confident prose outrun the EVIDENCE — this is a t
   not as a proven result.
 - SOURCES PER FIELD: name AT MOST THREE source sites in any single sentence/field; only sites in
   grounding_notes.evidenced_channels. If more matter, name the top two or three and stop.
+- REALISTIC OUTREACH: do NOT tell the merchant to "pitch" a major mainstream publisher (Vogue, Forbes,
+  Marie Claire, Allure, Cosmopolitan, Good Housekeeping, etc.) — they rarely cover an emerging or medium-tail
+  brand on a cold pitch, so that is not a real action. For winning a publisher-controlled lane, prescribe the
+  REACHABLE path first: earn authentic reviews + get listed/reviewed on the review aggregators AI already
+  cites, build genuine Reddit / niche-community presence, and collect first-party reviews — editorial pickup
+  follows those signals. Only suggest contacting a publisher when it is a niche/community site in EVIDENCE.
 - QUOTES: put a phrase in quotes ONLY when it is an EXACT search lane from EVIDENCE. NEVER quote your own
   product's features, ingredients, or angle ("bond technology that repairs disulfide bonds") as if it were a
   searched lane — write those as plain prose.

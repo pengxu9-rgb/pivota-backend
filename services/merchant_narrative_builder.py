@@ -337,6 +337,47 @@ _FIRST_MOVE_BY_LEVER: Dict[str, str] = {
     ),
 }
 
+# Major mainstream publishers: AI grounds in them, but they rarely cover an
+# emerging / medium-tail brand on a cold pitch — so "Pitch Vogue" is not a real
+# move for most merchants. We keep the citation insight but reframe the action
+# to the reachable path (reviews + community first) and flag realism so the UI
+# can prioritise doable moves.
+_MAJOR_PUBLISHER_HOSTS = frozenset({
+    "vogue.com", "forbes.com", "marieclaire.com", "allure.com", "elle.com",
+    "cosmopolitan.com", "goodhousekeeping.com", "harpersbazaar.com", "glamour.com",
+    "instyle.com", "refinery29.com", "womenshealthmag.com", "nytimes.com", "wsj.com",
+})
+_REVIEW_BUILD_FIRST_MOVE = (
+    "Earn authentic reviews and keep your product listing accurate in their "
+    "crowd-reviewed database — that's how AI (and shoppers) pick you up here, "
+    "not a paid pitch."
+)
+_MAJOR_PUBLISHER_FIRST_MOVE = (
+    "Major publishers rarely cover an emerging brand on a cold pitch. Build "
+    "review-site listings and authentic community/Reddit presence first — "
+    "editorial coverage follows the signals they pick up."
+)
+
+
+def _move_realism(host: str, htype: str, subtype: str) -> str:
+    """How realistically a merchant can act on this outreach move now —
+    so 'engage Reddit' / 'earn reviews' outrank 'pitch Vogue' for a long-tail
+    brand. reachable = earn it directly; diy = self-serve (community/reviews);
+    onboarding = list/get carried; hard = needs scale/relationships first."""
+    if htype in {"retailer", "marketplace"}:
+        return "onboarding"
+    if htype in {"community", "forum", "reddit", "social", "video"}:
+        return "diy"
+    if htype == "editorial":
+        # Major publisher check FIRST — a big name classified as review_site
+        # (e.g. forbes.com) is still hard to land for an emerging brand.
+        if subtype == "magazine" or host in _MAJOR_PUBLISHER_HOSTS:
+            return "hard"
+        if subtype in {"review_aggregator", "review_site", "community"}:
+            return "reachable"
+        return "reachable"
+    return "investigate"
+
 
 def _outreach_moves(who: Dict[str, Any]) -> List[Dict[str, Any]]:
     """Turn the 'who AI cites instead' hosts into concrete off-platform moves —
@@ -367,6 +408,7 @@ def _outreach_moves(who: Dict[str, Any]) -> List[Dict[str, Any]]:
                 "how to get your product featured, listed, or reviewed there."
             )}
         verb, lever = routed
+        realism = _move_realism(host, htype, subtype)
         recommends = str(h.get("recommendation_class") or "").strip().lower() == "recommends"
         cited_n = int(h.get("prompts_cited_count") or 0)
         category = bool(h.get("cited_on_category_query"))
@@ -389,12 +431,23 @@ def _outreach_moves(who: Dict[str, Any]) -> List[Dict[str, Any]]:
             "cited_on_category_query": category,
             "headline": f"{verb} {host}",
             "why": why,
-            "first_move": cls.get("outreach_hint") or _FIRST_MOVE_BY_LEVER.get(lever),
+            # Reframe the action to what's actually doable: review-building for
+            # review aggregators, the indirect path for major publishers (don't
+            # tell a long-tail brand to "pitch Vogue").
+            "first_move": (
+                _MAJOR_PUBLISHER_FIRST_MOVE if realism == "hard"
+                else _REVIEW_BUILD_FIRST_MOVE if subtype in {"review_aggregator", "review_site"}
+                else cls.get("outreach_hint") or _FIRST_MOVE_BY_LEVER.get(lever)
+            ),
+            "realism": realism,
             "pitch_recipient": cls.get("pitch_recipient"),
             # A host that actively recommends a RIVAL is the sharpest move
             # (you're losing the endorsement, not just absent) — weight it well
-            # above raw citation frequency.
-            "_priority": (5 if recommends else 0) + (1 if category else 0) + cited_n,
+            # above raw citation frequency. But de-prioritise "hard" (major-
+            # publisher) moves a long-tail brand can't realistically land, so
+            # reachable/DIY moves (reviews, Reddit/community) surface first.
+            "_priority": (5 if recommends else 0) + (1 if category else 0) + cited_n
+            - (4 if realism == "hard" else 0),
         })
     moves.sort(key=lambda m: -m["_priority"])
     for m in moves:
