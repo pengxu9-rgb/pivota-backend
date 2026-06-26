@@ -452,6 +452,59 @@ async def _call_deepseek_chat(
     return response.json()
 
 
+async def answer_grounded_question(
+    *,
+    system_prompt: str,
+    user_message: str,
+    timeout_s: float = 30.0,
+) -> str:
+    """Answer a freeform merchant question grounded in supplied audit
+    context, using Deepseek chat.
+
+    Deepseek runs UNGROUNDED here (no live web search), which is exactly
+    what we want for the "Ask about this product" box: the model must
+    reason only over the audit slice we pass, never the open web — that
+    keeps the answer faithful to the report and unable to invent outside
+    facts. Reuses `_call_deepseek_chat`, which forces JSON output, so the
+    caller's prompt should ask for `{"answer": "..."}` and we unwrap it
+    here (falling back to the raw text if the model returns bare prose).
+
+    Returns the plain-text answer (possibly empty if the model returned
+    nothing usable). Raises DeepseekProbeError on missing key / transport
+    / 4xx-5xx so the route can degrade to an honest "try again".
+    """
+    api_key = (settings.deepseek_api_key or "").strip()
+    if not api_key:
+        raise DeepseekProbeError(
+            "DEEPSEEK_API_KEY is not configured; cannot answer the question."
+        )
+    payload = await _call_deepseek_chat(
+        api_key=api_key,
+        base_url=settings.deepseek_api_base_url,
+        model=settings.deepseek_model,
+        system_prompt=system_prompt,
+        user_message=user_message,
+        timeout_s=timeout_s,
+        enable_web_search=False,
+    )
+    try:
+        content = payload["choices"][0]["message"]["content"]
+    except (KeyError, IndexError, TypeError) as exc:
+        raise DeepseekProbeError(
+            "Deepseek response missing choices[0].message.content"
+        ) from exc
+    if not isinstance(content, str) or not content.strip():
+        return ""
+    try:
+        parsed = json.loads(content)
+    except (ValueError, TypeError):
+        # Model ignored response_format and returned bare prose.
+        return content.strip()
+    if isinstance(parsed, dict):
+        return str(parsed.get("answer") or "").strip()
+    return content.strip()
+
+
 async def _run_single_query(
     *,
     api_key: str,
