@@ -1920,3 +1920,55 @@ def test_cited_source_reputation_and_prose_words_are_grounded():
 
     assert not any(f.startswith("unassessed-competitor-attribute") for f in failures), failures
     assert not any(f.startswith("unknown-entity") for f in failures), failures
+
+
+def test_category_answers_mine_verbatim_ai_answers_and_license_entities():
+    """#1: the brief evidence surfaces the AI's VERBATIM category answers — the
+    winning products, the sources, the angle — and licenses those entities for
+    grounding so the brief may name them (instead of generic 'build a PDP')."""
+    opportunity = {
+        "intent_ladder": {},
+        "per_prompt": [
+            {
+                "query": "best hair oil",
+                "axis": "category",
+                "query_class": "head",
+                "provider_verdicts": {"gemini": "loss", "chatgpt": "loss"},
+                "ownership_state": "competitor-owned",
+                "demand_signal": 1.0,
+                "competitors": ["K18", "Olaplex", "Moroccanoil"],
+                "cited_evidence": {
+                    "provider": "chatgpt",
+                    "excerpt": ("Top hair oils per Vogue and Allure feature K18 "
+                                "Molecular Repair Hair Oil and Olaplex, framed "
+                                "around bond repair and disulfide bonds."),
+                    "cited_hosts": ["vogue.com", "allure.com"],
+                    "competitors_named": ["K18 Molecular Repair Hair Oil",
+                                          "Olaplex", "Moroccanoil"],
+                },
+            },
+        ],
+        "top_open_lanes": [],
+    }
+    evidence = strategic_brief.assemble_sku_brief_evidence(
+        opportunity=opportunity,
+        attribute_graph={},
+        identity={"name": "Anuko Bond & Repair Hair Oil",
+                  "anchors": {"brand": "Anuko", "category": "hair oil"}},
+        sku_title="Anuko Bond & Repair Hair Oil",
+        merchant_host="anukoofficial.com",
+    )
+    answers = evidence["category_answers"]
+    assert answers and answers[0]["query"] == "best hair oil"
+    assert "bond repair" in answers[0]["ai_answer"].lower()
+    assert "vogue.com" in answers[0]["cited_sources"]
+    assert any("K18" in r for r in answers[0]["recommends"])
+    # Mined source + product are licensed for grounding.
+    allowed = strategic_brief._allowed_grounding(evidence)
+    assert "vogue.com" in allowed["domains"]
+    assert "allure.com" in allowed["domains"]
+    # A brief naming the mined winners/sources is grounded; invented ones are not.
+    assert strategic_brief.validate_grounding(
+        {"why_you_lose": "Vogue and Allure rank K18 and Olaplex."}, evidence) is True
+    assert strategic_brief.validate_grounding(
+        {"why_you_lose": "Brandzilla dominates via fakeshop.com."}, evidence) is False
