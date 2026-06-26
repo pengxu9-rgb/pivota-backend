@@ -70,7 +70,11 @@ CLAIM DISCIPLINE (do not let confident prose outrun the EVIDENCE — this is a t
   any marketplace (grounding_notes.merchant_channels = "unknown"). If a lane has no evidenced channel, the move
   is "own your own page/site for this lane first." You may suggest a marketplace/community move only
   CONDITIONALLY: "if you already sell on <evidenced channel>, …". Do NOT invent communities, subreddits,
-  influencers, or platforms.
+  influencers, or platforms. Name AT MOST THREE source sites/domains in any single field — if more control a
+  lane, name the two or three biggest and say "and others"; never list four or more.
+- NUMBERS: never write a percentage, price, "Nx" multiplier, or a review/rating/follower count — not even one
+  quoted in EVIDENCE. Describe magnitude in words ("most of its formula", "a large review base"), never digits
+  with %, $, x, or counts.
 - MERCHANT PATH: respect product.merchant_path. If archetype is "brand", the commercial goal is to drive
   buyers to the brand's own website. If archetype is "channel", the commercial goal is to drive buyers to the
   channel's own website. Do not blur those paths.
@@ -193,6 +197,31 @@ _FORBIDDEN_PATTERNS = (
     re.compile(r"\bgrounded agent\b", re.IGNORECASE),
     re.compile(r"\bscores?\b", re.IGNORECASE),
 )
+
+# Free-text EVIDENCE (mined AI answers, competitor "known for") can quote stats
+# like "90% of ingredients" or "$24" that the brief is forbidden to repeat
+# (forbidden:% / $ patterns above). Neutralise those stats to words BEFORE the
+# evidence reaches the prompt so a faithful draft doesn't trip the validator —
+# the qualitative signal is what the brief needs, not the exact number.
+_NUMERIC_CLAIM_SUBS: Tuple[Tuple["re.Pattern[str]", str], ...] = (
+    (re.compile(r"\b\d+(?:\.\d+)?\s?%"), "a large share"),
+    (re.compile(r"\$\s?\d[\d,]*(?:\.\d+)?"), "a set price"),
+    (re.compile(r"\b\d+(?:\.\d+)?\s*x\b", re.IGNORECASE), "several-fold"),
+    (re.compile(
+        r"\b\d[\d,]*\+?\s*(reviews?|ratings?|stars?|customers?|users?|sales?|followers?|subscribers?)\b",
+        re.IGNORECASE,
+    ), r"many \1"),
+    (re.compile(r"/100"), ""),
+)
+
+
+def _neutralize_numeric_claims(text: Any) -> str:
+    s = str(text or "")
+    for pattern, repl in _NUMERIC_CLAIM_SUBS:
+        s = pattern.sub(repl, s)
+    return s
+
+
 _DOMAIN_RE = re.compile(
     r"(?<!@)\b(?:[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.)+[a-z]{2,}\b",
     re.IGNORECASE,
@@ -680,6 +709,11 @@ _SAFETY_TERM_FAMILIES = (
 # grounding validator is strict, so a clean draft is found reliably only with
 # several tries; a passing draft short-circuits, so the common case stays cheap.
 _STRATEGIC_BRIEF_MAX_ATTEMPTS = 6
+# Raised from 1200: the brief evidence now carries mined category answers +
+# competitor "known for" depth, so 1200-token drafts were truncating
+# (finish_reason=length, shape_ok=False) on ~half the attempts → forced the
+# deterministic fallback. 2000 gives the full brief room to land.
+_STRATEGIC_BRIEF_MAX_TOKENS = 2000
 
 
 def assemble_sku_brief_evidence(
@@ -814,7 +848,7 @@ async def generate_sku_strategic_brief(
     dbg["model"] = selected_model
     system, user = build_sku_brief_prompt(evidence)
     dbg["prompt_chars"] = len(system) + len(user)
-    dbg["max_tokens"] = 1200
+    dbg["max_tokens"] = _STRATEGIC_BRIEF_MAX_TOKENS
     dbg["attempts"] = []
 
     # The grounding validator is deliberately strict (a trust product), so a
@@ -829,7 +863,7 @@ async def generate_sku_strategic_brief(
                 user=user,
                 provider=selected_provider,
                 model=selected_model,
-                max_tokens=1200,
+                max_tokens=_STRATEGIC_BRIEF_MAX_TOKENS,
             )
         except LLMSynthesisError as exc:
             att["error"] = f"{type(exc).__name__}: {exc}"[:300]
@@ -979,8 +1013,9 @@ def _category_answers(rows: List[Mapping[str, Any]]) -> List[Dict[str, Any]]:
         )
         answers.append({
             "query": _clean_str(row.get("query")),
-            # Verbatim AI answer — read it for the winning angle/claim.
-            "ai_answer": excerpt[:400],
+            # Verbatim AI answer — read it for the winning angle/claim. Stats
+            # neutralised so the brief doesn't echo a forbidden "%/$" figure.
+            "ai_answer": _neutralize_numeric_claims(excerpt)[:400],
             # Specific products/brands the engine recommended for this lane.
             "recommends": recommends[:6],
             # The sources the engine cited (where the recommendations come from).
@@ -1434,7 +1469,7 @@ def _competitor_attributes_note(value: Optional[Any]) -> Any:
             continue
         attr = attr_by_norm.get(_norm_phrase(item.get("attribute")))
         provider = _clean_str(item.get("provider"))
-        verbatim = _clean_str(item.get("verbatim"))
+        verbatim = _neutralize_numeric_claims(_clean_str(item.get("verbatim")))
         if not attr or not provider or not verbatim:
             continue
         evidence_rows.append({

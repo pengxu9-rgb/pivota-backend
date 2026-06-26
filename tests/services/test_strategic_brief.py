@@ -1972,3 +1972,36 @@ def test_category_answers_mine_verbatim_ai_answers_and_license_entities():
         {"why_you_lose": "Vogue and Allure rank K18 and Olaplex."}, evidence) is True
     assert strategic_brief.validate_grounding(
         {"why_you_lose": "Brandzilla dominates via fakeshop.com."}, evidence) is False
+
+
+def test_neutralize_numeric_claims_strips_forbidden_stats():
+    """#3: free-text evidence often quotes stats ("90%", "$24", "1,200 reviews")
+    the brief is forbidden to repeat. Neutralise them to words so a faithful
+    draft doesn't trip the validator."""
+    f = strategic_brief._neutralize_numeric_claims
+    assert "%" not in f("over 90% of ingredients are moisture essences")
+    assert "$" not in f("priced at $24.99 per bottle")
+    assert "x" not in f("3x more repair").lower().replace("several-fold", "")
+    out = f("backed by 1,200 reviews")
+    assert "1,200" not in out and "reviews" in out
+    # Plain prose is untouched.
+    assert f("known for deep hydration") == "known for deep hydration"
+
+
+def test_competitor_attributes_note_strips_percentages_before_brief():
+    """The competitor 'known for' verbatim (e.g. '90% moisture essences') must
+    not carry a percentage into the brief evidence — that was tripping
+    forbidden:% and forcing the deterministic fallback."""
+    note = strategic_brief._competitor_attributes_note({
+        "status": "assessed",
+        "competitor": "&Honey",
+        "attributes_present": ["organic"],
+        "evidence": [{
+            "attribute": "organic",
+            "provider": "gemini",
+            "verbatim": "&Honey is over 90% moisture essences, $24 a bottle.",
+        }],
+    })
+    assert note != "not_assessed"
+    blob = json.dumps(note)
+    assert "%" not in blob and "$" not in blob
