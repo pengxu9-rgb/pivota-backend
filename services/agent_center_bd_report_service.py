@@ -136,6 +136,11 @@ _PER_SKU_AUDIT_UPSTREAM_CHUNK_SIZE = 4
 _PER_SKU_AUDIT_MAX_CONSECUTIVE_CHUNK_FAILURES = 2
 _EXPLICIT_AVAILABLE_STATES = {"in_stock", "available"}
 _COMPETITOR_ATTRIBUTE_GROUNDED_PROVIDERS = {"gemini", "chatgpt"}
+# Sentinel attribute key for the category-agnostic verbatim "what {competitor}
+# is known for" capture (vs the typed alias attributes). Routed to the
+# competitor_attributes.known_for summary, kept OUT of attributes_present so it
+# never pollutes the brief's typed competitor-attribute words.
+_COMPETITOR_KNOWN_FOR_KEY = "__known_for__"
 _COMPETITOR_ATTRIBUTE_ALIASES: Tuple[Tuple[str, Tuple[str, ...]], ...] = (
     ("halal", ("halal",)),
     ("kosher", ("kosher",)),
@@ -6015,6 +6020,24 @@ async def build_per_sku_report(
         sku_key=sku_key,
         catalog_unavailable=catalog_unavailable,
     )
+    # Competitor-attribute depth: probe what the durable category winner is
+    # "known for" (ingredients/format/positioning) so the diagnosis answers WHAT
+    # competitors did right, not just who they are. Scoped to URL/wedge audits
+    # (catalog_unavailable => bounded SKU count) to avoid N×grounded calls on a
+    # full catalog; the internal gates (brief enabled + a durable competitor
+    # exists) mean it only spends when there's a real winner to learn from.
+    # build_per_sku_report previously skipped this entirely — only the legacy
+    # wedge-hero path ran it — so it never fired on the live per-SKU audit.
+    competitor_attributes: Any = "not_assessed"
+    if catalog_unavailable:
+        competitor_attributes = await _probe_durable_competitor_attributes_for_brief(
+            opportunity=opportunity,
+            product=product,
+            merchant_id=str(merchant_id),
+            run_id=audit_run_id or "",
+            coverage={"providers": list(provider_models.keys())},
+            provider_model_metadata=provider_models,
+        )
     next_best_action = await attach_sku_strategic_brief(
         next_best_action,
         opportunity=opportunity,
@@ -6024,7 +6047,14 @@ async def build_per_sku_report(
         identity=identity,
         sku_title=(_get_sku(sku_ctx).get("title") or product.get("title")),
         merchant_host=normalize_host(product.get("canonical_url") or product.get("pdp_url")),
+        competitor_attributes=(
+            competitor_attributes if competitor_attributes != "not_assessed" else None
+        ),
     )
+    # Surface the competitor intelligence on the report so the merchant/UI can
+    # see "what AI says <winner> is known for" directly (not only as brief input).
+    if isinstance(competitor_attributes, Mapping) and competitor_attributes.get("status") == "assessed":
+        next_best_action["competitor_intel"] = competitor_attributes
 
     deliverability = build_sku_deliverability_prediction(sku_ctx, scores)
     checkout_handoff = build_checkout_handoff_descriptor(
@@ -8585,6 +8615,15 @@ def _extract_competitor_attribute_evidence(
             "provider": provider,
             "verbatim": _attribute_verbatim(text, aliases),
         })
+    # Category-agnostic capture: the alias taxonomy above is collagen-specific,
+    # so for other categories (hair, skincare, …) it matches nothing. Always
+    # keep the grounded "what {competitor} is known for" answer verbatim so the
+    # competitor diagnosis works for ANY category, not just supplements.
+    out.append({
+        "attribute": _COMPETITOR_KNOWN_FOR_KEY,
+        "provider": provider,
+        "verbatim": " ".join(text.split())[:280],
+    })
     return out
 
 
@@ -8594,24 +8633,35 @@ def _merge_competitor_attribute_evidence(
     evidence_rows: List[Dict[str, str]],
 ) -> Any:
     by_attribute: Dict[str, Dict[str, str]] = {}
+    known_for: Optional[str] = None
     for row in evidence_rows:
         attribute = str(row.get("attribute") or "").strip()
         provider = str(row.get("provider") or "").strip()
         verbatim = str(row.get("verbatim") or "").strip()
         if not attribute or not provider or not verbatim:
             continue
+        if attribute == _COMPETITOR_KNOWN_FOR_KEY:
+            # First grounded "known for" answer wins (category-agnostic summary).
+            if not known_for:
+                known_for = verbatim[:280]
+            continue
         by_attribute.setdefault(attribute, {
             "attribute": attribute,
             "provider": provider,
             "verbatim": verbatim[:240],
         })
-    if not by_attribute:
+    if not by_attribute and not known_for:
         return "not_assessed"
     attributes = list(by_attribute)
     return {
         "status": "assessed",
         "competitor": competitor,
+        # Typed attributes the AI named (alias taxonomy) — used by the brief's
+        # grounded competitor-attribute words.
         "attributes_present": attributes[:8],
+        # Verbatim, category-agnostic "what the AI says this competitor is known
+        # for" — the surfaceable answer to "what did the winner do right".
+        "known_for": known_for,
         "evidence": [by_attribute[attr] for attr in attributes[:8]],
         "note": "Grounded presence only - not a claim the competitor lacks anything else.",
     }
