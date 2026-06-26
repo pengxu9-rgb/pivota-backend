@@ -112,12 +112,19 @@ WRITE the brief as JSON with these fields — each must be specific to THIS prod
   invisible in the category").
 - core_decision: the ONE big strategic call, stated plainly and decisively (what to do, what to STOP doing,
   and why — name the real reason from evidence).
-- why_you_lose: WHY the category winners win — synthesize the named winners × the sources that rank them ×
-  what the evidenced ranking sources imply about their moat (reviews/authority/distribution/positioning).
-  Do not claim competitor feature gaps as fact; make any competitor positioning read explicit inference.
+- why_you_lose: WHY the category winners win. READ category_answers (the AI's VERBATIM answers on the
+  category lanes) and synthesize: the specific winning PRODUCTS named (from recommends), the SOURCES that
+  rank them (from cited_sources), AND the category's winning ANGLE/claim that recurs across the answers
+  (e.g. a hair-oil category won on "bond repair / disulfide bonds"). Tie the moat to that angle ×
+  source authority/distribution. Only NAME products from recommends and sources from cited_sources/
+  grounding_notes (never invent others). Do not claim competitor feature gaps as fact; make any competitor
+  positioning read explicit inference.
 - your_angle: the defensible positioning wedge = the merchant's differentiating attributes that the named
-  product actually has. Reframe them from "a {category}" to a category of one without saying winners lack
-  those attributes as fact. Use exact EVIDENCE lane wording where their differentiation IS the answer.
+  product actually has. CRITICAL: if the winning ANGLE from category_answers is one the merchant's OWN
+  attributes already match (e.g. the product already claims "bond repair"), say so plainly — the wedge is
+  "you have the winning claim but aren't in the sources that rank it." Reframe from "a {category}" to a
+  category of one without saying winners lack those attributes as fact. Use exact EVIDENCE lane wording
+  where their differentiation IS the answer.
 - traffic_strategy: a ranked list of where the missed, WINNABLE demand is + who controls each channel
   (name only sources/retailers/communities from grounding_notes.evidenced_channels) + the realistic path in.
   If no channel is evidenced for a lane, say to own your page/site first. Marketplace/community moves must be
@@ -730,6 +737,10 @@ def assemble_sku_brief_evidence(
         },
         "position": _position_from_ladder(opportunity_map),
         "category_battle": category_battle,
+        # The verbatim AI answers on the category lanes — winning products,
+        # sources, and the category angle the brief should mine (see
+        # _category_answers + the why_you_lose / your_angle prompt fields).
+        "category_answers": _category_answers(category_rows),
         "substitution": _substitution_evidence(opportunity_map),
         "open_lanes": [_open_lane_evidence(lane) for lane in top_open_lanes],
         "channel_map": channel_map,
@@ -941,6 +952,41 @@ def _category_battle(rows: List[Mapping[str, Any]]) -> Dict[str, Any]:
         "ranked_by": _unique_host_roles(ranked_by),
         "prompt_details": prompt_details,
     }
+
+
+def _category_answers(rows: List[Mapping[str, Any]]) -> List[Dict[str, Any]]:
+    """The AI's VERBATIM grounded answers on the category lanes — the richest,
+    most under-used signal. The cited-evidence excerpt names the specific
+    winning PRODUCTS, the SOURCES the engine pulled from, and (implicitly) the
+    category's winning ANGLE/claim (e.g. hair oil is won on "bond repair /
+    disulfide bonds"). Surfacing it lets the brief diagnose WHY winners win and
+    whether the merchant's OWN attributes already match that angle, instead of
+    giving generic "build a canonical PDP" advice."""
+    answers: List[Dict[str, Any]] = []
+    for row in rows:
+        cited = _as_mapping(row.get("cited_evidence"))
+        excerpt = _clean_str(cited.get("excerpt"))
+        if not excerpt:
+            continue
+        recommends = _unique(
+            _as_str_list(cited.get("competitors_named"))
+            or _as_str_list(row.get("competitors"))
+        )
+        sources = _unique(
+            host for host in (
+                _normalize_host(h) for h in _as_str_list(cited.get("cited_hosts"))
+            ) if host
+        )
+        answers.append({
+            "query": _clean_str(row.get("query")),
+            # Verbatim AI answer — read it for the winning angle/claim.
+            "ai_answer": excerpt[:400],
+            # Specific products/brands the engine recommended for this lane.
+            "recommends": recommends[:6],
+            # The sources the engine cited (where the recommendations come from).
+            "cited_sources": list(sources)[:5],
+        })
+    return answers[:6]
 
 
 def _substitution_evidence(opportunity: Mapping[str, Any]) -> Dict[str, Any]:
@@ -2225,6 +2271,17 @@ def _allowed_grounding(evidence: Mapping[str, Any]) -> Dict[str, Any]:
     for ranked in _as_list(category_battle.get("ranked_by")):
         if isinstance(ranked, Mapping):
             add_domain(ranked.get("host"))
+
+    # License the entities mined from the verbatim AI answers so the brief may
+    # name the specific winning products + the sources that rank them.
+    for answer in _as_list(evidence.get("category_answers")):
+        if not isinstance(answer, Mapping):
+            continue
+        for recommended in _as_str_list(answer.get("recommends")):
+            add_term(recommended)
+            competitor_terms.add(_norm_phrase(recommended))
+        for source in _as_str_list(answer.get("cited_sources")):
+            add_domain(source)
 
     substitution = _as_mapping(evidence.get("substitution"))
     add_term(substitution.get("handed_to"))
