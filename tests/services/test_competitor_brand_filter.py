@@ -75,3 +75,22 @@ def test_blank_and_connective_only_names_are_not_dropped_as_types():
     assert is_ingredient_or_category_type("") is False
     assert is_ingredient_or_category_type("   ") is False
     assert is_ingredient_or_category_type("and the") is False
+
+
+def test_hair_ingredient_types_are_not_brands():
+    """#4: hair-care ingredient/material TYPES must be dropped so substitution
+    never says 'AI names Shea Butter, not you'. Real brands are kept."""
+    from services.competitor_brand_filter import (
+        is_ingredient_or_category_type,
+        filter_competitor_brands,
+    )
+    for t in ["Shea Butter", "Castor Oil", "Argan Oil", "Cocoa Butter",
+              "Coconut Oil", "Mango Butter"]:
+        assert is_ingredient_or_category_type(t), t
+    # Brands (a non-generic identity token) survive.
+    for b in ["Aunt Jackie's", "SheaMoisture", "Camille Rose", "Moroccanoil",
+              "Olive Young"]:
+        assert not is_ingredient_or_category_type(b), b
+    kept = filter_competitor_brands(["Shea Butter", "Aunt Jackie's", "Castor Oil",
+                                     "Camille Rose"])
+    assert kept == ["Aunt Jackie's", "Camille Rose"]

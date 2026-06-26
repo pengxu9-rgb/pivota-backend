@@ -62,6 +62,12 @@ _INGREDIENTS = frozenset({
     "tranexamic", "ferulic", "allantoin", "squalane", "squalene", "adapalene",
     "benzoyl", "bakuchiol", "centella", "cica", "snail", "mucin", "glycerin",
     "urea", "propolis", "panthenol", "madecassoside",
+    # hair / body botanical oils + butters (an "X butter"/"X oil" is an
+    # ingredient TYPE, not a brand — e.g. "Shea Butter", "Castor Oil")
+    "shea", "cocoa", "mango", "murumuru", "cupuacu", "kokum", "argan",
+    "jojoba", "castor", "coconut", "marula", "monoi", "baobab", "almond",
+    "avocado", "hemp", "amla", "batana", "mongongo", "ucuuba", "abyssinian",
+    "grapeseed", "rosehip", "sunflower", "olive", "rosemary", "chebe",
 })
 
 # Category / form words. On their own these never make a brand — they describe
@@ -75,6 +81,7 @@ _CATEGORY_FORM = frozenset({
     "blend", "formula", "nutrient", "nutrients", "nutrition", "serum", "cream",
     "creme", "moisturizer", "moisturiser", "cleanser", "toner", "essence",
     "sunscreen", "spf", "ampoule", "mask", "lotion", "gel", "balm",
+    "butter", "butters", "pomade", "conditioner", "shampoo", "treatment",
     # mineral / ester forms ("magnesium glycinate", "vitamin c ascorbate")
     "glycinate", "citrate", "oxide", "bisglycinate", "malate", "threonate",
     "chloride", "sulfate", "sulphate", "carbonate", "gluconate", "picolinate",
