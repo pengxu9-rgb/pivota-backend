@@ -1812,15 +1812,20 @@ def test_validate_grounding_rejects_overwide_controller_lists():
                 {"host": "beautyandthebrows.co", "role": "publisher"},
                 {"host": "sayweee.com", "role": "retailer"},
                 {"host": "krunbeauty.re", "role": "retailer"},
+                {"host": "halalgoods.co", "role": "retailer"},
+                {"host": "souqbeauty.ae", "role": "retailer"},
             ],
             "recommended_moves": ["Add a first-order offer."],
         }
     ]
     brief = _grounded_brief()
+    # A genuine laundry-list (6 domains in one field). Naming the few top
+    # controllers (<=5) is allowed; this is over the line.
     brief["traffic_strategy"] = [
         (
             "Own halal collagen sticks against moodarabia.com, "
-            "beautyandthebrows.co, sayweee.com, and krunbeauty.re."
+            "beautyandthebrows.co, sayweee.com, krunbeauty.re, halalgoods.co, "
+            "and souqbeauty.ae."
         )
     ]
 
@@ -2005,3 +2010,31 @@ def test_competitor_attributes_note_strips_percentages_before_brief():
     assert note != "not_assessed"
     blob = json.dumps(note)
     assert "%" not in blob and "$" not in blob
+
+
+def test_validate_grounding_allows_up_to_five_controllers_per_field():
+    """#3b: a channel-plan field that names a few (<=5) evidenced controllers is
+    legitimate and must pass — only a 6+ laundry-list is rejected. This is the
+    tolerance that lets a faithful LLM brief ship instead of the generic
+    deterministic fallback."""
+    evidence = _evidence()
+    evidence["buyer_path_opportunities"] = [
+        {
+            "query": "halal collagen sticks",
+            "controlled_by": [
+                {"host": "moodarabia.com", "role": "publisher"},
+                {"host": "beautyandthebrows.co", "role": "publisher"},
+                {"host": "sayweee.com", "role": "retailer"},
+                {"host": "krunbeauty.re", "role": "retailer"},
+            ],
+            "recommended_moves": ["Add a first-order offer."],
+        }
+    ]
+    brief = _grounded_brief()
+    brief["traffic_strategy"] = [
+        (
+            "Own halal collagen sticks against moodarabia.com, "
+            "beautyandthebrows.co, sayweee.com, and krunbeauty.re."
+        )
+    ]
+    assert strategic_brief.validate_grounding(brief, evidence) is True

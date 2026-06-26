@@ -75,6 +75,20 @@ CLAIM DISCIPLINE (do not let confident prose outrun the EVIDENCE — this is a t
 - NUMBERS: never write a percentage, price, "Nx" multiplier, or a review/rating/follower count — not even one
   quoted in EVIDENCE. Describe magnitude in words ("most of its formula", "a large review base"), never digits
   with %, $, x, or counts.
+- INGREDIENTS: name ingredients in plain consumer terms ("green tea", "shea butter", "argan oil"). NEVER write a
+  scientific / latin / INCI ingredient name (e.g. "Camellia Sinensis Leaf Water") or any multi-word proper-noun
+  ingredient — the validator treats it as an unverified entity.
+- CLAIMS: never use clinical or medical-efficacy language — no "clinical", "clinically", "proven", "treats",
+  "cures", "repairs" as a proven outcome. Describe a benefit as positioning ("positioned around bond repair"),
+  not as a proven result.
+- SOURCES PER FIELD: name AT MOST THREE source sites in any single sentence/field; only sites in
+  grounding_notes.evidenced_channels. If more matter, name the top two or three and stop.
+- QUOTES: put a phrase in quotes ONLY when it is an EXACT search lane from EVIDENCE. NEVER quote your own
+  product's features, ingredients, or angle ("bond technology that repairs disulfide bonds") as if it were a
+  searched lane — write those as plain prose.
+- COMPETITOR CONTRAST (reinforce): refer to a rival only as "recommended/ranked by <evidenced source>". NEVER
+  ascribe a specific product feature, ingredient, or capability to a named competitor, and NEVER say a
+  competitor lacks, misses, is the only one without, or fails to offer anything.
 - MERCHANT PATH: respect product.merchant_path. If archetype is "brand", the commercial goal is to drive
   buyers to the brand's own website. If archetype is "channel", the commercial goal is to drive buyers to the
   channel's own website. Do not blur those paths.
@@ -2186,7 +2200,11 @@ def _grounding_failures(
             for domain in _DOMAIN_RE.findall(leaf)
             if _normalize_host(domain) in allowed["domains"]
         )
-        if len(leaf_domains) > 3:
+        # A channel-plan sentence legitimately names the few controllers of a
+        # lane; reject only a genuine laundry-list. (The prompt still steers to
+        # ≤3; this tolerance stops a faithful 4–5-source plan from being killed,
+        # which was the single most frequent brief rejection.)
+        if len(leaf_domains) > 5:
             failures.append("overwide-controller-list")
 
     for domain in _DOMAIN_RE.findall(text):
