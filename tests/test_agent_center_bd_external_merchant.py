@@ -55,8 +55,10 @@ def test_extract_cited_hosts_uses_title_when_uri_is_redirector() -> None:
     """The actual production case from the Beauty of Joseon BD run:
     Vertex AI grounding wraps every cited URL in a redirector. Without
     title-based extraction the competitor list ended up as
-    [{vertexaisearch.cloud.google.com: 2}] — useless. The fix reads
-    title ("Sephora", "Olive Young Global", etc.) instead."""
+    [{vertexaisearch.cloud.google.com: 2}] — useless. The fix reads the
+    title ("Sephora", "Olive Young Global", …) and resolves it to the
+    canonical DOMAIN so the rollup keys are consistent hosts (and OpenAI
+    web_search page-headline titles never leak in as fake hosts)."""
     from agent_center_bd_external_merchant import _extract_cited_hosts
     raw_runs = [
         _run_with_sources([
@@ -83,13 +85,43 @@ def test_extract_cited_hosts_uses_title_when_uri_is_redirector() -> None:
     # a redirector and the host doesn't equal beautyofjoseon.com.
     assert merchant_runs == 1
     assert runs_with_citations == 2
-    # Competitors: Sephora(2 runs) + Olive Young Global(1) + YesStyle(1).
-    # No vertexaisearch entries — those are filtered as redirectors.
+    # Competitors keyed by resolved DOMAIN: Sephora(2) + Olive Young Global(1)
+    # + YesStyle(1). No vertexaisearch entries — those are filtered as
+    # redirectors; display-name titles resolve via the cited-host registry.
     assert competitors == Counter({
-        "Sephora": 2,
-        "Olive Young Global": 1,
-        "YesStyle": 1,
+        "sephora.com": 2,
+        "oliveyoungglobal.com": 1,
+        "yesstyle.com": 1,
     })
+
+
+def test_extract_cited_hosts_openai_titles_roll_up_by_domain_not_headline() -> None:
+    """Regression (#7): OpenAI web_search returns sources with a REAL uri plus a
+    page-headline title ("The 15 Best Hair Butters … | Marie Claire"). The
+    rollup must key by the resolved domain, never the headline — otherwise the
+    headline leaks into top_cited_hosts as a fake host."""
+    from agent_center_bd_external_merchant import _extract_cited_hosts
+    raw_runs = [
+        _run_with_sources([
+            {"uri": "https://www.stylecraze.com/articles/best-hair-butters/",
+             "title": "The 15 Best Hair Butters, Hairstylist’s Picks – 2026"},
+            {"uri": "https://www.hwahae.com/en/products/2121145",
+             "title": "Anuko NOURISHING HAIR BUTTER [shea butter & green tea]"},
+            {"uri": "https://anukoofficial.com/product/hair-butter",
+             "title": "Anuko Official"},  # merchant own-site
+        ]),
+    ]
+    competitors, merchant_runs, runs_with_citations = _extract_cited_hosts(
+        raw_runs,
+        merchant_host="anukoofficial.com",
+        merchant_brand="Anuko",
+    )
+    assert runs_with_citations == 1
+    # Keyed by domain; the headline is NOT a host. hwahae is a competitor host;
+    # the Anuko-branded sources match the merchant (brand/own host).
+    assert "stylecraze.com" in competitors
+    assert all(" " not in h for h in competitors), competitors
+    assert not any("best hair butter" in h.lower() for h in competitors)
 
 
 def test_extract_cited_hosts_legacy_uri_only_payload() -> None:
@@ -1095,9 +1127,10 @@ async def test_run_brand_report_aggregate_competitor_view(
     )
     # Sephora is cited 1× on each of 2 products = 2 total brand-wide.
     # Q-P1-3: rollup entry now carries confidence + source breakdown.
-    # Buyer-intent only → grounded_competitor; hosts are lowercased.
+    # Buyer-intent only → grounded_competitor; the cited host resolves to its
+    # canonical domain (sephora.com), not the bare display title.
     competitors = out["cross_product_competitors"]
-    assert competitors[0]["host"] == "sephora"
+    assert competitors[0]["host"] == "sephora.com"
     assert competitors[0]["times_cited"] == 2
     assert competitors[0]["confidence"] == "grounded_competitor"
     assert competitors[0]["source"] == "buyer_intent"

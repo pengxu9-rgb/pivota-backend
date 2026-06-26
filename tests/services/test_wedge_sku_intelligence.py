@@ -352,8 +352,16 @@ async def test_run_wedge_hero_sku_intelligence_builds_money_shot(monkeypatch):
         prompts_per_sku=4,
     )
 
-    assert len(calls) == 2
+    # Each provider probes TWO scan-mode groups (branded findability +
+    # organic category discovery — see _probe_per_sku_ctx), and the money-shot
+    # records mix a branded "where can I buy" query with category/sidewalk
+    # discovery queries, so 2 providers × 2 modes = 4 calls.
+    assert len(calls) == 4
     assert {call["provider"] for call in calls} == {"gemini", "deepseek"}
+    assert {call["scan_mode"] for call in calls} == {
+        "open_product_visibility_test",
+        "category_visibility_test",
+    }
     assert all(call["merchant_id"] == "merch-A" for call in calls)
     assert out["is_empty"] is False
     assert out["hero_sku"] == {
