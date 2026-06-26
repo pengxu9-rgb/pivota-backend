@@ -38,6 +38,7 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
+import json
 import logging
 import re
 import time
@@ -83,6 +84,10 @@ from services.catalog_identity import make_content_key
 from services.catalog_sync_service import make_pivota_canonical_fields
 from services.merchant_audit_readiness import assess_merchant_audit_readiness
 from services.merchant_credit_balance_service import get_balance
+from services.llm_providers.deepseek_probe import (
+    DeepseekProbeError,
+    answer_grounded_question,
+)
 from utils.auth import get_current_merchant
 from utils.logger import logger
 
@@ -2466,3 +2471,227 @@ async def list_merchant_executor_runs(
         "count": len(rows),
         "runs": rows,
     }
+
+
+# ── "Ask about this product" — grounded freeform Q&A over a completed audit ───
+# A merchant types a question; we answer it using ONLY the audit data already
+# computed for that run, via Deepseek (ungrounded — it reasons over the slice we
+# pass, never the live web, so it can't invent outside facts). This is the
+# generative companion to the deterministic per-product card; the structured
+# numbers remain the source of truth and the answer is rendered as an "AI
+# summary". MVP is unmetered (Deepseek is the cheapest provider); add a credit
+# debit / rate-limit before heavy promotion — the hook is
+# merchant_credit_balance_service.debit (category="prompt").
+
+_ASK_CONTEXT_MAX_CHARS = 8000
+
+
+def _ask_report_root(report: Dict[str, Any]) -> tuple[Optional[Dict[str, Any]], List[Any]]:
+    """per_sku_reports + merchant_narrative may sit at the top level (per_sku
+    runs) or nested under brand_report (legacy wedge). Normalize both."""
+    if not isinstance(report, dict):
+        return None, []
+    brand_report = report.get("brand_report")
+    brand_report = brand_report if isinstance(brand_report, dict) else {}
+    per_sku = report.get("per_sku_reports") or brand_report.get("per_sku_reports") or []
+    narrative = report.get("merchant_narrative") or brand_report.get("merchant_narrative")
+    return (narrative if isinstance(narrative, dict) else None), (per_sku if isinstance(per_sku, list) else [])
+
+
+def _ask_find_sku(per_sku: List[Any], product_key: Optional[str]) -> Optional[Dict[str, Any]]:
+    """Match a SKU by product_key/sku_key. product_key has two coexisting
+    formats sharing only the sig_<hex>; fall back to that shared token."""
+    if not product_key:
+        return None
+    sig = None
+    match = re.search(r"sig_[0-9a-f]+", str(product_key))
+    if match:
+        sig = match.group(0)
+    for r in per_sku:
+        if not isinstance(r, dict):
+            continue
+        keys = str(r.get("product_key") or "") + " " + str(r.get("sku_key") or "")
+        if product_key in (r.get("product_key"), r.get("sku_key")):
+            return r
+        if sig and sig in keys:
+            return r
+    return None
+
+
+def _ask_real_brief(sku: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+    """Only feed the real LLM strategic brief — never the deterministic
+    boilerplate fallback (mirrors the frontend suppression rule)."""
+    nba = sku.get("next_best_action") or {}
+    brief = nba.get("strategic_brief")
+    if not isinstance(brief, dict):
+        return None
+    outcome = (nba.get("brief_debug") or {}).get("outcome")
+    moves = list(brief.get("first_moves") or []) + list(brief.get("traffic_strategy") or [])
+    has_object_move = any(isinstance(m, dict) for m in moves)
+    if outcome == "llm" or (outcome is None and not has_object_move):
+        return brief
+    return None
+
+
+def _ask_sku_slice(sku: Dict[str, Any]) -> Dict[str, Any]:
+    pc = sku.get("product_competitiveness") or {}
+    disc = pc.get("discovery") or {}
+    ca = sku.get("channel_appearance") or {}
+    per_prompt = (sku.get("opportunity") or {}).get("per_prompt") or []
+    slice_: Dict[str, Any] = {
+        "name": (sku.get("identity") or {}).get("name") or sku.get("sku_title"),
+        "verdict": (sku.get("band_display") or {}).get("label") or sku.get("band"),
+    }
+    if pc:
+        slice_["discovery"] = {
+            "searches_tested": disc.get("total"),
+            "independently_recommended": disc.get("appeared_recommended"),
+            "found_via_listing": disc.get("appeared_listing"),
+            "by_model": disc.get("by_model") or pc.get("by_model"),
+            "missed_searches": [q for q in (disc.get("missed") or []) if isinstance(q, str)][:5],
+            "ai_recommends_instead": [
+                c.get("name") for c in (disc.get("top_competitors") or []) if isinstance(c, dict)
+            ][:6],
+            "grounding_unavailable": pc.get("grounding_unavailable"),
+        }
+    if ca:
+        slice_["channels"] = {
+            "own_site_cited": ca.get("own_site_cited"),
+            "brand_mentioned_count": ca.get("brand_mentioned_count"),
+            "total_queries": ca.get("total_queries"),
+            "where_ai_sends_buyers": [
+                {"host": c.get("host"), "type": c.get("type_label"), "cited": c.get("cited_query_count")}
+                for c in (ca.get("channels") or [])
+                if isinstance(c, dict) and not c.get("is_own_site")
+            ][:6],
+        }
+    what_ai_said = [
+        {
+            "query": r.get("query"),
+            "ai_answer": (r.get("cited_evidence") or {}).get("excerpt"),
+            "ai_named_instead": (r.get("substitution") or {}).get("substituted_by"),
+        }
+        for r in per_prompt
+        if isinstance(r, dict) and (r.get("cited_evidence") or {}).get("excerpt")
+    ]
+    if what_ai_said:
+        slice_["what_ai_actually_said"] = what_ai_said[:4]
+    brief = _ask_real_brief(sku)
+    if brief:
+        slice_["plan"] = {
+            "your_angle": brief.get("your_angle"),
+            "why_you_lose": brief.get("why_you_lose"),
+            "the_call": brief.get("core_decision"),
+            "first_moves": [m for m in (brief.get("first_moves") or []) if isinstance(m, str)][:5],
+        }
+    return slice_
+
+
+def _build_ask_context(report: Dict[str, Any], product_key: Optional[str]) -> Dict[str, Any]:
+    narrative, per_sku = _ask_report_root(report)
+    ctx: Dict[str, Any] = {}
+    if narrative:
+        ww = narrative.get("whats_working") or {}
+        wl = narrative.get("where_youre_losing") or {}
+        ctx["overview"] = {
+            "headline": narrative.get("headline_story"),
+            "whats_working": ww.get("summary") if isinstance(ww, dict) else None,
+            "where_youre_losing": wl.get("summary") if isinstance(wl, dict) else None,
+            "top_actions": [
+                a.get("headline")
+                for a in (narrative.get("prioritized_actions") or [])
+                if isinstance(a, dict) and a.get("headline")
+            ][:5],
+            "honest_limits": [l for l in (narrative.get("honest_limits") or []) if isinstance(l, str)][:3],
+        }
+    sku = _ask_find_sku(per_sku, product_key)
+    if isinstance(sku, dict):
+        ctx["product"] = _ask_sku_slice(sku)
+    elif per_sku:
+        ctx["products"] = [
+            {
+                "name": (r.get("identity") or {}).get("name") or r.get("sku_title"),
+                "verdict": (r.get("band_display") or {}).get("label") or r.get("band"),
+            }
+            for r in per_sku
+            if isinstance(r, dict)
+        ][:10]
+    return ctx
+
+
+_ASK_SYSTEM_PROMPT = (
+    "You are Pivota's AI-commerce-readiness assistant, helping a merchant "
+    "understand their audit. Answer the QUESTION using ONLY the facts in "
+    "CONTEXT (a JSON slice of their audit). Rules: never invent competitors, "
+    "hosts, brands, numbers, or recommendations that are not in CONTEXT; if the "
+    "answer is not in the data, say you don't have that in this audit and point "
+    "them to what they could check or re-run; never contradict the numbers in "
+    "CONTEXT; be concrete, plain-English, and under 120 words; no markdown "
+    'headers. Respond as JSON: {"answer": "<your answer>"}.'
+)
+
+
+class MerchantAuditAskRequest(BaseModel):
+    """POST /ask body — a grounded freeform question about a completed audit."""
+
+    run_id: str = Field(..., min_length=8, max_length=128, description="Audit run to ground the answer in.")
+    question: str = Field(..., min_length=3, max_length=500, description="The merchant's freeform question.")
+    product_key: Optional[str] = Field(
+        default=None,
+        max_length=256,
+        description="Optional SKU to focus on; omit for a brand-level answer.",
+    )
+
+
+@router.post("/ask")
+async def answer_merchant_audit_question(
+    body: MerchantAuditAskRequest,
+    merchant_id: str = Depends(get_current_merchant),
+) -> Dict[str, Any]:
+    """Answer a freeform merchant question grounded in their completed audit.
+
+    Cross-tenant safe: the run must belong to the calling merchant. Ungrounded
+    Deepseek reasons only over the audit slice we build — it cannot reach the
+    web — so the answer stays faithful to the report. MVP is unmetered.
+    """
+    run = await fetch_audit_run_by_id(run_id=body.run_id)
+    if not run or run.get("merchant_id") != merchant_id:
+        raise HTTPException(status_code=404, detail="Audit run not found.")
+    report = run.get("report_jsonb")
+    if not isinstance(report, dict):
+        raise HTTPException(
+            status_code=409,
+            detail="This audit doesn't have a report to answer from yet.",
+        )
+
+    context = _build_ask_context(report, body.product_key)
+    if not context:
+        raise HTTPException(
+            status_code=409,
+            detail="This audit doesn't have enough detail to answer questions yet.",
+        )
+    context_json = json.dumps(context, default=str)[:_ASK_CONTEXT_MAX_CHARS]
+    user_message = (
+        f"CONTEXT:\n{context_json}\n\nQUESTION: {body.question.strip()}\n\n"
+        'Answer as JSON: {"answer": "..."}.'
+    )
+
+    try:
+        answer = await answer_grounded_question(
+            system_prompt=_ASK_SYSTEM_PROMPT,
+            user_message=user_message,
+        )
+    except DeepseekProbeError as exc:
+        logger.warning("merchant audit ask failed (run=%s): %s", body.run_id, exc)
+        raise HTTPException(
+            status_code=503,
+            detail="Couldn't generate an answer right now — please try again.",
+        )
+
+    if not answer:
+        answer = (
+            "I don't have enough in this audit to answer that confidently. Try "
+            "asking about your discovery results, the competitors AI named, or "
+            "where AI sends buyers — or re-run the audit for fresh data."
+        )
+    return {"answer": answer, "grounded": True}
