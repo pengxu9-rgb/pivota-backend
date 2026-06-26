@@ -4937,6 +4937,12 @@ def build_product_competitiveness(per_prompt: Optional[List[Dict[str, Any]]]) ->
     """
     rows = [r for r in (per_prompt or []) if isinstance(r, dict)]
     disc_total = disc_appeared = disc_ungrounded = 0
+    # Of the discovery appearances, how many are the brand RECOMMENDED by an
+    # independent source vs merely its OWN listing being retrieved for the
+    # category query (findability, not endorsement — see
+    # `appearance_via_listing`). "7/9 appears" overstates competitiveness when
+    # all 7 are the brand's own listing surfacing.
+    disc_appeared_recommended = disc_appeared_listing = 0
     br_total = br_appeared = 0
     missed: List[str] = []
     comp_counts: Dict[str, Dict[str, Any]] = {}
@@ -4970,6 +4976,10 @@ def build_product_competitiveness(per_prompt: Optional[List[Dict[str, Any]]]) ->
             disc_total += 1
             if appeared:
                 disc_appeared += 1
+                if r.get("appearance_via_listing"):
+                    disc_appeared_listing += 1
+                else:
+                    disc_appeared_recommended += 1
             else:
                 q = str(r.get("query") or "").strip()
                 if q:
@@ -5003,6 +5013,12 @@ def build_product_competitiveness(per_prompt: Optional[List[Dict[str, Any]]]) ->
             "appeared": disc_appeared,
             "total": disc_total,
             "rate": round(disc_appeared / disc_total, 3) if disc_total else None,
+            # Endorsement vs findability split of the appearances: recommended
+            # by an independent source vs the brand's own listing merely being
+            # retrieved for the category query. recommended is the real
+            # category-competitiveness signal.
+            "appeared_recommended": disc_appeared_recommended,
+            "appeared_listing": disc_appeared_listing,
             "ungrounded": disc_ungrounded,
             "missed": missed[:8],
             "top_competitors": top_competitors,

@@ -174,3 +174,25 @@ def test_competitor_brand_label_keeps_two_word_brands():
     assert _competitor_brand_label("SheaMoisture") == "SheaMoisture"
     assert _competitor_brand_label("d'Alba") == "d'Alba"
     assert _competitor_brand_label("") == ""
+
+
+def test_discovery_appearance_splits_endorsement_from_own_listing():
+    """A category 'win' where the brand only appears via its OWN listing
+    (appearance_via_listing=True) is findability, not endorsement; it must be
+    counted separately so "appears N/M" doesn't overstate competitiveness."""
+    per_prompt = [
+        {  # own Hwahae listing retrieved — findability
+            "query": "best hair butter", "normalized_query": "best hair butter",
+            "axis": "category", "provider_verdicts": {"chatgpt": "win"},
+            "appearance_via_listing": True, "competitors": ["Cantu"],
+        },
+        {  # brand surfaced via an independent source — endorsement
+            "query": "top hair butter", "normalized_query": "top hair butter",
+            "axis": "category", "provider_verdicts": {"gemini": "win"},
+            "appearance_via_listing": False, "competitors": [],
+        },
+    ]
+    d = build_product_competitiveness(per_prompt)["discovery"]
+    assert d["appeared"] == 2
+    assert d["appeared_listing"] == 1
+    assert d["appeared_recommended"] == 1

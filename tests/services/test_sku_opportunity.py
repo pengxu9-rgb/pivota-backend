@@ -1214,3 +1214,18 @@ def test_lane_cited_evidence_is_none_without_excerpt():
     opp = build_sku_opportunity(ctx, runs, attribute_graph=graph)
     row = _by_query(opp)["halal collagen sticks before bed"]
     assert row.get("cited_evidence") is None
+
+
+def test_brand_in_grounding_titles_detects_own_listing():
+    """The endorsement-vs-findability discriminator: brand in a grounding
+    SOURCE TITLE = the brand's own product/store listing was retrieved (weak);
+    brand absent from titles = it surfaced via an independent source."""
+    from services.sku_opportunity import _brand_in_grounding_titles
+    own_listing = [{"grounding_sources": [
+        {"uri": "https://hwahae.com/x", "title": "Anuko NOURISHING HAIR BUTTER | Hwahae"}]}]
+    independent = [{"grounding_sources": [
+        {"uri": "https://stylecraze.com/best", "title": "The 15 Best Hair Butters | StyleCraze"}]}]
+    assert _brand_in_grounding_titles(own_listing, merchant_brand="Anuko") is True
+    assert _brand_in_grounding_titles(independent, merchant_brand="Anuko") is False
+    # No brand -> can't claim a listing.
+    assert _brand_in_grounding_titles(own_listing, merchant_brand="") is False

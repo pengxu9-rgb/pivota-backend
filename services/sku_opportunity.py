@@ -183,6 +183,38 @@ def _lane_cited_evidence(
     return best
 
 
+def _brand_in_grounding_titles(
+    runs: List[Dict[str, Any]],
+    *,
+    merchant_brand: Optional[str],
+) -> bool:
+    """True when the merchant brand appears in a grounding SOURCE TITLE — i.e.
+    the cited page IS the brand's own product/store listing ("Anuko NOURISHING
+    HAIR BUTTER … | Hwahae"), as opposed to an independent article whose title
+    is the category ("The 15 Best Hair Butters | StyleCraze") that merely
+    surfaces the brand in its body.
+
+    This is the discriminator between FINDABILITY (the brand's own listing was
+    retrieved for a category query) and ENDORSEMENT (an independent source
+    recommends the brand). For a discovery/category appearance, the former is a
+    far weaker signal — verified live (run 57d9183b): every ChatGPT category
+    "win" for Anuko was its own Hwahae listing being retrieved, never an
+    independent roundup pick."""
+    needle = str(merchant_brand or "").strip().lower()
+    if len(needle) < 3:
+        return False
+    for run in runs or []:
+        if not isinstance(run, dict):
+            continue
+        for src in (run.get("grounding_sources") or []):
+            if not isinstance(src, dict):
+                continue
+            title = str(src.get("title") or "").lower()
+            if title and needle in title:
+                return True
+    return False
+
+
 def _score_prompt_group(
     *,
     sku_ctx: Dict[str, Any],
@@ -361,6 +393,13 @@ def _score_prompt_group(
         "opportunity_score": opportunity_score,
         "opportunity_factors": opportunity_factors,
         "open_lane": open_lane,
+        # When the brand appears, did it appear via its OWN listing (brand in a
+        # grounding source title) vs an independent source? Lets the discovery
+        # appearance split findability from endorsement (see
+        # build_product_competitiveness).
+        "appearance_via_listing": _brand_in_grounding_titles(
+            runs, merchant_brand=merchant_brand
+        ),
         "substitution": substitution,
         "attribute_basis": _clean_basis(axis_metadata.get("sidewalk_attribute_basis")),
         "evidence": axis_metadata.get("sidewalk_evidence"),
