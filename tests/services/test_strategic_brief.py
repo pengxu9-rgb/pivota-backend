@@ -2038,3 +2038,37 @@ def test_validate_grounding_allows_up_to_five_controllers_per_field():
         )
     ]
     assert strategic_brief.validate_grounding(brief, evidence) is True
+
+
+def test_own_product_facts_license_brand_angle_and_ingredients():
+    """#3c: the merchant's OWN product facts (ingredients/angle) are licensed so
+    the brief can name them without unknown-entity / unknown-quoted-lane
+    rejections on the brand's own copy."""
+    opportunity = {
+        "intent_ladder": {},
+        "per_prompt": [],
+        "top_open_lanes": [],
+        "product_evidence": {
+            "explicit_text_phrases": [
+                "bond technology that repairs disulfide bonds",
+                "shea butter and green tea for damaged hair",
+            ],
+            "phrases": ["clinically shown to strengthen hair"],
+        },
+    }
+    evidence = strategic_brief.assemble_sku_brief_evidence(
+        opportunity=opportunity,
+        attribute_graph={},
+        identity={"name": "Anuko Bond & Repair Hair Oil",
+                  "anchors": {"brand": "Anuko", "category": "hair oil"}},
+        sku_title="Anuko Bond & Repair Hair Oil",
+        merchant_host="anukoofficial.com",
+    )
+    assert any("disulfide" in f for f in evidence["own_product_facts"])
+    allowed = strategic_brief._allowed_grounding(evidence)
+    assert "disulfide" in allowed["attribute_words"]
+    # The brand naming its OWN angle is grounded (not an unknown entity/lane).
+    assert strategic_brief.validate_grounding(
+        {"your_angle": "Your wedge is bond technology that repairs disulfide bonds."},
+        evidence,
+    ) is True
