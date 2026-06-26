@@ -4880,6 +4880,13 @@ _PRODUCT_FORM_WORDS = frozenset({
     "shea", "coconut", "argan", "jojoba", "olive", "castor", "marula", "monoi",
 })
 
+# Connector words that bind a brand's tokens together rather than separating the
+# brand from a product descriptor. When the 2nd token is one of these, the brand
+# spans ACROSS it ("As I Am", "Creme of Nature", "Bumble and bumble"), so the
+# 2-token rule would clip mid-name ("As I", "Creme of"). Keep the token after the
+# connector too. "&" / "i" are bare-word forms; "&honey" stays one token (no space).
+_CONNECTOR_WORDS = frozenset({"and", "of", "the", "&", "i"})
+
 
 def _competitor_brand_label(name: Any) -> str:
     """Coarse brand label from a competitor product name so a brand's many SKUs
@@ -4887,12 +4894,18 @@ def _competitor_brand_label(name: Any) -> str:
     Butter for…" -> "Cantu"; "&honey Moist Shampoo" -> "&honey"). Keeps genuine
     two-word brands intact ("Camille Rose", "Wonder Curl", "Aunt Jackie's") by
     dropping the 2nd word ONLY when it's an unambiguous product/ingredient noun
-    — the old first-word-only rule mangled them to "Camille"/"Wonder"/"Aunt"."""
+    — the old first-word-only rule mangled them to "Camille"/"Wonder"/"Aunt".
+    When the 2nd token is a connector ("As I Am", "Creme of Nature", "Bumble and
+    bumble"), the brand spans across it, so keep the token after the connector
+    too rather than clipping at the connector ("As I" / "Creme of")."""
     s = str(name or "").strip().split(",")[0].strip()
     words = s.split()
     if not words:
         return ""
-    if len(words) >= 2 and words[1].strip(".'").lower() not in _PRODUCT_FORM_WORDS:
+    second = words[1].strip(".'").lower() if len(words) >= 2 else ""
+    if second in _CONNECTOR_WORDS and len(words) >= 3:
+        return f"{words[0]} {words[1]} {words[2]}"
+    if len(words) >= 2 and second not in _PRODUCT_FORM_WORDS:
         return f"{words[0]} {words[1]}"
     return words[0]
 

@@ -176,6 +176,25 @@ def test_competitor_brand_label_keeps_two_word_brands():
     assert _competitor_brand_label("") == ""
 
 
+def test_competitor_brand_label_keeps_connector_word_brands():
+    """Regression (live run a51ae093): the 2-token rule clipped brands whose 2nd
+    token is a connector ("As I Am" -> "As I", "Creme of Nature" -> "Creme of").
+    A brand spanning a connector must survive whole; genuine product descriptors
+    must still collapse."""
+    from services.agent_center_bd_report_service import _competitor_brand_label
+    # Connector-spanning brands stay whole, even with trailing product words.
+    assert _competitor_brand_label("As I Am Coconut CoWash") == "As I Am"
+    assert _competitor_brand_label("Creme of Nature Argan Oil") == "Creme of Nature"
+    assert _competitor_brand_label("Bumble and bumble Surf Spray") == "Bumble and bumble"
+    assert _competitor_brand_label("Carol's Daughter") == "Carol's Daughter"
+    # Bare "&" connector (with surrounding spaces) as the 2nd token is held together.
+    assert _competitor_brand_label("Lock & Mane Detangler") == "Lock & Mane"
+    # Non-connector 2nd words are unaffected: real two-word brand kept...
+    assert _competitor_brand_label("Maui Moisture Curl Quench") == "Maui Moisture"
+    # ...and a product-form 2nd word still collapses to the lead brand token.
+    assert _competitor_brand_label("Cantu Shea Butter Leave-In") == "Cantu"
+
+
 def test_discovery_appearance_splits_endorsement_from_own_listing():
     """A category 'win' where the brand only appears via its OWN listing
     (appearance_via_listing=True) is findability, not endorsement; it must be
