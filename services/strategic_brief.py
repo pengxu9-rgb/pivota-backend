@@ -789,6 +789,9 @@ def assemble_sku_brief_evidence(
         # sources, and the category angle the brief should mine (see
         # _category_answers + the why_you_lose / your_angle prompt fields).
         "category_answers": _category_answers(category_rows),
+        # The merchant's OWN product facts — licensed so the brief can name its
+        # own ingredients/angle without tripping unknown-entity/quoted-lane.
+        "own_product_facts": _own_product_facts(product_evidence),
         "substitution": _substitution_evidence(opportunity_map),
         "open_lanes": [_open_lane_evidence(lane) for lane in top_open_lanes],
         "channel_map": channel_map,
@@ -1036,6 +1039,21 @@ def _category_answers(rows: List[Mapping[str, Any]]) -> List[Dict[str, Any]]:
             "cited_sources": list(sources)[:5],
         })
     return answers[:6]
+
+
+def _own_product_facts(product_evidence: Mapping[str, Any]) -> List[str]:
+    """The merchant's OWN grounded product phrases (ingredients, claims, angle)
+    from their PDP/content. Maximally groundable — the brief must be able to
+    name the brand's own 'bond technology / disulfide bonds / shea butter +
+    green tea' without the validator rejecting them as unknown entities or
+    treating the brand's own angle as an unverified quoted lane. Licensing only
+    the MERCHANT's own facts does NOT loosen any anti-competitor-fabrication
+    guard."""
+    pe = _as_mapping(product_evidence)
+    facts: List[str] = []
+    for key in ("explicit_text_phrases", "phrases"):
+        facts.extend(_as_str_list(pe.get(key)))
+    return _unique(f for f in facts if f)[:24]
 
 
 def _substitution_evidence(opportunity: Mapping[str, Any]) -> Dict[str, Any]:
@@ -2335,6 +2353,16 @@ def _allowed_grounding(evidence: Mapping[str, Any]) -> Dict[str, Any]:
             competitor_terms.add(_norm_phrase(recommended))
         for source in _as_str_list(answer.get("cited_sources")):
             add_domain(source)
+
+    # The merchant's OWN product facts (ingredients/claims/angle) are maximally
+    # groundable. License their terms + words so the brief can name the brand's
+    # own "bond technology", "disulfide bonds", "shea butter + green tea"
+    # without unknown-entity / unknown-quoted-lane rejections on the merchant's
+    # own copy. (Own content only — no competitor licensing here.)
+    for fact in _as_str_list(evidence.get("own_product_facts")):
+        add_term(fact)
+        for word in re.findall(r"[a-z0-9]+", fact.lower()):
+            add_attribute_word(word)
 
     substitution = _as_mapping(evidence.get("substitution"))
     add_term(substitution.get("handed_to"))

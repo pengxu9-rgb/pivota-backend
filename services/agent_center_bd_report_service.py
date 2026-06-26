@@ -6038,6 +6038,14 @@ async def build_per_sku_report(
             coverage={"providers": list(provider_models.keys())},
             provider_model_metadata=provider_models,
         )
+    # NOTE: competitor_attributes is intentionally NOT passed into the brief.
+    # The grounding validator only ever lets the brief state competitor
+    # PRESENCE ("X is recommended by source Z"), never competitor attributes —
+    # so feeding the competitor "known for" depth in only TEMPTED the model into
+    # forbidden competitor-lack / ungrounded-competitor-attribute claims that
+    # forced the whole brief back to the generic deterministic fallback. The
+    # depth is surfaced on competitor_intel for the merchant/UI instead, where
+    # it's unconstrained and useful.
     next_best_action = await attach_sku_strategic_brief(
         next_best_action,
         opportunity=opportunity,
@@ -6047,12 +6055,9 @@ async def build_per_sku_report(
         identity=identity,
         sku_title=(_get_sku(sku_ctx).get("title") or product.get("title")),
         merchant_host=normalize_host(product.get("canonical_url") or product.get("pdp_url")),
-        competitor_attributes=(
-            competitor_attributes if competitor_attributes != "not_assessed" else None
-        ),
     )
     # Surface the competitor intelligence on the report so the merchant/UI can
-    # see "what AI says <winner> is known for" directly (not only as brief input).
+    # see "what AI says <winner> is known for" directly.
     if isinstance(competitor_attributes, Mapping) and competitor_attributes.get("status") == "assessed":
         next_best_action["competitor_intel"] = competitor_attributes
 
