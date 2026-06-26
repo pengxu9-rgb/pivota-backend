@@ -83,7 +83,15 @@ from services.audit_index_intake import (
 from services.catalog_identity import make_content_key
 from services.catalog_sync_service import make_pivota_canonical_fields
 from services.merchant_audit_readiness import assess_merchant_audit_readiness
-from services.merchant_credit_balance_service import get_balance
+from services.credit_consumption_service import (
+    consume as consume_credits,
+    estimate_probe_credits,
+    merchant_is_paid_tier,
+)
+from services.merchant_credit_balance_service import (
+    InsufficientCreditsError,
+    get_balance,
+)
 from services.llm_providers.deepseek_probe import (
     DeepseekProbeError,
     answer_grounded_question,
@@ -2479,11 +2487,20 @@ async def list_merchant_executor_runs(
 # pass, never the live web, so it can't invent outside facts). This is the
 # generative companion to the deterministic per-product card; the structured
 # numbers remain the source of truth and the answer is rendered as an "AI
-# summary". MVP is unmetered (Deepseek is the cheapest provider); add a credit
-# debit / rate-limit before heavy promotion — the hook is
-# merchant_credit_balance_service.debit (category="prompt").
+# summary".
+#
+# Metered (category="prompt") via the canonical credit_consumption_service:
+# priced as one ungrounded Deepseek probe (~1 credit). Free-tier merchants are
+# gated up-front (402) when they can't afford it; paid tiers run on overage like
+# the audit path. We charge AFTER a successful answer — a failed Deepseek call
+# costs the merchant nothing. Idempotent on (merchant, run, product, question)
+# so re-asking the same question doesn't double-charge.
 
 _ASK_CONTEXT_MAX_CHARS = 8000
+
+# One ungrounded Deepseek chat completion. Priced through the shared per-probe
+# model so an "ask" bills consistently with the audit's Deepseek verify probes.
+_ASK_PROBE_SPEC = [("deepseek", 1, False)]
 
 
 def _ask_report_root(report: Dict[str, Any]) -> tuple[Optional[Dict[str, Any]], List[Any]]:
@@ -2652,7 +2669,8 @@ async def answer_merchant_audit_question(
 
     Cross-tenant safe: the run must belong to the calling merchant. Ungrounded
     Deepseek reasons only over the audit slice we build — it cannot reach the
-    web — so the answer stays faithful to the report. MVP is unmetered.
+    web — so the answer stays faithful to the report. Metered (category="prompt",
+    ~1 credit); free tiers gated up-front, charged only on a successful answer.
     """
     run = await fetch_audit_run_by_id(run_id=body.run_id)
     if not run or run.get("merchant_id") != merchant_id:
@@ -2670,6 +2688,20 @@ async def answer_merchant_audit_question(
             status_code=409,
             detail="This audit doesn't have enough detail to answer questions yet.",
         )
+
+    # Cost gate. Price one ungrounded Deepseek probe; gate free tiers up-front so
+    # we never do the work for a merchant who can't pay. Paid tiers run on
+    # overage (like the audit path), so they skip the pre-flight block.
+    cost_credits, _ = estimate_probe_credits(_ASK_PROBE_SPEC)
+    is_paid = await merchant_is_paid_tier(merchant_id)
+    if cost_credits > 0 and not is_paid:
+        balance = await get_balance(merchant_id)
+        if int(balance.get("credits") or 0) < cost_credits:
+            raise HTTPException(
+                status_code=402,
+                detail="Not enough credits to ask a question. Top up to continue.",
+            )
+
     context_json = json.dumps(context, default=str)[:_ASK_CONTEXT_MAX_CHARS]
     user_message = (
         f"CONTEXT:\n{context_json}\n\nQUESTION: {body.question.strip()}\n\n"
@@ -2682,6 +2714,7 @@ async def answer_merchant_audit_question(
             user_message=user_message,
         )
     except DeepseekProbeError as exc:
+        # No charge on failure — the merchant gets nothing, so they pay nothing.
         logger.warning("merchant audit ask failed (run=%s): %s", body.run_id, exc)
         raise HTTPException(
             status_code=503,
@@ -2694,4 +2727,33 @@ async def answer_merchant_audit_question(
             "asking about your discovery results, the competitors AI named, or "
             "where AI sends buyers — or re-run the audit for fresh data."
         )
-    return {"answer": answer, "grounded": True}
+
+    # Charge on success. Idempotent on (merchant, run, product, question) so a
+    # retry of the same question replays the debit rather than double-charging.
+    charged = 0
+    if cost_credits > 0:
+        idem = "ask:" + hashlib.sha256(
+            "|".join(
+                [
+                    merchant_id,
+                    body.run_id,
+                    body.product_key or "",
+                    body.question.strip(),
+                ]
+            ).encode("utf-8")
+        ).hexdigest()
+        try:
+            result = await consume_credits(
+                merchant_id, "prompt", idem, probes=_ASK_PROBE_SPEC,
+            )
+            charged = int(result.get("credits") or 0)
+        except InsufficientCreditsError:
+            # Rare race (balance dropped after the pre-flight gate, or a paid
+            # tier with no overage room). The answer is already produced — don't
+            # punish the merchant for our race; log and return it uncharged.
+            logger.warning(
+                "merchant audit ask: debit raced insufficient (merchant=%s run=%s)",
+                merchant_id, body.run_id,
+            )
+
+    return {"answer": answer, "grounded": True, "credits_charged": charged}
