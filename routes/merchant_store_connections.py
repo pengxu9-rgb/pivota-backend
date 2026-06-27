@@ -146,17 +146,22 @@ class ShopifyAppCreds:
 
 
 # install_source values routed to the PUBLIC App Store app (App A = "Pivota").
-_APPSTORE_INSTALL_SOURCES = {"app_store"}
+# ALL third-party OAuth connects use the public App A: a merchant can install
+# Pivota with Shopify's own OAuth (no custom app). App B ("Pivota Merchant") is
+# a custom app locked to a single org and CANNOT install on third-party stores,
+# so it is never used for OAuth — the write/BYO tier uses the custom-token
+# /connect path (merchant-supplied client_id+secret), not resolve_shopify_app.
+_APPSTORE_INSTALL_SOURCES = {"app_store", "merchant_portal", "public_install_link"}
 
 
 def resolve_shopify_app(install_source: Optional[str]) -> ShopifyAppCreds:
     """Select Shopify app credentials by install source.
 
-    app_store -> App A (public, read-only merchant tool).
-    everything else (merchant_portal, public_install_link, ...) -> App B
-    (custom/headless, keeps write_orders).
-    Defaults fall back to the single SHOPIFY_CLIENT_* env, so this is a no-op
-    until the SHOPIFY_HEADLESS_* envs are configured.
+    All OAuth install sources -> App A (public, read-only merchant tool), so
+    merchants connect through Pivota's own Shopify OAuth without creating a
+    custom app. The headless/write path is the custom-token /connect flow and
+    does not go through here. Defaults fall back to the single SHOPIFY_CLIENT_*
+    env, so this is a no-op until the SHOPIFY_APPSTORE_* envs are configured.
     """
     src = (install_source or "").strip().lower()
     if src in _APPSTORE_INSTALL_SOURCES:
