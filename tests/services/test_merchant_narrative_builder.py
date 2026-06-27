@@ -99,6 +99,91 @@ def test_narrative_category_endorsement_and_named_competitors():
     assert "goodhousekeeping.com" in cited
 
 
+def test_competitor_storefront_not_recommended_as_outreach():
+    """A competitor's own storefront the engine cited (e.g. asiamnaturally.com,
+    the 'As I Am' brand store) must be flagged a competitor and dropped from
+    'get cited on' outreach — you can't pitch a rival's store. The registry has
+    never seen the host (classify_host -> unclassified); detection comes from the
+    competitor brand name the engine itself listed in the same run. A genuine
+    independent source named alongside it is NOT suppressed."""
+    am = _authority_map(
+        [
+            _run("buy Anuko bond oil", "anuko.com"),
+            # prefix-match path: "As I Am" -> alias "asiam" prefixes the host.
+            _run("best bond repair hair oil", "asiamnaturally.com", "category",
+                 comps=["As I Am", "Olaplex"]),
+            # exact-match path: "Ouidad" -> alias "ouidad" == registrable label.
+            _run("best bond repair hair oil", "ouidad.com", "category",
+                 comps=["Ouidad"]),
+            # unclassified host that matches NO competitor — must survive (proves
+            # name-match precision, not just the editorial/host_type guard).
+            _run("best bond repair hair oil", "myhairnotes.com", "category",
+                 comps=["As I Am", "Olaplex"]),
+            # editorial host (registry-classified) — survives via host_type guard.
+            _run("best bond repair hair oil", "stylecraze.com", "category",
+                 comps=["As I Am", "Olaplex"]),
+        ],
+        host="anuko.com",
+        brand="Anuko",
+    )
+    # 1) The brand-level rollup flags competitor storefronts, even though the
+    #    cited-host registry returns 'unclassified' for them — via both the
+    #    prefix path (asiamnaturally) and the exact path (ouidad).
+    hosts = {h["host"]: h for h in am["hosts"]}
+    assert hosts["asiamnaturally.com"]["is_competitor"] is True
+    assert hosts["asiamnaturally.com"]["citation_role"] == "competitor"
+    assert hosts["ouidad.com"]["is_competitor"] is True
+    # A non-competitor UNCLASSIFIED source is left alone: the precision guard,
+    # not the registry/host_type guard, is what protects it.
+    assert hosts["myhairnotes.com"]["host_type"] == "unclassified"
+    assert hosts["myhairnotes.com"]["is_competitor"] is False
+    assert hosts["stylecraze.com"]["is_competitor"] is False
+
+    narr = build_merchant_narrative(
+        merchant_name="Anuko", per_sku_reports=[], authority_map=am,
+        providers=["gemini"], verify_providers=["deepseek"],
+    )
+    who = narr["where_youre_losing"]["who_ai_cites_instead"]
+    cited = {h["host"] for h in who["cited_hosts"]}
+    # 2) Both competitor stores are gone from outreach targets...
+    assert "asiamnaturally.com" not in cited
+    assert "ouidad.com" not in cited
+    # ...but the genuine independent sources named alongside them survive.
+    assert "myhairnotes.com" in cited
+    assert "stylecraze.com" in cited
+    # 3) The competitors are still surfaced as competitive intel (by name).
+    assert {"As I Am", "Ouidad"} <= {c["name"] for c in who["competitors"]}
+    # 4) No outreach move points the merchant at a competitor's store.
+    move_hosts = {m.get("host") for m in narr["where_youre_losing"].get("outreach_moves") or []}
+    assert "asiamnaturally.com" not in move_hosts
+    assert "ouidad.com" not in move_hosts
+
+
+def test_ingredient_type_named_competitor_does_not_flag_host():
+    """No over-suppression: on category queries the engine lists ingredient /
+    category TYPES (e.g. 'Argan Oil') as 'competitors'. Those must not turn an
+    unclassified host that merely leads with the term (arganoilworld.com) into a
+    competitor and strip it from outreach — same generic-type guard the
+    named-competitor list uses."""
+    am = _authority_map(
+        [
+            _run("buy Anuko bond oil", "anuko.com"),
+            _run("best hair oil", "arganoilworld.com", "category",
+                 comps=["Argan Oil", "Coconut Oil"]),
+        ],
+        host="anuko.com",
+        brand="Anuko",
+    )
+    hosts = {h["host"]: h for h in am["hosts"]}
+    assert hosts["arganoilworld.com"]["is_competitor"] is False
+    narr = build_merchant_narrative(
+        merchant_name="Anuko", per_sku_reports=[], authority_map=am,
+        providers=["gemini"], verify_providers=["deepseek"],
+    )
+    cited = {h["host"] for h in narr["where_youre_losing"]["who_ai_cites_instead"]["cited_hosts"]}
+    assert "arganoilworld.com" in cited
+
+
 def test_narrative_states_limit_when_landscape_unavailable():
     """No fabrication: when no third-party host or competitor surfaced, say so —
     don't invent a landscape."""

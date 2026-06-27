@@ -43,7 +43,10 @@ from services.brand_alias import (
     derive_brand_aliases,
     text_mentions_brand,
 )
-from services.competitor_brand_filter import filter_competitor_brands
+from services.competitor_brand_filter import (
+    filter_competitor_brands,
+    is_ingredient_or_category_type,
+)
 from services.buyer_path_stable_controllers import (
     stable_buyer_path_controller_hosts,
     stable_buyer_path_controllers_for_row,
@@ -7009,6 +7012,63 @@ def _host_is_competitor(raw_host_type: Optional[str], first_party: bool) -> bool
     return (raw_host_type or "").strip().lower() == "brand"
 
 
+def _run_competitor_aliases(competitor_brands, exclude) -> frozenset:
+    """De-spaced, normalized brand aliases (len >= 4) for the competitor names
+    the engines listed across the run, minus the merchant's own aliases.
+
+    The registry-based `_host_is_competitor` only recognises competitor
+    storefronts already classified as ``brand``. This catches the ones it hasn't
+    seen — a competitor's own .com that an engine cited on a category query — so
+    we never tell the merchant to "get cited on" a competitor's store."""
+    out = set()
+    for name in competitor_brands or ():
+        if not isinstance(name, str):
+            continue
+        # Category queries ("best argan oil") make the engine list ingredient /
+        # category TYPES as "competitors". Those are not brands, and their
+        # de-spaced forms (arganoil, collagen) would wrongly flag any unclassified
+        # host that leads with the term (arganoilshop.com) as a competitor and
+        # strip it from outreach. Drop them here — the same guard
+        # `_who_ai_cites_instead` applies to the named-competitor list.
+        if is_ingredient_or_category_type(name):
+            continue
+        for alias in derive_brand_aliases(name):
+            despaced = alias.replace(" ", "")
+            if len(despaced) >= 4 and despaced not in exclude:
+                out.add(despaced)
+    return frozenset(out)
+
+
+def _flag_competitor_by_name(row: Dict[str, Any], competitor_aliases: frozenset) -> bool:
+    """If a not-yet-classified cited host's registrable label matches a named
+    competitor brand, flag it as a competitor and recompute its role. Returns
+    True when it flipped the row.
+
+    Only overrides ``unclassified``/``retailer`` hosts — never an editorial /
+    forum / creator source that merely shares a brand prefix — so genuine
+    independent sources are preserved (precision over recall). The match is
+    exact or brand-prefix (alias len >= 5) on the registrable label, so the
+    9 other competitors named alongside ``asiamnaturally`` don't false-match."""
+    if not competitor_aliases:
+        return False
+    if row.get("first_party") or row.get("is_competitor"):
+        return False
+    host_type = (row.get("host_type") or "").strip().lower()
+    if host_type not in ("unclassified", "retailer"):
+        return False
+    reg = _registrable_name_from_host(row.get("host"))
+    if not reg or len(reg) < 4:
+        return False
+    for alias in competitor_aliases:
+        if reg == alias or (len(alias) >= 5 and reg.startswith(alias)):
+            row["is_competitor"] = True
+            row["citation_role"] = _citation_role(
+                row.get("host_type"), bool(row.get("first_party")), True
+            )
+            return True
+    return False
+
+
 def _citation_role(
     host_type: Optional[str],
     first_party: bool,
@@ -7207,6 +7267,10 @@ def build_authority_map(
 
     sku_entries: List[Dict[str, Any]] = []
     host_matrix: Dict[str, Dict[str, Any]] = {}
+    # Competitor brand names the engines listed anywhere in this run — collected
+    # across all SKUs so a competitor's storefront can be recognised even when it
+    # was cited under one SKU but named as a competitor under another.
+    run_competitor_brands: set = set()
     for report in per_sku_reports or []:
         sku_key = report.get("sku_key")
         probe_runs = probe_runs_by_sku.get(sku_key) if isinstance(probe_runs_by_sku, dict) else []
@@ -7218,6 +7282,9 @@ def build_authority_map(
             url_match = run.get("url_match") if isinstance(run.get("url_match"), dict) else {}
             llm_report = url_match.get("llm_self_report") if isinstance(url_match.get("llm_self_report"), dict) else {}
             competitors = parsed.get("competitors_listed") or parsed.get("competitors_appearing") or run.get("competitors_listed") or []
+            run_competitor_brands.update(
+                c for c in competitors if isinstance(c, str) and c.strip()
+            )
             exact = (
                 parsed.get("correct_sku") is True
                 or parsed.get("sku_mentioned") is True
@@ -7371,6 +7438,26 @@ def build_authority_map(
             "citation_signals": _citation_signals(authority_hosts),
             "reddit": {"subreddits": reddit_subreddits},
         })
+
+    # Second pass — now that the whole run's competitor names are known, flag
+    # competitor STOREFRONTS the cited-host registry hasn't classified yet (e.g.
+    # asiamnaturally.com, the "As I Am" brand store Gemini cited on category
+    # queries). Without this they stay `unclassified`/`is_competitor=False` and
+    # get recommended as "get cited on" outreach targets — pointing the merchant
+    # at a competitor's store. Runs before matrix_rows / signals so the
+    # findability-vs-endorsement rollup and competitor_hosts reflect the flips.
+    own_alias_set = frozenset(a.replace(" ", "") for a in brand_aliases)
+    competitor_aliases = _run_competitor_aliases(run_competitor_brands, own_alias_set)
+    if competitor_aliases:
+        for matrix in host_matrix.values():
+            _flag_competitor_by_name(matrix, competitor_aliases)
+        for entry in sku_entries:
+            flipped = False
+            for row in entry.get("authority_hosts") or []:
+                if _flag_competitor_by_name(row, competitor_aliases):
+                    flipped = True
+            if flipped:
+                entry["citation_signals"] = _citation_signals(entry["authority_hosts"])
 
     matrix_rows = []
     for row in host_matrix.values():
