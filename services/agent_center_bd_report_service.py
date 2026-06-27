@@ -43,7 +43,10 @@ from services.brand_alias import (
     derive_brand_aliases,
     text_mentions_brand,
 )
-from services.competitor_brand_filter import filter_competitor_brands
+from services.competitor_brand_filter import (
+    filter_competitor_brands,
+    is_ingredient_or_category_type,
+)
 from services.buyer_path_stable_controllers import (
     stable_buyer_path_controller_hosts,
     stable_buyer_path_controllers_for_row,
@@ -7020,6 +7023,14 @@ def _run_competitor_aliases(competitor_brands, exclude) -> frozenset:
     out = set()
     for name in competitor_brands or ():
         if not isinstance(name, str):
+            continue
+        # Category queries ("best argan oil") make the engine list ingredient /
+        # category TYPES as "competitors". Those are not brands, and their
+        # de-spaced forms (arganoil, collagen) would wrongly flag any unclassified
+        # host that leads with the term (arganoilshop.com) as a competitor and
+        # strip it from outreach. Drop them here — the same guard
+        # `_who_ai_cites_instead` applies to the named-competitor list.
+        if is_ingredient_or_category_type(name):
             continue
         for alias in derive_brand_aliases(name):
             despaced = alias.replace(" ", "")
