@@ -99,6 +99,51 @@ def test_narrative_category_endorsement_and_named_competitors():
     assert "goodhousekeeping.com" in cited
 
 
+def test_competitor_storefront_not_recommended_as_outreach():
+    """A competitor's own storefront the engine cited (e.g. asiamnaturally.com,
+    the 'As I Am' brand store) must be flagged a competitor and dropped from
+    'get cited on' outreach — you can't pitch a rival's store. The registry has
+    never seen the host (classify_host -> unclassified); detection comes from the
+    competitor brand name the engine itself listed in the same run. A genuine
+    independent source named alongside it is NOT suppressed."""
+    am = _authority_map(
+        [
+            _run("buy Anuko bond oil", "anuko.com"),
+            _run("best bond repair hair oil", "asiamnaturally.com", "category",
+                 comps=["As I Am", "Olaplex"]),
+            _run("best bond repair hair oil", "stylecraze.com", "category",
+                 comps=["As I Am", "Olaplex"]),
+        ],
+        host="anuko.com",
+        brand="Anuko",
+    )
+    # 1) The brand-level rollup flags the competitor storefront, even though the
+    #    cited-host registry returns 'unclassified' for it.
+    hosts = {h["host"]: h for h in am["hosts"]}
+    assert hosts["asiamnaturally.com"]["is_competitor"] is True
+    assert hosts["asiamnaturally.com"]["citation_role"] == "competitor"
+    # A non-competitor unclassified source is left alone (precision over recall).
+    assert hosts["stylecraze.com"]["is_competitor"] is False
+
+    narr = build_merchant_narrative(
+        merchant_name="Anuko", per_sku_reports=[], authority_map=am,
+        providers=["gemini"], verify_providers=["deepseek"],
+    )
+    who = narr["where_youre_losing"]["who_ai_cites_instead"]
+    cited = {h["host"] for h in who["cited_hosts"]}
+    # 2) The competitor store is gone from outreach targets...
+    assert "asiamnaturally.com" not in cited
+    # ...but the genuine independent source named alongside it survives.
+    assert "stylecraze.com" in cited
+    # 3) The competitor is still surfaced as competitive intel (by name).
+    assert "As I Am" in {c["name"] for c in who["competitors"]}
+    # 4) No outreach move points the merchant at the competitor's store.
+    assert all(
+        m.get("host") != "asiamnaturally.com"
+        for m in narr["where_youre_losing"].get("outreach_moves") or []
+    )
+
+
 def test_narrative_states_limit_when_landscape_unavailable():
     """No fabrication: when no third-party host or competitor surfaced, say so —
     don't invent a landscape."""

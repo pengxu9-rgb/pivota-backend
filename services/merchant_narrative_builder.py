@@ -22,7 +22,11 @@ from __future__ import annotations
 
 from typing import Any, Dict, List, Optional, Tuple
 
-from services.cited_host_classifier import classify_host, is_findability_role
+from services.cited_host_classifier import (
+    ROLE_COMPETITOR,
+    classify_host,
+    is_findability_role,
+)
 from services.competitor_brand_filter import is_ingredient_or_category_type
 
 # Probe axes that name the SKU/brand (branded/navigational) vs the non-branded
@@ -119,6 +123,12 @@ def _who_ai_cites_instead(authority_map: Dict[str, Any]) -> Dict[str, Any]:
         # instead" would read own-listing indexing as a competitor citation (the
         # no-inflation guardrail).
         if row.get("first_party") or is_findability_role(row.get("citation_role")):
+            continue
+        # A competitor's own storefront the engine cited is competitive intel, not
+        # an outreach target — you can't "get cited on" a rival's store. Drop it
+        # here so it never becomes a "get cited on" outreach move; it still shows
+        # up as a named competitor below and under store_as_destination.
+        if row.get("is_competitor") or row.get("citation_role") == ROLE_COMPETITOR:
             continue
         host = row.get("host")
         if host:
