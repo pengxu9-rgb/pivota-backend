@@ -2795,9 +2795,80 @@ def _action_product_key_by_title(report: Dict[str, Any], sku_title: Optional[str
     return None
 
 
+# Outreach drafts target EXTERNAL channels (the third-party sources AI cites),
+# not the merchant's own page — agents discount first-party copy. The system
+# prompt is chosen by channel kind so the draft is the right artifact to SEND.
+_OUTREACH_SYSTEM_PROMPTS: Dict[str, str] = {
+    "review": (
+        "You are Pivota's outreach assistant. Draft a concise, genuine note the "
+        "merchant can send to the TARGET CHANNEL — an independent review site/"
+        "aggregator that AI engines trust — to earn an honest review or get listed "
+        "in the right category roundup. Lead with what makes the product genuinely "
+        "notable (from CONTEXT), offer samples and any real proof, and ask for "
+        "review/inclusion. Specific, warm, non-spammy, under 150 words."
+    ),
+    "editorial": (
+        "You are Pivota's outreach assistant. Draft a short pitch email to the "
+        "editorial desk at the TARGET CHANNEL (a publisher AI cites) proposing the "
+        "merchant's product for a relevant roundup or feature. Hook + why it fits "
+        "their audience + offer samples/data. Specific, non-spammy, under 150 words."
+    ),
+    "creator": (
+        "You are Pivota's outreach assistant. Draft a short, friendly outreach "
+        "message to a creator / KOL (on the TARGET CHANNEL/platform) proposing a "
+        "product gifting or review collaboration. Personal, specific to the "
+        "product's hook from CONTEXT, low-pressure. Under 120 words."
+    ),
+    "community": (
+        "You are Pivota's community assistant. Draft an authentic, value-first post "
+        "for the TARGET CHANNEL (e.g. a relevant subreddit or forum) that genuinely "
+        "helps people choosing in this category and mentions the product only where "
+        "truly relevant — NOT an ad. Tell the merchant to disclose their brand "
+        "affiliation honestly. Under 160 words."
+    ),
+    "retailer": (
+        "You are Pivota's distribution assistant. Draft a short, concrete checklist "
+        "to get the product listed and win the buy-path on the TARGET CHANNEL (a "
+        "marketplace AI routes buyers to): accurate title/images/availability, "
+        "reviews to build, and a why-buy-direct reason for the brand's own page. "
+        "Under 140 words."
+    ),
+}
+_OUTREACH_SYSTEM_PROMPTS["default"] = _OUTREACH_SYSTEM_PROMPTS["review"]
+
+# Map a channel lever / type to the outreach kind that picks the draft prompt.
+_OUTREACH_KIND_BY_LEVER: Dict[str, str] = {
+    "editorial_outreach": "editorial",
+    "creator_partnership": "creator",
+    "community": "community",
+    "wholesale_onboarding": "retailer",
+    "marketplace_listing": "retailer",
+    "research": "review",
+}
+_OUTREACH_KIND_BY_TYPE: Dict[str, str] = {
+    "review_aggregator": "review",
+    "review_site": "review",
+    "creator_platform": "creator",
+    "editorial": "editorial",
+    "beauty": "editorial",
+    "community": "community",
+    "forum": "community",
+    "marketplace": "retailer",
+    "retailer": "retailer",
+}
+
+
+def _outreach_kind(lever: Optional[str], channel_type: Optional[str]) -> str:
+    if channel_type and channel_type in _OUTREACH_KIND_BY_TYPE:
+        return _OUTREACH_KIND_BY_TYPE[channel_type]
+    if lever and lever in _OUTREACH_KIND_BY_LEVER:
+        return _OUTREACH_KIND_BY_LEVER[lever]
+    return "default"
+
+
 class MerchantAuditActionStartRequest(BaseModel):
-    """POST /actions/start body — graduate a 'Start here' move into a tracked,
-    Pivota-drafted follow-up."""
+    """POST /actions/start body — graduate a 'Start here' move (or an external
+    channel outreach) into a tracked, Pivota-drafted follow-up."""
 
     run_id: str = Field(..., min_length=8, max_length=128)
     headline: str = Field(..., min_length=3, max_length=400)
@@ -2805,6 +2876,13 @@ class MerchantAuditActionStartRequest(BaseModel):
     sku_title: Optional[str] = Field(default=None, max_length=400)
     growth_phase: Optional[str] = Field(default=None, max_length=64)
     primary_gap: Optional[str] = Field(default=None, max_length=64)
+    # External-channel outreach context. When channel_host/channel_lever is set,
+    # we draft the outreach artifact to SEND to that third-party source (pitch /
+    # review request / community post / KOL DM) instead of first-party copy.
+    channel_host: Optional[str] = Field(default=None, max_length=256)
+    channel_lever: Optional[str] = Field(default=None, max_length=64)
+    channel_type: Optional[str] = Field(default=None, max_length=64)
+    query: Optional[str] = Field(default=None, max_length=300)
 
 
 @router.post("/actions/start")
@@ -2828,7 +2906,8 @@ async def start_merchant_audit_action(
         record_task_created,
     )
 
-    lever = (body.growth_phase or "audit_action").strip() or "audit_action"
+    is_outreach = bool(body.channel_host or body.channel_lever)
+    lever = "outreach" if is_outreach else ((body.growth_phase or "audit_action").strip() or "audit_action")
     title = body.headline.strip()[:300]
 
     existing = await find_pending_supersede_candidates(
@@ -2858,21 +2937,34 @@ async def start_merchant_audit_action(
 
     if can_draft:
         ctx_json = json.dumps(context, default=str)[:_ASK_CONTEXT_MAX_CHARS]
-        user_message = (
-            f"CONTEXT (the merchant's audit):\n{ctx_json}\n\nACTION: {title}\n"
-            + (f"FIRST MOVE: {body.first_move.strip()}\n" if body.first_move else "")
-            + 'Draft the deliverable to execute this action. Return JSON {"answer": "..."}.'
-        )
+        if is_outreach:
+            system_prompt = _OUTREACH_SYSTEM_PROMPTS[
+                _outreach_kind(body.channel_lever, body.channel_type)
+            ]
+            user_message = (
+                f"CONTEXT (the merchant's audit):\n{ctx_json}\n\n"
+                + (f"TARGET CHANNEL: {body.channel_host}\n" if body.channel_host else "")
+                + (f"CHANNEL TYPE: {body.channel_type}\n" if body.channel_type else "")
+                + (f"SHOPPER QUERY: {body.query.strip()}\n" if body.query else "")
+                + 'Draft the outreach to send. Return JSON {"answer": "..."}.'
+            )
+        else:
+            system_prompt = _ACTION_DRAFT_SYSTEM_PROMPT
+            user_message = (
+                f"CONTEXT (the merchant's audit):\n{ctx_json}\n\nACTION: {title}\n"
+                + (f"FIRST MOVE: {body.first_move.strip()}\n" if body.first_move else "")
+                + 'Draft the deliverable to execute this action. Return JSON {"answer": "..."}.'
+            )
         try:
             draft = await answer_grounded_question(
-                system_prompt=_ACTION_DRAFT_SYSTEM_PROMPT, user_message=user_message,
+                system_prompt=system_prompt, user_message=user_message,
             )
         except DeepseekProbeError as exc:
             logger.warning("action draft failed (run=%s): %s", body.run_id, exc)
             draft = None
         if draft:
             idem = "action_draft:" + hashlib.sha256(
-                "|".join([merchant_id, body.run_id, title]).encode("utf-8")
+                "|".join([merchant_id, body.run_id, title, body.channel_host or ""]).encode("utf-8")
             ).hexdigest()
             try:
                 res = await consume_credits(merchant_id, "prompt", idem, probes=_ASK_PROBE_SPEC)
@@ -2892,13 +2984,17 @@ async def start_merchant_audit_action(
         lever=lever,
         parent_audit_run_id=body.run_id,
         evidence={
-            "kind": "audit_action",
+            "kind": "outreach" if is_outreach else "audit_action",
             "headline": title,
             "first_move": body.first_move,
             "growth_phase": body.growth_phase,
             "primary_gap": body.primary_gap,
             "sku_title": body.sku_title,
             "product_key": product_key,
+            "channel_host": body.channel_host,
+            "channel_lever": body.channel_lever,
+            "channel_type": body.channel_type,
+            "query": body.query,
             "draft": draft,
         },
     )
