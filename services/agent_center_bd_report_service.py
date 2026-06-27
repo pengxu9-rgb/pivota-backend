@@ -10649,6 +10649,8 @@ async def run_brand_report(
                     "visibility": run_scores["avg_visibility"],
                     "attribution": run_scores["avg_attribution"],
                     "category_visibility": run_scores["avg_category_visibility"],
+                    # Per-engine medians for this run → drives the per-model delta.
+                    "by_model": _provider_medians(brand_rollup.get("citation_by_provider")),
                 },
             )
             brand_rollup["tracking"] = {"history": history} if history else None
@@ -13230,6 +13232,43 @@ def _build_what_pivota_changes(
     }
 
 
+def _provider_medians(citation_by_provider: Optional[Mapping[str, Any]]) -> Optional[Dict[str, int]]:
+    """{provider: median} from brand_rollup.citation_by_provider — the per-engine
+    score for a single run's trend point (e.g. {"gemini": 18, "chatgpt": 21})."""
+    if not isinstance(citation_by_provider, Mapping):
+        return None
+    out: Dict[str, int] = {}
+    for provider, entry in citation_by_provider.items():
+        median = entry.get("median") if isinstance(entry, Mapping) else None
+        if median is None:
+            continue
+        try:
+            out[str(provider)] = int(median)
+        except (TypeError, ValueError):
+            continue
+    return out or None
+
+
+def _by_model_delta(
+    current_by_model: Optional[Mapping[str, Any]],
+    prior_by_model: Optional[Mapping[str, Any]],
+) -> Optional[Dict[str, int]]:
+    """Per-engine score change since the last audit. None for any engine either
+    run didn't measure (so the UI can render '—' rather than a fake 0)."""
+    if not isinstance(current_by_model, Mapping) or not isinstance(prior_by_model, Mapping):
+        return None
+    out: Dict[str, int] = {}
+    for provider, current in current_by_model.items():
+        prior = prior_by_model.get(provider)
+        if current is None or prior is None:
+            continue
+        try:
+            out[str(provider)] = int(current) - int(prior)
+        except (TypeError, ValueError):
+            continue
+    return out or None
+
+
 def _build_history_trend(
     prior_runs: Optional[List[Dict[str, Any]]],
     current_scores: Optional[Dict[str, Any]] = None,
@@ -13277,6 +13316,11 @@ def _build_history_trend(
             "category_visibility": _delta(
                 "category_visibility", "category_visibility_score_avg",
             ),
+            # Per-engine delta (Gemini vs ChatGPT since last audit) when the
+            # current run carried per-provider scores.
+            "by_model": _by_model_delta(
+                current_scores.get("by_model"), most_recent.get("provider_scores"),
+            ),
             "days_since_last_audit": _days_between(
                 most_recent.get("requested_at"),
             ),
@@ -13290,17 +13334,20 @@ def _build_history_trend(
             "visibility": most_recent.get("visibility_score_avg"),
             "attribution": most_recent.get("attribution_score_avg"),
             "category_visibility": most_recent.get("category_visibility_score_avg"),
+            "by_model": most_recent.get("provider_scores"),
             "verdict_labels": most_recent.get("verdict_labels") or [],
         },
         "delta_from_most_recent": delta_from_most_recent,
         # The series for sparkline rendering (oldest → newest within
-        # the history window). Capped at the # of prior_runs we got.
+        # the history window). by_model = per-engine medians for that run
+        # (None on legacy runs with no per-provider scores).
         "series": [
             {
                 "requested_at": r.get("requested_at"),
                 "visibility": r.get("visibility_score_avg"),
                 "attribution": r.get("attribution_score_avg"),
                 "category_visibility": r.get("category_visibility_score_avg"),
+                "by_model": r.get("provider_scores"),
             }
             for r in reversed(succeeded)
         ],
