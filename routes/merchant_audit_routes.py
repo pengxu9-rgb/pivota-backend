@@ -2757,3 +2757,151 @@ async def answer_merchant_audit_question(
             )
 
     return {"answer": answer, "grounded": True, "credits_charged": charged}
+
+
+# ── "Start here" actions — turn a prioritized_actions move into a real follow-up ─
+# Clicking an action (1) creates a tracked merchant_task (the durable follow-up,
+# visible in the plan, markable done — the hook a future service-connection picks
+# up to auto-distribute) and (2) best-effort drafts the deliverable via grounded
+# Deepseek (the comparison copy / outreach template), so Pivota does the "create"
+# part. Drafting is metered (category="prompt", ~1 credit, charge-on-success); the
+# task is always created even if drafting is skipped (no credits) or fails.
+
+_ACTION_DRAFT_SYSTEM_PROMPT = (
+    "You are Pivota's content assistant, drafting a ready-to-use deliverable so a "
+    "merchant can execute one audit action. Use ONLY the facts in CONTEXT (their "
+    "audit). For a comparison action, draft the comparison-page copy: a short "
+    "intro, 3-4 honest comparison points vs the named competitor, and a 'why buy "
+    "direct' close. For an outreach or review action, draft a short, friendly "
+    "outreach / review-request template. Be specific to the merchant's product and "
+    "the competitors/sources named in CONTEXT; never invent facts, certifications, "
+    "or numbers that aren't there. Plain text, ready to paste, under 220 words, no "
+    'markdown headers. Return JSON: {"answer": "<the draft>"}.'
+)
+
+
+def _action_product_key_by_title(report: Dict[str, Any], sku_title: Optional[str]) -> Optional[str]:
+    """Resolve a prioritized_action's sku_title to a product_key for grounding."""
+    if not sku_title:
+        return None
+    _, per_sku = _ask_report_root(report)
+    target = sku_title.strip().lower()
+    for r in per_sku:
+        if not isinstance(r, dict):
+            continue
+        name = str((r.get("identity") or {}).get("name") or r.get("sku_title") or "").strip().lower()
+        if name and (name == target or target in name or name in target):
+            return r.get("product_key") or r.get("sku_key")
+    return None
+
+
+class MerchantAuditActionStartRequest(BaseModel):
+    """POST /actions/start body — graduate a 'Start here' move into a tracked,
+    Pivota-drafted follow-up."""
+
+    run_id: str = Field(..., min_length=8, max_length=128)
+    headline: str = Field(..., min_length=3, max_length=400)
+    first_move: Optional[str] = Field(default=None, max_length=600)
+    sku_title: Optional[str] = Field(default=None, max_length=400)
+    growth_phase: Optional[str] = Field(default=None, max_length=64)
+    primary_gap: Optional[str] = Field(default=None, max_length=64)
+
+
+@router.post("/actions/start")
+async def start_merchant_audit_action(
+    body: MerchantAuditActionStartRequest,
+    merchant_id: str = Depends(get_current_merchant),
+) -> Dict[str, Any]:
+    """Create a tracked follow-up task for an audit action and (best-effort) draft
+    its deliverable. Cross-tenant safe; idempotent on (lever, headline)."""
+    run = await fetch_audit_run_by_id(run_id=body.run_id)
+    if not run or run.get("merchant_id") != merchant_id:
+        raise HTTPException(status_code=404, detail="Audit run not found.")
+    report = run.get("report_jsonb")
+    if not isinstance(report, dict):
+        raise HTTPException(
+            status_code=409, detail="This audit doesn't have a report to act on yet.",
+        )
+
+    from db.merchant_tasks import (
+        find_pending_supersede_candidates,
+        record_task_created,
+    )
+
+    lever = (body.growth_phase or "audit_action").strip() or "audit_action"
+    title = body.headline.strip()[:300]
+
+    existing = await find_pending_supersede_candidates(
+        merchant_id=merchant_id, lever=lever, title=title,
+    )
+    if existing:
+        ev = existing[0].get("evidence_jsonb") or existing[0].get("evidence") or {}
+        prior_draft = ev.get("draft") if isinstance(ev, dict) else None
+        return {
+            "status": "exists",
+            "task_id": existing[0].get("task_id"),
+            "draft": prior_draft,
+            "credits_charged": 0,
+        }
+
+    # Best-effort, metered draft of the deliverable, grounded in this action's SKU.
+    draft: Optional[str] = None
+    charged = 0
+    product_key = _action_product_key_by_title(report, body.sku_title)
+    context = _build_ask_context(report, product_key)
+    cost_credits, _ = estimate_probe_credits(_ASK_PROBE_SPEC)
+    can_draft = bool(context)
+    if can_draft and cost_credits > 0 and not await merchant_is_paid_tier(merchant_id):
+        balance = await get_balance(merchant_id)
+        if int(balance.get("credits") or 0) < cost_credits:
+            can_draft = False  # not enough credits to draft — still create the task
+
+    if can_draft:
+        ctx_json = json.dumps(context, default=str)[:_ASK_CONTEXT_MAX_CHARS]
+        user_message = (
+            f"CONTEXT (the merchant's audit):\n{ctx_json}\n\nACTION: {title}\n"
+            + (f"FIRST MOVE: {body.first_move.strip()}\n" if body.first_move else "")
+            + 'Draft the deliverable to execute this action. Return JSON {"answer": "..."}.'
+        )
+        try:
+            draft = await answer_grounded_question(
+                system_prompt=_ACTION_DRAFT_SYSTEM_PROMPT, user_message=user_message,
+            )
+        except DeepseekProbeError as exc:
+            logger.warning("action draft failed (run=%s): %s", body.run_id, exc)
+            draft = None
+        if draft:
+            idem = "action_draft:" + hashlib.sha256(
+                "|".join([merchant_id, body.run_id, title]).encode("utf-8")
+            ).hexdigest()
+            try:
+                res = await consume_credits(merchant_id, "prompt", idem, probes=_ASK_PROBE_SPEC)
+                charged = int(res.get("credits") or 0)
+            except InsufficientCreditsError:
+                pass
+
+    task_body = (body.first_move or "").strip() or title
+    if draft:
+        task_body = (f"{task_body}\n\n— Pivota draft —\n{draft}")[:4000]
+
+    task_id = await record_task_created(
+        merchant_id=merchant_id,
+        title=title,
+        body=task_body,
+        severity="high",
+        lever=lever,
+        parent_audit_run_id=body.run_id,
+        evidence={
+            "kind": "audit_action",
+            "headline": title,
+            "first_move": body.first_move,
+            "growth_phase": body.growth_phase,
+            "primary_gap": body.primary_gap,
+            "sku_title": body.sku_title,
+            "product_key": product_key,
+            "draft": draft,
+        },
+    )
+    if not task_id:
+        raise HTTPException(status_code=500, detail="Could not create the follow-up task.")
+    return {"status": "success", "task_id": task_id, "draft": draft, "credits_charged": charged}
