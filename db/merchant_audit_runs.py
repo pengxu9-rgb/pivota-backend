@@ -67,6 +67,34 @@ def _decode_jsonb_field(value: Any) -> Optional[Dict[str, Any]]:
         return parsed if isinstance(parsed, dict) else None
     return None
 
+
+def _provider_scores_from_report(report_jsonb: Any) -> Optional[Dict[str, int]]:
+    """Per-model citation medians (e.g. {"gemini": 18, "chatgpt": 21}) for a run's
+    trend point, read from the run's report_jsonb.brand_rollup.citation_by_provider.
+
+    Lets the history trend show per-engine lines without a new column or migration:
+    the per-provider scores already ride in each run's stored report. Retroactive —
+    works for every historical run. (recent_runs_for_merchant already loads
+    report_jsonb; this only decodes the small per-provider slice from it.)
+    """
+    report = _decode_jsonb_field(report_jsonb)
+    if not report:
+        return None
+    rollup = report.get("brand_rollup")
+    cbp = (rollup or {}).get("citation_by_provider") if isinstance(rollup, dict) else None
+    if not isinstance(cbp, dict):
+        return None
+    out: Dict[str, int] = {}
+    for provider, entry in cbp.items():
+        median = entry.get("median") if isinstance(entry, dict) else None
+        if median is None:
+            continue
+        try:
+            out[str(provider)] = int(median)
+        except (TypeError, ValueError):
+            continue
+    return out or None
+
 from sqlalchemy import (
     ARRAY,
     Column,
@@ -547,6 +575,9 @@ async def recent_runs_for_merchant(
             "visibility_score_avg": d.get("visibility_score_avg"),
             "attribution_score_avg": d.get("attribution_score_avg"),
             "category_visibility_score_avg": d.get("category_visibility_score_avg"),
+            # Per-engine medians for the per-model trend (Gemini vs ChatGPT over
+            # time). Decoded from the run's stored report — no new column.
+            "provider_scores": _provider_scores_from_report(d.get("report_jsonb")),
             "audited_via_pivota_canonical_count": len(
                 d.get("audited_via_pivota_canonical") or []
             ),
