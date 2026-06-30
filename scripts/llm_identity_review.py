@@ -32,12 +32,16 @@ import sys
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from db.database import database  # noqa: E402
-from services.llm_identity_reviewer import drain_review_queue, review_brand  # noqa: E402
+from services.llm_identity_reviewer import (  # noqa: E402
+    drain_review_queue, reconcile_grouping, review_brand,
+)
 
 
 async def _run(args: argparse.Namespace) -> dict:
     await database.connect()
     try:
+        if args.reconcile_grouping:
+            return await reconcile_grouping(limit=args.limit, apply=args.apply)
         if args.queue:
             return await drain_review_queue(
                 limit=args.limit, offset=args.offset,
@@ -56,6 +60,8 @@ def main() -> None:
     src = ap.add_mutually_exclusive_group(required=True)
     src.add_argument("--queue", action="store_true", help="drain pending pdp_identity_review_queue")
     src.add_argument("--brand", help="targeted: review review_required listings of one brand")
+    src.add_argument("--reconcile-grouping", action="store_true",
+                     help="re-point content_key to canonical for already-approved overrides")
     ap.add_argument("--apply", action="store_true", help="write overrides + queue updates (default: dry-run)")
     ap.add_argument("--limit", type=int, default=30)
     ap.add_argument("--offset", type=int, default=0)

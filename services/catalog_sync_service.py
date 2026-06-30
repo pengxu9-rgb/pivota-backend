@@ -913,6 +913,33 @@ async def ingest_standard_products(
             metadata_json={"ingested_from": source_system},
         )
 
+    # Cross-seller grouping: a listing the LLM identity reviewer matched to an
+    # approved canonical carries an active force_exact_group override whose payload
+    # names the canonical content_key. Consult those here so the matched listing is
+    # assigned the CANONICAL content_key (not its title-forked one) — durably, on
+    # every sync — and therefore groups with the canonical in agent_pdp_view (which
+    # groups strictly by content_key). One query per merchant sync; a no-op for the
+    # ~all listings without such an override.
+    grouping_ck_by_ref: Dict[str, str] = {}
+    try:
+        _ov_rows = await database.fetch_all(
+            """
+            SELECT source_listing_ref, payload->>'matched_content_key' AS ck
+            FROM pdp_identity_override
+            WHERE active AND action_type = 'force_exact_group'
+              AND split_part(source_listing_ref, ':', 1) = :mid
+              AND payload->>'matched_content_key' IS NOT NULL
+            """,
+            {"mid": merchant_id},
+        )
+        for _r in _ov_rows or []:
+            grouping_ck_by_ref[str(_r["source_listing_ref"])] = str(_r["ck"])
+    except Exception as exc:  # noqa: BLE001
+        logger.warning(
+            "Catalog ingest: grouping-override load failed merchant=%s: %s",
+            merchant_id, str(exc)[:160],
+        )
+
     for raw_product in product_payloads or []:
         try:
             product = StandardProduct(**raw_product)
@@ -929,6 +956,13 @@ async def ingest_standard_products(
             canonical_url = str(metadata.get("canonical_url") or metadata.get("url") or "").strip() or None
             brand = str(product.vendor or metadata.get("brand") or "").strip() or None
             content_key = make_content_key(brand, product.title, product.barcode)
+            # Cross-seller grouping (see grouping_ck_by_ref above): if the LLM
+            # reviewer approved this listing as the same product as a canonical,
+            # adopt the canonical content_key so it groups with it. Falls through to
+            # the computed key for the ~all listings with no such override.
+            _grp_ck = grouping_ck_by_ref.get(f"{merchant_id}:{source_pid}")
+            if _grp_ck:
+                content_key = _grp_ck
             # Pivota canonical PDP fields (sig_id + agent.pivota.cc URL)
             # — every onboarded merchant product gets one. Deterministic
             # so re-syncs are idempotent.
