@@ -307,3 +307,67 @@ def test_inci_claims_helper_is_strict_on_source():
     claims = persist._inci_substantiated_claims(actives)
     assert [c["claim_text"] for c in claims] == ["Contains Retinol"]
     assert claims[0]["substantiation_status"] == "substantiated"
+
+
+# --- (C) auto-refresh the served agent_pdp_view on write -----------------------
+
+def _patch_refresh(monkeypatch, refreshed):
+    import services.agent_pdp_view_assembler as assembler
+
+    async def _fake(content_key, *, refresh_source=None, db=None):
+        refreshed.append((content_key, refresh_source))
+        return True
+
+    monkeypatch.setattr(assembler, "refresh_agent_pdp_view_for_content_key", _fake)
+
+
+def test_write_refreshes_agent_pdp_view(monkeypatch):
+    _patch_recompute(monkeypatch, [])
+    refreshed = []
+    _patch_refresh(monkeypatch, refreshed)
+    db = FakeDB(
+        cp=_CP,
+        skus=[{"sku_key": "s1", "raw_inci": "Water, Niacinamide",
+               "active_ingredients_json": [], "concentration_notes_json": None,
+               "source_system": "shopify_products_sync"}],
+        profile={"concerns_json": [], "evidence_profile": None},
+    )
+    asyncio.run(persist.enrich_and_persist_product("pk1", db=db))
+    # the freshly-authored evidence/actives are materialized into the served view.
+    assert refreshed == [("ck1", "beauty_enrichment")]
+
+
+def test_dry_run_does_not_refresh_view(monkeypatch):
+    _patch_recompute(monkeypatch, [])
+    refreshed = []
+    _patch_refresh(monkeypatch, refreshed)
+    db = FakeDB(
+        cp=_CP,
+        skus=[{"sku_key": "s1", "raw_inci": "Water, Niacinamide",
+               "active_ingredients_json": [], "concentration_notes_json": None,
+               "source_system": "shopify_products_sync"}],
+        profile={"concerns_json": [], "evidence_profile": None},
+    )
+    asyncio.run(persist.enrich_and_persist_product("pk1", db=db, dry_run=True))
+    assert refreshed == []
+
+
+def test_refresh_failure_does_not_break_enrich(monkeypatch):
+    import services.agent_pdp_view_assembler as assembler
+    _patch_recompute(monkeypatch, [])
+
+    async def _boom(content_key, *, refresh_source=None, db=None):
+        raise RuntimeError("view rebuild failed")
+
+    monkeypatch.setattr(assembler, "refresh_agent_pdp_view_for_content_key", _boom)
+    db = FakeDB(
+        cp=_CP,
+        skus=[{"sku_key": "s1", "raw_inci": "Water, Niacinamide",
+               "active_ingredients_json": [], "concentration_notes_json": None,
+               "source_system": "shopify_products_sync"}],
+        profile={"concerns_json": [], "evidence_profile": None},
+    )
+    # best-effort: a refresh failure never breaks enrichment.
+    res = asyncio.run(persist.enrich_and_persist_product("pk1", db=db))
+    assert res["status"] == "ok"
+    assert res["written"]["evidence_claims"] is True
