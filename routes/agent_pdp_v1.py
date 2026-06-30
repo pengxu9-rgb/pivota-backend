@@ -17,6 +17,7 @@ from fastapi.encoders import jsonable_encoder
 from db.database import database
 from services.catalog_identity import is_content_key
 from services.claim_safety import substantiated_claims
+from services.serving_freshness import serving_freshness
 
 
 router = APIRouter(prefix="/api/agent/pdp", tags=["agent-pdp"])
@@ -336,6 +337,14 @@ def _row_as_product(row: Dict[str, Any]) -> Dict[str, Any]:
     product.pop("required_disclaimers", None)
     product["evidence_claims"] = substantiated_claims(row.get("evidence_profile"))
     product["disclaimers"] = row.get("required_disclaimers") or []
+
+    # Honest freshness: offers/price are baked at row assembly, so refreshed_at
+    # bounds their age. Surface a staleness signal (never withhold) so agents
+    # can trust the baked price or choose to re-fetch. TTL mirrors the catalog
+    # sync price-fact window. See services.serving_freshness.
+    freshness = serving_freshness(row.get("refreshed_at"))
+    product["freshness"] = freshness
+    product["is_stale"] = freshness["is_stale"]
 
     price_min = row.get("price_min")
     currency = row.get("currency")
