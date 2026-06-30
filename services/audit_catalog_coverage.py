@@ -61,12 +61,16 @@ def audit_to_candidates(
     category_path: Optional[str] = None,
     expected_url_domains: Optional[Sequence[str]] = None,
     max_candidates: int = 300,
+    priority_rank: Optional[Dict[str, int]] = None,
 ) -> List[Dict[str, Any]]:
     """Build Path-C candidate records from an audit's competitor landscape.
 
     `category_path` is the merchant's category (load-bearing for recall) — pass the
     audited merchant's representative category. `expected_url_domains` is an optional
     hint (e.g. the brand's own domain); empty lets the validator search broadly.
+    `priority_rank` (normalized-name -> score, e.g. cross-audit recurrence from
+    services.competitor_recurrence) orders the output so the max_candidates cap keeps
+    the highest-demand brands.
 
     Each candidate carries `source='audit_competitor_discovery'` so the index can
     trace provenance. The competitor string is used as `product_name`; the Gemini
@@ -85,9 +89,11 @@ def audit_to_candidates(
                 "source": "audit_competitor_discovery",
             }
         )
-        if len(out) >= max_candidates:
-            break
-    return out
+    # Recurrence prioritization: highest cross-audit demand first, so the cap keeps
+    # the brands worth onboarding (stable — preserves discovery order within a tier).
+    if priority_rank:
+        out.sort(key=lambda c: priority_rank.get(_norm(c["product_name"]), 0), reverse=True)
+    return out[: max(1, int(max_candidates or 1))]
 
 
 async def filter_already_indexed(
