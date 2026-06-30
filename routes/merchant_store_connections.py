@@ -1023,21 +1023,31 @@ async def shopify_oauth_callback(request: Request):
         "storefront_token_present": bool(storefront_token),
         "webhooks": webhooks_report,
     }
-    if install_source == "app_store":
-        return RedirectResponse(
-            url=_append_query_params(
-                return_to or _marketplace_install_success_url("shopify"),
-                {
-                    "installed": "shopify",
-                    "merchant_id": merchant_id,
-                    "shop": canonical_myshopify_domain,
-                    "store_id": store_id,
-                    "status": "success",
-                },
-            ),
-            status_code=302,
-        )
-    return payload
+    # ALWAYS redirect the browser to a real UI after OAuth — never return raw
+    # JSON. The callback is hit by Shopify's OAuth redirect (a browser), so a
+    # JSON body renders as a raw/pretty-printed page, which Shopify review flags
+    # as a display error (2.1.1). This applies to every install source: App
+    # Store installs and portal "Connect with Shopify" (public_install_link /
+    # merchant_portal) alike. The JSON payload is kept only for structured
+    # logging below.
+    logger.info(
+        "shopify_oauth_callback success merchant=%s shop=%s store=%s source=%s payload=%s",
+        merchant_id, canonical_myshopify_domain, store_id, install_source or "?", payload,
+    )
+    redirect_target = return_to or _marketplace_install_success_url("shopify")
+    return RedirectResponse(
+        url=_append_query_params(
+            redirect_target,
+            {
+                "installed": "shopify",
+                "merchant_id": merchant_id,
+                "shop": canonical_myshopify_domain,
+                "store_id": store_id,
+                "status": "success",
+            },
+        ),
+        status_code=302,
+    )
 
 
 class ShopifySyncRequest(BaseModel):
