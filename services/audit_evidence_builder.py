@@ -652,13 +652,27 @@ async def _resolve_content_keys(
 
     product_keys: List[str] = []
     seen = set()
-    for product in (brand_report.get("per_product") or []):
-        if not isinstance(product, dict):
-            continue
-        pk = _product_key_from_report(product)
+
+    def _add(pk: Optional[str]) -> None:
         if pk and pk not in seen:
             seen.add(pk)
             product_keys.append(pk)
+
+    for product in (brand_report.get("per_product") or []):
+        if isinstance(product, dict):
+            _add(_product_key_from_report(product))
+    # P0.2 fix: per_product entries don't reliably carry a product_key (in prod
+    # they never do — _product_key_from_report returns None), so resolving only
+    # from per_product yields an empty map and NOTHING ever deposits. The
+    # authority_map SKUs DO carry product_key — and are exactly the set
+    # extract_citation_observations gates on — so resolve those too. Union keeps
+    # evidence-item stamping (per_product) working while unblocking the citation
+    # matrix deposit.
+    authority = brand_report.get("authority_map")
+    if isinstance(authority, dict):
+        for sku in (authority.get("skus") or []):
+            if isinstance(sku, dict):
+                _add(sku.get("product_key"))
     if not product_keys:
         return {}
 
@@ -696,14 +710,44 @@ async def _resolve_content_keys(
                 str(exc)[:200],
             )
 
+    # P0.2 fix #2: identity-graph confidence from catalog_row_trust (migration
+    # 136). The deposit gate authorizes on gtin | identity_high_conf | reviewed,
+    # but GTIN coverage is ~0% for the Shopify merchant base, so without this the
+    # gate NEVER opens. The Node identity graph already resolved these listings to
+    # their content_key with a stored confidence — pass it so high-confidence
+    # products deposit on the identity_high_conf basis (threshold from
+    # deposit_min_confidence(), default 0.85). MAX() dedupes any duplicate trust
+    # rows per product_key. Best-effort: a miss leaves conf None = GTIN-only
+    # behavior, no regression.
+    conf_by_pk: Dict[str, Any] = {}
+    try:
+        trust_rows = await database.fetch_all(
+            "SELECT product_key, MAX(identity_confidence) AS identity_confidence "
+            "FROM catalog_row_trust "
+            "WHERE product_key = ANY(:pks) AND identity_confidence IS NOT NULL "
+            "GROUP BY product_key",
+            {"pks": product_keys},
+        )
+        for tr in trust_rows or []:
+            conf_by_pk[tr["product_key"]] = tr["identity_confidence"]
+    except Exception as exc:  # noqa: BLE001
+        logger.warning(
+            "_resolve_content_keys: catalog_row_trust load failed: %s",
+            str(exc)[:200],
+        )
+
     out: Dict[str, Any] = {}
     for r in rows:
         ck = r["content_key"]
+        raw_conf = conf_by_pk.get(r["product_key"])
         out[r["product_key"]] = resolve_deposit_content_key(
             brand=r["brand"],
             title=r["title"],
             gtin=gtin_by_ck.get(ck) if ck else None,
             existing_content_key=ck,
+            identity_confidence=(
+                float(raw_conf) if raw_conf is not None else None
+            ),
         )
     return out
 
