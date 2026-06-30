@@ -112,6 +112,25 @@ async def _run_inner(args: argparse.Namespace) -> int:
     if not new:
         print("  nothing new to onboard.")
         return 0
+
+    if args.run:
+        # In-process Path-C pipeline: validate (Gemini resolves PDP url + drops
+        # non-resolving) and, with --ingest, write the resolved ones as depositable
+        # canonical anchors via the shared executor. ~1 Gemini call per candidate.
+        from services.catalog_enrichment_agent.runner import run_candidates  # noqa: E402
+
+        batch = new[: args.limit]
+        mode = "validate + INGEST" if args.ingest else "validate-only (no catalog writes)"
+        print(f"  --run: {mode} on {len(batch)} candidate(s) (~{len(batch)} Gemini calls)…")
+        summary = await run_candidates(
+            batch,
+            batch_label=f"audit_competitor_discovery:{run_id}",
+            apply=args.ingest,
+            concurrency=args.concurrency,
+        )
+        print(f"  result: {summary}")
+        return 0
+
     if args.apply:
         out_path.parent.mkdir(parents=True, exist_ok=True)
         with open(out_path, "w", encoding="utf-8") as fh:
@@ -139,8 +158,13 @@ def main(argv: Optional[List[str]] = None) -> int:
     p.add_argument("--category", help="override category_path (else derived from merchant catalog)")
     p.add_argument("--limit", type=int, default=300, help="max candidates")
     p.add_argument("--out", help="output JSONL path (default data/catalog_enrichment/audit_<run>_candidates.jsonl)")
-    p.add_argument("--apply", action="store_true", help="write the JSONL (else dry-run preview)")
+    p.add_argument("--apply", action="store_true", help="write the candidate JSONL (else dry-run preview)")
+    p.add_argument("--run", action="store_true", help="run the in-process Path-C pipeline (validate; with --ingest, also write anchors)")
+    p.add_argument("--ingest", action="store_true", help="with --run, actually ingest resolved candidates (catalog writes)")
+    p.add_argument("--concurrency", type=int, default=4, help="validation concurrency for --run")
     args = p.parse_args(argv)
+    if args.ingest and not args.run:
+        p.error("--ingest requires --run")
     return asyncio.run(_run(args))
 
 
