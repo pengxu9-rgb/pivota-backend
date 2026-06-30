@@ -359,6 +359,22 @@ def _derive_identity(
         }
     if (
         override is not None
+        and _get(override, "action_type") == "approve_first_party_canonical"
+        and _get(override, "active")
+    ):
+        # First-party brand authority (CREATE, vs force_exact_group's MATCH): the
+        # merchant is the declared/confirmed owner of this brand, so their own-store
+        # listing IS the canonical for that product. Brand-tier confidence FLOOR
+        # (0.9, not the 1.0 of a verified cross-source match) — honest that this is
+        # authority-by-ownership; still clears the 0.85 deposit gate.
+        return {
+            "status": "approved",
+            "confidence": 0.9,
+            "live_read": True,
+            "review_required": False,
+        }
+    if (
+        override is not None
         and _get(override, "action_type") == "force_review_required"
         and _get(override, "active")
     ):

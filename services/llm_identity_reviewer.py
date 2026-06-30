@@ -29,9 +29,11 @@ from __future__ import annotations
 import json
 import logging
 import os
+import re
 import uuid
 from collections import defaultdict
 from typing import Any, Dict, List, Optional
+from urllib.parse import urlparse
 
 from db.database import database
 from services.catalog_row_trust_upserter import upsert_catalog_row_trust
@@ -270,6 +272,98 @@ async def _set_queue_status(queue_id: Optional[str], status: str, note: Optional
     )
 
 
+_FIRST_PARTY_SYSTEM_PROMPT = (
+    "You are a product-identity adjudicator. A merchant sells a product under a brand "
+    "on their OWN store, and that brand is NOT yet a canonical in our index. Decide "
+    "whether the merchant is the FIRST-PARTY OWNER of the brand — i.e. it's their own "
+    "brand that they created and sell (common for small DTC sellers who source a "
+    "product, e.g. from AliExpress, and put their own brand on it) — as opposed to a "
+    "RESELLER / dropshipper of someone else's brand, or a generic product with no real "
+    "brand. Signals: the brand is distinctive (not a generic English word), appears in "
+    "the title, and the store URL corresponds to the brand. Be conservative: if it "
+    "looks like a reseller of a recognizable third-party brand, or a no-name generic "
+    "product, say first_party=false. "
+    'Respond ONLY as JSON: {"first_party": <bool>, "confidence": <0.0-1.0>, "reason": "<one sentence>"}.'
+)
+
+
+def _domain_contains_brand(canonical_url: Optional[str], brand: Optional[str]) -> bool:
+    """Inference signal (mirrors chooseSourceTier): does the listing's own store
+    domain correspond to its brand? True for a brand selling on its own domain
+    (ownist.com / ownist.myshopify.com); False for a multi-brand reseller whose
+    domain doesn't reflect the brand."""
+    b = re.sub(r"[^a-z0-9]", "", (brand or "").lower())
+    if not b or not canonical_url:
+        return False
+    try:
+        host = urlparse(canonical_url if "://" in canonical_url else "https://" + canonical_url).netloc.lower()
+    except Exception:  # noqa: BLE001
+        return False
+    host = re.sub(r"[^a-z0-9]", "", host.split(":")[0])
+    return bool(host) and b in host
+
+
+async def _fetch_owned_brands(merchant_ids: List[str]) -> Dict[str, set]:
+    """Declared brand ownership per merchant (decision: declaration is the durable
+    upgrade). v1 has no onboarding capture, so this reads an OPTIONAL
+    metadata_json->'owned_brands' and is empty for ~all merchants today — the
+    declared-auto path is wired but dormant until capture lands."""
+    out: Dict[str, set] = {}
+    if not merchant_ids:
+        return out
+    try:
+        rows = await database.fetch_all(
+            "SELECT merchant_id, metadata_json->'owned_brands' AS owned "
+            "FROM catalog_merchants WHERE merchant_id = ANY(:ids)",
+            {"ids": merchant_ids},
+        )
+        for r in rows or []:
+            owned = r["owned"]
+            if isinstance(owned, str):
+                try:
+                    owned = json.loads(owned)
+                except Exception:  # noqa: BLE001
+                    owned = None
+            if isinstance(owned, list):
+                out[r["merchant_id"]] = {_norm_brand(str(b)) for b in owned if b}
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("_fetch_owned_brands failed: %s", str(exc)[:160])
+    return out
+
+
+async def _judge_first_party(listing: Dict[str, Any], cfg: Dict[str, str]) -> Dict[str, Any]:
+    user_message = (
+        f"MERCHANT listing (brand has no canonical yet):\n  {_fmt_product(listing)}\n\n"
+        "Is the merchant the first-party owner of this brand (their own brand), or a "
+        "reseller / generic? Note: the store domain appears to correspond to the brand."
+    )
+    resp = await _call_deepseek_chat(
+        api_key=cfg["api_key"], base_url=cfg["base_url"], model=cfg["model"],
+        system_prompt=_FIRST_PARTY_SYSTEM_PROMPT, user_message=user_message,
+        timeout_s=30.0, enable_web_search=False,
+    )
+    parsed = json.loads(resp["choices"][0]["message"]["content"])
+    parsed["_tokens"] = {"out": (resp.get("usage") or {}).get("completion_tokens")}
+    return parsed
+
+
+async def _apply_first_party(listing: Dict[str, Any], basis: str, confidence: Any, reason: Optional[str]) -> None:
+    """Record an approve_first_party_canonical override (CREATE): the merchant's own
+    listing becomes the approved canonical for its brand. Recompute trust so the
+    deposit gate accepts it (derive_trust → approved/0.9)."""
+    payload = {"basis": basis, "llm_confidence": confidence, "llm_reason": reason, "reviewer": "deepseek"}
+    await database.execute(
+        """
+        INSERT INTO pdp_identity_override
+          (id, source_listing_ref, action_type, payload, created_by, active, created_at, updated_at)
+        VALUES (:id, :ref, 'approve_first_party_canonical', CAST(:payload AS JSONB), 'llm:deepseek', TRUE, now(), now())
+        ON CONFLICT (id) DO NOTHING
+        """,
+        {"id": "ov_" + uuid.uuid4().hex[:24], "ref": listing["source_listing_ref"], "payload": json.dumps(payload)},
+    )
+    await upsert_catalog_row_trust(db=database, product_key=listing["product_key"])
+
+
 async def review_listings(
     listings: List[Dict[str, Any]],
     *,
@@ -289,20 +383,62 @@ async def review_listings(
 
     brand_norms = sorted({_norm_brand(l["brand"]) for l in listings if l.get("brand")})
     candidates_by_brand = await _fetch_candidates(brand_norms)
+    owned_brands = await _fetch_owned_brands(sorted({l["merchant_id"] for l in listings if l.get("merchant_id")}))
 
     report: Dict[str, Any] = {
         "apply": bool(apply), "listings": len(listings), "no_candidate": 0, "judged": 0,
-        "approved": 0, "rejected": 0, "uncertain": 0, "errors": 0, "tokens_out": 0, "samples": [],
+        "approved": 0, "rejected": 0, "uncertain": 0, "errors": 0,
+        "first_party_created": 0, "tokens_out": 0, "samples": [],
     }
     writes: List[Dict[str, Any]] = []
+    fp_writes: List[Dict[str, Any]] = []
     status_updates: List[Dict[str, Any]] = []
 
     for listing in listings:
         cands = candidates_by_brand.get(_norm_brand(listing["brand"]), [])
         if not cands:
-            report["no_candidate"] += 1
-            status_updates.append({"queue_id": listing.get("queue_id"), "status": "llm_no_candidate",
-                                   "note": "no approved same-brand canonical to match against"})
+            # No existing canonical for this brand → first-party CREATE candidate.
+            # The "no canonical" condition IS the guardrail: a dropshipper of a known
+            # brand can't reach here (that brand would already have a canonical → MATCH).
+            brand_n = _norm_brand(listing.get("brand"))
+            declared = brand_n in owned_brands.get(listing.get("merchant_id"), set())
+            inferred = _domain_contains_brand(listing.get("canonical_url"), listing.get("brand"))
+            if not brand_n or (not declared and not inferred):
+                report["no_candidate"] += 1
+                status_updates.append({"queue_id": listing.get("queue_id"), "status": "llm_no_candidate",
+                                       "note": "no canonical; not a first-party brand owner (no declaration / no store-domain match)"})
+                continue
+            if declared:
+                # Decision 4: auto-CREATE for declared brand ownership (no LLM).
+                report["first_party_created"] += 1
+                fp_writes.append({"listing": listing, "basis": "declared", "confidence": 1.0,
+                                  "reason": "merchant-declared brand ownership"})
+                status_updates.append({"queue_id": listing.get("queue_id"), "status": "resolved_first_party",
+                                       "note": "declared brand ownership"})
+                continue
+            # Decision 4: inferred-only (store-domain match) → LLM-assisted confirm.
+            try:
+                fj = await _judge_first_party(listing, cfg)
+            except Exception as exc:  # noqa: BLE001
+                report["errors"] += 1
+                report["samples"].append({"title": listing.get("title"), "error": str(exc)[:140]})
+                continue
+            report["tokens_out"] += (fj.get("_tokens") or {}).get("out") or 0
+            fp = bool(fj.get("first_party")) and float(fj.get("confidence") or 0) >= min_confidence
+            if fp:
+                report["first_party_created"] += 1
+                fp_writes.append({"listing": listing, "basis": "inferred_llm",
+                                  "confidence": fj.get("confidence"), "reason": fj.get("reason")})
+                status_updates.append({"queue_id": listing.get("queue_id"), "status": "resolved_first_party",
+                                       "note": fj.get("reason")})
+            else:
+                report["no_candidate"] += 1
+                status_updates.append({"queue_id": listing.get("queue_id"), "status": "first_party_rejected",
+                                       "note": fj.get("reason")})
+            if len(report["samples"]) < samples:
+                report["samples"].append({"merchant_id": listing.get("merchant_id"), "title": listing.get("title"),
+                                          "first_party": fj.get("first_party"), "confidence": fj.get("confidence"),
+                                          "reason": fj.get("reason")})
             continue
         try:
             j = await _judge(listing, cands, cfg)
@@ -335,13 +471,20 @@ async def review_listings(
                 "same_product": j.get("same_product"), "confidence": conf, "reason": j.get("reason"),
             })
 
-    if apply and (writes or status_updates):
+    if apply and (writes or fp_writes or status_updates):
         for w in writes:
             try:
                 await _apply_decision(w["listing"], w["canonical"], w["judgment"])
             except Exception as exc:  # noqa: BLE001
                 report["errors"] += 1
                 logger.warning("llm_identity_reviewer apply failed for %s: %s",
+                               w["listing"].get("source_listing_ref"), str(exc)[:160])
+        for w in fp_writes:
+            try:
+                await _apply_first_party(w["listing"], w["basis"], w["confidence"], w["reason"])
+            except Exception as exc:  # noqa: BLE001
+                report["errors"] += 1
+                logger.warning("llm_identity_reviewer first-party apply failed for %s: %s",
                                w["listing"].get("source_listing_ref"), str(exc)[:160])
         for u in status_updates:
             try:
