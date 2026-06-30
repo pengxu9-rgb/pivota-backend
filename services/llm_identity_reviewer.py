@@ -39,6 +39,35 @@ from services.llm_providers.deepseek_probe import _call_deepseek_chat
 
 logger = logging.getLogger(__name__)
 
+
+async def _regroup_content_key(product_key: str, old_ck: Optional[str], new_ck: Optional[str]) -> bool:
+    """Cross-seller grouping: re-point a listing's content_key to the canonical so it
+    groups with it in agent_pdp_view (which groups strictly by content_key), then
+    cascade the served PDP + serving eligibility for both the new and old clusters.
+
+    Durable counterpart: catalog_sync_service consults the same override on every
+    sync, so this survives re-ingest. No-op when there's nothing to change."""
+    if not new_ck or not old_ck or old_ck == new_ck:
+        return False
+    await database.execute(
+        "UPDATE catalog_products SET content_key=:new WHERE product_key=:pk",
+        {"new": new_ck, "pk": product_key},
+    )
+    await upsert_catalog_row_trust(db=database, product_key=product_key)
+    from services.agent_pdp_view_assembler import refresh_agent_pdp_view_for_content_key
+    from services.index_pipeline_state_service import recompute_serving_eligibility
+    for ck in (new_ck, old_ck):
+        try:
+            await refresh_agent_pdp_view_for_content_key(ck, refresh_source="llm_identity_grouping", db=database)
+        except Exception:  # noqa: BLE001
+            pass
+        try:
+            await recompute_serving_eligibility(ck, reason="llm_identity_grouping")
+        except Exception:  # noqa: BLE001
+            pass
+    return True
+
+
 _SEED_PREFIX = "external_seed:"
 
 _SYSTEM_PROMPT = (
@@ -188,7 +217,48 @@ async def _apply_decision(listing: Dict[str, Any], canonical: Dict[str, Any], j:
         """,
         {"id": "ov_" + uuid.uuid4().hex[:24], "ref": listing["source_listing_ref"], "payload": json.dumps(payload)},
     )
-    await upsert_catalog_row_trust(db=database, product_key=listing["product_key"])
+    # Cross-seller grouping: adopt the canonical content_key now (immediate effect);
+    # the sync hook keeps it durable across re-ingest. _regroup_content_key also
+    # recomputes trust (so the override's force_exact_group → confidence 1.0 lands)
+    # and cascades the served PDP. If nothing to regroup, fall back to a plain trust
+    # recompute so the promotion still applies.
+    if not await _regroup_content_key(
+        listing["product_key"], listing.get("content_key"), canonical.get("content_key")
+    ):
+        await upsert_catalog_row_trust(db=database, product_key=listing["product_key"])
+
+
+async def reconcile_grouping(*, limit: int, apply: bool) -> Dict[str, Any]:
+    """Apply cross-seller grouping to listings whose active force_exact_group override
+    names a canonical content_key they don't yet carry (e.g. overrides written before
+    grouping shipped). Re-points content_key + cascades. Dry-run unless apply=True."""
+    rows = await database.fetch_all(
+        """
+        SELECT crt.product_key, cp.merchant_id, cp.title,
+               cp.content_key AS old_ck, o.payload->>'matched_content_key' AS new_ck
+        FROM pdp_identity_override o
+        JOIN catalog_row_trust crt ON crt.source_listing_ref = o.source_listing_ref
+        JOIN catalog_products cp ON cp.product_key = crt.product_key
+        WHERE o.active AND o.action_type = 'force_exact_group'
+          AND o.payload->>'matched_content_key' IS NOT NULL
+          AND cp.content_key <> o.payload->>'matched_content_key'
+        ORDER BY cp.merchant_id
+        LIMIT :limit
+        """,
+        {"limit": limit},
+    )
+    report: Dict[str, Any] = {"apply": bool(apply), "to_regroup": len(rows or []), "regrouped": 0, "samples": []}
+    for r in rows or []:
+        if apply:
+            try:
+                if await _regroup_content_key(r["product_key"], r["old_ck"], r["new_ck"]):
+                    report["regrouped"] += 1
+            except Exception as exc:  # noqa: BLE001
+                logger.warning("reconcile_grouping failed for %s: %s", r["product_key"], str(exc)[:160])
+        if len(report["samples"]) < 12:
+            report["samples"].append({"merchant_id": r["merchant_id"], "title": r["title"],
+                                      "old_ck": r["old_ck"], "new_ck": r["new_ck"]})
+    return report
 
 
 async def _set_queue_status(queue_id: Optional[str], status: str, note: Optional[str]) -> None:
