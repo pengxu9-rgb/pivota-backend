@@ -489,3 +489,36 @@ def test_index_eligible_read_on_still_blocks_when_neither_eligible(monkeypatch) 
 
     assert response.status_code == 404
     assert "ips.index_eligible = TRUE" in db.calls[0]["query"]
+
+
+def test_get_agent_pdp_emits_honest_freshness_block(monkeypatch) -> None:
+    # _row() bakes refreshed_at far in the past (2026-05-13), so the served
+    # offers/price are well past the 1h price-freshness window -> is_stale.
+    client, _ = _client(monkeypatch, [_row()])
+
+    response = client.get(f"/api/agent/pdp/{CK_A}")
+
+    assert response.status_code == 200
+    product = _canonical_product(response.json())
+    freshness = product["freshness"]
+    assert product["is_stale"] is True
+    assert freshness["is_stale"] is True
+    # observed_at echoes the row's refreshed_at (normalized to naive UTC);
+    # fresh_until is observed_at + the 1h TTL.
+    assert freshness["observed_at"] == "2026-05-13T12:00:00"
+    assert freshness["fresh_until"] == "2026-05-13T13:00:00"
+    assert freshness["ttl_seconds"] == 3600
+
+
+def test_get_agent_pdp_freshness_stale_when_refreshed_at_missing(monkeypatch) -> None:
+    row = _row()
+    row["refreshed_at"] = None
+    client, _ = _client(monkeypatch, [row])
+
+    response = client.get(f"/api/agent/pdp/{CK_A}")
+
+    assert response.status_code == 200
+    product = _canonical_product(response.json())
+    assert product["is_stale"] is True
+    assert product["freshness"]["observed_at"] is None
+    assert product["freshness"]["fresh_until"] is None
