@@ -268,6 +268,24 @@ async def enrich_and_persist_product(
 
     recomputed: Optional[bool] = None
     if (wrote_concerns or actives_written_skus or wrote_evidence) and not dry_run:
+        # Rebuild the denormalized agent_pdp_view row so freshly-authored evidence/
+        # actives are served to a calling agent immediately, not only on the next
+        # scheduled backfill. Best-effort: a stale PDP cache must never break enrich
+        # (mirrors the catalog_sync caller). Lazy import avoids an import cycle.
+        try:
+            from services.agent_pdp_view_assembler import (
+                refresh_agent_pdp_view_for_content_key,
+            )
+
+            await refresh_agent_pdp_view_for_content_key(
+                cp["content_key"], refresh_source="beauty_enrichment", db=db
+            )
+        except Exception:
+            logger.warning(
+                "enrich_and_persist_product: agent_pdp_view refresh failed for content_key=%s",
+                cp.get("content_key"),
+                exc_info=True,
+            )
         recomputed = await recompute_serving_eligibility(
             cp["content_key"], reason="beauty_enrichment"
         )
