@@ -159,6 +159,9 @@ from routes.agent_center_admin_routes import (
 from routes.agent_center_bd_routes import (
     router as agent_center_bd_router,
 )
+from routes.channel_graph_routes import (
+    router as channel_graph_router,
+)
 from routes.merchant_audit_routes import (
     router as merchant_audit_router,
 )
@@ -826,6 +829,7 @@ app.include_router(agent_center_demand_test_router)  # Agent Center: Demand Test
 app.include_router(agent_center_sku_match_router)  # Agent Center: SKU Match Agent V1 (internal pilot)
 app.include_router(agent_center_admin_router)  # Agent Center: stuck-run inspection / force-reset (admin-only)
 app.include_router(agent_center_bd_router)  # Agent Center: BD external-merchant AI visibility report
+app.include_router(channel_graph_router)  # BD Channel Graph: cross-merchant cited-host demand rollup (read-only)
 app.include_router(merchant_audit_router)  # Merchant self-service AI Commerce Readiness audit (legacy synchronous)
 app.include_router(brand_claim_router)  # P1: brand claim write path (claim -> verify -> brand_direct), merchant-scoped
 app.include_router(substantiation_admin_router)  # P1: substantiation grading (employee-only, flag-gated)
