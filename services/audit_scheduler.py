@@ -173,6 +173,22 @@ async def start_scheduler() -> None:
             coalesce=True,
         )
 
+        # Catalog-coverage unattended growth: drain the catalog-onboard queue
+        # (curated brands + audit-discovered competitors → commerce-index anchors).
+        # OFF BY DEFAULT — run_catalog_onboard_queue no-ops unless
+        # CATALOG_ONBOARD_ENABLED is set, so deploying never starts autonomous
+        # catalog writes; flip the flag to enable. 30-min interval.
+        from jobs.catalog_onboard_job import run_catalog_onboard_queue
+        _add_job(
+            run_catalog_onboard_queue,
+            "interval",
+            minutes=30,
+            id="catalog_onboard_queue_drain",
+            replace_existing=True,
+            misfire_grace_time=600,
+            coalesce=True,
+        )
+
         # P2.2: drive queued audit_runs through the async lifecycle.
         # No production traffic flows here until P2.3 ships POST
         # /api/audits, so the tick is a safe no-op until then. 10s
