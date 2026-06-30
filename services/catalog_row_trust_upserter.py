@@ -135,7 +135,8 @@ _PRODUCT_JOIN_SELECT = """
 
     pio.id                   AS override_id,
     pio.action_type          AS override_action_type,
-    pio.active               AS override_active
+    pio.active               AS override_active,
+    (pio.payload->>'first_party_confidence')::float AS override_first_party_confidence
 
   FROM catalog_products cp
   LEFT JOIN index_pipeline_state ips
@@ -521,6 +522,7 @@ def _joined_row_to_inputs(
                 "id": _row_get(row, "override_id"),
                 "action_type": _row_get(row, "override_action_type"),
                 "active": _row_get(row, "override_active"),
+                "first_party_confidence": _row_get(row, "override_first_party_confidence"),
             }
             if has_override
             else None

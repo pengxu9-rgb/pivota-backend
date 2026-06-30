@@ -352,12 +352,20 @@ def _derive_identity(
     ):
         # First-party brand authority (CREATE, vs force_exact_group's MATCH): the
         # merchant is the declared/confirmed owner of this brand, so their own-store
-        # listing IS the canonical for that product. Brand-tier confidence FLOOR
-        # (0.9, not the 1.0 of a verified cross-source match) — honest that this is
-        # authority-by-ownership; still clears the 0.85 deposit gate.
+        # listing IS the canonical for that product. Identity certainty here comes
+        # from OWNERSHIP, not signal corroboration — so we use a brand-tier floor,
+        # basis-aware: ~0.92 declared (self-asserted) vs ~0.87 inferred+LLM, both
+        # below the 1.0 of a verified cross-source match. Clamped to a safe band so a
+        # bad payload can't over- or under-grant. Content thinness is a separate
+        # concern (serving eligibility / content_quality_score), not identity.
+        raw_fp = _get(override, "first_party_confidence")
+        try:
+            fp_conf = _clamp(float(raw_fp), 0.85, 0.95) if raw_fp is not None else 0.9
+        except (TypeError, ValueError):
+            fp_conf = 0.9
         return {
             "status": "approved",
-            "confidence": 0.9,
+            "confidence": fp_conf,
             "live_read": True,
             "review_required": False,
         }

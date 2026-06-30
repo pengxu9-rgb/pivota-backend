@@ -351,7 +351,14 @@ async def _apply_first_party(listing: Dict[str, Any], basis: str, confidence: An
     """Record an approve_first_party_canonical override (CREATE): the merchant's own
     listing becomes the approved canonical for its brand. Recompute trust so the
     deposit gate accepts it (derive_trust → approved/0.9)."""
-    payload = {"basis": basis, "llm_confidence": confidence, "llm_reason": reason, "reviewer": "deepseek"}
+    # Basis-aware brand-tier floor: declared ownership is self-asserted-strong;
+    # inferred+LLM is weaker (just clears the 0.85 gate). derive_trust reads this
+    # from the payload (clamped to [0.85, 0.95]).
+    fp_confidence = 0.92 if basis == "declared" else 0.87
+    payload = {
+        "basis": basis, "first_party_confidence": fp_confidence,
+        "llm_confidence": confidence, "llm_reason": reason, "reviewer": "deepseek",
+    }
     await database.execute(
         """
         INSERT INTO pdp_identity_override
