@@ -19,7 +19,13 @@ Per product it does:
 Idempotent throughout. Input: a JSON array on --file or stdin; each item:
   {external_product_id, brand, title, category_kind, product_type,
    destination_url, image_url, price_amount, description, raw_inci,
-   offer_type?("brand_direct"|"retailer", default brand_direct)}
+   offer_type?("brand_direct"|"retailer", default brand_direct),
+   market?(default "US"), price_currency?(default "USD")}
+
+market/price_currency carry the offer's real locale (e.g. a Korean D2C brand
+sells in KRW) instead of being forced to US/USD -- baking a foreign price as USD
+would corrupt the shared index. The mirror already propagates seed.market and
+seed.price_currency to catalog_offers, so threading them here is sufficient.
 
 Usage:
   python -m scripts.onboard_external_brand_from_crawl --file cohort.json --apply
@@ -73,15 +79,18 @@ async def _upsert_seed(p: Dict[str, Any]) -> None:
           (id, external_product_id, market, tool, destination_url, title, image_url,
            price_amount, price_currency, availability, seed_data, status)
         VALUES
-          (:id, :epid, 'US', :tool, :url, :title, :img,
-           :price, 'USD', 'in_stock', CAST(:data AS jsonb), 'active')
+          (:id, :epid, :market, :tool, :url, :title, :img,
+           :price, :currency, 'in_stock', CAST(:data AS jsonb), 'active')
         ON CONFLICT (id) DO UPDATE SET
           title=EXCLUDED.title, image_url=EXCLUDED.image_url, price_amount=EXCLUDED.price_amount,
+          price_currency=EXCLUDED.price_currency, market=EXCLUDED.market,
           seed_data=EXCLUDED.seed_data, status='active', updated_at=NOW()
         """,
         {"id": _seed_id(p["external_product_id"]), "epid": p["external_product_id"], "tool": TOOL,
          "url": p.get("destination_url"), "title": p["title"], "img": p.get("image_url"),
-         "price": p.get("price_amount"), "data": json.dumps(seed_data, ensure_ascii=False)},
+         "price": p.get("price_amount"), "data": json.dumps(seed_data, ensure_ascii=False),
+         "market": (p.get("market") or "US").strip() or "US",
+         "currency": (p.get("price_currency") or "USD").strip() or "USD"},
     )
 
 
@@ -94,10 +103,13 @@ async def _set_category_and_offer(p: Dict[str, Any]) -> None:
         )
     offer_type = (p.get("offer_type") or "brand_direct").strip()
     is_first_party = offer_type == "brand_direct"
+    # Respect the product's real market (the mirror already set it from the seed);
+    # don't force 'US' -- a KRW Korean offer must not be relabeled US-market.
+    market = (p.get("market") or "US").strip() or "US"
     await database.execute(
-        "UPDATE catalog_offers SET is_first_party=:fp, offer_type=:ot, market='US', updated_at=NOW() "
+        "UPDATE catalog_offers SET is_first_party=:fp, offer_type=:ot, market=:market, updated_at=NOW() "
         "WHERE product_key=:pk",
-        {"fp": is_first_party, "ot": offer_type, "pk": pk},
+        {"fp": is_first_party, "ot": offer_type, "market": market, "pk": pk},
     )
 
 
@@ -148,7 +160,12 @@ async def _drive(args: argparse.Namespace) -> None:
     print(f"{'APPLY' if args.apply else 'DRY'} :: {len(cohort)} products")
     if not args.apply:
         for p in cohort:
-            print(f"  would onboard {p.get('external_product_id')} ({p.get('category_kind')})")
+            print(
+                f"  would onboard {p.get('external_product_id')} "
+                f"({p.get('category_kind')}) "
+                f"{p.get('price_amount')} {p.get('price_currency') or 'USD'} "
+                f"market={p.get('market') or 'US'} :: {p.get('title')}"
+            )
         return
     await database.connect()
     try:
