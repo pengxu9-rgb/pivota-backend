@@ -21,6 +21,7 @@ import db.catalog_onboard_queue as q
 from services.catalog_enrichment_agent.apply import apply_ingest_plan
 from services.catalog_enrichment_agent.ingestion import ingest_validated_jsonl
 from services.catalog_enrichment_agent.runner import run_candidates
+from services.competitor_recurrence import recurrence_rank
 from services.curated_brand_feed import records_for_brand
 
 logger = logging.getLogger(__name__)
@@ -51,7 +52,10 @@ async def enqueue_curated_brands(
     db: Any = None,
 ) -> int:
     """Enqueue {domain, category_path, brand?} rows (dedup on domain). priority =
-    recurrence rank of the brand name when available."""
+    recurrence rank of the brand name. When priority_rank is not supplied, it
+    defaults to cross-audit demand so every caller is demand-prioritized."""
+    if priority_rank is None:
+        priority_rank = await recurrence_rank(db=db)
     n = 0
     for b in brands or []:
         domain = str(b.get("domain") or "").strip().lower()
@@ -71,7 +75,10 @@ async def enqueue_audit_candidates(
     db: Any = None,
 ) -> int:
     """Enqueue Path-C candidates (dedup on normalized product_name). priority =
-    cross-audit recurrence rank."""
+    cross-audit recurrence rank; defaults to live demand when not supplied so every
+    caller is demand-prioritized."""
+    if priority_rank is None:
+        priority_rank = await recurrence_rank(db=db)
     n = 0
     for c in candidates or []:
         key = _norm(c.get("product_name"))

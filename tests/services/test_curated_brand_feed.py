@@ -29,7 +29,7 @@ def test_maps_shopify_product_to_validated_record():
     assert offers[0]["canonical_url"] == "https://cosrx.com/products/snail-mucin-gel-cleanser"
     assert offers[0]["merchant_inferred"] == "COSRX"
     assert offers[0]["in_stock"] is True
-    assert offers[0]["price"] == "16.00"
+    assert offers[0]["price"] == 16.0  # coerced to float (numeric columns reject strings)
 
 
 def test_brand_override_and_domain_cleaning():
@@ -50,3 +50,23 @@ def test_skips_unactionable():
     assert shopify_product_to_record({"title": "T", "vendor": "V"}, domain="x.com", category_path="x") is None  # no handle
     assert shopify_product_to_record(_product(vendor=""), domain="x.com", category_path="x") is None  # no brand
     assert shopify_product_to_record(None, domain="x.com", category_path="x") is None
+
+
+def test_drops_unpriced_gift_items():
+    # Gift-with-purchase / $0 / unpriced items have no purchasable offer → dropped
+    # entirely so they never enter the commerce index.
+    assert shopify_product_to_record(_product(variants=[{"price": None}]), domain="x.com", category_path="x") is None
+    assert shopify_product_to_record(_product(variants=[{"price": "0.00"}]), domain="x.com", category_path="x") is None
+    assert shopify_product_to_record(_product(variants=[]), domain="x.com", category_path="x") is None
+
+
+def test_picks_first_positive_priced_variant():
+    # First variant unpriced, second priced → keep the product, use the priced variant.
+    rec = shopify_product_to_record(
+        _product(variants=[{"price": "0.00", "barcode": "Z"}, {"price": "24.00", "barcode": "8809416470016", "available": True}]),
+        domain="x.com",
+        category_path="x",
+    )
+    assert rec is not None
+    assert rec["offers"][0]["price"] == 24.0
+    assert rec["pdp"]["barcode"] == "8809416470016"  # GTIN from the priced variant

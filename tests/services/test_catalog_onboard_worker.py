@@ -33,6 +33,24 @@ def test_enqueue_audit_candidates_normalizes_key(monkeypatch):
     assert calls == [("audit_candidate", "olly collagen", 5)]
 
 
+def test_enqueue_defaults_to_recurrence_rank(monkeypatch):
+    # No priority_rank supplied → falls back to live cross-audit demand.
+    calls = []
+
+    async def fake_enqueue(*, kind, dedup_key, payload, priority, source, db=None):
+        calls.append((dedup_key, priority))
+        return "id"
+
+    async def fake_rank(*, db=None):
+        return {"cosrx": 9}
+
+    monkeypatch.setattr(w.q, "enqueue", fake_enqueue)
+    monkeypatch.setattr(w, "recurrence_rank", fake_rank)
+    n = asyncio.run(w.enqueue_curated_brands([{"domain": "cosrx.com", "brand": "COSRX"}]))
+    assert n == 1
+    assert calls == [("cosrx.com", 9)]  # priority pulled from the recurrence default
+
+
 def _patch_drain(monkeypatch, items, *, raise_on=None, done=None, failed=None):
     async def claim_batch(limit, db=None):
         return items

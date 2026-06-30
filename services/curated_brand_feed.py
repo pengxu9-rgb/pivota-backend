@@ -104,7 +104,21 @@ def shopify_product_to_record(
     brand = str(brand_override or product.get("vendor") or "").strip()
     if not brand:
         return None
-    variant = _first(product.get("variants")) or {}
+    variants = product.get("variants")
+    variants = variants if isinstance(variants, list) else []
+    # Pick the first sellable (positive-price) variant. Gift-with-purchase and other
+    # $0/unpriced items have no purchasable offer — drop the product entirely so it
+    # never enters the commerce index (these were landing as junk PDPs/seeds, the
+    # offers_skipped noise seen onboarding kosas).
+    variant = None
+    price = None
+    for v in variants:
+        p = _to_float((v or {}).get("price"))
+        if p is not None and p > 0:
+            variant, price = v, p
+            break
+    if variant is None:
+        return None
     image = _first(product.get("images")) or {}
     barcode = str(variant.get("barcode") or "").strip() or None
     raw_tags = product.get("tags")
@@ -114,7 +128,6 @@ def shopify_product_to_record(
         else [t.strip() for t in str(raw_tags or "").split(",") if t.strip()]
     )
     canonical_url = f"https://{host}/products/{handle}"
-    price = _to_float(variant.get("price"))
     return {
         "pdp": {
             "brand": brand,
