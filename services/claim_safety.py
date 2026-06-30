@@ -80,6 +80,46 @@ def required_disclaimers_for_category(
     return []
 
 
+def ensure_category_disclaimers(
+    authored: Any,
+    category_kind: Optional[str],
+) -> Optional[List[Dict[str, Any]]]:
+    """Floor-safety merge: guarantee the category-mandatory disclaimers ride
+    along with any authored ones, deduped by ``code`` (authored wins).
+
+    A supplement must carry the FDA/DSHEA disclaimer even when the merchant
+    authored none -- and even when they authored *other* disclaimers but not
+    that one. Returns the authored value unchanged when the category mandates
+    nothing, so it is a no-op for non-supplement rows (``None`` in -> ``None``
+    out). Accepts authored items as dicts or ``RequiredDisclaimer`` objects.
+    """
+    mandatory = required_disclaimers_for_category(category_kind)
+    if not mandatory:
+        return authored
+
+    out: List[Dict[str, Any]] = []
+    seen: set = set()
+
+    def _add(items: Any) -> None:
+        for item in items or []:
+            if isinstance(item, RequiredDisclaimer):
+                item = {"code": item.code, "text": item.text, "applies_to": item.applies_to}
+            if not isinstance(item, dict):
+                continue
+            code = str(item.get("code") or "").strip().lower()
+            if code and code in seen:
+                continue
+            if code:
+                seen.add(code)
+            out.append(item)
+
+    # Authored first -> an authored disclaimer of the same code takes precedence
+    # over the canned mandatory text (a merchant may word it more specifically).
+    _add(authored if isinstance(authored, list) else [])
+    _add(mandatory)
+    return out or None
+
+
 def _coerce_claim(raw: Any) -> Optional[ProductClaim]:
     """One raw claim (a plain string or a dict) -> a ProductClaim, or None."""
     if isinstance(raw, str):

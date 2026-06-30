@@ -25,6 +25,7 @@ from typing import Any, Dict, List, Optional, Tuple
 
 from db.database import database
 from services.catalog_identity import normalize_gtin
+from services.claim_safety import ensure_category_disclaimers
 from services.source_quarantine import build_quarantine_anti_join_sql
 from services.title_normalization import normalize_display_title
 
@@ -83,6 +84,7 @@ async def fetch_products_for_key(content_key: str, *, db: Any = None) -> List[Di
           cp.brand,
           cp.product_type,
           cp.category,
+          cp.category_kind,
           cp.image_url,
           cp.product_payload,
           cp.tags,
@@ -810,8 +812,14 @@ def assemble_row(
         "usage_scenarios": (enrichment or {}).get("usage_scenarios"),
         # Agent-decision-grade evidence (provenance-backed claims + required
         # disclaimers) — highest-precedence across the content_key cluster.
+        # Floor-safety: a category-mandatory disclaimer (the FDA/DSHEA supplement
+        # statement) rides along even when the merchant authored none, so the
+        # direct PDP route serves it at parity with the search path.
         "evidence_profile": (evidence or {}).get("evidence_profile"),
-        "required_disclaimers": (evidence or {}).get("required_disclaimers"),
+        "required_disclaimers": ensure_category_disclaimers(
+            (evidence or {}).get("required_disclaimers"),
+            canonical.get("category_kind"),
+        ),
         "image_url": image_url,
         "image_urls": image_urls or None,
         "currency": currency,
