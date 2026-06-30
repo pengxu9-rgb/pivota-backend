@@ -320,6 +320,31 @@ async def start_scheduler() -> None:
             max_instances=1,
         )
 
+        # LLM product-identity reviewer: drains pdp_identity_review_queue —
+        # DeepSeek adjudicates "same product as an approved canonical?" and, on a
+        # confident yes, records a force_exact_group override so the listing
+        # deposits into the index. Gated OFF by default (the tick itself no-ops
+        # unless LLM_IDENTITY_REVIEW_ENABLED is set) — like the other autonomous-
+        # mutation features — so this deploy starts nothing until the flag flips.
+        # Interval/batch/min-confidence are env-tunable. Brandless listings (no
+        # brand anchor, e.g. AliExpress dropship) have no canonical to match and
+        # are marked llm_no_candidate without an LLM call.
+        from services.llm_identity_reviewer import run_llm_identity_review_tick
+        try:
+            _llm_review_interval = int(os.getenv("LLM_IDENTITY_REVIEW_INTERVAL_SECONDS") or 1800)
+        except (TypeError, ValueError):
+            _llm_review_interval = 1800
+        _add_job(
+            run_llm_identity_review_tick,
+            "interval",
+            seconds=max(60, _llm_review_interval),
+            id="llm_identity_review",
+            replace_existing=True,
+            misfire_grace_time=600,
+            coalesce=True,
+            max_instances=1,
+        )
+
         # ===== v1.3 monetization cron jobs =====
         # Stage 1: T6 GMV aggregation + T5 reservation reaper run ACTIVE.
         # Stage 4: T7 invoice generation + T8 partner settlement registered
