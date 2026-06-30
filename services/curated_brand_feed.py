@@ -71,6 +71,18 @@ def _first(seq: Any) -> Optional[Dict[str, Any]]:
     return seq[0] if isinstance(seq, list) and seq and isinstance(seq[0], dict) else None
 
 
+def _to_float(value: Any) -> Optional[float]:
+    """Coerce Shopify's string prices (e.g. '56.00') to float; None if absent/invalid.
+    Numeric columns (catalog_offers.*_price, external_product_seeds.price_amount) reject
+    strings, so the mapper must hand downstream a real number or None."""
+    if value is None or value == "":
+        return None
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return None
+
+
 def shopify_product_to_record(
     product: Dict[str, Any],
     *,
@@ -102,7 +114,7 @@ def shopify_product_to_record(
         else [t.strip() for t in str(raw_tags or "").split(",") if t.strip()]
     )
     canonical_url = f"https://{host}/products/{handle}"
-    price = variant.get("price")
+    price = _to_float(variant.get("price"))
     return {
         "pdp": {
             "brand": brand,
