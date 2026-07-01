@@ -149,6 +149,7 @@ async def fetch_offers_for_keys(product_keys: List[str], *, db: Any = None) -> L
           o.offer_id, o.sku_key, o.product_key, o.merchant_id,
           o.availability, o.currency, o.list_price,
           o.merchant_effective_price, o.estimated_best_price,
+          o.market, o.offer_type, o.is_first_party,
           m.merchant_name
         FROM catalog_offers o
         LEFT JOIN catalog_merchants m ON m.merchant_id = o.merchant_id
@@ -356,6 +357,13 @@ def normalize_offer(offer: Dict[str, Any], primary_merchant_id: Optional[str]) -
         "availability": offer.get("availability"),
         "url": None,  # caller injects via merchant_url_by_id
         "is_primary": offer.get("merchant_id") == primary_merchant_id,
+        # Buyability facts (market-agnostic; the serve layer decides buyable-here
+        # against the request market). A brand-direct KRW offer and a US retailer
+        # offer must be distinguishable so agents don't treat a cross-border
+        # listing as a same-market purchase.
+        "market": offer.get("market"),
+        "offer_type": offer.get("offer_type"),
+        "is_first_party": bool(offer.get("is_first_party")),
     }
 
 

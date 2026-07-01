@@ -510,6 +510,26 @@ def test_get_agent_pdp_emits_honest_freshness_block(monkeypatch) -> None:
     assert freshness["ttl_seconds"] == 3600
 
 
+def test_get_agent_pdp_marks_foreign_offer_not_buyable(monkeypatch) -> None:
+    # A KRW/market=KR brand-direct offer served to the US surface must be tagged
+    # buyable=False with no buy pick — not presented as a same-market purchase.
+    row = _row()
+    row["offers"] = [{
+        "merchant_id": "brand_direct", "merchant_name": "ANUKO",
+        "price": 26900.0, "currency": "KRW", "availability": "in_stock",
+        "market": "KR", "offer_type": "brand_direct",
+    }]
+    client, _ = _client(monkeypatch, [row])
+
+    response = client.get(f"/api/agent/pdp/{CK_A}")
+
+    assert response.status_code == 200
+    offers = _offers_module(response.json())["data"]["offers"]
+    assert offers[0]["market"] == "KR"
+    assert offers[0]["buyable"] is False
+    assert offers[0]["is_buy_pick"] is False
+
+
 def test_get_agent_pdp_freshness_stale_when_refreshed_at_missing(monkeypatch) -> None:
     row = _row()
     row["refreshed_at"] = None
