@@ -31,25 +31,29 @@ DEFAULT_BRANDS = (
 )
 
 _SELECT = """
-    SELECT DISTINCT ON (cp.product_key)
-           cp.product_key, s.sku_key, cp.product_payload->>'inci_list' AS inci
-    FROM catalog_products cp
-    JOIN catalog_skus s ON s.product_key = cp.product_key
-    LEFT JOIN beauty_sku_ingredients bsi
-      ON bsi.product_key = cp.product_key AND coalesce(bsi.raw_inci, '') <> ''
-    WHERE cp.merchant_id = 'external_seed'
-      AND cp.category_kind = 'skincare'
-      AND cp.brand ~* :brand
-      AND coalesce(cp.product_payload->>'inci_list', '') <> ''
-      -- Only REAL INCI: has a delimiter (excludes crawler keyword-blobs) and isn't
-      -- benefit/marketing prose. Mirrors crawled_inci_ingest._looks_like_inci — without
-      -- this, skippable sources never write raw_inci, so the `bsi IS NULL` window
-      -- re-selects them every pass and starves valid products behind them (they clog
-      -- ORDER BY product_key and the loop never drains).
-      AND position(',' in cp.product_payload->>'inci_list') > 0
-      AND cp.product_payload->>'inci_list' !~* '\\y(promot|improv|reduc|boost|helps|soothe|calm|nourish|brighten|clinically|dermatologist|visibly|wrinkle)\\y|anti-?aging'
-      AND bsi.product_key IS NULL            -- not yet ingested → resumable
-    ORDER BY cp.product_key, (s.sku_key LIKE '%::canonical') DESC
+    SELECT product_key, sku_key, inci FROM (
+      SELECT DISTINCT ON (cp.product_key)
+             cp.product_key, s.sku_key, cp.product_payload->>'inci_list' AS inci
+      FROM catalog_products cp
+      JOIN catalog_skus s ON s.product_key = cp.product_key
+      LEFT JOIN beauty_sku_ingredients bsi
+        ON bsi.product_key = cp.product_key AND coalesce(bsi.raw_inci, '') <> ''
+      WHERE cp.merchant_id = 'external_seed'
+        AND cp.category_kind = 'skincare'
+        AND cp.brand ~* :brand
+        AND coalesce(cp.product_payload->>'inci_list', '') <> ''
+        -- Only REAL INCI: has a delimiter (excludes crawler keyword-blobs) and isn't
+        -- benefit/marketing prose. Coarse pre-filter mirroring _looks_like_inci; runtime
+        -- _is_skippable_inci stays authoritative.
+        AND position(',' in cp.product_payload->>'inci_list') > 0
+        AND cp.product_payload->>'inci_list' !~* '\\y(promot|improv|reduc|boost|helps|soothe|calm|nourish|brighten|clinically|dermatologist|visibly|wrinkle)\\y|anti-?aging'
+        AND bsi.product_key IS NULL            -- not yet ingested → resumable
+      ORDER BY cp.product_key, (s.sku_key LIKE '%::canonical') DESC
+    ) t
+    -- Randomize AFTER dedup so the residual skippable sources the pre-filter misses
+    -- (Python's _PROSE_RE is broader than SQL can cheaply mirror) can't clog a fixed
+    -- ORDER-BY prefix and starve valid products — each pass samples fresh.
+    ORDER BY random()
     LIMIT :limit
 """
 
