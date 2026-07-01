@@ -510,9 +510,10 @@ def test_get_agent_pdp_emits_honest_freshness_block(monkeypatch) -> None:
     assert freshness["ttl_seconds"] == 3600
 
 
-def test_get_agent_pdp_marks_foreign_offer_not_buyable(monkeypatch) -> None:
-    # A KRW/market=KR brand-direct offer served to the US surface must be tagged
-    # buyable=False with no buy pick — not presented as a same-market purchase.
+def test_get_agent_pdp_marks_foreign_offer_cross_border(monkeypatch) -> None:
+    # A KRW/market=KR brand-direct offer served to the US surface is cross_border
+    # (a same-market purchase would be domestic). With no domestic alternative it
+    # is still the buy pick — flagged cross_border, not erased.
     row = _row()
     row["offers"] = [{
         "merchant_id": "brand_direct", "merchant_name": "ANUKO",
@@ -526,8 +527,8 @@ def test_get_agent_pdp_marks_foreign_offer_not_buyable(monkeypatch) -> None:
     assert response.status_code == 200
     offers = _offers_module(response.json())["data"]["offers"]
     assert offers[0]["market"] == "KR"
-    assert offers[0]["buyable"] is False
-    assert offers[0]["is_buy_pick"] is False
+    assert offers[0]["market_availability"] == "cross_border"
+    assert offers[0]["is_buy_pick"] is True
 
 
 def test_get_agent_pdp_freshness_stale_when_refreshed_at_missing(monkeypatch) -> None:

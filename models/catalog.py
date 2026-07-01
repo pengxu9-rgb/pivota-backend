@@ -287,12 +287,13 @@ class OfferNode(BaseModel):
     # dimension pass on official-brand seeds that are correctly not is_first_party.
     official_source: bool = False
     why_buy_direct: Optional[str] = None
-    # Market-aware buyability (set at serve against the request market): buyable
-    # is True when this offer can be purchased in the serving market; is_buy_pick
-    # flags the single offer to present as the buy (cheapest in-stock buyable).
-    # A cross-border offer (e.g. a KRW/market=KR listing served to a US query) is
-    # buyable=False so an agent doesn't treat it as a same-market purchase.
-    buyable: bool = True
+    # Market-aware buyability (set at serve against the request market).
+    # market_availability is "domestic" when this offer serves the buyer's market
+    # or "cross_border" when it's a different market (possibly shippable, with
+    # caveats — we don't collapse that into "unavailable" without ships_to data).
+    # is_buy_pick flags the single offer to present as the buy: cheapest in-stock
+    # domestic, falling back to a flagged cross_border offer.
+    market_availability: str = "domestic"
     is_buy_pick: bool = False
     pricing: PivotPricing = Field(default_factory=PivotPricing)
     incentives: List[IncentiveNode] = Field(default_factory=list)
