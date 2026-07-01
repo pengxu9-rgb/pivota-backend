@@ -292,14 +292,25 @@ def pick_canonical(rows: List[Dict[str, Any]]) -> Dict[str, Any]:
     """Deterministic canonical-row pick.
 
     Tiebreak ladder:
+      0. platform != 'url_audit'  (a real row always beats an observed audit seed)
       1. product_group_members.is_primary = true  (multi-seller canonical)
       2. catalog_products.pivota_signature_id is set  (indexed surface)
       3. lowest product_key ASC  (stable hash-derived ordering)
+
+    Tier 0 is a safety guardrail: a `url_audit` seed's content_key is brand+title
+    (non-unique, GTIN-less), so it can COLLIDE with a real/claimed product sharing
+    that content_key. agent_pdp_view is keyed by content_key, so whichever row
+    wins here supplies the served title/description/image. An audit seed must
+    NEVER win that over a non-audit row — else a colliding seed would overwrite a
+    claimed product's served PDP. Audit seeds therefore sort strictly last; when a
+    content_key has ONLY audit seeds (the common case — a competitor/arbitrary URL
+    the merchant audited), it isn't served anyway (no index_pipeline_state row).
     """
-    def key(r: Dict[str, Any]) -> Tuple[int, int, str]:
+    def key(r: Dict[str, Any]) -> Tuple[int, int, int, str]:
+        audit_rank = 1 if r.get("platform") == "url_audit" else 0
         primary_rank = 0 if r.get("group_is_primary") else 1
         sig_rank = 0 if r.get("pivota_signature_id") else 1
-        return (primary_rank, sig_rank, r.get("product_key") or "")
+        return (audit_rank, primary_rank, sig_rank, r.get("product_key") or "")
 
     return sorted(rows, key=key)[0]
 

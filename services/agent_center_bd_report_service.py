@@ -6179,6 +6179,42 @@ async def _per_sku_integration_block(
     }
 
 
+def _url_audit_seed_report_identity(
+    merchant_id: str,
+    product: Mapping[str, Any],
+    sku_ctx: Mapping[str, Any],
+) -> Tuple[Optional[str], Optional[str]]:
+    """(pipe product_key, content_key) for a URL-audit product that was seeded
+    into the commerce index, else (None, None).
+
+    Only returns a key when audit index-intake is ON — the seed must actually
+    exist for the portal's evidence endpoints (which resolve by platform +
+    source_product_id) to attach to it. Deterministic: mirrors the catalog row
+    audit_run_worker seeded from the SAME brand-surface URL (product.canonical_url),
+    so the pipe key's platform_product_id (source_product_id) matches the minted
+    row. The pipe form (`merchant|url_audit|source`) is what the portal's
+    parseProductKey expects, which is what lights up the 'supply proof' action."""
+    try:
+        from services.audit_index_intake import (
+            PLATFORM_URL_AUDIT,
+            audit_intake_enabled,
+            stable_source_id,
+        )
+        from services.catalog_identity import make_content_key
+    except Exception:  # noqa: BLE001 — never break report assembly on import
+        return None, None
+    if not merchant_id or not audit_intake_enabled():
+        return None, None
+    seed_url = str((product or {}).get("canonical_url") or "").strip() or None
+    source_id = stable_source_id(seed_url) if seed_url else None
+    if not source_id:
+        return None, None
+    brand = (product or {}).get("brand") or (product or {}).get("vendor")
+    title = (product or {}).get("title") or sku_ctx.get("sku_title")
+    content_key = make_content_key(brand, title) if (brand and title) else None
+    return f"{merchant_id}|{PLATFORM_URL_AUDIT}|{source_id}", content_key
+
+
 async def build_per_sku_report(
     sku_key: str,
     merchant_id: str,
@@ -6333,10 +6369,19 @@ async def build_per_sku_report(
     _attach_dimension_display(scores)
     sku_band = _sku_band(scores)
 
+    # A URL-audited product that was auto-seeded into the index gets an
+    # evidence-attachable pipe product_key (`merchant|url_audit|source`) so the
+    # portal can offer "supply proof / upload docs" on it; without this the report
+    # carries the ephemeral `urlwedge:` key, which the portal can't act on. Only
+    # when index-intake is ON (the seed actually exists to attach to).
+    _seed_pk, _seed_ck = (None, None)
+    if sku_ctx.get("synthetic_url_audit"):
+        _seed_pk, _seed_ck = _url_audit_seed_report_identity(merchant_id, product, sku_ctx)
+
     report = {
         "sku_key": sku_key,
-        "product_key": sku_ctx.get("product_key") or product.get("product_key"),
-        "content_key": sku_ctx.get("content_key") or product.get("content_key"),
+        "product_key": _seed_pk or sku_ctx.get("product_key") or product.get("product_key"),
+        "content_key": _seed_ck or sku_ctx.get("content_key") or product.get("content_key"),
         "sku_title": (_get_sku(sku_ctx).get("title") or product.get("title")),
         # Bad-name-tolerant resolved identity + confidence. When
         # identity.unresolved is True we only have a variant label / no

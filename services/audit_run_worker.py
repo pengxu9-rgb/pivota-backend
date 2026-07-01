@@ -369,6 +369,15 @@ async def _process_one_audit_run_inner(
                     launch_options=launch_options,
                     merchant_id=merchant_id,
                 )
+                # The audit IS the index-build motion: auto-seed each pasted
+                # product into the commerce index as an OBSERVED, unclaimed
+                # catalog row (flag-gated, best-effort — never breaks the audit).
+                # This is what gives a URL-audited product a durable canonical
+                # record the merchant can later attach proof/claims to.
+                await _seed_url_audit_index(
+                    merchant_id=merchant_id,
+                    synthetic_items=launch_options.get("synthetic_products") or [],
+                )
             else:
                 (
                     merchant_name,
@@ -1213,6 +1222,44 @@ def _detect_mock_audit_output(brand_report: Dict[str, Any]) -> List[Dict[str, An
         seen.add(reason)
         out.append(item)
     return out
+
+
+async def _seed_url_audit_index(
+    *, merchant_id: str, synthetic_items: List[Dict[str, Any]],
+) -> None:
+    """Best-effort: auto-seed the commerce index from a URL audit. Flag-gated
+    (ENABLE_AUDIT_INDEX_INTAKE, default OFF). For each pasted product, upsert an
+    OBSERVED, unclaimed catalog_products seed keyed on the BRAND's surface
+    (canonical_url — the brand site even when the pasted page is a retailer
+    channel). The seed's (platform='url_audit', source_product_id) is what the
+    per-SKU report re-derives deterministically so the merchant can attach
+    proof/claims to it. NEVER raises — an intake failure must not break a live
+    audit (the upsert is itself best-effort; this guard is belt-and-suspenders)."""
+    from services.audit_index_intake import (
+        audit_intake_enabled,
+        upsert_audited_sku_to_index,
+    )
+
+    if not audit_intake_enabled():
+        return
+    for item in synthetic_items or []:
+        try:
+            # Seed the brand's own product surface: for a retail-channel paste,
+            # canonical_url is the brand site (pdp_url is the retailer page). The
+            # report re-derives source_product_id from this same URL, so they agree.
+            seed_url = (
+                str((item or {}).get("canonical_url") or "").strip()
+                or str((item or {}).get("pdp_url") or "").strip()
+                or None
+            )
+            if not seed_url:
+                continue
+            await upsert_audited_sku_to_index(merchant_id, {**item, "pdp_url": seed_url})
+        except Exception as exc:  # noqa: BLE001 — best-effort, never break the audit
+            logger.warning(
+                "audit_run_worker: url-audit index seed failed for %s: %s",
+                (item or {}).get("sku_key"), str(exc)[:200],
+            )
 
 
 def _resolve_synthetic_url_products(

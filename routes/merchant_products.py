@@ -49,6 +49,7 @@ from services.beauty_field_authoring import (
 from services.fashion_field_authoring import (
     write_merchant_authored_fashion_fields,
 )
+from services.audit_index_intake import PLATFORM_URL_AUDIT
 from services.product_enrichment_pipeline import run_enrichment_for_product
 from services.product_exposure_service import build_agent_push_projection_from_cache_row
 from services.product_quality_backfill_service import process_quality_backfill_job
@@ -2046,7 +2047,11 @@ async def upsert_product_evidence_endpoint(
             & (products_cache.c.platform_product_id == platform_product_id)
         )
     )
-    if not owns:
+    # url_audit seeds aren't in products_cache (that's connected-store sync). Their
+    # ownership is proven instead by the merchant-scoped catalog resolve below,
+    # which only returns a product_key for a catalog_products row keyed to THIS
+    # merchant — so a merchant can only attach evidence to their own audit seed.
+    if not owns and platform != PLATFORM_URL_AUDIT:
         raise HTTPException(status_code=404, detail="Product not found")
 
     product_key, content_key = await _resolve_evidence_product(
@@ -2167,7 +2172,9 @@ async def extract_lab_report_evidence_endpoint(
             & (products_cache.c.platform_product_id == platform_product_id)
         )
     )
-    if not owns:
+    # url_audit seeds aren't in products_cache; the merchant-scoped catalog resolve
+    # below is the ownership proof (see the /evidence POST for the full rationale).
+    if not owns and platform != PLATFORM_URL_AUDIT:
         raise HTTPException(status_code=404, detail="Product not found")
 
     product_key, _ = await _resolve_evidence_product(merchant_id, platform, platform_product_id)
