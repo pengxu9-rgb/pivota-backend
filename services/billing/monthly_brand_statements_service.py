@@ -35,6 +35,31 @@ async def current_period_usage_snapshot(merchant_id: str) -> dict[str, Any]:
     today = _utc_today()
     period_start = today.replace(day=1)
     period_end = _next_month(period_start)
+
+    # Purchased top-up credits live in the wallet (merchant_credit_balance), NOT
+    # in user_subscriptions. They persist across calendar months and are spent
+    # AFTER the monthly allowance is drained. The subscription-derived snapshot
+    # below never sees them, so surface them here so the billing UI can show a
+    # merchant's real spendable balance distinctly from the monthly allowance.
+    # Lazy import: merchant_credit_balance_service -> routes.billing_routes ->
+    # this module would be a circular import at module load time.
+    purchased_credits = 0
+    available_credits = 0
+    try:
+        from services import merchant_credit_balance_service
+
+        wallet = await merchant_credit_balance_service.get_balance(merchant_id)
+        purchased_credits = int(wallet.get("purchased_credits") or 0)
+        # `credits` is the total spendable balance = remaining monthly allowance
+        # + purchased top-ups (debits drain allowance first). It is NOT additive
+        # with `allowance_credits`/`consumed_credits`, which describe allowance
+        # usage; it is the actual number of credits the merchant can spend now.
+        available_credits = int(wallet.get("credits") or 0)
+    except Exception:
+        # Wallet read is a display enrichment; never fail the snapshot on it.
+        purchased_credits = 0
+        available_credits = 0
+
     subscription = await _latest_active_subscription(
         merchant_id=merchant_id,
         period_start=period_start,
@@ -51,6 +76,8 @@ async def current_period_usage_snapshot(merchant_id: str) -> dict[str, Any]:
             "period_start": period_start,
             "period_end": period_end,
             "in_overage": False,
+            "purchased_credits": purchased_credits,
+            "available_credits": available_credits,
         }
 
     # Consumption is metered by the WIRED debit path
@@ -83,6 +110,8 @@ async def current_period_usage_snapshot(merchant_id: str) -> dict[str, Any]:
         "period_start": period_start,
         "period_end": period_end,
         "in_overage": overage_count > 0,
+        "purchased_credits": purchased_credits,
+        "available_credits": available_credits,
     }
 
 

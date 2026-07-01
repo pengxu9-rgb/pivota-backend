@@ -386,6 +386,65 @@ def test_current_period_response_has_no_credit_dollar_value_field(
         assert not re.search(r"(allowance|consumed|credit).*usd", key)
 
 
+def test_current_period_surfaces_purchased_topup_credits(
+    fake_db: _FakeBillingMeDatabase,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # Regression: purchased top-up credits live in the wallet
+    # (merchant_credit_balance), not user_subscriptions, so the snapshot must
+    # read the balance system to surface them — otherwise top-ups are invisible.
+    fake_db.add_subscription()
+
+    import services.merchant_credit_balance_service as balance_module
+
+    async def _fake_balance(merchant_id: str) -> dict[str, Any]:
+        # allowance 4000 (unspent) + 5000 purchased = 9000 spendable now.
+        return {"credits": 9000, "purchased_credits": 5000, "allowance_credits": 4000}
+
+    monkeypatch.setattr(balance_module, "get_balance", _fake_balance)
+
+    client, app = _build_client()
+    try:
+        response = client.get("/api/billing/me/current-period")
+    finally:
+        app.dependency_overrides.clear()
+
+    assert response.status_code == 200
+    body = response.json()
+    # Allowance/consumption still describe the subscription, unchanged.
+    assert body["allowance_credits"] == 4000
+    assert body["consumed_credits"] == 0
+    # New: the wallet balance is surfaced distinctly from the allowance.
+    assert body["purchased_credits"] == 5000
+    assert body["available_credits"] == 9000
+
+
+def test_current_period_surfaces_topup_credits_without_subscription(
+    fake_db: _FakeBillingMeDatabase,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # A merchant with no active plan can still hold purchased top-up credits.
+    import services.merchant_credit_balance_service as balance_module
+
+    async def _fake_balance(merchant_id: str) -> dict[str, Any]:
+        return {"credits": 5000, "purchased_credits": 5000, "allowance_credits": 0}
+
+    monkeypatch.setattr(balance_module, "get_balance", _fake_balance)
+
+    client, app = _build_client()
+    try:
+        response = client.get("/api/billing/me/current-period")
+    finally:
+        app.dependency_overrides.clear()
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body["tier"] is None
+    assert body["allowance_credits"] == 0
+    assert body["purchased_credits"] == 5000
+    assert body["available_credits"] == 5000
+
+
 def test_statements_returns_recent_frozen_invoiced_rows_only(
     fake_db: _FakeBillingMeDatabase,
 ) -> None:
