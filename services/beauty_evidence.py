@@ -74,6 +74,12 @@ _BENEFIT_VOCAB: Dict[str, tuple] = {
         [r"\bsmooth", r"\bfrizz", r"\bsleek", r"manageab"],
         "Smooths and helps tame the look of frizz",
     ),
+    # Antioxidant defense — cosmetic-safe environmental/free-radical framing
+    # (never therapeutic; still screened by screen_claim below).
+    "antioxidant": (
+        [r"antioxidant", r"free[\s-]?radical", r"environmental", r"\bpollution", r"oxidative", r"\bdefend"],
+        "Helps defend the look of skin against environmental stressors",
+    ),
 }
 _BENEFIT_RE = {b: re.compile("|".join(terms), re.IGNORECASE) for b, (terms, _) in _BENEFIT_VOCAB.items()}
 
@@ -106,6 +112,20 @@ _ACTIVE_BENEFITS: Dict[str, tuple] = {
     "Hydrolyzed Rice Protein": ("strengthening",),
     "Argan Oil": ("nourishing", "smoothing", "hydrating"),
     "Biotin": ("strengthening",),
+    # Expansion — labels MUST match beauty_enrichment._KEY_ACTIVES (drift test).
+    # Benefits mapped conservatively to well-established, cosmetic-safe outcomes.
+    "Vitamin E": ("antioxidant", "barrier-support"),
+    "Squalane": ("hydrating", "barrier-support"),
+    "Shea Butter": ("nourishing", "hydrating"),
+    "Jojoba Oil": ("nourishing", "hydrating"),
+    "Trehalose": ("hydrating",),
+    "Sunflower Oil": ("nourishing",),
+    "Heartleaf": ("soothing", "oil-control"),
+    "Beta-Glucan": ("soothing", "hydrating"),
+    "Licorice": ("brightening", "soothing"),
+    "Galactomyces": ("brightening", "barrier-support"),
+    "Arbutin": ("brightening",),
+    "Bakuchiol": ("anti-aging",),
 }
 
 

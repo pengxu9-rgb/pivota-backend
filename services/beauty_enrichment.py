@@ -76,6 +76,22 @@ _KEY_ACTIVES: List[Dict[str, Any]] = [
     {"label": "Argan Oil", "patterns": [r"argania\s+spinosa", r"argan\s+oil"]},
     {"label": "Biotin", "patterns": [r"\bbiotin\b"]},
     {"label": "Collagen", "patterns": [r"hydrolyzed\s+collagen", r"\bcollagen\b"]},
+    # Expansion (data-driven from the served catalog's INCI + canonical K-beauty
+    # actives). Tocopherol alone appears in ~1,100 products. Patterns match the
+    # standardized INCI name; benefits mapped conservatively in
+    # services.beauty_evidence._ACTIVE_BENEFITS.
+    {"label": "Vitamin E", "patterns": [r"\btocopherol\b", r"tocopheryl\s+acetate", r"tocophersolan", r"vitamin\s*e\b"]},
+    {"label": "Squalane", "patterns": [r"\bsqualane\b", r"\bsqualene\b"]},
+    {"label": "Shea Butter", "patterns": [r"butyrospermum\s+parkii", r"shea\s+butter"]},
+    {"label": "Jojoba Oil", "patterns": [r"simmondsia\s+chinensis", r"\bjojoba\b"]},
+    {"label": "Trehalose", "patterns": [r"\btrehalose\b"]},
+    {"label": "Sunflower Oil", "patterns": [r"helianthus\s+annuus", r"sunflower\s+seed\s+oil"]},
+    {"label": "Heartleaf", "patterns": [r"houttuynia\s+cordata", r"\bheartleaf\b"]},
+    {"label": "Beta-Glucan", "patterns": [r"beta-?glucan", r"\bglucan\b"]},
+    {"label": "Licorice", "patterns": [r"glycyrrhiza\s+\w+", r"licorice", r"liquorice", r"dipotassium\s+glycyrrhizate"]},
+    {"label": "Galactomyces", "patterns": [r"galactomyces", r"bifida\s+ferment", r"saccharomyces\s+ferment"]},
+    {"label": "Arbutin", "patterns": [r"\barbutin\b", r"alpha-?arbutin"]},
+    {"label": "Bakuchiol", "patterns": [r"\bbakuchiol\b"]},
 ]
 
 # Compile once.
