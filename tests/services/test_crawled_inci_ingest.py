@@ -15,6 +15,19 @@ def test_merchant_id_from_product_key():
     assert csi.merchant_id_from_product_key("") == "external_seed"
 
 
+def test_is_skippable_rejects_prose_and_blob():
+    # Regression (claim-quality audit): only a real delimited INCI may mint claims.
+    assert not csi._is_skippable_inci(
+        "Water, Snail Secretion Filtrate, Sodium Hyaluronate, Panthenol, Allantoin")
+    # crawler keyword-blob (no delimiters)
+    assert csi._is_skippable_inci("PDRNNiacinamideAzelaic AcidHeartleafCentellaCeramide")
+    # marketing/benefit prose, not an ingredient list
+    assert csi._is_skippable_inci("Promotes collagen creation, hydrates deeply, improves elasticity")
+    # legacy checks still hold
+    assert csi._is_skippable_inci("")
+    assert csi._is_skippable_inci("NO INGREDIENT INFO AVAILABLE")
+
+
 def test_ingest_upserts_with_source_system_and_enriches(monkeypatch):
     executed = []
     enriched = []
