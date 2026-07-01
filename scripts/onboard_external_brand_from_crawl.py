@@ -51,6 +51,7 @@ from services.external_seed_servability import (
     build_servable_quality_payload,
     make_external_seed_servable,
 )
+from services.pdp_scope_classifier import ScopeSignals, classify
 
 TOOL = "external_brand_crawl"
 
@@ -113,6 +114,36 @@ async def _set_category_and_offer(p: Dict[str, Any]) -> None:
     )
 
 
+async def _resolve_pdp_scope(p: Dict[str, Any]) -> None:
+    """Promote the mirrored row off the 'unverified' scope default so it clears
+    the serving-eligibility `entity_unresolved` gate (which requires a resolved
+    pdp_scope OR a product_group_id). Without this, a crawl-onboarded brand mirrors
+    + scores fine but never serves. Single-seller brand-direct crawl → seller_count
+    is 1 → classify() returns 'merchant_owned'; a product already carried by another
+    seller correctly classifies 'multi_merchant_canonical'.
+    """
+    pk = _product_key(p["external_product_id"])
+    row = await database.fetch_one(
+        """
+        SELECT 1
+          + COALESCE((SELECT COUNT(DISTINCT co.merchant_id) FROM catalog_offers co
+                      WHERE co.product_key = :pk AND co.merchant_id IS NOT NULL
+                        AND co.merchant_id <> 'external_seed'), 0)
+          + COALESCE((SELECT COUNT(DISTINCT eps.domain) FROM external_product_seeds eps
+                      WHERE eps.attached_product_key = :pk AND eps.status = 'active'
+                        AND eps.domain IS NOT NULL), 0) AS seller_count
+        """,
+        {"pk": pk},
+    )
+    seller_count = int((dict(row) if row else {}).get("seller_count") or 1)
+    scope = classify(ScopeSignals(category_label_source=None, seller_count=seller_count))
+    await database.execute(
+        "UPDATE catalog_products SET pdp_scope=:s, pdp_scope_source=:src, pdp_scope_set_at=NOW() "
+        "WHERE product_key=:pk AND pdp_scope='unverified'",
+        {"s": scope, "src": TOOL, "pk": pk},
+    )
+
+
 async def _onboard(cohort: List[Dict[str, Any]]) -> None:
     for p in cohort:
         await _upsert_seed(p)
@@ -120,6 +151,9 @@ async def _onboard(cohort: List[Dict[str, Any]]) -> None:
     print(f"mirror inserted_catalog_products={inserted}")
     for p in cohort:
         await _set_category_and_offer(p)
+        # Resolve identity scope BEFORE make_external_seed_servable recomputes
+        # eligibility, so the row can actually reach serving_eligible.
+        await _resolve_pdp_scope(p)
     # INCI + enrichment via the shared crawled-INCI ingest (scripts.ingest_crawled_inci,
     # #855) -- one upsert-raw_inci + enrich_and_persist path for both crawl tools.
     # category_kind is set above first (enrichment reads it).

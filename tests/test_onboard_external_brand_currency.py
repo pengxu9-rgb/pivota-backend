@@ -16,11 +16,15 @@ import scripts.onboard_external_brand_from_crawl as onboard  # noqa: E402
 
 
 class _FakeDB:
-    def __init__(self):
+    def __init__(self, fetch_one_result=None):
         self.calls = []
+        self._fetch_one_result = fetch_one_result
 
     async def execute(self, sql, params=None):
         self.calls.append((sql, params or {}))
+
+    async def fetch_one(self, sql, params=None):
+        return self._fetch_one_result
 
 
 @pytest.fixture
@@ -75,3 +79,22 @@ async def test_set_category_and_offer_defaults_market_us(fake_db):
     })
     offer_params = fake_db.calls[-1][1]
     assert offer_params["market"] == "US"
+
+
+async def test_resolve_pdp_scope_single_seller_is_merchant_owned(monkeypatch):
+    # seller_count=1 -> classify() returns 'merchant_owned' (a resolved scope),
+    # so the mirrored row can clear the entity_unresolved serving gate.
+    db = _FakeDB(fetch_one_result={"seller_count": 1})
+    monkeypatch.setattr(onboard, "database", db)
+    await onboard._resolve_pdp_scope({"external_product_id": "anuko_32"})
+    update_sql, params = db.calls[-1]
+    assert "catalog_products" in update_sql and "pdp_scope" in update_sql
+    assert params["s"] == "merchant_owned"
+    assert "pdp_scope='unverified'" in update_sql  # only promotes unresolved rows
+
+
+async def test_resolve_pdp_scope_multi_seller_is_canonical(monkeypatch):
+    db = _FakeDB(fetch_one_result={"seller_count": 3})
+    monkeypatch.setattr(onboard, "database", db)
+    await onboard._resolve_pdp_scope({"external_product_id": "anuko_32"})
+    assert db.calls[-1][1]["s"] == "multi_merchant_canonical"
