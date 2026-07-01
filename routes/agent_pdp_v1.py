@@ -17,11 +17,18 @@ from fastapi.encoders import jsonable_encoder
 from db.database import database
 from services.catalog_identity import is_content_key
 from services.claim_safety import substantiated_claims
+from services.offer_buyability import DEFAULT_SERVING_MARKET, annotate_offer_buyability
 from services.serving_freshness import serving_freshness
 
 
 router = APIRouter(prefix="/api/agent/pdp", tags=["agent-pdp"])
 logger = logging.getLogger(__name__)
+
+
+def _serving_market() -> str:
+    """Market this read surface serves buyability against. US-oriented index by
+    default; override with AGENT_PDP_SERVING_MARKET for a non-US deployment."""
+    return (os.getenv("AGENT_PDP_SERVING_MARKET") or DEFAULT_SERVING_MARKET).strip() or DEFAULT_SERVING_MARKET
 
 
 AGENT_PDP_VIEW_COLUMNS: Tuple[str, ...] = (
@@ -360,7 +367,10 @@ def _row_as_product(row: Dict[str, Any]) -> Dict[str, Any]:
 
 
 def _build_response(row: Dict[str, Any]) -> Dict[str, Any]:
-    offers = row.get("offers") or []
+    # Market-aware buyability: tag each offer buyable/is_buy_pick against the
+    # serving market so a cross-border brand-direct offer (e.g. a KRW listing)
+    # isn't presented to a US agent as a same-market purchase.
+    offers = annotate_offer_buyability(row.get("offers") or [], _serving_market())
     offer_count = row.get("offer_count")
     if offer_count is None:
         offer_count = len(offers)
