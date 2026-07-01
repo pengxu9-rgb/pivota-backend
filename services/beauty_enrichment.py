@@ -67,7 +67,10 @@ _KEY_ACTIVES: List[Dict[str, Any]] = [
     {"label": "Tranexamic Acid", "patterns": [r"tranexamic\s+acid"]},
     {"label": "Green Tea", "patterns": [r"camellia\s+sinensis", r"green\s+tea"]},
     {"label": "Propolis", "patterns": [r"\bpropolis\b"]},
-    {"label": "Mugwort", "patterns": [r"artemisia\s+\w+\s+extract", r"\bmugwort\b"]},
+    # Mugwort = Artemisia princeps/vulgaris/argyi ONLY. Sibling species (capillaris =
+    # capillary wormwood, annua = sweet wormwood, absinthium) are NOT mugwort — the old
+    # `artemisia\s+\w+` fired on all of them (systematic false "Contains Mugwort").
+    {"label": "Mugwort", "patterns": [r"artemisia\s+(?:princeps|vulgaris|argyi|montana)\b", r"\bmugwort\b"]},
     {"label": "Rice Extract", "patterns": [r"oryza\s+sativa", r"\brice\s+(?:extract|ferment|water|bran)"]},
     {"label": "Ginseng", "patterns": [r"panax\s+ginseng", r"\bginseng\b"]},
     # Haircare-leaning actives.
@@ -101,6 +104,10 @@ for _a in _KEY_ACTIVES:
 _INCI_SPLIT_RE = re.compile(r"[,\n;•·•/]+")
 # Strip trailing concentration / parenthetical notes from an INCI token.
 _INCI_CLEAN_RE = re.compile(r"\s*\([^)]*\)|\s*\d+(?:\.\d+)?\s*%.*$")
+# Crawler keyword-blob: many ingredient names concatenated with no delimiter show up as
+# one long token with a lower→UPPER seam mid-word (e.g. "…NiacinamideAzelaic…"). Real
+# INCI tokens are space/hyphen/slash separated and never carry that seam.
+_INCI_BLOB_RE = re.compile(r"[a-z][A-Z]")
 
 
 def parse_inci(raw_inci: Optional[str]) -> List[str]:
@@ -110,8 +117,11 @@ def parse_inci(raw_inci: Optional[str]) -> List[str]:
     tokens = []
     for part in _INCI_SPLIT_RE.split(str(raw_inci)):
         cleaned = _INCI_CLEAN_RE.sub("", part).strip().strip(".")
-        if cleaned and len(cleaned) > 1:
-            tokens.append(cleaned)
+        if not cleaned or len(cleaned) <= 1:
+            continue
+        if len(cleaned) > 24 and _INCI_BLOB_RE.search(cleaned):
+            continue  # concatenated keyword-blob, not a real ingredient token
+        tokens.append(cleaned)
     return tokens
 
 

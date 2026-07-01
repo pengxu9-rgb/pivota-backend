@@ -45,6 +45,29 @@ def test_extract_key_actives_no_false_positives():
     assert extract_key_actives("Water, Glycerin, Butylene Glycol, Fragrance") == []
 
 
+def test_mugwort_only_matches_true_mugwort_species():
+    # Regression (claim-quality audit): the old `artemisia\s+\w+` fired on ANY Artemisia
+    # → systematic false "Contains Mugwort". Only princeps/vulgaris/argyi are mugwort.
+    def lbl(inci):
+        return [a["label"] for a in extract_key_actives(inci)]
+    assert "Mugwort" in lbl("Water, Artemisia Princeps Leaf Extract, Glycerin")
+    assert "Mugwort" in lbl("Water, Artemisia Vulgaris Extract")
+    assert "Mugwort" not in lbl("Water, Artemisia Capillaris Extract, Glycerin")  # capillary wormwood
+    assert "Mugwort" not in lbl("Water, Artemisia Annua Extract")                 # sweet wormwood
+
+
+def test_parse_inci_drops_concatenated_keyword_blob():
+    # Crawler keyword-blobs (no delimiter, lower→UPPER seams) must not become tokens,
+    # so no false actives are minted from them.
+    toks = parse_inci("Water, Niacinamide, PhenoxyethanolCentellaMugwortRicePeach")
+    assert "Water" in toks and "Niacinamide" in toks
+    assert not any("Centella" in t for t in toks)  # blob suffix dropped
+    labels = [a["label"] for a in extract_key_actives(
+        "Water, Niacinamide, Sodium Hyaluronate, PhenoxyethanolCentellaMugwortRicePeach")]
+    assert "Niacinamide" in labels and "Hyaluronic Acid" in labels
+    assert "Centella Asiatica" not in labels and "Mugwort" not in labels
+
+
 def test_extract_key_actives_falls_back_to_text_when_no_inci():
     actives = extract_key_actives(None, fallback_text="A brightening serum with niacinamide and centella")
     labels = [a["label"] for a in actives]

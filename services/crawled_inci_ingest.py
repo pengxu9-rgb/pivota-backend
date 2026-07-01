@@ -16,6 +16,7 @@ dry_run writes nothing.
 
 from __future__ import annotations
 
+import re
 from typing import Any, Dict, List
 
 from db.database import database
@@ -44,8 +45,34 @@ def merchant_id_from_product_key(product_key: str) -> str:
     return parts[1] if len(parts) > 1 and parts[1] else "external_seed"
 
 
+# Marketing/benefit prose is not an INCI list. If the source reads like copy
+# ("promotes collagen creation", "helps calm redness") rather than a delimited
+# ingredient list, we must not mint substantiated claims from it.
+_PROSE_RE = re.compile(
+    r"\b(promot\w+|improv\w+|reduc\w+|boost\w+|helps?|soothe?s?|calm\w+|nourish\w+|"
+    r"brighten\w+|anti-?aging|wrinkle\w*|fine\s+lines|clinically|dermatologist|"
+    r"visibly|hydrates?\s+(?:the|your)\s+skin)\b",
+    re.IGNORECASE,
+)
+
+
+def _looks_like_inci(inci: str) -> bool:
+    """A real INCI is a comma-delimited list of several ingredients — not a keyword
+    blob (no delimiters) and not marketing/benefit prose."""
+    s = (inci or "").strip()
+    if len([p for p in s.split(",") if p.strip()]) < 2:
+        return False  # single run / keyword-blob, not a delimited ingredient list
+    if _PROSE_RE.search(s):
+        return False  # benefit/marketing copy, not an ingredient list
+    return True
+
+
 def _is_skippable_inci(inci: str) -> bool:
-    return not inci or inci.upper().startswith("NO INGREDIENT")
+    return (
+        not inci
+        or inci.strip().upper().startswith("NO INGREDIENT")
+        or not _looks_like_inci(inci)
+    )
 
 
 async def ingest_crawled_inci_items(
