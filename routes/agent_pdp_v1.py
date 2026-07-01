@@ -367,9 +367,9 @@ def _row_as_product(row: Dict[str, Any]) -> Dict[str, Any]:
 
 
 def _build_response(row: Dict[str, Any]) -> Dict[str, Any]:
-    # Market-aware buyability: tag each offer buyable/is_buy_pick against the
-    # serving market so a cross-border brand-direct offer (e.g. a KRW listing)
-    # isn't presented to a US agent as a same-market purchase.
+    # Market-aware buyability: tag each offer domestic/cross_border + is_buy_pick
+    # against the serving market so a cross-border brand-direct offer (e.g. a KRW
+    # listing) isn't presented to a US agent as a domestic same-market purchase.
     offers = annotate_offer_buyability(row.get("offers") or [], _serving_market())
     offer_count = row.get("offer_count")
     if offer_count is None:

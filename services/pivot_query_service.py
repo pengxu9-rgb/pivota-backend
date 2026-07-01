@@ -43,6 +43,7 @@ from services.skincare_attributes import (
     extract_spf_value,
     merge_concentration_into_actives,
 )
+from services.offer_buyability import annotate_offer_nodes
 from services.offer_classification import (
     OFFER_TYPE_RETAILER,
     classify_offer_type,
@@ -1867,6 +1868,11 @@ async def search_pivot_catalog(request: PivotQueryRequest) -> PivotQueryResponse
     items = _sort_items(
         (canonical_items + external_items + citable_items)[: request.limit * 2]
     )[: request.limit]
+    # Market-aware buyability: tag each offer domestic/cross_border + is_buy_pick
+    # against the request's market so a cross-border listing (e.g. a KRW/market=KR
+    # brand-direct offer answered to a US query) isn't presented as a domestic buy.
+    for item in items:
+        annotate_offer_nodes(item.offers, request.market)
     elapsed_ms = round((time.perf_counter() - started) * 1000.0, 1)
     if elapsed_ms >= 3000:
         logger.warning(
