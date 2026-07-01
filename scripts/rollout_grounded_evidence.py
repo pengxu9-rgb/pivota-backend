@@ -41,6 +41,13 @@ _SELECT = """
       AND cp.category_kind = 'skincare'
       AND cp.brand ~* :brand
       AND coalesce(cp.product_payload->>'inci_list', '') <> ''
+      -- Only REAL INCI: has a delimiter (excludes crawler keyword-blobs) and isn't
+      -- benefit/marketing prose. Mirrors crawled_inci_ingest._looks_like_inci — without
+      -- this, skippable sources never write raw_inci, so the `bsi IS NULL` window
+      -- re-selects them every pass and starves valid products behind them (they clog
+      -- ORDER BY product_key and the loop never drains).
+      AND position(',' in cp.product_payload->>'inci_list') > 0
+      AND cp.product_payload->>'inci_list' !~* '\\y(promot|improv|reduc|boost|helps|soothe|calm|nourish|brighten|clinically|dermatologist|visibly|wrinkle)\\y|anti-?aging'
       AND bsi.product_key IS NULL            -- not yet ingested → resumable
     ORDER BY cp.product_key, (s.sku_key LIKE '%::canonical') DESC
     LIMIT :limit
