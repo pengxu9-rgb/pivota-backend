@@ -17,6 +17,7 @@ from fastapi.encoders import jsonable_encoder
 from db.database import database
 from services.catalog_identity import is_content_key
 from services.claim_safety import substantiated_claims
+from services.independent_signals import independent_signals_for
 from services.offer_buyability import DEFAULT_SERVING_MARKET, annotate_offer_buyability
 from services.serving_freshness import serving_freshness
 
@@ -366,7 +367,10 @@ def _row_as_product(row: Dict[str, Any]) -> Dict[str, Any]:
     return product
 
 
-def _build_response(row: Dict[str, Any]) -> Dict[str, Any]:
+def _build_response(
+    row: Dict[str, Any],
+    independent_signals: Optional[list] = None,
+) -> Dict[str, Any]:
     # Market-aware buyability: tag each offer domestic/cross_border + is_buy_pick
     # against the serving market so a cross-border brand-direct offer (e.g. a KRW
     # listing) isn't presented to a US agent as a domestic same-market purchase.
@@ -375,11 +379,16 @@ def _build_response(row: Dict[str, Any]) -> Dict[str, Any]:
     if offer_count is None:
         offer_count = len(offers)
 
+    product = _row_as_product(row)
+    # SEPARATION invariant: independent (non-merchant) endorsements are a DISTINCT
+    # block, never merged into merchant-asserted evidence_claims.
+    product["independent_signals"] = independent_signals or []
+
     product_group_id = row.get("product_group_id")
     canonical_data: Dict[str, Any] = {
         "product_group_id": product_group_id,
         "pdp_payload": {
-            "product": _row_as_product(row),
+            "product": product,
             "offers": offers,
             "offers_count": offer_count,
             "product_group_id": product_group_id,
@@ -407,6 +416,13 @@ def _build_response(row: Dict[str, Any]) -> Dict[str, Any]:
         "offers_count": offer_count,
     }
     return jsonable_encoder(payload)
+
+
+async def _respond(row: Dict[str, Any]) -> Dict[str, Any]:
+    """Build the PDP response, enriched with credible independent signals (one
+    indexed lookup on content_key; [] for the common no-citation case)."""
+    signals = await independent_signals_for(str(row.get("content_key") or ""), db=database)
+    return _build_response(row, independent_signals=signals)
 
 
 @router.get("/{id}")
@@ -446,7 +462,7 @@ async def get_agent_pdp(id: str, request: Request) -> Dict[str, Any]:
                 status_code=status.HTTP_404_NOT_FOUND,
                 detail="PDP not found",
             )
-        return _build_response(_row_to_dict(row))
+        return await _respond(_row_to_dict(row))
 
     lookup_id = _strip_group_wrapper(raw_id)
     query = _query_for_id(
@@ -467,4 +483,4 @@ async def get_agent_pdp(id: str, request: Request) -> Dict[str, Any]:
             detail="PDP not found",
         )
 
-    return _build_response(_row_to_dict(row))
+    return await _respond(_row_to_dict(row))

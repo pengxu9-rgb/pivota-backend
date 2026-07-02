@@ -93,12 +93,21 @@ class FakeAgentPdpDatabase:
         ext_id_to_content_key: Optional[Dict[str, str]] = None,
         serving_eligible_by_content_key: Optional[Dict[str, bool]] = None,
         index_eligible_by_content_key: Optional[Dict[str, bool]] = None,
+        citations_by_content_key: Optional[Dict[str, List[Dict[str, Any]]]] = None,
     ) -> None:
         self.rows = rows
         self.ext_id_to_content_key = ext_id_to_content_key or {}
         self.serving_eligible_by_content_key = serving_eligible_by_content_key
         self.index_eligible_by_content_key = index_eligible_by_content_key or {}
+        self.citations_by_content_key = citations_by_content_key or {}
         self.calls: List[Dict[str, Any]] = []
+
+    async def fetch_all(self, query: str, values: Optional[Dict[str, Any]] = None):
+        query_text = str(query)
+        params = values or {}
+        if "citation_observations" in query_text:
+            return list(self.citations_by_content_key.get(str(params.get("ck") or ""), []))
+        return []
 
     def _passes_serving_eligibility(self, query: str, row: Dict[str, Any]) -> bool:
         if "index_pipeline_state ips" not in query:
@@ -164,12 +173,14 @@ def _client(
     ext_id_to_content_key: Optional[Dict[str, str]] = None,
     serving_eligible_by_content_key: Optional[Dict[str, bool]] = None,
     index_eligible_by_content_key: Optional[Dict[str, bool]] = None,
+    citations_by_content_key: Optional[Dict[str, List[Dict[str, Any]]]] = None,
 ):
     db = FakeAgentPdpDatabase(
         rows,
         ext_id_to_content_key=ext_id_to_content_key,
         serving_eligible_by_content_key=serving_eligible_by_content_key,
         index_eligible_by_content_key=index_eligible_by_content_key,
+        citations_by_content_key=citations_by_content_key,
     )
     monkeypatch.setattr(agent_pdp_v1, "database", db)
     app = FastAPI()
@@ -543,3 +554,32 @@ def test_get_agent_pdp_freshness_stale_when_refreshed_at_missing(monkeypatch) ->
     assert product["is_stale"] is True
     assert product["freshness"]["observed_at"] is None
     assert product["freshness"]["fresh_until"] is None
+
+
+def test_get_agent_pdp_serves_independent_signals_separately(monkeypatch) -> None:
+    # A credible independent citation is served as independent_signals, DISTINCT
+    # from merchant-asserted evidence_claims (SEPARATION invariant); a competitor
+    # citation is excluded.
+    citations = {
+        CK_A: [
+            {"cited_host": "allure.com", "host_type": "editorial", "citation_role": "editorial_review",
+             "evidence_url": "https://allure.com/x", "provider": "chatgpt",
+             "first_party": False, "is_competitor": False, "observed_at": None},
+            {"cited_host": "rival.com", "host_type": "brand", "citation_role": "competitor",
+             "evidence_url": "https://rival.com/y", "provider": "chatgpt",
+             "first_party": False, "is_competitor": True, "observed_at": None},
+        ]
+    }
+    client, _ = _client(monkeypatch, [_row()], citations_by_content_key=citations)
+
+    product = _canonical_product(client.get(f"/api/agent/pdp/{CK_A}").json())
+    sigs = product["independent_signals"]
+    assert [s["cited_host"] for s in sigs] == ["allure.com"]        # credible only
+    assert "independent_signals" != "evidence_claims"               # distinct fields
+    assert "allure.com" not in str(product.get("evidence_claims"))  # not merged into merchant evidence
+
+
+def test_get_agent_pdp_independent_signals_empty_by_default(monkeypatch) -> None:
+    client, _ = _client(monkeypatch, [_row()])  # no citations
+    product = _canonical_product(client.get(f"/api/agent/pdp/{CK_A}").json())
+    assert product["independent_signals"] == []
