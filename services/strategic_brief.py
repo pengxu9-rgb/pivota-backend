@@ -7,7 +7,9 @@ brief that names entities or lanes outside the evidence block.
 
 from __future__ import annotations
 
+import asyncio
 import json
+import logging
 import re
 from typing import Any, Dict, Iterable, List, Mapping, Optional, Set, Tuple
 from urllib.parse import urlparse
@@ -23,6 +25,8 @@ from services.buyer_path_controller_quality import (
 )
 from services.llm_synthesis import (
     LLMSynthesisError,
+    LLMSynthesisHTTPError,
+    MissingLLMKeyError,
     configured_key_for_provider,
     default_model_for_provider,
     normalize_provider,
@@ -35,6 +39,17 @@ from services.sku_lane_priority import (
     is_third_party_controlled_lane,
     prioritize_lanes,
 )
+
+logger = logging.getLogger(__name__)
+
+# Reliability knobs for the LLM ("mainline") brief. The deterministic brief is a
+# strictly worse merchant experience, so we retry transient provider failures with
+# backoff (a single blip must not drop the merchant to the deterministic template).
+# The content-attempt count / max tokens live in _STRATEGIC_BRIEF_MAX_ATTEMPTS /
+# _STRATEGIC_BRIEF_MAX_TOKENS below.
+_BRIEF_TRANSPORT_RETRIES = 3         # extra retries for a single transient provider blip
+_BRIEF_RETRY_BASE_DELAY_S = 0.5      # exponential backoff base for transient retries
+_RETRYABLE_HTTP_STATUS = {408, 409, 425, 429, 500, 502, 503, 504}
 
 _STRATEGIC_BRIEF_SYSTEM_PROMPT = """You are a senior D2C brand & growth strategist — the merchant's marketing director — writing the
 next-steps section of an AI-shopping-visibility audit. You make sharp, decisive calls a smart founder
@@ -279,6 +294,9 @@ _DOMAIN_RE = re.compile(
     re.IGNORECASE,
 )
 _QUOTE_RE = re.compile(r"[\"'`“”‘’]([^\"'`“”‘’\n]{4,160})[\"'`“”‘’]")
+# Apostrophe inside a word (contraction/possessive: don't, publisher's, it's).
+# Stripped before quoted-lane scanning so it is not mistaken for a quote delimiter.
+_INTRAWORD_APOSTROPHE_RE = re.compile(r"(?<=\w)['’](?=\w)")
 _CAP_WORD = r"(?:[A-Z][A-Za-z0-9&'’-]*|[A-Z]{2,}|[A-Za-z]+[A-Z][A-Za-z0-9]*)"
 _PROPER_SEQUENCE_RE = re.compile(
     rf"\b{_CAP_WORD}(?:[ \t]+(?:of|the|for))*[ \t]+{_CAP_WORD}"
@@ -901,19 +919,22 @@ async def generate_sku_strategic_brief(
         or default_model_for_provider(selected_provider)
     )
     dbg["model"] = selected_model
-    system, user = build_sku_brief_prompt(evidence)
-    dbg["prompt_chars"] = len(system) + len(user)
+    system, base_user = build_sku_brief_prompt(evidence)
+    dbg["prompt_chars"] = len(system) + len(base_user)
     dbg["max_tokens"] = _STRATEGIC_BRIEF_MAX_TOKENS
     dbg["attempts"] = []
+    user = base_user
 
     # The grounding validator is deliberately strict (a trust product), so a
     # single LLM draft can trip it stochastically. Retry enough that a clean
     # draft is reliably found — the LLM lane must work continuously, not fall
-    # back to the generic deterministic template. A clean draft short-circuits.
+    # back to the generic deterministic template. On shape/grounding rejection we
+    # feed the model a targeted repair hint before the next attempt; transient
+    # provider blips are retried with backoff inside _synthesize_with_transport_retry.
     for _attempt in range(_STRATEGIC_BRIEF_MAX_ATTEMPTS):
         att: Dict[str, Any] = {}
         try:
-            result = await synthesize(
+            result = await _synthesize_with_transport_retry(
                 system=system,
                 user=user,
                 provider=selected_provider,
@@ -942,6 +963,8 @@ async def generate_sku_strategic_brief(
             if isinstance(brief, dict):
                 att["missing_keys"] = sorted(_REQUIRED_BRIEF_KEYS - set(brief.keys()))
             dbg["attempts"].append(att)
+            # Regenerate with a shape-repair hint instead of falling back.
+            user = f"{base_user}\n\n{_SHAPE_REPAIR_HINT}"
             continue
         gf = _grounding_failures(brief, evidence)
         att["grounding_failures"] = gf
@@ -949,8 +972,131 @@ async def generate_sku_strategic_brief(
         if not gf:
             dbg["outcome"] = "llm"
             return brief
+        # Grounding rejected the draft — feed the model the exact violated rules
+        # so the next attempt lands the mainline brief rather than falling back.
+        user = f"{base_user}\n\n{_grounding_repair_hint(gf)}"
     dbg["outcome"] = "deterministic_after_rejects"
     return _validated_deterministic_brief(evidence, dbg=dbg)
+
+
+def _is_retryable_synthesis_error(exc: LLMSynthesisError) -> bool:
+    """A transient provider failure worth retrying vs. a fatal one. Missing key,
+    unsupported provider, and 4xx (except throttling) are fatal — retrying just
+    wastes time and delays the deterministic fallback. Transport failures (no
+    status code) and 429/5xx are transient."""
+    if isinstance(exc, MissingLLMKeyError):
+        return False
+    if isinstance(exc, LLMSynthesisHTTPError):
+        if exc.status_code is None:
+            return True  # timeout / network / transport failure
+        return exc.status_code in _RETRYABLE_HTTP_STATUS
+    return False
+
+
+async def _synthesize_with_transport_retry(
+    *,
+    system: str,
+    user: str,
+    provider: str,
+    model: str,
+    max_tokens: int,
+) -> Dict[str, Any]:
+    """synthesize() with exponential-backoff retry on transient provider errors.
+    Raises the last error once retries are exhausted or the error is fatal."""
+    delay = _BRIEF_RETRY_BASE_DELAY_S
+    for transport_attempt in range(_BRIEF_TRANSPORT_RETRIES + 1):
+        try:
+            return await synthesize(
+                system=system,
+                user=user,
+                provider=provider,
+                model=model,
+                max_tokens=max_tokens,
+            )
+        except LLMSynthesisError as exc:
+            if (
+                _is_retryable_synthesis_error(exc)
+                and transport_attempt < _BRIEF_TRANSPORT_RETRIES
+            ):
+                logger.info(
+                    "strategic brief transient LLM error (%s), retry %d/%d after %.1fs",
+                    type(exc).__name__,
+                    transport_attempt + 1,
+                    _BRIEF_TRANSPORT_RETRIES,
+                    delay,
+                )
+                await asyncio.sleep(delay)
+                delay *= 2
+                continue
+            raise
+    # Unreachable: the loop either returns or re-raises on the last attempt.
+    raise LLMSynthesisError("synthesis retry loop exhausted", provider=provider)
+
+
+_SHAPE_REPAIR_HINT = (
+    "Your previous reply was not valid JSON with every required field. Reply with "
+    "ONLY a single JSON object containing exactly these keys: position, "
+    "core_decision, why_you_lose, your_angle, traffic_strategy, substitution_play, "
+    "first_moves, diy_vs_pivota. No prose outside the JSON."
+)
+
+# Map the internal grounding-failure codes to a plain corrective instruction so a
+# retry can fix the specific violation instead of dropping to the deterministic brief.
+_GROUNDING_REPAIR_RULES: Tuple[Tuple[str, str], ...] = (
+    ("competitor-exclusive-claim",
+     "Do not use 'only' to say one brand/product/seller has or does something. "
+     "Rephrase without any exclusivity claim about the field."),
+    ("competitor-lack-claim",
+     "Do not use the words 'no', 'not', 'without', 'lacks', 'missing', or 'only' in "
+     "ANY sentence that names a competitor. If you need to note that the merchant is "
+     "absent, put it in a SEPARATE sentence that names no competitor (e.g. 'Your page "
+     "is not cited there yet.'). Never say a competitor lacks or is missing anything."),
+    ("unassessed-competitor-attribute",
+     "Do not attribute any feature, ingredient, quality, reviews, distribution, or "
+     "authority to a named competitor. Say only that the cited source lists/recommends "
+     "them; frame their advantage as YOUR inference about the source, not a stated fact."),
+    ("ungrounded-competitor-attribute",
+     "Do not attribute any feature, ingredient, quality, reviews, distribution, or "
+     "authority to a named competitor. Say only that the cited source lists/recommends "
+     "them; frame their advantage as YOUR inference about the source, not a stated fact."),
+    ("unknown-domain",
+     "Only name websites, retailers, publishers, or communities that appear verbatim "
+     "in the evidence. Remove any others."),
+    ("unknown-quoted-lane",
+     "Only put a search query in quotes if it appears verbatim in the evidence."),
+    ("safety-sensitive",
+     "Remove any unproven health, medical, or safety claim that is not in the evidence."),
+    ("overwide-controller-list",
+     "Name at most three sources in a single sentence."),
+    ("forbidden",
+     "Remove all numbers, prices, percentages, scores, '/100', and internal jargon "
+     "(retrievable, extractable, lane, materiality, controller, canonical, vacuum)."),
+)
+
+
+def _grounding_repair_hint(failures: List[str]) -> str:
+    """Build a targeted rewrite instruction from the grounding-failure codes."""
+    instructions: List[str] = []
+    seen: Set[str] = set()
+    for failure in failures:
+        code = str(failure).split(":", 1)[0]
+        for prefix, instruction in _GROUNDING_REPAIR_RULES:
+            if code.startswith(prefix) and instruction not in seen:
+                seen.add(instruction)
+                instructions.append(instruction)
+                break
+    if not instructions:
+        instructions.append(
+            "Only mention brands, products, sources, and search queries that appear "
+            "verbatim in the evidence."
+        )
+    bullet_list = "\n".join(f"- {line}" for line in instructions)
+    return (
+        "Your previous draft broke these grounding rules. Rewrite the full JSON "
+        "brief, fixing every one, and change nothing else:\n" + bullet_list
+    )
+
+
 
 
 def validate_grounding(brief: Mapping[str, Any], evidence: Mapping[str, Any]) -> bool:
@@ -2299,7 +2445,15 @@ def _grounding_failures(
         ):
             failures.append(f"unknown-domain:{domain}")
 
-    for quote in _QUOTE_RE.findall(text):
+    # Neutralize intra-word apostrophes (contractions/possessives: "don't",
+    # "publisher's", "it's") before scanning for single-quoted lanes. Otherwise
+    # the apostrophe in a contraction pairs with a real lane's quote and
+    # fabricates a bogus "unknown-quoted-lane" failure — which silently rejects
+    # otherwise-grounded LLM briefs and forces the deterministic fallback. A real
+    # quoted lane's delimiters have a non-word char on the outer side, so they are
+    # untouched by this substitution.
+    quote_scan_text = _INTRAWORD_APOSTROPHE_RE.sub("", text)
+    for quote in _QUOTE_RE.findall(quote_scan_text):
         phrase = _norm_phrase(quote)
         if not phrase or len(phrase.split()) < 2:
             continue

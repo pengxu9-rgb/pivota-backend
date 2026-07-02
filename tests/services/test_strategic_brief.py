@@ -822,6 +822,21 @@ def test_validate_grounding_accepts_fully_grounded_brief():
     assert strategic_brief.validate_grounding(_grounded_brief(), _evidence()) is True
 
 
+def test_grounding_ignores_intraword_apostrophe_near_quoted_lane():
+    """A contraction/possessive next to a grounded single-quoted lane must not
+    be mistaken for a quote delimiter (which would fabricate an
+    unknown-quoted-lane failure and force the deterministic fallback)."""
+    evidence = _evidence()
+    brief = _grounded_brief()
+    brief["why_you_lose"] = (
+        "The publisher's list drives the 'best collagen supplements for skin' "
+        "answer, so AI doesn't surface BB Lab there yet."
+    )
+    failures = strategic_brief._grounding_failures(brief, evidence)
+    assert not any(f.startswith("unknown-quoted-lane") for f in failures), failures
+    assert strategic_brief.validate_grounding(brief, evidence) is True
+
+
 def test_validate_grounding_accepts_evidenced_operational_moves():
     evidence = _evidence()
     brief = _grounded_brief()
@@ -1587,9 +1602,10 @@ async def test_generate_sku_strategic_brief_returns_grounded_mocked_brief(monkey
 
     monkeypatch.setattr(strategic_brief, "synthesize", fake_synthesize)
 
-    brief = await strategic_brief.generate_sku_strategic_brief(_evidence())
+    dbg: Dict[str, Any] = {}
+    brief = await strategic_brief.generate_sku_strategic_brief(_evidence(), debug=dbg)
 
-    assert brief.pop("brief_source") == "llm"
+    assert dbg["outcome"] == "llm"
     assert brief == _grounded_brief()
 
 
@@ -1612,10 +1628,11 @@ async def test_generate_sku_strategic_brief_retries_then_returns_deterministic_f
 
     monkeypatch.setattr(strategic_brief, "synthesize", fake_synthesize)
 
-    brief = await strategic_brief.generate_sku_strategic_brief(_evidence())
+    dbg: Dict[str, Any] = {}
+    brief = await strategic_brief.generate_sku_strategic_brief(_evidence(), debug=dbg)
 
     assert brief is not None
-    assert brief["brief_source"] == "deterministic"
+    assert dbg["outcome"].startswith("deterministic")
     assert strategic_brief.validate_grounding(brief, _evidence()) is True
     assert "first-order offer" in " ".join(brief["first_moves"])
     assert len(calls) == strategic_brief._STRATEGIC_BRIEF_MAX_ATTEMPTS
@@ -1633,11 +1650,108 @@ async def test_generate_sku_strategic_brief_returns_fallback_on_synthesis_error(
 
     monkeypatch.setattr(strategic_brief, "synthesize", fake_synthesize)
 
-    brief = await strategic_brief.generate_sku_strategic_brief(_evidence())
+    dbg: Dict[str, Any] = {}
+    brief = await strategic_brief.generate_sku_strategic_brief(_evidence(), debug=dbg)
 
     assert brief is not None
-    assert brief["brief_source"] == "deterministic"
+    assert dbg["outcome"].startswith("deterministic")
     assert strategic_brief.validate_grounding(brief, _evidence()) is True
+
+
+@pytest.mark.asyncio
+async def test_generate_sku_strategic_brief_retries_transient_error_then_returns_llm(monkeypatch):
+    """A single transient provider blip must NOT drop the merchant to the
+    deterministic brief — it retries and lands the LLM ("mainline") brief."""
+    from services.llm_synthesis import LLMSynthesisHTTPError
+
+    monkeypatch.setattr(strategic_brief.settings, "strategic_brief_enabled", True)
+    monkeypatch.setattr(strategic_brief.settings, "deepseek_api_key", "sk-test")
+
+    async def _no_sleep(_seconds):
+        return None
+
+    monkeypatch.setattr(strategic_brief.asyncio, "sleep", _no_sleep)
+
+    calls: List[Mapping[str, Any]] = []
+
+    async def fake_synthesize(**kwargs):
+        calls.append(kwargs)
+        if len(calls) == 1:
+            # transport failure (no status code) -> transient/retryable
+            raise LLMSynthesisHTTPError("deepseek synthesis transport failure",
+                                        provider=kwargs["provider"])
+        return {
+            "text": json.dumps(_grounded_brief()),
+            "usage": {"input_tokens": 1, "output_tokens": 1},
+            "provider": kwargs["provider"],
+            "model": kwargs["model"],
+        }
+
+    monkeypatch.setattr(strategic_brief, "synthesize", fake_synthesize)
+
+    dbg: Dict[str, Any] = {}
+    brief = await strategic_brief.generate_sku_strategic_brief(_evidence(), debug=dbg)
+
+    assert brief is not None
+    assert dbg["outcome"] == "llm"
+    assert len(calls) == 2  # retried past the transient failure
+
+
+@pytest.mark.asyncio
+async def test_generate_sku_strategic_brief_does_not_retry_fatal_http_error(monkeypatch):
+    """A non-retryable provider error (e.g. HTTP 400) falls back immediately
+    rather than burning retries."""
+    from services.llm_synthesis import LLMSynthesisHTTPError
+
+    monkeypatch.setattr(strategic_brief.settings, "strategic_brief_enabled", True)
+    monkeypatch.setattr(strategic_brief.settings, "deepseek_api_key", "sk-test")
+
+    calls: List[Mapping[str, Any]] = []
+
+    async def fake_synthesize(**kwargs):
+        calls.append(kwargs)
+        raise LLMSynthesisHTTPError("bad request", provider=kwargs["provider"], status_code=400)
+
+    monkeypatch.setattr(strategic_brief, "synthesize", fake_synthesize)
+
+    dbg: Dict[str, Any] = {}
+    brief = await strategic_brief.generate_sku_strategic_brief(_evidence(), debug=dbg)
+
+    assert dbg["outcome"].startswith("deterministic")
+    assert len(calls) == 1  # 400 is fatal — no retry
+
+
+@pytest.mark.asyncio
+async def test_generate_sku_strategic_brief_repairs_grounding_then_returns_llm(monkeypatch):
+    """A grounding-rejected first draft is retried WITH a repair hint; the
+    corrected draft lands the LLM brief instead of falling back."""
+    monkeypatch.setattr(strategic_brief.settings, "strategic_brief_enabled", True)
+    monkeypatch.setattr(strategic_brief.settings, "deepseek_api_key", "sk-test")
+
+    ungrounded = _grounded_brief()
+    ungrounded["why_you_lose"] = "Garden of Life owns this category."  # ungrounded competitor
+    calls: List[Mapping[str, Any]] = []
+
+    async def fake_synthesize(**kwargs):
+        calls.append(kwargs)
+        payload = ungrounded if len(calls) == 1 else _grounded_brief()
+        return {
+            "text": json.dumps(payload),
+            "usage": {"input_tokens": 1, "output_tokens": 1},
+            "provider": kwargs["provider"],
+            "model": kwargs["model"],
+        }
+
+    monkeypatch.setattr(strategic_brief, "synthesize", fake_synthesize)
+
+    dbg: Dict[str, Any] = {}
+    brief = await strategic_brief.generate_sku_strategic_brief(_evidence(), debug=dbg)
+
+    assert dbg["outcome"] == "llm"
+    assert len(calls) == 2
+    # the retry carried a repair instruction the first call did not
+    assert "grounding rules" in calls[1]["user"]
+    assert "grounding rules" not in calls[0]["user"]
 
 
 @pytest.mark.asyncio
