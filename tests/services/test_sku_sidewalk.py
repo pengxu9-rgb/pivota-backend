@@ -619,3 +619,40 @@ def test_stick_sku_unchanged_regression():
     assert graph["classes"]["format"] == ["stick"]
     assert any("collagen sticks" in q for q in lanes)
     assert not any("powder" in q or "tablet" in q for q in lanes)
+
+
+def test_attribute_graph_drops_promo_terms_from_all_classes():
+    """Regression: a promotional merchant tag ("skincare discount") leaked into
+    ``attribute_graph.use_case`` on the live DAMDAM audit and surfaced verbatim in
+    the merchant-facing brief ("...specific — sensitive skin, skincare discount,
+    ..."), which a DTC founder flagged as an outright bug. The same promo gate that
+    query generation uses must apply when the attribute graph is built, so promo
+    noise never becomes a product attribute in any class."""
+    from services.sku_sidewalk import build_sku_attribute_graph
+    from services.promo_terms import is_promo_term
+
+    product = {
+        "title": "Snow Mushroom Salt Cleanser",
+        "product_type": "cleanser",
+        "attributes_raw": {
+            # promo debris interleaved with real attributes and a merchandising label
+            "tags": [
+                "skincare discount",
+                "on sale",
+                "bestseller",
+                "sensitive skin",
+                "snow fungus",
+            ],
+        },
+    }
+    graph = build_sku_attribute_graph(product)
+
+    # The exact leak from the DAMDAM report is gone...
+    assert "skincare discount" not in (graph["classes"]["use_case"] or [])
+    # ...and no promo term survives in ANY class (single-chokepoint guarantee).
+    for class_name, attrs in graph["classes"].items():
+        for attr in attrs:
+            assert not is_promo_term(attr), (class_name, attr)
+
+    # Real, non-promo attributes that shared the tag list are untouched.
+    assert "sensitive skin" in (graph["classes"]["use_case"] or [])

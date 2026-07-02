@@ -98,6 +98,7 @@ from services.sku_lane_priority import (
     is_third_party_controlled_lane,
     lane_priority_sort_key,
 )
+from services.promo_terms import is_promo_term
 from services.sku_sidewalk import (
     build_sku_attribute_graph,
     generate_sidewalk_query_specs,
@@ -7746,60 +7747,10 @@ _PROMPT_TERM_STRIP_CHARS = " \t\r\n,.;:/\\\"'`[]{}<>()|*#~"
 # types "best moisturizer for skincare discount". PDP/marketing copy (topic tags,
 # bullets, merchant tags) routinely carries this debris, and once it interpolates
 # into a `best {category} for {term}` template it produces nonsense queries that
-# make the whole audit look broken (flagged live on the DAMDAM report). Drop it at
-# the source cleaner so it can never become a query axis term. Two match modes:
-#   - single-token stop set: unambiguous promo words, matched on word boundaries
-#     so real attributes are untouched ("sale" is dropped, "salicylic" is not);
-#   - multi-word phrases: matched as substrings of the collapsed term, so tokens
-#     that are legit alone but promo in context ("free shipping" vs "paraben
-#     free") are only rejected in the promo phrasing.
-_PROMO_STOP_TOKENS = frozenset({
-    "discount", "discounts", "discounted",
-    "sale", "sales",
-    "coupon", "coupons",
-    "promo", "promos", "promotion", "promotions", "promotional",
-    "clearance", "markdown", "markdowns", "blowout",
-    "bogo",
-    "voucher", "vouchers",
-    "rebate", "rebates",
-    "cashback",
-    "freebie", "freebies",
-    "giveaway", "giveaways", "sweepstakes",
-    "bestseller", "bestsellers",  # merchandising label, not an attribute
-    "clearout",
-})
-_PROMO_STOP_PHRASES = (
-    "% off",
-    "percent off",
-    "free shipping",
-    "free delivery",
-    "free gift",
-    "gift with purchase",
-    "buy one get one",
-    "on sale",
-    "flash sale",
-    "limited time",
-    "cash back",
-    "money back",
-    "best price",
-    "lowest price",
-    "shop now",
-    "add to cart",
-    "black friday",
-    "cyber monday",
-)
-
-
-def _is_promo_term(text: str) -> bool:
-    """True when a cleaned term is promotional/marketing noise rather than a
-    product attribute. `text` must already be lowercased and whitespace-collapsed
-    (as produced inside `_clean_prompt_term`)."""
-    if not text:
-        return False
-    if any(phrase in text for phrase in _PROMO_STOP_PHRASES):
-        return True
-    tokens = set(re.findall(r"[a-z0-9]+", text))
-    return bool(tokens & _PROMO_STOP_TOKENS)
+# make the whole audit look broken (flagged live on the DAMDAM report). The gate
+# lives in `services.promo_terms` so query generation here and attribute-graph
+# construction in `sku_sidewalk` share one stop list and can never drift apart.
+_is_promo_term = is_promo_term
 
 
 def _clean_prompt_term(value: Any) -> str:
