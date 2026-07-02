@@ -371,3 +371,22 @@ def test_refresh_failure_does_not_break_enrich(monkeypatch):
     res = asyncio.run(persist.enrich_and_persist_product("pk1", db=db))
     assert res["status"] == "ok"
     assert res["written"]["evidence_claims"] is True
+
+
+def _inci(*labels):
+    return [{"label": l, "source": "inci"} for l in labels]
+
+
+def test_filler_actives_excluded_from_contains_claims():
+    claims = persist._inci_substantiated_claims(_inci("Niacinamide", "Vitamin E", "Sunflower Oil"))
+    texts = [c["claim_text"] for c in claims]
+    assert "Contains Niacinamide" in texts
+    assert "Contains Vitamin E" not in texts   # filler excluded
+    assert "Contains Sunflower Oil" not in texts
+
+
+def test_filler_only_product_yields_no_claims():
+    # a product whose only INCI actives are filler produces NO substantiated claims
+    # -> it will not read as "has substantiated evidence"
+    claims = persist._inci_substantiated_claims(_inci("Vitamin E", "Jojoba Oil", "Shea Butter", "Trehalose"))
+    assert claims == []
