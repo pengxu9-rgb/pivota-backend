@@ -32,8 +32,8 @@ from models.catalog import (
 from services.catalog_sync_service import store_catalog_quote_snapshot
 from services.claim_safety import (
     CATEGORY_HAIRCARE,
-    normalize_claims,
     required_disclaimers_for_category,
+    substantiated_product_claims,
 )
 from services import haircare_attributes
 from services.beauty_enrichment import extract_key_actives, infer_concerns
@@ -390,13 +390,17 @@ async def _fetch_beauty_vertical_payload(product_key: str, sku_key: Optional[str
         )
     ]
 
+    # Serve gate (parity with the direct PDP route): the search surface must emit
+    # ONLY substantiated claims, never raw/unverified evidence — routed through the
+    # shared substantiated_product_claims filter so the two surfaces can't drift.
     evidence_raw = _json_dict(profile.get("evidence_profile"))
+    _substantiated = substantiated_product_claims(evidence_raw) if evidence_raw else []
     evidence_profile = (
         EvidenceProfile(
-            claims=normalize_claims(evidence_raw.get("claims")),
+            claims=_substantiated,
             review_state=str(evidence_raw.get("review_state") or "observed"),
         )
-        if evidence_raw
+        if _substantiated
         else None
     )
     category_kind = (profile.get("category_kind") or "").strip() or None

@@ -11,10 +11,43 @@ from services.claim_safety import (
     CATEGORY_SUPPLEMENT,
     FDA_DSHEA_DISCLAIMER_CODE,
     FDA_DSHEA_DISCLAIMER_TEXT,
+    SUBSTANTIATION_SUBSTANTIATED,
     SUBSTANTIATION_UNVERIFIED,
     normalize_claims,
     required_disclaimers_for_category,
+    substantiated_claims,
+    substantiated_product_claims,
 )
+
+
+_MIXED = {
+    "review_state": "observed",
+    "claims": [
+        {"claim_text": "Contains Niacinamide", "substantiation_status": "substantiated", "source_ref": "INCI"},
+        {"claim_text": "Reduces wrinkles overnight", "substantiation_status": "unverified"},
+        {"claim_text": "Flagged claim", "substantiation_status": "flagged"},
+    ],
+}
+
+
+def test_substantiated_product_claims_drops_unverified_and_flagged():
+    out = substantiated_product_claims(_MIXED)
+    assert [c.claim_text for c in out] == ["Contains Niacinamide"]
+    assert all(c.substantiation_status == SUBSTANTIATION_SUBSTANTIATED for c in out)
+
+
+def test_substantiated_claims_dict_form_matches_typed():
+    dicts = substantiated_claims(_MIXED)
+    typed = substantiated_product_claims(_MIXED)
+    # same set, dict vs ProductClaim — the two surfaces share one gate
+    assert [d["claim_text"] for d in dicts] == [c.claim_text for c in typed]
+
+
+def test_substantiated_gate_handles_json_string_and_empty():
+    import json as _json
+    assert [c.claim_text for c in substantiated_product_claims(_json.dumps(_MIXED))] == ["Contains Niacinamide"]
+    assert substantiated_product_claims(None) == []
+    assert substantiated_product_claims({"claims": [{"claim_text": "x", "substantiation_status": "unverified"}]}) == []
 
 
 def test_supplement_requires_fda_dshea_disclaimer():
