@@ -7,7 +7,9 @@ brief that names entities or lanes outside the evidence block.
 
 from __future__ import annotations
 
+import asyncio
 import json
+import logging
 import re
 from typing import Any, Dict, Iterable, List, Mapping, Optional, Set, Tuple
 from urllib.parse import urlparse
@@ -23,6 +25,8 @@ from services.buyer_path_controller_quality import (
 )
 from services.llm_synthesis import (
     LLMSynthesisError,
+    LLMSynthesisHTTPError,
+    MissingLLMKeyError,
     configured_key_for_provider,
     default_model_for_provider,
     normalize_provider,
@@ -35,6 +39,17 @@ from services.sku_lane_priority import (
     is_third_party_controlled_lane,
     prioritize_lanes,
 )
+
+logger = logging.getLogger(__name__)
+
+# Reliability knobs for the LLM ("mainline") brief. The deterministic brief is a
+# strictly worse merchant experience, so we retry transient provider failures with
+# backoff (a single blip must not drop the merchant to the deterministic template).
+# The content-attempt count / max tokens live in _STRATEGIC_BRIEF_MAX_ATTEMPTS /
+# _STRATEGIC_BRIEF_MAX_TOKENS below.
+_BRIEF_TRANSPORT_RETRIES = 3         # extra retries for a single transient provider blip
+_BRIEF_RETRY_BASE_DELAY_S = 0.5      # exponential backoff base for transient retries
+_RETRYABLE_HTTP_STATUS = {408, 409, 425, 429, 500, 502, 503, 504}
 
 _STRATEGIC_BRIEF_SYSTEM_PROMPT = """You are a senior D2C brand & growth strategist — the merchant's marketing director — writing the
 next-steps section of an AI-shopping-visibility audit. You make sharp, decisive calls a smart founder
@@ -112,9 +127,10 @@ CLAIM DISCIPLINE (do not let confident prose outrun the EVIDENCE — this is a t
   play, with only a light retrieval/schema layer. Do NOT invent discount depths, prices, savings percentages,
   review counts, retailer facts, or margin claims unless they appear in EVIDENCE.
 - AUTHORITY HONESTY: never promise that ChatGPT, Gemini, or any AI engine will cite, rank, or route to the
-  merchant page. Phrase the work as making the page more retrievable, extractable, citable, and authoritative
-  for the evidenced lane. Keep the materiality caveat: exposure is citation evidence, not proven buyer traffic,
-  until the lane is re-audited and verified.
+  merchant page. The work is making the page more retrievable, extractable, citable, and authoritative for the
+  evidenced lane — but to the merchant SAY THIS IN PLAIN WORDS ("easy for AI to find, quote, and trust"), never
+  the internal terms (see PLAIN LANGUAGE below). Keep the caveat: showing up in AI answers is citation evidence,
+  not proven buyer traffic, until the lane is re-audited and verified.
 - LANES: when you name a search lane or query, reuse the EXACT wording from EVIDENCE. Do not rephrase,
   singularize/pluralize, reorder, or coin a variant. (A positioning phrase for your brand is fine and separate
   — just don't present it as the searched lane.)
@@ -130,39 +146,70 @@ CLAIM DISCIPLINE (do not let confident prose outrun the EVIDENCE — this is a t
   output. Write a positioning read as a natural sentence ("incumbents look positioned as broad collagen, not a
   halal bedtime stick — worth confirming"), NOT as a caveat about what you may or may not claim. Never tell the
   merchant what you are or aren't allowed to say.
+- PLAIN LANGUAGE (write for a busy shop owner, not an SEO engineer): NEVER use the words "lane", "beachhead",
+  "wedge", "materiality", "controller", "canonical" (as a noun), or "vacuum" in the output. Say the plain thing
+  instead — a search query is the "'<query>' search" (quote the exact evidenced query); "the first beachhead
+  lane" → "the first search worth winning"; "verify materiality" → "check whether it's driving real buyer
+  traffic"; "who controls the lane" → "who currently owns that answer". Also NEVER write "retrievable" or
+  "extractable" to the merchant — say "easy for AI to find and quote". Expand PDP on first use ("your product
+  page").
+- NO FORMULA (this is the line between a bespoke memo and mail-merge — the merchant reads several of these briefs
+  back to back and WILL notice a repeated skeleton): NEVER use the "Stop chasing/Stop trying to win [broad]
+  … Instead, own/do …" construction ANYWHERE in core_decision — not as the opener, not mid-sentence, and not as
+  a variant ("Stop trying to win that broad query", "Stop chasing broad category queries", "don't fight the
+  broad search — instead…"). State the positive call directly instead of framing it as stop-this-then-do-that.
+  Likewise do NOT open your_angle with "Reframe from 'a X' to 'the Y'"; do NOT open substitution_play with
+  "When AI … hands the buyer to …. To win those buyers back, position…"; do NOT end first_moves with a
+  boilerplate "re-audit … before treating exposure as material" step. Lead every field with the ONE thing true only of THIS product — its specific angle, the exact competitor
+  AI named, or the exact source that controls the answer — and build the sentence around that fact, not around a
+  reusable frame. Vary sentence shape from field to field. Use each of these stock phrases AT MOST ONCE in the
+  whole brief and never as filler: "citable and buyable", "starter + replenishment bundle", "why-buy-direct
+  proof", "first-order offer". State the reasons to buy direct once, in plain words — never as a repeated
+  four-item list.
 
 WRITE the brief as JSON with these fields — each must be specific to THIS product and EVIDENCE:
-- position: one honest sentence on where they really stand (e.g. "niche challenger, strong when named,
-  invisible in the category").
-- core_decision: the ONE big strategic call, stated plainly and decisively (what to do, what to STOP doing,
-  and why — name the real reason from evidence).
-- why_you_lose: WHY the category winners win. READ category_answers (the AI's VERBATIM answers on the
-  category lanes) and synthesize: the specific winning PRODUCTS named (from recommends), the SOURCES that
-  rank them (from cited_sources), AND the category's winning ANGLE/claim that recurs across the answers
-  (e.g. a hair-oil category won on "bond repair / disulfide bonds"). Tie the moat to that angle ×
-  source authority/distribution. Only NAME products from recommends and sources from cited_sources/
-  grounding_notes (never invent others). Do not claim competitor feature gaps as fact; make any competitor
-  positioning read explicit inference.
-- your_angle: the defensible positioning wedge = the merchant's differentiating attributes that the named
-  product actually has. CRITICAL: if the winning ANGLE from category_answers is one the merchant's OWN
-  attributes already match (e.g. the product already claims "bond repair"), say so plainly — the wedge is
-  "you have the winning claim but aren't in the sources that rank it." Reframe from "a {category}" to a
-  category of one without saying winners lack those attributes as fact. Use exact EVIDENCE lane wording
-  where their differentiation IS the answer.
+- position: one honest sentence on where THIS product really stands, grounded in what the evidence shows for
+  this SKU. Do NOT reuse a stock label like "niche challenger, strong when named, invisible in the category".
+- core_decision: the ONE big strategic call for THIS product, stated plainly and decisively — the action and the
+  real reason from evidence (the specific product fact, the exact competitor AI named, or the exact source that
+  controls the answer that makes this the call). It may imply what to stop doing, but do NOT format it as a
+  "stop X, instead do Y" template — open with the product-specific reason, not the reusable verb frame. GOOD
+  (opens with the product-specific reason, no template): "Your shea-butter-and-green-tea butter is the only
+  thing in this category with real reviews behind it, so put those reviews on your own page and make it the
+  answer for the 'reviews hair butter treatment' search before spending anything on the crowded 'best hair mask'
+  question." BAD (template opener): "Stop chasing broad category queries… Instead, own the reviews lane first."
+- why_you_lose: WHY the category winners win. READ category_answers (the AI's VERBATIM answers on the category
+  lanes) and synthesize the specific winning PRODUCTS named (from recommends) and the SOURCES that rank them
+  (from cited_sources). The FACT is that those evidenced sources cite/rank the winners — attribute their
+  advantage to that SOURCE relationship ("Forbes lists them, which points to editorial authority the AI trusts"),
+  phrased as YOUR inference. Only NAME products from recommends and sources from cited_sources/grounding_notes
+  (never invent others). Do NOT state competitor product attributes, qualities, reviews, distribution, or
+  authority AS FACT, and do NOT claim competitor feature gaps. Describe the merchant's own absence plainly
+  ("your page is not cited there yet"), never as the merchant "lacking" or being "without" something.
+- your_angle: the defensible positioning = the merchant's differentiating attributes that the named product
+  actually has. CRITICAL: if the winning ANGLE from category_answers is one the merchant's OWN attributes already
+  match (e.g. the product already claims "bond repair"), say so plainly — the wedge is "you have the winning
+  claim but aren't in the sources that rank it." Position it as a specific product rather than a generic
+  {category} — without a fixed "reframe from 'a X' to 'the Y'" formula, and without saying winners lack those
+  attributes as fact. Use exact EVIDENCE query wording where their differentiation IS the answer.
 - traffic_strategy: a ranked list of where the missed, WINNABLE demand is + who controls each channel
   (name only sources/retailers/communities from grounding_notes.evidenced_channels) + the realistic path in.
   If no channel is evidenced for a lane, say to own your page/site first. Marketplace/community moves must be
   conditional ("if you already sell on <evidenced channel>..."). Explicitly say which big lanes to NOT chase
   yet and why.
 - substitution_play: if a substitution is present, how to win those buyers back (comparison/positioning vs
-  the named substitute), else null.
+  the named substitute), else null. Vary the phrasing per product — do NOT always open with "When AI … hands
+  the buyer to …".
 - first_moves: 3-5 concrete actions that EXECUTE the strategy above, in priority order, each tied to a
   strategic reason (not generic "add an FAQ" — "add the halal + bedtime story to your page so it is more
   citable for the lane you're claiming"). When EVIDENCE shows weak reseller/source-route exposure, at
   least one first move must name the exact lane and source-authority repair, using the mechanism order above
   and controller-type source route. When EVIDENCE shows credible retailer/marketplace competition, at least
   one first move must name the exact lane, listing fix, light retrieval/schema layer, and the operational reason
-  to buy from the merchant-controlled page (offer, bundle, subscription, or why-buy-direct proof).
+  to buy from the merchant-controlled page (offer, bundle, subscription, or why-buy-direct proof). Do NOT pad the
+  list to a fixed length or close every brief with the same "re-audit … before treating exposure as material"
+  step — include a re-measure step only when it is genuinely the most useful next action, phrased in this
+  product's own terms.
 - diy_vs_pivota: {self_serve:[2-3 merchant-owned moves], pivota:"one honest line on what only Pivota does
   — cited+buyable canonical page, serving, monitoring"}.   # the 70/30, honest, no cold-audit hard-sell"""
 
@@ -247,6 +294,9 @@ _DOMAIN_RE = re.compile(
     re.IGNORECASE,
 )
 _QUOTE_RE = re.compile(r"[\"'`“”‘’]([^\"'`“”‘’\n]{4,160})[\"'`“”‘’]")
+# Apostrophe inside a word (contraction/possessive: don't, publisher's, it's).
+# Stripped before quoted-lane scanning so it is not mistaken for a quote delimiter.
+_INTRAWORD_APOSTROPHE_RE = re.compile(r"(?<=\w)['’](?=\w)")
 _CAP_WORD = r"(?:[A-Z][A-Za-z0-9&'’-]*|[A-Z]{2,}|[A-Za-z]+[A-Z][A-Za-z0-9]*)"
 _PROPER_SEQUENCE_RE = re.compile(
     rf"\b{_CAP_WORD}(?:[ \t]+(?:of|the|for))*[ \t]+{_CAP_WORD}"
@@ -869,19 +919,23 @@ async def generate_sku_strategic_brief(
         or default_model_for_provider(selected_provider)
     )
     dbg["model"] = selected_model
-    system, user = build_sku_brief_prompt(evidence)
-    dbg["prompt_chars"] = len(system) + len(user)
+    system, base_user = build_sku_brief_prompt(evidence)
+    dbg["prompt_chars"] = len(system) + len(base_user)
     dbg["max_tokens"] = _STRATEGIC_BRIEF_MAX_TOKENS
     dbg["attempts"] = []
+    user = base_user
 
     # The grounding validator is deliberately strict (a trust product), so a
     # single LLM draft can trip it stochastically. Retry enough that a clean
     # draft is reliably found — the LLM lane must work continuously, not fall
-    # back to the generic deterministic template. A clean draft short-circuits.
+    # back to the generic deterministic template. On shape/grounding rejection we
+    # feed the model a targeted repair hint before the next attempt; transient
+    # provider blips are retried with backoff inside _synthesize_with_transport_retry.
+    best_grounded_brief: Optional[Dict[str, Any]] = None
     for _attempt in range(_STRATEGIC_BRIEF_MAX_ATTEMPTS):
         att: Dict[str, Any] = {}
         try:
-            result = await synthesize(
+            result = await _synthesize_with_transport_retry(
                 system=system,
                 user=user,
                 provider=selected_provider,
@@ -910,15 +964,217 @@ async def generate_sku_strategic_brief(
             if isinstance(brief, dict):
                 att["missing_keys"] = sorted(_REQUIRED_BRIEF_KEYS - set(brief.keys()))
             dbg["attempts"].append(att)
+            # Regenerate with a shape-repair hint instead of falling back.
+            user = f"{base_user}\n\n{_SHAPE_REPAIR_HINT}"
             continue
         gf = _grounding_failures(brief, evidence)
         att["grounding_failures"] = gf
+        if gf:
+            # Grounding is a hard gate (trust) — regenerate with the exact rules.
+            dbg["attempts"].append(att)
+            user = f"{base_user}\n\n{_grounding_repair_hint(gf)}"
+            continue
+        # Grounding-clean. Prefer a draft that is ALSO free of the banned
+        # "Stop trying to win …" opener / jargon the prompt can only *ask* for
+        # (temperature is non-zero, so the model still slips ~occasionally). A
+        # style slip is retried WITH a hint, but — unlike grounding — it must
+        # NEVER cost the merchant the LLM brief: a style-imperfect LLM draft
+        # (jargon then scrubbed deterministically) still beats the generic
+        # deterministic template, so we keep the first clean draft as a floor.
+        sf = _style_failures(brief)
+        if sf:
+            att["style_failures"] = sf
         dbg["attempts"].append(att)
-        if not gf:
+        if not sf:
             dbg["outcome"] = "llm"
-            return brief
+            return _scrub_merchant_jargon(brief)
+        if best_grounded_brief is None:
+            best_grounded_brief = brief
+        user = f"{base_user}\n\n{_grounding_repair_hint(sf)}"
+    if best_grounded_brief is not None:
+        # Exhausted retries but we DID get a grounded LLM draft — ship it (jargon
+        # scrubbed) rather than dropping the merchant to the deterministic brief.
+        dbg["outcome"] = "llm"
+        dbg["style_imperfect"] = True
+        return _scrub_merchant_jargon(best_grounded_brief)
     dbg["outcome"] = "deterministic_after_rejects"
     return _validated_deterministic_brief(evidence, dbg=dbg)
+
+
+def _is_retryable_synthesis_error(exc: LLMSynthesisError) -> bool:
+    """A transient provider failure worth retrying vs. a fatal one. Missing key,
+    unsupported provider, and 4xx (except throttling) are fatal — retrying just
+    wastes time and delays the deterministic fallback. Transport failures (no
+    status code) and 429/5xx are transient."""
+    if isinstance(exc, MissingLLMKeyError):
+        return False
+    if isinstance(exc, LLMSynthesisHTTPError):
+        if exc.status_code is None:
+            return True  # timeout / network / transport failure
+        return exc.status_code in _RETRYABLE_HTTP_STATUS
+    return False
+
+
+async def _synthesize_with_transport_retry(
+    *,
+    system: str,
+    user: str,
+    provider: str,
+    model: str,
+    max_tokens: int,
+) -> Dict[str, Any]:
+    """synthesize() with exponential-backoff retry on transient provider errors.
+    Raises the last error once retries are exhausted or the error is fatal."""
+    delay = _BRIEF_RETRY_BASE_DELAY_S
+    for transport_attempt in range(_BRIEF_TRANSPORT_RETRIES + 1):
+        try:
+            return await synthesize(
+                system=system,
+                user=user,
+                provider=provider,
+                model=model,
+                max_tokens=max_tokens,
+            )
+        except LLMSynthesisError as exc:
+            if (
+                _is_retryable_synthesis_error(exc)
+                and transport_attempt < _BRIEF_TRANSPORT_RETRIES
+            ):
+                logger.info(
+                    "strategic brief transient LLM error (%s), retry %d/%d after %.1fs",
+                    type(exc).__name__,
+                    transport_attempt + 1,
+                    _BRIEF_TRANSPORT_RETRIES,
+                    delay,
+                )
+                await asyncio.sleep(delay)
+                delay *= 2
+                continue
+            raise
+    # Unreachable: the loop either returns or re-raises on the last attempt.
+    raise LLMSynthesisError("synthesis retry loop exhausted", provider=provider)
+
+
+_SHAPE_REPAIR_HINT = (
+    "Your previous reply was not valid JSON with every required field. Reply with "
+    "ONLY a single JSON object containing exactly these keys: position, "
+    "core_decision, why_you_lose, your_angle, traffic_strategy, substitution_play, "
+    "first_moves, diy_vs_pivota. No prose outside the JSON."
+)
+
+# Style violations the prompt bans but a non-zero-temperature model still slips
+# into. Enforced deterministically via the same repair-retry loop as grounding.
+_FORMULAIC_OPENER_RE = re.compile(r"\bstop\s+(?:chasing|trying\s+to\s+win)\b", re.IGNORECASE)
+_MERCHANT_JARGON_RE = re.compile(r"\b(?:lane|lanes|beachhead|beachheads|materiality)\b", re.IGNORECASE)
+
+
+def _style_failures(brief: Mapping[str, Any]) -> List[str]:
+    """Flag banned merchant-facing style: the "Stop chasing/trying to win …"
+    template opener, and internal jargon words that must never reach a merchant."""
+    text = " ".join(_iter_leaf_text(brief))
+    failures: List[str] = []
+    if _FORMULAIC_OPENER_RE.search(text):
+        failures.append("style-formulaic-opener")
+    if _MERCHANT_JARGON_RE.search(text):
+        failures.append("style-jargon")
+    return failures
+
+
+_JARGON_SUBSTITUTIONS: Tuple[Tuple[re.Pattern, str], ...] = (
+    (re.compile(r"\blanes\b", re.IGNORECASE), "searches"),
+    (re.compile(r"\blane\b", re.IGNORECASE), "search"),
+    (re.compile(r"\bbeachheads\b", re.IGNORECASE), "first searches to win"),
+    (re.compile(r"\bbeachhead\b", re.IGNORECASE), "first search to win"),
+    (re.compile(r"\bmateriality\b", re.IGNORECASE), "real buyer traffic"),
+)
+
+
+def _scrub_merchant_jargon(brief: Optional[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
+    """Deterministically replace the internal jargon the prompt bans but the
+    model occasionally still emits (lane→search, etc.), so it never reaches the
+    merchant even when a retry could not coax a jargon-free draft. Structural
+    only — every replacement is a plain-language synonym, no facts change."""
+    if not isinstance(brief, dict):
+        return brief
+
+    def _scrub(value: Any) -> Any:
+        if isinstance(value, str):
+            for pattern, repl in _JARGON_SUBSTITUTIONS:
+                value = pattern.sub(repl, value)
+            return value
+        if isinstance(value, list):
+            return [_scrub(v) for v in value]
+        if isinstance(value, dict):
+            return {k: _scrub(v) for k, v in value.items()}
+        return value
+
+    return {k: _scrub(v) for k, v in brief.items()}
+
+
+# Map the internal grounding-failure codes to a plain corrective instruction so a
+# retry can fix the specific violation instead of dropping to the deterministic brief.
+_GROUNDING_REPAIR_RULES: Tuple[Tuple[str, str], ...] = (
+    ("style-formulaic-opener",
+     "Do NOT use a 'Stop chasing …' or 'Stop trying to win …' construction anywhere. "
+     "Open with the ONE fact true only of this product and state the positive move "
+     "directly, with no stop-this-then-do-that template."),
+    ("style-jargon",
+     "Do NOT use the words 'lane', 'beachhead', or 'materiality'. Say 'search' or "
+     "'the \"<query>\" search' instead of 'lane', and plain phrasing everywhere else."),
+    ("competitor-exclusive-claim",
+     "Do not use 'only' to say one brand/product/seller has or does something. "
+     "Rephrase without any exclusivity claim about the field."),
+    ("competitor-lack-claim",
+     "Do not use the words 'no', 'not', 'without', 'lacks', 'missing', or 'only' in "
+     "ANY sentence that names a competitor. If you need to note that the merchant is "
+     "absent, put it in a SEPARATE sentence that names no competitor (e.g. 'Your page "
+     "is not cited there yet.'). Never say a competitor lacks or is missing anything."),
+    ("unassessed-competitor-attribute",
+     "Do not attribute any feature, ingredient, quality, reviews, distribution, or "
+     "authority to a named competitor. Say only that the cited source lists/recommends "
+     "them; frame their advantage as YOUR inference about the source, not a stated fact."),
+    ("ungrounded-competitor-attribute",
+     "Do not attribute any feature, ingredient, quality, reviews, distribution, or "
+     "authority to a named competitor. Say only that the cited source lists/recommends "
+     "them; frame their advantage as YOUR inference about the source, not a stated fact."),
+    ("unknown-domain",
+     "Only name websites, retailers, publishers, or communities that appear verbatim "
+     "in the evidence. Remove any others."),
+    ("unknown-quoted-lane",
+     "Only put a search query in quotes if it appears verbatim in the evidence."),
+    ("safety-sensitive",
+     "Remove any unproven health, medical, or safety claim that is not in the evidence."),
+    ("overwide-controller-list",
+     "Name at most three sources in a single sentence."),
+    ("forbidden",
+     "Remove all numbers, prices, percentages, scores, '/100', and internal jargon "
+     "(retrievable, extractable, lane, materiality, controller, canonical, vacuum)."),
+)
+
+
+def _grounding_repair_hint(failures: List[str]) -> str:
+    """Build a targeted rewrite instruction from the grounding-failure codes."""
+    instructions: List[str] = []
+    seen: Set[str] = set()
+    for failure in failures:
+        code = str(failure).split(":", 1)[0]
+        for prefix, instruction in _GROUNDING_REPAIR_RULES:
+            if code.startswith(prefix) and instruction not in seen:
+                seen.add(instruction)
+                instructions.append(instruction)
+                break
+    if not instructions:
+        instructions.append(
+            "Only mention brands, products, sources, and search queries that appear "
+            "verbatim in the evidence."
+        )
+    bullet_list = "\n".join(f"- {line}" for line in instructions)
+    return (
+        "Your previous draft broke these grounding rules. Rewrite the full JSON "
+        "brief, fixing every one, and change nothing else:\n" + bullet_list
+    )
+
+
 
 
 def validate_grounding(brief: Mapping[str, Any], evidence: Mapping[str, Any]) -> bool:
@@ -1791,10 +2047,26 @@ def _deterministic_traffic_how(
     return default_how
 
 
+def _is_plausible_query(query: str) -> bool:
+    """Guard against a product description (or other long/label-prefixed blob)
+    leaking into a slot that expects a short search query. Real shopper queries
+    are short ("reviews hair mask / deep conditioning treatment"); a raw
+    description ("description a gentle scrub formulated with a natural exfoliator
+    …") is not, and must never be inlined verbatim into merchant-facing prose."""
+    q = _clean_str(query)
+    if not q:
+        return False
+    if len(q) > 90 or len(q.split()) > 12:
+        return False
+    if q.lower().startswith(("description ", "description:")):
+        return False
+    return True
+
+
 def _deterministic_wedge_decision(sideways_wedge: Mapping[str, Any]) -> str:
     beachhead = _as_mapping(sideways_wedge.get("recommended_beachhead_lane"))
     query = _clean_str(beachhead.get("query"))
-    if not query:
+    if not _is_plausible_query(query):
         return ""
     deferred = next(
         (
@@ -1806,13 +2078,13 @@ def _deterministic_wedge_decision(sideways_wedge: Mapping[str, Any]) -> str:
     )
     if deferred:
         return (
-            f"Start with {query} as the first beachhead and do not chase {deferred} "
-            "yet; the tighter lane is more product-specific and easier to turn into "
-            "the official more citable + buyable route."
+            f"Win the '{query}' search first and hold off on '{deferred}' for now — "
+            "the tighter search is more specific to this product, so your own page can "
+            "more easily become the one AI cites and buyers choose."
         )
     return (
-        f"Start with {query} as the first beachhead because it is product-specific "
-        "and already shows third-party-controlled demand."
+        f"Win the '{query}' search first — it is specific to this product and already "
+        "shows demand that other sites are capturing."
     )
 
 
@@ -1879,8 +2151,8 @@ def _low_signal_brief(evidence: Mapping[str, Any]) -> Dict[str, Any]:
             "this product."
         ),
         "your_angle": (
-            f"Use the evidenced product angle — {angle_terms} — as the reason {page_label} deserves "
-            "to be cited and bought from once it is complete and specific."
+            f"Lead with what makes this product specific — {angle_terms} — so that once "
+            f"{page_label} is complete, it is the page AI cites and buyers choose."
         ),
         "traffic_strategy": [],
         "substitution_play": None,
@@ -2010,9 +2282,9 @@ def _deterministic_brief(evidence: Mapping[str, Any]) -> Optional[Dict[str, Any]
             f"{controller_phrase}, not {destination}."
         )
         core_decision = (
-            f"Make {page_label} more retrievable, extractable, citable, and authoritative for "
-            f"{query}, then verify materiality; do not frame obscure cited hosts as a conversion "
-            "fight before the authority mechanism is in place."
+            f"Make {page_label} the page AI most easily finds, quotes, and trusts for the "
+            f"'{query}' search, then check whether it is driving real buyer traffic before "
+            "treating a few obscure cited sites as a lost sale."
         )
         why_you_lose = (
             f"AI's answers show {controller_phrase} shaping the citation trail for {query}. "
@@ -2036,9 +2308,9 @@ def _deterministic_brief(evidence: Mapping[str, Any]) -> Optional[Dict[str, Any]
             f"{controller_phrase}, not {destination}."
         )
         core_decision = (
-            f"Make {page_label} more retrievable, extractable, citable, and authoritative "
-            f"for {query}, then work the cited source trail by controller type with the "
-            "same facts."
+            f"Make {page_label} the page AI most easily finds, quotes, and trusts for the "
+            f"'{query}' search, then work with the sites AI already cites — keeping the "
+            "same facts everywhere."
         )
         why_you_lose = (
             f"AI's answers show {controller_phrase} shaping {query}. That suggests "
@@ -2062,9 +2334,9 @@ def _deterministic_brief(evidence: Mapping[str, Any]) -> Optional[Dict[str, Any]
             f"by {controller_phrase}, not {destination}."
         )
         core_decision = (
-            f"Make {page_label} the better place to buy for {query}; appearing in "
-            "AI answers is not the win until buyers have a reason to choose the "
-            "merchant-controlled path."
+            f"Make {page_label} the better place to buy for the '{query}' search — "
+            "showing up in AI answers is not the win until buyers have a reason to "
+            "choose your own site."
         )
         why_you_lose = (
             f"AI's answers show {controller_phrase} shaping {query}. That suggests "
@@ -2096,12 +2368,19 @@ def _deterministic_brief(evidence: Mapping[str, Any]) -> Optional[Dict[str, Any]
         deferred = defer_queries.get(item_query.lower())
         if isinstance(deferred, Mapping):
             beachhead = _as_mapping(sideways_wedge.get("recommended_beachhead_lane"))
-            beachhead_query = _clean_str(beachhead.get("query")) or query
-            how = (
-                f"Do not start here yet; use {beachhead_query} first because it is "
-                "more product-specific and easier to make the official page the best "
-                "more citable + buyable route."
-            )
+            beachhead_query = _clean_str(beachhead.get("query"))
+            if _is_plausible_query(beachhead_query):
+                how = (
+                    f"Do not start here yet — win the '{beachhead_query}' search first; "
+                    "it is more specific to this product, so your page can more easily "
+                    "become the best place AI can cite and buy from."
+                )
+            else:
+                how = (
+                    "Do not start here yet — win a more product-specific search first, "
+                    "so your page can more easily become the best place AI can cite and "
+                    "buy from."
+                )
         traffic_strategy.append({
             "where": item_query,
             "who_controls": _controller_phrase(
@@ -2122,8 +2401,8 @@ def _deterministic_brief(evidence: Mapping[str, Any]) -> Optional[Dict[str, Any]
         "core_decision": core_decision,
         "why_you_lose": why_you_lose,
         "your_angle": (
-            f"Use the evidenced product angle — {angle_terms} — as the reason the "
-            "merchant-controlled page deserves to be cited and bought from."
+            f"Lead with what makes this product specific — {angle_terms} — so your own "
+            "page is the one AI cites and buyers choose, not just another listing."
         ),
         "traffic_strategy": traffic_strategy,
         "substitution_play": _deterministic_substitution_play(evidence, page_label),
@@ -2147,9 +2426,11 @@ def _controller_phrase(controllers: List[Mapping[str, Any]]) -> str:
     ]
     hosts = _unique(host for host in hosts if host)
     if not hosts:
-        return "fragmented sources with no single site owning the lane"
+        return "fragmented sources with no single site owning the answer"
     if len(hosts) == 1:
         return hosts[0]
+    if len(hosts) == 2:
+        return f"{hosts[0]} and {hosts[1]}"
     return ", ".join(hosts[:-1]) + f", and {hosts[-1]}"
 
 
@@ -2166,6 +2447,8 @@ def _phrase_join(values: List[str], fallback: str) -> str:
         return fallback
     if len(cleaned) == 1:
         return cleaned[0]
+    if len(cleaned) == 2:
+        return f"{cleaned[0]} and {cleaned[1]}"
     return ", ".join(cleaned[:-1]) + f", and {cleaned[-1]}"
 
 
@@ -2240,7 +2523,15 @@ def _grounding_failures(
         ):
             failures.append(f"unknown-domain:{domain}")
 
-    for quote in _QUOTE_RE.findall(text):
+    # Neutralize intra-word apostrophes (contractions/possessives: "don't",
+    # "publisher's", "it's") before scanning for single-quoted lanes. Otherwise
+    # the apostrophe in a contraction pairs with a real lane's quote and
+    # fabricates a bogus "unknown-quoted-lane" failure — which silently rejects
+    # otherwise-grounded LLM briefs and forces the deterministic fallback. A real
+    # quoted lane's delimiters have a non-word char on the outer side, so they are
+    # untouched by this substitution.
+    quote_scan_text = _INTRAWORD_APOSTROPHE_RE.sub("", text)
+    for quote in _QUOTE_RE.findall(quote_scan_text):
         phrase = _norm_phrase(quote)
         if not phrase or len(phrase.split()) < 2:
             continue
