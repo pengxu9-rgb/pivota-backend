@@ -690,3 +690,87 @@ def test_attribute_graph_drops_operational_app_tags():
 
     # A real attribute that rode in the same tag list survives.
     assert any("pore care" in v for vs in graph["classes"].values() for v in vs)
+
+
+def _anuko_ko_product() -> Dict[str, Any]:
+    """The live ANUKO SKU as the Korean crawl actually stores it (all-Hangul
+    title / product_type / copy) — anukoofficial.com is an all-Korean
+    storefront. Audit run bfabfe9c (deployed e61581f5) came out generic because
+    the ASCII-only tokenizer stripped every Hangul character, so the graph
+    resolved zero attributes and no category."""
+    return {
+        "title": "아누코 루트 액티베이팅 탈모 볼륨 샴푸",
+        "product_type": "샴푸",
+        "attributes_raw": {
+            "tags": ["비건", "두피"],
+            "description": "탈모 케어 나이아신아마이드 두피 샴푸. 비건, 무향.",
+        },
+    }
+
+
+def test_korean_catalog_resolves_attributes_and_category():
+    """Regression for the i18n gap: an all-Korean SKU must resolve its category
+    and evidenced attributes (K-beauty head lexicon) instead of tokenizing to
+    nothing. Without this the strategic brief falls back to the literal
+    'the evidenced product attributes' and drops to a trust lane."""
+    from services.sku_sidewalk import (
+        build_sku_attribute_graph,
+        generate_sidewalk_query_specs,
+    )
+
+    product = _anuko_ko_product()
+    graph = build_sku_attribute_graph(product)
+    classes = graph["classes"]
+
+    assert classes["category"] == ["shampoo"]
+    assert "niacinamide" in classes["ingredient"]
+    assert "vegan" in classes["certification_constraint"]
+    assert "fragrance-free" in classes["certification_constraint"]
+
+    specs = generate_sidewalk_query_specs(
+        graph, title=product["title"], product_type=product["product_type"], n=6
+    )
+    queries = [spec["query"] for spec in specs]
+    assert queries, "Korean SKU should now yield category-lane sidewalk queries"
+    assert all("shampoo" in q for q in queries)
+    assert any("niacinamide" in q for q in queries)
+    # Every emitted query is still ASCII/English — Korean is normalized to the
+    # canonical English attribute, so downstream probing/rendering is unchanged.
+    assert all(q.isascii() for q in queries)
+
+
+def test_korean_and_english_serum_reach_parity():
+    """A Korean serum should resolve the same category/ingredient/cert lanes as
+    the English equivalent (serum was already in the lexicon, so the only thing
+    that differed was language)."""
+    from services.sku_sidewalk import build_sku_attribute_graph
+
+    ko = build_sku_attribute_graph(
+        {
+            "title": "글로우 비타민C 세럼",
+            "product_type": "세럼",
+            "attributes_raw": {
+                "tags": ["비건"],
+                "description": "나이아신아마이드 세럼. 비건, 무향.",
+            },
+        }
+    )["classes"]
+
+    assert ko["category"] == ["serum"]
+    assert "vitamin c" in ko["ingredient"]
+    assert "niacinamide" in ko["ingredient"]
+    assert "vegan" in ko["certification_constraint"]
+    assert "fragrance-free" in ko["certification_constraint"]
+
+
+def test_ascii_only_catalog_is_unaffected_by_cjk_tokenizer():
+    """Widening the tokenizer to preserve CJK must not change extraction for the
+    existing English catalog — guards the BB Lab collagen fixture end to end."""
+    from services.sku_sidewalk import build_sku_attribute_graph
+
+    classes = build_sku_attribute_graph(_bb_lab_product())["classes"]
+    assert "collagen" in classes["category"]
+    assert "stick" in classes["format"]
+    assert "fish collagen" in classes["ingredient"]
+    assert "halal" in classes["certification_constraint"]
+    assert "no water" in classes["exclusion"]
