@@ -83,8 +83,32 @@ def test_audit_intake_flag_defaults_off(monkeypatch):
     import services.audit_index_intake as intake
 
     monkeypatch.delenv("ENABLE_AUDIT_INDEX_INTAKE", raising=False)
+    monkeypatch.delenv("ENABLE_AUDIT_INDEX_INTAKE_MERCHANT_IDS", raising=False)
     assert intake.audit_intake_enabled() is False
     monkeypatch.setenv("ENABLE_AUDIT_INDEX_INTAKE", "yes")
+    assert intake.audit_intake_enabled() is True
+
+
+def test_audit_intake_per_merchant_canary_allowlist(monkeypatch):
+    import services.audit_index_intake as intake
+
+    monkeypatch.delenv("ENABLE_AUDIT_INDEX_INTAKE", raising=False)
+    monkeypatch.setenv("ENABLE_AUDIT_INDEX_INTAKE_MERCHANT_IDS", "m_canary, m_two")
+    # On for allowlisted merchants only — the safe prod canary.
+    assert intake.audit_intake_enabled("m_canary") is True
+    assert intake.audit_intake_enabled("m_two") is True
+    # Off for everyone else, and off when no merchant is supplied.
+    assert intake.audit_intake_enabled("m_other") is False
+    assert intake.audit_intake_enabled() is False
+
+
+def test_audit_intake_global_flag_overrides_allowlist(monkeypatch):
+    import services.audit_index_intake as intake
+
+    monkeypatch.setenv("ENABLE_AUDIT_INDEX_INTAKE", "true")
+    monkeypatch.delenv("ENABLE_AUDIT_INDEX_INTAKE_MERCHANT_IDS", raising=False)
+    # Graduation switch: on for all merchants regardless of the allowlist.
+    assert intake.audit_intake_enabled("anyone") is True
     assert intake.audit_intake_enabled() is True
 
 
