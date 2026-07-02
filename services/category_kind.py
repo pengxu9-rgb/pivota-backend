@@ -70,6 +70,41 @@ def _looks_like_supplement(text: str) -> bool:
     return False
 
 
+# Color-cosmetic (makeup) nouns. A product whose title/type names one of these is
+# makeup, NOT skincare/haircare -- even if an upstream path or ingest stamped it
+# skincare. Deliberately conservative: unambiguous color cosmetics only. Hybrids
+# (BB/CC cream, tinted moisturizer, primer, lip balm/treatment, makeup remover)
+# are intentionally EXCLUDED -- they carry real skincare function and must not be
+# demoted.
+_MAKEUP_RE = re.compile(
+    r"\b(?:foundation|concealer|eye\s?shadow|shadowstix|mascara|eye\s?liner|"
+    r"lipstick|lip\s+gloss|lip\s+liner|lip\s+stain|lip\s+crayon|lip\s+velvet|"
+    r"blush|bronzer|highlighter|setting\s+(?:powder|spray)|finishing\s+powder|"
+    r"pressed\s+powder|loose\s+powder|brow\s+(?:pencil|gel|pomade|powder|mascara)|"
+    r"eyebrow\s+(?:pencil|gel)|palette|colou?r\s+correct|kohl|kajal|"
+    r"match\s+stix|skinstick)\b",
+    re.IGNORECASE,
+)
+
+
+def is_makeup(
+    title: Optional[str] = None,
+    product_type: Optional[str] = None,
+    category: Optional[str] = None,
+    tags: Any = None,
+) -> bool:
+    """True when the product is a color cosmetic (makeup). Conservative positive
+    detection so it can safely demote a mis-stamped skincare/haircare row without
+    catching hybrid skincare-makeup (BB cream, tinted moisturizer, primer).
+
+    Matches on the TITLE only: in practice product_type/category are unreliable
+    (real skincare like "Firming-Lifting Cream" is stamped product_type='Bronzer'),
+    so trusting them would wrongly demote genuine skincare. The title is the
+    reliable signal — a foundation's title says foundation. (product_type/category
+    are accepted for API symmetry but not trusted for the makeup decision.)"""
+    return bool(_MAKEUP_RE.search(str(title or "").lower()))
+
+
 # Clearly-topical, non-ingestible beauty subcategories. A path under one of
 # these is never one of the three contract kinds, and must NOT fall through to
 # supplement text-detection (a makeup "stick" / setting "powder" is not a dose).
@@ -98,10 +133,15 @@ def resolve_category_kind(
     # Tolerate an exact subcategory-less path ("beauty/skincare") as well as a
     # nested one ("beauty/skincare/serum"); a trailing slash is insignificant.
     path = (category_path or "").strip().lower().rstrip("/")
-    if path == "beauty/skincare" or path.startswith("beauty/skincare/"):
-        return SKINCARE
-    if path == "beauty/haircare" or path.startswith("beauty/haircare/"):
-        return HAIRCARE
+    is_skin = path == "beauty/skincare" or path.startswith("beauty/skincare/")
+    is_hair = path == "beauty/haircare" or path.startswith("beauty/haircare/")
+    if is_skin or is_hair:
+        # Guard: a color cosmetic mis-pathed under skincare/haircare (a real
+        # occurrence — e.g. a foundation stamped skincare) is still makeup, not a
+        # contract kind. Prevents makeup from getting skincare claim-safety/framing.
+        if is_makeup(title=title, product_type=product_type, tags=tags):
+            return None
+        return SKINCARE if is_skin else HAIRCARE
     # An explicit supplement path is authoritative (e.g. a "beauty-supplements"
     # subcategory) -- recognized before the topical-beauty short-circuit so a
     # path literally naming supplements is never dropped to None.

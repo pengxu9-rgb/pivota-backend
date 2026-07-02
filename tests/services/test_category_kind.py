@@ -11,6 +11,7 @@ from services.category_kind import (
     HAIRCARE,
     SKINCARE,
     SUPPLEMENT,
+    is_makeup,
     resolve_category_kind,
 )
 
@@ -113,3 +114,36 @@ def test_unknown_returns_none_never_defaulted():
     assert resolve_category_kind() is None
     assert resolve_category_kind(title="Hydrating Serum") is None  # no path, no supplement signal
     assert resolve_category_kind(category_path="fashion/tops/tee") is None
+
+
+@pytest.mark.parametrize("title", [
+    "Pro Filt'r Soft Matte Powder Foundation",
+    "Killawatt Freestyle Highlighter",
+    "Shadowstix Longwear Eyeshadow Stick",
+    "Soft Radiance Setting Powder",
+    "Instant Retouch Concealer",
+    "Suede Powder Blush",
+    "Lengthening Mascara",
+])
+def test_is_makeup_positive(title):
+    assert is_makeup(title=title) is True
+
+
+@pytest.mark.parametrize("title", [
+    "Heartleaf 77% Soothing Toner",   # skincare
+    "Snail Mucin Essence",            # skincare
+    "BB Cream Natural Glow",          # hybrid — must NOT be flagged
+    "Tinted Moisturizer SPF 30",      # hybrid
+    "Hydrating Face Primer",          # primer — ambiguous, excluded
+    "Gentle Makeup Remover",          # cleansing, not color cosmetic
+    "Bond Repair Hair Oil",           # haircare
+])
+def test_is_makeup_negative(title):
+    assert is_makeup(title=title) is False
+
+
+def test_makeup_guard_demotes_mispathed_skincare():
+    # a foundation mis-pathed under skincare must NOT resolve to skincare...
+    assert resolve_category_kind(category_path="beauty/skincare/face", title="Matte Powder Foundation") is None
+    # ...but a real serum under the same path still resolves skincare
+    assert resolve_category_kind(category_path="beauty/skincare/face", title="Vitamin C Serum") == SKINCARE
