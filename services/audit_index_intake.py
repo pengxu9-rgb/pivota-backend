@@ -16,6 +16,7 @@ best-effort + flag-gated so it can never break a live audit.
 
 from __future__ import annotations
 
+import hashlib
 import logging
 import os
 from typing import Any, Dict, Optional
@@ -42,15 +43,29 @@ def _host(url: Optional[str]) -> str:
 
 
 def stable_source_id(pdp_url: Optional[str]) -> str:
-    """Stable source_product_id for a URL-sourced SKU: scheme/query/fragment
-    stripped, lowercased host+path. Re-auditing the same URL updates the SAME
-    row instead of duplicating it in the index."""
+    """Stable, URL-SAFE source_product_id for a URL-sourced SKU: scheme/query/
+    fragment/trailing-slash stripped + lowercased, then keyed as host + a short
+    hash of the path. Re-auditing the same URL yields the SAME id (dedup →
+    updates the same row).
+
+    Slash-free ON PURPOSE: this id flows into a URL PATH SEGMENT — both the
+    `/merchant/products/{platform}/{platform_product_id}/evidence` route and the
+    per-SKU report's pipe product_key (`merchant|url_audit|<id>`). A raw host+path
+    id contains '/', and the proxy/ASGI stack decodes %2F→/ before routing, so a
+    slashed id breaks single-segment matching → 404 (confirmed live). Hashing the
+    path (not `/`→`_`) keeps it collision-safe: source_product_id feeds the
+    product_key row identity, and an identity mis-merge is the index's worst
+    failure — a lossy substitution could merge two distinct products."""
     if not pdp_url:
         return ""
     parsed = urlparse(pdp_url.strip())
     host = _host(pdp_url)
     path = (parsed.path or "").rstrip("/").lower()
-    return f"{host}{path}" if host else pdp_url.strip().lower()
+    if not host:
+        return "url~" + hashlib.sha1(pdp_url.strip().lower().encode()).hexdigest()[:16]
+    if not path:
+        return host
+    return f"{host}~{hashlib.sha1(path.encode()).hexdigest()[:12]}"
 
 
 def _strip_html(html: Optional[str]) -> Optional[str]:

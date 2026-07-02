@@ -46,9 +46,20 @@ def test_stable_source_id_dedups_url_variants():
     # trailing slash, www, scheme, query, fragment all normalize to the same id
     a = stable_source_id("https://www.anua.com/products/heartleaf-toner/")
     b = stable_source_id("http://anua.com/products/heartleaf-toner?utm=x#reviews")
-    assert a == b == "anua.com/products/heartleaf-toner"
+    assert a == b
     # a different product is a different id
     assert stable_source_id("https://anua.com/products/cleanser") != a
+
+
+def test_stable_source_id_is_url_path_safe():
+    # The id flows into a URL path segment (evidence route + pipe product_key), so
+    # it must be slash-free — a '/' 404s via %2F decoding. Host stays readable.
+    sid = stable_source_id("https://www.anua.com/en/products/heartleaf-toner")
+    assert "/" not in sid
+    assert sid.startswith("anua.com~")
+    # encodeURIComponent-safe chars only (unreserved: alnum - . _ ~)
+    import re
+    assert re.fullmatch(r"[A-Za-z0-9._~-]+", sid)
 
 
 def test_requires_title_and_url_identity():
