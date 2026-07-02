@@ -7742,6 +7742,65 @@ def _dedupe_query_specs(specs: List[Tuple[str, str]]) -> List[Tuple[str, str]]:
 # debris from both ends and drop anything that collapses to a fragment.
 _PROMPT_TERM_STRIP_CHARS = " \t\r\n,.;:/\\\"'`[]{}<>()|*#~"
 
+# Promotional / marketing-noise terms are NOT product attributes — no shopper
+# types "best moisturizer for skincare discount". PDP/marketing copy (topic tags,
+# bullets, merchant tags) routinely carries this debris, and once it interpolates
+# into a `best {category} for {term}` template it produces nonsense queries that
+# make the whole audit look broken (flagged live on the DAMDAM report). Drop it at
+# the source cleaner so it can never become a query axis term. Two match modes:
+#   - single-token stop set: unambiguous promo words, matched on word boundaries
+#     so real attributes are untouched ("sale" is dropped, "salicylic" is not);
+#   - multi-word phrases: matched as substrings of the collapsed term, so tokens
+#     that are legit alone but promo in context ("free shipping" vs "paraben
+#     free") are only rejected in the promo phrasing.
+_PROMO_STOP_TOKENS = frozenset({
+    "discount", "discounts", "discounted",
+    "sale", "sales",
+    "coupon", "coupons",
+    "promo", "promos", "promotion", "promotions", "promotional",
+    "clearance", "markdown", "markdowns", "blowout",
+    "bogo",
+    "voucher", "vouchers",
+    "rebate", "rebates",
+    "cashback",
+    "freebie", "freebies",
+    "giveaway", "giveaways", "sweepstakes",
+    "bestseller", "bestsellers",  # merchandising label, not an attribute
+    "clearout",
+})
+_PROMO_STOP_PHRASES = (
+    "% off",
+    "percent off",
+    "free shipping",
+    "free delivery",
+    "free gift",
+    "gift with purchase",
+    "buy one get one",
+    "on sale",
+    "flash sale",
+    "limited time",
+    "cash back",
+    "money back",
+    "best price",
+    "lowest price",
+    "shop now",
+    "add to cart",
+    "black friday",
+    "cyber monday",
+)
+
+
+def _is_promo_term(text: str) -> bool:
+    """True when a cleaned term is promotional/marketing noise rather than a
+    product attribute. `text` must already be lowercased and whitespace-collapsed
+    (as produced inside `_clean_prompt_term`)."""
+    if not text:
+        return False
+    if any(phrase in text for phrase in _PROMO_STOP_PHRASES):
+        return True
+    tokens = set(re.findall(r"[a-z0-9]+", text))
+    return bool(tokens & _PROMO_STOP_TOKENS)
+
 
 def _clean_prompt_term(value: Any) -> str:
     text = re.sub(r"\s+", " ", str(value or "").strip().lower())
@@ -7749,6 +7808,10 @@ def _clean_prompt_term(value: Any) -> str:
     # A token with no real word content (a lone bracket/quote) or a single stray
     # character is not a shopper term — emitting it leaks a query fragment.
     if len(text) < 2 or not re.search(r"[a-z0-9]", text):
+        return ""
+    # A promo/discount/marketing term is not a shopper attribute — dropping it
+    # here keeps it out of every query template (topics, bullets, attributes).
+    if _is_promo_term(text):
         return ""
     return text
 
