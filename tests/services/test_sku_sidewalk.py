@@ -656,3 +656,37 @@ def test_attribute_graph_drops_promo_terms_from_all_classes():
 
     # Real, non-promo attributes that shared the tag list are untouched.
     assert "sensitive skin" in (graph["classes"]["use_case"] or [])
+
+
+def test_attribute_graph_drops_operational_app_tags():
+    """Regression: DAMDAM's PORE CARE RITUAL carried the Shopify tag
+    ``exclude_rebuy`` (a Rebuy-upsell-app directive). Live, it became the query
+    "best set for rebuy exclude" AND cascaded into a fabricated competitor
+    ("AI names Rebuy, not your product", citing rebuyengine.com). Storefront-app
+    / catalog-state tags must never become attributes — filtered at the same
+    single chokepoint as promo noise."""
+    from services.sku_sidewalk import build_sku_attribute_graph
+    from services.promo_terms import is_promo_term
+
+    product = {
+        "title": "Pore Care Ritual",
+        "product_type": "set",
+        "attributes_raw": {
+            "tags": [
+                "exclude_rebuy",  # the exact live leak
+                "rebuy exclude",
+                "yotpo",
+                "preorder",
+                "pore care",  # real attribute sharing the tag list
+            ],
+        },
+    }
+    graph = build_sku_attribute_graph(product)
+
+    for class_name, attrs in graph["classes"].items():
+        for attr in attrs:
+            assert not is_promo_term(attr), (class_name, attr)
+            assert "rebuy" not in attr and "yotpo" not in attr, (class_name, attr)
+
+    # A real attribute that rode in the same tag list survives.
+    assert any("pore care" in v for vs in graph["classes"].values() for v in vs)
