@@ -1241,7 +1241,7 @@ async def _seed_url_audit_index(
             upsert_audited_sku_to_index,
         )
 
-        if not audit_intake_enabled():
+        if not audit_intake_enabled(merchant_id):
             return
     except Exception as exc:  # noqa: BLE001 — import/flag must never break the audit
         logger.warning(

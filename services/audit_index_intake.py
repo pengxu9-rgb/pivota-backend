@@ -179,13 +179,32 @@ def resolve_seed_vendor(
     return fallback or None
 
 
-def audit_intake_enabled() -> bool:
-    """Flag: auto-seed the commerce index from audits. Default OFF — ships dark,
-    enabled per-env after canary. (The upsert is best-effort regardless, so it
-    can never break an audit; the flag governs whether we attempt it at all.)"""
-    return os.getenv("ENABLE_AUDIT_INDEX_INTAKE", "").strip().lower() in {
+def audit_intake_enabled(merchant_id: Optional[str] = None) -> bool:
+    """Flag: auto-seed the commerce index from audits. Default OFF — ships dark.
+
+    Canary-first (mirrors quote_first_enforcement's allowlist pattern):
+      1. ENABLE_AUDIT_INDEX_INTAKE_MERCHANT_IDS — CSV allowlist; on for JUST those
+         merchants (the safe prod canary — a global flag would seed EVERY
+         merchant's URL audits at once).
+      2. ENABLE_AUDIT_INDEX_INTAKE — boolean; on for ALL merchants (graduation).
+
+    The seed write (audit_run_worker) and the report's evidence-attachable key
+    (agent_center_bd_report_service) call this with the SAME merchant_id, so they
+    agree per-merchant. (The upsert is best-effort regardless, so this only
+    governs whether we attempt it — it can never break an audit.)"""
+    if os.getenv("ENABLE_AUDIT_INDEX_INTAKE", "").strip().lower() in {
         "1", "true", "yes", "on",
-    }
+    }:
+        return True
+    if merchant_id:
+        allowlist = {
+            m.strip()
+            for m in os.getenv("ENABLE_AUDIT_INDEX_INTAKE_MERCHANT_IDS", "").split(",")
+            if m.strip()
+        }
+        if str(merchant_id) in allowlist:
+            return True
+    return False
 
 
 # Only the columns we set; everything else (catalog_track, truth_tier,

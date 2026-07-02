@@ -6203,7 +6203,7 @@ def _url_audit_seed_report_identity(
         from services.catalog_identity import make_content_key
     except Exception:  # noqa: BLE001 — never break report assembly on import
         return None, None
-    if not merchant_id or not audit_intake_enabled():
+    if not merchant_id or not audit_intake_enabled(merchant_id):
         return None, None
     seed_url = str((product or {}).get("canonical_url") or "").strip() or None
     source_id = stable_source_id(seed_url) if seed_url else None
