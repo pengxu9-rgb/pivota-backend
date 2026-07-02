@@ -225,6 +225,30 @@ def test_get_agent_pdp_by_content_key_returns_modules_envelope(monkeypatch) -> N
     assert "ips.serving_eligible = TRUE" in db.calls[0]["query"]
 
 
+def test_get_agent_pdp_emits_citable_canonical_url(monkeypatch) -> None:
+    # An agent grounding on this product needs a URL to attribute; the API must
+    # emit the Pivota canonical PDP URL (parity with the crawlable page/JSON-LD).
+    client, _ = _client(monkeypatch, [_row()])
+
+    product = _canonical_product(client.get(f"/api/agent/pdp/{CK_A}").json())
+
+    expected = f"https://agent.pivota.cc/products/{SIG_A}"
+    assert product["pivota_canonical_url"] == expected
+    assert product["url"] == expected
+
+
+def test_get_agent_pdp_omits_canonical_url_when_no_signature(monkeypatch) -> None:
+    # No minted signature → no citable Pivota page → don't fabricate a URL.
+    client, _ = _client(
+        monkeypatch, [_row(content_key=CK_B, pivota_signature_id=None)]
+    )
+
+    product = _canonical_product(client.get(f"/api/agent/pdp/{CK_B}").json())
+
+    assert "pivota_canonical_url" not in product
+    assert "url" not in product
+
+
 def test_get_agent_pdp_by_content_key_returns_when_serving_eligible(monkeypatch) -> None:
     client, db = _client(
         monkeypatch,
