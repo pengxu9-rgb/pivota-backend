@@ -1,10 +1,19 @@
-"""Shared promo/marketing-term detection for the audit pipeline.
+"""Shared non-attribute merchant-noise detection for the audit pipeline.
 
-A promotional term ("skincare discount", "free shipping", "20% off") is
-merchandising noise, never a product attribute. When such a term leaks into the
-SKU attribute graph or a generated query axis it produces trust-killing,
-merchant-facing nonsense like "best moisturizer for skincare discount". This
-module is the single source of truth for that gate so query generation
+Some strings ride in on merchant tags / PDP copy but are NEVER product
+attributes, and when one leaks into the SKU attribute graph or a generated query
+axis it produces trust-killing, merchant-facing nonsense. Two families:
+
+  - promotional/marketing terms ("skincare discount", "free shipping", "20% off")
+    -> "best moisturizer for skincare discount";
+  - operational / storefront-app tags ("exclude_rebuy", "yotpo", "preorder") --
+    directives for Shopify apps, never something a shopper searches. DAMDAM's
+    PORE CARE RITUAL carried the tag `exclude_rebuy` (tells the Rebuy upsell app
+    to skip the product); it became the query "best set for rebuy exclude" AND
+    cascaded into a fabricated competitor ("AI names Rebuy, not your product",
+    citing rebuyengine.com). Flagged live on the DAMDAM report.
+
+This module is the single source of truth for that gate so query generation
 (`agent_center_bd_report_service._clean_prompt_term`) and attribute-graph
 construction (`sku_sidewalk._add_attr`) can never drift apart.
 
@@ -61,14 +70,41 @@ PROMO_STOP_PHRASES = (
     "cyber monday",
 )
 
+# Operational / storefront-app tags: unambiguous system directives and app names
+# that leak in as merchant product tags but are never product attributes. Kept
+# narrow and collision-free — every token here would be nonsense as a standalone
+# shopper term ("exclude" survives "excludes"/"exclusive"; app names are unique).
+OPERATIONAL_STOP_TOKENS = frozenset({
+    # storefront-app directives / names
+    "rebuy", "rebuyengine",
+    "loox", "yotpo", "judgeme", "okendo", "gorgias", "klaviyo", "stamped",
+    # visibility / catalog-state directives
+    "exclude", "excluded",
+    "unpublished", "noindex",
+    "preorder", "preorders", "preorderable",
+    "backorder", "backorders", "backordered",
+})
+OPERATIONAL_STOP_PHRASES = (
+    "exclude from",
+    "hide from search",
+    "back in stock",
+    "out of stock",
+    "gift card",
+    "gift cards",
+)
+
+_ALL_STOP_TOKENS = PROMO_STOP_TOKENS | OPERATIONAL_STOP_TOKENS
+_ALL_STOP_PHRASES = PROMO_STOP_PHRASES + OPERATIONAL_STOP_PHRASES
+
 
 def is_promo_term(text: str) -> bool:
-    """True when a cleaned term is promotional/marketing noise rather than a
-    product attribute. `text` must already be lowercased and whitespace-collapsed
-    (as produced by `_clean_prompt_term` or `sku_sidewalk._clean_attr`)."""
+    """True when a cleaned term is promotional/marketing OR operational-app noise
+    rather than a product attribute. `text` must already be lowercased and
+    whitespace-collapsed (as produced by `_clean_prompt_term` or
+    `sku_sidewalk._clean_attr`)."""
     if not text:
         return False
-    if any(phrase in text for phrase in PROMO_STOP_PHRASES):
+    if any(phrase in text for phrase in _ALL_STOP_PHRASES):
         return True
     tokens = set(re.findall(r"[a-z0-9]+", text))
-    return bool(tokens & PROMO_STOP_TOKENS)
+    return bool(tokens & _ALL_STOP_TOKENS)
