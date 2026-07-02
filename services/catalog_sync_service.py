@@ -1484,6 +1484,35 @@ async def ingest_standard_products(
                     "error": str(exc),
                 })
 
+            # Reap the stale agent_pdp_view row when this product was RE-KEYED:
+            # content_key = make_content_key(brand, title, barcode) and a changed
+            # title/barcode moves catalog_products to the new content_key in place.
+            # Without this, the OLD content_key's view row is orphaned and keeps
+            # squatting on the still-live pivota_signature_id (a latent
+            # /products/sig_* mis-serve + it blocks the live row from materializing).
+            # Ordered AFTER the new-key refresh so the live row exists first.
+            # Best-effort: the view is a cache; a reap failure must not break ingest.
+            old_content_key = (
+                dict(existing_product).get("content_key") if existing_product else None
+            )
+            if old_content_key and old_content_key != content_key:
+                try:
+                    from services.agent_pdp_view_assembler import (
+                        delete_agent_pdp_view_if_orphaned,
+                    )
+
+                    await delete_agent_pdp_view_if_orphaned(
+                        old_content_key, db=database
+                    )
+                except Exception as exc:  # noqa: BLE001
+                    logger.warning({
+                        "event": "agent_pdp_view_orphan_reap_failed",
+                        "site": "ingest_standard_products",
+                        "old_content_key": old_content_key,
+                        "new_content_key": content_key,
+                        "error": str(exc),
+                    })
+
             try:
                 from services.index_pipeline_state_service import recompute_serving_eligibility
 

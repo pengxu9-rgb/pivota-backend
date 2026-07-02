@@ -1069,6 +1069,123 @@ async def refresh_agent_pdp_view_for_content_key(
     return True
 
 
+# ---------------------------------------------------------------------
+# Orphan reaper — agent_pdp_view rows whose content_key vanished
+# ---------------------------------------------------------------------
+#
+# agent_pdp_view is keyed by content_key and kept fresh with UPSERT-on-content_key.
+# But content_key = make_content_key(brand, title, gtin) is derived from MUTABLE
+# fields: when a merchant re-syncs a product whose title or barcode changed, the
+# catalog_products row is re-keyed to the NEW content_key in place — and nothing
+# ever deletes the OLD content_key's agent_pdp_view row. It becomes an orphan:
+# unreachable by content_key, yet it keeps its pivota_signature_id. Because sig is
+# merchant-scoped and now belongs to the row under the NEW content_key, the unique
+# sig index blocks the live row from materializing, AND a /products/sig_* lookup
+# can resolve to the DEAD orphan instead of the live product. Reaping orphans fixes
+# both: it clears the latent mis-serve and frees the sig for the live row.
+#
+# "Orphaned" is defined conservatively as: an agent_pdp_view row whose content_key
+# has NO catalog_products row referencing it. That NOT-EXISTS guard means a
+# content_key still shared by another merchant/path (the legitimate multi-seller
+# case) is never reaped.
+
+_DELETE_ORPHAN_IF_UNREFERENCED_SQL = """
+    DELETE FROM agent_pdp_view av
+    WHERE av.content_key = :content_key
+      AND NOT EXISTS (
+        SELECT 1 FROM catalog_products cp WHERE cp.content_key = :content_key
+      )
+"""
+
+
+async def delete_agent_pdp_view_if_orphaned(content_key: str, *, db: Any = None) -> bool:
+    """Delete the agent_pdp_view row for `content_key` IFF it is orphaned — no
+    catalog_products row references it any more. No-op when the content_key is still
+    live (shared by another merchant/path) or has no view row. Safe to call on every
+    re-key; the DELETE re-checks NOT EXISTS so it can never remove a live row.
+
+    Returns True when a row was deleted, False otherwise.
+    """
+    if not content_key:
+        return False
+    read_db = db or database
+    was_orphan = await read_db.fetch_val(
+        """
+        SELECT EXISTS (SELECT 1 FROM agent_pdp_view WHERE content_key = :ck)
+           AND NOT EXISTS (SELECT 1 FROM catalog_products WHERE content_key = :ck)
+        """,
+        {"ck": content_key},
+    )
+    if not was_orphan:
+        return False
+    await read_db.execute(_DELETE_ORPHAN_IF_UNREFERENCED_SQL, {"content_key": content_key})
+    logger.info(
+        {"event": "agent_pdp_view_orphan_reaped", "content_key": content_key}
+    )
+    return True
+
+
+async def reap_orphaned_agent_pdp_view_rows(
+    *,
+    db: Any = None,
+    limit: Optional[int] = None,
+    dry_run: bool = False,
+) -> Dict[str, Any]:
+    """Sweep + delete ALL orphaned agent_pdp_view rows (content_key absent from
+    catalog_products). This is the catch-all for every re-key site — not just
+    catalog_sync — and the belt-and-suspenders backstop for the inline reap.
+
+    Deletes regardless of whether the orphan still carries an evidence_profile: an
+    orphan is unreachable by content_key and its evidence cannot be regenerated for
+    a content_key nothing resolves to (the live product under the new content_key
+    keeps its own evidence). `with_evidence` is surfaced for visibility since a
+    non-zero value is unusual and worth noticing.
+
+    Returns {"orphans", "with_evidence", "deleted", "sample"}. When dry_run, reports
+    without deleting.
+    """
+    read_db = db or database
+    limit_clause = " LIMIT :limit" if limit and int(limit) > 0 else ""
+    params = {"limit": int(limit)} if limit and int(limit) > 0 else {}
+    rows = await read_db.fetch_all(
+        """
+        SELECT av.content_key, av.pivota_signature_id, av.title,
+               av.refresh_source, (av.evidence_profile IS NOT NULL) AS has_evidence
+        FROM agent_pdp_view av
+        WHERE NOT EXISTS (
+            SELECT 1 FROM catalog_products cp WHERE cp.content_key = av.content_key
+        )
+        ORDER BY av.refreshed_at ASC
+        """ + limit_clause,
+        params,
+    )
+    orphans = [dict(r) for r in rows]
+    with_evidence = sum(1 for r in orphans if r.get("has_evidence"))
+    deleted = 0
+    if not dry_run:
+        # Per-row guarded delete (re-checks NOT EXISTS). Orphan counts are small and
+        # this reuses the single-row invariant, so no fragile array binding.
+        for r in orphans:
+            await read_db.execute(
+                _DELETE_ORPHAN_IF_UNREFERENCED_SQL, {"content_key": r["content_key"]}
+            )
+            deleted += 1
+    if orphans:
+        logger.info({
+            "event": "agent_pdp_view_orphan_sweep",
+            "orphans": len(orphans),
+            "with_evidence": with_evidence,
+            "deleted": deleted,
+            "dry_run": dry_run,
+        })
+    return {
+        "orphans": len(orphans),
+        "with_evidence": with_evidence,
+        "deleted": deleted,
+        "sample": orphans[:10],
+    }
+
+
 def _propagate_enrichment_on_write_enabled() -> bool:
     """Canary flag for write-triggered enrichment propagation (B①).
 
