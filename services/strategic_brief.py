@@ -931,6 +931,7 @@ async def generate_sku_strategic_brief(
     # back to the generic deterministic template. On shape/grounding rejection we
     # feed the model a targeted repair hint before the next attempt; transient
     # provider blips are retried with backoff inside _synthesize_with_transport_retry.
+    best_grounded_brief: Optional[Dict[str, Any]] = None
     for _attempt in range(_STRATEGIC_BRIEF_MAX_ATTEMPTS):
         att: Dict[str, Any] = {}
         try:
@@ -967,22 +968,35 @@ async def generate_sku_strategic_brief(
             user = f"{base_user}\n\n{_SHAPE_REPAIR_HINT}"
             continue
         gf = _grounding_failures(brief, evidence)
-        # Deterministically enforce the anti-formulaic / plain-language rules the
-        # prompt can only *ask* for (temperature is non-zero, so the model still
-        # slips into "Stop trying to win …" or leaks jargon ~occasionally). A
-        # style violation is retried with a repair hint exactly like a grounding
-        # failure, so the merchant never sees the banned opener/jargon.
-        sf = _style_failures(brief)
         att["grounding_failures"] = gf
+        if gf:
+            # Grounding is a hard gate (trust) — regenerate with the exact rules.
+            dbg["attempts"].append(att)
+            user = f"{base_user}\n\n{_grounding_repair_hint(gf)}"
+            continue
+        # Grounding-clean. Prefer a draft that is ALSO free of the banned
+        # "Stop trying to win …" opener / jargon the prompt can only *ask* for
+        # (temperature is non-zero, so the model still slips ~occasionally). A
+        # style slip is retried WITH a hint, but — unlike grounding — it must
+        # NEVER cost the merchant the LLM brief: a style-imperfect LLM draft
+        # (jargon then scrubbed deterministically) still beats the generic
+        # deterministic template, so we keep the first clean draft as a floor.
+        sf = _style_failures(brief)
         if sf:
             att["style_failures"] = sf
         dbg["attempts"].append(att)
-        if not gf and not sf:
+        if not sf:
             dbg["outcome"] = "llm"
-            return brief
-        # Grounding/style rejected the draft — feed the model the exact violated
-        # rules so the next attempt lands the mainline brief rather than falling back.
-        user = f"{base_user}\n\n{_grounding_repair_hint(gf + sf)}"
+            return _scrub_merchant_jargon(brief)
+        if best_grounded_brief is None:
+            best_grounded_brief = brief
+        user = f"{base_user}\n\n{_grounding_repair_hint(sf)}"
+    if best_grounded_brief is not None:
+        # Exhausted retries but we DID get a grounded LLM draft — ship it (jargon
+        # scrubbed) rather than dropping the merchant to the deterministic brief.
+        dbg["outcome"] = "llm"
+        dbg["style_imperfect"] = True
+        return _scrub_merchant_jargon(best_grounded_brief)
     dbg["outcome"] = "deterministic_after_rejects"
     return _validated_deterministic_brief(evidence, dbg=dbg)
 
@@ -1064,6 +1078,37 @@ def _style_failures(brief: Mapping[str, Any]) -> List[str]:
     if _MERCHANT_JARGON_RE.search(text):
         failures.append("style-jargon")
     return failures
+
+
+_JARGON_SUBSTITUTIONS: Tuple[Tuple[re.Pattern, str], ...] = (
+    (re.compile(r"\blanes\b", re.IGNORECASE), "searches"),
+    (re.compile(r"\blane\b", re.IGNORECASE), "search"),
+    (re.compile(r"\bbeachheads\b", re.IGNORECASE), "first searches to win"),
+    (re.compile(r"\bbeachhead\b", re.IGNORECASE), "first search to win"),
+    (re.compile(r"\bmateriality\b", re.IGNORECASE), "real buyer traffic"),
+)
+
+
+def _scrub_merchant_jargon(brief: Optional[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
+    """Deterministically replace the internal jargon the prompt bans but the
+    model occasionally still emits (lane→search, etc.), so it never reaches the
+    merchant even when a retry could not coax a jargon-free draft. Structural
+    only — every replacement is a plain-language synonym, no facts change."""
+    if not isinstance(brief, dict):
+        return brief
+
+    def _scrub(value: Any) -> Any:
+        if isinstance(value, str):
+            for pattern, repl in _JARGON_SUBSTITUTIONS:
+                value = pattern.sub(repl, value)
+            return value
+        if isinstance(value, list):
+            return [_scrub(v) for v in value]
+        if isinstance(value, dict):
+            return {k: _scrub(v) for k, v in value.items()}
+        return value
+
+    return {k: _scrub(v) for k, v in brief.items()}
 
 
 # Map the internal grounding-failure codes to a plain corrective instruction so a
