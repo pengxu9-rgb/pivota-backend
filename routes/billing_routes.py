@@ -253,6 +253,26 @@ async def handle_stripe_billing_webhook(
 
     logger.info("Received Stripe billing webhook: %s event_id=%s", event_type, event_id)
 
+    # Livemode gate: in production, refuse test-mode events. A test-mode endpoint
+    # secret that happens to verify (or a test-clock / smoke-test harness) must
+    # not be able to mutate live billing state. `livemode` is part of the signed
+    # event. Mirrors the order/PSP webhook guard in webhook_routes.py.
+    is_prod_env = (
+        os.getenv("ENVIRONMENT", "").lower() == "production"
+        or os.getenv("RAILWAY_ENVIRONMENT", "").lower() == "production"
+    )
+    if is_prod_env and event.get("livemode") is False:
+        logger.warning(
+            "Ignoring test-mode Stripe billing webhook (livemode=false) in production: type=%s event_id=%s",
+            event_type,
+            event_id,
+        )
+        await _mark_event_ignored(event_id, database)
+        return JSONResponse(
+            {"status": "ignored", "reason": "test_mode_event_in_production"},
+            status_code=200,
+        )
+
     if event_type == "checkout.session.completed":
         await _handle_checkout_session_completed(event, database)
     elif event_type == "customer.subscription.updated":
@@ -1189,31 +1209,48 @@ async def _lookup_subscription_plan(
     *,
     stripe_price_id: Optional[str],
     stripe_product_id: Optional[str],
+    mode: Optional[str] = None,
 ) -> Optional[Dict[str, Any]]:
+    # Resolve plans in the platform's current Stripe mode (live in prod). Test
+    # and live plan rows share a tier but carry distinct price ids; filtering by
+    # stripe_mode guards against ever resolving a live checkout to a test-mode
+    # plan row (mirrors _list_active_paid_plans). Column-guarded for old schemas.
+    mode = mode or _platform_stripe_mode()
+    has_mode = await _table_has_column(db, "subscription_plans", "stripe_mode")
+    mode_clause = "AND stripe_mode = :mode" if has_mode else ""
+
     if stripe_price_id:
+        params: Dict[str, Any] = {"stripe_price_id": stripe_price_id}
+        if has_mode:
+            params["mode"] = mode
         row = await db.fetch_one(
-            """
+            f"""
             SELECT id, name, stripe_price_id, monthly_credit_allowance
             FROM subscription_plans
             WHERE stripe_price_id = :stripe_price_id
               AND status = 'active'
+              {mode_clause}
             LIMIT 1
             """,
-            {"stripe_price_id": stripe_price_id},
+            params,
         )
         if row:
             return dict(row)
 
     if stripe_product_id and await _table_has_column(db, "subscription_plans", "stripe_product_id"):
+        params = {"stripe_product_id": stripe_product_id}
+        if has_mode:
+            params["mode"] = mode
         row = await db.fetch_one(
-            """
+            f"""
             SELECT id, name, stripe_price_id, monthly_credit_allowance
             FROM subscription_plans
             WHERE stripe_product_id = :stripe_product_id
               AND status = 'active'
+              {mode_clause}
             LIMIT 1
             """,
-            {"stripe_product_id": stripe_product_id},
+            params,
         )
         if row:
             return dict(row)
