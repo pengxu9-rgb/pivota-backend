@@ -88,9 +88,10 @@ CLAIM DISCIPLINE (do not let confident prose outrun the EVIDENCE — this is a t
   play, with only a light retrieval/schema layer. Do NOT invent discount depths, prices, savings percentages,
   review counts, retailer facts, or margin claims unless they appear in EVIDENCE.
 - AUTHORITY HONESTY: never promise that ChatGPT, Gemini, or any AI engine will cite, rank, or route to the
-  merchant page. Phrase the work as making the page more retrievable, extractable, citable, and authoritative
-  for the evidenced lane. Keep the materiality caveat: exposure is citation evidence, not proven buyer traffic,
-  until the lane is re-audited and verified.
+  merchant page. The work is making the page more retrievable, extractable, citable, and authoritative for the
+  evidenced lane — but to the merchant SAY THIS IN PLAIN WORDS ("easy for AI to find, quote, and trust"), never
+  the internal terms (see PLAIN LANGUAGE below). Keep the caveat: showing up in AI answers is citation evidence,
+  not proven buyer traffic, until the lane is re-audited and verified.
 - LANES: when you name a search lane or query, reuse the EXACT wording from EVIDENCE. Do not rephrase,
   singularize/pluralize, reorder, or coin a variant. (A positioning phrase for your brand is fine and separate
   — just don't present it as the searched lane.)
@@ -106,32 +107,64 @@ CLAIM DISCIPLINE (do not let confident prose outrun the EVIDENCE — this is a t
   output. Write a positioning read as a natural sentence ("incumbents look positioned as broad collagen, not a
   halal bedtime stick — worth confirming"), NOT as a caveat about what you may or may not claim. Never tell the
   merchant what you are or aren't allowed to say.
+- PLAIN LANGUAGE (write for a busy shop owner, not an SEO engineer): NEVER use the words "lane", "beachhead",
+  "wedge", "materiality", "controller", "canonical" (as a noun), or "vacuum" in the output. Say the plain thing
+  instead — a search query is the "'<query>' search" (quote the exact evidenced query); "the first beachhead
+  lane" → "the first search worth winning"; "verify materiality" → "check whether it's driving real buyer
+  traffic"; "who controls the lane" → "who currently owns that answer". Also NEVER write "retrievable" or
+  "extractable" to the merchant — say "easy for AI to find and quote". Expand PDP on first use ("your product
+  page").
+- NO FORMULA (this is the line between a bespoke memo and mail-merge — the merchant reads several of these briefs
+  back to back and WILL notice a repeated skeleton): NEVER use the "Stop chasing/Stop trying to win [broad]
+  … Instead, own/do …" construction ANYWHERE in core_decision — not as the opener, not mid-sentence, and not as
+  a variant ("Stop trying to win that broad query", "Stop chasing broad category queries", "don't fight the
+  broad search — instead…"). State the positive call directly instead of framing it as stop-this-then-do-that.
+  Likewise do NOT open your_angle with "Reframe from 'a X' to 'the Y'"; do NOT open substitution_play with
+  "When AI … hands the buyer to …. To win those buyers back, position…"; do NOT end first_moves with a
+  boilerplate "re-audit … before treating exposure as material" step. Lead every field with the ONE thing true only of THIS product — its specific angle, the exact competitor
+  AI named, or the exact source that controls the answer — and build the sentence around that fact, not around a
+  reusable frame. Vary sentence shape from field to field. Use each of these stock phrases AT MOST ONCE in the
+  whole brief and never as filler: "citable and buyable", "starter + replenishment bundle", "why-buy-direct
+  proof", "first-order offer". State the reasons to buy direct once, in plain words — never as a repeated
+  four-item list.
 
 WRITE the brief as JSON with these fields — each must be specific to THIS product and EVIDENCE:
-- position: one honest sentence on where they really stand (e.g. "niche challenger, strong when named,
-  invisible in the category").
-- core_decision: the ONE big strategic call, stated plainly and decisively (what to do, what to STOP doing,
-  and why — name the real reason from evidence).
+- position: one honest sentence on where THIS product really stands, in words that fit this product's actual
+  situation. Do NOT reuse a stock label like "niche challenger, strong when named, invisible in the category" —
+  ground it in what the evidence shows for this SKU.
+- core_decision: the ONE big strategic call for THIS product, stated plainly and decisively — the action and the
+  real reason from evidence (the specific product fact, the exact competitor AI named, or the exact source that
+  controls the answer that makes this the call). It may imply what to stop doing, but do NOT format it as a
+  "stop X, instead do Y" template — open with the product-specific reason, not the reusable verb frame. GOOD
+  (opens with the product-specific reason, no template): "Your shea-butter-and-green-tea butter is the only
+  thing in this category with real reviews behind it, so put those reviews on your own page and make it the
+  answer for the 'reviews hair butter treatment' search before spending anything on the crowded 'best hair mask'
+  question." BAD (template opener): "Stop chasing broad category queries… Instead, own the reviews lane first."
 - why_you_lose: WHY the category winners win — synthesize the named winners × the sources that rank them ×
   what the evidenced ranking sources imply about their moat (reviews/authority/distribution/positioning).
   Do not claim competitor feature gaps as fact; make any competitor positioning read explicit inference.
-- your_angle: the defensible positioning wedge = the merchant's differentiating attributes that the named
-  product actually has. Reframe them from "a {category}" to a category of one without saying winners lack
-  those attributes as fact. Use exact EVIDENCE lane wording where their differentiation IS the answer.
+- your_angle: the defensible positioning = the merchant's differentiating attributes that the named product
+  actually has. Position it as a specific product rather than a generic {category} — without a fixed "reframe
+  from 'a X' to 'the Y'" formula, and without saying winners lack those attributes as fact. Use exact EVIDENCE
+  query wording where their differentiation IS the answer.
 - traffic_strategy: a ranked list of where the missed, WINNABLE demand is + who controls each channel
   (name only sources/retailers/communities from grounding_notes.evidenced_channels) + the realistic path in.
   If no channel is evidenced for a lane, say to own your page/site first. Marketplace/community moves must be
   conditional ("if you already sell on <evidenced channel>..."). Explicitly say which big lanes to NOT chase
   yet and why.
 - substitution_play: if a substitution is present, how to win those buyers back (comparison/positioning vs
-  the named substitute), else null.
+  the named substitute), else null. Vary the phrasing per product — do NOT always open with "When AI … hands
+  the buyer to …".
 - first_moves: 3-5 concrete actions that EXECUTE the strategy above, in priority order, each tied to a
   strategic reason (not generic "add an FAQ" — "add the halal + bedtime story to your page so it is more
   citable for the lane you're claiming"). When EVIDENCE shows weak reseller/source-route exposure, at
   least one first move must name the exact lane and source-authority repair, using the mechanism order above
   and controller-type source route. When EVIDENCE shows credible retailer/marketplace competition, at least
   one first move must name the exact lane, listing fix, light retrieval/schema layer, and the operational reason
-  to buy from the merchant-controlled page (offer, bundle, subscription, or why-buy-direct proof).
+  to buy from the merchant-controlled page (offer, bundle, subscription, or why-buy-direct proof). Do NOT pad the
+  list to a fixed length or close every brief with the same "re-audit … before treating exposure as material"
+  step — include a re-measure step only when it is genuinely the most useful next action, phrased in this
+  product's own terms.
 - diy_vs_pivota: {self_serve:[2-3 merchant-owned moves], pivota:"one honest line on what only Pivota does
   — cited+buyable canonical page, serving, monitoring"}.   # the 70/30, honest, no cold-audit hard-sell"""
 
@@ -725,13 +758,25 @@ async def generate_sku_strategic_brief(
                 max_tokens=1200,
             )
         except LLMSynthesisError:
-            return _validated_deterministic_brief(evidence)
+            return _with_source(_validated_deterministic_brief(evidence), "deterministic")
         brief = _parse_brief_json(result.get("text"))
         if not isinstance(brief, dict) or not _has_required_shape(brief):
             continue
         if validate_grounding(brief, evidence):
-            return brief
-    return _validated_deterministic_brief(evidence)
+            return _with_source(brief, "llm")
+    return _with_source(_validated_deterministic_brief(evidence), "deterministic")
+
+
+def _with_source(
+    brief: Optional[Dict[str, Any]], source: str
+) -> Optional[Dict[str, Any]]:
+    """Tag a brief with the path that produced it ("llm" vs "deterministic") so
+    the fallback rate is measurable from stored audits. Applied AFTER grounding
+    validation so the marker never affects the grounding check. None passes
+    through unchanged (both paths failed → no brief)."""
+    if isinstance(brief, dict):
+        brief["brief_source"] = source
+    return brief
 
 
 def validate_grounding(brief: Mapping[str, Any], evidence: Mapping[str, Any]) -> bool:
@@ -1544,10 +1589,26 @@ def _deterministic_traffic_how(
     return default_how
 
 
+def _is_plausible_query(query: str) -> bool:
+    """Guard against a product description (or other long/label-prefixed blob)
+    leaking into a slot that expects a short search query. Real shopper queries
+    are short ("reviews hair mask / deep conditioning treatment"); a raw
+    description ("description a gentle scrub formulated with a natural exfoliator
+    …") is not, and must never be inlined verbatim into merchant-facing prose."""
+    q = _clean_str(query)
+    if not q:
+        return False
+    if len(q) > 90 or len(q.split()) > 12:
+        return False
+    if q.lower().startswith(("description ", "description:")):
+        return False
+    return True
+
+
 def _deterministic_wedge_decision(sideways_wedge: Mapping[str, Any]) -> str:
     beachhead = _as_mapping(sideways_wedge.get("recommended_beachhead_lane"))
     query = _clean_str(beachhead.get("query"))
-    if not query:
+    if not _is_plausible_query(query):
         return ""
     deferred = next(
         (
@@ -1559,13 +1620,13 @@ def _deterministic_wedge_decision(sideways_wedge: Mapping[str, Any]) -> str:
     )
     if deferred:
         return (
-            f"Start with {query} as the first beachhead and do not chase {deferred} "
-            "yet; the tighter lane is more product-specific and easier to turn into "
-            "the official more citable + buyable route."
+            f"Win the '{query}' search first and hold off on '{deferred}' for now — "
+            "the tighter search is more specific to this product, so your own page can "
+            "more easily become the one AI cites and buyers choose."
         )
     return (
-        f"Start with {query} as the first beachhead because it is product-specific "
-        "and already shows third-party-controlled demand."
+        f"Win the '{query}' search first — it is specific to this product and already "
+        "shows demand that other sites are capturing."
     )
 
 
@@ -1632,8 +1693,8 @@ def _low_signal_brief(evidence: Mapping[str, Any]) -> Dict[str, Any]:
             "this product."
         ),
         "your_angle": (
-            f"Use the evidenced product angle — {angle_terms} — as the reason {page_label} deserves "
-            "to be cited and bought from once it is complete and specific."
+            f"Lead with what makes this product specific — {angle_terms} — so that once "
+            f"{page_label} is complete, it is the page AI cites and buyers choose."
         ),
         "traffic_strategy": [],
         "substitution_play": None,
@@ -1763,9 +1824,9 @@ def _deterministic_brief(evidence: Mapping[str, Any]) -> Optional[Dict[str, Any]
             f"{controller_phrase}, not {destination}."
         )
         core_decision = (
-            f"Make {page_label} more retrievable, extractable, citable, and authoritative for "
-            f"{query}, then verify materiality; do not frame obscure cited hosts as a conversion "
-            "fight before the authority mechanism is in place."
+            f"Make {page_label} the page AI most easily finds, quotes, and trusts for the "
+            f"'{query}' search, then check whether it is driving real buyer traffic before "
+            "treating a few obscure cited sites as a lost sale."
         )
         why_you_lose = (
             f"AI's answers show {controller_phrase} shaping the citation trail for {query}. "
@@ -1789,9 +1850,9 @@ def _deterministic_brief(evidence: Mapping[str, Any]) -> Optional[Dict[str, Any]
             f"{controller_phrase}, not {destination}."
         )
         core_decision = (
-            f"Make {page_label} more retrievable, extractable, citable, and authoritative "
-            f"for {query}, then work the cited source trail by controller type with the "
-            "same facts."
+            f"Make {page_label} the page AI most easily finds, quotes, and trusts for the "
+            f"'{query}' search, then work with the sites AI already cites — keeping the "
+            "same facts everywhere."
         )
         why_you_lose = (
             f"AI's answers show {controller_phrase} shaping {query}. That suggests "
@@ -1815,9 +1876,9 @@ def _deterministic_brief(evidence: Mapping[str, Any]) -> Optional[Dict[str, Any]
             f"by {controller_phrase}, not {destination}."
         )
         core_decision = (
-            f"Make {page_label} the better place to buy for {query}; appearing in "
-            "AI answers is not the win until buyers have a reason to choose the "
-            "merchant-controlled path."
+            f"Make {page_label} the better place to buy for the '{query}' search — "
+            "showing up in AI answers is not the win until buyers have a reason to "
+            "choose your own site."
         )
         why_you_lose = (
             f"AI's answers show {controller_phrase} shaping {query}. That suggests "
@@ -1849,12 +1910,19 @@ def _deterministic_brief(evidence: Mapping[str, Any]) -> Optional[Dict[str, Any]
         deferred = defer_queries.get(item_query.lower())
         if isinstance(deferred, Mapping):
             beachhead = _as_mapping(sideways_wedge.get("recommended_beachhead_lane"))
-            beachhead_query = _clean_str(beachhead.get("query")) or query
-            how = (
-                f"Do not start here yet; use {beachhead_query} first because it is "
-                "more product-specific and easier to make the official page the best "
-                "more citable + buyable route."
-            )
+            beachhead_query = _clean_str(beachhead.get("query"))
+            if _is_plausible_query(beachhead_query):
+                how = (
+                    f"Do not start here yet — win the '{beachhead_query}' search first; "
+                    "it is more specific to this product, so your page can more easily "
+                    "become the best place AI can cite and buy from."
+                )
+            else:
+                how = (
+                    "Do not start here yet — win a more product-specific search first, "
+                    "so your page can more easily become the best place AI can cite and "
+                    "buy from."
+                )
         traffic_strategy.append({
             "where": item_query,
             "who_controls": _controller_phrase(
@@ -1875,8 +1943,8 @@ def _deterministic_brief(evidence: Mapping[str, Any]) -> Optional[Dict[str, Any]
         "core_decision": core_decision,
         "why_you_lose": why_you_lose,
         "your_angle": (
-            f"Use the evidenced product angle — {angle_terms} — as the reason the "
-            "merchant-controlled page deserves to be cited and bought from."
+            f"Lead with what makes this product specific — {angle_terms} — so your own "
+            "page is the one AI cites and buyers choose, not just another listing."
         ),
         "traffic_strategy": traffic_strategy,
         "substitution_play": _deterministic_substitution_play(evidence, page_label),
@@ -1900,9 +1968,11 @@ def _controller_phrase(controllers: List[Mapping[str, Any]]) -> str:
     ]
     hosts = _unique(host for host in hosts if host)
     if not hosts:
-        return "fragmented sources with no single site owning the lane"
+        return "fragmented sources with no single site owning the answer"
     if len(hosts) == 1:
         return hosts[0]
+    if len(hosts) == 2:
+        return f"{hosts[0]} and {hosts[1]}"
     return ", ".join(hosts[:-1]) + f", and {hosts[-1]}"
 
 
@@ -1919,6 +1989,8 @@ def _phrase_join(values: List[str], fallback: str) -> str:
         return fallback
     if len(cleaned) == 1:
         return cleaned[0]
+    if len(cleaned) == 2:
+        return f"{cleaned[0]} and {cleaned[1]}"
     return ", ".join(cleaned[:-1]) + f", and {cleaned[-1]}"
 
 

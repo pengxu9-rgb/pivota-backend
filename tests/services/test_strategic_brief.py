@@ -535,7 +535,7 @@ def test_fragmented_controller_lanes_are_framed_without_naming_one_off_hosts():
     assert surfaces["canonical_page_controllers"] == []
     assert surfaces["controller_strategy"] == "canonical_source_vacuum"
     assert "fragmented sources" in surfaces["brief_why_you_lose"]
-    assert "no single site owning the lane" in surfaces["brief_why_you_lose"]
+    assert "no single site owning the answer" in surfaces["brief_why_you_lose"]
     assert "fragmented" in surfaces["sku_headline"]
     assert "sayweee.com" not in blob
     assert "dubuypk.com" not in blob
@@ -1015,7 +1015,7 @@ def test_assemble_sku_brief_evidence_prioritizes_ownist_conversion_lane_over_sna
 
     brief = strategic_brief._deterministic_brief(evidence)
     assert brief is not None
-    assert "Start with vitamin c collagen jelly as the first beachhead" in (
+    assert "Win the 'vitamin c collagen jelly' search first" in (
         brief["core_decision"]
     )
     snack_strategy = next(
@@ -1206,7 +1206,7 @@ def test_deterministic_brief_branches_obscure_resellers_to_canonical_source_vacu
     assert "first-order offer" in blob
     assert "starter + replenishment bundle" in blob
     assert "why-buy-direct" in blob
-    assert "obscure cited hosts as a conversion fight" in blob
+    assert "obscure cited sites as a lost sale" in blob
     assert "%" not in blob and "$" not in blob
     assert strategic_brief.validate_grounding(brief, evidence) is True
     _assert_no_overpromise_payload(brief)
@@ -1561,6 +1561,7 @@ async def test_generate_sku_strategic_brief_returns_grounded_mocked_brief(monkey
 
     brief = await strategic_brief.generate_sku_strategic_brief(_evidence())
 
+    assert brief.pop("brief_source") == "llm"
     assert brief == _grounded_brief()
 
 
@@ -1586,6 +1587,7 @@ async def test_generate_sku_strategic_brief_retries_then_returns_deterministic_f
     brief = await strategic_brief.generate_sku_strategic_brief(_evidence())
 
     assert brief is not None
+    assert brief["brief_source"] == "deterministic"
     assert strategic_brief.validate_grounding(brief, _evidence()) is True
     assert "first-order offer" in " ".join(brief["first_moves"])
     assert len(calls) == 3
@@ -1606,6 +1608,7 @@ async def test_generate_sku_strategic_brief_returns_fallback_on_synthesis_error(
     brief = await strategic_brief.generate_sku_strategic_brief(_evidence())
 
     assert brief is not None
+    assert brief["brief_source"] == "deterministic"
     assert strategic_brief.validate_grounding(brief, _evidence()) is True
 
 
