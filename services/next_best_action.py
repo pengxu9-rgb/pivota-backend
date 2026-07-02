@@ -539,7 +539,7 @@ def _sku_prescription_for_gap(
                 "Those buyers are already shopping your category, they just don't "
                 "have a reason to pick you yet."
             ),
-            first_move=f"Publish a {sku_title} vs {substitute} comparison that shows when you win.",
+            first_move=f"Publish a comparison — {sku_title} vs {substitute} — showing when you win.",
             self_serve_actions=[
                 (
                     f"Make a clear {sku_title} vs {substitute} comparison: use cases, "
