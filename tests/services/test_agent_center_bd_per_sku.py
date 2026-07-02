@@ -692,6 +692,87 @@ def test_per_sku_queries_are_well_formed_even_with_garbled_attributes():
             assert str(record.get("axis") or "").strip(), ("missing axis", n, repr(q))
 
 
+def test_promo_terms_never_become_query_axis_terms():
+    """Regression: a promotional/marketing term ("skincare discount") leaked in as
+    an enrichment topic and produced nonsense merchant-facing queries like
+    "best moisturizer for skincare discount" across every SKU of the DAMDAM audit,
+    which a DTC founder flagged as an outright trust-killing bug. Promo/discount
+    noise must be dropped at the source cleaner so it never interpolates into a
+    query template."""
+    from services.agent_center_bd_report_service import (
+        _build_per_sku_audit_query_records,
+        _clean_prompt_term,
+        _is_promo_term,
+    )
+
+    # Direct unit checks: promo terms collapse to "" (word-boundary matched).
+    for promo in (
+        "skincare discount",
+        "discount",
+        "20% off",
+        "50 percent off",
+        "free shipping",
+        "on sale",
+        "flash sale",
+        "clearance",
+        "coupon code",
+        "buy one get one",
+        "black friday deal",
+        "gift with purchase",
+        "shop now",
+        "bestseller",
+    ):
+        assert _clean_prompt_term(promo) == "", repr(promo)
+        assert _is_promo_term(promo.lower()), repr(promo)
+
+    # Real attributes that merely share a substring with a promo token survive.
+    for legit in (
+        "salicylic acid",  # not "sale"
+        "paraben free",    # "free" only promo as "free shipping"/"free gift"
+        "cruelty free",
+        "fragrance free",
+        "sensitive skin",
+        "vitamin c",
+        "anti aging",
+    ):
+        assert _clean_prompt_term(legit) == legit, repr(legit)
+        assert not _is_promo_term(legit), repr(legit)
+
+    # End-to-end: promo topics/bullets never reach a generated query.
+    promo_ctx = {
+        "sku_key": "sku-promo",
+        "merchant_id": "m-1",
+        "product": {
+            "title": "DAMDAM Moisturizer",
+            "product_type": "moisturizer",
+            "attributes_raw": {"tags": ["skincare discount", "sale", "hydrating"]},
+        },
+        "product_enrichment": {
+            "topic_tags": ["skincare discount", "free shipping", "hydration"],
+            "audience_tags": ["50% off shoppers", "sensitive skin"],
+            "usage_scenarios": ["black friday", "daily routine"],
+            "bullet_points": ["coupon code SAVE20", "lightweight formula"],
+        },
+    }
+    # Attribute-derived noise that used to interpolate as a query axis term
+    # ("best moisturizer for skincare discount"). The fixed intent template
+    # "{title} for sale" is a legitimate availability query and out of scope —
+    # it isn't derived from topics/bullets, so it is intentionally preserved.
+    leaked_attribute_noise = (
+        "discount", "% off", "percent off", "free shipping",
+        "coupon", "on sale", "flash sale", "black friday", "bestseller",
+    )
+    for n in (1, 3, 8, 16, 40):
+        records = _build_per_sku_audit_query_records(promo_ctx, n)
+        assert records, ("expected non-empty query set", n)
+        for record in records:
+            q = str(record["query"]).lower()
+            # No "best {category} for {promo}" / "{promo} {category}" leaks.
+            assert "for skincare discount" not in q, ("bug regressed", n, repr(record["query"]))
+            for noise in leaked_attribute_noise:
+                assert noise not in q, ("promo attribute leaked", n, noise, repr(record["query"]))
+
+
 def test_deepseek_verify_deweights_only_answer_quality():
     from services.agent_center_bd_report_service import compute_citation_score
 
