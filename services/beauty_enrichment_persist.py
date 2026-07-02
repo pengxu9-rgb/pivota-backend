@@ -85,6 +85,19 @@ def _evidence_has_claims(value: Any) -> bool:
     return False
 
 
+# De-noise: ubiquitous emollients / stabilizers / humectants that appear on a
+# large fraction of products (Vitamin E/tocopherol was on ~69% of evidence rows).
+# "Contains Vitamin E" is true but not decision-grade — it dilutes the signal and
+# lets filler-only products read as substantiated. These are still extracted as
+# actives (they may appear in the ingredient list); they just don't mint a
+# standalone substantiated CLAIM. Meaningful actives (Retinol, Niacinamide,
+# Squalane, Heartleaf, …) are unaffected.
+_FILLER_ACTIVE_LABELS = frozenset({
+    "Vitamin E", "Sunflower Oil", "Jojoba Oil", "Shea Butter",
+    "Trehalose", "Argan Oil", "Collagen",
+})
+
+
 def _inci_substantiated_claims(actives: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
     """Provenance-backed ingredient-presence claims from INCI-VERIFIED actives.
 
@@ -95,6 +108,9 @@ def _inci_substantiated_claims(actives: List[Dict[str, Any]]) -> List[Dict[str, 
     active is ingredient-PRESENT, not verified, so it never earns `substantiated`
     here -- that distinction is what keeps marketing copy from masquerading as
     evidence. This is the `justify` dimension's provenance-backed-claim signal.
+
+    Ubiquitous filler actives (see _FILLER_ACTIVE_LABELS) are excluded: they are
+    true-but-low-signal and would let a filler-only product read as substantiated.
     """
     claims: List[Dict[str, Any]] = []
     seen: set = set()
@@ -103,7 +119,7 @@ def _inci_substantiated_claims(actives: List[Dict[str, Any]]) -> List[Dict[str, 
             continue
         label = str(active.get("label") or "").strip()
         key = label.lower()
-        if not label or key in seen:
+        if not label or key in seen or label in _FILLER_ACTIVE_LABELS:
             continue
         seen.add(key)
         claims.append(
