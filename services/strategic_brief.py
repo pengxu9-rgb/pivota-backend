@@ -967,14 +967,22 @@ async def generate_sku_strategic_brief(
             user = f"{base_user}\n\n{_SHAPE_REPAIR_HINT}"
             continue
         gf = _grounding_failures(brief, evidence)
+        # Deterministically enforce the anti-formulaic / plain-language rules the
+        # prompt can only *ask* for (temperature is non-zero, so the model still
+        # slips into "Stop trying to win …" or leaks jargon ~occasionally). A
+        # style violation is retried with a repair hint exactly like a grounding
+        # failure, so the merchant never sees the banned opener/jargon.
+        sf = _style_failures(brief)
         att["grounding_failures"] = gf
+        if sf:
+            att["style_failures"] = sf
         dbg["attempts"].append(att)
-        if not gf:
+        if not gf and not sf:
             dbg["outcome"] = "llm"
             return brief
-        # Grounding rejected the draft — feed the model the exact violated rules
-        # so the next attempt lands the mainline brief rather than falling back.
-        user = f"{base_user}\n\n{_grounding_repair_hint(gf)}"
+        # Grounding/style rejected the draft — feed the model the exact violated
+        # rules so the next attempt lands the mainline brief rather than falling back.
+        user = f"{base_user}\n\n{_grounding_repair_hint(gf + sf)}"
     dbg["outcome"] = "deterministic_after_rejects"
     return _validated_deterministic_brief(evidence, dbg=dbg)
 
@@ -1040,9 +1048,34 @@ _SHAPE_REPAIR_HINT = (
     "first_moves, diy_vs_pivota. No prose outside the JSON."
 )
 
+# Style violations the prompt bans but a non-zero-temperature model still slips
+# into. Enforced deterministically via the same repair-retry loop as grounding.
+_FORMULAIC_OPENER_RE = re.compile(r"\bstop\s+(?:chasing|trying\s+to\s+win)\b", re.IGNORECASE)
+_MERCHANT_JARGON_RE = re.compile(r"\b(?:lane|lanes|beachhead|beachheads|materiality)\b", re.IGNORECASE)
+
+
+def _style_failures(brief: Mapping[str, Any]) -> List[str]:
+    """Flag banned merchant-facing style: the "Stop chasing/trying to win …"
+    template opener, and internal jargon words that must never reach a merchant."""
+    text = " ".join(_iter_leaf_text(brief))
+    failures: List[str] = []
+    if _FORMULAIC_OPENER_RE.search(text):
+        failures.append("style-formulaic-opener")
+    if _MERCHANT_JARGON_RE.search(text):
+        failures.append("style-jargon")
+    return failures
+
+
 # Map the internal grounding-failure codes to a plain corrective instruction so a
 # retry can fix the specific violation instead of dropping to the deterministic brief.
 _GROUNDING_REPAIR_RULES: Tuple[Tuple[str, str], ...] = (
+    ("style-formulaic-opener",
+     "Do NOT use a 'Stop chasing …' or 'Stop trying to win …' construction anywhere. "
+     "Open with the ONE fact true only of this product and state the positive move "
+     "directly, with no stop-this-then-do-that template."),
+    ("style-jargon",
+     "Do NOT use the words 'lane', 'beachhead', or 'materiality'. Say 'search' or "
+     "'the \"<query>\" search' instead of 'lane', and plain phrasing everywhere else."),
     ("competitor-exclusive-claim",
      "Do not use 'only' to say one brand/product/seller has or does something. "
      "Rephrase without any exclusivity claim about the field."),

@@ -209,8 +209,8 @@ def _grounded_brief() -> Dict[str, Any]:
             "from the broad collagen category."
         ),
         "core_decision": (
-            "Stop chasing the broad collagen category first; claim halal "
-            "collagen sticks before bed because that lane fits BB Lab."
+            "Your halal bedtime collagen stick fits the halal collagen sticks "
+            "before bed search, so claim that search first for BB Lab."
         ),
         "why_you_lose": (
             "AI's answers show Vital Proteins, NeoCell, and Sports Research "
@@ -233,7 +233,7 @@ def _grounded_brief() -> Dict[str, Any]:
             {
                 "where": "best collagen supplements for skin",
                 "who_controls": "forbes.com and amazon.com",
-                "how": "Do not chase this lane first because the named winners already hold it.",
+                "how": "Do not chase this search first because the named winners already hold it.",
             },
         ],
         "substitution_play": (
@@ -1752,6 +1752,46 @@ async def test_generate_sku_strategic_brief_repairs_grounding_then_returns_llm(m
     # the retry carried a repair instruction the first call did not
     assert "grounding rules" in calls[1]["user"]
     assert "grounding rules" not in calls[0]["user"]
+
+
+@pytest.mark.asyncio
+async def test_generate_sku_strategic_brief_repairs_formulaic_opener(monkeypatch):
+    """A grounded draft that still uses the banned "Stop trying to win …" opener
+    is retried with a style-repair hint — the merchant never sees the template."""
+    monkeypatch.setattr(strategic_brief.settings, "strategic_brief_enabled", True)
+    monkeypatch.setattr(strategic_brief.settings, "deepseek_api_key", "sk-test")
+
+    formulaic = _grounded_brief()
+    formulaic["core_decision"] = (
+        "Stop trying to win the broad collagen category; instead own the halal "
+        "collagen sticks before bed lane."
+    )
+    assert strategic_brief._style_failures(formulaic) == [
+        "style-formulaic-opener",
+        "style-jargon",
+    ]
+    calls: List[Mapping[str, Any]] = []
+
+    async def fake_synthesize(**kwargs):
+        calls.append(kwargs)
+        payload = formulaic if len(calls) == 1 else _grounded_brief()
+        return {
+            "text": json.dumps(payload),
+            "usage": {"input_tokens": 1, "output_tokens": 1},
+            "provider": kwargs["provider"],
+            "model": kwargs["model"],
+        }
+
+    monkeypatch.setattr(strategic_brief, "synthesize", fake_synthesize)
+
+    dbg: Dict[str, Any] = {}
+    brief = await strategic_brief.generate_sku_strategic_brief(_evidence(), debug=dbg)
+
+    assert dbg["outcome"] == "llm"
+    assert len(calls) == 2
+    assert "Stop trying to win" not in json.dumps(brief)
+    # the retry was told to drop the template opener
+    assert "template" in calls[1]["user"].lower()
 
 
 @pytest.mark.asyncio
