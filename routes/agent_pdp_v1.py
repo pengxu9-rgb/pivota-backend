@@ -16,6 +16,7 @@ from fastapi.encoders import jsonable_encoder
 
 from db.database import database
 from services.catalog_identity import is_content_key
+from services.catalog_sync_service import pivota_canonical_pdp_url
 from services.claim_safety import substantiated_claims
 from services.independent_signals import independent_signals_for
 from services.offer_buyability import DEFAULT_SERVING_MARKET, annotate_offer_buyability
@@ -338,6 +339,18 @@ def _row_as_product(row: Dict[str, Any]) -> Dict[str, Any]:
             "variants": row.get("variants") or [],
         }
     )
+
+    # Citable canonical URL: the Pivota agent-facing PDP an agent should attribute
+    # to when it grounds a recommendation on this product. The crawlable page
+    # (sitemap + schema.org JSON-LD) already carries it; without it here, an agent
+    # calling the API/MCP has grounded claims but no source to cite. Built from the
+    # signature via the single source of truth (mirrors sitemap + JSON-LD exactly);
+    # `url` follows the schema.org convention the public page uses.
+    signature_id = row.get("pivota_signature_id")
+    if signature_id and str(signature_id).startswith("sig_"):
+        canonical_url = pivota_canonical_pdp_url(str(signature_id))
+        product["pivota_canonical_url"] = canonical_url
+        product["url"] = canonical_url
 
     # Serve gate: never leak the raw evidence_profile (it can carry unverified
     # claims); emit only substantiated claims + the required disclaimers.
