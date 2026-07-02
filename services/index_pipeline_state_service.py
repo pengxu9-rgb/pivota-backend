@@ -1133,7 +1133,27 @@ async def recompute_serving_eligibility(
         if new_state is None:
             return False
 
+        # Capture prior eligibility (cheap PK lookup) to detect the false->true
+        # transition that makes a canonical PDP newly citable.
+        prev_eligible = await database.fetch_val(
+            "SELECT serving_eligible FROM index_pipeline_state "
+            "WHERE content_key = :ck",
+            {"ck": content_key},
+        )
+
         await _upsert_index_pipeline_state(content_key, new_state)
+
+        # IndexNow: when a page becomes newly serving-eligible (and has a minted
+        # signature, so a canonical PDP exists), ask participating engines (Bing →
+        # ChatGPT search, Yandex, …) to crawl it. Non-blocking + best-effort — it
+        # never affects the recompute result.
+        if new_state.get("serving_eligible") and not prev_eligible:
+            sig = new_state.get("pivota_signature_id")
+            if sig and str(sig).startswith("sig_"):
+                from services.catalog_sync_service import pivota_canonical_pdp_url
+                from services.indexnow import schedule_submit_url
+
+                schedule_submit_url(pivota_canonical_pdp_url(str(sig)))
 
         if reason:
             logger.info({
