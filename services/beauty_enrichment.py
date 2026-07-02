@@ -109,6 +109,23 @@ _INCI_CLEAN_RE = re.compile(r"\s*\([^)]*\)|\s*\d+(?:\.\d+)?\s*%.*$")
 # INCI tokens are space/hyphen/slash separated and never carry that seam.
 _INCI_BLOB_RE = re.compile(r"[a-z][A-Z]")
 
+# A real INCI token names ONE compound. A single token that matches this many DISTINCT
+# key actives is a marketing "hero actives" menu the crawler prepended/appended to the
+# ingredient list (e.g. "Niacinamide Vitamin C Retinol Azelaic Acid Salicylic Acid
+# Hyaluronic Acid Alpha Arbutin Glycolic Acid Peptides Tranexamic Acid Marshmallow Root")
+# — never a real ingredient. Minting claims from it makes a lip balm "contain Retinol".
+_ACTIVES_MENU_MIN_HITS = 3
+
+
+def _is_actives_menu(token: str) -> bool:
+    hits = 0
+    for _a in _KEY_ACTIVES:
+        if _a["_re"].search(token):
+            hits += 1
+            if hits >= _ACTIVES_MENU_MIN_HITS:
+                return True
+    return False
+
 
 def parse_inci(raw_inci: Optional[str]) -> List[str]:
     """Split a raw INCI string into normalized ingredient tokens."""
@@ -121,6 +138,8 @@ def parse_inci(raw_inci: Optional[str]) -> List[str]:
             continue
         if len(cleaned) > 24 and _INCI_BLOB_RE.search(cleaned):
             continue  # concatenated keyword-blob, not a real ingredient token
+        if _is_actives_menu(cleaned):
+            continue  # marketing hero-actives menu, not a single ingredient
         tokens.append(cleaned)
     return tokens
 

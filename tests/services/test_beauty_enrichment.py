@@ -68,6 +68,26 @@ def test_parse_inci_drops_concatenated_keyword_blob():
     assert "Centella Asiatica" not in labels and "Mugwort" not in labels
 
 
+def test_parse_inci_drops_hero_actives_menu():
+    # Regression (audit 2): brands prepend a space-separated "hero actives" menu to the
+    # real INCI. It has commas (from the real body) and no prose verbs, so it slips the
+    # blob/prose gate — a lip balm ends up "containing" Retinol. A token matching ≥3
+    # distinct actives is a menu, not an ingredient → dropped.
+    balm = ("Niacinamide Vitamin C Retinol Azelaic Acid Salicylic Acid Hyaluronic Acid "
+            "Alpha Arbutin Glycolic Acid Peptides Tranexamic Acid Marshmallow Root, "
+            "Diisostearyl Malate, Butyrospermum Parkii (Shea) Butter, Squalane, Tocopherol")
+    labels = [a["label"] for a in extract_key_actives(balm)]
+    for junk in ("Retinol", "Niacinamide", "Azelaic Acid", "Peptides", "Vitamin C", "AHA"):
+        assert junk not in labels, f"menu leaked {junk!r}"
+    assert "Shea Butter" in labels and "Squalane" in labels  # real balm actives kept
+
+    # A real comma-separated multi-active INCI must be UNAFFECTED (each is its own token).
+    real = [a["label"] for a in extract_key_actives(
+        "Water, Niacinamide, Sodium Hyaluronate, Panthenol, Allantoin, Adenosine")]
+    for keep in ("Niacinamide", "Hyaluronic Acid", "Panthenol", "Allantoin", "Adenosine"):
+        assert keep in real
+
+
 def test_extract_key_actives_falls_back_to_text_when_no_inci():
     actives = extract_key_actives(None, fallback_text="A brightening serum with niacinamide and centella")
     labels = [a["label"] for a in actives]
