@@ -158,15 +158,14 @@ def normalize_claims(raw_claims: Any) -> List[ProductClaim]:
     return out
 
 
-def substantiated_claims(evidence_profile: Any) -> List[Dict[str, Any]]:
-    """Serve gate: return ONLY substantiated claims from an evidence_profile
-    (a dict with a "claims" list, a raw claims list, or a JSON string) as plain
-    dicts safe to emit to agents.
+def substantiated_product_claims(evidence_profile: Any) -> List[ProductClaim]:
+    """The substantiation serve-gate as typed ProductClaims: ONLY substantiated
+    claims from an evidence_profile (a dict with a "claims" list, a raw claims
+    list, or a JSON string). Unverified / flagged / rejected claims are dropped.
 
-    Unverified / flagged / rejected claims are dropped — so an unsubstantiated
-    merchant assertion can improve PDP copy but is never served to an agent as a
-    grounded, citable claim. Pure; no I/O. This is the single chokepoint every
-    agent-facing surface (PDP API, public PDP/JSON-LD, MCP, ACP) routes through.
+    THE shared substantiation filter — every agent-facing surface routes through
+    it so the gate can't drift: the flat-dict PDP API via substantiated_claims(),
+    and the search path's EvidenceProfile. Pure; no I/O.
     """
     raw: Any = evidence_profile
     if isinstance(raw, str):
@@ -176,16 +175,19 @@ def substantiated_claims(evidence_profile: Any) -> List[Dict[str, Any]]:
             return []
     if isinstance(raw, dict):
         raw = raw.get("claims")
-    out: List[Dict[str, Any]] = []
-    for claim in normalize_claims(raw):
-        if claim.substantiation_status != SUBSTANTIATION_SUBSTANTIATED:
-            continue
-        out.append(
-            {
-                "claim_text": claim.claim_text,
-                "source_ref": claim.source_ref,
-                "source_type": claim.source_type,
-                "evidence_grade": claim.evidence_grade,
-            }
-        )
-    return out
+    return [c for c in normalize_claims(raw) if c.substantiation_status == SUBSTANTIATION_SUBSTANTIATED]
+
+
+def substantiated_claims(evidence_profile: Any) -> List[Dict[str, Any]]:
+    """Flat-dict form of the substantiation serve-gate (PDP API / public
+    PDP+JSON-LD / MCP / ACP): substantiated claims only, as plain dicts safe to
+    emit to agents. Wraps substantiated_product_claims so the filter is shared."""
+    return [
+        {
+            "claim_text": c.claim_text,
+            "source_ref": c.source_ref,
+            "source_type": c.source_type,
+            "evidence_grade": c.evidence_grade,
+        }
+        for c in substantiated_product_claims(evidence_profile)
+    ]
