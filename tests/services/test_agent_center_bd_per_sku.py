@@ -1450,3 +1450,186 @@ def test_query_class_coverage_splits_branded_from_category():
     ]
     cov = _query_class_coverage(probe_runs)
     assert cov == {"branded_navigational": 3, "category_discovery": 1}
+
+
+# ---------------------------------------------------------------------------
+# Provider honesty gate: a provider whose probes all errored (e.g. OpenAI 429
+# quota) measured NOTHING and must be surfaced as coverage-unavailable, not
+# scored as a real 0 that drags the aggregate verdict toward INVISIBLE.
+# Reproduces run d4837efe (ANUKO): Gemini succeeded, every ChatGPT run 429'd.
+# ---------------------------------------------------------------------------
+_OPENAI_429 = (
+    "__error__:429 You exceeded your current quota, please check your plan "
+    "and billing details."
+)
+
+
+def _chatgpt_all_429_probe_runs(count: int = 3) -> List[Dict[str, Any]]:
+    """A ChatGPT payload shaped like the gateway's HTTP-200 all-runs-failed
+    response: raw_runs present but each carries an `__error__:` raw, and
+    usage.succeeded_runs==0 / failed_runs==count. No status='probe_failed'."""
+    raw_runs = [
+        {
+            "query": f"where can I buy Bright Skin Serum q{idx}",
+            "raw": _OPENAI_429,
+            "parsed": None,
+            "product_visible": False,
+            "grounding_sources": [],
+            "grounding_chunks": [],
+            "url_match": None,
+            "axis_metadata": {"axis": "intent", "source": "auto_generated", "sku_key": "sku-1"},
+        }
+        for idx in range(count)
+    ]
+    return [{
+        "provider": "chatgpt",
+        "model": "chat-latest",
+        "probe_run_id": "probe-chatgpt-429",
+        "runs_count": count,
+        "usage": {"succeeded_runs": 0, "failed_runs": count, "tokens_in": 0, "tokens_out": 0},
+        "raw_runs": raw_runs,
+    }]
+
+
+def test_provider_probes_all_failed_detects_429_vs_real_answers():
+    from services.agent_center_bd_report_service import (
+        _provider_probe_run_health,
+        _provider_probes_all_failed,
+    )
+
+    # All runs 429'd → attempted but zero succeeded → unavailable.
+    failed = _chatgpt_all_429_probe_runs(count=4)
+    assert _provider_probe_run_health(failed) == (0, 4)
+    assert _provider_probes_all_failed(failed) is True
+
+    # A real Gemini payload that answered → measured, not unavailable.
+    ok = _probe_runs()
+    succeeded, attempted = _provider_probe_run_health(ok)
+    assert succeeded == attempted == 2
+    assert _provider_probes_all_failed(ok) is False
+
+    # An explicit probe_failed payload (exception path) is still unavailable.
+    assert _provider_probes_all_failed(
+        [{"provider": "chatgpt", "status": "probe_failed", "runs_count": 0, "raw_runs": []}]
+    ) is True
+
+
+def test_build_citation_by_provider_marks_all_failed_provider_unavailable():
+    from services.agent_center_bd_report_service import build_citation_by_provider
+
+    sku_ctx = _base_sku_ctx()
+    probe_runs = _probe_runs() + _chatgpt_all_429_probe_runs(count=3)
+    cbp = build_citation_by_provider(sku_ctx, probe_runs)
+
+    # Gemini measured real signal → a scored entry (not unavailable).
+    assert "coverage_unavailable" not in cbp["gemini"]
+    assert cbp["gemini"].get("status") != "probe_failed"
+    assert cbp["gemini"]["score"] is not None
+
+    # ChatGPT 429'd wholesale → coverage unavailable, NOT a real 0.
+    chatgpt = cbp["chatgpt"]
+    assert chatgpt["status"] == "probe_failed"
+    assert chatgpt["coverage_unavailable"] is True
+    assert chatgpt["score"] is None  # unmeasured, not 0
+    assert chatgpt["prompts"] == 0
+    assert "429" in chatgpt["error"]
+
+
+def test_build_citation_by_provider_scores_real_zero_when_answered_no_cite():
+    """Regression guard: a provider that ANSWERED but never cited the merchant
+    (no errors, succeeded_runs>0) is a genuine measured 0 — it must keep a real
+    score and NOT be hidden as coverage-unavailable."""
+    from services.agent_center_bd_report_service import build_citation_by_provider
+
+    answered_no_cite = [{
+        "provider": "chatgpt",
+        "probe_run_id": "probe-answered",
+        "runs_count": 2,
+        "usage": {"succeeded_runs": 2, "failed_runs": 0},
+        "raw_runs": [
+            {
+                "query": f"best serum q{idx}",
+                "raw": "I recommend a different competitor product.",
+                "parsed": {"product_visible": False},
+                "grounding_sources": [{"uri": "https://competitor.test/x", "title": "Competitor"}],
+                "grounding_chunks": [],
+                "url_match": {"in_grounding": False},
+                "axis_metadata": {"axis": "intent", "sku_key": "sku-1"},
+            }
+            for idx in range(2)
+        ],
+    }]
+    cbp = build_citation_by_provider(_base_sku_ctx(), answered_no_cite)
+    entry = cbp["chatgpt"]
+    assert entry.get("status") != "probe_failed"
+    assert not entry.get("coverage_unavailable")
+    assert entry["score"] is not None  # a real measured score (0-ish), not None
+    assert entry["prompts"] == 2
+
+
+def test_models_cited_excludes_unavailable_provider():
+    from services.agent_center_bd_report_service import (
+        _models_cited_for_sku,
+        build_citation_by_provider,
+    )
+
+    probe_runs = _probe_runs() + _chatgpt_all_429_probe_runs(count=3)
+    cbp = build_citation_by_provider(_base_sku_ctx(), probe_runs)
+    # of == 1: only Gemini was measured; the 429'd ChatGPT is excluded.
+    assert _models_cited_for_sku(cbp)["of"] == 1
+
+
+def test_brand_rollup_surfaces_coverage_unavailable_provider():
+    from services.agent_center_bd_report_service import _brand_citation_by_provider
+
+    per_sku_reports = [
+        {
+            "sku_key": f"sku-{i}",
+            "citation_by_provider": {
+                "gemini": {
+                    "score": 14,
+                    "prompts": 16,
+                    "breakdown": {"first_party_rate": {"numerator": 0, "denominator": 16}},
+                },
+                "chatgpt": {
+                    "status": "probe_failed",
+                    "coverage_unavailable": True,
+                    "error": "429 You exceeded your current quota",
+                    "score": None,
+                    "prompts": 0,
+                },
+            },
+        }
+        for i in range(3)
+    ]
+    rollup = _brand_citation_by_provider(per_sku_reports)
+    # Gemini gets the normal scored rollup shape.
+    assert rollup["gemini"]["median"] == 14
+    assert rollup["gemini"]["skus_scored"] == 3
+    # ChatGPT is surfaced as coverage-unavailable, NOT a median-0 provider.
+    chatgpt = rollup["chatgpt"]
+    assert chatgpt["status"] == "coverage_unavailable"
+    assert chatgpt["skus_unavailable"] == 3
+    assert "median" not in chatgpt
+    assert "429" in chatgpt["error"]
+
+
+def test_all_per_sku_probes_failed_catches_wholesale_429():
+    from services.audit_run_worker import _all_per_sku_probes_failed
+
+    # Every provider 429'd across every SKU → nothing real to score → fire.
+    all_failed = {
+        "sku-1": _chatgpt_all_429_probe_runs(count=3),
+        "sku-2": _chatgpt_all_429_probe_runs(count=3),
+    }
+    assert _all_per_sku_probes_failed(all_failed) is True
+
+    # Gemini succeeded on the same SKUs while ChatGPT 429'd → real evidence
+    # exists → do NOT fire (the run finalizes on Gemini's data).
+    mixed = {
+        "sku-1": _probe_runs() + _chatgpt_all_429_probe_runs(count=3),
+    }
+    assert _all_per_sku_probes_failed(mixed) is False
+
+    # A fully successful run never fires.
+    assert _all_per_sku_probes_failed({"sku-1": _probe_runs()}) is False
