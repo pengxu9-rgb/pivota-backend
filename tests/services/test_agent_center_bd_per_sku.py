@@ -521,6 +521,167 @@ def test_per_sku_query_records_never_empty_for_any_prompts_per_sku():
             assert len(_chunk_query_specs(specs)) >= 1, (name, n)
 
 
+def _assert_query_well_formed(query: str, ctx_name: str) -> None:
+    """A generated probe query must be a clean shopper prompt, not a fragment."""
+    assert isinstance(query, str), (ctx_name, query)
+    stripped = query.strip()
+    assert len(stripped) >= 4, ("too short", ctx_name, repr(query))
+    # No interpolation/serialization debris leaked into the template.
+    for junk in ("[", "]", "{", "}", "<", ">"):
+        assert junk not in stripped, ("bracket leak", ctx_name, repr(query))
+    assert stripped.count("(") == stripped.count(")"), ("unbalanced paren", ctx_name, repr(query))
+    assert stripped.count('"') % 2 == 0, ("unbalanced quote", ctx_name, repr(query))
+    # No empty-attribute template left a dangling connective ("best toner for").
+    tokens = stripped.lower().split()
+    last_word = tokens[-1] if tokens else ""
+    assert last_word not in {
+        "for", "with", "and", "or", "the", "a", "an", "of", "to", "in", "on", "by", "from",
+    }, ("dangling connective", ctx_name, repr(query))
+    # The "f toner" orphan-token shape can't be caught by scanning output tokens
+    # (legit queries contain "I", and "vitamin c" contains "c"). It's prevented
+    # at the source instead — asserted directly via _clean_prompt_term below.
+
+
+def test_per_sku_queries_are_well_formed_even_with_garbled_attributes():
+    """Regression: malformed enrichment/attributes (lone bracket, stray quote,
+    single-letter junk, empty category/material/variant) must not leak fragment
+    queries like "best toner for [", 'best ... set for "', or "f toner" into the
+    probe set. The fixture deliberately stuffs every interpolation source with
+    junk so a single missed branch surfaces as a malformed query."""
+    from services.agent_center_bd_report_service import (
+        _build_per_sku_audit_query_records,
+        _is_well_formed_query,
+        _clean_prompt_term,
+    )
+
+    # Direct unit checks of the gate against the exact shapes seen in prod.
+    assert not _is_well_formed_query("best toner for [")
+    assert not _is_well_formed_query('best women\'s lingerie set for "')
+    assert not _is_well_formed_query("best toner for")
+    assert _is_well_formed_query("best rated women's lingerie set")
+    assert _is_well_formed_query("does Winona Soothing Repair Serum actually work")
+    assert _is_well_formed_query("buy TestBrand Serum (30ml) online")  # balanced parens ok
+
+    # Source cleaner drops debris/orphan tokens before they can interpolate.
+    for junk in ("[", "]", '"', "'", "f", "{", "}", "(", "  ", "", "<unset"):
+        assert _clean_prompt_term(junk) in ("", "unset"), repr(junk)
+    assert _clean_prompt_term("sensitive skin") == "sensitive skin"
+
+    garbled_ctx = {
+        "sku_key": "sku-garbled",
+        "merchant_id": "m-1",
+        "product": {
+            "title": "Mystery Toner",
+            "product_type": "toner",
+            # Empty/None attributes are exactly what triggered the leaks.
+            "category": "",
+            "attributes_raw": {
+                "material": "",
+                "variant": None,
+                "tags": ["[", '"', "f", "{placeholder}", "", "women"],
+            },
+        },
+        "product_enrichment": {
+            # Junk tokens that used to interpolate straight into templates.
+            "topic_tags": ["[", '"', "f", "", "  ", "]"],
+            "audience_tags": ['"', "(", "f"],
+            "usage_scenarios": ["<unset>", "f"],
+            "bullet_points": ["f", "[", '"', "g"],
+        },
+    }
+
+    for n in (1, 3, 8, 16, 40):
+        records = _build_per_sku_audit_query_records(garbled_ctx, n)
+        assert records, ("expected non-empty fallback set", n)
+        for record in records:
+            q = record["query"]
+            assert _is_well_formed_query(q), ("gate disagrees", n, repr(q))
+            _assert_query_well_formed(q, f"garbled@n={n}")
+            # axis must survive intact/additive on every record.
+            assert str(record.get("axis") or "").strip(), ("missing axis", n, repr(q))
+
+
+def test_promo_terms_never_become_query_axis_terms():
+    """Regression: a promotional/marketing term ("skincare discount") leaked in as
+    an enrichment topic and produced nonsense merchant-facing queries like
+    "best moisturizer for skincare discount" across every SKU of the DAMDAM audit,
+    which a DTC founder flagged as an outright trust-killing bug. Promo/discount
+    noise must be dropped at the source cleaner so it never interpolates into a
+    query template."""
+    from services.agent_center_bd_report_service import (
+        _build_per_sku_audit_query_records,
+        _clean_prompt_term,
+        _is_promo_term,
+    )
+
+    # Direct unit checks: promo terms collapse to "" (word-boundary matched).
+    for promo in (
+        "skincare discount",
+        "discount",
+        "20% off",
+        "50 percent off",
+        "free shipping",
+        "on sale",
+        "flash sale",
+        "clearance",
+        "coupon code",
+        "buy one get one",
+        "black friday deal",
+        "gift with purchase",
+        "shop now",
+        "bestseller",
+    ):
+        assert _clean_prompt_term(promo) == "", repr(promo)
+        assert _is_promo_term(promo.lower()), repr(promo)
+
+    # Real attributes that merely share a substring with a promo token survive.
+    for legit in (
+        "salicylic acid",  # not "sale"
+        "paraben free",    # "free" only promo as "free shipping"/"free gift"
+        "cruelty free",
+        "fragrance free",
+        "sensitive skin",
+        "vitamin c",
+        "anti aging",
+    ):
+        assert _clean_prompt_term(legit) == legit, repr(legit)
+        assert not _is_promo_term(legit), repr(legit)
+
+    # End-to-end: promo topics/bullets never reach a generated query.
+    promo_ctx = {
+        "sku_key": "sku-promo",
+        "merchant_id": "m-1",
+        "product": {
+            "title": "DAMDAM Moisturizer",
+            "product_type": "moisturizer",
+            "attributes_raw": {"tags": ["skincare discount", "sale", "hydrating"]},
+        },
+        "product_enrichment": {
+            "topic_tags": ["skincare discount", "free shipping", "hydration"],
+            "audience_tags": ["50% off shoppers", "sensitive skin"],
+            "usage_scenarios": ["black friday", "daily routine"],
+            "bullet_points": ["coupon code SAVE20", "lightweight formula"],
+        },
+    }
+    # Attribute-derived noise that used to interpolate as a query axis term
+    # ("best moisturizer for skincare discount"). The fixed intent template
+    # "{title} for sale" is a legitimate availability query and out of scope —
+    # it isn't derived from topics/bullets, so it is intentionally preserved.
+    leaked_attribute_noise = (
+        "discount", "% off", "percent off", "free shipping",
+        "coupon", "on sale", "flash sale", "black friday", "bestseller",
+    )
+    for n in (1, 3, 8, 16, 40):
+        records = _build_per_sku_audit_query_records(promo_ctx, n)
+        assert records, ("expected non-empty query set", n)
+        for record in records:
+            q = str(record["query"]).lower()
+            # No "best {category} for {promo}" / "{promo} {category}" leaks.
+            assert "for skincare discount" not in q, ("bug regressed", n, repr(record["query"]))
+            for noise in leaked_attribute_noise:
+                assert noise not in q, ("promo attribute leaked", n, noise, repr(record["query"]))
+
+
 def test_deepseek_verify_deweights_only_answer_quality():
     from services.agent_center_bd_report_service import compute_citation_score
 

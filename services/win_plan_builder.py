@@ -248,15 +248,12 @@ def _losing_query_plan(
                 else "sources that aren't independent publishers we can target"
             )
             limit = (
-                f"AI grounds this answer in {shown} ({kind}); none is an "
-                "independent publisher to pitch — the play is to earn this "
-                "category's first independent review."
+                f"AI grounds this answer in {shown} ({kind}); no independent "
+                "publisher to pitch here."
             )
         else:
             limit = (
-                "AI returned no resolvable independent source for this query — "
-                "no specific target host to name; earn a first independent "
-                "category citation."
+                "AI returned no resolvable independent source for this query."
             )
 
     return {
