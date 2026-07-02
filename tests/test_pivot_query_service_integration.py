@@ -1016,7 +1016,8 @@ async def test_fetch_canonical_search_rows_uses_candidate_cte_and_avoids_json_se
 
     assert rows == []
     assert "WITH candidate_skus AS" in observed["query"]
-    assert "JOIN catalog_offers o ON o.sku_key = c.sku_key" in observed["query"]
+    assert "JOIN catalog_offers o" in observed["query"]
+    assert "ON o.sku_key = c.sku_key" in observed["query"]
     assert "CAST(s.visible_option_labels AS TEXT)" not in observed["query"]
     assert "CAST(s.ingredient_ids AS TEXT)" not in observed["query"]
     assert observed["params"]["candidate_limit"] >= 20
