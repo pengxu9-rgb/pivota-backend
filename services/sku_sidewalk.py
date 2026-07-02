@@ -12,6 +12,8 @@ from html import unescape
 import re
 from typing import Any, Dict, Iterable, List, Mapping, Optional, Tuple
 
+from services.promo_terms import is_promo_term
+
 
 ATTRIBUTE_CLASSES: Tuple[str, ...] = (
     "category",
@@ -541,6 +543,14 @@ def _add_attr(
 ) -> None:
     cleaned = _clean_attr(attr)
     if not cleaned:
+        return
+    # A promotional/marketing term ("skincare discount", "free shipping") is not a
+    # product attribute — it leaks in via raw merchant tags/copy and, once it lands
+    # in a class like use_case, surfaces verbatim in the merchant-facing brief
+    # (flagged live on the DAMDAM report). Drop it at the single attribute
+    # chokepoint so it can never become an attribute in any class. Shares the stop
+    # list with query generation via `services.promo_terms`.
+    if is_promo_term(cleaned):
         return
     bucket = classes.setdefault(class_name, [])
     if cleaned not in bucket:
