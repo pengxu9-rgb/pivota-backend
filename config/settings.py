@@ -455,6 +455,25 @@ class Settings(BaseSettings):
     # `siteUrl` for URL Inspection read-back (e.g. "https://agent.pivota.cc/").
     gsc_pivota_property_url: str = os.getenv("GSC_PIVOTA_PROPERTY_URL", "")
 
+    # IndexNow: notify Bing (which powers ChatGPT search), Yandex, and other
+    # participating engines that a canonical PDP became newly citable so it gets
+    # crawled. Unlike the GSC Indexing API above (gated off pending proof Google
+    # honors product URLs), IndexNow IS honored for ordinary content pages, so
+    # this is our live discovery trigger. Best-effort. OFF by default (mirrors the
+    # GSC flags — an external call shouldn't fire from tests/local); set
+    # INDEXNOW_ENABLED=true in prod to activate ongoing auto-submit. The key
+    # default matches the public key file hosted at https://{host}/{key}.txt.
+    indexnow_enabled: bool = (
+        os.getenv("INDEXNOW_ENABLED", "false").lower() == "true"
+    )
+    indexnow_host: str = os.getenv("INDEXNOW_HOST", "agent.pivota.cc")
+    indexnow_key: str = os.getenv(
+        "INDEXNOW_KEY", "a4951ce31e0fa749463bc9d0cfe0f352"
+    )
+    indexnow_endpoint: str = os.getenv(
+        "INDEXNOW_ENDPOINT", "https://api.indexnow.org/indexnow"
+    )
+
     @property
     def cors_origins(self) -> list:
         """Parse comma-separated origins from environment variable"""
