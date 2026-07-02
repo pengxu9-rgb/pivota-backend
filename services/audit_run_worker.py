@@ -121,30 +121,65 @@ async def process_one_audit_run() -> bool:
         )
 
 
+def _run_errored(run: Any) -> bool:
+    """True when a grounded run carried an upstream error instead of an answer.
+    The gateway returns HTTP 200 with `raw` prefixed `__error__:` (e.g. an
+    OpenAI 429 quota error) rather than raising, so such a run is NOT real
+    grounded evidence."""
+    if not isinstance(run, dict):
+        return False
+    if run.get("error"):
+        return True
+    raw = run.get("raw")
+    return isinstance(raw, str) and raw.startswith("__error__")
+
+
 def _all_per_sku_probes_failed(
     probe_runs_by_sku: Dict[str, Any],
 ) -> bool:
-    """True when the producer collected ZERO grounded evidence and at least one
-    probe explicitly failed — e.g. the probe-auth key is missing on this worker.
+    """True when the producer collected ZERO *successful* grounded runs and at
+    least one probe failed — e.g. the probe-auth key is missing, or every run
+    came back as an upstream error (OpenAI 429 quota).
 
-    A successful probe returns raw_runs (one per query, even with no citation);
-    a failed probe returns status='probe_failed' with 0 raw_runs. So
-    "0 raw_runs total AND something failed" means every probe failed and the
-    audit has nothing real to score — it must NOT finalize as a 'succeeded'
-    empty audit that reads to the merchant as 'invisible in AI'.
+    A successful probe returns raw_runs carrying real answers; a failed probe
+    returns status='probe_failed' with 0 raw_runs, and a wholesale upstream
+    failure returns HTTP 200 with raw_runs that are all `__error__:`-prefixed
+    (usage.succeeded_runs==0). Counting only SUCCESSFUL runs — not raw_runs
+    length — catches both shapes: the audit has nothing real to score and must
+    NOT finalize as a 'succeeded' empty audit that reads to the merchant as
+    'invisible in AI'. When at least one provider succeeded (e.g. Gemini works
+    while ChatGPT 429s), this returns False and the run finalizes normally on
+    the real evidence.
     """
     saw_failure = False
-    total_raw_runs = 0
+    total_success_runs = 0
     saw_any_payload = False
     for payloads in (probe_runs_by_sku or {}).values():
         for payload in payloads or []:
             if not isinstance(payload, dict):
                 continue
             saw_any_payload = True
-            total_raw_runs += len(payload.get("raw_runs") or [])
             if str(payload.get("status") or "").lower() == "probe_failed":
                 saw_failure = True
-    return saw_any_payload and saw_failure and total_raw_runs == 0
+                continue
+            usage = payload.get("usage") if isinstance(payload.get("usage"), dict) else {}
+            succ = usage.get("succeeded_runs")
+            failed = usage.get("failed_runs")
+            raw_runs = [r for r in (payload.get("raw_runs") or []) if isinstance(r, dict)]
+            if isinstance(succ, int) or isinstance(failed, int):
+                s = int(succ or 0)
+                f = int(failed or 0)
+                total_success_runs += s
+                if s == 0 and f > 0:
+                    saw_failure = True
+            else:
+                # Older gateway response without per-run health: infer from the
+                # `__error__:` markers on the raw runs themselves.
+                ok = sum(1 for r in raw_runs if not _run_errored(r))
+                total_success_runs += ok
+                if raw_runs and ok == 0:
+                    saw_failure = True
+    return saw_any_payload and saw_failure and total_success_runs == 0
 
 
 def _first_probe_failure_reason(probe_runs_by_sku: Dict[str, Any]) -> str:

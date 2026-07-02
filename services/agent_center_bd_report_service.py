@@ -4131,6 +4131,81 @@ def _any_provider_probe_runs(per_sku_probe_runs: Any) -> List[Dict[str, Any]]:
     }] if merged_runs else []
 
 
+def _run_is_error(run: Any) -> bool:
+    """True when a single grounded run carried an upstream error instead of a
+    real answer. The gateway returns HTTP 200 with the run's `raw` prefixed
+    `__error__:` (e.g. an OpenAI 429 quota error) rather than raising, so these
+    runs must not be mistaken for a real "answered but didn't cite" run."""
+    if not isinstance(run, dict):
+        return False
+    if run.get("error"):
+        return True
+    raw = run.get("raw")
+    return isinstance(raw, str) and raw.startswith("__error__")
+
+
+def _provider_probe_run_health(probes: Any) -> Tuple[int, int]:
+    """(succeeded_runs, attempted_runs) across one provider's per-SKU payloads.
+
+    Prefers the gateway's authoritative usage.succeeded_runs / failed_runs; when
+    a payload predates those fields, falls back to counting non-error raw_runs.
+    An explicit probe_failed payload (the exception path) counts as an attempt
+    with zero successes."""
+    succeeded = 0
+    attempted = 0
+    for probe in _json_list(probes):
+        if not isinstance(probe, dict):
+            continue
+        if probe.get("status") == "probe_failed":
+            attempted += max(1, int(probe.get("runs_count") or 0))
+            continue
+        usage = probe.get("usage") if isinstance(probe.get("usage"), dict) else {}
+        succ = usage.get("succeeded_runs")
+        failed = usage.get("failed_runs")
+        raw_runs = [r for r in (probe.get("raw_runs") or []) if isinstance(r, dict)]
+        if isinstance(succ, int) or isinstance(failed, int):
+            s = int(succ or 0)
+            f = int(failed or 0)
+            succeeded += s
+            attempted += (s + f) if (s + f) > 0 else len(raw_runs)
+        else:
+            # Older gateway response without per-run health: infer from the
+            # `__error__:` markers on the raw runs themselves.
+            succeeded += sum(1 for r in raw_runs if not _run_is_error(r))
+            attempted += len(raw_runs)
+    return succeeded, attempted
+
+
+def _provider_probes_all_failed(probes: Any) -> bool:
+    """Per-provider mirror of the worker's `_all_per_sku_probes_failed`: True when
+    a provider attempted probes but produced ZERO successful runs (e.g. every
+    ChatGPT run came back as a 429 quota error). Such a provider measured
+    nothing and must be treated as "coverage unavailable", NOT scored as a real
+    0 that would drag the aggregate verdict toward INVISIBLE."""
+    succeeded, attempted = _provider_probe_run_health(probes)
+    return attempted > 0 and succeeded == 0
+
+
+def _first_probe_error(probes: Any) -> str:
+    """Human-readable upstream error for a wholesale-failed provider, pulled from
+    the payload `error` or the first `__error__:`-prefixed run."""
+    for probe in _json_list(probes):
+        if not isinstance(probe, dict):
+            continue
+        err = str(probe.get("error") or "").strip()
+        if err:
+            return err[:300]
+        for run in probe.get("raw_runs") or []:
+            if not isinstance(run, dict):
+                continue
+            raw = run.get("raw")
+            if isinstance(raw, str) and raw.startswith("__error__"):
+                return raw.replace("__error__:", "", 1).strip()[:300]
+            if run.get("error"):
+                return str(run.get("error")).strip()[:300]
+    return "provider probes returned no successful runs"
+
+
 def build_citation_by_provider(
     sku_ctx: Dict[str, Any],
     per_sku_probe_runs: Any,
@@ -4138,7 +4213,7 @@ def build_citation_by_provider(
 ) -> Dict[str, Dict[str, Any]]:
     out: Dict[str, Dict[str, Any]] = {}
     for provider, probes in sorted(_group_probe_runs_by_provider(per_sku_probe_runs).items()):
-        failed_probe = next(
+        explicit_failed = next(
             (
                 probe for probe in _json_list(probes)
                 if isinstance(probe, dict)
@@ -4146,11 +4221,23 @@ def build_citation_by_provider(
             ),
             None,
         )
-        if failed_probe is not None:
+        # Two shapes of "this provider measured nothing":
+        #   1. an explicit probe_failed payload (the probe call raised), or
+        #   2. the gateway returned HTTP 200 but every grounded run errored
+        #      (e.g. OpenAI 429 quota) — succeeded_runs==0 with no probe_failed.
+        # Both must be surfaced as coverage-unavailable rather than scored 0.
+        # Downstream rollups already skip status == "probe_failed".
+        if explicit_failed is not None or _provider_probes_all_failed(probes):
             score, breakdown = compute_citation_score(sku_ctx, [], verify_outputs=verify_outputs)
+            error = (
+                str(explicit_failed.get("error") or "").strip()[:500]
+                if explicit_failed is not None and explicit_failed.get("error")
+                else _first_probe_error(probes)
+            )
             out[provider] = {
                 "status": "probe_failed",
-                "error": str(failed_probe.get("error") or "")[:500],
+                "coverage_unavailable": True,
+                "error": error,
                 "score": score,
                 "breakdown": breakdown,
                 "prompts": 0,
@@ -4201,10 +4288,21 @@ def _brand_citation_by_provider(per_sku_reports: List[Dict[str, Any]]) -> Dict[s
     model cited, total prompts. With only Gemini running today this is a single
     entry; it's the surface that lights up as more providers are enabled."""
     by_provider: Dict[str, Dict[str, List[Any]]] = {}
+    unavailable: Dict[str, Dict[str, Any]] = {}
     for report in per_sku_reports or []:
         cbp = (report or {}).get("citation_by_provider") or {}
         for provider, entry in cbp.items():
-            if not isinstance(entry, dict) or entry.get("status") == "probe_failed":
+            if not isinstance(entry, dict):
+                continue
+            if entry.get("status") == "probe_failed" or entry.get("coverage_unavailable"):
+                # Provider measured nothing on this SKU (probe failed / all runs
+                # errored). Track it so a provider that NEVER scored is surfaced
+                # as coverage-unavailable rather than silently dropped — which
+                # would read to the merchant as "we only measured Gemini".
+                u = unavailable.setdefault(provider, {"skus": 0, "error": None})
+                u["skus"] += 1
+                if not u["error"] and entry.get("error"):
+                    u["error"] = str(entry.get("error"))[:300]
                 continue
             acc = by_provider.setdefault(provider, {"scores": [], "skus_cited": 0, "prompts": 0})
             score = entry.get("score")
@@ -4223,6 +4321,17 @@ def _brand_citation_by_provider(per_sku_reports: List[Dict[str, Any]]) -> Dict[s
             "skus_scored": len(scores),
             "skus_cited": acc["skus_cited"],
             "prompts": acc["prompts"],
+        }
+    # Providers that were attempted on some SKUs but never produced a scored
+    # result → coverage unavailable (not a real 0). A provider that scored on at
+    # least one SKU keeps its real entry above.
+    for provider, u in unavailable.items():
+        if provider in out:
+            continue
+        out[provider] = {
+            "status": "coverage_unavailable",
+            "skus_unavailable": u["skus"],
+            "error": u["error"] or "provider probes returned no successful runs",
         }
     return out
 
