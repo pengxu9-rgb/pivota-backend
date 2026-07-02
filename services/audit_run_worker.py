@@ -1235,12 +1235,18 @@ async def _seed_url_audit_index(
     per-SKU report re-derives deterministically so the merchant can attach
     proof/claims to it. NEVER raises — an intake failure must not break a live
     audit (the upsert is itself best-effort; this guard is belt-and-suspenders)."""
-    from services.audit_index_intake import (
-        audit_intake_enabled,
-        upsert_audited_sku_to_index,
-    )
+    try:
+        from services.audit_index_intake import (
+            audit_intake_enabled,
+            upsert_audited_sku_to_index,
+        )
 
-    if not audit_intake_enabled():
+        if not audit_intake_enabled():
+            return
+    except Exception as exc:  # noqa: BLE001 — import/flag must never break the audit
+        logger.warning(
+            "audit_run_worker: url-audit index seed setup failed: %s", str(exc)[:200],
+        )
         return
     for item in synthetic_items or []:
         try:
