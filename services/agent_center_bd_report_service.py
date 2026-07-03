@@ -7873,12 +7873,25 @@ _PROMPT_TERM_STRIP_CHARS = " \t\r\n,.;:/\\\"'`[]{}<>()|*#~"
 _is_promo_term = is_promo_term
 
 
+# A shopper attribute/category term is a short noun phrase ("bond repair
+# treatment", "low molecular weight collagen"), never a full sentence. When a
+# PDP description sentence leaks in as a "term" it becomes a nonsense query
+# ("description a gentle scrub formulated with a natural exfoliator … face
+# cleansers"). Cap the word count so sentence fragments are dropped while every
+# real multi-word attribute (well under this bound) passes untouched.
+_PROMPT_TERM_MAX_WORDS = 8
+
+
 def _clean_prompt_term(value: Any) -> str:
     text = re.sub(r"\s+", " ", str(value or "").strip().lower())
     text = text.strip(_PROMPT_TERM_STRIP_CHARS)
     # A token with no real word content (a lone bracket/quote) or a single stray
     # character is not a shopper term — emitting it leaks a query fragment.
     if len(text) < 2 or not re.search(r"[a-z0-9]", text):
+        return ""
+    # A full sentence (PDP description copy) is not a shopper attribute; emitting
+    # it produces a garbled multi-clause query. Drop anything sentence-length.
+    if len(re.findall(r"[a-z0-9]+", text)) > _PROMPT_TERM_MAX_WORDS:
         return ""
     # A promo/discount/marketing term is not a shopper attribute — dropping it
     # here keeps it out of every query template (topics, bullets, attributes).
@@ -7929,6 +7942,20 @@ def _graph_class_values(graph: Mapping[str, Any], class_name: str) -> List[str]:
     return out
 
 
+# Generic container/merchandising "categories" that describe a bundle, not a
+# product kind. Used as a category anchor they produce off-target queries and
+# absurd competitors — DAMDAM's CITRUS GLOW serum resolved to "set" and was
+# probed as "best set", returning cookware brands (All-Clad, Le Creuset) as
+# skincare rivals. Reject them so the anchor falls through to the title-derived
+# category ("serum").
+_GENERIC_CONTAINER_CATEGORIES = frozenset({
+    "product", "products", "item", "items",
+    "set", "sets", "kit", "kits", "bundle", "bundles",
+    "collection", "collections", "pack", "packs", "gift", "gifts",
+    "gift set", "gift sets", "starter kit", "sampler", "box", "value set",
+})
+
+
 def _category_for_unbranded_prompts(
     product: Mapping[str, Any],
     product_type: str,
@@ -7941,14 +7968,14 @@ def _category_for_unbranded_prompts(
     )
     if (
         direct
-        and direct not in {"product", "products", "item", "items"}
+        and direct not in _GENERIC_CONTAINER_CATEGORIES
         and not _noisy_prompt_category(direct)
     ):
         return direct
     for category in _graph_class_values(graph, "category"):
         if (
             category
-            and category not in {"product", "products", "item", "items"}
+            and category not in _GENERIC_CONTAINER_CATEGORIES
             and not _noisy_prompt_category(category)
         ):
             return category
@@ -8047,7 +8074,7 @@ def _unbranded_category_specs(
     bullets: List[str],
 ) -> List[Tuple[str, str]]:
     category = _clean_prompt_term(category)
-    if not category or category in {"product", "products", "item", "items"}:
+    if not category or category in _GENERIC_CONTAINER_CATEGORIES:
         return []
 
     # NOTE on tags: queries keep the COARSE `axis` vocabulary every downstream

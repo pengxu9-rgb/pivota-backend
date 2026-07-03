@@ -692,6 +692,70 @@ def test_per_sku_queries_are_well_formed_even_with_garbled_attributes():
             assert str(record.get("axis") or "").strip(), ("missing axis", n, repr(q))
 
 
+def test_description_sentences_never_become_query_terms():
+    """DAMDAM 2026-07-01: PDP description sentences leaked in as attributes and
+    produced garbled multi-clause queries ("description a gentle scrub formulated
+    with a natural exfoliator … face cleansers"). A shopper term is a short noun
+    phrase; sentence-length values are dropped, real multi-word attributes kept."""
+    from services.agent_center_bd_report_service import _clean_prompt_term
+
+    assert _clean_prompt_term(
+        "description a gentle scrub formulated with a natural exfoliator to draw "
+        "out impurities and prevent pore buildup without stripping skin dry"
+    ) == ""
+    assert _clean_prompt_term(
+        "a hybrid between an essence and setting spray this provides extra care"
+    ) == ""
+    # Real attributes (well under the word cap) survive unchanged.
+    for legit in (
+        "bond repair treatment",
+        "low molecular weight collagen",
+        "green tea and shea butter",
+        "vitamin c serum",
+    ):
+        assert _clean_prompt_term(legit) == legit, repr(legit)
+
+
+def test_generic_container_category_falls_through_to_title():
+    """DAMDAM 2026-07-01: a Vitamin C serum whose category resolved to "set" was
+    probed as "best set" and returned cookware brands as skincare rivals. Generic
+    container categories are rejected so the anchor derives from the title."""
+    from services.agent_center_bd_report_service import (
+        _category_for_unbranded_prompts,
+        _unbranded_category_specs,
+    )
+
+    product = {"title": "GINKGO BOUNCY Water Cream", "product_type": "set"}
+    category = _category_for_unbranded_prompts(product, "set", {})
+    assert category not in {"set", "gift set", "kit", "bundle", "collection"}
+    assert "cream" in category  # title-derived, not the bundle label
+
+    # And a container category passed straight to the spec builder yields nothing.
+    assert _unbranded_category_specs(
+        category="gift set", graph={}, topics=[], bullets=[],
+    ) == []
+
+
+def test_lane_product_evidence_drops_promo_phrases():
+    """DAMDAM 2026-07-01: "skincare discount" rode PDP/banner copy into the lane
+    evidence phrases and became the merchant's headline recommendation. The lane
+    evidence collector must gate promo phrases the same way query generation does."""
+    from services.sku_lane_priority import build_lane_product_evidence
+
+    evidence = build_lane_product_evidence(
+        product={
+            "title": "GINKGO BOUNCY Water Cream",
+            "product_type": "moisturizer",
+            "tags": ["skincare discount", "free shipping", "hydrating"],
+        },
+    )
+    phrases = " | ".join(evidence["phrases"]).lower()
+    assert "discount" not in phrases
+    assert "free shipping" not in phrases
+    # A real attribute from the same tag list is kept.
+    assert any("hydrating" in p for p in evidence["phrases"])
+
+
 def test_promo_terms_never_become_query_axis_terms():
     """Regression: a promotional/marketing term ("skincare discount") leaked in as
     an enrichment topic and produced nonsense merchant-facing queries like
