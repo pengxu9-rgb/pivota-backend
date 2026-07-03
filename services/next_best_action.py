@@ -854,19 +854,22 @@ def _sku_lane_chip(lane: Optional[Mapping[str, Any]]) -> Dict[str, Any]:
 
 
 def _sku_gap_chip(gap: Optional[Mapping[str, Any]]) -> Dict[str, Any]:
+    """Merchant-facing evidence chip for a scoring gap. Carries ONLY merchant-safe
+    copy: the `label`/`why` from _GAP_DISPLAY and a humanized `descriptor` (the
+    bucket name with underscores stripped, e.g. "vertical structure") used by the
+    content-revision prescription. The raw scoring keys (dimension="citation",
+    bucket="first_party_rate"), the internal `reason`, and the 0-100
+    points/max/gap model are internal vocabulary and must NOT ride into the
+    merchant-facing next-best-action evidence — they have no frontend consumer
+    and the sanitizer does not reach this chip. The raw gap objects keep those
+    keys for internal sort/match; the chip does not."""
     if not gap:
         return {}
+    descriptor = str(gap.get("bucket") or "").replace("_", " ").strip()
     return {
-        "dimension": gap.get("dimension"),
-        "bucket": gap.get("bucket"),
-        "points": gap.get("points"),
-        "max": gap.get("max"),
-        "gap": gap.get("gap"),
-        # Merchant-safe copy from _GAP_DISPLAY. The raw scoring `reason` is
-        # internal vocabulary and must not ride into the merchant-facing
-        # next-best-action evidence.
         "label": gap.get("label"),
         "why": gap.get("why"),
+        "descriptor": descriptor or None,
     }
 
 
@@ -963,6 +966,11 @@ def _sku_failing_prompt_chip(prompt: Any) -> Optional[Dict[str, Any]]:
 
 
 def _sku_gap_label(gap: Mapping[str, Any]) -> str:
+    # `gap` here is the merchant-facing chip: use its humanized `descriptor`
+    # (from _sku_gap_chip), falling back for a raw gap or an empty chip.
+    descriptor = str(gap.get("descriptor") or "").strip()
+    if descriptor:
+        return descriptor
     bucket = str(gap.get("bucket") or "content_richness").strip()
     return bucket.replace("_", " ")
 
@@ -1839,7 +1847,9 @@ def _sku_secondary_moves(
             "reason": why or (
                 "This is the next area to strengthen after your top priority above."
             ),
-            "evidence": _sku_gap_chip(gap),
+            # Only the merchant-safe label/why — never the chip's `descriptor`
+            # (a humanized bucket like "first party rate" reads as jargon here).
+            "evidence": {"label": gap.get("label"), "why": gap.get("why")},
         })
         if len(moves) >= 2:
             return moves

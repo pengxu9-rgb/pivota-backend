@@ -733,13 +733,14 @@ def test_sku_secondary_moves_never_leak_internal_metric_names():
     assert moves, "expected a secondary move from the citation gap"
     move = moves[0]
     assert move["title"] == "Cited as the source"
-    # No internal vocabulary anywhere in the merchant-facing strings.
-    blob = " ".join(
-        str(move.get(k) or "") for k in ("title", "concrete_next_step", "reason")
-    ).lower()
-    for leak in ("first_party_rate", "citation.", "missing points", "score gap", "bucket"):
+    # No internal vocabulary anywhere in the merchant-facing move — INCLUDING the
+    # evidence chip, which the sanitizer does not reach.
+    blob = json.dumps(move).lower()
+    for leak in ("first_party_rate", "citation.", "missing points", "score gap", "bucket", "dimension"):
         assert leak not in blob, (leak, move)
     assert move["reason"].startswith("When AI answers")
+    # The evidence chip carries only merchant-safe copy.
+    assert set(move["evidence"]) <= {"label", "why"}
 
 
 def test_sku_nba_content_gap_references_content_richness_bucket():

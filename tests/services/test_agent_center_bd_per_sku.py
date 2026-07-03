@@ -736,6 +736,30 @@ def test_generic_container_category_falls_through_to_title():
     ) == []
 
 
+def test_container_category_never_reaches_the_filler_pool():
+    """The filler-pool path builds queries straight off product_type; a container
+    product_type ("set") must not produce 'best set to buy online' / 'compare set
+    options' filler even when base+sidewalk under-fill the target."""
+    from services.agent_center_bd_report_service import _build_per_sku_audit_query_records
+
+    ctx = {
+        "sku_key": "sku-set",
+        "merchant_id": "m-1",
+        "product": {"title": "GINKGO BOUNCY Water Cream", "product_type": "set"},
+    }
+    container_filler = (
+        "top set", "recommended set", "best rated set", "popular set",
+        "compare set options", "set reviews", "best set to buy online",
+    )
+    for n in (8, 16, 40):
+        records = _build_per_sku_audit_query_records(ctx, n)
+        assert records, ("expected queries", n)
+        for record in records:
+            q = str(record["query"]).lower()
+            for junk in container_filler:
+                assert junk not in q, ("container filler leaked", n, junk, record["query"])
+
+
 def test_lane_product_evidence_drops_promo_phrases():
     """DAMDAM 2026-07-01: "skincare discount" rode PDP/banner copy into the lane
     evidence phrases and became the merchant's headline recommendation. The lane

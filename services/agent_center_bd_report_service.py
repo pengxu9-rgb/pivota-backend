@@ -8586,7 +8586,11 @@ def _build_per_sku_audit_query_records(
             (f"{filler_cat} reviews", "category"),
             (f"best {filler_cat} to buy online", "category"),
         ])
-        if filler_cat and filler_cat not in {"product", "products", "item", "items"}
+        if (
+            filler_cat
+            and filler_cat not in _GENERIC_CONTAINER_CATEGORIES
+            and not _noisy_prompt_category(filler_cat)
+        )
         else []
     )
     if not sidewalk_records:
@@ -10986,6 +10990,13 @@ async def run_brand_report(
                 _fp_total += int(_fp.get("denominator") or 0)
             except (TypeError, ValueError):
                 continue
+        # _fp_total > 0 holds whenever a scored verdict is reached: a non-None
+        # median_citation means at least one SKU's compute_citation_score
+        # returned non-None, which only happens when len(runs) > 0, and
+        # first_party_rate.denominator == len(runs). The guard is belt-and-
+        # suspenders (evidence with total=0 would render a nonsensical
+        # "None of 0 queries"); _per_sku_brand_verdict routes the true
+        # no-signal case to the blocked/insufficient branch before verdict_for.
         _brand_verdict_evidence = (
             {
                 "attribution_runs_total": _fp_total,
