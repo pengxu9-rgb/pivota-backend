@@ -1624,6 +1624,7 @@ def _per_sku_brand_verdict(
     median_citation: Optional[int],
     total_skus: int,
     blocked_count: int,
+    evidence: Optional[Dict[str, Any]] = None,
 ) -> Tuple[str, str, str]:
     """Honest brand-level verdict for the per-SKU audit.
 
@@ -1631,6 +1632,14 @@ def _per_sku_brand_verdict(
     at all (median is None — typically every SKU is blocked / not yet indexed),
     do NOT pass 0 into verdict_for: that emits a false bottom-tier "invisible"
     verdict with no path forward. Tell the merchant the truth instead.
+
+    `evidence` carries the brand's real citation counts (attribution_runs_total,
+    merchant_cited_runs summed across SKUs). Passing it is what stops an
+    INVISIBLE verdict from asserting the absolute falsehood "your URL did not
+    appear in any grounded source": with evidence, _explain_verdict reports the
+    honest "cited in N of M queries" and only claims total absence when the
+    merchant-cited count is genuinely 0 (the ANUKO 2026-07-02 regression, where
+    the brand was first-party cited on real prompts yet told it was invisible).
     """
     if median_citation is None:
         if total_skus > 0 and blocked_count >= total_skus:
@@ -1638,7 +1647,9 @@ def _per_sku_brand_verdict(
             return BRAND_STATE_BLOCKED_PRE_INDEX, label, explanation
         label, explanation = _BRAND_VERDICT_INSUFFICIENT_SIGNAL
         return BRAND_STATE_INSUFFICIENT_SIGNAL, label, explanation
-    label, explanation = verdict_for(int(median_citation), int(median_citation))
+    label, explanation = verdict_for(
+        int(median_citation), int(median_citation), evidence=evidence,
+    )
     return BRAND_STATE_SCORED, label, explanation
 
 
@@ -10864,11 +10875,36 @@ async def run_brand_report(
         )
         # Honest brand verdict — see _per_sku_brand_verdict. A blocked /
         # pre-index brand must NOT collapse to a false "invisible" verdict;
-        # the get-indexed action becomes step 1 below.
+        # the get-indexed action becomes step 1 below. Sum the per-SKU
+        # first-party citation counts so an INVISIBLE explanation reports the
+        # real "cited in N of M queries" instead of falsely asserting the
+        # merchant URL never appeared in any grounded source.
+        _fp_cited = 0
+        _fp_total = 0
+        for _r in per_sku_reports:
+            _fp = (
+                (((_r.get("scores") or {}).get("citation") or {}).get("breakdown") or {})
+                .get("first_party_rate")
+                or {}
+            )
+            try:
+                _fp_cited += int(_fp.get("numerator") or 0)
+                _fp_total += int(_fp.get("denominator") or 0)
+            except (TypeError, ValueError):
+                continue
+        _brand_verdict_evidence = (
+            {
+                "attribution_runs_total": _fp_total,
+                "merchant_cited_runs": _fp_cited,
+            }
+            if _fp_total > 0
+            else None
+        )
         brand_state, legacy_label, brand_verdict_explanation = _per_sku_brand_verdict(
             median_citation,
             len(per_sku_reports),
             len(brand_rollup.get("blocked_skus") or []),
+            evidence=_brand_verdict_evidence,
         )
         brand_rollup["brand_state"] = brand_state
         brand_rollup["brand_verdict_label"] = legacy_label
