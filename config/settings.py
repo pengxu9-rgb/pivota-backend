@@ -244,6 +244,18 @@ class Settings(BaseSettings):
     # path must remain deterministic unless explicitly enabled and keyed.
     strategic_brief_provider: str = os.getenv("STRATEGIC_BRIEF_PROVIDER", "deepseek")
     strategic_brief_model: str = os.getenv("STRATEGIC_BRIEF_MODEL", "")
+
+    # Stage-1 LLM prompt generation (extract_winnable_prompts): ON by default —
+    # deterministic templates alone can't produce the specific value-prop
+    # discovery prompts a long-tail brand can actually win. Kill switch per env.
+    # Provider/model are SEPARATE from the strategic brief so prompt-generation
+    # models can be A/B compared in prod without touching brief quality
+    # (fallback chain: PROMPT_GEN_* -> STRATEGIC_BRIEF_* -> provider default).
+    prompt_gen_enabled: bool = (
+        os.getenv("AUDIT_LLM_PROMPT_GEN_ENABLED", "true").lower() == "true"
+    )
+    prompt_gen_provider: str = os.getenv("PROMPT_GEN_PROVIDER", "")
+    prompt_gen_model: str = os.getenv("PROMPT_GEN_MODEL", "")
     strategic_brief_enabled: bool = (
         os.getenv("STRATEGIC_BRIEF_ENABLED", "false").lower() == "true"
     )

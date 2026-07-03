@@ -8594,22 +8594,37 @@ def _build_per_sku_audit_query_records(
         else []
     )
     if not sidewalk_records:
-        return _fill_per_sku_query_records(
+        records = _fill_per_sku_query_records(
             base_records,
             target=target,
             title=title,
             filler_pool=filler_pool,
         )
-    # All target sizes go through the sidewalk-majority budgeter (was: only target<=16;
-    # target>16 took an unbudgeted base+sidewalk path that let general base prompts
-    # crowd out the specific long-tail). Credit-neutral; specific is now the majority.
-    return _budgeted_wedge_query_records(
-        base_records=base_records,
-        sidewalk_records=sidewalk_records,
-        target=target,
-        title=title,
-        filler_pool=filler_pool,
-    )
+    else:
+        # All target sizes go through the sidewalk-majority budgeter (was: only
+        # target<=16; target>16 took an unbudgeted base+sidewalk path that let
+        # general base prompts crowd out the specific long-tail). Credit-neutral;
+        # specific is now the majority.
+        records = _budgeted_wedge_query_records(
+            base_records=base_records,
+            sidewalk_records=sidewalk_records,
+            target=target,
+            title=title,
+            filler_pool=filler_pool,
+        )
+    # Stamp LLM-generated discovery prompts so per-model prompt quality is
+    # comparable across runs (records keep their coarse "category" axis; the
+    # source key is additive observability, mirroring "sidewalk_candidate").
+    winnable = {
+        str(w or "").strip().lower()
+        for w in ((sku_ctx or {}).get("_winnable_prompts") or [])
+        if str(w or "").strip()
+    }
+    if winnable:
+        for record in records:
+            if str(record.get("query") or "").strip().lower() in winnable:
+                record["source"] = "llm_winnable"
+    return records
 
 
 def _query_metadata_from_records(
@@ -9117,15 +9132,25 @@ async def extract_winnable_prompts(
         if isinstance(attrs.get("tags"), list):
             tags = [str(t) for t in attrs["tags"]][:20]
     try:
+        # Prompt-generation model is independently configurable so different
+        # generators can be A/B compared in prod (PROMPT_GEN_PROVIDER/MODEL),
+        # falling back to the strategic-brief settings, then deepseek.
         provider = normalize_provider(
-            getattr(app_settings, "strategic_brief_provider", None) or "deepseek"
+            str(getattr(app_settings, "prompt_gen_provider", "") or "").strip()
+            or getattr(app_settings, "strategic_brief_provider", None)
+            or "deepseek"
         )
     except LLMSynthesisError:
         return []
     if not configured_key_for_provider(provider):
+        logger.warning(
+            "winnable-prompt extraction skipped: no API key for provider=%s",
+            provider,
+        )
         return []
     model = (
-        str(getattr(app_settings, "strategic_brief_model", "") or "").strip()
+        str(getattr(app_settings, "prompt_gen_model", "") or "").strip()
+        or str(getattr(app_settings, "strategic_brief_model", "") or "").strip()
         or default_model_for_provider(provider)
     )
     content = {
@@ -9162,6 +9187,21 @@ async def extract_winnable_prompts(
         out.append(s)
         if len(out) >= max_prompts:
             break
+    # Observability: this stage failed SILENTLY for a whole run once (ANUKO
+    # 2026-07-02 — zero LLM prompts, no trace). Always log the outcome with the
+    # provider/model so per-model prompt quality can be compared across runs
+    # and an empty result is a visible signal, not a mystery.
+    if out:
+        logger.info(
+            "winnable-prompts: provider=%s model=%s title=%r -> %d prompts: %s",
+            provider, model, title[:60], len(out), out,
+        )
+    else:
+        logger.warning(
+            "winnable-prompts: provider=%s model=%s title=%r -> EMPTY "
+            "(parse/validation dropped everything; raw len=%d)",
+            provider, model, title[:60], len(str(result.get("text") or "")),
+        )
     return out
 
 

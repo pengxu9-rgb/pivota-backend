@@ -67,3 +67,71 @@ def test_spec_builder_appends_winnable_prompts_as_discovery():
     assert "bond repair hair oil for breakage" in queries
     # they ride the discovery ("category") axis
     assert ("bond repair hair oil for breakage", "category") in specs
+
+
+@pytest.mark.asyncio
+async def test_prompt_gen_provider_overrides_brief_provider(monkeypatch):
+    """PROMPT_GEN_PROVIDER/MODEL select the stage-1 generation model
+    independently of the strategic brief, so generators can be A/B compared in
+    prod. Fallback chain: prompt_gen_* -> strategic_brief_* -> provider default."""
+    import json as _json
+    from config.settings import settings as app_settings
+    import services.llm_synthesis as llm
+
+    monkeypatch.setattr(app_settings, "strategic_brief_provider", "deepseek", raising=False)
+    monkeypatch.setattr(app_settings, "strategic_brief_model", "deepseek-chat", raising=False)
+    monkeypatch.setattr(app_settings, "prompt_gen_provider", "openai", raising=False)
+    monkeypatch.setattr(app_settings, "prompt_gen_model", "gpt-4o-mini", raising=False)
+
+    captured = {}
+
+    async def fake_synthesize(**kwargs):
+        captured.update(kwargs)
+        return {"text": _json.dumps(["best bond repair oil for damaged hair"])}
+
+    monkeypatch.setattr(llm, "synthesize", fake_synthesize, raising=False)
+    monkeypatch.setattr(llm, "configured_key_for_provider", lambda p: "sk-test", raising=False)
+    monkeypatch.setattr(llm, "default_model_for_provider", lambda p: "default-model", raising=False)
+
+    out = await svc.extract_winnable_prompts(
+        {"product": {"title": "Anuko Bond & Repair Hair Oil", "vendor": "Anuko"}}
+    )
+    assert out == ["best bond repair oil for damaged hair"]
+    assert captured["provider"] == "openai"
+    assert captured["model"] == "gpt-4o-mini"
+
+
+def test_prompt_gen_enabled_setting_defaults_on():
+    """The stage-1 LLM prompt-gen gate exists and defaults ON (env kill switch
+    AUDIT_LLM_PROMPT_GEN_ENABLED). The worker reads this as the default when a
+    launch option doesn't specify winnable_prompts."""
+    from config.settings import settings as app_settings
+
+    assert getattr(app_settings, "prompt_gen_enabled") is True
+
+
+def test_query_records_stamp_llm_winnable_source():
+    """LLM-generated discovery prompts are stamped source='llm_winnable' in the
+    query records so per-model prompt quality is comparable across runs."""
+    sku_ctx = {
+        "sku_key": "s1",
+        "merchant_id": "m1",
+        "product": {
+            "title": "Anuko Bond & Repair Hair Oil",
+            "vendor": "Anuko",
+            "product_type": "hair oil",
+        },
+        "_winnable_prompts": ["bond repair hair oil for chemically damaged hair"],
+    }
+    records = svc._build_per_sku_audit_query_records(sku_ctx, 14)
+    by_query = {str(r.get("query")).lower(): r for r in records}
+    marked = by_query.get("bond repair hair oil for chemically damaged hair")
+    assert marked is not None, "winnable prompt must survive budgeting at target=14"
+    assert marked.get("source") == "llm_winnable"
+    assert marked.get("axis") == "category"
+    # deterministic records are untouched
+    assert all(
+        r.get("source") != "llm_winnable"
+        for q, r in by_query.items()
+        if q != "bond repair hair oil for chemically damaged hair"
+    )
