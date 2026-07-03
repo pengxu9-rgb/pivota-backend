@@ -9,6 +9,7 @@ rollups or content-revision wiring.
 from __future__ import annotations
 
 import logging
+import re
 from typing import Any, Dict, List, Mapping, Optional, Tuple
 from urllib.parse import urlsplit
 
@@ -217,8 +218,14 @@ def build_sku_next_best_action(
     merchant_host: Optional[str] = None,
     sku_key: Optional[str] = None,
     catalog_unavailable: bool = False,
+    competitor_intel: Optional[Any] = None,
 ) -> Dict[str, Any]:
     """Build a deterministic per-SKU next-best-action prescription.
+
+    `competitor_intel` (when provided) is the grounded "what the category winner
+    is known for" probe result — {competitor, attributes_present, known_for}. It
+    lets the content-gap / substitution moves name the actual winner and the
+    decision factors AI credits them with, instead of generic "add more detail".
 
     `catalog_unavailable=True` (URL audits — a pasted product with no synced
     catalog) suppresses the "get indexed / serving" primary gate: serving
@@ -250,6 +257,7 @@ def build_sku_next_best_action(
         identity=_as_mapping(identity),
         sku_title=sku_title,
         merchant_host=merchant_host,
+        competitor_intel=competitor_intel,
     )
     prescription = _sku_prescription_for_gap(
         primary_gap=primary_gap,
@@ -443,12 +451,14 @@ def _build_sku_evidence_used(
     identity: Mapping[str, Any],
     sku_title: Optional[str],
     merchant_host: Optional[str],
+    competitor_intel: Optional[Any] = None,
 ) -> Dict[str, Any]:
     sideways_wedge = _as_mapping(opportunity.get("sideways_wedge")) or build_sideways_wedge(
         _as_list(opportunity.get("per_prompt")),
         product_evidence=_as_mapping(opportunity.get("product_evidence")),
     )
     return {
+        "competitor_intel": _sku_competitor_intel_chip(competitor_intel),
         "sku_title": _sku_title(identity=identity, sku_title=sku_title),
         "identity": dict(identity),
         "merchant_path": _merchant_path(identity=identity, opportunity=opportunity),
@@ -548,6 +558,26 @@ def _sku_prescription_for_gap(
     if primary_gap == PRIMARY_SKU_SUBSTITUTION_LEAK:
         substitute = str(substitution.get("substituted_by") or "a competitor").strip()
         prompt = _sku_query_phrase(substitution.get("prompt"))
+        # If the grounded winner probe assessed THIS substitute, fold in the
+        # decision factors AI credits them with so the comparison meets them
+        # head-on instead of a generic "vs" page. Only when the names match, so
+        # we never attribute one competitor's factors to another.
+        win = _as_mapping(evidence.get("competitor_intel"))
+        attrs_phrase = (
+            _phrase(_as_str_list(win.get("attributes")), "")
+            if str(win.get("competitor") or "").strip().lower() == substitute.lower()
+            else ""
+        )
+        compare_action = (
+            f"Make a clear {sku_title} vs {substitute} comparison — meet them on "
+            f"what AI credits {substitute} for ({attrs_phrase}) where you match, "
+            "plus use cases, proof, and price — so the choice is obvious."
+            if attrs_phrase
+            else (
+                f"Make a clear {sku_title} vs {substitute} comparison: use cases, "
+                "what's different, proof, and price, so the choice is obvious."
+            )
+        )
         return _base_payload(
             primary_gap=primary_gap,
             headline=f"When buyers ask for alternatives, AI names {substitute}, not {sku_title}.",
@@ -558,10 +588,7 @@ def _sku_prescription_for_gap(
             ),
             first_move=f"Publish a comparison — {sku_title} vs {substitute} — showing when you win.",
             self_serve_actions=[
-                (
-                    f"Make a clear {sku_title} vs {substitute} comparison: use cases, "
-                    "what's different, proof, and price, so the choice is obvious."
-                ),
+                compare_action,
                 (
                     f"Answer the {prompt} question on your own page so it resolves to "
                     "you, not a third party."
@@ -580,20 +607,66 @@ def _sku_prescription_for_gap(
         gap_why = str(content_gap.get("why") or "").strip()
         if gap_why and not gap_why.endswith("."):
             gap_why += "."
-        why_this_first = (
-            "AI can't confidently recommend a product it can't read. "
-            + (
-                gap_why
-                or f"{sku_title}'s page doesn't yet answer what shoppers ask."
+        # Competitor-targeted framing: when we know who wins the category and the
+        # decision factors AI credits them with (grounded probe, not fabricated),
+        # name them so the merchant fills the page with the specifics that decide
+        # THIS category — not a generic "add more detail". Falls back to the
+        # generic copy when there's no assessed winner (competitor_intel empty).
+        win = _as_mapping(evidence.get("competitor_intel"))
+        competitor = str(win.get("competitor") or "").strip()
+        attrs_phrase = _phrase(_as_str_list(win.get("attributes")), "")
+        if competitor:
+            headline = (
+                f"Give AI enough on {sku_title}'s page to pick you over {competitor}."
             )
-            + " That's the first fix."
-        )
-        return _base_payload(
-            primary_gap=primary_gap,
-            headline=f"Fill the gaps on {sku_title}'s page before chasing reach.",
-            why_this_first=why_this_first,
-            first_move=f"Strengthen {sku_title}'s page: {gap_phrase}.",
-            self_serve_actions=[
+            why_this_first = (
+                f"When shoppers ask the category question, AI recommends "
+                f"{competitor}, not {sku_title} — and {sku_title}'s page is still "
+                "too thin for AI to compare you against it. "
+                + (
+                    f"AI credits {competitor} for {attrs_phrase}; cover those same "
+                    f"decision points on your page (only where they're true of "
+                    f"{sku_title}) so AI can weigh you against them. "
+                    if attrs_phrase
+                    else ""
+                )
+                + "That's the first fix."
+            )
+            first_move = (
+                f"Strengthen {sku_title}'s page: {gap_phrase}"
+                + (
+                    f", leading with the specifics AI rewards {competitor} for — "
+                    f"{attrs_phrase}"
+                    if attrs_phrase
+                    else ""
+                )
+                + "."
+            )
+            self_serve_actions = [
+                (
+                    f"State the decision factors AI credits {competitor} with"
+                    + (f" — {attrs_phrase} — " if attrs_phrase else " ")
+                    + f"in plain text on {sku_title}'s page, only where they're "
+                    "genuinely true of your product."
+                ),
+                (
+                    "Fill the rest in plain language — what it is, who it's for, "
+                    "how to use it, the facts a buyer needs to decide — then "
+                    "re-run the audit to confirm they landed."
+                ),
+            ]
+        else:
+            headline = f"Fill the gaps on {sku_title}'s page before chasing reach."
+            why_this_first = (
+                "AI can't confidently recommend a product it can't read. "
+                + (
+                    gap_why
+                    or f"{sku_title}'s page doesn't yet answer what shoppers ask."
+                )
+                + " That's the first fix."
+            )
+            first_move = f"Strengthen {sku_title}'s page: {gap_phrase}."
+            self_serve_actions = [
                 (
                     "Fill the gap in plain language: what it is, who it's for, "
                     "how to use it, and the facts a buyer needs to decide."
@@ -602,7 +675,13 @@ def _sku_prescription_for_gap(
                     "Make sure those facts show up in the page itself, then re-run "
                     "the audit to confirm they landed."
                 ),
-            ],
+            ]
+        return _base_payload(
+            primary_gap=primary_gap,
+            headline=headline,
+            why_this_first=why_this_first,
+            first_move=first_move,
+            self_serve_actions=self_serve_actions,
             pivota_path=first_pivota_path,
             evidence_used=evidence,
             cta=_sku_cta("Publish the enriched product page"),
@@ -910,6 +989,34 @@ def _sku_gap_chip(gap: Optional[Mapping[str, Any]]) -> Dict[str, Any]:
     return {
         "label": gap.get("label"),
         "why": gap.get("why"),
+    }
+
+
+def _sku_competitor_intel_chip(competitor_intel: Optional[Any]) -> Dict[str, Any]:
+    """Merchant-safe chip for the grounded category-winner probe.
+
+    Carries the winner's name + the decision factors AI credits them with
+    (`attributes_present`, humanized) so the content-gap / substitution moves can
+    target the actual winner instead of prescribing generic "add more detail".
+    Empty dict when the probe wasn't run or found no assessed winner — callers
+    fall back to the generic copy. Only grounded, AI-named attributes ride in; no
+    claim is made about the merchant's own product."""
+    intel = _as_mapping(competitor_intel)
+    if intel.get("status") != "assessed":
+        return {}
+    competitor = str(intel.get("competitor") or "").strip()
+    if not competitor:
+        return {}
+    attrs: List[str] = []
+    seen = set()
+    for raw in _as_str_list(intel.get("attributes_present")):
+        label = re.sub(r"[_\-]+", " ", raw).strip().lower()
+        if label and label not in seen:
+            seen.add(label)
+            attrs.append(label)
+    return {
+        "competitor": competitor,
+        "attributes": attrs[:4],
     }
 
 
