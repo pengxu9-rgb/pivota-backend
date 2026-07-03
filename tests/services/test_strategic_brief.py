@@ -2229,3 +2229,81 @@ def test_own_product_facts_license_brand_angle_and_ingredients():
         {"your_angle": "Your wedge is bond technology that repairs disulfide bonds."},
         evidence,
     ) is True
+
+
+# ---------------------------------------------------------------------------
+# Brief-reliability fixes (2026-07-03): cited-host display names + provider chain
+
+
+def _grounding_evidence():
+    return {
+        "product": {
+            "title": "Anuko Hair Oil", "brand": "Anuko",
+            "merchant_host": "anukoofficial.com",
+            "attributes": {"ingredient": ["argan oil"], "category": ["hair oil"]},
+        },
+        "category_answers": [{
+            "recommends": ["Olaplex", "Moroccanoil"],
+            "cited_sources": ["whowhatwear.com", "reddit.com", "sephora.com",
+                              "nbcnews.com", "hwahae.com"],
+        }],
+    }
+
+
+def test_cited_host_display_names_do_not_trip_unknown_entity():
+    """A brief that names a REAL cited source in its natural display form must
+    pass — the significant-words collapse dropped common words so 'Who What
+    Wear' (whowhatwear.com) / 'NBC News' (nbcnews.com) / possessive 'Reddit's'
+    were wrongly rejected, forcing the deterministic fallback."""
+    ev = _grounding_evidence()
+    allowed = strategic_brief._allowed_grounding(ev)
+    for name in ["Who What Wear", "NBC News", "Reddit's", "Olaplex", "Sephora"]:
+        assert strategic_brief._entity_allowed(name, allowed), name
+
+
+def test_full_prose_brief_naming_real_hosts_passes():
+    ev = _grounding_evidence()
+    brief = {
+        "why_you_lose": "AI cites Who What Wear and NBC News, which rank Olaplex and Moroccanoil.",
+        "channel_plan": "Pitch Who What Wear; seed Reddit's community with your argan oil facts.",
+    }
+    assert strategic_brief._grounding_failures(brief, ev) == []
+
+
+def test_fabricated_entities_still_rejected():
+    """The recognition fix must NOT loosen the anti-fabrication guarantee: a
+    brand/host NOT in the evidence is still an unknown-entity failure."""
+    ev = _grounding_evidence()
+    for bad in [
+        {"why_you_lose": "Karethic and Aunt Jackie's dominate this category."},
+        {"the_call": "Pitch Cosmoprof for retail placement."},
+        {"the_call": "Beat FakeBrand Labs by owning the argan oil lane."},
+    ]:
+        failures = strategic_brief._grounding_failures(bad, ev)
+        assert any(f.startswith("unknown-entity") for f in failures), bad
+
+
+def test_resolve_brief_provider_defaults_gemini_then_falls_back(monkeypatch):
+    import services.strategic_brief as sb
+    from config.settings import settings
+
+    monkeypatch.setattr(settings, "strategic_brief_provider", "gemini", raising=False)
+
+    # gemini key present -> gemini
+    monkeypatch.setattr(sb, "configured_key_for_provider", lambda p: "k", raising=False)
+    assert sb._resolve_brief_provider(None) == "gemini"
+
+    # gemini key absent -> deepseek fallback
+    monkeypatch.setattr(
+        sb, "configured_key_for_provider",
+        lambda p: None if p == "gemini" else "k", raising=False,
+    )
+    assert sb._resolve_brief_provider(None) == "deepseek"
+
+    # no keys anywhere -> None (deterministic fallback path)
+    monkeypatch.setattr(sb, "configured_key_for_provider", lambda p: None, raising=False)
+    assert sb._resolve_brief_provider(None) is None
+
+    # explicit provider override wins
+    monkeypatch.setattr(sb, "configured_key_for_provider", lambda p: "k", raising=False)
+    assert sb._resolve_brief_provider("anthropic") == "anthropic"

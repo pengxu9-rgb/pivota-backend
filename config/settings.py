@@ -240,9 +240,13 @@ class Settings(BaseSettings):
     # support, which the probe relies on for predictable JSON outputs.
     deepseek_model: str = os.getenv("DEEPSEEK_MODEL", "deepseek-chat")
 
-    # Strategic brief synthesis (per-SKU Wave 1). Default-off: the report
-    # path must remain deterministic unless explicitly enabled and keyed.
-    strategic_brief_provider: str = os.getenv("STRATEGIC_BRIEF_PROVIDER", "deepseek")
+    # Strategic brief synthesis (per-SKU Wave 1). Default generator = Gemini
+    # Flash (founder call 2026-07-03): far better instruction adherence than
+    # DeepSeek on the brief's strict grounding rules (no forbidden words, no
+    # competitor-lack claims, only evidence entities), which is what drove the
+    # rich↔deterministic-fallback flip. Key-aware: falls back to DeepSeek when
+    # the Gemini key is absent (see _resolve_brief_provider).
+    strategic_brief_provider: str = os.getenv("STRATEGIC_BRIEF_PROVIDER", "gemini")
     strategic_brief_model: str = os.getenv("STRATEGIC_BRIEF_MODEL", "")
 
     # Stage-1 LLM prompt generation (extract_winnable_prompts): ON by default —
