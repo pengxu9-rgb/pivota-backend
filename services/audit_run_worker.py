@@ -493,6 +493,8 @@ async def _process_one_audit_run_inner(
                     if row.get("run_id") != run_id
                 ]
                 if audit_mode == "per_sku":
+                    from config.settings import settings
+
                     probe_runs_by_sku = await run_per_sku_audit_probe_fanout(
                         merchant_id=merchant_id,
                         audit_run_id=run_id,
@@ -504,9 +506,18 @@ async def _process_one_audit_run_inner(
                         # Merchant-input prompt slots (debited as prompt credits
                         # at enqueue). Probe them so they aren't billed-but-dropped.
                         custom_prompts=launch_options.get("custom_prompts"),
-                        # Opt-in (URL audits): LLM value-prop extraction -> probe
-                        # winnable SPECIFIC discovery prompts, not just generic heads.
-                        winnable_prompts=bool(launch_options.get("winnable_prompts")),
+                        # LLM value-prop extraction -> probe winnable SPECIFIC
+                        # discovery prompts, not just generic heads. Default ON
+                        # (settings.prompt_gen_enabled, env-killable); a launch
+                        # option still overrides explicitly either way. Was
+                        # opt-in — which left the paid catalog audit running on
+                        # deterministic templates only.
+                        winnable_prompts=bool(
+                            launch_options.get(
+                                "winnable_prompts",
+                                getattr(settings, "prompt_gen_enabled", True),
+                            )
+                        ),
                     )
                     await mar.record_partial_result(
                         run_id=run_id,
