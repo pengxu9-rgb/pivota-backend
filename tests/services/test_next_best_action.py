@@ -698,6 +698,86 @@ def test_sku_nba_substitution_names_substitute_in_first_move():
     _assert_70_30(nba)
 
 
+def test_blocked_thin_content_leads_with_foundation_not_substitution():
+    """#9 (ANUKO 2026-07-02): a blocked SKU (content 14) with a substitution
+    alert must lead with the content foundation fix, not a 'vs competitor'
+    comparison — AI can't win a lane it can't even read the product in."""
+    opportunity = _sku_base_opportunity()
+    opportunity["substitution_alert"] = {
+        "present": True,
+        "prompt": "ANUKO hair oil alternatives",
+        "substituted_by": "K18",
+        "engines": ["gemini"],
+    }
+    # Content critically thin (blocked band); other dims low too.
+    scores = {
+        "identity": {"score": 23},
+        "content_richness": {"score": 14},
+        "routability": {"score": 6},
+        "citation": {"score": 21},
+    }
+
+    nba = build_sku_next_best_action(
+        opportunity=opportunity,
+        scores=scores,
+        identity=_sku_identity(),
+        sku_title="ANUKO Bond & Repair Hair Oil",
+        catalog_unavailable=True,  # URL-wedge: get_indexed gate is skipped
+    )
+    assert nba["primary_gap"] == PRIMARY_SKU_CONTENT_REVISION_GAP
+    assert "comparison" not in nba["first_move"].lower()
+
+
+def test_readable_content_still_leads_with_substitution():
+    """The foundation-first override only fires in the blocked band: a SKU with
+    readable content (>=40) and a substitution alert still leads with the
+    comparison move."""
+    opportunity = _sku_base_opportunity()
+    opportunity["substitution_alert"] = {
+        "present": True,
+        "prompt": "BB Lab collagen alternatives",
+        "substituted_by": "Vital Proteins",
+        "engines": ["gemini"],
+    }
+    scores = {
+        "identity": {"score": 70},
+        "content_richness": {"score": 55},  # readable — above blocked band
+        "routability": {"score": 60},
+        "citation": {"score": 50},
+    }
+    nba = build_sku_next_best_action(
+        opportunity=opportunity, scores=scores, identity=_sku_identity(),
+        sku_title="BB Lab Good Night Collagen",
+    )
+    assert nba["primary_gap"] == PRIMARY_SKU_SUBSTITUTION_LEAK
+
+
+def test_foundation_first_boundary_is_strict_less_than_40():
+    """The blocked-band boundary is exclusive: content_richness EXACTLY 40 is
+    readable enough → substitution still leads. And an UNMEASURED content score
+    (None) must not trigger foundation-first over a real demand signal."""
+    def _nba(content_score):
+        opportunity = _sku_base_opportunity()
+        opportunity["substitution_alert"] = {
+            "present": True, "prompt": "alts", "substituted_by": "K18",
+            "engines": ["gemini"],
+        }
+        scores = {
+            "identity": {"score": 50},
+            "content_richness": {"score": content_score},
+            "routability": {"score": 50},
+            "citation": {"score": 40},
+        }
+        return build_sku_next_best_action(
+            opportunity=opportunity, scores=scores, identity=_sku_identity(),
+            sku_title="X",
+        )
+
+    assert _nba(40)["primary_gap"] == PRIMARY_SKU_SUBSTITUTION_LEAK   # boundary
+    assert _nba(39)["primary_gap"] == PRIMARY_SKU_CONTENT_REVISION_GAP  # below
+    assert _nba(None)["primary_gap"] == PRIMARY_SKU_SUBSTITUTION_LEAK  # unmeasured
+
+
 def test_sku_secondary_moves_never_leak_internal_metric_names():
     """ANUKO 2026-07-02: a secondary move titled 'Fix citation.first_party_rate'
     exposed the internal dimension.bucket to the merchant. Secondary moves must

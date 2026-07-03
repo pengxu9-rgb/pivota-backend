@@ -58,6 +58,46 @@ def _gsc_enabled() -> bool:
         return False
 
 
+def _pivota_submit_enabled() -> bool:
+    """Non-raising check for the Pivota-owned (service-account) submit path."""
+    try:
+        from config.settings import settings
+        return bool(getattr(settings, "gsc_pivota_submit_enabled", False))
+    except Exception:  # noqa: BLE001
+        return False
+
+
+# Pivota's own canonical-PDP host. Canonical URLs (agent.pivota.cc/products/<sig>)
+# MUST be submitted under the Pivota service-account credential, never the
+# merchant's OAuth — a merchant's grant covers their domain, so submitting a
+# Pivota-host URL under the merchant principal 403s (ADR-006).
+_PIVOTA_CANONICAL_HOST = "agent.pivota.cc"
+
+
+def _pivota_property_host() -> str:
+    try:
+        from urllib.parse import urlparse
+
+        from config.settings import settings
+        raw = getattr(settings, "gsc_pivota_property_url", "") or ""
+        return (urlparse(raw).netloc or "").lower()
+    except Exception:  # noqa: BLE001
+        return ""
+
+
+def _url_is_pivota_canonical(url: str) -> bool:
+    """True when `url` is on Pivota's own canonical property → submit under the
+    Pivota credential, not the merchant's OAuth."""
+    from urllib.parse import urlparse
+    host = (urlparse(url or "").netloc or "").lower()
+    if not host:
+        return False
+    prop = _pivota_property_host()
+    if prop and (host == prop or host.endswith("." + prop)):
+        return True
+    return host == _PIVOTA_CANONICAL_HOST or host.endswith("." + _PIVOTA_CANONICAL_HOST)
+
+
 class GscUrlSubmissionAgent(BaseExecutorAgent):
     """Re-submits stale unindexed Pivota canonical URLs to Google."""
 
@@ -72,7 +112,10 @@ class GscUrlSubmissionAgent(BaseExecutorAgent):
         """
         if not context.merchant_id:
             return False
-        if not _gsc_enabled():
+        # Either principal being available is enough: audit-seeded rows are
+        # Pivota canonical URLs (Pivota credential), while any merchant-owned
+        # rows use the OAuth path.
+        if not (_gsc_enabled() or _pivota_submit_enabled()):
             return False
         candidates = await self._fetch_stale_unindexed(context.merchant_id)
         return len(candidates) > 0
@@ -85,6 +128,7 @@ class GscUrlSubmissionAgent(BaseExecutorAgent):
         try:
             from services.gsc_integration import (
                 GscNotConfiguredError,
+                submit_pivota_canonical_url,
                 submit_url_to_gsc,
             )
         except Exception as exc:  # noqa: BLE001
@@ -105,27 +149,43 @@ class GscUrlSubmissionAgent(BaseExecutorAgent):
         results: List[Dict[str, Any]] = []
         succeeded = 0
         failed = 0
+        canonical_count = 0
 
         for entry in to_submit:
             url = entry["url"]
+            is_canonical = _url_is_pivota_canonical(url)
+            if is_canonical:
+                canonical_count += 1
             try:
-                resp = await submit_url_to_gsc(
-                    context.merchant_id,
-                    url,
-                    audit_run_id=context.parent_audit_run_id,
-                )
+                # Route by principal: Pivota canonical URLs go through the
+                # service-account credential; merchant-owned URLs through the
+                # merchant's OAuth. Submitting a canonical URL under the
+                # merchant principal 403s and writes a permanent error row
+                # (ADR-006) — the loop this agent used to spin on forever.
+                if is_canonical:
+                    resp = await submit_pivota_canonical_url(
+                        url,
+                        merchant_id=context.merchant_id,
+                        audit_run_id=context.parent_audit_run_id,
+                    )
+                else:
+                    resp = await submit_url_to_gsc(
+                        context.merchant_id,
+                        url,
+                        audit_run_id=context.parent_audit_run_id,
+                    )
             except GscNotConfiguredError as exc:
-                # Whole loop aborts: no OAuth means no submissions
-                # for any URL. Return what we've done so far + the
-                # diagnostic.
-                return ExecutorResult(
-                    status="failed",
-                    error_message=f"gsc_oauth_missing: {exc!r}",
-                    evidence={
-                        "submitted_count": succeeded,
-                        "results_so_far": results,
-                    },
-                )
+                # This URL's principal isn't configured (Pivota service account
+                # or merchant OAuth). Skip THIS url — don't abort siblings that
+                # may use the OTHER principal. This is a cheap config check, so
+                # no API quota is spent and no error row is written.
+                failed += 1
+                results.append({
+                    "url": url,
+                    "status": "error",
+                    "message": f"not_configured: {exc!r}",
+                })
+                continue
             except Exception as exc:  # noqa: BLE001
                 failed += 1
                 results.append({
@@ -150,6 +210,7 @@ class GscUrlSubmissionAgent(BaseExecutorAgent):
             "submits_attempted": len(to_submit),
             "succeeded_count": succeeded,
             "failed_count": failed,
+            "pivota_canonical_count": canonical_count,
             "skipped_for_throttle": max(0, len(candidates) - len(to_submit)),
             "results": results,
         }

@@ -45,6 +45,13 @@ PRIMARY_SKU_SOURCE_ROUTE_REPAIR = "source_route_repair"
 PRIMARY_SKU_PROTECTED_MONITORING = "protected_monitoring"
 PRIMARY_SKU_INSUFFICIENT_DATA = "insufficient_data"
 
+# Content-richness score at/above which a page is readable enough to chase
+# demand moves. Below it (the "blocked" band) AI can't reliably describe the
+# product, so the foundation fix leads — a "vs competitor" comparison can't win
+# a lane the SKU can't even be described in yet. Mirrors _band_for_score's
+# blocked boundary in agent_center_bd_report_service.
+_CONTENT_FOUNDATION_MAX = 40
+
 # Per-SKU CTA action descriptor. Maps the deterministic primary gap to the
 # Pivota-executable action the frontend wires its "have Pivota do it" button to.
 # 'request_indexing' submits the canonical page for indexing (the get-indexed
@@ -389,6 +396,16 @@ def _classify_sku_primary_gap(
     if _sku_top_open_lane(opportunity):
         return PRIMARY_SKU_OPEN_LANE_CAPTURE
 
+    # Foundation before comparison: when the page is too thin for AI to describe
+    # (content in the blocked band), lead with the content fix even if a
+    # substitution signal is present — you can't win a "vs competitor"
+    # comparison for a product AI can't read yet. Gated on the content SCORE,
+    # not on a content gap making the top-N primary_gaps, so it still fires when
+    # citation is the single biggest gap (the ANUKO case: content 14, top gap
+    # citation).
+    if _sku_content_critically_thin(scores):
+        return PRIMARY_SKU_CONTENT_REVISION_GAP
+
     if _as_mapping(opportunity.get("substitution_alert")).get("present"):
         return PRIMARY_SKU_SUBSTITUTION_LEAK
 
@@ -723,6 +740,21 @@ def _sku_top_open_lane(opportunity: Mapping[str, Any]) -> Optional[Mapping[str, 
         if isinstance(lane, Mapping) and str(lane.get("query") or "").strip():
             return lane
     return None
+
+
+def _sku_content_critically_thin(scores: Mapping[str, Any]) -> bool:
+    """True when the SKU's page content is in the blocked band — too thin for AI
+    to reliably describe the product. Gates the foundation-first ordering:
+    prioritise the content fix over demand moves (substitution) when AI can't
+    even read the page yet. Score None (unmeasured) is NOT thin — don't override
+    a real demand signal on missing data."""
+    content = _as_mapping(scores.get("content_richness"))
+    score = content.get("score")
+    # None (unmeasured) or a non-numeric score is NOT "thin" — never override a
+    # real demand signal on missing/garbage data.
+    if not isinstance(score, (int, float)) or isinstance(score, bool):
+        return False
+    return _score(score) < _CONTENT_FOUNDATION_MAX
 
 
 def _sku_top_content_gap(primary_gaps: List[Mapping[str, Any]]) -> Optional[Mapping[str, Any]]:

@@ -455,6 +455,17 @@ class Settings(BaseSettings):
     # `siteUrl` for URL Inspection read-back (e.g. "https://agent.pivota.cc/").
     gsc_pivota_property_url: str = os.getenv("GSC_PIVOTA_PROPERTY_URL", "")
 
+    # Master kill-switch for the audit executor-agent dispatch layer (content
+    # brief, canonical-PDP enrichment, competitor insights, GSC submission,
+    # sitemap freshness). Default ON = current behavior. Set to false to
+    # globally disable all post-audit agent side-effects (Gemini spend, Google
+    # API calls, merchant_tasks creation) in one place, e.g. during an incident
+    # or before a merchant-consent model ships. Per-agent flags (GSC, Gemini
+    # key) still apply on top of this.
+    audit_executor_dispatch_enabled: bool = (
+        os.getenv("AUDIT_EXECUTOR_DISPATCH_ENABLED", "true").lower() == "true"
+    )
+
     # IndexNow: notify Bing (which powers ChatGPT search), Yandex, and other
     # participating engines that a canonical PDP became newly citable so it gets
     # crawled. Unlike the GSC Indexing API above (gated off pending proof Google

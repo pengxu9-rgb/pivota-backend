@@ -728,6 +728,20 @@ async def _process_one_audit_run_inner(
                 # plan lives in each per_sku report's next_best_action already.
                 tasks_summary = {"skipped": "url_audit_no_executors"}
             else:
+                # Persist report_jsonb BEFORE dispatch. Executor agents are
+                # enqueued here but the executor_run_worker re-fetches
+                # report_jsonb from this row at claim time; it isn't stored inline
+                # in the queue and doesn't otherwise land until the verifying
+                # stage below. Without this, a claimed executor run reads a NULL
+                # report and silently skips (the content-brief agent's failed-
+                # query extraction returns [] → status='skipped', no task, no
+                # error). Writing it before any executor row exists closes the
+                # race. Best-effort — dispatch still runs if it fails.
+                await mar.persist_report_jsonb(
+                    run_id=run_id,
+                    worker_id=WORKER_ID,
+                    report_jsonb=brand_report,
+                )
                 tasks_summary = await _materialize_tasks_and_executors(
                     merchant_id=merchant_id,
                     run_id=run_id,

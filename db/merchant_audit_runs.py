@@ -974,6 +974,53 @@ async def transition_stage(
         return False
 
 
+async def persist_report_jsonb(
+    *,
+    run_id: str,
+    worker_id: str,
+    report_jsonb: Dict[str, Any],
+) -> bool:
+    """Persist ONLY the report_jsonb column mid-run, without touching status,
+    stage, or the aggregate score columns (those are set later by
+    record_audit_run_completed). Also bumps stage_updated_at (observability
+    only — the reaper keys off claimed_until, not this field).
+
+    Needed by the materializing stage: executor agents are enqueued there but
+    the executor_run_worker re-fetches report_jsonb from this row at claim time
+    (it isn't stored inline in the queue). Since report_jsonb otherwise only
+    lands during the verifying stage — AFTER dispatch — the worker could claim
+    an enqueued run and read a NULL report, silently skipping (e.g. the
+    content-brief agent). Writing it here, before dispatch enqueues any row,
+    closes that race. Guarded on worker ownership + not-cancelled. Best-effort.
+    """
+    await ensure_merchant_audit_runs_table()
+    query = """
+        UPDATE merchant_audit_runs
+           SET report_jsonb     = CAST(:report AS JSONB),
+               stage_updated_at = :now
+         WHERE run_id = :run_id
+           AND claimed_by_worker = :worker_id
+           AND cancelled_at IS NULL
+    """
+    try:
+        await database.execute(
+            query,
+            {
+                "run_id": run_id,
+                "worker_id": worker_id,
+                "report": json.dumps(_json_safe(report_jsonb or {})),
+                "now": _now_utc(),
+            },
+        )
+        return True
+    except Exception as exc:  # noqa: BLE001
+        logger.warning(
+            "persist_report_jsonb failed for run_id=%s: %s",
+            run_id, str(exc)[:200],
+        )
+        return False
+
+
 async def record_partial_result(
     *,
     run_id: str,
