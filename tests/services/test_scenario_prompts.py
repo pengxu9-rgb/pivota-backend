@@ -119,3 +119,76 @@ def test_scenario_shapes_respect_guardrails():
     })
     for s in _specs(graph, "collagen"):
         assert "sleep" not in s["query"]
+
+
+# ---------------------------------------------------------------------------
+# P4a: LLM-elicited scenario demand probes
+
+
+import json as _json
+
+import pytest
+
+
+@pytest.mark.asyncio
+async def test_elicit_scenario_prompts_filters_and_caps(monkeypatch):
+    from config.settings import settings as app_settings
+    import services.llm_synthesis as llm
+    from services import agent_center_bd_report_service as svc
+
+    monkeypatch.setattr(app_settings, "prompt_gen_provider", "gemini", raising=False)
+    captured = {}
+
+    async def fake_synthesize(**kwargs):
+        captured.update(kwargs)
+        return {"text": _json.dumps([
+            "best hair oil to pack for a beach vacation",   # keep
+            "hair oil that survives humid summer weather",  # keep
+            "anuko hair oil for travel",                    # drop: brand leak
+            "what to pack for a weekend trip",              # drop: no category
+            "oil",                                          # drop: too short
+            "hair oil for long flights and dry cabins",     # keep
+            "BEST hair oil to pack for a beach vacation",   # drop: dup
+            "hair oil routine for wedding day prep",        # keep (cap reached)
+            "hair oil for the office commute",              # beyond cap
+        ])}
+
+    monkeypatch.setattr(llm, "synthesize", fake_synthesize, raising=False)
+    monkeypatch.setattr(llm, "configured_key_for_provider", lambda p: "k", raising=False)
+    monkeypatch.setattr(llm, "default_model_for_provider", lambda p: "gemini-2.5-flash", raising=False)
+
+    out = await svc.elicit_scenario_prompts(
+        {"product": {"title": "ANUKO Bond & Repair Hair Oil", "vendor": "ANUKO"}},
+        category="hair oil",
+    )
+    assert out == [
+        "best hair oil to pack for a beach vacation",
+        "hair oil that survives humid summer weather",
+        "hair oil for long flights and dry cabins",
+        "hair oil routine for wedding day prep",
+    ]
+    assert captured["provider"] == "gemini"
+    assert "CATEGORY demand probes" in captured["system"]
+
+
+@pytest.mark.asyncio
+async def test_elicit_requires_category(monkeypatch):
+    from services import agent_center_bd_report_service as svc
+
+    assert await svc.elicit_scenario_prompts({"product": {"title": "X"}}, category="") == []
+
+
+def test_elicited_records_stamped_with_source_and_coverage_marker():
+    from services.agent_center_bd_report_service import _build_per_sku_audit_query_records
+
+    ctx = {
+        "sku_key": "s1", "merchant_id": "m1",
+        "product": {"title": "ANUKO Hair Oil", "vendor": "ANUKO", "product_type": "hair oil"},
+        "_scenario_elicited": ["best hair oil to pack for a beach vacation"],
+    }
+    records = _build_per_sku_audit_query_records(ctx, 16)
+    by_q = {str(r["query"]).lower(): r for r in records}
+    rec = by_q.get("best hair oil to pack for a beach vacation")
+    assert rec is not None, "elicited probe must survive budgeting"
+    assert rec.get("source") == "llm_scenario"
+    assert "scenario:elicited" in (rec.get("attribute_basis") or [])

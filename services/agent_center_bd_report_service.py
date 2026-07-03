@@ -8229,6 +8229,12 @@ def _build_per_sku_base_query_specs(
         text = str(winnable or "").strip()
         if text:
             specs.append((text, "category"))
+    # P4a scenario-elicited category demand probes (exploratory; validated by
+    # the demand loop). Discovery axis like winnable prompts.
+    for elicited in sku_ctx.get("_scenario_elicited") or []:
+        text = str(elicited or "").strip()
+        if text:
+            specs.append((text, "category"))
     if variant_label and variant_label.lower() not in title.lower():
         # Use the human variant label (e.g. "14 Servings, 2-Week Routine") with
         # the full identity, not the opaque variant id.
@@ -8630,6 +8636,21 @@ def _build_per_sku_audit_query_records(
         for record in records:
             if str(record.get("query") or "").strip().lower() in winnable:
                 record["source"] = "llm_winnable"
+    # Scenario-elicited probes: stamp source + a scenario basis marker so they
+    # count in the P0 coverage metric and are diffable per generator model.
+    elicited = {
+        str(w or "").strip().lower()
+        for w in ((sku_ctx or {}).get("_scenario_elicited") or [])
+        if str(w or "").strip()
+    }
+    if elicited:
+        for record in records:
+            if str(record.get("query") or "").strip().lower() in elicited:
+                record["source"] = "llm_scenario"
+                basis = list(record.get("attribute_basis") or [])
+                if "scenario:elicited" not in basis:
+                    basis.append("scenario:elicited")
+                record["attribute_basis"] = basis
     # P0 scenario-coverage metric (scenario-demand plan): how much of the probe
     # budget tests scenario/occasion buy-trigger demand. Baseline was 0.
     scenario_count = sum(
@@ -9121,43 +9142,22 @@ def _parse_winnable_prompts(raw: Any) -> List[str]:
     return [x for x in data if isinstance(x, str)] if isinstance(data, list) else []
 
 
-async def extract_winnable_prompts(
-    sku_ctx: Mapping[str, Any],
-    *,
-    max_prompts: int = 6,
-) -> List[str]:
-    """LLM (DeepSeek) value-prop extraction -> NON-branded, winnable, SPECIFIC
-    discovery prompts grounded in the product's own content (title + description
-    + tags). The audit then probes these instead of only generic category heads
-    ("best hair oil") that no brand can realistically win. Best-effort: returns
-    [] on disabled / no-key / parse / validation failure (caller falls back to
-    the deterministic specs). Non-branded + content-grounded by construction;
-    any brand-name leakage is filtered out."""
+def _resolve_prompt_gen_provider() -> Tuple[Optional[str], str]:
+    """Resolve the stage-1 prompt-generation (provider, model) pair.
+
+    Independently configurable so generators can be A/B compared in prod
+    (PROMPT_GEN_PROVIDER/MODEL; default gemini — founder call 2026-07-03). The
+    chain degrades by KEY availability — each candidate keeps its OWN model
+    preference so a fallback provider never runs with another provider's model
+    string. Returns (None, "") when no candidate has a configured key."""
     from config.settings import settings as app_settings
     from services.llm_synthesis import (
         LLMSynthesisError,
         configured_key_for_provider,
         default_model_for_provider,
         normalize_provider,
-        synthesize,
     )
 
-    product = _get_product(sku_ctx or {})
-    title = str(product.get("title") or "").strip()
-    if not title:
-        return []
-    brand = str(product.get("brand") or product.get("vendor") or "").strip()
-    attrs = product.get("attributes_raw")
-    description, tags = "", []
-    if isinstance(attrs, Mapping):
-        description = str(attrs.get("description") or "")[:1500]
-        if isinstance(attrs.get("tags"), list):
-            tags = [str(t) for t in attrs["tags"]][:20]
-    # Prompt-generation model is independently configurable so different
-    # generators can be A/B compared in prod (PROMPT_GEN_PROVIDER/MODEL;
-    # default gemini — founder call 2026-07-03). The chain degrades by KEY
-    # availability — each candidate keeps its OWN model preference so a
-    # fallback provider never runs with another provider's model string.
     candidate_chain = (
         (
             str(getattr(app_settings, "prompt_gen_provider", "") or "").strip(),
@@ -9169,8 +9169,6 @@ async def extract_winnable_prompts(
         ),
         ("deepseek", ""),
     )
-    provider: Optional[str] = None
-    model = ""
     seen_providers: set = set()
     for name, model_pref in candidate_chain:
         if not name:
@@ -9183,13 +9181,40 @@ async def extract_winnable_prompts(
             continue
         seen_providers.add(canonical)
         if configured_key_for_provider(canonical):
-            provider = canonical
-            model = model_pref or default_model_for_provider(canonical)
-            break
+            return canonical, (model_pref or default_model_for_provider(canonical))
         logger.warning(
-            "winnable-prompts: no API key for provider=%s — trying fallback",
+            "prompt-gen: no API key for provider=%s — trying fallback",
             canonical,
         )
+    return None, ""
+
+
+async def extract_winnable_prompts(
+    sku_ctx: Mapping[str, Any],
+    *,
+    max_prompts: int = 6,
+) -> List[str]:
+    """LLM value-prop extraction -> NON-branded, winnable, SPECIFIC
+    discovery prompts grounded in the product's own content (title + description
+    + tags). The audit then probes these instead of only generic category heads
+    ("best hair oil") that no brand can realistically win. Best-effort: returns
+    [] on disabled / no-key / parse / validation failure (caller falls back to
+    the deterministic specs). Non-branded + content-grounded by construction;
+    any brand-name leakage is filtered out."""
+    from services.llm_synthesis import synthesize
+
+    product = _get_product(sku_ctx or {})
+    title = str(product.get("title") or "").strip()
+    if not title:
+        return []
+    brand = str(product.get("brand") or product.get("vendor") or "").strip()
+    attrs = product.get("attributes_raw")
+    description, tags = "", []
+    if isinstance(attrs, Mapping):
+        description = str(attrs.get("description") or "")[:1500]
+        if isinstance(attrs.get("tags"), list):
+            tags = [str(t) for t in attrs["tags"]][:20]
+    provider, model = _resolve_prompt_gen_provider()
     if not provider:
         logger.warning(
             "winnable-prompt extraction skipped: no configured provider key "
@@ -9255,6 +9280,95 @@ async def extract_winnable_prompts(
             "winnable-prompts: provider=%s model=%s title=%r -> EMPTY "
             "(parse/validation dropped everything; raw len=%d finish_reason=%s)",
             provider, model, title[:60],
+            len(str(result.get("text") or "")),
+            result.get("finish_reason"),
+        )
+    return out
+
+
+_SCENARIO_ELICIT_SYSTEM = """You are a shopping-demand researcher for AI assistants.
+Given ONE product's category and verified attributes, enumerate scenario-framed shopper questions
+that REAL users ask AI assistants where this CATEGORY could be the answer — occasions, travel,
+activities, climate, life-stage, routines (packing for a beach trip, surviving a long flight,
+humid-weather hair routine, wedding-day makeup that lasts).
+
+RULES (this is a trust product — follow exactly):
+- These are CATEGORY demand probes: the scenario must be plausible for the category. Do NOT assert
+  product-specific claims, efficacy, or benefits the attributes don't support.
+- No medical, pregnancy, or child-safety scenarios.
+- Do NOT include any brand or product name — non-branded queries only.
+- EVERY query must contain BOTH the category (or an obvious synonym) AND a concrete scenario.
+- Natural shopper phrasing, lower-case, 5-10 words, no punctuation gimmicks.
+- Output ONLY a JSON array of 4-6 distinct query strings. No other text."""
+
+
+async def elicit_scenario_prompts(
+    sku_ctx: Mapping[str, Any],
+    *,
+    category: str,
+    max_prompts: int = 4,
+) -> List[str]:
+    """P4a scenario-demand mining: LLM-elicited scenario-framed shopper queries
+    for the CATEGORY (not product claims). These run as exploratory probes —
+    the existing demand loop (demand_signal -> open-lane / no-demand) is the
+    validation gate before any lane is surfaced as a recommendation, per the
+    demand-honesty principle. Best-effort: [] on any failure."""
+    from services.llm_synthesis import synthesize
+
+    category = str(category or "").strip()
+    if not category:
+        return []
+    product = _get_product(sku_ctx or {})
+    brand = str(product.get("brand") or product.get("vendor") or "").strip()
+    provider, model = _resolve_prompt_gen_provider()
+    if not provider:
+        return []
+    content = {
+        "category": category,
+        "product_type": product.get("product_type") or None,
+        "title": str(product.get("title") or "")[:120] or None,
+    }
+    user = "PRODUCT CONTENT:\n" + json.dumps(content, ensure_ascii=False, indent=2)
+    try:
+        result = await synthesize(
+            system=_SCENARIO_ELICIT_SYSTEM,
+            user=user,
+            provider=provider,
+            model=model,
+            max_tokens=400,
+        )
+    except Exception:  # noqa: BLE001 - best-effort exploratory stage
+        logger.warning("scenario-elicit failed for %r", category, exc_info=True)
+        return []
+    brand_tokens = set(re.findall(r"[a-z0-9]+", brand.lower())) if brand else set()
+    category_tokens = set(re.findall(r"[a-z0-9가-힣]+", category.lower()))
+    out: List[str] = []
+    seen: set = set()
+    for raw in _parse_winnable_prompts(result.get("text")):
+        s = re.sub(r"\s+", " ", str(raw or "").strip().lower())
+        tokens = re.findall(r"[a-z0-9가-힣]+", s)
+        if not s or not (4 <= len(tokens) <= 12):
+            continue
+        if brand_tokens & set(tokens):
+            continue  # brand leaked -> not a category demand probe
+        if not (category_tokens & set(tokens)):
+            continue  # must name the category, or the probe is unattributable
+        if s in seen:
+            continue
+        seen.add(s)
+        out.append(s)
+        if len(out) >= max_prompts:
+            break
+    if out:
+        logger.info(
+            "scenario-elicit: provider=%s model=%s category=%r -> %d prompts: %s",
+            provider, model, category, len(out), out,
+        )
+    else:
+        logger.warning(
+            "scenario-elicit: provider=%s model=%s category=%r -> EMPTY "
+            "(raw len=%d finish_reason=%s)",
+            provider, model, category,
             len(str(result.get("text") or "")),
             result.get("finish_reason"),
         )
@@ -10648,6 +10762,26 @@ async def run_per_sku_audit_probe_fanout(
                 sku_ctx["_winnable_prompts"] = await extract_winnable_prompts(sku_ctx)
             except Exception:  # noqa: BLE001 - never block probing on the LLM step
                 logger.warning("winnable-prompt extraction skipped", exc_info=True)
+            # P4a scenario-demand mining: category-level scenario probes
+            # (exploratory; the demand loop validates before any lane is
+            # surfaced). Runs AFTER the Tier-1 retailer-evidence stash so
+            # category resolution benefits from retailer excerpts.
+            try:
+                _product_map = _get_product(sku_ctx)
+                from services.sku_sidewalk import build_sku_attribute_graph
+
+                _graph = build_sku_attribute_graph(_product_map or {})
+                _elicit_category = _category_for_unbranded_prompts(
+                    _product_map or {},
+                    str((_product_map or {}).get("product_type") or ""),
+                    _graph,
+                )
+                if _elicit_category:
+                    sku_ctx["_scenario_elicited"] = await elicit_scenario_prompts(
+                        sku_ctx, category=_elicit_category,
+                    )
+            except Exception:  # noqa: BLE001 - never block probing on the LLM step
+                logger.warning("scenario elicitation skipped", exc_info=True)
         out[sku_key] = await _probe_per_sku_ctx(
             sku_ctx=sku_ctx,
             merchant_id=str(merchant_id),
