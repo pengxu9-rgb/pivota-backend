@@ -575,6 +575,18 @@ def _iter_product_sources(product: Mapping[str, Any]) -> Iterable[Tuple[str, str
                 if joined.strip():
                     yield "variant", joined
 
+    # Tier-1 retailer-evidence recycling (services/retailer_evidence.py): prior
+    # runs' third-party retailer/publisher excerpts, stashed on the product by
+    # the probe fan-out. Body-class on purpose — NOT an authoritative source, so
+    # it can surface ingredients/use-cases/certifications the thin own-page
+    # never states, but can never flip authoritative-only classes like format.
+    retailer_excerpts = product.get("_retailer_excerpts")
+    if isinstance(retailer_excerpts, list):
+        for excerpt in retailer_excerpts:
+            text = str(excerpt or "").strip()
+            if text:
+                yield "retailer_excerpt", text
+
 
 def _add_attr(
     classes: Dict[str, List[str]],
