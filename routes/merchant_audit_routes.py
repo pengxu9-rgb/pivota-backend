@@ -87,6 +87,7 @@ from services.credit_consumption_service import (
     consume as consume_credits,
     estimate_probe_credits,
     merchant_is_paid_tier,
+    refund as refund_credits,
 )
 from services.merchant_credit_balance_service import (
     InsufficientCreditsError,
@@ -2923,17 +2924,28 @@ async def start_merchant_audit_action(
             "credits_charged": 0,
         }
 
-    # Best-effort, metered draft of the deliverable, grounded in this action's SKU.
+    # Metered draft of the deliverable, grounded in this action's SKU.
+    # Billing invariant (charged iff delivered): CHARGE FIRST, generate
+    # second, refund if generation fails. The previous order (generate →
+    # charge, swallowing InsufficientCreditsError) handed out free drafts
+    # whenever the balance moved between the pre-check and the charge.
     draft: Optional[str] = None
     charged = 0
     product_key = _action_product_key_by_title(report, body.sku_title)
     context = _build_ask_context(report, product_key)
     cost_credits, _ = estimate_probe_credits(_ASK_PROBE_SPEC)
     can_draft = bool(context)
-    if can_draft and cost_credits > 0 and not await merchant_is_paid_tier(merchant_id):
-        balance = await get_balance(merchant_id)
-        if int(balance.get("credits") or 0) < cost_credits:
-            can_draft = False  # not enough credits to draft — still create the task
+    draft_idem = "action_draft:" + hashlib.sha256(
+        "|".join([merchant_id, body.run_id, title, body.channel_host or ""]).encode("utf-8")
+    ).hexdigest()
+    if can_draft and cost_credits > 0:
+        try:
+            res = await consume_credits(
+                merchant_id, "prompt", draft_idem, probes=_ASK_PROBE_SPEC,
+            )
+            charged = int(res.get("credits") or 0)
+        except InsufficientCreditsError:
+            can_draft = False  # can't pay for a draft — still create the task
 
     if can_draft:
         ctx_json = json.dumps(context, default=str)[:_ASK_CONTEXT_MAX_CHARS]
@@ -2962,15 +2974,19 @@ async def start_merchant_audit_action(
         except DeepseekProbeError as exc:
             logger.warning("action draft failed (run=%s): %s", body.run_id, exc)
             draft = None
-        if draft:
-            idem = "action_draft:" + hashlib.sha256(
-                "|".join([merchant_id, body.run_id, title, body.channel_host or ""]).encode("utf-8")
-            ).hexdigest()
+        if not draft and charged > 0:
+            # Charged but nothing delivered — refund (idempotent per action).
             try:
-                res = await consume_credits(merchant_id, "prompt", idem, probes=_ASK_PROBE_SPEC)
-                charged = int(res.get("credits") or 0)
-            except InsufficientCreditsError:
-                pass
+                await refund_credits(
+                    merchant_id, "prompt", charged,
+                    source_event_id=f"refund:{draft_idem}",
+                )
+                charged = 0
+            except Exception:  # noqa: BLE001 — surface, don't mask the miss
+                logger.exception(
+                    "action draft refund failed merchant_id=%s run=%s — "
+                    "RECONCILE MANUALLY", merchant_id, body.run_id,
+                )
 
     task_body = (body.first_move or "").strip() or title
     if draft:

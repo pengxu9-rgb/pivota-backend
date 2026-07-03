@@ -288,11 +288,11 @@ async def _process_one_audit_run_inner(
                     "audit_run_worker: discovery rehydrate failed "
                     "for run_id=%s — failing run", run_id,
                 )
-                await mar.transition_stage(
+                await _fail_run_and_refund(
                     run_id=run_id,
+                    merchant_id=merchant_id,
+                    launch_options=launch_options,
                     from_stage=mar.STAGE_PROBING,
-                    to_stage=mar.STAGE_FAILED,
-                    worker_id=WORKER_ID,
                     error_jsonb={
                         "stage": "probing_resume_rehydrate",
                         "message": (
@@ -300,15 +300,17 @@ async def _process_one_audit_run_inner(
                             f"replay: {str(exc)[:200]}"
                         ),
                     },
+                    reason="resume_rehydrate_failed",
                 )
                 return True
         else:
-            # Cannot reconstruct brand_report; fail cleanly.
-            await mar.transition_stage(
+            # Cannot reconstruct brand_report; fail cleanly (and refund —
+            # the merchant is asked to re-submit, which charges again).
+            await _fail_run_and_refund(
                 run_id=run_id,
+                merchant_id=merchant_id,
+                launch_options=launch_options,
                 from_stage=current_stage,
-                to_stage=mar.STAGE_FAILED,
-                worker_id=WORKER_ID,
                 error_jsonb={
                     "stage": f"{current_stage}_resume_unsupported",
                     "message": (
@@ -321,6 +323,7 @@ async def _process_one_audit_run_inner(
                         "stage). Please re-submit the audit."
                     ),
                 },
+                reason="resume_unsupported",
             )
             return True
 
@@ -541,11 +544,11 @@ async def _process_one_audit_run_inner(
                     # debited credits, like the mock-fallback guard below.
                     if _all_per_sku_probes_failed(probe_runs_by_sku):
                         reason = _first_probe_failure_reason(probe_runs_by_sku)
-                        await mar.transition_stage(
+                        await _fail_run_and_refund(
                             run_id=run_id,
+                            merchant_id=merchant_id,
+                            launch_options=launch_options,
                             from_stage=mar.STAGE_PROBING,
-                            to_stage=mar.STAGE_FAILED,
-                            worker_id=WORKER_ID,
                             error_jsonb={
                                 "code": "probe_infra_failure",
                                 "stage": "probing",
@@ -560,11 +563,6 @@ async def _process_one_audit_run_inner(
                                 ),
                                 "reason": reason,
                             },
-                        )
-                        await _refund_launch_debits(
-                            merchant_id=merchant_id,
-                            run_id=run_id,
-                            launch_options=launch_options,
                             reason="probe_infra_failure",
                         )
                         logger.error(
@@ -619,11 +617,11 @@ async def _process_one_audit_run_inner(
                     (mock_reports[0].get("upstream_status") or {}).get("reason")
                     or "Upstream returned mock data."
                 )
-                await mar.transition_stage(
+                await _fail_run_and_refund(
                     run_id=run_id,
+                    merchant_id=merchant_id,
+                    launch_options=launch_options,
                     from_stage=mar.STAGE_PROBING,
-                    to_stage=mar.STAGE_FAILED,
-                    worker_id=WORKER_ID,
                     error_jsonb={
                         "code": "upstream_mock_fallback",
                         "stage": "probing",
@@ -635,11 +633,6 @@ async def _process_one_audit_run_inner(
                         "reason": first_reason,
                         "mock_reports_count": len(mock_reports),
                     },
-                )
-                await _refund_launch_debits(
-                    merchant_id=merchant_id,
-                    run_id=run_id,
-                    launch_options=launch_options,
                     reason="upstream_mock_fallback",
                 )
                 logger.error(
@@ -974,11 +967,11 @@ async def _process_one_audit_run_inner(
                 # key changes per the 5-minute window so a re-submit
                 # within that window will dedupe to this failed run
                 # (need force=true to bypass).
-                await mar.transition_stage(
+                await _fail_run_and_refund(
                     run_id=run_id,
+                    merchant_id=merchant_id,
+                    launch_options=launch_options,
                     from_stage=mar.STAGE_VERIFYING,
-                    to_stage=mar.STAGE_FAILED,
-                    worker_id=WORKER_ID,
                     cost_summary_jsonb=cost_summary,
                     error_jsonb={
                         "stage": "verifying_post_processing",
@@ -992,6 +985,11 @@ async def _process_one_audit_run_inner(
                         ),
                         "errors": post_processing_errors,
                     },
+                    # The run is surfaced to the merchant as FAILED (the
+                    # poller reads terminal status), and the prescribed
+                    # recovery — re-submit — charges again. Refund so one
+                    # delivered report never costs two runs' credits.
+                    reason="verifying_post_processing",
                 )
                 logger.warning(
                     "audit_run_worker: failing run_id=%s due to %d "
@@ -1026,27 +1024,23 @@ async def _process_one_audit_run_inner(
             "audit_run_worker: failed run_id=%s at stage=%s",
             run_id, current_stage,
         )
-        # Best-effort transition to FAILED. If the lease was lost in
-        # the meantime this also returns False — that's fine, the
-        # next worker that picks it up will see the stale lease and
-        # restart the active stage.
-        try:
-            await mar.transition_stage(
-                run_id=run_id,
-                from_stage=current_stage,
-                to_stage=mar.STAGE_FAILED,
-                worker_id=WORKER_ID,
-                error_jsonb={
-                    "stage": current_stage,
-                    "message": str(exc)[:1000],
-                    "traceback_truncated": traceback.format_exc()[:2000],
-                },
-            )
-        except Exception as inner:  # noqa: BLE001
-            logger.warning(
-                "audit_run_worker: secondary failure persisting "
-                "failed-state for run_id=%s: %s", run_id, inner,
-            )
+        # Best-effort transition to FAILED + refund (charged iff
+        # delivered). If the lease was lost in the meantime the
+        # transition returns False and no refund fires from here —
+        # the worker that owns the run (or the abandoned reaper)
+        # handles its terminal state and refund instead.
+        await _fail_run_and_refund(
+            run_id=run_id,
+            merchant_id=merchant_id,
+            launch_options=launch_options,
+            from_stage=current_stage,
+            error_jsonb={
+                "stage": current_stage,
+                "message": str(exc)[:1000],
+                "traceback_truncated": traceback.format_exc()[:2000],
+            },
+            reason="worker_exception",
+        )
         return True
 
 
@@ -1092,10 +1086,26 @@ async def run_abandoned_run_reaper_tick() -> None:
     """
     try:
         from db.merchant_audit_runs import fail_abandoned_runs
-        n = await fail_abandoned_runs()
-        if n > 0:
+        reaped = await fail_abandoned_runs()
+        if reaped:
             logger.info(
-                "audit_run_worker: reaper failed %d abandoned runs", n,
+                "audit_run_worker: reaper failed %d abandoned runs",
+                len(reaped),
+            )
+        # Charged iff delivered: a reaped run delivered nothing, so its
+        # launch debit is refunded. The per-run+kind refund key makes
+        # this a no-op for any run another path already refunded.
+        for row in reaped:
+            run_id = str(row.get("run_id") or "")
+            merchant_id = str(row.get("merchant_id") or "")
+            launch = row.get("launch_options")
+            if not run_id or not merchant_id:
+                continue
+            await _refund_launch_debits(
+                merchant_id=merchant_id,
+                run_id=run_id,
+                launch_options=launch if isinstance(launch, dict) else {},
+                reason="audit_abandoned_reaped",
             )
     except Exception:  # noqa: BLE001
         logger.exception("audit_run_worker: abandoned-run reaper failed")
@@ -1150,6 +1160,17 @@ async def _refund_launch_debits(
     launch_options: Dict[str, Any],
     reason: str,
 ) -> None:
+    """Refund every launch debit for a run that delivered nothing.
+
+    Idempotent PER RUN + CREDIT KIND: the ledger dedupes on source_event_id,
+    and the key deliberately excludes `reason` so two different failure paths
+    reaching the same run (e.g. the generic worker handler AND the abandoned
+    reaper) can both call this safely — the second call is a no-op instead of
+    a double refund. `reason` is logged for diagnosis, never keyed.
+
+    Best-effort per item: one kind's refund failing must not block the rest
+    (nor mask the failure path that triggered the refund).
+    """
     items = _launch_debit_items(launch_options)
     if not items:
         logger.info(
@@ -1173,14 +1194,74 @@ async def _refund_launch_debits(
             purchased_credits = int(item.get("purchased_credits") or 0)
         except (TypeError, ValueError):
             purchased_credits = 0
-        await credit(
-            merchant_id,
-            kind,  # type: ignore[arg-type]
-            amount,
-            source_event_id=f"refund:audit_run:{run_id}:{reason}:{kind}",
-            usd_cogs=0,
-            purchased_credits=purchased_credits,
+        try:
+            await credit(
+                merchant_id,
+                kind,  # type: ignore[arg-type]
+                amount,
+                source_event_id=f"refund:audit_run:{run_id}:{kind}",
+                usd_cogs=0,
+                purchased_credits=purchased_credits,
+            )
+            logger.info(
+                "audit_run_worker: refunded %d %s credits run_id=%s "
+                "reason=%s", amount, kind, run_id, reason,
+            )
+        except Exception:  # noqa: BLE001 — refund must not mask the failure
+            logger.exception(
+                "audit_run_worker: refund failed run_id=%s kind=%s "
+                "reason=%s — RECONCILE MANUALLY", run_id, kind, reason,
+            )
+
+
+async def _fail_run_and_refund(
+    *,
+    run_id: str,
+    merchant_id: str,
+    launch_options: Dict[str, Any],
+    from_stage: str,
+    error_jsonb: Dict[str, Any],
+    reason: str,
+    cost_summary_jsonb: Optional[Dict[str, Any]] = None,
+) -> bool:
+    """THE single failure exit for a worker-processed audit run.
+
+    Transitions the run to FAILED and refunds its launch debits — enforcing
+    the billing invariant: a merchant is charged iff a completed report was
+    delivered. Every failure path in this module MUST exit through here (a
+    source-scan test enforces it) so no future failure branch can silently
+    keep the merchant's credits.
+
+    Refunds only when THIS worker won the terminal transition — if another
+    worker already finalized the run, that worker owns (or owned) the refund,
+    and the refund key (per run+kind) makes a double call a no-op anyway.
+    Returns whether the transition succeeded.
+    """
+    from db import merchant_audit_runs as mar
+
+    ok = False
+    try:
+        ok = await mar.transition_stage(
+            run_id=run_id,
+            from_stage=from_stage,
+            to_stage=mar.STAGE_FAILED,
+            worker_id=WORKER_ID,
+            error_jsonb=error_jsonb,
+            cost_summary_jsonb=cost_summary_jsonb,
         )
+    except Exception as inner:  # noqa: BLE001 — best-effort terminal write
+        logger.warning(
+            "audit_run_worker: failed persisting failed-state for "
+            "run_id=%s reason=%s: %s", run_id, reason, inner,
+        )
+    if ok:
+        await _refund_launch_debits(
+            merchant_id=merchant_id,
+            run_id=run_id,
+            launch_options=launch_options,
+            reason=reason,
+        )
+    return ok
 
 
 def _has_recorded_probe_payloads(partial_result_jsonb: Any) -> bool:
