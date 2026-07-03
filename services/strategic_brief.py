@@ -884,6 +884,29 @@ def build_sku_brief_prompt(evidence: Mapping[str, Any]) -> Tuple[str, str]:
     return _STRATEGIC_BRIEF_SYSTEM_PROMPT, user
 
 
+def _resolve_brief_provider(provider: Optional[str]) -> Optional[str]:
+    """Resolve the brief generator, degrading by KEY availability. Explicit
+    `provider` (if given) wins; else settings.strategic_brief_provider (default
+    gemini); DeepSeek is the final fallback so a missing Gemini key never
+    forces the deterministic template. Returns None only when NO candidate has
+    a configured key."""
+    chain = [provider, settings.strategic_brief_provider, "deepseek"]
+    seen: Set[str] = set()
+    for name in chain:
+        if not name:
+            continue
+        try:
+            canonical = normalize_provider(name)
+        except LLMSynthesisError:
+            continue
+        if canonical in seen:
+            continue
+        seen.add(canonical)
+        if configured_key_for_provider(canonical):
+            return canonical
+    return None
+
+
 async def generate_sku_strategic_brief(
     evidence: Mapping[str, Any],
     *,
@@ -901,19 +924,14 @@ async def generate_sku_strategic_brief(
     if not dbg["enabled"]:
         dbg["outcome"] = "none_disabled"
         return None
-    try:
-        selected_provider = normalize_provider(
-            provider or settings.strategic_brief_provider
-        )
-    except LLMSynthesisError as exc:
-        dbg["outcome"] = "none_bad_provider"
-        dbg["error"] = str(exc)[:200]
+    selected_provider = _resolve_brief_provider(provider)
+    if not selected_provider:
+        dbg["outcome"] = "none_no_key"
+        dbg["provider"] = str(provider or settings.strategic_brief_provider or "")
+        dbg["key_configured"] = False
         return None
     dbg["provider"] = selected_provider
-    dbg["key_configured"] = bool(configured_key_for_provider(selected_provider))
-    if not dbg["key_configured"]:
-        dbg["outcome"] = "none_no_key"
-        return None
+    dbg["key_configured"] = True
     selected_model = (
         str(model or settings.strategic_brief_model or "").strip()
         or default_model_for_provider(selected_provider)
@@ -3011,6 +3029,13 @@ def _sentence_initial_unallowed_token(
         tokens = tokens[1:]
     while tokens and _is_ignorable_entity_token(tokens[-1]):
         tokens = tokens[:-1]
+    # After dropping the sentence-initial verb + ignorable edges, the REMAINING
+    # phrase may itself be an allowed multi-word host/brand ("Pitch Who What
+    # Wear" -> "Who What Wear" -> whowhatwear.com). Re-check the whole phrase
+    # before flagging token-by-token, or "Who" gets reported as an unknown
+    # entity even though the real cited source is grounded.
+    if tokens and _entity_allowed(" ".join(tokens), allowed):
+        return None
     for idx, token in enumerate(tokens):
         if _is_ignorable_entity_token(token):
             continue
@@ -3066,6 +3091,35 @@ def _entity_allowed(entity: str, allowed: Mapping[str, Any]) -> bool:
         collapsed == _registrable_label(d) for d in allowed["domains"]
     ):
         return True
+    # The significant-words collapse above DROPS common words, so a host display
+    # name whose parts are common ("Who What Wear" -> whowhatwear.com, "NBC News"
+    # -> nbcnews.com) never resolves, and a possessive ("Reddit's") won't match
+    # the bare label — both silently rejected valid briefs that named a REAL
+    # cited source. Match the FULL de-punctuated form (possessive stripped)
+    # against any allowed host label. Safe: only an already-allowed host resolves.
+    _domain_labels = {_registrable_label(d) for d in allowed["domains"]}
+    depossessed = re.sub(r"['’]s\b", "", normalized).strip()
+    full_collapse = re.sub(r"[^a-z0-9]", "", depossessed)
+    if full_collapse and full_collapse in _domain_labels:
+        return True
+    # Possessive of an otherwise-allowed entity ("Reddit's" -> Reddit).
+    if depossessed and depossessed != normalized and depossessed in allowed["terms"]:
+        return True
+    # Hyphenated descriptor whose LEAD is an allowed brand/host and whose tail
+    # words are common/grounded ("Sephora-controlled", "Reddit-native").
+    if "-" in normalized:
+        parts = [p for p in re.split(r"-+", normalized) if p]
+        lead = parts[0] if parts else ""
+        lead_ok = bool(lead) and (
+            lead in allowed["terms"]
+            or re.sub(r"[^a-z0-9]", "", lead) in _domain_labels
+        )
+        if (
+            len(parts) >= 2
+            and lead_ok
+            and all(_entity_word_grounded_or_common(p, allowed) for p in parts[1:])
+        ):
+            return True
     if normalized in _INTERNAL_ALLOWED_ENTITIES:
         return True
     for term in allowed["terms"]:
