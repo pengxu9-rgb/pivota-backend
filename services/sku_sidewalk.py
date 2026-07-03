@@ -26,6 +26,11 @@ ATTRIBUTE_CLASSES: Tuple[str, ...] = (
     "offer_variant",
     "proof",
     "exclusion",
+    # Scenario/occasion demand (2026-07-03 plan P1): the buy trigger — travel,
+    # flight, beach, heat styling, wedding... Populated from direct page
+    # mentions (lexicon below) AND inferred from evidence edges (e.g. stick
+    # format -> travel), with inferred provenance marked in evidence.
+    "scenario",
 )
 
 _HTML_TAG_RE = re.compile(r"<[^>]+>")
@@ -75,6 +80,26 @@ _CATEGORY_TERMS: Tuple[Tuple[str, str], ...] = (
     ("앰플", "ampoule"),
     ("클렌저", "cleanser"),
     ("콜라겐", "collagen"),
+    # Haircare category pack (2026-07-03): ANUKO/DamDam runs showed hair-oil /
+    # hair-mask / moisturizer SKUs resolving no category from real titles.
+    ("hair oil", "hair oil"),
+    ("hair mask", "hair mask"),
+    ("hair treatment", "hair treatment"),
+    ("hair butter", "hair butter"),
+    ("hair pack", "hair mask"),
+    ("moisturizer", "moisturizer"),
+    ("moisturiser", "moisturizer"),
+    ("water cream", "moisturizer"),
+    ("헤어 오일", "hair oil"),
+    ("헤어오일", "hair oil"),
+    ("헤어 마스크", "hair mask"),
+    ("헤어팩", "hair mask"),
+    ("트리트먼트", "hair treatment"),
+    ("헤어버터", "hair butter"),
+    ("헤어 버터", "hair butter"),
+    ("수분크림", "moisturizer"),
+    ("수분 크림", "moisturizer"),
+    ("모이스처라이저", "moisturizer"),
 )
 _FORMAT_TERMS: Tuple[Tuple[str, str], ...] = (
     ("refill pod", "refill pod"),
@@ -130,6 +155,41 @@ _INGREDIENT_TERMS: Tuple[Tuple[str, str], ...] = (
     ("히알루론산", "hyaluronic acid"),
     ("비타민 c", "vitamin c"),
     ("비타민c", "vitamin c"),
+    # Haircare/K-beauty actives pack (2026-07-03): argan/shea/yuja were the
+    # literal hero ingredients of real audited SKUs and had no lexicon entry.
+    ("argan oil", "argan oil"),
+    ("shea butter", "shea butter"),
+    ("yuzu seed oil", "yuzu seed oil"),
+    ("yuja seed oil", "yuzu seed oil"),
+    ("green tea", "green tea"),
+    ("camellia oil", "camellia oil"),
+    ("tea tree", "tea tree"),
+    ("keratin", "keratin"),
+    ("ceramide", "ceramide"),
+    ("biotin", "biotin"),
+    ("centella", "centella"),
+    ("cica", "centella"),
+    ("ginkgo", "ginkgo"),
+    ("peptide", "peptide"),
+    ("panthenol", "panthenol"),
+    ("아르간 오일", "argan oil"),
+    ("아르간오일", "argan oil"),
+    ("시어버터", "shea butter"),
+    ("시어 버터", "shea butter"),
+    ("유자씨 오일", "yuzu seed oil"),
+    ("유자씨오일", "yuzu seed oil"),
+    ("녹차", "green tea"),
+    ("그린티", "green tea"),
+    ("동백 오일", "camellia oil"),
+    ("동백오일", "camellia oil"),
+    ("티트리", "tea tree"),
+    ("케라틴", "keratin"),
+    ("세라마이드", "ceramide"),
+    ("비오틴", "biotin"),
+    ("병풀", "centella"),
+    ("시카", "centella"),
+    ("펩타이드", "peptide"),
+    ("판테놀", "panthenol"),
 )
 _CERTIFICATION_TERMS: Tuple[Tuple[str, str], ...] = (
     ("halal certified", "halal"),
@@ -223,6 +283,130 @@ _PROOF_TERMS: Tuple[Tuple[str, str], ...] = (
     ("1000 da", "1000 da"),
     ("1,000 da", "1000 da"),
 )
+
+# ---------------------------------------------------------------------------
+# Scenario/occasion demand layer (2026-07-03 plan P1). Scenarios are the buy
+# TRIGGER (travel, flight, beach, heat styling, a wedding), distinct from
+# use_case routine terms. Two population paths:
+#   1. direct page mention via _SCENARIO_TERMS (EN + KR aliases);
+#   2. inferred via _SCENARIO_EVIDENCE_EDGES from already-evidenced attributes
+#      (stick format -> travel; reef-safe -> swim/beach), marked "inferred" in
+#      evidence so rendering can never present it as a page claim.
+# use_case values {travel, gym, summer} pre-date this class and stay where they
+# are; the prompt generator unions them into the scenario pool (no dupes).
+# Safety: no medical/pregnancy scenarios — those remain audience-gated.
+_SCENARIO_TERMS: Tuple[Tuple[str, str], ...] = (
+    ("heat styling", "heat-styling"),
+    ("heat protection", "heat-styling"),
+    ("heat protectant", "heat-styling"),
+    ("blow dry", "heat-styling"),
+    ("blow-dry", "heat-styling"),
+    ("flat iron", "heat-styling"),
+    ("고데기", "heat-styling"),
+    ("열기구", "heat-styling"),
+    ("드라이기", "heat-styling"),
+    ("열 보호", "heat-styling"),
+    ("열보호", "heat-styling"),
+    ("flight", "flight"),
+    ("in-flight", "flight"),
+    ("carry on", "flight"),
+    ("carry-on", "flight"),
+    ("기내", "flight"),
+    ("jet lag", "jet-lag"),
+    ("jetlag", "jet-lag"),
+    ("시차", "jet-lag"),
+    ("beach", "beach"),
+    ("해변", "beach"),
+    ("바닷가", "beach"),
+    ("swim", "swim"),
+    ("swimming", "swim"),
+    ("수영", "swim"),
+    ("물놀이", "swim"),
+    ("hiking", "hiking"),
+    ("trekking", "hiking"),
+    ("등산", "hiking"),
+    ("wedding", "wedding"),
+    ("bridal", "wedding"),
+    ("웨딩", "wedding"),
+    ("결혼식", "wedding"),
+    ("party", "party"),
+    ("night out", "party"),
+    ("파티", "party"),
+    ("office", "office"),
+    ("사무실", "office"),
+    ("humidity", "humidity"),
+    ("humid", "humidity"),
+    ("습기", "humidity"),
+    ("습한", "humidity"),
+    ("winter", "winter"),
+    ("겨울", "winter"),
+    ("overnight", "overnight"),
+    ("오버나이트", "overnight"),
+    ("여행", "travel"),
+    ("여행용", "travel"),
+    ("휴대용", "travel"),
+)
+
+# use_case values that are really scenarios; the prompt generator unions them
+# into the scenario pool so legacy extraction keeps working unchanged.
+_USE_CASE_SCENARIO_SLUGS = frozenset({"travel", "gym", "summer"})
+
+# Shopper-natural phrase per scenario slug, for "best {category} for {phrase}"
+# shapes. Keep phrases plain and provable — never a claim.
+_SCENARIO_PHRASES: Dict[str, str] = {
+    "heat-styling": "heat styling",
+    "flight": "a long flight",
+    "jet-lag": "jet lag",
+    "beach": "the beach",
+    "swim": "swimming",
+    "hiking": "hiking",
+    "wedding": "a wedding",
+    "party": "a night out",
+    "office": "the office",
+    "humidity": "humid weather",
+    "winter": "winter dryness",
+    "overnight": "overnight use",
+    "travel": "travel",
+    "gym": "the gym",
+    "summer": "summer",
+}
+
+# Scenarios where "what {category} to pack for {phrase}" reads naturally.
+_PACKABLE_SCENARIOS = frozenset({"travel", "flight", "beach", "gym", "hiking"})
+
+# Inferred scenario edges: (attribute_class, attribute_value) -> scenario slugs.
+# Only substantiation-safe inferences — a physical property implying a context
+# of use, never an efficacy claim.
+_SCENARIO_EVIDENCE_EDGES: Tuple[Tuple[str, str, Tuple[str, ...]], ...] = (
+    ("format", "stick", ("travel",)),
+    ("format", "refill pod", ("travel",)),
+    ("format", "gummy", ("travel",)),
+    ("exclusion", "no water", ("travel",)),
+    ("exclusion", "no melatonin", ("jet-lag",)),
+    ("certification_constraint", "reef-safe", ("swim", "beach")),
+    ("category", "sunscreen", ("beach", "swim")),
+)
+
+
+def _apply_scenario_edges(
+    classes: Dict[str, List[str]],
+    evidence: Dict[str, str],
+) -> None:
+    """Append evidence-edge-inferred scenarios (provenance marked 'inferred').
+    Direct page mentions win: an already-present slug is never overwritten."""
+    present = set(classes.get("scenario") or [])
+    for source_class, value, slugs in _SCENARIO_EVIDENCE_EDGES:
+        if value not in (classes.get(source_class) or []):
+            continue
+        for slug in slugs:
+            if slug in present:
+                continue
+            present.add(slug)
+            classes.setdefault("scenario", []).append(slug)
+            evidence.setdefault(
+                slug, f"inferred from {source_class}: {value}",
+            )
+
 
 _MEDICAL_BLOCKLIST: Tuple[str, ...] = (
     "sleep aid",
@@ -674,9 +858,35 @@ def _direct_tag_class(term: str) -> Optional[str]:
         return "proof"
     if cleaned.endswith("vitamin") or cleaned.endswith("vitamins") or "multivitamin" in searchable:
         return "category"
+    # Scenario tags ("heat protection", "여행용") classify as scenario, not the
+    # multi-word use_case default — keeps them out of problem-framed templates
+    # ("what helps with heat protection") and in the scenario shapes instead.
+    for _phrase, attr in _SCENARIO_TERMS:
+        if cleaned == attr or _has_phrase(cleaned, _phrase):
+            return "scenario"
     if len(cleaned.split()) == 1:
         return None
     return "use_case"
+
+
+def is_scenario_slug(value: str) -> bool:
+    """True for canonical scenario slugs (incl. legacy use_case scenarios) —
+    consumers use this to keep scenario terms out of problem-framed templates."""
+    return str(value or "").strip() in _SCENARIO_PHRASES
+
+
+def _canonical_scenario(term: str) -> Optional[str]:
+    """Map a scenario alias ("heat protection", "여행용") to its canonical slug;
+    None when the term isn't in the scenario lexicon."""
+    cleaned = str(term or "").strip()
+    if not cleaned:
+        return None
+    if cleaned in _SCENARIO_PHRASES:
+        return cleaned
+    for phrase, slug in _SCENARIO_TERMS:
+        if cleaned == phrase or cleaned == slug or _has_phrase(cleaned, phrase):
+            return slug
+    return None
 
 
 def _direct_category_allowed(value: str) -> bool:
@@ -720,8 +930,16 @@ def _add_direct_merchant_attrs(
     for tag in _tags_from_raw(attrs.get("tags") or product.get("tags")):
         cleaned = _safe_direct_attr(tag)
         class_name = _direct_tag_class(cleaned)
-        if class_name:
-            _add_attr(classes, evidence, class_name, cleaned, "tag")
+        if not class_name:
+            continue
+        if class_name == "scenario":
+            # Canonicalize alias -> slug ("heat protection"/"여행용" ->
+            # heat-styling/travel) so a direct tag never mints a duplicate
+            # raw-alias lane next to the lexicon's canonical one.
+            cleaned = _canonical_scenario(cleaned) or ""
+            if not cleaned:
+                continue
+        _add_attr(classes, evidence, class_name, cleaned, "tag")
 
 
 def _add_offer_and_proof_attrs(
@@ -867,6 +1085,14 @@ def build_sku_attribute_graph(product: dict) -> dict:
             class_name="proof",
             lexicon=_PROOF_TERMS,
         )
+        _add_lexicon_matches(
+            text=text,
+            source=source,
+            classes=classes,
+            evidence=evidence,
+            class_name="scenario",
+            lexicon=_SCENARIO_TERMS,
+        )
 
     _add_direct_merchant_attrs(safe_product, classes, evidence)
     _add_offer_and_proof_attrs(safe_product, classes, evidence)
@@ -883,6 +1109,10 @@ def build_sku_attribute_graph(product: dict) -> dict:
 
     # Resolve conflicting form signals to the most specific authoritative source.
     classes["format"] = _resolve_authoritative_form(safe_product, classes.get("format", []))
+
+    # Scenario inference AFTER format resolution so a demoted loose-tag format
+    # can't mint travel lanes the SKU's real form doesn't substantiate.
+    _apply_scenario_edges(classes, evidence)
 
     # Mineral UV filters are excipients/colorants in an ingestible — never pitch
     # a collagen tablet on "titanium dioxide". Keep them only for sunscreen.
@@ -974,7 +1204,12 @@ def _basis_evidence(graph: Mapping[str, Any], basis: Iterable[str]) -> List[str]
     out: List[str] = []
     seen = set()
     for attr in basis:
-        source = str(evidence.get(attr) or "").strip()
+        key = str(attr)
+        # "scenario:<slug>" basis markers (P0 coverage signal) resolve to the
+        # slug's evidence — a page mention or the "inferred from ..." note.
+        if key.startswith("scenario:"):
+            key = key.split(":", 1)[1]
+        source = str(evidence.get(key) or "").strip()
         if not source or source in seen:
             continue
         seen.add(source)
@@ -1164,6 +1399,25 @@ def generate_sidewalk_query_specs(
                 f"{use_case} {category} {plural_format}",
                 [use_case, category, primary_format],
                 0.85,
+            )
+
+    # Scenario/occasion shapes (plan P2): the buy-trigger demand. Pool = the
+    # scenario class (direct + inferred) plus legacy use_case scenarios. The
+    # "scenario:<slug>" basis marker is the P0 coverage signal downstream.
+    scenario_pool: List[str] = list(classes.get("scenario") or [])
+    for legacy in use_cases:
+        if legacy in _USE_CASE_SCENARIO_SLUGS and legacy not in scenario_pool:
+            scenario_pool.append(legacy)
+    for slug in scenario_pool[:4]:
+        phrase = _SCENARIO_PHRASES.get(slug) or slug.replace("-", " ")
+        marker = f"scenario:{slug}"
+        add(f"best {category} for {phrase}", [marker, category], 0.9)
+        add(f"{category} for {phrase}", [marker, category], 0.86)
+        if slug in _PACKABLE_SCENARIOS:
+            add(
+                f"what {category} to pack for {phrase}",
+                [marker, category],
+                0.88,
             )
 
     benefit = _benefit_for_category(category)
