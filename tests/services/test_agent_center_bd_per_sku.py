@@ -692,6 +692,94 @@ def test_per_sku_queries_are_well_formed_even_with_garbled_attributes():
             assert str(record.get("axis") or "").strip(), ("missing axis", n, repr(q))
 
 
+def test_description_sentences_never_become_query_terms():
+    """DAMDAM 2026-07-01: PDP description sentences leaked in as attributes and
+    produced garbled multi-clause queries ("description a gentle scrub formulated
+    with a natural exfoliator … face cleansers"). A shopper term is a short noun
+    phrase; sentence-length values are dropped, real multi-word attributes kept."""
+    from services.agent_center_bd_report_service import _clean_prompt_term
+
+    assert _clean_prompt_term(
+        "description a gentle scrub formulated with a natural exfoliator to draw "
+        "out impurities and prevent pore buildup without stripping skin dry"
+    ) == ""
+    assert _clean_prompt_term(
+        "a hybrid between an essence and setting spray this provides extra care"
+    ) == ""
+    # Real attributes (well under the word cap) survive unchanged.
+    for legit in (
+        "bond repair treatment",
+        "low molecular weight collagen",
+        "green tea and shea butter",
+        "vitamin c serum",
+    ):
+        assert _clean_prompt_term(legit) == legit, repr(legit)
+
+
+def test_generic_container_category_falls_through_to_title():
+    """DAMDAM 2026-07-01: a Vitamin C serum whose category resolved to "set" was
+    probed as "best set" and returned cookware brands as skincare rivals. Generic
+    container categories are rejected so the anchor derives from the title."""
+    from services.agent_center_bd_report_service import (
+        _category_for_unbranded_prompts,
+        _unbranded_category_specs,
+    )
+
+    product = {"title": "GINKGO BOUNCY Water Cream", "product_type": "set"}
+    category = _category_for_unbranded_prompts(product, "set", {})
+    assert category not in {"set", "gift set", "kit", "bundle", "collection"}
+    assert "cream" in category  # title-derived, not the bundle label
+
+    # And a container category passed straight to the spec builder yields nothing.
+    assert _unbranded_category_specs(
+        category="gift set", graph={}, topics=[], bullets=[],
+    ) == []
+
+
+def test_container_category_never_reaches_the_filler_pool():
+    """The filler-pool path builds queries straight off product_type; a container
+    product_type ("set") must not produce 'best set to buy online' / 'compare set
+    options' filler even when base+sidewalk under-fill the target."""
+    from services.agent_center_bd_report_service import _build_per_sku_audit_query_records
+
+    ctx = {
+        "sku_key": "sku-set",
+        "merchant_id": "m-1",
+        "product": {"title": "GINKGO BOUNCY Water Cream", "product_type": "set"},
+    }
+    container_filler = (
+        "top set", "recommended set", "best rated set", "popular set",
+        "compare set options", "set reviews", "best set to buy online",
+    )
+    for n in (8, 16, 40):
+        records = _build_per_sku_audit_query_records(ctx, n)
+        assert records, ("expected queries", n)
+        for record in records:
+            q = str(record["query"]).lower()
+            for junk in container_filler:
+                assert junk not in q, ("container filler leaked", n, junk, record["query"])
+
+
+def test_lane_product_evidence_drops_promo_phrases():
+    """DAMDAM 2026-07-01: "skincare discount" rode PDP/banner copy into the lane
+    evidence phrases and became the merchant's headline recommendation. The lane
+    evidence collector must gate promo phrases the same way query generation does."""
+    from services.sku_lane_priority import build_lane_product_evidence
+
+    evidence = build_lane_product_evidence(
+        product={
+            "title": "GINKGO BOUNCY Water Cream",
+            "product_type": "moisturizer",
+            "tags": ["skincare discount", "free shipping", "hydrating"],
+        },
+    )
+    phrases = " | ".join(evidence["phrases"]).lower()
+    assert "discount" not in phrases
+    assert "free shipping" not in phrases
+    # A real attribute from the same tag list is kept.
+    assert any("hydrating" in p for p in evidence["phrases"])
+
+
 def test_promo_terms_never_become_query_axis_terms():
     """Regression: a promotional/marketing term ("skincare discount") leaked in as
     an enrichment topic and produced nonsense merchant-facing queries like
@@ -808,6 +896,69 @@ def test_deepseek_verify_deweights_only_answer_quality():
     assert breakdown["answer_quality_rate"]["verify_deweighted"] == 1
 
 
+def test_any_provider_first_party_is_or_not_majority_over_union():
+    """BUG A regression (ANUKO 2026-07-02 false-INVISIBLE): the combined
+    any_profile_provider first_party_rate must be an OR of the per-provider
+    decision, never below max(per-provider). Each provider grounds on the
+    merchant PDP for a DIFFERENT prompt; the earlier majority-over-union test
+    let each provider's third-party sources veto the other's first-party hit."""
+    from services.agent_center_bd_report_service import (
+        _any_provider_probe_runs,
+        build_citation_by_provider,
+        compute_citation_score,
+    )
+
+    ctx = _base_sku_ctx()
+    runs = _multi_provider_probe_runs()
+
+    by_provider = build_citation_by_provider(ctx, runs)
+    gem_fp = by_provider["gemini"]["breakdown"]["first_party_rate"]["numerator"]
+    gpt_fp = by_provider["chatgpt"]["breakdown"]["first_party_rate"]["numerator"]
+    assert gem_fp == 1  # gemini cites the PDP on "where can I buy"
+    assert gpt_fp == 1  # chatgpt cites the PDP on "best serum for dullness"
+
+    _score, combined = compute_citation_score(
+        ctx, _any_provider_probe_runs(runs, sku_ctx=ctx),
+    )
+    # OR across providers over 2 distinct prompts → 2/2, and never below either
+    # provider's own count.
+    assert combined["first_party_rate"]["numerator"] == 2
+    assert combined["first_party_rate"]["denominator"] == 2
+    assert combined["first_party_rate"]["numerator"] >= max(gem_fp, gpt_fp)
+
+
+def test_any_provider_first_party_respects_negative_verdict():
+    """The OR is over the FULL per-run credit (grounded-primary AND not an
+    explicit negative), so a provider that grounds on the PDP while denying the
+    product does not earn first-party credit."""
+    from services.agent_center_bd_report_service import (
+        _any_provider_probe_runs,
+        compute_citation_score,
+    )
+
+    ctx = _base_sku_ctx()
+    runs = [{
+        "provider": "gemini",
+        "probe_run_id": "probe-neg",
+        "raw_runs": [{
+            "query": "is bright skin serum any good",
+            # PDP is a grounding source, but the answer explicitly denies the
+            # product is the right/visible one → no first-party credit.
+            "parsed": {"product_visible": False, "correct_sku": False},
+            "grounding_sources": [
+                {"uri": "https://merchant.test/products/serum", "title": "Bright Skin Serum"},
+            ],
+            "url_match": {"in_grounding": True},
+            "axis_metadata": {"axis": "intent", "source": "auto_generated", "sku_key": "sku-1"},
+        }],
+    }]
+
+    _score, combined = compute_citation_score(
+        ctx, _any_provider_probe_runs(runs, sku_ctx=ctx),
+    )
+    assert combined["first_party_rate"]["numerator"] == 0
+
+
 @pytest.mark.asyncio
 async def test_build_per_sku_report_end_to_end_with_mocked_loaders(monkeypatch):
     from services import agent_center_bd_report_service as bd
@@ -827,12 +978,18 @@ async def test_build_per_sku_report_end_to_end_with_mocked_loaders(monkeypatch):
     report = await bd.build_per_sku_report("sku-1", "m-1", "audit-1")
     assert report["sku_key"] == "sku-1"
     assert set(report["scores"]) == {"identity", "content_richness", "routability", "citation"}
-    # build_per_sku_report runs no verify pass → answer_quality is unscored, so
-    # the citation total is 10 below the old behavior (which credited unverified
-    # answer_quality).
-    assert report["scores"]["citation"]["score"] == 68
+    # build_per_sku_report runs no verify pass → answer_quality is unscored (0).
+    # any_profile_provider first_party is an OR across providers: gemini cites the
+    # merchant PDP on the "where can I buy" prompt and chatgpt cites it on the
+    # "best serum for dullness" prompt, so BOTH prompts earn first-party credit
+    # (2/2). The earlier code re-scored a MAJORITY test over the union of every
+    # provider's grounding sources, letting a non-citing provider's third-party
+    # sources veto a citing provider's hit — deflating this to 1/2 (score 68) and
+    # driving false-INVISIBLE verdicts (the ANUKO 2026-07-02 regression).
+    assert report["scores"]["citation"]["score"] == 90
     assert report["scores"]["citation"]["breakdown"]["answer_quality_rate"]["points"] == 0
-    assert report["scores"]["citation"]["breakdown"]["first_party_rate"]["numerator"] == 1
+    assert report["scores"]["citation"]["breakdown"]["first_party_rate"]["numerator"] == 2
+    assert report["scores"]["citation"]["breakdown"]["first_party_rate"]["denominator"] == 2
     assert report["scores"]["citation"]["breakdown"]["sku_mention_rate"]["numerator"] == 2
     assert report["scores"]["citation"]["breakdown"]["aggregation_rule"].startswith("any_profile_provider")
     assert set(report["citation_by_provider"]) == {"gemini", "chatgpt"}
@@ -1175,6 +1332,71 @@ def test_build_authority_map_classification_and_reddit_shape():
     assert reddit["threads"][0]["sentiment"] is None
     assert reddit["sentiment_proxy"] is None
     assert "chatgpt" in authority_map["hosts"][0]["providers"]
+
+
+def test_host_is_first_party_recognizes_brand_storefront_affix():
+    """BUG B (ANUKO 2026-07-02): a brand's second storefront whose domain is the
+    brand name plus a generic storefront affix (tryanuko.com, anukoofficial.com,
+    shopbblab.com) must be tagged first-party — not surfaced as a third party to
+    run outreach to. Bounded to alias>=5 + exact-affix so a same-category rival
+    that merely contains the brand token is NOT swept in."""
+    from services.agent_center_bd_report_service import _host_is_first_party
+    from services.brand_alias import derive_brand_aliases
+
+    anuko_aliases = derive_brand_aliases("ANUKO", "anukoofficial.com", ())
+    assert _host_is_first_party("tryanuko.com", frozenset(), anuko_aliases) is True
+    assert _host_is_first_party("anukoofficial.com", frozenset(), anuko_aliases) is True
+    assert _host_is_first_party("shopanuko.com", frozenset(), anuko_aliases) is True
+    # A genuine third party that just mentions the brand is NOT first-party.
+    assert _host_is_first_party("anukoreviews.blogspot.com", frozenset(), anuko_aliases) is False
+    assert _host_is_first_party("sephora.com", frozenset(), anuko_aliases) is False
+
+    # Short aliases (< 5 chars) must not affix-match — "glow" + "recipe" is a rival.
+    glow_aliases = derive_brand_aliases("Glow", "glow.com", ())
+    assert _host_is_first_party("glowrecipe.com", frozenset(), glow_aliases) is False
+
+
+def test_build_authority_map_folds_in_merchant_owned_domains():
+    """A domain Pivota already knows the merchant owns (onboarding/catalog),
+    passed via merchant_extra_hosts, is tagged first_party and thus excluded
+    from 'who AI cites instead' / outreach."""
+    from services.agent_center_bd_report_service import build_authority_map
+    from services.merchant_narrative_builder import _who_ai_cites_instead
+
+    runs = [{
+        "provider": "gemini",
+        "raw_runs": [{
+            "query": "where to buy the serum",
+            "parsed": {"product_visible": True, "correct_sku": True},
+            "grounding_sources": [
+                {"uri": "https://us-store.example-brand.com/p/serum", "title": "us-store.example-brand.com"},
+            ],
+            "url_match": {"in_grounding": True},
+            "axis_metadata": {"axis": "intent", "sku_key": "sku-1"},
+        }],
+    }]
+    per_sku_reports = [{"sku_key": "sku-1", "product_key": "prod-1"}]
+
+    # Without the owned-domain hint, the second storefront reads as a third party.
+    am_without = build_authority_map(
+        per_sku_reports, {"sku-1": runs}, merchant_host="brand.example.com",
+    )
+    host_without = {h["host"]: h for h in am_without["hosts"]}["us-store.example-brand.com"]
+    assert host_without["first_party"] is False
+
+    # With it folded in, it's the merchant's own findability, not an outreach target.
+    am_with = build_authority_map(
+        per_sku_reports,
+        {"sku-1": runs},
+        merchant_host="brand.example.com",
+        merchant_extra_hosts={"us-store.example-brand.com"},
+    )
+    host_with = {h["host"]: h for h in am_with["hosts"]}["us-store.example-brand.com"]
+    assert host_with["first_party"] is True
+    who = _who_ai_cites_instead(am_with)
+    assert "us-store.example-brand.com" not in {
+        c["host"] for c in (who.get("cited_hosts") or [])
+    }
 
 
 def _gemini_redirector_run(query: str, title: str) -> Dict[str, Any]:

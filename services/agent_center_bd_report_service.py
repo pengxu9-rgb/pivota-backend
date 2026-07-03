@@ -32,7 +32,7 @@ import json
 import logging
 import math
 import re
-from typing import Any, Dict, List, Mapping, Optional, Tuple
+from typing import Any, Dict, Iterable, List, Mapping, Optional, Tuple
 from urllib.parse import urlparse
 
 from services import agent_center_llm_client as llm_client
@@ -1624,6 +1624,7 @@ def _per_sku_brand_verdict(
     median_citation: Optional[int],
     total_skus: int,
     blocked_count: int,
+    evidence: Optional[Dict[str, Any]] = None,
 ) -> Tuple[str, str, str]:
     """Honest brand-level verdict for the per-SKU audit.
 
@@ -1631,6 +1632,14 @@ def _per_sku_brand_verdict(
     at all (median is None — typically every SKU is blocked / not yet indexed),
     do NOT pass 0 into verdict_for: that emits a false bottom-tier "invisible"
     verdict with no path forward. Tell the merchant the truth instead.
+
+    `evidence` carries the brand's real citation counts (attribution_runs_total,
+    merchant_cited_runs summed across SKUs). Passing it is what stops an
+    INVISIBLE verdict from asserting the absolute falsehood "your URL did not
+    appear in any grounded source": with evidence, _explain_verdict reports the
+    honest "cited in N of M queries" and only claims total absence when the
+    merchant-cited count is genuinely 0 (the ANUKO 2026-07-02 regression, where
+    the brand was first-party cited on real prompts yet told it was invisible).
     """
     if median_citation is None:
         if total_skus > 0 and blocked_count >= total_skus:
@@ -1638,7 +1647,9 @@ def _per_sku_brand_verdict(
             return BRAND_STATE_BLOCKED_PRE_INDEX, label, explanation
         label, explanation = _BRAND_VERDICT_INSUFFICIENT_SIGNAL
         return BRAND_STATE_INSUFFICIENT_SIGNAL, label, explanation
-    label, explanation = verdict_for(int(median_citation), int(median_citation))
+    label, explanation = verdict_for(
+        int(median_citation), int(median_citation), evidence=evidence,
+    )
     return BRAND_STATE_SCORED, label, explanation
 
 
@@ -3281,6 +3292,47 @@ def _first_party_grounding_primary_for_run(
     return first_party >= external
 
 
+def _run_negative_verdict(run: Dict[str, Any]) -> bool:
+    """True when a single run's answer explicitly denies this is the right /
+    visible product. Shared by the citation scorer's per-run gating AND the
+    any-provider merge, so both agree on what counts as a negative echo."""
+    parsed = run.get("parsed") if isinstance(run.get("parsed"), dict) else {}
+    url_match = run.get("url_match") if isinstance(run.get("url_match"), dict) else {}
+    llm_report = (
+        url_match.get("llm_self_report")
+        if isinstance(url_match.get("llm_self_report"), dict)
+        else {}
+    )
+    product_visible = parsed.get("product_visible")
+    if product_visible is None:
+        product_visible = run.get("product_visible")
+    if product_visible is None:
+        product_visible = llm_report.get("product_visible")
+    return (
+        product_visible is False
+        or parsed.get("correct_sku") is False
+        or llm_report.get("correct_sku") is False
+    )
+
+
+def _run_first_party_credit(
+    run: Dict[str, Any],
+    sku_ctx: Dict[str, Any],
+    product: Dict[str, Any],
+) -> bool:
+    """The complete per-run "does this prompt earn first-party credit" decision
+    for ONE provider's run: the merchant PDP is a primary grounding source AND
+    the answer is not an explicit negative. This is exactly what the
+    per-provider scorer counts; the any-provider aggregate ORs it across
+    providers BEFORE the source lists are unioned, so a non-citing provider's
+    external sources can never veto a citing provider's genuine first-party hit
+    (the majority test `first_party >= external` over the union did exactly
+    that — deflating combined first_party below the per-provider max)."""
+    return _first_party_grounding_primary_for_run(run, sku_ctx or {}, product) and not (
+        _run_negative_verdict(run)
+    )
+
+
 def _run_text(run: Dict[str, Any]) -> str:
     parsed = run.get("parsed") if isinstance(run.get("parsed"), dict) else {}
     return " ".join(
@@ -3529,10 +3581,9 @@ def _citation_positive_verify_candidates(
     sku_ctx: Dict[str, Any],
     probe_runs: Any,
 ) -> List[Dict[str, Any]]:
-    del sku_ctx  # reserved for future stricter candidate filters.
     candidates: List[Dict[str, Any]] = []
     seen = set()
-    for run in _flatten_probe_runs(_any_provider_probe_runs(probe_runs)):
+    for run in _flatten_probe_runs(_any_provider_probe_runs(probe_runs, sku_ctx=sku_ctx)):
         if not _answer_quality_positive(run):
             continue
         key = _citation_prompt_key(run)
@@ -3615,7 +3666,9 @@ async def _run_deepseek_verify_pass(
         if str(provider or "").strip()
     ]
     candidates = _citation_positive_verify_candidates(sku_ctx, probe_runs)
-    observed_prompt_count = len(_flatten_probe_runs(_any_provider_probe_runs(probe_runs)))
+    observed_prompt_count = len(
+        _flatten_probe_runs(_any_provider_probe_runs(probe_runs, sku_ctx=sku_ctx))
+    )
     sample_cap = _verify_sample_cap(
         positives_count=len(candidates),
         prompts_per_sku=prompts_per_sku,
@@ -3871,28 +3924,27 @@ def compute_citation_score(
         # negative verdict must not earn first_party / sku_mention / authority
         # credit. (It inflated the lowest-visibility SKUs: e.g. Collagen Garden
         # scored citation 28 on 3/40 visible, ~19 pts from ungated first_party.)
-        product_visible = parsed.get("product_visible")
-        if product_visible is None:
-            product_visible = run.get("product_visible")
-        if product_visible is None:
-            product_visible = llm_report.get("product_visible")
-        negative_verdict = (
-            product_visible is False
-            or parsed.get("correct_sku") is False
-            or llm_report.get("correct_sku") is False
-        )
+        negative_verdict = _run_negative_verdict(run)
 
         # first_party: the merchant PDP must be a primary grounding source.
         # `url_match.in_grounding` can be true on branded prompts where the
         # brand is merely mentioned while publishers/retailers carry the
         # citations; that is visibility, not first-party control.
-        grounded_first_party = _first_party_grounding_primary_for_run(
-            run,
-            sku_ctx or {},
-            product,
-        )
-        if grounded_first_party and not negative_verdict:
-            first_party_hits += 1
+        if "_any_first_party_primary" in run:
+            # Pre-merged any-provider run: the per-provider first-party decision
+            # (grounded-primary AND not-negative) was already OR'd across
+            # providers before their source lists were unioned, so use it
+            # directly instead of re-running the majority test over the union.
+            if run.get("_any_first_party_primary"):
+                first_party_hits += 1
+        else:
+            grounded_first_party = _first_party_grounding_primary_for_run(
+                run,
+                sku_ctx or {},
+                product,
+            )
+            if grounded_first_party and not negative_verdict:
+                first_party_hits += 1
 
         # Affirmative structured signal that the provider actually surfaced the SKU.
         # correct_sku=True remains independently affirmative; a mere
@@ -4052,6 +4104,7 @@ def _citation_prompt_key(run: Dict[str, Any]) -> Tuple[str, str, str]:
 
 def _merge_runs_for_any_provider(
     runs: List[Dict[str, Any]],
+    sku_ctx: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
     merged = dict(runs[0]) if runs else {}
     parsed_out: Dict[str, Any] = {}
@@ -4114,15 +4167,28 @@ def _merge_runs_for_any_provider(
     merged["_providers"] = providers
     if excerpts:
         merged["evidence_excerpt"] = excerpts[0]
+    # OR the per-provider first-party decision BEFORE the source lists were
+    # unioned above. Honoured by compute_citation_score so the combined
+    # first_party_rate reflects "any provider cited the merchant PDP", matching
+    # the printed any_profile_provider aggregation rule (see
+    # _run_first_party_credit for why the post-union majority test was wrong).
+    if sku_ctx is not None:
+        product = _get_product(sku_ctx or {})
+        merged["_any_first_party_primary"] = any(
+            _run_first_party_credit(run, sku_ctx, product) for run in runs
+        )
     return merged
 
 
-def _any_provider_probe_runs(per_sku_probe_runs: Any) -> List[Dict[str, Any]]:
+def _any_provider_probe_runs(
+    per_sku_probe_runs: Any,
+    sku_ctx: Optional[Dict[str, Any]] = None,
+) -> List[Dict[str, Any]]:
     grouped_runs: Dict[Tuple[str, str, str], List[Dict[str, Any]]] = defaultdict(list)
     for run in _flatten_probe_runs(per_sku_probe_runs):
         grouped_runs[_citation_prompt_key(run)].append(run)
     merged_runs = [
-        _merge_runs_for_any_provider(runs)
+        _merge_runs_for_any_provider(runs, sku_ctx=sku_ctx)
         for _key, runs in sorted(grouped_runs.items())
         if runs
     ]
@@ -6368,7 +6434,7 @@ async def build_per_sku_report(
         )
         citation_score, citation_breakdown = compute_citation_score(
             sku_ctx,
-            _any_provider_probe_runs(probe_runs),
+            _any_provider_probe_runs(probe_runs, sku_ctx=sku_ctx),
             verify_outputs=verify_outputs,
         )
         citation_breakdown["aggregation_rule"] = (
@@ -7129,16 +7195,53 @@ def _classify_authority_host(host: Optional[str]) -> str:
 CITATION_ROLE_UNCLASSIFIED = ROLE_RELATIVE_UNCLASSIFIED
 
 
+# Generic storefront affixes a brand bolts onto its own name for a second
+# domain (usually a regional / DTC storefront): "tryanuko.com", "shopbblab.com",
+# "anukoofficial.com". Used ONLY to recognise a brand-named own-domain — matched
+# as an exact affix on an alias of length >= 5 (short aliases collide), never a
+# free substring — so a same-category competitor ("glowrecipe" vs "glow") is not
+# swept in. First-party classification only moves a host from
+# endorsement/"who-cites-instead" to findability/"your own listing", so the
+# conservative-error direction is to under-count endorsement, not over-claim it.
+_BRAND_STOREFRONT_PREFIXES = ("try", "shop", "get", "buy", "my", "go", "the", "join")
+_BRAND_STOREFRONT_SUFFIXES = (
+    "official", "store", "shop", "hq", "us", "usa", "global", "eu", "co", "online",
+)
+_MIN_AFFIX_ALIAS_LEN = 5
+
+
+def _host_label_matches_brand_storefront(
+    label: str, brand_aliases: Tuple[str, ...]
+) -> bool:
+    """True when a host's registrable label is a brand alias wrapped in a generic
+    storefront affix (tryANUKO, shopBBLAB, ANUKOofficial). Bounded on purpose:
+    the alias must be >= 5 chars and match the WHOLE residual after stripping one
+    known affix — never a loose substring."""
+    if not label:
+        return False
+    for alias in brand_aliases:
+        a = alias.replace(" ", "")
+        if len(a) < _MIN_AFFIX_ALIAS_LEN:
+            continue
+        if any(label == p + a for p in _BRAND_STOREFRONT_PREFIXES):
+            return True
+        if any(label == a + s for s in _BRAND_STOREFRONT_SUFFIXES):
+            return True
+    return False
+
+
 def _host_is_first_party(
     host: Optional[str],
     merchant_hosts: frozenset,
     brand_aliases: Tuple[str, ...],
 ) -> bool:
     """True when a cited host is the merchant's own site — a direct host match,
-    a sub/parent-domain relationship, or a registrable label that equals one of
-    the brand's de-spaced aliases (e.g. brand "BB Lab" -> `bblab.shop`).
-    Exact-label, not substring, so a competitor that merely contains the brand
-    token ("glowrecipe.com" vs brand "Glow") is not mis-tagged as first-party."""
+    a sub/parent-domain relationship, a registrable label that equals one of the
+    brand's de-spaced aliases (e.g. brand "BB Lab" -> `bblab.shop`), or that
+    alias wrapped in a generic storefront affix (brand "ANUKO" -> `tryanuko.com`,
+    the brand's own US storefront). Exact-label / bounded-affix, not free
+    substring, so a competitor that merely contains the brand token
+    ("glowrecipe.com" vs brand "Glow") is not mis-tagged as first-party."""
     if not host:
         return False
     h = normalize_host(host) or str(host).strip().lower()
@@ -7148,7 +7251,11 @@ def _host_is_first_party(
         if mh and (h == mh or h.endswith(f".{mh}") or mh.endswith(f".{h}")):
             return True
     label = _registrable_name_from_host(h)
-    return bool(label) and label in brand_aliases
+    if not label:
+        return False
+    if label in brand_aliases:
+        return True
+    return _host_label_matches_brand_storefront(label, brand_aliases)
 
 
 def _host_is_competitor(raw_host_type: Optional[str], first_party: bool) -> bool:
@@ -7406,6 +7513,7 @@ def build_authority_map(
     merchant_host: Optional[str] = None,
     merchant_brand: Optional[str] = None,
     merchant_vendors: Optional[Tuple[str, ...]] = None,
+    merchant_extra_hosts: Optional[Iterable[str]] = None,
 ) -> Dict[str, Any]:
     # Fix 2 — merchant identity for first-party / own-listing classification.
     # Cited hosts that are the merchant's own site (or carry the brand's
@@ -7413,7 +7521,19 @@ def build_authority_map(
     # was surfaced" is never conflated with "independently recommended in
     # category". Omitting identity (legacy callers) is safe: nothing is tagged
     # first-party and roles fall back to host-type semantics.
-    merchant_hosts = frozenset(h for h in {normalize_host(merchant_host or "")} if h)
+    # merchant_extra_hosts = other domains Pivota already knows the merchant owns
+    # (onboarding store_url/website + catalog source/canonical hosts, from
+    # brand_claim_service.merchant_owned_domains). Folding them in stops a
+    # merchant's second storefront (e.g. ANUKO's tryanuko.com) being tagged a
+    # third party and surfaced under "who AI cites instead" / an outreach move.
+    merchant_hosts = frozenset(
+        h
+        for h in (
+            {normalize_host(merchant_host or "")}
+            | {normalize_host(x or "") for x in (merchant_extra_hosts or ())}
+        )
+        if h
+    )
     brand_aliases = derive_brand_aliases(
         merchant_brand,
         merchant_host,
@@ -7753,12 +7873,25 @@ _PROMPT_TERM_STRIP_CHARS = " \t\r\n,.;:/\\\"'`[]{}<>()|*#~"
 _is_promo_term = is_promo_term
 
 
+# A shopper attribute/category term is a short noun phrase ("bond repair
+# treatment", "low molecular weight collagen"), never a full sentence. When a
+# PDP description sentence leaks in as a "term" it becomes a nonsense query
+# ("description a gentle scrub formulated with a natural exfoliator … face
+# cleansers"). Cap the word count so sentence fragments are dropped while every
+# real multi-word attribute (well under this bound) passes untouched.
+_PROMPT_TERM_MAX_WORDS = 8
+
+
 def _clean_prompt_term(value: Any) -> str:
     text = re.sub(r"\s+", " ", str(value or "").strip().lower())
     text = text.strip(_PROMPT_TERM_STRIP_CHARS)
     # A token with no real word content (a lone bracket/quote) or a single stray
     # character is not a shopper term — emitting it leaks a query fragment.
     if len(text) < 2 or not re.search(r"[a-z0-9]", text):
+        return ""
+    # A full sentence (PDP description copy) is not a shopper attribute; emitting
+    # it produces a garbled multi-clause query. Drop anything sentence-length.
+    if len(re.findall(r"[a-z0-9]+", text)) > _PROMPT_TERM_MAX_WORDS:
         return ""
     # A promo/discount/marketing term is not a shopper attribute — dropping it
     # here keeps it out of every query template (topics, bullets, attributes).
@@ -7809,6 +7942,20 @@ def _graph_class_values(graph: Mapping[str, Any], class_name: str) -> List[str]:
     return out
 
 
+# Generic container/merchandising "categories" that describe a bundle, not a
+# product kind. Used as a category anchor they produce off-target queries and
+# absurd competitors — DAMDAM's CITRUS GLOW serum resolved to "set" and was
+# probed as "best set", returning cookware brands (All-Clad, Le Creuset) as
+# skincare rivals. Reject them so the anchor falls through to the title-derived
+# category ("serum").
+_GENERIC_CONTAINER_CATEGORIES = frozenset({
+    "product", "products", "item", "items",
+    "set", "sets", "kit", "kits", "bundle", "bundles",
+    "collection", "collections", "pack", "packs", "gift", "gifts",
+    "gift set", "gift sets", "starter kit", "sampler", "box", "value set",
+})
+
+
 def _category_for_unbranded_prompts(
     product: Mapping[str, Any],
     product_type: str,
@@ -7821,14 +7968,14 @@ def _category_for_unbranded_prompts(
     )
     if (
         direct
-        and direct not in {"product", "products", "item", "items"}
+        and direct not in _GENERIC_CONTAINER_CATEGORIES
         and not _noisy_prompt_category(direct)
     ):
         return direct
     for category in _graph_class_values(graph, "category"):
         if (
             category
-            and category not in {"product", "products", "item", "items"}
+            and category not in _GENERIC_CONTAINER_CATEGORIES
             and not _noisy_prompt_category(category)
         ):
             return category
@@ -7927,7 +8074,7 @@ def _unbranded_category_specs(
     bullets: List[str],
 ) -> List[Tuple[str, str]]:
     category = _clean_prompt_term(category)
-    if not category or category in {"product", "products", "item", "items"}:
+    if not category or category in _GENERIC_CONTAINER_CATEGORIES:
         return []
 
     # NOTE on tags: queries keep the COARSE `axis` vocabulary every downstream
@@ -8439,7 +8586,11 @@ def _build_per_sku_audit_query_records(
             (f"{filler_cat} reviews", "category"),
             (f"best {filler_cat} to buy online", "category"),
         ])
-        if filler_cat and filler_cat not in {"product", "products", "item", "items"}
+        if (
+            filler_cat
+            and filler_cat not in _GENERIC_CONTAINER_CATEGORIES
+            and not _noisy_prompt_category(filler_cat)
+        )
         else []
     )
     if not sidewalk_records:
@@ -10788,12 +10939,25 @@ async def run_brand_report(
         # findability/endorsement honestly for a reseller (the brands it carries
         # vs the store itself).
         brand_rollup["merchant_type"] = "reseller" if _merchant_is_reseller else "brand"
+        # Other domains Pivota already knows this merchant owns (onboarding +
+        # catalog). Best-effort: a failure must not break the audit, and a
+        # non-onboarded URL-wedge merchant simply returns none (the brand-alias
+        # storefront-affix match in _host_is_first_party still catches
+        # brand-named second domains like tryanuko.com).
+        _merchant_owned_hosts: set = set()
+        try:
+            from services.brand_claim_service import merchant_owned_domains
+
+            _merchant_owned_hosts = await merchant_owned_domains(str(merchant_id))
+        except Exception:  # noqa: BLE001
+            logger.warning("per-sku owned-domains load failed", exc_info=True)
         authority_map = build_authority_map(
             per_sku_reports,
             probe_runs_by_sku,
             merchant_host=_merchant_host,
             merchant_brand=merchant_name,
             merchant_vendors=_merchant_vendors,
+            merchant_extra_hosts=_merchant_owned_hosts,
         )
         # R3 — store-as-destination (the retailer win metric): is the store the
         # AI-routed buy path, and who does AI route to instead. Reuses the
@@ -10809,11 +10973,43 @@ async def run_brand_report(
         )
         # Honest brand verdict — see _per_sku_brand_verdict. A blocked /
         # pre-index brand must NOT collapse to a false "invisible" verdict;
-        # the get-indexed action becomes step 1 below.
+        # the get-indexed action becomes step 1 below. Sum the per-SKU
+        # first-party citation counts so an INVISIBLE explanation reports the
+        # real "cited in N of M queries" instead of falsely asserting the
+        # merchant URL never appeared in any grounded source.
+        _fp_cited = 0
+        _fp_total = 0
+        for _r in per_sku_reports:
+            _fp = (
+                (((_r.get("scores") or {}).get("citation") or {}).get("breakdown") or {})
+                .get("first_party_rate")
+                or {}
+            )
+            try:
+                _fp_cited += int(_fp.get("numerator") or 0)
+                _fp_total += int(_fp.get("denominator") or 0)
+            except (TypeError, ValueError):
+                continue
+        # _fp_total > 0 holds whenever a scored verdict is reached: a non-None
+        # median_citation means at least one SKU's compute_citation_score
+        # returned non-None, which only happens when len(runs) > 0, and
+        # first_party_rate.denominator == len(runs). The guard is belt-and-
+        # suspenders (evidence with total=0 would render a nonsensical
+        # "None of 0 queries"); _per_sku_brand_verdict routes the true
+        # no-signal case to the blocked/insufficient branch before verdict_for.
+        _brand_verdict_evidence = (
+            {
+                "attribution_runs_total": _fp_total,
+                "merchant_cited_runs": _fp_cited,
+            }
+            if _fp_total > 0
+            else None
+        )
         brand_state, legacy_label, brand_verdict_explanation = _per_sku_brand_verdict(
             median_citation,
             len(per_sku_reports),
             len(brand_rollup.get("blocked_skus") or []),
+            evidence=_brand_verdict_evidence,
         )
         brand_rollup["brand_state"] = brand_state
         brand_rollup["brand_verdict_label"] = legacy_label

@@ -11,6 +11,7 @@ import re
 from typing import Any, Dict, Iterable, List, Mapping, Optional, Tuple
 
 from services.buyer_path_stable_controllers import stable_buyer_path_controller_hosts
+from services.promo_terms import is_promo_term
 
 
 THIRD_PARTY_OWNERSHIP = {
@@ -123,6 +124,13 @@ def build_lane_product_evidence(
     def add(value: Any, source: str, *, explicit: bool = False) -> None:
         for phrase in _phrases_from_any(value):
             if len(phrase) < 3:
+                continue
+            # A promo/marketing/operational phrase ("skincare discount", "free
+            # shipping", "exclude_rebuy") is never a product attribute; letting
+            # it into the evidence phrases lets it become a lane and then the
+            # merchant's headline recommendation (the DAMDAM "skincare discount"
+            # first-move). Gate it here too, mirroring _clean_prompt_term.
+            if is_promo_term(phrase.lower()):
                 continue
             bucket = phrase_sources.setdefault(phrase, [])
             if source not in bucket:
