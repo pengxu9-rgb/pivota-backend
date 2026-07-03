@@ -8104,9 +8104,15 @@ def _unbranded_category_specs(
     # problem_jtbd shapes — how shoppers actually ask AI: need/problem-first. A
     # need-framed query returns products, not a bare ingredient rundown, which also
     # cuts the ingredient-as-competitor harvesting at the source (vs "best {cat}").
+    # "what helps with X" is gated to genuine problem/routine terms: scenario
+    # terms produced observed junk ("what helps with travel/summer") — those get
+    # proper scenario shapes in the sidewalk generator instead.
+    from services.sku_sidewalk import is_scenario_slug
+
     for use_case in use_cases[:3]:
         specs.append((f"best {category} for {use_case}", "category"))
-        specs.append((f"what helps with {use_case}", "category"))
+        if not is_scenario_slug(use_case):
+            specs.append((f"what helps with {use_case}", "category"))
     for audience in audiences[:2]:
         specs.append((f"{category} for {audience}", "category"))
     for topic in topics[:3]:
@@ -8624,6 +8630,22 @@ def _build_per_sku_audit_query_records(
         for record in records:
             if str(record.get("query") or "").strip().lower() in winnable:
                 record["source"] = "llm_winnable"
+    # P0 scenario-coverage metric (scenario-demand plan): how much of the probe
+    # budget tests scenario/occasion buy-trigger demand. Baseline was 0.
+    scenario_count = sum(
+        1
+        for record in records
+        if any(
+            str(b).startswith("scenario:")
+            for b in (record.get("attribute_basis") or [])
+        )
+    )
+    if records:
+        logger.info(
+            "prompt-budget: scenario coverage %d/%d for sku=%s",
+            scenario_count, len(records),
+            (sku_ctx or {}).get("sku_key"),
+        )
     return records
 
 
