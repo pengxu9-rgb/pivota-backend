@@ -35,6 +35,9 @@ from services.agent_center_bd_report_service import (
     normalize_host,
     _VERTEX_REDIRECTOR_HOSTS,
 )
+# W1 RunFacts — the same fold the report assembly stamps with, so the
+# rollup-reconciliation invariant can never drift from the stamping code.
+from services.audit_facts import aggregate_run_facts
 
 SEVERITY_CRITICAL = "critical"
 SEVERITY_WARN = "warn"
@@ -450,6 +453,115 @@ def _inv_no_machine_text_in_copy(payload, identity) -> List[Violation]:
     return out
 
 
+# ---------------------------------------------------------------------------
+# W1 RunFacts invariant — displayed counters must reconcile to the fact layer
+# ---------------------------------------------------------------------------
+# Counter fields a rolled-up run_facts dict must agree on with the fold of its
+# children's run_facts stamps (aggregate_run_facts is the SAME function the
+# assembly used, so a mismatch means the stamps were mutated after assembly or
+# a child was added/dropped without re-folding).
+_RUNFACTS_FOLD_FIELDS = (
+    "own_url_cited_runs",
+    "brand_mentioned_runs",
+    "run_count",
+    "runs_with_citations",
+    "prompt_count",
+)
+
+
+def _runfacts_internal_violations(rf: Mapping[str, Any], location: str) -> List[Violation]:
+    """A stamped run_facts dict must be internally coherent: tier counters are
+    over RUNS and can never exceed run_count; prompt-class and provider splits
+    must sum to their totals. WARN severity during the phase-1 parity window —
+    surfaced for review, never degrades a surface."""
+    out: List[Violation] = []
+    run_count = rf.get("run_count")
+    if not isinstance(run_count, int):
+        return out
+
+    def _warn(code: str, message: str, **evidence: Any) -> None:
+        out.append(Violation(
+            code=code, severity=SEVERITY_WARN, surface=SURFACE_BRAND,
+            message=f"{message} at {location}",
+            evidence={"location": location, **evidence},
+        ))
+
+    for name in ("own_url_cited_runs", "brand_mentioned_runs", "runs_with_citations"):
+        val = rf.get(name)
+        if isinstance(val, int) and not (0 <= val <= run_count):
+            _warn("RUNFACTS_COUNTER_OVERFLOW",
+                  f"run_facts.{name} ({val}) outside [0, run_count={run_count}]",
+                  **{name: val, "run_count": run_count})
+    prompt_count = rf.get("prompt_count")
+    by_class = rf.get("prompt_count_by_class")
+    if isinstance(prompt_count, int) and isinstance(by_class, Mapping) and by_class:
+        class_sum = sum(int(v or 0) for v in by_class.values())
+        if class_sum != prompt_count:
+            _warn("RUNFACTS_CLASS_SPLIT_MISMATCH",
+                  f"prompt_count_by_class sums to {class_sum} but prompt_count is {prompt_count}",
+                  prompt_count=prompt_count, prompt_count_by_class=dict(by_class))
+    coverage = rf.get("provider_coverage")
+    if isinstance(coverage, Mapping) and coverage:
+        coverage_sum = sum(int(v or 0) for v in coverage.values())
+        if coverage_sum != run_count:
+            _warn("RUNFACTS_PROVIDER_COVERAGE_MISMATCH",
+                  f"provider_coverage sums to {coverage_sum} but run_count is {run_count}",
+                  run_count=run_count, provider_coverage=dict(coverage))
+    return out
+
+
+def _inv_counters_match_run_facts(payload, identity) -> List[Violation]:
+    """W1/W7 — every stamped ``run_facts`` block must be internally coherent,
+    and a brand-level rollup must equal the fold of its children's stamps
+    (legacy mode: brand_report.run_facts vs per_product[*].run_facts; per-SKU
+    mode: brand_rollup.run_facts vs per_sku_reports[*].run_facts). Tolerant of
+    absent stamps (pre-W1 payloads yield no violations); skips the fold check
+    when any child lacks a stamp (mixed-era payloads)."""
+    out: List[Violation] = []
+    brand = payload.get("brand_report")
+    brand = brand if isinstance(brand, Mapping) else {}
+
+    rollup_sites = (
+        ("brand_report.run_facts", brand.get("run_facts"),
+         "brand_report.per_product", brand.get("per_product")),
+        ("brand_report.brand_rollup.run_facts",
+         _get(brand, "brand_rollup", "run_facts"),
+         "brand_report.per_sku_reports", brand.get("per_sku_reports")),
+    )
+    for rollup_loc, rollup, children_loc, children in rollup_sites:
+        if isinstance(rollup, Mapping):
+            out.extend(_runfacts_internal_violations(rollup, rollup_loc))
+        child_facts: List[Any] = []
+        for i, child in enumerate(children or []):
+            if not isinstance(child, Mapping):
+                continue
+            rf = child.get("run_facts")
+            child_facts.append(rf)
+            if isinstance(rf, Mapping):
+                out.extend(
+                    _runfacts_internal_violations(rf, f"{children_loc}[{i}].run_facts")
+                )
+        if (
+            isinstance(rollup, Mapping)
+            and child_facts
+            and all(isinstance(rf, Mapping) for rf in child_facts)
+        ):
+            refold = aggregate_run_facts(child_facts)
+            for name in _RUNFACTS_FOLD_FIELDS:
+                if rollup.get(name) != refold.get(name):
+                    out.append(Violation(
+                        code="RUNFACTS_ROLLUP_MISMATCH", severity=SEVERITY_WARN,
+                        surface=SURFACE_BRAND,
+                        message=(
+                            f"{rollup_loc}.{name} ({rollup.get(name)!r}) does not equal "
+                            f"the fold of {children_loc}[*].run_facts ({refold.get(name)!r})"
+                        ),
+                        evidence={"field": name, "rollup": rollup.get(name),
+                                  "refold": refold.get(name), "location": rollup_loc},
+                    ))
+    return out
+
+
 _INVARIANTS = (
     _inv_own_host_as_controller,
     _inv_strategic_brief_channels,
@@ -458,6 +570,7 @@ _INVARIANTS = (
     _inv_self_substitution,
     _inv_strong_but_unowned,
     _inv_no_machine_text_in_copy,
+    _inv_counters_match_run_facts,
 )
 
 
