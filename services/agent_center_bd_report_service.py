@@ -9220,8 +9220,10 @@ async def extract_winnable_prompts(
     else:
         logger.warning(
             "winnable-prompts: provider=%s model=%s title=%r -> EMPTY "
-            "(parse/validation dropped everything; raw len=%d)",
-            provider, model, title[:60], len(str(result.get("text") or "")),
+            "(parse/validation dropped everything; raw len=%d finish_reason=%s)",
+            provider, model, title[:60],
+            len(str(result.get("text") or "")),
+            result.get("finish_reason"),
         )
     return out
 
