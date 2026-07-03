@@ -1246,6 +1246,71 @@ def test_build_authority_map_classification_and_reddit_shape():
     assert "chatgpt" in authority_map["hosts"][0]["providers"]
 
 
+def test_host_is_first_party_recognizes_brand_storefront_affix():
+    """BUG B (ANUKO 2026-07-02): a brand's second storefront whose domain is the
+    brand name plus a generic storefront affix (tryanuko.com, anukoofficial.com,
+    shopbblab.com) must be tagged first-party — not surfaced as a third party to
+    run outreach to. Bounded to alias>=5 + exact-affix so a same-category rival
+    that merely contains the brand token is NOT swept in."""
+    from services.agent_center_bd_report_service import _host_is_first_party
+    from services.brand_alias import derive_brand_aliases
+
+    anuko_aliases = derive_brand_aliases("ANUKO", "anukoofficial.com", ())
+    assert _host_is_first_party("tryanuko.com", frozenset(), anuko_aliases) is True
+    assert _host_is_first_party("anukoofficial.com", frozenset(), anuko_aliases) is True
+    assert _host_is_first_party("shopanuko.com", frozenset(), anuko_aliases) is True
+    # A genuine third party that just mentions the brand is NOT first-party.
+    assert _host_is_first_party("anukoreviews.blogspot.com", frozenset(), anuko_aliases) is False
+    assert _host_is_first_party("sephora.com", frozenset(), anuko_aliases) is False
+
+    # Short aliases (< 5 chars) must not affix-match — "glow" + "recipe" is a rival.
+    glow_aliases = derive_brand_aliases("Glow", "glow.com", ())
+    assert _host_is_first_party("glowrecipe.com", frozenset(), glow_aliases) is False
+
+
+def test_build_authority_map_folds_in_merchant_owned_domains():
+    """A domain Pivota already knows the merchant owns (onboarding/catalog),
+    passed via merchant_extra_hosts, is tagged first_party and thus excluded
+    from 'who AI cites instead' / outreach."""
+    from services.agent_center_bd_report_service import build_authority_map
+    from services.merchant_narrative_builder import _who_ai_cites_instead
+
+    runs = [{
+        "provider": "gemini",
+        "raw_runs": [{
+            "query": "where to buy the serum",
+            "parsed": {"product_visible": True, "correct_sku": True},
+            "grounding_sources": [
+                {"uri": "https://us-store.example-brand.com/p/serum", "title": "us-store.example-brand.com"},
+            ],
+            "url_match": {"in_grounding": True},
+            "axis_metadata": {"axis": "intent", "sku_key": "sku-1"},
+        }],
+    }]
+    per_sku_reports = [{"sku_key": "sku-1", "product_key": "prod-1"}]
+
+    # Without the owned-domain hint, the second storefront reads as a third party.
+    am_without = build_authority_map(
+        per_sku_reports, {"sku-1": runs}, merchant_host="brand.example.com",
+    )
+    host_without = {h["host"]: h for h in am_without["hosts"]}["us-store.example-brand.com"]
+    assert host_without["first_party"] is False
+
+    # With it folded in, it's the merchant's own findability, not an outreach target.
+    am_with = build_authority_map(
+        per_sku_reports,
+        {"sku-1": runs},
+        merchant_host="brand.example.com",
+        merchant_extra_hosts={"us-store.example-brand.com"},
+    )
+    host_with = {h["host"]: h for h in am_with["hosts"]}["us-store.example-brand.com"]
+    assert host_with["first_party"] is True
+    who = _who_ai_cites_instead(am_with)
+    assert "us-store.example-brand.com" not in {
+        c["host"] for c in (who.get("cited_hosts") or [])
+    }
+
+
 def _gemini_redirector_run(query: str, title: str) -> Dict[str, Any]:
     """A Gemini grounding run whose only source is delivered as a Vertex
     redirector URI with the REAL publisher domain in `title` — the prod v3

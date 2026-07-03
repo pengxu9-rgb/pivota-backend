@@ -32,7 +32,7 @@ import json
 import logging
 import math
 import re
-from typing import Any, Dict, List, Mapping, Optional, Tuple
+from typing import Any, Dict, Iterable, List, Mapping, Optional, Tuple
 from urllib.parse import urlparse
 
 from services import agent_center_llm_client as llm_client
@@ -7195,16 +7195,53 @@ def _classify_authority_host(host: Optional[str]) -> str:
 CITATION_ROLE_UNCLASSIFIED = ROLE_RELATIVE_UNCLASSIFIED
 
 
+# Generic storefront affixes a brand bolts onto its own name for a second
+# domain (usually a regional / DTC storefront): "tryanuko.com", "shopbblab.com",
+# "anukoofficial.com". Used ONLY to recognise a brand-named own-domain — matched
+# as an exact affix on an alias of length >= 5 (short aliases collide), never a
+# free substring — so a same-category competitor ("glowrecipe" vs "glow") is not
+# swept in. First-party classification only moves a host from
+# endorsement/"who-cites-instead" to findability/"your own listing", so the
+# conservative-error direction is to under-count endorsement, not over-claim it.
+_BRAND_STOREFRONT_PREFIXES = ("try", "shop", "get", "buy", "my", "go", "the", "join")
+_BRAND_STOREFRONT_SUFFIXES = (
+    "official", "store", "shop", "hq", "us", "usa", "global", "eu", "co", "online",
+)
+_MIN_AFFIX_ALIAS_LEN = 5
+
+
+def _host_label_matches_brand_storefront(
+    label: str, brand_aliases: Tuple[str, ...]
+) -> bool:
+    """True when a host's registrable label is a brand alias wrapped in a generic
+    storefront affix (tryANUKO, shopBBLAB, ANUKOofficial). Bounded on purpose:
+    the alias must be >= 5 chars and match the WHOLE residual after stripping one
+    known affix — never a loose substring."""
+    if not label:
+        return False
+    for alias in brand_aliases:
+        a = alias.replace(" ", "")
+        if len(a) < _MIN_AFFIX_ALIAS_LEN:
+            continue
+        if any(label == p + a for p in _BRAND_STOREFRONT_PREFIXES):
+            return True
+        if any(label == a + s for s in _BRAND_STOREFRONT_SUFFIXES):
+            return True
+    return False
+
+
 def _host_is_first_party(
     host: Optional[str],
     merchant_hosts: frozenset,
     brand_aliases: Tuple[str, ...],
 ) -> bool:
     """True when a cited host is the merchant's own site — a direct host match,
-    a sub/parent-domain relationship, or a registrable label that equals one of
-    the brand's de-spaced aliases (e.g. brand "BB Lab" -> `bblab.shop`).
-    Exact-label, not substring, so a competitor that merely contains the brand
-    token ("glowrecipe.com" vs brand "Glow") is not mis-tagged as first-party."""
+    a sub/parent-domain relationship, a registrable label that equals one of the
+    brand's de-spaced aliases (e.g. brand "BB Lab" -> `bblab.shop`), or that
+    alias wrapped in a generic storefront affix (brand "ANUKO" -> `tryanuko.com`,
+    the brand's own US storefront). Exact-label / bounded-affix, not free
+    substring, so a competitor that merely contains the brand token
+    ("glowrecipe.com" vs brand "Glow") is not mis-tagged as first-party."""
     if not host:
         return False
     h = normalize_host(host) or str(host).strip().lower()
@@ -7214,7 +7251,11 @@ def _host_is_first_party(
         if mh and (h == mh or h.endswith(f".{mh}") or mh.endswith(f".{h}")):
             return True
     label = _registrable_name_from_host(h)
-    return bool(label) and label in brand_aliases
+    if not label:
+        return False
+    if label in brand_aliases:
+        return True
+    return _host_label_matches_brand_storefront(label, brand_aliases)
 
 
 def _host_is_competitor(raw_host_type: Optional[str], first_party: bool) -> bool:
@@ -7472,6 +7513,7 @@ def build_authority_map(
     merchant_host: Optional[str] = None,
     merchant_brand: Optional[str] = None,
     merchant_vendors: Optional[Tuple[str, ...]] = None,
+    merchant_extra_hosts: Optional[Iterable[str]] = None,
 ) -> Dict[str, Any]:
     # Fix 2 — merchant identity for first-party / own-listing classification.
     # Cited hosts that are the merchant's own site (or carry the brand's
@@ -7479,7 +7521,19 @@ def build_authority_map(
     # was surfaced" is never conflated with "independently recommended in
     # category". Omitting identity (legacy callers) is safe: nothing is tagged
     # first-party and roles fall back to host-type semantics.
-    merchant_hosts = frozenset(h for h in {normalize_host(merchant_host or "")} if h)
+    # merchant_extra_hosts = other domains Pivota already knows the merchant owns
+    # (onboarding store_url/website + catalog source/canonical hosts, from
+    # brand_claim_service.merchant_owned_domains). Folding them in stops a
+    # merchant's second storefront (e.g. ANUKO's tryanuko.com) being tagged a
+    # third party and surfaced under "who AI cites instead" / an outreach move.
+    merchant_hosts = frozenset(
+        h
+        for h in (
+            {normalize_host(merchant_host or "")}
+            | {normalize_host(x or "") for x in (merchant_extra_hosts or ())}
+        )
+        if h
+    )
     brand_aliases = derive_brand_aliases(
         merchant_brand,
         merchant_host,
@@ -10854,12 +10908,25 @@ async def run_brand_report(
         # findability/endorsement honestly for a reseller (the brands it carries
         # vs the store itself).
         brand_rollup["merchant_type"] = "reseller" if _merchant_is_reseller else "brand"
+        # Other domains Pivota already knows this merchant owns (onboarding +
+        # catalog). Best-effort: a failure must not break the audit, and a
+        # non-onboarded URL-wedge merchant simply returns none (the brand-alias
+        # storefront-affix match in _host_is_first_party still catches
+        # brand-named second domains like tryanuko.com).
+        _merchant_owned_hosts: set = set()
+        try:
+            from services.brand_claim_service import merchant_owned_domains
+
+            _merchant_owned_hosts = await merchant_owned_domains(str(merchant_id))
+        except Exception:  # noqa: BLE001
+            logger.warning("per-sku owned-domains load failed", exc_info=True)
         authority_map = build_authority_map(
             per_sku_reports,
             probe_runs_by_sku,
             merchant_host=_merchant_host,
             merchant_brand=merchant_name,
             merchant_vendors=_merchant_vendors,
+            merchant_extra_hosts=_merchant_owned_hosts,
         )
         # R3 — store-as-destination (the retailer win metric): is the store the
         # AI-routed buy path, and who does AI route to instead. Reuses the
