@@ -254,8 +254,22 @@ class Settings(BaseSettings):
     prompt_gen_enabled: bool = (
         os.getenv("AUDIT_LLM_PROMPT_GEN_ENABLED", "true").lower() == "true"
     )
-    prompt_gen_provider: str = os.getenv("PROMPT_GEN_PROVIDER", "")
+    # Default generator = Gemini Flash (founder call 2026-07-03): stronger
+    # Korean + more consistent output language than deepseek on K-beauty PDPs,
+    # cheap, and the key is already provisioned (content-brief agent). When the
+    # Gemini key is missing, extract_winnable_prompts falls back to the
+    # strategic-brief provider chain rather than silently disabling.
+    prompt_gen_provider: str = os.getenv("PROMPT_GEN_PROVIDER", "gemini")
     prompt_gen_model: str = os.getenv("PROMPT_GEN_MODEL", "")
+
+    # Gemini for backend-direct (ungrounded) synthesis — shares the key the
+    # content-brief executor already uses; model is the low-cost flash tier.
+    gemini_api_key: str = (
+        os.getenv("GEMINI_API_KEY", "") or os.getenv("PIVOTA_GEMINI_API_KEY", "")
+    )
+    gemini_synthesis_model: str = os.getenv(
+        "GEMINI_SYNTHESIS_MODEL", "gemini-2.5-flash"
+    )
     strategic_brief_enabled: bool = (
         os.getenv("STRATEGIC_BRIEF_ENABLED", "false").lower() == "true"
     )

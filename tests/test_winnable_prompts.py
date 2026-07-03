@@ -135,3 +135,69 @@ def test_query_records_stamp_llm_winnable_source():
         for q, r in by_query.items()
         if q != "bond repair hair oil for chemically damaged hair"
     )
+
+
+@pytest.mark.asyncio
+async def test_prompt_gen_falls_back_when_primary_key_missing(monkeypatch):
+    """Default provider is gemini; when its key is missing the extractor falls
+    back to the strategic-brief provider (with the BRIEF's model, never the
+    gemini model string) instead of silently disabling."""
+    import json as _json
+    from config.settings import settings as app_settings
+    import services.llm_synthesis as llm
+
+    monkeypatch.setattr(app_settings, "prompt_gen_provider", "gemini", raising=False)
+    monkeypatch.setattr(app_settings, "prompt_gen_model", "gemini-2.5-flash", raising=False)
+    monkeypatch.setattr(app_settings, "strategic_brief_provider", "deepseek", raising=False)
+    monkeypatch.setattr(app_settings, "strategic_brief_model", "deepseek-chat", raising=False)
+
+    captured = {}
+
+    async def fake_synthesize(**kwargs):
+        captured.update(kwargs)
+        return {"text": _json.dumps(["best bond repair oil for damaged hair"])}
+
+    monkeypatch.setattr(llm, "synthesize", fake_synthesize, raising=False)
+    monkeypatch.setattr(
+        llm, "configured_key_for_provider",
+        lambda p: None if p == "gemini" else "sk-test", raising=False,
+    )
+    monkeypatch.setattr(llm, "default_model_for_provider", lambda p: f"{p}-default", raising=False)
+
+    out = await svc.extract_winnable_prompts(
+        {"product": {"title": "Anuko Bond & Repair Hair Oil", "vendor": "Anuko"}}
+    )
+    assert out == ["best bond repair oil for damaged hair"]
+    assert captured["provider"] == "deepseek"
+    assert captured["model"] == "deepseek-chat"  # brief model, NOT the gemini one
+
+
+@pytest.mark.asyncio
+async def test_prompt_gen_default_is_gemini_when_key_present(monkeypatch):
+    """With the gemini key configured, the default chain picks gemini + the
+    flash synthesis model."""
+    import json as _json
+    from config.settings import settings as app_settings
+    import services.llm_synthesis as llm
+
+    monkeypatch.setattr(app_settings, "prompt_gen_provider", "gemini", raising=False)
+    monkeypatch.setattr(app_settings, "prompt_gen_model", "", raising=False)
+    monkeypatch.setattr(app_settings, "strategic_brief_provider", "deepseek", raising=False)
+    monkeypatch.setattr(app_settings, "strategic_brief_model", "", raising=False)
+
+    captured = {}
+
+    async def fake_synthesize(**kwargs):
+        captured.update(kwargs)
+        return {"text": _json.dumps(["yuja seed oil hair treatment for heat damage"])}
+
+    monkeypatch.setattr(llm, "synthesize", fake_synthesize, raising=False)
+    monkeypatch.setattr(llm, "configured_key_for_provider", lambda p: "k", raising=False)
+    monkeypatch.setattr(llm, "default_model_for_provider", lambda p: "gemini-2.5-flash", raising=False)
+
+    out = await svc.extract_winnable_prompts(
+        {"product": {"title": "Anuko Bond & Repair Hair Oil", "vendor": "Anuko"}}
+    )
+    assert out == ["yuja seed oil hair treatment for heat damage"]
+    assert captured["provider"] == "gemini"
+    assert captured["model"] == "gemini-2.5-flash"

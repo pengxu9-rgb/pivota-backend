@@ -43,8 +43,11 @@ _PROVIDER_ALIASES = {
     "chatgpt": "openai",
     "anthropic": "anthropic",
     "claude": "anthropic",
+    "gemini": "gemini",
+    "google": "gemini",
 }
 _DEFAULT_TIMEOUT_S = 30.0
+_GEMINI_BASE_URL = "https://generativelanguage.googleapis.com/v1beta"
 
 
 def normalize_provider(provider: str) -> str:
@@ -66,6 +69,8 @@ def default_model_for_provider(provider: str) -> str:
         return settings.openai_model
     if canonical == "anthropic":
         return settings.anthropic_model
+    if canonical == "gemini":
+        return settings.gemini_synthesis_model
     raise LLMSynthesisError(
         f"Unsupported synthesis provider: {provider}",
         provider=canonical,
@@ -80,6 +85,8 @@ def configured_key_for_provider(provider: str) -> Optional[str]:
         return settings.openai_api_key
     if canonical == "anthropic":
         return settings.anthropic_api_key
+    if canonical == "gemini":
+        return settings.gemini_api_key
     return None
 
 
@@ -101,6 +108,13 @@ async def synthesize(
 
     if canonical == "anthropic":
         return await _call_anthropic_messages(
+            system=system,
+            user=user,
+            model=selected_model,
+            max_tokens=max_tokens,
+        )
+    if canonical == "gemini":
+        return await _call_gemini_generate_content(
             system=system,
             user=user,
             model=selected_model,
@@ -216,6 +230,81 @@ async def _call_anthropic_messages(
         "provider": "anthropic",
         "model": model,
     }
+
+
+async def _call_gemini_generate_content(
+    *,
+    system: str,
+    user: str,
+    model: str,
+    max_tokens: int,
+) -> Dict[str, Any]:
+    api_key = settings.gemini_api_key
+    if not api_key:
+        raise MissingLLMKeyError(
+            "gemini API key is not configured",
+            provider="gemini",
+        )
+    body: Dict[str, Any] = {
+        "system_instruction": {"parts": [{"text": system}]},
+        "contents": [{"role": "user", "parts": [{"text": user}]}],
+        "generationConfig": {
+            "temperature": 0.2,
+            "maxOutputTokens": int(max_tokens),
+            # JSON mime type supports top-level arrays (unlike OpenAI's
+            # json_object mode) — callers like extract_winnable_prompts ask
+            # for a bare JSON array.
+            "responseMimeType": "application/json",
+        },
+    }
+    headers = {
+        "Content-Type": "application/json",
+        "x-goog-api-key": api_key,
+    }
+    payload = await _post_json(
+        url=f"{_GEMINI_BASE_URL}/models/{model}:generateContent",
+        body=body,
+        headers=headers,
+        provider="gemini",
+    )
+    text = _gemini_text(payload)
+    usage_block = (
+        payload.get("usageMetadata")
+        if isinstance(payload.get("usageMetadata"), Mapping)
+        else {}
+    )
+    candidates = payload.get("candidates") or []
+    first = candidates[0] if candidates and isinstance(candidates[0], Mapping) else {}
+    return {
+        "text": text,
+        "usage": {
+            "input_tokens": usage_block.get("promptTokenCount"),
+            "output_tokens": usage_block.get("candidatesTokenCount"),
+        },
+        "finish_reason": first.get("finishReason") if isinstance(first, Mapping) else None,
+        "provider": "gemini",
+        "model": model,
+    }
+
+
+def _gemini_text(payload: Mapping[str, Any]) -> str:
+    candidates = payload.get("candidates")
+    if not isinstance(candidates, list) or not candidates:
+        return ""
+    first = candidates[0]
+    if not isinstance(first, Mapping):
+        return ""
+    content = first.get("content")
+    if not isinstance(content, Mapping):
+        return ""
+    parts = content.get("parts")
+    if not isinstance(parts, list):
+        return ""
+    return "".join(
+        str(part.get("text") or "")
+        for part in parts
+        if isinstance(part, Mapping)
+    )
 
 
 async def _post_json(

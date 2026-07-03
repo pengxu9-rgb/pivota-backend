@@ -9131,28 +9131,49 @@ async def extract_winnable_prompts(
         description = str(attrs.get("description") or "")[:1500]
         if isinstance(attrs.get("tags"), list):
             tags = [str(t) for t in attrs["tags"]][:20]
-    try:
-        # Prompt-generation model is independently configurable so different
-        # generators can be A/B compared in prod (PROMPT_GEN_PROVIDER/MODEL),
-        # falling back to the strategic-brief settings, then deepseek.
-        provider = normalize_provider(
-            str(getattr(app_settings, "prompt_gen_provider", "") or "").strip()
-            or getattr(app_settings, "strategic_brief_provider", None)
-            or "deepseek"
-        )
-    except LLMSynthesisError:
-        return []
-    if not configured_key_for_provider(provider):
-        logger.warning(
-            "winnable-prompt extraction skipped: no API key for provider=%s",
-            provider,
-        )
-        return []
-    model = (
-        str(getattr(app_settings, "prompt_gen_model", "") or "").strip()
-        or str(getattr(app_settings, "strategic_brief_model", "") or "").strip()
-        or default_model_for_provider(provider)
+    # Prompt-generation model is independently configurable so different
+    # generators can be A/B compared in prod (PROMPT_GEN_PROVIDER/MODEL;
+    # default gemini — founder call 2026-07-03). The chain degrades by KEY
+    # availability — each candidate keeps its OWN model preference so a
+    # fallback provider never runs with another provider's model string.
+    candidate_chain = (
+        (
+            str(getattr(app_settings, "prompt_gen_provider", "") or "").strip(),
+            str(getattr(app_settings, "prompt_gen_model", "") or "").strip(),
+        ),
+        (
+            str(getattr(app_settings, "strategic_brief_provider", "") or "").strip(),
+            str(getattr(app_settings, "strategic_brief_model", "") or "").strip(),
+        ),
+        ("deepseek", ""),
     )
+    provider: Optional[str] = None
+    model = ""
+    seen_providers: set = set()
+    for name, model_pref in candidate_chain:
+        if not name:
+            continue
+        try:
+            canonical = normalize_provider(name)
+        except LLMSynthesisError:
+            continue
+        if canonical in seen_providers:
+            continue
+        seen_providers.add(canonical)
+        if configured_key_for_provider(canonical):
+            provider = canonical
+            model = model_pref or default_model_for_provider(canonical)
+            break
+        logger.warning(
+            "winnable-prompts: no API key for provider=%s — trying fallback",
+            canonical,
+        )
+    if not provider:
+        logger.warning(
+            "winnable-prompt extraction skipped: no configured provider key "
+            "(chain exhausted)",
+        )
+        return []
     content = {
         "title": title,
         "brand": brand or None,
