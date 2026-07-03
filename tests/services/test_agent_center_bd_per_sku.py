@@ -808,6 +808,69 @@ def test_deepseek_verify_deweights_only_answer_quality():
     assert breakdown["answer_quality_rate"]["verify_deweighted"] == 1
 
 
+def test_any_provider_first_party_is_or_not_majority_over_union():
+    """BUG A regression (ANUKO 2026-07-02 false-INVISIBLE): the combined
+    any_profile_provider first_party_rate must be an OR of the per-provider
+    decision, never below max(per-provider). Each provider grounds on the
+    merchant PDP for a DIFFERENT prompt; the earlier majority-over-union test
+    let each provider's third-party sources veto the other's first-party hit."""
+    from services.agent_center_bd_report_service import (
+        _any_provider_probe_runs,
+        build_citation_by_provider,
+        compute_citation_score,
+    )
+
+    ctx = _base_sku_ctx()
+    runs = _multi_provider_probe_runs()
+
+    by_provider = build_citation_by_provider(ctx, runs)
+    gem_fp = by_provider["gemini"]["breakdown"]["first_party_rate"]["numerator"]
+    gpt_fp = by_provider["chatgpt"]["breakdown"]["first_party_rate"]["numerator"]
+    assert gem_fp == 1  # gemini cites the PDP on "where can I buy"
+    assert gpt_fp == 1  # chatgpt cites the PDP on "best serum for dullness"
+
+    _score, combined = compute_citation_score(
+        ctx, _any_provider_probe_runs(runs, sku_ctx=ctx),
+    )
+    # OR across providers over 2 distinct prompts → 2/2, and never below either
+    # provider's own count.
+    assert combined["first_party_rate"]["numerator"] == 2
+    assert combined["first_party_rate"]["denominator"] == 2
+    assert combined["first_party_rate"]["numerator"] >= max(gem_fp, gpt_fp)
+
+
+def test_any_provider_first_party_respects_negative_verdict():
+    """The OR is over the FULL per-run credit (grounded-primary AND not an
+    explicit negative), so a provider that grounds on the PDP while denying the
+    product does not earn first-party credit."""
+    from services.agent_center_bd_report_service import (
+        _any_provider_probe_runs,
+        compute_citation_score,
+    )
+
+    ctx = _base_sku_ctx()
+    runs = [{
+        "provider": "gemini",
+        "probe_run_id": "probe-neg",
+        "raw_runs": [{
+            "query": "is bright skin serum any good",
+            # PDP is a grounding source, but the answer explicitly denies the
+            # product is the right/visible one → no first-party credit.
+            "parsed": {"product_visible": False, "correct_sku": False},
+            "grounding_sources": [
+                {"uri": "https://merchant.test/products/serum", "title": "Bright Skin Serum"},
+            ],
+            "url_match": {"in_grounding": True},
+            "axis_metadata": {"axis": "intent", "source": "auto_generated", "sku_key": "sku-1"},
+        }],
+    }]
+
+    _score, combined = compute_citation_score(
+        ctx, _any_provider_probe_runs(runs, sku_ctx=ctx),
+    )
+    assert combined["first_party_rate"]["numerator"] == 0
+
+
 @pytest.mark.asyncio
 async def test_build_per_sku_report_end_to_end_with_mocked_loaders(monkeypatch):
     from services import agent_center_bd_report_service as bd
@@ -827,12 +890,18 @@ async def test_build_per_sku_report_end_to_end_with_mocked_loaders(monkeypatch):
     report = await bd.build_per_sku_report("sku-1", "m-1", "audit-1")
     assert report["sku_key"] == "sku-1"
     assert set(report["scores"]) == {"identity", "content_richness", "routability", "citation"}
-    # build_per_sku_report runs no verify pass → answer_quality is unscored, so
-    # the citation total is 10 below the old behavior (which credited unverified
-    # answer_quality).
-    assert report["scores"]["citation"]["score"] == 68
+    # build_per_sku_report runs no verify pass → answer_quality is unscored (0).
+    # any_profile_provider first_party is an OR across providers: gemini cites the
+    # merchant PDP on the "where can I buy" prompt and chatgpt cites it on the
+    # "best serum for dullness" prompt, so BOTH prompts earn first-party credit
+    # (2/2). The earlier code re-scored a MAJORITY test over the union of every
+    # provider's grounding sources, letting a non-citing provider's third-party
+    # sources veto a citing provider's hit — deflating this to 1/2 (score 68) and
+    # driving false-INVISIBLE verdicts (the ANUKO 2026-07-02 regression).
+    assert report["scores"]["citation"]["score"] == 90
     assert report["scores"]["citation"]["breakdown"]["answer_quality_rate"]["points"] == 0
-    assert report["scores"]["citation"]["breakdown"]["first_party_rate"]["numerator"] == 1
+    assert report["scores"]["citation"]["breakdown"]["first_party_rate"]["numerator"] == 2
+    assert report["scores"]["citation"]["breakdown"]["first_party_rate"]["denominator"] == 2
     assert report["scores"]["citation"]["breakdown"]["sku_mention_rate"]["numerator"] == 2
     assert report["scores"]["citation"]["breakdown"]["aggregation_rule"].startswith("any_profile_provider")
     assert set(report["citation_by_provider"]) == {"gemini", "chatgpt"}

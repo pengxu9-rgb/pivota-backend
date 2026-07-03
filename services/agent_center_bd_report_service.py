@@ -3281,6 +3281,47 @@ def _first_party_grounding_primary_for_run(
     return first_party >= external
 
 
+def _run_negative_verdict(run: Dict[str, Any]) -> bool:
+    """True when a single run's answer explicitly denies this is the right /
+    visible product. Shared by the citation scorer's per-run gating AND the
+    any-provider merge, so both agree on what counts as a negative echo."""
+    parsed = run.get("parsed") if isinstance(run.get("parsed"), dict) else {}
+    url_match = run.get("url_match") if isinstance(run.get("url_match"), dict) else {}
+    llm_report = (
+        url_match.get("llm_self_report")
+        if isinstance(url_match.get("llm_self_report"), dict)
+        else {}
+    )
+    product_visible = parsed.get("product_visible")
+    if product_visible is None:
+        product_visible = run.get("product_visible")
+    if product_visible is None:
+        product_visible = llm_report.get("product_visible")
+    return (
+        product_visible is False
+        or parsed.get("correct_sku") is False
+        or llm_report.get("correct_sku") is False
+    )
+
+
+def _run_first_party_credit(
+    run: Dict[str, Any],
+    sku_ctx: Dict[str, Any],
+    product: Dict[str, Any],
+) -> bool:
+    """The complete per-run "does this prompt earn first-party credit" decision
+    for ONE provider's run: the merchant PDP is a primary grounding source AND
+    the answer is not an explicit negative. This is exactly what the
+    per-provider scorer counts; the any-provider aggregate ORs it across
+    providers BEFORE the source lists are unioned, so a non-citing provider's
+    external sources can never veto a citing provider's genuine first-party hit
+    (the majority test `first_party >= external` over the union did exactly
+    that — deflating combined first_party below the per-provider max)."""
+    return _first_party_grounding_primary_for_run(run, sku_ctx or {}, product) and not (
+        _run_negative_verdict(run)
+    )
+
+
 def _run_text(run: Dict[str, Any]) -> str:
     parsed = run.get("parsed") if isinstance(run.get("parsed"), dict) else {}
     return " ".join(
@@ -3529,10 +3570,9 @@ def _citation_positive_verify_candidates(
     sku_ctx: Dict[str, Any],
     probe_runs: Any,
 ) -> List[Dict[str, Any]]:
-    del sku_ctx  # reserved for future stricter candidate filters.
     candidates: List[Dict[str, Any]] = []
     seen = set()
-    for run in _flatten_probe_runs(_any_provider_probe_runs(probe_runs)):
+    for run in _flatten_probe_runs(_any_provider_probe_runs(probe_runs, sku_ctx=sku_ctx)):
         if not _answer_quality_positive(run):
             continue
         key = _citation_prompt_key(run)
@@ -3615,7 +3655,9 @@ async def _run_deepseek_verify_pass(
         if str(provider or "").strip()
     ]
     candidates = _citation_positive_verify_candidates(sku_ctx, probe_runs)
-    observed_prompt_count = len(_flatten_probe_runs(_any_provider_probe_runs(probe_runs)))
+    observed_prompt_count = len(
+        _flatten_probe_runs(_any_provider_probe_runs(probe_runs, sku_ctx=sku_ctx))
+    )
     sample_cap = _verify_sample_cap(
         positives_count=len(candidates),
         prompts_per_sku=prompts_per_sku,
@@ -3871,28 +3913,27 @@ def compute_citation_score(
         # negative verdict must not earn first_party / sku_mention / authority
         # credit. (It inflated the lowest-visibility SKUs: e.g. Collagen Garden
         # scored citation 28 on 3/40 visible, ~19 pts from ungated first_party.)
-        product_visible = parsed.get("product_visible")
-        if product_visible is None:
-            product_visible = run.get("product_visible")
-        if product_visible is None:
-            product_visible = llm_report.get("product_visible")
-        negative_verdict = (
-            product_visible is False
-            or parsed.get("correct_sku") is False
-            or llm_report.get("correct_sku") is False
-        )
+        negative_verdict = _run_negative_verdict(run)
 
         # first_party: the merchant PDP must be a primary grounding source.
         # `url_match.in_grounding` can be true on branded prompts where the
         # brand is merely mentioned while publishers/retailers carry the
         # citations; that is visibility, not first-party control.
-        grounded_first_party = _first_party_grounding_primary_for_run(
-            run,
-            sku_ctx or {},
-            product,
-        )
-        if grounded_first_party and not negative_verdict:
-            first_party_hits += 1
+        if "_any_first_party_primary" in run:
+            # Pre-merged any-provider run: the per-provider first-party decision
+            # (grounded-primary AND not-negative) was already OR'd across
+            # providers before their source lists were unioned, so use it
+            # directly instead of re-running the majority test over the union.
+            if run.get("_any_first_party_primary"):
+                first_party_hits += 1
+        else:
+            grounded_first_party = _first_party_grounding_primary_for_run(
+                run,
+                sku_ctx or {},
+                product,
+            )
+            if grounded_first_party and not negative_verdict:
+                first_party_hits += 1
 
         # Affirmative structured signal that the provider actually surfaced the SKU.
         # correct_sku=True remains independently affirmative; a mere
@@ -4052,6 +4093,7 @@ def _citation_prompt_key(run: Dict[str, Any]) -> Tuple[str, str, str]:
 
 def _merge_runs_for_any_provider(
     runs: List[Dict[str, Any]],
+    sku_ctx: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
     merged = dict(runs[0]) if runs else {}
     parsed_out: Dict[str, Any] = {}
@@ -4114,15 +4156,28 @@ def _merge_runs_for_any_provider(
     merged["_providers"] = providers
     if excerpts:
         merged["evidence_excerpt"] = excerpts[0]
+    # OR the per-provider first-party decision BEFORE the source lists were
+    # unioned above. Honoured by compute_citation_score so the combined
+    # first_party_rate reflects "any provider cited the merchant PDP", matching
+    # the printed any_profile_provider aggregation rule (see
+    # _run_first_party_credit for why the post-union majority test was wrong).
+    if sku_ctx is not None:
+        product = _get_product(sku_ctx or {})
+        merged["_any_first_party_primary"] = any(
+            _run_first_party_credit(run, sku_ctx, product) for run in runs
+        )
     return merged
 
 
-def _any_provider_probe_runs(per_sku_probe_runs: Any) -> List[Dict[str, Any]]:
+def _any_provider_probe_runs(
+    per_sku_probe_runs: Any,
+    sku_ctx: Optional[Dict[str, Any]] = None,
+) -> List[Dict[str, Any]]:
     grouped_runs: Dict[Tuple[str, str, str], List[Dict[str, Any]]] = defaultdict(list)
     for run in _flatten_probe_runs(per_sku_probe_runs):
         grouped_runs[_citation_prompt_key(run)].append(run)
     merged_runs = [
-        _merge_runs_for_any_provider(runs)
+        _merge_runs_for_any_provider(runs, sku_ctx=sku_ctx)
         for _key, runs in sorted(grouped_runs.items())
         if runs
     ]
@@ -6368,7 +6423,7 @@ async def build_per_sku_report(
         )
         citation_score, citation_breakdown = compute_citation_score(
             sku_ctx,
-            _any_provider_probe_runs(probe_runs),
+            _any_provider_probe_runs(probe_runs, sku_ctx=sku_ctx),
             verify_outputs=verify_outputs,
         )
         citation_breakdown["aggregation_rule"] = (
