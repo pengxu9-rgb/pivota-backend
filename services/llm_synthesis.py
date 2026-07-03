@@ -255,6 +255,14 @@ async def _call_gemini_generate_content(
             # json_object mode) — callers like extract_winnable_prompts ask
             # for a bare JSON array.
             "responseMimeType": "application/json",
+            # Gemini 2.5 models spend maxOutputTokens on internal "thinking"
+            # by default; with small caps (e.g. 400 for winnable prompts) the
+            # thoughts consume the whole budget and the actual answer arrives
+            # truncated to a fragment (prod run 370dde30: raw len 9 and 31 →
+            # EMPTY prompts, audit degraded to branded-only). Disable thinking:
+            # these are cheap extraction tasks, and this is also the fast/cheap
+            # behavior the flash tier is chosen for.
+            "thinkingConfig": {"thinkingBudget": 0},
         },
     }
     headers = {

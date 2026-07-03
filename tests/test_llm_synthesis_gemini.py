@@ -62,6 +62,10 @@ async def test_gemini_synthesize_call_shape(monkeypatch):
     assert captured["body"]["system_instruction"]["parts"][0]["text"] == "sys"
     assert captured["body"]["generationConfig"]["responseMimeType"] == "application/json"
     assert captured["body"]["generationConfig"]["maxOutputTokens"] == 400
+    # Gemini 2.5 thinking must be OFF: with small output caps the default
+    # thinking budget consumes maxOutputTokens and truncates the answer to a
+    # fragment (prod run 370dde30 -> EMPTY winnable prompts).
+    assert captured["body"]["generationConfig"]["thinkingConfig"] == {"thinkingBudget": 0}
 
 
 @pytest.mark.asyncio
