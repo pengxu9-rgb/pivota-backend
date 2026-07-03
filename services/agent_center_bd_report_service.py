@@ -9174,12 +9174,23 @@ async def extract_winnable_prompts(
             "(chain exhausted)",
         )
         return []
+    # Tier-1 retailer evidence (services/retailer_evidence.py): third-party
+    # listing excerpts from prior runs. For thin own-page fetches this is often
+    # the ONLY substantive product text — the extractor may use value props
+    # stated there (they're still this product's published listing content, with
+    # provenance), which keeps the no-invention rule intact.
+    retailer_excerpts = [
+        str(x or "").strip()
+        for x in (product.get("_retailer_excerpts") or [])
+        if str(x or "").strip()
+    ][:6]
     content = {
         "title": title,
         "brand": brand or None,
         "product_type": product.get("product_type") or None,
         "description": description or None,
         "tags": tags or None,
+        "retailer_listing_excerpts": retailer_excerpts or None,
     }
     user = "PRODUCT CONTENT:\n" + json.dumps(content, ensure_ascii=False, indent=2)
     try:
@@ -10586,6 +10597,27 @@ async def run_per_sku_audit_probe_fanout(
     out: Dict[str, List[Dict[str, Any]]] = {}
     for idx, sku_key in enumerate(sku_keys):
         sku_ctx = await load_sku_context(sku_key, str(merchant_id))
+        # Tier-1 retailer-evidence recycling: prior runs' third-party retailer
+        # excerpts (provenance-tagged, gray-market excluded) feed the attribute
+        # graph and the LLM extractor BELOW. Rescues thin own-page fetches —
+        # long-tail brand sites often yield title+brand only while the product's
+        # real story lives on Olive Young/Coupang listings we already captured
+        # as grounded evidence. Vocabulary/analysis input only; the verdict
+        # still reports the thin own page honestly.
+        if isinstance(sku_ctx, dict):
+            try:
+                from services.retailer_evidence import load_prior_retailer_evidence
+
+                _re = await load_prior_retailer_evidence(
+                    merchant_id=str(merchant_id), sku_key=str(sku_key),
+                )
+                if _re.get("excerpts"):
+                    product_map = sku_ctx.get("product")
+                    if isinstance(product_map, dict):
+                        product_map["_retailer_excerpts"] = _re["excerpts"]
+                        product_map["_retailer_excerpt_hosts"] = _re["hosts"]
+            except Exception:  # noqa: BLE001 - enrichment must never block probing
+                logger.warning("retailer-evidence stash skipped", exc_info=True)
         # Value-prop discovery prompts: extract from the product's content so the
         # audit probes winnable SPECIFIC demand, not just generic category heads.
         # Best-effort + opt-in (URL audits); stashed for the sync spec builder.
