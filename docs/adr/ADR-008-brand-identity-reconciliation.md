@@ -173,17 +173,19 @@ brand string (casing/alias differ: "ANUKO" vs "Anuko") — reuse
 
 ## Action Items
 
-1. [ ] **Audit-intake guard** (cheap, ship first): before `ENABLE_AUDIT_INDEX_INTAKE`
-       mints a row, look up an existing canonical identity by normalized brand +
-       host; attach/skip instead of minting. Closes the vector that created the
-       ANUKO shampoo row.
-2. [ ] **Deposit-unresolved telemetry**: count/log `DEPOSIT_BASIS_UNRESOLVED` at
-       `services/catalog_identity.py:265` so fragmentation is observable.
-3. [ ] **Reconciliation-at-connect**: on connect/sync, build a brand-match
-       proposal against `external_seed` canonical rows (normalized brand + domain,
-       via `brand_alias.py`); on match, write `force_exact_group` +
-       `approve_first_party_canonical` for the connected listing so it joins the
-       published canonical group as first-party owner.
+1. [x] **Audit-intake guard** — **SHIPPED (PR #1130)**, dormant behind
+       `ENABLE_AUDIT_BRAND_FRAGMENTATION_GUARD`. Before `ENABLE_AUDIT_INDEX_INTAKE`
+       mints a row, a same-brand+host canonical under another merchant routes the
+       seed to identity review and skips the orphan mint. Closes the vector that
+       created the ANUKO shampoo row.
+2. [x] **Deposit-unresolved telemetry** — **SHIPPED (PR #1131)**. Implemented at
+       the caller (`extract_citation_observations`) rather than the pure classifier
+       `resolve_deposit_content_key` — that's where an unresolved basis actually
+       drops a citation. Emits `citation_deposit_dropped_{skus,observations}_total`.
+3. [~] **Reconciliation-at-connect** — **designed, build PARKED** (see Appendix A).
+       Mechanism fully mapped (both repos); parked because the live blast radius is
+       ~0 real brands and auto-applying brand authority carries real risk. Revisit
+       when a real seed-brand connects.
 4. [ ] **Reuse, don't rebuild**: model the proposal/apply on the existing merge
        scripts (`scripts/align-external-seed-identity-to-catalog-sig.cjs`) and the
        `pdp_identity_recovery.py` proposal shape; gate behind a flag, dry-run first.
@@ -193,3 +195,83 @@ brand string (casing/alias differ: "ANUKO" vs "Anuko") — reuse
 6. [ ] Pairs with the English-identity work (PR #1128): the connected first-party
        listing should carry the resolved English `title_override` as the canonical
        title once unified.
+
+---
+
+## Appendix A: Reconcile-at-Connect (#3) — Design & Decision to Park
+
+_Added 2026-07-03 after a full cross-repo scoping pass (pivota-backend + PIVOTA-Agent). The mechanism is understood and buildable; the build is deliberately parked — see the decision at the end._
+
+### A.1 How the reconcile works (end-to-end)
+
+The two repos **share one Postgres**, and `pdp_identity_override` rows are honored by
+**both** the Node identity graph (`applyIdentityOverrides`,
+`pdpIdentityGraph.js:4808`) and the Python trust policy
+(`catalog_trust_policy._derive_identity:351` — a `force_exact_group` override →
+`status=approved, confidence=1.0`). Reconciling a connected listing to its brand's
+existing `external_seed` canonical = writing **two overrides** keyed on the
+connected listing's `source_listing_ref`:
+
+1. **`force_exact_group`** — `payload.target_sellable_item_group_id` = the
+   external_seed brand's group → joins both listings into one
+   `sellable_item_group_id`.
+2. **`approve_first_party_canonical`** — sets `source_tier='brand'`,
+   `identity_status='approved'`; the Python trust policy then sets
+   `identity_confidence=1.0`, clearing the deposit gate and making the connected
+   first-party listing the canonical within the group.
+
+`source_listing_ref` is `"{merchant_id}:{source_product_id}"`
+(`buildSourceListingRef`, `pdpIdentityGraph.js:449`) — trivially computable in
+Python; the connected listing must have a `pdp_identity_listing` row for the
+override to attach.
+
+### A.2 Anchors
+
+| Piece | Location |
+|---|---|
+| Post-sync trigger point (best-effort, sync flow) | `routes/universal_product_sync.py:242` (after `ingest_standard_products`, before status update) |
+| Brand-match helper to reuse | `services/brand_alias.py` (+ a new `external_seed`-by-brand query) |
+| Override write endpoint (id-hash + re-resolution trigger) | Node `POST /api/admin/pdp-identity/overrides` → `applyPdpIdentityOverride` (`pdpIdentityGraph.js:5197`) |
+| Override table (shared DB) | `pdp_identity_override` (`src/db/migrations/036_pdp_identity_graph.sql:67`) |
+| Python consumes override | `services/catalog_trust_policy.py:351`; loaded via `catalog_row_trust_upserter.py:80` |
+| Re-resolution (persists group to `pdp_identity_listing`) | Node `backfillPdpIdentityGraph`/`writeIdentityRows` (`pdpIdentityGraph.js:5066`) |
+
+### A.3 Three findings that gate the build
+
+1. **It unifies _serving_, not _content_keys_.** `force_exact_group` merges the
+   `sellable_item_group_id` (one canonical PDP served) and
+   `approve_first_party_canonical` makes the connected listing deposit-eligible —
+   **on its own `content_key`**. The two content_keys' `citation_observations`
+   rows still do not merge. So reconcile fixes _unpublished first-party SKUs_ and
+   makes the connected half _deposit instead of drop_ — but true content_key-level
+   citation merge remains the deferred Option B / item #5.
+2. **`approve_first_party_canonical` is high-authority** (brand tier, confidence
+   1.0, becomes canonical). Auto-applying it on a brand-name match is risky: a
+   wrong match hands a connected store authority over another brand's canonical and
+   pollutes serving + deposit. → **propose-first**, consistent with the ER gate and
+   the #1130 guard (both route to review, never auto-merge).
+3. **No Python→Node path exists** (no `PIVOTA_AGENT_URL`/client in pivota-backend),
+   and the override write wants the Node endpoint (it bundles id-hashing + the
+   re-resolution trigger). So auto-apply needs **new cross-service infra**. And the
+   live blast radius is **~0 real brands** (ANUKO = a bare-signup demo; the other 7
+   overlaps are multi-brand test merchants).
+
+### A.4 Recommended build shape (when un-parked)
+
+- **First cut — detect-and-propose** (cheap, dark, safe): post-sync hook →
+  brand-match → enqueue a reconcile _proposal_ (reuse the review-task pattern),
+  behind `RECONCILE_AT_CONNECT_ENABLED=false`, dry-run. No override write, no
+  cross-service call, no identity mutation — a **tripwire** so a real brand
+  connecting onto an existing seed surfaces a proposal instead of silent
+  fragmentation.
+- **Second cut — human-validated apply**: on approval, write the two overrides via
+  the Node endpoint. Auto-apply only after match precision is proven on real cases.
+
+### A.5 Decision: PARK the build
+
+The #1130 audit-intake guard already catches the intake fragmentation vector, and
+**nothing is actively fragmenting today** (zero live real cases; ANUKO is a demo).
+Building cross-service auto-merge infra that grants brand authority — for zero
+current demand and real mis-merge risk — is not justified now. **Park the build;
+keep this design ready.** Trigger to revisit: a real (non-test, non-demo)
+seed-brand connects a store — start with A.4's detect-and-propose tripwire.
