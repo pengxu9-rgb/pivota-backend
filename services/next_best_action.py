@@ -1823,16 +1823,21 @@ def _sku_secondary_moves(
     for gap in primary_gaps:
         if primary_gap == PRIMARY_SKU_CONTENT_REVISION_GAP and gap == primary_content_gap:
             continue
-        title = f"Fix {str(gap.get('dimension') or 'sku')}.{str(gap.get('bucket') or 'gap')}"
+        # Use the gap's merchant-safe label/why, NEVER the raw scoring
+        # dimension.bucket ("citation.first_party_rate") or internal `reason` —
+        # those are internal vocabulary and read as nonsense to a merchant.
+        label = str(gap.get("label") or "").strip()
+        why = str(gap.get("why") or "").strip()
         moves.append({
-            "title": title,
+            "title": label or "Strengthen your next-biggest visibility gap",
             "severity": "medium" if _score(gap.get("gap")) < 20 else "high",
             "lever": "sku_gap_repair",
             "target_host": None,
-            "concrete_next_step": str(gap.get("reason") or "Close the next largest per-SKU score gap."),
-            "reason": (
-                f"It is the next largest per-SKU gap at "
-                f"{_score(gap.get('gap'))} missing points."
+            "concrete_next_step": (
+                "Strengthen this next, after the top-priority move above."
+            ),
+            "reason": why or (
+                "This is the next area to strengthen after your top priority above."
             ),
             "evidence": _sku_gap_chip(gap),
         })

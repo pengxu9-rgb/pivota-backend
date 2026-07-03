@@ -698,6 +698,50 @@ def test_sku_nba_substitution_names_substitute_in_first_move():
     _assert_70_30(nba)
 
 
+def test_sku_secondary_moves_never_leak_internal_metric_names():
+    """ANUKO 2026-07-02: a secondary move titled 'Fix citation.first_party_rate'
+    exposed the internal dimension.bucket to the merchant. Secondary moves must
+    use the gap's merchant-safe label/why, never the raw scoring keys or the
+    '/100 missing points' internal phrasing."""
+    opportunity = _sku_base_opportunity()
+    opportunity["substitution_alert"] = {
+        "present": True,
+        "prompt": "BB Lab collagen alternatives",
+        "substituted_by": "Vital Proteins",
+        "engines": ["gemini"],
+    }
+    gaps = [{
+        "dimension": "citation",
+        "bucket": "first_party_rate",
+        "points": 3,
+        "max": 45,
+        "gap": 42,
+        "reason": "1/16 prompts matched",  # internal — must NOT surface
+        "label": "Cited as the source",
+        "why": "When AI answers shopper questions in this category, it rarely points to you as the source.",
+    }]
+
+    nba = build_sku_next_best_action(
+        opportunity=opportunity,
+        primary_gaps=gaps,
+        scores=_sku_scores(),
+        identity=_sku_identity(),
+        sku_title="BB Lab Good Night Collagen",
+    )
+
+    moves = nba["secondary_moves"]
+    assert moves, "expected a secondary move from the citation gap"
+    move = moves[0]
+    assert move["title"] == "Cited as the source"
+    # No internal vocabulary anywhere in the merchant-facing strings.
+    blob = " ".join(
+        str(move.get(k) or "") for k in ("title", "concrete_next_step", "reason")
+    ).lower()
+    for leak in ("first_party_rate", "citation.", "missing points", "score gap", "bucket"):
+        assert leak not in blob, (leak, move)
+    assert move["reason"].startswith("When AI answers")
+
+
 def test_sku_nba_content_gap_references_content_richness_bucket():
     opportunity = _sku_base_opportunity()
     gaps = [
