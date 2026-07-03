@@ -5431,6 +5431,16 @@ def _engine_moves(engine: str, status: str, hosts_by_type: Mapping[str, List[str
     return moves
 
 
+_ENGINE_NOTE_LABELS: Dict[str, str] = {"gemini": "Gemini", "chatgpt": "ChatGPT"}
+
+
+def _engine_note_label(engine: str) -> str:
+    """Short, capitalized engine name for merchant-facing note copy — never the
+    raw lowercase key ('chatgpt')."""
+    key = str(engine or "").strip().lower()
+    return _ENGINE_NOTE_LABELS.get(key, key.title() or key)
+
+
 def build_engine_playbook(
     *,
     per_prompt: Optional[List[Dict[str, Any]]],
@@ -5470,13 +5480,29 @@ def build_engine_playbook(
         primary_gap = min(measured, key=lambda e: (measured[e]["rate"] or 0.0))
     note = None
     if divergence:
-        won = sorted({m for d in divergence for m in (d.get("won") or [])})
-        lost = sorted({m for d in divergence for m in (d.get("lost") or [])})
-        if won and lost:
+        won = {m for d in divergence for m in (d.get("won") or [])}
+        lost = {m for d in divergence for m in (d.get("lost") or [])}
+        # Aggregating won/lost across ALL divergent queries is self-contradictory
+        # when each engine surfaces the product on DIFFERENT queries (won ∩ lost
+        # is non-empty) — it produced "you surface on chatgpt, gemini but not
+        # chatgpt, gemini". Only make the directional claim on the CLEAN split
+        # (one engine consistently ahead); otherwise say the honest mixed thing.
+        clean_won = sorted(won - lost, key=_engine_note_label)
+        clean_lost = sorted(lost - won, key=_engine_note_label)
+        example = str(divergence[0].get("query") or "").strip()
+        if clean_won and clean_lost:
+            won_names = ", ".join(_engine_note_label(m) for m in clean_won)
+            lost_names = ", ".join(_engine_note_label(m) for m in clean_lost)
             note = (
-                f"You surface on {', '.join(won)} but not {', '.join(lost)} for "
-                f"category queries like \"{divergence[0].get('query')}\" — "
-                f"closing the {', '.join(lost)} gap is the per-engine priority."
+                f"You surface on {won_names} but not {lost_names}"
+                + (f" for category queries like \"{example}\"" if example else "")
+                + f" — closing the {lost_names} gap is the per-engine priority."
+            )
+        elif example:
+            note = (
+                "Gemini and ChatGPT each surface you on different category "
+                f"queries (e.g. \"{example}\") — work each engine's gaps "
+                "separately."
             )
     return {
         "has_signal": bool(measured),
@@ -9388,6 +9414,39 @@ def _list_value(value: Any) -> List[Any]:
     return value if isinstance(value, list) else []
 
 
+# Retailer / marketplace NAME tokens classify_host misses (its registry keys on
+# hosts, and Coupang/Gmarket/etc. aren't in it). The "category winner" panel is
+# about a competing PRODUCT, so a store must never be selected as the winner.
+_RETAILER_NAME_TOKENS = frozenset({
+    "coupang", "gmarket", "qoo10", "shopee", "lazada", "aliexpress", "temu",
+    "amazon", "walmart", "sephora", "ulta", "nordstrom", "costco",
+    "oliveyoung", "musinsa", "kurly", "wconcept", "iherb", "yesstyle",
+    "stylevana",
+})
+
+
+def _competitor_is_brandlike(name: str) -> bool:
+    """True when `name` is a plausible competing brand/product — not an
+    ingredient/category type, a gray-market/secondhand marketplace, or a
+    retailer/marketplace store. The 'category winner' panel probes 'what is
+    {name} known for', which is nonsense for a store (Coupang/Bunjang)."""
+    cleaned = str(name or "").strip()
+    if not cleaned or is_ingredient_or_category_type(cleaned):
+        return False
+    tokens = set(re.findall(r"[a-z0-9]+", cleaned.lower()))
+    from services.retailer_evidence import _GRAY_MARKET_HOST_TOKENS
+
+    if tokens & _GRAY_MARKET_HOST_TOKENS or tokens & _RETAILER_NAME_TOKENS:
+        return False
+    # classify_host catches registry-known retailers/marketplaces (Olive Young,
+    # Amazon) even when passed as a display name.
+    for form in {cleaned, cleaned.lower().replace(" ", ""),
+                 cleaned.lower().replace(" ", "") + ".com"}:
+        if classify_host(form).get("type") in {"retailer", "marketplace"}:
+            return False
+    return True
+
+
 def _durable_competitor_for_brief(opportunity: Mapping[str, Any]) -> Optional[str]:
     counts: Counter = Counter()
     opportunity_map = opportunity if isinstance(opportunity, Mapping) else {}
@@ -9403,22 +9462,23 @@ def _durable_competitor_for_brief(opportunity: Mapping[str, Any]) -> Optional[st
             competitor_values = []
         for competitor in competitor_values:
             name = str(competitor or "").strip()
-            if name:
+            # Only real competing brands. `repeated_owner` is intentionally NOT
+            # folded in: when a category answer has no repeated competitor it
+            # falls back to the most-cited SOURCE HOST (sku_opportunity), which
+            # put stores like Coupang/Bunjang here and made the "category
+            # winner" panel probe "what is Coupang known for" — nonsense. Channel
+            # control is surfaced elsewhere (store_as_destination / who-cites).
+            if name and _competitor_is_brandlike(name):
                 counts[name] += 1
-        density = row.get("density") if isinstance(row.get("density"), Mapping) else {}
-        features = (
-            density.get("features")
-            if isinstance(density.get("features"), Mapping)
-            else {}
-        )
-        repeated_owner = str(features.get("repeated_owner") or "").strip()
-        if repeated_owner and repeated_owner.lower() not in {"false", "none"}:
-            counts[repeated_owner] += max(2, counts.get(repeated_owner, 0))
     if not counts:
         return None
     from services.sku_opportunity import _durable_competitor
 
-    return _durable_competitor(counts)
+    winner = _durable_competitor(counts)
+    # Defense in depth: never return a store even if one out-counts the brands.
+    if winner and not _competitor_is_brandlike(winner):
+        return None
+    return winner
 
 
 def _competitor_attribute_query(competitor: str, category: str) -> str:
