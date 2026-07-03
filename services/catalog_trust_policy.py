@@ -98,7 +98,7 @@ VALID_SUBJECT_TYPES = frozenset({"product", "offer", "listing", "content_key"})
 
 
 def _index_eligible_read_enabled() -> bool:
-    """ADR-007 SLICE 1 read flag. When ON, the index-pipeline serving gate in
+    """ADR-008 SLICE 1 read flag. When ON, the index-pipeline serving gate in
     the trust policy widens from serving_eligible to
     (serving_eligible OR index_eligible) — the OFFER-FREE citation floor.
     Default OFF ⇒ byte-identical to today (serving_eligible only)."""
@@ -538,9 +538,9 @@ def _derive_serving_decision(
             reasons.append(REASON_CODES.INDEX_NOT_SERVING_ELIGIBLE)
             return {"decision": "blocked"}
         if ips is not None:
-            # ADR-007 SLICE 1: the citation read surface accepts the OFFER-FREE
+            # ADR-008 SLICE 1: the citation read surface accepts the OFFER-FREE
             # index_eligible floor when INDEX_ELIGIBLE_READ is ON. Flag OFF ⇒
-            # serving_eligible-only, byte-identical to the pre-ADR-007 gate.
+            # serving_eligible-only, byte-identical to the pre-ADR-008 gate.
             ips_eligible = _get(ips, "serving_eligible") is True or (
                 _index_eligible_read_enabled()
                 and _get(ips, "index_eligible") is True

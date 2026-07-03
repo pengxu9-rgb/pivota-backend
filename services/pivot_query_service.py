@@ -985,12 +985,12 @@ async def _fetch_canonical_search_rows(
 
 
 # ---------------------------------------------------------------------------
-# ADR-007 SLICE 3 — citable recall (offer-free, NEVER buyable)
+# ADR-008 SLICE 3 — citable recall (offer-free, NEVER buyable)
 # ---------------------------------------------------------------------------
 
 
 def _index_eligible_recall_enabled() -> bool:
-    """ADR-007 SLICE 3 flag. When ON, the OFFER-FREE citable lane runs and
+    """ADR-008 SLICE 3 flag. When ON, the OFFER-FREE citable lane runs and
     contributes index_eligible (citation-only) products to recall for
     inform/recommend intent. Default OFF ⇒ the lane never runs, no new SQL
     executes, and recall is byte-identical to today (offer-backed lane only)."""
@@ -1059,7 +1059,7 @@ async def _fetch_citable_canonical_rows(
     merchant_id: Optional[str],
     limit: int,
 ) -> List[Dict[str, Any]]:
-    """ADR-007 SLICE 3: the OFFER-FREE citable recall lane.
+    """ADR-008 SLICE 3: the OFFER-FREE citable recall lane.
 
     Mirrors the text-match predicates of `_fetch_canonical_search_rows` but is a
     SEPARATE lane that joins catalog_products -> index_pipeline_state (on
@@ -1820,7 +1820,7 @@ async def search_pivot_catalog(request: PivotQueryRequest) -> PivotQueryResponse
     ):
         external_items = await _fetch_external_fallback_items(request)
 
-    # ADR-007 SLICE 3: the OFFER-FREE citable lane. Contributes index_eligible
+    # ADR-008 SLICE 3: the OFFER-FREE citable lane. Contributes index_eligible
     # (citation-only, NEVER buyable) rows for inform/recommend intent only.
     #
     # Hard gates (ALL must hold for the lane to even run):

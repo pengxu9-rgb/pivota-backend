@@ -535,7 +535,7 @@ def test_output_row_has_all_migration_columns_and_bounded_reason_vocab():
         assert r in REASON_CODE_VOCABULARY, f"reason code not in vocabulary: {r}"
 
 
-# ---- ADR-007 SLICE 1: INDEX_ELIGIBLE_READ widening --------------------------
+# ---- ADR-008 SLICE 1: INDEX_ELIGIBLE_READ widening --------------------------
 
 
 def test_index_eligible_read_off_keeps_offer_free_blocked(monkeypatch):

@@ -372,6 +372,106 @@ async def apply_audit_er_gate(fields: Dict[str, Any]) -> Dict[str, Any]:
     return {"content_key": original_ck, "action": "none"}
 
 
+# --- Brand-fragmentation guard (ADR-008) --------------------------------------
+# The ER gate above dedups at the SKU level (exact URL / source-id). It does NOT
+# catch BRAND-level fragmentation: a genuinely NEW SKU of a brand that already has
+# a published canonical presence under a DIFFERENT merchant (e.g. an external_seed
+# brand) gets minted as an orphan under the audit/wedge merchant, splitting the
+# brand's identity + citation signal across merchant_ids (the live ANUKO case:
+# the URL-wedge minted a shampoo row under the demo merchant while the brand was
+# already canonical under external_seed). This guard detects that collision and
+# routes it to identity review instead of minting the orphan. Flag-gated + dark +
+# best-effort — it may only SKIP a mint, never write across identities itself
+# (that reconciliation is a separate, reviewed step — see ADR-008).
+
+
+def audit_brand_fragmentation_guard_enabled() -> bool:
+    """Flag: skip minting an audit seed that would fork a brand already canonical
+    under another merchant, routing it to review instead. Default OFF."""
+    return os.getenv("ENABLE_AUDIT_BRAND_FRAGMENTATION_GUARD", "").strip().lower() in {
+        "1", "true", "yes", "on",
+    }
+
+
+async def _existing_brand_canonical_conflict(
+    merchant_id: str, fields: Dict[str, Any]
+) -> Optional[Dict[str, Any]]:
+    """Return an existing PUBLISHED canonical row for the SAME brand + host under a
+    DIFFERENT merchant, or None. Conservative (case-insensitive exact brand + host
+    match, published-only) to keep false-positives near-zero — a false skip would
+    drop a legitimately new brand's seed."""
+    brand = str(fields.get("brand") or "").strip()
+    host = str(fields.get("source_domain") or "").strip() or _host(fields.get("canonical_url"))
+    if not brand or not host:
+        return None
+    from db.database import database
+
+    row = await database.fetch_one(
+        """
+        SELECT product_key, merchant_id, content_key, pivota_signature_id
+        FROM catalog_products
+        WHERE lower(btrim(brand)) = lower(btrim(:brand))
+          AND merchant_id <> :merchant_id
+          AND (source_domain = :host OR canonical_url ILIKE :host_like)
+          AND (pivota_signature_id IS NOT NULL OR merchant_id = 'external_seed')
+          AND suppression_reason IS NULL
+        LIMIT 1
+        """,
+        {
+            "brand": brand,
+            "merchant_id": merchant_id,
+            "host": host,
+            "host_like": f"%{host}%",
+        },
+    )
+    return dict(row) if row else None
+
+
+async def apply_audit_brand_fragmentation_guard(
+    merchant_id: str, fields: Dict[str, Any]
+) -> Dict[str, Any]:
+    """Decide whether to mint this audit seed. Returns {action, ...}:
+      - 'proceed' : flag off, no conflict, or any error (fail-open — never block
+                    the seed on the guard's account).
+      - 'skip'    : a same-brand+host canonical exists under another merchant; a
+                    review task was enqueued and the orphan mint is suppressed.
+    """
+    if not audit_brand_fragmentation_guard_enabled():
+        return {"action": "proceed", "reason": "disabled"}
+    try:
+        conflict = await _existing_brand_canonical_conflict(merchant_id, fields)
+    except Exception as exc:  # noqa: BLE001 — never block the seed on a guard error
+        logger.warning(
+            "audit_intake.brand_guard lookup failed for %s: %s",
+            fields.get("product_key"), str(exc)[:200],
+        )
+        return {"action": "proceed", "reason": "error"}
+    if not conflict:
+        return {"action": "proceed", "reason": "no_conflict"}
+    # Reuse the ER-gate's review machinery so reconciliation can attach it.
+    await enqueue_audit_identity_review(
+        fields,
+        {
+            "product_key": conflict.get("product_key"),
+            "matcher": "brand_host_fragmentation",
+            "confidence": None,
+            "evidence": {
+                "reason": "brand_already_canonical_under_other_merchant",
+                "conflict_merchant_id": conflict.get("merchant_id"),
+                "conflict_content_key": conflict.get("content_key"),
+                "brand": fields.get("brand"),
+                "host": fields.get("source_domain"),
+            },
+        },
+    )
+    return {
+        "action": "skip",
+        "reason": "brand_fragmentation",
+        "conflict_product_key": conflict.get("product_key"),
+        "conflict_merchant_id": conflict.get("merchant_id"),
+    }
+
+
 async def upsert_audited_sku_to_index(
     merchant_id: str, audit_product: Dict[str, Any]
 ) -> Optional[str]:
@@ -385,14 +485,37 @@ async def upsert_audited_sku_to_index(
     # Entity-resolution gate (flag-gated): an EXACT match re-aligns the seed's
     # content_key to the existing canonical entity (dedup); a FUZZY match goes to
     # human review. Best-effort — content_key falls back to the original.
+    gate_action = "none"
     try:
         gate = await apply_audit_er_gate(fields)
         fields["content_key"] = gate.get("content_key") or fields.get("content_key")
+        gate_action = gate.get("action") or "none"
     except Exception as exc:  # noqa: BLE001 — the gate must never break the seed
         logger.warning(
             "upsert_audited_sku_to_index: ER gate failed for %s: %s",
             fields.get("product_key"), str(exc)[:200],
         )
+    # Brand-fragmentation guard (ADR-008): only when the ER gate found no exact
+    # SKU dedup — a real same-SKU 'align' is the correct outcome and proceeds. If
+    # the brand is already canonical under another merchant, SKIP the orphan mint
+    # (review was enqueued). Best-effort: on any failure the seed proceeds.
+    if gate_action != "align":
+        try:
+            guard = await apply_audit_brand_fragmentation_guard(merchant_id, fields)
+            if guard.get("action") == "skip":
+                logger.info(
+                    "audit_intake.brand_guard_skip pk=%s brand=%r host=%r "
+                    "conflict_pk=%s conflict_merchant=%s",
+                    fields.get("product_key"), fields.get("brand"),
+                    fields.get("source_domain"), guard.get("conflict_product_key"),
+                    guard.get("conflict_merchant_id"),
+                )
+                return None
+        except Exception as exc:  # noqa: BLE001 — guard must never break the seed
+            logger.warning(
+                "upsert_audited_sku_to_index: brand guard failed for %s: %s",
+                fields.get("product_key"), str(exc)[:200],
+            )
     try:
         from db.catalog import catalog_products
         from db.database import database

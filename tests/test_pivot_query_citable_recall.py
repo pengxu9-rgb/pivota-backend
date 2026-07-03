@@ -1,4 +1,4 @@
-"""ADR-007 SLICE 3 — citable recall lane.
+"""ADR-008 SLICE 3 — citable recall lane.
 
 The OFFER-FREE citable lane in services.pivot_query_service contributes
 index_eligible (citation-only) products to recall for inform/recommend intent.
@@ -409,7 +409,7 @@ def test_citable_track_gets_no_ownership_or_offer_boost_in_sort():
     'internal_merchant'. The citable lane uses catalog_track == 'citation'
     precisely so it inherits NO such boost — it ranks by merit only. Conversely,
     a buyable internal item must not get an ADDED ownership boost beyond what the
-    pre-ADR-007 sort already applied. Pin both with a same-merit comparison."""
+    pre-ADR-008 sort already applied. Pin both with a same-merit comparison."""
     import inspect
 
     src = inspect.getsource(module._sort_items)

@@ -1,4 +1,4 @@
-"""ADR-007 SLICE 2 — verify-to-serve graduation (pure, no DB).
+"""ADR-008 SLICE 2 — verify-to-serve graduation (pure, no DB).
 
 Proves the graduation primitive + its wiring into verify_brand_claim:
 
