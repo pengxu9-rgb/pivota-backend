@@ -648,6 +648,32 @@ def extract_cited_hosts(
     return competitors, merchant_cited_runs, runs_with_any_citation
 
 
+def _own_url_cited_runs(
+    raw_runs: List[Dict[str, Any]],
+    *,
+    merchant_host: Optional[str],
+) -> Optional[int]:
+    """Strict own-URL citation count: runs where the merchant's OWN domain is the
+    resolved host of a cited grounding source.
+
+    Distinct from `merchant_cited_runs` (which also counts brand-name-in-title
+    mentions and third-party listings) — this is the honest "AI cited YOUR page"
+    signal, mirroring the channels builder's `own_site_cited` logic. Returns None
+    when there's no merchant host to match against (so callers can fall back to
+    the softer signal rather than assert a false zero)."""
+    own = normalize_host(merchant_host) if merchant_host else None
+    if not own:
+        return None
+    count = 0
+    for run in raw_runs or []:
+        for src in _identify_run_sources(run) or []:
+            host = normalize_host((src.get("host") or "").strip())
+            if host and host == own:
+                count += 1
+                break
+    return count
+
+
 VERDICT_INVISIBLE = "INVISIBLE"
 VERDICT_MISATTRIBUTED = "VISIBLE BUT MISATTRIBUTED"
 VERDICT_VIA_RETAILERS = "VISIBLE VIA RETAILERS"
@@ -1508,6 +1534,36 @@ def _explain_verdict(
         )
 
     if label == VERDICT_STRONG:
+        # `cited` (merchant_cited_runs) counts runs where the brand was NAMED or
+        # its listing surfaced as a source — NOT runs where the merchant's OWN
+        # page was the cited source. `own_cited` is that stricter signal. When
+        # own-page citation is zero, "cite your URL / goal state" is false: AI
+        # mentions the brand but routes buyers to third parties, so the open
+        # lever is turning mentions into own-page citations + endorsements — not
+        # "post-discovery conversion friction". (own_cited is None for legacy
+        # callers that don't supply it → keep the pre-existing wording.)
+        own_cited = evidence.get("own_url_cited_runs")
+        mention_only = (
+            has_evidence
+            and own_cited is not None
+            and own_cited == 0
+            and (cited or 0) > 0
+        )
+        if mention_only:
+            return (
+                f"AI names your brand in {cited} of {runs_total} buyer-intent "
+                f"queries (visibility {visibility_score}/100, attribution "
+                f"{attribution_score}/100), but your own page is cited in none "
+                "of them — buyers are routed to third-party listings, not your "
+                "site. The open lever is turning those brand mentions into "
+                "citations of your own page and independent endorsements — see "
+                "the recommended actions below."
+            )
+        # own_cited > 0 (or unknown): report the honest own-URL citation count
+        # when we have it, else fall back to the softer `cited`.
+        url_cited_count = (
+            own_cited if (has_evidence and own_cited is not None) else cited
+        )
         # Branded buyer-intent (visibility + attribution) is at goal, but a
         # materially weaker category-visibility score means shoppers who search
         # the CATEGORY rather than the brand still don't surface the product.
@@ -1525,7 +1581,7 @@ def _explain_verdict(
         )
         if category_discovery_gap:
             lead = (
-                f"AI agents cite your URL in {cited} of {runs_total} "
+                f"AI agents cite your URL in {url_cited_count} of {runs_total} "
                 if has_evidence
                 else "AI agents reliably surface this product for "
             )
@@ -1545,7 +1601,7 @@ def _explain_verdict(
             )
         if has_evidence:
             return (
-                f"AI agents cite your URL in {cited} of {runs_total} "
+                f"AI agents cite your URL in {url_cited_count} of {runs_total} "
                 f"buyer-intent queries (visibility {visibility_score}/100, "
                 f"attribution {attribution_score}/100). Both discovery "
                 "and attribution are at goal state. Remaining leverage "
@@ -6495,6 +6551,33 @@ async def build_per_sku_report(
         positives_count=len(_citation_positive_verify_candidates(sku_ctx, probe_runs)),
         verify_sample=None,
     )
+    # Competitor-attribute depth: probe what the durable category winner is
+    # "known for" (ingredients/format/positioning) so the diagnosis answers WHAT
+    # competitors did right, not just who they are. Scoped to URL/wedge audits
+    # (catalog_unavailable => bounded SKU count) to avoid N×grounded calls on a
+    # full catalog; the internal gates (brief enabled + a durable competitor
+    # exists) mean it only spends when there's a real winner to learn from.
+    # build_per_sku_report previously skipped this entirely — only the legacy
+    # wedge-hero path ran it — so it never fired on the live per-SKU audit.
+    # Probed BEFORE the NBA so the deterministic content-gap / substitution moves
+    # can target the actual winner + the decision factors AI credits them with,
+    # instead of prescribing generic "add more detail".
+    competitor_attributes: Any = "not_assessed"
+    if catalog_unavailable:
+        competitor_attributes = await _probe_durable_competitor_attributes_for_brief(
+            opportunity=opportunity,
+            product=product,
+            merchant_id=str(merchant_id),
+            run_id=audit_run_id or "",
+            coverage={"providers": list(provider_models.keys())},
+            provider_model_metadata=provider_models,
+        )
+    competitor_intel_for_nba = (
+        competitor_attributes
+        if isinstance(competitor_attributes, Mapping)
+        and competitor_attributes.get("status") == "assessed"
+        else None
+    )
     next_best_action = build_sku_next_best_action(
         opportunity=opportunity,
         primary_gaps=primary_gaps,
@@ -6506,25 +6589,8 @@ async def build_per_sku_report(
         merchant_host=normalize_host(product.get("canonical_url") or product.get("pdp_url")),
         sku_key=sku_key,
         catalog_unavailable=catalog_unavailable,
+        competitor_intel=competitor_intel_for_nba,
     )
-    # Competitor-attribute depth: probe what the durable category winner is
-    # "known for" (ingredients/format/positioning) so the diagnosis answers WHAT
-    # competitors did right, not just who they are. Scoped to URL/wedge audits
-    # (catalog_unavailable => bounded SKU count) to avoid N×grounded calls on a
-    # full catalog; the internal gates (brief enabled + a durable competitor
-    # exists) mean it only spends when there's a real winner to learn from.
-    # build_per_sku_report previously skipped this entirely — only the legacy
-    # wedge-hero path ran it — so it never fired on the live per-SKU audit.
-    competitor_attributes: Any = "not_assessed"
-    if catalog_unavailable:
-        competitor_attributes = await _probe_durable_competitor_attributes_for_brief(
-            opportunity=opportunity,
-            product=product,
-            merchant_id=str(merchant_id),
-            run_id=audit_run_id or "",
-            coverage={"providers": list(provider_models.keys())},
-            provider_model_metadata=provider_models,
-        )
     # competitor_attributes IS fed to the brief: it LICENSES competitor
     # references for the grounding validator. Removing it (a #3c attempt)
     # backfired — every competitor mention then failed as
@@ -9522,6 +9588,65 @@ def _grounded_attribute_providers(coverage: Mapping[str, Any]) -> List[str]:
     return providers[:2]
 
 
+_COMPETITOR_PROSE_KEYS = ("evidence_excerpt", "summary", "answer", "known_for")
+
+
+def _salvage_competitor_prose(raw: Any) -> str:
+    """Recover clean prose from a winner-profile LLM response when the upstream
+    parse failed and left only the raw string.
+
+    The failure that leaked into prod: the model wrapped its answer in a
+    ```json { … "evidence_excerpt": "Rahua is …" } fence that was unterminated
+    (or otherwise malformed), so `parsed` came back empty and the caller dumped
+    the raw ```json envelope straight into merchant-facing copy. This salvages
+    the prose field (fence-strip → JSON-parse → regex fallback for truncated
+    envelopes). If it still can't extract prose, it returns "" so the section
+    hides rather than leaking JSON — never surface a raw ```json string.
+    """
+    text = str(raw or "").strip()
+    if not text:
+        return ""
+    looks_structured = "```" in text or bool(
+        re.search(
+            r'"(?:' + "|".join(_COMPETITOR_PROSE_KEYS)
+            + r'|product_visible|competitors_listed)"\s*:',
+            text,
+        )
+    )
+    if not looks_structured:
+        return text  # already clean prose — nothing to salvage
+    # Strip surrounding markdown code fences, tolerating a missing closing fence.
+    inner = re.sub(r"^```(?:json)?\s*", "", text, flags=re.IGNORECASE).strip()
+    inner = re.sub(r"\s*```$", "", inner).strip()
+    # Try to parse a JSON object (whole string, then first-brace..last-brace).
+    brace = ""
+    start, end = inner.find("{"), inner.rfind("}")
+    if start != -1 and end > start:
+        brace = inner[start : end + 1]
+    for attempt in (inner, brace):
+        if not attempt:
+            continue
+        try:
+            obj = json.loads(attempt)
+        except (ValueError, json.JSONDecodeError):
+            continue
+        if isinstance(obj, Mapping):
+            for key in _COMPETITOR_PROSE_KEYS:
+                value = obj.get(key)
+                if value:
+                    return str(value).strip()
+            return ""  # valid JSON but no prose field — hide, don't leak
+    # Parse failed (commonly a truncated/unterminated envelope). Pull the prose
+    # field directly, tolerating a missing closing quote/brace.
+    for key in _COMPETITOR_PROSE_KEYS:
+        match = re.search(
+            rf'"{key}"\s*:\s*"(.+?)(?:"\s*[,}}]|$)', inner, re.DOTALL
+        )
+        if match and match.group(1).strip():
+            return match.group(1).strip().rstrip('"').strip()
+    return ""
+
+
 def _competitor_attribute_run_text(run: Mapping[str, Any]) -> str:
     parsed_parts: List[str] = []
     parsed = run.get("parsed")
@@ -9532,8 +9657,9 @@ def _competitor_attribute_run_text(run: Mapping[str, Any]) -> str:
                 parsed_parts.append(str(value))
     if parsed_parts:
         return "\n".join(parsed_parts)
-    raw = run.get("raw")
-    return str(raw or "")
+    # `parsed` is empty — the upstream JSON parse failed. Salvage prose from the
+    # raw string instead of dumping a raw ```json envelope into the report.
+    return _salvage_competitor_prose(run.get("raw"))
 
 
 def _normal_text(value: str) -> str:
@@ -15367,6 +15493,13 @@ def build_structured_report(
     verdict_evidence: Dict[str, Any] = {
         "attribution_runs_total": len(attribution_runs),
         "merchant_cited_runs": merchant_cited_runs,
+        # Honest own-page citation count (own domain resolved as a cited source),
+        # distinct from merchant_cited_runs (brand-mention OR listing). Gates the
+        # STRONG "cite your URL / goal state" copy so it can't fire on mentions
+        # alone — see _explain_verdict.
+        "own_url_cited_runs": _own_url_cited_runs(
+            attribution_runs, merchant_host=merchant_host
+        ),
         "top_retailers": top_retailer_hosts,
         "top_cited_hosts": top_cited_hosts,
         "competitive_pressure_framing": (competitive_pressure or {}).get("framing"),
