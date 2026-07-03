@@ -192,3 +192,34 @@ def test_elicited_records_stamped_with_source_and_coverage_marker():
     assert rec is not None, "elicited probe must survive budgeting"
     assert rec.get("source") == "llm_scenario"
     assert "scenario:elicited" in (rec.get("attribute_basis") or [])
+
+
+def test_llm_prompt_pools_share_small_budgets_fairly():
+    """Validation run b77a15b2: at the wedge's target=14, sequential appends
+    gave winnable all mid-pool slots and dropped every elicited scenario probe.
+    Interleaving must keep BOTH pools represented at small targets."""
+    from services.agent_center_bd_report_service import _build_per_sku_audit_query_records
+
+    ctx = {
+        "sku_key": "s1", "merchant_id": "m1",
+        "product": {"title": "ANUKO Hair Oil", "vendor": "ANUKO", "product_type": "hair oil"},
+        "_winnable_prompts": [
+            "bonding technology hair repair oil", "hair oil for heat damaged hair",
+            "argan oil heat protectant for hair", "hair oil with yuzu seed and argan",
+            "heat protection hair oil 200c",
+        ],
+        "_scenario_elicited": [
+            "best hair oil to pack for a beach vacation", "hair oil for humid summer weather",
+            "hair oil that survives a long flight", "hair oil for the gym bag",
+        ],
+    }
+    records = _build_per_sku_audit_query_records(ctx, 14)
+    winnable = [r for r in records if r.get("source") == "llm_winnable"]
+    elicited = [r for r in records if r.get("source") == "llm_scenario"]
+    assert len(records) == 14
+    assert len(elicited) >= 2, "elicited scenario probes must get budget at target=14"
+    assert len(winnable) >= 2, "winnable prompts must keep budget too"
+    # At a full 40 target both pools run complete.
+    records40 = _build_per_sku_audit_query_records(ctx, 40)
+    assert len([r for r in records40 if r.get("source") == "llm_scenario"]) == 4
+    assert len([r for r in records40 if r.get("source") == "llm_winnable"]) == 5

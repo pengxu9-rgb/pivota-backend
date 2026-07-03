@@ -8225,16 +8225,25 @@ def _build_per_sku_base_query_specs(
     # treatment for damaged hair") — vs the generic "best hair oil" heads above,
     # which are kept only as a benchmark. Tagged "category" so they classify as
     # discovery (category_head / problem_jtbd) and feed product_competitiveness.
-    for winnable in sku_ctx.get("_winnable_prompts") or []:
-        text = str(winnable or "").strip()
-        if text:
-            specs.append((text, "category"))
-    # P4a scenario-elicited category demand probes (exploratory; validated by
-    # the demand loop). Discovery axis like winnable prompts.
-    for elicited in sku_ctx.get("_scenario_elicited") or []:
-        text = str(elicited or "").strip()
-        if text:
-            specs.append((text, "category"))
+    # LLM discovery prompts: value-prop winnable + P4a scenario-elicited.
+    # INTERLEAVED (w1, e1, w2, e2, ...) because the budgeter consumes the
+    # mid-specific base pool in order — appending sequentially gave winnable's
+    # 5 all the slots and dropped every elicited scenario probe at the wedge's
+    # target=14 (validation run b77a15b2). Interleaving splits the pool fairly:
+    # at 14 -> ~3 winnable + 2 elicited; at 40 -> all of both.
+    _winnable_texts = [
+        str(w or "").strip() for w in (sku_ctx.get("_winnable_prompts") or [])
+        if str(w or "").strip()
+    ]
+    _elicited_texts = [
+        str(e or "").strip() for e in (sku_ctx.get("_scenario_elicited") or [])
+        if str(e or "").strip()
+    ]
+    for i in range(max(len(_winnable_texts), len(_elicited_texts))):
+        if i < len(_winnable_texts):
+            specs.append((_winnable_texts[i], "category"))
+        if i < len(_elicited_texts):
+            specs.append((_elicited_texts[i], "category"))
     if variant_label and variant_label.lower() not in title.lower():
         # Use the human variant label (e.g. "14 Servings, 2-Week Routine") with
         # the full identity, not the opaque variant id.
