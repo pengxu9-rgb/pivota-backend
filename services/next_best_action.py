@@ -573,18 +573,29 @@ def _sku_prescription_for_gap(
         )
 
     if primary_gap == PRIMARY_SKU_CONTENT_REVISION_GAP:
-        bucket = _sku_gap_label(content_gap)
+        # Merchant-safe copy only: the gap's _GAP_DISPLAY label/why, never the
+        # scoring bucket name ("product quality score" is an internal metric,
+        # not something a merchant can add to a page).
+        gap_phrase = _sku_gap_label(content_gap)
+        gap_why = str(content_gap.get("why") or "").strip()
+        if gap_why and not gap_why.endswith("."):
+            gap_why += "."
+        why_this_first = (
+            "AI can't confidently recommend a product it can't read. "
+            + (
+                gap_why
+                or f"{sku_title}'s page doesn't yet answer what shoppers ask."
+            )
+            + " That's the first fix."
+        )
         return _base_payload(
             primary_gap=primary_gap,
             headline=f"Fill the gaps on {sku_title}'s page before chasing reach.",
-            why_this_first=(
-                f"AI can't confidently recommend a product it can't read, and "
-                f"{sku_title}'s page is thin on {bucket}. That's the first fix."
-            ),
-            first_move=f"Add the missing {bucket} to {sku_title}'s page.",
+            why_this_first=why_this_first,
+            first_move=f"Strengthen {sku_title}'s page: {gap_phrase}.",
             self_serve_actions=[
                 (
-                    f"Fill in {bucket} in plain language: what it is, who it's for, "
+                    "Fill the gap in plain language: what it is, who it's for, "
                     "how to use it, and the facts a buyer needs to decide."
                 ),
                 (
@@ -887,21 +898,18 @@ def _sku_lane_chip(lane: Optional[Mapping[str, Any]]) -> Dict[str, Any]:
 
 def _sku_gap_chip(gap: Optional[Mapping[str, Any]]) -> Dict[str, Any]:
     """Merchant-facing evidence chip for a scoring gap. Carries ONLY merchant-safe
-    copy: the `label`/`why` from _GAP_DISPLAY and a humanized `descriptor` (the
-    bucket name with underscores stripped, e.g. "vertical structure") used by the
-    content-revision prescription. The raw scoring keys (dimension="citation",
-    bucket="first_party_rate"), the internal `reason`, and the 0-100
-    points/max/gap model are internal vocabulary and must NOT ride into the
-    merchant-facing next-best-action evidence — they have no frontend consumer
-    and the sanitizer does not reach this chip. The raw gap objects keep those
-    keys for internal sort/match; the chip does not."""
+    copy: the `label`/`why` from _GAP_DISPLAY. The raw scoring keys
+    (dimension="citation", bucket="first_party_rate"), the internal `reason`,
+    the humanized bucket ("product quality score" is an internal metric name),
+    and the 0-100 points/max/gap model are internal vocabulary and must NOT
+    ride into the merchant-facing next-best-action evidence — they have no
+    frontend consumer and the sanitizer does not reach this chip. The raw gap
+    objects keep those keys for internal sort/match; the chip does not."""
     if not gap:
         return {}
-    descriptor = str(gap.get("bucket") or "").replace("_", " ").strip()
     return {
         "label": gap.get("label"),
         "why": gap.get("why"),
-        "descriptor": descriptor or None,
     }
 
 
@@ -997,14 +1005,28 @@ def _sku_failing_prompt_chip(prompt: Any) -> Optional[Dict[str, Any]]:
     }
 
 
+# Generic merchant-safe phrase when a content gap carries no display label
+# (e.g. foundation-first fired on the content SCORE with no content gap in the
+# top-N list). Honest and never an internal metric name.
+_CONTENT_GAP_FALLBACK_PHRASE = "richer product detail"
+
+
 def _sku_gap_label(gap: Mapping[str, Any]) -> str:
-    # `gap` here is the merchant-facing chip: use its humanized `descriptor`
-    # (from _sku_gap_chip), falling back for a raw gap or an empty chip.
-    descriptor = str(gap.get("descriptor") or "").strip()
-    if descriptor:
-        return descriptor
-    bucket = str(gap.get("bucket") or "content_richness").strip()
-    return bucket.replace("_", " ")
+    """Merchant-safe phrase for a content gap, shaped for mid-sentence use.
+
+    Uses the gap chip's _GAP_DISPLAY label ("Richer product detail" ->
+    "richer product detail") — NEVER the humanized bucket name: "product
+    quality score" / "model readiness" are Pivota-internal metrics, and telling
+    a merchant to "add the missing product quality score to your page" is the
+    flagged credibility-killer (ANUKO 2026-07-03 re-run, DamDam review). The
+    first char is lowercased only when the label isn't an acronym/proper form
+    ("AI-ready content" stays as-is)."""
+    label = str(gap.get("label") or "").strip()
+    if label:
+        if len(label) > 1 and label[1:2].islower():
+            return label[0].lower() + label[1:]
+        return label
+    return _CONTENT_GAP_FALLBACK_PHRASE
 
 
 def _merchant_path(
@@ -2547,7 +2569,7 @@ def _tracking_metrics_for_gap(
         ]
     if primary_gap == PRIMARY_SKU_CONTENT_REVISION_GAP:
         return [
-            f"Product-page {content_gap} completeness after the missing facts are added.",
+            f"Product-page completeness ({content_gap}) after the missing facts are added.",
             "Failed SKU prompts that now answer from the official PDP facts.",
         ]
     if primary_gap == PRIMARY_SKU_SOURCE_ROUTE_REPAIR:
