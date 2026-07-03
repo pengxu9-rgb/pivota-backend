@@ -265,7 +265,7 @@ async def _process_one_audit_run_inner(
                         products,
                         pivota_url_used,
                         integration_state,
-                    ) = _resolve_synthetic_url_products(
+                    ) = await _resolve_synthetic_url_products(
                         launch_options=launch_options,
                         merchant_id=merchant_id,
                     )
@@ -400,7 +400,7 @@ async def _process_one_audit_run_inner(
                     products,
                     pivota_url_used,
                     integration_state,
-                ) = _resolve_synthetic_url_products(
+                ) = await _resolve_synthetic_url_products(
                     launch_options=launch_options,
                     merchant_id=merchant_id,
                 )
@@ -1303,7 +1303,7 @@ async def _seed_url_audit_index(
             )
 
 
-def _resolve_synthetic_url_products(
+async def _resolve_synthetic_url_products(
     *, launch_options: Dict[str, Any], merchant_id: str,
 ) -> tuple:
     """Discovery stage for URL-audit (wedge) runs: build `products` from the
@@ -1319,7 +1319,15 @@ def _resolve_synthetic_url_products(
     from services.agent_center_bd_report_service import (
         register_synthetic_sku_contexts,
     )
+    from services.product_identity_i18n import resolve_synthetic_items_inplace
+
     items = launch_options.get("synthetic_products") or []
+    # US-primary market: a Korean-titled PDP yields Korean buyer probes and an
+    # empty attribute graph. Resolve the English identity FIRST (flag-gated,
+    # fail-safe) and mutate item['title'] in place, so the registered context
+    # (probe identity) and the products list (attribute graph) both pick it up.
+    # Idempotent on resume: an already-English title short-circuits at the gate.
+    await resolve_synthetic_items_inplace(items, merchant_id)
     register_synthetic_sku_contexts(items, merchant_id)
     products: List[Dict[str, Any]] = []
     for item in items:
