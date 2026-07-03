@@ -31,7 +31,16 @@ ATTRIBUTE_CLASSES: Tuple[str, ...] = (
 _HTML_TAG_RE = re.compile(r"<[^>]+>")
 _SPACE_RE = re.compile(r"\s+")
 _CONTEXT_SPLIT_RE = re.compile(r"[,.;:!?()\[\]\n\r]+")
-_TOKEN_RE = re.compile(r"[a-z0-9]+")
+# Non-Latin scripts we preserve through tokenization. The original tokenizer and
+# _search_text stripped every non-ASCII character, so an all-Korean storefront
+# (e.g. anukoofficial.com) tokenized to nothing -> zero attributes, no category,
+# and a thin/generic strategic brief. Korean is space-separated, so its runs line
+# up with lexicon phrases directly; Japanese/Chinese runs still need word
+# segmentation before they can match (a Kana/Kanji run tokenizes as one blob),
+# tracked separately alongside the LLM extractor fallback for the long tail.
+# Ranges: Hangul syllables, Hiragana+Katakana, CJK Unified Ideographs.
+_CJK_RANGES = "가-힣぀-ヿ一-鿿"
+_TOKEN_RE = re.compile(rf"[a-z0-9]+|[{_CJK_RANGES}]+")
 
 _CATEGORY_TERMS: Tuple[Tuple[str, str], ...] = (
     ("collagen", "collagen"),
@@ -45,6 +54,27 @@ _CATEGORY_TERMS: Tuple[Tuple[str, str], ...] = (
     ("hair vitamin", "hair vitamin"),
     ("balm", "balm"),
     ("supplement", "supplement"),
+    # K-beauty skincare/haircare categories. The lexicon above was built for a
+    # supplement/sunscreen/deodorant pilot and had no haircare or core-skincare
+    # categories, so an ANUKO shampoo resolved no category (hence no sidewalk
+    # queries) even from an English title.
+    ("shampoo", "shampoo"),
+    ("conditioner", "conditioner"),
+    ("toner", "toner"),
+    ("essence", "essence"),
+    ("ampoule", "ampoule"),
+    ("cleanser", "cleanser"),
+    # i18n (ko): Korean words/transliterations mapped to the canonical English
+    # attribute so downstream query/brief generation is unchanged.
+    ("샴푸", "shampoo"),
+    ("컨디셔너", "conditioner"),
+    ("세럼", "serum"),
+    ("선크림", "sunscreen"),
+    ("토너", "toner"),
+    ("에센스", "essence"),
+    ("앰플", "ampoule"),
+    ("클렌저", "cleanser"),
+    ("콜라겐", "collagen"),
 )
 _FORMAT_TERMS: Tuple[Tuple[str, str], ...] = (
     ("refill pod", "refill pod"),
@@ -95,6 +125,11 @@ _INGREDIENT_TERMS: Tuple[Tuple[str, str], ...] = (
     ("titanium dioxide", "titanium dioxide"),
     ("niacinamide", "niacinamide"),
     ("hyaluronic acid", "hyaluronic acid"),
+    # i18n (ko): map to English actives already present in this lexicon.
+    ("나이아신아마이드", "niacinamide"),
+    ("히알루론산", "hyaluronic acid"),
+    ("비타민 c", "vitamin c"),
+    ("비타민c", "vitamin c"),
 )
 _CERTIFICATION_TERMS: Tuple[Tuple[str, str], ...] = (
     ("halal certified", "halal"),
@@ -110,6 +145,13 @@ _CERTIFICATION_TERMS: Tuple[Tuple[str, str], ...] = (
     ("cruelty free", "cruelty-free"),
     ("cruelty-free", "cruelty-free"),
     ("mineral", "mineral"),
+    # i18n (ko): positive claim terms only. 무향 ("scent-free") already encodes
+    # the negated concept, so mapping it directly sidesteps the English-only
+    # negation guardrails (a bare Korean active with Korean negation grammar is
+    # out of scope for this head-term pass — see the LLM fallback follow-up).
+    ("비건", "vegan"),
+    ("무향", "fragrance-free"),
+    ("크루얼티프리", "cruelty-free"),
 )
 _AUDIENCE_TERMS: Tuple[Tuple[str, str], ...] = (
     ("kids", "kids"),
@@ -310,7 +352,7 @@ def _clean_attr(value: Any) -> str:
 def _search_text(value: Any) -> str:
     text = _clean_attr(value)
     text = text.replace("-", " ")
-    text = re.sub(r"[^a-z0-9$]+", " ", text)
+    text = re.sub(rf"[^a-z0-9${_CJK_RANGES}]+", " ", text)
     return f" {_SPACE_RE.sub(' ', text).strip()} "
 
 
