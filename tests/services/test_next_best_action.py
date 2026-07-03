@@ -823,7 +823,10 @@ def test_sku_secondary_moves_never_leak_internal_metric_names():
     assert set(move["evidence"]) <= {"label", "why"}
 
 
-def test_sku_nba_content_gap_references_content_richness_bucket():
+def test_sku_nba_content_gap_uses_merchant_safe_display_copy():
+    """The content-revision prescription must use the gap's _GAP_DISPLAY
+    label/why — never the humanized scoring bucket ('vertical structure',
+    'product quality score' are internal metric names)."""
     opportunity = _sku_base_opportunity()
     gaps = [
         {
@@ -832,7 +835,10 @@ def test_sku_nba_content_gap_references_content_richness_bucket():
             "points": 0,
             "max": 20,
             "gap": 20,
-            "reason": "missing ingredients and usage guides",
+            # Production gaps always carry the merchant-safe display copy
+            # (_primary_gaps attaches it; the coverage-guard test enforces it).
+            "label": "Category-specific details",
+            "why": "Shoppers in this category expect specifics (ingredients, materials, or specs) that aren't fully covered yet.",
         }
     ]
 
@@ -845,9 +851,65 @@ def test_sku_nba_content_gap_references_content_richness_bucket():
     )
 
     assert nba["primary_gap"] == PRIMARY_SKU_CONTENT_REVISION_GAP
-    assert "vertical structure" in nba["first_move"]
-    assert "vertical structure" in nba["why_this_first"]
+    assert "category-specific details" in nba["first_move"].lower()
+    assert "Shoppers in this category expect specifics" in nba["why_this_first"]
+    assert "vertical structure" not in json.dumps(nba).lower()
     _assert_70_30(nba)
+
+
+def test_sku_nba_content_gap_never_says_product_quality_score():
+    """ANUKO 2026-07-03 re-run: the first move read 'Add the missing product
+    quality score to <product>'s page' — an internal Pivota metric presented as
+    page content. The whole NBA payload must be free of the bucket phrase and
+    use the display label instead."""
+    opportunity = _sku_base_opportunity()
+    gaps = [{
+        "dimension": "content_richness",
+        "bucket": "product_quality_score",
+        "points": 2,
+        "max": 25,
+        "gap": 23,
+        "label": "Richer product detail",
+        "why": "The product description is thin where shoppers and AI ask the most questions.",
+    }]
+
+    nba = build_sku_next_best_action(
+        opportunity=opportunity,
+        primary_gaps=gaps,
+        scores={"identity": {"score": 23}, "content_richness": {"score": 14},
+                "routability": {"score": 6}, "citation": {"score": 21}},
+        identity=_sku_identity(),
+        sku_title="Anuko Bond & Repair Hair Oil",
+        catalog_unavailable=True,
+    )
+
+    assert nba["primary_gap"] == PRIMARY_SKU_CONTENT_REVISION_GAP
+    blob = json.dumps(nba).lower()
+    assert "product quality score" not in blob
+    assert "product_quality_score" not in blob
+    assert "richer product detail" in nba["first_move"].lower()
+    assert "thin where shoppers and AI ask" in nba["why_this_first"]
+
+
+def test_sku_nba_content_gap_without_display_copy_falls_back_safely():
+    """Foundation-first can fire on the content SCORE with no content gap in the
+    top-N list (the ANUKO SKU2 shape) — the copy must fall back to a safe
+    generic phrase, never 'content richness' (the internal dimension name)."""
+    opportunity = _sku_base_opportunity()
+
+    nba = build_sku_next_best_action(
+        opportunity=opportunity,
+        primary_gaps=[],  # no content gap surfaced
+        scores={"identity": {"score": 23}, "content_richness": {"score": 14},
+                "routability": {"score": 6}, "citation": {"score": 21}},
+        identity=_sku_identity(),
+        sku_title="Anuko Hair Butter",
+        catalog_unavailable=True,
+    )
+
+    assert nba["primary_gap"] == PRIMARY_SKU_CONTENT_REVISION_GAP
+    assert "richer product detail" in nba["first_move"].lower()
+    assert "content richness" not in json.dumps(nba).lower()
 
 
 def test_sku_nba_source_route_repair_uses_retailer_and_publisher_roles():
