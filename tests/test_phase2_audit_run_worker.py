@@ -36,6 +36,7 @@ class _FakeAccessors:
         self.partial_results: List[Dict[str, Any]] = []
         self.lease_extensions: List[Tuple[str, int]] = []
         self.legacy_writes: List[Dict[str, Any]] = []
+        self.report_persists: List[Dict[str, Any]] = []
         self.transition_returns: Dict[Tuple[str, str], bool] = {}
 
     async def claim_next_pending_run(self, *, worker_id):
@@ -61,6 +62,12 @@ class _FakeAccessors:
         self.lease_extensions.append((run_id, lease_seconds))
         return True
 
+    async def persist_report_jsonb(
+        self, *, run_id, worker_id, report_jsonb,
+    ):
+        self.report_persists.append(report_jsonb)
+        return True
+
 
 def _patch_worker_deps(
     monkeypatch,
@@ -82,6 +89,7 @@ def _patch_worker_deps(
     monkeypatch.setattr(mar, "record_partial_result",
                         fake.record_partial_result)
     monkeypatch.setattr(mar, "extend_lease", fake.extend_lease)
+    monkeypatch.setattr(mar, "persist_report_jsonb", fake.persist_report_jsonb)
 
     calls: Dict[str, Any] = {}
 
@@ -111,6 +119,12 @@ def _patch_worker_deps(
     monkeypatch.setattr(bd, "run_brand_report", fake_run_brand_report)
 
     async def fake_materialize(**kwargs):
+        # R1 regression: report_jsonb MUST be persisted before dispatch runs,
+        # or the executor_run_worker reads a NULL report at claim time and
+        # silently skips (e.g. the content-brief agent).
+        assert fake.report_persists, (
+            "report_jsonb must be persisted before executor dispatch"
+        )
         calls["materialize"] = kwargs
         return {"tasks_materialized": 2, "executors_dispatched": 1}
 
@@ -189,6 +203,11 @@ async def test_full_happy_path_stage_sequence(monkeypatch):
     assert keys == [
         "discovering", "probing", "scoring", "materializing", "verifying",
     ]
+
+    # R1: report_jsonb persisted once in materializing (before dispatch) so the
+    # executor_run_worker reads a populated report at claim time.
+    assert len(fake.report_persists) == 1
+    assert fake.report_persists[0].get("aggregate") is not None
 
     # Legacy aggregate write happened so dual-key consumers see a
     # populated row even before they migrate.
