@@ -147,7 +147,7 @@ async def _ensure_schema() -> None:
     offer_columns = await database.fetch_all("PRAGMA table_info(catalog_offers)")
     if "suppressed_at" not in {dict(row).get("name") for row in offer_columns}:
         await database.execute("ALTER TABLE catalog_offers ADD COLUMN suppressed_at TIMESTAMP")
-    # ADR-007 SLICE 1: backstop for test DBs created before index_eligible
+    # ADR-008 SLICE 1: backstop for test DBs created before index_eligible
     # existed (mirrors the suppressed_at backstop above).
     ips_columns = await database.fetch_all("PRAGMA table_info(index_pipeline_state)")
     if "index_eligible" not in {dict(row).get("name") for row in ips_columns}:
@@ -696,7 +696,7 @@ async def test_fail_close_index_pipeline_state_demotes_orphan_serving_row() -> N
 
 
 # ---------------------------------------------------------------------------
-# ADR-007 SLICE 1: index_eligible persistence + lifecycle (DB-backed)
+# ADR-008 SLICE 1: index_eligible persistence + lifecycle (DB-backed)
 # ---------------------------------------------------------------------------
 
 @pytest.mark.asyncio

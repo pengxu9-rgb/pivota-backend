@@ -117,7 +117,7 @@ class FakeAgentPdpDatabase:
         serving_ok = (
             self.serving_eligible_by_content_key.get(row["content_key"]) is True
         )
-        # ADR-007 SLICE 1: when INDEX_ELIGIBLE_READ is ON the emitted SQL widens
+        # ADR-008 SLICE 1: when INDEX_ELIGIBLE_READ is ON the emitted SQL widens
         # to (serving_eligible OR index_eligible). Mirror that here.
         if "ips.index_eligible = TRUE" in query:
             index_ok = self.index_eligible_by_content_key.get(row["content_key"]) is True
@@ -471,7 +471,7 @@ def test_sql_uses_agent_pdp_view_indexed_lookup_paths() -> None:
 
 
 # ---------------------------------------------------------------------------
-# ADR-007 SLICE 1: INDEX_ELIGIBLE_READ read-gate widening
+# ADR-008 SLICE 1: INDEX_ELIGIBLE_READ read-gate widening
 # ---------------------------------------------------------------------------
 
 def test_index_eligible_read_off_is_serving_only_byte_identical(monkeypatch) -> None:

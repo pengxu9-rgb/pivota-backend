@@ -609,7 +609,7 @@ def test_extraction_content_hash_is_deterministic():
 
 
 # ---------------------------------------------------------------------------
-# ADR-007 SLICE 1: index_eligible (offer-free citation floor)
+# ADR-008 SLICE 1: index_eligible (offer-free citation floor)
 # ---------------------------------------------------------------------------
 
 def test_index_eligible_true_for_offer_free_product_meeting_quality_image_identity():
@@ -625,7 +625,7 @@ def test_index_eligible_true_for_offer_free_product_meeting_quality_image_identi
 
 def test_serving_eligible_still_requires_has_price_unchanged():
     """Regression assertion: serving_eligible MUST still require has_price.
-    ADR-007 is strictly additive — it does not relax the serving gate."""
+    ADR-008 is strictly additive — it does not relax the serving gate."""
     with_price = _classify_product(_full_row(has_price=True), regression_domains=set())
     without_price = _classify_product(_full_row(has_price=False), regression_domains=set())
     assert with_price["serving_eligible"] is True
