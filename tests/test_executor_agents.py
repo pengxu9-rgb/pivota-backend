@@ -222,9 +222,10 @@ async def test_gsc_agent_execute_succeeds_with_partial_failures():
 
 
 @pytest.mark.asyncio
-async def test_gsc_agent_execute_aborts_on_oauth_missing():
-    """GscNotConfiguredError on the first URL aborts the loop —
-    subsequent URLs would all hit the same error."""
+async def test_gsc_agent_execute_fails_when_principal_not_configured():
+    """A GscNotConfiguredError skips THAT url (its principal isn't configured)
+    without aborting siblings that may use the other principal. When every url
+    fails, the agent reports failed with a not_configured per-url reason."""
     from services.executor_agents.gsc_url_submission import GscUrlSubmissionAgent
     from services.gsc_integration import GscNotConfiguredError
     agent = GscUrlSubmissionAgent()
@@ -237,7 +238,35 @@ async def test_gsc_agent_execute_aborts_on_oauth_missing():
          patch("services.gsc_integration.submit_url_to_gsc", new=AsyncMock(side_effect=_fake_submit)):
         result = await agent.execute(ExecutorContext(merchant_id="m1"))
     assert result.status == "failed"
-    assert "gsc_oauth_missing" in (result.error_message or "")
+    assert result.evidence["failed_count"] == 1
+    assert result.evidence["results"][0]["status"] == "error"
+    assert "not_configured" in result.evidence["results"][0]["message"]
+
+
+@pytest.mark.asyncio
+async def test_gsc_agent_routes_canonical_urls_through_pivota_principal():
+    """R2 regression (ADR-006): a Pivota canonical URL (agent.pivota.cc/...) must
+    be submitted under the Pivota service-account credential, NEVER the
+    merchant's OAuth — the latter 403s and spins a permanent error loop."""
+    from services.executor_agents.gsc_url_submission import GscUrlSubmissionAgent
+    agent = GscUrlSubmissionAgent()
+    candidates = [{
+        "url": "https://agent.pivota.cc/products/sig_123",
+        "last_status": "error", "last_status_at": "x",
+    }]
+
+    pivota_submit = AsyncMock(return_value={"status": "submitted", "message": "ok"})
+    merchant_submit = AsyncMock(return_value={"status": "submitted", "message": "ok"})
+
+    with patch.object(agent, "_fetch_stale_unindexed", new=AsyncMock(return_value=candidates)), \
+         patch("services.gsc_integration.submit_pivota_canonical_url", new=pivota_submit), \
+         patch("services.gsc_integration.submit_url_to_gsc", new=merchant_submit):
+        result = await agent.execute(ExecutorContext(merchant_id="m1"))
+
+    assert result.status == "succeeded"
+    assert result.evidence["pivota_canonical_count"] == 1
+    pivota_submit.assert_awaited_once()
+    merchant_submit.assert_not_awaited()  # canonical URL must NOT hit merchant OAuth
 
 
 @pytest.mark.asyncio

@@ -465,16 +465,16 @@ async def submit_audit_canonical_urls(
 
     Returns the list of per-URL results for diagnostics + telemetry.
     Empty list when:
-      - GSC integration disabled (feature flag off)
-      - Merchant has no OAuth tokens (no grant yet)
+      - Pivota-owned submit disabled (GSC_PIVOTA_SUBMIT_ENABLED=false)
       - No products audited via Pivota canonical PDP
+
+    ADR-006: these URLs are Pivota's OWN canonical PDPs
+    (agent.pivota.cc/products/<sig>), so they are submitted under the
+    Pivota service-account credential — NOT the merchant's OAuth. A merchant's
+    Search Console grant covers the merchant's domain, so submitting a
+    Pivota-host URL under the merchant principal 403s and writes a permanent
+    `error` row that the GSC executor agent then re-fails forever.
     """
-    import asyncio
-
-    from config.settings import settings
-    if not settings.gsc_integration_enabled:
-        return []
-
     # Walk per-product reports, collect canonical URLs.
     urls_to_submit: List[str] = []
     for report in (brand_report or {}).get("per_product") or []:
@@ -490,44 +490,17 @@ async def submit_audit_canonical_urls(
         url = report.get("merchant_pdp_url")
         if url and isinstance(url, str):
             urls_to_submit.append(url)
-    # Dedupe while preserving order
-    seen: set = set()
-    unique_urls: List[str] = []
-    for u in urls_to_submit:
-        if u in seen:
-            continue
-        seen.add(u)
-        unique_urls.append(u)
-    if not unique_urls:
+    if not urls_to_submit:
         return []
 
-    # Verify the merchant has tokens before firing submissions; saves
-    # one round-trip per URL when un-integrated.
-    if not await is_gsc_integrated(merchant_id):
-        return []
-
-    async def _safe_submit(url: str) -> Dict[str, Any]:
-        try:
-            return await submit_url_to_gsc(
-                merchant_id, url, audit_run_id=audit_run_id,
-            )
-        except Exception as exc:  # noqa: BLE001
-            logger.warning(
-                "gsc auto-submit failed for merchant=%s url=%s: %s",
-                merchant_id, url, exc,
-            )
-            return {
-                "status": "error",
-                "url": url,
-                "message": str(exc),
-            }
-
-    results = await asyncio.gather(*[_safe_submit(u) for u in unique_urls])
-    # Annotate with the URL each result came from for diagnostics.
-    for url, result in zip(unique_urls, results):
-        if "url" not in result:
-            result["url"] = url
-    return list(results)
+    # Delegate to the Pivota-credential batch helper: it dedupes, gates on
+    # gsc_pivota_submit_enabled, mints the service-account token once, and
+    # submits in parallel under the correct (Pivota-owned) principal.
+    return await submit_pivota_canonical_urls(
+        merchant_id=merchant_id,
+        urls=urls_to_submit,
+        audit_run_id=audit_run_id,
+    )
 
 
 def build_gsc_integration_action(

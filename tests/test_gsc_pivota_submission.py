@@ -244,6 +244,41 @@ async def test_batch_all_error_when_token_unavailable(monkeypatch):
     assert all(r["status"] == "error" for r in out)
 
 
+@pytest.mark.asyncio
+async def test_audit_seeder_submits_canonical_via_pivota_not_merchant(monkeypatch):
+    """R2 regression (ADR-006): submit_audit_canonical_urls collects
+    pivota_canonical_pdp URLs and MUST submit them under the Pivota
+    service-account credential (submit_pivota_canonical_url), never the
+    merchant's OAuth (submit_url_to_gsc) — the latter 403s and writes a
+    permanent error row the GSC executor then re-fails forever."""
+    _enable_pivota(monkeypatch)
+    brand_report = {
+        "per_product": [
+            {
+                "merchant_view": {"headline": {"url_source": "pivota_canonical_pdp"}},
+                "merchant_pdp_url": "https://agent.pivota.cc/products/sig_1",
+            },
+            {
+                "merchant_view": {"headline": {"url_source": "pivota_canonical_pdp"}},
+                "merchant_pdp_url": "https://agent.pivota.cc/products/sig_2",
+            },
+        ]
+    }
+    pivota_submit = AsyncMock(return_value={"status": "submitted", "url": "x"})
+    merchant_submit = AsyncMock(return_value={"status": "submitted", "url": "x"})
+
+    with patch.object(mod, "_get_pivota_access_token", AsyncMock(return_value="tok")), \
+         patch.object(mod, "submit_pivota_canonical_url", pivota_submit), \
+         patch.object(mod, "submit_url_to_gsc", merchant_submit):
+        out = await mod.submit_audit_canonical_urls(
+            merchant_id="m1", brand_report=brand_report,
+        )
+
+    assert len(out) == 2
+    assert pivota_submit.await_count == 2
+    merchant_submit.assert_not_awaited()  # never the merchant principal
+
+
 # ---- JWT-bearer token exchange ---------------------------------------------
 
 @pytest.mark.asyncio
