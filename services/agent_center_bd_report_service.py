@@ -11227,6 +11227,19 @@ async def run_brand_report(
                 # every product report so the integration action
                 # consistently fires (or stays absent) across products.
                 integration_state=integration_state,
+                # Cold-start is a BD prospect (no real merchant) AND a
+                # synthetic-unintegrated shape. Combining both signals
+                # flips exactly one case vs the old shape-only heuristic:
+                # a REAL merchant who's onboarded nothing yet (non-prospect
+                # id, unintegrated shape) is no longer misread as cold-
+                # start, so the "Complete Pivota integration" CTA fires for
+                # them. Every other case (prospect+synthetic → cold-start;
+                # competitor/None with integration_state=None → not cold-
+                # start; fully onboarded → not cold-start) is unchanged.
+                is_cold_start=(
+                    _merchant_id_is_prospect(merchant_id)
+                    and _is_cold_start_audit(integration_state)
+                ),
             )
             structured["coverage_profile"] = coverage.get("profile")
             structured["providers"] = profile_providers
@@ -14254,8 +14267,41 @@ def _build_competitive_table(
     return rows
 
 
+def _merchant_id_is_prospect(merchant_id: Optional[str]) -> bool:
+    """The honest cold-start discriminator: merchant identity, not the
+    integration_state shape.
+
+    A cold-start (BD-outreach) audit runs with NO onboarded merchant
+    behind it — the route mints a synthetic ``prospect_<hex>`` id (see
+    routes/agent_center_bd_routes.py::_prospect_merchant_id). A REAL
+    merchant always has a non-prospect merchant_id, even one who has
+    connected nothing yet.
+
+    This matters because a fresh (or lookup-failed) real merchant's
+    "totally unintegrated" integration_state — see
+    services/merchant_integration_state.get_integration_state, which
+    deliberately over-surfaces the integration CTA — is byte-identical
+    to the synthetic cold-start shape (store+psp both missing). So
+    `_is_cold_start_audit` (shape-only) can't tell them apart and
+    over-triggers, wrongly suppressing the "Complete Pivota
+    integration" CTA for real incomplete merchants. The merchant_id
+    can tell them apart; the shape can't.
+    """
+    mid = str(merchant_id).strip() if merchant_id is not None else ""
+    return (not mid) or mid.startswith("prospect_")
+
+
 def _is_cold_start_audit(integration_state: Optional[Dict[str, Any]]) -> bool:
-    """A cold-start audit's integration_state is the synthetic
+    """SHAPE-BASED cold-start fallback. Prefer an explicit `is_cold_start`
+    threaded from the merchant identity (`_merchant_id_is_prospect`) —
+    this heuristic is ambiguous: a real merchant who has connected
+    nothing yet (or whose integration lookup failed) produces the exact
+    same "store+psp both missing" shape as a synthetic cold-start
+    target, so this returns a false positive for them. Retained only as
+    the fallback when no explicit signal is supplied (e.g. direct
+    callers that don't know the merchant identity).
+
+    A cold-start audit's integration_state is the synthetic
     "totally unintegrated" shape minted by /bd/cold-start-audit:
     fully_integrated=False AND missing_pieces includes both
     store_platform AND psp. For these targets, history endpoints
@@ -14268,6 +14314,17 @@ def _is_cold_start_audit(integration_state: Optional[Dict[str, Any]]) -> bool:
         return False
     missing = integration_state.get("missing_pieces") or []
     return "store_platform" in missing and "psp" in missing
+
+
+def _resolve_cold_start(
+    is_cold_start: Optional[bool],
+    integration_state: Optional[Dict[str, Any]],
+) -> bool:
+    """Prefer the explicit merchant-identity signal; fall back to the
+    ambiguous shape heuristic only when no signal was threaded."""
+    if is_cold_start is not None:
+        return is_cold_start
+    return _is_cold_start_audit(integration_state)
 
 
 def _build_evidence_quotes(
@@ -14321,6 +14378,7 @@ def _build_tracking_block(
     pivota_baseline: Dict[str, Any],
     your_gap_to_baseline: Dict[str, int],
     current_scores: Optional[Dict[str, Any]] = None,
+    is_cold_start: Optional[bool] = None,
 ) -> Dict[str, Any]:
     """Tracking block for merchant_view.
 
@@ -14345,7 +14403,7 @@ def _build_tracking_block(
         for cold-start prospect ids). PR-1a re-audit trend works
         cross-cold-start.
     """
-    cold_start = _is_cold_start_audit(integration_state)
+    cold_start = _resolve_cold_start(is_cold_start, integration_state)
     block: Dict[str, Any] = {
         "next_audit_eligible_at": None,
         "history_link": None if cold_start else "/api/merchant-center/audit/history",
@@ -14472,6 +14530,7 @@ def _build_merchant_view(
     prior_runs: Optional[List[Dict[str, Any]]] = None,
     pivota_signature_minted_at: Optional[datetime] = None,
     integration_state: Optional[Dict[str, Any]] = None,
+    is_cold_start: Optional[bool] = None,
 ) -> Dict[str, Any]:
     """Project the already-computed structured report into a 6-layer
     information architecture the merchant portal can render directly:
@@ -14491,6 +14550,14 @@ def _build_merchant_view(
     Indexing-arc state computation lands in PR-D — for now the
     `diagnosis.indexing_arc_state` field is a static caveat.
     """
+    # Cold-start is a property of merchant identity (BD prospect vs a
+    # real onboarded merchant), NOT of the integration_state shape — a
+    # real merchant who has connected nothing is byte-identical in
+    # shape to a synthetic cold-start target. Prefer the explicit signal
+    # threaded from the caller (which knows the merchant_id); fall back
+    # to the ambiguous shape heuristic only when it's absent.
+    cold_start = _resolve_cold_start(is_cold_start, integration_state)
+
     headline_one_liner = (verdict_explanation or "").split(".")[0].strip()
     if headline_one_liner and not headline_one_liner.endswith("."):
         headline_one_liner += "."
@@ -14579,7 +14646,7 @@ def _build_merchant_view(
     # panel), NOT as the #1 diagnostic action. Skip the prepend so
     # the action ladder stays purely diagnostic. The pitch content
     # is unchanged in pivota_value_prop further below.
-    if integration_state is not None and not _is_cold_start_audit(integration_state):
+    if integration_state is not None and not cold_start:
         from services.merchant_integration_state import build_integration_action
         integration_action = build_integration_action(integration_state)
         if integration_action is not None:
@@ -14831,6 +14898,7 @@ def _build_merchant_view(
                 "attribution": attribution_score,
                 "category_visibility": category_visibility_score,
             },
+            is_cold_start=cold_start,
         ),
         "pivota_value_prop": what_pivota_changes,
     }
@@ -14838,7 +14906,7 @@ def _build_merchant_view(
         merchant_view=merchant_view,
         competitive_pressure=competitive_pressure,
         integration_state=integration_state,
-        is_cold_start=_is_cold_start_audit(integration_state),
+        is_cold_start=cold_start,
     )
     return merchant_view
 
@@ -14869,6 +14937,14 @@ def build_structured_report(
     # paragraph. Cold-start audits that didn't call infer_brand_context
     # pass None — narrative falls back to non-corporate framing.
     brand_context: Optional[Dict[str, Any]] = None,
+    # Explicit cold-start signal derived from merchant identity by the
+    # caller (run_brand_report computes it from merchant_id). When None,
+    # we fall back to the ambiguous integration_state shape heuristic —
+    # which false-positives for real merchants who've connected nothing
+    # yet. Threading the truthful value keeps the "Complete Pivota
+    # integration" CTA firing for real incomplete merchants while still
+    # routing the pitch to pivota_value_prop for BD cold-start targets.
+    is_cold_start: Optional[bool] = None,
 ) -> Dict[str, Any]:
     """Return a single JSON-serializable dict with everything the UI
     needs to render the BD report. Pure function.
@@ -14876,6 +14952,11 @@ def build_structured_report(
     `category_visibility_result` is optional (Phase 2a) — when provided,
     the report exposes a `category_visibility` block with score + queries,
     and `verdict.category_visibility_score` for downstream consumers."""
+    # Resolve cold-start once from the explicit merchant-identity signal
+    # (falling back to the shape heuristic), then thread the SAME value
+    # to every cold-start-sensitive builder so a report can't be
+    # cold-start in one section and onboarded in another.
+    _report_cold_start = _resolve_cold_start(is_cold_start, integration_state)
     visibility_score = (visibility_result.get("scores") or {}).get("visibility_score", 0)
     attribution_score = (attribution_result.get("scores") or {}).get("visibility_score", 0)
     visibility_runs = visibility_result.get("raw_runs") or []
@@ -15127,6 +15208,7 @@ def build_structured_report(
         prior_runs=prior_runs,
         pivota_signature_minted_at=pivota_signature_minted_at,
         integration_state=integration_state,
+        is_cold_start=_report_cold_start,
     )
 
     # PR-8a (post-Grüns synthesis layer): build the strategic
@@ -15172,7 +15254,7 @@ def build_structured_report(
     from services.audit_pivota_commitments_builder import (
         build_pivota_commitments,
     )
-    _is_cold = _is_cold_start_audit(integration_state)
+    _is_cold = _report_cold_start
     # _merchant_platform was hoisted earlier so the checkout_loop
     # chain in _build_what_pivota_changes can use the same value.
     pivota_commitments = build_pivota_commitments(

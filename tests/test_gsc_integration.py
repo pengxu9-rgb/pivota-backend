@@ -204,10 +204,19 @@ def _state(*, store: bool, psp: bool, gsc: bool) -> Dict[str, Any]:
 
 
 def test_gsc_action_NOT_emitted_when_phase_0_incomplete():
-    """When store+PSP onboarding isn't done, GSC action should NOT
-    surface — Phase 0's 'Complete Pivota integration' action takes
-    the top slot. Asking the merchant for GSC access before they've
-    even connected their store is wrong order."""
+    """For a REAL merchant whose store+PSP onboarding isn't done, the
+    GSC action should NOT surface — Phase 0's 'Complete Pivota
+    integration' action takes the top slot. Asking the merchant for GSC
+    access before they've even connected their store is wrong order.
+
+    `is_cold_start=False` marks this as a real merchant (has a
+    merchant_id). A real merchant who's connected nothing yet produces
+    a "store+psp both missing" integration_state that is byte-identical
+    to a synthetic cold-start prospect's — so the caller must supply the
+    truthful cold-start signal (derived from merchant identity), not let
+    the report re-infer it from the ambiguous shape. See the companion
+    test `test_gsc_action_suppressed_for_cold_start_prospect` for the
+    cold-start branch."""
     from services.agent_center_bd_report_service import (
         VERDICT_INVISIBLE,
         _build_merchant_view,
@@ -234,12 +243,112 @@ def test_gsc_action_NOT_emitted_when_phase_0_incomplete():
         merchant_brand="TestBrand",
         merchant_host=None,
         integration_state=_state(store=False, psp=False, gsc=False),
+        is_cold_start=False,  # real merchant, just hasn't onboarded yet
     )
     actions = mv["actions"]
     # Phase 0 action should be at the top
     assert actions[0]["lever"] == "pivota_integration"
     # GSC action should NOT appear
     assert all(a.get("lever") != "gsc_integration" for a in actions)
+
+
+def test_gsc_action_suppressed_for_cold_start_prospect():
+    """Companion to `test_gsc_action_NOT_emitted_when_phase_0_incomplete`:
+    the SAME "store+psp both missing" integration_state, but this is a BD
+    cold-start prospect (`is_cold_start=True`, no real merchant behind
+    it). For cold-start targets the integration pitch belongs in
+    `pivota_value_prop` (the "How Pivota addresses these gaps" panel),
+    NOT as the #1 diagnostic action — the BD operator isn't onboarding
+    the prospect from this dashboard. So NEITHER a pivota_integration nor
+    a gsc_integration action should surface; the action ladder stays
+    purely diagnostic. This is what distinguishes the cold-start branch
+    from the real-merchant branch on identical integration_state shape."""
+    from services.agent_center_bd_report_service import (
+        VERDICT_INVISIBLE,
+        _build_merchant_view,
+    )
+    mv = _build_merchant_view(
+        verdict_label=VERDICT_INVISIBLE,
+        verdict_explanation="Diagnostic.",
+        visibility_score=5,
+        attribution_score=0,
+        category_visibility_score=None,
+        category_match_details=None,
+        industry_context={"category": "sleepwear", "blurb": "blurb"},
+        # A non-empty ladder + value-prop so the assertions below can't
+        # pass vacuously on an empty list: the diagnostic action must
+        # SURVIVE while the integration CTAs are suppressed, and the pitch
+        # must land in pivota_value_prop.
+        action_items=[
+            {"severity": "medium", "title": "Strategic action", "body": "x"},
+        ],
+        competitive_pressure={},
+        what_pivota_changes={"headline": "How Pivota helps"},
+        attribution_runs=[],
+        merchant_cited_runs=0,
+        competitor_hosts_list=[],
+        category_retailer_hosts=[],
+        category_competitor_brands=[],
+        visibility_query_rows=[],
+        attribution_query_rows=[],
+        url_source=None,
+        merchant_brand="TestBrand",
+        merchant_host=None,
+        integration_state=_state(store=False, psp=False, gsc=False),
+        is_cold_start=True,  # BD prospect — no onboarded merchant
+    )
+    actions = mv["actions"]
+    # The diagnostic ladder is non-empty — so the suppression assertions
+    # are meaningful, not vacuously true on an empty list.
+    assert any(a.get("title") == "Strategic action" for a in actions)
+    # ...but neither integration CTA surfaces for a cold-start prospect.
+    assert all(a.get("lever") != "pivota_integration" for a in actions)
+    assert all(a.get("lever") != "gsc_integration" for a in actions)
+    # The integration pitch is routed to the value-prop panel instead of
+    # the #1 action slot.
+    assert mv["pivota_value_prop"] == {"headline": "How Pivota helps"}
+
+
+def test_cold_start_discriminator_is_merchant_identity_not_shape():
+    """Locks the fix for the phase-0 gating bug: cold-start is decided by
+    merchant IDENTITY, not the integration_state shape. A real merchant
+    (non-prospect id) with a "store+psp both missing" shape must NOT be
+    read as cold-start; a synthetic `prospect_*` prospect with the same
+    shape must be. `_resolve_cold_start` prefers the explicit signal and
+    only falls back to the ambiguous shape when none is supplied."""
+    from services.agent_center_bd_report_service import (
+        _merchant_id_is_prospect,
+        _is_cold_start_audit,
+        _resolve_cold_start,
+    )
+
+    unintegrated = _state(store=False, psp=False, gsc=False)
+
+    # Identity discriminator.
+    assert _merchant_id_is_prospect("prospect_ab12cd34ef56") is True
+    assert _merchant_id_is_prospect(None) is True
+    assert _merchant_id_is_prospect("") is True
+    assert _merchant_id_is_prospect("   ") is True
+    assert _merchant_id_is_prospect("merch_924da2be8503e5f7") is False
+
+    # The shape heuristic false-positives on a real incomplete merchant.
+    assert _is_cold_start_audit(unintegrated) is True
+
+    # Explicit signal wins; shape is the fallback only.
+    assert _resolve_cold_start(False, unintegrated) is False   # real merchant
+    assert _resolve_cold_start(True, unintegrated) is True     # prospect
+    assert _resolve_cold_start(None, unintegrated) is True     # fallback=shape
+
+    # Combined derivation used by run_brand_report flips exactly the
+    # buggy case (real merchant + unintegrated shape) and nothing else.
+    def combined(mid, state):
+        return _merchant_id_is_prospect(mid) and _is_cold_start_audit(state)
+
+    fully = _state(store=True, psp=True, gsc=True)
+    assert combined("merch_real", unintegrated) is False       # FIXED case
+    assert combined("prospect_x", unintegrated) is True        # cold-start
+    assert combined(None, None) is False                       # competitor path
+    assert combined("merch_real", fully) is False              # onboarded
 
 
 def test_gsc_action_emitted_when_phase_0_done_but_gsc_missing():
