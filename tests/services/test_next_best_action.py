@@ -752,6 +752,32 @@ def test_readable_content_still_leads_with_substitution():
     assert nba["primary_gap"] == PRIMARY_SKU_SUBSTITUTION_LEAK
 
 
+def test_foundation_first_boundary_is_strict_less_than_40():
+    """The blocked-band boundary is exclusive: content_richness EXACTLY 40 is
+    readable enough → substitution still leads. And an UNMEASURED content score
+    (None) must not trigger foundation-first over a real demand signal."""
+    def _nba(content_score):
+        opportunity = _sku_base_opportunity()
+        opportunity["substitution_alert"] = {
+            "present": True, "prompt": "alts", "substituted_by": "K18",
+            "engines": ["gemini"],
+        }
+        scores = {
+            "identity": {"score": 50},
+            "content_richness": {"score": content_score},
+            "routability": {"score": 50},
+            "citation": {"score": 40},
+        }
+        return build_sku_next_best_action(
+            opportunity=opportunity, scores=scores, identity=_sku_identity(),
+            sku_title="X",
+        )
+
+    assert _nba(40)["primary_gap"] == PRIMARY_SKU_SUBSTITUTION_LEAK   # boundary
+    assert _nba(39)["primary_gap"] == PRIMARY_SKU_CONTENT_REVISION_GAP  # below
+    assert _nba(None)["primary_gap"] == PRIMARY_SKU_SUBSTITUTION_LEAK  # unmeasured
+
+
 def test_sku_secondary_moves_never_leak_internal_metric_names():
     """ANUKO 2026-07-02: a secondary move titled 'Fix citation.first_party_rate'
     exposed the internal dimension.bucket to the merchant. Secondary moves must

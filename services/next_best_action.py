@@ -750,7 +750,9 @@ def _sku_content_critically_thin(scores: Mapping[str, Any]) -> bool:
     a real demand signal on missing data."""
     content = _as_mapping(scores.get("content_richness"))
     score = content.get("score")
-    if score is None:
+    # None (unmeasured) or a non-numeric score is NOT "thin" — never override a
+    # real demand signal on missing/garbage data.
+    if not isinstance(score, (int, float)) or isinstance(score, bool):
         return False
     return _score(score) < _CONTENT_FOUNDATION_MAX
 

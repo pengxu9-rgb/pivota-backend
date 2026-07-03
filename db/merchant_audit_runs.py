@@ -982,7 +982,8 @@ async def persist_report_jsonb(
 ) -> bool:
     """Persist ONLY the report_jsonb column mid-run, without touching status,
     stage, or the aggregate score columns (those are set later by
-    record_audit_run_completed).
+    record_audit_run_completed). Also bumps stage_updated_at (observability
+    only — the reaper keys off claimed_until, not this field).
 
     Needed by the materializing stage: executor agents are enqueued there but
     the executor_run_worker re-fetches report_jsonb from this row at claim time
