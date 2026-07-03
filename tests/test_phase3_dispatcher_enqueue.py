@@ -113,6 +113,34 @@ async def test_enqueues_one_run_per_should_run_true_agent(monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_kill_switch_disables_all_dispatch(monkeypatch):
+    """R3: AUDIT_EXECUTOR_DISPATCH_ENABLED=false must enqueue NOTHING —
+    no agent evaluated, no Gemini spend, no merchant_tasks, at every call site."""
+    from config.settings import settings
+    monkeypatch.setattr(settings, "audit_executor_dispatch_enabled", False)
+
+    agents = [
+        _FakeAgent("agent_a", should_run_returns=True),
+        _FakeAgent("agent_b", should_run_returns=True),
+    ]
+    stub = _EnqueueStub()
+    _patch_dispatcher(monkeypatch, agents=agents, stub=stub)
+
+    from services.executor_agents.base import ExecutorContext
+    from services.executor_agents.dispatcher import dispatch_agents
+    ctx = ExecutorContext(
+        merchant_id="m-1", parent_audit_run_id="audit-1", audit_report={"k": "v"},
+    )
+    result = await dispatch_agents(ctx)
+
+    assert result["disabled"] is True
+    assert result["agents_evaluated"] == 0
+    assert result["dispatched_count"] == 0
+    assert stub.enqueued == []
+    assert not any(a.execute_called for a in agents)
+
+
+@pytest.mark.asyncio
 async def test_dispatcher_does_not_call_execute(monkeypatch):
     """The defining behavior of P3.3 — dispatcher MUST NOT run
     agents inline. The worker is responsible for execution."""

@@ -101,12 +101,6 @@ async def dispatch_agents(
         "runs": [{agent_name, run_id, enqueued | deduped}, ...],
       }
     """
-    from db.executor_runs import (
-        compute_executor_idempotency_key,
-        enqueue_executor_run,
-        find_in_flight_executor_run_by_idempotency,
-    )
-
     summary: Dict[str, Any] = {
         "context": {
             "merchant_id": context.merchant_id,
@@ -117,6 +111,28 @@ async def dispatch_agents(
         "dispatched_count": 0,
         "runs": [],
     }
+
+    # Master kill-switch: when off, no executor agent runs — no Gemini spend, no
+    # Google API calls, no merchant_tasks. One env lever over every dispatch
+    # call site (durable pipeline, legacy sync, BD cold-start).
+    try:
+        from config.settings import settings
+        if not getattr(settings, "audit_executor_dispatch_enabled", True):
+            summary["disabled"] = True
+            logger.info(
+                "executor_dispatcher: dispatch disabled "
+                "(AUDIT_EXECUTOR_DISPATCH_ENABLED=false) for merchant=%s parent=%s",
+                context.merchant_id, context.parent_audit_run_id,
+            )
+            return summary
+    except Exception:  # noqa: BLE001 — a settings hiccup must not block dispatch
+        pass
+
+    from db.executor_runs import (
+        compute_executor_idempotency_key,
+        enqueue_executor_run,
+        find_in_flight_executor_run_by_idempotency,
+    )
 
     for agent in _registry():
         summary["agents_evaluated"] += 1
