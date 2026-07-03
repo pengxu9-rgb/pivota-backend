@@ -469,11 +469,21 @@ async def count_runs_for_merchant_by_subject(
     merchant_id: str,
     subject_type: str,
 ) -> int:
-    """Count this merchant's audit runs of a given `subject_type` (any
-    status). Used by the free URL-audit wedge to enforce its per-merchant
-    free allowance (subject_type="merchant_url"). Returns 0 on DB error —
-    matches count_runs_in_window's availability-over-strictness trade-off
-    (the cost ceiling also depends on these rows being persisted at all).
+    """Count this merchant's DELIVERED-or-in-flight audit runs of a given
+    `subject_type`. Used by the free URL-audit wedge to enforce its
+    per-merchant free allowance (subject_type="merchant_url").
+
+    Failed runs are excluded — the billing invariant is "charged (or a free
+    credit consumed) iff a report was delivered", so a run that failed must
+    not burn the merchant's free allowance. Cancelled runs also carry
+    status='failed' (transition_stage maps every non-completed terminal to
+    the legacy 'failed' status) so they're excluded by the same filter.
+    Runs still 'running' DO count — otherwise N concurrent submissions all
+    pass the cap check before any completes.
+
+    Returns 0 on DB error — matches count_runs_in_window's
+    availability-over-strictness trade-off (the cost ceiling also depends
+    on these rows being persisted at all).
     """
     await ensure_merchant_audit_runs_table()
     try:
@@ -484,6 +494,7 @@ async def count_runs_for_merchant_by_subject(
             .where(
                 merchant_audit_runs.c.merchant_id == merchant_id,
                 merchant_audit_runs.c.subject_type == subject_type,
+                merchant_audit_runs.c.status != "failed",
             )
         )
         if row is None:
@@ -1289,10 +1300,12 @@ async def release_stale_leases(
 
 async def fail_abandoned_runs(
     *, ttl_seconds: int = ABANDONED_RUN_TTL_SECONDS,
-) -> int:
+) -> List[Dict[str, Any]]:
     """Terminal backstop reaper: force-fail any run still `status='running'`
-    past an absolute age when NO worker holds a live lease. Returns the count
-    failed.
+    past an absolute age when NO worker holds a live lease. Returns the reaped
+    rows (run_id, merchant_id, partial_result_jsonb) so the caller can refund
+    each run's launch debit — a reaped run delivered nothing, and the billing
+    invariant is "charged iff delivered".
 
     Distinct from release_stale_leases(): that one only NULLs an expired lease
     so a sibling worker re-claims and RE-RUNS the durable per-SKU pipeline —
@@ -1328,14 +1341,25 @@ async def fail_abandoned_runs(
          WHERE status = 'running'
            AND requested_at < :cutoff
            AND (claimed_until IS NULL OR claimed_until < :now)
+     RETURNING run_id, merchant_id, partial_result_jsonb
     """
     try:
-        result = await database.execute(query, {"now": now, "cutoff": cutoff})
-        if isinstance(result, int):
-            return result
-        return 0
+        rows = await database.fetch_all(query, {"now": now, "cutoff": cutoff})
+        out: List[Dict[str, Any]] = []
+        for row in rows or []:
+            data = dict(row)
+            # asyncpg returns JSONB as a JSON STRING — decode here so callers
+            # get launch options as a dict (see _decode_jsonb_field docstring).
+            decoded = _decode_jsonb_field(data.get("partial_result_jsonb"))
+            launch = decoded.get("launch") if isinstance(decoded, dict) else None
+            out.append({
+                "run_id": data.get("run_id"),
+                "merchant_id": data.get("merchant_id"),
+                "launch_options": launch if isinstance(launch, dict) else {},
+            })
+        return out
     except Exception as exc:
         logger.warning(
             "fail_abandoned_runs failed: %s", str(exc)[:200],
         )
-        return 0
+        return []
