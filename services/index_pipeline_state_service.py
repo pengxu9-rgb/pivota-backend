@@ -318,7 +318,7 @@ def _classify_product(
         and not domain_has_regression
     )
 
-    # --- Index eligibility (ADR-007 SLICE 1: OFFER-FREE citation floor) ---
+    # --- Index eligibility (ADR-008 SLICE 1: OFFER-FREE citation floor) ---
     # `index_eligible` is the parallel trust+quality+identity gate that drives
     # the citation READ surface. It is the FULL serving_eligible predicate set
     # MINUS has_price — a brand can be worth citing without us carrying a

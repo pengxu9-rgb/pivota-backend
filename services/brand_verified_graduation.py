@@ -1,4 +1,4 @@
-"""ADR-007 SLICE 2 — "verify-to-serve" graduation for store-less brands.
+"""ADR-008 SLICE 2 — "verify-to-serve" graduation for store-less brands.
 
 When a store-less brand domain-verifies its claim (services.brand_claim_service
 .verify_brand_claim), its brand-AUTHORED products should become citable

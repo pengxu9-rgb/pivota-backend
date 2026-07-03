@@ -36,7 +36,23 @@ from __future__ import annotations
 import logging
 from typing import Any, Dict, List, Optional
 
+from observability.citation_deposit_metrics import record_deposit_dropped
+
 logger = logging.getLogger(__name__)
+
+
+def _count_depositable_observations(sku: Dict[str, Any]) -> int:
+    """How many citation rows this SKU would have emitted — i.e. how many are
+    dropped when its identity is unresolved. Mirrors the emit filter below
+    (a row needs both a query and a provider)."""
+    n = 0
+    for host in (sku.get("authority_hosts") or []):
+        if not isinstance(host, dict):
+            continue
+        for obs in (host.get("query_observations") or []):
+            if isinstance(obs, dict) and obs.get("query") and obs.get("provider"):
+                n += 1
+    return n
 
 
 # Confidence values per evidence/finding type. Pinned constants make
@@ -216,6 +232,8 @@ def extract_citation_observations(
     if not isinstance(authority, dict):
         return out
 
+    dropped_skus = 0
+    dropped_observations = 0
     for sku in (authority.get("skus") or []):
         if not isinstance(sku, dict):
             continue
@@ -225,6 +243,16 @@ def extract_citation_observations(
         if content_key_map is not None:
             resolved = content_key_map.get(product_key) if product_key else None
             if resolved is None or not getattr(resolved, "is_depositable", False):
+                # Silent-fragmentation signal (ADR-008 #2): an unresolved /
+                # missing identity drops this SKU's citations from deposit. Count
+                # it so the drop is observable instead of invisible.
+                n = _count_depositable_observations(sku)
+                record_deposit_dropped(
+                    basis=getattr(resolved, "basis", None) or "missing",
+                    observations=n,
+                )
+                dropped_skus += 1
+                dropped_observations += n
                 continue
             content_key = resolved.content_key
             basis = resolved.basis
@@ -258,6 +286,12 @@ def extract_citation_observations(
                     "is_competitor": host.get("is_competitor"),
                     "evidence_url": evidence_url,
                 })
+    if dropped_skus:
+        logger.info(
+            "citation_deposit.dropped skus=%d observations=%d "
+            "(unresolved identity -> citations not deposited; brand-fragmentation signal)",
+            dropped_skus, dropped_observations,
+        )
     return out
 
 

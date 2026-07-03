@@ -391,7 +391,7 @@ def test_list_canonical_pdps_uses_index_pipeline_state_join(env):
 
 
 # ---------------------------------------------------------------------------
-# ADR-007 SLICE 1: by-signature READ vs sitemap LISTING flag separation
+# ADR-008 SLICE 1: by-signature READ vs sitemap LISTING flag separation
 # ---------------------------------------------------------------------------
 
 

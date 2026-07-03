@@ -435,14 +435,14 @@ async def approve_manual_claim(
     from services.claim_state import promote_merchant_skus_to_claimed
 
     await promote_merchant_skus_to_claimed(claim["merchant_id"])
-    # ADR-007 SLICE 2 — verify-to-serve: graduate this brand's brand-authored
+    # ADR-008 SLICE 2 — verify-to-serve: graduate this brand's brand-authored
     # products to the offer-free citation floor. Flag-gated + best-effort.
     await _graduate_storeless_brand_catalog(claim["merchant_id"])
     return {"status": "verified", "brand_direct_set": ok, "approved_by": approved_by}
 
 
 async def _graduate_storeless_brand_catalog(merchant_id: str) -> None:
-    """ADR-007 SLICE 2 — verify-to-serve. After a brand claim verifies, graduate
+    """ADR-008 SLICE 2 — verify-to-serve. After a brand claim verifies, graduate
     the merchant's brand-authored products to the OFFER-FREE citation floor
     (index_eligible, NEUTRAL=merchant_owned, isolated, no offer minted).
 
@@ -541,7 +541,7 @@ async def verify_brand_claim(
     from services.claim_state import promote_merchant_skus_to_claimed
 
     await promote_merchant_skus_to_claimed(claim["merchant_id"])
-    # ADR-007 SLICE 2 — verify-to-serve: graduate this brand's brand-authored
+    # ADR-008 SLICE 2 — verify-to-serve: graduate this brand's brand-authored
     # products to the offer-free citation floor (index_eligible, NEUTRAL, no
     # offer). Flag-gated (ENABLE_STORELESS_BRAND_CATALOG) + best-effort.
     await _graduate_storeless_brand_catalog(claim["merchant_id"])

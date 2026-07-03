@@ -1,4 +1,4 @@
-"""ADR-007 SLICE 2 — verify-to-serve wiring into verify_brand_claim (pure).
+"""ADR-008 SLICE 2 — verify-to-serve wiring into verify_brand_claim (pure).
 
 Proves the flag-gated, best-effort hook fires (or doesn't) at the right place:
   * flag ON  -> verify_brand_claim graduates the merchant's brand-authored catalog,
