@@ -1,0 +1,45 @@
+{
+  "_incident": "DamDam Shiso shampoo URL audit, Jul 3 2026 8:59 PM — the category-winner panel rendered a raw markdown-fenced JSON probe envelope instead of prose. Leak site: competitor_intel.known_for (and .evidence[].verbatim), populated from _competitor_attribute_run_text falling through to run[raw] when the upstream JSON parse failed on an unterminated json code fence.",
+  "audited_url": "https://damdamtokyo.com",
+  "audited_products": [
+    {
+      "title": "DAMDAM CLASSIC SHAMPOO - Shiso",
+      "pdp_url": "https://damdamtokyo.com/en/products/classic-shampoo-shiso",
+      "vendor": "DAMDAM"
+    }
+  ],
+  "brand_report": {
+    "merchant_name": "DAMDAM",
+    "merchant_domain": "damdamtokyo.com",
+    "per_product": [
+      {
+        "title": "DAMDAM CLASSIC SHAMPOO - Shiso",
+        "pdp_url": "https://damdamtokyo.com/en/products/classic-shampoo-shiso",
+        "sku_intelligence": {
+          "next_best_action": {
+            "headline": "Fill the gaps on DAMDAM CLASSIC SHAMPOO - Shiso's page before chasing reach.",
+            "competitor_intel": {
+              "status": "assessed",
+              "competitor": "Rahua",
+              "attributes_present": ["vegan", "organic", "cruelty_free"],
+              "known_for": "```json { \"product_visible\": true, \"competitors_listed\": [], \"evidence_excerpt\": \"Rahua is known for its plant-powered hair care, body care, and wellness products, emphasizing clean formulas and salon-quality results. The brand is certified vegan and cruelty-free, and its product",
+              "evidence": [
+                {
+                  "attribute": "vegan",
+                  "provider": "gemini",
+                  "verbatim": "The brand is certified vegan and cruelty-free, and its products are free from parabens, sulfates, gluten, phthalates, and synthetic fragrances."
+                }
+              ],
+              "brief_debug": {
+                "outcome": "llm",
+                "grounding_failures": [
+                  "raw model output legitimately lives here: ```json {\"anything\": true}"
+                ]
+              }
+            }
+          }
+        }
+      }
+    ]
+  }
+}

@@ -42,6 +42,10 @@ SEVERITY_WARN = "warn"
 SURFACE_BRAND = "brand_report"
 SURFACE_SKU = "sku_intelligence"
 SURFACE_BRIEF = "strategic_brief"
+# Rendered-copy violations are ALARM-ONLY: they log at ERROR (alertable) but
+# never degrade a surface — detection belongs here, prevention belongs to the
+# generation layer (shared LLM envelope parsing / schema-constrained output).
+SURFACE_RENDERED = "rendered_copy"
 
 
 # ---------------------------------------------------------------------------
@@ -373,6 +377,79 @@ def _inv_strong_but_unowned(payload, identity) -> List[Violation]:
     return out
 
 
+# ---------------------------------------------------------------------------
+# Rendered-copy invariant (W7.1) — no machine text in merchant-facing strings
+# ---------------------------------------------------------------------------
+# Keys whose SUBTREES legitimately hold raw model/upstream output (probe runs,
+# debug traces, the merchant's own typed input). Everything else in the payload
+# is merchant-renderable and must never contain a markdown code fence, an
+# upstream error marker, or a raw structured-probe envelope. This is the
+# class-wide net for the 2026-07-03 "category winner rendered ```json {...}"
+# leak — that string lived in competitor_intel.known_for, a rendered field.
+_MACHINE_ONLY_KEYS = frozenset({
+    "raw", "raw_runs", "raw_output", "parsed",
+    "brief_debug", "grounding_failures",
+    "grounding_chunks", "grounding_sources",
+    "error", "error_jsonb", "traceback_truncated",
+    "probe_runs", "per_sku_probe_runs",
+    "partial_result_jsonb", "cost_summary_jsonb",
+    # The merchant's own typed input, echoed back — not our copy.
+    "custom_prompts",
+})
+
+# (marker substring, violation code). Envelope-key fragments catch a raw JSON
+# probe response leaking into prose even when its code fence was stripped.
+_MACHINE_TEXT_MARKERS: Tuple[Tuple[str, str], ...] = (
+    ("```", "MARKDOWN_FENCE_IN_COPY"),
+    ("__error__", "UPSTREAM_ERROR_MARKER_IN_COPY"),
+    ('"product_visible"', "RAW_LLM_ENVELOPE_IN_COPY"),
+    ('"evidence_excerpt"', "RAW_LLM_ENVELOPE_IN_COPY"),
+    ('"competitors_listed"', "RAW_LLM_ENVELOPE_IN_COPY"),
+    ('"grounding_sources"', "RAW_LLM_ENVELOPE_IN_COPY"),
+)
+
+_RENDERED_COPY_MAX_VIOLATIONS = 10
+_RENDERED_COPY_MAX_DEPTH = 40
+
+
+def _inv_no_machine_text_in_copy(payload, identity) -> List[Violation]:
+    """W7.1 — walk every merchant-renderable string in the payload and flag
+    machine text (markdown fences, upstream `__error__` markers, raw probe
+    envelopes). Subtrees under _MACHINE_ONLY_KEYS are skipped: raw runs and
+    debug fields legitimately hold that content. Capped so a systemic leak
+    reports a sample, not thousands of violations."""
+    out: List[Violation] = []
+
+    def walk(node: Any, path: str, depth: int) -> None:
+        if len(out) >= _RENDERED_COPY_MAX_VIOLATIONS or depth > _RENDERED_COPY_MAX_DEPTH:
+            return
+        if isinstance(node, Mapping):
+            for key, value in node.items():
+                if str(key) in _MACHINE_ONLY_KEYS:
+                    continue
+                walk(value, f"{path}.{key}" if path else str(key), depth + 1)
+        elif isinstance(node, (list, tuple)):
+            for i, value in enumerate(node):
+                walk(value, f"{path}[{i}]", depth + 1)
+        elif isinstance(node, str):
+            for marker, code in _MACHINE_TEXT_MARKERS:
+                if marker in node:
+                    out.append(Violation(
+                        code=code,
+                        severity=SEVERITY_CRITICAL,
+                        surface=SURFACE_RENDERED,
+                        message=(
+                            f"machine text {marker!r} found in a merchant-"
+                            f"facing string at {path}"
+                        ),
+                        evidence={"path": path, "snippet": node[:160]},
+                    ))
+                    break  # one violation per string is enough
+
+    walk(payload, "", 0)
+    return out
+
+
 _INVARIANTS = (
     _inv_own_host_as_controller,
     _inv_strategic_brief_channels,
@@ -380,6 +457,7 @@ _INVARIANTS = (
     _inv_count_overflow,
     _inv_self_substitution,
     _inv_strong_but_unowned,
+    _inv_no_machine_text_in_copy,
 )
 
 
