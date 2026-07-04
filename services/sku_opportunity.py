@@ -290,17 +290,20 @@ def _score_prompt_group(
         merchant_brand=str(merchant_brand or ""),
         merchant_vendors=merchant_identities,
     )
-    # W1 T3 secondary site (per-prompt-group opportunity scorer). extract_cited_hosts
-    # scalar reads here feed the group's density/opportunity math and are not yet on
-    # RunFacts. Instrumented log-only so the next multi-merchant run yields their
-    # drift before we decide the flip; one check per prompt group.
+    # W1 T3 secondary CUTOVER (per-prompt-group opportunity scorer): the group's
+    # citedness counts now derive from the RunFacts fold — same source as the verdict
+    # path (slice 1) and sku_opportunity's own site-9 rollup. Parity-proven == the
+    # legacy extract_cited_hosts scalars (Anuko 2026-07-04: 0 drift / 14 prompt
+    # groups; test_parity_with_legacy_implementations is the hard net). The
+    # parity_check calls stay as runtime tripwires; extract_cited_hosts still supplies
+    # `cited_counter` (the competitor rollup).
+    _grp_facts = compute_run_facts(
+        runs,
+        merchant_host=merchant_host,
+        merchant_brand=str(merchant_brand or ""),
+        merchant_vendors=merchant_identities,
+    )
     try:
-        _grp_facts = compute_run_facts(
-            runs,
-            merchant_host=merchant_host,
-            merchant_brand=str(merchant_brand or ""),
-            merchant_vendors=merchant_identities,
-        )
         parity_check(
             "sku_opportunity.prompt_group.merchant_cited_runs",
             merchant_cited_runs,
@@ -315,6 +318,8 @@ def _score_prompt_group(
         )
     except Exception:  # noqa: BLE001 — parity must never sink scoring
         pass
+    merchant_cited_runs = _grp_facts.brand_mentioned_runs
+    runs_with_citations = _grp_facts.runs_with_citations
     source_route = _source_route(source_roles, sku_ctx)
     competitors, competitor_counts = _competitors_for_runs(
         runs,
