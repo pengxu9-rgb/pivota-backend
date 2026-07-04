@@ -24,6 +24,7 @@ from services.agent_center_bd_report_service import (
     extract_cited_hosts,
     normalize_host,
 )
+from services.audit_facts import compute_run_facts, parity_measure
 from services.brand_alias import derive_brand_aliases, text_mentions_brand
 from services.buyer_path_stable_controllers import stable_buyer_path_controllers
 from services.cited_host_classifier import classify_host
@@ -119,6 +120,42 @@ def build_sku_opportunity(
         product=product,
         sku_ctx=sku_ctx,
         attribute_graph=graph,
+    )
+
+    # W1 site 9 (measure): per-prompt verdicts credit the merchant on ANSWER-
+    # TEXT mentions (merchant_mention -> win/partial); the decision-sheet
+    # target is T3 from the same source-walk as every other surface. One line
+    # per SKU quantifying the gap, computed with THIS module's exact identity
+    # inputs so the measure isolates the matcher, not identity.
+    parity_measure(
+        "sku_opportunity.per_prompt_verdicts.mention_prompts",
+        sum(
+            1
+            for row in per_prompt
+            if any(
+                v in _OWNED_PROVIDER_VERDICTS
+                for v in (row.get("provider_verdicts") or {}).values()
+            )
+        ),
+        sum(
+            1
+            for p in compute_run_facts(
+                runs,
+                merchant_host=_merchant_host(sku_ctx, product),
+                merchant_brand=str(
+                    product.get("brand")
+                    or product.get("vendor")
+                    or sku_ctx.get("merchant_brand")
+                    or ""
+                ),
+                merchant_vendors=_merchant_identity_values(sku_ctx, product),
+            ).prompts
+            if p.brand_mentioned
+        ),
+        context={
+            "sku_key": sku_ctx.get("sku_key") or product.get("sku_key"),
+            "prompt_groups": len(per_prompt),
+        },
     )
 
     return {
