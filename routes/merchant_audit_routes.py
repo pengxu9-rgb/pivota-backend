@@ -1747,7 +1747,7 @@ async def _run_wedge_audit_background(
     # (ENABLE_AUDIT_INDEX_INTAKE); observed/unclaimed seeds, un-served until they
     # graduate or are claimed. Seeded before the report so a probe failure below
     # still leaves the index populated.
-    if audit_intake_enabled():
+    if audit_intake_enabled(merchant_id):
         try:
             for _seed_product in audit_products:
                 await upsert_audited_sku_to_index(merchant_id, _seed_product)

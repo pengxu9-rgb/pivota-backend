@@ -32,6 +32,14 @@ for all merchants). Redeploy/restart so the worker + API pick up the env.
 > The seed write and the report's pipe key both read this with the same
 > `merchant_id`, so they agree — a non-allowlisted merchant sees no change.
 
+The **ADR-008 brand-fragmentation guard follows intake**: it is automatically
+active for any merchant intake is enabled for (no separate flag) — a same-brand +
+host canonical under another merchant routes the seed to identity review instead
+of minting a fragmenting orphan (fail-open: guard errors never block seeding).
+`DISABLE_AUDIT_BRAND_FRAGMENTATION_GUARD=true` is an explicit opt-out escape hatch
+only, if the guard ever needs to be forced off for a canary; leave it unset in
+normal operation.
+
 ## 2. Run a URL audit as the canary
 
 Via the portal (paste a product URL and run), or the API:

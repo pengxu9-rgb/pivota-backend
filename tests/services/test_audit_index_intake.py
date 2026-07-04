@@ -153,3 +153,137 @@ def test_upsert_skips_unmappable_product(monkeypatch):
         intake.upsert_audited_sku_to_index("m1", {"pdp_url": "https://x.com/p"})
     )
     assert out is None  # no title -> no mapping -> no DB write
+
+
+# --- W5.1: per-merchant CSV canary on the legacy wedge path ------------------
+
+def test_wedge_path_honors_per_merchant_csv_canary(monkeypatch):
+    """The wedge audit's seed loop is gated by audit_intake_enabled(merchant_id),
+    so the per-merchant CSV canary applies: a merchant in the allowlist seeds; one
+    not in it does not. (Previously the wedge path called it WITHOUT merchant_id,
+    so the CSV canary never took effect there.)"""
+    import asyncio
+
+    import routes.merchant_audit_routes as mar
+
+    monkeypatch.delenv("ENABLE_AUDIT_INDEX_INTAKE", raising=False)
+    monkeypatch.setenv("ENABLE_AUDIT_INDEX_INTAKE_MERCHANT_IDS", "m_canary")
+
+    seeded = []
+
+    async def _spy_upsert(merchant_id, product):
+        seeded.append((merchant_id, product))
+        return "ck_x"
+
+    async def _stop_after_seed(**kwargs):
+        # Fires immediately after the seed loop — abort the (heavy) report path so
+        # the test exercises only the intake gate. Recorded 'failed', then returns.
+        raise RuntimeError("stop after seed loop")
+
+    async def _noop_completed(**kwargs):
+        return None
+
+    monkeypatch.setattr(mar, "upsert_audited_sku_to_index", _spy_upsert)
+    monkeypatch.setattr(mar, "recent_runs_for_merchant", _stop_after_seed)
+    monkeypatch.setattr(mar, "record_audit_run_completed", _noop_completed)
+
+    products = [_shopify_audit_product()]
+
+    async def _run(mid):
+        seeded.clear()
+        await mar._run_wedge_audit_background(
+            run_id="run_1",
+            merchant_id=mid,
+            merchant_name="Anua",
+            merchant_domain="anua.com",
+            audit_products=products,
+            base_payload={},
+        )
+
+    asyncio.run(_run("m_canary"))       # allowlisted -> seed loop runs
+    assert seeded == [("m_canary", products[0])]
+
+    asyncio.run(_run("m_other"))        # not allowlisted -> seed loop skipped
+    assert seeded == []
+
+
+# --- W5.1: ADR-008 brand-fragmentation guard follows intake ------------------
+
+_GUARD_CONFLICT_ROW = {
+    "product_key": "prod::external_seed::external_seed::anua_1",
+    "merchant_id": "external_seed",
+    "content_key": "ck_existing_canonical",
+    "pivota_signature_id": "sig_abc",
+}
+
+
+def _wire_guard_seams(monkeypatch, *, fetch_one):
+    """Stub the DB + pdp-refresh + review-enqueue seams so upsert runs in-memory."""
+    import db.database
+    import services.agent_pdp_view_assembler as asm
+    import services.audit_index_intake as intake
+
+    calls = {"catalog_execute": 0, "enqueued": []}
+
+    async def _fake_fetch_one(query, values=None):
+        return fetch_one(query, values)
+
+    async def _fake_execute(stmt):
+        calls["catalog_execute"] += 1
+
+    async def _fake_refresh(ck, *, refresh_source, db=None):
+        return True
+
+    async def _fake_enqueue(fields, match):
+        calls["enqueued"].append(match)
+        return "pdptask_x"
+
+    monkeypatch.setattr(db.database.database, "fetch_one", _fake_fetch_one)
+    monkeypatch.setattr(db.database.database, "execute", _fake_execute)
+    monkeypatch.setattr(asm, "refresh_agent_pdp_view_for_content_key", _fake_refresh)
+    monkeypatch.setattr(intake, "enqueue_audit_identity_review", _fake_enqueue)
+    return calls
+
+
+def test_brand_guard_active_when_intake_enabled_no_guard_env(monkeypatch):
+    """The guard follows intake: enabled for the merchant + no opt-out env => the
+    guard runs and skips a brand-fragmenting orphan mint (routes it to review)."""
+    import asyncio
+
+    import services.audit_index_intake as intake
+
+    monkeypatch.setenv("ENABLE_AUDIT_INDEX_INTAKE", "1")          # intake on
+    monkeypatch.delenv("DISABLE_AUDIT_BRAND_FRAGMENTATION_GUARD", raising=False)
+    monkeypatch.delenv("ENABLE_AUDIT_ER_GATE", raising=False)
+
+    assert intake.audit_brand_fragmentation_guard_enabled("m_wedge_demo") is True
+
+    calls = _wire_guard_seams(monkeypatch, fetch_one=lambda q, v: dict(_GUARD_CONFLICT_ROW))
+    out = asyncio.run(intake.upsert_audited_sku_to_index("m_wedge_demo", _shopify_audit_product()))
+
+    assert out is None                       # orphan mint suppressed by the guard
+    assert calls["catalog_execute"] == 0     # no catalog upsert
+    assert len(calls["enqueued"]) == 1       # routed to identity review
+    assert calls["enqueued"][0]["matcher"] == "brand_host_fragmentation"
+
+
+def test_brand_guard_opt_out_env_disables_it(monkeypatch):
+    """DISABLE_AUDIT_BRAND_FRAGMENTATION_GUARD is the explicit opt-out escape
+    hatch: with it set, the guard does not run even though intake is enabled and a
+    same-brand conflict exists — the seed is minted."""
+    import asyncio
+
+    import services.audit_index_intake as intake
+
+    monkeypatch.setenv("ENABLE_AUDIT_INDEX_INTAKE", "1")             # intake on
+    monkeypatch.setenv("DISABLE_AUDIT_BRAND_FRAGMENTATION_GUARD", "1")  # opt out
+    monkeypatch.delenv("ENABLE_AUDIT_ER_GATE", raising=False)
+
+    assert intake.audit_brand_fragmentation_guard_enabled("m_wedge_demo") is False
+
+    calls = _wire_guard_seams(monkeypatch, fetch_one=lambda q, v: dict(_GUARD_CONFLICT_ROW))
+    out = asyncio.run(intake.upsert_audited_sku_to_index("m_wedge_demo", _shopify_audit_product()))
+
+    assert out                               # minted despite the conflict
+    assert calls["catalog_execute"] == 1     # catalog upsert happened
+    assert calls["enqueued"] == []           # nothing routed to review
