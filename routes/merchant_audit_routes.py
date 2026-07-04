@@ -1920,6 +1920,30 @@ async def get_merchant_audit_history(
     }
 
 
+@router.get("/tracking")
+async def get_merchant_visibility_tracking(
+    limit: int = 50,
+    merchant_id: str = Depends(get_current_merchant),
+) -> Dict[str, Any]:
+    """Visibility-over-time series for this merchant (the W2 payoff / retention
+    chart). Brand-level visibility / attribution / category scores across the
+    merchant's completed audits, plus per-provider lines — each point tagged with
+    its measurement basis so the chart connects ONLY comparable (same pinned prompt
+    set) points and breaks where the basis changed. Empty/baseline until there are
+    >=2 same-basis runs to trend."""
+    if limit <= 0 or limit > 50:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail="limit must be between 1 and 50",
+        )
+    from db.merchant_audit_runs import score_history_for_merchant
+    from services.audit_tracking_series import build_tracking_series
+
+    rows = await score_history_for_merchant(merchant_id=merchant_id, limit=limit)
+    series = build_tracking_series(rows)
+    return {"merchant_id": merchant_id, **series}
+
+
 @router.get("/outcomes")
 async def get_merchant_outcomes_endpoint(
     window: str = "all_time",
