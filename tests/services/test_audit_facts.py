@@ -263,3 +263,36 @@ def test_w7_invariant_flags_mutated_rollup_and_overflow():
         v for v in report.violations
         if v.code.startswith("RUNFACTS_") and v.severity != "warn"
     ]
+
+
+# ---- W1 cutover: observable parity (drift snapshot) --------------------------
+
+def test_parity_snapshot_tracks_checks_and_drifts():
+    import services.audit_facts as af
+    # isolate: snapshot the baseline for our unique sites
+    af.parity_check("test.site.agree", 7, 7)
+    af.parity_check("test.site.agree", 7, 7)
+    af.parity_check("test.site.drift", 7, 6)
+    af.parity_measure("test.site.measure", ["a"], ["a", "b"])
+
+    snap = af.parity_stats_snapshot()
+    assert snap["test.site.agree"] == {
+        "checks": 2, "drifts": 0, "drift_rate": 0.0, "last_drift": None,
+    }
+    drift = snap["test.site.drift"]
+    assert drift["checks"] == 1 and drift["drifts"] == 1 and drift["drift_rate"] == 1.0
+    assert drift["last_drift"] == {"legacy": "7", "run_facts": "6"}
+    # parity_measure feeds the same rollup (a measure disagreement counts as drift)
+    assert snap["test.site.measure"]["drifts"] == 1
+
+
+def test_parity_recording_never_raises_on_bad_input():
+    import services.audit_facts as af
+
+    class _Unhashable:
+        def __eq__(self, other):
+            raise RuntimeError("boom")
+
+    # parity_check swallows the comparison error; snapshot stays usable
+    assert af.parity_check("test.site.bad", _Unhashable(), 1) is False
+    assert isinstance(af.parity_stats_snapshot(), dict)
