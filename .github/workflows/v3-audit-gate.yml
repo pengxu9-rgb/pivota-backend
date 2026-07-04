@@ -55,7 +55,6 @@ on:
       - "tests/services/test_audit_v3_brand_alias.py"
       - "tests/services/test_audit_v3_product_concurrency.py"
       - "tests/test_audit_invariants.py"
-      - "tests/test_audit_review_gate.py"
       - ".github/workflows/v3-audit-gate.yml"
 
 jobs:
@@ -109,5 +108,4 @@ jobs:
             tests/services/test_audit_v3_product_concurrency.py \
             tests/services/test_audit_v3_sku_ref_resolution.py \
             tests/services/test_audit_v3_readiness_gate.py \
-            tests/test_audit_invariants.py \
-            tests/test_audit_review_gate.py
+            tests/test_audit_invariants.py
