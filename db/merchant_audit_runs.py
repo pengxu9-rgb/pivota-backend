@@ -544,6 +544,39 @@ async def score_history_for_merchant(
     return out
 
 
+async def completed_runs_in_window(*, window_seconds: int) -> List[Dict[str, Any]]:
+    """Completed runs (merchant_id, run_id, requested_at, report_jsonb) in the
+    trailing window, grouped by merchant + newest-first — for the W7 stability
+    canary's auto-detect (find any merchant with a same-basis pair inside a tight
+    time window). Naturally bounded by the window; best-effort, [] on DB error."""
+    await ensure_merchant_audit_runs_table()
+    try:
+        cutoff = datetime.fromtimestamp(
+            _now_utc().timestamp() - window_seconds, tz=timezone.utc,
+        )
+        rows = await database.fetch_all(
+            "SELECT merchant_id, run_id, requested_at, report_jsonb "
+            "FROM merchant_audit_runs "
+            "WHERE status = 'completed' AND report_jsonb IS NOT NULL "
+            "AND requested_at >= :cutoff "
+            "ORDER BY merchant_id, requested_at DESC",
+            {"cutoff": cutoff},
+        )
+    except Exception as exc:
+        logger.warning("completed_runs_in_window failed: %s", str(exc)[:200])
+        return []
+    out: List[Dict[str, Any]] = []
+    for r in rows or []:
+        d = dict(r)
+        out.append({
+            "merchant_id": str(d.get("merchant_id")) if d.get("merchant_id") else None,
+            "run_id": str(d.get("run_id")) if d.get("run_id") else None,
+            "requested_at": d.get("requested_at"),
+            "report_jsonb": _decode_jsonb_field(d.get("report_jsonb")),
+        })
+    return out
+
+
 async def recent_completed_reports_for_merchant(
     *, merchant_id: str, limit: int = 2
 ) -> List[Dict[str, Any]]:

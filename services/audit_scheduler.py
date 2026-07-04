@@ -191,16 +191,15 @@ async def start_scheduler() -> None:
             coalesce=True,
         )
 
-        # W7 stability canary: assert same-basis re-runs of the house-account hero
-        # SKUs land within tolerance (validates W2). No-op until
-        # AUDIT_STABILITY_CANARY_MERCHANTS is set. Twice-weekly (Mon/Thu 06:00 UTC).
+        # W7 stability canary: auto-detect same-basis re-runs (any merchant) inside a
+        # tight window and assert they land within tolerance — validates W2 / catches
+        # measurement-system noise. Every 12h so a 48h-window pair is reliably caught
+        # (create_alert dedups a persistent breach).
         from services.audit_stability_canary import run_stability_canary
         _add_job(
             run_stability_canary,
-            "cron",
-            day_of_week="mon,thu",
-            hour=6,
-            minute=0,
+            "interval",
+            hours=12,
             id="audit_stability_canary",
             replace_existing=True,
             misfire_grace_time=3600,
