@@ -23,7 +23,24 @@ def _host_row(host, role="editorial_review", *, cites_sku=True, near=False):
 
 
 def _report(host_rows):
-    return {"authority_map": {"hosts": host_rows}}
+    # Post W1 site-8: the oracle reads host_attribution_summary.endorsement_hosts
+    # (the RunFacts T2 set — endorsement-role host that NAMES the merchant), not a
+    # per-host SKU gate. Derive that set here from the rows the same way the real
+    # authority map does: endorsement role AND names the merchant.
+    from services.cited_host_classifier import is_endorsement_role
+
+    endorsement_hosts = [
+        r["host"]
+        for r in host_rows
+        if is_endorsement_role(r.get("citation_role"))
+        and (r.get("cites_exact_sku") or r.get("cites_near_variant"))
+    ]
+    return {
+        "authority_map": {
+            "hosts": host_rows,
+            "host_attribution_summary": {"endorsement_hosts": endorsement_hosts},
+        }
+    }
 
 
 def _outreach_task(task_id, host, *, lever="outreach_pitch"):
@@ -150,31 +167,35 @@ async def test_best_effort_swallows_errors(monkeypatch):
 
 @pytest.mark.asyncio
 async def test_reverify_against_REAL_authority_map_flips(monkeypatch):
-    """Integration regression for the loop-breaking bug the holistic review caught:
-    run reverify against a REAL build_authority_map output (the matrix-row shape
-    production actually feeds), not a hand-built row. Before the fix, matrix rows
-    (authority_map["hosts"]) lacked cites_exact_sku, so the oracle's set was always
-    empty and NO pitch ever flipped — yet the unit tests passed because they stubbed
-    the per-SKU row shape. This asserts both the structural fix and the flip."""
+    """Integration regression: run reverify against a REAL build_authority_map
+    output (the shape production feeds), not a hand-built row. Post W1 site-8 the
+    oracle reads host_attribution_summary.endorsement_hosts (RunFacts T2), so the
+    editorial must NAME the brand in its grounding — the honest endorsement shape."""
     from services.agent_center_bd_report_service import build_authority_map
 
-    # An editorial (endorsement-role) host that cited the merchant's exact SKU
-    # (parsed.correct_sku=True drives `exact`).
+    # An editorial (endorsement-role) host whose grounding NAMES the brand on a
+    # category query — a genuine RunFacts T2 endorsement.
     run = {
         "query": "best collagen for sleep",
+        "axis_metadata": {"axis": "category"},
         "parsed": {"product_visible": True, "correct_sku": True},
         "grounding_sources": [
-            {"uri": "https://www.goodhousekeeping.com/best-collagen", "title": "goodhousekeeping.com"}
+            {
+                "uri": "https://www.goodhousekeeping.com/reviews/aruen-collagen",
+                "title": "Aruen Collagen Review | goodhousekeeping.com",
+            }
         ],
         "url_match": {"in_grounding": False},
     }
     probe_runs = [{"provider": "gemini", "probe_run_id": "p1", "raw_runs": [run]}]
     authority_map = build_authority_map(
-        [{"sku_key": "sku-1", "product_key": "prod-1"}], {"sku-1": probe_runs}
+        [{"sku_key": "sku-1", "product_key": "prod-1"}], {"sku-1": probe_runs},
+        merchant_host="aruen.com", merchant_brand="Aruen",
     )
-    matrix = {h["host"]: h for h in authority_map["hosts"]}
-    # Structural guard (this assertion FAILS without the fix):
-    assert matrix["goodhousekeeping.com"]["cites_exact_sku"] is True
+    # The endorsement set the oracle now reads is populated from RunFacts T2.
+    assert "goodhousekeeping.com" in (
+        authority_map["host_attribution_summary"]["endorsement_hosts"]
+    )
 
     updates = []
 
