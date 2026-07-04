@@ -8917,7 +8917,25 @@ async def _probe_per_sku_ctx(
     safe_ctx = sku_ctx if isinstance(sku_ctx, dict) else {}
     sku_key = str(safe_ctx.get("sku_key") or "").strip() or "sku"
     target_prompts = max(1, int(prompts_per_sku or 0))
-    query_records = _build_per_sku_audit_query_records(safe_ctx, target_prompts)
+    # W2.1: when a prior run pinned the FULL selected set, reprobe EXACTLY those
+    # queries — no spec rebuild, so the whole measurement basis (not just the
+    # LLM lists W2 pins) is identical run-to-run. Confined to the probe path so
+    # report-time metadata seams keep building fresh (they only render).
+    pinned_specs = safe_ctx.get("_pinned_selected_specs")
+    if isinstance(pinned_specs, list) and pinned_specs:
+        query_records = [
+            dict(r) for r in pinned_specs
+            if isinstance(r, dict) and str(r.get("query") or "").strip()
+        ]
+        logger.info(
+            "prompt-basis: reprobing %d pinned selected specs for sku=%s",
+            len(query_records), sku_key,
+        )
+    else:
+        query_records = _build_per_sku_audit_query_records(safe_ctx, target_prompts)
+    # Record the auto set actually probed (pre-custom) so the fan-out can
+    # persist it as the pinned basis for the next run.
+    safe_ctx["_selected_specs_out"] = [dict(r) for r in query_records]
     # Append merchant-input prompt slots so they're actually probed (deduped
     # against the auto set). axis="custom" keeps them identifiable downstream.
     if custom_prompts:
@@ -10875,6 +10893,9 @@ async def run_per_sku_audit_probe_fanout(
                 )
                 sku_ctx["_winnable_prompts"] = _basis["winnable"]
                 sku_ctx["_scenario_elicited"] = _basis["scenario"]
+                # W2.1: when the prior run stored the full probed set, hand it
+                # to _probe_per_sku_ctx to reprobe verbatim (no spec rebuild).
+                sku_ctx["_pinned_selected_specs"] = _basis.get("selected_specs") or []
                 # Stamped on the per-SKU report (build_per_sku_report) so the
                 # NEXT run can reload it and the delta can assert basis identity.
                 sku_ctx["_prompt_basis_meta"] = _basis["meta"]
@@ -10898,11 +10919,19 @@ async def run_per_sku_audit_probe_fanout(
         if isinstance(sku_ctx, dict) and isinstance(
             sku_ctx.get("_prompt_basis_meta"), dict
         ):
-            from services.prompt_basis import attach_basis_meta_to_probe_runs
-
-            attach_basis_meta_to_probe_runs(
-                out[sku_key], sku_ctx["_prompt_basis_meta"],
+            from services.prompt_basis import (
+                attach_basis_meta_to_probe_runs,
+                set_selected_specs_on_meta,
             )
+
+            # W2.1: fold the queries ACTUALLY probed this run into the meta
+            # BEFORE persisting — a fresh run establishes the selected set; a
+            # pinned run re-records the same set (chain never breaks).
+            final_meta = set_selected_specs_on_meta(
+                sku_ctx["_prompt_basis_meta"],
+                sku_ctx.get("_selected_specs_out"),
+            )
+            attach_basis_meta_to_probe_runs(out[sku_key], final_meta)
     return out
 
 
