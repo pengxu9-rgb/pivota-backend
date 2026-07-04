@@ -46,7 +46,6 @@ from services.audit_facts import (
     _grounding_source_host,
     _identify_run_sources,
     _looks_like_host,
-    _own_url_cited_runs,
     _source_matches_merchant,
     aggregate_run_facts,
     compute_run_facts,
@@ -357,6 +356,10 @@ async def run_bd_probes(
 # _clean_identity_tuple / _own_url_cited_runs MOVED to
 # services/audit_facts.py (W1 RunFacts phase 1) and re-imported at the top
 # of this module — audit_facts must never import this module back.
+# W1 site 3 CUTOVER (T1): _own_url_cited_runs is no longer imported here — the
+# report path reads own-page citedness solely from run_facts.own_url_cited_runs
+# (parity-proven ==, see test_audit_facts.test_parity_with_legacy_implementations).
+# The legacy fn survives in audit_facts as the test-only equivalence oracle.
 
 def _vendor_is_merchant(vendor: Any, merchant_own_aliases: frozenset) -> bool:
     """Does a product's vendor/brand refer to the MERCHANT itself (a D2C brand
