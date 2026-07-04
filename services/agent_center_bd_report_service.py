@@ -37,6 +37,7 @@ from urllib.parse import urlparse
 
 from services import agent_center_llm_client as llm_client
 from services.audit_delta import build_reaudit_delta
+from services.prompt_basis import basis_meta_from_probe_runs
 from services.audit_facts import (
     QUERY_CLASS_BRANDED,
     QUERY_CLASS_CATEGORY,
@@ -6505,9 +6506,15 @@ async def build_per_sku_report(
         # was measured against, with a stable prompt_set_id. The NEXT run's
         # resolve_prompt_basis reloads this (same questions → comparable
         # scores); the re-audit delta asserts basis identity from it.
+        # Read from the PERSISTED probe payload first — the report phase
+        # reloads sku_ctx fresh, so the probing-phase ctx stash is only a
+        # same-instance fallback, never the durable carrier.
         "prompt_basis": (
-            sku_ctx.get("_prompt_basis_meta")
-            if isinstance(sku_ctx.get("_prompt_basis_meta"), dict) else None
+            basis_meta_from_probe_runs(probe_runs)
+            or (
+                sku_ctx.get("_prompt_basis_meta")
+                if isinstance(sku_ctx.get("_prompt_basis_meta"), dict) else None
+            )
         ),
         "verbatim_grounding_evidence": _grounding_evidence(probe_runs),
         "axis_coverage": _axis_coverage(probe_runs),
@@ -10883,6 +10890,19 @@ async def run_per_sku_audit_probe_fanout(
             # Brand-level merchant prompts run once, on the first SKU only.
             custom_prompts=clean_custom if idx == 0 else None,
         )
+        # W2: ride the basis meta on the PERSISTED probe payload. The report
+        # phase resets the sku-context cache and reloads sku_ctx fresh, so a
+        # ctx stash alone never reaches build_per_sku_report (prod pair
+        # 2026-07-04: run #1 stamped prompt_basis=None, run #2 regenerated).
+        # Probe runs are what report time durably reloads.
+        if isinstance(sku_ctx, dict) and isinstance(
+            sku_ctx.get("_prompt_basis_meta"), dict
+        ):
+            from services.prompt_basis import attach_basis_meta_to_probe_runs
+
+            attach_basis_meta_to_probe_runs(
+                out[sku_key], sku_ctx["_prompt_basis_meta"],
+            )
     return out
 
 
