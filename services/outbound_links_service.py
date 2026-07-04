@@ -4,12 +4,13 @@ import hashlib
 import hmac
 import json
 import os
+import re
 import time
 import uuid
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional, Tuple
-from urllib.parse import urlencode, urlparse, urlunparse, parse_qsl
+from urllib.parse import quote, urlencode, urlparse, urlunparse, parse_qsl
 
 from sqlalchemy import and_, desc, func, or_, select
 
@@ -121,6 +122,106 @@ def apply_utm(destination_url: str, utm_template: str, tokens: Dict[str, str]) -
 
     new_query = urlencode(existing, doseq=True)
     return urlunparse(parsed._replace(query=new_query))
+
+
+# --- T2-1: stable click-id join keys on external redirects -------------------
+# The click id minted at redirect-build time must survive to two places:
+#   1. the surface_click_events row (carried in the signed token ctx), and
+#   2. the merchant's order (carried onto the destination URL).
+# For Shopify destinations a cart permalink carries the id as a cart attribute,
+# which Shopify persists into the order's note_attributes with zero merchant
+# setup (order-side join, closable by T2-2). Non-Shopify destinations get the id
+# as a plain query param for click-side attribution only (honest degradation).
+
+_SHOPIFY_CART_CLICK_ATTRIBUTE = "attributes[pivota_click_id]"
+REFERRAL_CLICK_PARAM = "pvt_click_id"
+
+
+def normalize_shop_host(value: Optional[str]) -> str:
+    """Reduce a shop domain / full URL to a bare lowercase host (no scheme/path/port)."""
+    raw = str(value or "").strip().lower()
+    if not raw:
+        return ""
+    if "://" in raw:
+        raw = raw.split("://", 1)[1]
+    raw = raw.split("/", 1)[0]
+    raw = raw.split("@")[-1]
+    raw = raw.split(":")[0]
+    return raw.strip().strip(".")
+
+
+def extract_shopify_numeric_variant_id(raw: Optional[str]) -> Optional[str]:
+    """Return the numeric Shopify variant id for a Shopify variant reference, else None.
+
+    Accepts a bare numeric id or a ``gid://shopify/ProductVariant/<n>`` form. A
+    non-numeric SKU string yields None — we never fabricate a variant id for the
+    cart permalink.
+    """
+    s = str(raw or "").strip()
+    if not s:
+        return None
+    match = re.search(r"gid://shopify/ProductVariant/(\d+)", s)
+    if match:
+        return match.group(1)
+    if s.isdigit():
+        return s
+    return None
+
+
+def _append_query_fragment(url: str, fragment: str) -> str:
+    if not fragment:
+        return url
+    sep = "&" if "?" in url else "?"
+    return f"{url}{sep}{fragment}"
+
+
+def append_shopify_cart_click_attribute(url: str, click_id: str) -> str:
+    """Append the order-surviving cart attribute. Brackets are kept literal per
+    Shopify's documented cart-permalink form (``attributes[key]=value``)."""
+    cid = str(click_id or "").strip()
+    if not cid:
+        return url
+    return _append_query_fragment(url, f"{_SHOPIFY_CART_CLICK_ATTRIBUTE}={quote(cid, safe='')}")
+
+
+def append_referral_click_param(url: str, click_id: str) -> str:
+    """Append the click id as a plain query param — click-side attribution only.
+
+    A product page cannot carry a Shopify cart attribute, so this is referral-only
+    (there is no order-side join for the fallback destination).
+    """
+    cid = str(click_id or "").strip()
+    if not cid:
+        return url
+    return _append_query_fragment(url, f"{REFERRAL_CLICK_PARAM}={quote(cid, safe='')}")
+
+
+def shopify_cart_base_url(
+    *, shop_domain: Optional[str], variant_id: Optional[str], quantity: int = 1
+) -> Optional[str]:
+    """Build the Shopify cart-permalink base (no query) when a shop host AND a numeric
+    variant id are both known; otherwise None. Never fabricates a variant id."""
+    host = normalize_shop_host(shop_domain)
+    numeric_variant = extract_shopify_numeric_variant_id(variant_id)
+    if not host or not numeric_variant:
+        return None
+    try:
+        qty = max(1, int(quantity or 1))
+    except (TypeError, ValueError):
+        qty = 1
+    return f"https://{host}/cart/{numeric_variant}:{qty}"
+
+
+def build_shopify_cart_permalink(
+    *, shop_domain: Optional[str], variant_id: Optional[str], click_id: str, quantity: int = 1
+) -> Optional[str]:
+    """Full Shopify cart permalink carrying the pivota click id as an order-surviving
+    attribute, or None when a cart permalink cannot be built (missing host /
+    non-numeric variant id)."""
+    base = shopify_cart_base_url(shop_domain=shop_domain, variant_id=variant_id, quantity=quantity)
+    if not base:
+        return None
+    return append_shopify_cart_click_attribute(base, click_id)
 
 
 def url_domain(url: str) -> str:

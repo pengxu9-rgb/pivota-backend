@@ -59,9 +59,21 @@ from services.similarity_config import get_similarity_scoring_weights
 from services.outbound_links_service import (
     DEFAULT_UTM_TEMPLATE,
     apply_utm,
+    append_referral_click_param,
+    append_shopify_cart_click_attribute,
     get_allowed_domains_for_market,
     is_destination_domain_allowed,
     make_redirect_token,
+    normalize_shop_host,
+    shopify_cart_base_url,
+)
+from services.commerce_attribution_service import (
+    PVT_CLICK_ID,
+    PVT_PRODUCT_ID,
+    PVT_SURFACE,
+    PVT_VARIANT_ID,
+    new_click_id,
+    normalize_surface,
 )
 from models.standard_product import StandardProduct, StandardProductVariant, ProductStatus
 from services.agent_task_manager import AgentTaskManager
@@ -3802,6 +3814,11 @@ async def _handle_offers_resolve(
                 if isinstance(availability, str):
                     in_stock = availability.lower() not in {"out_of_stock", "outofstock", "sold_out"}
 
+                redirect_identity = _external_seed_redirect_identity(
+                    row=row_dict,
+                    seed_data=seed_data,
+                    offer_variant_id=_seed_offer_variant_id(v) or None,
+                )
                 redirect_url = await _make_external_redirect_url(
                     market=used_market,
                     tool=used_tool,
@@ -3815,6 +3832,11 @@ async def _handle_offers_resolve(
                         **({"skuId": sku_id} if sku_id else {}),
                         **({"productId": product_id} if product_id else {}),
                     },
+                    merchant_id=redirect_identity["merchant_id"],
+                    product_id=redirect_identity["product_id"],
+                    variant_id=redirect_identity["variant_id"],
+                    shop_domain=redirect_identity["shop_domain"],
+                    platform=redirect_identity["platform"],
                 )
                 if not redirect_url:
                     continue
@@ -6196,6 +6218,54 @@ def _build_external_seed_filter_product(
     )
 
 
+def _external_seed_redirect_identity(
+    *,
+    row: Dict[str, Any],
+    seed_data: Dict[str, Any],
+    offer_variant_id: Optional[str] = None,
+) -> Dict[str, Optional[str]]:
+    """Derive the attribution identity for an external-seed redirect.
+
+    ``attached_product_key`` is stored as ``{merchant_id}|{platform}|{platform_product_id}``
+    (see reviews_service / product_quality_service), so an *attached* seed yields the
+    pivota merchant id, the platform, and the canonical product id. A standalone seed
+    (no attached key) yields Nones for those — an honest Tier-2a referral with no merchant
+    join. The shop host + variant id gate whether a Shopify cart permalink can be built.
+    """
+    row = row or {}
+    seed_data = seed_data or {}
+    attached_key = str(
+        row.get("attached_product_key") or seed_data.get("attached_product_key") or ""
+    ).strip()
+    merchant_id: Optional[str] = None
+    platform: Optional[str] = None
+    canonical_product_id: Optional[str] = None
+    if attached_key.count("|") >= 2:
+        merchant_part, platform_part, _rest = attached_key.split("|", 2)
+        merchant_id = merchant_part.strip() or None
+        platform = (platform_part.strip() or None)
+        canonical_product_id = attached_key
+
+    attached_variant_id = str(
+        row.get("attached_variant_id") or seed_data.get("attached_variant_id") or ""
+    ).strip() or None
+    variant_id = attached_variant_id or (str(offer_variant_id).strip() if offer_variant_id else None) or None
+
+    shop_domain = str(row.get("domain") or seed_data.get("domain") or "").strip() or None
+    if not shop_domain:
+        shop_domain = _seed_domain_from_url(
+            row.get("destination_url") or seed_data.get("destination_url") or row.get("canonical_url")
+        ) or None
+
+    return {
+        "merchant_id": merchant_id,
+        "platform": platform,
+        "product_id": canonical_product_id,
+        "variant_id": variant_id,
+        "shop_domain": shop_domain,
+    }
+
+
 async def _make_external_redirect_url(
     *,
     market: str,
@@ -6204,11 +6274,44 @@ async def _make_external_redirect_url(
     utm_template: Optional[str],
     ctx: Dict[str, Any],
     allowed_domains: Optional[List[str]] = None,
+    merchant_id: Optional[str] = None,
+    product_id: Optional[str] = None,
+    variant_id: Optional[str] = None,
+    shop_domain: Optional[str] = None,
+    platform: Optional[str] = None,
+    quantity: int = 1,
+    click_id: Optional[str] = None,
 ) -> Optional[str]:
     if not destination_url.startswith(("http://", "https://")):
         return None
+
+    # T2-1: mint a stable click id at redirect-build time so the *same* id lands on both the
+    # surface_click_events row (via the signed token ctx) and the merchant order (via the
+    # destination). Reusing a caller-supplied id keeps redirect caches idempotent.
+    stable_click_id = str(click_id or "").strip() or new_click_id()
+
+    # Join strategy:
+    #   cart_permalink -> Shopify store + numeric variant id known: the id rides in
+    #     attributes[pivota_click_id], which Shopify persists into the order's note_attributes
+    #     (order-side join, closable by T2-2) with zero merchant setup.
+    #   referral_only  -> otherwise: keep the product URL and append the id as a plain query
+    #     param for click-side attribution only. Honest degradation (no order-side join).
+    candidate_host = normalize_shop_host(shop_domain) or _seed_domain_from_url(destination_url)
+    is_shopify = (
+        str(platform or "").strip().lower() == "shopify"
+        or candidate_host.endswith(".myshopify.com")
+    )
+    cart_base = None
+    if is_shopify:
+        cart_base = shopify_cart_base_url(
+            shop_domain=shop_domain or destination_url,
+            variant_id=variant_id,
+            quantity=quantity,
+        )
+    join_mode = "cart_permalink" if cart_base else "referral_only"
+
     dest_with_utm = apply_utm(
-        destination_url,
+        cart_base or destination_url,
         utm_template or DEFAULT_UTM_TEMPLATE,
         {"market": market, "tool": tool},
     )
@@ -6220,12 +6323,35 @@ async def _make_external_redirect_url(
         allowed_domains=runtime_allowed_domains,
     ):
         return None
+
+    # Append the join key AFTER the allowlist + UTM pass so the cart attribute's brackets stay
+    # literal (Shopify's documented cart-permalink form).
+    if join_mode == "cart_permalink":
+        dest = append_shopify_cart_click_attribute(dest_with_utm, stable_click_id)
+    else:
+        dest = append_referral_click_param(dest_with_utm, stable_click_id)
+
+    # Enrich the token ctx with the exact keys materialize_attribution_context reads so
+    # record_surface_event stamps the stable click id + merchant + product onto
+    # surface_click_events instead of minting a fresh throwaway id with NULL merchant/product.
+    enriched_ctx: Dict[str, Any] = dict(ctx or {})
+    enriched_ctx[PVT_CLICK_ID] = stable_click_id
+    enriched_ctx.setdefault(PVT_SURFACE, normalize_surface(tool))
+    enriched_ctx.setdefault("tool", tool)
+    enriched_ctx["join_mode"] = join_mode
+    if merchant_id:
+        enriched_ctx["merchant_id"] = merchant_id
+    if product_id:
+        enriched_ctx[PVT_PRODUCT_ID] = product_id
+    if variant_id:
+        enriched_ctx[PVT_VARIANT_ID] = variant_id
+
     token = make_redirect_token(
         {
             "market": market,
             "tool": tool,
-            "dest": dest_with_utm,
-            "ctx": ctx,
+            "dest": dest,
+            "ctx": enriched_ctx,
         }
     )
     base = resolve_public_api_base_url()
@@ -6359,6 +6485,11 @@ async def _build_prefetched_external_seed_wrappers(
             if redirect_cache_key in redirect_cache:
                 redirect_url = redirect_cache[redirect_cache_key]
             else:
+                redirect_identity = _external_seed_redirect_identity(
+                    row=candidate,
+                    seed_data=_ensure_seed_data_obj(candidate.get("seed_data")) or {},
+                    offer_variant_id=candidate.get("variant_id"),
+                )
                 redirect_url = await _make_external_redirect_url(
                     market=market,
                     tool=tool,
@@ -6366,6 +6497,11 @@ async def _build_prefetched_external_seed_wrappers(
                     utm_template=utm_template,
                     ctx={"seedId": candidate.get("external_seed_id")},
                     allowed_domains=None,
+                    merchant_id=redirect_identity["merchant_id"],
+                    product_id=redirect_identity["product_id"],
+                    variant_id=redirect_identity["variant_id"],
+                    shop_domain=redirect_identity["shop_domain"],
+                    platform=redirect_identity["platform"],
                 )
                 redirect_cache[redirect_cache_key] = redirect_url
         if not redirect_url:
@@ -8462,6 +8598,11 @@ async def _handle_find_products_multi(
             if redirect_cache_key in external_redirect_cache:
                 redirect_url = external_redirect_cache[redirect_cache_key]
             else:
+                redirect_identity = _external_seed_redirect_identity(
+                    row=row_dict,
+                    seed_data=seed_data,
+                    offer_variant_id=getattr(candidate, "variant_id", None),
+                )
                 redirect_url = await _make_external_redirect_url(
                     market=market,
                     tool=tool,
@@ -8469,6 +8610,11 @@ async def _handle_find_products_multi(
                     utm_template=utm_template,
                     ctx={"seedId": row_dict.get("id")},
                     allowed_domains=None,
+                    merchant_id=redirect_identity["merchant_id"],
+                    product_id=redirect_identity["product_id"],
+                    variant_id=redirect_identity["variant_id"],
+                    shop_domain=redirect_identity["shop_domain"],
+                    platform=redirect_identity["platform"],
                 )
                 external_redirect_cache[redirect_cache_key] = redirect_url
             if not redirect_url:
