@@ -126,7 +126,20 @@ def audit_product_to_index_fields(
     # `prod::` prefix / `::` separator, exactly like Shopify/marketplace rows.
     # (Lazy import keeps this pure mapping module import-light, like the db.*
     # imports in upsert_audited_sku_to_index below.)
-    from services.catalog_sync_service import make_catalog_product_key
+    from services.catalog_sync_service import (
+        make_catalog_product_key,
+        make_pivota_canonical_fields,
+    )
+
+    # W5 P3 (ADR-007): mint the Pivota canonical PDP identity at seed time so the
+    # seed can be served on the OFFER-FREE citation floor (index_eligible), not
+    # the full transact gate. The sig is deterministic from the SAME identity
+    # tuple (merchant, platform, source_id) that keys product_key, so re-auditing
+    # the same URL yields the same sig (idempotent — the upsert preserves it, see
+    # _CATALOG_INSERT_COLUMNS + the on-conflict COALESCE below).
+    pivota_fields = make_pivota_canonical_fields(
+        merchant_id, PLATFORM_URL_AUDIT, source_id
+    )
 
     return {
         "merchant_id": merchant_id,
@@ -143,11 +156,17 @@ def audit_product_to_index_fields(
         "product_type": (audit_product.get("product_type") or "").strip() or None,
         # OBSERVED content from the merchant-paid audit (the flywheel's exhaust):
         # enriches the seed so it's rich WHEN claimed. Adds no serving — the row
-        # stays un-served (pdp_lifecycle_stage NULL).
+        # stays un-served (pdp_lifecycle_stage NULL). The Pivota canonical sig/URL
+        # DO get minted (below): the citation floor is offer-free, so a
+        # rich-enough seed becomes citable even before it's claimed/transactable.
         "description": _audit_description(audit_product.get("attributes_raw") or {}),
         "image_url": _audit_image_url(audit_product.get("attributes_raw") or {}),
         "raw_title": audit_product.get("raw_title"),
         "attributes_raw": audit_product.get("attributes_raw") or {},
+        # Pivota canonical PDP fields (sig_id + agent.pivota.cc URL + minted_at).
+        "pivota_signature_id": pivota_fields["pivota_signature_id"],
+        "pivota_canonical_url": pivota_fields["pivota_canonical_url"],
+        "pivota_signature_minted_at": pivota_fields["pivota_signature_minted_at"],
     }
 
 
@@ -208,15 +227,20 @@ def audit_intake_enabled(merchant_id: Optional[str] = None) -> bool:
 
 
 # Only the columns we set; everything else (catalog_track, truth_tier,
-# readiness_tier, pdp_scope='unverified', sync_status, created_at, …) takes its
-# server_default — and pdp_lifecycle_stage stays NULL, so a seed is NOT recalled
-# /served until it graduates or is claimed. description + image_url are OBSERVED
-# content fields (the audit's exhaust) — they enrich the seed for when it's
-# claimed and add NO serving; the lifecycle stage is still left NULL.
+# readiness_tier, pdp_scope='unverified', sync_status='live', created_at, …)
+# takes its server_default — and pdp_lifecycle_stage stays NULL, so a seed is NOT
+# recalled on the transact lane until it graduates or is claimed. description +
+# image_url are OBSERVED content fields (the audit's exhaust) — they enrich the
+# seed for when it's claimed and add NO transact serving. The pivota_signature_*
+# fields (W5 P3) DO mint the offer-free citation identity: the by-signature PDP
+# read serves this seed once index_pipeline_state.index_eligible flips true
+# (which only happens when the seed passes the quality gates — a thin seed stays
+# ineligible until E1 enrichment upgrades it).
 _CATALOG_INSERT_COLUMNS = (
     "product_key", "merchant_id", "platform", "source_product_id",
     "title", "brand", "content_key", "canonical_url", "source_domain",
     "product_type", "description", "image_url",
+    "pivota_signature_id", "pivota_canonical_url", "pivota_signature_minted_at",
 )
 
 
@@ -529,6 +553,28 @@ async def upsert_audited_sku_to_index(
                 "upsert_audited_sku_to_index: brand guard failed for %s: %s",
                 fields.get("product_key"), str(exc)[:200],
             )
+    # W5 P3 (serve chain): the by-signature PDP read INNER-JOINs catalog_merchants
+    # (indexable + status='active'). URL-tier merchants have no synced storefront,
+    # so no catalog_merchants row exists — without one the seed's canonical PDP
+    # would 404 even once it's index_eligible. Upsert a minimal, indexable row
+    # (indexable defaults true; status='active' is set by upsert_catalog_merchant)
+    # so the citation read resolves. Best-effort — never break the seed.
+    try:
+        from services.catalog_sync_service import upsert_catalog_merchant
+
+        await upsert_catalog_merchant(
+            merchant_id=merchant_id,
+            merchant_name=None,
+            primary_platform=PLATFORM_URL_AUDIT,
+            source_system="url_audit_intake",
+            source_ref=fields.get("source_domain"),
+            metadata_json={"ingested_from": "url_audit_intake"},
+        )
+    except Exception as exc:  # noqa: BLE001 — merchant upsert is best-effort
+        logger.warning(
+            "upsert_audited_sku_to_index: catalog_merchant upsert failed for %s: %s",
+            merchant_id, str(exc)[:200],
+        )
     try:
         from db.catalog import catalog_products
         from db.database import database
@@ -558,6 +604,23 @@ async def upsert_audited_sku_to_index(
                 "image_url": func.coalesce(
                     stmt.excluded.image_url, catalog_products.c.image_url
                 ),
+                # W5 P3: the Pivota canonical sig is WRITE-ONCE — on a re-audit
+                # (conflict on product_key) preserve the EXISTING sig/URL/minted_at
+                # so a second audit never mints a second signature and the arc
+                # phase stays honest. `existing` first, `excluded` second only
+                # backfills rows that predate sig-minting (their sig was NULL).
+                "pivota_signature_id": func.coalesce(
+                    catalog_products.c.pivota_signature_id,
+                    stmt.excluded.pivota_signature_id,
+                ),
+                "pivota_canonical_url": func.coalesce(
+                    catalog_products.c.pivota_canonical_url,
+                    stmt.excluded.pivota_canonical_url,
+                ),
+                "pivota_signature_minted_at": func.coalesce(
+                    catalog_products.c.pivota_signature_minted_at,
+                    stmt.excluded.pivota_signature_minted_at,
+                ),
                 "updated_at": func.now(),
                 "content_changed_at": func.now(),
             },
@@ -583,6 +646,29 @@ async def upsert_audited_sku_to_index(
         except Exception as exc:  # noqa: BLE001 — PDP refresh is best-effort
             logger.warning(
                 "upsert_audited_sku_to_index: pdp refresh failed for %s: %s",
+                content_key, str(exc)[:200],
+            )
+        # W5 P3 (enrich→eligible graduation): recompute index_pipeline_state for
+        # this content_key through the REAL classifier — never force-set
+        # eligibility. A thin seed fails the quality gates (description length,
+        # etc.) and stays index_ineligible; once E1 (canonical_pdp_enrichment)
+        # fattens the PDP and re-runs this recompute, it graduates to
+        # index_eligible and the offer-free citation read starts serving it. Runs
+        # AFTER the agent_pdp_view refresh so the classifier reads fresh content.
+        # Best-effort — a recompute failure leaves the nightly job as the safety
+        # net and never breaks the seed.
+        try:
+            from services.index_pipeline_state_service import (
+                recompute_serving_eligibility,
+            )
+
+            await recompute_serving_eligibility(
+                content_key, reason="url_audit_intake"
+            )
+        except Exception as exc:  # noqa: BLE001 — recompute is best-effort
+            logger.warning(
+                "upsert_audited_sku_to_index: eligibility recompute failed for "
+                "%s: %s",
                 content_key, str(exc)[:200],
             )
     return content_key or fields.get("product_key")

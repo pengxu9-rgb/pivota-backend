@@ -41,16 +41,24 @@ from services.executor_agents.base import (
 logger = logging.getLogger(__name__)
 
 
-# W5: the executors that act on `context.audit_report` ALONE — no connected
-# store, no catalog_products read, no external side-effect beyond a Gemini call
-# that produces an internal ExecutorResult. These are the ONLY agents safe to
-# dispatch for a URL-audit (synthetic) run: the store-dependent agents
-# (canonical_pdp_enrichment, sitemap_freshness, gsc_url_submission) would read/
-# mutate the merchant's OWN catalog SKUs — irrelevant to a pasted URL and the
-# exact side-effect the url_audit skip was protecting against.
-REPORT_ONLY_EXECUTORS = frozenset({
+# W5.4: the FULL executor set that a URL-audit (synthetic) run may dispatch. Two
+# kinds of agent belong here:
+#   - report-only agents that act on `context.audit_report` ALONE
+#     (content_brief_generator, competitor_insights) — no catalog read, no
+#     external side-effect beyond an internal Gemini ExecutorResult; and
+#   - the seed-aware agents that DO act on the url_audit seed now that P3 mints a
+#     Pivota canonical identity for it: canonical_pdp_enrichment (fattens the thin
+#     seed's PDP → graduates it to index_eligible) and gsc_url_submission_loop
+#     (submits the seed's canonical URL for indexing). Both self-gate in
+#     should_run — they no-op unless a real candidate + the relevant enablement
+#     exist — so listing them here is safe even before those flags flip.
+# sitemap_freshness_monitor is DELIBERATELY excluded: it needs a connected
+# storefront sitemap, which a pasted-URL merchant does not have.
+URL_AUDIT_EXECUTORS = frozenset({
     "content_brief_generator",
     "competitor_insights",
+    "canonical_pdp_enrichment",
+    "gsc_url_submission_loop",
 })
 
 
@@ -108,9 +116,10 @@ async def dispatch_agents(
     next tick.
 
     `agent_names` (W5) restricts dispatch to that set of agent names — used to
-    run only the report-only executors (REPORT_ONLY_EXECUTORS) for URL-audit
-    runs, which have no connected catalog for the store-dependent agents to act
-    on. None = the full registry (connected-store audits).
+    run only the URL-tier executor set (URL_AUDIT_EXECUTORS) for URL-audit runs,
+    which have no connected storefront (so sitemap_freshness is excluded) but
+    whose seeds ARE index-minted (so canonical_pdp_enrichment + gsc submission
+    apply). None = the full registry (connected-store audits).
 
     Returns:
       {

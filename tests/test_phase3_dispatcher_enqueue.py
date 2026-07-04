@@ -288,7 +288,7 @@ async def test_payload_carries_extra_but_not_audit_report(monkeypatch):
 
 
 # =====================================================================
-# W5 — agent_names filter (report-only executors for URL-audit runs)
+# W5.4 — agent_names filter (URL-tier executor set for URL-audit runs)
 # =====================================================================
 
 @pytest.mark.asyncio
@@ -298,27 +298,35 @@ async def test_agent_names_restricts_dispatch_to_the_allowlist(monkeypatch):
         _FakeAgent("competitor_insights", should_run_returns=True),
         _FakeAgent("canonical_pdp_enrichment", should_run_returns=True),
         _FakeAgent("gsc_url_submission_loop", should_run_returns=True),
+        # connected-store-only — NOT in URL_AUDIT_EXECUTORS, must be filtered
+        # out BEFORE should_run (a URL-tier merchant has no storefront sitemap).
+        _FakeAgent("sitemap_freshness_monitor", should_run_returns=True),
     ]
     stub = _EnqueueStub()
     _patch_dispatcher(monkeypatch, agents=agents, stub=stub)
 
     from services.executor_agents.base import ExecutorContext
     from services.executor_agents.dispatcher import (
-        dispatch_agents, REPORT_ONLY_EXECUTORS,
+        dispatch_agents, URL_AUDIT_EXECUTORS,
     )
     result = await dispatch_agents(
         ExecutorContext(merchant_id="m-1", parent_audit_run_id="a-1",
                         audit_report={"k": "v"}),
-        agent_names=REPORT_ONLY_EXECUTORS,
+        agent_names=URL_AUDIT_EXECUTORS,
     )
-    # only the two report-only agents are even evaluated; the store-dependent
-    # ones are filtered out BEFORE should_run (never touch the catalog).
-    assert result["agents_evaluated"] == 2
+    # all four URL-tier agents are evaluated + enqueued; the store-only sitemap
+    # agent is filtered out BEFORE should_run.
+    assert result["agents_evaluated"] == 4
     enqueued = sorted(e["agent_name"] for e in stub.enqueued)
-    assert enqueued == ["competitor_insights", "content_brief_generator"]
-    # the store-dependent agents' should_run was never called
-    store_agents = [a for a in agents if a.name not in REPORT_ONLY_EXECUTORS]
-    assert not any(a.execute_called for a in store_agents)
+    assert enqueued == [
+        "canonical_pdp_enrichment",
+        "competitor_insights",
+        "content_brief_generator",
+        "gsc_url_submission_loop",
+    ]
+    # the excluded (store-only) agent's should_run was never called
+    excluded_agents = [a for a in agents if a.name not in URL_AUDIT_EXECUTORS]
+    assert not any(a.execute_called for a in excluded_agents)
 
 
 @pytest.mark.asyncio
@@ -426,17 +434,20 @@ async def test_kill_switch_beats_per_merchant_consent(monkeypatch):
     assert stub.enqueued == []
 
 
-def test_report_only_executors_are_a_real_subset_of_the_registry():
-    # Guard: the report-only allowlist must name agents that actually exist in
-    # the registry (a rename that orphans an allowlist entry is a red build).
+def test_url_audit_executors_are_a_real_subset_of_the_registry():
+    # Guard: the URL-tier allowlist must name agents that actually exist in the
+    # registry (a rename that orphans an allowlist entry is a red build).
     from services.executor_agents.dispatcher import (
-        _registry, REPORT_ONLY_EXECUTORS,
+        _registry, URL_AUDIT_EXECUTORS,
     )
     registry_names = {a.name for a in _registry()}
-    assert REPORT_ONLY_EXECUTORS <= registry_names, (
-        f"REPORT_ONLY_EXECUTORS names not in registry: "
-        f"{REPORT_ONLY_EXECUTORS - registry_names}"
+    assert URL_AUDIT_EXECUTORS <= registry_names, (
+        f"URL_AUDIT_EXECUTORS names not in registry: "
+        f"{URL_AUDIT_EXECUTORS - registry_names}"
     )
-    # and the excluded (store-dependent) agents are genuinely excluded
-    assert "canonical_pdp_enrichment" not in REPORT_ONLY_EXECUTORS
-    assert "gsc_url_submission_loop" not in REPORT_ONLY_EXECUTORS
+    # W5.4: the seed-aware agents are now IN the URL-tier set (P3 mints the seed's
+    # canonical identity, so they have something to act on).
+    assert "canonical_pdp_enrichment" in URL_AUDIT_EXECUTORS
+    assert "gsc_url_submission_loop" in URL_AUDIT_EXECUTORS
+    # sitemap_freshness stays connected-store-only — excluded from the URL tier.
+    assert "sitemap_freshness_monitor" not in URL_AUDIT_EXECUTORS

@@ -222,6 +222,8 @@ def _wire_guard_seams(monkeypatch, *, fetch_one):
     import db.database
     import services.agent_pdp_view_assembler as asm
     import services.audit_index_intake as intake
+    import services.catalog_sync_service as css
+    import services.index_pipeline_state_service as ips
 
     calls = {"catalog_execute": 0, "enqueued": []}
 
@@ -238,10 +240,20 @@ def _wire_guard_seams(monkeypatch, *, fetch_one):
         calls["enqueued"].append(match)
         return "pdptask_x"
 
+    # W5 P3's best-effort merchant upsert + eligibility recompute are stubbed to
+    # no-ops so this guard test isolates the single product upsert it asserts on.
+    async def _fake_upsert_merchant(**kwargs):
+        return "m_row"
+
+    async def _fake_recompute(content_key, *, reason=None, **kwargs):
+        return None
+
     monkeypatch.setattr(db.database.database, "fetch_one", _fake_fetch_one)
     monkeypatch.setattr(db.database.database, "execute", _fake_execute)
     monkeypatch.setattr(asm, "refresh_agent_pdp_view_for_content_key", _fake_refresh)
     monkeypatch.setattr(intake, "enqueue_audit_identity_review", _fake_enqueue)
+    monkeypatch.setattr(css, "upsert_catalog_merchant", _fake_upsert_merchant)
+    monkeypatch.setattr(ips, "recompute_serving_eligibility", _fake_recompute)
     return calls
 
 
@@ -287,3 +299,94 @@ def test_brand_guard_opt_out_env_disables_it(monkeypatch):
     assert out                               # minted despite the conflict
     assert calls["catalog_execute"] == 1     # catalog upsert happened
     assert calls["enqueued"] == []           # nothing routed to review
+
+# --- W5 P3: canonical PDP minting on url_audit seeds (ADR-007) -----------------
+
+def test_seed_mints_deterministic_pivota_signature():
+    from datetime import datetime
+
+    from services.catalog_sync_service import make_pivota_signature_id
+
+    f = audit_product_to_index_fields("m_anua", _shopify_audit_product())
+    # The offer-free citation identity is minted AT SEED TIME (ADR-007) — keyed on
+    # the SAME (merchant, platform, source_id) tuple that keys product_key.
+    assert f["pivota_signature_id"] == make_pivota_signature_id(
+        "m_anua", PLATFORM_URL_AUDIT, f["source_product_id"]
+    )
+    assert f["pivota_signature_id"].startswith("sig_")
+    # canonical URL embeds the sig (agent.pivota.cc/products/<sig>).
+    assert f["pivota_canonical_url"].endswith(
+        "/products/" + f["pivota_signature_id"]
+    )
+    # minted_at is a real timestamp (arc-phase honest, not a static caveat).
+    assert isinstance(f["pivota_signature_minted_at"], datetime)
+
+
+def test_reseed_same_url_yields_same_signature_no_duplicate():
+    # Re-auditing the same URL (same merchant) mints the SAME sig + product_key —
+    # idempotent, so the upsert updates ONE row and preserves ONE signature.
+    a = audit_product_to_index_fields("m_anua", _shopify_audit_product())
+    variant = _shopify_audit_product()
+    variant["pdp_url"] = "http://anua.com/products/heartleaf-toner?utm=x#reviews"
+    b = audit_product_to_index_fields("m_anua", variant)
+    assert a["source_product_id"] == b["source_product_id"]
+    assert a["product_key"] == b["product_key"]
+    assert a["pivota_signature_id"] == b["pivota_signature_id"]
+    # A different merchant NEVER collides (merchant_id is in the sig input).
+    c = audit_product_to_index_fields("m_other", _shopify_audit_product())
+    assert c["pivota_signature_id"] != a["pivota_signature_id"]
+
+
+def test_upsert_wires_merchant_row_and_eligibility_recompute(monkeypatch):
+    import asyncio
+
+    import db.database
+    import services.agent_pdp_view_assembler as asm
+    import services.audit_index_intake as intake
+    import services.catalog_sync_service as css
+    import services.index_pipeline_state_service as ips
+
+    executed = []
+    merchant_calls = []
+    recompute_calls = []
+
+    async def _fake_execute(stmt):
+        executed.append(stmt)
+
+    async def _fake_upsert_merchant(**kwargs):
+        merchant_calls.append(kwargs)
+
+    async def _fake_refresh(ck, *, refresh_source, db=None):
+        return True
+
+    async def _fake_recompute(content_key, *, reason=None):
+        # Thin seed stays ineligible until E1 enrichment graduates it — the
+        # classifier decides, the intake never force-sets eligibility.
+        recompute_calls.append((content_key, reason))
+        return False
+
+    monkeypatch.setattr(db.database.database, "execute", _fake_execute)
+    monkeypatch.setattr(css, "upsert_catalog_merchant", _fake_upsert_merchant)
+    monkeypatch.setattr(asm, "refresh_agent_pdp_view_for_content_key", _fake_refresh)
+    monkeypatch.setattr(ips, "recompute_serving_eligibility", _fake_recompute)
+
+    out = asyncio.run(
+        intake.upsert_audited_sku_to_index("m_anua", _shopify_audit_product())
+    )
+    assert out  # content_key returned
+
+    # Serve chain: a catalog_merchants row is upserted (indexable default true,
+    # status='active') so the by-signature PDP inner-join resolves for a
+    # store-less URL-tier merchant.
+    assert len(merchant_calls) == 1
+    assert merchant_calls[0]["merchant_id"] == "m_anua"
+    assert merchant_calls[0]["primary_platform"] == PLATFORM_URL_AUDIT
+
+    # exactly one catalog_products upsert (the merchant upsert is mocked out).
+    assert len(executed) == 1
+
+    # Eligibility recomputed through the REAL classifier entrypoint, keyed on the
+    # returned content_key, with the intake's reason.
+    assert len(recompute_calls) == 1
+    assert recompute_calls[0][0] == out
+    assert recompute_calls[0][1] == "url_audit_intake"

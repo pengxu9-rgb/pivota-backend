@@ -739,16 +739,16 @@ async def _process_one_audit_run_inner(
                 report_jsonb=brand_report,
             )
             if is_synthetic:
-                # W5: URL-audit runs now DELIVER the report-only executors
-                # (content briefs + competitor insights) — real work off the
-                # pasted URL's OWN report, no connected catalog. The
-                # store-dependent agents (canonical_pdp_enrichment /
-                # sitemap_freshness / gsc_url_submission) are excluded: they'd
-                # read/mutate the merchant's own catalog SKUs, irrelevant to a
-                # pasted URL (the exact side-effect the old blanket skip
-                # protected). The global kill-switch still governs them.
+                # W5.4: URL-audit runs DELIVER the full URL-tier executor set —
+                # content briefs + competitor insights (off the pasted URL's OWN
+                # report) PLUS canonical_pdp_enrichment + gsc_url_submission_loop,
+                # which act on the url_audit SEED now that P3 mints its Pivota
+                # canonical identity (fatten the thin PDP → index_eligible; submit
+                # the canonical URL). sitemap_freshness stays excluded (no
+                # connected storefront). Each seed-aware agent self-gates in
+                # should_run + the global kill-switch still governs them all.
                 from services.executor_agents.dispatcher import (
-                    REPORT_ONLY_EXECUTORS,
+                    URL_AUDIT_EXECUTORS,
                 )
 
                 tasks_summary = await _materialize_tasks_and_executors(
@@ -756,7 +756,7 @@ async def _process_one_audit_run_inner(
                     run_id=run_id,
                     brand_report=brand_report,
                     integration_state=integration_state,
-                    agent_names=REPORT_ONLY_EXECUTORS,
+                    agent_names=URL_AUDIT_EXECUTORS,
                     dispatch_only=True,
                 )
             else:
