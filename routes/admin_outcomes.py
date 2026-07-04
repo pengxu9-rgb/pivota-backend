@@ -38,6 +38,21 @@ async def get_outcomes_admin(
     return {"found": bool(row), "outcomes": row}
 
 
+@router.get("/seller-trust", response_model=Dict[str, Any])
+async def get_seller_trust_admin(
+    merchant_id: str,
+    window: str = "all_time",
+    _: None = Depends(require_admin_key),
+) -> Dict[str, Any]:
+    """The outcome-derived seller-trust envelope for one merchant (W8) — the same
+    signal attached to agent_pdp_view offers. None when the merchant has no
+    transacted outcomes yet (honest empty state, not a fabricated score)."""
+    from services.outcome_aggregation_service import get_seller_trust
+
+    trust = await get_seller_trust(merchant_id, window_key=window)
+    return {"found": bool(trust), "seller_trust": trust}
+
+
 @router.post("/outcomes/refresh", response_model=Dict[str, Any])
 async def refresh_outcomes_admin(
     _: None = Depends(require_admin_key),

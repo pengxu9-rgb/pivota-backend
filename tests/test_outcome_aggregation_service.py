@@ -38,6 +38,62 @@ def test_build_row_emits_rate_at_or_above_min_sample(monkeypatch: pytest.MonkeyP
     assert row["gmv_cents"] == 50000
 
 
+# --- W8: outcome -> seller_trust envelope (pure) ---------------------------------
+
+def test_seller_trust_none_when_no_outcome_row() -> None:
+    assert svc.seller_trust_from_outcome(None) is None
+
+
+def test_seller_trust_none_when_zero_transacted() -> None:
+    # No transacted orders → no signal, never a fabricated zero-trust.
+    assert svc.seller_trust_from_outcome({
+        "subject_key": "m1", "transacted_count": 0, "min_sample_met": False,
+    }) is None
+
+
+def test_seller_trust_below_sample_carries_counts_but_no_rate() -> None:
+    env = svc.seller_trust_from_outcome({
+        "subject_key": "m1", "window_key": "all_time",
+        "transacted_count": 4, "paid_count": 3, "refunded_count": 1,
+        "refund_rate": None, "gmv_cents": 6000, "currency": "USD",
+        "min_sample_met": False,
+    })
+    assert env is not None
+    assert env["transacted_count"] == 4          # honest volume still exposed
+    assert env["sample_backed"] is False
+    assert env["return_rate"] is None            # no rate claim below sample
+    assert env["return_rate_band"] is None
+
+
+def test_seller_trust_sample_backed_emits_rate_and_band() -> None:
+    env = svc.seller_trust_from_outcome({
+        "subject_key": "m2", "window_key": "all_time",
+        "transacted_count": 40, "paid_count": 38, "refunded_count": 2,
+        "refund_rate": 0.05, "gmv_cents": 120000, "currency": "USD",
+        "min_sample_met": True,
+    })
+    assert env["sample_backed"] is True
+    assert env["return_rate"] == 0.05
+    assert env["return_rate_band"] == "low"      # <= 0.05
+
+
+def test_seller_trust_band_thresholds() -> None:
+    assert svc._return_rate_band(None) is None
+    assert svc._return_rate_band(0.05) == "low"
+    assert svc._return_rate_band(0.12) == "moderate"
+    assert svc._return_rate_band(0.30) == "elevated"
+
+
+def test_seller_trust_ignores_stored_rate_when_sample_not_met() -> None:
+    # Defensive: even if a stray rate is present, don't surface it without sample.
+    env = svc.seller_trust_from_outcome({
+        "subject_key": "m3", "transacted_count": 5, "refund_rate": 0.4,
+        "min_sample_met": False,
+    })
+    assert env["return_rate"] is None
+    assert env["return_rate_band"] is None
+
+
 def test_build_row_product_uses_gmv_cents_directly() -> None:
     # Product rows carry gmv already in cents (from commerce_attribution_edges).
     row = svc._build_row("product", "trailing_90d", {

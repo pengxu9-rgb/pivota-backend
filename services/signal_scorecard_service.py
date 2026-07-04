@@ -37,10 +37,10 @@ EXPOSURE: Dict[str, Dict[str, str]] = {
     "catalog_base": {"state": "live", "note": "search_catalog / get_product (ranking noise stripped)"},
     "quality_meta": {"state": "internal", "note": "serving gate only; scores not sent to agents"},
     "offers": {"state": "gated", "note": "get_offers built; flag AURORA_BFF_RELATIONSHIP_GRAPH_AGENT_ENABLED off"},
-    "trust": {"state": "none", "note": "no get_seller_trust; offers carry no per-offer trust yet"},
+    "trust": {"state": "live", "note": "get_seller_trust + seller_trust on agent_pdp_view offers (outcome-derived, sample-gated; W8)"},
     "alternatives": {"state": "gated", "note": "get_alternatives built; same flag off; data thin"},
     "intel": {"state": "none", "note": "why/fit/evidence is chat-only; not on the agent PDP"},
-    "outcomes": {"state": "none", "note": "rail_transacted captured (funnel links); not yet aggregated/exposed"},
+    "outcomes": {"state": "internal", "note": "aggregated_outcomes computed + refreshed daily; surfaced via seller_trust (offers) + merchant brand rollup"},
 }
 
 

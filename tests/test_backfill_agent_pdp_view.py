@@ -227,6 +227,40 @@ def test_aggregate_offers_picks_dominant_currency_and_bounds_price() -> None:
     assert top[0]["url"] == "https://m1"
 
 
+def test_aggregate_offers_injects_seller_trust_when_present() -> None:
+    """W8: the outcome-derived seller_trust envelope rides onto each offer whose
+    merchant has one; merchants without an outcome carry no trust key."""
+    offers = [
+        {"merchant_id": "m1", "merchant_name": "M1", "availability": "in_stock",
+         "currency": "USD", "list_price": Decimal("19.99"),
+         "merchant_effective_price": Decimal("17.50"), "estimated_best_price": None},
+        {"merchant_id": "m2", "merchant_name": "M2", "availability": "in_stock",
+         "currency": "USD", "list_price": Decimal("22.00"),
+         "merchant_effective_price": Decimal("20.00"), "estimated_best_price": None},
+    ]
+    trust = {"m1": {"transacted_count": 40, "sample_backed": True, "return_rate_band": "low"}}
+    _, _, _, _, top = backfill.aggregate_offers(
+        offers, primary_merchant_id="m1", merchant_url_by_id={},
+        seller_trust_by_id=trust,
+    )
+    by_id = {o["merchant_id"]: o for o in top}
+    assert by_id["m1"]["seller_trust"]["return_rate_band"] == "low"
+    assert "seller_trust" not in by_id["m2"]      # no outcome → no key
+
+
+def test_aggregate_offers_no_seller_trust_key_when_absent() -> None:
+    """Absent seller_trust_by_id → offers carry no trust key (honest empty state)."""
+    offers = [
+        {"merchant_id": "m1", "merchant_name": "M1", "availability": "in_stock",
+         "currency": "USD", "list_price": Decimal("19.99"),
+         "merchant_effective_price": Decimal("17.50"), "estimated_best_price": None},
+    ]
+    _, _, _, _, top = backfill.aggregate_offers(
+        offers, primary_merchant_id="m1", merchant_url_by_id={},
+    )
+    assert "seller_trust" not in top[0]
+
+
 def test_aggregate_offers_caps_at_top_n() -> None:
     offers = [
         {"merchant_id": f"m{i}", "merchant_name": f"M{i}", "availability": "in_stock",

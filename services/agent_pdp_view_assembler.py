@@ -382,6 +382,7 @@ def aggregate_offers(
     offers: List[Dict[str, Any]],
     primary_merchant_id: Optional[str],
     merchant_url_by_id: Dict[str, Optional[str]],
+    seller_trust_by_id: Optional[Dict[str, Dict[str, Any]]] = None,
 ) -> Tuple[
     Optional[str],
     Optional[Decimal],
@@ -391,7 +392,12 @@ def aggregate_offers(
 ]:
     """Compute price aggregates + top-N offers. Stable ordering:
     primary merchant first, then price ASC, then merchant_id ASC.
+
+    `seller_trust_by_id` (W8): the outcome-derived per-merchant trust envelope,
+    injected onto each offer like `url` is. Absent/None → offers carry no trust
+    key (the honest empty state — no transacted outcomes, no claim).
     """
+    trust_by_id = seller_trust_by_id or {}
     normalized: List[Dict[str, Any]] = []
     for o in offers:
         n = normalize_offer(o, primary_merchant_id)
@@ -399,6 +405,9 @@ def aggregate_offers(
             continue
         merchant_id = n.get("merchant_id") or ""
         n["url"] = merchant_url_by_id.get(merchant_id)
+        trust = trust_by_id.get(merchant_id)
+        if trust:
+            n["seller_trust"] = trust
         normalized.append(n)
 
     if not normalized:
@@ -723,6 +732,7 @@ def assemble_row(
     evidence: Optional[Dict[str, Any]] = None,
     refresh_source: str = BACKFILL_REFRESH_SOURCE,
     enrichment: Optional[Dict[str, Any]] = None,
+    seller_trust_by_id: Optional[Dict[str, Dict[str, Any]]] = None,
 ) -> Optional[Dict[str, Any]]:
     """Produce the agent_pdp_view row payload from raw source rows.
     Returns None when the data is too thin to be useful (no title).
@@ -803,7 +813,7 @@ def assemble_row(
             merchant_url_by_id[mid] = p.get("canonical_url")
 
     currency, price_min, price_max, offer_count, top_offers = aggregate_offers(
-        offers, primary_merchant_id, merchant_url_by_id
+        offers, primary_merchant_id, merchant_url_by_id, seller_trust_by_id
     )
 
     variants_capped, variants_count = aggregate_variants(
@@ -1052,6 +1062,21 @@ async def refresh_agent_pdp_view_for_content_key(
     # description_markdown) so it reaches the served PDP AND the
     # serving-eligibility gate. Best-effort; None keeps the raw description.
     enrichment = await _fetch_enrichment_for_canonical(products)
+    # W8: attach the outcome-derived seller-trust signal to each offer's merchant.
+    # Best-effort — a trust-store hiccup must never block the served PDP, and a
+    # merchant with no transacted outcomes simply carries no trust key.
+    seller_trust_by_id: Dict[str, Dict[str, Any]] = {}
+    try:
+        from services.outcome_aggregation_service import seller_trust_bulk
+
+        seller_trust_by_id = await seller_trust_bulk(
+            [o.get("merchant_id") for o in offers if o.get("merchant_id")]
+        )
+    except Exception as exc:  # noqa: BLE001
+        logger.warning(
+            "agent_pdp_view seller_trust fetch failed (best-effort): %s",
+            str(exc)[:200],
+        )
 
     row = assemble_row(
         content_key=content_key,
@@ -1062,6 +1087,7 @@ async def refresh_agent_pdp_view_for_content_key(
         evidence=evidence,
         refresh_source=refresh_source,
         enrichment=enrichment,
+        seller_trust_by_id=seller_trust_by_id,
     )
     if row is None:
         return False
