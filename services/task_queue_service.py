@@ -477,26 +477,26 @@ async def reverify_outreach_records(
     from datetime import datetime, timezone
 
     from db.merchant_tasks import list_tasks_for_merchant, update_task_status
-    from services.cited_host_classifier import is_endorsement_role
 
     try:
-        # Oracle: NOT the bare endorsement_hosts roster — that includes independent
-        # hosts which grounded a category answer while recommending a COMPETITOR,
-        # i.e. a false "your pitch worked". Require the host to actually NAME the
-        # merchant's SKU (cites_exact_sku / cites_near_variant) AND be an
-        # independent endorsement role. Honest proof = the host now cites the merchant.
+        # Oracle = the run's ENDORSEMENT set (host_attribution_summary.endorsement_hosts):
+        # independent endorsement-role hosts that NAME THE MERCHANT. Post W1 site-8
+        # cutover this set is the RunFacts T2 fold (brand-grain naming, per-source),
+        # so proof-of-done shares ONE endorsement definition with the rendered
+        # "independently recommended" card instead of re-deriving a divergent
+        # SKU-name gate off the per-host rows. A host that grounded a category answer
+        # while recommending a COMPETITOR (never naming the merchant) is NOT in the
+        # T2 set, so it still can't produce a false "your pitch worked". Honest proof
+        # = the pitched host now independently cites the merchant.
         amap = (audit_report or {}).get("authority_map") or {}
-        citing_hosts = set()
-        for row in amap.get("hosts") or []:
-            if not isinstance(row, dict):
-                continue
-            if not is_endorsement_role(row.get("citation_role")):
-                continue
-            if not (row.get("cites_exact_sku") or row.get("cites_near_variant")):
-                continue
-            host = _norm_host(row.get("host"))
-            if host:
-                citing_hosts.add(host)
+        summary = amap.get("host_attribution_summary") or {}
+        citing_hosts = {
+            h
+            for h in (
+                _norm_host(x) for x in (summary.get("endorsement_hosts") or [])
+            )
+            if h
+        }
         if not citing_hosts:
             return {"checked": 0, "flipped": 0}
 

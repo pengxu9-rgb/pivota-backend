@@ -741,23 +741,32 @@ LEGACY_CITEDNESS_SITES: Tuple[Dict[str, Any], ...] = (
               " resolves"},
     {"id": 10, "site": "citation_operator_service", "tier": "T3-soft",
      "definition": "own thresholds + substring match", "instrumented": False,
-     "mode": "measure",
-     "notes": "operates on stored reports/probe snapshots outside the audit"
-              " assembly; instrument when its read path consumes stamped"
-              " run_facts (post-#1148 payloads only)"},
+     "mode": "measure", "decision": "defer",
+     "notes": "DEFER (2026-07-04): a SEPARATE probe-scan product (run_citation_scan"
+              " runs its own probes + extract_cited_hosts over them), not the audit"
+              " report path. Rewiring needs stamped run_facts on ITS scan payloads"
+              " first — distinct plumbing, no drift evidence, low traffic. Not a"
+              " quick collapse; left as-is"},
     {"id": 11, "site": "task_queue_service proof-of-done", "tier": "T2-ish",
-     "definition": "endorsement-host-now-cites", "instrumented": False,
-     "mode": "measure",
-     "notes": "decision sheet: proof-of-done becomes T2 (endorsement-host cite),"
-              " movement stays T3; compares stored before/after payloads —"
-              " instrument once stamped run_facts exists on both sides of a"
-              " re-audit pair"},
+     "definition": "endorsement-host-now-cites", "instrumented": True,
+     "mode": "measure", "rewired": True,
+     "notes": "REWIRED 2026-07-04: reverify_outreach_records now reads the ONE"
+              " endorsement set (host_attribution_summary.endorsement_hosts = the"
+              " RunFacts T2 fold post site-8) instead of re-deriving a divergent"
+              " SKU-name gate off per-host rows. Proof-of-done now shares the same"
+              " brand-grain endorsement definition as the rendered 'independently"
+              " recommended' card; a competitor-only citation still can't false-flip"
+              " (not in the T2 set)"},
     {"id": 12, "site": "co_occurrence_finder._brand_in_text", "tier": "T3-soft",
      "definition": "manually-synced copy of site 4's matcher", "instrumented": False,
-     "mode": "drift",
-     "notes": "answer-TEXT matcher with no source-walk analogue — cutover is"
-              " 'replace the copied matcher with the shared brand_alias one',"
-              " not a RunFacts rewire; no runtime parity to log"},
+     "mode": "drift", "decision": "keep-variant",
+     "notes": "KEEP (2026-07-04): a word-boundary brand matcher with a deliberate"
+              " 4-char threshold (false-positive guard on fetched ARTICLE text,"
+              " mirrors site 4). The shared brand_alias.text_mentions_brand uses a"
+              " looser 3-char _MIN_ALIAS_LEN, so swapping would REGRESS the guard;"
+              " and it matches arbitrary claimed competitor brands (no alias sets"
+              " to derive). Unify only if the shared matcher gains a configurable"
+              " threshold"},
 )
 
 
