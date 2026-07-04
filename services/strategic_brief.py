@@ -42,9 +42,10 @@ from services.sku_lane_priority import (
 
 logger = logging.getLogger(__name__)
 
-# Reliability knobs for the LLM ("mainline") brief. The deterministic brief is a
-# strictly worse merchant experience, so we retry transient provider failures with
-# backoff (a single blip must not drop the merchant to the deterministic template).
+# Reliability knobs for the LLM brief. W4: there is NO deterministic fallback —
+# a brief that can't ground returns None (honest failure + refund), never a
+# fabricated template — so we retry transient provider failures with backoff to
+# make honest-failure rare (a single blip must not lose the merchant a real brief).
 # The content-attempt count / max tokens live in _STRATEGIC_BRIEF_MAX_ATTEMPTS /
 # _STRATEGIC_BRIEF_MAX_TOKENS below.
 _BRIEF_TRANSPORT_RETRIES = 3         # extra retries for a single transient provider blip
@@ -775,14 +776,14 @@ _SAFETY_SENSITIVE_TERMS = {
 _SAFETY_TERM_FAMILIES = (
     frozenset({"treat", "treats", "treatment", "treatments"}),
 )
-# Max LLM drafts per SKU before giving up to the deterministic fallback. The
-# grounding validator is strict, so a clean draft is found reliably only with
-# several tries; a passing draft short-circuits, so the common case stays cheap.
+# Max LLM drafts per SKU before honest failure (return None). The grounding
+# validator is strict, so a clean draft is found reliably only with several tries;
+# a passing draft short-circuits, so the common case stays cheap.
 _STRATEGIC_BRIEF_MAX_ATTEMPTS = 6
 # Raised from 1200: the brief evidence now carries mined category answers +
 # competitor "known for" depth, so 1200-token drafts were truncating
-# (finish_reason=length, shape_ok=False) on ~half the attempts → forced the
-# deterministic fallback. 2000 gives the full brief room to land.
+# (finish_reason=length, shape_ok=False) on ~half the attempts → honest failure.
+# 2000 gives the full brief room to land.
 _STRATEGIC_BRIEF_MAX_TOKENS = 2000
 
 
@@ -835,8 +836,8 @@ def assemble_sku_brief_evidence(
             # The merchant's own canonical host. A useful brief MUST be able to
             # name it ("make anukoofficial.com the buyable canonical page"); add
             # it so grounding allows it instead of rejecting it as an unknown
-            # domain (which forced every brief back to the generic deterministic
-            # fallback that can only say "the official brand PDP").
+            # domain (which used to force honest failure — the brief couldn't even
+            # name the merchant's own buyable page).
             "merchant_host": _normalize_host(merchant_host) or None,
         },
         "position": _position_from_ladder(opportunity_map),
@@ -982,7 +983,7 @@ def _resolve_brief_provider(provider: Optional[str]) -> Optional[str]:
     """Resolve the brief generator, degrading by KEY availability. Explicit
     `provider` (if given) wins; else settings.strategic_brief_provider (default
     gemini); DeepSeek is the final fallback so a missing Gemini key never
-    forces the deterministic template. Returns None only when NO candidate has
+    forces honest failure (None). Returns None only when NO candidate has
     a configured key."""
     chain = [provider, settings.strategic_brief_provider, "deepseek"]
     seen: Set[str] = set()
@@ -1011,7 +1012,7 @@ async def generate_sku_strategic_brief(
     # `debug` (when provided) is populated in place with exactly why a brief did
     # or didn't ship, and persisted onto next_best_action.brief_debug so the
     # fallback cause is diagnosable from the stored report without worker-shell
-    # access (the LLM lane must work continuously; the deterministic fallback is
+    # access (the LLM lane must work continuously; honest failure is
     # not acceptable as a steady state).
     dbg: Dict[str, Any] = debug if debug is not None else {}
     dbg["enabled"] = bool(getattr(settings, "strategic_brief_enabled", False))
@@ -1040,7 +1041,7 @@ async def generate_sku_strategic_brief(
     # The grounding validator is deliberately strict (a trust product), so a
     # single LLM draft can trip it stochastically. Retry enough that a clean
     # draft is reliably found — the LLM lane must work continuously, not fall
-    # back to the generic deterministic template. On shape/grounding rejection we
+    # back to the honest failure (None). On shape/grounding rejection we
     # feed the model a targeted repair hint before the next attempt; transient
     # provider blips are retried with backoff inside _synthesize_with_transport_retry.
     best_grounded_brief: Optional[Dict[str, Any]] = None
@@ -1097,8 +1098,8 @@ async def generate_sku_strategic_brief(
         # (temperature is non-zero, so the model still slips ~occasionally). A
         # style slip is retried WITH a hint, but — unlike grounding — it must
         # NEVER cost the merchant the LLM brief: a style-imperfect LLM draft
-        # (jargon then scrubbed deterministically) still beats the generic
-        # deterministic template, so we keep the first clean draft as a floor.
+        # (jargon then scrubbed deterministically) still beats honest failure, so
+        # we keep the first clean draft as a floor.
         sf = _style_failures(brief)
         if sf:
             att["style_failures"] = sf
@@ -1118,7 +1119,7 @@ async def generate_sku_strategic_brief(
     # W4: every attempt failed grounding/shape — honest absence, no template.
     # The closed-world manifest makes this rare; when it happens the section is
     # withheld and brief_status reflects it, rather than shipping a generic
-    # deterministic brief that reads as bespoke analysis it isn't.
+    # fabricated brief that reads as bespoke analysis it isn't.
     dbg["outcome"] = "unavailable_after_rejects"
     return None
 
@@ -1126,7 +1127,7 @@ async def generate_sku_strategic_brief(
 def _is_retryable_synthesis_error(exc: LLMSynthesisError) -> bool:
     """A transient provider failure worth retrying vs. a fatal one. Missing key,
     unsupported provider, and 4xx (except throttling) are fatal — retrying just
-    wastes time and delays the deterministic fallback. Transport failures (no
+    wastes time and delays honest failure. Transport failures (no
     status code) and 429/5xx are transient."""
     if isinstance(exc, MissingLLMKeyError):
         return False
@@ -1234,7 +1235,7 @@ def _scrub_merchant_jargon(brief: Optional[Dict[str, Any]]) -> Optional[Dict[str
 
 
 # Map the internal grounding-failure codes to a plain corrective instruction so a
-# retry can fix the specific violation instead of dropping to the deterministic brief.
+# retry can fix the specific violation instead of dropping to honest failure.
 _GROUNDING_REPAIR_RULES: Tuple[Tuple[str, str], ...] = (
     ("style-formulaic-opener",
      "Do NOT use a 'Stop chasing …' or 'Stop trying to win …' construction anywhere. "
@@ -2106,420 +2107,6 @@ def _has_required_shape(brief: Mapping[str, Any]) -> bool:
     return True
 
 
-def _validated_deterministic_brief(
-    evidence: Mapping[str, Any],
-    *,
-    dbg: Optional[Dict[str, Any]] = None,
-) -> Optional[Dict[str, Any]]:
-    brief = _deterministic_brief(evidence)
-    if brief and validate_grounding(brief, evidence):
-        return brief
-    if dbg is not None:
-        dbg["deterministic_failed"] = True
-        dbg["deterministic_grounding_failures"] = (
-            _grounding_failures(brief, evidence) if brief else ["<empty deterministic brief>"]
-        )
-    return None
-
-
-def _deterministic_traffic_how(
-    opportunity: Mapping[str, Any],
-    *,
-    page_label: str,
-    default_how: str,
-) -> str:
-    profile = _as_mapping(opportunity.get("controller_profile")) or build_controller_profile(
-        _as_list(opportunity.get("controlled_by"))
-    )
-    if is_canonical_source_vacuum(profile):
-        return (
-            f"Make {page_label} more retrievable and extractable for the exact lane, "
-            "state the evidenced attributes in text, build reviews/proof, work the "
-            "cited source by controller type, keep source facts consistent, re-audit "
-            "and verify materiality, then add offer, bundle, subscription, and "
-            "why-buy-direct proof last."
-        )
-    if _clean_str(profile.get("strategy")) == "source_authority_gap":
-        return (
-            f"Make {page_label} more retrievable, extractable, and authoritative for "
-            "the exact lane, work the evidenced source trail by controller type, keep "
-            "facts consistent, re-audit and verify materiality, then add direct-buy "
-            "mechanics last."
-        )
-    return default_how
-
-
-def _is_plausible_query(query: str) -> bool:
-    """Guard against a product description (or other long/label-prefixed blob)
-    leaking into a slot that expects a short search query. Real shopper queries
-    are short ("reviews hair mask / deep conditioning treatment"); a raw
-    description ("description a gentle scrub formulated with a natural exfoliator
-    …") is not, and must never be inlined verbatim into merchant-facing prose."""
-    q = _clean_str(query)
-    if not q:
-        return False
-    if len(q) > 90 or len(q.split()) > 12:
-        return False
-    if q.lower().startswith(("description ", "description:")):
-        return False
-    return True
-
-
-def _deterministic_wedge_decision(sideways_wedge: Mapping[str, Any]) -> str:
-    beachhead = _as_mapping(sideways_wedge.get("recommended_beachhead_lane"))
-    query = _clean_str(beachhead.get("query"))
-    if not _is_plausible_query(query):
-        return ""
-    deferred = next(
-        (
-            _clean_str(item.get("query"))
-            for item in _as_list(sideways_wedge.get("do_not_chase_yet"))
-            if isinstance(item, Mapping) and _clean_str(item.get("query"))
-        ),
-        "",
-    )
-    if deferred:
-        return (
-            f"Win the '{query}' search first and hold off on '{deferred}' for now — "
-            "the tighter search is more specific to this product, so your own page can "
-            "more easily become the one AI cites and buyers choose."
-        )
-    return (
-        f"Win the '{query}' search first — it is specific to this product and already "
-        "shows demand that other sites are capturing."
-    )
-
-
-def _low_signal_brief(evidence: Mapping[str, Any]) -> Dict[str, Any]:
-    """Grounding-safe brief for SKUs with no buyer-path evidence yet.
-
-    A not-yet-visible SKU has no probes, citations, competitors, or lanes, so the
-    allowed-grounding set is sparse and any evidence-keyed brief (LLM or the lane-
-    driven deterministic path) gets rejected — historically yielding None and a
-    silent fall-through to the generic NBA boilerplate.
-
-    This brief is built ONLY from product facts that are already in the allowed-
-    grounding set (title, merchant page label/destination, evidenced attributes)
-    plus generic, non-named guidance. It names no competitor, domain, search lane,
-    statistic, or safety-sensitive claim, so it passes validate_grounding by
-    construction (see _allowed_grounding: product.title and merchant_path.* are
-    add_term'd, attributes feed _brief_angle_terms). The honest call for an
-    invisible SKU is to make its own page exist, be specific, and become citable
-    before any conversion play — never fabricated specifics.
-    """
-    product = _as_mapping(evidence.get("product"))
-    title = _clean_str(product.get("title")) or "this SKU"
-    merchant_path = _as_mapping(product.get("merchant_path"))
-    page_label = _clean_str(merchant_path.get("page_label")) or "the merchant-controlled page"
-    destination = _clean_str(merchant_path.get("destination")) or "the merchant-controlled website"
-    attributes = _as_mapping(product.get("attributes"))
-    angle_terms = _brief_angle_terms(attributes)
-
-    first_moves = [
-        (
-            f"Make {page_label} the complete, specific canonical page for {title}: "
-            "full description, images, specs, price, and availability in plain page text."
-        ),
-        (
-            f"State {angle_terms} in plain text on {page_label}, and add product, offer, "
-            "review, and FAQ schema so the page is more retrievable and extractable."
-        ),
-        (
-            f"Build verified reviews and proof on {page_label} so {destination} reads as the "
-            "most authoritative source for this product."
-        ),
-        (
-            f"Re-audit {title} after the page is live and complete, and verify whether it has "
-            "started to surface in AI shopping answers before treating any lane as lost."
-        ),
-    ]
-    self_serve = [
-        f"Make {page_label} complete and specific for {title} with full text, images, and schema.",
-        "Keep product facts, price, stock, and availability fresh and consistent.",
-        "Re-audit after the page is live to verify whether it surfaces in AI shopping answers.",
-    ]
-    return {
-        "position": (
-            f"{title} is not yet surfacing in AI shopping answers, so there is no grounded "
-            "demand or competitive read to act on yet."
-        ),
-        "core_decision": (
-            f"Make {page_label} the complete, specific, citable canonical page for {title} first; "
-            "getting the product retrievable and extractable comes before any conversion play."
-        ),
-        "why_you_lose": (
-            f"AI's answers do not yet reference {title}, which suggests {destination} is not yet a "
-            "retrievable, extractable, authoritative source AI shopping assistants can cite for "
-            "this product."
-        ),
-        "your_angle": (
-            f"Lead with what makes this product specific — {angle_terms} — so that once "
-            f"{page_label} is complete, it is the page AI cites and buyers choose."
-        ),
-        "traffic_strategy": [],
-        "substitution_play": None,
-        "first_moves": first_moves,
-        "diy_vs_pivota": {
-            "self_serve": self_serve,
-            "pivota": (
-                "Pivota makes the canonical page more citable, buyable, and agent-checkout ready, "
-                "then monitors whether this product starts to surface in AI shopping answers."
-            ),
-        },
-    }
-
-
-def _deterministic_brief(evidence: Mapping[str, Any]) -> Optional[Dict[str, Any]]:
-    product = _as_mapping(evidence.get("product"))
-    title = _clean_str(product.get("title")) or "this SKU"
-    merchant_path = _as_mapping(product.get("merchant_path"))
-    page_label = _clean_str(merchant_path.get("page_label")) or "the merchant-controlled page"
-    destination = _clean_str(merchant_path.get("destination")) or "the merchant-controlled website"
-    opportunities = [
-        item for item in _as_list(evidence.get("buyer_path_opportunities"))
-        if isinstance(item, Mapping) and _clean_str(item.get("query"))
-    ]
-    if not opportunities:
-        # No lane/buyer-path evidence (not-yet-visible SKU): fall back to the
-        # grounding-safe low-signal brief instead of returning None, which used
-        # to silently drop the per-SKU brief to generic NBA boilerplate.
-        return _low_signal_brief(evidence)
-    lead = opportunities[0]
-    query = _clean_str(lead.get("query"))
-    controllers = _unique_host_roles(
-        controller
-        for opportunity in opportunities[:3]
-        for controller in _as_list(opportunity.get("controlled_by"))
-        if isinstance(controller, Mapping)
-    )[:3]
-    controller_phrase = _controller_phrase(controllers)
-    attributes = _as_mapping(product.get("attributes"))
-    angle_terms = _brief_angle_terms(attributes)
-    lead_profile = _as_mapping(lead.get("controller_profile"))
-    if not _as_list(lead_profile.get("classified_controllers")):
-        lead_profile = build_controller_profile(_as_list(lead.get("controlled_by")))
-    vacuum_strategy = is_canonical_source_vacuum(lead_profile)
-    source_authority_strategy = _clean_str(lead_profile.get("strategy")) == "source_authority_gap"
-    sideways_wedge = _as_mapping(evidence.get("sideways_wedge"))
-    wedge_decision = _deterministic_wedge_decision(sideways_wedge)
-    source_action = _sentence(
-        _controller_source_route_action(lead_profile, controller_phrase, query, page_label)
-    )
-
-    if vacuum_strategy:
-        first_moves = [
-            (
-                f"Build {page_label} to rank for the exact lane {query} and add "
-                "product/offer/review/FAQ schema, so it is more retrievable and "
-                "extractable before any conversion play."
-            ),
-            (
-                f"State {angle_terms} in plain page text for {query}, then build "
-                "verified reviews and proof so the official page is more authoritative."
-            ),
-            (
-                source_action
-            ),
-            (
-                f"Keep SKU name, {angle_terms}, images, availability, and canonical URL "
-                f"consistent across {page_label} and {controller_phrase}; re-audit {query} "
-                "and verify materiality before treating exposure as lost buyer traffic."
-            ),
-            (
-                "After the page is more retrievable, extractable, and authoritative, add "
-                "first-order offer, starter + replenishment bundle, subscription incentive, "
-                "and why-buy-direct proof."
-            ),
-        ]
-    elif source_authority_strategy:
-        first_moves = [
-            (
-                f"Build {page_label} to rank for the exact lane {query} and add "
-                "product/offer/review/FAQ schema, so it is more retrievable and "
-                "extractable before outreach."
-            ),
-            (
-                f"State {angle_terms} in plain page text for {query}, then build "
-                "verified reviews and proof so the official page is more authoritative."
-            ),
-            (
-                source_action
-            ),
-            (
-                f"Keep SKU name, {angle_terms}, images, availability, and canonical URL "
-                f"consistent across {page_label} and {controller_phrase}; re-audit {query} "
-                "and verify materiality before treating exposure as lost buyer traffic."
-            ),
-            (
-                "After the page is more retrievable, extractable, and authoritative, add "
-                "first-order offer, starter + replenishment bundle, subscription incentive, "
-                "and why-buy-direct proof."
-            ),
-        ]
-    else:
-        first_moves = [
-            (
-                f"Make {page_label} the more citable + buyable canonical page for {query}, "
-                "then add a first-order offer so buyers have a reason to choose the "
-                "merchant path."
-            ),
-            (
-                f"Add a starter + replenishment bundle on {page_label} for {query}, "
-                "so the page has a concrete value reason beyond third-party exposure."
-            ),
-            (
-                "Add subscription incentive and why-buy-direct proof: guarantee, samples, "
-                "loyalty, returns, stock, and fresh facts."
-            ),
-        ]
-    if controllers:
-        first_moves.append(
-            f"Update the source trail around {controller_phrase} only after {page_label} "
-            "has the direct buying reason."
-        )
-
-    if vacuum_strategy:
-        position = (
-            f"{title} has AI answer exposure for {query}, but the grounded source trail leans on "
-            f"{controller_phrase}, not {destination}."
-        )
-        core_decision = (
-            f"Make {page_label} the page AI most easily finds, quotes, and trusts for the "
-            f"'{query}' search, then check whether it is driving real buyer traffic before "
-            "treating a few obscure cited sites as a lost sale."
-        )
-        why_you_lose = (
-            f"AI's answers show {controller_phrase} shaping the citation trail for {query}. "
-            f"That suggests {destination} is not yet the most authoritative fact-bearing source "
-            "for this lane."
-        )
-        traffic_how_default = (
-            f"Make {page_label} more retrievable and extractable for {query}, state "
-            f"{angle_terms} in text, build reviews/proof, work {controller_phrase} by "
-            "controller type, keep facts consistent, re-audit and verify materiality, "
-            "then add offer, bundle, subscription, and why-buy-direct proof last."
-        )
-        self_serve = [
-            f"Build {page_label} around the exact lane, schema, and plain-text attributes.",
-            f"Work {controller_phrase} by controller type and keep facts consistent.",
-            "Re-audit the lane and verify materiality before adding direct-buy mechanics.",
-        ]
-    elif source_authority_strategy:
-        position = (
-            f"{title} has real demand in AI answers, but the buying path is shaped by "
-            f"{controller_phrase}, not {destination}."
-        )
-        core_decision = (
-            f"Make {page_label} the page AI most easily finds, quotes, and trusts for the "
-            f"'{query}' search, then work with the sites AI already cites — keeping the "
-            "same facts everywhere."
-        )
-        why_you_lose = (
-            f"AI's answers show {controller_phrase} shaping {query}. That suggests "
-            "third-party source authority is carrying the facts and trust before the "
-            "official page does."
-        )
-        traffic_how_default = (
-            f"Make {page_label} more retrievable and extractable for {query}, state "
-            f"{angle_terms} in text, build reviews/proof, work {controller_phrase} by "
-            "controller type, keep facts consistent, re-audit and verify materiality, "
-            "then add direct-buy mechanics last."
-        )
-        self_serve = [
-            f"Build {page_label} around the exact lane, schema, and plain-text attributes.",
-            f"Work {controller_phrase} by controller type and keep facts consistent.",
-            "Re-audit the lane and verify materiality before adding direct-buy mechanics.",
-        ]
-    else:
-        position = (
-            f"{title} has real demand in AI answers, but the buying path is controlled "
-            f"by {controller_phrase}, not {destination}."
-        )
-        core_decision = (
-            f"Make {page_label} the better place to buy for the '{query}' search — "
-            "showing up in AI answers is not the win until buyers have a reason to "
-            "choose your own site."
-        )
-        why_you_lose = (
-            f"AI's answers show {controller_phrase} shaping {query}. That suggests "
-            "source and distribution authority are capturing the buyer path before "
-            f"{destination} does."
-        )
-        traffic_how_default = (
-            f"Make {page_label} the more citable + buyable canonical page first, "
-            "then add the offer, bundle, subscription, and why-buy-direct proof."
-        )
-        self_serve = [
-            "Add the offer, bundle, subscription, and why-buy-direct proof.",
-            "Keep price, stock, returns, reviews, and product facts fresh.",
-        ]
-
-    traffic_strategy = []
-    defer_queries = {
-        _clean_str(item.get("query")).lower(): item
-        for item in _as_list(sideways_wedge.get("do_not_chase_yet"))
-        if isinstance(item, Mapping) and _clean_str(item.get("query"))
-    }
-    for item in opportunities[:3]:
-        item_query = _clean_str(item.get("query"))
-        how = _deterministic_traffic_how(
-            item,
-            page_label=page_label,
-            default_how=traffic_how_default,
-        )
-        deferred = defer_queries.get(item_query.lower())
-        if isinstance(deferred, Mapping):
-            beachhead = _as_mapping(sideways_wedge.get("recommended_beachhead_lane"))
-            beachhead_query = _clean_str(beachhead.get("query"))
-            if _is_plausible_query(beachhead_query):
-                how = (
-                    f"Do not start here yet — win the '{beachhead_query}' search first; "
-                    "it is more specific to this product, so your page can more easily "
-                    "become the best place AI can cite and buy from."
-                )
-            else:
-                how = (
-                    "Do not start here yet — win a more product-specific search first, "
-                    "so your page can more easily become the best place AI can cite and "
-                    "buy from."
-                )
-        traffic_strategy.append({
-            "where": item_query,
-            "who_controls": _controller_phrase(
-                _unique_host_roles(
-                    controller
-                    for controller in _as_list(item.get("controlled_by"))
-                    if isinstance(controller, Mapping)
-                )
-            ),
-            "how": how,
-        })
-
-    if wedge_decision:
-        core_decision = f"{wedge_decision} {core_decision}"
-
-    return {
-        "position": position,
-        "core_decision": core_decision,
-        "why_you_lose": why_you_lose,
-        "your_angle": (
-            f"Lead with what makes this product specific — {angle_terms} — so your own "
-            "page is the one AI cites and buyers choose, not just another listing."
-        ),
-        "traffic_strategy": traffic_strategy,
-        "substitution_play": _deterministic_substitution_play(evidence, page_label),
-        "first_moves": first_moves[:5],
-        "diy_vs_pivota": {
-            "self_serve": self_serve,
-            "pivota": (
-                "Pivota makes the canonical page more citable, buyable, and agent-checkout "
-                "ready, then monitors whether these same lanes move toward the "
-                "merchant-controlled path."
-            ),
-        },
-    }
-
-
 def _controller_phrase(controllers: List[Mapping[str, Any]]) -> str:
     hosts = [
         _normalize_host(controller.get("host"))
@@ -2536,13 +2123,6 @@ def _controller_phrase(controllers: List[Mapping[str, Any]]) -> str:
     return ", ".join(hosts[:-1]) + f", and {hosts[-1]}"
 
 
-def _brief_angle_terms(attributes: Mapping[str, Any]) -> str:
-    terms: List[str] = []
-    for key in ("certification", "ingredient", "format", "use_case", "category"):
-        terms.extend(_as_str_list(attributes.get(key)))
-    return _phrase_join(_unique(terms[:5]), "the evidenced product attributes")
-
-
 def _phrase_join(values: List[str], fallback: str) -> str:
     cleaned = [value for value in values if _clean_str(value)]
     if not cleaned:
@@ -2552,33 +2132,6 @@ def _phrase_join(values: List[str], fallback: str) -> str:
     if len(cleaned) == 2:
         return f"{cleaned[0]} and {cleaned[1]}"
     return ", ".join(cleaned[:-1]) + f", and {cleaned[-1]}"
-
-
-def _deterministic_substitution_play(
-    evidence: Mapping[str, Any],
-    page_label: str,
-) -> Optional[str]:
-    substitution = _as_mapping(evidence.get("substitution"))
-    if not substitution.get("present"):
-        return None
-    prompt = _clean_str(substitution.get("on_prompt"))
-    handed_to = _clean_str(substitution.get("handed_to"))
-    if not prompt and not handed_to:
-        return None
-    if prompt and handed_to:
-        return (
-            f"Answer {prompt} on {page_label} with a factual comparison against "
-            f"{handed_to}, then connect the comparison to the direct buying reason."
-        )
-    if prompt:
-        return (
-            f"Answer {prompt} on {page_label}, then connect the comparison to the "
-            "direct buying reason."
-        )
-    return (
-        f"Publish a factual comparison against {handed_to} on {page_label}, then "
-        "connect it to the direct buying reason."
-    )
 
 
 def _grounding_failures(
@@ -2629,7 +2182,7 @@ def _grounding_failures(
     # "publisher's", "it's") before scanning for single-quoted lanes. Otherwise
     # the apostrophe in a contraction pairs with a real lane's quote and
     # fabricates a bogus "unknown-quoted-lane" failure — which silently rejects
-    # otherwise-grounded LLM briefs and forces the deterministic fallback. A real
+    # otherwise-grounded LLM briefs and forces honest failure. A real
     # quoted lane's delimiters have a non-word char on the outer side, so they are
     # untouched by this substitution.
     quote_scan_text = _INTRAWORD_APOSTROPHE_RE.sub("", text)
