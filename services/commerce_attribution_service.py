@@ -1,9 +1,10 @@
 from __future__ import annotations
 
+import json
 import logging
 import uuid
 from datetime import datetime, timezone
-from decimal import Decimal
+from decimal import Decimal, InvalidOperation
 from typing import Any, Dict, Optional
 from urllib.parse import parse_qsl, urlencode, urlparse, urlunparse
 
@@ -29,6 +30,15 @@ PVT_CLICK_ID = "pvt_click_id"
 PVT_PRODUCT_ID = "pvt_product_id"
 PVT_VARIANT_ID = "pvt_variant_id"
 PVT_PROMPT_CLUSTER = "pvt_prompt_cluster"
+
+# The order-surviving cart attribute T2-1 stamps onto the Shopify cart permalink.
+# Shopify persists it verbatim into the paid order's note_attributes, giving us
+# the join key on the way back in (orders/paid webhook). Keep in lockstep with
+# services/outbound_links_service.build_shopify_cart_permalink.
+EXTERNAL_CLICK_NOTE_ATTR = "pivota_click_id"
+EDGE_STATE_REFERRED = "referred"
+EDGE_STATE_CONVERTED = "converted"
+EDGE_SOURCE_EXTERNAL_REDIRECT = "external_redirect"
 
 
 def new_click_id() -> str:
@@ -513,4 +523,270 @@ async def trace_click_id(click_id: str) -> Dict[str, Any]:
     return {
         "click": dict(click_row) if click_row else None,
         "edges": [dict(row) for row in edge_rows],
+    }
+
+
+# --- T2-2: inbound loop closure for external (un-integrated-merchant) conversions ---
+#
+# A purchase completed on the merchant's OWN Shopify checkout has NO Pivota
+# `orders` row. T2-1 stamped `pivota_click_id` onto the cart permalink; Shopify
+# persisted it into the paid order's note_attributes. The orders/paid webhook
+# recovers it here and materializes a self-contained `converted` edge (gap #4).
+
+
+def extract_click_id_from_note_attributes(note_attributes: Any) -> Optional[str]:
+    """Pull `pivota_click_id` out of a Shopify order's ``note_attributes``.
+
+    Shopify sends note_attributes as ``[{"name": ..., "value": ...}, ...]``.
+    Tolerate a dict shape too (some connectors flatten it). Returns None when
+    the attribute is absent/blank — a normal, non-attributed order.
+    """
+    if isinstance(note_attributes, dict):
+        value = note_attributes.get(EXTERNAL_CLICK_NOTE_ATTR)
+        text = str(value).strip() if value is not None else ""
+        return text or None
+    if isinstance(note_attributes, (list, tuple)):
+        for attr in note_attributes:
+            if not isinstance(attr, dict):
+                continue
+            if str(attr.get("name") or "").strip() == EXTERNAL_CLICK_NOTE_ATTR:
+                value = attr.get("value")
+                text = str(value).strip() if value is not None else ""
+                if text:
+                    return text
+    return None
+
+
+def shopify_order_total_to_cents(data: Dict[str, Any]) -> tuple[Optional[int], Optional[str]]:
+    """Best-effort (amount_cents, currency) from a Shopify order webhook payload.
+
+    Prefers the ``*_set.shop_money`` shape (carries an explicit currency), then
+    falls back to the flat ``total_price`` + ``currency`` fields. Never guesses a
+    currency; returns amount even if currency is unknown so GMV is still counted.
+    """
+    money = None
+    for key in ("current_total_price_set", "total_price_set"):
+        candidate = data.get(key)
+        if isinstance(candidate, dict):
+            shop_money = candidate.get("shop_money")
+            if isinstance(shop_money, dict) and shop_money.get("amount") is not None:
+                money = shop_money
+                break
+    amount_raw: Any = None
+    currency: Optional[str] = None
+    if money is not None:
+        amount_raw = money.get("amount")
+        currency = money.get("currency_code")
+    if amount_raw is None:
+        amount_raw = data.get("current_total_price", data.get("total_price"))
+    if not currency:
+        currency = data.get("currency")
+
+    cents: Optional[int] = None
+    if amount_raw is not None:
+        try:
+            cents = int((Decimal(str(amount_raw)) * Decimal("100")).quantize(Decimal("1")))
+        except (InvalidOperation, ValueError, TypeError):
+            cents = None
+    currency = (str(currency).strip().upper() or None) if currency else None
+    return cents, currency
+
+
+def _ext_edge_keys(merchant_id: str, external_order_id: str) -> tuple[str, str]:
+    """Deterministic (edge_id, synthetic order_id) for an external conversion.
+
+    order_id is NOT NULL + UNIQUE on the table but there is no Pivota order, so
+    we mint a synthetic one that is 1:1 with (merchant, external order). Both
+    keys derive from the same seed, so a replay collides on BOTH the synthetic
+    order_id and the (merchant_id, external_order_id) guard.
+    """
+    seed = uuid.uuid5(uuid.NAMESPACE_URL, f"{merchant_id}:ext:{external_order_id}").hex
+    return f"cae_ext_{seed[:24]}", f"ext_{seed[:24]}"
+
+
+_CLOSE_EXTERNAL_CONVERSION_SQL = """
+INSERT INTO commerce_attribution_edges (
+  edge_id, merchant_id, interaction_id, click_id, order_id, external_order_id,
+  surface, commerce_surface, canonical_product_id, canonical_variant_id,
+  prompt_cluster, source_channel, source_family, query_source, agent_id,
+  protocol_name, llm_provider, llm_model, caller_id,
+  state, source, converted_at, gross_attributed_gmv_cents, currency,
+  refund_ids, refund_count, refunded_amount, metadata, created_at, updated_at
+) VALUES (
+  :edge_id, :merchant_id, :interaction_id, :click_id, :order_id, :external_order_id,
+  :surface, :commerce_surface, :canonical_product_id, :canonical_variant_id,
+  :prompt_cluster, :source_channel, :source_family, :query_source, :agent_id,
+  :protocol_name, :llm_provider, :llm_model, :caller_id,
+  :state, :source, :converted_at, :gross_attributed_gmv_cents, :currency,
+  '[]'::jsonb, 0, 0, CAST(:metadata AS JSONB), :now, :now
+)
+ON CONFLICT (merchant_id, external_order_id) DO NOTHING
+RETURNING edge_id
+"""
+
+
+async def close_external_order_conversion(
+    *,
+    merchant_id: str,
+    click_id: Optional[str],
+    external_order_id: str,
+    gross_amount_cents: Optional[int],
+    currency: Optional[str],
+    converted_at: Optional[datetime] = None,
+    note_attrs_or_payload: Optional[Dict[str, Any]] = None,
+) -> Optional[Dict[str, Any]]:
+    """Materialize a `converted` external attribution edge from an orders/paid webhook.
+
+    - Binds the edge to the original click by looking up ``surface_click_events``
+      (merchant-scoped) so the conversion carries the product/surface it came from.
+    - **Unknown-click decision:** if there is no click row (or the click belongs
+      to another merchant), we still RECORD the conversion — merchant-scoped,
+      product NULL, ``metadata.click_matched=false`` — rather than drop it. The
+      order literally carries a Pivota-minted click id, so the GMV is genuinely
+      Pivota-referred; dropping it would silently undercount merchant GMV. We
+      never *fabricate* a click row or a product binding.
+    - **Idempotent** on ``(merchant_id, external_order_id)`` via ON CONFLICT DO
+      NOTHING: a replay/at-least-once redelivery creates no second edge and does
+      not double-count GMV. Returns ``{"replayed": True, ...}`` on a replay.
+    """
+    merchant_id = str(merchant_id or "").strip()
+    external_order_id = str(external_order_id or "").strip()
+    if not merchant_id or not external_order_id:
+        logger.warning(
+            "commerce_attribution: external conversion missing keys "
+            "merchant_id=%r external_order_id=%r — skipping",
+            merchant_id,
+            external_order_id,
+        )
+        return None
+
+    click_id = (str(click_id).strip() or None) if click_id else None
+    now = _now()
+    converted_at = converted_at or now
+
+    # Bind to the originating click (merchant-scoped). Only adopt the click's
+    # product/surface when it is unscoped (NULL merchant, legacy thin row) or
+    # belongs to THIS merchant — never cross-bind another merchant's click.
+    click_row: Optional[Dict[str, Any]] = None
+    if click_id:
+        raw = await database.fetch_one(
+            select(surface_click_events).where(surface_click_events.c.click_id == click_id)
+        )
+        if raw is not None:
+            candidate = dict(raw)
+            click_merchant = candidate.get("merchant_id")
+            if not click_merchant or str(click_merchant) == merchant_id:
+                click_row = candidate
+    click_matched = click_row is not None
+
+    edge_id, synthetic_order_id = _ext_edge_keys(merchant_id, external_order_id)
+
+    def _pick(key: str) -> Optional[Any]:
+        return click_row.get(key) if click_row else None
+
+    metadata = {
+        "source": EDGE_SOURCE_EXTERNAL_REDIRECT,
+        "state": EDGE_STATE_CONVERTED,
+        "external_order_id": external_order_id,
+        "click_id": click_id,
+        "click_matched": click_matched,
+        "gross_attributed_gmv_cents": gross_amount_cents,
+        "currency": currency,
+    }
+    if isinstance(note_attrs_or_payload, dict):
+        metadata["shopify_order"] = {
+            k: note_attrs_or_payload.get(k)
+            for k in ("id", "name", "order_number", "financial_status")
+            if note_attrs_or_payload.get(k) is not None
+        }
+
+    values = {
+        "edge_id": edge_id,
+        "merchant_id": merchant_id,
+        "interaction_id": _pick("interaction_id"),
+        "click_id": click_id,
+        "order_id": synthetic_order_id,
+        "external_order_id": external_order_id,
+        "surface": _pick("surface"),
+        "commerce_surface": _pick("commerce_surface") or _pick("surface"),
+        "canonical_product_id": _pick("canonical_product_id"),
+        "canonical_variant_id": _pick("canonical_variant_id"),
+        "prompt_cluster": _pick("prompt_cluster"),
+        "source_channel": _pick("source_channel"),
+        "source_family": _pick("source_family"),
+        "query_source": _pick("query_source"),
+        "agent_id": _pick("agent_id"),
+        "protocol_name": _pick("protocol_name"),
+        "llm_provider": _pick("llm_provider"),
+        "llm_model": _pick("llm_model"),
+        "caller_id": _pick("caller_id"),
+        "state": EDGE_STATE_CONVERTED,
+        "source": EDGE_SOURCE_EXTERNAL_REDIRECT,
+        "converted_at": converted_at,
+        "gross_attributed_gmv_cents": (
+            int(gross_amount_cents) if gross_amount_cents is not None else None
+        ),
+        "currency": currency,
+        "metadata": json.dumps(metadata),
+        "now": now,
+    }
+
+    inserted = await database.fetch_one(_CLOSE_EXTERNAL_CONVERSION_SQL, values)
+    if inserted is None:
+        # Replay / at-least-once redelivery — the guard already holds this order.
+        logger.info(
+            "commerce_attribution: external conversion replay ignored "
+            "merchant_id=%s external_order_id=%s (no double-count)",
+            merchant_id,
+            external_order_id,
+        )
+        return {
+            "edge_id": edge_id,
+            "merchant_id": merchant_id,
+            "external_order_id": external_order_id,
+            "state": EDGE_STATE_CONVERTED,
+            "click_matched": click_matched,
+            "replayed": True,
+        }
+
+    # First observation only — emit the commerce event once (idempotency keyed on
+    # the external order so any downstream retry also dedupes).
+    await record_commerce_event_best_effort(
+        event_type="order.external_converted",
+        metadata={
+            "merchant_id": merchant_id,
+            "interaction_id": values["interaction_id"],
+            "external_order_id": external_order_id,
+            "order_id": synthetic_order_id,
+            "click_id": click_id,
+            "click_matched": click_matched,
+            "canonical_product_id": values["canonical_product_id"],
+            "canonical_variant_id": values["canonical_variant_id"],
+            "surface": values["surface"],
+            "gross_attributed_gmv_cents": values["gross_attributed_gmv_cents"],
+            "currency": currency,
+            "source": EDGE_SOURCE_EXTERNAL_REDIRECT,
+        },
+        source="commerce_attribution_edges",
+        upstream_idempotency_key=f"external_order:{merchant_id}:{external_order_id}",
+    )
+    if not click_matched:
+        logger.info(
+            "commerce_attribution: external conversion recorded UNATTRIBUTED "
+            "(no matching click row) merchant_id=%s external_order_id=%s click_id=%s",
+            merchant_id,
+            external_order_id,
+            click_id,
+        )
+    return {
+        "edge_id": edge_id,
+        "merchant_id": merchant_id,
+        "external_order_id": external_order_id,
+        "click_id": click_id,
+        "click_matched": click_matched,
+        "canonical_product_id": values["canonical_product_id"],
+        "gross_attributed_gmv_cents": values["gross_attributed_gmv_cents"],
+        "currency": currency,
+        "state": EDGE_STATE_CONVERTED,
+        "replayed": False,
     }
