@@ -233,3 +233,84 @@ async def get_outcomes(
 
 async def get_merchant_outcomes(merchant_id: str, *, window_key: str = "all_time") -> Optional[Dict[str, Any]]:
     return await get_outcomes("merchant", merchant_id, window_key=window_key)
+
+
+# Return-rate bands. Only assigned when min_sample_met — never inferred from a
+# handful of orders. Thresholds are deliberately coarse (the honest resolution of
+# a pre-launch sample): the raw refund_rate rides alongside for agents that want it.
+def _return_rate_band(refund_rate: Optional[float]) -> Optional[str]:
+    if refund_rate is None:
+        return None
+    if refund_rate <= 0.05:
+        return "low"
+    if refund_rate <= 0.15:
+        return "moderate"
+    return "elevated"
+
+
+def seller_trust_from_outcome(row: Optional[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
+    """Pure: turn one aggregated_outcomes merchant row into an honest seller-trust
+    envelope, or None when there's nothing real to say.
+
+    The moat signal is *what actually happened after an agent routed a buyer here*.
+    Discipline (mirrors the aggregator): counts are always real sums; a
+    return-rate + band appear ONLY when min_sample_met (transacted_count >=
+    MIN_SAMPLE_SIZE). Below that the envelope still carries the honest transacted
+    volume so an agent can weigh it — it just makes no rate claim. Returns None for
+    a merchant with zero transacted orders (no signal, not a fabricated zero)."""
+    if not row:
+        return None
+    transacted = int(row.get("transacted_count") or 0)
+    if transacted <= 0:
+        return None
+    min_met = bool(row.get("min_sample_met"))
+    raw_rate = row.get("refund_rate")
+    # refund_rate is already NULL below sample in the store; re-gate defensively.
+    refund_rate = float(raw_rate) if (min_met and raw_rate is not None) else None
+    computed_at = row.get("computed_at")
+    return {
+        "merchant_id": str(row.get("subject_key") or ""),
+        "window": str(row.get("window_key") or "all_time"),
+        "transacted_count": transacted,
+        "paid_count": int(row.get("paid_count") or 0),
+        "refunded_count": int(row.get("refunded_count") or 0),
+        "gmv_cents": int(row.get("gmv_cents") or 0),
+        "currency": row.get("currency"),
+        # Sample-gated: rate + band only when the volume backs it.
+        "sample_backed": min_met,
+        "return_rate": refund_rate,
+        "return_rate_band": _return_rate_band(refund_rate),
+        "computed_at": computed_at.isoformat() if hasattr(computed_at, "isoformat") else computed_at,
+    }
+
+
+async def get_seller_trust(merchant_id: str, *, window_key: str = "all_time") -> Optional[Dict[str, Any]]:
+    """The outcome-derived seller-trust signal for one merchant (W8 part B).
+
+    Reads the existing aggregated_outcomes store — no new table — and shapes the
+    honest envelope. None when the merchant has no transacted outcomes yet (the
+    correct empty-data behavior: fail-closed, never a fabricated trust score)."""
+    return seller_trust_from_outcome(await get_merchant_outcomes(merchant_id, window_key=window_key))
+
+
+async def seller_trust_bulk(
+    merchant_ids: List[str], *, window_key: str = "all_time"
+) -> Dict[str, Dict[str, Any]]:
+    """{merchant_id -> seller_trust envelope} for the merchants that have real
+    transacted outcomes. One query (no N+1); merchants with no outcome row simply
+    don't appear (the caller treats absence as "no signal yet")."""
+    ids = sorted({str(m) for m in (merchant_ids or []) if m})
+    if not ids:
+        return {}
+    await ensure_aggregated_outcomes_table()
+    rows = await database.fetch_all(
+        "SELECT * FROM aggregated_outcomes "
+        "WHERE subject_type = 'merchant' AND window_key = :wk AND subject_key = ANY(:ids)",
+        {"wk": window_key, "ids": ids},
+    )
+    out: Dict[str, Dict[str, Any]] = {}
+    for row in rows or []:
+        env = seller_trust_from_outcome(dict(row))
+        if env:
+            out[str(row["subject_key"])] = env
+    return out
