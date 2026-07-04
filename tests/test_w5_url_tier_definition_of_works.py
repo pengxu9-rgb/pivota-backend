@@ -133,9 +133,11 @@ async def test_seed_row_carries_pivota_signature_and_canonical_url(monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_seed_hook_inert_when_intake_off(monkeypatch):
-    """Intake OFF -> the discovery seed hook never touches the intake (no seed
-    row minted). The negative half of assertion 1."""
+async def test_seed_hook_seeds_unconditionally(monkeypatch):
+    """W5 P2: url_audit seeding is the unconditional main line — the discovery
+    seed hook mints a seed regardless of any env flag (ENABLE_AUDIT_INDEX_INTAKE
+    is gone). The positive restatement of the old flag-off negative: with no flag
+    set, the hook still calls the intake."""
     monkeypatch.delenv("ENABLE_AUDIT_INDEX_INTAKE", raising=False)
     monkeypatch.delenv("ENABLE_AUDIT_INDEX_INTAKE_MERCHANT_IDS", raising=False)
     import services.audit_index_intake as intake
@@ -151,7 +153,8 @@ async def test_seed_hook_inert_when_intake_off(monkeypatch):
     await worker._seed_url_audit_index(
         merchant_id=MERCHANT, synthetic_items=[_synthetic_item()],
     )
-    assert called == []
+    assert len(called) == 1
+    assert called[0][0] == MERCHANT
 
 
 # =====================================================================
@@ -213,21 +216,23 @@ async def test_indexing_cta_targets_real_seed_and_resolves(monkeypatch):
 
 @pytest.mark.asyncio
 async def test_cta_without_seed_keeps_urlwedge_and_honest_errors(monkeypatch):
-    """The negative: with NO seed (intake OFF), _url_audit_seed_report_identity
-    returns None so the CTA keeps its ephemeral urlwedge key, and the resolver
-    honestly returns None -> request_sku_indexing yields ``no_canonical_url``
-    (an honest error, not a crash). This is the 'honest error, zero silent
-    no-op' half of the invariant."""
-    monkeypatch.delenv("ENABLE_AUDIT_INDEX_INTAKE", raising=False)
-    monkeypatch.delenv("ENABLE_AUDIT_INDEX_INTAKE_MERCHANT_IDS", raising=False)
+    """The honest-error half of the invariant: when a seed genuinely can't be
+    keyed (no merchant_id / no resolvable seed URL — a real boundary, NOT a flag;
+    W5 P2 made seeding unconditional), _url_audit_seed_report_identity returns
+    None, so the CTA keeps its ephemeral urlwedge key, and the resolver honestly
+    returns None -> request_sku_indexing yields ``no_canonical_url`` (not a
+    crash). This is the 'honest error, zero silent no-op' half of the invariant."""
     import services.agent_center_bd_report_service as bd
 
     item = _synthetic_item()
     sku_ctx = bd.build_synthetic_sku_context(item, MERCHANT)
     product = sku_ctx["product"]
 
-    seed_pk, _seed_ck = bd._url_audit_seed_report_identity(MERCHANT, product, sku_ctx)
-    assert seed_pk is None  # intake off -> no seed to repoint to
+    # Genuine no-seed: an empty merchant_id can't key a seed (the real boundary
+    # P2 preserved at bd L6313 `if not merchant_id`), so there's nothing to
+    # repoint the CTA to.
+    seed_pk, _seed_ck = bd._url_audit_seed_report_identity("", product, sku_ctx)
+    assert seed_pk is None  # no merchant_id -> no seed to repoint to
 
     cta_target = item["sku_key"]  # stays the ephemeral key
     assert cta_target.startswith("urlwedge:")

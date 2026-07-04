@@ -70,8 +70,11 @@ def test_non_audit_pick_order_is_unchanged_by_the_guard():
     assert pick_canonical([higher, lowest])["product_key"] == "pk_a"
 
 
-def test_report_identity_is_pipe_key_when_intake_enabled(monkeypatch):
-    monkeypatch.setenv("ENABLE_AUDIT_INDEX_INTAKE", "1")
+def test_report_identity_is_pipe_key_unconditionally(monkeypatch):
+    # W5 P2: seeding is the unconditional main line — no flag env at all, the
+    # report still emits the real seed pipe key (the seed always exists to attach
+    # to).
+    monkeypatch.delenv("ENABLE_AUDIT_INDEX_INTAKE", raising=False)
     product = {
         "canonical_url": "https://www.anua.com/products/heartleaf-toner",
         "brand": "Anua",
@@ -85,17 +88,17 @@ def test_report_identity_is_pipe_key_when_intake_enabled(monkeypatch):
     assert ck == make_content_key("Anua", "Heartleaf 77% Soothing Toner")
 
 
-def test_report_identity_is_none_when_intake_disabled(monkeypatch):
+def test_report_identity_is_none_without_a_merchant_id(monkeypatch):
     monkeypatch.delenv("ENABLE_AUDIT_INDEX_INTAKE", raising=False)
     product = {
         "canonical_url": "https://www.anua.com/products/heartleaf-toner",
         "brand": "Anua",
         "title": "Heartleaf 77% Soothing Toner",
     }
-    # Off => keep the ephemeral urlwedge key (no seed exists to attach to).
-    assert _url_audit_seed_report_identity("m_anua", product, {}) == (None, None)
+    # No merchant_id => can't key a seed => keep the ephemeral urlwedge key.
+    assert _url_audit_seed_report_identity("", product, {}) == (None, None)
 
 
 def test_report_identity_is_none_without_a_url(monkeypatch):
-    monkeypatch.setenv("ENABLE_AUDIT_INDEX_INTAKE", "1")
+    monkeypatch.delenv("ENABLE_AUDIT_INDEX_INTAKE", raising=False)
     assert _url_audit_seed_report_identity("m_anua", {"title": "x"}, {}) == (None, None)

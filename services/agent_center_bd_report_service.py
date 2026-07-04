@@ -6294,23 +6294,23 @@ def _url_audit_seed_report_identity(
     """(pipe product_key, content_key) for a URL-audit product that was seeded
     into the commerce index, else (None, None).
 
-    Only returns a key when audit index-intake is ON — the seed must actually
-    exist for the portal's evidence endpoints (which resolve by platform +
-    source_product_id) to attach to it. Deterministic: mirrors the catalog row
-    audit_run_worker seeded from the SAME brand-surface URL (product.canonical_url),
-    so the pipe key's platform_product_id (source_product_id) matches the minted
-    row. The pipe form (`merchant|url_audit|source`) is what the portal's
-    parseProductKey expects, which is what lights up the 'supply proof' action."""
+    Always emits the seed key on the url_audit path (W5 P2 — audit_run_worker
+    seeds unconditionally, so the seed always exists for the portal's evidence
+    endpoints, which resolve by platform + source_product_id, to attach to it).
+    Deterministic: mirrors the catalog row audit_run_worker seeded from the SAME
+    brand-surface URL (product.canonical_url), so the pipe key's platform_product_id
+    (source_product_id) matches the minted row. The pipe form
+    (`merchant|url_audit|source`) is what the portal's parseProductKey expects,
+    which is what lights up the 'supply proof' action."""
     try:
         from services.audit_index_intake import (
             PLATFORM_URL_AUDIT,
-            audit_intake_enabled,
             stable_source_id,
         )
         from services.catalog_identity import make_content_key
     except Exception:  # noqa: BLE001 — never break report assembly on import
         return None, None
-    if not merchant_id or not audit_intake_enabled(merchant_id):
+    if not merchant_id:
         return None, None
     seed_url = str((product or {}).get("canonical_url") or "").strip() or None
     source_id = stable_source_id(seed_url) if seed_url else None
@@ -6489,8 +6489,8 @@ async def build_per_sku_report(
     # A URL-audited product that was auto-seeded into the index gets an
     # evidence-attachable pipe product_key (`merchant|url_audit|source`) so the
     # portal can offer "supply proof / upload docs" on it; without this the report
-    # carries the ephemeral `urlwedge:` key, which the portal can't act on. Only
-    # when index-intake is ON (the seed actually exists to attach to).
+    # carries the ephemeral `urlwedge:` key, which the portal can't act on. W5 P2:
+    # seeding is unconditional, so every url_audit SKU gets the real seed key.
     _seed_pk, _seed_ck = (None, None)
     if sku_ctx.get("synthetic_url_audit"):
         _seed_pk, _seed_ck = _url_audit_seed_report_identity(merchant_id, product, sku_ctx)
@@ -6502,9 +6502,10 @@ async def build_per_sku_report(
         # seed (no variant sku_key) becomes resolvable through the SAME mechanism
         # as a connected-store SKU — no tier-branching. Derived from the SAME
         # `_seed_pk` lineage (`merchant|url_audit|source`) so the CTA target and
-        # the seeded catalog_products.product_key always agree. Only when a seed
-        # actually exists (_seed_pk set → intake on); otherwise the CTA keeps the
-        # urlwedge key and the resolver honestly returns no_canonical_url.
+        # the seeded catalog_products.product_key always agree. Seeding is now
+        # unconditional (W5 P2), so _seed_pk is set for every url_audit SKU with a
+        # resolvable brand-surface URL; a SKU with no seed_url keeps the urlwedge
+        # key and the resolver honestly returns no_canonical_url.
         _seed_id_parts = str(_seed_pk or "").split("|") if _seed_pk else []
         if len(_seed_id_parts) == 3 and isinstance(next_best_action, dict):
             _cta = next_best_action.get("cta")
