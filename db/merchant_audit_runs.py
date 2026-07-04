@@ -464,6 +464,81 @@ async def count_runs_in_window(
         return 0
 
 
+async def audit_status_counts_in_window(*, window_seconds: int) -> Dict[str, int]:
+    """Global audit-run status breakdown over the trailing window (ALL merchants).
+    {status -> count}. Feeds the W7 audit-health tick. Best-effort — a metrics tick
+    must never raise into the scheduler — so returns {} on DB error."""
+    await ensure_merchant_audit_runs_table()
+    try:
+        cutoff = datetime.fromtimestamp(
+            _now_utc().timestamp() - window_seconds, tz=timezone.utc,
+        )
+        rows = await database.fetch_all(
+            "SELECT status, COUNT(*) AS n FROM merchant_audit_runs "
+            "WHERE requested_at >= :cutoff GROUP BY status",
+            {"cutoff": cutoff},
+        )
+        return {str(r["status"]): int(r["n"] or 0) for r in rows or []}
+    except Exception as exc:
+        logger.warning("audit_status_counts_in_window failed: %s", str(exc)[:200])
+        return {}
+
+
+async def recent_completed_reports(*, limit: int = 100) -> List[Dict[str, Any]]:
+    """The most recent COMPLETED runs' report payloads (report_jsonb only), newest
+    first — for the W7 brief-outcome scan (honest-failure lives INSIDE a completed
+    run, not in run status). Bounded + best-effort; [] on DB error."""
+    await ensure_merchant_audit_runs_table()
+    try:
+        rows = await database.fetch_all(
+            "SELECT run_id, report_jsonb FROM merchant_audit_runs "
+            "WHERE status = 'completed' AND report_jsonb IS NOT NULL "
+            "ORDER BY requested_at DESC LIMIT :lim",
+            {"lim": int(limit)},
+        )
+    except Exception as exc:
+        logger.warning("recent_completed_reports failed: %s", str(exc)[:200])
+        return []
+    out: List[Dict[str, Any]] = []
+    for r in rows or []:
+        d = dict(r)
+        out.append({
+            "run_id": str(d.get("run_id")) if d.get("run_id") else None,
+            "report_jsonb": _decode_jsonb_field(d.get("report_jsonb")),
+        })
+    return out
+
+
+async def recent_completed_reports_for_merchant(
+    *, merchant_id: str, limit: int = 2
+) -> List[Dict[str, Any]]:
+    """The most recent COMPLETED runs' full reports for ONE merchant, newest first
+    — for the W7 stability canary (compare the last two same-basis runs). Bounded +
+    best-effort; [] on DB error."""
+    await ensure_merchant_audit_runs_table()
+    try:
+        rows = await database.fetch_all(
+            "SELECT run_id, report_jsonb FROM merchant_audit_runs "
+            "WHERE merchant_id = :mid AND status = 'completed' AND report_jsonb IS NOT NULL "
+            "ORDER BY requested_at DESC LIMIT :lim",
+            {"mid": merchant_id, "lim": int(limit)},
+        )
+    except Exception as exc:
+        logger.warning(
+            "recent_completed_reports_for_merchant failed for %s: %s",
+            merchant_id, str(exc)[:200],
+        )
+        return []
+    out: List[Dict[str, Any]] = []
+    for r in rows or []:
+        d = dict(r)
+        out.append({
+            "run_id": str(d.get("run_id")) if d.get("run_id") else None,
+            "report_jsonb": _decode_jsonb_field(d.get("report_jsonb")),
+        })
+    return out
+
+
 async def count_runs_for_merchant_by_subject(
     *,
     merchant_id: str,

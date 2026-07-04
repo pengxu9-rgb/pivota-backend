@@ -53,6 +53,29 @@ async def get_seller_trust_admin(
     return {"found": bool(trust), "seller_trust": trust}
 
 
+@router.get("/audit-health", response_model=Dict[str, Any])
+async def get_audit_health_admin(
+    _: None = Depends(require_admin_key),
+) -> Dict[str, Any]:
+    """W7 audit-health snapshot: run-failure + honest-failure (brief unavailable_*)
+    rates over the rolling window, plus any threshold breaches. The same payload the
+    hourly audit_health_tick evaluates for alerting."""
+    from services.audit_health_metrics import compute_audit_health
+
+    return await compute_audit_health()
+
+
+@router.get("/stability-canary", response_model=Dict[str, Any])
+async def get_stability_canary_admin(
+    _: None = Depends(require_admin_key),
+) -> Dict[str, Any]:
+    """W7 stability canary: same-basis re-run |Δ| per configured house account (the
+    W2 comparability check). Runs the same read the twice-weekly tick evaluates."""
+    from services.audit_stability_canary import run_stability_canary
+
+    return await run_stability_canary()
+
+
 @router.post("/outcomes/refresh", response_model=Dict[str, Any])
 async def refresh_outcomes_admin(
     _: None = Depends(require_admin_key),
