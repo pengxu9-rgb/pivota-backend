@@ -157,6 +157,38 @@ def test_parity_check_logs_only_on_drift(caplog):
         assert "site.x" in caplog.text
 
 
+def test_parity_check_drift_alerts_once_per_site():
+    """W7 C3: a parity_check drift (Type-A invariant violation) flags the site for a
+    push alert — once per process, so hot per-prompt loops don't spam."""
+    import services.audit_facts as af
+
+    af._ALERTED_PARITY_SITES.discard("site.c3")
+    assert "site.c3" not in af._ALERTED_PARITY_SITES
+    parity_check("site.c3", 1, 2)                      # drift → alert flagged
+    assert "site.c3" in af._ALERTED_PARITY_SITES
+    parity_check("site.c3", 5, 9)                      # second drift → no re-flag/spam
+    assert "site.c3" in af._ALERTED_PARITY_SITES
+
+
+def test_parity_check_equal_does_not_alert():
+    import services.audit_facts as af
+
+    af._ALERTED_PARITY_SITES.discard("site.c3b")
+    parity_check("site.c3b", 7, 7)                     # equal → no alert
+    assert "site.c3b" not in af._ALERTED_PARITY_SITES
+
+
+def test_parity_measure_drift_does_not_alert():
+    """parity_measure is Type-B (definitions differ by design) — drift is EXPECTED
+    and must never page."""
+    from services.audit_facts import parity_measure
+    import services.audit_facts as af
+
+    af._ALERTED_PARITY_SITES.discard("site.measure")
+    parity_measure("site.measure", 3, 5)              # a real gap, but not an alarm
+    assert "site.measure" not in af._ALERTED_PARITY_SITES
+
+
 def test_legacy_site_registry_covers_all_12():
     assert [s["id"] for s in LEGACY_CITEDNESS_SITES] == list(range(1, 13))
     # The registry is the cutover checklist — every entry states tier + mode.
