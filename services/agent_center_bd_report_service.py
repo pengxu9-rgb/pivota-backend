@@ -6494,6 +6494,24 @@ async def build_per_sku_report(
     _seed_pk, _seed_ck = (None, None)
     if sku_ctx.get("synthetic_url_audit"):
         _seed_pk, _seed_ck = _url_audit_seed_report_identity(merchant_id, product, sku_ctx)
+        # W5 P4.1: repoint the request_indexing / enrichment CTA away from the
+        # EPHEMERAL `urlwedge:*` key (which build_sku_next_best_action stamps and
+        # which the portal + resolver "can't act on") to the seed's REAL catalog
+        # product_key. resolve_canonical_pdp_url resolves any target to its
+        # catalog_products row via one uniform product_key path, so a url_audit
+        # seed (no variant sku_key) becomes resolvable through the SAME mechanism
+        # as a connected-store SKU — no tier-branching. Derived from the SAME
+        # `_seed_pk` lineage (`merchant|url_audit|source`) so the CTA target and
+        # the seeded catalog_products.product_key always agree. Only when a seed
+        # actually exists (_seed_pk set → intake on); otherwise the CTA keeps the
+        # urlwedge key and the resolver honestly returns no_canonical_url.
+        _seed_id_parts = str(_seed_pk or "").split("|") if _seed_pk else []
+        if len(_seed_id_parts) == 3 and isinstance(next_best_action, dict):
+            _cta = next_best_action.get("cta")
+            if isinstance(_cta, dict):
+                from services.catalog_sync_service import make_catalog_product_key
+
+                _cta["target_sku_key"] = make_catalog_product_key(*_seed_id_parts)
 
     # W1 site-5 fix (2026-07-04): the channels table's own-site row reads the
     # RunFacts source walk, not top_cited_hosts (a competitor rollup that drops

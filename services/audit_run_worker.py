@@ -800,6 +800,14 @@ async def _process_one_audit_run_inner(
                     brand_report=brand_report,
                     pivota_url_used=pivota_url_used,
                 )
+                # W5 P4.2: submit the seeded url_audit canonical URLs (the only
+                # place a url_audit run does so — it never enters _run_verifiers).
+                # Self-gates on GSC_PIVOTA_SUBMIT_ENABLED so it lands INERT today.
+                await _submit_url_audit_seed_canonical_urls(
+                    merchant_id=merchant_id,
+                    synthetic_products=synthetic_products,
+                    run_id=run_id,
+                )
                 cost_summary = await _aggregate_cost_summary_for_run(
                     run_id=run_id, brand_report=brand_report,
                 )
@@ -1421,6 +1429,91 @@ async def _seed_url_audit_index(
                 "audit_run_worker: url-audit index seed failed for %s: %s",
                 (item or {}).get("sku_key"), str(exc)[:200],
             )
+
+
+async def _submit_url_audit_seed_canonical_urls(
+    *, merchant_id: str, synthetic_products: List[Dict[str, Any]], run_id: str,
+) -> None:
+    """W5 P4.2: auto-submit each url_audit SEED's Pivota canonical URL to Google's
+    Indexing API (Pivota credential) on the synthetic completion path.
+
+    url_audit runs never reach _run_verifiers (they complete synthetically), and
+    submit_audit_canonical_urls only collects url_source='pivota_canonical_pdp'
+    URLs, which url_audit per-SKU reports never carry — so without this hook a
+    seed's canonical URL is minted (P3) but never submitted. This closes that gap
+    and gives gsc_url_submission_loop its first rows to re-drive.
+
+    INERT until GSC_PIVOTA_SUBMIT_ENABLED flips (P5): the early gate here AND
+    submit_pivota_canonical_urls both self-gate on settings.gsc_pivota_submit_enabled
+    (returns [] today). Best-effort — never breaks a completed run. Idempotent:
+    URLs are deduped (per run by the read below + across runs by the
+    gsc_url_submissions ON CONFLICT (merchant_id, url) upsert)."""
+    try:
+        from config.settings import settings
+
+        # Replicate the callee's gate up front so the DB reads below don't run
+        # while the feature is inert (belt-and-suspenders — the submit itself
+        # also short-circuits on this flag).
+        if not settings.gsc_pivota_submit_enabled:
+            return
+        from services.audit_index_intake import (
+            PLATFORM_URL_AUDIT,
+            stable_source_id,
+        )
+
+        # Re-derive each seed's source_product_id from the SAME brand-surface URL
+        # the seed was keyed on (canonical_url, else pdp_url — see
+        # _seed_url_audit_index), then read the STORED pivota_canonical_url from
+        # catalog_products. Reading the stored URL (vs re-minting a sig) means we
+        # only submit seeds that ACTUALLY exist (intake on) — never a fabricated
+        # URL for an unseeded SKU.
+        source_ids: List[str] = []
+        seen_sids: set = set()
+        for item in synthetic_products or []:
+            seed_url = (
+                str((item or {}).get("canonical_url") or "").strip()
+                or str((item or {}).get("pdp_url") or "").strip()
+                or None
+            )
+            sid = stable_source_id(seed_url) if seed_url else None
+            if sid and sid not in seen_sids:
+                seen_sids.add(sid)
+                source_ids.append(sid)
+        if not source_ids:
+            return
+
+        from db.database import database
+        from db.catalog import catalog_products
+
+        rows = await database.fetch_all(
+            catalog_products.select().where(
+                catalog_products.c.merchant_id == merchant_id,
+                catalog_products.c.platform == PLATFORM_URL_AUDIT,
+                catalog_products.c.source_product_id.in_(source_ids),
+            )
+        )
+        urls: List[str] = []
+        for r in rows or []:
+            url = (r["pivota_canonical_url"] or "").strip()
+            if url:
+                urls.append(url)
+        if not urls:
+            return
+
+        from services.gsc_integration import submit_pivota_canonical_urls
+
+        await submit_pivota_canonical_urls(
+            merchant_id=merchant_id, urls=urls, audit_run_id=run_id,
+        )
+        logger.info(
+            "audit_run_worker: url-audit seed submit fired for run_id=%s "
+            "merchant=%s urls=%d", run_id, merchant_id, len(urls),
+        )
+    except Exception as exc:  # noqa: BLE001 — never break a completed run
+        logger.warning(
+            "audit_run_worker: url-audit seed submit failed for run_id=%s: %s",
+            run_id, str(exc)[:200],
+        )
 
 
 async def _resolve_synthetic_url_products(
