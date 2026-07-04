@@ -21,6 +21,14 @@ SIGNAL_LABELS = {
     "verdict": "Verdict",
 }
 MATERIAL_SCORE_DELTA = 15
+# W2 pinned basis: when this re-audit measured on the SAME pinned prompt set as
+# the prior run (measurement_basis same=True), prompt-regeneration noise — the
+# reason the loose 15 existed — is gone, so a smaller move is already real signal.
+# A non-comparable basis (refreshed / one side predates pinning) keeps the loose
+# threshold, because a bigger swing there can be the new questions rather than real
+# change. This is the honest version of "shrink the noise mask": tighten it only
+# where we've earned the right to.
+MATERIAL_SCORE_DELTA_SAME_BASIS = 5
 
 
 def build_reaudit_delta(
@@ -60,6 +68,16 @@ def build_reaudit_delta(
             ],
         }
 
+    # Resolve the measurement basis BEFORE diffing scores: if this run and the
+    # prior one were measured on the same pinned prompt set, a smaller move counts
+    # as material (W2). Categorical movements are exact-match and unaffected.
+    basis = _measurement_basis(current_report, prior_report, current, prior)
+    material_delta = (
+        MATERIAL_SCORE_DELTA_SAME_BASIS
+        if basis.get("same") is True
+        else MATERIAL_SCORE_DELTA
+    )
+
     movements: List[Dict[str, Any]] = []
     prior_scores = _scores(prior)
     current_scores = _scores(current)
@@ -69,6 +87,7 @@ def build_reaudit_delta(
                 signal=signal,
                 prior=prior_scores.get(signal),
                 current=current_scores.get(signal),
+                material_delta=material_delta,
             )
         )
 
@@ -90,12 +109,11 @@ def build_reaudit_delta(
         "movements": movements,
         # W2 pinned basis: is this delta measured against the SAME prompt set
         # as the prior run? same=True licenses "you moved X→Y" as a real
-        # comparison; same=False means the basis changed (explicit refresh /
-        # generator version bump) and score movement partly reflects the new
-        # questions; same=None means one side predates basis stamping.
-        "measurement_basis": _measurement_basis(
-            current_report, prior_report, current, prior,
-        ),
+        # comparison AND tightens the materiality threshold to
+        # MATERIAL_SCORE_DELTA_SAME_BASIS; same=False means the basis changed
+        # (explicit refresh / generator version bump) and score movement partly
+        # reflects the new questions; same=None means one side predates stamping.
+        "measurement_basis": basis,
         "tracked_metric_results": [
             _tracked_metric_result(metric, movements) for metric in metrics
         ],
@@ -248,16 +266,19 @@ def _score_movement(
     signal: str,
     prior: Optional[int],
     current: Optional[int],
+    material_delta: int = MATERIAL_SCORE_DELTA,
 ) -> Dict[str, Any]:
     # Materiality is gated on magnitude ONLY. A band boundary (e.g. 40) sitting
     # between two near-identical scores must NOT turn a 2-3 point probe jitter
     # into "improved" — that is exactly the run-to-run noise this layer exists to
-    # suppress. A genuine >= MATERIAL_SCORE_DELTA move that also crosses a band is
+    # suppress. A genuine >= material_delta move that also crosses a band is
     # still caught; the band only describes the move, it never triggers it.
+    # `material_delta` is tightened to MATERIAL_SCORE_DELTA_SAME_BASIS by the caller
+    # when the run was measured on the same pinned prompt set (W2).
     material = (
         prior is not None
         and current is not None
-        and abs(current - prior) >= MATERIAL_SCORE_DELTA
+        and abs(current - prior) >= material_delta
     )
     direction = "stable"
     if material and current is not None and prior is not None:
