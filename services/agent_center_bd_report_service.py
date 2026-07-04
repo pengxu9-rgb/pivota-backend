@@ -37,6 +37,23 @@ from urllib.parse import urlparse
 
 from services import agent_center_llm_client as llm_client
 from services.audit_delta import build_reaudit_delta
+from services.audit_facts import (
+    QUERY_CLASS_BRANDED,
+    QUERY_CLASS_CATEGORY,
+    _VERTEX_REDIRECTOR_HOSTS,
+    _clean_identity_tuple,
+    _grounding_source_host,
+    _identify_run_sources,
+    _looks_like_host,
+    _own_url_cited_runs,
+    _source_matches_merchant,
+    aggregate_run_facts,
+    compute_run_facts,
+    normalize_host,
+    parity_check,
+    query_class_for_axis as _query_class_for_axis,
+    run_query_class as _run_query_class,
+)
 from services.audit_playbook_engine import select_playbooks
 from services.brand_alias import (
     _registrable_name_from_host,
@@ -332,206 +349,11 @@ async def run_bd_probes(
 # ---------------------------------------------------------------------------
 
 
-def normalize_host(url: str) -> Optional[str]:
-    """Strip www, lowercase. Returns None for unparseable URLs."""
-    if not url or not isinstance(url, str):
-        return None
-    try:
-        parsed = urlparse(url if "://" in url else f"https://{url}")
-    except Exception:
-        return None
-    host = (parsed.hostname or "").lower()
-    if host.startswith("www."):
-        host = host[4:]
-    return host or None
-
-
-# Vertex AI grounding wraps every cited URL in a redirector — the URI we
-# get back is `vertexaisearch.cloud.google.com/grounding-api-redirect/...`
-# which hides the actual destination domain. The structured chunk's
-# `title` field contains the human-readable source name ("Sephora",
-# "Olive Young Global", "Beauty of Joseon Official Store") — much more
-# useful for BD competitor analysis than the redirector hostname.
-_VERTEX_REDIRECTOR_HOSTS = {
-    "vertexaisearch.cloud.google.com",
-    "vertex-ai-search.cloud.google.com",
-}
-
-
-def _identify_run_sources(run: Dict[str, Any]) -> List[Dict[str, str]]:
-    """Return a list of `{key, label}` source identifiers for one run.
-
-    Reads the new `grounding_sources` field (list of `{uri, title}`)
-    when present (PIVOTA-Agent #1302+), falls back to the legacy
-    `grounding_chunks` (URI strings only) for older payloads.
-
-    `key` is what we use for de-dup + merchant matching.
-    `label` is what we show in the competitor table — title preferred,
-    URI host as fallback when title is missing.
-    """
-    sources_raw = run.get("grounding_sources")
-    out: List[Dict[str, str]] = []
-    seen_keys = set()
-    if isinstance(sources_raw, list) and sources_raw:
-        for s in sources_raw:
-            if not isinstance(s, dict):
-                continue
-            uri = s.get("uri") or ""
-            title = (s.get("title") or "").strip()
-            host = normalize_host(uri) or ""
-            # The resolved publisher DOMAIN for this source (redirector ->
-            # title/registry; real URI -> uri host). This is the canonical
-            # "what site" key for the cited-host rollup; `label` stays the
-            # human title for display + merchant-brand matching.
-            resolved_host = _grounding_source_host(s) or ""
-            # Prefer title for the label/key when the URI is a redirector
-            # (which it almost always is with Vertex AI grounding).
-            if host in _VERTEX_REDIRECTOR_HOSTS:
-                if not title:
-                    continue  # nothing meaningful to surface
-                label = title
-                key = title.lower()
-                # Redirector titles ARE site names — resolve to the domain when
-                # we can; keep the display name as a last resort so an
-                # unregistered Gemini citation still surfaces.
-                rollup_host = resolved_host or title
-            else:
-                # Real (non-redirected) host — use the host for key and
-                # title for label when we have it.
-                label = title or host
-                key = host or title.lower()
-                # NEVER roll up by the title here: a real-URI source's title is
-                # the page headline (OpenAI web_search returns "The 15 Best Hair
-                # Butters … | Marie Claire"), which would leak into
-                # top_cited_hosts as a fake host. Use the resolved domain only.
-                rollup_host = resolved_host or host
-            if not key or key in seen_keys:
-                continue
-            seen_keys.add(key)
-            out.append({"key": key, "label": label, "host": rollup_host})
-        return out
-    # Legacy fallback: only URI strings available.
-    chunks = run.get("grounding_chunks") or []
-    for url in chunks:
-        host = normalize_host(url) if isinstance(url, str) else None
-        if not host or host in _VERTEX_REDIRECTOR_HOSTS:
-            continue
-        if host in seen_keys:
-            continue
-        seen_keys.add(host)
-        out.append({"key": host, "label": host, "host": host})
-    return out
-
-
-# A bare-domain string ("oliveyoung.com", "the-independent.com") rather than
-# a human-readable source title ("Olive Young Global"): has a dot, no
-# whitespace, plausible DNS labels. Used to decide whether a grounding-chunk
-# `title` can be taken as the real host verbatim.
-_HOSTLIKE_RE = re.compile(
-    r"^(?=.{1,253}$)[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?"
-    r"(\.[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?)+$"
-)
-
-
-def _looks_like_host(value: Optional[str]) -> bool:
-    host = normalize_host(value or "")
-    return bool(host) and " " not in host and bool(_HOSTLIKE_RE.match(host))
-
-
-def _grounding_source_host(source: Dict[str, Any]) -> Optional[str]:
-    """Resolve the *real* publisher host for one grounding source dict.
-
-    Gemini grounding wraps every cited URL in a Vertex redirector
-    (`vertexaisearch.cloud.google.com/grounding-api-redirect/<token>`) that
-    hides the destination domain; the structured chunk's `title` carries the
-    real source — almost always the bare domain ("oliveyoung.com", "ebay.com"),
-    occasionally a display name ("Olive Young Global"). Resolution order:
-
-      1. Real (non-redirector) URI host — use it directly (covers the case
-         where probe-time resolution already followed the 302, and any
-         non-Gemini provider that cites a plain URL).
-      2. Redirector URI -> derive the host from `title`:
-         a. title shaped like a domain -> that domain.
-         b. title is a display name -> BD cited-host registry alias lookup -> host.
-      3. Unresolvable -> None, so the citation is dropped from the host rollup
-         rather than mis-attributed to the opaque redirector domain.
-
-    This is the per-source analogue of `_identify_run_sources` (the
-    competitor-extraction path's redirector fix). Without it,
-    `authority_map.hosts` collapses every Gemini citation onto
-    `vertexaisearch.cloud.google.com` (the v3 per-SKU regression: the real
-    hosts live in each chunk's `title`, not the redirector URI host).
-    """
-    if not isinstance(source, dict):
-        return None
-    uri_host = normalize_host(source.get("uri") or "")
-    if uri_host and uri_host not in _VERTEX_REDIRECTOR_HOSTS:
-        return uri_host
-    title = (source.get("title") or "").strip()
-    if not title:
-        return None
-    if _looks_like_host(title):
-        return normalize_host(title)
-    # Display-name title — try the BD cited-host registry alias index, which
-    # maps "Sephora"/"Olive Young Global" to a canonical host. Restrict this to
-    # short, name-like titles: a real source name is a few words ("Beauty of
-    # Joseon Official Store"), whereas a long page headline could match a
-    # registry alias as a coincidental substring and fabricate a cited host
-    # (e.g. "...best collagen for your target audience" -> target.com). The
-    # no-fabrication guardrail makes dropping such a citation the safe default.
-    if len(title.split()) <= 6:
-        resolved = classify_host(title).get("host")
-        if resolved and _looks_like_host(resolved):
-            return resolved
-    return None
-
-
-def _source_matches_merchant(
-    source: Dict[str, str],
-    *,
-    merchant_host: Optional[str],
-    merchant_brand: Optional[str],
-    merchant_vendors: Optional[Tuple[str, ...]] = None,
-) -> bool:
-    """A grounding source counts as merchant-attribution when:
-      - host matches the verified merchant host (rare with redirectors), OR
-      - title contains the merchant host (e.g. "beautyofjoseon.com" in
-        "Beauty of Joseon Official Store" — only true for some titles), OR
-      - title contains the merchant brand name.
-    """
-    label_lower = source.get("label", "").lower()
-    if merchant_host and merchant_host in label_lower:
-        return True
-    if merchant_brand:
-        brand_lower = merchant_brand.strip().lower()
-        if brand_lower and brand_lower in label_lower:
-            return True
-        # Phase B: alias-aware match — the merchant is recorded as
-        # "BB Lab Global" but the cited source title says "BB Lab". Only
-        # ADDS matches over the literal compare above (never removes one).
-        if text_mentions_brand(
-            label_lower,
-            derive_brand_aliases(
-                merchant_brand,
-                merchant_host,
-                _clean_identity_tuple(merchant_vendors),
-            ),
-        ):
-            return True
-    return False
-
-
-def _clean_identity_tuple(values: Optional[Tuple[str, ...]]) -> Tuple[str, ...]:
-    out: List[str] = []
-    seen = set()
-    for value in values or ():
-        cleaned = re.sub(r"\s+", " ", str(value or "").strip())
-        key = cleaned.lower()
-        if cleaned and key not in seen:
-            seen.add(key)
-            out.append(cleaned)
-    return tuple(out)
-
+# normalize_host / _VERTEX_REDIRECTOR_HOSTS / _identify_run_sources /
+# _grounding_source_host / _looks_like_host / _source_matches_merchant /
+# _clean_identity_tuple / _own_url_cited_runs MOVED to
+# services/audit_facts.py (W1 RunFacts phase 1) and re-imported at the top
+# of this module — audit_facts must never import this module back.
 
 def _vendor_is_merchant(vendor: Any, merchant_own_aliases: frozenset) -> bool:
     """Does a product's vendor/brand refer to the MERCHANT itself (a D2C brand
@@ -646,32 +468,6 @@ def extract_cited_hosts(
         for host in run_competitor_hosts:
             competitors[host] += 1
     return competitors, merchant_cited_runs, runs_with_any_citation
-
-
-def _own_url_cited_runs(
-    raw_runs: List[Dict[str, Any]],
-    *,
-    merchant_host: Optional[str],
-) -> Optional[int]:
-    """Strict own-URL citation count: runs where the merchant's OWN domain is the
-    resolved host of a cited grounding source.
-
-    Distinct from `merchant_cited_runs` (which also counts brand-name-in-title
-    mentions and third-party listings) — this is the honest "AI cited YOUR page"
-    signal, mirroring the channels builder's `own_site_cited` logic. Returns None
-    when there's no merchant host to match against (so callers can fall back to
-    the softer signal rather than assert a false zero)."""
-    own = normalize_host(merchant_host) if merchant_host else None
-    if not own:
-        return None
-    count = 0
-    for run in raw_runs or []:
-        for src in _identify_run_sources(run) or []:
-            host = normalize_host((src.get("host") or "").strip())
-            if host and host == own:
-                count += 1
-                break
-    return count
 
 
 VERDICT_INVISIBLE = "INVISIBLE"
@@ -4899,26 +4695,9 @@ def _axis_coverage(probe_runs: Any) -> Dict[str, int]:
     return dict(counts)
 
 
-# Fix 2 — query-class tagging. Every probe query carries an `axis` (set in
-# `_build_per_sku_base_query_specs`). Only the `category` axis is a non-branded
-# discovery query ("best <product_type> ...", "top <product_type> for <topic>");
-# every other axis (intent / price / review / comparison / brand / identity /
-# content / custom) names the SKU or brand, i.e. branded/navigational. The two
-# classes must be reported separately: being found on a branded query ("where to
-# buy <my product>") proves nothing about category discovery.
-QUERY_CLASS_BRANDED = "branded_navigational"
-QUERY_CLASS_CATEGORY = "category_discovery"
-_CATEGORY_DISCOVERY_AXES = frozenset({"category"})
-
-
-def _query_class_for_axis(axis: Optional[str]) -> str:
-    a = str(axis or "").strip().lower()
-    return QUERY_CLASS_CATEGORY if a in _CATEGORY_DISCOVERY_AXES else QUERY_CLASS_BRANDED
-
-
-def _run_query_class(run: Dict[str, Any]) -> str:
-    meta = run.get("axis_metadata") if isinstance(run.get("axis_metadata"), dict) else {}
-    return _query_class_for_axis(meta.get("axis"))
+# QUERY_CLASS_BRANDED / QUERY_CLASS_CATEGORY / _query_class_for_axis /
+# _run_query_class MOVED to services/audit_facts.py (W1 RunFacts phase 1)
+# and re-imported at the top of this module.
 
 
 def _query_class_coverage(probe_runs: Any) -> Dict[str, int]:
@@ -11554,6 +11333,31 @@ async def run_brand_report(
         except Exception:  # noqa: BLE001
             logger.warning("per_sku trend attach failed", exc_info=True)
             brand_rollup["tracking"] = None
+        # W1 RunFacts phase 1 — compute the fact layer once per SKU from the
+        # SAME probe runs the per-SKU scorecards read, stamped per report and
+        # folded into a brand-level rollup on brand_rollup. Additive: no
+        # rendered number reads from it yet (phase-2 cutover); W7 invariants
+        # and parity logging do. Best-effort: a stamp failure must never sink
+        # the report.
+        try:
+            _facts_by_sku = {
+                _sku_key: compute_run_facts(
+                    _flatten_probe_runs(_sku_probe_runs),
+                    merchant_host=_merchant_host,
+                    merchant_brand=merchant_name,
+                    merchant_vendors=_merchant_vendors,
+                ).to_dict()
+                for _sku_key, _sku_probe_runs in probe_runs_by_sku.items()
+            }
+            for _r in per_sku_reports:
+                if _r.get("sku_key") in _facts_by_sku:
+                    _r["run_facts"] = _facts_by_sku[_r["sku_key"]]
+            brand_rollup["run_facts"] = aggregate_run_facts(
+                list(_facts_by_sku.values()),
+                identity={"host": _merchant_host, "brand": merchant_name},
+            )
+        except Exception:  # noqa: BLE001
+            logger.warning("per_sku run_facts stamp failed", exc_info=True)
         return {
             "audit_run_id": audit_run_id,
             "merchant_id": str(merchant_id),
@@ -11819,6 +11623,17 @@ async def run_brand_report(
         merchant_brand=merchant_name,
     )
 
+    # W1 RunFacts phase 1 — brand-level rollup folded from the per-product
+    # stamps, so brand counters and per-product counters share one basis.
+    # Additive; W7's _inv_counters_match_run_facts asserts the fold matches.
+    brand_run_facts = aggregate_run_facts(
+        [p.get("run_facts") for p in per_product],
+        identity={
+            "host": normalize_host(merchant_domain or "") or None,
+            "brand": merchant_name,
+        },
+    )
+
     return {
         "merchant_name": merchant_name,
         "merchant_domain": (merchant_domain or "").strip() or None,
@@ -11834,6 +11649,7 @@ async def run_brand_report(
         "model_is_override": _any_model_override(provider_model_metadata),
         "per_product": per_product,
         "aggregate": aggregate,
+        "run_facts": brand_run_facts,
         "cross_product_competitors": cross_competitors,
         "competitor_entities": competitor_entities,
         "social_intelligence": social_intelligence,
@@ -15438,6 +15254,29 @@ def build_structured_report(
         merchant_brand=merchant_brand,
         merchant_vendors=merchant_identities,
     )
+    # W1 RunFacts phase 1 — compute the fact layer ONCE for this report's
+    # attribution runs and stamp it on the payload below. Every displayed
+    # number still comes from the legacy implementations; the parity_check
+    # calls are log-only drift probes (grep RUNFACTS_PARITY_DRIFT) that gate
+    # the phase-2 cutover.
+    run_facts = compute_run_facts(
+        attribution_runs,
+        merchant_host=merchant_host,
+        merchant_brand=merchant_brand,
+        merchant_vendors=merchant_identities,
+    )
+    parity_check(
+        "bd_report.extract_cited_hosts.merchant_cited_runs",
+        merchant_cited_runs,
+        run_facts.brand_mentioned_runs,
+        context={"merchant": merchant_name, "product": product_title},
+    )
+    parity_check(
+        "bd_report.extract_cited_hosts.runs_with_any_citation",
+        runs_with_any_citation,
+        run_facts.runs_with_citations,
+        context={"merchant": merchant_name, "product": product_title},
+    )
 
     # Re-score category from raw_runs so brand text-matches in
     # evidence excerpts and grounding source titles count as positive
@@ -15490,16 +15329,23 @@ def build_structured_report(
         if category_score is not None
         else None
     )
+    # Honest own-page citation count (own domain resolved as a cited source),
+    # distinct from merchant_cited_runs (brand-mention OR listing). Gates the
+    # STRONG "cite your URL / goal state" copy so it can't fire on mentions
+    # alone — see _explain_verdict.
+    own_url_cited = _own_url_cited_runs(
+        attribution_runs, merchant_host=merchant_host
+    )
+    parity_check(
+        "bd_report._own_url_cited_runs",
+        own_url_cited,
+        run_facts.own_url_cited_runs,
+        context={"merchant": merchant_name, "product": product_title},
+    )
     verdict_evidence: Dict[str, Any] = {
         "attribution_runs_total": len(attribution_runs),
         "merchant_cited_runs": merchant_cited_runs,
-        # Honest own-page citation count (own domain resolved as a cited source),
-        # distinct from merchant_cited_runs (brand-mention OR listing). Gates the
-        # STRONG "cite your URL / goal state" copy so it can't fire on mentions
-        # alone — see _explain_verdict.
-        "own_url_cited_runs": _own_url_cited_runs(
-            attribution_runs, merchant_host=merchant_host
-        ),
+        "own_url_cited_runs": own_url_cited,
         "top_retailers": top_retailer_hosts,
         "top_cited_hosts": top_cited_hosts,
         "competitive_pressure_framing": (competitive_pressure or {}).get("framing"),
@@ -15732,6 +15578,10 @@ def build_structured_report(
         "provider": provider,
         "upstream_status": upstream_status,
         "timestamp": timestamp or datetime.now(timezone.utc).isoformat(timespec="seconds"),
+        # W1 RunFacts phase 1 — the compute-once fact layer for this report's
+        # attribution runs. Additive: no rendered number reads from it yet
+        # (that's the phase-2 cutover); W7 invariants + parity logging do.
+        "run_facts": run_facts.to_dict(),
         "verdict": {
             "label": verdict_label,
             # Client-facing softer rendering. Renderers that show a
