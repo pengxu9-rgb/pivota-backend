@@ -162,7 +162,6 @@ def _controller_surfaces(opportunity: Mapping[str, Any]) -> Dict[str, Any]:
         identity=_identity(),
         sku_title="BB Lab Good Night Collagen",
     )
-    brief = strategic_brief._deterministic_brief(evidence)
     nba = build_sku_next_best_action(
         opportunity=opportunity,
         primary_gaps=[],
@@ -171,11 +170,12 @@ def _controller_surfaces(opportunity: Mapping[str, Any]) -> Dict[str, Any]:
         sku_title="BB Lab Good Night Collagen",
     )
     return {
-        "brief_why_you_lose": (brief or {}).get("why_you_lose"),
+        # W4: the deterministic brief was deleted; controller-surface STABILITY is
+        # asserted on the live evidence/nba surfaces below (where the property
+        # actually lives), not on the retired brief prose.
         "buyer_path_controllers": (
             evidence.get("buyer_path_opportunities") or [{}]
         )[0].get("controlled_by"),
-        "brief_traffic_controller": ((brief or {}).get("traffic_strategy") or [{}])[0].get("who_controls"),
         "sku_headline": _sku_intelligence_headline(
             opportunity=opportunity,
             title="BB Lab Good Night Collagen",
@@ -484,7 +484,6 @@ def test_stable_controller_surfaces_ignore_run_to_run_one_off_citation_tails():
         {"host": "reddit.com", "role": "forum", "times_cited": 2}
     ]
     assert surfaces_a["canonical_page_controllers"] == ["reddit.com"]
-    assert "reddit.com" in surfaces_a["brief_why_you_lose"]
     assert "reddit.com" in surfaces_a["sku_headline"]
     for one_off in (
         "sayweee.com",
@@ -534,8 +533,6 @@ def test_fragmented_controller_lanes_are_framed_without_naming_one_off_hosts():
     assert surfaces["buyer_path_controllers"] == []
     assert surfaces["canonical_page_controllers"] == []
     assert surfaces["controller_strategy"] == "canonical_source_vacuum"
-    assert "fragmented sources" in surfaces["brief_why_you_lose"]
-    assert "no single site owning the answer" in surfaces["brief_why_you_lose"]
     assert "fragmented" in surfaces["sku_headline"]
     assert "sayweee.com" not in blob
     assert "dubuypk.com" not in blob
@@ -1029,20 +1026,9 @@ def test_assemble_sku_brief_evidence_prioritizes_ownist_conversion_lane_over_sna
         wedge["why_this_lane_not_the_head_prompt"]
     )
     assert wedge["canonical_page_play"]["lane"] == "vitamin c collagen jelly"
-
-    brief = strategic_brief._deterministic_brief(evidence)
-    assert brief is not None
-    assert "Win the 'vitamin c collagen jelly' search first" in (
-        brief["core_decision"]
-    )
-    snack_strategy = next(
-        item for item in brief["traffic_strategy"]
-        if item["where"] == "healthy snacks collagen jelly"
-    )
-    assert "Do not start here yet" in snack_strategy["how"]
-    assert "vitamin c collagen jelly" in snack_strategy["how"]
-    assert strategic_brief.validate_grounding(brief, evidence) is True
-    _assert_no_overpromise_payload(brief)
+    # W4: the deterministic-brief rendering assertions were removed with the dead
+    # renderer; this test's live subject is the evidence/wedge prioritization above
+    # (the conversion lane wins over the snack-drift lane).
 
 
 def test_aggregate_lead_profile_recomputes_recommended_moves_with_aggregate_controllers():
@@ -1143,90 +1129,6 @@ def test_controller_source_route_action_splits_forum_and_unclassified_sources():
     assert "pitch reddit.com and moodarabia.com" not in action
     assert "moodarabia.com discussion" not in action
     assert "reddit.com and moodarabia.com discussion" not in action
-
-
-def test_deterministic_brief_mentions_cited_buyable_agent_checkout_without_fabricated_economics():
-    evidence = _evidence()
-    evidence["buyer_path_opportunities"] = [
-        {
-            "query": "vitamin c collagen jelly",
-            "controlled_by": [
-                {"host": "oliveyoung.com", "role": "retailer"},
-                {"host": "costco.com", "role": "retailer"},
-                {"host": "flyairseoul.com", "role": "publisher"},
-            ],
-            "recommended_moves": [
-                "Make the official brand PDP the more citable + buyable canonical page for this lane.",
-                "Add a first-order offer without inventing a discount depth.",
-            ],
-        },
-    ]
-
-    brief = strategic_brief._deterministic_brief(evidence)
-    blob = json.dumps(brief).lower()
-
-    assert brief is not None
-    assert "more citable + buyable canonical page" in blob
-    assert "agent-checkout ready" in blob
-    assert "first-order offer" in blob
-    assert "starter + replenishment bundle" in blob
-    assert "why-buy-direct" in blob
-    assert "%" not in blob
-    assert "$" not in blob
-    assert strategic_brief.validate_grounding(brief, evidence) is True
-
-
-def test_deterministic_brief_branches_obscure_resellers_to_canonical_source_vacuum():
-    evidence = _evidence()
-    evidence["product"]["title"] = "Ownist Triple Shine Grape"
-    evidence["product"]["brand"] = "Ownist"
-    evidence["product"]["merchant_path"] = {
-        "archetype": "brand",
-        "destination": "the brand's own website",
-        "page_label": "the official brand PDP",
-        "goal": "drive buyers to the brand's own website",
-    }
-    evidence["buyer_path_opportunities"] = [
-        {
-            "query": "vitamin c collagen jelly",
-            "controlled_by": [
-                {"host": "cogentsteps.net", "role": "publisher"},
-                {"host": "medsysgroup.com", "role": "publisher"},
-                {"host": "hellokoop.com", "role": "retailer"},
-            ],
-            "controller_strategy": "canonical_source_vacuum",
-            "controller_profile": {
-                "strategy": "canonical_source_vacuum",
-                "label": "Canonical-source vacuum",
-            },
-            "recommended_moves": [
-                "Build the official brand PDP to rank for the exact lane vitamin c collagen jelly.",
-                "Add product/offer/review/FAQ schema.",
-                "State vitamin c, collagen, and jelly in plain page text.",
-            ],
-        }
-    ]
-
-    brief = strategic_brief._deterministic_brief(evidence)
-    blob = json.dumps(brief).lower()
-
-    assert brief is not None
-    assert "rank for the exact lane vitamin c collagen jelly" in blob
-    assert "product/offer/review/faq schema" in blob
-    assert "plain page text for vitamin c collagen jelly" in blob
-    assert "pitch cogentsteps.net, medsysgroup.com, and hellokoop.com" in blob
-    assert "re-audit vitamin c collagen jelly" in blob
-    assert "verify materiality" in blob
-    assert "more citable" in blob
-    assert "canonical-source gap" not in blob
-    assert "beat cogentsteps" not in blob
-    assert "first-order offer" in blob
-    assert "starter + replenishment bundle" in blob
-    assert "why-buy-direct" in blob
-    assert "obscure cited sites as a lost sale" in blob
-    assert "%" not in blob and "$" not in blob
-    assert strategic_brief.validate_grounding(brief, evidence) is True
-    _assert_no_overpromise_payload(brief)
 
 
 def test_validation_fix_accepts_grounded_bb_lab_brief_without_false_positives():
@@ -1910,57 +1812,6 @@ def _low_signal_evidence() -> Dict[str, Any]:
         identity=_identity(),
         sku_title="BB Lab Good Night Collagen",
     )
-
-
-def test_deterministic_brief_low_signal_sku_is_grounded_and_not_boilerplate():
-    evidence = _low_signal_evidence()
-    assert not evidence["buyer_path_opportunities"]
-
-    brief = strategic_brief._deterministic_brief(evidence)
-    # No longer None for a low-signal SKU — this was THE silent fall-through.
-    assert brief is not None
-    assert strategic_brief._has_required_shape(brief)
-    # Grounding-safe by construction, so it survives the same gate that the
-    # lane-driven brief runs (no fabricated competitor/domain/lane/stat).
-    assert strategic_brief._grounding_failures(brief, evidence) == []
-    assert strategic_brief.validate_grounding(brief, evidence) is True
-    assert strategic_brief._validated_deterministic_brief(evidence) is not None
-
-    # Specific to THIS product, not the name-swapped generic boilerplate: it
-    # names the actual SKU and prescribes the honest get-indexed/get-cited play.
-    blob = json.dumps(brief).lower()
-    assert "bb lab good night collagen" in blob
-    assert "surface in ai shopping answers" in blob
-    _assert_no_overpromise_payload(brief)
-
-
-def test_deterministic_brief_caps_overall_controller_phrase_to_top_three():
-    evidence = _evidence()
-    evidence["buyer_path_opportunities"] = [
-        {
-            "query": "vitamin c collagen jelly",
-            "controlled_by": [
-                {"host": "oliveyoung.com", "role": "retailer"},
-                {"host": "costco.com", "role": "retailer"},
-                {"host": "flyairseoul.com", "role": "publisher"},
-            ],
-        },
-        {
-            "query": "vitamin c collagen",
-            "controlled_by": [
-                {"host": "ubuy.mq", "role": "marketplace"},
-                {"host": "cogentsteps.net", "role": "publisher"},
-            ],
-        },
-    ]
-
-    brief = strategic_brief._deterministic_brief(evidence)
-
-    assert brief is not None
-    assert "oliveyoung.com, costco.com, and flyairseoul.com" in brief["position"]
-    assert "ubuy.mq" not in brief["position"]
-    assert "cogentsteps.net" not in brief["position"]
-    assert len(brief["traffic_strategy"][0]["who_controls"].split(",")) <= 3
 
 
 def test_validate_grounding_rejects_overwide_controller_lists():
