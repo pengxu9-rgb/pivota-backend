@@ -15,9 +15,9 @@ from services.agent_center_bd_report_service import (
     VERDICT_STRONG,
     _competitor_attribute_run_text,
     _explain_verdict,
-    _own_url_cited_runs,
     _salvage_competitor_prose,
 )
+from services.audit_facts import _own_url_cited_runs
 from services.next_best_action import (
     PRIMARY_SKU_CONTENT_REVISION_GAP,
     PRIMARY_SKU_SUBSTITUTION_LEAK,

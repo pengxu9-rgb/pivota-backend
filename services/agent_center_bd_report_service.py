@@ -46,7 +46,6 @@ from services.audit_facts import (
     _grounding_source_host,
     _identify_run_sources,
     _looks_like_host,
-    _own_url_cited_runs,
     _source_matches_merchant,
     aggregate_run_facts,
     compute_run_facts,
@@ -357,6 +356,10 @@ async def run_bd_probes(
 # _clean_identity_tuple / _own_url_cited_runs MOVED to
 # services/audit_facts.py (W1 RunFacts phase 1) and re-imported at the top
 # of this module — audit_facts must never import this module back.
+# W1 site 3 CUTOVER (T1): _own_url_cited_runs is no longer imported here — the
+# report path reads own-page citedness solely from run_facts.own_url_cited_runs
+# (parity-proven ==, see test_audit_facts.test_parity_with_legacy_implementations).
+# The legacy fn survives in audit_facts as the test-only equivalence oracle.
 
 def _vendor_is_merchant(vendor: Any, merchant_own_aliases: frozenset) -> bool:
     """Does a product's vendor/brand refer to the MERCHANT itself (a D2C brand
@@ -5734,6 +5737,32 @@ def build_custom_prompt_results(
             merchant_brand=merchant_brand,
             merchant_vendors=merchant_vendors,
         )
+        # W1 T3 secondary site (per-prompt lane classifier). This is one of the
+        # extract_cited_hosts scalar reads NOT yet on RunFacts — it gates the
+        # rendered lane verdict (open/contested/absent). Instrumented log-only so
+        # the next multi-merchant run yields its drift before we decide the flip;
+        # per-prompt runs, so the aggregator sees one check per prompt group.
+        try:
+            _lane_facts = compute_run_facts(
+                runs,
+                merchant_host=merchant_host,
+                merchant_brand=merchant_brand,
+                merchant_vendors=merchant_vendors,
+            )
+            parity_check(
+                "bd_report.prompt_lane.merchant_cited_runs",
+                merchant_cited_runs,
+                _lane_facts.brand_mentioned_runs,
+                context={"prompt": str(prompt)[:80]},
+            )
+            parity_check(
+                "bd_report.prompt_lane.runs_with_any",
+                runs_with_any,
+                _lane_facts.runs_with_citations,
+                context={"prompt": str(prompt)[:80]},
+            )
+        except Exception:  # noqa: BLE001 — parity must never sink the report
+            logger.warning("run_facts parity (prompt_lane) failed", exc_info=True)
 
         # Distinct sources the AI grounded in, split into "the brand" vs
         # everyone else. Dedup across this prompt's provider runs by source key.

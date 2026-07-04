@@ -70,10 +70,12 @@ IDENTITY = dict(
 
 def test_parity_with_legacy_implementations():
     """The whole point of phase 1: RunFacts rollups == legacy numbers."""
-    from services.agent_center_bd_report_service import (
-        _own_url_cited_runs,
-        extract_cited_hosts,
-    )
+    # T1's legacy oracle now lives in audit_facts (removed from the god module's
+    # import surface once the report path read RunFacts exclusively). T3's
+    # extract_cited_hosts stays in the god module — it still supplies the
+    # competitor rollup, so the parity net imports it from there.
+    from services.agent_center_bd_report_service import extract_cited_hosts
+    from services.audit_facts import _own_url_cited_runs
 
     facts = compute_run_facts(RUNS, **IDENTITY)
     _, legacy_cited, legacy_any = extract_cited_hosts(RUNS, **IDENTITY)
@@ -174,7 +176,7 @@ def test_own_url_cited_runs_any_multi_host():
     )
     runs = RUNS + [canonical_run]
     # Single host — matches _own_url_cited_runs semantics on the same input.
-    from services.agent_center_bd_report_service import _own_url_cited_runs
+    from services.audit_facts import _own_url_cited_runs
 
     assert own_url_cited_runs_any(runs, ["glowbrand.com"]) == _own_url_cited_runs(
         runs, merchant_host="glowbrand.com"

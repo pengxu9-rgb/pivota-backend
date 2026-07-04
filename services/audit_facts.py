@@ -667,10 +667,21 @@ LEGACY_CITEDNESS_SITES: Tuple[Dict[str, Any], ...] = (
      "mode": "drift"},
     {"id": 2, "site": "bd_report.extract_cited_hosts.merchant_cited_runs", "tier": "T3",
      "definition": ">=1 source matches merchant", "instrumented": True,
-     "mode": "drift"},
+     "mode": "drift",
+     "notes": "main verdict path REWIRED to run_facts (slice 1). SECONDARY call"
+              " sites still on legacy but now log-only instrumented pending a"
+              " multi-merchant flip decision: bd_report.prompt_lane.* (per-prompt"
+              " lane classifier) + sku_opportunity.prompt_group.* (opportunity"
+              " scorer). extract_cited_hosts itself STAYS — it supplies the"
+              " competitor rollup"},
     {"id": 3, "site": "bd_report._own_url_cited_runs", "tier": "T1",
      "definition": "own domain == resolved source host", "instrumented": True,
-     "mode": "drift"},
+     "mode": "drift", "rewired": True,
+     "notes": "REWIRED (verdict path reads run_facts.own_url_cited_runs since"
+              " slice 1); FINALIZED 2026-07-04 — the legacy fn was removed from"
+              " the god module's import surface (zero production callers"
+              " remained) and now lives in audit_facts as the test-only"
+              " equivalence oracle"},
     {"id": 4, "site": "bd_report.score_category_visibility", "tier": "mixed",
      "definition": "url_match OR title OR excerpt-triple", "instrumented": True,
      "mode": "measure",
