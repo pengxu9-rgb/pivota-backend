@@ -31,7 +31,7 @@ Idempotency:
 from __future__ import annotations
 
 import logging
-from typing import Any, Dict, List
+from typing import Any, Collection, Dict, List, Optional
 
 from services.executor_agents.base import (
     BaseExecutorAgent,
@@ -39,6 +39,19 @@ from services.executor_agents.base import (
 )
 
 logger = logging.getLogger(__name__)
+
+
+# W5: the executors that act on `context.audit_report` ALONE — no connected
+# store, no catalog_products read, no external side-effect beyond a Gemini call
+# that produces an internal ExecutorResult. These are the ONLY agents safe to
+# dispatch for a URL-audit (synthetic) run: the store-dependent agents
+# (canonical_pdp_enrichment, sitemap_freshness, gsc_url_submission) would read/
+# mutate the merchant's OWN catalog SKUs — irrelevant to a pasted URL and the
+# exact side-effect the url_audit skip was protecting against.
+REPORT_ONLY_EXECUTORS = frozenset({
+    "content_brief_generator",
+    "competitor_insights",
+})
 
 
 def _registry() -> List[BaseExecutorAgent]:
@@ -87,10 +100,17 @@ _AGENT_MAX_RETRIES: Dict[str, int] = {
 
 async def dispatch_agents(
     context: ExecutorContext,
+    *,
+    agent_names: Optional[Collection[str]] = None,
 ) -> Dict[str, Any]:
     """Enqueue every applicable agent for `context` into the durable
     work queue. The executor_run_worker (P3.2) picks them up on its
     next tick.
+
+    `agent_names` (W5) restricts dispatch to that set of agent names — used to
+    run only the report-only executors (REPORT_ONLY_EXECUTORS) for URL-audit
+    runs, which have no connected catalog for the store-dependent agents to act
+    on. None = the full registry (connected-store audits).
 
     Returns:
       {
@@ -134,7 +154,10 @@ async def dispatch_agents(
         find_in_flight_executor_run_by_idempotency,
     )
 
+    allow = frozenset(agent_names) if agent_names is not None else None
     for agent in _registry():
+        if allow is not None and agent.name not in allow:
+            continue
         summary["agents_evaluated"] += 1
         try:
             should = await agent.should_run(context)
