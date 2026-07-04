@@ -28,6 +28,10 @@ DEFAULT_MERCHANT_PORTAL_PREFERENCES: Dict[str, Any] = {
     "email_inventory": False,
     "email_weekly": False,
     "portal_language": DEFAULT_PORTAL_LANGUAGE,
+    # W5 P7: per-merchant consent for audit executor dispatch. Default ON
+    # preserves current behavior (existing merchants keep auto-execute);
+    # merchants opt into approval mode by setting this false.
+    "executor_auto_execute": True,
 }
 
 
@@ -46,6 +50,7 @@ merchant_portal_preferences = Table(
     Column("email_inventory", Boolean, nullable=False, default=False),
     Column("email_weekly", Boolean, nullable=False, default=False),
     Column("portal_language", String(16), nullable=False, default=DEFAULT_PORTAL_LANGUAGE),
+    Column("executor_auto_execute", Boolean, nullable=False, default=True),
     Column("created_at", DateTime, server_default=func.now(), nullable=False),
     Column("updated_at", DateTime, server_default=func.now(), onupdate=func.now(), nullable=False),
 )
@@ -73,6 +78,7 @@ async def ensure_merchant_portal_preferences_table() -> None:
                   email_inventory BOOLEAN NOT NULL DEFAULT FALSE,
                   email_weekly BOOLEAN NOT NULL DEFAULT FALSE,
                   portal_language VARCHAR(16) NOT NULL DEFAULT 'en',
+                  executor_auto_execute BOOLEAN NOT NULL DEFAULT TRUE,
                   created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
                   updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
                 );
@@ -82,6 +88,7 @@ async def ensure_merchant_portal_preferences_table() -> None:
                 "ALTER TABLE merchant_portal_preferences ADD COLUMN IF NOT EXISTS email_inventory BOOLEAN NOT NULL DEFAULT FALSE;",
                 "ALTER TABLE merchant_portal_preferences ADD COLUMN IF NOT EXISTS email_weekly BOOLEAN NOT NULL DEFAULT FALSE;",
                 "ALTER TABLE merchant_portal_preferences ADD COLUMN IF NOT EXISTS portal_language VARCHAR(16) NOT NULL DEFAULT 'en';",
+                "ALTER TABLE merchant_portal_preferences ADD COLUMN IF NOT EXISTS executor_auto_execute BOOLEAN NOT NULL DEFAULT TRUE;",
                 "ALTER TABLE merchant_portal_preferences ADD COLUMN IF NOT EXISTS created_at TIMESTAMPTZ NOT NULL DEFAULT NOW();",
                 "ALTER TABLE merchant_portal_preferences ADD COLUMN IF NOT EXISTS updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW();",
             ]
@@ -115,6 +122,12 @@ async def get_merchant_portal_preferences(merchant_id: str) -> Dict[str, Any]:
         "email_inventory": bool(payload.get("email_inventory")),
         "email_weekly": bool(payload.get("email_weekly")),
         "portal_language": normalize_portal_language(payload.get("portal_language")),
+        "executor_auto_execute": bool(
+            payload.get(
+                "executor_auto_execute",
+                DEFAULT_MERCHANT_PORTAL_PREFERENCES["executor_auto_execute"],
+            )
+        ),
         "created_at": payload.get("created_at"),
         "updated_at": payload.get("updated_at"),
     }
@@ -174,6 +187,15 @@ async def upsert_merchant_portal_preferences(
                 ),
             )
         ),
+        "executor_auto_execute": bool(
+            preferences.get(
+                "executor_auto_execute",
+                existing_payload.get(
+                    "executor_auto_execute",
+                    DEFAULT_MERCHANT_PORTAL_PREFERENCES["executor_auto_execute"],
+                ),
+            )
+        ),
     }
 
     if existing:
@@ -192,3 +214,38 @@ async def upsert_merchant_portal_preferences(
         )
 
     return await get_merchant_portal_preferences(merchant_id)
+
+
+async def get_merchant_executor_auto_execute(merchant_id: str) -> bool:
+    """W5 P7: per-merchant consent for audit executor dispatch.
+
+    Returns True (auto-execute) when the merchant has no row or the
+    read fails — the founder-locked default preserves current behavior.
+    The dispatcher reads this to decide whether executor_runs land in
+    `queued` (auto) or `pending_approval` (opt-in approval mode).
+    """
+    try:
+        prefs = await get_merchant_portal_preferences(merchant_id)
+    except Exception as exc:  # noqa: BLE001 — never block dispatch on a read
+        logger.warning(
+            "get_merchant_executor_auto_execute failed for %s (defaulting ON): %s",
+            merchant_id, str(exc)[:200],
+        )
+        return True
+    return bool(
+        prefs.get(
+            "executor_auto_execute",
+            DEFAULT_MERCHANT_PORTAL_PREFERENCES["executor_auto_execute"],
+        )
+    )
+
+
+async def set_merchant_executor_auto_execute(
+    merchant_id: str, enabled: bool,
+) -> bool:
+    """Persist the executor auto-execute consent toggle. Returns the
+    stored value."""
+    prefs = await upsert_merchant_portal_preferences(
+        merchant_id, {"executor_auto_execute": bool(enabled)},
+    )
+    return bool(prefs.get("executor_auto_execute", True))

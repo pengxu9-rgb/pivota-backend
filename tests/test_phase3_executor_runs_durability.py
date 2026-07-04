@@ -24,8 +24,14 @@ os.environ.setdefault("DATABASE_URL", "sqlite:///:memory:")
 def test_active_and_terminal_stages_are_disjoint():
     from db import executor_runs as er
     assert er.ACTIVE_STAGES & er.TERMINAL_STAGES == set()
+    # W5 P7: pending_approval is a "gate" stage — neither active
+    # (worker-claimable) nor terminal. It sits between dispatch and
+    # queue, waiting on merchant consent.
+    gate_stages = {er.STAGE_PENDING_APPROVAL}
+    assert gate_stages & er.ACTIVE_STAGES == set()
+    assert gate_stages & er.TERMINAL_STAGES == set()
     assert (
-        er.ACTIVE_STAGES | er.TERMINAL_STAGES
+        er.ACTIVE_STAGES | er.TERMINAL_STAGES | gate_stages
         == set(er.VALID_STAGE_TRANSITIONS.keys())
     )
 

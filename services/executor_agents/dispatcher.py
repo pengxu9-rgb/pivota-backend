@@ -149,10 +149,31 @@ async def dispatch_agents(
         pass
 
     from db.executor_runs import (
+        STAGE_PENDING_APPROVAL,
+        STAGE_QUEUED,
         compute_executor_idempotency_key,
         enqueue_executor_run,
         find_in_flight_executor_run_by_idempotency,
     )
+
+    # W5 P7: per-merchant consent, layered UNDER the global kill-switch.
+    # Default ON (founder-locked) preserves current behavior for existing
+    # merchants; a merchant who opted into approval mode gets executor_runs
+    # parked in `pending_approval` (inert — the worker only claims queued/
+    # claimed) until they approve or decline via the merchant portal.
+    auto_execute = True
+    if context.merchant_id:
+        try:
+            from db.merchant_portal_preferences import (
+                get_merchant_executor_auto_execute,
+            )
+            auto_execute = await get_merchant_executor_auto_execute(
+                context.merchant_id,
+            )
+        except Exception:  # noqa: BLE001 — never block dispatch on a read
+            auto_execute = True
+    target_stage = STAGE_QUEUED if auto_execute else STAGE_PENDING_APPROVAL
+    summary["auto_execute"] = auto_execute
 
     allow = frozenset(agent_names) if agent_names is not None else None
     for agent in _registry():
@@ -206,6 +227,7 @@ async def dispatch_agents(
             payload_jsonb={"extra": dict(context.extra or {})},
             idempotency_key=idem_key,
             max_retries=_AGENT_MAX_RETRIES.get(agent.name, 3),
+            stage=target_stage,
         )
         if run_id is None:
             logger.warning(
@@ -222,15 +244,16 @@ async def dispatch_agents(
 
         summary["agents_enqueued"] += 1
         summary["dispatched_count"] += 1
+        run_state = "enqueued" if auto_execute else "pending_approval"
         summary["runs"].append({
             "agent_name": agent.name,
             "run_id": run_id,
-            "state": "enqueued",
+            "state": run_state,
         })
         logger.info(
-            "executor_dispatcher: enqueued %s as run_id=%s for "
+            "executor_dispatcher: enqueued %s as run_id=%s stage=%s for "
             "merchant=%s parent=%s",
-            agent.name, run_id, context.merchant_id,
+            agent.name, run_id, target_stage, context.merchant_id,
             context.parent_audit_run_id,
         )
 

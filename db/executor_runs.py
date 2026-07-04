@@ -21,7 +21,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import uuid
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, List, Optional
 
 from db._jsonb_safe import _json_safe
@@ -79,16 +79,33 @@ executor_runs = Table(
 #   queued → claimed → succeeded
 #                     → failed → (re-enqueue) → claimed → ...
 #                     → exhausted_retries (when retry_count == max_retries)
+# W5 P7: when a merchant opts into approval mode (executor_auto_execute
+# = false), the dispatcher enqueues rows in `pending_approval` instead of
+# `queued`. The worker's claim query only pulls queued/claimed, so pending
+# rows are inert until a merchant approves (→ queued) or declines
+# (→ declined, terminal).
 STAGE_QUEUED = "queued"
 STAGE_CLAIMED = "claimed"
 STAGE_SUCCEEDED = "succeeded"
 STAGE_FAILED = "failed"
 STAGE_EXHAUSTED_RETRIES = "exhausted_retries"
+STAGE_PENDING_APPROVAL = "pending_approval"
+STAGE_DECLINED = "declined"
 
 ACTIVE_STAGES = frozenset({STAGE_QUEUED, STAGE_CLAIMED})
 TERMINAL_STAGES = frozenset({
     STAGE_SUCCEEDED, STAGE_FAILED, STAGE_EXHAUSTED_RETRIES,
+    STAGE_DECLINED,
 })
+# Stages that count as "already scheduled" for idempotency dedupe. A
+# pending_approval row is not actively worked but must still dedupe a
+# re-dispatch of the same (agent, merchant, audit) tuple.
+IN_FLIGHT_STAGES = frozenset(ACTIVE_STAGES | {STAGE_PENDING_APPROVAL})
+
+# W5 P7: pending_approval rows older than this are treated as expired —
+# they can't be approved (the underlying audit is stale). Enforced at
+# approve time, not by a cron (matches the lease-reclaim-inline pattern).
+PENDING_APPROVAL_TTL_DAYS = 30
 
 # Validate state transitions before any UPDATE so a worker race or
 # stale read can't silently corrupt the queue.
@@ -98,9 +115,12 @@ VALID_STAGE_TRANSITIONS: dict = {
         STAGE_SUCCEEDED, STAGE_FAILED, STAGE_QUEUED,
         STAGE_EXHAUSTED_RETRIES,
     },
+    # W5 P7: approve (→ queued) or decline (→ declined, terminal).
+    STAGE_PENDING_APPROVAL: {STAGE_QUEUED, STAGE_DECLINED},
     STAGE_SUCCEEDED: set(),
     STAGE_FAILED: set(),
     STAGE_EXHAUSTED_RETRIES: set(),
+    STAGE_DECLINED: set(),
 }
 
 
@@ -376,13 +396,26 @@ async def enqueue_executor_run(
     payload_jsonb: Optional[Dict[str, Any]] = None,
     idempotency_key: Optional[str] = None,
     max_retries: int = 3,
+    stage: str = STAGE_QUEUED,
 ) -> Optional[str]:
-    """Insert a row in stage='queued' for the executor_run_worker
-    to claim. Returns the run_id, or None on persistence failure.
+    """Insert a row for the executor_run_worker to claim. Returns the
+    run_id, or None on persistence failure.
+
+    `stage` (W5 P7) defaults to 'queued' (auto-execute). Pass
+    'pending_approval' when the merchant opted into approval mode — the
+    worker's claim query ignores it until the merchant approves.
     """
+    if stage not in (STAGE_QUEUED, STAGE_PENDING_APPROVAL):
+        raise ValueError(f"enqueue_executor_run: invalid stage {stage!r}")
     await ensure_executor_runs_table()
     run_id = str(uuid.uuid4())
     now = _now_utc()
+    # Legacy `status` mirrors `stage` during the dual-key window — old
+    # readers see 'running' for queued work, 'pending_approval' for
+    # awaiting-consent work.
+    status = (
+        "pending_approval" if stage == STAGE_PENDING_APPROVAL else "running"
+    )
     try:
         # TODO(brief-future): wire execution-credit debit to executor_runs
         # writes when execution layer ships.
@@ -393,10 +426,8 @@ async def enqueue_executor_run(
                 merchant_id=merchant_id,
                 parent_audit_run_id=parent_audit_run_id,
                 requested_at=now,
-                # Legacy `status` aligned with `stage` during the
-                # dual-key window — old readers see 'running'.
-                status="running",
-                stage=STAGE_QUEUED,
+                status=status,
+                stage=stage,
                 stage_updated_at=now,
                 # JSONB write boundary — coerce UUID/datetime/Decimal.
                 payload_jsonb=_json_safe(payload_jsonb) if payload_jsonb else payload_jsonb,
@@ -429,7 +460,7 @@ async def find_in_flight_executor_run_by_idempotency(
             select(executor_runs.c.run_id)
             .where(
                 executor_runs.c.idempotency_key == idempotency_key,
-                executor_runs.c.stage.in_(list(ACTIVE_STAGES)),
+                executor_runs.c.stage.in_(list(IN_FLIGHT_STAGES)),
             )
             .limit(1)
         )
@@ -695,6 +726,197 @@ async def fetch_executor_run_by_id(
         "idempotency_key": d.get("idempotency_key"),
     })
     return base
+
+
+# =====================================================================
+# W5 P7 — per-merchant consent: pending_approval read + approve/decline.
+# Used by routes/merchant_dashboard_routes.py (merchant-authenticated).
+# =====================================================================
+
+
+def _pending_is_expired(stage_updated_at_iso: Optional[str]) -> bool:
+    """True when a pending_approval row is past its TTL. The audit that
+    produced the pending executor work is stale, so approving would run
+    an agent against a report the merchant never actually saw fresh."""
+    if not stage_updated_at_iso:
+        return False
+    try:
+        dt = datetime.fromisoformat(stage_updated_at_iso)
+    except (ValueError, TypeError):
+        return False
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    return (_now_utc() - dt) > timedelta(days=PENDING_APPROVAL_TTL_DAYS)
+
+
+async def pending_approval_runs_for_merchant(
+    *,
+    merchant_id: str,
+    parent_audit_run_id: Optional[str] = None,
+) -> List[Dict[str, Any]]:
+    """List a merchant's executor_runs awaiting approval. Optionally
+    filtered to one audit run. Each row carries an `expired` flag so the
+    portal can grey out rows past the TTL (they can't be approved)."""
+    await ensure_executor_runs_table()
+    try:
+        query = (
+            executor_runs.select()
+            .where(
+                executor_runs.c.merchant_id == merchant_id,
+                executor_runs.c.stage == STAGE_PENDING_APPROVAL,
+            )
+            .order_by(executor_runs.c.requested_at.desc())
+        )
+        if parent_audit_run_id:
+            query = query.where(
+                executor_runs.c.parent_audit_run_id == parent_audit_run_id
+            )
+        rows = await database.fetch_all(query)
+    except Exception as exc:  # noqa: BLE001
+        logger.warning(
+            "pending_approval_runs_for_merchant failed for %s: %s",
+            merchant_id, str(exc)[:200],
+        )
+        return []
+    out: List[Dict[str, Any]] = []
+    for r in (rows or []):
+        d = dict(r)
+        base = _row_to_dict(r)
+        stage_updated_iso = (
+            d["stage_updated_at"].isoformat()
+            if isinstance(d.get("stage_updated_at"), datetime) else None
+        )
+        base.update({
+            "stage": d.get("stage"),
+            "stage_updated_at": stage_updated_iso,
+            "expired": _pending_is_expired(stage_updated_iso),
+        })
+        out.append(base)
+    return out
+
+
+async def approve_executor_run(
+    *, run_id: str, merchant_id: str,
+) -> Dict[str, Any]:
+    """Approve a pending_approval executor_run: transition it to
+    `queued` so the worker can claim it. Merchant-ownership enforced.
+
+    Idempotent: approving a row that's already queued/claimed/succeeded
+    is a no-op success. Returns {"status": ...} where status is one of
+    'success' | 'not_found' | 'forbidden' | 'expired' | 'conflict'.
+    """
+    row = await fetch_executor_run_by_id(run_id=run_id)
+    if row is None:
+        return {"status": "not_found", "run_id": run_id}
+    if (row.get("merchant_id") or None) != merchant_id:
+        return {"status": "forbidden", "run_id": run_id}
+
+    stage = row.get("stage")
+    # Idempotent no-op: an already-approved (or completed) run is a
+    # success — approving twice must not double-enqueue.
+    if stage in (STAGE_QUEUED, STAGE_CLAIMED, STAGE_SUCCEEDED):
+        return {"status": "success", "run_id": run_id, "stage": stage,
+                "noop": True}
+    if stage != STAGE_PENDING_APPROVAL:
+        # declined / failed / exhausted — not approvable.
+        return {"status": "conflict", "run_id": run_id, "stage": stage}
+    if _pending_is_expired(row.get("stage_updated_at")):
+        return {"status": "expired", "run_id": run_id, "stage": stage}
+
+    now = _now_utc()
+    cutoff = now - timedelta(days=PENDING_APPROVAL_TTL_DAYS)
+    # Atomic guarded transition — only the FIRST approve moves the row,
+    # so approve-exactly-once holds under concurrent calls. The TTL is
+    # re-checked in SQL so a row that expired between fetch and update
+    # can't slip through.
+    query = """
+        UPDATE executor_runs
+           SET stage            = 'queued',
+               status           = 'running',
+               stage_updated_at = :now
+         WHERE run_id = :run_id
+           AND merchant_id = :merchant_id
+           AND stage = 'pending_approval'
+           AND stage_updated_at >= :cutoff
+         RETURNING run_id
+    """
+    try:
+        matched = await database.fetch_one(
+            query,
+            {"run_id": run_id, "merchant_id": merchant_id,
+             "now": now, "cutoff": cutoff},
+        )
+    except Exception as exc:  # noqa: BLE001
+        logger.warning(
+            "approve_executor_run failed for run_id=%s: %s",
+            run_id, str(exc)[:200],
+        )
+        return {"status": "conflict", "run_id": run_id, "stage": stage}
+    if matched is not None:
+        return {"status": "success", "run_id": run_id, "stage": STAGE_QUEUED}
+    # UPDATE matched nothing — re-read to classify (raced approve or
+    # just-expired).
+    fresh = await fetch_executor_run_by_id(run_id=run_id)
+    fresh_stage = fresh.get("stage") if fresh else None
+    if fresh_stage in (STAGE_QUEUED, STAGE_CLAIMED, STAGE_SUCCEEDED):
+        return {"status": "success", "run_id": run_id, "stage": fresh_stage,
+                "noop": True}
+    return {"status": "expired", "run_id": run_id, "stage": fresh_stage}
+
+
+async def decline_executor_run(
+    *, run_id: str, merchant_id: str,
+) -> Dict[str, Any]:
+    """Decline a pending_approval executor_run: transition it to the
+    terminal `declined` stage so it never runs. Merchant-ownership
+    enforced. Idempotent: declining an already-declined run is a no-op
+    success. Returns {"status": ...} as with approve_executor_run.
+    """
+    row = await fetch_executor_run_by_id(run_id=run_id)
+    if row is None:
+        return {"status": "not_found", "run_id": run_id}
+    if (row.get("merchant_id") or None) != merchant_id:
+        return {"status": "forbidden", "run_id": run_id}
+
+    stage = row.get("stage")
+    if stage == STAGE_DECLINED:
+        return {"status": "success", "run_id": run_id, "stage": stage,
+                "noop": True}
+    if stage != STAGE_PENDING_APPROVAL:
+        # Already queued/claimed/succeeded/failed — can't decline.
+        return {"status": "conflict", "run_id": run_id, "stage": stage}
+
+    now = _now_utc()
+    query = """
+        UPDATE executor_runs
+           SET stage            = 'declined',
+               status           = 'declined',
+               stage_updated_at = :now,
+               completed_at     = :now
+         WHERE run_id = :run_id
+           AND merchant_id = :merchant_id
+           AND stage = 'pending_approval'
+         RETURNING run_id
+    """
+    try:
+        matched = await database.fetch_one(
+            query, {"run_id": run_id, "merchant_id": merchant_id, "now": now},
+        )
+    except Exception as exc:  # noqa: BLE001
+        logger.warning(
+            "decline_executor_run failed for run_id=%s: %s",
+            run_id, str(exc)[:200],
+        )
+        return {"status": "conflict", "run_id": run_id, "stage": stage}
+    if matched is not None:
+        return {"status": "success", "run_id": run_id, "stage": STAGE_DECLINED}
+    # Raced — re-read to report idempotently.
+    fresh = await fetch_executor_run_by_id(run_id=run_id)
+    fresh_stage = fresh.get("stage") if fresh else None
+    if fresh_stage == STAGE_DECLINED:
+        return {"status": "success", "run_id": run_id, "stage": fresh_stage,
+                "noop": True}
+    return {"status": "conflict", "run_id": run_id, "stage": fresh_stage}
 
 
 async def release_stale_executor_leases(

@@ -357,6 +357,9 @@ class MerchantPortalPreferencesRequest(BaseModel):
     portal_language: Optional[
         Literal["en", "zh-CN", "ja-JP", "ko-KR", "fr-FR", "de-DE"]
     ] = None
+    # W5 P7: consent toggle for audit executor dispatch. true = auto-execute
+    # (default), false = opt into per-run approval.
+    executor_auto_execute: Optional[bool] = None
 
 
 class MerchantWebhookConfigRequest(BaseModel):
@@ -595,6 +598,10 @@ async def get_merchant_settings_preferences(current_user: dict = Depends(get_cur
             "email_inventory": preferences.get("email_inventory", DEFAULT_MERCHANT_PORTAL_PREFERENCES["email_inventory"]),
             "email_weekly": preferences.get("email_weekly", DEFAULT_MERCHANT_PORTAL_PREFERENCES["email_weekly"]),
             "portal_language": preferences.get("portal_language", DEFAULT_PORTAL_LANGUAGE),
+            "executor_auto_execute": preferences.get(
+                "executor_auto_execute",
+                DEFAULT_MERCHANT_PORTAL_PREFERENCES["executor_auto_execute"],
+            ),
             "updated_at": preferences.get("updated_at"),
         },
     }
@@ -626,9 +633,117 @@ async def update_merchant_settings_preferences(
             "email_inventory": preferences["email_inventory"],
             "email_weekly": preferences["email_weekly"],
             "portal_language": preferences.get("portal_language", DEFAULT_PORTAL_LANGUAGE),
+            "executor_auto_execute": preferences.get(
+                "executor_auto_execute",
+                DEFAULT_MERCHANT_PORTAL_PREFERENCES["executor_auto_execute"],
+            ),
             "updated_at": preferences.get("updated_at"),
         },
     }
+
+
+@router.get("/merchant/executor-runs/pending")
+async def get_pending_executor_runs(
+    audit_run_id: Optional[str] = Query(default=None),
+    current_user: dict = Depends(get_current_user),
+):
+    """W5 P7: list this merchant's executor runs awaiting approval.
+
+    Only populated for merchants who opted into approval mode
+    (executor_auto_execute=false). Optionally filtered to one audit run.
+    """
+    if current_user["role"] != "merchant":
+        raise HTTPException(status_code=403, detail="Merchant access only")
+
+    merchant_id = current_user.get("merchant_id")
+    if not merchant_id:
+        raise HTTPException(status_code=400, detail="Merchant ID not found in token")
+
+    from db.executor_runs import pending_approval_runs_for_merchant
+
+    runs = await pending_approval_runs_for_merchant(
+        merchant_id=merchant_id,
+        parent_audit_run_id=audit_run_id,
+    )
+    return {
+        "status": "success",
+        "data": {
+            "merchant_id": merchant_id,
+            "audit_run_id": audit_run_id,
+            "runs": runs,
+            "count": len(runs),
+        },
+    }
+
+
+def _executor_consent_http(result: Dict[str, Any]) -> Dict[str, Any]:
+    """Map an approve/decline result dict to an HTTP response (raising
+    HTTPException for the non-success outcomes)."""
+    status = result.get("status")
+    if status == "success":
+        return {
+            "status": "success",
+            "data": {
+                "run_id": result.get("run_id"),
+                "stage": result.get("stage"),
+                "noop": bool(result.get("noop")),
+            },
+        }
+    if status in ("not_found", "forbidden"):
+        # 404 for both — don't leak whether another merchant owns the id.
+        raise HTTPException(status_code=404, detail="Executor run not found")
+    if status == "expired":
+        raise HTTPException(
+            status_code=409,
+            detail="Executor run pending-approval window expired",
+        )
+    # conflict / anything else
+    raise HTTPException(
+        status_code=409,
+        detail=f"Executor run is not in an approvable state (stage={result.get('stage')})",
+    )
+
+
+@router.post("/merchant/executor-runs/{run_id}/approve")
+async def approve_pending_executor_run(
+    run_id: str,
+    current_user: dict = Depends(get_current_user),
+):
+    """W5 P7: approve a pending executor run → queue it for the worker.
+    Idempotent: approving an already-queued/completed run is a no-op
+    success."""
+    if current_user["role"] != "merchant":
+        raise HTTPException(status_code=403, detail="Merchant access only")
+
+    merchant_id = current_user.get("merchant_id")
+    if not merchant_id:
+        raise HTTPException(status_code=400, detail="Merchant ID not found in token")
+
+    from db.executor_runs import approve_executor_run
+
+    result = await approve_executor_run(run_id=run_id, merchant_id=merchant_id)
+    return _executor_consent_http(result)
+
+
+@router.post("/merchant/executor-runs/{run_id}/decline")
+async def decline_pending_executor_run(
+    run_id: str,
+    current_user: dict = Depends(get_current_user),
+):
+    """W5 P7: decline a pending executor run → terminal, never runs.
+    Idempotent: declining an already-declined run is a no-op success."""
+    if current_user["role"] != "merchant":
+        raise HTTPException(status_code=403, detail="Merchant access only")
+
+    merchant_id = current_user.get("merchant_id")
+    if not merchant_id:
+        raise HTTPException(status_code=400, detail="Merchant ID not found in token")
+
+    from db.executor_runs import decline_executor_run
+
+    result = await decline_executor_run(run_id=run_id, merchant_id=merchant_id)
+    return _executor_consent_http(result)
+
 
 @router.get("/merchant/{merchant_id}/integrations")
 async def get_merchant_stores(

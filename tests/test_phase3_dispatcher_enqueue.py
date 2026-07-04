@@ -338,6 +338,94 @@ async def test_agent_names_none_dispatches_full_registry(monkeypatch):
     assert result["agents_evaluated"] == 2  # full registry, no filter
 
 
+# =====================================================================
+# W5 P7 — per-merchant executor consent (auto-execute toggle)
+# =====================================================================
+
+
+def _patch_consent(monkeypatch, *, auto_execute: bool):
+    """Stub the per-merchant consent read the dispatcher performs.
+    The dispatcher imports get_merchant_executor_auto_execute at call
+    time from db.merchant_portal_preferences."""
+    from db import merchant_portal_preferences as mpp
+
+    async def _fake(_merchant_id):
+        return auto_execute
+
+    monkeypatch.setattr(
+        mpp, "get_merchant_executor_auto_execute", _fake,
+    )
+
+
+@pytest.mark.asyncio
+async def test_default_merchant_enqueues_in_queued_stage(monkeypatch):
+    """(a) A merchant with auto-execute ON (the default) gets rows
+    enqueued in the 'queued' stage — behavior unchanged from pre-P7."""
+    _patch_consent(monkeypatch, auto_execute=True)
+    agents = [_FakeAgent("agent_a"), _FakeAgent("agent_b")]
+    stub = _EnqueueStub()
+    _patch_dispatcher(monkeypatch, agents=agents, stub=stub)
+
+    from services.executor_agents.base import ExecutorContext
+    from services.executor_agents.dispatcher import dispatch_agents
+    from db.executor_runs import STAGE_QUEUED
+
+    result = await dispatch_agents(
+        ExecutorContext(merchant_id="m-1", parent_audit_run_id="a-1"),
+    )
+    assert result["auto_execute"] is True
+    assert all(e["stage"] == STAGE_QUEUED for e in stub.enqueued)
+    assert {r["state"] for r in result["runs"]} == {"enqueued"}
+
+
+@pytest.mark.asyncio
+async def test_approval_mode_enqueues_in_pending_approval_stage(monkeypatch):
+    """(b) A merchant who opted into approval mode (auto_execute=false)
+    gets rows in 'pending_approval', NOT 'queued'."""
+    _patch_consent(monkeypatch, auto_execute=False)
+    agents = [_FakeAgent("agent_a"), _FakeAgent("agent_b")]
+    stub = _EnqueueStub()
+    _patch_dispatcher(monkeypatch, agents=agents, stub=stub)
+
+    from services.executor_agents.base import ExecutorContext
+    from services.executor_agents.dispatcher import dispatch_agents
+    from db.executor_runs import STAGE_PENDING_APPROVAL
+
+    result = await dispatch_agents(
+        ExecutorContext(merchant_id="m-1", parent_audit_run_id="a-1"),
+    )
+    assert result["auto_execute"] is False
+    assert len(stub.enqueued) == 2
+    assert all(
+        e["stage"] == STAGE_PENDING_APPROVAL for e in stub.enqueued
+    )
+    assert {r["state"] for r in result["runs"]} == {"pending_approval"}
+
+
+@pytest.mark.asyncio
+async def test_kill_switch_beats_per_merchant_consent(monkeypatch):
+    """(e) The global env kill-switch is layered ABOVE per-merchant
+    consent — env off ⇒ nothing enqueued regardless of the toggle."""
+    from config.settings import settings
+    monkeypatch.setattr(settings, "audit_executor_dispatch_enabled", False)
+    # Even with approval mode configured, the kill-switch short-circuits
+    # before any consent read or enqueue.
+    _patch_consent(monkeypatch, auto_execute=False)
+    agents = [_FakeAgent("agent_a", should_run_returns=True)]
+    stub = _EnqueueStub()
+    _patch_dispatcher(monkeypatch, agents=agents, stub=stub)
+
+    from services.executor_agents.base import ExecutorContext
+    from services.executor_agents.dispatcher import dispatch_agents
+
+    result = await dispatch_agents(
+        ExecutorContext(merchant_id="m-1", parent_audit_run_id="a-1"),
+    )
+    assert result["disabled"] is True
+    assert result["agents_evaluated"] == 0
+    assert stub.enqueued == []
+
+
 def test_report_only_executors_are_a_real_subset_of_the_registry():
     # Guard: the report-only allowlist must name agents that actually exist in
     # the registry (a rename that orphans an allowlist entry is a red build).
