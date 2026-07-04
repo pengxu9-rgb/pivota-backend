@@ -198,34 +198,6 @@ def resolve_seed_vendor(
     return fallback or None
 
 
-def audit_intake_enabled(merchant_id: Optional[str] = None) -> bool:
-    """Flag: auto-seed the commerce index from audits. Default OFF — ships dark.
-
-    Canary-first (mirrors quote_first_enforcement's allowlist pattern):
-      1. ENABLE_AUDIT_INDEX_INTAKE_MERCHANT_IDS — CSV allowlist; on for JUST those
-         merchants (the safe prod canary — a global flag would seed EVERY
-         merchant's URL audits at once).
-      2. ENABLE_AUDIT_INDEX_INTAKE — boolean; on for ALL merchants (graduation).
-
-    The seed write (audit_run_worker) and the report's evidence-attachable key
-    (agent_center_bd_report_service) call this with the SAME merchant_id, so they
-    agree per-merchant. (The upsert is best-effort regardless, so this only
-    governs whether we attempt it — it can never break an audit.)"""
-    if os.getenv("ENABLE_AUDIT_INDEX_INTAKE", "").strip().lower() in {
-        "1", "true", "yes", "on",
-    }:
-        return True
-    if merchant_id:
-        allowlist = {
-            m.strip()
-            for m in os.getenv("ENABLE_AUDIT_INDEX_INTAKE_MERCHANT_IDS", "").split(",")
-            if m.strip()
-        }
-        if str(merchant_id) in allowlist:
-            return True
-    return False
-
-
 # Only the columns we set; everything else (catalog_track, truth_tier,
 # readiness_tier, pdp_scope='unverified', sync_status='live', created_at, …)
 # takes its server_default — and pdp_lifecycle_stage stays NULL, so a seed is NOT
@@ -420,14 +392,15 @@ def audit_brand_fragmentation_guard_disabled() -> bool:
 
 
 def audit_brand_fragmentation_guard_enabled(merchant_id: Optional[str] = None) -> bool:
-    """The ADR-008 brand-fragmentation guard FOLLOWS intake: it runs whenever
-    audit-index intake is enabled for that merchant (per the mainline fix plan it's
-    a correctness feature of the main path, not a separate gate). The opt-out env
+    """The ADR-008 brand-fragmentation guard runs UNCONDITIONALLY. Now that
+    audit-index intake is the unconditional main line (W5 P2 removed
+    ENABLE_AUDIT_INDEX_INTAKE), the guard is the correctness protection that
+    REPLACES the flag — it must run for every seed. The opt-out env
     DISABLE_AUDIT_BRAND_FRAGMENTATION_GUARD (default false) can force it off as a
     canary escape hatch."""
     if audit_brand_fragmentation_guard_disabled():
         return False
-    return audit_intake_enabled(merchant_id)
+    return True
 
 
 async def _existing_brand_canonical_conflict(

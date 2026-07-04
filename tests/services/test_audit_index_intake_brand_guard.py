@@ -64,15 +64,15 @@ def _wire(monkeypatch, *, fetch_one, enqueue_spy=None):
     return calls
 
 
-def test_guard_off_when_intake_disabled_never_queries(monkeypatch):
-    # The guard follows intake: with intake disabled for the merchant it does not
-    # run (and never queries), regardless of the opt-out env.
+def test_guard_off_when_opt_out_set_never_queries(monkeypatch):
+    # W5 P2: the guard runs unconditionally; the ONLY way to turn it off is the
+    # explicit opt-out env. With it set the guard does not run (and never queries).
     monkeypatch.delenv("ENABLE_AUDIT_INDEX_INTAKE", raising=False)
     monkeypatch.delenv("ENABLE_AUDIT_INDEX_INTAKE_MERCHANT_IDS", raising=False)
-    monkeypatch.delenv("DISABLE_AUDIT_BRAND_FRAGMENTATION_GUARD", raising=False)
+    monkeypatch.setenv("DISABLE_AUDIT_BRAND_FRAGMENTATION_GUARD", "1")
 
     def _should_not_run(query, values):
-        raise AssertionError("guard must not query when intake is disabled")
+        raise AssertionError("guard must not query when the opt-out env is set")
 
     _wire(monkeypatch, fetch_one=_should_not_run)
     guard = asyncio.run(
@@ -82,7 +82,7 @@ def test_guard_off_when_intake_disabled_never_queries(monkeypatch):
 
 
 def test_guard_skips_mint_on_brand_conflict(monkeypatch):
-    monkeypatch.setenv("ENABLE_AUDIT_INDEX_INTAKE", "1")  # guard follows intake
+    monkeypatch.delenv("ENABLE_AUDIT_INDEX_INTAKE", raising=False)  # guard runs unconditionally
     monkeypatch.delenv("DISABLE_AUDIT_BRAND_FRAGMENTATION_GUARD", raising=False)
     monkeypatch.delenv("ENABLE_AUDIT_ER_GATE", raising=False)  # ER gate disabled
     calls = _wire(monkeypatch, fetch_one=lambda q, v: dict(_CONFLICT_ROW))
@@ -98,7 +98,7 @@ def test_guard_skips_mint_on_brand_conflict(monkeypatch):
 
 
 def test_guard_proceeds_when_no_conflict(monkeypatch):
-    monkeypatch.setenv("ENABLE_AUDIT_INDEX_INTAKE", "1")  # guard follows intake
+    monkeypatch.delenv("ENABLE_AUDIT_INDEX_INTAKE", raising=False)  # guard runs unconditionally
     monkeypatch.delenv("DISABLE_AUDIT_BRAND_FRAGMENTATION_GUARD", raising=False)
     monkeypatch.delenv("ENABLE_AUDIT_ER_GATE", raising=False)
     calls = _wire(monkeypatch, fetch_one=lambda q, v: None)
@@ -112,7 +112,7 @@ def test_guard_proceeds_when_no_conflict(monkeypatch):
 
 
 def test_guard_fails_open_on_db_error(monkeypatch):
-    monkeypatch.setenv("ENABLE_AUDIT_INDEX_INTAKE", "1")  # guard follows intake
+    monkeypatch.delenv("ENABLE_AUDIT_INDEX_INTAKE", raising=False)  # guard runs unconditionally
     monkeypatch.delenv("DISABLE_AUDIT_BRAND_FRAGMENTATION_GUARD", raising=False)
     monkeypatch.delenv("ENABLE_AUDIT_ER_GATE", raising=False)
 
@@ -130,7 +130,7 @@ def test_guard_fails_open_on_db_error(monkeypatch):
 def test_exact_sku_align_bypasses_brand_guard(monkeypatch):
     """An exact SKU dedup ('align') is the correct outcome and must NOT be
     diverted by the brand guard."""
-    monkeypatch.setenv("ENABLE_AUDIT_INDEX_INTAKE", "1")  # guard follows intake
+    monkeypatch.delenv("ENABLE_AUDIT_INDEX_INTAKE", raising=False)  # guard runs unconditionally
     calls = _wire(monkeypatch, fetch_one=lambda q, v: dict(_CONFLICT_ROW))
 
     async def _align(fields):

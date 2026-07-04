@@ -79,37 +79,12 @@ def test_brand_optional():
     assert "content_key" in f
 
 
-def test_audit_intake_flag_defaults_off(monkeypatch):
+def test_audit_intake_flag_removed(monkeypatch):
+    """W5 P2: seeding is the unconditional main line — the ENABLE_AUDIT_INDEX_INTAKE
+    flag helper is GONE. This locks in that no code path can re-introduce a gate."""
     import services.audit_index_intake as intake
 
-    monkeypatch.delenv("ENABLE_AUDIT_INDEX_INTAKE", raising=False)
-    monkeypatch.delenv("ENABLE_AUDIT_INDEX_INTAKE_MERCHANT_IDS", raising=False)
-    assert intake.audit_intake_enabled() is False
-    monkeypatch.setenv("ENABLE_AUDIT_INDEX_INTAKE", "yes")
-    assert intake.audit_intake_enabled() is True
-
-
-def test_audit_intake_per_merchant_canary_allowlist(monkeypatch):
-    import services.audit_index_intake as intake
-
-    monkeypatch.delenv("ENABLE_AUDIT_INDEX_INTAKE", raising=False)
-    monkeypatch.setenv("ENABLE_AUDIT_INDEX_INTAKE_MERCHANT_IDS", "m_canary, m_two")
-    # On for allowlisted merchants only — the safe prod canary.
-    assert intake.audit_intake_enabled("m_canary") is True
-    assert intake.audit_intake_enabled("m_two") is True
-    # Off for everyone else, and off when no merchant is supplied.
-    assert intake.audit_intake_enabled("m_other") is False
-    assert intake.audit_intake_enabled() is False
-
-
-def test_audit_intake_global_flag_overrides_allowlist(monkeypatch):
-    import services.audit_index_intake as intake
-
-    monkeypatch.setenv("ENABLE_AUDIT_INDEX_INTAKE", "true")
-    monkeypatch.delenv("ENABLE_AUDIT_INDEX_INTAKE_MERCHANT_IDS", raising=False)
-    # Graduation switch: on for all merchants regardless of the allowlist.
-    assert intake.audit_intake_enabled("anyone") is True
-    assert intake.audit_intake_enabled() is True
+    assert not hasattr(intake, "audit_intake_enabled")
 
 
 def test_upsert_orchestration_best_effort(monkeypatch):
@@ -155,19 +130,19 @@ def test_upsert_skips_unmappable_product(monkeypatch):
     assert out is None  # no title -> no mapping -> no DB write
 
 
-# --- W5.1: per-merchant CSV canary on the legacy wedge path ------------------
+# --- W5 P2: the legacy wedge path seeds UNCONDITIONALLY -----------------------
 
-def test_wedge_path_honors_per_merchant_csv_canary(monkeypatch):
-    """The wedge audit's seed loop is gated by audit_intake_enabled(merchant_id),
-    so the per-merchant CSV canary applies: a merchant in the allowlist seeds; one
-    not in it does not. (Previously the wedge path called it WITHOUT merchant_id,
-    so the CSV canary never took effect there.)"""
+def test_wedge_path_seeds_unconditionally(monkeypatch):
+    """W5 P2: seeding is the unconditional main line — the wedge audit's seed loop
+    runs for EVERY merchant with no flag set. (Previously it was gated on
+    audit_intake_enabled(merchant_id)'s per-merchant CSV canary; that gate is gone.)"""
     import asyncio
 
     import routes.merchant_audit_routes as mar
 
+    # No flag env at all — seeding must still happen.
     monkeypatch.delenv("ENABLE_AUDIT_INDEX_INTAKE", raising=False)
-    monkeypatch.setenv("ENABLE_AUDIT_INDEX_INTAKE_MERCHANT_IDS", "m_canary")
+    monkeypatch.delenv("ENABLE_AUDIT_INDEX_INTAKE_MERCHANT_IDS", raising=False)
 
     seeded = []
 
@@ -177,7 +152,7 @@ def test_wedge_path_honors_per_merchant_csv_canary(monkeypatch):
 
     async def _stop_after_seed(**kwargs):
         # Fires immediately after the seed loop — abort the (heavy) report path so
-        # the test exercises only the intake gate. Recorded 'failed', then returns.
+        # the test exercises only the seed loop. Recorded 'failed', then returns.
         raise RuntimeError("stop after seed loop")
 
     async def _noop_completed(**kwargs):
@@ -200,14 +175,15 @@ def test_wedge_path_honors_per_merchant_csv_canary(monkeypatch):
             base_payload={},
         )
 
-    asyncio.run(_run("m_canary"))       # allowlisted -> seed loop runs
-    assert seeded == [("m_canary", products[0])]
+    # Any merchant seeds — no allowlist, no flag.
+    asyncio.run(_run("m_any_merchant"))
+    assert seeded == [("m_any_merchant", products[0])]
 
-    asyncio.run(_run("m_other"))        # not allowlisted -> seed loop skipped
-    assert seeded == []
+    asyncio.run(_run("m_other_merchant"))
+    assert seeded == [("m_other_merchant", products[0])]
 
 
-# --- W5.1: ADR-008 brand-fragmentation guard follows intake ------------------
+# --- W5 P2: ADR-008 brand-fragmentation guard runs unconditionally -----------
 
 _GUARD_CONFLICT_ROW = {
     "product_key": "prod::external_seed::external_seed::anua_1",
@@ -257,14 +233,15 @@ def _wire_guard_seams(monkeypatch, *, fetch_one):
     return calls
 
 
-def test_brand_guard_active_when_intake_enabled_no_guard_env(monkeypatch):
-    """The guard follows intake: enabled for the merchant + no opt-out env => the
-    guard runs and skips a brand-fragmenting orphan mint (routes it to review)."""
+def test_brand_guard_active_unconditionally_no_guard_env(monkeypatch):
+    """W5 P2: the guard runs unconditionally — no ENABLE flag, no opt-out env =>
+    the guard runs and skips a brand-fragmenting orphan mint (routes it to
+    review)."""
     import asyncio
 
     import services.audit_index_intake as intake
 
-    monkeypatch.setenv("ENABLE_AUDIT_INDEX_INTAKE", "1")          # intake on
+    monkeypatch.delenv("ENABLE_AUDIT_INDEX_INTAKE", raising=False)
     monkeypatch.delenv("DISABLE_AUDIT_BRAND_FRAGMENTATION_GUARD", raising=False)
     monkeypatch.delenv("ENABLE_AUDIT_ER_GATE", raising=False)
 
@@ -281,13 +258,13 @@ def test_brand_guard_active_when_intake_enabled_no_guard_env(monkeypatch):
 
 def test_brand_guard_opt_out_env_disables_it(monkeypatch):
     """DISABLE_AUDIT_BRAND_FRAGMENTATION_GUARD is the explicit opt-out escape
-    hatch: with it set, the guard does not run even though intake is enabled and a
+    hatch: with it set, the guard does not run even though seeding is on and a
     same-brand conflict exists — the seed is minted."""
     import asyncio
 
     import services.audit_index_intake as intake
 
-    monkeypatch.setenv("ENABLE_AUDIT_INDEX_INTAKE", "1")             # intake on
+    monkeypatch.delenv("ENABLE_AUDIT_INDEX_INTAKE", raising=False)
     monkeypatch.setenv("DISABLE_AUDIT_BRAND_FRAGMENTATION_GUARD", "1")  # opt out
     monkeypatch.delenv("ENABLE_AUDIT_ER_GATE", raising=False)
 

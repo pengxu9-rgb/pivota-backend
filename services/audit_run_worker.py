@@ -1390,23 +1390,18 @@ def _detect_mock_audit_output(brand_report: Dict[str, Any]) -> List[Dict[str, An
 async def _seed_url_audit_index(
     *, merchant_id: str, synthetic_items: List[Dict[str, Any]],
 ) -> None:
-    """Best-effort: auto-seed the commerce index from a URL audit. Flag-gated
-    (ENABLE_AUDIT_INDEX_INTAKE, default OFF). For each pasted product, upsert an
-    OBSERVED, unclaimed catalog_products seed keyed on the BRAND's surface
-    (canonical_url — the brand site even when the pasted page is a retailer
-    channel). The seed's (platform='url_audit', source_product_id) is what the
-    per-SKU report re-derives deterministically so the merchant can attach
-    proof/claims to it. NEVER raises — an intake failure must not break a live
-    audit (the upsert is itself best-effort; this guard is belt-and-suspenders)."""
+    """Best-effort: auto-seed the commerce index from a URL audit. UNCONDITIONAL
+    on the url_audit path (W5 P2 — seeding is the main line, no longer flag-gated).
+    For each pasted product, upsert an OBSERVED, unclaimed catalog_products seed
+    keyed on the BRAND's surface (canonical_url — the brand site even when the
+    pasted page is a retailer channel). The seed's (platform='url_audit',
+    source_product_id) is what the per-SKU report re-derives deterministically so
+    the merchant can attach proof/claims to it. NEVER raises — an intake failure
+    must not break a live audit (the upsert is itself best-effort; this guard is
+    belt-and-suspenders)."""
     try:
-        from services.audit_index_intake import (
-            audit_intake_enabled,
-            upsert_audited_sku_to_index,
-        )
-
-        if not audit_intake_enabled(merchant_id):
-            return
-    except Exception as exc:  # noqa: BLE001 — import/flag must never break the audit
+        from services.audit_index_intake import upsert_audited_sku_to_index
+    except Exception as exc:  # noqa: BLE001 — import must never break the audit
         logger.warning(
             "audit_run_worker: url-audit index seed setup failed: %s", str(exc)[:200],
         )
