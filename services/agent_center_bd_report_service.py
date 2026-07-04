@@ -5737,6 +5737,32 @@ def build_custom_prompt_results(
             merchant_brand=merchant_brand,
             merchant_vendors=merchant_vendors,
         )
+        # W1 T3 secondary site (per-prompt lane classifier). This is one of the
+        # extract_cited_hosts scalar reads NOT yet on RunFacts — it gates the
+        # rendered lane verdict (open/contested/absent). Instrumented log-only so
+        # the next multi-merchant run yields its drift before we decide the flip;
+        # per-prompt runs, so the aggregator sees one check per prompt group.
+        try:
+            _lane_facts = compute_run_facts(
+                runs,
+                merchant_host=merchant_host,
+                merchant_brand=merchant_brand,
+                merchant_vendors=merchant_vendors,
+            )
+            parity_check(
+                "bd_report.prompt_lane.merchant_cited_runs",
+                merchant_cited_runs,
+                _lane_facts.brand_mentioned_runs,
+                context={"prompt": str(prompt)[:80]},
+            )
+            parity_check(
+                "bd_report.prompt_lane.runs_with_any",
+                runs_with_any,
+                _lane_facts.runs_with_citations,
+                context={"prompt": str(prompt)[:80]},
+            )
+        except Exception:  # noqa: BLE001 — parity must never sink the report
+            logger.warning("run_facts parity (prompt_lane) failed", exc_info=True)
 
         # Distinct sources the AI grounded in, split into "the brand" vs
         # everyone else. Dedup across this prompt's provider runs by source key.

@@ -24,7 +24,7 @@ from services.agent_center_bd_report_service import (
     extract_cited_hosts,
     normalize_host,
 )
-from services.audit_facts import compute_run_facts, parity_measure
+from services.audit_facts import compute_run_facts, parity_check, parity_measure
 from services.brand_alias import derive_brand_aliases, text_mentions_brand
 from services.buyer_path_stable_controllers import stable_buyer_path_controllers
 from services.cited_host_classifier import classify_host
@@ -290,6 +290,31 @@ def _score_prompt_group(
         merchant_brand=str(merchant_brand or ""),
         merchant_vendors=merchant_identities,
     )
+    # W1 T3 secondary site (per-prompt-group opportunity scorer). extract_cited_hosts
+    # scalar reads here feed the group's density/opportunity math and are not yet on
+    # RunFacts. Instrumented log-only so the next multi-merchant run yields their
+    # drift before we decide the flip; one check per prompt group.
+    try:
+        _grp_facts = compute_run_facts(
+            runs,
+            merchant_host=merchant_host,
+            merchant_brand=str(merchant_brand or ""),
+            merchant_vendors=merchant_identities,
+        )
+        parity_check(
+            "sku_opportunity.prompt_group.merchant_cited_runs",
+            merchant_cited_runs,
+            _grp_facts.brand_mentioned_runs,
+            context={"query": str(query)[:80]},
+        )
+        parity_check(
+            "sku_opportunity.prompt_group.runs_with_citations",
+            runs_with_citations,
+            _grp_facts.runs_with_citations,
+            context={"query": str(query)[:80]},
+        )
+    except Exception:  # noqa: BLE001 — parity must never sink scoring
+        pass
     source_route = _source_route(source_roles, sku_ctx)
     competitors, competitor_counts = _competitors_for_runs(
         runs,
