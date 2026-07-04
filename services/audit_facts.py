@@ -710,10 +710,15 @@ LEGACY_CITEDNESS_SITES: Tuple[Dict[str, Any], ...] = (
               " the 'unify the two own-domain matchers' cutover must decide on"},
     {"id": 8, "site": "bd_report._citation_signals (endorsement/findability)", "tier": "T2",
      "definition": "name-gated citation_role (cites_exact_sku/near_variant)",
-     "instrumented": True, "mode": "measure",
-     "notes": "endorsement_hosts set measured vs RunFacts endorsement_hosts —"
-              " quantifies the name-gate depth gap (SKU-level naming vs"
-              " label-mentions-brand)"},
+     "instrumented": True, "mode": "measure", "rewired": True,
+     "notes": "REWIRED 2026-07-04 (founder decision: brand-named counts). The"
+              " rendered endorsement set + derived flags now come from the RunFacts"
+              " T2 fold (endorsement-role host that names the BRAND); the SKU-name"
+              " gate produced false 'no endorsement' negatives (Anuko: legacy [] vs"
+              " RunFacts ['hwahae.com'], contradicting the report's own host table)."
+              " build_authority_map overlays it per-SKU + brand; legacy value stashed"
+              " as endorsement_hosts_legacy for the parity tripwire. Verdict does NOT"
+              " depend on endorsement (score-driven), so no verdict change"},
     {"id": 9, "site": "sku_opportunity per-prompt verdicts", "tier": "T3-soft",
      "definition": "free-text mention in answer body (merchant_mention -> win/partial)",
      "instrumented": True, "mode": "measure",
