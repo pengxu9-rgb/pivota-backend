@@ -664,7 +664,13 @@ def aggregate_run_facts(
 LEGACY_CITEDNESS_SITES: Tuple[Dict[str, Any], ...] = (
     {"id": 1, "site": "bd_report._source_matches_merchant", "tier": "T3-matcher",
      "definition": "host OR brand-in-title OR alias", "instrumented": True,
-     "mode": "drift"},
+     "mode": "drift", "rewired": True,
+     "notes": "ALREADY UNIFIED (confirmed 2026-07-04): a single implementation in"
+              " audit_facts (moved from the god module) is the ONE merchant-source"
+              " matcher — called by extract_cited_hosts (site 2), build_authority_map,"
+              " AND RunFacts' _source_fact. Since site 2's T3 parity is 0-drift and"
+              " both its sides call this fn, site 1 is transitively proven consistent."
+              " No duplicate to collapse"},
     {"id": 2, "site": "bd_report.extract_cited_hosts.merchant_cited_runs", "tier": "T3",
      "definition": ">=1 source matches merchant", "instrumented": True,
      "mode": "drift",
@@ -684,9 +690,16 @@ LEGACY_CITEDNESS_SITES: Tuple[Dict[str, Any], ...] = (
               " equivalence oracle"},
     {"id": 4, "site": "bd_report.score_category_visibility", "tier": "mixed",
      "definition": "url_match OR title OR excerpt-triple", "instrumented": True,
-     "mode": "measure",
-     "notes": "source-walk component (title_match) measured vs T3; word-boundary"
-              " vs substring matcher gap + excerpt/url paths quantified"},
+     "mode": "measure", "decision": "keep-variant",
+     "notes": "KEEP (decided 2026-07-04, like site 7): an intentional composite"
+              " SUPERSET, not a duplicate. Credits a category match via"
+              " url_match.in_grounding OR brand-in-title OR the excerpt-triple path"
+              " (excerpt + llm_self_report + grounding source — the 'Gruns fix' for"
+              " editorial citations where the brand is in the excerpt but not the"
+              " grounding metadata). RunFacts T3 deliberately has no excerpt/"
+              " self-report analogue, so collapsing to T3 would DROP signal and lower"
+              " category scores. The parity_measure stays to quantify the title_match"
+              " sub-component's matcher gap only"},
     {"id": 5, "site": "bd_report.build_channel_appearance.own_site_cited", "tier": "T1",
      "definition": "RunFacts source-walk T1 per prompt (rewired)", "instrumented": True,
      "mode": "measure", "rewired": True,
