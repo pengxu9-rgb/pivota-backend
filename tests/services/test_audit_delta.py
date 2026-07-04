@@ -13,8 +13,9 @@ def _report(
     top_controller: str = "walmart.com",
     verdict: str = "VISIBLE VIA RETAILERS",
     tracking_metrics: list[str] | None = None,
+    prompt_basis: dict | None = None,
 ) -> dict:
-    return {
+    report = {
         "verdict": {
             "label": verdict,
             "visibility_score": visibility,
@@ -47,6 +48,9 @@ def _report(
             },
         },
     }
+    if prompt_basis is not None:
+        report["prompt_basis"] = prompt_basis
+    return report
 
 
 def _movement(delta: dict, signal: str) -> dict:
@@ -137,6 +141,64 @@ def test_band_crossing_score_improvement_is_material():
     assert movement["direction"] == "improved"
     assert movement["is_material"] is True
     assert "improved: First-party citation" in delta["headline"]
+
+
+def test_same_basis_tightens_material_threshold():
+    """W2: when both runs were measured on the SAME pinned prompt set, an 8-point
+    move (below the loose 15 but at/above the tight 5) IS material — the prompt
+    noise that justified 15 is gone."""
+    pinned = {"selected_set_id": "sel_abc"}
+    prior = _report(attribution=45, prompt_basis=pinned)
+    current = _report(attribution=53, prompt_basis=pinned)
+
+    delta = build_reaudit_delta(
+        current_report=current,
+        prior_report=prior,
+        prior_row={"run_id": "prior"},
+        days_since=14,
+    )
+
+    assert delta["measurement_basis"]["same"] is True
+    movement = _movement(delta, "attribution")
+    assert movement["from"] == 45 and movement["to"] == 53
+    assert movement["direction"] == "improved"
+    assert movement["is_material"] is True
+
+
+def test_different_basis_keeps_loose_threshold():
+    """W2: when the prompt set changed between runs, the same 8-point move is NOT
+    material — it could be the new questions, not real movement. Loose 15 holds."""
+    prior = _report(attribution=45, prompt_basis={"selected_set_id": "sel_old"})
+    current = _report(attribution=53, prompt_basis={"selected_set_id": "sel_new"})
+
+    delta = build_reaudit_delta(
+        current_report=current,
+        prior_report=prior,
+        prior_row={"run_id": "prior"},
+        days_since=14,
+    )
+
+    assert delta["measurement_basis"]["same"] is False
+    movement = _movement(delta, "attribution")
+    assert movement["direction"] == "stable"
+    assert movement["is_material"] is False
+
+
+def test_unknown_basis_keeps_loose_threshold():
+    """W2: if one side predates prompt-basis pinning (same=None), stay conservative
+    — an 8-point move is not asserted as material."""
+    prior = _report(attribution=45)  # no prompt_basis
+    current = _report(attribution=53, prompt_basis={"selected_set_id": "sel_new"})
+
+    delta = build_reaudit_delta(
+        current_report=current,
+        prior_report=prior,
+        prior_row={"run_id": "prior"},
+        days_since=14,
+    )
+
+    assert delta["measurement_basis"]["same"] is None
+    assert _movement(delta, "attribution")["is_material"] is False
 
 
 def test_controller_archetype_flip_is_neutral_material_change():
