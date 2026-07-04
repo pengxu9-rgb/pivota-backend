@@ -6444,6 +6444,14 @@ async def build_per_sku_report(
         # never renders the raw enum (e.g. "band: agent_ready").
         "band_display": _band_display(sku_band),
         "primary_gaps": primary_gaps,
+        # W2 pinned measurement basis: the LLM-generated prompt lists this SKU
+        # was measured against, with a stable prompt_set_id. The NEXT run's
+        # resolve_prompt_basis reloads this (same questions → comparable
+        # scores); the re-audit delta asserts basis identity from it.
+        "prompt_basis": (
+            sku_ctx.get("_prompt_basis_meta")
+            if isinstance(sku_ctx.get("_prompt_basis_meta"), dict) else None
+        ),
         "verbatim_grounding_evidence": _grounding_evidence(probe_runs),
         "axis_coverage": _axis_coverage(probe_runs),
         "query_class_coverage": _query_class_coverage(probe_runs),
@@ -10731,17 +10739,24 @@ async def run_per_sku_audit_probe_fanout(
         # Value-prop discovery prompts: extract from the product's content so the
         # audit probes winnable SPECIFIC demand, not just generic category heads.
         # Best-effort + opt-in (URL audits); stashed for the sync spec builder.
+        #
+        # W2 PINNED MEASUREMENT BASIS: the LLM-generated lists (winnable + P4a
+        # scenario) are the stochastic part of the probe set — regenerating them
+        # per run made the same SKU's scores non-comparable run-to-run. The
+        # resolver reuses the basis a prior completed run stamped on its report
+        # (same questions → comparable scores → honest re-audit delta, and zero
+        # extra LLM spend); only a first audit — or an explicit refresh /
+        # PROMPT_BASIS_VERSION bump — generates. Scenario elicitation still runs
+        # AFTER the Tier-1 retailer-evidence stash so category resolution
+        # benefits from retailer excerpts.
         if winnable_prompts and isinstance(sku_ctx, dict):
-            try:
-                sku_ctx["_winnable_prompts"] = await extract_winnable_prompts(sku_ctx)
-            except Exception:  # noqa: BLE001 - never block probing on the LLM step
-                logger.warning("winnable-prompt extraction skipped", exc_info=True)
-            # P4a scenario-demand mining: category-level scenario probes
-            # (exploratory; the demand loop validates before any lane is
-            # surfaced). Runs AFTER the Tier-1 retailer-evidence stash so
-            # category resolution benefits from retailer excerpts.
-            try:
-                _product_map = _get_product(sku_ctx)
+            from services.prompt_basis import resolve_prompt_basis
+
+            async def _generate_winnable(_ctx: Dict[str, Any] = sku_ctx) -> List[str]:
+                return await extract_winnable_prompts(_ctx)
+
+            async def _generate_scenario(_ctx: Dict[str, Any] = sku_ctx) -> List[str]:
+                _product_map = _get_product(_ctx)
                 from services.sku_sidewalk import build_sku_attribute_graph
 
                 _graph = build_sku_attribute_graph(_product_map or {})
@@ -10750,12 +10765,26 @@ async def run_per_sku_audit_probe_fanout(
                     str((_product_map or {}).get("product_type") or ""),
                     _graph,
                 )
-                if _elicit_category:
-                    sku_ctx["_scenario_elicited"] = await elicit_scenario_prompts(
-                        sku_ctx, category=_elicit_category,
-                    )
+                if not _elicit_category:
+                    return []
+                return await elicit_scenario_prompts(
+                    _ctx, category=_elicit_category,
+                )
+
+            try:
+                _basis = await resolve_prompt_basis(
+                    merchant_id=str(merchant_id),
+                    sku_key=str(sku_key),
+                    generate_winnable=_generate_winnable,
+                    generate_scenario=_generate_scenario,
+                )
+                sku_ctx["_winnable_prompts"] = _basis["winnable"]
+                sku_ctx["_scenario_elicited"] = _basis["scenario"]
+                # Stamped on the per-SKU report (build_per_sku_report) so the
+                # NEXT run can reload it and the delta can assert basis identity.
+                sku_ctx["_prompt_basis_meta"] = _basis["meta"]
             except Exception:  # noqa: BLE001 - never block probing on the LLM step
-                logger.warning("scenario elicitation skipped", exc_info=True)
+                logger.warning("prompt-basis resolution skipped", exc_info=True)
         out[sku_key] = await _probe_per_sku_ctx(
             sku_ctx=sku_ctx,
             merchant_id=str(merchant_id),

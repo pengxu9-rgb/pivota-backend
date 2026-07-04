@@ -1,0 +1,297 @@
+"""W2 — pinned measurement basis: the LLM-generated prompt lists become an
+asset of the SKU, reused on re-runs so scores are comparable by construction.
+
+The core contract under test:
+  - a prior completed run's stamped basis is RELOADED (no LLM calls);
+  - only a first audit / explicit refresh / PROMPT_BASIS_VERSION bump generates;
+  - an empty prior basis (e.g. an LLM-outage run) is never pinned;
+  - the re-audit delta states basis identity honestly (same / changed / unknown).
+"""
+from __future__ import annotations
+
+from typing import Any, Dict, List
+
+import pytest
+
+from services.prompt_basis import (
+    PROMPT_BASIS_VERSION,
+    build_prompt_set_id,
+    harvest_prompt_basis,
+    resolve_prompt_basis,
+)
+
+
+def _report_with_basis(sku_key: str, basis: Dict[str, Any]) -> Dict[str, Any]:
+    return {
+        "brand_report": {
+            "per_sku_reports": [
+                {"sku_key": "other-sku", "prompt_basis": {"basis_version": 99}},
+                {"sku_key": sku_key, "prompt_basis": basis},
+            ],
+        },
+    }
+
+
+_GOOD_BASIS = {
+    "prompt_set_id": "ps_abc123",
+    "basis_version": PROMPT_BASIS_VERSION,
+    "source": "fresh",
+    "winnable": ["vegan shampoo", "shampoo with japanese shiso for healthy scalp"],
+    "scenario": ["best shampoo for postpartum hair loss"],
+    "created_at": "2026-07-03T12:00:00+00:00",
+}
+
+
+# ---- identity ----------------------------------------------------------------
+
+def test_prompt_set_id_is_stable_and_content_sensitive():
+    a = build_prompt_set_id(["p1", "p2"], ["s1"])
+    assert a == build_prompt_set_id(["p1", "p2"], ["s1"])
+    assert a != build_prompt_set_id(["p1"], ["s1"])
+    assert a != build_prompt_set_id(["p1", "p2"], [])
+    assert a.startswith("ps_")
+
+
+# ---- harvest -----------------------------------------------------------------
+
+def test_harvest_finds_the_right_sku_basis():
+    basis = harvest_prompt_basis(
+        _report_with_basis("sku-1", _GOOD_BASIS), sku_key="sku-1",
+    )
+    assert basis is not None
+    assert basis["winnable"] == _GOOD_BASIS["winnable"]
+    assert basis["scenario"] == _GOOD_BASIS["scenario"]
+    assert basis["prompt_set_id"] == "ps_abc123"
+    assert basis["created_at"] == "2026-07-03T12:00:00+00:00"
+
+
+def test_harvest_rejects_version_mismatch():
+    stale = dict(_GOOD_BASIS, basis_version=PROMPT_BASIS_VERSION + 1)
+    assert harvest_prompt_basis(
+        _report_with_basis("sku-1", stale), sku_key="sku-1",
+    ) is None
+
+
+def test_harvest_rejects_empty_basis():
+    empty = dict(_GOOD_BASIS, winnable=[], scenario=[])
+    assert harvest_prompt_basis(
+        _report_with_basis("sku-1", empty), sku_key="sku-1",
+    ) is None
+
+
+def test_harvest_absent_sku_or_malformed_returns_none():
+    assert harvest_prompt_basis(
+        _report_with_basis("sku-1", _GOOD_BASIS), sku_key="missing",
+    ) is None
+    assert harvest_prompt_basis({}, sku_key="sku-1") is None
+    assert harvest_prompt_basis(
+        {"brand_report": {"per_sku_reports": "not-a-list"}}, sku_key="sku-1",
+    ) is None
+
+
+# ---- resolve: pinned vs fresh --------------------------------------------------
+
+class _Generators:
+    """Counting fakes — the pinned path must make ZERO generator calls."""
+
+    def __init__(self, winnable: List[str], scenario: List[str]):
+        self.calls = 0
+        self._w, self._s = winnable, scenario
+
+    async def winnable(self) -> List[str]:
+        self.calls += 1
+        return self._w
+
+    async def scenario(self) -> List[str]:
+        self.calls += 1
+        return self._s
+
+
+@pytest.mark.asyncio
+async def test_resolve_pins_prior_basis_without_llm_calls(monkeypatch):
+    import services.prompt_basis as pb
+
+    async def fake_load(**kwargs):
+        return {
+            "winnable": ["pinned w1"], "scenario": ["pinned s1"],
+            "prompt_set_id": "ps_prior", "created_at": "2026-07-01T00:00:00+00:00",
+            "pinned_from_run_id": "run-prior",
+        }
+
+    monkeypatch.setattr(pb, "load_prior_prompt_basis", fake_load)
+    gen = _Generators(["fresh w"], ["fresh s"])
+
+    out = await resolve_prompt_basis(
+        merchant_id="m1", sku_key="sku-1",
+        generate_winnable=gen.winnable, generate_scenario=gen.scenario,
+    )
+    assert gen.calls == 0, "pinned path must not call the LLM generators"
+    assert out["winnable"] == ["pinned w1"]
+    assert out["scenario"] == ["pinned s1"]
+    meta = out["meta"]
+    assert meta["source"] == "pinned"
+    assert meta["prompt_set_id"] == "ps_prior"
+    assert meta["pinned_from_run_id"] == "run-prior"
+    # basis birthdate carries through the chain
+    assert meta["created_at"] == "2026-07-01T00:00:00+00:00"
+
+
+@pytest.mark.asyncio
+async def test_resolve_generates_fresh_when_no_prior(monkeypatch):
+    import services.prompt_basis as pb
+
+    async def fake_load(**kwargs):
+        return None
+
+    monkeypatch.setattr(pb, "load_prior_prompt_basis", fake_load)
+    gen = _Generators(["fresh w1", "fresh w1", " fresh w2 "], ["fresh s1"])
+
+    out = await resolve_prompt_basis(
+        merchant_id="m1", sku_key="sku-1",
+        generate_winnable=gen.winnable, generate_scenario=gen.scenario,
+    )
+    assert gen.calls == 2
+    # cleaned: deduped + stripped
+    assert out["winnable"] == ["fresh w1", "fresh w2"]
+    meta = out["meta"]
+    assert meta["source"] == "fresh"
+    assert meta["basis_version"] == PROMPT_BASIS_VERSION
+    assert meta["prompt_set_id"] == build_prompt_set_id(
+        ["fresh w1", "fresh w2"], ["fresh s1"],
+    )
+    assert meta["created_at"]  # stamped now
+
+
+@pytest.mark.asyncio
+async def test_resolve_refresh_skips_prior_and_marks_source(monkeypatch):
+    import services.prompt_basis as pb
+
+    load_calls = []
+
+    async def fake_load(**kwargs):
+        load_calls.append(1)
+        return {"winnable": ["old"], "scenario": [], "prompt_set_id": "ps_old"}
+
+    monkeypatch.setattr(pb, "load_prior_prompt_basis", fake_load)
+    gen = _Generators(["new w"], ["new s"])
+
+    out = await resolve_prompt_basis(
+        merchant_id="m1", sku_key="sku-1",
+        generate_winnable=gen.winnable, generate_scenario=gen.scenario,
+        refresh=True,
+    )
+    assert load_calls == [], "refresh=True must not even consult the prior basis"
+    assert gen.calls == 2
+    assert out["meta"]["source"] == "refreshed"
+
+
+@pytest.mark.asyncio
+async def test_resolve_generator_failure_yields_empty_never_raises(monkeypatch):
+    import services.prompt_basis as pb
+
+    async def fake_load(**kwargs):
+        return None
+
+    async def exploding() -> List[str]:
+        raise RuntimeError("LLM down")
+
+    async def working() -> List[str]:
+        return ["s1"]
+
+    monkeypatch.setattr(pb, "load_prior_prompt_basis", fake_load)
+    out = await resolve_prompt_basis(
+        merchant_id="m1", sku_key="sku-1",
+        generate_winnable=exploding, generate_scenario=working,
+    )
+    assert out["winnable"] == []
+    assert out["scenario"] == ["s1"]
+    assert out["meta"]["source"] == "fresh"
+
+
+# ---- round trip: this run's stamp is the next run's pin -----------------------
+
+@pytest.mark.asyncio
+async def test_stamped_meta_round_trips_through_harvest(monkeypatch):
+    import services.prompt_basis as pb
+
+    async def fake_load(**kwargs):
+        return None
+
+    monkeypatch.setattr(pb, "load_prior_prompt_basis", fake_load)
+    gen = _Generators(["w1"], ["s1"])
+    first = await resolve_prompt_basis(
+        merchant_id="m1", sku_key="sku-1",
+        generate_winnable=gen.winnable, generate_scenario=gen.scenario,
+    )
+    # The meta is stamped verbatim as per-SKU report `prompt_basis`…
+    prior_report = _report_with_basis("sku-1", first["meta"])
+    # …and the next run harvests exactly the same basis + identity.
+    harvested = harvest_prompt_basis(prior_report, sku_key="sku-1")
+    assert harvested is not None
+    assert harvested["winnable"] == first["winnable"]
+    assert harvested["scenario"] == first["scenario"]
+    assert harvested["prompt_set_id"] == first["meta"]["prompt_set_id"]
+
+
+# ---- delta basis identity -----------------------------------------------------
+
+def _delta_report(prompt_set_id):
+    return {
+        "per_product": [{
+            "prompt_basis": {"prompt_set_id": prompt_set_id},
+            "merchant_view": {"headline": {"scores": {
+                "visibility": 50, "attribution": 40, "category_visibility": 30,
+            }}},
+        }],
+    }
+
+
+def test_delta_states_same_basis():
+    from services.audit_delta import build_reaudit_delta
+
+    delta = build_reaudit_delta(
+        current_report=_delta_report("ps_x"),
+        prior_report=_delta_report("ps_x"),
+        prior_row={}, days_since=7,
+    )
+    basis = delta["measurement_basis"]
+    assert basis["same"] is True
+    assert basis["prompt_set_id"] == "ps_x"
+    assert "same prompt set" in basis["note"]
+
+
+def test_delta_states_changed_basis():
+    from services.audit_delta import build_reaudit_delta
+
+    delta = build_reaudit_delta(
+        current_report=_delta_report("ps_new"),
+        prior_report=_delta_report("ps_old"),
+        prior_row={}, days_since=7,
+    )
+    assert delta["measurement_basis"]["same"] is False
+    assert "changed" in delta["measurement_basis"]["note"]
+
+
+def test_delta_honest_when_prior_predates_pinning():
+    from services.audit_delta import build_reaudit_delta
+
+    prior = _delta_report(None)
+    prior["per_product"][0].pop("prompt_basis")
+    delta = build_reaudit_delta(
+        current_report=_delta_report("ps_x"),
+        prior_report=prior,
+        prior_row={}, days_since=7,
+    )
+    assert delta["measurement_basis"]["same"] is None
+
+
+def test_delta_first_audit_declares_baseline_basis():
+    from services.audit_delta import build_reaudit_delta
+
+    delta = build_reaudit_delta(
+        current_report=_delta_report("ps_x"),
+        prior_report=None, prior_row=None, days_since=None,
+    )
+    assert delta["is_first_audit"] is True
+    assert delta["measurement_basis"]["same"] is None
+    assert delta["measurement_basis"]["prompt_set_id"] == "ps_x"

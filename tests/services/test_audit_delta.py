@@ -170,6 +170,13 @@ def test_first_audit_establishes_baseline():
         "days_since_last": None,
         "headline": "Baseline established — re-audit in ~30 days to see movement.",
         "movements": [],
+        # W2 pinned basis: a first audit declares itself the measurement
+        # baseline (no prompt_basis in the legacy _report() fixture → id None).
+        "measurement_basis": {
+            "same": None,
+            "prompt_set_id": None,
+            "note": "This run establishes the measurement basis for future comparisons.",
+        },
         "tracked_metric_results": [
             {
                 "metric": "First-party citation rate on the same failed buyer questions.",

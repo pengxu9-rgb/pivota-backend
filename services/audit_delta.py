@@ -48,6 +48,9 @@ def build_reaudit_delta(
             "days_since_last": None,
             "headline": "Baseline established — re-audit in ~30 days to see movement.",
             "movements": [],
+            "measurement_basis": _measurement_basis(
+                current_report, prior_report, current, {},
+            ),
             "tracked_metric_results": [
                 _not_measurable(
                     metric,
@@ -85,9 +88,77 @@ def build_reaudit_delta(
         "days_since_last": days_since,
         "headline": _headline(movements, days_since),
         "movements": movements,
+        # W2 pinned basis: is this delta measured against the SAME prompt set
+        # as the prior run? same=True licenses "you moved X→Y" as a real
+        # comparison; same=False means the basis changed (explicit refresh /
+        # generator version bump) and score movement partly reflects the new
+        # questions; same=None means one side predates basis stamping.
+        "measurement_basis": _measurement_basis(
+            current_report, prior_report, current, prior,
+        ),
         "tracked_metric_results": [
             _tracked_metric_result(metric, movements) for metric in metrics
         ],
+    }
+
+
+def _prompt_set_id(
+    full_report: Optional[Mapping[str, Any]],
+    primary: Mapping[str, Any],
+) -> Optional[str]:
+    """The pinned prompt_set_id for a report, tolerant of both shapes: the
+    per-product/primary report carrying `prompt_basis` directly, or the full
+    payload carrying it under brand_report.per_sku_reports[0]."""
+    basis = primary.get("prompt_basis")
+    if isinstance(basis, Mapping) and basis.get("prompt_set_id"):
+        return str(basis["prompt_set_id"])
+    report = full_report if isinstance(full_report, Mapping) else {}
+    brand = report.get("brand_report")
+    if isinstance(brand, Mapping):
+        report = brand
+    for sku_report in report.get("per_sku_reports") or []:
+        if not isinstance(sku_report, Mapping):
+            continue
+        basis = sku_report.get("prompt_basis")
+        if isinstance(basis, Mapping) and basis.get("prompt_set_id"):
+            return str(basis["prompt_set_id"])
+    return None
+
+
+def _measurement_basis(
+    current_full: Optional[Mapping[str, Any]],
+    prior_full: Optional[Mapping[str, Any]],
+    current_primary: Mapping[str, Any],
+    prior_primary: Mapping[str, Any],
+) -> Dict[str, Any]:
+    current_id = _prompt_set_id(current_full, current_primary)
+    prior_id = _prompt_set_id(prior_full, prior_primary or {})
+    if not prior_primary:
+        return {
+            "same": None,
+            "prompt_set_id": current_id,
+            "note": "This run establishes the measurement basis for future comparisons.",
+        }
+    if not current_id or not prior_id:
+        return {
+            "same": None,
+            "prompt_set_id": current_id,
+            "note": (
+                "One of the compared runs predates prompt-basis pinning, so "
+                "basis identity can't be asserted for this delta."
+            ),
+        }
+    same = current_id == prior_id
+    return {
+        "same": same,
+        "prompt_set_id": current_id,
+        "note": (
+            "Measured on the same prompt set as your last audit — score "
+            "movement is a real comparison."
+            if same else
+            "The prompt set changed between these runs (measurement basis "
+            "refreshed), so score movement partly reflects the new questions."
+        ),
     }
 
 
