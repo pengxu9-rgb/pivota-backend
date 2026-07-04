@@ -1830,12 +1830,12 @@ async def _run_wedge_audit_background(
     try:
         from services.audit_invariants import enforce_audit_invariants
         enforce_audit_invariants(full_payload, run_id=run_id, merchant_id=merchant_id)
-        # Layer 2 (default-off): an LLM review gate over the prose surfaces that
-        # passed Layer 1; flags-or-fails withhold the surface (the deterministic
-        # next_best_action remains). No key / flag off → no-op.
-        from services.audit_review_gate import apply_audit_review_gate
-        await apply_audit_review_gate(full_payload, run_id=run_id)
-    except Exception as exc:  # noqa: BLE001 — the gate must not crash the audit runner
+        # W4: the default-off LLM review gate (Layer 2) is removed. Prose
+        # trustworthiness is now enforced upstream at generation — the brief's
+        # closed-world entity manifest + grounding validator — and detected here
+        # by the rendered-copy invariant (W7.1), so a post-hoc LLM re-read added
+        # cost and a second failure mode without unique coverage.
+    except Exception as exc:  # noqa: BLE001 — the invariant gate must not crash the audit runner
         logger.warning("audit invariant gate skipped: %s", exc)
     await record_audit_run_completed(
         run_id=run_id, status="succeeded",
