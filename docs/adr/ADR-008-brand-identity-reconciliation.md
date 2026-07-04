@@ -173,11 +173,16 @@ brand string (casing/alias differ: "ANUKO" vs "Anuko") — reuse
 
 ## Action Items
 
-1. [x] **Audit-intake guard** — **SHIPPED (PR #1130)**, dormant behind
-       `ENABLE_AUDIT_BRAND_FRAGMENTATION_GUARD`. Before `ENABLE_AUDIT_INDEX_INTAKE`
-       mints a row, a same-brand+host canonical under another merchant routes the
-       seed to identity review and skips the orphan mint. Closes the vector that
-       created the ANUKO shampoo row.
+1. [x] **Audit-intake guard** — **SHIPPED (PR #1130)**. Before
+       `ENABLE_AUDIT_INDEX_INTAKE` mints a row, a same-brand+host canonical under
+       another merchant routes the seed to identity review and skips the orphan
+       mint. Closes the vector that created the ANUKO shampoo row. **W5 update:**
+       the guard now **follows intake** — it runs whenever audit-index intake is
+       enabled for that merchant (it's a correctness feature of the main path, not
+       a separate gate), and `ENABLE_AUDIT_BRAND_FRAGMENTATION_GUARD` was inverted
+       into an explicit opt-out `DISABLE_AUDIT_BRAND_FRAGMENTATION_GUARD` (default
+       false) kept only as a canary escape hatch. Guard logic unchanged; still
+       fail-open.
 2. [x] **Deposit-unresolved telemetry** — **SHIPPED (PR #1131)**. Implemented at
        the caller (`extract_citation_observations`) rather than the pure classifier
        `resolve_deposit_content_key` — that's where an unresolved basis actually

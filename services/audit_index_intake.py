@@ -385,12 +385,25 @@ async def apply_audit_er_gate(fields: Dict[str, Any]) -> Dict[str, Any]:
 # (that reconciliation is a separate, reviewed step — see ADR-008).
 
 
-def audit_brand_fragmentation_guard_enabled() -> bool:
-    """Flag: skip minting an audit seed that would fork a brand already canonical
-    under another merchant, routing it to review instead. Default OFF."""
-    return os.getenv("ENABLE_AUDIT_BRAND_FRAGMENTATION_GUARD", "").strip().lower() in {
+def audit_brand_fragmentation_guard_disabled() -> bool:
+    """Explicit OPT-OUT for the ADR-008 brand-fragmentation guard. Default false.
+    Set DISABLE_AUDIT_BRAND_FRAGMENTATION_GUARD=1 only to force the guard OFF for a
+    merchant that intake is otherwise enabled for — a canary escape hatch, not the
+    normal enablement lever."""
+    return os.getenv("DISABLE_AUDIT_BRAND_FRAGMENTATION_GUARD", "").strip().lower() in {
         "1", "true", "yes", "on",
     }
+
+
+def audit_brand_fragmentation_guard_enabled(merchant_id: Optional[str] = None) -> bool:
+    """The ADR-008 brand-fragmentation guard FOLLOWS intake: it runs whenever
+    audit-index intake is enabled for that merchant (per the mainline fix plan it's
+    a correctness feature of the main path, not a separate gate). The opt-out env
+    DISABLE_AUDIT_BRAND_FRAGMENTATION_GUARD (default false) can force it off as a
+    canary escape hatch."""
+    if audit_brand_fragmentation_guard_disabled():
+        return False
+    return audit_intake_enabled(merchant_id)
 
 
 async def _existing_brand_canonical_conflict(
@@ -436,7 +449,7 @@ async def apply_audit_brand_fragmentation_guard(
       - 'skip'    : a same-brand+host canonical exists under another merchant; a
                     review task was enqueued and the orphan mint is suppressed.
     """
-    if not audit_brand_fragmentation_guard_enabled():
+    if not audit_brand_fragmentation_guard_enabled(merchant_id):
         return {"action": "proceed", "reason": "disabled"}
     try:
         conflict = await _existing_brand_canonical_conflict(merchant_id, fields)
