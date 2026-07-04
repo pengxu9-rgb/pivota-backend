@@ -780,6 +780,32 @@ LEGACY_CITEDNESS_SITES: Tuple[Dict[str, Any], ...] = (
 # not an audit ledger).
 _PARITY_STATS: Dict[str, Dict[str, Any]] = {}
 
+# W7 C3: sites that have already pushed a drift alert this process lifetime. A
+# parity_check drift is a Type-A invariant violation (the numbers were supposed to
+# be EQUAL) — it must page, not sit in a warning log Railway hides. But parity_check
+# runs in hot per-prompt loops, so we alert ONCE per site per process (magnitude for
+# every drift still accumulates in _PARITY_STATS / GET /admin/runfacts-parity).
+# Resets on restart, like _PARITY_STATS.
+_ALERTED_PARITY_SITES: set = set()
+
+
+def _alert_parity_drift(site: str, legacy_value: Any, facts_value: Any) -> None:
+    """Escalate a parity_check drift to Sentry (the reliable sink — app WARNING/ERROR
+    logs are hidden on Railway). Best-effort, first-time-per-site, never raises."""
+    if site in _ALERTED_PARITY_SITES:
+        return
+    _ALERTED_PARITY_SITES.add(site)
+    try:
+        import sentry_sdk
+
+        sentry_sdk.capture_message(
+            f"RUNFACTS_PARITY_DRIFT (Type-A invariant) site={site} "
+            f"legacy={legacy_value!r} run_facts={facts_value!r}",
+            level="error",
+        )
+    except Exception:  # noqa: BLE001 — alerting must never break a report
+        pass
+
 
 def _record_parity(site: str, legacy_value: Any, facts_value: Any, equal: bool) -> None:
     try:
@@ -836,13 +862,17 @@ def parity_check(
         equal = legacy_value == facts_value
         _record_parity(site, legacy_value, facts_value, equal)
         if not equal:
-            logger.warning(
+            # ERROR, not warning: a parity_check drift is an invariant violation
+            # (these were supposed to be EQUAL) — an alarm, per this function's
+            # contract vs parity_measure. W7 C3 also pushes it to Sentry.
+            logger.error(
                 "RUNFACTS_PARITY_DRIFT site=%s legacy=%r run_facts=%r context=%s",
                 site,
                 legacy_value,
                 facts_value,
                 dict(context) if context else {},
             )
+            _alert_parity_drift(site, legacy_value, facts_value)
         return equal
     except Exception:  # noqa: BLE001 — parity logging must never break a report
         logger.warning("RUNFACTS_PARITY_CHECK_FAILED site=%s", site, exc_info=True)
