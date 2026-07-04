@@ -677,13 +677,15 @@ LEGACY_CITEDNESS_SITES: Tuple[Dict[str, Any], ...] = (
      "notes": "source-walk component (title_match) measured vs T3; word-boundary"
               " vs substring matcher gap + excerpt/url paths quantified"},
     {"id": 5, "site": "bd_report.build_channel_appearance.own_site_cited", "tier": "T1",
-     "definition": "own domain in per-prompt cited hosts", "instrumented": True,
-     "mode": "measure",
-     "notes": "reads source_summary.top_cited_hosts, which extract_cited_hosts"
-              " built as a COMPETITOR rollup — own-domain sources whose label"
-              " names the brand are routed to the merchant bucket and never"
-              " reach top_cited_hosts, so 'Your site N/M' can UNDERCOUNT T1;"
-              " the measure quantifies that undercount"},
+     "definition": "RunFacts source-walk T1 per prompt (rewired)", "instrumented": True,
+     "mode": "measure", "rewired": True,
+     "notes": "REWIRED 2026-07-04 (first phase-2 cutover, shipped early as a"
+              " defect fix — decision sheet already said 'T1, keep'): the"
+              " own-site row now reads per-prompt own_url_cited from the"
+              " RunFacts source walk. The legacy top_cited_hosts scan was a"
+              " COMPETITOR rollup that dropped own-domain sources whose label"
+              " names the brand — measured on the 2026-07-04 DamDam run as"
+              " 'Your site 0/14' displayed vs 13/14 true"},
     {"id": 6, "site": "bd_report._citation_by_intent", "tier": "T3",
      "definition": "per-prompt merchant_cited_runs > 0", "instrumented": True,
      "mode": "drift",
