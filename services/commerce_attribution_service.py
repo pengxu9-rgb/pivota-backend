@@ -426,7 +426,7 @@ SET
   latest_refund_id = :refund_id,
   refund_ids = CASE
     WHEN COALESCE(refund_ids, '[]'::jsonb) ? :refund_id THEN COALESCE(refund_ids, '[]'::jsonb)
-    ELSE COALESCE(refund_ids, '[]'::jsonb) || to_jsonb(:refund_id::text)
+    ELSE COALESCE(refund_ids, '[]'::jsonb) || to_jsonb(CAST(:refund_id AS TEXT))
   END,
   refund_count = CASE
     WHEN COALESCE(refund_ids, '[]'::jsonb) ? :refund_id THEN COALESCE(refund_count, 0)

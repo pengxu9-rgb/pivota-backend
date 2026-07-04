@@ -9421,14 +9421,24 @@ def _durable_competitor_for_brief(opportunity: Mapping[str, Any]) -> Optional[st
             competitor_values = []
         for competitor in competitor_values:
             name = str(competitor or "").strip()
-            # Only real competing brands. `repeated_owner` is intentionally NOT
-            # folded in: when a category answer has no repeated competitor it
-            # falls back to the most-cited SOURCE HOST (sku_opportunity), which
-            # put stores like Coupang/Bunjang here and made the "category
-            # winner" panel probe "what is Coupang known for" — nonsense. Channel
-            # control is surfaced elsewhere (store_as_destination / who-cites).
+            # Only real competing brands.
             if name and _competitor_is_brandlike(name):
                 counts[name] += 1
+        # `repeated_owner` (the AI's most-repeated owner in this category answer)
+        # is a real winner signal — but sku_opportunity falls back to the
+        # most-cited SOURCE HOST when no competitor repeats, which put stores
+        # (Coupang/Bunjang) here and made the panel probe "what is Coupang known
+        # for" — nonsense (#1143). Fold it in ONLY when it's brand-like: keeps
+        # the meaningful brand signal (breaks a competitor-count tie toward the
+        # repeated owner) while never letting a retailer win.
+        density = row.get("density")
+        features = density.get("features") if isinstance(density, Mapping) else None
+        owner = (
+            str(features.get("repeated_owner") or "").strip()
+            if isinstance(features, Mapping) else ""
+        )
+        if owner and _competitor_is_brandlike(owner):
+            counts[owner] += 1
     if not counts:
         return None
     from services.sku_opportunity import _durable_competitor

@@ -78,6 +78,9 @@ async def test_synthesize_builds_deepseek_request(monkeypatch):
     assert result == {
         "text": '{"ok": true}',
         "usage": {"input_tokens": 11, "output_tokens": 7},
+        # openai-compatible responses carry finish_reason (None when the mock
+        # choice omits it) — part of the return since the field was added.
+        "finish_reason": None,
         "provider": "deepseek",
         "model": "deepseek-chat",
     }

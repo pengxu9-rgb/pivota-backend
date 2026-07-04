@@ -1008,6 +1008,19 @@ def fake_db_full(monkeypatch: pytest.MonkeyPatch) -> _FakeFullDatabase:
     monkeypatch.setenv("RAILWAY_ENVIRONMENT", "production")
     monkeypatch.delenv("SETTLEMENT_TRANSFER_ALLOWED_ON_STAGING", raising=False)
     partner_settlement_service._TABLE_COLUMN_CACHE.clear()
+
+    # Stripe-customer resolution (resolve_merchant_stripe_customer_id) does a
+    # schema-adaptive `merchants` lookup (PRAGMA table_info on SQLite) that this
+    # hand-rolled fake DB doesn't emulate — and it's out of scope for the
+    # overage-invoice round trip this suite asserts (that resolver is covered by
+    # the billing_routes tests). Mock it to a fixed customer id.
+    async def _fake_stripe_customer(_merchant_id: str) -> str:
+        return "cus_test_overage"
+
+    monkeypatch.setattr(
+        credit_overage_billing, "_stripe_customer_id_for_merchant",
+        _fake_stripe_customer,
+    )
     return db
 
 

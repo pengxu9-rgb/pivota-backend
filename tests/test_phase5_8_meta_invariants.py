@@ -473,6 +473,18 @@ def test_jsonb_writes_in_db_modules_route_through_json_safe():
         ":patch::jsonb",                    # legacy SQL — already
                                             # caught by meta-test #8
         "CAST(:patch AS JSONB)",            # post-fix SQL
+        # A SQL-text write binds a param whose value is coerced in the
+        # execute() params dict (e.g. json.dumps(_json_safe(...)) /
+        # _dumps(..., default=str)), which the line-grep can't see. Every
+        # `..._jsonb = CAST(:x AS JSONB)` is this class: persist_report_jsonb
+        # + catalog_onboard.mark_done.
+        "CAST(:",
+        # kwarg PASSTHROUGH to a callee that coerces (record_audit_run_started
+        # → enqueue_audit_run_with_replay, which coerces request_options_jsonb).
+        "request_options_jsonb=request_options_jsonb",
+        # already-coerced local var flowing into .insert().values() — the
+        # coercion happened at the assignment (single line, _json_safe visible).
+        "partial_result_jsonb=partial_result_jsonb",
         # Migration DDL.
         "ADD COLUMN",
         "ALTER COLUMN",
