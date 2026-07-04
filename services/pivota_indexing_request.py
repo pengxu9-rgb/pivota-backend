@@ -28,14 +28,23 @@ _INFLIGHT_STATUSES = frozenset({"submitted", "pending", "indexed"})
 
 
 async def resolve_canonical_pdp_url(
-    sku_key: str, merchant_id: str,
+    target_key: str, merchant_id: str,
 ) -> Optional[str]:
-    """`sku_key` + `merchant_id` -> the SKU's canonical
-    agent.pivota.cc/products/<sig> URL, or None when the SKU has no minted
-    Pivota signature yet (in which case there is nothing for Pivota to submit —
-    the merchant's own page must become crawlable first). Best-effort: returns
-    None on any DB error rather than raising into the request path."""
-    if not sku_key or not merchant_id:
+    """`target_key` (a catalog_skus.sku_key OR a catalog_products.product_key) +
+    `merchant_id` -> the product's canonical agent.pivota.cc/products/<sig> URL,
+    or None when it has no minted Pivota signature yet (in which case there is
+    nothing for Pivota to submit — the merchant's own page must become crawlable
+    first). Best-effort: returns None on any DB error rather than raising.
+
+    ONE uniform resolution keyed on catalog_products.product_key — the identity
+    EVERY product carries. The target is first resolved to a product_key: if it
+    names a catalog_skus row (connected-store variant SKUs) we take that row's
+    product_key; otherwise the target already IS a product_key (URL-tier url_audit
+    seeds have no variant SKU, so their report CTA stamps the seed's catalog
+    product_key directly). Both cases then load the SAME catalog_products row via
+    the SAME query — url_audit is not a special case, just a target that resolves
+    to a product_key without the sku indirection."""
+    if not target_key or not merchant_id:
         return None
     from db.database import database
 
@@ -46,10 +55,13 @@ async def resolve_canonical_pdp_url(
              WHERE sku_key = :sku_key AND merchant_id = :merchant_id
              LIMIT 1
             """,
-            {"sku_key": sku_key, "merchant_id": merchant_id},
+            {"sku_key": target_key, "merchant_id": merchant_id},
         )
-        if not sku:
-            return None
+        # A sku_key resolves to its product_key; a product_key target IS the
+        # product_key. Namespaces don't collide (`sku::`/`::v::`/`::canonical`
+        # sku_keys vs `prod::` product_keys), so treating an unmatched target as a
+        # product_key can only hit its own row or nothing.
+        product_key = sku["product_key"] if sku else target_key
         product = await database.fetch_one(
             """
             SELECT pivota_canonical_url, pivota_signature_id, content_key
@@ -57,7 +69,7 @@ async def resolve_canonical_pdp_url(
              WHERE product_key = :product_key AND merchant_id = :merchant_id
              LIMIT 1
             """,
-            {"product_key": sku["product_key"], "merchant_id": merchant_id},
+            {"product_key": product_key, "merchant_id": merchant_id},
         )
         # Prefer the already-stored canonical URL — it's the merchant's own
         # minted URL and stays consistent with the environment's base host.
@@ -82,8 +94,8 @@ async def resolve_canonical_pdp_url(
             sig = ips["pivota_signature_id"] if ips else None
     except Exception as exc:  # noqa: BLE001
         logger.warning(
-            "resolve_canonical_pdp_url failed sku=%s merchant=%s: %s",
-            sku_key, merchant_id, exc,
+            "resolve_canonical_pdp_url failed target=%s merchant=%s: %s",
+            target_key, merchant_id, exc,
         )
         return None
 

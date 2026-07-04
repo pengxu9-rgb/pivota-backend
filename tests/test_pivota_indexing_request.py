@@ -87,6 +87,56 @@ async def test_resolve_returns_none_when_no_sku():
         assert await mod.resolve_canonical_pdp_url("sku_x", "m1") is None
 
 
+# ---- URL-tier (url_audit) resolves through the SAME uniform path ----------
+
+@pytest.mark.asyncio
+async def test_resolve_url_audit_product_key_uniform_path():
+    """A URL-tier seed carries no variant sku_key, so its CTA stamps the seed's
+    catalog product_key directly. The resolver treats a target with no
+    catalog_skus row AS a product_key and loads catalog_products via the SAME
+    query a connected-store SKU uses — no url_audit branch."""
+    product_key = "prod::m1::url_audit::host~abc123"
+    rows = [
+        None,                                                        # catalog_skus miss
+        {"pivota_canonical_url": "https://agent.pivota.cc/products/sig_seed",
+         "pivota_signature_id": "sig_seed", "content_key": "ck_seed"},  # catalog_products
+    ]
+    calls = []
+
+    async def _fetch_one(query, params):
+        calls.append((query, params))
+        return rows.pop(0)
+
+    with patch("db.database.database.fetch_one", AsyncMock(side_effect=_fetch_one)):
+        url = await mod.resolve_canonical_pdp_url(product_key, "m1")
+
+    assert url == "https://agent.pivota.cc/products/sig_seed"
+    # The catalog_products lookup used the target AS the product_key (no sku
+    # indirection), merchant-scoped on the caller's merchant_id.
+    _, product_params = calls[1]
+    assert product_params["product_key"] == product_key
+    assert product_params["merchant_id"] == "m1"
+
+
+@pytest.mark.asyncio
+async def test_resolve_url_audit_no_seed_returns_none():
+    """No seed row (intake off / guard-skipped) -> honest no canonical URL."""
+    rows = [None, None]  # catalog_skus miss, then catalog_products miss
+
+    async def _fetch_one(query, params):
+        return rows.pop(0)
+
+    with patch("db.database.database.fetch_one", AsyncMock(side_effect=_fetch_one)):
+        url = await mod.resolve_canonical_pdp_url(
+            "prod::m1::url_audit::host~abc123", "m1"
+        )
+    assert url is None
+    # request_sku_indexing preserves the honest status on top of it.
+    with patch.object(mod, "resolve_canonical_pdp_url", AsyncMock(return_value=None)):
+        res = await mod.request_sku_indexing("prod::m1::url_audit::host~abc123", "m1")
+    assert res["status"] == "no_canonical_url"
+
+
 @pytest.mark.asyncio
 async def test_resolve_returns_none_on_empty_inputs():
     assert await mod.resolve_canonical_pdp_url("", "m1") is None
