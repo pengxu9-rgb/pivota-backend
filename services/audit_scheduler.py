@@ -191,6 +191,22 @@ async def start_scheduler() -> None:
             coalesce=True,
         )
 
+        # W7 stability canary: assert same-basis re-runs of the house-account hero
+        # SKUs land within tolerance (validates W2). No-op until
+        # AUDIT_STABILITY_CANARY_MERCHANTS is set. Twice-weekly (Mon/Thu 06:00 UTC).
+        from services.audit_stability_canary import run_stability_canary
+        _add_job(
+            run_stability_canary,
+            "cron",
+            day_of_week="mon,thu",
+            hour=6,
+            minute=0,
+            id="audit_stability_canary",
+            replace_existing=True,
+            misfire_grace_time=3600,
+            coalesce=True,
+        )
+
         # Catalog-coverage unattended growth: drain the catalog-onboard queue
         # (curated brands + audit-discovered competitors → commerce-index anchors).
         # OFF BY DEFAULT — run_catalog_onboard_queue no-ops unless

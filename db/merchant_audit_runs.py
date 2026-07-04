@@ -509,6 +509,36 @@ async def recent_completed_reports(*, limit: int = 100) -> List[Dict[str, Any]]:
     return out
 
 
+async def recent_completed_reports_for_merchant(
+    *, merchant_id: str, limit: int = 2
+) -> List[Dict[str, Any]]:
+    """The most recent COMPLETED runs' full reports for ONE merchant, newest first
+    — for the W7 stability canary (compare the last two same-basis runs). Bounded +
+    best-effort; [] on DB error."""
+    await ensure_merchant_audit_runs_table()
+    try:
+        rows = await database.fetch_all(
+            "SELECT run_id, report_jsonb FROM merchant_audit_runs "
+            "WHERE merchant_id = :mid AND status = 'completed' AND report_jsonb IS NOT NULL "
+            "ORDER BY requested_at DESC LIMIT :lim",
+            {"mid": merchant_id, "lim": int(limit)},
+        )
+    except Exception as exc:
+        logger.warning(
+            "recent_completed_reports_for_merchant failed for %s: %s",
+            merchant_id, str(exc)[:200],
+        )
+        return []
+    out: List[Dict[str, Any]] = []
+    for r in rows or []:
+        d = dict(r)
+        out.append({
+            "run_id": str(d.get("run_id")) if d.get("run_id") else None,
+            "report_jsonb": _decode_jsonb_field(d.get("report_jsonb")),
+        })
+    return out
+
+
 async def count_runs_for_merchant_by_subject(
     *,
     merchant_id: str,
