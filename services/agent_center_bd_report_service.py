@@ -15467,6 +15467,16 @@ def build_structured_report(
         run_facts.runs_with_citations,
         context={"merchant": merchant_name, "product": product_title},
     )
+    # W1 CUTOVER (verdict surface): the verdict + every downstream consumer now
+    # reads the citedness counts from the single RunFacts fold — parity-proven ==
+    # the legacy extract_cited_hosts values just checked (the parity_check calls
+    # above stay as runtime tripwires; test_audit_facts.test_parity_with_legacy_
+    # implementations is the hard net). This closes the contradiction class for
+    # the verdict: it now shares ONE fact with build_channel_appearance (rewired
+    # #1151), so "cite your URL N/M" can't disagree with "own site X/M".
+    # extract_cited_hosts still supplies `competitors`.
+    merchant_cited_runs = run_facts.brand_mentioned_runs
+    runs_with_any_citation = run_facts.runs_with_citations
 
     # Re-score category from raw_runs so brand text-matches in
     # evidence excerpts and grounding source titles count as positive
@@ -15548,15 +15558,9 @@ def build_structured_report(
     # distinct from merchant_cited_runs (brand-mention OR listing). Gates the
     # STRONG "cite your URL / goal state" copy so it can't fire on mentions
     # alone — see _explain_verdict.
-    own_url_cited = _own_url_cited_runs(
-        attribution_runs, merchant_host=merchant_host
-    )
-    parity_check(
-        "bd_report._own_url_cited_runs",
-        own_url_cited,
-        run_facts.own_url_cited_runs,
-        context={"merchant": merchant_name, "product": product_title},
-    )
+    # W1 CUTOVER: own-page citation count from the RunFacts fold (parity-proven
+    # == legacy _own_url_cited_runs; the equivalence test is the net). One source.
+    own_url_cited = run_facts.own_url_cited_runs
     verdict_evidence: Dict[str, Any] = {
         "attribution_runs_total": len(attribution_runs),
         "merchant_cited_runs": merchant_cited_runs,
