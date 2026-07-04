@@ -1,9 +1,12 @@
-"""W5 — URL-audit runs deliver the report-only executors.
+"""W5.4 — URL-audit runs deliver the full URL-tier executor set.
 
 The worker's materializing stage used to skip executor dispatch entirely for
-synthetic (URL-audit) runs (url_audit_no_executors). Now it dispatches ONLY the
-report-only agents (content_brief + competitor_insights) via dispatch_only, so
-a pasted-URL merchant gets real executor work without touching their catalog.
+synthetic (URL-audit) runs (url_audit_no_executors). Now it dispatches the
+URL-tier set (content_brief + competitor_insights + canonical_pdp_enrichment +
+gsc_url_submission_loop) via dispatch_only, so a pasted-URL merchant gets real
+executor work — including seed-aware enrichment/indexing now that P3 mints the
+seed's Pivota canonical identity — while sitemap_freshness (connected-store-only)
+stays excluded.
 """
 from __future__ import annotations
 
@@ -43,16 +46,17 @@ async def test_dispatch_only_skips_task_materialization_and_forwards_allowlist(m
     summary = await worker._materialize_tasks_and_executors(
         merchant_id="m-1", run_id="r-1", brand_report={"k": "v"},
         integration_state=None,
-        agent_names=disp.REPORT_ONLY_EXECUTORS,
+        agent_names=disp.URL_AUDIT_EXECUTORS,
         dispatch_only=True,
     )
 
     # dispatch_only: NO task-queue materialization, NO outreach reverify
     assert tasks_called == []
     assert summary["tasks_materialized"] == 0
-    # executors DID dispatch, restricted to the report-only allowlist
+    # executors DID dispatch, restricted to the URL-tier allowlist (the fake
+    # dispatch returns a fixed count; the point here is the allowlist forwarding)
     assert summary["executors_dispatched"] == 2
-    assert dispatch_calls == [{"agent_names": disp.REPORT_ONLY_EXECUTORS}]
+    assert dispatch_calls == [{"agent_names": disp.URL_AUDIT_EXECUTORS}]
 
 
 @pytest.mark.asyncio

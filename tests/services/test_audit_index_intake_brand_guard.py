@@ -5,6 +5,8 @@ import asyncio
 import db.database
 import services.agent_pdp_view_assembler as asm
 import services.audit_index_intake as intake
+import services.catalog_sync_service as css
+import services.index_pipeline_state_service as ips
 
 
 def _audit_product():
@@ -43,10 +45,22 @@ def _wire(monkeypatch, *, fetch_one, enqueue_spy=None):
         calls["enqueued"].append(match)
         return "pdptask_x"
 
+    # W5 P3 added a best-effort catalog_merchant upsert + serving-eligibility
+    # recompute inside upsert_audited_sku_to_index. Stub both to no-ops so the
+    # guard tests isolate the single PRODUCT upsert they assert on (the merchant
+    # upsert otherwise routes through the same execute seam and inflates the count).
+    async def _fake_upsert_merchant(**kwargs):
+        return "m_row"
+
+    async def _fake_recompute(content_key, *, reason=None, **kwargs):
+        return None
+
     monkeypatch.setattr(db.database.database, "fetch_one", _fake_fetch_one)
     monkeypatch.setattr(db.database.database, "execute", _fake_execute)
     monkeypatch.setattr(asm, "refresh_agent_pdp_view_for_content_key", _fake_refresh)
     monkeypatch.setattr(intake, "enqueue_audit_identity_review", enqueue_spy or _fake_enqueue)
+    monkeypatch.setattr(css, "upsert_catalog_merchant", _fake_upsert_merchant)
+    monkeypatch.setattr(ips, "recompute_serving_eligibility", _fake_recompute)
     return calls
 
 
