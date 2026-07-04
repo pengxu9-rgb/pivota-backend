@@ -50,7 +50,9 @@ from services.audit_facts import (
     aggregate_run_facts,
     compute_run_facts,
     normalize_host,
+    own_url_cited_runs_any,
     parity_check,
+    parity_measure,
     query_class_for_axis as _query_class_for_axis,
     run_query_class as _run_query_class,
 )
@@ -3867,6 +3869,22 @@ def compute_citation_score(
             extra={"numerator": numerator, "denominator": denominator, "rate": round(rate, 4)},
         )
 
+    # W1 site 7 (measure): legacy first-party = own page cited as PRIMARY
+    # grounding + not negative-verdict; the decision-sheet target is T1 with
+    # one unified resolver. own_url_cited_runs_any over the SAME candidate
+    # hosts isolates the primary/negative-gating gap from the host-resolution
+    # gap the cutover must decide on.
+    parity_measure(
+        "bd_report.compute_citation_score.first_party_rate",
+        first_party_hits,
+        own_url_cited_runs_any(
+            runs, _first_party_url_candidates(sku_ctx, product)
+        ),
+        context={
+            "sku": str(title or "")[:80],
+            "denominator": denominator,
+        },
+    )
     _rate_bucket("first_party_rate", first_party_hits, 45)
     _rate_bucket("sku_mention_rate", sku_mentions, 25)
     _rate_bucket("authority_near_variant_rate", authority_hits, 20)
@@ -6520,6 +6538,55 @@ async def build_per_sku_report(
     }
     if checkout_handoff:
         report["checkout_handoff"] = checkout_handoff
+    # W1 sites 5 + 6 — phase-1 parity over the assembled per-SKU report.
+    try:
+        # Site 5 (measure): channel_appearance's own-site count reads
+        # source_summary.top_cited_hosts — a COMPETITOR rollup that drops
+        # own-domain sources whose label names the brand — so "Your site N/M"
+        # can undercount T1. Recompute T1 with the SAME host identity
+        # channel_appearance used (host only, no brand: isolates the own-URL
+        # dimension) to quantify that undercount.
+        _ca = report.get("channel_appearance") or {}
+        if _ca.get("own_site_host"):
+            _ca_facts = compute_run_facts(
+                _flatten_probe_runs(probe_runs),
+                merchant_host=_ca.get("own_site_host"),
+            )
+            parity_measure(
+                "bd_report.build_channel_appearance.own_site_cited",
+                _ca.get("own_site_cited_count"),
+                sum(1 for p in _ca_facts.prompts if p.own_url_cited),
+                context={
+                    "sku_key": sku_key,
+                    "total_queries": _ca.get("total_queries"),
+                    "prompt_count": len(_ca_facts.prompts),
+                },
+            )
+        # Site 6 (drift): citation_by_intent is a pure view over the per-prompt
+        # source_summary — its cited total must equal the rows it viewed.
+        _per_prompt_rows = [
+            r
+            for r in ((report.get("opportunity") or {}).get("per_prompt") or [])
+            if isinstance(r, dict)
+        ]
+        parity_check(
+            "bd_report._citation_by_intent.cited_total",
+            sum(
+                int((b or {}).get("cited") or 0)
+                for b in (report.get("citation_by_intent") or {}).values()
+            ),
+            sum(
+                1
+                for r in _per_prompt_rows
+                if int(
+                    ((r.get("source_summary") or {}).get("merchant_cited_runs")) or 0
+                )
+                > 0
+            ),
+            context={"sku_key": sku_key},
+        )
+    except Exception:  # noqa: BLE001 — parity must never sink the report
+        logger.warning("run_facts parity (sites 5/6) failed", exc_info=True)
     return report
 
 
@@ -11385,6 +11452,33 @@ async def run_brand_report(
                 list(_facts_by_sku.values()),
                 identity={"host": _merchant_host, "brand": merchant_name},
             )
+            # W1 site 8 (measure): the authority map's endorsement set is
+            # name-gated at SKU level (cites_exact_sku / near_variant); T2's
+            # gate is label-mentions-brand. The set comparison quantifies the
+            # gate-depth gap behind "Independently recommended N/M".
+            _legacy_endorse = sorted(
+                str(h)
+                for h in (
+                    (authority_map.get("host_attribution_summary") or {}).get(
+                        "endorsement_hosts"
+                    )
+                    or []
+                )
+                if h
+            )
+            _facts_endorse = sorted(
+                brand_rollup["run_facts"].get("endorsement_hosts") or []
+            )
+            parity_measure(
+                "bd_report._citation_signals.endorsement_hosts",
+                _legacy_endorse[:10],
+                _facts_endorse[:10],
+                context={
+                    "merchant": merchant_name,
+                    "legacy_count": len(_legacy_endorse),
+                    "run_facts_count": len(_facts_endorse),
+                },
+            )
         except Exception:  # noqa: BLE001
             logger.warning("per_sku run_facts stamp failed", exc_info=True)
         return {
@@ -15318,6 +15412,31 @@ def build_structured_report(
             merchant_host=merchant_host,
             merchant_brand=merchant_brand,
             merchant_vendors=merchant_identities,
+        )
+        # W1 site 4 (measure): the score's source-walk component (title_match)
+        # vs T3 over the same category runs + identity. Quantifies the
+        # word-boundary-vs-substring matcher gap; the in_grounding/excerpt
+        # paths are context (they have no source-walk analogue by design).
+        _cat_facts = compute_run_facts(
+            category_runs,
+            merchant_host=merchant_host,
+            merchant_brand=merchant_brand,
+            merchant_vendors=merchant_identities,
+        )
+        parity_measure(
+            "bd_report.score_category_visibility.title_match_runs",
+            sum(1 for d in category_match_details if d.get("title_match")),
+            _cat_facts.brand_mentioned_runs,
+            context={
+                "merchant": merchant_name,
+                "matched_total": sum(
+                    1 for d in category_match_details if d.get("matched")
+                ),
+                "in_grounding": sum(
+                    1 for d in category_match_details if d.get("in_grounding")
+                ),
+                "runs": len(category_runs),
+            },
         )
         category_competitor_brands, category_retailer_hosts = (
             extract_category_competitors(

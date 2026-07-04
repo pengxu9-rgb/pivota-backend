@@ -262,6 +262,31 @@ def _source_matches_merchant(
     return False
 
 
+def own_url_cited_runs_any(
+    raw_runs: Sequence[Mapping[str, Any]],
+    hosts: Sequence[Optional[str]],
+) -> Optional[int]:
+    """Multi-host T1: runs where ANY of the merchant's own hosts is the resolved
+    host of a cited grounding source. This is the unified own-domain resolver the
+    phase-2 cutover points `first_party_rate` at (a merchant legitimately owns
+    several hosts: store domain, Pivota canonical, second storefronts) — in
+    phase 1 it only feeds parity measurement. Returns None when no host
+    normalizes (mirror of `_own_url_cited_runs`'s no-false-zero contract)."""
+    own = {h for h in (normalize_host(x) for x in hosts or [] if x) if h}
+    if not own:
+        return None
+    count = 0
+    for run in raw_runs or []:
+        if not isinstance(run, Mapping):
+            continue
+        for src in _identify_run_sources(dict(run)) or []:
+            host = normalize_host((src.get("host") or "").strip())
+            if host and host in own:
+                count += 1
+                break
+    return count
+
+
 def _own_url_cited_runs(
     raw_runs: List[Dict[str, Any]],
     *,
@@ -624,33 +649,84 @@ def aggregate_run_facts(
 # The full inventory from the 2026-07-03 architecture review §1.1 (site 0,
 # PIVOTA-Agent's `url_match.in_grounding`, lives in the other repo). Each site
 # is deleted in phase 2 only after its parity window is green; flip
-# `instrumented` to True when its RUNFACTS_PARITY_DRIFT comparison lands.
-# Deliberately env-less and constant: this list IS the cutover checklist.
+# `instrumented` to True when its comparison lands. Deliberately env-less and
+# constant: this list IS the cutover checklist.
+#
+# `mode` states what the comparison MEANS:
+#   "drift"   — same definition; values must be equal. Logged as a WARNING
+#               (RUNFACTS_PARITY_DRIFT) on mismatch; a drift-free week is the
+#               cutover gate for the site.
+#   "measure" — the legacy definition intentionally differs from the decision-
+#               sheet target tier; the comparison QUANTIFIES the gap for the
+#               founder sign-off. Logged at INFO (RUNFACTS_PARITY_MEASURE) on
+#               every computation, agreement and disagreement alike — cutover
+#               here is a product decision, not a zero-drift gate.
 LEGACY_CITEDNESS_SITES: Tuple[Dict[str, Any], ...] = (
     {"id": 1, "site": "bd_report._source_matches_merchant", "tier": "T3-matcher",
-     "definition": "host OR brand-in-title OR alias", "instrumented": True},
+     "definition": "host OR brand-in-title OR alias", "instrumented": True,
+     "mode": "drift"},
     {"id": 2, "site": "bd_report.extract_cited_hosts.merchant_cited_runs", "tier": "T3",
-     "definition": ">=1 source matches merchant", "instrumented": True},
+     "definition": ">=1 source matches merchant", "instrumented": True,
+     "mode": "drift"},
     {"id": 3, "site": "bd_report._own_url_cited_runs", "tier": "T1",
-     "definition": "own domain == resolved source host", "instrumented": True},
+     "definition": "own domain == resolved source host", "instrumented": True,
+     "mode": "drift"},
     {"id": 4, "site": "bd_report.score_category_visibility", "tier": "mixed",
-     "definition": "url_match OR title OR excerpt-triple", "instrumented": False},
+     "definition": "url_match OR title OR excerpt-triple", "instrumented": True,
+     "mode": "measure",
+     "notes": "source-walk component (title_match) measured vs T3; word-boundary"
+              " vs substring matcher gap + excerpt/url paths quantified"},
     {"id": 5, "site": "bd_report.build_channel_appearance.own_site_cited", "tier": "T1",
-     "definition": "own domain in per-prompt cited hosts", "instrumented": False},
+     "definition": "own domain in per-prompt cited hosts", "instrumented": True,
+     "mode": "measure",
+     "notes": "reads source_summary.top_cited_hosts, which extract_cited_hosts"
+              " built as a COMPETITOR rollup — own-domain sources whose label"
+              " names the brand are routed to the merchant bucket and never"
+              " reach top_cited_hosts, so 'Your site N/M' can UNDERCOUNT T1;"
+              " the measure quantifies that undercount"},
     {"id": 6, "site": "bd_report._citation_by_intent", "tier": "T3",
-     "definition": "per-prompt merchant_cited_runs > 0", "instrumented": False},
+     "definition": "per-prompt merchant_cited_runs > 0", "instrumented": True,
+     "mode": "drift",
+     "notes": "pure view over site 9's per-prompt source_summary — checked as"
+              " an internal-consistency equality, must never drift"},
     {"id": 7, "site": "bd_report.compute_citation_score.first_party_rate", "tier": "T1-variant",
-     "definition": "merchant PDP cited (url_match)", "instrumented": False},
+     "definition": "merchant PDP cited as PRIMARY grounding + not negative-verdict",
+     "instrumented": True, "mode": "measure",
+     "notes": "measured vs own_url_cited_runs_any over _first_party_url_candidates"
+              " hosts — quantifies the primary/negative gating + multi-host gap"
+              " the 'unify the two own-domain matchers' cutover must decide on"},
     {"id": 8, "site": "bd_report._citation_signals (endorsement/findability)", "tier": "T2",
-     "definition": "name-gated citation_role", "instrumented": False},
-    {"id": 9, "site": "sku_opportunity._score_prompt_group", "tier": "T3-soft",
-     "definition": "free-text mention in answer body", "instrumented": False},
+     "definition": "name-gated citation_role (cites_exact_sku/near_variant)",
+     "instrumented": True, "mode": "measure",
+     "notes": "endorsement_hosts set measured vs RunFacts endorsement_hosts —"
+              " quantifies the name-gate depth gap (SKU-level naming vs"
+              " label-mentions-brand)"},
+    {"id": 9, "site": "sku_opportunity per-prompt verdicts", "tier": "T3-soft",
+     "definition": "free-text mention in answer body (merchant_mention -> win/partial)",
+     "instrumented": True, "mode": "measure",
+     "notes": "per-SKU rollup measured: prompts with a win/partial provider"
+              " verdict vs prompts with source-walk brand_mentioned — the"
+              " answer-text-vs-source-walk gap the decision sheet's T3 row"
+              " resolves"},
     {"id": 10, "site": "citation_operator_service", "tier": "T3-soft",
-     "definition": "own thresholds + substring match", "instrumented": False},
+     "definition": "own thresholds + substring match", "instrumented": False,
+     "mode": "measure",
+     "notes": "operates on stored reports/probe snapshots outside the audit"
+              " assembly; instrument when its read path consumes stamped"
+              " run_facts (post-#1148 payloads only)"},
     {"id": 11, "site": "task_queue_service proof-of-done", "tier": "T2-ish",
-     "definition": "endorsement-host-now-cites", "instrumented": False},
+     "definition": "endorsement-host-now-cites", "instrumented": False,
+     "mode": "measure",
+     "notes": "decision sheet: proof-of-done becomes T2 (endorsement-host cite),"
+              " movement stays T3; compares stored before/after payloads —"
+              " instrument once stamped run_facts exists on both sides of a"
+              " re-audit pair"},
     {"id": 12, "site": "co_occurrence_finder._brand_in_text", "tier": "T3-soft",
-     "definition": "manually-synced copy of site 4's matcher", "instrumented": False},
+     "definition": "manually-synced copy of site 4's matcher", "instrumented": False,
+     "mode": "drift",
+     "notes": "answer-TEXT matcher with no source-walk analogue — cutover is"
+              " 'replace the copied matcher with the shared brand_alias one',"
+              " not a RunFacts rewire; no runtime parity to log"},
 )
 
 
@@ -683,3 +759,32 @@ def parity_check(
     except Exception:  # noqa: BLE001 — parity logging must never break a report
         logger.warning("RUNFACTS_PARITY_CHECK_FAILED site=%s", site, exc_info=True)
         return False
+
+
+def parity_measure(
+    site: str,
+    legacy_value: Any,
+    facts_value: Any,
+    *,
+    context: Optional[Mapping[str, Any]] = None,
+) -> None:
+    """Phase-1 gap measurement for sites whose legacy definition intentionally
+    differs from the decision-sheet target tier (mode="measure" in
+    :data:`LEGACY_CITEDNESS_SITES`). Unlike :func:`parity_check` this is NOT an
+    alarm: it logs at INFO on every computation — agreement included — so the
+    week's logs give the founder the actual drift distribution behind each
+    displayed-number change before signing off the cutover.
+
+    Grep target: ``RUNFACTS_PARITY_MEASURE``.
+    """
+    try:
+        logger.info(
+            "RUNFACTS_PARITY_MEASURE site=%s legacy=%r run_facts=%r equal=%s context=%s",
+            site,
+            legacy_value,
+            facts_value,
+            legacy_value == facts_value,
+            dict(context) if context else {},
+        )
+    except Exception:  # noqa: BLE001 — measurement must never break a report
+        logger.warning("RUNFACTS_PARITY_MEASURE_FAILED site=%s", site, exc_info=True)

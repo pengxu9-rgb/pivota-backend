@@ -19,7 +19,9 @@ from services.audit_facts import (
     QUERY_CLASS_CATEGORY,
     aggregate_run_facts,
     compute_run_facts,
+    own_url_cited_runs_any,
     parity_check,
+    parity_measure,
 )
 
 
@@ -155,8 +157,47 @@ def test_parity_check_logs_only_on_drift(caplog):
 
 def test_legacy_site_registry_covers_all_12():
     assert [s["id"] for s in LEGACY_CITEDNESS_SITES] == list(range(1, 13))
-    # The registry is the cutover checklist — every entry states its tier.
+    # The registry is the cutover checklist — every entry states tier + mode.
     assert all(s.get("tier") and s.get("site") for s in LEGACY_CITEDNESS_SITES)
+    assert all(s.get("mode") in ("drift", "measure") for s in LEGACY_CITEDNESS_SITES)
+    # Phase-2 prep instrumented sites 1-9; 10-12 carry scoping notes instead.
+    by_id = {s["id"]: s for s in LEGACY_CITEDNESS_SITES}
+    assert all(by_id[i]["instrumented"] for i in range(1, 10))
+    assert all(not by_id[i]["instrumented"] and by_id[i].get("notes") for i in (10, 11, 12))
+
+
+def test_own_url_cited_runs_any_multi_host():
+    # Same runs, richer identity: the Pivota-canonical host counts too.
+    canonical_run = _run(
+        "glow brand serum",
+        [{"uri": "https://pdp.pivota.cc/sig_abc", "title": "Glow Brand Serum"}],
+    )
+    runs = RUNS + [canonical_run]
+    # Single host — matches _own_url_cited_runs semantics on the same input.
+    from services.agent_center_bd_report_service import _own_url_cited_runs
+
+    assert own_url_cited_runs_any(runs, ["glowbrand.com"]) == _own_url_cited_runs(
+        runs, merchant_host="glowbrand.com"
+    ) == 1
+    # Multi-host T1 picks up the canonical citation as first-party.
+    assert own_url_cited_runs_any(
+        runs, ["https://glowbrand.com/products/serum", "https://pdp.pivota.cc/x"]
+    ) == 2
+    # No resolvable hosts -> None (no false zero), same contract as legacy.
+    assert own_url_cited_runs_any(runs, []) is None
+    assert own_url_cited_runs_any(runs, [None, ""]) is None
+
+
+def test_parity_measure_always_logs_info(caplog):
+    with caplog.at_level(logging.INFO, logger="services.audit_facts"):
+        parity_measure("site.m", 5, 5, context={"sku": "x"})  # agreement logs too
+        parity_measure("site.m", 5, 7)
+    lines = [r for r in caplog.records if "RUNFACTS_PARITY_MEASURE" in r.getMessage()]
+    assert len(lines) == 2
+    assert "equal=True" in lines[0].getMessage()
+    assert "equal=False" in lines[1].getMessage()
+    # Measurement is INFO — it must never land in the WARNING drift channel.
+    assert all(r.levelno == logging.INFO for r in lines)
 
 
 def test_build_structured_report_stamps_run_facts():
