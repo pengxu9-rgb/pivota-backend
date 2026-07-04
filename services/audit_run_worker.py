@@ -724,28 +724,42 @@ async def _process_one_audit_run_inner(
                 run_id=run_id, worker_id=WORKER_ID,
                 lease_seconds=LONG_STAGE_LEASE_SECONDS,
             )
+            # Persist report_jsonb BEFORE dispatch. Executor agents are enqueued
+            # here but the executor_run_worker re-fetches report_jsonb from this
+            # row at claim time; it isn't stored inline in the queue and doesn't
+            # otherwise land until the verifying stage below. Without this, a
+            # claimed executor run reads a NULL report and silently skips (the
+            # content-brief agent's failed-query extraction returns [] →
+            # status='skipped', no task, no error). Writing it before any
+            # executor row exists closes the race. Best-effort — dispatch still
+            # runs if it fails.
+            await mar.persist_report_jsonb(
+                run_id=run_id,
+                worker_id=WORKER_ID,
+                report_jsonb=brand_report,
+            )
             if is_synthetic:
-                # URL-audit: no executor dispatch. dispatch_agents would enrich
-                # /mutate the merchant's OWN catalog SKUs (canonical_pdp_enrichment
-                # falls back to thin catalog candidates) — irrelevant to a pasted
-                # URL and a side-effect the wedge never had. The advisory action
-                # plan lives in each per_sku report's next_best_action already.
-                tasks_summary = {"skipped": "url_audit_no_executors"}
-            else:
-                # Persist report_jsonb BEFORE dispatch. Executor agents are
-                # enqueued here but the executor_run_worker re-fetches
-                # report_jsonb from this row at claim time; it isn't stored inline
-                # in the queue and doesn't otherwise land until the verifying
-                # stage below. Without this, a claimed executor run reads a NULL
-                # report and silently skips (the content-brief agent's failed-
-                # query extraction returns [] → status='skipped', no task, no
-                # error). Writing it before any executor row exists closes the
-                # race. Best-effort — dispatch still runs if it fails.
-                await mar.persist_report_jsonb(
-                    run_id=run_id,
-                    worker_id=WORKER_ID,
-                    report_jsonb=brand_report,
+                # W5: URL-audit runs now DELIVER the report-only executors
+                # (content briefs + competitor insights) — real work off the
+                # pasted URL's OWN report, no connected catalog. The
+                # store-dependent agents (canonical_pdp_enrichment /
+                # sitemap_freshness / gsc_url_submission) are excluded: they'd
+                # read/mutate the merchant's own catalog SKUs, irrelevant to a
+                # pasted URL (the exact side-effect the old blanket skip
+                # protected). The global kill-switch still governs them.
+                from services.executor_agents.dispatcher import (
+                    REPORT_ONLY_EXECUTORS,
                 )
+
+                tasks_summary = await _materialize_tasks_and_executors(
+                    merchant_id=merchant_id,
+                    run_id=run_id,
+                    brand_report=brand_report,
+                    integration_state=integration_state,
+                    agent_names=REPORT_ONLY_EXECUTORS,
+                    dispatch_only=True,
+                )
+            else:
                 tasks_summary = await _materialize_tasks_and_executors(
                     merchant_id=merchant_id,
                     run_id=run_id,
@@ -1583,6 +1597,8 @@ async def _materialize_tasks_and_executors(
     run_id: str,
     brand_report: Dict[str, Any],
     integration_state: Optional[Dict[str, Any]],
+    agent_names: Optional[Any] = None,
+    dispatch_only: bool = False,
 ) -> Dict[str, Any]:
     """Materializing stage: task queue + executor dispatch. Unlike
     the legacy route which fires-and-forgets executor agents, the
@@ -1591,35 +1607,40 @@ async def _materialize_tasks_and_executors(
     summary: Dict[str, Any] = {
         "tasks_materialized": 0, "executors_dispatched": 0,
     }
-    try:
-        from services.task_queue_service import (
-            materialize_tasks_from_audit,
-            reverify_outreach_records,
-        )
-        tasks_summary = await materialize_tasks_from_audit(
-            merchant_id=merchant_id,
-            audit_run_id=run_id,
-            audit_report=brand_report,
-            integration_state=integration_state,
-        )
-        if isinstance(tasks_summary, dict):
-            summary["tasks_materialized"] = (
-                tasks_summary.get("created_count")
-                or tasks_summary.get("count")
-                or 0
+    # W5: dispatch_only (URL-audit) skips task-queue materialization + outreach
+    # reverification — the url-audit's advisory plan already lives in each
+    # per_sku report's next_best_action, and those paths are connected-store
+    # oriented. Only the report-only executor dispatch below runs.
+    if not dispatch_only:
+        try:
+            from services.task_queue_service import (
+                materialize_tasks_from_audit,
+                reverify_outreach_records,
             )
-        # Outreach Step 2 — close the loop: flip any pitched host that now cites us
-        # to 'cited' (the proof). Best-effort (self-catching); never sinks the audit.
-        outreach_summary = await reverify_outreach_records(
-            merchant_id=merchant_id, run_id=run_id, audit_report=brand_report,
-        )
-        if isinstance(outreach_summary, dict) and outreach_summary.get("flipped"):
-            summary["outreach_cited"] = outreach_summary["flipped"]
-    except Exception as exc:  # noqa: BLE001
-        logger.warning(
-            "audit_run_worker: task materialization failed "
-            "for run_id=%s: %s", run_id, exc,
-        )
+            tasks_summary = await materialize_tasks_from_audit(
+                merchant_id=merchant_id,
+                audit_run_id=run_id,
+                audit_report=brand_report,
+                integration_state=integration_state,
+            )
+            if isinstance(tasks_summary, dict):
+                summary["tasks_materialized"] = (
+                    tasks_summary.get("created_count")
+                    or tasks_summary.get("count")
+                    or 0
+                )
+            # Outreach Step 2 — close the loop: flip any pitched host that now
+            # cites us to 'cited' (the proof). Best-effort; never sinks the audit.
+            outreach_summary = await reverify_outreach_records(
+                merchant_id=merchant_id, run_id=run_id, audit_report=brand_report,
+            )
+            if isinstance(outreach_summary, dict) and outreach_summary.get("flipped"):
+                summary["outreach_cited"] = outreach_summary["flipped"]
+        except Exception as exc:  # noqa: BLE001
+            logger.warning(
+                "audit_run_worker: task materialization failed "
+                "for run_id=%s: %s", run_id, exc,
+            )
 
     try:
         from services.executor_agents.base import ExecutorContext
@@ -1629,7 +1650,7 @@ async def _materialize_tasks_and_executors(
             parent_audit_run_id=run_id,
             audit_report=brand_report,
         )
-        result = await dispatch_agents(ctx)
+        result = await dispatch_agents(ctx, agent_names=agent_names)
         if isinstance(result, dict):
             summary["executors_dispatched"] = (
                 result.get("dispatched_count")

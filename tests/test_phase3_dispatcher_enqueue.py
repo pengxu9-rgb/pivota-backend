@@ -285,3 +285,70 @@ async def test_payload_carries_extra_but_not_audit_report(monkeypatch):
     payload = stub.enqueued[0]["payload_jsonb"]
     assert "audit_report" not in payload
     assert payload.get("extra") == {"trigger": "manual"}
+
+
+# =====================================================================
+# W5 — agent_names filter (report-only executors for URL-audit runs)
+# =====================================================================
+
+@pytest.mark.asyncio
+async def test_agent_names_restricts_dispatch_to_the_allowlist(monkeypatch):
+    agents = [
+        _FakeAgent("content_brief_generator", should_run_returns=True),
+        _FakeAgent("competitor_insights", should_run_returns=True),
+        _FakeAgent("canonical_pdp_enrichment", should_run_returns=True),
+        _FakeAgent("gsc_url_submission_loop", should_run_returns=True),
+    ]
+    stub = _EnqueueStub()
+    _patch_dispatcher(monkeypatch, agents=agents, stub=stub)
+
+    from services.executor_agents.base import ExecutorContext
+    from services.executor_agents.dispatcher import (
+        dispatch_agents, REPORT_ONLY_EXECUTORS,
+    )
+    result = await dispatch_agents(
+        ExecutorContext(merchant_id="m-1", parent_audit_run_id="a-1",
+                        audit_report={"k": "v"}),
+        agent_names=REPORT_ONLY_EXECUTORS,
+    )
+    # only the two report-only agents are even evaluated; the store-dependent
+    # ones are filtered out BEFORE should_run (never touch the catalog).
+    assert result["agents_evaluated"] == 2
+    enqueued = sorted(e["agent_name"] for e in stub.enqueued)
+    assert enqueued == ["competitor_insights", "content_brief_generator"]
+    # the store-dependent agents' should_run was never called
+    store_agents = [a for a in agents if a.name not in REPORT_ONLY_EXECUTORS]
+    assert not any(a.execute_called for a in store_agents)
+
+
+@pytest.mark.asyncio
+async def test_agent_names_none_dispatches_full_registry(monkeypatch):
+    agents = [
+        _FakeAgent("content_brief_generator", should_run_returns=True),
+        _FakeAgent("canonical_pdp_enrichment", should_run_returns=True),
+    ]
+    stub = _EnqueueStub()
+    _patch_dispatcher(monkeypatch, agents=agents, stub=stub)
+
+    from services.executor_agents.base import ExecutorContext
+    from services.executor_agents.dispatcher import dispatch_agents
+    result = await dispatch_agents(
+        ExecutorContext(merchant_id="m-1"), agent_names=None,
+    )
+    assert result["agents_evaluated"] == 2  # full registry, no filter
+
+
+def test_report_only_executors_are_a_real_subset_of_the_registry():
+    # Guard: the report-only allowlist must name agents that actually exist in
+    # the registry (a rename that orphans an allowlist entry is a red build).
+    from services.executor_agents.dispatcher import (
+        _registry, REPORT_ONLY_EXECUTORS,
+    )
+    registry_names = {a.name for a in _registry()}
+    assert REPORT_ONLY_EXECUTORS <= registry_names, (
+        f"REPORT_ONLY_EXECUTORS names not in registry: "
+        f"{REPORT_ONLY_EXECUTORS - registry_names}"
+    )
+    # and the excluded (store-dependent) agents are genuinely excluded
+    assert "canonical_pdp_enrichment" not in REPORT_ONLY_EXECUTORS
+    assert "gsc_url_submission_loop" not in REPORT_ONLY_EXECUTORS
