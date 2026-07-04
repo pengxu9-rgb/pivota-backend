@@ -102,16 +102,30 @@ def build_reaudit_delta(
     }
 
 
+def _basis_id(basis: Mapping[str, Any]) -> Optional[str]:
+    """The strongest measurement-basis identity a `prompt_basis` block carries:
+    W2.1 `selected_set_id` (the FULL probed set — the true "measured the same
+    way?" key) when present, else W2 `prompt_set_id` (the LLM lists only)."""
+    if not isinstance(basis, Mapping):
+        return None
+    return (
+        str(basis.get("selected_set_id") or "")
+        or str(basis.get("prompt_set_id") or "")
+        or None
+    )
+
+
 def _prompt_set_id(
     full_report: Optional[Mapping[str, Any]],
     primary: Mapping[str, Any],
 ) -> Optional[str]:
-    """The pinned prompt_set_id for a report, tolerant of both shapes: the
+    """The pinned basis identity for a report, tolerant of both shapes: the
     per-product/primary report carrying `prompt_basis` directly, or the full
-    payload carrying it under brand_report.per_sku_reports[0]."""
-    basis = primary.get("prompt_basis")
-    if isinstance(basis, Mapping) and basis.get("prompt_set_id"):
-        return str(basis["prompt_set_id"])
+    payload carrying it under brand_report.per_sku_reports[0]. Prefers the
+    W2.1 selected-set identity over the W2 LLM-list identity."""
+    from_primary = _basis_id(primary.get("prompt_basis"))
+    if from_primary:
+        return from_primary
     report = full_report if isinstance(full_report, Mapping) else {}
     brand = report.get("brand_report")
     if isinstance(brand, Mapping):
@@ -119,9 +133,9 @@ def _prompt_set_id(
     for sku_report in report.get("per_sku_reports") or []:
         if not isinstance(sku_report, Mapping):
             continue
-        basis = sku_report.get("prompt_basis")
-        if isinstance(basis, Mapping) and basis.get("prompt_set_id"):
-            return str(basis["prompt_set_id"])
+        basis_id = _basis_id(sku_report.get("prompt_basis"))
+        if basis_id:
+            return basis_id
     return None
 
 

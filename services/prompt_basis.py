@@ -17,8 +17,15 @@ This module makes the prompt set an ASSET OF THE SKU:
     bumping PROMPT_BASIS_VERSION (a deliberate generator change) or passing
     `refresh=True` (a deliberate caller action) regenerates; nothing else does.
 
-The deterministic sidewalk prompts are NOT pinned here — they are already a
-pure function of the attribute graph. Only the stochastic LLM lists are.
+W2 (winnable/scenario) pins only the stochastic LLM lists. W2.1 pins the FULL
+SELECTED probe set — the exact `{query, axis, source, …}` records that were
+actually probed. The deterministic sidewalk/base prompts are a pure function of
+the attribute graph, BUT that graph is mutated between runs by retailer-evidence
+recycling, so the FINAL selected set still drifted a slot or two (prod pair
+2026-07-04: conditioner 14/14 identical, shampoo 13/14 with one oscillating
+slot). Persisting the selected set closes that residual: a re-run probes the
+exact prior queries, so the whole measurement basis — not just the LLM lists —
+is identical.
 """
 
 from __future__ import annotations
@@ -39,6 +46,13 @@ PROMPT_BASIS_VERSION = 1
 
 _MAX_PROMPTS_PER_LIST = 12
 _MAX_PROMPT_CHARS = 300
+# The probe budget per SKU is small (wedge 14, readiness 40). Cap generously so
+# a pinned set can never bloat the stored report, and drop malformed records.
+_MAX_SELECTED_SPECS = 64
+# Record keys worth preserving on a pinned spec — enough to reprobe identically
+# AND keep the downstream sidewalk-metadata seam faithful (axis + attribute
+# basis + evidence + weight). Anything else on a record is regenerable.
+_SELECTED_SPEC_KEYS = ("query", "axis", "source", "attribute_basis", "evidence", "intent_weight")
 
 
 def _clean_prompts(values: Any) -> List[str]:
@@ -55,14 +69,79 @@ def _clean_prompts(values: Any) -> List[str]:
     return out
 
 
+def clean_selected_specs(records: Any) -> List[Dict[str, Any]]:
+    """Sanitize the final selected query records for durable storage: keep only
+    the reprobe-relevant keys, JSON-safe, deduped by query, order-preserving.
+    A record with no query is dropped."""
+    out: List[Dict[str, Any]] = []
+    seen: set = set()
+    for record in records if isinstance(records, (list, tuple)) else []:
+        if not isinstance(record, Mapping):
+            continue
+        query = str(record.get("query") or "").strip()[:_MAX_PROMPT_CHARS]
+        key = query.lower()
+        if not query or key in seen:
+            continue
+        seen.add(key)
+        spec: Dict[str, Any] = {"query": query}
+        axis = record.get("axis")
+        spec["axis"] = str(axis).strip() if axis else "intent"
+        source = record.get("source")
+        if source:
+            spec["source"] = str(source).strip()
+        basis = record.get("attribute_basis")
+        if isinstance(basis, (list, tuple)):
+            spec["attribute_basis"] = [str(b) for b in basis if b]
+        evidence = record.get("evidence")
+        if isinstance(evidence, (list, tuple)):
+            spec["evidence"] = [str(e) for e in evidence if e][:6]
+        weight = record.get("intent_weight")
+        if isinstance(weight, (int, float)):
+            spec["intent_weight"] = float(weight)
+        out.append(spec)
+        if len(out) >= _MAX_SELECTED_SPECS:
+            break
+    return out
+
+
 def build_prompt_set_id(winnable: List[str], scenario: List[str]) -> str:
-    """Stable identity of a prompt basis — same prompts (order-sensitive,
+    """Stable identity of the LLM-list basis — same prompts (order-sensitive,
     case-preserving) → same id, across runs and processes."""
     payload = json.dumps(
         {"w": list(winnable), "s": list(scenario)},
         ensure_ascii=False, sort_keys=True,
     )
     return "ps_" + hashlib.sha256(payload.encode("utf-8")).hexdigest()[:16]
+
+
+def build_selected_set_id(specs: List[Mapping[str, Any]]) -> str:
+    """Stable identity of the FULL probed set — the (query, axis) sequence that
+    was actually measured. This, not prompt_set_id, is the true "were we
+    measured the same way?" key for the re-audit delta."""
+    payload = json.dumps(
+        [[str(s.get("query") or ""), str(s.get("axis") or "")] for s in specs],
+        ensure_ascii=False,
+    )
+    return "sel_" + hashlib.sha256(payload.encode("utf-8")).hexdigest()[:16]
+
+
+def set_selected_specs_on_meta(
+    meta: Optional[Mapping[str, Any]],
+    built_specs: Any,
+) -> Dict[str, Any]:
+    """Record the queries ACTUALLY probed this run onto the basis meta.
+
+    Called after probing (pinned or fresh) so the chain never breaks: a pinned
+    run re-records the same set; a fresh run establishes it. Returns a new meta
+    dict with `selected_specs` + `selected_set_id`; a no-op (returns meta
+    unchanged) when there's nothing to record."""
+    out = dict(meta) if isinstance(meta, Mapping) else {}
+    specs = clean_selected_specs(built_specs)
+    if not specs:
+        return out
+    out["selected_specs"] = specs
+    out["selected_set_id"] = build_selected_set_id(specs)
+    return out
 
 
 def harvest_prompt_basis(
@@ -92,11 +171,20 @@ def harvest_prompt_basis(
             return None  # generators changed — explicit regeneration event
         winnable = _clean_prompts(basis.get("winnable"))
         scenario = _clean_prompts(basis.get("scenario"))
-        if not winnable and not scenario:
+        selected_specs = clean_selected_specs(basis.get("selected_specs"))
+        if not winnable and not scenario and not selected_specs:
             return None  # never pin an empty basis (e.g. a prior LLM outage)
         return {
             "winnable": winnable,
             "scenario": scenario,
+            # W2.1: the full probed set from the prior run (may be empty for a
+            # basis stamped before W2.1 shipped — then only the LLM lists pin,
+            # and this run re-records the selected set to establish it).
+            "selected_specs": selected_specs,
+            "selected_set_id": (
+                str(basis.get("selected_set_id") or "")
+                or (build_selected_set_id(selected_specs) if selected_specs else None)
+            ),
             "prompt_set_id": (
                 str(basis.get("prompt_set_id") or "")
                 or build_prompt_set_id(winnable, scenario)
@@ -209,6 +297,7 @@ async def resolve_prompt_basis(
             merchant_id=merchant_id, sku_key=sku_key,
         )
         if prior:
+            selected_specs = prior.get("selected_specs") or []
             meta = {
                 "prompt_set_id": prior["prompt_set_id"],
                 "basis_version": PROMPT_BASIS_VERSION,
@@ -221,15 +310,18 @@ async def resolve_prompt_basis(
                 "pinned_from_run_id": prior.get("pinned_from_run_id"),
             }
             logger.info(
-                "prompt-basis: pinned %s (%d winnable, %d scenario) from run "
-                "%s for sku=%s",
+                "prompt-basis: pinned %s (%d winnable, %d scenario, %d "
+                "selected) from run %s for sku=%s",
                 meta["prompt_set_id"], len(prior["winnable"]),
-                len(prior["scenario"]), prior.get("pinned_from_run_id"),
-                sku_key,
+                len(prior["scenario"]), len(selected_specs),
+                prior.get("pinned_from_run_id"), sku_key,
             )
             return {
                 "winnable": prior["winnable"],
                 "scenario": prior["scenario"],
+                # W2.1: when the prior run stored the full probed set, the
+                # caller reprobes EXACTLY these — no spec rebuild, no drift.
+                "selected_specs": selected_specs,
                 "meta": meta,
             }
 
@@ -252,4 +344,12 @@ async def resolve_prompt_basis(
         "created_at": datetime.now(timezone.utc).isoformat(),
         "pinned_from_run_id": None,
     }
-    return {"winnable": winnable, "scenario": scenario, "meta": meta}
+    # Fresh run: no prior selected set to reprobe. The caller builds specs
+    # normally, then records what was actually probed via
+    # set_selected_specs_on_meta so the NEXT run can pin it.
+    return {
+        "winnable": winnable,
+        "scenario": scenario,
+        "selected_specs": [],
+        "meta": meta,
+    }

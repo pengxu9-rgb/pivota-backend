@@ -16,8 +16,11 @@ import pytest
 from services.prompt_basis import (
     PROMPT_BASIS_VERSION,
     build_prompt_set_id,
+    build_selected_set_id,
+    clean_selected_specs,
     harvest_prompt_basis,
     resolve_prompt_basis,
+    set_selected_specs_on_meta,
 )
 
 
@@ -349,3 +352,184 @@ def test_delta_first_audit_declares_baseline_basis():
     assert delta["is_first_audit"] is True
     assert delta["measurement_basis"]["same"] is None
     assert delta["measurement_basis"]["prompt_set_id"] == "ps_x"
+
+
+# ---- W2.1: pin the FULL selected probe set, not just the LLM lists ----------
+
+_SPECS = [
+    {"query": "vegan shampoo", "axis": "category", "source": "llm_winnable"},
+    {"query": "best shampoo for shiso", "axis": "sidewalk",
+     "attribute_basis": ["ingredient:shiso"], "evidence": ["shiso extract"],
+     "intent_weight": 0.7},
+    {"query": "DAMDAM CLASSIC SHAMPOO - Shiso reviews", "axis": "review"},
+]
+
+
+def test_clean_selected_specs_sanitizes_dedupes_caps():
+    dirty = [
+        {"query": "  Vegan Shampoo  ", "axis": "category", "source": "x", "junk": 1},
+        {"query": "vegan shampoo", "axis": "category"},   # dup (case/space)
+        {"axis": "category"},                              # no query -> dropped
+        {"query": "q2", "attribute_basis": ["a", "", None], "evidence": list("abcdefghij"),
+         "intent_weight": 3},
+    ]
+    out = clean_selected_specs(dirty)
+    assert [s["query"] for s in out] == ["Vegan Shampoo", "q2"]
+    assert "junk" not in out[0]
+    assert out[0]["axis"] == "category"
+    # evidence capped at 6; attribute_basis drops falsy; weight coerced to float
+    assert out[1]["attribute_basis"] == ["a"]
+    assert len(out[1]["evidence"]) == 6
+    assert out[1]["intent_weight"] == 3.0
+    assert clean_selected_specs("not-a-list") == []
+
+
+def test_selected_set_id_is_query_and_axis_sensitive():
+    a = build_selected_set_id(_SPECS)
+    assert a == build_selected_set_id(_SPECS)
+    assert a.startswith("sel_")
+    # order matters
+    assert a != build_selected_set_id(list(reversed(_SPECS)))
+    # axis matters (same queries, different axis)
+    shifted = [dict(s, axis="other") for s in _SPECS]
+    assert a != build_selected_set_id(shifted)
+    # extra metadata (evidence/weight) does NOT change identity — only query+axis
+    stripped = [{"query": s["query"], "axis": s["axis"]} for s in _SPECS]
+    assert a == build_selected_set_id(stripped)
+
+
+def test_set_selected_specs_on_meta_folds_and_ids():
+    meta = {"prompt_set_id": "ps_x", "source": "fresh"}
+    out = set_selected_specs_on_meta(meta, _SPECS)
+    assert out["prompt_set_id"] == "ps_x"          # untouched
+    assert [s["query"] for s in out["selected_specs"]] == [s["query"] for s in _SPECS]
+    assert out["selected_set_id"] == build_selected_set_id(_SPECS)
+    # no-op when nothing to record (an all-empty probe set never overwrites)
+    assert set_selected_specs_on_meta(meta, []) == meta
+    assert "selected_set_id" not in set_selected_specs_on_meta(meta, [])
+
+
+def test_harvest_reads_selected_specs_version_gated():
+    basis = dict(_GOOD_BASIS, selected_specs=_SPECS,
+                 selected_set_id=build_selected_set_id(_SPECS))
+    got = harvest_prompt_basis(_report_with_basis("sku-1", basis), sku_key="sku-1")
+    assert [s["query"] for s in got["selected_specs"]] == [s["query"] for s in _SPECS]
+    assert got["selected_set_id"] == build_selected_set_id(_SPECS)
+    # a W2-only basis (no selected_specs) still pins the LLM lists; selected empty
+    got2 = harvest_prompt_basis(_report_with_basis("sku-1", _GOOD_BASIS), sku_key="sku-1")
+    assert got2["selected_specs"] == []
+    assert got2["selected_set_id"] is None
+
+
+@pytest.mark.asyncio
+async def test_resolve_pins_selected_specs_for_reprobe(monkeypatch):
+    import services.prompt_basis as pb
+
+    async def fake_load(**kwargs):
+        return {
+            "winnable": ["w"], "scenario": ["s"], "selected_specs": _SPECS,
+            "selected_set_id": build_selected_set_id(_SPECS),
+            "prompt_set_id": "ps_prior", "created_at": "2026-07-01T00:00:00+00:00",
+            "pinned_from_run_id": "run-prior",
+        }
+
+    monkeypatch.setattr(pb, "load_prior_prompt_basis", fake_load)
+    gen = _Generators(["fresh"], ["fresh"])
+    out = await resolve_prompt_basis(
+        merchant_id="m1", sku_key="sku-1",
+        generate_winnable=gen.winnable, generate_scenario=gen.scenario,
+    )
+    assert gen.calls == 0
+    assert [s["query"] for s in out["selected_specs"]] == [s["query"] for s in _SPECS]
+
+
+@pytest.mark.asyncio
+async def test_resolve_fresh_has_empty_selected_specs(monkeypatch):
+    import services.prompt_basis as pb
+
+    async def fake_load(**kwargs):
+        return None
+
+    monkeypatch.setattr(pb, "load_prior_prompt_basis", fake_load)
+    gen = _Generators(["w"], ["s"])
+    out = await resolve_prompt_basis(
+        merchant_id="m1", sku_key="sku-1",
+        generate_winnable=gen.winnable, generate_scenario=gen.scenario,
+    )
+    assert out["selected_specs"] == []  # established after probing, not here
+
+
+@pytest.mark.asyncio
+async def test_selected_specs_round_trip_fresh_then_pin(monkeypatch):
+    """Fresh run records the probed set -> stamped on report -> next run pins &
+    reprobes it. The end-to-end W2.1 contract in one test."""
+    import services.prompt_basis as pb
+
+    async def no_prior(**kwargs):
+        return None
+
+    monkeypatch.setattr(pb, "load_prior_prompt_basis", no_prior)
+    gen = _Generators(["w1"], ["s1"])
+    fresh = await resolve_prompt_basis(
+        merchant_id="m1", sku_key="sku-1",
+        generate_winnable=gen.winnable, generate_scenario=gen.scenario,
+    )
+    # the fan-out folds what was probed into the meta before persisting
+    final_meta = set_selected_specs_on_meta(fresh["meta"], _SPECS)
+    prior_report = _report_with_basis("sku-1", final_meta)
+
+    # next run harvests + resolves -> pins the same selected set
+    async def load_from_report(**kwargs):
+        got = harvest_prompt_basis(prior_report, sku_key="sku-1")
+        got["pinned_from_run_id"] = "run-1"
+        return got
+
+    monkeypatch.setattr(pb, "load_prior_prompt_basis", load_from_report)
+    gen2 = _Generators(["should-not-run"], ["should-not-run"])
+    pinned = await resolve_prompt_basis(
+        merchant_id="m1", sku_key="sku-1",
+        generate_winnable=gen2.winnable, generate_scenario=gen2.scenario,
+    )
+    assert gen2.calls == 0
+    assert [s["query"] for s in pinned["selected_specs"]] == [s["query"] for s in _SPECS]
+    assert pinned["meta"]["source"] == "pinned"
+
+
+def test_probe_path_reprobes_pinned_selected_specs():
+    """Source-level pin: _probe_per_sku_ctx must reprobe _pinned_selected_specs
+    directly (no spec rebuild) and record _selected_specs_out — the exact
+    dataflow W2.1 depends on. Mirrors the W6/W2 source-scan pattern."""
+    from pathlib import Path
+
+    src = Path("services/agent_center_bd_report_service.py").read_text()
+    fn = src[src.index("async def _probe_per_sku_ctx"):]
+    fn = fn[:fn.index("\nasync def ", 1)] if "\nasync def " in fn[1:] else fn[:8000]
+    assert '_pinned_selected_specs' in fn
+    assert '_selected_specs_out' in fn
+
+
+def test_delta_prefers_selected_set_id_over_prompt_set_id():
+    """When the FULL probed set matches, the delta says same=True even if the
+    LLM-list prompt_set_id differs; when the probed set differs, same=False even
+    if prompt_set_id matches."""
+    from services.audit_delta import build_reaudit_delta
+
+    def rep(prompt_id, sel_id):
+        return {"per_product": [{
+            "prompt_basis": {"prompt_set_id": prompt_id, "selected_set_id": sel_id},
+            "merchant_view": {"headline": {"scores": {
+                "visibility": 50, "attribution": 40, "category_visibility": 30}}},
+        }]}
+
+    # same selected set, different LLM-list id -> same measurement
+    d1 = build_reaudit_delta(
+        current_report=rep("ps_A", "sel_X"), prior_report=rep("ps_B", "sel_X"),
+        prior_row={}, days_since=7)
+    assert d1["measurement_basis"]["same"] is True
+    assert d1["measurement_basis"]["prompt_set_id"] == "sel_X"
+
+    # different selected set, same LLM-list id -> NOT the same measurement
+    d2 = build_reaudit_delta(
+        current_report=rep("ps_A", "sel_X"), prior_report=rep("ps_A", "sel_Y"),
+        prior_row={}, days_since=7)
+    assert d2["measurement_basis"]["same"] is False
