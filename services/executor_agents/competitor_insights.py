@@ -122,19 +122,11 @@ def _parse_insights(payload: Dict[str, Any]) -> List[Dict[str, Any]]:
     text = "\n".join(p.get("text", "") for p in parts if isinstance(p, dict)).strip()
     if not text:
         return []
-    text = re.sub(r"^```(?:json)?\s*", "", text, flags=re.IGNORECASE)
-    text = re.sub(r"\s*```\s*$", "", text)
-    try:
-        parsed = json.loads(text)
-    except json.JSONDecodeError:
-        m = re.search(r"\{[\s\S]*\}", text)
-        if not m:
-            return []
-        try:
-            parsed = json.loads(m.group(0))
-        except json.JSONDecodeError:
-            return []
-    if not isinstance(parsed, dict):
+    # W3: shared tolerant parser (bare/fence/substring), one implementation.
+    from services.llm_io import parse_llm_object
+
+    parsed = parse_llm_object(text, label="competitor_insights")
+    if parsed is None:
         return []
     out: List[Dict[str, Any]] = []
     for item in parsed.get("insights") or []:

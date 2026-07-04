@@ -236,38 +236,14 @@ def _build_user_message(
     return query
 
 
-_JSON_FENCE_RE = re.compile(r"```(?:json)?\s*(\{.*?\})\s*```", re.DOTALL)
-
-
 def _parse_deepseek_response(raw_text: str) -> Optional[Dict[str, Any]]:
-    """Extract the JSON object from Deepseek's response. Handles three
-    common formats: bare JSON, fenced ```json...``` block, JSON
-    embedded mid-text. Returns None when nothing parseable is found
-    (run is treated as upstream-failed by the scorer)."""
-    if not raw_text or not raw_text.strip():
-        return None
-    text = raw_text.strip()
-    # Try bare JSON first
-    try:
-        return json.loads(text)
-    except json.JSONDecodeError:
-        pass
-    # Try fenced JSON block
-    match = _JSON_FENCE_RE.search(text)
-    if match:
-        try:
-            return json.loads(match.group(1))
-        except json.JSONDecodeError:
-            pass
-    # Last attempt: find the first {...} substring
-    start = text.find("{")
-    end = text.rfind("}")
-    if start >= 0 and end > start:
-        try:
-            return json.loads(text[start:end + 1])
-        except json.JSONDecodeError:
-            pass
-    return None
+    """Extract the JSON object from Deepseek's response (bare / fenced /
+    embedded), or None when nothing parseable is found (the scorer treats the
+    run as upstream-failed). W3: the shared parser is the single implementation
+    of this bare→fence→substring recovery."""
+    from services.llm_io import parse_llm_object
+
+    return parse_llm_object(raw_text, label="deepseek_probe")
 
 
 def _extract_grounding_sources(

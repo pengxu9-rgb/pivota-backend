@@ -110,25 +110,11 @@ def _is_claim_safe(claim_text: str) -> bool:
 
 
 def _safe_json(text: Optional[str]) -> Optional[Any]:
-    """Parse a model's JSON response, tolerating code fences / surrounding prose."""
-    if not text or not isinstance(text, str):
-        return None
-    s = text.strip()
-    if s.startswith("```"):
-        s = s.strip("`")
-        nl = s.find("\n")
-        if nl != -1 and s[:nl].strip().lower() in ("json", ""):
-            s = s[nl + 1:]
-    try:
-        return json.loads(s)
-    except Exception:
-        i, j = s.find("{"), s.rfind("}")
-        if i != -1 and j != -1 and j > i:
-            try:
-                return json.loads(s[i:j + 1])
-            except Exception:
-                return None
-    return None
+    """Parse a model's JSON response, tolerating code fences / surrounding prose.
+    W3: delegates to the single shared tolerant parser."""
+    from services.llm_io import parse_llm_json
+
+    return parse_llm_json(text, label="evidence_extraction")
 
 
 def _parse_candidates(result: Any, *, max_claims: int) -> List[Dict[str, Any]]:

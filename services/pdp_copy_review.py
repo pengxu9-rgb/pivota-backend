@@ -120,19 +120,12 @@ def _extract_copy_text(payload: Dict[str, Any]) -> str:
 
 
 def _parse_rubric(content: str) -> Optional[Dict[str, Any]]:
-    if not isinstance(content, str) or not content.strip():
-        return None
-    text = content.strip()
-    # Tolerate ```json fences.
-    if text.startswith("```"):
-        text = text.strip("`")
-        if text.lower().startswith("json"):
-            text = text[4:]
-    try:
-        obj = json.loads(text)
-    except (ValueError, TypeError):
-        return None
-    if not isinstance(obj, dict):
+    # W3: shared tolerant parse; the strict rubric validation below is unchanged
+    # (fail-closed on any malformed/evasive rubric).
+    from services.llm_io import parse_llm_object
+
+    obj = parse_llm_object(content, label="pdp_copy_review")
+    if obj is None:
         return None
     decision = str(obj.get("decision") or "").strip().lower()
     if decision not in {"pass", "reject", "needs_human_review"}:

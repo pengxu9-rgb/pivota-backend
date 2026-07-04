@@ -389,19 +389,11 @@ def _parse_enrichment_response(payload: Dict[str, Any]) -> Optional[Dict[str, An
     ).strip()
     if not text:
         return None
-    text = re.sub(r"^```(?:json)?\s*", "", text, flags=re.IGNORECASE)
-    text = re.sub(r"\s*```\s*$", "", text)
-    try:
-        parsed = json.loads(text)
-    except json.JSONDecodeError:
-        match = re.search(r"\{[\s\S]*\}", text)
-        if not match:
-            return None
-        try:
-            parsed = json.loads(match.group(0))
-        except json.JSONDecodeError:
-            return None
-    if not isinstance(parsed, dict):
+    # W3: shared tolerant parser (bare/fence/substring), one implementation.
+    from services.llm_io import parse_llm_object
+
+    parsed = parse_llm_object(text, label="canonical_pdp_enrichment")
+    if parsed is None:
         return None
 
     desc = parsed.get("description_markdown")
