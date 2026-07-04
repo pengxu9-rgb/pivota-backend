@@ -1979,30 +1979,10 @@ def _health_sensitive(
 
 
 def _parse_brief_json(raw_text: Any) -> Optional[Dict[str, Any]]:
-    text = str(raw_text or "").strip()
-    if not text:
-        return None
-    try:
-        parsed = json.loads(text)
-        return parsed if isinstance(parsed, dict) else None
-    except json.JSONDecodeError:
-        pass
-    fence = re.search(r"```(?:json)?\s*(\{.*?\})\s*```", text, re.DOTALL)
-    if fence:
-        try:
-            parsed = json.loads(fence.group(1))
-            return parsed if isinstance(parsed, dict) else None
-        except json.JSONDecodeError:
-            pass
-    start = text.find("{")
-    end = text.rfind("}")
-    if start >= 0 and end > start:
-        try:
-            parsed = json.loads(text[start:end + 1])
-            return parsed if isinstance(parsed, dict) else None
-        except json.JSONDecodeError:
-            return None
-    return None
+    # W3: the shared tolerant parser is the single bare→fence→substring impl.
+    from services.llm_io import parse_llm_object
+
+    return parse_llm_object(raw_text, label="strategic_brief")
 
 
 def _has_required_shape(brief: Mapping[str, Any]) -> bool:

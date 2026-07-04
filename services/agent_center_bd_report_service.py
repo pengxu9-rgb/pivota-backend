@@ -9130,17 +9130,10 @@ RULES (this is a trust product — follow exactly):
 
 
 def _parse_winnable_prompts(raw: Any) -> List[str]:
-    text = str(raw or "").strip()
-    if not text:
-        return []
-    match = re.search(r"\[.*\]", text, re.DOTALL)
-    if match:
-        text = match.group(0)
-    try:
-        data = json.loads(text)
-    except (ValueError, TypeError):
-        return []
-    return [x for x in data if isinstance(x, str)] if isinstance(data, list) else []
+    # W3: the shared parser handles bare/fenced/embedded JSON arrays uniformly.
+    from services.llm_io import parse_llm_str_array
+
+    return parse_llm_str_array(raw, label="winnable_prompts")
 
 
 def _resolve_prompt_gen_provider() -> Tuple[Optional[str], str]:
@@ -9515,29 +9508,23 @@ def _salvage_competitor_prose(raw: Any) -> str:
     )
     if not looks_structured:
         return text  # already clean prose — nothing to salvage
-    # Strip surrounding markdown code fences, tolerating a missing closing fence.
+    # W3: the shared parser handles the well-formed-envelope case (bare / fenced
+    # / brace-substring). If it parses, extract the prose field.
+    from services.llm_io import parse_llm_object
+
+    obj = parse_llm_object(text, label="competitor_prose")
+    if isinstance(obj, Mapping):
+        for key in _COMPETITOR_PROSE_KEYS:
+            value = obj.get(key)
+            if value:
+                return str(value).strip()
+        return ""  # valid JSON but no prose field — hide, don't leak
+    # Parse failed (commonly a TRUNCATED/unterminated envelope, which no general
+    # JSON parser can recover). Pull the prose field directly, tolerating a
+    # missing closing quote/brace — the one thing this salvage adds over
+    # parse_llm_object, and why it stays local.
     inner = re.sub(r"^```(?:json)?\s*", "", text, flags=re.IGNORECASE).strip()
     inner = re.sub(r"\s*```$", "", inner).strip()
-    # Try to parse a JSON object (whole string, then first-brace..last-brace).
-    brace = ""
-    start, end = inner.find("{"), inner.rfind("}")
-    if start != -1 and end > start:
-        brace = inner[start : end + 1]
-    for attempt in (inner, brace):
-        if not attempt:
-            continue
-        try:
-            obj = json.loads(attempt)
-        except (ValueError, json.JSONDecodeError):
-            continue
-        if isinstance(obj, Mapping):
-            for key in _COMPETITOR_PROSE_KEYS:
-                value = obj.get(key)
-                if value:
-                    return str(value).strip()
-            return ""  # valid JSON but no prose field — hide, don't leak
-    # Parse failed (commonly a truncated/unterminated envelope). Pull the prose
-    # field directly, tolerating a missing closing quote/brace.
     for key in _COMPETITOR_PROSE_KEYS:
         match = re.search(
             rf'"{key}"\s*:\s*"(.+?)(?:"\s*[,}}]|$)', inner, re.DOTALL

@@ -225,12 +225,12 @@ def _manual_review_result(
 
 
 def _extract_json_object(text: str) -> Dict[str, Any]:
-    cleaned = (text or "").strip()
-    if cleaned.startswith("```"):
-        cleaned = re.sub(r"^```(?:json)?\s*", "", cleaned, flags=re.IGNORECASE)
-        cleaned = re.sub(r"\s*```$", "", cleaned)
-    parsed = json.loads(cleaned)
-    if not isinstance(parsed, dict):
+    # W3: the shared tolerant parser; raise (as before) when no object parses so
+    # the moderation caller's error path is unchanged.
+    from services.llm_io import parse_llm_object
+
+    parsed = parse_llm_object(text, label="review_moderation")
+    if parsed is None:
         raise ValueError("moderation response was not a JSON object")
     return parsed
 

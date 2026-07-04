@@ -103,23 +103,12 @@ def _build_user(*, surface: str, identity: Mapping[str, Any], claims: Any, evide
 
 
 def _parse_verdict(text: str) -> Optional[Dict[str, Any]]:
-    raw = str(text or "").strip()
-    if not raw:
-        return None
-    candidates = [raw]
-    fence = re.search(r"```(?:json)?\s*(\{.*?\})\s*```", raw, re.DOTALL)
-    if fence:
-        candidates.append(fence.group(1))
-    start, end = raw.find("{"), raw.rfind("}")
-    if start != -1 and end > start:
-        candidates.append(raw[start:end + 1])
-    for cand in candidates:
-        try:
-            obj = json.loads(cand)
-        except (ValueError, TypeError):
-            continue
-        if isinstance(obj, dict) and str(obj.get("verdict", "")).lower() in (VERDICT_PASS, VERDICT_FLAG):
-            return obj
+    # W3: shared tolerant parse; domain gate (a valid verdict value) unchanged.
+    from services.llm_io import parse_llm_object
+
+    obj = parse_llm_object(text, label="audit_review_gate")
+    if obj and str(obj.get("verdict", "")).lower() in (VERDICT_PASS, VERDICT_FLAG):
+        return obj
     return None
 
 
