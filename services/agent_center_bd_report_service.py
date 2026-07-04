@@ -7500,6 +7500,45 @@ def _citation_signals(host_rows: List[Dict[str, Any]]) -> Dict[str, Any]:
     }
 
 
+def _overlay_endorsement_from_facts(
+    signals: Dict[str, Any], facts: Any
+) -> Dict[str, Any]:
+    """W1 site 8 CUTOVER (T2): replace `_citation_signals`' SKU-name-gated
+    endorsement set with the RunFacts T2 set — an endorsement-role host that names
+    the BRAND (not necessarily the exact SKU). Founder decision 2026-07-04: a
+    brand-naming independent source IS 'independently recommended', so a review
+    publisher that names the brand but not the precise SKU (e.g. hwahae.com naming
+    ANUKO) counts. The legacy name-gate produced a false "no endorsement" that
+    contradicted the report's own host table (hwahae rendered as a trusted
+    publisher). findability / competitor / channels rows stay from
+    `_citation_signals`; only the endorsement portion + its derived flags are
+    re-sourced, and the legacy value is stashed for the parity tripwire.
+
+    `facts` is a RunFacts (its `.prompts` carry per-query-class `.endorsed_by`, so
+    the category-endorsement subset is reconstructable). A falsy `facts` (no fold
+    available) leaves the legacy signals untouched — never a silent zero.
+    """
+    if not facts:
+        return signals
+    endorsement_hosts = list(getattr(facts, "endorsement_hosts", ()) or ())
+    category_hosts = sorted({
+        h
+        for p in (getattr(facts, "prompts", ()) or ())
+        if getattr(p, "cls", None) == QUERY_CLASS_CATEGORY
+        for h in (getattr(p, "endorsed_by", ()) or ())
+    })
+    out = dict(signals)
+    out["endorsement_hosts_legacy"] = signals.get("endorsement_hosts", [])
+    out["endorsement_hosts"] = endorsement_hosts
+    out["endorsement_category_hosts"] = category_hosts
+    out["has_independent_endorsement"] = bool(endorsement_hosts)
+    out["independently_recommended_for_category"] = bool(category_hosts)
+    out["surfaced_only_via_own_listing"] = (
+        bool(out.get("findability_hosts")) and not endorsement_hosts
+    )
+    return out
+
+
 def _reddit_subreddit_from_url(url: str) -> Optional[str]:
     parsed = urlparse(url if "://" in url else f"https://{url}")
     parts = [p for p in (parsed.path or "").split("/") if p]
@@ -7549,9 +7588,23 @@ def build_authority_map(
     # across all SKUs so a competitor's storefront can be recognised even when it
     # was cited under one SKU but named as a competitor under another.
     run_competitor_brands: set = set()
+    # W1 site 8: RunFacts folds for the endorsement cutover. Per SKU (feeds each
+    # sku_entry's citation_signals) + all runs pooled (feeds the brand rollup).
+    _facts_by_sku: Dict[Any, Any] = {}
+    _all_runs_for_facts: List[Dict[str, Any]] = []
+    _fact_vendors = _clean_identity_tuple(merchant_vendors)
     for report in per_sku_reports or []:
         sku_key = report.get("sku_key")
         probe_runs = probe_runs_by_sku.get(sku_key) if isinstance(probe_runs_by_sku, dict) else []
+        _sku_runs = _flatten_probe_runs(probe_runs)
+        _all_runs_for_facts.extend(_sku_runs)
+        _sku_facts = compute_run_facts(
+            _sku_runs,
+            merchant_host=merchant_host,
+            merchant_brand=merchant_brand,
+            merchant_vendors=_fact_vendors,
+        )
+        _facts_by_sku[sku_key] = _sku_facts
         host_rows: Dict[str, Dict[str, Any]] = {}
         reddit_threads: Dict[str, List[Dict[str, Any]]] = defaultdict(list)
         for run in _flatten_probe_runs(probe_runs):
@@ -7713,7 +7766,9 @@ def build_authority_map(
             "product_key": report.get("product_key"),
             "content_key": report.get("content_key"),
             "authority_hosts": authority_hosts,
-            "citation_signals": _citation_signals(authority_hosts),
+            "citation_signals": _overlay_endorsement_from_facts(
+                _citation_signals(authority_hosts), _facts_by_sku.get(sku_key)
+            ),
             "reddit": {"subreddits": reddit_subreddits},
         })
 
@@ -7735,7 +7790,10 @@ def build_authority_map(
                 if _flag_competitor_by_name(row, competitor_aliases):
                     flipped = True
             if flipped:
-                entry["citation_signals"] = _citation_signals(entry["authority_hosts"])
+                entry["citation_signals"] = _overlay_endorsement_from_facts(
+                    _citation_signals(entry["authority_hosts"]),
+                    _facts_by_sku.get(entry.get("sku_key")),
+                )
 
     matrix_rows = []
     for row in host_matrix.values():
@@ -7762,12 +7820,26 @@ def build_authority_map(
     # visibility, and FINDABILITY (own site + retail/marketplace listings) only
     # as a distribution signal — so "your listings are indexed" is never sold as
     # "AI recommends you".
-    signals = _citation_signals(matrix_rows)
+    # W1 site 8: endorsement re-sourced from the RunFacts T2 fold over all pooled
+    # runs (brand grain), matching the per-SKU overlay above. findability /
+    # competitor rows stay from _citation_signals (the host-matrix view).
+    _brand_facts = compute_run_facts(
+        _all_runs_for_facts,
+        merchant_host=merchant_host,
+        merchant_brand=merchant_brand,
+        merchant_vendors=_fact_vendors,
+    )
+    signals = _overlay_endorsement_from_facts(
+        _citation_signals(matrix_rows), _brand_facts
+    )
     host_attribution_summary = {
         "distinct_hosts": len(matrix_rows),
         "by_role": signals["by_role"],
         "findability_hosts": signals["findability_hosts"],
         "endorsement_hosts": signals["endorsement_hosts"],
+        # W1 site 8: the retired SKU-name-gated endorsement set, kept for the parity
+        # tripwire (run_brand_report) — NOT rendered.
+        "endorsement_hosts_legacy": signals.get("endorsement_hosts_legacy", []),
         "endorsement_category_hosts": signals["endorsement_category_hosts"],
         "competitor_hosts": signals["competitor_hosts"],
         "independent_hosts": signals["endorsement_hosts"],  # back-compat alias
@@ -11548,15 +11620,16 @@ async def run_brand_report(
                 list(_facts_by_sku.values()),
                 identity={"host": _merchant_host, "brand": merchant_name},
             )
-            # W1 site 8 (measure): the authority map's endorsement set is
-            # name-gated at SKU level (cites_exact_sku / near_variant); T2's
-            # gate is label-mentions-brand. The set comparison quantifies the
-            # gate-depth gap behind "Independently recommended N/M".
+            # W1 site 8 (CUTOVER): the rendered endorsement now IS the RunFacts T2
+            # set (build_authority_map overlays it). The retired SKU-name-gated
+            # value is stashed under `endorsement_hosts_legacy`; the tripwire keeps
+            # measuring the legacy-vs-RunFacts gap so a regression in either surface
+            # still shows up (grep RUNFACTS_PARITY_DRIFT).
             _legacy_endorse = sorted(
                 str(h)
                 for h in (
                     (authority_map.get("host_attribution_summary") or {}).get(
-                        "endorsement_hosts"
+                        "endorsement_hosts_legacy"
                     )
                     or []
                 )

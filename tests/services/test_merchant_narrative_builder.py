@@ -23,6 +23,28 @@ def _run(query: str, title: str, axis: str = "intent", *, excerpt: str = None, c
     return run
 
 
+def _editorial(query: str, host: str, brand: str, *, comps: List[str] = None) -> Dict[str, Any]:
+    """A real-URI editorial grounding whose title NAMES the brand on a category
+    query — the honest endorsement shape. Post W1 site-8 cutover, endorsement
+    requires the source to name the brand (RunFacts T2), so a bare-host redirector
+    title no longer implies endorsement."""
+    run: Dict[str, Any] = {
+        "query": query,
+        "axis_metadata": {"axis": "category"},
+        "parsed": {"product_visible": True, "correct_sku": True},
+        "grounding_sources": [
+            {
+                "uri": f"https://www.{host}/reviews/{brand.lower()}-collagen",
+                "title": f"{brand} Collagen Review | {host}",
+            }
+        ],
+        "url_match": {"in_grounding": False},
+    }
+    if comps:
+        run["parsed"]["competitors_listed"] = comps
+    return run
+
+
 def _authority_map(raw_runs: List[Dict[str, Any]], *, host: str, brand: str) -> Dict[str, Any]:
     probe_runs = [{"provider": "gemini", "probe_run_id": "p", "raw_runs": raw_runs}]
     return build_authority_map(
@@ -73,8 +95,8 @@ def test_narrative_category_endorsement_and_named_competitors():
         [
             _run("buy Aruen", "aruen.com"),
             _run("Aruen for sale", "ebay.com"),
-            _run("best collagen supplement", "goodhousekeeping.com", "category",
-                 comps=["Vital Proteins", "Ancient Nutrition"]),
+            _editorial("best collagen supplement", "goodhousekeeping.com", "Aruen",
+                       comps=["Vital Proteins", "Ancient Nutrition"]),
         ],
         host="aruen.com",
         brand="Aruen",

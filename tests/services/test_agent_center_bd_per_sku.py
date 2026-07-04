@@ -1522,6 +1522,27 @@ def _redir_run(query: str, title: str, axis: str = "intent") -> Dict[str, Any]:
     }
 
 
+def _editorial_run(
+    query: str, host: str, brand: str, axis: str = "category"
+) -> Dict[str, Any]:
+    """A real-URI editorial grounding whose title NAMES the brand — the honest
+    endorsement shape. Post W1 site-8 cutover, endorsement requires the source
+    itself to name the brand (RunFacts T2), not merely a run-level correct_sku
+    flag; `_redir_run`'s bare-host titles no longer imply endorsement."""
+    return {
+        "query": query,
+        "axis_metadata": {"axis": axis, "source": "auto_generated", "sku_key": "sku-1"},
+        "parsed": {"product_visible": True, "correct_sku": True},
+        "grounding_sources": [
+            {
+                "uri": f"https://www.{host}/reviews/{brand.lower()}-collagen",
+                "title": f"{brand} Collagen Review | {host}",
+            }
+        ],
+        "url_match": {"in_grounding": False},
+    }
+
+
 def test_recommendation_class_axis():
     from services.cited_host_classifier import recommendation_class
 
@@ -1639,7 +1660,9 @@ def test_authority_map_separates_findability_from_endorsement():
                 _redir_run("Aruen collagen for sale", "ebay.com", "intent"),
                 _redir_run("shop Aruen collagen online", "desertcart.com", "intent"),
                 _redir_run("best price Aruen collagen", "gosupps.com", "price"),
-                _redir_run("best collagen supplement", "goodhousekeeping.com", "category"),
+                # Editorial that actually names the brand on a category query — the
+                # honest endorsement (post site-8 cutover: naming, not a run flag).
+                _editorial_run("best collagen supplement", "goodhousekeeping.com", "Aruen", "category"),
             ],
         }
     ]
@@ -1717,6 +1740,44 @@ def test_authority_map_own_listing_only_never_reads_as_recommended():
     assert sig["independently_recommended_for_category"] is False
     assert sig["surfaced_only_via_own_listing"] is True
     assert am["host_attribution_summary"]["surfaced_only_via_own_listing"] is True
+
+
+def test_authority_map_editorial_not_naming_brand_is_not_endorsement():
+    """W1 site-8 cutover — the over-attribution fix. Legacy credited EVERY host
+    cited in a run where the model self-reported correct_sku as 'naming the
+    merchant', so an editorial cited for the CATEGORY (never naming the brand)
+    read as an endorsement. RunFacts T2 requires the source itself to name the
+    brand: the own site is found, but the category editorial that doesn't name
+    Aruen is NOT an endorsement."""
+    from services.agent_center_bd_report_service import build_authority_map
+
+    probe_runs = [
+        {
+            "provider": "gemini",
+            "probe_run_id": "p",
+            "raw_runs": [
+                # Own site found on a branded query (correct_sku True) ...
+                _redir_run("buy Aruen collagen", "aruen.com", "intent"),
+                # ... and an editorial cited on the CATEGORY query whose grounding
+                # never names Aruen (bare-host title). Same run flag correct_sku,
+                # but no per-source brand mention.
+                _redir_run("best collagen supplement", "goodhousekeeping.com", "category"),
+            ],
+        }
+    ]
+    am = build_authority_map(
+        [{"sku_key": "sku-1", "product_key": "prod-1"}],
+        {"sku-1": probe_runs},
+        merchant_host="aruen.com",
+        merchant_brand="Aruen",
+    )
+    summary = am["host_attribution_summary"]
+    # goodhousekeeping is still classified an editorial host and surfaces as a
+    # "who AI cites instead" channel — it just isn't a merchant ENDORSEMENT.
+    assert summary["endorsement_hosts"] == []
+    assert summary["has_independent_endorsement"] is False
+    assert summary["independently_recommended_for_category"] is False
+    assert am["skus"][0]["citation_signals"]["endorsement_hosts"] == []
 
 
 def test_authority_map_without_merchant_identity_has_no_first_party():
