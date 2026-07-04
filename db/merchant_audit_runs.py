@@ -509,6 +509,41 @@ async def recent_completed_reports(*, limit: int = 100) -> List[Dict[str, Any]]:
     return out
 
 
+async def score_history_for_merchant(
+    *, merchant_id: str, limit: int = 50, subject_type: str = "merchant"
+) -> List[Dict[str, Any]]:
+    """Completed audit runs for one merchant, OLDEST-first, with the brand-level
+    score columns + report_jsonb (for basis + per-provider extraction) — for the W2
+    visibility-tracking series. Best-effort; [] on DB error."""
+    await ensure_merchant_audit_runs_table()
+    try:
+        rows = await database.fetch_all(
+            "SELECT run_id, requested_at, visibility_score_avg, attribution_score_avg, "
+            "category_visibility_score_avg, report_jsonb "
+            "FROM merchant_audit_runs "
+            "WHERE merchant_id = :mid AND subject_type = :st AND status = 'completed' "
+            "ORDER BY requested_at DESC LIMIT :lim",
+            {"mid": merchant_id, "st": subject_type, "lim": int(limit)},
+        )
+    except Exception as exc:
+        logger.warning(
+            "score_history_for_merchant failed for %s: %s", merchant_id, str(exc)[:200]
+        )
+        return []
+    out: List[Dict[str, Any]] = []
+    for r in reversed(rows or []):  # DESC fetch, reversed → oldest-first for charting
+        d = dict(r)
+        out.append({
+            "run_id": str(d.get("run_id")) if d.get("run_id") else None,
+            "requested_at": d.get("requested_at"),
+            "visibility": d.get("visibility_score_avg"),
+            "attribution": d.get("attribution_score_avg"),
+            "category_visibility": d.get("category_visibility_score_avg"),
+            "report_jsonb": _decode_jsonb_field(d.get("report_jsonb")),
+        })
+    return out
+
+
 async def completed_runs_in_window(*, window_seconds: int) -> List[Dict[str, Any]]:
     """Completed runs (merchant_id, run_id, requested_at, report_jsonb) in the
     trailing window, grouped by merchant + newest-first — for the W7 stability
