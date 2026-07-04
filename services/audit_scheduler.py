@@ -162,7 +162,10 @@ async def start_scheduler() -> None:
         # 05:00 UTC (after nightly_index_health). Min-sample-gated, so it surfaces
         # nothing until real transaction volume exists — a safe no-op pre-launch.
         from services.outcome_aggregation_service import refresh_all_outcomes
-        scheduler.add_job(
+        # _add_job (NOT scheduler.add_job) so staging — which shares prod's
+        # Postgres — does not double-fire this singleton cron. It used the raw
+        # add_job and slipped the env gate every other job respects.
+        _add_job(
             refresh_all_outcomes,
             "cron",
             hour=5,

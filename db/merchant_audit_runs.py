@@ -689,10 +689,10 @@ async def enqueue_audit_run_with_replay(
     await ensure_merchant_audit_runs_table()
     run_id = str(uuid.uuid4())
     now = _now_utc()
-    partial_result_jsonb = (
-        _json_safe(request_options_jsonb)
-        if isinstance(request_options_jsonb, dict) else None
-    )
+    # Single line so the _json_safe coercion is visible on the assignment (the
+    # jsonb-write meta-invariant is a line-grep; the value flows into .values()
+    # below already coerced).
+    partial_result_jsonb = _json_safe(request_options_jsonb) if isinstance(request_options_jsonb, dict) else None
 
     # If no idempotency_key, fall through to the original behavior —
     # no dedupe possible.
