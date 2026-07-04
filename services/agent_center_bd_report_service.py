@@ -4776,11 +4776,18 @@ def _citation_by_intent(per_prompt: Any) -> Dict[str, Dict[str, Any]]:
     return buckets
 
 
+def _channel_query_key(query: Any) -> str:
+    """Whitespace-collapsed lowercase query key — matches sku_opportunity's
+    `_norm_query` so per_prompt rows and RunFacts prompt groups join cleanly."""
+    return re.sub(r"\s+", " ", str(query or "").strip().lower())
+
+
 def build_channel_appearance(
     *,
     per_prompt: Optional[List[Dict[str, Any]]],
     merchant_host: Optional[str],
     retail_channel_host: Optional[str] = None,
+    own_cited_by_query: Optional[Mapping[str, bool]] = None,
 ) -> Dict[str, Any]:
     """Per-product channel-by-channel appearance: across the probed queries, WHERE
     the brand's product shows up in AI answers — the brand's own site vs each
@@ -4788,6 +4795,15 @@ def build_channel_appearance(
     product; cited third-party hosts are CHANNELS (distribution), not the
     product's identity. Reuses each per_prompt row's cited-host evidence
     (`source_summary.top_cited_hosts` + `merchant_cited_runs`) — no new probes.
+
+    `own_cited_by_query` (W1 site-5 fix, 2026-07-04): per-prompt T1 flags from
+    the RunFacts source walk, keyed by `_channel_query_key`. When provided it is
+    the source of truth for the own-site row. The legacy fallback — scanning
+    `top_cited_hosts` for the own domain — UNDERCOUNTS T1, because that list is
+    `extract_cited_hosts`' COMPETITOR rollup: an own-domain source whose label
+    names the brand is routed to the merchant bucket and never appears there
+    (the "Your site 0/14 next to a cited-everywhere headline" contradiction,
+    measured on the 2026-07-04 DamDam run as 0/14 displayed vs 13/14 true).
 
     Returns {total_queries, own_site_host, own_site_cited(_count), channels[]}
     where each channel is {host, type, type_label, is_own_site, is_your_listing,
@@ -4812,7 +4828,13 @@ def build_channel_appearance(
         # actual cited source hosts for this query? (NOT merchant_cited_runs,
         # which is the softer "brand was named somewhere" signal — a retailer
         # page citing the brand is distribution, not the brand's own page.)
-        own_cited_here = False
+        # Source-walk facts win when supplied; the top_cited_hosts scan below
+        # only fills in for legacy callers (see docstring).
+        own_cited_here = (
+            bool(own_cited_by_query.get(_channel_query_key(q), False))
+            if own_cited_by_query is not None
+            else False
+        )
         for h in (ss.get("top_cited_hosts") or []):
             raw = h.get("host") if isinstance(h, dict) else h
             host = normalize_host(raw)
@@ -6443,6 +6465,23 @@ async def build_per_sku_report(
     if sku_ctx.get("synthetic_url_audit"):
         _seed_pk, _seed_ck = _url_audit_seed_report_identity(merchant_id, product, sku_ctx)
 
+    # W1 site-5 fix (2026-07-04): the channels table's own-site row reads the
+    # RunFacts source walk, not top_cited_hosts (a competitor rollup that drops
+    # own-domain sources whose label names the brand — it displayed
+    # "Your site 0/14" while the own page was cited on 13/14 prompts).
+    _channel_own_host = normalize_host(
+        product.get("canonical_url") or product.get("pdp_url")
+    )
+    _channel_own_map: Dict[str, bool] = {}
+    if _channel_own_host:
+        _channel_own_map = {
+            _channel_query_key(p.query): p.own_url_cited
+            for p in compute_run_facts(
+                _flatten_probe_runs(probe_runs),
+                merchant_host=_channel_own_host,
+            ).prompts
+        }
+
     report = {
         "sku_key": sku_key,
         "product_key": _seed_pk or sku_ctx.get("product_key") or product.get("product_key"),
@@ -6491,8 +6530,9 @@ async def build_per_sku_report(
         # channels-as-context (not "the retailer is you"). Reuses per_prompt.
         "channel_appearance": build_channel_appearance(
             per_prompt=opportunity.get("per_prompt") if isinstance(opportunity, dict) else None,
-            merchant_host=normalize_host(product.get("canonical_url") or product.get("pdp_url")),
+            merchant_host=_channel_own_host,
             retail_channel_host=product.get("retail_channel_host"),
+            own_cited_by_query=_channel_own_map or None,
         ),
         # Per-ENGINE operating plan: Gemini (Google index) and ChatGPT (Bing +
         # Reddit/community) cite different sources, so the moves to win each
@@ -6502,8 +6542,9 @@ async def build_per_sku_report(
             per_prompt=opportunity.get("per_prompt") if isinstance(opportunity, dict) else None,
             channel_appearance=build_channel_appearance(
                 per_prompt=opportunity.get("per_prompt") if isinstance(opportunity, dict) else None,
-                merchant_host=normalize_host(product.get("canonical_url") or product.get("pdp_url")),
+                merchant_host=_channel_own_host,
                 retail_channel_host=product.get("retail_channel_host"),
+                own_cited_by_query=_channel_own_map or None,
             ),
         ),
         "failing_prompts": failing_prompts,
@@ -6538,30 +6579,10 @@ async def build_per_sku_report(
     }
     if checkout_handoff:
         report["checkout_handoff"] = checkout_handoff
-    # W1 sites 5 + 6 — phase-1 parity over the assembled per-SKU report.
+    # W1 site 6 — phase-1 parity over the assembled per-SKU report. (Site 5's
+    # measure was retired 2026-07-04 when the own-site row was REWIRED to the
+    # RunFacts source walk above — the measured undercount is fixed at source.)
     try:
-        # Site 5 (measure): channel_appearance's own-site count reads
-        # source_summary.top_cited_hosts — a COMPETITOR rollup that drops
-        # own-domain sources whose label names the brand — so "Your site N/M"
-        # can undercount T1. Recompute T1 with the SAME host identity
-        # channel_appearance used (host only, no brand: isolates the own-URL
-        # dimension) to quantify that undercount.
-        _ca = report.get("channel_appearance") or {}
-        if _ca.get("own_site_host"):
-            _ca_facts = compute_run_facts(
-                _flatten_probe_runs(probe_runs),
-                merchant_host=_ca.get("own_site_host"),
-            )
-            parity_measure(
-                "bd_report.build_channel_appearance.own_site_cited",
-                _ca.get("own_site_cited_count"),
-                sum(1 for p in _ca_facts.prompts if p.own_url_cited),
-                context={
-                    "sku_key": sku_key,
-                    "total_queries": _ca.get("total_queries"),
-                    "prompt_count": len(_ca_facts.prompts),
-                },
-            )
         # Site 6 (drift): citation_by_intent is a pure view over the per-prompt
         # source_summary — its cited total must equal the rows it viewed.
         _per_prompt_rows = [
@@ -6586,7 +6607,7 @@ async def build_per_sku_report(
             context={"sku_key": sku_key},
         )
     except Exception:  # noqa: BLE001 — parity must never sink the report
-        logger.warning("run_facts parity (sites 5/6) failed", exc_info=True)
+        logger.warning("run_facts parity (site 6) failed", exc_info=True)
     return report
 
 
