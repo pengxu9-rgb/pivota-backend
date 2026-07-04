@@ -97,7 +97,15 @@ async def synthesize(
     provider: str,
     model: str,
     max_tokens: int = 1200,
+    response_schema: Optional[Mapping[str, Any]] = None,
 ) -> Dict[str, Any]:
+    """Ungrounded JSON synthesis. `response_schema` (W3b), when supplied, is a
+    JSON-Schema the provider enforces at the API layer so the SHAPE is
+    guaranteed, not parsed-and-hoped: Gemini `responseSchema`, OpenAI
+    `response_format: json_schema`. DeepSeek/Anthropic have no native schema
+    mode, so there the schema is advisory (prompt + downstream validation);
+    pass a Gemini/OpenAI-compatible schema (OpenAPI subset, no
+    additionalProperties) when you rely on enforcement."""
     canonical = normalize_provider(provider)
     selected_model = str(model or default_model_for_provider(canonical)).strip()
     if not selected_model:
@@ -119,6 +127,7 @@ async def synthesize(
             user=user,
             model=selected_model,
             max_tokens=max_tokens,
+            response_schema=response_schema,
         )
     return await _call_openai_compatible_chat(
         system=system,
@@ -126,6 +135,7 @@ async def synthesize(
         provider=canonical,
         model=selected_model,
         max_tokens=max_tokens,
+        response_schema=response_schema,
     )
 
 
@@ -136,6 +146,7 @@ async def _call_openai_compatible_chat(
     provider: str,
     model: str,
     max_tokens: int,
+    response_schema: Optional[Mapping[str, Any]] = None,
 ) -> Dict[str, Any]:
     if provider == "deepseek":
         api_key = settings.deepseek_api_key
@@ -154,13 +165,26 @@ async def _call_openai_compatible_chat(
             provider=provider,
         )
 
+    # OpenAI enforces a JSON Schema natively (json_schema response format);
+    # DeepSeek supports only json_object, so there the schema is advisory.
+    if response_schema and provider == "openai":
+        response_format: Dict[str, Any] = {
+            "type": "json_schema",
+            "json_schema": {
+                "name": "response",
+                "schema": dict(response_schema),
+                "strict": True,
+            },
+        }
+    else:
+        response_format = {"type": "json_object"}
     body: Dict[str, Any] = {
         "model": model,
         "messages": [
             {"role": "system", "content": system},
             {"role": "user", "content": user},
         ],
-        "response_format": {"type": "json_object"},
+        "response_format": response_format,
         "temperature": 0.2,
         "max_tokens": int(max_tokens),
     }
@@ -238,6 +262,7 @@ async def _call_gemini_generate_content(
     user: str,
     model: str,
     max_tokens: int,
+    response_schema: Optional[Mapping[str, Any]] = None,
 ) -> Dict[str, Any]:
     api_key = settings.gemini_api_key
     if not api_key:
@@ -245,25 +270,29 @@ async def _call_gemini_generate_content(
             "gemini API key is not configured",
             provider="gemini",
         )
+    generation_config: Dict[str, Any] = {
+        "temperature": 0.2,
+        "maxOutputTokens": int(max_tokens),
+        # JSON mime type supports top-level arrays (unlike OpenAI's
+        # json_object mode) — callers like extract_winnable_prompts ask
+        # for a bare JSON array.
+        "responseMimeType": "application/json",
+        # Gemini 2.5 models spend maxOutputTokens on internal "thinking"
+        # by default; with small caps (e.g. 400 for winnable prompts) the
+        # thoughts consume the whole budget and the actual answer arrives
+        # truncated to a fragment (prod run 370dde30: raw len 9 and 31 →
+        # EMPTY prompts, audit degraded to branded-only). Disable thinking:
+        # these are cheap extraction tasks, and this is also the fast/cheap
+        # behavior the flash tier is chosen for.
+        "thinkingConfig": {"thinkingBudget": 0},
+    }
+    # W3b: enforce the response SHAPE at the API when a schema is supplied.
+    if response_schema:
+        generation_config["responseSchema"] = dict(response_schema)
     body: Dict[str, Any] = {
         "system_instruction": {"parts": [{"text": system}]},
         "contents": [{"role": "user", "parts": [{"text": user}]}],
-        "generationConfig": {
-            "temperature": 0.2,
-            "maxOutputTokens": int(max_tokens),
-            # JSON mime type supports top-level arrays (unlike OpenAI's
-            # json_object mode) — callers like extract_winnable_prompts ask
-            # for a bare JSON array.
-            "responseMimeType": "application/json",
-            # Gemini 2.5 models spend maxOutputTokens on internal "thinking"
-            # by default; with small caps (e.g. 400 for winnable prompts) the
-            # thoughts consume the whole budget and the actual answer arrives
-            # truncated to a fragment (prod run 370dde30: raw len 9 and 31 →
-            # EMPTY prompts, audit degraded to branded-only). Disable thinking:
-            # these are cheap extraction tasks, and this is also the fast/cheap
-            # behavior the flash tier is chosen for.
-            "thinkingConfig": {"thinkingBudget": 0},
-        },
+        "generationConfig": generation_config,
     }
     headers = {
         "Content-Type": "application/json",

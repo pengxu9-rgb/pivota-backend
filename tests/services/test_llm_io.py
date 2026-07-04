@@ -164,3 +164,126 @@ def test_no_new_raw_llm_json_parsers():
         "New local LLM-JSON parser(s) — route through services/llm_io "
         f"(parse_llm_json/parse_llm_object/parse_llm_str_array): {offenders}"
     )
+
+
+# ---- W3b: generate_structured (schema enforcement + one targeted repair) ------
+
+import services.llm_io as llm_io
+
+
+class _FakeSynth:
+    """Records synthesize() calls and replays scripted responses in order."""
+
+    def __init__(self, responses):
+        self._responses = list(responses)
+        self.calls = []
+
+    async def __call__(self, *, system, user, provider, model, max_tokens,
+                       response_schema=None):
+        self.calls.append({"user": user, "response_schema": response_schema})
+        if isinstance(self._responses[0], Exception):
+            raise self._responses.pop(0)
+        return {"text": self._responses.pop(0)}
+
+
+def _patch_synth(monkeypatch, responses):
+    import services.llm_synthesis as synth_mod
+    fake = _FakeSynth(responses)
+    monkeypatch.setattr(synth_mod, "synthesize", fake)
+    return fake
+
+
+@pytest.mark.asyncio
+async def test_structured_ok_first_try(monkeypatch):
+    fake = _patch_synth(monkeypatch, ['{"a": 1}'])
+    res = await llm_io.generate_structured(
+        system="s", user="u", provider="gemini",
+        schema={"type": "object"}, expect="object",
+    )
+    assert res.outcome == "ok" and res.ok
+    assert res.value == {"a": 1}
+    assert res.violations == []
+    # the schema reached the provider
+    assert fake.calls[0]["response_schema"] == {"type": "object"}
+    assert len(fake.calls) == 1  # no repair needed
+
+
+@pytest.mark.asyncio
+async def test_structured_repairs_on_validation_failure(monkeypatch):
+    fake = _patch_synth(monkeypatch, ['{"a": 1}', '{"a": 1, "b": 2}'])
+
+    def needs_b(value):
+        return [] if "b" in value else ["missing required key 'b'"]
+
+    res = await llm_io.generate_structured(
+        system="s", user="draft the thing", provider="openai",
+        validate=needs_b, expect="object",
+    )
+    assert res.outcome == "repaired" and res.ok
+    assert res.value == {"a": 1, "b": 2}
+    assert len(fake.calls) == 2
+    # the repair retry fed the SPECIFIC violation back
+    assert "missing required key 'b'" in fake.calls[1]["user"]
+    assert "draft the thing" in fake.calls[1]["user"]  # original preserved
+
+
+@pytest.mark.asyncio
+async def test_structured_fails_honestly_after_repair(monkeypatch):
+    # both attempts violate -> failed (not a silent fallback)
+    fake = _patch_synth(monkeypatch, ['{"a": 1}', '{"a": 1}'])
+    res = await llm_io.generate_structured(
+        system="s", user="u", provider="deepseek",
+        validate=lambda v: ["still wrong"], expect="object",
+    )
+    assert res.outcome == "failed" and not res.ok
+    assert res.violations == ["still wrong"]
+    assert len(fake.calls) == 2
+
+
+@pytest.mark.asyncio
+async def test_structured_unparseable_triggers_repair(monkeypatch):
+    fake = _patch_synth(monkeypatch, ["not json", '{"a": 1}'])
+    res = await llm_io.generate_structured(
+        system="s", user="u", provider="gemini", expect="object",
+    )
+    assert res.outcome == "repaired"
+    assert res.value == {"a": 1}
+    assert "not valid JSON" in fake.calls[1]["user"]
+
+
+@pytest.mark.asyncio
+async def test_structured_no_repair_flag(monkeypatch):
+    fake = _patch_synth(monkeypatch, ["garbage"])
+    res = await llm_io.generate_structured(
+        system="s", user="u", provider="gemini", expect="object", repair=False,
+    )
+    assert res.outcome == "failed"
+    assert len(fake.calls) == 1  # no retry when repair disabled
+
+
+@pytest.mark.asyncio
+async def test_structured_provider_error_never_raises(monkeypatch):
+    from services.llm_synthesis import LLMSynthesisError
+    _patch_synth(monkeypatch, [LLMSynthesisError("boom", provider="gemini")])
+    res = await llm_io.generate_structured(
+        system="s", user="u", provider="gemini", expect="object",
+    )
+    assert res.outcome == "error" and not res.ok
+    assert res.value is None
+    assert "boom" in (res.error or "")
+
+
+@pytest.mark.asyncio
+async def test_structured_bad_validator_does_not_crash(monkeypatch):
+    _patch_synth(monkeypatch, ['{"a": 1}'])
+
+    def exploding(value):
+        raise RuntimeError("validator bug")
+
+    res = await llm_io.generate_structured(
+        system="s", user="u", provider="gemini", validate=exploding,
+        expect="object",
+    )
+    # a broken validator is treated as no-violation, not a crash
+    assert res.outcome == "ok"
+    assert res.value == {"a": 1}

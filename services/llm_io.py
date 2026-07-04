@@ -23,9 +23,14 @@ import json
 import logging
 import re
 from collections import Counter
-from typing import Any, Dict, List, Optional
+from dataclasses import dataclass, field
+from typing import Any, Awaitable, Callable, Dict, List, Mapping, Optional
 
 logger = logging.getLogger(__name__)
+
+# A caller-supplied semantic validator: returns the list of violations (empty =
+# valid). This is what a repair retry feeds back to the model, verbatim.
+Validator = Callable[[Any], List[str]]
 
 # Leading/trailing markdown code fence (```json … ``` or ``` … ```), tolerant of
 # an unterminated closing fence — the exact shape that truncation leaks.
@@ -174,3 +179,124 @@ def parse_llm_str_array(
     if not isinstance(result, list):
         return []
     return [item for item in result if isinstance(item, str)]
+
+
+# ---------------------------------------------------------------------------
+# W3b — structured generation with schema enforcement + one targeted repair.
+# ---------------------------------------------------------------------------
+@dataclass
+class StructuredResult:
+    """Outcome of a structured LLM call.
+
+    outcome:
+      - "ok"       first response parsed + validated clean
+      - "repaired" invalid first response, the one repair retry fixed it
+      - "failed"   still invalid after repair (or repair disabled) — value may
+                   be a parsed-but-invalid object, or None if unparseable
+      - "error"    provider/transport failure (no usable response at all)
+    A caller acts on outcome, never on presence of `value` alone. This is the
+    honest-failure primitive W4 builds its no-fallback synthesis on.
+    """
+
+    value: Optional[Any]
+    outcome: str
+    violations: List[str] = field(default_factory=list)
+    raw_text: str = ""
+    error: Optional[str] = None
+
+    @property
+    def ok(self) -> bool:
+        return self.outcome in ("ok", "repaired")
+
+
+def _repair_user_message(user: str, violations: List[str]) -> str:
+    bullets = "\n".join(f"- {v}" for v in violations if v)
+    return (
+        f"{user}\n\n"
+        "Your previous response had these problems:\n"
+        f"{bullets}\n\n"
+        "Return ONLY corrected JSON that fixes every problem above. No prose, "
+        "no code fences."
+    )
+
+
+def _validate(value: Any, expect: str, validate: Optional[Validator]) -> List[str]:
+    if value is None:
+        return [f"the response was not valid JSON of the expected shape ({expect})"]
+    if validate is None:
+        return []
+    try:
+        return [str(v) for v in (validate(value) or []) if v]
+    except Exception as exc:  # noqa: BLE001 — a bad validator must not crash the call
+        logger.warning("llm_io validator raised: %s", exc, exc_info=True)
+        return []
+
+
+async def generate_structured(
+    *,
+    system: str,
+    user: str,
+    provider: str,
+    model: str = "",
+    schema: Optional[Mapping[str, Any]] = None,
+    validate: Optional[Validator] = None,
+    expect: str = "object",
+    max_tokens: int = 1200,
+    repair: bool = True,
+    label: Optional[str] = None,
+) -> StructuredResult:
+    """Generate JSON from an LLM with the shape enforced at the API (when the
+    provider supports `schema`) AND verified after: parse tolerantly, run the
+    caller's `validate`, and on any violation make ONE targeted repair retry
+    that feeds the specific violations back to the model. Never raises — returns
+    a StructuredResult whose `outcome` the caller acts on.
+
+    This replaces the "generate → validate → fall back to a deterministic
+    template" pattern with "generate → validate → targeted repair → honest
+    failure": prevention (schema) + a specific second chance, not a blind
+    regenerate loop.
+    """
+    from services.llm_synthesis import LLMSynthesisError, synthesize
+
+    async def _call(message: str) -> Dict[str, Any]:
+        return await synthesize(
+            system=system, user=message, provider=provider, model=model,
+            max_tokens=max_tokens, response_schema=schema,
+        )
+
+    lbl = label or "structured"
+    try:
+        first = await _call(user)
+    except LLMSynthesisError as exc:
+        _record("error", lbl)
+        return StructuredResult(None, "error", raw_text="", error=str(exc))
+
+    raw = str(first.get("text") or "")
+    value = parse_llm_json(raw, expect=expect, label=label)
+    violations = _validate(value, expect, validate)
+    if not violations:
+        _record("ok", f"{lbl}:structured")
+        return StructuredResult(value, "ok", raw_text=raw)
+    if not repair:
+        _record("failed", f"{lbl}:structured")
+        return StructuredResult(value, "failed", violations=violations, raw_text=raw)
+
+    # One targeted repair — feed the specific violations back.
+    try:
+        second = await _call(_repair_user_message(user, violations))
+    except LLMSynthesisError as exc:
+        _record("failed", f"{lbl}:structured")
+        return StructuredResult(value, "failed", violations=violations,
+                                raw_text=raw, error=str(exc))
+    raw2 = str(second.get("text") or "")
+    value2 = parse_llm_json(raw2, expect=expect, label=label)
+    violations2 = _validate(value2, expect, validate)
+    if not violations2:
+        _record("repaired", f"{lbl}:structured")
+        return StructuredResult(value2, "repaired", raw_text=raw2)
+    _record("failed", f"{lbl}:structured")
+    logger.info(
+        "generate_structured failed after repair (label=%s): %s",
+        lbl, "; ".join(violations2)[:300],
+    )
+    return StructuredResult(value2, "failed", violations=violations2, raw_text=raw2)
