@@ -274,6 +274,38 @@ async def get_psp_list(current_user: dict = Depends(require_admin)):
 # Agent ranking configuration (CQ/MR thresholds & weights)
 # ============================================================================
 
+@router.get("/runfacts-parity")
+async def get_runfacts_parity(current_user: dict = Depends(require_admin)):
+    """W1 cutover gate: per-site RunFacts-vs-legacy drift since this worker
+    started. For each legacy citedness site — how many times it ran (`checks`),
+    how often the legacy number disagreed with RunFacts (`drifts` / `drift_rate`),
+    and the last disagreeing sample. A Type-B (number-changing) site with a low,
+    understood drift_rate is safe to cut over; a surprising one is not. This
+    surfaces the drift the RUNFACTS_PARITY_* logs emit but the host doesn't show.
+    Resets on deploy — it's a recent-traffic signal, not a ledger."""
+    from services.audit_facts import LEGACY_CITEDNESS_SITES, parity_stats_snapshot
+
+    snapshot = parity_stats_snapshot()
+    return {
+        "status": "success",
+        "note": (
+            "Per-site drift since worker start (resets on deploy). drift_rate=0 "
+            "on a Type-A site → cut over freely; review the last_drift sample + "
+            "rate on a Type-B site before flipping."
+        ),
+        "sites": snapshot,
+        # The intended mode per site (check = expect-equal / Type-A;
+        # measure = definition differs / Type-B) so the reader knows which
+        # drift is a bug vs. an expected correction.
+        "registry": [
+            {"site": s.get("site"), "mode": s.get("mode"), "tier": s.get("tier"),
+             "rewired": bool(s.get("rewired"))}
+            for s in LEGACY_CITEDNESS_SITES
+            if isinstance(s, dict)
+        ],
+    }
+
+
 @router.get("/agent-ranking/config")
 async def get_agent_ranking_config(current_user: dict = Depends(require_admin)):
     """

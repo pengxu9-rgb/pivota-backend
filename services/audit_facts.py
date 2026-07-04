@@ -732,6 +732,53 @@ LEGACY_CITEDNESS_SITES: Tuple[Dict[str, Any], ...] = (
 )
 
 
+# In-process parity rollup. The cutover's safety gate is "review the drift
+# distribution per site before flipping a Type-B (number-changing) site" — but
+# the RUNFACTS_PARITY_* logs go to a logger the prod host doesn't surface, so
+# that gate was unobservable. This aggregator makes it queryable via
+# GET /admin/runfacts-parity: per site, how many times it ran, how often legacy
+# and RunFacts DISAGREED, and the last disagreeing sample. Bounded, cheap,
+# never blocks a report. Resets on process restart (a recent-traffic signal,
+# not an audit ledger).
+_PARITY_STATS: Dict[str, Dict[str, Any]] = {}
+
+
+def _record_parity(site: str, legacy_value: Any, facts_value: Any, equal: bool) -> None:
+    try:
+        row = _PARITY_STATS.get(site)
+        if row is None:
+            row = {"checks": 0, "drifts": 0, "last_drift": None}
+            _PARITY_STATS[site] = row
+        row["checks"] += 1
+        if not equal:
+            row["drifts"] += 1
+            # Keep only a small string sample so this never grows unbounded.
+            row["last_drift"] = {
+                "legacy": repr(legacy_value)[:120],
+                "run_facts": repr(facts_value)[:120],
+            }
+    except Exception:  # noqa: BLE001 — telemetry must never break a report
+        pass
+
+
+def parity_stats_snapshot() -> Dict[str, Dict[str, Any]]:
+    """Per-site parity rollup since process start: {site: {checks, drifts,
+    drift_rate, last_drift}}. Drives GET /admin/runfacts-parity so the founder
+    can SEE each site's drift distribution before signing off a Type-B cutover
+    (the drift the logs emit but the host doesn't surface)."""
+    out: Dict[str, Dict[str, Any]] = {}
+    for site, row in _PARITY_STATS.items():
+        checks = int(row.get("checks") or 0)
+        drifts = int(row.get("drifts") or 0)
+        out[site] = {
+            "checks": checks,
+            "drifts": drifts,
+            "drift_rate": round(drifts / checks, 4) if checks else 0.0,
+            "last_drift": row.get("last_drift"),
+        }
+    return out
+
+
 def parity_check(
     site: str,
     legacy_value: Any,
@@ -743,12 +790,13 @@ def parity_check(
     the RunFacts value and WARN (log-only, never raises, never changes the
     returned number) on drift. Returns True when the values agree.
 
-    Grep target: ``RUNFACTS_PARITY_DRIFT``. A week of drift-free logs on a
-    site is the evidence that lets phase 2 rewire it to RunFacts and delete
-    the legacy path.
+    Grep target: ``RUNFACTS_PARITY_DRIFT``; queryable via parity_stats_snapshot.
+    A drift-free window on a site is the evidence that lets phase 2 rewire it to
+    RunFacts and delete the legacy path.
     """
     try:
         equal = legacy_value == facts_value
+        _record_parity(site, legacy_value, facts_value, equal)
         if not equal:
             logger.warning(
                 "RUNFACTS_PARITY_DRIFT site=%s legacy=%r run_facts=%r context=%s",
@@ -773,19 +821,22 @@ def parity_measure(
     """Phase-1 gap measurement for sites whose legacy definition intentionally
     differs from the decision-sheet target tier (mode="measure" in
     :data:`LEGACY_CITEDNESS_SITES`). Unlike :func:`parity_check` this is NOT an
-    alarm: it logs at INFO on every computation — agreement included — so the
-    week's logs give the founder the actual drift distribution behind each
-    displayed-number change before signing off the cutover.
+    alarm: it records every computation — agreement included — so the drift
+    distribution behind each displayed-number change is visible (via
+    parity_stats_snapshot / GET /admin/runfacts-parity) before the founder signs
+    off the cutover.
 
     Grep target: ``RUNFACTS_PARITY_MEASURE``.
     """
     try:
+        equal = legacy_value == facts_value
+        _record_parity(site, legacy_value, facts_value, equal)
         logger.info(
             "RUNFACTS_PARITY_MEASURE site=%s legacy=%r run_facts=%r equal=%s context=%s",
             site,
             legacy_value,
             facts_value,
-            legacy_value == facts_value,
+            equal,
             dict(context) if context else {},
         )
     except Exception:  # noqa: BLE001 — measurement must never break a report
