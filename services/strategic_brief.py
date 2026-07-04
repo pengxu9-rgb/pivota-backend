@@ -874,12 +874,106 @@ def assemble_sku_brief_evidence(
     }
 
 
+def _licensed_entity_manifest(evidence: Mapping[str, Any]) -> Dict[str, List[str]]:
+    """W4 closed-world manifest: the proper-noun entities the brief is LICENSED
+    to name, extracted from the same evidence the grounding validator checks.
+
+    Making the allowlist explicit up front (competitors / sources / lanes /
+    merchant identity) makes fabrication structurally hard — the model names
+    from a set instead of inventing, and the validator becomes a backstop, not
+    the primary defense. Deduped, order-preserving, capped so the prompt stays
+    lean; empty lists are fine (an absent category just isn't licensed)."""
+
+    def _uniq(values: List[str], *, cap: int) -> List[str]:
+        out: List[str] = []
+        seen: Set[str] = set()
+        for value in values:
+            text = _clean_str(value)
+            key = text.lower()
+            if text and key not in seen:
+                seen.add(key)
+                out.append(text)
+            if len(out) >= cap:
+                break
+        return out
+
+    product = _as_mapping(evidence.get("product"))
+    battle = _as_mapping(evidence.get("category_battle"))
+    substitution = _as_mapping(evidence.get("substitution"))
+    grounding = _as_mapping(evidence.get("grounding_notes"))
+    comp_attrs = _as_mapping(grounding.get("competitor_attributes"))
+
+    competitors: List[str] = list(_as_str_list(battle.get("winners")))
+    for answer in _as_list(evidence.get("category_answers")):
+        if isinstance(answer, Mapping):
+            competitors += _as_str_list(answer.get("recommends"))
+    if substitution.get("handed_to"):
+        competitors.append(_clean_str(substitution.get("handed_to")))
+    if _clean_str(comp_attrs.get("status")).lower() == "assessed" and comp_attrs.get("competitor"):
+        competitors.append(_clean_str(comp_attrs.get("competitor")))
+
+    sources: List[str] = []
+    for ranked in _as_list(battle.get("ranked_by")):
+        if isinstance(ranked, Mapping) and ranked.get("host"):
+            sources.append(_clean_str(ranked.get("host")))
+    for answer in _as_list(evidence.get("category_answers")):
+        if isinstance(answer, Mapping):
+            sources += _as_str_list(answer.get("cited_sources"))
+    for chan in _as_list(grounding.get("evidenced_channels")):
+        if isinstance(chan, Mapping) and chan.get("host"):
+            sources.append(_clean_str(chan.get("host")))
+    for lane in _as_list(evidence.get("channel_map")):
+        if isinstance(lane, Mapping):
+            for controller in _as_list(lane.get("controlled_by")):
+                if isinstance(controller, Mapping) and controller.get("host"):
+                    sources.append(_clean_str(controller.get("host")))
+
+    lanes: List[str] = list(_as_str_list(battle.get("prompts")))
+    for lane in _as_list(evidence.get("open_lanes")):
+        if isinstance(lane, Mapping) and lane.get("query"):
+            lanes.append(_clean_str(lane.get("query")))
+
+    merchant: List[str] = []
+    for key in ("brand", "title", "merchant_host"):
+        if product.get(key):
+            merchant.append(_clean_str(product.get(key)))
+
+    return {
+        "competitors": _uniq(competitors, cap=12),
+        "sources": _uniq(sources, cap=12),
+        "lanes": _uniq(lanes, cap=14),
+        "merchant": _uniq(merchant, cap=4),
+    }
+
+
+def _render_entity_manifest(manifest: Mapping[str, List[str]]) -> str:
+    def _line(label: str, values: List[str]) -> str:
+        return f"- {label}: " + (", ".join(values) if values else "(none in evidence)")
+
+    return (
+        "LICENSED ENTITIES — you may name ONLY the proper nouns below (they are "
+        "the entities present in EVIDENCE). Naming any competitor brand, source "
+        "site, or search lane NOT in these lists is a fabrication and will be "
+        "rejected. Generic references ('the relevant communities', 'your own "
+        "page') are always allowed.\n"
+        + _line("Competitor brands you may name", manifest.get("competitors", []))
+        + "\n"
+        + _line("Source sites/domains you may name", manifest.get("sources", []))
+        + "\n"
+        + _line("Search lanes you may reference (use this wording)", manifest.get("lanes", []))
+        + "\n"
+        + _line("The merchant's own brand/site", manifest.get("merchant", []))
+    )
+
+
 def build_sku_brief_prompt(evidence: Mapping[str, Any]) -> Tuple[str, str]:
-    user = "EVIDENCE:\n" + json.dumps(
-        evidence,
-        ensure_ascii=False,
-        indent=2,
-        sort_keys=True,
+    # W4: lead with the closed-world manifest so the model names from an
+    # explicit allowlist, then the full evidence for the reasoning substrate.
+    manifest = _render_entity_manifest(_licensed_entity_manifest(evidence))
+    user = (
+        manifest
+        + "\n\nEVIDENCE:\n"
+        + json.dumps(evidence, ensure_ascii=False, indent=2, sort_keys=True)
     )
     return _STRATEGIC_BRIEF_SYSTEM_PROMPT, user
 
@@ -963,13 +1057,19 @@ async def generate_sku_strategic_brief(
         except LLMSynthesisError as exc:
             att["error"] = f"{type(exc).__name__}: {exc}"[:300]
             dbg["attempts"].append(att)
-            dbg["outcome"] = "deterministic_after_llm_error"
-            return _validated_deterministic_brief(evidence, dbg=dbg)
+            # W4: honest failure — no deterministic template. The brief is one
+            # section of an otherwise-complete report (metered at the run level,
+            # W6), so a failed brief means the section is absent, not that the
+            # merchant got nothing. brief_status="unavailable" downstream; the
+            # rest of the report ships. A thin template pretending to be
+            # analysis is exactly what this workstream removes.
+            dbg["outcome"] = "unavailable_llm_error"
+            return None
         except Exception as exc:  # noqa: BLE001 - capture any synth failure for diagnosis
             att["error"] = f"unexpected {type(exc).__name__}: {exc}"[:300]
             dbg["attempts"].append(att)
-            dbg["outcome"] = "deterministic_after_unexpected_error"
-            return _validated_deterministic_brief(evidence, dbg=dbg)
+            dbg["outcome"] = "unavailable_unexpected_error"
+            return None
         text = result.get("text") or ""
         att["text_len"] = len(text)
         att["finish_reason"] = result.get("finish_reason")
@@ -1011,12 +1111,16 @@ async def generate_sku_strategic_brief(
         user = f"{base_user}\n\n{_grounding_repair_hint(sf)}"
     if best_grounded_brief is not None:
         # Exhausted retries but we DID get a grounded LLM draft — ship it (jargon
-        # scrubbed) rather than dropping the merchant to the deterministic brief.
+        # scrubbed). A grounded-but-style-imperfect real brief is the main line.
         dbg["outcome"] = "llm"
         dbg["style_imperfect"] = True
         return _scrub_merchant_jargon(best_grounded_brief)
-    dbg["outcome"] = "deterministic_after_rejects"
-    return _validated_deterministic_brief(evidence, dbg=dbg)
+    # W4: every attempt failed grounding/shape — honest absence, no template.
+    # The closed-world manifest makes this rare; when it happens the section is
+    # withheld and brief_status reflects it, rather than shipping a generic
+    # deterministic brief that reads as bespoke analysis it isn't.
+    dbg["outcome"] = "unavailable_after_rejects"
+    return None
 
 
 def _is_retryable_synthesis_error(exc: LLMSynthesisError) -> bool:

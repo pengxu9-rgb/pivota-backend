@@ -795,7 +795,9 @@ def test_build_sku_brief_prompt_uses_exact_role_and_injects_evidence_json():
     assert system.startswith("You are a senior D2C brand & growth strategist")
     assert "ABSOLUTE GROUNDING RULES" in system
     assert "WRITE the brief as JSON with these fields" in system
-    assert user.startswith("EVIDENCE:\n")
+    # W4: the closed-world entity manifest leads, then the full evidence JSON.
+    assert user.startswith("LICENSED ENTITIES")
+    assert "EVIDENCE:\n" in user
     assert json.loads(user.split("EVIDENCE:\n", 1)[1]) == evidence
 
 
@@ -1610,7 +1612,10 @@ async def test_generate_sku_strategic_brief_returns_grounded_mocked_brief(monkey
 
 
 @pytest.mark.asyncio
-async def test_generate_sku_strategic_brief_retries_then_returns_deterministic_fallback(monkeypatch):
+async def test_generate_sku_strategic_brief_every_draft_ungrounded_fails_honestly(monkeypatch):
+    # W4: when every draft fails grounding, there is NO deterministic template —
+    # the brief is withheld (None) so the section is honestly absent, not a
+    # generic template pretending to be bespoke analysis.
     monkeypatch.setattr(strategic_brief.settings, "strategic_brief_enabled", True)
     monkeypatch.setattr(strategic_brief.settings, "deepseek_api_key", "sk-test")
     calls: List[Mapping[str, Any]] = []
@@ -1631,15 +1636,14 @@ async def test_generate_sku_strategic_brief_retries_then_returns_deterministic_f
     dbg: Dict[str, Any] = {}
     brief = await strategic_brief.generate_sku_strategic_brief(_evidence(), debug=dbg)
 
-    assert brief is not None
-    assert dbg["outcome"].startswith("deterministic")
-    assert strategic_brief.validate_grounding(brief, _evidence()) is True
-    assert "first-order offer" in " ".join(brief["first_moves"])
+    assert brief is None
+    assert dbg["outcome"] == "unavailable_after_rejects"
     assert len(calls) == strategic_brief._STRATEGIC_BRIEF_MAX_ATTEMPTS
 
 
 @pytest.mark.asyncio
-async def test_generate_sku_strategic_brief_returns_fallback_on_synthesis_error(monkeypatch):
+async def test_generate_sku_strategic_brief_synthesis_error_fails_honestly(monkeypatch):
+    # W4: a provider error withholds the brief (None), no template fallback.
     from services.llm_synthesis import LLMSynthesisError
 
     monkeypatch.setattr(strategic_brief.settings, "strategic_brief_enabled", True)
@@ -1653,9 +1657,8 @@ async def test_generate_sku_strategic_brief_returns_fallback_on_synthesis_error(
     dbg: Dict[str, Any] = {}
     brief = await strategic_brief.generate_sku_strategic_brief(_evidence(), debug=dbg)
 
-    assert brief is not None
-    assert dbg["outcome"].startswith("deterministic")
-    assert strategic_brief.validate_grounding(brief, _evidence()) is True
+    assert brief is None
+    assert dbg["outcome"] == "unavailable_llm_error"
 
 
 @pytest.mark.asyncio
@@ -1699,8 +1702,8 @@ async def test_generate_sku_strategic_brief_retries_transient_error_then_returns
 
 @pytest.mark.asyncio
 async def test_generate_sku_strategic_brief_does_not_retry_fatal_http_error(monkeypatch):
-    """A non-retryable provider error (e.g. HTTP 400) falls back immediately
-    rather than burning retries."""
+    """A non-retryable provider error (e.g. HTTP 400) withholds the brief
+    immediately (W4: honest absence, no template) rather than burning retries."""
     from services.llm_synthesis import LLMSynthesisHTTPError
 
     monkeypatch.setattr(strategic_brief.settings, "strategic_brief_enabled", True)
@@ -1717,7 +1720,8 @@ async def test_generate_sku_strategic_brief_does_not_retry_fatal_http_error(monk
     dbg: Dict[str, Any] = {}
     brief = await strategic_brief.generate_sku_strategic_brief(_evidence(), debug=dbg)
 
-    assert dbg["outcome"].startswith("deterministic")
+    assert brief is None
+    assert dbg["outcome"] == "unavailable_llm_error"
     assert len(calls) == 1  # 400 is fatal — no retry
 
 
@@ -2307,3 +2311,32 @@ def test_resolve_brief_provider_defaults_gemini_then_falls_back(monkeypatch):
     # explicit provider override wins
     monkeypatch.setattr(sb, "configured_key_for_provider", lambda p: "k", raising=False)
     assert sb._resolve_brief_provider("anthropic") == "anthropic"
+
+
+# ---- W4: closed-world entity manifest --------------------------------------
+
+def test_licensed_entity_manifest_lists_evidence_entities_only():
+    evidence = _evidence()
+    manifest = strategic_brief._licensed_entity_manifest(evidence)
+    # real competitors from the evidence are licensed
+    assert "Vital Proteins" in manifest["competitors"]
+    # the merchant's own brand is licensed
+    assert any("BB Lab" in m for m in manifest["merchant"])
+    # a brand NOT in the evidence is not licensed (fabrication guard)
+    assert "Garden of Life" not in manifest["competitors"]
+    # sources are hosts present in evidence
+    assert all("." in s for s in manifest["sources"])
+
+
+def test_rendered_manifest_leads_the_prompt_and_names_the_rules():
+    _system, user = strategic_brief.build_sku_brief_prompt(_evidence())
+    assert user.startswith("LICENSED ENTITIES")
+    assert "you may name ONLY the proper nouns below" in user
+    assert "Vital Proteins" in user.split("EVIDENCE:\n", 1)[0]  # in the manifest, not just the JSON
+
+
+def test_manifest_handles_empty_evidence_without_crashing():
+    manifest = strategic_brief._licensed_entity_manifest({})
+    assert manifest == {"competitors": [], "sources": [], "lanes": [], "merchant": []}
+    rendered = strategic_brief._render_entity_manifest(manifest)
+    assert "(none in evidence)" in rendered
