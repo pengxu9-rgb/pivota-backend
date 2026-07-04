@@ -147,6 +147,41 @@ async def load_prior_prompt_basis(
     return None
 
 
+_PROBE_RUN_META_KEY = "prompt_basis_meta"
+
+
+def attach_basis_meta_to_probe_runs(
+    probe_runs: Any,
+    meta: Mapping[str, Any],
+) -> None:
+    """Ride the basis meta on the PERSISTED probe payload (first run dict).
+
+    The probing phase and the report phase use DIFFERENT sku_ctx instances —
+    run_brand_report resets the context cache and reloads, so anything stashed
+    on the probing-phase ctx silently vanishes by report time (the prod
+    validation pair of 2026-07-04 caught exactly that: run #1 stamped
+    prompt_basis=None and run #2 regenerated). The probe runs are what the
+    report phase durably reloads (load_per_sku_probe_runs), so the meta rides
+    there. An extra key on a run dict is inert to every extractor (they .get()
+    known fields) and survives worker restarts/resume."""
+    if not isinstance(meta, Mapping):
+        return
+    for run in probe_runs if isinstance(probe_runs, list) else []:
+        if isinstance(run, dict):
+            run[_PROBE_RUN_META_KEY] = dict(meta)
+            return
+
+
+def basis_meta_from_probe_runs(probe_runs: Any) -> Optional[Dict[str, Any]]:
+    """Recover the basis meta attached by attach_basis_meta_to_probe_runs."""
+    for run in probe_runs if isinstance(probe_runs, list) else []:
+        if isinstance(run, Mapping):
+            meta = run.get(_PROBE_RUN_META_KEY)
+            if isinstance(meta, Mapping):
+                return dict(meta)
+    return None
+
+
 async def resolve_prompt_basis(
     *,
     merchant_id: str,

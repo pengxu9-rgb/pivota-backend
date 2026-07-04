@@ -233,6 +233,60 @@ async def test_stamped_meta_round_trips_through_harvest(monkeypatch):
     assert harvested["prompt_set_id"] == first["meta"]["prompt_set_id"]
 
 
+# ---- durable carrier: the meta must ride the PERSISTED probe payload ----------
+# The probing phase and the report phase use DIFFERENT sku_ctx instances
+# (run_brand_report resets the context cache and reloads), so a ctx stash alone
+# silently vanishes by report time — the 2026-07-04 prod validation pair caught
+# exactly that (run #1 stamped prompt_basis=None; run #2 regenerated fresh).
+
+def test_meta_rides_probe_runs_round_trip():
+    from services.prompt_basis import (
+        attach_basis_meta_to_probe_runs,
+        basis_meta_from_probe_runs,
+    )
+
+    runs = [
+        {"query": "best shampoo", "raw": "..."},
+        {"query": "vegan shampoo", "raw": "..."},
+    ]
+    attach_basis_meta_to_probe_runs(runs, dict(_GOOD_BASIS))
+    # attached to exactly one run; run fields untouched
+    assert runs[0]["prompt_basis_meta"]["prompt_set_id"] == "ps_abc123"
+    assert "prompt_basis_meta" not in runs[1]
+    assert runs[0]["query"] == "best shampoo"
+    recovered = basis_meta_from_probe_runs(runs)
+    assert recovered == dict(_GOOD_BASIS)
+
+
+def test_meta_helpers_tolerate_garbage():
+    from services.prompt_basis import (
+        attach_basis_meta_to_probe_runs,
+        basis_meta_from_probe_runs,
+    )
+
+    attach_basis_meta_to_probe_runs(None, _GOOD_BASIS)      # no runs
+    attach_basis_meta_to_probe_runs([], _GOOD_BASIS)        # empty
+    attach_basis_meta_to_probe_runs(["not-a-dict"], _GOOD_BASIS)
+    attach_basis_meta_to_probe_runs([{"query": "q"}], None)  # no meta
+    assert basis_meta_from_probe_runs(None) is None
+    assert basis_meta_from_probe_runs([{"query": "q"}]) is None
+
+
+def test_report_stamp_reads_probe_runs_not_only_ctx():
+    """The report assembly must source prompt_basis from the persisted probe
+    payload (basis_meta_from_probe_runs) — a ctx-only read is the exact
+    dataflow break that shipped. Source-level pin, mirrors the W6 pattern."""
+    from pathlib import Path
+
+    src = Path("services/agent_center_bd_report_service.py").read_text()
+    stamp = src[src.index('"prompt_basis": ('):]
+    stamp = stamp[:stamp.index('),')]
+    assert "basis_meta_from_probe_runs(probe_runs)" in stamp, (
+        "per-SKU report prompt_basis no longer reads the durable probe-run "
+        "carrier — the probing-phase ctx stash does not survive to report time"
+    )
+
+
 # ---- delta basis identity -----------------------------------------------------
 
 def _delta_report(prompt_set_id):
