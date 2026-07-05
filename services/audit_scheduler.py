@@ -176,6 +176,26 @@ async def start_scheduler() -> None:
             coalesce=True,
         )
 
+        # T2-2b external-conversion polling floor: for merchants we hold
+        # `read_orders` for but that have NOT registered an `orders/paid`
+        # webhook (App-Store installs; the connected TEST merchant), poll recent
+        # Shopify orders, recover the T2-1 `pivota_click_id` from note_attributes
+        # and close each conversion via the SAME idempotent primitive the webhook
+        # uses. OFF BY DEFAULT — poll_external_conversions_batch no-ops unless
+        # EXTERNAL_CONVERSION_POLLER_ENABLED is set, so deploying never starts
+        # autonomous Shopify polling (mirrors catalog_onboard_queue). Every
+        # 15 min; scoped to merchants with a click in the last 30 days.
+        from services.external_conversion_poller import poll_external_conversions_batch
+        _add_job(
+            poll_external_conversions_batch,
+            "interval",
+            minutes=15,
+            id="external_conversion_poll",
+            replace_existing=True,
+            misfire_grace_time=600,
+            coalesce=True,
+        )
+
         # W7 audit-health: the alarm the no-fallback main line assumes. Computes
         # run-failure + honest-failure (brief unavailable_*) rates over a rolling
         # window and alerts on breach. Observational — no merchant-facing effect.
