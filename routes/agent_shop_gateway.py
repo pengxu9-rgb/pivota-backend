@@ -3381,6 +3381,55 @@ def _attach_eligible_serving_fields_to_items(
     return attached_items
 
 
+def _rank_offers_merit_first(offers: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """Rank offers MERIT-FIRST, never by in-agent integration status (T2-4, decision #3).
+
+    Index neutrality is a core differentiator: an external (referred, ``orderable:false``)
+    offer must not be demoted purely for being un-integrated. Internal (buy-here) and
+    external (referral) offers compete on the same relevance/quality signal — the per-offer
+    match ``confidence`` — and in-agent transactability is applied ONLY as a tiebreaker
+    between otherwise-equal-FIT offers (an orderable/buy-here offer wins the tie).
+
+    The two tiers score match ``confidence`` on non-comparable scales (internal exact = 0.95
+    at ``_build_internal_offer_summary``; external exact = 1.0 in ``_append_external_...``), so
+    a RAW-confidence sort would let a 0.05 scale artifact permanently outrank an exact
+    buy-here offer with an exact referral — inverting the demotion instead of neutralising it.
+    We therefore bucket confidence into shared FIT TIERS (exact / product / loose) so both
+    scales' exact matches land in the same tier; only then does transactability break the tie.
+    Raw confidence is a final deterministic tiebreak within a tier. We do NOT mutate the source
+    confidence values (other code reads them) — the bucketing is local to the sort key.
+
+    Sort key (all ascending): (fit_tier_rank, transactability_rank, -confidence). The sort is
+    stable, so equal-key offers keep prior order — a pure-internal set (same-product offers
+    share a confidence) is ordered byte-identically to the old ``internal + external`` list.
+    """
+
+    def _merit(offer: Dict[str, Any]) -> float:
+        try:
+            return float(offer.get("confidence") or 0.0)
+        except (TypeError, ValueError):
+            return 0.0
+
+    def _fit_tier_rank(confidence: float) -> int:
+        # Shared tiers across both scales: internal 0.95/0.8/0.7 and external 1.0/0.8/0.6.
+        # exact (internal 0.95 AND external 1.0) collapse to one tier so the tiebreaker fires.
+        if confidence >= 0.95:
+            return 0  # exact match
+        if confidence >= 0.8:
+            return 1  # product-level match
+        return 2  # loose match
+
+    def _transactability_rank(offer: Dict[str, Any]) -> int:
+        # Tiebreaker only: 0 = transactable in-agent (buy-here) wins ties, 1 = referral.
+        return 0 if str(offer.get("purchase_route") or "") == "internal_checkout" else 1
+
+    def _key(offer: Dict[str, Any]) -> Tuple[int, int, float]:
+        confidence = _merit(offer)
+        return (_fit_tier_rank(confidence), _transactability_rank(offer), -confidence)
+
+    return sorted(offers, key=_key)
+
+
 async def _handle_offers_resolve(
     payload: OffersResolvePayload,
     request_metadata: Optional[Dict[str, Any]],
@@ -4513,8 +4562,9 @@ async def _handle_offers_resolve(
                 query="external_seed_by_internal_identity",
             )
 
-    # Internal offers always come first for checkout.
-    offers = internal_offers + external_offers
+    # T2-4 (decision #3 — index neutrality): rank internal (buy-here) and external (referred)
+    # offers MERIT-FIRST in one list, never by integration status (was: internal-first block).
+    offers = _rank_offers_merit_first(internal_offers + external_offers)
     offers = offers[:limit]
 
     canonical_ref: Optional[str] = None

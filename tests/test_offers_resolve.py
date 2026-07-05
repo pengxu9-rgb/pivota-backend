@@ -528,3 +528,355 @@ def test_offers_resolve_strict_surface_fails_closed_without_eligible_variant(
     assert metadata.get("reason_code") == "NOT_SERVABLE"
     assert metadata.get("reason") == "not_servable"
     assert "out_of_stock" in (metadata.get("servable_reason_codes") or [])
+
+
+# ---------------------------------------------------------------------------
+# T2-4 — merit-first ranking neutrality (decision #3) + honest buy-here/referral labels
+# ---------------------------------------------------------------------------
+
+
+def _internal_offer(offer_id: str, confidence: float) -> dict:
+    return {
+        "offer_id": offer_id,
+        "confidence": confidence,
+        "purchase_route": "internal_checkout",
+        "affiliate_url": None,
+        "internal_checkout_items": [{"merchant_id": "m", "product_id": "p", "quantity": 1}],
+        "source": {"type": "internal_product"},
+    }
+
+
+def _external_offer(offer_id: str, confidence: float) -> dict:
+    return {
+        "offer_id": offer_id,
+        "confidence": confidence,
+        "purchase_route": "affiliate_outbound",
+        "affiliate_url": "https://example.com/r?token=x",
+        "internal_checkout_items": None,
+        "source": {"type": "external_seed"},
+    }
+
+
+def test_rank_offers_merit_first_higher_merit_external_beats_lower_merit_internal() -> None:
+    """Neutrality invariant: a higher-merit external (referred) offer ranks ABOVE a
+    lower-merit internal (buy-here) offer — no blanket down-rank by integration status."""
+    import routes.agent_shop_gateway as gateway
+
+    internal = _internal_offer("of:internal", 0.8)
+    external = _external_offer("of:external", 1.0)
+
+    ranked = gateway._rank_offers_merit_first([internal, external])
+
+    assert [o["offer_id"] for o in ranked] == ["of:external", "of:internal"]
+    assert ranked[0]["purchase_route"] == "affiliate_outbound"
+    assert ranked[0]["confidence"] > ranked[1]["confidence"]
+
+
+def test_rank_offers_merit_first_transactability_breaks_ties() -> None:
+    """Tiebreaker ONLY: when fit is equal, the transactable (buy-here) offer wins."""
+    import routes.agent_shop_gateway as gateway
+
+    external = _external_offer("of:external", 0.9)
+    internal = _internal_offer("of:internal", 0.9)
+
+    # External is listed first in the input; the tiebreaker must still promote internal.
+    ranked = gateway._rank_offers_merit_first([external, internal])
+
+    assert [o["offer_id"] for o in ranked] == ["of:internal", "of:external"]
+    assert ranked[0]["purchase_route"] == "internal_checkout"
+
+
+def test_rank_offers_merit_first_exact_tiers_collapse_across_scales() -> None:
+    """Scale-artifact guard: internal exact (0.95) and external exact (1.0) are the SAME fit
+    tier, so the transactability tiebreaker fires and buy-here (internal) ranks first — the
+    0.05 cross-scale gap must NOT invert the demotion."""
+    import routes.agent_shop_gateway as gateway
+
+    external_exact = _external_offer("of:external_exact", 1.0)
+    internal_exact = _internal_offer("of:internal_exact", 0.95)
+
+    ranked = gateway._rank_offers_merit_first([external_exact, internal_exact])
+
+    assert [o["offer_id"] for o in ranked] == ["of:internal_exact", "of:external_exact"]
+    assert ranked[0]["purchase_route"] == "internal_checkout"
+
+
+def test_rank_offers_merit_first_exact_external_beats_lower_tier_internal() -> None:
+    """Merit still wins ACROSS tiers: an exact external (1.0) outranks a product-tier (0.8)
+    or loose (0.7) internal offer — genuinely higher fit, not a scale artifact."""
+    import routes.agent_shop_gateway as gateway
+
+    external_exact = _external_offer("of:external_exact", 1.0)
+    internal_product = _internal_offer("of:internal_product", 0.8)
+    internal_loose = _internal_offer("of:internal_loose", 0.7)
+
+    ranked = gateway._rank_offers_merit_first([internal_product, internal_loose, external_exact])
+
+    assert ranked[0]["offer_id"] == "of:external_exact"
+
+
+def test_rank_offers_merit_first_pure_internal_order_unchanged() -> None:
+    """Regression: a pure-internal set is ordered identically to the old
+    ``internal_offers + external_offers`` construction (stable sort, no internal churn)."""
+    import routes.agent_shop_gateway as gateway
+
+    # Same-product internal offers share a confidence in real runs -> stable => input order.
+    internal_offers = [
+        _internal_offer("of:internal_a", 0.95),
+        _internal_offer("of:internal_b", 0.95),
+        _internal_offer("of:internal_c", 0.95),
+    ]
+
+    ranked = gateway._rank_offers_merit_first(list(internal_offers))
+
+    assert [o["offer_id"] for o in ranked] == [o["offer_id"] for o in internal_offers]
+
+
+def test_offers_resolve_ranks_higher_merit_external_above_lower_merit_internal(
+    monkeypatch: pytest.MonkeyPatch, client: TestClient
+) -> None:
+    """End-to-end: an exact-match external referral (confidence 1.0) outranks a loose-match
+    internal offer (confidence 0.8) in the resolved output, and every offer carries an
+    unambiguous buy-here vs referral label."""
+    import routes.agent_shop_gateway as gateway
+
+    async def fake_fetch_all(query: str, values=None):
+        q = str(query)
+        if "FROM external_product_seeds" in q:
+            return [
+                {
+                    "id": "eps_merit_1",
+                    "external_product_id": "ext_merit_1",
+                    "market": "US",
+                    "tool": "*",
+                    "destination_url": "https://brand.example/products/serum",
+                    "canonical_url": "https://brand.example/products/serum",
+                    "domain": "brand.example",
+                    "title": "Brand Serum",
+                    "price_amount": 25.0,
+                    "price_currency": "USD",
+                    "availability": "in_stock",
+                    "utm_template": None,
+                    "seed_data": {
+                        "brand": "Brand Example",
+                        "variants": [
+                            {
+                                "variant_id": "SKU_MERIT_WIN",
+                                "title": "Brand Serum 30ml",
+                                "price_amount": 25.0,
+                                "price_currency": "USD",
+                                "availability": "in_stock",
+                            }
+                        ],
+                    },
+                    "status": "active",
+                }
+            ]
+        if "FROM products_cache" in q:
+            # Internal product exists but its variant does NOT match the queried sku -> a
+            # lower-merit (0.8) loose match, versus the external exact match (1.0).
+            return [
+                {
+                    "merchant_id": "merch_loose",
+                    "product_data": {
+                        "id": "prod_loose_1",
+                        "title": "Loose Internal Product",
+                        "currency": "USD",
+                        "price": 30.0,
+                        "inventory_quantity": 5,
+                        "merchant_name": "Loose Internal Store",
+                        "variants": [{"id": "SKU_INTERNAL_OTHER", "price": 30.0, "inventory_quantity": 5}],
+                    },
+                }
+            ]
+        return []
+
+    async def fake_gate(*args, **kwargs):
+        return False, type("GateStatus", (), {"blocker_anomaly_types": []})()
+
+    monkeypatch.setattr(gateway.database, "fetch_all", fake_fetch_all)
+    monkeypatch.setattr(gateway, "should_block_external_referral_runtime", fake_gate)
+    monkeypatch.setattr(
+        gateway, "_make_external_redirect_url", AsyncMock(return_value="https://example.com/r?token=merit")
+    )
+
+    res = client.post(
+        "/agent/shop/v1/invoke",
+        json={
+            "operation": "offers.resolve",
+            "payload": {"product": {"sku_id": "SKU_MERIT_WIN"}, "limit": 10, "market": "US", "tool": "*"},
+            "metadata": {"source": "creator-agent-ui"},
+        },
+    )
+    assert res.status_code == 200
+    body = res.json()
+    assert body["status"] == "success"
+    offers = body.get("offers") or []
+    assert len(offers) >= 2, "both the external and the internal offer should be present"
+
+    # Neutrality invariant: the higher-merit external referral ranks first.
+    assert offers[0]["purchase_route"] == "affiliate_outbound"
+    assert offers[0]["source"]["type"] == "external_seed"
+    internal = next(o for o in offers if o["purchase_route"] == "internal_checkout")
+    assert offers[0]["confidence"] > internal["confidence"]
+    assert offers.index(offers[0]) < offers.index(internal)
+
+    # Honest, unambiguous labels: referral vs buy-here on every offer.
+    assert offers[0]["affiliate_url"].startswith("https://example.com/r?token=")
+    assert offers[0]["internal_checkout_items"] is None
+    assert internal["affiliate_url"] is None
+    assert isinstance(internal["internal_checkout_items"], list)
+
+
+def test_offers_resolve_exact_internal_beats_exact_external_end_to_end(
+    monkeypatch: pytest.MonkeyPatch, client: TestClient
+) -> None:
+    """End-to-end tiebreaker (now REACHABLE): when the SAME sku matches both an internal
+    (buy-here, confidence 0.95) and an external (referral, confidence 1.0) offer, they are the
+    same fit tier -> transactability breaks the tie -> the internal buy-here offer ranks first.
+    The 0.95-vs-1.0 cross-scale gap must not invert the demotion."""
+    import routes.agent_shop_gateway as gateway
+
+    async def fake_fetch_all(query: str, values=None):
+        q = str(query)
+        if "FROM external_product_seeds" in q:
+            return [
+                {
+                    "id": "eps_tie_1",
+                    "external_product_id": "ext_tie_1",
+                    "market": "US",
+                    "tool": "*",
+                    "destination_url": "https://brand.example/products/serum",
+                    "canonical_url": "https://brand.example/products/serum",
+                    "domain": "brand.example",
+                    "title": "Brand Serum (referral)",
+                    "price_amount": 25.0,
+                    "price_currency": "USD",
+                    "availability": "in_stock",
+                    "utm_template": None,
+                    "seed_data": {
+                        "brand": "Brand Example",
+                        "variants": [
+                            {
+                                "variant_id": "SKU_TIE_EXACT",
+                                "title": "Brand Serum 30ml",
+                                "price_amount": 25.0,
+                                "price_currency": "USD",
+                                "availability": "in_stock",
+                            }
+                        ],
+                    },
+                    "status": "active",
+                }
+            ]
+        if "FROM products_cache" in q:
+            # Internal product's variant matches the SAME queried sku -> exact (0.95).
+            return [
+                {
+                    "merchant_id": "merch_tie",
+                    "product_data": {
+                        "id": "prod_tie_1",
+                        "title": "Internal Serum (buy-here)",
+                        "currency": "USD",
+                        "price": 24.0,
+                        "inventory_quantity": 5,
+                        "merchant_name": "Buy-Here Store",
+                        "variants": [{"id": "SKU_TIE_EXACT", "price": 24.0, "inventory_quantity": 5}],
+                    },
+                }
+            ]
+        return []
+
+    async def fake_gate(*args, **kwargs):
+        return False, type("GateStatus", (), {"blocker_anomaly_types": []})()
+
+    monkeypatch.setattr(gateway.database, "fetch_all", fake_fetch_all)
+    monkeypatch.setattr(gateway, "should_block_external_referral_runtime", fake_gate)
+    monkeypatch.setattr(
+        gateway, "_make_external_redirect_url", AsyncMock(return_value="https://example.com/r?token=tie")
+    )
+
+    res = client.post(
+        "/agent/shop/v1/invoke",
+        json={
+            "operation": "offers.resolve",
+            "payload": {"product": {"sku_id": "SKU_TIE_EXACT"}, "limit": 10, "market": "US", "tool": "*"},
+            "metadata": {"source": "creator-agent-ui"},
+        },
+    )
+    assert res.status_code == 200
+    body = res.json()
+    offers = body.get("offers") or []
+    assert len(offers) >= 2, "both the exact internal and exact external offer should be present"
+
+    # Same fit tier (exact) -> transactability tiebreaker -> buy-here (internal) first.
+    assert offers[0]["purchase_route"] == "internal_checkout"
+    assert offers[0]["source"]["type"] == "internal_product"
+    external = next(o for o in offers if o["purchase_route"] == "affiliate_outbound")
+    assert offers.index(offers[0]) < offers.index(external)
+    # Despite the external carrying a numerically higher raw confidence.
+    assert external["confidence"] > offers[0]["confidence"]
+
+    # Honest labels remain on both.
+    assert offers[0]["affiliate_url"] is None
+    assert isinstance(offers[0]["internal_checkout_items"], list)
+    assert external["affiliate_url"].startswith("https://example.com/r?token=")
+    assert external["internal_checkout_items"] is None
+
+
+def test_offers_resolve_pure_internal_order_unchanged_end_to_end(
+    monkeypatch: pytest.MonkeyPatch, client: TestClient
+) -> None:
+    """Regression: with no external seeds, the resolved output is internal-only and preserves
+    the source row order (no internal-only churn from the merit-first sort)."""
+    import routes.agent_shop_gateway as gateway
+
+    async def fake_fetch_all(query: str, values=None):
+        q = str(query)
+        if "FROM external_product_seeds" in q:
+            return []
+        if "FROM products_cache" in q:
+            return [
+                {
+                    "merchant_id": "merch_a",
+                    "product_data": {
+                        "id": "prod_pure_a",
+                        "title": "Pure Internal A",
+                        "currency": "USD",
+                        "price": 10.0,
+                        "inventory_quantity": 4,
+                        "variants": [{"id": "SKU_PURE_A", "price": 10.0, "inventory_quantity": 4}],
+                    },
+                },
+                {
+                    "merchant_id": "merch_b",
+                    "product_data": {
+                        "id": "prod_pure_b",
+                        "title": "Pure Internal B",
+                        "currency": "USD",
+                        "price": 12.0,
+                        "inventory_quantity": 4,
+                        "variants": [{"id": "SKU_PURE_B", "price": 12.0, "inventory_quantity": 4}],
+                    },
+                },
+            ]
+        return []
+
+    monkeypatch.setattr(gateway.database, "fetch_all", fake_fetch_all)
+
+    res = client.post(
+        "/agent/shop/v1/invoke",
+        json={
+            "operation": "offers.resolve",
+            "payload": {"product": {"product_id": "prod_pure_a"}, "limit": 10},
+            "metadata": {"source": "creator-agent-ui"},
+        },
+    )
+    assert res.status_code == 200
+    body = res.json()
+    offers = body.get("offers") or []
+    assert offers, "should return at least one internal offer"
+    assert all(o["purchase_route"] == "internal_checkout" for o in offers)
+    # Source row order (merch_a before merch_b) is preserved.
+    sellers_or_ids = [str((o.get("source") or {}).get("product_id") or "") for o in offers]
+    assert sellers_or_ids[0] == "prod_pure_a"
