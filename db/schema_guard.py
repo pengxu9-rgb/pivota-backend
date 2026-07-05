@@ -804,6 +804,23 @@ async def ensure_required_schema_light() -> None:
                     """
                 )
             )
+            # T2-2b read_orders polling floor (migration 168): per-merchant
+            # watermark so each poll only fetches new/updated Shopify orders.
+            # services/external_conversion_poller.py reads/writes this table on
+            # every run; Railway deploys skip db/migrations/, so self-heal here.
+            await database.execute(
+                text(
+                    """
+                    CREATE TABLE IF NOT EXISTS external_conversion_poll_state (
+                      merchant_id        TEXT PRIMARY KEY,
+                      last_polled_at     TIMESTAMPTZ,
+                      last_run_at        TIMESTAMPTZ,
+                      last_closed_count  INTEGER NOT NULL DEFAULT 0,
+                      updated_at         TIMESTAMPTZ NOT NULL DEFAULT NOW()
+                    );
+                    """
+                )
+            )
             return
 
         if IS_SQLITE:
