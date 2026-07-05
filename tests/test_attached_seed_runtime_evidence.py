@@ -111,10 +111,12 @@ async def test_hydrate_product_payloads_from_attached_seed_runtime_evidence(
     import services.attached_seed_runtime_evidence as module
 
     async def fake_fetch_all(query, values):
-        assert values["product_key_prefix"] == "merch_1|shopify|%"
+        # T1: attached_product_key is stored in the prod:: STORAGE format, never pipe.
+        # merchant ids contain '_', so the LIKE prefix escapes it (ESCAPE '\').
+        assert values["product_key_prefix"] == "prod::merch\\_1::shopify::%"
         return [
             {
-                "attached_product_key": "merch_1|shopify|prod_1",
+                "attached_product_key": "prod::merch_1::shopify::prod_1",
                 "attached_variant_id": "∅",
                 "canonical_url": "https://brand.example/products/serum",
                 "destination_url": "https://brand.example/products/serum",
