@@ -12,11 +12,23 @@ HONESTY DISCIPLINE (load-bearing, pre-launch data is tiny + test-concentrated):
 - counts (transacted/paid/refunded) and GMV are always real sums, never estimates.
 
 Sources:
-- merchant outcomes  ← `orders` grouped by merchant_id.
-- product outcomes   ← `commerce_attribution_edges` (canonical_product_id, gmv) JOIN
-                        `orders` for payment status. (checkout_decisions.content_key
+- merchant outcomes  ← `orders` grouped by merchant_id, UNION external converted
+                        edges (T2-3) that have no `orders` row.
+- product outcomes   ← `commerce_attribution_edges` (canonical_product_id, gmv) LEFT
+                        JOIN `orders` for payment status. (checkout_decisions.content_key
                         is not yet populated, so product attribution rides the
                         attribution edge, which already carries canonical_product_id.)
+
+T2-3 also counts EXTERNAL conversions — a purchase completed on an un-integrated
+merchant's own checkout (T2-2). Such an edge has state='converted' + GMV/currency ON
+the edge and NO `orders` row, so both queries fall back to the edge's own fields for
+it. INTEGRITY: only `metadata.click_matched = true` external edges count — a false
+value is a forgeable, merchant-supplied click id and must never inflate the outcome/
+trust signal. Internal-order numbers are byte-identical to pre-T2-3.
+
+Handoff: seller_trust (get_seller_trust / seller_trust_from_outcome, below) reads the
+merchant aggregated_outcomes row; T2-3 makes external outcomes flow into it — no
+seller_trust change needed here.
 
 The aggregator is idempotent (UPSERT) and safe to re-run; a scheduled job refreshes
 it. Reads (get_outcomes) gate on min_sample_met for any rate-bearing consumer.
@@ -87,45 +99,114 @@ async def ensure_aggregated_outcomes_table() -> None:
         _DDL_READY = True
 
 
-# Window clause: all_time has no lower bound; trailing_90d bounds on created_at.
-def _window_clause(window_key: str, alias: str) -> str:
+# Window clause: all_time has no lower bound; trailing_90d bounds on a timestamp.
+def _window_expr_clause(window_key: str, expr: str) -> str:
     if window_key == "trailing_90d":
-        return f"AND {alias}.created_at >= now() - interval '{TRAILING_WINDOW_DAYS} days'"
+        return f"AND {expr} >= now() - interval '{TRAILING_WINDOW_DAYS} days'"
     return ""
 
 
+def _window_clause(window_key: str, alias: str) -> str:
+    return _window_expr_clause(window_key, f"{alias}.created_at")
+
+
+# --- T2-3: external-conversion arm -------------------------------------------------
+#
+# T2-2 lets an un-integrated merchant's sale on their OWN checkout be recorded as a
+# self-contained `converted` attribution edge with NO Pivota `orders` row (GMV +
+# currency live ON the edge). Aggregation must count those so the moat signal
+# (aggregated_outcomes → seller_trust) reflects real external outcomes.
+#
+# HARD INTEGRITY GATE (non-negotiable): only count an external converted edge whose
+# `metadata.click_matched = true`. A false value means the click_id arrived via the
+# merchant-controllable Shopify note_attributes with no matching Pivota click row —
+# it is FORGEABLE and must never inflate the outcome/trust signal. `metadata` is
+# JSONB; `->>'click_matched'` yields text 'true'/'false', and `::boolean IS TRUE`
+# is NULL-safe (legacy/internal edges have no such key → excluded from this arm).
+_EXT_CONVERTED_PREDICATE = (
+    "(cae.state = 'converted' "
+    "AND (cae.metadata->>'click_matched')::boolean IS TRUE)"
+)
+# Internal/PSP edges are counted exactly as before: they carry a real `orders` row.
+_INT_TRANSACTED_PREDICATE = (
+    "(o.order_id IS NOT NULL AND o.payment_status = ANY(:transacted))"
+)
+_PROD_TRANSACTED_PREDICATE = f"({_INT_TRANSACTED_PREDICATE} OR {_EXT_CONVERTED_PREDICATE})"
+
+
 def _merchant_sql(window_key: str) -> str:
+    # The internal arm is byte-identical to the pre-T2-3 query (same FROM/WHERE and
+    # the same per-row expressions: gmv_units = orders.total in currency units, which
+    # _build_row multiplies ×100 → cents). External converted edges have NO orders
+    # row, so they are UNION'd in as their own rows — each is one transacted + paid
+    # sale, GMV read from the edge (cents ÷ 100, kept in the same `gmv_units` space so
+    # the internal code path is untouched). Refunds are not tracked on the external
+    # path (the T2-2 edge writes refund_count=0), so external rows are never refunded.
+    # INTEGRITY GATE applied on the external arm only (see _EXT_CONVERTED_PREDICATE).
     return f"""
         SELECT
             merchant_id AS subject_key,
-            count(*) FILTER (WHERE payment_status = ANY(:transacted))                       AS transacted_count,
-            count(*) FILTER (WHERE payment_status = 'paid')                                  AS paid_count,
-            count(*) FILTER (WHERE payment_status = ANY(:refunded))                          AS refunded_count,
-            COALESCE(SUM((total)::numeric) FILTER (WHERE payment_status = ANY(:transacted)), 0) AS gmv_units,
-            MAX(currency)                                                                    AS currency
-        FROM orders o
-        WHERE merchant_id IS NOT NULL
-          {_window_clause(window_key, 'o')}
+            count(*) FILTER (WHERE is_transacted)                        AS transacted_count,
+            count(*) FILTER (WHERE is_paid)                              AS paid_count,
+            count(*) FILTER (WHERE is_refunded)                          AS refunded_count,
+            COALESCE(SUM(gmv_units) FILTER (WHERE is_transacted), 0)     AS gmv_units,
+            MAX(currency)                                                AS currency
+        FROM (
+            -- Internal / PSP orders — semantics unchanged from before T2-3.
+            SELECT
+                merchant_id,
+                (payment_status = ANY(:transacted)) AS is_transacted,
+                (payment_status = 'paid')           AS is_paid,
+                (payment_status = ANY(:refunded))   AS is_refunded,
+                (total)::numeric                    AS gmv_units,
+                currency
+            FROM orders o
+            WHERE merchant_id IS NOT NULL
+              {_window_clause(window_key, 'o')}
+            UNION ALL
+            -- External converted edges (T2-2): no orders row; click_matched-gated.
+            SELECT
+                cae.merchant_id,
+                TRUE  AS is_transacted,
+                TRUE  AS is_paid,
+                FALSE AS is_refunded,
+                (cae.gross_attributed_gmv_cents::numeric / 100) AS gmv_units,
+                cae.currency
+            FROM commerce_attribution_edges cae
+            WHERE cae.merchant_id IS NOT NULL
+              AND {_EXT_CONVERTED_PREDICATE}
+              {_window_expr_clause(window_key, 'cae.converted_at')}
+        ) u
         GROUP BY merchant_id
-        HAVING count(*) FILTER (WHERE payment_status = ANY(:transacted)) > 0
+        HAVING count(*) FILTER (WHERE is_transacted) > 0
     """
 
 
 def _product_sql(window_key: str) -> str:
+    # LEFT JOIN (was INNER): an external converted edge has a SYNTHETIC order_id with
+    # no matching `orders` row, so an INNER JOIN dropped it. With LEFT JOIN a row is
+    # transacted when EITHER the internal order is paid/refunded OR the edge is an
+    # external `converted` (click_matched) edge. For INTERNAL-only data this is
+    # byte-identical: internal edges always have a matching orders row, the external
+    # predicate never fires (state is NULL on internal edges), and the extra
+    # (non-transacted) rows LEFT JOIN now admits contribute 0 to every FILTER and are
+    # dropped by HAVING. GMV always comes from the edge's own gross_attributed_gmv_cents
+    # (internal edges already carried it); currency prefers the order, falling back to
+    # the edge for external conversions. INTEGRITY GATE on the external arm only.
     return f"""
         SELECT
             cae.canonical_product_id AS subject_key,
-            count(*) FILTER (WHERE o.payment_status = ANY(:transacted))                       AS transacted_count,
-            count(*) FILTER (WHERE o.payment_status = 'paid')                                 AS paid_count,
+            count(*) FILTER (WHERE {_PROD_TRANSACTED_PREDICATE})                              AS transacted_count,
+            count(*) FILTER (WHERE o.payment_status = 'paid' OR {_EXT_CONVERTED_PREDICATE})   AS paid_count,
             count(*) FILTER (WHERE o.payment_status = ANY(:refunded))                         AS refunded_count,
-            COALESCE(SUM(cae.gross_attributed_gmv_cents) FILTER (WHERE o.payment_status = ANY(:transacted)), 0) AS gmv_cents,
-            MAX(o.currency)                                                                   AS currency
+            COALESCE(SUM(cae.gross_attributed_gmv_cents) FILTER (WHERE {_PROD_TRANSACTED_PREDICATE}), 0) AS gmv_cents,
+            MAX(COALESCE(o.currency, cae.currency))                                           AS currency
         FROM commerce_attribution_edges cae
-        JOIN orders o ON o.order_id = cae.order_id
+        LEFT JOIN orders o ON o.order_id = cae.order_id
         WHERE cae.canonical_product_id IS NOT NULL
-          {_window_clause(window_key, 'o')}
+          {_window_expr_clause(window_key, 'COALESCE(o.created_at, cae.converted_at, cae.created_at)')}
         GROUP BY cae.canonical_product_id
-        HAVING count(*) FILTER (WHERE o.payment_status = ANY(:transacted)) > 0
+        HAVING count(*) FILTER (WHERE {_PROD_TRANSACTED_PREDICATE}) > 0
     """
 
 
