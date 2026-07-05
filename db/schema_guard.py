@@ -772,6 +772,38 @@ async def ensure_required_schema_light() -> None:
                     """
                 )
             )
+            # T2-2 external-conversion representation (migration 167). These
+            # columns are now in the SQLAlchemy Table model, so every runtime
+            # `select(commerce_attribution_edges)` emits them — they MUST exist
+            # in prod or the SELECT crashes (the PR #494/#501 apm_enabled class
+            # of outage). Railway deploys skip db/migrations/, so self-heal here.
+            # gross_attributed_gmv_cents predates this (migration 109) and is
+            # already in prod; re-adding IF NOT EXISTS is a harmless no-op.
+            await database.execute(
+                text(
+                    """
+                    ALTER TABLE IF EXISTS commerce_attribution_edges
+                      ADD COLUMN IF NOT EXISTS state TEXT,
+                      ADD COLUMN IF NOT EXISTS converted_at TIMESTAMPTZ,
+                      ADD COLUMN IF NOT EXISTS currency TEXT,
+                      ADD COLUMN IF NOT EXISTS external_order_id TEXT,
+                      ADD COLUMN IF NOT EXISTS source TEXT,
+                      ADD COLUMN IF NOT EXISTS click_id TEXT,
+                      ADD COLUMN IF NOT EXISTS gross_attributed_gmv_cents BIGINT;
+                    """
+                )
+            )
+            # Idempotency guard for the external-conversion closure — one edge
+            # per (merchant, external Shopify order). Internal edges keep
+            # external_order_id NULL (distinct under multi-column NULL rules).
+            await database.execute(
+                text(
+                    """
+                    CREATE UNIQUE INDEX IF NOT EXISTS uq_commerce_attribution_edges_external_order
+                      ON commerce_attribution_edges (merchant_id, external_order_id);
+                    """
+                )
+            )
             return
 
         if IS_SQLITE:

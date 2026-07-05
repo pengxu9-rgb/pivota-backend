@@ -25,6 +25,11 @@ from config.settings import settings
 from utils.logger import logger
 from services.dispute_records_service import stripe_dispute_pack_status
 from services.shopify_webhook_ingest import verify_shopify_hmac, ingest_shopify_webhook
+from services.commerce_attribution_service import (
+    close_external_order_conversion,
+    extract_click_id_from_note_attributes,
+    shopify_order_total_to_cents,
+)
 from services.catalog_sync_service import (
     create_catalog_sync_job,
     mark_catalog_sync_event_processed,
@@ -1949,6 +1954,40 @@ async def handle_shopify_webhook(
                 merchant_id=merchant_id,
                 metadata={"shopify_order_id": shopify_order_id, "topic": topic},
             )
+
+            # T2-2: close the attribution loop for a purchase completed on an
+            # un-integrated merchant's OWN Shopify checkout. There is no Pivota
+            # `orders` row (result is None above) — recovery goes through the
+            # `pivota_click_id` T2-1 stamped onto the cart permalink, which
+            # Shopify persisted into note_attributes. Gated on `orders/paid`
+            # (the conversion event; orders/create precedes payment). This runs
+            # only AFTER the HMAC verification above (lines ~1742-1749) — the
+            # same signature gate the whole handler is behind. Best-effort and
+            # fully isolated: a failure here must not break order-event logging
+            # or change the webhook's 200 for an otherwise-valid order.
+            if topic == "orders/paid":
+                try:
+                    click_id = extract_click_id_from_note_attributes(
+                        data.get("note_attributes")
+                    )
+                    if click_id:
+                        amount_cents, order_currency = shopify_order_total_to_cents(data)
+                        await close_external_order_conversion(
+                            merchant_id=merchant_id,
+                            click_id=click_id,
+                            external_order_id=shopify_order_id,
+                            gross_amount_cents=amount_cents,
+                            currency=order_currency,
+                            converted_at=occurred_at,
+                            note_attrs_or_payload=data if isinstance(data, dict) else None,
+                        )
+                except Exception as e:
+                    logger.warning(
+                        "T2-2 external conversion close failed merchant=%s shopify_order=%s err=%s",
+                        merchant_id,
+                        shopify_order_id,
+                        str(e)[:200],
+                    )
 
         elif topic == "orders/cancelled":
             # 订单取消
