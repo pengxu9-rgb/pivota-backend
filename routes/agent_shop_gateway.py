@@ -2902,6 +2902,33 @@ def _safe_lower(s: Any) -> str:
     return str(s or "").strip().lower()
 
 
+def _escape_like(value: str) -> str:
+    """Escape SQL LIKE wildcards so an interpolated literal matches itself.
+
+    Needed for the storage-format attached-seed lookup (see IDENTITY_REFERENCE
+    Trap T1): ``merchant_id`` values contain underscores (``merch_...``), and an
+    unescaped ``_`` in a LIKE pattern matches any single char, which would
+    over-match across merchants. Pair every LIKE using an escaped value with
+    ``ESCAPE '\\'``.
+    """
+    return str(value or "").replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+
+
+def _parse_catalog_product_key(key: Any) -> Optional[Tuple[str, str, str]]:
+    """Split the STORAGE-format product key `prod::{merchant}::{platform}::{pid}`.
+
+    Returns (merchant, platform, source_product_id) or None if `key` is not the
+    `prod::` storage form (e.g. NULL, or a bare/pipe form — see IDENTITY_REFERENCE
+    Trap T1). Source product ids never contain `::`, so the pid is the 4th segment.
+    """
+    if not isinstance(key, str) or not key.startswith("prod::"):
+        return None
+    parts = key.split("::")
+    if len(parts) < 4 or not parts[1] or not parts[3]:
+        return None
+    return parts[1], parts[2], "::".join(parts[3:])
+
+
 def _coerce_int(v: Any) -> Optional[int]:
     try:
         if v is None:
@@ -3512,6 +3539,7 @@ async def _handle_offers_resolve(
         row_count: Optional[int] = None,
         error: Optional[str] = None,
         query: Optional[str] = None,
+        extra: Optional[Dict[str, Any]] = None,
     ) -> None:
         entry: Dict[str, Any] = {
             "source": source,
@@ -3527,6 +3555,8 @@ async def _handle_offers_resolve(
             entry["error"] = str(error)[:500]
         if query:
             entry["query"] = query
+        if extra:
+            entry.update(extra)
         source_status.append(entry)
 
     async def _fetch_attached_seed_rows(
@@ -3546,22 +3576,37 @@ async def _handle_offers_resolve(
             return []
 
         attached_platform = str(platform or "").strip() or None
+        # T1 fix (docs/IDENTITY_REFERENCE.md §4 "Trap T1"; ADR-009 §Prerequisite fix):
+        # external_product_seeds.attached_product_key stores the STORAGE format
+        # `prod::{merchant}::{platform}::{pid}` (make_catalog_product_key), NOT the
+        # pipe transport form. The prior pipe-format match keys matched zero prod rows
+        # (8,004 prod:: / 0 pipe as of 2026-07-05) — a confirmed dead path. Build match
+        # keys with make_catalog_product_key + a `prod::{merchant}::%` prefix so the
+        # attached-ref mainline actually matches. LIKE values are wildcard-escaped
+        # because merchant ids contain `_` (see _escape_like). The 720 bare-format rows
+        # are a separate ADR-009 backfill decision and are deliberately NOT matched here
+        # (adding a third format would be a new crutch).
+        from services.catalog_sync_service import make_catalog_product_key
+
         params: Dict[str, Any] = {
             "limit": attached_seed_limit,
-            "attached_prefix": f"{attached_merchant_id}|%",
+            "attached_prefix": f"prod::{_escape_like(attached_merchant_id)}::%",
         }
         match_clauses: List[str] = []
 
         for idx, pid_alias in enumerate(pid_aliases[:8]):
             pid_key = f"attached_pid_{idx}"
             if attached_platform:
-                params[pid_key] = f"{attached_merchant_id}|{attached_platform}|{pid_alias}"
+                params[pid_key] = make_catalog_product_key(attached_merchant_id, attached_platform, pid_alias)
                 match_clauses.append(f"attached_product_key = :{pid_key}")
             else:
-                params[pid_key] = f"{attached_merchant_id}|%|{pid_alias}"
-                match_clauses.append(f"attached_product_key LIKE :{pid_key}")
+                # platform-unknown: prod::{merchant}::<any platform>::{pid}
+                params[pid_key] = f"prod::{_escape_like(attached_merchant_id)}::%::{_escape_like(pid_alias)}"
+                match_clauses.append(f"attached_product_key LIKE :{pid_key} ESCAPE '\\'")
 
         for idx, sku_alias in enumerate(sku_aliases[:8]):
+            # attached_variant_id stores the RAW variant id (not prod::-prefixed) — the
+            # T2-1/T2-2 order-side join key — so exact equality is correct here.
             sku_key = f"attached_sku_{idx}"
             params[sku_key] = sku_alias
             match_clauses.append(f"attached_variant_id = :{sku_key}")
@@ -3576,7 +3621,7 @@ async def _handle_offers_resolve(
                 FROM external_product_seeds
                 WHERE status = 'active'
                   AND attached_product_key IS NOT NULL
-                  AND attached_product_key LIKE :attached_prefix
+                  AND attached_product_key LIKE :attached_prefix ESCAPE '\\'
                   AND ({' OR '.join(match_clauses)})
                 ORDER BY updated_at DESC, created_at DESC
                 LIMIT :limit
@@ -3950,12 +3995,22 @@ async def _handle_offers_resolve(
     if allow_external_fallback:
         external_started = time.perf_counter()
         try:
-            query_label = "external_seed_by_ref"
+            # Fuzzy (external_product_id/title/url LIKE) is the default label; the
+            # attached-ref mainline overwrites it on success so telemetry can alarm on
+            # the fuzzy:attached ratio (founder directive: fuzzy must not be a silent
+            # fallback for attached seeds). See IDENTITY_REFERENCE Trap T1 / ADR-009.
+            query_label = "external_seed_by_fuzzy_ref"
             where_clauses = ["status = 'active'"]
             params: Dict[str, Any] = {"limit": attached_seed_limit}
             seed_rows: List[Any] = []
+            # (merchant, pid) pairs the attached-ref mainline actually searched — used to
+            # tell a genuine mainline miss (fuzzy surfaced a seed the mainline SHOULD have
+            # matched) from a legitimate cross-merchant / rebound-store fuzzy match.
+            searched_attached_merchants: set[str] = set()
+            searched_attached_pids: set[str] = {a for a in product_id_aliases if a}
 
             if merchant_scope and (product_id_aliases or sku_id_aliases):
+                searched_attached_merchants.add(merchant_scope)
                 seed_rows = await _fetch_attached_seed_rows(
                     merchant_id=merchant_scope,
                     product_aliases=product_id_aliases,
@@ -3976,12 +4031,16 @@ async def _handle_offers_resolve(
                         )
                         if str(alias or "").strip()
                     ]
+                    prefetched_merchant = str(prefetched_internal.get("merchant_id") or "").strip() or None
+                    prefetched_pid = str(prefetched_internal.get("product_id") or "").strip() or None
+                    if prefetched_merchant:
+                        searched_attached_merchants.add(prefetched_merchant)
+                    if prefetched_pid:
+                        searched_attached_pids.add(prefetched_pid)
                     seed_rows = await _fetch_attached_seed_rows(
-                        merchant_id=str(prefetched_internal.get("merchant_id") or "").strip() or None,
+                        merchant_id=prefetched_merchant,
                         platform=str(prefetched_internal.get("platform") or "").strip() or None,
-                        product_aliases=[
-                            str(prefetched_internal.get("product_id") or "").strip() or None
-                        ] + product_id_aliases,
+                        product_aliases=[prefetched_pid] + product_id_aliases,
                         variant_aliases=retry_variant_aliases,
                     )
                     if seed_rows:
@@ -4037,6 +4096,36 @@ async def _handle_offers_resolve(
                     timeout=OFFERS_RESOLVE_SEED_QUERY_TIMEOUT_SECONDS,
                 )
 
+            # T1 mainline-miss telemetry (founder directive: no silent fuzzy fallback for
+            # attached seeds). The fuzzy query legitimately surfaces STANDALONE seeds
+            # (attached_product_key NULL) and rebound-store / cross-merchant matches. But
+            # if it surfaces a seed whose STORAGE-format attached key names a (merchant, pid)
+            # the attached-ref mainline actually searched, the mainline SHOULD have matched
+            # it and didn't — that is OBSERVABLE breakage, not a pass. Deliver the offer
+            # anyway (honest delivery); just make the miss alarmable. See IDENTITY_REFERENCE
+            # Trap T1 / ADR-009 §Prerequisite fix.
+            mainline_miss_seed_ids: List[str] = []
+            if query_label == "external_seed_by_fuzzy_ref":
+                for row in seed_rows or []:
+                    row_dict = _row_to_dict(row)
+                    parsed = _parse_catalog_product_key(row_dict.get("attached_product_key"))
+                    if not parsed:
+                        continue
+                    seed_merchant, _seed_platform, seed_pid = parsed
+                    if seed_merchant in searched_attached_merchants and seed_pid in searched_attached_pids:
+                        mainline_miss_seed_ids.append(str(row_dict.get("id") or ""))
+            if mainline_miss_seed_ids:
+                logger.warning(
+                    "attached_seed_mainline_miss",
+                    extra={
+                        "event": "attached_seed_mainline_miss",
+                        "seed_ids": mainline_miss_seed_ids,
+                        "product_aliases": product_id_aliases,
+                        "sku_aliases": sku_id_aliases,
+                        "searched_merchants": sorted(searched_attached_merchants),
+                    },
+                )
+
             await _append_external_offers_from_seed_rows(list(seed_rows or []))
             _record_source(
                 source="external_product_seeds",
@@ -4045,6 +4134,11 @@ async def _handle_offers_resolve(
                 source_started=external_started,
                 row_count=len(seed_rows or []),
                 query=query_label,
+                extra=(
+                    {"mainline_miss_seed_ids": mainline_miss_seed_ids}
+                    if mainline_miss_seed_ids
+                    else None
+                ),
             )
         except Exception as e:
             logger.info("offers.resolve.external.failed", extra={"error": str(e)})
@@ -4054,7 +4148,7 @@ async def _handle_offers_resolve(
                 reason_code=_classify_db_reason_code(e),
                 source_started=external_started,
                 error=type(e).__name__,
-                query="external_seed_by_ref",
+                query=query_label,
             )
 
     # 2) Internal checkout offers (primary)

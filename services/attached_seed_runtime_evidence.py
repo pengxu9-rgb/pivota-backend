@@ -14,7 +14,7 @@ from services.external_seed_audit import (
     normalize_url_like,
 )
 from services.pci_kb_scope_review import fetch_pci_kb_runtime_evidence_rows_by_source_refs_sync
-from services.reviews_service import build_product_key
+from services.catalog_sync_service import make_catalog_product_key
 
 _COSMETIC_SHADE_HINTS = ("foundation", "lipstick", "blush", "gloss")
 
@@ -297,16 +297,29 @@ async def hydrate_product_payloads_from_attached_seed_runtime_evidence(
     if not product_payloads:
         return product_payloads
 
+    # T1 fix (docs/IDENTITY_REFERENCE.md §4 "Trap T1"): external_product_seeds
+    # .attached_product_key stores the STORAGE format `prod::{merchant}::{platform}::{pid}`
+    # (make_catalog_product_key), NOT the pipe transport form that build_product_key emits.
+    # The prior pipe-format prefix + pipe-keyed membership dict matched zero prod rows —
+    # the same dead-path bug as _fetch_attached_seed_rows in routes/agent_shop_gateway.py.
     product_keys: Dict[str, int] = {}
     for index, payload in enumerate(product_payloads):
         platform_product_id = normalize_non_empty_string(payload.get("product_id") or payload.get("id"))
         if not platform_product_id:
             continue
-        product_keys[build_product_key(merchant_id=merchant_id, platform=platform, platform_product_id=platform_product_id)] = index
+        product_keys[make_catalog_product_key(merchant_id, platform, platform_product_id)] = index
 
     if not product_keys:
         return product_payloads
 
+    # Escape LIKE wildcards: merchant ids contain '_'. The exact `product_key in
+    # product_keys` membership check below is the real filter, so the prefix only prunes.
+    escaped_prefix = (
+        str(merchant_id).replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+    )
+    escaped_platform = (
+        str(platform).replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+    )
     try:
         seed_rows = await database.fetch_all(
             """
@@ -315,9 +328,9 @@ async def hydrate_product_payloads_from_attached_seed_runtime_evidence(
             FROM external_product_seeds
             WHERE status = 'active'
               AND attached_product_key IS NOT NULL
-              AND attached_product_key LIKE :product_key_prefix
+              AND attached_product_key LIKE :product_key_prefix ESCAPE '\\'
             """,
-            {"product_key_prefix": f"{merchant_id}|{platform}|%"},
+            {"product_key_prefix": f"prod::{escaped_prefix}::{escaped_platform}::%"},
         )
     except Exception:
         return product_payloads

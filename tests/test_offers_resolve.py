@@ -1,5 +1,7 @@
 import asyncio
+import logging
 import os
+import re
 from unittest.mock import AsyncMock
 
 import pytest
@@ -880,3 +882,270 @@ def test_offers_resolve_pure_internal_order_unchanged_end_to_end(
     # Source row order (merch_a before merch_b) is preserved.
     sellers_or_ids = [str((o.get("source") or {}).get("product_id") or "") for o in offers]
     assert sellers_or_ids[0] == "prod_pure_a"
+
+
+# ---------------------------------------------------------------------------
+# T1 — attached-seed mainline matches the STORAGE format (prod::…), never pipe.
+# Regression for the confirmed dead path in _fetch_attached_seed_rows
+# (docs/IDENTITY_REFERENCE.md "Trap T1"; ADR-009 §Prerequisite fix). The existing
+# offers.resolve tests mock fetch_all by query STRING and return canned rows
+# regardless of the WHERE params, so they never exercised the match-key format —
+# which is exactly how the pipe-vs-prod:: bug survived. These tests SIMULATE the SQL
+# match so the key construction is actually load-bearing.
+# ---------------------------------------------------------------------------
+
+
+def _like_to_regex(pattern: str) -> "re.Pattern[str]":
+    """Translate a SQL ``LIKE ... ESCAPE '\\'`` pattern to an anchored regex."""
+    out: list[str] = []
+    i = 0
+    while i < len(pattern):
+        c = pattern[i]
+        if c == "\\" and i + 1 < len(pattern):
+            out.append(re.escape(pattern[i + 1]))
+            i += 2
+            continue
+        if c == "%":
+            out.append(".*")
+        elif c == "_":
+            out.append(".")
+        else:
+            out.append(re.escape(c))
+        i += 1
+    return re.compile("^" + "".join(out) + "$")
+
+
+def _attached_query_matches(stored: dict, params: dict) -> bool:
+    """Replay the _fetch_attached_seed_rows WHERE clause against one stored seed:
+    ``attached_product_key LIKE :attached_prefix AND (pid clauses OR variant clauses)``.
+
+    pid params (``attached_pid_*``) match ``attached_product_key`` as LIKE/equality;
+    variant params (``attached_sku_*``) match ``attached_variant_id`` by equality.
+    """
+    apk = str(stored.get("attached_product_key") or "")
+    avid = str(stored.get("attached_variant_id") or "")
+    prefix = params.get("attached_prefix")
+    if not prefix or not _like_to_regex(prefix).match(apk):
+        return False
+    for key, value in params.items():
+        if key.startswith("attached_pid_") and _like_to_regex(str(value)).match(apk):
+            return True
+        if key.startswith("attached_sku_") and str(value) == avid:
+            return True
+    return False
+
+
+_STORAGE_SEED = {
+    "id": "eps_storage_1",
+    "external_product_id": "ext_storage_1",
+    "market": "US",
+    "tool": "*",
+    "destination_url": "https://brand.example/products/thing",
+    "canonical_url": "https://brand.example/products/thing",
+    "domain": "brand.example",
+    "title": "Storage Format Offer",
+    "price_amount": 42.0,
+    "price_currency": "USD",
+    "availability": "in_stock",
+    "utm_template": None,
+    # REAL prod:: storage-format key (make_catalog_product_key(merch_x, shopify, 123)).
+    "attached_product_key": "prod::merch_x::shopify::123",
+    "attached_variant_id": "var_9",
+    "seed_data": {
+        "brand": "Brand Example",
+        "variants": [
+            {
+                "variant_id": "var_9",
+                "title": "Variant Nine",
+                "price_amount": 42.0,
+                "price_currency": "USD",
+                "availability": "in_stock",
+            }
+        ],
+    },
+    "status": "active",
+}
+
+
+def test_fetch_attached_seed_matches_storage_format_key(
+    monkeypatch: pytest.MonkeyPatch, client: TestClient
+) -> None:
+    """POSITIVE: a seed whose attached_product_key is the REAL prod:: storage form is
+    matched by _fetch_attached_seed_rows when the caller passes the raw platform ids
+    (product '123', variant 'var_9'). If the handler built pipe-format keys (the bug),
+    the simulated SQL match would find nothing and no external offer would surface."""
+    import routes.agent_shop_gateway as gateway
+
+    captured: dict = {}
+
+    async def fake_fetch_all(query: str, values=None):
+        q = str(query)
+        if "FROM external_product_seeds" in q and "attached_product_key IS NOT NULL" in q and "attached_prefix" in q:
+            captured["attached_params"] = dict(values or {})
+            return [dict(_STORAGE_SEED)] if _attached_query_matches(_STORAGE_SEED, values or {}) else []
+        if "FROM external_product_seeds" in q:
+            return []  # fuzzy must not be needed
+        if "FROM products_cache" in q:
+            return []  # external-only; no internal offer
+        return []
+
+    async def fake_gate(*args, **kwargs):
+        return False, type("GateStatus", (), {"blocker_anomaly_types": []})()
+
+    monkeypatch.setattr(gateway.database, "fetch_all", fake_fetch_all)
+    monkeypatch.setattr(gateway, "should_block_external_referral_runtime", fake_gate)
+    monkeypatch.setattr(gateway, "_make_external_redirect_url", AsyncMock(return_value="https://example.com/r?token=storage"))
+
+    res = client.post(
+        "/agent/shop/v1/invoke",
+        json={
+            "operation": "offers.resolve",
+            "payload": {
+                "product": {"product_id": "123", "sku_id": "var_9", "merchant_id": "merch_x"},
+                "limit": 10,
+                "market": "US",
+                "tool": "*",
+            },
+            "metadata": {"source": "creator-agent-ui"},
+        },
+    )
+    assert res.status_code == 200
+    body = res.json()
+    offers = body.get("offers") or []
+    external = [o for o in offers if o.get("purchase_route") == "affiliate_outbound"]
+    assert external, "the storage-format attached seed must surface via the attached-ref mainline"
+    assert external[0]["source"]["external_product_id"] == "ext_storage_1"
+
+    metadata = body.get("metadata") or {}
+    assert any(
+        str(s.get("source")) == "external_product_seeds"
+        and str(s.get("query")) == "external_seed_by_attached_ref"
+        for s in (metadata.get("sources") or [])
+    ), "the match must be labeled as the attached-ref mainline, not fuzzy"
+
+    # Format pin: the match keys the handler built are prod:: storage form, never pipe.
+    params = captured.get("attached_params") or {}
+    assert params, "the attached-ref query must have run"
+    assert str(params["attached_prefix"]).startswith("prod::merch")
+    for key, value in params.items():
+        if key.startswith("attached_pid_"):
+            assert str(value).startswith("prod::"), f"{key}={value!r} must be prod:: storage form"
+        if key != "limit":
+            assert "|" not in str(value), f"no pipe-format key may be built: {key}={value!r}"
+
+
+def test_fetch_attached_seed_pipe_format_key_finds_nothing(
+    monkeypatch: pytest.MonkeyPatch, client: TestClient
+) -> None:
+    """NEGATIVE (pins the storage format): a seed stored in the legacy PIPE form is NOT
+    matched by the (now storage-format) match keys — reproducing the exact prod fact
+    (8,004 prod:: rows match, 0 pipe rows). It must not surface via the attached-ref path."""
+    import routes.agent_shop_gateway as gateway
+
+    pipe_seed = dict(_STORAGE_SEED, id="eps_pipe_1", attached_product_key="merch_x|shopify|123")
+    saw_fuzzy = {"ran": False}
+
+    async def fake_fetch_all(query: str, values=None):
+        q = str(query)
+        if "FROM external_product_seeds" in q and "attached_product_key IS NOT NULL" in q and "attached_prefix" in q:
+            # Simulate matching the storage-format params against a PIPE-stored seed.
+            return [dict(pipe_seed)] if _attached_query_matches(pipe_seed, values or {}) else []
+        if "FROM external_product_seeds" in q:
+            saw_fuzzy["ran"] = True
+            return []  # fuzzy also finds nothing in this test
+        if "FROM products_cache" in q:
+            return []
+        return []
+
+    async def fake_gate(*args, **kwargs):
+        return False, type("GateStatus", (), {"blocker_anomaly_types": []})()
+
+    monkeypatch.setattr(gateway.database, "fetch_all", fake_fetch_all)
+    monkeypatch.setattr(gateway, "should_block_external_referral_runtime", fake_gate)
+    monkeypatch.setattr(gateway, "_make_external_redirect_url", AsyncMock(return_value="https://example.com/r?token=pipe"))
+
+    res = client.post(
+        "/agent/shop/v1/invoke",
+        json={
+            "operation": "offers.resolve",
+            "payload": {
+                "product": {"product_id": "123", "sku_id": "var_9", "merchant_id": "merch_x"},
+                "limit": 10,
+                "market": "US",
+                "tool": "*",
+            },
+            "metadata": {"source": "creator-agent-ui"},
+        },
+    )
+    assert res.status_code == 200
+    body = res.json()
+    offers = body.get("offers") or []
+    assert not [o for o in offers if o.get("purchase_route") == "affiliate_outbound"], (
+        "a pipe-format attached_product_key must NOT match the storage-format mainline"
+    )
+    assert saw_fuzzy["ran"], "control: the fuzzy path still ran (the pipe seed simply matched nothing)"
+
+
+def test_fetch_attached_seed_fuzzy_surfacing_is_observable_mainline_miss(
+    monkeypatch: pytest.MonkeyPatch, client: TestClient, caplog: pytest.LogCaptureFixture
+) -> None:
+    """OBSERVABILITY: when the fuzzy path surfaces a seed that HAS a storage-format
+    attached_product_key for a (merchant, pid) the attached-ref mainline actually
+    searched, that is a mainline MISS — it must be logged (attached_seed_mainline_miss)
+    and stamped on the source metadata, while the offer is still delivered honestly."""
+    import routes.agent_shop_gateway as gateway
+
+    async def fake_fetch_all(query: str, values=None):
+        q = str(query)
+        if "FROM external_product_seeds" in q and "attached_product_key IS NOT NULL" in q and "attached_prefix" in q:
+            return []  # simulate a residual attached-ref gap
+        if "FROM external_product_seeds" in q and "external_product_id =" in q:
+            return [dict(_STORAGE_SEED, id="eps_miss_1")]  # fuzzy surfaces the attached seed
+        if "FROM external_product_seeds" in q:
+            return []
+        if "FROM products_cache" in q:
+            return []
+        return []
+
+    async def fake_gate(*args, **kwargs):
+        return False, type("GateStatus", (), {"blocker_anomaly_types": []})()
+
+    monkeypatch.setattr(gateway.database, "fetch_all", fake_fetch_all)
+    monkeypatch.setattr(gateway, "should_block_external_referral_runtime", fake_gate)
+    monkeypatch.setattr(gateway, "_make_external_redirect_url", AsyncMock(return_value="https://example.com/r?token=miss"))
+
+    with caplog.at_level(logging.WARNING):
+        res = client.post(
+            "/agent/shop/v1/invoke",
+            json={
+                "operation": "offers.resolve",
+                "payload": {
+                    "product": {"product_id": "123", "sku_id": "var_9", "merchant_id": "merch_x"},
+                    "limit": 10,
+                    "market": "US",
+                    "tool": "*",
+                },
+                "metadata": {"source": "creator-agent-ui"},
+            },
+        )
+    assert res.status_code == 200
+    body = res.json()
+
+    # Honest delivery: the offer still surfaces.
+    offers = body.get("offers") or []
+    assert [o for o in offers if o.get("purchase_route") == "affiliate_outbound"], "the offer must still be delivered"
+
+    # Observable: a distinct WARNING fired naming the missed seed.
+    miss_records = [r for r in caplog.records if r.message == "attached_seed_mainline_miss"]
+    assert miss_records, "the fuzzy surfacing of an attached seed must emit a mainline-miss warning"
+    assert "eps_miss_1" in (getattr(miss_records[0], "seed_ids", []) or [])
+
+    # Truthful label + stamped metadata so telemetry can alarm on the fuzzy:attached ratio.
+    metadata = body.get("metadata") or {}
+    seed_source = next(
+        (s for s in (metadata.get("sources") or []) if str(s.get("source")) == "external_product_seeds"),
+        None,
+    )
+    assert seed_source is not None
+    assert str(seed_source.get("query")) == "external_seed_by_fuzzy_ref"
+    assert "eps_miss_1" in (seed_source.get("mainline_miss_seed_ids") or [])
