@@ -266,6 +266,32 @@ async def ensure_required_schema_light() -> None:
                     """
                 )
             )
+            # Allow 'partner_invite' in partner_send_log so the invite auto-email
+            # is recorded in "Recent sends" (migration 172). Prod fast mode skips
+            # db/migrations/, so widen the CHECK here on startup (DROP+ADD is
+            # idempotent). Without it the invite send-log INSERT violates the
+            # settlement-only template CHECK and is silently dropped.
+            await database.execute(
+                text(
+                    "ALTER TABLE IF EXISTS partner_send_log "
+                    "DROP CONSTRAINT IF EXISTS ck_partner_send_log_template;"
+                )
+            )
+            await database.execute(
+                text(
+                    """
+                    ALTER TABLE IF EXISTS partner_send_log
+                      ADD CONSTRAINT ck_partner_send_log_template CHECK (
+                        template_id IN (
+                          'settlement_monthly',
+                          'settlement_skipped',
+                          'settlement_failed_notice',
+                          'partner_invite'
+                        )
+                      );
+                    """
+                )
+            )
             # Merchant portal primary-store selection (migration 089).
             # Production fast mode skips db/migrations/, so keep the
             # critical column and invariant available at startup.
