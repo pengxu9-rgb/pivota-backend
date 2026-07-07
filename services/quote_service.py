@@ -29,7 +29,7 @@ from services.store_discount_evidence_service import (
 )
 from services.savings_presentation_service import build_savings_presentation
 from services.shopify_promotions_sync import sync_shopify_promotions_for_merchant
-from services.shopify_pricing_service import ShopifyPricingError, ShopifyPricingService
+from services.shopify_pricing_service import ShopifyPricingError
 from services.shopify_storefront_pricing_service import ShopifyStorefrontPricingService
 from utils.logger import logger
 
@@ -181,7 +181,6 @@ class QuoteService:
     def __init__(self):
         self.ttl_seconds = int(os.getenv("QUOTE_TTL_SECONDS", "600"))
         self.pricing_storefront = ShopifyStorefrontPricingService()
-        self.pricing_admin_checkout = ShopifyPricingService()
 
     async def preview_quote(
         self,
@@ -220,9 +219,15 @@ class QuoteService:
 
         result = None
         attempts: List[Dict[str, Any]] = []
-        storefront_err: Optional[ShopifyPricingError] = None
-        admin_err: Optional[ShopifyPricingError] = None
 
+        # Storefront Cart is the ONE pricing mainline. The former Admin-Checkout
+        # fallback (ShopifyPricingService.preview_checkout_quote → Admin
+        # POST /checkouts.json) required write_checkouts — a scope NO install type
+        # holds by deliberate decision — so it could only ever 403, AND it shipped
+        # customer_email + shipping_address to Shopify. Per the founder no-fallback
+        # directive it is removed: a failed Storefront quote fails honestly here.
+        # The inventory hard-fail (OUT_OF_STOCK/INSUFFICIENT_INVENTORY) is kept
+        # exactly as-is (audit fix #7).
         try:
             result = await self.pricing_storefront.preview_cart_quote(
                 merchant_id=merchant_id,
@@ -233,10 +238,9 @@ class QuoteService:
                 selected_delivery_option=selected_delivery_option,
             )
         except ShopifyPricingError as e:
-            storefront_err = e
-            # Do not fall back to other engines when Shopify explicitly rejects inventory.
-            # Our checkout creates orders via Shopify Admin API (not Shopify checkout), so we must
-            # treat these as hard failures to avoid charging buyers for unavailable items.
+            # Do not mask inventory rejections. Our checkout creates orders via the
+            # Shopify Admin API (not Shopify checkout), so these are hard failures
+            # to avoid charging buyers for unavailable items.
             if e.code in {"OUT_OF_STOCK", "INSUFFICIENT_INVENTORY"}:
                 raise QuoteError(
                     e.code,
@@ -253,39 +257,15 @@ class QuoteService:
                     "details": getattr(e, "details", {}) or {},
                 }
             )
-
-        if result is None:
-            try:
-                result = await self.pricing_admin_checkout.preview_checkout_quote(
-                    merchant_id=merchant_id,
-                    items=normalized_items,
-                    discount_codes=codes,
-                    customer_email=customer_email,
-                    shipping_address=normalized_shipping,
-                    selected_delivery_option=selected_delivery_option,
-                )
-            except ShopifyPricingError as e:
-                admin_err = e
-                attempts.append(
-                    {
-                        "engine": "shopify_rest_checkout",
-                        "code": e.code,
-                        "message": e.message,
-                        "debug_id": e.debug_id,
-                        "details": getattr(e, "details", {}) or {},
-                    }
-                )
-
-        if result is None:
-            preferred = storefront_err or admin_err
-            if preferred is None:
-                raise QuoteError("SHOPIFY_PRICING_UNAVAILABLE", "Pricing engine unavailable")
             raise QuoteError(
-                preferred.code,
-                preferred.message,
-                debug_id=preferred.debug_id,
+                e.code,
+                e.message,
+                debug_id=e.debug_id,
                 details={"attempts": attempts},
             )
+
+        if result is None:
+            raise QuoteError("SHOPIFY_PRICING_UNAVAILABLE", "Pricing engine unavailable")
 
         self._raise_if_shipping_unverified(
             shipping_address=normalized_shipping,
