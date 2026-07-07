@@ -244,6 +244,9 @@ async def _onboard(cohort: List[Dict[str, Any]]) -> None:
             quality_payload=build_servable_quality_payload(
                 title=p["title"], description=p.get("description"), price=p.get("price_amount"),
                 image_url=p.get("image_url"), brand=p.get("brand"), product_type=p.get("product_type"),
+                # category_kind is always set (never null) → lets brand+category
+                # score; raw_inci feeds the source-backed attributes component.
+                category=p.get("category_kind"), raw_inci=p.get("raw_inci"),
             ),
             reason=TOOL,
         )
