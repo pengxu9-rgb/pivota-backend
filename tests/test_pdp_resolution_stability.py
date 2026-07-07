@@ -129,11 +129,83 @@ def test_products_resolve_hits_known_products(monkeypatch: pytest.MonkeyPatch, c
         assert body.get("resolved") is True
         assert body.get("reason_code") == "OK"
         assert body["candidate_count"] > 0
-        assert (body.get("canonical_ref") or "").startswith("pc:")
+        # ADR-009 decision 1 (no-fallback): grouped products key on pg — the
+        # group lookup runs even on the exact-identifier fast path.
+        assert body.get("canonical_ref") == f"pg:pg_{pid}"
+        assert body.get("canonical_identity_status") == "resolved"
+        assert body.get("canonical_product_group_id") == f"pg_{pid}"
         assert body.get("metadata", {}).get("reason_code") == "OK"
         sources = body.get("metadata", {}).get("sources") or []
         assert any(s.get("source") == "products_cache_exact" and s.get("ok") is True for s in sources)
+        assert any(s.get("source") == "product_group_members" and s.get("ok") is True for s in sources)
         assert all("latency_ms" in s for s in sources)
+
+
+def _iter_strings(obj):
+    """Yield every string anywhere inside a JSON-shaped payload."""
+    if isinstance(obj, str):
+        yield obj
+    elif isinstance(obj, dict):
+        for k, v in obj.items():
+            yield from _iter_strings(k)
+            yield from _iter_strings(v)
+    elif isinstance(obj, (list, tuple)):
+        for item in obj:
+            yield from _iter_strings(item)
+
+
+def test_products_resolve_ungrouped_product_is_honest_absent_never_pc(
+    monkeypatch: pytest.MonkeyPatch,
+    client: TestClient,
+) -> None:
+    """ADR-009 ratified decision 1 (no-fallback), mirrored from
+    tests/test_offers_resolve.py: a product with NO product_group_members row
+    resolves with canonical_ref None and canonical_identity_status ==
+    'no_canonical_identity' — and NOTHING anywhere in the response carries a
+    merchant-scoped `pc:` ref (the removed fallback must not resurface)."""
+    import routes.agent_api as agent_api
+
+    pid = "9886499864904"
+
+    async def fake_search(**kwargs):
+        raise AssertionError("exact resolve path should not call agent_search_products for direct product_id hits")
+
+    async def fake_fetch_all(query: str, values=None):
+        q = str(query)
+        values = values or {}
+        if "FROM products_cache" in q and "platform_product_id = ANY(:pid_aliases)" in q:
+            if pid in set(values.get("pid_aliases") or []):
+                return [_build_product_cache_row(pid, KNOWN_PRODUCTS[pid])]
+            return []
+        if "FROM product_group_members" in q:
+            return []  # pg-NULL product: no membership row anywhere
+        return []
+
+    monkeypatch.setattr(agent_api.database, "fetch_all", fake_fetch_all)
+    monkeypatch.setattr(agent_api, "agent_search_products", fake_search)
+
+    res = client.get(
+        f"/agent/v1/products/resolve?merchant_id={KNOWN_MERCHANT_ID}&product_id={pid}&limit=10",
+        headers={"X-API-Key": "test-api-key"},
+    )
+    assert res.status_code == 200
+    body = res.json()
+    assert body["status"] == "success"
+    assert body.get("resolved") is True, "the candidate itself is still served — only the canonical ref is absent"
+    assert body["candidate_count"] > 0
+
+    assert body.get("canonical_ref") is None
+    assert body.get("canonical_identity_status") == "no_canonical_identity"
+    assert body.get("canonical_product_group_id") is None
+    # canonical_product stays a best-effort merchant-level pointer.
+    canonical_product = body.get("canonical_product") or {}
+    assert canonical_product.get("product_id") == pid
+    assert canonical_product.get("product_group_id") is None
+
+    # The banned fallback must not resurface ANYWHERE in the response — not
+    # in candidates, canonical_product, sources, or any nested string.
+    pc_strings = [s for s in _iter_strings(body) if s.startswith("pc:")]
+    assert pc_strings == [], f"merchant-scoped pc: refs must never be minted: {pc_strings}"
 
 
 def test_products_resolve_reports_db_ambiguous_param_and_skips_global_fallback(
