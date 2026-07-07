@@ -19,9 +19,11 @@ from __future__ import annotations
 
 from services.agent_center_bd_report_service import (
     _BAND_DISPLAY,
+    _BLOCKED_BUT_CITED_BAND_DISPLAY,
     _DIMENSION_BAND_MEANING,
     _DIMENSION_DISPLAY,
     _attach_dimension_display,
+    _band_display,
     _band_for_score,
     _dimension_band,
     _dimension_display,
@@ -83,6 +85,8 @@ def _all_copy_strings():
     for entry in _BAND_DISPLAY.values():
         yield entry.get("label", "")
         yield entry.get("meaning", "")
+    yield _BLOCKED_BUT_CITED_BAND_DISPLAY["label"]
+    yield _BLOCKED_BUT_CITED_BAND_DISPLAY["meaning"]
     for entry in _DIMENSION_DISPLAY.values():
         yield entry.get("label", "")
         yield entry.get("question", "")
@@ -125,6 +129,49 @@ def test_dimension_display_emits_expected_band_and_meaning():
     none_disp = _dimension_display("routability", None)
     assert none_disp["band"] == "unscored"
     assert none_disp["band_label"] == "Not measured"
+
+
+def _scores(citation=None, **others):
+    scores = {dim: {"score": val} for dim, val in others.items()}
+    scores["citation"] = {"score": citation}
+    return scores
+
+
+def test_band_display_softens_blocked_when_citation_partial_or_better():
+    # The ANUKO URL-wedge shape: identity/routability structurally blocked
+    # (no catalog anchor / no buyable offer), content thin, citation PARTIAL.
+    # The SKU band is honestly "blocked" (min of dimensions) but the flat
+    # "Not yet visible / can't recommend" copy would contradict the nonzero
+    # citations rendered beside it — so the label/meaning soften while the
+    # raw enum stays "blocked" for everything that branches on it.
+    for citation in (40, 52, 70, 100):
+        disp = _band_display("blocked", _scores(citation=citation, identity=16, routability=6))
+        assert disp["band"] == "blocked", citation
+        assert disp["label"] == _BLOCKED_BUT_CITED_BAND_DISPLAY["label"], citation
+        assert disp["meaning"] == _BLOCKED_BUT_CITED_BAND_DISPLAY["meaning"], citation
+
+
+def test_band_display_keeps_hard_copy_when_citation_blocked_or_unscored():
+    hard = _BAND_DISPLAY["blocked"]
+    for citation in (None, 0, 12, 39):
+        disp = _band_display("blocked", _scores(citation=citation, identity=16))
+        assert disp["band"] == "blocked", citation
+        assert disp["label"] == hard["label"], citation
+        assert disp["meaning"] == hard["meaning"], citation
+    # No scores at all (plain enum→copy map) — unchanged behavior.
+    disp = _band_display("blocked")
+    assert disp["label"] == hard["label"]
+
+
+def test_band_display_softening_only_applies_to_blocked():
+    # A partial/ready/agent_ready SKU band keeps its own copy regardless of
+    # how strong citation is — the softening exists only to fix the blocked
+    # contradiction, not to re-band anything.
+    for band in ("partial", "ready", "agent_ready"):
+        disp = _band_display(band, _scores(citation=90, identity=90))
+        assert disp["band"] == band
+        assert disp["label"] == _BAND_DISPLAY[band]["label"]
+        assert disp["meaning"] == _BAND_DISPLAY[band]["meaning"]
 
 
 def test_attach_dimension_display_is_additive():

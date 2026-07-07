@@ -6160,10 +6160,39 @@ def _dimension_display(dimension: str, score: Optional[int]) -> Dict[str, str]:
     }
 
 
-def _band_display(band: str) -> Dict[str, str]:
-    """Merchant-safe {band, label, meaning} for a SKU-level (or rollup) band."""
+# When the SKU-level band is "blocked" (min across dimensions) but the citation
+# dimension itself measured partial or better, the flat "Not yet visible" /
+# "AI can't reliably find or recommend this yet" copy contradicts the nonzero
+# citations rendered right below it. URL-wedge audits hit this structurally —
+# identity and routability can't clear their catalog-anchored buckets without a
+# connected store, so the min lands in blocked-band even when AI demonstrably
+# recommends the product — but the contradiction is the same on any tier.
+# Mirror of _VERDICT_INVISIBLE_WITH_CITATIONS_LABEL (#1196): display-only. The
+# raw band enum stays "blocked" for everything that branches on it
+# (blocked_skus rollup, band_rank sorting, re-audit deltas, frontend).
+_BLOCKED_BUT_CITED_BAND_DISPLAY: Dict[str, str] = {
+    "label": "Recommended, but not agent-ready",
+    "meaning": "AI already recommends this sometimes, but gaps elsewhere keep it from being reliably identified and bought.",
+}
+
+
+def _band_display(
+    band: str, scores: Optional[Dict[str, Any]] = None
+) -> Dict[str, str]:
+    """Merchant-safe {band, label, meaning} for a SKU-level (or rollup) band.
+
+    Pass the SKU's `scores` to enable the blocked-but-cited softening; omit it
+    (default) for a plain enum→copy map.
+    """
     copy_ = _BAND_DISPLAY.get(band, _BAND_DISPLAY["blocked"])
-    return {"band": band, "label": copy_["label"], "meaning": copy_["meaning"]}
+    label, meaning = copy_["label"], copy_["meaning"]
+    if band == "blocked" and isinstance(scores, dict):
+        citation = scores.get("citation")
+        citation_score = citation.get("score") if isinstance(citation, dict) else None
+        if citation_score is not None and _band_for_score(citation_score) != "blocked":
+            label = _BLOCKED_BUT_CITED_BAND_DISPLAY["label"]
+            meaning = _BLOCKED_BUT_CITED_BAND_DISPLAY["meaning"]
+    return {"band": band, "label": label, "meaning": meaning}
 
 
 def _attach_dimension_display(scores: Dict[str, Any]) -> None:
@@ -6567,8 +6596,10 @@ async def build_per_sku_report(
         "deliverability": deliverability,
         "band": sku_band,
         # Merchant-safe label + meaning for the SKU-level band so the frontend
-        # never renders the raw enum (e.g. "band: agent_ready").
-        "band_display": _band_display(sku_band),
+        # never renders the raw enum (e.g. "band: agent_ready"). `scores` is
+        # passed so a blocked band with partial+ citation gets the coherent
+        # blocked-but-cited copy instead of "Not yet visible".
+        "band_display": _band_display(sku_band, scores),
         "primary_gaps": primary_gaps,
         # W2 pinned measurement basis: the LLM-generated prompt lists this SKU
         # was measured against, with a stable prompt_set_id. The NEXT run's
