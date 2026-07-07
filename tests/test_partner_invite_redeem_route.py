@@ -18,9 +18,12 @@ def _build_client(
     app = FastAPI()
     app.include_router(module.router)
     if authenticated:
-        app.dependency_overrides[module.require_approved_merchant] = lambda: {
+        # The route resolves the caller via _resolve_merchant_for_redeem
+        # (X-Merchant-API-Key or Bearer JWT, any merchant status), which returns
+        # just {"merchant_id": ...}. Unauthenticated (no override) exercises the
+        # real dependency, which raises 401 when neither credential is present.
+        app.dependency_overrides[module._resolve_merchant_for_redeem] = lambda: {
             "merchant_id": merchant_id,
-            "status": "approved",
         }
     return TestClient(app), app
 
