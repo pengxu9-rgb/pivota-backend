@@ -9,6 +9,8 @@ double-counts GMV. See tier2_v1_build_plan §T2-2 (gaps #3, #4).
 
 from __future__ import annotations
 
+import json
+import logging
 import sys
 from pathlib import Path
 from typing import Any, Dict, Optional
@@ -220,6 +222,128 @@ async def test_missing_keys_skip(monkeypatch):
         gross_amount_cents=1, currency="USD",
     ) is None
     assert fake.insert_attempts == 0
+
+
+# --- ADR-009 §D3: interim seller-mismatch guard --------------------------------
+
+
+def _stored_metadata(fake: "FakeDB") -> Dict[str, Any]:
+    stored = next(iter(fake.edges.values()))
+    return json.loads(stored["metadata"])
+
+
+@pytest.mark.asyncio
+async def test_matching_converting_domain_is_not_flagged_and_counted(monkeypatch):
+    # Converting store == the click's redirect destination host → honest match:
+    # no seller_mismatch stamp, so T2-3 counts it.
+    fake = FakeDB(click_row=_click_row(dest_domain="teststore.myshopify.com"))
+    monkeypatch.setattr(svc, "database", fake)
+
+    result = await svc.close_external_order_conversion(
+        merchant_id="merch_test", click_id="clk_known",
+        external_order_id="6100", gross_amount_cents=4999, currency="USD",
+        converting_shop_domain="teststore.myshopify.com",
+    )
+    assert result["seller_mismatch"] is False
+    assert result["seller_domain_unverified"] is False
+    md = _stored_metadata(fake)
+    assert "seller_mismatch" not in md            # no false flag
+    assert md["converting_shop_domain"] == "teststore.myshopify.com"  # forensics
+    assert md["click_dest_domain"] == "teststore.myshopify.com"
+
+
+@pytest.mark.asyncio
+async def test_mismatched_converting_domain_is_flagged_and_warned(monkeypatch, caplog):
+    # Converting store != the click's destination host → the sale happened on a
+    # store other than the seed's destination seller. Record the edge but stamp
+    # seller_mismatch=true (excluded downstream) and WARN with the distinct key.
+    fake = FakeDB(click_row=_click_row(dest_domain="brand-a.myshopify.com"))
+    monkeypatch.setattr(svc, "database", fake)
+
+    with caplog.at_level(logging.WARNING, logger="commerce_attribution_service"):
+        result = await svc.close_external_order_conversion(
+            merchant_id="merch_test", click_id="clk_known",
+            external_order_id="6101", gross_amount_cents=4999, currency="USD",
+            converting_shop_domain="seller-b.myshopify.com",
+        )
+    assert result["seller_mismatch"] is True
+    md = _stored_metadata(fake)
+    assert md["seller_mismatch"] is True
+    assert md["converting_shop_domain"] == "seller-b.myshopify.com"
+    assert md["click_dest_domain"] == "brand-a.myshopify.com"
+    # edge is still recorded (honest gap, not dropped)
+    assert len(fake.edges) == 1
+    # WARNING fired with the distinct event key
+    assert any(
+        "external_conversion_seller_mismatch" in r.message and r.levelno == logging.WARNING
+        for r in caplog.records
+    )
+
+
+@pytest.mark.asyncio
+async def test_unknown_converting_domain_is_unverified_not_flagged(monkeypatch, caplog):
+    # Caller supplies no converting_shop_domain (predates the guard) → stamp
+    # seller_domain_unverified (observable) but STILL count it; never a mismatch.
+    fake = FakeDB(click_row=_click_row(dest_domain="teststore.myshopify.com"))
+    monkeypatch.setattr(svc, "database", fake)
+
+    with caplog.at_level(logging.INFO, logger="commerce_attribution_service"):
+        result = await svc.close_external_order_conversion(
+            merchant_id="merch_test", click_id="clk_known",
+            external_order_id="6102", gross_amount_cents=4999, currency="USD",
+            converting_shop_domain=None,
+        )
+    assert result["seller_domain_unverified"] is True
+    assert result["seller_mismatch"] is False
+    md = _stored_metadata(fake)
+    assert md["seller_domain_unverified"] is True
+    assert "seller_mismatch" not in md
+    assert "converting_shop_domain" not in md      # nothing to record
+    assert any("UNVERIFIED" in r.message for r in caplog.records)
+
+
+@pytest.mark.asyncio
+async def test_unmatched_click_with_domain_stamps_forensics_not_mismatch(monkeypatch):
+    # click_matched=false (no click row) → already excluded by the click gate; the
+    # guard must NOT double-guard with seller_mismatch, but DOES stamp the
+    # converting domain for forensics.
+    fake = FakeDB(click_row=None)
+    monkeypatch.setattr(svc, "database", fake)
+
+    result = await svc.close_external_order_conversion(
+        merchant_id="merch_test", click_id="clk_ghost",
+        external_order_id="6103", gross_amount_cents=1234, currency="USD",
+        converting_shop_domain="seller-b.myshopify.com",
+    )
+    assert result["click_matched"] is False
+    assert result["seller_mismatch"] is False
+    md = _stored_metadata(fake)
+    assert md["converting_shop_domain"] == "seller-b.myshopify.com"
+    assert "seller_mismatch" not in md
+    assert "click_dest_domain" not in md
+
+
+@pytest.mark.asyncio
+async def test_mismatch_replay_is_idempotent(monkeypatch):
+    # A mismatched conversion re-closed → no duplicate edge, still one stamped edge.
+    fake = FakeDB(click_row=_click_row(dest_domain="brand-a.myshopify.com"))
+    monkeypatch.setattr(svc, "database", fake)
+
+    first = await svc.close_external_order_conversion(
+        merchant_id="merch_test", click_id="clk_known",
+        external_order_id="6104", gross_amount_cents=5000, currency="USD",
+        converting_shop_domain="seller-b.myshopify.com",
+    )
+    second = await svc.close_external_order_conversion(
+        merchant_id="merch_test", click_id="clk_known",
+        external_order_id="6104", gross_amount_cents=5000, currency="USD",
+        converting_shop_domain="seller-b.myshopify.com",
+    )
+    assert first["replayed"] is False and first["seller_mismatch"] is True
+    assert second["replayed"] is True and second["seller_mismatch"] is True
+    assert fake.insert_attempts == 2
+    assert len(fake.edges) == 1  # guard held → no dup
+    assert _stored_metadata(fake)["seller_mismatch"] is True
 
 
 # --- (d) currency / amount parsed to cents correctly ---------------------------

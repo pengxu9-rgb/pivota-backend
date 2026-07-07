@@ -165,6 +165,15 @@ partially overlap. This is the root cause behind the shared `external_seed` buck
 - **ADR-009:** the edge's `merchant_id` must mean the SELLER of the conversion. Until
   seller_ref lands, closure is only correct for self-anchored seeds (destination ==
   anchor's own store).
+  - **Interim seller-mismatch guard (A9-1, §D3, shipped):** `close_external_order_conversion`
+    now takes `converting_shop_domain` (the caller-authenticated / polled store the
+    sale happened on) and compares its normalized host against the click's
+    `dest_domain`. Host compare is EXACT (no eTLD+1 helper exists — do not hand-roll).
+    On mismatch the edge is still recorded but stamped `metadata.seller_mismatch=true`
+    and EXCLUDED from `aggregated_outcomes` (T2-3 gate `->>'seller_mismatch' IS NOT
+    TRUE`, NULL-safe). A caller that supplies no domain stamps
+    `metadata.seller_domain_unverified=true` and is still counted (unknown is neither
+    a pass nor an exclusion) — expected only from callers predating the guard.
 
 ---
 

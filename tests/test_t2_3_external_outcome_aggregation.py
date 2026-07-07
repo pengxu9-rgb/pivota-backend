@@ -38,11 +38,14 @@ from services import outcome_aggregation_service as svc  # noqa: E402
 # =============================================================================
 
 GATE = "(cae.metadata->>'click_matched')::boolean IS TRUE"
+# ADR-009 §D3 interim seller-mismatch gate — NULL-safe, so legacy/matched edges count.
+SELLER_GATE = "(cae.metadata->>'seller_mismatch')::boolean IS NOT TRUE"
 
 
 def test_product_sql_has_click_matched_gate_and_left_join() -> None:
     sql = svc._product_sql("all_time")
     assert GATE in sql, "product SQL must gate external edges on click_matched=true"
+    assert SELLER_GATE in sql, "product SQL must exclude seller_mismatch edges (ADR-009 D3)"
     assert "LEFT JOIN orders o ON o.order_id = cae.order_id" in sql, "must LEFT (not INNER) JOIN orders"
     assert "cae.state = 'converted'" in sql
     # GMV always from the edge (works with or without an orders row).
@@ -53,6 +56,7 @@ def test_merchant_sql_unions_external_arm_with_gate() -> None:
     sql = svc._merchant_sql("all_time")
     assert "UNION ALL" in sql, "merchant SQL must UNION the external (no-orders-row) arm"
     assert GATE in sql, "merchant external arm must gate on click_matched=true"
+    assert SELLER_GATE in sql, "merchant external arm must exclude seller_mismatch edges (ADR-009 D3)"
     assert "cae.gross_attributed_gmv_cents::numeric / 100" in sql, "external GMV read from the edge"
     # Internal arm preserved verbatim (byte-identical intent).
     assert "(payment_status = ANY(:transacted)) AS is_transacted" in sql
@@ -84,10 +88,15 @@ def _edge(
     *, product: Optional[str], merchant_id: str, order_id: str,
     state: Optional[str] = None, click_matched: Optional[bool] = None,
     gmv_cents: Optional[int] = None, currency: Optional[str] = None,
+    seller_mismatch: Optional[bool] = None, seller_domain_unverified: Optional[bool] = None,
 ) -> Dict[str, Any]:
     metadata: Dict[str, Any] = {}
     if click_matched is not None:
         metadata["click_matched"] = click_matched
+    if seller_mismatch is not None:
+        metadata["seller_mismatch"] = seller_mismatch
+    if seller_domain_unverified is not None:
+        metadata["seller_domain_unverified"] = seller_domain_unverified
     return {
         "canonical_product_id": product, "merchant_id": merchant_id, "order_id": order_id,
         "state": state, "metadata": metadata,
@@ -111,8 +120,14 @@ class PgLikeDB:
 
     @staticmethod
     def _ext_converted(edge: Dict[str, Any]) -> bool:
-        # (cae.state='converted' AND (metadata->>'click_matched')::boolean IS TRUE)
-        return edge.get("state") == "converted" and edge.get("metadata", {}).get("click_matched") is True
+        # (cae.state='converted' AND (metadata->>'click_matched')::boolean IS TRUE
+        #  AND (metadata->>'seller_mismatch')::boolean IS NOT TRUE)  — ADR-009 §D3.
+        md = edge.get("metadata", {})
+        return (
+            edge.get("state") == "converted"
+            and md.get("click_matched") is True
+            and md.get("seller_mismatch") is not True  # NULL-safe: absent/false → counted
+        )
 
     def _merchant_rows(self) -> List[Dict[str, Any]]:
         groups: Dict[str, Dict[str, Any]] = {}
@@ -251,6 +266,39 @@ async def test_external_converted_unmatched_edge_is_excluded() -> None:
     # A forgeable (unmatched) click id must NOT create any outcome row.
     assert ("product", "merch_x|shopify|1") not in out
     assert ("merchant", "merch_x") not in out
+
+
+# --- ADR-009 §D3: seller_mismatch=true external edge → EXCLUDED -------------------
+
+@pytest.mark.asyncio
+async def test_external_seller_mismatch_edge_is_excluded() -> None:
+    # A converted, click_matched edge that was flagged as a seller mismatch (the
+    # sale happened on a store other than the seed's destination seller) must not
+    # inflate the outcome signal — honest gap over misattribution.
+    edges = [_edge(
+        product="merch_x|shopify|1", merchant_id="merch_x", order_id="ext_mism",
+        state="converted", click_matched=True, seller_mismatch=True,
+        gmv_cents=7777, currency="USD",
+    )]
+    out = await _run(orders=[], edges=edges)
+    assert ("product", "merch_x|shopify|1") not in out
+    assert ("merchant", "merch_x") not in out
+
+
+# --- ADR-009 §D3: seller_domain_unverified edge → STILL counted (legacy-compat) ---
+
+@pytest.mark.asyncio
+async def test_external_seller_domain_unverified_edge_is_counted() -> None:
+    # Unknown converting domain (caller predating the guard) is stamped
+    # seller_domain_unverified but is NOT a mismatch → it still counts.
+    edges = [_edge(
+        product="merch_x|shopify|1", merchant_id="merch_x", order_id="ext_unv",
+        state="converted", click_matched=True, seller_domain_unverified=True,
+        gmv_cents=4999, currency="USD",
+    )]
+    out = await _run(orders=[], edges=edges)
+    assert out[("product", "merch_x|shopify|1")]["transacted_count"] == 1
+    assert out[("merchant", "merch_x")]["gmv_cents"] == 4999
 
 
 # --- referred (non-converted) edge → not counted ---------------------------------

@@ -1980,6 +1980,16 @@ async def handle_shopify_webhook(
                             currency=order_currency,
                             converted_at=occurred_at,
                             note_attrs_or_payload=data if isinstance(data, dict) else None,
+                            # ADR-009 §D3 seller-mismatch guard: pass the SAME shop
+                            # domain this handler authenticated. `got_canon` is the
+                            # canonicalized `X-Shopify-Shop-Domain`; in production it
+                            # was verified to be a connected store for this merchant
+                            # and to key the HMAC secret (see the shop-domain-mismatch
+                            # + secret-resolution gate above), so it is the store the
+                            # sale actually happened on. Best-effort: it can be None
+                            # off-production (missing header) → the closure stamps
+                            # `seller_domain_unverified` rather than crashing.
+                            converting_shop_domain=got_canon,
                         )
                 except Exception as e:
                     logger.warning(

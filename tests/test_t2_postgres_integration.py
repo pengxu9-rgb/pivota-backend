@@ -111,3 +111,71 @@ async def test_external_conversion_closes_and_aggregates_on_real_postgres():
         assert merch[M_EXT]["gmv_cents"] == 8000, "click_matched=false conversion must not inflate outcomes"
     finally:
         await database.disconnect()
+
+
+@pytest.mark.asyncio
+async def test_seller_mismatch_edge_excluded_on_real_postgres():
+    """ADR-009 §D3: a converted+click_matched edge whose converting store did NOT
+    correspond to the click's destination seller is stamped seller_mismatch=true by
+    the real closure and EXCLUDED by the real Postgres aggregation predicate
+    (`->>'seller_mismatch' IS NOT TRUE`, NULL-safe)."""
+    os.environ["DATABASE_URL"] = _PG_URL
+    from sqlalchemy import create_engine
+    from db.database import database, metadata
+    from db.commerce_attribution import commerce_attribution_edges, surface_click_events
+    from db.orders import orders as orders_table
+    from services.commerce_attribution_service import close_external_order_conversion
+    from services.outcome_aggregation_service import (
+        refresh_all_outcomes,
+        ensure_aggregated_outcomes_table,
+    )
+
+    sync = _PG_URL.replace("postgresql://", "postgresql+psycopg2://", 1)
+    eng = create_engine(sync)
+    metadata.create_all(eng, tables=[surface_click_events, commerce_attribution_edges, orders_table])
+    eng.dispose()
+
+    M_SELLER, P_SELLER = "M_SELLER", "prodcanon_SELLER"
+    await database.connect()
+    try:
+        await ensure_aggregated_outcomes_table()
+        for t in ("aggregated_outcomes", "commerce_attribution_edges", "surface_click_events", "orders"):
+            await database.execute(f"DELETE FROM {t}")
+
+        # A click whose redirect DESTINATION is brand-a's own store.
+        await database.execute(surface_click_events.insert().values(
+            click_id="clk_seller", merchant_id=M_SELLER, surface="agent",
+            canonical_product_id=P_SELLER, dest_domain="brand-a.myshopify.com",
+            click_count=1, impression_count=0, created_at=NOW, updated_at=NOW,
+        ))
+        # Matched close but converting store is a DIFFERENT seller → mismatch.
+        r_mismatch = await close_external_order_conversion(
+            merchant_id=M_SELLER, click_id="clk_seller", external_order_id="shop_mm1",
+            gross_amount_cents=6000, currency="USD", converted_at=NOW,
+            converting_shop_domain="seller-b.myshopify.com")
+        # A clean matched close on the SAME store → counted (control).
+        await database.execute(surface_click_events.insert().values(
+            click_id="clk_ok", merchant_id=M_SELLER, surface="agent",
+            canonical_product_id=P_SELLER, dest_domain="brand-a.myshopify.com",
+            click_count=1, impression_count=0, created_at=NOW, updated_at=NOW,
+        ))
+        r_ok = await close_external_order_conversion(
+            merchant_id=M_SELLER, click_id="clk_ok", external_order_id="shop_ok1",
+            gross_amount_cents=5000, currency="USD", converted_at=NOW,
+            converting_shop_domain="brand-a.myshopify.com")
+
+        await refresh_all_outcomes()
+        merch = {r["subject_key"]: dict(r) for r in await database.fetch_all(
+            "SELECT * FROM aggregated_outcomes WHERE subject_type='merchant'")}
+        mism = await database.fetch_one(
+            "SELECT (metadata->>'seller_mismatch') AS sm FROM commerce_attribution_edges "
+            "WHERE external_order_id = 'shop_mm1'")
+
+        assert r_mismatch and r_mismatch["seller_mismatch"] is True
+        assert r_ok and r_ok["seller_mismatch"] is False
+        assert mism["sm"] == "true", "mismatch edge must be stamped in Postgres JSONB"
+        # Only the clean 5000 conversion counts — the 6000 mismatch is excluded.
+        assert merch[M_SELLER]["gmv_cents"] == 5000, "seller_mismatch conversion must not inflate outcomes"
+        assert merch[M_SELLER]["transacted_count"] == 1
+    finally:
+        await database.disconnect()
