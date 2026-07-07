@@ -124,9 +124,8 @@ async def ops_resubscribe_shopify_webhooks(
         "disputes/update",
         "returns/create",
         "returns/update",
-        "customers/data_request",
-        "customers/redact",
-        "shop/redact",
+        # NOTE: compliance topics (customers/data_request, customers/redact, shop/redact)
+        # are toml/dashboard-managed app-config subscriptions and CANNOT be REST-registered.
     ]
 
     report: Dict[str, Any] = {"attempted": True}

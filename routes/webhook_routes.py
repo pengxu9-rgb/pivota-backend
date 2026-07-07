@@ -2478,12 +2478,10 @@ async def register_shopify_webhooks(
             # Returns (if enabled by shop/app)
             "returns/create",
             "returns/update",
-            # GDPR compliance (required when accessing customer/order data)
-            "customers/data_request",
-            "customers/redact",
-            "shop/redact",
+            # NOTE: compliance topics (customers/data_request, customers/redact, shop/redact)
+            # are toml/dashboard-managed app-config subscriptions and CANNOT be REST-registered.
         ]
-        
+
         registered = []
         already_exists = []
         failed = []
