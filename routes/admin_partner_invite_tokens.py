@@ -6,7 +6,7 @@ from fastapi import APIRouter, Depends
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field
 
-from services import partner_invite_token_service
+from services import partner_invite_email, partner_invite_token_service
 from utils.auth import require_admin
 
 
@@ -16,6 +16,8 @@ router = APIRouter(tags=["Admin - Partner Invite Tokens"])
 class IssueInviteTokenRequest(BaseModel):
     expires_in_days: int = Field(90, ge=1)
     notes: str | None = None
+    # Optional soft cap on distinct-merchant redemptions; omit for unlimited.
+    max_uses: int | None = Field(None, ge=1)
 
 
 class RevokeInviteTokenRequest(BaseModel):
@@ -40,17 +42,32 @@ async def issue_invite_token(
             issued_by=str(current_admin.get("email") or ""),
             expires_in_days=body.expires_in_days,
             notes=body.notes,
+            max_uses=body.max_uses,
         )
     except ValueError as exc:
         return JSONResponse(
             status_code=404,
             content={"error": "partner_not_found", "message": str(exc)},
         )
+
+    # Best-effort: also email the link + how-it-works blurb to the partner's
+    # contact. Never fails token creation; the response reports the outcome so
+    # the operator knows whether to send the link manually.
+    email_outcome = await partner_invite_email.send_invite_email(
+        channel_partner_id=channel_partner_id,
+        signup_url=result.signup_url,
+        expires_at=result.expires_at,
+    )
+
     return {
         "token_id": result.token_id,
         "raw_token": result.raw_token,
         "signup_url": result.signup_url,
         "expires_at": result.expires_at,
+        "max_uses": body.max_uses,
+        "email_sent": bool(email_outcome.get("email_sent")),
+        "email_recipient": email_outcome.get("recipient"),
+        "email_error": email_outcome.get("reason"),
     }
 
 

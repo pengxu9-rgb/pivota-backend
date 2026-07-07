@@ -41,13 +41,20 @@ async def issue(
     issued_by: str,
     expires_in_days: int = DEFAULT_INVITE_EXPIRY_DAYS,
     notes: str | None = None,
+    max_uses: int | None = None,
 ) -> IssueResult:
-    """Generate a new invite token for a partner."""
+    """Generate a new multi-use invite token for a partner.
+
+    max_uses is an optional soft cap on how many distinct merchants may redeem
+    the link; None (default) means unlimited until it expires or is revoked.
+    """
 
     if int(channel_partner_id) <= 0:
         raise ValueError("channel_partner_id must be positive")
     if int(expires_in_days) <= 0:
         raise ValueError("expires_in_days must be positive")
+    if max_uses is not None and int(max_uses) <= 0:
+        raise ValueError("max_uses must be positive when set")
 
     partner = await database.fetch_one(
         """
@@ -75,7 +82,8 @@ async def issue(
           expires_at,
           status,
           issued_by,
-          notes
+          notes,
+          max_uses
         ) VALUES (
           :channel_partner_id,
           :token_hash,
@@ -83,7 +91,8 @@ async def issue(
           :expires_at,
           'active',
           :issued_by,
-          :notes
+          :notes,
+          :max_uses
         )
         RETURNING id
         """,
@@ -94,6 +103,7 @@ async def issue(
             "expires_at": expires_at,
             "issued_by": str(issued_by or "").strip() or None,
             "notes": notes,
+            "max_uses": int(max_uses) if max_uses is not None else None,
         },
     )
     if not row:
@@ -112,7 +122,13 @@ async def consume(
     raw_token: str,
     merchant_id: str,
 ) -> int:
-    """Consume an active token for a merchant. Returns partner_attribution id."""
+    """Redeem a MULTI-USE token for a merchant. Returns partner_attribution id.
+
+    The link stays 'active' and reusable until it expires or is revoked — each
+    distinct merchant that redeems it gets a partner_attribution row and bumps
+    use_count. A merchant redeeming twice is idempotent (unique merchant+partner)
+    and does not double-count. max_uses, when set, is a soft cap.
+    """
 
     normalized_token = _normalize_token(raw_token)
     normalized_merchant_id = _normalize_merchant_id(merchant_id)
@@ -124,7 +140,9 @@ async def consume(
           id,
           channel_partner_id,
           status,
-          expires_at
+          expires_at,
+          use_count,
+          max_uses
         FROM partner_invite_tokens
         WHERE token_hash = :token_hash
         LIMIT 1
@@ -135,41 +153,50 @@ async def consume(
         raise TokenInvalidError("Invite token not found")
 
     token_id = int(_row_get(token, "id"))
-    channel_partner_id = int(_row_get(token, "channel_partner_id"))
     status = str(_row_get(token, "status") or "")
     if status != "active":
         raise TokenNotRedeemableError(f"Invite token status is {status}")
 
     expires_at = _coerce_datetime(_row_get(token, "expires_at"))
     if expires_at <= _utcnow():
-        await database.fetch_one(
+        # Mark expired outside the redemption transaction so the status flip is
+        # not rolled back by the raise below.
+        await database.execute(
             """
             UPDATE partner_invite_tokens
             SET status = 'expired'
             WHERE id = :token_id
               AND status = 'active'
-            RETURNING id
             """,
             {"token_id": token_id},
         )
         raise TokenNotRedeemableError("Invite token is expired")
 
     async with database.transaction():
-        consumed = await database.fetch_one(
+        # Re-read under a row lock so a concurrent revoke/expire, or a parallel
+        # redemption bumping use_count, is observed consistently.
+        locked = await database.fetch_one(
             """
-            UPDATE partner_invite_tokens
-            SET status = 'consumed',
-                consumed_at = NOW(),
-                consumed_by_merchant_id = :merchant_id
+            SELECT channel_partner_id, status, expires_at, use_count, max_uses
+            FROM partner_invite_tokens
             WHERE id = :token_id
-              AND status = 'active'
-            RETURNING id
+            FOR UPDATE
             """,
-            {"token_id": token_id, "merchant_id": normalized_merchant_id},
+            {"token_id": token_id},
         )
-        if not consumed:
+        if locked is None or str(_row_get(locked, "status") or "") != "active":
             raise TokenNotRedeemableError(
-                "Invite token was already consumed, revoked, or expired"
+                "Invite token was revoked or expired"
+            )
+        if _coerce_datetime(_row_get(locked, "expires_at")) <= _utcnow():
+            raise TokenNotRedeemableError("Invite token is expired")
+
+        channel_partner_id = int(_row_get(locked, "channel_partner_id"))
+        max_uses = _row_get(locked, "max_uses")
+        use_count = int(_row_get(locked, "use_count") or 0)
+        if max_uses is not None and use_count >= int(max_uses):
+            raise TokenNotRedeemableError(
+                "Invite token has reached its usage limit"
             )
 
         inserted = await database.fetch_one(
@@ -195,6 +222,17 @@ async def consume(
             },
         )
         if inserted:
+            # Count the use only for a genuinely new merchant; the link stays
+            # 'active' and reusable. consumed_at records the first redemption.
+            await database.execute(
+                """
+                UPDATE partner_invite_tokens
+                SET use_count = use_count + 1,
+                    consumed_at = COALESCE(consumed_at, NOW())
+                WHERE id = :token_id
+                """,
+                {"token_id": token_id},
+            )
             return int(_row_get(inserted, "id"))
 
         existing = await database.fetch_one(
@@ -285,6 +323,8 @@ async def list_for_partner(
           expires_at,
           created_at,
           consumed_by_merchant_id,
+          use_count,
+          max_uses,
           revoked_by,
           revoked_reason,
           notes
@@ -304,6 +344,8 @@ async def list_for_partner(
             "expires_at": _row_get(row, "expires_at"),
             "created_at": _row_get(row, "created_at"),
             "consumed_by_merchant_id": _row_get(row, "consumed_by_merchant_id"),
+            "use_count": int(_row_get(row, "use_count") or 0),
+            "max_uses": _row_get(row, "max_uses"),
             "revoked_by": _row_get(row, "revoked_by"),
             "revoked_reason": _row_get(row, "revoked_reason"),
             "notes": _row_get(row, "notes"),
