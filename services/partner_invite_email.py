@@ -9,11 +9,19 @@ whether they still need to send the link manually.
 from __future__ import annotations
 
 import logging
+import os
 from datetime import date, datetime
 from typing import Any
 
 from db.database import database
 from utils.email_sender import mask_email, send_email
+
+
+def _from_email() -> str:
+    # send_email has no from-address default (returns FROM_EMAIL_MISSING when
+    # unset), so pass one explicitly — same env + fallback the other Pivota
+    # email paths use (order confirmations, settlement statements).
+    return (os.getenv("FROM_EMAIL") or "noreply@pivota.ai").strip()
 
 
 logger = logging.getLogger(__name__)
@@ -71,6 +79,7 @@ async def send_invite_email(
             to_email=contact_email,
             subject=subject,
             text_body=text_body,
+            from_email=_from_email(),
             from_name="Pivota Partnerships",
             tags={"kind": "partner_invite", "partner_id": str(channel_partner_id)},
         )
