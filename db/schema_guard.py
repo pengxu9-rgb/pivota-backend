@@ -252,6 +252,20 @@ async def ensure_required_schema_light() -> None:
                     """
                 )
             )
+            # Multi-use partner invite links (migration 171). Production fast
+            # mode skips db/migrations/, so ensure the columns the invite-token
+            # service reads/writes (use_count, max_uses) exist at startup —
+            # otherwise list_for_partner/issue/consume 500 on the missing
+            # columns and the whole invite panel breaks.
+            await database.execute(
+                text(
+                    """
+                    ALTER TABLE IF EXISTS partner_invite_tokens
+                      ADD COLUMN IF NOT EXISTS use_count INTEGER NOT NULL DEFAULT 0,
+                      ADD COLUMN IF NOT EXISTS max_uses INTEGER;
+                    """
+                )
+            )
             # Merchant portal primary-store selection (migration 089).
             # Production fast mode skips db/migrations/, so keep the
             # critical column and invariant available at startup.
