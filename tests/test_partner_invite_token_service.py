@@ -159,7 +159,9 @@ class _FakePartnerInviteDatabase:
 
         if sql.startswith("update partner_invite_tokens set status = 'revoked'"):
             row = self._token_by_id(int(params["token_id"]))
-            if row and row["status"] == "active":
+            if row is None or not self._partner_scope_ok(row, params):
+                return None
+            if row["status"] == "active":
                 row["status"] = "revoked"
                 row["revoked_at"] = _NOW
                 row["revoked_by"] = params.get("revoked_by")
@@ -170,7 +172,9 @@ class _FakePartnerInviteDatabase:
 
         if sql.startswith("select status from partner_invite_tokens"):
             row = self._token_by_id(int(params["token_id"]))
-            return {"status": row["status"]} if row else None
+            if row is None or not self._partner_scope_ok(row, params):
+                return None
+            return {"status": row["status"]}
 
         raise AssertionError(f"Unhandled fetch_one query: {query}")
 
@@ -315,6 +319,15 @@ class _FakePartnerInviteDatabase:
         row = self._token_by_id(token_id)
         assert row is not None
         return row
+
+    def _partner_scope_ok(
+        self, row: dict[str, Any], params: dict[str, Any]
+    ) -> bool:
+        # Mirror the conditional partner filter: enforced only when the caller
+        # passes channel_partner_id (matches the fixed SQL's optional clause).
+        if "channel_partner_id" not in params:
+            return True
+        return int(row["channel_partner_id"]) == int(params["channel_partner_id"])
 
     def _token_by_id(self, token_id: int) -> dict[str, Any] | None:
         return next(
@@ -554,6 +567,37 @@ async def test_revoke_active_token_succeeds(
     assert token_row["status"] == "revoked"
     assert token_row["revoked_by"] == "admin@example.com"
     assert token_row["revoked_reason"] == "rep left"
+
+
+async def test_revoke_with_matching_channel_partner_id_succeeds(
+    fake_db: _FakePartnerInviteDatabase,
+) -> None:
+    # The admin route always passes channel_partner_id; exercise that branch
+    # of the conditional partner filter (the one that carried the 42P08 bug).
+    token_id = fake_db.add_token(raw_token="mkto_scoped", channel_partner_id=19)
+
+    await service.revoke(
+        token_id=token_id,
+        revoked_by="admin@example.com",
+        channel_partner_id=19,
+    )
+
+    assert fake_db.token(token_id)["status"] == "revoked"
+
+
+async def test_revoke_with_wrong_channel_partner_id_not_found(
+    fake_db: _FakePartnerInviteDatabase,
+) -> None:
+    token_id = fake_db.add_token(raw_token="mkto_scoped_wrong", channel_partner_id=19)
+
+    with pytest.raises(service.TokenInvalidError, match="not found"):
+        await service.revoke(
+            token_id=token_id,
+            revoked_by="admin@example.com",
+            channel_partner_id=999,
+        )
+
+    assert fake_db.token(token_id)["status"] == "active"
 
 
 async def test_revoke_consumed_token_raises(
