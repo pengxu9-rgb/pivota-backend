@@ -23,6 +23,35 @@ from services.catalog_offer_writer_guard import (
 logger = logging.getLogger("catalog_enrichment_agent.apply")
 
 
+async def _derive_seed_seller_for_plan_row(seed: Dict[str, Any]) -> tuple[Optional[str], Optional[str]]:
+    """Derive `(seller_ref, seed_kind)` for one enrichment plan seed row (ADR-009
+    D3). Brand comes from the seed_data JSON (`_build_seed_inserts` stores it),
+    the destination from `domain`/`destination_url`, and the anchor from
+    `attached_product_key` (synthetic here → no tenant anchor → CROSS)."""
+    import json as _json
+
+    from services.seller_identity import (
+        anchor_merchant_from_product_key,
+        derive_seed_seller,
+    )
+
+    seed_data_raw = seed.get("seed_data")
+    brand: Optional[str] = None
+    if isinstance(seed_data_raw, str) and seed_data_raw.strip():
+        try:
+            brand = (_json.loads(seed_data_raw) or {}).get("brand")
+        except Exception:  # noqa: BLE001 — brand is best-effort; NULL is honest
+            brand = None
+    elif isinstance(seed_data_raw, dict):
+        brand = seed_data_raw.get("brand")
+    return await derive_seed_seller(
+        anchor_merchant_id=anchor_merchant_from_product_key(seed.get("attached_product_key")),
+        brand=brand,
+        destination_domain=seed.get("domain") or seed.get("destination_url"),
+        source_system=str(seed.get("tool") or AGENT_VERSION),
+    )
+
+
 async def apply_ingest_plan(
     plan: Dict[str, Any],
     *,
@@ -217,18 +246,25 @@ async def apply_ingest_plan(
     # 5. external_product_seeds — audit + legacy compatibility.
     for seed in seeds:
         try:
+            # ADR-009 D3 (docs/adr/ADR-009-seller-of-record-identity.md; IDENTITY
+            # _REFERENCE §4): derive the seller-of-record at write time. Enrichment
+            # offers are external retailer offers whose `attached_product_key` is a
+            # synthetic `pk_<hash>` (no tenant anchor) → these resolve CROSS to an
+            # observed seller. NULL only when unmintable (derive logs loudly) —
+            # never assumed 'self'.
+            seller_ref, seed_kind = await _derive_seed_seller_for_plan_row(seed)
             await database.execute(
                 """
                 INSERT INTO external_product_seeds
                   (id, external_product_id, market, tool, title, image_url,
                    price_amount, price_currency, destination_url,
                    canonical_url, domain, attached_product_key, status,
-                   availability, seed_data)
+                   availability, seed_data, seller_ref, seed_kind)
                 VALUES
                   (:id, :external_product_id, :market, :tool, :title, :image_url,
                    :price_amount, :price_currency, :destination_url,
                    :canonical_url, :domain, :attached_product_key, :status,
-                   :availability, CAST(:seed_data AS jsonb))
+                   :availability, CAST(:seed_data AS jsonb), :seller_ref, :seed_kind)
                 ON CONFLICT (id) DO UPDATE SET
                   external_product_id = EXCLUDED.external_product_id,
                   attached_product_key = EXCLUDED.attached_product_key,
@@ -239,9 +275,13 @@ async def apply_ingest_plan(
                   status = EXCLUDED.status,
                   availability = EXCLUDED.availability,
                   seed_data = EXCLUDED.seed_data,
+                  -- Fresh derivation wins; a NULL re-derivation (unresolvable —
+                  -- already logged loudly) never degrades an existing seller.
+                  seller_ref = COALESCE(EXCLUDED.seller_ref, external_product_seeds.seller_ref),
+                  seed_kind = COALESCE(EXCLUDED.seed_kind, external_product_seeds.seed_kind),
                   updated_at = NOW()
                 """,
-                seed,
+                {**seed, "seller_ref": seller_ref, "seed_kind": seed_kind},
             )
             counts["seeds"] += 1
         except Exception as exc:  # noqa: BLE001

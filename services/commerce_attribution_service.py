@@ -592,6 +592,33 @@ def shopify_order_total_to_cents(data: Dict[str, Any]) -> tuple[Optional[int], O
     return cents, currency
 
 
+def _coerce_json_obj(value: Any) -> Dict[str, Any]:
+    """Return `value` as a dict. surface_click_events.context is JSONB: asyncpg
+    (prod) decodes it to a dict, but the SQLite/JSON test path and some driver
+    modes hand back a JSON string — coerce both so closure reads are driver-
+    agnostic. Non-object / unparseable → {}."""
+    if isinstance(value, dict):
+        return value
+    if isinstance(value, str) and value.strip():
+        try:
+            parsed = json.loads(value)
+            return parsed if isinstance(parsed, dict) else {}
+        except Exception:  # noqa: BLE001 — malformed context is not fatal
+            return {}
+    return {}
+
+
+def _seed_seller_from_click(row: Optional[Dict[str, Any]]) -> tuple[Optional[str], Optional[str]]:
+    """`(seller_ref, seed_kind)` off a surface_click_events row's `context` JSONB
+    (ADR-009 D3; docs/IDENTITY_REFERENCE.md §4). The T2-1 redirect stamps these
+    into the signed token ctx (`_make_external_redirect_url` enriched_ctx), which
+    `record_surface_event` persists into `context`. NULL threads through as None."""
+    ctx = _coerce_json_obj((row or {}).get("context"))
+    seller_ref = str(ctx.get("seller_ref") or "").strip() or None
+    seed_kind = str(ctx.get("seed_kind") or "").strip() or None
+    return seller_ref, seed_kind
+
+
 def _ext_edge_keys(merchant_id: str, external_order_id: str) -> tuple[str, str]:
     """Deterministic (edge_id, synthetic order_id) for an external conversion.
 
@@ -649,19 +676,31 @@ async def close_external_order_conversion(
     - **Idempotent** on ``(merchant_id, external_order_id)`` via ON CONFLICT DO
       NOTHING: a replay/at-least-once redelivery creates no second edge and does
       not double-count GMV. Returns ``{"replayed": True, ...}`` on a replay.
-    - **Seller-mismatch guard (ADR-009 §D3 interim; IDENTITY_REFERENCE §4):**
-      ``converting_shop_domain`` is the store the sale actually happened on (the
-      caller-authenticated Shopify shop domain / polled store). Until
-      ``external_product_seeds.seller_ref`` lands (A9-3) the edge's ``merchant_id``
-      is trusted as the seller-of-record; this guard checks that the converting
-      store matches the click's redirect DESTINATION host (``dest_domain``,
-      stamped by T2-1). On mismatch the edge is still recorded but stamped
+    - **Seller-keyed subject + mismatch guard (ADR-009 §D3; IDENTITY_REFERENCE
+      §4):** the edge's conversion SUBJECT (``merchant_id``) is the SELLER-OF-
+      RECORD. When the matched click carries a ``seller_ref`` (stamped by T2-1
+      from ``external_product_seeds.seller_ref``, A9-3) the subject IS that
+      ``seller_ref`` and the seller check UPGRADES from raw-host compare to an
+      IDENTITY compare: the converting store's own tenant ``merchant_id`` (the
+      caller-authenticated/polled param) must equal ``seller_ref`` to count.
+      SELF seeds have ``seller_ref == anchor == converting merchant`` → the
+      subject (and idempotency key) is unchanged. CROSS seeds re-subject to
+      ``seller_ref`` and close legitimately only when the sale happened on the
+      seller's own tenant store — this RESOLVES the A9-1 limitation (a custom-
+      storefront-domain seed no longer false-mismatches, because identity, not
+      raw host, is compared). On mismatch the edge is still recorded but stamped
       ``metadata.seller_mismatch=true`` and EXCLUDED from the outcome signal
-      (T2-3) — an honest gap over silent misattribution, exactly the
-      ``click_matched`` philosophy. When the caller supplies no domain the edge is
-      stamped ``metadata.seller_domain_unverified=true`` and still counted
-      (unknown is neither a silent pass nor an exclusion); such unverified closes
-      are expected ONLY from callers predating this guard.
+      (T2-3) — honest gap over silent misattribution, exactly the
+      ``click_matched`` philosophy.
+    - **Legacy (no seller_ref, pre-A9-4) path:** the click carries no seller_ref
+      (un-migrated seed). The subject stays the converting ``merchant_id`` (== the
+      A9-1 behavior) and the guard keeps the A9-1 raw-host compare of
+      ``converting_shop_domain`` vs the click's ``dest_domain`` BYTE-IDENTICAL,
+      additionally stamping ``metadata.seller_ref_missing=true`` so the
+      un-migrated volume is observable and A9-4 has a kill metric. When the caller
+      supplies no domain the edge is stamped
+      ``metadata.seller_domain_unverified=true`` and still counted (unknown is
+      neither a silent pass nor an exclusion).
     """
     merchant_id = str(merchant_id or "").strip()
     external_order_id = str(external_order_id or "").strip()
@@ -688,12 +727,36 @@ async def close_external_order_conversion(
         )
         if raw is not None:
             candidate = dict(raw)
+            candidate_seller_ref, _ = _seed_seller_from_click(candidate)
             click_merchant = candidate.get("merchant_id")
-            if not click_merchant or str(click_merchant) == merchant_id:
+            # Adopt the click when it is unscoped (legacy thin row), belongs to
+            # THIS converting merchant, OR carries a seller_ref (ADR-009 D3 seller-
+            # keyed click). For a seller-keyed click the click's own merchant_id is
+            # the ANCHOR (a surface dimension), so anchor-scoping would wrongly drop
+            # legitimate cross-seed closes — integrity is instead enforced by the
+            # converting==seller_ref IDENTITY check below (a forged click_id on a
+            # store that is not the seller mismatches and is excluded).
+            if (not click_merchant) or (str(click_merchant) == merchant_id) or candidate_seller_ref:
                 click_row = candidate
     click_matched = click_row is not None
 
-    edge_id, synthetic_order_id = _ext_edge_keys(merchant_id, external_order_id)
+    # ADR-009 D3: the seed's seller-of-record off the matched click's context.
+    click_seller_ref, click_seed_kind = (
+        _seed_seller_from_click(click_row) if click_matched else (None, None)
+    )
+
+    # The edge's conversion SUBJECT (merchant_id on the edge) is the SELLER
+    # (seller_ref) when the click is seller-keyed, else the converting store's own
+    # tenant merchant (== today's behavior). SELF seeds have
+    # seller_ref==anchor==converting merchant, so the subject — and therefore the
+    # (merchant_id, external_order_id) idempotency key + the deterministic edge
+    # keys — is UNCHANGED. CROSS seeds re-subject to seller_ref; a replay under the
+    # same seller stays idempotent because click_id → seller_ref is stable, so the
+    # subject is stable across redeliveries. A DIFFERENT converting store replaying
+    # the same (seller, order) collides on the same guard (still one edge).
+    subject_merchant_id = click_seller_ref or merchant_id
+
+    edge_id, synthetic_order_id = _ext_edge_keys(subject_merchant_id, external_order_id)
 
     def _pick(key: str) -> Optional[Any]:
         return click_row.get(key) if click_row else None
@@ -713,6 +776,20 @@ async def close_external_order_conversion(
             for k in ("id", "name", "order_number", "financial_status")
             if note_attrs_or_payload.get(k) is not None
         }
+    # ADR-009 D3: record the seller subject (or the honest legacy gap).
+    if click_seller_ref:
+        metadata["seller_ref"] = click_seller_ref
+        if click_seed_kind:
+            metadata["seed_kind"] = click_seed_kind
+        # The anchor merchant (the surface the click happened on) stays a separate
+        # dimension: the converting store's own tenant merchant, distinct from the
+        # seller subject on cross seeds.
+        metadata["converting_merchant_id"] = merchant_id
+    else:
+        # The click carries no seller_ref (legacy/pre-A9-4, or unattributed). Make
+        # the un-migrated volume observable so A9-4 has a kill metric; NEVER assume
+        # 'self' (no-fallback). Subject stays the converting merchant (== today).
+        metadata["seller_ref_missing"] = True
 
     # --- ADR-009 §D3 interim seller-mismatch guard (IDENTITY_REFERENCE §4) -------
     # This edge's ``merchant_id`` is meant to be the SELLER-OF-RECORD, but until
@@ -741,30 +818,53 @@ async def close_external_order_conversion(
     converting_host = normalize_shop_host(converting_shop_domain)
     seller_mismatch = False
     seller_domain_unverified = False
-    if not converting_host:
-        # Caller could not determine the converting store's domain. UNKNOWN is not a
-        # pass (no silent absorb) and not an exclusion (that would break the pilot,
-        # where the webhook/poller always know the domain) — only make it observable.
-        seller_domain_unverified = True
-        metadata["seller_domain_unverified"] = True
+    if click_seller_ref:
+        # ADR-009 D3: IDENTITY compare — this UPGRADES the A9-1 raw-host compare
+        # for seller-keyed clicks. The converting store's OWN tenant merchant (the
+        # caller-authenticated / polled `merchant_id` param) IS the seller iff it
+        # equals the seed's seller_ref. SELF seeds: seller_ref==anchor==converting
+        # → match. CROSS seeds close legitimately only when the sale happened on
+        # the seller's own tenant store — and this RESOLVES the A9-1 limitation: a
+        # seed whose destination is a custom storefront domain while the webhook
+        # authenticates the .myshopify.com domain no longer false-mismatches,
+        # because we compare seller IDENTITY, not raw host. On mismatch we still
+        # record the edge (idempotent) but stamp seller_mismatch=true so T2-3
+        # EXCLUDES it (honest gap, no-fallback). converting_host is stamped for
+        # forensics only; it is NOT the decision input on this path.
+        if converting_host:
+            metadata["converting_shop_domain"] = converting_host
+        if merchant_id != click_seller_ref:
+            seller_mismatch = True
+            metadata["seller_mismatch"] = True
     else:
-        # Forensics: always stamp the converting store we verified against.
-        metadata["converting_shop_domain"] = converting_host
-        if click_matched:
-            click_dest_host = normalize_shop_host((click_row or {}).get("dest_domain"))
-            if click_dest_host:
-                metadata["click_dest_domain"] = click_dest_host
-                if converting_host != click_dest_host:
-                    seller_mismatch = True
-                    metadata["seller_mismatch"] = True
-            # else: a matched but thin/legacy click carries no dest_domain — nothing
-            #       to compare against, so we make NO mismatch claim (honest silence).
-        # else: click_matched is False → T2-3 already excludes this edge; we do NOT
-        #       double-guard with seller_mismatch, only stamp the converting domain.
+        # LEGACY (no seller_ref on the click): keep the A9-1 raw-host compare
+        # EXACTLY as-is (byte-identical), so un-migrated volume behaves as today.
+        if not converting_host:
+            # Caller could not determine the converting store's domain. UNKNOWN is not
+            # a pass (no silent absorb) and not an exclusion (that would break the
+            # pilot, where the webhook/poller always know the domain) — only observable.
+            seller_domain_unverified = True
+            metadata["seller_domain_unverified"] = True
+        else:
+            # Forensics: always stamp the converting store we verified against.
+            metadata["converting_shop_domain"] = converting_host
+            if click_matched:
+                click_dest_host = normalize_shop_host((click_row or {}).get("dest_domain"))
+                if click_dest_host:
+                    metadata["click_dest_domain"] = click_dest_host
+                    if converting_host != click_dest_host:
+                        seller_mismatch = True
+                        metadata["seller_mismatch"] = True
+                # else: a matched but thin/legacy click carries no dest_domain — nothing
+                #       to compare against, so we make NO mismatch claim (honest silence).
+            # else: click_matched is False → T2-3 already excludes this edge; we do NOT
+            #       double-guard with seller_mismatch, only stamp the converting domain.
 
     values = {
         "edge_id": edge_id,
-        "merchant_id": merchant_id,
+        # ADR-009 D3: the edge SUBJECT is the seller (seller_ref) when seller-keyed,
+        # else the converting merchant (unchanged). Matches the idempotency guard.
+        "merchant_id": subject_merchant_id,
         "interaction_id": _pick("interaction_id"),
         "click_id": click_id,
         "order_id": synthetic_order_id,
@@ -793,23 +893,33 @@ async def close_external_order_conversion(
         "now": now,
     }
 
+    # ADR-009 D3 observability — surfaced on every return (subject = seller when
+    # seller-keyed; converting merchant is the separate anchor/surface dimension).
+    seller_fields = {
+        "seller_ref": click_seller_ref,
+        "seed_kind": click_seed_kind,
+        "seller_ref_missing": click_seller_ref is None,
+        "converting_merchant_id": merchant_id,
+    }
+
     inserted = await database.fetch_one(_CLOSE_EXTERNAL_CONVERSION_SQL, values)
     if inserted is None:
         # Replay / at-least-once redelivery — the guard already holds this order.
         logger.info(
             "commerce_attribution: external conversion replay ignored "
-            "merchant_id=%s external_order_id=%s (no double-count)",
-            merchant_id,
+            "subject_merchant_id=%s external_order_id=%s (no double-count)",
+            subject_merchant_id,
             external_order_id,
         )
         return {
             "edge_id": edge_id,
-            "merchant_id": merchant_id,
+            "merchant_id": subject_merchant_id,
             "external_order_id": external_order_id,
             "state": EDGE_STATE_CONVERTED,
             "click_matched": click_matched,
             "seller_mismatch": seller_mismatch,
             "seller_domain_unverified": seller_domain_unverified,
+            **seller_fields,
             "replayed": True,
         }
 
@@ -818,7 +928,11 @@ async def close_external_order_conversion(
     await record_commerce_event_best_effort(
         event_type="order.external_converted",
         metadata={
-            "merchant_id": merchant_id,
+            # Subject = the seller-of-record (ADR-009 D3).
+            "merchant_id": subject_merchant_id,
+            "converting_merchant_id": merchant_id,
+            "seller_ref": click_seller_ref,
+            "seed_kind": click_seed_kind,
             "interaction_id": values["interaction_id"],
             "external_order_id": external_order_id,
             "order_id": synthetic_order_id,
@@ -832,7 +946,9 @@ async def close_external_order_conversion(
             "source": EDGE_SOURCE_EXTERNAL_REDIRECT,
         },
         source="commerce_attribution_edges",
-        upstream_idempotency_key=f"external_order:{merchant_id}:{external_order_id}",
+        # Idempotency keyed on the SUBJECT (matches the edge guard): self/legacy
+        # subject == merchant_id (unchanged); cross subject == seller_ref.
+        upstream_idempotency_key=f"external_order:{subject_merchant_id}:{external_order_id}",
     )
     if not click_matched:
         logger.info(
@@ -843,15 +959,19 @@ async def close_external_order_conversion(
             click_id,
         )
     # Seller-guard observability (ADR-009 §D3) — first observation only (replays
-    # returned above), so a redelivery never double-logs.
+    # returned above), so a redelivery never double-logs. Covers BOTH the identity
+    # mismatch (seller-keyed click) and the legacy host mismatch.
     if seller_mismatch:
         logger.warning(
-            "external_conversion_seller_mismatch: converting store %s != click "
-            "destination %s — edge recorded but EXCLUDED from outcome signal "
-            "(ADR-009 D3) merchant_id=%s external_order_id=%s click_id=%s",
-            metadata.get("converting_shop_domain"),
-            metadata.get("click_dest_domain"),
+            "external_conversion_seller_mismatch: converting merchant %s / store %s "
+            "!= seed seller_ref %s (click destination %s) — edge recorded but "
+            "EXCLUDED from outcome signal (ADR-009 D3) subject=%s "
+            "external_order_id=%s click_id=%s",
             merchant_id,
+            metadata.get("converting_shop_domain"),
+            click_seller_ref,
+            metadata.get("click_dest_domain"),
+            subject_merchant_id,
             external_order_id,
             click_id,
         )
@@ -866,12 +986,13 @@ async def close_external_order_conversion(
         )
     return {
         "edge_id": edge_id,
-        "merchant_id": merchant_id,
+        "merchant_id": subject_merchant_id,
         "external_order_id": external_order_id,
         "click_id": click_id,
         "click_matched": click_matched,
         "seller_mismatch": seller_mismatch,
         "seller_domain_unverified": seller_domain_unverified,
+        **seller_fields,
         "canonical_product_id": values["canonical_product_id"],
         "gross_attributed_gmv_cents": values["gross_attributed_gmv_cents"],
         "currency": currency,

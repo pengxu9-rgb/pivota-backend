@@ -14,6 +14,14 @@ HONESTY DISCIPLINE (load-bearing, pre-launch data is tiny + test-concentrated):
 Sources:
 - merchant outcomes  ← `orders` grouped by merchant_id, UNION external converted
                         edges (T2-3) that have no `orders` row.
+                        ADR-009 D3 (A9-3): the external edge's `merchant_id` is now
+                        the SELLER-OF-RECORD (seller_ref) — for a self seed that is
+                        the anchor merchant (unchanged), for a cross seed it is the
+                        seed's seller. Grouping by `merchant_id` therefore means
+                        "by seller" for external edges with NO SQL change here; the
+                        anchor stays a separate dimension on the edge metadata
+                        (`converting_merchant_id`). Verified: this file still only
+                        GROUP BYs `merchant_id`.
 - product outcomes   ← `commerce_attribution_edges` (canonical_product_id, gmv) LEFT
                         JOIN `orders` for payment status. (checkout_decisions.content_key
                         is not yet populated, so product attribution rides the
@@ -24,12 +32,13 @@ merchant's own checkout (T2-2). Such an edge has state='converted' + GMV/currenc
 the edge and NO `orders` row, so both queries fall back to the edge's own fields for
 it. INTEGRITY: only `metadata.click_matched = true` external edges count — a false
 value is a forgeable, merchant-supplied click id and must never inflate the outcome/
-trust signal. Additionally (ADR-009 §D3 interim guard) edges stamped
-`metadata.seller_mismatch = true` — the converting store did not correspond to the
-click's redirect-destination seller — are EXCLUDED: an honest gap over misattributing
-a conversion to a merchant that did not make the sale. Both gates are NULL-safe, so
-legacy/internal edges are unaffected. Internal-order numbers are byte-identical to
-pre-T2-3.
+trust signal. Additionally (ADR-009 §D3) edges stamped `metadata.seller_mismatch =
+true` — the converting store's identity did not match the seed's seller-of-record
+(A9-3 identity compare; or, on the legacy no-seller_ref path, the converting host did
+not match the click's redirect-destination host) — are EXCLUDED: an honest gap over
+misattributing a conversion to a seller that did not make the sale. Both gates are
+NULL-safe, so legacy/internal edges are unaffected. Internal-order numbers are
+byte-identical to pre-T2-3.
 
 Handoff: seller_trust (get_seller_trust / seller_trust_from_outcome, below) reads the
 merchant aggregated_outcomes row; T2-3 makes external outcomes flow into it — no

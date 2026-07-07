@@ -36,17 +36,20 @@ def fake_db(monkeypatch):
 
 
 async def test_upsert_seed_carries_krw_market(fake_db):
+    # A9-3 (ADR-009 D3): _upsert_seed now stamps the derived seller-of-record.
     await onboard._upsert_seed({
         "external_product_id": "anuko_32",
         "title": "Bond & Repair Hair Oil 75ml",
         "price_amount": 26900,
         "market": "KR",
         "price_currency": "KRW",
-    })
+    }, seller_ref="merch_obs_deadbeefdeadbeef", seed_kind="self")
     _, params = fake_db.calls[0]
     assert params["market"] == "KR"
     assert params["currency"] == "KRW"
     assert params["price"] == 26900
+    assert params["seller_ref"] == "merch_obs_deadbeefdeadbeef"
+    assert params["seed_kind"] == "self"
 
 
 async def test_upsert_seed_defaults_to_us_usd(fake_db):
@@ -54,10 +57,13 @@ async def test_upsert_seed_defaults_to_us_usd(fake_db):
         "external_product_id": "x1",
         "title": "Some US Product",
         "price_amount": 24.99,
-    })
+    }, seller_ref=None, seed_kind=None)
     _, params = fake_db.calls[0]
     assert params["market"] == "US"
     assert params["currency"] == "USD"
+    # A9-3: NULL seller_ref/seed_kind thread through as bound NULLs (never guessed).
+    assert params["seller_ref"] is None
+    assert params["seed_kind"] is None
 
 
 # A9-2: _set_category_and_offer / _resolve_pdp_scope take the resolved observed
