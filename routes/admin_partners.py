@@ -309,7 +309,10 @@ async def create_admin_partner(
             for stream, brand_year, rate_bp in _default_rate_rows(
                 body.gmv_take_definition
             ):
-                await database.execute(
+                # RETURNING + fetch_one so the reported count reflects rows
+                # actually inserted, not attempted — ON CONFLICT DO NOTHING
+                # yields no row when a schedule already exists.
+                inserted = await database.fetch_one(
                     """
                     INSERT INTO partner_rate_schedules (
                       channel_partner_id, scope, stream, brand_year,
@@ -322,6 +325,7 @@ async def create_admin_partner(
                     ON CONFLICT
                       (channel_partner_id, scope, stream, brand_year, effective_from)
                     DO NOTHING
+                    RETURNING id
                     """,
                     {
                         "channel_partner_id": new_partner_id,
@@ -332,7 +336,8 @@ async def create_admin_partner(
                         "effective_from": effective_from,
                     },
                 )
-                seeded_rate_count += 1
+                if inserted is not None:
+                    seeded_rate_count += 1
 
     partner = await get_admin_partner(new_partner_id, current_admin)
     if isinstance(partner, JSONResponse):

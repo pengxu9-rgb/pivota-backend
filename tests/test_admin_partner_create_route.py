@@ -64,6 +64,10 @@ class _FakeCreateDatabase:
             self.channel_partners.append(row)
             return {"id": partner_id, "term_start_date": row["term_start_date"]}
 
+        if sql.startswith("insert into partner_rate_schedules"):
+            self.partner_rate_schedules.append(dict(params))
+            return {"id": len(self.partner_rate_schedules)}
+
         if "from channel_partners cp" in sql:
             row = next(
                 (

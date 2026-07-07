@@ -145,6 +145,13 @@ async def try_activate_brand(
     The update is guarded by SELECT FOR UPDATE plus activated_at IS NULL on the
     UPDATE itself. If activated_at is already set, this function is a no-op even
     if evaluate_activation() would currently return a different date.
+
+    Return value is the activation *eligibility* decision, not a signal of
+    whether a row was written — the UPDATE can be a guarded no-op (already
+    activated, or a terminal revoked/expired row) while still returning an
+    eligible decision. Callers that need "did this brand actually activate"
+    should go through activate_brands_for_merchant(), which pre-filters to
+    non-terminal, not-yet-activated attributions.
     """
 
     decision = await evaluate_activation(merchant_id=merchant_id)
