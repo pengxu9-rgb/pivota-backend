@@ -842,6 +842,11 @@ app.include_router(audit_runs_router)  # P2.3: async audit_runs lifecycle (POST/
 from routes.scheduler_health import router as scheduler_health_router
 app.include_router(scheduler_health_router)
 
+# Admin: resume/pause allowlisted settlement crons (T7/T8 + settlement-file
+# jobs) for Stage-4 promotion and rollback without a redeploy.
+from routes.admin_scheduler_jobs import router as admin_scheduler_jobs_router
+app.include_router(admin_scheduler_jobs_router)
+
 # C1 Phase 2d — read-only trust table health (total rows, decision distribution,
 # drift count, stale rows). Mirrors /__scheduler_health in naming convention.
 from routes.__trust_health import router as trust_health_router

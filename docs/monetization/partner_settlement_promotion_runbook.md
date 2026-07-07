@@ -81,19 +81,28 @@ Rollback: set back to `false`.
 
 ## Step 2 — Resume T7, then T8
 
-There is **no admin endpoint to resume a paused job today** — `scheduler_health`
-only lists jobs. Pick one mechanism:
+Use the **guarded admin endpoint** (admin auth, allowlisted to the settlement
+job ids, no deploy, one-call rollback):
 
-- **Preferred — a small guarded admin endpoint** that calls
-  `get_scheduler().resume_job(<id>)` / `.pause_job(<id>)`. Controllable and
-  reversible with no deploy. (Not yet built — see follow-up below.)
-- **Runtime call** in a service shell:
-  `from services.audit_scheduler import get_scheduler;
-  get_scheduler().resume_job("invoice_generation_monthly")` then
-  `resume_job("partner_settlement_monthly")`.
-- **Code edit + deploy**: remove `next_run_time=None` from the two `_add_job`
-  calls in `services/audit_scheduler.py` (lines ~523 and ~540). Resumes on next
-  boot; least controllable — avoid for the first run.
+```bash
+# inspect current state of the four managed jobs
+curl -sS -H "Authorization: Bearer $ADMIN_JWT" https://api.pivota.cc/admin/scheduler/jobs
+# resume T7 first, then T8
+curl -sS -X POST -H "Authorization: Bearer $ADMIN_JWT" \
+  https://api.pivota.cc/admin/scheduler/jobs/invoice_generation_monthly/resume
+curl -sS -X POST -H "Authorization: Bearer $ADMIN_JWT" \
+  https://api.pivota.cc/admin/scheduler/jobs/partner_settlement_monthly/resume
+```
+
+Each call returns `{action, id, paused, next_run_time, trigger}`. `resume` is a
+no-op if already running; `pause` (rollback) a no-op if already paused. Only the
+four settlement job ids are accepted — any other id returns 403.
+
+Fallback mechanisms if the endpoint is unavailable: a runtime
+`get_scheduler().resume_job(<id>)` in a service shell, or removing
+`next_run_time=None` from the two `_add_job` calls in
+`services/audit_scheduler.py` (lines ~523 and ~540) and redeploying (least
+controllable — avoid for the first run).
 
 Resume **T7 first**. On day 2 it freezes the prior month's statements and writes
 a `completed` billing_runs row. Confirm via `scheduler_health` (job shows a
@@ -123,7 +132,7 @@ If a transfer fails, the staff-only retry endpoint is
 | Undo | How |
 |---|---|
 | Flag | `PARTNER_REV_SHARE_USE_V2=false` |
-| Crons | pause the jobs again (`.pause_job(id)` / re-add `next_run_time=None` + deploy) |
+| Crons | `POST /admin/scheduler/jobs/{id}/pause` (one call, no deploy) |
 | Snapshots | immutable by design — do **not** hand-edit; a bad run is corrected by clawback/adjustment ledger entries, not deletion |
 | Transfers | cannot be un-sent; reconcile via Stripe refund/adjustment out of band |
 
@@ -137,7 +146,7 @@ because it is SELECT-only.
 
 ## Follow-up worth building
 
-A guarded `POST /admin/scheduler/jobs/{id}/{resume|pause}` endpoint (admin auth,
-allowlisted to the settlement job ids) would make Step 2 controllable and
-auditable without a deploy, and give a one-call rollback. Recommended before the
-first live promotion.
+- A **contract-terms editor** and **cohort-target creation** endpoint (partner
+  detail is otherwise read-only after creation).
+- Wiring all of these endpoints into the employee-portal UI (they exist as APIs
+  only today).
