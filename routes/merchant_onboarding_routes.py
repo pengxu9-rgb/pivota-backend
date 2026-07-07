@@ -307,10 +307,31 @@ async def resolve_public_merchant_identity_merge(
     if normalized_role in PUBLIC_MERGEABLE_ACCOUNT_ROLES:
         from utils.auth import verify_password
 
-        if not entered_password or not verify_password(
-            entered_password,
-            str(existing_user.get("password_hash") or ""),
-        ):
+        stored_hash = str(existing_user.get("password_hash") or "").strip()
+
+        # No credential was ever set on this account (e.g. a channel-partner /
+        # CRM contact that was onboarded without a login). There is no password
+        # the signer could possibly enter to "verify", so demanding one is an
+        # unrecoverable dead-end — the account can never be converted and every
+        # signup attempt bounces off a 409 forever.
+        #
+        # Because a password-less account has no credential to protect and
+        # cannot be logged into as-is, treat it as claimable by the email owner:
+        # the password they set during merchant signup becomes the account's
+        # first credential. This is intentionally limited to non-privileged
+        # public roles — internal/privileged roles are handled above and still
+        # require an explicit admin merge even when password-less.
+        if not stored_hash:
+            return existing_user, {
+                "converted_from_role": normalized_role,
+                "claimed_passwordless": True,
+                "message": (
+                    "Existing password-less account claimed and converted into "
+                    "the merchant identity."
+                ),
+            }
+
+        if not entered_password or not verify_password(entered_password, stored_hash):
             raise HTTPException(
                 status_code=409,
                 detail=build_identity_conflict_detail(
@@ -457,14 +478,17 @@ async def register_merchant(
             await database.execute("SELECT 1")
         except Exception as pre_err:
             if "transaction is aborted" in str(pre_err).lower():
-                # Attempt rollback then reconnect
+                # Clear the aborted transaction state WITHOUT tearing down the
+                # pool. database.disconnect()/connect() here operates on the
+                # shared prod connection (DB_POOL_MIN_SIZE=1), so recycling it
+                # mid-request resets every OTHER in-flight request — those
+                # clients see a dropped connection, which the browser surfaces
+                # as a generic "Network Error" (no HTTP response). A scoped
+                # ROLLBACK clears the poisoned transaction on its own.
                 try:
                     await database.execute("ROLLBACK")
                 except Exception:
                     pass
-                await database.disconnect()
-                await asyncio.sleep(0.5)
-                await database.connect()
 
         normalized_email = normalize_contact_email(merchant_data.contact_email)
         normalized_store_url = canonicalize_store_url(merchant_data.store_url)
@@ -679,14 +703,17 @@ async def register_merchant(
         # Handle database transaction errors
         if "transaction is aborted" in error_msg.lower():
             print("🔄 Attempting to recover from transaction error...")
+            # Clear the poisoned transaction with a scoped ROLLBACK instead of
+            # recycling the shared connection pool. disconnect()/connect() here
+            # resets other in-flight requests on the shared prod connection,
+            # which reaches those clients as a no-response "Network Error".
             try:
-                await database.disconnect()
-                await asyncio.sleep(1)
-                await database.connect()
-                print("✅ Database reconnected, retrying once...")
-                # Retry once after reconnection
+                await database.execute("ROLLBACK")
+                print("✅ Transaction rolled back, retrying once...")
+                # Retry once after clearing the aborted transaction
                 try:
                     merchant_dict = merchant_data.dict()
+                    merchant_dict.pop("password", None)
                     merchant_id = await create_merchant_onboarding(merchant_dict)
                     background_tasks.add_task(auto_approve_kyc, merchant_id)
                     return {
@@ -696,13 +723,14 @@ async def register_merchant(
                         "next_step": "Upload KYC documents or wait for auto-verification"
                     }
                 except Exception as retry_err:
-                    print(f"⚠️ Retry after reconnect failed: {retry_err}")
-            except Exception as reconnect_error:
-                print(f"⚠️ Database reconnect attempt failed: {reconnect_error}")
-            # Always return 503 to prompt a retry on the client
+                    print(f"⚠️ Retry after rollback failed: {retry_err}")
+            except Exception as rollback_error:
+                print(f"⚠️ Transaction rollback attempt failed: {rollback_error}")
+            # Always return 503 (CORS-wrapped, so the client can read it) to
+            # prompt a retry instead of dropping the connection.
             raise HTTPException(
                 status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
-                detail="Database connection reset. Please try your request again."
+                detail="Database was momentarily busy. Please try your request again."
             )
         
         raise HTTPException(
