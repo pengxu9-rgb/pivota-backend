@@ -13,6 +13,7 @@ import re
 from typing import Any, Dict, List, Mapping, Optional, Tuple
 from urllib.parse import urlsplit
 
+from services.text_normalization import sanitize_display_name
 from services.buyer_path_stable_controllers import (
     stable_buyer_path_controllers_for_row,
 )
@@ -946,7 +947,14 @@ def _sku_is_protected(
 
 
 def _sku_title(*, identity: Mapping[str, Any], sku_title: Optional[str]) -> str:
-    return str(identity.get("name") or sku_title or "this SKU").strip() or "this SKU"
+    # Sanitize before it renders into NBA copy: a dirty identity name (e.g.
+    # "...30 sticks's page" from a leaked template) must not surface verbatim.
+    # Conservative — legit names pass through unchanged. See sanitize_display_name.
+    return (
+        sanitize_display_name(identity.get("name"))
+        or sanitize_display_name(sku_title)
+        or "this SKU"
+    )
 
 
 def _sku_scores(scores: Mapping[str, Any]) -> Dict[str, Optional[int]]:

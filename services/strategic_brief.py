@@ -15,6 +15,7 @@ from typing import Any, Dict, Iterable, List, Mapping, Optional, Set, Tuple
 from urllib.parse import urlparse
 
 from config.settings import settings
+from services.text_normalization import sanitize_display_name
 from services.buyer_path_stable_controllers import (
     stable_buyer_path_controllers_for_row,
 )
@@ -802,7 +803,13 @@ def assemble_sku_brief_evidence(
     opportunity_map = _as_mapping(opportunity)
     identity_map = _as_mapping(identity)
     attributes = _attribute_evidence(attribute_graph)
-    title = _clean_str(sku_title) or _clean_str(identity_map.get("name")) or "this SKU"
+    # Sanitize the display name before it renders into brief copy (dirty
+    # identity strings like "...30 sticks's page" must not surface verbatim).
+    title = (
+        sanitize_display_name(sku_title)
+        or sanitize_display_name(identity_map.get("name"))
+        or "this SKU"
+    )
     anchors = _as_mapping(identity_map.get("anchors"))
     brand = _clean_str(anchors.get("brand"))
     merchant_path = _merchant_path(identity=identity_map, opportunity=opportunity_map)
