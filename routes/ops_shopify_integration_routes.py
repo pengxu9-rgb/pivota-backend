@@ -32,6 +32,29 @@ class OpsSyncReturnsRequest(BaseModel):
     limit: int = Field(20, ge=1, le=100)
 
 
+class OpsResubscribeAllRequest(BaseModel):
+    callback_base_url: str = Field(..., min_length=4)
+    api_version: Optional[str] = None
+    limit: int = Field(200, ge=1, le=2000)
+
+
+# Mainline order/uninstall topics for the idempotent sweep. Deliberately mirrors
+# _SHOPIFY_OAUTH_REQUIRED_WEBHOOK_TOPICS in routes/merchant_store_connections.py.
+# Compliance topics (customers/data_request, customers/redact, shop/redact) are
+# EXCLUDED — they are toml/dashboard-managed app-config subscriptions and cannot
+# be REST-registered (audit fix #5).
+_SWEEP_WEBHOOK_TOPICS: List[str] = [
+    "orders/create",
+    "orders/updated",
+    "orders/paid",
+    "orders/cancelled",
+    "fulfillments/create",
+    "fulfillments/update",
+    "orders/fulfilled",
+    "app/uninstalled",
+]
+
+
 def _decode_scopes_json(value: Any) -> Any:
     """
     Backward-compatible: older versions stored scopes_json as a JSON string.
@@ -145,6 +168,87 @@ async def ops_resubscribe_shopify_webhooks(
         raise HTTPException(status_code=500, detail="Failed to resubscribe webhooks")
 
     return {"status": "success", "webhooks": report, "requested_by": current_user.get("sub")}
+
+
+@router.post("/integrations/shopify/resubscribe-all")
+async def ops_resubscribe_all_shopify_webhooks(
+    request: OpsResubscribeAllRequest,
+    current_user: dict = Depends(get_current_employee),
+):
+    """
+    Idempotent re-registration sweep over ALL active/connected Shopify stores.
+
+    This backfills webhook subscriptions for stores connected before the connect
+    path registered them (audit fix #1b). It is safe to re-run: Shopify REST
+    create returns 422 "address has already been taken" for existing hooks, which
+    register_webhooks_best_effort reports as already_exists.
+
+    Processes stores sequentially (rate-safety) and NEVER raises on a single
+    store's failure — errors are collected per-merchant. Capped by `limit`
+    (default 200).
+    """
+    api_version = (request.api_version or "2024-07").strip() or "2024-07"
+
+    rows = await database.fetch_all(
+        """
+        SELECT store_id, merchant_id, domain, api_key
+        FROM merchant_stores
+        WHERE platform = 'shopify'
+          AND lower(COALESCE(status, '')) IN ('active', 'connected')
+        ORDER BY connected_at DESC NULLS LAST
+        LIMIT :limit
+        """,
+        {"limit": request.limit},
+    )
+
+    results: List[Dict[str, Any]] = []
+    for row in rows or []:
+        store = dict(row)
+        merchant_id = store.get("merchant_id")
+        shop_domain = (store.get("domain") or "").strip()
+        store_id = str(store.get("store_id") or "").strip() or None
+        summary: Dict[str, Any] = {
+            "merchant_id": merchant_id,
+            "shop_domain": shop_domain,
+            "created": [],
+            "already_exists": [],
+            "failed": [],
+            "error": None,
+        }
+        try:
+            access_token, _meta = await resolve_shopify_admin_access_token(
+                shop_domain=shop_domain,
+                api_key_raw=store.get("api_key"),
+                store_id=store_id,
+            )
+            access_token = (access_token or "").strip()
+            if not shop_domain or not access_token:
+                summary["error"] = "missing_credentials"
+                results.append(summary)
+                continue
+
+            report = await register_webhooks_best_effort(
+                shop_domain=shop_domain,
+                access_token=access_token,
+                merchant_id=merchant_id,
+                callback_base_url=request.callback_base_url,
+                topics=_SWEEP_WEBHOOK_TOPICS,
+                api_version=api_version,
+            )
+            summary["created"] = report.get("created") or []
+            summary["already_exists"] = report.get("already_exists") or []
+            summary["failed"] = report.get("failed") or []
+        except Exception as e:  # never let one store abort the sweep
+            logger.warning("Resubscribe-all failed merchant=%s shop=%s: %s", merchant_id, shop_domain, str(e)[:200])
+            summary["error"] = str(e)[:300]
+        results.append(summary)
+
+    return {
+        "status": "success",
+        "processed": len(results),
+        "results": results,
+        "requested_by": current_user.get("sub"),
+    }
 
 
 @router.post("/merchants/{merchant_id}/integrations/shopify/returns/sync")
