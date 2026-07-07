@@ -240,8 +240,6 @@ class _FakePartnerInviteDatabase:
             row = self._token_by_id(int(params["token_id"]))
             if row is not None:
                 row["use_count"] = int(row.get("use_count", 0)) + 1
-                if row.get("consumed_at") is None:
-                    row["consumed_at"] = _NOW
                 row["updated_at"] = _NOW
             return None
         raise AssertionError(f"Unhandled execute query: {query}")
@@ -443,7 +441,9 @@ async def test_consume_active_token_creates_partner_attribution_and_stays_reusab
     # Multi-use: the link stays active and reusable; the redemption is counted.
     assert token_row["status"] == "active"
     assert token_row["use_count"] == 1
-    assert token_row["consumed_at"] == _NOW
+    # consumed_at stays null on the multi-use path (ck_..._consumed_pair pairs
+    # consumed_at with consumed_by_merchant_id).
+    assert token_row["consumed_at"] is None
     assert fake_db.partner_attribution == [
         {
             "id": 1,

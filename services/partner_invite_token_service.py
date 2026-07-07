@@ -223,12 +223,14 @@ async def consume(
         )
         if inserted:
             # Count the use only for a genuinely new merchant; the link stays
-            # 'active' and reusable. consumed_at records the first redemption.
+            # 'active' and reusable. Do NOT touch consumed_at/consumed_by here:
+            # the ck_partner_invite_tokens_consumed_pair CHECK requires those two
+            # to be set (or null) together, and they belong to the legacy
+            # single-use path — use_count is the multi-use redemption record.
             await database.execute(
                 """
                 UPDATE partner_invite_tokens
-                SET use_count = use_count + 1,
-                    consumed_at = COALESCE(consumed_at, NOW())
+                SET use_count = use_count + 1
                 WHERE id = :token_id
                 """,
                 {"token_id": token_id},
