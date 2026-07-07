@@ -501,8 +501,28 @@ _VERDICT_DISPLAY_LABELS = {
     VERDICT_PARTIAL: "Partial AI-channel attribution",
 }
 
+# When the tier is INVISIBLE but the merchant WAS cited on a few prompts, the
+# flat "Invisible..." header contradicts the body ("cited in N of M queries").
+# Both scores are still below the invisible threshold — the merchant isn't
+# strongly visible — but "Invisible" is a factual overstatement atop a nonzero
+# count. This softer header stays honest without the self-contradiction. The raw
+# INVISIBLE enum is unchanged; this is purely the rendering string.
+_VERDICT_INVISIBLE_WITH_CITATIONS_LABEL = "Rarely cited in grounded LLM answers"
 
-def _verdict_display_label(label: str) -> str:
+
+def _verdict_display_label(label: str, cited_runs: Optional[int] = None) -> str:
+    """Merchant-facing rendering string for a verdict enum.
+
+    `cited_runs` (own-brand citations on buyer-intent prompts) softens ONLY the
+    INVISIBLE case: a nonzero count means the header would otherwise contradict
+    the "cited in N of M" body. Omit it (default) for a plain enum→label map.
+    """
+    if (
+        label == VERDICT_INVISIBLE
+        and cited_runs is not None
+        and cited_runs > 0
+    ):
+        return _VERDICT_INVISIBLE_WITH_CITATIONS_LABEL
     return _VERDICT_DISPLAY_LABELS.get(label, label)
 
 
@@ -15366,7 +15386,9 @@ def _build_merchant_view(
             # only Layer 1 grounded LLM citation, which is one channel
             # among many). The raw `verdict_label` is preserved for
             # downstream code that branches on the enum.
-            "verdict_label_display": _verdict_display_label(verdict_label),
+            "verdict_label_display": _verdict_display_label(
+                verdict_label, cited_runs=merchant_cited_runs
+            ),
             "one_liner": headline_one_liner or None,
             # Plain-language answer to "Am I visible to AI users or
             # not?" — translates the score combination into one short
@@ -15869,7 +15891,9 @@ def build_structured_report(
         competitor_brands=category_competitor_brands or [],
         industry_blurb=industry_context.get("blurb", ""),
         industry_share_pct=industry_context.get("ai_search_share_pct"),
-        verdict_pill_text=_verdict_display_label(verdict_label),
+        verdict_pill_text=_verdict_display_label(
+            verdict_label, cited_runs=merchant_cited_runs
+        ),
         # PR-7a: corporate intel from brand_context.corporate, when
         # available. Used by the editorial-archetype paragraph to
         # weave "{merchant_name}, a {parent}-owned brand" framing.
@@ -15928,7 +15952,9 @@ def build_structured_report(
             # bare label string (e.g. the headline VerdictBanner)
             # should prefer this; downstream code that branches on
             # the verdict enum keeps using `label`.
-            "label_display": _verdict_display_label(verdict_label),
+            "label_display": _verdict_display_label(
+                verdict_label, cited_runs=merchant_cited_runs
+            ),
             "explanation": verdict_explanation,
             "visibility_score": visibility_score,
             "attribution_score": attribution_score,
