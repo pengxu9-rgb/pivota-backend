@@ -25,6 +25,7 @@ from config.settings import settings
 from db.database import IS_POSTGRES, database
 from db.merchant_onboarding import get_merchant_onboarding
 from routes.payment_execution_routes import verify_merchant_api_key
+from services.activation_event_service import activate_brands_for_merchant
 from services.billing import monthly_brand_statements_service
 from services.merchant_store_service import get_primary_store, parse_api_credentials
 from utils.auth import decode_token, get_current_merchant, optional_security
@@ -878,6 +879,32 @@ async def _handle_invoice_paid(event: Dict[str, Any], db: Database) -> None:
         )
         if not updated:
             await _insert_minimal_invoice(db, invoice_values)
+
+        # Partner lifecycle: a paid, positive-net invoice is the Track-B
+        # activation event. Stamp partner_attribution.activated_at so the
+        # merchant's brand starts accruing rev-share. Best-effort — activation
+        # is write-once/idempotent and a miss is re-covered by any later
+        # invoice.paid, so it must never fail the webhook.
+        if merchant_id:
+            try:
+                outcomes = await activate_brands_for_merchant(merchant_id=merchant_id)
+                activated = [o for o in outcomes if o.get("activated")]
+                if activated:
+                    logger.info(
+                        "invoice.paid activated %d partner attribution(s) for "
+                        "merchant_id=%s partners=%s",
+                        len(activated),
+                        merchant_id,
+                        ",".join(str(o["channel_partner_id"]) for o in activated),
+                    )
+            except Exception:  # noqa: BLE001
+                logger.warning(
+                    "partner activation hook failed for merchant_id=%s "
+                    "stripe_invoice_id=%s",
+                    merchant_id,
+                    stripe_invoice_id,
+                    exc_info=True,
+                )
 
         await _mark_event_processed(event_id, db)
     except Exception as exc:

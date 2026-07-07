@@ -145,6 +145,13 @@ async def try_activate_brand(
     The update is guarded by SELECT FOR UPDATE plus activated_at IS NULL on the
     UPDATE itself. If activated_at is already set, this function is a no-op even
     if evaluate_activation() would currently return a different date.
+
+    Return value is the activation *eligibility* decision, not a signal of
+    whether a row was written — the UPDATE can be a guarded no-op (already
+    activated, or a terminal revoked/expired row) while still returning an
+    eligible decision. Callers that need "did this brand actually activate"
+    should go through activate_brands_for_merchant(), which pre-filters to
+    non-terminal, not-yet-activated attributions.
     """
 
     decision = await evaluate_activation(merchant_id=merchant_id)
@@ -178,12 +185,21 @@ async def try_activate_brand(
         # path always sets activation_at, but the fallback keeps callers
         # forward-compat).
         activated_at_value = decision.activation_at or decision.activation_date
+        # Stamp activated_at (write-once via the activated_at IS NULL guard) and
+        # advance the lifecycle status to 'active' from registered/signed. The
+        # status guard leaves terminal rows (revoked/expired) untouched so a
+        # later paid invoice can never resurrect a revoked attribution.
         await database.execute(
             """
             UPDATE partner_attribution
-            SET activated_at = :activated_at
+            SET activated_at = :activated_at,
+                status = CASE
+                  WHEN status IN ('registered', 'signed') THEN 'active'
+                  ELSE status
+                END
             WHERE id = :attribution_id
               AND activated_at IS NULL
+              AND status NOT IN ('revoked', 'expired')
             """,
             {
                 "activated_at": activated_at_value,
@@ -192,6 +208,47 @@ async def try_activate_brand(
         )
 
     return decision
+
+
+async def activate_brands_for_merchant(*, merchant_id: str) -> list[dict[str, Any]]:
+    """Attempt Track-B activation for every live partner attribution of a merchant.
+
+    Invoked from the invoice-paid billing webhook. For each not-yet-activated,
+    non-terminal attribution we call try_activate_brand(), which is write-once
+    and idempotent, so redelivered webhooks and multiple paid invoices are safe.
+    Returns one summary dict per attribution examined, for the caller to log.
+    """
+
+    normalized_merchant_id = (merchant_id or "").strip()
+    if not normalized_merchant_id:
+        return []
+
+    rows = await database.fetch_all(
+        """
+        SELECT channel_partner_id
+        FROM partner_attribution
+        WHERE merchant_id = :merchant_id
+          AND activated_at IS NULL
+          AND status IN ('registered', 'signed')
+        """,
+        {"merchant_id": normalized_merchant_id},
+    )
+
+    outcomes: list[dict[str, Any]] = []
+    for row in rows or []:
+        channel_partner_id = int(_row_get(row, "channel_partner_id"))
+        decision = await try_activate_brand(
+            merchant_id=normalized_merchant_id,
+            channel_partner_id=channel_partner_id,
+        )
+        outcomes.append(
+            {
+                "channel_partner_id": channel_partner_id,
+                "activated": bool(decision.eligible and decision.activation_date),
+                "reason": decision.reason,
+            }
+        )
+    return outcomes
 
 
 async def _net_cash_received_through_activation_date(
