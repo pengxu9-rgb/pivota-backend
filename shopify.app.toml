@@ -27,7 +27,11 @@ api_version = "2026-01"
 # Learn more at https://shopify.dev/docs/apps/tools/cli/configuration#access_scopes
 scopes = "read_discounts,read_fulfillments,read_orders,read_products"
 optional_scopes = [ ]
-use_legacy_install_flow = true
+# Managed install (legacy flow removed 2026-07-07): required for the app-owned
+# [[webhooks.subscriptions]] above — Shopify rejects app-specific webhooks under
+# use_legacy_install_flow. Scopes are now granted from this declared set at
+# install time (Shopify-managed) rather than the OAuth `scope=` param.
+use_legacy_install_flow = false
 
 [auth]
 redirect_urls = [ "https://api.pivota.cc/integrations/shopify/oauth/callback" ]
