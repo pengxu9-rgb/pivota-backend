@@ -46,22 +46,48 @@ if str(ROOT) not in sys.path:
 
 from db.database import database
 from scripts.mirror_external_seeds_to_catalog_products import _apply as mirror_apply
+from services.brand_claim_service import normalize_host
+from services.catalog_sync_service import make_catalog_product_key
 from services.crawled_inci_ingest import ingest_crawled_inci_items
 from services.external_seed_servability import (
     build_servable_quality_payload,
     make_external_seed_servable,
 )
 from services.pdp_scope_classifier import ScopeSignals, classify
+# ADR-009 D2 (docs/adr/ADR-009-seller-of-record-identity.md; IDENTITY_REFERENCE
+# §3 Trap T3): a crawl-onboarded brand mints its own per-brand observed
+# seller-of-record instead of landing under the banned 'external_seed' bucket.
+from services.seller_identity import ensure_observed_seller
 
 TOOL = "external_brand_crawl"
+# catalog_products.platform channel for external-seed supply (matches the mirror).
+PLATFORM = "external_seed"
 
 
 def _seed_id(epid: str) -> str:
     return f"{TOOL}::{epid}"
 
 
-def _product_key(epid: str) -> str:
-    return f"prod::external_seed::external_seed::{epid}"
+def _seed_domain(p: Dict[str, Any]) -> str:
+    """Registrable host of the crawled brand site (its destination_url). This is
+    the seller identity's domain half; it is also written to the seed's `domain`
+    column so the mirror resolves the SAME observed seller for this product."""
+    return normalize_host(p.get("destination_url"))
+
+
+async def _resolve_seller_and_key(p: Dict[str, Any]) -> tuple[str, str]:
+    """Resolve-or-mint this product's observed seller-of-record and its
+    per-brand product_key. Deterministic on (brand, registrable-domain), so the
+    key computed here MATCHES what the mirror writes for the same seed
+    (ensure_observed_seller is idempotent). Raises on empty brand/domain — no
+    fallback identity (ADR-009 D2)."""
+    merchant_id = await ensure_observed_seller(
+        brand=p.get("brand") or "",
+        domain=_seed_domain(p),
+        source_system=TOOL,
+        primary_platform=PLATFORM,
+    )
+    return merchant_id, make_catalog_product_key(merchant_id, PLATFORM, p["external_product_id"])
 
 
 async def _upsert_seed(p: Dict[str, Any]) -> None:
@@ -77,17 +103,19 @@ async def _upsert_seed(p: Dict[str, Any]) -> None:
     await database.execute(
         """
         INSERT INTO external_product_seeds
-          (id, external_product_id, market, tool, destination_url, title, image_url,
+          (id, external_product_id, market, tool, domain, destination_url, title, image_url,
            price_amount, price_currency, availability, seed_data, status)
         VALUES
-          (:id, :epid, :market, :tool, :url, :title, :img,
+          (:id, :epid, :market, :tool, :domain, :url, :title, :img,
            :price, :currency, 'in_stock', CAST(:data AS jsonb), 'active')
         ON CONFLICT (id) DO UPDATE SET
           title=EXCLUDED.title, image_url=EXCLUDED.image_url, price_amount=EXCLUDED.price_amount,
           price_currency=EXCLUDED.price_currency, market=EXCLUDED.market,
+          domain=EXCLUDED.domain,
           seed_data=EXCLUDED.seed_data, status='active', updated_at=NOW()
         """,
         {"id": _seed_id(p["external_product_id"]), "epid": p["external_product_id"], "tool": TOOL,
+         "domain": _seed_domain(p) or None,
          "url": p.get("destination_url"), "title": p["title"], "img": p.get("image_url"),
          "price": p.get("price_amount"), "data": json.dumps(seed_data, ensure_ascii=False),
          "market": (p.get("market") or "US").strip() or "US",
@@ -95,8 +123,8 @@ async def _upsert_seed(p: Dict[str, Any]) -> None:
     )
 
 
-async def _set_category_and_offer(p: Dict[str, Any]) -> None:
-    pk = _product_key(p["external_product_id"])
+async def _set_category_and_offer(p: Dict[str, Any], product_key: str) -> None:
+    pk = product_key
     if p.get("category_kind"):
         await database.execute(
             "UPDATE catalog_products SET category_kind=:ck, updated_at=NOW() WHERE product_key=:pk",
@@ -114,26 +142,32 @@ async def _set_category_and_offer(p: Dict[str, Any]) -> None:
     )
 
 
-async def _resolve_pdp_scope(p: Dict[str, Any]) -> None:
+async def _resolve_pdp_scope(p: Dict[str, Any], product_key: str, self_merchant_id: str) -> None:
     """Promote the mirrored row off the 'unverified' scope default so it clears
     the serving-eligibility `entity_unresolved` gate (which requires a resolved
     pdp_scope OR a product_group_id). Without this, a crawl-onboarded brand mirrors
     + scores fine but never serves. Single-seller brand-direct crawl → seller_count
     is 1 → classify() returns 'merchant_owned'; a product already carried by another
     seller correctly classifies 'multi_merchant_canonical'.
+
+    seller_count counts distinct OTHER sellers of the product. Under ADR-009 D2
+    the product's own seller is now a per-brand observed merchant (not the shared
+    'external_seed' bucket), so the self-exclusion is on `self_merchant_id` — this
+    preserves the exact prior semantics (count of OTHER sellers) without changing
+    any serving-eligibility rule.
     """
-    pk = _product_key(p["external_product_id"])
+    pk = product_key
     row = await database.fetch_one(
         """
         SELECT 1
           + COALESCE((SELECT COUNT(DISTINCT co.merchant_id) FROM catalog_offers co
                       WHERE co.product_key = :pk AND co.merchant_id IS NOT NULL
-                        AND co.merchant_id <> 'external_seed'), 0)
+                        AND co.merchant_id <> :self_merchant), 0)
           + COALESCE((SELECT COUNT(DISTINCT eps.domain) FROM external_product_seeds eps
                       WHERE eps.attached_product_key = :pk AND eps.status = 'active'
                         AND eps.domain IS NOT NULL), 0) AS seller_count
         """,
-        {"pk": pk},
+        {"pk": pk, "self_merchant": self_merchant_id},
     )
     seller_count = int((dict(row) if row else {}).get("seller_count") or 1)
     scope = classify(ScopeSignals(category_label_source=None, seller_count=seller_count))
@@ -147,20 +181,28 @@ async def _resolve_pdp_scope(p: Dict[str, Any]) -> None:
 async def _onboard(cohort: List[Dict[str, Any]]) -> None:
     for p in cohort:
         await _upsert_seed(p)
+    # ADR-009 D2: resolve-or-mint each product's per-brand observed seller BEFORE
+    # the mirror runs. The mirror derives the SAME identity (deterministic on
+    # brand + registrable domain), so the product_key stashed here matches the
+    # row the mirror writes — every downstream update targets the right PDP.
+    keys: Dict[str, tuple[str, str]] = {}
+    for p in cohort:
+        keys[p["external_product_id"]] = await _resolve_seller_and_key(p)
     inserted = await mirror_apply(max(50, len(cohort) * 3))
     print(f"mirror inserted_catalog_products={inserted}")
     for p in cohort:
-        await _set_category_and_offer(p)
+        merchant_id, product_key = keys[p["external_product_id"]]
+        await _set_category_and_offer(p, product_key)
         # Resolve identity scope BEFORE make_external_seed_servable recomputes
         # eligibility, so the row can actually reach serving_eligible.
-        await _resolve_pdp_scope(p)
+        await _resolve_pdp_scope(p, product_key, merchant_id)
     # INCI + enrichment via the shared crawled-INCI ingest (scripts.ingest_crawled_inci,
     # #855) -- one upsert-raw_inci + enrich_and_persist path for both crawl tools.
     # category_kind is set above first (enrichment reads it).
     inci_items = [
         {
-            "product_key": _product_key(p["external_product_id"]),
-            "sku_key": _product_key(p["external_product_id"]) + "::canonical",
+            "product_key": keys[p["external_product_id"]][1],
+            "sku_key": keys[p["external_product_id"]][1] + "::canonical",
             "raw_inci": p.get("raw_inci") or "",
         }
         for p in cohort
@@ -168,8 +210,9 @@ async def _onboard(cohort: List[Dict[str, Any]]) -> None:
     report = await ingest_crawled_inci_items(inci_items, dry_run=False, db=database)
     print(f"inci ingest: written={report.get('inci_written')} actives={report.get('actives_filled')} skipped={report.get('skipped')}")
     for p in cohort:
+        _merchant_id, product_key = keys[p["external_product_id"]]
         summary = await make_external_seed_servable(
-            product_key=_product_key(p["external_product_id"]),
+            product_key=product_key,
             seed_id=_seed_id(p["external_product_id"]),
             source_product_id=p["external_product_id"],
             quality_payload=build_servable_quality_payload(

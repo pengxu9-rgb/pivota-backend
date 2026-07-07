@@ -59,6 +59,13 @@ Verified facts (2026-07-05, prod read-only):
 
 ### D2 — Seller-of-record = a `catalog_merchants` row; observed rows are first-class
 
+- **Serving amendment (A9-2 review, 2026-07-07):** `status='observed'` is an
+  identity-lifecycle state, NOT a serving switch. The public canonical-PDP read's
+  merchant gate accepts `status IN ('active','observed')` — observed sellers' pages
+  served under the shared bucket before this ADR and must keep serving, or per-brand
+  identity would darken Path B's citation output (a mainline regression). Product-level
+  gates (`serving_eligible`/`index_eligible`) remain the sole serving control; claiming
+  governs ownership actions, not visibility.
 - Every supply-ingestion path mints (or resolves to) a real per-brand
   `catalog_merchants` row at ingestion — **the shared `external_seed` bucket is banned**
   (generalizing the W5 P3 rule). Observed sellers get `status='observed'`,

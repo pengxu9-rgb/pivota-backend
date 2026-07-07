@@ -24,6 +24,7 @@ class _FakeDB:
         self.calls.append((sql, params or {}))
 
     async def fetch_one(self, sql, params=None):
+        self.calls.append((sql, params or {}))
         return self._fetch_one_result
 
 
@@ -59,16 +60,23 @@ async def test_upsert_seed_defaults_to_us_usd(fake_db):
     assert params["currency"] == "USD"
 
 
+# A9-2: _set_category_and_offer / _resolve_pdp_scope take the resolved observed
+# product_key (and self-merchant) explicitly now (ADR-009 D2) — the singleton
+# 'external_seed' product_key is gone.
+_PK = "prod::merch_obs_deadbeefdeadbeef::external_seed::anuko_32"
+
+
 async def test_set_category_and_offer_does_not_force_us(fake_db):
     await onboard._set_category_and_offer({
         "external_product_id": "anuko_32",
         "category_kind": "haircare",
         "market": "KR",
-    })
+    }, _PK)
     # last execute = the catalog_offers UPDATE; market must be the product's, not 'US'
     offer_sql, offer_params = fake_db.calls[-1]
     assert "catalog_offers" in offer_sql
     assert offer_params["market"] == "KR"
+    assert offer_params["pk"] == _PK
     assert "market='US'" not in offer_sql  # the old hardcode is gone
 
 
@@ -76,7 +84,7 @@ async def test_set_category_and_offer_defaults_market_us(fake_db):
     await onboard._set_category_and_offer({
         "external_product_id": "x1",
         "category_kind": "skincare",
-    })
+    }, _PK)
     offer_params = fake_db.calls[-1][1]
     assert offer_params["market"] == "US"
 
@@ -86,7 +94,9 @@ async def test_resolve_pdp_scope_single_seller_is_merchant_owned(monkeypatch):
     # so the mirrored row can clear the entity_unresolved serving gate.
     db = _FakeDB(fetch_one_result={"seller_count": 1})
     monkeypatch.setattr(onboard, "database", db)
-    await onboard._resolve_pdp_scope({"external_product_id": "anuko_32"})
+    await onboard._resolve_pdp_scope(
+        {"external_product_id": "anuko_32"}, _PK, "merch_obs_deadbeefdeadbeef"
+    )
     update_sql, params = db.calls[-1]
     assert "catalog_products" in update_sql and "pdp_scope" in update_sql
     assert params["s"] == "merchant_owned"
@@ -96,5 +106,20 @@ async def test_resolve_pdp_scope_single_seller_is_merchant_owned(monkeypatch):
 async def test_resolve_pdp_scope_multi_seller_is_canonical(monkeypatch):
     db = _FakeDB(fetch_one_result={"seller_count": 3})
     monkeypatch.setattr(onboard, "database", db)
-    await onboard._resolve_pdp_scope({"external_product_id": "anuko_32"})
+    await onboard._resolve_pdp_scope(
+        {"external_product_id": "anuko_32"}, _PK, "merch_obs_deadbeefdeadbeef"
+    )
     assert db.calls[-1][1]["s"] == "multi_merchant_canonical"
+
+
+async def test_resolve_pdp_scope_excludes_own_observed_seller(monkeypatch):
+    # The self-exclusion binds the row's OWN observed merchant (ADR-009 D2), not
+    # the retired 'external_seed' literal — preserving "count of OTHER sellers".
+    db = _FakeDB(fetch_one_result={"seller_count": 1})
+    monkeypatch.setattr(onboard, "database", db)
+    await onboard._resolve_pdp_scope(
+        {"external_product_id": "anuko_32"}, _PK, "merch_obs_deadbeefdeadbeef"
+    )
+    select_call = next(c for c in db.calls if "seller_count" in c[0])
+    assert select_call[1]["self_merchant"] == "merch_obs_deadbeefdeadbeef"
+    assert "<> :self_merchant" in select_call[0]  # no 'external_seed' literal
