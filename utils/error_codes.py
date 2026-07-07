@@ -122,6 +122,11 @@ class ErrorCode(Enum):
     )
 
     # Conflict Errors (409)
+    CONFLICT = ErrorDefinition(
+        "CONFLICT",
+        409,
+        "Request conflicts with the current state of the resource"
+    )
     VARIANT_NOT_READY_FOR_CHECKOUT = ErrorDefinition(
         "VARIANT_NOT_READY_FOR_CHECKOUT",
         409,
