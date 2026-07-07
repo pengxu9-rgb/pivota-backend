@@ -22,6 +22,7 @@ class _FakeDb:
     def __init__(self, *, partner: dict | None, contact: dict | None) -> None:
         self._partner = partner
         self._contact = contact
+        self.sends: list[dict[str, Any]] = []
 
     async def fetch_one(self, query: str, values: dict[str, Any] | None = None):
         sql = " ".join(query.split()).lower()
@@ -30,6 +31,13 @@ class _FakeDb:
         if "from partner_contacts" in sql:
             return self._contact
         raise AssertionError(f"Unhandled query: {query}")
+
+    async def execute(self, query: str, values: dict[str, Any] | None = None):
+        sql = " ".join(query.split()).lower()
+        if sql.startswith("insert into partner_send_log"):
+            self.sends.append(dict(values or {}))
+            return None
+        raise AssertionError(f"Unhandled execute: {query}")
 
 
 def _install(monkeypatch, *, partner, contact, sender):
@@ -51,13 +59,21 @@ async def test_sends_when_contact_email_present(monkeypatch) -> None:
         sender=_sender,
     )
 
+    db = mod.database  # captured fake for send-log assertions below
+
     out = await mod.send_invite_email(
         channel_partner_id=19,
         signup_url="https://app.pivota.cc/signup?ref=mkto_abc",
         expires_at=datetime(2026, 9, 1, tzinfo=timezone.utc),
+        issued_by="admin@pivota.cc",
     )
 
     assert out == {"email_sent": True, "recipient": "finance@markato.com"}
+    # Recorded in partner_send_log so it appears in "Recent sends".
+    assert len(db.sends) == 1
+    assert db.sends[0]["to_email"] == "finance@markato.com"
+    assert db.sends[0]["sent_by"] == "admin@pivota.cc"
+    assert db.sends[0]["send_status"] == "sent"
     assert len(calls) == 1
     assert calls[0]["to_email"] == "finance@markato.com"
     # from_email must be set — send_email returns FROM_EMAIL_MISSING otherwise.

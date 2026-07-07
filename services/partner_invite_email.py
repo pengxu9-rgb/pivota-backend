@@ -32,6 +32,7 @@ async def send_invite_email(
     channel_partner_id: int,
     signup_url: str,
     expires_at: Any,
+    issued_by: str = "",
 ) -> dict[str, Any]:
     """Email the partner's contact their invite link. Best-effort.
 
@@ -83,7 +84,19 @@ async def send_invite_email(
             from_name="Pivota Partnerships",
             tags={"kind": "partner_invite", "partner_id": str(channel_partner_id)},
         )
-        if getattr(result, "ok", False):
+        ok = bool(getattr(result, "ok", False))
+        # Record in partner_send_log so the invite shows in "Recent sends".
+        await _record_send_log(
+            channel_partner_id=channel_partner_id,
+            to_email=contact_email,
+            subject=subject,
+            body_text=text_body,
+            sent_by=issued_by,
+            ok=ok,
+            provider_message_id=getattr(result, "message_id", None),
+            error=getattr(result, "error", None),
+        )
+        if ok:
             logger.info(
                 "partner invite email sent partner_id=%s to=%s",
                 channel_partner_id,
@@ -103,6 +116,54 @@ async def send_invite_email(
             exc_info=True,
         )
         return {"email_sent": False, "reason": "exception"}
+
+
+async def _record_send_log(
+    *,
+    channel_partner_id: int,
+    to_email: str,
+    subject: str,
+    body_text: str,
+    sent_by: str,
+    ok: bool,
+    provider_message_id: str | None,
+    error: str | None,
+) -> None:
+    """Best-effort partner_send_log row so the invite appears in Recent sends.
+
+    Never raises to the caller — a log-write failure must not affect the email
+    result. cc_emails defaults to '[]' (no bind), avoiding the :param::jsonb
+    cast footgun.
+    """
+
+    try:
+        await database.execute(
+            """
+            INSERT INTO partner_send_log (
+              channel_partner_id, template_id, to_email, subject,
+              body_text, sent_by, send_status, provider_message_id, send_error
+            ) VALUES (
+              :channel_partner_id, 'partner_invite', :to_email, :subject,
+              :body_text, :sent_by, :send_status, :provider_message_id, :send_error
+            )
+            """,
+            {
+                "channel_partner_id": int(channel_partner_id),
+                "to_email": to_email,
+                "subject": subject,
+                "body_text": body_text,
+                "sent_by": (sent_by or "").strip() or "system",
+                "send_status": "sent" if ok else "failed",
+                "provider_message_id": provider_message_id,
+                "send_error": None if ok else error,
+            },
+        )
+    except Exception:  # noqa: BLE001
+        logger.warning(
+            "partner invite send-log write failed partner_id=%s",
+            channel_partner_id,
+            exc_info=True,
+        )
 
 
 def _compose_text(

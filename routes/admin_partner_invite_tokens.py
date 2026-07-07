@@ -57,6 +57,7 @@ async def issue_invite_token(
         channel_partner_id=channel_partner_id,
         signup_url=result.signup_url,
         expires_at=result.expires_at,
+        issued_by=str(current_admin.get("email") or ""),
     )
 
     return {
