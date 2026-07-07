@@ -4492,10 +4492,16 @@ async def _handle_offers_resolve(
 
                 exact_sku_match = bool(sku_id_aliases and exact_variant and _variant_ref_from_payload(exact_variant) in sku_id_aliases)
                 confidence = 0.95 if (exact_pid_match or exact_sku_match) else 0.8 if sku_id else 0.7
+                # ADR-009 ratified decision 1 (no-fallback): the offer keys on
+                # product_group_id UNCONDITIONALLY. A product with no pg has no
+                # canonical identity yet (store-less / thin row) — it gets NO
+                # canonical_ref (honest-absent), never a merchant-scoped `pc:`
+                # substitute. Singleton pg minting (services.product_group_
+                # autogrouper.ensure_singleton_group_membership + the backfill)
+                # makes pg total for every content_key'd product, so the former
+                # `else pc:…` branch is dead; removing it kills the crutch.
                 canonical_ref = (
-                    f"pg:{canonical_group_id}"
-                    if canonical_group_id
-                    else f"pc:{merchant_id}:{platform}:{pid}"
+                    f"pg:{canonical_group_id}" if canonical_group_id else None
                 )
                 mapping_candidates.append(
                     _conf(
@@ -4663,20 +4669,18 @@ async def _handle_offers_resolve(
     offers = _rank_offers_merit_first(internal_offers + external_offers)
     offers = offers[:limit]
 
+    # ADR-009 ratified decision 1 (no-fallback): canonical_ref is pg-keyed or
+    # ABSENT — never a merchant-scoped `pc:{merchant}:{platform}:{pid}`
+    # substitute. The internal build above only ever stamps a `pg:…`
+    # source.canonical_ref (or None), so propagating it here cannot resurrect
+    # the removed `pc:` crutch.
     canonical_ref: Optional[str] = None
     if canonical_group_id:
         canonical_ref = f"pg:{canonical_group_id}"
     elif internal_offers:
         src = (internal_offers[0].get("source") or {}) if isinstance(internal_offers[0], dict) else {}
-        if isinstance(src, dict):
-            if src.get("canonical_ref"):
-                canonical_ref = str(src.get("canonical_ref"))
-            else:
-                mid = str(src.get("merchant_id") or "").strip()
-                pid = str(src.get("product_id") or "").strip()
-                plat = str(src.get("platform") or "").strip() or "unknown"
-                if mid and pid:
-                    canonical_ref = f"pc:{mid}:{plat}:{pid}"
+        if isinstance(src, dict) and src.get("canonical_ref"):
+            canonical_ref = str(src.get("canonical_ref"))
 
     if canonical_product is None and canonical_member:
         canonical_product = {
@@ -4755,6 +4759,13 @@ async def _handle_offers_resolve(
         "mapping": {
             "canonical_ref": canonical_ref,
             "canonical_product_group_id": canonical_group_id,
+            # ADR-009 decision 1: observable honest-absent state. `resolved`
+            # when the offer keyed on a product_group_id; `no_canonical_identity`
+            # when the product has no pg yet (store-less / thin, pg-NULL) — an
+            # explicit reason, NOT a silent content_key/`pc:` substitution.
+            "canonical_identity_status": (
+                "resolved" if canonical_ref else "no_canonical_identity"
+            ),
             "canonical_product": canonical_product,
             "requested_target": requested_target,
             "resolved_target": resolved_target,

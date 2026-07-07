@@ -1149,3 +1149,153 @@ def test_fetch_attached_seed_fuzzy_surfacing_is_observable_mainline_miss(
     assert seed_source is not None
     assert str(seed_source.get("query")) == "external_seed_by_fuzzy_ref"
     assert "eps_miss_1" in (seed_source.get("mainline_miss_seed_ids") or [])
+
+
+# ---------------------------------------------------------------------------
+# ADR-009 ratified decision 1 (no-fallback) — offers key on product_group_id
+# UNCONDITIONALLY. canonical_ref is `pg:…` or ABSENT (honest
+# `no_canonical_identity`), never a merchant-scoped `pc:{merchant}:{platform}:
+# {pid}` substitute.
+# ---------------------------------------------------------------------------
+
+
+def _iter_strings(obj):
+    """Yield every string anywhere inside a JSON-shaped payload."""
+    if isinstance(obj, str):
+        yield obj
+    elif isinstance(obj, dict):
+        for k, v in obj.items():
+            yield from _iter_strings(k)
+            yield from _iter_strings(v)
+    elif isinstance(obj, (list, tuple)):
+        for item in obj:
+            yield from _iter_strings(item)
+
+
+def test_offers_resolve_grouped_product_keys_on_pg_and_reports_resolved(
+    monkeypatch: pytest.MonkeyPatch, client: TestClient
+) -> None:
+    """A product WITH a product_group_members row resolves with canonical_ref ==
+    `pg:<gid>` and mapping.canonical_identity_status == 'resolved'."""
+    import routes.agent_shop_gateway as gateway
+
+    group_id = "pg_32de31827aded89c8d0339895b6a2786"
+
+    async def fake_fetch_all(query: str, values=None):
+        q = str(query)
+        if "FROM external_product_seeds" in q:
+            return []
+        if "FROM product_group_members" in q:
+            return [
+                {
+                    "product_group_id": group_id,
+                    "merchant_id": "merch_grp",
+                    "platform": "shopify",
+                    "platform_product_id": "prod_grp_1",
+                    "is_primary": True,
+                }
+            ]
+        if "FROM products_cache" in q:
+            return [
+                {
+                    "merchant_id": "merch_grp",
+                    "platform": "shopify",
+                    "platform_product_id": "prod_grp_1",
+                    "product_data": {
+                        "id": "prod_grp_1",
+                        "title": "Grouped Product",
+                        "currency": "USD",
+                        "price": 18.0,
+                        "inventory_quantity": 7,
+                        "variants": [{"id": "SKU_GRP_1", "price": 18.0, "inventory_quantity": 7}],
+                        "merchant_name": "Grouped Store",
+                    },
+                }
+            ]
+        return []
+
+    monkeypatch.setattr(gateway.database, "fetch_all", fake_fetch_all)
+
+    res = client.post(
+        "/agent/shop/v1/invoke",
+        json={
+            "operation": "offers.resolve",
+            "payload": {"product": {"product_id": "prod_grp_1"}, "limit": 10},
+            "metadata": {"source": "creator-agent-ui"},
+        },
+    )
+    assert res.status_code == 200
+    body = res.json()
+    assert body["status"] == "success"
+    assert body.get("offers"), "should return the internal offer"
+
+    mapping = body.get("mapping") or {}
+    assert mapping.get("canonical_ref") == f"pg:{group_id}"
+    assert mapping.get("canonical_product_group_id") == group_id
+    assert mapping.get("canonical_identity_status") == "resolved"
+    assert body.get("canonical_product_ref") == f"pg:{group_id}"
+    canonical_product = mapping.get("canonical_product") or {}
+    assert canonical_product.get("product_group_id") == group_id
+
+
+def test_offers_resolve_ungrouped_product_is_honest_absent_never_pc(
+    monkeypatch: pytest.MonkeyPatch, client: TestClient
+) -> None:
+    """A product with NO group membership yields canonical_ref None and
+    canonical_identity_status == 'no_canonical_identity' — and NOTHING in the
+    mapping payload carries a merchant-scoped `pc:` ref (the removed fallback
+    must not resurface anywhere, including nested candidates/sources)."""
+    import routes.agent_shop_gateway as gateway
+
+    async def fake_fetch_all(query: str, values=None):
+        q = str(query)
+        if "FROM external_product_seeds" in q:
+            return []
+        if "FROM product_group_members" in q:
+            return []  # pg-NULL product: no membership row anywhere
+        if "FROM products_cache" in q:
+            return [
+                {
+                    "merchant_id": "merch_nogroup",
+                    "platform": "shopify",
+                    "platform_product_id": "prod_nogroup_1",
+                    "product_data": {
+                        "id": "prod_nogroup_1",
+                        "title": "Ungrouped Product",
+                        "currency": "USD",
+                        "price": 22.0,
+                        "inventory_quantity": 4,
+                        "variants": [{"id": "SKU_NOGRP_1", "price": 22.0, "inventory_quantity": 4}],
+                        "merchant_name": "Ungrouped Store",
+                    },
+                }
+            ]
+        return []
+
+    monkeypatch.setattr(gateway.database, "fetch_all", fake_fetch_all)
+
+    res = client.post(
+        "/agent/shop/v1/invoke",
+        json={
+            "operation": "offers.resolve",
+            "payload": {"product": {"product_id": "prod_nogroup_1"}, "limit": 10},
+            "metadata": {"source": "creator-agent-ui"},
+        },
+    )
+    assert res.status_code == 200
+    body = res.json()
+    assert body["status"] == "success"
+    assert body.get("offers"), "the offer itself is still served — only the canonical ref is absent"
+
+    mapping = body.get("mapping") or {}
+    assert mapping.get("canonical_ref") is None
+    assert mapping.get("canonical_identity_status") == "no_canonical_identity"
+    assert "canonical_product_ref" not in body
+
+    # The banned fallback must not resurface ANYWHERE in the mapping payload —
+    # not in candidates, canonical_product, targets, or any nested string.
+    pc_strings = [s for s in _iter_strings(mapping) if s.startswith("pc:")]
+    assert pc_strings == [], f"merchant-scoped pc: refs must never be minted: {pc_strings}"
+    # Belt-and-braces: nor anywhere else in the response body.
+    pc_strings_body = [s for s in _iter_strings(body) if s.startswith("pc:")]
+    assert pc_strings_body == [], f"pc: ref leaked outside mapping: {pc_strings_body}"

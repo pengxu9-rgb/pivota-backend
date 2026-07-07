@@ -112,6 +112,144 @@ def derive_product_group_id(content_key: str) -> str:
     return "pg_" + content_key[len("ck_"):]
 
 
+# ---------------------------------------------------------------------------
+# Singleton product-group minting (ADR-009 ratified decision 1 — no-fallback)
+# ---------------------------------------------------------------------------
+#
+# ADR-009 "Resolved decisions" 1: the offer's product key is `product_group_id`
+# UNCONDITIONALLY — the originally proposed "pg when present, content_key
+# fallback" was rejected as the crutch pattern. Instead the mainline is made
+# total: every product carries a pg. Where a product is not part of a
+# multi-member cluster (this autogrouper only groups clusters of size >= 2,
+# see `autogroup_clusters` below) it gets a deterministic SINGLETON group,
+# derived from its own `content_key` — the SAME derivation the multi-member
+# path uses (`derive_product_group_id`). `content_key` is a DERIVATION INPUT,
+# never a runtime alternative.
+#
+# NON-MERGE PROPERTY (IDENTITY_REFERENCE §2 "mis-merge is worse than
+# fragmentation", brand_verified_graduation.py:71):
+#   - singleton pg = pg_ + hex(content_key). content_key IS the cross-merchant
+#     physical-product identity (IDENTITY_REFERENCE §2 / Trap T6), so two rows
+#     that share a content_key legitimately share the singleton pg — that is
+#     CORRECT grouping of ONE physical product, not a merge of DISTINCT
+#     products. Two DIFFERENT content_keys always map to DIFFERENT pgs.
+#   - the singleton pg is byte-identical to what `autogroup_clusters` would
+#     mint for the same content_key, so a singleton that later gains a second
+#     listing grows seamlessly into a real multi-member group under the SAME
+#     pg (no re-key, no fork).
+#   - the membership write is ON CONFLICT DO NOTHING, so a row already claimed
+#     by a real/curated group is never overwritten with a singleton (we never
+#     re-subject an existing grouping — no auto-merge, no mis-merge).
+#
+# CROSS-MERCHANT (not per-merchant): the singleton is keyed on `content_key`
+# ALONE — matching how the multi-member path groups (`_build_cluster_query`
+# groups BY content_key with NO merchant filter, and `derive_product_group_id`
+# takes only content_key). ADR-009 D1: the PRODUCT layer is cross-merchant,
+# seller-free by construction; the seller lives on the OFFER, never the group.
+
+
+def make_singleton_product_group_id(content_key: str) -> str:
+    """Deterministic singleton product_group_id for a lone content identity.
+
+    Same content_key → same pg forever (idempotent). Requires a non-empty
+    `ck_`-prefixed content_key: a singleton is a group of exactly ONE content
+    identity, so minting one from an absent content_key would be inventing a
+    pg from nothing — banned (ADR-009 decision 1: `content_key` is a derivation
+    INPUT, never a runtime alternative; store-less rows stay pg-NULL and are
+    handled honestly downstream, not force-minted).
+
+    Reuses `derive_product_group_id` so the singleton namespace is IDENTICAL to
+    the multi-member namespace (`pg_<hex>`) — a singleton is just an autogroup
+    of size 1 (see the NON-MERGE PROPERTY note above)."""
+    if not isinstance(content_key, str) or not content_key.strip():
+        raise ValueError(
+            "cannot mint a singleton product_group_id without a content_key "
+            "(ADR-009 decision 1: never mint a pg from nothing)"
+        )
+    return derive_product_group_id(content_key.strip())
+
+
+_UPSERT_SINGLETON_MEMBER_SQL = """
+    INSERT INTO product_group_members (
+      product_group_id, merchant_id, platform, platform_product_id,
+      is_primary, updated_at
+    ) VALUES (
+      :product_group_id, :merchant_id, :platform, :platform_product_id,
+      TRUE, NOW()
+    )
+    ON CONFLICT (merchant_id, platform, platform_product_id)
+    DO NOTHING
+"""
+
+
+async def ensure_singleton_group_membership(
+    *,
+    merchant_id: str,
+    platform: str,
+    source_product_id: str,
+    content_key: Optional[str],
+    db: Any = None,
+) -> Optional[str]:
+    """Materialize the singleton pg for one catalog listing at ingestion time.
+
+    ADR-009 decision 1 (no-fallback): so the offer path can key on pg with ZERO
+    branching, every product must carry a pg BEFORE it is served — computing pg
+    at offer time would itself be the banned runtime fallback. This stamps the
+    singleton membership row (the `product_group_members` table that
+    `offers.resolve` reads, agent_shop_gateway.py) when the listing is written.
+
+    Idempotent + non-destructive:
+      - `ON CONFLICT DO NOTHING`: a row already claimed by a real/curated group
+        (autogrouper cluster, variant promoter, manual governance) is left
+        untouched — a singleton NEVER overwrites a real group (no auto-merge).
+      - deterministic pg (`make_singleton_product_group_id`), so a re-run and
+        the autogroup path converge on the same value.
+
+    Honest absence: when `content_key` is NULL/blank the listing has no
+    canonical content identity yet (store-less / thin row). We do NOT invent a
+    pg — we leave the product pg-NULL and log observably. Downstream
+    (`offers.resolve`) treats a pg-NULL product as `no_canonical_identity`, not
+    a silent content_key substitution.
+
+    Returns the singleton pg when minted, else None.
+    """
+    ck = (content_key or "").strip()
+    if not ck:
+        logger.info(
+            "pg_singleton.skip.no_content_key",
+            extra={
+                "event": "pg_singleton.skip.no_content_key",
+                "merchant_id": merchant_id,
+                "platform": platform,
+                "source_product_id": source_product_id,
+            },
+        )
+        return None
+
+    pg = make_singleton_product_group_id(ck)
+    conn = db if db is not None else database
+    await conn.execute(
+        _UPSERT_SINGLETON_MEMBER_SQL,
+        {
+            "product_group_id": pg,
+            "merchant_id": merchant_id,
+            "platform": platform,
+            "platform_product_id": source_product_id,
+        },
+    )
+    logger.debug(
+        "pg_singleton.minted",
+        extra={
+            "event": "pg_singleton.minted",
+            "product_group_id": pg,
+            "merchant_id": merchant_id,
+            "platform": platform,
+            "source_product_id": source_product_id,
+        },
+    )
+    return pg
+
+
 def _lifecycle_rank(stage: Optional[str]) -> int:
     if not isinstance(stage, str):
         return 0

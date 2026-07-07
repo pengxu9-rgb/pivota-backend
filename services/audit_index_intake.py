@@ -608,6 +608,28 @@ async def upsert_audited_sku_to_index(
 
     content_key = fields.get("content_key")
     if content_key:
+        # ADR-009 ratified decision 1 (no-fallback): stamp the deterministic
+        # SINGLETON product_group_id so this audit-sourced product carries a pg
+        # (offer path keys on pg with zero branching). ON CONFLICT DO NOTHING —
+        # never overwrites a real/curated group (no auto-merge). Best-effort like
+        # the rest of this intake: a failure is logged loudly, never silently
+        # absorbed, and the backfill remains the safety net.
+        try:
+            from services.product_group_autogrouper import (
+                ensure_singleton_group_membership,
+            )
+
+            await ensure_singleton_group_membership(
+                merchant_id=str(fields.get("merchant_id") or ""),
+                platform=str(fields.get("platform") or ""),
+                source_product_id=str(fields.get("source_product_id") or ""),
+                content_key=content_key,
+            )
+        except Exception as exc:  # noqa: BLE001 — best-effort, never break intake
+            logger.warning(
+                "upsert_audited_sku_to_index: singleton pg mint failed for %s: %s",
+                fields.get("product_key"), str(exc)[:200],
+            )
         try:
             from services.agent_pdp_view_assembler import (
                 refresh_agent_pdp_view_for_content_key,

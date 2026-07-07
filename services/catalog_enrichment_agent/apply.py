@@ -166,6 +166,26 @@ async def apply_ingest_plan(
         except Exception as exc:  # noqa: BLE001
             logger.exception("insert pdp failed for product_key=%s — %s", pdp.get("product_key"), exc)
 
+        # ADR-009 ratified decision 1 (no-fallback): stamp the deterministic
+        # SINGLETON product_group_id so this enriched product carries a pg (offer
+        # path keys on pg with zero branching). ON CONFLICT DO NOTHING — never
+        # overwrites a real/curated group (no auto-merge). content_key NULL →
+        # pg-NULL + observable log.
+        try:
+            from services.product_group_autogrouper import (
+                ensure_singleton_group_membership,
+            )
+
+            await ensure_singleton_group_membership(
+                merchant_id=str(pdp.get("merchant_id") or ""),
+                platform=str(pdp.get("platform") or ""),
+                source_product_id=str(pdp.get("source_product_id") or ""),
+                content_key=pdp.get("content_key"),
+            )
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("singleton pg mint failed for product_key=%s — %s",
+                           pdp.get("product_key"), str(exc)[:200])
+
     async with database.transaction():
         # 3. catalog_skus — INSERT one synthetic 'canonical' SKU per PDP.
         for sku in skus:
