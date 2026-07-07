@@ -57,18 +57,44 @@ def build_servable_quality_payload(
     image_url: Optional[str],
     brand: Optional[str] = None,
     product_type: Optional[str] = None,
+    category: Optional[str] = None,
+    raw_inci: Optional[str] = None,
 ) -> Dict[str, Any]:
-    """Shape the fields the deterministic quality scorer reads."""
-    return build_quality_payload(
+    """Shape the fields the deterministic quality scorer reads.
+
+    External-seed crawl products often have a null ``product_type`` and carry
+    their ingredient list separately (``raw_inci``). Without help, the scorer
+    sees no category (fails the brand+category component) and no ingredients
+    (fails the source-backed attributes component), so genuinely-stocked
+    products score ~50 and never clear the serving threshold. We therefore:
+      * fall back to ``category`` (e.g. category_kind) when product_type is null,
+        so the brand+category component can pass, and
+      * attach the INCI to the payload's ``seed_data`` where
+        ``source_backed_attribute_signal_count`` reads it, so a product with a
+        real ingredient list earns the attributes component.
+    """
+    payload = build_quality_payload(
         {
             "title": title,
             "description": description,
             "price": price,
             "image_url": image_url,
             "brand": brand,
-            "product_type": product_type,
+            # product_type drives global_category_id; fall back to category_kind
+            "product_type": product_type or category,
         }
     )
+
+    inci = (raw_inci or "").strip()
+    if inci:
+        inci_list = [tok.strip() for tok in inci.split(",") if tok.strip()]
+        # build_quality_payload does not carry ingredients through; attach them
+        # to the top-level seed_data slot that _source_backed_roots() reads.
+        payload["seed_data"] = {
+            "inci_list": inci_list,
+            "pdp_ingredients_raw": inci,
+        }
+    return payload
 
 
 async def make_external_seed_servable(
@@ -97,6 +123,10 @@ async def make_external_seed_servable(
             platform_product_id=source_product_id,
             geo_code="default",
             payload=quality_payload,
+            # External seeds ARE the source-backed case: their quality hinges on
+            # the ingredient/attribute signals we attach above, so score those
+            # components here rather than gating them behind the global env flag.
+            score_source_backed_components=True,
         )
         summary["quality"] = True
     except Exception:  # noqa: BLE001
