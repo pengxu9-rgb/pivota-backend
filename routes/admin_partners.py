@@ -339,6 +339,27 @@ async def create_admin_partner(
                 if inserted is not None:
                     seeded_rate_count += 1
 
+        # Seed the comms contact row so the canonical read path
+        # (partner_contacts) has the email captured at creation — this is what
+        # the invite auto-email and the comms panel read. Without it a
+        # brand-new partner looks like it has no contact email.
+        contact_email = (body.contact_email or "").strip()
+        if contact_email:
+            # Plain INSERT (no ON CONFLICT): new_partner_id was just minted in
+            # this transaction, so no partner_contacts row can exist for it —
+            # avoids depending on the channel_partner_id UNIQUE constraint being
+            # present in prod (schema is applied piecemeal here).
+            await database.execute(
+                """
+                INSERT INTO partner_contacts (channel_partner_id, contact_email)
+                VALUES (:channel_partner_id, :contact_email)
+                """,
+                {
+                    "channel_partner_id": new_partner_id,
+                    "contact_email": contact_email,
+                },
+            )
+
     partner = await get_admin_partner(new_partner_id, current_admin)
     if isinstance(partner, JSONResponse):
         return partner

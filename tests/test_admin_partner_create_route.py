@@ -19,6 +19,7 @@ class _FakeCreateDatabase:
     def __init__(self) -> None:
         self.channel_partners: list[dict[str, Any]] = []
         self.partner_rate_schedules: list[dict[str, Any]] = []
+        self.partner_contacts: list[dict[str, Any]] = []
         self._next_id = 1
 
     @asynccontextmanager
@@ -92,6 +93,9 @@ class _FakeCreateDatabase:
         if sql.startswith("insert into partner_rate_schedules"):
             self.partner_rate_schedules.append(dict(params))
             return None
+        if sql.startswith("insert into partner_contacts"):
+            self.partner_contacts.append(dict(params))
+            return None
         raise AssertionError(f"Unhandled execute query: {query}")
 
 
@@ -152,6 +156,40 @@ def test_create_minimal_seeds_default_scope_b_rates(
     assert streams == {"subscription", "credit_overage", "gmv_take"}
     # Every seed row is dated at the partner's term_start_date.
     assert {r["effective_from"] for r in fake_db.partner_rate_schedules} == {_TODAY}
+
+
+def test_create_with_contact_email_seeds_partner_contacts(
+    fake_db: _FakeCreateDatabase,
+) -> None:
+    client, app = _build_client()
+    try:
+        response = _post(
+            client,
+            legal_name="Contact Co",
+            archetype="agency",
+            contact_email="finance@contact.co",
+        )
+    finally:
+        app.dependency_overrides.clear()
+
+    assert response.status_code == 201
+    # The email must land in partner_contacts (the canonical read path the
+    # invite auto-email + comms panel use), not only channel_partners.
+    assert len(fake_db.partner_contacts) == 1
+    assert fake_db.partner_contacts[0]["contact_email"] == "finance@contact.co"
+
+
+def test_create_without_contact_email_writes_no_contact_row(
+    fake_db: _FakeCreateDatabase,
+) -> None:
+    client, app = _build_client()
+    try:
+        response = _post(client, legal_name="No Email Co", archetype="agency")
+    finally:
+        app.dependency_overrides.clear()
+
+    assert response.status_code == 201
+    assert fake_db.partner_contacts == []
 
 
 def test_create_channel_tiered_seeds_split_gmv_streams(
