@@ -266,8 +266,25 @@ async def revoke(
         raise TokenInvalidError("token_id must be positive")
     revoker = str(revoked_by or "").strip()
 
+    # Build the partner-scope filter conditionally rather than
+    # `:channel_partner_id IS NULL OR ...`: a bare `$n IS NULL` bind gives
+    # Postgres no way to infer the parameter type and it raises 42P08
+    # (AmbiguousParameterError). The clause is a fixed literal — the value
+    # still binds through :channel_partner_id — so there is no injection risk.
+    partner_clause = ""
+    if channel_partner_id is not None:
+        partner_clause = "AND channel_partner_id = :channel_partner_id"
+
+    update_params: dict[str, Any] = {
+        "token_id": int(token_id),
+        "revoked_by": revoker,
+        "revoked_reason": reason,
+    }
+    if channel_partner_id is not None:
+        update_params["channel_partner_id"] = int(channel_partner_id)
+
     updated = await database.fetch_one(
-        """
+        f"""
         UPDATE partner_invite_tokens
         SET status = 'revoked',
             revoked_at = NOW(),
@@ -275,28 +292,27 @@ async def revoke(
             revoked_reason = :revoked_reason
         WHERE id = :token_id
           AND status = 'active'
-          AND (:channel_partner_id IS NULL OR channel_partner_id = :channel_partner_id)
+          {partner_clause}
         RETURNING id
         """,
-        {
-            "token_id": int(token_id),
-            "channel_partner_id": channel_partner_id,
-            "revoked_by": revoker,
-            "revoked_reason": reason,
-        },
+        update_params,
     )
     if updated:
         return
 
+    select_params: dict[str, Any] = {"token_id": int(token_id)}
+    if channel_partner_id is not None:
+        select_params["channel_partner_id"] = int(channel_partner_id)
+
     current = await database.fetch_one(
-        """
+        f"""
         SELECT status
         FROM partner_invite_tokens
         WHERE id = :token_id
-          AND (:channel_partner_id IS NULL OR channel_partner_id = :channel_partner_id)
+          {partner_clause}
         LIMIT 1
         """,
-        {"token_id": int(token_id), "channel_partner_id": channel_partner_id},
+        select_params,
     )
     if not current:
         raise TokenInvalidError(f"Invite token not found: {token_id}")
