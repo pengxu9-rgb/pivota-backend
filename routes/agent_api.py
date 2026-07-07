@@ -6757,7 +6757,6 @@ async def agent_resolve_products(
         sources.append(row)
 
     candidates_by_key: Dict[str, Dict[str, Any]] = {}
-    exact_path_resolved = False
 
     def _add_candidate(
         *,
@@ -6882,7 +6881,6 @@ async def agent_resolve_products(
             row_count=len(exact_cache_rows),
             query="products_cache_exact",
         )
-        exact_path_resolved = bool(candidates_by_key)
     except Exception as e:
         _record_source(
             source="products_cache_exact",
@@ -7065,90 +7063,92 @@ async def agent_resolve_products(
         reverse=True,
     )
 
-    # Canonical mapping via product groups.
+    # Canonical mapping via product groups. ADR-009 ratified decision 1
+    # (no-fallback): canonical_ref comes from product_group_members or is
+    # ABSENT, so this lookup runs even when the exact-identifier fast path
+    # already produced candidates — skipping it (the former
+    # `skipped_fast_path` branch) was only tolerable while the merchant-scoped
+    # `pc:` substitute papered over the gap; now it would misreport grouped
+    # products as `no_canonical_identity`.
     canonical_group_id: Optional[str] = None
     canonical_ref: Optional[str] = None
     canonical_product: Optional[Dict[str, Any]] = None
     group_started = time.perf_counter()
-    if exact_path_resolved and has_identifier_input:
-        _record_source(
-            source="product_group_members",
-            status="skipped",
-            reason_code="skipped_fast_path",
-            source_started=group_started,
-            row_count=0,
-            query="product_group_members_by_pid",
-        )
-    else:
-        try:
-            candidate_product_ids = [str(c.get("product_id") or "").strip() for c in candidates if c.get("product_id")]
-            candidate_product_ids = list(dict.fromkeys([c for c in candidate_product_ids if c]))[:200]
-            if candidate_product_ids:
-                rows = await asyncio.wait_for(
-                    database.fetch_all(
-                        """
-                        SELECT product_group_id, merchant_id, platform, platform_product_id, is_primary
-                        FROM product_group_members
-                        WHERE platform_product_id = ANY(:pids)
-                        ORDER BY is_primary DESC, merchant_id ASC
-                        LIMIT 200
-                        """,
-                        {"pids": candidate_product_ids},
-                    ),
-                    timeout=resolve_group_timeout_s,
-                )
-                if rows:
-                    first = dict(rows[0])
-                    canonical_group_id = str(first.get("product_group_id") or "").strip() or None
-                    if canonical_group_id:
-                        primary = None
-                        for r in rows:
-                            rd = dict(r)
-                            if str(rd.get("product_group_id") or "") != canonical_group_id:
-                                continue
-                            if bool(rd.get("is_primary")):
-                                primary = rd
-                                break
-                            if primary is None:
-                                primary = rd
-                        if primary:
-                            canonical_product = {
-                                "merchant_id": primary.get("merchant_id"),
-                                "platform": primary.get("platform"),
-                                "product_id": primary.get("platform_product_id"),
-                                "product_group_id": canonical_group_id,
-                            }
-                            canonical_ref = f"pg:{canonical_group_id}"
-                _record_source(
-                    source="product_group_members",
-                    status="ok" if rows else "empty",
-                    reason_code="ok" if rows else "no_candidates",
-                    source_started=group_started,
-                    row_count=len(rows or []),
-                    query="product_group_members_by_pid",
-                )
-            else:
-                _record_source(
-                    source="product_group_members",
-                    status="empty",
-                    reason_code="no_candidates",
-                    source_started=group_started,
-                    row_count=0,
-                    query="product_group_members_by_pid",
-                )
-        except Exception as e:
+    try:
+        candidate_product_ids = [str(c.get("product_id") or "").strip() for c in candidates if c.get("product_id")]
+        candidate_product_ids = list(dict.fromkeys([c for c in candidate_product_ids if c]))[:200]
+        if candidate_product_ids:
+            rows = await asyncio.wait_for(
+                database.fetch_all(
+                    """
+                    SELECT product_group_id, merchant_id, platform, platform_product_id, is_primary
+                    FROM product_group_members
+                    WHERE platform_product_id = ANY(:pids)
+                    ORDER BY is_primary DESC, merchant_id ASC
+                    LIMIT 200
+                    """,
+                    {"pids": candidate_product_ids},
+                ),
+                timeout=resolve_group_timeout_s,
+            )
+            if rows:
+                first = dict(rows[0])
+                canonical_group_id = str(first.get("product_group_id") or "").strip() or None
+                if canonical_group_id:
+                    primary = None
+                    for r in rows:
+                        rd = dict(r)
+                        if str(rd.get("product_group_id") or "") != canonical_group_id:
+                            continue
+                        if bool(rd.get("is_primary")):
+                            primary = rd
+                            break
+                        if primary is None:
+                            primary = rd
+                    if primary:
+                        canonical_product = {
+                            "merchant_id": primary.get("merchant_id"),
+                            "platform": primary.get("platform"),
+                            "product_id": primary.get("platform_product_id"),
+                            "product_group_id": canonical_group_id,
+                        }
+                        canonical_ref = f"pg:{canonical_group_id}"
             _record_source(
                 source="product_group_members",
-                status="error",
-                reason_code=_classify_db_reason_code(e),
+                status="ok" if rows else "empty",
+                reason_code="ok" if rows else "no_candidates",
                 source_started=group_started,
-                error=type(e).__name__,
+                row_count=len(rows or []),
                 query="product_group_members_by_pid",
             )
+        else:
+            _record_source(
+                source="product_group_members",
+                status="empty",
+                reason_code="no_candidates",
+                source_started=group_started,
+                row_count=0,
+                query="product_group_members_by_pid",
+            )
+    except Exception as e:
+        _record_source(
+            source="product_group_members",
+            status="error",
+            reason_code=_classify_db_reason_code(e),
+            source_started=group_started,
+            error=type(e).__name__,
+            query="product_group_members_by_pid",
+        )
 
-    if not canonical_ref and candidates:
+    # ADR-009 ratified decision 1 (no-fallback): canonical_ref is `pg:…` or
+    # ABSENT (honest `no_canonical_identity`), never a merchant-scoped
+    # `pc:{merchant}:{platform}:{pid}` substitute. Singleton pg minting
+    # (services.product_group_autogrouper.ensure_singleton_group_membership)
+    # makes pg total for every content_key'd product; a candidate with no pg
+    # has no canonical identity yet. canonical_product stays a best-effort
+    # merchant-level pointer — it carries no canonical identity claim.
+    if canonical_product is None and candidates:
         top = candidates[0]
-        canonical_ref = f"pc:{top.get('merchant_id')}:{top.get('platform')}:{top.get('product_id')}"
         canonical_product = {
             "merchant_id": top.get("merchant_id"),
             "platform": top.get("platform"),
@@ -7215,6 +7215,13 @@ async def agent_resolve_products(
             "query": query_text or None,
         },
         "canonical_ref": canonical_ref,
+        # ADR-009 decision 1: observable honest-absent state. `resolved` when
+        # the ref keyed on a product_group_id; `no_canonical_identity` when no
+        # candidate carries a pg yet (store-less / thin, pg-NULL) — an
+        # explicit reason, NOT a silent merchant-scoped `pc:` substitution.
+        "canonical_identity_status": (
+            "resolved" if canonical_ref else "no_canonical_identity"
+        ),
         "canonical_product_group_id": canonical_group_id,
         "canonical_product": canonical_product,
         "candidates": candidates,
