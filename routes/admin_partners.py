@@ -466,6 +466,48 @@ def _default_rate_rows(gmv_take_definition: str) -> list[tuple[str, int, int]]:
     return rows
 
 
+@router.post("/admin/partners/{channel_partner_id}/deactivate", response_model=None)
+async def deactivate_admin_partner(
+    channel_partner_id: int,
+    current_admin: dict = Depends(require_admin),
+) -> dict[str, Any] | JSONResponse:
+    """Soft-delete a partner: set status to 'inactive'.
+
+    Partners are never hard-deleted — every financial/attribution table FKs to
+    channel_partners with ON DELETE RESTRICT to preserve rev-share history. An
+    inactive partner drops out of the active list and its legal_name is freed
+    for reuse (the create-partner duplicate guard ignores inactive partners).
+    """
+    return await _set_partner_status(channel_partner_id, "inactive", current_admin)
+
+
+@router.post("/admin/partners/{channel_partner_id}/reactivate", response_model=None)
+async def reactivate_admin_partner(
+    channel_partner_id: int,
+    current_admin: dict = Depends(require_admin),
+) -> dict[str, Any] | JSONResponse:
+    """Reverse a deactivation: set status back to 'active'."""
+    return await _set_partner_status(channel_partner_id, "active", current_admin)
+
+
+async def _set_partner_status(
+    channel_partner_id: int,
+    status_value: str,
+    current_admin: dict,
+) -> dict[str, Any] | JSONResponse:
+    existing = await database.fetch_one(
+        "SELECT id FROM channel_partners WHERE id = :id LIMIT 1",
+        {"id": channel_partner_id},
+    )
+    if not existing:
+        return JSONResponse(status_code=404, content={"error": "partner_not_found"})
+    await database.execute(
+        "UPDATE channel_partners SET status = :status WHERE id = :id",
+        {"status": status_value, "id": channel_partner_id},
+    )
+    return await get_admin_partner(channel_partner_id, current_admin)
+
+
 @router.put(
     "/admin/partners/{channel_partner_id}/stripe-connect",
     response_model=None,
