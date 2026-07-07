@@ -165,6 +165,14 @@ async def resolve_shopify_admin_access_token(
         return current_token, meta
     if not normalized_domain:
         meta["refresh_error"] = "shop_domain_missing"
+        # Every caller discards meta (access_token, _ = ...), so this resolver is
+        # the single observability point for a dead token refresh — otherwise it
+        # surfaces only as opaque downstream Shopify 401s (audit fix #9).
+        logger.warning(
+            "Shopify token refresh skipped: shop_domain missing shop=%s store_id=%s",
+            shop_domain,
+            store_id,
+        )
         return current_token, meta
 
     new_token, expires_in, refresh_error = await exchange_shopify_client_credentials_token(
@@ -174,6 +182,12 @@ async def resolve_shopify_admin_access_token(
     )
     if not new_token:
         meta["refresh_error"] = refresh_error or "unknown_refresh_error"
+        logger.warning(
+            "Shopify token refresh failed shop=%s store_id=%s refresh_error=%s",
+            shop_domain,
+            store_id,
+            meta["refresh_error"],
+        )
         return current_token, meta
 
     now = datetime.now(timezone.utc)

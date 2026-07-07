@@ -7,7 +7,7 @@ from services.merchant_store_service import get_merchant_active_stores, get_prim
 from services.shopify_access_token_service import resolve_shopify_admin_access_token
 from fastapi import APIRouter, BackgroundTasks, Request, HTTPException, Header, Response, Depends
 from fastapi.security import HTTPBasic, HTTPBasicCredentials
-from typing import Optional, Dict, Any, Tuple
+from typing import Optional, Dict, Any, Tuple, List
 from urllib.parse import urlparse
 import stripe
 import os
@@ -20,6 +20,7 @@ from decimal import Decimal
 
 from db.orders import get_order, update_order, update_order_status, mark_order_paid, mark_order_shipped
 from db.merchant_onboarding import get_merchant_onboarding
+from utils.auth import get_current_employee
 from db.products import log_order_event
 from config.settings import settings
 from utils.logger import logger
@@ -1503,6 +1504,326 @@ async def handle_stripe_webhook(
 # Shopify GDPR Webhooks (static endpoint for Partner Dashboard configuration)
 # ============================================================================
 
+# PII keys stripped when scrubbing webhook-event payloads during redaction. Kept
+# in sync with services/shopify_webhook_ingest._PII_KEYS (fix #6); duplicated here
+# to scrub historical rows persisted BEFORE fix #6 landed.
+_GDPR_SCRUB_KEYS = (
+    "customer",
+    "email",
+    "contact_email",
+    "phone",
+    "billing_address",
+    "shipping_address",
+    "customer_locale",
+    "browser_ip",
+    "customer_url",
+)
+
+_REDACTED_NAME = "[REDACTED]"
+
+
+def _redacted_email(original: Optional[str]) -> str:
+    """
+    Non-null tombstone for the non-nullable orders.customer_email column. Uses an
+    sha256-8 of the original so redacted rows remain distinct (no collisions on a
+    single sentinel) without retaining the address.
+    """
+    src = (original or "").strip().lower()
+    digest = hashlib.sha256(src.encode("utf-8")).hexdigest()[:8] if src else "00000000"
+    return f"redacted+{digest}@redacted.invalid"
+
+
+def _scrub_webhook_event_payload(payload_json: Any) -> Any:
+    """Strip PII keys from a stored webhook-event payload (dict-in, dict-out)."""
+    if not isinstance(payload_json, dict):
+        return payload_json
+    for key in _GDPR_SCRUB_KEYS:
+        payload_json.pop(key, None)
+    line_items = payload_json.get("line_items")
+    if isinstance(line_items, list):
+        for item in line_items:
+            if isinstance(item, dict):
+                item.pop("destination_location", None)
+                item.pop("origin_location", None)
+    payload_json["pii_stripped"] = True
+    return payload_json
+
+
+async def _record_gdpr_request(
+    *,
+    merchant_id: Optional[str],
+    shop_domain: Optional[str],
+    topic: str,
+    shopify_request: Dict[str, Any],
+    status: str,
+    resolution: Dict[str, Any],
+) -> None:
+    """Persist the compliance-request audit row (best-effort; never raises)."""
+    try:
+        from db.database import database
+
+        await database.execute(
+            """
+            INSERT INTO shopify_gdpr_requests
+              (merchant_id, shop_domain, topic, shopify_request, status, resolution, resolved_at)
+            VALUES
+              (:merchant_id, :shop_domain, :topic, CAST(:shopify_request AS jsonb),
+               :status, CAST(:resolution AS jsonb),
+               CASE WHEN :status IN ('completed', 'needs_review') THEN NOW() ELSE NULL END)
+            """,
+            {
+                "merchant_id": merchant_id,
+                "shop_domain": shop_domain,
+                "topic": topic,
+                "shopify_request": json.dumps(shopify_request or {}, ensure_ascii=False, default=str),
+                "status": status,
+                "resolution": json.dumps(resolution or {}, ensure_ascii=False, default=str),
+            },
+        )
+    except Exception as e:
+        logger.warning("Failed to persist shopify_gdpr_requests row topic=%s err=%s", topic, str(e)[:200])
+
+
+async def _scrub_webhook_events_for_email(
+    *, shop_domain: Optional[str], customer_email: Optional[str]
+) -> int:
+    """
+    Scrub PII from pcs_shopify_webhook_events order rows for this shop whose
+    payload contains the customer's email. Returns count of rows rewritten.
+    """
+    if not shop_domain or not customer_email:
+        return 0
+    from db.database import database
+
+    rows = await database.fetch_all(
+        """
+        SELECT id, payload_json
+        FROM pcs_shopify_webhook_events
+        WHERE lower(shop_domain) = :shop_domain
+          AND topic LIKE 'orders/%'
+        """,
+        {"shop_domain": shop_domain.strip().lower()},
+    )
+    target = customer_email.strip().lower()
+    scrubbed = 0
+    for row in rows or []:
+        payload = row["payload_json"]
+        if isinstance(payload, str):
+            try:
+                payload = json.loads(payload)
+            except Exception:
+                continue
+        if not isinstance(payload, dict):
+            continue
+        if target not in json.dumps(payload, ensure_ascii=False, default=str).lower():
+            continue
+        cleaned = _scrub_webhook_event_payload(payload)
+        await database.execute(
+            "UPDATE pcs_shopify_webhook_events SET payload_json = CAST(:p AS jsonb) WHERE id = :id",
+            {"p": json.dumps(cleaned, ensure_ascii=False, default=str), "id": row["id"]},
+        )
+        scrubbed += 1
+    return scrubbed
+
+
+async def _scrub_webhook_events_for_shop(*, shop_domain: Optional[str]) -> int:
+    """Scrub PII from ALL order webhook-event rows for a shop. Returns count."""
+    if not shop_domain:
+        return 0
+    from db.database import database
+
+    rows = await database.fetch_all(
+        """
+        SELECT id, payload_json
+        FROM pcs_shopify_webhook_events
+        WHERE lower(shop_domain) = :shop_domain
+          AND topic LIKE 'orders/%'
+        """,
+        {"shop_domain": shop_domain.strip().lower()},
+    )
+    scrubbed = 0
+    for row in rows or []:
+        payload = row["payload_json"]
+        if isinstance(payload, str):
+            try:
+                payload = json.loads(payload)
+            except Exception:
+                continue
+        if not isinstance(payload, dict):
+            continue
+        cleaned = _scrub_webhook_event_payload(payload)
+        await database.execute(
+            "UPDATE pcs_shopify_webhook_events SET payload_json = CAST(:p AS jsonb) WHERE id = :id",
+            {"p": json.dumps(cleaned, ensure_ascii=False, default=str), "id": row["id"]},
+        )
+        scrubbed += 1
+    return scrubbed
+
+
+async def _fulfill_shopify_gdpr_request(
+    *,
+    merchant_id: Optional[str],
+    shop_domain: Optional[str],
+    topic: str,
+    data: Dict[str, Any],
+) -> Dict[str, Any]:
+    """
+    Fulfill a Shopify compliance obligation for real (not log-and-200).
+
+    - customers/redact: anonymize matching Pivota `orders` rows and scrub matching
+      pcs_shopify_webhook_events payloads.
+    - shop/redact: same for the whole shop.
+    - customers/data_request: export what Pivota holds for the customer into the
+      audit row's resolution (merchant delivers out-of-band); no PII to app logs.
+
+    Always records a shopify_gdpr_requests audit row. Wrapped so a failure marks
+    the row needs_review; the caller still returns 200 (Shopify requires 200; the
+    audit row is the source of truth).
+    """
+    from db.database import database
+
+    resolution: Dict[str, Any] = {}
+    status = "completed"
+
+    # Compliance payloads carry ids, not bulk PII. Persist those for the audit row.
+    customer = data.get("customer") if isinstance(data, dict) else None
+    customer_email = None
+    customer_id = None
+    if isinstance(customer, dict):
+        customer_email = (customer.get("email") or "").strip() or None
+        customer_id = customer.get("id")
+    orders_to_redact = data.get("orders_to_redact") if isinstance(data, dict) else None
+    shopify_request = {
+        "shop_domain": shop_domain,
+        "customer_id": customer_id,
+        "orders_to_redact": orders_to_redact,
+        "orders_requested": data.get("orders_requested") if isinstance(data, dict) else None,
+    }
+
+    try:
+        if topic == "customers/redact":
+            redacted_orders = 0
+            if merchant_id and customer_email:
+                rows = await database.fetch_all(
+                    """
+                    UPDATE orders
+                    SET customer_name = :redacted_name,
+                        customer_email = :redacted_email,
+                        shipping_address = NULL
+                    WHERE merchant_id = :merchant_id
+                      AND lower(customer_email) = :email
+                    RETURNING order_id
+                    """,
+                    {
+                        "redacted_name": _REDACTED_NAME,
+                        "redacted_email": _redacted_email(customer_email),
+                        "merchant_id": merchant_id,
+                        "email": customer_email.strip().lower(),
+                    },
+                )
+                redacted_orders = len(rows or [])
+            # Also redact by explicit shopify order ids if provided.
+            if merchant_id and isinstance(orders_to_redact, list) and orders_to_redact:
+                ids = [str(x) for x in orders_to_redact if x is not None]
+                if ids:
+                    rows2 = await database.fetch_all(
+                        """
+                        UPDATE orders
+                        SET customer_name = :redacted_name,
+                            customer_email = :redacted_email,
+                            shipping_address = NULL
+                        WHERE merchant_id = :merchant_id
+                          AND shopify_order_id = ANY(:ids)
+                        RETURNING order_id
+                        """,
+                        {
+                            "redacted_name": _REDACTED_NAME,
+                            "redacted_email": _redacted_email(customer_email),
+                            "merchant_id": merchant_id,
+                            "ids": ids,
+                        },
+                    )
+                    redacted_orders += len(rows2 or [])
+            events_scrubbed = await _scrub_webhook_events_for_email(
+                shop_domain=shop_domain, customer_email=customer_email
+            )
+            resolution = {"orders_redacted": redacted_orders, "webhook_events_scrubbed": events_scrubbed}
+
+        elif topic == "shop/redact":
+            orders_redacted = 0
+            if merchant_id:
+                rows = await database.fetch_all(
+                    """
+                    UPDATE orders
+                    SET customer_name = :redacted_name,
+                        customer_email = :redacted_email,
+                        shipping_address = NULL
+                    WHERE merchant_id = :merchant_id
+                      AND customer_email NOT LIKE 'redacted+%@redacted.invalid'
+                    RETURNING order_id
+                    """,
+                    {
+                        "redacted_name": _REDACTED_NAME,
+                        # Per-shop bulk redaction has no single original email; use a
+                        # stable shop-scoped tombstone so the column stays non-null.
+                        "redacted_email": _redacted_email(shop_domain),
+                        "merchant_id": merchant_id,
+                    },
+                )
+                orders_redacted = len(rows or [])
+            events_scrubbed = await _scrub_webhook_events_for_shop(shop_domain=shop_domain)
+            resolution = {"orders_redacted": orders_redacted, "webhook_events_scrubbed": events_scrubbed}
+
+        elif topic == "customers/data_request":
+            export: List[Dict[str, Any]] = []
+            if merchant_id and customer_email:
+                rows = await database.fetch_all(
+                    """
+                    SELECT order_id, shopify_order_id, created_at, total, currency, status, payment_status
+                    FROM orders
+                    WHERE merchant_id = :merchant_id
+                      AND lower(customer_email) = :email
+                    ORDER BY created_at DESC
+                    """,
+                    {"merchant_id": merchant_id, "email": customer_email.strip().lower()},
+                )
+                for r in rows or []:
+                    d = dict(r)
+                    export.append(
+                        {
+                            "order_id": d.get("order_id"),
+                            "shopify_order_id": d.get("shopify_order_id"),
+                            "created_at": str(d.get("created_at")) if d.get("created_at") else None,
+                            "total": str(d.get("total")) if d.get("total") is not None else None,
+                            "currency": d.get("currency"),
+                            "status": d.get("status"),
+                            "payment_status": d.get("payment_status"),
+                        }
+                    )
+            # customer_email is an id in the compliance payload, not app-log PII, so
+            # we do NOT log it; the export lives only in the audit row's resolution.
+            resolution = {"orders_found": len(export), "export": export}
+
+        else:
+            status = "needs_review"
+            resolution = {"error": f"unhandled_topic:{topic}"}
+
+    except Exception as e:
+        status = "needs_review"
+        resolution = {"error": str(e)[:400]}
+        logger.warning("GDPR fulfillment error topic=%s merchant=%s err=%s", topic, merchant_id, str(e)[:200])
+
+    await _record_gdpr_request(
+        merchant_id=merchant_id,
+        shop_domain=shop_domain,
+        topic=topic,
+        shopify_request=shopify_request,
+        status=status,
+        resolution=resolution,
+    )
+    return {"status": status, "resolution": resolution}
+
+
 @router.post("/shopify/gdpr")
 async def handle_shopify_gdpr_webhook(
     request: Request,
@@ -1521,65 +1842,72 @@ async def handle_shopify_gdpr_webhook(
     topic = x_shopify_topic or "unknown"
     shop_domain = _canonicalize_shop_domain(x_shopify_shop_domain)
 
-    app_secret = (settings.shopify_client_secret or "").strip()
-    if not app_secret:
+    # Dual-app HMAC: verify against ALL app secrets (appstore + legacy + headless),
+    # deduped, any-match. Once SHOPIFY_APPSTORE_CLIENT_SECRET diverges from the
+    # legacy env, single-secret verification would 401 App A's compliance webhooks
+    # and fail automated review (audit C2). Mirrors the main handler's candidate
+    # pattern.
+    secret_candidates = _shopify_app_secret_candidates()
+    if not secret_candidates:
         record_shopify_webhook(result="error", reason="missing_secret", topic=topic)
         raise HTTPException(status_code=500, detail="Shopify webhook verification not configured")
     if not x_shopify_hmac_sha256:
         record_shopify_webhook(result="error", reason="missing_hmac", topic=topic)
         raise HTTPException(status_code=401, detail="Missing Shopify webhook signature")
-    if not verify_shopify_hmac(secret=app_secret, payload=payload, header_hmac_base64=x_shopify_hmac_sha256):
+    if not any(
+        verify_shopify_hmac(secret=secret, payload=payload, header_hmac_base64=x_shopify_hmac_sha256)
+        for secret in secret_candidates
+    ):
         record_shopify_webhook(result="error", reason="invalid_signature", topic=topic)
         raise HTTPException(status_code=401, detail="Invalid Shopify webhook signature")
 
-    merchant_id: Optional[str] = None
-    if shop_domain:
-        try:
-            from db.database import database
+    merchant_id = await _resolve_merchant_id_by_shop_domain(shop_domain)
 
-            row = await database.fetch_one(
-                """
-                SELECT merchant_id
-                FROM merchant_stores
-                WHERE platform = 'shopify' AND lower(domain) = :domain
-                ORDER BY connected_at DESC
-                LIMIT 1
-                """,
-                {"domain": shop_domain},
-            )
-            if row:
-                merchant_id = row["merchant_id"]
-            else:
-                row = await database.fetch_one(
-                    """
-                    SELECT merchant_id
-                    FROM merchant_onboarding
-                    WHERE lower(mcp_shop_domain) = :domain
-                    ORDER BY updated_at DESC
-                    LIMIT 1
-                    """,
-                    {"domain": shop_domain},
-                )
-                if row:
-                    merchant_id = row["merchant_id"]
-        except Exception as e:
-            logger.warning("GDPR webhook merchant lookup failed shop=%s err=%s", shop_domain, str(e)[:200])
-
-    payload_keys: list[str] = []
     try:
         data = json.loads(payload.decode("utf-8"))
-        if isinstance(data, dict):
-            payload_keys = list(data.keys())
+        if not isinstance(data, dict):
+            data = {}
     except Exception:
-        payload_keys = []
+        data = {}
 
+    # Fulfill the obligation for real (redact / export) and persist the audit row.
+    # Wrapped so Shopify still gets its required 200 even on error (the
+    # shopify_gdpr_requests row records needs_review as the audit trail).
+    outcome: Dict[str, Any] = {"status": "needs_review"}
+    try:
+        outcome = await _fulfill_shopify_gdpr_request(
+            merchant_id=merchant_id,
+            shop_domain=shop_domain,
+            topic=topic,
+            data=data,
+        )
+    except Exception as e:
+        logger.warning("GDPR fulfillment top-level error topic=%s err=%s", topic, str(e)[:200])
+        try:
+            await _record_gdpr_request(
+                merchant_id=merchant_id,
+                shop_domain=shop_domain,
+                topic=topic,
+                shopify_request={"shop_domain": shop_domain},
+                status="needs_review",
+                resolution={"error": str(e)[:400]},
+            )
+        except Exception:
+            pass
+
+    # Preserve the existing order_events breadcrumb + metric (no PII: keys only).
     if merchant_id:
         try:
             await log_order_event(
                 event_type="gdpr_webhook",
                 order_id=f"gdpr_{merchant_id}",
                 merchant_id=merchant_id,
-                metadata={"topic": topic, "payload_keys": payload_keys, "shop_domain": shop_domain},
+                metadata={
+                    "topic": topic,
+                    "payload_keys": list(data.keys()) if isinstance(data, dict) else [],
+                    "shop_domain": shop_domain,
+                    "resolution_status": outcome.get("status"),
+                },
             )
         except Exception as e:
             logger.warning("GDPR webhook log failed merchant=%s err=%s", merchant_id, str(e)[:200])
@@ -1588,13 +1916,63 @@ async def handle_shopify_gdpr_webhook(
     return {"status": "success", "topic": topic}
 
 
-# ============================================================================
-# Shopify Webhooks
-# ============================================================================
+def _shopify_app_secret_candidates() -> list[str]:
+    """
+    Deduped list of app shared secrets that could sign a Shopify webhook in the
+    dual-app (App A App-Store / App B headless) setup. Order is not significant;
+    any-match acceptance mirrors the per-merchant handler.
+    """
+    candidates: list[str] = []
+    for attr in ("shopify_appstore_client_secret", "shopify_client_secret", "shopify_headless_client_secret"):
+        val = getattr(settings, attr, None)
+        val = val.strip() if isinstance(val, str) else ""
+        if val and val not in candidates:
+            candidates.append(val)
+    return candidates
 
-@router.post("/shopify/{merchant_id}")
-async def handle_shopify_webhook(
-    merchant_id: str,
+
+async def _resolve_merchant_id_by_shop_domain(shop_domain: Optional[str]) -> Optional[str]:
+    """
+    Resolve merchant_id from a canonicalized Shopify shop domain, using the exact
+    lookup the GDPR handler uses: merchant_stores by domain, then
+    merchant_onboarding by mcp_shop_domain. Returns None if unknown.
+    """
+    if not shop_domain:
+        return None
+    try:
+        from db.database import database
+
+        row = await database.fetch_one(
+            """
+            SELECT merchant_id
+            FROM merchant_stores
+            WHERE platform = 'shopify' AND lower(domain) = :domain
+            ORDER BY connected_at DESC
+            LIMIT 1
+            """,
+            {"domain": shop_domain},
+        )
+        if row:
+            return row["merchant_id"]
+        row = await database.fetch_one(
+            """
+            SELECT merchant_id
+            FROM merchant_onboarding
+            WHERE lower(mcp_shop_domain) = :domain
+            ORDER BY updated_at DESC
+            LIMIT 1
+            """,
+            {"domain": shop_domain},
+        )
+        if row:
+            return row["merchant_id"]
+    except Exception as e:
+        logger.warning("Shop-domain merchant lookup failed shop=%s err=%s", shop_domain, str(e)[:200])
+    return None
+
+
+@router.post("/shopify/orders")
+async def handle_shopify_orders_static_webhook(
     request: Request,
     background_tasks: BackgroundTasks,
     x_shopify_hmac_sha256: Optional[str] = Header(None),
@@ -1604,167 +1982,116 @@ async def handle_shopify_webhook(
     x_shopify_triggered_at: Optional[str] = Header(None),
 ):
     """
-    处理 Shopify 事件
-    
-	    支持的事件：
-	    - orders/create, orders/updated, orders/paid, orders/cancelled
-	    - fulfillments/create, fulfillments/update, orders/fulfilled (legacy)
-	    - refunds/create (preferred) / orders/refunded (legacy)
-	    - returns/* (Shopify Returns; topic availability varies by shop/app)
-	    """
+    Static order/uninstall webhook endpoint for the App Store app (App A).
+
+    App A holds NO write_webhooks scope (deliberate) and therefore can never
+    self-register per-merchant webhooks — its ONLY delivery mechanism is the
+    app-owned shopify.app.toml `[[webhooks.subscriptions]]`, which deliver to ONE
+    static uri. The per-merchant /webhooks/shopify/{merchant_id} address doesn't
+    fit that model, so App A subscribes orders/paid + app/uninstalled here and we
+    resolve the merchant from X-Shopify-Shop-Domain (audit fix #3).
+
+    Strict in ALL environments (new endpoint, no legacy traffic): missing shop
+    domain -> 401, missing/invalid HMAC -> 401, unknown shop -> 404. HMAC is
+    verified against BOTH app secrets (App A + legacy) so a secret repoint does
+    not silently 401 App A's traffic.
+    """
+    payload = await request.body()
+    topic = x_shopify_topic or "unknown"
+
+    if not x_shopify_shop_domain:
+        record_shopify_webhook(result="error", reason="missing_shop_domain", topic=topic)
+        raise HTTPException(status_code=401, detail="Missing Shopify shop domain")
+
+    secret_candidates = _shopify_app_secret_candidates()
+    if not secret_candidates:
+        record_shopify_webhook(result="error", reason="missing_secret", topic=topic)
+        raise HTTPException(status_code=500, detail="Shopify webhook verification not configured")
+    if not x_shopify_hmac_sha256:
+        record_shopify_webhook(result="error", reason="missing_hmac", topic=topic)
+        raise HTTPException(status_code=401, detail="Missing Shopify webhook signature")
+
+    signature_verified = any(
+        verify_shopify_hmac(secret=secret, payload=payload, header_hmac_base64=x_shopify_hmac_sha256)
+        for secret in secret_candidates
+    )
+    if not signature_verified:
+        record_shopify_webhook(result="error", reason="invalid_signature", topic=topic)
+        raise HTTPException(status_code=401, detail="Invalid Shopify webhook signature")
+
+    got_canon = _canonicalize_shop_domain(x_shopify_shop_domain)
+    merchant_id = await _resolve_merchant_id_by_shop_domain(got_canon)
+    if not merchant_id:
+        # Unknown shop: 404 so Shopify stops retrying junk (and we emit a metric).
+        record_shopify_webhook(result="error", reason="unknown_shop", topic=topic)
+        logger.warning("Static Shopify order webhook: unknown shop domain got=%s topic=%s", got_canon, topic)
+        raise HTTPException(status_code=404, detail="Unknown Shopify shop")
+
     try:
-        payload = await request.body()
-        topic = x_shopify_topic or "unknown"
-        
-        # 获取商户信息
-        merchant = await get_merchant_onboarding(merchant_id)
-        if not merchant:
-            raise HTTPException(status_code=404, detail="Merchant not found")
-
-        got_canon = _canonicalize_shop_domain(x_shopify_shop_domain)
-
-        # Build Shopify store allowlist and (optional) per-store webhook secret mapping.
-        # Note: the shop domain comes from an untrusted header, so we ONLY use it to select
-        # a secret after confirming it matches a connected Shopify store for this merchant.
-        stores = []
-        try:
-            stores = await get_merchant_active_stores(merchant_id)
-        except Exception as e:
-            logger.warning("Shopify webhook store lookup failed merchant=%s err=%s", merchant_id, str(e)[:160])
-            stores = []
-
-        allowed_domains: Dict[str, Dict[str, Any]] = {}
-        for store in stores or []:
-            if (store.get("platform") or "").lower() != "shopify":
-                continue
-            dom = _canonicalize_shop_domain(store.get("domain"))
-            if dom:
-                allowed_domains[dom] = store
-
-        matched_store = allowed_domains.get(got_canon) if got_canon else None
-        store_secret: str = ""
-        if matched_store:
-            creds = matched_store.get("api_credentials") or {}
-            if isinstance(creds, dict):
-                for k in ("webhook_secret", "client_secret", "api_secret_key", "shopify_client_secret"):
-                    v = creds.get(k)
-                    if isinstance(v, str) and v.strip():
-                        store_secret = v.strip()
-                        break
-
-        # Verify signature (strict in production; must use raw request body).
-        instance_id = socket.gethostname()
-        is_production = (
-            os.getenv("APP_ENV", "").lower() == "production"
-            or os.getenv("ENVIRONMENT", "").lower() == "production"
-            or bool(os.getenv("RAILWAY_GIT_COMMIT_SHA"))
-        )
-        app_secret = getattr(settings, "shopify_client_secret", None)
-        app_secret = app_secret.strip() if isinstance(app_secret, str) else ""
-        store_secret = store_secret.strip() if isinstance(store_secret, str) else ""
-
-        # Webhook signatures are generated using the Shopify app's shared secret. In practice, we may
-        # have BOTH an app-level secret (env) and a per-store override (DB) during migrations or when
-        # merchants reconnect via different onboarding flows. Accept when ANY known secret matches.
-        secret_candidates: list[tuple[str, str]] = []
-        if store_secret:
-            secret_candidates.append(("store_credentials", store_secret))
-        if app_secret and app_secret != store_secret:
-            secret_candidates.append(("app_env", app_secret))
-
-        secret_source = secret_candidates[0][0] if secret_candidates else "none"
-        secret_len = len(secret_candidates[0][1]) if secret_candidates else 0
-        has_store_secret = bool(store_secret)
-        has_app_secret = bool(app_secret)
-        store_secret_len = len(store_secret) if store_secret else 0
-        app_secret_len = len(app_secret) if app_secret else 0
-
-        debug_meta = {
-            "merchant_id": merchant_id,
-            "instance": instance_id,
-            "topic": topic,
-            "webhook_id": x_shopify_webhook_id,
-            "shop_domain": got_canon,
-            "has_shop_domain_header": bool(x_shopify_shop_domain),
-            "has_hmac_header": bool(x_shopify_hmac_sha256),
-            "has_webhook_id_header": bool(x_shopify_webhook_id),
-            "content_length": request.headers.get("content-length"),
-            "user_agent": request.headers.get("user-agent"),
-            "secret_source": secret_source,
-            "secret_len": secret_len,
-            "has_store_secret": has_store_secret,
-            "has_app_secret": has_app_secret,
-            "store_secret_len": store_secret_len,
-            "app_secret_len": app_secret_len,
-            "secret_candidate_count": len(secret_candidates),
-        }
-        if is_production:
-            if not x_shopify_shop_domain:
-                record_shopify_webhook(result="error", reason="missing_shop_domain", topic=topic)
-                logger.warning("Shopify webhook rejected: missing shop domain header %s", debug_meta)
-                raise HTTPException(status_code=401, detail="Missing Shopify shop domain")
-            if not allowed_domains:
-                record_shopify_webhook(result="error", reason="no_shopify_store", topic=topic)
-                logger.error(
-                    "Shopify webhook rejected: no Shopify store configured merchant=%s topic=%s got=%s",
-                    merchant_id,
-                    topic,
-                    got_canon,
-                )
-                raise HTTPException(status_code=400, detail="No Shopify store connected")
-            if got_canon and got_canon not in allowed_domains:
-                record_shopify_webhook(result="error", reason="shop_domain_mismatch", topic=topic)
-                logger.error(
-                    "Shopify webhook shop_domain mismatch merchant=%s allowed=%s got=%s topic=%s",
-                    merchant_id,
-                    sorted(list(allowed_domains.keys())),
-                    got_canon,
-                    topic,
-                )
-                raise HTTPException(status_code=403, detail="Shop domain mismatch")
-            if not secret_candidates:
-                record_shopify_webhook(result="error", reason="missing_secret", topic=topic)
-                logger.error(
-                    "Shopify webhook verification secret missing merchant=%s topic=%s source=%s",
-                    merchant_id,
-                    topic,
-                    secret_source,
-                )
-                raise HTTPException(status_code=500, detail="Shopify webhook verification not configured")
-            if not x_shopify_hmac_sha256:
-                record_shopify_webhook(result="error", reason="missing_hmac", topic=topic)
-                logger.warning("Shopify webhook rejected: missing HMAC header %s", debug_meta)
-                raise HTTPException(status_code=401, detail="Missing Shopify webhook signature")
-
-        signature_verified = False
-        verified_source = None
-        for source, secret in secret_candidates:
-            if verify_shopify_hmac(secret=secret, payload=payload, header_hmac_base64=x_shopify_hmac_sha256):
-                signature_verified = True
-                verified_source = source
-                break
-        debug_meta["verified_secret_source"] = verified_source
-        if is_production and not signature_verified:
-            record_shopify_webhook(result="error", reason="invalid_signature", topic=topic)
-            # This commonly indicates env drift across instances (different SHOPIFY_CLIENT_SECRET).
-            meta = dict(debug_meta)
-            if x_shopify_hmac_sha256:
-                meta["hmac_prefix"] = x_shopify_hmac_sha256[:10]
-            logger.warning("Shopify webhook rejected: invalid signature %s", meta)
-            raise HTTPException(status_code=401, detail="Invalid Shopify webhook signature")
-
-        # Parse event
         data = json.loads(payload)
-        shop_domain = x_shopify_shop_domain or merchant.get("mcp_shop_domain") or "unknown"
+    except Exception:
+        record_shopify_webhook(result="error", reason="invalid_json", topic=topic)
+        raise HTTPException(status_code=400, detail="Invalid JSON payload")
 
-        # Occurred_at is best-effort; Shopify may provide X-Shopify-Triggered-At.
-        occurred_at: Optional[datetime] = None
-        if x_shopify_triggered_at:
-            try:
-                occurred_at = datetime.fromisoformat(x_shopify_triggered_at.replace("Z", "+00:00"))
-            except Exception:
-                occurred_at = None
+    shop_domain = x_shopify_shop_domain or "unknown"
+    occurred_at: Optional[datetime] = None
+    if x_shopify_triggered_at:
+        try:
+            occurred_at = datetime.fromisoformat(x_shopify_triggered_at.replace("Z", "+00:00"))
+        except Exception:
+            occurred_at = None
 
+    # Identical post-verification processing as the per-merchant route.
+    return await _process_shopify_webhook_event(
+        merchant_id=merchant_id,
+        payload=payload,
+        data=data,
+        topic=topic,
+        shop_domain=shop_domain,
+        got_canon=got_canon,
+        occurred_at=occurred_at,
+        x_shopify_webhook_id=x_shopify_webhook_id,
+        background_tasks=background_tasks,
+        signature_verified=signature_verified,
+    )
+
+
+# ============================================================================
+# Shopify Webhooks
+# ============================================================================
+
+
+async def _process_shopify_webhook_event(
+    *,
+    merchant_id: str,
+    payload: bytes,
+    data: Any,
+    topic: str,
+    shop_domain: str,
+    got_canon: Optional[str],
+    occurred_at: Optional[datetime],
+    x_shopify_webhook_id: Optional[str],
+    background_tasks: BackgroundTasks,
+    signature_verified: bool,
+):
+    """
+    Shared post-verification processing for Shopify webhooks.
+
+    Extracted verbatim from handle_shopify_webhook so BOTH the per-merchant
+    route (POST /webhooks/shopify/{merchant_id}) and the static App-A order
+    route (POST /webhooks/shopify/orders) execute IDENTICAL logic after HMAC
+    verification + merchant resolution (audit fix #3). Callers own HMAC
+    verification, shop-domain allowlisting, and merchant resolution; this helper
+    owns idempotent ingest + topic dispatch. Zero behavior change vs. the prior
+    inline body — parameters are passed exactly, especially `got_canon` for the
+    ADR-009 seller-mismatch guard and the idempotency/duplicate return.
+    """
+    is_production = (
+        os.getenv("APP_ENV", "").lower() == "production"
+        or os.getenv("ENVIRONMENT", "").lower() == "production"
+        or bool(os.getenv("RAILWAY_GIT_COMMIT_SHA"))
+    )
+    try:
         # Persist event (append-only) with idempotency guard
         try:
             is_dup, _row = await ingest_shopify_webhook(
@@ -2387,14 +2714,227 @@ async def handle_shopify_webhook(
                 pass
 
         elif topic in ("customers/data_request", "customers/redact", "shop/redact"):
+            # Fulfill the obligation for real (redact / export) + audit row, same
+            # shared handler as the static /gdpr endpoint. got_canon is the
+            # canonicalized shop domain this handler authenticated. Wrapped so a
+            # failure marks needs_review and still returns 200.
+            outcome: Dict[str, Any] = {"status": "needs_review"}
+            try:
+                outcome = await _fulfill_shopify_gdpr_request(
+                    merchant_id=merchant_id,
+                    shop_domain=got_canon,
+                    topic=topic,
+                    data=data if isinstance(data, dict) else {},
+                )
+            except Exception as e:
+                logger.warning("GDPR fulfillment (per-merchant) error topic=%s err=%s", topic, str(e)[:200])
             await log_order_event(
                 event_type="gdpr_webhook",
                 order_id=f"gdpr_{merchant_id}",
                 merchant_id=merchant_id,
-                metadata={"topic": topic, "payload_keys": list((data or {}).keys())},
+                metadata={
+                    "topic": topic,
+                    "payload_keys": list((data or {}).keys()),
+                    "resolution_status": outcome.get("status"),
+                },
             )
-        
+
         return {"status": "success", "topic": topic}
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.exception(f"Error handling Shopify webhook: {e}")
+        raise HTTPException(status_code=500, detail="Internal server error")
+
+
+@router.post("/shopify/{merchant_id}")
+async def handle_shopify_webhook(
+    merchant_id: str,
+    request: Request,
+    background_tasks: BackgroundTasks,
+    x_shopify_hmac_sha256: Optional[str] = Header(None),
+    x_shopify_topic: Optional[str] = Header(None),
+    x_shopify_shop_domain: Optional[str] = Header(None),
+    x_shopify_webhook_id: Optional[str] = Header(None),
+    x_shopify_triggered_at: Optional[str] = Header(None),
+):
+    """
+    处理 Shopify 事件
+    
+	    支持的事件：
+	    - orders/create, orders/updated, orders/paid, orders/cancelled
+	    - fulfillments/create, fulfillments/update, orders/fulfilled (legacy)
+	    - refunds/create (preferred) / orders/refunded (legacy)
+	    - returns/* (Shopify Returns; topic availability varies by shop/app)
+	    """
+    try:
+        payload = await request.body()
+        topic = x_shopify_topic or "unknown"
+        
+        # 获取商户信息
+        merchant = await get_merchant_onboarding(merchant_id)
+        if not merchant:
+            raise HTTPException(status_code=404, detail="Merchant not found")
+
+        got_canon = _canonicalize_shop_domain(x_shopify_shop_domain)
+
+        # Build Shopify store allowlist and (optional) per-store webhook secret mapping.
+        # Note: the shop domain comes from an untrusted header, so we ONLY use it to select
+        # a secret after confirming it matches a connected Shopify store for this merchant.
+        stores = []
+        try:
+            stores = await get_merchant_active_stores(merchant_id)
+        except Exception as e:
+            logger.warning("Shopify webhook store lookup failed merchant=%s err=%s", merchant_id, str(e)[:160])
+            stores = []
+
+        allowed_domains: Dict[str, Dict[str, Any]] = {}
+        for store in stores or []:
+            if (store.get("platform") or "").lower() != "shopify":
+                continue
+            dom = _canonicalize_shop_domain(store.get("domain"))
+            if dom:
+                allowed_domains[dom] = store
+
+        matched_store = allowed_domains.get(got_canon) if got_canon else None
+        store_secret: str = ""
+        if matched_store:
+            creds = matched_store.get("api_credentials") or {}
+            if isinstance(creds, dict):
+                for k in ("webhook_secret", "client_secret", "api_secret_key", "shopify_client_secret"):
+                    v = creds.get(k)
+                    if isinstance(v, str) and v.strip():
+                        store_secret = v.strip()
+                        break
+
+        # Verify signature (strict in production; must use raw request body).
+        instance_id = socket.gethostname()
+        is_production = (
+            os.getenv("APP_ENV", "").lower() == "production"
+            or os.getenv("ENVIRONMENT", "").lower() == "production"
+            or bool(os.getenv("RAILWAY_GIT_COMMIT_SHA"))
+        )
+        app_secret = getattr(settings, "shopify_client_secret", None)
+        app_secret = app_secret.strip() if isinstance(app_secret, str) else ""
+        store_secret = store_secret.strip() if isinstance(store_secret, str) else ""
+
+        # Webhook signatures are generated using the Shopify app's shared secret. In practice, we may
+        # have BOTH an app-level secret (env) and a per-store override (DB) during migrations or when
+        # merchants reconnect via different onboarding flows. Accept when ANY known secret matches.
+        secret_candidates: list[tuple[str, str]] = []
+        if store_secret:
+            secret_candidates.append(("store_credentials", store_secret))
+        if app_secret and app_secret != store_secret:
+            secret_candidates.append(("app_env", app_secret))
+
+        secret_source = secret_candidates[0][0] if secret_candidates else "none"
+        secret_len = len(secret_candidates[0][1]) if secret_candidates else 0
+        has_store_secret = bool(store_secret)
+        has_app_secret = bool(app_secret)
+        store_secret_len = len(store_secret) if store_secret else 0
+        app_secret_len = len(app_secret) if app_secret else 0
+
+        debug_meta = {
+            "merchant_id": merchant_id,
+            "instance": instance_id,
+            "topic": topic,
+            "webhook_id": x_shopify_webhook_id,
+            "shop_domain": got_canon,
+            "has_shop_domain_header": bool(x_shopify_shop_domain),
+            "has_hmac_header": bool(x_shopify_hmac_sha256),
+            "has_webhook_id_header": bool(x_shopify_webhook_id),
+            "content_length": request.headers.get("content-length"),
+            "user_agent": request.headers.get("user-agent"),
+            "secret_source": secret_source,
+            "secret_len": secret_len,
+            "has_store_secret": has_store_secret,
+            "has_app_secret": has_app_secret,
+            "store_secret_len": store_secret_len,
+            "app_secret_len": app_secret_len,
+            "secret_candidate_count": len(secret_candidates),
+        }
+        if is_production:
+            if not x_shopify_shop_domain:
+                record_shopify_webhook(result="error", reason="missing_shop_domain", topic=topic)
+                logger.warning("Shopify webhook rejected: missing shop domain header %s", debug_meta)
+                raise HTTPException(status_code=401, detail="Missing Shopify shop domain")
+            if not allowed_domains:
+                record_shopify_webhook(result="error", reason="no_shopify_store", topic=topic)
+                logger.error(
+                    "Shopify webhook rejected: no Shopify store configured merchant=%s topic=%s got=%s",
+                    merchant_id,
+                    topic,
+                    got_canon,
+                )
+                raise HTTPException(status_code=400, detail="No Shopify store connected")
+            if got_canon and got_canon not in allowed_domains:
+                record_shopify_webhook(result="error", reason="shop_domain_mismatch", topic=topic)
+                logger.error(
+                    "Shopify webhook shop_domain mismatch merchant=%s allowed=%s got=%s topic=%s",
+                    merchant_id,
+                    sorted(list(allowed_domains.keys())),
+                    got_canon,
+                    topic,
+                )
+                raise HTTPException(status_code=403, detail="Shop domain mismatch")
+            if not secret_candidates:
+                record_shopify_webhook(result="error", reason="missing_secret", topic=topic)
+                logger.error(
+                    "Shopify webhook verification secret missing merchant=%s topic=%s source=%s",
+                    merchant_id,
+                    topic,
+                    secret_source,
+                )
+                raise HTTPException(status_code=500, detail="Shopify webhook verification not configured")
+            if not x_shopify_hmac_sha256:
+                record_shopify_webhook(result="error", reason="missing_hmac", topic=topic)
+                logger.warning("Shopify webhook rejected: missing HMAC header %s", debug_meta)
+                raise HTTPException(status_code=401, detail="Missing Shopify webhook signature")
+
+        signature_verified = False
+        verified_source = None
+        for source, secret in secret_candidates:
+            if verify_shopify_hmac(secret=secret, payload=payload, header_hmac_base64=x_shopify_hmac_sha256):
+                signature_verified = True
+                verified_source = source
+                break
+        debug_meta["verified_secret_source"] = verified_source
+        if is_production and not signature_verified:
+            record_shopify_webhook(result="error", reason="invalid_signature", topic=topic)
+            # This commonly indicates env drift across instances (different SHOPIFY_CLIENT_SECRET).
+            meta = dict(debug_meta)
+            if x_shopify_hmac_sha256:
+                meta["hmac_prefix"] = x_shopify_hmac_sha256[:10]
+            logger.warning("Shopify webhook rejected: invalid signature %s", meta)
+            raise HTTPException(status_code=401, detail="Invalid Shopify webhook signature")
+
+        # Parse event
+        data = json.loads(payload)
+        shop_domain = x_shopify_shop_domain or merchant.get("mcp_shop_domain") or "unknown"
+
+        # Occurred_at is best-effort; Shopify may provide X-Shopify-Triggered-At.
+        occurred_at: Optional[datetime] = None
+        if x_shopify_triggered_at:
+            try:
+                occurred_at = datetime.fromisoformat(x_shopify_triggered_at.replace("Z", "+00:00"))
+            except Exception:
+                occurred_at = None
+
+        # Delegate all post-verification processing (idempotent ingest +
+        # topic dispatch) to the shared helper. See _process_shopify_webhook_event.
+        return await _process_shopify_webhook_event(
+            merchant_id=merchant_id,
+            payload=payload,
+            data=data,
+            topic=topic,
+            shop_domain=shop_domain,
+            got_canon=got_canon,
+            occurred_at=occurred_at,
+            x_shopify_webhook_id=x_shopify_webhook_id,
+            background_tasks=background_tasks,
+            signature_verified=signature_verified,
+        )
         
     except HTTPException:
         raise
@@ -2410,11 +2950,19 @@ async def handle_shopify_webhook(
 @router.post("/register/shopify/{merchant_id}")
 async def register_shopify_webhooks(
     merchant_id: str,
-    callback_base_url: str
+    callback_base_url: str,
+    current_user: dict = Depends(get_current_employee),
 ):
     """
     为商户注册 Shopify webhooks
-    
+
+    SECURITY: employee-authenticated only. This endpoint uses the merchant's
+    stored admin token to point that store's order webhooks (full-PII payloads)
+    at a caller-supplied callback_base_url — an unauthenticated caller could
+    re-point a store's webhooks to an attacker host. Gated to ops/employee
+    credentials, matching the equivalent ops route in
+    routes/ops_shopify_integration_routes.py. See audit fix #2.
+
     Args:
         merchant_id: 商户 ID
         callback_base_url: Webhook 回调的基础 URL（如 https://api.pivota.com）
@@ -2478,12 +3026,10 @@ async def register_shopify_webhooks(
             # Returns (if enabled by shop/app)
             "returns/create",
             "returns/update",
-            # GDPR compliance (required when accessing customer/order data)
-            "customers/data_request",
-            "customers/redact",
-            "shop/redact",
+            # NOTE: compliance topics (customers/data_request, customers/redact, shop/redact)
+            # are toml/dashboard-managed app-config subscriptions and CANNOT be REST-registered.
         ]
-        
+
         registered = []
         already_exists = []
         failed = []
