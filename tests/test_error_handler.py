@@ -111,6 +111,14 @@ class TestErrorCodes:
             assert isinstance(error_code.default_message, str)
             assert 100 <= error_code.http_status < 600  # Valid HTTP status
 
+    def test_409_maps_to_conflict_not_internal_error(self):
+        """409 responses must surface as CONFLICT, not INTERNAL_SERVER_ERROR."""
+        from middleware.error_handler import ErrorHandlerMiddleware
+
+        mapped = ErrorHandlerMiddleware(None)._map_status_to_error_code(409)
+        assert mapped is ErrorCode.CONFLICT
+        assert mapped.http_status == 409
+
 
 class TestPivotaAPIError:
     """Test PivotaAPIError exception"""
