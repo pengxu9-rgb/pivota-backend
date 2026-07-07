@@ -16,12 +16,15 @@ dry_run writes nothing.
 
 from __future__ import annotations
 
+import logging
 import re
 from typing import Any, Dict, List
 
 from db.database import database
 from services.beauty_enrichment_persist import enrich_and_persist_product
 from services.canonical_inci_intake import may_write
+
+logger = logging.getLogger(__name__)
 
 DEFAULT_SOURCE_SYSTEM = "pdp_crawl"
 
@@ -40,7 +43,19 @@ _UPSERT = """
 
 
 def merchant_id_from_product_key(product_key: str) -> str:
-    """external_seed for seeds; otherwise the product_key's 2nd '::' segment."""
+    """Return the RAW/HISTORICAL merchant token in a product_key's 2nd '::'
+    segment (or 'external_seed').
+
+    WARNING — NEVER use this to write a seller subject (ADR-009 D2;
+    IDENTITY_REFERENCE T1/T2/T6). After the A9-4 seller-of-record backfill
+    re-subjects ownership, a crawled row keeps its HISTORICAL-FORMAT key
+    `prod::external_seed::...` while the true seller lives in
+    `catalog_products.merchant_id`. Parsing this token would write the banned
+    `external_seed` bucket back into `beauty_sku_ingredients` on every re-ingest —
+    refilling the bucket downstream forever. The ingest write site resolves the
+    seller by LOOK-UP from `catalog_products` instead (see
+    `ingest_crawled_inci_items`), so this parser has no live seller-writing
+    caller; it survives only as a pure string helper for back-compat/tests."""
     parts = product_key.split("::")
     return parts[1] if len(parts) > 1 and parts[1] else "external_seed"
 
@@ -91,7 +106,7 @@ async def ingest_crawled_inci_items(
         await db.connect()
     report: Dict[str, Any] = {
         "n": 0, "inci_written": 0, "actives_filled": 0, "claims_written": 0,
-        "skipped": 0, "skipped_outranked": 0, "items": [],
+        "skipped": 0, "skipped_outranked": 0, "skipped_unresolved_seller": 0, "items": [],
     }
     try:
         for it in items:
@@ -102,6 +117,25 @@ async def ingest_crawled_inci_items(
             if not (pk and sk) or _is_skippable_inci(inci):
                 report["skipped"] += 1
                 report["items"].append({"product_key": pk, "status": "skipped_no_inci"})
+                continue
+            # Seller-of-record is the AUTHORITATIVE catalog_products.merchant_id, not
+            # a parse of the product_key (ADR-009 D2 bans the 'external_seed' bucket
+            # for new writes; IDENTITY_REFERENCE T1/T2/T6 "look up, don't parse"). A
+            # product_key left in historical format (`prod::external_seed::...`) by
+            # the A9-4 backfill still resolves to its re-subjected observed seller
+            # here — closing the forward-leak where a re-ingest would rebucket it.
+            # No catalog row => seller genuinely unknown: SKIP loudly (never bucket,
+            # never parse-guess), and do NOT enrich under an unknown subject.
+            cat_row = await db.fetch_one(
+                "SELECT merchant_id FROM catalog_products WHERE product_key = :pk", {"pk": pk})
+            seller_merchant_id = dict(cat_row).get("merchant_id") if cat_row else None
+            if not seller_merchant_id:
+                report["skipped_unresolved_seller"] += 1
+                report["items"].append({"product_key": pk, "status": "skipped_unresolved_seller"})
+                logger.warning(
+                    "crawled_inci_ingest: no catalog_products row for product_key=%r — "
+                    "skipping INCI write + enrich (seller-of-record unknown; ADR-009 D2 "
+                    "bans bucketing under 'external_seed').", pk)
                 continue
             # ADR-001 source precedence: never downgrade a higher-authority INCI
             # source. A higher-ranked row already owns this sku (and was enriched
@@ -117,7 +151,7 @@ async def ingest_crawled_inci_items(
             if not dry_run:
                 await db.execute(
                     _UPSERT,
-                    {"sk": sk, "pk": pk, "mid": merchant_id_from_product_key(pk),
+                    {"sk": sk, "pk": pk, "mid": seller_merchant_id,
                      "inci": inci, "src": source_system},
                 )
             res = await enrich_and_persist_product(pk, db=db, dry_run=dry_run)
