@@ -83,6 +83,8 @@ class _FakePartnerInviteDatabase:
                 "notes": params.get("notes"),
                 "consumed_at": None,
                 "consumed_by_merchant_id": None,
+                "use_count": 0,
+                "max_uses": params.get("max_uses"),
                 "revoked_at": None,
                 "revoked_by": None,
                 "revoked_reason": None,
@@ -103,6 +105,8 @@ class _FakePartnerInviteDatabase:
                         "channel_partner_id": row["channel_partner_id"],
                         "status": row["status"],
                         "expires_at": row["expires_at"],
+                        "use_count": row.get("use_count", 0),
+                        "max_uses": row.get("max_uses"),
                     }
                     for row in self.partner_invite_tokens
                     if row["token_hash"] == params["token_hash"]
@@ -110,26 +114,20 @@ class _FakePartnerInviteDatabase:
                 None,
             )
 
-        if sql.startswith("update partner_invite_tokens set status = 'expired'"):
+        if (
+            sql.startswith("select channel_partner_id, status, expires_at")
+            and "for update" in sql
+        ):
             row = self._token_by_id(int(params["token_id"]))
-            if row and row["status"] == "active":
-                row["status"] = "expired"
-                row["updated_at"] = _NOW
-                return {"id": row["id"]}
-            return None
-
-        if sql.startswith("update partner_invite_tokens set status = 'consumed'"):
-            if self.consume_update_barrier is not None:
-                await self.consume_update_barrier.wait()
-            async with self._consume_update_lock:
-                row = self._token_by_id(int(params["token_id"]))
-                if row and row["status"] == "active":
-                    row["status"] = "consumed"
-                    row["consumed_at"] = _NOW
-                    row["consumed_by_merchant_id"] = params["merchant_id"]
-                    row["updated_at"] = _NOW
-                    return {"id": row["id"]}
-            return None
+            if row is None:
+                return None
+            return {
+                "channel_partner_id": row["channel_partner_id"],
+                "status": row["status"],
+                "expires_at": row["expires_at"],
+                "use_count": row.get("use_count", 0),
+                "max_uses": row.get("max_uses"),
+            }
 
         if sql.startswith("insert into partner_attribution"):
             existing = self._attribution_by_merchant_partner(
@@ -203,6 +201,8 @@ class _FakePartnerInviteDatabase:
                     "expires_at": row["expires_at"],
                     "created_at": row["created_at"],
                     "consumed_by_merchant_id": row["consumed_by_merchant_id"],
+                    "use_count": row.get("use_count", 0),
+                    "max_uses": row.get("max_uses"),
                     "revoked_by": row["revoked_by"],
                     "revoked_reason": row["revoked_reason"],
                     "notes": row["notes"],
@@ -218,12 +218,27 @@ class _FakePartnerInviteDatabase:
         values: dict[str, Any] | None = None,
     ) -> None:
         sql = _normalize_sql(query)
+        params = dict(values or {})
         if sql.startswith("update partner_invite_tokens set status = 'active'"):
             for row in self.partner_invite_tokens:
                 if row["status"] in {"consumed", "revoked", "expired"}:
                     raise RuntimeError(
                         f"partner_invite_tokens row {row['id']} is in terminal status {row['status']} and cannot transition"
                     )
+            return None
+        if sql.startswith("update partner_invite_tokens set status = 'expired'"):
+            row = self._token_by_id(int(params["token_id"]))
+            if row and row["status"] == "active":
+                row["status"] = "expired"
+                row["updated_at"] = _NOW
+            return None
+        if sql.startswith("update partner_invite_tokens set use_count = use_count + 1"):
+            row = self._token_by_id(int(params["token_id"]))
+            if row is not None:
+                row["use_count"] = int(row.get("use_count", 0)) + 1
+                if row.get("consumed_at") is None:
+                    row["consumed_at"] = _NOW
+                row["updated_at"] = _NOW
             return None
         raise AssertionError(f"Unhandled execute query: {query}")
 
@@ -242,6 +257,8 @@ class _FakePartnerInviteDatabase:
         consumed_by_merchant_id: str | None = None,
         revoked_by: str | None = None,
         revoked_reason: str | None = None,
+        use_count: int = 0,
+        max_uses: int | None = None,
     ) -> int:
         token_id = self._next_token_id
         self._next_token_id += 1
@@ -254,6 +271,8 @@ class _FakePartnerInviteDatabase:
             "status": status,
             "issued_by": issued_by,
             "notes": notes,
+            "use_count": use_count,
+            "max_uses": max_uses,
             "consumed_at": _NOW if status == "consumed" else None,
             "consumed_by_merchant_id": (
                 consumed_by_merchant_id if status == "consumed" else None
@@ -395,7 +414,7 @@ async def test_issue_unknown_partner_raises_valueerror(
         await service.issue(channel_partner_id=404, issued_by="admin@example.com")
 
 
-async def test_consume_active_token_creates_partner_attribution_and_marks_consumed(
+async def test_consume_active_token_creates_partner_attribution_and_stays_reusable(
     fake_db: _FakePartnerInviteDatabase,
 ) -> None:
     fake_db.add_partner()
@@ -408,8 +427,10 @@ async def test_consume_active_token_creates_partner_attribution_and_marks_consum
 
     assert attribution_id == 1
     token_row = fake_db.token(token_id)
-    assert token_row["status"] == "consumed"
-    assert token_row["consumed_by_merchant_id"] == "merch_new"
+    # Multi-use: the link stays active and reusable; the redemption is counted.
+    assert token_row["status"] == "active"
+    assert token_row["use_count"] == 1
+    assert token_row["consumed_at"] == _NOW
     assert fake_db.partner_attribution == [
         {
             "id": 1,
@@ -421,6 +442,36 @@ async def test_consume_active_token_creates_partner_attribution_and_marks_consum
             "updated_at": _NOW,
         }
     ]
+
+
+async def test_consume_multiple_merchants_reuse_one_link(
+    fake_db: _FakePartnerInviteDatabase,
+) -> None:
+    fake_db.add_partner()
+    token_id = fake_db.add_token(raw_token="mkto_shared")
+
+    id_a = await service.consume(raw_token="mkto_shared", merchant_id="merch_a")
+    id_b = await service.consume(raw_token="mkto_shared", merchant_id="merch_b")
+    id_c = await service.consume(raw_token="mkto_shared", merchant_id="merch_c")
+
+    assert len({id_a, id_b, id_c}) == 3
+    token_row = fake_db.token(token_id)
+    assert token_row["status"] == "active"
+    assert token_row["use_count"] == 3
+    assert len(fake_db.partner_attribution) == 3
+
+
+async def test_consume_respects_max_uses_soft_cap(
+    fake_db: _FakePartnerInviteDatabase,
+) -> None:
+    fake_db.add_partner()
+    fake_db.add_token(raw_token="mkto_capped", max_uses=1)
+
+    await service.consume(raw_token="mkto_capped", merchant_id="merch_first")
+    with pytest.raises(service.TokenNotRedeemableError, match="usage limit"):
+        await service.consume(raw_token="mkto_capped", merchant_id="merch_second")
+
+    assert len(fake_db.partner_attribution) == 1
 
 
 async def test_consume_with_wrong_token_raises_token_invalid(
@@ -480,35 +531,12 @@ async def test_consume_idempotent_when_merchant_already_attributed(
     )
 
     assert attribution_id == existing_id
-    assert fake_db.token(token_id)["status"] == "consumed"
+    # Re-redeem by an already-attributed merchant is idempotent: link stays
+    # active, no new attribution, and the use is not double-counted.
+    token_row = fake_db.token(token_id)
+    assert token_row["status"] == "active"
+    assert token_row["use_count"] == 0
     assert len(fake_db.partner_attribution) == 1
-
-
-async def test_consume_race_only_one_wins(
-    fake_db: _FakePartnerInviteDatabase,
-) -> None:
-    fake_db.add_token(raw_token="mkto_race")
-    fake_db.consume_update_barrier = _AsyncBarrier(2)
-
-    async def attempt_consume() -> int:
-        return await service.consume(raw_token="mkto_race", merchant_id="merch_race")
-
-    results = await asyncio.gather(
-        attempt_consume(),
-        attempt_consume(),
-        return_exceptions=True,
-    )
-
-    successes = [result for result in results if isinstance(result, int)]
-    failures = [
-        result
-        for result in results
-        if isinstance(result, service.TokenNotRedeemableError)
-    ]
-    assert successes == [1]
-    assert len(failures) == 1
-    assert len(fake_db.partner_attribution) == 1
-    assert fake_db.partner_invite_tokens[0]["status"] == "consumed"
 
 
 async def test_revoke_active_token_succeeds(
@@ -563,6 +591,8 @@ async def test_list_for_partner_returns_metadata_not_raw_tokens(
             "expires_at": _NOW + timedelta(days=30),
             "created_at": _NOW,
             "consumed_by_merchant_id": None,
+            "use_count": 0,
+            "max_uses": None,
             "revoked_by": None,
             "revoked_reason": None,
             "notes": "audit",
