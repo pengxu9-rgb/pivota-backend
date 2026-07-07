@@ -141,7 +141,7 @@ async def upsert_partner_contact(
               :contact_name,
               :contact_role,
               :contact_email,
-              COALESCE(:cc_emails::jsonb, '[]'::jsonb),
+              COALESCE(CAST(:cc_emails AS jsonb), '[]'::jsonb),
               :internal_notes,
               :notes_updated_by,
               :notes_updated_at
@@ -173,7 +173,7 @@ async def upsert_partner_contact(
             set_clauses.append("contact_email = :contact_email")
             params["contact_email"] = body.contact_email
         if body.cc_emails is not None:
-            set_clauses.append("cc_emails = :cc_emails::jsonb")
+            set_clauses.append("cc_emails = CAST(:cc_emails AS jsonb)")
             params["cc_emails"] = cc_json
         if body.internal_notes is not None:
             set_clauses.append("internal_notes = :internal_notes")
@@ -343,7 +343,7 @@ async def send_settlement_email(
           :settlement_file_id,
           :template_id,
           :to_email,
-          :cc_emails::jsonb,
+          CAST(:cc_emails AS jsonb),
           :subject,
           :body_text,
           :sent_by,
