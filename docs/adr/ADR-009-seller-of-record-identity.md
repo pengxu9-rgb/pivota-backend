@@ -1,6 +1,7 @@
 # ADR-009: Seller-of-Record Identity and the Offer Layer
 
-**Status:** Proposed
+**Status:** Accepted — decisions ratified by founder 2026-07-07, with the no-fallback
+amendment to open decision 1 (see "Resolved decisions")
 **Date:** 2026-07-05
 **Deciders:** Commerce-index / Trust & Identity owners (peng)
 **Builds on:** ADR-007 (citable index vs commerce overlay), ADR-008 (brand-identity
@@ -121,11 +122,21 @@ should ship first with a regression test pinning the storage format.
   threading changes in T2-1/T2-2/T2-3, and the backfill. No sig churn, no content-identity
   merges, no downstream schema changes (subjects remain merchant_id-shaped).
 
-## Open decisions
+## Resolved decisions (ratified 2026-07-07)
 
-1. `product_group_id` vs `content_key` as the offer's product key where pg is absent
-   (recommend: pg when present, content_key fallback — matches serving).
-2. Observed-merchant `merchant_id` format for minted sellers (recommend deterministic
-   `merch_obs_<hash(brand::etld1)>` to be visibly distinct from tenant-created ids).
-3. Backfill timing/window and whether the 720 bare-format `attached_product_key` rows are
-   repaired in the same pass.
+1. **The offer's product key is `product_group_id`, UNCONDITIONALLY.** The originally
+   proposed "pg when present, content_key fallback" was rejected under the founder's
+   no-fallback directive — a runtime fallback branch is itself the crutch pattern (two
+   code paths, one of which rots). Instead the mainline is made total: where a product
+   has no pg, ingestion/backfill mints a deterministic **singleton group**
+   (`pg` derived from the product's `content_key`), so every offer keys on pg with zero
+   branching. `content_key` remains a *derivation input*, never a runtime alternative.
+2. **Observed-merchant id = deterministic `merch_obs_<hash(brand_identity::etld1)>`** —
+   visibly distinct from tenant-created `merch_` ids, idempotent (same brand+domain →
+   same identity forever), mintable by any ingestion path without coordination.
+3. **Backfill starts now** (outcome history under the bucket is ~zero; W1-style parity
+   window per D4) **and the 720 bare-format `attached_product_key` rows are repaired in
+   the same pass** — re-derived to storage-format keys from seed_data/URLs. Rows that
+   cannot be re-derived are flagged to a review queue, NOT silently left as a third
+   format and NOT absorbed by a widened matcher (no-fallback: honest failure over a
+   permanent format exception).
