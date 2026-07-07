@@ -184,9 +184,19 @@ async def _resolve_credentials(merchant_id: str) -> Optional[Dict[str, str]]:
         return None
 
 
-async def _process_order(*, merchant_id: str, order: Dict[str, Any], converted_at_default: datetime) -> str:
+async def _process_order(
+    *,
+    merchant_id: str,
+    order: Dict[str, Any],
+    converted_at_default: datetime,
+    shop_domain: Optional[str] = None,
+) -> str:
     """Close one order if it carries our click id AND is paid. Returns an outcome
-    tag: 'closed' | 'no_click' | 'unpaid' | 'no_order_id' | 'invalid'."""
+    tag: 'closed' | 'no_click' | 'unpaid' | 'no_order_id' | 'invalid'.
+
+    ``shop_domain`` is the polled store's Shopify domain (the store the sale
+    happened on); it is forwarded as ``converting_shop_domain`` for the ADR-009
+    §D3 seller-mismatch guard inside the closure."""
     if not isinstance(order, dict):
         return "invalid"
     click_id = extract_click_id_from_note_attributes(order.get("note_attributes"))
@@ -209,6 +219,8 @@ async def _process_order(*, merchant_id: str, order: Dict[str, Any], converted_a
         currency=currency,
         converted_at=converted_at,
         note_attrs_or_payload=order,
+        # ADR-009 §D3: the store we polled IS the converting store-of-record.
+        converting_shop_domain=shop_domain,
     )
     return "closed"
 
@@ -289,7 +301,12 @@ async def poll_external_conversions_for_merchant(
         for order in orders:
             summary["scanned"] += 1
             try:
-                outcome = await _process_order(merchant_id=merchant_id, order=order, converted_at_default=now)
+                outcome = await _process_order(
+                    merchant_id=merchant_id,
+                    order=order,
+                    converted_at_default=now,
+                    shop_domain=shop_domain,  # ADR-009 §D3: the polled store-of-record
+                )
             except Exception as e:
                 summary["errors"] += 1
                 logger.warning(

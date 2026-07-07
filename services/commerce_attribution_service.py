@@ -634,6 +634,7 @@ async def close_external_order_conversion(
     currency: Optional[str],
     converted_at: Optional[datetime] = None,
     note_attrs_or_payload: Optional[Dict[str, Any]] = None,
+    converting_shop_domain: Optional[str] = None,
 ) -> Optional[Dict[str, Any]]:
     """Materialize a `converted` external attribution edge from an orders/paid webhook.
 
@@ -648,6 +649,19 @@ async def close_external_order_conversion(
     - **Idempotent** on ``(merchant_id, external_order_id)`` via ON CONFLICT DO
       NOTHING: a replay/at-least-once redelivery creates no second edge and does
       not double-count GMV. Returns ``{"replayed": True, ...}`` on a replay.
+    - **Seller-mismatch guard (ADR-009 §D3 interim; IDENTITY_REFERENCE §4):**
+      ``converting_shop_domain`` is the store the sale actually happened on (the
+      caller-authenticated Shopify shop domain / polled store). Until
+      ``external_product_seeds.seller_ref`` lands (A9-3) the edge's ``merchant_id``
+      is trusted as the seller-of-record; this guard checks that the converting
+      store matches the click's redirect DESTINATION host (``dest_domain``,
+      stamped by T2-1). On mismatch the edge is still recorded but stamped
+      ``metadata.seller_mismatch=true`` and EXCLUDED from the outcome signal
+      (T2-3) — an honest gap over silent misattribution, exactly the
+      ``click_matched`` philosophy. When the caller supplies no domain the edge is
+      stamped ``metadata.seller_domain_unverified=true`` and still counted
+      (unknown is neither a silent pass nor an exclusion); such unverified closes
+      are expected ONLY from callers predating this guard.
     """
     merchant_id = str(merchant_id or "").strip()
     external_order_id = str(external_order_id or "").strip()
@@ -700,6 +714,54 @@ async def close_external_order_conversion(
             if note_attrs_or_payload.get(k) is not None
         }
 
+    # --- ADR-009 §D3 interim seller-mismatch guard (IDENTITY_REFERENCE §4) -------
+    # This edge's ``merchant_id`` is meant to be the SELLER-OF-RECORD, but until
+    # ``external_product_seeds.seller_ref`` lands (A9-3) closure trusts the caller's
+    # merchant_id. Verify that the sale actually happened on that seller's own
+    # store: compare the CONVERTING store's host (``converting_shop_domain`` — what
+    # the caller authenticated/polled) against the click's redirect DESTINATION host
+    # (T2-1 ``dest_domain``, injected from the signed token by
+    # ``outbound_links_service.log_outbound_event``). On mismatch we still record the
+    # edge (idempotent, as today) but stamp ``metadata.seller_mismatch=true`` so T2-3
+    # EXCLUDES it — an honest gap over silent misattribution (no-fallback: a mismatch
+    # is never absorbed as a pass). Self-anchored pilot seeds (destination == the
+    # anchor's own store) match and are unaffected.
+    #
+    # Host comparison is EXACT (normalized bare host), NOT eTLD+1: there is no
+    # registrable-domain / eTLD+1 helper in this codebase and hand-rolling one is out
+    # of scope for this packet. ``normalize_shop_host`` (outbound_links_service)
+    # strips scheme/path/port/lowercases; it is imported locally because
+    # outbound_links_service already imports this module at top level (import cycle).
+    # Caveat (accepted per D3): a seed whose destination is a custom storefront domain
+    # while the webhook authenticates the ``.myshopify.com`` domain (or vice-versa)
+    # would be flagged; that is the honest-gap direction (exclude, never misattribute)
+    # and is resolved for real when seller_ref lands (A9-3).
+    from services.outbound_links_service import normalize_shop_host  # local: import cycle
+
+    converting_host = normalize_shop_host(converting_shop_domain)
+    seller_mismatch = False
+    seller_domain_unverified = False
+    if not converting_host:
+        # Caller could not determine the converting store's domain. UNKNOWN is not a
+        # pass (no silent absorb) and not an exclusion (that would break the pilot,
+        # where the webhook/poller always know the domain) — only make it observable.
+        seller_domain_unverified = True
+        metadata["seller_domain_unverified"] = True
+    else:
+        # Forensics: always stamp the converting store we verified against.
+        metadata["converting_shop_domain"] = converting_host
+        if click_matched:
+            click_dest_host = normalize_shop_host((click_row or {}).get("dest_domain"))
+            if click_dest_host:
+                metadata["click_dest_domain"] = click_dest_host
+                if converting_host != click_dest_host:
+                    seller_mismatch = True
+                    metadata["seller_mismatch"] = True
+            # else: a matched but thin/legacy click carries no dest_domain — nothing
+            #       to compare against, so we make NO mismatch claim (honest silence).
+        # else: click_matched is False → T2-3 already excludes this edge; we do NOT
+        #       double-guard with seller_mismatch, only stamp the converting domain.
+
     values = {
         "edge_id": edge_id,
         "merchant_id": merchant_id,
@@ -746,6 +808,8 @@ async def close_external_order_conversion(
             "external_order_id": external_order_id,
             "state": EDGE_STATE_CONVERTED,
             "click_matched": click_matched,
+            "seller_mismatch": seller_mismatch,
+            "seller_domain_unverified": seller_domain_unverified,
             "replayed": True,
         }
 
@@ -778,12 +842,36 @@ async def close_external_order_conversion(
             external_order_id,
             click_id,
         )
+    # Seller-guard observability (ADR-009 §D3) — first observation only (replays
+    # returned above), so a redelivery never double-logs.
+    if seller_mismatch:
+        logger.warning(
+            "external_conversion_seller_mismatch: converting store %s != click "
+            "destination %s — edge recorded but EXCLUDED from outcome signal "
+            "(ADR-009 D3) merchant_id=%s external_order_id=%s click_id=%s",
+            metadata.get("converting_shop_domain"),
+            metadata.get("click_dest_domain"),
+            merchant_id,
+            external_order_id,
+            click_id,
+        )
+    elif seller_domain_unverified:
+        logger.info(
+            "commerce_attribution: external conversion seller domain UNVERIFIED "
+            "(caller supplied no converting_shop_domain) merchant_id=%s "
+            "external_order_id=%s click_id=%s — counted (legacy-compatible), NOT a pass",
+            merchant_id,
+            external_order_id,
+            click_id,
+        )
     return {
         "edge_id": edge_id,
         "merchant_id": merchant_id,
         "external_order_id": external_order_id,
         "click_id": click_id,
         "click_matched": click_matched,
+        "seller_mismatch": seller_mismatch,
+        "seller_domain_unverified": seller_domain_unverified,
         "canonical_product_id": values["canonical_product_id"],
         "gross_attributed_gmv_cents": values["gross_attributed_gmv_cents"],
         "currency": currency,

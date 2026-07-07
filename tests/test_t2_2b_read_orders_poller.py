@@ -175,6 +175,31 @@ async def test_paid_attributed_order_closes_conversion(monkeypatch):
     assert stored["canonical_product_id"] == "merch_test|shopify|999"
 
 
+# --- (a2) ADR-009 §D3 wiring: the polled store is forwarded to the closure ------
+
+
+@pytest.mark.asyncio
+async def test_poller_forwards_converting_shop_domain(monkeypatch):
+    fake = FakeDB(click_row=_click_row())
+    monkeypatch.setattr(poller, "database", fake)
+    monkeypatch.setattr(svc, "database", fake)
+    _install_fetch(monkeypatch, [[_order()]])
+
+    calls: List[Dict[str, Any]] = []
+
+    async def close_spy(**kwargs: Any):
+        calls.append(kwargs)
+        return {"replayed": False}
+
+    monkeypatch.setattr(poller, "close_external_order_conversion", close_spy)
+
+    await poller.poll_external_conversions_for_merchant(merchant_id="merch_test", credentials=CREDS)
+
+    assert len(calls) == 1
+    # the store we polled (CREDS shop_domain) is the converting store-of-record
+    assert calls[0]["converting_shop_domain"] == CREDS["shop_domain"]
+
+
 # --- (b) re-poll same order → idempotent, no duplicate edge --------------------
 
 

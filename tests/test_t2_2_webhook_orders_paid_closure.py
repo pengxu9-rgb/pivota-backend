@@ -113,6 +113,9 @@ async def test_orders_paid_with_click_attr_closes_conversion(monkeypatch):
     assert call["external_order_id"] == "6600123"
     assert call["gross_amount_cents"] == 5990
     assert call["currency"] == "USD"
+    # ADR-009 §D3 wiring: the handler forwards the SAME (canonicalized) shop domain
+    # it authenticated as the converting store-of-record for the seller-mismatch guard.
+    assert call["converting_shop_domain"] == "teststore.myshopify.com"
 
 
 @pytest.mark.asyncio

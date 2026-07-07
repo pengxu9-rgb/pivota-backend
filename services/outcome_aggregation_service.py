@@ -24,7 +24,12 @@ merchant's own checkout (T2-2). Such an edge has state='converted' + GMV/currenc
 the edge and NO `orders` row, so both queries fall back to the edge's own fields for
 it. INTEGRITY: only `metadata.click_matched = true` external edges count — a false
 value is a forgeable, merchant-supplied click id and must never inflate the outcome/
-trust signal. Internal-order numbers are byte-identical to pre-T2-3.
+trust signal. Additionally (ADR-009 §D3 interim guard) edges stamped
+`metadata.seller_mismatch = true` — the converting store did not correspond to the
+click's redirect-destination seller — are EXCLUDED: an honest gap over misattributing
+a conversion to a merchant that did not make the sale. Both gates are NULL-safe, so
+legacy/internal edges are unaffected. Internal-order numbers are byte-identical to
+pre-T2-3.
 
 Handoff: seller_trust (get_seller_trust / seller_trust_from_outcome, below) reads the
 merchant aggregated_outcomes row; T2-3 makes external outcomes flow into it — no
@@ -123,9 +128,17 @@ def _window_clause(window_key: str, alias: str) -> str:
 # it is FORGEABLE and must never inflate the outcome/trust signal. `metadata` is
 # JSONB; `->>'click_matched'` yields text 'true'/'false', and `::boolean IS TRUE`
 # is NULL-safe (legacy/internal edges have no such key → excluded from this arm).
+#
+# ADR-009 §D3 SELLER-MISMATCH GATE (interim, ships before seller_ref): also EXCLUDE
+# any edge whose `metadata.seller_mismatch = true` — a conversion whose converting
+# store did not correspond to the click's redirect destination seller (T2-2 stamps
+# this). `::boolean IS NOT TRUE` is NULL-safe: legacy edges + honest matches lack the
+# key (or carry false) → still counted. `seller_domain_unverified` is deliberately
+# NOT gated here (unknown ≠ mismatch; it is stamped for observability only).
 _EXT_CONVERTED_PREDICATE = (
     "(cae.state = 'converted' "
-    "AND (cae.metadata->>'click_matched')::boolean IS TRUE)"
+    "AND (cae.metadata->>'click_matched')::boolean IS TRUE "
+    "AND (cae.metadata->>'seller_mismatch')::boolean IS NOT TRUE)"
 )
 # Internal/PSP edges are counted exactly as before: they carry a real `orders` row.
 _INT_TRANSACTED_PREDICATE = (
