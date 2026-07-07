@@ -24,6 +24,21 @@ class _FakeActivationDatabase:
     async def transaction(self):
         yield
 
+    async def fetch_all(self, query: str, values: dict[str, Any] | None = None):
+        sql = _normalize_sql(query)
+        params = dict(values or {})
+
+        if "select channel_partner_id from partner_attribution" in sql:
+            return [
+                {"channel_partner_id": row["channel_partner_id"]}
+                for row in self.partner_attribution
+                if row["merchant_id"] == params["merchant_id"]
+                and row.get("activated_at") is None
+                and row.get("status", "registered") in ("registered", "signed")
+            ]
+
+        raise AssertionError(f"Unhandled fetch_all query: {query}")
+
     async def fetch_one(self, query: str, values: dict[str, Any] | None = None):
         sql = _normalize_sql(query)
         params = dict(values or {})
@@ -70,8 +85,16 @@ class _FakeActivationDatabase:
         if sql.startswith("update partner_attribution"):
             for row in self.partner_attribution:
                 if int(row["id"]) == int(params["attribution_id"]):
-                    if row.get("activated_at") is None:
+                    status = row.get("status", "registered")
+                    # Mirror the real SQL guards: write-once on activated_at and
+                    # never touch terminal (revoked/expired) rows.
+                    if (
+                        row.get("activated_at") is None
+                        and status not in ("revoked", "expired")
+                    ):
                         row["activated_at"] = params["activated_at"]
+                        if status in ("registered", "signed"):
+                            row["status"] = "active"
                         self.update_count += 1
                     return None
             return None
@@ -119,6 +142,7 @@ class _FakeActivationDatabase:
         merchant_id: str,
         channel_partner_id: int,
         activated_at: date | None = None,
+        status: str = "registered",
     ) -> int:
         attribution_id = self._next_attribution_id
         self._next_attribution_id += 1
@@ -128,6 +152,7 @@ class _FakeActivationDatabase:
                 "merchant_id": merchant_id,
                 "channel_partner_id": channel_partner_id,
                 "activated_at": activated_at,
+                "status": status,
             }
         )
         return attribution_id
@@ -327,6 +352,116 @@ async def test_try_activate_brand_no_op_when_activated_at_already_set(
     assert decision.activation_date == date(2025, 6, 1)
     assert fake_db.partner_attribution[0]["activated_at"] == date(2025, 5, 1)
     assert fake_db.update_count == 0
+
+
+async def test_try_activate_brand_advances_status_to_active(
+    fake_db: _FakeActivationDatabase,
+) -> None:
+    merchant_id = "merch_status_active"
+    partner_id = 7
+    fake_db.add_attribution(
+        merchant_id=merchant_id,
+        channel_partner_id=partner_id,
+        status="signed",
+    )
+    fake_db.add_invoice(
+        merchant_id=merchant_id,
+        paid_at=datetime(2025, 6, 10, tzinfo=timezone.utc),
+    )
+
+    await service.try_activate_brand(
+        merchant_id=merchant_id,
+        channel_partner_id=partner_id,
+    )
+
+    attribution = fake_db.partner_attribution[0]
+    assert attribution["status"] == "active"
+    assert attribution["activated_at"] == datetime(2025, 6, 10, tzinfo=timezone.utc)
+    assert fake_db.update_count == 1
+
+
+async def test_try_activate_brand_skips_revoked_attribution(
+    fake_db: _FakeActivationDatabase,
+) -> None:
+    merchant_id = "merch_revoked"
+    partner_id = 7
+    fake_db.add_attribution(
+        merchant_id=merchant_id,
+        channel_partner_id=partner_id,
+        status="revoked",
+    )
+    fake_db.add_invoice(
+        merchant_id=merchant_id,
+        paid_at=datetime(2025, 6, 10, tzinfo=timezone.utc),
+    )
+
+    await service.try_activate_brand(
+        merchant_id=merchant_id,
+        channel_partner_id=partner_id,
+    )
+
+    attribution = fake_db.partner_attribution[0]
+    assert attribution["status"] == "revoked"
+    assert attribution["activated_at"] is None
+    assert fake_db.update_count == 0
+
+
+async def test_activate_brands_for_merchant_activates_live_attributions(
+    fake_db: _FakeActivationDatabase,
+) -> None:
+    merchant_id = "merch_fanout"
+    fake_db.add_attribution(
+        merchant_id=merchant_id,
+        channel_partner_id=1,
+        status="registered",
+    )
+    fake_db.add_attribution(
+        merchant_id=merchant_id,
+        channel_partner_id=2,
+        status="revoked",
+    )
+    fake_db.add_invoice(
+        merchant_id=merchant_id,
+        paid_at=datetime(2025, 6, 10, tzinfo=timezone.utc),
+    )
+
+    outcomes = await service.activate_brands_for_merchant(merchant_id=merchant_id)
+
+    # Only the live (registered) attribution is picked up; the revoked one is
+    # excluded by the lookup filter entirely.
+    assert [o["channel_partner_id"] for o in outcomes] == [1]
+    assert outcomes[0]["activated"] is True
+    live = fake_db.partner_attribution[0]
+    revoked = fake_db.partner_attribution[1]
+    assert live["status"] == "active"
+    assert live["activated_at"] == datetime(2025, 6, 10, tzinfo=timezone.utc)
+    assert revoked["status"] == "revoked"
+    assert revoked["activated_at"] is None
+
+
+async def test_activate_brands_for_merchant_noop_without_paid_invoice(
+    fake_db: _FakeActivationDatabase,
+) -> None:
+    merchant_id = "merch_no_invoice_yet"
+    fake_db.add_attribution(
+        merchant_id=merchant_id,
+        channel_partner_id=1,
+        status="registered",
+    )
+
+    outcomes = await service.activate_brands_for_merchant(merchant_id=merchant_id)
+
+    assert outcomes[0]["channel_partner_id"] == 1
+    assert outcomes[0]["activated"] is False
+    assert fake_db.partner_attribution[0]["activated_at"] is None
+    assert fake_db.partner_attribution[0]["status"] == "registered"
+    assert fake_db.update_count == 0
+
+
+async def test_activate_brands_for_merchant_empty_merchant_id(
+    fake_db: _FakeActivationDatabase,
+) -> None:
+    assert await service.activate_brands_for_merchant(merchant_id="") == []
 
 
 def _normalize_sql(query: str) -> str:
