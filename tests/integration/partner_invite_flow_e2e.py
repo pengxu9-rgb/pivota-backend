@@ -126,6 +126,9 @@ async def main() -> None:
         check("mailer invoked with the signup_url",
               len(sent) == 1 and res.signup_url in sent[0].get("text_body", ""),
               repr(sent[:1])[:200])
+        check("mailer invoked with a from_email (else SES FROM_EMAIL_MISSING)",
+              bool((sent[0].get("from_email") or "").strip()) if sent else False,
+              repr(sent[:1])[:200])
 
         # 4. REDEEM by multiple merchants (multi-use) + duplicate
         a1 = await tok.consume(raw_token=raw, merchant_id="merch_e2e_a")

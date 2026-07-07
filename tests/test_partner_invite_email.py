@@ -60,6 +60,8 @@ async def test_sends_when_contact_email_present(monkeypatch) -> None:
     assert out == {"email_sent": True, "recipient": "finance@markato.com"}
     assert len(calls) == 1
     assert calls[0]["to_email"] == "finance@markato.com"
+    # from_email must be set — send_email returns FROM_EMAIL_MISSING otherwise.
+    assert (calls[0].get("from_email") or "").strip()
     # The link and the multi-use explanation ride in the body.
     assert "mkto_abc" in calls[0]["text_body"]
     assert "same link works for every brand" in calls[0]["text_body"]
