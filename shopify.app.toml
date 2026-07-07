@@ -6,10 +6,11 @@ application_url = "https://api.pivota.cc/integrations/shopify/app"
 embedded = false
 
 [webhooks]
-# TODO(founder): toml pins 2026-01 but all backend code registers/calls 2024-07
-# (services/shopify_integration_verify.py, routes/webhook_routes.py). Pick one
-# and pin both before App A review (audit D3).
-api_version = "2026-01"
+# Pinned to match the version the backend registers/calls everywhere
+# (DEFAULT_API_VERSION in services/shopify_integration_verify.py; the
+# /admin/api/2024-07/webhooks.json REST path in routes/webhook_routes.py).
+# Keep this in lockstep with the code when bumping (audit D3, resolved).
+api_version = "2024-07"
 
   [[webhooks.subscriptions]]
   uri = "https://api.pivota.cc/webhooks/shopify/gdpr"
