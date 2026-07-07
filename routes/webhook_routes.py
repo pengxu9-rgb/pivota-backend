@@ -7,7 +7,7 @@ from services.merchant_store_service import get_merchant_active_stores, get_prim
 from services.shopify_access_token_service import resolve_shopify_admin_access_token
 from fastapi import APIRouter, BackgroundTasks, Request, HTTPException, Header, Response, Depends
 from fastapi.security import HTTPBasic, HTTPBasicCredentials
-from typing import Optional, Dict, Any, Tuple
+from typing import Optional, Dict, Any, Tuple, List
 from urllib.parse import urlparse
 import stripe
 import os
@@ -1504,6 +1504,326 @@ async def handle_stripe_webhook(
 # Shopify GDPR Webhooks (static endpoint for Partner Dashboard configuration)
 # ============================================================================
 
+# PII keys stripped when scrubbing webhook-event payloads during redaction. Kept
+# in sync with services/shopify_webhook_ingest._PII_KEYS (fix #6); duplicated here
+# to scrub historical rows persisted BEFORE fix #6 landed.
+_GDPR_SCRUB_KEYS = (
+    "customer",
+    "email",
+    "contact_email",
+    "phone",
+    "billing_address",
+    "shipping_address",
+    "customer_locale",
+    "browser_ip",
+    "customer_url",
+)
+
+_REDACTED_NAME = "[REDACTED]"
+
+
+def _redacted_email(original: Optional[str]) -> str:
+    """
+    Non-null tombstone for the non-nullable orders.customer_email column. Uses an
+    sha256-8 of the original so redacted rows remain distinct (no collisions on a
+    single sentinel) without retaining the address.
+    """
+    src = (original or "").strip().lower()
+    digest = hashlib.sha256(src.encode("utf-8")).hexdigest()[:8] if src else "00000000"
+    return f"redacted+{digest}@redacted.invalid"
+
+
+def _scrub_webhook_event_payload(payload_json: Any) -> Any:
+    """Strip PII keys from a stored webhook-event payload (dict-in, dict-out)."""
+    if not isinstance(payload_json, dict):
+        return payload_json
+    for key in _GDPR_SCRUB_KEYS:
+        payload_json.pop(key, None)
+    line_items = payload_json.get("line_items")
+    if isinstance(line_items, list):
+        for item in line_items:
+            if isinstance(item, dict):
+                item.pop("destination_location", None)
+                item.pop("origin_location", None)
+    payload_json["pii_stripped"] = True
+    return payload_json
+
+
+async def _record_gdpr_request(
+    *,
+    merchant_id: Optional[str],
+    shop_domain: Optional[str],
+    topic: str,
+    shopify_request: Dict[str, Any],
+    status: str,
+    resolution: Dict[str, Any],
+) -> None:
+    """Persist the compliance-request audit row (best-effort; never raises)."""
+    try:
+        from db.database import database
+
+        await database.execute(
+            """
+            INSERT INTO shopify_gdpr_requests
+              (merchant_id, shop_domain, topic, shopify_request, status, resolution, resolved_at)
+            VALUES
+              (:merchant_id, :shop_domain, :topic, CAST(:shopify_request AS jsonb),
+               :status, CAST(:resolution AS jsonb),
+               CASE WHEN :status IN ('completed', 'needs_review') THEN NOW() ELSE NULL END)
+            """,
+            {
+                "merchant_id": merchant_id,
+                "shop_domain": shop_domain,
+                "topic": topic,
+                "shopify_request": json.dumps(shopify_request or {}, ensure_ascii=False, default=str),
+                "status": status,
+                "resolution": json.dumps(resolution or {}, ensure_ascii=False, default=str),
+            },
+        )
+    except Exception as e:
+        logger.warning("Failed to persist shopify_gdpr_requests row topic=%s err=%s", topic, str(e)[:200])
+
+
+async def _scrub_webhook_events_for_email(
+    *, shop_domain: Optional[str], customer_email: Optional[str]
+) -> int:
+    """
+    Scrub PII from pcs_shopify_webhook_events order rows for this shop whose
+    payload contains the customer's email. Returns count of rows rewritten.
+    """
+    if not shop_domain or not customer_email:
+        return 0
+    from db.database import database
+
+    rows = await database.fetch_all(
+        """
+        SELECT id, payload_json
+        FROM pcs_shopify_webhook_events
+        WHERE lower(shop_domain) = :shop_domain
+          AND topic LIKE 'orders/%'
+        """,
+        {"shop_domain": shop_domain.strip().lower()},
+    )
+    target = customer_email.strip().lower()
+    scrubbed = 0
+    for row in rows or []:
+        payload = row["payload_json"]
+        if isinstance(payload, str):
+            try:
+                payload = json.loads(payload)
+            except Exception:
+                continue
+        if not isinstance(payload, dict):
+            continue
+        if target not in json.dumps(payload, ensure_ascii=False, default=str).lower():
+            continue
+        cleaned = _scrub_webhook_event_payload(payload)
+        await database.execute(
+            "UPDATE pcs_shopify_webhook_events SET payload_json = CAST(:p AS jsonb) WHERE id = :id",
+            {"p": json.dumps(cleaned, ensure_ascii=False, default=str), "id": row["id"]},
+        )
+        scrubbed += 1
+    return scrubbed
+
+
+async def _scrub_webhook_events_for_shop(*, shop_domain: Optional[str]) -> int:
+    """Scrub PII from ALL order webhook-event rows for a shop. Returns count."""
+    if not shop_domain:
+        return 0
+    from db.database import database
+
+    rows = await database.fetch_all(
+        """
+        SELECT id, payload_json
+        FROM pcs_shopify_webhook_events
+        WHERE lower(shop_domain) = :shop_domain
+          AND topic LIKE 'orders/%'
+        """,
+        {"shop_domain": shop_domain.strip().lower()},
+    )
+    scrubbed = 0
+    for row in rows or []:
+        payload = row["payload_json"]
+        if isinstance(payload, str):
+            try:
+                payload = json.loads(payload)
+            except Exception:
+                continue
+        if not isinstance(payload, dict):
+            continue
+        cleaned = _scrub_webhook_event_payload(payload)
+        await database.execute(
+            "UPDATE pcs_shopify_webhook_events SET payload_json = CAST(:p AS jsonb) WHERE id = :id",
+            {"p": json.dumps(cleaned, ensure_ascii=False, default=str), "id": row["id"]},
+        )
+        scrubbed += 1
+    return scrubbed
+
+
+async def _fulfill_shopify_gdpr_request(
+    *,
+    merchant_id: Optional[str],
+    shop_domain: Optional[str],
+    topic: str,
+    data: Dict[str, Any],
+) -> Dict[str, Any]:
+    """
+    Fulfill a Shopify compliance obligation for real (not log-and-200).
+
+    - customers/redact: anonymize matching Pivota `orders` rows and scrub matching
+      pcs_shopify_webhook_events payloads.
+    - shop/redact: same for the whole shop.
+    - customers/data_request: export what Pivota holds for the customer into the
+      audit row's resolution (merchant delivers out-of-band); no PII to app logs.
+
+    Always records a shopify_gdpr_requests audit row. Wrapped so a failure marks
+    the row needs_review; the caller still returns 200 (Shopify requires 200; the
+    audit row is the source of truth).
+    """
+    from db.database import database
+
+    resolution: Dict[str, Any] = {}
+    status = "completed"
+
+    # Compliance payloads carry ids, not bulk PII. Persist those for the audit row.
+    customer = data.get("customer") if isinstance(data, dict) else None
+    customer_email = None
+    customer_id = None
+    if isinstance(customer, dict):
+        customer_email = (customer.get("email") or "").strip() or None
+        customer_id = customer.get("id")
+    orders_to_redact = data.get("orders_to_redact") if isinstance(data, dict) else None
+    shopify_request = {
+        "shop_domain": shop_domain,
+        "customer_id": customer_id,
+        "orders_to_redact": orders_to_redact,
+        "orders_requested": data.get("orders_requested") if isinstance(data, dict) else None,
+    }
+
+    try:
+        if topic == "customers/redact":
+            redacted_orders = 0
+            if merchant_id and customer_email:
+                rows = await database.fetch_all(
+                    """
+                    UPDATE orders
+                    SET customer_name = :redacted_name,
+                        customer_email = :redacted_email,
+                        shipping_address = NULL
+                    WHERE merchant_id = :merchant_id
+                      AND lower(customer_email) = :email
+                    RETURNING order_id
+                    """,
+                    {
+                        "redacted_name": _REDACTED_NAME,
+                        "redacted_email": _redacted_email(customer_email),
+                        "merchant_id": merchant_id,
+                        "email": customer_email.strip().lower(),
+                    },
+                )
+                redacted_orders = len(rows or [])
+            # Also redact by explicit shopify order ids if provided.
+            if merchant_id and isinstance(orders_to_redact, list) and orders_to_redact:
+                ids = [str(x) for x in orders_to_redact if x is not None]
+                if ids:
+                    rows2 = await database.fetch_all(
+                        """
+                        UPDATE orders
+                        SET customer_name = :redacted_name,
+                            customer_email = :redacted_email,
+                            shipping_address = NULL
+                        WHERE merchant_id = :merchant_id
+                          AND shopify_order_id = ANY(:ids)
+                        RETURNING order_id
+                        """,
+                        {
+                            "redacted_name": _REDACTED_NAME,
+                            "redacted_email": _redacted_email(customer_email),
+                            "merchant_id": merchant_id,
+                            "ids": ids,
+                        },
+                    )
+                    redacted_orders += len(rows2 or [])
+            events_scrubbed = await _scrub_webhook_events_for_email(
+                shop_domain=shop_domain, customer_email=customer_email
+            )
+            resolution = {"orders_redacted": redacted_orders, "webhook_events_scrubbed": events_scrubbed}
+
+        elif topic == "shop/redact":
+            orders_redacted = 0
+            if merchant_id:
+                rows = await database.fetch_all(
+                    """
+                    UPDATE orders
+                    SET customer_name = :redacted_name,
+                        customer_email = :redacted_email,
+                        shipping_address = NULL
+                    WHERE merchant_id = :merchant_id
+                      AND customer_email NOT LIKE 'redacted+%@redacted.invalid'
+                    RETURNING order_id
+                    """,
+                    {
+                        "redacted_name": _REDACTED_NAME,
+                        # Per-shop bulk redaction has no single original email; use a
+                        # stable shop-scoped tombstone so the column stays non-null.
+                        "redacted_email": _redacted_email(shop_domain),
+                        "merchant_id": merchant_id,
+                    },
+                )
+                orders_redacted = len(rows or [])
+            events_scrubbed = await _scrub_webhook_events_for_shop(shop_domain=shop_domain)
+            resolution = {"orders_redacted": orders_redacted, "webhook_events_scrubbed": events_scrubbed}
+
+        elif topic == "customers/data_request":
+            export: List[Dict[str, Any]] = []
+            if merchant_id and customer_email:
+                rows = await database.fetch_all(
+                    """
+                    SELECT order_id, shopify_order_id, created_at, total, currency, status, payment_status
+                    FROM orders
+                    WHERE merchant_id = :merchant_id
+                      AND lower(customer_email) = :email
+                    ORDER BY created_at DESC
+                    """,
+                    {"merchant_id": merchant_id, "email": customer_email.strip().lower()},
+                )
+                for r in rows or []:
+                    d = dict(r)
+                    export.append(
+                        {
+                            "order_id": d.get("order_id"),
+                            "shopify_order_id": d.get("shopify_order_id"),
+                            "created_at": str(d.get("created_at")) if d.get("created_at") else None,
+                            "total": str(d.get("total")) if d.get("total") is not None else None,
+                            "currency": d.get("currency"),
+                            "status": d.get("status"),
+                            "payment_status": d.get("payment_status"),
+                        }
+                    )
+            # customer_email is an id in the compliance payload, not app-log PII, so
+            # we do NOT log it; the export lives only in the audit row's resolution.
+            resolution = {"orders_found": len(export), "export": export}
+
+        else:
+            status = "needs_review"
+            resolution = {"error": f"unhandled_topic:{topic}"}
+
+    except Exception as e:
+        status = "needs_review"
+        resolution = {"error": str(e)[:400]}
+        logger.warning("GDPR fulfillment error topic=%s merchant=%s err=%s", topic, merchant_id, str(e)[:200])
+
+    await _record_gdpr_request(
+        merchant_id=merchant_id,
+        shop_domain=shop_domain,
+        topic=topic,
+        shopify_request=shopify_request,
+        status=status,
+        resolution=resolution,
+    )
+    return {"status": status, "resolution": resolution}
+
+
 @router.post("/shopify/gdpr")
 async def handle_shopify_gdpr_webhook(
     request: Request,
@@ -1522,65 +1842,72 @@ async def handle_shopify_gdpr_webhook(
     topic = x_shopify_topic or "unknown"
     shop_domain = _canonicalize_shop_domain(x_shopify_shop_domain)
 
-    app_secret = (settings.shopify_client_secret or "").strip()
-    if not app_secret:
+    # Dual-app HMAC: verify against ALL app secrets (appstore + legacy + headless),
+    # deduped, any-match. Once SHOPIFY_APPSTORE_CLIENT_SECRET diverges from the
+    # legacy env, single-secret verification would 401 App A's compliance webhooks
+    # and fail automated review (audit C2). Mirrors the main handler's candidate
+    # pattern.
+    secret_candidates = _shopify_app_secret_candidates()
+    if not secret_candidates:
         record_shopify_webhook(result="error", reason="missing_secret", topic=topic)
         raise HTTPException(status_code=500, detail="Shopify webhook verification not configured")
     if not x_shopify_hmac_sha256:
         record_shopify_webhook(result="error", reason="missing_hmac", topic=topic)
         raise HTTPException(status_code=401, detail="Missing Shopify webhook signature")
-    if not verify_shopify_hmac(secret=app_secret, payload=payload, header_hmac_base64=x_shopify_hmac_sha256):
+    if not any(
+        verify_shopify_hmac(secret=secret, payload=payload, header_hmac_base64=x_shopify_hmac_sha256)
+        for secret in secret_candidates
+    ):
         record_shopify_webhook(result="error", reason="invalid_signature", topic=topic)
         raise HTTPException(status_code=401, detail="Invalid Shopify webhook signature")
 
-    merchant_id: Optional[str] = None
-    if shop_domain:
-        try:
-            from db.database import database
+    merchant_id = await _resolve_merchant_id_by_shop_domain(shop_domain)
 
-            row = await database.fetch_one(
-                """
-                SELECT merchant_id
-                FROM merchant_stores
-                WHERE platform = 'shopify' AND lower(domain) = :domain
-                ORDER BY connected_at DESC
-                LIMIT 1
-                """,
-                {"domain": shop_domain},
-            )
-            if row:
-                merchant_id = row["merchant_id"]
-            else:
-                row = await database.fetch_one(
-                    """
-                    SELECT merchant_id
-                    FROM merchant_onboarding
-                    WHERE lower(mcp_shop_domain) = :domain
-                    ORDER BY updated_at DESC
-                    LIMIT 1
-                    """,
-                    {"domain": shop_domain},
-                )
-                if row:
-                    merchant_id = row["merchant_id"]
-        except Exception as e:
-            logger.warning("GDPR webhook merchant lookup failed shop=%s err=%s", shop_domain, str(e)[:200])
-
-    payload_keys: list[str] = []
     try:
         data = json.loads(payload.decode("utf-8"))
-        if isinstance(data, dict):
-            payload_keys = list(data.keys())
+        if not isinstance(data, dict):
+            data = {}
     except Exception:
-        payload_keys = []
+        data = {}
 
+    # Fulfill the obligation for real (redact / export) and persist the audit row.
+    # Wrapped so Shopify still gets its required 200 even on error (the
+    # shopify_gdpr_requests row records needs_review as the audit trail).
+    outcome: Dict[str, Any] = {"status": "needs_review"}
+    try:
+        outcome = await _fulfill_shopify_gdpr_request(
+            merchant_id=merchant_id,
+            shop_domain=shop_domain,
+            topic=topic,
+            data=data,
+        )
+    except Exception as e:
+        logger.warning("GDPR fulfillment top-level error topic=%s err=%s", topic, str(e)[:200])
+        try:
+            await _record_gdpr_request(
+                merchant_id=merchant_id,
+                shop_domain=shop_domain,
+                topic=topic,
+                shopify_request={"shop_domain": shop_domain},
+                status="needs_review",
+                resolution={"error": str(e)[:400]},
+            )
+        except Exception:
+            pass
+
+    # Preserve the existing order_events breadcrumb + metric (no PII: keys only).
     if merchant_id:
         try:
             await log_order_event(
                 event_type="gdpr_webhook",
                 order_id=f"gdpr_{merchant_id}",
                 merchant_id=merchant_id,
-                metadata={"topic": topic, "payload_keys": payload_keys, "shop_domain": shop_domain},
+                metadata={
+                    "topic": topic,
+                    "payload_keys": list(data.keys()) if isinstance(data, dict) else [],
+                    "shop_domain": shop_domain,
+                    "resolution_status": outcome.get("status"),
+                },
             )
         except Exception as e:
             logger.warning("GDPR webhook log failed merchant=%s err=%s", merchant_id, str(e)[:200])
@@ -2387,13 +2714,31 @@ async def _process_shopify_webhook_event(
                 pass
 
         elif topic in ("customers/data_request", "customers/redact", "shop/redact"):
+            # Fulfill the obligation for real (redact / export) + audit row, same
+            # shared handler as the static /gdpr endpoint. got_canon is the
+            # canonicalized shop domain this handler authenticated. Wrapped so a
+            # failure marks needs_review and still returns 200.
+            outcome: Dict[str, Any] = {"status": "needs_review"}
+            try:
+                outcome = await _fulfill_shopify_gdpr_request(
+                    merchant_id=merchant_id,
+                    shop_domain=got_canon,
+                    topic=topic,
+                    data=data if isinstance(data, dict) else {},
+                )
+            except Exception as e:
+                logger.warning("GDPR fulfillment (per-merchant) error topic=%s err=%s", topic, str(e)[:200])
             await log_order_event(
                 event_type="gdpr_webhook",
                 order_id=f"gdpr_{merchant_id}",
                 merchant_id=merchant_id,
-                metadata={"topic": topic, "payload_keys": list((data or {}).keys())},
+                metadata={
+                    "topic": topic,
+                    "payload_keys": list((data or {}).keys()),
+                    "resolution_status": outcome.get("status"),
+                },
             )
-        
+
         return {"status": "success", "topic": topic}
 
     except HTTPException:
