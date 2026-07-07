@@ -42,7 +42,9 @@ def test_mirror_insert_mints_canonical_signature_on_new_rows() -> None:
     as they are created. Public serving is still controlled elsewhere."""
     source = Path(mirror_module.__file__).read_text()
 
-    assert "from services.catalog_sync_service import make_pivota_canonical_fields" in source
+    # imported from catalog_sync_service (grouped import since A9-2 added
+    # make_catalog_product_key alongside it)
+    assert "make_pivota_canonical_fields" in source
     assert "pivota_fields = make_pivota_canonical_fields(" in source
     assert "pivota_signature_id" in source
     assert "pivota_canonical_url" in source

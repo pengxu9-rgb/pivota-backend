@@ -44,7 +44,9 @@ def _sitemap_row_eligible(r: Dict[str, Any]) -> bool:
     else:
         if r.get("merchant_indexable") is not True:
             return False
-        if r.get("merchant_status", "active") != "active":
+        # ADR-009 amendment: observed (unclaimed) sellers serve; only
+        # disabled/inactive merchants are excluded.
+        if r.get("merchant_status", "active") not in ("active", "observed"):
             return False
     has_sig = str(r.get("pivota_signature_id") or "").startswith("sig_")
     serving = r.get("serving_eligible") is True
@@ -80,7 +82,7 @@ class FakeDb:
                 and r.get("content_key")
                 and r.get("serving_eligible") is True
                 and r.get("merchant_indexable", True) is True
-                and r.get("merchant_status", "active") == "active"
+                and r.get("merchant_status", "active") in ("active", "observed")
             ):
                 return r
         return None
@@ -383,7 +385,10 @@ def test_list_canonical_pdps_uses_index_pipeline_state_join(env):
     assert "JOIN catalog_merchants" in sql
     assert "serving_eligible IS true" in sql
     assert "catalog_merchants.indexable IS true" in sql
-    assert "catalog_merchants.status = 'active'" in sql
+    # ADR-009 amendment: gate = "not disabled" (active OR observed);
+    # a plain 'active'-only equality would darken observed sellers.
+    assert "catalog_merchants.status IN" in sql
+    assert "catalog_merchants.status = 'active'" not in sql
     assert "ORDER BY catalog_products.content_changed_at DESC" in sql
     assert "catalog_products.pivota_signature_id ASC" in sql
     assert "catalog_products.content_key ASC" in sql

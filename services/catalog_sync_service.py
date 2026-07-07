@@ -849,7 +849,13 @@ async def upsert_catalog_merchant(
     source_system: str,
     source_ref: Optional[str],
     metadata_json: Optional[Dict[str, Any]] = None,
+    status: str = "active",
 ) -> None:
+    # `status` defaults to 'active' so every existing caller (synced tenants,
+    # url_audit intake) is unchanged. Observed sellers minted at ingestion pass
+    # status='observed' (ADR-009 D2) — first-class but NOT servable as the public
+    # citation artifact until graduation (pivota_canonical_routes gates on
+    # status='active'). See services/seller_identity.py.
     if not merchant_name:
         merchant_name = await _resolve_merchant_name(merchant_id)
     await _upsert_by_pk(
@@ -859,7 +865,7 @@ async def upsert_catalog_merchant(
             "merchant_id": merchant_id,
             "merchant_name": merchant_name,
             "primary_platform": primary_platform,
-            "status": "active",
+            "status": status,
             "source_system": source_system,
             "source_ref": source_ref,
             "metadata_json": metadata_json or {},

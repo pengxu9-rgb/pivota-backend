@@ -260,7 +260,12 @@ async def get_canonical_pdp_by_signature(sig_id: str) -> Dict[str, Any]:
                     widen_with_index_eligible=_flag_on("INDEX_ELIGIBLE_READ")
                 ),
                 catalog_merchants.c.indexable.is_(True),
-                catalog_merchants.c.status == "active",
+                # ADR-009 amendment (A9-2 review): merchant status is an IDENTITY-
+                # LIFECYCLE field (observed → claimed/active), not a serving switch.
+                # Observed sellers' pages served under the shared bucket yesterday and
+                # keep serving; product-level gates (serving_eligible/index_eligible)
+                # remain the SOLE serving control. Gate semantics = "not disabled".
+                catalog_merchants.c.status.in_(["active", "observed"]),
             )
         )
         .limit(1)
@@ -336,7 +341,7 @@ async def list_canonical_pdp_signatures(
         merchant_gate = or_(
             and_(
                 catalog_merchants.c.indexable.is_(True),
-                catalog_merchants.c.status == "active",
+                catalog_merchants.c.status.in_(["active", "observed"]),
             ),
             and_(
                 catalog_merchants.c.merchant_id.is_(None),
@@ -350,7 +355,7 @@ async def list_canonical_pdp_signatures(
         )
         merchant_gate = and_(
             catalog_merchants.c.indexable.is_(True),
-            catalog_merchants.c.status == "active",
+            catalog_merchants.c.status.in_(["active", "observed"]),
         )
     eligibility_filter = and_(
         catalog_products.c.content_key.isnot(None),

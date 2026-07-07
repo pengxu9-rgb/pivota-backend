@@ -40,8 +40,20 @@ from db.database import database
 from services.beauty_external_ranking import (
     normalize_external_seed_structured_ingredient_ids,
 )
+from services.brand_claim_service import normalize_host
 from services.catalog_identity import make_content_key
-from services.catalog_sync_service import make_pivota_canonical_fields
+from services.catalog_sync_service import (
+    make_catalog_product_key,
+    make_pivota_canonical_fields,
+)
+# ADR-009 D2 (docs/adr/ADR-009-seller-of-record-identity.md) + IDENTITY_REFERENCE
+# §3 Trap T3: Path B must mint a real per-brand observed seller-of-record at
+# ingestion instead of stuffing everything under the banned 'external_seed'
+# bucket. See services/seller_identity.py.
+from services.seller_identity import (
+    BANNED_BUCKET_MERCHANT_ID,
+    ensure_observed_seller,
+)
 from services.external_seed_servability import (
     backlink_seed_to_product,
     build_servable_quality_payload,
@@ -358,8 +370,15 @@ async def _ensure_external_seed_merchant() -> None:
 async def _upsert_canonical_sku_for_mirror_row(
     product_key: str,
     row_dict: Dict[str, Any],
+    merchant_id: str = MERCHANT_ID,
 ) -> None:
     """Phase 7d: write the canonical SKU row for a mirrored product.
+
+    `merchant_id` defaults to the legacy singleton so the existing repair /
+    backfill callers (scripts/repair_external_seed_offer_mainline.py,
+    scripts/backfill_canonical_chain_for_path_b_mirror.py) that heal EXISTING
+    external_seed rows are unchanged. The forward Path B mirror now passes the
+    per-brand observed seller (ADR-009 D2).
     Matches Path C convention — one synthetic 'canonical' SKU per
     product. The actual variant-level data lives only in seed_data on
     external_product_seeds; we don't expand variants here because the
@@ -410,7 +429,7 @@ async def _upsert_canonical_sku_for_mirror_row(
         {
             "sku_key": sku_key,
             "product_key": product_key,
-            "merchant_id": MERCHANT_ID,
+            "merchant_id": merchant_id,
             "platform": PLATFORM,
             "source_product_id": row_dict.get("external_product_id"),
             # Phase 7d fix: the catalog_skus unique index
@@ -439,6 +458,7 @@ async def _upsert_canonical_sku_for_mirror_row(
 async def _upsert_canonical_offer_for_mirror_row(
     product_key: str,
     row_dict: Dict[str, Any],
+    merchant_id: str = MERCHANT_ID,
 ) -> None:
     """Phase 7d: write the canonical offer row carrying price + currency
     + availability. This is the field that fixes the "all prices zero"
@@ -495,7 +515,7 @@ async def _upsert_canonical_offer_for_mirror_row(
             "offer_id": offer_id,
             "sku_key": sku_key,
             "product_key": product_key,
-            "merchant_id": MERCHANT_ID,
+            "merchant_id": merchant_id,
             "catalog_track": CATALOG_TRACK,
             "truth_tier": TRUTH_TIER,
             "readiness_tier": READINESS_TIER,
@@ -674,11 +694,17 @@ candidates AS (
     AND nullif(btrim(coalesce(title, '')), '') IS NOT NULL
 ),
 missing AS (
+  -- A seed is "missing" only if it has NO mirrored catalog_products row yet,
+  -- under EITHER identity: the legacy singleton merchant_id='external_seed'
+  -- OR a per-brand observed seller (merch_obs_*, ADR-009 D2). The join is now
+  -- keyed on (platform, source_product_id) with NO merchant literal, so a seed
+  -- already mirrored under the bucket is treated as present and is NOT
+  -- re-mirrored under a fresh observed identity — re-keying existing rows is the
+  -- A9-4 parity backfill, explicitly out of scope here (ADR-009 D4).
   SELECT c.*
   FROM candidates c
   LEFT JOIN catalog_products cp
-    ON cp.merchant_id = 'external_seed'
-   AND cp.platform = 'external_seed'
+    ON cp.platform = 'external_seed'
    AND cp.source_product_id = c.external_product_id
   WHERE cp.product_key IS NULL
 )
@@ -809,11 +835,31 @@ async def _build_report(*, sample_limit: int, limit: int, apply: bool) -> Dict[s
     return report
 
 
+def _seller_domain_for_row(row_dict: Dict[str, Any]) -> str:
+    """Best registrable-domain source for the row's seller identity: the seed's
+    own `domain`, else the host of its destination_url, else canonical_url. Path
+    B seeds always carry a brand site (that is what was crawled), so one of these
+    is populated for real supply. Returns '' when none is — the caller then skips
+    the row (never buckets it)."""
+    for candidate in (
+        row_dict.get("domain"),
+        row_dict.get("destination_url"),
+        row_dict.get("canonical_url"),
+    ):
+        host = normalize_host(candidate)
+        if host:
+            return host
+    return ""
+
+
 async def _apply(limit: int) -> int:
-    # Phase 7d: Path B writes the full canonical chain. The merchant
-    # row is a single synthetic 'external_seed' aggregator — upsert it
-    # once before the per-row loop so catalog_offers FKs resolve.
-    await _ensure_external_seed_merchant()
+    # ADR-009 D2: Path B no longer stuffs every crawled brand under the singleton
+    # 'external_seed' merchant. Each row now resolves-or-mints its own per-brand
+    # observed seller (services/seller_identity.ensure_observed_seller), which
+    # upserts the catalog_merchants row on demand — so the old
+    # _ensure_external_seed_merchant() pre-pass is gone from this write path (the
+    # function is retained only for the legacy repair/backfill scripts).
+    skipped_no_seller = 0
 
     limit_clause = ""
     values: Dict[str, Any] = {}
@@ -825,7 +871,6 @@ async def _apply(limit: int) -> int:
         COMMON_CTES
         + f"""
         SELECT
-          'prod::external_seed::external_seed::' || external_product_id AS product_key,
           id,
           external_product_id,
           attached_product_key,
@@ -856,11 +901,47 @@ async def _apply(limit: int) -> int:
     inserted = 0
     for row in rows or []:
         row_dict = dict(row)
+        external_product_id = str(row_dict.get("external_product_id") or "")
+        # ADR-009 D2: resolve-or-mint this row's per-brand seller-of-record.
+        # brand comes from the crawled snapshot (mirrored_brand); domain from the
+        # crawled brand site. If we cannot form a real brand+registrable-domain
+        # identity we SKIP the row loudly — we never fall back to the banned
+        # 'external_seed' bucket (no silent placeholder identity).
+        seller_domain = _seller_domain_for_row(row_dict)
+        try:
+            seller_merchant_id = await ensure_observed_seller(
+                brand=row_dict.get("mirrored_brand") or "",
+                domain=seller_domain,
+                source_system=SOURCE_SYSTEM,
+                primary_platform=PLATFORM,
+            )
+        except ValueError as exc:
+            skipped_no_seller += 1
+            print(
+                f"SKIP: no seller identity for external_product_id="
+                f"{external_product_id!r} (brand={row_dict.get('mirrored_brand')!r}, "
+                f"domain={seller_domain!r}): {exc}",
+                file=sys.stderr,
+            )
+            continue
+        # ADR-009 D2 write-boundary tripwire: the banned bucket must NEVER be the
+        # resolved seller-of-record for a new write. Fail loudly (founder
+        # no-fallback directive) rather than let a bucketed row slip through.
+        if seller_merchant_id == BANNED_BUCKET_MERCHANT_ID:
+            raise RuntimeError(
+                "ADR-009 D2 violation: refusing to mirror a new catalog row under "
+                f"the banned 'external_seed' bucket (external_product_id="
+                f"{external_product_id!r})"
+            )
+        product_key = make_catalog_product_key(
+            seller_merchant_id, PLATFORM, external_product_id
+        )
+
         mirrored_at = datetime.now(timezone.utc).isoformat()
         pivota_fields = make_pivota_canonical_fields(
-            MERCHANT_ID,
+            seller_merchant_id,
             PLATFORM,
-            str(row_dict.get("external_product_id") or ""),
+            external_product_id,
         )
         category_meta = resolve_mirror_category_metadata(
             category=row_dict.get("mirrored_category"),
@@ -1015,8 +1096,8 @@ async def _apply(limit: int) -> int:
             RETURNING product_key
             """,
             {
-                "product_key": row_dict.get("product_key"),
-                "merchant_id": MERCHANT_ID,
+                "product_key": product_key,
+                "merchant_id": seller_merchant_id,
                 "platform": PLATFORM,
                 "source_product_id": row_dict.get("external_product_id"),
                 "catalog_track": CATALOG_TRACK,
@@ -1073,11 +1154,15 @@ async def _apply(limit: int) -> int:
         # missing skus/offers without needing a separate backfill
         # script. The product_key is the same identifier on both
         # paths, so chain writes stay attached to the correct PDP.
-        product_key_for_chain = row_dict.get("product_key")
+        product_key_for_chain = product_key
         if product_key_for_chain:
             try:
-                await _upsert_canonical_sku_for_mirror_row(product_key_for_chain, row_dict)
-                await _upsert_canonical_offer_for_mirror_row(product_key_for_chain, row_dict)
+                await _upsert_canonical_sku_for_mirror_row(
+                    product_key_for_chain, row_dict, merchant_id=seller_merchant_id
+                )
+                await _upsert_canonical_offer_for_mirror_row(
+                    product_key_for_chain, row_dict, merchant_id=seller_merchant_id
+                )
             except Exception as exc:
                 # Don't break the whole apply if one row's chain fails
                 # — log and continue. The next --apply pass will retry
@@ -1117,6 +1202,15 @@ async def _apply(limit: int) -> int:
                     f"WARNING: servability step failed for product_key={product_key_for_chain}: {exc!r}",
                     file=sys.stderr,
                 )
+    if skipped_no_seller:
+        # Loud, not silent (founder no-fallback directive): these rows carried no
+        # resolvable brand+registrable-domain identity, so ADR-009 D2 forbids
+        # mirroring them under any bucket. They are left un-mirrored on purpose.
+        print(
+            f"NOTE: skipped {skipped_no_seller} seed row(s) with no resolvable "
+            "seller-of-record identity (ADR-009 D2 — no fallback bucket)",
+            file=sys.stderr,
+        )
     return inserted
 
 
