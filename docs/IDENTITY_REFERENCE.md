@@ -61,6 +61,19 @@ plumbing and must not leak into agent-facing or cross-merchant semantics.
 - **Scope:** per-merchant per-platform listing.
 - **Traps:** see **T1 (pipe transport form)** — a pipe-delimited *transport* form of the
   same triple exists and is NOT interchangeable with this storage form.
+- **A9-4 historical-format residue (ADR-009 D4.2):** the seller-of-record backfill
+  (`scripts/backfill_seller_of_record.py`) re-subjects `catalog_products.merchant_id`
+  off the `external_seed` bucket but deliberately does **NOT** re-key `product_key`
+  (ADR-009 D4.2 says "re-key `merchant_id`", not `product_key`). So a re-subjected
+  crawled row keeps `prod::external_seed::external_seed::{pid}` — the merchant segment
+  is now a HISTORICAL-FORMAT storage token, not the current owner. This is safe
+  because the decision layer keys on `content_key`/`product_group_id` (§1) and the
+  discipline is "look up by key, never parse the merchant out of it" (T1/T2/T6). The
+  one path that parses a merchant from a product key —
+  `services/crawled_inci_ingest.merchant_id_from_product_key` (feeds
+  `beauty_sku_ingredients.merchant_id` at INCI ingest) — already yields
+  `external_seed` for these rows and stays byte-identical. **MUST NOT** read
+  ownership out of a `prod::` key; join `catalog_products.merchant_id` instead.
 
 ### The PIPE transport form (`{merchant_id}|{platform}|{source_id}`)
 - **What:** a pipe-delimited rendering of the product triple used as a REPORT/EVIDENCE
