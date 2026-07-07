@@ -176,7 +176,7 @@ SELECT product_key, platform, source_product_id
 FROM catalog_products
 WHERE merchant_id = :merchant_id
   AND (platform, source_product_id) IN (
-      SELECT unnest(:platforms::text[]), unnest(:source_ids::text[])
+      SELECT unnest(CAST(:platforms AS text[])), unnest(CAST(:source_ids AS text[]))
   )
 """
 
