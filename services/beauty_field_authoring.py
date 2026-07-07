@@ -392,14 +392,14 @@ async def _write_profile_payload_field(
           product_key, merchant_id, profile_payload, updated_at
         ) VALUES (
           :pk, :mid,
-          jsonb_build_object(:field, to_jsonb(:value::text)),
+          jsonb_build_object(CAST(:field AS text), to_jsonb(CAST(:value AS text))),
           NOW()
         )
         ON CONFLICT (product_key) DO UPDATE SET
           profile_payload = jsonb_set(
             COALESCE(beauty_product_profiles.profile_payload, '{}'::jsonb),
             ARRAY[:field],
-            to_jsonb(:value::text),
+            to_jsonb(CAST(:value AS text)),
             true
           ),
           updated_at = NOW()
