@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from datetime import datetime, timezone
+from datetime import date, datetime, timezone
 from typing import Any
 
 from fastapi import APIRouter, Depends, HTTPException
@@ -14,6 +14,33 @@ from utils.auth import require_admin
 
 router = APIRouter(tags=["Admin - Partners"])
 
+# Mirrors the channel_partners / partner_rate_schedules CHECK constraints
+# (migrations 108 + 125). Validated in-handler so a bad payload returns a clean
+# 400 instead of surfacing a raw DB constraint violation as a 500.
+_PARTNER_ARCHETYPES = frozenset(
+    {
+        "curated_marketplace",
+        "agency",
+        "affiliate",
+        "platform",
+        "protocol_partner",
+        "other",
+    }
+)
+_PARTNER_STATUSES = frozenset({"pending", "active", "inactive", "suspended"})
+_RATE_SCOPES = frozenset({"A", "B", "C"})
+_GMV_TAKE_DEFINITIONS = frozenset({"gross", "net", "channel_tiered"})
+
+# Build-brief §6.4 default Scope-B rate table (basis points) by brand year.
+# Seeded on partner creation so the rev-share engine resolves non-zero rates
+# from day one — a partner with no rate rows silently earns $0 (the resolver
+# returns 0 on a schedule miss).
+_DEFAULT_RATE_BP: dict[str, dict[int, int]] = {
+    "subscription": {1: 2700, 2: 1700, 3: 700},
+    "credit_overage": {1: 1700, 2: 1200, 3: 700},
+    "gmv": {1: 3000, 2: 2200, 3: 1200},
+}
+
 
 class PartnerSubsidyIssueRequest(BaseModel):
     merchant_id: str
@@ -25,6 +52,33 @@ class PartnerSubsidyIssueRequest(BaseModel):
 
 class StripeConnectUpsertRequest(BaseModel):
     stripe_connect_account_id: str | None = None
+
+
+class PartnerCreateRequest(BaseModel):
+    """Create a channel partner with structured contract terms.
+
+    Only legal_name and archetype are required; every contract term defaults to
+    the build-brief value (migration 125). By default the standard Scope-rate
+    schedule is seeded so the partner is immediately earning-capable.
+    """
+
+    legal_name: str
+    archetype: str
+    contact_email: str | None = None
+    status: str = "pending"
+    term_start_date: date | None = None
+    term_months: int = 12
+    term_auto_renew: bool = True
+    per_brand_tail_months: int = 36
+    churn_clawback_days: int = 90
+    nonpayment_clawback_days: int = 60
+    per_brand_subsidy_cap_cents: int | None = 500000
+    gmv_take_rate_bp: int = 1000
+    active_rate_scope: str = "B"
+    gmv_take_definition: str = "net"
+    prepaid_credits_supported: bool = True
+    monthly_overage_supported: bool = True
+    seed_default_rate_schedule: bool = True
 
 
 @router.get("/admin/partners")
@@ -168,6 +222,222 @@ async def get_admin_partner(
         "ytd_gmv_cents": int(_row_get(row, "ytd_gmv_cents") or 0),
         "cohort_progress": cohort_progress,
     }
+
+
+@router.post("/admin/partners", status_code=201, response_model=None)
+async def create_admin_partner(
+    body: PartnerCreateRequest,
+    current_admin: dict = Depends(require_admin),
+) -> dict[str, Any] | JSONResponse:
+    """Create a channel partner and seed its rate schedule.
+
+    Validates the enum/range fields up front (clean 400s), guards against an
+    accidental duplicate legal_name, inserts the partner, and — unless
+    `seed_default_rate_schedule` is false — seeds the standard rate table under
+    the partner's active scope so rev-share is non-zero from day one. All in one
+    transaction: a rate-seed failure rolls back the partner insert.
+    """
+
+    legal_name = (body.legal_name or "").strip()
+    error = _validate_partner_create(body, legal_name)
+    if error is not None:
+        return error
+
+    # Guard against double-submit / duplicate onboarding. inactive partners are
+    # ignored so a name can be reused after a partner is retired.
+    duplicate = await database.fetch_one(
+        """
+        SELECT id
+        FROM channel_partners
+        WHERE lower(legal_name) = lower(:legal_name)
+          AND status <> 'inactive'
+        LIMIT 1
+        """,
+        {"legal_name": legal_name},
+    )
+    if duplicate:
+        return JSONResponse(
+            status_code=409,
+            content={
+                "error": "partner_already_exists",
+                "existing_partner_id": int(_row_get(duplicate, "id")),
+            },
+        )
+
+    async with database.transaction():
+        created = await database.fetch_one(
+            """
+            INSERT INTO channel_partners (
+              legal_name, contact_email, archetype, status,
+              term_start_date, term_months, term_auto_renew,
+              per_brand_tail_months, churn_clawback_days, nonpayment_clawback_days,
+              per_brand_subsidy_cap_cents, gmv_take_rate_bp, active_rate_scope,
+              gmv_take_definition, prepaid_credits_supported, monthly_overage_supported
+            ) VALUES (
+              :legal_name, :contact_email, :archetype, :status,
+              COALESCE(:term_start_date, CURRENT_DATE), :term_months, :term_auto_renew,
+              :per_brand_tail_months, :churn_clawback_days, :nonpayment_clawback_days,
+              :per_brand_subsidy_cap_cents, :gmv_take_rate_bp, :active_rate_scope,
+              :gmv_take_definition, :prepaid_credits_supported, :monthly_overage_supported
+            )
+            RETURNING id, term_start_date
+            """,
+            {
+                "legal_name": legal_name,
+                "contact_email": (body.contact_email or None),
+                "archetype": body.archetype,
+                "status": body.status,
+                "term_start_date": body.term_start_date,
+                "term_months": body.term_months,
+                "term_auto_renew": body.term_auto_renew,
+                "per_brand_tail_months": body.per_brand_tail_months,
+                "churn_clawback_days": body.churn_clawback_days,
+                "nonpayment_clawback_days": body.nonpayment_clawback_days,
+                "per_brand_subsidy_cap_cents": body.per_brand_subsidy_cap_cents,
+                "gmv_take_rate_bp": body.gmv_take_rate_bp,
+                "active_rate_scope": body.active_rate_scope,
+                "gmv_take_definition": body.gmv_take_definition,
+                "prepaid_credits_supported": body.prepaid_credits_supported,
+                "monthly_overage_supported": body.monthly_overage_supported,
+            },
+        )
+        new_partner_id = int(_row_get(created, "id"))
+        effective_from = _row_get(created, "term_start_date")
+
+        seeded_rate_count = 0
+        if body.seed_default_rate_schedule:
+            for stream, brand_year, rate_bp in _default_rate_rows(
+                body.gmv_take_definition
+            ):
+                await database.execute(
+                    """
+                    INSERT INTO partner_rate_schedules (
+                      channel_partner_id, scope, stream, brand_year,
+                      rate_bp, effective_from, notes
+                    ) VALUES (
+                      :channel_partner_id, :scope, :stream, :brand_year,
+                      :rate_bp, :effective_from,
+                      'Seeded on partner creation (build brief §6.4 defaults)'
+                    )
+                    ON CONFLICT
+                      (channel_partner_id, scope, stream, brand_year, effective_from)
+                    DO NOTHING
+                    """,
+                    {
+                        "channel_partner_id": new_partner_id,
+                        "scope": body.active_rate_scope,
+                        "stream": stream,
+                        "brand_year": brand_year,
+                        "rate_bp": rate_bp,
+                        "effective_from": effective_from,
+                    },
+                )
+                seeded_rate_count += 1
+
+    partner = await get_admin_partner(new_partner_id, current_admin)
+    if isinstance(partner, JSONResponse):
+        return partner
+    partner["seeded_rate_schedule_count"] = seeded_rate_count
+    return partner
+
+
+def _validate_partner_create(
+    body: PartnerCreateRequest,
+    legal_name: str,
+) -> JSONResponse | None:
+    if not legal_name:
+        return _bad_request("legal_name_required", "legal_name must be non-empty")
+    if body.archetype not in _PARTNER_ARCHETYPES:
+        return _bad_request(
+            "invalid_archetype",
+            "archetype must be one of the allowed values",
+            allowed=sorted(_PARTNER_ARCHETYPES),
+        )
+    if body.status not in _PARTNER_STATUSES:
+        return _bad_request(
+            "invalid_status",
+            "status must be one of the allowed values",
+            allowed=sorted(_PARTNER_STATUSES),
+        )
+    if body.active_rate_scope not in _RATE_SCOPES:
+        return _bad_request(
+            "invalid_active_rate_scope",
+            "active_rate_scope must be A, B, or C",
+            allowed=sorted(_RATE_SCOPES),
+        )
+    if body.gmv_take_definition not in _GMV_TAKE_DEFINITIONS:
+        return _bad_request(
+            "invalid_gmv_take_definition",
+            "gmv_take_definition must be one of the allowed values",
+            allowed=sorted(_GMV_TAKE_DEFINITIONS),
+        )
+    if not (0 <= body.gmv_take_rate_bp <= 10000):
+        return _bad_request(
+            "invalid_gmv_take_rate_bp",
+            "gmv_take_rate_bp must be between 0 and 10000",
+        )
+    if body.term_months <= 0:
+        return _bad_request("invalid_term_months", "term_months must be positive")
+    if body.per_brand_tail_months <= 0:
+        return _bad_request(
+            "invalid_per_brand_tail_months",
+            "per_brand_tail_months must be positive",
+        )
+    if body.churn_clawback_days <= 0 or body.nonpayment_clawback_days <= 0:
+        return _bad_request(
+            "invalid_clawback_days",
+            "churn_clawback_days and nonpayment_clawback_days must be positive",
+        )
+    if (
+        body.per_brand_subsidy_cap_cents is not None
+        and body.per_brand_subsidy_cap_cents < 0
+    ):
+        return _bad_request(
+            "invalid_subsidy_cap",
+            "per_brand_subsidy_cap_cents must be null or non-negative",
+        )
+    if not (body.prepaid_credits_supported or body.monthly_overage_supported):
+        return _bad_request(
+            "invalid_billing_mode",
+            "at least one of prepaid_credits_supported / "
+            "monthly_overage_supported must be true",
+        )
+    return None
+
+
+def _bad_request(
+    error: str,
+    message: str,
+    *,
+    allowed: list[str] | None = None,
+) -> JSONResponse:
+    content: dict[str, Any] = {"error": error, "message": message}
+    if allowed is not None:
+        content["allowed_values"] = allowed
+    return JSONResponse(status_code=400, content=content)
+
+
+def _default_rate_rows(gmv_take_definition: str) -> list[tuple[str, int, int]]:
+    """Return (stream, brand_year, rate_bp) rows for the default seed.
+
+    The GMV stream depends on gmv_take_definition: gross/net resolve `gmv_take`,
+    channel_tiered resolves `gmv_take_personal` + `gmv_take_third_party`. Seeding
+    the wrong stream would leave the GMV share at 0.
+    """
+
+    rows: list[tuple[str, int, int]] = []
+    for stream in ("subscription", "credit_overage"):
+        for brand_year, rate_bp in _DEFAULT_RATE_BP[stream].items():
+            rows.append((stream, brand_year, rate_bp))
+
+    if gmv_take_definition == "channel_tiered":
+        gmv_streams = ("gmv_take_personal", "gmv_take_third_party")
+    else:
+        gmv_streams = ("gmv_take",)
+    for stream in gmv_streams:
+        for brand_year, rate_bp in _DEFAULT_RATE_BP["gmv"].items():
+            rows.append((stream, brand_year, rate_bp))
+    return rows
 
 
 @router.put(
