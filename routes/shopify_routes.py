@@ -180,11 +180,19 @@ async def oauth_start_legacy(merchant_id: str, shop: str, current_user: dict = D
     if current_user["role"] == "merchant" and current_user.get("merchant_id") != merchant_id:
         raise HTTPException(status_code=403, detail="Can only initiate OAuth for your own merchant_id")
 
-    client_id = settings.shopify_client_id or os.getenv("SHOPIFY_CLIENT_ID")
-    redirect_uri = settings.shopify_redirect_uri or os.getenv("SHOPIFY_REDIRECT_URI")
+    # Consolidate onto resolve_shopify_app so this legacy start path can NEVER
+    # request write scopes (the legacy `shopify_scopes` union includes
+    # write_orders + write_webhooks) under App A's read-only client id. All OAuth
+    # sources route to App A (read-only merchant tool); the write path is the
+    # custom-token /connect flow, not OAuth (audit fix #8).
+    from routes.merchant_store_connections import resolve_shopify_app
+
+    app = resolve_shopify_app("merchant_portal")
+    client_id = app.client_id or settings.shopify_client_id or os.getenv("SHOPIFY_CLIENT_ID")
+    redirect_uri = app.redirect_uri or settings.shopify_redirect_uri or os.getenv("SHOPIFY_REDIRECT_URI")
+    scopes = app.scopes or settings.shopify_scopes or os.getenv("SHOPIFY_SCOPES", "read_products")
     if not client_id or not redirect_uri:
         raise HTTPException(status_code=400, detail="Missing SHOPIFY_CLIENT_ID/SHOPIFY_REDIRECT_URI")
-    scopes = settings.shopify_scopes or os.getenv("SHOPIFY_SCOPES", "read_products")
 
     state = _generate_state(merchant_id)
     params = {
@@ -194,7 +202,7 @@ async def oauth_start_legacy(merchant_id: str, shop: str, current_user: dict = D
         "state": state,
     }
     auth_url = f"https://{shop}/admin/oauth/authorize?{urlencode(params)}"
-    logger.info(f"shopify_oauth_start merchant_id={merchant_id} shop={shop} scopes={scopes}")
+    logger.info(f"shopify_oauth_start merchant_id={merchant_id} shop={shop} scopes={scopes} app={app.label}")
     return {"authorize": auth_url, "state": state}
 
 

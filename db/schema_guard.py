@@ -142,6 +142,17 @@ REQUIRED_SCHEMA: Sequence[RequiredTableColumns] = (
         },
     ),
     RequiredTableColumns(
+        table="external_product_seeds",
+        columns={
+            # ADR-009 D3 seller-of-record threading — see migration 169.
+            # Seeds carry the seller-of-record (seller_ref) + seed_kind so the
+            # T2 attribution chain keys conversions by SELLER. NULL = pre-A9-4
+            # legacy; never assumed 'self'.
+            "seller_ref",
+            "seed_kind",
+        },
+    ),
+    RequiredTableColumns(
         table="merchant_credit_balance",
         columns={
             "purchased_credits",
@@ -819,6 +830,84 @@ async def ensure_required_schema_light() -> None:
                       updated_at         TIMESTAMPTZ NOT NULL DEFAULT NOW()
                     );
                     """
+                )
+            )
+            # ADR-009 D3 seller-of-record threading (migration 169). external
+            # seeds gain seller_ref (a catalog_merchants.merchant_id) + seed_kind
+            # ('self'|'cross'); the T2-1 redirect stamps them onto the click and
+            # T2-2 closure keys the conversion subject by seller_ref. Railway
+            # deploys skip db/migrations/, so self-heal here (167/168 idiom).
+            # Additive + nullable: NULL = pre-A9-4 legacy (never assumed 'self').
+            await database.execute(
+                text(
+                    """
+                    ALTER TABLE IF EXISTS external_product_seeds
+                      ADD COLUMN IF NOT EXISTS seller_ref TEXT,
+                      ADD COLUMN IF NOT EXISTS seed_kind TEXT;
+                    """
+                )
+            )
+            # Honesty guard for seed_kind (idempotent via DO block — mirrors the
+            # migration-167 state constraint). Only the two derived kinds; NULL
+            # allowed for legacy/pre-backfill rows.
+            await database.execute(
+                text(
+                    """
+                    DO $$
+                    BEGIN
+                        IF NOT EXISTS (
+                            SELECT 1 FROM pg_constraint
+                            WHERE conname = 'ck_external_product_seeds_seed_kind'
+                        ) THEN
+                            ALTER TABLE external_product_seeds
+                                ADD CONSTRAINT ck_external_product_seeds_seed_kind
+                                CHECK (seed_kind IS NULL OR seed_kind IN ('self', 'cross'));
+                        END IF;
+                    END $$;
+                    """
+                )
+            )
+            await database.execute(
+                text(
+                    """
+                    CREATE INDEX IF NOT EXISTS idx_external_product_seeds_seller_ref
+                      ON external_product_seeds (seller_ref)
+                      WHERE seller_ref IS NOT NULL;
+                    """
+                )
+            )
+            # GDPR/data-privacy compliance audit trail. The compliance handlers in
+            # routes/webhook_routes.py write one row per Shopify compliance webhook
+            # recording that the obligation was fulfilled (or flagged needs_review),
+            # not just logged. Railway deploys skip db/migrations/, so self-heal here
+            # (mirrors db/migrations/170_shopify_gdpr_requests.sql).
+            await database.execute(
+                text(
+                    """
+                    CREATE TABLE IF NOT EXISTS shopify_gdpr_requests (
+                      id              BIGSERIAL PRIMARY KEY,
+                      merchant_id     TEXT,
+                      shop_domain     TEXT,
+                      topic           TEXT NOT NULL,
+                      shopify_request JSONB,
+                      status          TEXT NOT NULL DEFAULT 'received',
+                      resolution      JSONB,
+                      received_at     TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                      resolved_at     TIMESTAMPTZ
+                    );
+                    """
+                )
+            )
+            await database.execute(
+                text(
+                    "CREATE INDEX IF NOT EXISTS idx_shopify_gdpr_requests_shop_domain "
+                    "ON shopify_gdpr_requests (shop_domain);"
+                )
+            )
+            await database.execute(
+                text(
+                    "CREATE INDEX IF NOT EXISTS idx_shopify_gdpr_requests_merchant "
+                    "ON shopify_gdpr_requests (merchant_id);"
                 )
             )
             return

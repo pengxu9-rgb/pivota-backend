@@ -179,3 +179,88 @@ async def test_seller_mismatch_edge_excluded_on_real_postgres():
         assert merch[M_SELLER]["transacted_count"] == 1
     finally:
         await database.disconnect()
+
+
+@pytest.mark.asyncio
+async def test_seller_ref_keyed_subject_on_real_postgres():
+    """A9-3 (ADR-009 §D3): a click whose JSONB context carries seller_ref/seed_kind
+    (threaded by T2-1 from external_product_seeds.seller_ref) closes with the edge
+    SUBJECT = seller_ref (not the anchor on the click row), passes the IDENTITY
+    seller check even when the converting host differs from the click's dest_domain
+    (the A9-1 custom-domain false-mismatch, inverted), replays idempotently on the
+    real (merchant_id, external_order_id) unique index under the seller subject,
+    and aggregates under the SELLER in aggregated_outcomes."""
+    os.environ["DATABASE_URL"] = _PG_URL
+    from sqlalchemy import create_engine
+    from db.database import database, metadata
+    from db.commerce_attribution import commerce_attribution_edges, surface_click_events
+    from db.orders import orders as orders_table
+    from services.commerce_attribution_service import close_external_order_conversion
+    from services.outcome_aggregation_service import (
+        refresh_all_outcomes,
+        ensure_aggregated_outcomes_table,
+    )
+
+    sync = _PG_URL.replace("postgresql://", "postgresql+psycopg2://", 1)
+    eng = create_engine(sync)
+    metadata.create_all(eng, tables=[surface_click_events, commerce_attribution_edges, orders_table])
+    eng.dispose()
+
+    M_ANCHOR, M_SELLER_B, P_X = "M_ANCHOR", "merch_obs_sellerb", "prodcanon_X"
+    await database.connect()
+    try:
+        await ensure_aggregated_outcomes_table()
+        for t in ("aggregated_outcomes", "commerce_attribution_edges", "surface_click_events", "orders"):
+            await database.execute(f"DELETE FROM {t}")
+
+        # CROSS seed click: column merchant_id = the ANCHOR; JSONB context carries
+        # the seed's seller-of-record. dest_domain is the seed's CUSTOM storefront
+        # domain (brand.com) — the A9-1 raw-host compare would false-mismatch this.
+        await database.execute(surface_click_events.insert().values(
+            click_id="clk_seller_ref", merchant_id=M_ANCHOR, surface="agent",
+            canonical_product_id=P_X, dest_domain="brand.com",
+            context={"seller_ref": M_SELLER_B, "seed_kind": "cross"},
+            click_count=1, impression_count=0, created_at=NOW, updated_at=NOW,
+        ))
+        # Seller B's own webhook closes (converting merchant == seller_ref) with a
+        # myshopify host != the click's custom dest host → identity match wins.
+        r1 = await close_external_order_conversion(
+            merchant_id=M_SELLER_B, click_id="clk_seller_ref", external_order_id="shop_sr1",
+            gross_amount_cents=7000, currency="USD", converted_at=NOW,
+            converting_shop_domain="sellerb.myshopify.com")
+        # Replay under the same seller subject — must hit the real UNIQUE index.
+        r2 = await close_external_order_conversion(
+            merchant_id=M_SELLER_B, click_id="clk_seller_ref", external_order_id="shop_sr1",
+            gross_amount_cents=7000, currency="USD", converted_at=NOW,
+            converting_shop_domain="sellerb.myshopify.com")
+        # A DIFFERENT merchant closing against the same seller-keyed click →
+        # identity mismatch: recorded (under the seller subject) but excluded.
+        r3 = await close_external_order_conversion(
+            merchant_id="M_IMPOSTOR", click_id="clk_seller_ref", external_order_id="shop_sr2",
+            gross_amount_cents=99999, currency="USD", converted_at=NOW,
+            converting_shop_domain="impostor.myshopify.com")
+
+        await refresh_all_outcomes()
+        merch = {r["subject_key"]: dict(r) for r in await database.fetch_all(
+            "SELECT * FROM aggregated_outcomes WHERE subject_type='merchant'")}
+        edge = await database.fetch_one(
+            "SELECT merchant_id, metadata->>'seller_ref' AS sr, "
+            "metadata->>'converting_merchant_id' AS cm "
+            "FROM commerce_attribution_edges WHERE external_order_id = 'shop_sr1'")
+        conv = await database.fetch_one(
+            "SELECT count(*) c FROM commerce_attribution_edges WHERE state='converted'")
+
+        # Subject = seller_ref; identity match despite host difference (A9-1 inverted).
+        assert r1 and r1["seller_mismatch"] is False and r1["merchant_id"] == M_SELLER_B
+        assert edge["merchant_id"] == M_SELLER_B
+        assert edge["sr"] == M_SELLER_B and edge["cm"] == M_SELLER_B
+        # Replay idempotent under the new subject (real unique index).
+        assert r2 and r2.get("replayed") is True
+        assert conv["c"] == 2, "replay must not create a duplicate edge under the seller subject"
+        # Impostor close: subject still the seller, but mismatch-stamped + excluded.
+        assert r3 and r3["seller_mismatch"] is True and r3["merchant_id"] == M_SELLER_B
+        assert merch[M_SELLER_B]["gmv_cents"] == 7000, "identity-mismatch close must not inflate the seller's outcomes"
+        assert merch[M_SELLER_B]["transacted_count"] == 1
+        assert M_ANCHOR not in merch, "the anchor must NOT receive the cross-seed conversion"
+    finally:
+        await database.disconnect()

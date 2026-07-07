@@ -3931,6 +3931,8 @@ async def _handle_offers_resolve(
                     variant_id=redirect_identity["variant_id"],
                     shop_domain=redirect_identity["shop_domain"],
                     platform=redirect_identity["platform"],
+                    seller_ref=redirect_identity["seller_ref"],
+                    seed_kind=redirect_identity["seed_kind"],
                 )
                 if not redirect_url:
                     continue
@@ -6401,12 +6403,25 @@ def _external_seed_redirect_identity(
             row.get("destination_url") or seed_data.get("destination_url") or row.get("canonical_url")
         ) or None
 
+    # ADR-009 D3 (docs/adr/ADR-009-seller-of-record-identity.md; IDENTITY_REFERENCE
+    # §4): carry the seed's stored seller-of-record (seller_ref) + seed_kind so the
+    # T2-1 redirect stamps them into the signed token ctx alongside the ANCHOR
+    # merchant_id above. T2-2 closure keys the conversion SUBJECT by seller_ref;
+    # the anchor stays a separate surface dimension. Read-only here — the value is
+    # DERIVED AT WRITE TIME (services/seller_identity.derive_seed_seller) and stored
+    # on the row, so the hot redirect path does no minting. NULL (legacy/pre-A9-4
+    # rows) threads through as None and closure stamps seller_ref_missing.
+    seller_ref = str(row.get("seller_ref") or seed_data.get("seller_ref") or "").strip() or None
+    seed_kind = str(row.get("seed_kind") or seed_data.get("seed_kind") or "").strip() or None
+
     return {
         "merchant_id": merchant_id,
         "platform": platform,
         "product_id": canonical_product_id,
         "variant_id": variant_id,
         "shop_domain": shop_domain,
+        "seller_ref": seller_ref,
+        "seed_kind": seed_kind,
     }
 
 
@@ -6425,6 +6440,8 @@ async def _make_external_redirect_url(
     platform: Optional[str] = None,
     quantity: int = 1,
     click_id: Optional[str] = None,
+    seller_ref: Optional[str] = None,
+    seed_kind: Optional[str] = None,
 ) -> Optional[str]:
     if not destination_url.startswith(("http://", "https://")):
         return None
@@ -6489,6 +6506,16 @@ async def _make_external_redirect_url(
         enriched_ctx[PVT_PRODUCT_ID] = product_id
     if variant_id:
         enriched_ctx[PVT_VARIANT_ID] = variant_id
+    # ADR-009 D3: thread the seed's seller-of-record into the signed token ctx.
+    # record_surface_event persists the whole ctx into surface_click_events.context
+    # (JSONB), so T2-2 closure reads seller_ref/seed_kind from there — see the
+    # "column vs context" note in services/commerce_attribution_service.
+    # close_external_order_conversion. Only stamp when present: a NULL (legacy)
+    # seed threads through as absent, and closure stamps seller_ref_missing.
+    if seller_ref:
+        enriched_ctx["seller_ref"] = seller_ref
+    if seed_kind:
+        enriched_ctx["seed_kind"] = seed_kind
 
     token = make_redirect_token(
         {
@@ -6625,15 +6652,22 @@ async def _build_prefetched_external_seed_wrappers(
         utm_template = candidate.get("utm_template")
         redirect_url = str(candidate.get("external_redirect_url") or "").strip() or None
         if not redirect_url:
-            redirect_cache_key = "||".join([market, tool, destination_url, str(utm_template or "")])
+            redirect_identity = _external_seed_redirect_identity(
+                row=candidate,
+                seed_data=_ensure_seed_data_obj(candidate.get("seed_data")) or {},
+                offer_variant_id=candidate.get("variant_id"),
+            )
+            # ADR-009 D3: seller_ref/seed_kind ride in the token ctx, so a cache
+            # hit must not reuse a redirect built for a different seller. Include
+            # them in the key (cheap — read from the already-loaded row).
+            redirect_cache_key = "||".join([
+                market, tool, destination_url, str(utm_template or ""),
+                str(redirect_identity.get("seller_ref") or ""),
+                str(redirect_identity.get("seed_kind") or ""),
+            ])
             if redirect_cache_key in redirect_cache:
                 redirect_url = redirect_cache[redirect_cache_key]
             else:
-                redirect_identity = _external_seed_redirect_identity(
-                    row=candidate,
-                    seed_data=_ensure_seed_data_obj(candidate.get("seed_data")) or {},
-                    offer_variant_id=candidate.get("variant_id"),
-                )
                 redirect_url = await _make_external_redirect_url(
                     market=market,
                     tool=tool,
@@ -6646,6 +6680,8 @@ async def _build_prefetched_external_seed_wrappers(
                     variant_id=redirect_identity["variant_id"],
                     shop_domain=redirect_identity["shop_domain"],
                     platform=redirect_identity["platform"],
+                    seller_ref=redirect_identity["seller_ref"],
+                    seed_kind=redirect_identity["seed_kind"],
                 )
                 redirect_cache[redirect_cache_key] = redirect_url
         if not redirect_url:
@@ -8731,22 +8767,26 @@ async def _handle_find_products_multi(
             market = str(row_dict.get("market") or "US")
             tool = str(row_dict.get("tool") or "*")
             utm_template = row_dict.get("utm_template") or seed_data.get("utm_template")
+            redirect_identity = _external_seed_redirect_identity(
+                row=row_dict,
+                seed_data=seed_data,
+                offer_variant_id=getattr(candidate, "variant_id", None),
+            )
+            # ADR-009 D3: include seller_ref/seed_kind in the cache key so a cache
+            # hit never reuses a redirect built for a different seller.
             redirect_cache_key = "||".join(
                 [
                     market,
                     tool,
                     str(dest),
                     str(utm_template or ""),
+                    str(redirect_identity.get("seller_ref") or ""),
+                    str(redirect_identity.get("seed_kind") or ""),
                 ]
             )
             if redirect_cache_key in external_redirect_cache:
                 redirect_url = external_redirect_cache[redirect_cache_key]
             else:
-                redirect_identity = _external_seed_redirect_identity(
-                    row=row_dict,
-                    seed_data=seed_data,
-                    offer_variant_id=getattr(candidate, "variant_id", None),
-                )
                 redirect_url = await _make_external_redirect_url(
                     market=market,
                     tool=tool,
@@ -8759,6 +8799,8 @@ async def _handle_find_products_multi(
                     variant_id=redirect_identity["variant_id"],
                     shop_domain=redirect_identity["shop_domain"],
                     platform=redirect_identity["platform"],
+                    seller_ref=redirect_identity["seller_ref"],
+                    seed_kind=redirect_identity["seed_kind"],
                 )
                 external_redirect_cache[redirect_cache_key] = redirect_url
             if not redirect_url:

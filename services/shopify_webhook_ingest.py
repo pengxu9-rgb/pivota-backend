@@ -11,6 +11,59 @@ from services.pcs_hash import chain_hash, sha256_hex
 logger = logging.getLogger(__name__)
 
 
+# PII keys stripped from order-family webhook payloads before persistence.
+# No consumer reads customer PII from pcs_shopify_webhook_events (verified in the
+# Shopify app-config audit, C6): attribution reads only note_attributes + totals.
+# Financial fields, ids, timestamps, and note_attributes are preserved.
+_PII_KEYS = frozenset(
+    {
+        "customer",
+        "email",
+        "contact_email",
+        "phone",
+        "billing_address",
+        "shipping_address",
+        "customer_locale",
+        "browser_ip",
+        "customer_url",
+    }
+)
+# Address blobs nested inside each line_item.
+_LINE_ITEM_LOCATION_KEYS = frozenset({"destination_location", "origin_location"})
+# Topics whose payloads carry customer PII.
+_PII_TOPIC_PREFIXES = ("orders/", "refunds/", "returns/")
+
+
+def _strip_order_payload_pii(payload_json: Any) -> Any:
+    """
+    Remove customer PII from an order-family webhook payload IN PLACE-safe fashion
+    (operates on the parsed dict). Deep-removes top-level PII keys, scrubs address
+    blobs nested inside line_items, and stamps `pii_stripped: true`. Non-dict
+    payloads are returned unchanged. See _PII_KEYS for the exact key set.
+    """
+    if not isinstance(payload_json, dict):
+        return payload_json
+
+    for key in list(payload_json.keys()):
+        if key in _PII_KEYS:
+            payload_json.pop(key, None)
+
+    line_items = payload_json.get("line_items")
+    if isinstance(line_items, list):
+        for item in line_items:
+            if isinstance(item, dict):
+                for loc_key in _LINE_ITEM_LOCATION_KEYS:
+                    item.pop(loc_key, None)
+
+    payload_json["pii_stripped"] = True
+    return payload_json
+
+
+def _topic_carries_pii(topic: Optional[str]) -> bool:
+    t = (topic or "").strip().lower()
+    return t.startswith(_PII_TOPIC_PREFIXES)
+
+
 def verify_shopify_hmac(*, secret: str, payload: bytes, header_hmac_base64: Optional[str]) -> bool:
     if not secret or not header_hmac_base64:
         return False
@@ -69,6 +122,13 @@ async def ingest_shopify_webhook(
         payload_json = json.loads(payload.decode("utf-8"))
     except Exception:
         payload_json = {"_raw": payload.decode("utf-8", errors="replace")}
+    # PII minimization (audit fix #6): strip customer PII from order-family
+    # payloads BEFORE persistence. payload_sha256 above is computed on the RAW
+    # bytes and is unchanged — the hash chain / idempotency still attest exactly
+    # what Shopify sent; only the stored JSONB copy is trimmed (no consumer reads
+    # customer PII from it).
+    if _topic_carries_pii(topic):
+        payload_json = _strip_order_payload_pii(payload_json)
     # NOTE: The `databases` + `asyncpg` stack expects JSON/JSONB bind params as `str`,
     # not Python `dict`. Serialize explicitly to avoid runtime 500s (and Shopify retries).
     payload_json_str = json.dumps(payload_json, ensure_ascii=False)

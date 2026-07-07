@@ -1789,6 +1789,31 @@ async def _fetch_storefront_referral_seed_candidates(
     }
 
 
+async def _derive_seed_seller_columns(
+    *,
+    attached_product_key: Optional[str],
+    brand: Optional[str],
+    destination: Optional[str],
+    source_system: str,
+) -> Tuple[Optional[str], Optional[str]]:
+    """ADR-009 D3 (docs/adr/ADR-009-seller-of-record-identity.md; IDENTITY_
+    REFERENCE §4): derive `(seller_ref, seed_kind)` for a NEW employee/ops-created
+    seed. A storefront seed pointing at the merchant's own store resolves SELF
+    (destination belongs to the anchor); a referral to another seller resolves
+    CROSS. Unresolvable → `(None, None)` (honest pre-A9-4 NULL; never 'self')."""
+    from services.seller_identity import (
+        anchor_merchant_from_product_key,
+        derive_seed_seller,
+    )
+
+    return await derive_seed_seller(
+        anchor_merchant_id=anchor_merchant_from_product_key(attached_product_key),
+        brand=brand,
+        destination_domain=destination,
+        source_system=source_system,
+    )
+
+
 async def _upsert_storefront_referral_seed_candidate(
     candidate: Dict[str, Any],
     *,
@@ -1947,6 +1972,16 @@ async def _upsert_storefront_referral_seed_candidate(
         action = "updated"
     else:
         seed_id = _seed_id()
+        # ADR-009 D3: a storefront seed's destination IS the merchant's own store
+        # → derive resolves SELF (seller_ref = the anchor merchant). NULL only if
+        # unmintable (logged loudly). New-row derivation only; the UPDATE branch
+        # above leaves an existing row's seller_ref untouched (A9-4 backfills).
+        seller_ref, seed_kind = await _derive_seed_seller_columns(
+            attached_product_key=attached_product_key or None,
+            brand=candidate.get("brand"),
+            destination=values.get("domain") or storefront_url,
+            source_system="employee_storefront_seed",
+        )
         await _execute_seed_data_stmt(
             """
             INSERT INTO external_product_seeds (
@@ -1954,18 +1989,22 @@ async def _upsert_storefront_referral_seed_candidate(
               destination_url, canonical_url, domain, title, image_url,
               price_amount, price_currency, availability,
               seed_data,
-              status, notes, created_by_employee_id, attached_product_key, attached_variant_id
+              status, notes, created_by_employee_id, attached_product_key, attached_variant_id,
+              seller_ref, seed_kind
             ) VALUES (
               :id, :external_product_id, :market, :tool, :utm_template, :partner_type, :disclosure_text,
               :destination_url, :canonical_url, :domain, :title, :image_url,
               :price_amount, :price_currency, :availability,
               :seed_data,
-              'active', :notes, :created_by_employee_id, :attached_product_key, :attached_variant_id
+              'active', :notes, :created_by_employee_id, :attached_product_key, :attached_variant_id,
+              :seller_ref, :seed_kind
             )
             """,
             {
                 **values,
                 "id": seed_id,
+                "seller_ref": seller_ref,
+                "seed_kind": seed_kind,
             },
         )
         action = "created"
@@ -2536,6 +2575,15 @@ async def _import_external_seeds_csv_text(
                     "source": "employee_seed_csv_catalog",
                 }
 
+                # ADR-009 D3: CSV-catalog seed has no anchor (attached_product_key
+                # NULL) → derive resolves CROSS to an observed seller (brand +
+                # destination domain). NULL only if unmintable (logged loudly).
+                seller_ref, seed_kind = await _derive_seed_seller_columns(
+                    attached_product_key=None,
+                    brand=brand,
+                    destination=domain or dest,
+                    source_system="employee_seed_csv_catalog",
+                )
                 await _execute_seed_data_stmt(
                     """
                     INSERT INTO external_product_seeds (
@@ -2544,6 +2592,7 @@ async def _import_external_seeds_csv_text(
                       destination_url, canonical_url, domain,
                       title, image_url, price_amount, price_currency, availability,
                       seed_data, status, notes, created_by_employee_id, attached_product_key, attached_variant_id,
+                      seller_ref, seed_kind,
                       created_at, updated_at
                     ) VALUES (
                       :id, :external_product_id, :market, :tool,
@@ -2551,6 +2600,7 @@ async def _import_external_seeds_csv_text(
                       :destination_url, :canonical_url, :domain,
                       :title, :image_url, :price_amount, :price_currency, :availability,
                       :seed_data, :status, :notes, :created_by_employee_id, :attached_product_key, :attached_variant_id,
+                      :seller_ref, :seed_kind,
                       NOW(), NOW()
                     )
                     """,
@@ -2576,6 +2626,8 @@ async def _import_external_seeds_csv_text(
                         "created_by_employee_id": created_by,
                         "attached_product_key": None,
                         "attached_variant_id": None,
+                        "seller_ref": seller_ref,
+                        "seed_kind": seed_kind,
                     },
                 )
                 created += 1
@@ -2774,6 +2826,17 @@ async def _import_external_seeds_csv_text(
                     "source": "employee_seed_csv",
                 }
 
+                # ADR-009 D3: a partner-referral CSV seed. If it attaches to a
+                # merchant's own store (attached_product_key owns the domain) it
+                # resolves SELF; otherwise CROSS to an observed seller. With no
+                # brand on this CSV shape a CROSS seed is UNRESOLVABLE → NULL +
+                # loud log (honest gap; A9-4 backfills). Never assumed 'self'.
+                seller_ref, seed_kind = await _derive_seed_seller_columns(
+                    attached_product_key=attached_product_key,
+                    brand=seed_data.get("brand"),
+                    destination=domain or dest,
+                    source_system="employee_seed_csv",
+                )
                 await _execute_seed_data_stmt(
                     """
                     INSERT INTO external_product_seeds (
@@ -2782,6 +2845,7 @@ async def _import_external_seeds_csv_text(
                       destination_url, canonical_url, domain,
                       title, image_url, price_amount, price_currency, availability,
                       seed_data, status, notes, created_by_employee_id, attached_product_key, attached_variant_id,
+                      seller_ref, seed_kind,
                       created_at, updated_at
                     ) VALUES (
                       :id, :external_product_id, :market, :tool,
@@ -2789,6 +2853,7 @@ async def _import_external_seeds_csv_text(
                       :destination_url, :canonical_url, :domain,
                       :title, :image_url, :price_amount, :price_currency, :availability,
                       :seed_data, :status, :notes, :created_by_employee_id, :attached_product_key, :attached_variant_id,
+                      :seller_ref, :seed_kind,
                       NOW(), NOW()
                     )
                     """,
@@ -2814,6 +2879,8 @@ async def _import_external_seeds_csv_text(
                         "created_by_employee_id": created_by,
                         "attached_product_key": attached_product_key,
                         "attached_variant_id": attached_variant_id or ("∅" if attached_product_key else None),
+                        "seller_ref": seller_ref,
+                        "seed_kind": seed_kind,
                     },
                 )
                 created += 1
@@ -3856,6 +3923,16 @@ async def create_external_seed(
             },
         }
 
+        # ADR-009 D3: derive the seller-of-record for this employee-created seed.
+        # SELF when it attaches to the merchant's own store (attached_product_key
+        # owns the destination); CROSS to an observed seller otherwise. NULL only
+        # if unmintable (logged loudly) — never assumed 'self'.
+        seller_ref, seed_kind = await _derive_seed_seller_columns(
+            attached_product_key=attached_product_key,
+            brand=(body.brand or "").strip() or None,
+            destination=domain or dest,
+            source_system="employee_seed",
+        )
         await _execute_seed_data_stmt(
             """
             INSERT INTO external_product_seeds (
@@ -3863,13 +3940,15 @@ async def create_external_seed(
               destination_url, canonical_url, domain, title, image_url,
               price_amount, price_currency, availability,
               seed_data,
-              status, notes, created_by_employee_id, attached_product_key, attached_variant_id
+              status, notes, created_by_employee_id, attached_product_key, attached_variant_id,
+              seller_ref, seed_kind
             ) VALUES (
               :id, :external_product_id, :market, :tool, :utm_template, :partner_type, :disclosure_text,
               :destination_url, :canonical_url, :domain, :title, :image_url,
               :price_amount, :price_currency, :availability,
               :seed_data,
-              'active', :notes, :created_by_employee_id, :attached_product_key, :attached_variant_id
+              'active', :notes, :created_by_employee_id, :attached_product_key, :attached_variant_id,
+              :seller_ref, :seed_kind
             )
             """,
             {
@@ -3893,6 +3972,8 @@ async def create_external_seed(
                 "created_by_employee_id": str(employee_id) if employee_id else None,
                 "attached_product_key": attached_product_key,
                 "attached_variant_id": attached_variant_id,
+                "seller_ref": seller_ref,
+                "seed_kind": seed_kind,
             },
         )
 

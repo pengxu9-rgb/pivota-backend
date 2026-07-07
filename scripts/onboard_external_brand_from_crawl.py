@@ -38,7 +38,7 @@ import asyncio
 import json
 import sys
 from pathlib import Path
-from typing import Any, Dict, List
+from typing import Any, Dict, List, Optional
 
 ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
@@ -54,10 +54,12 @@ from services.external_seed_servability import (
     make_external_seed_servable,
 )
 from services.pdp_scope_classifier import ScopeSignals, classify
-# ADR-009 D2 (docs/adr/ADR-009-seller-of-record-identity.md; IDENTITY_REFERENCE
-# §3 Trap T3): a crawl-onboarded brand mints its own per-brand observed
-# seller-of-record instead of landing under the banned 'external_seed' bucket.
-from services.seller_identity import ensure_observed_seller
+# ADR-009 D2/D3 (docs/adr/ADR-009-seller-of-record-identity.md; IDENTITY_REFERENCE
+# §3 Trap T3, §4): a crawl-onboarded brand mints its own per-brand observed
+# seller-of-record instead of landing under the banned 'external_seed' bucket,
+# and the seed row records that seller (seller_ref/seed_kind) so T2 attribution
+# keys conversions by seller.
+from services.seller_identity import derive_seed_seller, ensure_observed_seller
 
 TOOL = "external_brand_crawl"
 # catalog_products.platform channel for external-seed supply (matches the mirror).
@@ -90,7 +92,12 @@ async def _resolve_seller_and_key(p: Dict[str, Any]) -> tuple[str, str]:
     return merchant_id, make_catalog_product_key(merchant_id, PLATFORM, p["external_product_id"])
 
 
-async def _upsert_seed(p: Dict[str, Any]) -> None:
+async def _upsert_seed(
+    p: Dict[str, Any],
+    *,
+    seller_ref: Optional[str],
+    seed_kind: Optional[str],
+) -> None:
     seed_data = {
         "snapshot": {
             "title": p["title"], "description": p.get("description"), "brand": p.get("brand"),
@@ -100,18 +107,24 @@ async def _upsert_seed(p: Dict[str, Any]) -> None:
         "pdp_ingredients_raw": p.get("raw_inci"),
         "inci_list": p.get("raw_inci"),
     }
+    # ADR-009 D3: stamp the derived seller-of-record. A crawl-onboarded brand's
+    # destination IS its own store, so this resolves to seed_kind='self',
+    # seller_ref=<the observed seller>. NULL only if the brand/domain were
+    # unmintable (derive_seed_seller logged loudly) — never assumed 'self'.
     await database.execute(
         """
         INSERT INTO external_product_seeds
           (id, external_product_id, market, tool, domain, destination_url, title, image_url,
-           price_amount, price_currency, availability, seed_data, status)
+           price_amount, price_currency, availability, seed_data, status, seller_ref, seed_kind)
         VALUES
           (:id, :epid, :market, :tool, :domain, :url, :title, :img,
-           :price, :currency, 'in_stock', CAST(:data AS jsonb), 'active')
+           :price, :currency, 'in_stock', CAST(:data AS jsonb), 'active', :seller_ref, :seed_kind)
         ON CONFLICT (id) DO UPDATE SET
           title=EXCLUDED.title, image_url=EXCLUDED.image_url, price_amount=EXCLUDED.price_amount,
           price_currency=EXCLUDED.price_currency, market=EXCLUDED.market,
           domain=EXCLUDED.domain,
+          seller_ref=COALESCE(EXCLUDED.seller_ref, external_product_seeds.seller_ref),
+          seed_kind=COALESCE(EXCLUDED.seed_kind, external_product_seeds.seed_kind),
           seed_data=EXCLUDED.seed_data, status='active', updated_at=NOW()
         """,
         {"id": _seed_id(p["external_product_id"]), "epid": p["external_product_id"], "tool": TOOL,
@@ -119,7 +132,8 @@ async def _upsert_seed(p: Dict[str, Any]) -> None:
          "url": p.get("destination_url"), "title": p["title"], "img": p.get("image_url"),
          "price": p.get("price_amount"), "data": json.dumps(seed_data, ensure_ascii=False),
          "market": (p.get("market") or "US").strip() or "US",
-         "currency": (p.get("price_currency") or "USD").strip() or "USD"},
+         "currency": (p.get("price_currency") or "USD").strip() or "USD",
+         "seller_ref": seller_ref, "seed_kind": seed_kind},
     )
 
 
@@ -179,15 +193,27 @@ async def _resolve_pdp_scope(p: Dict[str, Any], product_key: str, self_merchant_
 
 
 async def _onboard(cohort: List[Dict[str, Any]]) -> None:
-    for p in cohort:
-        await _upsert_seed(p)
-    # ADR-009 D2: resolve-or-mint each product's per-brand observed seller BEFORE
-    # the mirror runs. The mirror derives the SAME identity (deterministic on
-    # brand + registrable domain), so the product_key stashed here matches the
+    # ADR-009 D2/D3: resolve-or-mint each product's per-brand observed seller
+    # BEFORE upserting the seed (so seller_ref/seed_kind land on the row) AND
+    # before the mirror runs. The mirror derives the SAME identity (deterministic
+    # on brand + registrable domain), so the product_key stashed here matches the
     # row the mirror writes — every downstream update targets the right PDP.
     keys: Dict[str, tuple[str, str]] = {}
     for p in cohort:
         keys[p["external_product_id"]] = await _resolve_seller_and_key(p)
+    for p in cohort:
+        merchant_id, _pk = keys[p["external_product_id"]]
+        # A crawl-onboarded brand's destination is its own store → derive resolves
+        # to ('self', <observed seller>). Using the shared derivation keeps a
+        # single write-time rule and the honest NULL path (never assume 'self').
+        seller_ref, seed_kind = await derive_seed_seller(
+            anchor_merchant_id=merchant_id,
+            brand=p.get("brand") or "",
+            destination_domain=p.get("destination_url"),
+            source_system=TOOL,
+            primary_platform=PLATFORM,
+        )
+        await _upsert_seed(p, seller_ref=seller_ref, seed_kind=seed_kind)
     inserted = await mirror_apply(max(50, len(cohort) * 3))
     print(f"mirror inserted_catalog_products={inserted}")
     for p in cohort:

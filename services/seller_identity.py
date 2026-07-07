@@ -200,3 +200,161 @@ async def ensure_observed_seller(
         },
     )
     return observed_id
+
+
+# ---------------------------------------------------------------------------
+# A9-3 (ADR-009 D3): derive the seller-of-record for a NEW external_product_seeds
+# row at write time. `docs/adr/ADR-009-seller-of-record-identity.md` §D3 +
+# `docs/IDENTITY_REFERENCE.md` §3 (Trap T3) / §4.
+#
+# The seed's identity today is the ANCHOR merchant's `attached_product_key` plus a
+# raw destination `domain`. A9-3 makes the seller explicit:
+#   - SELF  : the destination registrable domain belongs to the anchor merchant
+#             (its connected-store domains / mcp_shop_domain / catalog source_ref)
+#             → seller_ref = the anchor merchant_id, seed_kind='self'. Anchor ==
+#             seller, so attribution was already coincidentally correct.
+#   - CROSS : otherwise → seller_ref = ensure_observed_seller(brand, destination)
+#             (A9-2), seed_kind='cross'. The anchor is a surface dimension only.
+#   - UNRESOLVABLE : no destination to key a seller on, or a CROSS seed with an
+#             empty brand / non-registrable domain (ensure_observed_seller raises)
+#             → (None, None). No fallback identity is invented (founder no-fallback
+#             directive); NULL is the honest pre-A9-4 state and is backfilled by
+#             A9-4. NEVER assume 'self'.
+# ---------------------------------------------------------------------------
+
+
+def anchor_merchant_from_product_key(attached_product_key: Optional[str]) -> Optional[str]:
+    """Extract the anchor merchant_id embedded in a seed's `attached_product_key`.
+
+    STORAGE format is `prod::{merchant_id}::{platform}::{source_product_id}` (the
+    `make_catalog_product_key` double-colon form — IDENTITY_REFERENCE §2). The
+    PIPE transport form (`{merchant}|{platform}|{pid}`) is defended against too,
+    but per Trap T1 it must never be in the column. Returns None for a synthetic
+    / non-catalog key (e.g. the enrichment agent's `pk_<hash>`), which correctly
+    yields "no tenant anchor" → the seed is treated as CROSS.
+    """
+    key = str(attached_product_key or "").strip()
+    if not key:
+        return None
+    if key.startswith("prod::"):
+        parts = key.split("::")
+        # ['prod', merchant_id, platform, source_product_id...]
+        if len(parts) >= 2 and parts[1].strip():
+            return parts[1].strip()
+        return None
+    if key.count("|") >= 2:  # defensive: transport form (should not be persisted)
+        head = key.split("|", 1)[0].strip()
+        return head or None
+    return None
+
+
+async def _anchor_owns_domain(anchor_merchant_id: str, registrable: str) -> bool:
+    """True iff `registrable` (an eTLD+1) belongs to the anchor merchant.
+
+    Checks the three places a merchant's own storefront domain is recorded:
+      - `catalog_merchants.source_ref` (the index/serving subject's brand domain,
+        which is exactly what A9-2 stamps on an observed seller);
+      - `merchant_onboarding.mcp_shop_domain` (the tenant's authenticated store);
+      - `merchant_stores` connected-store domains (store_url / shop_domain).
+    Each candidate is reduced to its eTLD+1 (`etld1`) before comparison, so a
+    www./subdomain/path variant still matches. Best-effort: any DB / missing-table
+    error → False (fall through to CROSS — never guess SELF). ADR-009 D3.
+    """
+    if not anchor_merchant_id or not registrable:
+        return False
+    # catalog_merchants.source_ref (already a registrable domain for observed rows)
+    try:
+        row = await database.fetch_one(
+            "SELECT source_ref FROM catalog_merchants WHERE merchant_id = :mid",
+            {"mid": anchor_merchant_id},
+        )
+        if row and etld1(dict(row).get("source_ref")) == registrable:
+            return True
+    except Exception as exc:  # noqa: BLE001 — best-effort
+        logger.warning("seller_identity: catalog_merchants source_ref lookup failed: %s", str(exc)[:200])
+    # merchant_onboarding.mcp_shop_domain (the authenticated tenant storefront)
+    try:
+        row = await database.fetch_one(
+            "SELECT mcp_shop_domain FROM merchant_onboarding WHERE merchant_id = :mid",
+            {"mid": anchor_merchant_id},
+        )
+        if row and etld1(dict(row).get("mcp_shop_domain")) == registrable:
+            return True
+    except Exception as exc:  # noqa: BLE001 — best-effort
+        logger.warning("seller_identity: merchant_onboarding lookup failed: %s", str(exc)[:200])
+    # merchant_stores connected-store domains (the `domain` column — verified
+    # against services/external_referral_readiness._fetch_store_domains_by_merchant).
+    try:
+        rows = await database.fetch_all(
+            "SELECT domain FROM merchant_stores WHERE merchant_id = :mid AND domain IS NOT NULL",
+            {"mid": anchor_merchant_id},
+        )
+        for r in rows or []:
+            if etld1(dict(r).get("domain")) == registrable:
+                return True
+    except Exception as exc:  # noqa: BLE001 — best-effort (table/column may vary)
+        logger.warning("seller_identity: merchant_stores lookup failed: %s", str(exc)[:200])
+    return False
+
+
+async def derive_seed_seller(
+    *,
+    anchor_merchant_id: Optional[str],
+    brand: Optional[str],
+    destination_domain: Optional[str],
+    source_system: str,
+    primary_platform: Optional[str] = None,
+) -> tuple[Optional[str], Optional[str]]:
+    """Derive `(seller_ref, seed_kind)` for a NEW external_product_seeds row.
+
+    Returns:
+      - `(anchor_merchant_id, 'self')` when the destination belongs to the anchor;
+      - `(observed_seller_id, 'cross')` when it belongs to a different seller;
+      - `(None, None)` when unresolvable (leave the columns NULL — pre-A9-4 state).
+
+    ``destination_domain`` may be a bare host or a full URL; it is reduced to its
+    registrable domain here. ``anchor_merchant_id`` is the merchant whose product
+    the seed is attached to (see ``anchor_merchant_from_product_key``); pass None
+    for a standalone seed with no anchor (→ CROSS).
+
+    No-fallback (ADR-009 D3): a missing destination logs at DEBUG and returns
+    NULL (there is simply nothing to key a seller on — not an error, and A9-4
+    backfills it). A present-but-unmintable destination on a CROSS seed (empty
+    brand / non-registrable domain) logs LOUDLY (warning) and returns NULL — we
+    NEVER invent a seller and NEVER assume 'self'.
+    """
+    registrable = etld1(destination_domain)
+    if not registrable:
+        # No destination identity to key a seller on. Not an error (many legacy /
+        # content-only seed writers carry no destination) — quiet, NULL, A9-4
+        # backfills. Assuming 'self' here is exactly the crutch D3 forbids.
+        logger.debug(
+            "derive_seed_seller: no registrable destination (domain=%r) — leaving "
+            "seller_ref NULL (pre-A9-4 legacy state); ADR-009 D3",
+            destination_domain,
+        )
+        return (None, None)
+
+    anchor = str(anchor_merchant_id or "").strip() or None
+    if anchor and await _anchor_owns_domain(anchor, registrable):
+        return (anchor, "self")
+
+    try:
+        seller_ref = await ensure_observed_seller(
+            brand=brand or "",
+            domain=destination_domain or "",
+            source_system=source_system,
+            primary_platform=primary_platform,
+        )
+    except ValueError as exc:
+        # We HAD a destination but could not mint a seller (empty brand / non-
+        # registrable domain). Loud, NULL, never guessed — ADR-009 D3 no-fallback.
+        logger.warning(
+            "derive_seed_seller: UNRESOLVABLE cross-seller for brand=%r domain=%r "
+            "(%s) — leaving seller_ref NULL (ADR-009 D3 no-fallback; A9-4 backfills)",
+            brand,
+            destination_domain,
+            str(exc)[:200],
+        )
+        return (None, None)
+    return (seller_ref, "cross")

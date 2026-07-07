@@ -61,6 +61,19 @@ plumbing and must not leak into agent-facing or cross-merchant semantics.
 - **Scope:** per-merchant per-platform listing.
 - **Traps:** see **T1 (pipe transport form)** — a pipe-delimited *transport* form of the
   same triple exists and is NOT interchangeable with this storage form.
+- **A9-4 historical-format residue (ADR-009 D4.2):** the seller-of-record backfill
+  (`scripts/backfill_seller_of_record.py`) re-subjects `catalog_products.merchant_id`
+  off the `external_seed` bucket but deliberately does **NOT** re-key `product_key`
+  (ADR-009 D4.2 says "re-key `merchant_id`", not `product_key`). So a re-subjected
+  crawled row keeps `prod::external_seed::external_seed::{pid}` — the merchant segment
+  is now a HISTORICAL-FORMAT storage token, not the current owner. This is safe
+  because the decision layer keys on `content_key`/`product_group_id` (§1) and the
+  discipline is "look up by key, never parse the merchant out of it" (T1/T2/T6). The
+  one path that parses a merchant from a product key —
+  `services/crawled_inci_ingest.merchant_id_from_product_key` (feeds
+  `beauty_sku_ingredients.merchant_id` at INCI ingest) — already yields
+  `external_seed` for these rows and stays byte-identical. **MUST NOT** read
+  ownership out of a `prod::` key; join `catalog_products.merchant_id` instead.
 
 ### The PIPE transport form (`{merchant_id}|{platform}|{source_id}`)
 - **What:** a pipe-delimited rendering of the product triple used as a REPORT/EVIDENCE
@@ -137,6 +150,33 @@ partially overlap. This is the root cause behind the shared `external_seed` buck
 
 ## 4. Offer / attribution identifiers
 
+### `external_product_seeds.seller_ref` + `seed_kind` (ADR-009 D3, A9-3)
+- **What:** the seed's explicit SELLER-OF-RECORD. `seller_ref` is a
+  `catalog_merchants.merchant_id` (§3); `seed_kind` is `'self'` (destination ==
+  the anchor merchant's own store — anchor IS the seller) or `'cross'`
+  (destination is a different seller than the anchor). Derived AT WRITE TIME by
+  `services/seller_identity.derive_seed_seller` for every new-seed writer
+  (`onboard_external_brand_from_crawl`, `catalog_enrichment_agent/apply`,
+  `seed_data_writer`, and the four `routes/employee_products` seed INSERTs):
+  SELF → the anchor merchant_id; CROSS → `ensure_observed_seller(brand, dest)`
+  (A9-2); unresolvable → NULL + a loud log (never guessed).
+- **NULL = pre-A9-4 legacy** (the ~9.4k existing rows). Migration 169 adds the
+  columns (schema_guard self-heals in prod — the migration-167/168 idiom); A9-4
+  backfills the NULLs via the W1 RunFacts parity pattern. **MUST NOT** be silently
+  treated as `'self'` anywhere — every decision on a NULL seller_ref keeps today's
+  behavior and stamps an observability marker (e.g. closure's
+  `metadata.seller_ref_missing=true`) so A9-4 has a kill metric.
+- **Threaded through T2 (A9-3):** the T2-1 redirect
+  (`_external_seed_redirect_identity` / `_make_external_redirect_url`) carries
+  `seller_ref` + `seed_kind` in the signed token ctx alongside the ANCHOR
+  merchant_id; `record_surface_event` persists them into
+  `surface_click_events.context` (JSONB — reused rather than adding two columns to
+  the high-volume click table; the closure reads them back via a driver-agnostic
+  JSON coerce). T2-2 closure keys the edge's conversion SUBJECT
+  (`commerce_attribution_edges.merchant_id`) by `seller_ref`; the anchor becomes a
+  separate dimension (`metadata.converting_merchant_id`). T2-3 aggregates by
+  `merchant_id`, which now means SELLER for external edges — no SQL change.
+
 ### `external_product_seeds.attached_product_key` + `attached_variant_id`
 - **What:** binds an external seed (a referral offer) to the catalog listing it represents.
   STORAGE format is `prod::…` (verified in prod 2026-07-05: 8,004 `prod::`, 720 other/bare,
@@ -162,18 +202,30 @@ partially overlap. This is the root cause behind the shared `external_seed` buck
 - **Integrity:** `metadata.click_matched=false` edges are FORGEABLE (note_attributes is
   merchant-controllable) and are excluded from `aggregated_outcomes` (T2-3). Never widen
   that gate.
-- **ADR-009:** the edge's `merchant_id` must mean the SELLER of the conversion. Until
-  seller_ref lands, closure is only correct for self-anchored seeds (destination ==
-  anchor's own store).
-  - **Interim seller-mismatch guard (A9-1, §D3, shipped):** `close_external_order_conversion`
-    now takes `converting_shop_domain` (the caller-authenticated / polled store the
-    sale happened on) and compares its normalized host against the click's
-    `dest_domain`. Host compare is EXACT (no eTLD+1 helper exists — do not hand-roll).
-    On mismatch the edge is still recorded but stamped `metadata.seller_mismatch=true`
-    and EXCLUDED from `aggregated_outcomes` (T2-3 gate `->>'seller_mismatch' IS NOT
-    TRUE`, NULL-safe). A caller that supplies no domain stamps
-    `metadata.seller_domain_unverified=true` and is still counted (unknown is neither
-    a pass nor an exclusion) — expected only from callers predating the guard.
+- **ADR-009:** the edge's `merchant_id` means the SELLER of the conversion.
+  - **Seller-keyed subject (A9-3, §D3, shipped):** when the matched click carries a
+    `seller_ref` (threaded from the seed), `close_external_order_conversion` sets the
+    edge SUBJECT (`merchant_id`) to that `seller_ref` and UPGRADES the seller check to
+    an IDENTITY compare — the converting store's own tenant `merchant_id` (the
+    caller-authenticated/polled param) must equal `seller_ref` to count. This resolves
+    the A9-1 limitation: a seed whose destination is a custom storefront domain while
+    the webhook authenticates the `.myshopify.com` domain no longer false-mismatches,
+    because identity (not raw host) is compared. Idempotency is preserved — SELF seeds
+    keep `subject == converting merchant`; CROSS seeds re-subject to `seller_ref`, and
+    a replay under the same seller is stable (click_id → seller_ref is fixed).
+  - **Interim seller-mismatch guard (A9-1, §D3, LEGACY path):** for a click with NO
+    `seller_ref` (pre-A9-4 legacy seed), the subject stays the converting merchant and
+    `close_external_order_conversion` keeps the A9-1 host compare BYTE-IDENTICAL: it
+    takes `converting_shop_domain` (the caller-authenticated / polled store the sale
+    happened on) and compares its normalized host against the click's `dest_domain`.
+    Host compare is EXACT (no eTLD+1 helper exists — do not hand-roll). It additionally
+    stamps `metadata.seller_ref_missing=true` so A9-4 can size the un-migrated volume.
+  - On mismatch (either path) the edge is still recorded but stamped
+    `metadata.seller_mismatch=true` and EXCLUDED from `aggregated_outcomes` (T2-3 gate
+    `->>'seller_mismatch' IS NOT TRUE`, NULL-safe). A caller that supplies no domain on
+    the legacy path stamps `metadata.seller_domain_unverified=true` and is still counted
+    (unknown is neither a pass nor an exclusion) — expected only from callers predating
+    the guard.
 
 ---
 

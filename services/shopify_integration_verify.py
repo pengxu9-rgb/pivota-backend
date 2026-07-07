@@ -388,9 +388,9 @@ async def verify_shopify_integration(
         "disputes/update",
         "returns/create",
         "returns/update",
-        "customers/data_request",
-        "customers/redact",
-        "shop/redact",
+        # NOTE: compliance topics (customers/data_request, customers/redact, shop/redact)
+        # are toml/dashboard-managed app-config subscriptions and CANNOT be REST-registered
+        # (Shopify rejects them via the webhooks API → permanent `failed` noise). Omitted here.
     ]
     # Shopify access scopes UI is inconsistent across app types; instead of hard-gating on scopes,
     # we attempt registration and report failures (401/403/422) to make onboarding deterministic.

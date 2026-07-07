@@ -1255,6 +1255,7 @@ class GetStoreSupportEmailResponse(BaseModel):
 @router.post("/shopify/connect")
 async def merchant_connect_shopify(
     request: ConnectShopifyRequest,
+    http_request: Request,
     current_user: dict = Depends(get_current_user)
 ):
     """Allow merchant to connect their Shopify store"""
@@ -1540,7 +1541,53 @@ async def merchant_connect_shopify(
         
         # Legacy MCP fields have been migrated to merchant_stores table
         # No need to update merchant_onboarding anymore
-        
+
+        # Register the required order/uninstall webhooks now that credentials are
+        # stored. The custom-token connect path (App B / write-tier) is the ONLY
+        # path that holds write_webhooks, so this is the mainline for conversion
+        # closure — historically it was NEVER registered here, so orders/paid was
+        # left unsubscribed for every custom-token store (audit fix #1). We do NOT
+        # fail the connect if registration fails (credential storage already
+        # succeeded and is useful), but the gap MUST be impossible to miss: the
+        # full report is returned and, when orders/paid is not subscribed, we log
+        # at ERROR with the failure bodies. This is deliberately NOT silent
+        # best-effort — no fallback-as-pass.
+        webhooks_report: Dict[str, Any] = {"attempted": False}
+        orders_paid_subscribed = False
+        try:
+            from services.shopify_integration_verify import register_webhooks_best_effort
+
+            callback_base_url = _shopify_webhook_callback_base_url(http_request)
+            report = await register_webhooks_best_effort(
+                shop_domain=canonical_myshopify_domain,
+                access_token=effective_access_token,
+                merchant_id=request.merchant_id,
+                callback_base_url=callback_base_url,
+                topics=list(_SHOPIFY_OAUTH_REQUIRED_WEBHOOK_TOPICS),
+                api_version="2024-07",
+            )
+            webhooks_report = {"attempted": True, "callback_base_url": callback_base_url, **report}
+            # `created` is a list of {"topic", "webhook_id"}; `already_exists` is a list of topic strings.
+            created_topics = {(c or {}).get("topic") for c in (report.get("created") or [])}
+            already_topics = set(report.get("already_exists") or [])
+            orders_paid_subscribed = ("orders/paid" in created_topics) or ("orders/paid" in already_topics)
+        except Exception as e:
+            logger.error(
+                "Shopify webhook registration raised during connect merchant=%s shop=%s err=%s",
+                request.merchant_id,
+                canonical_myshopify_domain,
+                str(e)[:300],
+            )
+            webhooks_report = {"attempted": True, "error": "webhook_registration_failed", "detail": str(e)[:300]}
+
+        if not orders_paid_subscribed:
+            logger.error(
+                "Shopify connect: orders/paid NOT subscribed merchant=%s shop=%s report=%s",
+                request.merchant_id,
+                canonical_myshopify_domain,
+                json.dumps(webhooks_report, ensure_ascii=False, default=str)[:1500],
+            )
+
         return {
             "status": "success",
             "message": "Shopify store connected successfully",
@@ -1550,6 +1597,8 @@ async def merchant_connect_shopify(
             "storefront_token_present": bool(storefront_token),
             "storefront_token_verified": storefront_token_verified,
             "storefront_token_created": storefront_token_created,
+            "webhooks_ok": orders_paid_subscribed,
+            "webhooks": webhooks_report,
             "warning": None
             if storefront_token
             else "Storefront token missing: enable Storefront API for the Shopify custom app so Pivota can auto-generate it, or have support add it later.",

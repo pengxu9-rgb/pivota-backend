@@ -1,0 +1,33 @@
+# Learn more about configuring your app at https://shopify.dev/docs/apps/tools/cli/configuration
+
+client_id = "7c97247555f2ca1330705c230832b070"
+name = "Pivota"
+application_url = "https://api.pivota.cc/integrations/shopify/app"
+embedded = false
+
+[webhooks]
+# TODO(founder): toml pins 2026-01 but all backend code registers/calls 2024-07
+# (services/shopify_integration_verify.py, routes/webhook_routes.py). Pick one
+# and pin both before App A review (audit D3).
+api_version = "2026-01"
+
+  [[webhooks.subscriptions]]
+  uri = "https://api.pivota.cc/webhooks/shopify/gdpr"
+  compliance_topics = [ "customers/data_request", "customers/redact", "shop/redact" ]
+
+  # App A holds no write_webhooks scope and cannot self-register per-merchant
+  # webhooks; these app-owned subscriptions are its ONLY order-delivery path.
+  # They deliver to the static endpoint that resolves the merchant from
+  # X-Shopify-Shop-Domain (routes/webhook_routes.py POST /webhooks/shopify/orders).
+  [[webhooks.subscriptions]]
+  uri = "https://api.pivota.cc/webhooks/shopify/orders"
+  topics = [ "orders/paid", "app/uninstalled" ]
+
+[access_scopes]
+# Learn more at https://shopify.dev/docs/apps/tools/cli/configuration#access_scopes
+scopes = "read_discounts,read_fulfillments,read_orders,read_products"
+optional_scopes = [ ]
+use_legacy_install_flow = true
+
+[auth]
+redirect_urls = [ "https://api.pivota.cc/integrations/shopify/oauth/callback" ]

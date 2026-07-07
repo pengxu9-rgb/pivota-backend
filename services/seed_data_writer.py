@@ -664,6 +664,33 @@ async def _apply_merge(
         )
 
 
+async def _derive_seed_seller_from_proposal(
+    cleaned_proposal: Dict[str, Any],
+) -> Tuple[Optional[str], Optional[str]]:
+    """Derive `(seller_ref, seed_kind)` for a brand-new seed created from a
+    content proposal (ADR-009 D3). Best-effort: uses the proposal's brand +
+    destination when present; returns `(None, None)` for a content-only proposal
+    with no destination (the honest pre-A9-4 legacy state — never assumed 'self')."""
+    from services.seller_identity import (
+        anchor_merchant_from_product_key,
+        derive_seed_seller,
+    )
+
+    destination = (
+        cleaned_proposal.get("destination_url")
+        or cleaned_proposal.get("canonical_url")
+        or cleaned_proposal.get("domain")
+    )
+    return await derive_seed_seller(
+        anchor_merchant_id=anchor_merchant_from_product_key(
+            cleaned_proposal.get("attached_product_key")
+        ),
+        brand=cleaned_proposal.get("brand"),
+        destination_domain=destination,
+        source_system="seed_data_writer",
+    )
+
+
 async def _insert_new_row(
     *,
     seed_id: str,
@@ -709,6 +736,14 @@ async def _insert_new_row(
         current_lock={}, decisions=decisions, proposer=proposer
     )
 
+    # ADR-009 D3 (docs/adr/ADR-009-seller-of-record-identity.md; IDENTITY_REFERENCE
+    # §4): when a proposal creates a brand-new seed row, derive its seller-of-record
+    # if the proposal carries a destination. Content-only proposals with no
+    # destination leave seller_ref/seed_kind NULL (the honest pre-A9-4 state,
+    # backfilled by A9-4) — never assumed 'self'. Derived here, inside the same
+    # write-token transaction, so a new observed seller mint commits atomically.
+    seller_ref, seed_kind = await _derive_seed_seller_from_proposal(cleaned_proposal)
+
     async with database.transaction():
         await database.execute(
             f"SET LOCAL {WRITE_TOKEN_VAR} = '{AUTHORIZED_TOKEN}'"
@@ -716,15 +751,18 @@ async def _insert_new_row(
         await database.execute(
             """
             INSERT INTO external_product_seeds (
-                id, external_product_id, seed_data, content_lock
+                id, external_product_id, seed_data, content_lock, seller_ref, seed_kind
             ) VALUES (
                 :seed_id, :external_product_id,
                 CAST(:seed_data AS jsonb),
-                CAST(:content_lock AS jsonb)
+                CAST(:content_lock AS jsonb),
+                :seller_ref, :seed_kind
             )
             ON CONFLICT (id) DO UPDATE SET
                 seed_data = EXCLUDED.seed_data,
                 content_lock = EXCLUDED.content_lock,
+                seller_ref = COALESCE(external_product_seeds.seller_ref, EXCLUDED.seller_ref),
+                seed_kind = COALESCE(external_product_seeds.seed_kind, EXCLUDED.seed_kind),
                 updated_at = NOW()
             """,
             {
@@ -732,6 +770,8 @@ async def _insert_new_row(
                 "external_product_id": external_product_id,
                 "seed_data": json.dumps(cleaned_proposal),
                 "content_lock": json.dumps(initial_lock),
+                "seller_ref": seller_ref,
+                "seed_kind": seed_kind,
             },
         )
         await database.execute(
