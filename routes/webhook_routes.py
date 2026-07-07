@@ -20,6 +20,7 @@ from decimal import Decimal
 
 from db.orders import get_order, update_order, update_order_status, mark_order_paid, mark_order_shipped
 from db.merchant_onboarding import get_merchant_onboarding
+from utils.auth import get_current_employee
 from db.products import log_order_event
 from config.settings import settings
 from utils.logger import logger
@@ -2410,11 +2411,19 @@ async def handle_shopify_webhook(
 @router.post("/register/shopify/{merchant_id}")
 async def register_shopify_webhooks(
     merchant_id: str,
-    callback_base_url: str
+    callback_base_url: str,
+    current_user: dict = Depends(get_current_employee),
 ):
     """
     为商户注册 Shopify webhooks
-    
+
+    SECURITY: employee-authenticated only. This endpoint uses the merchant's
+    stored admin token to point that store's order webhooks (full-PII payloads)
+    at a caller-supplied callback_base_url — an unauthenticated caller could
+    re-point a store's webhooks to an attacker host. Gated to ops/employee
+    credentials, matching the equivalent ops route in
+    routes/ops_shopify_integration_routes.py. See audit fix #2.
+
     Args:
         merchant_id: 商户 ID
         callback_base_url: Webhook 回调的基础 URL（如 https://api.pivota.com）
