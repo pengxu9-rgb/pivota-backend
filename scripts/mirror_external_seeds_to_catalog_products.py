@@ -1146,6 +1146,28 @@ async def _apply(limit: int) -> int:
         if inserted_row:
             inserted += 1
 
+        # ADR-009 ratified decision 1 (no-fallback): stamp the deterministic
+        # SINGLETON product_group_id for the mirrored product (and the
+        # crawl-onboard path, which delegates to this `_apply`) so it carries a
+        # pg — the offer path keys on pg with zero branching. Runs regardless of
+        # whether the INSERT was new or a no-op (like the sku/offer chain below),
+        # so legacy mirrored rows get healed too. ON CONFLICT DO NOTHING — never
+        # overwrites a real/curated group (no auto-merge). Uses the SAME
+        # content_key the row was written with, so singleton and autogroup
+        # converge on one pg. content_key NULL → pg-NULL + observable log.
+        from services.product_group_autogrouper import (
+            ensure_singleton_group_membership as _ensure_singleton_pg,
+        )
+
+        await _ensure_singleton_pg(
+            merchant_id=seller_merchant_id,
+            platform=PLATFORM,
+            source_product_id=row_dict.get("external_product_id"),
+            content_key=make_content_key(
+                row_dict.get("mirrored_brand"), row_dict.get("title"), None,
+            ),
+        )
+
         # Phase 7d: write canonical sku + offer for this product
         # regardless of whether the catalog_products INSERT was new or
         # a no-op. The chain inserts use ON CONFLICT DO UPDATE so

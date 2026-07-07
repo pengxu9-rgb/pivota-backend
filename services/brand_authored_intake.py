@@ -146,6 +146,26 @@ async def upsert_brand_authored_catalog_row(fields: Dict[str, Any]) -> Optional[
         },
     )
     await database.execute(stmt)
+
+    # ADR-009 ratified decision 1 (no-fallback): stamp the deterministic
+    # SINGLETON product_group_id so this brand-authored product carries a pg —
+    # the offer path keys on pg with zero branching. ON CONFLICT DO NOTHING —
+    # never overwrites a real/curated group (no auto-merge). content_key NULL →
+    # pg-NULL + observable log.
+    try:
+        from services.product_group_autogrouper import (
+            ensure_singleton_group_membership,
+        )
+
+        await ensure_singleton_group_membership(
+            merchant_id=str(fields.get("merchant_id") or ""),
+            platform=str(fields.get("platform") or ""),
+            source_product_id=str(fields.get("source_product_id") or ""),
+            content_key=fields.get("content_key"),
+        )
+    except Exception as exc:  # noqa: BLE001 — best-effort; backfill is the net
+        logger.warning("singleton pg mint failed for product_key=%s — %s",
+                       fields.get("product_key"), str(exc)[:200])
     return fields.get("product_key")
 
 

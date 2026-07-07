@@ -41,6 +41,7 @@ from models.catalog import PaymentIncentiveInput
 from models.standard_product import StandardProduct, StandardProductVariant
 from services.catalog_identity import make_content_key
 from services.category_kind import resolve_category_kind
+from services.product_group_autogrouper import ensure_singleton_group_membership
 from services.fashion_field_extractor import (
     EXTRACTION_SOURCE_LLM,
     batch_extract_fashion_fields,
@@ -1103,6 +1104,18 @@ async def ingest_standard_products(
                 if audit is not None:
                     audit.record_info({"recovered_after_stale": 1})
             stats["products_ingested"] += 1
+
+            # ADR-009 ratified decision 1 (no-fallback): stamp the deterministic
+            # SINGLETON product_group_id at ingestion so every product carries a
+            # pg and the offer path keys on pg with ZERO branching. ON CONFLICT
+            # DO NOTHING — a row already in a real/curated group is untouched
+            # (no auto-merge). content_key NULL → left pg-NULL + observable log.
+            await ensure_singleton_group_membership(
+                merchant_id=merchant_id,
+                platform=platform,
+                source_product_id=source_pid,
+                content_key=content_key,
+            )
 
             # Phase O-5b live-ingest enrichment: spawn a fire-and-forget
             # LLM batched extraction for material/care/size_guide on rows
