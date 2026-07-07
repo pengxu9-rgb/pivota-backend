@@ -410,8 +410,12 @@ class SellerBackfill:
     # -- phase 1: seeds seller_ref ------------------------------------------
 
     async def run_seeds(self, report: BackfillReport) -> None:
+        # NOTE: external_product_seeds has no top-level `brand` column — brand
+        # lives inside seed_data JSON (_seed_brand falls back to it). Selecting a
+        # non-existent `brand` column crashed this phase against the prod schema
+        # (UndefinedColumnError), which is why the seeds backfill had never run.
         rows = await self.db.fetch_all(
-            "SELECT id, attached_product_key, brand, domain, destination_url, "
+            "SELECT id, attached_product_key, domain, destination_url, "
             "canonical_url, seed_data FROM external_product_seeds WHERE seller_ref IS NULL"
         )
         stats = {"scanned": 0, "self": 0, "cross_existing": 0, "cross_mint": 0,
