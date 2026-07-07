@@ -880,7 +880,7 @@ async def ensure_required_schema_light() -> None:
             # routes/webhook_routes.py write one row per Shopify compliance webhook
             # recording that the obligation was fulfilled (or flagged needs_review),
             # not just logged. Railway deploys skip db/migrations/, so self-heal here
-            # (mirrors db/migrations/169_shopify_gdpr_requests.sql).
+            # (mirrors db/migrations/170_shopify_gdpr_requests.sql).
             await database.execute(
                 text(
                     """

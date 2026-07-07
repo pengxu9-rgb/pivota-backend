@@ -1,4 +1,4 @@
--- 169_shopify_gdpr_requests.sql
+-- 170_shopify_gdpr_requests.sql
 -- Audit trail for Shopify GDPR / data-privacy compliance webhooks
 -- (customers/data_request, customers/redact, shop/redact).
 --
