@@ -23,7 +23,6 @@ from __future__ import annotations
 
 import argparse
 import asyncio
-import hashlib
 import json
 import os
 import sys
@@ -45,6 +44,15 @@ from services.catalog_identity import make_content_key
 from services.catalog_sync_service import (
     make_catalog_product_key,
     make_pivota_canonical_fields,
+)
+# Convergence P1.6: the seed→catalog_offers projection (offer id derivation +
+# field mapping + upsert) is owned by services.external_offer_dual_write so the
+# mirror and the on-demand / reconciliation paths cannot drift. This script's
+# _derive_mirror_* / _upsert_canonical_offer_for_mirror_row now delegate there.
+from services.external_offer_dual_write import (
+    derive_mirror_offer_id as _shared_offer_id,
+    derive_mirror_sku_key as _shared_sku_key,
+    upsert_catalog_offer_from_seed_row as _shared_upsert_offer,
 )
 # ADR-009 D2 (docs/adr/ADR-009-seller-of-record-identity.md) + IDENTITY_REFERENCE
 # §3 Trap T3: Path B must mint a real per-brand observed seller-of-record at
@@ -101,17 +109,16 @@ def _make_servable_enabled() -> bool:
 
 
 def _derive_mirror_sku_key(product_key: str) -> str:
-    """One canonical SKU per mirrored product. Keeps the chain
-    semantically identical to Path C (`<product_key>::canonical`)."""
-    return f"{product_key}{SKU_SUFFIX}"
+    """One canonical SKU per mirrored product (`<product_key>::canonical`).
+    Delegates to the shared projection (services.external_offer_dual_write)."""
+    return _shared_sku_key(product_key)
 
 
 def _derive_mirror_offer_id(product_key: str) -> str:
-    """Deterministic offer id keyed off product_key. Hashed so the
-    column-length limit (catalog_offers.offer_id is VARCHAR(64) per
-    schema) is safe even for long external_product_id values."""
-    digest = hashlib.sha256(product_key.encode("utf-8")).hexdigest()[:32]
-    return f"{OFFER_ID_PREFIX}{digest}"
+    """Deterministic offer id keyed off product_key. Delegates to the shared
+    projection (services.external_offer_dual_write) so the mirror and the
+    on-demand dual-write derive byte-identical offer ids."""
+    return _shared_offer_id(product_key)
 
 
 def _parse_args() -> argparse.Namespace:
@@ -470,71 +477,7 @@ async def _upsert_canonical_offer_for_mirror_row(
     `price_amount` from external_product_seeds is mapped 1:1 to all
     three pricing columns (no spread between list/effective/best on
     this path — the seed has only the displayed retailer price)."""
-    sku_key = _derive_mirror_sku_key(product_key)
-    offer_id = _derive_mirror_offer_id(product_key)
-    raw_price = row_dict.get("price_amount")
-    try:
-        list_price_value = float(raw_price) if raw_price is not None else None
-    except (TypeError, ValueError):
-        list_price_value = None
-    offer_payload = {
-        "source": "external_product_seeds_mirror_v1",
-        "destination_url": row_dict.get("destination_url"),
-        "canonical_url": row_dict.get("canonical_url"),
-        "domain": row_dict.get("domain"),
-        "external_seed_id": row_dict.get("id"),
-        "market": row_dict.get("market"),
-    }
-    await database.execute(
-        """
-        INSERT INTO catalog_offers
-          (offer_id, sku_key, product_key, merchant_id,
-           catalog_track, truth_tier, readiness_tier, offer_mode,
-           channel, availability, inventory_quantity, currency,
-           list_price, merchant_effective_price, estimated_best_price,
-           price_confidence, source_system, source_ref, offer_payload)
-        VALUES
-          (:offer_id, :sku_key, :product_key, :merchant_id,
-           :catalog_track, :truth_tier, :readiness_tier, :offer_mode,
-           :channel, :availability, :inventory_quantity, :currency,
-           :list_price, :merchant_effective_price, :estimated_best_price,
-           :price_confidence, :source_system, :source_ref,
-           CAST(:offer_payload AS jsonb))
-        ON CONFLICT (offer_id) DO UPDATE SET
-          availability = EXCLUDED.availability,
-          inventory_quantity = EXCLUDED.inventory_quantity,
-          currency = EXCLUDED.currency,
-          list_price = EXCLUDED.list_price,
-          merchant_effective_price = EXCLUDED.merchant_effective_price,
-          estimated_best_price = EXCLUDED.estimated_best_price,
-          price_confidence = EXCLUDED.price_confidence,
-          offer_payload = EXCLUDED.offer_payload,
-          updated_at = NOW()
-        """,
-        {
-            "offer_id": offer_id,
-            "sku_key": sku_key,
-            "product_key": product_key,
-            "merchant_id": merchant_id,
-            "catalog_track": CATALOG_TRACK,
-            "truth_tier": TRUTH_TIER,
-            "readiness_tier": READINESS_TIER,
-            "offer_mode": OFFER_MODE,
-            "channel": "external_referral",
-            "availability": row_dict.get("availability"),
-            "inventory_quantity": None,
-            "currency": row_dict.get("price_currency") or "USD",
-            "list_price": list_price_value,
-            "merchant_effective_price": list_price_value,
-            "estimated_best_price": list_price_value,
-            "price_confidence": (
-                str(PRICE_CONFIDENCE_AT_MIRROR) if list_price_value is not None else None
-            ),
-            "source_system": SOURCE_SYSTEM,
-            "source_ref": row_dict.get("id"),
-            "offer_payload": json.dumps(offer_payload, ensure_ascii=False, default=_json_default),
-        },
-    )
+    await _shared_upsert_offer(product_key, row_dict, merchant_id)
 
 
 def _compute_mirror_lifecycle_stage(

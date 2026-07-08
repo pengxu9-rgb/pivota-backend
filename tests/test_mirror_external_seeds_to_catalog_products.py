@@ -27,6 +27,9 @@ from scripts.mirror_external_seeds_to_catalog_products import (  # noqa: E402
     resolve_mirror_category_metadata,
 )
 import scripts.mirror_external_seeds_to_catalog_products as mirror_module  # noqa: E402
+# P1.6: the offer upsert delegates to the shared projection module, so the offer
+# tests patch the database there (the sku/merchant writes stay in mirror_module).
+import services.external_offer_dual_write as dual_write_module  # noqa: E402
 
 
 def test_mirror_query_includes_attached_seed_rows() -> None:
@@ -316,7 +319,7 @@ async def test_upsert_canonical_offer_carries_price_amount_into_three_columns(mo
         async def execute(self, sql, params):
             executed.append({"sql": str(sql), "params": dict(params)})
 
-    monkeypatch.setattr(mirror_module, "database", DummyDB())
+    monkeypatch.setattr(dual_write_module, "database", DummyDB())
 
     pk = "prod::external_seed::external_seed::ext_abc"
     row_dict = {
@@ -366,7 +369,7 @@ async def test_upsert_canonical_offer_handles_null_price_gracefully(monkeypatch)
         async def execute(self, sql, params):
             executed.append({"sql": str(sql), "params": dict(params)})
 
-    monkeypatch.setattr(mirror_module, "database", DummyDB())
+    monkeypatch.setattr(dual_write_module, "database", DummyDB())
 
     pk = "prod::external_seed::external_seed::ext_xyz"
     row_dict = {
