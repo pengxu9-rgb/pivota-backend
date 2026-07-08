@@ -41,6 +41,7 @@ from models.catalog import PaymentIncentiveInput
 from models.standard_product import StandardProduct, StandardProductVariant
 from services.catalog_identity import make_content_key
 from services.category_kind import resolve_category_kind
+from services.vertical_profiles import resolve_vertical
 from services.product_group_autogrouper import ensure_singleton_group_membership
 from services.fashion_field_extractor import (
     EXTRACTION_SOURCE_LLM,
@@ -1037,6 +1038,29 @@ async def ingest_standard_products(
                         product.product_type,
                         product.title,
                         _tags_for_ingest,
+                    ),
+                    # Durable top-level vertical (mig 173): resolved once at
+                    # intake so both this repo and the Node serving layer read the
+                    # same value. The title signal includes tags + description so a
+                    # SKU whose vertical only shows in its tags (e.g. a supplement
+                    # with a noisy fetched product_type) resolves consistently with
+                    # the report path (_resolved_vertical_for_ctx), which reads this
+                    # persisted column first. See services.vertical_profiles.
+                    "resolved_vertical": resolve_vertical(
+                        {
+                            "product_type": product.product_type,
+                            "category": product.product_type,
+                            "category_path": _cat_path,
+                        },
+                        title=" ".join(
+                            str(part)
+                            for part in (
+                                product.title,
+                                _description_for_ingest,
+                                *(_tags_for_ingest or []),
+                            )
+                            if part
+                        ),
                     ),
                     # Phase O-5b (#3): merchant-published fashion fields
                     # (Shopify metafields / admin-injected). Only set when

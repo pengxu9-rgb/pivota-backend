@@ -72,6 +72,10 @@ catalog_products = Table(
     # Durable category_kind in {skincare, haircare, supplement} (mig 151).
     # Drives claim-safety / disclaimers / serving-gate; see services.category_kind.
     Column("category_kind", String(16), nullable=True),
+    # Durable top-level vertical in {beauty, fashion, electronics, other} (mig 173).
+    # Resolved once at sync intake and read by both this repo and the Node serving
+    # layer; see services.vertical_profiles.resolve_vertical.
+    Column("resolved_vertical", String(16), nullable=True),
     Column("canonical_url", Text, nullable=True),
     Column("image_url", Text, nullable=True),
     Column("product_payload", JSONB_TYPE, nullable=True),
