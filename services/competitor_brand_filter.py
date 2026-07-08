@@ -23,7 +23,7 @@ and callers degrade to an empty list when nothing brand-like remains.
 from __future__ import annotations
 
 import re
-from typing import List
+from typing import FrozenSet, List, Optional
 
 # Single-token ingredient / actives / supplement names that are categories, not
 # brands. Grouped for readability; the rule below only fires when EVERY content
@@ -101,8 +101,12 @@ def _tokens(name: str) -> List[str]:
     return [t for t in re.split(r"[^a-z0-9]+", name.lower()) if t]
 
 
-def _is_generic_token(token: str) -> bool:
-    if token in _INGREDIENTS or token in _CATEGORY_FORM:
+def _is_generic_token(
+    token: str,
+    ingredient_tokens: FrozenSet[str],
+    form_tokens: FrozenSet[str],
+) -> bool:
+    if token in ingredient_tokens or token in form_tokens:
         return True
     # vitamin codes (d, b12, k2) and bare numbers (omega "3", "6")
     if token.isdigit() or _VITAMIN_CODE.match(token):
@@ -110,24 +114,47 @@ def _is_generic_token(token: str) -> bool:
     return False
 
 
-def is_ingredient_or_category_type(name: str) -> bool:
-    """True when `name` is a generic ingredient / supplement / actives TYPE
-    rather than a competitor brand — i.e. every content token is generic.
+def is_ingredient_or_category_type(
+    name: str,
+    *,
+    ingredient_tokens: Optional[FrozenSet[str]] = None,
+    form_tokens: Optional[FrozenSet[str]] = None,
+) -> bool:
+    """True when `name` is a generic ingredient / supplement / actives / product
+    TYPE rather than a competitor brand — i.e. every content token is generic.
 
-    Multi-word ingredient names ('hyaluronic acid', 'magnesium glycinate',
-    'vitamin b12', 'omega-3') are caught because each of their tokens is generic;
-    brands ('Thorne', 'Vital Proteins', 'The Ordinary') survive because at least
-    one token carries identity.
+    Multi-word type names ('hyaluronic acid', 'magnesium glycinate', 'omega-3',
+    and — for electronics — 'wireless earbuds', 'noise cancelling headphones')
+    are caught because each of their tokens is generic; brands ('Thorne', 'The
+    Ordinary', 'Bose', 'Shokz') survive because at least one token carries
+    identity.
+
+    `ingredient_tokens`/`form_tokens` default to the beauty sets (byte-identical
+    to pre-vertical behavior). A caller passes a vertical profile's token sets to
+    make the drop category-correct (e.g. drop 'wireless earbuds' for audio).
     """
+    ing = _INGREDIENTS if ingredient_tokens is None else ingredient_tokens
+    form = _CATEGORY_FORM if form_tokens is None else form_tokens
     content = [t for t in _tokens(name) if t not in _CONNECTIVES]
     if not content:
         return False  # connectives-only / empty — leave for the caller's checks
-    if not any(t in _INGREDIENTS or t in _CATEGORY_FORM for t in content):
+    if not any(t in ing or t in form for t in content):
         return False  # must mention at least one real ingredient/category word
-    return all(_is_generic_token(t) for t in content)
+    return all(_is_generic_token(t, ing, form) for t in content)
 
 
-def filter_competitor_brands(names: List[str]) -> List[str]:
+def filter_competitor_brands(
+    names: List[str],
+    *,
+    ingredient_tokens: Optional[FrozenSet[str]] = None,
+    form_tokens: Optional[FrozenSet[str]] = None,
+) -> List[str]:
     """Keep only competitor-brand-like names, dropping ingredient/category types.
     Order-preserving; never rewrites a name. Returns [] when nothing remains."""
-    return [n for n in names if not is_ingredient_or_category_type(str(n or ""))]
+    return [
+        n
+        for n in names
+        if not is_ingredient_or_category_type(
+            str(n or ""), ingredient_tokens=ingredient_tokens, form_tokens=form_tokens
+        )
+    ]

@@ -345,13 +345,79 @@ GENERIC_PROFILE = VerticalProfile(
     ),
 )
 
-# Phase-0 STUB. Content (head-nouns, retailer/competitor/authority tokens, brief
-# rules, health_sensitive=False) is Phase 1 — see the profile table in the scope
-# doc. Left empty on purpose so that deleting/ignoring it degrades an electronics
-# SKU to honest-generic, never to beauty.
+# Phase-1 content. Each field was re-traced to its actual consumer before being
+# filled (per the scope doc's "re-trace each table row to its call site" rule):
+#   - category_head_nouns/category_modifiers -> _category_from_title (already
+#     wired in Phase 0 to read the resolved profile);
+#   - competitor_ingredient_tokens/competitor_form_tokens -> competitor_brand_filter
+#     (drops type-name fake "brands" like "wireless earbuds");
+#   - retailer_tokens -> _competitor_is_brandlike (keeps Best Buy/Newegg out of
+#     the "category winner" panel);
+#   - authority_hosts / publisher_avoid_list / health_sensitive / brief_rules are
+#     data here; their consumers (cited-host classifier, strategic_brief) are
+#     wired in Phase 1b.
+# Audio-first (the Mojawa pilot). Generic-electronics PDP checks live in the
+# existing per-vertical branch; don't build registry inheritance yet.
+_ELECTRONICS_AUDIO_HEAD_NOUNS = frozenset({
+    "headphones", "headphone", "earbuds", "earbud", "earphones", "earphone",
+    "headset", "speaker", "speakers", "soundbar", "earpods", "buds",
+    "microphone", "amplifier", "amp", "dac", "turntable", "receiver",
+    "subwoofer", "monitors",
+})
+# Modifiers that pair before a head-noun ("wireless earbuds", "gaming headset",
+# "bluetooth speaker", "open-ear headphones").
+_ELECTRONICS_AUDIO_MODIFIERS = frozenset({
+    "wireless", "bluetooth", "wired", "gaming", "portable", "open", "over",
+    "in", "on", "noise", "true", "sport", "sports", "studio", "bookshelf",
+})
+# Category / TYPE + descriptor tokens: a competitor name built ENTIRELY of these
+# is a product type, not a brand ("wireless earbuds", "noise cancelling
+# headphones", "bone conduction earphones", "true wireless"). A real brand
+# (Bose, Sony, Shokz, JBL) carries an identity token and survives.
+_ELECTRONICS_AUDIO_TYPE_TOKENS = frozenset({
+    # type nouns
+    "headphones", "headphone", "earbuds", "earbud", "earphones", "earphone",
+    "headset", "speaker", "speakers", "soundbar", "buds", "earpods",
+    "microphone", "mic", "amplifier", "amp", "dac", "subwoofer",
+    # descriptors that make a name generic
+    "wireless", "wired", "bluetooth", "noise", "cancelling", "canceling",
+    "cancellation", "anc", "tws", "bone", "conduction", "open", "over", "in",
+    "on", "ear", "true", "portable", "waterproof", "sweatproof", "sport",
+    "sports", "gaming", "hifi", "audiophile", "stereo", "mono", "surround",
+    "wearable", "smart",
+})
+_ELECTRONICS_AUDIO_RETAILER_TOKENS = frozenset({
+    "bestbuy", "newegg", "crutchfield", "adorama", "bhphoto", "microcenter",
+    "amazon", "walmart", "costco", "target", "ebay", "aliexpress", "temu",
+})
+# Audio authority hosts — where citations are valued AND the outreach pitch-target
+# list (partner-visible quality, per the scope doc). Consumer wired in Phase 1b.
+_ELECTRONICS_AUDIO_AUTHORITY_HOSTS = (
+    "rtings.com", "soundguys.com", "head-fi.org", "whathifi.com",
+    "audiosciencereview.com", "techradar.com", "cnet.com", "theverge.com",
+    "tomsguide.com", "wirecutter.com",
+)
+# Big mainstream outlets a merchant should NOT be told to cold-pitch (brief rule,
+# Phase 1b): even a strong audio brand rarely lands these on a cold email.
+_ELECTRONICS_AUDIO_PUBLISHER_AVOID = (
+    "Wirecutter", "Rtings", "SoundGuys", "What Hi-Fi", "The Verge", "CNET",
+)
+
 ELECTRONICS_AUDIO_PROFILE = VerticalProfile(
     name="electronics_audio",
+    category_head_nouns=_ELECTRONICS_AUDIO_HEAD_NOUNS,
+    category_modifiers=_ELECTRONICS_AUDIO_MODIFIERS,
+    category_fallbacks=(),          # no beauty-style fallbacks; unknown -> ""
+    noisy_prompt_tokens=frozenset(),
+    retailer_tokens=_ELECTRONICS_AUDIO_RETAILER_TOKENS,
+    competitor_ingredient_tokens=frozenset(),   # electronics has no "ingredients"
+    competitor_form_tokens=_ELECTRONICS_AUDIO_TYPE_TOKENS,
     attribute_strategy="llm_extractor",
+    publisher_avoid_list=_ELECTRONICS_AUDIO_PUBLISHER_AVOID,
+    authority_hosts=_ELECTRONICS_AUDIO_AUTHORITY_HOSTS,
+    # Do NOT swap in electronics tokens ("battery"/"waterproof") — that would
+    # falsely flag earphones health-sensitive. Electronics is not health-sensitive.
+    health_sensitive=False,
     evidence_bindings="none",
     grounded_coverage_disclosure=(
         "grounded-evidence dimensions are unavailable for this category"
