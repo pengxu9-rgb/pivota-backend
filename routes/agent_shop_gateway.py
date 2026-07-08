@@ -9635,7 +9635,7 @@ async def _handle_find_products_multi_inner(
                     try:
                         prod = StandardProduct(**product_data)
                         prod.merchant_id = prod.merchant_id or mid
-                        merchant_products.append((prod, merchant_map.get(mid, "")))
+                        _append_merchant_candidate(prod, merchant_map.get(mid, ""), mid)
                     except Exception:
                         continue
         except Exception as e:
