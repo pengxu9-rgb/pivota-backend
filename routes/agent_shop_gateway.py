@@ -5313,6 +5313,99 @@ async def _attach_connected_product_redirects(
         logger.warning("connected-product redirect stamping failed: %s", str(e)[:160])
 
 
+def _record_gateway_decision_events(
+    result: Any,
+    *,
+    surface: str,
+    query: Optional[str] = None,
+    merchant_id: Optional[str] = None,
+    source: Optional[str] = None,
+    extra_context: Optional[Dict[str, Any]] = None,
+) -> None:
+    """Phase 0 (convergence plan): deposit the serving slate into the
+    decision-layer event store from the mainline gateway — previously the
+    highest-traffic lane emitted NO decision events, so the ledger had no
+    behavioral baseline for this surface.
+
+    Mirrors the agent_v2/agent_sdk_fixed writer pattern: stamp a decision_id
+    into result metadata (so order creation can link the funnel), then
+    fire-and-forget the event-store enqueue. Fail-soft everywhere — recording
+    can never break search. The ``protocol`` dimension is derived from the
+    request source label (mcp/acp/ucp) instead of hardcoding pdp_direct."""
+    try:
+        import uuid as _uuid
+
+        if not isinstance(result, dict):
+            return
+        # Idempotence: retry/fallback branches re-enter the wrapper with the
+        # SAME result object — one returned slate must yield exactly one
+        # decision event, so a result already stamped is never re-recorded.
+        existing_meta = result.get("metadata")
+        if isinstance(existing_meta, dict) and isinstance(existing_meta.get("decision_layer"), dict):
+            return
+        products = [p for p in (result.get("products") or []) if isinstance(p, dict)]
+
+        decision_id = str(_uuid.uuid4())
+        metadata = result.get("metadata") if isinstance(result.get("metadata"), dict) else {}
+        metadata = dict(metadata or {})
+        metadata["decision_id"] = decision_id
+        metadata["decision_layer"] = {
+            "decision_id": decision_id,
+            "correlation_source": surface,
+        }
+        result["metadata"] = metadata
+
+        from services.agent_decision_event_store import (
+            record_decision_candidates,
+            record_decision_event,
+            record_exposure_events,
+        )
+        from services.protocols import derive_protocol_for_surface
+
+        protocol = derive_protocol_for_surface(source)
+        rows = []
+        for idx, product in enumerate(products):
+            rows.append(
+                {
+                    "content_key": product.get("content_key") or product.get("product_key"),
+                    "catalog_offer_id": product.get("catalog_offer_id") or product.get("offer_id"),
+                    "position": idx,
+                    "eligibility_flags": {
+                        "merchant_id": product.get("merchant_id"),
+                        "platform": product.get("platform"),
+                        "in_stock": product.get("in_stock"),
+                        "source": product.get("source"),
+                        "has_external_redirect": bool(product.get("external_redirect_url")),
+                    },
+                    "slot": "search_result",
+                }
+            )
+
+        async def _record() -> None:
+            try:
+                await record_decision_event(
+                    decision_id=decision_id,
+                    merchant_id=merchant_id,
+                    surface=surface,
+                    channel=source,
+                    protocol=protocol,
+                    agent_context={
+                        "query": query,
+                        "source": source,
+                        "result_count": len(products),
+                        **(extra_context or {}),
+                    },
+                )
+                await record_decision_candidates(decision_id, rows)
+                await record_exposure_events(decision_id, rows)
+            except Exception:
+                logger.debug("gateway decision event enqueue failed", exc_info=True)
+
+        asyncio.create_task(_record())
+    except Exception:  # never let ledger recording break search
+        logger.debug("gateway decision event scheduling failed", exc_info=True)
+
+
 def _pivot_primary_offer(item: PivotResultItem) -> Optional[Any]:
     if not item.offers:
         return None
@@ -7184,7 +7277,7 @@ async def _handle_find_products(
     # P2b: attributed /r links on connected cards (fail-soft, additive).
     await _attach_connected_product_redirects(product_payloads, tool="find_products")
 
-    return {
+    result = {
         "products": product_payloads,
         "total": total,
         "page": page,
@@ -7194,6 +7287,14 @@ async def _handle_find_products(
             "fetched_at": datetime.utcnow().isoformat(),
         },
     }
+    # Phase 0 (convergence): merchant-scoped search also deposits its slate.
+    _record_gateway_decision_events(
+        result,
+        surface="agent_shop_gateway.find_products",
+        query=filters.query,
+        merchant_id=merchant_id,
+    )
+    return result
 
 
 async def _invoke_multi_upstream_fallback(
@@ -7318,6 +7419,18 @@ async def _handle_find_products_multi(
             await _attach_connected_product_redirects(result.get("products"), tool="find_products_multi")
     except Exception:
         pass  # never let attribution stamping break search
+    # Phase 0 (convergence): deposit the served slate into the decision-layer
+    # ledger AFTER redirect stamping so eligibility_flags see the final cards.
+    _record_gateway_decision_events(
+        result,
+        surface="agent_shop_gateway.find_products_multi",
+        query=payload.search.query if payload and payload.search else None,
+        source=(request_metadata or {}).get("source") if isinstance(request_metadata, dict) else None,
+        extra_context={
+            "page": payload.search.page if payload and payload.search else None,
+            "limit": payload.search.limit if payload and payload.search else None,
+        },
+    )
     return result
 
 
