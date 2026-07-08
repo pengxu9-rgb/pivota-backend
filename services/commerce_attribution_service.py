@@ -412,6 +412,37 @@ async def upsert_order_attribution_edge(
     return values
 
 
+async def get_order_attribution_edge_id(order_id: Optional[str]) -> Optional[str]:
+    """Return the commerce_attribution_edges.edge_id for an order if a row
+    exists, else None (convergence P0.3).
+
+    The decision-layer funnel link (agent_decision_funnel_links) carries a
+    ``commerce_attribution_edge_id`` FK to bridge a decision → the GMV-bearing
+    attribution edge, but the live writers hardcoded it to None — so
+    outcome_aggregation_service could only value decisions off the parallel
+    edge rail, never through the funnel link. This resolves the FK target
+    safely: the FK is ON DELETE SET NULL and returning only an EXISTING
+    edge_id keeps the link INSERT from aborting when an order has no edge (a
+    direct checkout with no attribution signal). One indexed lookup on
+    idx_commerce_attribution_edges_order; best-effort (any error → None)."""
+    oid = str(order_id or "").strip()
+    if not oid:
+        return None
+    try:
+        row = await database.fetch_one(
+            select(commerce_attribution_edges.c.edge_id).where(
+                commerce_attribution_edges.c.order_id == oid
+            )
+        )
+        return dict(row).get("edge_id") if row else None
+    except Exception as exc:  # noqa: BLE001 — never break the caller's flow
+        logger.warning(
+            "commerce_attribution: edge_id lookup failed order_id=%s: %s",
+            oid, str(exc)[:200],
+        )
+        return None
+
+
 # Atomic refund attribution UPDATE that handles the multi-edge fan-out case
 # correctly. v1.3 T9 stamps every commerce_attribution_edges row sharing an
 # order_id with the same gross_attributed_gmv_cents — by design (one edge per

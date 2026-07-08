@@ -995,6 +995,9 @@ async def handle_stripe_webhook(
                         extract_order_decision_linkage,
                         record_funnel_link,
                     )
+                    from services.commerce_attribution_service import (
+                        get_order_attribution_edge_id,
+                    )
 
                     linkage = extract_order_decision_linkage(result.get("metadata"))
                     funnel_event_ids = finalization.get("funnel_event_ids") or []
@@ -1007,7 +1010,13 @@ async def handle_stripe_webhook(
                                 linkage.get("decision_id"),
                                 linkage.get("checkout_decision_id"),
                             )
-                        # Only the decision links + merchant_id are written here.
+                        # P0.3: bridge the decision funnel link to the GMV-bearing
+                        # attribution edge. FK-safe — resolves only an EXISTING
+                        # edge_id (ON DELETE SET NULL), so an order with no edge
+                        # (direct checkout, no attribution signal) threads None
+                        # and the link still records. This is what lets
+                        # outcome_aggregation value the decision via the edge.
+                        edge_id = await get_order_attribution_edge_id(order_id)
                         # content_key / catalog_offer_id are deliberately omitted:
                         # they're ON DELETE RESTRICT FKs and a stale value would
                         # abort the whole link row, dropping an otherwise-valid
@@ -1016,6 +1025,7 @@ async def handle_stripe_webhook(
                         link_kwargs = {
                             "decision_id": linkage.get("decision_id"),
                             "checkout_decision_id": linkage.get("checkout_decision_id"),
+                            "commerce_attribution_edge_id": edge_id,
                             "merchant_id": merchant_id,
                         }
                         if linkage.get("protocol"):
