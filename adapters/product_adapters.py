@@ -670,6 +670,16 @@ class ShopifyProductAdapter:
             updated_at=updated_at,
             in_stock=is_in_stock,
             orderable=is_orderable,
+            # TOP-LEVEL handle, not just platform_metadata: the agent gateway
+            # serves StandardProduct(**products_cache.product_data) directly
+            # (services/product_query_service), so only top-level fields reach
+            # the card builder — the P2b redirect post-pass
+            # (_attach_connected_product_redirects) derives the merchant-store
+            # destination from connected shop domain + handle. No
+            # online_store_url here: the adapter only knows the admin-API
+            # domain; the gateway builds the destination from the connected
+            # store's domain.
+            handle=(str(sp.get("handle") or "").strip() or None),
             platform_metadata={
                 "shopify_id": sp["id"],
                 "handle": sp.get("handle"),
