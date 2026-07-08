@@ -198,16 +198,28 @@ def resolve_seed_vendor(
     return fallback or None
 
 
-# Only the columns we set; everything else (catalog_track, truth_tier,
-# readiness_tier, pdp_scope='unverified', sync_status='live', created_at, …)
-# takes its server_default — and pdp_lifecycle_stage stays NULL, so a seed is NOT
-# recalled on the transact lane until it graduates or is claimed. description +
-# image_url are OBSERVED content fields (the audit's exhaust) — they enrich the
-# seed for when it's claimed and add NO transact serving. The pivota_signature_*
-# fields (W5 P3) DO mint the offer-free citation identity: the by-signature PDP
-# read serves this seed once index_pipeline_state.index_eligible flips true
-# (which only happens when the seed passes the quality gates — a thin seed stays
+# Only the columns we set; everything else (pdp_scope='unverified',
+# sync_status='live', created_at, …) takes its server_default — and
+# pdp_lifecycle_stage stays NULL, so a seed is NOT recalled on the transact
+# lane until it graduates or is claimed. description + image_url are OBSERVED
+# content fields (the audit's exhaust) — they enrich the seed for when it's
+# claimed and add NO transact serving. The pivota_signature_* fields (W5 P3)
+# DO mint the offer-free citation identity: the by-signature PDP read serves
+# this seed once index_pipeline_state.index_eligible flips true (which only
+# happens when the seed passes the quality gates — a thin seed stays
 # ineligible until E1 enrichment upgrades it).
+#
+# Convergence Phase 1.1: the tier triple is stamped EXPLICITLY. The DB
+# server-defaults (internal_merchant/primary/commerce_ready, db/catalog.py)
+# describe a FIRST-PARTY SYNCED product; an audit seed is an OBSERVED,
+# unclaimed record and must carry the same honest triple as the external-seed
+# mirror door (external_referral/observed/referral_only). Insert-only: the
+# ON CONFLICT branch never re-asserts tiers, so a row a future graduation
+# ladder has advanced is never downgraded by a re-audit.
+_AUDIT_SEED_CATALOG_TRACK = "external_referral"
+_AUDIT_SEED_TRUTH_TIER = "observed"
+_AUDIT_SEED_READINESS_TIER = "referral_only"
+
 _CATALOG_INSERT_COLUMNS = (
     "product_key", "merchant_id", "platform", "source_product_id",
     "title", "brand", "content_key", "canonical_url", "source_domain",
@@ -553,6 +565,11 @@ async def upsert_audited_sku_to_index(
         from db.database import database
 
         values = {k: fields.get(k) for k in _CATALOG_INSERT_COLUMNS}
+        # Phase 1.1: honest tier triple on INSERT only (see comment at
+        # _AUDIT_SEED_* above) — never in the ON CONFLICT set_.
+        values["catalog_track"] = _AUDIT_SEED_CATALOG_TRACK
+        values["truth_tier"] = _AUDIT_SEED_TRUTH_TIER
+        values["readiness_tier"] = _AUDIT_SEED_READINESS_TIER
         stmt = _pg_insert(catalog_products).values(**values)
         stmt = stmt.on_conflict_do_update(
             index_elements=["product_key"],
