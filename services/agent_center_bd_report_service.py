@@ -9610,18 +9610,27 @@ def _list_value(value: Any) -> List[Any]:
 _RETAILER_NAME_TOKENS = BEAUTY_PROFILE.retailer_tokens
 
 
-def _competitor_is_brandlike(name: str) -> bool:
+def _competitor_is_brandlike(name: str, *, profile: VerticalProfile = BEAUTY_PROFILE) -> bool:
     """True when `name` is a plausible competing brand/product — not an
     ingredient/category type, a gray-market/secondhand marketplace, or a
     retailer/marketplace store. The 'category winner' panel probes 'what is
-    {name} known for', which is nonsense for a store (Coupang/Bunjang)."""
+    {name} known for', which is nonsense for a store (Coupang/Bunjang) or a
+    type name ('wireless earbuds').
+
+    `profile` selects the vertical's type/retailer vocab (defaults to beauty =
+    byte-identical); electronics drops 'wireless earbuds' as a type and
+    'Best Buy'/'Newegg' as retailers."""
     cleaned = str(name or "").strip()
-    if not cleaned or is_ingredient_or_category_type(cleaned):
+    if not cleaned or is_ingredient_or_category_type(
+        cleaned,
+        ingredient_tokens=profile.competitor_ingredient_tokens,
+        form_tokens=profile.competitor_form_tokens,
+    ):
         return False
     tokens = set(re.findall(r"[a-z0-9]+", cleaned.lower()))
     from services.retailer_evidence import _GRAY_MARKET_HOST_TOKENS
 
-    if tokens & _GRAY_MARKET_HOST_TOKENS or tokens & _RETAILER_NAME_TOKENS:
+    if tokens & _GRAY_MARKET_HOST_TOKENS or tokens & profile.retailer_tokens:
         return False
     # classify_host catches registry-known retailers/marketplaces (Olive Young,
     # Amazon) even when passed as a display name.
@@ -9632,7 +9641,11 @@ def _competitor_is_brandlike(name: str) -> bool:
     return True
 
 
-def _durable_competitor_for_brief(opportunity: Mapping[str, Any]) -> Optional[str]:
+def _durable_competitor_for_brief(
+    opportunity: Mapping[str, Any],
+    *,
+    profile: VerticalProfile = BEAUTY_PROFILE,
+) -> Optional[str]:
     counts: Counter = Counter()
     opportunity_map = opportunity if isinstance(opportunity, Mapping) else {}
     for row in _list_value(opportunity_map.get("per_prompt")):
@@ -9648,7 +9661,7 @@ def _durable_competitor_for_brief(opportunity: Mapping[str, Any]) -> Optional[st
         for competitor in competitor_values:
             name = str(competitor or "").strip()
             # Only real competing brands.
-            if name and _competitor_is_brandlike(name):
+            if name and _competitor_is_brandlike(name, profile=profile):
                 counts[name] += 1
         # `repeated_owner` (the AI's most-repeated owner in this category answer)
         # is a real winner signal — but sku_opportunity falls back to the
@@ -9663,7 +9676,7 @@ def _durable_competitor_for_brief(opportunity: Mapping[str, Any]) -> Optional[st
             str(features.get("repeated_owner") or "").strip()
             if isinstance(features, Mapping) else ""
         )
-        if owner and _competitor_is_brandlike(owner):
+        if owner and _competitor_is_brandlike(owner, profile=profile):
             counts[owner] += 1
     if not counts:
         return None
@@ -9671,7 +9684,7 @@ def _durable_competitor_for_brief(opportunity: Mapping[str, Any]) -> Optional[st
 
     winner = _durable_competitor(counts)
     # Defense in depth: never return a store even if one out-counts the brands.
-    if winner and not _competitor_is_brandlike(winner):
+    if winner and not _competitor_is_brandlike(winner, profile=profile):
         return None
     return winner
 
@@ -9885,7 +9898,9 @@ async def _probe_durable_competitor_attributes_for_brief(
 ) -> Any:
     if not _strategic_brief_live_probe_enabled():
         return "not_assessed"
-    competitor = _durable_competitor_for_brief(opportunity)
+    competitor = _durable_competitor_for_brief(
+        opportunity, profile=_profile_for_sku_ctx(None, product)
+    )
     if not competitor:
         return "not_assessed"
     category = str(

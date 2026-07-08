@@ -235,15 +235,48 @@ def test_generic_is_default_not_beauty():
     assert get_profile("fashion").name == "generic"  # no fashion profile in Phase 0
 
 
-def test_electronics_maps_to_audio_stub_which_is_empty():
+def test_electronics_profile_has_phase1_content_and_is_not_beauty():
     prof = get_profile("electronics")
     assert prof.name == "electronics_audio"
-    # STUB: content is Phase 1. Must be empty so an electronics SKU degrades to
-    # honest-generic behavior, never to beauty.
-    assert prof.category_head_nouns == frozenset()
-    assert prof.category_fallbacks == ()
-    assert prof.retailer_tokens == frozenset()
-    assert prof.competitor_ingredient_tokens == frozenset()
+    # Phase 1 populated audio content...
+    assert "headphones" in prof.category_head_nouns
+    assert "earbuds" in prof.category_head_nouns
+    assert "earbuds" in prof.competitor_form_tokens  # type-name drop
+    assert "anc" in prof.competitor_form_tokens
+    assert "newegg" in prof.retailer_tokens
+    assert prof.health_sensitive is False           # NOT swapped to elec tokens
+    assert "rtings.com" in prof.authority_hosts
+    # ...but it is NOT beauty and keeps no beauty-style category fallbacks.
+    assert prof.category_fallbacks == ()            # unknown -> "", never "beauty supplement"
+    assert prof.competitor_ingredient_tokens == frozenset()  # electronics has no "ingredients"
+    assert "serum" not in prof.category_head_nouns
+    assert "sephora" not in prof.retailer_tokens
+
+
+def test_electronics_competitor_filter_drops_type_names_keeps_brands():
+    from services.competitor_brand_filter import filter_competitor_brands
+    prof = get_profile("electronics")
+    kept = filter_competitor_brands(
+        ["wireless earbuds", "Bose", "noise cancelling headphones", "Shokz",
+         "bone conduction earphones", "Sony WH-1000XM5"],
+        ingredient_tokens=prof.competitor_ingredient_tokens,
+        form_tokens=prof.competitor_form_tokens,
+    )
+    assert kept == ["Bose", "Shokz", "Sony WH-1000XM5"]
+
+
+def test_electronics_head_noun_and_retailer_resolution():
+    import services.agent_center_bd_report_service as R
+    prof = get_profile("electronics")
+    assert R._category_from_title(
+        "Shokz OpenRun Pro Bone Conduction Headphones", brand="Shokz", profile=prof
+    ) == "headphones"
+    assert R._competitor_is_brandlike("Bose", profile=prof) is True
+    assert R._competitor_is_brandlike("wireless earbuds", profile=prof) is False
+    assert R._competitor_is_brandlike("Newegg", profile=prof) is False
+    # beauty default unchanged
+    assert R._competitor_is_brandlike("Coupang") is False
+    assert R._competitor_is_brandlike("Thorne") is True
 
 
 def test_beauty_profile_carries_migrated_constants():
