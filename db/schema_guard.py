@@ -598,6 +598,27 @@ async def ensure_required_schema_light() -> None:
                     """
                 )
             )
+            # Sitemap list pagination index (migration 175). GET
+            # /api/canonical/products orders by this exact composite key
+            # (and keyset cursors seek on it); without the index every
+            # page sorts the whole eligible set and deep OFFSET pages
+            # trip the 4s route timeout. Migration 138's single-column
+            # content_changed_at index never got a schema_guard entry,
+            # so prod had no index behind this sort until this one.
+            await database.execute(
+                text(
+                    """
+                    CREATE INDEX IF NOT EXISTS idx_catalog_products_sitemap_keyset
+                      ON catalog_products (
+                        content_changed_at DESC,
+                        pivota_signature_id ASC,
+                        content_key ASC,
+                        product_key ASC
+                      )
+                      WHERE pivota_signature_id LIKE 'sig_%' AND content_key IS NOT NULL;
+                    """
+                )
+            )
             # Phase O-5b: structured fashion fields + per-field provenance
             # (migration 094_catalog_fashion_fields.sql). Production
             # fast-mode startup skips db/migrations/, so schema_guard owns
