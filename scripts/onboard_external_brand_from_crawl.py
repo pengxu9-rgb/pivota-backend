@@ -16,6 +16,15 @@ Per product it does:
   5. make_external_seed_servable: attached_product_key back-link + quality
      snapshot + agent_pdp_view refresh + recompute eligibility
 
+Before onboarding, the cohort is deduplicated (dedupe_cohort): duplicate Shopify
+listings of ONE real product — the "(Copy)"/"(Copy_T1)"/"(Convert_a)"-titled and
+`-N`/`-copy`-handled clones a merchant's admin accumulates — collapse to a single
+canonical (clean title, clean handle, oldest listing). Only the canonical is
+seeded; each skipped clone's already-active seed is deactivated and its
+catalog_products mirror suppressed (two-mirror gotcha), so a re-crawl of a
+polluted store self-heals instead of re-creating N serving rows. See
+docs/HANDOFF_crawl_side_dedup.md.
+
 Idempotent throughout. Input: a JSON array on --file or stdin; each item:
   {external_product_id, brand, title, category_kind, product_type,
    destination_url, image_url, price_amount, description, raw_inci,
@@ -36,9 +45,10 @@ from __future__ import annotations
 import argparse
 import asyncio
 import json
+import re
 import sys
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
@@ -68,6 +78,158 @@ PLATFORM = "external_seed"
 
 def _seed_id(epid: str) -> str:
     return f"{TOOL}::{epid}"
+
+
+# ---------------------------------------------------------------------------
+# Crawl-side dedup of duplicate Shopify listings.
+#
+# A merchant who uses Shopify's "Duplicate product" (or hand-relists) ends up
+# with several distinct product IDs for ONE real product — the copies carry
+# junk titles like "... (Copy)", "(Copy_T1)", "(Convert_a)" and handles like
+# `foo-serum-2` / `foo-serum-copy`. Each distinct title mints a distinct
+# content_key on the mirror, so the serving-side near-dup collapse (keyed on
+# content_key) can't merge them and every copy leaks into search/PLP as its own
+# serving row (see docs/HANDOFF_crawl_side_dedup.md; the Jumiso "20% NIACINAMIDE
+# High Potency Dark Spot Serum" cluster was 21 active seeds → 1).
+#
+# We collapse them at the source: group a cohort by (normalized brand, base
+# title) and seed only ONE canonical per group — preferring a clean (non-copy)
+# title, then a clean (unsuffixed) handle, then the oldest listing (smallest
+# Shopify id = the original). Grouping is deliberately by brand+title only (NOT
+# handle) so genuinely-distinct products are never merged; the handle is used
+# only to pick the winner inside an already-established duplicate group.
+# ---------------------------------------------------------------------------
+
+# An opening "(Copy" / "(Convert" parenthetical anywhere in the title,
+# case-insensitive. Deliberately does NOT require a closing paren — prod has a
+# malformed leaker titled "...Dark Spot Serum (Copy_e" (no close). Mirrors the
+# heuristic in scripts/cleanup_niacinamide_test_variants.py.
+_JUNK_TITLE_RE = re.compile(r"\(\s*(?:copy|convert)", re.IGNORECASE)
+# Everything from that parenthetical to end of string — stripped to derive the
+# shared base title that copies collapse onto.
+_JUNK_TITLE_SUFFIX_RE = re.compile(r"\s*\(\s*(?:copy|convert).*$", re.IGNORECASE)
+# Trailing handle suffixes Shopify/relists append to a duplicate:
+# `-copy`, `-copy_a`, `-copy-2`, `-convert_a`, or a bare `-2` / `-3`.
+_HANDLE_DUP_SUFFIX_RE = re.compile(r"-(?:copy|convert)(?:[_-]?[a-z0-9]+)*$", re.IGNORECASE)
+_HANDLE_NUM_SUFFIX_RE = re.compile(r"-\d+$")
+_TRAILING_DIGITS_RE = re.compile(r"(\d+)$")
+
+# Mirror suppression reason for a duplicate listing whose canonical sibling is
+# seeded instead. Follows the established tombstone pattern (migrations 139/146):
+# deactivating a seed does NOT clean its catalog_products mirror, so the mirror
+# row must be suppressed explicitly.
+DUP_SUPPRESSION_REASON = "external_brand_crawl_dup_listing"
+
+
+def _norm_ws(value: Any) -> str:
+    return re.sub(r"\s+", " ", str(value or "")).strip()
+
+
+def _norm_brand(brand: Any) -> str:
+    return _norm_ws(brand).lower()
+
+
+def _is_junk_title(title: Any) -> bool:
+    return bool(_JUNK_TITLE_RE.search(str(title or "")))
+
+
+def _base_title(title: Any) -> str:
+    """Title with the '(copy…'/'(convert…' parenthetical (and everything after)
+    stripped, lowercased and whitespace-collapsed. This is the key duplicate
+    listings of one product share."""
+    return _norm_ws(_JUNK_TITLE_SUFFIX_RE.sub("", str(title or ""))).lower()
+
+
+def _handle_from_url(url: Any) -> str:
+    """Last path segment of a Shopify destination_url (…/products/<handle>),
+    lowercased, query/fragment removed. Empty string if unavailable."""
+    raw = str(url or "").split("?", 1)[0].split("#", 1)[0].rstrip("/")
+    if not raw:
+        return ""
+    return raw.rsplit("/", 1)[-1].strip().lower()
+
+
+def _base_handle(handle: str) -> str:
+    """Strip trailing duplicate suffixes (`-copy…`, `-convert…`, bare `-N`) off a
+    handle, iteratively, so `foo-serum-copy-2` and `foo-serum-2` both reduce to
+    `foo-serum`. Used only for ranking within a duplicate group, so mild
+    over-stripping is harmless."""
+    prev = None
+    cur = handle
+    while cur and cur != prev:
+        prev = cur
+        cur = _HANDLE_DUP_SUFFIX_RE.sub("", cur)
+        cur = _HANDLE_NUM_SUFFIX_RE.sub("", cur)
+    return cur
+
+
+def _numeric_id(epid: str) -> int:
+    """Trailing digit run of the external_product_id (the Shopify product id).
+    Smaller = created earlier = the original listing. Non-numeric ids sort last
+    but remain stable via the epid tiebreak."""
+    m = _TRAILING_DIGITS_RE.search(epid or "")
+    return int(m.group(1)) if m else 2**63 - 1
+
+
+def _group_key(p: Dict[str, Any]) -> Optional[Tuple[str, str]]:
+    """(normalized brand, base title). None when there's no usable title — such
+    rows are never grouped (each kept as-is) so we never collapse on emptiness."""
+    base = _base_title(p.get("title"))
+    if not base:
+        return None
+    return (_norm_brand(p.get("brand")), base)
+
+
+def _canonical_rank(p: Dict[str, Any]) -> Tuple[int, int, int, str]:
+    """Sort key inside a duplicate group; smallest wins. Prefer clean title, then
+    clean handle, then the oldest (smallest Shopify id), then a stable id tiebreak."""
+    epid = str(p.get("external_product_id") or "")
+    handle = _handle_from_url(p.get("destination_url"))
+    handle_clean = 0 if (handle and _base_handle(handle) == handle) else 1
+    title_clean = 0 if not _is_junk_title(p.get("title")) else 1
+    return (title_clean, handle_clean, _numeric_id(epid), epid)
+
+
+def dedupe_cohort(
+    cohort: List[Dict[str, Any]],
+) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]], List[Tuple[Dict[str, Any], List[Dict[str, Any]]]]]:
+    """Collapse duplicate listings of one product to a single canonical.
+
+    Returns (kept, dropped, decisions):
+      - kept: one canonical per product plus every ungrouped/singleton row,
+        in original cohort order.
+      - dropped: the duplicate listings to skip (and suppress if already seeded).
+      - decisions: [(canonical, [dropped…])] for grouped products, for logging.
+
+    Pure — no DB, no I/O — so it's directly unit-testable.
+    """
+    groups: Dict[Tuple[str, str], List[int]] = {}
+    order: List[Tuple[str, str]] = []
+    for idx, p in enumerate(cohort):
+        key = _group_key(p)
+        if key is None:
+            continue
+        if key not in groups:
+            groups[key] = []
+            order.append(key)
+        groups[key].append(idx)
+
+    dropped_idx: Dict[int, int] = {}  # dropped cohort index -> canonical index
+    decisions: List[Tuple[Dict[str, Any], List[Dict[str, Any]]]] = []
+    for key in order:
+        members = groups[key]
+        if len(members) < 2:
+            continue
+        ranked = sorted(members, key=lambda i: _canonical_rank(cohort[i]))
+        canonical_i = ranked[0]
+        drops = ranked[1:]
+        for i in drops:
+            dropped_idx[i] = canonical_i
+        decisions.append((cohort[canonical_i], [cohort[i] for i in drops]))
+
+    kept = [p for i, p in enumerate(cohort) if i not in dropped_idx]
+    dropped = [p for i, p in enumerate(cohort) if i in dropped_idx]
+    return kept, dropped, decisions
 
 
 def _seed_domain(p: Dict[str, Any]) -> str:
@@ -192,7 +354,38 @@ async def _resolve_pdp_scope(p: Dict[str, Any], product_key: str, self_merchant_
     )
 
 
-async def _onboard(cohort: List[Dict[str, Any]]) -> None:
+async def _suppress_dropped_listings(dropped: List[Dict[str, Any]]) -> int:
+    """Self-heal already-polluted stores: for each duplicate listing we're now
+    skipping, deactivate any active seed row and suppress its catalog_products
+    mirror. Two-mirror gotcha — deactivating a seed does NOT tombstone its
+    mirror (the stale-catalog sweep excludes external_seed), so the mirror row
+    is suppressed explicitly via source_ref = seed id (globally unique; no
+    merchant literal needed). Both writes are idempotency-guarded, so a re-crawl
+    is a no-op once collapsed. No hard-deletes (reversible)."""
+    suppressed = 0
+    for p in dropped:
+        sid = _seed_id(p["external_product_id"])
+        await database.execute(
+            "UPDATE external_product_seeds SET status='inactive', updated_at=NOW() "
+            "WHERE id=:id AND status='active'",
+            {"id": sid},
+        )
+        await database.execute(
+            "UPDATE catalog_products SET suppression_reason=:reason, updated_at=NOW() "
+            "WHERE source_ref=:id AND suppression_reason IS NULL",
+            {"id": sid, "reason": DUP_SUPPRESSION_REASON},
+        )
+        suppressed += 1
+    return suppressed
+
+
+async def _onboard(cohort: List[Dict[str, Any]], dropped: List[Dict[str, Any]]) -> None:
+    # Collapse duplicate Shopify listings BEFORE anything else: deactivate the
+    # skipped listings' seeds + suppress their mirror rows (must precede
+    # mirror_apply so the mirror doesn't recreate them — the mirror only inserts
+    # rows for ACTIVE seeds). `cohort` is already the deduped (canonical) set.
+    suppressed = await _suppress_dropped_listings(dropped)
+    print(f"dedup: {len(cohort)} canonical, {len(dropped)} duplicate listing(s) suppressed={suppressed}")
     # ADR-009 D2/D3: resolve-or-mint each product's per-brand observed seller
     # BEFORE upserting the seed (so seller_ref/seed_kind land on the row) AND
     # before the mirror runs. The mirror derives the SAME identity (deterministic
@@ -263,19 +456,36 @@ def _load(args: argparse.Namespace) -> List[Dict[str, Any]]:
 
 async def _drive(args: argparse.Namespace) -> None:
     cohort = _load(args)
-    print(f"{'APPLY' if args.apply else 'DRY'} :: {len(cohort)} products")
+    kept, dropped, decisions = dedupe_cohort(cohort)
+    print(
+        f"{'APPLY' if args.apply else 'DRY'} :: {len(cohort)} products "
+        f"({len(kept)} canonical, {len(dropped)} duplicate listing(s) collapsed)"
+    )
+    for canonical, drops in decisions:
+        print(
+            f"  collapse {len(drops) + 1} listings of "
+            f"{canonical.get('brand')!r} / {_base_title(canonical.get('title'))!r} "
+            f"-> keep {canonical.get('external_product_id')}"
+        )
+        for d in drops:
+            print(f"      drop {d.get('external_product_id')} :: {d.get('title')}")
     if not args.apply:
-        for p in cohort:
+        for p in kept:
             print(
                 f"  would onboard {p.get('external_product_id')} "
                 f"({p.get('category_kind')}) "
                 f"{p.get('price_amount')} {p.get('price_currency') or 'USD'} "
                 f"market={p.get('market') or 'US'} :: {p.get('title')}"
             )
+        for p in dropped:
+            print(
+                f"  would SKIP dup {p.get('external_product_id')} "
+                f"(deactivate seed + suppress mirror if present) :: {p.get('title')}"
+            )
         return
     await database.connect()
     try:
-        await _onboard(cohort)
+        await _onboard(kept, dropped)
     finally:
         await database.disconnect()
 
