@@ -796,6 +796,37 @@ class WixProductAdapter:
         return None
 
     @staticmethod
+    def _storefront_page_url(wp: Dict[str, Any]) -> Optional[str]:
+        """Absolute public product-page URL from Wix ``productPageUrl``.
+
+        Wix Stores returns it either as base+path parts
+        (``{"base": "https://www.site.com/", "path": "/product-page/mug"}``)
+        or, on some payloads, a plain string. Returns None when the field is
+        absent or not an absolute URL — the attributed-redirect lane must
+        never get a fabricated destination."""
+        raw = wp.get("productPageUrl") or wp.get("product_page_url")
+        if isinstance(raw, str):
+            url = raw.strip()
+            return url if url.startswith(("http://", "https://")) else None
+        if not isinstance(raw, dict):
+            return None
+        base = str(raw.get("base") or "").strip()
+        path = str(raw.get("path") or "").strip()
+        if not base.startswith(("http://", "https://")) or not path:
+            return None
+        return base.rstrip("/") + "/" + path.lstrip("/")
+
+    @staticmethod
+    def _storefront_slug(wp: Dict[str, Any], page_url: Optional[str]) -> Optional[str]:
+        slug = str(wp.get("slug") or "").strip()
+        if slug:
+            return slug
+        if not page_url:
+            return None
+        tail = page_url.split("?", 1)[0].split("#", 1)[0].rstrip("/").rsplit("/", 1)[-1].strip()
+        return tail or None
+
+    @staticmethod
     def _extract_wix_variants(wp: Dict[str, Any]) -> List[Dict[str, Any]]:
         raw = wp.get("variants")
         if isinstance(raw, list):
@@ -817,6 +848,14 @@ class WixProductAdapter:
 
         image_url = WixProductAdapter._first_image_url(wp.get("media"))
         inventory = WixProductAdapter._stock_to_inventory(wp.get("stock"))
+
+        # Storefront identity (attributed-redirect lane): the agent gateway
+        # serves StandardProduct(**products_cache.product_data) directly, so
+        # these must land as TOP-LEVEL fields at sync time; the portal's
+        # products-v2 mapper additionally reads platform_metadata
+        # permalink/slug (see _apply_storefront_fields).
+        page_url = WixProductAdapter._storefront_page_url(wp)
+        slug = WixProductAdapter._storefront_slug(wp, page_url)
 
         name = str(wp.get("name", "Unnamed Product"))
         product_id = str(wp.get("id", "")).strip()
@@ -925,6 +964,12 @@ class WixProductAdapter:
             orderable=is_orderable,
             created_at=wp.get("dateCreated"),
             updated_at=wp.get("lastUpdated"),
+            handle=slug,
+            online_store_url=page_url,
+            platform_metadata={
+                "permalink": page_url,
+                "slug": slug,
+            },
         )
 
         # Run orderable validation
