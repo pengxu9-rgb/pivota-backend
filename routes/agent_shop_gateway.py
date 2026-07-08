@@ -5111,6 +5111,14 @@ def _standard_to_shop_product(p: StandardProduct) -> Dict[str, Any]:
         "platform": p.platform,
     }
 
+    # Storefront identity for the attributed-redirect lane (P2b): lets the
+    # post-pass derive the merchant-store PDP destination. Additive; absent for
+    # platforms whose sync captures neither (e.g. Wix today).
+    if getattr(p, "handle", None):
+        base["handle"] = p.handle
+    if getattr(p, "online_store_url", None):
+        base["online_store_url"] = p.online_store_url
+
     # Expose full image gallery so frontends can render multi-image carousels.
     if p.images:
         base["images"] = p.images
@@ -5156,6 +5164,111 @@ def _standard_to_shop_product(p: StandardProduct) -> Dict[str, Any]:
         base["all_deals"] = all_deals
 
     return base
+
+
+async def _attach_connected_product_redirects(
+    products: Any,
+    *,
+    market: Optional[str] = None,
+    tool: Optional[str] = None,
+) -> None:
+    """P2b (attributed-redirect lane): stamp signed /r attribution links onto
+    CONNECTED-merchant product cards, in place. External-seed cards are already
+    stamped at build time; connected cards previously carried no outbound link
+    at all, so agent click-outs to connected stores were unattributed.
+
+    Additive only — sets ``external_redirect_url`` when a merchant-store
+    destination is derivable: ``online_store_url``, else (Shopify) the
+    connected shop domain + ``handle``. A connected Shopify product with a
+    numeric variant id yields join_mode=cart_permalink inside the mint — an
+    ORDER-side join closable by T2-2 with zero merchant setup. Wix cards are
+    skipped until wix_sync captures a storefront URL (honest degradation).
+
+    Trust basis: the destination is the merchant's OWN connected store, so the
+    mint's domain allowlist is exactly that destination's host (the store
+    connection IS the policy) — market allowlists govern external seeds, not
+    connected merchants. Fail-soft: any error leaves cards unchanged; one
+    domain lookup per merchant and one mint per (dest, variant) per request.
+    """
+    try:
+        if not isinstance(products, list):
+            return
+        candidates = [
+            p
+            for p in products
+            if isinstance(p, dict)
+            and str(p.get("merchant_id") or "").strip()
+            and not p.get("external_redirect_url")
+            and str(p.get("source") or "") != "external_seed"
+        ]
+        if not candidates:
+            return
+        used_market = str(market or "US").strip().upper() or "US"
+        used_tool = str(tool or "*").strip() or "*"
+
+        from services.merchant_store_service import get_merchant_active_stores
+
+        shop_domains: Dict[str, str] = {}
+        for merchant_id in {str(p["merchant_id"]).strip() for p in candidates}:
+            try:
+                stores = await get_merchant_active_stores(merchant_id)
+            except Exception:
+                stores = []
+            shop = next(
+                (
+                    s
+                    for s in stores or []
+                    if str(s.get("platform") or "").strip().lower() == "shopify"
+                    and str(s.get("domain") or "").strip()
+                ),
+                None,
+            )
+            if shop:
+                shop_domains[merchant_id] = str(shop["domain"]).strip()
+
+        mint_cache: Dict[str, Optional[str]] = {}
+        for p in candidates:
+            merchant_id = str(p.get("merchant_id") or "").strip()
+            platform = str(p.get("platform") or "").strip().lower()
+            shop_domain = shop_domains.get(merchant_id)
+            dest = str(p.get("online_store_url") or "").strip()
+            handle = str(p.get("handle") or "").strip()
+            if not dest and platform == "shopify" and shop_domain and handle:
+                dest = f"https://{normalize_shop_host(shop_domain)}/products/{handle}"
+            if not dest.startswith(("http://", "https://")):
+                continue  # no derivable merchant destination (e.g. Wix today)
+
+            variant_id: Optional[str] = None
+            for v in p.get("variants") or []:
+                if isinstance(v, dict) and str(v.get("variant_id") or v.get("id") or "").strip():
+                    variant_id = str(v.get("variant_id") or v.get("id")).strip()
+                    break
+
+            cache_key = "||".join([used_market, used_tool, dest, variant_id or ""])
+            if cache_key in mint_cache:
+                redirect_url = mint_cache[cache_key]
+            else:
+                redirect_url = await _make_external_redirect_url(
+                    market=used_market,
+                    tool=used_tool,
+                    destination_url=dest,
+                    utm_template=None,
+                    ctx={"source": "connected_catalog"},
+                    # The merchant's own connected store is the trust basis. Allow both the
+                    # destination host and the connected shop domain — online_store_url may
+                    # live on a custom domain while the connection stores the .myshopify one.
+                    allowed_domains=[h for h in {normalize_shop_host(dest), normalize_shop_host(shop_domain or "")} if h],
+                    merchant_id=merchant_id,
+                    product_id=str(p.get("product_id") or p.get("id") or "").strip() or None,
+                    variant_id=variant_id,
+                    shop_domain=shop_domain,
+                    platform=platform or None,
+                )
+                mint_cache[cache_key] = redirect_url
+            if redirect_url:
+                p["external_redirect_url"] = redirect_url
+    except Exception as e:  # never let attribution stamping break search
+        logger.warning("connected-product redirect stamping failed: %s", str(e)[:160])
 
 
 def _pivot_primary_offer(item: PivotResultItem) -> Optional[Any]:
@@ -7026,6 +7139,8 @@ async def _handle_find_products(
         payment_context=None,
         market=None,
     )
+    # P2b: attributed /r links on connected cards (fail-soft, additive).
+    await _attach_connected_product_redirects(product_payloads, tool="find_products")
 
     return {
         "products": product_payloads,
@@ -7146,6 +7261,25 @@ async def _invoke_multi_upstream_fallback(
 
 
 async def _handle_find_products_multi(
+    payload: FindProductsMultiPayload,
+    request_metadata: Optional[Dict[str, Any]],
+    background_tasks: BackgroundTasks,
+) -> Dict[str, Any]:
+    """Thin wrapper over the real multi-search implementation that stamps
+    attributed /r links onto connected-merchant cards on EVERY return branch
+    (the implementation has many exits — cached, pivot, fallback, retry). P2b;
+    fail-soft and idempotent (already-stamped cards, incl. external_seed, are
+    skipped), so re-entrant retry paths that call this wrapper again are safe."""
+    result = await _handle_find_products_multi_inner(payload, request_metadata, background_tasks)
+    try:
+        if isinstance(result, dict):
+            await _attach_connected_product_redirects(result.get("products"), tool="find_products_multi")
+    except Exception:
+        pass  # never let attribution stamping break search
+    return result
+
+
+async def _handle_find_products_multi_inner(
     payload: FindProductsMultiPayload,
     request_metadata: Optional[Dict[str, Any]],
     background_tasks: BackgroundTasks,
