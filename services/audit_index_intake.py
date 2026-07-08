@@ -449,23 +449,36 @@ async def _existing_brand_canonical_conflict(
     return dict(row) if row else None
 
 
-async def apply_audit_brand_fragmentation_guard(
-    merchant_id: str, fields: Dict[str, Any]
+async def apply_intake_brand_fragmentation_guard(
+    merchant_id: str,
+    fields: Dict[str, Any],
+    *,
+    door: str = "url_audit_intake",
+    block_on_conflict: bool = True,
 ) -> Dict[str, Any]:
-    """Decide whether to mint this audit seed. Returns {action, ...}:
-      - 'proceed' : flag off, no conflict, or any error (fail-open — never block
-                    the seed on the guard's account).
-      - 'skip'    : a same-brand+host canonical exists under another merchant; a
-                    review task was enqueued and the orphan mint is suppressed.
+    """ADR-008 prevent-at-intake, shared by ALL intake doors (convergence
+    P1.4 — previously only the audit door ran it). Returns {action, ...}:
+      - 'proceed' : flag off, no conflict, or any error (fail-open — never
+                    block a record on the guard's account).
+      - 'skip'    : (block_on_conflict=True; observed-data doors: audit,
+                    seed mirror) a same-brand+host canonical exists under
+                    another merchant; a review task was enqueued and the
+                    orphan mint is suppressed.
+      - 'flag'    : (block_on_conflict=False; the FIRST-PARTY sync door) the
+                    conflict was enqueued for reconciliation but the record
+                    PROCEEDS — a connected merchant's own catalog is the
+                    higher-truth source and must never be blocked by an
+                    observed row (ADR-008 reconcile-at-connect, not
+                    block-at-connect).
     """
     if not audit_brand_fragmentation_guard_enabled(merchant_id):
         return {"action": "proceed", "reason": "disabled"}
     try:
         conflict = await _existing_brand_canonical_conflict(merchant_id, fields)
-    except Exception as exc:  # noqa: BLE001 — never block the seed on a guard error
+    except Exception as exc:  # noqa: BLE001 — never block the record on a guard error
         logger.warning(
-            "audit_intake.brand_guard lookup failed for %s: %s",
-            fields.get("product_key"), str(exc)[:200],
+            "%s.brand_guard lookup failed for %s: %s",
+            door, fields.get("product_key"), str(exc)[:200],
         )
         return {"action": "proceed", "reason": "error"}
     if not conflict:
@@ -479,6 +492,7 @@ async def apply_audit_brand_fragmentation_guard(
             "confidence": None,
             "evidence": {
                 "reason": "brand_already_canonical_under_other_merchant",
+                "door": door,
                 "conflict_merchant_id": conflict.get("merchant_id"),
                 "conflict_content_key": conflict.get("content_key"),
                 "brand": fields.get("brand"),
@@ -487,11 +501,20 @@ async def apply_audit_brand_fragmentation_guard(
         },
     )
     return {
-        "action": "skip",
+        "action": "skip" if block_on_conflict else "flag",
         "reason": "brand_fragmentation",
         "conflict_product_key": conflict.get("product_key"),
         "conflict_merchant_id": conflict.get("merchant_id"),
     }
+
+
+async def apply_audit_brand_fragmentation_guard(
+    merchant_id: str, fields: Dict[str, Any]
+) -> Dict[str, Any]:
+    """Audit-door wrapper (original call-site contract): conflict → 'skip'."""
+    return await apply_intake_brand_fragmentation_guard(
+        merchant_id, fields, door="url_audit_intake", block_on_conflict=True
+    )
 
 
 async def upsert_audited_sku_to_index(

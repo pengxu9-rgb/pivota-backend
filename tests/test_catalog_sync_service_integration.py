@@ -1494,11 +1494,22 @@ async def test_ingest_standard_products_passes_through_shopify_metafields(
     async def _noop_execute(*args, **kwargs):
         return None
 
+    class _DummyTx:
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *args):
+            return False
+
     monkeypatch.setattr(module, "_upsert_by_pk", _capture_upsert)
     monkeypatch.setattr(module, "upsert_catalog_merchant", _noop_upsert_merchant)
     monkeypatch.setattr(module, "_upsert_field_fact", _noop_upsert_field_fact)
     monkeypatch.setattr(module, "_resolve_catalog_sku_key", _generated_sku_key)
     monkeypatch.setattr(module.database, "execute", _noop_execute)
+    # Order-robustness: without a transaction stub this test only passed by
+    # inheriting connection state from earlier tests in the same session
+    # (the sibling tests at DummyTransaction already stub it).
+    monkeypatch.setattr(module.database, "transaction", lambda: _DummyTx())
 
     await module.ingest_standard_products(
         merchant_id="merch_fashion",
@@ -1567,11 +1578,20 @@ async def test_ingest_standard_products_omits_fashion_keys_when_no_metafields(
     async def _generated_sku_key(**kwargs):
         return f"sku::{kwargs.get('product_key')}::{kwargs.get('source_variant_id')}"
 
+    class _DummyTx:
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *args):
+            return False
+
     monkeypatch.setattr(module, "_upsert_by_pk", _capture_upsert)
     monkeypatch.setattr(module, "upsert_catalog_merchant", _noop)
     monkeypatch.setattr(module, "_upsert_field_fact", _noop)
     monkeypatch.setattr(module, "_resolve_catalog_sku_key", _generated_sku_key)
     monkeypatch.setattr(module.database, "execute", _noop)
+    # Order-robustness: see the transaction-stub note in the metafields test.
+    monkeypatch.setattr(module.database, "transaction", lambda: _DummyTx())
 
     await module.ingest_standard_products(
         merchant_id="merch_no_meta",
