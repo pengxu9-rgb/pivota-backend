@@ -28,6 +28,7 @@ from services.cited_host_classifier import (
     is_findability_role,
 )
 from services.competitor_brand_filter import is_ingredient_or_category_type
+from services.vertical_profiles import BEAUTY_PROFILE, VerticalProfile
 
 # Probe axes that name the SKU/brand (branded/navigational) vs the non-branded
 # category/discovery axis. Kept local so this module has no import cycle with
@@ -108,7 +109,11 @@ def _first_branded_excerpt(per_sku_reports: List[Dict[str, Any]]) -> Optional[Di
     return None
 
 
-def _who_ai_cites_instead(authority_map: Dict[str, Any]) -> Dict[str, Any]:
+def _who_ai_cites_instead(
+    authority_map: Dict[str, Any],
+    *,
+    vertical_profile: VerticalProfile = BEAUTY_PROFILE,
+) -> Dict[str, Any]:
     """The real hosts + competitors AI cites that are NOT the merchant. Strictly
     from grounded data — if nothing independent surfaced, says so explicitly."""
     hosts = authority_map.get("hosts") if isinstance(authority_map, dict) else None
@@ -164,7 +169,11 @@ def _who_ai_cites_instead(authority_map: Dict[str, Any]) -> Dict[str, Any]:
                 # this only ever removes a name, never invents one, and the list
                 # degrades to empty (the caller emits an honest note) if nothing
                 # brand-like remains.
-                if name and not is_ingredient_or_category_type(name):
+                if name and not is_ingredient_or_category_type(
+                    name,
+                    ingredient_tokens=vertical_profile.competitor_ingredient_tokens,
+                    form_tokens=vertical_profile.competitor_form_tokens,
+                ):
                     competitor_skus.setdefault(name, set()).add(sku_key)
                     competitor_prominence[name] = competitor_prominence.get(name, 0) + 1
     competitors = [
@@ -503,7 +512,7 @@ def _where_youre_losing(
             f"{merchant_name or 'the brand'} doesn't surface at all — neither "
             "your own listings nor any independent source appears."
         )
-    who = _who_ai_cites_instead(authority_map)
+    who = _who_ai_cites_instead(authority_map, vertical_profile=vertical_profile)
     return {
         "summary": text,
         "independently_recommended_for_category": endorsed_category,
@@ -758,6 +767,7 @@ def build_merchant_narrative(
     pending_engine_support: Optional[List[str]] = None,
     coverage_profile: Optional[str] = None,
     win_plan: Optional[Dict[str, Any]] = None,
+    vertical_profile: VerticalProfile = BEAUTY_PROFILE,
 ) -> Dict[str, Any]:
     """Assemble the seven merchant-facing narrative sections from already-built
     report data. Pure + defensive: every section degrades to an honest "not
