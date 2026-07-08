@@ -31,6 +31,13 @@ on:
       - "services/bd_cold_start_service.py"
       - "services/sku_opportunity.py"
       - "services/buyer_path_stable_controllers.py"
+      # Multi-vertical audit spine (Phase 0-2): the resolver + profiles, the
+      # vertical-aware brief, and the LLM attribute extractor all shape audit
+      # output — gate them so a change can't skip the v3 end-to-end run.
+      - "services/vertical_profiles.py"
+      - "services/strategic_brief.py"
+      - "services/llm_attribute_extractor.py"
+      - "services/competitor_brand_filter.py"
       - "services/audit_invariants.py"
       - "services/audit_review_gate.py"
       - "db/llm_probe_runs.py"

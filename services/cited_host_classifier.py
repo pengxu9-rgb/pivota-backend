@@ -331,6 +331,25 @@ _DEFAULT_GROUNDING_WEIGHT_BY_HOST: Dict[str, str] = {
 }
 
 
+# Phase 1c: register each VerticalProfile's authority hosts as review-site
+# grounding sources, sourced from the profile registry so there's one home for
+# "what an audio/electronics authority host is" (Rtings, SoundGuys, head-fi,
+# What Hi-Fi...). Additive via setdefault: a host with an explicit higher weight
+# (e.g. wirecutter.com = "high") is never downgraded. Beauty-safe — beauty audits
+# don't cite these, so nothing changes until an electronics audit encounters one.
+def _register_profile_authority_hosts() -> None:
+    from services.vertical_profiles import VERTICAL_PROFILES
+
+    for profile in VERTICAL_PROFILES.values():
+        for host in getattr(profile, "authority_hosts", ()) or ():
+            key = _normalize_host_key(host)
+            if key:
+                _DEFAULT_GROUNDING_WEIGHT_BY_HOST.setdefault(key, "medium")
+
+
+_register_profile_authority_hosts()
+
+
 def _default_tier_for_host(host: str, host_type: str) -> Optional[int]:
     """Tier from explicit registry entry, then from default map,
     then heuristic from host_type. Returns None when no signal."""
