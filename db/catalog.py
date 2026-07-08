@@ -76,6 +76,9 @@ catalog_products = Table(
     # Resolved once at sync intake and read by both this repo and the Node serving
     # layer; see services.vertical_profiles.resolve_vertical.
     Column("resolved_vertical", String(16), nullable=True),
+    # Cached LLM attribute-extractor output keyed by a source_hash (mig 174) so
+    # re-audits don't re-pay the LLM. See services.llm_attribute_extractor.
+    Column("llm_attributes", JSONB_TYPE, nullable=True),
     Column("canonical_url", Text, nullable=True),
     Column("image_url", Text, nullable=True),
     Column("product_payload", JSONB_TYPE, nullable=True),

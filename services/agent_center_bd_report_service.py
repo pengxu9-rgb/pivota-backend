@@ -130,9 +130,13 @@ from services.vertical_profiles import (
 )
 from services.llm_attribute_extractor import (
     GroundedAttribute,
+    build_source_text,
+    deserialize_grounded,
     extract_attributes,
     merge_grounded_into_graph,
+    serialize_grounded,
     should_run_extractor,
+    source_fingerprint,
 )
 
 
@@ -2297,6 +2301,18 @@ async def _maybe_stash_llm_attributes(ctx: Dict[str, Any]) -> None:
         lexicon_graph = build_sku_attribute_graph(product)
         if not should_run_extractor(profile, lexicon_graph):
             return
+        source_text = build_source_text(product)
+        if not source_text.strip():
+            return
+        fingerprint = source_fingerprint(source_text)
+        # Durable cache read-through: use the cached grounded attributes when the
+        # product copy is unchanged (source_hash match). A hit — even an empty one
+        # (a genuinely attribute-less SKU) — skips the LLM entirely.
+        cached = _cached_llm_attributes(product, fingerprint)
+        if cached is not None:
+            if cached:
+                ctx[_LLM_ATTR_STASH_KEY] = cached
+            return
         provider, model = _resolve_extractor_provider()
         if not provider:
             return
@@ -2308,11 +2324,61 @@ async def _maybe_stash_llm_attributes(ctx: Dict[str, Any]) -> None:
             provider=provider,
             model=model or "",
             max_tokens=int(getattr(app_settings, "attribute_extractor_max_tokens", 900) or 900),
+            source_text=source_text,
         )
         if grounded:
             ctx[_LLM_ATTR_STASH_KEY] = list(grounded)
+        # Persist (best-effort) so the next audit doesn't re-pay — negative results
+        # cached too. Only for catalog-resident SKUs (URL-audit synthetics have no row).
+        await _persist_llm_attributes(product, fingerprint, grounded)
     except Exception as exc:  # never let extraction break context load
         logger.warning("attribute extractor stash failed: %s", exc)
+
+
+def _cached_llm_attributes(
+    product: Mapping[str, Any],
+    fingerprint: str,
+) -> Optional[List[GroundedAttribute]]:
+    """Return the cached grounded attributes when the durable cache matches the
+    current source copy, else None (a miss -> extract). The cache is trusted only
+    on a source_hash match, so a stale span can never seed a probe."""
+    cached = product.get("llm_attributes")
+    if not isinstance(cached, Mapping):
+        return None
+    if str(cached.get("source_hash") or "") != fingerprint:
+        return None
+    return deserialize_grounded(cached.get("attributes"))
+
+
+async def _persist_llm_attributes(
+    product: Mapping[str, Any],
+    fingerprint: str,
+    grounded: Sequence[GroundedAttribute],
+) -> None:
+    """Best-effort durable write of the extractor cache to catalog_products. Never
+    raises into the audit; skips URL-audit synthetics (no catalog row)."""
+    product_key = str(product.get("product_key") or "").strip()
+    merchant_id = str(product.get("merchant_id") or "").strip()
+    if not product_key or not merchant_id:
+        return
+    payload = json.dumps({
+        "source_hash": fingerprint,
+        "attributes": serialize_grounded(grounded),
+    })
+    try:
+        from db.database import database
+
+        await database.execute(
+            """
+            UPDATE catalog_products
+               SET llm_attributes = CAST(:payload AS jsonb)
+             WHERE product_key = :product_key
+               AND merchant_id = :merchant_id
+            """,
+            {"payload": payload, "product_key": product_key, "merchant_id": merchant_id},
+        )
+    except Exception as exc:
+        logger.warning("attribute extractor cache write failed: %s", exc)
 
 
 def _confidence_ok(value: Any) -> bool:

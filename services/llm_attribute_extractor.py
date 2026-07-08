@@ -28,6 +28,7 @@ tests never hit a network.
 
 from __future__ import annotations
 
+import hashlib
 import json
 import logging
 import re
@@ -80,6 +81,42 @@ def build_source_text(product: Mapping[str, Any]) -> str:
     the SAME sources the lexicon path uses, so grounding is consistent with it."""
     parts = [text for _source, text in _iter_product_sources(product) if text]
     return "\n".join(parts)
+
+
+# --------------------------------------------------------------------------- #
+# Durable cache (Phase 2b-2): serialize grounded attributes + fingerprint the
+# source copy so a product edit invalidates a stale cache (a stale span must
+# never seed a probe for a spec the edited page no longer states).
+# --------------------------------------------------------------------------- #
+
+def source_fingerprint(source_text: str) -> str:
+    """Stable hash of the NORMALIZED source copy — the cache key. Normalized so a
+    whitespace/punctuation-only edit doesn't needlessly bust the cache, but any
+    real copy change does."""
+    return hashlib.sha1(_normalize(source_text).encode("utf-8")).hexdigest()
+
+
+def serialize_grounded(grounded: Sequence[GroundedAttribute]) -> List[Dict[str, str]]:
+    return [
+        {"class_name": g.class_name, "value": g.value, "span": g.span}
+        for g in grounded
+    ]
+
+
+def deserialize_grounded(items: Any) -> List[GroundedAttribute]:
+    """Reconstruct grounded attributes from a cached payload. Light validation
+    only — the cache is used ONLY when its source_hash matches the current copy,
+    so the spans are still present in the source; no need to re-run the guard."""
+    out: List[GroundedAttribute] = []
+    for item in items or []:
+        if not isinstance(item, Mapping):
+            continue
+        class_name = str(item.get("class_name") or "").strip()
+        value = str(item.get("value") or "").strip()
+        span = str(item.get("span") or "").strip()
+        if class_name in _EXTRACTABLE_CLASSES and value and span:
+            out.append(GroundedAttribute(class_name=class_name, value=value, span=span))
+    return out
 
 
 # --------------------------------------------------------------------------- #

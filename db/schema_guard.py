@@ -643,6 +643,18 @@ async def ensure_required_schema_light() -> None:
                     """
                 )
             )
+            # LLM attribute-extractor cache (migration 174). catalog_products is
+            # SELECT *'d at audit context-build; a missing column would break the
+            # read the moment the extractor flag is on. Railway skips migrations,
+            # so self-heal it here.
+            await database.execute(
+                text(
+                    """
+                    ALTER TABLE IF EXISTS catalog_products
+                      ADD COLUMN IF NOT EXISTS llm_attributes JSONB;
+                    """
+                )
+            )
             await database.execute(
                 text(
                     """
