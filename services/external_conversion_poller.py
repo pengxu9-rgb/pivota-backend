@@ -383,6 +383,20 @@ async def poll_external_conversions_batch(
             result["results"].append(res)
             result["merchants_polled"] += 1
             result["total_closed"] += int(res.get("closed") or 0)
+
+        # T2-2c: WooCommerce lane — same flag, same batch tick, own candidate
+        # scoping + woo:: watermark namespace. Import here (not module level) so
+        # the Shopify lane never pays for a Woo-lane import failure.
+        try:
+            from services.woocommerce_conversion_poller import poll_wc_conversions_batch_lane
+
+            woo_results = await poll_wc_conversions_batch_lane(click_recency_days=click_recency_days, now=now)
+            for res in woo_results:
+                result["results"].append(res)
+                result["merchants_polled"] += 1
+                result["total_closed"] += int(res.get("closed") or 0)
+        except Exception as e:
+            logger.warning("external_conversion_poller: woo lane failed err=%s", str(e)[:200])
     except Exception as e:  # the batch entry must never raise out
         logger.warning("external_conversion_poller: batch aborted err=%s", str(e)[:200])
         result["ok"] = False

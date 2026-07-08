@@ -185,15 +185,24 @@ def append_shopify_cart_click_attribute(url: str, click_id: str) -> str:
 
 
 def append_referral_click_param(url: str, click_id: str) -> str:
-    """Append the click id as a plain query param — click-side attribution only.
+    """Append the click id to a non-Shopify destination.
 
-    A product page cannot carry a Shopify cart attribute, so this is referral-only
-    (there is no order-side join for the fallback destination).
+    Two carriers, both appended:
+      - ``pvt_click_id`` — Pivota's own click-side attribution param (legacy carrier).
+      - ``utm_content``  — WooCommerce 8.5+ core Order Attribution persists standard
+        ``utm_*`` landing params onto the order as ``_wc_order_attribution_utm_*``
+        meta, which gives referral_only destinations an ORDER-SIDE join after all
+        (T2-2c Woo closure polls orders and recovers the click id from that meta).
+        Only added when the URL does not already carry a ``utm_content`` (a
+        merchant-configured utm_template wins).
     """
     cid = str(click_id or "").strip()
     if not cid:
         return url
-    return _append_query_fragment(url, f"{REFERRAL_CLICK_PARAM}={quote(cid, safe='')}")
+    out = _append_query_fragment(url, f"{REFERRAL_CLICK_PARAM}={quote(cid, safe='')}")
+    if "utm_content=" not in out:
+        out = _append_query_fragment(out, f"utm_content={quote(cid, safe='')}")
+    return out
 
 
 def shopify_cart_base_url(
