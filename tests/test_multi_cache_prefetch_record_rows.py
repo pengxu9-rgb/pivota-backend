@@ -13,7 +13,10 @@ import json
 
 import pytest
 
-from routes.agent_shop_gateway import _products_cache_row_candidate
+from routes.agent_shop_gateway import (
+    _order_row_merchant_items,
+    _products_cache_row_candidate,
+)
 
 
 class FakeRecord:
@@ -80,3 +83,48 @@ def test_unusable_rows_are_rejected_not_raised():
     assert _products_cache_row_candidate({"merchant_id": "m", "product_data": "{bad"}) == ("m", None)
     assert _products_cache_row_candidate({"merchant_id": "m", "product_data": 7}) == ("m", None)
     assert _products_cache_row_candidate(None) == ("", None)
+
+
+ORDER_ITEMS = [{"product_id": "p1", "product_title": "AeroFlex joggers", "quantity": 2}]
+
+
+def test_order_items_parsed_from_record_row():
+    row = FakeRecord({"merchant_id": "merch_efbc46b4619cfbdf", "items": ORDER_ITEMS})
+    mid, items = _order_row_merchant_items(row)
+    assert mid == "merch_efbc46b4619cfbdf"
+    assert items == ORDER_ITEMS
+
+
+def test_order_items_parsed_from_record_row_with_json_string_payload():
+    row = FakeRecord(
+        {"merchant_id": "merch_efbc46b4619cfbdf", "items": json.dumps(ORDER_ITEMS)}
+    )
+    mid, items = _order_row_merchant_items(row)
+    assert mid == "merch_efbc46b4619cfbdf"
+    assert items == ORDER_ITEMS
+
+
+def test_order_items_parsed_from_plain_dict_row():
+    mid, items = _order_row_merchant_items({"merchant_id": "m1", "items": ORDER_ITEMS})
+    assert mid == "m1"
+    assert items == ORDER_ITEMS
+
+
+def test_unusable_order_rows_are_rejected_not_raised():
+    assert _order_row_merchant_items({}) == (None, None)
+    assert _order_row_merchant_items({"merchant_id": "m", "items": "{bad"}) == ("m", None)
+    assert _order_row_merchant_items({"merchant_id": "m", "items": {"not": "a list"}}) == ("m", None)
+    assert _order_row_merchant_items(None) == (None, None)
+    row = FakeRecord({"merchant_id": "m", "items": None})
+    assert _order_row_merchant_items(row) == ("m", None)
+
+
+def test_no_dead_record_get_idiom_left_in_gateway():
+    """Guard: `row.get(...) if isinstance(row, dict) else None` silently skips
+    every Record row database.fetch_all/fetch_one returns in production. Six
+    personalization/fallback lanes were dead because of it; keep it out."""
+    import inspect
+
+    import routes.agent_shop_gateway as gateway
+
+    assert "if isinstance(row, dict) else None" not in inspect.getsource(gateway)
