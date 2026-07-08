@@ -285,6 +285,20 @@ def resolve_vertical(
 # --------------------------------------------------------------------------- #
 
 @dataclass(frozen=True)
+class BriefRules:
+    """The two category-specific slots of the strategic-brief system prompt
+    (everything else in that prompt is vertical-neutral). ``claim_rules`` replaces
+    the beauty INGREDIENTS+CLAIMS block; ``cold_pitch_publishers`` replaces the
+    mainstream-publisher list a merchant shouldn't be told to cold-pitch.
+
+    A profile with ``brief_rules is None`` uses the INCUMBENT (beauty) prompt
+    verbatim — see services.strategic_brief._render_system_prompt."""
+
+    claim_rules: str
+    cold_pitch_publishers: str
+
+
+@dataclass(frozen=True)
 class VerticalProfile:
     """One vertical's swappable content. Phase 0 populates ``beauty`` (migrated
     from today's constants), a neutral ``generic`` default, and a
@@ -310,7 +324,7 @@ class VerticalProfile:
 
     # --- Phase 1 placeholders (not read in Phase 0) ---
     attribute_strategy: str = "llm_extractor"   # beauty overrides to lexicon_first
-    brief_rules: Optional[str] = None
+    brief_rules: Optional["BriefRules"] = None
     publisher_avoid_list: Tuple[str, ...] = ()
     authority_hosts: Tuple[str, ...] = ()
     health_sensitive: Optional[bool] = None
@@ -413,6 +427,21 @@ ELECTRONICS_AUDIO_PROFILE = VerticalProfile(
     competitor_ingredient_tokens=frozenset(),   # electronics has no "ingredients"
     competitor_form_tokens=_ELECTRONICS_AUDIO_TYPE_TOKENS,
     attribute_strategy="llm_extractor",
+    brief_rules=BriefRules(
+        claim_rules=(
+            '- SPECS: name specs in plain buyer terms and say what they DO for the '
+            'buyer ("15-hour battery so it lasts a week of workouts", "IP68 so it '
+            'survives a pool swim", "open-ear / bone conduction so you still hear '
+            'traffic"). Do NOT dump a spec sheet, model-number soup, or a '
+            'codec/driver-size list.\n'
+            '- CLAIMS: a hard spec (waterproof rating, battery hours, wireless '
+            'range) is fine when it appears in EVIDENCE — state the evidenced spec, '
+            'never inflate it. Frame subjective superlatives ("best sound", "studio '
+            'quality") as positioning, not proven fact, and do NOT use medical or '
+            'health-efficacy language for a consumer audio product.'
+        ),
+        cold_pitch_publishers="Wirecutter, Rtings, SoundGuys, What Hi-Fi, etc.",
+    ),
     publisher_avoid_list=_ELECTRONICS_AUDIO_PUBLISHER_AVOID,
     authority_hosts=_ELECTRONICS_AUDIO_AUTHORITY_HOSTS,
     # Do NOT swap in electronics tokens ("battery"/"waterproof") — that would
