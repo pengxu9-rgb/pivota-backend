@@ -950,6 +950,368 @@ async def ensure_required_schema_light() -> None:
                     "ON shopify_gdpr_requests (merchant_id);"
                 )
             )
+            # ---------------------------------------------------------------
+            # schema-guard-coverage backfill (migrations 103-165).
+            # Railway fast-mode skips db/migrations/, so every ADD COLUMN from
+            # these already-shipped migrations is mirrored here as an idempotent,
+            # additive, NULLABLE self-heal (NOT NULL dropped so it can never fail
+            # on existing rows). Guarded per the schema-guard-coverage CI gate.
+            # ---------------------------------------------------------------
+            # mig 103: merchants
+            await database.execute(
+                text(
+                    """
+                    ALTER TABLE IF EXISTS merchants
+                      ADD COLUMN IF NOT EXISTS stripe_customer_id TEXT,
+                      ADD COLUMN IF NOT EXISTS subscription_id BIGINT,
+                      ADD COLUMN IF NOT EXISTS current_tier TEXT DEFAULT 'free',
+                      ADD COLUMN IF NOT EXISTS credits_balance BIGINT DEFAULT 0,
+                      ADD COLUMN IF NOT EXISTS current_period_credit_used BIGINT DEFAULT 0,
+                      ADD COLUMN IF NOT EXISTS promo_period_until TIMESTAMPTZ,
+                      ADD COLUMN IF NOT EXISTS billing_anchor_day SMALLINT DEFAULT 1;
+                    """
+                )
+            )
+            # mig 109,128: commerce_attribution_edges — monetization + gmv-channel fields
+            await database.execute(
+                text(
+                    """
+                    ALTER TABLE IF EXISTS commerce_attribution_edges
+                      ADD COLUMN IF NOT EXISTS channel_partner_id BIGINT,
+                      ADD COLUMN IF NOT EXISTS take_rate_applied_bp SMALLINT,
+                      ADD COLUMN IF NOT EXISTS refund_amount_cents BIGINT DEFAULT 0,
+                      ADD COLUMN IF NOT EXISTS refunded_at TIMESTAMPTZ,
+                      ADD COLUMN IF NOT EXISTS protocol_name TEXT,
+                      ADD COLUMN IF NOT EXISTS gmv_channel TEXT,
+                      ADD COLUMN IF NOT EXISTS third_party_platform TEXT,
+                      ADD COLUMN IF NOT EXISTS third_party_platform_fee_pct NUMERIC(5,4);
+                    """
+                )
+            )
+            # mig 116: agent_payouts
+            await database.execute(
+                text(
+                    """
+                    ALTER TABLE IF EXISTS agent_payouts
+                      ADD COLUMN IF NOT EXISTS payee_type TEXT DEFAULT 'agent',
+                      ADD COLUMN IF NOT EXISTS payee_id BIGINT,
+                      ADD COLUMN IF NOT EXISTS comp_config_version INTEGER,
+                      ADD COLUMN IF NOT EXISTS snapshot_id BIGINT,
+                      ADD COLUMN IF NOT EXISTS billing_run_id BIGINT,
+                      ADD COLUMN IF NOT EXISTS subsidy_cap_remaining_cents BIGINT,
+                      ADD COLUMN IF NOT EXISTS clawback_amount_cents BIGINT DEFAULT 0;
+                    """
+                )
+            )
+            # mig 117: credit_reservations
+            await database.execute(
+                text(
+                    """
+                    ALTER TABLE IF EXISTS credit_reservations
+                      ADD COLUMN IF NOT EXISTS metadata JSONB DEFAULT '{}'::jsonb;
+                    """
+                )
+            )
+            # mig 117: credit_ledger
+            await database.execute(
+                text(
+                    """
+                    ALTER TABLE IF EXISTS credit_ledger
+                      ADD COLUMN IF NOT EXISTS source_type TEXT;
+                    """
+                )
+            )
+            # mig 118,119,129: invoices
+            await database.execute(
+                text(
+                    """
+                    ALTER TABLE IF EXISTS invoices
+                      ADD COLUMN IF NOT EXISTS paid_at TIMESTAMPTZ,
+                      ADD COLUMN IF NOT EXISTS billing_run_id BIGINT,
+                      ADD COLUMN IF NOT EXISTS stripe_customer_id TEXT,
+                      ADD COLUMN IF NOT EXISTS refunded_cents BIGINT DEFAULT 0;
+                    """
+                )
+            )
+            # mig 119: billing_run_items
+            await database.execute(
+                text(
+                    """
+                    ALTER TABLE IF EXISTS billing_run_items
+                      ADD COLUMN IF NOT EXISTS voided_at TIMESTAMPTZ;
+                    """
+                )
+            )
+            # mig 119: invoice_disputes
+            await database.execute(
+                text(
+                    """
+                    ALTER TABLE IF EXISTS invoice_disputes
+                      ADD COLUMN IF NOT EXISTS disputed_line_items_jsonb JSONB DEFAULT '[]'::jsonb;
+                    """
+                )
+            )
+            # mig 124: subscription_plans
+            await database.execute(
+                text(
+                    """
+                    ALTER TABLE IF EXISTS subscription_plans
+                      ADD COLUMN IF NOT EXISTS stripe_mode TEXT;
+                    """
+                )
+            )
+            # mig 125: channel_partners
+            await database.execute(
+                text(
+                    """
+                    ALTER TABLE IF EXISTS channel_partners
+                      ADD COLUMN IF NOT EXISTS term_start_date DATE,
+                      ADD COLUMN IF NOT EXISTS term_months INTEGER DEFAULT 12,
+                      ADD COLUMN IF NOT EXISTS term_auto_renew BOOLEAN DEFAULT TRUE,
+                      ADD COLUMN IF NOT EXISTS per_brand_tail_months INTEGER DEFAULT 36,
+                      ADD COLUMN IF NOT EXISTS churn_clawback_days INTEGER DEFAULT 90,
+                      ADD COLUMN IF NOT EXISTS nonpayment_clawback_days INTEGER DEFAULT 60,
+                      ADD COLUMN IF NOT EXISTS per_brand_subsidy_cap_cents BIGINT,
+                      ADD COLUMN IF NOT EXISTS gmv_take_rate_bp INTEGER DEFAULT 1000,
+                      ADD COLUMN IF NOT EXISTS active_rate_scope TEXT DEFAULT 'B',
+                      ADD COLUMN IF NOT EXISTS gmv_take_definition TEXT DEFAULT 'net',
+                      ADD COLUMN IF NOT EXISTS prepaid_credits_supported BOOLEAN DEFAULT TRUE,
+                      ADD COLUMN IF NOT EXISTS monthly_overage_supported BOOLEAN DEFAULT TRUE;
+                    """
+                )
+            )
+            # mig 127: monthly_brand_statements
+            await database.execute(
+                text(
+                    """
+                    ALTER TABLE IF EXISTS monthly_brand_statements
+                      ADD COLUMN IF NOT EXISTS merchant_id VARCHAR(50),
+                      ADD COLUMN IF NOT EXISTS calendar_month DATE,
+                      ADD COLUMN IF NOT EXISTS subscription_plan_id BIGINT,
+                      ADD COLUMN IF NOT EXISTS tier_name TEXT,
+                      ADD COLUMN IF NOT EXISTS subscription_revenue_usd_cents BIGINT DEFAULT 0,
+                      ADD COLUMN IF NOT EXISTS credits_consumed BIGINT DEFAULT 0,
+                      ADD COLUMN IF NOT EXISTS bundled_credits_consumed BIGINT DEFAULT 0,
+                      ADD COLUMN IF NOT EXISTS overage_credits BIGINT DEFAULT 0,
+                      ADD COLUMN IF NOT EXISTS overage_revenue_usd_cents BIGINT DEFAULT 0,
+                      ADD COLUMN IF NOT EXISTS gmv_usd_cents BIGINT DEFAULT 0,
+                      ADD COLUMN IF NOT EXISTS gmv_personal_usd_cents BIGINT DEFAULT 0,
+                      ADD COLUMN IF NOT EXISTS gmv_third_party_usd_cents BIGINT DEFAULT 0,
+                      ADD COLUMN IF NOT EXISTS pivota_gmv_take_usd_cents BIGINT DEFAULT 0,
+                      ADD COLUMN IF NOT EXISTS total_revenue_usd_cents BIGINT DEFAULT 0,
+                      ADD COLUMN IF NOT EXISTS total_cogs_usd_cents BIGINT DEFAULT 0,
+                      ADD COLUMN IF NOT EXISTS pivota_gross_margin_usd_cents BIGINT DEFAULT 0,
+                      ADD COLUMN IF NOT EXISTS status TEXT DEFAULT 'open',
+                      ADD COLUMN IF NOT EXISTS frozen_at TIMESTAMPTZ,
+                      ADD COLUMN IF NOT EXISTS invoiced_at TIMESTAMPTZ,
+                      ADD COLUMN IF NOT EXISTS overage_invoice_id BIGINT,
+                      ADD COLUMN IF NOT EXISTS metadata JSONB DEFAULT '{}'::jsonb,
+                      ADD COLUMN IF NOT EXISTS created_at TIMESTAMPTZ DEFAULT NOW(),
+                      ADD COLUMN IF NOT EXISTS updated_at TIMESTAMPTZ DEFAULT NOW();
+                    """
+                )
+            )
+            # mig 134: partner_invite_tokens
+            await database.execute(
+                text(
+                    """
+                    ALTER TABLE IF EXISTS partner_invite_tokens
+                      ADD COLUMN IF NOT EXISTS channel_partner_id BIGINT,
+                      ADD COLUMN IF NOT EXISTS token_hash TEXT,
+                      ADD COLUMN IF NOT EXISTS token_prefix TEXT,
+                      ADD COLUMN IF NOT EXISTS expires_at TIMESTAMPTZ,
+                      ADD COLUMN IF NOT EXISTS status TEXT DEFAULT 'active',
+                      ADD COLUMN IF NOT EXISTS issued_by TEXT,
+                      ADD COLUMN IF NOT EXISTS notes TEXT,
+                      ADD COLUMN IF NOT EXISTS consumed_at TIMESTAMPTZ,
+                      ADD COLUMN IF NOT EXISTS consumed_by_merchant_id VARCHAR(50),
+                      ADD COLUMN IF NOT EXISTS revoked_at TIMESTAMPTZ,
+                      ADD COLUMN IF NOT EXISTS revoked_by TEXT,
+                      ADD COLUMN IF NOT EXISTS revoked_reason TEXT,
+                      ADD COLUMN IF NOT EXISTS created_at TIMESTAMPTZ DEFAULT NOW(),
+                      ADD COLUMN IF NOT EXISTS updated_at TIMESTAMPTZ DEFAULT NOW();
+                    """
+                )
+            )
+            # mig 135,151,161: catalog_products
+            await database.execute(
+                text(
+                    """
+                    ALTER TABLE IF EXISTS catalog_products
+                      ADD COLUMN IF NOT EXISTS suppression_reason TEXT,
+                      ADD COLUMN IF NOT EXISTS suppressed_at TIMESTAMPTZ,
+                      ADD COLUMN IF NOT EXISTS suppression_metadata JSONB,
+                      ADD COLUMN IF NOT EXISTS category_kind VARCHAR(16),
+                      ADD COLUMN IF NOT EXISTS claim_state VARCHAR(16) DEFAULT 'unclaimed';
+                    """
+                )
+            )
+            # mig 135: catalog_skus
+            await database.execute(
+                text(
+                    """
+                    ALTER TABLE IF EXISTS catalog_skus
+                      ADD COLUMN IF NOT EXISTS suppression_reason TEXT,
+                      ADD COLUMN IF NOT EXISTS suppressed_at TIMESTAMPTZ,
+                      ADD COLUMN IF NOT EXISTS suppression_metadata JSONB;
+                    """
+                )
+            )
+            # mig 135,149: catalog_offers
+            await database.execute(
+                text(
+                    """
+                    ALTER TABLE IF EXISTS catalog_offers
+                      ADD COLUMN IF NOT EXISTS suppression_metadata JSONB,
+                      ADD COLUMN IF NOT EXISTS offer_type VARCHAR(16),
+                      ADD COLUMN IF NOT EXISTS market VARCHAR(8) DEFAULT 'US',
+                      ADD COLUMN IF NOT EXISTS is_first_party BOOLEAN DEFAULT FALSE,
+                      ADD COLUMN IF NOT EXISTS why_buy_direct TEXT;
+                    """
+                )
+            )
+            # mig 145: agent_decision_events
+            await database.execute(
+                text(
+                    """
+                    ALTER TABLE IF EXISTS agent_decision_events
+                      ADD COLUMN IF NOT EXISTS protocol VARCHAR(32) DEFAULT 'pdp_direct';
+                    """
+                )
+            )
+            # mig 145: checkout_decisions
+            await database.execute(
+                text(
+                    """
+                    ALTER TABLE IF EXISTS checkout_decisions
+                      ADD COLUMN IF NOT EXISTS protocol VARCHAR(32) DEFAULT 'pdp_direct';
+                    """
+                )
+            )
+            # mig 145: agent_decision_funnel_links
+            await database.execute(
+                text(
+                    """
+                    ALTER TABLE IF EXISTS agent_decision_funnel_links
+                      ADD COLUMN IF NOT EXISTS protocol VARCHAR(32) DEFAULT 'pdp_direct';
+                    """
+                )
+            )
+            # mig 146,158: citation_targets
+            await database.execute(
+                text(
+                    """
+                    ALTER TABLE IF EXISTS citation_targets
+                      ADD COLUMN IF NOT EXISTS merchant_brand TEXT,
+                      ADD COLUMN IF NOT EXISTS merchant_host TEXT,
+                      ADD COLUMN IF NOT EXISTS content_key VARCHAR(40);
+                    """
+                )
+            )
+            # mig 150: beauty_product_profiles
+            await database.execute(
+                text(
+                    """
+                    ALTER TABLE IF EXISTS beauty_product_profiles
+                      ADD COLUMN IF NOT EXISTS evidence_profile JSONB,
+                      ADD COLUMN IF NOT EXISTS required_disclaimers JSONB;
+                    """
+                )
+            )
+            # mig 152,162: agent_pdp_view
+            await database.execute(
+                text(
+                    """
+                    ALTER TABLE IF EXISTS agent_pdp_view
+                      ADD COLUMN IF NOT EXISTS evidence_profile JSONB,
+                      ADD COLUMN IF NOT EXISTS required_disclaimers JSONB,
+                      ADD COLUMN IF NOT EXISTS bullet_points jsonb,
+                      ADD COLUMN IF NOT EXISTS usage_scenarios jsonb;
+                    """
+                )
+            )
+            # mig 156: merchant_stores
+            await database.execute(
+                text(
+                    """
+                    ALTER TABLE IF EXISTS merchant_stores
+                      ADD COLUMN IF NOT EXISTS content_writeback_status TEXT DEFAULT 'disabled',
+                      ADD COLUMN IF NOT EXISTS content_writeback_enabled_at TIMESTAMPTZ,
+                      ADD COLUMN IF NOT EXISTS content_writeback_canary_product_id TEXT,
+                      ADD COLUMN IF NOT EXISTS content_writeback_last_canary_product_id TEXT,
+                      ADD COLUMN IF NOT EXISTS content_writeback_last_written_at TIMESTAMPTZ,
+                      ADD COLUMN IF NOT EXISTS content_writeback_last_error TEXT;
+                    """
+                )
+            )
+            # mig 158: merchant_audit_runs
+            await database.execute(
+                text(
+                    """
+                    ALTER TABLE IF EXISTS merchant_audit_runs
+                      ADD COLUMN IF NOT EXISTS content_keys TEXT[],
+                      ADD COLUMN IF NOT EXISTS content_key_basis JSONB;
+                    """
+                )
+            )
+            # mig 158: evidence_items
+            await database.execute(
+                text(
+                    """
+                    ALTER TABLE IF EXISTS evidence_items
+                      ADD COLUMN IF NOT EXISTS content_key VARCHAR(40);
+                    """
+                )
+            )
+            # mig 158: readiness_findings
+            await database.execute(
+                text(
+                    """
+                    ALTER TABLE IF EXISTS readiness_findings
+                      ADD COLUMN IF NOT EXISTS content_key VARCHAR(40);
+                    """
+                )
+            )
+            # mig 158: niche_target_outcomes
+            await database.execute(
+                text(
+                    """
+                    ALTER TABLE IF EXISTS niche_target_outcomes
+                      ADD COLUMN IF NOT EXISTS content_key VARCHAR(40);
+                    """
+                )
+            )
+            # mig 158: citation_scan_runs
+            await database.execute(
+                text(
+                    """
+                    ALTER TABLE IF EXISTS citation_scan_runs
+                      ADD COLUMN IF NOT EXISTS content_key VARCHAR(40);
+                    """
+                )
+            )
+            # mig 165: index_pipeline_state
+            await database.execute(
+                text(
+                    """
+                    ALTER TABLE IF EXISTS index_pipeline_state
+                      ADD COLUMN IF NOT EXISTS index_eligible BOOLEAN DEFAULT FALSE;
+                    """
+                )
+            )
+            # mig 109: commerce_attribution_edges.net_attributed_gmv_cents — STORED generated column
+            # (derived from refund_amount_cents, added above). Emitted LAST so this
+            # lone potential table-rewrite can't block the lightweight self-heals;
+            # in prod the column already exists so IF NOT EXISTS no-ops.
+            await database.execute(
+                text(
+                    """
+                    ALTER TABLE IF EXISTS commerce_attribution_edges
+                      ADD COLUMN IF NOT EXISTS net_attributed_gmv_cents BIGINT GENERATED ALWAYS AS ( CASE WHEN gross_attributed_gmv_cents IS NULL THEN NULL ELSE GREATEST(gross_attributed_gmv_cents - refund_amount_cents, 0) END ) STORED;
+                    """
+                )
+            )
+
             return
 
         if IS_SQLITE:
