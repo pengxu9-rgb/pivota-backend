@@ -12028,6 +12028,16 @@ async def run_brand_report(
             "verify_summary": brand_verify_summary,
             "authority_map": authority_map,
             "merchant_narrative": merchant_narrative,
+            # Honesty gate (Principle 4): a category with no grounded-evidence
+            # binding (electronics/generic — evidence_bindings="none") DISCLOSES
+            # it rather than implying full coverage. Beauty is INCI-grounded and
+            # carries no disclosure, so the key is OMITTED -> beauty reports are
+            # byte-identical. Uses the merchant/dominant-vertical profile.
+            **(
+                {"grounded_coverage_disclosure": _merchant_profile.grounded_coverage_disclosure}
+                if getattr(_merchant_profile, "grounded_coverage_disclosure", None)
+                else {}
+            ),
             "win_plan": win_plan,
             "brand_state": brand_state,
             "brand_verdict_label": legacy_label,
