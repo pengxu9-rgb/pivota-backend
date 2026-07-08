@@ -17,10 +17,16 @@ Surface:
         404 if sig_id doesn't exist.
         Public — no auth (it's a discovery surface).
   - GET /api/canonical/products?limit=N&offset=M
+    GET /api/canonical/products?limit=N&cursor=<next_cursor>
         Returns { items: [{sig_id, canonical_url, last_modified}, ...],
-                  total, limit, offset }
+                  total, limit, offset, has_more, next_cursor }
         For sitemap generation (pivota-agent-ui sitemap-products.xml).
         Bounded list (max 1000 per page) to keep response size sane.
+        `total` is computed only on the first page (offset=0, no cursor)
+        and is null otherwise — the eligibility-filtered COUNT(*) is the
+        most expensive part of the query and consumers only need it once.
+        Prefer cursor (keyset) pagination: OFFSET cost grows linearly
+        with page depth and deep pages can hit the DB timeout.
         Public — no auth.
 
 Why not gate on auth? These endpoints serve data we WANT public
@@ -32,9 +38,11 @@ own gateway/sitemap from working.
 from __future__ import annotations
 
 import asyncio
+import base64
+import json
 import os
 from datetime import datetime
-from typing import Any, Awaitable, Dict, TypeVar
+from typing import Any, Awaitable, Dict, Optional, TypeVar
 
 from fastapi import APIRouter, HTTPException, Query, status
 from sqlalchemy import Boolean, DateTime, Float, String, Text, and_, column, func, or_, select, table
@@ -206,6 +214,60 @@ def _shape_product_for_pdp(row: Dict[str, Any]) -> Dict[str, Any]:
     }
 
 
+_LIST_CURSOR_VERSION = 1
+
+
+def _encode_list_cursor(row: Dict[str, Any]) -> Optional[str]:
+    """Opaque keyset cursor: the full ORDER BY key of the last row on a
+    page, so the next page seeks past it instead of OFFSET-scanning.
+
+    Returns None when the boundary row can't anchor a seek — e.g. a
+    widened-sitemap citation row with a NULL pivota_signature_id (ADR-007).
+    Consumers then fall back to offset paging (next_cursor is null while
+    has_more stays accurate)."""
+    ts = row.get("content_changed_at")
+    if not isinstance(ts, datetime):
+        return None
+    if not all(
+        isinstance(row.get(k), str)
+        for k in ("pivota_signature_id", "content_key", "product_key")
+    ):
+        return None
+    payload = json.dumps(
+        {
+            "v": _LIST_CURSOR_VERSION,
+            "ts": ts.isoformat(),
+            "sig": row["pivota_signature_id"],
+            "ck": row["content_key"],
+            "pk": row["product_key"],
+        },
+        separators=(",", ":"),
+    )
+    return base64.urlsafe_b64encode(payload.encode("utf-8")).decode("ascii").rstrip("=")
+
+
+def _decode_list_cursor(cursor: str) -> Dict[str, Any]:
+    try:
+        padded = cursor + "=" * (-len(cursor) % 4)
+        payload = json.loads(base64.urlsafe_b64decode(padded.encode("ascii")))
+        if payload.get("v") != _LIST_CURSOR_VERSION:
+            raise ValueError("unsupported cursor version")
+        decoded = {
+            "ts": datetime.fromisoformat(payload["ts"]),
+            "sig": payload["sig"],
+            "ck": payload["ck"],
+            "pk": payload["pk"],
+        }
+        if not all(isinstance(decoded[k], str) for k in ("sig", "ck", "pk")):
+            raise ValueError("cursor key fields must be strings")
+        return decoded
+    except Exception as exc:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="cursor must be a next_cursor value from a previous response",
+        ) from exc
+
+
 @router.get("/products/{sig_id}")
 async def get_canonical_pdp_by_signature(sig_id: str) -> Dict[str, Any]:
     """Resolve a sig_* to product fields. Backs the SSR + client-side
@@ -294,6 +356,13 @@ async def get_canonical_pdp_by_signature(sig_id: str) -> Dict[str, Any]:
 async def list_canonical_pdp_signatures(
     limit: int = Query(200, ge=1, le=1000),
     offset: int = Query(0, ge=0),
+    cursor: Optional[str] = Query(
+        None,
+        description=(
+            "Opaque keyset cursor from a previous response's next_cursor. "
+            "Mutually exclusive with offset; preferred for deep pagination."
+        ),
+    ),
 ) -> Dict[str, Any]:
     """Paginated list of public-serving canonical PDP signatures.
 
@@ -301,7 +370,21 @@ async def list_canonical_pdp_signatures(
     same fail-closed serving gate as the PDP read path: a sig is public only
     when its content_key is present in index_pipeline_state with
     serving_eligible=TRUE.
+
+    Two pagination modes:
+      - offset (legacy): kept for existing consumers; deep offsets scan
+        linearly and can hit the DB timeout.
+      - cursor (keyset): seeks on the ORDER BY key, constant cost per page.
+    `total` is returned only on the first page (offset=0, no cursor) so the
+    expensive eligibility-filtered COUNT(*) runs once per crawl, not per page.
     """
+    if cursor is not None and offset:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Pass either cursor or offset, not both",
+        )
+    cursor_key = _decode_list_cursor(cursor) if cursor is not None else None
+
     # ADR-007 SLICE 1: the public /products SITEMAP listing is a content/SEO
     # decision distinct from the citation read surface. It is widened ONLY by
     # INDEX_ELIGIBLE_SITEMAP — never by INDEX_ELIGIBLE_READ. Both default OFF.
@@ -364,14 +447,51 @@ async def list_canonical_pdp_signatures(
         merchant_gate,
     )
 
-    total_q = (
-        select(func.count())
-        .select_from(serving_join)
-        .where(eligibility_filter)
-    )
-    total = int(
-        await _bounded_db(database.fetch_val(total_q), "product_signature_count") or 0
-    )
+    # The eligibility-filtered COUNT(*) scans the whole join, so it runs on
+    # the first page only. Later pages return total=null; has_more (from the
+    # limit+1 fetch below) is the paging signal.
+    total: Optional[int] = None
+    if cursor_key is None and offset == 0:
+        total_q = (
+            select(func.count())
+            .select_from(serving_join)
+            .where(eligibility_filter)
+        )
+        total = int(
+            await _bounded_db(database.fetch_val(total_q), "product_signature_count") or 0
+        )
+
+    where_clause = eligibility_filter
+    if cursor_key is not None:
+        # The ORDER BY mixes directions (content_changed_at DESC, rest ASC),
+        # so the seek can't be a single row-tuple comparison.
+        seek_filter = or_(
+            catalog_products.c.content_changed_at < cursor_key["ts"],
+            and_(
+                catalog_products.c.content_changed_at == cursor_key["ts"],
+                catalog_products.c.pivota_signature_id > cursor_key["sig"],
+            ),
+            and_(
+                catalog_products.c.content_changed_at == cursor_key["ts"],
+                catalog_products.c.pivota_signature_id == cursor_key["sig"],
+                catalog_products.c.content_key > cursor_key["ck"],
+            ),
+            and_(
+                catalog_products.c.content_changed_at == cursor_key["ts"],
+                catalog_products.c.pivota_signature_id == cursor_key["sig"],
+                catalog_products.c.content_key == cursor_key["ck"],
+                catalog_products.c.product_key > cursor_key["pk"],
+            ),
+            # Widened sitemap (ADR-007): NULL-sig citation rows sort after
+            # every non-null sig within the same timestamp (ASC NULLS LAST),
+            # so they are strictly past any cursor (cursors are only minted
+            # from non-null-sig rows).
+            and_(
+                catalog_products.c.content_changed_at == cursor_key["ts"],
+                catalog_products.c.pivota_signature_id.is_(None),
+            ),
+        )
+        where_clause = and_(eligibility_filter, seek_filter)
 
     # index_eligible is selected ONLY when the sitemap is widened — keeps the
     # strict (flag-OFF) query byte-identical to the pre-Tier-2 behavior.
@@ -392,18 +512,22 @@ async def list_canonical_pdp_signatures(
     rows_q = (
         select(*select_cols)
         .select_from(serving_join)
-        .where(eligibility_filter)
+        .where(where_clause)
         .order_by(
             catalog_products.c.content_changed_at.desc(),
             catalog_products.c.pivota_signature_id.asc(),
             catalog_products.c.content_key.asc(),
             catalog_products.c.product_key.asc(),
         )
-        .limit(limit)
-        .offset(offset)
+        # limit+1 answers has_more without a second COUNT query.
+        .limit(limit + 1)
     )
+    if cursor_key is None and offset:
+        rows_q = rows_q.offset(offset)
     rows = await _bounded_db(database.fetch_all(rows_q), "product_signature_list")
-    has_more = offset + len(rows) < total
+    has_more = len(rows) > limit
+    rows = rows[:limit]
+    next_cursor = _encode_list_cursor(dict(rows[-1])) if has_more and rows else None
     items = [
         {
             "sig_id": r["pivota_signature_id"],
@@ -436,4 +560,5 @@ async def list_canonical_pdp_signatures(
         "limit": limit,
         "offset": offset,
         "has_more": has_more,
+        "next_cursor": next_cursor,
     }

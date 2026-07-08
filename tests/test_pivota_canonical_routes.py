@@ -87,8 +87,26 @@ class FakeDb:
                 return r
         return None
 
+    def _eligible_sorted(self) -> List[Dict[str, Any]]:
+        """Rows passing the (flag-aware) sitemap gate, in the endpoint's
+        ORDER BY: (content_changed_at DESC, sig ASC NULLS LAST,
+        content_key ASC, product_key ASC)."""
+        rows = [r for r in self._rows if _sitemap_row_eligible(r)]
+        rows.sort(
+            key=lambda r: (
+                r["pivota_signature_id"] is None,  # NULLS LAST
+                r["pivota_signature_id"] or "",
+                r["content_key"],
+                r["product_key"],
+            )
+        )
+        rows.sort(key=lambda r: r["content_changed_at"], reverse=True)
+        return rows
+
     async def fetch_all(self, query):
-        # Used by the list endpoint; mirror the real eligibility filter.
+        # Used by the list endpoint; return rows passing the (flag-aware)
+        # sitemap gate in sort order, honoring the compiled LIMIT/OFFSET
+        # and (if present) the keyset seek predicate.
         try:
             sql = str(query.compile(compile_kwargs={"literal_binds": True}))
         except Exception:
@@ -100,8 +118,35 @@ class FakeDb:
         m_off = re.search(r"OFFSET\s+(\d+)", sql, re.I)
         lim = int(m_lim.group(1)) if m_lim else 200
         off = int(m_off.group(1)) if m_off else 0
-        eligible = [r for r in self._rows if _sitemap_row_eligible(r)]
-        return eligible[off : off + lim]
+        rows = self._eligible_sorted()
+
+        # Keyset seek: the route compiles `content_changed_at < '<ts>'
+        # OR (... pivota_signature_id > '<sig>') OR (... content_key >
+        # '<ck>') OR (... product_key > '<pk>') OR (... sig IS NULL)`.
+        # Extract the literals and apply the same "strictly after cursor
+        # position" filter.
+        m_ts = re.search(r"content_changed_at\s*<\s*'([^']+)'", sql)
+        if m_ts:
+            ts = datetime.fromisoformat(m_ts.group(1))
+            sig = re.search(r"pivota_signature_id\s*>\s*'([^']+)'", sql).group(1)
+            ck = re.search(r"content_key\s*>\s*'([^']+)'", sql).group(1)
+            pk = re.search(r"product_key\s*>\s*'([^']+)'", sql).group(1)
+
+            def _after_cursor(r: Dict[str, Any]) -> bool:
+                if r["content_changed_at"] != ts:
+                    return r["content_changed_at"] < ts
+                if r["pivota_signature_id"] is None:
+                    # NULLS LAST: always past a non-null cursor sig.
+                    return True
+                if r["pivota_signature_id"] != sig:
+                    return r["pivota_signature_id"] > sig
+                if r["content_key"] != ck:
+                    return r["content_key"] > ck
+                return r["product_key"] > pk
+
+            rows = [r for r in rows if _after_cursor(r)]
+
+        return rows[off : off + lim]
 
     async def fetch_val(self, query):
         try:
@@ -365,12 +410,107 @@ def test_list_canonical_pdps_pagination_bounds(env):
     assert len(body["items"]) == 2
     assert body["total"] == 3
     assert body["has_more"] is True
+    assert body["next_cursor"]
 
     res2 = client.get("/api/canonical/products?limit=2&offset=2")
     body2 = res2.json()
     assert len(body2["items"]) == 1
-    assert body2["total"] == 3
+    # COUNT(*) runs on the first page only; later pages return total=null
+    # and consumers page on has_more (or items.length >= limit).
+    assert body2["total"] is None
     assert body2["has_more"] is False
+    assert body2["next_cursor"] is None
+
+
+def test_list_canonical_pdps_counts_only_on_first_page(env):
+    client = env
+    from routes import pivota_canonical_routes as pcr
+
+    client.get("/api/canonical/products?limit=2&offset=0")
+    client.get("/api/canonical/products?limit=2&offset=2")
+
+    count_queries = [s for s in pcr.database.compiled_sql if "count(" in s.lower()]
+    assert len(count_queries) == 1
+
+
+def test_list_canonical_pdps_cursor_pagination_walks_all_rows(env):
+    client = env
+    res = client.get("/api/canonical/products?limit=2")
+    body = res.json()
+    assert body["total"] == 3
+    assert body["has_more"] is True
+    cursor = body["next_cursor"]
+    assert cursor
+
+    res2 = client.get(f"/api/canonical/products?limit=2&cursor={cursor}")
+    assert res2.status_code == 200
+    body2 = res2.json()
+    assert body2["total"] is None
+    assert body2["has_more"] is False
+    assert body2["next_cursor"] is None
+
+    # Cursor mode must not COUNT and must not OFFSET-scan.
+    from routes import pivota_canonical_routes as pcr
+
+    cursor_sql = pcr.database.compiled_sql[-1]
+    assert "count(" not in cursor_sql.lower()
+    assert "OFFSET" not in cursor_sql.upper()
+    assert "content_changed_at <" in cursor_sql
+
+    # Both pages together cover every eligible sig exactly once.
+    sigs = [i["sig_id"] for i in body["items"]] + [i["sig_id"] for i in body2["items"]]
+    assert sorted(sigs) == ["sig_abc", "sig_def", "sig_noimg"]
+    assert len(set(sigs)) == 3
+
+
+def test_list_canonical_pdps_cursor_seeks_across_timestamp_boundary(env, monkeypatch):
+    """Rows with distinct content_changed_at values page correctly:
+    newest first, and the cursor resumes on the older-timestamp side."""
+    from routes import pivota_canonical_routes as pcr
+
+    rows = [
+        _row("old", content_changed_at=datetime(2026, 4, 1, tzinfo=timezone.utc)),
+        _row("new", content_changed_at=datetime(2026, 6, 1, tzinfo=timezone.utc)),
+        _row("mid", content_changed_at=datetime(2026, 5, 1, tzinfo=timezone.utc)),
+    ]
+    monkeypatch.setattr(pcr, "database", FakeDb(rows))
+    app = FastAPI()
+    app.include_router(pcr.router)
+    client = TestClient(app)
+
+    res = client.get("/api/canonical/products?limit=1")
+    body = res.json()
+    assert [i["sig_id"] for i in body["items"]] == ["sig_new"]
+    assert body["has_more"] is True
+
+    res2 = client.get(f"/api/canonical/products?limit=1&cursor={body['next_cursor']}")
+    body2 = res2.json()
+    assert [i["sig_id"] for i in body2["items"]] == ["sig_mid"]
+    assert body2["has_more"] is True
+
+    res3 = client.get(f"/api/canonical/products?limit=1&cursor={body2['next_cursor']}")
+    body3 = res3.json()
+    assert [i["sig_id"] for i in body3["items"]] == ["sig_old"]
+    assert body3["has_more"] is False
+    assert body3["next_cursor"] is None
+
+
+def test_list_canonical_pdps_rejects_cursor_with_offset(env):
+    client = env
+    res = client.get("/api/canonical/products?limit=2")
+    cursor = res.json()["next_cursor"]
+
+    res2 = client.get(f"/api/canonical/products?offset=2&cursor={cursor}")
+    assert res2.status_code == 400
+    assert "not both" in res2.json()["detail"]
+
+
+def test_list_canonical_pdps_rejects_malformed_cursor(env):
+    client = env
+    for bad in ["garbage", "eyJ2IjoyfQ", "aGVsbG8"]:  # junk, wrong version, non-JSON-object
+        res = client.get(f"/api/canonical/products?cursor={bad}")
+        assert res.status_code == 400, bad
+        assert "cursor" in res.json()["detail"]
 
 
 def test_list_canonical_pdps_uses_index_pipeline_state_join(env):
