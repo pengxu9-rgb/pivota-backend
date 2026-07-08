@@ -560,6 +560,32 @@ async def upsert_audited_sku_to_index(
             "upsert_audited_sku_to_index: catalog_merchant upsert failed for %s: %s",
             merchant_id, str(exc)[:200],
         )
+    # Convergence P1.2 (ADR-009 D3): seller-of-record on the CANONICAL row.
+    # Audit-door records have no external_product_seeds row, so without this
+    # the attribution closure has no seller_ref source and stamps
+    # seller_ref_missing. derive_seed_seller is the SAME derivation the seed
+    # writers use: (auditing merchant, 'self') when it owns the destination
+    # domain, else the observed seller ('cross'); underivable → NULL/NULL —
+    # never assumed 'self'. Best-effort: seller derivation must never break
+    # the audit seed.
+    seller_ref: Optional[str] = None
+    seed_kind: Optional[str] = None
+    try:
+        from services.seller_identity import derive_seed_seller
+
+        seller_ref, seed_kind = await derive_seed_seller(
+            anchor_merchant_id=merchant_id,
+            brand=fields.get("brand"),
+            destination_domain=fields.get("source_domain") or fields.get("canonical_url"),
+            source_system="url_audit_intake",
+            primary_platform=PLATFORM_URL_AUDIT,
+        )
+    except Exception as exc:  # noqa: BLE001
+        logger.warning(
+            "upsert_audited_sku_to_index: seller derivation failed for %s: %s",
+            fields.get("product_key"), str(exc)[:200],
+        )
+
     try:
         from db.catalog import catalog_products
         from db.database import database
@@ -570,6 +596,9 @@ async def upsert_audited_sku_to_index(
         values["catalog_track"] = _AUDIT_SEED_CATALOG_TRACK
         values["truth_tier"] = _AUDIT_SEED_TRUTH_TIER
         values["readiness_tier"] = _AUDIT_SEED_READINESS_TIER
+        # Phase 1.2: seller identity rides the canonical row.
+        values["seller_ref"] = seller_ref
+        values["seed_kind"] = seed_kind
         stmt = _pg_insert(catalog_products).values(**values)
         stmt = stmt.on_conflict_do_update(
             index_elements=["product_key"],
@@ -610,6 +639,15 @@ async def upsert_audited_sku_to_index(
                 "pivota_signature_minted_at": func.coalesce(
                     catalog_products.c.pivota_signature_minted_at,
                     stmt.excluded.pivota_signature_minted_at,
+                ),
+                # P1.2: seller identity is WRITE-ONCE (existing first) — a
+                # re-audit backfills NULL legacy rows but never re-keys a
+                # seller already derived (identity stability, ADR-009).
+                "seller_ref": func.coalesce(
+                    catalog_products.c.seller_ref, stmt.excluded.seller_ref
+                ),
+                "seed_kind": func.coalesce(
+                    catalog_products.c.seed_kind, stmt.excluded.seed_kind
                 ),
                 "updated_at": func.now(),
                 "content_changed_at": func.now(),

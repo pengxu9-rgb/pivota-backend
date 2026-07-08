@@ -23,9 +23,10 @@ import services.audit_index_intake as intake  # noqa: E402
 
 
 def _audit_product() -> Dict[str, Any]:
+    # NB: audit_product_to_index_fields reads the brand from `vendor`.
     return {
         "title": "Gentle Cleanser",
-        "brand": "TestBrand",
+        "vendor": "TestBrand",
         "pdp_url": "https://brand.example/products/gentle-cleanser",
         "description": "A cleanser observed during a URL audit.",
     }
@@ -86,6 +87,92 @@ def _find_catalog_products_insert(executed: List[Any]) -> Optional[Any]:
         if getattr(table, "name", "") == "catalog_products":
             return stmt
     return None
+
+
+@pytest.mark.asyncio
+async def test_insert_carries_seller_identity(monkeypatch: pytest.MonkeyPatch):
+    """P1.2: the canonical row carries (seller_ref, seed_kind) from the SAME
+    derivation the seed writers use, and the ON CONFLICT branch is
+    existing-first (write-once identity — re-audits backfill NULLs, never
+    re-key)."""
+    executed: List[Any] = []
+
+    async def fake_execute(stmt, *a, **kw):
+        executed.append(stmt)
+        return None
+
+    async def fake_fetch_one(*a, **kw):
+        return None
+
+    async def fake_fetch_all(*a, **kw):
+        return []
+
+    from db.database import database
+    import services.seller_identity as si
+
+    async def fake_derive(**kwargs):
+        assert kwargs["anchor_merchant_id"] == "merch_test"
+        assert kwargs["brand"] == "TestBrand"
+        return ("merch_obs_testbrand_example", "cross")
+
+    monkeypatch.setattr(database, "execute", fake_execute)
+    monkeypatch.setattr(database, "fetch_one", fake_fetch_one)
+    monkeypatch.setattr(database, "fetch_all", fake_fetch_all)
+    monkeypatch.setattr(si, "derive_seed_seller", fake_derive)
+    monkeypatch.setattr(intake, "apply_audit_er_gate", _none_gate)
+    monkeypatch.setattr(intake, "apply_audit_brand_fragmentation_guard", _none_guard)
+
+    await intake.upsert_audited_sku_to_index("merch_test", _audit_product())
+
+    insert_stmt = _find_catalog_products_insert(executed)
+    assert insert_stmt is not None
+    params = insert_stmt.compile().params
+    assert params.get("seller_ref") == "merch_obs_testbrand_example"
+    assert params.get("seed_kind") == "cross"
+
+    # ON CONFLICT: existing-first coalesce (write-once), for both columns.
+    sql_text = str(insert_stmt.compile()).lower()
+    on_conflict = sql_text.split("on conflict", 1)[1]
+    assert "coalesce(catalog_products.seller_ref, excluded.seller_ref)" in on_conflict
+    assert "coalesce(catalog_products.seed_kind, excluded.seed_kind)" in on_conflict
+
+
+@pytest.mark.asyncio
+async def test_seller_derivation_failure_leaves_null_and_still_seeds(monkeypatch: pytest.MonkeyPatch):
+    """No-fallback (ADR-009 D3): derivation failure → NULL/NULL, and the seed
+    insert still proceeds — seller derivation must never break an audit."""
+    executed: List[Any] = []
+
+    async def fake_execute(stmt, *a, **kw):
+        executed.append(stmt)
+        return None
+
+    async def fake_fetch(*a, **kw):
+        return None
+
+    async def fake_fetch_all(*a, **kw):
+        return []
+
+    from db.database import database
+    import services.seller_identity as si
+
+    async def boom(**kwargs):
+        raise RuntimeError("identity service down")
+
+    monkeypatch.setattr(database, "execute", fake_execute)
+    monkeypatch.setattr(database, "fetch_one", fake_fetch)
+    monkeypatch.setattr(database, "fetch_all", fake_fetch_all)
+    monkeypatch.setattr(si, "derive_seed_seller", boom)
+    monkeypatch.setattr(intake, "apply_audit_er_gate", _none_gate)
+    monkeypatch.setattr(intake, "apply_audit_brand_fragmentation_guard", _none_guard)
+
+    await intake.upsert_audited_sku_to_index("merch_test", _audit_product())
+
+    insert_stmt = _find_catalog_products_insert(executed)
+    assert insert_stmt is not None
+    params = insert_stmt.compile().params
+    assert params.get("seller_ref") is None
+    assert params.get("seed_kind") is None
 
 
 @pytest.mark.asyncio
