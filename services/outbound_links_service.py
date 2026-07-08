@@ -250,7 +250,15 @@ def make_redirect_token(payload: Dict[str, Any], ttl_seconds: int = 7 * 24 * 360
     return f"{payload_b64}.{sig_b64}"
 
 
-def parse_and_verify_redirect_token(token: str) -> Dict[str, Any]:
+def parse_redirect_token_verified(token: str) -> tuple[Dict[str, Any], bool]:
+    """
+    Verify signature/shape and return ``(payload, is_expired)`` WITHOUT raising on expiry.
+
+    Attributed-redirect lane D3: /r links are embedded in agent-platform product feeds that
+    outlive the token TTL in caches. An EXPIRED-but-VALIDLY-SIGNED token must still resolve to
+    its destination (the /r route degrades to a plain 302 without click logging) rather than
+    dead-ending a cached feed link on an error page. Signature/shape failures still raise.
+    """
     if not token or "." not in token:
         raise ValueError("INVALID_TOKEN")
     payload_b64, sig_b64 = token.split(".", 1)
@@ -263,7 +271,13 @@ def parse_and_verify_redirect_token(token: str) -> Dict[str, Any]:
     if payload.get("t") not in (None, "redirect"):
         raise ValueError("INVALID_TOKEN")
     exp = int(payload.get("exp") or 0)
-    if exp and _now_ts() > exp:
+    is_expired = bool(exp and _now_ts() > exp)
+    return payload, is_expired
+
+
+def parse_and_verify_redirect_token(token: str) -> Dict[str, Any]:
+    payload, is_expired = parse_redirect_token_verified(token)
+    if is_expired:
         raise ValueError("TOKEN_EXPIRED")
     return payload
 
