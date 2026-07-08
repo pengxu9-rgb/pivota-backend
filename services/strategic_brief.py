@@ -40,6 +40,7 @@ from services.sku_lane_priority import (
     is_third_party_controlled_lane,
     prioritize_lanes,
 )
+from services.vertical_profiles import BEAUTY_PROFILE, BriefRules, get_profile, resolve_vertical
 
 logger = logging.getLogger(__name__)
 
@@ -214,6 +215,53 @@ WRITE the brief as JSON with these fields — each must be specific to THIS prod
   product's own terms.
 - diy_vs_pivota: {self_serve:[2-3 merchant-owned moves], pivota:"one honest line on what only Pivota does
   — cited+buyable canonical page, serving, monitoring"}.   # the 70/30, honest, no cold-audit hard-sell"""
+
+# --- Vertical-aware brief rules (Phase 1b) -----------------------------------
+# The prompt above is the INCUMBENT (beauty) prompt; all of it is vertical-neutral
+# EXCEPT two spans — the INGREDIENTS+CLAIMS block and the mainstream-publisher
+# list a merchant shouldn't cold-pitch. We DERIVE a template from the incumbent by
+# replacing exactly those two single-occurrence spans with sentinels (no
+# retyping), so beauty renders byte-identically and only the two slots swap per
+# vertical. See services.vertical_profiles.BriefRules.
+_BRIEF_CLAIM_SENTINEL = "CATEGORY_CLAIM_RULES"
+_BRIEF_PUBLISHER_SENTINEL = "COLD_PITCH_PUBLISHERS"
+
+
+def _derive_brief_template(incumbent: str) -> Tuple[str, BriefRules]:
+    claim = incumbent[incumbent.index("- INGREDIENTS:"): incumbent.index("\n- SOURCES PER FIELD:")]
+    p1 = incumbent.index("major mainstream publisher (") + len("major mainstream publisher (")
+    publishers = incumbent[p1: incumbent.index(")", p1)]
+    template = incumbent.replace(claim, _BRIEF_CLAIM_SENTINEL).replace(
+        "(" + publishers + ")", "(" + _BRIEF_PUBLISHER_SENTINEL + ")"
+    )
+    return template, BriefRules(claim_rules=claim, cold_pitch_publishers=publishers)
+
+
+_SYSTEM_PROMPT_TEMPLATE, _BEAUTY_BRIEF_RULES = _derive_brief_template(_STRATEGIC_BRIEF_SYSTEM_PROMPT)
+
+
+def _render_system_prompt(profile: Any) -> str:
+    """The brief system prompt for a vertical. A profile with no ``brief_rules``
+    (beauty / anything not affirmatively switched) returns the incumbent prompt
+    VERBATIM — byte-identical. Electronics swaps only the two category slots."""
+    rules = getattr(profile, "brief_rules", None)
+    if rules is None:
+        return _STRATEGIC_BRIEF_SYSTEM_PROMPT
+    return _SYSTEM_PROMPT_TEMPLATE.replace(
+        _BRIEF_CLAIM_SENTINEL, rules.claim_rules
+    ).replace(_BRIEF_PUBLISHER_SENTINEL, rules.cold_pitch_publishers)
+
+
+def _brief_profile_for_evidence(evidence: Mapping[str, Any]) -> Any:
+    """Choose the brief profile. ONLY an affirmatively-electronics vertical swaps
+    to a non-beauty prompt; beauty / fashion / other / unknown keep the incumbent
+    (beauty) prompt — the conservative choice for a trust-critical LLM prompt, so a
+    beauty SKU that resolved ambiguously never loses the INCI/claims guard."""
+    vertical = str((evidence or {}).get("vertical") or "").strip().lower()
+    if vertical == "electronics":
+        return get_profile("electronics")
+    return BEAUTY_PROFILE
+
 
 _ATTRIBUTE_FIELD_MAP = {
     "category": ("category",),
@@ -812,6 +860,20 @@ def assemble_sku_brief_evidence(
     )
     anchors = _as_mapping(identity_map.get("anchors"))
     brand = _clean_str(anchors.get("brand"))
+    # Resolve the SKU vertical ONCE for the brief (Principle 1). Signal = category
+    # + title + the attribute values (ingredients / specs) the brief reasons over.
+    # Only an affirmatively-electronics vertical changes the prompt / disclaimers;
+    # see _brief_profile_for_evidence.
+    _brief_vertical = resolve_vertical(
+        {
+            "product_type": _clean_str(anchors.get("category")),
+            "category": _clean_str(anchors.get("category")),
+        },
+        title=" ".join(
+            [title, brand, *[item for values in attributes.values() for item in values]]
+        ),
+    )
+    _brief_profile = get_profile(_brief_vertical)
     merchant_path = _merchant_path(identity=identity_map, opportunity=opportunity_map)
     product_evidence = _as_mapping(opportunity_map.get("product_evidence")) or build_lane_product_evidence(
         product={"title": title, "brand": brand, "category": anchors.get("category")},
@@ -835,6 +897,9 @@ def assemble_sku_brief_evidence(
     )
 
     return {
+        # Resolved SKU vertical (Principle 1) — read by build_sku_brief_prompt to
+        # pick the category rules block, and by the notes.health_sensitive gate.
+        "vertical": _brief_vertical,
         "product": {
             "title": title,
             "brand": brand or None,
@@ -873,10 +938,14 @@ def assemble_sku_brief_evidence(
         "demand_state": opportunity_map.get("demand_state_summary"),
         "notes": {
             "merchant_can_act_in_30d": True,
-            "health_sensitive": _health_sensitive(
-                title=title,
-                brand=brand,
-                attributes=attributes,
+            # Metadata flag (one call site). The profile can hard-set it — electronics
+            # is health_sensitive=False (a "battery"/"waterproof" token must not flag
+            # earphones health-sensitive); a profile leaving it None (beauty / other)
+            # falls back to the token detector, byte-identical to before.
+            "health_sensitive": (
+                _brief_profile.health_sensitive
+                if _brief_profile.health_sensitive is not None
+                else _health_sensitive(title=title, brand=brand, attributes=attributes)
             ),
         },
     }
@@ -983,7 +1052,7 @@ def build_sku_brief_prompt(evidence: Mapping[str, Any]) -> Tuple[str, str]:
         + "\n\nEVIDENCE:\n"
         + json.dumps(evidence, ensure_ascii=False, indent=2, sort_keys=True)
     )
-    return _STRATEGIC_BRIEF_SYSTEM_PROMPT, user
+    return _render_system_prompt(_brief_profile_for_evidence(evidence)), user
 
 
 def _resolve_brief_provider(provider: Optional[str]) -> Optional[str]:
