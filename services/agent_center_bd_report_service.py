@@ -2293,6 +2293,17 @@ async def _maybe_stash_llm_attributes(ctx: Dict[str, Any]) -> None:
 
     if not getattr(app_settings, "attribute_extractor_enabled", False):
         return
+    # Per-merchant scoping: when an allowlist is configured, run ONLY for those
+    # merchants (Mojawa-scoped pilot). Empty allowlist -> no restriction.
+    allowlist = getattr(app_settings, "attribute_extractor_merchants", set()) or set()
+    if allowlist:
+        merchant_id = str(
+            (ctx.get("merchant_id") if isinstance(ctx, Mapping) else "")
+            or (_get_product(ctx) or {}).get("merchant_id")
+            or ""
+        ).strip()
+        if merchant_id not in allowlist:
+            return
     product = _get_product(ctx)
     if not isinstance(product, Mapping) or not product:
         return

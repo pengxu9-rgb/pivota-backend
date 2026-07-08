@@ -290,6 +290,22 @@ class Settings(BaseSettings):
     attribute_extractor_max_tokens: int = int(
         os.getenv("ATTRIBUTE_EXTRACTOR_MAX_TOKENS", "900")
     )
+    # Per-merchant scoping for the extractor rollout. Comma-separated merchant_ids.
+    # NON-EMPTY -> the extractor runs ONLY for these merchants (even with the flag
+    # on) — the safe way to pilot on one merchant (Mojawa) without touching prod
+    # electronics/thin traffic. EMPTY -> no merchant restriction (the flag alone
+    # governs), preserving Phase-2b behavior.
+    attribute_extractor_merchants_raw: str = os.getenv(
+        "AUDIT_ATTRIBUTE_EXTRACTOR_MERCHANTS", ""
+    )
+
+    @property
+    def attribute_extractor_merchants(self) -> set:
+        return {
+            m.strip()
+            for m in (self.attribute_extractor_merchants_raw or "").split(",")
+            if m.strip()
+        }
     openai_api_key: Optional[str] = os.getenv("OPENAI_API_KEY")
     openai_model: str = os.getenv("OPENAI_MODEL", "gpt-4.1")
     anthropic_api_key: Optional[str] = os.getenv("ANTHROPIC_API_KEY")
