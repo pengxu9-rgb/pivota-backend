@@ -9489,6 +9489,9 @@ async def agent_confirm_payment(
 
         try:
             from services.agent_decision_event_store import record_funnel_link
+            from services.commerce_attribution_service import (
+                get_order_attribution_edge_id,
+            )
             from services.protocols import DEFAULT_PROTOCOL
 
             order_metadata = order.get("metadata") if isinstance(order.get("metadata"), dict) else {}
@@ -9498,13 +9501,17 @@ async def agent_confirm_payment(
             for funnel_event_id in funnel_event_ids or []:
                 async def _record_funnel_link(fid: str) -> None:
                     try:
+                        # P0.3: FK-safe bridge to the GMV-bearing attribution
+                        # edge (None when the order has no edge). Resolved inside
+                        # the task so it never blocks the confirm-payment reply.
+                        edge_id = await get_order_attribution_edge_id(order_id)
                         await record_funnel_link(
                             decision_id=decision_id,
                             funnel_event_id=fid,
                             checkout_decision_id=checkout_decision_id,
                             content_key=refs.get("content_key"),
                             catalog_offer_id=refs.get("catalog_offer_id"),
-                            commerce_attribution_edge_id=None,
+                            commerce_attribution_edge_id=edge_id,
                             merchant_id=str(order.get("merchant_id") or ""),
                             protocol=DEFAULT_PROTOCOL,
                         )
