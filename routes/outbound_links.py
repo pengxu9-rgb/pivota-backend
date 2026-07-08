@@ -22,6 +22,7 @@ from services.outbound_links_service import (
     normalize_tool,
     parse_and_verify_report_token,
     parse_and_verify_redirect_token,
+    parse_redirect_token_verified,
     resolve_outbound_link,
     log_outbound_click,
     log_outbound_event,
@@ -40,6 +41,45 @@ async def require_links_admin(
     expected = os.getenv("ADMIN_API_KEY") or os.getenv("PROMOTIONS_ADMIN_KEY")
     if not expected or x_admin_key != expected:
         raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="UNAUTHORIZED")
+
+
+def _env_truthy(v: Optional[str]) -> bool:
+    return str(v or "").strip().lower() in {"1", "true", "yes", "on"}
+
+
+async def require_links_resolve_caller(
+    request: Request,
+    x_admin_key: Optional[str] = Header(None, alias="X-ADMIN-KEY"),
+    x_links_service_key: Optional[str] = Header(None, alias="X-Links-Service-Key"),
+) -> None:
+    """
+    Service auth for POST /api/links/resolve (attributed-redirect lane P1 security fix).
+
+    /resolve mints signed /r redirect tokens with caller-chosen ctx — once those tokens carry
+    money significance (click attribution → GMV → take), an open minter is an abuse surface
+    (attribution stuffing, open-redirect laundering through allowed domains).
+
+    Accepted credentials: admin key (ops/smokes) OR the shared service key the gateway sends
+    (OUTBOUND_LINKS_SERVICE_KEY, header X-Links-Service-Key).
+
+    Rollout-safe enforcement: deny only when OUTBOUND_LINKS_RESOLVE_REQUIRE_KEY is truthy.
+    Until then, unauthenticated calls are ALLOWED but logged at WARNING so we can confirm all
+    legit callers carry the key before flipping enforcement (same pattern as shadow-mode gates).
+    """
+    admin_expected = os.getenv("ADMIN_API_KEY") or os.getenv("PROMOTIONS_ADMIN_KEY")
+    service_expected = os.getenv("OUTBOUND_LINKS_SERVICE_KEY")
+    if admin_expected and x_admin_key == admin_expected:
+        return
+    if service_expected and x_links_service_key == service_expected:
+        return
+    if _env_truthy(os.getenv("OUTBOUND_LINKS_RESOLVE_REQUIRE_KEY")):
+        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="UNAUTHORIZED")
+    import logging
+
+    logging.getLogger(__name__).warning(
+        "outbound-links /resolve called without a valid key (enforcement off) client=%s",
+        getattr(getattr(request, "client", None), "host", None),
+    )
 
 
 class ResolveCandidates(BaseModel):
@@ -73,7 +113,11 @@ class ResolveResponse(BaseModel):
 
 
 @api_router.post("/resolve", response_model=ResolveResponse)
-async def resolve_endpoint(req: Request, body: ResolveRequest) -> ResolveResponse:
+async def resolve_endpoint(
+    req: Request,
+    body: ResolveRequest,
+    _: None = Depends(require_links_resolve_caller),
+) -> ResolveResponse:
     """
     Resolve an outbound link for a candidate (sku/brand/category/role) for a given tool+market.
 
@@ -116,13 +160,20 @@ async def redirect_endpoint(req: Request, token: str = Query(..., min_length=10)
     - 302 to the destination URL (already includes UTM if configured)
     """
     try:
-        payload = parse_and_verify_redirect_token(token)
+        payload, is_expired = parse_redirect_token_verified(token)
     except Exception as exc:
         code = str(getattr(exc, "args", ["INVALID_TOKEN"])[0] or "INVALID_TOKEN")
         raise HTTPException(status_code=400, detail=code) from exc
     dest = str(payload.get("dest") or "")
     if not dest.startswith("http://") and not dest.startswith("https://"):
         raise HTTPException(status_code=400, detail="INVALID_DEST")
+
+    # Attributed-redirect lane D3: a VALIDLY-SIGNED but EXPIRED token (e.g. a feed link cached by
+    # an agent platform past the 7-day TTL) still 302s to its destination — a dead link punishes
+    # the buyer and the merchant for our cache horizon — but the click is NOT logged, so expired
+    # links can never farm attribution. Bad signatures/shapes still 400 above.
+    if is_expired:
+        return RedirectResponse(url=dest, status_code=302)
 
     # Best-effort click logging.
     try:
