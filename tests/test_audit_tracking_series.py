@@ -70,6 +70,26 @@ def test_missing_basis_is_never_comparable():
     assert series["basis_changes"] == [1]
 
 
+def test_interleaved_same_basis_points_still_connect():
+    # A merchant alternating two URL sets: comparability is a property of the
+    # BASIS, not of adjacency. A same-basis re-audit must join its earlier
+    # points' segment even when differently-based checks ran in between.
+    series = build_tracking_series([
+        _row(0, 60, 45, 55, basis_id="sel_a"),
+        _row(1, 30, 20, 25, basis_id="sel_b"),   # other URL set interleaved
+        _row(2, 32, 22, 27, basis_id="sel_b"),
+        _row(3, 68, 52, 60, basis_id="sel_a"),   # back to the first set
+    ])
+    pts = series["points"]
+    assert [p["comparable_with_prev"] for p in pts] == [False, False, True, True]
+    # Two per-basis segments; sel_a spans the interleaved run.
+    assert [seg["basis_id"] for seg in series["segments"]] == ["sel_a", "sel_b"]
+    assert [seg["indices"] for seg in series["segments"]] == [[0, 3], [1, 2]]
+    # One break: where the NEW basis first appeared. Returning to sel_a at
+    # index 3 continues an existing thread — no break there.
+    assert series["basis_changes"] == [1]
+
+
 def test_empty_history():
     series = build_tracking_series([])
     assert series["points"] == []
