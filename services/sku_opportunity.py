@@ -29,6 +29,7 @@ from services.brand_alias import derive_brand_aliases, text_mentions_brand
 from services.buyer_path_stable_controllers import stable_buyer_path_controllers
 from services.cited_host_classifier import classify_host
 from services.sku_lane_priority import build_lane_product_evidence, is_synthetic_probe_query
+from services.vertical_profiles import BEAUTY_PROFILE, VerticalProfile
 
 
 # Ordering/fallback for per-prompt provider verdicts. _expected_providers also
@@ -90,8 +91,13 @@ def build_sku_opportunity(
     probe_runs: Any,
     *,
     attribute_graph: Optional[Dict[str, Any]] = None,
+    vertical_profile: VerticalProfile = BEAUTY_PROFILE,
 ) -> Dict[str, Any]:
-    """Build additive per-prompt opportunity intelligence for one SKU."""
+    """Build additive per-prompt opportunity intelligence for one SKU.
+
+    `vertical_profile` selects the vertical's competitor type-token vocab for the
+    substitution-brand filter (defaults to beauty = byte-identical; electronics
+    drops 'wireless earbuds' as a type, not a substitute brand)."""
     product = _get_product(sku_ctx)
     graph = attribute_graph if isinstance(attribute_graph, dict) else {}
     runs = _flatten_probe_runs(probe_runs)
@@ -106,6 +112,7 @@ def build_sku_opportunity(
             runs=group_runs,
             providers=all_providers,
             attribute_graph=graph,
+            vertical_profile=vertical_profile,
         )
         for query, group_runs in sorted(groups.items(), key=lambda item: item[0])
     ]
@@ -260,6 +267,7 @@ def _score_prompt_group(
     runs: List[Dict[str, Any]],
     providers: List[str],
     attribute_graph: Dict[str, Any],
+    vertical_profile: VerticalProfile = BEAUTY_PROFILE,
 ) -> Dict[str, Any]:
     merchant_category = (
         product.get("product_type")
@@ -390,6 +398,7 @@ def _score_prompt_group(
         durable_competitor=durable_competitor,
     )
     substitution = _substitution(
+        vertical_profile=vertical_profile,
         query=query,
         axis=axis,
         query_class=query_class,
@@ -1405,6 +1414,7 @@ def _substitution(
     provider_verdicts: Dict[str, str],
     competitors: List[str],
     competitor_counts: Counter,
+    vertical_profile: VerticalProfile = BEAUTY_PROFILE,
 ) -> Dict[str, Any]:
     comparison_signal = axis in {"comparison", "alternatives"} or bool(
         _COMPARISON_TOKEN_RE.search(query or "")
@@ -1426,7 +1436,11 @@ def _substitution(
         # merchant, there's no brand substitution to act on.
         from services.competitor_brand_filter import filter_competitor_brands
 
-        brand_competitors = filter_competitor_brands(competitors)
+        brand_competitors = filter_competitor_brands(
+            competitors,
+            ingredient_tokens=vertical_profile.competitor_ingredient_tokens,
+            form_tokens=vertical_profile.competitor_form_tokens,
+        )
         if not brand_competitors:
             return {"present": False}
         # The most-recommended rival brand (durable across the answer set).

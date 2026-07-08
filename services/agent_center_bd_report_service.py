@@ -2229,6 +2229,33 @@ def _profile_for_sku_ctx(
     return get_profile(_resolved_vertical_for_ctx(sku_ctx, product))
 
 
+def _merchant_profile_from_reports(
+    per_sku_reports: Optional[List[Mapping[str, Any]]],
+) -> VerticalProfile:
+    """The MERCHANT/run-level profile — the dominant vertical across the audit's
+    SKUs. Used by the run-level competitor panels (reseller not-carried, merchant
+    narrative) that aggregate names across SKUs and so have no single SKU vertical.
+    Defaults to beauty (byte-identical) when nothing resolves. Per Principle 1,
+    merchant/audit vertical is a default; per-SKU panels still resolve per-SKU."""
+    from collections import Counter
+
+    counts: Counter = Counter()
+    for report in per_sku_reports or []:
+        if not isinstance(report, Mapping):
+            continue
+        vertical = resolve_vertical(
+            {
+                "product_type": report.get("product_type"),
+                "category": report.get("product_type"),
+            },
+            title=report.get("title"),
+        )
+        counts[vertical] += 1
+    if not counts:
+        return BEAUTY_PROFILE
+    return get_profile(counts.most_common(1)[0][0])
+
+
 # --- Phase 2b: live LLM attribute extractor (flag-gated) -------------------- #
 # Stash key on the SKU context; the grounded attributes are merged into the
 # attribute graph ONLY at the probe-seeding sites, so they influence what the
@@ -5757,6 +5784,7 @@ async def _winning_products_not_carried(
     win_plan: Optional[Dict[str, Any]],
     *,
     cap: int = 12,
+    vertical_profile: VerticalProfile = BEAUTY_PROFILE,
 ) -> List[Dict[str, Any]]:
     """C3 — for a RESELLER: the winning competitor products AI names that the
     merchant does NOT carry (a stocking / sourcing signal). Collect the competitor
@@ -5776,7 +5804,11 @@ async def _winning_products_not_carried(
             if not isinstance(q, dict):
                 continue
             query = str(q.get("query") or "").strip()
-            for name in filter_competitor_brands(list(q.get("competitor_benchmark") or [])):
+            for name in filter_competitor_brands(
+                list(q.get("competitor_benchmark") or []),
+                ingredient_tokens=vertical_profile.competitor_ingredient_tokens,
+                form_tokens=vertical_profile.competitor_form_tokens,
+            ):
                 key = name.strip().lower()
                 if not key:
                     continue
@@ -6620,6 +6652,7 @@ async def build_per_sku_report(
         sku_ctx,
         probe_runs,
         attribute_graph=attribute_graph,
+        vertical_profile=_profile_for_sku_ctx(sku_ctx, product),
     )
 
     if sku_ctx.get("missing_inputs") and not product.get("product_key"):
@@ -11157,6 +11190,7 @@ async def run_wedge_hero_sku_intelligence(
         sku_ctx,
         {sku_ctx["sku_key"]: real_runs},
         attribute_graph=attribute_graph,
+        vertical_profile=_profile_for_sku_ctx(sku_ctx, _get_product(sku_ctx)),
     )
     display = _display_sku_intelligence(
         sku_ctx=sku_ctx,
@@ -11856,13 +11890,19 @@ async def run_brand_report(
         except Exception:  # noqa: BLE001
             logger.warning("win_plan build failed", exc_info=True)
             win_plan = None
+        # Merchant/run-level vertical (dominant across the audit's SKUs) — the
+        # run-level competitor panels below aggregate names across SKUs, so they
+        # use this single profile rather than a per-SKU one. Beauty -> byte-identical.
+        _merchant_profile = _merchant_profile_from_reports(per_sku_reports)
         # C3 — for a reseller, the winning competitor products AI names that the
         # merchant does NOT carry (a stocking / sourcing signal; the catalog-overlap
         # no DIY-with-a-frontier-model can produce). Best-effort + reseller-gated.
         if _merchant_is_reseller:
             try:
                 brand_rollup["winning_products_not_carried"] = (
-                    await _winning_products_not_carried(str(merchant_id), win_plan)
+                    await _winning_products_not_carried(
+                        str(merchant_id), win_plan, vertical_profile=_merchant_profile
+                    )
                 )
             except Exception:  # noqa: BLE001
                 logger.warning("C3 winning_products_not_carried failed", exc_info=True)
@@ -11883,6 +11923,7 @@ async def run_brand_report(
                 pending_engine_support=coverage.get("pending_engine_support") or [],
                 coverage_profile=coverage.get("profile"),
                 win_plan=win_plan,
+                vertical_profile=_merchant_profile,
             )
         except Exception:  # noqa: BLE001
             logger.warning("merchant_narrative build failed", exc_info=True)
