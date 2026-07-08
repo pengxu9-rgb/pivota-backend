@@ -2982,6 +2982,27 @@ def _products_cache_row_candidate(row: Any) -> tuple[str, Optional[Dict[str, Any
     return mid, product_data
 
 
+def _order_row_merchant_items(row: Any) -> tuple[Any, Optional[List[Any]]]:
+    """Parse an orders row into (merchant_id, items list).
+
+    Same Record-vs-dict trap as _products_cache_row_candidate: rows from
+    database.fetch_all are Record objects, so row.get(...) must never be
+    called on the raw row. `items` may arrive as a JSON string or an
+    already-decoded list. Returns (merchant_id, None) when items are unusable.
+    """
+    row_map = _row_to_dict(row)
+    merchant_id = row_map.get("merchant_id")
+    raw_items = row_map.get("items")
+    if isinstance(raw_items, str):
+        try:
+            raw_items = json.loads(raw_items)
+        except Exception:
+            return merchant_id, None
+    if not isinstance(raw_items, list):
+        return merchant_id, None
+    return merchant_id, raw_items
+
+
 def _extract_price_currency_from_variant(v: Dict[str, Any], fallback_currency: str) -> tuple[Optional[float], str]:
     price = (
         v.get("price_amount")
@@ -7691,13 +7712,8 @@ async def _handle_find_products_multi_inner(
         product_ids: set[str] = set()
         titles: List[str] = []
         for row in rows:
-            raw_items = row.get("items") if isinstance(row, dict) else None
-            if isinstance(raw_items, str):
-                try:
-                    raw_items = json.loads(raw_items)
-                except Exception:
-                    raw_items = None
-            if not isinstance(raw_items, list):
+            _, raw_items = _order_row_merchant_items(row)
+            if raw_items is None:
                 continue
             for item in raw_items:
                 if not isinstance(item, dict):
@@ -7748,14 +7764,8 @@ async def _handle_find_products_multi_inner(
             )
             if not row:
                 return None
-            merchant_id = row.get("merchant_id") if isinstance(row, dict) else None
-            product_data = row.get("product_data") if isinstance(row, dict) else None
-            if isinstance(product_data, str):
-                try:
-                    product_data = json.loads(product_data)
-                except Exception:
-                    return None
-            if not isinstance(product_data, dict):
+            merchant_id, product_data = _products_cache_row_candidate(row)
+            if product_data is None:
                 return None
             try:
                 product = StandardProduct(**product_data)
@@ -7824,16 +7834,8 @@ async def _handle_find_products_multi_inner(
 
         popularity = Counter()
         for row in rows:
-            merchant_id = row.get("merchant_id") if isinstance(row, dict) else None
-            raw_items = row.get("items") if isinstance(row, dict) else None
-            if not merchant_id:
-                continue
-            if isinstance(raw_items, str):
-                try:
-                    raw_items = json.loads(raw_items)
-                except Exception:
-                    raw_items = None
-            if not isinstance(raw_items, list):
+            merchant_id, raw_items = _order_row_merchant_items(row)
+            if not merchant_id or raw_items is None:
                 continue
             for item in raw_items:
                 if not isinstance(item, dict):
@@ -7867,13 +7869,8 @@ async def _handle_find_products_multi_inner(
             )
             if not row:
                 return None
-            product_data = row.get("product_data") if isinstance(row, dict) else None
-            if isinstance(product_data, str):
-                try:
-                    product_data = json.loads(product_data)
-                except Exception:
-                    return None
-            if not isinstance(product_data, dict):
+            _, product_data = _products_cache_row_candidate(row)
+            if product_data is None:
                 return None
             try:
                 product = StandardProduct(**product_data)
@@ -7913,16 +7910,8 @@ async def _handle_find_products_multi_inner(
 
         popularity = Counter()
         for row in rows:
-            merchant_id = row.get("merchant_id") if isinstance(row, dict) else None
-            raw_items = row.get("items") if isinstance(row, dict) else None
-            if not merchant_id:
-                continue
-            if isinstance(raw_items, str):
-                try:
-                    raw_items = json.loads(raw_items)
-                except Exception:
-                    raw_items = None
-            if not isinstance(raw_items, list):
+            merchant_id, raw_items = _order_row_merchant_items(row)
+            if not merchant_id or raw_items is None:
                 continue
             for item in raw_items:
                 if not isinstance(item, dict):
@@ -7958,13 +7947,8 @@ async def _handle_find_products_multi_inner(
             )
             if not row:
                 return None
-            product_data = row.get("product_data") if isinstance(row, dict) else None
-            if isinstance(product_data, str):
-                try:
-                    product_data = json.loads(product_data)
-                except Exception:
-                    return None
-            if not isinstance(product_data, dict):
+            _, product_data = _products_cache_row_candidate(row)
+            if product_data is None:
                 return None
             try:
                 product = StandardProduct(**product_data)
@@ -7997,13 +7981,8 @@ async def _handle_find_products_multi_inner(
             {"limit": max_candidates},
         )
         for row in rows:
-            product_data = row.get("product_data") if isinstance(row, dict) else None
-            if isinstance(product_data, str):
-                try:
-                    product_data = json.loads(product_data)
-                except Exception:
-                    continue
-            if not isinstance(product_data, dict):
+            _, product_data = _products_cache_row_candidate(row)
+            if product_data is None:
                 continue
             try:
                 prod = StandardProduct(**product_data)
@@ -8633,14 +8612,9 @@ async def _handle_find_products_multi_inner(
         seen_keys: set[tuple[str, str]] = set()
 
         for row in rows:
-            merchant_id = row.get("merchant_id") if isinstance(row, dict) else None
-            product_data = row.get("product_data") if isinstance(row, dict) else None
-            if isinstance(product_data, str):
-                try:
-                    product_data = json.loads(product_data)
-                except Exception:
-                    continue
-            if not isinstance(product_data, dict):
+            mid, product_data = _products_cache_row_candidate(row)
+            merchant_id = mid or None
+            if product_data is None:
                 continue
             try:
                 prod = StandardProduct(**product_data)
@@ -9213,14 +9187,9 @@ async def _handle_find_products_multi_inner(
                 )
             source = "cache_global_fallback"
             for row in rows:
-                merchant_id = row.get("merchant_id") if isinstance(row, dict) else None
-                product_data = row.get("product_data") if isinstance(row, dict) else None
-                if isinstance(product_data, str):
-                    try:
-                        product_data = json.loads(product_data)
-                    except Exception:
-                        continue
-                if not isinstance(product_data, dict):
+                mid, product_data = _products_cache_row_candidate(row)
+                merchant_id = mid or None
+                if product_data is None:
                     continue
                 try:
                     prod = StandardProduct(**product_data)
