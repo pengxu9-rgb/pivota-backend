@@ -901,7 +901,12 @@ async def ingest_standard_products(
         "beauty_shades_upserted": 0,
         "beauty_content_assets_upserted": 0,
         "beauty_compatibility_rules_upserted": 0,
+        "brand_conflicts_flagged": 0,
     }
+    # ADR-008 prevent-at-intake (convergence P1.4): guard once per distinct
+    # brand per ingest run — a merchant's catalog is usually one brand, so
+    # this is ~1 extra lookup per sync, not per product.
+    _brand_guard_seen: set = set()
     audit = (
         WriterAuditAccumulator(
             writer_name=source_system,
@@ -937,6 +942,41 @@ async def ingest_standard_products(
             canonical_url = str(metadata.get("canonical_url") or metadata.get("url") or "").strip() or None
             brand = str(product.vendor or metadata.get("brand") or "").strip() or None
             content_key = make_content_key(brand, product.title, product.barcode)
+            # ADR-008 prevent-at-intake (convergence P1.4) — FIRST-PARTY door
+            # semantics: the connected merchant's own catalog ALWAYS proceeds
+            # (higher truth than any observed row); a brand+host already
+            # canonical under a DIFFERENT merchant is flagged for
+            # reconciliation instead (reconcile-at-connect, never
+            # block-at-connect). Best-effort; once per distinct brand per run.
+            if brand and source_domain_value and brand.lower() not in _brand_guard_seen:
+                _brand_guard_seen.add(brand.lower())
+                try:
+                    from services.audit_index_intake import (
+                        apply_intake_brand_fragmentation_guard,
+                    )
+
+                    _guard = await apply_intake_brand_fragmentation_guard(
+                        merchant_id,
+                        {
+                            "product_key": product_key,
+                            "brand": brand,
+                            "source_domain": source_domain_value,
+                            "canonical_url": canonical_url,
+                            "content_key": content_key,
+                        },
+                        door="catalog_sync",
+                        block_on_conflict=False,
+                    )
+                    if _guard.get("action") == "flag":
+                        stats["brand_conflicts_flagged"] += 1
+                        logger.info(
+                            "catalog_sync.brand_guard_flag merchant=%s brand=%r host=%r "
+                            "conflict_merchant=%s (review enqueued, sync proceeds)",
+                            merchant_id, brand, source_domain_value,
+                            _guard.get("conflict_merchant_id"),
+                        )
+                except Exception:  # noqa: BLE001 — guard must never break a sync
+                    logger.debug("catalog_sync brand guard failed", exc_info=True)
             # Pivota canonical PDP fields (sig_id + agent.pivota.cc URL)
             # — every onboarded merchant product gets one. Deterministic
             # so re-syncs are idempotent.

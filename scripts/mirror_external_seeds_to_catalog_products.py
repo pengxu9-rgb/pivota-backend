@@ -860,6 +860,7 @@ async def _apply(limit: int) -> int:
     # _ensure_external_seed_merchant() pre-pass is gone from this write path (the
     # function is retained only for the legacy repair/backfill scripts).
     skipped_no_seller = 0
+    skipped_brand_guard = 0  # ADR-008 prevent-at-intake (convergence P1.4)
 
     limit_clause = ""
     values: Dict[str, Any] = {}
@@ -936,6 +937,40 @@ async def _apply(limit: int) -> int:
         product_key = make_catalog_product_key(
             seller_merchant_id, PLATFORM, external_product_id
         )
+
+        # ADR-008 prevent-at-intake (convergence P1.4): the mirror door now
+        # runs the SAME brand-fragmentation guard as the audit door. An
+        # observed seed whose brand+host is already canonical under a
+        # DIFFERENT merchant must not mint a fragmented orphan — the conflict
+        # goes to review instead. Fail-open on guard errors (never blocks a
+        # legitimate mirror on the guard's account).
+        try:
+            from services.audit_index_intake import (
+                apply_intake_brand_fragmentation_guard,
+            )
+
+            guard = await apply_intake_brand_fragmentation_guard(
+                seller_merchant_id,
+                {
+                    "product_key": product_key,
+                    "brand": row_dict.get("mirrored_brand"),
+                    "source_domain": row_dict.get("domain"),
+                    "canonical_url": row_dict.get("canonical_url"),
+                    "content_key": row_dict.get("content_key"),
+                },
+                door="external_seed_mirror",
+                block_on_conflict=True,
+            )
+            if guard.get("action") == "skip":
+                skipped_brand_guard += 1
+                print(
+                    "SKIP: ADR-008 brand guard — brand already canonical under "
+                    f"{guard.get('conflict_merchant_id')} "
+                    f"(external_product_id={external_product_id!r}); review enqueued"
+                )
+                continue
+        except Exception as exc:  # noqa: BLE001 — guard must never break the mirror
+            print(f"WARN: brand guard errored for {external_product_id!r}: {exc}")
 
         mirrored_at = datetime.now(timezone.utc).isoformat()
         pivota_fields = make_pivota_canonical_fields(
@@ -1231,6 +1266,15 @@ async def _apply(limit: int) -> int:
         print(
             f"NOTE: skipped {skipped_no_seller} seed row(s) with no resolvable "
             "seller-of-record identity (ADR-009 D2 — no fallback bucket)",
+            file=sys.stderr,
+        )
+    if skipped_brand_guard:
+        # Loud, not silent: these seeds collide with a brand already canonical
+        # under another merchant (ADR-008); each enqueued a review task instead
+        # of minting a fragmented orphan.
+        print(
+            f"NOTE: skipped {skipped_brand_guard} seed row(s) via the ADR-008 "
+            "brand-fragmentation guard (review tasks enqueued)",
             file=sys.stderr,
         )
     return inserted

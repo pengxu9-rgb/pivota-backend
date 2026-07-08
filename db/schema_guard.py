@@ -962,6 +962,38 @@ async def ensure_required_schema_light() -> None:
                     """
                 )
             )
+            # Convergence P1.2 (migration 176): seller-of-record on the CANONICAL
+            # product row. The audit intake door writes catalog_products with no
+            # external_product_seeds row, so seller identity must live on the
+            # canonical row or attribution closure stamps seller_ref_missing.
+            # Same column semantics + honesty guard as the 169 seed columns.
+            # Railway deploys skip db/migrations/, so self-heal here.
+            await database.execute(
+                text(
+                    """
+                    ALTER TABLE IF EXISTS catalog_products
+                      ADD COLUMN IF NOT EXISTS seller_ref TEXT,
+                      ADD COLUMN IF NOT EXISTS seed_kind TEXT;
+                    """
+                )
+            )
+            await database.execute(
+                text(
+                    """
+                    DO $$
+                    BEGIN
+                        IF NOT EXISTS (
+                            SELECT 1 FROM pg_constraint
+                            WHERE conname = 'ck_catalog_products_seed_kind'
+                        ) THEN
+                            ALTER TABLE catalog_products
+                                ADD CONSTRAINT ck_catalog_products_seed_kind
+                                CHECK (seed_kind IS NULL OR seed_kind IN ('self', 'cross'));
+                        END IF;
+                    END $$;
+                    """
+                )
+            )
             # GDPR/data-privacy compliance audit trail. The compliance handlers in
             # routes/webhook_routes.py write one row per Shopify compliance webhook
             # recording that the obligation was fulfilled (or flagged needs_review),

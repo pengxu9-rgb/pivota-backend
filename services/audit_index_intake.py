@@ -198,16 +198,28 @@ def resolve_seed_vendor(
     return fallback or None
 
 
-# Only the columns we set; everything else (catalog_track, truth_tier,
-# readiness_tier, pdp_scope='unverified', sync_status='live', created_at, …)
-# takes its server_default — and pdp_lifecycle_stage stays NULL, so a seed is NOT
-# recalled on the transact lane until it graduates or is claimed. description +
-# image_url are OBSERVED content fields (the audit's exhaust) — they enrich the
-# seed for when it's claimed and add NO transact serving. The pivota_signature_*
-# fields (W5 P3) DO mint the offer-free citation identity: the by-signature PDP
-# read serves this seed once index_pipeline_state.index_eligible flips true
-# (which only happens when the seed passes the quality gates — a thin seed stays
+# Only the columns we set; everything else (pdp_scope='unverified',
+# sync_status='live', created_at, …) takes its server_default — and
+# pdp_lifecycle_stage stays NULL, so a seed is NOT recalled on the transact
+# lane until it graduates or is claimed. description + image_url are OBSERVED
+# content fields (the audit's exhaust) — they enrich the seed for when it's
+# claimed and add NO transact serving. The pivota_signature_* fields (W5 P3)
+# DO mint the offer-free citation identity: the by-signature PDP read serves
+# this seed once index_pipeline_state.index_eligible flips true (which only
+# happens when the seed passes the quality gates — a thin seed stays
 # ineligible until E1 enrichment upgrades it).
+#
+# Convergence Phase 1.1: the tier triple is stamped EXPLICITLY. The DB
+# server-defaults (internal_merchant/primary/commerce_ready, db/catalog.py)
+# describe a FIRST-PARTY SYNCED product; an audit seed is an OBSERVED,
+# unclaimed record and must carry the same honest triple as the external-seed
+# mirror door (external_referral/observed/referral_only). Insert-only: the
+# ON CONFLICT branch never re-asserts tiers, so a row a future graduation
+# ladder has advanced is never downgraded by a re-audit.
+_AUDIT_SEED_CATALOG_TRACK = "external_referral"
+_AUDIT_SEED_TRUTH_TIER = "observed"
+_AUDIT_SEED_READINESS_TIER = "referral_only"
+
 _CATALOG_INSERT_COLUMNS = (
     "product_key", "merchant_id", "platform", "source_product_id",
     "title", "brand", "content_key", "canonical_url", "source_domain",
@@ -437,23 +449,36 @@ async def _existing_brand_canonical_conflict(
     return dict(row) if row else None
 
 
-async def apply_audit_brand_fragmentation_guard(
-    merchant_id: str, fields: Dict[str, Any]
+async def apply_intake_brand_fragmentation_guard(
+    merchant_id: str,
+    fields: Dict[str, Any],
+    *,
+    door: str = "url_audit_intake",
+    block_on_conflict: bool = True,
 ) -> Dict[str, Any]:
-    """Decide whether to mint this audit seed. Returns {action, ...}:
-      - 'proceed' : flag off, no conflict, or any error (fail-open — never block
-                    the seed on the guard's account).
-      - 'skip'    : a same-brand+host canonical exists under another merchant; a
-                    review task was enqueued and the orphan mint is suppressed.
+    """ADR-008 prevent-at-intake, shared by ALL intake doors (convergence
+    P1.4 — previously only the audit door ran it). Returns {action, ...}:
+      - 'proceed' : flag off, no conflict, or any error (fail-open — never
+                    block a record on the guard's account).
+      - 'skip'    : (block_on_conflict=True; observed-data doors: audit,
+                    seed mirror) a same-brand+host canonical exists under
+                    another merchant; a review task was enqueued and the
+                    orphan mint is suppressed.
+      - 'flag'    : (block_on_conflict=False; the FIRST-PARTY sync door) the
+                    conflict was enqueued for reconciliation but the record
+                    PROCEEDS — a connected merchant's own catalog is the
+                    higher-truth source and must never be blocked by an
+                    observed row (ADR-008 reconcile-at-connect, not
+                    block-at-connect).
     """
     if not audit_brand_fragmentation_guard_enabled(merchant_id):
         return {"action": "proceed", "reason": "disabled"}
     try:
         conflict = await _existing_brand_canonical_conflict(merchant_id, fields)
-    except Exception as exc:  # noqa: BLE001 — never block the seed on a guard error
+    except Exception as exc:  # noqa: BLE001 — never block the record on a guard error
         logger.warning(
-            "audit_intake.brand_guard lookup failed for %s: %s",
-            fields.get("product_key"), str(exc)[:200],
+            "%s.brand_guard lookup failed for %s: %s",
+            door, fields.get("product_key"), str(exc)[:200],
         )
         return {"action": "proceed", "reason": "error"}
     if not conflict:
@@ -467,6 +492,7 @@ async def apply_audit_brand_fragmentation_guard(
             "confidence": None,
             "evidence": {
                 "reason": "brand_already_canonical_under_other_merchant",
+                "door": door,
                 "conflict_merchant_id": conflict.get("merchant_id"),
                 "conflict_content_key": conflict.get("content_key"),
                 "brand": fields.get("brand"),
@@ -475,11 +501,20 @@ async def apply_audit_brand_fragmentation_guard(
         },
     )
     return {
-        "action": "skip",
+        "action": "skip" if block_on_conflict else "flag",
         "reason": "brand_fragmentation",
         "conflict_product_key": conflict.get("product_key"),
         "conflict_merchant_id": conflict.get("merchant_id"),
     }
+
+
+async def apply_audit_brand_fragmentation_guard(
+    merchant_id: str, fields: Dict[str, Any]
+) -> Dict[str, Any]:
+    """Audit-door wrapper (original call-site contract): conflict → 'skip'."""
+    return await apply_intake_brand_fragmentation_guard(
+        merchant_id, fields, door="url_audit_intake", block_on_conflict=True
+    )
 
 
 async def upsert_audited_sku_to_index(
@@ -548,11 +583,61 @@ async def upsert_audited_sku_to_index(
             "upsert_audited_sku_to_index: catalog_merchant upsert failed for %s: %s",
             merchant_id, str(exc)[:200],
         )
+    # Convergence P1.2 (ADR-009 D3): seller-of-record on the CANONICAL row.
+    # Audit-door records have no external_product_seeds row, so without this
+    # the attribution closure has no seller_ref source and stamps
+    # seller_ref_missing.
+    #
+    # CRITICAL: we resolve the seller from the DESTINATION (brand + audited
+    # domain) via the SAME claim-aware primitive the crawl door uses
+    # (ensure_observed_seller), NOT by treating the auditing merchant as an
+    # "anchor that owns the domain". The audit path calls upsert_catalog_merchant
+    # ABOVE, which overwrites catalog_merchants[merchant_id].source_ref with the
+    # AUDITED domain — so an anchor-owns-domain check reads that back and would
+    # tautologically resolve 'self' for EVERY audit, mis-attributing a
+    # competitor's product to the auditing merchant (write-once, never
+    # corrected). ensure_observed_seller instead reads verified `brand_claims`:
+    #   - destination is a VERIFIED-claimed domain → that tenant is the seller
+    #     (→ seed_kind 'self' iff it IS the auditing merchant, else 'cross');
+    #   - otherwise → a per-brand observed seller (→ 'cross').
+    # underivable (no brand / non-registrable domain / error) → NULL/NULL, the
+    # honest legacy state that A9-4 backfills; NEVER assume 'self'.
+    seller_ref: Optional[str] = None
+    seed_kind: Optional[str] = None
+    try:
+        from services.seller_identity import ensure_observed_seller, etld1
+
+        _dest = fields.get("source_domain") or fields.get("canonical_url")
+        _brand = str(fields.get("brand") or "").strip()
+        if _brand and etld1(_dest):
+            resolved_seller = await ensure_observed_seller(
+                brand=_brand,
+                domain=_dest,
+                source_system="url_audit_intake",
+                primary_platform=PLATFORM_URL_AUDIT,
+            )
+            seller_ref = resolved_seller
+            seed_kind = "self" if resolved_seller == merchant_id else "cross"
+    except Exception as exc:  # noqa: BLE001 — must never break the audit seed
+        seller_ref, seed_kind = None, None
+        logger.warning(
+            "upsert_audited_sku_to_index: seller derivation failed for %s: %s",
+            fields.get("product_key"), str(exc)[:200],
+        )
+
     try:
         from db.catalog import catalog_products
         from db.database import database
 
         values = {k: fields.get(k) for k in _CATALOG_INSERT_COLUMNS}
+        # Phase 1.1: honest tier triple on INSERT only (see comment at
+        # _AUDIT_SEED_* above) — never in the ON CONFLICT set_.
+        values["catalog_track"] = _AUDIT_SEED_CATALOG_TRACK
+        values["truth_tier"] = _AUDIT_SEED_TRUTH_TIER
+        values["readiness_tier"] = _AUDIT_SEED_READINESS_TIER
+        # Phase 1.2: seller identity rides the canonical row.
+        values["seller_ref"] = seller_ref
+        values["seed_kind"] = seed_kind
         stmt = _pg_insert(catalog_products).values(**values)
         stmt = stmt.on_conflict_do_update(
             index_elements=["product_key"],
@@ -593,6 +678,15 @@ async def upsert_audited_sku_to_index(
                 "pivota_signature_minted_at": func.coalesce(
                     catalog_products.c.pivota_signature_minted_at,
                     stmt.excluded.pivota_signature_minted_at,
+                ),
+                # P1.2: seller identity is WRITE-ONCE (existing first) — a
+                # re-audit backfills NULL legacy rows but never re-keys a
+                # seller already derived (identity stability, ADR-009).
+                "seller_ref": func.coalesce(
+                    catalog_products.c.seller_ref, stmt.excluded.seller_ref
+                ),
+                "seed_kind": func.coalesce(
+                    catalog_products.c.seed_kind, stmt.excluded.seed_kind
                 ),
                 "updated_at": func.now(),
                 "content_changed_at": func.now(),

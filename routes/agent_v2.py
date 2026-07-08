@@ -738,7 +738,7 @@ async def search_products_v2(
             record_decision_event,
             record_exposure_events,
         )
-        from services.protocols import DEFAULT_PROTOCOL
+        from services.protocols import derive_protocol_for_surface
 
         raw_products = [p for p in (result.get("products") or []) if isinstance(p, dict)]
         rows = []
@@ -764,7 +764,12 @@ async def search_products_v2(
                     merchant_id=body.merchant_id,
                     surface="agent_v2.products.search",
                     channel=body.request_context.channel if body.request_context else None,
-                    protocol=DEFAULT_PROTOCOL,
+                    # Phase 0: derive the agentic-commerce protocol from the
+                    # request channel instead of hardcoding pdp_direct —
+                    # conservative mapper, unknown channels stay default.
+                    protocol=derive_protocol_for_surface(
+                        body.request_context.channel if body.request_context else None
+                    ),
                     agent_context={
                         "agent_id": getattr(context, "agent_id", None),
                         "session_id": getattr(context, "session_id", None),

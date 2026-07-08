@@ -5313,6 +5313,113 @@ async def _attach_connected_product_redirects(
         logger.warning("connected-product redirect stamping failed: %s", str(e)[:160])
 
 
+def _record_gateway_decision_events(
+    result: Any,
+    *,
+    surface: str,
+    query: Optional[str] = None,
+    merchant_id: Optional[str] = None,
+    source: Optional[str] = None,
+    extra_context: Optional[Dict[str, Any]] = None,
+) -> None:
+    """Phase 0 (convergence plan): deposit the serving slate into the
+    decision-layer event store from the mainline gateway — previously the
+    highest-traffic lane emitted NO decision events, so the ledger had no
+    behavioral baseline for this surface.
+
+    Mirrors the agent_v2/agent_sdk_fixed writer pattern: stamp a decision_id
+    into result metadata (so order creation can link the funnel), then
+    fire-and-forget the event-store enqueue. Fail-soft everywhere — recording
+    can never break search. The ``protocol`` dimension is derived from the
+    request source label (mcp/acp/ucp) instead of hardcoding pdp_direct."""
+    try:
+        import uuid as _uuid
+
+        if not isinstance(result, dict):
+            return
+        # Idempotence: retry/fallback branches re-enter the wrapper with the
+        # SAME result object — one returned slate must yield exactly one
+        # decision event, so a result already stamped is never re-recorded.
+        existing_meta = result.get("metadata")
+        if isinstance(existing_meta, dict) and isinstance(existing_meta.get("decision_layer"), dict):
+            return
+        products = [p for p in (result.get("products") or []) if isinstance(p, dict)]
+
+        decision_id = str(_uuid.uuid4())
+        metadata = result.get("metadata") if isinstance(result.get("metadata"), dict) else {}
+        metadata = dict(metadata or {})
+        metadata["decision_id"] = decision_id
+        metadata["decision_layer"] = {
+            "decision_id": decision_id,
+            "correlation_source": surface,
+        }
+        result["metadata"] = metadata
+
+        from services.agent_decision_event_store import (
+            record_decision_candidates,
+            record_decision_event,
+            record_exposure_events,
+        )
+        from services.protocols import derive_protocol_for_surface
+
+        # NOTE (honest scope): on the gateway SHOPPING lane the source label is
+        # shopping-*/aurora-*/creator-* (not a protocol session), so this
+        # resolves DEFAULT_PROTOCOL for ~all mainline traffic — which is
+        # correct (direct-PDP serving). The dimension only becomes non-default
+        # when a genuine mcp/acp/ucp surface drives the call (e.g. agent_v2's
+        # request channel). It replaces the previous unconditional hardcode.
+        protocol = derive_protocol_for_surface(source)
+        rows = []
+        for idx, product in enumerate(products):
+            rows.append(
+                {
+                    # external-seed cards carry catalog identity under
+                    # attached_product_key; connected/pivot mainline cards
+                    # don't emit a top-level content_key yet (Phase-2 card
+                    # mapping) — captured here best-effort, NULL otherwise.
+                    "content_key": (
+                        product.get("content_key")
+                        or product.get("product_key")
+                        or product.get("attached_product_key")
+                    ),
+                    "catalog_offer_id": product.get("catalog_offer_id") or product.get("offer_id"),
+                    "position": idx,
+                    "eligibility_flags": {
+                        "merchant_id": product.get("merchant_id"),
+                        "platform": product.get("platform"),
+                        "in_stock": product.get("in_stock"),
+                        "source": product.get("source"),
+                        "has_external_redirect": bool(product.get("external_redirect_url")),
+                    },
+                    "slot": "search_result",
+                }
+            )
+
+        async def _record() -> None:
+            try:
+                await record_decision_event(
+                    decision_id=decision_id,
+                    merchant_id=merchant_id,
+                    surface=surface,
+                    channel=source,
+                    protocol=protocol,
+                    agent_context={
+                        "query": query,
+                        "source": source,
+                        "result_count": len(products),
+                        **(extra_context or {}),
+                    },
+                )
+                await record_decision_candidates(decision_id, rows)
+                await record_exposure_events(decision_id, rows)
+            except Exception:
+                logger.debug("gateway decision event enqueue failed", exc_info=True)
+
+        asyncio.create_task(_record())
+    except Exception:  # never let ledger recording break search
+        logger.debug("gateway decision event scheduling failed", exc_info=True)
+
+
 def _pivot_primary_offer(item: PivotResultItem) -> Optional[Any]:
     if not item.offers:
         return None
@@ -7184,7 +7291,7 @@ async def _handle_find_products(
     # P2b: attributed /r links on connected cards (fail-soft, additive).
     await _attach_connected_product_redirects(product_payloads, tool="find_products")
 
-    return {
+    result = {
         "products": product_payloads,
         "total": total,
         "page": page,
@@ -7194,6 +7301,14 @@ async def _handle_find_products(
             "fetched_at": datetime.utcnow().isoformat(),
         },
     }
+    # Phase 0 (convergence): merchant-scoped search also deposits its slate.
+    _record_gateway_decision_events(
+        result,
+        surface="agent_shop_gateway.find_products",
+        query=filters.query,
+        merchant_id=merchant_id,
+    )
+    return result
 
 
 async def _invoke_multi_upstream_fallback(
@@ -7306,18 +7421,40 @@ async def _handle_find_products_multi(
     payload: FindProductsMultiPayload,
     request_metadata: Optional[Dict[str, Any]],
     background_tasks: BackgroundTasks,
+    *,
+    emit_decision_event: bool = True,
 ) -> Dict[str, Any]:
     """Thin wrapper over the real multi-search implementation that stamps
     attributed /r links onto connected-merchant cards on EVERY return branch
     (the implementation has many exits — cached, pivot, fallback, retry). P2b;
     fail-soft and idempotent (already-stamped cards, incl. external_seed, are
-    skipped), so re-entrant retry paths that call this wrapper again are safe."""
+    skipped), so re-entrant retry paths that call this wrapper again are safe.
+
+    ``emit_decision_event`` (Phase 0): this wrapper is ALSO used as an internal
+    building block — find_similar_products calls it (primary + broad fallback)
+    and the fragrance semantic-retry re-invokes it — where the produced slate is
+    an intermediate, not what gets served. Those callers pass False so the
+    decision-layer ledger records exactly one event per SERVED slate, not the
+    intermediate queries (which would pollute the behavioral baseline)."""
     result = await _handle_find_products_multi_inner(payload, request_metadata, background_tasks)
     try:
         if isinstance(result, dict):
             await _attach_connected_product_redirects(result.get("products"), tool="find_products_multi")
     except Exception:
         pass  # never let attribution stamping break search
+    # Phase 0 (convergence): deposit the served slate into the decision-layer
+    # ledger AFTER redirect stamping so eligibility_flags see the final cards.
+    if emit_decision_event:
+        _record_gateway_decision_events(
+            result,
+            surface="agent_shop_gateway.find_products_multi",
+            query=payload.search.query if payload and payload.search else None,
+            source=(request_metadata or {}).get("source") if isinstance(request_metadata, dict) else None,
+            extra_context={
+                "page": payload.search.page if payload and payload.search else None,
+                "limit": payload.search.limit if payload and payload.search else None,
+            },
+        )
     return result
 
 
@@ -10723,6 +10860,9 @@ async def _handle_find_products_multi_inner(
                 retry_payload,
                 retry_metadata,
                 background_tasks,
+                # internal semantic-retry slate — not the served result; the
+                # outer wrapper records the one event for what's actually served.
+                emit_decision_event=False,
             )
             if isinstance(retry_result, dict):
                 retry_products = retry_result.get("products")
@@ -11390,6 +11530,9 @@ async def _handle_find_similar_products(
                 primary_payload,
                 request_metadata or {},
                 background_tasks,
+                # find_similar building block — the served slate is the similar
+                # result, not this internal multi-search; don't record it.
+                emit_decision_event=False,
             )
             fallback_products = primary_result.get("products", []) or []
 
@@ -11415,6 +11558,7 @@ async def _handle_find_similar_products(
                     broad_payload,
                     request_metadata or {},
                     background_tasks,
+                    emit_decision_event=False,  # internal fallback slate
                 )
                 fallback_products = broad_result.get("products", []) or []
 

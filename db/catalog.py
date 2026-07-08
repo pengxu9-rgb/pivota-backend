@@ -79,6 +79,13 @@ catalog_products = Table(
     # Cached LLM attribute-extractor output keyed by a source_hash (mig 174) so
     # re-audits don't re-pay the LLM. See services.llm_attribute_extractor.
     Column("llm_attributes", JSONB_TYPE, nullable=True),
+    # ADR-009 seller-of-record on the CANONICAL row (mig 176, convergence P1.2):
+    # records written without an external_product_seeds row (the audit intake
+    # door) need seller identity here or attribution closure stamps
+    # seller_ref_missing. seed_kind ∈ {'self','cross'}; NULL = legacy/underivable
+    # (never assumed 'self' — ADR-009 D3 no-fallback).
+    Column("seller_ref", Text, nullable=True),
+    Column("seed_kind", Text, nullable=True),
     Column("canonical_url", Text, nullable=True),
     Column("image_url", Text, nullable=True),
     Column("product_payload", JSONB_TYPE, nullable=True),
