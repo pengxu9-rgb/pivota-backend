@@ -1923,6 +1923,7 @@ async def get_merchant_audit_history(
 @router.get("/tracking")
 async def get_merchant_visibility_tracking(
     limit: int = 50,
+    subject_type: str = "merchant",
     merchant_id: str = Depends(get_current_merchant),
 ) -> Dict[str, Any]:
     """Visibility-over-time series for this merchant (the W2 payoff / retention
@@ -1930,16 +1931,28 @@ async def get_merchant_visibility_tracking(
     merchant's completed audits, plus per-provider lines — each point tagged with
     its measurement basis so the chart connects ONLY comparable (same pinned prompt
     set) points and breaks where the basis changed. Empty/baseline until there are
-    >=2 same-basis runs to trend."""
+    >=2 same-basis runs to trend.
+
+    `subject_type` scopes the series to one run kind, mirroring /history:
+    "merchant" (per-SKU catalog audits, default) or "merchant_url" (the
+    URL-visibility wedge) — the two never mix in one trend because their
+    scores are measured on different subjects."""
     if limit <= 0 or limit > 50:
         raise HTTPException(
             status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
             detail="limit must be between 1 and 50",
         )
+    if subject_type not in ("merchant", "merchant_url"):
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail="subject_type must be 'merchant' or 'merchant_url'",
+        )
     from db.merchant_audit_runs import score_history_for_merchant
     from services.audit_tracking_series import build_tracking_series
 
-    rows = await score_history_for_merchant(merchant_id=merchant_id, limit=limit)
+    rows = await score_history_for_merchant(
+        merchant_id=merchant_id, limit=limit, subject_type=subject_type,
+    )
     series = build_tracking_series(rows)
     return {"merchant_id": merchant_id, **series}
 

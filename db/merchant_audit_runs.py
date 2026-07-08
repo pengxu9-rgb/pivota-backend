@@ -484,6 +484,14 @@ async def audit_status_counts_in_window(*, window_seconds: int) -> Dict[str, int
         return {}
 
 
+# Successful runs carry legacy status='succeeded' (transition_stage keeps the
+# old column aligned; nothing writes status='completed'). 'completed' stays in
+# the IN-list only for any pre-stage-era rows. Filtering on `stage='completed'`
+# instead would be wrong: the stage column was backfilled with DEFAULT
+# 'completed' for ALL legacy rows, including failed ones.
+_COMPLETED_STATUS_SQL = "status IN ('succeeded', 'completed')"
+
+
 async def recent_completed_reports(*, limit: int = 100) -> List[Dict[str, Any]]:
     """The most recent COMPLETED runs' report payloads (report_jsonb only), newest
     first — for the W7 brief-outcome scan (honest-failure lives INSIDE a completed
@@ -492,7 +500,7 @@ async def recent_completed_reports(*, limit: int = 100) -> List[Dict[str, Any]]:
     try:
         rows = await database.fetch_all(
             "SELECT run_id, report_jsonb FROM merchant_audit_runs "
-            "WHERE status = 'completed' AND report_jsonb IS NOT NULL "
+            f"WHERE {_COMPLETED_STATUS_SQL} AND report_jsonb IS NOT NULL "
             "ORDER BY requested_at DESC LIMIT :lim",
             {"lim": int(limit)},
         )
@@ -521,7 +529,7 @@ async def score_history_for_merchant(
             "SELECT run_id, requested_at, visibility_score_avg, attribution_score_avg, "
             "category_visibility_score_avg, report_jsonb "
             "FROM merchant_audit_runs "
-            "WHERE merchant_id = :mid AND subject_type = :st AND status = 'completed' "
+            f"WHERE merchant_id = :mid AND subject_type = :st AND {_COMPLETED_STATUS_SQL} "
             "ORDER BY requested_at DESC LIMIT :lim",
             {"mid": merchant_id, "st": subject_type, "lim": int(limit)},
         )
@@ -557,7 +565,7 @@ async def completed_runs_in_window(*, window_seconds: int) -> List[Dict[str, Any
         rows = await database.fetch_all(
             "SELECT merchant_id, run_id, requested_at, report_jsonb "
             "FROM merchant_audit_runs "
-            "WHERE status = 'completed' AND report_jsonb IS NOT NULL "
+            f"WHERE {_COMPLETED_STATUS_SQL} AND report_jsonb IS NOT NULL "
             "AND requested_at >= :cutoff "
             "ORDER BY merchant_id, requested_at DESC",
             {"cutoff": cutoff},
@@ -587,7 +595,7 @@ async def recent_completed_reports_for_merchant(
     try:
         rows = await database.fetch_all(
             "SELECT run_id, report_jsonb FROM merchant_audit_runs "
-            "WHERE merchant_id = :mid AND status = 'completed' AND report_jsonb IS NOT NULL "
+            f"WHERE merchant_id = :mid AND {_COMPLETED_STATUS_SQL} AND report_jsonb IS NOT NULL "
             "ORDER BY requested_at DESC LIMIT :lim",
             {"mid": merchant_id, "lim": int(limit)},
         )

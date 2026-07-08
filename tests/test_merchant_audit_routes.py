@@ -790,3 +790,60 @@ def test_happy_path_returns_brand_report_with_per_product_array(env):
         p["pdp_url"] in {"https://example.com/p/p1", "https://example.com/p/p2"}
         for p in products
     )
+
+
+# ---------------------------------------------------------------------------
+# GET /tracking — subject_type scoping (the URL-audit page's trend chart)
+# ---------------------------------------------------------------------------
+
+
+def test_tracking_defaults_to_merchant_subject_type(
+    env, monkeypatch: pytest.MonkeyPatch,
+):
+    """Without a subject_type param the series covers catalog audits."""
+    client, _, _ = env
+    captured: Dict[str, Any] = {}
+
+    async def _fake_history(**kwargs):
+        captured.update(kwargs)
+        return []
+
+    monkeypatch.setattr(
+        "db.merchant_audit_runs.score_history_for_merchant", _fake_history,
+    )
+    res = client.get("/api/merchant-center/audit/tracking")
+    assert res.status_code == 200, res.text
+    assert captured["subject_type"] == "merchant"
+    assert res.json()["points"] == []
+
+
+def test_tracking_scopes_to_merchant_url_runs(
+    env, monkeypatch: pytest.MonkeyPatch,
+):
+    """subject_type=merchant_url scopes the series to URL-wedge runs — the
+    URL-audit page's chart must reflect the audits run on that page."""
+    client, _, _ = env
+    captured: Dict[str, Any] = {}
+
+    async def _fake_history(**kwargs):
+        captured.update(kwargs)
+        return []
+
+    monkeypatch.setattr(
+        "db.merchant_audit_runs.score_history_for_merchant", _fake_history,
+    )
+    res = client.get(
+        "/api/merchant-center/audit/tracking",
+        params={"subject_type": "merchant_url"},
+    )
+    assert res.status_code == 200, res.text
+    assert captured["subject_type"] == "merchant_url"
+
+
+def test_tracking_422_on_unknown_subject_type(env):
+    client, _, _ = env
+    res = client.get(
+        "/api/merchant-center/audit/tracking",
+        params={"subject_type": "cold_start"},
+    )
+    assert res.status_code == 422

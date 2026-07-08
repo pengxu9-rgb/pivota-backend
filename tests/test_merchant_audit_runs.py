@@ -186,3 +186,62 @@ async def sqlite_db(monkeypatch):
 )
 async def test_record_audit_run_started_then_completed_round_trip(sqlite_db):
     pass
+
+
+# ---------------------------------------------------------------------
+# 3. Completed-run status filter (regression)
+# ---------------------------------------------------------------------
+#
+# Successful runs are written with legacy status='succeeded'
+# (transition_stage keeps the old column aligned; nothing ever writes
+# status='completed'). The W2 tracking readers originally filtered
+# `status = 'completed'`, which matched ZERO rows — the visibility
+# trend was empty for every merchant. These tests pin the corrected
+# filter so it can't regress.
+
+
+class _CapturingDatabase:
+    """Stands in for db.merchant_audit_runs.database; records raw SQL."""
+
+    def __init__(self):
+        self.queries: List[str] = []
+
+    async def fetch_all(self, query, values=None):
+        self.queries.append(str(query))
+        return []
+
+
+@pytest.mark.parametrize(
+    "call",
+    [
+        lambda m: m.score_history_for_merchant(merchant_id="m1"),
+        lambda m: m.recent_completed_reports(),
+        lambda m: m.recent_completed_reports_for_merchant(merchant_id="m1"),
+        lambda m: m.completed_runs_in_window(window_seconds=3600),
+    ],
+    ids=[
+        "score_history_for_merchant",
+        "recent_completed_reports",
+        "recent_completed_reports_for_merchant",
+        "completed_runs_in_window",
+    ],
+)
+def test_completed_readers_match_succeeded_status(monkeypatch, call):
+    import db.merchant_audit_runs as m
+
+    fake_db = _CapturingDatabase()
+    monkeypatch.setattr(m, "database", fake_db)
+
+    async def _no_op_ensure():
+        return None
+
+    monkeypatch.setattr(m, "ensure_merchant_audit_runs_table", _no_op_ensure)
+
+    asyncio.run(call(m))
+    assert len(fake_db.queries) == 1
+    sql = fake_db.queries[0]
+    # Completed runs carry status='succeeded'; 'completed' is tolerated
+    # for pre-stage-era rows only. A bare equality on 'completed' is the
+    # regression this test exists to block.
+    assert "status IN ('succeeded', 'completed')" in sql
+    assert "status = 'completed'" not in sql
