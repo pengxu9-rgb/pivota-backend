@@ -2172,6 +2172,25 @@ def _vertical_for(product: Dict[str, Any]) -> str:
     return resolve_vertical(product)
 
 
+def _sku_vertical_signal_text(product: Mapping[str, Any]) -> str:
+    """The free-text a SKU's vertical is resolved from when it has no structured
+    product_type/category — title PLUS attributes_raw values (tags, description).
+    Mirrors the `combined` text the unbranded-category fallback already reads, so
+    a beauty SKU whose only beauty signal lives in its tags/description (e.g. a
+    supplement whose fetched product_type is the noisy "grape jelly") still
+    resolves beauty instead of collapsing to the generic profile."""
+    parts: List[str] = [str(product.get("title") or ""), str(product.get("raw_title") or "")]
+    attrs = product.get("attributes_raw")
+    if isinstance(attrs, Mapping):
+        for value in attrs.values():
+            if isinstance(value, (str, int, float)):
+                parts.append(str(value))
+        tags = attrs.get("tags")
+        if isinstance(tags, list):
+            parts.extend(str(tag) for tag in tags)
+    return " ".join(p for p in parts if p)
+
+
 def _resolved_vertical_for_ctx(
     sku_ctx: Optional[Mapping[str, Any]],
     product: Optional[Mapping[str, Any]],
@@ -2179,7 +2198,8 @@ def _resolved_vertical_for_ctx(
     """The resolved vertical for a SKU-context, honoring Principle 1 (resolve
     once, pass down). Preference order: a vertical already stashed on the ctx ->
     the durable `resolved_vertical` column on the product row -> live resolution
-    (with title, so URL-audit / store-less SKUs still resolve). Returns one of
+    (product_type/category first, then the title + tags/description signal, so
+    URL-audit / store-less SKUs still resolve). Returns one of
     beauty|fashion|electronics|other."""
     for source in (sku_ctx, product):
         if isinstance(source, Mapping):
@@ -2187,7 +2207,7 @@ def _resolved_vertical_for_ctx(
             if value in {"beauty", "fashion", "electronics", "other"}:
                 return value
     prod = product if isinstance(product, Mapping) else {}
-    return resolve_vertical(prod, title=prod.get("title") or prod.get("raw_title"))
+    return resolve_vertical(prod, title=_sku_vertical_signal_text(prod))
 
 
 def _profile_for_sku_ctx(
