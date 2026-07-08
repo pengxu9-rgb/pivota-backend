@@ -128,6 +128,12 @@ from services.vertical_profiles import (
     get_profile,
     resolve_vertical,
 )
+from services.llm_attribute_extractor import (
+    GroundedAttribute,
+    extract_attributes,
+    merge_grounded_into_graph,
+    should_run_extractor,
+)
 
 
 _ANSWER_QUALITY_VERIFY_SCAN_MODE = "answer_quality_verify"
@@ -2217,6 +2223,96 @@ def _profile_for_sku_ctx(
     """The VerticalProfile for a SKU-context. Beauty -> beauty profile (identical
     behavior); unknown -> generic (never beauty-as-fallback)."""
     return get_profile(_resolved_vertical_for_ctx(sku_ctx, product))
+
+
+# --- Phase 2b: live LLM attribute extractor (flag-gated) -------------------- #
+# Stash key on the SKU context; the grounded attributes are merged into the
+# attribute graph ONLY at the probe-seeding sites, so they influence what the
+# audit probes without touching the lexicon path when the flag is off.
+_LLM_ATTR_STASH_KEY = "_llm_extracted_attributes"
+
+
+def _resolve_extractor_provider() -> Tuple[Optional[str], Optional[str]]:
+    """Provider/model for the attribute extractor. An explicit, keyed
+    ATTRIBUTE_EXTRACTOR_PROVIDER wins; otherwise reuse the (cheap, key-aware)
+    prompt-gen chain. ATTRIBUTE_EXTRACTOR_MODEL overrides the model when set."""
+    from config.settings import settings as app_settings
+
+    override_model = (app_settings.attribute_extractor_model or "").strip()
+    explicit = (app_settings.attribute_extractor_provider or "").strip()
+    if explicit:
+        from services.llm_synthesis import (
+            LLMSynthesisError,
+            configured_key_for_provider,
+            default_model_for_provider,
+            normalize_provider,
+        )
+        try:
+            canonical = normalize_provider(explicit)
+            if configured_key_for_provider(canonical):
+                return canonical, override_model or default_model_for_provider(canonical)
+        except LLMSynthesisError:
+            pass
+    provider, model = _resolve_prompt_gen_provider()
+    return provider, (override_model or model)
+
+
+def _stashed_grounded_attributes(sku_ctx: Optional[Mapping[str, Any]]) -> List[GroundedAttribute]:
+    if not isinstance(sku_ctx, Mapping):
+        return []
+    stash = sku_ctx.get(_LLM_ATTR_STASH_KEY)
+    return list(stash) if isinstance(stash, list) else []
+
+
+def _attribute_graph_for_probes(
+    sku_ctx: Optional[Mapping[str, Any]],
+    product: Mapping[str, Any],
+) -> Dict[str, Any]:
+    """The attribute graph the probe generators consume: the deterministic
+    lexicon graph, plus any flag-gated LLM-extracted (and grounded) attributes
+    stashed on the ctx. With the flag off / nothing stashed this is exactly
+    build_sku_attribute_graph(product) — no behavior change."""
+    graph = build_sku_attribute_graph(product)
+    grounded = _stashed_grounded_attributes(sku_ctx)
+    if grounded:
+        merge_grounded_into_graph(graph, grounded)
+    return graph
+
+
+async def _maybe_stash_llm_attributes(ctx: Dict[str, Any]) -> None:
+    """When the extractor flag is on, run the LLM attribute extractor for SKUs the
+    lexicon can't serve and stash the grounded attributes on the ctx. Best-effort:
+    any failure leaves the ctx untouched (the audit falls back to the lexicon
+    path). No-op when the flag is off — so beauty and every existing audit are
+    byte-identical."""
+    from config.settings import settings as app_settings
+
+    if not getattr(app_settings, "attribute_extractor_enabled", False):
+        return
+    product = _get_product(ctx)
+    if not isinstance(product, Mapping) or not product:
+        return
+    try:
+        profile = _profile_for_sku_ctx(ctx, product)
+        lexicon_graph = build_sku_attribute_graph(product)
+        if not should_run_extractor(profile, lexicon_graph):
+            return
+        provider, model = _resolve_extractor_provider()
+        if not provider:
+            return
+        from services.llm_synthesis import synthesize
+
+        grounded = await extract_attributes(
+            product,
+            synthesize=synthesize,
+            provider=provider,
+            model=model or "",
+            max_tokens=int(getattr(app_settings, "attribute_extractor_max_tokens", 900) or 900),
+        )
+        if grounded:
+            ctx[_LLM_ATTR_STASH_KEY] = list(grounded)
+    except Exception as exc:  # never let extraction break context load
+        logger.warning("attribute extractor stash failed: %s", exc)
 
 
 def _confidence_ok(value: Any) -> bool:
@@ -4679,6 +4775,10 @@ async def load_sku_context(sku_key: str, merchant_id: str) -> Dict[str, Any]:
         "substantiated_evidence_count": substantiated_evidence_count,
         "third_party_evidence_sources": third_party_evidence_sources,
     }
+    # Phase 2b: flag-gated LLM attribute extraction for lexicon-thin SKUs
+    # (electronics/generic/thin) — no-op when the flag is off. Runs once here and
+    # is cached with the ctx, so the sync probe builders read the stash for free.
+    await _maybe_stash_llm_attributes(ctx)
     _SKU_CONTEXT_CACHE[cache_key] = ctx
     return ctx
 
@@ -8368,7 +8468,7 @@ def _build_per_sku_base_query_specs(
         or product.get("category")
         or ""
     )
-    attribute_graph = build_sku_attribute_graph(product)
+    attribute_graph = _attribute_graph_for_probes(sku_ctx, product)
     profile = _profile_for_sku_ctx(sku_ctx, product)
     unbranded_category = _category_for_unbranded_prompts(
         product,
@@ -8523,7 +8623,7 @@ def _sidewalk_query_records_for_sku(
     if not _product_has_attributes_raw(product):
         return []
 
-    graph = build_sku_attribute_graph(product)
+    graph = _attribute_graph_for_probes(sku_ctx, product)
     # Win-the-specific-long-tail: generate enough stacked prompts for the specific
     # lane to be the MAJORITY of the budget (reserve ~6 for the thin diagnostic
     # head/branded spine). Was hard-capped at 16, which starved the only lane that

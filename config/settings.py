@@ -277,6 +277,19 @@ class Settings(BaseSettings):
     strategic_brief_enabled: bool = (
         os.getenv("STRATEGIC_BRIEF_ENABLED", "false").lower() == "true"
     )
+    # Phase 2b — LLM attribute extractor (services/llm_attribute_extractor.py).
+    # OFF by default: a staged rollout. When on, it runs ONLY for SKUs the
+    # lexicon can't serve (profile.attribute_strategy == llm_extractor, i.e.
+    # electronics/generic, or a lexicon miss) — the beauty happy path never calls
+    # it. Provider/model fall back to the prompt-gen chain when unset.
+    attribute_extractor_enabled: bool = (
+        os.getenv("AUDIT_ATTRIBUTE_EXTRACTOR_ENABLED", "false").lower() == "true"
+    )
+    attribute_extractor_provider: str = os.getenv("ATTRIBUTE_EXTRACTOR_PROVIDER", "")
+    attribute_extractor_model: str = os.getenv("ATTRIBUTE_EXTRACTOR_MODEL", "")
+    attribute_extractor_max_tokens: int = int(
+        os.getenv("ATTRIBUTE_EXTRACTOR_MAX_TOKENS", "900")
+    )
     openai_api_key: Optional[str] = os.getenv("OPENAI_API_KEY")
     openai_model: str = os.getenv("OPENAI_MODEL", "gpt-4.1")
     anthropic_api_key: Optional[str] = os.getenv("ANTHROPIC_API_KEY")
