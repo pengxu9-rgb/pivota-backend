@@ -5113,7 +5113,7 @@ def _standard_to_shop_product(p: StandardProduct) -> Dict[str, Any]:
 
     # Storefront identity for the attributed-redirect lane (P2b): lets the
     # post-pass derive the merchant-store PDP destination. Additive; absent for
-    # platforms whose sync captures neither (e.g. Wix today).
+    # platforms whose sync captures neither.
     if getattr(p, "handle", None):
         base["handle"] = p.handle
     if getattr(p, "online_store_url", None):
@@ -5181,8 +5181,9 @@ async def _attach_connected_product_redirects(
     destination is derivable: ``online_store_url``, else (Shopify) the
     connected shop domain + ``handle``. A connected Shopify product with a
     numeric variant id yields join_mode=cart_permalink inside the mint — an
-    ORDER-side join closable by T2-2 with zero merchant setup. Wix cards are
-    skipped until wix_sync captures a storefront URL (honest degradation).
+    ORDER-side join closable by T2-2 with zero merchant setup. Wix cards join
+    via ``online_store_url`` captured by the Wix sync (referral_only join);
+    cards with no derivable destination are skipped (honest degradation).
 
     Trust basis: the destination is the merchant's OWN connected store, so the
     mint's domain allowlist is exactly that destination's host (the store
@@ -5236,7 +5237,7 @@ async def _attach_connected_product_redirects(
             if not dest and platform == "shopify" and shop_domain and handle:
                 dest = f"https://{normalize_shop_host(shop_domain)}/products/{handle}"
             if not dest.startswith(("http://", "https://")):
-                continue  # no derivable merchant destination (e.g. Wix today)
+                continue  # no derivable merchant destination — never fabricate one
 
             variant_id: Optional[str] = None
             for v in p.get("variants") or []:

@@ -45,7 +45,7 @@ def _slug_from_url(url: Optional[str]) -> Optional[str]:
 def _apply_storefront_fields(sp: StandardProduct) -> StandardProduct:
     """Fill the cross-platform handle / online_store_url from platform_metadata
     when they aren't already set, so the portal has one reliable field to match
-    audited product URLs against (Shopify=handle, WooCommerce=permalink/slug).
+    audited product URLs against (Shopify=handle, WooCommerce/Wix=permalink/slug).
     Best-effort and in-place; leaves them None when nothing usable exists."""
     meta = sp.platform_metadata or {}
     if not sp.handle:

@@ -539,7 +539,7 @@ class StandardProduct(BaseModel):
 
     # 店面 URL / handle — 跨平台统一字段，用于把站外（AI 可见性）审计里
     # 粘贴的商品链接匹配回已同步的 SKU。Shopify=handle slug；
-    # WooCommerce=permalink/slug。商户端无此数据时为 None（如 Wix）。
+    # WooCommerce=permalink/slug；Wix=slug/productPageUrl。商户端无此数据时为 None。
     handle: Optional[str] = None  # 产品 URL slug（用于匹配粘贴的商品链接）
     online_store_url: Optional[str] = None  # 商户店面完整商品 URL（如有）
 
