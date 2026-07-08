@@ -2962,6 +2962,26 @@ def _row_to_dict(row: Any) -> Dict[str, Any]:
         return {}
 
 
+def _products_cache_row_candidate(row: Any) -> tuple[str, Optional[Dict[str, Any]]]:
+    """Parse a products_cache row into (merchant_id, product_data dict).
+
+    `databases` returns Record objects (not dicts) whose `.get` attribute
+    resolves to a column lookup, so row.get(...) must never be called on the
+    raw row. Returns ("", None) / (mid, None) when the row is unusable.
+    """
+    row_map = _row_to_dict(row)
+    mid = str(row_map.get("merchant_id") or "").strip()
+    product_data = row_map.get("product_data")
+    if isinstance(product_data, str):
+        try:
+            product_data = json.loads(product_data)
+        except Exception:
+            return mid, None
+    if not isinstance(product_data, dict):
+        return mid, None
+    return mid, product_data
+
+
 def _extract_price_currency_from_variant(v: Dict[str, Any], fallback_currency: str) -> tuple[Optional[float], str]:
     price = (
         v.get("price_amount")
@@ -9468,16 +9488,8 @@ async def _handle_find_products_multi_inner(
                 )
 
                 for row in rows:
-                    mid = str(row.get("merchant_id") or "").strip()
-                    if not mid:
-                        continue
-                    product_data = row.get("product_data")
-                    if isinstance(product_data, str):
-                        try:
-                            product_data = json.loads(product_data)
-                        except Exception:
-                            continue
-                    if not isinstance(product_data, dict):
+                    mid, product_data = _products_cache_row_candidate(row)
+                    if not mid or product_data is None:
                         continue
                     try:
                         prod = StandardProduct(**product_data)
@@ -9486,7 +9498,7 @@ async def _handle_find_products_multi_inner(
                     except Exception:
                         continue
         except Exception as e:
-            logger.info(
+            logger.warning(
                 "multi.cross_merchant_cache_prefetch.failed",
                 extra={"query": q, "error": str(e)},
             )
@@ -9615,27 +9627,19 @@ async def _handle_find_products_multi_inner(
                     return False
 
                 for row in rows:
-                    mid = row.get("merchant_id") if isinstance(row, dict) else None
-                    if not mid:
-                        continue
-                    product_data = row.get("product_data") if isinstance(row, dict) else None
-                    if isinstance(product_data, str):
-                        try:
-                            product_data = json.loads(product_data)
-                        except Exception:
-                            continue
-                    if not isinstance(product_data, dict):
+                    mid, product_data = _products_cache_row_candidate(row)
+                    if not mid or product_data is None:
                         continue
                     if not _recall_row_matches(product_data):
                         continue
                     try:
                         prod = StandardProduct(**product_data)
-                        prod.merchant_id = prod.merchant_id or str(mid)
-                        merchant_products.append((prod, merchant_map.get(str(mid), "")))
+                        prod.merchant_id = prod.merchant_id or mid
+                        merchant_products.append((prod, merchant_map.get(mid, "")))
                     except Exception:
                         continue
         except Exception as e:
-            logger.info(
+            logger.warning(
                 "multi.cache_query_boost.failed",
                 extra={"query": q, "error": str(e)},
             )
