@@ -153,6 +153,36 @@ async def test_empty_slate_still_records_decision(monkeypatch: pytest.MonkeyPatc
     assert [op for op, _ in enqueued] == ["decision"]  # no candidate/exposure rows
 
 
+@pytest.mark.asyncio
+async def test_wrapper_suppresses_event_for_internal_subcalls(monkeypatch: pytest.MonkeyPatch):
+    """The wrapper is an internal building block (find_similar, semantic retry);
+    when called with emit_decision_event=False it must NOT record — so a single
+    served slate yields exactly one event, not one per intermediate query."""
+    enqueued = _capture_enqueue(monkeypatch)
+
+    async def fake_inner(payload, request_metadata, background_tasks):
+        return _result(1)
+
+    monkeypatch.setattr(gw, "_handle_find_products_multi_inner", fake_inner)
+    # avoid the redirect post-pass touching the DB in this unit test
+    async def _noop_redirects(*a, **k):
+        return None
+
+    monkeypatch.setattr(gw, "_attach_connected_product_redirects", _noop_redirects)
+
+    from fastapi import BackgroundTasks
+
+    payload = gw.FindProductsMultiPayload(search=gw.MultiSearchFilters(query="x", limit=5))
+
+    await gw._handle_find_products_multi(payload, {}, BackgroundTasks(), emit_decision_event=False)
+    await _drain()
+    assert [op for op, _ in enqueued] == []  # suppressed
+
+    await gw._handle_find_products_multi(payload, {}, BackgroundTasks())  # default True
+    await _drain()
+    assert "decision" in [op for op, _ in enqueued]  # recorded
+
+
 def test_derive_protocol_for_surface_mapping() -> None:
     assert derive_protocol_for_surface("mcp") == "mcp_session"
     assert derive_protocol_for_surface("acp-feed") == "acp_session"

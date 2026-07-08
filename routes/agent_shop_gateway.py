@@ -5362,12 +5362,26 @@ def _record_gateway_decision_events(
         )
         from services.protocols import derive_protocol_for_surface
 
+        # NOTE (honest scope): on the gateway SHOPPING lane the source label is
+        # shopping-*/aurora-*/creator-* (not a protocol session), so this
+        # resolves DEFAULT_PROTOCOL for ~all mainline traffic — which is
+        # correct (direct-PDP serving). The dimension only becomes non-default
+        # when a genuine mcp/acp/ucp surface drives the call (e.g. agent_v2's
+        # request channel). It replaces the previous unconditional hardcode.
         protocol = derive_protocol_for_surface(source)
         rows = []
         for idx, product in enumerate(products):
             rows.append(
                 {
-                    "content_key": product.get("content_key") or product.get("product_key"),
+                    # external-seed cards carry catalog identity under
+                    # attached_product_key; connected/pivot mainline cards
+                    # don't emit a top-level content_key yet (Phase-2 card
+                    # mapping) — captured here best-effort, NULL otherwise.
+                    "content_key": (
+                        product.get("content_key")
+                        or product.get("product_key")
+                        or product.get("attached_product_key")
+                    ),
                     "catalog_offer_id": product.get("catalog_offer_id") or product.get("offer_id"),
                     "position": idx,
                     "eligibility_flags": {
@@ -7407,12 +7421,21 @@ async def _handle_find_products_multi(
     payload: FindProductsMultiPayload,
     request_metadata: Optional[Dict[str, Any]],
     background_tasks: BackgroundTasks,
+    *,
+    emit_decision_event: bool = True,
 ) -> Dict[str, Any]:
     """Thin wrapper over the real multi-search implementation that stamps
     attributed /r links onto connected-merchant cards on EVERY return branch
     (the implementation has many exits — cached, pivot, fallback, retry). P2b;
     fail-soft and idempotent (already-stamped cards, incl. external_seed, are
-    skipped), so re-entrant retry paths that call this wrapper again are safe."""
+    skipped), so re-entrant retry paths that call this wrapper again are safe.
+
+    ``emit_decision_event`` (Phase 0): this wrapper is ALSO used as an internal
+    building block — find_similar_products calls it (primary + broad fallback)
+    and the fragrance semantic-retry re-invokes it — where the produced slate is
+    an intermediate, not what gets served. Those callers pass False so the
+    decision-layer ledger records exactly one event per SERVED slate, not the
+    intermediate queries (which would pollute the behavioral baseline)."""
     result = await _handle_find_products_multi_inner(payload, request_metadata, background_tasks)
     try:
         if isinstance(result, dict):
@@ -7421,16 +7444,17 @@ async def _handle_find_products_multi(
         pass  # never let attribution stamping break search
     # Phase 0 (convergence): deposit the served slate into the decision-layer
     # ledger AFTER redirect stamping so eligibility_flags see the final cards.
-    _record_gateway_decision_events(
-        result,
-        surface="agent_shop_gateway.find_products_multi",
-        query=payload.search.query if payload and payload.search else None,
-        source=(request_metadata or {}).get("source") if isinstance(request_metadata, dict) else None,
-        extra_context={
-            "page": payload.search.page if payload and payload.search else None,
-            "limit": payload.search.limit if payload and payload.search else None,
-        },
-    )
+    if emit_decision_event:
+        _record_gateway_decision_events(
+            result,
+            surface="agent_shop_gateway.find_products_multi",
+            query=payload.search.query if payload and payload.search else None,
+            source=(request_metadata or {}).get("source") if isinstance(request_metadata, dict) else None,
+            extra_context={
+                "page": payload.search.page if payload and payload.search else None,
+                "limit": payload.search.limit if payload and payload.search else None,
+            },
+        )
     return result
 
 
@@ -10836,6 +10860,9 @@ async def _handle_find_products_multi_inner(
                 retry_payload,
                 retry_metadata,
                 background_tasks,
+                # internal semantic-retry slate — not the served result; the
+                # outer wrapper records the one event for what's actually served.
+                emit_decision_event=False,
             )
             if isinstance(retry_result, dict):
                 retry_products = retry_result.get("products")
@@ -11503,6 +11530,9 @@ async def _handle_find_similar_products(
                 primary_payload,
                 request_metadata or {},
                 background_tasks,
+                # find_similar building block — the served slate is the similar
+                # result, not this internal multi-search; don't record it.
+                emit_decision_event=False,
             )
             fallback_products = primary_result.get("products", []) or []
 
@@ -11528,6 +11558,7 @@ async def _handle_find_similar_products(
                     broad_payload,
                     request_metadata or {},
                     background_tasks,
+                    emit_decision_event=False,  # internal fallback slate
                 )
                 fallback_products = broad_result.get("products", []) or []
 

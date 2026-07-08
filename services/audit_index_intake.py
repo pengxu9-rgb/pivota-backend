@@ -586,24 +586,40 @@ async def upsert_audited_sku_to_index(
     # Convergence P1.2 (ADR-009 D3): seller-of-record on the CANONICAL row.
     # Audit-door records have no external_product_seeds row, so without this
     # the attribution closure has no seller_ref source and stamps
-    # seller_ref_missing. derive_seed_seller is the SAME derivation the seed
-    # writers use: (auditing merchant, 'self') when it owns the destination
-    # domain, else the observed seller ('cross'); underivable → NULL/NULL —
-    # never assumed 'self'. Best-effort: seller derivation must never break
-    # the audit seed.
+    # seller_ref_missing.
+    #
+    # CRITICAL: we resolve the seller from the DESTINATION (brand + audited
+    # domain) via the SAME claim-aware primitive the crawl door uses
+    # (ensure_observed_seller), NOT by treating the auditing merchant as an
+    # "anchor that owns the domain". The audit path calls upsert_catalog_merchant
+    # ABOVE, which overwrites catalog_merchants[merchant_id].source_ref with the
+    # AUDITED domain — so an anchor-owns-domain check reads that back and would
+    # tautologically resolve 'self' for EVERY audit, mis-attributing a
+    # competitor's product to the auditing merchant (write-once, never
+    # corrected). ensure_observed_seller instead reads verified `brand_claims`:
+    #   - destination is a VERIFIED-claimed domain → that tenant is the seller
+    #     (→ seed_kind 'self' iff it IS the auditing merchant, else 'cross');
+    #   - otherwise → a per-brand observed seller (→ 'cross').
+    # underivable (no brand / non-registrable domain / error) → NULL/NULL, the
+    # honest legacy state that A9-4 backfills; NEVER assume 'self'.
     seller_ref: Optional[str] = None
     seed_kind: Optional[str] = None
     try:
-        from services.seller_identity import derive_seed_seller
+        from services.seller_identity import ensure_observed_seller, etld1
 
-        seller_ref, seed_kind = await derive_seed_seller(
-            anchor_merchant_id=merchant_id,
-            brand=fields.get("brand"),
-            destination_domain=fields.get("source_domain") or fields.get("canonical_url"),
-            source_system="url_audit_intake",
-            primary_platform=PLATFORM_URL_AUDIT,
-        )
-    except Exception as exc:  # noqa: BLE001
+        _dest = fields.get("source_domain") or fields.get("canonical_url")
+        _brand = str(fields.get("brand") or "").strip()
+        if _brand and etld1(_dest):
+            resolved_seller = await ensure_observed_seller(
+                brand=_brand,
+                domain=_dest,
+                source_system="url_audit_intake",
+                primary_platform=PLATFORM_URL_AUDIT,
+            )
+            seller_ref = resolved_seller
+            seed_kind = "self" if resolved_seller == merchant_id else "cross"
+    except Exception as exc:  # noqa: BLE001 — must never break the audit seed
+        seller_ref, seed_kind = None, None
         logger.warning(
             "upsert_audited_sku_to_index: seller derivation failed for %s: %s",
             fields.get("product_key"), str(exc)[:200],

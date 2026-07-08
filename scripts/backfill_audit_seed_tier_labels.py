@@ -38,11 +38,19 @@ logger = logging.getLogger("backfill_audit_seed_tier_labels")
 
 # Fingerprint of the audit door + untouched server-defaults. Keep in sync with
 # services/audit_index_intake.py PLATFORM_URL_AUDIT / _AUDIT_SEED_* constants.
+#
+# CRITICAL guard: claim + graduation NEVER write the tier triple (claim_state.py
+# sets only claim_state; brand_verified_graduation.py sets only pdp_scope), so a
+# CLAIMED or MERCHANT-OWNED audit row still carries the default triple and would
+# otherwise match here — relabelling it to referral_only could pull it off the
+# transact lane. Exclude any row that has advanced past the raw observed state.
 WHERE_MISLABELED = """
     platform = 'url_audit'
       AND catalog_track = 'internal_merchant'
       AND truth_tier = 'primary'
       AND readiness_tier = 'commerce_ready'
+      AND claim_state = 'unclaimed'
+      AND pdp_scope = 'unverified'
 """
 
 COUNT_SQL = f"SELECT COUNT(*) AS n FROM catalog_products WHERE {WHERE_MISLABELED}"
@@ -78,18 +86,35 @@ TOUCHED_SQL = """
     ORDER BY n DESC
 """
 
+# Audit rows carrying the raw default triple but which have ADVANCED
+# (claimed / graduated) — deliberately skipped by WHERE_MISLABELED so we never
+# downgrade a transact-eligible row. Surfaced so an operator can see them.
+SKIPPED_ADVANCED_SQL = """
+    SELECT claim_state, pdp_scope, COUNT(*) AS n
+    FROM catalog_products
+    WHERE platform = 'url_audit'
+      AND catalog_track = 'internal_merchant'
+      AND truth_tier = 'primary'
+      AND readiness_tier = 'commerce_ready'
+      AND (claim_state <> 'unclaimed' OR pdp_scope <> 'unverified')
+    GROUP BY claim_state, pdp_scope
+    ORDER BY n DESC
+"""
+
 
 async def run_backfill(*, apply: bool) -> Dict[str, Any]:
     row = await database.fetch_one(COUNT_SQL)
     mislabeled = int(dict(row).get("n") or 0) if row else 0
     samples = [dict(r) for r in await database.fetch_all(SAMPLE_SQL)]
     touched = [dict(r) for r in await database.fetch_all(TOUCHED_SQL)]
+    skipped_advanced = [dict(r) for r in await database.fetch_all(SKIPPED_ADVANCED_SQL)]
 
     report: Dict[str, Any] = {
         "apply": apply,
         "mislabeled_rows": mislabeled,
         "sample": samples,
         "skipped_non_default_tiers": touched,
+        "skipped_advanced_default_triple": skipped_advanced,
         "rows_updated": 0,
     }
     if apply and mislabeled:
