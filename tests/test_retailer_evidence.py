@@ -143,3 +143,37 @@ async def test_winnable_extractor_receives_retailer_excerpts(monkeypatch):
     assert out
     assert "retailer_listing_excerpts" in captured["user"]
     assert "argan oil and 200C heat protection" in captured["user"]
+
+
+@pytest.mark.asyncio
+async def test_load_prior_scans_succeeded_runs_and_scopes_run_kind(monkeypatch):
+    """Regression: recent_runs_for_merchant rows carry `status` and NO `stage`
+    key — the old stage=='completed' filter skipped every run, so Tier-1
+    recycling silently never engaged. Also: a urlwedge:* SKU's scan must ask
+    for merchant_url runs (the only kind that can carry it)."""
+    import db.merchant_audit_runs as mar
+    from services.retailer_evidence import load_prior_retailer_evidence
+
+    report = _report(
+        [_vge("Olive Young lists it with argan oil. " + LONG, ["oliveyoung.co.kr"])],
+    )
+    captured = {}
+
+    async def fake_recent(**kwargs):
+        captured.update(kwargs)
+        return [{
+            "run_id": "run-1",
+            "status": "succeeded",
+            "subject_type": "merchant_url",
+            # NO "stage" key — the trend projection never included one.
+        }]
+
+    async def fake_fetch(*, run_id):
+        return {"run_id": run_id, "report_jsonb": report}
+
+    monkeypatch.setattr(mar, "recent_runs_for_merchant", fake_recent)
+    monkeypatch.setattr(mar, "fetch_audit_run_by_id", fake_fetch)
+
+    out = await load_prior_retailer_evidence(merchant_id="m1", sku_key="urlwedge:abc")
+    assert out["excerpts"], "succeeded prior run must be harvestable"
+    assert captured["subject_type"] == "merchant_url"

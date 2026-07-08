@@ -54,6 +54,23 @@ _MAX_SELECTED_SPECS = 64
 # basis + evidence + weight). Anything else on a record is regenerable.
 _SELECTED_SPEC_KEYS = ("query", "axis", "source", "attribute_basis", "evidence", "intent_weight")
 
+# Namespace of the URL-wedge synthetic SKU keys (routes/merchant_audit_routes
+# mints them via _synthetic_url_sku_key, deterministic on (merchant_id,
+# pdp_url)). The namespace doubles as the run-kind signal: a wedge SKU's prior
+# basis lives in prior subject_type='merchant_url' runs, a catalog SKU's in
+# subject_type='merchant' runs — scanning the other kind can never match the
+# sku_key and only burns scan-window slots.
+URL_WEDGE_SKU_PREFIX = "urlwedge:"
+
+
+def subject_type_for_sku_key(sku_key: str) -> str:
+    """The audit-run subject_type whose reports can carry this SKU's basis."""
+    return (
+        "merchant_url"
+        if str(sku_key or "").startswith(URL_WEDGE_SKU_PREFIX)
+        else "merchant"
+    )
+
 
 def _clean_prompts(values: Any) -> List[str]:
     out: List[str] = []
@@ -207,15 +224,27 @@ async def load_prior_prompt_basis(
         return None
     try:
         from db.merchant_audit_runs import (
+            COMPLETED_RUN_STATUSES,
             fetch_audit_run_by_id,
             recent_runs_for_merchant,
         )
 
         runs = await recent_runs_for_merchant(
             merchant_id=merchant_id, limit=max(1, max_runs) + 2,
+            # Scope the scan to the run kind that can carry this SKU: URL-wedge
+            # synthetic SKUs live only in merchant_url runs, catalog SKUs only
+            # in merchant runs. Without this, a merchant alternating wedge and
+            # catalog audits fills the scan window with runs that can't match.
+            subject_type=subject_type_for_sku_key(sku_key),
         )
         for run in runs or []:
-            if str(run.get("stage") or "") != "completed":
+            # Completion is a STATUS question ('succeeded', legacy
+            # 'completed'). recent_runs_for_merchant rows carry no `stage`
+            # key at all — the old `stage == 'completed'` filter here skipped
+            # every run, so pinning silently never engaged (every audit
+            # regenerated a fresh basis; the tracking chart drew every point
+            # as its own basis segment).
+            if str(run.get("status") or "") not in COMPLETED_RUN_STATUSES:
                 continue
             row = await fetch_audit_run_by_id(run_id=str(run.get("run_id")))
             if not row:

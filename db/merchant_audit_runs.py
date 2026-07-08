@@ -489,7 +489,10 @@ async def audit_status_counts_in_window(*, window_seconds: int) -> Dict[str, int
 # the IN-list only for any pre-stage-era rows. Filtering on `stage='completed'`
 # instead would be wrong: the stage column was backfilled with DEFAULT
 # 'completed' for ALL legacy rows, including failed ones.
-_COMPLETED_STATUS_SQL = "status IN ('succeeded', 'completed')"
+COMPLETED_RUN_STATUSES = ("succeeded", "completed")
+_COMPLETED_STATUS_SQL = "status IN ({})".format(
+    ", ".join(f"'{s}'" for s in COMPLETED_RUN_STATUSES)
+)
 
 
 async def recent_completed_reports(*, limit: int = 100) -> List[Dict[str, Any]]:

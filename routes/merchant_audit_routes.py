@@ -1184,12 +1184,17 @@ def _synthetic_url_sku_key(merchant_id: str, pdp_url: str) -> str:
 
     Namespaced `urlwedge:` so it can never collide with a real catalog key, and
     deterministic on (merchant_id, pdp_url) so re-auditing the same URL reuses
-    the key (the per-run probe rows are still namespaced by audit_run_id, so no
-    cross-run bleed)."""
+    the key — which is what lets W2 prompt-basis pinning (and Tier-1 retailer-
+    evidence recycling) find the prior run's basis and keep re-audit scores
+    comparable. The prefix is shared with services/prompt_basis, which routes a
+    SKU's prior-basis scan to merchant_url runs by this namespace. (The per-run
+    probe rows are still namespaced by audit_run_id, so no cross-run bleed.)"""
+    from services.prompt_basis import URL_WEDGE_SKU_PREFIX
+
     digest = hashlib.sha1(
         f"{merchant_id}|{(pdp_url or '').strip().lower()}".encode("utf-8")
     ).hexdigest()[:16]
-    return f"urlwedge:{digest}"
+    return f"{URL_WEDGE_SKU_PREFIX}{digest}"
 
 
 def _shape_url_audit_response(row: Dict[str, Any]) -> Dict[str, Any]:

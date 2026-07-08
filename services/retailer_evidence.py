@@ -144,15 +144,23 @@ async def load_prior_retailer_evidence(
         return empty
     try:
         from db.merchant_audit_runs import (
+            COMPLETED_RUN_STATUSES,
             fetch_audit_run_by_id,
             recent_runs_for_merchant,
         )
+        from services.prompt_basis import subject_type_for_sku_key
 
         runs = await recent_runs_for_merchant(
             merchant_id=merchant_id, limit=max(1, max_runs) + 2,
+            # Same scoping as load_prior_prompt_basis: only the run kind that
+            # can carry this SKU (wedge synthetic SKUs ↔ merchant_url runs).
+            subject_type=subject_type_for_sku_key(sku_key),
         )
         for run in runs or []:
-            if str(run.get("stage") or "") != "completed":
+            # Completion is a STATUS question — recent_runs_for_merchant rows
+            # carry no `stage` key, so the old `stage == 'completed'` filter
+            # skipped every run and Tier-1 recycling silently never engaged.
+            if str(run.get("status") or "") not in COMPLETED_RUN_STATUSES:
                 continue
             row = await fetch_audit_run_by_id(run_id=str(run.get("run_id")))
             if not row:

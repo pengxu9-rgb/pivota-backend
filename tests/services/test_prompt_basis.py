@@ -92,6 +92,115 @@ def test_harvest_absent_sku_or_malformed_returns_none():
     ) is None
 
 
+# ---- load: the prior-run scan against the REAL run-row contract ---------------
+# recent_runs_for_merchant rows carry `status` ('succeeded' on success; nothing
+# writes 'completed') and NO `stage` key at all. The original filter here read
+# run["stage"] == "completed", which no row can ever satisfy — so pinning (and
+# the wedge trend line downstream) silently never engaged. These tests feed the
+# scan realistic rows so that contract break can't ship again.
+
+def _run_row(run_id: str, status: str = "succeeded") -> Dict[str, Any]:
+    """A recent_runs_for_merchant row as production actually shapes it."""
+    return {
+        "run_id": run_id,
+        "requested_at": "2026-07-07T00:00:00+00:00",
+        "completed_at": "2026-07-07T00:10:00+00:00",
+        "status": status,
+        "subject_type": "merchant",
+        "product_keys": [],
+        # NO "stage" key — the trend-friendly projection never included it.
+    }
+
+
+@pytest.fixture()
+def _patched_run_store(monkeypatch):
+    """Patch the db module load_prior_prompt_basis imports lazily; returns a
+    dict the test fills with runs/reports and reads captured kwargs from."""
+    import db.merchant_audit_runs as mar
+
+    store: Dict[str, Any] = {"runs": [], "reports": {}, "recent_kwargs": None}
+
+    async def fake_recent(**kwargs):
+        store["recent_kwargs"] = kwargs
+        return store["runs"]
+
+    async def fake_fetch(*, run_id: str):
+        report = store["reports"].get(run_id)
+        return {"run_id": run_id, "report_jsonb": report} if report else None
+
+    monkeypatch.setattr(mar, "recent_runs_for_merchant", fake_recent)
+    monkeypatch.setattr(mar, "fetch_audit_run_by_id", fake_fetch)
+    return store
+
+
+@pytest.mark.asyncio
+async def test_load_prior_pins_from_succeeded_run_without_stage_key(_patched_run_store):
+    from services.prompt_basis import load_prior_prompt_basis
+
+    _patched_run_store["runs"] = [_run_row("run-1")]
+    _patched_run_store["reports"]["run-1"] = _report_with_basis("sku-1", _GOOD_BASIS)
+
+    basis = await load_prior_prompt_basis(merchant_id="m1", sku_key="sku-1")
+    assert basis is not None, (
+        "a status='succeeded' run (no `stage` key) must be scannable — the "
+        "dead stage filter made every audit regenerate a fresh basis"
+    )
+    assert basis["prompt_set_id"] == "ps_abc123"
+    assert basis["pinned_from_run_id"] == "run-1"
+
+
+@pytest.mark.asyncio
+async def test_load_prior_skips_non_completed_statuses(_patched_run_store):
+    from services.prompt_basis import load_prior_prompt_basis
+
+    _patched_run_store["runs"] = [
+        _run_row("run-running", status="running"),
+        _run_row("run-failed", status="failed"),
+        _run_row("run-ok", status="succeeded"),
+    ]
+    _patched_run_store["reports"]["run-running"] = _report_with_basis(
+        "sku-1", dict(_GOOD_BASIS, prompt_set_id="ps_partial"),
+    )
+    _patched_run_store["reports"]["run-ok"] = _report_with_basis("sku-1", _GOOD_BASIS)
+
+    basis = await load_prior_prompt_basis(merchant_id="m1", sku_key="sku-1")
+    assert basis is not None
+    assert basis["pinned_from_run_id"] == "run-ok"
+
+
+@pytest.mark.asyncio
+async def test_load_prior_scopes_scan_to_the_sku_run_kind(_patched_run_store):
+    """URL-wedge synthetic SKUs (urlwedge:*) live only in merchant_url runs;
+    catalog SKUs only in merchant runs. The scan must ask for the right kind —
+    otherwise a merchant alternating wedge and catalog audits fills the
+    scan window with runs that can never carry the SKU."""
+    from services.prompt_basis import load_prior_prompt_basis
+
+    await load_prior_prompt_basis(merchant_id="m1", sku_key="urlwedge:abc123")
+    assert _patched_run_store["recent_kwargs"]["subject_type"] == "merchant_url"
+
+    await load_prior_prompt_basis(merchant_id="m1", sku_key="sig_deadbeef")
+    assert _patched_run_store["recent_kwargs"]["subject_type"] == "merchant"
+
+
+def test_subject_type_for_sku_key_namespacing():
+    from services.prompt_basis import (
+        URL_WEDGE_SKU_PREFIX,
+        subject_type_for_sku_key,
+    )
+
+    assert subject_type_for_sku_key(f"{URL_WEDGE_SKU_PREFIX}2215a3744a56cde5") == "merchant_url"
+    assert subject_type_for_sku_key("sig_abc") == "merchant"
+    assert subject_type_for_sku_key("") == "merchant"
+    # The wedge route mints keys from the SAME prefix constant — namespace
+    # drift between minting and scan-routing would silently unpin the wedge.
+    from routes.merchant_audit_routes import _synthetic_url_sku_key
+
+    minted = _synthetic_url_sku_key("m1", "https://example.com/p/1")
+    assert minted.startswith(URL_WEDGE_SKU_PREFIX)
+    assert subject_type_for_sku_key(minted) == "merchant_url"
+
+
 # ---- resolve: pinned vs fresh --------------------------------------------------
 
 class _Generators:
