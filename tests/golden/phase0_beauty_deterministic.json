@@ -1,0 +1,476 @@
+{
+  "attribute_graph": {
+    "anuko_marine_collagen": {
+      "classes": {
+        "audience": [],
+        "category": [
+          "collagen",
+          "marine collagen"
+        ],
+        "certification_constraint": [
+          "vegan"
+        ],
+        "exclusion": [],
+        "format": [],
+        "geography": [],
+        "ingredient": [
+          "marine collagen"
+        ],
+        "offer_variant": [],
+        "proof": [],
+        "scenario": [],
+        "use_case": []
+      },
+      "evidence": {
+        "collagen": "tag",
+        "marine collagen": "tag",
+        "vegan": "tag"
+      }
+    },
+    "cosrx_snail_essence": {
+      "classes": {
+        "audience": [],
+        "category": [
+          "essence",
+          "beauty/skincare/essence"
+        ],
+        "certification_constraint": [
+          "fragrance-free"
+        ],
+        "exclusion": [
+          "fragrance-free"
+        ],
+        "format": [],
+        "geography": [],
+        "ingredient": [],
+        "offer_variant": [],
+        "proof": [],
+        "scenario": [],
+        "use_case": [
+          "snail mucin"
+        ]
+      },
+      "evidence": {
+        "beauty/skincare/essence": "product_type",
+        "essence": "product_type",
+        "fragrance-free": "tag",
+        "snail mucin": "tag"
+      }
+    },
+    "melatonin_gummies_no_type": {
+      "classes": {
+        "audience": [],
+        "category": [],
+        "certification_constraint": [],
+        "exclusion": [],
+        "format": [
+          "gummy"
+        ],
+        "geography": [],
+        "ingredient": [],
+        "offer_variant": [],
+        "proof": [],
+        "scenario": [
+          "travel"
+        ],
+        "use_case": []
+      },
+      "evidence": {
+        "gummy": "tag",
+        "travel": "inferred from format: gummy"
+      }
+    },
+    "noisy_variant_title": {
+      "classes": {
+        "audience": [],
+        "category": [],
+        "certification_constraint": [],
+        "exclusion": [],
+        "format": [],
+        "geography": [],
+        "ingredient": [],
+        "offer_variant": [],
+        "proof": [],
+        "scenario": [],
+        "use_case": []
+      },
+      "evidence": {}
+    },
+    "urlaudit_storeless_hair_oil": {
+      "classes": {
+        "audience": [],
+        "category": [
+          "hair oil"
+        ],
+        "certification_constraint": [],
+        "exclusion": [],
+        "format": [],
+        "geography": [],
+        "ingredient": [],
+        "offer_variant": [],
+        "proof": [],
+        "scenario": [
+          "heat-styling"
+        ],
+        "use_case": [
+          "damaged hair"
+        ]
+      },
+      "evidence": {
+        "damaged hair": "tag",
+        "hair oil": "title",
+        "heat-styling": "tag"
+      }
+    }
+  },
+  "base_query_specs": {
+    "anuko_marine_collagen": {
+      "category": "Supplements",
+      "specs": [
+        [
+          "where can I buy ANUKO Marine Collagen Peptides",
+          "intent"
+        ],
+        [
+          "shop ANUKO Marine Collagen Peptides online",
+          "intent"
+        ],
+        [
+          "is ANUKO legit",
+          "review"
+        ],
+        [
+          "ANUKO Marine Collagen Peptides reviews",
+          "review"
+        ],
+        [
+          "does ANUKO Marine Collagen Peptides actually work",
+          "review"
+        ],
+        [
+          "best supplements",
+          "category"
+        ],
+        [
+          "what supplements should I buy",
+          "category"
+        ],
+        [
+          "vegan supplements",
+          "attribute"
+        ],
+        [
+          "marine collagen supplements",
+          "attribute"
+        ],
+        [
+          "ANUKO Marine Collagen Peptides 30 Sticks, 1-Month Supply",
+          "identity"
+        ],
+        [
+          "buy ANUKO Marine Collagen Peptides (30 Sticks, 1-Month Supply) online",
+          "identity"
+        ]
+      ],
+      "title": "ANUKO Marine Collagen Peptides"
+    },
+    "cosrx_snail_essence": {
+      "category": "Beauty/Skincare/Essence",
+      "specs": [
+        [
+          "where can I buy COSRX Advanced Snail 96 Mucin Power Essence",
+          "intent"
+        ],
+        [
+          "shop COSRX Advanced Snail 96 Mucin Power Essence online",
+          "intent"
+        ],
+        [
+          "is COSRX legit",
+          "review"
+        ],
+        [
+          "COSRX Advanced Snail 96 Mucin Power Essence reviews",
+          "review"
+        ],
+        [
+          "does COSRX Advanced Snail 96 Mucin Power Essence actually work",
+          "review"
+        ],
+        [
+          "best beauty/skincare/essence",
+          "category"
+        ],
+        [
+          "what beauty/skincare/essence should I buy",
+          "category"
+        ],
+        [
+          "best beauty/skincare/essence for snail mucin",
+          "category"
+        ],
+        [
+          "what helps with snail mucin",
+          "category"
+        ],
+        [
+          "fragrance-free beauty/skincare/essence",
+          "attribute"
+        ],
+        [
+          "COSRX Advanced Snail 96 Mucin Power Essence 100ml",
+          "identity"
+        ],
+        [
+          "buy COSRX Advanced Snail 96 Mucin Power Essence (100ml) online",
+          "identity"
+        ]
+      ],
+      "title": "COSRX Advanced Snail 96 Mucin Power Essence"
+    },
+    "melatonin_gummies_no_type": {
+      "category": "supplement",
+      "specs": [
+        [
+          "where can I buy Sleep Well Melatonin Gummies",
+          "intent"
+        ],
+        [
+          "shop Sleep Well Melatonin Gummies online",
+          "intent"
+        ],
+        [
+          "is Sleep Well legit",
+          "review"
+        ],
+        [
+          "Sleep Well Melatonin Gummies reviews",
+          "review"
+        ],
+        [
+          "does Sleep Well Melatonin Gummies actually work",
+          "review"
+        ],
+        [
+          "best supplement",
+          "category"
+        ],
+        [
+          "what supplement should I buy",
+          "category"
+        ],
+        [
+          "Sleep Well Melatonin Gummies 60 count",
+          "identity"
+        ],
+        [
+          "buy Sleep Well Melatonin Gummies (60 count) online",
+          "identity"
+        ]
+      ],
+      "title": "Sleep Well Melatonin Gummies"
+    },
+    "noisy_variant_title": {
+      "category": "product",
+      "specs": [
+        [
+          "where can I buy Vitagummies Triple Shine Grape",
+          "intent"
+        ],
+        [
+          "shop Vitagummies Triple Shine Grape online",
+          "intent"
+        ],
+        [
+          "is Vitagummies legit",
+          "review"
+        ],
+        [
+          "Vitagummies Triple Shine Grape reviews",
+          "review"
+        ],
+        [
+          "does Vitagummies Triple Shine Grape actually work",
+          "review"
+        ]
+      ],
+      "title": "Vitagummies Triple Shine Grape"
+    },
+    "urlaudit_storeless_hair_oil": {
+      "category": "hair oil",
+      "specs": [
+        [
+          "where can I buy Olaplex Bond & Repair Hair Oil",
+          "intent"
+        ],
+        [
+          "shop Olaplex Bond & Repair Hair Oil online",
+          "intent"
+        ],
+        [
+          "is Olaplex legit",
+          "review"
+        ],
+        [
+          "Olaplex Bond & Repair Hair Oil reviews",
+          "review"
+        ],
+        [
+          "does Olaplex Bond & Repair Hair Oil actually work",
+          "review"
+        ],
+        [
+          "best hair oil",
+          "category"
+        ],
+        [
+          "what hair oil should I buy",
+          "category"
+        ],
+        [
+          "best hair oil for damaged hair",
+          "category"
+        ],
+        [
+          "what helps with damaged hair",
+          "category"
+        ],
+        [
+          "Olaplex Bond & Repair Hair Oil Default",
+          "identity"
+        ],
+        [
+          "buy Olaplex Bond & Repair Hair Oil (Default) online",
+          "identity"
+        ]
+      ],
+      "title": "Olaplex Bond & Repair Hair Oil"
+    }
+  },
+  "category_from_title": {
+    "Bond & Repair Hair Oil": "hair oil",
+    "Daily Multivitamin Gummies": "gummies",
+    "Deep Moisture Face Cream": "face cream",
+    "Matte Lipstick Ruby": "lipstick",
+    "Nourishing Scalp Treatment": "scalp treatment",
+    "Random Widget Thing": "",
+    "Triple Shine Grape": "",
+    "Vitamin C Brightening Serum": "serum"
+  },
+  "competitor_is_brandlike": {
+    "Amazon": false,
+    "Ancient Nutrition": true,
+    "Ashwagandha": false,
+    "Coupang": false,
+    "Magnesium": false,
+    "Olive Young": false,
+    "Probiotics": false,
+    "Sephora": false,
+    "The Ordinary": true,
+    "Thorne": true,
+    "Vital Proteins": true,
+    "Vitamin D": false,
+    "hyaluronic acid": false,
+    "magnesium glycinate": false
+  },
+  "filter_competitor_brands": [
+    "Thorne",
+    "Vital Proteins",
+    "Coupang",
+    "The Ordinary",
+    "Olive Young",
+    "Sephora",
+    "Ancient Nutrition",
+    "Amazon"
+  ],
+  "is_ingredient_or_category_type": {
+    "Amazon": false,
+    "Ancient Nutrition": false,
+    "Ashwagandha": true,
+    "Coupang": false,
+    "Magnesium": true,
+    "Olive Young": false,
+    "Probiotics": true,
+    "Sephora": false,
+    "The Ordinary": false,
+    "Thorne": false,
+    "Vital Proteins": false,
+    "Vitamin D": true,
+    "hyaluronic acid": true,
+    "magnesium glycinate": true
+  },
+  "noisy_prompt_category": {
+    "glow": true,
+    "grape": true,
+    "hair oil": false,
+    "orange": true,
+    "serum": false,
+    "sunscreen": false
+  },
+  "sidewalk_query_specs": {
+    "anuko_marine_collagen": [
+      {
+        "attribute_basis": [
+          "vegan",
+          "collagen"
+        ],
+        "query": "vegan collagen"
+      },
+      {
+        "attribute_basis": [
+          "marine collagen",
+          "collagen"
+        ],
+        "query": "marine collagen"
+      },
+      {
+        "attribute_basis": [
+          "marine collagen",
+          "collagen"
+        ],
+        "query": "marine collagen skin"
+      }
+    ],
+    "cosrx_snail_essence": [
+      {
+        "attribute_basis": [
+          "fragrance-free",
+          "essence"
+        ],
+        "query": "fragrance-free essence"
+      }
+    ],
+    "melatonin_gummies_no_type": [],
+    "noisy_variant_title": [],
+    "urlaudit_storeless_hair_oil": [
+      {
+        "attribute_basis": [
+          "scenario:heat-styling",
+          "hair oil"
+        ],
+        "query": "best hair oil for heat styling"
+      },
+      {
+        "attribute_basis": [
+          "scenario:heat-styling",
+          "hair oil"
+        ],
+        "query": "hair oil for heat styling"
+      }
+    ]
+  },
+  "unbranded_category": {
+    "anuko_marine_collagen": "supplements",
+    "cosrx_snail_essence": "beauty/skincare/essence",
+    "melatonin_gummies_no_type": "supplement",
+    "noisy_variant_title": "",
+    "urlaudit_storeless_hair_oil": "hair oil"
+  },
+  "vertical_for": {
+    "anuko_marine_collagen": "beauty",
+    "cosrx_snail_essence": "beauty",
+    "melatonin_gummies_no_type": "other",
+    "noisy_variant_title": "other",
+    "urlaudit_storeless_hair_oil": "other"
+  }
+}

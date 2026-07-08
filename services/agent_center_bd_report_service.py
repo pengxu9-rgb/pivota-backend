@@ -122,6 +122,12 @@ from services.sku_sidewalk import (
     build_sku_attribute_graph,
     generate_sidewalk_query_specs,
 )
+from services.vertical_profiles import (
+    BEAUTY_PROFILE,
+    VerticalProfile,
+    get_profile,
+    resolve_vertical,
+)
 
 
 _ANSWER_QUALITY_VERIFY_SCAN_MODE = "answer_quality_verify"
@@ -2156,22 +2162,41 @@ def _finish_breakdown(
     return total, breakdown
 
 
-def _category_text(product: Dict[str, Any]) -> str:
-    return " ".join(
-        str(product.get(k) or "")
-        for k in ("product_type", "category", "category_path")
-    ).lower()
-
-
 def _vertical_for(product: Dict[str, Any]) -> str:
-    text = _category_text(product)
-    if any(x in text for x in ("beauty", "skin", "cosmetic", "makeup", "wellness", "supplement", "vitamin")):
-        return "beauty"
-    if any(x in text for x in ("fashion", "apparel", "clothing", "sleepwear", "shirt", "dress", "shoe")):
-        return "fashion"
-    if any(x in text for x in ("electronics", "device", "laptop", "phone", "camera", "headphone", "speaker")):
-        return "electronics"
-    return "other"
+    # Delegates to the single shared resolver (services.vertical_profiles).
+    # Called WITHOUT a title so this keeps _vertical_for's legacy category-text
+    # semantics (product_type/category/category_path only) byte-identical for
+    # beauty; the resolver only adds unambiguous electronics/audio recall + the
+    # incidental-weak-token demotion, neither of which touches a genuine beauty
+    # SKU. See the golden-file regression guard.
+    return resolve_vertical(product)
+
+
+def _resolved_vertical_for_ctx(
+    sku_ctx: Optional[Mapping[str, Any]],
+    product: Optional[Mapping[str, Any]],
+) -> str:
+    """The resolved vertical for a SKU-context, honoring Principle 1 (resolve
+    once, pass down). Preference order: a vertical already stashed on the ctx ->
+    the durable `resolved_vertical` column on the product row -> live resolution
+    (with title, so URL-audit / store-less SKUs still resolve). Returns one of
+    beauty|fashion|electronics|other."""
+    for source in (sku_ctx, product):
+        if isinstance(source, Mapping):
+            value = str(source.get("vertical") or source.get("resolved_vertical") or "").strip().lower()
+            if value in {"beauty", "fashion", "electronics", "other"}:
+                return value
+    prod = product if isinstance(product, Mapping) else {}
+    return resolve_vertical(prod, title=prod.get("title") or prod.get("raw_title"))
+
+
+def _profile_for_sku_ctx(
+    sku_ctx: Optional[Mapping[str, Any]],
+    product: Optional[Mapping[str, Any]],
+) -> VerticalProfile:
+    """The VerticalProfile for a SKU-context. Beauty -> beauty profile (identical
+    behavior); unknown -> generic (never beauty-as-fallback)."""
+    return get_profile(_resolved_vertical_for_ctx(sku_ctx, product))
 
 
 def _confidence_ok(value: Any) -> bool:
@@ -4608,6 +4633,11 @@ async def load_sku_context(sku_key: str, merchant_id: str) -> Dict[str, Any]:
         "merchant_id": merchant_id,
         "product_key": product_key,
         "content_key": content_key,
+        # Resolve the vertical ONCE at SKU-context build (Principle 1). Honors the
+        # durable catalog_products.resolved_vertical column when present, else
+        # resolves live (with title). Every downstream component reads this key
+        # via _profile_for_sku_ctx instead of re-inferring the vertical.
+        "vertical": _resolved_vertical_for_ctx(None, product),
         "product": product,
         "sku": sku,
         "all_skus": all_skus,
@@ -8105,6 +8135,8 @@ def _category_for_unbranded_prompts(
     product: Mapping[str, Any],
     product_type: str,
     graph: Mapping[str, Any],
+    *,
+    profile: VerticalProfile = BEAUTY_PROFILE,
 ) -> str:
     direct = _clean_prompt_term(
         product_type
@@ -8114,14 +8146,14 @@ def _category_for_unbranded_prompts(
     if (
         direct
         and direct not in _GENERIC_CONTAINER_CATEGORIES
-        and not _noisy_prompt_category(direct)
+        and not _noisy_prompt_category(direct, profile=profile)
     ):
         return direct
     for category in _graph_class_values(graph, "category"):
         if (
             category
             and category not in _GENERIC_CONTAINER_CATEGORIES
-            and not _noisy_prompt_category(category)
+            and not _noisy_prompt_category(category, profile=profile)
         ):
             return category
     attrs = product.get("attributes_raw")
@@ -8137,10 +8169,13 @@ def _category_for_unbranded_prompts(
             attrs_text += " " + " ".join(str(tag).lower() for tag in tag_values)
     title_text = str(product.get("title") or product.get("raw_title") or "").lower()
     combined = f"{title_text} {attrs_text}"
-    if any(token in combined for token in ("collagen", "vitamin c", "niacin")):
-        return "beauty supplement"
-    if any(token in combined for token in ("supplement", "gummy", "gummies")):
-        return "supplement"
+    # Vertical-scoped category fallbacks. For beauty these are the historical
+    # "beauty supplement" / "supplement" rules; for an unknown vertical the
+    # generic profile has NO fallbacks, so a non-beauty URL audit no longer
+    # collapses to "beauty supplement".
+    for trigger_tokens, label in profile.category_fallbacks:
+        if any(token in combined for token in trigger_tokens):
+            return label
     # Last resort: derive the category from the product TITLE. Store-less brands
     # audited by URL often have no product_type, no graph, and no catalog
     # (product_type=None, attribute_graph=null) — without a category the per-SKU
@@ -8151,33 +8186,31 @@ def _category_for_unbranded_prompts(
     from_title = _category_from_title(
         product.get("title") or product.get("raw_title"),
         brand=product.get("vendor") or product.get("brand"),
+        profile=profile,
     )
     if from_title:
         return from_title
     return ""
 
 
-# Personal-care / beauty category head-nouns (Pivota's vertical) + the body-part
-# qualifiers that pair with them ("hair oil", "face cream", "lip balm"). Used to
-# extract a clean category from a product title when no structured category
-# exists. Beauty-scoped on purpose: high precision, and a non-match just falls
-# back to "" (same as today — no discovery queries, no regression).
-_CATEGORY_HEAD_NOUNS = frozenset({
-    "oil", "butter", "treatment", "mask", "shampoo", "conditioner", "serum",
-    "cream", "spray", "balm", "gel", "wax", "pomade", "tonic", "ampoule",
-    "essence", "cleanser", "moisturizer", "moisturiser", "sunscreen", "sunblock",
-    "toner", "lotion", "scrub", "peel", "mist", "foam", "wash", "soap",
-    "exfoliant", "emulsion", "patch", "stick", "lipstick", "mascara",
-    "foundation", "concealer", "primer", "powder", "blush", "supplement",
-    "gummies", "gummy", "capsule", "tablet",
-})
-_CATEGORY_MODIFIERS = frozenset({
-    "hair", "face", "facial", "skin", "body", "eye", "lip", "lips", "scalp",
-    "foot", "hand", "sun", "night", "day", "leave", "curl", "curly",
-})
+# Personal-care / beauty category head-nouns + the body-part qualifiers that pair
+# with them ("hair oil", "face cream", "lip balm"). Used to extract a clean
+# category from a product title when no structured category exists.
+#
+# MIGRATED to the beauty profile (services.vertical_profiles.BEAUTY_PROFILE);
+# these module-level names are backward-compatible aliases so every call site
+# stays byte-identical. A non-match falls back to "" (no discovery queries, no
+# regression), exactly as before.
+_CATEGORY_HEAD_NOUNS = BEAUTY_PROFILE.category_head_nouns
+_CATEGORY_MODIFIERS = BEAUTY_PROFILE.category_modifiers
 
 
-def _category_from_title(title: Any, brand: Optional[str] = None) -> str:
+def _category_from_title(
+    title: Any,
+    brand: Optional[str] = None,
+    *,
+    profile: VerticalProfile = BEAUTY_PROFILE,
+) -> str:
     """Extract a clean buyer-facing category ("hair oil", "face cream") from a
     product title. Strips variant noise (after '#'/'(', sizes), drops brand
     tokens, then finds a head-noun and its body-part qualifier. Returns "" when
@@ -8188,25 +8221,25 @@ def _category_from_title(title: Any, brand: Optional[str] = None) -> str:
     brand_tokens = set(re.findall(r"[a-z0-9]+", str(brand or "").lower()))
     tokens = [t for t in re.findall(r"[a-z0-9]+", text) if t and t not in brand_tokens]
     for i, tok in enumerate(tokens):
-        if tok in _CATEGORY_HEAD_NOUNS:
+        if tok in profile.category_head_nouns:
             modifier = (
                 tokens[i - 1]
-                if i > 0 and tokens[i - 1] in _CATEGORY_MODIFIERS
+                if i > 0 and tokens[i - 1] in profile.category_modifiers
                 else None
             )
             candidate = f"{modifier} {tok}".strip() if modifier else tok
             cleaned = _clean_prompt_term(candidate)
-            if cleaned and not _noisy_prompt_category(cleaned):
+            if cleaned and not _noisy_prompt_category(cleaned, profile=profile):
                 return cleaned
     return ""
 
 
-def _noisy_prompt_category(value: str) -> bool:
+def _noisy_prompt_category(value: str, *, profile: VerticalProfile = BEAUTY_PROFILE) -> bool:
     cleaned = _clean_prompt_term(value)
     if not cleaned:
         return True
     tokens = set(re.findall(r"[a-z0-9]+", cleaned))
-    if tokens & {"glow", "grape", "jelly", "orange", "shine"}:
+    if tokens & profile.noisy_prompt_tokens:
         return True
     return False
 
@@ -8316,10 +8349,12 @@ def _build_per_sku_base_query_specs(
         or ""
     )
     attribute_graph = build_sku_attribute_graph(product)
+    profile = _profile_for_sku_ctx(sku_ctx, product)
     unbranded_category = _category_for_unbranded_prompts(
         product,
         str(product_type or ""),
         attribute_graph,
+        profile=profile,
     )
     enrichment = (
         sku_ctx.get("product_enrichment")
@@ -9547,12 +9582,12 @@ def _list_value(value: Any) -> List[Any]:
 # Retailer / marketplace NAME tokens classify_host misses (its registry keys on
 # hosts, and Coupang/Gmarket/etc. aren't in it). The "category winner" panel is
 # about a competing PRODUCT, so a store must never be selected as the winner.
-_RETAILER_NAME_TOKENS = frozenset({
-    "coupang", "gmarket", "qoo10", "shopee", "lazada", "aliexpress", "temu",
-    "amazon", "walmart", "sephora", "ulta", "nordstrom", "costco",
-    "oliveyoung", "musinsa", "kurly", "wconcept", "iherb", "yesstyle",
-    "stylevana",
-})
+#
+# MIGRATED to the beauty profile; this alias keeps the _competitor_is_brandlike
+# call site byte-identical. (Phase 1 will add electronics retailers — bestbuy,
+# bhphoto, crutchfield, newegg — to the electronics_audio profile and gate this
+# lookup on the resolved vertical.)
+_RETAILER_NAME_TOKENS = BEAUTY_PROFILE.retailer_tokens
 
 
 def _competitor_is_brandlike(name: str) -> bool:

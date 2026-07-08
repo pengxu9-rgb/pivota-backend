@@ -630,6 +630,19 @@ async def ensure_required_schema_light() -> None:
                     """
                 )
             )
+            # Durable top-level vertical (migration 173). Railway fast-mode
+            # startup skips db/migrations/, so schema_guard owns the apply.
+            # catalog_sync_service's upsert NAMES this column, so without the
+            # self-heal the first sync in prod crashes on "column does not
+            # exist" (the PR #494/#501 apm_enabled outage shape).
+            await database.execute(
+                text(
+                    """
+                    ALTER TABLE IF EXISTS catalog_products
+                      ADD COLUMN IF NOT EXISTS resolved_vertical VARCHAR(16);
+                    """
+                )
+            )
             await database.execute(
                 text(
                     """
