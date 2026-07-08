@@ -492,7 +492,7 @@ async def recent_completed_reports(*, limit: int = 100) -> List[Dict[str, Any]]:
     try:
         rows = await database.fetch_all(
             "SELECT run_id, report_jsonb FROM merchant_audit_runs "
-            "WHERE status = 'completed' AND report_jsonb IS NOT NULL "
+            "WHERE status = 'succeeded' AND report_jsonb IS NOT NULL "
             "ORDER BY requested_at DESC LIMIT :lim",
             {"lim": int(limit)},
         )
@@ -521,7 +521,12 @@ async def score_history_for_merchant(
             "SELECT run_id, requested_at, visibility_score_avg, attribution_score_avg, "
             "category_visibility_score_avg, report_jsonb "
             "FROM merchant_audit_runs "
-            "WHERE merchant_id = :mid AND subject_type = :st AND status = 'completed' "
+            # status='succeeded' is what BOTH success writers stamp
+            # (transition_stage + record_audit_run_completed callers);
+            # nothing ever writes status='completed', and stage can't be
+            # trusted here — the legacy insert path leaves stage at its
+            # server default 'completed' even while running/failed.
+            "WHERE merchant_id = :mid AND subject_type = :st AND status = 'succeeded' "
             "ORDER BY requested_at DESC LIMIT :lim",
             {"mid": merchant_id, "st": subject_type, "lim": int(limit)},
         )
@@ -557,7 +562,7 @@ async def completed_runs_in_window(*, window_seconds: int) -> List[Dict[str, Any
         rows = await database.fetch_all(
             "SELECT merchant_id, run_id, requested_at, report_jsonb "
             "FROM merchant_audit_runs "
-            "WHERE status = 'completed' AND report_jsonb IS NOT NULL "
+            "WHERE status = 'succeeded' AND report_jsonb IS NOT NULL "
             "AND requested_at >= :cutoff "
             "ORDER BY merchant_id, requested_at DESC",
             {"cutoff": cutoff},
@@ -587,7 +592,7 @@ async def recent_completed_reports_for_merchant(
     try:
         rows = await database.fetch_all(
             "SELECT run_id, report_jsonb FROM merchant_audit_runs "
-            "WHERE merchant_id = :mid AND status = 'completed' AND report_jsonb IS NOT NULL "
+            "WHERE merchant_id = :mid AND status = 'succeeded' AND report_jsonb IS NOT NULL "
             "ORDER BY requested_at DESC LIMIT :lim",
             {"mid": merchant_id, "lim": int(limit)},
         )
