@@ -287,8 +287,13 @@ class Settings(BaseSettings):
     )
     attribute_extractor_provider: str = os.getenv("ATTRIBUTE_EXTRACTOR_PROVIDER", "")
     attribute_extractor_model: str = os.getenv("ATTRIBUTE_EXTRACTOR_MODEL", "")
+    # Raised 900 -> 4000: the extractor emits {"attributes":[{class_name,value,
+    # span}...]} where each span is a verbatim page excerpt, so a rich
+    # electronics/audio SKU overflows 900 tokens, the JSON truncates, and the
+    # parser silently returns [] (the extractor contributes nothing). A real
+    # HaptiFit SKU needed ~2000 output tokens; 4000 gives headroom.
     attribute_extractor_max_tokens: int = int(
-        os.getenv("ATTRIBUTE_EXTRACTOR_MAX_TOKENS", "900")
+        os.getenv("ATTRIBUTE_EXTRACTOR_MAX_TOKENS", "4000")
     )
     # Per-merchant scoping for the extractor rollout. Comma-separated merchant_ids.
     # NON-EMPTY -> the extractor runs ONLY for these merchants (even with the flag

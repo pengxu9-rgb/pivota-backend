@@ -183,3 +183,80 @@ async def test_extractor_transport_error_returns_empty_not_fabricated():
         MOJAWA, synthesize=boom, provider="deepseek", model="deepseek-chat"
     )
     assert grounded == []
+
+
+# --------------------- truncation salvage (fix: silent-empty) --------------------- #
+
+def _obj(cn, v, s):
+    return {"class_name": cn, "value": v, "span": s}
+
+
+def test_salvage_recovers_complete_objects_and_drops_severed_tail():
+    # Two complete objects, third severed mid-token (the token-cap truncation shape).
+    raw = (
+        '{"attributes": ['
+        '{"class_name": "category", "value": "bone conduction", "span": "bone conduction headphones"},'
+        '{"class_name": "format", "value": "open-ear", "span": "open-ear design"},'
+        '{"class_name": "certification_constraint", "value": "IP68", "span": "IP68 water'
+    )
+    assert ax._salvage_attribute_objects(raw) == [
+        _obj("category", "bone conduction", "bone conduction headphones"),
+        _obj("format", "open-ear", "open-ear design"),
+    ]
+
+
+def test_salvage_is_string_aware_for_escaped_quotes_and_braces():
+    raw = (
+        '{"attributes": ['
+        '{"class_name": "audience", "value": "pros", "span": "for \\"serious\\" pros"},'
+        '{"class_name": "ingredient", "value": "codec", "span": "codec {LDAC} support"},'
+        '{"class_name": "format", "value": "trunc'
+    )
+    assert ax._salvage_attribute_objects(raw) == [
+        _obj("audience", "pros", 'for "serious" pros'),
+        _obj("ingredient", "codec", "codec {LDAC} support"),
+    ]
+
+
+def test_salvage_stops_at_array_end_and_never_emits_the_wrapper():
+    raw = '{"attributes": [{"class_name": "c", "value": "v", "span": "s"}], "extra": {"z": 1}}'
+    assert ax._salvage_attribute_objects(raw) == [_obj("c", "v", "s")]
+
+
+def test_salvage_empty_or_missing_array():
+    assert ax._salvage_attribute_objects('{"attributes": []}') == []
+    assert ax._salvage_attribute_objects('{"nope": 1}') == []
+    assert ax._salvage_attribute_objects("") == []
+
+
+def test_parse_attributes_falls_back_to_salvage_on_truncated_json():
+    raw = (
+        '{"attributes": ['
+        '{"class_name": "use_case", "value": "swimming", "span": "built for swimming"},'
+        '{"class_name": "ingredient", "value": "32GB'
+    )
+    assert ax._parse_attributes(raw) == [
+        _obj("use_case", "swimming", "built for swimming"),
+    ]
+
+
+@pytest.mark.asyncio
+async def test_extractor_grounds_from_a_truncated_response():
+    # A real-provider TRUNCATION (JSON severed mid-array, finish_reason 'length'):
+    # salvage + guard must still land the complete, grounded attrs. Regression for
+    # the 900-token silent-empty bug.
+    truncated = (
+        '{"attributes": ['
+        '{"class_name": "certification_constraint", "value": "IP68", "span": "IP68 waterproof rating"},'
+        '{"class_name": "use_case", "value": "swimming", "span": "built for swimming with"},'
+        '{"class_name": "ingredient", "value": "32GB'
+    )
+
+    async def truncating(**kwargs):
+        return {"text": truncated, "finish_reason": "length"}
+
+    grounded = await ax.extract_attributes(
+        MOJAWA, synthesize=truncating, provider="deepseek", model="deepseek-chat"
+    )
+    values = {g.value for g in grounded}
+    assert "IP68" in values and "swimming" in values  # recovered despite truncation

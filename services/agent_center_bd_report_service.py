@@ -2361,7 +2361,7 @@ async def _maybe_stash_llm_attributes(ctx: Dict[str, Any]) -> None:
             synthesize=synthesize,
             provider=provider,
             model=model or "",
-            max_tokens=int(getattr(app_settings, "attribute_extractor_max_tokens", 900) or 900),
+            max_tokens=int(getattr(app_settings, "attribute_extractor_max_tokens", 4000) or 4000),
             source_text=source_text,
         )
         if grounded:
@@ -9676,7 +9676,7 @@ async def extract_winnable_prompts(
             user=user,
             provider=provider,
             model=model,
-            max_tokens=400,
+            max_tokens=1000,  # was 400 — too tight for a multi-item array (truncation-empty class)
         )
     except Exception:  # noqa: BLE001 - best-effort; fall back to deterministic specs
         logger.warning("winnable-prompt extraction failed for %r", title[:60], exc_info=True)
@@ -9765,7 +9765,7 @@ async def elicit_scenario_prompts(
             user=user,
             provider=provider,
             model=model,
-            max_tokens=400,
+            max_tokens=1000,  # was 400 — too tight for a multi-item array (truncation-empty class)
         )
     except Exception:  # noqa: BLE001 - best-effort exploratory stage
         logger.warning("scenario-elicit failed for %r", category, exc_info=True)

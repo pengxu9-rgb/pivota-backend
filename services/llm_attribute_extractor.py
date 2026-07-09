@@ -278,9 +278,56 @@ def _parse_attributes(raw_text: str) -> List[Mapping[str, Any]]:
     try:
         data = json.loads(text)
     except (json.JSONDecodeError, ValueError):
-        return []
+        # Truncated/partial JSON (e.g. the response hit the output-token cap
+        # mid-array). Rather than drop EVERYTHING, salvage the complete attribute
+        # objects that did arrive. Defense-in-depth behind the raised token cap.
+        return _salvage_attribute_objects(text)
     attrs = data.get("attributes") if isinstance(data, Mapping) else None
     return [a for a in attrs if isinstance(a, Mapping)] if isinstance(attrs, list) else []
+
+
+def _salvage_attribute_objects(text: str) -> List[Mapping[str, Any]]:
+    """Best-effort recovery of complete `{...}` attribute objects from a
+    truncated JSON array. String-aware brace balancing (so a brace inside a span
+    value doesn't confuse the scan); the severed trailing object is dropped."""
+    m = re.search(r'"attributes"\s*:\s*\[', text)
+    if not m:
+        return []
+    scan = text[m.end():]
+    out: List[Mapping[str, Any]] = []
+    depth = 0
+    start = -1
+    in_str = False
+    esc = False
+    for i, ch in enumerate(scan):
+        if in_str:
+            if esc:
+                esc = False
+            elif ch == "\\":
+                esc = True
+            elif ch == '"':
+                in_str = False
+            continue
+        if ch == '"':
+            in_str = True
+        elif ch == "{":
+            if depth == 0:
+                start = i
+            depth += 1
+        elif ch == "}":
+            if depth > 0:
+                depth -= 1
+                if depth == 0 and start >= 0:
+                    try:
+                        obj = json.loads(scan[start : i + 1])
+                    except (json.JSONDecodeError, ValueError):
+                        obj = None
+                    if isinstance(obj, Mapping):
+                        out.append(obj)
+                    start = -1
+        elif ch == "]" and depth == 0:
+            break
+    return out
 
 
 async def extract_attributes(
@@ -289,7 +336,7 @@ async def extract_attributes(
     synthesize: Callable[..., Awaitable[Mapping[str, Any]]],
     provider: str,
     model: str,
-    max_tokens: int = 900,
+    max_tokens: int = 4000,
     source_text: Optional[str] = None,
 ) -> List[GroundedAttribute]:
     """Run the extractor for one SKU and return ONLY grounded attributes.
@@ -310,4 +357,22 @@ async def extract_attributes(
         logger.warning("attribute extractor synthesize failed: %s", exc)
         return []
     raw = result.get("text") if isinstance(result, Mapping) else None
-    return ground_extracted_attributes(_parse_attributes(raw or ""), text)
+    finish_reason = result.get("finish_reason") if isinstance(result, Mapping) else None
+    parsed = _parse_attributes(raw or "")
+    grounded = ground_extracted_attributes(parsed, text)
+    if (raw or "").strip() and not grounded:
+        # A non-empty model response that yielded ZERO grounded attributes. Split
+        # by finish_reason so the extractor can never again be a SILENT no-op (the
+        # bug that hid the 900-token truncation) without spamming at scale:
+        #  - truncated (finish_reason length/MAX_TOKENS) = a real problem, the cap
+        #    is too small -> WARNING;
+        #  - otherwise = an ordinary guard-discard (the model paraphrased the
+        #    spans), expected on thin SKUs -> INFO.
+        truncated = str(finish_reason or "").lower() in {"length", "max_tokens"}
+        (logger.warning if truncated else logger.info)(
+            "attribute extractor: 0 grounded attrs from a %d-char response "
+            "(parsed=%d, finish_reason=%s) — %s",
+            len(raw or ""), len(parsed), finish_reason,
+            "TRUNCATED; raise ATTRIBUTE_EXTRACTOR_MAX_TOKENS" if truncated else "guard-discard",
+        )
+    return grounded

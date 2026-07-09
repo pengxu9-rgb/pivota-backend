@@ -501,7 +501,7 @@ async def test_call_deepseek_chat_sends_canonical_request_body(monkeypatch):
     ]
     assert body["response_format"] == {"type": "json_object"}
     assert body["temperature"] == 0.2
-    assert body["max_tokens"] == 800
+    assert body["max_tokens"] == 2000
     assert "tools" not in body
     assert "enable_search" not in body
 
