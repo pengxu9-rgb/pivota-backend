@@ -330,6 +330,13 @@ class VerticalProfile:
     health_sensitive: Optional[bool] = None
     evidence_bindings: str = "none"
     grounded_coverage_disclosure: Optional[str] = None
+    # "what helps with X" is a problem/concern-framed discovery shape ("what helps
+    # with dry skin"). It only reads naturally when the vertical's use-cases are
+    # genuine CONCERNS (beauty). For verticals whose use-cases are activities or
+    # product types (electronics: "sports", "bone conduction headphones") it
+    # produces junk ("what helps with bone conduction headphones") — so it's gated
+    # off there. Default True preserves the historical beauty behavior.
+    problem_framed_prompts: bool = True
 
 
 BEAUTY_PROFILE = VerticalProfile(
@@ -447,6 +454,9 @@ ELECTRONICS_AUDIO_PROFILE = VerticalProfile(
     # Do NOT swap in electronics tokens ("battery"/"waterproof") — that would
     # falsely flag earphones health-sensitive. Electronics is not health-sensitive.
     health_sensitive=False,
+    # Audio use-cases are activities/product types, not concerns — "what helps
+    # with X" is nonsensical here, so drop the problem-framed discovery shape.
+    problem_framed_prompts=False,
     evidence_bindings="none",
     grounded_coverage_disclosure=(
         "grounded-evidence dimensions are unavailable for this category"
