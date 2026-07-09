@@ -477,7 +477,7 @@ async def _upsert_canonical_offer_for_mirror_row(
     `price_amount` from external_product_seeds is mapped 1:1 to all
     three pricing columns (no spread between list/effective/best on
     this path — the seed has only the displayed retailer price)."""
-    await _shared_upsert_offer(product_key, row_dict, merchant_id)
+    await _shared_upsert_offer(product_key, row_dict, merchant_id=merchant_id)
 
 
 def _compute_mirror_lifecycle_stage(

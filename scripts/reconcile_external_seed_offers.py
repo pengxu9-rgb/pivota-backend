@@ -41,18 +41,22 @@ logger = logging.getLogger("reconcile_external_seed_offers")
 
 _MIRROR_SOURCE = "external_product_seeds_mirror_v1"
 
-# Active seeds that have a mirror product but no mirror offer.
+# Active seeds that have a mirror PRODUCT but no mirror OFFER. The product is
+# located by provenance (catalog_products.source_ref = seed id under the mirror
+# source_system) — NOT by reconstructing a product_key, because ADR-009 D2 keys
+# the mirror product under a per-brand observed seller (merch_obs_*), so the old
+# 'prod::external_seed::external_seed::' || external_product_id join matched
+# nothing and this reported a false 0-missing.
 MISSING_SQL = """
     SELECT eps.id AS seed_id, eps.external_product_id, eps.price_amount
     FROM external_product_seeds eps
     JOIN catalog_products cp
-      ON cp.product_key =
-         'prod::external_seed::external_seed::' || eps.external_product_id
+      ON cp.source_ref = eps.id
+     AND cp.source_system = :mirror_source
     LEFT JOIN catalog_offers co
       ON co.source_ref = eps.id
      AND co.source_system = :mirror_source
     WHERE eps.status = 'active'
-      AND nullif(btrim(coalesce(eps.external_product_id, '')), '') IS NOT NULL
       AND co.offer_id IS NULL
     ORDER BY eps.updated_at DESC
 """

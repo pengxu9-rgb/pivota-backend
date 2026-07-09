@@ -41,14 +41,16 @@ from decimal import Decimal
 from typing import Any, Dict, Optional
 
 from db.database import database
-from services.catalog_sync_service import make_catalog_product_key
 
 logger = logging.getLogger(__name__)
 
-# Sentinel merchant + platform for employee-managed external seeds (matches the
-# mirror). product_key = prod::external_seed::external_seed::<external_product_id>.
-MIRROR_MERCHANT_ID = "external_seed"
-MIRROR_PLATFORM = "external_seed"
+# The mirror row is located by its provenance link to the seed, NOT by
+# reconstructing a product_key. Since ADR-009 D2 the mirror mints a PER-BRAND
+# observed seller (merch_obs_<digest>) and keys the product under it, so the old
+# `prod::external_seed::external_seed::<ext_id>` assumption never matches a real
+# row. The mirror stamps catalog_products.source_ref = external_product_seeds.id
+# with this source_system — that pair is the stable seed→product link.
+MIRROR_SOURCE_SYSTEM = "external_product_seeds_mirror_v1"
 
 # The external offer's intrinsic tier triple + shape. An external seed is an
 # OBSERVED, redirect-fulfilled offer — never first-party, never native checkout.
@@ -67,21 +69,46 @@ OFFER_ID_PREFIX = "offer:external_seed:"
 def dual_write_enabled() -> bool:
     """Flag: run the synchronous seed→offer dual-write on seed writes.
 
-    Default ON — the projection is inert to live serving (the pivot lane that
-    reads catalog_offers is flag-off; the mainline serves external seeds
-    directly), so it only keeps the persisted mirror fresh. Off makes every
-    `sync_offer_for_seed` call a no-op for an instant kill-switch.
+    Default OFF — genuine dark launch (slice 3 ships inert). The projection is
+    inert to live serving anyway (the pivot lane reading catalog_offers is
+    flag-off; the mainline serves seeds directly), but a default-ON write hook
+    is not "dark" — flip EXTERNAL_OFFER_DUAL_WRITE_ENABLED=1 to start populating,
+    co-gated with the Phase-2 pivot cutover.
     """
-    return os.getenv("EXTERNAL_OFFER_DUAL_WRITE_ENABLED", "true").strip().lower() not in {
-        "0", "false", "no", "off",
+    return os.getenv("EXTERNAL_OFFER_DUAL_WRITE_ENABLED", "false").strip().lower() in {
+        "1", "true", "yes", "on",
     }
 
 
-def mirror_product_key(external_product_id: str) -> str:
-    """The catalog_products.product_key the mirror assigns to a seed."""
-    return make_catalog_product_key(
-        MIRROR_MERCHANT_ID, MIRROR_PLATFORM, str(external_product_id)
+async def resolve_mirror_product(seed_id: str) -> Optional[Dict[str, str]]:
+    """Locate the seed's existing mirror product by provenance
+    (catalog_products.source_ref = seed_id under the mirror source_system) and
+    return its real {product_key, merchant_id}.
+
+    This is the fix for the per-brand seller keying (ADR-009 D2): we NEVER
+    reconstruct the product_key from a sentinel merchant — we read the row the
+    mirror actually wrote, so the offer attaches under the correct observed
+    seller (never the ADR-009-banned 'external_seed' bucket). Returns None when
+    the mirror hasn't materialized the product yet (the batch job owns creation).
+    """
+    row = await database.fetch_one(
+        """
+        SELECT product_key, merchant_id
+        FROM catalog_products
+        WHERE source_ref = :seed_id AND source_system = :src
+        ORDER BY updated_at DESC NULLS LAST
+        LIMIT 1
+        """,
+        {"seed_id": str(seed_id), "src": MIRROR_SOURCE_SYSTEM},
     )
+    if not row:
+        return None
+    data = dict(row)
+    pk = str(data.get("product_key") or "").strip()
+    mid = str(data.get("merchant_id") or "").strip()
+    if not pk or not mid:
+        return None
+    return {"product_key": pk, "merchant_id": mid}
 
 
 def derive_mirror_sku_key(product_key: str) -> str:
@@ -107,7 +134,8 @@ def _json_default(value: Any) -> Any:
 async def upsert_catalog_offer_from_seed_row(
     product_key: str,
     row_dict: Dict[str, Any],
-    merchant_id: str = MIRROR_MERCHANT_ID,
+    *,
+    merchant_id: str,
 ) -> None:
     """Write / refresh the canonical offer row carrying price + currency +
     availability for one external seed. `price_amount` is mapped 1:1 to all
@@ -116,7 +144,16 @@ async def upsert_catalog_offer_from_seed_row(
     Idempotent on offer_id: ON CONFLICT refreshes the mutable price/availability
     fields. This is the single source of truth for the seed→offer projection —
     both the mirror script and the reconciliation script call it.
+
+    `merchant_id` is REQUIRED and must be the seed's real observed seller (from
+    resolve_mirror_product) — never the 'external_seed' sentinel, which ADR-009
+    D2 bans and the mirror refuses.
     """
+    if not merchant_id or merchant_id == "external_seed":
+        raise ValueError(
+            f"external_offer_dual_write: refusing offer write under merchant_id="
+            f"{merchant_id!r} (must be the seed's observed seller; product_key={product_key})"
+        )
     sku_key = derive_mirror_sku_key(product_key)
     offer_id = derive_mirror_offer_id(product_key)
     raw_price = row_dict.get("price_amount")
@@ -217,18 +254,16 @@ async def sync_offer_for_seed(seed_id: str) -> Dict[str, Any]:
         if not external_product_id:
             return {"seed_id": seed_id, "status": "no_external_product_id"}
 
-        product_key = mirror_product_key(external_product_id)
-        exists = await database.fetch_val(
-            "SELECT 1 FROM catalog_products WHERE product_key = :pk",
-            {"pk": product_key},
-        )
-        if not exists:
-            # The mirror hasn't materialized this seed's product yet; the batch
-            # job will create the full chain (product + sku + offer). Skip.
-            return {"seed_id": seed_id, "status": "no_mirror_product",
-                    "product_key": product_key}
+        mirror = await resolve_mirror_product(seed_id)
+        if not mirror:
+            # The mirror hasn't materialized this seed's product yet (or under a
+            # different provenance); the batch job owns product creation. Skip.
+            return {"seed_id": seed_id, "status": "no_mirror_product"}
 
-        await upsert_catalog_offer_from_seed_row(product_key, seed)
+        product_key = mirror["product_key"]
+        await upsert_catalog_offer_from_seed_row(
+            product_key, seed, merchant_id=mirror["merchant_id"]
+        )
         return {"seed_id": seed_id, "status": "synced", "product_key": product_key}
     except Exception as exc:  # noqa: BLE001
         logger.warning({

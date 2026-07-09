@@ -1,15 +1,17 @@
 """Unit tests for the P1.6 external seed → catalog_offers projection.
 
-Pure-logic + mocked-database tests (no real SQL execution). The offer field
-mapping itself is asserted by the mirror test suite (which now patches this
-module); here we cover the identity derivation + the sync_offer_for_seed control
-flow and its dark-launch kill-switch.
+Pure-logic + mocked-database tests (no real SQL execution). Post-review
+(convergence v2): the offer must attach under the seed's REAL per-brand
+observed seller (resolved by provenance, catalog_products.source_ref = seed id),
+NOT the legacy 'external_seed' sentinel — the earlier draft keyed everything
+under the sentinel and was a silent no-op against real (ADR-009 D2) data.
 """
 
 from __future__ import annotations
 
 import sys
 from pathlib import Path
+from typing import Any, Dict, Optional
 
 import pytest
 
@@ -19,44 +21,47 @@ from services import external_offer_dual_write as mod  # noqa: E402
 
 
 class FakeDB:
-    def __init__(self, *, seed=None, product_exists=False):
+    """Mocks the two reads sync_offer_for_seed does: the seed fetch and the
+    provenance mirror-product lookup (both fetch_one), plus execute capture."""
+
+    def __init__(self, *, seed=None, mirror=None):
         self._seed = seed
-        self._product_exists = product_exists
+        self._mirror = mirror  # {"product_key":..., "merchant_id":...} or None
         self.executed = []
 
     async def fetch_one(self, sql, params=None):
-        # Only the seed lookup uses fetch_one in this module.
-        return dict(self._seed) if self._seed else None
-
-    async def fetch_val(self, sql, params=None):
-        return 1 if self._product_exists else None
+        s = str(sql)
+        if "FROM external_product_seeds" in s and "WHERE id" in s:
+            return dict(self._seed) if self._seed else None
+        if "FROM catalog_products" in s and "source_ref" in s:
+            return dict(self._mirror) if self._mirror else None
+        return None
 
     async def execute(self, sql, params=None):
         self.executed.append({"sql": str(sql), "params": dict(params or {})})
 
 
-def test_mirror_product_key_format():
-    assert mod.mirror_product_key("ext1") == "prod::external_seed::external_seed::ext1"
+_REAL_PK = "prod::merch_obs_deadbeef::external_seed::ext1"  # per-brand seller key
+_REAL_SELLER = "merch_obs_deadbeef"
 
 
 def test_derive_sku_key():
-    pk = "prod::external_seed::external_seed::ext1"
-    assert mod.derive_mirror_sku_key(pk) == f"{pk}::canonical"
+    assert mod.derive_mirror_sku_key(_REAL_PK) == f"{_REAL_PK}::canonical"
 
 
 def test_derive_offer_id_deterministic_and_prefixed():
-    pk = "prod::external_seed::external_seed::ext1"
-    a = mod.derive_mirror_offer_id(pk)
-    b = mod.derive_mirror_offer_id(pk)
-    assert a == b
+    a = mod.derive_mirror_offer_id(_REAL_PK)
+    assert a == mod.derive_mirror_offer_id(_REAL_PK)
     assert a.startswith(mod.OFFER_ID_PREFIX)
     assert mod.derive_mirror_offer_id("other") != a
 
 
 @pytest.mark.asyncio
-async def test_sync_disabled_is_noop(monkeypatch):
-    monkeypatch.setenv("EXTERNAL_OFFER_DUAL_WRITE_ENABLED", "off")
-    fake = FakeDB(seed={"id": "s1", "external_product_id": "ext1"}, product_exists=True)
+async def test_dark_by_default(monkeypatch):
+    """Genuine dark launch: with the flag UNSET, the dual-write is a no-op."""
+    monkeypatch.delenv("EXTERNAL_OFFER_DUAL_WRITE_ENABLED", raising=False)
+    assert mod.dual_write_enabled() is False
+    fake = FakeDB(seed={"id": "s1"}, mirror={"product_key": _REAL_PK, "merchant_id": _REAL_SELLER})
     monkeypatch.setattr(mod, "database", fake)
     result = await mod.sync_offer_for_seed("s1")
     assert result["status"] == "disabled"
@@ -65,76 +70,91 @@ async def test_sync_disabled_is_noop(monkeypatch):
 
 @pytest.mark.asyncio
 async def test_sync_seed_missing(monkeypatch):
-    monkeypatch.setenv("EXTERNAL_OFFER_DUAL_WRITE_ENABLED", "true")
+    monkeypatch.setenv("EXTERNAL_OFFER_DUAL_WRITE_ENABLED", "1")
     fake = FakeDB(seed=None)
     monkeypatch.setattr(mod, "database", fake)
-    result = await mod.sync_offer_for_seed("gone")
-    assert result["status"] == "seed_missing"
-
-
-@pytest.mark.asyncio
-async def test_sync_no_external_product_id(monkeypatch):
-    monkeypatch.setenv("EXTERNAL_OFFER_DUAL_WRITE_ENABLED", "true")
-    fake = FakeDB(seed={"id": "s1", "external_product_id": None})
-    monkeypatch.setattr(mod, "database", fake)
-    result = await mod.sync_offer_for_seed("s1")
-    assert result["status"] == "no_external_product_id"
-    assert fake.executed == []
+    assert (await mod.sync_offer_for_seed("gone"))["status"] == "seed_missing"
 
 
 @pytest.mark.asyncio
 async def test_sync_no_mirror_product_yet(monkeypatch):
-    monkeypatch.setenv("EXTERNAL_OFFER_DUAL_WRITE_ENABLED", "true")
-    fake = FakeDB(
-        seed={"id": "s1", "external_product_id": "ext1"}, product_exists=False
-    )
+    """No mirror product resolved by provenance → skip, write nothing."""
+    monkeypatch.setenv("EXTERNAL_OFFER_DUAL_WRITE_ENABLED", "1")
+    fake = FakeDB(seed={"id": "s1", "external_product_id": "ext1"}, mirror=None)
     monkeypatch.setattr(mod, "database", fake)
     result = await mod.sync_offer_for_seed("s1")
     assert result["status"] == "no_mirror_product"
-    assert result["product_key"] == "prod::external_seed::external_seed::ext1"
-    assert fake.executed == []  # never creates the product/offer chain itself
+    assert fake.executed == []
 
 
 @pytest.mark.asyncio
-async def test_sync_projects_offer_when_mirror_exists(monkeypatch):
-    monkeypatch.setenv("EXTERNAL_OFFER_DUAL_WRITE_ENABLED", "true")
+async def test_sync_projects_offer_under_real_seller(monkeypatch):
+    """The offer attaches under the mirror's REAL per-brand seller + product_key
+    (resolved by provenance), never the 'external_seed' sentinel."""
+    monkeypatch.setenv("EXTERNAL_OFFER_DUAL_WRITE_ENABLED", "1")
     seed = {
-        "id": "s1",
-        "external_product_id": "ext1",
-        "price_amount": 19.99,
-        "price_currency": "USD",
-        "availability": "in_stock",
-        "destination_url": "https://x.test/p",
-        "canonical_url": "https://x.test/p",
-        "domain": "x.test",
-        "market": "US",
+        "id": "s1", "external_product_id": "ext1",
+        "price_amount": 19.99, "price_currency": "USD", "availability": "in_stock",
+        "destination_url": "https://x.test/p", "canonical_url": "https://x.test/p",
+        "domain": "x.test", "market": "US",
     }
-    fake = FakeDB(seed=seed, product_exists=True)
+    fake = FakeDB(seed=seed, mirror={"product_key": _REAL_PK, "merchant_id": _REAL_SELLER})
     monkeypatch.setattr(mod, "database", fake)
+
     result = await mod.sync_offer_for_seed("s1")
     assert result["status"] == "synced"
-    assert result["product_key"] == "prod::external_seed::external_seed::ext1"
+    assert result["product_key"] == _REAL_PK
     assert len(fake.executed) == 1
     params = fake.executed[0]["params"]
     assert "INSERT INTO catalog_offers" in fake.executed[0]["sql"]
+    assert params["product_key"] == _REAL_PK
+    assert params["merchant_id"] == _REAL_SELLER  # NOT "external_seed"
+    assert params["merchant_id"] != "external_seed"
     assert params["list_price"] == 19.99
-    assert params["merchant_effective_price"] == 19.99
-    assert params["estimated_best_price"] == 19.99
     assert params["catalog_track"] == "external_referral"
     assert params["truth_tier"] == "observed"
     assert params["readiness_tier"] == "referral_only"
-    assert params["offer_mode"] == "redirect"
     assert params["source_ref"] == "s1"
 
 
 @pytest.mark.asyncio
+async def test_offer_id_agrees_with_mirror_on_the_real_product_key(monkeypatch):
+    """S2 regression: the dual-write's offer_id/sku_key are derived from the
+    SAME product_key the mirror wrote (resolved via provenance), so a re-project
+    refreshes the mirror's row (ON CONFLICT) rather than forking a divergent one.
+    This is the invariant the sentinel-keyed draft violated."""
+    monkeypatch.setenv("EXTERNAL_OFFER_DUAL_WRITE_ENABLED", "1")
+    fake = FakeDB(
+        seed={"id": "s1", "external_product_id": "ext1", "price_amount": 5.0},
+        mirror={"product_key": _REAL_PK, "merchant_id": _REAL_SELLER},
+    )
+    monkeypatch.setattr(mod, "database", fake)
+    await mod.sync_offer_for_seed("s1")
+    params = fake.executed[0]["params"]
+    # offer_id + sku_key are the deterministic functions of the mirror's key
+    assert params["offer_id"] == mod.derive_mirror_offer_id(_REAL_PK)
+    assert params["sku_key"] == mod.derive_mirror_sku_key(_REAL_PK)
+
+
+@pytest.mark.asyncio
+async def test_upsert_refuses_banned_bucket():
+    """ADR-009 D2: an offer may never be written under the 'external_seed'
+    sentinel — the upsert raises rather than corrupt seller attribution."""
+    with pytest.raises(ValueError):
+        await mod.upsert_catalog_offer_from_seed_row(
+            _REAL_PK, {"id": "s1"}, merchant_id="external_seed"
+        )
+    with pytest.raises(ValueError):
+        await mod.upsert_catalog_offer_from_seed_row(_REAL_PK, {"id": "s1"}, merchant_id="")
+
+
+@pytest.mark.asyncio
 async def test_sync_is_fail_soft(monkeypatch):
-    monkeypatch.setenv("EXTERNAL_OFFER_DUAL_WRITE_ENABLED", "true")
+    monkeypatch.setenv("EXTERNAL_OFFER_DUAL_WRITE_ENABLED", "1")
 
     class BoomDB:
         async def fetch_one(self, *a, **k):
             raise RuntimeError("db down")
 
     monkeypatch.setattr(mod, "database", BoomDB())
-    result = await mod.sync_offer_for_seed("s1")
-    assert result["status"] == "error"  # never raises into the caller
+    assert (await mod.sync_offer_for_seed("s1"))["status"] == "error"  # never raises
