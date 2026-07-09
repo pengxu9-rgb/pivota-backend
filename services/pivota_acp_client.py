@@ -96,13 +96,21 @@ def _resolve_bearer_token() -> str:
 
 def _acp_items(items: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
     """Map cart items to the ACP `{id, quantity}` shape. `id` prefers sku, then
-    variant, then product id — matching how the platform-order ACP path picks it."""
+    variant, then product id — matching how the platform-order ACP path picks it.
+
+    P-T2.3.4: also carry `product_id` + `variant_id` when present. The pivota-acp
+    session stores items as JSONB, so these persist to /complete where the real-
+    capture path needs BOTH to build a Pivota quote (a Pivota quote requires a
+    product_id AND a variant_id; the single ACP `id` is not enough). Omitted when
+    absent so nothing changes for callers that don't supply them."""
     out: List[Dict[str, Any]] = []
     for item in items or []:
+        product_id = str(item.get("product_id") or "").strip()
+        variant_id = str(item.get("variant_id") or "").strip()
         item_id = (
             str(item.get("sku") or "").strip()
-            or str(item.get("variant_id") or "").strip()
-            or str(item.get("product_id") or "").strip()
+            or variant_id
+            or product_id
             or "unknown"
         )
         qty = item.get("quantity")
@@ -110,7 +118,12 @@ def _acp_items(items: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
             qty = int(qty) if qty is not None else 1
         except (TypeError, ValueError):
             qty = 1
-        out.append({"id": item_id, "quantity": max(1, qty)})
+        acp_item: Dict[str, Any] = {"id": item_id, "quantity": max(1, qty)}
+        if product_id:
+            acp_item["product_id"] = product_id
+        if variant_id:
+            acp_item["variant_id"] = variant_id
+        out.append(acp_item)
     return out
 
 

@@ -74,7 +74,9 @@ async def test_client_builds_request_and_parses_session(monkeypatch):
     assert sent["headers"]["API-Version"] == c.PIVOTA_ACP_API_VERSION
     assert sent["headers"]["X-Merchant-Id"] == "merch_x"
     assert sent["headers"]["X-Platform"] == "shopify"
-    assert sent["json"]["items"] == [{"id": "SKU1", "quantity": 2}]
+    # P-T2.3.4: product_id/variant_id ride the ACP item so the session persists
+    # them for the real-capture quote (id still prefers sku).
+    assert sent["json"]["items"] == [{"id": "SKU1", "quantity": 2, "product_id": "p1"}]
     # pvt_click_id threaded into session metadata for attribution parity.
     assert sent["json"]["metadata"]["pvt_click_id"] == "clk_abc"
 
