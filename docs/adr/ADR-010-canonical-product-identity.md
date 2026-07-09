@@ -1,6 +1,6 @@
 # ADR-010: Pivota Canonical Product Identity (resolver-owned, multi-signal)
 
-**Status:** Proposed (rev 2 — substantially revised after adversarial review, 2026-07-09)
+**Status:** Accepted in principle (founder sign-off 2026-07-09 — Option B target / Option D increment, incl. the publish-surface addendum; open decisions D1–D4 remain itemized below). Rev 2 — substantially revised after adversarial review, 2026-07-09.
 **Date:** 2026-07-09
 **Deciders:** Commerce-index / Trust & Identity owners (peng)
 **Builds on:** ADR-001 (canonical record vs supplier), ADR-007 (citable index vs commerce overlay), ADR-008 (brand-identity reconciliation), ADR-009 (seller-of-record identity). Companion reference: `docs/IDENTITY_REFERENCE.md`.
@@ -110,3 +110,63 @@ The live decision is **how much of B to commit now**. The fact-check reframed th
 6. [ ] Only after 2–5 and the convergence pivot co-gate: auto-merge above threshold + Phase-2 cross-merchant cards (variant grain), with mis-merge/neutrality monitoring + unmerge SLO. Tier 2/3 remain deferred until the measurement justifies them.
 
 **Open decisions for sign-off:** (D1) B-as-target / D-as-increment framing; (D2) Tier-1 auto-merge later requires a *complete* per-vertical identity signature, or confidence threshold alone [rec: complete signature — spec-completeness is the Dewu lesson]; (D3) unmerge granularity [rec: per-member detach + projection re-derive; money rows unaffected by construction]; (D4) merchant-facing identity contributions — review-only in v1.
+
+## Addendum — the publish-surface identity contract (2026-07-09, indexing-recovery session)
+
+The Google-indexing investigation surfaced an identity layer this ADR's resolver scope does not yet
+cover: **the identity the outside world sees** (sitemap URLs, PDP `rel=canonical`, JSON-LD `@id`,
+agent-facing PDP resolution). Findings are prod-measured (same D-1 run vintage).
+
+**Sig fragmentation is a live publish defect, not just internal debt.** `catalog_products` carries
+`pivota_signature_id` in two hex lengths (24-hex: 1,429 rows; 32-hex: 9,356 rows; **no content_key
+mixes lengths**, so the *length split* is an ingestion-path artifact between products). Separately,
+**1,218 content_keys carry more than one sig**, so the public product sitemap emitted 7,407 URLs for
+only **6,133 distinct products** — ~17% duplicate URLs splitting index signal across pages Google
+must reconcile. Note the measurements relate but differ: the 1,218 multi-sig keys overlap the D-1
+duplicate-row populations (1,076 intra-merchant + 374 cross-merchant dup keys) — multi-sig-per-key
+is largely multi-*row*-per-key wearing different sigs, i.e. it includes the resolver's real
+duplicate/collision problem, not merely an ingestion nuisance.
+Interim fixes in `pivota-agent-ui` while this ADR's resolver work proceeds: **#257 (merged
+2026-07-08**, static sitemap files — ended GSC "Couldn't fetch"); **#260 and #261 (proposed, in
+review** at time of writing): #260 stops the hard-`noindex` on transient SSR failure (which ISR
+cached for up to 1h), #261 dedups the sitemap to **one URL per content_key** (deterministic winner
+among duplicate sigs — longer sig class, then lexicographic — max-lastmod merge). Product URLs are
+still unindexed, so consolidating URLs now costs zero re-indexing.
+
+> **Caveat the interim rule must carry (review finding):** #261's collapse is publish-layer only
+> (sitemap URL selection — no offer/buy-box merge, and money/citation invariants are untouched),
+> but keying purely on `content_key` means it also collapses the **374 cross-merchant,
+> collision-suspect keys** with zero resolver confidence, and `preferSitemapId`'s winner is
+> arbitrary with respect to merchant (a mild ADR-007 neutrality concern). That is acceptable as a
+> stopgap on today's scale; the **durable D-5 function must become resolver-confidence-aware for
+> cross-merchant keys**, consistent with the item-6 gate ("mis-merge is worse than fragmentation").
+
+**Gap 1 — no single canonical-URL selection policy.** T5 correctly keeps sigs write-once, but
+*which* sig is THE public card is decided independently per surface today: the sitemap generator
+(the #261 rule, content_key/sig grain) and the PDP's self-declared `rel=canonical`
+(`readServerCanonicalRouteId`, `pivota-agent-ui/src/app/products/[id]/page.tsx` — which can declare
+a **`pg_` group id** for multi-merchant scopes, a grain the sitemap never emits). Where they
+disagree, Google receives sitemap URL X whose page declares canonical Y — a standing index-signal
+leak. Reconciling them therefore also forces the **grain decision**: D-5 covers the
+single-merchant / content grain now; the multi-merchant-card case stays deferred to the resolver
+(item 6), which D-5 must not pre-empt.
+
+**Gap 2 — publish-side resolution is a parallel implementation.** The Node shop gateway
+(`PIVOTA-Agent/src/server.js`, `get_pdp_v2`) implements its own tiered sig→product resolution
+(requires a row with `merchant_id` + `source_product_id`; else `400 MISSING_MERCHANT_CONTEXT` — or,
+with a default merchant configured, a downstream `404 PRODUCT_NOT_SERVABLE`), independent of this
+repo's identity code. That respects A.3 (Node consumes, never writes) but the resolution
+*predicate* is duplicated rather than derived from resolver output — divergence here is what turned
+transient backend failures into de-indexed pages during the investigation.
+
+**Additional action items** (publish-surface hygiene within the Option-D increment; the
+cross-merchant canonicalization component of D-5 is gated with item 6):
+
+7. [ ] **Canonical-URL policy (D-5):** one deterministic `content_key → public URL` selection,
+   single implementation consumed by the sitemap generator, PDP `rel=canonical`, and JSON-LD `@id`
+   (#261's rule is the interim reference; align `readServerCanonicalRouteId` with it at content
+   grain). Non-winning sigs keep resolving (T5) and self-declare the winner as canonical. For
+   cross-merchant keys the selection becomes resolver-confidence-aware (item-6 gate).
+8. [ ] **Sig-minting discipline (D-6):** one minting path + truncation length for *new* sigs
+   (existing sigs stay write-once per T5); the multi-sig backlog (1,218 content_keys) is consumed
+   by the D-2 provenance/alias schema so every historical sig resolves to its canonical card.
