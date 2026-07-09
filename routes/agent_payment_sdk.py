@@ -769,6 +769,42 @@ async def create_payment(
                 kill_switch.reason,
             )
 
+        # P-T2.3.2: scoped test-mode capture. When AGENT_ACP_TEST_CAPTURE is on,
+        # a kill-switch-permitted ACP charge may run against a TEST-MODE PSP by
+        # bypassing live-readiness — but only up to a hard amount cap. Default off
+        # → engaged=False → live readiness enforced as before. An engaged charge
+        # over the cap is refused outright (never downgraded).
+        from services.agent_checkout_kill_switch import resolve_acp_test_capture
+
+        _acp_amount_cents = int(round(float(order_total) * 100))
+        acp_test_capture = resolve_acp_test_capture(
+            order_metadata.get("protocol_name"),
+            amount_cents=_acp_amount_cents,
+            kill_switch_allowed=kill_switch.allowed,
+        )
+        if acp_test_capture.engaged and not acp_test_capture.within_cap:
+            logger.warning(
+                "[AgentPayments] ACP test-mode capture REFUSED (over cap) order=%s "
+                "amount_cents=%s cap=%s",
+                request.order_id, _acp_amount_cents, acp_test_capture.max_cents,
+            )
+            raise HTTPException(
+                status_code=403,
+                detail={
+                    "error": "TIER2_TEST_CAPTURE_OVER_CAP",
+                    "amount_cents": _acp_amount_cents,
+                    "max_cents": acp_test_capture.max_cents,
+                    "message": "ACP test-mode capture exceeds the configured amount cap.",
+                },
+            )
+        if acp_test_capture.bypass_live_readiness:
+            logger.warning(
+                "[AgentPayments] ACP TEST-MODE capture lane engaged order=%s "
+                "amount_cents=%s cap=%s — bypassing live PSP readiness for the "
+                "test PSP (test canary only)",
+                request.order_id, _acp_amount_cents, acp_test_capture.max_cents,
+            )
+
         payment_flow = order_metadata.get("payment_flow") if isinstance(order_metadata.get("payment_flow"), dict) else {}
         auth_first_psp = str((payment_flow or {}).get("psp") or "").strip().lower()
         auth_first_manual_capture = (
@@ -869,7 +905,10 @@ async def create_payment(
                     preferred_psps=preferred_psps,
                     restrict_to_preferred_psps=bool(auth_first_manual_capture or requested_psp_mode),
                     canonical_psp_required=True,
-                    enforce_live_readiness=True,
+                    # P-T2.3.2: only the scoped ACP test-capture canary bypasses
+                    # live-readiness (to let a test-mode PSP transact). Every other
+                    # charge — all production flows — still enforces it.
+                    enforce_live_readiness=not acp_test_capture.bypass_live_readiness,
                 ),
                 timeout=AGENT_PAYMENT_INITIATION_TIMEOUT_SECONDS,
             )
