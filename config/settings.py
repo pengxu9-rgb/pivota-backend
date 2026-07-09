@@ -362,6 +362,15 @@ class Settings(BaseSettings):
         os.getenv("SUBMIT_PAYMENT", "false").strip().lower()
         in {"true", "1", "on", "yes"}
     )
+    # agent_submit_payment_merchants: the canary scope. Comma-separated merchant
+    # ids; when NON-EMPTY, a protocol-tier charge is allowed only for a merchant
+    # on this list (even with submit_payment ON) — so the first live flip opens
+    # exactly one merchant by construction, not everyone. EMPTY (default) = no
+    # per-merchant restriction (submit_payment governs globally). Never widens
+    # access on its own: it can only further restrict an already-enabled ceiling.
+    agent_submit_payment_merchants: frozenset[str] = frozenset(
+        m.strip() for m in os.getenv("SUBMIT_PAYMENT_MERCHANTS", "").split(",") if m.strip()
+    )
 
     # Readiness audit / thin-slice flags
     feature_readiness_audit: bool = os.getenv("FEATURE_READINESS_AUDIT", "false").lower() == "true"

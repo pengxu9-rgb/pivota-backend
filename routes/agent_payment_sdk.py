@@ -745,7 +745,10 @@ async def create_payment(
         # for a canary (P-T2.3). Placed before any PSP call so nothing charges.
         from services.agent_checkout_kill_switch import evaluate_tier2_charge
 
-        kill_switch = evaluate_tier2_charge(order_metadata.get("protocol_name"))
+        kill_switch = evaluate_tier2_charge(
+            order_metadata.get("protocol_name"),
+            merchant_id=str(merchant_id),
+        )
         if not kill_switch.allowed:
             logger.warning(
                 "[AgentPayments] Tier-2 protocol charge blocked by kill-switch "
