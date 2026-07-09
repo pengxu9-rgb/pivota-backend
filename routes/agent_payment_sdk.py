@@ -887,31 +887,65 @@ async def create_payment(
         except Exception:
             pass
 
-        try:
-            success, payment_intent, error, psp_used = await asyncio.wait_for(
-                create_payment_with_failover(
-                    merchant_id=merchant_id,
-                    amount=amount,
-                    currency=currency,
-                    metadata={
-                        "order_id": request.order_id,
-                        "agent_id": context.agent_id,
-                        "payment_method_type": request.payment_method.type,
-                        "idempotency_key": request.idempotency_key,
-                        **({"psp_mode": requested_psp_mode} if requested_psp_mode else {}),
-                        **auth_first_payment_metadata,
-                        **({"return_url": request.return_url} if request.return_url else {}),
+        # P-T2.3.3: in the ACP test-capture canary, do a real server-side
+        # off-session capture on the MERCHANT's test Stripe key (the shared path
+        # only client-confirms, which can't complete an in-chat charge). Isolated,
+        # amount-capped, idempotent. All other charges keep the failover path.
+        _acp_offsession = acp_test_capture.bypass_live_readiness
+        if _acp_offsession:
+            from services.acp_offsession_capture import capture_offsession
+
+            _oc = await capture_offsession(
+                merchant_id=str(merchant_id),
+                amount_cents=_acp_amount_cents,
+                currency=str(currency),
+                idempotency_key=(request.idempotency_key or f"acp_off:{request.order_id}"),
+                payment_method=(request.payment_method.token or None),
+                metadata={
+                    "order_id": str(request.order_id),
+                    "agent_id": str(context.agent_id or ""),
+                    **{
+                        k: str(order_metadata[k])
+                        for k in ("protocol_name", "pvt_click_id", "checkout_session_id")
+                        if order_metadata.get(k)
                     },
-                    preferred_psps=preferred_psps,
-                    restrict_to_preferred_psps=bool(auth_first_manual_capture or requested_psp_mode),
-                    canonical_psp_required=True,
-                    # P-T2.3.2: only the scoped ACP test-capture canary bypasses
-                    # live-readiness (to let a test-mode PSP transact). Every other
-                    # charge — all production flows — still enforces it.
-                    enforce_live_readiness=not acp_test_capture.bypass_live_readiness,
-                ),
-                timeout=AGENT_PAYMENT_INITIATION_TIMEOUT_SECONDS,
+                },
             )
+            success = _oc.success
+            error = _oc.error
+            psp_used = "stripe"
+            payment_intent = SimpleNamespace(
+                id=_oc.payment_intent_id or f"acp_off_{request.order_id}",
+                status=_oc.status or ("succeeded" if _oc.success else "failed"),
+                client_secret=None,
+            )
+
+        try:
+            if not _acp_offsession:
+                success, payment_intent, error, psp_used = await asyncio.wait_for(
+                    create_payment_with_failover(
+                        merchant_id=merchant_id,
+                        amount=amount,
+                        currency=currency,
+                        metadata={
+                            "order_id": request.order_id,
+                            "agent_id": context.agent_id,
+                            "payment_method_type": request.payment_method.type,
+                            "idempotency_key": request.idempotency_key,
+                            **({"psp_mode": requested_psp_mode} if requested_psp_mode else {}),
+                            **auth_first_payment_metadata,
+                            **({"return_url": request.return_url} if request.return_url else {}),
+                        },
+                        preferred_psps=preferred_psps,
+                        restrict_to_preferred_psps=bool(auth_first_manual_capture or requested_psp_mode),
+                        canonical_psp_required=True,
+                        # P-T2.3.2: only the scoped ACP test-capture canary bypasses
+                        # live-readiness (to let a test-mode PSP transact). Every other
+                        # charge — all production flows — still enforces it.
+                        enforce_live_readiness=not acp_test_capture.bypass_live_readiness,
+                    ),
+                    timeout=AGENT_PAYMENT_INITIATION_TIMEOUT_SECONDS,
+                )
         except asyncio.TimeoutError as exc:
             logger.error(
                 "[AgentPayments] Payment initiation timed out for order %s after %.2fs",
