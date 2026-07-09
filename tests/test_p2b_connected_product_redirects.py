@@ -119,3 +119,51 @@ async def test_fail_soft_on_store_lookup_error(monkeypatch: pytest.MonkeyPatch) 
     await gw._attach_connected_product_redirects([card], market="US")
     # no domain → shopify handle path unavailable → card unchanged, no raise
     assert not card.get("external_redirect_url")
+
+
+# ---- A-F1.3: connected-WooCommerce fallback destination ----
+
+@pytest.fixture()
+def _woo_store(monkeypatch: pytest.MonkeyPatch):
+    async def fake_stores(merchant_id: str):
+        return [{"platform": "woocommerce", "domain": "woostore.example", "status": "active"}]
+
+    monkeypatch.setattr(mss, "get_merchant_active_stores", fake_stores)
+
+
+@pytest.mark.asyncio
+async def test_woo_card_default_permalink_from_handle(_woo_store) -> None:
+    """No online_store_url → derive the WooCommerce default /product/<slug>
+    base from the connected Woo store domain (referral_only join)."""
+    card = _card(platform="woocommerce", handle="blue-widget", online_store_url="", variants=[])
+    await gw._attach_connected_product_redirects([card], market="US", tool="find_products")
+
+    url = card.get("external_redirect_url")
+    assert url and "/r?token=" in url
+    payload = _token_payload(url)
+    assert payload["dest"].startswith("https://woostore.example/product/blue-widget")
+    assert (payload.get("ctx") or {}).get("join_mode") == "referral_only"
+    assert "utm_content=" in payload["dest"]
+
+
+@pytest.mark.asyncio
+async def test_woo_real_permalink_wins_over_default_base(_woo_store) -> None:
+    """A real permalink captured at sync (online_store_url, possibly a custom
+    permalink structure) takes precedence over the /product/<slug> default."""
+    card = _card(
+        platform="woocommerce",
+        handle="blue-widget",
+        online_store_url="https://woostore.example/shop/cat/blue-widget-123",
+        variants=[],
+    )
+    await gw._attach_connected_product_redirects([card], market="US")
+    payload = _token_payload(card["external_redirect_url"])
+    assert payload["dest"].startswith("https://woostore.example/shop/cat/blue-widget-123")
+
+
+@pytest.mark.asyncio
+async def test_woo_card_without_handle_is_skipped(_woo_store) -> None:
+    """No permalink and no slug → never fabricate a destination."""
+    card = _card(platform="woocommerce", handle="", online_store_url="", variants=[])
+    await gw._attach_connected_product_redirects([card], market="US")
+    assert not card.get("external_redirect_url")
