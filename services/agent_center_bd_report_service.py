@@ -9053,7 +9053,10 @@ def _budgeted_wedge_query_records(
     # category-template tail ("best {cat} for {audience}") for the mid-reserve
     # slots. They sit AFTER the templates in base_records order, so a plain
     # `remaining_base` fill dropped them at target=14 (the whole point of Gemini
-    # generation was being wasted). Float them to the front of the fill.
+    # generation was being wasted). Float ONLY those to the front; everything else
+    # keeps its original base-before-sidewalk fill order (moving all sidewalk ahead
+    # of the mid-specific base prompts stole the reserve — it dropped the audience
+    # discovery query "multivitamin for women" at target=14).
     priority = priority_queries or frozenset()
     remaining_base_priority = [
         record for record in remaining_base
@@ -9066,8 +9069,8 @@ def _budgeted_wedge_query_records(
     return _fill_per_sku_query_records(
         selected
         + remaining_base_priority
-        + remaining_sidewalk
-        + remaining_base_other,
+        + remaining_base_other
+        + remaining_sidewalk,
         target=target,
         title=title,
         filler_pool=filler_pool,
