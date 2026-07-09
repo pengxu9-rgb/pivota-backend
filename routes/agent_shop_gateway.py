@@ -5223,8 +5223,10 @@ async def _attach_connected_product_redirects(
     connected shop domain + ``handle``. A connected Shopify product with a
     numeric variant id yields join_mode=cart_permalink inside the mint — an
     ORDER-side join closable by T2-2 with zero merchant setup. Wix cards join
-    via ``online_store_url`` captured by the Wix sync (referral_only join);
-    cards with no derivable destination are skipped (honest degradation).
+    via ``online_store_url`` captured by the Wix sync (referral_only join).
+    Connected WooCommerce cards join via ``online_store_url`` (real permalink),
+    else the WooCommerce default product base + ``handle`` (referral_only).
+    Cards with no derivable destination are skipped (honest degradation).
 
     Trust basis: the destination is the merchant's OWN connected store, so the
     mint's domain allowlist is exactly that destination's host (the store
@@ -5250,33 +5252,44 @@ async def _attach_connected_product_redirects(
 
         from services.merchant_store_service import get_merchant_active_stores
 
-        shop_domains: Dict[str, str] = {}
+        # Per-merchant connected-store domain keyed by PLATFORM, so a card's
+        # destination can be derived for its own platform (a merchant may have
+        # e.g. both a Shopify and a Woo store). Was Shopify-only.
+        store_domains: Dict[str, Dict[str, str]] = {}
         for merchant_id in {str(p["merchant_id"]).strip() for p in candidates}:
             try:
                 stores = await get_merchant_active_stores(merchant_id)
             except Exception:
                 stores = []
-            shop = next(
-                (
-                    s
-                    for s in stores or []
-                    if str(s.get("platform") or "").strip().lower() == "shopify"
-                    and str(s.get("domain") or "").strip()
-                ),
-                None,
-            )
-            if shop:
-                shop_domains[merchant_id] = str(shop["domain"]).strip()
+            by_platform: Dict[str, str] = {}
+            for s in stores or []:
+                plat = str(s.get("platform") or "").strip().lower()
+                dom = str(s.get("domain") or "").strip()
+                if plat and dom and plat not in by_platform:
+                    by_platform[plat] = dom
+            if by_platform:
+                store_domains[merchant_id] = by_platform
 
         mint_cache: Dict[str, Optional[str]] = {}
         for p in candidates:
             merchant_id = str(p.get("merchant_id") or "").strip()
             platform = str(p.get("platform") or "").strip().lower()
-            shop_domain = shop_domains.get(merchant_id)
+            merchant_store_domain = (store_domains.get(merchant_id) or {}).get(platform)
+            # shop_domain feeds the Shopify cart-permalink mint; only meaningful
+            # for Shopify (its absence → referral_only for other platforms).
+            shop_domain = merchant_store_domain if platform == "shopify" else None
             dest = str(p.get("online_store_url") or "").strip()
             handle = str(p.get("handle") or "").strip()
-            if not dest and platform == "shopify" and shop_domain and handle:
-                dest = f"https://{normalize_shop_host(shop_domain)}/products/{handle}"
+            if not dest and platform == "shopify" and merchant_store_domain and handle:
+                dest = f"https://{normalize_shop_host(merchant_store_domain)}/products/{handle}"
+            elif not dest and platform == "woocommerce" and merchant_store_domain and handle:
+                # A-F1.3: connected-Woo fallback. The real permalink
+                # (online_store_url captured at sync) wins; this only fires when
+                # it's absent, using WooCommerce's DEFAULT product base
+                # (/product/<slug>). Not fabricated beyond that convention —
+                # non-default-permalink stores carry online_store_url and take
+                # the branch above. No handle → skip (never guess).
+                dest = f"https://{normalize_shop_host(merchant_store_domain)}/product/{handle}"
             if not dest.startswith(("http://", "https://")):
                 continue  # no derivable merchant destination — never fabricate one
 
@@ -5299,7 +5312,7 @@ async def _attach_connected_product_redirects(
                     # The merchant's own connected store is the trust basis. Allow both the
                     # destination host and the connected shop domain — online_store_url may
                     # live on a custom domain while the connection stores the .myshopify one.
-                    allowed_domains=[h for h in {normalize_shop_host(dest), normalize_shop_host(shop_domain or "")} if h],
+                    allowed_domains=[h for h in {normalize_shop_host(dest), normalize_shop_host(merchant_store_domain or ""), normalize_shop_host(shop_domain or "")} if h],
                     merchant_id=merchant_id,
                     product_id=str(p.get("product_id") or p.get("id") or "").strip() or None,
                     variant_id=variant_id,
@@ -11918,6 +11931,14 @@ async def _handle_get_product_detail(
         if options
         else None
     )
+
+    # A-F1.2 (funnel plan): attribute PDP click-outs. The detail card previously
+    # emitted no /r link, so a buyer landing on a product-detail card had no
+    # attributed path to checkout. Reuse the exact post-pass find_products uses
+    # (in place on the single-card list; fail-soft; external/pre-stamped cards
+    # skipped, connected cards with a derivable destination get cart_permalink
+    # or referral_only).
+    await _attach_connected_product_redirects([base], tool="get_product_detail")
 
     review_summary = None
     seller_feedback_summary = None
