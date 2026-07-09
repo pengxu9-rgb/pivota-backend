@@ -41,9 +41,13 @@ _LLM_OUT = {
 
 
 def _fake_synth_factory(counter):
+    return _fake_synth_out(_LLM_OUT, counter)
+
+
+def _fake_synth_out(payload, counter):
     async def fake_synth(**kwargs):
         counter["n"] += 1
-        return {"text": json.dumps(_LLM_OUT), "provider": kwargs["provider"], "model": kwargs["model"]}
+        return {"text": json.dumps(payload), "provider": kwargs["provider"], "model": kwargs["model"]}
     return fake_synth
 
 
@@ -105,6 +109,92 @@ def test_merge_helper_no_stash_equals_plain_graph():
     plain = build_sku_attribute_graph(MOJAWA)
     merged = R._attribute_graph_for_probes({"product": MOJAWA}, MOJAWA)
     assert merged == plain                         # flag off / no stash -> identical
+
+
+# A lexicon-thin own page: title + type only. The rescue material (IP68 / swim)
+# lives ONLY in the recycled retailer excerpt, never on the own page.
+THIN = {
+    "title": "Acme X1",
+    "product_type": "Bone Conduction Headphones",
+}
+_RETAILER_LLM_OUT = {
+    "attributes": [
+        {
+            "class_name": "certification_constraint",
+            "value": "IP68",
+            "span": "rated IP68 waterproof for swimming",
+        },
+    ]
+}
+
+
+@pytest.mark.asyncio
+async def test_extractor_grounds_in_recycled_retailer_excerpts(monkeypatch):
+    """Regression: the extractor runs INSIDE load_sku_context, before the probe
+    loop stashes _retailer_excerpts, so it must self-load prior retailer evidence
+    or it can never ground attributes that live only on Tier-1 retailer listings —
+    the exact rescue path for thin url-wedge pages."""
+    monkeypatch.setattr(settings, "attribute_extractor_enabled", True)
+    monkeypatch.setattr(R, "_resolve_extractor_provider", lambda: ("deepseek", "deepseek-chat"))
+    counter = {"n": 0}
+    monkeypatch.setattr(
+        "services.llm_synthesis.synthesize", _fake_synth_out(_RETAILER_LLM_OUT, counter)
+    )
+
+    async def fake_evidence(*, merchant_id, sku_key, **_kw):
+        assert merchant_id == "merch_1" and sku_key == "urlwedge:abc"
+        return {
+            "excerpts": ["Acme X1 is rated IP68 waterproof for swimming with 32GB storage."],
+            "hosts": ["rtings.com"],
+        }
+
+    monkeypatch.setattr("services.retailer_evidence.load_prior_retailer_evidence", fake_evidence)
+
+    product = dict(THIN)
+    ctx = {
+        "product": product,
+        "vertical": "electronics",
+        "merchant_id": "merch_1",
+        "sku_key": "urlwedge:abc",
+    }
+    await R._maybe_stash_llm_attributes(ctx)
+
+    assert counter["n"] == 1
+    values = {g.value for g in (ctx.get(R._LLM_ATTR_STASH_KEY) or [])}
+    assert "IP68" in values                       # grounded in the recycled excerpt
+    # excerpt now lives on the product for the downstream graph/prompt consumers
+    assert product.get("_retailer_excerpts")
+
+
+@pytest.mark.asyncio
+async def test_extractor_drops_retailer_only_span_when_no_evidence(monkeypatch):
+    """Control: same LLM output, but no prior retailer evidence — the span isn't
+    in the own-page source, so the groundedness guard drops it. Proves it's the
+    excerpt (not the own page) that grounds the attribute."""
+    monkeypatch.setattr(settings, "attribute_extractor_enabled", True)
+    monkeypatch.setattr(R, "_resolve_extractor_provider", lambda: ("deepseek", "deepseek-chat"))
+    counter = {"n": 0}
+    monkeypatch.setattr(
+        "services.llm_synthesis.synthesize", _fake_synth_out(_RETAILER_LLM_OUT, counter)
+    )
+
+    async def no_evidence(**_kw):
+        return {"excerpts": [], "hosts": []}
+
+    monkeypatch.setattr("services.retailer_evidence.load_prior_retailer_evidence", no_evidence)
+
+    product = dict(THIN)
+    ctx = {
+        "product": product,
+        "vertical": "electronics",
+        "merchant_id": "merch_1",
+        "sku_key": "urlwedge:abc",
+    }
+    await R._maybe_stash_llm_attributes(ctx)
+
+    values = {g.value for g in (ctx.get(R._LLM_ATTR_STASH_KEY) or [])}
+    assert "IP68" not in values                   # own-page source lacks the span
+    assert not product.get("_retailer_excerpts")
 
 
 @pytest.mark.asyncio
