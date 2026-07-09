@@ -29,6 +29,9 @@ from services.commerce_execution_policy import (
 )
 from services.quote_service import QuoteError, QuoteService
 from services.traffic_taxonomy_service import attach_traffic_taxonomy, build_traffic_taxonomy
+from services.tier2_acp_lane import resolve_acp_lane_decision
+from services.pivota_acp_client import AcpClientError, create_checkout_session
+from config.settings import settings
 
 from sqlalchemy.sql import func
 
@@ -558,6 +561,110 @@ async def create_external_platform_checkout(
         "warnings": [
             "Pivota did not create an order or PSP payment for this response.",
             "Final price, tax, shipping, payment, and inventory availability are validated by the merchant platform checkout.",
+        ],
+    }
+
+
+class CreateAcpCheckoutRequest(BaseModel):
+    items: List[CheckoutIntentItem]
+    shipping_address: Optional[Dict[str, Any]] = None
+    customer_email: Optional[str] = None
+    pvt_click_id: Optional[str] = Field(None, description="Attribution click id to thread through the ACP session")
+    pvt_surface: Optional[str] = Field(None, description="Origin surface (e.g. chatgpt)")
+    source: Optional[str] = None
+
+
+def _redirect_fallback(merchant_id: str, *, reason: str, platform: Optional[str] = None) -> Dict[str, Any]:
+    """Uniform 'not this lane — use the redirect floor' response. Never an error:
+    routing to the floor is a valid outcome (fail-open, never a dead end)."""
+    return {
+        "status": "requires_redirect_floor",
+        "checkout_source": "redirect_floor",
+        "lane": "redirect_floor",
+        "reason": reason,
+        "merchant_id": merchant_id,
+        "platform": platform,
+        "message": (
+            "In-chat ACP checkout is not available for this merchant; fall back to "
+            "the redirect floor (POST /agent/v1/checkout/external-platform or a "
+            "merchant redirect)."
+        ),
+    }
+
+
+@router.post("/acp")
+async def create_acp_checkout(
+    req: CreateAcpCheckoutRequest,
+    context: AgentContext = Depends(get_agent_context),
+):
+    """P-T2.3.1b — initiate an in-chat ACP checkout SCREEN for an ACP-capable,
+    charge-permitted merchant, else fall back to the redirect floor.
+
+    DARK: this creates a pivota-acp session (screen/quote) only. It does NOT
+    complete or charge — real capture is gated behind the kill-switch + P-T2.3.2+.
+    By default (SUBMIT_PAYMENT off) the lane decision routes every merchant to the
+    redirect floor, so this endpoint is inert until a merchant is canary-enabled.
+    """
+    if not req.items:
+        raise HTTPException(status_code=400, detail={"error": "INVALID_REQUEST", "message": "items[] is required"})
+    merchant_id = _single_checkout_merchant_or_raise(req.items)
+    if not context.can_access_merchant(merchant_id):
+        raise HTTPException(status_code=403, detail="Not authorized for this merchant")
+
+    # Capability + kill-switch gate (P-T2.3.1). Fail-open to redirect for anything
+    # short of "ACP-capable AND charge-permitted for this merchant".
+    decision = await resolve_acp_lane_decision(merchant_id)
+    if not decision.is_acp:
+        return _redirect_fallback(merchant_id, reason=decision.reason, platform=decision.platform)
+
+    # Defense-in-depth: even when the kill-switch permits, do not touch the
+    # pivota-acp integration unless it is explicitly enabled.
+    if not settings.enable_platform_orders_acp:
+        return _redirect_fallback(merchant_id, reason="acp_integration_disabled", platform=decision.platform)
+
+    metadata: Dict[str, Any] = {
+        "source": req.source or "agent_api",
+        "commerce_surface": req.pvt_surface or "acp",
+    }
+    if req.pvt_click_id:
+        metadata["pvt_click_id"] = req.pvt_click_id
+    if req.pvt_surface:
+        metadata["pvt_surface"] = req.pvt_surface
+
+    try:
+        session = await create_checkout_session(
+            merchant_id=merchant_id,
+            platform=decision.platform or "shopify",
+            items=[it.model_dump() for it in req.items],
+            fulfillment_address=req.shipping_address,
+            buyer={"email": req.customer_email} if req.customer_email else None,
+            metadata=metadata,
+        )
+    except AcpClientError as exc:
+        # Fail-open to the redirect floor on any ACP error — never a dead end.
+        return _redirect_fallback(
+            merchant_id, reason=f"acp_unavailable:{exc.code}", platform=decision.platform
+        )
+
+    return {
+        "status": "requires_in_chat_acp_checkout",
+        "checkout_source": "acp_in_chat",
+        "lane": "acp_in_chat",
+        "protocol": "acp",
+        "merchant_id": merchant_id,
+        "platform": decision.platform,
+        "acp_session_id": session.session_id,
+        "checkout_url": session.checkout_url,
+        "currency": session.currency,
+        "totals": session.totals,
+        "pvt_click_id": req.pvt_click_id,
+        # DARK lane invariants — honest about what this does NOT do yet.
+        "creates_pivota_order": False,
+        "creates_psp_payment": False,
+        "capture_enabled": False,
+        "warnings": [
+            "In-chat ACP checkout screen only: no order or charge is created here.",
+            "Real capture is gated behind the kill-switch and is not yet enabled (P-T2.3.2+).",
         ],
     }
 
