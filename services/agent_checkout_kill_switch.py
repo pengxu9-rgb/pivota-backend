@@ -41,6 +41,8 @@ REASON_NOT_PROTOCOL = "not_protocol_tier"
 REASON_ALLOWED_STRICT_ENABLED = "allowed_strict_submit_enabled"
 REASON_ALLOWED_STRICT_DISABLED = "allowed_strict_disabled_dev_bypass"
 REASON_BLOCKED_SUBMIT_DISABLED = "blocked_submit_payment_disabled"
+REASON_BLOCKED_MERCHANT_NOT_ALLOWLISTED = "blocked_merchant_not_allowlisted"
+REASON_ALLOWED_MERCHANT_ALLOWLISTED = "allowed_merchant_allowlisted"
 
 
 def is_guarded_protocol(protocol: Optional[str]) -> bool:
@@ -58,6 +60,11 @@ class KillSwitchDecision:
     # True only for a protocol-tier charge that this switch actually governs; a
     # non-protocol (REST/redirect/hosted) charge is `allowed=True, guarded=False`.
     guarded: bool
+    # The merchant evaluated (if supplied) and whether a per-merchant canary
+    # allowlist was in force. merchant_allowlisted is None when no allowlist is set.
+    merchant_id: Optional[str] = None
+    merchant_allowlist_active: bool = False
+    merchant_allowlisted: Optional[bool] = None
 
     def as_error_detail(self) -> dict:
         return {
@@ -66,9 +73,16 @@ class KillSwitchDecision:
             "protocol": self.protocol,
             "agent_checkout_strict": self.strict,
             "submit_payment_enabled": self.submit_payment_enabled,
+            "merchant_id": self.merchant_id,
+            "merchant_allowlist_active": self.merchant_allowlist_active,
             "message": (
-                "In-chat protocol checkout is not enabled. This charge lane is "
-                "fail-closed until SUBMIT_PAYMENT is turned on for a canary."
+                "In-chat protocol checkout is not enabled for this charge. It is "
+                "fail-closed until SUBMIT_PAYMENT is turned on"
+                + (
+                    " and this merchant is on SUBMIT_PAYMENT_MERCHANTS."
+                    if self.merchant_allowlist_active
+                    else " for a canary."
+                )
             ),
         }
 
@@ -76,61 +90,69 @@ class KillSwitchDecision:
 def evaluate_tier2_charge(
     protocol: Optional[str],
     *,
+    merchant_id: Optional[str] = None,
     strict: Optional[bool] = None,
     submit_payment_enabled: Optional[bool] = None,
+    submit_payment_merchants: Optional[frozenset] = None,
 ) -> KillSwitchDecision:
     """Decide whether a charge on the given protocol lane may proceed.
 
-    `strict` / `submit_payment_enabled` default to the live settings; pass
-    explicit values in tests. A non-protocol lane is always allowed (guarded=
-    False) so this is safe to call unconditionally on the shared charge path.
+    `strict` / `submit_payment_enabled` / `submit_payment_merchants` default to
+    the live settings; pass explicit values in tests. A non-protocol lane is
+    always allowed (guarded=False) so this is safe to call unconditionally on the
+    shared charge path.
+
+    When a per-merchant canary allowlist (`submit_payment_merchants`) is
+    non-empty, a protocol charge is allowed only for a merchant on the list —
+    even with submit_payment ON — so the first live flip opens exactly one
+    merchant. The allowlist only *narrows*: it is never consulted unless
+    submit_payment is already ON.
     """
     proto = str(protocol or "").strip().lower() or None
+    mid = str(merchant_id or "").strip() or None
     strict_on = settings.agent_checkout_strict if strict is None else bool(strict)
     submit_on = (
         settings.agent_submit_payment_enabled
         if submit_payment_enabled is None
         else bool(submit_payment_enabled)
     )
+    allowlist = (
+        settings.agent_submit_payment_merchants
+        if submit_payment_merchants is None
+        else frozenset(submit_payment_merchants)
+    )
+    allowlist_active = bool(allowlist)
+
+    def _decision(allowed: bool, reason: str, *, merchant_allowlisted=None) -> KillSwitchDecision:
+        return KillSwitchDecision(
+            allowed=allowed,
+            reason=reason,
+            protocol=proto,
+            strict=strict_on,
+            submit_payment_enabled=submit_on,
+            guarded=is_guarded_protocol(proto),
+            merchant_id=mid,
+            merchant_allowlist_active=allowlist_active,
+            merchant_allowlisted=merchant_allowlisted,
+        )
 
     if not is_guarded_protocol(proto):
         # Redirect floor / REST / hosted — not this switch's concern.
-        return KillSwitchDecision(
-            allowed=True,
-            reason=REASON_NOT_PROTOCOL,
-            protocol=proto,
-            strict=strict_on,
-            submit_payment_enabled=submit_on,
-            guarded=False,
-        )
+        return _decision(True, REASON_NOT_PROTOCOL)
 
     if not strict_on:
         # Strict explicitly disabled (dev bypass). Honest, logged.
-        return KillSwitchDecision(
-            allowed=True,
-            reason=REASON_ALLOWED_STRICT_DISABLED,
-            protocol=proto,
-            strict=strict_on,
-            submit_payment_enabled=submit_on,
-            guarded=True,
-        )
+        return _decision(True, REASON_ALLOWED_STRICT_DISABLED)
 
     # Strict ON (default): the ceiling is submit_payment.
-    if submit_on:
-        return KillSwitchDecision(
-            allowed=True,
-            reason=REASON_ALLOWED_STRICT_ENABLED,
-            protocol=proto,
-            strict=strict_on,
-            submit_payment_enabled=submit_on,
-            guarded=True,
-        )
+    if not submit_on:
+        return _decision(False, REASON_BLOCKED_SUBMIT_DISABLED)
 
-    return KillSwitchDecision(
-        allowed=False,
-        reason=REASON_BLOCKED_SUBMIT_DISABLED,
-        protocol=proto,
-        strict=strict_on,
-        submit_payment_enabled=submit_on,
-        guarded=True,
-    )
+    # submit_payment ON. If a canary allowlist is in force, the merchant must be
+    # on it (safe-by-construction single-merchant canary).
+    if allowlist_active:
+        if mid and mid in allowlist:
+            return _decision(True, REASON_ALLOWED_MERCHANT_ALLOWLISTED, merchant_allowlisted=True)
+        return _decision(False, REASON_BLOCKED_MERCHANT_NOT_ALLOWLISTED, merchant_allowlisted=False)
+
+    return _decision(True, REASON_ALLOWED_STRICT_ENABLED)
