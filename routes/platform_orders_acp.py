@@ -19,7 +19,29 @@ from db.platform_orders import (
     update_platform_order_data,
     update_platform_order_by_platform_id,
 )
+from services.commerce_attribution_service import (
+    PVT_CLICK_ID,
+    PVT_PRODUCT_ID,
+    PVT_PROMPT_CLUSTER,
+    PVT_SURFACE,
+    PVT_VARIANT_ID,
+    has_attribution_signal,
+    materialize_attribution_context,
+    upsert_order_attribution_edge,
+)
 from config.settings import settings
+
+# P-T2.0: the pvt_* attribution keys we thread through the ACP checkout metadata
+# so a Tier-2 (in-chat protocol) order deposits an attribution edge with the same
+# pvt_click_id as the redirect floor. Kept as a tuple so the carry-in (checkout
+# create) and recovery (order-completed webhook) stay in lockstep.
+_ACP_ATTRIBUTION_KEYS = (
+    PVT_SURFACE,
+    PVT_CLICK_ID,
+    PVT_PRODUCT_ID,
+    PVT_VARIANT_ID,
+    PVT_PROMPT_CLUSTER,
+)
 
 router = APIRouter(
     prefix="/platform-orders",
@@ -136,7 +158,33 @@ async def create_acp_checkout_for_platform_order(
     # ACP currently only supports shopify/wix
     # For amazon/temu, we use shopify as a proxy
     acp_platform = "shopify" if order['platform'] in ['amazon', 'temu'] else order['platform']
-    
+
+    # P-T2.0 attribution parity: thread the pvt_click_id/surface into the ACP
+    # checkout metadata so the completed-order webhook can deposit a
+    # commerce_attribution_edge, exactly like the redirect floor. The click id
+    # rides the platform order's own `data` (stamped upstream at order intake,
+    # the Tier-2 analogue of the redirect cart-attribute round-trip). We only
+    # add keys we actually resolved — an order with no attribution signal keeps
+    # today's behavior (no synthetic click id injected into the provider call).
+    acp_metadata = {
+        "platform_order_id": order['order_id'],
+        "platform_order_db_id": str(order_id),
+        "platform": order['platform'],  # Keep original platform in metadata
+        "acp_platform": acp_platform,
+    }
+    attribution_updates: Dict[str, Any] = {}
+    if has_attribution_signal(order.get('data') or {}):
+        attribution_context = materialize_attribution_context(
+            order['data'],
+            default_surface=str((order['data'] or {}).get(PVT_SURFACE) or "acp"),
+            merchant_id=order['merchant_id'],
+        )
+        for key in _ACP_ATTRIBUTION_KEYS:
+            value = attribution_context.get(key)
+            if value:
+                acp_metadata[key] = str(value)
+                attribution_updates[key] = str(value)
+
     # Call ACP API
     acp_bearer = _resolve_acp_bearer_token()
     try:
@@ -153,12 +201,7 @@ async def create_acp_checkout_for_platform_order(
                 json={
                     "items": acp_items,
                     "fulfillment_address": fulfillment_address,
-                    "metadata": {
-                        "platform_order_id": order['order_id'],
-                        "platform_order_db_id": str(order_id),
-                        "platform": order['platform'],  # Keep original platform in metadata
-                        "acp_platform": acp_platform
-                    }
+                    "metadata": acp_metadata
                 }
             )
         
@@ -192,7 +235,11 @@ async def create_acp_checkout_for_platform_order(
                         'payment_status': 'pending',
                         'acp_created_at': datetime.utcnow().isoformat(),
                         'acp_total_cents': total_cents,
-                        'acp_currency': currency
+                        'acp_currency': currency,
+                        # P-T2.0: persist the resolved pvt_* keys onto the order so
+                        # the completed-order webhook can recover the click id even
+                        # if the ACP provider does not echo our metadata back.
+                        **attribution_updates,
                     }
                 )
             except Exception as db_exc:
@@ -331,7 +378,56 @@ async def handle_acp_order_completed_webhook(
         elif platform_order_id:
             await update_platform_order_by_platform_id(platform_order_id, updates)
             logger.info(f"Updated order {platform_order_id}: {mapped_status}")
-        
+
+        # P-T2.0 attribution parity: on a paid Tier-2 (in-chat ACP) order, deposit a
+        # commerce_attribution_edge with the same pvt_click_id the redirect floor
+        # deposits. The click id round-trips two ways: the ACP provider echoes the
+        # metadata we stamped at checkout create, and we persisted the pvt_* keys onto
+        # the platform order's `data` as a fallback. upsert_order_attribution_edge is
+        # idempotent on order_id and self-gates on has_attribution_signal, so an order
+        # with no signal is a warning-logged skip (Stage-1 gap sizing), never a fake
+        # edge. Best-effort: an attribution write must never fail the webhook ack.
+        if mapped_status == 'paid':
+            try:
+                edge_merchant_id: Optional[str] = None
+                order_data: Dict[str, Any] = {}
+                if platform_order_db_id:
+                    platform_order = await get_platform_order_by_id(int(platform_order_db_id))
+                    if platform_order:
+                        edge_merchant_id = platform_order.get('merchant_id')
+                        order_data = platform_order.get('data') or {}
+                # Merge the persisted order-side pvt_* (from checkout create) with the
+                # provider-echoed webhook metadata; the webhook wins on conflict since
+                # it reflects the session that actually converted.
+                edge_metadata = {
+                    **{k: order_data[k] for k in _ACP_ATTRIBUTION_KEYS if order_data.get(k)},
+                    **{k: v for k, v in (metadata or {}).items() if v is not None},
+                    "protocol_name": "acp",
+                    "commerce_surface": str(
+                        (metadata or {}).get(PVT_SURFACE) or order_data.get(PVT_SURFACE) or "acp"
+                    ),
+                }
+                edge_order_id = str(acp_order_id or platform_order_id or platform_order_db_id or "").strip()
+                if edge_merchant_id and edge_order_id and has_attribution_signal(edge_metadata):
+                    await upsert_order_attribution_edge(
+                        order_id=edge_order_id,
+                        merchant_id=str(edge_merchant_id),
+                        metadata=edge_metadata,
+                    )
+                elif not edge_merchant_id:
+                    logger.info(
+                        "ACP attribution edge skipped: merchant unresolved "
+                        "(platform_order_db_id=%s platform_order_id=%s)",
+                        platform_order_db_id, platform_order_id,
+                    )
+            except Exception as attribution_exc:  # noqa: BLE001 — best-effort
+                logger.warning(
+                    "Failed to persist ACP commerce attribution edge for order "
+                    "%s: %s",
+                    platform_order_id or platform_order_db_id,
+                    attribution_exc,
+                )
+
         # Log payment transaction in background
         async def log_payment():
             try:
