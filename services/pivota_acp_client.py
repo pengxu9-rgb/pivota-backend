@@ -1,0 +1,209 @@
+"""P-T2.3.1b — backend → pivota-acp checkout-session client.
+
+A thin, reusable client for creating an ACP checkout SESSION on the pivota-acp
+service (`settings.platform_orders_acp_url`). This is the in-chat screen/quote
+step only — it creates a session and returns its descriptor; it does NOT call
+`/complete` and it does NOT charge (real capture is P-T2.3.2+).
+
+It threads the `pvt_*` attribution keys into the session metadata so the
+order-completed webhook (P-T2.0) can later deposit an attribution edge with the
+same `pvt_click_id` as the redirect floor.
+
+Framework-agnostic: raises `AcpClientError` (not HTTPException) so callers own
+the HTTP translation.
+"""
+
+from __future__ import annotations
+
+import logging
+import os
+from dataclasses import dataclass, field
+from typing import Any, Dict, List, Optional
+
+import httpx
+
+from config.settings import settings
+from services.commerce_attribution_service import (
+    PVT_CLICK_ID,
+    PVT_PRODUCT_ID,
+    PVT_PROMPT_CLUSTER,
+    PVT_SURFACE,
+    PVT_VARIANT_ID,
+    has_attribution_signal,
+    materialize_attribution_context,
+)
+
+logger = logging.getLogger("pivota_acp_client")
+
+PIVOTA_ACP_API_VERSION = "2025-09-29"
+
+# Keep in lockstep with routes/platform_orders_acp._ACP_ATTRIBUTION_KEYS: the
+# pvt_* keys we thread into the ACP session metadata for attribution parity.
+_ACP_ATTRIBUTION_KEYS = (
+    PVT_SURFACE,
+    PVT_CLICK_ID,
+    PVT_PRODUCT_ID,
+    PVT_VARIANT_ID,
+    PVT_PROMPT_CLUSTER,
+)
+
+
+class AcpClientError(Exception):
+    """A pivota-acp call failed. `status_code` is the upstream status when known."""
+
+    def __init__(self, message: str, *, status_code: Optional[int] = None, code: str = "acp_error"):
+        super().__init__(message)
+        self.message = message
+        self.status_code = status_code
+        self.code = code
+
+
+@dataclass(frozen=True)
+class AcpSession:
+    session_id: str
+    checkout_url: str
+    status: Optional[str]
+    currency: Optional[str]
+    total_cents: Optional[int]
+    totals: List[Dict[str, Any]] = field(default_factory=list)
+    raw: Dict[str, Any] = field(default_factory=dict)
+
+
+def _acp_base_url() -> str:
+    return str(settings.platform_orders_acp_url or "").rstrip("/")
+
+
+def _resolve_bearer_token() -> str:
+    """Service-to-service bearer for pivota-acp. Required in production; falls
+    back to the shared dev placeholder otherwise (mirrors
+    routes/platform_orders_acp._resolve_acp_bearer_token, but raises
+    AcpClientError instead of HTTPException)."""
+    token = settings.platform_orders_acp_token
+    if token:
+        return token
+    is_prod = (
+        os.getenv("ENVIRONMENT", "").lower() == "production"
+        or os.getenv("RAILWAY_ENVIRONMENT", "").lower() == "production"
+    )
+    if is_prod:
+        raise AcpClientError(
+            "platform_orders_acp_token_not_configured",
+            status_code=503,
+            code="acp_token_missing",
+        )
+    return "test"
+
+
+def _acp_items(items: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """Map cart items to the ACP `{id, quantity}` shape. `id` prefers sku, then
+    variant, then product id — matching how the platform-order ACP path picks it."""
+    out: List[Dict[str, Any]] = []
+    for item in items or []:
+        item_id = (
+            str(item.get("sku") or "").strip()
+            or str(item.get("variant_id") or "").strip()
+            or str(item.get("product_id") or "").strip()
+            or "unknown"
+        )
+        qty = item.get("quantity")
+        try:
+            qty = int(qty) if qty is not None else 1
+        except (TypeError, ValueError):
+            qty = 1
+        out.append({"id": item_id, "quantity": max(1, qty)})
+    return out
+
+
+async def create_checkout_session(
+    *,
+    merchant_id: str,
+    platform: str,
+    items: List[Dict[str, Any]],
+    fulfillment_address: Optional[Dict[str, Any]] = None,
+    buyer: Optional[Dict[str, Any]] = None,
+    metadata: Optional[Dict[str, Any]] = None,
+    timeout: float = 30.0,
+) -> AcpSession:
+    """Create a pivota-acp checkout session. Threads pvt_* attribution into the
+    session metadata. Raises AcpClientError on connection/HTTP/parse failure.
+    Does NOT complete or charge."""
+    base = _acp_base_url()
+    if not base:
+        raise AcpClientError("platform_orders_acp_url_not_configured", code="acp_url_missing")
+    acp_items = _acp_items(items)
+    if not acp_items:
+        raise AcpClientError("items_required", status_code=400, code="acp_items_required")
+
+    acp_metadata: Dict[str, Any] = {
+        "merchant_id": merchant_id,
+        "platform": platform,
+    }
+    # Attribution parity: carry the click id/surface into the session so the
+    # order-completed webhook can deposit the edge (P-T2.0).
+    src = dict(metadata or {})
+    if has_attribution_signal(src):
+        attribution = materialize_attribution_context(
+            src, default_surface=str(src.get(PVT_SURFACE) or "acp"), merchant_id=merchant_id
+        )
+        for key in _ACP_ATTRIBUTION_KEYS:
+            value = attribution.get(key)
+            if value:
+                acp_metadata[key] = str(value)
+    # Pass through any caller metadata that isn't a reserved key (non-destructive).
+    for k, v in src.items():
+        acp_metadata.setdefault(k, v)
+
+    body: Dict[str, Any] = {"items": acp_items, "metadata": acp_metadata}
+    if fulfillment_address:
+        body["fulfillment_address"] = fulfillment_address
+    if buyer:
+        body["buyer"] = buyer
+
+    headers = {
+        "Authorization": f"Bearer {_resolve_bearer_token()}",
+        "API-Version": PIVOTA_ACP_API_VERSION,
+        "X-Merchant-Id": str(merchant_id),
+        "X-Platform": str(platform or "shopify"),
+        "Content-Type": "application/json",
+    }
+
+    try:
+        async with httpx.AsyncClient(timeout=timeout) as client:
+            resp = await client.post(f"{base}/checkout_sessions", headers=headers, json=body)
+    except httpx.RequestError as exc:
+        raise AcpClientError(f"acp_connection_error: {exc}", code="acp_connection_error") from exc
+
+    if resp.status_code not in (200, 201):
+        raise AcpClientError(
+            f"acp_http_{resp.status_code}: {resp.text[:200]}",
+            status_code=resp.status_code,
+            code="acp_http_error",
+        )
+
+    try:
+        payload = resp.json()
+    except Exception as exc:  # noqa: BLE001
+        raise AcpClientError("acp_invalid_json", status_code=resp.status_code, code="acp_bad_json") from exc
+
+    session_id = str((payload or {}).get("id") or "").strip()
+    if not session_id:
+        raise AcpClientError("acp_missing_session_id", status_code=resp.status_code, code="acp_no_session")
+
+    totals = payload.get("totals") if isinstance(payload.get("totals"), list) else []
+    total_obj = next((t for t in totals if isinstance(t, dict) and t.get("type") == "total"), None)
+    total_cents = None
+    if isinstance(total_obj, dict) and total_obj.get("amount") is not None:
+        try:
+            total_cents = int(total_obj["amount"])
+        except (TypeError, ValueError):
+            total_cents = None
+
+    return AcpSession(
+        session_id=session_id,
+        checkout_url=f"{base}/checkout/{session_id}",
+        status=str(payload.get("status") or "") or None,
+        currency=str(payload.get("currency") or "") or None,
+        total_cents=total_cents,
+        totals=totals,
+        raw=payload if isinstance(payload, dict) else {},
+    )
