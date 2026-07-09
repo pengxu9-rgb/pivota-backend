@@ -918,6 +918,36 @@ async def create_payment(
             ),
         )
 
+        # P-T2.0 attribution parity: deposit a commerce_attribution_edge for this
+        # protocol/checkout charge, exactly like the redirect + ops-canary paths do
+        # (routes/payment_execution_routes.py, routes/order_routes.py). This is the
+        # real charge path the Shopping Gateway's submit_payment op proxies to
+        # (routes/agent_shop_gateway._handle_submit_payment -> /agent/v1/payments),
+        # so wiring the kernel here makes every Tier-2 payment measurable. The
+        # order's metadata is the durable carrier of pvt_click_id (stamped at
+        # create_order); upsert_order_attribution_edge is idempotent on order_id
+        # (a no-op refresh if create_order already deposited) and self-gates on
+        # has_attribution_signal (a warning-logged skip when no signal is present,
+        # which Stage-1 uses to size the direct-checkout gap). Best-effort: never
+        # break the payment on an attribution write.
+        try:
+            from services.commerce_attribution_service import (
+                upsert_order_attribution_edge,
+            )
+
+            await upsert_order_attribution_edge(
+                order_id=str(request.order_id),
+                merchant_id=str(merchant_id),
+                metadata=order_metadata,
+            )
+        except Exception as attribution_exc:  # noqa: BLE001 — attribution is best-effort
+            logger.warning(
+                "[AgentPayments] Failed to persist commerce attribution edge for "
+                "order %s: %s",
+                request.order_id,
+                attribution_exc,
+            )
+
         # PCS v0.2-b (best-effort): internal payment fact for reducer replay (no PII).
         try:
             from services.pcs_fact_ingest import append_internal_fact_best_effort
