@@ -1028,6 +1028,57 @@ async def ensure_required_schema_light() -> None:
                     "ON shopify_gdpr_requests (merchant_id);"
                 )
             )
+            # ADR-011 intake identity contract: provenance for every
+            # resolve-or-attach outcome at every intake door (services/
+            # intake_identity.py). Railway deploys skip db/migrations/, so
+            # self-heal here (mirrors db/migrations/177_intake_identity_events.sql).
+            await database.execute(
+                text(
+                    """
+                    CREATE TABLE IF NOT EXISTS intake_identity_events (
+                      id                BIGSERIAL PRIMARY KEY,
+                      door              TEXT NOT NULL,
+                      action            TEXT NOT NULL,
+                      matcher           TEXT NULL,
+                      merchant_id       TEXT NULL,
+                      product_key       TEXT NULL,
+                      content_key       TEXT NULL,
+                      product_group_id  TEXT NULL,
+                      evidence          JSONB NULL,
+                      created_at        TIMESTAMPTZ NOT NULL DEFAULT NOW()
+                    );
+                    """
+                )
+            )
+            await database.execute(
+                text(
+                    "CREATE INDEX IF NOT EXISTS idx_intake_identity_events_content_key "
+                    "ON intake_identity_events (content_key) WHERE content_key IS NOT NULL;"
+                )
+            )
+            await database.execute(
+                text(
+                    "CREATE INDEX IF NOT EXISTS idx_intake_identity_events_door_action "
+                    "ON intake_identity_events (door, action, created_at);"
+                )
+            )
+            # ADR-011 (mig 178): GTIN as a match-attribute on catalog_products
+            # (NOT folded into content_key). The resolve-or-attach primitive's
+            # Tier-0 GTIN matcher keys on it; every intake door persists the
+            # source barcode here. Additive + nullable — behavior byte-identical
+            # until populated. Railway skips db/migrations/, so self-heal here.
+            await database.execute(
+                text(
+                    "ALTER TABLE IF EXISTS catalog_products "
+                    "ADD COLUMN IF NOT EXISTS gtin TEXT;"
+                )
+            )
+            await database.execute(
+                text(
+                    "CREATE INDEX IF NOT EXISTS idx_catalog_products_gtin "
+                    "ON catalog_products (gtin) WHERE gtin IS NOT NULL;"
+                )
+            )
             # ---------------------------------------------------------------
             # schema-guard-coverage backfill (migrations 103-165).
             # Railway fast-mode skips db/migrations/, so every ADD COLUMN from

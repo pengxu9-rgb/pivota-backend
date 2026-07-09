@@ -106,8 +106,52 @@ async def apply_ingest_plan(
         except Exception as exc:  # noqa: BLE001
             logger.exception("insert merchant failed for merchant_id=%s — %s", merchant.get("merchant_id"), exc)
 
+    from services.intake_identity import (
+        ACTION_SKIP,
+        DOOR_CATALOG_ENRICHMENT,
+        canonical_gtin,
+        intake_identity_enabled,
+        resolve_or_attach_content_identity,
+    )
+
+    identity_gate_on = intake_identity_enabled(DOOR_CATALOG_ENRICHMENT)
+    counts["pdps_skipped_identity"] = 0
+    skipped_product_keys: set = set()
+
     # 2. catalog_products — UPSERT by product_key.
     for pdp in pdps:
+        # ADR-011: canonicalize any source barcode into the gtin match-attribute
+        # column (never folded into content_key). Plan rows may omit it, so set
+        # the key unconditionally to keep the named INSERT param bound.
+        pdp["gtin"] = canonical_gtin(pdp.get("gtin") or pdp.get("barcode"))
+        if identity_gate_on:
+            # ADR-011 resolve-or-attach (flag-gated). This door was previously
+            # UNGUARDED — R1 makes the primitive its required pre-insert step,
+            # which also extends the ADR-008/P1.4 brand guard to this door
+            # (observed retailer data → a brand conflict SKIPs the mint).
+            ident = await resolve_or_attach_content_identity(
+                brand=pdp.get("brand"),
+                title=pdp.get("title"),
+                gtin=pdp.get("gtin"),
+                canonical_url=pdp.get("canonical_url"),
+                source_product_id=pdp.get("source_product_id"),
+                door=DOOR_CATALOG_ENRICHMENT,
+                merchant_ctx={
+                    "merchant_id": pdp.get("merchant_id"),
+                    "platform": pdp.get("platform"),
+                    "source_domain": pdp.get("source_domain"),
+                    "product_key": pdp.get("product_key"),
+                },
+            )
+            if ident.get("action") == ACTION_SKIP:
+                counts["pdps_skipped_identity"] += 1
+                skipped_product_keys.add(pdp.get("product_key"))
+                logger.info(
+                    "apply_ingest_plan: identity gate skipped product_key=%s "
+                    "(brand conflict — review enqueued)", pdp.get("product_key"),
+                )
+                continue
+            pdp["content_key"] = ident.get("content_key") or pdp.get("content_key")
         try:
             await database.execute(
                 """
@@ -121,7 +165,7 @@ async def apply_ingest_plan(
                    price_tier, use_case_tags, lifestyle_tags, demographic,
                    pdp_lifecycle_stage,
                    pdp_scope, pdp_scope_source, pdp_scope_set_at,
-                   content_key)
+                   content_key, gtin)
                 VALUES
                   (:product_key, :merchant_id, :platform, :source_product_id,
                    :pivota_signature_id, :pivota_canonical_url, :pivota_signature_minted_at,
@@ -136,7 +180,7 @@ async def apply_ingest_plan(
                    :demographic,
                    :pdp_lifecycle_stage,
                    :pdp_scope, :pdp_scope_source, NOW(),
-                   :content_key)
+                   :content_key, :gtin)
                 ON CONFLICT (product_key) DO UPDATE SET
                   pivota_signature_id = COALESCE(catalog_products.pivota_signature_id, EXCLUDED.pivota_signature_id),
                   pivota_canonical_url = COALESCE(catalog_products.pivota_canonical_url, EXCLUDED.pivota_canonical_url),
@@ -158,6 +202,7 @@ async def apply_ingest_plan(
                   pdp_scope_source = EXCLUDED.pdp_scope_source,
                   pdp_scope_set_at = NOW(),
                   content_key = COALESCE(EXCLUDED.content_key, catalog_products.content_key),
+                  gtin = COALESCE(EXCLUDED.gtin, catalog_products.gtin),
                   updated_at = NOW()
                 """,
                 pdp,
@@ -185,6 +230,15 @@ async def apply_ingest_plan(
         except Exception as exc:  # noqa: BLE001
             logger.warning("singleton pg mint failed for product_key=%s — %s",
                            pdp.get("product_key"), str(exc)[:200])
+
+    if skipped_product_keys:
+        # A PDP the identity gate skipped must not leave orphan child rows.
+        skus = [s for s in skus if s.get("product_key") not in skipped_product_keys]
+        offers = [o for o in offers if o.get("product_key") not in skipped_product_keys]
+        seeds = [
+            s for s in seeds
+            if s.get("attached_product_key") not in skipped_product_keys
+        ]
 
     async with database.transaction():
         # 3. catalog_skus — INSERT one synthetic 'canonical' SKU per PDP.

@@ -26,6 +26,7 @@ from sqlalchemy import func
 from sqlalchemy.dialects.postgresql import insert as _pg_insert
 
 from services.catalog_identity import make_content_key
+from services.intake_identity import canonical_gtin
 
 logger = logging.getLogger(__name__)
 
@@ -102,15 +103,29 @@ def _audit_image_url(attrs: Dict[str, Any]) -> Optional[str]:
     return None
 
 
+def _audit_gtin(audit_product: Dict[str, Any]) -> Optional[str]:
+    """R3 (ADR-011): read a source barcode/GTIN from the fetched PDP's
+    structured-data attributes, so it can plumb through as the identity
+    match-attribute instead of being dropped. Best-effort."""
+    attrs = audit_product.get("attributes_raw")
+    if not isinstance(attrs, dict):
+        return None
+    for key in ("gtin", "gtin13", "gtin14", "barcode", "upc", "ean"):
+        value = str(attrs.get(key) or "").strip()
+        if value:
+            return value
+    return None
+
+
 def audit_product_to_index_fields(
     merchant_id: str, audit_product: Dict[str, Any]
 ) -> Optional[Dict[str, Any]]:
     """Map a fetched audit-product dict -> canonical catalog_products fields.
 
     Returns None when there's not enough to mint an identity (no title, or no
-    resolvable URL identity). content_key is brand+title here (GTIN enrichment
-    is a follow-up); the deliberately non-unique key is de-conflated downstream
-    by the identity gate, exactly as for other seed sources."""
+    resolvable URL identity). content_key is the GTIN-less brand+title FAMILY
+    key (ADR-011 SPU model); any source barcode rides the separate `gtin`
+    match-attribute column, de-conflated downstream by the identity gate."""
     if not merchant_id or not isinstance(audit_product, dict):
         return None
     title = (audit_product.get("title") or "").strip()
@@ -151,6 +166,10 @@ def audit_product_to_index_fields(
         "title": title,
         "brand": brand,
         "content_key": make_content_key(brand, title),
+        # ADR-011: GTIN as a match-attribute (canonicalized), never folded into
+        # content_key. Populated even when the identity flag is off so the
+        # match corpus builds ahead of rollout.
+        "gtin": canonical_gtin(_audit_gtin(audit_product)),
         "canonical_url": pdp_url,
         "source_domain": _host(pdp_url) or None,
         "product_type": (audit_product.get("product_type") or "").strip() or None,
@@ -222,7 +241,7 @@ _AUDIT_SEED_READINESS_TIER = "referral_only"
 
 _CATALOG_INSERT_COLUMNS = (
     "product_key", "merchant_id", "platform", "source_product_id",
-    "title", "brand", "content_key", "canonical_url", "source_domain",
+    "title", "brand", "content_key", "gtin", "canonical_url", "source_domain",
     "product_type", "description", "image_url",
     "pivota_signature_id", "pivota_canonical_url", "pivota_signature_minted_at",
 )
@@ -527,40 +546,92 @@ async def upsert_audited_sku_to_index(
     fields = audit_product_to_index_fields(merchant_id, audit_product)
     if not fields:
         return None
-    # Entity-resolution gate (flag-gated): an EXACT match re-aligns the seed's
-    # content_key to the existing canonical entity (dedup); a FUZZY match goes to
-    # human review. Best-effort — content_key falls back to the original.
-    gate_action = "none"
-    try:
-        gate = await apply_audit_er_gate(fields)
-        fields["content_key"] = gate.get("content_key") or fields.get("content_key")
-        gate_action = gate.get("action") or "none"
-    except Exception as exc:  # noqa: BLE001 — the gate must never break the seed
-        logger.warning(
-            "upsert_audited_sku_to_index: ER gate failed for %s: %s",
-            fields.get("product_key"), str(exc)[:200],
+    from services.intake_identity import (
+        ACTION_SKIP,
+        DOOR_URL_AUDIT,
+        intake_identity_enabled,
+        resolve_or_attach_content_identity,
+    )
+
+    if intake_identity_enabled(DOOR_URL_AUDIT):
+        # ADR-011 resolve-or-attach (flag-gated; replaces the legacy ER gate +
+        # standalone brand guard below when ON — the primitive composes both).
+        ident = await resolve_or_attach_content_identity(
+            brand=fields.get("brand"),
+            title=fields.get("title"),
+            gtin=fields.get("gtin"),
+            canonical_url=fields.get("canonical_url"),
+            source_product_id=fields.get("source_product_id"),
+            door=DOOR_URL_AUDIT,
+            merchant_ctx={
+                "merchant_id": merchant_id,
+                "platform": PLATFORM_URL_AUDIT,
+                "source_domain": fields.get("source_domain"),
+                "product_key": fields.get("product_key"),
+            },
         )
-    # Brand-fragmentation guard (ADR-008): only when the ER gate found no exact
-    # SKU dedup — a real same-SKU 'align' is the correct outcome and proceeds. If
-    # the brand is already canonical under another merchant, SKIP the orphan mint
-    # (review was enqueued). Best-effort: on any failure the seed proceeds.
-    if gate_action != "align":
+        if ident.get("action") == ACTION_SKIP:
+            logger.info(
+                "audit_intake.identity_skip pk=%s brand=%r host=%r",
+                fields.get("product_key"), fields.get("brand"),
+                fields.get("source_domain"),
+            )
+            return None
+        fields["content_key"] = ident.get("content_key") or fields.get("content_key")
+        attach = ident.get("attach") or None
+        if attach and attach.get("same_merchant"):
+            # R4 / ADR-010 D-6 at intake: the audited URL resolved Tier-0 to a
+            # listing THIS merchant already has — re-key the upsert onto that
+            # listing's existing (platform, source_product_id, product_key)
+            # identity instead of minting a URL-fresh sibling row + sig. The
+            # on-conflict branch preserves the existing sig (write-once), so
+            # a re-audit at a new URL updates the one listing, never mints a
+            # second public PDP for it.
+            from services.catalog_sync_service import make_catalog_product_key
+
+            fields["source_product_id"] = attach["source_product_id"]
+            fields["platform"] = attach.get("platform") or fields.get("platform")
+            fields["product_key"] = attach.get("product_key") or make_catalog_product_key(
+                merchant_id, fields["platform"], fields["source_product_id"]
+            )
+            if attach.get("pivota_signature_id"):
+                fields["pivota_signature_id"] = attach["pivota_signature_id"]
+                fields["pivota_canonical_url"] = attach.get("pivota_canonical_url")
+    else:
+        # Entity-resolution gate (flag-gated): an EXACT match re-aligns the seed's
+        # content_key to the existing canonical entity (dedup); a FUZZY match goes to
+        # human review. Best-effort — content_key falls back to the original.
+        gate_action = "none"
         try:
-            guard = await apply_audit_brand_fragmentation_guard(merchant_id, fields)
-            if guard.get("action") == "skip":
-                logger.info(
-                    "audit_intake.brand_guard_skip pk=%s brand=%r host=%r "
-                    "conflict_pk=%s conflict_merchant=%s",
-                    fields.get("product_key"), fields.get("brand"),
-                    fields.get("source_domain"), guard.get("conflict_product_key"),
-                    guard.get("conflict_merchant_id"),
-                )
-                return None
-        except Exception as exc:  # noqa: BLE001 — guard must never break the seed
+            gate = await apply_audit_er_gate(fields)
+            fields["content_key"] = gate.get("content_key") or fields.get("content_key")
+            gate_action = gate.get("action") or "none"
+        except Exception as exc:  # noqa: BLE001 — the gate must never break the seed
             logger.warning(
-                "upsert_audited_sku_to_index: brand guard failed for %s: %s",
+                "upsert_audited_sku_to_index: ER gate failed for %s: %s",
                 fields.get("product_key"), str(exc)[:200],
             )
+        # Brand-fragmentation guard (ADR-008): only when the ER gate found no exact
+        # SKU dedup — a real same-SKU 'align' is the correct outcome and proceeds. If
+        # the brand is already canonical under another merchant, SKIP the orphan mint
+        # (review was enqueued). Best-effort: on any failure the seed proceeds.
+        if gate_action != "align":
+            try:
+                guard = await apply_audit_brand_fragmentation_guard(merchant_id, fields)
+                if guard.get("action") == "skip":
+                    logger.info(
+                        "audit_intake.brand_guard_skip pk=%s brand=%r host=%r "
+                        "conflict_pk=%s conflict_merchant=%s",
+                        fields.get("product_key"), fields.get("brand"),
+                        fields.get("source_domain"), guard.get("conflict_product_key"),
+                        guard.get("conflict_merchant_id"),
+                    )
+                    return None
+            except Exception as exc:  # noqa: BLE001 — guard must never break the seed
+                logger.warning(
+                    "upsert_audited_sku_to_index: brand guard failed for %s: %s",
+                    fields.get("product_key"), str(exc)[:200],
+                )
     # W5 P3 (serve chain): the by-signature PDP read INNER-JOINs catalog_merchants
     # (indexable + status='active'). URL-tier merchants have no synced storefront,
     # so no catalog_merchants row exists — without one the seed's canonical PDP
