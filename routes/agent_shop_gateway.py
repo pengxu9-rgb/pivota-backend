@@ -5289,6 +5289,13 @@ async def _attach_connected_product_redirects(
                 # (/product/<slug>). Not fabricated beyond that convention —
                 # non-default-permalink stores carry online_store_url and take
                 # the branch above. No handle → skip (never guess).
+                #
+                # DEPENDENCY (dead today: woo=0 connected, no Woo product sync
+                # exists — adapters/woocommerce_adapter.py is a connection stub):
+                # when a Woo product sync is built it MUST populate
+                # online_store_url for CUSTOM-permalink stores, else this default
+                # /product/<slug> fabricates a 404 for them (a dead link is worse
+                # than no link). Keep in lockstep with that sync.
                 dest = f"https://{normalize_shop_host(merchant_store_domain)}/product/{handle}"
             if not dest.startswith(("http://", "https://")):
                 continue  # no derivable merchant destination — never fabricate one
