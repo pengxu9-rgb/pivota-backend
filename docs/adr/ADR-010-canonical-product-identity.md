@@ -110,3 +110,46 @@ The live decision is **how much of B to commit now**. The fact-check reframed th
 6. [ ] Only after 2–5 and the convergence pivot co-gate: auto-merge above threshold + Phase-2 cross-merchant cards (variant grain), with mis-merge/neutrality monitoring + unmerge SLO. Tier 2/3 remain deferred until the measurement justifies them.
 
 **Open decisions for sign-off:** (D1) B-as-target / D-as-increment framing; (D2) Tier-1 auto-merge later requires a *complete* per-vertical identity signature, or confidence threshold alone [rec: complete signature — spec-completeness is the Dewu lesson]; (D3) unmerge granularity [rec: per-member detach + projection re-derive; money rows unaffected by construction]; (D4) merchant-facing identity contributions — review-only in v1.
+
+## Addendum — the publish-surface identity contract (2026-07-09, indexing-recovery session)
+
+The Google-indexing investigation surfaced an identity layer this ADR's resolver scope does not yet
+cover: **the identity the outside world sees** (sitemap URLs, PDP `rel=canonical`, JSON-LD `@id`,
+agent-facing PDP resolution). Findings are prod-measured (same D-1 run vintage).
+
+**Sig fragmentation is a live publish defect, not just internal debt.** `catalog_products` carries
+`pivota_signature_id` in two hex lengths (24-hex: 1,429 rows; 32-hex: 9,356 rows; **no content_key
+mixes lengths** — an ingestion-path artifact, not per-product ambiguity). **1,218 content_keys carry
+more than one sig**, so the public product sitemap emitted 7,407 URLs for only **6,133 distinct
+products** — ~17% duplicate URLs splitting index signal across pages Google must reconcile.
+Interim fixes shipped in `pivota-agent-ui` while this ADR's resolver work proceeds: #257 (static
+sitemap files — ended GSC "Couldn't fetch"), #260 (stop hard-`noindex` on transient SSR failure,
+which ISR cached for up to 1h), #261 (sitemap dedup: **one URL per content_key**, deterministic
+winner among duplicate sigs — longer sig class, then lexicographic — max-lastmod merge). #261
+landed while product URLs are still unindexed, so the URL consolidation cost zero re-indexing.
+
+**Gap 1 — no single canonical-URL selection policy.** T5 correctly keeps sigs write-once, but
+*which* sig is THE public card is decided independently per surface today: the sitemap generator
+(the #261 rule) and the PDP's self-declared `rel=canonical`
+(`readServerCanonicalRouteId`, `pivota-agent-ui/src/app/products/[id]/page.tsx` — its own
+group-id-vs-sig heuristics). Where they disagree, Google receives sitemap URL X whose page declares
+canonical Y — a standing index-signal leak. The "canonical multi-merchant card" selection this ADR
+already names as a serving-selection policy must be **one deterministic function, exported once and
+consumed by sitemap, PDP `rel=canonical`, and JSON-LD `@id`**.
+
+**Gap 2 — publish-side resolution is a parallel implementation.** The Node shop gateway
+(`PIVOTA-Agent/src/server.js`, `get_pdp_v2`) implements its own tiered sig→product resolution
+(requires a row with `merchant_id` + `source_product_id`; else `400 MISSING_MERCHANT_CONTEXT`),
+independent of this repo's identity code. That respects A.3 (Node consumes, never writes) but the
+resolution *predicate* is duplicated rather than derived from resolver output — divergence here is
+what turned transient backend failures into de-indexed pages during the investigation.
+
+**Additional action items:**
+
+7. [ ] **Canonical-URL policy (D-5):** one deterministic `content_key → public URL` selection,
+   single implementation consumed by the sitemap generator, PDP `rel=canonical`, and JSON-LD `@id`
+   (#261's rule is the interim reference; align `readServerCanonicalRouteId` with it). Non-winning
+   sigs keep resolving (T5) and self-declare the winner as canonical.
+8. [ ] **Sig-minting discipline (D-6):** one minting path + truncation length for *new* sigs
+   (existing sigs stay write-once per T5); the multi-sig backlog (1,218 content_keys) is consumed
+   by the D-2 provenance/alias schema so every historical sig resolves to its canonical card.
