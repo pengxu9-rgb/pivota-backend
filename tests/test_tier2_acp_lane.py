@@ -34,7 +34,7 @@ def _cap(protocols, *, platform="shopify", psp="stripe"):
     }
 
 
-def _patch(monkeypatch, capability, *, strict=True, submit=False, merchants=frozenset()):
+def _patch(monkeypatch, capability, *, strict=True, submit=False, merchants=frozenset(), test_capture=False):
     async def fake_capability(mid):
         return capability
 
@@ -46,6 +46,46 @@ def _patch(monkeypatch, capability, *, strict=True, submit=False, merchants=froz
     monkeypatch.setattr(settings, "agent_checkout_strict", strict, raising=False)
     monkeypatch.setattr(settings, "agent_submit_payment_enabled", submit, raising=False)
     monkeypatch.setattr(settings, "agent_submit_payment_merchants", frozenset(merchants), raising=False)
+    monkeypatch.setattr(settings, "agent_acp_test_capture", test_capture, raising=False)
+
+
+@pytest.mark.asyncio
+async def test_test_capture_canary_is_acp_capable_without_live_psp(monkeypatch):
+    # merch on a TEST PSP → protocols=[] (not live-charge-ready), but the armed
+    # test-capture canary (allowlisted + AGENT_ACP_TEST_CAPTURE) routes to ACP.
+    _patch(monkeypatch, _cap([], platform="shopify", psp=None),
+           strict=True, submit=True, merchants={"merch_x"}, test_capture=True)
+    d = await resolve_acp_lane_decision("merch_x")
+    assert d.lane == LANE_ACP_IN_CHAT
+    assert d.reason == REASON_ACP_ENABLED
+
+
+@pytest.mark.asyncio
+async def test_test_capture_canary_off_still_redirects(monkeypatch):
+    # Same test-PSP merchant, but the canary flag is off → redirect (default).
+    _patch(monkeypatch, _cap([], platform="shopify", psp=None),
+           strict=True, submit=True, merchants={"merch_x"}, test_capture=False)
+    d = await resolve_acp_lane_decision("merch_x")
+    assert d.lane == LANE_REDIRECT_FLOOR
+    assert d.reason == REASON_NOT_ACP_CAPABLE
+
+
+@pytest.mark.asyncio
+async def test_test_capture_canary_scoped_to_allowlisted_merchant(monkeypatch):
+    # Canary on, but this merchant is NOT on the allowlist → redirect.
+    _patch(monkeypatch, _cap([], platform="shopify", psp=None),
+           strict=True, submit=True, merchants={"other"}, test_capture=True)
+    d = await resolve_acp_lane_decision("merch_x")
+    assert d.lane == LANE_REDIRECT_FLOOR
+
+
+@pytest.mark.asyncio
+async def test_test_capture_canary_shopify_only(monkeypatch):
+    # Canary applies only to ACP-capable platforms (shopify); wix → redirect.
+    _patch(monkeypatch, _cap([], platform="wix", psp=None),
+           strict=True, submit=True, merchants={"merch_x"}, test_capture=True)
+    d = await resolve_acp_lane_decision("merch_x")
+    assert d.lane == LANE_REDIRECT_FLOOR
 
 
 @pytest.mark.asyncio

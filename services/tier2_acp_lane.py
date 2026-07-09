@@ -29,9 +29,27 @@ import logging
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional
 
+from config.settings import settings
 from services.agent_checkout_kill_switch import evaluate_tier2_charge
 from services.merchant_capability_resolver import resolve_merchant_capability
 from services.platform_capabilities import PROTOCOL_ACP
+
+# Platforms whose merchants can be driven by the ACP test-capture canary even
+# without a live PSP (the pivota-acp real-capture connector is Shopify-only).
+_ACP_TEST_CAPABLE_PLATFORMS = frozenset({"shopify"})
+
+
+def _is_acp_test_canary(merchant_id: str, platform: Optional[str]) -> bool:
+    """P-T2.3.4: the ACP test-capture canary (AGENT_ACP_TEST_CAPTURE on + this
+    merchant on SUBMIT_PAYMENT_MERCHANTS) is chargeable via the off-session TEST
+    lane even without a live-charge-ready PSP, so route it to ACP. Scoped +
+    default-off: production ACP still requires a live PSP (protocols has acp)."""
+    return (
+        settings.agent_acp_test_capture
+        and bool(merchant_id)
+        and merchant_id in settings.agent_submit_payment_merchants
+        and str(platform or "").strip().lower() in _ACP_TEST_CAPABLE_PLATFORMS
+    )
 
 logger = logging.getLogger("tier2_acp_lane")
 
@@ -99,7 +117,12 @@ async def resolve_acp_lane_decision(merchant_id: str) -> AcpLaneDecision:
         return _redirect(REASON_NOT_ACP_CAPABLE)
 
     protocols: List[str] = list(capability.get("protocols") or [])
-    if PROTOCOL_ACP not in protocols:
+    # ACP-capable if the resolver says so (live PSP), OR this is the armed
+    # test-capture canary (chargeable via the off-session test lane).
+    acp_capable = PROTOCOL_ACP in protocols or _is_acp_test_canary(
+        mid, capability.get("platform")
+    )
+    if not acp_capable:
         # Not ACP-capable (wrong platform, no live PSP, etc.) → redirect floor.
         return _redirect(REASON_NOT_ACP_CAPABLE, capability=capability)
 
