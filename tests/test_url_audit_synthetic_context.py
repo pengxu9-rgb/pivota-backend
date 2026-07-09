@@ -124,3 +124,33 @@ def test_synthetic_enrichment_empty_when_no_attrs():
         {"sku_key": "urlwedge:f", "product_key": "urlwedge:f", "title": "X",
          "pdp_url": "https://x.com/p"}, MID)
     assert "product_enrichment" not in ctx  # nothing to enrich -> omitted
+
+
+def test_synthetic_url_audit_invokes_the_attribute_extractor(monkeypatch):
+    """Regression: url_audit synthetic SKUs MUST run the LLM attribute extractor.
+
+    They return from load_sku_context at the _SYNTHETIC_SKU_CONTEXTS branch, before
+    the catalog fall-through where _maybe_stash_llm_attributes runs — so historically
+    the extractor NEVER fired on url_audits (only on connected catalog SKUs), and the
+    Mojawa store-less pilot got zero attribute-axis enrichment. The sentinel also
+    guards against re-paying the LLM on a cache-reset re-read."""
+    svc = _fresh()
+    calls = []
+
+    async def _spy(ctx):
+        calls.append(ctx)
+
+    monkeypatch.setattr(svc, "_maybe_stash_llm_attributes", _spy)
+    svc.register_synthetic_sku_contexts([ITEM], MID)
+
+    async def _check():
+        ctx1 = await svc.load_sku_context("urlwedge:abc123", MID)
+        assert len(calls) == 1, "extractor must run on the synthetic url-audit ctx"
+        assert ctx1.get("_llm_attr_extractor_attempted") is True
+        # cache-reset re-read (the per_sku assembly loop) must NOT re-invoke — url_audit
+        # SKUs aren't durably cached, so an unguarded call would re-pay the LLM.
+        svc.reset_sku_context_cache()
+        await svc.load_sku_context("urlwedge:abc123", MID)
+        assert len(calls) == 1, "extractor must run at most once per synthetic ctx"
+
+    asyncio.run(_check())

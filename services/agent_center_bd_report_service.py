@@ -4583,6 +4583,19 @@ async def load_sku_context(sku_key: str, merchant_id: str) -> Dict[str, Any]:
     # sees the same context the probe fan-out used.
     if cache_key in _SYNTHETIC_SKU_CONTEXTS:
         ctx = _SYNTHETIC_SKU_CONTEXTS[cache_key]
+        # URL-audit synthetic SKUs return HERE, before the catalog fall-through
+        # where the LLM attribute extractor runs (_maybe_stash_llm_attributes,
+        # below). Historically that meant the extractor NEVER fired on url_audits —
+        # only on connected catalog SKUs — so url_audit electronics/generic SKUs
+        # silently got no grounded attribute-axis enrichment. Run it here too, using
+        # the same flag/allowlist/should_run gating. Guarded by a sentinel so it runs
+        # at most once per synthetic ctx: the ctx persists in _SYNTHETIC_SKU_CONTEXTS
+        # across reset_sku_context_cache, and url_audit SKUs (no catalog row) aren't
+        # covered by the extractor's durable cache, so an unguarded call would re-pay
+        # the LLM on every cache-reset re-read.
+        if not ctx.get("_llm_attr_extractor_attempted"):
+            ctx["_llm_attr_extractor_attempted"] = True
+            await _maybe_stash_llm_attributes(ctx)
         _SKU_CONTEXT_CACHE[cache_key] = ctx
         return ctx
     if not cache_key[0] or not cache_key[1]:
