@@ -137,7 +137,6 @@ from routes.employee_dashboard_routes import router as employee_dashboard_router
 from routes.employees_security import router as employees_security_router
 from routes.mcp_mgmt import router as mcp_mgmt_router
 from routes.employee_missing_endpoints import router as employee_missing_router
-from routes.agent_sdk_ready import router as agent_sdk_router
 from routes.agent_sdk_fixed import router as agent_sdk_fixed_router
 from routes.employee_store_psp_fixes import router as emp_store_psp_router
 from routes.fix_agents_table import router as fix_agents_router
@@ -1006,7 +1005,6 @@ app.include_router(questions_router)  # Buyer Questions (UGC)
 app.include_router(reviews_invitation_issuer_router)  # Internal: mint invitation_token from paid orders
 app.include_router(reviews_invitation_shortlink_router)  # Public: short links -> buyer review submission
 app.include_router(employee_missing_router)  # Missing employee endpoints
-# app.include_router(agent_sdk_router)  # Replaced with fixed version
 app.include_router(agent_sdk_fixed_router)  # Fixed SDK-ready agent endpoints
 app.include_router(emp_store_psp_router)  # Employee store/PSP connection fixes
 app.include_router(fix_agents_router)  # Fix agents table schema
