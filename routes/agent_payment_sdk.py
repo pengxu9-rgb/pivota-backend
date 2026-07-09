@@ -735,6 +735,37 @@ async def create_payment(
         amount = Decimal(str(order_total))
         currency = currency_code
         order_metadata = order.get("metadata") if isinstance(order.get("metadata"), dict) else {}
+
+        # P-T2.2 kill-switch: fail-closed gate on the Tier-2 (in-chat protocol)
+        # charge lane. Scoped to protocol-tier orders (protocol_name in
+        # {acp,ucp,ap2}); the live redirect floor + REST/hosted flows
+        # (protocol_name="rest"/unset) evaluate as guarded=False and pass through
+        # untouched. Strict is ON by default and cannot be silently absent, so a
+        # protocol charge is blocked until SUBMIT_PAYMENT is explicitly enabled
+        # for a canary (P-T2.3). Placed before any PSP call so nothing charges.
+        from services.agent_checkout_kill_switch import evaluate_tier2_charge
+
+        kill_switch = evaluate_tier2_charge(order_metadata.get("protocol_name"))
+        if not kill_switch.allowed:
+            logger.warning(
+                "[AgentPayments] Tier-2 protocol charge blocked by kill-switch "
+                "order=%s protocol=%s reason=%s (strict=%s submit_payment=%s)",
+                request.order_id,
+                kill_switch.protocol,
+                kill_switch.reason,
+                kill_switch.strict,
+                kill_switch.submit_payment_enabled,
+            )
+            raise HTTPException(status_code=403, detail=kill_switch.as_error_detail())
+        if kill_switch.guarded:
+            logger.info(
+                "[AgentPayments] Tier-2 protocol charge permitted order=%s "
+                "protocol=%s reason=%s",
+                request.order_id,
+                kill_switch.protocol,
+                kill_switch.reason,
+            )
+
         payment_flow = order_metadata.get("payment_flow") if isinstance(order_metadata.get("payment_flow"), dict) else {}
         auth_first_psp = str((payment_flow or {}).get("psp") or "").strip().lower()
         auth_first_manual_capture = (

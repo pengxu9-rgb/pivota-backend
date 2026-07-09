@@ -340,6 +340,29 @@ class Settings(BaseSettings):
         "PLATFORM_ORDERS_ACP_WEBHOOK_SECRET"
     )
 
+    # --- P-T2.2: Tier-2 in-chat protocol checkout kill-switch --------------
+    # Two fail-closed gates on the real charge path for the agentic-commerce
+    # protocol lane (ACP/UCP/AP2). They ONLY affect protocol-tier charges; the
+    # live redirect floor + existing REST/hosted flows (protocol_name="rest")
+    # are never touched. See services/agent_checkout_kill_switch.py.
+    #
+    # agent_checkout_strict: the protective guard. ON by default and stays on
+    #   unless explicitly disabled — an absent/blank env is treated as ON
+    #   (fail-closed). When ON, a protocol-tier charge is allowed only if
+    #   submit_payment is also enabled. When explicitly OFF (dev only), the
+    #   guard is bypassed.
+    # agent_submit_payment_enabled: the ceiling. OFF by default — a protocol
+    #   charge cannot execute until this is explicitly turned on (P-T2.3
+    #   canary), and only while strict is ON.
+    agent_checkout_strict: bool = (
+        os.getenv("AGENT_CHECKOUT_STRICT", "true").strip().lower()
+        not in {"false", "0", "off", "no"}
+    )
+    agent_submit_payment_enabled: bool = (
+        os.getenv("SUBMIT_PAYMENT", "false").strip().lower()
+        in {"true", "1", "on", "yes"}
+    )
+
     # Readiness audit / thin-slice flags
     feature_readiness_audit: bool = os.getenv("FEATURE_READINESS_AUDIT", "false").lower() == "true"
     feature_readiness_ucp_thin_slice: bool = os.getenv("FEATURE_READINESS_UCP_THIN_SLICE", "false").lower() == "true"
