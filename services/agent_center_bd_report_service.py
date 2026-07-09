@@ -4596,6 +4596,17 @@ async def load_sku_context(sku_key: str, merchant_id: str) -> Dict[str, Any]:
         if not ctx.get("_llm_attr_extractor_attempted"):
             ctx["_llm_attr_extractor_attempted"] = True
             await _maybe_stash_llm_attributes(ctx)
+            # Observability: url_audit SKUs leave no durable extractor trace
+            # (no catalog row, stash is in-memory), so log the grounded count +
+            # source size to make the extractor's contribution to url-audits
+            # verifiable instead of silent.
+            logger.info(
+                "url_audit extractor: merchant=%s sku=%s stashed_grounded=%d source_chars=%d",
+                ctx.get("merchant_id"),
+                cache_key[0],
+                len(ctx.get(_LLM_ATTR_STASH_KEY) or []),
+                len(build_source_text(_get_product(ctx) or {})),
+            )
         _SKU_CONTEXT_CACHE[cache_key] = ctx
         return ctx
     if not cache_key[0] or not cache_key[1]:
