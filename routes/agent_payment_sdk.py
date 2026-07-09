@@ -1055,6 +1055,42 @@ async def create_payment(
                 attribution_exc,
             )
 
+        # P-T2.3.3b: the off-session capture succeeded SYNCHRONOUSLY, so no PSP
+        # webhook will arrive to finalize the order. Transition it to PAID via the
+        # same shared finalizer the webhook path uses (services.psp_payment_finalizer)
+        # — it flips the order to paid atomically, stamps gross attributed GMV on
+        # the attribution edge deposited just above, and logs the conversion event,
+        # all idempotently (terminal-state guarded). Scoped to the off-session lane:
+        # the normal client-confirm flow returns "processing"/"requires_action" and
+        # is correctly finalized later by its own webhook, so it is untouched.
+        if _acp_offsession and status == "succeeded":
+            try:
+                from services.psp_payment_finalizer import finalize_payment_success
+                from db.orders import mark_order_paid
+                from routes.order_routes import log_order_event
+
+                await finalize_payment_success(
+                    order,
+                    psp="stripe",
+                    payment_reference=payment_intent.id,
+                    transaction_id=payment_intent.id,
+                    amount_minor=None,
+                    currency=str(currency),
+                    source_event="acp_offsession_capture",
+                    metadata_extra={
+                        "acp_test_capture": True,
+                        "protocol_name": order_metadata.get("protocol_name"),
+                    },
+                    update_payment_info_fn=update_payment_info,
+                    mark_order_paid_fn=mark_order_paid,
+                    log_order_event_fn=log_order_event,
+                )
+            except Exception as finalize_exc:  # noqa: BLE001 — capture already succeeded; don't fail the response
+                logger.warning(
+                    "[AgentPayments] ACP off-session paid-transition failed order=%s: %s",
+                    request.order_id, finalize_exc,
+                )
+
         # PCS v0.2-b (best-effort): internal payment fact for reducer replay (no PII).
         try:
             from services.pcs_fact_ingest import append_internal_fact_best_effort
