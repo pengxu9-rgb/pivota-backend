@@ -32,7 +32,7 @@ import json
 import logging
 import math
 import re
-from typing import Any, Dict, Iterable, List, Mapping, Optional, Tuple
+from typing import AbstractSet, Any, Dict, Iterable, List, Mapping, Optional, Tuple
 from urllib.parse import urlparse
 
 from services import agent_center_llm_client as llm_client
@@ -8501,12 +8501,46 @@ def _noisy_prompt_category(value: str, *, profile: VerticalProfile = BEAUTY_PROF
     return False
 
 
+def _term_repeats_category(
+    term: str,
+    category: str,
+    *,
+    profile: VerticalProfile = BEAUTY_PROFILE,
+) -> bool:
+    """True when folding ``term`` into a ``best {category} for {term}`` shape
+    would repeat the category noun ("best headphones for bone conduction
+    headphones", "best headphones for golf headphones").
+
+    BIDIRECTIONAL — the old ``term not in category`` guard only caught
+    term ⊆ category (short use-case inside a longer category); it missed the far
+    more common category ⊆ term ("headphones" inside "bone conduction
+    headphones"). We reject when either nests, or when ``term`` carries the
+    category's own head noun OR any of the vertical's product-type head nouns
+    (electronics: earbuds/speaker/headset — "best headphones for wireless
+    earbuds" is nesting two product types). Beauty head nouns are all product
+    FORMS (oil/serum/cream), so genuine concern use-cases ("dry skin", "frizz")
+    never trip this."""
+    t = _clean_prompt_term(term)
+    c = _clean_prompt_term(category)
+    if not t or not c:
+        return True
+    if t == c or t in c or c in t:
+        return True
+    term_tokens = set(re.findall(r"[a-z0-9]+", t))
+    head_nouns = set(getattr(profile, "category_head_nouns", None) or ())
+    ctoks = re.findall(r"[a-z0-9]+", c)
+    if ctoks:
+        head_nouns.add(ctoks[-1])   # the category's own head noun, vertical-agnostic
+    return bool(head_nouns & term_tokens)
+
+
 def _unbranded_category_specs(
     *,
     category: str,
     graph: Mapping[str, Any],
     topics: List[str],
     bullets: List[str],
+    profile: VerticalProfile = BEAUTY_PROFILE,
 ) -> List[Tuple[str, str]]:
     category = _clean_prompt_term(category)
     if not category or category in _GENERIC_CONTAINER_CATEGORIES:
@@ -8528,7 +8562,7 @@ def _unbranded_category_specs(
     use_cases = [
         cleaned
         for cleaned in (_clean_prompt_term(u) for u in _graph_class_values(graph, "use_case"))
-        if cleaned and cleaned not in category
+        if cleaned and not _term_repeats_category(cleaned, category, profile=profile)
     ]
     audiences = [
         cleaned
@@ -8544,15 +8578,19 @@ def _unbranded_category_specs(
     # proper scenario shapes in the sidewalk generator instead.
     from services.sku_sidewalk import is_scenario_slug
 
+    # "what helps with X" is problem/concern-framed: only emit it for verticals
+    # whose use-cases are genuine concerns (beauty). Electronics use-cases are
+    # activities/product types, so the profile gates it off entirely.
+    problem_framed = bool(getattr(profile, "problem_framed_prompts", True))
     for use_case in use_cases[:3]:
         specs.append((f"best {category} for {use_case}", "category"))
-        if not is_scenario_slug(use_case):
+        if problem_framed and not is_scenario_slug(use_case):
             specs.append((f"what helps with {use_case}", "category"))
     for audience in audiences[:2]:
         specs.append((f"{category} for {audience}", "category"))
     for topic in topics[:3]:
         cleaned = _clean_prompt_term(topic)
-        if cleaned and cleaned not in category:
+        if cleaned and not _term_repeats_category(cleaned, category, profile=profile):
             specs.append((f"best {category} for {cleaned}", "category"))
 
     # constraint shapes — cert / exclusion / ingredient framed ("vegan collagen",
@@ -8654,6 +8692,7 @@ def _build_per_sku_base_query_specs(
             graph=attribute_graph,
             topics=topics,
             bullets=bullets,
+            profile=profile,
         )
     )
     # LLM value-prop discovery prompts (extract_winnable_prompts, stashed on
@@ -8971,6 +9010,7 @@ def _budgeted_wedge_query_records(
     target: int,
     title: str,
     filler_pool: Optional[List[Dict[str, Any]]] = None,
+    priority_queries: Optional[AbstractSet[str]] = None,
 ) -> List[Dict[str, Any]]:
     # Win-the-specific-long-tail allocation (credit-neutral; same `target`):
     #  1. a THIN diagnostic spine — 2 navigational + 2 head + 2 trust — the honest
@@ -9008,8 +9048,26 @@ def _budgeted_wedge_query_records(
         record for record in sidewalk_records
         if str(record.get("query") or "").strip().lower() not in selected_keys
     ]
+    # Leftover-slot priority: the LLM value-prop prompts (extract_winnable_prompts
+    # + scenario-elicited) are SPECIFIC and winnable — they must beat the generic
+    # category-template tail ("best {cat} for {audience}") for the mid-reserve
+    # slots. They sit AFTER the templates in base_records order, so a plain
+    # `remaining_base` fill dropped them at target=14 (the whole point of Gemini
+    # generation was being wasted). Float them to the front of the fill.
+    priority = priority_queries or frozenset()
+    remaining_base_priority = [
+        record for record in remaining_base
+        if str(record.get("query") or "").strip().lower() in priority
+    ]
+    remaining_base_other = [
+        record for record in remaining_base
+        if str(record.get("query") or "").strip().lower() not in priority
+    ]
     return _fill_per_sku_query_records(
-        selected + remaining_base + remaining_sidewalk,
+        selected
+        + remaining_base_priority
+        + remaining_sidewalk
+        + remaining_base_other,
         target=target,
         title=title,
         filler_pool=filler_pool,
@@ -9051,6 +9109,19 @@ def _build_per_sku_audit_query_records(
         )
         else []
     )
+    # LLM value-prop prompts (winnable + scenario-elicited): the SPECIFIC,
+    # content-grounded discovery queries Gemini generated. They must win the
+    # budgeter's leftover slots over the generic category-template tail — see
+    # _budgeted_wedge_query_records. (Also stamped as `source` below for
+    # per-model observability.)
+    llm_prompt_queries = frozenset(
+        str(q or "").strip().lower()
+        for q in (
+            list((sku_ctx or {}).get("_winnable_prompts") or [])
+            + list((sku_ctx or {}).get("_scenario_elicited") or [])
+        )
+        if str(q or "").strip()
+    )
     if not sidewalk_records:
         records = _fill_per_sku_query_records(
             base_records,
@@ -9069,6 +9140,7 @@ def _build_per_sku_audit_query_records(
             target=target,
             title=title,
             filler_pool=filler_pool,
+            priority_queries=llm_prompt_queries,
         )
     # Stamp LLM-generated discovery prompts so per-model prompt quality is
     # comparable across runs (records keep their coarse "category" axis; the
