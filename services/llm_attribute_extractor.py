@@ -357,16 +357,22 @@ async def extract_attributes(
         logger.warning("attribute extractor synthesize failed: %s", exc)
         return []
     raw = result.get("text") if isinstance(result, Mapping) else None
+    finish_reason = result.get("finish_reason") if isinstance(result, Mapping) else None
     parsed = _parse_attributes(raw or "")
     grounded = ground_extracted_attributes(parsed, text)
     if (raw or "").strip() and not grounded:
-        # A non-empty model response that yielded ZERO grounded attributes —
-        # usually a truncated JSON body (raise ATTRIBUTE_EXTRACTOR_MAX_TOKENS) or
-        # the guard discarding everything. Log it so the extractor can never again
-        # be a silent no-op (the bug that hid the 900-token truncation).
-        logger.warning(
+        # A non-empty model response that yielded ZERO grounded attributes. Split
+        # by finish_reason so the extractor can never again be a SILENT no-op (the
+        # bug that hid the 900-token truncation) without spamming at scale:
+        #  - truncated (finish_reason length/MAX_TOKENS) = a real problem, the cap
+        #    is too small -> WARNING;
+        #  - otherwise = an ordinary guard-discard (the model paraphrased the
+        #    spans), expected on thin SKUs -> INFO.
+        truncated = str(finish_reason or "").lower() in {"length", "max_tokens"}
+        (logger.warning if truncated else logger.info)(
             "attribute extractor: 0 grounded attrs from a %d-char response "
-            "(parsed=%d) — possible truncation or guard-discard",
-            len(raw or ""), len(parsed),
+            "(parsed=%d, finish_reason=%s) — %s",
+            len(raw or ""), len(parsed), finish_reason,
+            "TRUNCATED; raise ATTRIBUTE_EXTRACTOR_MAX_TOKENS" if truncated else "guard-discard",
         )
     return grounded

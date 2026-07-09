@@ -2361,7 +2361,7 @@ async def _maybe_stash_llm_attributes(ctx: Dict[str, Any]) -> None:
             synthesize=synthesize,
             provider=provider,
             model=model or "",
-            max_tokens=int(getattr(app_settings, "attribute_extractor_max_tokens", 900) or 900),
+            max_tokens=int(getattr(app_settings, "attribute_extractor_max_tokens", 4000) or 4000),
             source_text=source_text,
         )
         if grounded:
