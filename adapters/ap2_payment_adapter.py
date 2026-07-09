@@ -171,23 +171,37 @@ class AP2PaymentAdapter(BasePSPAdapter):
                 )
                 
             else:
-                # No underlying PSP - simulate response
-                logger.warning(f"[Phase 4++] No underlying PSP for AP2 transaction {ap2_transaction_id}")
-                ap2_response = {
-                    "protocol": self.PROTOCOL,
-                    "version": self.VERSION,
-                    "transaction_id": ap2_transaction_id,
-                    "status": "simulated",
-                    "timestamp": datetime.utcnow().isoformat(),
-                    "order_id": order_id,
-                    "message": "AP2 simulation mode - no underlying PSP"
-                }
-                
-                await self._update_ap2_transaction(ap2_tx_id, 'authorized', ap2_response=ap2_response)
-            
+                # No underlying PSP — FAIL CLOSED. This previously returned a
+                # fabricated status="simulated" response and marked the AP2
+                # transaction 'authorized' (success=True) — a fake authorization
+                # with no real charge. With AP2 now a partner-facing capability
+                # (ENABLE_AP2_ROUTES), never report a successful authorization
+                # without a real PSP; mark the pending row failed and raise so the
+                # caller returns an honest failure (no dangling 'pending' row).
+                logger.error(
+                    f"[AP2] No underlying PSP for AP2 transaction {ap2_transaction_id} "
+                    "— failing closed (simulated authorization disabled)."
+                )
+                await self._update_ap2_transaction(
+                    ap2_tx_id,
+                    'failed',
+                    ap2_response={
+                        "protocol": self.PROTOCOL,
+                        "version": self.VERSION,
+                        "transaction_id": ap2_transaction_id,
+                        "status": "failed",
+                        "order_id": order_id,
+                        "message": "AP2 authorization unavailable: no underlying PSP configured",
+                    },
+                )
+                raise RuntimeError(
+                    f"AP2 authorization unavailable for order {order_id}: "
+                    "no underlying PSP configured (simulated auth disabled)."
+                )
+
             # Return combined response
             return {
-                "success": ap2_response.get('status') in ['authorized', 'simulated'],
+                "success": ap2_response.get('status') in ['authorized'],
                 "ap2_transaction_id": ap2_transaction_id,
                 "psp_payment_id": ap2_response.get('psp_payment_id'),
                 "status": ap2_response.get('status'),
