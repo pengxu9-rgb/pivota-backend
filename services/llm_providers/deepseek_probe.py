@@ -396,9 +396,12 @@ async def _call_deepseek_chat(
         # Conservative temperature — we want consistent structured
         # output, not creative variation.
         "temperature": 0.2,
-        # Hard cap on output tokens. Evidence excerpts are <300 chars;
-        # full response with competitor list is well under 1k tokens.
-        "max_tokens": 800,
+        # Output-token cap. Raised from 800: a rich category / competitor-list
+        # response overflows 800 tokens and truncates the JSON, which then fails
+        # to parse and is SILENTLY dropped from the visibility denominator (see
+        # _run_single_query) — depressing the score with no prior signal. 2000
+        # gives ample headroom; a response that still hits the cap is logged.
+        "max_tokens": 2000,
     }
     # Retained for caller compatibility; Deepseek chat rejects web_search as a
     # non-function tool, so this path must remain ungrounded.
@@ -542,10 +545,24 @@ async def _run_single_query(
         }
     choices = api_response.get("choices") or []
     raw_text = ""
+    finish_reason = None
     if choices and isinstance(choices[0], dict):
         message = choices[0].get("message") or {}
         raw_text = message.get("content") or ""
+        finish_reason = choices[0].get("finish_reason")
     parsed = _parse_deepseek_response(raw_text)
+    if parsed is None and raw_text:
+        # HTTP-200 with a non-empty body that did NOT parse — almost always a
+        # TRUNCATED JSON response (finish_reason == 'length'), not a genuine
+        # visibility miss. This run is excluded from the score denominator below,
+        # so a truncation silently depresses visibility with no prior signal. Log
+        # it so truncation is distinguishable from a real miss (raise the cap if
+        # it recurs).
+        logger.warning(
+            "deepseek_probe HTTP-200 unparsed (likely truncation) scan_mode=%s "
+            "query=%r finish_reason=%s raw_len=%d",
+            scan_mode, query[:80], finish_reason, len(raw_text),
+        )
     grounding_sources = _extract_grounding_sources(api_response)
     grounding_chunks = [s.get("uri", "") for s in grounding_sources if s.get("uri")]
     url_match = _build_url_match(
