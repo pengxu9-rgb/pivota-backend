@@ -6645,9 +6645,11 @@ def _external_seed_redirect_identity(
 ) -> Dict[str, Optional[str]]:
     """Derive the attribution identity for an external-seed redirect.
 
-    ``attached_product_key`` is stored as ``{merchant_id}|{platform}|{platform_product_id}``
-    (see reviews_service / product_quality_service), so an *attached* seed yields the
-    pivota merchant id, the platform, and the canonical product id. A standalone seed
+    ``attached_product_key`` is stored double-colon as
+    ``prod::{merchant_id}::{platform}::{source_product_id}`` (make_catalog_product_key,
+    IDENTITY_REFERENCE §2; the pipe form is a never-persisted transport, Trap T1), so
+    an *attached* seed yields the pivota merchant id, the platform, and the canonical
+    product id. A standalone seed
     (no attached key) yields Nones for those — an honest Tier-2a referral with no merchant
     join. The shop host + variant id gate whether a Shopify cart permalink can be built.
     """
@@ -6659,7 +6661,18 @@ def _external_seed_redirect_identity(
     merchant_id: Optional[str] = None
     platform: Optional[str] = None
     canonical_product_id: Optional[str] = None
-    if attached_key.count("|") >= 2:
+    # attached_product_key STORAGE is the double-colon form
+    # prod::{merchant}::{platform}::{source_product_id} (IDENTITY_REFERENCE §2);
+    # the pipe form is a never-persisted transport (Trap T1). The old parse only
+    # handled pipe, so on every real (double-colon) seed merchant/platform/
+    # product stayed None → surface_click_events.merchant_id NULL. Handle both.
+    if attached_key.startswith("prod::"):
+        parts = attached_key.split("::")
+        if len(parts) >= 4:
+            merchant_id = parts[1].strip() or None
+            platform = parts[2].strip() or None
+            canonical_product_id = attached_key
+    elif attached_key.count("|") >= 2:
         merchant_part, platform_part, _rest = attached_key.split("|", 2)
         merchant_id = merchant_part.strip() or None
         platform = (platform_part.strip() or None)

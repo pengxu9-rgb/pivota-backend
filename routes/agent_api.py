@@ -3686,16 +3686,61 @@ async def _build_external_seed_product(
         _increment_external_seed_metric_reason(metrics_out, "destination_domain_not_allowed")
         return None
 
+    # A-F1.1 (funnel plan): stable click identity + referral carriers. This
+    # ctx previously carried only source/seed ids — the /r click minted a
+    # throwaway id with NULL merchant (record_surface_event) and the dest
+    # lacked utm_content (the WC order-side join key), so clicks from this
+    # surface could NEVER bind to a conversion. Mirrors the gateway's
+    # canonical mint (_make_external_redirect_url + the seed identity
+    # threading of _external_seed_redirect_identity). Referral param appended
+    # AFTER the allowlist pass — same ordering as the gateway.
+    from services.commerce_attribution_service import (
+        PVT_CLICK_ID,
+        PVT_SURFACE,
+        new_click_id,
+        normalize_surface,
+    )
+    from services.outbound_links_service import append_referral_click_param
+    from services.seller_identity import anchor_merchant_from_product_key
+
+    stable_click_id = new_click_id()
+    dest_with_utm = append_referral_click_param(dest_with_utm, stable_click_id)
+
+    # ADR-009 no-fallback: thread the STORED seller-of-record + anchor
+    # merchant only when present — never invent identity at mint time.
+    # attached_product_key is stored double-colon (prod::merchant::platform::id,
+    # IDENTITY_REFERENCE §2) — use the canonical extractor, not an inline pipe
+    # parse (Trap T1): the pipe form is never persisted, so a raw split dropped
+    # the anchor for every real seed, leaving surface_click_events.merchant_id
+    # NULL — the very gap this fix closes.
+    _anchor_merchant_id = anchor_merchant_from_product_key(
+        seed_row.get("attached_product_key")
+    )
+    _seller_ref = str(seed_row.get("seller_ref") or seed_data.get("seller_ref") or "").strip() or None
+    _seed_kind = str(seed_row.get("seed_kind") or seed_data.get("seed_kind") or "").strip() or None
+
+    _redirect_ctx: Dict[str, Any] = {
+        "source": "external_seed",
+        "external_seed_id": seed_id,
+        "external_product_id": external_product_id,
+        PVT_CLICK_ID: stable_click_id,
+        PVT_SURFACE: normalize_surface(tool),
+        "tool": tool,
+        "join_mode": "referral_only",
+    }
+    if _anchor_merchant_id:
+        _redirect_ctx["merchant_id"] = _anchor_merchant_id
+    if _seller_ref:
+        _redirect_ctx["seller_ref"] = _seller_ref
+    if _seed_kind:
+        _redirect_ctx["seed_kind"] = _seed_kind
+
     token = make_redirect_token(
         {
             "market": market,
             "tool": tool,
             "dest": dest_with_utm,
-            "ctx": {
-                "source": "external_seed",
-                "external_seed_id": seed_id,
-                "external_product_id": external_product_id,
-            },
+            "ctx": _redirect_ctx,
         }
     )
     external_redirect_url = f"{_request_base_url(req)}/r?token={token}"
