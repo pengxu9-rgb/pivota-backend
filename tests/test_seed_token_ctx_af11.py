@@ -46,7 +46,11 @@ def _seed_row(**over: Any) -> Dict[str, Any]:
         "price_currency": "USD",
         "availability": "in_stock",
         "seed_data": {"snapshot": {"title": "Test Serum"}},
-        "attached_product_key": "merch_anchor|shopify|prod_1",
+        # Canonical STORAGE form (double-colon), prod::merchant::platform::pid —
+        # this is what the column actually holds (IDENTITY_REFERENCE §2). The
+        # earlier fixture used the never-persisted pipe form and masked the
+        # delimiter bug.
+        "attached_product_key": "prod::merch_anchor::shopify::prod_1",
         "seller_ref": "merch_obs_brand_example",
         "seed_kind": "cross",
     }
@@ -135,6 +139,21 @@ async def test_legacy_seed_threads_no_invented_identity(module_path: str, monkey
 
 @pytest.mark.parametrize("module_path", ["routes.agent_api", "routes.agent_sdk_fixed"])
 @pytest.mark.asyncio
+async def test_anchor_from_pipe_transport_form_also_parses(module_path: str, monkeypatch: pytest.MonkeyPatch):
+    """The canonical extractor also defends the never-persisted pipe transport
+    form, so a legacy pipe key still yields the anchor merchant."""
+    import importlib
+
+    module = importlib.import_module(module_path)
+    product = await _build(
+        module, _seed_row(attached_product_key="merch_anchor|shopify|prod_1"), monkeypatch
+    )
+    ctx = _decode(product["external_redirect_url"])["ctx"]
+    assert ctx.get("merchant_id") == "merch_anchor"
+
+
+@pytest.mark.parametrize("module_path", ["routes.agent_api", "routes.agent_sdk_fixed"])
+@pytest.mark.asyncio
 async def test_each_mint_gets_a_fresh_click_id(module_path: str, monkeypatch: pytest.MonkeyPatch):
     """Click ids must be per-mint (per card render), not shared."""
     import importlib
@@ -145,3 +164,24 @@ async def test_each_mint_gets_a_fresh_click_id(module_path: str, monkeypatch: py
     c1 = _decode(p1["external_redirect_url"])["ctx"]["pvt_click_id"]
     c2 = _decode(p2["external_redirect_url"])["ctx"]["pvt_click_id"]
     assert c1 != c2
+
+
+def test_gateway_identity_parses_double_colon_storage_form():
+    """The gateway's external-seed identity (the highest-traffic surface) shares
+    the delimiter fix: the double-colon STORAGE form must yield the anchor
+    merchant/platform/product, not None (the old pipe-only parse dropped them)."""
+    import routes.agent_shop_gateway as gw
+
+    ident = gw._external_seed_redirect_identity(
+        row={"attached_product_key": "prod::merch_anchor::shopify::123", "domain": "brand.example"},
+        seed_data={},
+    )
+    assert ident["merchant_id"] == "merch_anchor"
+    assert ident["platform"] == "shopify"
+    assert ident["product_id"] == "prod::merch_anchor::shopify::123"
+
+    # standalone (no attached key) → no invented merchant (honest referral)
+    standalone = gw._external_seed_redirect_identity(
+        row={"attached_product_key": None, "domain": "brand.example"}, seed_data={}
+    )
+    assert standalone["merchant_id"] is None

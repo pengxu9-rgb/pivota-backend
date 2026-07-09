@@ -297,15 +297,15 @@ async def _build_external_seed_product(
         normalize_surface,
     )
     from services.outbound_links_service import append_referral_click_param
+    from services.seller_identity import anchor_merchant_from_product_key
 
     stable_click_id = new_click_id()
     dest_with_utm = append_referral_click_param(dest_with_utm, stable_click_id)
 
-    _attached_key = str(seed_row.get("attached_product_key") or "").strip()
-    _anchor_merchant_id = (
-        _attached_key.split("|", 1)[0].strip() or None
-        if _attached_key.count("|") >= 2
-        else None
+    # Canonical double-colon extractor (see the agent_api builder for why an
+    # inline pipe parse silently dropped the anchor for every real seed).
+    _anchor_merchant_id = anchor_merchant_from_product_key(
+        seed_row.get("attached_product_key")
     )
     _seller_ref = str(seed_row.get("seller_ref") or seed_data.get("seller_ref") or "").strip() or None
     _seed_kind = str(seed_row.get("seed_kind") or seed_data.get("seed_kind") or "").strip() or None
