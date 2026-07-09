@@ -330,6 +330,7 @@ async def fetch_external_seed_rows(
                   seed_data,
                   status, notes, created_by_employee_id,
                   attached_product_key, attached_variant_id,
+                  seller_ref, seed_kind,
                   created_at, updated_at,
                   {rank_expr} AS brand_term_hit
                 FROM external_product_seeds
