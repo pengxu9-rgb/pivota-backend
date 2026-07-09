@@ -942,13 +942,50 @@ async def ingest_standard_products(
             canonical_url = str(metadata.get("canonical_url") or metadata.get("url") or "").strip() or None
             brand = str(product.vendor or metadata.get("brand") or "").strip() or None
             content_key = make_content_key(brand, product.title, product.barcode)
+            from services.intake_identity import (
+                ACTION_FLAG as _IDENTITY_FLAG,
+                DOOR_CATALOG_SYNC as _DOOR_SYNC,
+                intake_identity_enabled as _intake_identity_enabled,
+                resolve_or_attach_content_identity as _resolve_or_attach,
+            )
+
+            if _intake_identity_enabled(_DOOR_SYNC):
+                # ADR-011 resolve-or-attach (flag-gated; composes the ADR-008
+                # brand guard, replacing the legacy standalone call below when
+                # ON). FIRST-PARTY door semantics: NEVER blocked — conflicts
+                # FLAG (review enqueued) and the sync proceeds. The memo keeps
+                # the brand guard at once-per-distinct-brand per run.
+                _ident = await _resolve_or_attach(
+                    brand=brand,
+                    title=product.title,
+                    gtin=product.barcode,
+                    canonical_url=canonical_url,
+                    source_product_id=source_pid,
+                    door=_DOOR_SYNC,
+                    merchant_ctx={
+                        "merchant_id": merchant_id,
+                        "platform": platform,
+                        "source_domain": source_domain_value,
+                        "product_key": product_key,
+                        "brand_guard_memo": _brand_guard_seen,
+                    },
+                )
+                content_key = _ident.get("content_key") or content_key
+                if _ident.get("action") == _IDENTITY_FLAG:
+                    stats["brand_conflicts_flagged"] += 1
+                    logger.info(
+                        "catalog_sync.identity_flag merchant=%s brand=%r "
+                        "matcher=%s (review enqueued, sync proceeds)",
+                        merchant_id, brand,
+                        (_ident.get("evidence") or {}).get("matcher"),
+                    )
             # ADR-008 prevent-at-intake (convergence P1.4) — FIRST-PARTY door
             # semantics: the connected merchant's own catalog ALWAYS proceeds
             # (higher truth than any observed row); a brand+host already
             # canonical under a DIFFERENT merchant is flagged for
             # reconciliation instead (reconcile-at-connect, never
             # block-at-connect). Best-effort; once per distinct brand per run.
-            if brand and source_domain_value and brand.lower() not in _brand_guard_seen:
+            elif brand and source_domain_value and brand.lower() not in _brand_guard_seen:
                 _brand_guard_seen.add(brand.lower())
                 try:
                     from services.audit_index_intake import (

@@ -81,12 +81,16 @@ def build_catalog_fields(
     description: Optional[str] = None,
     image_url: Optional[str] = None,
     tags: Optional[List[str]] = None,
+    gtin: Optional[str] = None,
 ) -> Dict[str, Any]:
     """Map a merchant create/edit payload -> canonical catalog_products fields.
 
     content_key resolved the SAME way audit-seed does: make_content_key(brand,
     title) (GTIN enrichment is a follow-up; the deliberately non-unique key is
-    de-conflated downstream by the identity gate, exactly as for other seeds)."""
+    de-conflated downstream by the identity gate, exactly as for other seeds).
+    `gtin` (R3, ADR-011) is carried TRANSIENTLY on the fields dict for the
+    resolve-or-attach primitive — it is not a catalog_products column and is
+    filtered out of the insert by _CATALOG_INSERT_COLUMNS."""
     from services.catalog_sync_service import make_catalog_product_key
 
     brand_norm = (brand or "").strip() or None
@@ -107,6 +111,7 @@ def build_catalog_fields(
         "image_url": (image_url or "").strip() or None,
         "tags": list(tags) if tags else None,
         "pdp_scope": "unverified",
+        "gtin": (gtin or "").strip() or None,
     }
 
 
@@ -117,6 +122,38 @@ async def upsert_brand_authored_catalog_row(fields: Dict[str, Any]) -> Optional[
     product_key on success, None otherwise."""
     from db.catalog import catalog_products
     from db.database import database
+    from services.intake_identity import (
+        ACTION_SKIP,
+        DOOR_BRAND_AUTHORED,
+        intake_identity_enabled,
+        resolve_or_attach_content_identity,
+    )
+
+    if intake_identity_enabled(DOOR_BRAND_AUTHORED):
+        # ADR-011 resolve-or-attach (flag-gated). This door was previously
+        # UNGUARDED — R1 makes the primitive its required pre-insert step. A
+        # first-party manual door is never blocked (brand conflicts FLAG and
+        # proceed); the SKIP branch is defensive only.
+        ident = await resolve_or_attach_content_identity(
+            brand=fields.get("brand"),
+            title=fields.get("title"),
+            gtin=fields.get("gtin"),
+            canonical_url=None,
+            source_product_id=fields.get("source_product_id"),
+            door=DOOR_BRAND_AUTHORED,
+            merchant_ctx={
+                "merchant_id": fields.get("merchant_id"),
+                "platform": fields.get("platform"),
+                "product_key": fields.get("product_key"),
+            },
+        )
+        if ident.get("action") == ACTION_SKIP:
+            logger.info(
+                "brand_authored_intake.identity_skip pk=%s brand=%r",
+                fields.get("product_key"), fields.get("brand"),
+            )
+            return None
+        fields["content_key"] = ident.get("content_key") or fields.get("content_key")
 
     values = {k: fields.get(k) for k in _CATALOG_INSERT_COLUMNS}
     stmt = _pg_insert(catalog_products).values(**values)

@@ -335,6 +335,26 @@ def _extract_tags_from_seed_data(seed_data: Any) -> List[str]:
     return []
 
 
+def _seed_gtin(seed_data: Any) -> Optional[str]:
+    """R3 (ADR-011): best-effort barcode/GTIN read from the crawled seed_data
+    snapshot, for the resolve-or-attach primitive — never hardcode None when
+    the source carried a barcode. Checks the top level and the first variant
+    (Shopify snapshots keep barcodes on variants)."""
+    if not isinstance(seed_data, dict):
+        return None
+    for key in ("gtin", "gtin13", "gtin14", "barcode", "upc", "ean"):
+        value = str(seed_data.get(key) or "").strip()
+        if value:
+            return value
+    variants = seed_data.get("variants")
+    if isinstance(variants, list) and variants and isinstance(variants[0], dict):
+        for key in ("gtin", "barcode", "upc", "ean"):
+            value = str(variants[0].get(key) or "").strip()
+            if value:
+                return value
+    return None
+
+
 async def _ensure_external_seed_merchant() -> None:
     """Phase 7d: idempotent UPSERT of the singleton 'external_seed'
     merchant row. Path B has all mirrored products under one synthetic
@@ -881,39 +901,82 @@ async def _apply(limit: int) -> int:
             seller_merchant_id, PLATFORM, external_product_id
         )
 
-        # ADR-008 prevent-at-intake (convergence P1.4): the mirror door now
-        # runs the SAME brand-fragmentation guard as the audit door. An
-        # observed seed whose brand+host is already canonical under a
-        # DIFFERENT merchant must not mint a fragmented orphan — the conflict
-        # goes to review instead. Fail-open on guard errors (never blocks a
-        # legitimate mirror on the guard's account).
-        try:
-            from services.audit_index_intake import (
-                apply_intake_brand_fragmentation_guard,
-            )
+        # Stage 1 (mig 083): content-derived identity for the mirrored row.
+        # The ADR-011 primitive below may re-align it to an existing entity.
+        content_key_value = make_content_key(
+            row_dict.get("mirrored_brand"), row_dict.get("title"), None
+        )
 
-            guard = await apply_intake_brand_fragmentation_guard(
-                seller_merchant_id,
-                {
-                    "product_key": product_key,
-                    "brand": row_dict.get("mirrored_brand"),
+        from services.intake_identity import (
+            ACTION_SKIP as _IDENTITY_SKIP,
+            DOOR_EXTERNAL_SEED_MIRROR as _DOOR_MIRROR,
+            intake_identity_enabled as _intake_identity_enabled,
+            resolve_or_attach_content_identity as _resolve_or_attach,
+        )
+
+        if _intake_identity_enabled(_DOOR_MIRROR):
+            # ADR-011 resolve-or-attach (flag-gated; composes the ADR-008
+            # brand guard, so the legacy standalone guard call below is
+            # replaced when ON). Tier-0 exact only; SKIP suppresses the mint
+            # (observed-data door) with review enqueued.
+            ident = await _resolve_or_attach(
+                brand=row_dict.get("mirrored_brand"),
+                title=row_dict.get("title"),
+                gtin=_seed_gtin(row_dict.get("seed_data")),
+                canonical_url=row_dict.get("canonical_url")
+                or row_dict.get("destination_url"),
+                source_product_id=external_product_id,
+                door=_DOOR_MIRROR,
+                merchant_ctx={
+                    "merchant_id": seller_merchant_id,
+                    "platform": PLATFORM,
                     "source_domain": row_dict.get("domain"),
-                    "canonical_url": row_dict.get("canonical_url"),
-                    "content_key": row_dict.get("content_key"),
+                    "product_key": product_key,
                 },
-                door="external_seed_mirror",
-                block_on_conflict=True,
             )
-            if guard.get("action") == "skip":
+            if ident.get("action") == _IDENTITY_SKIP:
                 skipped_brand_guard += 1
                 print(
-                    "SKIP: ADR-008 brand guard — brand already canonical under "
-                    f"{guard.get('conflict_merchant_id')} "
+                    "SKIP: ADR-011 identity gate — brand already canonical under "
+                    "another merchant "
                     f"(external_product_id={external_product_id!r}); review enqueued"
                 )
                 continue
-        except Exception as exc:  # noqa: BLE001 — guard must never break the mirror
-            print(f"WARN: brand guard errored for {external_product_id!r}: {exc}")
+            content_key_value = ident.get("content_key") or content_key_value
+        else:
+            # ADR-008 prevent-at-intake (convergence P1.4): the mirror door now
+            # runs the SAME brand-fragmentation guard as the audit door. An
+            # observed seed whose brand+host is already canonical under a
+            # DIFFERENT merchant must not mint a fragmented orphan — the conflict
+            # goes to review instead. Fail-open on guard errors (never blocks a
+            # legitimate mirror on the guard's account).
+            try:
+                from services.audit_index_intake import (
+                    apply_intake_brand_fragmentation_guard,
+                )
+
+                guard = await apply_intake_brand_fragmentation_guard(
+                    seller_merchant_id,
+                    {
+                        "product_key": product_key,
+                        "brand": row_dict.get("mirrored_brand"),
+                        "source_domain": row_dict.get("domain"),
+                        "canonical_url": row_dict.get("canonical_url"),
+                        "content_key": row_dict.get("content_key"),
+                    },
+                    door="external_seed_mirror",
+                    block_on_conflict=True,
+                )
+                if guard.get("action") == "skip":
+                    skipped_brand_guard += 1
+                    print(
+                        "SKIP: ADR-008 brand guard — brand already canonical under "
+                        f"{guard.get('conflict_merchant_id')} "
+                        f"(external_product_id={external_product_id!r}); review enqueued"
+                    )
+                    continue
+            except Exception as exc:  # noqa: BLE001 — guard must never break the mirror
+                print(f"WARN: brand guard errored for {external_product_id!r}: {exc}")
 
         mirrored_at = datetime.now(timezone.utc).isoformat()
         pivota_fields = make_pivota_canonical_fields(
@@ -1108,17 +1171,10 @@ async def _apply(limit: int) -> int:
                 "lifestyle_tags": json.dumps(taxonomy["lifestyle_tags"], ensure_ascii=False),
                 "demographic": taxonomy["demographic"],
                 "pdp_lifecycle_stage": mirror_lifecycle_stage,
-                # Stage 1 (mig 083): content-derived identity. Mirror
-                # paths typically don't carry a GTIN on the seed, so
-                # content_key for external_seed rows is brand+title-
-                # only; that's acceptable because Stage 2's auto-grouper
-                # tolerates GTIN absence by falling back to brand+title
-                # trigram for cross-merchant matching.
-                "content_key": make_content_key(
-                    row_dict.get("mirrored_brand"),
-                    row_dict.get("title"),
-                    None,
-                ),
+                # Stage 1 (mig 083): content-derived identity, computed above
+                # (and possibly re-aligned to an existing entity by the
+                # ADR-011 resolve-or-attach primitive when its flag is ON).
+                "content_key": content_key_value,
             },
         )
         if inserted_row:
@@ -1141,9 +1197,7 @@ async def _apply(limit: int) -> int:
             merchant_id=seller_merchant_id,
             platform=PLATFORM,
             source_product_id=row_dict.get("external_product_id"),
-            content_key=make_content_key(
-                row_dict.get("mirrored_brand"), row_dict.get("title"), None,
-            ),
+            content_key=content_key_value,
         )
 
         # Phase 7d: write canonical sku + offer for this product
