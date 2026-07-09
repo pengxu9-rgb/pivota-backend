@@ -125,6 +125,49 @@ _CAPABILITIES: Dict[str, StorePlatformCapabilities] = {
 }
 
 
+# --- P-T2.1: protocol dimension (Tier-2 in-chat checkout capability gate) ------
+#
+# Which agentic-commerce protocols a merchant's rails can be driven by. This is
+# the routing gate: the decision layer sends traffic to an in-chat protocol
+# checkout only for protocols listed here, else it falls back to the redirect
+# floor (never a dead end). Kept deliberately CONSERVATIVE + honest — a protocol
+# is listed only where we can actually honor it today.
+PROTOCOL_ACP = "acp"
+PROTOCOL_UCP = "ucp"
+PROTOCOL_AP2 = "ap2"
+
+# Per-platform protocol support. Each entry: (protocol, requires_active_psp).
+# `requires_active_psp=True` protocols only light up when the merchant has a
+# live-charge-ready PSP — this mirrors the existing ephemeral ACP signal in
+# readiness/sources/shopify_live.acp_checkout_supported (shopify_connected AND
+# psp_config). Any platform absent here honestly resolves to no protocols.
+#
+# Today only Shopify + a live PSP can be driven via the (external) ACP provider.
+# UCP is absent (readiness export only) and AP2 is dormant (router unmounted),
+# so neither is ever listed until its lane actually ships (P-T2.3/P-T2.4).
+_PLATFORM_PROTOCOLS: Dict[str, tuple[tuple[str, bool], ...]] = {
+    "shopify": ((PROTOCOL_ACP, True),),
+}
+
+
+def get_platform_protocols(platform: str | None, *, has_live_psp: bool) -> list[str]:
+    """Truthful protocols[] a merchant on `platform` can be checked out through.
+
+    `has_live_psp` gates charge-capable protocols (ACP) so an order can only be
+    routed to a protocol we can actually settle. Returns a stable, de-duplicated,
+    conservatively-ordered list — empty (honest "redirect only") for any platform
+    we cannot drive in-chat today.
+    """
+    key = str(platform or "").strip().lower()
+    out: list[str] = []
+    for protocol, requires_psp in _PLATFORM_PROTOCOLS.get(key, ()):  # noqa: E501
+        if requires_psp and not has_live_psp:
+            continue
+        if protocol not in out:
+            out.append(protocol)
+    return out
+
+
 def get_store_platform_capabilities(platform: str | None) -> StorePlatformCapabilities:
     key = str(platform or "").strip().lower()
     return _CAPABILITIES.get(
