@@ -1038,24 +1038,23 @@ class PaymentRoutingService:
         return sorted(psps, key=lambda x: psp_metrics.get(x.get("psp"), 0), reverse=True)
     
     async def _execute_with_psp(self, psp_name: str, payment_request: Dict) -> Dict:
-        """Execute payment with specific PSP"""
-        # TODO: Integrate with actual PSP adapters
-        # For now, simulate with success/failure
-        
-        # Simulate PSP processing time
-        await asyncio.sleep(random.uniform(0.1, 0.5))
-        
-        # Simulate success rate (90% for stripe, 85% for adyen, 80% for others)
-        success_rates = {"stripe": 0.9, "adyen": 0.85, "paypal": 0.8}
-        success_rate = success_rates.get(psp_name, 0.75)
-        
-        if random.random() < success_rate:
-            return {
-                "transaction_id": f"{psp_name}_{hashlib.md5(str(datetime.utcnow()).encode()).hexdigest()[:12]}",
-                "status": "success"
-            }
-        else:
-            raise Exception(f"Payment failed with {psp_name}: Insufficient funds")
+        """Execute a payment with a specific PSP.
+
+        FAIL-CLOSED: this previously SIMULATED execution with ``random.random()``
+        and returned a fabricated ``transaction_id`` + ``status="success"`` without
+        ever contacting a PSP. That is unsafe now that agents/partners are live —
+        the mounted endpoint ``POST /agents/{id}/payments/route`` would report a
+        fake "payment succeeded" with no money moved. Real charges go through the
+        hosted-checkout -> merchant PSP path (``initiate_merchant_payment``), NOT
+        this routing shim. Until real PSP adapters are wired here we fail closed,
+        so no fabricated success can be returned; the failover caller converts this
+        into an honest failure response.
+        """
+        raise NotImplementedError(
+            f"PSP execution via payment routing is not implemented for '{psp_name}'; "
+            "the simulated success path is disabled (fail-closed). Use the "
+            "hosted-checkout / initiate_merchant_payment path for real payments."
+        )
     
     def _generate_attempt_id(self, order_id: str, attempt_number: int) -> str:
         """Generate unique attempt ID"""
