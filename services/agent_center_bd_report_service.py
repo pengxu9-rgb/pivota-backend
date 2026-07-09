@@ -4599,8 +4599,11 @@ async def load_sku_context(sku_key: str, merchant_id: str) -> Dict[str, Any]:
             # Observability: url_audit SKUs leave no durable extractor trace
             # (no catalog row, stash is in-memory), so log the grounded count +
             # source size to make the extractor's contribution to url-audits
-            # verifiable instead of silent.
-            logger.info(
+            # verifiable instead of silent. WARNING level on purpose: the app
+            # configures no logging handler, so INFO from app-module loggers is
+            # dropped in prod (only Python's last-resort WARNING+ handler emits);
+            # this is a real signal worth surfacing.
+            logger.warning(
                 "url_audit extractor: merchant=%s sku=%s stashed_grounded=%d source_chars=%d",
                 ctx.get("merchant_id"),
                 cache_key[0],
