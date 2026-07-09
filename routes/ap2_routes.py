@@ -455,8 +455,8 @@ async def get_exchange_quote(exchange_request: AP2ExchangeRateRequest):
             "x402/quote: %s not in snapshot for %s — failing closed", to_ccy, from_ccy
         )
         raise HTTPException(
-            status_code=422,
-            detail=f"Exchange rate {from_ccy}->{to_ccy} is not available.",
+            status_code=503,
+            detail=f"Exchange rate {from_ccy}->{to_ccy} is unavailable.",
         )
 
     rate = float(rates_data[to_ccy])
