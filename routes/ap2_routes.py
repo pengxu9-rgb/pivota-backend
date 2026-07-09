@@ -409,6 +409,19 @@ async def get_exchange_quote(exchange_request: AP2ExchangeRateRequest):
     
     Public endpoint - no authentication required
     """
+    from_ccy = exchange_request.from_currency.upper()
+    to_ccy = exchange_request.to_currency.upper()
+
+    # Same currency is a legitimate 1:1 — no rate snapshot needed.
+    if from_ccy == to_ccy:
+        return AP2ExchangeRateResponse(
+            from_currency=from_ccy,
+            to_currency=to_ccy,
+            rate=1.0,
+            converted_amount=exchange_request.amount,
+            timestamp=datetime.utcnow().isoformat(),
+        )
+
     # Query latest exchange rate snapshot
     query = """
         SELECT rates, base_currency, created_at
@@ -418,41 +431,42 @@ async def get_exchange_quote(exchange_request: AP2ExchangeRateRequest):
         ORDER BY created_at DESC
         LIMIT 1
     """
-    
-    result = await database.fetch_one(
-        query,
-        {"base_currency": exchange_request.from_currency.upper()}
-    )
-    
+    result = await database.fetch_one(query, {"base_currency": from_ccy})
+
     if not result:
-        # Use default 1:1 rate if not found
-        rate = 1.0
-        logger.warning(
-            f"No exchange rate found for {exchange_request.from_currency}/"
-            f"{exchange_request.to_currency}, using 1:1"
+        # FAIL CLOSED. Previously this silently returned a fabricated 1:1 quote.
+        # The x402_exchange_rates table is fed ONLY by a manual admin endpoint (no
+        # scheduled sync), so an unsynced/stale table quoted EVERY pair at par —
+        # a made-up FX rate served from a public endpoint. Never quote a rate we
+        # don't have.
+        logger.error(
+            "x402/quote: no fresh exchange-rate snapshot for %s — failing closed",
+            from_ccy,
         )
-    else:
-        # Parse JSONB rates field
-        rates_data = json.loads(result["rates"]) if isinstance(result["rates"], str) else result["rates"]
-        to_currency = exchange_request.to_currency.upper()
-        
-        if to_currency in rates_data:
-            rate = float(rates_data[to_currency])
-        else:
-            # Currency not found in snapshot
-            rate = 1.0
-            logger.warning(
-                f"Currency {to_currency} not found in snapshot, using 1:1"
-            )
-    
+        raise HTTPException(
+            status_code=503,
+            detail=f"Exchange rate for {from_ccy} is unavailable or stale.",
+        )
+
+    rates_data = json.loads(result["rates"]) if isinstance(result["rates"], str) else result["rates"]
+    if to_ccy not in rates_data:
+        # FAIL CLOSED: pair not in the snapshot (was a silent 1:1).
+        logger.error(
+            "x402/quote: %s not in snapshot for %s — failing closed", to_ccy, from_ccy
+        )
+        raise HTTPException(
+            status_code=422,
+            detail=f"Exchange rate {from_ccy}->{to_ccy} is not available.",
+        )
+
+    rate = float(rates_data[to_ccy])
     converted_amount = exchange_request.amount * rate
-    
     return AP2ExchangeRateResponse(
-        from_currency=exchange_request.from_currency.upper(),
-        to_currency=exchange_request.to_currency.upper(),
+        from_currency=from_ccy,
+        to_currency=to_ccy,
         rate=rate,
         converted_amount=converted_amount,
-        timestamp=datetime.utcnow().isoformat()
+        timestamp=datetime.utcnow().isoformat(),
     )
 
 

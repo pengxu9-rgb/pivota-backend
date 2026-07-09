@@ -123,6 +123,15 @@ async def get_merchant_inventory_endpoint(merchant_id: str):
 @router.post("/orders", response_model=OrderResponse)
 async def create_order_endpoint(request: CreateOrderRequest):
     """Create a new order"""
+    # FAIL CLOSED: /mcp/orders is an in-memory SIMULATION store (module docstring:
+    # "Simulates agent-merchant communication for the full order flow") — orders
+    # here are lost on restart, charge nothing, and must never be mistaken for a
+    # real order now that partners are live. Use the production order/checkout flow.
+    raise HTTPException(
+        status_code=501,
+        detail="This MCP order endpoint is a simulation surface and is disabled. "
+               "Use the production order / checkout flow.",
+    )
     try:
         # Convert request items to dict format
         items_dict = [
@@ -200,6 +209,11 @@ async def get_merchant_orders(merchant_id: str):
 @router.put("/orders/{order_id}/status")
 async def update_order_status_endpoint(order_id: str, update: OrderStatusUpdate):
     """Update order status"""
+    # FAIL CLOSED: in-memory simulation store — see create_order_endpoint.
+    raise HTTPException(
+        status_code=501,
+        detail="This MCP order endpoint is a simulation surface and is disabled.",
+    )
     try:
         # Validate status
         try:
@@ -233,6 +247,11 @@ async def update_order_status_endpoint(order_id: str, update: OrderStatusUpdate)
 @router.delete("/orders/{order_id}")
 async def cancel_order_endpoint(order_id: str):
     """Cancel an order"""
+    # FAIL CLOSED: in-memory simulation store — see create_order_endpoint.
+    raise HTTPException(
+        status_code=501,
+        detail="This MCP order endpoint is a simulation surface and is disabled.",
+    )
     try:
         success = cancel_order(order_id)
         if not success:
