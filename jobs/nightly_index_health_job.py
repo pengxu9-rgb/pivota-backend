@@ -506,6 +506,14 @@ async def run_nightly_index_health() -> Dict[str, Any]:
         stage_counts: Dict[str, int] = {}
         total_processed = 0
         eligible_count = 0
+        # P1.5 graduation ladder: check the kill-switch once per run so the
+        # per-content_key loop is skipped entirely (no overhead) when dark.
+        from services.index_graduation_ladder import (
+            advance_from_state,
+            graduation_ladder_enabled,
+        )
+        graduation_enabled = graduation_ladder_enabled()
+        graduated_count = 0
 
         while True:
             try:
@@ -561,6 +569,26 @@ async def run_nightly_index_health() -> Dict[str, Any]:
                     summary["batch_errors"] += 1
                     summary["errors"].append(f"batch_upsert cursor={cursor!r}: {exc!r}")
 
+            # Convergence P1.5: advance the observed-track graduation ladder for
+            # each freshly classified content_key, using the state we just
+            # computed (no extra recompute). Dark unless
+            # INDEX_GRADUATION_LADDER_ENABLED; every call is best-effort and the
+            # writer is monotonic (referral_only → knowledge_ready →
+            # commerce_ready), so a re-run never downgrades.
+            if graduation_enabled and batch_states:
+                for state in batch_states:
+                    try:
+                        result = await advance_from_state(
+                            state["content_key"], state, reason="nightly_index_health",
+                        )
+                        graduated_count += int(result.get("advanced") or 0)
+                    except Exception as exc:  # noqa: BLE001
+                        logger.warning(
+                            "nightly_index_health: graduation advance failed for "
+                            "content_key=%r: %s",
+                            state.get("content_key"), exc,
+                        )
+
             # Advance cursor to the last distinct content_key in this batch.
             # The query pages by content key but returns all live catalog rows
             # for each key, so raw row count can exceed BATCH_SIZE.
@@ -575,6 +603,8 @@ async def run_nightly_index_health() -> Dict[str, Any]:
         summary["total_processed"] = total_processed
         summary["eligible_count"] = eligible_count
         summary["stage_counts"] = stage_counts
+        summary["graduation_enabled"] = graduation_enabled
+        summary["graduated_rows"] = graduated_count
 
         # 4. Orphan invalidation: catalog_products rows can be hard-deleted by
         # the Shopify catalog source prune. An IPS row whose catalog product

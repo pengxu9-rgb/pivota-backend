@@ -27,6 +27,9 @@ from scripts.mirror_external_seeds_to_catalog_products import (  # noqa: E402
     resolve_mirror_category_metadata,
 )
 import scripts.mirror_external_seeds_to_catalog_products as mirror_module  # noqa: E402
+# P1.6: the offer upsert delegates to the shared projection module, so the offer
+# tests patch the database there (the sku/merchant writes stay in mirror_module).
+import services.external_offer_dual_write as dual_write_module  # noqa: E402
 
 
 def test_mirror_query_includes_attached_seed_rows() -> None:
@@ -269,7 +272,7 @@ async def test_upsert_canonical_sku_writes_path_C_compatible_shape(monkeypatch) 
 
     monkeypatch.setattr(mirror_module, "database", DummyDB())
 
-    pk = "prod::external_seed::external_seed::ext_abc"
+    pk = "prod::merch_obs_abc123::external_seed::ext_abc"
     row_dict = {
         "external_product_id": "ext_abc",
         "title": "Test Product",
@@ -316,9 +319,9 @@ async def test_upsert_canonical_offer_carries_price_amount_into_three_columns(mo
         async def execute(self, sql, params):
             executed.append({"sql": str(sql), "params": dict(params)})
 
-    monkeypatch.setattr(mirror_module, "database", DummyDB())
+    monkeypatch.setattr(dual_write_module, "database", DummyDB())
 
-    pk = "prod::external_seed::external_seed::ext_abc"
+    pk = "prod::merch_obs_abc123::external_seed::ext_abc"
     row_dict = {
         "id": "eps_123",
         "external_product_id": "ext_abc",
@@ -330,7 +333,7 @@ async def test_upsert_canonical_offer_carries_price_amount_into_three_columns(mo
         "domain": "example.com",
         "market": "US",
     }
-    await _upsert_canonical_offer_for_mirror_row(pk, row_dict)
+    await _upsert_canonical_offer_for_mirror_row(pk, row_dict, merchant_id="merch_obs_abc123")
 
     assert len(executed) == 1
     sql = executed[0]["sql"]
@@ -344,7 +347,10 @@ async def test_upsert_canonical_offer_carries_price_amount_into_three_columns(mo
     assert params["currency"] == "USD"
     assert params["sku_key"] == f"{pk}::canonical"
     assert params["product_key"] == pk
-    assert params["merchant_id"] == MERCHANT_ID
+    # Offer attaches under the seed's REAL per-brand observed seller (ADR-009 D2),
+    # never the 'external_seed' sentinel.
+    assert params["merchant_id"] == "merch_obs_abc123"
+    assert params["merchant_id"] != MERCHANT_ID
     assert params["catalog_track"] == "external_referral"
     assert params["offer_mode"] == "redirect"
     assert params["availability"] == "in_stock"
@@ -366,7 +372,7 @@ async def test_upsert_canonical_offer_handles_null_price_gracefully(monkeypatch)
         async def execute(self, sql, params):
             executed.append({"sql": str(sql), "params": dict(params)})
 
-    monkeypatch.setattr(mirror_module, "database", DummyDB())
+    monkeypatch.setattr(dual_write_module, "database", DummyDB())
 
     pk = "prod::external_seed::external_seed::ext_xyz"
     row_dict = {
@@ -380,7 +386,7 @@ async def test_upsert_canonical_offer_handles_null_price_gracefully(monkeypatch)
         "domain": "example.com",
         "market": "US",
     }
-    await _upsert_canonical_offer_for_mirror_row(pk, row_dict)
+    await _upsert_canonical_offer_for_mirror_row(pk, row_dict, merchant_id="merch_obs_abc123")
 
     params = executed[0]["params"]
     assert params["list_price"] is None

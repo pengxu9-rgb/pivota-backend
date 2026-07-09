@@ -510,6 +510,19 @@ async def upsert_seed_data(
             proposal_id=proposal_id,
         )
         final_status = "merged"
+        # Convergence P1.6: keep the persisted catalog_offers mirror fresh for
+        # this seed. Post-commit, best-effort, flag-gated, and a no-op if the
+        # seed has no mirror product yet (the 15-min job creates the chain) —
+        # it must never fail the authorized seed write.
+        try:
+            from services.external_offer_dual_write import sync_offer_for_seed
+
+            await sync_offer_for_seed(seed_id)
+        except Exception:  # noqa: BLE001
+            logger.warning(
+                "seed_data_writer: catalog_offers dual-write failed for seed_id=%r",
+                seed_id, exc_info=True,
+            )
     else:
         final_status = proposal_status  # 'rejected' or 'no_change'
 
