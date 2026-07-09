@@ -1,13 +1,21 @@
 """ADR-011 — the resolve-or-attach primitive's golden ATTACH/MINT/FLAG/SKIP matrix.
 
-Covers the review-driven R3 semantics (GTIN'd content_key form first, GTIN-less
-fallback second, disagreement → FLAG never a silent second identity), the
-Tier-0 exact matchers (content_key / canonical_url / source_product_id), the
-composed ADR-008 brand guard with per-door FLAG-vs-SKIP semantics, per-door
-flags defaulting OFF, and fail-open on any internal error.
+SPU identity model (founder direction 2026-07-09): content_key is ALWAYS the
+GTIN-less brand+title FAMILY key; GTIN is a match-ATTRIBUTE, never key-material.
+Covers:
+  - MINT keys purely on brand+title; the canonicalized GTIN is returned for the
+    door to persist as the attribute (never folded into content_key);
+  - Tier-0 GTIN attribute match is authoritative and cross-merchant → ATTACH;
+  - same GTIN under a different brand+title family → ATTACH-to-GTIN + FLAG drift;
+  - same brand+title, different GTIN → FLAG collision (two products on the
+    deliberately non-unique family key; told apart by the gtin attribute
+    downstream);
+  - a product seen with-then-without a barcode converges on ONE identity;
+  - canonical_url / source_product_id exact matchers, the composed ADR-008 brand
+    guard (per-door FLAG-vs-SKIP), per-door flags default OFF, fail-open.
 
-DB lookups are monkeypatched at the module-helper seam (each helper is one
-small exact query) so the matrix is pure unit-golden — no infrastructure.
+DB lookups are monkeypatched at the module-helper seam so the matrix is pure
+unit-golden — no infrastructure.
 """
 
 from __future__ import annotations
@@ -20,16 +28,17 @@ import pytest
 os.environ.setdefault("DATABASE_URL", "postgresql://user:pass@localhost:5432/testdb")
 
 import services.intake_identity as ii  # noqa: E402
-from services.catalog_identity import make_content_key, normalize_gtin  # noqa: E402
+from services.catalog_identity import make_content_key  # noqa: E402
 from services.product_group_autogrouper import (  # noqa: E402
     make_singleton_product_group_id,
 )
 
 BRAND = "Anua"
 TITLE = "Heartleaf 77% Soothing Toner"
-GTIN = "8809640733458"
-CK_GTIN = make_content_key(BRAND, TITLE, GTIN)
-CK_PLAIN = make_content_key(BRAND, TITLE)
+CK = make_content_key(BRAND, TITLE)          # the single canonical family key
+GTIN_RAW = "8809640733458"                   # 13-digit EAN
+GTIN14 = "08809640733458"                    # GS1-canonical 14-digit
+GTIN14_OTHER = "00000000000017"
 MERCHANT = "m_anua"
 
 
@@ -42,7 +51,8 @@ def _row(**over: Any) -> Dict[str, Any]:
         "canonical_url": "https://anua.com/products/heartleaf-toner",
         "title": TITLE,
         "brand": BRAND,
-        "content_key": CK_PLAIN,
+        "content_key": CK,
+        "gtin": None,
         "pivota_signature_id": "sig_" + "a" * 32,
         "pivota_canonical_url": "https://agent.pivota.cc/products/sig_" + "a" * 32,
     }
@@ -67,11 +77,10 @@ def quiet(monkeypatch: pytest.MonkeyPatch) -> Dict[str, List[Any]]:
     async def capture_review(door: str, ctx: Dict, ck: Optional[str], matcher: str, detail: Dict) -> None:
         calls["reviews"].append({"door": door, "matcher": matcher, "detail": detail})
 
+    monkeypatch.setattr(ii, "_rows_by_gtin", none_rows)
     monkeypatch.setattr(ii, "_rows_by_content_key", none_rows)
     monkeypatch.setattr(ii, "_candidates_by_canonical_url", none_rows)
     monkeypatch.setattr(ii, "_candidates_by_source_id", none_rows)
-    monkeypatch.setattr(ii, "_known_gtin13_for_content_key", none_one)
-    monkeypatch.setattr(ii, "_content_key_for_gtin13", none_one)
     monkeypatch.setattr(ii, "_existing_pg_for_listing", none_one)
     monkeypatch.setattr(ii, "_write_provenance", capture_provenance)
     monkeypatch.setattr(ii, "_flag_review", capture_review)
@@ -95,7 +104,16 @@ def _ctx(**over: Any) -> Dict[str, Any]:
     return ctx
 
 
-# --- Flags ------------------------------------------------------------------------
+# --- canonical_gtin + flags ---------------------------------------------------------
+
+
+def test_canonical_gtin_only_keeps_clean_gtin14():
+    assert ii.canonical_gtin("8809640733458") == GTIN14      # 13 → padded 14
+    assert ii.canonical_gtin("012345678905") == "00012345678905"  # 12 → 14
+    assert ii.canonical_gtin(" 08809640733458 ") == GTIN14   # trims + already 14
+    assert ii.canonical_gtin("1234567890123456") is None     # 16 malformed → dropped
+    assert ii.canonical_gtin("") is None
+    assert ii.canonical_gtin(None) is None
 
 
 def test_all_door_flags_default_off():
@@ -109,7 +127,7 @@ def test_flag_enables_one_door(monkeypatch: pytest.MonkeyPatch):
     assert ii.intake_identity_enabled(ii.DOOR_CATALOG_SYNC) is False
 
 
-# --- MINT -------------------------------------------------------------------------
+# --- MINT (GTIN-less canonical key) -------------------------------------------------
 
 
 @pytest.mark.asyncio
@@ -118,25 +136,26 @@ async def test_mint_when_nothing_matches(quiet):
         BRAND, TITLE, door=ii.DOOR_URL_AUDIT, merchant_ctx=_ctx()
     )
     assert out["action"] == ii.ACTION_MINT
-    assert out["content_key"] == CK_PLAIN
-    assert out["product_group_id"] == make_singleton_product_group_id(CK_PLAIN)
+    assert out["content_key"] == CK
+    assert out["product_group_id"] == make_singleton_product_group_id(CK)
+    assert out["gtin"] is None
     assert out["attach"] is None
-    # provenance {door, action, matcher, evidence} written for EVERY outcome
-    assert len(quiet["provenance"]) == 1
     prov = quiet["provenance"][0]
     assert prov["door"] == ii.DOOR_URL_AUDIT
     assert prov["action"] == ii.ACTION_MINT
     assert prov["matcher"] is None
-    assert prov["evidence"]["deposit_basis"] == "unresolved"
 
 
 @pytest.mark.asyncio
-async def test_mint_with_gtin_uses_gtin_form(quiet):
+async def test_mint_with_gtin_keeps_gtinless_key_returns_attribute(quiet):
+    """The GTIN never enters content_key — it comes back as the attribute for
+    the door to persist. This is the crux of the SPU model."""
     out = await ii.resolve_or_attach_content_identity(
-        BRAND, TITLE, gtin=GTIN, door=ii.DOOR_URL_AUDIT, merchant_ctx=_ctx()
+        BRAND, TITLE, gtin=GTIN_RAW, door=ii.DOOR_URL_AUDIT, merchant_ctx=_ctx()
     )
     assert out["action"] == ii.ACTION_MINT
-    assert out["content_key"] == CK_GTIN  # R3: the GTIN-aware form
+    assert out["content_key"] == CK          # GTIN-less family key, unchanged
+    assert out["gtin"] == GTIN14             # canonicalized attribute
     assert quiet["provenance"][0]["evidence"]["deposit_basis"] == "gtin"
 
 
@@ -151,63 +170,142 @@ async def test_mint_null_identity_inputs(quiet):
     assert quiet["provenance"][0]["evidence"]["reason"] == "no_identity_inputs"
 
 
-# --- ATTACH: content_key forms (Tier-0a, R3) ---------------------------------------
+# --- Tier-0a: GTIN attribute (authoritative, cross-merchant) ------------------------
 
 
 @pytest.mark.asyncio
-async def test_attach_on_gtin_content_key_form(quiet, monkeypatch):
-    async def rows(ck: str, prefer: Optional[str]) -> List[Dict[str, Any]]:
-        return [_row(content_key=CK_GTIN)] if ck == CK_GTIN else []
+async def test_attach_on_gtin_attribute_clean(quiet, monkeypatch):
+    async def by_gtin(g: str, prefer: Optional[str]) -> List[Dict[str, Any]]:
+        return [_row(gtin=GTIN14, content_key=CK)] if g == GTIN14 else []
 
-    monkeypatch.setattr(ii, "_rows_by_content_key", rows)
+    monkeypatch.setattr(ii, "_rows_by_gtin", by_gtin)
     out = await ii.resolve_or_attach_content_identity(
-        BRAND, TITLE, gtin=GTIN, door=ii.DOOR_URL_AUDIT, merchant_ctx=_ctx()
+        BRAND, TITLE, gtin=GTIN_RAW, door=ii.DOOR_URL_AUDIT, merchant_ctx=_ctx()
     )
     assert out["action"] == ii.ACTION_ATTACH
-    assert out["content_key"] == CK_GTIN
-    assert out["product_group_id"] == make_singleton_product_group_id(CK_GTIN)
-    assert quiet["provenance"][0]["matcher"] == "content_key_gtin"
+    assert out["content_key"] == CK
+    assert quiet["provenance"][0]["matcher"] == "gtin_match"
     assert out["attach"]["same_merchant"] is False
 
 
 @pytest.mark.asyncio
-async def test_attach_gtin_less_fallback_when_gtin_form_misses(quiet, monkeypatch):
-    """R3: the legacy catalog is GTIN-less — a GTIN'd source must find its
-    GTIN-less twin instead of minting a parallel identity."""
-    async def rows(ck: str, prefer: Optional[str]) -> List[Dict[str, Any]]:
-        return [_row(content_key=CK_PLAIN)] if ck == CK_PLAIN else []
+async def test_gtin_beats_brand_title_and_converges_across_title_drift(quiet, monkeypatch):
+    """Same GTIN under a DIFFERENT brand+title family → GTIN authoritative:
+    ATTACH to it, FLAG the drift, never fork a second identity."""
+    other_ck = make_content_key("Anua", "Heartleaf Toner 250 ml")  # drifted title
 
-    monkeypatch.setattr(ii, "_rows_by_content_key", rows)
+    async def by_gtin(g: str, prefer: Optional[str]) -> List[Dict[str, Any]]:
+        return [_row(gtin=GTIN14, content_key=other_ck, product_key="pk_other")]
+
+    monkeypatch.setattr(ii, "_rows_by_gtin", by_gtin)
     out = await ii.resolve_or_attach_content_identity(
-        BRAND, TITLE, gtin=GTIN, door=ii.DOOR_URL_AUDIT, merchant_ctx=_ctx()
+        BRAND, TITLE, gtin=GTIN_RAW, door=ii.DOOR_URL_AUDIT, merchant_ctx=_ctx()
     )
-    assert out["action"] == ii.ACTION_ATTACH
-    assert out["content_key"] == CK_PLAIN  # reuses the twin, no second identity
-    assert quiet["provenance"][0]["matcher"] == "content_key_brand_title_gtin_fallback"
+    assert out["action"] == ii.ACTION_FLAG
+    assert out["content_key"] == other_ck          # converged onto the GTIN's identity
+    assert out["attach"]["product_key"] == "pk_other"
+    assert quiet["provenance"][0]["matcher"] == "gtin_match_brand_title_drift"
+    assert len(quiet["reviews"]) == 1
 
 
 @pytest.mark.asyncio
-async def test_attach_plain_no_gtin(quiet, monkeypatch):
-    async def rows(ck: str, prefer: Optional[str]) -> List[Dict[str, Any]]:
-        return [_row()] if ck == CK_PLAIN else []
+async def test_gtinless_observation_converges_onto_family(quiet, monkeypatch):
+    """The convergence the SPU model wins that GTIN-in-key lost: a later
+    barcode-less observation of the same product ATTACHes on brand+title."""
+    async def by_ck(ck: str, prefer: Optional[str]) -> List[Dict[str, Any]]:
+        return [_row(gtin=GTIN14, content_key=CK)] if ck == CK else []
 
-    monkeypatch.setattr(ii, "_rows_by_content_key", rows)
+    monkeypatch.setattr(ii, "_rows_by_content_key", by_ck)
+    out = await ii.resolve_or_attach_content_identity(
+        BRAND, TITLE, gtin=None, door=ii.DOOR_EXTERNAL_SEED_MIRROR, merchant_ctx=_ctx()
+    )
+    assert out["action"] == ii.ACTION_ATTACH
+    assert out["content_key"] == CK
+    assert quiet["provenance"][0]["matcher"] == "content_key"
+
+
+@pytest.mark.asyncio
+async def test_gtin_only_attach_when_brand_title_absent(quiet, monkeypatch):
+    """No brand+title, but the GTIN matches an existing identity → ATTACH
+    (we never MINT an identity from a GTIN alone, but we can attach to one)."""
+    async def by_gtin(g: str, prefer: Optional[str]) -> List[Dict[str, Any]]:
+        return [_row(gtin=GTIN14, content_key=CK)]
+
+    monkeypatch.setattr(ii, "_rows_by_gtin", by_gtin)
+    out = await ii.resolve_or_attach_content_identity(
+        None, "", gtin=GTIN_RAW, door=ii.DOOR_CATALOG_ENRICHMENT, merchant_ctx=_ctx()
+    )
+    assert out["action"] == ii.ACTION_ATTACH
+    assert out["content_key"] == CK
+
+
+# --- Tier-0b: brand+title family, and the collision FLAG ----------------------------
+
+
+@pytest.mark.asyncio
+async def test_attach_on_content_key_no_gtin(quiet, monkeypatch):
+    async def by_ck(ck: str, prefer: Optional[str]) -> List[Dict[str, Any]]:
+        return [_row()] if ck == CK else []
+
+    monkeypatch.setattr(ii, "_rows_by_content_key", by_ck)
     out = await ii.resolve_or_attach_content_identity(
         BRAND, TITLE, door=ii.DOOR_EXTERNAL_SEED_MIRROR, merchant_ctx=_ctx()
     )
     assert out["action"] == ii.ACTION_ATTACH
-    assert quiet["provenance"][0]["matcher"] == "content_key_brand_title"
+    assert quiet["provenance"][0]["matcher"] == "content_key"
+
+
+@pytest.mark.asyncio
+async def test_flag_brand_title_collision_distinct_gtin(quiet, monkeypatch):
+    """Same brand+title, but a DIFFERENT GTIN already lives on the family key →
+    two distinct products colliding on the non-unique key → FLAG. The row still
+    lands under the shared family key; the gtin attribute discriminates them."""
+    async def by_gtin(g: str, prefer: Optional[str]) -> List[Dict[str, Any]]:
+        return []  # incoming GTIN is not itself known yet
+
+    async def by_ck(ck: str, prefer: Optional[str]) -> List[Dict[str, Any]]:
+        return [_row(gtin=GTIN14_OTHER, product_key="pk_existing")] if ck == CK else []
+
+    monkeypatch.setattr(ii, "_rows_by_gtin", by_gtin)
+    monkeypatch.setattr(ii, "_rows_by_content_key", by_ck)
+    out = await ii.resolve_or_attach_content_identity(
+        BRAND, TITLE, gtin=GTIN_RAW, door=ii.DOOR_URL_AUDIT, merchant_ctx=_ctx()
+    )
+    assert out["action"] == ii.ACTION_FLAG
+    assert out["content_key"] == CK          # shared family key (hash can't fork)
+    assert out["gtin"] == GTIN14             # its own attribute discriminates it
+    assert quiet["provenance"][0]["matcher"] == "brand_title_collision"
+    assert quiet["reviews"][0]["detail"]["existing_gtins"] == [GTIN14_OTHER]
+
+
+@pytest.mark.asyncio
+async def test_attach_when_family_gtin_agrees(quiet, monkeypatch):
+    """Incoming GTIN equals an existing family member's GTIN → same product →
+    clean ATTACH (no collision flag)."""
+    async def by_gtin(g: str, prefer: Optional[str]) -> List[Dict[str, Any]]:
+        return []
+
+    async def by_ck(ck: str, prefer: Optional[str]) -> List[Dict[str, Any]]:
+        return [_row(gtin=GTIN14)] if ck == CK else []
+
+    monkeypatch.setattr(ii, "_rows_by_gtin", by_gtin)
+    monkeypatch.setattr(ii, "_rows_by_content_key", by_ck)
+    out = await ii.resolve_or_attach_content_identity(
+        BRAND, TITLE, gtin=GTIN_RAW, door=ii.DOOR_URL_AUDIT, merchant_ctx=_ctx()
+    )
+    assert out["action"] == ii.ACTION_ATTACH
+    assert quiet["provenance"][0]["matcher"] == "content_key"
 
 
 @pytest.mark.asyncio
 async def test_attach_reuses_existing_curated_pg(quiet, monkeypatch):
-    async def rows(ck: str, prefer: Optional[str]) -> List[Dict[str, Any]]:
-        return [_row()] if ck == CK_PLAIN else []
+    async def by_ck(ck: str, prefer: Optional[str]) -> List[Dict[str, Any]]:
+        return [_row()] if ck == CK else []
 
     async def existing_pg(row: Dict[str, Any]) -> Optional[str]:
         return "pg_curated123"
 
-    monkeypatch.setattr(ii, "_rows_by_content_key", rows)
+    monkeypatch.setattr(ii, "_rows_by_content_key", by_ck)
     monkeypatch.setattr(ii, "_existing_pg_for_listing", existing_pg)
     out = await ii.resolve_or_attach_content_identity(
         BRAND, TITLE, door=ii.DOOR_URL_AUDIT, merchant_ctx=_ctx()
@@ -215,66 +313,7 @@ async def test_attach_reuses_existing_curated_pg(quiet, monkeypatch):
     assert out["product_group_id"] == "pg_curated123"  # curated pg wins over singleton
 
 
-# --- FLAG: GTIN disagreements (R3) --------------------------------------------------
-
-
-@pytest.mark.asyncio
-async def test_flag_gtin_disagreement_same_brand_title(quiet, monkeypatch):
-    """Twin exists on brand+title but is known under a DIFFERENT GTIN → FLAG,
-    proceed with the fresh GTIN'd identity — flagged, never silent."""
-    async def rows(ck: str, prefer: Optional[str]) -> List[Dict[str, Any]]:
-        return [_row(content_key=CK_PLAIN)] if ck == CK_PLAIN else []
-
-    async def known(ck: str) -> Optional[str]:
-        return normalize_gtin("0000000000001")  # a different product's GTIN
-
-    monkeypatch.setattr(ii, "_rows_by_content_key", rows)
-    monkeypatch.setattr(ii, "_known_gtin13_for_content_key", known)
-    out = await ii.resolve_or_attach_content_identity(
-        BRAND, TITLE, gtin=GTIN, door=ii.DOOR_URL_AUDIT, merchant_ctx=_ctx()
-    )
-    assert out["action"] == ii.ACTION_FLAG
-    assert out["content_key"] == CK_GTIN  # fresh GTIN'd identity, not the twin's
-    assert quiet["provenance"][0]["matcher"] == "gtin_disagreement"
-    assert len(quiet["reviews"]) == 1
-    assert quiet["reviews"][0]["matcher"] == "gtin_disagreement"
-
-
-@pytest.mark.asyncio
-async def test_attach_when_twin_gtin_agrees(quiet, monkeypatch):
-    async def rows(ck: str, prefer: Optional[str]) -> List[Dict[str, Any]]:
-        return [_row(content_key=CK_PLAIN)] if ck == CK_PLAIN else []
-
-    async def known(ck: str) -> Optional[str]:
-        return normalize_gtin(GTIN)  # same GTIN — agreement, not conflict
-
-    monkeypatch.setattr(ii, "_rows_by_content_key", rows)
-    monkeypatch.setattr(ii, "_known_gtin13_for_content_key", known)
-    out = await ii.resolve_or_attach_content_identity(
-        BRAND, TITLE, gtin=GTIN, door=ii.DOOR_URL_AUDIT, merchant_ctx=_ctx()
-    )
-    assert out["action"] == ii.ACTION_ATTACH
-    assert out["content_key"] == CK_PLAIN
-
-
-@pytest.mark.asyncio
-async def test_flag_gtin_known_under_other_brand_title(quiet, monkeypatch):
-    """Reverse disagreement: no content_key hit, but the GTIN already lives
-    under a different brand+title identity → FLAG."""
-    async def other(gtin13: str) -> Optional[Dict[str, Any]]:
-        return {"content_key": "ck_" + "f" * 32, "brand": "Other", "title": "Thing"}
-
-    monkeypatch.setattr(ii, "_content_key_for_gtin13", other)
-    out = await ii.resolve_or_attach_content_identity(
-        BRAND, TITLE, gtin=GTIN, door=ii.DOOR_URL_AUDIT, merchant_ctx=_ctx()
-    )
-    assert out["action"] == ii.ACTION_FLAG
-    assert out["content_key"] == CK_GTIN
-    assert quiet["provenance"][0]["matcher"] == "gtin_conflict"
-    assert len(quiet["reviews"]) == 1
-
-
-# --- ATTACH: URL / source-id exact matchers (Tier-0b/0c) ----------------------------
+# --- Tier-0c/0d: URL / source-id exact matchers -------------------------------------
 
 
 @pytest.mark.asyncio
@@ -368,7 +407,7 @@ async def test_flag_on_brand_conflict_first_party_door(quiet, monkeypatch):
             BRAND, TITLE, door=door, merchant_ctx=_ctx()
         )
         assert out["action"] == ii.ACTION_FLAG
-        assert out["content_key"] == CK_PLAIN  # proceeds with the fresh identity
+        assert out["content_key"] == CK  # proceeds with the family identity
 
 
 @pytest.mark.asyncio
@@ -394,10 +433,11 @@ async def test_fail_open_mints_on_internal_error(quiet, monkeypatch):
     async def boom(*a: Any, **k: Any) -> None:
         raise RuntimeError("db down")
 
-    monkeypatch.setattr(ii, "_rows_by_content_key", boom)
+    monkeypatch.setattr(ii, "_rows_by_gtin", boom)
     out = await ii.resolve_or_attach_content_identity(
-        BRAND, TITLE, gtin=GTIN, door=ii.DOOR_URL_AUDIT, merchant_ctx=_ctx()
+        BRAND, TITLE, gtin=GTIN_RAW, door=ii.DOOR_URL_AUDIT, merchant_ctx=_ctx()
     )
     assert out["action"] == ii.ACTION_MINT  # never blocks intake
-    assert out["content_key"] == CK_GTIN
+    assert out["content_key"] == CK
+    assert out["gtin"] == GTIN14
     assert out["evidence"]["evidence"]["reason"] == "error"

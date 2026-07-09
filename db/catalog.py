@@ -130,6 +130,16 @@ catalog_products = Table(
     # + plans/rosy-mixing-bengio.md. Nullable for rows predating mig
     # 083; backfilled by scripts/backfill_content_key.py.
     Column("content_key", Text, nullable=True),
+    # ADR-011 (mig 178): GS1-canonical GTIN-14 as a MATCH ATTRIBUTE on the
+    # canonical identity — NOT folded into content_key. The SPU model
+    # (Amazon ASIN / Dewu SPU): content_key is the merchant-agnostic
+    # brand+title family key, and GTIN is a strong cross-merchant matcher
+    # the resolve-or-attach primitive keys on (services/intake_identity.py)
+    # so a product seen with-then-without a barcode converges on ONE
+    # identity instead of fragmenting. Nullable; populated by every intake
+    # door when the source carried a barcode. Legacy rows stay NULL until a
+    # re-ingest / D-2 backfill.
+    Column("gtin", Text, nullable=True),
     # P1 (mig 161): claim lifecycle on the SKU —
     # unclaimed | claimed | attested | substantiated. Audit-seed defaults
     # 'unclaimed'; a verified brand claim promotes to 'claimed'. Drives the
@@ -184,6 +194,14 @@ catalog_products = Table(
         "idx_catalog_products_content_key",
         "content_key",
         postgresql_where=Column("content_key").isnot(None),
+    ),
+    # ADR-011 (mig 178): the GTIN match-attribute lookup. Partial (most rows
+    # are GTIN-less) so the resolve-or-attach primitive's Tier-0 GTIN matcher
+    # is an index seek, not a scan.
+    Index(
+        "idx_catalog_products_gtin",
+        "gtin",
+        postgresql_where=Column("gtin").isnot(None),
     ),
     # Stage 2a (mig 084): partial index on the non-live tail. Most
     # recall queries filter sync_status='live' (the default); sweep

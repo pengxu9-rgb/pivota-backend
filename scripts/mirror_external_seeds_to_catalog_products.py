@@ -910,9 +910,15 @@ async def _apply(limit: int) -> int:
         from services.intake_identity import (
             ACTION_SKIP as _IDENTITY_SKIP,
             DOOR_EXTERNAL_SEED_MIRROR as _DOOR_MIRROR,
+            canonical_gtin as _canonical_gtin,
             intake_identity_enabled as _intake_identity_enabled,
             resolve_or_attach_content_identity as _resolve_or_attach,
         )
+
+        # ADR-011: any crawled barcode rides the gtin match-attribute column,
+        # never folded into content_key. Populated regardless of the flag so
+        # the match corpus builds ahead of rollout.
+        gtin_value = _canonical_gtin(_seed_gtin(row_dict.get("seed_data")))
 
         if _intake_identity_enabled(_DOOR_MIRROR):
             # ADR-011 resolve-or-attach (flag-gated; composes the ADR-008
@@ -922,7 +928,7 @@ async def _apply(limit: int) -> int:
             ident = await _resolve_or_attach(
                 brand=row_dict.get("mirrored_brand"),
                 title=row_dict.get("title"),
-                gtin=_seed_gtin(row_dict.get("seed_data")),
+                gtin=gtin_value,
                 canonical_url=row_dict.get("canonical_url")
                 or row_dict.get("destination_url"),
                 source_product_id=external_product_id,
@@ -1095,6 +1101,7 @@ async def _apply(limit: int) -> int:
               demographic,
               pdp_lifecycle_stage,
               content_key,
+              gtin,
               created_at,
               updated_at
             )
@@ -1130,6 +1137,7 @@ async def _apply(limit: int) -> int:
               :demographic,
               :pdp_lifecycle_stage,
               :content_key,
+              :gtin,
               now(),
               now()
             )
@@ -1175,6 +1183,8 @@ async def _apply(limit: int) -> int:
                 # (and possibly re-aligned to an existing entity by the
                 # ADR-011 resolve-or-attach primitive when its flag is ON).
                 "content_key": content_key_value,
+                # ADR-011: GTIN match-attribute (canonicalized), never in the key.
+                "gtin": gtin_value,
             },
         )
         if inserted_row:

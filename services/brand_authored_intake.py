@@ -57,7 +57,7 @@ def generate_source_product_id(title: str) -> str:
 # 'unverified' explicitly (matches its server_default + audit-seed semantics).
 _CATALOG_INSERT_COLUMNS = (
     "product_key", "merchant_id", "platform", "source_product_id",
-    "title", "brand", "content_key", "description", "product_type",
+    "title", "brand", "content_key", "gtin", "description", "product_type",
     "category", "image_url", "tags", "pdp_scope",
 )
 
@@ -85,13 +85,12 @@ def build_catalog_fields(
 ) -> Dict[str, Any]:
     """Map a merchant create/edit payload -> canonical catalog_products fields.
 
-    content_key resolved the SAME way audit-seed does: make_content_key(brand,
-    title) (GTIN enrichment is a follow-up; the deliberately non-unique key is
-    de-conflated downstream by the identity gate, exactly as for other seeds).
-    `gtin` (R3, ADR-011) is carried TRANSIENTLY on the fields dict for the
-    resolve-or-attach primitive — it is not a catalog_products column and is
-    filtered out of the insert by _CATALOG_INSERT_COLUMNS."""
+    content_key is the GTIN-less brand+title FAMILY key (ADR-011 SPU model);
+    a merchant-supplied `gtin` (R3) is canonicalized and persisted to the
+    separate `gtin` match-attribute column, which the resolve-or-attach
+    primitive keys on — it is never folded into content_key."""
     from services.catalog_sync_service import make_catalog_product_key
+    from services.intake_identity import canonical_gtin
 
     brand_norm = (brand or "").strip() or None
     title_norm = (title or "").strip()
@@ -105,13 +104,13 @@ def build_catalog_fields(
         "title": title_norm,
         "brand": brand_norm,
         "content_key": make_content_key(brand_norm, title_norm),
+        "gtin": canonical_gtin(gtin),
         "description": (description or "").strip() or None,
         "product_type": (product_type or "").strip() or None,
         "category": (category or "").strip() or None,
         "image_url": (image_url or "").strip() or None,
         "tags": list(tags) if tags else None,
         "pdp_scope": "unverified",
-        "gtin": (gtin or "").strip() or None,
     }
 
 

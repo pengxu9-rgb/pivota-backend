@@ -26,6 +26,7 @@ from sqlalchemy import func
 from sqlalchemy.dialects.postgresql import insert as _pg_insert
 
 from services.catalog_identity import make_content_key
+from services.intake_identity import canonical_gtin
 
 logger = logging.getLogger(__name__)
 
@@ -102,15 +103,29 @@ def _audit_image_url(attrs: Dict[str, Any]) -> Optional[str]:
     return None
 
 
+def _audit_gtin(audit_product: Dict[str, Any]) -> Optional[str]:
+    """R3 (ADR-011): read a source barcode/GTIN from the fetched PDP's
+    structured-data attributes, so it can plumb through as the identity
+    match-attribute instead of being dropped. Best-effort."""
+    attrs = audit_product.get("attributes_raw")
+    if not isinstance(attrs, dict):
+        return None
+    for key in ("gtin", "gtin13", "gtin14", "barcode", "upc", "ean"):
+        value = str(attrs.get(key) or "").strip()
+        if value:
+            return value
+    return None
+
+
 def audit_product_to_index_fields(
     merchant_id: str, audit_product: Dict[str, Any]
 ) -> Optional[Dict[str, Any]]:
     """Map a fetched audit-product dict -> canonical catalog_products fields.
 
     Returns None when there's not enough to mint an identity (no title, or no
-    resolvable URL identity). content_key is brand+title here (GTIN enrichment
-    is a follow-up); the deliberately non-unique key is de-conflated downstream
-    by the identity gate, exactly as for other seed sources."""
+    resolvable URL identity). content_key is the GTIN-less brand+title FAMILY
+    key (ADR-011 SPU model); any source barcode rides the separate `gtin`
+    match-attribute column, de-conflated downstream by the identity gate."""
     if not merchant_id or not isinstance(audit_product, dict):
         return None
     title = (audit_product.get("title") or "").strip()
@@ -151,6 +166,10 @@ def audit_product_to_index_fields(
         "title": title,
         "brand": brand,
         "content_key": make_content_key(brand, title),
+        # ADR-011: GTIN as a match-attribute (canonicalized), never folded into
+        # content_key. Populated even when the identity flag is off so the
+        # match corpus builds ahead of rollout.
+        "gtin": canonical_gtin(_audit_gtin(audit_product)),
         "canonical_url": pdp_url,
         "source_domain": _host(pdp_url) or None,
         "product_type": (audit_product.get("product_type") or "").strip() or None,
@@ -222,7 +241,7 @@ _AUDIT_SEED_READINESS_TIER = "referral_only"
 
 _CATALOG_INSERT_COLUMNS = (
     "product_key", "merchant_id", "platform", "source_product_id",
-    "title", "brand", "content_key", "canonical_url", "source_domain",
+    "title", "brand", "content_key", "gtin", "canonical_url", "source_domain",
     "product_type", "description", "image_url",
     "pivota_signature_id", "pivota_canonical_url", "pivota_signature_minted_at",
 )
@@ -517,20 +536,6 @@ async def apply_audit_brand_fragmentation_guard(
     )
 
 
-def _audit_gtin(audit_product: Dict[str, Any]) -> Optional[str]:
-    """R3 (ADR-011): plumb a source barcode/GTIN through the audit door when
-    the fetched PDP carried one, instead of hardcoding None. Best-effort read
-    of the structured-data attributes."""
-    attrs = audit_product.get("attributes_raw")
-    if not isinstance(attrs, dict):
-        return None
-    for key in ("gtin", "gtin13", "gtin14", "barcode", "upc", "ean"):
-        value = str(attrs.get(key) or "").strip()
-        if value:
-            return value
-    return None
-
-
 async def upsert_audited_sku_to_index(
     merchant_id: str, audit_product: Dict[str, Any]
 ) -> Optional[str]:
@@ -554,7 +559,7 @@ async def upsert_audited_sku_to_index(
         ident = await resolve_or_attach_content_identity(
             brand=fields.get("brand"),
             title=fields.get("title"),
-            gtin=_audit_gtin(audit_product),
+            gtin=fields.get("gtin"),
             canonical_url=fields.get("canonical_url"),
             source_product_id=fields.get("source_product_id"),
             door=DOOR_URL_AUDIT,

@@ -109,6 +109,7 @@ async def apply_ingest_plan(
     from services.intake_identity import (
         ACTION_SKIP,
         DOOR_CATALOG_ENRICHMENT,
+        canonical_gtin,
         intake_identity_enabled,
         resolve_or_attach_content_identity,
     )
@@ -119,6 +120,10 @@ async def apply_ingest_plan(
 
     # 2. catalog_products — UPSERT by product_key.
     for pdp in pdps:
+        # ADR-011: canonicalize any source barcode into the gtin match-attribute
+        # column (never folded into content_key). Plan rows may omit it, so set
+        # the key unconditionally to keep the named INSERT param bound.
+        pdp["gtin"] = canonical_gtin(pdp.get("gtin") or pdp.get("barcode"))
         if identity_gate_on:
             # ADR-011 resolve-or-attach (flag-gated). This door was previously
             # UNGUARDED — R1 makes the primitive its required pre-insert step,
@@ -127,7 +132,7 @@ async def apply_ingest_plan(
             ident = await resolve_or_attach_content_identity(
                 brand=pdp.get("brand"),
                 title=pdp.get("title"),
-                gtin=pdp.get("gtin") or pdp.get("barcode"),
+                gtin=pdp.get("gtin"),
                 canonical_url=pdp.get("canonical_url"),
                 source_product_id=pdp.get("source_product_id"),
                 door=DOOR_CATALOG_ENRICHMENT,
@@ -160,7 +165,7 @@ async def apply_ingest_plan(
                    price_tier, use_case_tags, lifestyle_tags, demographic,
                    pdp_lifecycle_stage,
                    pdp_scope, pdp_scope_source, pdp_scope_set_at,
-                   content_key)
+                   content_key, gtin)
                 VALUES
                   (:product_key, :merchant_id, :platform, :source_product_id,
                    :pivota_signature_id, :pivota_canonical_url, :pivota_signature_minted_at,
@@ -175,7 +180,7 @@ async def apply_ingest_plan(
                    :demographic,
                    :pdp_lifecycle_stage,
                    :pdp_scope, :pdp_scope_source, NOW(),
-                   :content_key)
+                   :content_key, :gtin)
                 ON CONFLICT (product_key) DO UPDATE SET
                   pivota_signature_id = COALESCE(catalog_products.pivota_signature_id, EXCLUDED.pivota_signature_id),
                   pivota_canonical_url = COALESCE(catalog_products.pivota_canonical_url, EXCLUDED.pivota_canonical_url),
@@ -197,6 +202,7 @@ async def apply_ingest_plan(
                   pdp_scope_source = EXCLUDED.pdp_scope_source,
                   pdp_scope_set_at = NOW(),
                   content_key = COALESCE(EXCLUDED.content_key, catalog_products.content_key),
+                  gtin = COALESCE(EXCLUDED.gtin, catalog_products.gtin),
                   updated_at = NOW()
                 """,
                 pdp,

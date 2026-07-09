@@ -13,9 +13,26 @@ matching invention:
   - the ADR-008 / P1.4 brand-fragmentation guard
     (services.audit_index_intake.apply_intake_brand_fragmentation_guard).
 
-Tier-0 EXACT matches only (ADR-010's auto tier): GTIN (via the content_key
-forms), canonical_url, source_product_id. Fuzzy/attribute matching stays
-propose-only elsewhere — never here.
+IDENTITY MODEL (SPU — Amazon ASIN / Dewu SPU; founder direction 2026-07-09):
+GTIN is a MATCH ATTRIBUTE, never key-material. There is ONE canonical family
+identity per product — `content_key = make_content_key(brand, title)`, GTIN-less
+— and the barcode lives beside it in `catalog_products.gtin`. Many products have
+no standard GTIN, so a GTIN can never be *required* to have an identity; and a
+product seen with-then-without a barcode must converge on ONE identity, not
+fragment. The primitive therefore:
+
+  - mints/keys purely on brand+title (the always-available signal),
+  - uses GTIN as the STRONGEST Tier-0 matcher (GS1 GTIN = same physical product
+    across merchants), attaching to whatever identity already carries it,
+  - keeps the two-grain split (ADR-010, R7): content_key is the FAMILY grain;
+    the GTIN attribute is the variant/buy-box discriminator downstream. Two
+    genuinely-different products that collide on the deliberately non-unique
+    brand+title key are FLAGged (never silently forked — the deterministic hash
+    can't fork anyway) and told apart downstream by their distinct gtin
+    attribute + the deposit gate.
+
+Tier-0 EXACT matches only (ADR-010's auto tier): GTIN attribute, canonical_url,
+source_product_id. Fuzzy/attribute matching stays propose-only elsewhere.
 
 ATTACH semantics (ADR-011, review-verified): a catalog_products row IS still
 inserted by the door — it reuses the resolved content_key / product_group_id
@@ -23,11 +40,12 @@ instead of minting fresh ones. This is NOT P1.3's seed-detach ATTACH (nothing
 here touches external_product_seeds.attached_product_key) and there is no
 serving change of any kind.
 
-R3 (GTIN with reconciliation): make_content_key(brand,title,gtin) differs from
-the GTIN-less form and the legacy catalog is GTIN-less, so the GTIN'd form is
-tried FIRST and the GTIN-less form is the fallback. A GTIN disagreement (same
-GTIN, different brand+title — or same brand+title, different known GTIN) is a
-FLAG, never a silent second identity.
+R3 disagreement semantics (FLAG, never a silent second identity):
+  - same GTIN, different brand+title family → GTIN is authoritative: ATTACH to
+    the GTIN's identity, FLAG the title/brand drift for review;
+  - same brand+title, different GTIN → two distinct products colliding on the
+    family key → FLAG for disambiguation (the row still lands under the shared
+    family key, discriminated by its own gtin attribute downstream).
 
 Rollout: per-door enable flags, default OFF (mirror-then-sync enable order).
 Fail-open: any internal error degrades to MINT (today's behavior) — the
@@ -90,20 +108,55 @@ def intake_identity_enabled(door: str) -> bool:
     return os.getenv(env, "").strip().lower() in {"1", "true", "yes", "on"}
 
 
+def canonical_gtin(value: Optional[str]) -> Optional[str]:
+    """GS1-canonical GTIN-14 for storage + matching, or None. Only a clean
+    14-digit form is a reliable identifier — normalize_gtin passes 15+ digit
+    malformed inputs through unchanged, so we drop those rather than store a
+    junk match key (mirrors agent_pdp_view_assembler.pick_gtin13)."""
+    from services.catalog_identity import normalize_gtin
+
+    norm = normalize_gtin(value)
+    return norm if norm and len(norm) == 14 else None
+
+
 # --- DB lookups (each one small, exact, and monkeypatch-friendly) ----------------
 
 _ROW_COLUMNS = (
     "product_key, merchant_id, platform, source_product_id, canonical_url, "
-    "title, brand, content_key, pivota_signature_id, pivota_canonical_url"
+    "title, brand, content_key, gtin, pivota_signature_id, pivota_canonical_url"
 )
+
+
+async def _rows_by_gtin(
+    gtin14: str, prefer_merchant_id: Optional[str]
+) -> List[Dict[str, Any]]:
+    """Existing listings carrying this GTIN attribute (the authoritative Tier-0
+    matcher). GLOBAL scope — a GS1 GTIN identifies one physical product across
+    every merchant. Same-merchant rows first, then oldest (the original
+    identity), suppressed rows excluded."""
+    if not gtin14:
+        return []
+    from db.database import database
+
+    rows = await database.fetch_all(
+        f"""
+        SELECT {_ROW_COLUMNS}
+        FROM catalog_products
+        WHERE gtin = :gtin
+          AND suppression_reason IS NULL
+        ORDER BY (merchant_id = :merchant_id) DESC, created_at ASC
+        LIMIT 5
+        """,
+        {"gtin": gtin14, "merchant_id": prefer_merchant_id or ""},
+    )
+    return [dict(row) for row in rows or []]
 
 
 async def _rows_by_content_key(
     content_key: str, prefer_merchant_id: Optional[str]
 ) -> List[Dict[str, Any]]:
-    """Existing listings carrying this EXACT content_key (the GTIN or GTIN-less
-    form). Same-merchant rows first (R4 cares), then oldest (the original
-    identity), suppressed rows excluded."""
+    """Existing listings on this brand+title FAMILY key. Same-merchant rows
+    first, then oldest, suppressed rows excluded."""
     if not content_key:
         return []
     from db.database import database
@@ -166,41 +219,6 @@ async def _candidates_by_source_id(
         {"source_product_id": source_product_id, "merchant_id": merchant_id},
     )
     return [dict(row) for row in rows or []]
-
-
-async def _known_gtin13_for_content_key(content_key: str) -> Optional[str]:
-    """The canonical GTIN-14 the existing identity is known by, from the
-    denormalized agent_pdp_view (indexed; pick_gtin13 has already picked the
-    modal barcode across the group's SKUs). None when unknown — absence of
-    evidence is never a disagreement."""
-    if not content_key:
-        return None
-    from db.database import database
-
-    row = await database.fetch_one(
-        "SELECT gtin13 FROM agent_pdp_view WHERE content_key = :ck",
-        {"ck": content_key},
-    )
-    value = row["gtin13"] if row else None
-    return str(value) if value else None
-
-
-async def _content_key_for_gtin13(gtin13: str) -> Optional[Dict[str, Any]]:
-    """Reverse lookup: is this GTIN already known under some OTHER content
-    identity? Uses the partial index on agent_pdp_view.gtin13."""
-    if not gtin13:
-        return None
-    from db.database import database
-
-    row = await database.fetch_one(
-        """
-        SELECT content_key, brand, title FROM agent_pdp_view
-        WHERE gtin13 = :gtin13 AND content_key IS NOT NULL
-        LIMIT 1
-        """,
-        {"gtin13": gtin13},
-    )
-    return dict(row) if row else None
 
 
 async def _existing_pg_for_listing(row: Dict[str, Any]) -> Optional[str]:
@@ -272,8 +290,9 @@ def _singleton_pg(content_key: Optional[str]) -> Optional[str]:
 
 def _deposit_basis(brand, title, gtin, content_key) -> str:
     """Deposit-gate annotation (catalog_identity.resolve_deposit_content_key):
-    how strongly the resolved key is grounded. Evidence-only here — deposits
-    themselves stay gated at their own call sites."""
+    how strongly the resolved key is grounded (GTIN-backed identities are
+    well-grounded even though our KEY no longer folds the GTIN in). Evidence
+    only — deposits themselves stay gated at their own call sites."""
     from services.catalog_identity import resolve_deposit_content_key
 
     return resolve_deposit_content_key(
@@ -290,6 +309,7 @@ async def _finish(
     door: str,
     merchant_ctx: Dict[str, Any],
     detail: Dict[str, Any],
+    gtin: Optional[str],
     attach: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
     provenance = {
@@ -312,6 +332,7 @@ async def _finish(
         "content_key": content_key,
         "product_group_id": product_group_id,
         "action": action,
+        "gtin": gtin,
         "evidence": provenance,
         "attach": attach,
     }
@@ -383,137 +404,143 @@ async def resolve_or_attach_content_identity(
 ) -> Dict[str, Any]:
     """Resolve-or-attach the content identity for one incoming catalog row.
 
-    Returns {content_key, product_group_id, action, evidence, attach}:
-      - ATTACH: an existing identity matched Tier-0 exactly — the door inserts
-        its row REUSING content_key/product_group_id (and, same-merchant at the
-        audit door, the matched listing's source_product_id/sig — R4).
-      - MINT:   no exact match — content_key is the fresh make_content_key
-        (GTIN-aware when the door plumbed one through, R3) and
-        product_group_id its deterministic singleton pg.
-      - FLAG:   a conflict (GTIN disagreement, or a brand-fragmentation
-        conflict at a first-party door) was enqueued for identity review; the
-        door PROCEEDS with the returned (fresh) identity — flagged, not silent.
+    Returns {content_key, product_group_id, action, gtin, evidence, attach}:
+      - ATTACH: an existing identity matched Tier-0 exactly (GTIN attribute,
+        content_key, canonical_url, or same-merchant source_product_id) — the
+        door inserts its row REUSING content_key/product_group_id (and,
+        same-merchant at the audit door, the matched listing's
+        source_product_id/sig — R4).
+      - MINT:   no exact match — content_key is the GTIN-less family key
+        make_content_key(brand, title) and product_group_id its deterministic
+        singleton pg. `gtin` (canonicalized) is returned for the door to persist
+        as the match attribute.
+      - FLAG:   a conflict (GTIN/brand-title disagreement, or a
+        brand-fragmentation conflict at a first-party door) was enqueued for
+        identity review; the door PROCEEDS with the returned identity — flagged,
+        not silent.
       - SKIP:   observed-data doors only — a brand-fragmentation conflict; the
         door must not insert (review enqueued).
 
     Fail-open by construction: any internal error returns MINT with today's
-    hash-computed identity. Never raises.
+    brand+title identity. Never raises.
     """
     ctx = dict(merchant_ctx or {})
     merchant_id = str(ctx.get("merchant_id") or "") or None
 
-    from services.catalog_identity import make_content_key, normalize_gtin
+    from services.catalog_identity import make_content_key
 
-    gtin_norm = normalize_gtin(gtin)
-    ck_gtin = make_content_key(brand, title, gtin) if gtin_norm else None
-    ck_plain = make_content_key(brand, title)
-    ck_fresh = ck_gtin or ck_plain  # what MINT/FLAG hand back (R3 GTIN-aware)
+    gtin14 = canonical_gtin(gtin)
+    content_key = make_content_key(brand, title)  # single canonical FAMILY key
 
     def _base_detail() -> Dict[str, Any]:
         return {
             "brand": brand,
             "title": title,
-            "gtin13": gtin_norm or None,
+            "gtin": gtin14,
             "canonical_url": canonical_url,
             "source_product_id": source_product_id,
-            "ck_gtin_form": ck_gtin,
-            "ck_plain_form": ck_plain,
+            "content_key": content_key,
         }
 
-    if not ck_plain and not ck_gtin:
-        # No brand/title identity to resolve — the door keeps today's
-        # content_key-NULL behavior (honest absence; pg stays NULL too).
-        return await _finish(
-            action=ACTION_MINT, content_key=None, product_group_id=None,
-            matcher=None, door=door, merchant_ctx=ctx,
-            detail={**_base_detail(), "reason": "no_identity_inputs"},
-        )
-
     try:
-        # -- Tier-0a: GTIN, via the content_key forms (R3: GTIN'd form first,
-        # GTIN-less fallback second so a GTIN'd source still finds its legacy
-        # GTIN-less twin instead of minting a parallel identity).
-        if ck_gtin:
-            rows = await _rows_by_content_key(ck_gtin, merchant_id)
+        # -- Tier-0a: GTIN attribute (authoritative, cross-merchant). A GS1 GTIN
+        # identifies one physical product regardless of who sells it or how the
+        # title is phrased, so it OUTRANKS brand+title.
+        if gtin14:
+            rows = await _rows_by_gtin(gtin14, merchant_id)
             if rows:
                 row = rows[0]
-                ck = row.get("content_key") or ck_gtin
+                matched_ck = row.get("content_key") or content_key
+                distinct_cks = {r.get("content_key") for r in rows if r.get("content_key")}
+                drift = bool(content_key and matched_ck != content_key)
+                if drift or len(distinct_cks) > 1:
+                    # Same GTIN under a different brand+title family (or split
+                    # across families). GTIN is authoritative → ATTACH to it,
+                    # but FLAG the metadata drift. We never fork a new identity,
+                    # so this is non-silent-attach, not a second identity.
+                    detail = {
+                        **_base_detail(),
+                        "reason": "gtin_match_brand_title_drift",
+                        "conflict_product_key": row.get("product_key"),
+                        "matched_content_key": matched_ck,
+                        "incoming_content_key": content_key,
+                        "distinct_content_keys": sorted(c for c in distinct_cks if c),
+                        "deposit_basis": _deposit_basis(brand, title, gtin, matched_ck),
+                    }
+                    await _flag_review(
+                        door, ctx, matched_ck, "gtin_match_brand_title_drift", detail
+                    )
+                    return await _finish(
+                        action=ACTION_FLAG, content_key=matched_ck,
+                        product_group_id=await _attach_pg(row, matched_ck),
+                        matcher="gtin_match_brand_title_drift", door=door,
+                        merchant_ctx=ctx, detail=detail, gtin=gtin14,
+                        attach=_attach_info(row, merchant_id),
+                    )
                 return await _finish(
-                    action=ACTION_ATTACH, content_key=ck,
-                    product_group_id=await _attach_pg(row, ck),
-                    matcher="content_key_gtin", door=door, merchant_ctx=ctx,
+                    action=ACTION_ATTACH, content_key=matched_ck,
+                    product_group_id=await _attach_pg(row, matched_ck),
+                    matcher="gtin_match", door=door, merchant_ctx=ctx,
                     detail={
                         **_base_detail(),
                         "matched_product_key": row.get("product_key"),
-                        "deposit_basis": _deposit_basis(brand, title, gtin, ck),
+                        "deposit_basis": _deposit_basis(brand, title, gtin, matched_ck),
                     },
-                    attach=_attach_info(row, merchant_id),
+                    gtin=gtin14, attach=_attach_info(row, merchant_id),
                 )
 
-        if ck_plain:
-            rows = await _rows_by_content_key(ck_plain, merchant_id)
-            if rows:
-                row = rows[0]
-                ck = row.get("content_key") or ck_plain
-                if gtin_norm:
-                    # R3 disagreement check: the brand+title twin is already
-                    # known under a DIFFERENT GTIN → two physical products
-                    # colliding on brand+title. FLAG, never a silent attach.
-                    known = await _known_gtin13_for_content_key(ck)
-                    if known and known != gtin_norm:
-                        detail = {
-                            **_base_detail(),
-                            "reason": "gtin_disagreement_same_brand_title",
-                            "conflict_product_key": row.get("product_key"),
-                            "conflict_content_key": ck,
-                            "known_gtin13": known,
-                        }
-                        await _flag_review(
-                            door, ctx, ck_fresh, "gtin_disagreement", detail
-                        )
-                        return await _finish(
-                            action=ACTION_FLAG, content_key=ck_fresh,
-                            product_group_id=_singleton_pg(ck_fresh),
-                            matcher="gtin_disagreement", door=door,
-                            merchant_ctx=ctx, detail=detail,
-                        )
-                return await _finish(
-                    action=ACTION_ATTACH, content_key=ck,
-                    product_group_id=await _attach_pg(row, ck),
-                    matcher=(
-                        "content_key_brand_title_gtin_fallback"
-                        if gtin_norm else "content_key_brand_title"
-                    ),
-                    door=door, merchant_ctx=ctx,
-                    detail={
-                        **_base_detail(),
-                        "matched_product_key": row.get("product_key"),
-                        "deposit_basis": _deposit_basis(brand, title, gtin, ck),
-                    },
-                    attach=_attach_info(row, merchant_id),
-                )
+        if not content_key:
+            # No brand+title identity and no GTIN attach — honest absence (the
+            # door keeps today's content_key-NULL behavior; pg stays NULL). We
+            # never mint an identity from a GTIN alone.
+            return await _finish(
+                action=ACTION_MINT, content_key=None, product_group_id=None,
+                matcher=None, door=door, merchant_ctx=ctx, gtin=gtin14,
+                detail={**_base_detail(), "reason": "no_identity_inputs"},
+            )
 
-        # -- Tier-0a': reverse GTIN disagreement — no content_key hit, but the
-        # GTIN is already known under some other brand+title identity. FLAG.
-        if gtin_norm:
-            other = await _content_key_for_gtin13(gtin_norm)
-            if other and other.get("content_key") not in {ck_gtin, ck_plain}:
+        # -- Tier-0b: content_key (brand+title FAMILY key).
+        rows = await _rows_by_content_key(content_key, merchant_id)
+        if rows:
+            known_gtins = {r.get("gtin") for r in rows if r.get("gtin")}
+            if gtin14 and known_gtins and gtin14 not in known_gtins:
+                # Same brand+title, but a DIFFERENT GTIN already lives on this
+                # family key → two distinct products colliding on the
+                # deliberately non-unique family key (ADR-010 two-grain:
+                # family=content_key, variant=gtin). The deterministic hash
+                # can't fork, so the row still lands under this family key,
+                # discriminated by its own gtin attribute + the deposit gate
+                # downstream. FLAG for disambiguation — never silent.
                 detail = {
                     **_base_detail(),
-                    "reason": "gtin_conflict_different_brand_title",
-                    "conflict_content_key": other.get("content_key"),
-                    "conflict_brand": other.get("brand"),
-                    "conflict_title": other.get("title"),
+                    "reason": "brand_title_collision_distinct_gtin",
+                    "conflict_product_key": rows[0].get("product_key"),
+                    "existing_gtins": sorted(g for g in known_gtins if g),
                 }
-                await _flag_review(door, ctx, ck_fresh, "gtin_conflict", detail)
-                return await _finish(
-                    action=ACTION_FLAG, content_key=ck_fresh,
-                    product_group_id=_singleton_pg(ck_fresh),
-                    matcher="gtin_conflict", door=door, merchant_ctx=ctx,
-                    detail=detail,
+                await _flag_review(
+                    door, ctx, content_key, "brand_title_collision", detail
                 )
+                return await _finish(
+                    action=ACTION_FLAG, content_key=content_key,
+                    product_group_id=_singleton_pg(content_key),
+                    matcher="brand_title_collision", door=door, merchant_ctx=ctx,
+                    detail=detail, gtin=gtin14,
+                )
+            row = rows[0]
+            ck = row.get("content_key") or content_key
+            return await _finish(
+                action=ACTION_ATTACH, content_key=ck,
+                product_group_id=await _attach_pg(row, ck),
+                matcher="content_key", door=door, merchant_ctx=ctx,
+                detail={
+                    **_base_detail(),
+                    "matched_product_key": row.get("product_key"),
+                    "deposit_basis": _deposit_basis(brand, title, gtin, ck),
+                },
+                gtin=gtin14, attach=_attach_info(row, merchant_id),
+            )
 
-        # -- Tier-0b: canonical_url exact (the ER gate's matcher, unchanged:
+        # -- Tier-0c: canonical_url exact (the ER gate's matcher, unchanged:
         # unique normalized-equality hit or nothing).
         if canonical_url:
             from urllib.parse import urlparse
@@ -553,10 +580,10 @@ async def resolve_or_attach_content_identity(
                             "matcher_evidence": match.get("evidence"),
                             "deposit_basis": _deposit_basis(brand, title, gtin, ck),
                         },
-                        attach=_attach_info(row, merchant_id),
+                        gtin=gtin14, attach=_attach_info(row, merchant_id),
                     )
 
-        # -- Tier-0c: source_product_id exact, SAME-merchant scope only.
+        # -- Tier-0d: source_product_id exact, SAME-merchant scope only.
         if source_product_id and merchant_id:
             from services.pdp_matcher.deterministic import source_product_id_match
 
@@ -589,7 +616,7 @@ async def resolve_or_attach_content_identity(
                             "matcher_evidence": match.get("evidence"),
                             "deposit_basis": _deposit_basis(brand, title, gtin, ck),
                         },
-                        attach=_attach_info(row, merchant_id),
+                        gtin=gtin14, attach=_attach_info(row, merchant_id),
                     )
 
         # -- No exact match → ADR-008 / P1.4 brand-fragmentation guard, now
@@ -615,7 +642,7 @@ async def resolve_or_attach_content_identity(
                     "brand": brand,
                     "source_domain": ctx.get("source_domain"),
                     "canonical_url": canonical_url,
-                    "content_key": ck_fresh,
+                    "content_key": content_key,
                 },
                 door=door,
                 block_on_conflict=_DOOR_BLOCKS_ON_BRAND_CONFLICT.get(door, True),
@@ -628,34 +655,27 @@ async def resolve_or_attach_content_identity(
 
         if guard_action == "skip":
             return await _finish(
-                action=ACTION_SKIP, content_key=ck_fresh,
+                action=ACTION_SKIP, content_key=content_key,
                 product_group_id=None, matcher="brand_host_fragmentation",
-                door=door, merchant_ctx=ctx,
-                detail={
-                    **_base_detail(),
-                    "reason": "brand_fragmentation",
-                    **guard_detail,
-                },
+                door=door, merchant_ctx=ctx, gtin=gtin14,
+                detail={**_base_detail(), "reason": "brand_fragmentation", **guard_detail},
             )
         if guard_action == "flag":
             return await _finish(
-                action=ACTION_FLAG, content_key=ck_fresh,
-                product_group_id=_singleton_pg(ck_fresh),
+                action=ACTION_FLAG, content_key=content_key,
+                product_group_id=_singleton_pg(content_key),
                 matcher="brand_host_fragmentation", door=door, merchant_ctx=ctx,
-                detail={
-                    **_base_detail(),
-                    "reason": "brand_fragmentation",
-                    **guard_detail,
-                },
+                gtin=gtin14,
+                detail={**_base_detail(), "reason": "brand_fragmentation", **guard_detail},
             )
 
         return await _finish(
-            action=ACTION_MINT, content_key=ck_fresh,
-            product_group_id=_singleton_pg(ck_fresh), matcher=None,
-            door=door, merchant_ctx=ctx,
+            action=ACTION_MINT, content_key=content_key,
+            product_group_id=_singleton_pg(content_key), matcher=None,
+            door=door, merchant_ctx=ctx, gtin=gtin14,
             detail={
                 **_base_detail(),
-                "deposit_basis": _deposit_basis(brand, title, gtin, ck_fresh),
+                "deposit_basis": _deposit_basis(brand, title, gtin, content_key),
             },
         )
     except Exception as exc:  # noqa: BLE001 — fail-open: never block intake
@@ -664,9 +684,10 @@ async def resolve_or_attach_content_identity(
             door, merchant_id, str(exc)[:300],
         )
         return {
-            "content_key": ck_fresh,
+            "content_key": content_key,
             "product_group_id": None,
             "action": ACTION_MINT,
+            "gtin": gtin14,
             "evidence": {
                 "door": door,
                 "action": ACTION_MINT,

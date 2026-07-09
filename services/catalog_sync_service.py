@@ -945,6 +945,7 @@ async def ingest_standard_products(
             from services.intake_identity import (
                 ACTION_FLAG as _IDENTITY_FLAG,
                 DOOR_CATALOG_SYNC as _DOOR_SYNC,
+                canonical_gtin as _canonical_gtin,
                 intake_identity_enabled as _intake_identity_enabled,
                 resolve_or_attach_content_identity as _resolve_or_attach,
             )
@@ -1182,6 +1183,11 @@ async def ingest_standard_products(
                     # which Stage 2 uses to auto-group product_group_members.
                     # See services/catalog_identity.py + plan.
                     "content_key": content_key,
+                    # ADR-011 (mig 178): the barcode as a GTIN match-attribute,
+                    # canonicalized, never folded into content_key (SPU model).
+                    # Written regardless of the identity flag so the match
+                    # corpus builds ahead of rollout.
+                    "gtin": _canonical_gtin(product.barcode),
                     # Stage 2a (mig 084): mark this row as freshly seen
                     # in a Path A sync. The nightly sweep
                     # (scripts/sweep_stale_catalog_products.py) compares

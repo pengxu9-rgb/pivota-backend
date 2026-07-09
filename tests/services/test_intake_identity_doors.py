@@ -62,11 +62,13 @@ def _catalog_products_stmt(executed: List[Any]) -> Any:
 
 
 def _ident(action: str, content_key: Optional[str] = None,
-           attach: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+           attach: Optional[Dict[str, Any]] = None,
+           gtin: Optional[str] = None) -> Dict[str, Any]:
     return {
         "content_key": content_key,
         "product_group_id": "pg_x",
         "action": action,
+        "gtin": gtin,
         "evidence": {"door": "?", "action": action, "matcher": "test", "evidence": {}},
         "attach": attach,
     }
@@ -158,10 +160,17 @@ async def test_audit_door_attach_realigns_content_key_and_plumbs_gtin(fake_db, m
     calls = _stub_primitive(monkeypatch, _ident(ii.ACTION_ATTACH, resolved_ck))
     out = await intake.upsert_audited_sku_to_index("m_anua", _audit_product())
     assert out == resolved_ck
-    # R3: the source barcode reached the primitive (never hardcoded None)
-    assert calls[0]["gtin"] == "8809640733458"
+    # R3: the source barcode reached the primitive, canonicalized (GS1 GTIN-14)
+    assert calls[0]["gtin"] == "08809640733458"
     assert calls[0]["door"] == ii.DOOR_URL_AUDIT
     assert calls[0]["merchant_ctx"]["merchant_id"] == "m_anua"
+    # ...and is persisted as the gtin match-attribute on the row.
+    from sqlalchemy.dialects import postgresql
+
+    stmt = _catalog_products_stmt(fake_db.executed)
+    params = stmt.compile(dialect=postgresql.dialect()).params
+    assert params["gtin"] == "08809640733458"
+    assert params["content_key"] == resolved_ck
 
 
 @pytest.mark.asyncio
@@ -277,15 +286,15 @@ async def test_brand_authored_attach_realigns_content_key(fake_db, monkeypatch):
     out = await upsert_brand_authored_catalog_row(fields)
     assert out == fields["product_key"]
     assert fields["content_key"] == resolved_ck
-    # R3: the merchant-supplied GTIN reached the primitive
-    assert calls[0]["gtin"] == "8809640733458"
+    # R3: the merchant-supplied GTIN reached the primitive, canonicalized
+    assert calls[0]["gtin"] == "08809640733458"
     assert calls[0]["door"] == ii.DOOR_BRAND_AUTHORED
-    # transient key never reaches the insert columns
+    # ...and persists as the gtin match-attribute column.
     from sqlalchemy.dialects import postgresql
 
     stmt = _catalog_products_stmt(fake_db.executed)
     params = stmt.compile(dialect=postgresql.dialect()).params
-    assert "gtin" not in params
+    assert params["gtin"] == "08809640733458"
     assert params["content_key"] == resolved_ck
 
 
@@ -320,6 +329,7 @@ def _plan() -> Dict[str, Any]:
             "use_case_tags": "[]", "lifestyle_tags": "[]", "demographic": None,
             "pdp_lifecycle_stage": None, "pdp_scope": "unverified",
             "pdp_scope_source": None, "content_key": "ck_" + "0" * 32,
+            "barcode": "8809640733458" if brand == "BrandB" else None,
         }
 
     return {
@@ -366,6 +376,8 @@ async def test_enrichment_door_skip_filters_pdp_and_children(monkeypatch):
     assert len(pdp_inserts) == 1
     assert pdp_inserts[0]["product_key"] == "pk::2"
     assert pdp_inserts[0]["content_key"] == resolved_ck  # ATTACH re-aligned
+    # R3: pk::2's barcode canonicalized into the gtin match-attribute column
+    assert pdp_inserts[0]["gtin"] == "08809640733458"
 
 
 @pytest.mark.asyncio
