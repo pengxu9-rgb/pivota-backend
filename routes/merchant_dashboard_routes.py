@@ -395,32 +395,9 @@ PAID_PAYMENT_STATUSES_SQL = "('paid','completed','succeeded','success','settled'
 # merchant fixtures belong in tests/dev-only fixtures, not runtime fallback.
 DEMO_MERCHANT_DATA = {}
 
-def generate_demo_orders(merchant_id: str, limit: int = 10) -> List[Dict[str, Any]]:
-    """Generate demo orders for merchant"""
-    orders = []
-    statuses = ["completed", "pending", "processing", "failed", "refunded"]
-    
-    for i in range(limit):
-        order_date = datetime.now() - timedelta(days=random.randint(0, 30), hours=random.randint(0, 23))
-        orders.append({
-            "order_id": f"ORD{str(1000 + i).zfill(8)}",
-            "merchant_id": merchant_id,
-            "amount": round(random.uniform(10, 500), 2),
-            "currency": "USD",
-            "status": random.choice(statuses),
-            "payment_method": random.choice(["card", "bank_transfer", "alipay", "wechat_pay"]),
-            "customer": {
-                "name": f"Customer {i+1}",
-                "email": f"customer{i+1}@example.com"
-            },
-            "created_at": order_date.isoformat() + "Z",
-            "updated_at": order_date.isoformat() + "Z"
-        })
-    
-    return sorted(orders, key=lambda x: x["created_at"], reverse=True)
-
-# REMOVED: generate_analytics() - was causing random data display
-# All analytics now come from real database queries only
+# REMOVED: generate_demo_orders() + generate_analytics() — fabricated random
+# order/analytics fixtures. Production dashboards fail closed (DEMO_MERCHANT_DATA
+# is empty, so the .get() call sites return None); demo data belongs in tests.
 
 
 async def _resolve_merchant_id(current_user: dict) -> str:
