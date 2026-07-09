@@ -156,3 +156,53 @@ def evaluate_tier2_charge(
         return _decision(False, REASON_BLOCKED_MERCHANT_NOT_ALLOWLISTED, merchant_allowlisted=False)
 
     return _decision(True, REASON_ALLOWED_STRICT_ENABLED)
+
+
+# --- P-T2.3.2: scoped test-mode capture (readiness bypass, amount-capped) -----
+
+
+@dataclass(frozen=True)
+class AcpTestCaptureDecision:
+    # `engaged` = the ACP test-mode capture lane applies: the charge is a guarded
+    # protocol, the kill-switch already permits it, and AGENT_ACP_TEST_CAPTURE is
+    # ON. In that lane the caller bypasses live-PSP readiness so a test-mode PSP
+    # can transact. `within_cap` gates the amount; an engaged-but-over-cap charge
+    # must be REFUSED (not silently downgraded to live readiness).
+    engaged: bool
+    within_cap: bool
+    max_cents: int
+    amount_cents: Optional[int]
+    reason: str
+
+    @property
+    def bypass_live_readiness(self) -> bool:
+        return self.engaged and self.within_cap
+
+
+def resolve_acp_test_capture(
+    protocol: Optional[str],
+    *,
+    amount_cents: Optional[int],
+    kill_switch_allowed: bool,
+    enabled: Optional[bool] = None,
+    max_cents: Optional[int] = None,
+) -> AcpTestCaptureDecision:
+    """Decide whether this charge runs in the ACP test-mode capture lane.
+
+    Engages only when ALL hold: guarded protocol, kill-switch already permitted,
+    and AGENT_ACP_TEST_CAPTURE on. Defaults read live settings; pass explicit
+    values in tests. Never engages for a non-protocol charge or in production
+    (flag off), so it cannot weaken any real flow.
+    """
+    en = settings.agent_acp_test_capture if enabled is None else bool(enabled)
+    cap = settings.agent_acp_test_max_cents if max_cents is None else int(max_cents)
+    if not (is_guarded_protocol(protocol) and en and bool(kill_switch_allowed)):
+        return AcpTestCaptureDecision(
+            engaged=False, within_cap=True, max_cents=cap,
+            amount_cents=amount_cents, reason="not_engaged",
+        )
+    within = amount_cents is not None and int(amount_cents) <= cap
+    return AcpTestCaptureDecision(
+        engaged=True, within_cap=within, max_cents=cap, amount_cents=amount_cents,
+        reason="engaged" if within else "over_cap",
+    )

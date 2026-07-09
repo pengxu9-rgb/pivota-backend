@@ -371,6 +371,19 @@ class Settings(BaseSettings):
     agent_submit_payment_merchants: frozenset[str] = frozenset(
         m.strip() for m in os.getenv("SUBMIT_PAYMENT_MERCHANTS", "").split(",") if m.strip()
     )
+    # P-T2.3.2 test-mode capture canary. When ON, an ACP-tier charge that the
+    # kill-switch already permits may run against a TEST-MODE PSP by bypassing the
+    # live-readiness gate — but ONLY in this lane, and ONLY up to a hard amount
+    # cap. Default OFF: production ACP charges still require a live PSP. This is
+    # what lets a test-mode Stripe key transact for the canary without weakening
+    # any real flow (the "system blocks test keys" unblock).
+    agent_acp_test_capture: bool = (
+        os.getenv("AGENT_ACP_TEST_CAPTURE", "false").strip().lower()
+        in {"true", "1", "on", "yes"}
+    )
+    agent_acp_test_max_cents: int = int(
+        os.getenv("AGENT_ACP_TEST_MAX_CENTS", "500") or "500"
+    )
 
     # Readiness audit / thin-slice flags
     feature_readiness_audit: bool = os.getenv("FEATURE_READINESS_AUDIT", "false").lower() == "true"
