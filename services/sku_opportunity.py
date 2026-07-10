@@ -338,6 +338,12 @@ def _score_prompt_group(
     )
     any_competitor_first_party = _any_competitor_first_party(runs, competitors)
     provider_analysis = _provider_analysis(runs, sku_ctx=sku_ctx, product=product)
+    # Strict SKU-verified run count across providers (vs the brand-level
+    # merchant_cited_runs above) — the sibling-conflation split.
+    sku_cited_runs = sum(
+        int(row.get("sku_identified_runs") or 0)
+        for row in provider_analysis.values()
+    )
     provider_verdicts = {
         provider: provider_analysis.get(provider, {}).get("verdict", "absent")
         for provider in providers
@@ -451,10 +457,21 @@ def _score_prompt_group(
         "source_route": source_route,
         "source_summary": {
             "merchant_cited_runs": merchant_cited_runs,
+            # Strict SKU-level split: merchant_cited_runs is BRAND-level (RunFacts
+            # brand_mentioned_runs, parity-locked to the verdict path — unchanged);
+            # sku_cited_runs counts only runs where THIS SKU was verified. The gap
+            # between the two is sibling/brand-only citation.
+            "sku_cited_runs": sku_cited_runs,
             "runs_with_citations": runs_with_citations,
             "top_cited_hosts": top_cited_hosts,
             "buyer_path_controllers": buyer_path_controllers,
         },
+        # Brand cited on this query, but THIS SKU never verified in any answer —
+        # the "AI answers with your brand/older product, not this SKU" signal
+        # (Purra Swim probes answered with Run Plus content, run 7420c2b5).
+        "brand_cited_sku_absent": bool(
+            merchant_cited_runs > 0 and sku_cited_runs == 0
+        ),
         "competitors": competitors,
         "competitor_count": len(competitors),
         "any_competitor_first_party": any_competitor_first_party,
@@ -553,6 +570,10 @@ def _provider_analysis(
             "merchant_mention": merchant_mention,
             "negative_verdict": negative,
             "grounded_first_party": any(v["grounded_first_party"] for v in verdicts),
+            # Strict per-SKU identification (no brand-text fallback) — feeds the
+            # sibling-conflation split (sku_cited_runs vs merchant_cited_runs).
+            "sku_identified": any(v["sku_identified"] for v in verdicts),
+            "sku_identified_runs": sum(1 for v in verdicts if v["sku_identified"]),
         }
     return out
 
@@ -632,6 +653,21 @@ def _run_visibility_verdict(
         or (merchant_mention and not negative_verdict)
     )
     positive_product_signal = product_positive and not negative_verdict
+    # STRICT SKU-level identification — no brand-text fallback. merchant_mention
+    # fires on the BRAND name too, which conflates sibling products: a Purra
+    # Swim probe answered with Run Plus content counted as "merchant cited" and
+    # inflated this SKU's citation rate (live run 7420c2b5). This flag is true
+    # only when THIS SKU was verified in the answer (probe self-report or the
+    # SKU's own canonical URL in the grounding set).
+    sku_identified = bool(
+        not negative_verdict
+        and (
+            correct_sku is True
+            or sku_mentioned is True
+            or product_visible is True
+            or url_match.get("in_grounding") is True
+        )
+    )
     positive_merchant_signal = merchant_mention and not negative_verdict
     grounded_positive = bool(
         not negative_verdict
@@ -657,6 +693,7 @@ def _run_visibility_verdict(
         "product_visible": product_visible,
         "correct_sku": correct_sku,
         "sku_mentioned": sku_mentioned,
+        "sku_identified": sku_identified,
         "negative_verdict": negative_verdict,
         "no_info_denial": no_info_denial,
         "grounded_first_party": grounded_first_party and not negative_verdict,

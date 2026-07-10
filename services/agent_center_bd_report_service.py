@@ -5096,20 +5096,64 @@ def _intent_axis_for(query: Optional[str], axis: Optional[str]) -> str:
 def _citation_by_intent(per_prompt: Any) -> Dict[str, Dict[str, Any]]:
     """Per-SKU citation rate grouped by fine intent axis: for each intent, how many
     of its probed queries cited the merchant. Surfaces WHERE the SKU wins by question
-    type (e.g. cited on trust/navigational but not problem/discovery). Snapshot-only."""
+    type (e.g. cited on trust/navigational but not problem/discovery). Snapshot-only.
+
+    `cited`/`rate` stay BRAND-level (merchant_cited_runs — unchanged for
+    run-to-run comparability). `sku_cited`/`sku_rate` are the strict SKU-level
+    split (this exact SKU verified in the answer): the gap between the two is
+    sibling/brand-only citation — brand visibility this SKU doesn't own."""
     buckets: Dict[str, Dict[str, Any]] = {}
     for row in per_prompt or []:
         if not isinstance(row, dict):
             continue
         intent = _intent_axis_for(row.get("normalized_query") or row.get("query"), row.get("axis"))
-        bucket = buckets.setdefault(intent, {"cited": 0, "total": 0})
+        bucket = buckets.setdefault(intent, {"cited": 0, "sku_cited": 0, "total": 0})
         bucket["total"] += 1
         summary = row.get("source_summary") if isinstance(row.get("source_summary"), dict) else {}
         if int(summary.get("merchant_cited_runs") or 0) > 0:
             bucket["cited"] += 1
+        if int(summary.get("sku_cited_runs") or 0) > 0:
+            bucket["sku_cited"] += 1
     for bucket in buckets.values():
         bucket["rate"] = round(bucket["cited"] / bucket["total"], 3) if bucket["total"] else 0.0
+        bucket["sku_rate"] = round(bucket["sku_cited"] / bucket["total"], 3) if bucket["total"] else 0.0
     return buckets
+
+
+def _brand_vs_sku_citation(per_prompt: Any) -> Dict[str, Any]:
+    """Sibling-conflation summary for the per-SKU report: queries where the
+    BRAND was cited but THIS SKU was never verified in any answer — AI is
+    answering with the brand's other products / brand-level content, not this
+    one. Honest split only; no attempt to name WHICH sibling (that would need
+    excerpt attribution we don't have). Additive block beside citation_by_intent."""
+    rows = [r for r in (per_prompt or []) if isinstance(r, dict)]
+    if not rows:
+        return {"detected": False, "brand_only_queries": [], "count": 0}
+    brand_only = [
+        str(r.get("query") or "").strip()
+        for r in rows
+        if r.get("brand_cited_sku_absent")
+    ]
+    sku_cited = sum(
+        1 for r in rows
+        if int(((r.get("source_summary") or {}).get("sku_cited_runs")) or 0) > 0
+    )
+    brand_cited = sum(
+        1 for r in rows
+        if int(((r.get("source_summary") or {}).get("merchant_cited_runs")) or 0) > 0
+    )
+    return {
+        "detected": bool(brand_only),
+        "count": len(brand_only),
+        "brand_only_queries": brand_only[:8],
+        "brand_cited_queries": brand_cited,
+        "sku_cited_queries": sku_cited,
+        "note": (
+            "On these queries AI cites the brand but never identifies this "
+            "exact product — brand visibility this SKU doesn't own yet "
+            "(often a sibling product carrying the answer)."
+        ) if brand_only else None,
+    }
 
 
 def _channel_query_key(query: Any) -> str:
@@ -6939,6 +6983,12 @@ async def build_per_sku_report(
         # Step 2 — citation rate by fine intent axis (head/problem/constraint/trust/
         # nav). Snapshot of WHERE this SKU is cited by question type. Additive.
         "citation_by_intent": _citation_by_intent(
+            opportunity.get("per_prompt") if isinstance(opportunity, dict) else None
+        ),
+        # Sibling-conflation split: queries where the BRAND is cited but THIS
+        # SKU never verified — brand visibility the SKU doesn't own (AI often
+        # answering with a sibling product). Additive.
+        "brand_vs_sku_citation": _brand_vs_sku_citation(
             opportunity.get("per_prompt") if isinstance(opportunity, dict) else None
         ),
         # Product-FIRST competitiveness: does the product win NON-BRANDED
