@@ -62,17 +62,37 @@ from services.pdp_matcher.deterministic import normalize_canonical_url  # noqa: 
 
 DEMO_DOMAIN_PREFIX = "pivota-review-demo"
 
-WORKING_ROWS_SQL = """
+# Seed linkage is bidirectional: the mirror door stamps the seed id into
+# catalog_products.source_ref, but the enrichment door (source_system
+# catalog_enrichment_agent_v1) writes NO source_ref — its rows are linked the
+# other way, via external_product_seeds.attached_product_key. A row only
+# counts as seed-less ('missing') when NEITHER direction finds a seed.
+SEED_STATUS_SQL = """
+    CASE WHEN cp.platform = 'external_seed' THEN
+        CASE
+            WHEN EXISTS (
+                SELECT 1 FROM external_product_seeds e
+                WHERE (e.id = cp.source_ref
+                       OR e.attached_product_key = cp.product_key)
+                  AND lower(coalesce(e.status, '')) = 'active')
+            THEN 'active'
+            WHEN EXISTS (
+                SELECT 1 FROM external_product_seeds e
+                WHERE e.id = cp.source_ref
+                   OR e.attached_product_key = cp.product_key)
+            THEN 'inactive'
+            ELSE 'missing'
+        END
+    END
+"""
+
+WORKING_ROWS_SQL = f"""
 WITH keyed AS (
     SELECT cp.merchant_id, cp.content_key, cp.product_key, cp.platform,
            cp.canonical_url, cp.source_domain, cp.source_product_id,
            cp.source_ref, cp.pivota_signature_id, cp.title, cp.created_at,
-           CASE WHEN cp.platform = 'external_seed'
-                THEN lower(coalesce(eps.status, 'missing'))
-           END AS seed_status
+           {SEED_STATUS_SQL} AS seed_status
     FROM catalog_products cp
-    LEFT JOIN external_product_seeds eps
-      ON cp.platform = 'external_seed' AND eps.id = cp.source_ref
     WHERE cp.content_key IS NOT NULL AND cp.suppression_reason IS NULL
 ),
 xm AS (
@@ -90,15 +110,21 @@ WHERE xm.content_key IS NOT NULL OR sm.content_key IS NOT NULL
 """
 
 # Whole-catalog orphan-mirror population (not just dup groups): every active
-# external_seed catalog row whose seed is gone or not active.
-ORPHAN_MIRRORS_SQL = """
+# external_seed catalog row with no active seed in EITHER linkage direction
+# (see SEED_STATUS_SQL). Shared with scripts/step5_sweep_orphan_mirrors.py so
+# the report and the sweep can never disagree about what an orphan mirror is.
+ORPHAN_MIRRORS_SQL = f"""
 SELECT cp.product_key, cp.content_key, cp.source_ref, cp.canonical_url,
-       lower(coalesce(eps.status, 'missing')) AS seed_status
+       cp.pivota_signature_id,
+       {SEED_STATUS_SQL} AS seed_status
 FROM catalog_products cp
-LEFT JOIN external_product_seeds eps ON eps.id = cp.source_ref
 WHERE cp.platform = 'external_seed'
   AND cp.suppression_reason IS NULL
-  AND (eps.id IS NULL OR lower(coalesce(eps.status, '')) <> 'active')
+  AND NOT EXISTS (
+        SELECT 1 FROM external_product_seeds e
+        WHERE (e.id = cp.source_ref
+               OR e.attached_product_key = cp.product_key)
+          AND lower(coalesce(e.status, '')) = 'active')
 """
 
 
