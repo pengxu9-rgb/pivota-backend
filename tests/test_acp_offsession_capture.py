@@ -28,13 +28,25 @@ class _FakeIntents:
         return self.outcome
 
 
+class _FakePaymentMethods:
+    def retrieve(self, pm_id):
+        if _FakeStripeClient.pm_lookup_raises:
+            raise RuntimeError("pm lookup boom")
+        return SimpleNamespace(id=pm_id, customer=_FakeStripeClient.pm_customer)
+
+
 class _FakeStripeClient:
     last_api_key = None
     intents = None
+    pm_customer = None          # what payment_methods.retrieve reports as .customer
+    pm_lookup_raises = False
 
     def __init__(self, api_key, *a, **k):
         _FakeStripeClient.last_api_key = api_key
-        self.v1 = SimpleNamespace(payment_intents=_FakeStripeClient.intents)
+        self.v1 = SimpleNamespace(
+            payment_intents=_FakeStripeClient.intents,
+            payment_methods=_FakePaymentMethods(),
+        )
 
 
 def _install_stripe(monkeypatch, outcome):
@@ -42,6 +54,8 @@ def _install_stripe(monkeypatch, outcome):
 
     _FakeStripeClient.intents = _FakeIntents(outcome)
     _FakeStripeClient.last_api_key = None
+    _FakeStripeClient.pm_customer = None
+    _FakeStripeClient.pm_lookup_raises = False
     monkeypatch.setattr(stripe, "StripeClient", _FakeStripeClient)
     return _FakeStripeClient.intents
 
@@ -219,3 +233,44 @@ async def test_test_lane_still_honors_real_pm_token(monkeypatch):
         payment_method="pm_card_mastercard",
     )
     assert intents.calls[0]["payload"]["payment_method"] == "pm_card_mastercard"
+
+
+# --- #1303: customer + mandate for off-session SCA cards ---
+@pytest.mark.asyncio
+async def test_pm_customer_is_passed_to_payment_intent(monkeypatch):
+    # A pm attached to a customer (via SetupIntent{customer, off_session}) must
+    # ride into the PaymentIntent so Stripe applies the mandate (SCA card succeeds).
+    intents = _install_stripe(monkeypatch, SimpleNamespace(id="pi_c", status="succeeded", amount=169, currency="usd"))
+    _install_merchant_key(monkeypatch, "sk_live_merch")
+    _FakeStripeClient.pm_customer = "cus_ABC"
+    r = await cap.capture_offsession(
+        merchant_id="m", amount_cents=169, currency="usd", idempotency_key="k",
+        payment_method="pm_real", allow_live=True, max_cents=500,
+    )
+    assert r.success is True
+    assert intents.calls[0]["payload"]["customer"] == "cus_ABC"
+
+
+@pytest.mark.asyncio
+async def test_no_customer_key_when_pm_unattached(monkeypatch):
+    # A bare pm with no customer (US/non-SCA card, or test PM) → no customer key.
+    intents = _install_stripe(monkeypatch, SimpleNamespace(id="pi_n", status="succeeded", amount=100, currency="usd"))
+    _install_merchant_key(monkeypatch, "sk_test_merch")
+    _FakeStripeClient.pm_customer = None
+    await cap.capture_offsession(
+        merchant_id="m", amount_cents=100, currency="usd", idempotency_key="k",
+    )
+    assert "customer" not in intents.calls[0]["payload"]
+
+
+@pytest.mark.asyncio
+async def test_pm_lookup_failure_still_charges_without_customer(monkeypatch):
+    # A payment_method.retrieve failure must not block the charge (best-effort).
+    intents = _install_stripe(monkeypatch, SimpleNamespace(id="pi_f", status="succeeded", amount=100, currency="usd"))
+    _install_merchant_key(monkeypatch, "sk_test_merch")
+    _FakeStripeClient.pm_lookup_raises = True
+    r = await cap.capture_offsession(
+        merchant_id="m", amount_cents=100, currency="usd", idempotency_key="k",
+    )
+    assert r.success is True
+    assert "customer" not in intents.calls[0]["payload"]
