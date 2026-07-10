@@ -35,8 +35,13 @@ from services.merchant_capability_resolver import resolve_merchant_capability
 from services.platform_capabilities import PROTOCOL_ACP
 
 # Platforms whose merchants can be driven by the ACP test-capture canary even
-# without a live PSP (the pivota-acp real-capture connector is Shopify-only).
-_ACP_TEST_CAPABLE_PLATFORMS = frozenset({"shopify"})
+# without a live PSP. Both now have a pivota-acp real-capture connector wired to
+# the shared backend quote→order(acp)→pay flow. This gates only the CANARY (flag +
+# allowlist); production ACP-capability is still governed per-platform by the
+# capability resolver (e.g. Wix order-writeback), so widening this set does NOT by
+# itself claim production readiness — it lets a Wix merchant be canary-tested
+# before that claim is made.
+_ACP_TEST_CAPABLE_PLATFORMS = frozenset({"shopify", "wix"})
 
 
 def _is_acp_test_canary(merchant_id: str, platform: Optional[str]) -> bool:

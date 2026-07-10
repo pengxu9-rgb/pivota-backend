@@ -80,9 +80,19 @@ async def test_test_capture_canary_scoped_to_allowlisted_merchant(monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_test_capture_canary_shopify_only(monkeypatch):
-    # Canary applies only to ACP-capable platforms (shopify); wix → redirect.
+async def test_test_capture_canary_includes_wix(monkeypatch):
+    # P-T2.3.6: wix now has a real-capture connector → canary-capable like shopify.
     _patch(monkeypatch, _cap([], platform="wix", psp=None),
+           strict=True, submit=True, merchants={"merch_x"}, test_capture=True)
+    d = await resolve_acp_lane_decision("merch_x")
+    assert d.lane == LANE_ACP_IN_CHAT
+    assert d.reason == REASON_ACP_ENABLED
+
+
+@pytest.mark.asyncio
+async def test_test_capture_canary_excludes_uncapable_platform(monkeypatch):
+    # A platform without a real-capture connector (e.g. woocommerce) → redirect.
+    _patch(monkeypatch, _cap([], platform="woocommerce", psp=None),
            strict=True, submit=True, merchants={"merch_x"}, test_capture=True)
     d = await resolve_acp_lane_decision("merch_x")
     assert d.lane == LANE_REDIRECT_FLOOR
