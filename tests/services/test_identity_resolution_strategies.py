@@ -162,6 +162,19 @@ class TestMultiSellerObservation:
         ]}
         assert strategy_multi_seller_observation([g]) == []
 
+    def test_multi_domain_seed_groups_get_labeled(self):
+        g = {"merchant_id": "external_seed", "content_key": "ck_1", "rows": [
+            {"product_key": "a", "platform": "external_seed",
+             "merchant_id": "external_seed", "source_product_id": "s1",
+             "source_domain": "theordinary.com"},
+            {"product_key": "b", "platform": "external_seed",
+             "merchant_id": "external_seed", "source_product_id": "s2",
+             "source_domain": "ulta.com"},
+        ]}
+        (p,) = strategy_multi_seller_observation([], [g])
+        assert p["kind"] == "label_only"
+        assert p["evidence"]["domains"] == ["theordinary.com", "ulta.com"]
+
 
 class TestBuildAll:
     def test_runs_every_strategy_and_dedupes_nothing_silently(self):

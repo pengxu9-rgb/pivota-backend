@@ -204,10 +204,25 @@ def strategy_junk_url(
 
 def strategy_multi_seller_observation(
     cross_groups: List[Dict[str, Any]],
+    multi_domain_groups: Optional[List[Dict[str, Any]]] = None,
 ) -> List[Dict[str, Any]]:
-    """Cross-merchant, NOT a dup store connection, no seed/first-party mix:
-    label as multi-seller so it is never mistaken for a dedup backlog."""
+    """Label groups that are multi-SELLER observations, never dedup backlog:
+    (a) cross-merchant groups that are neither a dup store connection nor a
+    seed/first-party twin; (b) same-pseudo-merchant multi-domain groups (the
+    external_seed brand+retailer pattern — theordinary+ulta, apple+bestbuy —
+    and same-brand regional storefronts, per the lane-4 review verdicts)."""
     proposals = []
+    for g in multi_domain_groups or []:
+        proposals.append(new_proposal(
+            kind="label_only",
+            strategy="multi_seller_observation",
+            subject_product_keys=[r["product_key"] for r in g["rows"]],
+            merchant_id=g.get("merchant_id"),
+            content_key=g["content_key"],
+            confidence=0.8,
+            evidence={"domains": sorted({
+                str(r.get("source_domain") or "") for r in g["rows"]})[:6]},
+        ))
     for g in cross_groups:
         spid_merchants: Dict[str, set] = defaultdict(set)
         for r in g["rows"]:
@@ -256,5 +271,6 @@ def build_all_proposals(
         "junk_url": strategy_junk_url(
             lanes.get("lane2_same_url", []) + lanes.get("lane3_campaign_clones", [])
             + lane4_same_merchant, detail_by_key),
-        "multi_seller_observation": strategy_multi_seller_observation(cross),
+        "multi_seller_observation": strategy_multi_seller_observation(
+            cross, lanes.get("lane4_multi_domain", [])),
     }

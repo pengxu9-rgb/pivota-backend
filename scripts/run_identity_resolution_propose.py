@@ -70,9 +70,12 @@ async def _run(write: bool) -> int:
         detail_by_key = {d["product_key"]: d for d in detail}
 
         per_strategy = build_all_proposals(report, detail_by_key)
-        summary: Dict[str, Any] = {
-            s: {"proposals": len(ps)} for s, ps in per_strategy.items()
-        }
+        summary: Dict[str, Any] = {}
+        for s, ps in per_strategy.items():
+            kinds: Dict[str, int] = {}
+            for p in ps:
+                kinds[p["kind"]] = kinds.get(p["kind"], 0) + 1
+            summary[s] = {"proposals": len(ps), "by_kind": kinds}
 
         if write:
             for s, ps in per_strategy.items():
