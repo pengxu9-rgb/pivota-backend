@@ -26,6 +26,17 @@ SIDEWAYS_QUERY_CLASSES = {"attribute", "objection", "sidewalk"}
 SIDEWAYS_AXES = {"attribute", "objection", "sidewalk"}
 HEAD_QUERY_CLASSES = {"category", "head"}
 HEAD_AXES = {"category", "head"}
+# LLM value-prop discovery prompts (extract_winnable_prompts + scenario
+# elicitation). They carry the coarse axis="category" like the head terms, but
+# are SPECIFIC by construction — anchored to the product's own differentiators.
+# They classify as sideways lanes (the winnable pool), never head pressure;
+# keying on axis alone put "bone conduction headphones for swimming without
+# phone" into do_not_chase_yet as a "broad category prompt".
+LLM_PROMPT_SOURCES = {"llm_winnable", "llm_scenario"}
+
+
+def _row_prompt_source(row: Mapping[str, Any]) -> str:
+    return str(row.get("prompt_source") or "").strip().lower()
 
 # Synthetic probe-query placeholder: when the real query generator falls short of
 # the requested prompt count it pads with `"<title> shopper question <n>"`
@@ -403,12 +414,19 @@ def lane_priority(
 
 
 def _is_sideways_wedge_lane(row: Mapping[str, Any]) -> bool:
+    if _row_prompt_source(row) in LLM_PROMPT_SOURCES:
+        return True
     query_class = _state(row.get("query_class"))
     axis = _state(row.get("axis"))
     return query_class in SIDEWAYS_QUERY_CLASSES or axis in SIDEWAYS_AXES
 
 
 def _is_head_prompt_pressure(row: Mapping[str, Any]) -> bool:
+    # A specific LLM discovery prompt is never head pressure, even when its
+    # phrasing starts with "best ..." — specificity comes from the generator
+    # contract (anchored to the product's own differentiators), not the prefix.
+    if _row_prompt_source(row) in LLM_PROMPT_SOURCES:
+        return False
     query_class = _state(row.get("query_class"))
     axis = _state(row.get("axis"))
     if query_class in HEAD_QUERY_CLASSES or axis in HEAD_AXES:
@@ -423,6 +441,7 @@ def _sideways_wedge_lane_chip(row: Mapping[str, Any], *, lane_type: str) -> Dict
         "lane_type": lane_type,
         "axis": row.get("axis"),
         "query_class": row.get("query_class"),
+        "prompt_source": row.get("prompt_source"),
         "ownership_state": row.get("ownership_state"),
         "source_route": row.get("source_route"),
         "controllers": _lane_controllers(row),

@@ -9191,22 +9191,36 @@ def _build_per_sku_audit_query_records(
     return records
 
 
+# Generator stamps for the LLM value-prop discovery prompts (winnable +
+# scenario-elicited). Threaded into axis_metadata as `prompt_source` so the
+# lane classifier (sku_lane_priority) can tell a SPECIFIC, content-grounded
+# discovery prompt from a generic head term — both carry the coarse
+# axis="category", which previously made the wedge classify winnable prompts
+# as head-prompt pressure and tell the merchant NOT to chase them.
+_LLM_PROMPT_SOURCES = frozenset({"llm_winnable", "llm_scenario"})
+
+
 def _query_metadata_from_records(
     records: List[Dict[str, Any]],
 ) -> Dict[str, Dict[str, Any]]:
     metadata: Dict[str, Dict[str, Any]] = {}
     for record in records:
-        if record.get("axis") != "sidewalk":
+        prompt_source = str(record.get("source") or "").strip()
+        is_llm_prompt = prompt_source in _LLM_PROMPT_SOURCES
+        if record.get("axis") != "sidewalk" and not is_llm_prompt:
             continue
         query = str(record.get("query") or "").strip()
         if not query:
             continue
-        metadata[query] = {
-            "axis": "sidewalk",
+        entry: Dict[str, Any] = {
+            "axis": str(record.get("axis") or "sidewalk"),
             "attribute_basis": list(record.get("attribute_basis") or []),
             "evidence": list(record.get("evidence") or []),
             "intent_weight": float(record.get("intent_weight") or 0.0),
         }
+        if is_llm_prompt:
+            entry["prompt_source"] = prompt_source
+        metadata[query] = entry
     return metadata
 
 
@@ -9372,6 +9386,12 @@ def _normalize_per_sku_probe_payload(
                     sidewalk_meta.get("intent_weight") or 0.0
                 ),
             })
+            # Generator stamp (llm_winnable / llm_scenario): lets the lane
+            # classifier tell a SPECIFIC LLM discovery prompt from a generic
+            # head term (both are axis="category"). Distinct key from the
+            # pipeline `source` set just above.
+            if sidewalk_meta.get("prompt_source"):
+                meta["prompt_source"] = str(sidewalk_meta["prompt_source"])
         row["axis_metadata"] = meta
         if not isinstance(row.get("url_match"), dict):
             row["url_match"] = {
