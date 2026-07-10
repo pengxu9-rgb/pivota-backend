@@ -1121,6 +1121,20 @@ def _competitors_for_runs(
             first_seen[normalized] = len(first_seen)
         counter[normalized] += int(row.get("times_cited") or 1)
 
+    # Dedup among observed names: case variants (Shokz/SHOKZ), 0-vs-o typo
+    # variants (H2O/H20 Audio), and product-names onto their observed brand
+    # (Suunto Aqua -> Suunto). Split counts also understated competitor
+    # durability (_durable_competitor needs a repeated name).
+    from services.competitor_brand_filter import canonicalize_competitor_counts
+
+    collapsed, alias_map = canonicalize_competitor_counts(dict(counter))
+    counter = Counter(collapsed)
+    display_first_seen: Dict[str, int] = {}
+    for raw_name, order in sorted(first_seen.items(), key=lambda item: item[1]):
+        display = alias_map.get(raw_name, raw_name)
+        display_first_seen.setdefault(display, order)
+    first_seen = display_first_seen
+
     names = [
         name
         for name, _count in sorted(

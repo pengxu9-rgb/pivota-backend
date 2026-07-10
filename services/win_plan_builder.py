@@ -180,17 +180,14 @@ def _target(
 
 
 def _competitor_benchmark(competitors_named: Any) -> List[str]:
-    out: List[str] = []
-    seen: set = set()
-    for name in competitors_named or []:
-        s = str(name or "").strip()
-        key = s.lower()
-        if s and key not in seen:
-            seen.add(key)
-            out.append(s)
-        if len(out) >= _MAX_COMPETITORS_PER_QUERY:
-            break
-    return out
+    # Shared competitor-name dedup (case variants, 0-vs-o typos, product-names
+    # onto their observed brand) so the win-plan benchmark matches the
+    # opportunity panels — was a plain lowercase dedupe that kept "H20 Audio"
+    # beside "H2O Audio" across panels.
+    from services.competitor_brand_filter import normalize_competitor_list
+
+    names = normalize_competitor_list(list(competitors_named or []))
+    return names[:_MAX_COMPETITORS_PER_QUERY]
 
 
 def _win_condition(query: str, targets: List[Dict[str, Any]]) -> Optional[str]:
