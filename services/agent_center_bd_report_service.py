@@ -5990,6 +5990,12 @@ def _failing_prompts(probe_runs: Any, cap: int = 20) -> List[Dict[str, Any]]:
             "axis": (run.get("axis_metadata") or {}).get("axis") if isinstance(run.get("axis_metadata"), dict) else None,
             "reason": "no first-party or correct-SKU grounded citation",
             "evidence_run_id": run.get("_probe_run_id"),
+            # Which engine this failing run came from — the win plan merges the
+            # per-provider rows for one query into ONE labeled row (they used
+            # to render as unlabeled duplicates with contradictory limits).
+            "provider": str(
+                run.get("_provider") or run.get("provider") or ""
+            ).strip().lower() or None,
             "grounding_sources": run.get("grounding_sources") or [],
             "competitors_named": parsed.get("competitors_listed") or parsed.get("competitors_appearing") or run.get("competitors_listed") or [],
         })
