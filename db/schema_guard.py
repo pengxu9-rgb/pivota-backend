@@ -1079,6 +1079,94 @@ async def ensure_required_schema_light() -> None:
                     "ON catalog_products (gtin) WHERE gtin IS NOT NULL;"
                 )
             )
+            # ADR-010 D-2 (mig 179): identity-resolution spine — proposals,
+            # append-only apply/revert events, provenance columns on
+            # product_group_members, and pdp_review_tasks moved into
+            # migrations. Additive only; dark until the Phase-A2 engine
+            # writes here (docs/plans/adr010_d2_catalog_reconciliation_
+            # at_scale.md). Railway skips db/migrations/, so self-heal here.
+            await database.execute(
+                text(
+                    """
+                    CREATE TABLE IF NOT EXISTS identity_resolution_proposals (
+                      proposal_id          TEXT PRIMARY KEY,
+                      proposal_key         TEXT NOT NULL,
+                      kind                 TEXT NOT NULL,
+                      strategy             TEXT NOT NULL,
+                      resolver_version     TEXT NOT NULL,
+                      merchant_id          TEXT NULL,
+                      content_key          TEXT NULL,
+                      subject_product_keys TEXT[] NOT NULL,
+                      keeper_product_key   TEXT NULL,
+                      member_fingerprint   TEXT NOT NULL,
+                      confidence           NUMERIC NULL,
+                      evidence             JSONB NULL,
+                      status               TEXT NOT NULL DEFAULT 'proposed',
+                      run_id               TEXT NULL,
+                      decided_by           TEXT NULL,
+                      created_at           TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                      decided_at           TIMESTAMPTZ NULL,
+                      applied_at           TIMESTAMPTZ NULL
+                    );
+                    """
+                )
+            )
+            await database.execute(
+                text(
+                    "CREATE UNIQUE INDEX IF NOT EXISTS uq_identity_resolution_proposals_key "
+                    "ON identity_resolution_proposals (proposal_key);"
+                )
+            )
+            await database.execute(
+                text(
+                    "CREATE INDEX IF NOT EXISTS idx_identity_resolution_proposals_status "
+                    "ON identity_resolution_proposals (status, strategy);"
+                )
+            )
+            await database.execute(
+                text(
+                    "CREATE INDEX IF NOT EXISTS idx_identity_resolution_proposals_content_key "
+                    "ON identity_resolution_proposals (content_key) "
+                    "WHERE content_key IS NOT NULL;"
+                )
+            )
+            await database.execute(
+                text(
+                    """
+                    CREATE TABLE IF NOT EXISTS identity_resolution_events (
+                      id           BIGSERIAL PRIMARY KEY,
+                      proposal_id  TEXT NULL,
+                      action       TEXT NOT NULL,
+                      run_id       TEXT NOT NULL,
+                      detail       JSONB NULL,
+                      created_at   TIMESTAMPTZ NOT NULL DEFAULT NOW()
+                    );
+                    """
+                )
+            )
+            await database.execute(
+                text(
+                    "CREATE INDEX IF NOT EXISTS idx_identity_resolution_events_run "
+                    "ON identity_resolution_events (run_id);"
+                )
+            )
+            await database.execute(
+                text(
+                    "CREATE INDEX IF NOT EXISTS idx_identity_resolution_events_proposal "
+                    "ON identity_resolution_events (proposal_id) "
+                    "WHERE proposal_id IS NOT NULL;"
+                )
+            )
+            await database.execute(
+                text(
+                    "ALTER TABLE IF EXISTS product_group_members "
+                    "ADD COLUMN IF NOT EXISTS match_tier TEXT NULL, "
+                    "ADD COLUMN IF NOT EXISTS confidence NUMERIC NULL, "
+                    "ADD COLUMN IF NOT EXISTS evidence JSONB NULL, "
+                    "ADD COLUMN IF NOT EXISTS resolver_version TEXT NULL, "
+                    "ADD COLUMN IF NOT EXISTS resolved_at TIMESTAMPTZ NULL;"
+                )
+            )
             # ---------------------------------------------------------------
             # schema-guard-coverage backfill (migrations 103-165).
             # Railway fast-mode skips db/migrations/, so every ADD COLUMN from
