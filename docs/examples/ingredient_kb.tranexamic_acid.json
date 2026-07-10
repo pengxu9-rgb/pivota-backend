@@ -1,0 +1,84 @@
+{
+  "_what_this_is": "Pivota-authored Tier-G ingredient KB entry for Tranexamic Acid (ADR-002 v2-lite format). Evidence grade B. All 2 citation(s) verified to resolve on PubMed/PMC via web search at authoring 2026-07-08. SEEDING NOTE: upsert into aurora_ingredient_research_kb via ingredientResearchKbStore.upsertIngredientResearchKbEntry, computing kb_key=buildIngredientResearchKbKey({query,lang:'EN',layer:'generic'}) for EACH of _kb_lookup_queries, status='ready', source_meta.tier='grounded' (REQUIRED - collectActives() skips entries whose source_meta.tier != 'grounded'). All served claim text is claim-safe (no treats/heals/anti-inflammatory/antibacterial - DRUG_RE drops those).",
+  "_kb_lookup_queries": [
+    "tranexamic acid"
+  ],
+  "_seed_source_meta": {
+    "tier": "grounded"
+  },
+  "usage": {
+    "notes": [
+      "Pairs well with niacinamide and vitamin C for tone.",
+      "SPF is non-negotiable."
+    ],
+    "pair_well": [
+      "niacinamide",
+      "vitamin c",
+      "sunscreen"
+    ],
+    "routine_step": "serum",
+    "consider_separating": []
+  },
+  "safety": {
+    "watchouts": [
+      {
+        "issue": "Recurrence without SPF",
+        "likelihood": "high",
+        "what_to_do": "Daily broad-spectrum SPF is essential — UV re-drives the pigmentation it addresses."
+      }
+    ],
+    "irritation_risk": "low"
+  },
+  "status": "ready",
+  "benefits": [
+    {
+      "concern": "stubborn patchy discoloration / melasma appearance",
+      "strength": 3,
+      "mechanism": "Tranexamic acid inhibits plasminogen activation in keratinocytes; because UV-triggered plasmin drives release of pigment-stimulating mediators, blocking it dampens the UV-and-vascular signalling that fuels excess melanin (mechanism study vs hydroquinone, PMC5574746).",
+      "what_it_means": "Visibly fades the look of stubborn, patchy discoloration (the melasma pattern) over 8-12 weeks."
+    },
+    {
+      "concern": "uneven tone / dullness",
+      "strength": 2,
+      "mechanism": "Reduced pigment-mediator signalling lowers baseline melanin deposition across the treated area (review, PMC4235096).",
+      "what_it_means": "Evens overall tone and brightens with continued use."
+    }
+  ],
+  "evidence": {
+    "grade": "B",
+    "summary": "Plasmin-pathway mechanism and topical efficacy for melasma-type pigmentation shown in randomized comparisons vs hydroquinone and mechanism reviews; graded B.",
+    "citations": [
+      {
+        "url": "https://pmc.ncbi.nlm.nih.gov/articles/PMC5574746/",
+        "year": 2017,
+        "title": "Therapeutic effects of topical tranexamic acid in comparison with hydroquinone in treatment of women with melasma",
+        "source": "PMC5574746"
+      },
+      {
+        "url": "https://pmc.ncbi.nlm.nih.gov/articles/PMC4235096/",
+        "year": 2014,
+        "title": "Topical tranexamic acid as a promising treatment for melasma",
+        "source": "PMC4235096"
+      }
+    ]
+  },
+  "overview": "Tranexamic acid targets the UV-and-vascular signalling that drives stubborn, patchy discoloration, making it a standout for the look of melasma-type pigmentation when paired with sun protection.",
+  "provider": "pivota_research",
+  "ingredient": {
+    "inci": "Tranexamic Acid",
+    "aliases": [
+      "txa"
+    ],
+    "what_it_is": "A small amino-acid derivative that has become a leading topical ingredient for stubborn, UV-driven discoloration such as melasma-type patches.",
+    "display_name": "Tranexamic Acid",
+    "marketing_vs_reality": [
+      {
+        "reality": "It visibly fades UV-driven discoloration with sustained use but does not erase it; melasma is recurrence-prone and daily SPF is essential to hold results.",
+        "evidence_type": "marketing_vs_reality",
+        "claim_in_market": "Tranexamic acid 'erases melasma'"
+      }
+    ]
+  },
+  "schema_version": "v2-lite",
+  "confidence_level": "high"
+}

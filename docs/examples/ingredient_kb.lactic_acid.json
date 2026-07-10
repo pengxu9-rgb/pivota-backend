@@ -1,0 +1,93 @@
+{
+  "_what_this_is": "Pivota-authored Tier-G ingredient KB entry for Lactic Acid (AHA) (ADR-002 v2-lite format). Evidence grade B. All 1 citation(s) verified to resolve on PubMed/PMC via web search at authoring 2026-07-08. SEEDING NOTE: upsert into aurora_ingredient_research_kb via ingredientResearchKbStore.upsertIngredientResearchKbEntry, computing kb_key=buildIngredientResearchKbKey({query,lang:'EN',layer:'generic'}) for EACH of _kb_lookup_queries, status='ready', source_meta.tier='grounded' (REQUIRED - collectActives() skips entries whose source_meta.tier != 'grounded'). All served claim text is claim-safe (no treats/heals/anti-inflammatory/antibacterial - DRUG_RE drops those).",
+  "_kb_lookup_queries": [
+    "lactic acid"
+  ],
+  "_seed_source_meta": {
+    "tier": "grounded"
+  },
+  "usage": {
+    "notes": [
+      "Gentlest mainstream AHA — good entry exfoliant.",
+      "SPF by day."
+    ],
+    "pair_well": [
+      "hyaluronic acid",
+      "ceramides",
+      "niacinamide"
+    ],
+    "routine_step": "toner_or_serum",
+    "consider_separating": [
+      "retinoid at the same step on sensitive skin"
+    ]
+  },
+  "safety": {
+    "watchouts": [
+      {
+        "issue": "Sun sensitivity",
+        "likelihood": "moderate",
+        "what_to_do": "Use daily broad-spectrum SPF."
+      },
+      {
+        "issue": "Stinging on compromised skin",
+        "likelihood": "low",
+        "what_to_do": "Lower strengths (5-10%) are well tolerated; patch test if reactive."
+      }
+    ],
+    "irritation_risk": "low_to_moderate"
+  },
+  "status": "ready",
+  "benefits": [
+    {
+      "concern": "dryness / rough texture on sensitive skin",
+      "strength": 3,
+      "mechanism": "Lactic acid promotes surface desquamation and, as a natural-moisturizing-factor component, increases stratum-corneum water content, so it exfoliates while supporting hydration; controlled AHA trials show improved photodamaged-skin appearance (PMID 8651713).",
+      "what_it_means": "Gently smooths and hydrates rough, dry skin — a milder alpha-hydroxy acid suited to sensitive or dehydrated skin."
+    },
+    {
+      "concern": "dullness / uneven tone",
+      "strength": 2,
+      "mechanism": "Gentle acceleration of surface turnover disperses surface pigment and refines the outer layer.",
+      "what_it_means": "Brightens dull skin and evens tone with gradual use."
+    },
+    {
+      "concern": "fine lines appearance",
+      "strength": 1,
+      "mechanism": "Chronic AHA exposure is associated with modest epidermal and dermal remodeling in controlled trials.",
+      "what_it_means": "Supportive smoothing of the look of fine surface lines over time."
+    }
+  ],
+  "evidence": {
+    "grade": "B",
+    "summary": "AHA surface-renewal and photodamage benefit shown in double-blind vehicle-controlled human trial (8% lactic arm); humectant role is established NMF chemistry. Graded B.",
+    "citations": [
+      {
+        "url": "https://pubmed.ncbi.nlm.nih.gov/8651713/",
+        "year": 1996,
+        "title": "Topical 8% glycolic acid and 8% L-lactic acid creams for the treatment of photodamaged skin: a double-blind vehicle-controlled clinical trial",
+        "source": "Archives of Dermatology (Stiller et al.); PMID 8651713"
+      }
+    ]
+  },
+  "overview": "Lactic acid gently smooths and hydrates rough, dry or sensitive skin: it promotes surface exfoliation while drawing water into the stratum corneum, making it the AHA of choice for dehydrated or reactive skin.",
+  "provider": "pivota_research",
+  "ingredient": {
+    "inci": "Lactic Acid",
+    "aliases": [
+      "aha",
+      "alpha hydroxy acid",
+      "2-hydroxypropanoic acid"
+    ],
+    "what_it_is": "A larger alpha-hydroxy acid (AHA) than glycolic, so it penetrates more slowly and gently. It is also a component of the skin’s natural moisturizing factor, so it doubles as a humectant.",
+    "display_name": "Lactic Acid (AHA)",
+    "marketing_vs_reality": [
+      {
+        "reality": "It does exfoliate more gently than glycolic because of its larger molecule, but it is also a natural-moisturizing-factor humectant, so it supports hydration at the same time — a dual role glycolic does not share.",
+        "evidence_type": "marketing_vs_reality",
+        "claim_in_market": "Lactic acid is 'just a gentler exfoliant'"
+      }
+    ]
+  },
+  "schema_version": "v2-lite",
+  "confidence_level": "high"
+}

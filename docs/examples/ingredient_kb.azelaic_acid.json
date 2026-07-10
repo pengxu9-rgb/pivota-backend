@@ -1,0 +1,83 @@
+{
+  "_what_this_is": "Pivota-authored Tier-G ingredient KB entry for Azelaic Acid (ADR-002 v2-lite format). Evidence grade B. All 2 citation(s) verified to resolve on PubMed/PMC via web search at authoring 2026-07-08. SEEDING NOTE: upsert into aurora_ingredient_research_kb via ingredientResearchKbStore.upsertIngredientResearchKbEntry, computing kb_key=buildIngredientResearchKbKey({query,lang:'EN',layer:'generic'}) for EACH of _kb_lookup_queries, status='ready', source_meta.tier='grounded' (REQUIRED - collectActives() skips entries whose source_meta.tier != 'grounded'). All served claim text is claim-safe (no treats/heals/anti-inflammatory/antibacterial - DRUG_RE drops those).",
+  "_kb_lookup_queries": [
+    "azelaic acid"
+  ],
+  "_seed_source_meta": {
+    "tier": "grounded"
+  },
+  "usage": {
+    "notes": [
+      "Well tolerated in deeper skin tones.",
+      "Judge tone at 8-12 weeks."
+    ],
+    "pair_well": [
+      "niacinamide",
+      "hyaluronic acid"
+    ],
+    "routine_step": "serum",
+    "consider_separating": []
+  },
+  "safety": {
+    "watchouts": [
+      {
+        "issue": "Tingling / transient itch on application",
+        "likelihood": "moderate",
+        "what_to_do": "A brief tingle is common early on and usually settles; start once daily and build to twice."
+      }
+    ],
+    "irritation_risk": "low_to_moderate"
+  },
+  "status": "ready",
+  "benefits": [
+    {
+      "concern": "uneven tone / dark marks / post-blemish marks",
+      "strength": 3,
+      "mechanism": "Azelaic acid is a competitive, reversible inhibitor of tyrosinase, the rate-limiting enzyme of melanin formation, and acts selectively on hyperactive melanocytes so normal skin tone is spared (mechanism review, PMC12517662).",
+      "what_it_means": "Fades the look of dark spots and evens uneven tone over 8-12 weeks, including in deeper skin tones."
+    },
+    {
+      "concern": "blemish-prone / bumpy uneven texture",
+      "strength": 2,
+      "mechanism": "It normalises the follicular keratinisation that contributes to congestion, smoothing surface texture (clinical review, PMC10809820).",
+      "what_it_means": "Refines the look of blemish-prone, bumpy skin and improves overall clarity."
+    }
+  ],
+  "evidence": {
+    "grade": "B",
+    "summary": "Tyrosinase-inhibition and selective-melanocyte mechanism established in peer-reviewed reviews and pigment-disorder studies; graded B for the tone/clarity cosmetic benefits (acne/rosacea therapeutic uses are out of cosmetic scope).",
+    "citations": [
+      {
+        "url": "https://pmc.ncbi.nlm.nih.gov/articles/PMC12517662/",
+        "year": 2024,
+        "title": "Azelaic acid in dermatology: a review of its mechanism of action",
+        "source": "PMC12517662"
+      },
+      {
+        "url": "https://pmc.ncbi.nlm.nih.gov/articles/PMC10809820/",
+        "year": 2023,
+        "title": "The multiple uses of azelaic acid in dermatology: mechanism of action, preparations, and potential therapeutic applications",
+        "source": "PMC10809820"
+      }
+    ]
+  },
+  "overview": "Azelaic acid evens uneven tone and softens the look of dark marks by selectively calming overactive pigment cells, while refining the look of blemish-prone, bumpy skin — well tolerated across skin tones.",
+  "provider": "pivota_research",
+  "ingredient": {
+    "inci": "Azelaic Acid",
+    "aliases": [
+      "nonanedioic acid"
+    ],
+    "what_it_is": "A naturally occurring dicarboxylic acid. In skin care it is valued for evening tone and refining the look of blemish-prone, uneven skin.",
+    "display_name": "Azelaic Acid",
+    "marketing_vs_reality": [
+      {
+        "reality": "It does not bleach. It selectively dampens overactive pigment-producing cells while leaving normal skin tone untouched, so it evens rather than lightens overall.",
+        "evidence_type": "marketing_vs_reality",
+        "claim_in_market": "Azelaic acid 'bleaches skin'"
+      }
+    ]
+  },
+  "schema_version": "v2-lite",
+  "confidence_level": "high"
+}
