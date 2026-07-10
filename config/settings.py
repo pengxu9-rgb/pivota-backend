@@ -401,9 +401,26 @@ class Settings(BaseSettings):
         os.getenv("AGENT_ACP_ALLOW_LIVE_CAPTURE", "false").strip().lower()
         in {"true", "1", "on", "yes"}
     )
-    agent_acp_live_capture_merchants: frozenset[str] = frozenset(
-        m.strip() for m in os.getenv("AGENT_ACP_LIVE_CAPTURE_MERCHANTS", "").split(",") if m.strip()
-    )
+    # #1308: stored as a raw string + parsed in a property (mirrors
+    # phase_c_enabled_markets) so pydantic-settings never tries to JSON-decode a
+    # frozenset from the env — a bare comma value (`merch_a,merch_b`) used to crash
+    # settings load / crash-loop the app. Tolerates a bare comma list AND a legacy
+    # JSON-array value (`["merch_a"]`), so no value can crash load.
+    agent_acp_live_capture_merchants_raw: str = os.getenv("AGENT_ACP_LIVE_CAPTURE_MERCHANTS", "")
+
+    @property
+    def agent_acp_live_capture_merchants(self) -> frozenset:
+        raw = (self.agent_acp_live_capture_merchants_raw or "").strip()
+        if not raw:
+            return frozenset()
+        if raw.startswith("["):
+            try:
+                import json
+                return frozenset(str(x).strip() for x in json.loads(raw) if str(x).strip())
+            except Exception:
+                pass  # fall through to comma-split for a malformed array
+        return frozenset(m.strip() for m in raw.split(",") if m.strip())
+
     agent_acp_live_max_cents: int = int(
         os.getenv("AGENT_ACP_LIVE_MAX_CENTS", "200") or "200"
     )
