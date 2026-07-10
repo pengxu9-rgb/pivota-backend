@@ -194,3 +194,28 @@ async def test_test_lane_still_hard_refuses_live_key(monkeypatch):
         merchant_id="m", amount_cents=100, currency="usd", idempotency_key="k",
     )
     assert r.success is False and r.error_code == "live_key_refused"
+
+
+@pytest.mark.asyncio
+async def test_test_lane_ignores_non_pm_token_forwarded_by_surface(monkeypatch):
+    # P-T2.3.5 pairing: the connector now forwards payment_data.token; a placeholder
+    # like "tok_test" must NOT become the PM on the test lane — fall back to the
+    # test PM so the proven test canary keeps working.
+    intents = _install_stripe(monkeypatch, SimpleNamespace(id="pi_t", status="succeeded", amount=169, currency="usd"))
+    _install_merchant_key(monkeypatch, "sk_test_merch")
+    await cap.capture_offsession(
+        merchant_id="m", amount_cents=169, currency="usd", idempotency_key="k",
+        payment_method="tok_test",
+    )
+    assert intents.calls[0]["payload"]["payment_method"] == "pm_card_visa"
+
+
+@pytest.mark.asyncio
+async def test_test_lane_still_honors_real_pm_token(monkeypatch):
+    intents = _install_stripe(monkeypatch, SimpleNamespace(id="pi_u", status="succeeded", amount=50, currency="usd"))
+    _install_merchant_key(monkeypatch, "sk_test_merch")
+    await cap.capture_offsession(
+        merchant_id="m", amount_cents=50, currency="usd", idempotency_key="k",
+        payment_method="pm_card_mastercard",
+    )
+    assert intents.calls[0]["payload"]["payment_method"] == "pm_card_mastercard"

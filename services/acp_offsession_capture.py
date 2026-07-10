@@ -111,7 +111,11 @@ async def capture_offsession(
                 "live_capture_requires_real_payment_method", "live_pm_required",
             )
     else:
-        pm = pm or DEFAULT_TEST_PAYMENT_METHOD
+        # Test lane: only honor a real Stripe payment method (pm_*). A placeholder
+        # or delegate token the surface may forward (e.g. "tok_test", "vt_*") is
+        # NOT a chargeable test PM, so fall back to the test PM — the test canary
+        # always charges a valid PM regardless of what token rode in.
+        pm = pm if pm.startswith("pm_") else DEFAULT_TEST_PAYMENT_METHOD
 
     # Resolve the MERCHANT's runtime Stripe key (merchant of record).
     try:
