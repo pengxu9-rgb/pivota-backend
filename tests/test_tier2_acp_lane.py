@@ -35,7 +35,7 @@ def _cap(protocols, *, platform="shopify", psp="stripe"):
 
 
 def _patch(monkeypatch, capability, *, strict=True, submit=False, merchants=frozenset(), test_capture=False):
-    async def fake_capability(mid):
+    async def fake_capability(mid, *, store_id=None, platform_override=None):
         return capability
 
     monkeypatch.setattr(lane, "resolve_merchant_capability", fake_capability)
@@ -138,7 +138,7 @@ async def test_allowlist_scopes_the_acp_lane_to_one_merchant(monkeypatch):
     assert d.lane == LANE_ACP_IN_CHAT
 
     # A different merchant, same capability, is NOT on the allowlist → redirect.
-    async def fake_capability_other(mid):
+    async def fake_capability_other(mid, *, store_id=None, platform_override=None):
         c = _cap(["acp"])
         c["merchant_id"] = "merch_other"
         return c
@@ -168,3 +168,32 @@ async def test_decision_serializes(monkeypatch):
     assert blob["lane"] == LANE_ACP_IN_CHAT
     assert blob["protocol"] == "acp"
     assert set(blob) >= {"lane", "reason", "merchant_id", "protocol", "platform", "psp", "capability", "kill_switch"}
+
+
+@pytest.mark.asyncio
+async def test_store_override_forwarded_selects_targeted_platform(monkeypatch):
+    """A multi-store merchant: primary resolves Shopify, but a platform_override
+    of 'wix' makes the resolver return the Wix store → the armed canary lights up
+    the ACP lane for Wix (the Wix connector), not Shopify."""
+    from config.settings import settings
+
+    async def fake_capability(mid, *, store_id=None, platform_override=None):
+        # Emulate the real resolver's store selection on a Shopify+Wix merchant.
+        platform = platform_override or "shopify"  # primary = shopify
+        return _cap([], platform=platform, psp=None)
+
+    monkeypatch.setattr(lane, "resolve_merchant_capability", fake_capability)
+    monkeypatch.setattr(settings, "agent_checkout_strict", True, raising=False)
+    monkeypatch.setattr(settings, "agent_submit_payment_enabled", True, raising=False)
+    monkeypatch.setattr(settings, "agent_submit_payment_merchants", frozenset({"merch_x"}), raising=False)
+    monkeypatch.setattr(settings, "agent_acp_test_capture", True, raising=False)
+
+    # No override → primary Shopify still canary-capable.
+    d_default = await resolve_acp_lane_decision("merch_x")
+    assert d_default.lane == LANE_ACP_IN_CHAT
+    assert d_default.platform == "shopify"
+
+    # Override → Wix store targeted.
+    d_wix = await resolve_acp_lane_decision("merch_x", platform_override="wix")
+    assert d_wix.lane == LANE_ACP_IN_CHAT
+    assert d_wix.platform == "wix"

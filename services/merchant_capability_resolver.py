@@ -29,7 +29,7 @@ from urllib.parse import urlparse
 from db.database import database
 from db.merchant_onboarding import get_merchant_onboarding
 from services.merchant_psp_config_service import evaluate_psp_readiness
-from services.merchant_store_service import get_primary_store
+from services.merchant_store_service import get_merchant_active_stores, get_primary_store
 from services.platform_capabilities import get_platform_protocols
 
 logger = logging.getLogger("merchant_capability_resolver")
@@ -123,7 +123,49 @@ async def _resolve_live_psp_provider(merchant_id: str) -> Optional[str]:
     return None
 
 
-async def resolve_merchant_capability(merchant_id: str) -> Dict[str, Any]:
+async def _select_target_store(
+    merchant_id: str,
+    *,
+    store_id: Optional[str],
+    platform_override: Optional[str],
+) -> Optional[Dict[str, Any]]:
+    """Pick the connected store to resolve capability against.
+
+    With no selector → the primary store (existing behavior). With a `store_id` or
+    `platform` selector → the merchant's matching *active* store (store_id wins;
+    else first store on that platform). A selector that matches no active store
+    returns None so the caller resolves to the redirect floor — the override only
+    ever narrows to a store the merchant genuinely has, never fabricates one.
+    """
+    sid = str(store_id or "").strip()
+    plat = str(platform_override or "").strip().lower()
+    if not sid and not plat:
+        return await get_primary_store(merchant_id)
+    try:
+        stores = await get_merchant_active_stores(merchant_id)
+    except Exception as exc:  # noqa: BLE001 — never break routing on a store read
+        logger.warning(
+            "capability_resolver: active-store lookup failed merchant_id=%s: %s",
+            merchant_id, str(exc)[:200],
+        )
+        return None
+    if sid:
+        for s in stores or []:
+            if str((s or {}).get("store_id") or "").strip() == sid:
+                return s
+        return None  # named a store_id this merchant doesn't have → honest miss
+    for s in stores or []:
+        if str((s or {}).get("platform") or "").strip().lower() == plat:
+            return s
+    return None  # named a platform this merchant has no active store on
+
+
+async def resolve_merchant_capability(
+    merchant_id: str,
+    *,
+    store_id: Optional[str] = None,
+    platform_override: Optional[str] = None,
+) -> Dict[str, Any]:
     """Resolve `{platform, psp, protocols[]}` for Tier-2 routing.
 
     Always returns a dict (never raises); ``platform`` is a slug or ``"unknown"``,
@@ -131,8 +173,16 @@ async def resolve_merchant_capability(merchant_id: str) -> Dict[str, Any]:
     ``platform_source`` records how the platform was resolved (connected store,
     domain fingerprint, or unknown) so callers/telemetry can distinguish a
     high-confidence connected platform from a fingerprinted crawl merchant.
+
+    `store_id` / `platform_override` optionally select which connected store to
+    resolve against (else the primary store). A selector that matches no active
+    store resolves to ``"unknown"`` (redirect floor) — it never falls back to a
+    *different* store than asked for, and never fabricates a platform.
     """
     merchant_id = str(merchant_id or "").strip()
+    selector_requested = bool(
+        str(store_id or "").strip() or str(platform_override or "").strip()
+    )
     if not merchant_id:
         return {
             "merchant_id": merchant_id,
@@ -143,7 +193,26 @@ async def resolve_merchant_capability(merchant_id: str) -> Dict[str, Any]:
             "protocols": [],
         }
 
-    store = await get_primary_store(merchant_id)
+    store = await _select_target_store(
+        merchant_id, store_id=store_id, platform_override=platform_override
+    )
+    if selector_requested and store is None:
+        # Override named a store/platform this merchant has no active store on →
+        # honest unknown. Do NOT fingerprint or fall back to primary: that would
+        # silently check out against a different store than requested.
+        return {
+            "merchant_id": merchant_id,
+            "platform": PLATFORM_SOURCE_UNKNOWN,
+            "platform_source": PLATFORM_SOURCE_UNKNOWN,
+            "psp": None,
+            "has_live_psp": False,
+            "protocols": [],
+            "store_selector": {
+                "store_id": str(store_id or "").strip() or None,
+                "platform": str(platform_override or "").strip().lower() or None,
+                "matched": False,
+            },
+        }
     merchant = await get_merchant_onboarding(merchant_id)
 
     platform = str(
@@ -170,7 +239,7 @@ async def resolve_merchant_capability(merchant_id: str) -> Dict[str, Any]:
     has_live_psp = bool(live_psp)
     protocols: List[str] = get_platform_protocols(platform, has_live_psp=has_live_psp)
 
-    return {
+    result: Dict[str, Any] = {
         "merchant_id": merchant_id,
         "platform": platform or PLATFORM_SOURCE_UNKNOWN,
         "platform_source": platform_source or PLATFORM_SOURCE_UNKNOWN,
@@ -178,3 +247,11 @@ async def resolve_merchant_capability(merchant_id: str) -> Dict[str, Any]:
         "has_live_psp": has_live_psp,
         "protocols": protocols,
     }
+    if selector_requested:
+        result["store_selector"] = {
+            "store_id": str(store_id or "").strip() or None,
+            "platform": str(platform_override or "").strip().lower() or None,
+            "matched": True,
+            "resolved_store_id": str((store or {}).get("store_id") or "").strip() or None,
+        }
+    return result

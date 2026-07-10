@@ -94,9 +94,20 @@ class AcpLaneDecision:
         }
 
 
-async def resolve_acp_lane_decision(merchant_id: str) -> AcpLaneDecision:
+async def resolve_acp_lane_decision(
+    merchant_id: str,
+    *,
+    store_id: Optional[str] = None,
+    platform_override: Optional[str] = None,
+) -> AcpLaneDecision:
     """Decide the checkout lane for `merchant_id`. Always returns a decision;
-    never raises (any resolution error falls open to the redirect floor)."""
+    never raises (any resolution error falls open to the redirect floor).
+
+    `store_id` / `platform_override` optionally select which of the merchant's
+    connected stores to resolve capability against (else the primary store). This
+    only narrows to a store the merchant actually has connected; a selector that
+    matches no active store resolves to the redirect floor (honest, never a
+    fabricated platform)."""
     mid = str(merchant_id or "").strip()
 
     def _redirect(reason: str, *, capability=None, kill_switch=None) -> AcpLaneDecision:
@@ -112,7 +123,9 @@ async def resolve_acp_lane_decision(merchant_id: str) -> AcpLaneDecision:
         )
 
     try:
-        capability = await resolve_merchant_capability(mid)
+        capability = await resolve_merchant_capability(
+            mid, store_id=store_id, platform_override=platform_override
+        )
     except Exception as exc:  # noqa: BLE001 — routing must never break; fall to floor
         logger.warning(
             "tier2_acp_lane: capability resolve failed merchant_id=%s: %s — "

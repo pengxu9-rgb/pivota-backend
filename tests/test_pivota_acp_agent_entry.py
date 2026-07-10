@@ -138,7 +138,7 @@ def _decision(is_acp: bool):
 async def test_endpoint_routes_to_redirect_when_not_acp(monkeypatch):
     from routes import agent_checkout_intents as m
 
-    async def fake_decision(mid):
+    async def fake_decision(mid, *, store_id=None, platform_override=None):
         return _decision(is_acp=False)
 
     monkeypatch.setattr(m, "resolve_acp_lane_decision", fake_decision)
@@ -152,7 +152,7 @@ async def test_endpoint_routes_to_redirect_when_not_acp(monkeypatch):
 async def test_endpoint_redirects_when_integration_disabled(monkeypatch):
     from routes import agent_checkout_intents as m
 
-    async def fake_decision(mid):
+    async def fake_decision(mid, *, store_id=None, platform_override=None):
         return _decision(is_acp=True)
 
     monkeypatch.setattr(m, "resolve_acp_lane_decision", fake_decision)
@@ -167,7 +167,7 @@ async def test_endpoint_creates_acp_session_when_enabled(monkeypatch):
     from routes import agent_checkout_intents as m
     from services.pivota_acp_client import AcpSession
 
-    async def fake_decision(mid):
+    async def fake_decision(mid, *, store_id=None, platform_override=None):
         return _decision(is_acp=True)
 
     async def fake_session(**kwargs):
@@ -196,7 +196,7 @@ async def test_endpoint_fails_open_to_redirect_on_acp_error(monkeypatch):
     from routes import agent_checkout_intents as m
     from services.pivota_acp_client import AcpClientError
 
-    async def fake_decision(mid):
+    async def fake_decision(mid, *, store_id=None, platform_override=None):
         return _decision(is_acp=True)
 
     async def boom(**kwargs):
