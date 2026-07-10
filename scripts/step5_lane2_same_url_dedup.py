@@ -61,7 +61,7 @@ SUPPRESSION_REASON = "step5_same_merchant_same_url_dup"
 DETAIL_SQL = """
 SELECT cp.product_key, cp.merchant_id, cp.content_key, cp.platform,
        cp.canonical_url, cp.source_ref, cp.pivota_signature_id,
-       cp.created_at,
+       cp.title, cp.created_at,
        length(coalesce(cp.product_payload::text, '')) AS payload_bytes,
        pgm.is_primary AS group_is_primary
 FROM catalog_products cp
