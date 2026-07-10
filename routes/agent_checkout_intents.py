@@ -572,6 +572,14 @@ class CreateAcpCheckoutRequest(BaseModel):
     pvt_click_id: Optional[str] = Field(None, description="Attribution click id to thread through the ACP session")
     pvt_surface: Optional[str] = Field(None, description="Origin surface (e.g. chatgpt)")
     source: Optional[str] = None
+    # Store/platform override — selects WHICH of the merchant's connected stores
+    # the lane resolves capability against, instead of the default primary store.
+    # Only ever narrows to a store the merchant actually has connected (never
+    # fabricates capability); a selector that matches no active store resolves to
+    # the redirect floor. Chief use: exercise a specific platform's connector on a
+    # multi-store merchant (e.g. the Wix store when a Shopify store is primary).
+    store_id: Optional[str] = Field(None, description="Connected store_id to check out against (overrides primary store)")
+    platform: Optional[str] = Field(None, description="Connected store platform to check out against, e.g. 'wix' (overrides primary store; store_id wins if both given)")
 
 
 def _redirect_fallback(merchant_id: str, *, reason: str, platform: Optional[str] = None) -> Dict[str, Any]:
@@ -612,8 +620,14 @@ async def create_acp_checkout(
         raise HTTPException(status_code=403, detail="Not authorized for this merchant")
 
     # Capability + kill-switch gate (P-T2.3.1). Fail-open to redirect for anything
-    # short of "ACP-capable AND charge-permitted for this merchant".
-    decision = await resolve_acp_lane_decision(merchant_id)
+    # short of "ACP-capable AND charge-permitted for this merchant". An optional
+    # store/platform override selects which connected store to resolve against
+    # (else the primary store) — narrows only, never fabricates capability.
+    decision = await resolve_acp_lane_decision(
+        merchant_id,
+        store_id=req.store_id,
+        platform_override=req.platform,
+    )
     if not decision.is_acp:
         return _redirect_fallback(merchant_id, reason=decision.reason, platform=decision.platform)
 

@@ -161,3 +161,97 @@ async def test_resolve_blank_merchant_id_is_safe():
     assert cap["platform"] == "unknown"
     assert cap["protocols"] == []
     assert cap["has_live_psp"] is False
+
+
+# --- store/platform override (multi-store canary targeting) ------------------
+
+def _patch_multistore(monkeypatch, *, live_psp="stripe"):
+    """merch with BOTH a Shopify (primary) and a Wix store connected."""
+    from services import merchant_capability_resolver as res
+
+    shopify = {"store_id": "st_shop", "platform": "shopify", "status": "active",
+               "domain": "brand.myshopify.com"}
+    wix = {"store_id": "st_wix", "platform": "wix", "status": "active",
+           "domain": "brand.wixsite.com"}
+
+    async def fake_primary(mid):
+        return shopify  # primary = Shopify
+
+    async def fake_active(mid):
+        return [shopify, wix]
+
+    async def fake_onboarding(mid):
+        return {}
+
+    async def fake_live_psp(mid):
+        return live_psp
+
+    monkeypatch.setattr(res, "get_primary_store", fake_primary)
+    monkeypatch.setattr(res, "get_merchant_active_stores", fake_active)
+    monkeypatch.setattr(res, "get_merchant_onboarding", fake_onboarding)
+    monkeypatch.setattr(res, "_resolve_live_psp_provider", fake_live_psp)
+
+
+@pytest.mark.asyncio
+async def test_override_defaults_to_primary_store(monkeypatch):
+    from services.merchant_capability_resolver import resolve_merchant_capability
+    _patch_multistore(monkeypatch)
+
+    cap = await resolve_merchant_capability("m")  # no selector
+    assert cap["platform"] == "shopify"
+    assert "store_selector" not in cap
+
+
+@pytest.mark.asyncio
+async def test_override_by_platform_selects_wix(monkeypatch):
+    from services.merchant_capability_resolver import resolve_merchant_capability
+    _patch_multistore(monkeypatch)
+
+    cap = await resolve_merchant_capability("m", platform_override="wix")
+    assert cap["platform"] == "wix"
+    assert cap["platform_source"] == "connected"
+    assert cap["store_selector"]["matched"] is True
+    assert cap["store_selector"]["resolved_store_id"] == "st_wix"
+
+
+@pytest.mark.asyncio
+async def test_override_by_store_id_selects_wix(monkeypatch):
+    from services.merchant_capability_resolver import resolve_merchant_capability
+    _patch_multistore(monkeypatch)
+
+    cap = await resolve_merchant_capability("m", store_id="st_wix")
+    assert cap["platform"] == "wix"
+    assert cap["store_selector"]["resolved_store_id"] == "st_wix"
+
+
+@pytest.mark.asyncio
+async def test_override_store_id_wins_over_platform(monkeypatch):
+    from services.merchant_capability_resolver import resolve_merchant_capability
+    _patch_multistore(monkeypatch)
+
+    # store_id points at Shopify, platform says wix → store_id wins.
+    cap = await resolve_merchant_capability("m", store_id="st_shop", platform_override="wix")
+    assert cap["platform"] == "shopify"
+    assert cap["store_selector"]["resolved_store_id"] == "st_shop"
+
+
+@pytest.mark.asyncio
+async def test_override_unmatched_is_honest_unknown(monkeypatch):
+    from services.merchant_capability_resolver import resolve_merchant_capability
+    _patch_multistore(monkeypatch)
+
+    # Merchant has no BigCommerce store → must NOT fall back to primary/fingerprint.
+    cap = await resolve_merchant_capability("m", platform_override="bigcommerce")
+    assert cap["platform"] == "unknown"
+    assert cap["protocols"] == []
+    assert cap["store_selector"]["matched"] is False
+
+
+@pytest.mark.asyncio
+async def test_override_unmatched_store_id_is_honest_unknown(monkeypatch):
+    from services.merchant_capability_resolver import resolve_merchant_capability
+    _patch_multistore(monkeypatch)
+
+    cap = await resolve_merchant_capability("m", store_id="st_nope")
+    assert cap["platform"] == "unknown"
+    assert cap["store_selector"]["matched"] is False
