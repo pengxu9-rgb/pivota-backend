@@ -67,14 +67,29 @@ async def capture_offsession(
     payment_method: Optional[str] = None,
     metadata: Optional[Dict[str, Any]] = None,
     max_cents: Optional[int] = None,
+    allow_live: bool = False,
 ) -> OffSessionCaptureResult:
     """Create + confirm an off_session PaymentIntent on the merchant's Stripe key.
 
-    Returns a normalized result; never raises. `payment_method` defaults to the
-    Stripe test PM for the canary. `max_cents` defaults to the configured ACP
-    test cap (defense-in-depth against the caller).
+    Returns a normalized result; never raises.
+
+    Two lanes:
+    - test lane (`allow_live=False`, default): `payment_method` defaults to the
+      Stripe test PM and a LIVE merchant key is HARD-REFUSED (the canary must run
+      test-mode). This is the proven P-T2.3.3 path.
+    - live lane (`allow_live=True`, P-T2.3.5): a live merchant key is permitted
+      and a REAL buyer payment method is REQUIRED (the test PM is refused — it
+      can't charge a live key). The caller must have cleared the separate live
+      gate (`resolve_acp_live_capture`) first; this flag only relaxes the
+      test-lane refusal, it does not itself authorize anything.
+
+    `max_cents` defaults to the configured test cap; the live lane caller passes
+    the (lower) live cap. Either way it's a belt-and-suspenders check on top of
+    the caller's cap.
     """
-    cap = settings.agent_acp_test_max_cents if max_cents is None else int(max_cents)
+    cap = (
+        settings.agent_acp_test_max_cents if max_cents is None else int(max_cents)
+    )
     try:
         amount_cents = int(amount_cents)
     except (TypeError, ValueError):
@@ -85,7 +100,18 @@ async def capture_offsession(
         # Should never reach here (caller caps first), but refuse hard regardless.
         return _fail(amount_cents, currency, f"amount_exceeds_cap:{cap}", "over_cap")
 
-    pm = str(payment_method or "").strip() or DEFAULT_TEST_PAYMENT_METHOD
+    # Payment method: the test lane may default to Stripe's test PM; the live lane
+    # MUST carry a real buyer-provided pm_ (a test PM would fail on a live key, and
+    # silently defaulting to it on the live lane would be dangerously misleading).
+    pm = str(payment_method or "").strip()
+    if allow_live:
+        if not pm or pm == DEFAULT_TEST_PAYMENT_METHOD:
+            return _fail(
+                amount_cents, currency,
+                "live_capture_requires_real_payment_method", "live_pm_required",
+            )
+    else:
+        pm = pm or DEFAULT_TEST_PAYMENT_METHOD
 
     # Resolve the MERCHANT's runtime Stripe key (merchant of record).
     try:
@@ -96,11 +122,17 @@ async def capture_offsession(
     api_key = str((row or {}).get("api_key") or (row or {}).get("secret_key") or "").strip()
     if not api_key:
         return _fail(amount_cents, currency, "merchant_stripe_key_unresolved", "no_merchant_psp")
-    # Hard refuse to charge a LIVE key from this test-only path (defense-in-depth:
-    # the canary must run on a test key; a live key here is a misconfiguration).
-    if api_key.startswith("sk_live_") or api_key.startswith("rk_live_"):
+    key_is_live = api_key.startswith("sk_live_") or api_key.startswith("rk_live_")
+    if not allow_live and key_is_live:
+        # Test lane: a live key is a misconfiguration — hard refuse (the canary
+        # must run on a test key). This is the P-T2.3.3 defense-in-depth guard.
         logger.error("acp_offsession: REFUSING live Stripe key in test-capture lane merchant_id=%s", merchant_id)
         return _fail(amount_cents, currency, "live_key_in_test_lane", "live_key_refused")
+    if allow_live and not key_is_live:
+        # Live lane armed but the merchant key is test-mode: refuse rather than
+        # move $0 while reporting a "live" capture (honest + fail-closed).
+        logger.error("acp_offsession: live lane requires a live merchant key merchant_id=%s", merchant_id)
+        return _fail(amount_cents, currency, "live_lane_requires_live_key", "live_key_required")
 
     try:
         import stripe  # local import: keep module import-safe without stripe configured
@@ -114,7 +146,10 @@ async def capture_offsession(
                 "payment_method": pm,
                 "off_session": True,
                 "confirm": True,
-                "metadata": {**(metadata or {}), "pivota_acp_test_capture": "true"},
+                "metadata": {
+                    **(metadata or {}),
+                    ("pivota_acp_live_capture" if allow_live else "pivota_acp_test_capture"): "true",
+                },
             },
             {"idempotency_key": str(idempotency_key)},
         )

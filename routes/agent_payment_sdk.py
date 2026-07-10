@@ -805,6 +805,42 @@ async def create_payment(
                 request.order_id, _acp_amount_cents, acp_test_capture.max_cents,
             )
 
+        # P-T2.3.5: scoped LIVE-money capture. A SEPARATE, stricter gate than the
+        # test lane — its own master switch + required per-merchant allowlist + a
+        # low cap. Engages only when the kill-switch already permits, the flag is
+        # on, and the merchant is allowlisted. Over-cap engaged charges are refused
+        # (never downgraded). Default off → engaged=False → nothing changes.
+        from services.agent_checkout_kill_switch import resolve_acp_live_capture
+
+        acp_live_capture = resolve_acp_live_capture(
+            order_metadata.get("protocol_name"),
+            merchant_id=str(merchant_id),
+            amount_cents=_acp_amount_cents,
+            kill_switch_allowed=kill_switch.allowed,
+        )
+        if acp_live_capture.engaged and not acp_live_capture.within_cap:
+            logger.warning(
+                "[AgentPayments] ACP LIVE-money capture REFUSED (over cap) order=%s "
+                "amount_cents=%s cap=%s",
+                request.order_id, _acp_amount_cents, acp_live_capture.max_cents,
+            )
+            raise HTTPException(
+                status_code=403,
+                detail={
+                    "error": "TIER2_LIVE_CAPTURE_OVER_CAP",
+                    "amount_cents": _acp_amount_cents,
+                    "max_cents": acp_live_capture.max_cents,
+                    "message": "ACP live-money capture exceeds the configured live amount cap.",
+                },
+            )
+        if acp_live_capture.allow_live:
+            logger.warning(
+                "[AgentPayments] ACP LIVE-MONEY capture lane engaged order=%s "
+                "amount_cents=%s cap=%s merchant=%s — REAL money on the merchant's "
+                "live PSP (P-T2.3.5 canary)",
+                request.order_id, _acp_amount_cents, acp_live_capture.max_cents, merchant_id,
+            )
+
         payment_flow = order_metadata.get("payment_flow") if isinstance(order_metadata.get("payment_flow"), dict) else {}
         auth_first_psp = str((payment_flow or {}).get("psp") or "").strip().lower()
         auth_first_manual_capture = (
@@ -891,7 +927,11 @@ async def create_payment(
         # off-session capture on the MERCHANT's test Stripe key (the shared path
         # only client-confirms, which can't complete an in-chat charge). Isolated,
         # amount-capped, idempotent. All other charges keep the failover path.
-        _acp_offsession = acp_test_capture.bypass_live_readiness
+        # The off-session lane runs for either the test-capture canary OR the
+        # live-money canary. `_acp_allow_live` switches capture_offsession into the
+        # live lane (live key permitted, real payment method required, live cap).
+        _acp_allow_live = acp_live_capture.allow_live
+        _acp_offsession = acp_test_capture.bypass_live_readiness or _acp_allow_live
         if _acp_offsession:
             from services.acp_offsession_capture import capture_offsession
 
@@ -910,6 +950,8 @@ async def create_payment(
                         if order_metadata.get(k)
                     },
                 },
+                allow_live=_acp_allow_live,
+                max_cents=(acp_live_capture.max_cents if _acp_allow_live else None),
             )
             success = _oc.success
             error = _oc.error
@@ -1078,7 +1120,7 @@ async def create_payment(
                     currency=str(currency),
                     source_event="acp_offsession_capture",
                     metadata_extra={
-                        "acp_test_capture": True,
+                        ("acp_live_capture" if _acp_allow_live else "acp_test_capture"): True,
                         "protocol_name": order_metadata.get("protocol_name"),
                     },
                     update_payment_info_fn=update_payment_info,
