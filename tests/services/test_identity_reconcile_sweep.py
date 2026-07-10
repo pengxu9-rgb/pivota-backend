@@ -181,3 +181,19 @@ class TestJudgeWiring:
                    "reasoning": "r", "judge_version": "tier3.v2"}
         p = build_judge_proposal(source, details, verdict)
         assert p["keeper_product_key"] == "a"  # signed wins within all-junk
+
+
+class TestDemoExclusion:
+    def test_gauges_exclude_demo_storefronts(self):
+        # The demo pair is the live Shopify app-review rig: rows keep serving
+        # (catalog_track untouched — it is a serving classification enum),
+        # but the reconciliation scoreboard must not count them.
+        from services.identity_reconcile_sweep import GAUGES_SQL
+        for sql in GAUGES_SQL.values():
+            assert "pivota-review-demo" in sql
+
+    def test_predicate_is_shared_not_redefined(self):
+        from scripts.step5_working_set import DEMO_EXCLUSION_SQL
+        from services.identity_reconcile_sweep import GAUGES_SQL
+        for sql in GAUGES_SQL.values():
+            assert DEMO_EXCLUSION_SQL in sql

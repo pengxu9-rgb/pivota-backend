@@ -57,18 +57,25 @@ logger = logging.getLogger("identity_reconcile_sweep")
 # config change: it is deliberately a code constant with a test pinning it.
 AUTO_APPROVE_STRATEGIES: Tuple[str, ...] = ("same_url_dup", "junk_url")
 
+# Gauges exclude the demo/app-review storefronts (shared predicate — see
+# DEMO_EXCLUSION_SQL's comment for why catalog_track is NOT the label), so
+# the scoreboard reads the production catalog only.
+from scripts.step5_working_set import DEMO_EXCLUSION_SQL  # noqa: E402
+
 GAUGES_SQL = {
-    "same_merchant_dup_keys": """
+    "same_merchant_dup_keys": f"""
         SELECT COUNT(*) FROM (
             SELECT content_key FROM catalog_products
             WHERE content_key IS NOT NULL AND suppression_reason IS NULL
+              AND {DEMO_EXCLUSION_SQL}
             GROUP BY content_key, merchant_id HAVING COUNT(*) > 1
         ) t
     """,
-    "cross_merchant_shared_keys": """
+    "cross_merchant_shared_keys": f"""
         SELECT COUNT(*) FROM (
             SELECT content_key FROM catalog_products
             WHERE content_key IS NOT NULL AND suppression_reason IS NULL
+              AND {DEMO_EXCLUSION_SQL}
             GROUP BY content_key HAVING COUNT(DISTINCT merchant_id) > 1
         ) t
     """,
