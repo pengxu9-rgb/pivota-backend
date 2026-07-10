@@ -129,6 +129,29 @@ Ordered; none started beyond the tooling:
   `db/schema_guard.py` (self-heal); `scripts/backfill_catalog_products_gtin.py`;
   `tests/services/test_intake_identity*.py`, `tests/test_catalog_products_writer_tripwire.py`.
 
+## 7. Update 2026-07-10 — first organic traffic burst (verified read-only)
+
+Hours after this snapshot, the sync door woke up (2026-07-09 16:53–22:54 UTC)
+and processed its first organic batch. Results:
+
+- **924 organic events**: catalog_sync 879 ATTACH + 40 MINT; url_audit_intake
+  4 ATTACH + 1 MINT. MINT is now prod-observed; FLAG/SKIP remain unit-only.
+- **Duplication metric held at exact plateau** (canonical
+  `measure_identity_duplication.py` definitions): same-merchant dup keys
+  **1,076** (unchanged), cross-merchant shares **374** (unchanged), and no dup
+  key gained a member row created ≥ 2026-07-09. First live evidence the
+  intake fix stops new fragmentation under real traffic.
+- Catalog: 11,002 keyed rows (+1 — the url_audit MINT), 8,287 content_keys,
+  9 merchants. `gtin` still 0 populated (batch carried no barcodes — expected).
+- **Observation worth a follow-up:** all 40 sync MINTs are the Wix door's
+  rows with `brand: null` → `reason: no_identity_inputs` — the fail-open path
+  minting with **no content_key** (these are the ~20 perpetually-unkeyed wix
+  rows, hit by two sync ticks). Wix intake never yields identity keys until
+  brand extraction (or a merchant/store-name fallback) exists for that
+  platform. Low volume today (20 rows) but it re-fires every sync tick.
+- Ops note confirmed: the pooled `database.connect()` path timed out against
+  the public proxy exactly as §6 warns; the single-conn retry recipe worked.
+
 ## TL;DR
 Contract shipped and merged; SPU model (GTIN as attribute, not key); all five
 doors enabled in prod and the primitive is validated live (clean idempotent
