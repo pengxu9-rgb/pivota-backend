@@ -158,10 +158,22 @@ def normalize_provider_config(
             or ""
         ).strip()
         client_key = str(config.get("client_key") or config.get("clientKey") or "").strip()
+        # P-T2.3.7 item 4: Adyen's LIVE Checkout endpoint is per-merchant —
+        # https://{prefix}-checkout-live.adyenpayments.com/... — so the live URL
+        # prefix (from the merchant's Customer Area) must be stored for a live
+        # off-session capture. Test mode uses the shared host and needs none.
+        live_url_prefix = str(
+            config.get("live_url_prefix")
+            or config.get("liveUrlPrefix")
+            or config.get("endpoint_prefix")
+            or ""
+        ).strip()
         normalized = {
             "merchant_account": merchant_account or None,
             "client_key": client_key or None,
         }
+        if live_url_prefix:
+            normalized["live_url_prefix"] = live_url_prefix
         if env_value != "unknown":
             normalized["environment"] = env_value
         return normalized
@@ -219,6 +231,14 @@ def build_provider_summary(
         return {
             "merchant_account": config.get("merchant_account"),
             "client_key_present": bool(config.get("client_key")),
+            "live_url_prefix_present": bool(
+                str(
+                    config.get("live_url_prefix")
+                    or config.get("liveUrlPrefix")
+                    or config.get("endpoint_prefix")
+                    or ""
+                ).strip()
+            ),
             "environment": env_value,
         }
     if provider_norm == "checkout":
@@ -453,6 +473,11 @@ def evaluate_psp_readiness(
             add_blocker("Adyen merchant account is missing")
         if not summary.get("client_key_present"):
             add_blocker("Adyen client key is missing")
+        # NOTE: the ACP off-session MIT capture ALSO needs a live_url_prefix, but
+        # that is enforced in _AdyenCaptureAdapter (scoped to the capture lane) —
+        # NOT here. The existing Adyen dropin/routing path does not require it, so
+        # gating general live-charge readiness on it would wrongly drop working
+        # Adyen merchants from payment routing.
 
     elif provider_norm == "checkout":
         if not summary.get("processing_channel_id"):
