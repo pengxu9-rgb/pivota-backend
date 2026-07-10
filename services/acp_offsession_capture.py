@@ -142,19 +142,40 @@ async def capture_offsession(
         import stripe  # local import: keep module import-safe without stripe configured
 
         client = stripe.StripeClient(api_key)
+
+        # Resolve the customer the PaymentMethod is attached to, if any. A card set
+        # up for off-session via a SetupIntent{customer, usage: off_session} carries
+        # its customer + mandate; passing the customer lets Stripe apply that mandate
+        # so an SCA (EU/UK) card charges off_session WITHOUT re-challenging (which
+        # would otherwise come back requires_action). A pm with no customer (e.g. a
+        # bare createPaymentMethod for a US/non-SCA card, or the test pm_card_visa)
+        # → charge as before. Best-effort: a lookup failure never blocks the charge.
+        customer_id: Optional[str] = None
+        try:
+            pm_obj = await asyncio.to_thread(client.v1.payment_methods.retrieve, pm)
+            customer_id = getattr(pm_obj, "customer", None) or None
+        except Exception as _pm_exc:  # noqa: BLE001 — charge without customer on lookup failure
+            logger.warning(
+                "acp_offsession: payment_method lookup failed (charging without customer) "
+                "merchant_id=%s: %s", merchant_id, str(_pm_exc)[:150],
+            )
+
+        intent_params: Dict[str, Any] = {
+            "amount": amount_cents,
+            "currency": str(currency or "usd").lower(),
+            "payment_method": pm,
+            "off_session": True,
+            "confirm": True,
+            "metadata": {
+                **(metadata or {}),
+                ("pivota_acp_live_capture" if allow_live else "pivota_acp_test_capture"): "true",
+            },
+        }
+        if customer_id:
+            intent_params["customer"] = customer_id
         intent = await asyncio.to_thread(
             client.v1.payment_intents.create,
-            {
-                "amount": amount_cents,
-                "currency": str(currency or "usd").lower(),
-                "payment_method": pm,
-                "off_session": True,
-                "confirm": True,
-                "metadata": {
-                    **(metadata or {}),
-                    ("pivota_acp_live_capture" if allow_live else "pivota_acp_test_capture"): "true",
-                },
-            },
+            intent_params,
             {"idempotency_key": str(idempotency_key)},
         )
     except Exception as exc:  # noqa: BLE001 — Stripe CardError etc.; normalize
