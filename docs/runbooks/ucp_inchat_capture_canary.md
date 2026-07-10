@@ -23,8 +23,9 @@ the **UCP web app** (`pivota_infra_main`, PR pivota-acp #30).
    as Wix (`capture_offsession` resolves the merchant's runtime PSP).
 4. **`UCP-Agent` header** is required at session create (or set
    `UCP_ALLOW_MISSING_UCP_AGENT=true`).
-5. **Test lane** → no buyer token (backend test PM). Live buyer-token intake is a
-   deferred follow-up (see Known limitations).
+5. **Test lane** → no buyer token (backend test PM). A **live** charge supplies a
+   real card token via `payment_data.token` on `/complete` (buyer-token model,
+   pivota-acp #31) — see "Promote to LIVE".
 
 ## Prerequisites
 
@@ -116,20 +117,67 @@ Re-run 4(a)+4(b) on a fresh session → 4(b) returns `requires_escalation` (dark
 
 ## Known limitations (v1 — deferred follow-ups)
 
-- **Live buyer-token intake (Q1).** The test lane uses the backend test PM
-  (`payment_token=None`). A real card charge needs the UCP buyer-token model — the
-  one genuinely-new design piece, not yet built.
 - **Real buyer shipping address.** UCP collects none at create, so the capture uses
-  a consistent placeholder (fine for the test canary; the amount comes from the
-  backend re-quote).
+  a consistent placeholder (fine for the canary; the amount comes from the backend
+  re-quote). A real buyer address on the live lane is a follow-up.
 - **Platform order webhook.** The capture path links the backend order + completes
   but does **not** fire the platform's order webhook — the existing `_link-order`
   webhook needs a UCP-**local** order row, and the backend order lives in the
   backend DB. Wiring the webhook off the backend order is a follow-up.
+- **Handler public key.** The advertised `card` payment handler names the contract
+  (`payment_data.token`) but not the merchant's PSP publishable key — the agent
+  obtains it out-of-band for now. Advertising it needs a merchant-PSP-key source.
 
-## Promote to LIVE (later)
+## Promote to LIVE
 
-Mirrors the ACP live lane: solve buyer-token intake, use a live merchant PSP + a
-real buyer card token, and arm `AGENT_ACP_ALLOW_LIVE_CAPTURE` +
-`AGENT_ACP_LIVE_CAPTURE_MERCHANTS` (JSON array) + `AGENT_ACP_LIVE_MAX_CENTS` on the
-backend (the UCP order flows through the same live-capture lane as ACP).
+The live buyer-token model is built (pivota-acp #31): when `UCP_ENABLE_REAL_CAPTURE`
+is on, the checkout-session response advertises a `card` handler, `/complete`
+accepts `payment_data.token`, and the UCP app forwards it to the backend
+**live-capture** lane (the same one ACP/Wix live uses — no backend change). To run
+a LIVE charge:
+
+### 1. Prereqs (beyond the test canary)
+
+- The merchant has a **live** Stripe PSP (live key in `merchant_psps`).
+- The UCP web service on `main` ≥ #31.
+
+### 2. Tokenize a real buyer card (SCA-safe)
+
+The agent/buyer surface tokenizes client-side (Stripe.js) — PAN never touches our
+servers. For an **SCA** (EU/UK) card the `pm` must carry an **off-session mandate**,
+or the off-session capture returns `requires_action`:
+- Create a Stripe **Customer** → a **SetupIntent{customer, usage: off_session}** →
+  confirm it (complete 3DS) → a `pm_...` attached to that customer with a mandate.
+- A non-SCA card can use a bare `createPaymentMethod` → `pm_...`.
+
+Record the `pm_...`.
+
+### 3. Arm the BACKEND live lane
+
+The live lane is **separate** from the test-capture flags (§1) — leave those off.
+```
+AGENT_ACP_ALLOW_LIVE_CAPTURE=true
+AGENT_ACP_LIVE_CAPTURE_MERCHANTS=["<UCP_MERCHANT_ID>"]   # JSON array (bare CSV also tolerated since #1313); REQUIRED allowlist
+AGENT_ACP_LIVE_MAX_CENTS=200                             # own low cap ($2) for the first live run
+```
+UCP web keeps `UCP_ENABLE_REAL_CAPTURE=true` + the backend creds.
+
+### 4. Run — same mint → create → complete chain, but 4(b) carries the token
+
+```bash
+curl -sS -X POST "<UCP_WEB_URL>/ucp/v1/checkout-sessions/<checkout_id>/complete" \
+  -H "Content-Type: application/json" \
+  -d '{"payment_data":{"token":"<pm_...>"}}'
+```
+The backend selects the LIVE lane from its flags + the merchant's live key, **refuses
+a test PM**, resolves the `pm`'s customer/mandate (#1309), and charges the merchant's
+LIVE Stripe. (Amount is the backend re-quote of the item, ≤ `AGENT_ACP_LIVE_MAX_CENTS`.)
+
+### 5. Verify + clean up
+
+Backend order `payment_status=paid` + a real PaymentIntent in the merchant's **live**
+Stripe dashboard. Then **disarm** (`AGENT_ACP_ALLOW_LIVE_CAPTURE=false`,
+`UCP_ENABLE_REAL_CAPTURE=false`) and **refund** the charge.
+
+> This mirrors the proven ACP live-money canary, which succeeded on a real (even
+> SCA/CN) card via customer + SetupIntent{off_session} + a 3DS mandate.
