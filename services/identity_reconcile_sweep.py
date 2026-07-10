@@ -105,6 +105,128 @@ ORDER BY created_at DESC
 LIMIT 1
 """
 
+# --- Tier-3 judge wiring (Phase C, docs/plans/... §5) -----------------------
+# The judge has PROPOSAL RIGHTS ONLY: a confident 'collapse' becomes a NEW
+# suppress_dup proposal under strategy 'tier3_judge' — which is NOT in
+# AUTO_APPROVE_STRATEGIES (test-pinned), so it lands on the review rail like
+# any other judgment-shaped proposal. A confident 'keep_separate' annotates
+# the source ambiguity proposal's evidence (a human still closes the review
+# task). Dark unless ENABLE_TIER3_JUDGE=1 AND a Gemini key is present; calls
+# are bounded per sweep. spot_check pre-marks the standing 10% human-audit
+# sample for the day the judge earns per-strategy auto-approval.
+JUDGE_STRATEGY = "tier3_judge"
+JUDGE_MAX_GROUPS_PER_SWEEP = 50
+
+AMBIGUOUS_PROPOSALS_SQL = """
+SELECT proposal_id, merchant_id, content_key, subject_product_keys, evidence
+FROM identity_resolution_proposals
+WHERE status = 'proposed' AND strategy = 'campaign_clone_ambiguous'
+  AND (evidence->'tier3_judge') IS NULL
+ORDER BY created_at
+LIMIT $1
+"""
+
+JUDGE_ROWS_SQL = """
+SELECT product_key, title, brand, canonical_url, source_ref, platform,
+       pivota_signature_id, source_product_id
+FROM catalog_products
+WHERE product_key = ANY($1::text[])
+"""
+
+ANNOTATE_JUDGE_SQL = """
+UPDATE identity_resolution_proposals
+SET evidence = COALESCE(evidence, '{}'::jsonb) || jsonb_build_object('tier3_judge', $2::jsonb)
+WHERE proposal_id = $1
+"""
+
+
+def tier3_judge_enabled() -> bool:
+    return str(os.getenv("ENABLE_TIER3_JUDGE", "")).strip().lower() in (
+        "1", "true", "yes", "on",
+    )
+
+
+def is_spot_check(proposal_id: str) -> bool:
+    """Deterministic ~10% sample: these stay human-reviewed even after the
+    judge earns per-strategy auto-approval."""
+    import hashlib
+
+    digest = hashlib.sha256(proposal_id.encode("utf-8")).digest()
+    return digest[0] % 10 == 0
+
+
+def build_judge_proposal(
+    source: Dict[str, Any],
+    details: List[Dict[str, Any]],
+    verdict: Dict[str, Any],
+) -> Dict[str, Any]:
+    """Pure: a confident judge 'collapse' -> a suppress_dup proposal under
+    the judge's own strategy. Keeper stays serving-aligned (pick_canonical),
+    the judge only decides SAMENESS."""
+    from services.agent_pdp_view_assembler import pick_canonical
+    from services.identity_resolution import new_proposal
+
+    keeper = pick_canonical(details)
+    proposal = new_proposal(
+        kind="suppress_dup",
+        strategy=JUDGE_STRATEGY,
+        subject_product_keys=[d["product_key"] for d in details],
+        keeper_product_key=keeper["product_key"],
+        merchant_id=source.get("merchant_id"),
+        content_key=source.get("content_key"),
+        confidence=float(verdict["confidence"]),
+        evidence={
+            "judge_version": verdict.get("judge_version"),
+            "reasoning": verdict.get("reasoning"),
+            "source_proposal_id": source["proposal_id"],
+        },
+    )
+    proposal["evidence"]["spot_check"] = is_spot_check(proposal["proposal_id"])
+    return proposal
+
+
+async def _judge_ambiguous(conn, limit: int = JUDGE_MAX_GROUPS_PER_SWEEP) -> Dict[str, Any]:
+    """Run the Tier-3 judge over pending ambiguity proposals. Every source
+    proposal gets its judge outcome annotated (incl. unsure/failure, so it
+    isn't re-judged every sweep); confident collapses mint tier3_judge
+    proposals for the review rail."""
+    from services.identity_resolution import upsert_proposals
+    from services.identity_tier3_judge import (
+        CONFIDENCE_FLOOR,
+        JUDGE_VERSION,
+        judge_group,
+    )
+
+    rows = await conn.fetch(AMBIGUOUS_PROPOSALS_SQL, limit)
+    judged = {"judged": 0, "collapse_proposals": 0, "keep": 0, "unsure": 0,
+              "judge_version": JUDGE_VERSION}
+    minted: List[Dict[str, Any]] = []
+    for r in rows:
+        source = dict(r)
+        details = [dict(d) for d in await conn.fetch(
+            JUDGE_ROWS_SQL, source["subject_product_keys"])]
+        if len(details) < 2:
+            continue
+        verdict = judge_group(details) or {"verdict": "unsure", "confidence": 0.0,
+                                           "judge_version": JUDGE_VERSION}
+        judged["judged"] += 1
+        confident = float(verdict.get("confidence") or 0) >= CONFIDENCE_FLOOR
+        if verdict["verdict"] == "collapse" and confident:
+            minted.append(build_judge_proposal(source, details, verdict))
+            judged["collapse_proposals"] += 1
+        elif verdict["verdict"] == "keep_separate" and confident:
+            judged["keep"] += 1
+        else:
+            judged["unsure"] += 1
+        await conn.execute(
+            ANNOTATE_JUDGE_SQL, source["proposal_id"],
+            json.dumps({k: verdict.get(k) for k in
+                        ("verdict", "confidence", "reasoning", "judge_version")}),
+        )
+    if minted:
+        judged["upsert"] = await upsert_proposals(conn, minted)
+    return judged
+
 
 def identity_reconcile_sweep_enabled() -> bool:
     return str(os.getenv("ENABLE_IDENTITY_RECONCILE_SWEEP", "")).strip().lower() in (
@@ -212,6 +334,12 @@ async def run_identity_reconcile_sweep_tick(
         for s, ps in per_strategy.items():
             proposed[s] = await upsert_proposals(conn, ps)
 
+        judge_summary: Dict[str, Any] = {"skipped": "ENABLE_TIER3_JUDGE is off"}
+        if tier3_judge_enabled():
+            # Runs BEFORE review-task enqueue so freshly minted tier3_judge
+            # proposals land on the review rail within the same sweep.
+            judge_summary = await _judge_ambiguous(conn)
+
         applied: Dict[str, Any] = {"applied": [], "skipped": []}
         approved: List[str] = []
         if apply_allowlist:
@@ -246,6 +374,7 @@ async def run_identity_reconcile_sweep_tick(
             "gauges": gauges,
             "lanes": lanes_summary,
             "proposed": proposed,
+            "tier3_judge": judge_summary,
             "auto_approved": len(approved),
             "applied": applied.get("applied", []),
             "apply_skipped": applied.get("skipped", []),

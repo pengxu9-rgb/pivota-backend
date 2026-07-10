@@ -96,3 +96,53 @@ class TestReviewTaskRow:
         p["kind"] = "label_only"
         _, pdp_id, _, _ = review_task_row(p)
         assert pdp_id == "a"
+
+
+class TestJudgeWiring:
+    def test_judge_strategy_is_never_auto_approved(self):
+        # The judge has proposal rights only. Adding 'tier3_judge' to the
+        # allowlist requires the per-strategy earn-in from the phase plan §5.
+        from services.identity_reconcile_sweep import JUDGE_STRATEGY
+        assert JUDGE_STRATEGY not in AUTO_APPROVE_STRATEGIES
+
+    def test_judge_flag_default_off(self, monkeypatch):
+        from services.identity_reconcile_sweep import tier3_judge_enabled
+        monkeypatch.delenv("ENABLE_TIER3_JUDGE", raising=False)
+        assert tier3_judge_enabled() is False
+
+    def test_spot_check_is_deterministic_and_roughly_ten_percent(self):
+        from services.identity_reconcile_sweep import is_spot_check
+        ids = [f"irp_{i}" for i in range(2000)]
+        marked = [i for i in ids if is_spot_check(i)]
+        assert is_spot_check("irp_7") == is_spot_check("irp_7")
+        assert 120 <= len(marked) <= 280  # ~10% with slack
+
+    def test_build_judge_proposal_shape(self):
+        from services.identity_reconcile_sweep import (
+            JUDGE_STRATEGY,
+            build_judge_proposal,
+        )
+        source = {"proposal_id": "irp_src", "merchant_id": "m", "content_key": "ck"}
+        details = [
+            {"product_key": "a", "platform": "external_seed",
+             "pivota_signature_id": "sig", "canonical_url": "u1"},
+            {"product_key": "b", "platform": "external_seed",
+             "pivota_signature_id": None, "canonical_url": "u2"},
+        ]
+        verdict = {"verdict": "collapse", "confidence": 0.92,
+                   "reasoning": "clones", "judge_version": "tier3.v2"}
+        p = build_judge_proposal(source, details, verdict)
+        assert p["strategy"] == JUDGE_STRATEGY
+        assert p["kind"] == "suppress_dup"
+        assert p["keeper_product_key"] == "a"  # serving-aligned, judge only decides sameness
+        assert p["confidence"] == 0.92
+        assert p["evidence"]["source_proposal_id"] == "irp_src"
+        assert isinstance(p["evidence"]["spot_check"], bool)
+
+    def test_annotation_sql_prevents_rejudging(self):
+        from services.identity_reconcile_sweep import (
+            AMBIGUOUS_PROPOSALS_SQL,
+            ANNOTATE_JUDGE_SQL,
+        )
+        assert "(evidence->'tier3_judge') IS NULL" in AMBIGUOUS_PROPOSALS_SQL
+        assert "tier3_judge" in ANNOTATE_JUDGE_SQL
