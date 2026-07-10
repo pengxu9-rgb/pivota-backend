@@ -26,6 +26,9 @@ jobs:
     env:
       DATABASE_URL: ${{ secrets.DATABASE_URL }}
       CHECKOUT_UI_BASE_URL: ${{ vars.CHECKOUT_UI_BASE_URL || 'https://agent.pivota.cc' }}
+      # ADR-011 intake identity contract — keep in step with the Railway
+      # ENABLE_INTAKE_IDENTITY_MIRROR flag (this env doesn't see Railway vars).
+      ENABLE_INTAKE_IDENTITY_MIRROR: "1"
       PYTHONDONTWRITEBYTECODE: "1"
     steps:
       - name: Checkout
