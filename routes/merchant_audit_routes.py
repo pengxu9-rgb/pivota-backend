@@ -1093,6 +1093,17 @@ class MerchantUrlAuditRequest(BaseModel):
             "grounded in, and which competitors it named instead."
         ),
     )
+    refresh: bool = Field(
+        default=False,
+        description=(
+            "Regenerate the prompt basis instead of reusing (pinning) the "
+            "prior run's frozen query set. Default False keeps re-audit scores "
+            "comparable (W2 pinning); set True when a re-audit must reflect "
+            "product/evidence changes in the probed queries — e.g. after new "
+            "grounded attributes become available. Costs the basis-generation "
+            "LLM calls the pinned path skips."
+        ),
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -1612,6 +1623,10 @@ async def run_merchant_url_audit(
                 # extraction), not just generic category heads — this is the
                 # demand a store-less brand can realistically win in AI.
                 "winnable_prompts": True,
+                # Opt-in basis refresh (default False): regenerate the prompt
+                # basis for this run instead of pinning a prior run's, so a
+                # re-audit reflects newly-grounded attributes in the probed set.
+                "refresh_prompt_basis": bool(body.refresh),
                 "synthetic_products": synthetic_products,
                 "merchant_name": merchant_name,
                 "merchant_domain": merchant_domain,

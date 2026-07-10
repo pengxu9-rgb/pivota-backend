@@ -521,6 +521,12 @@ async def _process_one_audit_run_inner(
                                 getattr(settings, "prompt_gen_enabled", True),
                             )
                         ),
+                        # Explicit re-audit refresh: regenerate the prompt basis
+                        # instead of pinning a prior run's frozen query set.
+                        # Default False -> every existing audit pins as before.
+                        refresh_prompt_basis=bool(
+                            launch_options.get("refresh_prompt_basis", False)
+                        ),
                     )
                     await mar.record_partial_result(
                         run_id=run_id,
