@@ -479,6 +479,7 @@ def _where_youre_losing(
     authority_map: Dict[str, Any],
     summary: Dict[str, Any],
     win_plan: Optional[Dict[str, Any]] = None,
+    vertical_profile: VerticalProfile = BEAUTY_PROFILE,
 ) -> Dict[str, Any]:
     endorsed_category = bool(summary.get("independently_recommended_for_category"))
     endorsement_hosts = list(summary.get("endorsement_category_hosts") or summary.get("endorsement_hosts") or [])
@@ -789,7 +790,9 @@ def build_merchant_narrative(
         for r in (per_sku_reports or []) if isinstance(r, dict)
     )
 
-    where = _where_youre_losing(name, authority_map, summary, win_plan)
+    where = _where_youre_losing(
+        name, authority_map, summary, win_plan, vertical_profile=vertical_profile
+    )
     verify_plain = _verify_plain(verify_summary)
     honest_limits = _honest_limits(
         summary,
