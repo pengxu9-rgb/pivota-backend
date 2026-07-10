@@ -64,3 +64,24 @@ def test_acp_address_passthrough_when_already_acp_shaped():
 def test_acp_address_none_without_street_line():
     assert _acp_address({"city": "NYC"}) is None
     assert _acp_address(None) is None
+
+
+# --- P-T2.3.4 fix: buyer → ACP Buyer contract (first_name/last_name required) ---
+from services.pivota_acp_client import _acp_buyer  # noqa: E402
+
+
+def test_acp_buyer_omitted_when_only_email():
+    # pivota-acp Buyer REQUIRES first_name+last_name; an email-only buyer must be
+    # omitted (session buyer is optional) rather than 422 the whole session.
+    assert _acp_buyer({"email": "a@b.com"}) is None
+    assert _acp_buyer(None) is None
+
+
+def test_acp_buyer_maps_first_last_and_email():
+    out = _acp_buyer({"first_name": "Ada", "last_name": "Lovelace", "email": "ada@x.com"})
+    assert out == {"first_name": "Ada", "last_name": "Lovelace", "email": "ada@x.com"}
+
+
+def test_acp_buyer_splits_single_name():
+    out = _acp_buyer({"name": "Grace Hopper"})
+    assert out == {"first_name": "Grace", "last_name": "Hopper"}

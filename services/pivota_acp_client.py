@@ -155,6 +155,31 @@ def _acp_address(addr: Optional[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
     return {k: v for k, v in out.items() if v is not None}
 
 
+def _acp_buyer(buyer: Optional[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
+    """Map a Pivota buyer to the ACP session `Buyer` contract. pivota-acp's Buyer
+    REQUIRES first_name + last_name, so our email-only buyer 422s the session. Map
+    first/last (splitting a single `name` when needed); when both names aren't
+    available, return None so the buyer is omitted (it's optional on the session)
+    rather than failing the whole checkout. Email, when present, is preserved into
+    metadata by the caller."""
+    if not buyer:
+        return None
+    b = dict(buyer)
+    first = b.get("first_name") or b.get("firstName")
+    last = b.get("last_name") or b.get("lastName")
+    if (not first or not last) and b.get("name"):
+        parts = str(b["name"]).strip().split(None, 1)
+        first = first or (parts[0] if parts else None)
+        last = last or (parts[1] if len(parts) > 1 else None)
+    if not (first and last):
+        return None
+    out: Dict[str, Any] = {"first_name": str(first), "last_name": str(last)}
+    email = b.get("email")
+    if email:
+        out["email"] = email
+    return out
+
+
 async def create_checkout_session(
     *,
     merchant_id: str,
@@ -194,12 +219,19 @@ async def create_checkout_session(
     for k, v in src.items():
         acp_metadata.setdefault(k, v)
 
+    # Preserve the buyer email into metadata even when the buyer object is
+    # omitted below (ACP Buyer needs first+last names we may not have), so the
+    # order-completed path can still recover it.
+    if isinstance(buyer, dict) and buyer.get("email"):
+        acp_metadata.setdefault("customer_email", buyer["email"])
+
     body: Dict[str, Any] = {"items": acp_items, "metadata": acp_metadata}
     acp_address = _acp_address(fulfillment_address)
     if acp_address:
         body["fulfillment_address"] = acp_address
-    if buyer:
-        body["buyer"] = buyer
+    acp_buyer = _acp_buyer(buyer)
+    if acp_buyer:
+        body["buyer"] = acp_buyer
 
     headers = {
         "Authorization": f"Bearer {_resolve_bearer_token()}",
