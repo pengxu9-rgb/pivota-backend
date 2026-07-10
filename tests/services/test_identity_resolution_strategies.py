@@ -94,6 +94,21 @@ class TestCampaignClone:
         assert base_slug("balm-copy-3") == "balm"
         assert base_slug("balm-99") == "balm"
 
+    def test_unit_number_suffixes_are_identity_not_clone_counters(self):
+        # The Tier-3 eval caught two live mis-merges from stripping these
+        # (Merit SPF-45 vs SPF-50). spf/size numbers must never collapse.
+        assert base_slug("the-uniform-spf-45") != base_slug("the-uniform-spf-50")
+        assert base_slug("shampoo-200ml") != base_slug("shampoo-400ml")
+        assert base_slug("the-uniform-spf-50-eu") == base_slug("the-uniform-spf-50")
+
+    def test_spf_pair_is_ambiguous_not_clone(self):
+        detail = {
+            "a": _detail("a", "https://meritbeauty.com/products/the-uniform-spf-50"),
+            "b": _detail("b", "https://meritbeauty.com/products/the-uniform-spf-45"),
+        }
+        (p,) = strategy_campaign_clone([_group(["a", "b"])], detail)
+        assert p["kind"] == "label_only"
+
 
 class TestSeedFirstPartyTwin:
     def test_first_party_sibling_wins(self):

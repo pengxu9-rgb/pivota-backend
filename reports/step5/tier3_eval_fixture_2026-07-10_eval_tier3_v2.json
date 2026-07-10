@@ -1,0 +1,2036 @@
+{
+ "gate": {
+  "judge_version": "tier3.v2",
+  "confidence_floor": 0.7,
+  "n": 252,
+  "mis_merges": 0,
+  "mis_merge_rate": 0.0,
+  "mis_merge_group_ids": [],
+  "collapse_coverage": 1.0,
+  "keep_coverage": 0.9833333333333333,
+  "unsure_or_failed": 2,
+  "gate_passed": true
+ },
+ "results": [
+  {
+   "group_id": "l3_ck_0dae9cc826d17",
+   "label": "collapse",
+   "source": "lane3_as_applied",
+   "verdict": "collapse",
+   "confidence": 1.0,
+   "reasoning": "The URLs are on the same domain and differ only by a regional suffix (-ca) or are exact duplicates, indicating regional path clones or re-crawls of the same product page."
+  },
+  {
+   "group_id": "l3_ck_0f23da3d8b834",
+   "label": "collapse",
+   "source": "lane3_as_applied",
+   "verdict": "collapse",
+   "confidence": 1.0,
+   "reasoning": "Listings are on the same domain and differ only by a regional URL slug suffix ('-eu'), indicating regional path clones of one storefront listing."
+  },
+  {
+   "group_id": "l3_ck_13f1a3f03f013",
+   "label": "collapse",
+   "source": "lane3_as_applied",
+   "verdict": "collapse",
+   "confidence": 1.0,
+   "reasoning": "All listings are on the same domain and differ only by regional URL slugs or are exact duplicates, which are considered regional path clones of one storefront listing."
+  },
+  {
+   "group_id": "l3_ck_15133b0b1e11d",
+   "label": "collapse",
+   "source": "lane3_as_applied",
+   "verdict": "collapse",
+   "confidence": 0.95,
+   "reasoning": "Listings are on the same domain and differ only by a regional URL slug suffix (-eu), indicating regional path clones of one storefront listing."
+  },
+  {
+   "group_id": "l3_ck_196d4c3e6025a",
+   "label": "collapse",
+   "source": "lane3_as_applied",
+   "verdict": "collapse",
+   "confidence": 1.0,
+   "reasoning": "All listings are on the same domain and differ only by regional URL suffixes (-eu, -uk) or no suffix, indicating regional path clones of a single storefront listing."
+  },
+  {
+   "group_id": "l3_ck_1a922342af9d5",
+   "label": "collapse",
+   "source": "lane3_as_applied",
+   "verdict": "collapse",
+   "confidence": 1.0,
+   "reasoning": "All listings are on the same domain and differ only by regional URL suffixes ('-ca', '-eu') or the base slug, which are considered regional path clones of one storefront listing."
+  },
+  {
+   "group_id": "l3_ck_1ac91ed3646fb",
+   "label": "collapse",
+   "source": "lane3_as_applied",
+   "verdict": "collapse",
+   "confidence": 1.0,
+   "reasoning": "Listings are on the same domain and differ only by regional URL suffixes or are exact duplicates, indicating regional path clones of one storefront listing."
+  },
+  {
+   "group_id": "l3_ck_1c8185c748dd6",
+   "label": "collapse",
+   "source": "lane3_as_applied",
+   "verdict": "collapse",
+   "confidence": 0.95,
+   "reasoning": "All listings share the same brand and title, and are on the same domain; the URL slug variations contain campaign, date, and split-test identifiers, indicating they point to the same purchasable product."
+  },
+  {
+   "group_id": "l3_ck_1eb0e9fa6b8f3",
+   "label": "collapse",
+   "source": "lane3_as_applied",
+   "verdict": "collapse",
+   "confidence": 1.0,
+   "reasoning": "The URLs are on the same domain and differ only by a regional slug suffix ('-uk'), indicating regional path clones of one storefront listing."
+  },
+  {
+   "group_id": "l3_ck_21e5f980aec23",
+   "label": "collapse",
+   "source": "lane3_as_applied",
+   "verdict": "collapse",
+   "confidence": 0.95,
+   "reasoning": "The URLs differ only by campaign, split-test, or tracking slugs on the same domain for an identical product title and brand, indicating they point to the same purchasable listing."
+  },
+  {
+   "group_id": "l3_ck_23a1739221f44",
+   "label": "collapse",
+   "source": "lane3_as_applied",
+   "verdict": "collapse",
+   "confidence": 0.95,
+   "reasoning": "The URLs are on the same domain and differ only by a non-specifying trailing number in the slug, indicating a duplicate URL for the same product page."
+  },
+  {
+   "group_id": "l3_ck_30f4ba3b4fea7",
+   "label": "collapse",
+   "source": "lane3_as_applied",
+   "verdict": "collapse",
+   "confidence": 0.95,
+   "reasoning": "All listings share the exact same title and brand on the same domain, with only a trailing number in the URL slug, indicating campaign tracking, split-test variations, or duplicate product page entries rather than distinct product specifications."
+  },
+  {
+   "group_id": "l3_ck_338c2645f0426",
+   "label": "collapse",
+   "source": "lane3_as_applied",
+   "verdict": "collapse",
+   "confidence": 0.95,
+   "reasoning": "Listings are on the same domain and differ only by a regional URL suffix ('-eu'), indicating regional path clones of one storefront listing."
+  },
+  {
+   "group_id": "l3_ck_39afa5d5f1067",
+   "label": "collapse",
+   "source": "lane3_as_applied",
+   "verdict": "collapse",
+   "confidence": 1.0,
+   "reasoning": "URLs differ only by regional suffixes (-uk, -ca) on the same domain, indicating regional path clones of one storefront listing."
+  },
+  {
+   "group_id": "l3_ck_3a35eb126c8b4",
+   "label": "collapse",
+   "source": "lane3_as_applied",
+   "verdict": "collapse",
+   "confidence": 0.95,
+   "reasoning": "All listings are on the same domain and differ only by regional suffixes in the URL slug, which are considered regional path clones of one storefront listing."
+  },
+  {
+   "group_id": "l3_ck_3cb39bed4dd01",
+   "label": "collapse",
+   "source": "lane3_as_applied",
+   "verdict": "collapse",
+   "confidence": 0.95,
+   "reasoning": "URLs on the same domain differing only by a regional suffix ('-eu') are considered regional path clones of one storefront listing."
+  },
+  {
+   "group_id": "l3_ck_40dacd81a1c3d",
+   "label": "collapse",
+   "source": "lane3_as_applied",
+   "verdict": "collapse",
+   "confidence": 0.95,
+   "reasoning": "The URL slugs contain identifiers consistent with campaign tracking or split-testing for the same product page on the same domain."
+  },
+  {
+   "group_id": "l3_ck_41b3725433559",
+   "label": "collapse",
+   "source": "lane3_as_applied",
+   "verdict": "collapse",
+   "confidence": 0.95,
+   "reasoning": "All listings share the exact same brand and title, and the URL slugs contain numerous marketing campaign identifiers, date codes, and tracking parameters, indicating they point to the same underlying product page for different promotional efforts."
+  },
+  {
+   "group_id": "l3_ck_41cdb5d8c5584",
+   "label": "collapse",
+   "source": "lane3_as_applied",
+   "verdict": "collapse",
+   "confidence": 0.95,
+   "reasoning": "Listings are on the same domain and differ only by a regional URL slug suffix ('-eu'), indicating regional path clones of one storefront listing."
+  },
+  {
+   "group_id": "l3_ck_42f7448f65969",
+   "label": "collapse",
+   "source": "lane3_as_applied",
+   "verdict": "collapse",
+   "confidence": 0.9,
+   "reasoning": "The URLs are on the same domain and differ only by a trailing '-2' in the slug, which indicates a system-generated duplicate or version of the same product page."
+  },
+  {
+   "group_id": "l3_ck_435d5265a4983",
+   "label": "collapse",
+   "source": "lane3_as_applied",
+   "verdict": "collapse",
+   "confidence": 0.95,
+   "reasoning": "The URLs differ only by a trailing number in the slug (11 vs 12) on the same domain, which indicates campaign/split-test variations or re-crawls of the same product page, not distinct product specifications."
+  },
+  {
+   "group_id": "l3_ck_44b58190d9441",
+   "label": "collapse",
+   "source": "lane3_as_applied",
+   "verdict": "collapse",
+   "confidence": 0.95,
+   "reasoning": "All listings are on the same domain and differ only by a regional URL slug (-eu), indicating regional path clones of one storefront listing."
+  },
+  {
+   "group_id": "l3_ck_49cb17c45ffd3",
+   "label": "collapse",
+   "source": "lane3_as_applied",
+   "verdict": "collapse",
+   "confidence": 0.95,
+   "reasoning": "The URLs differ only by a trailing generic number '-1' in the slug, which indicates a duplicate page or system-generated variant, not a distinct product spec."
+  },
+  {
+   "group_id": "l3_ck_52f72b9991912",
+   "label": "collapse",
+   "source": "lane3_as_applied",
+   "verdict": "collapse",
+   "confidence": 0.95,
+   "reasoning": "Listings are on the same domain and differ only by a regional suffix ('-eu'), indicating regional path clones of one storefront listing."
+  },
+  {
+   "group_id": "l3_ck_53d523c4babd1",
+   "label": "collapse",
+   "source": "lane3_as_applied",
+   "verdict": "collapse",
+   "confidence": 0.95,
+   "reasoning": "The URLs are on the same domain and differ only by regional path suffixes (-uk, -eu) or the absence thereof, indicating regional clones of a single product listing."
+  },
+  {
+   "group_id": "l3_ck_53e36680cf3b9",
+   "label": "collapse",
+   "source": "lane3_as_applied",
+   "verdict": "collapse",
+   "confidence": 1.0,
+   "reasoning": "All listings are on the same domain and differ only by regional URL suffixes (-eu, -uk) or no suffix, indicating regional path clones of a single storefront listing."
+  },
+  {
+   "group_id": "l3_ck_555ef61ee357d",
+   "label": "collapse",
+   "source": "lane3_as_applied",
+   "verdict": "collapse",
+   "confidence": 0.9,
+   "reasoning": "The listings share identical title, brand, and domain, with URLs differing only by a trailing number in the slug that does not express a product specification, indicating duplicate product pages."
+  },
+  {
+   "group_id": "l3_ck_55d63ba3f7fd3",
+   "label": "collapse",
+   "source": "lane3_as_applied",
+   "verdict": "collapse",
+   "confidence": 0.95,
+   "reasoning": "The URLs differ only by a trailing '-1' on the same domain, which indicates a cloned or re-crawled product page rather than a distinct product variant or specification."
+  },
+  {
+   "group_id": "l3_ck_56e4ad20499e4",
+   "label": "collapse",
+   "source": "lane3_as_applied",
+   "verdict": "collapse",
+   "confidence": 1.0,
+   "reasoning": "Listings are on the same domain and differ only by regional URL slugs or are exact duplicates, indicating regional path clones of one storefront listing."
+  },
+  {
+   "group_id": "l3_ck_5b50f14db0e37",
+   "label": "collapse",
+   "source": "lane3_as_applied",
+   "verdict": "collapse",
+   "confidence": 1.0,
+   "reasoning": "All listings are on the same domain and differ only by a regional URL slug ('-eu'), indicating regional path clones of one storefront listing."
+  },
+  {
+   "group_id": "l3_ck_5f8416610fece",
+   "label": "collapse",
+   "source": "lane3_as_applied",
+   "verdict": "collapse",
+   "confidence": 1.0,
+   "reasoning": "All listings are on the same domain and differ only by a regional suffix ('-uk') in the URL slug, indicating regional path clones of one storefront listing."
+  },
+  {
+   "group_id": "l3_ck_60b5cca833c99",
+   "label": "collapse",
+   "source": "lane3_as_applied",
+   "verdict": "collapse",
+   "confidence": 0.95,
+   "reasoning": "All listings share the same brand and title, and are on the same domain; the URL slugs contain clear indicators of campaign tracking, split-test identifiers (e.g., 'jul22', 'georginasplit', 'digitalclock', 'texture', 'exclusive'), and minor internal page variations (e.g., '_a_', 'ce' vs 'pe') for the same product."
+  },
+  {
+   "group_id": "l3_ck_6ca24bbead155",
+   "label": "collapse",
+   "source": "lane3_as_applied",
+   "verdict": "collapse",
+   "confidence": 0.9,
+   "reasoning": "All URLs are on the same domain and represent either a regional path clone ('-eu') or a common CMS-generated duplicate slug ('-1') for an identical product title, not a distinct product specification."
+  },
+  {
+   "group_id": "l3_ck_6da46420af9a2",
+   "label": "collapse",
+   "source": "lane3_as_applied",
+   "verdict": "collapse",
+   "confidence": 0.95,
+   "reasoning": "All listings share identical title and brand, and their URLs contain clear indicators of campaign tracking, A/B testing, and internal versioning (e.g., 'ctest', 'ttest', 'georginasplit', influencer names, trailing numbers that are not product specs), suggesting they point to the same purchasable product page."
+  },
+  {
+   "group_id": "l3_ck_6da783ff72836",
+   "label": "collapse",
+   "source": "lane3_as_applied",
+   "verdict": "collapse",
+   "confidence": 0.95,
+   "reasoning": "The URLs differ only by a single trailing digit, which appears to be a clone counter or tracking suffix rather than a product specification."
+  },
+  {
+   "group_id": "l3_ck_71d729759a74c",
+   "label": "collapse",
+   "source": "lane3_as_applied",
+   "verdict": "collapse",
+   "confidence": 0.95,
+   "reasoning": "All listings are on the same domain and differ only by regional URL slugs (-eu, -uk), which are considered regional path clones of one storefront listing."
+  },
+  {
+   "group_id": "l3_ck_7672d88d9befc",
+   "label": "collapse",
+   "source": "lane3_as_applied",
+   "verdict": "collapse",
+   "confidence": 1.0,
+   "reasoning": "All listings are on the same domain and differ only by regional URL suffixes ('-ca', '-eu') or no suffix, which are treated as regional path clones of one storefront listing."
+  },
+  {
+   "group_id": "l3_ck_833720fbd2be5",
+   "label": "collapse",
+   "source": "lane3_as_applied",
+   "verdict": "collapse",
+   "confidence": 1.0,
+   "reasoning": "URLs on the same domain differing only by regional path suffixes (-eu, -uk) are considered regional clones of one storefront listing."
+  },
+  {
+   "group_id": "l3_ck_8803f8ca80d29",
+   "label": "collapse",
+   "source": "lane3_as_applied",
+   "verdict": "collapse",
+   "confidence": 1.0,
+   "reasoning": "Listings are on the same domain and differ only by a regional URL slug ('-eu'), indicating regional path clones of one storefront listing."
+  },
+  {
+   "group_id": "l3_ck_895a46be83d7a",
+   "label": "collapse",
+   "source": "lane3_as_applied",
+   "verdict": "collapse",
+   "confidence": 1.0,
+   "reasoning": "Listings are on the same domain and differ only by regional URL slugs, indicating regional path clones of one storefront listing."
+  },
+  {
+   "group_id": "l3_ck_90d74c9a74a00",
+   "label": "collapse",
+   "source": "lane3_as_applied",
+   "verdict": "collapse",
+   "confidence": 0.95,
+   "reasoning": "All listings share the same title and brand, and the URL slugs on the same domain contain campaign names, dates, and tracking codes, indicating they are different entry points to the same product page for A/B testing or promotional tracking."
+  },
+  {
+   "group_id": "l3_ck_926124b551d49",
+   "label": "collapse",
+   "source": "lane3_as_applied",
+   "verdict": "collapse",
+   "confidence": 1.0,
+   "reasoning": "The URLs are on the same domain and differ only by a regional suffix ('-eu'), indicating regional path clones of one storefront listing."
+  },
+  {
+   "group_id": "l3_ck_93df0422a9e9d",
+   "label": "collapse",
+   "source": "lane3_as_applied",
+   "verdict": "collapse",
+   "confidence": 0.95,
+   "reasoning": "All listings share identical titles and brands, and their URLs differ only by a trailing number in the slug on the same domain, indicating campaign tracking or internal IDs for the same product page."
+  },
+  {
+   "group_id": "l3_ck_97da65bd883bc",
+   "label": "collapse",
+   "source": "lane3_as_applied",
+   "verdict": "collapse",
+   "confidence": 1.0,
+   "reasoning": "The listings are on the same domain and either have identical URLs or differ only by a regional suffix, indicating regional path clones."
+  },
+  {
+   "group_id": "l3_ck_9ad160ae38f4e",
+   "label": "collapse",
+   "source": "lane3_as_applied",
+   "verdict": "collapse",
+   "confidence": 1.0,
+   "reasoning": "All listings are on the same domain, and the differing URL slug indicates a regional path clone, which should be collapsed."
+  },
+  {
+   "group_id": "l3_ck_9cbd981168381",
+   "label": "collapse",
+   "source": "lane3_as_applied",
+   "verdict": "collapse",
+   "confidence": 1.0,
+   "reasoning": "The URLs are on the same domain and differ only by a regional suffix, indicating regional path clones of one storefront listing."
+  },
+  {
+   "group_id": "l3_ck_a19bfc4e5bc09",
+   "label": "collapse",
+   "source": "lane3_as_applied",
+   "verdict": "collapse",
+   "confidence": 0.95,
+   "reasoning": "Listings are on the same domain and differ only by regional URL slugs (-uk, -eu), indicating regional path clones of one storefront listing."
+  },
+  {
+   "group_id": "l3_ck_a2d53b90b1f7f",
+   "label": "collapse",
+   "source": "lane3_as_applied",
+   "verdict": "collapse",
+   "confidence": 1.0,
+   "reasoning": "All listings are on the same domain and differ only by regional URL slugs (-ca, -uk) or are duplicates of the base URL, indicating regional path clones of one storefront listing."
+  },
+  {
+   "group_id": "l3_ck_a55e50ab11084",
+   "label": "collapse",
+   "source": "lane3_as_applied",
+   "verdict": "collapse",
+   "confidence": 0.95,
+   "reasoning": "All listings share the exact same title and brand, and their URLs differ only by a non-spec-related trailing number on the same domain, indicating multiple instances of the same promotional page."
+  },
+  {
+   "group_id": "l3_ck_aa5b186ccdf03",
+   "label": "collapse",
+   "source": "lane3_as_applied",
+   "verdict": "collapse",
+   "confidence": 0.95,
+   "reasoning": "Listings are on the same domain and differ only by regional URL suffixes, indicating regional path clones of one storefront listing."
+  },
+  {
+   "group_id": "l3_ck_abf1a7ee29607",
+   "label": "collapse",
+   "source": "lane3_as_applied",
+   "verdict": "collapse",
+   "confidence": 0.95,
+   "reasoning": "The URLs are on the same domain and differ only by a trailing '-1' in the slug, which indicates a duplicate URL for the same product page rather than a distinct product variant."
+  },
+  {
+   "group_id": "l3_ck_ac05975062016",
+   "label": "collapse",
+   "source": "lane3_as_applied",
+   "verdict": "collapse",
+   "confidence": 0.95,
+   "reasoning": "All listings are on the same domain and differ only by regional URL suffixes (-ca, -eu), indicating regional path clones of a single storefront listing."
+  },
+  {
+   "group_id": "l3_ck_acb7883aee413",
+   "label": "collapse",
+   "source": "lane3_as_applied",
+   "verdict": "collapse",
+   "confidence": 1.0,
+   "reasoning": "All listings are on the same domain and differ only by a regional URL slug ('-ukeu'), indicating they are regional path clones of one storefront listing."
+  },
+  {
+   "group_id": "l3_ck_aff4a55d0954d",
+   "label": "collapse",
+   "source": "lane3_as_applied",
+   "verdict": "collapse",
+   "confidence": 0.95,
+   "reasoning": "URLs on the same domain differing only by regional suffixes (-eu, -uk) are considered regional path clones of one storefront listing."
+  },
+  {
+   "group_id": "l3_ck_b0b960b61c905",
+   "label": "collapse",
+   "source": "lane3_as_applied",
+   "verdict": "collapse",
+   "confidence": 1.0,
+   "reasoning": "Listings are on the same domain and differ only by a regional URL slug suffix ('-eu'), indicating regional path clones of one storefront listing."
+  },
+  {
+   "group_id": "l3_ck_b90b45294a646",
+   "label": "collapse",
+   "source": "lane3_as_applied",
+   "verdict": "collapse",
+   "confidence": 0.95,
+   "reasoning": "All listings share the exact same title, brand, and the descriptive part of the URL slug; the only differences are non-descriptive trailing numbers in the URL, indicating these are likely campaign/tracking variants or internal IDs for the same product page."
+  },
+  {
+   "group_id": "l3_ck_b9f2b9bf363b5",
+   "label": "collapse",
+   "source": "lane3_as_applied",
+   "verdict": "collapse",
+   "confidence": 0.95,
+   "reasoning": "The listings share the same brand, title, and domain, with URLs differing only by a trailing number appended to a generic promotional slug, indicating cloned or tracked product pages."
+  },
+  {
+   "group_id": "l3_ck_ba46f80c66419",
+   "label": "collapse",
+   "source": "lane3_as_applied",
+   "verdict": "collapse",
+   "confidence": 0.95,
+   "reasoning": "All listings are on the same domain and differ only by regional URL suffixes (-ca, -eu), indicating regional path clones of a single storefront listing."
+  },
+  {
+   "group_id": "l3_ck_bef9c0e9731e6",
+   "label": "collapse",
+   "source": "lane3_as_applied",
+   "verdict": "collapse",
+   "confidence": 1.0,
+   "reasoning": "Listings are on the same domain and differ only by a regional URL slug suffix ('-eu'), indicating regional path clones of the same product."
+  },
+  {
+   "group_id": "l3_ck_c08a4d20ec80a",
+   "label": "collapse",
+   "source": "lane3_as_applied",
+   "verdict": "collapse",
+   "confidence": 1.0,
+   "reasoning": "The URLs are on the same domain and differ only by a regional suffix or are exact duplicates, indicating regional path clones of one storefront listing."
+  },
+  {
+   "group_id": "l3_ck_c1784f1d8d200",
+   "label": "collapse",
+   "source": "lane3_as_applied",
+   "verdict": "collapse",
+   "confidence": 0.95,
+   "reasoning": "The URLs differ only by a trailing number in the slug, which does not express a product specification and likely indicates a cloned or versioned product page."
+  },
+  {
+   "group_id": "l3_ck_c42ad008ea1a6",
+   "label": "collapse",
+   "source": "lane3_as_applied",
+   "verdict": "collapse",
+   "confidence": 0.95,
+   "reasoning": "The URLs are on the same domain and differ only by a trailing '-2' in the slug, which indicates a duplicate or cloned product page rather than a distinct product specification."
+  },
+  {
+   "group_id": "l3_ck_c9b363cd60c8a",
+   "label": "collapse",
+   "source": "lane3_as_applied",
+   "verdict": "collapse",
+   "confidence": 0.95,
+   "reasoning": "The URLs differ only by a tracking or split-test suffix on the same domain, indicating the same product page."
+  },
+  {
+   "group_id": "l3_ck_cacb2d69981f2",
+   "label": "collapse",
+   "source": "lane3_as_applied",
+   "verdict": "collapse",
+   "confidence": 0.95,
+   "reasoning": "The URLs differ only by a trailing suffix in the slug, which, combined with 'georginasplit_jul22', indicates a split test or campaign tracking for the same product page."
+  },
+  {
+   "group_id": "l3_ck_d15e5e7af567e",
+   "label": "collapse",
+   "source": "lane3_as_applied",
+   "verdict": "collapse",
+   "confidence": 1.0,
+   "reasoning": "URLs differ only by a regional suffix ('-eu') on the same domain, indicating regional path clones of one storefront listing."
+  },
+  {
+   "group_id": "l3_ck_dc2a373353c3a",
+   "label": "collapse",
+   "source": "lane3_as_applied",
+   "verdict": "collapse",
+   "confidence": 1.0,
+   "reasoning": "Listings on the same domain differing only by a regional URL slug ('-eu') are considered regional path clones of one storefront listing."
+  },
+  {
+   "group_id": "l3_ck_dc9e15a63776c",
+   "label": "collapse",
+   "source": "lane3_as_applied",
+   "verdict": "collapse",
+   "confidence": 0.95,
+   "reasoning": "Listings are on the same domain and differ only by a regional URL slug (-eu) or are direct duplicates, indicating regional path clones of one storefront listing."
+  },
+  {
+   "group_id": "l3_ck_dceb158096e26",
+   "label": "collapse",
+   "source": "lane3_as_applied",
+   "verdict": "collapse",
+   "confidence": 1.0,
+   "reasoning": "Listings are on the same domain and differ only by a regional slug suffix ('-eu'), which indicates regional path clones of one storefront listing."
+  },
+  {
+   "group_id": "l3_ck_ddfc659bf6607",
+   "label": "collapse",
+   "source": "lane3_as_applied",
+   "verdict": "collapse",
+   "confidence": 0.95,
+   "reasoning": "URLs on the same domain differing only by regional suffixes (-uk, -eu) are considered regional path clones of a single storefront listing."
+  },
+  {
+   "group_id": "l3_ck_e58b67cdeee58",
+   "label": "collapse",
+   "source": "lane3_as_applied",
+   "verdict": "collapse",
+   "confidence": 0.95,
+   "reasoning": "The listings are on the same domain and differ only by regional URL slugs (-uk, -ca, or no suffix), indicating regional path clones of a single storefront listing."
+  },
+  {
+   "group_id": "l3_ck_e6d385efaa8f9",
+   "label": "collapse",
+   "source": "lane3_as_applied",
+   "verdict": "collapse",
+   "confidence": 1.0,
+   "reasoning": "URLs on the same domain differing only by regional suffixes (-eu, -uk) are considered regional path clones of one storefront listing."
+  },
+  {
+   "group_id": "l3_ck_ed0e2b1d945d7",
+   "label": "collapse",
+   "source": "lane3_as_applied",
+   "verdict": "collapse",
+   "confidence": 0.95,
+   "reasoning": "All listings share identical title and brand, and the URLs differ only by a trailing number on the same domain and path, indicating these are likely tracking suffixes or internal IDs for the same promotional page."
+  },
+  {
+   "group_id": "l3_ck_ed900be6e4f50",
+   "label": "collapse",
+   "source": "lane3_as_applied",
+   "verdict": "collapse",
+   "confidence": 0.9,
+   "reasoning": "The URL slugs contain clear indicators of marketing campaigns, A/B tests, and tracking codes (e.g., 'jul22_ahj4', 'sjy1', 'original1', 'split', 'room', 'context', 'benefit', 'ugc', 'flight', 'socialproof'), suggesting these are different landing pages for the same product."
+  },
+  {
+   "group_id": "l3_ck_f0cba95d1add7",
+   "label": "collapse",
+   "source": "lane3_as_applied",
+   "verdict": "collapse",
+   "confidence": 1.0,
+   "reasoning": "URLs on the same domain differ only by a regional suffix ('-ukeu'), indicating regional path clones of one storefront listing."
+  },
+  {
+   "group_id": "l3_ck_f2fafc394a202",
+   "label": "collapse",
+   "source": "lane3_as_applied",
+   "verdict": "collapse",
+   "confidence": 0.95,
+   "reasoning": "The URLs are on the same domain and the slugs appear to be internal tracking or A/B test variants for the same product page."
+  },
+  {
+   "group_id": "l3_ck_f8c199e4f8491",
+   "label": "collapse",
+   "source": "lane3_as_applied",
+   "verdict": "collapse",
+   "confidence": 0.95,
+   "reasoning": "All listings are on the same domain and differ only by regional URL slugs (-uk, -eu), indicating regional path clones of a single storefront listing."
+  },
+  {
+   "group_id": "l3_ck_f8c7503691013",
+   "label": "collapse",
+   "source": "lane3_as_applied",
+   "verdict": "collapse",
+   "confidence": 0.9,
+   "reasoning": "All listings share identical brand and title, and the URLs differ only by a trailing number in the slug, which appears to be an internal identifier or versioning for the same promotional page, not a product specification."
+  },
+  {
+   "group_id": "l3_ck_fc9da4924c103",
+   "label": "collapse",
+   "source": "lane3_as_applied",
+   "verdict": "collapse",
+   "confidence": 0.95,
+   "reasoning": "The listings have identical titles and brands, and the URLs differ only by a non-spec trailing number on the same domain, indicating duplicate product pages."
+  },
+  {
+   "group_id": "l3_ck_fdb55dc4dc43e",
+   "label": "collapse",
+   "source": "lane3_as_applied",
+   "verdict": "collapse",
+   "confidence": 1.0,
+   "reasoning": "URLs on the same domain differing only by a regional suffix ('-eu') are considered regional path clones of one storefront listing."
+  },
+  {
+   "group_id": "l2_ck_000715328b111",
+   "label": "collapse",
+   "source": "lane2_as_applied",
+   "verdict": "collapse",
+   "confidence": 1.0,
+   "reasoning": "Both listings have identical titles, brands, and URLs, indicating they refer to the exact same product page."
+  },
+  {
+   "group_id": "l2_ck_028032ce3b616",
+   "label": "collapse",
+   "source": "lane2_as_applied",
+   "verdict": "collapse",
+   "confidence": 0.95,
+   "reasoning": "All listings share the same base URL; the additional query parameters in one listing are tracking or variant selectors for the same product page."
+  },
+  {
+   "group_id": "l2_ck_07aa16d5cfe55",
+   "label": "collapse",
+   "source": "lane2_as_applied",
+   "verdict": "collapse",
+   "confidence": 1.0,
+   "reasoning": "Both listings have identical brands, titles, and URLs, indicating they refer to the exact same product page."
+  },
+  {
+   "group_id": "l2_ck_0d5be0d33ae04",
+   "label": "collapse",
+   "source": "lane2_as_applied",
+   "verdict": "collapse",
+   "confidence": 1.0,
+   "reasoning": "The listings have identical titles, brands, and URLs, indicating they are observations of the same product page."
+  },
+  {
+   "group_id": "l2_ck_11f4806a51c6d",
+   "label": "collapse",
+   "source": "lane2_as_applied",
+   "verdict": "collapse",
+   "confidence": 1.0,
+   "reasoning": "Both listings have identical titles, brands (case-insensitive), and URLs, indicating they are the exact same product page."
+  },
+  {
+   "group_id": "l2_ck_165b2290a6976",
+   "label": "collapse",
+   "source": "lane2_as_applied",
+   "verdict": "collapse",
+   "confidence": 1.0,
+   "reasoning": "Both listings have identical titles, brands, and URLs, indicating they are the exact same product page."
+  },
+  {
+   "group_id": "l2_ck_1c278d16d06e9",
+   "label": "collapse",
+   "source": "lane2_as_applied",
+   "verdict": "collapse",
+   "confidence": 1.0,
+   "reasoning": "Both listings have identical titles, brands, and URLs, indicating they are the same product page duplicated."
+  },
+  {
+   "group_id": "l2_ck_24a7e7e0a501c",
+   "label": "collapse",
+   "source": "lane2_as_applied",
+   "verdict": "collapse",
+   "confidence": 1.0,
+   "reasoning": "Both listings have identical titles, brands, and URLs, indicating they refer to the exact same product page on the same domain."
+  },
+  {
+   "group_id": "l2_ck_286f1083b5475",
+   "label": "collapse",
+   "source": "lane2_as_applied",
+   "verdict": "collapse",
+   "confidence": 1.0,
+   "reasoning": "Both listings have identical titles, brands, and URLs, indicating they are observations of the exact same product page."
+  },
+  {
+   "group_id": "l2_ck_2c91c4ed3098a",
+   "label": "collapse",
+   "source": "lane2_as_applied",
+   "verdict": "collapse",
+   "confidence": 1.0,
+   "reasoning": "The listings have identical titles, brands, and URLs, indicating they refer to the exact same product page."
+  },
+  {
+   "group_id": "l2_ck_315cd702a9f84",
+   "label": "collapse",
+   "source": "lane2_as_applied",
+   "verdict": "collapse",
+   "confidence": 1.0,
+   "reasoning": "Both listings have identical titles, brands, and URLs, indicating they refer to the exact same product page."
+  },
+  {
+   "group_id": "l2_ck_363f876c5781e",
+   "label": "collapse",
+   "source": "lane2_as_applied",
+   "verdict": "collapse",
+   "confidence": 1.0,
+   "reasoning": "Both listings have identical titles, brands, and URLs, indicating they are observations of the exact same product page."
+  },
+  {
+   "group_id": "l2_ck_3db16e970bb35",
+   "label": "collapse",
+   "source": "lane2_as_applied",
+   "verdict": "collapse",
+   "confidence": 1.0,
+   "reasoning": "The titles, normalized brands, and URLs are all identical, indicating these are observations of the exact same product page."
+  },
+  {
+   "group_id": "l2_ck_42c1050779688",
+   "label": "collapse",
+   "source": "lane2_as_applied",
+   "verdict": "collapse",
+   "confidence": 1.0,
+   "reasoning": "Both listings have identical titles, brands, and URLs, indicating they are duplicates of the same product page."
+  },
+  {
+   "group_id": "l2_ck_494a6e7856b12",
+   "label": "collapse",
+   "source": "lane2_as_applied",
+   "verdict": "collapse",
+   "confidence": 1.0,
+   "reasoning": "Both listings have identical titles, brands, and URLs, indicating they are the exact same product page duplicated."
+  },
+  {
+   "group_id": "l2_ck_4ee37ccbcb8fa",
+   "label": "collapse",
+   "source": "lane2_as_applied",
+   "verdict": "collapse",
+   "confidence": 1.0,
+   "reasoning": "All listings share the exact same title, brand, and URL, indicating they are multiple observations or re-crawls of the identical product page."
+  },
+  {
+   "group_id": "l2_ck_537fd46223418",
+   "label": "collapse",
+   "source": "lane2_as_applied",
+   "verdict": "collapse",
+   "confidence": 1.0,
+   "reasoning": "Both listings have identical titles, brands (differing only by case), and URLs, indicating they refer to the exact same product page."
+  },
+  {
+   "group_id": "l2_ck_571ee7ec2d6e8",
+   "label": "collapse",
+   "source": "lane2_as_applied",
+   "verdict": "collapse",
+   "confidence": 1.0,
+   "reasoning": "Both listings have identical titles, brands, and URLs, indicating they are observations of the exact same product page."
+  },
+  {
+   "group_id": "l2_ck_59378daec7b2e",
+   "label": "collapse",
+   "source": "lane2_as_applied",
+   "verdict": "collapse",
+   "confidence": 1.0,
+   "reasoning": "Both listings have identical titles, brands, and URLs, indicating they are observations of the same product page."
+  },
+  {
+   "group_id": "l2_ck_5e8993e33a7f2",
+   "label": "collapse",
+   "source": "lane2_as_applied",
+   "verdict": "collapse",
+   "confidence": 1.0,
+   "reasoning": "The listings have identical titles, brands, and URLs, indicating they are observations of the same product page."
+  },
+  {
+   "group_id": "l2_ck_681be6dd213b2",
+   "label": "collapse",
+   "source": "lane2_as_applied",
+   "verdict": "collapse",
+   "confidence": 1.0,
+   "reasoning": "The listings have identical titles, brands, and URLs, indicating they refer to the exact same product page."
+  },
+  {
+   "group_id": "l2_ck_6d43f6bf374f2",
+   "label": "collapse",
+   "source": "lane2_as_applied",
+   "verdict": "collapse",
+   "confidence": 1.0,
+   "reasoning": "The titles, normalized brands, and URLs are all identical, indicating a duplicate listing of the same product page."
+  },
+  {
+   "group_id": "l2_ck_73244fec1ed6b",
+   "label": "collapse",
+   "source": "lane2_as_applied",
+   "verdict": "collapse",
+   "confidence": 1.0,
+   "reasoning": "The listings have identical titles, brands, and URLs, indicating they are the same product page duplicated."
+  },
+  {
+   "group_id": "l2_ck_78941c24c4eab",
+   "label": "collapse",
+   "source": "lane2_as_applied",
+   "verdict": "collapse",
+   "confidence": 1.0,
+   "reasoning": "All listings have identical titles, brands, and URLs, indicating they are the same product page."
+  },
+  {
+   "group_id": "l2_ck_811a0fd4d5503",
+   "label": "collapse",
+   "source": "lane2_as_applied",
+   "verdict": "collapse",
+   "confidence": 1.0,
+   "reasoning": "The brand, title, and URL are all identical, indicating the same product page was observed multiple times."
+  },
+  {
+   "group_id": "l2_ck_8430d93810a8a",
+   "label": "collapse",
+   "source": "lane2_as_applied",
+   "verdict": "collapse",
+   "confidence": 1.0,
+   "reasoning": "The listings have identical titles, brands, and URLs, indicating they are observations of the same product page."
+  },
+  {
+   "group_id": "l2_ck_87bc4417e0a1f",
+   "label": "collapse",
+   "source": "lane2_as_applied",
+   "verdict": "collapse",
+   "confidence": 1.0,
+   "reasoning": "Both listings have identical titles, normalized brands, and URLs, indicating they are the exact same product page observed multiple times."
+  },
+  {
+   "group_id": "l2_ck_8ca3d7a3489c0",
+   "label": "collapse",
+   "source": "lane2_as_applied",
+   "verdict": "collapse",
+   "confidence": 1.0,
+   "reasoning": "Both listings have identical titles, normalized brands, and URLs, indicating they are the same product page."
+  },
+  {
+   "group_id": "l2_ck_907fa3b5b923f",
+   "label": "collapse",
+   "source": "lane2_as_applied",
+   "verdict": "collapse",
+   "confidence": 1.0,
+   "reasoning": "The listings have identical titles, brands, and URLs, indicating they are observations of the same product page."
+  },
+  {
+   "group_id": "l2_ck_97164a649e7d6",
+   "label": "collapse",
+   "source": "lane2_as_applied",
+   "verdict": "collapse",
+   "confidence": 1.0,
+   "reasoning": "Both listings have identical titles, brands, and URLs, indicating they are duplicates of the exact same product page."
+  },
+  {
+   "group_id": "l2_ck_9d24b04b235ac",
+   "label": "collapse",
+   "source": "lane2_as_applied",
+   "verdict": "collapse",
+   "confidence": 1.0,
+   "reasoning": "Both listings have identical titles, brands, and URLs, indicating they refer to the exact same product page."
+  },
+  {
+   "group_id": "l2_ck_a11fecb93dd03",
+   "label": "collapse",
+   "source": "lane2_as_applied",
+   "verdict": "collapse",
+   "confidence": 1.0,
+   "reasoning": "The listings have identical titles, brands, and URLs, indicating they are the same product page."
+  },
+  {
+   "group_id": "l2_ck_a4b5b79568bc2",
+   "label": "collapse",
+   "source": "lane2_as_applied",
+   "verdict": "collapse",
+   "confidence": 1.0,
+   "reasoning": "Both listings have identical titles, brands, and URLs, indicating they are the exact same product page duplicated."
+  },
+  {
+   "group_id": "l2_ck_a7db481913779",
+   "label": "collapse",
+   "source": "lane2_as_applied",
+   "verdict": "collapse",
+   "confidence": 1.0,
+   "reasoning": "Both listings have identical titles, brands, and URLs, indicating they are the exact same product page duplicated."
+  },
+  {
+   "group_id": "l2_ck_adccf0801b6ea",
+   "label": "collapse",
+   "source": "lane2_as_applied",
+   "verdict": "collapse",
+   "confidence": 1.0,
+   "reasoning": "Both listings have identical titles, brands, and URLs, indicating they are the same product page duplicated."
+  },
+  {
+   "group_id": "l2_ck_b1c5e3f5cba3e",
+   "label": "collapse",
+   "source": "lane2_as_applied",
+   "verdict": "collapse",
+   "confidence": 1.0,
+   "reasoning": "The brand, title, and full URL are identical for both listings, indicating they are the same product page duplicated."
+  },
+  {
+   "group_id": "l2_ck_b673457e046a9",
+   "label": "collapse",
+   "source": "lane2_as_applied",
+   "verdict": "collapse",
+   "confidence": 1.0,
+   "reasoning": "Both listings have identical brand, title, and URL, indicating they refer to the exact same product page."
+  },
+  {
+   "group_id": "l2_ck_ba8708c0bb904",
+   "label": "collapse",
+   "source": "lane2_as_applied",
+   "verdict": "collapse",
+   "confidence": 1.0,
+   "reasoning": "The listings have identical brand, title, and URL, indicating they are observations of the exact same product page."
+  },
+  {
+   "group_id": "l2_ck_c32c166c0ac26",
+   "label": "collapse",
+   "source": "lane2_as_applied",
+   "verdict": "collapse",
+   "confidence": 1.0,
+   "reasoning": "The brand, title, and URL are identical for both listings, indicating they are duplicate observations of the same product page."
+  },
+  {
+   "group_id": "l2_ck_c8deaa68a3e6d",
+   "label": "collapse",
+   "source": "lane2_as_applied",
+   "verdict": "collapse",
+   "confidence": 1.0,
+   "reasoning": "Both listings have identical titles, brands, and URLs, indicating they refer to the exact same product page."
+  },
+  {
+   "group_id": "l2_ck_cd75205e43d54",
+   "label": "collapse",
+   "source": "lane2_as_applied",
+   "verdict": "collapse",
+   "confidence": 1.0,
+   "reasoning": "Both listings share identical titles, brands, and URLs, indicating they are the same product page."
+  },
+  {
+   "group_id": "l2_ck_d9e136fc53864",
+   "label": "collapse",
+   "source": "lane2_as_applied",
+   "verdict": "collapse",
+   "confidence": 1.0,
+   "reasoning": "Both listings have identical titles and URLs, indicating they refer to the exact same product page, with only a minor capitalization difference in the brand name."
+  },
+  {
+   "group_id": "l2_ck_df0a467d97119",
+   "label": "collapse",
+   "source": "lane2_as_applied",
+   "verdict": "collapse",
+   "confidence": 1.0,
+   "reasoning": "Both listings have identical titles, brands, and URLs, indicating they are the exact same product page duplicated."
+  },
+  {
+   "group_id": "l2_ck_e2c8b7dfd4664",
+   "label": "collapse",
+   "source": "lane2_as_applied",
+   "verdict": "collapse",
+   "confidence": 1.0,
+   "reasoning": "Both listings have identical brand, title, and URL, indicating they are the exact same product page."
+  },
+  {
+   "group_id": "l2_ck_e67d9ec341454",
+   "label": "collapse",
+   "source": "lane2_as_applied",
+   "verdict": "collapse",
+   "confidence": 1.0,
+   "reasoning": "The listings have identical URLs, indicating they point to the exact same product page."
+  },
+  {
+   "group_id": "l2_ck_ea14d8b5f729f",
+   "label": "collapse",
+   "source": "lane2_as_applied",
+   "verdict": "collapse",
+   "confidence": 1.0,
+   "reasoning": "Both listings have identical titles, brands (case-insensitive), and URLs, indicating they are observations of the exact same product page."
+  },
+  {
+   "group_id": "l2_ck_f04edfa8826de",
+   "label": "collapse",
+   "source": "lane2_as_applied",
+   "verdict": "collapse",
+   "confidence": 1.0,
+   "reasoning": "All provided attributes (title, brand, and URL) are identical for both listings, indicating they are the same product page duplicated."
+  },
+  {
+   "group_id": "l2_ck_f50b7ee804dea",
+   "label": "collapse",
+   "source": "lane2_as_applied",
+   "verdict": "collapse",
+   "confidence": 1.0,
+   "reasoning": "Both listings have identical URLs, indicating they point to the exact same product page on the same domain."
+  },
+  {
+   "group_id": "l2_ck_f911b75e76e4f",
+   "label": "collapse",
+   "source": "lane2_as_applied",
+   "verdict": "collapse",
+   "confidence": 1.0,
+   "reasoning": "The titles, brands, and URLs are all identical, indicating these are duplicate observations of the same product page."
+  },
+  {
+   "group_id": "l2_ck_fce5ed706c6d1",
+   "label": "collapse",
+   "source": "lane2_as_applied",
+   "verdict": "collapse",
+   "confidence": 1.0,
+   "reasoning": "The brand, title, and URL are all identical for both listings, indicating they refer to the exact same product page."
+  },
+  {
+   "group_id": "l4_ck_00766907d0ad7",
+   "label": "keep_separate",
+   "source": "KEEP_multi_seller_observation",
+   "verdict": "keep_separate",
+   "confidence": 0.95,
+   "reasoning": "The listings are for the same product but are found on different seller domains (the brand's official site vs. a retailer)."
+  },
+  {
+   "group_id": "l4_ck_01f63f94dd920",
+   "label": "keep_separate",
+   "source": "KEEP_multi_seller_observation",
+   "verdict": "keep_separate",
+   "confidence": 0.95,
+   "reasoning": "Listing [0] is on a different retailer domain (bestbuy.com) than listings [1] and [2] (sony.com), making it a legitimately separate listing, even though [1] and [2] are duplicates of each other."
+  },
+  {
+   "group_id": "l4_ck_020b7bc1543ad",
+   "label": "keep_separate",
+   "source": "KEEP_multi_seller_observation",
+   "verdict": "keep_separate",
+   "confidence": 0.95,
+   "reasoning": "The listings are for the same product but originate from different seller domains (brand's official site vs. a retailer)."
+  },
+  {
+   "group_id": "l4_ck_04ede53a30147",
+   "label": "keep_separate",
+   "source": "KEEP_multi_seller_observation",
+   "verdict": "keep_separate",
+   "confidence": 0.95,
+   "reasoning": "The listings are for the same product but are legitimately separate because they originate from different seller domains (the brand's official site vs. a retailer)."
+  },
+  {
+   "group_id": "l4_ck_0b3faa8916a03",
+   "label": "keep_separate",
+   "source": "KEEP_multi_seller_observation",
+   "verdict": "keep_separate",
+   "confidence": 0.9,
+   "reasoning": "Listing [0] is from a different retailer domain (Best Buy) than listings [1] and [2] (Samsung's official site), making it a distinct observation, even though [1] and [2] are identical duplicates."
+  },
+  {
+   "group_id": "l4_ck_0c969710b2a7b",
+   "label": "keep_separate",
+   "source": "KEEP_multi_seller_observation",
+   "verdict": "keep_separate",
+   "confidence": 1.0,
+   "reasoning": "The same product is listed on the brand's official website and a distinct retailer's website, which are considered separate storefronts."
+  },
+  {
+   "group_id": "l4_ck_10a8ab2b19b69",
+   "label": "keep_separate",
+   "source": "KEEP_regional_storefronts",
+   "verdict": "keep_separate",
+   "confidence": 1.0,
+   "reasoning": "The listings are for the same product but are hosted on different regional domains (.jp vs .us), which represent separate storefronts according to the rules."
+  },
+  {
+   "group_id": "l4_ck_11efc6ebe08b5",
+   "label": "keep_separate",
+   "source": "KEEP_multi_seller_observation",
+   "verdict": "keep_separate",
+   "confidence": 0.95,
+   "reasoning": "The listings are for the same product but are found on different seller domains (a retailer vs. the brand's own site), which constitutes legitimately distinct multi-seller observations."
+  },
+  {
+   "group_id": "l4_ck_120d20d3f929e",
+   "label": "keep_separate",
+   "source": "KEEP_multi_seller_observation",
+   "verdict": "keep_separate",
+   "confidence": 0.95,
+   "reasoning": "Listing [0] is from a retailer (ulta.com), while listings [1] and [2] are from the brand's own website (esteelauder.com), making them legitimately separate multi-seller observations."
+  },
+  {
+   "group_id": "l4_ck_12c4b16eed04a",
+   "label": "keep_separate",
+   "source": "KEEP_multi_seller_observation",
+   "verdict": "keep_separate",
+   "confidence": 0.95,
+   "reasoning": "The listings are for the same product but are hosted on different domains (brand's official site vs. a retailer), which constitutes legitimately separate listings."
+  },
+  {
+   "group_id": "l4_ck_1a141552db513",
+   "label": "keep_separate",
+   "source": "KEEP_multi_seller_observation",
+   "verdict": "keep_separate",
+   "confidence": 1.0,
+   "reasoning": "The listings are for the same product but are sold on different domains (a retailer vs. the brand's official site), which are legitimately separate storefronts."
+  },
+  {
+   "group_id": "l4_ck_1bb81b0e2499c",
+   "label": "keep_separate",
+   "source": "KEEP_multi_seller_observation",
+   "verdict": "keep_separate",
+   "confidence": 0.95,
+   "reasoning": "The listings are for the same product sold on different domains (the brand's official site vs. a retailer)."
+  },
+  {
+   "group_id": "l4_ck_1c0f8e1ea9664",
+   "label": "keep_separate",
+   "source": "KEEP_regional_storefronts",
+   "verdict": "keep_separate",
+   "confidence": 0.95,
+   "reasoning": "The listings are on different regional storefront domains (.us vs .jp), which are considered legitimately separate listings."
+  },
+  {
+   "group_id": "l4_ck_1f74136fc6a80",
+   "label": "keep_separate",
+   "source": "KEEP_multi_seller_observation",
+   "verdict": "keep_separate",
+   "confidence": 1.0,
+   "reasoning": "The listings are for the same product but are on different domains (brand's official site vs. a retailer's site), making them legitimately separate storefront listings."
+  },
+  {
+   "group_id": "l4_ck_2058bf8fad78c",
+   "label": "keep_separate",
+   "source": "KEEP_regional_storefronts",
+   "verdict": "keep_separate",
+   "confidence": 0.95,
+   "reasoning": "The listings are on different regional domains (.us vs .jp), which represent separate storefronts and should be kept separate."
+  },
+  {
+   "group_id": "l4_ck_205eecd46ac88",
+   "label": "keep_separate",
+   "source": "KEEP_regional_storefronts",
+   "verdict": "keep_separate",
+   "confidence": 0.95,
+   "reasoning": "The listings are on different regional domains (.jp vs .us), which represent separate storefronts according to the rules."
+  },
+  {
+   "group_id": "l4_ck_2249bc9cfbd67",
+   "label": "keep_separate",
+   "source": "KEEP_regional_storefronts",
+   "verdict": "keep_separate",
+   "confidence": 1.0,
+   "reasoning": "The listings are on different regional domains (.us vs .jp), which represent separate storefronts."
+  },
+  {
+   "group_id": "l4_ck_230c41b0bf080",
+   "label": "keep_separate",
+   "source": "KEEP_multi_seller_observation",
+   "verdict": "keep_separate",
+   "confidence": 1.0,
+   "reasoning": "The listings are for the same product but are hosted on different domains: one is the brand's official website (cosrx.com) and the other is a retailer's website (sokoglam.com), which are considered legitimately separate listings."
+  },
+  {
+   "group_id": "l4_ck_23ed79d5cd293",
+   "label": "keep_separate",
+   "source": "KEEP_regional_storefronts",
+   "verdict": "keep_separate",
+   "confidence": 1.0,
+   "reasoning": "The listings are on different regional domains (.us vs .jp), indicating separate storefronts, which should be kept separate."
+  },
+  {
+   "group_id": "l4_ck_247d90efc344e",
+   "label": "keep_separate",
+   "source": "KEEP_regional_storefronts",
+   "verdict": "keep_separate",
+   "confidence": 1.0,
+   "reasoning": "The listings are on different regional domains (.us vs .jp), which represent separate storefronts and should be kept separate according to the rules."
+  },
+  {
+   "group_id": "l4_ck_252a70c2d457b",
+   "label": "keep_separate",
+   "source": "KEEP_multi_seller_observation",
+   "verdict": "keep_separate",
+   "confidence": 1.0,
+   "reasoning": "The listings are for the same product but are hosted on different domains (a retailer vs. the brand's official site), which constitutes legitimately separate listings according to the rules."
+  },
+  {
+   "group_id": "l4_ck_2579545fc7afb",
+   "label": "keep_separate",
+   "source": "KEEP_regional_storefronts",
+   "verdict": "keep_separate",
+   "confidence": 0.95,
+   "reasoning": "The listings are for the same product but are hosted on different regional storefront domains (.us vs .jp), which are considered legitimately separate listings."
+  },
+  {
+   "group_id": "l4_ck_2a3ac9ecc23d8",
+   "label": "keep_separate",
+   "source": "KEEP_regional_storefronts",
+   "verdict": "keep_separate",
+   "confidence": 0.95,
+   "reasoning": "The listings are on different regional-storefront domains (.us vs .jp), which are considered separate storefronts."
+  },
+  {
+   "group_id": "l4_ck_2ead0707d8ff8",
+   "label": "keep_separate",
+   "source": "KEEP_multi_seller_observation",
+   "verdict": "keep_separate",
+   "confidence": 0.9,
+   "reasoning": "Listing [1] is from a different retailer domain (Best Buy) than listings [0] and [2] (Sennheiser's brand site), making it a legitimately separate listing, which prevents an overall 'collapse' verdict for the entire set."
+  },
+  {
+   "group_id": "l4_ck_3008349189d07",
+   "label": "keep_separate",
+   "source": "KEEP_regional_storefronts",
+   "verdict": "keep_separate",
+   "confidence": 1.0,
+   "reasoning": "The listings are on different regional domains (.us vs .jp), which represent separate storefronts."
+  },
+  {
+   "group_id": "l4_ck_308435f0a07e6",
+   "label": "keep_separate",
+   "source": "KEEP_regional_storefronts",
+   "verdict": "keep_separate",
+   "confidence": 0.95,
+   "reasoning": "The listings are on different regional domains (.jp vs .us), which represent separate storefronts, not duplicates."
+  },
+  {
+   "group_id": "l4_ck_3352fd51b0456",
+   "label": "keep_separate",
+   "source": "KEEP_regional_storefronts",
+   "verdict": "keep_separate",
+   "confidence": 1.0,
+   "reasoning": "The listings are on different regional domains (.us and .jp), which represent separate storefronts and should be kept separate according to the rules."
+  },
+  {
+   "group_id": "l4_ck_3759e486e2e62",
+   "label": "keep_separate",
+   "source": "KEEP_multi_seller_observation",
+   "verdict": "keep_separate",
+   "confidence": 0.95,
+   "reasoning": "Listings are from different retailers (Apple vs Best Buy) and specify different colors ('midnight' vs 'blue'), making them legitimately distinct purchasable items, even though two of the listings are duplicates of each other."
+  },
+  {
+   "group_id": "l4_ck_394ebf7815b72",
+   "label": "keep_separate",
+   "source": "KEEP_regional_storefronts",
+   "verdict": "keep_separate",
+   "confidence": 1.0,
+   "reasoning": "The listings are on different regional domains (.jp vs .us), indicating separate storefronts, which should be kept separate according to the rules."
+  },
+  {
+   "group_id": "l4_ck_3b2901ff67bfc",
+   "label": "keep_separate",
+   "source": "KEEP_regional_storefronts",
+   "verdict": "keep_separate",
+   "confidence": 1.0,
+   "reasoning": "The listings are on different regional domains (.us vs .jp), indicating separate storefronts, which should be kept separate."
+  },
+  {
+   "group_id": "l4_ck_3c985e7fac7e3",
+   "label": "keep_separate",
+   "source": "KEEP_multi_seller_observation",
+   "verdict": "keep_separate",
+   "confidence": 1.0,
+   "reasoning": "The listings are for the same product but are from different seller domains (brand site vs. retailer)."
+  },
+  {
+   "group_id": "l4_ck_3da3bd2251101",
+   "label": "keep_separate",
+   "source": "KEEP_regional_storefronts",
+   "verdict": "keep_separate",
+   "confidence": 1.0,
+   "reasoning": "The listings are on different regional storefront domains (.jp vs .us), which are considered separate purchasable listings."
+  },
+  {
+   "group_id": "l4_ck_3daf075d8bc58",
+   "label": "keep_separate",
+   "source": "KEEP_multi_seller_observation",
+   "verdict": "keep_separate",
+   "confidence": 0.95,
+   "reasoning": "The listings are on different domains (brand site vs. retailer site), which makes them distinct purchasable listings."
+  },
+  {
+   "group_id": "l4_ck_3de700484b6ac",
+   "label": "keep_separate",
+   "source": "KEEP_multi_seller_observation",
+   "verdict": "keep_separate",
+   "confidence": 0.95,
+   "reasoning": "The listings are for the same product sold on different retailer domains (the brand's official site vs. Ulta)."
+  },
+  {
+   "group_id": "l4_ck_4422d3c43ed76",
+   "label": "keep_separate",
+   "source": "KEEP_regional_storefronts",
+   "verdict": "keep_separate",
+   "confidence": 1.0,
+   "reasoning": "The listings are on different regional domains (.us vs .jp), which are considered separate storefronts according to the rules."
+  },
+  {
+   "group_id": "l4_ck_46250f773d2eb",
+   "label": "keep_separate",
+   "source": "KEEP_multi_seller_observation",
+   "verdict": "keep_separate",
+   "confidence": 0.95,
+   "reasoning": "The listings are from different domains: one is a retailer (ulta.com) and the other is the brand's official site (lorealparisusa.com), which are considered distinct storefronts."
+  },
+  {
+   "group_id": "l4_ck_465bfbf2cbf89",
+   "label": "keep_separate",
+   "source": "KEEP_multi_seller_observation",
+   "verdict": "keep_separate",
+   "confidence": 0.95,
+   "reasoning": "The listings are for the same product but are hosted on different seller domains (brand site vs. retailer), which should be kept separate."
+  },
+  {
+   "group_id": "l4_ck_479bc1b79c926",
+   "label": "keep_separate",
+   "source": "KEEP_regional_storefronts",
+   "verdict": "keep_separate",
+   "confidence": 0.9,
+   "reasoning": "The listings are on different regional storefront domains (.jp vs .us), which are considered legitimately separate listings."
+  },
+  {
+   "group_id": "l4_ck_4d831d782c92d",
+   "label": "keep_separate",
+   "source": "KEEP_regional_storefronts",
+   "verdict": "keep_separate",
+   "confidence": 0.95,
+   "reasoning": "The listings are for the same product but on different regional storefront domains (.jp vs .us), which are considered legitimately separate."
+  },
+  {
+   "group_id": "l4_ck_5478a79409c09",
+   "label": "keep_separate",
+   "source": "KEEP_multi_seller_observation",
+   "verdict": "keep_separate",
+   "confidence": 1.0,
+   "reasoning": "The listings are for the same product but originate from different seller domains (the brand's official site vs. a retailer)."
+  },
+  {
+   "group_id": "l4_ck_55677dc41e173",
+   "label": "keep_separate",
+   "source": "KEEP_multi_seller_observation",
+   "verdict": "keep_separate",
+   "confidence": 1.0,
+   "reasoning": "The listings are from different seller domains (a retailer vs. the brand's official site), which are legitimately distinct observations."
+  },
+  {
+   "group_id": "l4_ck_55af98167f900",
+   "label": "keep_separate",
+   "source": "KEEP_regional_storefronts",
+   "verdict": "keep_separate",
+   "confidence": 1.0,
+   "reasoning": "The listings are on different regional domains (.us vs .jp), indicating separate storefronts, which should be kept separate according to the rules."
+  },
+  {
+   "group_id": "l4_ck_5b1172242b28f",
+   "label": "keep_separate",
+   "source": "KEEP_multi_seller_observation",
+   "verdict": "keep_separate",
+   "confidence": 1.0,
+   "reasoning": "The listings are for the same product but are from different seller domains (brand site vs. retailer), which should be kept separate."
+  },
+  {
+   "group_id": "l4_ck_606dc9051883c",
+   "label": "keep_separate",
+   "source": "KEEP_multi_seller_observation",
+   "verdict": "keep_separate",
+   "confidence": 1.0,
+   "reasoning": "The listings are for the same product but are found on different seller domains (brand's official site vs. a retailer)."
+  },
+  {
+   "group_id": "l4_ck_65ef16486c0d6",
+   "label": "keep_separate",
+   "source": "KEEP_regional_storefronts",
+   "verdict": "keep_separate",
+   "confidence": 0.95,
+   "reasoning": "The listings are on different regional storefront domains (.jp vs .us), which are considered legitimately separate listings according to the rules."
+  },
+  {
+   "group_id": "l4_ck_685dda60794f3",
+   "label": "keep_separate",
+   "source": "KEEP_multi_seller_observation",
+   "verdict": "keep_separate",
+   "confidence": 0.95,
+   "reasoning": "The listings are for the same product sold on different seller domains (brand's official site vs. a retailer)."
+  },
+  {
+   "group_id": "l4_ck_698ddc49670eb",
+   "label": "keep_separate",
+   "source": "KEEP_regional_storefronts",
+   "verdict": "keep_separate",
+   "confidence": 1.0,
+   "reasoning": "The listings are on different regional domains (.jp vs .us), which represent separate storefronts."
+  },
+  {
+   "group_id": "l4_ck_6ae38af8dde24",
+   "label": "keep_separate",
+   "source": "KEEP_multi_seller_observation",
+   "verdict": "keep_separate",
+   "confidence": 1.0,
+   "reasoning": "The listings are for the same product but are found on different domains (a retailer and the brand's official site), which constitutes separate observations."
+  },
+  {
+   "group_id": "l4_ck_6b17321120dc4",
+   "label": "keep_separate",
+   "source": "KEEP_regional_storefronts",
+   "verdict": "keep_separate",
+   "confidence": 1.0,
+   "reasoning": "The listings are on different regional domains (.jp vs .us), which are considered separate storefronts even if the product details and URL paths are identical."
+  },
+  {
+   "group_id": "l4_ck_6e45a056ac625",
+   "label": "keep_separate",
+   "source": "KEEP_regional_storefronts",
+   "verdict": "keep_separate",
+   "confidence": 1.0,
+   "reasoning": "The listings are on different regional domains (.jp vs .us), which are considered separate storefronts and thus distinct purchasable listings."
+  },
+  {
+   "group_id": "l4_ck_6f2ce9465a5ae",
+   "label": "keep_separate",
+   "source": "KEEP_multi_seller_observation",
+   "verdict": "keep_separate",
+   "confidence": 1.0,
+   "reasoning": "The listings are for the same product but are on different domains (brand site vs. retailer site), which constitutes separate storefronts."
+  },
+  {
+   "group_id": "l4_ck_700f2748c78d7",
+   "label": "keep_separate",
+   "source": "KEEP_multi_seller_observation",
+   "verdict": "keep_separate",
+   "confidence": 0.95,
+   "reasoning": "Listings from the brand's own website (Benefit) and a distinct retailer's website (Ulta) are legitimately separate purchasable listings, even if some URLs on the brand's site are duplicates of each other."
+  },
+  {
+   "group_id": "l4_ck_70ee3271bdb9e",
+   "label": "keep_separate",
+   "source": "KEEP_regional_storefronts",
+   "verdict": "keep_separate",
+   "confidence": 1.0,
+   "reasoning": "The listings are on different regional domains (.us vs .jp), indicating separate storefronts, which should be kept separate according to the rules."
+  },
+  {
+   "group_id": "l4_ck_71304aeb63fb7",
+   "label": "keep_separate",
+   "source": "KEEP_multi_seller_observation",
+   "verdict": "keep_separate",
+   "confidence": 0.95,
+   "reasoning": "These are listings for the same product sold on different seller domains (brand site vs. retailer)."
+  },
+  {
+   "group_id": "l4_ck_7392a953c262d",
+   "label": "keep_separate",
+   "source": "KEEP_multi_seller_observation",
+   "verdict": "keep_separate",
+   "confidence": 0.95,
+   "reasoning": "These are the same product listed on different domains: one is a retailer (ulta.com) and the other is the brand's official site (theordinary.com), which should be kept separate."
+  },
+  {
+   "group_id": "l4_ck_748777c5b43c3",
+   "label": "keep_separate",
+   "source": "KEEP_regional_storefronts",
+   "verdict": "keep_separate",
+   "confidence": 0.95,
+   "reasoning": "Listings are on separate regional domains (.us vs .jp), which are considered distinct storefronts per the rules."
+  },
+  {
+   "group_id": "l4_ck_77a5094009cb6",
+   "label": "keep_separate",
+   "source": "KEEP_regional_storefronts",
+   "verdict": "keep_separate",
+   "confidence": 0.95,
+   "reasoning": "The listings are on different regional storefront domains (.us vs .jp), which are considered legitimately separate listings."
+  },
+  {
+   "group_id": "l4_ck_78a025db28e43",
+   "label": "keep_separate",
+   "source": "KEEP_regional_storefronts",
+   "verdict": "keep_separate",
+   "confidence": 1.0,
+   "reasoning": "The listings are for the same product but on different regional storefront domains (.jp vs .us), which are considered legitimately separate listings."
+  },
+  {
+   "group_id": "l4_ck_7c4f960466331",
+   "label": "keep_separate",
+   "source": "KEEP_multi_seller_observation",
+   "verdict": "keep_separate",
+   "confidence": 0.95,
+   "reasoning": "These listings are for the same product but are legitimately separate because they originate from different seller domains (brand site vs. retailer)."
+  },
+  {
+   "group_id": "l4_ck_7e96eee640a68",
+   "label": "keep_separate",
+   "source": "KEEP_multi_seller_observation",
+   "verdict": "keep_separate",
+   "confidence": 1.0,
+   "reasoning": "The listings are for the same product but are hosted on different seller domains (the brand's official site vs. a retailer's site)."
+  },
+  {
+   "group_id": "l4_ck_80138594d4579",
+   "label": "keep_separate",
+   "source": "KEEP_regional_storefronts",
+   "verdict": "keep_separate",
+   "confidence": 0.95,
+   "reasoning": "The listings are on different regional domains (.us vs .jp), which represent separate storefronts and distinct purchasable listings, even if the product and URL slug are otherwise identical."
+  },
+  {
+   "group_id": "l4_ck_897f419948360",
+   "label": "keep_separate",
+   "source": "KEEP_regional_storefronts",
+   "verdict": "keep_separate",
+   "confidence": 0.95,
+   "reasoning": "The listings are on different regional domains (.us vs .jp), which represent separate storefronts according to the rules."
+  },
+  {
+   "group_id": "l4_ck_8aada760b3c58",
+   "label": "keep_separate",
+   "source": "KEEP_multi_seller_observation",
+   "verdict": "keep_separate",
+   "confidence": 0.95,
+   "reasoning": "The listings are from different domains (a retailer and the brand's official site), representing distinct storefront observations of the same product."
+  },
+  {
+   "group_id": "l4_ck_8bf284e6b50d9",
+   "label": "keep_separate",
+   "source": "KEEP_multi_seller_observation",
+   "verdict": "keep_separate",
+   "confidence": 0.95,
+   "reasoning": "The listings originate from different seller/retailer domains (Maybelline's brand site, Target, and Ulta), which are considered legitimately separate listings."
+  },
+  {
+   "group_id": "l4_ck_8bf562310a73d",
+   "label": "keep_separate",
+   "source": "KEEP_regional_storefronts",
+   "verdict": "keep_separate",
+   "confidence": 1.0,
+   "reasoning": "The listings are on different regional storefront domains (.us and .jp), which are considered legitimately separate listings according to the rules."
+  },
+  {
+   "group_id": "l4_ck_8fae0d7fcb5fd",
+   "label": "keep_separate",
+   "source": "KEEP_multi_seller_observation",
+   "verdict": null,
+   "confidence": 0.0,
+   "reasoning": null
+  },
+  {
+   "group_id": "l4_ck_902e6fada28fd",
+   "label": "keep_separate",
+   "source": "KEEP_regional_storefronts",
+   "verdict": "keep_separate",
+   "confidence": 0.8,
+   "reasoning": "Listings on different regional domains (.us vs .jp) represent distinct purchasable listings, even if there are likely duplicate URLs within each domain."
+  },
+  {
+   "group_id": "l4_ck_914bb89381d15",
+   "label": "keep_separate",
+   "source": "KEEP_regional_storefronts",
+   "verdict": "keep_separate",
+   "confidence": 1.0,
+   "reasoning": "The listings are on different regional domains (.us vs .jp), indicating separate storefronts for the same product."
+  },
+  {
+   "group_id": "l4_ck_91ea0a689b010",
+   "label": "keep_separate",
+   "source": "KEEP_regional_storefronts",
+   "verdict": "keep_separate",
+   "confidence": 1.0,
+   "reasoning": "The listings are on separate regional domains (.jp vs .us), which are considered distinct storefronts according to the rules."
+  },
+  {
+   "group_id": "l4_ck_939480cbc7bca",
+   "label": "keep_separate",
+   "source": "KEEP_multi_seller_observation",
+   "verdict": "keep_separate",
+   "confidence": 0.95,
+   "reasoning": "The listings are for the same product but are hosted on different seller domains (brand site vs. retailer site), which are considered legitimately separate listings."
+  },
+  {
+   "group_id": "l4_ck_9509938241fd7",
+   "label": "keep_separate",
+   "source": "KEEP_regional_storefronts",
+   "verdict": "keep_separate",
+   "confidence": 0.95,
+   "reasoning": "Listings are on different regional domains (.jp vs .us), which are considered separate storefronts per the rules, even with identical titles and '-copy' slugs."
+  },
+  {
+   "group_id": "l4_ck_a14faa694f176",
+   "label": "keep_separate",
+   "source": "KEEP_multi_seller_observation",
+   "verdict": "keep_separate",
+   "confidence": 1.0,
+   "reasoning": "The listings are for the same product but are hosted on different seller domains (brand's official site vs. a retailer), which are considered legitimately distinct observations."
+  },
+  {
+   "group_id": "l4_ck_a43ce905d6513",
+   "label": "keep_separate",
+   "source": "KEEP_multi_seller_observation",
+   "verdict": "keep_separate",
+   "confidence": 0.95,
+   "reasoning": "The listings are for the same product but are found on different domains (a retailer vs. the brand's official site), making them legitimately separate observations."
+  },
+  {
+   "group_id": "l4_ck_a55cef1a581cb",
+   "label": "keep_separate",
+   "source": "KEEP_regional_storefronts",
+   "verdict": "keep_separate",
+   "confidence": 1.0,
+   "reasoning": "The listings are on different regional storefront domains (.us vs .jp), which are considered legitimately distinct listings."
+  },
+  {
+   "group_id": "l4_ck_a724d81c5c149",
+   "label": "keep_separate",
+   "source": "KEEP_multi_seller_observation",
+   "verdict": "keep_separate",
+   "confidence": 0.95,
+   "reasoning": "These are the same product sold on different domains: the brand's official site and a retailer's site, which are legitimately distinct listings."
+  },
+  {
+   "group_id": "l4_ck_a7c5868e03045",
+   "label": "keep_separate",
+   "source": "KEEP_regional_storefronts",
+   "verdict": "keep_separate",
+   "confidence": 1.0,
+   "reasoning": "The listings are on different regional domains (.us vs .jp), which represent separate storefronts and should be kept separate according to the rules."
+  },
+  {
+   "group_id": "l4_ck_a7d3d790c5b7a",
+   "label": "keep_separate",
+   "source": "KEEP_regional_storefronts",
+   "verdict": "keep_separate",
+   "confidence": 1.0,
+   "reasoning": "The listings are on different regional storefront domains (.jp and .us), which are considered separate purchasable listings according to the rules."
+  },
+  {
+   "group_id": "l4_ck_a86c41d6ac28b",
+   "label": "keep_separate",
+   "source": "KEEP_regional_storefronts",
+   "verdict": "keep_separate",
+   "confidence": 0.95,
+   "reasoning": "The listings are on different regional domains (.us vs .jp), indicating separate storefronts, which per rules should be kept separate."
+  },
+  {
+   "group_id": "l4_ck_a9180f65cfcce",
+   "label": "keep_separate",
+   "source": "KEEP_multi_seller_observation",
+   "verdict": "keep_separate",
+   "confidence": 0.95,
+   "reasoning": "The listings are from different domains: one is the brand's official site (theordinary.com) and the other is a retailer's site (ulta.com), making them distinct observations of the same product across different storefronts."
+  },
+  {
+   "group_id": "l4_ck_ab43e145163dc",
+   "label": "keep_separate",
+   "source": "KEEP_multi_seller_observation",
+   "verdict": "keep_separate",
+   "confidence": 0.95,
+   "reasoning": "Listings are from different retailer domains (Amazon, Best Buy) and the brand's official site (Sony.com), making them legitimately separate observations of the same product. While two Sony.com URLs are identical, the presence of distinct domains means the set as a whole is not merely duplicates of one listing."
+  },
+  {
+   "group_id": "l4_ck_ac7d470cab786",
+   "label": "keep_separate",
+   "source": "KEEP_regional_storefronts",
+   "verdict": "keep_separate",
+   "confidence": 1.0,
+   "reasoning": "The listings are for the same product but on different regional-storefront domains (.jp vs .us), which should be kept separate as per rules."
+  },
+  {
+   "group_id": "l4_ck_afbfe2fb4a908",
+   "label": "keep_separate",
+   "source": "KEEP_multi_seller_observation",
+   "verdict": "keep_separate",
+   "confidence": 1.0,
+   "reasoning": "The listings are for the same product sold on different retailer (Ulta) and brand (The Ordinary) domains."
+  },
+  {
+   "group_id": "l4_ck_b29b3c9b81e94",
+   "label": "keep_separate",
+   "source": "KEEP_regional_storefronts",
+   "verdict": "keep_separate",
+   "confidence": 1.0,
+   "reasoning": "The listings are on different regional domains (.jp vs .us), which are considered separate storefronts."
+  },
+  {
+   "group_id": "l4_ck_b75008a97bf9d",
+   "label": "keep_separate",
+   "source": "KEEP_multi_seller_observation",
+   "verdict": "keep_separate",
+   "confidence": 0.95,
+   "reasoning": "The listings are for the same product but are sold on different domains (a retailer vs. the brand's official site), which constitutes legitimately distinct multi-seller observations."
+  },
+  {
+   "group_id": "l4_ck_bceff92177b6b",
+   "label": "keep_separate",
+   "source": "KEEP_regional_storefronts",
+   "verdict": "keep_separate",
+   "confidence": 1.0,
+   "reasoning": "The listings are on different regional domains (.us vs .jp), which represent separate storefronts, even if the product details and URL paths are otherwise identical."
+  },
+  {
+   "group_id": "l4_ck_bd40e6d907c4a",
+   "label": "keep_separate",
+   "source": "KEEP_regional_storefronts",
+   "verdict": "keep_separate",
+   "confidence": 1.0,
+   "reasoning": "The listings are on different regional domains (.jp vs .us), which represent separate storefronts, not duplicates of the same product page."
+  },
+  {
+   "group_id": "l4_ck_bdb52051d1f82",
+   "label": "keep_separate",
+   "source": "KEEP_multi_seller_observation",
+   "verdict": "unsure",
+   "confidence": 0.9,
+   "reasoning": "Listings [0] and [1] are regional path clones on the same domain and should collapse, but listing [2] is on a different retailer domain and should be kept separate, making the set a mix of duplicates and distinct listings."
+  },
+  {
+   "group_id": "l4_ck_c012b7375025d",
+   "label": "keep_separate",
+   "source": "KEEP_multi_seller_observation",
+   "verdict": "keep_separate",
+   "confidence": 0.95,
+   "reasoning": "The listings are for the same product but are found on different seller domains (the brand's official site vs. a retailer)."
+  },
+  {
+   "group_id": "l4_ck_c2442f47ec399",
+   "label": "keep_separate",
+   "source": "KEEP_regional_storefronts",
+   "verdict": "keep_separate",
+   "confidence": 1.0,
+   "reasoning": "The listings are on different regional domains (.us vs .jp), indicating separate storefronts, which should be kept separate according to the rules."
+  },
+  {
+   "group_id": "l4_ck_c62971e428276",
+   "label": "keep_separate",
+   "source": "KEEP_regional_storefronts",
+   "verdict": "keep_separate",
+   "confidence": 0.95,
+   "reasoning": "The listings are on different regional domains (.us vs .jp), which are considered separate storefronts and thus distinct purchasable listings according to the rules."
+  },
+  {
+   "group_id": "l4_ck_d0cd374d59609",
+   "label": "keep_separate",
+   "source": "KEEP_regional_storefronts",
+   "verdict": "keep_separate",
+   "confidence": 1.0,
+   "reasoning": "Listings are on different regional domains (.jp vs .us), which are considered separate storefronts, not duplicates."
+  },
+  {
+   "group_id": "l4_ck_d19270e9a1aef",
+   "label": "keep_separate",
+   "source": "KEEP_regional_storefronts",
+   "verdict": "keep_separate",
+   "confidence": 1.0,
+   "reasoning": "The listings are for the same product but on different regional domains (.jp vs .us), which are considered separate storefronts."
+  },
+  {
+   "group_id": "l4_ck_d19b066bebaea",
+   "label": "keep_separate",
+   "source": "KEEP_regional_storefronts",
+   "verdict": "keep_separate",
+   "confidence": 1.0,
+   "reasoning": "Listings are on different regional domains (.us vs .jp), which represent separate storefronts and should be kept separate."
+  },
+  {
+   "group_id": "l4_ck_d527c20672e40",
+   "label": "keep_separate",
+   "source": "KEEP_regional_storefronts",
+   "verdict": "keep_separate",
+   "confidence": 0.95,
+   "reasoning": "The listings are on different regional domains (.us vs .jp), which are considered separate storefronts despite identical titles and slugs."
+  },
+  {
+   "group_id": "l4_ck_d9a912570f483",
+   "label": "keep_separate",
+   "source": "KEEP_multi_seller_observation",
+   "verdict": "keep_separate",
+   "confidence": 0.95,
+   "reasoning": "The listings are for the same product but are found on different seller domains (the brand's official site vs. a retailer)."
+  },
+  {
+   "group_id": "l4_ck_da7a1d2fd549d",
+   "label": "keep_separate",
+   "source": "KEEP_regional_storefronts",
+   "verdict": "keep_separate",
+   "confidence": 0.95,
+   "reasoning": "The listings are on different regional domains (.us vs .jp), indicating separate storefronts."
+  },
+  {
+   "group_id": "l4_ck_daa3093bb9b1f",
+   "label": "keep_separate",
+   "source": "KEEP_multi_seller_observation",
+   "verdict": "keep_separate",
+   "confidence": 0.95,
+   "reasoning": "The listings are for the same product but are hosted on different domains: one is a retailer (ulta.com) and the other is the brand's official site (theordinary.com), which are considered distinct seller observations."
+  },
+  {
+   "group_id": "l4_ck_dca7de2b4e28a",
+   "label": "keep_separate",
+   "source": "KEEP_multi_seller_observation",
+   "verdict": "keep_separate",
+   "confidence": 0.9,
+   "reasoning": "Listings [0] and [2] are identical URLs from the brand's site, but listing [1] is from a different retailer domain (Best Buy), which must be kept separate."
+  },
+  {
+   "group_id": "l4_ck_de1dae962b7c6",
+   "label": "keep_separate",
+   "source": "KEEP_multi_seller_observation",
+   "verdict": "keep_separate",
+   "confidence": 0.95,
+   "reasoning": "The listings are on different seller domains (brand site vs. retailer), which are legitimately distinct observations."
+  },
+  {
+   "group_id": "l4_ck_df4965b9b0356",
+   "label": "keep_separate",
+   "source": "KEEP_regional_storefronts",
+   "verdict": "keep_separate",
+   "confidence": 1.0,
+   "reasoning": "The listings are for the same product but are hosted on different regional domains (.jp vs .us), which represents separate storefronts and should be kept separate."
+  },
+  {
+   "group_id": "l4_ck_e0302b9de1681",
+   "label": "keep_separate",
+   "source": "KEEP_regional_storefronts",
+   "verdict": "keep_separate",
+   "confidence": 1.0,
+   "reasoning": "The listings are on different regional storefront domains (.jp vs .us), which are considered separate purchasable listings according to the rules."
+  },
+  {
+   "group_id": "l4_ck_e1c5f7836e69d",
+   "label": "keep_separate",
+   "source": "KEEP_regional_storefronts",
+   "verdict": "keep_separate",
+   "confidence": 1.0,
+   "reasoning": "The listings are on different regional domains (.us vs .jp), which are considered separate storefronts according to the rules."
+  },
+  {
+   "group_id": "l4_ck_e50bcc83855c5",
+   "label": "keep_separate",
+   "source": "KEEP_multi_seller_observation",
+   "verdict": "keep_separate",
+   "confidence": 0.95,
+   "reasoning": "The listings are for the same product but are found on different seller domains (the brand's official site vs. a retailer)."
+  },
+  {
+   "group_id": "l4_ck_e8df3d2b0d8a6",
+   "label": "keep_separate",
+   "source": "KEEP_regional_storefronts",
+   "verdict": "keep_separate",
+   "confidence": 0.95,
+   "reasoning": "The listings are on different regional domains (.jp vs .us), which are considered separate storefronts and thus distinct purchasable listings."
+  },
+  {
+   "group_id": "l4_ck_e93d67e3fcadf",
+   "label": "keep_separate",
+   "source": "KEEP_regional_storefronts",
+   "verdict": "keep_separate",
+   "confidence": 1.0,
+   "reasoning": "The listings are on different regional domains (.us vs .jp), which represent separate storefronts and should be kept separate."
+  },
+  {
+   "group_id": "l4_ck_ea208203030f0",
+   "label": "keep_separate",
+   "source": "KEEP_multi_seller_observation",
+   "verdict": "keep_separate",
+   "confidence": 1.0,
+   "reasoning": "The listings are on different seller domains (brand's official site vs. a retailer's site), which are considered legitimately separate listings."
+  },
+  {
+   "group_id": "l4_ck_f1662e7ba0566",
+   "label": "keep_separate",
+   "source": "KEEP_regional_storefronts",
+   "verdict": "keep_separate",
+   "confidence": 1.0,
+   "reasoning": "The listings are on different regional storefront domains (.us vs .jp), which are considered separate purchasable listings according to the rules."
+  },
+  {
+   "group_id": "l4_ck_f31d6d279778b",
+   "label": "keep_separate",
+   "source": "KEEP_regional_storefronts",
+   "verdict": "keep_separate",
+   "confidence": 0.95,
+   "reasoning": "The listings are on different regional domains (.jp vs .us), which represent separate storefronts and should be kept separate."
+  },
+  {
+   "group_id": "l4_ck_f4380605d9e05",
+   "label": "keep_separate",
+   "source": "KEEP_multi_seller_observation",
+   "verdict": "keep_separate",
+   "confidence": 0.95,
+   "reasoning": "Listings [0] and [1] are on different retailer domains (Best Buy vs Bose.com), making them legitimately separate listings, while listings [1] and [2] are identical URLs on the same domain and would be collapsed into one."
+  },
+  {
+   "group_id": "l4_ck_f497d505eeeba",
+   "label": "keep_separate",
+   "source": "KEEP_regional_storefronts",
+   "verdict": "keep_separate",
+   "confidence": 1.0,
+   "reasoning": "The listings are on different regional domains (.jp vs .us), which are considered separate storefronts even with identical product titles and URL paths."
+  },
+  {
+   "group_id": "l4_ck_f4fb29540c470",
+   "label": "keep_separate",
+   "source": "KEEP_regional_storefronts",
+   "verdict": "keep_separate",
+   "confidence": 1.0,
+   "reasoning": "The listings are on different regional storefront domains (.jp vs .us), which are considered separate listings according to the rules."
+  },
+  {
+   "group_id": "l4_ck_f5ce9623546fa",
+   "label": "keep_separate",
+   "source": "KEEP_multi_seller_observation",
+   "verdict": "keep_separate",
+   "confidence": 0.95,
+   "reasoning": "The listings are on different domains (brand site vs. retailer site), which per rules, are legitimately distinct observations."
+  },
+  {
+   "group_id": "l4_ck_f761a46d93b46",
+   "label": "keep_separate",
+   "source": "KEEP_regional_storefronts",
+   "verdict": "keep_separate",
+   "confidence": 1.0,
+   "reasoning": "The listings are on different regional domains (.jp vs .us), which represent separate storefronts and distinct sellable observations."
+  },
+  {
+   "group_id": "l4_ck_f8219d4aa2a8c",
+   "label": "keep_separate",
+   "source": "KEEP_regional_storefronts",
+   "verdict": "keep_separate",
+   "confidence": 1.0,
+   "reasoning": "The listings are on different regional domains (.us vs .jp), indicating separate storefronts."
+  },
+  {
+   "group_id": "l4_ck_1ce33d487dedc",
+   "label": "keep_separate",
+   "source": "KEEP_size_variants",
+   "verdict": "keep_separate",
+   "confidence": 1.0,
+   "reasoning": "The listings represent different product sizes (100ml vs 50ml), which are distinct sellable SKUs and should be kept separate."
+  },
+  {
+   "group_id": "l4_ck_32f66dad624e1",
+   "label": "collapse",
+   "source": "KEEP_title_collision_distinct_products",
+   "verdict": "collapse",
+   "confidence": 0.95,
+   "reasoning": "All listings share the same title, brand, and domain, with URL slug variations strongly indicating campaign tracking, A/B testing, or internal identifiers for the same product page.",
+   "relabeled": true
+  },
+  {
+   "group_id": "l4_ck_36fc604d18829",
+   "label": "keep_separate",
+   "source": "KEEP_size_variants",
+   "verdict": "keep_separate",
+   "confidence": 0.95,
+   "reasoning": "The URLs indicate genuinely different products or distinct sizes/variants of products (e.g., 'renight-cream' vs 'renight-cream-10ml'), not duplicates."
+  },
+  {
+   "group_id": "l4_ck_82a155613b1f1",
+   "label": "collapse",
+   "source": "KEEP_size_variants",
+   "verdict": "collapse",
+   "confidence": 0.95,
+   "reasoning": "The listings have identical titles (including size) and brands on the same domain; the URL slug differences appear to be tracking or internal system variations for the same product page.",
+   "relabeled": true
+  },
+  {
+   "group_id": "l4_ck_8a689896699a2",
+   "label": "keep_separate",
+   "source": "KEEP_title_collision_distinct_products",
+   "verdict": "keep_separate",
+   "confidence": 0.95,
+   "reasoning": "The URLs differ by a numerical segment that appears to be a product identifier (e.g., JAN code), indicating distinct SKUs of the same product line."
+  },
+  {
+   "group_id": "l4_ck_9a9a086e48840",
+   "label": "collapse",
+   "source": "KEEP_size_variants",
+   "verdict": "collapse",
+   "confidence": 0.9,
+   "reasoning": "The listings share identical titles and brands on the same domain; the URL slug difference is merely a more descriptive path for what appears to be the same product.",
+   "relabeled": true
+  },
+  {
+   "group_id": "l4_ck_b750be54799aa",
+   "label": "keep_separate",
+   "source": "KEEP_size_variants",
+   "verdict": "keep_separate",
+   "confidence": 1.0,
+   "reasoning": "The URLs indicate different product sizes (200ml vs 400ml), which are distinct sellable SKUs."
+  },
+  {
+   "group_id": "l4_ck_e5c5288eb2345",
+   "label": "keep_separate",
+   "source": "KEEP_title_collision_distinct_products",
+   "verdict": "keep_separate",
+   "confidence": 0.75,
+   "reasoning": "The trailing number '1' in the URL slug could indicate a distinct product variant or version, which, according to the rules, should be kept separate."
+  },
+  {
+   "group_id": "l4_ck_e9d1ffdec5b4d",
+   "label": "keep_separate",
+   "source": "KEEP_size_variants",
+   "verdict": "keep_separate",
+   "confidence": 1.0,
+   "reasoning": "The listings represent different product sizes (100ml vs 50ml), which are distinct sellable SKUs and not duplicates."
+  }
+ ],
+ "note": "3 gold labels corrected after independent re-adjudication of the v2 disagreements (all were worksheet-heuristic errors; rationale in the fixture); verdicts untouched"
+}
