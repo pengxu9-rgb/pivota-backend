@@ -60,11 +60,14 @@ def _install_stripe(monkeypatch, outcome):
     return _FakeStripeClient.intents
 
 
-def _install_merchant_key(monkeypatch, api_key="sk_test_merch", psp_provider="stripe", environment=None):
+def _install_merchant_key(monkeypatch, api_key="sk_test_merch", psp_provider="stripe", environment=None, provider_config=None):
     async def fake_row(*, merchant_id, provider=None, psp_id=None, database_override=None):
         # P-T2.3.7: capture resolves the active PSP with NO provider hint and
         # dispatches by the row's `provider`.
-        return {"api_key": api_key, "provider": psp_provider, "environment": environment}
+        return {
+            "api_key": api_key, "provider": psp_provider, "environment": environment,
+            "provider_config": provider_config,
+        }
 
     monkeypatch.setattr(cap, "fetch_active_runtime_merchant_psp", fake_row)
 
@@ -267,9 +270,9 @@ async def test_no_customer_key_when_pm_unattached(monkeypatch):
 # --- P-T2.3.7: PSP-agnostic dispatch ---
 @pytest.mark.asyncio
 async def test_unsupported_provider_fails_closed(monkeypatch):
-    # A resolved key on a PSP with no capture adapter (e.g. Adyen before its
-    # adapter lands) must fail closed — never charge, never fall back to Stripe.
-    _install_merchant_key(monkeypatch, api_key="test_ADYEN_KEY", psp_provider="adyen")
+    # A resolved key on a PSP with no capture adapter (e.g. Mollie — not yet built)
+    # must fail closed — never charge, never fall back to Stripe.
+    _install_merchant_key(monkeypatch, api_key="test_MOLLIE_KEY", psp_provider="mollie")
     r = await cap.capture_offsession(merchant_id="m", amount_cents=100, currency="usd", idempotency_key="k")
     assert r.success is False
     assert r.error_code == "unsupported_provider"
@@ -306,3 +309,167 @@ async def test_pm_lookup_failure_still_charges_without_customer(monkeypatch):
     )
     assert r.success is True
     assert "customer" not in intents.calls[0]["payload"]
+
+
+# --- P-T2.3.7: AdyenCaptureAdapter (MIT /payments, mocked httpx) ---
+
+import json as _json  # noqa: E402
+
+
+class _FakeAdyenResp:
+    def __init__(self, status_code, payload):
+        self.status_code = status_code
+        self._payload = payload
+        self.text = _json.dumps(payload)
+
+    def json(self):
+        return self._payload
+
+
+class _FakeAdyenClient:
+    captured = None
+    response = None
+
+    def __init__(self, *a, **k):
+        pass
+
+    async def __aenter__(self):
+        return self
+
+    async def __aexit__(self, *a):
+        return False
+
+    async def post(self, url, headers=None, json=None):
+        _FakeAdyenClient.captured = {"url": url, "headers": headers or {}, "json": json or {}}
+        return _FakeAdyenClient.response
+
+
+def _install_adyen_http(monkeypatch, *, status_code=200, payload):
+    import httpx
+
+    _FakeAdyenClient.captured = None
+    _FakeAdyenClient.response = _FakeAdyenResp(status_code, payload)
+    monkeypatch.setattr(httpx, "AsyncClient", _FakeAdyenClient)
+
+
+_ADYEN_CFG = {"merchant_account": "PivotaTestECOM"}
+_ADYEN_MD = {"adyen_shopper_reference": "shopper_efbc", "order_id": "ORD_WIX_1"}
+
+
+@pytest.mark.asyncio
+async def test_adyen_authorised_success(monkeypatch):
+    _install_merchant_key(monkeypatch, api_key="test_ADYEN", psp_provider="adyen", provider_config=_ADYEN_CFG)
+    _install_adyen_http(monkeypatch, payload={"resultCode": "Authorised", "pspReference": "ADY_PSP_1"})
+    r = await cap.capture_offsession(
+        merchant_id="merch_efbc", amount_cents=169, currency="USD", idempotency_key="idem_a",
+        payment_method="8416891234567890", metadata=dict(_ADYEN_MD), max_cents=5000,
+    )
+    assert r.success is True and r.status == "succeeded"
+    assert r.payment_intent_id == "ADY_PSP_1"
+    body = _FakeAdyenClient.captured["json"]
+    assert _FakeAdyenClient.captured["url"] == "https://checkout-test.adyen.com/v71/payments"
+    assert body["merchantAccount"] == "PivotaTestECOM"
+    assert body["shopperInteraction"] == "ContAuth"
+    assert body["recurringProcessingModel"] == "CardOnFile"
+    assert body["paymentMethod"] == {"type": "scheme", "storedPaymentMethodId": "8416891234567890"}
+    assert body["shopperReference"] == "shopper_efbc"
+    assert body["amount"] == {"value": 169, "currency": "USD"}
+    assert body["reference"] == "ORD_WIX_1"
+    assert _FakeAdyenClient.captured["headers"]["Idempotency-Key"] == "idem_a"
+    assert _FakeAdyenClient.captured["headers"]["X-API-Key"] == "test_ADYEN"
+    assert body["metadata"]["pivota_acp_test_capture"] == "true"
+
+
+@pytest.mark.asyncio
+async def test_adyen_refused_fails(monkeypatch):
+    _install_merchant_key(monkeypatch, api_key="test_ADYEN", psp_provider="adyen", provider_config=_ADYEN_CFG)
+    _install_adyen_http(monkeypatch, payload={"resultCode": "Refused", "refusalReason": "Insufficient funds", "pspReference": "ADY_PSP_2"})
+    r = await cap.capture_offsession(
+        merchant_id="m", amount_cents=169, currency="USD", idempotency_key="k",
+        payment_method="8416891234567890", metadata=dict(_ADYEN_MD), max_cents=5000,
+    )
+    assert r.success is False and r.error_code == "adyen_refused"
+    assert "Insufficient funds" in r.error
+
+
+@pytest.mark.asyncio
+async def test_adyen_sca_is_requires_action(monkeypatch):
+    _install_merchant_key(monkeypatch, api_key="test_ADYEN", psp_provider="adyen", provider_config=_ADYEN_CFG)
+    _install_adyen_http(monkeypatch, payload={"resultCode": "RedirectShopper", "pspReference": "ADY_PSP_3"})
+    r = await cap.capture_offsession(
+        merchant_id="m", amount_cents=169, currency="USD", idempotency_key="k",
+        payment_method="8416891234567890", metadata=dict(_ADYEN_MD), max_cents=5000,
+    )
+    assert r.success is False and r.error_code == "requires_action"
+
+
+@pytest.mark.asyncio
+async def test_adyen_missing_merchant_account(monkeypatch):
+    _install_merchant_key(monkeypatch, api_key="test_ADYEN", psp_provider="adyen", provider_config={})
+    r = await cap.capture_offsession(
+        merchant_id="m", amount_cents=169, currency="USD", idempotency_key="k",
+        payment_method="8416891234567890", metadata=dict(_ADYEN_MD), max_cents=5000,
+    )
+    assert r.success is False and r.error_code == "adyen_config"
+
+
+@pytest.mark.asyncio
+async def test_adyen_requires_shopper_reference(monkeypatch):
+    _install_merchant_key(monkeypatch, api_key="test_ADYEN", psp_provider="adyen", provider_config=_ADYEN_CFG)
+    r = await cap.capture_offsession(
+        merchant_id="m", amount_cents=169, currency="USD", idempotency_key="k",
+        payment_method="8416891234567890", metadata={"order_id": "ORD_1"}, max_cents=5000,
+    )
+    assert r.success is False and r.error_code == "adyen_shopper_ref_required"
+
+
+@pytest.mark.asyncio
+async def test_adyen_rejects_stripe_style_token(monkeypatch):
+    # A Stripe-style pm_/tok_/vt_ token is not an Adyen storedPaymentMethodId.
+    _install_merchant_key(monkeypatch, api_key="test_ADYEN", psp_provider="adyen", provider_config=_ADYEN_CFG)
+    for tok in ("pm_card_visa", "tok_test", "vt_abc", ""):
+        r = await cap.capture_offsession(
+            merchant_id="m", amount_cents=169, currency="USD", idempotency_key="k",
+            payment_method=tok, metadata=dict(_ADYEN_MD), max_cents=5000,
+        )
+        assert r.success is False and r.error_code == "adyen_pm_required"
+
+
+@pytest.mark.asyncio
+async def test_adyen_live_requires_url_prefix(monkeypatch):
+    # Live lane with a live key but no live_url_prefix in provider_config → config fail.
+    _install_merchant_key(monkeypatch, api_key="live_ADYEN", psp_provider="adyen", provider_config=_ADYEN_CFG)
+    r = await cap.capture_offsession(
+        merchant_id="m", amount_cents=169, currency="USD", idempotency_key="k",
+        payment_method="8416891234567890", metadata=dict(_ADYEN_MD),
+        allow_live=True, max_cents=5000,
+    )
+    assert r.success is False and r.error_code == "adyen_config"
+
+
+@pytest.mark.asyncio
+async def test_adyen_live_uses_prefixed_endpoint(monkeypatch):
+    _install_merchant_key(
+        monkeypatch, api_key="live_ADYEN", psp_provider="adyen",
+        provider_config={"merchant_account": "PivotaLiveECOM", "live_url_prefix": "1797a-Pivota"},
+    )
+    _install_adyen_http(monkeypatch, payload={"resultCode": "Authorised", "pspReference": "ADY_LIVE_1"})
+    r = await cap.capture_offsession(
+        merchant_id="m", amount_cents=169, currency="USD", idempotency_key="k",
+        payment_method="8416891234567890", metadata=dict(_ADYEN_MD),
+        allow_live=True, max_cents=5000,
+    )
+    assert r.success is True
+    assert _FakeAdyenClient.captured["url"] == "https://1797a-Pivota-checkout-live.adyenpayments.com/checkout/v71/payments"
+    assert _FakeAdyenClient.captured["json"]["metadata"]["pivota_acp_live_capture"] == "true"
+
+
+@pytest.mark.asyncio
+async def test_adyen_http_error_fails_closed(monkeypatch):
+    _install_merchant_key(monkeypatch, api_key="test_ADYEN", psp_provider="adyen", provider_config=_ADYEN_CFG)
+    _install_adyen_http(monkeypatch, status_code=401, payload={"message": "Unauthorized"})
+    r = await cap.capture_offsession(
+        merchant_id="m", amount_cents=169, currency="USD", idempotency_key="k",
+        payment_method="8416891234567890", metadata=dict(_ADYEN_MD), max_cents=5000,
+    )
+    assert r.success is False and r.error_code == "adyen_http_401"
