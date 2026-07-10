@@ -55,7 +55,14 @@ def is_synthetic_probe_query(query: Any) -> bool:
 
 _WORD_RE = re.compile(r"[a-z0-9]+")
 _PHRASE_CLEAN_RE = re.compile(r"[^a-z0-9]+")
+# Conversion-intent vocabulary for lane ranking. Was beauty-only (built for the
+# BB Lab pilot), which starved every electronics lane of conversion_fit — an
+# audio row could only score via "best"/"buy"/"online" (~0.04). Phrases are
+# vertical-DISTINCTIVE (a beauty phrase never appears in an audio query and
+# vice versa), so a flat superset is safe: only the phrases present in the
+# query fire. Weights mirror the beauty tiers.
 _CONVERSION_PHRASES: Tuple[Tuple[str, float], ...] = (
+    # beauty / supplement (original set)
     ("vitamin c", 0.34),
     ("collagen jelly", 0.2),
     ("healthy skin", 0.18),
@@ -66,14 +73,27 @@ _CONVERSION_PHRASES: Tuple[Tuple[str, float], ...] = (
     ("kbeauty", 0.16),
     ("before bed", 0.14),
     ("halal", 0.14),
-    ("buy online", 0.1),
-    ("for sale", 0.1),
-    ("subscription", 0.08),
-    ("replenishment", 0.08),
     ("supplement", 0.07),
     ("stick", 0.07),
     ("jelly", 0.07),
     ("collagen", 0.06),
+    # electronics / audio (Mojawa pilot: spec-anchored buying intent)
+    ("bone conduction", 0.2),
+    ("noise cancelling", 0.18),
+    ("noise cancellation", 0.18),
+    ("waterproof", 0.16),
+    ("battery life", 0.16),
+    ("open ear", 0.14),
+    ("wireless", 0.1),
+    ("bluetooth", 0.1),
+    ("for swimming", 0.14),
+    ("for running", 0.12),
+    ("for gym", 0.12),
+    # vertical-neutral commerce intent
+    ("buy online", 0.1),
+    ("for sale", 0.1),
+    ("subscription", 0.08),
+    ("replenishment", 0.08),
     ("best", 0.04),
     ("buy", 0.04),
     ("online", 0.04),

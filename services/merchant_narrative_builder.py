@@ -203,7 +203,11 @@ def _who_ai_cites_instead(
     }
 
 
-def _headline_story(merchant_name: str, summary: Dict[str, Any]) -> str:
+def _headline_story(
+    merchant_name: str,
+    summary: Dict[str, Any],
+    per_sku_reports: Optional[List[Dict[str, Any]]] = None,
+) -> str:
     name = merchant_name or "This brand"
     findable = bool(summary.get("findability_hosts"))
     endorsed_category = bool(summary.get("independently_recommended_for_category"))
@@ -225,10 +229,24 @@ def _headline_story(merchant_name: str, summary: Dict[str, Any]) -> str:
             "listings nor any independent source surface when shoppers ask."
         )
     if endorsed_category:
-        return (
+        headline = (
             f"{name} is independently recommended for the category, not just "
             "found through your own listings — the channel is working for you."
         )
+        # BRIDGE (operator-review fix): "channel working" beside a scorecard
+        # where every audited SKU is blocked read as the report disagreeing
+        # with itself (live Mojawa run 7420c2b5). When the brand earns the
+        # category recommendation but ALL audited SKUs sit in the blocked
+        # band, say both truths in one sentence.
+        reports = [r for r in (per_sku_reports or []) if isinstance(r, dict)]
+        bands = [str(r.get("band") or "").strip().lower() for r in reports]
+        if bands and all(band == "blocked" for band in bands):
+            headline += (
+                " The audited products themselves aren't agent-ready yet, "
+                "though — the brand's recognition isn't attached to these "
+                "exact SKUs; the actions below close that gap."
+            )
+        return headline
     if endorsed:
         return (
             f"Independent sources cite {name}, but not yet on the category "
@@ -812,7 +830,7 @@ def build_merchant_narrative(
     if arc_caveat:
         honest_limits = list(honest_limits) + [arc_caveat]
     return {
-        "headline_story": _headline_story(name, summary),
+        "headline_story": _headline_story(name, summary, per_sku_reports),
         "whats_working": _whats_working(name, summary, per_sku_reports),
         "where_youre_losing": where,
         "per_sku_scorecard": _per_sku_scorecard(per_sku_reports, authority_map),

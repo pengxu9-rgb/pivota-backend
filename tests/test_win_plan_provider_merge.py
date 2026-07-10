@@ -89,7 +89,10 @@ def test_coverage_counts_unique_queries():
 
 
 def test_single_provider_row_still_labeled():
-    plan = _plan([_fp("best headphones", "gemini")])
+    # A specific (non-head) query: gets the own-content path AND the label.
+    # ("best headphones" is now gated to win_path=None — a bare head term
+    # can't be won with own content either; see test_report_copy_cleanup.)
+    plan = _plan([_fp("bone conduction headphones for swimming", "gemini")])
     row = plan["sku_plans"][0]["losing_queries"][0]
     assert row["providers"] == ["gemini"]
     assert row["win_path"] == "own_content"
