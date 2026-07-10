@@ -30,7 +30,7 @@ from db.database import database
 from db.merchant_onboarding import get_merchant_onboarding
 from services.merchant_psp_config_service import evaluate_psp_readiness
 from services.merchant_store_service import get_merchant_active_stores, get_primary_store
-from services.platform_capabilities import get_platform_protocols
+from services.platform_capabilities import get_platform_protocols_for_store
 
 logger = logging.getLogger("merchant_capability_resolver")
 
@@ -237,7 +237,12 @@ async def resolve_merchant_capability(
 
     live_psp = await _resolve_live_psp_provider(merchant_id)
     has_live_psp = bool(live_psp)
-    protocols: List[str] = get_platform_protocols(platform, has_live_psp=has_live_psp)
+    # Store-aware: Wix ACP lights up per-store (order-writeback readiness), so
+    # pass the resolved store. `store` is None for fingerprinted/crawl merchants
+    # → no per-store grant (honest). Shopify et al. are unaffected.
+    protocols: List[str] = get_platform_protocols_for_store(
+        platform, store, has_live_psp=has_live_psp
+    )
 
     result: Dict[str, Any] = {
         "merchant_id": merchant_id,

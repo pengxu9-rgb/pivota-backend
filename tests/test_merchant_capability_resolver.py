@@ -33,6 +33,71 @@ def test_protocol_matrix_other_platforms_empty(platform):
     assert get_platform_protocols(platform, has_live_psp=True) == []
 
 
+# --- P-T2.3.6: Wix production ACP is store-writeback-gated ------------------
+
+def _wix_store(*, status="active", order_writeback_status="enabled"):
+    return {
+        "store_id": "wix_store_1",
+        "platform": "wix",
+        "status": status,
+        "order_writeback_status": order_writeback_status,
+    }
+
+
+def test_store_aware_wix_enabled_with_live_psp_gets_acp():
+    from services.platform_capabilities import get_platform_protocols_for_store
+
+    assert get_platform_protocols_for_store(
+        "wix", _wix_store(), has_live_psp=True
+    ) == ["acp"]
+
+
+def test_store_aware_wix_enabled_without_live_psp_empty():
+    from services.platform_capabilities import get_platform_protocols_for_store
+
+    # Ready store but no way to settle → honest redirect-only.
+    assert get_platform_protocols_for_store(
+        "wix", _wix_store(), has_live_psp=False
+    ) == []
+
+
+@pytest.mark.parametrize(
+    "store",
+    [
+        None,  # crawl / fingerprinted merchant, no connected store
+        _wix_store(order_writeback_status="disabled"),
+        _wix_store(order_writeback_status="paused"),
+        _wix_store(order_writeback_status="failed"),
+        _wix_store(order_writeback_status="canary"),  # per-order gate, not routable pre-checkout
+        _wix_store(status="disconnected"),
+    ],
+)
+def test_store_aware_wix_not_ready_empty(store):
+    from services.platform_capabilities import get_platform_protocols_for_store
+
+    assert get_platform_protocols_for_store("wix", store, has_live_psp=True) == []
+
+
+def test_store_aware_shopify_unchanged_by_store_gate():
+    from services.platform_capabilities import get_platform_protocols_for_store
+
+    # Shopify stays platform-global (no per-store writeback gate); store irrelevant.
+    assert get_platform_protocols_for_store(
+        "shopify", None, has_live_psp=True
+    ) == ["acp"]
+    assert get_platform_protocols_for_store(
+        "shopify", {"platform": "shopify", "status": "active"}, has_live_psp=False
+    ) == []
+
+
+def test_store_aware_global_matrix_stays_honest_for_bare_wix():
+    # The platform-global matrix must NEVER grant Wix acp from a bare slug — the
+    # grant lives only in the store-aware path.
+    from services.platform_capabilities import get_platform_protocols
+
+    assert get_platform_protocols("wix", has_live_psp=True) == []
+
+
 # --- domain fingerprint -----------------------------------------------------
 
 @pytest.mark.parametrize(
@@ -150,6 +215,65 @@ async def test_resolve_unknown_merchant(monkeypatch):
     cap = await res.resolve_merchant_capability("merch_unknown")
     assert cap["platform"] == "unknown"
     assert cap["platform_source"] == "unknown"
+    assert cap["protocols"] == []
+
+
+@pytest.mark.asyncio
+async def test_resolve_connected_wix_enabled_store_with_live_psp(monkeypatch):
+    from services import merchant_capability_resolver as res
+
+    async def fake_get_primary_store(mid):
+        return {
+            "store_id": "wix_1",
+            "platform": "wix",
+            "status": "active",
+            "order_writeback_status": "enabled",
+        }
+
+    async def fake_get_merchant_onboarding(mid):
+        return {}
+
+    async def fake_live_psp(mid):
+        return "stripe"
+
+    monkeypatch.setattr(res, "get_primary_store", fake_get_primary_store)
+    monkeypatch.setattr(res, "get_merchant_onboarding", fake_get_merchant_onboarding)
+    monkeypatch.setattr(res, "_resolve_live_psp_provider", fake_live_psp)
+
+    cap = await res.resolve_merchant_capability("merch_wix_ready")
+    assert cap["platform"] == "wix"
+    assert cap["platform_source"] == "connected"
+    assert cap["has_live_psp"] is True
+    # Wix production ACP lights up: writeback-enabled store + live PSP.
+    assert cap["protocols"] == ["acp"]
+
+
+@pytest.mark.asyncio
+async def test_resolve_connected_wix_not_writeback_ready_is_dark(monkeypatch):
+    from services import merchant_capability_resolver as res
+
+    async def fake_get_primary_store(mid):
+        return {
+            "store_id": "wix_1",
+            "platform": "wix",
+            "status": "active",
+            "order_writeback_status": "disabled",  # default until proven
+        }
+
+    async def fake_get_merchant_onboarding(mid):
+        return {}
+
+    async def fake_live_psp(mid):
+        return "stripe"
+
+    monkeypatch.setattr(res, "get_primary_store", fake_get_primary_store)
+    monkeypatch.setattr(res, "get_merchant_onboarding", fake_get_merchant_onboarding)
+    monkeypatch.setattr(res, "_resolve_live_psp_provider", fake_live_psp)
+
+    cap = await res.resolve_merchant_capability("merch_wix_pending")
+    assert cap["platform"] == "wix"
+    assert cap["has_live_psp"] is True
+    # Live PSP but store not writeback-ready → redirect floor (dark).
     assert cap["protocols"] == []
 
 

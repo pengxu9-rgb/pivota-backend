@@ -6,6 +6,7 @@ from typing import Any, Dict
 from services.platform_order_writeback_readiness import (
     ORDER_WRITEBACK_STATUS_CANARY,
     ORDER_WRITEBACK_STATUS_ENABLED,
+    is_store_order_writeback_allowed,
     store_order_writeback_context,
 )
 
@@ -166,6 +167,43 @@ def get_platform_protocols(platform: str | None, *, has_live_psp: bool) -> list[
         if protocol not in out:
             out.append(protocol)
     return out
+
+
+def get_platform_protocols_for_store(
+    platform: str | None,
+    store: Dict[str, Any] | None,
+    *,
+    has_live_psp: bool,
+) -> list[str]:
+    """Store-aware protocols[] (P-T2.3.6 — Wix production ACP gate).
+
+    Same truthful list as `get_platform_protocols`, but layers on the protocols
+    whose capability is gated *per store* rather than per platform. Today that is
+    Wix ACP: the in-chat capture connector is live (pivota-acp WixConnector →
+    shared backend quote→order(acp)→pay), so a Wix merchant CAN be checked out
+    in-chat — but only once THIS store's order-writeback readiness is `enabled`
+    (an active, verified Wix store) and it has a live PSP to settle on.
+
+    Deliberately kept OUT of the platform-global `_PLATFORM_PROTOCOLS` /
+    `get_platform_protocols`: those stay honest that Wix *alone* (platform only,
+    no store context) grants no protocol. This function is the only place the
+    per-store grant is added, so it can never light up from a bare platform slug
+    (e.g. a domain-fingerprinted crawl merchant with no connected store).
+
+    Dark until a Wix store row is marked `order_writeback_status='enabled'`;
+    `canary` status is intentionally NOT routable here (it is a per-order
+    writeback gate keyed on a specific order id, not a pre-checkout signal).
+    """
+    protocols = get_platform_protocols(platform, has_live_psp=has_live_psp)
+    key = str(platform or "").strip().lower()
+    if (
+        key == "wix"
+        and has_live_psp
+        and PROTOCOL_ACP not in protocols
+        and is_store_order_writeback_allowed(store, platform="wix")
+    ):
+        protocols = [*protocols, PROTOCOL_ACP]
+    return protocols
 
 
 def get_store_platform_capabilities(platform: str | None) -> StorePlatformCapabilities:
