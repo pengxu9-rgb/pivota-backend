@@ -35,6 +35,7 @@ degrades to an honest "not available" / stated limit rather than guessing.
 
 from __future__ import annotations
 
+import re
 from typing import Any, Dict, List, Optional
 
 from services.audit_playbook_engine import build_pitch_draft_for_host
@@ -268,6 +269,13 @@ def _losing_query_plan(
     return {
         "query": query,
         "axis": failing_prompt.get("axis"),
+        # Engines whose runs failed this query (merged upstream in _sku_plan) —
+        # replaces the unlabeled per-provider duplicate rows.
+        "providers": sorted(
+            str(p).strip().lower()
+            for p in (failing_prompt.get("providers") or [])
+            if str(p or "").strip()
+        ),
         "grounds_in": targets,
         "competitor_benchmark": competitor_benchmark,
         "win_condition": win_condition,
@@ -291,15 +299,46 @@ def _sku_plan(
     if not losing_category:
         return None
 
+    # MERGE per-provider failing rows for the same query into ONE plan row.
+    # failing_prompts emits one entry per provider run, which rendered as
+    # unlabeled duplicate losing queries with contradictory limits ("no
+    # publisher to pitch here" beside "get cited in techradar" for the same
+    # query — live run 7420c2b5). One row per query: grounding-source union
+    # (a publisher target found by ANY engine wins), competitor-benchmark
+    # union (deduped downstream), and a `providers` label listing the engines
+    # that failed it.
+    merged: Dict[str, Dict[str, Any]] = {}
+    order: List[str] = []
+    for fp in losing_category:
+        query_key = re.sub(r"\s+", " ", str(fp.get("query") or "").strip().lower())
+        if not query_key:
+            continue
+        row = merged.get(query_key)
+        if row is None:
+            row = {
+                "query": fp.get("query"),
+                "axis": fp.get("axis"),
+                "grounding_sources": [],
+                "competitors_named": [],
+                "providers": [],
+            }
+            merged[query_key] = row
+            order.append(query_key)
+        row["grounding_sources"].extend(fp.get("grounding_sources") or [])
+        row["competitors_named"].extend(fp.get("competitors_named") or [])
+        provider = str(fp.get("provider") or "").strip().lower()
+        if provider and provider not in row["providers"]:
+            row["providers"].append(provider)
+
     uri_index = _uri_to_host_row(authority_hosts)
     losing_queries = [
         _losing_query_plan(
-            fp,
+            merged[query_key],
             uri_index,
             merchant_name=merchant_name,
             merchant_category=merchant_category,
         )
-        for fp in losing_category[:_MAX_LOSING_QUERIES_PER_SKU]
+        for query_key in order[:_MAX_LOSING_QUERIES_PER_SKU]
     ]
 
     with_target = [q for q in losing_queries if q["grounds_in"]]
