@@ -2339,6 +2339,37 @@ async def _maybe_stash_llm_attributes(ctx: Dict[str, Any]) -> None:
         lexicon_graph = build_sku_attribute_graph(product)
         if not should_run_extractor(profile, lexicon_graph):
             return
+        # Feed Tier-1 retailer evidence into the extractor's source text. This
+        # extractor runs INSIDE load_sku_context — BEFORE the probe fan-out loop
+        # stashes _retailer_excerpts onto the product — so without this preload
+        # build_source_text() below sees only the (often thin) own-page copy and
+        # the extractor can never ground attributes in the retailer listings that
+        # exist precisely to rescue thin url-wedge pages. Gated AFTER
+        # should_run_extractor so the "does this SKU need the LLM?" decision still
+        # keys off the own page, and isolated in its own try so a lookup failure
+        # falls back to own-page-only extraction rather than disabling the
+        # extractor. Only prior completed runs carry excerpts (recycling), so a
+        # first-ever audit legitimately has none. Skipped when excerpts are
+        # already present (e.g. a re-read of a ctx the probe loop enriched).
+        if isinstance(product, dict) and not product.get("_retailer_excerpts"):
+            try:
+                from services.retailer_evidence import load_prior_retailer_evidence
+
+                _re = await load_prior_retailer_evidence(
+                    merchant_id=str(
+                        ctx.get("merchant_id")
+                        or product.get("merchant_id")
+                        or ""
+                    ),
+                    sku_key=str(ctx.get("sku_key") or ""),
+                )
+                if _re.get("excerpts"):
+                    product["_retailer_excerpts"] = _re["excerpts"]
+                    product["_retailer_excerpt_hosts"] = _re["hosts"]
+            except Exception:  # noqa: BLE001 - preload must never disable extraction
+                logger.debug(
+                    "extractor retailer-excerpt preload skipped", exc_info=True
+                )
         source_text = build_source_text(product)
         if not source_text.strip():
             return
@@ -11401,12 +11432,21 @@ async def run_per_sku_audit_probe_fanout(
         sku_ctx = await load_sku_context(sku_key, str(merchant_id))
         # Tier-1 retailer-evidence recycling: prior runs' third-party retailer
         # excerpts (provenance-tagged, gray-market excluded) feed the attribute
-        # graph and the LLM extractor BELOW. Rescues thin own-page fetches —
-        # long-tail brand sites often yield title+brand only while the product's
-        # real story lives on Olive Young/Coupang listings we already captured
-        # as grounded evidence. Vocabulary/analysis input only; the verdict
-        # still reports the thin own page honestly.
-        if isinstance(sku_ctx, dict):
+        # graph and the winnable/scenario prompt generation BELOW. (The LLM
+        # attribute extractor also consumes these excerpts, but it runs earlier —
+        # inside load_sku_context — and self-loads them there; when the extractor
+        # ran, the product already carries them and the load below short-circuits.)
+        # Rescues thin own-page fetches — long-tail brand sites often yield
+        # title+brand only while the product's real story lives on Olive
+        # Young/Coupang listings we already captured as grounded evidence.
+        # Vocabulary/analysis input only; the verdict still reports the thin own
+        # page honestly.
+        _existing_product = sku_ctx.get("product") if isinstance(sku_ctx, dict) else None
+        _has_retailer_excerpts = (
+            isinstance(_existing_product, dict)
+            and bool(_existing_product.get("_retailer_excerpts"))
+        )
+        if isinstance(sku_ctx, dict) and not _has_retailer_excerpts:
             try:
                 from services.retailer_evidence import load_prior_retailer_evidence
 
