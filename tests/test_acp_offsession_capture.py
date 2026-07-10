@@ -60,10 +60,11 @@ def _install_stripe(monkeypatch, outcome):
     return _FakeStripeClient.intents
 
 
-def _install_merchant_key(monkeypatch, api_key="sk_test_merch"):
-    async def fake_row(*, merchant_id, provider):
-        assert provider == "stripe"
-        return {"api_key": api_key}
+def _install_merchant_key(monkeypatch, api_key="sk_test_merch", psp_provider="stripe", environment=None):
+    async def fake_row(*, merchant_id, provider=None, psp_id=None, database_override=None):
+        # P-T2.3.7: capture resolves the active PSP with NO provider hint and
+        # dispatches by the row's `provider`.
+        return {"api_key": api_key, "provider": psp_provider, "environment": environment}
 
     monkeypatch.setattr(cap, "fetch_active_runtime_merchant_psp", fake_row)
 
@@ -123,7 +124,7 @@ async def test_card_declined_is_normalized(monkeypatch):
 
 @pytest.mark.asyncio
 async def test_unresolved_merchant_key(monkeypatch):
-    async def no_row(*, merchant_id, provider):
+    async def no_row(*, merchant_id, provider=None, psp_id=None, database_override=None):
         return None
 
     monkeypatch.setattr(cap, "fetch_active_runtime_merchant_psp", no_row)
@@ -261,6 +262,37 @@ async def test_no_customer_key_when_pm_unattached(monkeypatch):
         merchant_id="m", amount_cents=100, currency="usd", idempotency_key="k",
     )
     assert "customer" not in intents.calls[0]["payload"]
+
+
+# --- P-T2.3.7: PSP-agnostic dispatch ---
+@pytest.mark.asyncio
+async def test_unsupported_provider_fails_closed(monkeypatch):
+    # A resolved key on a PSP with no capture adapter (e.g. Adyen before its
+    # adapter lands) must fail closed — never charge, never fall back to Stripe.
+    _install_merchant_key(monkeypatch, api_key="test_ADYEN_KEY", psp_provider="adyen")
+    r = await cap.capture_offsession(merchant_id="m", amount_cents=100, currency="usd", idempotency_key="k")
+    assert r.success is False
+    assert r.error_code == "unsupported_provider"
+
+
+@pytest.mark.asyncio
+async def test_missing_provider_fails_closed(monkeypatch):
+    # A row with no provider slug can't be dispatched → fail closed.
+    _install_merchant_key(monkeypatch, api_key="sk_test_merch", psp_provider="")
+    r = await cap.capture_offsession(merchant_id="m", amount_cents=100, currency="usd", idempotency_key="k")
+    assert r.success is False
+    assert r.error_code == "unsupported_provider"
+
+
+@pytest.mark.asyncio
+async def test_live_key_guard_generalizes_to_non_stripe(monkeypatch):
+    # The test-lane live-key refusal must hold for ANY provider, not just Stripe:
+    # an Adyen `live_` key on the test lane is refused BEFORE any adapter runs
+    # (so the missing Adyen adapter is never even reached).
+    _install_merchant_key(monkeypatch, api_key="live_ADYEN_KEY", psp_provider="adyen")
+    r = await cap.capture_offsession(merchant_id="m", amount_cents=100, currency="usd", idempotency_key="k")
+    assert r.success is False
+    assert r.error_code == "live_key_refused"
 
 
 @pytest.mark.asyncio
