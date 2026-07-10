@@ -60,7 +60,20 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from services.pdp_matcher.deterministic import normalize_canonical_url  # noqa: E402
 
+# Demo/test-track stores: the pivota-review-demo pair is the LIVE Shopify
+# app-review rig — its rows must keep serving, so we deliberately do NOT
+# relabel their catalog_track (that column is a serving-classification enum:
+# 'internal_merchant' drives first-party offer typing in
+# services/offer_classification.py). Demo-ness is instead THIS one shared
+# predicate, consumed by the working-set classifier and the sweep gauges —
+# add new demo storefronts here, nowhere else.
 DEMO_DOMAIN_PREFIX = "pivota-review-demo"
+
+# SQL twin of is_demo_row(); interpolate into any gauge that should read the
+# production catalog only.
+DEMO_EXCLUSION_SQL = (
+    "COALESCE(source_domain, '') NOT LIKE 'pivota-review-demo%'"
+)
 
 # Seed linkage is bidirectional: the mirror door stamps the seed id into
 # catalog_products.source_ref, but the enrichment door (source_system
