@@ -35,6 +35,10 @@ on:
       # vertical-aware brief, and the LLM attribute extractor all shape audit
       # output — gate them so a change can't skip the v3 end-to-end run.
       - "services/vertical_profiles.py"
+      # Phase 1c: host role/tier classification (authority + retailer wiring)
+      # feeds source_roles, authority_map, and the outreach targets — a
+      # classifier change must not skip the v3 end-to-end run.
+      - "services/cited_host_classifier.py"
       - "services/strategic_brief.py"
       - "services/llm_attribute_extractor.py"
       - "services/competitor_brand_filter.py"

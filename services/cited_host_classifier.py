@@ -350,6 +350,56 @@ def _register_profile_authority_hosts() -> None:
 _register_profile_authority_hosts()
 
 
+# Phase 1c (retailer half): the profiles also know which RETAILERS matter per
+# vertical (`retailer_tokens`: bestbuy, newegg, oliveyoung, ...), but until now
+# that knowledge only fed the competitor-brand filter — never this classifier.
+# Result: a cited bestbuy.com came back type="unclassified", tier=null, and the
+# report layer could then mis-flag the merchant's own retail channel as a
+# competitor storefront. Registering the tokens here gives every consumer of
+# classify_host (source_roles, authority_map, playbooks) the retailer verdict.
+# Tokens are brand labels, not hosts, so matching is by dot-label (bestbuy.com,
+# shop.target.com, target.com.au all match "target"). Deliberately NOT gated on
+# the BD registry loading — vertical knowledge is independent of that file.
+_PROFILE_RETAILER_HOST_TOKENS: set = set()
+
+
+def _register_profile_retailer_tokens() -> None:
+    from services.vertical_profiles import VERTICAL_PROFILES
+
+    for profile in VERTICAL_PROFILES.values():
+        for token in getattr(profile, "retailer_tokens", ()) or ():
+            cleaned = str(token or "").strip().lower()
+            if len(cleaned) >= 4:
+                _PROFILE_RETAILER_HOST_TOKENS.add(cleaned)
+
+
+_register_profile_retailer_tokens()
+
+
+def is_profile_retailer_name(name: str) -> bool:
+    """True when a brand-ish NAME names a known vertical retailer ("Best Buy",
+    "walmart"). Used by the report layer to keep engine-listed retailer names
+    out of competitor alias sets — a retailer carrying the merchant's listing
+    is a channel, not a competitor."""
+    despaced = re.sub(r"[^a-z0-9]+", "", str(name or "").lower())
+    return bool(despaced) and despaced in _PROFILE_RETAILER_HOST_TOKENS
+
+
+def _profile_retailer_fallback(host: str) -> Optional[Dict[str, Any]]:
+    labels = [part for part in host.split(".") if part]
+    if not any(label in _PROFILE_RETAILER_HOST_TOKENS for label in labels):
+        return None
+    out = _unclassified(host)
+    out["type"] = "retailer"
+    out["confidence"] = "profile_token"
+    out["subtype"] = "vertical_retailer"
+    out["tier"] = None  # tier is an editorial-only concept
+    out["expected_outreach_cycle_weeks"] = _default_outreach_cycle_weeks(
+        out["editorial_cadence"], "retailer"
+    )
+    return out
+
+
 def _default_tier_for_host(host: str, host_type: str) -> Optional[int]:
     """Tier from explicit registry entry, then from default map,
     then heuristic from host_type. Returns None when no signal."""
@@ -422,6 +472,9 @@ def classify_host(
         known = _default_known_host(h) if registry else None
         if known:
             return known
+        retailer = _profile_retailer_fallback(h)
+        if retailer:
+            return retailer
         return _unclassified(h)
 
     categories = list(entry.get("categories") or [])
