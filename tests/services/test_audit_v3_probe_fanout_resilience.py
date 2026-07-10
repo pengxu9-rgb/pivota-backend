@@ -135,6 +135,37 @@ async def test_consecutive_failures_bail_after_cap(monkeypatch) -> None:
     assert bd._flatten_probe_runs(out[SKU_KEY]) == []
 
 
+async def test_refresh_prompt_basis_threads_to_resolver(monkeypatch) -> None:
+    """The `refresh_prompt_basis` fan-out arg must reach resolve_prompt_basis's
+    `refresh=` — that's the whole point of the flag: a re-audit that regenerates
+    the basis (reflecting newly-grounded attributes) instead of pinning a prior
+    run's frozen query set. Default must stay False so every existing audit pins
+    exactly as before."""
+    _install(monkeypatch, fail_on=set())
+    captured: List[bool] = []
+
+    async def _fake_resolve(*, merchant_id, sku_key, generate_winnable,
+                            generate_scenario, refresh=False):
+        captured.append(refresh)
+        return {"winnable": [], "scenario": [], "selected_specs": [], "meta": {}}
+
+    # resolve_prompt_basis is imported inside the fan-out at call time.
+    monkeypatch.setattr("services.prompt_basis.resolve_prompt_basis", _fake_resolve)
+
+    async def _run_with(refresh_flag: bool):
+        captured.clear()
+        await bd.run_per_sku_audit_probe_fanout(
+            merchant_id=MERCHANT, audit_run_id="r",
+            products=[{"product_key": "p1"}], coverage_profile="pilot_gemini",
+            prompts_per_sku=PROMPTS, winnable_prompts=True,
+            refresh_prompt_basis=refresh_flag,
+        )
+        return captured[:]
+
+    assert await _run_with(False) == [False], "default must pin (refresh=False)"
+    assert await _run_with(True) == [True], "refresh must thread through to the resolver"
+
+
 async def test_fanout_matches_shared_probe_per_sku_ctx(monkeypatch) -> None:
     """Refactor regression: DB fan-out is just load_sku_context + shared loop."""
     calls: List[Dict[str, Any]] = []

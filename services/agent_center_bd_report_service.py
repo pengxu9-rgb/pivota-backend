@@ -11398,6 +11398,7 @@ async def run_per_sku_audit_probe_fanout(
     prompts_per_sku: Optional[int] = None,
     custom_prompts: Optional[List[str]] = None,
     winnable_prompts: bool = False,
+    refresh_prompt_basis: bool = False,
 ) -> Dict[str, List[Dict[str, Any]]]:
     """Run and shape v3 per-SKU citation probes before report assembly.
 
@@ -11501,6 +11502,11 @@ async def run_per_sku_audit_probe_fanout(
                     sku_key=str(sku_key),
                     generate_winnable=_generate_winnable,
                     generate_scenario=_generate_scenario,
+                    # When set, regenerate the basis instead of pinning a prior
+                    # run's — an explicit caller action (e.g. a re-audit that must
+                    # reflect newly-grounded attributes in the probed query set,
+                    # rather than reuse the frozen pre-change basis).
+                    refresh=refresh_prompt_basis,
                 )
                 sku_ctx["_winnable_prompts"] = _basis["winnable"]
                 sku_ctx["_scenario_elicited"] = _basis["scenario"]
