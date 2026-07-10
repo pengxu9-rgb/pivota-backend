@@ -627,6 +627,29 @@ async def start_scheduler() -> None:
             misfire_grace_time=120,
         )
 
+        # ADR-010 D-2 Phase B: weekly catalog identity-reconcile sweep —
+        # classify -> propose -> auto-apply ONLY the mechanical allowlist
+        # (same_url_dup, junk_url) -> review batches for the rest -> alert
+        # if a duplication gauge rises. DORMANT unless
+        # ENABLE_IDENTITY_RECONCILE_SWEEP is set (the tick checks the flag
+        # itself); staging shares the prod DB, so enable deliberately.
+        # docs/plans/adr010_d2_catalog_reconciliation_at_scale.md.
+        from services.identity_reconcile_sweep import (
+            run_identity_reconcile_sweep_tick,
+        )
+        _add_job(
+            run_identity_reconcile_sweep_tick,
+            "cron",
+            day_of_week="mon",
+            hour=4,
+            minute=30,
+            id="identity_reconcile_sweep",
+            replace_existing=True,
+            coalesce=True,
+            max_instances=1,
+            misfire_grace_time=21600,  # fire up to 6h late rather than skip a week
+        )
+
         scheduler.start()
         _SCHEDULER = scheduler
         logger.info(
@@ -647,7 +670,8 @@ async def start_scheduler() -> None:
             "+ settlement_file_generate (day 5 02:00 UTC, ACTIVE) "
             "+ settlement_file_transfer (day 10 02:00 UTC, ACTIVE) "
             "+ catalog_row_trust_backfill (6h, ACTIVE) "
-            "+ payment_reconcile_tick (5min, flag-gated PAYMENT_RECONCILE_SWEEP_ENABLED)"
+            "+ payment_reconcile_tick (5min, flag-gated PAYMENT_RECONCILE_SWEEP_ENABLED) "
+            "+ identity_reconcile_sweep (Mon 04:30 UTC, flag-gated ENABLE_IDENTITY_RECONCILE_SWEEP)"
         )
     except Exception as exc:  # noqa: BLE001
         logger.warning(
