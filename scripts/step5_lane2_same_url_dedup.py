@@ -82,14 +82,36 @@ WHERE cp.product_key = ANY($1::text[])
   AND cp.suppression_reason IS NULL
 """
 
-# Deactivate the losers' seeds via BOTH linkage directions; the keeper's seed
-# is untouched because only loser product_keys/source_refs are passed.
+# Deactivate the losers' seeds via BOTH linkage directions — EXCEPT any seed
+# that also backs the keeper. Seed<->row linkage is many-to-many within a
+# group: the first prod apply hit 411 seeds whose id was a loser's source_ref
+# while their attached_product_key pointed at the KEEPER; deactivating them
+# orphaned the kept card (EXTERNAL_SEED_INACTIVE serving block) until a
+# targeted reactivation repaired it. The keeper's linkage is excluded
+# in-statement so that cannot recur.
 DEACTIVATE_SEEDS_SQL = """
 UPDATE external_product_seeds
 SET status = 'inactive', updated_at = NOW()
 WHERE (id = ANY($1::text[]) OR attached_product_key = ANY($2::text[]))
   AND lower(coalesce(status, '')) = 'active'
+  AND (attached_product_key IS NULL OR attached_product_key <> $3)
+  AND id IS DISTINCT FROM $4
 RETURNING id
+"""
+
+# Post-apply guard: a keeper must still have an active seed in at least one
+# linkage direction (external_seed keepers only; others have no seed to lose).
+ORPHANED_KEEPERS_SQL = """
+SELECT COUNT(*)
+FROM catalog_products cp
+WHERE cp.product_key = ANY($1::text[])
+  AND cp.platform = 'external_seed'
+  AND cp.suppression_reason IS NULL
+  AND NOT EXISTS (
+        SELECT 1 FROM external_product_seeds e
+        WHERE (e.id = cp.source_ref
+               OR e.attached_product_key = cp.product_key)
+          AND lower(coalesce(e.status, '')) = 'active')
 """
 
 
@@ -260,11 +282,20 @@ async def _run(args: argparse.Namespace) -> int:
                 )
                 suppressed += int(str(result).split()[-1] or 0)
                 deactivated = await conn.fetch(
-                    DEACTIVATE_SEEDS_SQL, loser_refs, loser_keys
+                    DEACTIVATE_SEEDS_SQL,
+                    loser_refs,
+                    loser_keys,
+                    g["keeper"]["product_key"],
+                    g["keeper"].get("source_ref"),
                 )
                 seed_ids.extend(str(r["id"]) for r in deactivated)
 
-        # Post-check: every applied group must still have >=1 unsuppressed row.
+        # Post-checks: every applied group keeps >=1 unsuppressed row, and no
+        # keeper lost its seed backing (would be an EXTERNAL_SEED_INACTIVE
+        # serving block on the card we meant to keep).
+        orphaned_keepers = await conn.fetchval(
+            ORPHANED_KEEPERS_SQL, [g["keeper"]["product_key"] for g in to_apply]
+        )
         empty = await conn.fetchval(
             """
             SELECT COUNT(*) FROM (
@@ -285,12 +316,13 @@ async def _run(args: argparse.Namespace) -> int:
                     "run_id": run_id,
                     "reason": SUPPRESSION_REASON,
                     "groups_left_empty_post_check": empty,
+                    "keepers_orphaned_post_check": orphaned_keepers,
                     "deactivated_seed_ids": seed_ids,
                 },
                 indent=2,
             )
         )
-        return 0 if empty == 0 else 1
+        return 0 if (empty == 0 and orphaned_keepers == 0) else 1
     finally:
         await conn.close()
 

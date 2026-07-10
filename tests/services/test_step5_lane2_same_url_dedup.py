@@ -124,6 +124,14 @@ class TestApplyGuards:
         assert "id = ANY" in DEACTIVATE_SEEDS_SQL
         assert "= 'active'" in DEACTIVATE_SEEDS_SQL
 
+    def test_seed_deactivation_never_touches_keeper_backing(self):
+        # Seed<->row linkage is many-to-many: a seed can be a loser's
+        # source_ref while its attached_product_key points at the KEEPER.
+        # The first prod apply orphaned 411 keepers this way; the exclusion
+        # must live in the deactivation statement itself.
+        assert "attached_product_key <> $3" in DEACTIVATE_SEEDS_SQL
+        assert "id IS DISTINCT FROM $4" in DEACTIVATE_SEEDS_SQL
+
     def test_metadata_traces_run_and_keeper(self):
         detail = {pk: _detail(pk) for pk in ("a", "b")}
         (g,) = build_proposal([_lane2_group(["a", "b"])], detail)["groups"]
