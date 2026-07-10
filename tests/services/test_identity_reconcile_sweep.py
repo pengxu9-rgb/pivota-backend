@@ -146,3 +146,38 @@ class TestJudgeWiring:
         )
         assert "(evidence->'tier3_judge') IS NULL" in AMBIGUOUS_PROPOSALS_SQL
         assert "tier3_judge" in ANNOTATE_JUDGE_SQL
+
+    def test_keeper_prefers_clean_slug_over_signed_junk_copy(self):
+        # The first judge review found 8/30 proposals with a '-copy' page as
+        # keeper (junk copies carry sigs + low keys). The clean member must
+        # win even when the junk row would win pick_canonical outright.
+        from services.identity_reconcile_sweep import build_judge_proposal
+        source = {"proposal_id": "irp_src", "merchant_id": "m", "content_key": "ck"}
+        details = [
+            {"product_key": "a-copy-row", "platform": "external_seed",
+             "pivota_signature_id": "sig",
+             "canonical_url": "https://s.com/products/super-slick-lip-balm-copy-1"},
+            {"product_key": "z-shade-row", "platform": "external_seed",
+             "pivota_signature_id": None,
+             "canonical_url": "https://s.com/products/super-slick-lip-balm-cherry"},
+        ]
+        verdict = {"verdict": "collapse", "confidence": 0.9,
+                   "reasoning": "r", "judge_version": "tier3.v2"}
+        p = build_judge_proposal(source, details, verdict)
+        assert p["keeper_product_key"] == "z-shade-row"
+
+    def test_all_junk_group_falls_back_to_pick_canonical(self):
+        from services.identity_reconcile_sweep import build_judge_proposal
+        source = {"proposal_id": "irp_src", "merchant_id": "m", "content_key": "ck"}
+        details = [
+            {"product_key": "a", "platform": "external_seed",
+             "pivota_signature_id": "sig",
+             "canonical_url": "https://s.com/products/0627_cm_a_jhp1"},
+            {"product_key": "b", "platform": "external_seed",
+             "pivota_signature_id": None,
+             "canonical_url": "https://s.com/products/0627_cm_b_jhp2"},
+        ]
+        verdict = {"verdict": "collapse", "confidence": 0.9,
+                   "reasoning": "r", "judge_version": "tier3.v2"}
+        p = build_judge_proposal(source, details, verdict)
+        assert p["keeper_product_key"] == "a"  # signed wins within all-junk
