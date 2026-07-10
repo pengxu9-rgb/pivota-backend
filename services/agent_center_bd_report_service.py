@@ -5996,6 +5996,14 @@ def _failing_prompts(probe_runs: Any, cap: int = 20) -> List[Dict[str, Any]]:
             "provider": str(
                 run.get("_provider") or run.get("provider") or ""
             ).strip().lower() or None,
+            # Generator stamp (llm_winnable/llm_scenario) — the win plan uses
+            # it to never treat a specific LLM discovery prompt as a bare head
+            # term when gating the own-content win condition.
+            "prompt_source": (
+                (run.get("axis_metadata") or {}).get("prompt_source")
+                if isinstance(run.get("axis_metadata"), dict)
+                else None
+            ),
             "grounding_sources": run.get("grounding_sources") or [],
             "competitors_named": parsed.get("competitors_listed") or parsed.get("competitors_appearing") or run.get("competitors_listed") or [],
         })
@@ -6247,7 +6255,9 @@ _GAP_DISPLAY: Dict[Tuple[str, str], Dict[str, str]] = {
     },
     ("content_richness", "vertical_structure"): {
         "label": "Category-specific details",
-        "why": "Shoppers in this category expect specifics (ingredients, materials, or specs) that aren't fully covered yet.",
+        # Vertical-neutral phrasing: this copy renders for every vertical, and
+        # "ingredients" read absurd on an electronics report (live Mojawa run).
+        "why": "Shoppers in this category expect the specific details they compare products on, and those aren't fully covered yet.",
     },
     ("content_richness", "model_readiness"): {
         "label": "AI-ready content",
@@ -9026,10 +9036,24 @@ def build_suggested_prompts(
     return {
         "prompts": prompts,
         "has_prompts": bool(prompts),
+        # Honest empty state: since the winnable/sidewalk prompts are budgeted
+        # INTO the audit itself (spec-matched prompt work, #1281/#1284), the
+        # common case is that every specific prompt was already probed — the
+        # old rationale ("this audit didn't test yet") then described an empty
+        # list with a promise it couldn't keep.
         "rationale": (
-            "Specific, attribute-stacked prompts built from your product's verified "
-            "attributes that this audit didn't test yet — the niches you're positioned "
-            "to own. Add them to your prompts to measure where you can win."
+            (
+                "Specific, attribute-stacked prompts built from your product's "
+                "verified attributes that this audit didn't test yet — the niches "
+                "you're positioned to own. Add them to your prompts to measure "
+                "where you can win."
+            )
+            if prompts
+            else (
+                "All of this product's specific winnable prompts were already "
+                "probed in this audit (the attribute-stacked discovery queries "
+                "above) — there's nothing untested left to suggest."
+            )
         ),
     }
 

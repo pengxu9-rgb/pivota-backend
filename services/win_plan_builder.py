@@ -198,6 +198,29 @@ def _win_condition(query: str, targets: List[Dict[str, Any]]) -> Optional[str]:
     return f'Get cited in {" / ".join(hosts)} for "{query}".'
 
 
+# Bare head-term shapes: "best headphones", "top serums", "what headphones
+# should I buy". Kept deliberately TIGHT (prefix + <=3 tokens, or the
+# what-should-I-buy pattern) so mid-specific queries like "best collagen for
+# sleep" still get the own-content play. An LLM winnable/scenario prompt is
+# never head — specificity comes from the generator contract (#1310).
+_BROAD_HEAD_PREFIXES = ("best ", "top ", "popular ", "what is ")
+_WHAT_SHOULD_I_BUY_RE = re.compile(
+    r"^what\s+[\w\- ]{1,40}\s+should\s+i\s+buy\??$", re.IGNORECASE
+)
+_LLM_PROMPT_SOURCES = {"llm_winnable", "llm_scenario"}
+
+
+def _is_broad_head_query(query: str, *, prompt_source: Any = None) -> bool:
+    if str(prompt_source or "").strip().lower() in _LLM_PROMPT_SOURCES:
+        return False
+    q = " ".join(str(query or "").lower().split())
+    if not q:
+        return False
+    if _WHAT_SHOULD_I_BUY_RE.match(q):
+        return True
+    return len(q.split()) <= 3 and q.startswith(_BROAD_HEAD_PREFIXES)
+
+
 def _losing_query_plan(
     failing_prompt: Dict[str, Any],
     uri_index: Dict[str, Dict[str, Any]],
@@ -230,7 +253,18 @@ def _losing_query_plan(
     targets = targets[:_MAX_TARGETS_PER_QUERY]
 
     limit: Optional[str] = None
-    win_path = "publisher" if targets else "own_content"
+    # Own-content only helps where a spec-complete page can plausibly BE the
+    # answer — not on bare head terms ("best headphones", "what headphones
+    # should I buy"), which a niche brand can't win with its own content
+    # either. For head terms with no publisher target the honest limit stands
+    # alone (win_condition null, win_path none) — the old over-optimistic
+    # phrasing told the merchant to publish a page "answering best headphones".
+    broad_head = _is_broad_head_query(
+        query, prompt_source=failing_prompt.get("prompt_source")
+    )
+    win_path: Optional[str] = "publisher" if targets else (
+        None if broad_head else "own_content"
+    )
     win_condition = _win_condition(query, targets)
     if not targets:
         # No independent target we can name for this query. Be specific about
@@ -260,11 +294,12 @@ def _losing_query_plan(
             limit = (
                 "AI returned no resolvable independent source for this query."
             )
-        win_condition = (
-            "No publisher controls this answer — win it with your own "
-            f'content: publish a spec-complete product page that answers "{query}" '
-            "so AI can ground on you directly."
-        )
+        if not broad_head:
+            win_condition = (
+                "No publisher controls this answer — win it with your own "
+                f'content: publish a spec-complete product page that answers "{query}" '
+                "so AI can ground on you directly."
+            )
 
     return {
         "query": query,
@@ -318,6 +353,7 @@ def _sku_plan(
             row = {
                 "query": fp.get("query"),
                 "axis": fp.get("axis"),
+                "prompt_source": None,
                 "grounding_sources": [],
                 "competitors_named": [],
                 "providers": [],
@@ -326,6 +362,8 @@ def _sku_plan(
             order.append(query_key)
         row["grounding_sources"].extend(fp.get("grounding_sources") or [])
         row["competitors_named"].extend(fp.get("competitors_named") or [])
+        if not row.get("prompt_source") and fp.get("prompt_source"):
+            row["prompt_source"] = fp.get("prompt_source")
         provider = str(fp.get("provider") or "").strip().lower()
         if provider and provider not in row["providers"]:
             row["providers"].append(provider)
