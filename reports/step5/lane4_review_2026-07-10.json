@@ -1,0 +1,2555 @@
+{
+  "generated": "2026-07-10",
+  "source": "step5_working_set post-lane1 run",
+  "summary": {
+    "KEEP_multi_seller_observation": 54,
+    "KEEP_regional_storefronts": 60,
+    "FIX_URL": 1,
+    "REVIEW_junk_copy_vs_variant": 10,
+    "REVIEW_possible_clone_conservative_spare": 31,
+    "KEEP_size_variants": 6,
+    "KEEP_title_collision_distinct_products": 3,
+    "SUPPRESS_seed_twin_pending_signoff": 4,
+    "KEEP_audit_observation": 1
+  },
+  "verdicts": [
+    {
+      "lane": "multi_domain",
+      "content_key": "ck_00766907d0ad7a56e1f03e54dbf948f3",
+      "merchant_id": "external_seed",
+      "n_rows": 2,
+      "verdict": "KEEP_multi_seller_observation",
+      "why": "brand+retailer observation ['theordinary.com', 'ulta.com'] — future resolver/buy-box input",
+      "hosts": [
+        "theordinary.com",
+        "ulta.com"
+      ],
+      "sample_urls": [
+        "https://theordinary.com/en-us/alpha-arbutin-2-ha-serum-769915233674.html",
+        "https://www.ulta.com/p/alpha-arbutin-2-hyaluronic-acid-hyperpigmentation-pimprod2007108?sku=2551165"
+      ]
+    },
+    {
+      "lane": "multi_domain",
+      "content_key": "ck_01f63f94dd920c58fbc72771c1902a0c",
+      "merchant_id": "external_seed",
+      "n_rows": 3,
+      "verdict": "KEEP_multi_seller_observation",
+      "why": "brand+retailer observation ['bestbuy.com', 'sony.com'] — future resolver/buy-box input",
+      "hosts": [
+        "bestbuy.com",
+        "sony.com"
+      ],
+      "sample_urls": [
+        "https://www.bestbuy.com/site/sony-wf-1000xm5-true-wireless-noise-cancelling-earbuds-black/6548318.p?skuId=6548318",
+        "https://www.sony.com/electronics/in-ear-headphones/wf-1000xm5/buy/wf1000xm5-b",
+        "https://www.sony.com/electronics/in-ear-headphones/wf-1000xm5/buy/wf1000xm5-b"
+      ]
+    },
+    {
+      "lane": "multi_domain",
+      "content_key": "ck_020b7bc1543adf402c3544fbe78d1f3e",
+      "merchant_id": "external_seed",
+      "n_rows": 2,
+      "verdict": "KEEP_multi_seller_observation",
+      "why": "brand+retailer observation ['theordinary.com', 'ulta.com'] — future resolver/buy-box input",
+      "hosts": [
+        "theordinary.com",
+        "ulta.com"
+      ],
+      "sample_urls": [
+        "https://www.ulta.com/p/glycolic-acid-7-exfoliating-brightening-daily-toner-pimprod2007097?sku=2551155",
+        "https://theordinary.com/en-us/glycolic-acid-7-exfoliating-toner-100418.html"
+      ]
+    },
+    {
+      "lane": "multi_domain",
+      "content_key": "ck_04ede53a3014779686fd18fd02277a01",
+      "merchant_id": "external_seed",
+      "n_rows": 2,
+      "verdict": "KEEP_multi_seller_observation",
+      "why": "brand+retailer observation ['theordinary.com', 'ulta.com'] — future resolver/buy-box input",
+      "hosts": [
+        "theordinary.com",
+        "ulta.com"
+      ],
+      "sample_urls": [
+        "https://theordinary.com/en-us/niacinamide-5-face-body-serum-100661.html",
+        "https://www.ulta.com/p/niacinamide-5-face-body-emulsion-dark-spots-uneven-tone-pimprod2046887?sku=2630449"
+      ]
+    },
+    {
+      "lane": "multi_domain",
+      "content_key": "ck_0b3faa8916a03428b00675b36f4f9a42",
+      "merchant_id": "external_seed",
+      "n_rows": 3,
+      "verdict": "KEEP_multi_seller_observation",
+      "why": "brand+retailer observation ['bestbuy.com', 'samsung.com'] — future resolver/buy-box input",
+      "hosts": [
+        "bestbuy.com",
+        "samsung.com"
+      ],
+      "sample_urls": [
+        "https://www.bestbuy.com/site/samsung-galaxy-buds3-pro-wireless-earbud-headphones-silver/6590000.p?skuId=6590000",
+        "https://www.samsung.com/us/mobile/audio/galaxy-buds/galaxy-buds3-pro-silver-sm-r630nzaaxar/",
+        "https://www.samsung.com/us/mobile/audio/galaxy-buds/galaxy-buds3-pro-silver-sm-r630nzaaxar/"
+      ]
+    },
+    {
+      "lane": "multi_domain",
+      "content_key": "ck_0c969710b2a7ba27b8ffd5aec13b743d",
+      "merchant_id": "external_seed",
+      "n_rows": 2,
+      "verdict": "KEEP_multi_seller_observation",
+      "why": "brand+retailer observation ['theordinary.com', 'ulta.com'] — future resolver/buy-box input",
+      "hosts": [
+        "theordinary.com",
+        "ulta.com"
+      ],
+      "sample_urls": [
+        "https://theordinary.com/en-us/mandelic-acid-10-ha-exfoliator-100429.html",
+        "https://www.ulta.com/p/mandelic-acid-10-ha-gentle-facial-exfoliating-serum-hydration-pimprod2009251?sku=2552293"
+      ]
+    },
+    {
+      "lane": "multi_domain",
+      "content_key": "ck_10a8ab2b19b695b39efb54c013b4c7dd",
+      "merchant_id": "external_seed",
+      "n_rows": 2,
+      "verdict": "KEEP_regional_storefronts",
+      "why": "same brand on regional domains ['arencia.jp', 'arencia.us']",
+      "hosts": [
+        "arencia.jp",
+        "arencia.us"
+      ],
+      "sample_urls": [
+        "https://arencia.jp/products/フレッシュもちソープ-カレンデュラ-120g",
+        "https://arencia.us/products/フレッシュもちソープ-カレンデュラ-120g"
+      ]
+    },
+    {
+      "lane": "multi_domain",
+      "content_key": "ck_11efc6ebe08b5368b8d5a4f6d1958320",
+      "merchant_id": "external_seed",
+      "n_rows": 2,
+      "verdict": "KEEP_multi_seller_observation",
+      "why": "brand+retailer observation ['theordinary.com', 'ulta.com'] — future resolver/buy-box input",
+      "hosts": [
+        "theordinary.com",
+        "ulta.com"
+      ],
+      "sample_urls": [
+        "https://www.ulta.com/p/glycolipid-cream-cleanser-dry-skin-makeup-removal-pimprod2038843?sku=2609861",
+        "https://theordinary.com/en-us/glycolipid-cream-face-cleanser-100615.html"
+      ]
+    },
+    {
+      "lane": "multi_domain",
+      "content_key": "ck_120d20d3f929e52dae563921176cb48c",
+      "merchant_id": "external_seed",
+      "n_rows": 3,
+      "verdict": "KEEP_multi_seller_observation",
+      "why": "brand+retailer observation ['esteelauder.com', 'ulta.com'] — future resolver/buy-box input",
+      "hosts": [
+        "esteelauder.com",
+        "ulta.com"
+      ],
+      "sample_urls": [
+        "https://www.ulta.com/p/double-wear-stay-in-place-24-hour-concealer-pimprod2050283?sku=2635341",
+        "https://esteelauder.com/products/est-e-lauder-double-wear-stay-in-place-concealer",
+        "https://www.esteelauder.com/product/643/112207/product-catalog/makeup/face/concealer/double-wear-stay-in-place-24h-concealer"
+      ]
+    },
+    {
+      "lane": "multi_domain",
+      "content_key": "ck_12c4b16eed04a766711d91e5a111d6d2",
+      "merchant_id": "external_seed",
+      "n_rows": 2,
+      "verdict": "KEEP_multi_seller_observation",
+      "why": "brand+retailer observation ['theordinary.com', 'ulta.com'] — future resolver/buy-box input",
+      "hosts": [
+        "theordinary.com",
+        "ulta.com"
+      ],
+      "sample_urls": [
+        "https://theordinary.com/en-us/100-plant-derived-squalane-face-oil-100398.html",
+        "https://www.ulta.com/p/100-plant-derived-squalane-skin-hair-hydration-pimprod2007112?sku=2551177"
+      ]
+    },
+    {
+      "lane": "multi_domain",
+      "content_key": "ck_1a141552db513817359292a4ff4ad42d",
+      "merchant_id": "external_seed",
+      "n_rows": 2,
+      "verdict": "KEEP_multi_seller_observation",
+      "why": "brand+retailer observation ['nordstrom.com', 'yslbeautyus.com'] — future resolver/buy-box input",
+      "hosts": [
+        "nordstrom.com",
+        "yslbeautyus.com"
+      ],
+      "sample_urls": [
+        "https://www.nordstrom.com/s/yves-saint-laurent-volume-effet-faux-cils-volumizing-mascara/3002677",
+        "https://yslbeautyus.com/products/ysl-volume-effet-faux-cils-mascara"
+      ]
+    },
+    {
+      "lane": "multi_domain",
+      "content_key": "ck_1bb81b0e2499ca2d8c9ba58bbb766067",
+      "merchant_id": "external_seed",
+      "n_rows": 2,
+      "verdict": "KEEP_multi_seller_observation",
+      "why": "brand+retailer observation ['theordinary.com', 'ulta.com'] — future resolver/buy-box input",
+      "hosts": [
+        "theordinary.com",
+        "ulta.com"
+      ],
+      "sample_urls": [
+        "https://theordinary.com/en-us/pha-5-exfoliating-lip-serum-100721.html",
+        "https://www.ulta.com/p/pha-5-exfoliating-lip-serum-pimprod2054313?sku=2645081"
+      ]
+    },
+    {
+      "lane": "multi_domain",
+      "content_key": "ck_1c0f8e1ea9664b9eeb8558c9053b9324",
+      "merchant_id": "external_seed",
+      "n_rows": 2,
+      "verdict": "KEEP_regional_storefronts",
+      "why": "same brand on regional domains ['arencia.jp', 'arencia.us']",
+      "hosts": [
+        "arencia.jp",
+        "arencia.us"
+      ],
+      "sample_urls": [
+        "https://arencia.us/products/arencia-holy-hyssop-serum-30-1-76-oz-copy",
+        "https://arencia.jp/products/arencia-holy-hyssop-serum-30-1-76-oz-copy"
+      ]
+    },
+    {
+      "lane": "multi_domain",
+      "content_key": "ck_1f74136fc6a800e2007507822a87d027",
+      "merchant_id": "external_seed",
+      "n_rows": 2,
+      "verdict": "KEEP_multi_seller_observation",
+      "why": "brand+retailer observation ['theordinary.com', 'ulta.com'] — future resolver/buy-box input",
+      "hosts": [
+        "theordinary.com",
+        "ulta.com"
+      ],
+      "sample_urls": [
+        "https://theordinary.com/en-us/sulfur-10-powder-to-cream-concentrate-100708.html",
+        "https://www.ulta.com/p/sulfur-10-powder-cream-concentrate-pimprod2054312?sku=2645080"
+      ]
+    },
+    {
+      "lane": "multi_domain",
+      "content_key": "ck_2058bf8fad78c75fa9943c5d36547d11",
+      "merchant_id": "external_seed",
+      "n_rows": 2,
+      "verdict": "KEEP_regional_storefronts",
+      "why": "same brand on regional domains ['arencia.jp', 'arencia.us']",
+      "hosts": [
+        "arencia.jp",
+        "arencia.us"
+      ],
+      "sample_urls": [
+        "https://arencia.us/products/arencia-rice-mucin-glow-serum-collagen-hyaluronic-acid-niacinamide-1-01-fl-oz",
+        "https://arencia.jp/products/arencia-rice-mucin-glow-serum-collagen-hyaluronic-acid-niacinamide-1-01-fl-oz"
+      ]
+    },
+    {
+      "lane": "multi_domain",
+      "content_key": "ck_205eecd46ac887246f761c3d6feb9f76",
+      "merchant_id": "external_seed",
+      "n_rows": 2,
+      "verdict": "KEEP_regional_storefronts",
+      "why": "same brand on regional domains ['arencia.jp', 'arencia.us']",
+      "hosts": [
+        "arencia.jp",
+        "arencia.us"
+      ],
+      "sample_urls": [
+        "https://arencia.jp/products/glass-skin-renewal-set-spotless-skin-5-step-routine-copy",
+        "https://arencia.us/products/glass-skin-renewal-set-spotless-skin-5-step-routine-copy"
+      ]
+    },
+    {
+      "lane": "multi_domain",
+      "content_key": "ck_2249bc9cfbd6720b58d3240f8ca4891d",
+      "merchant_id": "external_seed",
+      "n_rows": 2,
+      "verdict": "KEEP_regional_storefronts",
+      "why": "same brand on regional domains ['arencia.jp', 'arencia.us']",
+      "hosts": [
+        "arencia.jp",
+        "arencia.us"
+      ],
+      "sample_urls": [
+        "https://arencia.us/products/arencia-deep-water-surge-soothing-cream-hyaluronic-acid-cica-pdrn-ceramide",
+        "https://arencia.jp/products/arencia-deep-water-surge-soothing-cream-hyaluronic-acid-cica-pdrn-ceramide"
+      ]
+    },
+    {
+      "lane": "multi_domain",
+      "content_key": "ck_230c41b0bf08055c8a7bf04d41d8d341",
+      "merchant_id": "external_seed",
+      "n_rows": 2,
+      "verdict": "KEEP_multi_seller_observation",
+      "why": "brand+retailer observation ['cosrx.com', 'sokoglam.com'] — future resolver/buy-box input",
+      "hosts": [
+        "cosrx.com",
+        "sokoglam.com"
+      ],
+      "sample_urls": [
+        "https://www.cosrx.com/products/the-6-peptide-skin-booster-serum",
+        "https://sokoglam.com/products/cosrx-the-6-peptide-skin-booster-serum"
+      ]
+    },
+    {
+      "lane": "multi_domain",
+      "content_key": "ck_23ed79d5cd29360e81653577ab9d7ed0",
+      "merchant_id": "external_seed",
+      "n_rows": 2,
+      "verdict": "KEEP_regional_storefronts",
+      "why": "same brand on regional domains ['arencia.jp', 'arencia.us']",
+      "hosts": [
+        "arencia.jp",
+        "arencia.us"
+      ],
+      "sample_urls": [
+        "https://arencia.us/products/glass-skin-renewal-set",
+        "https://arencia.jp/products/glass-skin-renewal-set"
+      ]
+    },
+    {
+      "lane": "multi_domain",
+      "content_key": "ck_247d90efc344e8b218550593ecaa72ef",
+      "merchant_id": "external_seed",
+      "n_rows": 2,
+      "verdict": "KEEP_regional_storefronts",
+      "why": "same brand on regional domains ['arencia.jp', 'arencia.us']",
+      "hosts": [
+        "arencia.jp",
+        "arencia.us"
+      ],
+      "sample_urls": [
+        "https://arencia.us/products/フレッシュもちソープ-ロイヤルブルーヒソップ-120g",
+        "https://arencia.jp/products/フレッシュもちソープ-ロイヤルブルーヒソップ-120g"
+      ]
+    },
+    {
+      "lane": "multi_domain",
+      "content_key": "ck_252a70c2d457b3a518f5ac42dee5c19b",
+      "merchant_id": "external_seed",
+      "n_rows": 2,
+      "verdict": "KEEP_multi_seller_observation",
+      "why": "brand+retailer observation ['theordinary.com', 'ulta.com'] — future resolver/buy-box input",
+      "hosts": [
+        "theordinary.com",
+        "ulta.com"
+      ],
+      "sample_urls": [
+        "https://www.ulta.com/p/saccharomyces-ferment-30-milky-toner-gentle-exfoliation-hydration-pimprod2045245?sku=2623549",
+        "https://theordinary.com/en-us/saccharomyces-ferment-30-milky-toner-100647.html"
+      ]
+    },
+    {
+      "lane": "multi_domain",
+      "content_key": "ck_2579545fc7afb0d6e375ecd0ece0329d",
+      "merchant_id": "external_seed",
+      "n_rows": 2,
+      "verdict": "KEEP_regional_storefronts",
+      "why": "same brand on regional domains ['arencia.jp', 'arencia.us']",
+      "hosts": [
+        "arencia.jp",
+        "arencia.us"
+      ],
+      "sample_urls": [
+        "https://arencia.us/products/nad-time-rewind-booster-shot-firming-revitalizing-serum-with-5-nad-complex-peptides-resveratrol-1-01-fl-oz-copy",
+        "https://arencia.jp/products/nad-time-rewind-booster-shot-firming-revitalizing-serum-with-5-nad-complex-peptides-resveratrol-1-01-fl-oz-copy"
+      ]
+    },
+    {
+      "lane": "multi_domain",
+      "content_key": "ck_2a3ac9ecc23d89b6b0d1ea3500469fad",
+      "merchant_id": "external_seed",
+      "n_rows": 2,
+      "verdict": "KEEP_regional_storefronts",
+      "why": "same brand on regional domains ['arencia.jp', 'arencia.us']",
+      "hosts": [
+        "arencia.jp",
+        "arencia.us"
+      ],
+      "sample_urls": [
+        "https://arencia.us/products/vitamin-c-booster-shot-30ml",
+        "https://arencia.jp/products/vitamin-c-booster-shot-30ml"
+      ]
+    },
+    {
+      "lane": "multi_domain",
+      "content_key": "ck_2ead0707d8ff88bbf0d38519d3d1e3f2",
+      "merchant_id": "external_seed",
+      "n_rows": 3,
+      "verdict": "KEEP_multi_seller_observation",
+      "why": "brand+retailer observation ['bestbuy.com', 'sennheiser-hearing.com'] — future resolver/buy-box input",
+      "hosts": [
+        "bestbuy.com",
+        "sennheiser-hearing.com"
+      ],
+      "sample_urls": [
+        "https://www.sennheiser-hearing.com/en-US/p/momentum-4-wireless/",
+        "https://www.bestbuy.com/site/sennheiser-momentum-4-wireless-adaptive-noise-canceling-over-the-ear-headphones-black/6512500.p?skuId=6512500",
+        "https://www.sennheiser-hearing.com/en-US/p/momentum-4-wireless/"
+      ]
+    },
+    {
+      "lane": "multi_domain",
+      "content_key": "ck_3008349189d0700a6cb2572e5e87dd84",
+      "merchant_id": "external_seed",
+      "n_rows": 2,
+      "verdict": "KEEP_regional_storefronts",
+      "why": "same brand on regional domains ['arencia.jp', 'arencia.us']",
+      "hosts": [
+        "arencia.jp",
+        "arencia.us"
+      ],
+      "sample_urls": [
+        "https://arencia.us/products/arencia-calendula-rice-mochi-cleanser-gentle-exfoliating-foam-wash-for-sensitive-dry-rough-skin-4-23oz-120g-copy",
+        "https://arencia.jp/products/arencia-calendula-rice-mochi-cleanser-gentle-exfoliating-foam-wash-for-sensitive-dry-rough-skin-4-23oz-120g-copy"
+      ]
+    },
+    {
+      "lane": "multi_domain",
+      "content_key": "ck_308435f0a07e69cea31c02518c31fbfe",
+      "merchant_id": "external_seed",
+      "n_rows": 2,
+      "verdict": "KEEP_regional_storefronts",
+      "why": "same brand on regional domains ['arencia.jp', 'arencia.us']",
+      "hosts": [
+        "arencia.jp",
+        "arencia.us"
+      ],
+      "sample_urls": [
+        "https://arencia.jp/products/arencia-red-collagen-peptide-smoothie-serum-8-niacinamide-vitamin-c-vitamin-e-lifting-anti-aging-serum-for-skin-texture-for-glass-skin-copy",
+        "https://arencia.us/products/arencia-red-collagen-peptide-smoothie-serum-8-niacinamide-vitamin-c-vitamin-e-lifting-anti-aging-serum-for-skin-texture-for-glass-skin-copy"
+      ]
+    },
+    {
+      "lane": "multi_domain",
+      "content_key": "ck_3352fd51b04563e1a19af1ee9bf5639a",
+      "merchant_id": "external_seed",
+      "n_rows": 2,
+      "verdict": "KEEP_regional_storefronts",
+      "why": "same brand on regional domains ['arencia.jp', 'arencia.us']",
+      "hosts": [
+        "arencia.jp",
+        "arencia.us"
+      ],
+      "sample_urls": [
+        "https://arencia.us/products/arencia-hyssop-multi-eye-balm",
+        "https://arencia.jp/products/arencia-hyssop-multi-eye-balm"
+      ]
+    },
+    {
+      "lane": "multi_domain",
+      "content_key": "ck_3759e486e2e62aac95340f2c2fefefd8",
+      "merchant_id": "external_seed",
+      "n_rows": 3,
+      "verdict": "KEEP_multi_seller_observation",
+      "why": "brand+retailer observation ['apple.com', 'bestbuy.com'] — future resolver/buy-box input",
+      "hosts": [
+        "apple.com",
+        "bestbuy.com"
+      ],
+      "sample_urls": [
+        "https://www.apple.com/shop/buy-airpods/airpods-max/midnight",
+        "https://www.bestbuy.com/site/apple-airpods-max-usb-c-blue/6569032.p?skuId=6569032",
+        "https://www.apple.com/shop/buy-airpods/airpods-max/midnight"
+      ]
+    },
+    {
+      "lane": "multi_domain",
+      "content_key": "ck_394ebf7815b72f318744cc53c5302f15",
+      "merchant_id": "external_seed",
+      "n_rows": 2,
+      "verdict": "KEEP_regional_storefronts",
+      "why": "same brand on regional domains ['arencia.jp', 'arencia.us']",
+      "hosts": [
+        "arencia.jp",
+        "arencia.us"
+      ],
+      "sample_urls": [
+        "https://arencia.jp/products/glass-skin-starter-trio",
+        "https://arencia.us/products/glass-skin-starter-trio"
+      ]
+    },
+    {
+      "lane": "multi_domain",
+      "content_key": "ck_3b2901ff67bfc04cf33c7c7db54f7732",
+      "merchant_id": "external_seed",
+      "n_rows": 2,
+      "verdict": "KEEP_regional_storefronts",
+      "why": "same brand on regional domains ['arencia.jp', 'arencia.us']",
+      "hosts": [
+        "arencia.jp",
+        "arencia.us"
+      ],
+      "sample_urls": [
+        "https://arencia.us/products/clarifying-skin-duo-for-oily-skin",
+        "https://arencia.jp/products/clarifying-skin-duo-for-oily-skin"
+      ]
+    },
+    {
+      "lane": "multi_domain",
+      "content_key": "ck_3c985e7fac7e37fdaa2a9061737c110a",
+      "merchant_id": "external_seed",
+      "n_rows": 2,
+      "verdict": "KEEP_multi_seller_observation",
+      "why": "brand+retailer observation ['theordinary.com', 'ulta.com'] — future resolver/buy-box input",
+      "hosts": [
+        "theordinary.com",
+        "ulta.com"
+      ],
+      "sample_urls": [
+        "https://theordinary.com/en-us/uv-filters-spf-45-serum-100720.html",
+        "https://www.ulta.com/p/uv-filters-spf-45-serum-pimprod2051384?sku=2637168"
+      ]
+    },
+    {
+      "lane": "multi_domain",
+      "content_key": "ck_3da3bd225110125ea276076b8f8c6b8c",
+      "merchant_id": "external_seed",
+      "n_rows": 2,
+      "verdict": "KEEP_regional_storefronts",
+      "why": "same brand on regional domains ['arencia.jp', 'arencia.us']",
+      "hosts": [
+        "arencia.jp",
+        "arencia.us"
+      ],
+      "sample_urls": [
+        "https://arencia.jp/products/fresh-green-rice-mochi-cleanser-120g",
+        "https://arencia.us/products/fresh-green-rice-mochi-cleanser-120g"
+      ]
+    },
+    {
+      "lane": "multi_domain",
+      "content_key": "ck_3daf075d8bc589076a6f3be2bac68e53",
+      "merchant_id": "external_seed",
+      "n_rows": 2,
+      "verdict": "KEEP_multi_seller_observation",
+      "why": "brand+retailer observation ['theordinary.com', 'ulta.com'] — future resolver/buy-box input",
+      "hosts": [
+        "theordinary.com",
+        "ulta.com"
+      ],
+      "sample_urls": [
+        "https://theordinary.com/en-us/multi-active-delivery-essence-100706.html",
+        "https://www.ulta.com/p/multi-active-delivery-essence-hydration-pimprod2050415?sku=2637074"
+      ]
+    },
+    {
+      "lane": "multi_domain",
+      "content_key": "ck_3de700484b6ac13c7964ad7c3dc34fbf",
+      "merchant_id": "external_seed",
+      "n_rows": 2,
+      "verdict": "KEEP_multi_seller_observation",
+      "why": "brand+retailer observation ['theordinary.com', 'ulta.com'] — future resolver/buy-box input",
+      "hosts": [
+        "theordinary.com",
+        "ulta.com"
+      ],
+      "sample_urls": [
+        "https://theordinary.com/en-us/squalane-amino-acids-lip-balm-100657.html",
+        "https://www.ulta.com/p/squalane-amino-acids-hydrating-lip-balm-lips-elbows-cuticles-pimprod2045568?sku=2626327"
+      ]
+    },
+    {
+      "lane": "multi_domain",
+      "content_key": "ck_4422d3c43ed76d3ca9ca3f7553e278d5",
+      "merchant_id": "external_seed",
+      "n_rows": 2,
+      "verdict": "KEEP_regional_storefronts",
+      "why": "same brand on regional domains ['arencia.jp', 'arencia.us']",
+      "hosts": [
+        "arencia.jp",
+        "arencia.us"
+      ],
+      "sample_urls": [
+        "https://arencia.us/products/eraser-shot-glycolic-acid-exfoliator-6-76-fl-oz",
+        "https://arencia.jp/products/eraser-shot-glycolic-acid-exfoliator-6-76-fl-oz"
+      ]
+    },
+    {
+      "lane": "multi_domain",
+      "content_key": "ck_46250f773d2ebb50aa3fd83546eaf706",
+      "merchant_id": "external_seed",
+      "n_rows": 2,
+      "verdict": "KEEP_multi_seller_observation",
+      "why": "brand+retailer observation ['lorealparisusa.com', 'ulta.com'] — future resolver/buy-box input",
+      "hosts": [
+        "lorealparisusa.com",
+        "ulta.com"
+      ],
+      "sample_urls": [
+        "https://www.ulta.com/p/colour-riche-original-satin-lipstick-pimprod2006764",
+        "https://www.lorealparisusa.com/makeup/lip-makeup/lipstick/colour-riche-satin-lipstick"
+      ]
+    },
+    {
+      "lane": "multi_domain",
+      "content_key": "ck_465bfbf2cbf89826c1cf7875eb6134b2",
+      "merchant_id": "external_seed",
+      "n_rows": 2,
+      "verdict": "KEEP_multi_seller_observation",
+      "why": "brand+retailer observation ['theordinary.com', 'ulta.com'] — future resolver/buy-box input",
+      "hosts": [
+        "theordinary.com",
+        "ulta.com"
+      ],
+      "sample_urls": [
+        "https://theordinary.com/en-us/natural-moisturizing-factors-ha-for-scalp-hair-scalp-treatment-100422.html",
+        "https://www.ulta.com/p/natural-moisturizing-factors-hyaluronic-acid-scalp-serum-pimprod2034187?sku=2592846"
+      ]
+    },
+    {
+      "lane": "multi_domain",
+      "content_key": "ck_479bc1b79c926ecced7bf6c57048b0c4",
+      "merchant_id": "external_seed",
+      "n_rows": 2,
+      "verdict": "KEEP_regional_storefronts",
+      "why": "same brand on regional domains ['arencia.jp', 'arencia.us']",
+      "hosts": [
+        "arencia.jp",
+        "arencia.us"
+      ],
+      "sample_urls": [
+        "https://arencia.jp/products/poreperfection-collagen-serum-duo",
+        "https://arencia.us/products/poreperfection-collagen-serum-duo"
+      ]
+    },
+    {
+      "lane": "multi_domain",
+      "content_key": "ck_4ab2d5aab1658fd69a1ea5c52211cc5e",
+      "merchant_id": "external_seed",
+      "n_rows": 3,
+      "verdict": "FIX_URL",
+      "why": "row carries a grounding-redirect URL, not a PDP; repair or suppress that row",
+      "hosts": [
+        "bestbuy.com",
+        "vertexaisearch.cloud.google.com"
+      ],
+      "sample_urls": [
+        "https://vertexaisearch.cloud.google.com/grounding-api-redirect/AUZIYQFhERVW_eypT8YONFxB8Mpz5vEbPC4QiGNBieDDtnY8pU6KnKeZ9P7wMJyyxqNuuC7MqptjTc-zcwBr4Slz9-f9FRYsrwEJsOkami5OljONuBj-ha73o-s5b9EgbBQ=",
+        "https://www.bestbuy.com/site/jbl-live-770nc-wireless-over-ear-headphones-with-true-adaptive-noise-cancelling-2024-black/6561840.p?skuId=6561840",
+        "https://vertexaisearch.cloud.google.com/grounding-api-redirect/AUZIYQFhERVW_eypT8YONFxB8Mpz5vEbPC4QiGNBieDDtnY8pU6KnKeZ9P7wMJyyxqNuuC7MqptjTc-zcwBr4Slz9-f9FRYsrwEJsOkami5OljONuBj-ha73o-s5b9EgbBQ="
+      ]
+    },
+    {
+      "lane": "multi_domain",
+      "content_key": "ck_4d831d782c92da2e3b1e6f1377937a03",
+      "merchant_id": "external_seed",
+      "n_rows": 2,
+      "verdict": "KEEP_regional_storefronts",
+      "why": "same brand on regional domains ['arencia.jp', 'arencia.us']",
+      "hosts": [
+        "arencia.jp",
+        "arencia.us"
+      ],
+      "sample_urls": [
+        "https://arencia.jp/products/holy-hyssop-serum-30",
+        "https://arencia.us/products/holy-hyssop-serum-30"
+      ]
+    },
+    {
+      "lane": "multi_domain",
+      "content_key": "ck_5478a79409c09c1eedf79cbb5e72f472",
+      "merchant_id": "external_seed",
+      "n_rows": 2,
+      "verdict": "KEEP_multi_seller_observation",
+      "why": "brand+retailer observation ['theordinary.com', 'ulta.com'] — future resolver/buy-box input",
+      "hosts": [
+        "theordinary.com",
+        "ulta.com"
+      ],
+      "sample_urls": [
+        "https://theordinary.com/en-us/natural-moisturizing-factors-inulin-body-lotion-100668.html",
+        "https://www.ulta.com/p/natural-moisturizing-factors-inulin-body-lotion-pimprod2048767?sku=2631999"
+      ]
+    },
+    {
+      "lane": "multi_domain",
+      "content_key": "ck_55677dc41e173edc0d6028042813a915",
+      "merchant_id": "external_seed",
+      "n_rows": 2,
+      "verdict": "KEEP_multi_seller_observation",
+      "why": "brand+retailer observation ['theordinary.com', 'ulta.com'] — future resolver/buy-box input",
+      "hosts": [
+        "theordinary.com",
+        "ulta.com"
+      ],
+      "sample_urls": [
+        "https://www.ulta.com/p/squalane-cleanser-hydrating-makeup-remover-pimprod2007098?sku=2551159",
+        "https://theordinary.com/en-us/squalane-face-cleanser-100446.html"
+      ]
+    },
+    {
+      "lane": "multi_domain",
+      "content_key": "ck_55af98167f900b80bb7132d1dcd1f628",
+      "merchant_id": "external_seed",
+      "n_rows": 2,
+      "verdict": "KEEP_regional_storefronts",
+      "why": "same brand on regional domains ['arencia.jp', 'arencia.us']",
+      "hosts": [
+        "arencia.jp",
+        "arencia.us"
+      ],
+      "sample_urls": [
+        "https://arencia.us/products/ヒュームバーム-マルチスキンケアモチバーム-30g",
+        "https://arencia.jp/products/ヒュームバーム-マルチスキンケアモチバーム-30g"
+      ]
+    },
+    {
+      "lane": "multi_domain",
+      "content_key": "ck_5b1172242b28fb7f592a6bf23e4d0a9d",
+      "merchant_id": "external_seed",
+      "n_rows": 2,
+      "verdict": "KEEP_multi_seller_observation",
+      "why": "brand+retailer observation ['esteelauder.com', 'nordstrom.com'] — future resolver/buy-box input",
+      "hosts": [
+        "esteelauder.com",
+        "nordstrom.com"
+      ],
+      "sample_urls": [
+        "https://www.esteelauder.com/product/644/109400/product-catalog/makeup/lips/lipstick/pure-color-hi-lustre-lipstick",
+        "https://www.nordstrom.com/s/estee-lauder-pure-color-long-lasting-hi-lustre-lipstick/7500000"
+      ]
+    },
+    {
+      "lane": "multi_domain",
+      "content_key": "ck_606dc9051883cc143e4f393a9ce0fd60",
+      "merchant_id": "external_seed",
+      "n_rows": 2,
+      "verdict": "KEEP_multi_seller_observation",
+      "why": "brand+retailer observation ['theordinary.com', 'ulta.com'] — future resolver/buy-box input",
+      "hosts": [
+        "theordinary.com",
+        "ulta.com"
+      ],
+      "sample_urls": [
+        "https://www.ulta.com/p/lash-curl-finisher-pimprod2055986?sku=2645082",
+        "https://theordinary.com/en-us/lash-curl-finisher-100732.html"
+      ]
+    },
+    {
+      "lane": "multi_domain",
+      "content_key": "ck_65ef16486c0d642620d5e7d080ac4928",
+      "merchant_id": "external_seed",
+      "n_rows": 2,
+      "verdict": "KEEP_regional_storefronts",
+      "why": "same brand on regional domains ['arencia.jp', 'arencia.us']",
+      "hosts": [
+        "arencia.jp",
+        "arencia.us"
+      ],
+      "sample_urls": [
+        "https://arencia.jp/products/booster-shot-skin-renewal-duo-vitamin-c-retinal-for-day-and-night-brightening-pore-minimizing-moisturizing-and-fades-dark-spots-1-01-fl-oz-1-01-fl-oz-copy",
+        "https://arencia.us/products/booster-shot-skin-renewal-duo-vitamin-c-retinal-for-day-and-night-brightening-pore-minimizing-moisturizing-and-fades-dark-spots-1-01-fl-oz-1-01-fl-oz-copy"
+      ]
+    },
+    {
+      "lane": "multi_domain",
+      "content_key": "ck_685dda60794f3fecfaa1e77b0a9f6a75",
+      "merchant_id": "external_seed",
+      "n_rows": 2,
+      "verdict": "KEEP_multi_seller_observation",
+      "why": "brand+retailer observation ['theordinary.com', 'ulta.com'] — future resolver/buy-box input",
+      "hosts": [
+        "theordinary.com",
+        "ulta.com"
+      ],
+      "sample_urls": [
+        "https://theordinary.com/en-us/natural-moisturizing-factors-ha-moisturizer-100435.html",
+        "https://www.ulta.com/p/natural-moisturizing-factors-hyaluronic-acid-daily-moisturizer-pimprod2007113?sku=2551163"
+      ]
+    },
+    {
+      "lane": "multi_domain",
+      "content_key": "ck_698ddc49670eb31aace9a79426c01f9a",
+      "merchant_id": "external_seed",
+      "n_rows": 2,
+      "verdict": "KEEP_regional_storefronts",
+      "why": "same brand on regional domains ['arencia.jp', 'arencia.us']",
+      "hosts": [
+        "arencia.jp",
+        "arencia.us"
+      ],
+      "sample_urls": [
+        "https://arencia.jp/products/フレッシュもちソープ-ロイヤルローズヒップ-120g",
+        "https://arencia.us/products/フレッシュもちソープ-ロイヤルローズヒップ-120g"
+      ]
+    },
+    {
+      "lane": "multi_domain",
+      "content_key": "ck_6ae38af8dde24eb5039588bd0f57289e",
+      "merchant_id": "external_seed",
+      "n_rows": 2,
+      "verdict": "KEEP_multi_seller_observation",
+      "why": "brand+retailer observation ['theordinary.com', 'ulta.com'] — future resolver/buy-box input",
+      "hosts": [
+        "theordinary.com",
+        "ulta.com"
+      ],
+      "sample_urls": [
+        "https://www.ulta.com/p/granactive-retinoid-2-emulsion-wrinkles-uneven-texture-pimprod2007125?sku=2551170",
+        "https://theordinary.com/en-us/granactive-retinoid-2-emulsion-serum-100419.html"
+      ]
+    },
+    {
+      "lane": "multi_domain",
+      "content_key": "ck_6b17321120dc49d1c26f21d8571b1daf",
+      "merchant_id": "external_seed",
+      "n_rows": 2,
+      "verdict": "KEEP_regional_storefronts",
+      "why": "same brand on regional domains ['arencia.jp', 'arencia.us']",
+      "hosts": [
+        "arencia.jp",
+        "arencia.us"
+      ],
+      "sample_urls": [
+        "https://arencia.jp/products/pdrn-booster-shot-rosy-pdrn-peptides-for-glowy-healthy-skin-1-01-fl-oz-copy",
+        "https://arencia.us/products/pdrn-booster-shot-rosy-pdrn-peptides-for-glowy-healthy-skin-1-01-fl-oz-copy"
+      ]
+    },
+    {
+      "lane": "multi_domain",
+      "content_key": "ck_6e45a056ac625cfddb336fac7a07d8de",
+      "merchant_id": "external_seed",
+      "n_rows": 2,
+      "verdict": "KEEP_regional_storefronts",
+      "why": "same brand on regional domains ['arencia.jp', 'arencia.us']",
+      "hosts": [
+        "arencia.jp",
+        "arencia.us"
+      ],
+      "sample_urls": [
+        "https://arencia.jp/products/ブラックヘッド専用クレンザー-もちソープ-ブラックティー-ユズ-120g",
+        "https://arencia.us/products/ブラックヘッド専用クレンザー-もちソープ-ブラックティー-ユズ-120g"
+      ]
+    },
+    {
+      "lane": "multi_domain",
+      "content_key": "ck_6f2ce9465a5ae1e754c6fec1156f257a",
+      "merchant_id": "external_seed",
+      "n_rows": 2,
+      "verdict": "KEEP_multi_seller_observation",
+      "why": "brand+retailer observation ['theordinary.com', 'ulta.com'] — future resolver/buy-box input",
+      "hosts": [
+        "theordinary.com",
+        "ulta.com"
+      ],
+      "sample_urls": [
+        "https://theordinary.com/en-us/volufiline-92-pal-isoleucine-1pct-plumping-serum-100724.html",
+        "https://www.ulta.com/p/volufiline-92-pal-isoleucine-1-plumping-serum-pimprod2055836?sku=2645079"
+      ]
+    },
+    {
+      "lane": "multi_domain",
+      "content_key": "ck_700f2748c78d7d5cfa4a45bf3e5d0886",
+      "merchant_id": "external_seed",
+      "n_rows": 3,
+      "verdict": "KEEP_multi_seller_observation",
+      "why": "brand+retailer observation ['benefitcosmetics.com', 'ulta.com'] — future resolver/buy-box input",
+      "hosts": [
+        "benefitcosmetics.com",
+        "ulta.com"
+      ],
+      "sample_urls": [
+        "https://benefitcosmetics.com/products/benefit-roller-lash-curling-mascara",
+        "https://www.benefitcosmetics.com/en-us/product/roller-lash-curling-mascara",
+        "https://www.ulta.com/p/roller-lash-curling-lifting-mascara-xlsImpprod11951085?sku=2285068"
+      ]
+    },
+    {
+      "lane": "multi_domain",
+      "content_key": "ck_70ee3271bdb9e4d92d65564298f7158d",
+      "merchant_id": "external_seed",
+      "n_rows": 2,
+      "verdict": "KEEP_regional_storefronts",
+      "why": "same brand on regional domains ['arencia.jp', 'arencia.us']",
+      "hosts": [
+        "arencia.jp",
+        "arencia.us"
+      ],
+      "sample_urls": [
+        "https://arencia.us/products/mochi-glow-starter-duo-rice-mochi-cleanser-vitamin-c-booster-shot-2-step-korean-glow-routine",
+        "https://arencia.jp/products/mochi-glow-starter-duo-rice-mochi-cleanser-vitamin-c-booster-shot-2-step-korean-glow-routine"
+      ]
+    },
+    {
+      "lane": "multi_domain",
+      "content_key": "ck_71304aeb63fb79bbca0484f3e6d90594",
+      "merchant_id": "external_seed",
+      "n_rows": 2,
+      "verdict": "KEEP_multi_seller_observation",
+      "why": "brand+retailer observation ['theordinary.com', 'ulta.com'] — future resolver/buy-box input",
+      "hosts": [
+        "theordinary.com",
+        "ulta.com"
+      ],
+      "sample_urls": [
+        "https://theordinary.com/en-us/gf-15-solution-growth-factors-serum-100702.html",
+        "https://www.ulta.com/p/gf-15-serum-visible-skin-repair-wrinkles-pimprod2050414?sku=2637073"
+      ]
+    },
+    {
+      "lane": "multi_domain",
+      "content_key": "ck_7392a953c262d155c1e1d7fbd78419fd",
+      "merchant_id": "external_seed",
+      "n_rows": 2,
+      "verdict": "KEEP_multi_seller_observation",
+      "why": "brand+retailer observation ['theordinary.com', 'ulta.com'] — future resolver/buy-box input",
+      "hosts": [
+        "theordinary.com",
+        "ulta.com"
+      ],
+      "sample_urls": [
+        "https://www.ulta.com/p/salicylic-acid-2-solution-exfoliating-serum-acne-pimprod2034186?sku=2600087",
+        "https://theordinary.com/en-us/salicylic-acid-2-solution-acne-control-100098.html"
+      ]
+    },
+    {
+      "lane": "multi_domain",
+      "content_key": "ck_748777c5b43c3957cd3e29c99783bd81",
+      "merchant_id": "external_seed",
+      "n_rows": 2,
+      "verdict": "KEEP_regional_storefronts",
+      "why": "same brand on regional domains ['arencia.jp', 'arencia.us']",
+      "hosts": [
+        "arencia.jp",
+        "arencia.us"
+      ],
+      "sample_urls": [
+        "https://arencia.us/products/clear-glow-hydration-duo-copy",
+        "https://arencia.jp/products/clear-glow-hydration-duo-copy"
+      ]
+    },
+    {
+      "lane": "multi_domain",
+      "content_key": "ck_77a5094009cb66c753b5f7a769a6a770",
+      "merchant_id": "external_seed",
+      "n_rows": 2,
+      "verdict": "KEEP_regional_storefronts",
+      "why": "same brand on regional domains ['arencia.jp', 'arencia.us']",
+      "hosts": [
+        "arencia.jp",
+        "arencia.us"
+      ],
+      "sample_urls": [
+        "https://arencia.us/products/arencia-overnight-red-smoothie-face-mask-serum-glowing-soothing-with-30-red-collagen-niacinamide-peptide-vitamin-e-copy-1",
+        "https://arencia.jp/products/arencia-overnight-red-smoothie-face-mask-serum-glowing-soothing-with-30-red-collagen-niacinamide-peptide-vitamin-e-copy-1"
+      ]
+    },
+    {
+      "lane": "multi_domain",
+      "content_key": "ck_78a025db28e43e404d35c070f8eb3052",
+      "merchant_id": "external_seed",
+      "n_rows": 2,
+      "verdict": "KEEP_regional_storefronts",
+      "why": "same brand on regional domains ['arencia.jp', 'arencia.us']",
+      "hosts": [
+        "arencia.jp",
+        "arencia.us"
+      ],
+      "sample_urls": [
+        "https://arencia.jp/products/red-collagen-jello-skin-bundle-poreless-skin-4-step-routine",
+        "https://arencia.us/products/red-collagen-jello-skin-bundle-poreless-skin-4-step-routine"
+      ]
+    },
+    {
+      "lane": "multi_domain",
+      "content_key": "ck_7c4f9604663317c4f0e496219b7a8340",
+      "merchant_id": "external_seed",
+      "n_rows": 2,
+      "verdict": "KEEP_multi_seller_observation",
+      "why": "brand+retailer observation ['theordinary.com', 'ulta.com'] — future resolver/buy-box input",
+      "hosts": [
+        "theordinary.com",
+        "ulta.com"
+      ],
+      "sample_urls": [
+        "https://www.ulta.com/p/natural-moisturizing-factors-phytoceramides-rich-moisturizer-pimprod2037765?sku=2606219",
+        "https://theordinary.com/en-us/natural-moisturizing-factors-phytoceramides-moisturizer-100610.html"
+      ]
+    },
+    {
+      "lane": "multi_domain",
+      "content_key": "ck_7e96eee640a6852b140667c4eaac6852",
+      "merchant_id": "external_seed",
+      "n_rows": 2,
+      "verdict": "KEEP_multi_seller_observation",
+      "why": "brand+retailer observation ['theordinary.com', 'ulta.com'] — future resolver/buy-box input",
+      "hosts": [
+        "theordinary.com",
+        "ulta.com"
+      ],
+      "sample_urls": [
+        "https://theordinary.com/en-us/multi-peptide-copper-peptides-1-serum-100625.html",
+        "https://www.ulta.com/p/multi-peptide-copper-peptides-1-wrinkles-skin-elasticity-pimprod2039725?sku=2611370"
+      ]
+    },
+    {
+      "lane": "multi_domain",
+      "content_key": "ck_80138594d4579787d10d1db2315f0d5d",
+      "merchant_id": "external_seed",
+      "n_rows": 2,
+      "verdict": "KEEP_regional_storefronts",
+      "why": "same brand on regional domains ['arencia.jp', 'arencia.us']",
+      "hosts": [
+        "arencia.jp",
+        "arencia.us"
+      ],
+      "sample_urls": [
+        "https://arencia.us/products/vitamin-c-brightening-booster-cream-glow-enhancing-moisturizer-with-vitamin-c-txa-glutathione-for-radiant-glass-skin-3-38-fl-oz-copy",
+        "https://arencia.jp/products/vitamin-c-brightening-booster-cream-glow-enhancing-moisturizer-with-vitamin-c-txa-glutathione-for-radiant-glass-skin-3-38-fl-oz-copy"
+      ]
+    },
+    {
+      "lane": "multi_domain",
+      "content_key": "ck_897f41994836055346252e7cde997db5",
+      "merchant_id": "external_seed",
+      "n_rows": 2,
+      "verdict": "KEEP_regional_storefronts",
+      "why": "same brand on regional domains ['arencia.jp', 'arencia.us']",
+      "hosts": [
+        "arencia.jp",
+        "arencia.us"
+      ],
+      "sample_urls": [
+        "https://arencia.us/products/red-collagen-jello-skin-trio-poreless-skin-routine",
+        "https://arencia.jp/products/red-collagen-jello-skin-trio-poreless-skin-routine"
+      ]
+    },
+    {
+      "lane": "multi_domain",
+      "content_key": "ck_8aada760b3c5897021ac9e0749b4f5cc",
+      "merchant_id": "external_seed",
+      "n_rows": 2,
+      "verdict": "KEEP_multi_seller_observation",
+      "why": "brand+retailer observation ['theordinary.com', 'ulta.com'] — future resolver/buy-box input",
+      "hosts": [
+        "theordinary.com",
+        "ulta.com"
+      ],
+      "sample_urls": [
+        "https://www.ulta.com/p/natural-moisturizing-factors-beta-glucan-lightweight-gel-moisturizer-pimprod2039174?sku=2609860",
+        "https://theordinary.com/en-us/natural-moisturizing-factors-beta-glucan-moisturizer-100612.html"
+      ]
+    },
+    {
+      "lane": "multi_domain",
+      "content_key": "ck_8bf284e6b50d9562cf326fa0187863c9",
+      "merchant_id": "external_seed",
+      "n_rows": 4,
+      "verdict": "KEEP_multi_seller_observation",
+      "why": "brand+retailer observation ['maybelline.com', 'target.com', 'ulta.com'] — future resolver/buy-box input",
+      "hosts": [
+        "maybelline.com",
+        "target.com",
+        "ulta.com"
+      ],
+      "sample_urls": [
+        "https://www.maybelline.com/eye-makeup/mascara/lash-sensational-washable-mascara",
+        "https://maybelline.com/products/maybelline-lash-sensational-mascara",
+        "https://www.target.com/p/maybelline-lash-sensational-lengthening-mascara-washable-midnight-black/-/A-14787003"
+      ]
+    },
+    {
+      "lane": "multi_domain",
+      "content_key": "ck_8bf562310a73d9fc6b5e8c3e9fffa87b",
+      "merchant_id": "external_seed",
+      "n_rows": 2,
+      "verdict": "KEEP_regional_storefronts",
+      "why": "same brand on regional domains ['arencia.jp', 'arencia.us']",
+      "hosts": [
+        "arencia.jp",
+        "arencia.us"
+      ],
+      "sample_urls": [
+        "https://arencia.us/products/sos-relief-mask-pore-reset-sheet-mask-for-clogged-acne-prone-skin-with-glycolic-acid-bha-pha-centella-ceramide-4-sheets-copy",
+        "https://arencia.jp/products/sos-relief-mask-pore-reset-sheet-mask-for-clogged-acne-prone-skin-with-glycolic-acid-bha-pha-centella-ceramide-4-sheets-copy"
+      ]
+    },
+    {
+      "lane": "multi_domain",
+      "content_key": "ck_8fae0d7fcb5fd8dcc97d3ab3ea4c2ad9",
+      "merchant_id": "external_seed",
+      "n_rows": 2,
+      "verdict": "KEEP_multi_seller_observation",
+      "why": "brand+retailer observation ['maccosmetics.com', 'ulta.com'] — future resolver/buy-box input",
+      "hosts": [
+        "maccosmetics.com",
+        "ulta.com"
+      ],
+      "sample_urls": [
+        "https://www.maccosmetics.com/product/13854/1225/products/makeup/lips/lipstick/macximal-silky-matte-lipstick",
+        "https://www.ulta.com/p/macximal-silky-matte-lipstick-pimprod2041285"
+      ]
+    },
+    {
+      "lane": "multi_domain",
+      "content_key": "ck_902e6fada28fdd5a1eebdaa43f4a0fe8",
+      "merchant_id": "external_seed",
+      "n_rows": 4,
+      "verdict": "KEEP_regional_storefronts",
+      "why": "same brand on regional domains ['arencia.jp', 'arencia.us']",
+      "hosts": [
+        "arencia.jp",
+        "arencia.us"
+      ],
+      "sample_urls": [
+        "https://arencia.us/products/reverse-aging-boosting-trio-mt",
+        "https://arencia.jp/products/reverse-aging-boosting-trio-mt",
+        "https://arencia.us/products/reverse-aging-boosting-trio-anti-aging-fine-lines-eraser-vitamin-c-glutathione-retinal-caffeine-peptides-for-youthful-skin"
+      ]
+    },
+    {
+      "lane": "multi_domain",
+      "content_key": "ck_914bb89381d1583940ff576b8eaee902",
+      "merchant_id": "external_seed",
+      "n_rows": 2,
+      "verdict": "KEEP_regional_storefronts",
+      "why": "same brand on regional domains ['arencia.jp', 'arencia.us']",
+      "hosts": [
+        "arencia.jp",
+        "arencia.us"
+      ],
+      "sample_urls": [
+        "https://arencia.us/products/red-smoothie-serum-30",
+        "https://arencia.jp/products/red-smoothie-serum-30"
+      ]
+    },
+    {
+      "lane": "multi_domain",
+      "content_key": "ck_91ea0a689b010219f7f14cea1b5cf592",
+      "merchant_id": "external_seed",
+      "n_rows": 2,
+      "verdict": "KEEP_regional_storefronts",
+      "why": "same brand on regional domains ['arencia.jp', 'arencia.us']",
+      "hosts": [
+        "arencia.jp",
+        "arencia.us"
+      ],
+      "sample_urls": [
+        "https://arencia.jp/products/eraser-soothing-cream-lightweight-barrier-moisturizer-with-centella-ceramide-np-for-hydration-calm-looking-skin-1-69-fl-oz-copy",
+        "https://arencia.us/products/eraser-soothing-cream-lightweight-barrier-moisturizer-with-centella-ceramide-np-for-hydration-calm-looking-skin-1-69-fl-oz-copy"
+      ]
+    },
+    {
+      "lane": "multi_domain",
+      "content_key": "ck_939480cbc7bca69ca2792d22b2d83bf2",
+      "merchant_id": "external_seed",
+      "n_rows": 2,
+      "verdict": "KEEP_multi_seller_observation",
+      "why": "brand+retailer observation ['theordinary.com', 'ulta.com'] — future resolver/buy-box input",
+      "hosts": [
+        "theordinary.com",
+        "ulta.com"
+      ],
+      "sample_urls": [
+        "https://theordinary.com/en-us/niacinamide-10-zinc-1-serum-100436.html",
+        "https://www.ulta.com/p/niacinamide-10-zinc-1-serum-oily-skin-pimprod2007111?sku=2551167"
+      ]
+    },
+    {
+      "lane": "multi_domain",
+      "content_key": "ck_9509938241fd783b27646f0f657a9d2c",
+      "merchant_id": "external_seed",
+      "n_rows": 2,
+      "verdict": "KEEP_regional_storefronts",
+      "why": "same brand on regional domains ['arencia.jp', 'arencia.us']",
+      "hosts": [
+        "arencia.jp",
+        "arencia.us"
+      ],
+      "sample_urls": [
+        "https://arencia.jp/products/honey-glazed-collagen-lip-mask-plump-juicy-lips-with-lasting-hydration-0-52oz-copy",
+        "https://arencia.us/products/honey-glazed-collagen-lip-mask-plump-juicy-lips-with-lasting-hydration-0-52oz-copy"
+      ]
+    },
+    {
+      "lane": "multi_domain",
+      "content_key": "ck_a14faa694f176655bc91efbb869a8572",
+      "merchant_id": "external_seed",
+      "n_rows": 2,
+      "verdict": "KEEP_multi_seller_observation",
+      "why": "brand+retailer observation ['cosrx.com', 'sokoglam.com'] — future resolver/buy-box input",
+      "hosts": [
+        "cosrx.com",
+        "sokoglam.com"
+      ],
+      "sample_urls": [
+        "https://www.cosrx.com/products/low-ph-niacinamide-micellar-cleansing-water",
+        "https://sokoglam.com/products/low-ph-niacinamide-micellar-cleansing-water"
+      ]
+    },
+    {
+      "lane": "multi_domain",
+      "content_key": "ck_a43ce905d6513a9465bc3d3df63585ef",
+      "merchant_id": "external_seed",
+      "n_rows": 2,
+      "verdict": "KEEP_multi_seller_observation",
+      "why": "brand+retailer observation ['theordinary.com', 'ulta.com'] — future resolver/buy-box input",
+      "hosts": [
+        "theordinary.com",
+        "ulta.com"
+      ],
+      "sample_urls": [
+        "https://www.ulta.com/p/lactic-acid-10-ha-2-high-strength-exfoliating-serum-uneven-texture-pimprod2007103?sku=2551156",
+        "https://theordinary.com/en-us/lactic-acid-10-ha-exfoliator-100426.html"
+      ]
+    },
+    {
+      "lane": "multi_domain",
+      "content_key": "ck_a55cef1a581cb69d6e0ad95e944a87cf",
+      "merchant_id": "external_seed",
+      "n_rows": 2,
+      "verdict": "KEEP_regional_storefronts",
+      "why": "same brand on regional domains ['arencia.jp', 'arencia.us']",
+      "hosts": [
+        "arencia.jp",
+        "arencia.us"
+      ],
+      "sample_urls": [
+        "https://arencia.us/products/arencia-holy-hyssop-glow-serum-12-copy",
+        "https://arencia.jp/products/arencia-holy-hyssop-glow-serum-12-copy"
+      ]
+    },
+    {
+      "lane": "multi_domain",
+      "content_key": "ck_a724d81c5c1491d22aa31947d8e18a19",
+      "merchant_id": "external_seed",
+      "n_rows": 2,
+      "verdict": "KEEP_multi_seller_observation",
+      "why": "brand+retailer observation ['theordinary.com', 'ulta.com'] — future resolver/buy-box input",
+      "hosts": [
+        "theordinary.com",
+        "ulta.com"
+      ],
+      "sample_urls": [
+        "https://theordinary.com/en-us/multi-peptide-eye-serum-100620.html",
+        "https://www.ulta.com/p/multi-peptide-eye-serum-wrinkles-crows-feet-pimprod2036916?sku=2606218"
+      ]
+    },
+    {
+      "lane": "multi_domain",
+      "content_key": "ck_a7c5868e030450d82b2d38e65d6062dc",
+      "merchant_id": "external_seed",
+      "n_rows": 2,
+      "verdict": "KEEP_regional_storefronts",
+      "why": "same brand on regional domains ['arencia.jp', 'arencia.us']",
+      "hosts": [
+        "arencia.jp",
+        "arencia.us"
+      ],
+      "sample_urls": [
+        "https://arencia.us/products/vitamin-c-glutathione-booster-shot-essence-lightweight-brightening-dark-spot-care-for-radiant-even-looking-skin-3-21-fl-oz-copy",
+        "https://arencia.jp/products/vitamin-c-glutathione-booster-shot-essence-lightweight-brightening-dark-spot-care-for-radiant-even-looking-skin-3-21-fl-oz-copy"
+      ]
+    },
+    {
+      "lane": "multi_domain",
+      "content_key": "ck_a7d3d790c5b7ae4a0de360dea7fb3574",
+      "merchant_id": "external_seed",
+      "n_rows": 2,
+      "verdict": "KEEP_regional_storefronts",
+      "why": "same brand on regional domains ['arencia.jp', 'arencia.us']",
+      "hosts": [
+        "arencia.jp",
+        "arencia.us"
+      ],
+      "sample_urls": [
+        "https://arencia.jp/products/retinal-boosting-eye-mask-patch-depuffing-hydrogel-eye-masks-with-retinal-peptides-for-under-eye-bags-fine-lines-smile-lines-60-patches-2-96-oz-copy",
+        "https://arencia.us/products/retinal-boosting-eye-mask-patch-depuffing-hydrogel-eye-masks-with-retinal-peptides-for-under-eye-bags-fine-lines-smile-lines-60-patches-2-96-oz-copy"
+      ]
+    },
+    {
+      "lane": "multi_domain",
+      "content_key": "ck_a86c41d6ac28b580795e7ee247187092",
+      "merchant_id": "external_seed",
+      "n_rows": 2,
+      "verdict": "KEEP_regional_storefronts",
+      "why": "same brand on regional domains ['arencia.jp', 'arencia.us']",
+      "hosts": [
+        "arencia.jp",
+        "arencia.us"
+      ],
+      "sample_urls": [
+        "https://arencia.us/products/arencia-deep-water-surge-serum-hyaluronic-acid-pdrn-ceramide-1-01-fl-oz-copy",
+        "https://arencia.jp/products/arencia-deep-water-surge-serum-hyaluronic-acid-pdrn-ceramide-1-01-fl-oz-copy"
+      ]
+    },
+    {
+      "lane": "multi_domain",
+      "content_key": "ck_a9180f65cfcce0b7fa35caf5733dd511",
+      "merchant_id": "external_seed",
+      "n_rows": 2,
+      "verdict": "KEEP_multi_seller_observation",
+      "why": "brand+retailer observation ['theordinary.com', 'ulta.com'] — future resolver/buy-box input",
+      "hosts": [
+        "theordinary.com",
+        "ulta.com"
+      ],
+      "sample_urls": [
+        "https://theordinary.com/en-us/hyaluronic-acid-2-b5-serum-with-ceramides-100637.html",
+        "https://www.ulta.com/p/hyaluronic-acid-2-b5-hydrating-serum-with-ceramides-pimprod2043525?sku=2618749"
+      ]
+    },
+    {
+      "lane": "multi_domain",
+      "content_key": "ck_ab43e145163dcbb69a4662bb54f77f77",
+      "merchant_id": "external_seed",
+      "n_rows": 4,
+      "verdict": "KEEP_multi_seller_observation",
+      "why": "brand+retailer observation ['amzn.to', 'bestbuy.com', 'sony.com'] — future resolver/buy-box input",
+      "hosts": [
+        "amzn.to",
+        "bestbuy.com",
+        "sony.com"
+      ],
+      "sample_urls": [
+        "https://amzn.to/3QKz2zA",
+        "https://www.bestbuy.com/site/sony-wh-1000xm5-wireless-noise-canceling-over-the-ear-headphones-black/6505726.p?skuId=6505726",
+        "https://www.sony.com/electronics/headband-headphones/wh-1000xm5"
+      ]
+    },
+    {
+      "lane": "multi_domain",
+      "content_key": "ck_ac7d470cab7868b2fbe0de237604e50f",
+      "merchant_id": "external_seed",
+      "n_rows": 2,
+      "verdict": "KEEP_regional_storefronts",
+      "why": "same brand on regional domains ['arencia.jp', 'arencia.us']",
+      "hosts": [
+        "arencia.jp",
+        "arencia.us"
+      ],
+      "sample_urls": [
+        "https://arencia.jp/products/プレミアムもちソープ-グリーン-120g",
+        "https://arencia.us/products/プレミアムもちソープ-グリーン-120g"
+      ]
+    },
+    {
+      "lane": "multi_domain",
+      "content_key": "ck_afbfe2fb4a9089d8b6ec1e779ff387f0",
+      "merchant_id": "external_seed",
+      "n_rows": 2,
+      "verdict": "KEEP_multi_seller_observation",
+      "why": "brand+retailer observation ['theordinary.com', 'ulta.com'] — future resolver/buy-box input",
+      "hosts": [
+        "theordinary.com",
+        "ulta.com"
+      ],
+      "sample_urls": [
+        "https://www.ulta.com/p/soothing-barrier-support-serum-sensitive-skin-hydration-pimprod2041026?sku=2615437",
+        "https://theordinary.com/en-us/soothing-barrier-support-serum-100634.html"
+      ]
+    },
+    {
+      "lane": "multi_domain",
+      "content_key": "ck_b29b3c9b81e944f8dc5f760bdb5c6203",
+      "merchant_id": "external_seed",
+      "n_rows": 2,
+      "verdict": "KEEP_regional_storefronts",
+      "why": "same brand on regional domains ['arencia.jp', 'arencia.us']",
+      "hosts": [
+        "arencia.jp",
+        "arencia.us"
+      ],
+      "sample_urls": [
+        "https://arencia.jp/products/retinal-booster-shot-30ml",
+        "https://arencia.us/products/retinal-booster-shot-30ml"
+      ]
+    },
+    {
+      "lane": "multi_domain",
+      "content_key": "ck_b75008a97bf9dd3e41854e6eafc3b216",
+      "merchant_id": "external_seed",
+      "n_rows": 2,
+      "verdict": "KEEP_multi_seller_observation",
+      "why": "brand+retailer observation ['theordinary.com', 'ulta.com'] — future resolver/buy-box input",
+      "hosts": [
+        "theordinary.com",
+        "ulta.com"
+      ],
+      "sample_urls": [
+        "https://www.ulta.com/p/retinol-05-in-squalane-intermediate-retinol-serum-pimprod2007127?sku=2551172",
+        "https://theordinary.com/en-us/retinol-05-in-squalane-serum-100440.html"
+      ]
+    },
+    {
+      "lane": "multi_domain",
+      "content_key": "ck_bceff92177b6b327ea3e124d4930728d",
+      "merchant_id": "external_seed",
+      "n_rows": 2,
+      "verdict": "KEEP_regional_storefronts",
+      "why": "same brand on regional domains ['arencia.jp', 'arencia.us']",
+      "hosts": [
+        "arencia.jp",
+        "arencia.us"
+      ],
+      "sample_urls": [
+        "https://arencia.us/products/retinal-booster-shot-advanced-retinal-caffeine-formula-for-firm-pore-refined-skin-1-01-fl-oz-copy",
+        "https://arencia.jp/products/retinal-booster-shot-advanced-retinal-caffeine-formula-for-firm-pore-refined-skin-1-01-fl-oz-copy"
+      ]
+    },
+    {
+      "lane": "multi_domain",
+      "content_key": "ck_bd40e6d907c4a5d70476f06c36fe42b9",
+      "merchant_id": "external_seed",
+      "n_rows": 2,
+      "verdict": "KEEP_regional_storefronts",
+      "why": "same brand on regional domains ['arencia.jp', 'arencia.us']",
+      "hosts": [
+        "arencia.jp",
+        "arencia.us"
+      ],
+      "sample_urls": [
+        "https://arencia.jp/products/eraser-shot-glycolic-acid-booster-daily-clarifying-multi-acid-formula-for-smoother-clear-looking-skin-1-01-fl-oz-copy",
+        "https://arencia.us/products/eraser-shot-glycolic-acid-booster-daily-clarifying-multi-acid-formula-for-smoother-clear-looking-skin-1-01-fl-oz-copy"
+      ]
+    },
+    {
+      "lane": "multi_domain",
+      "content_key": "ck_bdb52051d1f82fb9d226ff1a5ad5ad66",
+      "merchant_id": "external_seed",
+      "n_rows": 3,
+      "verdict": "KEEP_multi_seller_observation",
+      "why": "brand+retailer observation ['dior.com', 'ulta.com'] — future resolver/buy-box input",
+      "hosts": [
+        "dior.com",
+        "ulta.com"
+      ],
+      "sample_urls": [
+        "https://dior.com/products/dior-diorshow-iconic-overcurl-mascara",
+        "https://www.dior.com/en_us/beauty/makeup/eyes/mascara/diorshow-iconic-overcurl-mascara",
+        "https://www.ulta.com/diorshow-iconic-overcurl-mascara?productId=pimprod2039774"
+      ]
+    },
+    {
+      "lane": "multi_domain",
+      "content_key": "ck_c012b7375025d19a81830e441211afc4",
+      "merchant_id": "external_seed",
+      "n_rows": 2,
+      "verdict": "KEEP_multi_seller_observation",
+      "why": "brand+retailer observation ['theordinary.com', 'ulta.com'] — future resolver/buy-box input",
+      "hosts": [
+        "theordinary.com",
+        "ulta.com"
+      ],
+      "sample_urls": [
+        "https://www.ulta.com/p/multi-peptide-hyaluronic-acid-serum-firmness-elasticity-pimprod2035079?sku=2600597",
+        "https://theordinary.com/en-us/multi-peptide-ha-serum-100613.html"
+      ]
+    },
+    {
+      "lane": "multi_domain",
+      "content_key": "ck_c2442f47ec399bded1620e865bdd91cd",
+      "merchant_id": "external_seed",
+      "n_rows": 2,
+      "verdict": "KEEP_regional_storefronts",
+      "why": "same brand on regional domains ['arencia.jp', 'arencia.us']",
+      "hosts": [
+        "arencia.jp",
+        "arencia.us"
+      ],
+      "sample_urls": [
+        "https://arencia.us/products/fresh-rosehip-rice-mochi-cleanser-120g",
+        "https://arencia.jp/products/fresh-rosehip-rice-mochi-cleanser-120g"
+      ]
+    },
+    {
+      "lane": "multi_domain",
+      "content_key": "ck_c62971e42827642b20a1543fd77fe747",
+      "merchant_id": "external_seed",
+      "n_rows": 2,
+      "verdict": "KEEP_regional_storefronts",
+      "why": "same brand on regional domains ['arencia.jp', 'arencia.us']",
+      "hosts": [
+        "arencia.jp",
+        "arencia.us"
+      ],
+      "sample_urls": [
+        "https://arencia.us/products/pore-melt-mochi-makeup-removing-cleansing-oil-non-comedogenic-acne-safe-rice-amino-acids-hd-vitamin-e-cica-ceramide-6-76-fl-oz-copy",
+        "https://arencia.jp/products/pore-melt-mochi-makeup-removing-cleansing-oil-non-comedogenic-acne-safe-rice-amino-acids-hd-vitamin-e-cica-ceramide-6-76-fl-oz-copy"
+      ]
+    },
+    {
+      "lane": "multi_domain",
+      "content_key": "ck_d0cd374d5960910ca073b6629fd897d6",
+      "merchant_id": "external_seed",
+      "n_rows": 2,
+      "verdict": "KEEP_regional_storefronts",
+      "why": "same brand on regional domains ['arencia.jp', 'arencia.us']",
+      "hosts": [
+        "arencia.jp",
+        "arencia.us"
+      ],
+      "sample_urls": [
+        "https://arencia.jp/products/red-smoothie-face-lotion-moisturizer-5-niacinamide-5-collagen-for-daily-bouncy-glowy-skin-care",
+        "https://arencia.us/products/red-smoothie-face-lotion-moisturizer-5-niacinamide-5-collagen-for-daily-bouncy-glowy-skin-care"
+      ]
+    },
+    {
+      "lane": "multi_domain",
+      "content_key": "ck_d19270e9a1aefc6173c031c6c413cf56",
+      "merchant_id": "external_seed",
+      "n_rows": 2,
+      "verdict": "KEEP_regional_storefronts",
+      "why": "same brand on regional domains ['arencia.jp', 'arencia.us']",
+      "hosts": [
+        "arencia.jp",
+        "arencia.us"
+      ],
+      "sample_urls": [
+        "https://arencia.jp/products/フレッシュクラウド-スクラブ-ラベンダー-ペア-260g",
+        "https://arencia.us/products/フレッシュクラウド-スクラブ-ラベンダー-ペア-260g"
+      ]
+    },
+    {
+      "lane": "multi_domain",
+      "content_key": "ck_d19b066bebaead689eb8306ee8ffd797",
+      "merchant_id": "external_seed",
+      "n_rows": 2,
+      "verdict": "KEEP_regional_storefronts",
+      "why": "same brand on regional domains ['arencia.jp', 'arencia.us']",
+      "hosts": [
+        "arencia.jp",
+        "arencia.us"
+      ],
+      "sample_urls": [
+        "https://arencia.us/products/arencia-holy-hyssop-sheet-mask-5-pack-copy",
+        "https://arencia.jp/products/arencia-holy-hyssop-sheet-mask-5-pack-copy"
+      ]
+    },
+    {
+      "lane": "multi_domain",
+      "content_key": "ck_d527c20672e40c86fb95409deeb2d598",
+      "merchant_id": "external_seed",
+      "n_rows": 2,
+      "verdict": "KEEP_regional_storefronts",
+      "why": "same brand on regional domains ['arencia.jp', 'arencia.us']",
+      "hosts": [
+        "arencia.jp",
+        "arencia.us"
+      ],
+      "sample_urls": [
+        "https://arencia.us/products/pore-melt-cleansing-oil-pad-easy-makeup-removing-with-cleansing-wipes-with-green-tea-rice-ceramide-4-73-oz-50-pads-copy",
+        "https://arencia.jp/products/pore-melt-cleansing-oil-pad-easy-makeup-removing-with-cleansing-wipes-with-green-tea-rice-ceramide-4-73-oz-50-pads-copy"
+      ]
+    },
+    {
+      "lane": "multi_domain",
+      "content_key": "ck_d9a912570f483872e709234606fe4ba6",
+      "merchant_id": "external_seed",
+      "n_rows": 2,
+      "verdict": "KEEP_multi_seller_observation",
+      "why": "brand+retailer observation ['theordinary.com', 'ulta.com'] — future resolver/buy-box input",
+      "hosts": [
+        "theordinary.com",
+        "ulta.com"
+      ],
+      "sample_urls": [
+        "https://theordinary.com/en-us/multi-peptide-lash-brow-serum-100111.html",
+        "https://www.ulta.com/p/multi-peptide-lash-brow-serum-thicker-fuller-looking-lashes-brows-pimprod2033455?sku=2592847"
+      ]
+    },
+    {
+      "lane": "multi_domain",
+      "content_key": "ck_da7a1d2fd549d5ac6720063538603cb8",
+      "merchant_id": "external_seed",
+      "n_rows": 2,
+      "verdict": "KEEP_regional_storefronts",
+      "why": "same brand on regional domains ['arencia.jp', 'arencia.us']",
+      "hosts": [
+        "arencia.jp",
+        "arencia.us"
+      ],
+      "sample_urls": [
+        "https://arencia.us/products/collagen-pore-perfection-duo",
+        "https://arencia.jp/products/collagen-pore-perfection-duo"
+      ]
+    },
+    {
+      "lane": "multi_domain",
+      "content_key": "ck_daa3093bb9b1f08033868762340a6d33",
+      "merchant_id": "external_seed",
+      "n_rows": 2,
+      "verdict": "KEEP_multi_seller_observation",
+      "why": "brand+retailer observation ['theordinary.com', 'ulta.com'] — future resolver/buy-box input",
+      "hosts": [
+        "theordinary.com",
+        "ulta.com"
+      ],
+      "sample_urls": [
+        "https://www.ulta.com/p/retinal-02-emulsion-high-strength-retinoid-nighttime-treatment-pimprod2044942?sku=2623548",
+        "https://theordinary.com/en-us/retinal-02-emulsion-100646.html"
+      ]
+    },
+    {
+      "lane": "multi_domain",
+      "content_key": "ck_dca7de2b4e28a0cfc070582235e0e1f9",
+      "merchant_id": "external_seed",
+      "n_rows": 3,
+      "verdict": "KEEP_multi_seller_observation",
+      "why": "brand+retailer observation ['bestbuy.com', 'us.kobobooks.com'] — future resolver/buy-box input",
+      "hosts": [
+        "bestbuy.com",
+        "us.kobobooks.com"
+      ],
+      "sample_urls": [
+        "https://us.kobobooks.com/products/kobo-libra-colour",
+        "https://www.bestbuy.com/site/kobo-libra-colour-ereader-7-glare-free-colour-e-ink-kaleido-3-display-dark-mode-option-waterproof-2024-black/6575000.p?skuId=6575000",
+        "https://us.kobobooks.com/products/kobo-libra-colour"
+      ]
+    },
+    {
+      "lane": "multi_domain",
+      "content_key": "ck_de1dae962b7c673707948dfaa265a352",
+      "merchant_id": "external_seed",
+      "n_rows": 2,
+      "verdict": "KEEP_multi_seller_observation",
+      "why": "brand+retailer observation ['theordinary.com', 'ulta.com'] — future resolver/buy-box input",
+      "hosts": [
+        "theordinary.com",
+        "ulta.com"
+      ],
+      "sample_urls": [
+        "https://theordinary.com/en-us/aloe-2-nag-2-solution-blemish-serum-100618.html",
+        "https://www.ulta.com/p/aloe-2-nag-2-solution-post-acne-marks-pimprod2039172?sku=2609862"
+      ]
+    },
+    {
+      "lane": "multi_domain",
+      "content_key": "ck_df4965b9b0356ed787ae8406f5b4f567",
+      "merchant_id": "external_seed",
+      "n_rows": 2,
+      "verdict": "KEEP_regional_storefronts",
+      "why": "same brand on regional domains ['arencia.jp', 'arencia.us']",
+      "hosts": [
+        "arencia.jp",
+        "arencia.us"
+      ],
+      "sample_urls": [
+        "https://arencia.jp/products/pdrn-hyaluronic-acid-deep-hydration-toner-pads-6-76-fl-oz-90-pads-copy",
+        "https://arencia.us/products/pdrn-hyaluronic-acid-deep-hydration-toner-pads-6-76-fl-oz-90-pads-copy"
+      ]
+    },
+    {
+      "lane": "multi_domain",
+      "content_key": "ck_e0302b9de16817bd7248c7085b45fcc4",
+      "merchant_id": "external_seed",
+      "n_rows": 2,
+      "verdict": "KEEP_regional_storefronts",
+      "why": "same brand on regional domains ['arencia.jp', 'arencia.us']",
+      "hosts": [
+        "arencia.jp",
+        "arencia.us"
+      ],
+      "sample_urls": [
+        "https://arencia.jp/products/arencia-blue-hyssop-rice-mochi-cleanser-copy",
+        "https://arencia.us/products/arencia-blue-hyssop-rice-mochi-cleanser-copy"
+      ]
+    },
+    {
+      "lane": "multi_domain",
+      "content_key": "ck_e1c5f7836e69da127ca4e831c8d71a74",
+      "merchant_id": "external_seed",
+      "n_rows": 2,
+      "verdict": "KEEP_regional_storefronts",
+      "why": "same brand on regional domains ['arencia.jp', 'arencia.us']",
+      "hosts": [
+        "arencia.jp",
+        "arencia.us"
+      ],
+      "sample_urls": [
+        "https://arencia.us/products/フレッシュクラウドスクラブ-ゼラニウム-プリムローズ-260g",
+        "https://arencia.jp/products/フレッシュクラウドスクラブ-ゼラニウム-プリムローズ-260g"
+      ]
+    },
+    {
+      "lane": "multi_domain",
+      "content_key": "ck_e50bcc83855c5a345c9dc0b2dbbbcfff",
+      "merchant_id": "external_seed",
+      "n_rows": 2,
+      "verdict": "KEEP_multi_seller_observation",
+      "why": "brand+retailer observation ['theordinary.com', 'ulta.com'] — future resolver/buy-box input",
+      "hosts": [
+        "theordinary.com",
+        "ulta.com"
+      ],
+      "sample_urls": [
+        "https://www.ulta.com/p/salicylic-acid-2-anhydrous-solution-gentle-exfoliating-serum-blemishes-pimprod2029951?sku=2590731",
+        "https://theordinary.com/en-us/salicylic-acid-2-anhydrous-solution-exfoliator-100442.html"
+      ]
+    },
+    {
+      "lane": "multi_domain",
+      "content_key": "ck_e8df3d2b0d8a68a074cec13a50870e18",
+      "merchant_id": "external_seed",
+      "n_rows": 2,
+      "verdict": "KEEP_regional_storefronts",
+      "why": "same brand on regional domains ['arencia.jp', 'arencia.us']",
+      "hosts": [
+        "arencia.jp",
+        "arencia.us"
+      ],
+      "sample_urls": [
+        "https://arencia.jp/products/arencia-black-tea-rice-mochi-cleanser",
+        "https://arencia.us/products/arencia-black-tea-rice-mochi-cleanser"
+      ]
+    },
+    {
+      "lane": "multi_domain",
+      "content_key": "ck_e93d67e3fcadf720bf962dd0e4a4871f",
+      "merchant_id": "external_seed",
+      "n_rows": 2,
+      "verdict": "KEEP_regional_storefronts",
+      "why": "same brand on regional domains ['arencia.jp', 'arencia.us']",
+      "hosts": [
+        "arencia.jp",
+        "arencia.us"
+      ],
+      "sample_urls": [
+        "https://arencia.us/products/ホーリーヒソップセラム50g美容液色素沈着",
+        "https://arencia.jp/products/ホーリーヒソップセラム50g美容液色素沈着"
+      ]
+    },
+    {
+      "lane": "multi_domain",
+      "content_key": "ck_ea208203030f0a1fe39a0bd72db46a01",
+      "merchant_id": "external_seed",
+      "n_rows": 2,
+      "verdict": "KEEP_multi_seller_observation",
+      "why": "brand+retailer observation ['hudabeauty.com', 'sephora.com'] — future resolver/buy-box input",
+      "hosts": [
+        "hudabeauty.com",
+        "sephora.com"
+      ],
+      "sample_urls": [
+        "https://hudabeauty.com/products/huda-beauty-empowered-eyeshadow-palette",
+        "https://www.sephora.com/product/huda-beauty-empowered-eyeshadow-palette-P500850"
+      ]
+    },
+    {
+      "lane": "multi_domain",
+      "content_key": "ck_f1662e7ba056642d1b64cce324e0a797",
+      "merchant_id": "external_seed",
+      "n_rows": 2,
+      "verdict": "KEEP_regional_storefronts",
+      "why": "same brand on regional domains ['arencia.jp', 'arencia.us']",
+      "hosts": [
+        "arencia.jp",
+        "arencia.us"
+      ],
+      "sample_urls": [
+        "https://arencia.us/products/arencia-green-tea-lha-deep-pore-rice-cake-cleanser-5-07-fl-oz-copy",
+        "https://arencia.jp/products/arencia-green-tea-lha-deep-pore-rice-cake-cleanser-5-07-fl-oz-copy"
+      ]
+    },
+    {
+      "lane": "multi_domain",
+      "content_key": "ck_f31d6d279778b40beecaa9fd00b2be80",
+      "merchant_id": "external_seed",
+      "n_rows": 2,
+      "verdict": "KEEP_regional_storefronts",
+      "why": "same brand on regional domains ['arencia.jp', 'arencia.us']",
+      "hosts": [
+        "arencia.jp",
+        "arencia.us"
+      ],
+      "sample_urls": [
+        "https://arencia.jp/products/pore-melt-double-cleansing-duo-gentle-cleansing-oil-fresh-green-rice-mochi-cleanser-copy",
+        "https://arencia.us/products/pore-melt-double-cleansing-duo-gentle-cleansing-oil-fresh-green-rice-mochi-cleanser-copy"
+      ]
+    },
+    {
+      "lane": "multi_domain",
+      "content_key": "ck_f4380605d9e05a3abb3d5bccd1cc3d93",
+      "merchant_id": "external_seed",
+      "n_rows": 3,
+      "verdict": "KEEP_multi_seller_observation",
+      "why": "brand+retailer observation ['bestbuy.com', 'bose.com'] — future resolver/buy-box input",
+      "hosts": [
+        "bestbuy.com",
+        "bose.com"
+      ],
+      "sample_urls": [
+        "https://www.bestbuy.com/site/bose-quietcomfort-earbuds-ii-true-wireless-noise-cancelling-in-ear-headphones-midnight-blue/6512914.p?skuId=6512914",
+        "https://www.bose.com/p/headphones/bose-quietcomfort-earbuds-ii/QCEARBII-HEADPHONE.html",
+        "https://www.bose.com/p/headphones/bose-quietcomfort-earbuds-ii/QCEARBII-HEADPHONE.html"
+      ]
+    },
+    {
+      "lane": "multi_domain",
+      "content_key": "ck_f497d505eeeba996835383d66338e19c",
+      "merchant_id": "external_seed",
+      "n_rows": 2,
+      "verdict": "KEEP_regional_storefronts",
+      "why": "same brand on regional domains ['arencia.jp', 'arencia.us']",
+      "hosts": [
+        "arencia.jp",
+        "arencia.us"
+      ],
+      "sample_urls": [
+        "https://arencia.jp/products/vitamin-c-booster-shot-pure-vitamin-c-glutathione-for-bright-healthy-skin-glow-1-01-fl-oz-copy",
+        "https://arencia.us/products/vitamin-c-booster-shot-pure-vitamin-c-glutathione-for-bright-healthy-skin-glow-1-01-fl-oz-copy"
+      ]
+    },
+    {
+      "lane": "multi_domain",
+      "content_key": "ck_f4fb29540c470e8e71c569b25f930c2e",
+      "merchant_id": "external_seed",
+      "n_rows": 2,
+      "verdict": "KEEP_regional_storefronts",
+      "why": "same brand on regional domains ['arencia.jp', 'arencia.us']",
+      "hosts": [
+        "arencia.jp",
+        "arencia.us"
+      ],
+      "sample_urls": [
+        "https://arencia.jp/products/deep-glow-hydration-trio-day-night-moisture-lock-in-routine",
+        "https://arencia.us/products/deep-glow-hydration-trio-day-night-moisture-lock-in-routine"
+      ]
+    },
+    {
+      "lane": "multi_domain",
+      "content_key": "ck_f5ce9623546fac62d0a8ea5777adc7fe",
+      "merchant_id": "external_seed",
+      "n_rows": 2,
+      "verdict": "KEEP_multi_seller_observation",
+      "why": "brand+retailer observation ['theordinary.com', 'ulta.com'] — future resolver/buy-box input",
+      "hosts": [
+        "theordinary.com",
+        "ulta.com"
+      ],
+      "sample_urls": [
+        "https://theordinary.com/en-us/multi-antioxidant-radiance-serum-100716.html",
+        "https://www.ulta.com/p/multi-antioxidant-radiance-serum-with-vitamin-c-ginseng-pimprod2051185?sku=2637075"
+      ]
+    },
+    {
+      "lane": "multi_domain",
+      "content_key": "ck_f761a46d93b46ad040cfb0b58ed9763e",
+      "merchant_id": "external_seed",
+      "n_rows": 2,
+      "verdict": "KEEP_regional_storefronts",
+      "why": "same brand on regional domains ['arencia.jp', 'arencia.us']",
+      "hosts": [
+        "arencia.jp",
+        "arencia.us"
+      ],
+      "sample_urls": [
+        "https://arencia.jp/products/txa-booster-shot-intensive-dark-spot-correcting-serum-with-5-txa-niacinamide-10-peptides-for-visible-tone-correction-radiant-looking-skin-1-01-fl-oz-copy",
+        "https://arencia.us/products/txa-booster-shot-intensive-dark-spot-correcting-serum-with-5-txa-niacinamide-10-peptides-for-visible-tone-correction-radiant-looking-skin-1-01-fl-oz-copy"
+      ]
+    },
+    {
+      "lane": "multi_domain",
+      "content_key": "ck_f8219d4aa2a8ca08a81f3dc15786ce05",
+      "merchant_id": "external_seed",
+      "n_rows": 2,
+      "verdict": "KEEP_regional_storefronts",
+      "why": "same brand on regional domains ['arencia.jp', 'arencia.us']",
+      "hosts": [
+        "arencia.jp",
+        "arencia.us"
+      ],
+      "sample_urls": [
+        "https://arencia.us/products/arencia-deep-water-surge-overnight-serum-30",
+        "https://arencia.jp/products/arencia-deep-water-surge-overnight-serum-30"
+      ]
+    },
+    {
+      "lane": "lane3_spared",
+      "content_key": "ck_0039f18aaa1e20c19bddd2bac33326de",
+      "merchant_id": "external_seed",
+      "n_rows": 2,
+      "verdict": "REVIEW_junk_copy_vs_variant",
+      "why": "a -copy row paired with a variant slug: ['super-slick-lip-balm-copy-4', 'super-slick-lip-balm-sunset']",
+      "slugs": [
+        "super-slick-lip-balm-copy-4",
+        "super-slick-lip-balm-sunset"
+      ]
+    },
+    {
+      "lane": "lane3_spared",
+      "content_key": "ck_04aeb130fbd202492a028eefc6bf1480",
+      "merchant_id": "external_seed",
+      "n_rows": 2,
+      "verdict": "REVIEW_possible_clone_conservative_spare",
+      "why": "shares base words, spared by the conservative rule: ['hydra-melt', 'hydra-melt-dewy-skin-balm']",
+      "slugs": [
+        "hydra-melt",
+        "hydra-melt-dewy-skin-balm"
+      ]
+    },
+    {
+      "lane": "lane3_spared",
+      "content_key": "ck_0c994d3725a268985da803cb83905a3d",
+      "merchant_id": "external_seed",
+      "n_rows": 2,
+      "verdict": "REVIEW_possible_clone_conservative_spare",
+      "why": "shares base words, spared by the conservative rule: ['liquid-fairy-lights', 'liquid-fairy-lights-all-shades']",
+      "slugs": [
+        "liquid-fairy-lights",
+        "liquid-fairy-lights-all-shades"
+      ]
+    },
+    {
+      "lane": "lane3_spared",
+      "content_key": "ck_1324d6e96e07bd36854ed9e87dee2974",
+      "merchant_id": "external_seed",
+      "n_rows": 2,
+      "verdict": "REVIEW_junk_copy_vs_variant",
+      "why": "a -copy row paired with a variant slug: ['super-slick-mini-lip-balm-blossom', 'super-slick-mini-lip-balm-copy']",
+      "slugs": [
+        "super-slick-mini-lip-balm-blossom",
+        "super-slick-mini-lip-balm-copy"
+      ]
+    },
+    {
+      "lane": "lane3_spared",
+      "content_key": "ck_13e6a09bc30dfa2b2e3b6baa760f2a92",
+      "merchant_id": "external_seed",
+      "n_rows": 3,
+      "verdict": "REVIEW_possible_clone_conservative_spare",
+      "why": "shares base words, spared by the conservative rule: ['brow-duo', 'the-brow-duo-eu']",
+      "slugs": [
+        "brow-duo",
+        "the-brow-duo-eu"
+      ]
+    },
+    {
+      "lane": "lane3_spared",
+      "content_key": "ck_17d5106e1b5c8be5757a5eb2337217a6",
+      "merchant_id": "external_seed",
+      "n_rows": 2,
+      "verdict": "REVIEW_possible_clone_conservative_spare",
+      "why": "shares base words, spared by the conservative rule: ['red-collection-velvet-blur-mini-lipstick-balm-lava', 'velvet-blur-matte-mini-lipstick-balm-lava']",
+      "slugs": [
+        "red-collection-velvet-blur-mini-lipstick-balm-lava",
+        "velvet-blur-matte-mini-lipstick-balm-lava"
+      ]
+    },
+    {
+      "lane": "lane3_spared",
+      "content_key": "ck_1ce33d487dedcc50ccf8ae39b97b9c78",
+      "merchant_id": "external_seed",
+      "n_rows": 2,
+      "verdict": "KEEP_size_variants",
+      "why": "slugs differ by size token: ['huile-prodigieuse-100ml', 'huile-prodigieuse-50ml']",
+      "slugs": [
+        "huile-prodigieuse-100ml",
+        "huile-prodigieuse-50ml"
+      ]
+    },
+    {
+      "lane": "lane3_spared",
+      "content_key": "ck_32f66dad624e1ed3f75f8f80b5b71038",
+      "merchant_id": "external_seed",
+      "n_rows": 13,
+      "verdict": "KEEP_title_collision_distinct_products",
+      "why": "no shared slug words — distinct products under one normalized title: ['0627_cm_2544_pp_four_jhp1', '0627_cm_2544_pp_fourimg_jhp1', '0627_cm_4564_pp_four_jhp1']",
+      "slugs": [
+        "0627_cm_2544_pp_four_jhp1",
+        "0627_cm_2544_pp_fourimg_jhp1",
+        "0627_cm_4564_pp_four_jhp1",
+        "0627_cm_4564_pp_fourimg_jhp1",
+        "0627_cm_a_pp_four_jhp1",
+        "0627_cm_a_pp_fourimg_jhp1"
+      ]
+    },
+    {
+      "lane": "lane3_spared",
+      "content_key": "ck_36fc604d18829c8cef46f92cf953c2b5",
+      "merchant_id": "external_seed",
+      "n_rows": 5,
+      "verdict": "KEEP_size_variants",
+      "why": "slugs differ by size token: ['luminant-cream', 'remedy-cream', 'renight-cream']",
+      "slugs": [
+        "luminant-cream",
+        "remedy-cream",
+        "renight-cream",
+        "renight-cream-10ml",
+        "sublime-skin-cream"
+      ]
+    },
+    {
+      "lane": "lane3_spared",
+      "content_key": "ck_444583b65297ed041793fce468c7ceef",
+      "merchant_id": "external_seed",
+      "n_rows": 2,
+      "verdict": "REVIEW_possible_clone_conservative_spare",
+      "why": "shares base words, spared by the conservative rule: ['glossier-lash-slick-mascara', 'lash-slick']",
+      "slugs": [
+        "glossier-lash-slick-mascara",
+        "lash-slick"
+      ]
+    },
+    {
+      "lane": "lane3_spared",
+      "content_key": "ck_45fdf8ec41411f570d6a7cc049d65cfa",
+      "merchant_id": "external_seed",
+      "n_rows": 4,
+      "verdict": "REVIEW_possible_clone_conservative_spare",
+      "why": "shares base words, spared by the conservative rule: ['the-skin-tint-blur-complexion-duo', 'the-skin-tint-blur-complexion-duo-ca', 'the-skin-tint-blur-complexion-duo-gb']",
+      "slugs": [
+        "the-skin-tint-blur-complexion-duo",
+        "the-skin-tint-blur-complexion-duo-ca",
+        "the-skin-tint-blur-complexion-duo-gb"
+      ]
+    },
+    {
+      "lane": "lane3_spared",
+      "content_key": "ck_47355a47f4338666323091197d2b4872",
+      "merchant_id": "external_seed",
+      "n_rows": 3,
+      "verdict": "REVIEW_possible_clone_conservative_spare",
+      "why": "shares base words, spared by the conservative rule: ['active-pureness-toner', 'essential-toner', 'remedy-toner']",
+      "slugs": [
+        "active-pureness-toner",
+        "essential-toner",
+        "remedy-toner"
+      ]
+    },
+    {
+      "lane": "lane3_spared",
+      "content_key": "ck_47847d038aa726ec0876ba970b0249ea",
+      "merchant_id": "external_seed",
+      "n_rows": 3,
+      "verdict": "REVIEW_possible_clone_conservative_spare",
+      "why": "shares base words, spared by the conservative rule: ['body-strategist-oil', 'renight-oil', 'tranquillity-oil']",
+      "slugs": [
+        "body-strategist-oil",
+        "renight-oil",
+        "tranquillity-oil"
+      ]
+    },
+    {
+      "lane": "lane3_spared",
+      "content_key": "ck_536d0ec9ae348f0bb59766ad994a7fe7",
+      "merchant_id": "external_seed",
+      "n_rows": 3,
+      "verdict": "REVIEW_possible_clone_conservative_spare",
+      "why": "shares base words, spared by the conservative rule: ['ilia-limitless-lash-mascara', 'limitless-lash-lengthening-mascara']",
+      "slugs": [
+        "ilia-limitless-lash-mascara",
+        "limitless-lash-lengthening-mascara"
+      ]
+    },
+    {
+      "lane": "lane3_spared",
+      "content_key": "ck_57491440e9dd53a3e9d526b06afa0283",
+      "merchant_id": "external_seed",
+      "n_rows": 7,
+      "verdict": "REVIEW_possible_clone_conservative_spare",
+      "why": "shares base words, spared by the conservative rule: ['color-duo', 'color-duo-eu', 'color-duo-uk']",
+      "slugs": [
+        "color-duo",
+        "color-duo-eu",
+        "color-duo-uk",
+        "the-color-duo",
+        "the-color-duo-eu",
+        "the-color-duo-uk"
+      ]
+    },
+    {
+      "lane": "lane3_spared",
+      "content_key": "ck_5bcf8bd9bac9f5c07c46a2448912b7f7",
+      "merchant_id": "external_seed",
+      "n_rows": 2,
+      "verdict": "REVIEW_junk_copy_vs_variant",
+      "why": "a -copy row paired with a variant slug: ['super-slick-lip-balm-cherry', 'super-slick-lip-balm-copy-1']",
+      "slugs": [
+        "super-slick-lip-balm-cherry",
+        "super-slick-lip-balm-copy-1"
+      ]
+    },
+    {
+      "lane": "lane3_spared",
+      "content_key": "ck_605f7f7d0ce288d75f1afa38c79a76e6",
+      "merchant_id": "external_seed",
+      "n_rows": 4,
+      "verdict": "REVIEW_possible_clone_conservative_spare",
+      "why": "shares base words, spared by the conservative rule: ['the-glow-set-1', 'the-glow-set-2', 'the-glow-set-blc']",
+      "slugs": [
+        "the-glow-set-1",
+        "the-glow-set-2",
+        "the-glow-set-blc"
+      ]
+    },
+    {
+      "lane": "lane3_spared",
+      "content_key": "ck_696865ba4e849d1231a219fce1e3ef82",
+      "merchant_id": "external_seed",
+      "n_rows": 2,
+      "verdict": "REVIEW_junk_copy_vs_variant",
+      "why": "a -copy row paired with a variant slug: ['super-slick-lip-balm-copy-3', 'super-slick-lip-balm-sierra']",
+      "slugs": [
+        "super-slick-lip-balm-copy-3",
+        "super-slick-lip-balm-sierra"
+      ]
+    },
+    {
+      "lane": "lane3_spared",
+      "content_key": "ck_7993f4d4905de687df1808ac1cb35ca2",
+      "merchant_id": "external_seed",
+      "n_rows": 4,
+      "verdict": "REVIEW_junk_copy_vs_variant",
+      "why": "a -copy row paired with a variant slug: ['amazon-nr-1-marke-invisible-collagen-sun-serum-kein-weissschleier-spf-50-pa', 'amazon-nr-1-marke-invisible-collagen-sun-serum-kein-weissschleier-spf-50-pa-1', 'amazon-nr-1-marke-invisible-collagen-sun-serum-kein-weissschleier-spf-50-pa-2']",
+      "slugs": [
+        "amazon-nr-1-marke-invisible-collagen-sun-serum-kein-weissschleier-spf-50-pa",
+        "amazon-nr-1-marke-invisible-collagen-sun-serum-kein-weissschleier-spf-50-pa-1",
+        "amazon-nr-1-marke-invisible-collagen-sun-serum-kein-weissschleier-spf-50-pa-2",
+        "amazon-nr-1-marke-kollagen-gel-toner-pads-sanfter-glow-in-nur-15-minuten-copy"
+      ]
+    },
+    {
+      "lane": "lane3_spared",
+      "content_key": "ck_7c5f7ff6b5aaafadb362882a891d98f4",
+      "merchant_id": "external_seed",
+      "n_rows": 2,
+      "verdict": "REVIEW_possible_clone_conservative_spare",
+      "why": "shares base words, spared by the conservative rule: ['maybelline-the-falsies-lash-lift-mascara', 'the-falsies-lash-lift-washable-mascara-eye-makeup']",
+      "slugs": [
+        "maybelline-the-falsies-lash-lift-mascara",
+        "the-falsies-lash-lift-washable-mascara-eye-makeup"
+      ]
+    },
+    {
+      "lane": "lane3_spared",
+      "content_key": "ck_807277038ecd54b0b21932cbd2242635",
+      "merchant_id": "external_seed",
+      "n_rows": 2,
+      "verdict": "REVIEW_possible_clone_conservative_spare",
+      "why": "shares base words, spared by the conservative rule: ['tranquillity-blend', 'tranquillity-blend-refill']",
+      "slugs": [
+        "tranquillity-blend",
+        "tranquillity-blend-refill"
+      ]
+    },
+    {
+      "lane": "lane3_spared",
+      "content_key": "ck_82a155613b1f181570194557d2ea6868",
+      "merchant_id": "external_seed",
+      "n_rows": 2,
+      "verdict": "KEEP_size_variants",
+      "why": "slugs differ by size token: ['damage-therapy-no-wash-treatment-ex-250ml-8-54-fl-oz-hidden-260527-gm', 'growus-damage-therapy-no-wash-treatment']",
+      "slugs": [
+        "damage-therapy-no-wash-treatment-ex-250ml-8-54-fl-oz-hidden-260527-gm",
+        "growus-damage-therapy-no-wash-treatment"
+      ]
+    },
+    {
+      "lane": "lane3_spared",
+      "content_key": "ck_846e5cf8f942e71faed78dde9423c2be",
+      "merchant_id": "external_seed",
+      "n_rows": 2,
+      "verdict": "REVIEW_junk_copy_vs_variant",
+      "why": "a -copy row paired with a variant slug: ['super-slick-lip-balm-breeze', 'super-slick-lip-balm-copy']",
+      "slugs": [
+        "super-slick-lip-balm-breeze",
+        "super-slick-lip-balm-copy"
+      ]
+    },
+    {
+      "lane": "lane3_spared",
+      "content_key": "ck_853727046367309ef6f875cf7d69d57d",
+      "merchant_id": "external_seed",
+      "n_rows": 3,
+      "verdict": "REVIEW_possible_clone_conservative_spare",
+      "why": "shares base words, spared by the conservative rule: ['pure-hand-cream', 'pure-hand-cream-4', 'pure-hand-cream-b-w']",
+      "slugs": [
+        "pure-hand-cream",
+        "pure-hand-cream-4",
+        "pure-hand-cream-b-w"
+      ]
+    },
+    {
+      "lane": "lane3_spared",
+      "content_key": "ck_8839882ddf25cab55b180a716de712f2",
+      "merchant_id": "external_seed",
+      "n_rows": 2,
+      "verdict": "REVIEW_possible_clone_conservative_spare",
+      "why": "shares base words, spared by the conservative rule: ['hydramemory-body-lotion', 'tranquillity-body-lotion']",
+      "slugs": [
+        "hydramemory-body-lotion",
+        "tranquillity-body-lotion"
+      ]
+    },
+    {
+      "lane": "lane3_spared",
+      "content_key": "ck_89f7b60c0373063440361150dec26e08",
+      "merchant_id": "external_seed",
+      "n_rows": 3,
+      "verdict": "REVIEW_possible_clone_conservative_spare",
+      "why": "shares base words, spared by the conservative rule: ['lip-blush-trio-ukeu', 'the-lip-blush-trio']",
+      "slugs": [
+        "lip-blush-trio-ukeu",
+        "the-lip-blush-trio"
+      ]
+    },
+    {
+      "lane": "lane3_spared",
+      "content_key": "ck_8a689896699a26bc2a9fb0b6a9fd618f",
+      "merchant_id": "external_seed",
+      "n_rows": 2,
+      "verdict": "KEEP_title_collision_distinct_products",
+      "why": "no shared slug words — distinct products under one normalized title: ['4901301413246', '4901301447647']",
+      "slugs": [
+        "4901301413246",
+        "4901301447647"
+      ]
+    },
+    {
+      "lane": "lane3_spared",
+      "content_key": "ck_8c5af2d85a23d7ec4bd71858130a40d9",
+      "merchant_id": "external_seed",
+      "n_rows": 2,
+      "verdict": "REVIEW_possible_clone_conservative_spare",
+      "why": "shares base words, spared by the conservative rule: ['active-pureness-mask', 'renight-mask']",
+      "slugs": [
+        "active-pureness-mask",
+        "renight-mask"
+      ]
+    },
+    {
+      "lane": "lane3_spared",
+      "content_key": "ck_8eb60cc13e2cf78686ed2293cf9b3a52",
+      "merchant_id": "external_seed",
+      "n_rows": 3,
+      "verdict": "REVIEW_possible_clone_conservative_spare",
+      "why": "shares base words, spared by the conservative rule: ['makewaves-mascara', 'makewaves®-mascara-gift-with-purchase']",
+      "slugs": [
+        "makewaves-mascara",
+        "makewaves®-mascara-gift-with-purchase"
+      ]
+    },
+    {
+      "lane": "lane3_spared",
+      "content_key": "ck_946d3f1a00d51a5c9b823e1b9e5fa4d3",
+      "merchant_id": "external_seed",
+      "n_rows": 4,
+      "verdict": "REVIEW_possible_clone_conservative_spare",
+      "why": "shares base words, spared by the conservative rule: ['signature-lip', 'signature-lip-uk', 'signature-lipstick-eu']",
+      "slugs": [
+        "signature-lip",
+        "signature-lip-uk",
+        "signature-lipstick-eu"
+      ]
+    },
+    {
+      "lane": "lane3_spared",
+      "content_key": "ck_9973df953049b5c6e0795727a6c43b18",
+      "merchant_id": "external_seed",
+      "n_rows": 2,
+      "verdict": "REVIEW_possible_clone_conservative_spare",
+      "why": "shares base words, spared by the conservative rule: ['divine-rose-ii-collection', 'pat-mcgrath-labs-mothership-viii-divine-rose-ii-palette']",
+      "slugs": [
+        "divine-rose-ii-collection",
+        "pat-mcgrath-labs-mothership-viii-divine-rose-ii-palette"
+      ]
+    },
+    {
+      "lane": "lane3_spared",
+      "content_key": "ck_9a9a086e48840ddb298dd5cfffc773a0",
+      "merchant_id": "external_seed",
+      "n_rows": 2,
+      "verdict": "KEEP_size_variants",
+      "why": "slugs differ by size token: ['cosmic-kylie-jenner-30ml-pen-spray-gift-set', 'cosmic-kylie-jenner-eau-de-parfum-30ml-10ml-pen-spray-gift-set']",
+      "slugs": [
+        "cosmic-kylie-jenner-30ml-pen-spray-gift-set",
+        "cosmic-kylie-jenner-eau-de-parfum-30ml-10ml-pen-spray-gift-set"
+      ]
+    },
+    {
+      "lane": "lane3_spared",
+      "content_key": "ck_9c4a3372ca6e3aeacf51ee787e219cba",
+      "merchant_id": "external_seed",
+      "n_rows": 2,
+      "verdict": "REVIEW_junk_copy_vs_variant",
+      "why": "a -copy row paired with a variant slug: ['super-slick-mini-lip-balm-breeze', 'super-slick-mini-lip-balm-copy-1']",
+      "slugs": [
+        "super-slick-mini-lip-balm-breeze",
+        "super-slick-mini-lip-balm-copy-1"
+      ]
+    },
+    {
+      "lane": "lane3_spared",
+      "content_key": "ck_9e19fc2cc91db6148d48a7818df46179",
+      "merchant_id": "external_seed",
+      "n_rows": 2,
+      "verdict": "REVIEW_possible_clone_conservative_spare",
+      "why": "shares base words, spared by the conservative rule: ['rouge-g-the-customizable-ultra-care-lipstick-S000050.html', 'rouge-g-the-customizable-ultra-care-lipstick-S000070.html']",
+      "slugs": [
+        "rouge-g-the-customizable-ultra-care-lipstick-S000050.html",
+        "rouge-g-the-customizable-ultra-care-lipstick-S000070.html"
+      ]
+    },
+    {
+      "lane": "lane3_spared",
+      "content_key": "ck_b750be54799aacc37372797f3b755328",
+      "merchant_id": "external_seed",
+      "n_rows": 2,
+      "verdict": "KEEP_size_variants",
+      "why": "slugs differ by size token: ['the-high-shine-shampoo-200ml', 'the-high-shine-shampoo-400ml']",
+      "slugs": [
+        "the-high-shine-shampoo-200ml",
+        "the-high-shine-shampoo-400ml"
+      ]
+    },
+    {
+      "lane": "lane3_spared",
+      "content_key": "ck_ba6334ab1e42312bf0a566fa635ce287",
+      "merchant_id": "external_seed",
+      "n_rows": 2,
+      "verdict": "REVIEW_possible_clone_conservative_spare",
+      "why": "shares base words, spared by the conservative rule: ['luminant-serum', 'remedy-serum']",
+      "slugs": [
+        "luminant-serum",
+        "remedy-serum"
+      ]
+    },
+    {
+      "lane": "lane3_spared",
+      "content_key": "ck_c16508d15628d445345d12e50b6a68d8",
+      "merchant_id": "external_seed",
+      "n_rows": 2,
+      "verdict": "REVIEW_possible_clone_conservative_spare",
+      "why": "shares base words, spared by the conservative rule: ['matte-slick-invisible-lip-balm', 'matte-slick-mini-invisible-balm']",
+      "slugs": [
+        "matte-slick-invisible-lip-balm",
+        "matte-slick-mini-invisible-balm"
+      ]
+    },
+    {
+      "lane": "lane3_spared",
+      "content_key": "ck_c7fa43cca080b9bd6de4dbb2ed6303ac",
+      "merchant_id": "external_seed",
+      "n_rows": 2,
+      "verdict": "REVIEW_possible_clone_conservative_spare",
+      "why": "shares base words, spared by the conservative rule: ['red-collection-velvet-blur-mini-lipstick-balm-windburn', 'velvet-blur-matte-mini-lipstick-balm-windburn']",
+      "slugs": [
+        "red-collection-velvet-blur-mini-lipstick-balm-windburn",
+        "velvet-blur-matte-mini-lipstick-balm-windburn"
+      ]
+    },
+    {
+      "lane": "lane3_spared",
+      "content_key": "ck_cc25910c4206f15657901ac8c8cb205f",
+      "merchant_id": "external_seed",
+      "n_rows": 2,
+      "verdict": "REVIEW_possible_clone_conservative_spare",
+      "why": "shares base words, spared by the conservative rule: ['glam-eyeshadow-palette', 'natasha-denona-glam-eyeshadow-palette']",
+      "slugs": [
+        "glam-eyeshadow-palette",
+        "natasha-denona-glam-eyeshadow-palette"
+      ]
+    },
+    {
+      "lane": "lane3_spared",
+      "content_key": "ck_cdf9cba4841a9a3308900275ee136848",
+      "merchant_id": "external_seed",
+      "n_rows": 5,
+      "verdict": "REVIEW_possible_clone_conservative_spare",
+      "why": "shares base words, spared by the conservative rule: ['color-trio', 'the-color-trio', 'the-color-trio-eu']",
+      "slugs": [
+        "color-trio",
+        "the-color-trio",
+        "the-color-trio-eu",
+        "the-color-trio-uk"
+      ]
+    },
+    {
+      "lane": "lane3_spared",
+      "content_key": "ck_dcd7ee9530134f04233394c413127634",
+      "merchant_id": "external_seed",
+      "n_rows": 4,
+      "verdict": "REVIEW_junk_copy_vs_variant",
+      "why": "a -copy row paired with a variant slug: ['amazon-1-big-spring-sale-biodance-collagen-gel-toner-pads-copy', 'amazon-nr-1-marke-kollagen-gel-toner-pads-sanfter-glow-in-nur-15-minuten', 'amazon-nr-1-marke-kollagen-gel-toner-pads-sanfter-glow-in-nur-15-minuten-1']",
+      "slugs": [
+        "amazon-1-big-spring-sale-biodance-collagen-gel-toner-pads-copy",
+        "amazon-nr-1-marke-kollagen-gel-toner-pads-sanfter-glow-in-nur-15-minuten",
+        "amazon-nr-1-marke-kollagen-gel-toner-pads-sanfter-glow-in-nur-15-minuten-1",
+        "amazon-nr-1-marke-kollagen-gel-toner-pads-sanfter-glow-in-nur-15-minuten-2"
+      ]
+    },
+    {
+      "lane": "lane3_spared",
+      "content_key": "ck_e5c5288eb234567b6434909d276a1a57",
+      "merchant_id": "external_seed",
+      "n_rows": 2,
+      "verdict": "KEEP_title_collision_distinct_products",
+      "why": "no shared slug words — distinct products under one normalized title: ['stilligouttes', 'stilligouttes1']",
+      "slugs": [
+        "stilligouttes",
+        "stilligouttes1"
+      ]
+    },
+    {
+      "lane": "lane3_spared",
+      "content_key": "ck_e65ab07927cc46c62b02f442208c702e",
+      "merchant_id": "external_seed",
+      "n_rows": 2,
+      "verdict": "REVIEW_possible_clone_conservative_spare",
+      "why": "shares base words, spared by the conservative rule: ['mediheal-vitamide-brightening-pad-refill', 'vitamide-brightening-pad-refill']",
+      "slugs": [
+        "mediheal-vitamide-brightening-pad-refill",
+        "vitamide-brightening-pad-refill"
+      ]
+    },
+    {
+      "lane": "lane3_spared",
+      "content_key": "ck_e74ed58e788d22d287ab3a6d105b4339",
+      "merchant_id": "external_seed",
+      "n_rows": 3,
+      "verdict": "REVIEW_possible_clone_conservative_spare",
+      "why": "shares base words, spared by the conservative rule: ['glossybounce-duo', 'glossybounce-duo-2025']",
+      "slugs": [
+        "glossybounce-duo",
+        "glossybounce-duo-2025"
+      ]
+    },
+    {
+      "lane": "lane3_spared",
+      "content_key": "ck_e9d1ffdec5b4dd35f1f39392cd6fdc1e",
+      "merchant_id": "external_seed",
+      "n_rows": 2,
+      "verdict": "KEEP_size_variants",
+      "why": "slugs differ by size token: ['huile-prodigieuse-florale-100ml', 'huile-prodigieuse-florale-50ml']",
+      "slugs": [
+        "huile-prodigieuse-florale-100ml",
+        "huile-prodigieuse-florale-50ml"
+      ]
+    },
+    {
+      "lane": "lane3_spared",
+      "content_key": "ck_eb9bd29f0e9ee49c90fc1675cb34774b",
+      "merchant_id": "external_seed",
+      "n_rows": 2,
+      "verdict": "REVIEW_possible_clone_conservative_spare",
+      "why": "shares base words, spared by the conservative rule: ['honey-orange-blossom-hand-cream-1', 'honey-orange-hand-cream']",
+      "slugs": [
+        "honey-orange-blossom-hand-cream-1",
+        "honey-orange-hand-cream"
+      ]
+    },
+    {
+      "lane": "lane3_spared",
+      "content_key": "ck_ef05bf07aae4148721527a7cfff61bd1",
+      "merchant_id": "external_seed",
+      "n_rows": 2,
+      "verdict": "REVIEW_junk_copy_vs_variant",
+      "why": "a -copy row paired with a variant slug: ['super-slick-lip-balm-copy-2', 'super-slick-lip-balm-dune']",
+      "slugs": [
+        "super-slick-lip-balm-copy-2",
+        "super-slick-lip-balm-dune"
+      ]
+    },
+    {
+      "lane": "lane3_spared",
+      "content_key": "ck_f580dc89591fa7b6ef59001f12e2d60e",
+      "merchant_id": "external_seed",
+      "n_rows": 2,
+      "verdict": "REVIEW_junk_copy_vs_variant",
+      "why": "a -copy row paired with a variant slug: ['arencia-fresh-green-mochi-cleanser', 'arencia-fresh-rosehip-mochi-cleanser-copy']",
+      "slugs": [
+        "arencia-fresh-green-mochi-cleanser",
+        "arencia-fresh-rosehip-mochi-cleanser-copy"
+      ]
+    },
+    {
+      "lane": "lane3_spared",
+      "content_key": "ck_f6043e61c3c4a716704b0e2bdc669296",
+      "merchant_id": "external_seed",
+      "n_rows": 2,
+      "verdict": "REVIEW_possible_clone_conservative_spare",
+      "why": "shares base words, spared by the conservative rule: ['collagen-ampoule-pad-refill', 'mediheal-collagen-ampoule-pad-refill']",
+      "slugs": [
+        "collagen-ampoule-pad-refill",
+        "mediheal-collagen-ampoule-pad-refill"
+      ]
+    },
+    {
+      "lane": "lane3_spared",
+      "content_key": "ck_ff5b458019ad1fa9409c4b61c786e1e3",
+      "merchant_id": "external_seed",
+      "n_rows": 2,
+      "verdict": "REVIEW_possible_clone_conservative_spare",
+      "why": "shares base words, spared by the conservative rule: ['honeyed-grapefruit-body-cream', 'honeyed-grapefruit-whipped-body-cream-1']",
+      "slugs": [
+        "honeyed-grapefruit-body-cream",
+        "honeyed-grapefruit-whipped-body-cream-1"
+      ]
+    },
+    {
+      "lane": "seed_first_party_twin",
+      "content_key": "ck_07993a56a5d6a5704623bdb12a4d68e0",
+      "merchant_id": "cross",
+      "n_rows": 2,
+      "verdict": "SUPPRESS_seed_twin_pending_signoff",
+      "why": "first-party claimed row + seed mirror of the same URL — cross_merchant_redundant_external_seed precedent; NOTE first-party account is merch_test_ownist_001 (test-named), confirm before cut",
+      "sample_urls": [
+        "https://ownist.com/products/triple-collagen-garden-gift-set",
+        "https://ownist.com/products/triple-collagen-garden-gift-set"
+      ]
+    },
+    {
+      "lane": "seed_first_party_twin",
+      "content_key": "ck_207b488833d1d30063ef58ea7492bce8",
+      "merchant_id": "cross",
+      "n_rows": 2,
+      "verdict": "SUPPRESS_seed_twin_pending_signoff",
+      "why": "first-party claimed row + seed mirror of the same URL — cross_merchant_redundant_external_seed precedent; NOTE first-party account is merch_test_ownist_001 (test-named), confirm before cut",
+      "sample_urls": [
+        "https://ownist.com/products/triple-shine-1-box",
+        "https://ownist.com/products/triple-shine-1-box"
+      ]
+    },
+    {
+      "lane": "seed_first_party_twin",
+      "content_key": "ck_6ade2fac142ad3a1cac48c2e7d0540c8",
+      "merchant_id": "cross",
+      "n_rows": 2,
+      "verdict": "SUPPRESS_seed_twin_pending_signoff",
+      "why": "first-party claimed row + seed mirror of the same URL — cross_merchant_redundant_external_seed precedent; NOTE first-party account is merch_test_ownist_001 (test-named), confirm before cut",
+      "sample_urls": [
+        "https://ownist.com/products/triple-shine-garden-gift-set",
+        "https://ownist.com/products/triple-shine-garden-gift-set"
+      ]
+    },
+    {
+      "lane": "seed_first_party_twin",
+      "content_key": "ck_b6c694cf4003f3f2f91a8a10a37ea94f",
+      "merchant_id": "cross",
+      "n_rows": 2,
+      "verdict": "SUPPRESS_seed_twin_pending_signoff",
+      "why": "first-party claimed row + seed mirror of the same URL — cross_merchant_redundant_external_seed precedent; NOTE first-party account is merch_test_ownist_001 (test-named), confirm before cut",
+      "sample_urls": [
+        "https://ownist.com/products/ownist-triple-collagen-1-box",
+        "https://ownist.com/products/ownist-triple-collagen-1-box"
+      ]
+    },
+    {
+      "lane": "seed_first_party_twin",
+      "content_key": "ck_db609742a340461140793408da201052",
+      "merchant_id": "cross",
+      "n_rows": 2,
+      "verdict": "KEEP_audit_observation",
+      "why": "url_audit row never wins serving; seed row is the real card",
+      "sample_urls": [
+        "https://anukoofficial.com/product/%EC%95%84%EB%88%84%EC%BD%94-%EB%AF%B8%EB%8B%88-%EB%94%94%ED%83%B1%EA%B8%80-%EB%B8%8C%EB%9F%AC%EC%89%AC/30/",
+        "https://anukoofficial.com/product/아누코-미니-디탱글-브러쉬/30/"
+      ]
+    }
+  ]
+}
