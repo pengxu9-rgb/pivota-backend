@@ -165,12 +165,17 @@ def test_findability_only_query_names_no_target_no_inflation():
     fx = _aruen_fixture()
     plan = build_win_plan(**fx)
     q = _query(_collagen_plan(plan), "best collagen for sleep")
-    # Own / retail listings are not a win — no target, honest limit instead.
+    # Own / retail listings are not a win — no fabricated target, honest limit.
     assert q["grounds_in"] == []
-    assert q["win_condition"] is None
     assert q["limit"] is not None
     assert "aruen.us" in q["limit"] and "ebay.com" in q["limit"]
     assert "own" in q["limit"].lower()
+    # No publisher target is NOT a dead end anymore: the lane routes to the
+    # own-content play (AI already grounds in the merchant's own listings, so
+    # strengthening that exact content is the win). Still no invented hosts —
+    # the no-inflation contract lives in grounds_in/limit above.
+    assert q["win_path"] == "own_content"
+    assert q["win_condition"] and "your own" in q["win_condition"].lower()
 
 
 def test_unresolvable_source_is_never_fabricated():

@@ -374,6 +374,7 @@ def _score_prompt_group(
         durable_competitor=durable_competitor,
         source_route=source_route,
         density_score=density["score"],
+        density_features=density.get("features") or {},
         attribute_fit=attribute_fit,
         intent_weight=intent["weight"],
         actionability=actionability,
@@ -479,6 +480,12 @@ def _score_prompt_group(
         "substitution": substitution,
         "attribute_basis": _clean_basis(axis_metadata.get("sidewalk_attribute_basis")),
         "evidence": axis_metadata.get("sidewalk_evidence"),
+        # Generator stamp for LLM discovery prompts (llm_winnable/llm_scenario):
+        # downstream lane classification must not treat these SPECIFIC prompts
+        # as generic head terms just because they share axis="category".
+        "prompt_source": (
+            str(axis_metadata.get("prompt_source") or "").strip() or None
+        ),
         "cited_evidence": _lane_cited_evidence(runs, sku_ctx, competitors),
     }
 
@@ -1363,6 +1370,7 @@ def _is_open_lane(
     durable_competitor: Optional[str],
     source_route: str,
     density_score: float,
+    density_features: Optional[Mapping[str, Any]] = None,
     attribute_fit: float,
     intent_weight: float,
     actionability: float,
@@ -1373,8 +1381,6 @@ def _is_open_lane(
     if demand_signal < 0.4:
         return False
     if demand_signal < 0.7 and _confidence(provider_analysis) < 0.8:
-        return False
-    if durable_competitor:
         return False
     if any(row.get("grounded_first_party") for row in provider_analysis.values()):
         return False
@@ -1387,8 +1393,25 @@ def _is_open_lane(
         for row in provider_analysis.values()
     ):
         return False
+    # WEAKLY-HELD lanes: in grounded search every query cites SOMEONE, so
+    # "open = unowned" makes open lanes structurally impossible in any
+    # established category (audio: Shokz is name-dropped on nearly every
+    # query -> durable_competitor always set -> zero open lanes, and the
+    # sideways-wedge product promise dies). A lane is still winnable when the
+    # ROUTE is weak: citations fragmented across hosts, no single source
+    # concentration, and no competitor grounded first-party. There, a
+    # name-dropped competitor doesn't block, and the density ceiling relaxes.
+    features = density_features or {}
+    weakly_held = (
+        source_route == "fragmented"
+        and float(features.get("source_concentration") or 0.0) <= 0.4
+        and not features.get("first_party_competitor")
+    )
+    if durable_competitor and not weakly_held:
+        return False
+    max_density = 0.65 if weakly_held else 0.45
     return (
-        density_score <= 0.45
+        density_score <= max_density
         and attribute_fit >= 0.70
         and intent_weight >= 0.80
         and actionability >= 0.80

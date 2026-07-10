@@ -232,9 +232,16 @@ def _losing_query_plan(
     targets = targets[:_MAX_TARGETS_PER_QUERY]
 
     limit: Optional[str] = None
+    win_path = "publisher" if targets else "own_content"
+    win_condition = _win_condition(query, targets)
     if not targets:
         # No independent target we can name for this query. Be specific about
-        # WHY using only real resolved hosts — never invent a target.
+        # WHY using only real resolved hosts — never invent a target. But a
+        # missing publisher is NOT a dead end: it means no publisher CONTROLS
+        # this answer, which is exactly when the merchant's own content can
+        # win it. Emit the own-content win condition instead of null — the old
+        # null dead-ended precisely on the specific long-tail queries the
+        # audit generates for the merchant to win.
         non_endorsement = [
             r.get("host")
             for r in resolved
@@ -255,13 +262,19 @@ def _losing_query_plan(
             limit = (
                 "AI returned no resolvable independent source for this query."
             )
+        win_condition = (
+            "No publisher controls this answer — win it with your own "
+            f'content: publish a spec-complete product page that answers "{query}" '
+            "so AI can ground on you directly."
+        )
 
     return {
         "query": query,
         "axis": failing_prompt.get("axis"),
         "grounds_in": targets,
         "competitor_benchmark": competitor_benchmark,
-        "win_condition": _win_condition(query, targets),
+        "win_condition": win_condition,
+        "win_path": win_path,
         "limit": limit,
     }
 
