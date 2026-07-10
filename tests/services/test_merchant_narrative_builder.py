@@ -573,6 +573,44 @@ def test_win_plan_summary_absent_when_no_plan_no_fabrication():
     assert narr2["where_youre_losing"]["win_plan_summary"] is None
 
 
+def test_where_youre_losing_threads_vertical_profile_without_nameerror():
+    """Regression for the #1243 NameError: `_where_youre_losing` referenced
+    `vertical_profile` at its `_who_ai_cites_instead(...)` call site without
+    receiving it as a parameter, so it raised on EVERY narrative build (best-
+    effort-caught in run_brand_report, silently killing the section). The
+    profile must thread from `build_merchant_narrative` down through
+    `_where_youre_losing` into `_who_ai_cites_instead` for any vertical — not
+    just the BEAUTY default that happened to be an in-scope module global."""
+    from services.vertical_profiles import ELECTRONICS_AUDIO_PROFILE
+
+    am = _authority_map(
+        [
+            _run("buy Anuko headphones", "anuko.com"),
+            _editorial("best noise cancelling headphones", "rtings.com", "Anuko",
+                       comps=["Bose", "Sony"]),
+        ],
+        host="anuko.com",
+        brand="Anuko",
+    )
+    # A non-default vertical must not raise and must still produce the section.
+    narr = build_merchant_narrative(
+        merchant_name="Anuko", per_sku_reports=[], authority_map=am,
+        providers=["gemini"], vertical_profile=ELECTRONICS_AUDIO_PROFILE,
+    )
+    where = narr["where_youre_losing"]
+    assert isinstance(where, dict)
+    assert "who_ai_cites_instead" in where
+    assert where["who_ai_cites_instead"]["available"] is True
+
+    # And the helper itself accepts the profile directly (the broken call site).
+    from services.merchant_narrative_builder import _where_youre_losing
+    direct = _where_youre_losing(
+        "Anuko", am, {"findability_hosts": []}, None,
+        vertical_profile=ELECTRONICS_AUDIO_PROFILE,
+    )
+    assert isinstance(direct, dict) and "who_ai_cites_instead" in direct
+
+
 def test_narrative_cited_via_retailer_is_not_invisible():
     # Brand cited via RETAILERS on branded queries (no own-site first-party, no
     # category endorsement) but with real per-SKU citation must NOT read as
