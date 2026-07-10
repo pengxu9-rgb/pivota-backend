@@ -42,7 +42,13 @@ logger = logging.getLogger(__name__)
 # strategy). A stored basis from an older version is ignored, so every SKU
 # regenerates ONCE on its next audit — that regeneration is the explicit,
 # deploy-visible "measurement basis updated" event.
-PROMPT_BASIS_VERSION = 1
+# v2 (#1281): spec-matched discovery-prompt generators changed materially —
+# bidirectional category-noun redundancy guard (kills "best headphones for bone
+# conduction headphones"), vertical-gated "what helps with X" (off for
+# electronics), and a budget reorder floating LLM winnable/scenario prompts ahead
+# of the generic category-template tail. SKUs pinned to a v1 basis (already-
+# audited partners) must regenerate to actually receive the fixed prompts.
+PROMPT_BASIS_VERSION = 2
 
 _MAX_PROMPTS_PER_LIST = 12
 _MAX_PROMPT_CHARS = 300

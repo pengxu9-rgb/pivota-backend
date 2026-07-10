@@ -1310,10 +1310,26 @@ def generate_sidewalk_query_specs(
 
     candidates: List[Dict[str, Any]] = []
 
+    # Category HEAD noun ("headphones" of "bone conduction headphones") — used to
+    # reject NON-ADJACENT category repeats that _destutter can't see: when a
+    # use_case/format slug already carries the product-type noun (audio's
+    # product-type leaks into the use_case class), a shape like
+    # "{format} {category} {format2} {use_case}" yields
+    # "bluetooth 5.3 bone conduction headphones open-ear structure bone conduction
+    # headphones". Adjacent-stutter collapse misses it; the token count catches it.
+    _cat_head = (category.split()[-1] if category.split() else category).lower()
+
     def add(query: str, basis: Iterable[str], weight: float) -> None:
         query = _destutter_query(query)
         if not _query_has_category(query, category):
             return
+        if _cat_head and len(_cat_head) >= 3:
+            toks = re.findall(r"[a-z0-9]+", query.lower())
+            if toks.count(_cat_head) > 1:
+                # The category noun appears twice — a slot re-introduced it. Drop
+                # rather than probe an awkward "…headphones … headphones" query;
+                # the generator produces plenty of clean variants to fill from.
+                return
         item = _candidate(safe_graph, query, basis, weight)
         if item:
             candidates.append(item)

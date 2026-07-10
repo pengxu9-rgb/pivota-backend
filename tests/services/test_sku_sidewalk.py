@@ -161,6 +161,40 @@ def test_sidewalk_generation_bb_lab():
     assert not any("sleep" in query for query in queries)
 
 
+def test_sidewalk_no_category_noun_repeat_electronics():
+    """When the product-type noun leaks into the use_case class (audio: the
+    category IS 'bone conduction headphones' and 'bone conduction headphones' also
+    lands in use_case), the generator must not emit shapes that repeat the head
+    noun ('...open-ear structure bone conduction headphones'). _destutter only
+    collapses ADJACENT repeats; the category-head-noun count guard catches the
+    non-adjacent one."""
+    import re
+    from services.sku_sidewalk import generate_sidewalk_query_specs
+
+    graph = {
+        "classes": {
+            "category": ["bone conduction headphones"],
+            "format": ["open-ear structure"],
+            "certification_constraint": ["ip68 waterproof certified"],
+            "use_case": ["bone conduction headphones", "daily sports"],
+        }
+    }
+    specs = generate_sidewalk_query_specs(
+        graph,
+        title="Purra Swim",
+        product_type="bone conduction headphones",
+        n=12,
+    )
+    queries = [s["query"] for s in specs]
+    assert queries, "expected some clean sidewalk queries"
+    for q in queries:
+        assert re.findall(r"[a-z0-9]+", q.lower()).count("headphones") <= 1, (
+            f"category noun repeated in sidewalk query: {q!r}"
+        )
+    # the legitimate, non-repeating use_case still produces a spec query.
+    assert any("daily sports" in q for q in queries)
+
+
 def test_sidewalk_guardrail_health():
     from services.sku_sidewalk import (
         build_sku_attribute_graph,
