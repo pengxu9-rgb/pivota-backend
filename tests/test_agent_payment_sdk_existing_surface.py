@@ -584,3 +584,82 @@ async def test_agent_payments_retries_transient_db_busy_after_psp_without_double
     assert response.payment_action["type"] == "stripe_client_secret"
     assert psp_calls["count"] == 1
     assert execute_calls["payment_insert"] == 2
+
+
+@pytest.mark.asyncio
+async def test_protocol_order_does_not_reuse_existing_surface(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # A protocol-tier (ACP) order with a pre-existing client-confirm surface must
+    # NOT reuse it — it has to fall through to the kill-switch + off-session lane.
+    # With submit_payment off (test default) the kill-switch blocks → 403, proving
+    # the reuse branch was skipped (otherwise it would return 200 with the reused
+    # surface and never reach the kill-switch). Calls create_payment directly (no
+    # `from main import app`) to avoid the repo-governance startup check.
+    import mvp.events as mvp_events
+    import mvp.governance as mvp_governance
+    import routes.agent_payment_sdk as payment_module
+    from fastapi import BackgroundTasks
+    from db.database import database as database_obj
+
+    class _Context:
+        agent_id = "agent_test"
+        session_id = "sess_test"
+
+        def can_access_merchant(self, merchant_id: Optional[str]) -> bool:
+            return merchant_id == "merch_test_123"
+
+    async def fake_get_order(order_id: str) -> Dict[str, Any]:
+        meta = dict(_live_quote_metadata())
+        meta["protocol_name"] = "acp"  # <-- guarded protocol
+        return {
+            "order_id": order_id,
+            "merchant_id": "merch_test_123",
+            "payment_status": "processing",
+            "total": 1.69,
+            "currency": "USD",
+            "shipping_address": {"country": "US", "postal_code": "94105", "city": "SF", "state": "CA"},
+            "psp_used": "stripe",
+            "payment_intent_id": "pi_existing_123",       # an existing surface...
+            "client_secret": "pi_existing_123_secret_456",
+            "items": [{"product_id": "prod_1", "merchant_id": "merch_test_123"}],
+            "metadata": meta,
+        }
+
+    async def fake_get_merchant_onboarding(merchant_id: str) -> Dict[str, Any]:
+        return {"merchant_id": merchant_id}
+
+    async def fake_select_psp(self, *, agent_id: str, merchant_id: str, amount: float, currency: str):
+        return "stripe", {"route_id": "r", "psp_priority": [{"psp": "stripe", "priority": 1}]}
+
+    async def fail_failover(*args: Any, **kwargs: Any):
+        raise AssertionError("must not reach PSP for a kill-switch-blocked protocol charge")
+
+    async def fake_fetch_one(*args: Any, **kwargs: Any):
+        return None
+
+    class _Decision:
+        decision = "allow"; reason_codes = []; required_scopes = []; risk_tier = "low"
+
+    monkeypatch.setattr(payment_module, "get_order", fake_get_order)
+    monkeypatch.setattr(payment_module, "get_merchant_onboarding", fake_get_merchant_onboarding)
+    monkeypatch.setattr(payment_module.PaymentRoutingService, "select_psp", fake_select_psp)
+    monkeypatch.setattr(payment_module, "create_payment_with_failover", fail_failover)
+    monkeypatch.setattr(database_obj, "fetch_one", fake_fetch_one)
+    monkeypatch.setattr(mvp_events, "emit_best_effort", lambda **_: None)
+    monkeypatch.setattr(mvp_governance.governance, "evaluate", lambda *_a, **_k: _Decision())
+    monkeypatch.setattr(mvp_governance.governance, "record_audit_event", lambda **_: None)
+
+    with pytest.raises(payment_module.HTTPException) as exc:
+        await payment_module.create_payment(
+            payment_module.PaymentRequest(
+                order_id="ORD_ACP_1",
+                payment_method=payment_module.PaymentMethod(type="dynamic"),
+            ),
+            BackgroundTasks(),
+            context=_Context(),
+        )
+
+    # Reuse was skipped → kill-switch blocked the protocol charge (submit off).
+    assert exc.value.status_code == 403
+    assert exc.value.detail["error"] == "TIER2_CHARGE_DISABLED"

@@ -646,9 +646,27 @@ async def create_payment(
                     created_at=datetime.now().isoformat()
                 )
 
-        existing_payment_surface = await _build_existing_order_payment_surface(
-            order,
-            require_redirect_ready=bool(request.return_url),
+        # A protocol-tier (ACP/UCP/AP2) in-chat charge must NEVER reuse an existing
+        # client-confirm payment surface: the buyer isn't present to complete a
+        # requires_action/3DS step, so reusing a pre-created PaymentIntent here
+        # short-circuits the fail-closed kill-switch + the server-side off-session
+        # capture lane below (they'd never run) and returns a dead requires_action.
+        # Only non-protocol (REST/hosted) flows — where a frontend completes the
+        # surface — reuse one. Guarded protocols are gated by the kill-switch (403)
+        # and, when permitted, captured off_session further down.
+        from services.agent_checkout_kill_switch import is_guarded_protocol
+
+        _order_proto = (
+            (order.get("metadata") or {}).get("protocol_name")
+            if isinstance(order.get("metadata"), dict) else None
+        )
+        existing_payment_surface = (
+            None
+            if is_guarded_protocol(_order_proto)
+            else await _build_existing_order_payment_surface(
+                order,
+                require_redirect_ready=bool(request.return_url),
+            )
         )
         if existing_payment_surface:
             logger.info(
