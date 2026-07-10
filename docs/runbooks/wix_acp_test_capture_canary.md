@@ -25,6 +25,29 @@ production lane (PR #1314, dark until then).
   `lane=acp_in_chat` → the backend ACP client sends `X-Platform: wix` to
   pivota-acp → the `WixConnector` is selected at session create.
 
+## ⚠️ Multi-store merchants — target the Wix store explicitly
+
+The canary merchant **merch_efbc46b4619cfbdf has BOTH a Shopify and a Wix store
+connected.** The ACP lane resolves a merchant to ONE platform via its **primary**
+store, so without targeting, the "Wix canary" silently re-runs the **Shopify**
+connector. Two ways to point it at Wix:
+
+- **Preferred — store/platform override** (backend PR #1316): pass
+  `"platform": "wix"` (or `"store_id": "<wix_store_id>"`) in the 3(a) request
+  body. No DB mutation; the lane resolves capability against the Wix store and
+  sends `X-Platform: wix` to pivota-acp. Requires #1316 deployed.
+- **Fallback — flip `is_primary`** (reversible):
+  `UPDATE merchant_stores SET is_primary=(platform='wix') WHERE
+  merchant_id='merch_efbc46b4619cfbdf';`
+
+Confirm current state first:
+```sql
+SELECT store_id, platform, status, is_primary, connected_at, order_writeback_status,
+       (api_key IS NOT NULL AND api_key <> '') AS has_api_key, domain
+FROM merchant_stores WHERE merchant_id='merch_efbc46b4619cfbdf'
+ORDER BY is_primary DESC, connected_at DESC;
+```
+
 ## Prerequisites
 
 - A **Wix** store connected to the canary merchant in prod (`<WIX_MERCHANT_ID>`),
@@ -70,20 +93,22 @@ curl -sS -X POST https://api.pivota.cc/agent/v1/checkout/acp \
   -H "X-API-Key: <working ak_live_ agent key>" \
   -H "Content-Type: application/json" \
   -d '{
-    "merchant_id": "<WIX_MERCHANT_ID>",
-    "items": [{"product_id": "<PID>", "variant_id": "<VID>", "quantity": 1}],
+    "items": [{"merchant_id": "<WIX_MERCHANT_ID>", "product_id": "<PID>", "variant_id": "<VID>", "quantity": 1}],
+    "platform": "wix",
     "shipping_address": {
       "name": "Test Buyer", "address_line1": "1 Test St",
       "city": "San Francisco", "state": "CA", "postal_code": "94105", "country": "US"
     },
-    "metadata": {"pvt_click_id": "clk_wix_canary_1", "pvt_surface": "canary"}
+    "pvt_click_id": "clk_wix_canary_1", "pvt_surface": "canary"
   }'
 ```
 
+`"platform": "wix"` (PR #1316) targets the Wix store on this multi-store merchant.
 Expect `status: requires_in_chat_acp_checkout`, `lane: acp_in_chat`,
-`acp_session_id: csn_...`, `platform: wix`. If `lane` is `redirect_floor`, the
-canary gate isn't armed — recheck step 1 (`SUBMIT_PAYMENT_MERCHANTS` must contain
-`<WIX_MERCHANT_ID>`) and that the merchant resolves as `platform=wix`.
+`acp_session_id: csn_...`, `platform: wix`, and `capability.store_selector.matched:
+true`. If `lane` is `redirect_floor`, the canary gate isn't armed — recheck step 1
+(`SUBMIT_PAYMENT_MERCHANTS` must contain `<WIX_MERCHANT_ID>`) and that the override
+matched a Wix store (`store_selector.matched`).
 
 **3(b) — complete on pivota-acp → triggers the backend off-session capture:**
 
