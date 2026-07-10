@@ -1,0 +1,56 @@
+{
+  "_what_this_is": "Pivota-authored Tier-G ingredient KB entry for Allantoin (ADR-002 v2-lite format). Evidence grade C. Grade-C ingredient_function - established cosmetic role, no clinical citation claimed. SEEDING NOTE: upsert into aurora_ingredient_research_kb via ingredientResearchKbStore.upsertIngredientResearchKbEntry, computing kb_key=buildIngredientResearchKbKey({query,lang:'EN',layer:'generic'}) for EACH of _kb_lookup_queries, status='ready', source_meta.tier='grounded' (REQUIRED - collectActives() skips entries whose source_meta.tier != 'grounded'). All served claim text is claim-safe (no treats/heals/anti-inflammatory/antibacterial - DRUG_RE drops those).",
+  "_kb_lookup_queries": [
+    "allantoin"
+  ],
+  "_seed_source_meta": {
+    "tier": "grounded"
+  },
+  "usage": {
+    "notes": [
+      "A gentle soothing/conditioning base."
+    ],
+    "pair_well": [
+      "panthenol",
+      "ceramides",
+      "hyaluronic acid"
+    ],
+    "routine_step": "any",
+    "consider_separating": []
+  },
+  "safety": {
+    "watchouts": [],
+    "irritation_risk": "very_low"
+  },
+  "status": "ready",
+  "benefits": [
+    {
+      "concern": "rough / dry / uncomfortable skin",
+      "strength": 2,
+      "mechanism": "Allantoin is a keratolytic skin-conditioning agent that helps soften and slough away rough surface cells while improving skin feel.",
+      "what_it_means": "Softens and smooths rough, dry skin and leaves it feeling comforted."
+    },
+    {
+      "concern": "sensitive / reactive skin comfort",
+      "strength": 1,
+      "mechanism": "It is a well-tolerated conditioning agent that improves surface comfort and smoothness.",
+      "what_it_means": "Helps calm the feel of sensitive, reactive skin."
+    }
+  ],
+  "evidence": {
+    "grade": "C",
+    "summary": "Skin-conditioning and softening role is an established cosmetic function of allantoin; graded C (ingredient function).",
+    "citations": []
+  },
+  "overview": "Allantoin is a soothing, skin-conditioning agent that softens rough skin and comforts sensitive or reactive skin — a gentle supportive ingredient found across soothing formulas.",
+  "provider": "pivota_research",
+  "ingredient": {
+    "inci": "Allantoin",
+    "aliases": [],
+    "what_it_is": "A gentle skin-conditioning agent used to soften, smooth and comfort skin.",
+    "display_name": "Allantoin",
+    "marketing_vs_reality": []
+  },
+  "schema_version": "v2-lite",
+  "confidence_level": "high"
+}

@@ -1,0 +1,100 @@
+{
+  "_what_this_is": "Pivota-authored Tier-G ingredient KB entry for Salicylic Acid (BHA) (ADR-002 v2-lite format). Evidence grade B. All 2 citation(s) verified to resolve on PubMed/PMC via web search at authoring 2026-07-08. SEEDING NOTE: upsert into aurora_ingredient_research_kb via ingredientResearchKbStore.upsertIngredientResearchKbEntry, computing kb_key=buildIngredientResearchKbKey({query,lang:'EN',layer:'generic'}) for EACH of _kb_lookup_queries, status='ready', source_meta.tier='grounded' (REQUIRED - collectActives() skips entries whose source_meta.tier != 'grounded'). All served claim text is claim-safe (no treats/heals/anti-inflammatory/antibacterial - DRUG_RE drops those).",
+  "_kb_lookup_queries": [
+    "salicylic acid"
+  ],
+  "_seed_source_meta": {
+    "tier": "grounded"
+  },
+  "usage": {
+    "notes": [
+      "Judge congestion benefit at 2-4 weeks.",
+      "Leave-on 0.5-2% is the common cosmetic range."
+    ],
+    "pair_well": [
+      "niacinamide",
+      "hyaluronic acid",
+      "ceramides"
+    ],
+    "routine_step": "toner_or_serum",
+    "consider_separating": [
+      "high-strength AHA or retinoid at the same step on reactive skin"
+    ]
+  },
+  "safety": {
+    "watchouts": [
+      {
+        "issue": "Dryness / over-exfoliation",
+        "likelihood": "moderate",
+        "what_to_do": "Start 2-3x/week; do not stack with other strong acids or a retinoid at the same step on sensitive skin. Follow with moisturizer."
+      },
+      {
+        "issue": "Sun sensitivity",
+        "likelihood": "moderate",
+        "what_to_do": "Use daily broad-spectrum SPF; exfoliated skin is more UV-exposed."
+      }
+    ],
+    "irritation_risk": "low_to_moderate"
+  },
+  "status": "ready",
+  "benefits": [
+    {
+      "concern": "congestion / blackheads / blemish-prone skin",
+      "strength": 3,
+      "mechanism": "Salicylic acid is lipophilic and concentrates in sebum-rich follicles, where it weakens the intercellular cement between the dead cells lining the pore and disperses the microcomedone plug (comedolytic action, cyanoacrylate-biopsy assay, PMID 6191495).",
+      "what_it_means": "Clears out pore congestion and reduces blackheads and blemishes over 2-4 weeks. Because it is oil-soluble it works inside the pore, where water-soluble acids cannot reach."
+    },
+    {
+      "concern": "oiliness / enlarged-looking pores",
+      "strength": 2,
+      "mechanism": "Keeping the follicular opening clear of desquamated cells and sebum reduces the pore-plugging that makes pores look larger; an 8-week multicenter study of salicylic-acid products showed reduced lesion counts and improved appearance (PMID 33070577).",
+      "what_it_means": "Reduces surface oil and the look of enlarged pores with regular use."
+    },
+    {
+      "concern": "rough / uneven texture / clarity",
+      "strength": 2,
+      "mechanism": "Surface keratolysis promotes even shedding of the outer stratum corneum, refining texture.",
+      "what_it_means": "Smooths rough, bumpy texture and improves overall clarity."
+    }
+  ],
+  "evidence": {
+    "grade": "B",
+    "summary": "Comedolytic action is demonstrated by follicular-biopsy assay and supported by controlled clinical use studies; graded B (peer-reviewed mechanism plus observational clinical) for the congestion/clarity benefits.",
+    "citations": [
+      {
+        "url": "https://pubmed.ncbi.nlm.nih.gov/6191495/",
+        "year": 1983,
+        "title": "Assay of comedolytic activity in acne patients",
+        "source": "British Journal of Dermatology; PMID 6191495"
+      },
+      {
+        "url": "https://pubmed.ncbi.nlm.nih.gov/33070577/",
+        "year": 2020,
+        "title": "Effectiveness of a combination of salicylic acid-based products for mild comedonal-papular acne: a multicenter prospective observational study",
+        "source": "Journal of Cosmetic Dermatology; PMID 33070577"
+      }
+    ]
+  },
+  "overview": "Salicylic acid is the go-to oil-soluble exfoliant for congestion and blemish-prone skin: because it is lipophilic it works inside the pore, where water-soluble AHAs cannot reach, dislodging the plug that forms blackheads and bumps.",
+  "provider": "pivota_research",
+  "ingredient": {
+    "inci": "Salicylic Acid",
+    "aliases": [
+      "bha",
+      "beta hydroxy acid",
+      "beta-hydroxy acid",
+      "2-hydroxybenzoic acid"
+    ],
+    "what_it_is": "An oil-soluble beta-hydroxy acid (BHA). Its lipophilicity lets it penetrate sebum-filled follicles, where it loosens the bonds holding dead cells together inside the pore.",
+    "display_name": "Salicylic Acid (BHA)",
+    "marketing_vs_reality": [
+      {
+        "reality": "It clears existing congestion and keeps follicles clear with ongoing use, but the benefit depends on continued use and pore diameter itself is genetically set, not physically shrunk.",
+        "evidence_type": "marketing_vs_reality",
+        "claim_in_market": "Salicylic acid 'unclogs pores permanently'"
+      }
+    ]
+  },
+  "schema_version": "v2-lite",
+  "confidence_level": "high"
+}

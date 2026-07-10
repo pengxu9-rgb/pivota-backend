@@ -1,0 +1,101 @@
+{
+  "_what_this_is": "Pivota-authored Tier-G ingredient KB entry for Glycolic Acid (AHA) (ADR-002 v2-lite format). Evidence grade B. All 2 citation(s) verified to resolve on PubMed/PMC via web search at authoring 2026-07-08. SEEDING NOTE: upsert into aurora_ingredient_research_kb via ingredientResearchKbStore.upsertIngredientResearchKbEntry, computing kb_key=buildIngredientResearchKbKey({query,lang:'EN',layer:'generic'}) for EACH of _kb_lookup_queries, status='ready', source_meta.tier='grounded' (REQUIRED - collectActives() skips entries whose source_meta.tier != 'grounded'). All served claim text is claim-safe (no treats/heals/anti-inflammatory/antibacterial - DRUG_RE drops those).",
+  "_kb_lookup_queries": [
+    "glycolic acid"
+  ],
+  "_seed_source_meta": {
+    "tier": "grounded"
+  },
+  "usage": {
+    "notes": [
+      "SPF is non-negotiable.",
+      "Judge texture at 4-8 weeks."
+    ],
+    "pair_well": [
+      "hyaluronic acid",
+      "niacinamide",
+      "ceramides"
+    ],
+    "routine_step": "toner_or_serum",
+    "consider_separating": [
+      "retinoid",
+      "BHA at the same step on sensitive skin"
+    ]
+  },
+  "safety": {
+    "watchouts": [
+      {
+        "issue": "Sun sensitivity",
+        "likelihood": "high",
+        "what_to_do": "Daily broad-spectrum SPF is essential; AHAs increase UV sensitivity for up to a week after use."
+      },
+      {
+        "issue": "Tingling / stinging",
+        "likelihood": "moderate",
+        "what_to_do": "Start low and infrequent; avoid stacking with other strong acids or a retinoid at the same step."
+      }
+    ],
+    "irritation_risk": "moderate"
+  },
+  "status": "ready",
+  "benefits": [
+    {
+      "concern": "dullness / rough uneven texture",
+      "strength": 3,
+      "mechanism": "Glycolic acid reduces cohesion between corneocytes in the lower stratum corneum, accelerating desquamation and epidermal renewal; a pilot histologic study showed epidermal and dermal remodeling of photoaged skin (PMID 8642081).",
+      "what_it_means": "Resurfaces dull, rough skin for visibly smoother, brighter texture over 4-8 weeks."
+    },
+    {
+      "concern": "fine lines / photoaging appearance",
+      "strength": 2,
+      "mechanism": "Sustained AHA use is associated with epidermal thickening and increased dermal collagen and glycosaminoglycans in a double-blind vehicle-controlled trial of 8% glycolic/lactic creams (PMID 8651713).",
+      "what_it_means": "Softens the look of fine lines and photodamage with consistent use."
+    },
+    {
+      "concern": "uneven tone / post-blemish marks",
+      "strength": 2,
+      "mechanism": "Faster desquamation disperses clustered surface pigment and smooths the stratum corneum.",
+      "what_it_means": "Evens the look of tone and fades post-blemish marks by speeding surface turnover."
+    }
+  ],
+  "evidence": {
+    "grade": "B",
+    "summary": "Surface-renewal mechanism and dermal remodeling shown in controlled histologic and double-blind vehicle-controlled human trials; graded B.",
+    "citations": [
+      {
+        "url": "https://pubmed.ncbi.nlm.nih.gov/8642081/",
+        "year": 1996,
+        "title": "Effects of alpha-hydroxy acids on photoaged skin: a pilot clinical, histologic, and ultrastructural study",
+        "source": "Journal of the American Academy of Dermatology (Ditre, Van Scott et al.); PMID 8642081"
+      },
+      {
+        "url": "https://pubmed.ncbi.nlm.nih.gov/8651713/",
+        "year": 1996,
+        "title": "Topical 8% glycolic acid and 8% L-lactic acid creams for the treatment of photodamaged skin: a double-blind vehicle-controlled clinical trial",
+        "source": "Archives of Dermatology (Stiller et al.); PMID 8651713"
+      }
+    ]
+  },
+  "overview": "Glycolic acid resurfaces dull, rough skin by loosening dead cells at the skin surface, revealing smoother, brighter texture; with sustained use it is also associated with increased dermal collagen in controlled studies.",
+  "provider": "pivota_research",
+  "ingredient": {
+    "inci": "Glycolic Acid",
+    "aliases": [
+      "aha",
+      "alpha hydroxy acid",
+      "alpha-hydroxy acid",
+      "hydroxyacetic acid"
+    ],
+    "what_it_is": "The smallest alpha-hydroxy acid (AHA). Its small molecular size gives it the fastest penetration of the AHAs, making it the most-studied for surface renewal.",
+    "display_name": "Glycolic Acid (AHA)",
+    "marketing_vs_reality": [
+      {
+        "reality": "At cosmetic strengths glycolic acid gently accelerates the skin’s natural exfoliation; it is not a chemical peel. Deeper resurfacing requires professional concentrations under supervision.",
+        "evidence_type": "marketing_vs_reality",
+        "claim_in_market": "AHAs 'peel away' damage"
+      }
+    ]
+  },
+  "schema_version": "v2-lite",
+  "confidence_level": "high"
+}

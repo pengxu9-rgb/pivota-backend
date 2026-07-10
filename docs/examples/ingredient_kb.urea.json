@@ -1,0 +1,70 @@
+{
+  "_what_this_is": "Pivota-authored Tier-G ingredient KB entry for Urea (ADR-002 v2-lite format). Evidence grade C. Grade-C ingredient_function - established cosmetic role, no clinical citation claimed. SEEDING NOTE: upsert into aurora_ingredient_research_kb via ingredientResearchKbStore.upsertIngredientResearchKbEntry, computing kb_key=buildIngredientResearchKbKey({query,lang:'EN',layer:'generic'}) for EACH of _kb_lookup_queries, status='ready', source_meta.tier='grounded' (REQUIRED - collectActives() skips entries whose source_meta.tier != 'grounded'). All served claim text is claim-safe (no treats/heals/anti-inflammatory/antibacterial - DRUG_RE drops those).",
+  "_kb_lookup_queries": [
+    "urea"
+  ],
+  "_seed_source_meta": {
+    "tier": "grounded"
+  },
+  "usage": {
+    "notes": [
+      "<10% = hydrating; higher = smoothing."
+    ],
+    "pair_well": [
+      "ceramides",
+      "glycerin",
+      "hyaluronic acid"
+    ],
+    "routine_step": "moisturizer",
+    "consider_separating": []
+  },
+  "safety": {
+    "watchouts": [
+      {
+        "issue": "Tingle on compromised skin at high %",
+        "likelihood": "low",
+        "what_to_do": "High-percentage urea can tingle on cracked skin; lower levels are broadly gentle."
+      }
+    ],
+    "irritation_risk": "low"
+  },
+  "status": "ready",
+  "benefits": [
+    {
+      "concern": "dryness / dehydration",
+      "strength": 2,
+      "mechanism": "Urea is a humectant component of the skin’s natural moisturizing factor, binding water within the stratum corneum.",
+      "what_it_means": "Draws water into skin for lasting hydration and a softer feel."
+    },
+    {
+      "concern": "rough / flaky / thickened skin",
+      "strength": 2,
+      "mechanism": "At higher concentrations urea loosens corneocyte bonds, gently helping shed rough surface build-up.",
+      "what_it_means": "Softens and smooths rough, flaky or thickened areas with regular use."
+    }
+  ],
+  "evidence": {
+    "grade": "C",
+    "summary": "Humectant (NMF) and concentration-dependent smoothing are established cosmetic functions of urea; graded C (ingredient function).",
+    "citations": []
+  },
+  "overview": "Urea is a dual-action natural-moisturizing-factor ingredient: it draws water into skin to hydrate, and at higher levels softens and smooths rough, flaky or thickened skin.",
+  "provider": "pivota_research",
+  "ingredient": {
+    "inci": "Urea",
+    "aliases": [
+      "carbamide"
+    ],
+    "what_it_is": "A component of skin’s own natural moisturizing factor. At low levels it hydrates; at higher levels it also helps soften and smooth rough, flaky skin.",
+    "display_name": "Urea",
+    "marketing_vs_reality": [
+      {
+        "reality": "Concentration decides its role: low levels (below ~10%) are purely hydrating and gentle; higher levels add a smoothing, softening action for rough or flaky areas.",
+        "evidence_type": "marketing_vs_reality",
+        "claim_in_market": "Urea is 'harsh'"
+      }
+    ]
+  },
+  "schema_version": "v2-lite",
+  "confidence_level": "high"
+}

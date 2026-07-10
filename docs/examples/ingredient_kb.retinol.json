@@ -1,0 +1,99 @@
+{
+  "_what_this_is": "Pivota-authored Tier-G ingredient KB entry for Retinol (Vitamin A) (ADR-002 v2-lite format). Evidence grade B. All 2 citation(s) verified to resolve on PubMed/PMC via web search at authoring 2026-07-08. SEEDING NOTE: upsert into aurora_ingredient_research_kb via ingredientResearchKbStore.upsertIngredientResearchKbEntry, computing kb_key=buildIngredientResearchKbKey({query,lang:'EN',layer:'generic'}) for EACH of _kb_lookup_queries, status='ready', source_meta.tier='grounded' (REQUIRED - collectActives() skips entries whose source_meta.tier != 'grounded'). All served claim text is claim-safe (no treats/heals/anti-inflammatory/antibacterial - DRUG_RE drops those).",
+  "_kb_lookup_queries": [
+    "retinol"
+  ],
+  "_seed_source_meta": {
+    "tier": "grounded"
+  },
+  "usage": {
+    "notes": [
+      "PM use with AM SPF.",
+      "Judge firmness/lines at 12 weeks."
+    ],
+    "pair_well": [
+      "niacinamide",
+      "ceramides",
+      "hyaluronic acid",
+      "peptides"
+    ],
+    "routine_step": "pm_serum",
+    "consider_separating": [
+      "AHA/BHA at the same step on sensitive skin"
+    ]
+  },
+  "safety": {
+    "watchouts": [
+      {
+        "issue": "Dryness / peeling / retinoid irritation",
+        "likelihood": "high",
+        "what_to_do": "Start 2x/week at low strength and build up; buffer with moisturizer. Avoid stacking with strong acids at the same step."
+      },
+      {
+        "issue": "Sun sensitivity / pregnancy",
+        "likelihood": "moderate",
+        "what_to_do": "Use PM only with daily SPF; retinoids are generally advised against in pregnancy — consult a professional."
+      }
+    ],
+    "irritation_risk": "moderate"
+  },
+  "status": "ready",
+  "benefits": [
+    {
+      "concern": "fine lines / firmness / photoaging appearance",
+      "strength": 3,
+      "mechanism": "Retinol converts in skin to retinoic acid, which binds retinoic-acid receptors, up-regulating procollagen synthesis and down-regulating the matrix-metalloproteinases that break collagen down; tretinoin (the prescription retinoid) restored collagen formation in photodamaged skin on biopsy (Griffiths/Voorhees, NEJM 1993).",
+      "what_it_means": "Softens the look of fine lines and improves firmness over 12 weeks of consistent use."
+    },
+    {
+      "concern": "uneven texture / dullness",
+      "strength": 2,
+      "mechanism": "Retinoids normalise keratinocyte differentiation and accelerate epidermal turnover, refining surface texture.",
+      "what_it_means": "Smooths rough texture and boosts radiance by renewing the surface."
+    },
+    {
+      "concern": "uneven tone / dark marks",
+      "strength": 2,
+      "mechanism": "Faster, more even turnover disperses surface pigment and evens the stratum corneum.",
+      "what_it_means": "Fades the look of uneven tone and post-blemish marks over time."
+    }
+  ],
+  "evidence": {
+    "grade": "B",
+    "summary": "The retinoid receptor mechanism (collagen up, MMP down) is well established; tretinoin RCTs show biopsy-confirmed collagen restoration. Retinol is the cosmetic precursor that converts to the same active, at gentler potency; graded B for the cosmetic form.",
+    "citations": [
+      {
+        "url": "https://www.nejm.org/doi/full/10.1056/NEJM199308193290803",
+        "year": 1993,
+        "title": "Restoration of collagen formation in photodamaged human skin by tretinoin (retinoic acid)",
+        "source": "New England Journal of Medicine (Griffiths et al.)"
+      },
+      {
+        "url": "https://pmc.ncbi.nlm.nih.gov/articles/PMC9112391/",
+        "year": 2022,
+        "title": "Topical tretinoin for treating photoaging: a systematic review of randomized controlled trials",
+        "source": "PMC9112391"
+      }
+    ]
+  },
+  "overview": "Retinol is the best-evidenced anti-aging active class for smoothing fine lines and improving firmness, working by signalling collagen synthesis and normalising skin-cell turnover; results build gradually over 8-12+ weeks.",
+  "provider": "pivota_research",
+  "ingredient": {
+    "inci": "Retinol",
+    "aliases": [
+      "vitamin a",
+      "retinoid"
+    ],
+    "what_it_is": "The cosmetic form of vitamin A. In skin it is converted to retinoic acid, the active retinoid that signals skin cells to renew and build collagen.",
+    "display_name": "Retinol (Vitamin A)",
+    "marketing_vs_reality": [
+      {
+        "reality": "Retinol is converted to its active form in two steps, so visible change is gradual — texture in weeks, firmness and fine lines over 12 weeks or more. Higher strength is not always better; tolerance builds slowly.",
+        "evidence_type": "marketing_vs_reality",
+        "claim_in_market": "Retinol 'works overnight'"
+      }
+    ]
+  },
+  "schema_version": "v2-lite",
+  "confidence_level": "high"
+}

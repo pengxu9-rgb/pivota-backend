@@ -1,0 +1,69 @@
+{
+  "_what_this_is": "Pivota-authored Tier-G ingredient KB entry for Licorice Root (Glycyrrhiza Glabra) (ADR-002 v2-lite format). Evidence grade C. Grade-C ingredient_function - established cosmetic role, no clinical citation claimed. SEEDING NOTE: upsert into aurora_ingredient_research_kb via ingredientResearchKbStore.upsertIngredientResearchKbEntry, computing kb_key=buildIngredientResearchKbKey({query,lang:'EN',layer:'generic'}) for EACH of _kb_lookup_queries, status='ready', source_meta.tier='grounded' (REQUIRED - collectActives() skips entries whose source_meta.tier != 'grounded'). All served claim text is claim-safe (no treats/heals/anti-inflammatory/antibacterial - DRUG_RE drops those).",
+  "_kb_lookup_queries": [
+    "glycyrrhiza glabra",
+    "glycyrrhiza glabra extract",
+    "licorice",
+    "licorice extract"
+  ],
+  "_seed_source_meta": {
+    "tier": "grounded"
+  },
+  "usage": {
+    "notes": [
+      "Gentle brightener; layers well."
+    ],
+    "pair_well": [
+      "niacinamide",
+      "vitamin c"
+    ],
+    "routine_step": "serum",
+    "consider_separating": []
+  },
+  "safety": {
+    "watchouts": [],
+    "irritation_risk": "low"
+  },
+  "status": "ready",
+  "benefits": [
+    {
+      "concern": "uneven tone / dark spots / dullness",
+      "strength": 2,
+      "mechanism": "Glabridin, licorice’s key polyphenol, slows tyrosinase-driven melanin production, so pigment builds up less over time.",
+      "what_it_means": "Gently brightens and evens the look of tone and dark spots with gradual use."
+    },
+    {
+      "concern": "environmental stress / look of redness",
+      "strength": 1,
+      "mechanism": "Licorice flavonoids scavenge oxidative stress at the skin surface.",
+      "what_it_means": "Adds antioxidant support and helps calm the look of redness."
+    }
+  ],
+  "evidence": {
+    "grade": "C",
+    "summary": "Glabridin-driven tone-evening and antioxidant activity is an established cosmetic function of licorice extract; graded C (ingredient function).",
+    "citations": []
+  },
+  "overview": "Licorice root extract gently brightens and evens tone through its glabridin content while adding antioxidant support — a mild, well-tolerated tone ingredient.",
+  "provider": "pivota_research",
+  "ingredient": {
+    "inci": "Glycyrrhiza Glabra Root Extract",
+    "aliases": [
+      "licorice",
+      "liquorice",
+      "glabridin",
+      "licorice root extract"
+    ],
+    "what_it_is": "An extract of licorice root whose signature compound, glabridin, is a well-known gentle brightening and antioxidant agent.",
+    "display_name": "Licorice Root (Glycyrrhiza Glabra)",
+    "marketing_vs_reality": [
+      {
+        "reality": "It gently evens tone by slowing pigment production; it does not whiten or bleach, and works gradually.",
+        "evidence_type": "marketing_vs_reality",
+        "claim_in_market": "Licorice 'whitens' skin"
+      }
+    ]
+  },
+  "schema_version": "v2-lite",
+  "confidence_level": "high"
+}

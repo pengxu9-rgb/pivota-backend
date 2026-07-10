@@ -1,0 +1,64 @@
+{
+  "_what_this_is": "Pivota-authored Tier-G ingredient KB entry for Caffeine (ADR-002 v2-lite format). Evidence grade C. Grade-C ingredient_function - established cosmetic role, no clinical citation claimed. SEEDING NOTE: upsert into aurora_ingredient_research_kb via ingredientResearchKbStore.upsertIngredientResearchKbEntry, computing kb_key=buildIngredientResearchKbKey({query,lang:'EN',layer:'generic'}) for EACH of _kb_lookup_queries, status='ready', source_meta.tier='grounded' (REQUIRED - collectActives() skips entries whose source_meta.tier != 'grounded'). All served claim text is claim-safe (no treats/heals/anti-inflammatory/antibacterial - DRUG_RE drops those).",
+  "_kb_lookup_queries": [
+    "caffeine"
+  ],
+  "_seed_source_meta": {
+    "tier": "grounded"
+  },
+  "usage": {
+    "notes": [
+      "Best for a temporary de-puffed look."
+    ],
+    "pair_well": [
+      "niacinamide",
+      "peptides",
+      "hyaluronic acid"
+    ],
+    "routine_step": "eye_or_serum",
+    "consider_separating": []
+  },
+  "safety": {
+    "watchouts": [],
+    "irritation_risk": "very_low"
+  },
+  "status": "ready",
+  "benefits": [
+    {
+      "concern": "puffiness / tired look around the eyes",
+      "strength": 2,
+      "mechanism": "Caffeine is a vasoconstrictor that transiently narrows superficial blood vessels and supports fluid movement, reducing the look of puffiness.",
+      "what_it_means": "Temporarily reduces the look of puffiness and gives a tighter, more awake appearance."
+    },
+    {
+      "concern": "environmental stress / dullness",
+      "strength": 1,
+      "mechanism": "Caffeine is a methylxanthine antioxidant that helps scavenge reactive oxygen species at the skin surface.",
+      "what_it_means": "Adds antioxidant support against daily oxidative stress."
+    }
+  ],
+  "evidence": {
+    "grade": "C",
+    "summary": "Vasoconstrictor de-puffing and antioxidant activity are established cosmetic functions of caffeine; graded C (ingredient function).",
+    "citations": []
+  },
+  "overview": "Caffeine is a fast-penetrating ingredient prized for a temporary de-puffing, tightening look around the eyes and for antioxidant support.",
+  "provider": "pivota_research",
+  "ingredient": {
+    "inci": "Caffeine",
+    "aliases": [
+      "1,3,7-trimethylxanthine"
+    ],
+    "what_it_is": "A small, fast-penetrating molecule used mainly around the eyes for a temporarily de-puffed, tightened look, plus antioxidant support.",
+    "display_name": "Caffeine",
+    "marketing_vs_reality": [
+      {
+        "reality": "It can temporarily reduce the look of puffiness and give a tighter appearance, which softens shadowing — but it does not remove pigment-based or structural dark circles.",
+        "evidence_type": "marketing_vs_reality",
+        "claim_in_market": "Caffeine 'removes dark circles'"
+      }
+    ]
+  },
+  "schema_version": "v2-lite",
+  "confidence_level": "high"
+}

@@ -1,0 +1,75 @@
+{
+  "_what_this_is": "Pivota-authored Tier-G ingredient KB entry for Aloe Vera (ADR-002 v2-lite format). Evidence grade C. Grade-C ingredient_function - established cosmetic role, no clinical citation claimed. SEEDING NOTE: upsert into aurora_ingredient_research_kb via ingredientResearchKbStore.upsertIngredientResearchKbEntry, computing kb_key=buildIngredientResearchKbKey({query,lang:'EN',layer:'generic'}) for EACH of _kb_lookup_queries, status='ready', source_meta.tier='grounded' (REQUIRED - collectActives() skips entries whose source_meta.tier != 'grounded'). All served claim text is claim-safe (no treats/heals/anti-inflammatory/antibacterial - DRUG_RE drops those).",
+  "_kb_lookup_queries": [
+    "aloe barbadensis",
+    "aloe barbadensis extract",
+    "aloe vera"
+  ],
+  "_seed_source_meta": {
+    "tier": "grounded"
+  },
+  "usage": {
+    "notes": [
+      "Great after sun or heat.",
+      "A supportive hydrating base."
+    ],
+    "pair_well": [
+      "hyaluronic acid",
+      "niacinamide",
+      "ceramides"
+    ],
+    "routine_step": "hydrator_or_mask",
+    "consider_separating": []
+  },
+  "safety": {
+    "watchouts": [
+      {
+        "issue": "Rare aloe sensitivity",
+        "likelihood": "low",
+        "what_to_do": "Patch test if you have known plant/latex sensitivities."
+      }
+    ],
+    "irritation_risk": "low"
+  },
+  "status": "ready",
+  "benefits": [
+    {
+      "concern": "dehydration / tightness",
+      "strength": 2,
+      "mechanism": "Aloe polysaccharides and sugars act as humectants, binding water at the skin surface for immediate hydration.",
+      "what_it_means": "Adds lightweight, non-greasy hydration and a soft, comfortable feel."
+    },
+    {
+      "concern": "post-sun / heat discomfort / look of redness",
+      "strength": 2,
+      "mechanism": "Its high water content and film-forming polysaccharides provide a cooling, comforting layer that eases the sensation of overheated skin.",
+      "what_it_means": "Calms the feel of hot, tight or after-sun skin and the look of temporary redness."
+    }
+  ],
+  "evidence": {
+    "grade": "C",
+    "summary": "Humectant and skin-comfort role is an established cosmetic function of aloe gel; graded C (ingredient function).",
+    "citations": []
+  },
+  "overview": "Aloe vera is a lightweight, water-based humectant that hydrates and comforts skin, especially after sun or heat exposure; a supportive soothing base rather than a treatment active.",
+  "provider": "pivota_research",
+  "ingredient": {
+    "inci": "Aloe Barbadensis Leaf Extract",
+    "aliases": [
+      "aloe",
+      "aloe vera",
+      "aloe barbadensis leaf juice"
+    ],
+    "what_it_is": "The gel fraction of the aloe leaf — a water-rich blend of polysaccharides, sugars and humectants used to hydrate and comfort skin.",
+    "display_name": "Aloe Vera",
+    "marketing_vs_reality": [
+      {
+        "reality": "Aloe is a genuinely good lightweight hydrator and comfort agent, but it is a supportive base ingredient, not a treatment active — most of a formula’s active benefit comes from what is paired with it.",
+        "evidence_type": "marketing_vs_reality",
+        "claim_in_market": "Aloe is a 'miracle repair' ingredient"
+      }
+    ]
+  },
+  "schema_version": "v2-lite",
+  "confidence_level": "medium"
+}

@@ -1,0 +1,83 @@
+{
+  "_what_this_is": "Pivota-authored Tier-G ingredient KB entry for Arbutin (Alpha-Arbutin) (ADR-002 v2-lite format). Evidence grade B. All 2 citation(s) verified to resolve on PubMed/PMC via web search at authoring 2026-07-08. SEEDING NOTE: upsert into aurora_ingredient_research_kb via ingredientResearchKbStore.upsertIngredientResearchKbEntry, computing kb_key=buildIngredientResearchKbKey({query,lang:'EN',layer:'generic'}) for EACH of _kb_lookup_queries, status='ready', source_meta.tier='grounded' (REQUIRED - collectActives() skips entries whose source_meta.tier != 'grounded'). All served claim text is claim-safe (no treats/heals/anti-inflammatory/antibacterial - DRUG_RE drops those).",
+  "_kb_lookup_queries": [
+    "alpha arbutin",
+    "alpha-arbutin",
+    "arbutin",
+    "beta-arbutin"
+  ],
+  "_seed_source_meta": {
+    "tier": "grounded"
+  },
+  "usage": {
+    "notes": [
+      "Non-photoreactive; AM or PM.",
+      "Gentle and gradual."
+    ],
+    "pair_well": [
+      "niacinamide",
+      "vitamin c"
+    ],
+    "routine_step": "serum",
+    "consider_separating": []
+  },
+  "safety": {
+    "watchouts": [
+      {
+        "issue": "Slow, gradual results",
+        "likelihood": "moderate",
+        "what_to_do": "Give it 8-12 weeks; pairs well with vitamin C or niacinamide to layer complementary brightening."
+      }
+    ],
+    "irritation_risk": "low"
+  },
+  "status": "ready",
+  "benefits": [
+    {
+      "concern": "uneven tone / dark spots / dullness",
+      "strength": 2,
+      "mechanism": "Arbutin is a competitive, reversible inhibitor of tyrosinase, reducing melanin synthesis at non-cytotoxic concentrations in human melanocyte culture (mechanism study, PMID 8632348).",
+      "what_it_means": "Gradually brightens and fades the look of dark spots and uneven tone over 8-12 weeks."
+    }
+  ],
+  "evidence": {
+    "grade": "B",
+    "summary": "Competitive reversible tyrosinase inhibition demonstrated in human melanocyte culture and skin-tissue models; graded B.",
+    "citations": [
+      {
+        "url": "https://pubmed.ncbi.nlm.nih.gov/8632348/",
+        "year": 1996,
+        "title": "Arbutin: mechanism of its depigmenting action in human melanocyte culture",
+        "source": "Journal of Pharmacology and Experimental Therapeutics; PMID 8632348"
+      },
+      {
+        "url": "https://pubmed.ncbi.nlm.nih.gov/19387580/",
+        "year": 2009,
+        "title": "Inhibitory effects of arbutin on melanin biosynthesis of alpha-MSH-induced hyperpigmentation in cultured brownish guinea pig skin tissues",
+        "source": "PMID 19387580"
+      }
+    ]
+  },
+  "overview": "Arbutin gently brightens and evens tone by slowing melanin production, delivering a milder, gradual alternative to harsher brightening agents.",
+  "provider": "pivota_research",
+  "ingredient": {
+    "inci": "Arbutin",
+    "aliases": [
+      "alpha-arbutin",
+      "alpha arbutin",
+      "beta-arbutin",
+      "hydroquinone glucoside"
+    ],
+    "what_it_is": "A naturally derived glucoside of hydroquinone that releases its brightening action slowly and gently, making it a milder, non-photoreactive tone-evening ingredient.",
+    "display_name": "Arbutin (Alpha-Arbutin)",
+    "marketing_vs_reality": [
+      {
+        "reality": "It is a glucoside that releases its active slowly, which makes it far gentler and, unlike some depigmenting agents, non-photoreactive — but also more gradual in effect.",
+        "evidence_type": "marketing_vs_reality",
+        "claim_in_market": "Arbutin is 'just natural hydroquinone'"
+      }
+    ]
+  },
+  "schema_version": "v2-lite",
+  "confidence_level": "high"
+}
