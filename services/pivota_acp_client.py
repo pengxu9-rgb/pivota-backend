@@ -127,6 +127,34 @@ def _acp_items(items: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
     return out
 
 
+def _acp_address(addr: Optional[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
+    """Map a Pivota checkout `shipping_address` (address_line1/address_line2) to
+    the ACP session `Address` contract (line_one/line_two). pivota-acp's Address
+    model *requires* line_one, so passing our shape straight through 422s. Accepts
+    either shape (idempotent when already ACP-shaped) and drops empties. Returns
+    None when there's no usable street line."""
+    if not addr:
+        return None
+    a = dict(addr)
+    line_one = (
+        a.get("line_one") or a.get("address_line1") or a.get("line1") or a.get("addressLine1")
+    )
+    if not line_one:
+        return None
+    line_two = a.get("line_two") or a.get("address_line2") or a.get("line2") or a.get("addressLine2")
+    out: Dict[str, Any] = {
+        "line_one": str(line_one),
+        "name": a.get("name"),
+        "city": a.get("city"),
+        "state": a.get("state"),
+        "country": a.get("country"),
+        "postal_code": a.get("postal_code") or a.get("postalCode") or a.get("zip"),
+    }
+    if line_two:
+        out["line_two"] = str(line_two)
+    return {k: v for k, v in out.items() if v is not None}
+
+
 async def create_checkout_session(
     *,
     merchant_id: str,
@@ -167,8 +195,9 @@ async def create_checkout_session(
         acp_metadata.setdefault(k, v)
 
     body: Dict[str, Any] = {"items": acp_items, "metadata": acp_metadata}
-    if fulfillment_address:
-        body["fulfillment_address"] = fulfillment_address
+    acp_address = _acp_address(fulfillment_address)
+    if acp_address:
+        body["fulfillment_address"] = acp_address
     if buyer:
         body["buyer"] = buyer
 

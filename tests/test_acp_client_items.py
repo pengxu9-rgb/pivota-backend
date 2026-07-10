@@ -37,3 +37,30 @@ def test_acp_items_id_fallback_when_no_sku():
     out = _acp_items([{"product_id": "P1", "variant_id": "V1", "quantity": 1}])
     assert out[0]["id"] == "V1"  # falls to variant when sku absent
     assert out[0]["product_id"] == "P1" and out[0]["variant_id"] == "V1"
+
+
+# --- P-T2.3.4 fix: fulfillment_address → ACP Address contract (line_one) ---
+from services.pivota_acp_client import _acp_address  # noqa: E402
+
+
+def test_acp_address_maps_address_line1_to_line_one():
+    # pivota-acp's Address REQUIRES line_one; the Pivota checkout shape uses
+    # address_line1, so it must be mapped or pivota-acp 422s on the session.
+    out = _acp_address({
+        "name": "ACP Canary", "address_line1": "1 Test St", "address_line2": "Apt 2",
+        "city": "San Francisco", "state": "CA", "country": "US", "postal_code": "94102",
+    })
+    assert out == {
+        "line_one": "1 Test St", "line_two": "Apt 2", "name": "ACP Canary",
+        "city": "San Francisco", "state": "CA", "country": "US", "postal_code": "94102",
+    }
+
+
+def test_acp_address_passthrough_when_already_acp_shaped():
+    out = _acp_address({"line_one": "5 Main", "city": "NYC", "country": "US"})
+    assert out["line_one"] == "5 Main" and "line_two" not in out
+
+
+def test_acp_address_none_without_street_line():
+    assert _acp_address({"city": "NYC"}) is None
+    assert _acp_address(None) is None
