@@ -34,6 +34,7 @@ import asyncio
 import json
 import logging
 import os
+import re
 from typing import Any, Dict, List, Optional, Tuple
 
 from scripts.step5_lane2_same_url_dedup import DETAIL_SQL
@@ -155,18 +156,38 @@ def is_spot_check(proposal_id: str) -> bool:
     return digest[0] % 10 == 0
 
 
+_COPY_SLUG = re.compile(r"-copy(-\d{1,3})?$", re.IGNORECASE)
+
+
+def is_clean_keeper_candidate(detail: Dict[str, Any]) -> bool:
+    """A keeper should be a real PDP, not a junk clone. The first judge
+    review found pick_canonical choosing '-copy' pages as keepers in 8/30
+    groups (junk copies carry signatures and low sort keys, so they win the
+    serving tiebreak) — approving those would have suppressed the REAL shade
+    PDPs and kept the junk."""
+    from scripts.step5_lane3_campaign_clone_dedup import url_slug
+    from services.identity_resolution_strategies import is_campaign_slug
+
+    slug = url_slug(detail.get("canonical_url"))
+    if not slug:
+        return False
+    return not _COPY_SLUG.search(slug) and not is_campaign_slug(slug)
+
+
 def build_judge_proposal(
     source: Dict[str, Any],
     details: List[Dict[str, Any]],
     verdict: Dict[str, Any],
 ) -> Dict[str, Any]:
     """Pure: a confident judge 'collapse' -> a suppress_dup proposal under
-    the judge's own strategy. Keeper stays serving-aligned (pick_canonical),
-    the judge only decides SAMENESS."""
+    the judge's own strategy. Keeper = pick_canonical over the CLEAN-slug
+    members (falling back to all members when every slug is junk); the
+    judge only decides SAMENESS, never invents keepers."""
     from services.agent_pdp_view_assembler import pick_canonical
     from services.identity_resolution import new_proposal
 
-    keeper = pick_canonical(details)
+    clean = [d for d in details if is_clean_keeper_candidate(d)]
+    keeper = pick_canonical(clean or details)
     proposal = new_proposal(
         kind="suppress_dup",
         strategy=JUDGE_STRATEGY,
