@@ -69,6 +69,22 @@ def _fail(amount_cents, currency, error, code, status="failed") -> OffSessionCap
     )
 
 
+def _as_config_dict(value: Any) -> Dict[str, Any]:
+    """Coerce a PSP row's provider_config (JSONB dict or JSON string) into a dict.
+    Never raises — a malformed value resolves to an empty dict."""
+    if isinstance(value, dict):
+        return value
+    if isinstance(value, str) and value.strip():
+        try:
+            import json
+
+            parsed = json.loads(value)
+            return parsed if isinstance(parsed, dict) else {}
+        except Exception:  # noqa: BLE001
+            return {}
+    return {}
+
+
 def _key_is_live(provider: str, api_key: str, environment: Optional[str]) -> bool:
     """Provider-aware live-key detection for the lane guard.
 
@@ -100,6 +116,7 @@ class CaptureProvider(Protocol):
         payment_method: str,
         metadata: Dict[str, Any],
         allow_live: bool,
+        provider_config: Optional[Dict[str, Any]] = None,
     ) -> OffSessionCaptureResult:
         ...
 
@@ -119,6 +136,7 @@ class _StripeCaptureAdapter:
         payment_method: str,
         metadata: Dict[str, Any],
         allow_live: bool,
+        provider_config: Optional[Dict[str, Any]] = None,  # unused (Stripe needs only the key)
     ) -> OffSessionCaptureResult:
         # Payment method: the test lane may default to Stripe's test PM; the live
         # lane MUST carry a real buyer-provided pm_ (a test PM would fail on a live
@@ -208,10 +226,155 @@ class _StripeCaptureAdapter:
         )
 
 
-# Registry of PSP-specific capture adapters. Adyen (P-T2.3.7 item 3) slots in here
-# once its MIT /payments adapter lands; any provider absent here fails closed.
+class _AdyenCaptureAdapter:
+    """Adyen off-session capture via a merchant-initiated transaction (MIT) against
+    a stored payment method — the Adyen analog of Stripe's off_session confirm.
+
+    ⚠️ UNVERIFIED against real Adyen — mocked-tested only; must be proven in a
+    deployed Adyen test-mode canary before it is trusted (there is no universal
+    Adyen test PM like Stripe's pm_card_visa, so the canary must first tokenize an
+    Adyen test card to obtain a shopperReference + storedPaymentMethodId).
+
+    Needs, beyond the API key: `merchant_account` (from the PSP row's
+    provider_config), a `storedPaymentMethodId` (the forwarded `payment_method`
+    token), and a `shopperReference` (threaded via order/session metadata — the
+    stored PM is bound to it). Live requires a `live_url_prefix` in provider_config
+    (Adyen's per-merchant live endpoint host). Test/live is taken from `allow_live`
+    (the orchestrator already proved the key matches the lane).
+    """
+
+    TEST_BASE = "https://checkout-test.adyen.com/v71"
+    API_VERSION = "v71"
+
+    @staticmethod
+    def _shopper_reference(metadata: Dict[str, Any], provider_config: Dict[str, Any]) -> str:
+        md = metadata or {}
+        cfg = provider_config or {}
+        return str(
+            md.get("adyen_shopper_reference")
+            or md.get("shopper_reference")
+            or cfg.get("shopper_reference")
+            or ""
+        ).strip()
+
+    def _base_url(self, *, allow_live: bool, provider_config: Dict[str, Any]) -> Optional[str]:
+        if not allow_live:
+            return self.TEST_BASE
+        prefix = str(
+            (provider_config or {}).get("live_url_prefix")
+            or (provider_config or {}).get("endpoint_prefix")
+            or ""
+        ).strip()
+        if not prefix:
+            return None  # live lane needs the per-merchant live host prefix
+        return f"https://{prefix}-checkout-live.adyenpayments.com/checkout/{self.API_VERSION}"
+
+    async def capture(
+        self,
+        *,
+        merchant_id: str,
+        api_key: str,
+        amount_cents: int,
+        currency: str,
+        idempotency_key: str,
+        payment_method: str,
+        metadata: Dict[str, Any],
+        allow_live: bool,
+        provider_config: Optional[Dict[str, Any]] = None,
+    ) -> OffSessionCaptureResult:
+        cfg = provider_config or {}
+        merchant_account = str(cfg.get("merchant_account") or cfg.get("merchantAccount") or "").strip()
+        if not merchant_account:
+            return _fail(amount_cents, currency, "adyen_merchant_account_missing", "adyen_config")
+
+        stored_pm = str(payment_method or "").strip()
+        # Adyen has no universal test PM — a real stored payment method is required
+        # on BOTH lanes (the token is a storedPaymentMethodId, not a card).
+        if not stored_pm or stored_pm.startswith(("pm_", "tok_", "vt_")):
+            return _fail(amount_cents, currency, "adyen_requires_stored_payment_method", "adyen_pm_required")
+
+        shopper_ref = self._shopper_reference(metadata, cfg)
+        if not shopper_ref:
+            # MIT against a stored PM requires the shopperReference it is bound to;
+            # it must be threaded from tokenization (order/session metadata).
+            return _fail(amount_cents, currency, "adyen_requires_shopper_reference", "adyen_shopper_ref_required")
+
+        base = self._base_url(allow_live=allow_live, provider_config=cfg)
+        if base is None:
+            return _fail(amount_cents, currency, "adyen_live_url_prefix_missing", "adyen_config")
+
+        md = metadata or {}
+        adyen_meta = {
+            k: str(md[k])
+            for k in ("order_id", "protocol_name", "pvt_click_id", "checkout_session_id")
+            if md.get(k)
+        }
+        adyen_meta["pivota_acp_live_capture" if allow_live else "pivota_acp_test_capture"] = "true"
+
+        body: Dict[str, Any] = {
+            "merchantAccount": merchant_account,
+            "amount": {"value": int(amount_cents), "currency": str(currency or "USD").upper()},
+            "reference": str(md.get("order_id") or idempotency_key),
+            "paymentMethod": {"type": "scheme", "storedPaymentMethodId": stored_pm},
+            "shopperReference": shopper_ref,
+            "shopperInteraction": "ContAuth",
+            "recurringProcessingModel": "CardOnFile",
+            "metadata": adyen_meta,
+        }
+        headers = {
+            "X-API-Key": api_key,
+            "Content-Type": "application/json",
+            "Idempotency-Key": str(idempotency_key),
+        }
+
+        try:
+            import httpx  # local import: keep module import-safe
+
+            async with httpx.AsyncClient(timeout=30.0) as client:
+                resp = await client.post(f"{base}/payments", headers=headers, json=body)
+        except Exception as exc:  # noqa: BLE001 — normalize any transport error
+            logger.warning("acp_offsession: adyen capture transport error merchant_id=%s: %s", merchant_id, str(exc)[:200])
+            return _fail(amount_cents, currency, str(exc)[:300], "adyen_network_error")
+
+        if resp.status_code not in (200, 201):
+            logger.warning("acp_offsession: adyen capture http %s merchant_id=%s: %s", resp.status_code, merchant_id, resp.text[:200])
+            return _fail(amount_cents, currency, f"adyen_http_error:{resp.text[:200]}", f"adyen_http_{resp.status_code}")
+
+        try:
+            data = resp.json() or {}
+        except Exception:  # noqa: BLE001
+            return _fail(amount_cents, currency, "adyen_bad_response", "adyen_bad_response")
+
+        result_code = str(data.get("resultCode") or "")
+        psp_reference = data.get("pspReference")
+        if result_code == "Authorised":
+            logger.info("acp_offsession: adyen captured merchant_id=%s pspRef=%s amount=%s", merchant_id, psp_reference, amount_cents)
+            return OffSessionCaptureResult(
+                success=True, status="succeeded", payment_intent_id=psp_reference,
+                amount_cents=amount_cents, currency=currency, error=None, error_code=None,
+            )
+        if result_code in {"RedirectShopper", "ChallengeShopper", "IdentifyShopper"}:
+            # SCA — cannot complete off-session in-chat. MIT normally carries an
+            # exemption, so this should be rare.
+            logger.warning("acp_offsession: adyen requires_action merchant_id=%s resultCode=%s", merchant_id, result_code)
+            return OffSessionCaptureResult(
+                success=False, status="requires_action", payment_intent_id=psp_reference,
+                amount_cents=amount_cents, currency=currency,
+                error=f"adyen_sca:{result_code}", error_code="requires_action",
+            )
+        refusal = str(data.get("refusalReason") or result_code or "unknown")
+        logger.warning("acp_offsession: adyen refused merchant_id=%s resultCode=%s refusal=%s", merchant_id, result_code, refusal)
+        return OffSessionCaptureResult(
+            success=False, status="failed", payment_intent_id=psp_reference,
+            amount_cents=amount_cents, currency=currency,
+            error=f"adyen_{result_code or 'error'}:{refusal}"[:300], error_code="adyen_refused",
+        )
+
+
+# Registry of PSP-specific capture adapters. Any provider absent here fails closed.
 _CAPTURE_ADAPTERS: Dict[str, CaptureProvider] = {
     "stripe": _StripeCaptureAdapter(),
+    "adyen": _AdyenCaptureAdapter(),
 }
 
 
@@ -267,6 +430,7 @@ async def capture_offsession(
     provider = str((row or {}).get("provider") or "").strip().lower()
     api_key = str((row or {}).get("api_key") or (row or {}).get("secret_key") or "").strip()
     environment = (row or {}).get("environment")
+    provider_config = _as_config_dict((row or {}).get("provider_config"))
     if not api_key:
         return _fail(amount_cents, currency, "merchant_psp_key_unresolved", "no_merchant_psp")
 
@@ -298,4 +462,5 @@ async def capture_offsession(
         payment_method=payment_method or "",
         metadata=dict(metadata or {}),
         allow_live=allow_live,
+        provider_config=provider_config,
     )
