@@ -154,10 +154,49 @@ Backend: `AGENT_ACP_TEST_CAPTURE=false`, `SUBMIT_PAYMENT=false`.
 pivota-acp: `ACP_ENABLE_REAL_CAPTURE=false`.
 Re-probe 3(a) → expect `lane=redirect_floor` (dark again).
 
-## 6. Promote Wix to production (the "flag flip")
+## 6. Promote Wix to production — checklist
 
-Once the canary passes, PR #1314 makes production routing honor per-store
-readiness. To light up the *proven* Wix store for the production lane:
+The canary above proves **only** the connector→backend money path (Stripe capture
+driven by `WixConnector`), using a known-good **Shopify-catalog** product. It does
+**not** prove two things production Wix ACP depends on. Validate both **before**
+flipping the store to `enabled` — the flip is what makes the production lane
+advertise ACP for the store.
+
+### Prereq A — a *Wix-store* product is quotable
+
+The money path re-quotes against the merchant catalog by `product_id`/`variant_id`.
+In production a buyer orders a **Wix** product, so confirm merch_efbc's Wix catalog
+is synced as orderable (the canary deliberately sidestepped this by reusing the
+Shopify product):
+
+```bash
+# a real product_id/variant_id from the WIX store (NOT the Shopify one)
+curl -sS -X POST https://api.pivota.cc/agent/v1/quotes/preview \
+  -H "X-API-Key: <ak_ key>" -H "Content-Type: application/json" \
+  -d '{"merchant_id":"<WIX_MERCHANT_ID>","items":[{"product_id":"<WIX_PID>","variant_id":"<WIX_VID>","quantity":1}],
+       "shipping_address":{ ... }}'
+```
+Expect `200` with a `quote_id` + line items. A quote error → the Wix catalog isn't
+orderable yet (sync/quotability gap) → fix before promoting.
+
+### Prereq B — Wix order-writeback actually lands an order in Wix
+
+Production ACP orders should reach the merchant's Wix system for fulfillment via
+`create_wix_order` — a path the canary does **not** exercise (off-session capture
+only creates a Pivota order + Stripe charge; it never writes to Wix). It needs, on
+the `merchant_stores` row:
+- **credentials**: Wix `api_key` (or OAuth `access_token`) + `site_id`, with
+  eCommerce **Orders write** scope — a read-only/catalog connection is NOT enough;
+- **`order_writeback_status`** in {`canary`, `enabled`} (+ a matching
+  `order_writeback_canary_order_id` while `canary`);
+- global `DISABLE_PLATFORM_ORDER_WRITEBACK` off.
+
+Prove it with a **writeback canary** first: set `order_writeback_status='canary'` +
+`order_writeback_canary_order_id=<the test order id>`, run a real order through, and
+confirm it appears in the merchant's Wix dashboard (a `wix_order_id` lands on the
+Pivota order). Only then promote to `enabled`.
+
+### Then flip the store to production-ready
 
 ```
 UPDATE merchant_stores
@@ -165,7 +204,24 @@ UPDATE merchant_stores
  WHERE merchant_id = '<WIX_MERCHANT_ID>' AND platform = 'wix' AND status IN ('active','connected');
 ```
 
-Then merge #1314. `resolve_merchant_capability(<WIX_MERCHANT_ID>)` will return
-`protocols: ["acp"]` (given a live PSP), and the production ACP lane activates —
-still fail-closed behind the kill-switch (`SUBMIT_PAYMENT` + allowlist) for any
-real charge. Every other Wix store stays dark until individually promoted.
+### Then merge #1314
+
+`resolve_merchant_capability(<WIX_MERCHANT_ID>)` returns `protocols: ["acp"]` (given
+a live PSP), and the production ACP lane activates — still fail-closed behind the
+kill-switch (`SUBMIT_PAYMENT` + allowlist) for any real charge. Every other Wix
+store stays dark until individually promoted.
+
+### Post-promotion smoke
+
+Run a real end-to-end order of a **Wix** product through the production lane and
+confirm **both** the Stripe capture **and** the order landing in the Wix dashboard.
+
+### Checklist
+
+- [ ] Money-path canary passed (§1–4), disarmed (§5)
+- [ ] Prereq A — a Wix-store product quotes `200` via `/quotes/preview`
+- [ ] Prereq B — Wix write creds present (`api_key`/`access_token` + `site_id`, Orders scope)
+- [ ] Prereq B — writeback canary lands an order in the Wix dashboard
+- [ ] Store flipped to `order_writeback_status='enabled'`
+- [ ] #1314 merged
+- [ ] Post-promotion — a Wix product ordered end-to-end (Stripe paid + order in Wix)
