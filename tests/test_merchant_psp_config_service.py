@@ -186,6 +186,68 @@ def test_evaluate_psp_readiness_blocks_missing_adyen_client_key() -> None:
     assert "Processor validation has not been run" in readiness["readiness_blockers"]
 
 
+# --- P-T2.3.7 item 4: Adyen live URL prefix ---
+
+def test_build_provider_connect_record_persists_adyen_live_url_prefix() -> None:
+    record = build_provider_connect_record(
+        "adyen",
+        api_key="live_adyen_key",
+        account_id="PivotaLiveECOM",
+        provider_config={"client_key": "pub_client_key", "live_url_prefix": "1797a-Pivota"},
+        environment="live",
+        validation_status="valid",
+    )
+
+    assert record["provider_config"]["live_url_prefix"] == "1797a-Pivota"
+    assert record["provider_summary"]["live_url_prefix_present"] is True
+
+
+def test_normalize_adyen_accepts_camel_and_endpoint_prefix_aliases() -> None:
+    for cfg in ({"liveUrlPrefix": "abc-Pivota"}, {"endpoint_prefix": "abc-Pivota"}):
+        record = build_provider_connect_record(
+            "adyen", api_key="live_adyen_key", account_id="ECOM",
+            provider_config={"client_key": "k", **cfg}, environment="live",
+        )
+        assert record["provider_config"]["live_url_prefix"] == "abc-Pivota"
+
+
+def test_evaluate_psp_readiness_not_gated_on_adyen_live_url_prefix() -> None:
+    # The live_url_prefix is needed only by the ACP off-session MIT capture (enforced
+    # in _AdyenCaptureAdapter). General live-charge readiness must NOT depend on it —
+    # else existing Adyen dropin/routing merchants would be wrongly dropped.
+    readiness = evaluate_psp_readiness(
+        "adyen",
+        status="active",
+        api_key="live_adyen_key",
+        account_id="PivotaLiveECOM",
+        provider_config={"merchant_account": "PivotaLiveECOM", "client_key": "pub"},
+        environment="live",
+        validation_status="valid",
+    )
+
+    assert "Adyen live URL prefix is missing" not in readiness["readiness_blockers"]
+    assert readiness["live_charge_ready"] is True
+
+
+def test_evaluate_psp_readiness_adyen_live_with_prefix_is_ready() -> None:
+    readiness = evaluate_psp_readiness(
+        "adyen",
+        status="active",
+        api_key="live_adyen_key",
+        account_id="PivotaLiveECOM",
+        provider_config={
+            "merchant_account": "PivotaLiveECOM",
+            "client_key": "pub",
+            "live_url_prefix": "1797a-Pivota",
+        },
+        environment="live",
+        validation_status="valid",
+    )
+
+    assert "Adyen live URL prefix is missing" not in readiness["readiness_blockers"]
+    assert readiness["live_charge_ready"] is True
+
+
 def test_evaluate_psp_readiness_blocks_mismatched_live_flag_with_test_stripe_key() -> None:
     readiness = evaluate_psp_readiness(
         "stripe",
