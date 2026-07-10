@@ -58,6 +58,20 @@ JUNK_URL_RE = re.compile(
 
 _REGION = re.compile(r"-(eu|ca|us|uk|au|intl|global|ukeu|uk-fr)$")
 _COPYNUM = re.compile(r"(-copy(-\d+)?|-\d{1,3})$")
+# A trailing number preceded by a unit/spec token is PRODUCT IDENTITY
+# (spf-45 vs spf-50, 100ml vs 50ml), not a clone counter. The Tier-3 eval
+# caught two live mis-merges (Merit "The Uniform"/"Effortless Set" SPF pairs)
+# where the bare -\d strip ate the SPF number — never strip these.
+_UNIT_NUMBER = re.compile(r"(spf|ml|g|gr|oz|mg|ct|pack|pcs|pk)[-_]?\d{1,4}$",
+                          re.IGNORECASE)
+
+
+def is_campaign_slug(slug: str) -> bool:
+    """Campaign-marked, UNLESS the trailing number is a unit/spec (spf-45,
+    100ml) — those are product identity, not clone counters."""
+    if _UNIT_NUMBER.search(slug):
+        return False
+    return bool(CAMPAIGN_MARKER_RE.search(slug))
 
 
 def base_slug(slug: str) -> str:
@@ -66,7 +80,8 @@ def base_slug(slug: str) -> str:
     while s != prev:
         prev = s
         s = _REGION.sub("", s)
-        s = _COPYNUM.sub("", s)
+        if not _UNIT_NUMBER.search(s):
+            s = _COPYNUM.sub("", s)
     return s
 
 
@@ -116,7 +131,7 @@ def strategy_campaign_clone(
             continue
         slugs = [url_slug(d.get("canonical_url")) for d in details]
         bases = {base_slug(s) for s in slugs}
-        all_campaign = all(bool(CAMPAIGN_MARKER_RE.search(s)) for s in slugs)
+        all_campaign = all(is_campaign_slug(s) for s in slugs)
         collapses = len(bases) == 1
         subject = [d["product_key"] for d in details]
         if collapses or all_campaign:
