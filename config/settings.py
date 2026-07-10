@@ -388,6 +388,25 @@ class Settings(BaseSettings):
     agent_acp_test_max_cents: int = int(
         os.getenv("AGENT_ACP_TEST_MAX_CENTS", "500") or "500"
     )
+    # P-T2.3.5 live-capture canary. Graduates the proven test-mode ACP capture to
+    # a REAL live-money off-session charge. Deliberately a SEPARATE, stricter gate
+    # from the test lane — its own default-off master switch, its own required
+    # per-merchant allowlist, and its own (low) amount cap — so turning on the test
+    # canary can never imply live money. A live capture engages ONLY when the
+    # kill-switch already permits, allow_live is ON, AND the merchant is on
+    # AGENT_ACP_LIVE_CAPTURE_MERCHANTS (empty = no merchant can go live; the master
+    # switch alone is inert). Requires a real live PSP + a real buyer payment token
+    # (the test pm_card_visa default is refused on the live lane).
+    agent_acp_allow_live_capture: bool = (
+        os.getenv("AGENT_ACP_ALLOW_LIVE_CAPTURE", "false").strip().lower()
+        in {"true", "1", "on", "yes"}
+    )
+    agent_acp_live_capture_merchants: frozenset[str] = frozenset(
+        m.strip() for m in os.getenv("AGENT_ACP_LIVE_CAPTURE_MERCHANTS", "").split(",") if m.strip()
+    )
+    agent_acp_live_max_cents: int = int(
+        os.getenv("AGENT_ACP_LIVE_MAX_CENTS", "200") or "200"
+    )
 
     # Readiness audit / thin-slice flags
     feature_readiness_audit: bool = os.getenv("FEATURE_READINESS_AUDIT", "false").lower() == "true"

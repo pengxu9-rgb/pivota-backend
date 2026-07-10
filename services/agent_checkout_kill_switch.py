@@ -206,3 +206,68 @@ def resolve_acp_test_capture(
         engaged=True, within_cap=within, max_cents=cap, amount_cents=amount_cents,
         reason="engaged" if within else "over_cap",
     )
+
+
+# --- P-T2.3.5: scoped LIVE-money capture (separate gate, low cap) --------------
+
+
+@dataclass(frozen=True)
+class AcpLiveCaptureDecision:
+    # `engaged` = the ACP LIVE-money capture lane applies: guarded protocol, the
+    # kill-switch already permits the charge, AGENT_ACP_ALLOW_LIVE_CAPTURE is ON,
+    # AND the merchant is on the live allowlist. In that lane a live PSP key is
+    # permitted (the test lane refuses it). `within_cap` gates the amount against
+    # the (low) live cap; an engaged-but-over-cap charge MUST be refused.
+    engaged: bool
+    within_cap: bool
+    max_cents: int
+    amount_cents: Optional[int]
+    reason: str
+
+    @property
+    def allow_live(self) -> bool:
+        return self.engaged and self.within_cap
+
+
+def resolve_acp_live_capture(
+    protocol: Optional[str],
+    *,
+    merchant_id: Optional[str],
+    amount_cents: Optional[int],
+    kill_switch_allowed: bool,
+    enabled: Optional[bool] = None,
+    merchants: Optional[frozenset] = None,
+    max_cents: Optional[int] = None,
+) -> AcpLiveCaptureDecision:
+    """Decide whether this charge runs in the ACP LIVE-money capture lane.
+
+    Engages only when ALL hold: guarded protocol, kill-switch already permitted,
+    AGENT_ACP_ALLOW_LIVE_CAPTURE on, AND the merchant is on the live allowlist. An
+    EMPTY live allowlist means no merchant can go live — the master switch alone is
+    inert, by construction — so this can never widen access the way a global flag
+    might. Kept separate from the test lane so enabling the test canary never
+    implies live money. Defaults read live settings; pass explicit values in tests.
+    """
+    en = settings.agent_acp_allow_live_capture if enabled is None else bool(enabled)
+    allowlist = (
+        settings.agent_acp_live_capture_merchants if merchants is None else frozenset(merchants)
+    )
+    cap = settings.agent_acp_live_max_cents if max_cents is None else int(max_cents)
+    mid = str(merchant_id or "").strip() or None
+    engaged = bool(
+        is_guarded_protocol(protocol)
+        and en
+        and kill_switch_allowed
+        and mid
+        and mid in allowlist
+    )
+    if not engaged:
+        return AcpLiveCaptureDecision(
+            engaged=False, within_cap=True, max_cents=cap,
+            amount_cents=amount_cents, reason="not_engaged",
+        )
+    within = amount_cents is not None and int(amount_cents) <= cap
+    return AcpLiveCaptureDecision(
+        engaged=True, within_cap=within, max_cents=cap, amount_cents=amount_cents,
+        reason="engaged" if within else "over_cap",
+    )
