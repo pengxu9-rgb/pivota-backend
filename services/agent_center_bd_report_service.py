@@ -7264,6 +7264,33 @@ def _wycw_factors(row: Dict[str, Any]) -> Optional[Dict[str, Any]]:
     return out if any(v is not None for v in out.values()) else None
 
 
+def _wedge_chase_lanes(report: Dict[str, Any]) -> Dict[str, Dict[str, Any]]:
+    """Normalized-query → lane for the per-SKU sideways wedge's CHASE verdicts
+    (recommended beachhead + sideways lanes). These are the queries the report's
+    next-best-action tells the operator to fight for — build_where_you_can_win
+    must not simultaneously file them under skip. do_not_chase_yet lanes are
+    deliberately absent (that verdict AGREES with skip)."""
+    nba = report.get("next_best_action") or {}
+    evidence = nba.get("evidence") if isinstance(nba, dict) else {}
+    wedge = (evidence or {}).get("sideways_wedge") or {}
+    if not isinstance(wedge, dict):
+        return {}
+    beachhead = wedge.get("recommended_beachhead_lane")
+    beachhead = beachhead if isinstance(beachhead, dict) else {}
+    beachhead_q = str(beachhead.get("query") or "").strip().lower()
+    out: Dict[str, Dict[str, Any]] = {}
+    for lane in [beachhead, *(wedge.get("sideways_wedge_lanes") or [])]:
+        if not isinstance(lane, dict):
+            continue
+        q = str(lane.get("query") or "").strip().lower()
+        if not q or q in out:
+            continue
+        entry = dict(lane)
+        entry["is_beachhead"] = bool(beachhead_q) and q == beachhead_q
+        out[q] = entry
+    return out
+
+
 def build_where_you_can_win(
     per_sku_reports: List[Dict[str, Any]],
     *,
@@ -7280,12 +7307,30 @@ def build_where_you_can_win(
     abandon (controlled by someone else, with what the AI actually said).
 
     targets = open lanes (winnable: demand + attribute fit + no owner), ranked by
-    opportunity_score. skip = head terms the brand loses to a controller that
-    actually have demand. Both deduped by query (best SKU kept). The per-target
-    action hands off to the create/distribute engine (Phase 3).
+    opportunity_score, PLUS the sideways-wedge chase lanes (see below). skip =
+    head terms the brand loses to a controller that actually have demand. Both
+    deduped by query (best SKU kept). The per-target action hands off to the
+    create/distribute engine (Phase 3).
+
+    One query, one verdict (P0-2, operator review 2026-07-10): the sideways
+    wedge is the report's #1 recommendation ("chase this lane first"), but this
+    builder used to file the very same query under `skip` whenever its lane had
+    an owner — the report argued with itself on its flagship move (live on both
+    the Mojawa and ANUKO pilot runs). The wedge owns the chase/skip decision:
+    its beachhead + sideways lanes are surfaced as targets (source
+    "sideways_wedge", probed queries — so the suggested_prompts disjointness
+    contract still holds) and are never listed in skip. Head prompts the wedge
+    files under do_not_chase_yet keep landing in skip — the two verdicts agree
+    there.
     """
     targets_by_q: Dict[str, Dict[str, Any]] = {}
     skip_by_q: Dict[str, Dict[str, Any]] = {}
+    # Global chase set: a query ANY SKU's wedge chose to chase must not land in
+    # skip via a sibling SKU's row (multi-SKU runs share sidewalk queries).
+    wedge_chase_all: set = set()
+    for report in per_sku_reports or []:
+        if isinstance(report, dict):
+            wedge_chase_all.update(_wedge_chase_lanes(report))
     for report in per_sku_reports or []:
         if not isinstance(report, dict):
             continue
@@ -7296,16 +7341,22 @@ def build_where_you_can_win(
             or report.get("sku_title")
             or report.get("sku_key")
         )
+        wedge_lanes = _wedge_chase_lanes(report)
         for row in opp.get("per_prompt") or []:
             if not isinstance(row, dict):
                 continue
             q = str(row.get("normalized_query") or row.get("query") or "").strip().lower()
             if not q:
                 continue
+            wedge_lane = wedge_lanes.get(q)
             if row.get("open_lane") is True:
                 score = float(row.get("opportunity_score") or 0)
                 prev = targets_by_q.get(q)
-                if prev is None or score > prev["opportunity_score"]:
+                # An open lane strictly outranks a wedge form of the same query
+                # (no owner beats contested); among open lanes, best score wins.
+                if prev is None or prev.get("source") == "sideways_wedge" or (
+                    score > float(prev.get("opportunity_score") or 0)
+                ):
                     targets_by_q[q] = {
                         "query": row.get("query") or q,
                         "normalized_query": q,
@@ -7319,8 +7370,39 @@ def build_where_you_can_win(
                         "opportunity_factors": _wycw_factors(row),
                         "action": "create_answer",
                     }
+            elif wedge_lane is not None:
+                score = float(
+                    wedge_lane.get("opportunity_score")
+                    or row.get("opportunity_score")
+                    or 0
+                )
+                prev = targets_by_q.get(q)
+                # An open-lane target for the same query (any SKU) outranks the
+                # wedge form — open lanes are strictly more winnable.
+                if prev is None or (
+                    prev.get("source") == "sideways_wedge"
+                    and score > float(prev.get("opportunity_score") or 0)
+                ):
+                    targets_by_q[q] = {
+                        "query": row.get("query") or q,
+                        "normalized_query": q,
+                        "sku": sku_name,
+                        "sku_key": report.get("sku_key"),
+                        "attribute_fit": row.get("attribute_fit"),
+                        "demand_state": row.get("demand_state"),
+                        "opportunity_score": score,
+                        "why_you_fit": _wycw_why_you_fit(row),
+                        "evidence": _wycw_evidence(row),
+                        "opportunity_factors": _wycw_factors(row),
+                        "action": "create_answer",
+                        "source": "sideways_wedge",
+                        "is_beachhead": bool(wedge_lane.get("is_beachhead")),
+                        "controllers": list(wedge_lane.get("controllers") or []),
+                        "selection_reason": wedge_lane.get("selection_reason"),
+                    }
             elif (
-                row.get("ownership_state") in _WYCW_LOSING_OWNERSHIP
+                q not in wedge_chase_all
+                and row.get("ownership_state") in _WYCW_LOSING_OWNERSHIP
                 and float(row.get("demand_signal") or 0) >= _WYCW_SKIP_DEMAND_FLOOR
             ):
                 demand = float(row.get("demand_signal") or 0)
