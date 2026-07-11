@@ -46,6 +46,16 @@ class CheckoutSessionRequest(BaseModel):
     cancel_url: str
 
 
+class PortalSessionRequest(BaseModel):
+    """Request body for creating a Stripe Billing Portal Session.
+
+    ``return_url`` is where Stripe sends the merchant back after they finish
+    managing their subscription (cancel plan, update/remove card, view invoices).
+    """
+
+    return_url: str
+
+
 class CreditTopUpRequest(BaseModel):
     """Manual direct/self-serve credit top-up request."""
 
@@ -578,6 +588,88 @@ async def create_billing_checkout_session(
         raise HTTPException(status_code=502, detail="Stripe Checkout Session returned no URL")
 
     return {"session_url": session_url, "session_id": session_id}
+
+
+@router.post("/api/billing/portal-session")
+async def create_billing_portal_session(
+    body: PortalSessionRequest,
+    merchant: Dict[str, Any] = Depends(require_approved_merchant),
+) -> Dict[str, str]:
+    """Open a Stripe Billing Portal so a merchant can self-serve their plan.
+
+    The portal is the merchant's off-ramp: from it they can cancel their
+    subscription (Stripe schedules it to stop at period end — no more surprise
+    monthly charges), update or remove their payment card, and view invoices.
+    It is Stripe-hosted, so we never handle raw card data.
+
+    Nothing new is needed on the receiving side: whatever the merchant does in
+    the portal arrives back through the existing ``customer.subscription.updated``
+    (which reads ``cancel_at_period_end`` / ``canceled_at``) and
+    ``customer.subscription.deleted`` webhook handlers, so the local
+    subscription row stays in sync automatically.
+    """
+
+    _require_platform_stripe_key()
+
+    merchant_id = _as_text(merchant.get("merchant_id"))
+    return_url = _as_text(body.return_url)
+    if not merchant_id:
+        raise HTTPException(status_code=400, detail="Authenticated merchant is missing merchant_id")
+    if not return_url:
+        raise HTTPException(status_code=400, detail="return_url is required")
+
+    contact_email = _as_text(merchant.get("contact_email"))
+    billing_row = await _fetch_merchant_billing_row(
+        database,
+        merchant_id=merchant_id,
+        contact_email=contact_email,
+        stripe_customer_id=None,
+    )
+    stripe_customer_id = _as_text((billing_row or {}).get("stripe_customer_id"))
+    if not stripe_customer_id:
+        # No Stripe customer => the merchant has never subscribed off-platform
+        # (free tier, App Store install, or never completed checkout). There is
+        # nothing to manage; 404 lets the portal render a "no subscription"
+        # state rather than surfacing a server error.
+        raise HTTPException(status_code=404, detail="No subscription to manage for this merchant")
+
+    try:
+        session = await asyncio.to_thread(
+            stripe_client.v1.billing_portal.sessions.create,
+            {"customer": stripe_customer_id, "return_url": return_url},
+        )
+    except Exception as exc:
+        # The Billing Portal requires a one-time configuration in the Stripe
+        # Dashboard (Settings -> Billing -> Customer portal). Until that exists,
+        # Stripe raises an InvalidRequestError mentioning "configuration" — call
+        # it out explicitly so the operator knows the fix is a dashboard toggle,
+        # not a code bug.
+        if "configuration" in str(exc).lower():
+            logger.error(
+                "Stripe Billing Portal is not configured for merchant_id=%s: %s",
+                merchant_id,
+                exc,
+            )
+            raise HTTPException(
+                status_code=500,
+                detail=(
+                    "The billing portal is not configured yet. An administrator "
+                    "must enable it in the Stripe Dashboard (Settings -> Billing "
+                    "-> Customer portal)."
+                ),
+            )
+        logger.warning(
+            "Stripe billing portal session failed for merchant_id=%s: %s",
+            merchant_id,
+            exc,
+        )
+        raise HTTPException(status_code=502, detail="Could not open the billing portal. Please try again.")
+
+    portal_url = _as_text(getattr(session, "url", None) or _stripe_object_to_dict(session).get("url"))
+    if not portal_url:
+        raise HTTPException(status_code=502, detail="Stripe Billing Portal returned no URL")
+
+    return {"portal_url": portal_url}
 
 
 @router.post("/api/credits/topup")
