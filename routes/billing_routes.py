@@ -306,6 +306,19 @@ def _is_missing_customer_error(exc: Exception) -> bool:
     return "no such customer" in str(getattr(exc, "user_message", None) or exc).lower()
 
 
+def _is_unique_violation(exc: Exception) -> bool:
+    """True when ``exc`` is a Postgres unique-violation (SQLSTATE 23505).
+
+    The databases/asyncpg stack surfaces the driver error; match on its
+    ``sqlstate``/``pgcode`` (or class name as a fallback) without importing the
+    driver here.
+    """
+    code = getattr(exc, "sqlstate", None) or getattr(exc, "pgcode", None)
+    if code == "23505":
+        return True
+    return "uniqueviolation" in type(exc).__name__.lower()
+
+
 async def _ensure_merchant_billing_row(
     db: Database, *, merchant_id: str, contact_email: str
 ) -> None:
@@ -317,11 +330,14 @@ async def _ensure_merchant_billing_row(
     subscriber otherwise 500s ("local merchants row missing") and orphans a
     Stripe customer. Provision the row here from the approved onboarding record.
 
-    Idempotent and safe to call on every checkout: a no-op once a row matches
-    (by ``contact_email``), and the ``WHERE NOT EXISTS`` guards a concurrent
-    double-click. The ``merchants`` table has no ``merchant_id`` column — it is
-    keyed by ``contact_email``, which is also how the Stripe webhook maps a
-    completed checkout back to the merchant.
+    Idempotent and concurrency-safe. Two guards cover a double-submit race:
+    ``WHERE NOT EXISTS`` skips the insert when a row already exists, and — if two
+    requests both pass that check before either commits — the
+    ``uq_merchants_lower_contact_email`` unique index (migration 180) makes the
+    losing insert raise a unique violation, which we swallow (the row we wanted
+    now exists; the caller re-reads it). The ``merchants`` table has no
+    ``merchant_id`` column — it is keyed by ``contact_email``, which is also how
+    the Stripe webhook maps a completed checkout back to the merchant.
     """
     if not contact_email:
         return
@@ -339,27 +355,41 @@ async def _ensure_merchant_billing_row(
     business_name = _as_text(onboarding.get("business_name")) or contact_email
     store_url = _as_text(onboarding.get("store_url")) or None
 
-    await db.execute(
-        """
-        INSERT INTO merchants (
-            business_name, legal_name, platform, store_url,
-            contact_email, status, verification_status,
-            current_tier, created_at, updated_at
+    try:
+        await db.execute(
+            """
+            INSERT INTO merchants (
+                business_name, legal_name, platform, store_url,
+                contact_email, status, verification_status,
+                current_tier, created_at, updated_at
+            )
+            SELECT
+                :business_name, :business_name, 'custom', :store_url,
+                :contact_email, 'active', 'verified',
+                'free', NOW(), NOW()
+            WHERE NOT EXISTS (
+                SELECT 1 FROM merchants WHERE LOWER(contact_email) = LOWER(:contact_email)
+            )
+            """,
+            {
+                "business_name": business_name,
+                "store_url": store_url,
+                "contact_email": contact_email,
+            },
         )
-        SELECT
-            :business_name, :business_name, 'custom', :store_url,
-            :contact_email, 'active', 'verified',
-            'free', NOW(), NOW()
-        WHERE NOT EXISTS (
-            SELECT 1 FROM merchants WHERE LOWER(contact_email) = LOWER(:contact_email)
+    except Exception as exc:  # noqa: BLE001 — narrowed via _is_unique_violation
+        # A concurrent checkout (double-submit) can win the race between the
+        # WHERE NOT EXISTS check above and this INSERT; with the unique index the
+        # losing insert raises 23505. The row now exists, so provisioning is
+        # satisfied — the caller re-reads billing_row. Re-raise anything else.
+        if not _is_unique_violation(exc):
+            raise
+        logger.info(
+            "merchants billing row for contact_email=%s created concurrently; "
+            "treating provisioning as satisfied.",
+            contact_email,
         )
-        """,
-        {
-            "business_name": business_name,
-            "store_url": store_url,
-            "contact_email": contact_email,
-        },
-    )
+        return
     logger.info(
         "Provisioned merchants billing row for merchant_id=%s from approved "
         "onboarding record (contact_email=%s).",
