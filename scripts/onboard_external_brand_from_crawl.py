@@ -470,16 +470,26 @@ async def _onboard(
     # agent_pdp_view + serving-eligibility recompute) when its own env flag
     # EXTERNAL_SEED_MIRROR_MAKE_SERVABLE is on (prod has it on) — so skipping the
     # script's later servable loop is NOT enough to keep a --no-serving onboard
-    # decision-grade only; the mirror would still mint serving artifacts and only
-    # serving_eligible=False (via the entity_unresolved / low_quality gates) would
-    # hold the row out. Under --no-serving we disable that mirror pass for THIS
-    # process so no serving artifacts are created at all — the invariant then holds
-    # by construction (no agent_pdp_view / no quality snapshot / no ips row), not by
-    # a fragile quality score. The unconditional attached_product_key back-link the
-    # mirror also does is serving-neutral (it just links seed↔product) and is kept.
+    # decision-grade only; the mirror would still mint serving artifacts, and the
+    # rows would only be held out by serving_eligible=False (the low_quality gate,
+    # since no quality snapshot is written). Under --no-serving we disable that
+    # mirror pass just for THIS mirror_apply call so no serving artifacts are
+    # created at all — the invariant then holds by construction (no agent_pdp_view
+    # / no quality snapshot / no ips row). Save+restore the flag so a later
+    # _onboard(serve=True) in the same process (a future batch driver) is not
+    # silently held out of serving. The unconditional attached_product_key
+    # back-link the mirror also does is serving-neutral (just links seed↔product).
+    _prev_make_servable = os.environ.get("EXTERNAL_SEED_MIRROR_MAKE_SERVABLE")
     if not serve:
         os.environ["EXTERNAL_SEED_MIRROR_MAKE_SERVABLE"] = "0"
-    inserted = await mirror_apply(max(50, len(cohort) * 3))
+    try:
+        inserted = await mirror_apply(max(50, len(cohort) * 3))
+    finally:
+        if not serve:
+            if _prev_make_servable is None:
+                os.environ.pop("EXTERNAL_SEED_MIRROR_MAKE_SERVABLE", None)
+            else:
+                os.environ["EXTERNAL_SEED_MIRROR_MAKE_SERVABLE"] = _prev_make_servable
     print(f"mirror inserted_catalog_products={inserted}")
     for p in cohort:
         merchant_id, product_key = keys[p["external_product_id"]]
@@ -487,8 +497,8 @@ async def _onboard(
         # Resolve identity scope BEFORE make_external_seed_servable recomputes
         # eligibility, so the row can actually reach serving_eligible. SKIPPED
         # under --no-serving: leaving pdp_scope=NULL holds the row at the
-        # `entity_unresolved` serving blocker, one of the four gates that keep a
-        # decision-grade-only onboard out of serving (see the early return below).
+        # `entity_unresolved` serving blocker — a backstop behind the operative
+        # `low_quality` gate (see the early return below).
         if serve:
             await _resolve_pdp_scope(p, product_key, merchant_id)
     # INCI + enrichment via the shared crawled-INCI ingest (scripts.ingest_crawled_inci,
@@ -512,13 +522,17 @@ async def _onboard(
         # DEPOSIT-eligible once the identity graph credits identity_confidence
         # (deposit reads catalog_row_trust, independent of serving). What we
         # deliberately DON'T do here is the serving half: no _resolve_pdp_scope
-        # (above) and no make_external_seed_servable (below), so no
-        # attached_product_key backlink, no product_quality_snapshot, and no
-        # agent_pdp_view row are produced. The row therefore trips all four
-        # serving blockers — entity_unresolved + no_seed + low_quality + no_image
-        # (services.index_pipeline_state_service) — and never becomes servable.
-        # Use this for a merchant we want measured/deposited but held out of
-        # search/PLP (e.g. the electronics pilot's Mojawa onboard).
+        # (above) and no make_external_seed_servable (via the mirror or the loop
+        # below), so no product_quality_snapshot and no agent_pdp_view row are
+        # produced. (The mirror's attached_product_key backlink IS unconditional,
+        # so `no_seed` is cleared — but the serving-eligibility ladder is
+        # first-fail-wins and `low_quality` fires first, since no quality snapshot
+        # exists; services.index_pipeline_state_service.) The row therefore stays
+        # serving_eligible=False and never becomes servable — robustly, because
+        # low_quality depends directly on the skipped make_servable pass, so
+        # serving stays off even if pdp_scope were later resolved. Use this for a
+        # merchant we want measured/deposited but held out of search/PLP (e.g. the
+        # electronics pilot's Mojawa onboard).
         print(
             f"no-serving: {len(cohort)} row(s) onboarded decision-grade only "
             f"(serving artifacts intentionally skipped)"

@@ -100,6 +100,15 @@ async def _trust_preflight(product_keys: List[str]) -> Dict[str, Dict[str, Any]]
 
 
 def _depositable(entry: Optional[Dict[str, Any]], threshold: float) -> bool:
+    """Pre-flight LOWER-BOUND approximation of the real deposit gate
+    (services.catalog_identity.resolve_deposit_content_key), which opens on
+    gtin | identity_high_conf | reviewed. This checks only the identity_high_conf
+    basis (identity_confidence >= threshold) — the live basis for a --no-serving
+    crawl-onboard, where no agent_pdp_view.gtin13 exists (GTIN basis can't fire)
+    and nothing is reviewed. On a serving merchant it may false-refuse a
+    GTIN-only key (use --force) or false-pass a high-confidence key with a NULL
+    content_key (the run then deposits 0). For exactness on mixed cohorts, swap
+    in resolve_deposit_content_key_for_row."""
     if not entry:
         return False
     conf = entry.get("identity_confidence")

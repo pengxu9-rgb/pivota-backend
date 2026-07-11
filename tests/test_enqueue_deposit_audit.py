@@ -91,3 +91,93 @@ def test_mixed_cohort_depositable_count():
     keys = ["pk_ok", "pk_low", "pk_missing"]
     depositable = [k for k in keys if enq._depositable(trust.get(k), threshold)]
     assert depositable == ["pk_ok"]
+
+
+# ---- _drive: the load-bearing enqueue contract (launch payload + refusal) ----
+
+import argparse  # noqa: E402
+
+
+class _DriveDB:
+    """Fake app DB for _drive: connect/disconnect + the two fetch_all queries
+    (catalog_products key resolution, catalog_row_trust preflight)."""
+
+    def __init__(self, keys, conf_by_key):
+        self._keys = keys
+        self._conf = conf_by_key
+
+    async def connect(self):
+        return None
+
+    async def disconnect(self):
+        return None
+
+    async def fetch_all(self, sql, params=None):
+        if "catalog_row_trust" in sql:
+            return [
+                {"product_key": k, "identity_confidence": c, "identity_status": "approved"}
+                for k, c in self._conf.items()
+            ]
+        if "catalog_products" in sql:
+            return [{"product_key": k} for k in self._keys]
+        return []
+
+
+def _drive_args(**over):
+    base = dict(
+        merchant_id="merch_obs_x", product_key=None,
+        prompts_per_sku=12, apply=False, force=False,
+    )
+    base.update(over)
+    return argparse.Namespace(**base)
+
+
+async def test_drive_apply_enqueues_per_sku_non_synthetic_no_debits(monkeypatch):
+    monkeypatch.setattr(enq, "database", _DriveDB(["pk1"], {"pk1": 0.92}))
+    captured = {}
+
+    async def fake_enqueue(*, merchant_id, product_keys, subject_type, request_options_jsonb):
+        captured.update(
+            merchant_id=merchant_id, product_keys=product_keys,
+            subject_type=subject_type, request_options_jsonb=request_options_jsonb,
+        )
+        return "run_123"
+
+    monkeypatch.setattr("db.merchant_audit_runs.enqueue_audit_run", fake_enqueue)
+    await enq._drive(_drive_args(apply=True))
+
+    assert captured["merchant_id"] == "merch_obs_x"
+    assert captured["product_keys"] == ["pk1"]
+    assert captured["subject_type"] == "merchant"
+    launch = captured["request_options_jsonb"]["launch"]
+    # per-SKU mode (builds authority_map.skus -> citations deposit)...
+    assert launch["audit_mode"] == "per_sku"
+    # ...NOT synthetic (else is_synthetic short-circuits persist_canonical_evidence)...
+    assert "synthetic_products" not in launch
+    # ...and no debit keys (observed seller has no wallet).
+    assert "debited" not in launch
+    assert not any(k.startswith("estimated_") for k in launch)
+
+
+async def test_drive_refuses_when_zero_depositable(monkeypatch):
+    monkeypatch.setattr(enq, "database", _DriveDB(["pk1"], {"pk1": 0.50}))  # < 0.85
+
+    async def must_not_enqueue(**_):
+        raise AssertionError("must not enqueue when 0 depositable")
+
+    monkeypatch.setattr("db.merchant_audit_runs.enqueue_audit_run", must_not_enqueue)
+    with pytest.raises(SystemExit):
+        await enq._drive(_drive_args(apply=True))
+
+
+async def test_drive_force_enqueues_despite_zero_depositable(monkeypatch):
+    monkeypatch.setattr(enq, "database", _DriveDB(["pk1"], {"pk1": 0.50}))
+    called = {}
+
+    async def fake_enqueue(**_):
+        called["enqueued"] = True
+        return "run_x"
+
+    monkeypatch.setattr("db.merchant_audit_runs.enqueue_audit_run", fake_enqueue)
+    await enq._drive(_drive_args(apply=True, force=True))
+    assert called.get("enqueued") is True
