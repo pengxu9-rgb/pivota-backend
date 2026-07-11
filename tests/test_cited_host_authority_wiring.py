@@ -136,3 +136,89 @@ def test_submission_only_host_renders_paste_draft_for_win_plan():
     assert draft["recipient_email"] is None
     assert draft["submission_url"] == "https://www.rtings.com/tv/suggestions"
     assert "Mojawa" in draft["body"]
+
+
+# --- Electronics/sport-audio pilot batch 2: hosts left `unclassified` in the
+#     Mojawa deposit run (69782ea5) that the registry now classifies. ---
+
+def test_electronics_editorial_review_hosts_classified():
+    # Tier-1 / niche tech-review sites cited in the electronics pilot but absent
+    # from the registry until now — they came back type="unclassified" so their
+    # citations counted toward neither findability nor endorsement.
+    for host in [
+        "pcmag.com", "headphonesaddict.com", "headfonia.com",
+        "techgearlab.com", "techhive.com",
+    ]:
+        r = C.classify_host(host)
+        assert r["type"] == "editorial", host
+        assert r.get("subtype") == "review_site", host
+
+
+def test_sport_review_hosts_classified_as_editorial_endorsement():
+    # A bone-conduction / sport-audio brand (Mojawa) is recommended in running /
+    # cycling / tri / swim gear roundups; those niche sport-review hosts must
+    # classify as editorial so the recommendation reads as an endorsement, not
+    # an unclassified "neither" signal.
+    from services.cited_host_classifier import (
+        merchant_relative_role, is_endorsement_role,
+    )
+    for host in [
+        "believeintherun.com", "bikeradar.com", "cyclingweekly.com", "road.cc",
+        "220triathlon.com", "swimswam.com", "mensfitness.co.uk",
+        "velo.outsideonline.com", "averagejoecyclist.com",
+    ]:
+        r = C.classify_host(host)
+        assert r["type"] == "editorial", host
+        role = merchant_relative_role(r["type"], first_party=False, is_competitor=False)
+        assert is_endorsement_role(role), host
+
+
+def test_officedepot_classifies_as_retailer():
+    r = C.classify_host("officedepot.com")
+    assert r["type"] == "retailer", r
+
+
+def test_competitor_brand_storefronts_flag_is_competitor():
+    # Brand-owned competitor storefronts (Shokz/Soundcore/Underwater Audio/
+    # Voistek) now carry registry type="brand", so the deposit path's FIRST pass
+    # (`_host_is_competitor`) flags them — no longer dependent on the engine
+    # happening to NAME the brand as a competitor in that run.
+    from services.agent_center_bd_report_service import (
+        _host_is_competitor, _classify_authority_host, _citation_role,
+    )
+    from services.cited_host_classifier import ROLE_COMPETITOR
+    for host in ["shokz.com", "soundcore.com", "underwateraudio.com", "voistek.com"]:
+        raw = (C.classify_host(host).get("type") or "").lower()
+        assert raw == "brand", host
+        assert _host_is_competitor(raw, first_party=False) is True, host
+        # And the folded citation role is `competitor` (counts toward neither
+        # findability nor endorsement — a rival's store is not the merchant's).
+        role = _citation_role(_classify_authority_host(host), False, True)
+        assert role == ROLE_COMPETITOR, host
+
+
+def test_competitor_brand_not_flagged_when_first_party():
+    # The merchant auditing its OWN brand store is never flagged a competitor:
+    # `_host_is_competitor` short-circuits on first_party. Guards against a Shokz
+    # audit tagging shokz.com as its own competitor.
+    from services.agent_center_bd_report_service import _host_is_competitor
+    raw = (C.classify_host("shokz.com").get("type") or "").lower()
+    assert _host_is_competitor(raw, first_party=True) is False
+
+
+def test_registry_additions_present_with_valid_shape():
+    # Sanity that the hand-formatted registry still parses after the batch-2
+    # additions and the new hosts are present with a documented type. (The
+    # insertions-only guarantee itself is enforced by the git numstat, not here.)
+    import json
+    from pathlib import Path
+    doc = json.loads(
+        (Path(__file__).resolve().parent.parent / "data" / "cited_host_registry.json").read_text()
+    )
+    hosts = doc["hosts"]
+    for h in ["shokz.com", "soundcore.com", "pcmag.com", "officedepot.com", "swimswam.com"]:
+        assert h in hosts, h
+        assert hosts[h]["type"] in {
+            "editorial", "retailer", "marketplace", "video", "community",
+            "forum", "social", "brand", "cdn", "unclassified",
+        }, h
