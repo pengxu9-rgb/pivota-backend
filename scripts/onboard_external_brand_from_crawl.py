@@ -254,16 +254,59 @@ async def _resolve_seller_and_key(p: Dict[str, Any]) -> tuple[str, str]:
     return merchant_id, make_catalog_product_key(merchant_id, PLATFORM, p["external_product_id"])
 
 
+def build_default_seed_variant(p: Dict[str, Any]) -> Dict[str, Any]:
+    """Minimal sellable variant from the crawl row's own price/availability.
+
+    The external-referral runtime gate (services/external_referral_readiness.py)
+    treats `zero_variants` as a BLOCKER, so a seed without a variants array is
+    dropped from every agent-search response at build time even when recalled.
+    Crawled D2C PDPs are single-offer pages: the row-level price/currency/
+    availability IS the sellable unit, so author it as one explicit default
+    variant instead of leaving the seed permanently blocked. (Live incident
+    2026-07-11: all 2,151 external_brand_crawl seeds carried no variants ->
+    the whole cohort was invisible to find_products_multi.)
+    """
+    epid = str(p.get("external_product_id") or "").strip()
+    variant_id = f"{epid}-default" if epid else "seed-variant-default"
+    return {
+        "id": variant_id,
+        "variant_id": variant_id,
+        "sku": variant_id,
+        "title": p.get("title") or "Default",
+        "price_amount": p.get("price_amount"),
+        "price": p.get("price_amount"),
+        "currency": (p.get("price_currency") or "USD").strip() or "USD",
+        "availability": "in_stock",
+        "image_url": p.get("image_url"),
+        "source": "crawl_default_variant_v1",
+    }
+
+
 async def _upsert_seed(
     p: Dict[str, Any],
     *,
     seller_ref: Optional[str],
     seed_kind: Optional[str],
 ) -> None:
+    from datetime import datetime, timezone
+
     seed_data = {
         "snapshot": {
             "title": p["title"], "description": p.get("description"), "brand": p.get("brand"),
             "product_type": p.get("product_type"), "category": p.get("category_kind"),
+            # Sellable unit + extraction time. variants: see
+            # build_default_seed_variant (zero_variants runtime blocker).
+            # extracted_at: the stale_snapshot gate (7d) falls back to
+            # updated_at when absent, which any metadata write silently
+            # extends — stamp the real extraction event instead so freshness
+            # is auditable. Crawl cohorts carry it as extracted_at when the
+            # crawler recorded one; onboarding time is the honest floor
+            # otherwise (this runner ingests fresh crawl output).
+            "variants": [build_default_seed_variant(p)],
+            "extracted_at": (
+                str(p.get("extracted_at") or "").strip()
+                or datetime.now(timezone.utc).isoformat()
+            ),
         },
         "pdp_description_raw": p.get("description"),
         "pdp_ingredients_raw": p.get("raw_inci"),
