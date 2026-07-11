@@ -1,6 +1,15 @@
 """Onboard a crawled (external-seed) brand's products into the live catalog so
 they land BOTH decision-grade and SERVABLE, in one pass.
 
+--no-serving mode: onboard DECISION-GRADE ONLY. Writes identity + mirror +
+category/offer + INCI (so the rows are audit- and deposit-eligible once the
+identity graph credits trust — the deposit gate reads catalog_row_trust,
+independent of serving) but SKIPS the serving half (_resolve_pdp_scope +
+make_external_seed_servable). The rows then trip all four serving blockers
+(entity_unresolved + no_seed + low_quality + no_image) and never enter
+search/PLP. Use to measure/deposit a brand held out of serving (the electronics
+pilot's Mojawa onboard).
+
 Complements scripts/ingest_crawled_inci.py (#855), which adds INCI to products
 that already exist by product_key. This runner is the other entry point: it
 CREATES the external-seed catalog product from crawl output and walks it all the
@@ -38,6 +47,7 @@ seed.price_currency to catalog_offers, so threading them here is sufficient.
 
 Usage:
   python -m scripts.onboard_external_brand_from_crawl --file cohort.json --apply
+  python -m scripts.onboard_external_brand_from_crawl --file cohort.json --apply --no-serving
 """
 
 from __future__ import annotations
@@ -45,6 +55,7 @@ from __future__ import annotations
 import argparse
 import asyncio
 import json
+import os
 import re
 import sys
 from pathlib import Path
@@ -422,7 +433,12 @@ async def _suppress_dropped_listings(dropped: List[Dict[str, Any]]) -> int:
     return suppressed
 
 
-async def _onboard(cohort: List[Dict[str, Any]], dropped: List[Dict[str, Any]]) -> None:
+async def _onboard(
+    cohort: List[Dict[str, Any]],
+    dropped: List[Dict[str, Any]],
+    *,
+    serve: bool = True,
+) -> None:
     # Collapse duplicate Shopify listings BEFORE anything else: deactivate the
     # skipped listings' seeds + suppress their mirror rows (must precede
     # mirror_apply so the mirror doesn't recreate them — the mirror only inserts
@@ -450,14 +466,41 @@ async def _onboard(cohort: List[Dict[str, Any]], dropped: List[Dict[str, Any]]) 
             primary_platform=PLATFORM,
         )
         await _upsert_seed(p, seller_ref=seller_ref, seed_kind=seed_kind)
-    inserted = await mirror_apply(max(50, len(cohort) * 3))
+    # mirror_apply ITSELF runs make_external_seed_servable (quality snapshot +
+    # agent_pdp_view + serving-eligibility recompute) when its own env flag
+    # EXTERNAL_SEED_MIRROR_MAKE_SERVABLE is on (prod has it on) — so skipping the
+    # script's later servable loop is NOT enough to keep a --no-serving onboard
+    # decision-grade only; the mirror would still mint serving artifacts, and the
+    # rows would only be held out by serving_eligible=False (the low_quality gate,
+    # since no quality snapshot is written). Under --no-serving we disable that
+    # mirror pass just for THIS mirror_apply call so no serving artifacts are
+    # created at all — the invariant then holds by construction (no agent_pdp_view
+    # / no quality snapshot / no ips row). Save+restore the flag so a later
+    # _onboard(serve=True) in the same process (a future batch driver) is not
+    # silently held out of serving. The unconditional attached_product_key
+    # back-link the mirror also does is serving-neutral (just links seed↔product).
+    _prev_make_servable = os.environ.get("EXTERNAL_SEED_MIRROR_MAKE_SERVABLE")
+    if not serve:
+        os.environ["EXTERNAL_SEED_MIRROR_MAKE_SERVABLE"] = "0"
+    try:
+        inserted = await mirror_apply(max(50, len(cohort) * 3))
+    finally:
+        if not serve:
+            if _prev_make_servable is None:
+                os.environ.pop("EXTERNAL_SEED_MIRROR_MAKE_SERVABLE", None)
+            else:
+                os.environ["EXTERNAL_SEED_MIRROR_MAKE_SERVABLE"] = _prev_make_servable
     print(f"mirror inserted_catalog_products={inserted}")
     for p in cohort:
         merchant_id, product_key = keys[p["external_product_id"]]
         await _set_category_and_offer(p, product_key)
         # Resolve identity scope BEFORE make_external_seed_servable recomputes
-        # eligibility, so the row can actually reach serving_eligible.
-        await _resolve_pdp_scope(p, product_key, merchant_id)
+        # eligibility, so the row can actually reach serving_eligible. SKIPPED
+        # under --no-serving: leaving pdp_scope=NULL holds the row at the
+        # `entity_unresolved` serving blocker — a backstop behind the operative
+        # `low_quality` gate (see the early return below).
+        if serve:
+            await _resolve_pdp_scope(p, product_key, merchant_id)
     # INCI + enrichment via the shared crawled-INCI ingest (scripts.ingest_crawled_inci,
     # #855) -- one upsert-raw_inci + enrich_and_persist path for both crawl tools.
     # category_kind is set above first (enrichment reads it).
@@ -471,6 +514,30 @@ async def _onboard(cohort: List[Dict[str, Any]], dropped: List[Dict[str, Any]]) 
     ]
     report = await ingest_crawled_inci_items(inci_items, dry_run=False, db=database)
     print(f"inci ingest: written={report.get('inci_written')} actives={report.get('actives_filled')} skipped={report.get('skipped')}")
+    if not serve:
+        # Decision-grade-only onboard (--no-serving). Everything above is written:
+        # the per-brand observed seller identity, the external_product_seeds rows,
+        # the catalog_products + catalog_skus mirror (with content_key), the
+        # category/offer, and INCI/enrichment. Those make the rows AUDIT- and
+        # DEPOSIT-eligible once the identity graph credits identity_confidence
+        # (deposit reads catalog_row_trust, independent of serving). What we
+        # deliberately DON'T do here is the serving half: no _resolve_pdp_scope
+        # (above) and no make_external_seed_servable (via the mirror or the loop
+        # below), so no product_quality_snapshot and no agent_pdp_view row are
+        # produced. (The mirror's attached_product_key backlink IS unconditional,
+        # so `no_seed` is cleared — but the serving-eligibility ladder is
+        # first-fail-wins and `low_quality` fires first, since no quality snapshot
+        # exists; services.index_pipeline_state_service.) The row therefore stays
+        # serving_eligible=False and never becomes servable — robustly, because
+        # low_quality depends directly on the skipped make_servable pass, so
+        # serving stays off even if pdp_scope were later resolved. Use this for a
+        # merchant we want measured/deposited but held out of search/PLP (e.g. the
+        # electronics pilot's Mojawa onboard).
+        print(
+            f"no-serving: {len(cohort)} row(s) onboarded decision-grade only "
+            f"(serving artifacts intentionally skipped)"
+        )
+        return
     for p in cohort:
         _merchant_id, product_key = keys[p["external_product_id"]]
         summary = await make_external_seed_servable(
@@ -520,9 +587,11 @@ async def _drive(args: argparse.Namespace) -> None:
             file=sys.stderr,
         )
     kept, dropped, decisions = dedupe_cohort(cohort)
+    serve = not args.no_serving
     print(
         f"{'APPLY' if args.apply else 'DRY'} :: {len(cohort)} products "
-        f"({len(kept)} canonical, {len(dropped)} duplicate listing(s) collapsed)"
+        f"({len(kept)} canonical, {len(dropped)} duplicate listing(s) collapsed) "
+        f"[posture: {'serving' if serve else 'decision-grade only (no serving)'}]"
     )
     for canonical, drops in decisions:
         print(
@@ -538,7 +607,9 @@ async def _drive(args: argparse.Namespace) -> None:
                 f"  would onboard {p.get('external_product_id')} "
                 f"({p.get('category_kind')}) "
                 f"{p.get('price_amount')} {p.get('price_currency') or 'USD'} "
-                f"market={p.get('market') or 'US'} :: {p.get('title')}"
+                f"market={p.get('market') or 'US'} "
+                f"{'[decision-grade only]' if not serve else '[+serving]'} "
+                f":: {p.get('title')}"
             )
         for p in dropped:
             print(
@@ -548,7 +619,7 @@ async def _drive(args: argparse.Namespace) -> None:
         return
     await database.connect()
     try:
-        await _onboard(kept, dropped)
+        await _onboard(kept, dropped, serve=serve)
     finally:
         await database.disconnect()
 
@@ -565,6 +636,17 @@ def main() -> int:
             "ISO timestamp of the crawl that produced this cohort file; stamped as "
             "snapshot.extracted_at on items that lack their own. Without it, items "
             "missing extracted_at get RUN time (only honest for fresh crawl output)."
+        ),
+    )
+    parser.add_argument(
+        "--no-serving",
+        action="store_true",
+        help=(
+            "decision-grade-only onboard: write identity + mirror + category/offer "
+            "+ INCI (so the rows are audit/deposit-eligible) but SKIP the serving "
+            "half (_resolve_pdp_scope + make_external_seed_servable), so the rows "
+            "never become servable. Use to measure/deposit a brand while holding it "
+            "out of search/PLP (e.g. the electronics pilot's Mojawa onboard)."
         ),
     )
     asyncio.run(_drive(parser.parse_args()))
