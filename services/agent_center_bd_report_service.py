@@ -5085,6 +5085,19 @@ async def load_per_sku_probe_runs(
             continue
         seen.add(key)
         out.append(candidate)
+    # P2-5: unwrap Vertex grounding redirectors to the real publisher URLs
+    # BEFORE any builder consumes these runs, so every operator-facing surface
+    # (failing_prompts, verbatim evidence, win-plan grounds_in) stores a
+    # clickable, permanent URL instead of the opaque, expiring redirector.
+    # Best-effort + process-cached; unresolvable URIs stay as-is.
+    try:
+        from services.grounding_redirect_resolver import (
+            resolve_grounding_redirects_in_runs,
+        )
+
+        await resolve_grounding_redirects_in_runs(_flatten_probe_runs(out))
+    except Exception as exc:  # noqa: BLE001 — never sink the report build
+        logger.warning("grounding redirect unwrap skipped: %s", exc)
     return out
 
 
