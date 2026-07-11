@@ -147,3 +147,110 @@ def test_opportunity_factors_curated_and_forwarded():
     assert t["opportunity_factors"] == {
         "attribute_fit": 0.9, "demand": 0.7, "low_competition": 0.8, "intent": 0.85,
     }
+
+
+# --- P0-2 (operator review 2026-07-10): one query, one verdict — the sideways
+# wedge owns chase/skip; its lanes must never appear in skip. Live contradiction
+# on both pilot runs: Mojawa d1e80bc6 recommended beachhead "ip67 waterproof
+# bone conduction headphones open-ear" while the same query sat in skip
+# (retailer-owned); ANUKO 549ace84 same with "green tea hair butter".
+
+def _report_with_wedge(sku_name, sku_key, rows, wedge):
+    report = _report(sku_name, sku_key, rows)
+    report["next_best_action"] = {"evidence": {"sideways_wedge": wedge}}
+    return report
+
+
+def test_wedge_beachhead_never_lands_in_skip():
+    rows = [
+        # the Mojawa shape: contested sidewalk lane, retailer-owned, real demand
+        {"query": "ip67 waterproof bone conduction headphones open-ear",
+         "normalized_query": "ip67 waterproof bone conduction headphones open-ear",
+         "open_lane": False, "ownership_state": "retailer-owned", "demand_signal": 1.0,
+         "opportunity_score": 14.06, "attribute_fit": 1.0, "demand_state": "contested",
+         "who_owns": "target.com", "cited_evidence": {"competitors_named": ["Shokz"]}},
+        # a genuine skip: head term, publisher-owned
+        {"query": "best headphones", "normalized_query": "best headphones",
+         "open_lane": False, "ownership_state": "publisher-owned", "demand_signal": 1.0,
+         "who_owns": "techradar.com", "cited_evidence": {"competitors_named": ["Sony"]}},
+    ]
+    wedge = {
+        "recommended_beachhead_lane": {
+            "query": "ip67 waterproof bone conduction headphones open-ear",
+            "opportunity_score": 14.06, "controllers": ["target.com", "mojawa.com"],
+            "selection_reason": "stronger merchant-fit evidence",
+        },
+        "sideways_wedge_lanes": [
+            {"query": "ip67 waterproof bone conduction headphones open-ear",
+             "opportunity_score": 14.06, "controllers": ["target.com", "mojawa.com"]},
+        ],
+        "do_not_chase_yet": [{"query": "best headphones"}],
+    }
+    out = build_where_you_can_win([_report_with_wedge("Purra Run", "sku_run", rows, wedge)])
+    skip_queries = [s["query"] for s in out["skip"]]
+    target_queries = [t["query"] for t in out["targets"]]
+    # the flagship recommendation is a target, not a skip
+    assert "ip67 waterproof bone conduction headphones open-ear" in target_queries
+    assert "ip67 waterproof bone conduction headphones open-ear" not in skip_queries
+    # do_not_chase head terms still skip (the two verdicts agree there)
+    assert skip_queries == ["best headphones"]
+    wedge_target = out["targets"][0]
+    assert wedge_target["source"] == "sideways_wedge"
+    assert wedge_target["is_beachhead"] is True
+    assert wedge_target["action"] == "create_answer"
+    assert wedge_target["controllers"] == ["target.com", "mojawa.com"]
+
+
+def test_wedge_lane_from_sibling_sku_suppresses_cross_sku_skip():
+    # SKU A's wedge chases the lane; SKU B probed the same query and lost it —
+    # B's row must not resurrect the skip verdict.
+    lane_q = "green tea hair butter"
+    row_contested = {
+        "query": lane_q, "normalized_query": lane_q, "open_lane": False,
+        "ownership_state": "retailer-owned", "demand_signal": 1.0,
+        "opportunity_score": 9.0, "attribute_fit": 1.0, "demand_state": "contested",
+        "who_owns": "oliveyoung.com", "cited_evidence": {},
+    }
+    wedge = {"recommended_beachhead_lane": {"query": lane_q, "opportunity_score": 9.0},
+             "sideways_wedge_lanes": [], "do_not_chase_yet": []}
+    report_a = _report_with_wedge("Hair Butter", "sku_a", [row_contested], wedge)
+    report_b = _report("Sibling", "sku_b", [dict(row_contested)])
+    out = build_where_you_can_win([report_a, report_b])
+    assert [s["query"] for s in out["skip"]] == []
+    assert [t["query"] for t in out["targets"]] == [lane_q]
+    assert out["targets"][0]["sku"] == "Hair Butter"
+
+
+def test_open_lane_outranks_wedge_form_of_same_query():
+    q = "vegan hair butter"
+    wedge = {"recommended_beachhead_lane": {"query": q, "opportunity_score": 50.0},
+             "sideways_wedge_lanes": [], "do_not_chase_yet": []}
+    report_a = _report_with_wedge("A", "sku_a", [
+        {"query": q, "normalized_query": q, "open_lane": False,
+         "ownership_state": "retailer-owned", "demand_signal": 1.0,
+         "opportunity_score": 50.0, "cited_evidence": {}},
+    ], wedge)
+    report_b = _report("B", "sku_b", [
+        {"query": q, "normalized_query": q, "open_lane": True,
+         "opportunity_score": 10.0, "attribute_fit": 0.9,
+         "demand_state": "open-lane", "attribute_basis": ["vegan"]},
+    ])
+    out = build_where_you_can_win([report_a, report_b])
+    assert len(out["targets"]) == 1
+    t = out["targets"][0]
+    # open-lane form wins even with a lower score
+    assert t["sku"] == "B"
+    assert "source" not in t
+
+
+def test_reports_without_wedge_keep_legacy_behavior():
+    reports = [
+        _report("X", "sku_x", [
+            {"query": "best vitamin c serum", "normalized_query": "best vitamin c serum",
+             "open_lane": False, "ownership_state": "retailer-owned", "demand_signal": 0.9,
+             "who_owns": "sephora.com", "cited_evidence": {"competitors_named": ["BrandA"]}},
+        ]),
+    ]
+    out = build_where_you_can_win(reports)
+    assert [s["query"] for s in out["skip"]] == ["best vitamin c serum"]
+    assert out["targets"] == []
