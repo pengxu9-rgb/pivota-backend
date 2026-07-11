@@ -499,6 +499,26 @@ def _load(args: argparse.Namespace) -> List[Dict[str, Any]]:
 
 async def _drive(args: argparse.Namespace) -> None:
     cohort = _load(args)
+    # extracted_at honesty contract (review finding on the variants fix):
+    # snapshot.extracted_at is what the 7d stale_snapshot serving gate audits,
+    # so re-running a STALE cohort file must not mint fresh-looking extraction
+    # events. Cohort items may carry their own extracted_at; --extracted-at
+    # stamps a caller-asserted crawl time onto items that lack one; otherwise
+    # _upsert_seed falls back to run time — only honest for freshly-crawled
+    # input, hence the loud warning.
+    run_extracted_at = str(getattr(args, "extracted_at", "") or "").strip()
+    missing_ts = [p for p in cohort if not str(p.get("extracted_at") or "").strip()]
+    if run_extracted_at:
+        for p in missing_ts:
+            p["extracted_at"] = run_extracted_at
+    elif missing_ts:
+        print(
+            f"WARNING: {len(missing_ts)}/{len(cohort)} cohort items carry no extracted_at; "
+            "their snapshot.extracted_at will be stamped with RUN TIME. Only proceed if "
+            "this file is fresh crawl output — for older files pass --extracted-at "
+            "<ISO timestamp of the actual crawl>.",
+            file=sys.stderr,
+        )
     kept, dropped, decisions = dedupe_cohort(cohort)
     print(
         f"{'APPLY' if args.apply else 'DRY'} :: {len(cohort)} products "
@@ -537,6 +557,16 @@ def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--file", help="JSON array file (default: stdin)")
     parser.add_argument("--apply", action="store_true", help="write (default: dry-run)")
+    parser.add_argument(
+        "--extracted-at",
+        dest="extracted_at",
+        default="",
+        help=(
+            "ISO timestamp of the crawl that produced this cohort file; stamped as "
+            "snapshot.extracted_at on items that lack their own. Without it, items "
+            "missing extracted_at get RUN time (only honest for fresh crawl output)."
+        ),
+    )
     asyncio.run(_drive(parser.parse_args()))
     return 0
 
