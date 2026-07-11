@@ -2721,6 +2721,35 @@ def _raw_pdp_content_fraction(
     return min(1.0, fraction)
 
 
+def _raw_vertical_attribute_signals(product: Dict[str, Any]) -> List[str]:
+    """Category-specific detail signals readable straight off the fetched PDP
+    (attributes_raw + description), for SKUs whose curated vertical artifacts
+    (electronics_meta / beauty tables / fashion fields) don't exist yet — every
+    URL-wedge product, and any fresh connected ingest before enrichment runs.
+
+    Weak-but-honest proxies: spec-ish tags, a deep description, variant/option
+    structure, and structured page metadata. They can't prove curated vertical
+    meta (pro_reviews, in_box, INCI...), which is why the fallback bucket is
+    capped below the enriched ceiling."""
+    attrs = _json_obj(product.get("attributes_raw"))
+    signals: List[str] = []
+    tags = [str(t).strip() for t in _json_list(attrs.get("tags")) if str(t).strip()]
+    if len(tags) >= 3:
+        signals.append("spec_tags")
+    description = str(
+        product.get("description") or attrs.get("description") or ""
+    ).strip()
+    if len(description) >= 400:
+        signals.append("deep_description")
+    if _nonempty(attrs.get("variants")) or _nonempty(attrs.get("options")):
+        signals.append("variant_structure")
+    if _nonempty(attrs.get("offers")) or _nonempty(attrs.get("aggregateRating")) or (
+        _nonempty(attrs.get("brand")) and _nonempty(attrs.get("category") or attrs.get("product_type"))
+    ):
+        signals.append("structured_metadata")
+    return signals
+
+
 def compute_content_richness_score(sku_ctx: Dict[str, Any]) -> Tuple[int, Dict[str, Any]]:
     """Spec A.2 content-richness score. Pure: reads normalized SKU context."""
     product = _get_product(sku_ctx or {})
@@ -2828,10 +2857,28 @@ def compute_content_richness_score(sku_ctx: Dict[str, Any]) -> Tuple[int, Dict[s
             vertical_missing.append("catalog_products.product_payload.facts")
         if not reviewed_facts:
             vertical_missing.append("catalog_field_facts.reviewed")
+    # Raw-PDP fallback, same contract as product_quality_score/model_readiness
+    # above: the curated vertical artifacts don't exist for URL-wedge SKUs (or
+    # fresh ingests), so this bucket scored a flat 0/20 and the top action told
+    # a merchant with a spec-rich page it was "too thin" (live on the Mojawa
+    # pilot, content 39 with a rich PDP). When the artifacts are absent but the
+    # fetched page itself carries category detail, score that — capped at 16/20
+    # because raw signals can't prove curated vertical meta — and keep `missing`
+    # on the enrichment artifacts so the recommendation still targets the real
+    # gap (get Pivota-enriched), not "publish a page you already have".
+    vertical_reason = f"{vertical} structure coverage" if vertical_points else "data unavailable"
+    if not vertical_points:
+        raw_signals = _raw_vertical_attribute_signals(product)
+        if raw_signals:
+            vertical_points = min(16, 4 * len(raw_signals))
+            vertical_reason = (
+                f"raw PDP category signals {len(raw_signals)}/4 "
+                "(Pivota vertical enrichment pending)"
+            )
     _add_bucket(
         breakdown, missing, "vertical_structure",
         vertical_points, 20,
-        f"{vertical} structure coverage" if vertical_points else "data unavailable",
+        vertical_reason,
         missing=vertical_missing or None,
         extra={"vertical": vertical},
     )
