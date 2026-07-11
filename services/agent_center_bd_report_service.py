@@ -7763,6 +7763,11 @@ def _classify_authority_host(host: Optional[str]) -> str:
         return "retailer"
     if host_type == "video":
         return "creator"
+    if host_type in {"community", "forum", "social"}:
+        # Registry-classified forums (head-fi.org, audiosciencereview.com) fold
+        # to the forum role — merchant_relative_role already handles it; without
+        # this fold they read as unclassified in the authority map.
+        return "forum"
     return "unclassified"
 
 

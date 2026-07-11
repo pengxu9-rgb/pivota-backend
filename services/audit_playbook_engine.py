@@ -255,6 +255,7 @@ def _build_pitch_draft(
     pb: Dict[str, Any],
     host_entry: Dict[str, Any],
     ctx: Dict[str, Any],
+    allow_submission_channel: bool = False,
 ) -> Optional[Dict[str, Any]]:
     """Phase A: render the pre-filled email pitch the merchant can
     one-click into their mail client. Returns None when either side
@@ -269,12 +270,20 @@ def _build_pitch_draft(
         "recipient_note":  "..." | None,
       }
 
-    Email-only path. Hosts without a published editorial email (e.g.
-    Wirecutter's submission form) are intentionally skipped — we only
-    render the "Draft pitch email" CTA when it actually opens a
-    pre-filled mail client in one click. Half-working fallbacks
-    (open-the-form-yourself) erode trust in the execution layer; we
-    prefer honest coverage gaps.
+    Two honest channels, never a fake mailto (P3-8):
+      - channel="email": a published editorial email exists — the UI may
+        render a one-click pre-filled mail client CTA.
+      - channel="submission_form" (only when allow_submission_channel=True —
+        the win-plan surface, whose renderer handles email-less drafts): no
+        email, but a published submission / contact page exists — the UI
+        renders "copy this draft + open their form", never a mailto with no
+        recipient. (The original email-only rule was about not shipping
+        half-working mailto CTAs; a paste-ready draft next to the real form
+        link keeps that promise while unlocking form-only hosts like
+        Wirecutter or Rtings.) Callers whose renderers assume an email CTA
+        (select_playbooks → the ai-readiness DraftPitchButton mailto) keep the
+        default and stay email-only.
+    Hosts with NEITHER recipient stay None — the honest coverage gap.
     """
     pitch_tpl = pb.get("pitch_template") or {}
     subject_tpl = pitch_tpl.get("subject_template") or ""
@@ -283,10 +292,12 @@ def _build_pitch_draft(
         return None
 
     recipient = host_entry.get("pitch_recipient") or {}
-    recipient_email = recipient.get("email") if isinstance(recipient, dict) else None
-    recipient_note = recipient.get("note") if isinstance(recipient, dict) else None
+    recipient = recipient if isinstance(recipient, dict) else {}
+    recipient_email = recipient.get("email")
+    submission_url = recipient.get("submission_url")
+    recipient_note = recipient.get("note")
 
-    if not recipient_email:
+    if not recipient_email and not (allow_submission_channel and submission_url):
         return None
 
     subject = _render_template(subject_tpl, ctx)
@@ -297,7 +308,9 @@ def _build_pitch_draft(
     return {
         "subject": subject,
         "body": body,
+        "channel": "email" if recipient_email else "submission_form",
         "recipient_email": recipient_email,
+        "submission_url": submission_url,
         "recipient_note": recipient_note,
     }
 
@@ -309,6 +322,7 @@ def build_pitch_draft_for_host(
     merchant_category: Optional[str] = None,
     example_query: Optional[str] = None,
     competitors_named: Optional[List[str]] = None,
+    allow_submission_channel: bool = False,
 ) -> Optional[Dict[str, Any]]:
     """Render the one-click pitch email for a SINGLE target host, keyed to a
     specific failing query + its competitor benchmark.
@@ -357,7 +371,10 @@ def build_pitch_draft_for_host(
         "competitors_phrase_short": _competitors_phrase_short(comps),
         "example_phrase_short": _example_phrase_short(example),
     }
-    return _build_pitch_draft(pb=pb, host_entry=host_entry, ctx=ctx)
+    return _build_pitch_draft(
+        pb=pb, host_entry=host_entry, ctx=ctx,
+        allow_submission_channel=allow_submission_channel,
+    )
 
 
 # A host cited only once in the audit's grounding sources is weak

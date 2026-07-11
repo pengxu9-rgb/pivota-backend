@@ -102,8 +102,8 @@
       "outreach_hint": "Wirecutter editorial pitch — competitive, multi-month review cycle, requires sample submission.",
       "pitch_recipient": {
         "email": null,
-        "submission_url": "https://www.nytimes.com/wirecutter/about/submission-guidelines/",
-        "note": "Wirecutter doesn't accept open pitches by email — submit via their official submission guidelines page. Multi-month review cycle."
+        "submission_url": "https://www.nytimes.com/wirecutter/how-to-pitch/",
+        "note": "Wirecutter's pitch page is for freelance journalists ('we don't take many pitches for reviews'); no brand product-submission path is published. (Prior submission-guidelines URL now 404s — verified 2026-07-11.)"
       }
     },
     "wirecutter.com": {
@@ -112,7 +112,12 @@
       "categories": ["fashion", "sleepwear", "beauty", "home", "fitness", "electronics"],
       "aliases": ["Wirecutter", "NYT Wirecutter", "The New York Times Wirecutter"],
       "coverage_note": "Wirecutter is The New York Times' consumer reviews vertical; AI assistants frequently ground category recommendations in its tested roundups.",
-      "outreach_hint": "Wirecutter editorial pitch — competitive, multi-month review cycle, requires sample submission."
+      "outreach_hint": "Wirecutter editorial pitch — competitive, multi-month review cycle, requires sample submission.",
+      "pitch_recipient": {
+        "email": null,
+        "submission_url": "https://www.nytimes.com/wirecutter/how-to-pitch/",
+        "note": "Wirecutter's pitch page is for freelance journalists ('we don't take many pitches for reviews'); no brand product-submission path is published. (Verified 2026-07-11.)"
+      }
     },
     "forbes.com": {
       "type": "editorial",
@@ -513,7 +518,12 @@
       "categories": ["beauty", "skincare", "kbeauty"],
       "aliases": ["Hwahae"],
       "coverage_note": "Hwahae (화해) is Korea's leading cosmetics review-and-ingredient-analysis platform (the Korean equivalent of Skinsort); AI grounds K-beauty product safety, ingredient, and 'is X good' queries in its crowd-reviewed database.",
-      "outreach_hint": "Editorial / database channel — keep ingredient listings accurate and monitor user reviews; not a paid-placement surface."
+      "outreach_hint": "Editorial / database channel — keep ingredient listings accurate and monitor user reviews; not a paid-placement surface.",
+      "pitch_recipient": {
+        "email": null,
+        "submission_url": "https://business.hwahae.co.kr/",
+        "note": "Reviews are user-generated — brands can't pitch them. The brand door is Hwahae Business: ad/seeding programs and Hwahae Shopping entry (part_ads_sales@hwahae.com is the ads-sales inbox, not an editorial pitch address). Verified 2026-07-11."
+      }
     },
     "stylecraze.com": {
       "type": "editorial",
@@ -650,6 +660,136 @@
       "aliases": ["Eyidara Naturals"],
       "coverage_note": "Small natural-hair products brand site surfacing in textured-hair category answers.",
       "outreach_hint": "Competitor brand site — not an outreach target."
+    },
+    "rtings.com": {
+      "type": "editorial",
+      "subtype": "review_site",
+      "categories": ["electronics", "audio", "headphones", "home"],
+      "aliases": ["RTINGS", "Rtings"],
+      "coverage_note": "Rtings runs standardized lab tests per category; AI assistants ground 'best X' electronics answers in its measured rankings.",
+      "outreach_hint": "RTINGS buys every product it tests ('We buy our own products, just like you') — there is no sample or pitch path. Suggest your product on their per-category Review Pipeline page and rally votes.",
+      "pitch_recipient": {
+        "email": null,
+        "submission_url": "https://www.rtings.com/tv/suggestions",
+        "note": "No pitch email — products are suggested and voted on via the Review Pipeline (free account required). They purchase review units themselves. Verified 2026-07-11."
+      }
+    },
+    "soundguys.com": {
+      "type": "editorial",
+      "subtype": "review_site",
+      "categories": ["electronics", "audio", "headphones"],
+      "aliases": ["SoundGuys"],
+      "coverage_note": "SoundGuys publishes measured headphone/earbud reviews and category roundups with strong AI-grounding pickup for audio queries.",
+      "outreach_hint": "Their contact page publishes a dedicated 'PR and product reviews' address — the explicit door for product review pitches.",
+      "pitch_recipient": {
+        "email": "pr@soundguys.com",
+        "submission_url": "https://www.soundguys.com/contact/",
+        "note": "pr@soundguys.com is listed under 'PR and product reviews' on their contact page. Verified 2026-07-11."
+      }
+    },
+    "whathifi.com": {
+      "type": "editorial",
+      "subtype": "review_site",
+      "categories": ["electronics", "audio", "headphones", "home_cinema"],
+      "aliases": ["What Hi-Fi", "What Hi-Fi?"],
+      "coverage_note": "What Hi-Fi? (Future) runs starred hi-fi/AV reviews and awards; a review or award badge is a durable grounding source for audio queries.",
+      "outreach_hint": "Contact page routes 'editorial or publishing opportunities' to the Content Director — pitch the product for review consideration there.",
+      "pitch_recipient": {
+        "email": "joe.cox@futurenet.com",
+        "submission_url": "https://www.whathifi.com/news/contact-us",
+        "note": "Published on their contact page for 'any editorial or publishing opportunities' (Content Director). No dedicated review-sample address is published. Verified 2026-07-11."
+      }
+    },
+    "techradar.com": {
+      "type": "editorial",
+      "subtype": "review_site",
+      "categories": ["electronics", "audio", "computing"],
+      "aliases": ["TechRadar"],
+      "coverage_note": "TechRadar (Future) publishes high-volume reviews and 'best X' guides that AI assistants ground category answers in.",
+      "outreach_hint": "TechRadar explicitly declines brand pitches ('If you're representing a brand... we're not interested') — the published route is offering an expert interview, or earning coverage via their reviews desk.",
+      "pitch_recipient": {
+        "email": null,
+        "submission_url": "https://www.techradar.com/how-to/how-to-pitch-your-ideas-to-techradar",
+        "note": "Their pitch page is for freelance writers and states brand-interested pitches are not accepted; it suggests offering an interview opportunity instead. Verified 2026-07-11."
+      }
+    },
+    "tomsguide.com": {
+      "type": "editorial",
+      "subtype": "review_site",
+      "categories": ["electronics", "audio", "computing"],
+      "aliases": ["Tom's Guide", "Toms Guide"],
+      "coverage_note": "Tom's Guide (Future) reviews and roundups appear frequently in AI grounding for consumer-electronics queries.",
+      "outreach_hint": "No brand/PR product-pitch address is published — the about page lists editors by beat; target the editor covering your category.",
+      "pitch_recipient": {
+        "email": null,
+        "submission_url": "https://www.tomsguide.com/reference/about-us",
+        "note": "freelancepitches@futurenet.com on this page is for freelance story pitches, not product pitches; the page lists per-beat editors. Verified 2026-07-11."
+      }
+    },
+    "runnersworld.com": {
+      "type": "editorial",
+      "subtype": "review_site",
+      "categories": ["fitness", "running", "electronics", "audio"],
+      "aliases": ["Runner's World", "Runners World"],
+      "coverage_note": "Runner's World gear desk tests running gear including sports audio; its roundups ground AI answers for running-gear queries.",
+      "outreach_hint": "The published gear-desk address accepts gear story pitches — frame yours as a testable gear story, and disclose brand affiliation (their guidelines require it).",
+      "pitch_recipient": {
+        "email": "RWgear@hearst.com",
+        "submission_url": "https://www.runnersworld.com/about/a34243071/how-to-pitch-runners-world-magazine/",
+        "note": "'Send gear story pitches to RWgear@hearst.com' — the page is framed for writers/testers and asks for disclosure of brand sponsorships; be transparent that you represent the brand. Verified 2026-07-11."
+      }
+    },
+    "head-fi.org": {
+      "type": "community",
+      "subtype": "forum",
+      "categories": ["electronics", "audio", "headphones"],
+      "aliases": ["Head-Fi"],
+      "coverage_note": "Head-Fi is the largest headphone-enthusiast forum; long-running threads and member impressions get picked up in AI grounding for audio queries.",
+      "outreach_hint": "No editorial review program — manufacturers must register as Member of the Trade to post; the brand door is sponsorship via advertise@head-fi.org.",
+      "pitch_recipient": {
+        "email": "advertise@head-fi.org",
+        "submission_url": "https://www.head-fi.org/articles/advertise.12522/",
+        "note": "Sponsorship/advertising contact ('please contact advertise@head-fi.org'), not an editorial pitch inbox. Organic presence requires Member-of-the-Trade registration. Verified 2026-07-11."
+      }
+    },
+    "audiosciencereview.com": {
+      "type": "community",
+      "subtype": "forum",
+      "categories": ["electronics", "audio"],
+      "aliases": ["Audio Science Review", "ASR"],
+      "coverage_note": "ASR publishes founder-run measurements of audio gear; its objective test threads are a trusted grounding source for audio-quality claims.",
+      "outreach_hint": "Manufacturers can loan units for free measurement via the founder's pinned 'We measure audio equipment for free' thread (start a conversation with amirm); no preferential treatment.",
+      "pitch_recipient": {
+        "email": null,
+        "submission_url": "https://www.audiosciencereview.com/forum/index.php?threads/we-measure-audio-equipment-for-free.1995/",
+        "note": "Submission is via forum DM to the founder per the pinned thread; loaned units are measured and returned, with no preferential treatment. Verified 2026-07-11."
+      }
+    },
+    "theverge.com": {
+      "type": "editorial",
+      "subtype": "review_site",
+      "categories": ["electronics", "audio", "computing"],
+      "aliases": ["The Verge"],
+      "coverage_note": "The Verge's reviews and buying guides are high-weight AI grounding sources for consumer electronics.",
+      "outreach_hint": "No public editorial email — use the contact form's 'I have a press inquiry' option for brand/PR outreach.",
+      "pitch_recipient": {
+        "email": null,
+        "submission_url": "https://www.theverge.com/contact-the-verge",
+        "note": "On-page form with options including 'I want to pitch a story' and 'I have a press inquiry' — the press-inquiry option is the brand door. Verified 2026-07-11."
+      }
+    },
+    "cnet.com": {
+      "type": "editorial",
+      "subtype": "review_site",
+      "categories": ["electronics", "audio", "computing", "home"],
+      "aliases": ["CNET"],
+      "coverage_note": "CNET reviews and best-lists remain a broad AI grounding source across consumer electronics.",
+      "outreach_hint": "CNET publishes no product-pitch path; press@cnet.com on the about page is framed for media seeking expert commentary — use with that caveat.",
+      "pitch_recipient": {
+        "email": null,
+        "submission_url": "https://www.cnet.com/about/",
+        "note": "No published product-pitch door. press@cnet.com exists on the about page but is framed for press seeking CNET experts, not brand pitches. Verified 2026-07-11."
+      }
     }
   }
 }

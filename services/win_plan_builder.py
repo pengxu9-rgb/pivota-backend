@@ -142,7 +142,8 @@ def _outreach_from_meta(meta: Dict[str, Any]) -> Dict[str, Any]:
             "submission_url": submission_url,
             "note": (recipient or {}).get("note"),
         } if recipient else None,
-        # Phase 2: the rendered one-click pitch, attached below for draft_ready.
+        # The rendered pitch, attached below for draft_ready (email channel)
+        # and submission_only (submission_form channel).
         "pitch_draft": None,
     }
 
@@ -158,18 +159,22 @@ def _target(
     host = row.get("host")
     meta = classify_host(host, merchant_category=merchant_category)
     outreach = _outreach_from_meta(meta)
-    # Attach the one-click pitch email when the host actually supports it (a real
-    # email recipient + a playbook pitch template). Keyed to THIS losing query +
-    # its competitor benchmark so the draft is specific, not generic. Reuses the
+    # Attach the rendered pitch when the host actually supports one (a real
+    # recipient + a playbook pitch template). Keyed to THIS losing query + its
+    # competitor benchmark so the draft is specific, not generic. Reuses the
     # playbook engine (no re-implementation); stays None when not renderable, so
-    # submission_only / target_only targets honestly show no draft button.
-    if outreach["state"] == OUTREACH_DRAFT_READY:
+    # target_only targets honestly show no draft. draft_ready gets the one-click
+    # email; submission_only gets a channel="submission_form" draft — the copy
+    # the merchant pastes into the host's published form (P3-8).
+    if outreach["state"] in (OUTREACH_DRAFT_READY, OUTREACH_SUBMISSION_ONLY):
         outreach["pitch_draft"] = build_pitch_draft_for_host(
             meta,
             merchant_name=merchant_name,
             merchant_category=merchant_category,
             example_query=query,
             competitors_named=competitors_named,
+            # Win-plan renderer handles email-less drafts (copy + open form).
+            allow_submission_channel=True,
         )
     return {
         "host": host,

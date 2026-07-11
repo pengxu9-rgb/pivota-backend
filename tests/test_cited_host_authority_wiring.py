@@ -4,17 +4,26 @@ from services.vertical_profiles import get_profile
 
 
 def test_audio_authority_hosts_are_recognized_review_sites():
-    for host in ["rtings.com", "soundguys.com", "head-fi.org", "whathifi.com"]:
+    for host in ["rtings.com", "soundguys.com", "whathifi.com"]:
         r = C.classify_host(host)
         assert r["type"] == "editorial", host
         assert r.get("subtype") == "review_site", host
         assert r.get("ai_grounding_weight") == "medium", host
+    # P3-8: head-fi.org is registry-classified for what it actually is — a
+    # forum, not an editorial review site (the profile still lists it as an
+    # authority host; the grounding weight registration is type-agnostic).
+    hf = C.classify_host("head-fi.org")
+    assert hf["type"] == "community"
+    assert hf.get("subtype") == "forum"
+    assert hf.get("ai_grounding_weight") == "medium"
 
 
 def test_profile_is_the_source_of_truth():
-    # every electronics_audio authority host classifies as a known review site
+    # every electronics_audio authority host classifies as a KNOWN host — an
+    # editorial review site, or (per the registry's finer knowledge, P3-8) a
+    # community forum like head-fi.org. Never unclassified.
     for host in get_profile("electronics").authority_hosts:
-        assert C.classify_host(host)["type"] == "editorial", host
+        assert C.classify_host(host)["type"] in {"editorial", "community"}, host
 
 
 def test_existing_higher_weight_not_downgraded_and_beauty_unaffected():
@@ -92,3 +101,38 @@ def test_source_roles_mark_merchant_own_domain():
     # legacy call shape (no sku_ctx) keeps the old behavior
     legacy = {r["host"]: r for r in _source_roles_for_runs(runs, "electronics")}
     assert legacy["mojawa.com"]["role"] == "unclassified"
+
+
+# --- P3-8: verified pitch recipients for the pilot authority hosts ---
+
+def test_pilot_authority_hosts_have_pitch_recipients():
+    # Registry data verified against each site's own pages (2026-07-11). A
+    # removed recipient silently regresses every win-plan target back to
+    # target_only — the dead-end state the operator review flagged.
+    email_hosts = {"soundguys.com": "pr@soundguys.com", "runnersworld.com": "RWgear@hearst.com"}
+    for host, email in email_hosts.items():
+        rec = C.classify_host(host).get("pitch_recipient") or {}
+        assert rec.get("email") == email, host
+    for host in ["rtings.com", "techradar.com", "tomsguide.com", "theverge.com",
+                 "cnet.com", "wirecutter.com", "hwahae.com", "audiosciencereview.com"]:
+        rec = C.classify_host(host).get("pitch_recipient") or {}
+        assert rec.get("submission_url"), host
+
+
+def test_submission_only_host_renders_paste_draft_for_win_plan():
+    from services.audit_playbook_engine import build_pitch_draft_for_host
+
+    rtings = C.classify_host("rtings.com", merchant_category="electronics")
+    # ai-readiness surface (default): email-only contract preserved — no draft.
+    assert build_pitch_draft_for_host(rtings, merchant_name="Mojawa") is None
+    # win-plan surface: paste-ready submission_form draft.
+    draft = build_pitch_draft_for_host(
+        rtings, merchant_name="Mojawa", merchant_category="electronics",
+        example_query="best bone conduction headphones",
+        allow_submission_channel=True,
+    )
+    assert draft is not None
+    assert draft["channel"] == "submission_form"
+    assert draft["recipient_email"] is None
+    assert draft["submission_url"] == "https://www.rtings.com/tv/suggestions"
+    assert "Mojawa" in draft["body"]
