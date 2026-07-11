@@ -306,6 +306,68 @@ def _is_missing_customer_error(exc: Exception) -> bool:
     return "no such customer" in str(getattr(exc, "user_message", None) or exc).lower()
 
 
+async def _ensure_merchant_billing_row(
+    db: Database, *, merchant_id: str, contact_email: str
+) -> None:
+    """Ensure a ``merchants`` (billing account) row exists for this merchant.
+
+    Portal signup + approval only writes ``merchant_onboarding``; no code path
+    promotes an approved merchant into the ``merchants`` monetization table. The
+    checkout flow assumes that row exists and ``UPDATE``s it, so a first-time
+    subscriber otherwise 500s ("local merchants row missing") and orphans a
+    Stripe customer. Provision the row here from the approved onboarding record.
+
+    Idempotent and safe to call on every checkout: a no-op once a row matches
+    (by ``contact_email``), and the ``WHERE NOT EXISTS`` guards a concurrent
+    double-click. The ``merchants`` table has no ``merchant_id`` column — it is
+    keyed by ``contact_email``, which is also how the Stripe webhook maps a
+    completed checkout back to the merchant.
+    """
+    if not contact_email:
+        return
+    columns = await _table_columns(db, "merchants")
+    if "contact_email" not in columns:
+        return
+
+    existing = await _fetch_merchant_billing_row(
+        db, merchant_id=merchant_id, contact_email=contact_email, stripe_customer_id=None
+    )
+    if existing:
+        return
+
+    onboarding = await get_merchant_onboarding(merchant_id) or {}
+    business_name = _as_text(onboarding.get("business_name")) or contact_email
+    store_url = _as_text(onboarding.get("store_url")) or None
+
+    await db.execute(
+        """
+        INSERT INTO merchants (
+            business_name, legal_name, platform, store_url,
+            contact_email, status, verification_status,
+            current_tier, created_at, updated_at
+        )
+        SELECT
+            :business_name, :business_name, 'custom', :store_url,
+            :contact_email, 'active', 'verified',
+            'free', NOW(), NOW()
+        WHERE NOT EXISTS (
+            SELECT 1 FROM merchants WHERE LOWER(contact_email) = LOWER(:contact_email)
+        )
+        """,
+        {
+            "business_name": business_name,
+            "store_url": store_url,
+            "contact_email": contact_email,
+        },
+    )
+    logger.info(
+        "Provisioned merchants billing row for merchant_id=%s from approved "
+        "onboarding record (contact_email=%s).",
+        merchant_id,
+        contact_email,
+    )
+
+
 async def _create_and_persist_stripe_customer(
     *, merchant_id: str, contact_email: str, idempotency_key: str
 ) -> str:
@@ -392,6 +454,23 @@ async def create_billing_checkout_session(
         contact_email = _as_text(billing_row.get("contact_email"))
     if not contact_email:
         raise HTTPException(status_code=400, detail="Merchant contact email is required")
+
+    if not billing_row:
+        # Portal signup + approval writes only `merchant_onboarding`; nothing
+        # promotes an approved merchant into the `merchants` monetization table,
+        # so a first-time subscriber would otherwise 500 in
+        # `_create_and_persist_stripe_customer` (its UPDATE matches zero rows).
+        # Provision the billing row now, idempotently, from the approved
+        # onboarding record, then re-read it.
+        await _ensure_merchant_billing_row(
+            database, merchant_id=merchant_id, contact_email=contact_email
+        )
+        billing_row = await _fetch_merchant_billing_row(
+            database,
+            merchant_id=merchant_id,
+            contact_email=contact_email,
+            stripe_customer_id=None,
+        )
 
     stripe_customer_id = _as_text((billing_row or {}).get("stripe_customer_id"))
     if not stripe_customer_id:
