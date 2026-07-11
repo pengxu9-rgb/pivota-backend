@@ -790,6 +790,158 @@
         "submission_url": "https://www.cnet.com/about/",
         "note": "No published product-pitch door. press@cnet.com exists on the about page but is framed for press seeking CNET experts, not brand pitches. Verified 2026-07-11."
       }
+    },
+    "pcmag.com": {
+      "type": "editorial",
+      "subtype": "review_site",
+      "categories": ["electronics", "audio", "computing"],
+      "aliases": ["PCMag", "PC Magazine"],
+      "coverage_note": "PCMag runs lab-tested reviews and 'best' roundups across consumer electronics; its ratings are a frequent AI-grounding source for electronics and audio queries.",
+      "outreach_hint": "Editorial reviews desk — pitch the product for review to the editor covering your category; no paid-placement path."
+    },
+    "headphonesaddict.com": {
+      "type": "editorial",
+      "subtype": "review_site",
+      "categories": ["audio", "headphones", "electronics"],
+      "aliases": ["Headphones Addict", "HeadphonesAddict"],
+      "coverage_note": "Headphones Addict publishes headphone/earbud reviews and best-of roundups; a niche audio review source AI assistants ground 'best headphones' answers in.",
+      "outreach_hint": "Independent audio review blog — offer a review unit via their contact page; editorial coverage, not paid."
+    },
+    "headfonia.com": {
+      "type": "editorial",
+      "subtype": "review_site",
+      "categories": ["audio", "headphones", "electronics"],
+      "aliases": ["Headfonia"],
+      "coverage_note": "Headfonia is a long-running enthusiast audio-review site covering headphones, IEMs and portable gear that surfaces in AI grounding for audiophile queries.",
+      "outreach_hint": "Enthusiast audio review site — pitch a review sample via their review-request/contact page."
+    },
+    "techgearlab.com": {
+      "type": "editorial",
+      "subtype": "review_site",
+      "categories": ["electronics", "audio", "outdoor"],
+      "aliases": ["TechGearLab", "Tech Gear Lab"],
+      "coverage_note": "TechGearLab runs hands-on comparative testing of consumer tech and gear (a GearLab property); its ranked head-to-heads get grounded in AI 'best X' answers.",
+      "outreach_hint": "GearLab-style independent testing that typically buys its own test units — no direct sample/pitch path; earn inclusion by ranking in their category test."
+    },
+    "techhive.com": {
+      "type": "editorial",
+      "subtype": "review_site",
+      "categories": ["electronics", "audio", "smart_home"],
+      "aliases": ["TechHive"],
+      "coverage_note": "TechHive (Foundry/IDG) reviews home electronics, audio and smart-home gear; its reviews and buying guides feed AI grounding for consumer-electronics queries.",
+      "outreach_hint": "Editorial reviews desk — pitch the product for review to the relevant editor; no paid placement."
+    },
+    "believeintherun.com": {
+      "type": "editorial",
+      "subtype": "review_site",
+      "categories": ["running", "fitness", "audio"],
+      "aliases": ["Believe in the Run"],
+      "coverage_note": "Believe in the Run reviews running shoes and gear including sport headphones; its roundups are grounded in AI answers for running-gear queries.",
+      "outreach_hint": "Independent running-gear review site — pitch a review sample via their contact page as a testable gear story."
+    },
+    "bikeradar.com": {
+      "type": "editorial",
+      "subtype": "review_site",
+      "categories": ["cycling", "fitness", "audio"],
+      "aliases": ["BikeRadar"],
+      "coverage_note": "BikeRadar (Our Media) reviews cycling gear and tech, including ride-safe audio; its reviews surface in AI grounding for cycling-gear queries.",
+      "outreach_hint": "Cycling-media reviews desk — pitch a review unit to the tech/gear editor."
+    },
+    "cyclingweekly.com": {
+      "type": "editorial",
+      "subtype": "review_site",
+      "categories": ["cycling", "fitness", "audio"],
+      "aliases": ["Cycling Weekly"],
+      "coverage_note": "Cycling Weekly (Future) publishes cycling gear reviews and buying guides that AI assistants ground cycling-gear answers in.",
+      "outreach_hint": "Cycling-media reviews desk — pitch a review unit to the gear editor covering accessories."
+    },
+    "road.cc": {
+      "type": "editorial",
+      "subtype": "review_site",
+      "categories": ["cycling", "fitness", "audio"],
+      "aliases": ["road.cc"],
+      "coverage_note": "road.cc runs high-volume road-cycling gear reviews, including bone-conduction/ride-safe headphones, that surface in AI grounding for cycling-accessory queries.",
+      "outreach_hint": "Cycling-media reviews desk — offer a review sample to their gear-review team."
+    },
+    "220triathlon.com": {
+      "type": "editorial",
+      "subtype": "review_site",
+      "categories": ["triathlon", "fitness", "audio"],
+      "aliases": ["220 Triathlon"],
+      "coverage_note": "220 Triathlon reviews multisport gear including swim/run audio; its roundups are grounded in AI answers for triathlon-gear queries.",
+      "outreach_hint": "Multisport reviews desk — pitch a review unit as a testable multisport-gear story."
+    },
+    "swimswam.com": {
+      "type": "editorial",
+      "subtype": "review_site",
+      "categories": ["swimming", "fitness", "audio"],
+      "aliases": ["SwimSwam"],
+      "coverage_note": "SwimSwam covers competitive swimming and reviews swim gear including waterproof audio players; a niche grounding source for swim-gear queries.",
+      "outreach_hint": "Swimming-media desk — pitch waterproof audio for a gear review or roundup."
+    },
+    "mensfitness.co.uk": {
+      "type": "editorial",
+      "subtype": "review_site",
+      "categories": ["fitness", "audio"],
+      "aliases": ["Men's Fitness UK", "Mens Fitness UK"],
+      "coverage_note": "Men's Fitness UK reviews training gear and workout audio; its 'best' roundups feed AI grounding for fitness-gear queries.",
+      "outreach_hint": "Fitness-media reviews desk — pitch workout headphones for a gear roundup."
+    },
+    "velo.outsideonline.com": {
+      "type": "editorial",
+      "subtype": "review_site",
+      "categories": ["cycling", "fitness", "audio"],
+      "aliases": ["VeloNews"],
+      "coverage_note": "Velo (Outside Inc.'s cycling title, formerly VeloNews) reviews road/gravel cycling gear and accessories that AI grounds cycling answers in.",
+      "outreach_hint": "Cycling reviews desk within Outside — pitch a review unit to the gear editor."
+    },
+    "averagejoecyclist.com": {
+      "type": "editorial",
+      "subtype": "review_site",
+      "categories": ["cycling", "fitness", "audio"],
+      "aliases": ["Average Joe Cyclist"],
+      "coverage_note": "Average Joe Cyclist is a cycling blog reviewing bikes and accessories including ride-safe headphones; a long-tail grounding source for cycling-gear queries.",
+      "outreach_hint": "Independent cycling blog — offer a review sample via their contact page."
+    },
+    "officedepot.com": {
+      "type": "retailer",
+      "subtype": "mass_market",
+      "categories": ["electronics", "office", "computing"],
+      "aliases": ["Office Depot", "Office Depot OfficeMax"],
+      "coverage_note": "Office Depot/OfficeMax carries consumer electronics and audio alongside office supplies; a mass retail carrier surfaced on where-to-buy electronics queries.",
+      "outreach_hint": "Retail carrier — pursue vendor/marketplace onboarding; a listing here is distribution, not endorsement."
+    },
+    "shokz.com": {
+      "type": "brand",
+      "subtype": "mass_market",
+      "categories": ["audio", "headphones", "electronics"],
+      "aliases": ["Shokz", "AfterShokz"],
+      "coverage_note": "Shokz (formerly AfterShokz) is the category-leading bone-conduction / open-ear sport headphone brand; its own storefront is a dominant organic winner for bone-conduction queries.",
+      "outreach_hint": "Competitor brand site — benchmark their sport-audio PDP/authority; not an outreach target."
+    },
+    "soundcore.com": {
+      "type": "brand",
+      "subtype": "mass_market",
+      "categories": ["audio", "headphones", "electronics"],
+      "aliases": ["Soundcore", "Anker Soundcore"],
+      "coverage_note": "Soundcore (Anker) is a high-volume earbud/headphone brand whose own storefront wins organic 'best budget earbuds/headphones' answers.",
+      "outreach_hint": "Competitor brand site — benchmark, not an outreach target."
+    },
+    "underwateraudio.com": {
+      "type": "brand",
+      "subtype": "mass_market",
+      "categories": ["audio", "headphones", "swimming", "electronics"],
+      "aliases": ["Underwater Audio"],
+      "coverage_note": "Underwater Audio sells waterproof music players and swim headphones; a direct competitor storefront for swim/waterproof audio queries.",
+      "outreach_hint": "Competitor brand site — benchmark their waterproof-audio PDP; not an outreach target."
+    },
+    "voistek.com": {
+      "type": "brand",
+      "subtype": "mass_market",
+      "categories": ["audio", "headphones", "electronics"],
+      "aliases": ["Voistek"],
+      "coverage_note": "Voistek sells bone-conduction / open-ear sport headphones; a competitor storefront surfacing on bone-conduction category queries.",
+      "outreach_hint": "Competitor brand site — benchmark, not an outreach target."
     }
   }
 }
