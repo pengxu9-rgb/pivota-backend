@@ -1,0 +1,97 @@
+name: Crawl Seed Snapshot Refresh
+
+# Daily off-box refresh of stale external_brand_crawl seeds via
+# scripts/refresh_crawl_seed_snapshots.py — the durable fix for the 7-day
+# stale_snapshot serving gate (services/external_referral_readiness.py,
+# EXTERNAL_REFERRAL_STALE_DAYS=7). The one-shot prod re-crawl cleared the gate
+# once; this keeps it clear. run_external_referral_refresh_batch (the in-process
+# batch) covers ALL ~9.1k attached seeds oldest-first at limit=500/day — an
+# ~18-day cycle that under-covers the 7-day window — so the crawl cohort gets
+# its own scoped daily sweep here instead (2,154 seeds → ~308/day needed;
+# excludes seeds already fresh <24h, so a daily run keeps the cohort <2 days old).
+#
+# Honest by design: re-fetches each product's LIVE Shopify JSON and stamps
+# extracted_at with the actual fetch time; 404/parse-fail seeds are left stale,
+# never falsely refreshed. Resumable (per-host incremental writes + fresh-<24h
+# exclusion), so a timed-out run continues the next day.
+
+on:
+  workflow_dispatch:
+    inputs:
+      apply:
+        description: "Write refreshed snapshots (unchecked = dry-run report only)"
+        required: true
+        default: false
+        type: boolean
+      host:
+        description: "Restrict to one registrable host (e.g. acropass.us); blank = all stale"
+        required: false
+        default: ""
+        type: string
+  schedule:
+    # Daily 05:23 UTC — off-peak, offset from the orphan reaper (04:37) and the
+    # PDP production smoke (08:17).
+    - cron: "23 5 * * *"
+
+# Never run two refreshes at once (a slow run must not overlap the next day's).
+concurrency:
+  group: crawl-seed-refresh
+  cancel-in-progress: false
+
+jobs:
+  crawl-seed-refresh:
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+    env:
+      DATABASE_URL: ${{ secrets.DATABASE_URL }}
+      PYTHONDONTWRITEBYTECODE: "1"
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: "pip"
+
+      - name: Install deps
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Refresh (dry-run report)
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [[ -z "${DATABASE_URL:-}" ]]; then
+            echo "DATABASE_URL secret is required (must be a publicly reachable host, e.g. the Railway public proxy)" >&2
+            exit 1
+          fi
+          out_dir="reports/workflow_ops/crawl-seed-refresh/${{ github.run_id }}"
+          mkdir -p "${out_dir}"
+          python -m scripts.refresh_crawl_seed_snapshots \
+            ${{ github.event_name == 'workflow_dispatch' && inputs.host != '' && format('--host {0}', inputs.host) || '' }} \
+            | tee "${out_dir}/dry_run.json"
+
+      - name: Refresh (apply)
+        # Scheduled runs auto-apply (that is the point). Manual runs apply only
+        # when the apply box is checked.
+        if: ${{ github.event_name == 'schedule' || (github.event_name == 'workflow_dispatch' && inputs.apply) }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          out_dir="reports/workflow_ops/crawl-seed-refresh/${{ github.run_id }}"
+          mkdir -p "${out_dir}"
+          python -m scripts.refresh_crawl_seed_snapshots \
+            --apply \
+            ${{ github.event_name == 'workflow_dispatch' && inputs.host != '' && format('--host {0}', inputs.host) || '' }} \
+            | tee "${out_dir}/apply.json"
+
+      - name: Upload artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: crawl-seed-refresh-${{ github.run_id }}
+          path: reports/workflow_ops/crawl-seed-refresh/${{ github.run_id }}
+          retention-days: 14
