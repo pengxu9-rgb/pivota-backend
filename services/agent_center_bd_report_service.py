@@ -80,6 +80,7 @@ from services.cited_host_classifier import (
     classify_host,
     is_endorsement_role,
     is_findability_role,
+    is_profile_retailer_name,
     merchant_relative_role,
     recommendation_class,
     ROLE_COMPETITOR,
@@ -7751,9 +7752,17 @@ def _run_competitor_aliases(competitor_brands, exclude) -> frozenset:
         # `_who_ai_cites_instead` applies to the named-competitor list.
         if is_ingredient_or_category_type(name):
             continue
+        # Engines also list RETAILERS as "competitors" on branded/where-to-buy
+        # queries ("Best Buy", "Walmart (Refurbished)"). A retailer carrying the
+        # merchant's listing is a channel, not a competitor storefront — and its
+        # alias here is what flipped bestbuy.com to is_competitor on the Mojawa
+        # pilot. Drop retailer names (whole-name and per-alias, so the
+        # "(Refurbished)" variants can't smuggle the alias back in).
+        if is_profile_retailer_name(name):
+            continue
         for alias in derive_brand_aliases(name):
             despaced = alias.replace(" ", "")
-            if len(despaced) >= 4 and despaced not in exclude:
+            if len(despaced) >= 4 and despaced not in exclude and not is_profile_retailer_name(despaced):
                 out.add(despaced)
     return frozenset(out)
 

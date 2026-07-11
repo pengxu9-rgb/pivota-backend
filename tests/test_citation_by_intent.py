@@ -39,10 +39,16 @@ def test_citation_by_intent_buckets_and_rate():
          "source_summary": {"merchant_cited_runs": 1}},
     ]
     out = m._citation_by_intent(per_prompt)
-    assert out["category_head"] == {"cited": 0, "total": 1, "rate": 0.0}
-    assert out["problem_jtbd"] == {"cited": 1, "total": 2, "rate": 0.5}
-    assert out["trust"] == {"cited": 1, "total": 1, "rate": 1.0}
-    assert out["navigational"] == {"cited": 1, "total": 1, "rate": 1.0}
+    # PR #1323 added the strict SKU split (sku_cited/sku_rate) to every bucket;
+    # these rows carry no sku_cited_runs, so the strict counts are zero.
+    assert out["category_head"] == {
+        "cited": 0, "total": 1, "rate": 0.0, "sku_cited": 0, "sku_rate": 0.0}
+    assert out["problem_jtbd"] == {
+        "cited": 1, "total": 2, "rate": 0.5, "sku_cited": 0, "sku_rate": 0.0}
+    assert out["trust"] == {
+        "cited": 1, "total": 1, "rate": 1.0, "sku_cited": 0, "sku_rate": 0.0}
+    assert out["navigational"] == {
+        "cited": 1, "total": 1, "rate": 1.0, "sku_cited": 0, "sku_rate": 0.0}
 
 
 def test_citation_by_intent_handles_empty_and_garbage():
@@ -50,7 +56,8 @@ def test_citation_by_intent_handles_empty_and_garbage():
     assert m._citation_by_intent([]) == {}
     # rows missing source_summary count as not-cited, never crash
     out = m._citation_by_intent([{"normalized_query": "best collagen", "axis": "category"}])
-    assert out["category_head"] == {"cited": 0, "total": 1, "rate": 0.0}
+    assert out["category_head"] == {
+        "cited": 0, "total": 1, "rate": 0.0, "sku_cited": 0, "sku_rate": 0.0}
 
 
 def test_brand_citation_by_intent_rolls_up_skus():

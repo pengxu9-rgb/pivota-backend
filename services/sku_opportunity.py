@@ -55,6 +55,7 @@ _SHOPPING_WORDS = {
     "under",
 }
 _ROLE_PRIORITY = {
+    "own_site": 8,
     "brand": 7,
     "marketplace": 6,
     "retailer": 5,
@@ -287,7 +288,7 @@ def _score_prompt_group(
     attribute_fit = _attribute_fit(query, axis_metadata, attribute_graph, product)
     intent = _intent_for(query, axis, axis_metadata)
 
-    source_roles = _source_roles_for_runs(runs, merchant_category)
+    source_roles = _source_roles_for_runs(runs, merchant_category, sku_ctx)
     source_counts = Counter({
         str(source["host"]): int(source.get("times_cited") or 0)
         for source in source_roles
@@ -855,6 +856,7 @@ def _source_label_matches_merchant(
 def _source_roles_for_runs(
     runs: List[Dict[str, Any]],
     merchant_category: Optional[str],
+    sku_ctx: Optional[Dict[str, Any]] = None,
 ) -> List[Dict[str, Any]]:
     rows: Dict[str, Dict[str, Any]] = {}
     for run in runs:
@@ -865,7 +867,15 @@ def _source_roles_for_runs(
                 seen_in_run.add(str(host))
         for host in seen_in_run:
             classification = classify_host(host, merchant_category=merchant_category)
-            role = _normalize_role(classification.get("type"), host)
+            # The merchant's own domain is a fact the pipeline already knows
+            # (_is_first_party_host drives source_route with it) — the BD host
+            # registry never will. Without this, the operator reads their own
+            # site as role="unclassified" in every per-prompt row.
+            first_party = bool(sku_ctx) and _is_first_party_host(host, sku_ctx or {})
+            if first_party:
+                role = "own_site"
+            else:
+                role = _normalize_role(classification.get("type"), host)
             row = rows.setdefault(
                 host,
                 {
@@ -876,6 +886,8 @@ def _source_roles_for_runs(
                     "times_cited": 0,
                 },
             )
+            if first_party:
+                row["first_party"] = True
             row["times_cited"] += 1
 
     return sorted(
