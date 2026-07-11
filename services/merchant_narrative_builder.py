@@ -492,6 +492,76 @@ def _outreach_moves(who: Dict[str, Any]) -> List[Dict[str, Any]]:
     return moves[:6]
 
 
+def _vertical_pitch_targets(
+    vertical_profile: VerticalProfile,
+    who: Dict[str, Any],
+    endorsement_hosts: List[str],
+) -> List[Dict[str, Any]]:
+    """Phase-4 T5: the profile's STANDING authority-host pitch list for this
+    vertical, annotated with what this audit actually observed. _outreach_moves
+    only surfaces hosts the engines happened to cite in this run's sample — so
+    an electronics partner would see youtube + one editorial and never learn
+    that Rtings/SoundGuys/What Hi-Fi are the category's pitch targets. This
+    list is the vertical knowledge itself (empty for profiles without
+    authority_hosts, e.g. beauty today), status-stamped so the operator knows
+    which targets already ground answers in their category.
+
+    Copy mirrors _outreach_moves' editorial routing (review-build vs major-
+    publisher realism) so the panel reads as one voice."""
+    hosts = getattr(vertical_profile, "authority_hosts", ()) or ()
+    if not hosts:
+        return []
+    endorsed = {str(h or "").strip().lower() for h in (endorsement_hosts or [])}
+    cited = {
+        str((h or {}).get("host") or "").strip().lower()
+        for h in ((who.get("cited_hosts") if isinstance(who, dict) else None) or [])
+    }
+    targets: List[Dict[str, Any]] = []
+    for raw in hosts:
+        host = str(raw or "").strip().lower()
+        if not host:
+            continue
+        cls = classify_host(host) or {}
+        subtype = str(cls.get("subtype") or "").strip().lower()
+        realism = _move_realism(host, "editorial", subtype)
+        if host in endorsed:
+            status = "already_endorses_you"
+            why = f"{host} already recommends you — keep the listing accurate and build on it."
+        elif host in cited:
+            status = "cited_in_your_category"
+            why = (
+                f"AI grounded answers in {host} during this audit — it shapes "
+                "your category's recommendations today."
+            )
+        else:
+            status = "not_yet_observed"
+            why = (
+                f"{host} is a standing authority for this category — AI engines "
+                "ground category answers in it even when this audit's sample "
+                "didn't surface it."
+            )
+        targets.append({
+            "host": host,
+            "status": status,
+            "why": why,
+            "realism": realism,
+            "tier": cls.get("tier"),
+            "ai_grounding_weight": cls.get("ai_grounding_weight"),
+            "expected_outreach_cycle_weeks": cls.get("expected_outreach_cycle_weeks"),
+            "pitch_recipient": cls.get("pitch_recipient"),
+            "first_move": (
+                _MAJOR_PUBLISHER_FIRST_MOVE if realism == "hard"
+                else _REVIEW_BUILD_FIRST_MOVE if subtype in {"review_aggregator", "review_site"}
+                else cls.get("outreach_hint") or _FIRST_MOVE_BY_LEVER.get("editorial_outreach")
+            ),
+        })
+    # already-cited targets first (proven to shape this category's answers),
+    # then reachable before hard; profile order breaks ties.
+    order = {"already_endorses_you": 0, "cited_in_your_category": 1, "not_yet_observed": 2}
+    targets.sort(key=lambda t: (order.get(t["status"], 3), t["realism"] == "hard"))
+    return targets
+
+
 def _where_youre_losing(
     merchant_name: str,
     authority_map: Dict[str, Any],
@@ -541,6 +611,12 @@ def _where_youre_losing(
         # editorial sites / get carried by the retailers / engage the
         # communities AI grounds in. No connected store required.
         "outreach_moves": _outreach_moves(who),
+        # Phase-4 T5 — the vertical's standing pitch-target list (profile
+        # authority_hosts), status-stamped against this audit. Empty list for
+        # verticals without a curated list (beauty today) — the panel hides it.
+        "pitch_targets": _vertical_pitch_targets(
+            vertical_profile, who, endorsement_hosts
+        ),
         # Fix 4 — the path to winning the category recommendation back, rolled
         # up from the per-SKU win-plan. None when there's no plan to show.
         "win_plan_summary": _win_plan_summary(win_plan),
