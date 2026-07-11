@@ -254,16 +254,59 @@ async def _resolve_seller_and_key(p: Dict[str, Any]) -> tuple[str, str]:
     return merchant_id, make_catalog_product_key(merchant_id, PLATFORM, p["external_product_id"])
 
 
+def build_default_seed_variant(p: Dict[str, Any]) -> Dict[str, Any]:
+    """Minimal sellable variant from the crawl row's own price/availability.
+
+    The external-referral runtime gate (services/external_referral_readiness.py)
+    treats `zero_variants` as a BLOCKER, so a seed without a variants array is
+    dropped from every agent-search response at build time even when recalled.
+    Crawled D2C PDPs are single-offer pages: the row-level price/currency/
+    availability IS the sellable unit, so author it as one explicit default
+    variant instead of leaving the seed permanently blocked. (Live incident
+    2026-07-11: all 2,151 external_brand_crawl seeds carried no variants ->
+    the whole cohort was invisible to find_products_multi.)
+    """
+    epid = str(p.get("external_product_id") or "").strip()
+    variant_id = f"{epid}-default" if epid else "seed-variant-default"
+    return {
+        "id": variant_id,
+        "variant_id": variant_id,
+        "sku": variant_id,
+        "title": p.get("title") or "Default",
+        "price_amount": p.get("price_amount"),
+        "price": p.get("price_amount"),
+        "currency": (p.get("price_currency") or "USD").strip() or "USD",
+        "availability": "in_stock",
+        "image_url": p.get("image_url"),
+        "source": "crawl_default_variant_v1",
+    }
+
+
 async def _upsert_seed(
     p: Dict[str, Any],
     *,
     seller_ref: Optional[str],
     seed_kind: Optional[str],
 ) -> None:
+    from datetime import datetime, timezone
+
     seed_data = {
         "snapshot": {
             "title": p["title"], "description": p.get("description"), "brand": p.get("brand"),
             "product_type": p.get("product_type"), "category": p.get("category_kind"),
+            # Sellable unit + extraction time. variants: see
+            # build_default_seed_variant (zero_variants runtime blocker).
+            # extracted_at: the stale_snapshot gate (7d) falls back to
+            # updated_at when absent, which any metadata write silently
+            # extends — stamp the real extraction event instead so freshness
+            # is auditable. Crawl cohorts carry it as extracted_at when the
+            # crawler recorded one; onboarding time is the honest floor
+            # otherwise (this runner ingests fresh crawl output).
+            "variants": [build_default_seed_variant(p)],
+            "extracted_at": (
+                str(p.get("extracted_at") or "").strip()
+                or datetime.now(timezone.utc).isoformat()
+            ),
         },
         "pdp_description_raw": p.get("description"),
         "pdp_ingredients_raw": p.get("raw_inci"),
@@ -456,6 +499,26 @@ def _load(args: argparse.Namespace) -> List[Dict[str, Any]]:
 
 async def _drive(args: argparse.Namespace) -> None:
     cohort = _load(args)
+    # extracted_at honesty contract (review finding on the variants fix):
+    # snapshot.extracted_at is what the 7d stale_snapshot serving gate audits,
+    # so re-running a STALE cohort file must not mint fresh-looking extraction
+    # events. Cohort items may carry their own extracted_at; --extracted-at
+    # stamps a caller-asserted crawl time onto items that lack one; otherwise
+    # _upsert_seed falls back to run time — only honest for freshly-crawled
+    # input, hence the loud warning.
+    run_extracted_at = str(getattr(args, "extracted_at", "") or "").strip()
+    missing_ts = [p for p in cohort if not str(p.get("extracted_at") or "").strip()]
+    if run_extracted_at:
+        for p in missing_ts:
+            p["extracted_at"] = run_extracted_at
+    elif missing_ts:
+        print(
+            f"WARNING: {len(missing_ts)}/{len(cohort)} cohort items carry no extracted_at; "
+            "their snapshot.extracted_at will be stamped with RUN TIME. Only proceed if "
+            "this file is fresh crawl output — for older files pass --extracted-at "
+            "<ISO timestamp of the actual crawl>.",
+            file=sys.stderr,
+        )
     kept, dropped, decisions = dedupe_cohort(cohort)
     print(
         f"{'APPLY' if args.apply else 'DRY'} :: {len(cohort)} products "
@@ -494,6 +557,16 @@ def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--file", help="JSON array file (default: stdin)")
     parser.add_argument("--apply", action="store_true", help="write (default: dry-run)")
+    parser.add_argument(
+        "--extracted-at",
+        dest="extracted_at",
+        default="",
+        help=(
+            "ISO timestamp of the crawl that produced this cohort file; stamped as "
+            "snapshot.extracted_at on items that lack their own. Without it, items "
+            "missing extracted_at get RUN time (only honest for fresh crawl output)."
+        ),
+    )
     asyncio.run(_drive(parser.parse_args()))
     return 0
 
