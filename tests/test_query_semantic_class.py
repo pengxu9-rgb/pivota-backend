@@ -27,3 +27,41 @@ def test_classify_query_semantic_class_catches_beauty_regression_queries() -> No
     assert classify_query_semantic_class("overnight mask for dry skin") == "beauty"
     assert classify_query_semantic_class("retinal night cream") == "beauty"
     assert classify_query_semantic_class("clean makeup remover balm") == "beauty"
+
+
+def test_classify_query_semantic_class_kbeauty_forms_and_actives() -> None:
+    """K-beauty forms/actives are real high-count inventory (essence, ampoule,
+    emulsion, cica, pdrn, centella, tea tree, ceramide, ...). Missing them
+    misclassified these as 'default', blocking the external-seed beauty leg and
+    zeroing legitimate results on the agent tool."""
+    for q in [
+        "snail mucin essence",
+        "hydrating essence",
+        "centella ampoule",
+        "propolis ampoule",
+        "pdrn essence",
+        "cica cream",
+        "ceramide emulsion",
+        "tea tree toner",
+        "collagen ampoule",
+        "rice water toner",
+        "mugwort cleanser",
+        "heartleaf calming mist",
+    ]:
+        assert classify_query_semantic_class(q) == "beauty", q
+
+
+def test_classify_query_semantic_class_kbeauty_additions_do_not_over_capture() -> None:
+    """The additions are word-boundary / skincare-clear only (no bare
+    cream/oil/mask/gel), so genuinely non-beauty queries stay 'default' and the
+    junk guards keep protecting them."""
+    for q in [
+        "leather crossbody bag",
+        "dog food",
+        "running shoes",
+        "wireless earbuds",
+        "ice cream maker",
+        "olive oil",
+        "notepad",
+    ]:
+        assert classify_query_semantic_class(q) == "default", q
