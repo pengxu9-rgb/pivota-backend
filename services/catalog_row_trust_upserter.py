@@ -144,8 +144,12 @@ _PRODUCT_JOIN_SELECT = """
     ON pil.merchant_id = cp.merchant_id
    AND pil.product_id = cp.source_product_id
   LEFT JOIN external_seed_one eps
-    ON cp.merchant_id = 'external_seed'
-   AND cp.source_system = 'external_product_seeds_mirror_v1'
+    -- ADR-009: match the external-seed mirror by source_system, NOT the legacy
+    -- merchant_id='external_seed' bucket. External seeds now mirror under
+    -- per-brand observed sellers (merch_obs_…); the merchant_id conjunct made
+    -- their eps join miss (eps NULL), so _derive_source_lifecycle returned
+    -- 'unknown' and a disabled merch_obs_ seed never emitted its inactive block.
+    ON cp.source_system = 'external_product_seeds_mirror_v1'
    AND eps.external_product_id = cp.source_product_id
   LEFT JOIN merchant_store_one ms
     ON ms.merchant_id = cp.merchant_id AND ms.platform = cp.platform
