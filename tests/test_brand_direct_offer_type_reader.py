@@ -7,7 +7,7 @@ offer_type is decision/display metadata, NEVER a rank signal (P0.3).
 import inspect
 
 import services.pivot_query_service as pqs
-from services.offer_classification import OFFER_TYPE_BRAND_DIRECT, OFFER_TYPE_RETAILER
+from services.offer_classification import OFFER_TYPE_BRAND_DIRECT
 from services.pivot_query_service import (
     _brand_direct_reader_enabled,
     _resolve_offer_type,
@@ -44,10 +44,33 @@ def test_stored_offer_type_wins():
     )
 
 
-def test_external_referral_is_retailer_regardless_of_flag():
+def test_external_referral_null_stays_unknown_regardless_of_flag():
+    # Fix Plan C: a NULL stored offer_type on an external_referral row is an
+    # authoritative "unknown" (the domain-based derivation already ran at write
+    # time and found no evidence). The reader must NOT re-guess 'retailer' from
+    # the lane — neither with the brand_direct flag on nor off.
     assert (
         _resolve_offer_type(None, "external_referral", None, brand_direct_enabled=False)
-        == OFFER_TYPE_RETAILER
+        is None
+    )
+    assert (
+        _resolve_offer_type(None, "external_referral", None, brand_direct_enabled=True)
+        is None
+    )
+
+
+def test_external_referral_stored_offer_type_still_wins():
+    # The domain-derived value written to catalog_offers.offer_type is
+    # authoritative and still surfaces unchanged.
+    assert (
+        _resolve_offer_type("retailer", "external_referral", None, brand_direct_enabled=False)
+        == "retailer"
+    )
+    assert (
+        _resolve_offer_type(
+            "brand_direct", "external_referral", None, brand_direct_enabled=False
+        )
+        == "brand_direct"
     )
 
 
