@@ -228,8 +228,10 @@ async def fetch_evidence_for_keys(
     canonical record is shared across the merchant rows that resolve to one
     content_key. Per ADR-001 source precedence (brand-official > supplier >
     reseller) the canonical evidence is the brand-official one — which for the
-    crawled wedge catalog is the `external_seed` row. So prefer external_seed,
-    then the most-recently-authored, among the rows that actually carry evidence.
+    crawled wedge catalog is the external-seed row: the legacy 'external_seed'
+    bucket OR (ADR-009) a per-brand observed seller (merch_obs_…). So prefer
+    external-seed-origin evidence, then the most-recently-authored, among the
+    rows that actually carry evidence.
 
     Returns {} when no row in the cluster has authored evidence yet (the agent
     view column stays NULL — the merchant simply isn't decision-grade yet).
@@ -243,7 +245,7 @@ async def fetch_evidence_for_keys(
         FROM beauty_product_profiles
         WHERE product_key = ANY(:keys)
           AND evidence_profile IS NOT NULL
-        ORDER BY (merchant_id = 'external_seed') DESC, updated_at DESC
+        ORDER BY (merchant_id = 'external_seed' OR merchant_id LIKE 'merch_obs_%') DESC, updated_at DESC
         LIMIT 1
         """,
         {"keys": product_keys},
@@ -511,7 +513,7 @@ def evidence_safe_product_keys(
     A no-GTIN content_key is DELIBERATELY non-unique — it collapses to brand+title
     (services/catalog_identity.py) — so a content_key cluster can collide two
     DISTINCT physical products. fetch_evidence_for_keys picks ONE member's evidence
-    cluster-wide (ORDER BY external_seed DESC, updated_at DESC LIMIT 1) with no
+    cluster-wide (ORDER BY external-seed-origin DESC, updated_at DESC LIMIT 1) with no
     record of which member; assemble_row then bakes it onto pick_canonical's row,
     which may be a DIFFERENT product — i.e. Brand A's substantiated claim served on
     Brand B's listing. Restrict the evidence fetch to the canonical member UNLESS
