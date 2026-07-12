@@ -148,6 +148,34 @@ def _coerce_list(value: Any) -> List[Any]:
     return [value]
 
 
+def _llm_attributes_field_count(llm_attributes: Any) -> int:
+    """Count the populated buyer-facing attribute fields in a structural-depth
+    llm_attributes envelope (Fix Plan G). Tolerates a jsonb dict or a JSON
+    string, the versioned envelope ({"attributes": {...}}) OR a bare attributes
+    dict, and the legacy grounded-span extractor cache ({"attributes": [...]}).
+    Returns 0 for anything empty/unparseable — a durable depth signal for
+    model-readiness, never raises."""
+    data = llm_attributes
+    if isinstance(data, str):
+        try:
+            data = json.loads(data)
+        except (ValueError, TypeError):
+            return 0
+    if not isinstance(data, dict):
+        return 0
+    attrs = data.get("attributes", data)
+    if isinstance(attrs, list):  # legacy extractor cache: list of grounded spans
+        return len([a for a in attrs if isinstance(a, dict) and a.get("value")])
+    if not isinstance(attrs, dict):
+        return 0
+    reserved = {"schema_version", "vertical", "category_kind", "generated_at",
+                "model", "provenance", "source_hash", "attributes"}
+    return sum(
+        1 for k, v in attrs.items()
+        if k not in reserved and v not in (None, [], "", {})
+    )
+
+
 def _first_non_empty(*values: Any) -> Any:
     for value in values:
         if value is None:
@@ -456,6 +484,13 @@ def build_quality_payload(
         "topic_tags": _coerce_list(enrichment.get("topic_tags")),
         "brand": _as_text(brand) or None,
         "global_category_id": _as_text(category) or None,
+        # Fix Plan G (T2) — durable structure-depth signals for model_readiness.
+        # Additive; absent for legacy callers (StandardProduct / portal preview),
+        # in which case readiness simply omits their contribution.
+        "resolved_vertical": _as_text(product_data.get("resolved_vertical")) or None,
+        "llm_attribute_field_count": _llm_attributes_field_count(
+            product_data.get("llm_attributes")
+        ),
     }
 
 
@@ -752,11 +787,37 @@ def preview_quality(
 
     content_quality_score = round(avg_score * 100.0, 1)
 
-    # Model readiness: simple proxy based on L3 + attributes presence
+    # Model readiness: can a frontier agent GROUND a citation on this product?
+    #
+    # Fix Plan G (T2) re-derivation. The prior formula read ONLY the L3
+    # enrichment overlay (summary_short * 0.4 + bullets * 0.3 + L3 attributes *
+    # 0.3). That overlay is unpopulated for ~all of the live catalog, so
+    # readiness sat at ~0 (prod: avg 2.5/100, only 570/12,551 > 0) even for
+    # fully-structured products — the score was effectively unwired. It now reads
+    # the BASE catalog structure that actually exists (title / description /
+    # image / brand+category / price — the same signals content_quality uses)
+    # plus the two durable depth signals the index now carries: a resolved
+    # vertical (Fix Plan B) and a populated llm_attributes payload (Fix Plan G
+    # T1). Weights sum to 1.0; absent signals contribute 0 (honest under-fill,
+    # never a fabricated score). content_quality_score is unchanged.
+    vertical = str(payload.get("resolved_vertical") or "").strip().lower()
+    vertical_resolved = bool(vertical) and vertical != "other"
+    # Depth: how many buyer-facing attribute fields the structural-depth payload
+    # resolved, saturating at 5 (skin_type/concerns/key_ingredients/texture/
+    # finish/spf/volume — a product rarely carries all).
+    attr_field_count = int(payload.get("llm_attribute_field_count") or 0)
+    attribute_depth = min(attr_field_count / 5.0, 1.0)
+    readiness_components: List[Tuple[str, float, float]] = [
+        ("description", desc_score, 0.20),
+        ("attribute_depth", attribute_depth, 0.20),
+        ("images", 1.0 if has_any_image else 0.0, 0.15),
+        ("vertical_resolved", 1.0 if vertical_resolved else 0.0, 0.15),
+        ("title", title_score, 0.10),
+        ("brand_category", 1.0 if (brand_present and category_present) else 0.0, 0.10),
+        ("price", 1.0 if price_ok else 0.0, 0.10),
+    ]
     model_readiness_score = round(
-        (summary_score * 0.4 + (1.0 if bullets_ok else 0.0) * 0.3 + attribute_score * 0.3)
-        * 100.0,
-        1,
+        sum(s * w for _, s, w in readiness_components) * 100.0, 1
     )
 
     # Conversion potential is not computed in preview; just stub for now.
@@ -770,6 +831,10 @@ def preview_quality(
         "components": [
             {"name": name, "score": round(score * 100.0, 1)}
             for name, score in raw_components
+        ],
+        "readiness_components": [
+            {"name": name, "score": round(score * 100.0, 1), "weight": weight}
+            for name, score, weight in readiness_components
         ],
     }
     if source_backed_enabled:
