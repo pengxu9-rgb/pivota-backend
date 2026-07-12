@@ -142,6 +142,33 @@ def call_external_seed(**overrides):
     return derive_trust(inputs)
 
 
+def observed_seller_product(**overrides):
+    # ADR-009: an external seed mirrored under its per-brand observed seller
+    # (merch_obs_…) instead of the legacy 'external_seed' merchant bucket.
+    base = external_seed_product(
+        product_key="pk_obs_1",
+        content_key="ck_obs_1",
+        merchant_id="merch_obs_8887b6c53f029191",
+        source_domain="goongbe.us",
+    )
+    base.update(overrides)
+    return base
+
+
+def call_observed_seller(**overrides):
+    inputs = {
+        "subject_type": "product",
+        "subject_key": "pk_obs_1",
+        "product": observed_seller_product(),
+        "identity": approved_identity(source_listing_ref="merch_obs_8887b6c53f029191:ext_4242"),
+        "ips": eligible_ips(),
+        "external_seed": active_external_seed(),
+        "now": NOW,
+    }
+    inputs.update(overrides)
+    return derive_trust(inputs)
+
+
 # ---- HAPPY PATH -------------------------------------------------------------
 
 
@@ -367,6 +394,65 @@ def test_first_party_approved_with_null_confidence_is_public():
     assert trust["serving_decision"] == "public"
     assert REASON_CODES.IDENTITY_NOT_APPLICABLE_FIRST_PARTY in trust["serving_reason_codes"]
     assert REASON_CODES.IDENTITY_CONFIDENCE_NULL not in trust["serving_reason_codes"]
+
+
+# ---- ADR-009 OBSERVED-SELLER TIER (Option C) --------------------------------
+#
+# merch_obs_ observed sellers are external-seed CONTENT (subject to the index/
+# quality gate, like the legacy 'external_seed' lump) but are the brand's own
+# authoritative D2C crawl (exempt from the identity-COVERAGE shadow gates, like
+# a first-party merchant). Hard identity gates still apply.
+
+
+def test_observed_seller_no_ips_row_is_blocked_like_external_seed():
+    # Gate 1 applies: external-seed content with no IPS must not serve, even
+    # under a merch_obs_ merchant (closes the c1.v0.4 hole for observed sellers).
+    trust = call_observed_seller(ips=None)
+    assert trust["serving_decision"] == "blocked"
+    assert REASON_CODES.INDEX_NOT_SERVING_ELIGIBLE in trust["serving_reason_codes"]
+
+
+def test_observed_seller_ips_present_and_eligible_remains_public():
+    trust = call_observed_seller()
+    assert trust["serving_decision"] == "public"
+    assert REASON_CODES.PUBLIC_PASSTHROUGH in trust["serving_reason_codes"]
+
+
+def test_observed_seller_ips_not_eligible_still_blocks():
+    trust = call_observed_seller(ips=eligible_ips(serving_eligible=False))
+    assert trust["serving_decision"] == "blocked"
+    assert REASON_CODES.INDEX_NOT_SERVING_ELIGIBLE in trust["serving_reason_codes"]
+
+
+def test_observed_seller_no_identity_row_is_public_exempt_from_coverage_gate():
+    # The key Option C behavior: unlike the legacy 'external_seed' lump (which
+    # shadows with IDENTITY_CONFIDENCE_NULL), an observed seller's own D2C crawl
+    # is authoritative and exempt from the identity-coverage shadow gate.
+    trust = call_observed_seller(identity=None)
+    assert trust["serving_decision"] == "public"
+    assert trust["identity_status"] == "unknown"
+    assert REASON_CODES.IDENTITY_NOT_APPLICABLE_FIRST_PARTY in trust["serving_reason_codes"]
+    assert REASON_CODES.IDENTITY_CONFIDENCE_NULL not in trust["serving_reason_codes"]
+
+
+def test_observed_seller_approved_with_null_confidence_is_public():
+    trust = call_observed_seller(identity=approved_identity(identity_confidence=None))
+    assert trust["serving_decision"] == "public"
+    assert REASON_CODES.IDENTITY_NOT_APPLICABLE_FIRST_PARTY in trust["serving_reason_codes"]
+    assert REASON_CODES.IDENTITY_CONFIDENCE_NULL not in trust["serving_reason_codes"]
+
+
+def test_observed_seller_identity_conflict_still_blocks():
+    # Hard gates are NOT exempted — a real identity conflict still blocks.
+    trust = call_observed_seller(identity=approved_identity(identity_status="conflict"))
+    assert trust["serving_decision"] == "blocked"
+    assert REASON_CODES.IDENTITY_CONFLICT in trust["serving_reason_codes"]
+
+
+def test_observed_seller_review_required_still_shadows():
+    trust = call_observed_seller(identity=approved_identity(review_required=True))
+    assert trust["serving_decision"] != "public"
+    assert REASON_CODES.IDENTITY_REVIEW_REQUIRED_LIVE_READ in trust["serving_reason_codes"]
 
 
 def test_first_party_approved_with_live_read_disabled_is_public():
