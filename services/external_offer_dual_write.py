@@ -156,6 +156,19 @@ async def upsert_catalog_offer_from_seed_row(
         )
     sku_key = derive_mirror_sku_key(product_key)
     offer_id = derive_mirror_offer_id(product_key)
+    # Offer typing from the seed's role. A crawl seed with seed_kind='self' is the
+    # brand selling its OWN product on its OWN storefront (D2C), so its offer is
+    # brand_direct / first-party — matching what
+    # scripts/onboard_external_brand_from_crawl.py::_set_category_and_offer stamps.
+    # Setting it HERE closes the gap where mirror-only paths (the 15-min
+    # materialization job, the nightly reconciliation) left brand-owned offers at
+    # offer_type=NULL / is_first_party=false (the 2026-07-12 backfill of 344 Paul
+    # Mitchell / FORBEAUT / Genabelle / Fwee / Essenherb offers). `is_first_party`
+    # marks brand-ownership of the offer and is orthogonal to the referral
+    # fulfillment tier above — an external self-seed is still redirect-fulfilled.
+    is_self_seed = str(row_dict.get("seed_kind") or "").strip().lower() == "self"
+    offer_type_value = "brand_direct" if is_self_seed else None
+    is_first_party_value = is_self_seed
     raw_price = row_dict.get("price_amount")
     try:
         list_price_value = float(raw_price) if raw_price is not None else None
@@ -173,18 +186,24 @@ async def upsert_catalog_offer_from_seed_row(
         """
         INSERT INTO catalog_offers
           (offer_id, sku_key, product_key, merchant_id,
-           catalog_track, truth_tier, readiness_tier, offer_mode,
+           catalog_track, truth_tier, readiness_tier,
+           offer_type, is_first_party, offer_mode,
            channel, availability, inventory_quantity, currency,
            list_price, merchant_effective_price, estimated_best_price,
            price_confidence, source_system, source_ref, offer_payload)
         VALUES
           (:offer_id, :sku_key, :product_key, :merchant_id,
-           :catalog_track, :truth_tier, :readiness_tier, :offer_mode,
+           :catalog_track, :truth_tier, :readiness_tier,
+           :offer_type, :is_first_party, :offer_mode,
            :channel, :availability, :inventory_quantity, :currency,
            :list_price, :merchant_effective_price, :estimated_best_price,
            :price_confidence, :source_system, :source_ref,
            CAST(:offer_payload AS jsonb))
         ON CONFLICT (offer_id) DO UPDATE SET
+          -- Fill offer typing without clobbering a value onboard already set:
+          -- COALESCE only fills a NULL offer_type; is_first_party sticks true.
+          offer_type = COALESCE(catalog_offers.offer_type, EXCLUDED.offer_type),
+          is_first_party = catalog_offers.is_first_party OR EXCLUDED.is_first_party,
           availability = EXCLUDED.availability,
           inventory_quantity = EXCLUDED.inventory_quantity,
           currency = EXCLUDED.currency,
@@ -203,6 +222,8 @@ async def upsert_catalog_offer_from_seed_row(
             "catalog_track": OFFER_CATALOG_TRACK,
             "truth_tier": OFFER_TRUTH_TIER,
             "readiness_tier": OFFER_READINESS_TIER,
+            "offer_type": offer_type_value,
+            "is_first_party": is_first_party_value,
             "offer_mode": OFFER_MODE,
             "channel": OFFER_CHANNEL,
             "availability": row_dict.get("availability"),
