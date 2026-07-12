@@ -144,6 +144,7 @@ def build_external_seed_text_clause(
     include_seed_data_text_match: bool = False,
     param_prefix: str = "q",
     skip_phrase_arms: bool = False,
+    lean_columns: bool = False,
 ) -> tuple[str, Dict[str, Any]]:
     query = str(raw_query or "").strip().lower()
     if not query:
@@ -152,6 +153,20 @@ def build_external_seed_text_clause(
     values: Dict[str, Any] = {}
     clauses: List[str] = []
     tokens = seed_search_terms(query)
+
+    # lean_columns restricts EVERY per-arm match to the four cheap inline columns
+    # (destination_url/canonical_url/domain/title) and drops the seed_data->derived
+    # ->recall JSON paths from the WHERE. Those paths are trgm-indexed, but GIN
+    # trgm is lossy: every candidate the bitmap flags is heap-rechecked, and the
+    # recheck detoasts the whole TOASTed seed_data blob. For a many-token query a
+    # common token (e.g. "skin", "cream") matches thousands of rows via the long
+    # retrieval_summary arm → thousands of detoasts → the query blows past the
+    # stage-A timeout and returns nothing ("gentle foaming cleanser for oily skin"
+    # ~2.4s → timeout → 0). Dropping the seed_data arms keeps the match on the
+    # inline columns only (no detoast): worst-case ~0.06s, and title/url matching
+    # is HIGHER precision for long natural-language queries. The caller only opts
+    # into this above a token-count threshold, so short ingredient queries keep
+    # the recall-rich full path.
 
     # The whole-phrase (%a b c%) and compact (%abc%) arms are a strict SUBSET of
     # the per-token OR (%a% OR %b% OR %c%) — anything matching the phrase matches
@@ -164,7 +179,13 @@ def build_external_seed_text_clause(
     if not (skip_phrase_arms and tokens):
         key = f"{param_prefix}_like"
         values[key] = f"%{query}%"
-        clauses.append(_build_text_match_clause(param_key=key, include_seed_data_text_match=include_seed_data_text_match))
+        clauses.append(
+            _build_text_match_clause(
+                param_key=key,
+                include_seed_data_text_match=include_seed_data_text_match,
+                columns_only=lean_columns,
+            )
+        )
 
         compact = "".join(query.split())
         if compact and compact != query:
@@ -174,6 +195,7 @@ def build_external_seed_text_clause(
                 _build_text_match_clause(
                     param_key=compact_key,
                     include_seed_data_text_match=include_seed_data_text_match,
+                    columns_only=lean_columns,
                 )
             )
 
@@ -184,6 +206,7 @@ def build_external_seed_text_clause(
             _build_text_match_clause(
                 param_key=term_key,
                 include_seed_data_text_match=include_seed_data_text_match,
+                columns_only=lean_columns,
             )
         )
 
@@ -306,7 +329,17 @@ async def fetch_external_seed_rows(
     use_required_terms_filter: bool = False,
     include_total_count: bool = True,
     fast_multiterm: bool = False,
+    lean_where_min_tokens: Optional[int] = None,
 ) -> Dict[str, Any]:
+    # For queries at/above lean_where_min_tokens tokens, restrict the WHERE to the
+    # cheap inline columns (no seed_data->recall JSON arms) so a broad many-token
+    # OR can't detoast thousands of rows and blow the stage-A timeout. Below the
+    # threshold the recall-rich full path is unchanged. None/0 disables entirely.
+    lean_where_applied = bool(
+        lean_where_min_tokens
+        and lean_where_min_tokens > 0
+        and len(seed_search_terms(query)) >= lean_where_min_tokens
+    )
     where = ["status = :status"]
     values: Dict[str, Any] = {
         "status": "active",
@@ -324,6 +357,7 @@ async def fetch_external_seed_rows(
         include_seed_data_text_match=include_seed_data_text_match,
         param_prefix="q",
         skip_phrase_arms=fast_multiterm,
+        lean_columns=lean_where_applied,
     )
     if text_clause:
         where.append(text_clause)
@@ -474,6 +508,7 @@ async def fetch_external_seed_rows(
             "query_timeout": False,
             "table_missing": False,
             "scope": str(scope or "default"),
+            "lean_where_applied": lean_where_applied,
         }
     except asyncio.TimeoutError:
         return {
