@@ -597,8 +597,8 @@ LEFT JOIN LATERAL (
 ) pgm ON TRUE
 LEFT JOIN LATERAL (
     SELECT
-        bool_or(TRUE)                                AS has_store,
-        bool_or(ms.status IN ('active', 'connected')) AS has_active_store
+        bool_or(TRUE)                                                    AS has_store,
+        bool_or(lower(coalesce(ms.status, '')) IN ('active', 'connected')) AS has_active_store
     FROM merchant_stores ms
     WHERE ms.merchant_id = cp.merchant_id
 ) mstore ON TRUE
