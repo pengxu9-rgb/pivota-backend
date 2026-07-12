@@ -281,6 +281,82 @@ def resolve_vertical(
 
 
 # --------------------------------------------------------------------------- #
+# Intake structure helpers (Fix Plan B) — shared by the two catalog_products
+# write sites (ingest_standard_products + the external-seed mirror) so their
+# category normalization and unresolved-vertical accounting cannot drift.
+# Pure functions; no I/O. Additive to this leaf module.
+# --------------------------------------------------------------------------- #
+
+# The category signal fields resolve_vertical reads off a product mapping. A row
+# whose vertical resolves to 'other' with ALL of these empty never carried any
+# machine-readable structure at all — that is the "unresolved" cohort T3 counts
+# and the intake brake trips on.
+_VERTICAL_SIGNAL_FIELDS: Tuple[str, ...] = ("product_type", "category", "category_path")
+
+# Default share of unresolved-vertical rows above which an intake run should fail
+# (the founder's "stop ingesting structureless garbage" brake). Configurable per
+# call site / env; this is only the fallback.
+DEFAULT_UNRESOLVED_VERTICAL_FAIL_THRESHOLD = 0.20
+
+
+def normalize_category(value: Any) -> Optional[str]:
+    """Case/trim normalization for the free-text ``category`` column (T4).
+
+    Lowercases and collapses internal whitespace so "Haircare", "haircare " and
+    "Hair  Care" converge. This is CASE/TRIM ONLY — it performs NO semantic
+    renaming (that is a separate ontology effort). Empty / whitespace-only input
+    returns ``None`` so a blank stays NULL rather than an empty string.
+    """
+    if value is None:
+        return None
+    norm = re.sub(r"\s+", " ", str(value)).strip().lower()
+    return norm or None
+
+
+def is_vertical_unresolved(resolved: Optional[str], product: Mapping[str, Any]) -> bool:
+    """T3: a row is "unresolved" when ``resolve_vertical`` returned ``'other'``
+    AND it carried no category/product_type/category_path signal at all.
+
+    A row that resolved to a real vertical is never unresolved. A row that
+    resolved 'other' but DID carry category text (just no keyword match) is a
+    lexicon gap, not a structure gap, so it is NOT counted here — that keeps the
+    brake from tripping on genuinely-categorized-but-uncovered products.
+    """
+    if str(resolved or "").strip().lower() != "other":
+        return False
+    for key in _VERTICAL_SIGNAL_FIELDS:
+        if str(product.get(key) or "").strip():
+            return False
+    return True
+
+
+def summarize_unresolved_vertical(
+    unresolved: int,
+    total: int,
+    *,
+    threshold: float = DEFAULT_UNRESOLVED_VERTICAL_FAIL_THRESHOLD,
+) -> dict:
+    """Build the per-run intake summary + brake verdict for T3.
+
+    Returns the unresolved count/total, the share, the threshold, a one-line
+    ``summary`` string (``unresolved_vertical: N/M (P%)``), and ``should_fail``
+    — True when the share strictly exceeds ``threshold``. An empty run
+    (``total == 0``) never fails.
+    """
+    total = max(int(total), 0)
+    unresolved = max(int(unresolved), 0)
+    share = (unresolved / total) if total else 0.0
+    return {
+        "unresolved_vertical": unresolved,
+        "total": total,
+        "share": share,
+        "threshold": threshold,
+        "summary": f"unresolved_vertical: {unresolved}/{total} ({share * 100:.1f}%)",
+        "should_fail": bool(total) and share > threshold,
+    }
+
+
+# --------------------------------------------------------------------------- #
 # VerticalProfile registry.
 # --------------------------------------------------------------------------- #
 
