@@ -45,11 +45,11 @@ from services.skincare_attributes import (
 )
 from services.offer_buyability import annotate_offer_nodes
 from services.offer_classification import (
-    OFFER_TYPE_RETAILER,
     classify_offer_type,
     is_first_party_track,
     select_best_us_offer,
 )
+from services.offer_seller_identity import derive_offer_seller_identity
 from services.pdp_category_classifier import category_path_prefix_for_query
 from services.beauty_external_ranking import (
     BEAUTY_EXTERNAL_RANKING_AUDIT_VERSION,
@@ -577,16 +577,20 @@ def _resolve_offer_type(
     *,
     brand_direct_enabled: bool,
 ) -> Optional[str]:
-    """Resolve an offer's type. Stored value wins. Else derive from track:
-    external_referral -> retailer; internal_merchant -> brand_direct ONLY when
-    the seller is a verified brand (classify_offer_type enforces the
-    brand_relationship check) AND the reader flag is on — else None (never
-    assumed). This is the P1 'wire the reader' step that makes a verified
+    """Resolve an offer's type. Stored value wins. Else fall back by track:
+    external_referral -> None ("unknown") — a NULL stored offer_type on an
+    external_referral row is AUTHORITATIVE: the write/backfill path already ran
+    the domain-based seller-identity derivation (services/offer_seller_identity.py)
+    and left it NULL for want of evidence, so the read path must NOT re-guess
+    'retailer' from the lane (Fix Plan C: do not guess). internal_merchant ->
+    brand_direct ONLY when the seller is a verified brand (classify_offer_type
+    enforces the brand_relationship check) AND the reader flag is on — else None
+    (never assumed). This is the P1 'wire the reader' step that makes a verified
     brand_direct claim load-bearing."""
     if stored_offer_type is not None:
         return stored_offer_type
     if catalog_track == "external_referral":
-        return classify_offer_type(catalog_track)
+        return classify_offer_type(catalog_track)  # None post-Fix-Plan-C
     if brand_direct_enabled and catalog_track == "internal_merchant":
         return classify_offer_type(catalog_track, brand_relationship)
     return None
@@ -1646,6 +1650,43 @@ def _external_visible_option_labels(candidate: RankedExternalBeautyCandidate) ->
     return labels
 
 
+def _external_seed_offer_identity(
+    candidate: RankedExternalBeautyCandidate,
+) -> Dict[str, Any]:
+    """Fix Plan C: derive WHO SELLS a directly-served external seed.
+
+    The external-seed fallback lane serves rows straight from
+    external_product_seeds and never touches catalog_offers, so these offers
+    have no domain-derived offer_type written for them. Classify by the seed's
+    OWN domain via the shared derivation (the same module the write path uses):
+    a known-retailer host -> 'retailer', a brand-owned host -> 'brand_direct'
+    (first-party / official), everything else -> None ("unknown"). This replaces
+    the old blanket 'retailer' guess, which mislabeled every brand-D2C seed.
+
+    No official_domain is available on this lane, so brand_direct is recognized
+    only via the brand-token-in-domain rule; a brand seed on an unrelated host
+    honestly resolves to unknown rather than being guessed either way.
+
+    Brand MUST come from the seed's DECLARED fields, never candidate.brand:
+    beauty_external_ranking falls candidate.brand back to the domain host when a
+    seed carries no brand, and passing that host as `brand` would make
+    brand_owns_domain(host, host) trivially true -> a brandless reseller seed
+    would be over-claimed as brand_direct/first-party/official. A seed with no
+    declared brand passes brand=None and correctly resolves to retailer (rule 0)
+    or unknown (rule 3), never brand_direct."""
+    seed_data = candidate.seed_data or {}
+    declared_brand = (
+        seed_data.get("vendor")
+        or seed_data.get("brand")
+        or seed_data.get("manufacturer")
+    )
+    return derive_offer_seller_identity(
+        domain=candidate.domain,
+        canonical_url=candidate.canonical_url or candidate.destination_url,
+        brand=declared_brand,
+    )
+
+
 def _build_external_item_from_candidate(
     candidate: RankedExternalBeautyCandidate,
     *,
@@ -1653,6 +1694,7 @@ def _build_external_item_from_candidate(
 ) -> PivotResultItem:
     row = candidate.row
     seed_data = candidate.seed_data
+    seller_identity = _external_seed_offer_identity(candidate)
     pricing = PivotPricing(
         currency=candidate.price_currency or row.get("price_currency"),
         list_price=_to_decimal(candidate.price_amount if candidate.price_amount is not None else row.get("price_amount")),
@@ -1698,9 +1740,13 @@ def _build_external_item_from_candidate(
                 source_system="external_product_seeds",
                 availability=candidate.availability or row.get("availability"),
                 inventory_quantity=None,
-                offer_type=OFFER_TYPE_RETAILER,
+                offer_type=seller_identity["offer_type"],
                 market=str(seed_data.get("market") or row.get("market") or "US"),
-                is_first_party=False,
+                is_first_party=bool(seller_identity["is_first_party"]),
+                # A brand-owned external seed is served from the brand's OWN
+                # domain -> official_source (the trust signal), mirroring the
+                # canonical offer node. Retailer/unknown seeds stay False.
+                official_source=bool(seller_identity["is_first_party"]),
                 pricing=pricing,
                 incentives=[],
             )

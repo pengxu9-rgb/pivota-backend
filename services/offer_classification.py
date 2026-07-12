@@ -6,7 +6,12 @@ first-party, and which market they serve -- so an agent can resolve a single
 best US offer and frame "why buy direct" honestly.
 
 Two deterministic rules, no fabrication:
-  * external_referral offers are always 'retailer' / not first-party.
+  * external_referral offers are never first-party, but the ingest LANE alone
+    does not reveal the SELLER — a brand's own D2C storefront and a marketplace
+    mirror both ingest as external_referral. So offer_type = None ("unknown")
+    here; the real brand-vs-retailer verdict is derived from the offer DOMAIN by
+    services/offer_seller_identity.py and STORED at write/backfill time. This
+    function never guesses 'retailer' from the lane (Fix Plan C: do not guess).
   * internal_merchant offers are first-party, but 'brand_direct' ONLY when the
     merchant is explicitly verified as the brand (carried in via
     catalog_merchants.metadata_json.brand_relationship). Unverified internal
@@ -46,11 +51,16 @@ def classify_offer_type(
     brand_relationship: Optional[str] = None,
 ) -> Optional[str]:
     """Resolve offer_type from the offer's track + the merchant's *verified*
-    brand relationship. Returns None ("unknown") for an internal merchant that
-    has not been verified as the brand -- we never assume brand_direct.
+    brand relationship. Returns None ("unknown") when the LANE cannot honestly
+    name the seller: an external_referral (seller = brand-or-retailer, decided
+    by domain, not the lane) or an internal merchant not verified as the brand.
+    We never assume 'retailer' from external_referral or 'brand_direct' from an
+    unverified internal merchant.
     """
     if catalog_track == "external_referral":
-        return OFFER_TYPE_RETAILER
+        # Seller identity is domain-derived + stored (services/offer_seller_identity.py);
+        # a stored NULL means "no domain evidence" -> unknown. Do NOT guess retailer.
+        return None
     if catalog_track == "internal_merchant":
         if (brand_relationship or "").strip().lower() == OFFER_TYPE_BRAND_DIRECT:
             return OFFER_TYPE_BRAND_DIRECT

@@ -9,15 +9,18 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 from models.catalog import OfferNode, PivotPricing
 from services.offer_classification import (
     OFFER_TYPE_BRAND_DIRECT,
-    OFFER_TYPE_RETAILER,
     classify_offer_type,
     is_first_party_track,
     select_best_us_offer,
 )
 
 
-def test_external_referral_is_retailer_not_first_party():
-    assert classify_offer_type("external_referral") == OFFER_TYPE_RETAILER
+def test_external_referral_is_unknown_not_first_party():
+    # Fix Plan C: the lane cannot name the seller (brand-D2C and marketplace
+    # mirror both ingest as external_referral), so offer_type is None ("unknown")
+    # here — the brand-vs-retailer verdict is domain-derived + stored elsewhere.
+    # We never guess 'retailer' from the lane. Still never first-party.
+    assert classify_offer_type("external_referral") is None
     assert is_first_party_track("external_referral") is False
 
 
