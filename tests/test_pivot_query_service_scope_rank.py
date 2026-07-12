@@ -196,3 +196,44 @@ def test_canonical_match_reason_v2_falls_back_to_rank_score_when_no_split(monkey
     reason = pivot_query_service._canonical_match_reason(citable_row, "anuko hair butter")
     assert reason["candidate_score"] == 0.9
     assert reason["structure_score"] == 0.0
+
+
+# ---------------------------------------------------------------------------
+# Part A — token-overlap recall on the main cross-merchant lane
+# ---------------------------------------------------------------------------
+
+
+def test_canonical_token_match_flag_default_off():
+    """Default OFF ⇒ the flag helper returns False ⇒ token_where/token_score
+    stay empty ⇒ byte-identical SQL. (Enabled in prod via PIVOT_CANONICAL_TOKEN_MATCH.)"""
+    import os
+    prev = os.environ.pop("PIVOT_CANONICAL_TOKEN_MATCH", None)
+    try:
+        assert pivot_query_service._canonical_token_match_enabled() is False
+    finally:
+        if prev is not None:
+            os.environ["PIVOT_CANONICAL_TOKEN_MATCH"] = prev
+
+
+def test_canonical_token_match_flag_on(monkeypatch):
+    monkeypatch.setenv("PIVOT_CANONICAL_TOKEN_MATCH", "true")
+    assert pivot_query_service._canonical_token_match_enabled() is True
+
+
+def test_canonical_recall_wires_flag_gated_token_overlap():
+    """The main recall lane must gain a flag-gated token-overlap clause so a
+    multi-word query ("hydrating cleanser", "snail mucin essence") whose words
+    appear non-contiguously in a title still matches — the whole-phrase
+    LIKE :query_like alone only matches the verbatim phrase."""
+    src = _src(pivot_query_service._fetch_canonical_search_rows)
+    assert "_canonical_token_match_enabled()" in src, "recall must consult the token-match flag"
+    assert "token_where" in src and "token_score" in src, "token clauses must be named fragments"
+    assert "{token_where}" in src, "token_where must be interpolated into the WHERE"
+    assert "{token_score}" in src, "token_score must contribute to ranking"
+    # Reuses the shared tokenizer + the >=2 overlap floor (junk guard).
+    assert "_citable_query_tokens(lowered)" in src
+    assert "len(_tokens) >= 2" in src
+    assert "cctok_min" in src
+    # Cross-merchant only (merchant-scoped queries already see their own rows).
+    idx = src.index("token_where = \"\"")
+    assert "if not merchant_id and _canonical_token_match_enabled()" in src[idx:idx + 400]
