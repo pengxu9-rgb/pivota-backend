@@ -8621,6 +8621,21 @@ async def _handle_find_products_multi_inner(
     # text and rank structured-evidence products higher — not hard-zero when structured ingredient_ids are
     # absent. Scoped to the ingredient gate only (does not widen the broader non_strict recall). (#1659)
     beauty_ingredient_text_recall_enabled = query_semantic_class == "beauty"
+    # Category/attribute text-recall on the STRICT agent surface. Mirrors the
+    # ingredient text-recall #1659 made always-on for beauty: a category query like
+    # "green tea toner" should match toners that NAME the category in their text
+    # instead of hard-zeroing when structured visible_attributes are absent. On the
+    # strict agent surface (agent_api) essentially no products carry structured
+    # visible_attributes, so the structured-only category/attribute gate blocks
+    # EVERY beauty category query. Flag-gated (STRICT_BEAUTY_CATEGORY_TEXT_RECALL,
+    # default OFF ⇒ byte-identical). Precision preserved: the category/attribute
+    # word must appear in the product TITLE/TYPE/TAGS (never description), and the
+    # merchant-status gate + downstream precision still apply.
+    beauty_category_text_recall_enabled = query_semantic_class == "beauty" and (
+        not strict_serving_mode
+        or (os.getenv("STRICT_BEAUTY_CATEGORY_TEXT_RECALL") or "").strip().lower()
+        in {"1", "true", "yes", "on"}
+    )
     expanded_shopping_beauty_prefetch = False
     # Apply the generic-default precision gate to ANY default-class generic query with no structured
     # intents, regardless of source or serving mode. The OR-over-terms lexical recall otherwise leaks
@@ -10140,14 +10155,22 @@ async def _handle_find_products_multi_inner(
                 (product.product_type or "").lower(),
             ]
         ).strip()
-        beauty_text_blob = blob_for_filters if non_strict_beauty_text_recall_enabled else pet_accessory_blob
-        visible_attribute_blob = " ".join(
+        # title/type/tags ONLY (no description) — the precise blob for strict-surface
+        # category/attribute text recall.
+        title_type_tag_blob = " ".join(
             [
                 (product.title or "").lower(),
                 (product.product_type or "").lower(),
                 " ".join(str(tag).lower() for tag in (getattr(product, "tags", None) or []) if tag),
             ]
         ).strip()
+        if non_strict_beauty_text_recall_enabled:
+            beauty_text_blob = blob_for_filters
+        elif beauty_category_text_recall_enabled:
+            beauty_text_blob = title_type_tag_blob
+        else:
+            beauty_text_blob = pet_accessory_blob
+        visible_attribute_blob = title_type_tag_blob
         if non_strict_beauty_text_recall_enabled:
             visible_attribute_blob = beauty_text_blob
         product_visible_attributes = _normalize_product_visible_attributes(product)
@@ -10205,13 +10228,13 @@ async def _handle_find_products_multi_inner(
                     )
                 if (
                     not matched
-                    and non_strict_beauty_text_recall_enabled
+                    and (non_strict_beauty_text_recall_enabled or beauty_category_text_recall_enabled)
                 ):
                     matched = _normalized_intent_terms_match(beauty_text_blob, list(group["product_terms"]))
             elif not matched:
                 matched = _normalized_intent_terms_match(pet_accessory_blob, list(group["product_terms"]))
             if matched:
-                if matched and not structured_match and non_strict_beauty_text_recall_enabled:
+                if matched and not structured_match and (non_strict_beauty_text_recall_enabled or beauty_category_text_recall_enabled):
                     non_strict_beauty_text_recall_used = True
                 matched_visible_category_labels.append(label)
         if active_visible_category_intents and not matched_visible_category_labels:
@@ -10237,13 +10260,13 @@ async def _handle_find_products_multi_inner(
                     )
                 if (
                     not matched
-                    and non_strict_beauty_text_recall_enabled
+                    and (non_strict_beauty_text_recall_enabled or beauty_category_text_recall_enabled)
                 ):
                     matched = _normalized_intent_terms_match(visible_attribute_blob, list(group["product_terms"]))
             elif not matched:
                 matched = _normalized_intent_terms_match(visible_attribute_blob, list(group["product_terms"]))
             if matched:
-                if matched and not structured_match and non_strict_beauty_text_recall_enabled:
+                if matched and not structured_match and (non_strict_beauty_text_recall_enabled or beauty_category_text_recall_enabled):
                     non_strict_beauty_text_recall_used = True
                 matched_visible_attribute_labels.append(label)
         if active_visible_attribute_intents and (
