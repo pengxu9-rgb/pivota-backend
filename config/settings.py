@@ -425,6 +425,29 @@ class Settings(BaseSettings):
         os.getenv("AGENT_ACP_LIVE_MAX_CENTS", "200") or "200"
     )
 
+    # ---- Capability-based checkout gate (Fix Plan A, option (ii)) ----
+    # Lets a protocol-capable merchant (a row in pcs_merchant_capabilities) create an
+    # order WITHOUT a merchant_psps row — for the protocol/deferred-payment lane only.
+    # Default OFF (fail-closed): with the flag off, order-create keeps its exact
+    # today's behavior (a missing PSP is still a hard 400). Same-named flag as the
+    # PIVOTA-Agent serving gate (AGENT_CHECKOUT_CAPABILITY_GATE). This flag ONLY
+    # relaxes the order-CREATE PSP requirement on the deferred-payment path; it does
+    # NOT authorize a synchronous charge against a non-PSP merchant (see the mapped
+    # charge-path seam in the runbook).
+    agent_checkout_capability_gate: bool = (
+        os.getenv("AGENT_CHECKOUT_CAPABILITY_GATE", "false").strip().lower()
+        in {"true", "1", "on", "yes"}
+    )
+    # Canary scope: comma-separated merchant ids. When NON-EMPTY, the capability-gate
+    # bypass applies ONLY to a merchant on this list (so the first flip opens exactly
+    # one pilot merchant, never everyone). EMPTY (default) = no per-merchant
+    # restriction (the boolean flag governs globally). Never widens on its own.
+    agent_checkout_capability_gate_merchants: frozenset[str] = frozenset(
+        m.strip()
+        for m in os.getenv("AGENT_CHECKOUT_CAPABILITY_GATE_MERCHANTS", "").split(",")
+        if m.strip()
+    )
+
     # Readiness audit / thin-slice flags
     feature_readiness_audit: bool = os.getenv("FEATURE_READINESS_AUDIT", "false").lower() == "true"
     feature_readiness_ucp_thin_slice: bool = os.getenv("FEATURE_READINESS_UCP_THIN_SLICE", "false").lower() == "true"

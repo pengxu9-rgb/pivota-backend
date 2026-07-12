@@ -129,7 +129,7 @@ def _install_order_create_harness(
     ):
         return "stripe", {"route_id": "route_ws12"}
 
-    async def fake_resolve_active_order_psp(_merchant_id: str, _provider_hint):
+    async def fake_resolve_active_order_psp(_merchant_id: str, _provider_hint, **_kwargs):
         return "stripe", "psp_ws12"
 
     async def fake_ensure_explicit_preferred_psp_available(**_kwargs):

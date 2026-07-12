@@ -85,7 +85,7 @@ def _install_success_harness(monkeypatch: pytest.MonkeyPatch, module) -> dict:
     ):
         return "stripe", {"route_id": "route_ws11"}
 
-    async def fake_resolve_active_order_psp(_merchant_id: str, _provider_hint):
+    async def fake_resolve_active_order_psp(_merchant_id: str, _provider_hint, **_kwargs):
         return "stripe", "psp_ws11"
 
     async def fake_create_order(order_data):
