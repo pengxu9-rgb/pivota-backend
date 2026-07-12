@@ -97,6 +97,42 @@ def test_baseline_eligible_product_classified_correctly():
     assert state["content_quality_score"] == 80.0
 
 
+def test_connected_merchant_with_no_active_store_blocks_serving():
+    """A connected merchant (has ≥1 store) whose stores are ALL non-active
+    (retired_test_rig / inactive / disconnected) must not serve, even if the
+    product itself is otherwise fully eligible."""
+    state = _classify_product(
+        _full_row(merchant_has_store=True, merchant_has_active_store=False),
+        regression_domains=set(),
+    )
+    assert state["blocker_code"] == "merchant_store_inactive"
+    assert state["serving_eligible"] is False
+    assert state["index_eligible"] is False
+
+
+def test_connected_merchant_with_active_store_still_serves():
+    """The store guard must not fire when the merchant has an active store."""
+    state = _classify_product(
+        _full_row(merchant_has_store=True, merchant_has_active_store=True),
+        regression_domains=set(),
+    )
+    assert state["blocker_code"] == "none"
+    assert state["serving_eligible"] is True
+
+
+def test_external_seed_without_store_row_is_exempt_from_store_guard():
+    """CRITICAL: external seeds (and merch_obs_ observed sellers) have NO
+    merchant_stores row → merchant_has_store=False → the store guard must NOT
+    fire, so the whole external-seed cohort keeps serving."""
+    state = _classify_product(
+        _full_row(merchant_has_store=False, merchant_has_active_store=False),
+        regression_domains=set(),
+    )
+    assert state["blocker_code"] == "none"
+    assert state["serving_eligible"] is True
+    assert state["index_eligible"] is True
+
+
 def test_quality_score_exactly_at_threshold_passes():
     state = _classify_product(
         _full_row(content_quality_score=QUALITY_SCORE_THRESHOLD),

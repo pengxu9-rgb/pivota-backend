@@ -20,6 +20,7 @@ from db.database import database
 # metric name, score, or pipeline term.
 BLOCKER_CODE_TO_REASON: Dict[str, str] = {
     "not_live": "This product isn't live in your store yet. Publish it, then re-sync.",
+    "merchant_store_inactive": "Your store is no longer connected, so its products aren't listed for shopping agents. Reconnect your store to resume serving.",
     "non_core_product": "This looks like a sample, gift, or add-on, so it isn't listed as a standalone product for shopping agents.",
     "no_seed": "We're still preparing this product for AI shopping agents. Re-sync if it doesn't appear shortly.",
     "no_extraction": "We couldn't read this product's details. Make sure it has a clear title and description, then re-sync.",

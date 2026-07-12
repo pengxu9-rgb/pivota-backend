@@ -277,9 +277,11 @@ def _derive_source_lifecycle(
     # Merchant store lifecycle.
     if merchant_store is not None:
         status = str(_get(merchant_store, "status") or "").lower()
-        if status == "active":
+        if status in ("active", "connected"):
             return {"state": "active"}
-        if status in ("inactive", "disconnected"):
+        # retired_test_rig is a decommissioned demo/test store: it must be treated
+        # as inactive (not "unknown"), else its catalog leaks into serving.
+        if status in ("inactive", "disconnected", "retired_test_rig"):
             reasons.append(REASON_CODES.MERCHANT_STORE_INACTIVE)
             return {"state": "inactive"}
         return {"state": "unknown"}
