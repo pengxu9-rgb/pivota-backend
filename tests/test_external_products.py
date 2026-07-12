@@ -8117,3 +8117,148 @@ async def test_shop_gateway_find_products_multi_generic_default_ui_skips_externa
     assert metadata.get("query_semantic_class") == "default"
     assert metadata.get("external_seed_executed") is False
     assert metadata.get("external_seed_skip_reason") == "semantic_class_blocked"
+
+
+@pytest.mark.asyncio
+async def test_shop_gateway_find_products_multi_catalog_brand_allows_external_seed_fallback(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A bare brand-name query that names a real catalog brand (dynamic dict)
+    must NOT be blocked by the default-semantic-class external-seed gate — the
+    brand's own external-seed products should be allowed to surface (#1769
+    parity on the Python find_products lane)."""
+    import routes.agent_shop_gateway as agent_shop_gateway_module
+    import routes.agent_api as agent_api_module
+
+    async def fake_fetch_all(query: str, values=None):
+        return []
+
+    seed_fetch_calls = {"n": 0}
+
+    async def recording_fetch_external_seed_rows(**kwargs):
+        seed_fetch_calls["n"] += 1
+        # Empty result keeps the downstream pipeline simple; the assertion under
+        # test is that the fetch is ATTEMPTED (gate opened), not blocked.
+        return {"rows": [], "query_timeout": False, "total_count": 0}
+
+    async def fake_prefetched_external_seed_wrappers(request_metadata):
+        return []
+
+    # Force "acropass" to detect as a catalog brand regardless of the live dict.
+    async def fake_ensure_brand_dictionary_loaded():
+        return None
+
+    def fake_detect_brand_query(query):
+        if "acropass" in str(query or "").lower():
+            return {
+                "brand_like": True,
+                "brand_terms": ["acropass"],
+                "mode": "catalog",
+                "has_category_hint": False,
+                "scope": "broad",
+            }
+        return {"brand_like": False, "brand_terms": [], "mode": None, "has_category_hint": False, "scope": None}
+
+    monkeypatch.setattr(agent_shop_gateway_module.database, "fetch_all", fake_fetch_all)
+    monkeypatch.setattr(
+        agent_shop_gateway_module,
+        "fetch_external_seed_rows",
+        recording_fetch_external_seed_rows,
+    )
+    monkeypatch.setattr(
+        agent_shop_gateway_module,
+        "_build_prefetched_external_seed_wrappers",
+        fake_prefetched_external_seed_wrappers,
+    )
+    monkeypatch.setattr(agent_api_module, "_ensure_brand_dictionary_loaded", fake_ensure_brand_dictionary_loaded)
+    monkeypatch.setattr(agent_api_module, "_detect_brand_query", fake_detect_brand_query)
+    monkeypatch.setattr(agent_shop_gateway_module, "MULTI_SEARCH_DELEGATE_SHOPPING_TO_UPSTREAM", False)
+    monkeypatch.setattr(agent_shop_gateway_module, "MULTI_SEARCH_SKIP_HISTORY_SHOPPING", True)
+
+    payload = agent_shop_gateway_module.FindProductsMultiPayload(
+        search=agent_shop_gateway_module.MultiSearchFilters(
+            query="acropass",
+            page=1,
+            limit=10,
+            in_stock_only=True,
+        ),
+        metadata=agent_shop_gateway_module.RequestMetadata(source="shopping-agent-ui"),
+    )
+    result = await agent_shop_gateway_module._handle_find_products_multi(
+        payload,
+        {"source": "shopping-agent-ui"},
+        agent_shop_gateway_module.BackgroundTasks(),
+    )
+
+    metadata = result.get("metadata") or {}
+    # Gate opened: brand detected, external-seed fetch attempted, NOT blocked.
+    assert metadata.get("brand_query_detected") is True
+    assert metadata.get("brand_query_terms") == ["acropass"]
+    assert metadata.get("external_seed_skip_reason") != "semantic_class_blocked"
+    assert seed_fetch_calls["n"] >= 1
+
+
+@pytest.mark.asyncio
+async def test_shop_gateway_find_products_multi_heuristic_brand_does_not_open_external_seed_gate(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Only catalog/static brand detection opens the external-seed gate. The
+    looser suffix-pattern heuristic (mode='heuristic') must NOT — it is not a
+    proof the brand exists in the catalog, so a default-class query that merely
+    looks brand-like stays blocked (no junk widening)."""
+    import routes.agent_shop_gateway as agent_shop_gateway_module
+    import routes.agent_api as agent_api_module
+
+    async def fake_fetch_all(query: str, values=None):
+        return []
+
+    async def fail_fetch_external_seed_rows(**kwargs):
+        raise AssertionError("heuristic-only brand detection must not execute external seed search")
+
+    async def fail_prefetched_external_seed_wrappers(request_metadata):
+        raise AssertionError("heuristic-only brand detection must not load prefetched external seed wrappers")
+
+    async def fake_ensure_brand_dictionary_loaded():
+        return None
+
+    def fake_detect_brand_query(query):
+        # Simulate a suffix-pattern heuristic hit (looser signal, unverified).
+        return {
+            "brand_like": True,
+            "brand_terms": ["mystery labs"],
+            "mode": "heuristic",
+            "has_category_hint": False,
+            "scope": "broad",
+        }
+
+    monkeypatch.setattr(agent_shop_gateway_module.database, "fetch_all", fake_fetch_all)
+    monkeypatch.setattr(agent_shop_gateway_module, "fetch_external_seed_rows", fail_fetch_external_seed_rows)
+    monkeypatch.setattr(
+        agent_shop_gateway_module,
+        "_build_prefetched_external_seed_wrappers",
+        fail_prefetched_external_seed_wrappers,
+    )
+    monkeypatch.setattr(agent_api_module, "_ensure_brand_dictionary_loaded", fake_ensure_brand_dictionary_loaded)
+    monkeypatch.setattr(agent_api_module, "_detect_brand_query", fake_detect_brand_query)
+    monkeypatch.setattr(agent_shop_gateway_module, "MULTI_SEARCH_DELEGATE_SHOPPING_TO_UPSTREAM", False)
+    monkeypatch.setattr(agent_shop_gateway_module, "MULTI_SEARCH_SKIP_HISTORY_SHOPPING", True)
+
+    payload = agent_shop_gateway_module.FindProductsMultiPayload(
+        search=agent_shop_gateway_module.MultiSearchFilters(
+            query="mystery labs",
+            page=1,
+            limit=10,
+            in_stock_only=True,
+        ),
+        metadata=agent_shop_gateway_module.RequestMetadata(source="shopping-agent-ui"),
+    )
+    result = await agent_shop_gateway_module._handle_find_products_multi(
+        payload,
+        {"source": "shopping-agent-ui"},
+        agent_shop_gateway_module.BackgroundTasks(),
+    )
+
+    metadata = result.get("metadata") or {}
+    assert metadata.get("brand_query_detected") is False
+    assert metadata.get("external_seed_executed") is False
+    assert metadata.get("external_seed_skip_reason") == "semantic_class_blocked"

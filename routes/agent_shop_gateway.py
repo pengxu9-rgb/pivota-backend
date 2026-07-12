@@ -8580,8 +8580,40 @@ async def _handle_find_products_multi_inner(
         and not active_visible_option_intents
         and not active_ingredient_intents
     )
+    # Bare brand-name queries (e.g. "acropass") frequently classify as the
+    # "default" semantic class, which blocks the external-seed leg — where
+    # observed / crawl-seed brands live — so the query returns zero instead of
+    # that brand's own products. When the query names a brand that ACTUALLY
+    # EXISTS in the catalog (dynamic dictionary, GATEWAY_DYNAMIC_BRAND_DETECT) or
+    # a curated static brand, allow the external-seed fallback: the seed fetch is
+    # scoped by the query terms so it returns brand-matching rows (not the
+    # off-domain lexical junk this gate guards against), and the
+    # generic_default_precision_gate still filters multi-term default queries.
+    # Mirrors the Node gateway brand-detection guard (#1769).
+    brand_query_detected = False
+    brand_query_terms: List[str] = []
+    try:
+        from routes.agent_api import (
+            _detect_brand_query as _agent_detect_brand_query,
+            _ensure_brand_dictionary_loaded as _agent_ensure_brand_dictionary_loaded,
+        )
+
+        await _agent_ensure_brand_dictionary_loaded()
+        _brand_detect = _agent_detect_brand_query(q_ascii or q_lower) or {}
+        if _brand_detect.get("brand_like") and str(_brand_detect.get("mode") or "") in {
+            "catalog",
+            "static",
+        }:
+            brand_query_detected = True
+            brand_query_terms = [str(t) for t in (_brand_detect.get("brand_terms") or []) if t]
+    except Exception:
+        # Never let brand detection break recall — fall back to the prior gate.
+        brand_query_detected = False
+        brand_query_terms = []
     semantic_external_seed_fallback_allowed = bool(
-        strict_serving_mode or query_semantic_class in {"beauty", "fragrance"}
+        strict_serving_mode
+        or query_semantic_class in {"beauty", "fragrance"}
+        or brand_query_detected
     )
 
     # Detect special intents for downstream filtering/UX.
@@ -9231,6 +9263,8 @@ async def _handle_find_products_multi_inner(
                     "budget_fx_unresolved": budget_fx_unresolved,
                     "external_seed_executed": False,
                     "external_seed_skip_reason": external_seed_skip_reason,
+                    "brand_query_detected": brand_query_detected,
+                    "brand_query_terms": brand_query_terms,
                     "fetched_at": datetime.utcnow().isoformat(),
                     "merchants_searched": 0,
                     **(
@@ -11063,6 +11097,8 @@ async def _handle_find_products_multi_inner(
                 "external_seed_broad_scope_rows": external_seed_broad_scope_rows,
                 "external_seed_executed": bool(external_seed_rows_fetched or external_filtered_count),
                 "external_seed_skip_reason": external_seed_skip_reason,
+                "brand_query_detected": brand_query_detected,
+                "brand_query_terms": brand_query_terms,
                 "external_seed_cache_hit": False,
                 "external_seed_rows_built": len(external_seed_wrappers),
                 "external_seed_returned_count": external_filtered_count,
@@ -11086,6 +11122,8 @@ async def _handle_find_products_multi_inner(
                 "route_health": {
                     "external_seed_executed": bool(external_seed_rows_fetched or external_filtered_count),
                     "external_seed_skip_reason": external_seed_skip_reason,
+                    "brand_query_detected": brand_query_detected,
+                    "brand_query_terms": brand_query_terms,
                     "external_seed_cache_hit": False,
                     "external_seed_query_timeout": external_seed_query_timeout,
                     "external_seed_rows_fetched": external_seed_rows_fetched,
