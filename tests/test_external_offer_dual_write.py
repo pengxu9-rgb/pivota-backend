@@ -152,10 +152,14 @@ async def test_self_seed_projects_brand_direct_first_party(monkeypatch):
     params = fake.executed[0]["params"]
     assert params["offer_type"] == "brand_direct"
     assert params["is_first_party"] is True
-    # ON CONFLICT is non-clobbering: only fills a NULL offer_type, is_first_party sticks.
+    # ON CONFLICT: a known-retailer verdict (EXCLUDED.offer_type='retailer') is
+    # authoritative and OVERRIDES a wrongly-stored value; otherwise it only fills a
+    # NULL offer_type and is_first_party stays sticky. Assert both CASE arms.
     sql = fake.executed[0]["sql"]
-    assert "offer_type = COALESCE(catalog_offers.offer_type, EXCLUDED.offer_type)" in sql
-    assert "is_first_party = catalog_offers.is_first_party OR EXCLUDED.is_first_party" in sql
+    assert "WHEN EXCLUDED.offer_type = 'retailer' THEN 'retailer'" in sql
+    assert "ELSE COALESCE(catalog_offers.offer_type, EXCLUDED.offer_type)" in sql
+    assert "WHEN EXCLUDED.offer_type = 'retailer' THEN FALSE" in sql
+    assert "ELSE catalog_offers.is_first_party OR EXCLUDED.is_first_party" in sql
 
 
 @pytest.mark.asyncio

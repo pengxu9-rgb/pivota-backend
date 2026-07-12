@@ -41,6 +41,7 @@ from decimal import Decimal
 from typing import Any, Dict, Optional
 
 from db.database import database
+from services.offer_seller_identity import host_from_url, is_known_retailer
 
 logger = logging.getLogger(__name__)
 
@@ -156,19 +157,30 @@ async def upsert_catalog_offer_from_seed_row(
         )
     sku_key = derive_mirror_sku_key(product_key)
     offer_id = derive_mirror_offer_id(product_key)
-    # Offer typing from the seed's role. A crawl seed with seed_kind='self' is the
-    # brand selling its OWN product on its OWN storefront (D2C), so its offer is
-    # brand_direct / first-party — matching what
-    # scripts/onboard_external_brand_from_crawl.py::_set_category_and_offer stamps.
-    # Setting it HERE closes the gap where mirror-only paths (the 15-min
-    # materialization job, the nightly reconciliation) left brand-owned offers at
-    # offer_type=NULL / is_first_party=false (the 2026-07-12 backfill of 344 Paul
-    # Mitchell / FORBEAUT / Genabelle / Fwee / Essenherb offers). `is_first_party`
-    # marks brand-ownership of the offer and is orthogonal to the referral
-    # fulfillment tier above — an external self-seed is still redirect-fulfilled.
+    # Offer typing by SELLER IDENTITY (Fix Plan C), not just the ingest lane. A
+    # crawl seed with seed_kind='self' is the brand selling its OWN product on its
+    # OWN storefront (D2C) -> brand_direct / first-party. But we also honour the
+    # domain: a KNOWN-retailer host (ulta.com …) is always 'retailer' even if the
+    # seed was mislabelled 'self', and a self-seed keeps brand_direct only when the
+    # domain isn't a retailer. `is_first_party` marks brand-ownership of the offer
+    # and is orthogonal to the referral fulfillment tier above — an external
+    # self-seed is still redirect-fulfilled.
+    evidence_domain = (
+        str(row_dict.get("domain") or "").strip()
+        or host_from_url(row_dict.get("canonical_url"))
+        or host_from_url(row_dict.get("destination_url"))
+    )
     is_self_seed = str(row_dict.get("seed_kind") or "").strip().lower() == "self"
-    offer_type_value = "brand_direct" if is_self_seed else None
-    is_first_party_value = is_self_seed
+    if evidence_domain and is_known_retailer(evidence_domain):
+        # Retailer host is authoritative that this is a third-party offer.
+        offer_type_value = "retailer"
+        is_first_party_value = False
+    elif is_self_seed:
+        offer_type_value = "brand_direct"
+        is_first_party_value = True
+    else:
+        offer_type_value = None
+        is_first_party_value = False
     raw_price = row_dict.get("price_amount")
     try:
         list_price_value = float(raw_price) if raw_price is not None else None
@@ -200,10 +212,20 @@ async def upsert_catalog_offer_from_seed_row(
            :price_confidence, :source_system, :source_ref,
            CAST(:offer_payload AS jsonb))
         ON CONFLICT (offer_id) DO UPDATE SET
-          -- Fill offer typing without clobbering a value onboard already set:
-          -- COALESCE only fills a NULL offer_type; is_first_party sticks true.
-          offer_type = COALESCE(catalog_offers.offer_type, EXCLUDED.offer_type),
-          is_first_party = catalog_offers.is_first_party OR EXCLUDED.is_first_party,
+          -- A KNOWN-retailer host is AUTHORITATIVE third-party evidence, so it
+          -- corrects a wrongly-stored value (demotes a bad brand_direct/first-party):
+          -- when EXCLUDED.offer_type='retailer' it wins. Otherwise we only FILL a
+          -- NULL offer_type (COALESCE) and keep is_first_party sticky — a brand_direct
+          -- or unknown never clobbers what onboard already set. Real corrections
+          -- away from retailer are the backfill's job, not this ingest upsert.
+          offer_type = CASE
+            WHEN EXCLUDED.offer_type = 'retailer' THEN 'retailer'
+            ELSE COALESCE(catalog_offers.offer_type, EXCLUDED.offer_type)
+          END,
+          is_first_party = CASE
+            WHEN EXCLUDED.offer_type = 'retailer' THEN FALSE
+            ELSE catalog_offers.is_first_party OR EXCLUDED.is_first_party
+          END,
           availability = EXCLUDED.availability,
           inventory_quantity = EXCLUDED.inventory_quantity,
           currency = EXCLUDED.currency,
