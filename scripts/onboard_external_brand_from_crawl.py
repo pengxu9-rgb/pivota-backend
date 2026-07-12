@@ -74,6 +74,7 @@ from services.external_seed_servability import (
     build_servable_quality_payload,
     make_external_seed_servable,
 )
+from services.offer_seller_identity import derive_offer_seller_identity
 from services.pdp_scope_classifier import ScopeSignals, classify
 # ADR-009 D2/D3 (docs/adr/ADR-009-seller-of-record-identity.md; IDENTITY_REFERENCE
 # §3 Trap T3, §4): a crawl-onboarded brand mints its own per-brand observed
@@ -360,8 +361,25 @@ async def _set_category_and_offer(p: Dict[str, Any], product_key: str) -> None:
             "UPDATE catalog_products SET category_kind=:ck, updated_at=NOW() WHERE product_key=:pk",
             {"ck": p["category_kind"], "pk": pk},
         )
-    offer_type = (p.get("offer_type") or "brand_direct").strip()
-    is_first_party = offer_type == "brand_direct"
+    # Seller-identity derivation (Fix Plan C). Path B onboards a brand's OWN
+    # storefront, so the common case is brand_direct — but derive from the domain
+    # so a KNOWN-retailer host is never mislabelled brand_direct. An explicit
+    # caller-provided offer_type still wins (manual override); otherwise we use the
+    # domain/brand verdict and only fall back to brand_direct when the domain gives
+    # no signal (the storefront we just crawled is the brand's by construction).
+    explicit_offer_type = (p.get("offer_type") or "").strip()
+    if explicit_offer_type:
+        offer_type = explicit_offer_type
+        is_first_party = offer_type == "brand_direct"
+    else:
+        verdict = derive_offer_seller_identity(
+            domain=_seed_domain(p),
+            canonical_url=p.get("destination_url"),
+            official_domain=p.get("official_domain"),
+            brand=p.get("brand"),
+        )
+        offer_type = verdict["offer_type"] or "brand_direct"
+        is_first_party = offer_type == "brand_direct"
     # Respect the product's real market (the mirror already set it from the seed);
     # don't force 'US' -- a KRW Korean offer must not be relabeled US-market.
     market = (p.get("market") or "US").strip() or "US"
