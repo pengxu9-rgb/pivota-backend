@@ -807,6 +807,37 @@ async def _fetch_canonical_search_rows(
             + CASE WHEN p.category_path IS NOT NULL AND p.category_path LIKE :category_path_prefix THEN 90 ELSE 0 END
         """
 
+    # Token-overlap recall (Part A). ADDITIVE: the whole-phrase `LIKE :query_like`
+    # clause above only matches the verbatim phrase, so multi-word queries whose
+    # words appear non-contiguously ("hydrating cleanser", "snail mucin essence")
+    # returned zero. When >=2 significant tokens are present, ALSO match a row
+    # whose title/brand/sku-title/product_type contains >=ceil(n/2) (min 2) of
+    # them, ranked by overlap (x25). The >=2 floor keeps single-common-token junk
+    # out; the existing precision gate downstream still applies. Flag-gated
+    # (PIVOT_CANONICAL_TOKEN_MATCH, default OFF) ⇒ token_where/token_score stay
+    # empty ⇒ byte-identical SQL. Skipped for merchant-scoped queries (they
+    # already see all their own rows).
+    token_where = ""
+    token_score = ""
+    if not merchant_id and _canonical_token_match_enabled():
+        _tokens = _citable_query_tokens(lowered)
+        if len(_tokens) >= 2:
+            _overlap_terms = []
+            for _i, _tok in enumerate(_tokens):
+                _pname = f"cctok{_i}"
+                params[_pname] = f"%{_tok}%"
+                _overlap_terms.append(
+                    "(CASE WHEN LOWER(COALESCE(p.title, '')) LIKE :" + _pname
+                    + " OR LOWER(COALESCE(p.brand, '')) LIKE :" + _pname
+                    + " OR LOWER(COALESCE(s.title, '')) LIKE :" + _pname
+                    + " OR LOWER(COALESCE(p.product_type, '')) LIKE :" + _pname
+                    + " THEN 1 ELSE 0 END)"
+                )
+            _overlap_expr = " + ".join(_overlap_terms)
+            params["cctok_min"] = max(2, (len(_tokens) + 1) // 2)
+            token_where = f"\n                OR (({_overlap_expr}) >= :cctok_min)\n"
+            token_score = f"\n                    + (({_overlap_expr}) * 25)\n"
+
     rows = await database.fetch_all(
         f"""
         WITH candidate_skus AS (
@@ -871,6 +902,7 @@ async def _fetch_canonical_search_rows(
                     CASE WHEN p.pdp_lifecycle_stage = 'validated' THEN 20 ELSE 0 END
                     {category_score}
                     {vertical_score}
+                    {token_score}
                 ) AS rank_score,
                 -- RECALL_RELEVANCE_V2: TEXT relevance only (exact + partial LIKE
                 -- + vertical term hits), with NO structural/scope boost. Used to
@@ -892,6 +924,7 @@ async def _fetch_canonical_search_rows(
                     CASE WHEN LOWER(COALESCE(m.merchant_name, '')) LIKE :query_like THEN 50 ELSE 0 END +
                     CASE WHEN LOWER(COALESCE(p.source_product_id, '')) LIKE :query_like THEN 40 ELSE 0 END
                     {vertical_score}
+                    {token_score}
                 ) AS text_score,
                 -- RECALL_RELEVANCE_V2: STRUCTURAL/scope quality, kept separate so
                 -- it can act as a SECONDARY tie-break (not a relevance signal).
@@ -914,6 +947,7 @@ async def _fetch_canonical_search_rows(
                 LOWER(COALESCE(p.source_product_id, '')) LIKE :query_like
                 {category_where}
                 {vertical_where}
+                {token_where}
             )
             {merchant_clause}
             {lifecycle_clause}
@@ -1033,6 +1067,20 @@ def _citable_token_match_enabled() -> bool:
     title still matches — ported from the gateway's tokenMatch."""
     return (
         (os.getenv("CITABLE_TOKEN_MATCH") or "").strip().lower()
+        in {"1", "true", "yes", "on"}
+    )
+
+
+def _canonical_token_match_enabled() -> bool:
+    """Flag for the token-overlap match on the MAIN cross-merchant recall lane
+    (_fetch_canonical_search_rows). Default OFF ⇒ byte-identical SQL. When ON, a
+    multi-word query whose words appear NON-CONTIGUOUSLY in a title still
+    matches (whole-phrase `LIKE '%a b c%'` only matches the verbatim phrase, so
+    'hydrating cleanser'/'snail mucin essence' returned zero). Same shape as the
+    citable token match: >=ceil(n/2) (min 2) significant tokens must hit, ranked
+    by overlap — the >=2 floor keeps single-common-token junk out."""
+    return (
+        (os.getenv("PIVOT_CANONICAL_TOKEN_MATCH") or "").strip().lower()
         in {"1", "true", "yes", "on"}
     )
 
