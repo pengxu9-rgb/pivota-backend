@@ -109,11 +109,23 @@ _SELECT_SQL = """
 """
 
 # Writes ONLY resolved_vertical; guards IS NULL so a concurrently-resolved row is
-# never clobbered.
+# never clobbered. Single-row form (kept for readability / any 1-off use).
 _UPDATE_SQL = """
     UPDATE catalog_products
     SET resolved_vertical = :resolved_vertical
     WHERE product_key = :product_key AND resolved_vertical IS NULL
+"""
+
+# Set-based batch form: ONE round-trip updates the whole batch by zipping two
+# arrays (product_keys, verticals) through unnest. Per-row execute /
+# execute_many over the public proxy is ~1 write/s (round-trip-bound); this
+# collapses a 500-row batch into a single statement. Still writes ONLY
+# resolved_vertical and still guards IS NULL (idempotent, never clobbers).
+_UPDATE_BATCH_SQL = """
+    UPDATE catalog_products AS c
+    SET resolved_vertical = v.rv
+    FROM unnest(CAST(:keys AS text[]), CAST(:vals AS text[])) AS v(pk, rv)
+    WHERE c.product_key = v.pk AND c.resolved_vertical IS NULL
 """
 
 
@@ -165,6 +177,7 @@ async def _drive(args: argparse.Namespace, *, db: Any = database) -> Dict[str, A
             if not rows:
                 break
             batches += 1
+            batch_updates: List[Dict[str, Any]] = []
             for row in rows:
                 scanned += 1
                 resolved = _resolve_for_row(row)
@@ -180,16 +193,24 @@ async def _drive(args: argparse.Namespace, *, db: Any = database) -> Dict[str, A
                             "resolved_vertical": resolved,
                         }
                     )
-                if not args.dry_run:
-                    await _with_retry(
-                        lambda pk=row["product_key"], rv=resolved: db.execute(
-                            _UPDATE_SQL, {"product_key": pk, "resolved_vertical": rv}
-                        ),
-                        max_retries=args.max_retries,
-                        base_delay=args.retry_base_delay,
-                        label="update_row",
-                    )
-                    written += 1
+                batch_updates.append(
+                    {"product_key": row["product_key"], "resolved_vertical": resolved}
+                )
+            if not args.dry_run and batch_updates:
+                # One set-based round-trip for the whole batch (per-row execute /
+                # execute_many over the public proxy is round-trip-bound at
+                # ~1 write/s — far too slow for 11.6K rows).
+                keys = [u["product_key"] for u in batch_updates]
+                vals = [u["resolved_vertical"] for u in batch_updates]
+                await _with_retry(
+                    lambda k=keys, v=vals: db.execute(
+                        _UPDATE_BATCH_SQL, {"keys": k, "vals": v}
+                    ),
+                    max_retries=args.max_retries,
+                    base_delay=args.retry_base_delay,
+                    label="update_batch",
+                )
+                written += len(batch_updates)
             # Advance the keyset cursor past this batch's last product_key.
             cursor = rows[-1]["product_key"]
             print(

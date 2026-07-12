@@ -73,12 +73,19 @@ class _FakeDB:
 
     async def execute(self, sql, params):
         self.updates.append({"sql": str(sql), "params": dict(params)})
-        pk = params["product_key"]
+        if "keys" in params and "vals" in params:
+            # Set-based batch UPDATE via unnest(keys, vals).
+            for pk, rv in zip(params["keys"], params["vals"]):
+                self._apply_update(pk, rv)
+        else:
+            self._apply_update(params["product_key"], params["resolved_vertical"])
+        return 1
+
+    def _apply_update(self, pk, rv):
         row = self.rows.get(pk)
         # Guarded IS NULL: only writes when currently NULL.
         if row is not None and row.get("resolved_vertical") is None:
-            row["resolved_vertical"] = params["resolved_vertical"]
-        return 1
+            row["resolved_vertical"] = rv
 
 
 # ---------------------------------------------------------------------------
@@ -99,7 +106,22 @@ def test_update_sql_writes_only_resolved_vertical_and_guards_null() -> None:
     assert "SET resolved_vertical = :resolved_vertical" in sql
     assert "resolved_vertical IS NULL" in sql
     assert "WHERE product_key = :product_key" in sql
-    # Must NOT touch any other column (single-column backfill hard constraint).
+    _assert_single_column(sql)
+
+
+def test_batch_update_sql_writes_only_resolved_vertical_and_guards_null() -> None:
+    """The set-based batch UPDATE (the fast path actually used) must also touch
+    ONLY resolved_vertical and keep the IS NULL idempotency guard."""
+    sql = backfill._UPDATE_BATCH_SQL
+    assert "UPDATE catalog_products" in sql
+    assert "SET resolved_vertical = v.rv" in sql
+    assert "unnest(" in sql.lower()
+    assert "c.resolved_vertical IS NULL" in sql
+    _assert_single_column(sql)
+
+
+def _assert_single_column(sql: str) -> None:
+    """Single-column backfill hard constraint: no other column is written."""
     for forbidden in ("category", "seed_data", "product_payload", "product_type", "tags"):
         assert f"SET {forbidden}" not in sql
         assert f", {forbidden} =" not in sql
@@ -144,7 +166,9 @@ async def test_apply_writes_one_update_per_row_with_resolver_value() -> None:
     assert report["written"] == 2
     assert db.rows["p1"]["resolved_vertical"] == "beauty"
     assert db.rows["p2"]["resolved_vertical"] == "electronics"
-    assert len(db.updates) == 2
+    # One set-based batch execute covers both rows (not one round-trip per row).
+    assert len(db.updates) == 1
+    assert set(db.updates[0]["params"]["keys"]) == {"p1", "p2"}
 
 
 @pytest.mark.asyncio
