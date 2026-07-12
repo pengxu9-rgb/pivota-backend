@@ -5137,6 +5137,27 @@ _BRAND_MERCHANT_NAME_SUFFIX_RE = re.compile(
     r"\s+(official\s+(site|store|shop)|flagship\s+store)\s*$",
     re.IGNORECASE,
 )
+# Degenerate display names that carry no real brand (the external-seed display-name
+# builder falls back to a bare "Official Site" when no brand/domain is known) — map
+# these to no brand rather than emit garbage.
+_STOREFRONT_ONLY_BRAND_NAMES = frozenset(
+    {
+        "", "official", "official site", "official store", "official shop",
+        "flagship store", "site", "store", "shop",
+    }
+)
+
+
+def _clean_brand_from_merchant_name(merchant_name: Optional[str]) -> Optional[str]:
+    """Derive a brand from a merchant display name: strip an explicit storefront
+    suffix and drop degenerate storefront-only names (e.g. "Official Site")."""
+    name = str(merchant_name or "").strip()
+    if not name:
+        return None
+    cleaned = _BRAND_MERCHANT_NAME_SUFFIX_RE.sub("", name).strip()
+    if cleaned.lower() in _STOREFRONT_ONLY_BRAND_NAMES:
+        return None
+    return cleaned or None
 
 
 def _derive_product_brand(p: StandardProduct) -> Optional[str]:
@@ -5151,11 +5172,7 @@ def _derive_product_brand(p: StandardProduct) -> Optional[str]:
     brand = str(getattr(p, "brand", None) or "").strip()
     if brand:
         return brand
-    merchant_name = str(getattr(p, "merchant_name", None) or "").strip()
-    if merchant_name:
-        cleaned = _BRAND_MERCHANT_NAME_SUFFIX_RE.sub("", merchant_name).strip()
-        return cleaned or merchant_name
-    return None
+    return _clean_brand_from_merchant_name(getattr(p, "merchant_name", None))
 
 
 def _standard_to_shop_product(p: StandardProduct) -> Dict[str, Any]:
@@ -6887,6 +6904,15 @@ def _external_seed_to_shop_product(
     if isinstance(availability, str):
         in_stock = availability.lower() not in {"out_of_stock", "outofstock", "sold_out"}
 
+    # Structured brand so agents can cite "<brand>'s <product>" without parsing the
+    # title. External seeds carry brand/vendor in seed_data; fall back to the
+    # merchant display name with a trailing " Official Site/Store" suffix stripped.
+    # (The connected-merchant projection _standard_to_shop_product does the same;
+    # this covers the external-seed lane, which is the bulk of catalog results.)
+    seed_brand = str(seed_data.get("brand") or seed_data.get("vendor") or "").strip()
+    if not seed_brand:
+        seed_brand = _clean_brand_from_merchant_name(merchant_name) or ""
+
     filter_product = _build_external_seed_filter_product(
         row=row,
         seed_data=seed_data,
@@ -6909,6 +6935,7 @@ def _external_seed_to_shop_product(
         "merchant_id": None,
         "merchant_name": merchant_name,
         "title": title or "External product",
+        "brand": seed_brand or None,
         "description": seed_data.get("description") or "",
         "price": price_amount or 0,
         "currency": price_currency,
