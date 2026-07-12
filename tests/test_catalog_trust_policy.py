@@ -213,6 +213,17 @@ def test_inactive_merchant_store_blocks():
     assert REASON_CODES.MERCHANT_STORE_INACTIVE in trust["serving_reason_codes"]
 
 
+def test_retired_test_rig_merchant_store_blocks():
+    """retired_test_rig is a decommissioned demo/test store — it must be treated
+    as inactive (was falling through to 'unknown' and serving demo junk)."""
+    trust = call(
+        merchant_store=active_merchant_store(status="retired_test_rig"),
+    )
+    assert trust["serving_decision"] == "blocked"
+    assert trust["source_lifecycle_state"] == "inactive"
+    assert REASON_CODES.MERCHANT_STORE_INACTIVE in trust["serving_reason_codes"]
+
+
 def test_quarantined_domain_blocks():
     trust = call(
         active_quarantines=[

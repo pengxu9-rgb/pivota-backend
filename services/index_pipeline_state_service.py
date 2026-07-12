@@ -241,6 +241,16 @@ def _classify_product(
         pdp_image_url or None,
     )
 
+    # --- Merchant store lifecycle ---
+    # A CONNECTED merchant (has ≥1 merchant_stores row) whose stores are ALL
+    # non-active (retired_test_rig / inactive / disconnected) can no longer be
+    # trusted or fulfilled, so its catalog must stop serving. External seeds have
+    # NO merchant_stores row → merchant_has_store=False → merchant_store_retired
+    # stays False → exempt (governed by external_product_seeds.status instead).
+    merchant_has_store = bool(row.get("merchant_has_store"))
+    merchant_has_active_store = bool(row.get("merchant_has_active_store"))
+    merchant_store_retired = merchant_has_store and not merchant_has_active_store
+
     # --- Determine blocker (first failing check wins) ---
     blocker_code = "none"
     blocker_detail: Optional[str] = None
@@ -248,6 +258,12 @@ def _classify_product(
     if cp_sync_status and cp_sync_status != "live":
         blocker_code = "not_live"
         blocker_detail = f"catalog_products.sync_status={cp_sync_status!r}"
+    elif merchant_store_retired:
+        blocker_code = "merchant_store_inactive"
+        blocker_detail = (
+            "merchant has no active/connected store "
+            "(all merchant_stores are retired/inactive/disconnected)"
+        )
     elif _is_non_core_product(row, seed_title=seed_title):
         blocker_code = "non_core_product"
         blocker_detail = (
@@ -307,6 +323,7 @@ def _classify_product(
     serving_eligible = (
         blocker_code == "none"
         and cp_sync_status == "live"
+        and not merchant_store_retired
         and bool(source_title)
         and quality_score is not None
         and quality_score >= QUALITY_SCORE_THRESHOLD
@@ -345,6 +362,7 @@ def _classify_product(
     non_core_product = _is_non_core_product(row, seed_title=seed_title)
     index_eligible = (
         cp_sync_status == "live"
+        and not merchant_store_retired
         and source_document_present
         and bool(source_title)
         and quality_score is not None
@@ -526,7 +544,14 @@ _ELIGIBILITY_COLUMNS = f"""
         LIMIT 1
     )                           AS has_key_actives,
 {_HAS_OFFER_SNAPSHOT_COLUMN},
-    pgm.product_group_id
+    pgm.product_group_id,
+    -- Merchant store lifecycle. A CONNECTED merchant whose stores are all
+    -- non-active (retired/inactive/disconnected) can no longer be trusted or
+    -- fulfilled, so its catalog must stop serving. External seeds have NO
+    -- merchant_stores row → merchant_has_store=FALSE → exempt (they are governed
+    -- by external_product_seeds.status, not store status).
+    COALESCE(mstore.has_store, FALSE)        AS merchant_has_store,
+    COALESCE(mstore.has_active_store, FALSE) AS merchant_has_active_store
 """
 
 # `has_offer_snapshot` only influences the low-confidence crawled/discovered
@@ -570,6 +595,13 @@ LEFT JOIN LATERAL (
       AND platform_product_id = cp.source_product_id
     LIMIT 1
 ) pgm ON TRUE
+LEFT JOIN LATERAL (
+    SELECT
+        bool_or(TRUE)                                AS has_store,
+        bool_or(ms.status IN ('active', 'connected')) AS has_active_store
+    FROM merchant_stores ms
+    WHERE ms.merchant_id = cp.merchant_id
+) mstore ON TRUE
 """
 
 _BATCH_QUERY = f"""
@@ -715,7 +747,13 @@ SELECT
           AND pgm.platform = cp.platform
           AND pgm.platform_product_id = cp.source_product_id
         LIMIT 1
-    ) AS product_group_id
+    ) AS product_group_id,
+    -- SQLite (test) path: non-blocking placeholders. The merchant-store
+    -- lifecycle gate is computed on the Postgres path; a False/False pair here
+    -- means merchant_store_retired is never true in tests unless a row is
+    -- passed to _classify_product directly (the guard's unit test does this).
+    0 AS merchant_has_store,
+    0 AS merchant_has_active_store
 FROM catalog_products cp
 LEFT JOIN agent_pdp_view apv
     ON apv.content_key = cp.content_key
