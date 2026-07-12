@@ -1916,6 +1916,25 @@ def _seed_query_fast_multiterm_enabled() -> bool:
         "yes",
         "on",
     }
+
+
+def _seed_query_lean_where_min_tokens() -> int:
+    """Token-count threshold at/above which the fast stage-A seed query drops the
+    seed_data->recall JSON arms from the WHERE and matches only the cheap inline
+    columns (title/url/domain). A many-token OR over the long trgm-indexed
+    retrieval_summary detoasts thousands of rows on recheck and blows the stage-A
+    timeout → 0 results for long natural-language queries. Restricting to inline
+    columns keeps such queries at ~0.06s with higher-precision title matches.
+    Only applies when SEED_QUERY_FAST_MULTITERM is on; 0 disables. Default 4 keeps
+    short (≤3-token) ingredient queries on the recall-rich full path."""
+    return _env_int(
+        "SEED_QUERY_LEAN_WHERE_MIN_TOKENS",
+        4,
+        min_value=0,
+        max_value=8,
+    )
+
+
 MULTI_SEARCH_SEED_BUILD_BUDGET_SECONDS = _env_float(
     "AGENT_SHOP_MULTI_SEED_BUILD_BUDGET_SECONDS",
     1.0,
@@ -9077,6 +9096,7 @@ async def _handle_find_products_multi_inner(
                     0.9,
                 ),
             )
+            _seed_fast_multiterm = _seed_query_fast_multiterm_enabled()
             stage_a_result = await fetch_external_seed_rows(
                 database=database,
                 market=None,
@@ -9091,7 +9111,15 @@ async def _handle_find_products_multi_inner(
                 scope="default",
                 use_required_terms_filter=False,
                 include_total_count=False,
-                fast_multiterm=_seed_query_fast_multiterm_enabled(),
+                fast_multiterm=_seed_fast_multiterm,
+                # Lean WHERE (inline columns only) for long many-token queries, so a
+                # broad OR over the trgm-indexed retrieval_summary can't detoast
+                # thousands of rows and time stage-A out to 0. Gated behind the fast
+                # flag ⇒ byte-identical when the flag is off. Stage-B (the empty-
+                # result fallback below) deliberately keeps the full recall path.
+                lean_where_min_tokens=(
+                    _seed_query_lean_where_min_tokens() if _seed_fast_multiterm else None
+                ),
             )
             seed_rows = stage_a_result.get("rows") or []
             external_seed_query_timeout = bool(stage_a_result.get("query_timeout") or False)
