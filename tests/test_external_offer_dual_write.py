@@ -137,6 +137,45 @@ async def test_offer_id_agrees_with_mirror_on_the_real_product_key(monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_self_seed_projects_brand_direct_first_party(monkeypatch):
+    """A seed_kind='self' crawl seed is the brand selling its OWN product (D2C),
+    so its projected offer is brand_direct / first-party. This closes the gap where
+    mirror-only paths left brand-owned offers at offer_type=NULL / is_first_party
+    =false (the 2026-07-12 backfill of 344 Paul Mitchell / FORBEAUT / etc. offers)."""
+    fake = FakeDB()
+    monkeypatch.setattr(mod, "database", fake)
+    await mod.upsert_catalog_offer_from_seed_row(
+        _REAL_PK,
+        {"id": "s1", "external_product_id": "ext1", "seed_kind": "Self", "price_amount": 12.0},
+        merchant_id=_REAL_SELLER,
+    )
+    params = fake.executed[0]["params"]
+    assert params["offer_type"] == "brand_direct"
+    assert params["is_first_party"] is True
+    # ON CONFLICT is non-clobbering: only fills a NULL offer_type, is_first_party sticks.
+    sql = fake.executed[0]["sql"]
+    assert "offer_type = COALESCE(catalog_offers.offer_type, EXCLUDED.offer_type)" in sql
+    assert "is_first_party = catalog_offers.is_first_party OR EXCLUDED.is_first_party" in sql
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("seed_kind", [None, "", "retailer", "reseller", "marketplace"])
+async def test_non_self_seed_leaves_offer_untyped(monkeypatch, seed_kind):
+    """A non-self seed (retailer/reseller/unknown) must NOT be auto-marked
+    brand_direct — it stays offer_type=NULL / is_first_party=false (the prior
+    default), so onboard or a human types it deliberately."""
+    fake = FakeDB()
+    monkeypatch.setattr(mod, "database", fake)
+    row = {"id": "s1", "external_product_id": "ext1", "price_amount": 12.0}
+    if seed_kind is not None:
+        row["seed_kind"] = seed_kind
+    await mod.upsert_catalog_offer_from_seed_row(_REAL_PK, row, merchant_id=_REAL_SELLER)
+    params = fake.executed[0]["params"]
+    assert params["offer_type"] is None
+    assert params["is_first_party"] is False
+
+
+@pytest.mark.asyncio
 async def test_upsert_refuses_banned_bucket():
     """ADR-009 D2: an offer may never be written under the 'external_seed'
     sentinel — the upsert raises rather than corrupt seller attribution."""
