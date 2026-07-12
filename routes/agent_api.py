@@ -908,6 +908,25 @@ def _gateway_dynamic_brand_detect_enabled() -> bool:
     )
 
 
+def _brand_dictionary_aliases(raw_brand: str) -> List[str]:
+    """Detection keys to index for one raw catalog brand string. A polluted
+    brand field like "Biodance | Better Formula for Better Glow" (brand +
+    tagline) is stored as a single dictionary entry, so a bare "biodance"
+    query — one token vs the whole multi-word span — never matches. Index the
+    leading segment before a tagline separator ('|' or newline) IN ADDITION to
+    the full string. Only the FIRST segment is the brand; later segments are
+    marketing copy and must NOT be indexed (they'd turn category-ish words into
+    false brand hits)."""
+    out: List[str] = []
+    full = _normalize_brand_query_text(raw_brand)
+    if full:
+        out.append(full)
+    lead = _normalize_brand_query_text(re.split(r"[|\n]", str(raw_brand or ""), maxsplit=1)[0])
+    if lead and lead != full:
+        out.append(lead)
+    return out
+
+
 async def _ensure_brand_dictionary_loaded() -> None:
     """Warm the catalog brand cache (best-effort, TTL'd). No-op when the flag is
     off, so brand detection stays byte-identical to today."""
@@ -935,9 +954,9 @@ async def _ensure_brand_dictionary_loaded() -> None:
             return  # leave any prior cache intact; never break recall
         brands = set()
         for r in rows:
-            b = _normalize_brand_query_text(dict(r).get("b") or "")
-            if b and len(b) >= _MIN_DYNAMIC_BRAND_LEN and b not in _DYNAMIC_BRAND_STOPWORDS:
-                brands.add(b)
+            for b in _brand_dictionary_aliases(dict(r).get("b") or ""):
+                if b and len(b) >= _MIN_DYNAMIC_BRAND_LEN and b not in _DYNAMIC_BRAND_STOPWORDS:
+                    brands.add(b)
         _DYNAMIC_BRAND_SET = frozenset(brands)
         _DYNAMIC_BRAND_LOADED_AT = time.monotonic()
 

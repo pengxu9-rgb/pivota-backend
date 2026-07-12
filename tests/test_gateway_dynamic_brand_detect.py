@@ -54,3 +54,27 @@ def test_short_brand_below_min_len_ignored(monkeypatch):
     monkeypatch.setenv("GATEWAY_DYNAMIC_BRAND_DETECT", "1")
     _set_cache({"abc"})  # 3 chars < _MIN_DYNAMIC_BRAND_LEN
     assert agent_api._detect_brand_query("abc serum")["brand_like"] is False
+
+
+def test_brand_dictionary_aliases_indexes_leading_segment():
+    # "Biodance | Better Formula for Better Glow" must yield a matchable
+    # "biodance" alias (the incident: a bare brand query missed the full span).
+    aliases = agent_api._brand_dictionary_aliases("biodance | better formula for better glow")
+    assert "biodance" in aliases
+    assert "biodance better formula for better glow" in aliases
+    # the tagline segment is NOT indexed on its own (no false brand hits)
+    assert "better formula for better glow" not in aliases
+    # a clean single-segment brand yields exactly one alias (no dup)
+    assert agent_api._brand_dictionary_aliases("acropass") == ["acropass"]
+    # newline separator handled too
+    assert "rovectin" in agent_api._brand_dictionary_aliases("rovectin\nskin essentials")
+
+
+def test_piped_brand_detected_by_leading_token(monkeypatch):
+    monkeypatch.setenv("GATEWAY_DYNAMIC_BRAND_DETECT", "1")
+    # Mirror what _ensure_brand_dictionary_loaded builds from the raw brand row.
+    _set_cache(set(agent_api._brand_dictionary_aliases("biodance | better formula for better glow")))
+    r = agent_api._detect_brand_query("biodance collagen mask")
+    assert r["brand_like"] is True
+    assert r["mode"] == "catalog"
+    assert "biodance" in r["brand_terms"]
