@@ -47,6 +47,9 @@ from services.merchant_psp_config_service import (
     fetch_active_runtime_merchant_psp,
     infer_runtime_provider,
 )
+from services.merchant_capability_gate import (
+    capability_gate_permits_order_create,
+)
 from services.promotions_service import list_promotions, PromotionStatus
 from services.commerce_attribution_service import (
     PVT_CLICK_ID,
@@ -564,8 +567,25 @@ def _resolve_order_live_readiness_requirement(
     return True
 
 
+# Sentinel PSP identity for a capability-gated, deferred-payment order that has NO
+# merchant_psps row. It NEVER charges: the deferred path (see
+# `defer_order_payment_surface`) skips create_payment_with_failover entirely, and
+# submit_payment for such an order must route to the protocol/ACP lane (mapped seam,
+# see docs/protocol_checkout_capability_canary_runbook.md). Kept as a recognizable,
+# non-empty value so the downstream psp_type/psp_id validation passes without ever
+# resolving a real PSP adapter.
+CAPABILITY_DEFERRED_PSP_PROVIDER = "protocol_deferred"
+
+
+def _capability_deferred_psp_id(merchant_id: str) -> str:
+    return f"{str(merchant_id or '').strip()}:protocol_deferred"
+
+
 async def _resolve_active_order_psp(
-    merchant_id: str, provider_hint: Optional[str]
+    merchant_id: str,
+    provider_hint: Optional[str],
+    *,
+    defer_payment: bool = False,
 ) -> Tuple[str, str]:
     psp_row = await fetch_active_runtime_merchant_psp(
         merchant_id=merchant_id,
@@ -573,6 +593,20 @@ async def _resolve_active_order_psp(
     )
 
     if not psp_row:
+        # Capability-gate bypass (Fix Plan A, option (ii)): a protocol-capable
+        # merchant on the deferred-payment lane may create an order with no PSP row.
+        # Fail-closed: with AGENT_CHECKOUT_CAPABILITY_GATE off (default) this branch
+        # is never taken and the 400 below is byte-identical to today's behavior.
+        if defer_payment and await capability_gate_permits_order_create(merchant_id):
+            logger.info(
+                "[OrderRoutes] Capability-gate: deferred order for protocol-capable "
+                "merchant %s created without a merchant_psps row",
+                merchant_id,
+            )
+            return (
+                CAPABILITY_DEFERRED_PSP_PROVIDER,
+                _capability_deferred_psp_id(merchant_id),
+            )
         raise HTTPException(
             status_code=400,
             detail="No active PSP configuration found for this merchant",
@@ -3895,11 +3929,16 @@ async def create_new_order(
 
         # Always get psp_id for PSP metrics tracking (even if psp_type is known)
         psp_id_value = None
+        # A deferred-payment (hosted/protocol) order does not charge at create time,
+        # so a protocol-capable merchant may create one without a merchant_psps row
+        # when the capability gate is on (fail-closed; see _resolve_active_order_psp).
+        _defers_payment_for_psp = _order_defers_payment_surface(order_request.metadata or {})
         try:
             _t = time.perf_counter()
             psp_type, psp_id_value = await _resolve_active_order_psp(
                 order_request.merchant_id,
                 provider_hint,
+                defer_payment=_defers_payment_for_psp,
             )
             logger.info(
                 "[OrderRoutes][PERF] step=_resolve_active_order_psp duration_ms=%d order=%s",
