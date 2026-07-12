@@ -41,7 +41,12 @@ from models.catalog import PaymentIncentiveInput
 from models.standard_product import StandardProduct, StandardProductVariant
 from services.catalog_identity import make_content_key
 from services.category_kind import resolve_category_kind
-from services.vertical_profiles import resolve_vertical
+from services.vertical_profiles import (
+    is_vertical_unresolved,
+    normalize_category,
+    resolve_vertical,
+    summarize_unresolved_vertical,
+)
 from services.product_group_autogrouper import ensure_singleton_group_membership
 from services.fashion_field_extractor import (
     EXTRACTION_SOURCE_LLM,
@@ -314,6 +319,24 @@ def make_catalog_sku_key(product_key: str, source_variant_id: str) -> str:
 # ---------------------------------------------------------------------------
 
 import os as _os
+
+from services.vertical_profiles import DEFAULT_UNRESOLVED_VERTICAL_FAIL_THRESHOLD
+
+
+def _unresolved_vertical_fail_threshold(env_var: str) -> float:
+    """Fix Plan B T3: read the configurable intake brake threshold (fraction,
+    e.g. 0.20) from ``env_var``. Falls back to the shared default when unset,
+    unparseable, or out of the [0, 1] range."""
+    raw = _os.getenv(env_var)
+    if raw is None:
+        return DEFAULT_UNRESOLVED_VERTICAL_FAIL_THRESHOLD
+    try:
+        val = float(raw)
+    except (TypeError, ValueError):
+        return DEFAULT_UNRESOLVED_VERTICAL_FAIL_THRESHOLD
+    if 0.0 <= val <= 1.0:
+        return val
+    return DEFAULT_UNRESOLVED_VERTICAL_FAIL_THRESHOLD
 
 
 def make_pivota_signature_id(
@@ -907,6 +930,9 @@ async def ingest_standard_products(
     # brand per ingest run — a merchant's catalog is usually one brand, so
     # this is ~1 extra lookup per sync, not per product.
     _brand_guard_seen: set = set()
+    # Fix Plan B T3: per-run vertical-structure accounting for the intake brake.
+    _vertical_rows_considered = 0
+    _vertical_rows_unresolved = 0
     audit = (
         WriterAuditAccumulator(
             writer_name=source_system,
@@ -1081,6 +1107,33 @@ async def ingest_standard_products(
                 "source_system": source_system,
             }
 
+            # Fix Plan B T4: case/trim-normalize the free-text category before it
+            # is written (no semantic renames). NULL stays NULL.
+            _normalized_category = normalize_category(product.product_type)
+            # Fix Plan B T1/T3: resolve the durable top-level vertical (mig 173)
+            # once, into a local, so we both persist it and count the rows that
+            # carried no machine-readable structure at all (the intake brake).
+            _vertical_signals = {
+                "product_type": product.product_type,
+                "category": _normalized_category,
+                "category_path": _cat_path,
+            }
+            _resolved_vertical = resolve_vertical(
+                _vertical_signals,
+                title=" ".join(
+                    str(part)
+                    for part in (
+                        product.title,
+                        _description_for_ingest,
+                        *(_tags_for_ingest or []),
+                    )
+                    if part
+                ),
+            )
+            _vertical_rows_considered += 1
+            if is_vertical_unresolved(_resolved_vertical, _vertical_signals):
+                _vertical_rows_unresolved += 1
+
             existing_product = await _upsert_by_pk(
                 catalog_products,
                 "product_key",
@@ -1102,7 +1155,8 @@ async def ingest_standard_products(
                     "description": _description_for_ingest,
                     "brand": brand,
                     "product_type": product.product_type,
-                    "category": product.product_type,
+                    # Fix Plan B T4: case/trim-normalized (no semantic rename).
+                    "category": _normalized_category,
                     # Phase O-5: category_path classified inline at sync time
                     # via services/pdp_category_classifier.fold_category_from_variants.
                     # Source enum + confidence let downstream agents trust-gate.
@@ -1124,22 +1178,9 @@ async def ingest_standard_products(
                     # with a noisy fetched product_type) resolves consistently with
                     # the report path (_resolved_vertical_for_ctx), which reads this
                     # persisted column first. See services.vertical_profiles.
-                    "resolved_vertical": resolve_vertical(
-                        {
-                            "product_type": product.product_type,
-                            "category": product.product_type,
-                            "category_path": _cat_path,
-                        },
-                        title=" ".join(
-                            str(part)
-                            for part in (
-                                product.title,
-                                _description_for_ingest,
-                                *(_tags_for_ingest or []),
-                            )
-                            if part
-                        ),
-                    ),
+                    # Computed once above into _resolved_vertical so the intake
+                    # brake (T3) counts the same value that is persisted.
+                    "resolved_vertical": _resolved_vertical,
                     # Phase O-5b (#3): merchant-published fashion fields
                     # (Shopify metafields / admin-injected). Only set when
                     # actually populated — NULL stays NULL so the LLM
@@ -1691,6 +1732,34 @@ async def ingest_standard_products(
         .where(catalog_merchants.c.merchant_id == merchant_id)
         .values(last_full_sync_at=_utcnow())
     )
+
+    # Fix Plan B T3 — intake structure brake. Summarize the share of rows this
+    # sync ingested that carried no machine-readable vertical at all, and surface
+    # it (with a should_fail verdict) in the returned stats. Threshold is
+    # configurable via CATALOG_INGEST_UNRESOLVED_VERTICAL_FAIL_THRESHOLD. Unlike
+    # the offline mirror CLI (which turns should_fail into a non-zero exit), a
+    # LIVE merchant sync must NOT raise mid-write — so here we surface + log
+    # loudly and let the caller act, never rolling back a committed sync.
+    _vertical_threshold = _unresolved_vertical_fail_threshold(
+        "CATALOG_INGEST_UNRESOLVED_VERTICAL_FAIL_THRESHOLD"
+    )
+    _vertical_guard = summarize_unresolved_vertical(
+        _vertical_rows_unresolved,
+        _vertical_rows_considered,
+        threshold=_vertical_threshold,
+    )
+    stats["vertical_guard"] = _vertical_guard
+    if _vertical_guard["should_fail"]:
+        logger.warning(
+            "Catalog ingest intake brake TRIPPED merchant=%s platform=%s %s "
+            "(threshold=%.1f%%) — batch has too little machine-readable vertical structure",
+            merchant_id, platform, _vertical_guard["summary"], _vertical_threshold * 100,
+        )
+    else:
+        logger.info(
+            "Catalog ingest merchant=%s platform=%s %s",
+            merchant_id, platform, _vertical_guard["summary"],
+        )
     return stats
 
 

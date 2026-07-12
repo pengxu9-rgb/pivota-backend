@@ -74,6 +74,17 @@ from services.pdp_category_classifier import (
 from services.pdp_lifecycle import compute_lifecycle_stage
 from services.pdp_taxonomy import derive_taxonomy_v1
 from services.text_normalization.brand_case import proper_case_brand
+# Fix Plan B: the durable top-level vertical (mig 173) + intake structure
+# helpers. The mirror lane historically OMITTED resolved_vertical entirely, so
+# ~83% of the catalog had a NULL vertical. Wire it in go-forward here, matching
+# the ingest_standard_products signal set exactly (catalog_sync_service.py:1127).
+from services.vertical_profiles import (
+    DEFAULT_UNRESOLVED_VERTICAL_FAIL_THRESHOLD,
+    is_vertical_unresolved,
+    normalize_category,
+    resolve_vertical,
+    summarize_unresolved_vertical,
+)
 
 
 MERCHANT_ID = "external_seed"
@@ -85,6 +96,23 @@ READINESS_TIER = "referral_only"
 SOURCE_SYSTEM = "external_product_seeds_mirror_v1"
 CATEGORY_CONFIDENCE_REGEX_AT_MIRROR = 0.85
 CATEGORY_LABEL_SOURCE_AT_MIRROR = "regex_backfill_at_mirror"
+
+
+def _unresolved_vertical_fail_threshold() -> float:
+    """Fix Plan B T3: the intake brake trips when the share of
+    structureless (unresolved-vertical) rows exceeds this. Configurable via
+    MIRROR_UNRESOLVED_VERTICAL_FAIL_THRESHOLD (fraction, e.g. 0.20); falls back
+    to the shared default. An out-of-range / unparseable value falls back too."""
+    raw = os.getenv("MIRROR_UNRESOLVED_VERTICAL_FAIL_THRESHOLD")
+    if raw is None:
+        return DEFAULT_UNRESOLVED_VERTICAL_FAIL_THRESHOLD
+    try:
+        val = float(raw)
+    except (TypeError, ValueError):
+        return DEFAULT_UNRESOLVED_VERTICAL_FAIL_THRESHOLD
+    if 0.0 <= val <= 1.0:
+        return val
+    return DEFAULT_UNRESOLVED_VERTICAL_FAIL_THRESHOLD
 
 # Phase 7d: Path B writes the full canonical chain (skus + offers +
 # merchants), matching Phase 7a Path C. Without this, JOIN catalog_offers
@@ -824,6 +852,9 @@ async def _apply(limit: int) -> int:
     # function is retained only for the legacy repair/backfill scripts).
     skipped_no_seller = 0
     skipped_brand_guard = 0  # ADR-008 prevent-at-intake (convergence P1.4)
+    # Fix Plan B T3: per-run vertical-structure accounting for the intake brake.
+    rows_considered = 0
+    rows_unresolved_vertical = 0
 
     limit_clause = ""
     values: Dict[str, Any] = {}
@@ -1016,6 +1047,38 @@ async def _apply(limit: int) -> int:
             description=row_dict.get("mirrored_description"),
             tags=seed_tags,
         )
+        # Fix Plan B T4: case/trim-normalize the free-text category BEFORE it is
+        # written (no semantic renames). NULL stays NULL.
+        normalized_category = normalize_category(row_dict.get("mirrored_category"))
+        # Fix Plan B T1: durable top-level vertical (mig 173). Resolve here on the
+        # external-seed mirror lane exactly as ingest_standard_products does at
+        # catalog_sync_service.py:1127 — category signals + a title blob that also
+        # folds description + tags so a SKU whose vertical only shows in its tags
+        # resolves consistently with the report path (which reads this column
+        # first). See services.vertical_profiles.
+        vertical_signals = {
+            "product_type": row_dict.get("mirrored_product_type"),
+            "category": normalized_category,
+            "category_path": category_meta.get("category_path"),
+        }
+        resolved_vertical = resolve_vertical(
+            vertical_signals,
+            title=" ".join(
+                str(part)
+                for part in (
+                    row_dict.get("title"),
+                    row_dict.get("mirrored_description"),
+                    *(seed_tags or []),
+                )
+                if part
+            ),
+        )
+        # Fix Plan B T3: count rows that carry no machine-readable structure at
+        # all (resolved 'other' AND no category/product_type/category_path). The
+        # per-run brake below trips if their share is too high.
+        rows_considered += 1
+        if is_vertical_unresolved(resolved_vertical, vertical_signals):
+            rows_unresolved_vertical += 1
         # Phase O-4: compute lifecycle stage. Mirror rows default to
         # pdp_scope=NULL (no scope assignment in this script — the
         # catalog_products row has unverified by Phase 6 default), so
@@ -1087,6 +1150,7 @@ async def _apply(limit: int) -> int:
               brand,
               product_type,
               category,
+              resolved_vertical,
               category_path,
               category_confidence,
               category_label_source,
@@ -1123,6 +1187,7 @@ async def _apply(limit: int) -> int:
               :brand,
               :product_type,
               :category,
+              :resolved_vertical,
               :category_path,
               :category_confidence,
               :category_label_source,
@@ -1165,7 +1230,10 @@ async def _apply(limit: int) -> int:
                 # affects what users see.
                 "brand": mirrored_brand_display or row_dict.get("mirrored_brand"),
                 "product_type": row_dict.get("mirrored_product_type"),
-                "category": row_dict.get("mirrored_category"),
+                # T4: case/trim-normalized (no semantic rename).
+                "category": normalized_category,
+                # T1: durable top-level vertical (mig 173).
+                "resolved_vertical": resolved_vertical,
                 "category_path": category_meta.get("category_path"),
                 "category_confidence": category_meta.get("category_confidence"),
                 "category_label_source": category_meta.get("category_label_source"),
@@ -1284,7 +1352,25 @@ async def _apply(limit: int) -> int:
             "brand-fragmentation guard (review tasks enqueued)",
             file=sys.stderr,
         )
-    return inserted
+    # Fix Plan B T3 — intake structure brake. Emit the per-run summary line and
+    # flag (never silently) when too large a share of this batch carried no
+    # machine-readable vertical at all. _run turns should_fail into a non-zero
+    # process exit so "stop ingesting structureless garbage" is enforceable.
+    guard = summarize_unresolved_vertical(
+        rows_unresolved_vertical,
+        rows_considered,
+        threshold=_unresolved_vertical_fail_threshold(),
+    )
+    print(f"NOTE: {guard['summary']}", file=sys.stderr)
+    if guard["should_fail"]:
+        print(
+            "ERROR: unresolved-vertical share "
+            f"{guard['share'] * 100:.1f}% exceeds the {guard['threshold'] * 100:.1f}% "
+            "intake brake — refusing to treat this mirror run as clean "
+            "(set MIRROR_UNRESOLVED_VERTICAL_FAIL_THRESHOLD to adjust).",
+            file=sys.stderr,
+        )
+    return {"inserted": inserted, "vertical_guard": guard}
 
 
 def _render_markdown(report: Dict[str, Any]) -> str:
@@ -1374,7 +1460,9 @@ async def _run(args: argparse.Namespace) -> Dict[str, Any]:
                     "(merchant_id, platform, source_product_id) unique index prevents "
                     "duplicate catalog identities"
                 )
-            inserted = await _apply(args.limit)
+            apply_result = await _apply(args.limit)
+            inserted = apply_result["inserted"]
+            vertical_guard = apply_result["vertical_guard"]
             after = await _build_report(
                 sample_limit=args.sample_limit,
                 limit=args.limit,
@@ -1384,6 +1472,13 @@ async def _run(args: argparse.Namespace) -> Dict[str, Any]:
             after_totals = after.get("totals") or {}
             report = after
             report["warnings"] = list(before.get("warnings") or []) + list(after.get("warnings") or [])
+            # Fix Plan B T3: surface the vertical-structure guard in the report,
+            # and fail the run (report ok=False -> non-zero exit) when the brake
+            # tripped, so a garbage-heavy ingest cannot be treated as clean.
+            report["vertical_guard"] = vertical_guard
+            if vertical_guard.get("should_fail"):
+                report["ok"] = False
+                report.setdefault("warnings", []).append(vertical_guard["summary"])
             report["before_totals"] = before_totals
             report["totals"] = {
                 **before_totals,
