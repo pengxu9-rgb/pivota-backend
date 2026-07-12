@@ -86,7 +86,7 @@ async def test_quote_first_create_order_persists_authoritative_pricing(monkeypat
     async def fake_select_psp(self, *, agent_id: str, merchant_id: str, amount: float, currency: str):
         return "stripe", {"route_id": "route_test"}
 
-    async def fake_resolve_active_order_psp(_merchant_id: str, _provider_hint):
+    async def fake_resolve_active_order_psp(_merchant_id: str, _provider_hint, **_kwargs):
         return "stripe", "psp_1"
 
     async def fake_create_order(order_data):

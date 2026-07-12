@@ -121,7 +121,7 @@ def _install_create_new_order_harness(
     async def fake_select_psp(self, *, agent_id: str, merchant_id: str, amount: float, currency: str):
         return "stripe", {"route_id": "route_test"}
 
-    async def fake_resolve_active_order_psp(merchant_id: str, provider_hint: str):
+    async def fake_resolve_active_order_psp(merchant_id: str, provider_hint: str, **kwargs):
         return "stripe", "psp_test"
 
     async def fake_create_order(order_data):
