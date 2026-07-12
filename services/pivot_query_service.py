@@ -1665,11 +1665,25 @@ def _external_seed_offer_identity(
 
     No official_domain is available on this lane, so brand_direct is recognized
     only via the brand-token-in-domain rule; a brand seed on an unrelated host
-    honestly resolves to unknown rather than being guessed either way."""
+    honestly resolves to unknown rather than being guessed either way.
+
+    Brand MUST come from the seed's DECLARED fields, never candidate.brand:
+    beauty_external_ranking falls candidate.brand back to the domain host when a
+    seed carries no brand, and passing that host as `brand` would make
+    brand_owns_domain(host, host) trivially true -> a brandless reseller seed
+    would be over-claimed as brand_direct/first-party/official. A seed with no
+    declared brand passes brand=None and correctly resolves to retailer (rule 0)
+    or unknown (rule 3), never brand_direct."""
+    seed_data = candidate.seed_data or {}
+    declared_brand = (
+        seed_data.get("vendor")
+        or seed_data.get("brand")
+        or seed_data.get("manufacturer")
+    )
     return derive_offer_seller_identity(
         domain=candidate.domain,
         canonical_url=candidate.canonical_url or candidate.destination_url,
-        brand=candidate.brand,
+        brand=declared_brand,
     )
 
 

@@ -15,9 +15,16 @@ from services.beauty_external_ranking import build_ranked_external_beauty_candid
 from services.pivot_query_service import _build_external_item_from_candidate
 
 
-def _seed_row(*, canonical_url: str, brand: str, title: str = "Vitamin C Serum") -> dict:
+def _seed_row(
+    *, canonical_url: str, brand: str | None, title: str = "Vitamin C Serum"
+) -> dict:
     """Minimal external_product_seeds row. `domain` is the seed's crawled host
-    (what fetch_external_seed_rows selects); brand rides in seed_data."""
+    (what fetch_external_seed_rows selects); brand rides in seed_data. Pass
+    brand=None to model a seed with NO declared brand (the common case that
+    makes candidate.brand fall back to the domain host)."""
+    seed_data = {"title": title, "market": "US"}
+    if brand is not None:
+        seed_data["brand"] = brand
     return {
         "id": "seed::x1",
         "external_product_id": "x1",
@@ -29,11 +36,11 @@ def _seed_row(*, canonical_url: str, brand: str, title: str = "Vitamin C Serum")
         "price_currency": "USD",
         "availability": "in_stock",
         "market": "US",
-        "seed_data": {"title": title, "brand": brand, "market": "US"},
+        "seed_data": seed_data,
     }
 
 
-def _offer_for(*, canonical_url: str, brand: str):
+def _offer_for(*, canonical_url: str, brand: str | None):
     candidate = build_ranked_external_beauty_candidate(
         _seed_row(canonical_url=canonical_url, brand=brand), source_order=0
     )
@@ -65,6 +72,28 @@ def test_ambiguous_host_seed_is_unknown_not_guessed():
     # We do NOT fall back to 'retailer' (nor to 'brand_direct').
     offer = _offer_for(canonical_url="https://shop-example-store.com/p/9", brand="Round Lab")
     assert offer.offer_type is None
+    assert offer.is_first_party is False
+    assert offer.official_source is False
+
+
+def test_brandless_seed_on_unlisted_reseller_is_unknown_not_brand_direct():
+    # REGRESSION GUARD: a seed with NO declared brand on a reseller host that
+    # isn't in the known-retailer list. candidate.brand falls back to the domain
+    # host (beauty_external_ranking vendor fallback); if that host were passed as
+    # `brand`, brand_owns_domain(host, host) would be trivially true and the seed
+    # would be over-claimed brand_direct/first-party/official. We source brand
+    # from the seed's declared fields only, so this resolves to honest unknown.
+    offer = _offer_for(canonical_url="https://kbeautyworld.com/p/55", brand=None)
+    assert offer.offer_type is None
+    assert offer.is_first_party is False
+    assert offer.official_source is False
+
+
+def test_brandless_seed_on_known_retailer_is_still_retailer():
+    # A brandless seed on a known-retailer host is still correctly 'retailer'
+    # (rule 0 preempts regardless of brand), never unknown.
+    offer = _offer_for(canonical_url="https://www.ulta.com/p/77", brand=None)
+    assert offer.offer_type == "retailer"
     assert offer.is_first_party is False
     assert offer.official_source is False
 
