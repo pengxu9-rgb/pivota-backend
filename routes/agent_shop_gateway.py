@@ -5130,6 +5130,34 @@ def _build_options_from_variants(p: StandardProduct) -> List[Dict[str, Any]]:
     return options
 
 
+# Only strip an EXPLICIT storefront suffix ("… Official Site/Store/Shop",
+# "… Flagship Store") — never a bare trailing "Store"/"Shop", which would mangle a
+# legitimate brand name (e.g. "The Body Shop" → "The Body").
+_BRAND_MERCHANT_NAME_SUFFIX_RE = re.compile(
+    r"\s+(official\s+(site|store|shop)|flagship\s+store)\s*$",
+    re.IGNORECASE,
+)
+
+
+def _derive_product_brand(p: StandardProduct) -> Optional[str]:
+    """Populate a structured brand for the product contract so agents can cite
+    "<brand>'s <product>" without parsing the title. StandardProduct.vendor is the
+    catalog brand (hydrated from products_cache product_data->>'vendor'); fall back
+    to the merchant display name with a trailing " Official Site/Store" suffix
+    stripped. Previously the projection emitted no brand at all (always null)."""
+    vendor = str(getattr(p, "vendor", None) or "").strip()
+    if vendor:
+        return vendor
+    brand = str(getattr(p, "brand", None) or "").strip()
+    if brand:
+        return brand
+    merchant_name = str(getattr(p, "merchant_name", None) or "").strip()
+    if merchant_name:
+        cleaned = _BRAND_MERCHANT_NAME_SUFFIX_RE.sub("", merchant_name).strip()
+        return cleaned or merchant_name
+    return None
+
+
 def _standard_to_shop_product(p: StandardProduct) -> Dict[str, Any]:
     """
     Map internal StandardProduct to Shopping AI product contract.
@@ -5142,6 +5170,7 @@ def _standard_to_shop_product(p: StandardProduct) -> Dict[str, Any]:
         "product_id": p.product_id or p.id,
         "merchant_id": p.merchant_id,
         "title": p.title,
+        "brand": _derive_product_brand(p),
         "description": p.description or "",
         "price": p.price,
         "currency": p.currency,
