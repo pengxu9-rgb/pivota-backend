@@ -532,9 +532,24 @@ def _derive_serving_decision(
     # quality-gated yet. First-party rows (MOYU/GR/PawStyle/etc.) keep the
     # legacy behavior since first-party merchants are the source of truth and
     # IPS coverage there is sparse by design.
+    # ADR-009 observed-seller trust tier (docs/adr009_observed_seller_trust_decision.md,
+    # Option C). Classify by content SOURCE, not the legacy merchant_id='external_seed'
+    # string: external seeds now mirror under per-brand observed sellers (merch_obs_…).
+    #   - is_external_seed_content: legacy 'external_seed' lump OR an observed seller —
+    #     both are scraped supply and must clear the index/quality gate.
+    #   - is_observed_seller: the brand's own D2C crawl (merch_obs_), authoritative
+    #     for its own content, so exempt from the identity-COVERAGE shadow gates
+    #     (below) like a first-party merchant — but NOT from the index/quality gate.
+    _merchant_id = str(_get(product, "merchant_id") or "") if product is not None else ""
+    _platform = str(_get(product, "platform") or "").lower() if product is not None else ""
+    is_external_seed_content = (
+        _platform == "external_seed"
+        or _merchant_id == "external_seed"
+        or _merchant_id.startswith("merch_obs_")
+    )
+    is_observed_seller = _merchant_id.startswith("merch_obs_")
     if product is not None:
-        is_first_party_catalog = _get(product, "merchant_id") != "external_seed"
-        if not is_first_party_catalog and ips is None:
+        if is_external_seed_content and ips is None:
             reasons.append(REASON_CODES.INDEX_NOT_SERVING_ELIGIBLE)
             return {"decision": "blocked"}
         if ips is not None:
@@ -556,13 +571,16 @@ def _derive_serving_decision(
     # Shadow conditions — would have served under legacy gates, but the
     # contract gates them out of public reads.
     #
-    # c1.v0.3: first-party sources (any merchant_id other than 'external_seed')
-    # are exempt from the identity-pipeline shadow gates. For internal Shopify/
-    # Wix/etc. merchants, the merchant IS the source of truth — the identity
-    # pipeline exists to verify scraped third-party content. review_required
-    # and IDENTITY_CONFLICT still apply (those are explicit moderation/data-
-    # quality signals, not identity-coverage gaps).
-    is_first_party = product is not None and _get(product, "merchant_id") != "external_seed"
+    # c1.v0.3 + ADR-009 Option C: exempt from the identity-COVERAGE shadow gates
+    # both (a) connected first-party merchants (the merchant IS the source of
+    # truth — the pipeline exists to verify scraped third-party content) and
+    # (b) per-brand observed sellers (merch_obs_, the brand's own D2C crawl,
+    # authoritative for its own content). The legacy anonymous 'external_seed'
+    # lump stays subject. review_required and IDENTITY_CONFLICT still apply to
+    # everyone (explicit moderation/data-quality signals, not coverage gaps).
+    is_identity_coverage_exempt = product is not None and (
+        not is_external_seed_content or is_observed_seller
+    )
 
     if identity_decision["status"] == "review_required":
         reasons.append(REASON_CODES.IDENTITY_REVIEW_REQUIRED_LIVE_READ)
@@ -572,20 +590,20 @@ def _derive_serving_decision(
         and identity_decision["confidence"] is None
     )
     if missing_confidence:
-        if is_first_party:
+        if is_identity_coverage_exempt:
             reasons.append(REASON_CODES.IDENTITY_NOT_APPLICABLE_FIRST_PARTY)
         else:
             reasons.append(REASON_CODES.IDENTITY_CONFIDENCE_NULL)
 
     if identity_decision["status"] == "approved" and identity_decision["live_read"] is False:
-        if not is_first_party:
+        if not is_identity_coverage_exempt:
             reasons.append(REASON_CODES.IDENTITY_LIVE_READ_DISABLED)
 
     shadow = (
         identity_decision["status"] == "review_required"
         or REASON_CODES.IDENTITY_CONFIDENCE_NULL in reasons
         or REASON_CODES.IDENTITY_LIVE_READ_DISABLED in reasons
-        or (identity_decision["status"] == "unknown" and not is_first_party)
+        or (identity_decision["status"] == "unknown" and not is_identity_coverage_exempt)
     )
 
     if shadow:
