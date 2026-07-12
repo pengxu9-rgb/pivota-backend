@@ -110,6 +110,30 @@ async def make_external_seed_servable(
     recompute eligibility. Returns a per-step summary; never raises."""
     summary: Dict[str, Any] = {"backlink": False, "quality": False, "apv": False, "serving_eligible": None}
 
+    # Resolve the product's REAL identity up front. Under ADR-009 an external
+    # seed is keyed to its per-brand observed seller (merch_obs_…), not the
+    # legacy "external_seed" merchant. The quality snapshot MUST be written
+    # under that same merchant, because the serving classifier
+    # (index_pipeline_state_service) reads the snapshot by the product's own
+    # merchant — writing it under EXTERNAL_SEED_MERCHANT_ID leaves the snapshot
+    # unfindable ("no quality snapshot found"), so serving_eligible/
+    # index_eligible never flip for every merch_obs_-keyed seed. Fall back to
+    # the legacy merchant only when the catalog row is missing (pre-ADR-009
+    # rows resolve to "external_seed" anyway, so this is correct for both).
+    quality_merchant_id = EXTERNAL_SEED_MERCHANT_ID
+    content_key: Optional[str] = None
+    try:
+        cp = await db.fetch_one(
+            "SELECT merchant_id, content_key FROM catalog_products WHERE product_key = :pk",
+            {"pk": product_key},
+        )
+        if cp:
+            cp = dict(cp)
+            quality_merchant_id = str(cp.get("merchant_id") or "").strip() or EXTERNAL_SEED_MERCHANT_ID
+            content_key = cp.get("content_key")
+    except Exception:  # noqa: BLE001 -- fall back to legacy merchant, never raise
+        logger.exception("catalog identity lookup failed for %s", product_key)
+
     try:
         await backlink_seed_to_product(seed_id, product_key, db=db)
         summary["backlink"] = True
@@ -118,7 +142,7 @@ async def make_external_seed_servable(
 
     try:
         await full_quality_eval(
-            merchant_id=EXTERNAL_SEED_MERCHANT_ID,
+            merchant_id=quality_merchant_id,
             platform=EXTERNAL_SEED_PLATFORM,
             platform_product_id=source_product_id,
             geo_code="default",
@@ -139,10 +163,6 @@ async def make_external_seed_servable(
         logger.exception("agent_pdp_view refresh failed for %s", product_key)
 
     try:
-        cp = await db.fetch_one(
-            "SELECT content_key FROM catalog_products WHERE product_key = :pk", {"pk": product_key}
-        )
-        content_key = (dict(cp).get("content_key") if cp else None)
         if content_key:
             summary["serving_eligible"] = await recompute_serving_eligibility(content_key, reason=reason)
     except Exception:  # noqa: BLE001
