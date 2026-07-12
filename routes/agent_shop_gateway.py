@@ -5130,8 +5130,11 @@ def _build_options_from_variants(p: StandardProduct) -> List[Dict[str, Any]]:
     return options
 
 
+# Only strip an EXPLICIT storefront suffix ("… Official Site/Store/Shop",
+# "… Flagship Store") — never a bare trailing "Store"/"Shop", which would mangle a
+# legitimate brand name (e.g. "The Body Shop" → "The Body").
 _BRAND_MERCHANT_NAME_SUFFIX_RE = re.compile(
-    r"\s+(official\s+(site|store|shop)|flagship\s+store|store|shop)\s*$",
+    r"\s+(official\s+(site|store|shop)|flagship\s+store)\s*$",
     re.IGNORECASE,
 )
 

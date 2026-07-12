@@ -53,42 +53,6 @@ def classify_query_semantic_class(query: Optional[str]) -> str:
         or "sin fragancia" in q
     ):
         return "beauty"
-    # K-beauty / skincare vocabulary. The catalog is beauty-dominant and these are
-    # real, high-count inventory (essence 61, ampoule 72, mist 50, cica 58, pdrn 51,
-    # centella 44, tea tree 43, ceramide 25, peptide 73, collagen 141, ...), but the
-    # lists above missed them — so "snail mucin essence" / "centella ampoule" /
-    # "ceramide emulsion" fell to "default", which BLOCKS the external-seed (beauty)
-    # leg and applies the generic-default precision gate, zeroing legitimate results.
-    # Only clearly-skincare forms/actives (no bare "cream"/"oil"/"mask"/"gel").
-    if re.search(
-        r"\b("
-        r"essence|ampoule|ampule|emulsion|face mist|facial mist|cushion|"
-        r"scrub|peel|exfoliant|exfoliator|"
-        r"sheet mask|clay mask|sleeping mask|cleansing oil|cleansing balm|"
-        r"face oil|facial oil|toner pad|spot patch|pimple patch|micellar water|"
-        r"cica|centella|centella asiatica|madecassoside|heartleaf|houttuynia|mugwort|"
-        r"snail mucin|snail|propolis|pdrn|polynucleotide|ceramide|ceramides|"
-        r"peptide|peptides|collagen|tea tree|green tea|rice water|bakuchiol|"
-        r"azelaic|glycolic acid|mandelic acid|lactic acid|tranexamic|arbutin|"
-        r"panthenol|allantoin"
-        r")\b",
-        q,
-    ):
-        return "beauty"
-    if any(
-        token in q_compact
-        for token in (
-            "essence", "ampoule", "ampule", "emulsion", "facemist", "facialmist",
-            "cushion", "exfoliant", "exfoliator", "sheetmask", "claymask",
-            "sleepingmask", "cleansingoil", "cleansingbalm", "faceoil", "facialoil",
-            "spotpatch", "pimplepatch", "micellarwater", "cica", "centella",
-            "madecassoside", "heartleaf", "houttuynia", "mugwort", "snailmucin",
-            "propolis", "pdrn", "polynucleotide", "ceramide", "peptide", "collagen",
-            "teatree", "greentea", "ricewater", "bakuchiol", "azelaic",
-            "tranexamic", "arbutin", "panthenol", "allantoin",
-        )
-    ):
-        return "beauty"
     if re.search(
         r"\b(perfume|perfumes|fragrance|fragrances|parfum|parfums|cologne|eau de parfum|eau de toilette|body mist)\b",
         q,
@@ -120,6 +84,47 @@ def classify_query_semantic_class(query: Optional[str]) -> str:
         q,
     ):
         return "lingerie"
+    # K-beauty / skincare vocabulary missed by the lists above. These are real,
+    # high-count catalog inventory (essence 61, ampoule 72, cica 58, pdrn 51,
+    # centella 44, ceramide 25, ...); missing them classified "snail mucin essence"
+    # / "centella ampoule" as "default", which BLOCKS the external-seed (beauty)
+    # recall leg and applies the generic-default precision gate — zeroing legitimate
+    # results. Placed AFTER fragrance/lingerie so a perfume/lingerie query still wins.
+    # PRECISION: generic product-forms are QUALIFIED (cushion foundation, face/body
+    # scrub, chemical peel — never bare cushion/scrub/peel/emulsion), and only
+    # skincare-EXCLUSIVE actives are listed (cica/pdrn/ceramide/…). Food/supplement/
+    # garden-colliding terms (collagen, peptide, green tea, rice water, propolis,
+    # mugwort, tea tree, bare snail) are omitted — they still classify beauty when
+    # combined with a form word ("collagen ampoule" → ampoule, "tea tree toner" →
+    # toner). Word-boundary matched; compact list is compounds-only (no substring
+    # over-match).
+    if re.search(
+        r"\b("
+        r"essence|ampoule|ampule|"
+        r"face mist|facial mist|"
+        r"cushion foundation|cushion compact|bb cushion|"
+        r"face scrub|body scrub|lip scrub|sugar scrub|exfoliating scrub|"
+        r"chemical peel|peeling gel|exfoliating peel|exfoliant|exfoliator|"
+        r"sheet mask|clay mask|sleeping mask|"
+        r"cleansing oil|cleansing balm|face oil|facial oil|"
+        r"toner pad|spot patch|pimple patch|micellar water|"
+        r"cica|centella|centella asiatica|madecassoside|heartleaf|houttuynia|"
+        r"snail mucin|pdrn|polynucleotide|ceramide|ceramides|bakuchiol|"
+        r"azelaic|glycolic acid|mandelic acid|lactic acid|tranexamic|arbutin|"
+        r"panthenol|allantoin"
+        r")\b",
+        q,
+    ):
+        return "beauty"
+    if any(
+        token in q_compact
+        for token in (
+            "snailmucin", "centellaasiatica", "madecassoside", "polynucleotide",
+            "sheetmask", "claymask", "sleepingmask",
+            "cleansingoil", "cleansingbalm", "micellarwater",
+        )
+    ):
+        return "beauty"
     if re.search(
         r"\b("
         r"beauty|skincare|skin care|cosmetic|cosmetics|makeup|"

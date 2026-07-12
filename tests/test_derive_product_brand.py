@@ -24,6 +24,14 @@ def test_brand_falls_back_to_vendorless_brand_field():
 def test_brand_strips_official_suffix_from_merchant_name():
     assert _derive_product_brand(_P(vendor=None, brand=None, merchant_name="Iunik Official Store")) == "Iunik"
     assert _derive_product_brand(_P(vendor=None, brand=None, merchant_name="Beauty of Joseon Official Site")) == "Beauty of Joseon"
+    assert _derive_product_brand(_P(vendor=None, brand=None, merchant_name="COSRX Flagship Store")) == "COSRX"
+
+
+def test_brand_does_not_strip_bare_store_or_shop_from_real_brand_names():
+    """A bare trailing "Store"/"Shop" is part of the brand, not a storefront
+    suffix — never strip it (regression: would mangle "The Body Shop")."""
+    assert _derive_product_brand(_P(vendor=None, brand=None, merchant_name="The Body Shop")) == "The Body Shop"
+    assert _derive_product_brand(_P(vendor=None, brand=None, merchant_name="Lush Cosmetics Shop")) == "Lush Cosmetics Shop"
 
 
 def test_brand_none_when_no_source():
