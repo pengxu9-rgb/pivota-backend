@@ -77,12 +77,25 @@ def seed_search_terms(raw_query: str) -> List[str]:
     return filtered or terms[:4]
 
 
-def _build_text_match_clause(*, param_key: str, include_seed_data_text_match: bool) -> str:
+def _build_text_match_clause(
+    *, param_key: str, include_seed_data_text_match: bool, columns_only: bool = False
+) -> str:
     parts = [
         f"LOWER(destination_url) LIKE :{param_key}",
         f"LOWER(canonical_url) LIKE :{param_key}",
         f"LOWER(domain) LIKE :{param_key}",
         f"LOWER(title) LIKE :{param_key}",
+    ]
+    if columns_only:
+        # Rank-only path: match the cheap indexed columns and DO NOT touch the
+        # seed_data JSON recall paths. Extracting those (#>>) detoasts the large
+        # TOASTed seed_data per candidate for the ORDER BY — the dominant cost of
+        # a broad multi-term seed query. Ranking is a soft signal (the caller
+        # re-ranks), so the JSON paths are omitted for speed. Recall (the WHERE)
+        # is unaffected — it still uses build_external_seed_text_clause with the
+        # full path set.
+        return "(" + " OR ".join(parts) + ")"
+    parts_extra = [
         # Match the recall enrichment so a product's verified actives / search
         # aliases (e.g. "soy isoflavones", "adenosine", "korean firming cream")
         # count toward recall — these live in derived.recall, NOT the title, so
@@ -96,6 +109,7 @@ def _build_text_match_clause(*, param_key: str, include_seed_data_text_match: bo
         f"LOWER(COALESCE(seed_data#>>'{{derived,recall,ingredient_tokens}}', '')) LIKE :{param_key}",
         f"LOWER(COALESCE(seed_data#>>'{{derived,recall,alias_tokens}}', '')) LIKE :{param_key}",
     ]
+    parts.extend(parts_extra)
     if include_seed_data_text_match:
         parts.append(f"LOWER(CAST(seed_data AS TEXT)) LIKE :{param_key}")
     return "(" + " OR ".join(parts) + ")"
@@ -129,6 +143,7 @@ def build_external_seed_text_clause(
     raw_query: Optional[str],
     include_seed_data_text_match: bool = False,
     param_prefix: str = "q",
+    skip_phrase_arms: bool = False,
 ) -> tuple[str, Dict[str, Any]]:
     query = str(raw_query or "").strip().lower()
     if not query:
@@ -136,23 +151,33 @@ def build_external_seed_text_clause(
 
     values: Dict[str, Any] = {}
     clauses: List[str] = []
+    tokens = seed_search_terms(query)
 
-    key = f"{param_prefix}_like"
-    values[key] = f"%{query}%"
-    clauses.append(_build_text_match_clause(param_key=key, include_seed_data_text_match=include_seed_data_text_match))
+    # The whole-phrase (%a b c%) and compact (%abc%) arms are a strict SUBSET of
+    # the per-token OR (%a% OR %b% OR %c%) — anything matching the phrase matches
+    # each token. When there ARE per-token arms they're redundant, and they bloat
+    # the OR enough that the planner abandons the trgm GIN indexes for a full
+    # parallel seq scan that detoasts seed_data per row (the multi-term perf
+    # cliff: "brightening vitamin c serum" ~4s → ~1s once dropped). So skip them
+    # when skip_phrase_arms and tokens exist — recall is unchanged (per-token is a
+    # superset). If there are no usable tokens, keep the whole-phrase arm.
+    if not (skip_phrase_arms and tokens):
+        key = f"{param_prefix}_like"
+        values[key] = f"%{query}%"
+        clauses.append(_build_text_match_clause(param_key=key, include_seed_data_text_match=include_seed_data_text_match))
 
-    compact = "".join(query.split())
-    if compact and compact != query:
-        compact_key = f"{param_prefix}_compact_like"
-        values[compact_key] = f"%{compact}%"
-        clauses.append(
-            _build_text_match_clause(
-                param_key=compact_key,
-                include_seed_data_text_match=include_seed_data_text_match,
+        compact = "".join(query.split())
+        if compact and compact != query:
+            compact_key = f"{param_prefix}_compact_like"
+            values[compact_key] = f"%{compact}%"
+            clauses.append(
+                _build_text_match_clause(
+                    param_key=compact_key,
+                    include_seed_data_text_match=include_seed_data_text_match,
+                )
             )
-        )
 
-    for idx, term in enumerate(seed_search_terms(query)):
+    for idx, term in enumerate(tokens):
         term_key = f"{param_prefix}_term_{idx}"
         values[term_key] = f"%{term}%"
         clauses.append(
@@ -211,6 +236,7 @@ def build_external_seed_prefer_terms_rank_sql(
     prefer_terms: Optional[List[str]],
     include_seed_data_text_match: bool = True,
     param_prefix: str = "prefer",
+    columns_only: bool = False,
 ) -> tuple[str, Dict[str, Any]]:
     terms = _normalize_seed_terms(prefer_terms, max_items=8)
     if not terms:
@@ -225,6 +251,7 @@ def build_external_seed_prefer_terms_rank_sql(
             + _build_text_match_clause(
                 param_key=key,
                 include_seed_data_text_match=include_seed_data_text_match,
+                columns_only=columns_only,
             )
             + " THEN 1 ELSE 0 END)"
         )
@@ -278,6 +305,7 @@ async def fetch_external_seed_rows(
     scope: str = "default",
     use_required_terms_filter: bool = False,
     include_total_count: bool = True,
+    fast_multiterm: bool = False,
 ) -> Dict[str, Any]:
     where = ["status = :status"]
     values: Dict[str, Any] = {
@@ -295,6 +323,7 @@ async def fetch_external_seed_rows(
         raw_query=query,
         include_seed_data_text_match=include_seed_data_text_match,
         param_prefix="q",
+        skip_phrase_arms=fast_multiterm,
     )
     if text_clause:
         where.append(text_clause)
@@ -314,6 +343,7 @@ async def fetch_external_seed_rows(
         prefer_terms=prefer_terms or required_terms,
         include_seed_data_text_match=include_seed_data_text_match,
         param_prefix="prefer",
+        columns_only=fast_multiterm,
     )
     scope_token = str(scope or "default").strip().lower() or "default"
     rank_enabled = scope_token in {"brand_strict", "brand_broad", "brand", "default"}
