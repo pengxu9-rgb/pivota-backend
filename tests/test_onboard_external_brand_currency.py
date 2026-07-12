@@ -72,27 +72,34 @@ async def test_upsert_seed_defaults_to_us_usd(fake_db):
 _PK = "prod::merch_obs_deadbeefdeadbeef::external_seed::anuko_32"
 
 
+_MID = "merch_obs_deadbeefdeadbeef"
+
+
 async def test_set_category_and_offer_does_not_force_us(fake_db):
     await onboard._set_category_and_offer({
         "external_product_id": "anuko_32",
         "category_kind": "haircare",
         "market": "KR",
-    }, _PK)
+    }, _PK, _MID)
     # last execute = the catalog_offers UPDATE; market must be the product's, not 'US'
     offer_sql, offer_params = fake_db.calls[-1]
     assert "catalog_offers" in offer_sql
     assert offer_params["market"] == "KR"
     assert offer_params["pk"] == _PK
     assert "market='US'" not in offer_sql  # the old hardcode is gone
+    # Scoped to THIS seller's own offer, not every offer on the product_key.
+    assert "merchant_id=:mid" in offer_sql
+    assert offer_params["mid"] == _MID
 
 
 async def test_set_category_and_offer_defaults_market_us(fake_db):
     await onboard._set_category_and_offer({
         "external_product_id": "x1",
         "category_kind": "skincare",
-    }, _PK)
+    }, _PK, _MID)
     offer_params = fake_db.calls[-1][1]
     assert offer_params["market"] == "US"
+    assert offer_params["mid"] == _MID
 
 
 async def test_resolve_pdp_scope_single_seller_is_merchant_owned(monkeypatch):

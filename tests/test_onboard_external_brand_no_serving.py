@@ -62,7 +62,7 @@ def spies(monkeypatch):
     async def _upsert_seed(p, *, seller_ref, seed_kind):
         return None
 
-    async def _set_category_and_offer(p, pk):
+    async def _set_category_and_offer(p, pk, self_merchant_id):
         return None
 
     async def _suppress(dropped):

@@ -354,7 +354,9 @@ async def _upsert_seed(
     )
 
 
-async def _set_category_and_offer(p: Dict[str, Any], product_key: str) -> None:
+async def _set_category_and_offer(
+    p: Dict[str, Any], product_key: str, self_merchant_id: str
+) -> None:
     pk = product_key
     if p.get("category_kind"):
         await database.execute(
@@ -383,10 +385,18 @@ async def _set_category_and_offer(p: Dict[str, Any], product_key: str) -> None:
     # Respect the product's real market (the mirror already set it from the seed);
     # don't force 'US' -- a KRW Korean offer must not be relabeled US-market.
     market = (p.get("market") or "US").strip() or "US"
+    # Scope to THIS seller's own offer (product_key + observed merchant), NOT every
+    # offer on the product_key. A canonical product carried by multiple sellers has
+    # sibling offers (a retailer offer via attach_retailer_offer, a connected-
+    # merchant offer) sharing this product_key under different merchant_ids; an
+    # unqualified `WHERE product_key` would stamp the crawled brand's brand_direct/
+    # first-party onto those third-party offers too. The very next step
+    # (_resolve_pdp_scope) counts those other sellers, so multi-seller products are
+    # a real, expected case here.
     await database.execute(
         "UPDATE catalog_offers SET is_first_party=:fp, offer_type=:ot, market=:market, updated_at=NOW() "
-        "WHERE product_key=:pk",
-        {"fp": is_first_party, "ot": offer_type, "market": market, "pk": pk},
+        "WHERE product_key=:pk AND merchant_id=:mid",
+        {"fp": is_first_party, "ot": offer_type, "market": market, "pk": pk, "mid": self_merchant_id},
     )
 
 
@@ -511,7 +521,7 @@ async def _onboard(
     print(f"mirror inserted_catalog_products={inserted}")
     for p in cohort:
         merchant_id, product_key = keys[p["external_product_id"]]
-        await _set_category_and_offer(p, product_key)
+        await _set_category_and_offer(p, product_key, merchant_id)
         # Resolve identity scope BEFORE make_external_seed_servable recomputes
         # eligibility, so the row can actually reach serving_eligible. SKIPPED
         # under --no-serving: leaving pdp_scope=NULL holds the row at the
