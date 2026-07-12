@@ -1901,6 +1901,21 @@ MULTI_SEARCH_SEED_QUERY_TIMEOUT_SECONDS = _env_float(
     min_value=0.1,
     max_value=5.0,
 )
+
+
+def _seed_query_fast_multiterm_enabled() -> bool:
+    """Flag for the fast multi-term external-seed query. Default OFF ⇒
+    byte-identical SQL. When ON, the seed text query drops the redundant
+    whole-phrase/compact OR arms (a strict subset of the per-token OR) and ranks
+    on cheap indexed columns instead of detoasting seed_data JSON — flipping a
+    broad multi-term query off the parallel seq scan (~4s) onto the trgm indexes
+    (~0.4s). Recall is unchanged; ranking is a soft signal the caller re-ranks."""
+    return (os.getenv("SEED_QUERY_FAST_MULTITERM") or "").strip().lower() in {
+        "1",
+        "true",
+        "yes",
+        "on",
+    }
 MULTI_SEARCH_SEED_BUILD_BUDGET_SECONDS = _env_float(
     "AGENT_SHOP_MULTI_SEED_BUILD_BUDGET_SECONDS",
     1.0,
@@ -9076,6 +9091,7 @@ async def _handle_find_products_multi_inner(
                 scope="default",
                 use_required_terms_filter=False,
                 include_total_count=False,
+                fast_multiterm=_seed_query_fast_multiterm_enabled(),
             )
             seed_rows = stage_a_result.get("rows") or []
             external_seed_query_timeout = bool(stage_a_result.get("query_timeout") or False)
@@ -9102,6 +9118,7 @@ async def _handle_find_products_multi_inner(
                     scope="default",
                     use_required_terms_filter=False,
                     include_total_count=False,
+                    fast_multiterm=_seed_query_fast_multiterm_enabled(),
                 )
                 stage_b_rows = stage_b_result.get("rows") or []
                 external_seed_query_timeout = bool(
