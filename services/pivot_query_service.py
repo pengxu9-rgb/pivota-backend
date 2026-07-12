@@ -768,6 +768,19 @@ async def _fetch_canonical_search_rows(
     sync_status_clause = ""
     if not merchant_id:
         sync_status_clause = "AND p.sync_status = 'live'"
+
+    # Exclude products from DEACTIVATED merchants (catalog_merchants.status =
+    # 'inactive') from cross-merchant recall. A retired/deactivated merchant —
+    # e.g. a decommissioned test rig whose stores are all retired — must not leak
+    # its catalog into "find me a X" results. This semantic-core recall previously
+    # text-matched catalog_products with NO merchant-status gate, so a demo
+    # merchant's dog leashes surfaced for "leather crossbody bag". COALESCE keeps
+    # rows with no catalog_merchants row (external seeds) and non-inactive statuses
+    # (active / observed sellers) serving. Merchant-scoped queries skip this so a
+    # merchant can still see their own rows in the operator dashboard.
+    merchant_status_clause = ""
+    if not merchant_id:
+        merchant_status_clause = "AND COALESCE(m.status, 'active') <> 'inactive'"
     vertical_where = ""
     vertical_score = ""
     if vertical_search:
@@ -905,6 +918,7 @@ async def _fetch_canonical_search_rows(
             {merchant_clause}
             {lifecycle_clause}
             {sync_status_clause}
+            {merchant_status_clause}
             ORDER BY rank_score DESC, p.updated_at DESC, s.updated_at DESC
             LIMIT :candidate_limit
         )

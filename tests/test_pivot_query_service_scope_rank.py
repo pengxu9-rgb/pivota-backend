@@ -88,6 +88,28 @@ def test_canonical_search_lifecycle_filter_skips_merchant_scoped_queries():
     )
 
 
+def test_canonical_search_excludes_deactivated_merchants_from_global_recall():
+    """A deactivated merchant (catalog_merchants.status='inactive') — e.g. a
+    decommissioned test rig whose stores are all retired — must NOT leak its
+    catalog into cross-merchant recall (this is what surfaced a demo merchant's
+    dog leashes for 'leather crossbody bag'). COALESCE keeps external seeds
+    (no catalog_merchants row -> NULL -> 'active') and observed sellers serving."""
+    src = _src(pivot_query_service._fetch_canonical_search_rows)
+    assert "COALESCE(m.status, 'active') <> 'inactive'" in src, (
+        "global recall must exclude products from merchants marked inactive"
+    )
+    assert "merchant_status_clause" in src, (
+        "the merchant-status filter must be a named SQL fragment for clarity"
+    )
+    # Must be merchant_id-conditional so a merchant still sees their own rows:
+    # the COALESCE assignment is guarded by an `if not merchant_id:` branch.
+    idx_assign = src.index('"AND COALESCE(m.status')
+    assert "if not merchant_id" in src[max(0, idx_assign - 80):idx_assign], (
+        "merchant_status_clause must be assigned inside an `if not merchant_id` "
+        "branch so merchant-scoped queries keep returning all of a merchant's inventory"
+    )
+
+
 def test_canonical_search_includes_lifecycle_rank_bonus():
     """Within the live pool, published > validated as a tie-breaker.
     Pin both magnitudes — they must stay below brand-exact (80) and
