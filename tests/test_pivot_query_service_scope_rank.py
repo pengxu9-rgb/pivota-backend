@@ -95,15 +95,16 @@ def test_canonical_search_excludes_deactivated_merchants_from_global_recall():
     dog leashes for 'leather crossbody bag'). COALESCE keeps external seeds
     (no catalog_merchants row -> NULL -> 'active') and observed sellers serving."""
     src = _src(pivot_query_service._fetch_canonical_search_rows)
-    assert "COALESCE(m.status, 'active') <> 'inactive'" in src, (
-        "global recall must exclude products from merchants marked inactive"
+    assert "lower(COALESCE(m.status, 'active')) <> 'inactive'" in src, (
+        "global recall must exclude products from merchants marked inactive "
+        "(lower() so a non-lowercase status can't slip past)"
     )
     assert "merchant_status_clause" in src, (
         "the merchant-status filter must be a named SQL fragment for clarity"
     )
     # Must be merchant_id-conditional so a merchant still sees their own rows:
     # the COALESCE assignment is guarded by an `if not merchant_id:` branch.
-    idx_assign = src.index('"AND COALESCE(m.status')
+    idx_assign = src.index('"AND lower(COALESCE(m.status')
     assert "if not merchant_id" in src[max(0, idx_assign - 80):idx_assign], (
         "merchant_status_clause must be assigned inside an `if not merchant_id` "
         "branch so merchant-scoped queries keep returning all of a merchant's inventory"

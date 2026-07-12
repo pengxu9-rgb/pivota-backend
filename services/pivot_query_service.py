@@ -780,7 +780,7 @@ async def _fetch_canonical_search_rows(
     # merchant can still see their own rows in the operator dashboard.
     merchant_status_clause = ""
     if not merchant_id:
-        merchant_status_clause = "AND COALESCE(m.status, 'active') <> 'inactive'"
+        merchant_status_clause = "AND lower(COALESCE(m.status, 'active')) <> 'inactive'"
     vertical_where = ""
     vertical_score = ""
     if vertical_search:
