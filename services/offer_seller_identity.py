@@ -36,6 +36,9 @@ DEFAULT_KNOWN_RETAILER_DOMAINS = (
     "cultbeauty.com", "cultbeauty.co.uk", "yesstyle.com", "stylevana.com",
     "iherb.com", "ebay.com", "kohls.com", "jcpenney.com", "beautylish.com",
     "revolve.com", "asos.com", "boots.com", "feelunique.com", "skinstore.com",
+    # Dept-store / marketplace beauty retailers (added Fix Plan C read-review):
+    "selfridges.com", "harrods.com", "spacenk.com",
+    "coupang.com", "gmarket.co.kr",
 )
 
 _MULTI_LEVEL_TLDS = frozenset({
@@ -132,6 +135,16 @@ def is_known_retailer(host: Optional[str], extra_csv: Optional[str] = None) -> b
 
 
 def brand_owns_domain(brand: Optional[str], host: Optional[str]) -> bool:
+    """True only when the domain's SLD *is* the brand (collapsed), i.e. exact
+    label equality — NOT mere substring containment.
+
+    Unanchored substring matching produced retailer->brand_direct false positives:
+    'elf' is inside 'selfridges', 'mac' inside 'pharmacy', and the reverse rule
+    made brand 'beautyofjoseon' match the label 'beauty' (beauty.com). Every
+    genuine D2C case the suite pins is exact (cosrx.com, tomfordbeauty.com,
+    wholesale.publicgoods.com -> 'publicgoods'), so exact equality keeps all real
+    matches while erring toward 'unknown' (never a false brand_direct) for affixed
+    hosts like shopcosrx.com — the honest, safe direction."""
     b = normalize_brand(brand)
     label = domain_name_label(host)
     if not b or not label:
@@ -139,13 +152,7 @@ def brand_owns_domain(brand: Optional[str], host: Optional[str]) -> bool:
     label_norm = re.sub(r"[^a-z0-9]+", "", label)
     if not label_norm:
         return False
-    if len(b) < 3:
-        return b == label_norm
-    if b in label_norm:
-        return True
-    if len(b) >= 4 and label_norm in b and len(label_norm) >= 4:
-        return True
-    return False
+    return b == label_norm
 
 
 def derive_offer_seller_identity(

@@ -71,6 +71,12 @@ def test_domains_match(a, b, expected):
     ("amzn.to", True),
     ("global.oliveyoung.com", True),
     ("bestbuy.com", True),
+    # Dept-store / marketplace beauty retailers added in the read-review.
+    ("selfridges.com", True),
+    ("harrods.com", True),
+    ("spacenk.com", True),
+    ("coupang.com", True),
+    ("gmarket.co.kr", True),
     ("fentybeauty.com", False),
     ("notulta.com", False),
 ])
@@ -79,8 +85,9 @@ def test_is_known_retailer(host, expected):
 
 
 def test_is_known_retailer_csv_extendable():
-    assert is_known_retailer("coupang.com") is False
-    assert is_known_retailer("coupang.com", "coupang.com") is True
+    # A host NOT in the default list is only recognized once supplied via CSV.
+    assert is_known_retailer("regional-mall.example") is False
+    assert is_known_retailer("regional-mall.example", "regional-mall.example") is True
 
 
 @pytest.mark.parametrize("brand,host,expected", [
@@ -92,6 +99,16 @@ def test_is_known_retailer_csv_extendable():
     ("", "anything.com", False),
     (None, "anything.com", False),
     ("Naturium", None, False),
+    # Anchoring regression guards: brand token is a SUBSTRING of the domain label
+    # but does NOT own it -> must be False (was wrongly True under substring match).
+    ("e.l.f.", "selfridges.com", False),   # 'elf' inside 'selfridges'
+    ("MAC", "pharmacy.com", False),        # 'mac' inside 'pharmacy'
+    ("Ordinary", "extraordinary-shop.com", False),
+    # Reverse direction: brand longer than the label -> label must not "win".
+    ("Beauty of Joseon", "beauty.com", False),  # label 'beauty' inside brand
+    # Affixed brand host now resolves conservatively to unknown (was True); the
+    # honest under-claim direction. Documented, not a silent regression.
+    ("COSRX", "shopcosrx.com", False),
 ])
 def test_brand_owns_domain(brand, host, expected):
     assert brand_owns_domain(brand, host) is expected
@@ -133,6 +150,22 @@ def test_brand_wholesale_subdomain_is_brand_direct_not_retailer():
 
 def test_unknown_domain_no_evidence_is_none():
     r = derive_offer_seller_identity(domain="somerandommarketplace.com", brand="Acme")
+    assert r["offer_type"] is None and r["rule"] == "unknown_no_evidence"
+
+
+def test_substring_brand_on_listed_retailer_is_retailer_not_brand_direct():
+    # e.l.f. offered on Selfridges: 'elf' is a substring of 'selfridges', which the
+    # old unanchored rule mis-flipped to brand_direct. Selfridges is now a known
+    # retailer, so rule 0 preempts -> retailer.
+    r = derive_offer_seller_identity(domain="www.selfridges.com", brand="e.l.f.")
+    assert r["offer_type"] == "retailer" and r["is_first_party"] is False
+    assert r["rule"] == "known_retailer_domain"
+
+
+def test_substring_brand_on_unlisted_host_is_unknown_not_brand_direct():
+    # Same substring shape but the host is NOT a known retailer: the anchored
+    # brand rule refuses to guess brand_direct -> honest unknown (no over-claim).
+    r = derive_offer_seller_identity(domain="extraordinary-shop.com", brand="Ordinary")
     assert r["offer_type"] is None and r["rule"] == "unknown_no_evidence"
 
 

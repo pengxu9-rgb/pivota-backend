@@ -212,10 +212,20 @@ async def upsert_catalog_offer_from_seed_row(
            :price_confidence, :source_system, :source_ref,
            CAST(:offer_payload AS jsonb))
         ON CONFLICT (offer_id) DO UPDATE SET
-          -- Fill offer typing without clobbering a value onboard already set:
-          -- COALESCE only fills a NULL offer_type; is_first_party sticks true.
-          offer_type = COALESCE(catalog_offers.offer_type, EXCLUDED.offer_type),
-          is_first_party = catalog_offers.is_first_party OR EXCLUDED.is_first_party,
+          -- A KNOWN-retailer host is AUTHORITATIVE third-party evidence, so it
+          -- corrects a wrongly-stored value (demotes a bad brand_direct/first-party):
+          -- when EXCLUDED.offer_type='retailer' it wins. Otherwise we only FILL a
+          -- NULL offer_type (COALESCE) and keep is_first_party sticky — a brand_direct
+          -- or unknown never clobbers what onboard already set. Real corrections
+          -- away from retailer are the backfill's job, not this ingest upsert.
+          offer_type = CASE
+            WHEN EXCLUDED.offer_type = 'retailer' THEN 'retailer'
+            ELSE COALESCE(catalog_offers.offer_type, EXCLUDED.offer_type)
+          END,
+          is_first_party = CASE
+            WHEN EXCLUDED.offer_type = 'retailer' THEN FALSE
+            ELSE catalog_offers.is_first_party OR EXCLUDED.is_first_party
+          END,
           availability = EXCLUDED.availability,
           inventory_quantity = EXCLUDED.inventory_quantity,
           currency = EXCLUDED.currency,
