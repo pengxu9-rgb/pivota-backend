@@ -606,6 +606,114 @@ def test_get_succeeded_reshapes_per_sku_report(monkeypatch):
     assert body["audited_url"] == "https://m.example"
 
 
+def test_get_succeeded_methodology_reports_measured_coverage(monkeypatch):
+    # The persisted methodology carries the PLANNED budget; the reshape must
+    # overwrite it with what the providers ACTUALLY ran (real per-model counts +
+    # real model names), so the header stops claiming a static "14 (Gemini)".
+    per_sku_report = {
+        "per_sku_reports": [
+            {
+                "sku_key": "urlwedge:x",
+                "scores": {},
+                "citation_by_provider": {
+                    "gemini": {"score": 40, "prompts": 7},
+                    "chatgpt": {"score": 60, "prompts": 10},
+                    # A failed provider must NOT count toward coverage.
+                    "deepseek": {"status": "probe_failed", "prompts": 0},
+                },
+            }
+        ],
+    }
+    c = _get_client(monkeypatch, {
+        "run_id": "run-url-1",
+        "merchant_id": "merch-A", "subject_type": "merchant_url",
+        "status": "succeeded", "report_jsonb": per_sku_report,
+        "partial_result_jsonb": {"launch": {"wedge_base_payload": {
+            "tier": "url_per_sku",
+            "methodology": {
+                "products_audited": 1,
+                # The static planned budget that used to leak into the header.
+                "queries_per_product": mar._WEDGE_PROMPTS_PER_SKU,
+                "what_we_checked": "... (Gemini grounded search) ...",
+            },
+        }}},
+    })
+    m = c.get(f"{_URL}/run-url-1").json()["methodology"]
+    # Measured, not the static 14: the fullest single-model coverage (10).
+    assert m["queries_per_product"] == 10
+    # Planned budget preserved for reference.
+    assert m["queries_per_product_target"] == mar._WEDGE_PROMPTS_PER_SKU
+    # Real per-model run counts + real model list (failed provider excluded).
+    assert m["prompts_by_provider"] == {"gemini": 7, "chatgpt": 10}
+    assert m["providers_ran"] == ["chatgpt", "gemini"]
+    # The copy names the models that actually ran — no lone "Gemini" claim.
+    assert "ChatGPT" in m["what_we_checked"] and "Gemini" in m["what_we_checked"]
+    assert "10 AI shopping-agent buyer-intent queries" in m["what_we_checked"]
+
+
+def test_get_succeeded_all_providers_failed_marks_coverage_unavailable(monkeypatch):
+    # A run that "succeeds" but every provider came back failed / coverage-
+    # unavailable must NOT show the static planned "14 (Gemini)" — it reports
+    # coverage_unavailable so the header prompts a re-run instead of fabricating.
+    per_sku_report = {
+        "per_sku_reports": [
+            {
+                "sku_key": "urlwedge:x",
+                "scores": {},
+                "citation_by_provider": {
+                    "gemini": {"status": "probe_failed", "prompts": 0},
+                    "chatgpt": {
+                        "coverage_unavailable": True,
+                        "score": None,
+                        "prompts": 0,
+                    },
+                },
+            }
+        ],
+    }
+    c = _get_client(monkeypatch, {
+        "run_id": "run-url-1",
+        "merchant_id": "merch-A", "subject_type": "merchant_url",
+        "status": "succeeded", "report_jsonb": per_sku_report,
+        "partial_result_jsonb": {"launch": {"wedge_base_payload": {
+            "tier": "url_per_sku",
+            "methodology": {
+                "products_audited": 1,
+                "queries_per_product": mar._WEDGE_PROMPTS_PER_SKU,
+                "what_we_checked": "... (Gemini grounded search) ...",
+            },
+        }}},
+    })
+    m = c.get(f"{_URL}/run-url-1").json()["methodology"]
+    assert m["coverage_unavailable"] is True
+    assert m["queries_per_product"] == 0
+    assert m["providers_ran"] == []
+    assert m["queries_per_product_target"] == mar._WEDGE_PROMPTS_PER_SKU
+    assert "Gemini grounded search" not in m["what_we_checked"]
+
+
+def test_get_succeeded_legacy_report_keeps_planned_methodology(monkeypatch):
+    # No per-provider signal at all (legacy report shape) → we can't measure,
+    # so leave the planned methodology untouched (don't wrongly zero a real run).
+    per_sku_report = {"per_sku_reports": [{"sku_key": "urlwedge:x", "scores": {}}]}
+    c = _get_client(monkeypatch, {
+        "run_id": "run-url-1",
+        "merchant_id": "merch-A", "subject_type": "merchant_url",
+        "status": "succeeded", "report_jsonb": per_sku_report,
+        "partial_result_jsonb": {"launch": {"wedge_base_payload": {
+            "tier": "url_per_sku",
+            "methodology": {
+                "products_audited": 1,
+                "queries_per_product": mar._WEDGE_PROMPTS_PER_SKU,
+            },
+        }}},
+    })
+    m = c.get(f"{_URL}/run-url-1").json()["methodology"]
+    assert m["queries_per_product"] == mar._WEDGE_PROMPTS_PER_SKU
+    assert "coverage_unavailable" not in m
+    assert "providers_ran" not in m
+
+
 def test_get_failed_maps_mock_fallback(monkeypatch):
     c = _get_client(monkeypatch, {
         "merchant_id": "merch-A", "subject_type": "merchant_url",

@@ -1208,6 +1208,90 @@ def _synthetic_url_sku_key(merchant_id: str, pdp_url: str) -> str:
     return f"{URL_WEDGE_SKU_PREFIX}{digest}"
 
 
+# Merchant-facing model display names for the honest methodology rewrite.
+_PROVIDER_DISPLAY_NAMES: Dict[str, str] = {
+    "gemini": "Gemini",
+    "chatgpt": "ChatGPT",
+    "openai": "ChatGPT",
+    "deepseek": "DeepSeek",
+    "claude": "Claude",
+}
+
+
+def _humanize_provider_list(providers: List[str]) -> str:
+    """"gemini","chatgpt" -> "Gemini and ChatGPT" (Oxford-free, ≤3 reads clean)."""
+    names = [
+        _PROVIDER_DISPLAY_NAMES.get(p, p.title()) for p in providers
+    ]
+    if not names:
+        return ""
+    if len(names) == 1:
+        return names[0]
+    if len(names) == 2:
+        return f"{names[0]} and {names[1]}"
+    return f"{', '.join(names[:-1])}, and {names[-1]}"
+
+
+def _measured_probe_coverage(
+    per_sku_reports: List[Dict[str, Any]],
+) -> Dict[str, Any]:
+    """Derive HONEST run coverage from the completed per-SKU results, so the
+    methodology header reflects what providers actually ran — not the static
+    `_WEDGE_PROMPTS_PER_SKU` budget claimed before any probe fired.
+
+    Reads each SKU's `citation_by_provider[*].prompts` (the real per-provider
+    run count, failed/coverage-unavailable providers excluded). Returns:
+      - providers_ran:      sorted provider ids that produced ≥1 scored run
+      - prompts_by_provider {provider: total prompts across audited SKUs}
+      - queries_per_product the honest per-product query count = the fullest
+                            single-provider coverage a product received (all
+                            providers share the generated query set, so the max
+                            is the distinct set actually probed; a provider that
+                            dropped runs to timeouts sits below it).
+    Empty dict when nothing measurable ran (caller keeps the planned budget).
+    """
+    prompts_by_provider: Dict[str, int] = {}
+    per_sku_max: List[int] = []
+    for report in per_sku_reports or []:
+        cbp = (report or {}).get("citation_by_provider") or {}
+        sku_max = 0
+        for provider, entry in cbp.items():
+            if not isinstance(entry, dict):
+                continue
+            if entry.get("status") == "probe_failed" or entry.get(
+                "coverage_unavailable"
+            ):
+                continue
+            n = int(entry.get("prompts") or 0)
+            if n <= 0:
+                continue
+            prompts_by_provider[provider] = (
+                prompts_by_provider.get(provider, 0) + n
+            )
+            sku_max = max(sku_max, n)
+        if sku_max:
+            per_sku_max.append(sku_max)
+    if not prompts_by_provider:
+        return {}
+    return {
+        "providers_ran": sorted(prompts_by_provider),
+        "prompts_by_provider": prompts_by_provider,
+        "queries_per_product": max(per_sku_max) if per_sku_max else 0,
+    }
+
+
+def _providers_attempted(per_sku_reports: List[Dict[str, Any]]) -> bool:
+    """True when at least one SKU carries a per-provider citation entry (scored
+    OR failed). Lets the reshape distinguish "providers ran and all failed"
+    (report coverage-unavailable) from "no per-provider signal at all" (legacy
+    report shape — leave the planned methodology untouched)."""
+    for report in per_sku_reports or []:
+        cbp = (report or {}).get("citation_by_provider") or {}
+        if any(isinstance(entry, dict) for entry in cbp.values()):
+            return True
+    return False
+
+
 def _shape_url_audit_response(row: Dict[str, Any]) -> Dict[str, Any]:
     """Reshape a completed per_sku run row into the URL-audit response envelope.
 
@@ -1216,6 +1300,12 @@ def _shape_url_audit_response(row: Dict[str, Any]) -> Dict[str, Any]:
     free_audits_*, billing) was echoed into launch.wedge_base_payload at
     enqueue. Catalog-only dimensions are flagged unavailable so the client
     renders the connect-store funnel rather than misleading low scores.
+
+    The persisted methodology carries the PLANNED query budget
+    (`_WEDGE_PROMPTS_PER_SKU`); before returning we overwrite it with the
+    MEASURED coverage read back from the per-SKU results, so the header reports
+    what actually ran (real query count + real model names) instead of a static
+    promise. The planned budget is preserved as `queries_per_product_target`.
     """
     run_id = row.get("run_id")
     report = row.get("report_jsonb")
@@ -1255,6 +1345,53 @@ def _shape_url_audit_response(row: Dict[str, Any]) -> Dict[str, Any]:
     if isinstance(base, dict):
         for key, value in base.items():
             out.setdefault(key, value)
+
+    # Honest coverage: overwrite the static planned budget in the persisted
+    # methodology with what the providers ACTUALLY ran (read from the per-SKU
+    # results). Keeps the header's "N buyer-intent queries (X grounded search)"
+    # in sync with the per-model counts shown in the body.
+    per_sku = out.get("per_sku_reports") or []
+    measured = _measured_probe_coverage(per_sku)
+    if measured:
+        methodology = dict(out.get("methodology") or {})
+        planned = methodology.get("queries_per_product")
+        if planned is not None:
+            methodology["queries_per_product_target"] = planned
+        methodology["queries_per_product"] = measured["queries_per_product"]
+        methodology["providers_ran"] = measured["providers_ran"]
+        methodology["prompts_by_provider"] = measured["prompts_by_provider"]
+        n = measured["queries_per_product"]
+        provider_label = _humanize_provider_list(measured["providers_ran"])
+        methodology["what_we_checked"] = (
+            "Each product URL you gave us is audited on its own: we ran "
+            f"{n} AI shopping-agent buyer-intent quer{'y' if n == 1 else 'ies'} "
+            f"per product on {provider_label} (grounded search) and checked "
+            "whether your URL is cited, which competitors are cited instead, "
+            "and on which sources."
+        )
+        out["methodology"] = methodology
+    elif _providers_attempted(per_sku):
+        # A "succeeded" run where every provider came back failed / coverage-
+        # unavailable. Don't let the static planned methodology assert a
+        # fabricated "14 (Gemini)" — report coverage as unavailable so the
+        # header reflects that nothing scored. (When there's NO per-provider
+        # signal at all — a legacy report shape — we leave the planned
+        # methodology untouched rather than wrongly zeroing a real run.)
+        methodology = dict(out.get("methodology") or {})
+        planned = methodology.get("queries_per_product")
+        if planned is not None:
+            methodology["queries_per_product_target"] = planned
+        methodology["queries_per_product"] = 0
+        methodology["providers_ran"] = []
+        methodology["prompts_by_provider"] = {}
+        methodology["coverage_unavailable"] = True
+        methodology["what_we_checked"] = (
+            "We attempted grounded buyer-intent queries on the models you "
+            "selected, but none returned a scored result on this run (the "
+            "providers errored or were rate-limited). Re-run to measure "
+            "coverage."
+        )
+        out["methodology"] = methodology
     return out
 
 
@@ -1536,12 +1673,19 @@ async def run_merchant_url_audit(
             "model": "merchant_curated_per_sku",
             "products_audited": len(audit_products),
             "products_requested": len(body.product_urls),
+            # Pre-run PLANNED budget + the models we're about to launch. On a
+            # successful run `_shape_url_audit_response` overwrites both with the
+            # MEASURED coverage; this copy is what the "running" poll and the
+            # rare all-providers-failed path show, so it must name the real
+            # launch set (not a hardcoded "Gemini") and read as a plan ("up to").
             "queries_per_product": _WEDGE_PROMPTS_PER_SKU,
             "what_we_checked": (
-                "Each product URL you gave us is audited on its own: we run "
-                "AI shopping-agent (Gemini grounded search) buyer-intent "
-                "queries per product and check whether your URL is cited, "
-                "which competitors are cited instead, and on which sources."
+                "Each product URL you gave us is audited on its own: we run up "
+                f"to {_WEDGE_PROMPTS_PER_SKU} AI shopping-agent buyer-intent "
+                "queries per product on "
+                f"{_humanize_provider_list(providers_for_launch)} (grounded "
+                "search) and check whether your URL is cited, which competitors "
+                "are cited instead, and on which sources."
             ),
             "limitations": [
                 "Catalog-only signals (availability, variants, structured "
