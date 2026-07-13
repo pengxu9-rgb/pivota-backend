@@ -1232,6 +1232,50 @@ def _humanize_provider_list(providers: List[str]) -> str:
     return f"{', '.join(names[:-1])}, and {names[-1]}"
 
 
+# Natural reading order for the header (primary engine first), unknown providers
+# tacked on alphabetically. Keeps the label from reading in raw alphabetical id
+# order ("ChatGPT + Gemini") when Gemini is the base engine.
+_PROVIDER_DISPLAY_ORDER = ["gemini", "chatgpt", "deepseek", "claude"]
+
+
+def _ordered_for_display(providers: List[str]) -> List[str]:
+    return sorted(
+        providers,
+        key=lambda p: (
+            _PROVIDER_DISPLAY_ORDER.index(p)
+            if p in _PROVIDER_DISPLAY_ORDER
+            else len(_PROVIDER_DISPLAY_ORDER),
+            p,
+        ),
+    )
+
+
+def _grounded_search_label(providers: List[str]) -> str:
+    """The header parenthetical, owned by the backend so the frontend renders it
+    verbatim (no client-side provider-name mapping / fallback):
+    ["chatgpt","gemini"] -> "Gemini + ChatGPT grounded search". Empty list ->
+    "" so the caller can omit the parenthetical rather than fabricate one."""
+    names = [
+        _PROVIDER_DISPLAY_NAMES.get(p, p.title())
+        for p in _ordered_for_display(providers)
+    ]
+    if not names:
+        return ""
+    return f"{' + '.join(names)} grounded search"
+
+
+def _provider_run_summary(
+    prompts_by_provider: Dict[str, int], order: List[str]
+) -> str:
+    """Display-ready per-model run counts, e.g. "Gemini 7 · ChatGPT 10", in
+    natural engine order. Empty when nothing ran."""
+    return " · ".join(
+        f"{_PROVIDER_DISPLAY_NAMES.get(p, p.title())} "
+        f"{int(prompts_by_provider.get(p) or 0)}"
+        for p in _ordered_for_display(order)
+    )
+
+
 def _measured_probe_coverage(
     per_sku_reports: List[Dict[str, Any]],
 ) -> Dict[str, Any]:
@@ -1360,6 +1404,15 @@ def _shape_url_audit_response(row: Dict[str, Any]) -> Dict[str, Any]:
         methodology["queries_per_product"] = measured["queries_per_product"]
         methodology["providers_ran"] = measured["providers_ran"]
         methodology["prompts_by_provider"] = measured["prompts_by_provider"]
+        # Display-ready strings the header renders verbatim — the backend is the
+        # single source of truth for model naming, so the frontend never
+        # re-derives a label or falls back to a generic one.
+        methodology["grounded_search_label"] = _grounded_search_label(
+            measured["providers_ran"]
+        )
+        methodology["provider_run_summary"] = _provider_run_summary(
+            measured["prompts_by_provider"], measured["providers_ran"]
+        )
         n = measured["queries_per_product"]
         provider_label = _humanize_provider_list(measured["providers_ran"])
         methodology["what_we_checked"] = (
@@ -1384,6 +1437,11 @@ def _shape_url_audit_response(row: Dict[str, Any]) -> Dict[str, Any]:
         methodology["queries_per_product"] = 0
         methodology["providers_ran"] = []
         methodology["prompts_by_provider"] = {}
+        # Clear the planned label the base_payload set — nothing scored, so a
+        # "Gemini + ChatGPT grounded search" string here would contradict the
+        # "none returned a result" body. Empty → the frontend omits it.
+        methodology["grounded_search_label"] = ""
+        methodology["provider_run_summary"] = ""
         methodology["coverage_unavailable"] = True
         methodology["what_we_checked"] = (
             "We attempted grounded buyer-intent queries on the models you "
@@ -1679,6 +1737,10 @@ async def run_merchant_url_audit(
             # rare all-providers-failed path show, so it must name the real
             # launch set (not a hardcoded "Gemini") and read as a plan ("up to").
             "queries_per_product": _WEDGE_PROMPTS_PER_SKU,
+            # Display-ready header label from the PLANNED launch set — the
+            # measured reshape overwrites it; this is what a legacy report shape
+            # (no per-provider signal) falls back to, still naming real models.
+            "grounded_search_label": _grounded_search_label(providers_for_launch),
             "what_we_checked": (
                 "Each product URL you gave us is audited on its own: we run up "
                 f"to {_WEDGE_PROMPTS_PER_SKU} AI shopping-agent buyer-intent "

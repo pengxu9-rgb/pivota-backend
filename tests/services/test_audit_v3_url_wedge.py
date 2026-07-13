@@ -649,6 +649,10 @@ def test_get_succeeded_methodology_reports_measured_coverage(monkeypatch):
     # The copy names the models that actually ran — no lone "Gemini" claim.
     assert "ChatGPT" in m["what_we_checked"] and "Gemini" in m["what_we_checked"]
     assert "10 AI shopping-agent buyer-intent queries" in m["what_we_checked"]
+    # Backend owns the display-ready header strings (frontend renders verbatim),
+    # in natural engine order (Gemini first), not raw alphabetical id order.
+    assert m["grounded_search_label"] == "Gemini + ChatGPT grounded search"
+    assert m["provider_run_summary"] == "Gemini 7 · ChatGPT 10"
 
 
 def test_get_succeeded_all_providers_failed_marks_coverage_unavailable(monkeypatch):
@@ -680,6 +684,9 @@ def test_get_succeeded_all_providers_failed_marks_coverage_unavailable(monkeypat
             "methodology": {
                 "products_audited": 1,
                 "queries_per_product": mar._WEDGE_PROMPTS_PER_SKU,
+                # Production shape: base_payload always carries the PLANNED label
+                # from the launch set — it must NOT survive into an all-failed run.
+                "grounded_search_label": "Gemini + ChatGPT grounded search",
                 "what_we_checked": "... (Gemini grounded search) ...",
             },
         }}},
@@ -690,6 +697,9 @@ def test_get_succeeded_all_providers_failed_marks_coverage_unavailable(monkeypat
     assert m["providers_ran"] == []
     assert m["queries_per_product_target"] == mar._WEDGE_PROMPTS_PER_SKU
     assert "Gemini grounded search" not in m["what_we_checked"]
+    # The stale planned label must be cleared, not left contradicting the body.
+    assert not m.get("grounded_search_label")
+    assert not m.get("provider_run_summary")
 
 
 def test_get_succeeded_legacy_report_keeps_planned_methodology(monkeypatch):
