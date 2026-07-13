@@ -213,13 +213,19 @@ async def start_scheduler() -> None:
 
         # W7 stability canary: auto-detect same-basis re-runs (any merchant) inside a
         # tight window and assert they land within tolerance — validates W2 / catches
-        # measurement-system noise. Every 12h so a 48h-window pair is reliably caught
+        # measurement-system noise. Twice daily so a 48h-window pair is reliably caught
         # (create_alert dedups a persistent breach).
+        #
+        # CRON trigger, NOT `interval` — same restart-starvation reasoning as the
+        # catalog_row_trust backfill below: a 12h interval job's first fire is
+        # start+12h, reset on every redeploy, so on a service that recycles more
+        # often than every 12h it would never fire. Fixed 05:30/17:30 UTC slots.
         from services.audit_stability_canary import run_stability_canary
         _add_job(
             run_stability_canary,
-            "interval",
-            hours=12,
+            "cron",
+            hour="5,17",
+            minute=30,
             id="audit_stability_canary",
             replace_existing=True,
             misfire_grace_time=3600,
@@ -577,16 +583,28 @@ async def start_scheduler() -> None:
         # Catches rows missed by the dual-write producer hooks (Phase 2b/2c).
         # Idempotent UPSERT means idle runs (no drift) emit zero writes.
         # Disable via CATALOG_TRUST_BACKFILL_ENABLED=false without a deploy.
+        #
+        # CRON trigger (fixed 6-hourly slots), NOT `interval`. An interval job's
+        # first fire is `process_start + interval`, and every restart re-registers
+        # it (replace_existing) resetting that timer to now+interval. This service
+        # redeploys on push + recycles far more often than every 6h, so a 6h
+        # interval job NEVER reached its first fire — the backfill effectively
+        # never ran (stale trust rows sat blocked for days; see
+        # docs/catalog_row_trust_freshness_crawled_finding_2026-07-13.md in the
+        # PIVOTA-Agent repo). A cron trigger fires at wall-clock slots regardless
+        # of restart cadence; the job only needs to be alive at (or within
+        # misfire_grace_time of) a slot.
         from jobs.catalog_row_trust_backfill_cron import (
             run_catalog_row_trust_backfill_tick,
         )
         _add_job(
             run_catalog_row_trust_backfill_tick,
-            "interval",
-            hours=6,
+            "cron",
+            hour="*/6",
+            minute=17,  # off the top of the hour to avoid contending with :00 crons
             id="catalog_row_trust_backfill",
             replace_existing=True,
-            misfire_grace_time=1800,
+            misfire_grace_time=1800,  # fire up to 30min late (post-restart) not skip
             coalesce=True,
             max_instances=1,
         )
@@ -669,7 +687,7 @@ async def start_scheduler() -> None:
             "+ partner_settlement_monthly (day 3 04:00 UTC, PAUSED) "
             "+ settlement_file_generate (day 5 02:00 UTC, ACTIVE) "
             "+ settlement_file_transfer (day 10 02:00 UTC, ACTIVE) "
-            "+ catalog_row_trust_backfill (6h, ACTIVE) "
+            "+ catalog_row_trust_backfill (cron */6h :17, ACTIVE) "
             "+ payment_reconcile_tick (5min, flag-gated PAYMENT_RECONCILE_SWEEP_ENABLED) "
             "+ identity_reconcile_sweep (Mon 04:30 UTC, flag-gated ENABLE_IDENTITY_RECONCILE_SWEEP)"
         )
