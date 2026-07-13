@@ -174,6 +174,15 @@ _PER_SKU_AUDIT_UPSTREAM_CHUNK_SIZE = 4
 # genuinely down/slow provider doesn't grind through every remaining chunk at
 # the full per-call timeout (which is what stalled prior runs).
 _PER_SKU_AUDIT_MAX_CONSECUTIVE_CHUNK_FAILURES = 2
+# A single chunk failure is usually a transient ReadTimeout or a provider
+# rate-limit blip (esp. Gemini, which sheds under its global gate) — not a real
+# outage. Retry the chunk ONCE, after a short backoff, before counting it lost,
+# so the planned prompt budget actually lands instead of silently dropping ~4
+# prompts on one hiccup. The consecutive-failure bail above still protects
+# against a genuinely-down provider (a retried-then-failed chunk still counts as
+# one consecutive failure).
+_PER_SKU_AUDIT_CHUNK_RETRIES = 1
+_PER_SKU_AUDIT_CHUNK_RETRY_BACKOFF_S = 0.75
 _EXPLICIT_AVAILABLE_STATES = {"in_stock", "available"}
 _COMPETITOR_ATTRIBUTE_GROUNDED_PROVIDERS = {"gemini", "chatgpt"}
 # Sentinel attribute key for the category-agnostic verbatim "what {competitor}
@@ -9830,20 +9839,43 @@ async def _probe_per_sku_ctx(
                     f"{audit_run_id or 'adhoc'}:{sku_key}:"
                     f"{provider_id}:per_sku:{mode_tag}:{chunk_idx}"
                 )
-                try:
-                    result = await llm_client.probe(
-                        scan_mode=scan_mode,
-                        scan_target_id=probe_run_id,
-                        merchant_id=str(merchant_id),
-                        store_id=f"{merchant_id}_audit",
-                        context=_per_sku_probe_context(safe_ctx, chunk),
-                        provider=provider_id,
-                        max_runs=len(chunk),
-                        model=model_info.get("model"),
-                        model_is_override=bool(
-                            model_info.get("model_is_override")
-                        ),
-                    )
+                # Attempt the chunk with one retry on failure: a transient
+                # timeout / rate-limit blip shouldn't silently drop this chunk's
+                # prompts from the budget. Only a retried-then-still-failed chunk
+                # is recorded failed (and counts toward the consecutive bail).
+                result = None
+                last_exc: Optional[Exception] = None
+                for attempt in range(_PER_SKU_AUDIT_CHUNK_RETRIES + 1):
+                    try:
+                        result = await llm_client.probe(
+                            scan_mode=scan_mode,
+                            scan_target_id=probe_run_id,
+                            merchant_id=str(merchant_id),
+                            store_id=f"{merchant_id}_audit",
+                            context=_per_sku_probe_context(safe_ctx, chunk),
+                            provider=provider_id,
+                            max_runs=len(chunk),
+                            model=model_info.get("model"),
+                            model_is_override=bool(
+                                model_info.get("model_is_override")
+                            ),
+                        )
+                        last_exc = None
+                        break
+                    except Exception as exc:  # noqa: BLE001 - isolate provider/chunk
+                        last_exc = exc
+                        if attempt < _PER_SKU_AUDIT_CHUNK_RETRIES:
+                            logger.info(
+                                "per-sku probe chunk failed; retrying sku=%s "
+                                "provider=%s mode=%s chunk=%s attempt=%d/%d: %s",
+                                sku_key, provider_id, mode_tag, chunk_idx,
+                                attempt + 1, _PER_SKU_AUDIT_CHUNK_RETRIES, exc,
+                            )
+                            if _PER_SKU_AUDIT_CHUNK_RETRY_BACKOFF_S > 0:
+                                await asyncio.sleep(
+                                    _PER_SKU_AUDIT_CHUNK_RETRY_BACKOFF_S
+                                )
+                if last_exc is None:
                     out.append(
                         _normalize_per_sku_probe_payload(
                             result=result,
@@ -9857,14 +9889,14 @@ async def _probe_per_sku_ctx(
                         )
                     )
                     consecutive_failures = 0
-                except Exception as exc:  # noqa: BLE001 - isolate provider/chunk
+                else:
                     out.append(
                         _failed_per_sku_probe_payload(
                             provider=provider_id,
                             sku_key=sku_key,
                             sku_ctx=safe_ctx,
                             probe_run_id=probe_run_id,
-                            error=str(exc),
+                            error=str(last_exc),
                             model_info=model_info,
                             scan_mode=scan_mode,
                         )
@@ -14566,9 +14598,12 @@ def _build_what_pivota_changes(
     # surface): the Layer-1 grounded-citation copy must name the providers this
     # audit's `attribution_score` was actually measured on, not a hardcoded
     # "Gemini". `providers` is the resolved grounded-shopping profile
-    # (profile_providers) threaded down from build_structured_report — the
-    # answer-quality verify provider (DeepSeek) is intentionally NOT in it, since
-    # it doesn't produce the grounded citation this block describes.
+    # (profile_providers) threaded down from build_structured_report — NOT the
+    # answer-quality verify set. On the default/verify-only profiles that's
+    # Gemini (+ChatGPT), with DeepSeek confined to the separate verify pass. On
+    # operator-selected profiles that put DeepSeek in `providers` (e.g.
+    # gemini_deepseek), DeepSeek genuinely fed attribution_score and is named
+    # here — which is honest, not a leak of the verify-only provider.
     _ran_label = _humanize_provider_list(providers or []) or "Gemini"
     _ran_keys = {str(p).strip().lower() for p in (providers or [])}
     # Roadmap engines shown as "maturing" — drop any already running today so a
