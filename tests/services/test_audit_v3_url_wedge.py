@@ -649,6 +649,10 @@ def test_get_succeeded_methodology_reports_measured_coverage(monkeypatch):
     # The copy names the models that actually ran — no lone "Gemini" claim.
     assert "ChatGPT" in m["what_we_checked"] and "Gemini" in m["what_we_checked"]
     assert "10 AI shopping-agent buyer-intent queries" in m["what_we_checked"]
+    # Backend owns the display-ready header strings (frontend renders verbatim),
+    # in natural engine order (Gemini first), not raw alphabetical id order.
+    assert m["grounded_search_label"] == "Gemini + ChatGPT grounded search"
+    assert m["provider_run_summary"] == "Gemini 7 · ChatGPT 10"
 
 
 def test_get_succeeded_all_providers_failed_marks_coverage_unavailable(monkeypatch):
