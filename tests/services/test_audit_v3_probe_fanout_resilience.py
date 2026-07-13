@@ -59,10 +59,22 @@ def _expected_chunks() -> List[List[Any]]:
     return chunks
 
 
-def _install(monkeypatch, *, fail_on):
-    """Stub the DB helpers; fake probe fails on the given 1-based ORDINALS (the
-    Nth chunk attempted, across both scan-mode groups for the provider)."""
+def _install(monkeypatch, *, fail_on=frozenset(), fail_first_attempt=frozenset()):
+    """Stub the DB helpers; fake probe fails per DISTINCT CHUNK (keyed by the
+    stable scan_target_id, so a chunk's retry shares its ordinal).
+
+    - `fail_on`:            chunk ordinals that fail on EVERY attempt (a real,
+                            un-retryable outage).
+    - `fail_first_attempt`: chunk ordinals that fail their FIRST attempt only,
+                            then succeed — the transient-blip case the one-retry
+                            is meant to recover.
+    Chunk ordinals are 1-based in first-seen order across both scan-mode groups.
+    """
+    # Zero the retry backoff so retry-exercising tests don't actually sleep.
+    monkeypatch.setattr(bd, "_PER_SKU_AUDIT_CHUNK_RETRY_BACKOFF_S", 0.0)
     calls: List[Dict[str, Any]] = []
+    ordinal_by_run: Dict[str, int] = {}
+    attempts_by_run: Dict[str, int] = {}
 
     async def _fake_sku_keys(products, merchant_id):
         return [SKU_KEY]
@@ -73,13 +85,18 @@ def _install(monkeypatch, *, fail_on):
     async def _fake_probe(*, scan_mode, scan_target_id, merchant_id, store_id,
                           context, provider, max_runs, model=None,
                           model_is_override=False):
-        # probe_run_id now carries a mode tag ("...:per_sku:branded:1"), so the
-        # chunk index is no longer a bare int. Track attempt ORDER instead.
-        ordinal = len(calls) + 1
-        calls.append({"chunk_idx": ordinal, "scan_mode": scan_mode,
-                      "max_runs": max_runs,
+        # One distinct chunk == one scan_target_id (probe_run_id); a retry of the
+        # same chunk reuses it, so track attempts per-id and assign a stable
+        # first-seen ordinal.
+        if scan_target_id not in ordinal_by_run:
+            ordinal_by_run[scan_target_id] = len(ordinal_by_run) + 1
+        ordinal = ordinal_by_run[scan_target_id]
+        attempts_by_run[scan_target_id] = attempts_by_run.get(scan_target_id, 0) + 1
+        attempt = attempts_by_run[scan_target_id]
+        calls.append({"chunk_idx": ordinal, "attempt": attempt,
+                      "scan_mode": scan_mode, "max_runs": max_runs,
                       "queries": list(context.get("queries") or [])})
-        if ordinal in fail_on:
+        if ordinal in fail_on or (ordinal in fail_first_attempt and attempt == 1):
             raise bd.llm_client.AgentCenterLlmClientError(
                 "llm probe transport failed after retry (ReadTimeout): ReadTimeout('')"
             )
@@ -102,36 +119,64 @@ async def _run():
     )
 
 
-async def test_single_transient_timeout_does_not_zero_the_sku(monkeypatch) -> None:
-    """A failure on chunk 2 must NOT stop chunks 3+; the SKU keeps real runs."""
+async def test_single_transient_timeout_recovers_via_retry(monkeypatch) -> None:
+    """A transient failure on a chunk's FIRST attempt is retried once and
+    recovers — the full prompt budget still lands, nothing silently dropped."""
     chunks = _expected_chunks()
     n = len(chunks)
-    assert n >= 3, "need >=3 chunks to test continue-past-failure"
+    assert n >= 3, "need >=3 chunks to exercise continue + retry"
+
+    calls = _install(monkeypatch, fail_first_attempt={2})
+    out = await _run()
+
+    # Chunk 2 was attempted twice (fail -> retry); every other chunk once.
+    assert len([c for c in calls if c["chunk_idx"] == 2]) == 2
+    assert len(calls) == n + 1  # exactly one extra call (the single retry)
+    assert all(c["max_runs"] <= 4 for c in calls)
+    assert bd._PER_SKU_AUDIT_UPSTREAM_CHUNK_SIZE <= 4
+
+    runs = bd._flatten_probe_runs(out[SKU_KEY])
+    # Retry recovered chunk 2 -> the FULL budget is measured, not n-1 chunks.
+    assert len(runs) == sum(len(c) for c in chunks) > 0
+
+
+async def test_chunk_failing_both_attempts_continues_but_is_zeroed(monkeypatch) -> None:
+    """A chunk that fails BOTH attempts (a real outage, not a blip) still doesn't
+    break the loop — later chunks run — but that one chunk contributes no runs."""
+    chunks = _expected_chunks()
+    n = len(chunks)
+    assert n >= 3
 
     calls = _install(monkeypatch, fail_on={2})
     out = await _run()
 
-    # All chunks attempted (the single failure at chunk 2 did not break the loop).
-    assert len(calls) == n, f"expected all {n} chunks attempted, got {len(calls)}"
-    # Chunk size really is small now (<= 4), so each call is light.
-    assert all(c["max_runs"] <= 4 for c in calls)
-    assert bd._PER_SKU_AUDIT_UPSTREAM_CHUNK_SIZE <= 4
+    # Chunk 2 attempted (retries + 1) times, then given up on.
+    assert len([c for c in calls if c["chunk_idx"] == 2]) == (
+        bd._PER_SKU_AUDIT_CHUNK_RETRIES + 1
+    )
+    # All chunks were still reached (the isolated failure did not break the loop).
+    assert {c["chunk_idx"] for c in calls} == set(range(1, n + 1))
 
-    entries = out[SKU_KEY]
-    runs = bd._flatten_probe_runs(entries)
-    # Successful chunks (all but chunk 2) still produced evidence — SKU not zeroed.
+    runs = bd._flatten_probe_runs(out[SKU_KEY])
+    # SKU not zeroed: every chunk EXCEPT 2 produced runs.
     expected_runs = sum(len(c) for i, c in enumerate(chunks, start=1) if i != 2)
     assert len(runs) == expected_runs > 0
 
 
 async def test_consecutive_failures_bail_after_cap(monkeypatch) -> None:
-    """If every chunk times out, bail after the consecutive-failure cap — don't
-    grind through every remaining chunk at the full per-call timeout."""
+    """If every chunk times out (even after its retry), bail after the
+    consecutive-failure cap — don't grind through every remaining chunk. Each
+    failed chunk now costs (retries + 1) calls before it's counted failed."""
     cap = bd._PER_SKU_AUDIT_MAX_CONSECUTIVE_CHUNK_FAILURES
-    calls = _install(monkeypatch, fail_on=set(range(1, 99)))  # fail all
+    per_chunk = bd._PER_SKU_AUDIT_CHUNK_RETRIES + 1
+    calls = _install(monkeypatch, fail_on=set(range(1, 99)))  # fail all, always
     out = await _run()
 
-    assert len(calls) == cap, f"expected bail after {cap} consecutive failures, got {len(calls)}"
+    distinct_chunks = {c["chunk_idx"] for c in calls}
+    assert len(distinct_chunks) == cap, (
+        f"expected bail after {cap} failed chunks, saw {len(distinct_chunks)}"
+    )
+    assert len(calls) == cap * per_chunk
     assert bd._flatten_probe_runs(out[SKU_KEY]) == []
 
 
