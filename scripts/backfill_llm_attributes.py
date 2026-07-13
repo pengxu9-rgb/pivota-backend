@@ -220,6 +220,7 @@ async def _drive(
     actual_output_tokens = 0
     written_keys: List[str] = []
     samples: List[Dict[str, Any]] = []
+    aborted: Optional[str] = None
 
     is_pilot = args.mode == "pilot"
     if is_pilot and synthesize is None:
@@ -259,6 +260,7 @@ async def _drive(
                 break
             batches += 1
             batch_writes: List[Dict[str, str]] = []
+            pending: List[Any] = []
 
             for row in rows:
                 scanned += 1
@@ -288,27 +290,54 @@ async def _drive(
                         })
                     continue
 
-                # pilot: run the LLM residual and build the envelope.
-                residual = await run_llm_residual(
-                    row, det.residual_fields, synthesize=synthesize,
-                    provider=args.provider, model=args.model,
-                    max_tokens=args.max_tokens,
-                )
-                llm_outcomes[residual.outcome] += 1
-                actual_input_tokens += int(residual.usage.get("input_tokens") or 0)
-                actual_output_tokens += int(residual.usage.get("output_tokens") or 0)
-                envelope = build_envelope(det, residual)
-                if len(samples) < args.sample_size:
-                    samples.append({
-                        "product_key": row.get("product_key"),
-                        "title": row.get("title"),
-                        "envelope": envelope,
-                        "llm_outcome": residual.outcome,
+                pending.append((row, det))
+
+            if is_pilot and pending:
+                # LLM residual with bounded concurrency (full-run throughput;
+                # default 1 preserves the sequential pilot behavior). One retry
+                # on a transport error so a blip does not permanently consume
+                # the row with a deterministic-only envelope (a written row
+                # leaves the IS NULL cohort and would never be revisited).
+                concurrency = max(1, int(getattr(args, "concurrency", 1) or 1))
+
+                async def _residual_with_retry(row, det):
+                    out = await run_llm_residual(
+                        row, det.residual_fields, synthesize=synthesize,
+                        provider=args.provider, model=args.model,
+                        max_tokens=args.max_tokens,
+                    )
+                    if out.outcome == "error":
+                        await asyncio.sleep(2.0)
+                        out = await run_llm_residual(
+                            row, det.residual_fields, synthesize=synthesize,
+                            provider=args.provider, model=args.model,
+                            max_tokens=args.max_tokens,
+                        )
+                    return out
+
+                residuals: List[Any] = []
+                for i in range(0, len(pending), concurrency):
+                    chunk = pending[i:i + concurrency]
+                    residuals.extend(await asyncio.gather(
+                        *[_residual_with_retry(r, d) for r, d in chunk]
+                    ))
+
+                for (row, det), residual in zip(pending, residuals):
+                    llm_outcomes[residual.outcome] += 1
+                    actual_input_tokens += int(residual.usage.get("input_tokens") or 0)
+                    actual_output_tokens += int(residual.usage.get("output_tokens") or 0)
+                    envelope = build_envelope(det, residual)
+                    if len(samples) < args.sample_size:
+                        samples.append({
+                            "product_key": row.get("product_key"),
+                            "title": row.get("title"),
+                            "envelope": envelope,
+                            "llm_outcome": residual.outcome,
+                        })
+                    batch_writes.append({
+                        "product_key": row["product_key"],
+                        "payload": json.dumps(envelope, ensure_ascii=False),
                     })
-                batch_writes.append({
-                    "product_key": row["product_key"],
-                    "payload": json.dumps(envelope, ensure_ascii=False),
-                })
 
             if is_pilot and batch_writes and not args.no_write:
                 keys = [w["product_key"] for w in batch_writes]
@@ -322,7 +351,31 @@ async def _drive(
                 written_keys.extend(keys)
 
             cursor = rows[-1]["product_key"]
-            print(f"batch {batches}: scanned={scanned} written={written} cursor={cursor!r}", flush=True)
+            cum_cost = (actual_input_tokens / 1000.0) * _RATE_INPUT_PER_1K + \
+                       (actual_output_tokens / 1000.0) * _RATE_OUTPUT_PER_1K
+            total_llm = sum(llm_outcomes.values())
+            cum_pf = llm_outcomes.get("parse_fail", 0) + llm_outcomes.get("truncated", 0)
+            print(
+                f"batch {batches}: scanned={scanned} written={written} "
+                f"llm={total_llm} outcomes={dict(llm_outcomes)} "
+                f"parse_fail={cum_pf} cost_usd={cum_cost:.4f} cursor={cursor!r}",
+                flush=True,
+            )
+            # ---- mid-run kill-switches (full-run safety; checked per batch) ----
+            if is_pilot and total_llm >= 50:
+                pf_rate = cum_pf / total_llm
+                if pf_rate > args.max_parse_fail_rate:
+                    aborted = (f"KILL-SWITCH: cumulative parse-failure rate "
+                               f"{pf_rate:.1%} > {args.max_parse_fail_rate:.1%} "
+                               f"after {total_llm} calls — aborting (resumable).")
+                    print(aborted, flush=True)
+                    break
+            max_cost = float(getattr(args, "max_cost_usd", 0.0) or 0.0)
+            if is_pilot and max_cost and cum_cost > max_cost:
+                aborted = (f"KILL-SWITCH: cumulative cost ${cum_cost:.4f} > "
+                           f"${max_cost:.2f} ceiling — aborting (resumable).")
+                print(aborted, flush=True)
+                break
     finally:
         await _disconnect_if_needed(db, was)
 
@@ -373,6 +426,8 @@ async def _drive(
             "actual_cost_usd": round(actual_cost, 4),
             "actual_cost_usd_per_llm_call": round(actual_cost / total_llm, 6) if total_llm else 0.0,
         }
+        if aborted:
+            report["ABORTED"] = aborted
         # FAIL LOUDLY: the known systemic failure is truncation→swallow. Above the
         # threshold the run is not trustworthy and the operator must raise the cap.
         if total_llm and parse_fail_rate > args.max_parse_fail_rate:
@@ -409,6 +464,12 @@ def _parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
                    help="Stop after N batches (0 = run the whole cohort; dry-run only).")
     p.add_argument("--sample-size", type=int, default=15)
     p.add_argument("--no-write", action="store_true", help="Pilot: compute + cost but do not write.")
+    p.add_argument("--concurrency", type=int, default=1,
+                   help="Concurrent LLM residual calls per chunk (full-run throughput; "
+                        "default 1 = the sequential pilot behavior).")
+    p.add_argument("--max-cost-usd", type=float, default=0.0,
+                   help="Abort (resumable) when cumulative ACTUAL cost exceeds this "
+                        "ceiling. 0 = no ceiling.")
     p.add_argument("--max-retries", type=int, default=5)
     p.add_argument("--retry-base-delay", type=float, default=1.0)
     return p.parse_args(argv)
