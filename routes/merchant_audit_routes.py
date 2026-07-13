@@ -1437,6 +1437,11 @@ def _shape_url_audit_response(row: Dict[str, Any]) -> Dict[str, Any]:
         methodology["queries_per_product"] = 0
         methodology["providers_ran"] = []
         methodology["prompts_by_provider"] = {}
+        # Clear the planned label the base_payload set — nothing scored, so a
+        # "Gemini + ChatGPT grounded search" string here would contradict the
+        # "none returned a result" body. Empty → the frontend omits it.
+        methodology["grounded_search_label"] = ""
+        methodology["provider_run_summary"] = ""
         methodology["coverage_unavailable"] = True
         methodology["what_we_checked"] = (
             "We attempted grounded buyer-intent queries on the models you "
