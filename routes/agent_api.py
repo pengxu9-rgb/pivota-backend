@@ -1515,6 +1515,21 @@ AGENT_EXTERNAL_SEED_STAGE_B_QUERY_TIMEOUT_SECONDS = _env_float(
     min_value=0.05,
     max_value=10.0,
 )
+
+
+def _external_seed_stage_a_lean_timeout_rescue_enabled() -> bool:
+    """Kill-switch for the stage-A lean timeout rescue (default ON).
+
+    The rescue only runs when stage A timed out with ZERO rows — a state that
+    today serves nothing — so enabling it cannot regress a query that currently
+    serves. Read per-call so ops can flip it without a restart-ordering hazard.
+    """
+    return (os.getenv("SEED_STAGE_A_LEAN_TIMEOUT_RESCUE") or "true").strip().lower() not in {
+        "0",
+        "false",
+        "no",
+        "off",
+    }
 AGENT_EXTERNAL_SEED_FAST_SUPPLEMENT_BUDGET_MS = int(
     _env_float(
         "AGENT_EXTERNAL_SEED_FAST_SUPPLEMENT_BUDGET_MS",
@@ -3941,6 +3956,50 @@ async def _load_external_seed_products_for_search(
     )
     stage_a_rows = stage_a_result.get("rows") or []
     stage_a_timeout = bool(stage_a_result.get("query_timeout") or False)
+    # Lean timeout rescue: stage-A's WHERE arms include the seed_data->derived
+    # ->recall JSON paths, and GIN trgm is lossy — every flagged candidate is
+    # heap-rechecked, detoasting the whole TOASTed seed_data blob. Dense
+    # verticals (beauty) fill the LIMIT early and finish; SPARSE verticals
+    # (electronics: "bone conduction headphones", prod-measured 4.7s vs the
+    # 0.9s stage-A budget) can't terminate early, time out, and serve nothing —
+    # the "external-seed recall lane dead for non-beauty verticals" bug. When
+    # stage A times out with zero rows, retry once with the lean inline-column
+    # WHERE (title/url/domain only, ~0.5s prod-measured, no COUNT twin). The
+    # rescue only runs where today's answer is "nothing", so it cannot regress
+    # a query that currently serves; recall-JSON-only matches still arrive via
+    # stage B when it completes.
+    stage_a_lean_rescue_attempted = False
+    stage_a_lean_rescue_rows = 0
+    if (
+        stage_a_timeout
+        and not stage_a_rows
+        and str(query or "").strip()
+        and _external_seed_stage_a_lean_timeout_rescue_enabled()
+    ):
+        stage_a_lean_rescue_attempted = True
+        lean_rescue_result = await fetch_external_seed_rows(
+            database=database,
+            market=DEFAULT_EXTERNAL_SEED_MARKET,
+            query=query,
+            limit=limit,
+            offset=max(0, int(page_offset or 0)),
+            include_seed_data_text_match=False,
+            only_unattached=strict_only_unattached,
+            query_timeout_seconds=stage_a_timeout_seconds,
+            required_terms=None,
+            prefer_terms=normalized_brand_prefer_terms if brand_query_detected else None,
+            scope=strict_scope,
+            use_required_terms_filter=strict_use_required_terms_filter,
+            include_total_count=False,
+            fast_multiterm=True,
+            lean_where_min_tokens=1,
+        )
+        lean_rescue_rows = lean_rescue_result.get("rows") or []
+        stage_a_lean_rescue_rows = len(lean_rescue_rows)
+        if lean_rescue_rows:
+            stage_a_result = lean_rescue_result
+            stage_a_rows = lean_rescue_rows
+            stage_a_timeout = bool(lean_rescue_result.get("query_timeout") or False)
     rows = list(stage_a_rows)
     stage_b_attempted = False
     stage_b_timeout = False
@@ -4026,6 +4085,8 @@ async def _load_external_seed_products_for_search(
         metrics["brand_relevant_rows"] = strict_brand_relevant_rows
         metrics["query_semantic_class"] = normalized_semantic_class
         metrics["stage_a_rows"] = len(stage_a_rows)
+        metrics["stage_a_lean_rescue_attempted"] = bool(stage_a_lean_rescue_attempted)
+        metrics["stage_a_lean_rescue_rows"] = int(stage_a_lean_rescue_rows)
         metrics["stage_b_attempted"] = bool(stage_b_attempted)
         metrics["stage_b_rows"] = len(stage_b_rows)
         metrics["stage_b_timeout"] = bool(stage_b_timeout)
