@@ -284,3 +284,64 @@ def test_platform_coverage_lists_shopify_woo_bc_as_shipped():
     # No longer claims roadmap for Woo + BC (they're shipped)
     assert "WooCommerce" not in (pc.get("roadmap") or [])
     assert "BigCommerce" not in (pc.get("roadmap") or [])
+
+
+# ---------------------------------------------------------------------
+# Honest model naming in discovery_lift (Layer-1 methodology copy names
+# the providers that actually ran, not a hardcoded "Gemini" — parity
+# with the URL-audit surface's _shape_url_audit_response).
+# ---------------------------------------------------------------------
+
+
+def _discovery_lift_for_providers(providers):
+    from services.agent_center_bd_report_service import _build_what_pivota_changes
+
+    wpc = _build_what_pivota_changes(
+        merchant_name="Grüns",
+        merchant_pdp_url="https://gruns.co/products/greens-gummies",
+        attribution_score=0,
+        attribution_runs=3,
+        merchant_cited_runs=0,
+        category_retailer_hosts=[{"host": "forbes.com", "times_cited": 2}],
+        category_visibility_score=100,
+        providers=providers,
+    )
+    return wpc["discovery_lift"]
+
+
+def test_methodology_note_names_multiple_providers_when_they_ran():
+    """Gemini + ChatGPT run → methodology_note + Layer-1 subtitle name BOTH,
+    and ChatGPT is not also parked in the 'as those engines mature' roadmap."""
+    dl = _discovery_lift_for_providers(["gemini", "chatgpt"])
+
+    note = dl["methodology_note"]
+    assert "grounded LLM citation via Gemini and ChatGPT" in note
+
+    layer1 = dl["layers"][0]
+    assert layer1["name"].startswith("Layer 1")
+    subtitle = layer1["subtitle"]
+    assert subtitle.startswith("Gemini and ChatGPT today")
+    # ChatGPT already ran — must not be re-listed as a maturing engine.
+    assert "ChatGPT search" not in subtitle
+    # Non-run roadmap engines still surface.
+    assert "Perplexity" in subtitle and "Claude" in subtitle
+
+
+def test_methodology_note_gemini_only_run():
+    """Single-provider (Gemini-only) run still reads 'via Gemini' and keeps
+    ChatGPT/Perplexity/Claude on the maturing roadmap."""
+    dl = _discovery_lift_for_providers(["gemini"])
+
+    assert "grounded LLM citation via Gemini)" in dl["methodology_note"]
+    subtitle = dl["layers"][0]["subtitle"]
+    assert subtitle.startswith("Gemini today")
+    assert "ChatGPT search" in subtitle
+
+
+def test_methodology_note_falls_back_to_gemini_when_no_providers():
+    """Legacy callers that don't thread providers get the prior 'Gemini'
+    wording rather than an empty label."""
+    dl = _discovery_lift_for_providers(None)
+
+    assert "grounded LLM citation via Gemini)" in dl["methodology_note"]
+    assert dl["layers"][0]["subtitle"].startswith("Gemini today")

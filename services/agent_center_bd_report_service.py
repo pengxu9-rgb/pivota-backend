@@ -5747,7 +5747,13 @@ def _engine_moves(engine: str, status: str, hosts_by_type: Mapping[str, List[str
     return moves
 
 
-_ENGINE_NOTE_LABELS: Dict[str, str] = {"gemini": "Gemini", "chatgpt": "ChatGPT"}
+_ENGINE_NOTE_LABELS: Dict[str, str] = {
+    "gemini": "Gemini",
+    "chatgpt": "ChatGPT",
+    "openai": "ChatGPT",
+    "deepseek": "DeepSeek",
+    "claude": "Claude",
+}
 
 
 def _engine_note_label(engine: str) -> str:
@@ -5755,6 +5761,25 @@ def _engine_note_label(engine: str) -> str:
     raw lowercase key ('chatgpt')."""
     key = str(engine or "").strip().lower()
     return _ENGINE_NOTE_LABELS.get(key, key.title() or key)
+
+
+def _humanize_provider_list(providers: List[str]) -> str:
+    """['gemini', 'chatgpt'] -> 'Gemini and ChatGPT'. Mirrors the URL-audit
+    methodology label in routes/merchant_audit_routes._humanize_provider_list so
+    both audit surfaces name the models that ACTUALLY ran instead of a
+    hardcoded 'Gemini'. De-dupes on display name (openai/chatgpt collapse)."""
+    names: List[str] = []
+    for provider in providers or []:
+        label = _engine_note_label(provider)
+        if label and label not in names:
+            names.append(label)
+    if not names:
+        return ""
+    if len(names) == 1:
+        return names[0]
+    if len(names) == 2:
+        return f"{names[0]} and {names[1]}"
+    return f"{', '.join(names[:-1])}, and {names[-1]}"
 
 
 def build_engine_playbook(
@@ -14468,6 +14493,7 @@ def _build_what_pivota_changes(
     category_retailer_hosts: List[Dict[str, Any]],
     category_visibility_score: Optional[int],
     merchant_platform: Optional[str] = None,
+    providers: Optional[List[str]] = None,
 ) -> Dict[str, Any]:
     """Return the "What Pivota changes after onboarding" structured block.
 
@@ -14536,6 +14562,32 @@ def _build_what_pivota_changes(
         f"{captured_by_phrase}."
     )
 
+    # Honest model naming (mirrors _shape_url_audit_response on the URL-audit
+    # surface): the Layer-1 grounded-citation copy must name the providers this
+    # audit's `attribution_score` was actually measured on, not a hardcoded
+    # "Gemini". `providers` is the resolved grounded-shopping profile
+    # (profile_providers) threaded down from build_structured_report — the
+    # answer-quality verify provider (DeepSeek) is intentionally NOT in it, since
+    # it doesn't produce the grounded citation this block describes.
+    _ran_label = _humanize_provider_list(providers or []) or "Gemini"
+    _ran_keys = {str(p).strip().lower() for p in (providers or [])}
+    # Roadmap engines shown as "maturing" — drop any already running today so a
+    # provider never appears in both the "today" and the "as those mature" lists.
+    _layer1_roadmap = [
+        label
+        for key, label in (
+            ("chatgpt", "ChatGPT search"),
+            ("perplexity", "Perplexity"),
+            ("claude", "Claude"),
+        )
+        if key not in _ran_keys
+    ]
+    _layer1_subtitle = f"{_ran_label} today" + (
+        f"; {' / '.join(_layer1_roadmap)} as those engines mature"
+        if _layer1_roadmap
+        else ""
+    )
+
     discovery_lift = {
         "title": "Why your AI-channel discoverability will improve (multi-layer)",
         "current_state": (
@@ -14553,7 +14605,7 @@ def _build_what_pivota_changes(
         "layers": [
             {
                 "name": "Layer 1 — Grounded LLM citation",
-                "subtitle": "Gemini today; ChatGPT search / Perplexity / Claude as those engines mature",
+                "subtitle": _layer1_subtitle,
                 "what_it_is": (
                     "AI assistants that ground answers in live web search "
                     "(Google for Gemini, Bing for ChatGPT, etc.) cite "
@@ -14671,7 +14723,7 @@ def _build_what_pivota_changes(
         ),
         "methodology_note": (
             "This audit's `attribution_score` measures Layer 1 only "
-            "(grounded LLM citation via Gemini). The "
+            f"(grounded LLM citation via {_ran_label}). The "
             f"{PIVOTA_PDP_BASELINE_REFERENCE['median_visibility']}/"
             f"{PIVOTA_PDP_BASELINE_REFERENCE['median_attribution']} "
             "Pivota baseline (probe modes "
@@ -16563,6 +16615,15 @@ def build_structured_report(
         (integration_state or {}).get("store_platform_name")
         if integration_state else None
     )
+    # `provider` is the resolved grounded-shopping profile label
+    # (provider_label = single id or comma-joined profile_providers). Parse it
+    # back to a list so the Layer-1 methodology copy names the models actually
+    # run instead of a hardcoded "Gemini".
+    _resolved_providers = [
+        part.strip().lower()
+        for part in str(provider or "").split(",")
+        if part and part.strip()
+    ]
     what_pivota_changes = _build_what_pivota_changes(
         merchant_name=merchant_name,
         merchant_pdp_url=merchant_pdp_url,
@@ -16572,6 +16633,7 @@ def build_structured_report(
         category_retailer_hosts=category_retailer_hosts,
         category_visibility_score=category_score,
         merchant_platform=_merchant_platform,
+        providers=_resolved_providers,
     )
 
     visibility_query_rows = _per_query_rows(visibility_runs, "product_visible")
