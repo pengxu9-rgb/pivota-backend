@@ -216,6 +216,26 @@ def test_per_sku_comparability_follows_the_basis_rule():
     assert [seg["indices"] for seg in sku["segments"]] == [[0, 1], [2]]
 
 
+def test_per_sku_path_case_is_identity():
+    # URL paths are case-sensitive: /Serum and /serum are DIFFERENT products.
+    # Only scheme+host case (and a trailing slash) may be normalized away.
+    series = build_tracking_series([
+        _row(0, 60, 45, 55, per_product=[_product(_URL_A, 70)]),
+        _row(30, 62, 47, 57, per_product=[
+            _product("https://shop.example.com/products/SERUM", 72),
+        ]),
+    ])
+    assert len(series["per_sku"]) == 2
+
+
+def test_attempted_count_prefers_aggregate_products_count():
+    # aggregate.products_count (what the run TRIED) outranks the failed[] fallback.
+    row = _row(0, 60, 45, 55, per_product=[_product(_URL_A, 70)])
+    row["report_jsonb"]["aggregate"] = {"products_count": 5}
+    series = build_tracking_series([row])
+    assert series["points"][0]["attempted_sku_count"] == 5
+
+
 def test_per_sku_url_normalization_joins_series():
     # Trailing slash / host case must not split one product into two series.
     series = build_tracking_series([

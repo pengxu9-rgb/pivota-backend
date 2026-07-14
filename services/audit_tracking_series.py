@@ -126,7 +126,8 @@ def _attempted_count(report: Mapping[str, Any], measured: int) -> Optional[int]:
     aggregate = report.get("aggregate")
     if isinstance(aggregate, dict):
         count = aggregate.get("products_count")
-        if isinstance(count, int) and count >= measured:
+        # bool is an int subclass — a corrupt True would surface as "1 attempted"
+        if isinstance(count, int) and not isinstance(count, bool) and count >= measured:
             return count
     failed = report.get("failed")
     if isinstance(failed, list):
@@ -248,7 +249,9 @@ def build_tracking_series(rows: List[Dict[str, Any]]) -> Dict[str, Any]:
     if per_sku_truncated:
         keep = sorted(
             sku_series.items(),
-            key=lambda kv: (-len(kv[1]["points"]), kv[1]["title"] or "", kv[0]),
+            # str() the title tiebreak: a corrupt non-string title in one stored
+            # report must not make the whole endpoint 500 on a sort TypeError
+            key=lambda kv: (-len(kv[1]["points"]), str(kv[1]["title"] or ""), kv[0]),
         )[:PER_SKU_SERIES_CAP]
         sku_series = dict(keep)
     per_sku: Dict[str, Dict[str, Any]] = {}
