@@ -221,6 +221,42 @@ async def assess_merchant_audit_readiness(
         )
 
     ready = not blocking_gaps
+
+    # Provenance breakdown (merchant-wide, all platforms — NOT platform-scoped
+    # like `counts`, which mirrors the dominant-platform audit gate). Lets the
+    # portal tell a merchant whose "catalog" is really just historical URL-audit
+    # observations to connect a store for a deeper first-party audit, instead of
+    # calling those observed rows "synced".
+    #   - connected_store_products: rows from a connected commerce integration
+    #     (shopify/wix/woocommerce/…) — i.e. NOT the observed/authored platforms.
+    #   - observed_referral_products: url_audit + external_seed rows the merchant
+    #     never synced (catalog_track='external_referral').
+    #   - brand_authored_products: merchant-authored content rows (not a store sync).
+    provenance = {
+        "connected_store_products": await _table_count(
+            "catalog_products", merchant_id,
+            where_extra=(
+                "platform NOT IN ('url_audit', 'external_seed', 'brand_authored')"
+            ),
+        ),
+        "observed_referral_products": await _table_count(
+            "catalog_products", merchant_id,
+            where_extra="catalog_track = 'external_referral'",
+        ),
+        "brand_authored_products": await _table_count(
+            "catalog_products", merchant_id,
+            where_extra="platform = 'brand_authored'",
+        ),
+    }
+    # Recommend a store sync when the merchant's whole catalog is observed
+    # URL-audit/seed rows (from past audits) with no connected store behind it —
+    # the readiness audit runs on thin observed data, and a sync unlocks a
+    # first-party audit. Advisory only: never flips `ready`.
+    recommend_store_sync = (
+        provenance["connected_store_products"] == 0
+        and provenance["observed_referral_products"] > 0
+    )
+
     # Active quality-backfill timing (status/progress/eta) so the portal's
     # "Preparing your catalog" state shows a grounded countdown instead of a
     # flat "a few minutes". None when no job is in flight; never blocks.
@@ -233,6 +269,8 @@ async def assess_merchant_audit_readiness(
         "platform": platform,
         "ready": ready,
         "counts": counts,
+        "provenance": provenance,
+        "recommend_store_sync": recommend_store_sync,
         "blocking_gaps": blocking_gaps,
         "enhancement_gaps": enhancement_gaps,
         "backfill": backfill,
