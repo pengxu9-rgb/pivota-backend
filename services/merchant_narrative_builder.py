@@ -196,7 +196,13 @@ def _who_ai_cites_instead(
     # win plan says to win) could be truncated out while unclassified 1-cite
     # blogs survived — making this panel contradict the win-plan panel. Count
     # still dominates; ties break by endorsement weight: recommends-class,
-    # then category-query citation, then any known citation role, then host.
+    # then category-query citation, then any known citation role, then a
+    # grounded rival on the host, then host. The competitors_named term sits
+    # LAST before the alphabetical fallback so it only splits otherwise-true
+    # ties: among equal-frequency, equal-classification peers, the host that
+    # grounded a named rival is the more actionable "you're losing this
+    # endorsement" move, so it should survive the [:8] cap ahead of a peer
+    # that named none. It never overrides frequency or the higher-signal terms.
     def _cited_host_rank(h: Dict[str, Any]) -> Tuple:
         recommends = str(h.get("recommendation_class") or "").strip().lower() == "recommends"
         classified = str(h.get("citation_role") or "").strip().lower() not in {"", "unclassified"}
@@ -205,6 +211,7 @@ def _who_ai_cites_instead(
             0 if recommends else 1,
             0 if h.get("cited_on_category_query") else 1,
             0 if classified else 1,
+            0 if h.get("competitors_named") else 1,
             h["host"],
         )
     cited_hosts.sort(key=_cited_host_rank)
