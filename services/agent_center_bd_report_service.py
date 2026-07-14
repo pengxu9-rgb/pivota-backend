@@ -15424,6 +15424,11 @@ def _build_failed_queries_detailed(
     out: List[Dict[str, Any]] = []
     brand_lower = (merchant_brand or "").strip().lower()
     host_lower = (merchant_host or "").strip().lower()
+    # Alias-aware own-brand filter for competitors_appearing below — a de-spaced
+    # echo ("bblab") or a vendor alias isn't a substring of the brand, so the
+    # bare substring test used to leak the merchant into this merchant-facing
+    # competitors_named field.
+    brand_aliases = derive_brand_aliases(merchant_brand, merchant_host)
 
     for run in attribution_runs or []:
         parsed = run.get("parsed") or {}
@@ -15459,19 +15464,11 @@ def _build_failed_queries_detailed(
         if top_host and host_lower and host_lower in top_host.lower():
             continue
 
-        competitors: List[str] = []
-        for raw in parsed.get("competitors_appearing") or []:
-            if not isinstance(raw, str):
-                continue
-            name = raw.strip()
-            if not name:
-                continue
-            name_lower = name.lower()
-            if brand_lower and (brand_lower in name_lower or name_lower in brand_lower):
-                continue
-            competitors.append(name)
-            if len(competitors) >= 5:
-                break
+        competitors: List[str] = _strip_own_brand_competitors(
+            parsed.get("competitors_appearing") or [],
+            brand_lower,
+            brand_aliases,
+        )[:5]
 
         host_classification: Dict[str, Any]
         if top_host:
