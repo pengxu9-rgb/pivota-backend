@@ -70,14 +70,16 @@ def _normalize(text: Optional[str]) -> str:
     cited on' outreach (prod run 83e8fcb4, competitor 'Kérastase' vs
     kerastase-usa.com)."""
     t = (text or "").lower()
-    # ®/™ first: NFKD decomposes '™' to the LETTERS 'tm', which would glue a
-    # bogus 'tm' onto the preceding token ('Brand™' → 'brandtm') if the fold
-    # ran before the mark strip.
+    # Fold BEFORE the mark strip, so a fullwidth/compatibility spelling of the
+    # marks normalizes into the ASCII forms the strip below already knows:
+    # 'Brand（ｔｍ）' → '(tm)' → stripped. (Stripping first would leave a bogus
+    # 'tm' token behind.) The literal '™' needs no such care either way — NFKD
+    # maps it to UPPERCASE 'TM', which the lowercase-only class below scrubs.
+    t = unicodedata.normalize("NFKD", t)
+    t = "".join(ch for ch in t if not unicodedata.combining(ch))
     for mark in ("®", "™"):
         t = t.replace(mark, " ")
     t = re.sub(r"\(\s*(?:r|tm)\s*\)", " ", t)
-    t = unicodedata.normalize("NFKD", t)
-    t = "".join(ch for ch in t if not unicodedata.combining(ch))
     t = re.sub(r"[^a-z0-9]+", " ", t)
     return re.sub(r"\s+", " ", t).strip()
 

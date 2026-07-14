@@ -76,12 +76,14 @@ def test_diacritics_fold_to_ascii_base_letters():
     assert derive_brand_aliases("Shiseidō") == ("shiseido",)
 
 
-def test_trademark_symbol_never_folds_into_letters():
-    """NFKD decomposes '™' to the LETTERS 'tm' — the mark strip must run before
-    the fold so 'Brand™' aliases to 'brand', never 'brandtm'."""
-    a = derive_brand_aliases("Brand™")
-    assert "brand" in a
-    assert all("brandtm" not in alias for alias in a)
+def test_trademark_marks_leave_no_letter_residue():
+    """A trademark mark must never leave letter residue in the alias, in any
+    spelling. The literal '™' is safe under either ordering (NFKD maps it to
+    UPPERCASE 'TM', which the lowercase-only char class scrubs) — the case that
+    actually discriminates is the fullwidth/compatibility spelling, which only
+    normalizes into the strippable ASCII '(tm)' when the fold runs FIRST."""
+    for raw in ("Brand™", "Brand®", "Brand℠", "Brand（ｔｍ）", "Brand (TM)"):
+        assert derive_brand_aliases(raw) == ("brand",), raw
 
 
 def test_folded_alias_matches_ascii_text():
