@@ -228,13 +228,17 @@ def test_resolve_shopify_app_routes_by_install_source(monkeypatch: pytest.Monkey
         "read_products,read_orders,read_fulfillments,read_discounts,write_webhooks,write_orders",
     )
 
-    a = module.resolve_shopify_app("app_store")
-    assert a.label == "appstore"
-    assert a.client_id == "A_id"
-    assert a.client_secret == "A_secret"
-    assert "write_orders" not in a.scopes
+    # Every OAuth install source resolves to App A (public, read-only). The
+    # write-scoped headless app must never be reachable over OAuth.
+    for src in ("app_store", "merchant_portal"):
+        a = module.resolve_shopify_app(src)
+        assert a.label == "appstore"
+        assert a.client_id == "A_id"
+        assert a.client_secret == "A_secret"
+        assert "write_orders" not in a.scopes
 
-    for src in ("merchant_portal", "public_install_link", "", None, "whatever"):
+    # Non-OAuth / unknown sources fall through to the custom-token headless app.
+    for src in ("", None, "whatever"):
         b = module.resolve_shopify_app(src)
         assert b.label == "headless"
         assert b.client_id == "B_id"
