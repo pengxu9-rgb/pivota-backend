@@ -99,7 +99,7 @@ BEAUTY_RETAILER_TOKENS = frozenset({
     "coupang", "gmarket", "qoo10", "shopee", "lazada", "aliexpress", "temu",
     "amazon", "walmart", "sephora", "ulta", "nordstrom", "costco",
     "oliveyoung", "musinsa", "kurly", "wconcept", "iherb", "yesstyle",
-    "stylevana",
+    "stylevana", "bluemercury",
 })
 
 

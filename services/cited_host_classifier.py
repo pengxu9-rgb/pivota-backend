@@ -129,11 +129,18 @@ def _alias_index(registry: Dict[str, Dict[str, Any]]) -> Dict[str, str]:
 # Aliases that are also common English words (or word phrases) — resolve them
 # ONLY on an exact match, never as a substring, so a coincidental title like
 # "best collagen for your target audience" can't be mis-attributed to target.com,
-# or "the independent best serums" to the-independent.com. An exact title of
-# "Target" / "The Independent" still resolves via the exact-match path above;
-# this guard only suppresses the looser substring match. Real citations titled
-# "Amazon.com: ..." still resolve via domain-token extraction upstream.
-_COMMON_WORD_ALIASES = {"target", "amazon", "the independent"}
+# "the independent best serums" to the-independent.com, or "living between town
+# and country" to townandcountrymag.com. An exact title of "Target" / "The
+# Independent" / "Town and Country" still resolves via the exact-match path
+# above; this guard only suppresses the looser substring match. Real citations
+# titled "Amazon.com: ..." still resolve via domain-token extraction upstream,
+# and the distinctive "&"/"+" magazine-title forms ("Town & Country",
+# "Travel + Leisure") normalize to "town country" / "travel leisure", which
+# stay substring-eligible.
+_COMMON_WORD_ALIASES = {
+    "target", "amazon", "the independent", "town and country",
+    "travel and leisure",
+}
 
 
 def _resolve_alias(value: str, registry: Dict[str, Dict[str, Any]]) -> Optional[str]:

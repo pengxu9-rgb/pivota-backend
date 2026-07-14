@@ -358,6 +358,14 @@
       "coverage_note": "Mass + premium beauty retailer; strong AI-channel grounding for beauty.",
       "outreach_hint": "Ulta Sparked program (D2C/indie) or wholesale."
     },
+    "bluemercury.com": {
+      "type": "retailer",
+      "subtype": "beauty_retailer",
+      "categories": ["beauty", "skincare"],
+      "aliases": ["Bluemercury", "Blue Mercury"],
+      "coverage_note": "Bluemercury is a US prestige-beauty and spa specialty retailer (Macy's-owned, ~180 stores); AI cites its listings for luxury/prestige skincare and beauty buying queries.",
+      "outreach_hint": "Wholesale onboarding — Bluemercury merchant/vendor relations; positioned for prestige and indie-luxe brands."
+    },
     "iherb.com": {
       "type": "retailer",
       "subtype": "wellness_retailer",
@@ -525,6 +533,14 @@
         "note": "Reviews are user-generated — brands can't pitch them. The brand door is Hwahae Business: ad/seeding programs and Hwahae Shopping entry (part_ads_sales@hwahae.com is the ads-sales inbox, not an editorial pitch address). Verified 2026-07-11."
       }
     },
+    "glowpick.com": {
+      "type": "editorial",
+      "subtype": "review_aggregator",
+      "categories": ["beauty", "skincare", "kbeauty"],
+      "aliases": ["Glowpick"],
+      "coverage_note": "Glowpick (글로우픽) is a leading Korean cosmetics review-and-ranking platform (peer of Hwahae) whose consumer-review-driven rankings and Glowpick Awards AI grounds for K-beauty 'best X' and product-rating queries.",
+      "outreach_hint": "Editorial / database channel — earn authentic consumer reviews and keep product listings accurate; rankings and awards are review-driven, not a paid-placement surface."
+    },
     "stylecraze.com": {
       "type": "editorial",
       "subtype": "review_site",
@@ -540,6 +556,72 @@
       "aliases": ["Marie Claire"],
       "coverage_note": "Major fashion/beauty magazine whose tested product roundups AI cites for 'best {category}' beauty and hair queries.",
       "outreach_hint": "Editorial pitch — beauty desk / product testing; PR sampling for roundup inclusion."
+    },
+    "consumerreports.org": {
+      "type": "editorial",
+      "subtype": "review_site",
+      "categories": ["home", "electronics", "health", "wellness", "beauty", "fitness", "food_bev"],
+      "aliases": ["Consumer Reports"],
+      "tier": 1,
+      "ai_grounding_weight": "high",
+      "coverage_note": "Consumer Reports is the independent US nonprofit product-testing organization (sunscreens, appliances, electronics, health products); AI treats its lab-tested ratings as high-authority grounding for 'best X' and safety queries.",
+      "outreach_hint": "CR buys every tested product anonymously at retail and accepts no samples or pitches — the lever is broad retail availability and accurate public specs so your product gets picked up in their category tests."
+    },
+    "cntraveler.com": {
+      "type": "editorial",
+      "subtype": "magazine",
+      "categories": ["travel", "lifestyle", "beauty", "fashion"],
+      "aliases": ["Condé Nast Traveler", "Conde Nast Traveler", "CN Traveler"],
+      "coverage_note": "Condé Nast Traveler is a major travel/lifestyle magazine; AI cites its gear, travel-beauty, and destination roundups for travel-adjacent product queries.",
+      "outreach_hint": "Editorial pitch via PR / agency relationships — major-publisher desk, realistic mainly for established brands."
+    },
+    "gq.com": {
+      "type": "editorial",
+      "subtype": "magazine",
+      "categories": ["fashion", "beauty", "lifestyle"],
+      "aliases": ["GQ Magazine"],
+      "coverage_note": "Condé Nast men's magazine; its Grooming Awards and best-of roundups are AI-grounded for men's grooming, skincare, and style queries.",
+      "outreach_hint": "Editorial pitch via PR / agency relationships — major-publisher desk, realistic mainly for established brands."
+    },
+    "teenvogue.com": {
+      "type": "editorial",
+      "subtype": "magazine",
+      "categories": ["beauty", "fashion", "skincare"],
+      "aliases": ["Teen Vogue"],
+      "coverage_note": "Condé Nast youth title; beauty and skincare roundups AI cites for budget/gen-z beauty queries.",
+      "outreach_hint": "Editorial pitch via PR / agency relationships — major-publisher desk, realistic mainly for established brands."
+    },
+    "instyle.com": {
+      "type": "editorial",
+      "subtype": "magazine",
+      "categories": ["beauty", "fashion", "skincare"],
+      "aliases": ["InStyle"],
+      "coverage_note": "Major beauty/fashion magazine (Dotdash Meredith) whose tested roundups AI cites for 'best {category}' beauty queries.",
+      "outreach_hint": "Editorial pitch via PR / agency relationships — major-publisher desk, realistic mainly for established brands."
+    },
+    "oprahdaily.com": {
+      "type": "editorial",
+      "subtype": "magazine",
+      "categories": ["beauty", "fashion", "home", "wellness"],
+      "aliases": ["Oprah Daily", "O, The Oprah Magazine"],
+      "coverage_note": "Hearst lifestyle title (formerly O, The Oprah Magazine); its beauty and O-List product roundups carry strong AI-grounding weight.",
+      "outreach_hint": "Editorial pitch via PR / agency relationships — major-publisher desk, realistic mainly for established brands."
+    },
+    "townandcountrymag.com": {
+      "type": "editorial",
+      "subtype": "magazine",
+      "categories": ["beauty", "fashion", "lifestyle"],
+      "aliases": ["Town & Country", "Town and Country"],
+      "coverage_note": "Hearst luxury-lifestyle magazine; AI cites its prestige beauty and gift roundups for luxury product queries.",
+      "outreach_hint": "Editorial pitch via PR / agency relationships — major-publisher desk, realistic mainly for established brands."
+    },
+    "travelandleisure.com": {
+      "type": "editorial",
+      "subtype": "magazine",
+      "categories": ["travel", "lifestyle", "beauty"],
+      "aliases": ["Travel + Leisure", "Travel and Leisure"],
+      "coverage_note": "Major travel magazine (Dotdash Meredith, peer of Condé Nast Traveler); AI cites its travel-gear and travel-beauty roundups.",
+      "outreach_hint": "Editorial pitch via PR / agency relationships — major-publisher desk, realistic mainly for established brands."
     },
     "curlynikki.com": {
       "type": "editorial",
