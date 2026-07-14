@@ -6064,7 +6064,13 @@ def _grounding_evidence(probe_runs: Any, cap: int = 12) -> List[Dict[str, Any]]:
     return evidence
 
 
-def _failing_prompts(probe_runs: Any, cap: int = 20) -> List[Dict[str, Any]]:
+def _failing_prompts(
+    probe_runs: Any,
+    cap: int = 20,
+    *,
+    brand_lower: str = "",
+    brand_aliases: Tuple[str, ...] = (),
+) -> List[Dict[str, Any]]:
     out: List[Dict[str, Any]] = []
     for run in _flatten_probe_runs(probe_runs):
         parsed = run.get("parsed") if isinstance(run.get("parsed"), dict) else {}
@@ -6100,7 +6106,20 @@ def _failing_prompts(probe_runs: Any, cap: int = 20) -> List[Dict[str, Any]]:
                 else None
             ),
             "grounding_sources": run.get("grounding_sources") or [],
-            "competitors_named": parsed.get("competitors_listed") or parsed.get("competitors_appearing") or run.get("competitors_listed") or [],
+            # Strip the merchant's own brand before its competitors reach the
+            # win-plan competitor benchmark (win_plan_builder._competitor_benchmark).
+            # Engines echo the merchant back inside competitors_listed on
+            # branded/where-to-buy queries; unfiltered, the brand would render as
+            # a "competitor to beat" for its own failing prompt. Same fan-out
+            # source + same own-brand skip as the authority-map path.
+            "competitors_named": _strip_own_brand_competitors(
+                parsed.get("competitors_listed")
+                or parsed.get("competitors_appearing")
+                or run.get("competitors_listed")
+                or [],
+                brand_lower,
+                brand_aliases,
+            ),
         })
         if len(out) >= cap:
             break
@@ -6916,7 +6935,23 @@ async def build_per_sku_report(
         primary_gaps = [
             g for g in primary_gaps if g.get("dimension") != "routability"
         ]
-    failing_prompts = _failing_prompts(probe_runs)
+    # Own-brand context so an engine that echoes the merchant back inside
+    # competitors_listed doesn't surface the brand as its own competitor in the
+    # win-plan benchmark (mirrors the authority-map own-brand skip).
+    _fp_brand = str(
+        (identity.get("anchors") or {}).get("brand")
+        or product.get("brand")
+        or product.get("vendor")
+        or ""
+    ).strip()
+    failing_prompts = _failing_prompts(
+        probe_runs,
+        brand_lower=_fp_brand.lower(),
+        brand_aliases=derive_brand_aliases(
+            _fp_brand,
+            normalize_host(product.get("canonical_url") or product.get("pdp_url")),
+        ),
+    )
     verify_summary_out = verify_summary or _verify_skipped_summary(
         reason="not_run",
         positives_count=len(_citation_positive_verify_candidates(sku_ctx, probe_runs)),
