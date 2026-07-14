@@ -253,11 +253,11 @@
       "coverage_note": "Affiliate-heavy lifestyle reviews; high volume of category roundups.",
       "outreach_hint": "Editorial pitch — affiliate-driven roundups."
     },
-    "the-independent.com": {
+    "independent.co.uk": {
       "type": "editorial",
       "subtype": "review_site",
       "categories": ["beauty", "skincare", "supplements", "wellness", "fashion"],
-      "aliases": ["The Independent", "IndyBest"],
+      "aliases": ["The Independent", "IndyBest", "the-independent.com"],
       "coverage_note": "The Independent's IndyBest vertical runs tested 'best {category}' roundups (skincare, supplements, beauty) that AI grounds in for UK/EU category queries; frequently cited for K-beauty and collagen comparisons.",
       "outreach_hint": "Editorial pitch to the IndyBest desk — sample-based reviews, UK/EU market angle."
     },
