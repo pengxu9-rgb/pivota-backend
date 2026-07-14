@@ -65,10 +65,60 @@ _MIN_ALIAS_LEN = 3
 # an ASCII alias match anyway.
 _FOLDABLE_LATIN_RE = re.compile(r"[À-ɏ̀-ͯḀ-ỿ]")
 
+# Latin letters whose diacritic is welded INTO the letterform (a stroke, a bar,
+# a ligature) rather than layered on as a combining mark. Unicode gives them NO
+# decomposition at all, so the decompose-and-drop-marks fold above is a no-op on
+# them and the [^a-z0-9] collapse then deletes them outright — silently mangling
+# the brand: 'Æther Beauty' → 'ther beauty', 'Straße' → 'stra e', 'Søstrene' →
+# 's strene'. Those junk aliases can never match the ASCII spellings and hosts
+# they are compared against ('aetherbeauty.com'), which is the same under-count
+# [[the diacritic fold]] exists to fix — it just does not reach these letters.
+#
+# So we transliterate them explicitly. This is the standard ASCII romanization
+# (what ICU/unidecode produce), and the multi-char expansions are the point: the
+# German 'ß' is 'ss' and the ligature 'æ' is 'ae' in every ASCII spelling of a
+# brand that uses them.
+#
+# Applied AFTER the decompose, so a letter that carries BOTH a stroke and a
+# combining mark lands correctly too ('ǣ' = æ+macron → NFD → 'æ' → 'ae').
+#
+# Every entry maps a LETTER to LETTERS, never a symbol to alphanumerics — so
+# unlike NFKD (see `compat` below) this cannot manufacture a brand mention out
+# of unrelated punctuation, and it is safe on both the alias and the text side.
+# Keys are lowercase only: both callers lowercase before folding, and any
+# uppercase residue is scrubbed by the lowercase-only classes downstream exactly
+# as it is today.
+#
+# It does collapse a real distinction, and that is inherent to romanizing at all
+# (ICU and unidecode do the same): a brand 'Sol' now matches the Norwegian word
+# 'søl', 'Ore' the Danish 'øre'. Accepted — the same collision already exists for
+# any ASCII brand named after a common word, the catalog is ~90% ASCII/Korean
+# brands, and the alternative is leaving every stroked brand unmatchable.
+_UNDECOMPOSABLE_LATIN = {
+    "ß": "ss", "æ": "ae", "œ": "oe", "ĳ": "ij",
+    "ø": "o", "ł": "l", "đ": "d", "ð": "d", "þ": "th",
+    "ħ": "h", "ŧ": "t", "ı": "i", "ŋ": "n", "ſ": "s",
+}
+_UNDECOMPOSABLE_TABLE = str.maketrans(_UNDECOMPOSABLE_LATIN)
+# Guard so non-Latin copy never pays for the translate. str.translate walks the
+# whole string, and Korean/CJK answer text (a hot path here) contains none of
+# these letters, so the pass would be pure cost for a guaranteed no-op.
+_UNDECOMPOSABLE_RE = re.compile("[" + "".join(_UNDECOMPOSABLE_LATIN) + "]")
 
-def _fold_diacritics(s: str, *, compat: bool = False) -> str:
-    """Fold accented letters to their ASCII base letter: decompose, then drop
-    the combining marks. 'kérastase' → 'kerastase'.
+
+def _romanize(s: str) -> str:
+    """Map the undecomposable Latin letters to ASCII. No-op unless one is
+    present, so ASCII and CJK strings are returned untouched."""
+    if s.isascii() or not _UNDECOMPOSABLE_RE.search(s):
+        return s
+    return s.translate(_UNDECOMPOSABLE_TABLE)
+
+
+def _fold_diacritics(s: str, *, compat: bool = False, translit: bool = True) -> str:
+    """Fold accented letters to their ASCII base letter: decompose, drop the
+    combining marks, then transliterate the letters Unicode refuses to
+    decompose. 'kérastase' → 'kerastase'; 'æther' → 'aether'; 'straße' →
+    'strasse'.
 
     `compat` selects the decomposition, and the two callers genuinely need
     different ones:
@@ -99,13 +149,46 @@ def _fold_diacritics(s: str, *, compat: bool = False) -> str:
     if not compat and not _FOLDABLE_LATIN_RE.search(s):
         return s
     decomposed = unicodedata.normalize("NFKD" if compat else "NFD", s)
-    return "".join(ch for ch in decomposed if not unicodedata.combining(ch))
+    folded = "".join(ch for ch in decomposed if not unicodedata.combining(ch))
+    return folded if not translit else _romanize(folded)
 
 
-def _normalize(text: Optional[str]) -> str:
+def _normalize_legacy(text: Optional[str]) -> str:
+    """`_normalize` without the undecomposable-letter transliteration — i.e. the
+    alias spelling this module produced before that map existed, where ß æ ø ł đ
+    were simply deleted by the [^a-z0-9] collapse ('Æther Beauty' → 'ther
+    beauty').
+
+    derive_brand_aliases keeps these mangled forms ALONGSIDE the romanized ones,
+    because they are junk that MATCHES: 'ther beauty' hits the raw text 'æther
+    beauty' — the pattern's boundary class is [a-z0-9], so the 'æ' the collapse
+    deleted reads as a word boundary. Dropping them in favour of the correct
+    'aether beauty' would REMOVE matches the engine makes today, which the module
+    invariant forbids. Costs nothing for the ASCII brands that are the norm: both
+    normalizations agree and the dedup in _add collapses them, so 'COSRX' still
+    yields exactly ('cosrx',).
+
+    Be honest about what this buys, though. For REALISTIC copy the romanized
+    alias already covers the real mention (text 'æther beauty' romanizes to
+    'aether beauty' and matches the correct alias), so what the legacy spelling
+    actually preserves is mostly the OLD FALSE POSITIVES: the matches it uniquely
+    makes are pathological glue ('zætherbeauty', 'æther beautyß'), and for a
+    brand whose mangled form is a generic fragment it is outright bad — 'Þór
+    Skin' → 'or skin' matches "great for hair or skin health". That FP is
+    PRE-EXISTING (today it is the brand's ONLY alias, so this change strictly
+    improves such a brand by adding the correct 'thor skin' next to it), and
+    correcting it means deliberately removing a match — a separate decision from
+    this fix, and one that should be made against the invariant explicitly rather
+    than smuggled in here.
+    """
+    return _normalize(text, translit=False)
+
+
+def _normalize(text: Optional[str], *, translit: bool = True) -> str:
     """Lowercase, fold diacritics to their ASCII base letter (NFKD, combining
-    marks dropped), strip ®/™/(r)/(tm), reduce to alnum tokens joined by single
-    spaces. 'Crème de la Mer®' → 'creme de la mer', 'Kérastase' → 'kerastase'.
+    marks dropped, undecomposable letters romanized), strip ®/™/(r)/(tm), reduce
+    to alnum tokens joined by single spaces. 'Crème de la Mer®' → 'creme de la
+    mer', 'Kérastase' → 'kerastase', 'Æther Beauty' → 'aether beauty'.
 
     The fold must happen BEFORE the non-alnum collapse: without it an accented
     letter becomes a token BREAK, splitting the brand into junk tokens
@@ -114,14 +197,20 @@ def _normalize(text: Optional[str]) -> str:
     and registrable host labels ('kerastase-usa'). That silent miss is what let
     a rival's own storefront through _flag_competitor_by_name and into 'Get
     cited on' outreach (prod run 83e8fcb4, competitor 'Kérastase' vs
-    kerastase-usa.com)."""
+    kerastase-usa.com).
+
+    The same is true one level down for the letters Unicode will not decompose
+    at all (ß æ ø ł đ): the collapse DELETES them, so 'Æther Beauty' became the
+    junk 'ther beauty' and 'Straße' the junk 'stra e'. `translit` romanizes them
+    instead; pass translit=False for the legacy spelling (see _normalize_legacy).
+    """
     t = (text or "").lower()
     # Fold BEFORE the mark strip, so a fullwidth/compatibility spelling of the
     # marks normalizes into the ASCII forms the strip below already knows:
     # 'Brand（ｔｍ）' → '(tm)' → stripped. (Stripping first would leave a bogus
     # 'tm' token behind.) The literal '™' needs no such care either way — NFKD
     # maps it to UPPERCASE 'TM', which the lowercase-only class below scrubs.
-    t = _fold_diacritics(t, compat=True)
+    t = _fold_diacritics(t, compat=True, translit=translit)
     for mark in ("®", "™"):
         t = t.replace(mark, " ")
     t = re.sub(r"\(\s*(?:r|tm)\s*\)", " ", t)
@@ -165,6 +254,11 @@ def derive_brand_aliases(
     >=2 tokens remain), de-spaced forms, the registrable host name, and any
     product vendors. Every alias is >=3 chars. `vendors` must be a tuple so
     the result is cacheable.
+
+    A brand written with an undecomposable letter (ß æ ø ł đ) contributes BOTH
+    the romanized spelling and the legacy mangled one — see _normalize_legacy for
+    why dropping the latter would violate the module invariant. For every other
+    brand the two normalizations agree and the dedup below collapses them.
     """
     aliases: List[str] = []
     seen = set()
@@ -175,8 +269,7 @@ def derive_brand_aliases(
             seen.add(candidate)
             aliases.append(candidate)
 
-    def _add_brand_forms(value: str) -> None:
-        norm = _normalize(value)
+    def _add_forms(norm: str) -> None:
         if not norm:
             return
         _add(norm)
@@ -194,6 +287,10 @@ def derive_brand_aliases(
                 _add(core_str)
                 _add(core_str.replace(" ", ""))
 
+    def _add_brand_forms(value: str) -> None:
+        _add_forms(_normalize(value))
+        _add_forms(_normalize_legacy(value))
+
     _add_brand_forms(brand or "")
     for vendor in vendors or ():
         _add_brand_forms(vendor)
@@ -201,6 +298,7 @@ def derive_brand_aliases(
     reg = _registrable_name_from_host(host)
     if reg:
         _add(_normalize(reg).replace(" ", ""))
+        _add(_normalize_legacy(reg).replace(" ", ""))
 
     return tuple(aliases)
 
@@ -227,18 +325,38 @@ def text_mentions_brand(text_lower: str, aliases: Tuple[str, ...]) -> bool:
     (PR #1391) fixed the rival-storefront direction and left this one silently
     under-counting own-brand visibility and attribution.
 
-    We search the folded text and, when the fold actually changed something, the
-    raw text too. The second pass costs nothing on the ASCII hot path (the fold
-    is identity there, so there is no second string) and it keeps the module's
-    only-ADDS-matches invariant airtight: an accented letter is NOT in the
-    patterns' [a-z0-9] boundary class but its folded base letter IS, so folding
-    can destroy a word boundary the raw text had — 'bb labé' matches the alias
-    'bb lab' before the fold and 'bb labe' does not match after it.
+    We search every spelling the fold can produce, because folding can DESTROY a
+    word boundary as well as create a match — a non-ASCII letter is not in the
+    patterns' [a-z0-9] boundary class but its ASCII fold is. Searching all of
+    them is what keeps the module's only-ADDS-matches invariant airtight:
+
+      - the full fold ('kérastase' → 'kerastase', 'æther' → 'aether') — the
+        match this function exists to make;
+      - the marks-only fold, which folds the accents but leaves the
+        undecomposable letters (ß æ ø ł đ) standing. Transliterating them can eat
+        a boundary the accent fold had kept: alias 'kerastase' matches
+        'kérastaseø' via this spelling ('ø' ends the word) but not via the full
+        fold, which reads 'kerastaseo' as one longer word;
+      - the raw text, for the same reason one level up — 'bb labé' matches the
+        alias 'bb lab' and the folded 'bb labe' does not.
+
+    Text with no foldable Latin letter in it — plain ASCII answer copy, and the
+    Korean/CJK titles that are the other hot path here — takes none of this: both
+    folds are provably the identity on it (every key of the romanize map lies
+    inside _FOLDABLE_LATIN_RE, so if that finds nothing the romanize cannot fire
+    either), and it searches the raw string alone, exactly as it did before the
+    fold existed. Only genuinely accented or stroked text builds a second or
+    third haystack.
     """
     if not text_lower or not aliases:
         return False
-    folded = _fold_diacritics(text_lower)
-    haystacks = (folded,) if folded == text_lower else (folded, text_lower)
+    if text_lower.isascii() or not _FOLDABLE_LATIN_RE.search(text_lower):
+        haystacks = (text_lower,)
+    else:
+        # One decomposition pass: the romanized spelling is a cheap table
+        # translate off the marks-only one, not a second NFD over the string.
+        marks_only = _fold_diacritics(text_lower, translit=False)
+        haystacks = tuple(dict.fromkeys((_romanize(marks_only), marks_only, text_lower)))
     for alias in aliases:
         if len(alias) < _MIN_ALIAS_LEN:
             continue
