@@ -62,6 +62,33 @@ def test_min_length_and_dedup():
     assert len(a2) == len(set(a2))
 
 
+def test_diacritics_fold_to_ascii_base_letters():
+    """'Kérastase' must alias to 'kerastase' — the form ASCII answer copy,
+    source titles, and registrable host labels ('kerastase-usa') actually use.
+    Pre-fix, the accented letter became a token BREAK ('k rastase' → de-spaced
+    'krastase'), so the alias could never match, and a rival's own storefront
+    slipped past the competitor flag into 'Get cited on' outreach (prod run
+    83e8fcb4, competitor 'Kérastase' vs kerastase-usa.com)."""
+    assert derive_brand_aliases("Kérastase") == ("kerastase",)
+    creme = derive_brand_aliases("Crème de la Mer")
+    assert "creme de la mer" in creme
+    assert "cremedelamer" in creme
+    assert derive_brand_aliases("Shiseidō") == ("shiseido",)
+
+
+def test_trademark_symbol_never_folds_into_letters():
+    """NFKD decomposes '™' to the LETTERS 'tm' — the mark strip must run before
+    the fold so 'Brand™' aliases to 'brand', never 'brandtm'."""
+    a = derive_brand_aliases("Brand™")
+    assert "brand" in a
+    assert all("brandtm" not in alias for alias in a)
+
+
+def test_folded_alias_matches_ascii_text():
+    aliases = derive_brand_aliases("Kérastase")
+    assert text_mentions_brand("best kerastase dupes for bond repair", aliases)
+
+
 # --------------------------------------------------------------------------
 # text_mentions_brand
 # --------------------------------------------------------------------------

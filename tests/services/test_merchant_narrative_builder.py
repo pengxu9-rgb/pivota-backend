@@ -181,6 +181,47 @@ def test_competitor_storefront_not_recommended_as_outreach():
     assert "ouidad.com" not in move_hosts
 
 
+def test_accented_competitor_storefront_not_recommended_as_outreach():
+    """Diacritics: a competitor named with accents ('Kérastase') must flag the
+    rival's own ASCII storefront (kerastase-usa.com, unknown to the registry →
+    unclassified) exactly like an ASCII name would. Pre-fix,
+    brand_alias._normalize turned the accented letter into a token break
+    ('Kérastase' → alias 'krastase'), the alias never matched the registrable
+    label 'kerastase-usa', and the rival's store served as a 'Get cited on'
+    outreach move (prod run 83e8fcb4-5cd8-45a1-9067-f46b86a56336, merchant
+    merch_924da2be8503e5f7 / Anuko)."""
+    am = _authority_map(
+        [
+            _run("buy Anuko bond oil", "anuko.com"),
+            _run("best bond repair hair oil", "kerastase-usa.com", "category",
+                 comps=["Kérastase", "Olaplex"]),
+            # An unclassified host that does NOT belong to the accented rival —
+            # must survive (registrable-label match, not substring-anywhere).
+            _run("best bond repair hair oil", "myhairnotes.com", "category",
+                 comps=["Kérastase", "Olaplex"]),
+        ],
+        host="anuko.com",
+        brand="Anuko",
+    )
+    hosts = {h["host"]: h for h in am["hosts"]}
+    assert hosts["kerastase-usa.com"]["is_competitor"] is True
+    assert hosts["kerastase-usa.com"]["citation_role"] == "competitor"
+    assert hosts["myhairnotes.com"]["is_competitor"] is False
+
+    narr = build_merchant_narrative(
+        merchant_name="Anuko", per_sku_reports=[], authority_map=am,
+        providers=["gemini"], verify_providers=["deepseek"],
+    )
+    who = narr["where_youre_losing"]["who_ai_cites_instead"]
+    cited = {h["host"] for h in who["cited_hosts"]}
+    assert "kerastase-usa.com" not in cited
+    assert "myhairnotes.com" in cited
+    # The rival stays in competitive intel under its display name.
+    assert "Kérastase" in {c["name"] for c in who["competitors"]}
+    move_hosts = {m.get("host") for m in narr["where_youre_losing"].get("outreach_moves") or []}
+    assert "kerastase-usa.com" not in move_hosts
+
+
 def test_ingredient_type_named_competitor_does_not_flag_host():
     """No over-suppression: on category queries the engine lists ingredient /
     category TYPES (e.g. 'Argan Oil') as 'competitors'. Those must not turn an

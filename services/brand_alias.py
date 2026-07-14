@@ -28,6 +28,7 @@ Safety choices (to avoid false positives that would over-credit a brand):
 from __future__ import annotations
 
 import re
+import unicodedata
 from functools import lru_cache
 from typing import List, Optional, Pattern, Tuple
 from urllib.parse import urlparse
@@ -56,13 +57,27 @@ _MIN_ALIAS_LEN = 3
 
 
 def _normalize(text: Optional[str]) -> str:
-    """Lowercase, strip ®/™/(r)/(tm), reduce to alnum tokens joined by single
-    spaces. 'Crème de la Mer®' → 'creme de la mer' (accents drop via the
-    non-alnum collapse)."""
+    """Lowercase, fold diacritics to their ASCII base letter (NFKD, combining
+    marks dropped), strip ®/™/(r)/(tm), reduce to alnum tokens joined by single
+    spaces. 'Crème de la Mer®' → 'creme de la mer', 'Kérastase' → 'kerastase'.
+
+    The fold must happen BEFORE the non-alnum collapse: without it an accented
+    letter becomes a token BREAK, splitting the brand into junk tokens
+    ('Kérastase' → 'k rastase' / de-spaced 'krastase') that can never match the
+    ASCII text these aliases are compared against — answer copy, source titles,
+    and registrable host labels ('kerastase-usa'). That silent miss is what let
+    a rival's own storefront through _flag_competitor_by_name and into 'Get
+    cited on' outreach (prod run 83e8fcb4, competitor 'Kérastase' vs
+    kerastase-usa.com)."""
     t = (text or "").lower()
+    # ®/™ first: NFKD decomposes '™' to the LETTERS 'tm', which would glue a
+    # bogus 'tm' onto the preceding token ('Brand™' → 'brandtm') if the fold
+    # ran before the mark strip.
     for mark in ("®", "™"):
         t = t.replace(mark, " ")
     t = re.sub(r"\(\s*(?:r|tm)\s*\)", " ", t)
+    t = unicodedata.normalize("NFKD", t)
+    t = "".join(ch for ch in t if not unicodedata.combining(ch))
     t = re.sub(r"[^a-z0-9]+", " ", t)
     return re.sub(r"\s+", " ", t).strip()
 
