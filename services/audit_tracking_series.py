@@ -111,6 +111,69 @@ def _per_product_entries(report: Mapping[str, Any]) -> List[Dict[str, Any]]:
     return out
 
 
+def _per_sku_mode_entries(report: Mapping[str, Any]) -> List[Dict[str, Any]]:
+    """The per_sku-audit-mode counterpart of _per_product_entries: modern runs
+    (the durable worker / URL wedge, audit_mode='per_sku') persist
+    report_jsonb.per_sku_reports — a DIFFERENT shape with 4-dimension scores —
+    and no per_product at all, so without this fallback their coverage reads
+    unknown and the per-SKU lens is empty for exactly the freshest runs.
+
+    Score mapping mirrors _per_sku_run_aggregate (agent_center_bd_report_service)
+    EXACTLY, so a SKU's series composes with the run-level columns those runs
+    persist: visibility = _overall_score (the SKU's weakest dimension — the
+    headline AI-readiness number), attribution = the citation-dimension score,
+    category_visibility = None (no such dimension in per_sku).
+
+    Keyed by the run's own sku_key (urlwedge:* / catalog sku key) rather than a
+    PDP-URL hash — mode purity by construction: a per_sku series can never merge
+    with a legacy per_product series for the same product, which matters because
+    the two modes write different score semantics (see _per_sku_prior_runs)."""
+    holder: Mapping[str, Any] = report
+    brand = report.get("brand_report")
+    if isinstance(brand, Mapping):  # tolerate the wrapped shape, like audit_delta
+        holder = brand
+    per_sku = holder.get("per_sku_reports")
+    if not isinstance(per_sku, list):
+        return []
+    from services.agent_center_bd_report_service import _overall_score
+
+    out: List[Dict[str, Any]] = []
+    for entry in per_sku:
+        if not isinstance(entry, dict):
+            continue
+        key = entry.get("sku_key") or entry.get("content_key")
+        if not isinstance(key, str) or not key.strip():
+            continue
+        citation = (entry.get("scores") or {}).get("citation")
+        citation_score = citation.get("score") if isinstance(citation, dict) else None
+        # Harden both scores against a poisoned stored value: the write path
+        # swallows report errors, so one junk score in one historical row must
+        # not 500 the whole tracking endpoint (same rule as the title tiebreak
+        # below). int-cast attribution to mirror _per_sku_run_aggregate exactly.
+        try:
+            visibility = _overall_score(entry)
+        except (TypeError, ValueError):
+            visibility = None
+        if isinstance(citation_score, bool):
+            citation_score = None
+        else:
+            try:
+                citation_score = int(citation_score) if citation_score is not None else None
+            except (TypeError, ValueError):
+                citation_score = None
+        out.append({
+            "sku_key": key.strip(),
+            "title": entry.get("sku_title"),
+            "pdp_url": None,  # per_sku entries don't carry the PDP URL top-level
+            "scores": {
+                "visibility": visibility,
+                "attribution": citation_score,
+                "category_visibility": None,
+            },
+        })
+    return out
+
+
 def _panel_id(sku_keys: List[str]) -> Optional[str]:
     """Identity of the measured SKU set — order-independent, so two runs over
     the same products always agree regardless of audit order."""
@@ -202,7 +265,10 @@ def build_tracking_series(rows: List[Dict[str, Any]]) -> Dict[str, Any]:
     sku_series: Dict[str, Dict[str, Any]] = {}
     for r in rows or []:
         report = r.get("report_jsonb") or {}
-        entries = _per_product_entries(report)
+        # A run is one mode or the other: legacy runs persist per_product,
+        # per_sku-mode runs persist per_sku_reports. Legacy first (its shape is
+        # the one _extract_products_from_prior_report pins panels on).
+        entries = _per_product_entries(report) or _per_sku_mode_entries(report)
         basis_id = _basis_id(report)
         point = {
             "run_id": r.get("run_id"),

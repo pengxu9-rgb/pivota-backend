@@ -263,6 +263,113 @@ def test_per_sku_cap_keeps_most_covered_and_flags_truncation():
     assert any(len(s["points"]) == 2 for s in series["per_sku"].values())
 
 
+# ---------------------------------------------------------------------------
+# per_sku audit mode (the modern wedge / durable-worker shape)
+# ---------------------------------------------------------------------------
+
+
+def _sku_report(sku_key, title, dims, basis_id="sel_abc"):
+    """A per_sku_reports entry in the modern (audit_mode='per_sku') shape."""
+    return {
+        "sku_key": sku_key,
+        "sku_title": title,
+        "scores": {d: {"score": s} for d, s in dims.items()},
+        "prompt_basis": {"selected_set_id": basis_id} if basis_id else {},
+    }
+
+
+def _per_sku_row(day, vis, att, sku_reports, basis_id="sel_abc"):
+    """A per_sku-mode run: report_jsonb carries per_sku_reports, NO per_product."""
+    return {
+        "run_id": f"run-{day}",
+        "requested_at": _T0 + timedelta(days=day),
+        "visibility": vis,
+        "attribution": att,
+        "category_visibility": None,
+        "report_jsonb": {
+            "audit_mode": "per_sku",
+            "per_sku_reports": [
+                ({**s, "prompt_basis": {"selected_set_id": basis_id} if basis_id else {}}
+                 if isinstance(s, dict) else s)   # junk entries pass through as-is
+                for s in sku_reports
+            ],
+            "brand_rollup": {"citation_by_provider": {"gemini": {"median": vis}}},
+        },
+    }
+
+
+def test_per_sku_mode_runs_get_coverage_and_series():
+    # per_sku_reports, no per_product. Scores must mirror _per_sku_run_aggregate:
+    # visibility = weakest dimension, attribution = citation, category = None.
+    series = build_tracking_series([
+        _per_sku_row(0, 40, 40, [_sku_report(
+            "urlwedge:aaa", "Hair Butter",
+            {"citation": 40, "identity": 80, "content_richness": 65, "routability": 90},
+        )]),
+        _per_sku_row(30, 46, 46, [_sku_report(
+            "urlwedge:aaa", "Hair Butter",
+            {"citation": 46, "identity": 82, "content_richness": 70, "routability": 90},
+        )]),
+    ])
+    p = series["points"][0]
+    assert p["sku_count"] == 1
+    assert p["attempted_sku_count"] is None      # per_sku runs record no failed[]
+    assert p["panel_id"] is not None
+    assert list(series["per_sku"].keys()) == ["urlwedge:aaa"]
+    sku = series["per_sku"]["urlwedge:aaa"]
+    assert sku["title"] == "Hair Butter"
+    assert sku["points"][0]["scores"] == {
+        "visibility": 40,                        # min(40, 80, 65, 90) — weakest dim
+        "attribution": 40,                       # the citation dimension
+        "category_visibility": None,             # no such dimension in per_sku
+    }
+    assert [pt["comparable_with_prev"] for pt in sku["points"]] == [False, True]
+    assert series["panel_changes"] == []
+
+
+def test_per_sku_mode_never_merges_with_legacy_series():
+    # Mode purity: the same product measured by a legacy run (per_product,
+    # PDP-URL-keyed) and a per_sku run (sku_key-keyed) must stay TWO series —
+    # the two modes write different score semantics into the same fields.
+    series = build_tracking_series([
+        _row(0, 60, 45, 55, per_product=[_product(_URL_A, 70)]),
+        _per_sku_row(30, 46, 46, [_sku_report(
+            "urlwedge:aaa", "Serum", {"citation": 46, "identity": 82},
+        )]),
+    ])
+    assert len(series["per_sku"]) == 2
+
+
+def test_per_sku_mode_tolerates_junk_entries():
+    series = build_tracking_series([
+        _per_sku_row(0, 40, 40, [
+            _sku_report("urlwedge:aaa", "Hair Butter", {"citation": 40}),
+            "junk",                                   # not a dict
+            {"sku_title": "no key"},                  # no sku_key/content_key
+            {"sku_key": "  "},                        # blank key
+        ]),
+    ])
+    assert series["points"][0]["sku_count"] == 1
+    assert list(series["per_sku"].keys()) == ["urlwedge:aaa"]
+
+
+def test_per_sku_mode_junk_scores_never_500():
+    # The write path swallows report errors, so a poisoned stored score must
+    # degrade to None on read — one bad historical row can't brick the endpoint.
+    series = build_tracking_series([
+        _per_sku_row(0, 40, 40, [
+            _sku_report("urlwedge:aaa", "Hair Butter", {"citation": "n/a"}),
+        ]),
+        _per_sku_row(30, 46, 46, [
+            _sku_report("urlwedge:bbb", "Oil", {"citation": True}),  # bool ≠ score
+        ]),
+    ])
+    a = series["per_sku"]["urlwedge:aaa"]["points"][0]["scores"]
+    b = series["per_sku"]["urlwedge:bbb"]["points"][0]["scores"]
+    assert a == {"visibility": None, "attribution": None, "category_visibility": None}
+    assert b["attribution"] is None
+
+
 def test_brand_points_unchanged_by_sku_axis():
     # The additive fields must not disturb the existing contract.
     series = build_tracking_series([
