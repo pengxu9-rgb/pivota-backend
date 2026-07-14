@@ -47,6 +47,7 @@ _SHOPIFY_OAUTH_REQUIRED_WEBHOOK_TOPICS = [
 _STOREFRONT_AUTO_CREATE_DENIED_UNTIL: Dict[str, float] = {}
 _STOREFRONT_AUTO_CREATE_DENIED_TTL_SECONDS = 24 * 3600
 _MARKETPLACE_INSTALL_SUCCESS_PATH = "/app/install/success"
+_MARKETPLACE_INSTALL_ERROR_PATH = "/app/install/error"
 
 
 class ConnectShopifyRequest(BaseModel):
@@ -238,6 +239,36 @@ def _marketplace_install_success_url(platform: str) -> str:
     if env_url:
         return env_url
     return f"{settings.merchant_portal_base_url.rstrip('/')}{_MARKETPLACE_INSTALL_SUCCESS_PATH}"
+
+
+_INSTALL_ERROR_REASON_RE = re.compile(r"reason=([a-z0-9_]+)")
+
+
+def _install_error_reason(detail: Any) -> str:
+    """Map an internal OAuth failure into a short, non-leaky reason slug."""
+    text = str(detail or "").strip()
+    m = _INSTALL_ERROR_REASON_RE.search(text)
+    if m:
+        return m.group(1)
+    lowered = text.lower()
+    if "signature" in lowered:
+        return "invalid_signature"
+    if "not configured" in lowered:
+        return "not_configured"
+    if "access token" in lowered or "access_token" in lowered:
+        return "token_exchange_failed"
+    if "verification failed" in lowered or "shop response" in lowered:
+        return "shop_verification_failed"
+    if "shop" in lowered and "required" in lowered:
+        return "missing_shop"
+    if "missing required oauth params" in lowered:
+        return "missing_params"
+    return "install_failed"
+
+
+def _marketplace_install_error_url(reason: str) -> str:
+    base = settings.merchant_portal_base_url.rstrip("/")
+    return f"{base}{_MARKETPLACE_INSTALL_ERROR_PATH}?{urlencode({'reason': reason})}"
 
 
 async def _ensure_shopify_oauth_tables() -> None:
@@ -639,7 +670,37 @@ async def shopify_app_store_install(
 @router.get("/shopify/oauth/callback")
 async def shopify_oauth_callback(request: Request):
     """
+    Shopify OAuth callback. This endpoint is loaded by a BROWSER (Shopify's OAuth
+    redirect), so it must NEVER render a JSON body — Shopify review flags a raw /
+    pretty-printed JSON page as a display error (2.1.1), and every failure path
+    below used to raise HTTPException. Any failure is therefore converted into a
+    302 to a clean portal error page; the real reason is kept in the logs and
+    reduced to a short slug in the query string.
+    """
+    try:
+        return await _shopify_oauth_callback_impl(request)
+    except HTTPException as exc:
+        reason = _install_error_reason(exc.detail)
+        logger.warning(
+            "shopify_oauth_callback failed status=%s reason=%s detail=%s shop=%s",
+            exc.status_code, reason, exc.detail, request.query_params.get("shop"),
+        )
+        return RedirectResponse(url=_marketplace_install_error_url(reason), status_code=302)
+    except Exception:
+        logger.exception(
+            "shopify_oauth_callback crashed shop=%s", request.query_params.get("shop")
+        )
+        return RedirectResponse(
+            url=_marketplace_install_error_url("install_failed"), status_code=302
+        )
+
+
+async def _shopify_oauth_callback_impl(request: Request):
+    """
     Shopify OAuth callback (unauthenticated; validated via HMAC + state anti-replay).
+
+    Raises HTTPException on any failure; the route wrapper above turns that into a
+    browser redirect. Never return raw JSON from here.
     """
     shop_domain = _validate_myshopify_domain(request.query_params.get("shop") or "")
     code = (request.query_params.get("code") or "").strip()
