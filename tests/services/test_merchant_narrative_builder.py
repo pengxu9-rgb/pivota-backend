@@ -673,6 +673,82 @@ def test_who_ai_cites_ranks_recommends_class_over_unclassified_ties():
     assert [h["host"] for h in who2["cited_hosts"]][0] == "zzz-frequent.com"
 
 
+def test_who_ai_cites_ranks_host_with_grounded_rival_over_tie_without():
+    """Next tie-break gap after the Anuko fix (#1382): among 1-citation,
+    recommends-class, category-cited, classified peers that ALSO tie on those
+    terms, a host that grounded a named rival ('you're losing this
+    endorsement') must survive the [:8] cap ahead of an otherwise-identical
+    peer that named none — instead of both falling to the alphabetical host
+    key. The competitors_named term breaks only true ties: it sits below
+    frequency and the higher-signal endorsement terms and above host."""
+    from services.merchant_narrative_builder import _who_ai_cites_instead
+    # 7 filler peers, all tied on the first four rank terms, no grounded rival.
+    fillers = [
+        {"host": f"tie-{c}.com", "citation_role": "editorial_review",
+         "recommendation_class": "recommends", "prompts_cited_count": 1,
+         "cited_on_category_query": True}
+        for c in "abcdefg"
+    ]
+    # Two focal peers, identical on every rank term and alphabetically LAST (so
+    # without the rival term they'd tie at the tail and sort by host). Only one
+    # grounded a competitor.
+    with_rival = {
+        "host": "zeta-with-rival.com", "citation_role": "editorial_review",
+        "recommendation_class": "recommends", "prompts_cited_count": 1,
+        "cited_on_category_query": True,
+    }
+    no_rival = {
+        "host": "zeta-no-rival.com", "citation_role": "editorial_review",
+        "recommendation_class": "recommends", "prompts_cited_count": 1,
+        "cited_on_category_query": True,
+    }
+    # The per-host grounded rival is derived from the SKU authority rows (a real
+    # brand name, not an ingredient/category type), exactly as production does.
+    skus = [{
+        "sku_key": "sku-1",
+        "authority_hosts": [
+            {"host": "zeta-with-rival.com", "competitors_named": ["Vital Proteins"]},
+        ],
+    }]
+    who = _who_ai_cites_instead(
+        {"hosts": fillers + [no_rival, with_rival], "skus": skus}
+    )
+    cited = [h["host"] for h in who["cited_hosts"]]
+    assert len(cited) == 8  # cap still applies (9 hosts in, 8 out)
+    assert cited[0] == "zeta-with-rival.com"  # grounded rival wins the tie
+    assert "zeta-with-rival.com" in cited  # survives the [:8] cap
+    assert "zeta-no-rival.com" not in cited  # the no-rival tie-peer is truncated
+    # Sanity: the rival term must NOT override citation frequency. A 2-cite peer
+    # with no grounded rival still outranks the 1-cite host that has one.
+    frequent = {"host": "aaa-frequent.com", "citation_role": "editorial_review",
+                "recommendation_class": "recommends", "prompts_cited_count": 2,
+                "cited_on_category_query": True}
+    who2 = _who_ai_cites_instead(
+        {"hosts": fillers + [no_rival, with_rival, frequent], "skus": skus}
+    )
+    assert [h["host"] for h in who2["cited_hosts"]][0] == "aaa-frequent.com"
+    # ...and the higher-signal endorsement terms must still dominate the rival
+    # term: a recommends-class host with NO grounded rival outranks a
+    # non-recommends host that HAS one. Pins the tuple ordering (rival term sits
+    # below recommends/category/classified) against a future reorder.
+    non_recommends_with_rival = {
+        "host": "bbb-plain-with-rival.com", "citation_role": "editorial_review",
+        "recommendation_class": "unknown", "prompts_cited_count": 1,
+        "cited_on_category_query": True,
+    }
+    skus3 = [{
+        "sku_key": "sku-3",
+        "authority_hosts": [
+            {"host": "bbb-plain-with-rival.com", "competitors_named": ["Vital Proteins"]},
+        ],
+    }]
+    who3 = _who_ai_cites_instead(
+        {"hosts": [no_rival, non_recommends_with_rival], "skus": skus3}
+    )
+    ranked3 = [h["host"] for h in who3["cited_hosts"]]
+    assert ranked3.index("zeta-no-rival.com") < ranked3.index("bbb-plain-with-rival.com")
+
+
 def test_endorsing_host_outreach_move_not_framed_as_rival_recommendation():
     """Grounding defect 1 end-to-end: an editorial that independently endorses
     the merchant on a category query (endorsement_hosts) while also grounding
