@@ -556,8 +556,11 @@ def _outreach_moves(
             # above raw citation frequency. But de-prioritise "hard" (major-
             # publisher) moves a long-tail brand can't realistically land, so
             # reachable/DIY moves (reviews, Reddit/community) surface first.
+            # The hard penalty is about COLD-pitch odds — extending coverage a
+            # host already gave you isn't a cold pitch, so endorsed hosts keep
+            # their standing even at major publishers.
             "_priority": (5 if recommends_rival else 0) + (1 if category else 0) + cited_n
-            - (4 if realism == "hard" else 0),
+            - (4 if realism == "hard" and not already_endorses else 0),
         })
     moves.sort(key=lambda m: -m["_priority"])
     for m in moves:

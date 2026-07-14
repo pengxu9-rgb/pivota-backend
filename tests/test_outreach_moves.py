@@ -215,3 +215,27 @@ def test_single_prompt_count_copy_reads_naturally(monkeypatch):
     (move,) = mnb._outreach_moves(who)
     assert "in 1 of your tested prompts" in move["why"]
     assert "tested prompt " not in move["why"]
+
+
+def test_endorsed_major_publisher_not_penalized_as_cold_pitch(monkeypatch):
+    """The hard-realism -4 penalty models COLD-pitch odds at a major publisher.
+    A host that already endorses the merchant isn't being cold-pitched — its
+    'build on won coverage' move must keep its standing, not silently drop
+    below cold-outreach moves (or out of the top-6)."""
+    _patch_classifier(monkeypatch, {
+        "vogue.com": {"type": "editorial", "subtype": "magazine"},
+        "elle.com": {"type": "editorial", "subtype": "magazine"},
+    })
+    who = {"cited_hosts": [
+        {"host": "elle.com", "recommendation_class": "recommends",
+         "prompts_cited_count": 2, "cited_on_category_query": True},
+        {"host": "vogue.com", "recommendation_class": "recommends",
+         "prompts_cited_count": 2, "cited_on_category_query": True},
+    ]}
+    moves = mnb._outreach_moves(who, endorsement_hosts=["vogue.com"])
+    # Identical stats: the endorsed publisher outranks the cold-pitch one.
+    assert [m["host"] for m in moves] == ["vogue.com", "elle.com"]
+    endorsed = moves[0]
+    assert endorsed["already_endorses_you"] is True
+    assert endorsed["realism"] == "hard"  # host difficulty stays honest
+    assert "extending won coverage" in endorsed["first_move"].lower()
