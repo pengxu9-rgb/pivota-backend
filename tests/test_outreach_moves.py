@@ -91,3 +91,47 @@ def test_outreach_moves_are_realism_aware_for_long_tail_brands():
     # Reachable hwahae outranks hard vogue even though both "recommend" a rival.
     order = [m["host"] for m in _outreach_moves(who)]
     assert order.index("hwahae.com") < order.index("vogue.com")
+
+
+def test_anuko_hosts_route_to_specific_playbooks_not_catchall():
+    """Regression (real registry, no mock): hosts from real Anuko audit runs
+    used to come back unclassified, so every one of them fell through to the
+    generic 'Get cited on X' investigate move. Each must now route to its
+    host-type-specific playbook."""
+    from services.merchant_narrative_builder import (
+        _MAJOR_PUBLISHER_FIRST_MOVE,
+        _REVIEW_BUILD_FIRST_MOVE,
+        _outreach_moves,
+    )
+    who = {"cited_hosts": [
+        {"host": "bluemercury.com", "prompts_cited_count": 3,
+         "cited_on_category_query": True},
+        {"host": "glowpick.com", "prompts_cited_count": 2,
+         "cited_on_category_query": True},
+        {"host": "consumerreports.org", "prompts_cited_count": 2,
+         "cited_on_category_query": False},
+        {"host": "cntraveler.com", "prompts_cited_count": 1,
+         "cited_on_category_query": False},
+    ]}
+    moves = {m["host"]: m for m in _outreach_moves(who)}
+    assert len(moves) == 4
+    # Nothing falls through to the unclassified catch-all anymore.
+    assert all(m["action_verb"] != "Get cited on" for m in moves.values())
+
+    # Retailer → "Apply to be carried" wholesale move.
+    assert moves["bluemercury.com"]["action_verb"] == "Get carried by"
+    assert moves["bluemercury.com"]["lever"] == "wholesale_onboarding"
+    assert moves["bluemercury.com"]["realism"] == "onboarding"
+
+    # Review aggregator (peer of hwahae) → earn-reviews move.
+    assert moves["glowpick.com"]["lever"] == "editorial_outreach"
+    assert moves["glowpick.com"]["first_move"] == _REVIEW_BUILD_FIRST_MOVE
+    assert moves["glowpick.com"]["realism"] == "reachable"
+
+    # Review site → editorial outreach, reachable.
+    assert moves["consumerreports.org"]["lever"] == "editorial_outreach"
+    assert moves["consumerreports.org"]["realism"] == "reachable"
+
+    # Magazine subtype → major-publisher realism gate: no cold-pitch advice.
+    assert moves["cntraveler.com"]["realism"] == "hard"
+    assert moves["cntraveler.com"]["first_move"] == _MAJOR_PUBLISHER_FIRST_MOVE

@@ -318,6 +318,60 @@ def test_beauty_hair_cited_hosts_are_classified():
         assert got["type"] == want, f"{host}: expected {want}, got {got['type']}"
 
 
+def test_anuko_audit_cited_hosts_are_classified():
+    """Regression: hosts that appeared UNCLASSIFIED in real Anuko audit runs
+    (merch_924da2be8503e5f7), which made the narrative's outreach moves fall
+    through to the generic 'Get cited on X' catch-all instead of the
+    host-type-specific playbook. type+subtype both matter here: subtype drives
+    the earn-reviews first_move (review_aggregator) and the major-publisher
+    realism gate (magazine)."""
+    from services.cited_host_classifier import classify_host
+
+    expected = {
+        "bluemercury.com": ("retailer", "beauty_retailer"),
+        "glowpick.com": ("editorial", "review_aggregator"),
+        "consumerreports.org": ("editorial", "review_site"),
+        "cntraveler.com": ("editorial", "magazine"),
+    }
+    for host, (want_type, want_subtype) in expected.items():
+        got = classify_host(host, merchant_category="beauty")
+        assert got["type"] == want_type, f"{host}: expected {want_type}, got {got['type']}"
+        assert got["subtype"] == want_subtype, (
+            f"{host}: expected subtype {want_subtype}, got {got['subtype']}"
+        )
+        assert got["applies_to_merchant_category"] is True, host
+        assert got["coverage_note"] and got["outreach_hint"], host
+
+
+def test_major_magazine_titles_classified_with_magazine_subtype():
+    """The magazine subtype is what keeps long-tail brands from being told to
+    cold-pitch a major publisher (realism='hard' in the narrative layer) —
+    Condé Nast / Hearst / Dotdash Meredith titles seen in grounding must not
+    drop to unclassified."""
+    from services.cited_host_classifier import classify_host
+
+    for host in (
+        "cntraveler.com", "gq.com", "teenvogue.com", "instyle.com",
+        "oprahdaily.com", "townandcountrymag.com", "travelandleisure.com",
+        "marieclaire.com",
+    ):
+        got = classify_host(host)
+        assert got["type"] == "editorial", host
+        assert got["subtype"] == "magazine", host
+
+
+def test_bluemercury_registered_as_profile_retailer_token():
+    """'bluemercury' is a beauty retailer token (peer of sephora/ulta): the
+    name-form must be recognized by the competitor filter, and regional /
+    subdomain host variants must classify as retailer via the profile-token
+    fallback even without a per-host registry entry."""
+    from services.cited_host_classifier import classify_host, is_profile_retailer_name
+
+    assert is_profile_retailer_name("Bluemercury")
+    out = classify_host("shop.bluemercury.co.uk")
+    assert out["type"] == "retailer"
+
+
 # ---------------------------------------------------------------------
 # 5. End-to-end: merchant_view.receipts.cited_hosts_detailed populated
 # ---------------------------------------------------------------------
