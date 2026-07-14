@@ -103,6 +103,52 @@ async def test_enrichment_with_content_raises_no_gap(monkeypatch) -> None:
     assert not any("product_enrichment" in g for g in r["enhancement_gaps"])
 
 
+async def test_recommend_store_sync_when_observed_only(monkeypatch) -> None:
+    # Catalog is entirely observed URL-audit/seed rows, no connected store —
+    # ready to audit, but recommend a sync for a first-party run. Mirrors the
+    # real "merch_924…" (Anuko) shape: connected_store=0, observed>0.
+    async def _fake_count(table, merchant_id, *, platform=None, where_extra=None):
+        if table == "catalog_products" and where_extra:
+            if "NOT IN" in where_extra:
+                return 0  # connected_store_products
+            if "external_referral" in where_extra:
+                return 5  # observed_referral_products
+            if "brand_authored" in where_extra:
+                return 0  # brand_authored_products
+        return {
+            "catalog_products": 5, "products_cache": 0,
+            "product_quality_snapshot": 5, "product_enrichment": 0,
+        }.get(table, 0)
+    monkeypatch.setattr(mar, "_table_count", _fake_count)
+
+    r = await mar.assess_merchant_audit_readiness("m1")
+    assert r["ready"] is True  # advisory only — never blocks
+    assert r["recommend_store_sync"] is True
+    assert r["provenance"]["connected_store_products"] == 0
+    assert r["provenance"]["observed_referral_products"] == 5
+
+
+async def test_no_recommend_when_store_connected(monkeypatch) -> None:
+    # A merchant with real synced store rows should NOT get the sync nudge.
+    async def _fake_count(table, merchant_id, *, platform=None, where_extra=None):
+        if table == "catalog_products" and where_extra:
+            if "NOT IN" in where_extra:
+                return 763  # connected_store_products
+            if "external_referral" in where_extra:
+                return 0
+            if "brand_authored" in where_extra:
+                return 0
+        return {
+            "catalog_products": 763, "products_cache": 763,
+            "product_quality_snapshot": 763, "product_enrichment": 763,
+        }.get(table, 0)
+    monkeypatch.setattr(mar, "_table_count", _fake_count)
+
+    r = await mar.assess_merchant_audit_readiness("m1")
+    assert r["recommend_store_sync"] is False
+    assert r["provenance"]["connected_store_products"] == 763
+
+
 async def test_count_refuses_non_whitelisted_table() -> None:
     import pytest
     with pytest.raises(ValueError):
