@@ -135,3 +135,43 @@ def test_failing_prompts_stamp_provider():
     ]
     out = _failing_prompts(probe_runs)
     assert out and out[0]["provider"] == "gemini"
+
+
+def test_failing_prompts_strips_merchant_own_brand_from_competitors():
+    """#1382 follow-up (nit #3, sibling path): _failing_prompts fans a run's raw
+    competitors_listed into `competitors_named`, which feeds the win-plan
+    competitor benchmark (win_plan_builder._competitor_benchmark). An engine that
+    echoes the merchant back inside competitors_listed (common on branded /
+    where-to-buy queries) must not have the merchant's OWN brand surface as a
+    "competitor to beat" for its own failing prompt. Only the genuine rival
+    survives; the authority-map path already applies the same own-brand skip."""
+    from services.agent_center_bd_report_service import _failing_prompts
+    from services.brand_alias import derive_brand_aliases
+
+    probe_runs = [{
+        "raw_runs": [{
+            "query": "where to buy BB Lab collagen",
+            "_provider": "gemini",
+            "parsed": {
+                "correct_sku": False,
+                "product_visible": False,
+                # LLM listed the merchant itself (exact + spaced + aliased) next
+                # to one real rival.
+                "competitors_listed": ["BB Lab Global", "BB Lab", "bblab", "GlowCo"],
+            },
+            "url_match": {"in_grounding": False, "llm_self_report": {}},
+            "axis_metadata": {"axis": "category"},
+            "grounding_sources": [],
+        }],
+    }]
+    # No brand context → legacy behaviour (nothing stripped), proving the filter
+    # is what removes the own brand, not some other path.
+    unfiltered = _failing_prompts(probe_runs)[0]["competitors_named"]
+    assert "BB Lab" in unfiltered
+
+    named = _failing_prompts(
+        probe_runs,
+        brand_lower="bb lab global",
+        brand_aliases=derive_brand_aliases("BB Lab Global", "bblab.com"),
+    )[0]["competitors_named"]
+    assert named == ["GlowCo"], named
