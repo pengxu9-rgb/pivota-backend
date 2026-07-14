@@ -82,7 +82,7 @@ _VERTEX_REDIRECTOR_HOSTS = {
 }
 
 
-# A bare-domain string ("oliveyoung.com", "the-independent.com") rather than
+# A bare-domain string ("oliveyoung.com", "independent.co.uk") rather than
 # a human-readable source title ("Olive Young Global"): has a dot, no
 # whitespace, plausible DNS labels. Used to decide whether a grounding-chunk
 # `title` can be taken as the real host verbatim.

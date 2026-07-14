@@ -129,7 +129,7 @@ def _alias_index(registry: Dict[str, Dict[str, Any]]) -> Dict[str, str]:
 # Aliases that are also common English words (or word phrases) — resolve them
 # ONLY on an exact match, never as a substring, so a coincidental title like
 # "best collagen for your target audience" can't be mis-attributed to target.com,
-# "the independent best serums" to the-independent.com, or "living between town
+# "the independent best serums" to independent.co.uk, or "living between town
 # and country" to townandcountrymag.com. An exact title of "Target" / "The
 # Independent" / "Town and Country" still resolves via the exact-match path
 # above; this guard only suppresses the looser substring match. Real citations

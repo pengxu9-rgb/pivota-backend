@@ -188,6 +188,36 @@ def test_common_word_aliases_resolve_only_on_exact_match():
     assert classify_host("Travel + Leisure")["host"] == "travelandleisure.com"
 
 
+def test_the_independent_is_keyed_by_real_domain():
+    """Regression: the registry used to key The Independent under the synthetic
+    domain 'the-independent.com', so real citations of independent.co.uk fell to
+    unclassified while title-alias hits resolved to a host that doesn't exist —
+    the same report double-listed the publication (seen in prod Anuko run
+    bcdfc4aa, 2026-07-14). The canonical key must be the real domain."""
+    from services.cited_host_classifier import classify_host
+
+    # The actually-cited URL host classifies via the registry key.
+    real = classify_host("independent.co.uk", merchant_category="beauty")
+    assert real["host"] == "independent.co.uk"
+    assert real["type"] == "editorial"
+    assert real["subtype"] == "review_site"
+
+    # An exact citation title resolves to the real domain (exact-match only —
+    # "the independent" is in _COMMON_WORD_ALIASES).
+    titled = classify_host("The Independent", merchant_category="beauty")
+    assert titled["host"] == "independent.co.uk"
+    assert titled["type"] == "editorial"
+
+    indybest = classify_host("IndyBest", merchant_category="beauty")
+    assert indybest["host"] == "independent.co.uk"
+
+    # The retired synthetic host (present in stored historical reports) still
+    # resolves via the alias path instead of regressing to unclassified.
+    legacy = classify_host("the-independent.com", merchant_category="beauty")
+    assert legacy["host"] == "independent.co.uk"
+    assert legacy["type"] == "editorial"
+
+
 def test_applies_to_merchant_category_false_when_category_mismatch():
     """nymag.com has 'fashion'/'sleepwear'/'beauty'/'home'/'fitness' in
     its categories — fitness merchant should still get applies=True
