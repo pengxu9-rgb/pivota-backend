@@ -6106,12 +6106,11 @@ def _failing_prompts(
                 else None
             ),
             "grounding_sources": run.get("grounding_sources") or [],
-            # Strip the merchant's own brand before its competitors reach the
-            # win-plan competitor benchmark (win_plan_builder._competitor_benchmark).
-            # Engines echo the merchant back inside competitors_listed on
-            # branded/where-to-buy queries; unfiltered, the brand would render as
-            # a "competitor to beat" for its own failing prompt. Same fan-out
-            # source + same own-brand skip as the authority-map path.
+            # Strip the merchant's own brand/aliases: this list feeds rival-
+            # framing copy (win-plan competitor benchmark, playbook pitch drafts
+            # + next_best_action competitor phrases via failed_queries_detailed),
+            # where surfacing the merchant as its own "competitor" reads as a
+            # bug. Same own-brand filter as the authority-map path (#1384).
             "competitors_named": _strip_own_brand_competitors(
                 parsed.get("competitors_listed")
                 or parsed.get("competitors_appearing")
@@ -6935,22 +6934,29 @@ async def build_per_sku_report(
         primary_gaps = [
             g for g in primary_gaps if g.get("dimension") != "routability"
         ]
-    # Own-brand context so an engine that echoes the merchant back inside
-    # competitors_listed doesn't surface the brand as its own competitor in the
-    # win-plan benchmark (mirrors the authority-map own-brand skip).
-    _fp_brand = str(
-        (identity.get("anchors") or {}).get("brand")
-        or product.get("brand")
-        or product.get("vendor")
-        or ""
-    ).strip()
+    # Merchant identity so failing_prompts.competitors_named never surfaces the
+    # merchant's own brand/aliases as a rival (the list feeds the win-plan
+    # competitor benchmark + NBA / playbook framing). Derived from the resolved
+    # SKU identity anchors + product; vendor and anchor-domain aliases included
+    # so a de-spaced or vendor-recorded echo of the own brand still strips.
+    _fp_anchors = identity.get("anchors") if isinstance(identity, dict) else {}
+    _fp_anchors = _fp_anchors if isinstance(_fp_anchors, dict) else {}
+    _fp_brand = _fp_anchors.get("brand") or product.get("brand") or product.get("vendor") or ""
+    _fp_host = (
+        _fp_anchors.get("domain")
+        or normalize_host(product.get("canonical_url") or product.get("pdp_url"))
+    )
+    _fp_vendor = product.get("vendor")
+    _fp_brand_lower = str(_fp_brand or "").strip().lower()
+    _fp_brand_aliases = derive_brand_aliases(
+        _fp_brand or None,
+        _fp_host,
+        _clean_identity_tuple((_fp_vendor,) if _fp_vendor else None),
+    )
     failing_prompts = _failing_prompts(
         probe_runs,
-        brand_lower=_fp_brand.lower(),
-        brand_aliases=derive_brand_aliases(
-            _fp_brand,
-            normalize_host(product.get("canonical_url") or product.get("pdp_url")),
-        ),
+        brand_lower=_fp_brand_lower,
+        brand_aliases=_fp_brand_aliases,
     )
     verify_summary_out = verify_summary or _verify_skipped_summary(
         reason="not_run",
@@ -15399,6 +15405,7 @@ def _build_failed_queries_detailed(
     merchant_brand: Optional[str],
     merchant_host: Optional[str],
     merchant_category: Optional[str],
+    merchant_vendors: Optional[Tuple[str, ...]] = None,
     cap: int = 10,
 ) -> List[Dict[str, Any]]:
     """For each attribution-test query where the merchant's URL was
@@ -15416,7 +15423,8 @@ def _build_failed_queries_detailed(
                            field (it's already in `top_cited_host`)
       competitors_named  : up to 5 competitor brand names from
                            parsed.competitors_appearing, with the
-                           merchant's own brand filtered out
+                           merchant's own brand + aliases filtered out
+                           (alias-aware via _strip_own_brand_competitors)
 
     Capped at `cap` entries (default 10) to keep response size bounded
     even on large probe runs.
@@ -15427,8 +15435,12 @@ def _build_failed_queries_detailed(
     # Alias-aware own-brand filter for competitors_appearing below — a de-spaced
     # echo ("bblab") or a vendor alias isn't a substring of the brand, so the
     # bare substring test used to leak the merchant into this merchant-facing
-    # competitors_named field.
-    brand_aliases = derive_brand_aliases(merchant_brand, merchant_host)
+    # competitors_named field. Vendor aliases included when the caller has them.
+    brand_aliases = derive_brand_aliases(
+        merchant_brand or None,
+        merchant_host,
+        _clean_identity_tuple(merchant_vendors),
+    )
 
     for run in attribution_runs or []:
         parsed = run.get("parsed") or {}

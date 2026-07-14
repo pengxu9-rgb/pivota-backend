@@ -204,6 +204,79 @@ def test_helper_filters_own_brand_aliases_not_just_substring():
     assert out[0]["competitors_named"] == ["GlowCo"], out[0]["competitors_named"]
 
 
+def test_helper_strips_aliased_own_brand_from_competitors():
+    """Regression (#1384 follow-up): the plain substring skip let an aliased
+    own-brand form leak into competitors_named. For a merchant recorded as
+    "BB Lab Global", the DE-SPACED alias "BBLab" is NOT a substring of the
+    brand ("bblab" is not in "bb lab global"), so the pre-fix substring-only
+    check missed it — only text_mentions_brand (alias-aware) strips it.
+    "Torriden" is a genuine rival and must survive."""
+    from services.agent_center_bd_report_service import _build_failed_queries_detailed
+    runs = [
+        _attr_run(
+            "best korean collagen serum",
+            found=False,
+            grounding=["https://nymag.com/x"],
+            competitors=["BBLab", "Torriden"],
+        ),
+    ]
+    out = _build_failed_queries_detailed(
+        runs,
+        merchant_brand="BB Lab Global",
+        merchant_host="bblabglobal.com",
+        merchant_category="skincare",
+    )
+    named = out[0]["competitors_named"]
+    assert "BBLab" not in named
+    assert named == ["Torriden"]
+
+
+def test_helper_strips_own_brand_via_host_alias():
+    """The merchant's own storefront, listed as a 'competitor' under its host
+    registrable name, is stripped via the host-derived alias (the pre-fix
+    brand-only substring check never saw the host)."""
+    from services.agent_center_bd_report_service import _build_failed_queries_detailed
+    runs = [
+        _attr_run(
+            "q1",
+            found=False,
+            grounding=["https://nymag.com/x"],
+            competitors=["Torriden", "Anua"],
+        ),
+    ]
+    out = _build_failed_queries_detailed(
+        runs,
+        merchant_brand="Some Registered Co",  # brand text differs from host
+        merchant_host="torriden.com",
+        merchant_category="skincare",
+    )
+    # "Torriden" matches the host registrable alias, so it's dropped; "Anua"
+    # is an unrelated rival and survives.
+    assert out[0]["competitors_named"] == ["Anua"]
+
+
+def test_helper_strips_own_brand_via_vendor_alias():
+    """A vendor name passed via merchant_vendors also strips the merchant's
+    own brand from the competitor list."""
+    from services.agent_center_bd_report_service import _build_failed_queries_detailed
+    runs = [
+        _attr_run(
+            "q1",
+            found=False,
+            grounding=["https://nymag.com/x"],
+            competitors=["HouseVendor", "Torriden"],
+        ),
+    ]
+    out = _build_failed_queries_detailed(
+        runs,
+        merchant_brand="Storefront Brand",
+        merchant_host="storefront.com",
+        merchant_category="skincare",
+        merchant_vendors=("HouseVendor",),
+    )
+    assert out[0]["competitors_named"] == ["Torriden"]
+
+
 def test_helper_caps_competitors_at_5():
     from services.agent_center_bd_report_service import _build_failed_queries_detailed
     competitors = [f"Brand{i}" for i in range(10)]
