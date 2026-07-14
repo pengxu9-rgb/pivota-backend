@@ -2159,6 +2159,13 @@ async def get_merchant_visibility_tracking(
     set) points and breaks where the basis changed. Empty/baseline until there are
     >=2 same-basis runs to trend.
 
+    Each point also discloses its SKU coverage (sku_count / attempted_sku_count /
+    panel_id — every brand score is an AVERAGE over that run's measured products),
+    `panel_changes` marks checks whose measured SKU set differs from the previous
+    one ("tracked products changed", distinct from a prompt refresh), and `per_sku`
+    carries one mini-series per measured product (same basis-comparability rule)
+    so the chart can offer a per-SKU lens without a second query.
+
     `subject_type` scopes the series to one run kind, mirroring /history:
     "merchant" (per-SKU catalog audits, default) or "merchant_url" (the
     URL-visibility wedge) — the two never mix in one trend because their
