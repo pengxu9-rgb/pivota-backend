@@ -160,13 +160,50 @@ def derive_brand_aliases(
     return tuple(aliases)
 
 
+_SEP = r"[\s\-_]*"           # between any two alias tokens
+_SEP_APOS = r"[\s\-_'’]*"    # …plus an apostrophe, where that is safe (below)
+
+
 @lru_cache(maxsize=8192)
 def _alias_pattern(alias: str) -> Pattern[str]:
     """Compile an alias to a boundary-anchored regex. Internal spaces become a
-    flexible separator so 'bb lab' matches 'bb lab', 'bb-lab', and 'bblab';
-    the non-alnum lookarounds stop it matching inside a larger word."""
-    parts = [re.escape(p) for p in alias.split(" ") if p]
-    body = r"[\s\-_]*".join(parts)
+    flexible separator so 'bb lab' matches 'bb lab', 'bb-lab', and 'bblab', and
+    'l oreal paris' matches "l'oreal paris"; the non-alnum lookarounds stop it
+    matching inside a larger word.
+
+    The apostrophe is a separator because _normalize turns it into a token BREAK
+    ("L'Oréal Paris" → 'l oreal paris'), so without it the alias could never
+    match the brand as real copy actually spells it, and own-brand visibility
+    under-counted for every apostrophe brand. Both the ASCII quote and the
+    typographic right-single-quote are accepted — real copy uses U+2019, and the
+    diacritic fold leaves it untouched, so it never reduces to U+0027. (U+2018,
+    U+02BC and U+FF07 are NOT accepted; that just leaves the old under-count in
+    place for those rarer spellings, which is safe, not a new miss.)
+
+    But an apostrophe is only allowed to bind INTO a token of >=2 chars, because
+    _normalize splits two different things the same way:
+
+        elision      "L'Oréal Paris" → l | oreal | paris   (binds into 'oreal')
+        contraction  "It's Skin"     → it | s | skin        (binds into 's')
+
+    Letting the apostrophe bind into the 1-char token would make the alias
+    re-absorb an ordinary English contraction, so "It's Skin" (a real catalog
+    brand) would match the sentence "whether it's skin texture or tone" — and in
+    the own-brand FILTER paths that would silently drop a real competitor's
+    citation, not merely over-credit visibility. Contraction brands lose nothing
+    by this: callers OR-in a literal compare, and such text spells the brand
+    exactly as stored, so the literal compare already matches it.
+
+    Both classes are supersets of the plain separator, so this only ever ADDS
+    matches over the literal compare — never removes one, per the module
+    invariant.
+    """
+    parts = [p for p in alias.split(" ") if p]
+    if not parts:
+        return re.compile(r"(?!)")
+    body = re.escape(parts[0])
+    for part in parts[1:]:
+        body += (_SEP_APOS if len(part) >= 2 else _SEP) + re.escape(part)
     return re.compile(r"(?<![a-z0-9])" + body + r"(?![a-z0-9])")
 
 
