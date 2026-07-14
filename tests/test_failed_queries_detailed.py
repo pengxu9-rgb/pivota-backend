@@ -178,6 +178,32 @@ def test_helper_extracts_competitors_named_filtering_merchant_brand():
     assert out[0]["competitors_named"] == ["Lunya", "Eberjey", "Hill House Home"]
 
 
+def test_helper_filters_own_brand_aliases_not_just_substring():
+    """#1382 follow-up (nit #3): the own-brand skip here used to be a bare
+    bidirectional substring, so a de-spaced echo ("bblab") or a multi-word
+    brand's alias slipped through into this merchant-facing competitors_named.
+    Now alias-aware (derive_brand_aliases + word boundary), matching the
+    authority-map / win-plan paths. Only the genuine rival survives."""
+    from services.agent_center_bd_report_service import _build_failed_queries_detailed
+    runs = [
+        _attr_run(
+            "where to buy BB Lab collagen",
+            found=False,
+            grounding=["https://nymag.com/x"],
+            # LLM echoed the merchant back in exact, spaced, and de-spaced forms
+            # ("bblab" is NOT a substring of "bb lab global" → the old test missed it).
+            competitors=["BB Lab Global", "BB Lab", "bblab", "GlowCo"],
+        ),
+    ]
+    out = _build_failed_queries_detailed(
+        runs,
+        merchant_brand="BB Lab Global",
+        merchant_host="bblab.com",
+        merchant_category="beauty",
+    )
+    assert out[0]["competitors_named"] == ["GlowCo"], out[0]["competitors_named"]
+
+
 def test_helper_caps_competitors_at_5():
     from services.agent_center_bd_report_service import _build_failed_queries_detailed
     competitors = [f"Brand{i}" for i in range(10)]

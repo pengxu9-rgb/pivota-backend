@@ -1475,7 +1475,10 @@ def test_build_authority_map_strips_merchant_own_brand_from_competitors():
     assert "recommends a competitor over you" not in moves["goodhousekeeping.com"]["why"]
     assert not moves["goodhousekeeping.com"].get("competitors_named")
     assert "allure.com" in moves
-    assert "recommends a competitor over you" in moves["allure.com"]["why"]
+    # Post-#1385 honest co-citation copy (competitors_named is fanned onto every
+    # co-cited host, so the host "grounds answers that recommend competitors"
+    # rather than personally "recommends a competitor over you").
+    assert "grounds answers that recommend competitors over you" in moves["allure.com"]["why"]
 
 
 def test_strip_own_brand_competitors_word_boundary_guard():
