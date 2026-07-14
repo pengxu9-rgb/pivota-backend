@@ -543,3 +543,28 @@ def test_top_cited_hosts_still_present_alongside_detailed():
     assert "top_cited_hosts" in receipts
     assert "cited_hosts_detailed" in receipts
     assert "nymag.com" in receipts["top_cited_hosts"]
+
+
+def test_registry_has_no_duplicate_host_keys():
+    """Regression for the 2026-07-14 dermstore.com clobber: two PRs each added
+    a `dermstore.com` entry, and json.load silently kept only the later one —
+    dropping a verified pitch_recipient fill. Duplicate keys in the shipped
+    registry are always an authoring error; fail loudly on any."""
+    registry_path = (
+        Path(__file__).resolve().parent.parent / "data" / "cited_host_registry.json"
+    )
+
+    duplicates: List[str] = []
+
+    def _collect(pairs):
+        seen = set()
+        for key, _ in pairs:
+            if key in seen:
+                duplicates.append(key)
+            seen.add(key)
+        return dict(pairs)
+
+    with open(registry_path, "r", encoding="utf-8") as fh:
+        json.load(fh, object_pairs_hook=_collect)
+
+    assert duplicates == [], f"duplicate keys in cited_host_registry.json: {duplicates}"
