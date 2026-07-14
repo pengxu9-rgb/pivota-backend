@@ -59,7 +59,16 @@ def test_registry_and_editorial_defaults_still_win_over_token():
 
 
 def test_unknown_hosts_stay_unclassified():
-    assert C.classify_host("mobileciti.com.au")["type"] == "unclassified"
+    # Negative control for the retailer-token rule above: a host carrying no
+    # retail token must fall all the way through to `unclassified`, in the bare
+    # and the cc-TLD form alike. The host is synthetic on purpose — a real
+    # retailer would be typed the moment it landed in the registry or in an
+    # ELECTRONICS profile retailer_token, and this assert would die for reasons
+    # that have nothing to do with the rule it is guarding.
+    for host in ["unknown-fixture-host.example", "unknown-fixture-host.com.au"]:
+        r = C.classify_host(host)
+        assert r["type"] == "unclassified", host
+        assert r["confidence"] == "fallback", host  # pins the fallback path
 
 
 def test_is_profile_retailer_name():
