@@ -146,12 +146,27 @@ def _per_sku_mode_entries(report: Mapping[str, Any]) -> List[Dict[str, Any]]:
             continue
         citation = (entry.get("scores") or {}).get("citation")
         citation_score = citation.get("score") if isinstance(citation, dict) else None
+        # Harden both scores against a poisoned stored value: the write path
+        # swallows report errors, so one junk score in one historical row must
+        # not 500 the whole tracking endpoint (same rule as the title tiebreak
+        # below). int-cast attribution to mirror _per_sku_run_aggregate exactly.
+        try:
+            visibility = _overall_score(entry)
+        except (TypeError, ValueError):
+            visibility = None
+        if isinstance(citation_score, bool):
+            citation_score = None
+        else:
+            try:
+                citation_score = int(citation_score) if citation_score is not None else None
+            except (TypeError, ValueError):
+                citation_score = None
         out.append({
             "sku_key": key.strip(),
             "title": entry.get("sku_title"),
             "pdp_url": None,  # per_sku entries don't carry the PDP URL top-level
             "scores": {
-                "visibility": _overall_score(entry),
+                "visibility": visibility,
                 "attribution": citation_score,
                 "category_visibility": None,
             },

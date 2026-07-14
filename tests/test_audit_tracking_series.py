@@ -353,6 +353,23 @@ def test_per_sku_mode_tolerates_junk_entries():
     assert list(series["per_sku"].keys()) == ["urlwedge:aaa"]
 
 
+def test_per_sku_mode_junk_scores_never_500():
+    # The write path swallows report errors, so a poisoned stored score must
+    # degrade to None on read — one bad historical row can't brick the endpoint.
+    series = build_tracking_series([
+        _per_sku_row(0, 40, 40, [
+            _sku_report("urlwedge:aaa", "Hair Butter", {"citation": "n/a"}),
+        ]),
+        _per_sku_row(30, 46, 46, [
+            _sku_report("urlwedge:bbb", "Oil", {"citation": True}),  # bool ≠ score
+        ]),
+    ])
+    a = series["per_sku"]["urlwedge:aaa"]["points"][0]["scores"]
+    b = series["per_sku"]["urlwedge:bbb"]["points"][0]["scores"]
+    assert a == {"visibility": None, "attribution": None, "category_visibility": None}
+    assert b["attribution"] is None
+
+
 def test_brand_points_unchanged_by_sku_axis():
     # The additive fields must not disturb the existing contract.
     series = build_tracking_series([
