@@ -704,6 +704,64 @@ def test_endorsing_host_outreach_move_not_framed_as_rival_recommendation():
     moves = {m["host"]: m for m in where["outreach_moves"]}
     gh = moves["goodhousekeeping.com"]
     assert gh["already_endorses_you"] is True
-    assert "recommends a competitor" not in gh["why"]
+    assert "recommend competitors over you" not in gh["why"]
     assert "already recommends you" in gh["why"]
     assert gh["headline"] == "Build on goodhousekeeping.com"
+
+
+def test_cocited_rival_host_copy_is_grounding_not_personal_endorsement():
+    """Follow-up to #1382 — over-attribution guard. build_authority_map fans a
+    run's competitors onto EVERY grounding source of that run, so a recommends-
+    class editorial merely co-cited alongside another source inherits
+    `competitors_named` even though the rival's name came from the answer, not
+    that host's own content. The outreach copy must therefore say the host
+    GROUNDS answers that recommend competitors (co-citation) — it must never
+    assert this specific host personally 'recommends a competitor over you'."""
+    # One category run, one answer that named a rival, TWO editorial grounding
+    # sources — neither names the merchant (so neither is an endorser), and
+    # neither individually named the rival; the ANSWER did. Both inherit the
+    # fanned competitor via build_authority_map.
+    cocited_run = {
+        "query": "best collagen supplement",
+        "axis_metadata": {"axis": "category"},
+        "parsed": {
+            "product_visible": True,
+            "correct_sku": False,
+            "competitors_listed": ["Vital Proteins"],
+        },
+        "grounding_sources": [
+            {"uri": "https://www.stylecraze.com/articles/best-collagen",
+             "title": "Best Collagen Supplements 2026"},
+            {"uri": "https://www.byrdie.com/best-collagen-5munit",
+             "title": "The Best Collagen, Tested"},
+        ],
+        "url_match": {"in_grounding": False},
+    }
+    am = _authority_map(
+        [_run("buy Aruen", "aruen.com"), cocited_run],
+        host="aruen.com",
+        brand="Aruen",
+    )
+    narr = build_merchant_narrative(
+        merchant_name="Aruen", per_sku_reports=[], authority_map=am,
+        providers=["gemini"], verify_providers=["deepseek"],
+    )
+    where = narr["where_youre_losing"]
+    # Neither co-cited editorial is an endorser (neither named the brand).
+    assert "stylecraze.com" not in where["endorsement_hosts"]
+    assert "byrdie.com" not in where["endorsement_hosts"]
+    moves = {m["host"]: m for m in where["outreach_moves"]}
+    # At least one co-cited editorial surfaces as a rival-grounding move.
+    rival_moves = [
+        m for m in moves.values()
+        if "recommend competitors over you" in m["why"]
+    ]
+    assert rival_moves, "expected a co-citation rival-grounding move"
+    for m in rival_moves:
+        assert m["host"] in {"stylecraze.com", "byrdie.com"}
+        # The fanned competitor drives the move — but the copy is co-citation
+        # ("grounds answers that recommend competitors"), never a personal
+        # endorsement claim about this specific host.
+        assert "grounds answers that recommend competitors over you" in m["why"]
+        assert "it recommends a competitor over you" not in m["why"]
+        assert m["already_endorses_you"] is False

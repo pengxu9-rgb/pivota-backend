@@ -55,7 +55,12 @@ def test_routes_ranks_and_skips(monkeypatch):
     assert moves[0]["action_verb"] == "Pitch"
     assert moves[0]["lever"] == "editorial_outreach"
     assert moves[0]["pitch_recipient"] == "tips@hwahae.com"
-    assert "recommends a competitor" in moves[0]["why"]
+    # Honest co-citation framing: this host GROUNDS answers that recommend
+    # competitors — the copy never asserts the host itself "recommends a
+    # competitor over you" (competitors_named is fanned onto every co-cited host
+    # upstream, so a rival's name can't be pinned to this specific host).
+    assert "grounds answers that recommend competitors over you" in moves[0]["why"]
+    assert "it recommends a competitor over you" not in moves[0]["why"]
 
     by_host = {m["host"]: m for m in moves}
     assert by_host["oliveyoung.com"]["lever"] == "wholesale_onboarding"
@@ -163,7 +168,7 @@ def test_recommends_class_alone_does_not_claim_competitor(monkeypatch):
     ]}
     moves = mnb._outreach_moves(who)
     by_host = {m["host"]: m for m in moves}
-    assert "recommends a competitor" not in by_host["hwahae.com"]["why"]
+    assert "recommend competitors over you" not in by_host["hwahae.com"]["why"]
     # Honest fallback: the grounded citation-count copy instead.
     assert "in 2 of your tested prompts" in by_host["hwahae.com"]["why"]
     # No +5 rival boost: the 6-cite retailer outranks the 2-cite editorial.
@@ -173,8 +178,8 @@ def test_recommends_class_alone_does_not_claim_competitor(monkeypatch):
 def test_already_endorsing_host_reframed_not_defamed(monkeypatch):
     """Grounding defect 1b: hwahae.com independently recommends the merchant
     (endorsement_hosts) yet also grounded answers naming rivals. It must never
-    be framed as 'recommends a competitor over you' — the move is to extend the
-    won coverage, and the rival boost goes to genuinely losing hosts."""
+    be framed as grounding a rival's recommendation over you — the move is to
+    extend the won coverage, and the rival boost goes to genuinely losing hosts."""
     _patch_classifier(monkeypatch, {
         "hwahae.com": {"type": "editorial", "subtype": "review_site"},
         "beautyblog.com": {"type": "editorial", "subtype": "review_site"},
@@ -191,7 +196,7 @@ def test_already_endorsing_host_reframed_not_defamed(monkeypatch):
     by_host = {m["host"]: m for m in moves}
     endorsed = by_host["hwahae.com"]
     assert endorsed["already_endorses_you"] is True
-    assert "recommends a competitor" not in endorsed["why"]
+    assert "recommend competitors over you" not in endorsed["why"]
     assert "already recommends you" in endorsed["why"]
     assert "extend" in endorsed["why"]
     assert endorsed["headline"] == "Build on hwahae.com"
@@ -200,7 +205,7 @@ def test_already_endorsing_host_reframed_not_defamed(monkeypatch):
     # it ranks first despite fewer citations.
     losing = by_host["beautyblog.com"]
     assert losing["already_endorses_you"] is False
-    assert "recommends a competitor" in losing["why"]
+    assert "grounds answers that recommend competitors over you" in losing["why"]
     assert moves[0]["host"] == "beautyblog.com"
 
 
