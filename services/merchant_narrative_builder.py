@@ -506,10 +506,17 @@ def _outreach_moves(
         realism = _move_realism(host, htype, subtype)
         # recommendation_class is a HOST-TYPE property (editorial/video sources
         # recommend rather than list) — it says the host's citations carry
-        # endorsement weight, NOT that a rival was endorsed. Claiming
-        # "recommends a competitor over you" additionally requires a competitor
-        # actually named in answers this host grounded, and that the host isn't
-        # one that already independently recommends THIS merchant.
+        # endorsement weight, NOT that a rival was endorsed. We additionally
+        # require a competitor named in this host's grounded answers (and that
+        # the host isn't one that already independently recommends THIS
+        # merchant) before flagging it. NOTE: competitors_named is fanned onto
+        # every co-cited host of a run upstream (build_authority_map appends the
+        # run's competitors to every grounding source's row), so it proves this
+        # host was co-cited in a run whose answer named a rival — NOT that this
+        # host's own content named it (that per-(host, competitor) provenance
+        # isn't retained). The rendered copy is therefore co-citation framing —
+        # the host "grounds answers that recommend competitors" — and never
+        # asserts this specific host personally "recommends a competitor over you".
         recommends_class = str(h.get("recommendation_class") or "").strip().lower() == "recommends"
         already_endorses = host.lower() in endorsed
         recommends_rival = (
@@ -528,7 +535,7 @@ def _outreach_moves(
         else:
             why = f"AI cites {host}"
             if recommends_rival:
-                why += " and it recommends a competitor over you"
+                why += " and it grounds answers that recommend competitors over you"
             elif cited_n:
                 why += f" in {cited_n} of your tested prompts"
             if category:
