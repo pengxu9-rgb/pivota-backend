@@ -7913,6 +7913,26 @@ def _host_is_competitor(raw_host_type: Optional[str], first_party: bool) -> bool
     return (raw_host_type or "").strip().lower() == "brand"
 
 
+def _competitor_is_merchant_own(
+    name: Any, brand_lower: str, brand_aliases: Tuple[str, ...]
+) -> bool:
+    """True when a name the engine listed as a "competitor" is actually the
+    merchant's OWN brand. LLMs routinely echo the merchant back inside
+    `competitors_listed` (especially on branded/where-to-buy queries), and the
+    raw list is fanned onto every cited host's `competitors_named` — where it
+    later reads as "recommends a competitor over you" against the merchant's own
+    brand. Mirrors the own-brand skip already applied on the attribution path
+    (`_query_level_competitor_context`) and the storefront-alias path
+    (`_run_competitor_aliases` exclude=own_alias_set), which this raw list
+    bypassed."""
+    name_lower = str(name or "").strip().lower()
+    if not name_lower:
+        return False
+    if brand_lower and (brand_lower in name_lower or name_lower in brand_lower):
+        return True
+    return text_mentions_brand(name_lower, brand_aliases)
+
+
 def _run_competitor_aliases(competitor_brands, exclude) -> frozenset:
     """De-spaced, normalized brand aliases (len >= 4) for the competitor names
     the engines listed across the run, minus the merchant's own aliases.
@@ -8225,6 +8245,7 @@ def build_authority_map(
         merchant_host,
         _clean_identity_tuple(merchant_vendors),
     )
+    brand_lower = (merchant_brand or "").strip().lower()
 
     sku_entries: List[Dict[str, Any]] = []
     host_matrix: Dict[str, Dict[str, Any]] = {}
@@ -8256,10 +8277,23 @@ def build_authority_map(
             parsed = run.get("parsed") if isinstance(run.get("parsed"), dict) else {}
             url_match = run.get("url_match") if isinstance(run.get("url_match"), dict) else {}
             llm_report = url_match.get("llm_self_report") if isinstance(url_match.get("llm_self_report"), dict) else {}
-            competitors = parsed.get("competitors_listed") or parsed.get("competitors_appearing") or run.get("competitors_listed") or []
-            run_competitor_brands.update(
-                c for c in competitors if isinstance(c, str) and c.strip()
-            )
+            # Drop the merchant's OWN brand before the list is fanned onto every
+            # cited host's competitors_named (below) and pooled into
+            # run_competitor_brands — an engine echoing the merchant back in
+            # competitors_listed must never read as "recommends a competitor
+            # over you" against the brand itself.
+            competitors = [
+                c
+                for c in (
+                    parsed.get("competitors_listed")
+                    or parsed.get("competitors_appearing")
+                    or run.get("competitors_listed")
+                    or []
+                )
+                if isinstance(c, str) and c.strip()
+                and not _competitor_is_merchant_own(c, brand_lower, brand_aliases)
+            ]
+            run_competitor_brands.update(competitors)
             exact = (
                 parsed.get("correct_sku") is True
                 or parsed.get("sku_mentioned") is True

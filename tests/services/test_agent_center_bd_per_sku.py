@@ -1334,6 +1334,49 @@ def test_build_authority_map_classification_and_reddit_shape():
     assert "chatgpt" in authority_map["hosts"][0]["providers"]
 
 
+def test_build_authority_map_drops_own_brand_from_competitors_named():
+    """#1382 follow-up: an engine that echoes the merchant back inside
+    `competitors_listed` (common on branded / where-to-buy queries) must not have
+    the merchant's OWN brand fanned onto a cited host's `competitors_named` —
+    downstream that reads as "recommends a competitor over you" against the brand
+    itself. Only the genuine rival survives. Covers exact, substring, and aliased
+    forms of the own brand."""
+    from services.agent_center_bd_report_service import build_authority_map
+
+    per_sku_reports = [{"sku_key": "sku-1", "product_key": "prod-1"}]
+    probe_runs = [{
+        "provider": "gemini",
+        "probe_run_id": "probe-own",
+        "raw_runs": [{
+            "query": "best serum like BB Lab",
+            "parsed": {
+                "product_visible": False,
+                # LLM listed the merchant itself (exact + spaced + aliased) next
+                # to one real rival.
+                "competitors_listed": [
+                    "BB Lab Global", "BB Lab", "bblab", "GlowCo",
+                ],
+            },
+            "grounding_sources": [
+                {"uri": "https://forbes.com/best-serums", "title": "Best serums"},
+            ],
+            "grounding_chunks": ["https://forbes.com/best-serums"],
+            "url_match": {"in_grounding": False},
+            "axis_metadata": {"axis": "category", "source": "auto_generated", "sku_key": "sku-1"},
+        }],
+    }]
+    authority_map = build_authority_map(
+        per_sku_reports, {"sku-1": probe_runs},
+        merchant_host="bblab.com", merchant_brand="BB Lab Global",
+    )
+    hosts = {h["host"]: h for h in authority_map["skus"][0]["authority_hosts"]}
+    named = hosts["forbes.com"]["competitors_named"]
+    assert "GlowCo" in named, named
+    # None of the merchant's own-brand forms leak in as a "competitor".
+    lowered = {n.lower() for n in named}
+    assert lowered == {"glowco"}, named
+
+
 def test_host_is_first_party_recognizes_brand_storefront_affix():
     """BUG B (ANUKO 2026-07-02): a brand's second storefront whose domain is the
     brand name plus a generic storefront affix (tryanuko.com, anukoofficial.com,
