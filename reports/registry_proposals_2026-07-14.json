@@ -4,9 +4,9 @@
     "runs_scanned": 174,
     "merchants_scanned": 11,
     "hosts_seen": 938,
-    "hosts_already_classified": 108,
-    "hosts_unclassified": 830,
-    "proposals": 830,
+    "hosts_already_classified": 114,
+    "hosts_unclassified": 824,
+    "proposals": 824,
     "min_merchants": 1,
     "min_citations": 1,
     "review_required": true,
@@ -15,43 +15,6 @@
     "output_path": "reports/registry_proposals_2026-07-14.json"
   },
   "proposals": [
-    {
-      "host": "bluemercury.com",
-      "type": null,
-      "subtype": null,
-      "categories": [],
-      "tier": null,
-      "proposed_by": "heuristic:competitor_name_match_ambiguous",
-      "confidence": "none",
-      "rationale": "Host label 'bluemercury' matches competitor name(s) the engines returned (Bluemercury), BUT it is cited across 3 merchants \u2014 which is retailer/platform behaviour, not one rival's storefront. A human must pick: type=brand (rival's own store, and the narrative builder will stop pitching it) or type=retailer (a channel worth listing on). Typing it wrong in either direction is worse than leaving it unclassified, so the script refuses to guess.",
-      "review_status": "pending_human_review",
-      "evidence": {
-        "merchants": 3,
-        "citations": 18,
-        "sample_merchant_ids": [
-          "merch_924da2be8503e5f7",
-          "merch_cf2dbaf5774a524d",
-          "merch_efbc46b4619cfbdf"
-        ],
-        "sample_run_ids": [
-          "549ace84-edd2-4b86-9265-b31fd8f14260",
-          "08ce5e6d-72d0-45bd-977f-dcd4c2e400c1",
-          "5e35456e-f8e8-447e-ac00-7b35b7f3674d"
-        ],
-        "citation_roles": {
-          "competitor": 2,
-          "unclassified": 10
-        },
-        "report_host_types": {
-          "unclassified": 12
-        },
-        "is_competitor_rows": 2,
-        "competitor_names_matched": [
-          "Bluemercury"
-        ],
-        "sample_evidence_urls": []
-      }
-    },
     {
       "host": "dermstore.com",
       "type": null,
@@ -661,39 +624,6 @@
         },
         "report_host_types": {
           "unclassified": 3
-        },
-        "is_competitor_rows": 0,
-        "competitor_names_matched": [],
-        "sample_evidence_urls": []
-      }
-    },
-    {
-      "host": "independent.co.uk",
-      "type": null,
-      "subtype": null,
-      "categories": [],
-      "tier": null,
-      "proposed_by": "heuristic:unresolved",
-      "confidence": "none",
-      "rationale": "No rule fired \u2014 a human must type this host. Cited by 2 merchant(s) across 5 prompt citation(s).",
-      "review_status": "pending_human_review",
-      "evidence": {
-        "merchants": 2,
-        "citations": 5,
-        "sample_merchant_ids": [
-          "merch_924da2be8503e5f7",
-          "merch_cf2dbaf5774a524d"
-        ],
-        "sample_run_ids": [
-          "bcdfc4aa-a63c-4749-b57b-f90f9b7ad340",
-          "08ce5e6d-72d0-45bd-977f-dcd4c2e400c1",
-          "2e19eef5-6871-460a-a9ca-75ab3871e2bb"
-        ],
-        "citation_roles": {
-          "unclassified": 5
-        },
-        "report_host_types": {
-          "unclassified": 5
         },
         "is_competitor_rows": 0,
         "competitor_names_matched": [],
@@ -9641,38 +9571,6 @@
       }
     },
     {
-      "host": "oprahdaily.com",
-      "type": "editorial",
-      "subtype": "review_site",
-      "categories": [],
-      "tier": 3,
-      "proposed_by": "heuristic:editorial_label_token",
-      "confidence": "low",
-      "rationale": "Host label 'oprahdaily' contains an editorial token; tier 3 is the conservative default for an unknown editorial source.",
-      "review_status": "pending_human_review",
-      "evidence": {
-        "merchants": 1,
-        "citations": 3,
-        "sample_merchant_ids": [
-          "merch_efbc46b4619cfbdf"
-        ],
-        "sample_run_ids": [
-          "2748a6d3-a903-49cd-9bf7-1019e3cecab4",
-          "95c4f100-7f57-4c8e-a040-663ca622d717",
-          "0351a8a8-6baf-4c29-8759-d70de75bb316"
-        ],
-        "citation_roles": {
-          "unclassified": 3
-        },
-        "report_host_types": {
-          "unclassified": 3
-        },
-        "is_competitor_rows": 0,
-        "competitor_names_matched": [],
-        "sample_evidence_urls": []
-      }
-    },
-    {
       "host": "pharmavite.com",
       "type": null,
       "subtype": null,
@@ -11900,36 +11798,6 @@
         },
         "report_host_types": {
           "unclassified": 2
-        },
-        "is_competitor_rows": 0,
-        "competitor_names_matched": [],
-        "sample_evidence_urls": []
-      }
-    },
-    {
-      "host": "glowpick.com",
-      "type": null,
-      "subtype": null,
-      "categories": [],
-      "tier": null,
-      "proposed_by": "heuristic:unresolved",
-      "confidence": "none",
-      "rationale": "No rule fired \u2014 a human must type this host. Cited by 1 merchant(s) across 2 prompt citation(s).",
-      "review_status": "pending_human_review",
-      "evidence": {
-        "merchants": 1,
-        "citations": 2,
-        "sample_merchant_ids": [
-          "merch_924da2be8503e5f7"
-        ],
-        "sample_run_ids": [
-          "e3d3019a-d1be-4236-9d35-7df74cbb78bf"
-        ],
-        "citation_roles": {
-          "unclassified": 1
-        },
-        "report_host_types": {
-          "unclassified": 1
         },
         "is_competitor_rows": 0,
         "competitor_names_matched": [],
@@ -16599,36 +16467,6 @@
       }
     },
     {
-      "host": "cntraveler.com",
-      "type": null,
-      "subtype": null,
-      "categories": [],
-      "tier": null,
-      "proposed_by": "heuristic:unresolved",
-      "confidence": "none",
-      "rationale": "No rule fired \u2014 a human must type this host. Cited by 1 merchant(s) across 1 prompt citation(s).",
-      "review_status": "pending_human_review",
-      "evidence": {
-        "merchants": 1,
-        "citations": 1,
-        "sample_merchant_ids": [
-          "merch_924da2be8503e5f7"
-        ],
-        "sample_run_ids": [
-          "549ace84-edd2-4b86-9265-b31fd8f14260"
-        ],
-        "citation_roles": {
-          "unclassified": 1
-        },
-        "report_host_types": {
-          "unclassified": 1
-        },
-        "is_competitor_rows": 0,
-        "competitor_names_matched": [],
-        "sample_evidence_urls": []
-      }
-    },
-    {
       "host": "colorescience.com",
       "type": "brand",
       "subtype": "competitor_storefront",
@@ -16719,36 +16557,6 @@
         "competitor_names_matched": [
           "Conscious Skincare"
         ],
-        "sample_evidence_urls": []
-      }
-    },
-    {
-      "host": "consumerreports.org",
-      "type": null,
-      "subtype": null,
-      "categories": [],
-      "tier": null,
-      "proposed_by": "heuristic:unresolved",
-      "confidence": "none",
-      "rationale": "No rule fired \u2014 a human must type this host. Cited by 1 merchant(s) across 1 prompt citation(s).",
-      "review_status": "pending_human_review",
-      "evidence": {
-        "merchants": 1,
-        "citations": 1,
-        "sample_merchant_ids": [
-          "merch_924da2be8503e5f7"
-        ],
-        "sample_run_ids": [
-          "549ace84-edd2-4b86-9265-b31fd8f14260"
-        ],
-        "citation_roles": {
-          "unclassified": 1
-        },
-        "report_host_types": {
-          "unclassified": 1
-        },
-        "is_competitor_rows": 0,
-        "competitor_names_matched": [],
         "sample_evidence_urls": []
       }
     },
