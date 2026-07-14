@@ -582,6 +582,70 @@ def _outreach_moves(
     return moves[:6]
 
 
+# Registry subtypes for a host that PUBLISHES like editorial but is owned by a
+# brand: hair.com is L'Oreal's house media + storefront for Redken / Kerastase /
+# Matrix / Pureology, and its "Our 15 Favorite Hair Oils" roundups only ever
+# feature L'Oreal Pro brands.
+_BRAND_OWNED_MEDIA_SUBTYPES = frozenset({"brand_owned_media"})
+
+
+def _closed_channels(authority_map: Dict[str, Any]) -> List[Dict[str, Any]]:
+    """Cited hosts that look like an outreach target but can never cite you,
+    because a competitor owns them.
+
+    `_outreach_moves` already skips every `type=brand` host, and it is right to:
+    you don't pitch a rival's site. But skipping it SILENTLY throws away a
+    structural fact about the merchant's category — that the "editorial" ranking
+    the category is the competition, publishing under an editorial mask. A
+    merchant who never sees the host just wonders why the roundups never include
+    them. Name the closed door instead of quietly deleting it.
+
+    Deliberately narrow: only hosts the registry has explicitly typed as
+    brand-owned MEDIA. A rival's plain storefront is competitive intel (already
+    surfaced as a named competitor), not a channel the merchant would otherwise
+    have tried to pitch.
+    """
+    rows = authority_map.get("hosts") if isinstance(authority_map, dict) else None
+    out: List[Dict[str, Any]] = []
+    for row in rows if isinstance(rows, list) else []:
+        if not isinstance(row, dict) or row.get("first_party"):
+            continue
+        host = str(row.get("host") or "").strip()
+        if not host:
+            continue
+        cls = classify_host(host) or {}
+        if str(cls.get("type") or "").strip().lower() != "brand":
+            continue
+        if str(cls.get("subtype") or "").strip().lower() not in _BRAND_OWNED_MEDIA_SUBTYPES:
+            continue
+
+        cited = int(row.get("prompts_cited_count") or 0)
+        category = bool(row.get("cited_on_category_query"))
+        where = " on your category questions" if category else ""
+        cited_phrase = (
+            f"AI cited {host} in {cited} of your tested prompts{where}"
+            if cited else f"AI cites {host}{where}"
+        )
+        out.append({
+            "host": host,
+            "prompts_cited_count": cited,
+            "cited_on_category_query": category,
+            "why_closed": (
+                f"{cited_phrase}, and its 'best of' roundups read like independent "
+                "editorial — but a competitor owns the site, and those roundups only "
+                "ever feature the owner's own brands."
+            ),
+            "what_it_means": (
+                "No pitch can win a citation here: the recommendation is the owner's "
+                "marketing. Don't count it as a target you're failing to land — it is "
+                "a closed door, and the category is the thing to win instead."
+            ),
+            "detail": cls.get("coverage_note"),
+        })
+    out.sort(key=lambda c: (-(c["prompts_cited_count"] or 0), c["host"]))
+    return out[:4]
+
+
 def _vertical_pitch_targets(
     vertical_profile: VerticalProfile,
     who: Dict[str, Any],
@@ -706,6 +770,22 @@ def _where_youre_losing(
             "your own listings nor any independent source appears."
         )
     who = _who_ai_cites_instead(authority_map, vertical_profile=vertical_profile)
+
+    # A cited host that publishes editorial-shaped roundups but is owned by a
+    # rival is a structural fact about the category, not a missed pitch. State it
+    # — otherwise the merchant reads a "get cited" section that quietly omits the
+    # very source ranking their category and concludes their pitch was too weak.
+    closed_channels = _closed_channels(authority_map)
+    closed_note = None
+    if closed_channels:
+        hosts = ", ".join(c["host"] for c in closed_channels)
+        closed_note = (
+            f"{hosts} {'is' if len(closed_channels) == 1 else 'are'} cited for your "
+            "category but owned by a competitor — the roundups there are the owner's "
+            "marketing, so no pitch can win a citation. They are excluded from the "
+            "moves above on purpose."
+        )
+
     return {
         "summary": text,
         "independently_recommended_for_category": endorsed_category,
@@ -718,6 +798,11 @@ def _where_youre_losing(
         # the merchant — on branded OR category queries — from being framed as
         # "recommends a competitor over you".
         "outreach_moves": _outreach_moves(who, endorsement_hosts=all_endorsement_hosts),
+        # Cited hosts that _outreach_moves correctly refuses to pitch because a
+        # rival owns them — surfaced rather than silently dropped, so "why do the
+        # roundups never include me?" has an honest answer.
+        "closed_channels": closed_channels,
+        "closed_channels_note": closed_note,
         # Phase-4 T5 — the vertical's standing pitch-target list (profile
         # authority_hosts), status-stamped against this audit. Empty list for
         # verticals without a curated list (beauty today) — the panel hides it.
