@@ -1,25 +1,48 @@
-"""W2 tracking series — the basis-segmentation honesty is the point under test."""
+"""W2 tracking series — the basis-segmentation honesty is the point under test,
+plus the SKU-coverage axis: per-point panel disclosure + per-SKU mini-series."""
 
 from __future__ import annotations
 
 from datetime import datetime, timedelta, timezone
 
-from services.audit_tracking_series import build_tracking_series
+from services.audit_tracking_series import PER_SKU_SERIES_CAP, build_tracking_series
 
 _T0 = datetime(2026, 7, 1, 12, 0, tzinfo=timezone.utc)
 
 
-def _row(day, vis, att, cat, basis_id="sel_abc"):
+def _product(url, vis, att=None, cat=None, title=None):
+    """A per_product entry in the shape build_structured_report persists."""
+    return {
+        "merchant_pdp_url": url,
+        "product": {"title": title or url.rsplit("/", 1)[-1]},
+        "verdict": {
+            "visibility_score": vis,
+            "attribution_score": att,
+            "category_visibility_score": cat,
+        },
+    }
+
+
+def _row(day, vis, att, cat, basis_id="sel_abc", per_product=None, failed=None):
+    report = {
+        "prompt_basis": {"selected_set_id": basis_id} if basis_id else {},
+        "brand_rollup": {"citation_by_provider": {"gemini": {"median": vis}}},
+    }
+    if per_product is not None:
+        # Real reports carry prompt_basis on each per-product entry (audit_delta's
+        # _primary_report reads per_product[0]), not at the payload top level.
+        report["per_product"] = [
+            {**p, "prompt_basis": {"selected_set_id": basis_id} if basis_id else {}}
+            for p in per_product
+        ]
+        report["failed"] = failed or []
     return {
         "run_id": f"run-{day}",
         "requested_at": _T0 + timedelta(days=day),
         "visibility": vis,
         "attribution": att,
         "category_visibility": cat,
-        "report_jsonb": {
-            "prompt_basis": {"selected_set_id": basis_id} if basis_id else {},
-            "brand_rollup": {"citation_by_provider": {"gemini": {"median": vis}}},
-        },
+        "report_jsonb": report,
     }
 
 
@@ -94,3 +117,159 @@ def test_empty_history():
     series = build_tracking_series([])
     assert series["points"] == []
     assert series["is_baseline_only"] is True
+    assert series["per_sku"] == {}
+    assert series["panel_changes"] == []
+    assert series["per_sku_truncated"] is False
+
+
+# ---------------------------------------------------------------------------
+# SKU-coverage axis
+# ---------------------------------------------------------------------------
+
+_URL_A = "https://shop.example.com/products/serum"
+_URL_B = "https://shop.example.com/products/toner"
+_URL_C = "https://shop.example.com/products/mask"
+
+
+def test_point_carries_sku_coverage():
+    series = build_tracking_series([
+        _row(0, 60, 45, 55, per_product=[
+            _product(_URL_A, 70, 50, 60),
+            _product(_URL_B, 50, 40, 50),
+        ], failed=[{"pdp_url": _URL_C, "error": "probe failed"}]),
+    ])
+    p = series["points"][0]
+    assert p["sku_count"] == 2                    # what the averages are over
+    assert p["attempted_sku_count"] == 3          # measured + failed
+    assert p["panel_id"] is not None
+
+
+def test_pre_panel_era_rows_have_unknown_coverage():
+    # A report with no per_product (legacy shape) → coverage is unknown, not 0.
+    series = build_tracking_series([_row(0, 60, 45, 55)])
+    p = series["points"][0]
+    assert p["sku_count"] is None
+    assert p["attempted_sku_count"] is None
+    assert p["panel_id"] is None
+
+
+def test_panel_id_is_order_independent_and_stable():
+    series = build_tracking_series([
+        _row(0, 60, 45, 55, per_product=[_product(_URL_A, 70), _product(_URL_B, 50)]),
+        _row(30, 62, 47, 57, per_product=[_product(_URL_B, 52), _product(_URL_A, 72)]),
+    ])
+    pts = series["points"]
+    assert pts[0]["panel_id"] == pts[1]["panel_id"]   # same set, different order
+    assert series["panel_changes"] == []
+
+
+def test_panel_change_is_marked():
+    series = build_tracking_series([
+        _row(0, 60, 45, 55, per_product=[_product(_URL_A, 70), _product(_URL_B, 50)]),
+        _row(30, 40, 30, 35, per_product=[_product(_URL_A, 70), _product(_URL_C, 10)]),
+    ])
+    assert series["panel_changes"] == [1]             # composition shift, not a drop
+
+
+def test_panel_change_never_asserted_across_unknown():
+    # legacy row (no panel) between two known panels → no false "changed" marker
+    series = build_tracking_series([
+        _row(0, 60, 45, 55, per_product=[_product(_URL_A, 70)]),
+        _row(30, 62, 47, 57),                                        # unknown panel
+        _row(60, 64, 49, 59, per_product=[_product(_URL_A, 74)]),
+    ])
+    assert series["panel_changes"] == []
+
+
+def test_per_sku_series_explodes_run_history():
+    series = build_tracking_series([
+        _row(0, 60, 45, 55, per_product=[
+            _product(_URL_A, 70, 50, 60, title="Serum"),
+            _product(_URL_B, 50, 40, 50, title="Toner"),
+        ]),
+        _row(30, 68, 52, 60, per_product=[
+            _product(_URL_A, 76, 54, 64, title="Serum"),
+        ]),
+    ])
+    assert len(series["per_sku"]) == 2
+    serum = next(s for s in series["per_sku"].values() if s["title"] == "Serum")
+    toner = next(s for s in series["per_sku"].values() if s["title"] == "Toner")
+    # SKU points only cover runs that measured the SKU
+    assert [p["scores"]["visibility"] for p in serum["points"]] == [70, 76]
+    assert [p["run_id"] for p in toner["points"]] == ["run-0"]
+    # per-SKU scores are the SKU's own verdict, not the brand average
+    assert serum["points"][1]["scores"] == {
+        "visibility": 76, "attribution": 54, "category_visibility": 64,
+    }
+    assert serum["pdp_url"] == _URL_A
+
+
+def test_per_sku_comparability_follows_the_basis_rule():
+    series = build_tracking_series([
+        _row(0, 60, 45, 55, basis_id="sel_old", per_product=[_product(_URL_A, 70)]),
+        _row(30, 62, 47, 57, basis_id="sel_old", per_product=[_product(_URL_A, 72)]),
+        _row(60, 40, 30, 35, basis_id="sel_new", per_product=[_product(_URL_A, 42)]),
+    ])
+    (sku,) = series["per_sku"].values()
+    assert [p["comparable_with_prev"] for p in sku["points"]] == [False, True, False]
+    assert sku["basis_changes"] == [2]
+    assert [seg["indices"] for seg in sku["segments"]] == [[0, 1], [2]]
+
+
+def test_per_sku_path_case_is_identity():
+    # URL paths are case-sensitive: /Serum and /serum are DIFFERENT products.
+    # Only scheme+host case (and a trailing slash) may be normalized away.
+    series = build_tracking_series([
+        _row(0, 60, 45, 55, per_product=[_product(_URL_A, 70)]),
+        _row(30, 62, 47, 57, per_product=[
+            _product("https://shop.example.com/products/SERUM", 72),
+        ]),
+    ])
+    assert len(series["per_sku"]) == 2
+
+
+def test_attempted_count_prefers_aggregate_products_count():
+    # aggregate.products_count (what the run TRIED) outranks the failed[] fallback.
+    row = _row(0, 60, 45, 55, per_product=[_product(_URL_A, 70)])
+    row["report_jsonb"]["aggregate"] = {"products_count": 5}
+    series = build_tracking_series([row])
+    assert series["points"][0]["attempted_sku_count"] == 5
+
+
+def test_per_sku_url_normalization_joins_series():
+    # Trailing slash / host case must not split one product into two series.
+    series = build_tracking_series([
+        _row(0, 60, 45, 55, per_product=[_product(_URL_A, 70)]),
+        _row(30, 62, 47, 57, per_product=[
+            _product("https://SHOP.EXAMPLE.COM/products/serum/", 72),
+        ]),
+    ])
+    assert len(series["per_sku"]) == 1
+    (sku,) = series["per_sku"].values()
+    assert len(sku["points"]) == 2
+
+
+def test_per_sku_cap_keeps_most_covered_and_flags_truncation():
+    urls = [f"https://shop.example.com/products/sku-{i}" for i in range(PER_SKU_SERIES_CAP + 5)]
+    rows = [
+        # run 0 measures every SKU once; run 1 re-measures only sku-0 → sku-0
+        # has the most points and must survive the cap.
+        _row(0, 60, 45, 55, per_product=[_product(u, 50) for u in urls]),
+        _row(30, 62, 47, 57, per_product=[_product(urls[0], 52)]),
+    ]
+    series = build_tracking_series(rows)
+    assert series["per_sku_truncated"] is True
+    assert len(series["per_sku"]) == PER_SKU_SERIES_CAP
+    assert any(len(s["points"]) == 2 for s in series["per_sku"].values())
+
+
+def test_brand_points_unchanged_by_sku_axis():
+    # The additive fields must not disturb the existing contract.
+    series = build_tracking_series([
+        _row(0, 60, 45, 55, per_product=[_product(_URL_A, 70)]),
+        _row(30, 68, 52, 60, per_product=[_product(_URL_A, 76)]),
+    ])
+    pts = series["points"]
+    assert pts[1]["scores"] == {"visibility": 68, "attribution": 52, "category_visibility": 60}
+    assert pts[1]["provider_scores"] == {"gemini": 68}
+    assert [p["comparable_with_prev"] for p in pts] == [False, True]
