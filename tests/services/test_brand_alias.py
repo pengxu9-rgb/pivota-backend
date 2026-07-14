@@ -159,6 +159,53 @@ def test_accented_brand_matches_next_to_a_footnote_marker():
     assert text_mentions_brand("estée lauder² night repair", estee)
 
 
+def test_undecomposable_letters_are_romanized_not_deleted():
+    """ß æ ø œ ł đ carry the diacritic INSIDE the letterform, so Unicode gives
+    them no decomposition and the accent fold is a no-op on them — the [^a-z0-9]
+    collapse then DELETED them, mangling the brand ('Æther Beauty' → 'ther
+    beauty', 'Straße' → 'stra e'). They are transliterated instead."""
+    assert derive_brand_aliases("Æther Beauty")[0] == "aether beauty"
+    assert derive_brand_aliases("Straße Berlin")[0] == "strasse berlin"
+    assert derive_brand_aliases("Søstrene Grene")[0] == "sostrene grene"
+    assert derive_brand_aliases("Łódź Cosmetics")[0] == "lodz cosmetics"
+    assert derive_brand_aliases("Œuvre Skin")[0] == "oeuvre skin"
+    # a letter carrying BOTH a stroke and a combining mark: decompose, then map
+    assert derive_brand_aliases("Ǣther")[0] == "aether"
+
+
+def test_undecomposable_brand_matches_both_spellings_and_its_host():
+    """The romanized alias is what the ASCII world actually writes — answer copy
+    that spells the brand out, and the registrable host label, which is where the
+    Kérastase-class miss (PR #1391) did its damage."""
+    aether = derive_brand_aliases("Æther Beauty", "aetherbeauty.com")
+    assert text_mentions_brand("shop æther beauty crystal palette", aether)   # as written
+    assert text_mentions_brand("shop aether beauty crystal palette", aether)  # ASCII
+    assert "aetherbeauty" in aether                                           # host label
+    strasse = derive_brand_aliases("Straße Berlin")
+    assert text_mentions_brand("straße berlin lipstick", strasse)
+    assert text_mentions_brand("strasse berlin lipstick", strasse)
+
+
+def test_legacy_mangled_alias_is_kept_so_no_match_is_removed():
+    """The mangled spelling is junk that MATCHES: 'ther beauty' hits raw 'æther
+    beauty', because the deleted 'æ' reads as a word boundary to the [a-z0-9]
+    lookarounds. Dropping it for the correct 'aether beauty' would REMOVE a match
+    the engine makes today, which the module invariant forbids — so we keep both.
+    ASCII brands must not pick up any extra alias from this."""
+    assert derive_brand_aliases("Æther Beauty") == (
+        "aether beauty", "aetherbeauty", "ther beauty", "therbeauty",
+    )
+    assert derive_brand_aliases("COSRX") == ("cosrx",)
+    assert derive_brand_aliases("Kérastase") == ("kerastase",)
+
+
+def test_romanizing_the_text_cannot_eat_a_word_boundary():
+    """Transliteration can DESTROY a boundary the accent fold kept: 'ø' ends a
+    word, but romanized to 'o' it glues on. text_mentions_brand searches the
+    marks-only spelling too, so the match survives."""
+    assert text_mentions_brand("kérastaseø", derive_brand_aliases("Kérastase"))
+
+
 # --------------------------------------------------------------------------
 # text_mentions_brand
 # --------------------------------------------------------------------------
