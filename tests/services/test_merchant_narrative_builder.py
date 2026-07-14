@@ -841,3 +841,63 @@ def test_cocited_rival_host_copy_is_grounding_not_personal_endorsement():
         assert "grounds answers that recommend competitors over you" in m["why"]
         assert "it recommends a competitor over you" not in m["why"]
         assert m["already_endorses_you"] is False
+
+
+def test_branded_only_endorser_not_framed_as_rival_recommendation():
+    """Grounding defect 1c (#1382 follow-up): a host that endorsed the merchant
+    ONLY on branded queries lives in `endorsement_hosts` but not
+    `endorsement_category_hosts`. When ANY category endorsement also exists, the
+    category-preferred selection used for the summary copy would drop the
+    branded-only endorser from the outreach-suppression set — so it could still
+    be framed as 'recommends a competitor over you' despite already endorsing the
+    merchant. The suppression set must UNION both lists.
+
+    Also pins the intended split: the category-recommendation summary copy (and
+    the `endorsement_hosts` output field paired with it) stay CATEGORY-scoped —
+    the branded-only host is deliberately absent there, only present in the
+    suppression path.
+    """
+    from services.merchant_narrative_builder import _where_youre_losing
+
+    # A category endorser (drives the summary copy) AND a branded-only endorser
+    # that also grounded a rival — the union must protect the latter.
+    summary = {
+        "independently_recommended_for_category": True,
+        "endorsement_category_hosts": ["allure.com"],
+        "endorsement_hosts": ["allure.com", "byrdie.com"],
+        "findability_hosts": ["merchant.com"],
+    }
+    authority_map = {
+        "hosts": [
+            {
+                "host": "byrdie.com",
+                "citation_role": "independent_editorial",
+                "recommendation_class": "recommends",
+                "prompts_cited_count": 2,
+                "cited_on_category_query": False,
+            },
+        ],
+        "skus": [
+            {
+                "sku_key": "sku-1",
+                "authority_hosts": [
+                    {"host": "byrdie.com", "competitors_named": ["Rival Beauty"]},
+                ],
+            },
+        ],
+    }
+    where = _where_youre_losing("Aruen", authority_map, summary)
+
+    # The branded-only endorser's outreach move is reframed as extend-the-win,
+    # never "recommends a competitor over you".
+    moves = {m["host"]: m for m in where["outreach_moves"]}
+    byrdie = moves["byrdie.com"]
+    assert byrdie["already_endorses_you"] is True
+    assert "recommends a competitor" not in byrdie["why"]
+    assert "already recommends you" in byrdie["why"]
+
+    # Intended split is preserved: the category-recommendation summary + the
+    # paired output field stay category-scoped (branded-only host absent there).
+    assert "allure.com" in where["summary"]
+    assert "byrdie.com" not in where["summary"]
+    assert where["endorsement_hosts"] == ["allure.com"]
