@@ -2105,3 +2105,78 @@ def test_all_per_sku_probes_failed_catches_wholesale_429():
 
     # A fully successful run never fires.
     assert _all_per_sku_probes_failed({"sku-1": _probe_runs()}) is False
+
+
+# ---------------------------------------------------------------------
+# _failing_prompts own-brand competitor filter (#1384 follow-up)
+#
+# competitors_named on failing prompts feeds rival-framing copy
+# (audit_playbook pitch drafts, next_best_action competitor phrases via
+# failed_queries_detailed). The merchant's own brand/aliases must never
+# surface there as a named "competitor".
+# ---------------------------------------------------------------------
+
+
+def _failing_run(query: str, competitors: List[str]) -> Dict[str, Any]:
+    # A run that is NOT cited (no correct_sku / sku_mentioned / grounding /
+    # product_visible) so _failing_prompts keeps it, carrying competitors.
+    return {
+        "query": query,
+        "parsed": {
+            "correct_sku": False,
+            "sku_mentioned": False,
+            "competitors_appearing": list(competitors),
+        },
+        "url_match": {"in_grounding": False},
+    }
+
+
+def test_failing_prompts_strips_own_brand_and_aliases():
+    from services.agent_center_bd_report_service import _failing_prompts
+    from services.brand_alias import derive_brand_aliases
+
+    aliases = derive_brand_aliases("BB Lab Global", "bblabglobal.com", None)
+    runs = [
+        # "BB Lab Global" (word-boundary own-brand), de-spaced alias "BBLab"
+        # (alias-only — not a substring of the brand), and a genuine rival.
+        _failing_run("best korean collagen serum", ["BB Lab Global", "BBLab", "Torriden"]),
+    ]
+    out = _failing_prompts(
+        runs,
+        brand_lower="bb lab global",
+        brand_aliases=aliases,
+    )
+    assert len(out) == 1
+    named = out[0]["competitors_named"]
+    assert "BB Lab Global" not in named
+    assert "BBLab" not in named
+    assert named == ["Torriden"]
+
+
+def test_failing_prompts_without_identity_keeps_list_unfiltered():
+    # Back-compat: no brand identity supplied => no own-brand stripping, list
+    # passes through as before (the pre-fix behavior).
+    from services.agent_center_bd_report_service import _failing_prompts
+
+    runs = [_failing_run("q1", ["BB Lab Global", "Torriden"])]
+    out = _failing_prompts(runs)
+    assert out[0]["competitors_named"] == ["BB Lab Global", "Torriden"]
+
+
+def test_strip_own_brand_competitors_helper_matrix():
+    from services.agent_center_bd_report_service import _strip_own_brand_competitors
+    from services.brand_alias import derive_brand_aliases
+
+    aliases = derive_brand_aliases("BB Lab Global", "bblabglobal.com", ("Anua",))
+    names = ["BB Lab Global Inc", "BBLab", "Torriden", "", 123, "Anua"]
+    out = _strip_own_brand_competitors(names, "bb lab global", aliases)
+    # "BB Lab Global Inc" (word-boundary brand), "BBLab" (de-spaced alias) and
+    # "Anua" (vendor alias) dropped; "" and non-str 123 skipped; order kept.
+    assert out == ["Torriden"]
+
+    # Word-boundary guard: a brand (len>=4) must not erase a genuine rival that
+    # merely STARTS with the brand's letters as part of a larger word — the
+    # plain substring the run-brand tally uses would over-strip "Glowbiotics"
+    # for brand "Glow"; the word boundary keeps it.
+    kept = _strip_own_brand_competitors(["Glowbiotics"], "glow", ())
+    assert kept == ["Glowbiotics"]

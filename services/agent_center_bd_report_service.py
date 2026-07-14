@@ -6064,7 +6064,13 @@ def _grounding_evidence(probe_runs: Any, cap: int = 12) -> List[Dict[str, Any]]:
     return evidence
 
 
-def _failing_prompts(probe_runs: Any, cap: int = 20) -> List[Dict[str, Any]]:
+def _failing_prompts(
+    probe_runs: Any,
+    cap: int = 20,
+    *,
+    brand_lower: str = "",
+    brand_aliases: Tuple[str, ...] = (),
+) -> List[Dict[str, Any]]:
     out: List[Dict[str, Any]] = []
     for run in _flatten_probe_runs(probe_runs):
         parsed = run.get("parsed") if isinstance(run.get("parsed"), dict) else {}
@@ -6100,7 +6106,19 @@ def _failing_prompts(probe_runs: Any, cap: int = 20) -> List[Dict[str, Any]]:
                 else None
             ),
             "grounding_sources": run.get("grounding_sources") or [],
-            "competitors_named": parsed.get("competitors_listed") or parsed.get("competitors_appearing") or run.get("competitors_listed") or [],
+            # Strip the merchant's own brand/aliases: this list feeds rival-
+            # framing copy (playbook pitch drafts + next_best_action competitor
+            # phrases via failed_queries_detailed), where surfacing the merchant
+            # as its own "competitor" reads as a bug. Same own-brand filter as
+            # the run-brand tally / _build_failed_queries_detailed (#1384).
+            "competitors_named": _strip_own_brand_competitors(
+                parsed.get("competitors_listed")
+                or parsed.get("competitors_appearing")
+                or run.get("competitors_listed")
+                or [],
+                brand_lower,
+                brand_aliases,
+            ),
         })
         if len(out) >= cap:
             break
@@ -6916,7 +6934,29 @@ async def build_per_sku_report(
         primary_gaps = [
             g for g in primary_gaps if g.get("dimension") != "routability"
         ]
-    failing_prompts = _failing_prompts(probe_runs)
+    # Merchant identity so failing_prompts.competitors_named never surfaces the
+    # merchant's own brand/aliases as a rival (the list feeds NBA / playbook
+    # framing). Derived from the resolved SKU identity anchors + product, same
+    # brand_lower + brand_aliases shape _strip_own_brand_competitors expects.
+    _fp_anchors = identity.get("anchors") if isinstance(identity, dict) else {}
+    _fp_anchors = _fp_anchors if isinstance(_fp_anchors, dict) else {}
+    _fp_brand = _fp_anchors.get("brand") or product.get("brand") or product.get("vendor") or ""
+    _fp_host = (
+        _fp_anchors.get("domain")
+        or normalize_host(product.get("canonical_url") or product.get("pdp_url"))
+    )
+    _fp_vendor = product.get("vendor")
+    _fp_brand_lower = str(_fp_brand or "").strip().lower()
+    _fp_brand_aliases = derive_brand_aliases(
+        _fp_brand or None,
+        _fp_host,
+        _clean_identity_tuple((_fp_vendor,) if _fp_vendor else None),
+    )
+    failing_prompts = _failing_prompts(
+        probe_runs,
+        brand_lower=_fp_brand_lower,
+        brand_aliases=_fp_brand_aliases,
+    )
     verify_summary_out = verify_summary or _verify_skipped_summary(
         reason="not_run",
         positives_count=len(_citation_positive_verify_candidates(sku_ctx, probe_runs)),
@@ -15364,6 +15404,7 @@ def _build_failed_queries_detailed(
     merchant_brand: Optional[str],
     merchant_host: Optional[str],
     merchant_category: Optional[str],
+    merchant_vendors: Optional[Tuple[str, ...]] = None,
     cap: int = 10,
 ) -> List[Dict[str, Any]]:
     """For each attribution-test query where the merchant's URL was
@@ -15381,7 +15422,8 @@ def _build_failed_queries_detailed(
                            field (it's already in `top_cited_host`)
       competitors_named  : up to 5 competitor brand names from
                            parsed.competitors_appearing, with the
-                           merchant's own brand filtered out
+                           merchant's own brand + aliases filtered out
+                           (alias-aware via _strip_own_brand_competitors)
 
     Capped at `cap` entries (default 10) to keep response size bounded
     even on large probe runs.
@@ -15389,6 +15431,15 @@ def _build_failed_queries_detailed(
     out: List[Dict[str, Any]] = []
     brand_lower = (merchant_brand or "").strip().lower()
     host_lower = (merchant_host or "").strip().lower()
+    # Alias-aware own-brand strip: the pre-fix substring-only skip missed
+    # aliased/de-spaced own-brand forms ("BB Lab" for a merchant recorded as
+    # "BB Lab Global"), leaking the merchant into its own who-cites-instead
+    # list. Reuse the shared #1384 filter (brand_lower + derived aliases).
+    brand_aliases = derive_brand_aliases(
+        merchant_brand or None,
+        merchant_host,
+        _clean_identity_tuple(merchant_vendors),
+    )
 
     for run in attribution_runs or []:
         parsed = run.get("parsed") or {}
@@ -15424,19 +15475,11 @@ def _build_failed_queries_detailed(
         if top_host and host_lower and host_lower in top_host.lower():
             continue
 
-        competitors: List[str] = []
-        for raw in parsed.get("competitors_appearing") or []:
-            if not isinstance(raw, str):
-                continue
-            name = raw.strip()
-            if not name:
-                continue
-            name_lower = name.lower()
-            if brand_lower and (brand_lower in name_lower or name_lower in brand_lower):
-                continue
-            competitors.append(name)
-            if len(competitors) >= 5:
-                break
+        competitors = _strip_own_brand_competitors(
+            parsed.get("competitors_appearing") or [],
+            brand_lower,
+            brand_aliases,
+        )[:5]
 
         host_classification: Dict[str, Any]
         if top_host:
