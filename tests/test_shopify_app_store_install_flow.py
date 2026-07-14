@@ -318,3 +318,282 @@ async def test_shopify_oauth_callback_redirects_instead_of_rendering_json(
         assert f"reason={expected_reason}" in location, location
         # The internal detail must not leak into the browser URL.
         assert "Shopify" not in location and "OAuth" not in location
+
+
+@pytest.mark.asyncio
+async def test_claim_token_roundtrip_and_tamper_rejection(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The claim token must be unforgeable — it is the only proof of install."""
+    import routes.merchant_store_connections as module
+    from fastapi import HTTPException
+
+    monkeypatch.setattr(module.settings, "jwt_secret_key", "test-secret")
+
+    token = module._sign_claim_token(
+        {
+            "typ": "pivota_shopify_claim",
+            "jti": "jti-1",
+            "merchant_id": "merch_shopify_abc",
+            "shop_domain": "demo-shop.myshopify.com",
+            "iat": 0,
+            "exp": 9999999999,
+        }
+    )
+    payload = module._verify_claim_token(token)
+    assert payload["merchant_id"] == "merch_shopify_abc"
+    assert payload["shop_domain"] == "demo-shop.myshopify.com"
+
+    # Flipping the payload without re-signing must fail.
+    msg, sig = token.split(".")
+    forged_msg = module._b64url(
+        b'{"typ":"pivota_shopify_claim","jti":"jti-1","merchant_id":"merch_victim",'
+        b'"shop_domain":"demo-shop.myshopify.com","iat":0,"exp":9999999999}'
+    )
+    with pytest.raises(HTTPException) as exc:
+        module._verify_claim_token(f"{forged_msg}.{sig}")
+    assert exc.value.status_code == 401
+
+    # A token signed with a different key must fail.
+    monkeypatch.setattr(module.settings, "jwt_secret_key", "other-secret")
+    with pytest.raises(HTTPException):
+        module._verify_claim_token(token)
+
+    # A non-claim token type must fail.
+    monkeypatch.setattr(module.settings, "jwt_secret_key", "test-secret")
+    wrong_type = module._sign_claim_token({"typ": "something_else", "jti": "x"})
+    with pytest.raises(HTTPException):
+        module._verify_claim_token(wrong_type)
+
+
+@pytest.mark.asyncio
+async def test_claim_rejects_replayed_token(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A consumed claim token cannot re-bind the store (the UPDATE is the lock)."""
+    import routes.merchant_store_connections as module
+    from fastapi import HTTPException
+
+    monkeypatch.setattr(module.settings, "jwt_secret_key", "test-secret")
+
+    class FakeDatabase:
+        async def fetch_one(self, query: str, values: dict):
+            if "UPDATE shopify_store_claim_tokens" in query:
+                return None  # already used / expired -> no row returned
+            raise AssertionError(f"unexpected query before token consumption: {query}")
+
+        async def execute(self, *args, **kwargs):
+            raise AssertionError("must not write anything when the token is spent")
+
+    async def fake_ensure_tables():
+        return None
+
+    monkeypatch.setattr(module, "database", FakeDatabase())
+    monkeypatch.setattr(module, "_ensure_shopify_oauth_tables", fake_ensure_tables)
+
+    token = module._sign_claim_token(
+        {
+            "typ": "pivota_shopify_claim",
+            "jti": "jti-used",
+            "merchant_id": "merch_shopify_abc",
+            "shop_domain": "demo-shop.myshopify.com",
+            "iat": 0,
+            "exp": 9999999999,
+        }
+    )
+
+    with pytest.raises(HTTPException) as exc:
+        await module.claim_shopify_store(
+            module.ShopifyStoreClaimRequest(
+                claim_token=token,
+                email="reviewer@example.com",
+                password="a-good-password",
+            )
+        )
+    assert exc.value.status_code == 400
+    assert "already been used" in str(exc.value.detail)
+
+
+@pytest.mark.asyncio
+async def test_claim_creates_account_and_binds_shell_merchant(monkeypatch: pytest.MonkeyPatch) -> None:
+    import routes.merchant_store_connections as module
+
+    monkeypatch.setattr(module.settings, "jwt_secret_key", "test-secret")
+
+    executed: list = []
+
+    class FakeDatabase:
+        async def fetch_one(self, query: str, values: dict):
+            if "UPDATE shopify_store_claim_tokens" in query:
+                return {"merchant_id": "merch_shopify_abc"}
+            if "FROM users WHERE email" in query:
+                return None  # brand-new account
+            raise AssertionError(f"unexpected query: {query}")
+
+        async def execute(self, query: str, values: dict = None):
+            executed.append((query, values or {}))
+
+    async def fake_ensure_tables():
+        return None
+
+    monkeypatch.setattr(module, "database", FakeDatabase())
+    monkeypatch.setattr(module, "_ensure_shopify_oauth_tables", fake_ensure_tables)
+
+    token = module._sign_claim_token(
+        {
+            "typ": "pivota_shopify_claim",
+            "jti": "jti-fresh",
+            "merchant_id": "merch_shopify_abc",
+            "shop_domain": "demo-shop.myshopify.com",
+            "iat": 0,
+            "exp": 9999999999,
+        }
+    )
+
+    result = await module.claim_shopify_store(
+        module.ShopifyStoreClaimRequest(
+            claim_token=token,
+            email="Reviewer@Example.com",
+            password="a-good-password",
+            full_name="Shopify Reviewer",
+        )
+    )
+
+    assert result["status"] == "success"
+    assert result["token"]
+    assert result["user"]["merchant_id"] == "merch_shopify_abc"
+    assert result["user"]["email"] == "reviewer@example.com"  # normalised
+
+    inserts = [q for q, _ in executed if "INSERT INTO users" in q]
+    assert len(inserts) == 1, "should create exactly one user row"
+    # The placeholder @pivota.invalid contact must be replaced with the real email.
+    contact_updates = [v for q, v in executed if "UPDATE merchant_onboarding" in q]
+    assert contact_updates and contact_updates[0]["email"] == "reviewer@example.com"
+
+    # The stored password must be hashed, never the plaintext.
+    user_values = [v for q, v in executed if "INSERT INTO users" in q][0]
+    assert user_values["password_hash"] != "a-good-password"
+    assert module.verify_bcrypt_password("a-good-password", user_values["password_hash"])
+
+
+@pytest.mark.asyncio
+async def test_claim_with_existing_merchant_moves_store_not_account(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Someone who already runs a merchant keeps it and just gains the store."""
+    import routes.merchant_store_connections as module
+
+    monkeypatch.setattr(module.settings, "jwt_secret_key", "test-secret")
+    existing_hash = module.hash_password("a-good-password")
+    reassigned: dict = {}
+
+    class FakeDatabase:
+        async def fetch_one(self, query: str, values: dict):
+            if "UPDATE shopify_store_claim_tokens" in query:
+                return {"merchant_id": "merch_shopify_abc"}
+            if "FROM users WHERE email" in query:
+                return {
+                    "id": 7,
+                    "email": "owner@example.com",
+                    "password_hash": existing_hash,
+                    "full_name": "Owner",
+                    "role": "merchant",
+                    "active": True,
+                    "merchant_id": "merch_real_123",
+                }
+            raise AssertionError(f"unexpected query: {query}")
+
+        async def execute(self, query: str, values: dict = None):
+            if "UPDATE users" in query:
+                raise AssertionError("must not repoint an existing account at the shell merchant")
+
+    async def fake_ensure_tables():
+        return None
+
+    async def fake_reassign(*, from_merchant_id, to_merchant_id, shop_domain):
+        reassigned.update(
+            {"from": from_merchant_id, "to": to_merchant_id, "shop": shop_domain}
+        )
+
+    monkeypatch.setattr(module, "database", FakeDatabase())
+    monkeypatch.setattr(module, "_ensure_shopify_oauth_tables", fake_ensure_tables)
+    monkeypatch.setattr(module, "_reassign_store_to_merchant", fake_reassign)
+
+    token = module._sign_claim_token(
+        {
+            "typ": "pivota_shopify_claim",
+            "jti": "jti-existing",
+            "merchant_id": "merch_shopify_abc",
+            "shop_domain": "demo-shop.myshopify.com",
+            "iat": 0,
+            "exp": 9999999999,
+        }
+    )
+
+    result = await module.claim_shopify_store(
+        module.ShopifyStoreClaimRequest(
+            claim_token=token,
+            email="owner@example.com",
+            password="a-good-password",
+        )
+    )
+
+    assert result["user"]["merchant_id"] == "merch_real_123"
+    assert reassigned == {
+        "from": "merch_shopify_abc",
+        "to": "merch_real_123",
+        "shop": "demo-shop.myshopify.com",
+    }
+
+
+@pytest.mark.asyncio
+async def test_claim_rejects_wrong_password_for_existing_account(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The claim token proves the install, NOT ownership of an arbitrary account."""
+    import routes.merchant_store_connections as module
+    from fastapi import HTTPException
+
+    monkeypatch.setattr(module.settings, "jwt_secret_key", "test-secret")
+
+    class FakeDatabase:
+        async def fetch_one(self, query: str, values: dict):
+            if "UPDATE shopify_store_claim_tokens" in query:
+                return {"merchant_id": "merch_shopify_abc"}
+            if "FROM users WHERE email" in query:
+                return {
+                    "id": 7,
+                    "email": "victim@example.com",
+                    "password_hash": module.hash_password("the-real-password"),
+                    "full_name": "Victim",
+                    "role": "merchant",
+                    "active": True,
+                    "merchant_id": "merch_victim",
+                }
+            raise AssertionError(f"unexpected query: {query}")
+
+        async def execute(self, *args, **kwargs):
+            raise AssertionError("must not mutate anything on a failed auth")
+
+    async def fake_ensure_tables():
+        return None
+
+    monkeypatch.setattr(module, "database", FakeDatabase())
+    monkeypatch.setattr(module, "_ensure_shopify_oauth_tables", fake_ensure_tables)
+
+    token = module._sign_claim_token(
+        {
+            "typ": "pivota_shopify_claim",
+            "jti": "jti-x",
+            "merchant_id": "merch_shopify_abc",
+            "shop_domain": "demo-shop.myshopify.com",
+            "iat": 0,
+            "exp": 9999999999,
+        }
+    )
+
+    with pytest.raises(HTTPException) as exc:
+        await module.claim_shopify_store(
+            module.ShopifyStoreClaimRequest(
+                claim_token=token,
+                email="victim@example.com",
+                password="not-the-password",
+            )
+        )
+    assert exc.value.status_code == 401
