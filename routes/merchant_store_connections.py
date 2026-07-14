@@ -33,8 +33,6 @@ logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/integrations", tags=["Merchant Integrations"])
 
 _SHOPIFY_OAUTH_STATE_TTL_SECONDS = 30 * 60
-_SHOPIFY_INSTALL_TOKEN_TTL_SECONDS = 15 * 60
-_SHOPIFY_OAUTH_ALLOWED_MERCHANT_IDS_DEFAULT: set[str] = set()
 _SHOPIFY_OAUTH_REQUIRED_WEBHOOK_TOPICS = [
     "orders/create",
     "orders/updated",
@@ -104,13 +102,6 @@ async def _create_storefront_access_token_best_effort(*, shop_domain: str, acces
         return None
 
 
-def _allowed_oauth_merchants() -> set[str]:
-    raw = (os.getenv("SHOPIFY_OAUTH_ALLOWED_MERCHANT_IDS") or "").strip()
-    if not raw:
-        return set(_SHOPIFY_OAUTH_ALLOWED_MERCHANT_IDS_DEFAULT)
-    return {x.strip() for x in raw.split(",") if x.strip()}
-
-
 def _canonicalize_shop_domain(value: Optional[str]) -> Optional[str]:
     if not value:
         return None
@@ -151,7 +142,7 @@ class ShopifyAppCreds:
 # a custom app locked to a single org and CANNOT install on third-party stores,
 # so it is never used for OAuth — the write/BYO tier uses the custom-token
 # /connect path (merchant-supplied client_id+secret), not resolve_shopify_app.
-_APPSTORE_INSTALL_SOURCES = {"app_store", "merchant_portal", "public_install_link"}
+_APPSTORE_INSTALL_SOURCES = {"app_store", "merchant_portal"}
 
 
 def resolve_shopify_app(install_source: Optional[str]) -> ShopifyAppCreds:
@@ -206,60 +197,6 @@ def _shopify_oauth_verify_hmac(*, request: Request, secret: str) -> bool:
     message = "&".join([f"{k}={v}" for (k, v) in items])
     digest = hmac.new(secret.encode("utf-8"), message.encode("utf-8"), hashlib.sha256).hexdigest()
     return hmac.compare_digest(digest, received)
-
-
-def _install_link_signing_key() -> str:
-    key = (settings.shopify_install_link_signing_key or "").strip()
-    if key:
-        return key
-    # Backward-compat fallback so deployments don't break if the dedicated key is not set.
-    return (settings.jwt_secret_key or "").strip()
-
-
-def _b64url(data: bytes) -> str:
-    import base64
-
-    return base64.urlsafe_b64encode(data).decode("utf-8").rstrip("=")
-
-
-def _b64url_decode(data: str) -> bytes:
-    import base64
-
-    s = (data or "").strip()
-    pad = "=" * ((4 - (len(s) % 4)) % 4)
-    return base64.urlsafe_b64decode(s + pad)
-
-
-def _sign_install_token(payload: Dict[str, Any]) -> str:
-    """
-    Signed, URL-safe install token:
-      token = base64url(json_payload) + "." + base64url(hmac_sha256(payload, key))
-    """
-    raw = json.dumps(payload, separators=(",", ":"), ensure_ascii=False).encode("utf-8")
-    msg = _b64url(raw)
-    sig = hmac.new(_install_link_signing_key().encode("utf-8"), msg.encode("utf-8"), hashlib.sha256).digest()
-    return f"{msg}.{_b64url(sig)}"
-
-
-def _verify_install_token(token: str) -> Dict[str, Any]:
-    parts = (token or "").split(".")
-    if len(parts) != 2:
-        raise HTTPException(status_code=400, detail="Invalid install_token format")
-    msg, sig = parts[0], parts[1]
-    try:
-        expected = hmac.new(_install_link_signing_key().encode("utf-8"), msg.encode("utf-8"), hashlib.sha256).digest()
-        got = _b64url_decode(sig)
-    except Exception:
-        raise HTTPException(status_code=400, detail="Invalid install_token encoding")
-    if not hmac.compare_digest(expected, got):
-        raise HTTPException(status_code=401, detail="Invalid install_token signature")
-    try:
-        payload = json.loads(_b64url_decode(msg).decode("utf-8"))
-    except Exception:
-        raise HTTPException(status_code=400, detail="Invalid install_token payload")
-    if not isinstance(payload, dict):
-        raise HTTPException(status_code=400, detail="Invalid install_token payload type")
-    return payload
 
 
 def _shopify_webhook_callback_base_url(request: Request) -> str:
@@ -617,9 +554,6 @@ async def shopify_oauth_start(
     if current_user.get("role") == "merchant" and current_user.get("merchant_id") != target_merchant_id:
         raise HTTPException(status_code=403, detail="Can only connect your own store")
 
-    if target_merchant_id not in _allowed_oauth_merchants():
-        raise HTTPException(status_code=403, detail="Merchant not enabled for Shopify OAuth yet")
-
     shop_domain = _validate_myshopify_domain(shop)
 
     state = secrets.token_urlsafe(32)
@@ -642,167 +576,6 @@ async def shopify_oauth_start(
     return {
         "status": "success",
         "merchant_id": target_merchant_id,
-        "shop_domain": shop_domain,
-        "authorization_url": url,
-        "state_sha256_prefix": state_sha[:10],
-        "expires_in_seconds": _SHOPIFY_OAUTH_STATE_TTL_SECONDS,
-    }
-
-
-class CreateShopifyInstallLinkRequest(BaseModel):
-    merchant_id: str
-    shop_domain: str
-    ttl_seconds: Optional[int] = None
-
-
-@router.post("/shopify/install-links")
-async def create_shopify_install_link(
-    request: Request,
-    body: CreateShopifyInstallLinkRequest,
-    current_user: dict = Depends(get_current_user),
-    x_request_id: Optional[str] = Header(None),
-):
-    """
-    Create a no-login install link for a merchant.
-    This returns an opaque one-time `install_token` bound to (merchant_id, shop_domain).
-    """
-    if current_user.get("role") not in ["merchant", "employee", "admin", "super_admin"]:
-        raise HTTPException(status_code=403, detail="Not authorized")
-
-    merchant_id = (body.merchant_id or "").strip()
-    if not merchant_id:
-        raise HTTPException(status_code=400, detail="merchant_id is required")
-    if current_user.get("role") == "merchant" and current_user.get("merchant_id") != merchant_id:
-        raise HTTPException(status_code=403, detail="Can only create install link for your own merchant")
-
-    shop_domain = _validate_myshopify_domain(body.shop_domain)
-
-    ttl = int(body.ttl_seconds or _SHOPIFY_INSTALL_TOKEN_TTL_SECONDS)
-    ttl = max(60, min(ttl, 24 * 3600))
-
-    jti = secrets.token_urlsafe(24)
-    jti_sha = hashlib.sha256(jti.encode("utf-8")).hexdigest()
-    now = datetime.now(timezone.utc)
-    exp = now + timedelta(seconds=ttl)
-
-    payload = {
-        "v": 1,
-        "typ": "pivota_shopify_install",
-        "jti": jti,
-        "merchant_id": merchant_id,
-        "shop_domain": shop_domain,
-        "iat": int(now.timestamp()),
-        "exp": int(exp.timestamp()),
-    }
-    token = _sign_install_token(payload)
-
-    await _ensure_shopify_oauth_tables()
-
-    await database.execute(
-        """
-        INSERT INTO shopify_install_tokens (jti_sha256, merchant_id, shop_domain, expires_at)
-        VALUES (:jti_sha256, :merchant_id, :shop_domain, :expires_at)
-        """,
-        {
-            "jti_sha256": jti_sha,
-            "merchant_id": merchant_id,
-            "shop_domain": shop_domain,
-            "expires_at": exp,
-        },
-    )
-
-    base = _shopify_webhook_callback_base_url(request).rstrip("/")
-
-    install_url = (
-        f"{base}/integrations/shopify/oauth/start/public?"
-        + urlencode({"shop": shop_domain, "install_token": token, "redirect": "true"})
-    )
-
-    return {
-        "status": "success",
-        "merchant_id": merchant_id,
-        "shop_domain": shop_domain,
-        "install_url": install_url,
-        "install_token_sha256_prefix": hashlib.sha256(token.encode("utf-8")).hexdigest()[:10],
-        "ttl_seconds": ttl,
-        "request_id": x_request_id,
-    }
-
-
-@router.get("/shopify/oauth/start/public")
-async def shopify_oauth_start_public(
-    request: Request,
-    shop: str = Query(..., description="Shop domain, e.g. your-shop.myshopify.com"),
-    install_token: str = Query(..., description="Opaque, signed one-time install token"),
-    redirect: bool = Query(True, description="If true, 302 redirect to Shopify"),
-    x_request_id: Optional[str] = Header(None),
-):
-    """
-    No-login OAuth start endpoint for distributing install links.
-    Binds OAuth state to the merchant_id embedded in the install_token.
-    """
-    shop_domain = _validate_myshopify_domain(shop)
-    payload = _verify_install_token(install_token)
-
-    if payload.get("typ") != "pivota_shopify_install":
-        raise HTTPException(status_code=400, detail="Invalid install_token type")
-    merchant_id = str(payload.get("merchant_id") or "").strip()
-    token_shop = str(payload.get("shop_domain") or "").strip().lower()
-    jti = str(payload.get("jti") or "").strip()
-    exp = payload.get("exp")
-    if not merchant_id or not token_shop or not jti:
-        raise HTTPException(status_code=400, detail="Invalid install_token payload")
-    if token_shop != shop_domain:
-        raise HTTPException(status_code=403, detail="install_token shop mismatch")
-    try:
-        exp_ts = int(exp)
-    except Exception:
-        raise HTTPException(status_code=400, detail="Invalid install_token exp")
-    if int(datetime.now(timezone.utc).timestamp()) > exp_ts:
-        raise HTTPException(status_code=400, detail="install_token expired")
-
-    jti_sha = hashlib.sha256(jti.encode("utf-8")).hexdigest()
-    consumed = await database.fetch_one(
-        """
-        UPDATE shopify_install_tokens
-        SET used_at = NOW(), used_request_id = :used_request_id
-        WHERE jti_sha256 = :jti_sha256
-          AND used_at IS NULL
-          AND expires_at > NOW()
-          AND merchant_id = :merchant_id
-          AND shop_domain = :shop_domain
-        RETURNING merchant_id
-        """,
-        {
-            "jti_sha256": jti_sha,
-            "merchant_id": merchant_id,
-            "shop_domain": shop_domain,
-            "used_request_id": x_request_id,
-        },
-    )
-    if not consumed:
-        raise HTTPException(status_code=400, detail="install_token already used or invalid")
-
-    state = secrets.token_urlsafe(32)
-    state_sha = hashlib.sha256(state.encode("utf-8")).hexdigest()
-    expires_at = datetime.now(timezone.utc) + timedelta(seconds=_SHOPIFY_OAUTH_STATE_TTL_SECONDS)
-
-    await _insert_shopify_oauth_state(
-        state_sha256=state_sha,
-        merchant_id=merchant_id,
-        shop_domain=shop_domain,
-        expires_at=expires_at,
-        install_source="public_install_link",
-    )
-
-    url = _shopify_oauth_authorize_url(
-        shop_domain=shop_domain, state=state, app=resolve_shopify_app("public_install_link")
-    )
-    if redirect:
-        return RedirectResponse(url=url, status_code=302)
-    return {
-        "status": "success",
-        "merchant_id": merchant_id,
         "shop_domain": shop_domain,
         "authorization_url": url,
         "state_sha256_prefix": state_sha[:10],
@@ -1027,8 +800,8 @@ async def shopify_oauth_callback(request: Request):
     # JSON. The callback is hit by Shopify's OAuth redirect (a browser), so a
     # JSON body renders as a raw/pretty-printed page, which Shopify review flags
     # as a display error (2.1.1). This applies to every install source: App
-    # Store installs and portal "Connect with Shopify" (public_install_link /
-    # merchant_portal) alike. The JSON payload is kept only for structured
+    # Store installs (app_store) and portal "Connect with Shopify"
+    # (merchant_portal) alike. The JSON payload is kept only for structured
     # logging below.
     logger.info(
         "shopify_oauth_callback success merchant=%s shop=%s store=%s source=%s payload=%s",
