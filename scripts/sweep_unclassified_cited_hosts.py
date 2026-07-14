@@ -427,6 +427,23 @@ _KNOWN_SOCIAL_HOSTS = {
 }
 
 
+def _brand_storefront_affix_residual(label: str) -> Optional[str]:
+    """When a label is a generic storefront affix wrapped around a >=4-char
+    residual ('shopzygo' -> 'zygo', 'trycosrx' -> 'cosrx'), return the residual.
+
+    Mirrors the report layer's `_BRAND_STOREFRONT_PREFIXES` — the affixes brands
+    bolt onto their OWN name for a DTC domain. A label of this shape is exactly
+    as likely to be a rival's storefront as a retailer, so the proposer must not
+    type it from the label alone.
+    """
+    for affix in ("shop", "try", "get", "buy", "my", "the", "go"):
+        if label.startswith(affix) and len(label) - len(affix) >= 4:
+            return label[len(affix):]
+        if label.endswith(affix) and len(label) - len(affix) >= 4:
+            return label[: -len(affix)]
+    return None
+
+
 def _is_known_non_brand_label(label: str) -> bool:
     """True when a host's registrable label names a retailer / marketplace /
     platform the repo already knows is NOT a rival brand."""
@@ -568,6 +585,28 @@ def propose_type(stat: Dict[str, Any]) -> Dict[str, Any]:
         }
 
     if any(tok in label for tok in _RETAILER_LABEL_TOKENS):
+        # ...but a retail word is ALSO how a brand names its own DTC storefront:
+        # 'shopzygo' is not a shop, it is Zygo (bone-conduction swim headphones,
+        # a direct rival of the catalog's audio brands) wearing the same prefix
+        # the report layer knows as _BRAND_STOREFRONT_PREFIXES (tryanuko,
+        # shopbblab). Typing that 'retailer' gets it exactly backwards and leaves
+        # the narrative builder pitching a rival's store. The label cannot decide,
+        # so the proposer doesn't.
+        residual = _brand_storefront_affix_residual(label)
+        if residual:
+            return {
+                "type": None, "subtype": None, "tier": None, "categories": [],
+                "proposed_by": "heuristic:brand_storefront_affix_ambiguous",
+                "confidence": "none",
+                "rationale": (
+                    f"Host label '{label}' is a retail word wrapped around "
+                    f"'{residual}' — the shape of a BRAND's own DTC storefront "
+                    "(shopzygo.com = Zygo, a rival) as much as of a shop. Typing it "
+                    "'retailer' when it is a rival's store leaves the narrative "
+                    "builder pitching it; typing it 'brand' when it is a real shop "
+                    f"deletes a channel. Check '{residual}': one brand, or many?"
+                ),
+            }
         return {
             "type": "retailer", "subtype": "online_retailer", "tier": None,
             "categories": [],

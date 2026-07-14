@@ -286,6 +286,26 @@ def test_labeled_heuristics_for_editorial_and_retail_tokens():
     assert editorial["confidence"] == "low" and retail["confidence"] == "low"
 
 
+def test_shop_prefixed_brand_storefront_is_not_typed_as_a_retailer():
+    # Caught in the first human review: shopzygo.com is Zygo, a bone-conduction
+    # swim-headphone BRAND — a direct rival of the catalog's audio merchants. The
+    # retail-token rule read the `shop` prefix and called it a retailer, which is
+    # exactly backwards: `retailer` leaves the narrative builder pitching a
+    # rival's store. The label alone can't decide, so the proposer must not.
+    stats = aggregate_hosts([_run("m1", "r1", [_host_row("shopzygo.com")])])
+    proposal = propose_type(stats["shopzygo.com"])
+    assert proposal["type"] is None
+    assert proposal["proposed_by"] == "heuristic:brand_storefront_affix_ambiguous"
+    assert "zygo" in proposal["rationale"]
+
+
+def test_plain_retail_token_still_proposes_retailer():
+    stats = aggregate_hosts([_run("m1", "r1", [_host_row("beautystore.com")])])
+    proposal = propose_type(stats["beautystore.com"])
+    assert proposal["type"] == "retailer"
+    assert proposal["proposed_by"] == "heuristic:retailer_label_token"
+
+
 def test_already_classified_hosts_are_excluded_and_counted():
     def classify(host: str) -> Dict[str, Any]:
         return {"type": "editorial" if host == "healthline.com" else "unclassified"}
