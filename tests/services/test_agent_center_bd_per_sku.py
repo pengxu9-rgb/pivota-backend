@@ -1478,6 +1478,35 @@ def test_build_authority_map_strips_merchant_own_brand_from_competitors():
     assert "recommends a competitor over you" in moves["allure.com"]["why"]
 
 
+def test_strip_own_brand_competitors_word_boundary_guard():
+    """The own-brand strip must not erase a genuine rival whose name merely
+    CONTAINS the merchant brand as a sub-word — a plain bidirectional substring
+    would (e.g. brand "Glow" swallowing "Glowbiotics"). It uses a word-boundary
+    match once the brand is specific enough (len >= 4), so only the merchant's
+    own bounded brand token is dropped."""
+    from services.agent_center_bd_report_service import _strip_own_brand_competitors
+    from services.brand_alias import derive_brand_aliases
+
+    brand = "Glow"
+    aliases = derive_brand_aliases(brand, "glow.com", ())
+    kept = _strip_own_brand_competitors(
+        ["Glow", "Glowbiotics", "Sephora", "Rival Beauty"],
+        brand.lower(),
+        aliases,
+    )
+    # Merchant's own bounded brand token dropped; sub-word rivals retained.
+    assert "Glow" not in kept
+    assert "Glowbiotics" in kept
+    assert "Sephora" in kept
+    assert "Rival Beauty" in kept
+
+    # No merchant identity -> everything passes through (legacy callers).
+    assert _strip_own_brand_competitors(["Anything", "GlowCo"], "", ()) == [
+        "Anything",
+        "GlowCo",
+    ]
+
+
 def _gemini_redirector_run(query: str, title: str) -> Dict[str, Any]:
     """A Gemini grounding run whose only source is delivered as a Vertex
     redirector URI with the REAL publisher domain in `title` — the prod v3

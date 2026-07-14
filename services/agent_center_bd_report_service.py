@@ -7986,16 +7986,30 @@ def _strip_own_brand_competitors(names, brand_lower: str, brand_aliases) -> List
     Engines sometimes name the merchant itself among "competitors" in their
     grounded self-report. Left unfiltered, the merchant's own brand leaks into
     ``competitors_named`` and — post-#1382 — trips the ``recommends_rival``
-    outreach move with the "rival" actually being the merchant. Mirrors the
-    own-brand skip the run-brand tally already applies (brand substring + the
-    shared alias-boundary matcher) so the two competitor paths stay symmetric."""
+    outreach move with the "rival" actually being the merchant.
+
+    Matching mirrors the ``_brand_in`` own-brand test used for RunFacts: a
+    word-boundary match once the brand is long enough to be specific
+    (``len >= 4``), substring only for very short brands, plus the shared
+    alias-boundary matcher. The word boundary stops a short/common-word brand
+    (e.g. "Glow") from erasing a genuine rival ("Glow Recipe") now that these
+    names feed an outreach surface — the plain bidirectional substring the
+    run-brand tally uses would over-strip here."""
+    use_word_boundary = bool(brand_lower) and len(brand_lower) >= 4
+    brand_pattern = (
+        re.compile(r"\b" + re.escape(brand_lower) + r"\b") if use_word_boundary else None
+    )
     out: List[str] = []
     for name in names or ():
         if not isinstance(name, str) or not name.strip():
             continue
         name_lower = name.strip().lower()
-        if brand_lower and (brand_lower in name_lower or name_lower in brand_lower):
-            continue  # the merchant's own brand
+        if brand_lower:
+            if brand_pattern is not None:
+                if brand_pattern.search(name_lower) is not None:
+                    continue  # the merchant's own brand (word-boundary)
+            elif brand_lower in name_lower:
+                continue  # short brand: substring, boundary FP class already moot
         if brand_aliases and text_mentions_brand(name_lower, brand_aliases):
             continue  # an alias of the merchant, not a rival
         out.append(name)
