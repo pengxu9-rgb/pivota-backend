@@ -373,3 +373,79 @@ def test_newly_filled_retailer_host_reaches_submission_only_without_fabrication(
         example_query="best k-beauty collagen", competitors_named=["Vital Proteins"],
         allow_submission_channel=True,
     ) is None
+
+
+def test_batch2_glowpick_reaches_submission_only_and_renders_review_aggregator_draft():
+    # Batch-2 fill (2026-07-14): glowpick.com — the Hwahae-peer Korean review
+    # aggregator — carries a pitch_recipient pointing at Glowpick's official
+    # product-DB registration guide (listing registration, not a press pitch).
+    # It must flip to submission_only off the REAL registry with no fabricated
+    # email, and the review_aggregator playbook has a pitch_template, so a
+    # submission_form draft renders for the merchant to adapt.
+    from services.cited_host_classifier import classify_host, reset_registry_cache
+    from services.audit_playbook_engine import build_pitch_draft_for_host
+    from services.win_plan_builder import _outreach_from_meta
+
+    reset_registry_cache()
+    meta = classify_host("glowpick.com", merchant_category="beauty")
+    recipient = meta.get("pitch_recipient")
+    assert recipient and recipient.get("submission_url")   # real DB-registration guide
+    assert recipient.get("email") is None                  # no fabricated email
+    assert "2026-07-14" in (recipient.get("note") or "")   # dated verification carried
+
+    outreach = _outreach_from_meta(meta)
+    assert outreach["state"] == OUTREACH_SUBMISSION_ONLY   # flipped off target_only
+
+    draft = build_pitch_draft_for_host(
+        meta, merchant_name="Aruen", merchant_category="beauty",
+        example_query="best k-beauty collagen cream", competitors_named=["Vital Proteins"],
+        allow_submission_channel=True,
+    )
+    assert draft is not None                               # review_aggregator playbook renders
+    assert draft["channel"] == "submission_form"
+    assert draft["recipient_email"] is None                # honest: form/guide channel, no mailto
+    assert draft["submission_url"] == recipient["submission_url"]
+
+
+def test_batch2_dermstore_reaches_submission_only_via_wholesale_channel():
+    # Batch-2 fill (2026-07-14): dermstore.com publishes no vendor page; the
+    # public path is a RangeMe supplier profile (Dermstore is a listed RangeMe
+    # retail buyer). Retailer-type host -> wholesale playbook: the ladder
+    # advances to submission_only, and build_pitch_draft_for_host honestly
+    # renders no one-click draft (wholesale playbooks carry no pitch_template).
+    from services.cited_host_classifier import classify_host, reset_registry_cache
+    from services.audit_playbook_engine import build_pitch_draft_for_host
+    from services.win_plan_builder import _outreach_from_meta
+
+    reset_registry_cache()
+    meta = classify_host("dermstore.com", merchant_category="beauty")
+    assert meta.get("type") == "retailer"                  # routes to wholesale playbook
+    recipient = meta.get("pitch_recipient")
+    assert recipient and recipient.get("submission_url")   # RangeMe supplier intake
+    assert recipient.get("email") is None                  # no fabricated email
+    assert "2026-07-14" in (recipient.get("note") or "")   # dated verification carried
+
+    outreach = _outreach_from_meta(meta)
+    assert outreach["state"] == OUTREACH_SUBMISSION_ONLY
+
+    assert build_pitch_draft_for_host(
+        meta, merchant_name="Aruen", merchant_category="beauty",
+        example_query="best vitamin c serum", competitors_named=["Skinceuticals"],
+        allow_submission_channel=True,
+    ) is None
+
+
+def test_batch2_no_channel_hosts_stay_target_only_with_dated_hint():
+    # Honesty guard: hosts whose research found NO public intake path must stay
+    # target_only (no recipient invented) and carry the finding, dated, in the
+    # outreach_hint so the narrative stops implying a pitch is possible.
+    from services.cited_host_classifier import classify_host, reset_registry_cache
+    from services.win_plan_builder import _outreach_from_meta
+
+    reset_registry_cache()
+    for host in ("sokoglam.com", "jolse.com", "stylevana.com", "stylekorean.com"):
+        meta = classify_host(host, merchant_category="beauty")
+        assert meta.get("pitch_recipient") is None, host
+        assert _outreach_from_meta(meta)["state"] == OUTREACH_TARGET_ONLY, host
+        hint = meta.get("outreach_hint") or ""
+        assert "2026-07-14" in hint, host                  # dated no-channel verification

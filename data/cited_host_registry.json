@@ -587,15 +587,20 @@
       "categories": ["beauty", "skincare", "kbeauty"],
       "aliases": ["Soko Glam"],
       "coverage_note": "Soko Glam is a curated US K-beauty retailer; AI cites its listings and curation as a buying route and trust signal for Korean skincare queries.",
-      "outreach_hint": "No self-serve vendor/brand-submission process is published (verified 2026-07-14). Curation is internal and founder-led: Soko Glam invites product *suggestions* at hello@sokoglam.com ('our team tests each and every product before deciding whether to curate it'), but that is a general customer-suggestions inbox, not a brand-pitch channel — getting curated is a BD-relationship motion."
+      "outreach_hint": "No self-serve vendor/brand-submission process is published (re-verified 2026-07-14: sokoglam.com/pages/contact lists only hello@sokoglam.com for customer service and press@sokoglam.com for press — no vendor, wholesale, or brand-partnership channel). Curation is internal and founder-led: Soko Glam invites product *suggestions* at hello@sokoglam.com ('our team tests each and every product before deciding whether to curate it'), but that is a general customer-suggestions inbox, not a brand-pitch channel — getting carried is a BD-relationship motion."
     },
     "dermstore.com": {
       "type": "retailer",
       "subtype": "beauty_retailer",
-      "categories": ["beauty", "skincare"],
+      "categories": ["beauty", "skincare", "haircare"],
       "aliases": ["Dermstore"],
-      "coverage_note": "Dermstore is a US dermatologist-founded beauty/skincare e-tailer (THG-owned); AI cites its listings for prestige and derm-recommended skincare buying queries.",
-      "outreach_hint": "No public vendor/brand-submission or 'sell on Dermstore' page exists (verified 2026-07-14; only an affiliate-marketing page for creators). Brand onboarding runs through THG buyer relationships — a BD motion, not a public form."
+      "coverage_note": "Dermstore is a US dermatologist-founded multi-brand beauty e-tailer (THG-owned) AI answers cite as a place to buy prestige and clinical skincare; it carries hundreds of brands, so a citation proves the product is findable there, not that it was independently recommended.",
+      "outreach_hint": "Wholesale onboarding — dermstore.com publishes no vendor/brand-submission page (re-verified 2026-07-14; only an affiliate program for creators, and parent THG's site has no public brand-partnership form either). The public path is a RangeMe supplier profile: Dermstore is a listed RangeMe retail buyer.",
+      "pitch_recipient": {
+        "email": null,
+        "submission_url": "https://www.rangeme.com/suppliers",
+        "note": "Dermstore itself publishes no vendor intake (dermstore.com about/help pages and thg.com/our-businesses/thg-beauty checked 2026-07-14 — neither has a form or email for brand submissions). RangeMe's official 'Retailers on RangeMe' directory (https://help.rangeme.com/hc/en-us/articles/115002205528-Retailers-on-RangeMe) lists Dermstore among the US retail buyers sourcing on the platform, so the actionable public path is a RangeMe supplier profile plus submission when Dermstore opportunities open. Verified 2026-07-14. No pitch email published, no response cycle stated; buyer follow-up is discretionary."
+      }
     },
     "jolse.com": {
       "type": "retailer",
@@ -631,7 +636,12 @@
       "categories": ["beauty", "skincare", "kbeauty"],
       "aliases": ["Glowpick"],
       "coverage_note": "Glowpick (글로우픽) is a leading Korean cosmetics review-and-ranking platform (peer of Hwahae) whose consumer-review-driven rankings and Glowpick Awards AI grounds for K-beauty 'best X' and product-rating queries.",
-      "outreach_hint": "Editorial / database channel — earn authentic consumer reviews and keep product listings accurate; rankings and awards are review-driven, not a paid-placement surface."
+      "outreach_hint": "Editorial / database channel — rankings and awards are review-driven, not a paid-placement surface. The brand door is getting the product listed in Glowpick's review database (DB registration) so authentic reviews can accrue.",
+      "pitch_recipient": {
+        "email": null,
+        "submission_url": "https://glowpickad.oopy.io/6da775c0-0d7b-403a-8d9d-8b5fb9c333e6",
+        "note": "Rankings are consumer-review-driven — brands can't pitch placement. The listing door is product DB registration via Glowpick's official ad portal (glowpickad.oopy.io, operated by Glowdayz Co., Ltd. / 주식회사 글로우데이즈, biz reg 211-88-98005, the company behind glowpick.com): this guide page provides the registration template, which is emailed with product cut-out images to db@glowmee.com — a DB-ops intake, not an editorial pitch address (the portal's ad inbox is media@glowmee.com; partnership inquiries route to glowpick.com/contact/alliance). Verified 2026-07-14. No response cycle stated — the DB team sends a confirmation email when registration completes."
+      }
     },
     "stylecraze.com": {
       "type": "editorial",
@@ -1116,14 +1126,6 @@
       "aliases": ["Voistek"],
       "coverage_note": "Voistek sells bone-conduction / open-ear sport headphones; a competitor storefront surfacing on bone-conduction category queries.",
       "outreach_hint": "Competitor brand site — benchmark, not an outreach target."
-    },
-    "dermstore.com": {
-      "type": "retailer",
-      "subtype": "beauty_retailer",
-      "categories": ["beauty", "skincare", "haircare"],
-      "aliases": ["Dermstore"],
-      "coverage_note": "Dermstore (THG) is a dermatologist-led multi-brand beauty retailer AI answers cite as a place to buy prestige and clinical skincare; it carries hundreds of brands, so a citation proves the product is findable there, not that it was independently recommended.",
-      "outreach_hint": "Wholesale/marketplace onboarding — get the SKU listed and its PDP content complete, not an editorial pitch."
     },
     "cvs.com": {
       "type": "retailer",
