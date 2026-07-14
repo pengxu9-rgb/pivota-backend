@@ -721,8 +721,11 @@ def _where_youre_losing(
         # Phase-4 T5 — the vertical's standing pitch-target list (profile
         # authority_hosts), status-stamped against this audit. Empty list for
         # verticals without a curated list (beauty today) — the panel hides it.
+        # Uses the SAME full endorser set as outreach_moves so the two panels
+        # never disagree about whether a host already endorses you — a branded-
+        # only endorser must read as already_endorses_you in both.
         "pitch_targets": _vertical_pitch_targets(
-            vertical_profile, who, endorsement_hosts
+            vertical_profile, who, all_endorsement_hosts
         ),
         # Fix 4 — the path to winning the category recommendation back, rolled
         # up from the per-SKU win-plan. None when there's no plan to show.

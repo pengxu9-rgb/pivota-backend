@@ -901,3 +901,62 @@ def test_branded_only_endorser_not_framed_as_rival_recommendation():
     assert "allure.com" in where["summary"]
     assert "byrdie.com" not in where["summary"]
     assert where["endorsement_hosts"] == ["allure.com"]
+
+
+def test_outreach_and_pitch_targets_agree_on_endorser_status():
+    """#1382 follow-up, cross-panel consistency: outreach_moves and pitch_targets
+    render in the same portal panel and both stamp 'already endorses you'. They
+    MUST use the same full endorser set, or the same host reads 'already
+    recommends you' in one and 'not yet observed' in the other.
+
+    Also guards BOTH union operands with the RunFacts overlay's independent
+    re-sourcing (neither list is a guaranteed subset of the other):
+      - wirecutter.com — endorser on BRANDED queries only (in endorsement_hosts,
+        not endorsement_category_hosts).
+      - rtings.com — endorser on CATEGORY queries only (in
+        endorsement_category_hosts, not endorsement_hosts).
+    Both must be suppressed from the rival framing and stamped already-endorses in
+    both panels. Uses the electronics profile so pitch_targets is non-empty (its
+    authority_hosts include both hosts); beauty returns [] and can't catch this.
+    """
+    from services.merchant_narrative_builder import _where_youre_losing
+    from services.vertical_profiles import ELECTRONICS_AUDIO_PROFILE
+
+    summary = {
+        "independently_recommended_for_category": True,
+        "endorsement_category_hosts": ["rtings.com"],   # category-only endorser
+        "endorsement_hosts": ["wirecutter.com"],        # branded-only endorser
+        "findability_hosts": ["merchant.com"],
+    }
+    authority_map = {
+        "hosts": [
+            {"host": "wirecutter.com", "citation_role": "independent_editorial",
+             "recommendation_class": "recommends", "prompts_cited_count": 3,
+             "cited_on_category_query": False},
+            {"host": "rtings.com", "citation_role": "independent_editorial",
+             "recommendation_class": "recommends", "prompts_cited_count": 2,
+             "cited_on_category_query": True},
+        ],
+        "skus": [
+            {"sku_key": "sku-1", "authority_hosts": [
+                {"host": "wirecutter.com", "competitors_named": ["Rivaltone"]},
+                {"host": "rtings.com", "competitors_named": ["Rivaltone"]},
+            ]},
+        ],
+    }
+    where = _where_youre_losing(
+        "Aruen", authority_map, summary,
+        vertical_profile=ELECTRONICS_AUDIO_PROFILE,
+    )
+
+    # Neither endorser is framed as recommending a rival (both union operands).
+    moves = {m["host"]: m for m in where["outreach_moves"]}
+    for host in ("wirecutter.com", "rtings.com"):
+        assert moves[host]["already_endorses_you"] is True, host
+        assert "recommends a competitor" not in moves[host]["why"], host
+
+    # The pitch-targets panel agrees — same already-endorses status, no
+    # contradictory "not yet observed" / "cited in your category" badge.
+    pitch = {t["host"]: t for t in where["pitch_targets"]}
+    for host in ("wirecutter.com", "rtings.com"):
+        assert pitch[host]["status"] == "already_endorses_you", host
