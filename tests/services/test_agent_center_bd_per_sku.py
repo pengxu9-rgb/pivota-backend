@@ -1467,15 +1467,19 @@ def test_build_authority_map_strips_merchant_own_brand_from_competitors():
     assert "Rival Beauty" in all_named
 
     # goodhousekeeping.com had only the merchant's own name as a "competitor", so
-    # its outreach move must NOT claim it recommends a rival; allure.com kept a
-    # real rival, so its move still does.
+    # its outreach move must NOT carry the rival co-citation framing; allure.com
+    # kept a real rival, so its move still does. The rendered copy is co-citation
+    # framing ("grounds answers that recommend competitors over you"), NOT the
+    # older per-host "recommends a competitor over you" claim — see the
+    # recommends_rival comment in merchant_narrative_builder._outreach_moves.
+    _RIVAL_FRAMING = "grounds answers that recommend competitors over you"
     who = _who_ai_cites_instead(authority_map)
     moves = {m["host"]: m for m in _outreach_moves(who)}
     assert "goodhousekeeping.com" in moves
-    assert "recommends a competitor over you" not in moves["goodhousekeeping.com"]["why"]
+    assert _RIVAL_FRAMING not in moves["goodhousekeeping.com"]["why"]
     assert not moves["goodhousekeeping.com"].get("competitors_named")
     assert "allure.com" in moves
-    assert "recommends a competitor over you" in moves["allure.com"]["why"]
+    assert _RIVAL_FRAMING in moves["allure.com"]["why"]
 
 
 def test_strip_own_brand_competitors_word_boundary_guard():
