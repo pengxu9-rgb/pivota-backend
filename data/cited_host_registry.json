@@ -1428,6 +1428,14 @@
       "aliases": ["DoorDash"],
       "coverage_note": "DoorDash's on-demand delivery marketplace now carries convenience/beauty SKUs; named by engines as a 'competitor' but it is a delivery channel.",
       "outreach_hint": "Marketplace/delivery listing via retail partners — no editorial lever."
+    },
+    "hair.com": {
+      "type": "brand",
+      "subtype": "brand_owned_media",
+      "categories": ["beauty", "haircare"],
+      "aliases": ["Hair.com", "Hair.com by L'Oreal", "L'Oreal Hair.com"],
+      "coverage_note": "Hair.com By L'Oreal is L'Oreal's own house media + storefront for its Professional Products portfolio (Redken, Kerastase, Matrix, Pureology, Mizani). Verified 2026-07-14 from its own page titles ('25 of the Best Hair Products from L'Oreal Pro Brands') and from the pages our audits cited (best-hair-oil.html, hair-oil-for-frizz.html): the roundups read editorial but only ever recommend L'Oreal-owned brands. Neither a neutral retailer nor a single brand — a corporate portfolio's owned media.",
+      "outreach_hint": "NOT an outreach target despite the editorial format: its 'best of' lists only feature L'Oreal Pro brands, so a rival can never be cited there. Compete on the category query instead."
     }
   }
 }
