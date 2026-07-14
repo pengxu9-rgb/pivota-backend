@@ -11,7 +11,8 @@
       "coverage_note": "1-2 sentences: what this host actually publishes for these categories, why it matters",
       "outreach_hint": "1 sentence: which lever applies (editorial pitch / wholesale onboarding / creator partnership / etc.)"
     },
-    "added_for_test_merchant_audits": "2026-05-07 — initial seed covering hosts that appeared in merch_efbc46b4619cfbdf sleepwear audit + the broader fashion/beauty/lifestyle review surface."
+    "added_for_test_merchant_audits": "2026-05-07 — initial seed covering hosts that appeared in merch_efbc46b4619cfbdf sleepwear audit + the broader fashion/beauty/lifestyle review surface.",
+    "batch_2026_07_14": "Reviewed batch from scripts/sweep_unclassified_cited_hosts.py (reports/registry_proposals_2026-07-14.json) — the recurring cited hosts across 174 succeeded audit runs / 11 merchants that classify_host could not type. Each host was checked individually before typing; the sweep proposes, a human decides."
   },
   "hosts": {
     "healthline.com": {
@@ -57,13 +58,29 @@
       "coverage_note": "Women's Health covers supplements, beauty-from-within, and fitness products in frequently-cited roundups.",
       "outreach_hint": "Editorial pitch to the health/beauty desk; creator and expert tie-ins help."
     },
+    "cosmopolitan.com": {
+      "type": "editorial",
+      "subtype": "review_site",
+      "categories": ["beauty", "fashion", "wellness", "lifestyle"],
+      "aliases": ["Cosmopolitan", "Cosmo"],
+      "coverage_note": "Cosmopolitan (Hearst) runs beauty/lifestyle product roundups and reviews that AI grounds for 'best {beauty/lifestyle}' queries.",
+      "outreach_hint": "Coverage is beauty/commerce-editor and PR-relationship driven — Hearst publishes no public product-pitch inbox or submission form that could be verified (2026-07-14). Treat as an editor-relationship target, not a self-serve channel."
+    },
+    "health.clevelandclinic.org": {
+      "type": "editorial",
+      "subtype": "educational",
+      "categories": ["health", "wellness", "supplements", "skincare", "beauty"],
+      "aliases": ["Cleveland Clinic", "Cleveland Clinic Health Essentials"],
+      "coverage_note": "Cleveland Clinic Health Essentials is the hospital's clinician-driven consumer-health content site; AI treats it as high-authority grounding for health, supplement, and ingredient-safety queries.",
+      "outreach_hint": "No product-pitch path exists: articles are written with and medically approved by Cleveland Clinic experts, and the site states explicit editorial independence ('does not endorse any of the products and services advertised'). Its published inboxes (editorial@ccf.org for content questions, healthessentials@ccf.org for the newsletter) are not product-submission channels. The honest lever is clinical/ingredient evidence a Cleveland Clinic expert might independently cite — not outreach."
+    },
     "stylevana.com": {
       "type": "retailer",
       "subtype": "beauty_retailer",
       "categories": ["beauty", "skincare", "kbeauty"],
       "aliases": ["Stylevana"],
       "coverage_note": "Stylevana is a major K-beauty cross-border retailer; AI routes K-beauty buying queries (Korean collagen, sunscreen, skincare) through its listings.",
-      "outreach_hint": "Wholesale/marketplace onboarding plus accurate listing titles, stock, and reviews."
+      "outreach_hint": "No public brand-supplier or 'sell with us' channel is published on stylevana.com (only customer support and an affiliate/blogger program); Stylevana sources via distributors, so brand onboarding is a BD-relationship motion, not a public form. (Verified 2026-07-14.)"
     },
     "yesstyle.com": {
       "type": "retailer",
@@ -71,7 +88,12 @@
       "categories": ["beauty", "skincare", "kbeauty", "fashion"],
       "aliases": ["YesStyle"],
       "coverage_note": "YesStyle is a large Asian beauty and fashion retailer frequently cited by AI as a buying route for K-beauty skincare and supplements.",
-      "outreach_hint": "Marketplace onboarding plus listing optimization (title, attributes, availability, reviews)."
+      "outreach_hint": "Marketplace onboarding via YesStyle's Business Opportunities form, plus listing optimization (title, attributes, availability, reviews).",
+      "pitch_recipient": {
+        "email": null,
+        "submission_url": "https://www.yesstyle.com/en/about-us/business-opportunities.html",
+        "note": "YesStyle's official Business Opportunities page is a self-serve brand/supplier submission form ('our business development team will review the information and contact potential partners shortly'); verified 2026-07-14. Form-only, no email published; timeline stated only as 'shortly', so no cycle is recorded. The separate asianbeautywholesale.com, affiliate, and influencer programs are distinct channels."
+      }
     },
     "stylekorean.com": {
       "type": "retailer",
@@ -79,7 +101,7 @@
       "categories": ["beauty", "skincare", "kbeauty"],
       "aliases": ["StyleKorean"],
       "coverage_note": "StyleKorean is a K-beauty retailer and brand aggregator AI cites for Korean skincare and beauty-supplement purchase routes.",
-      "outreach_hint": "Wholesale/retailer onboarding plus accurate, review-backed product listings."
+      "outreach_hint": "No self-serve brand-supplier channel is published on stylekorean.com: its wholesale.stylekorean.com page is a buy-side reseller account (retailers/shops purchasing in bulk), not brand onboarding. Brand-supplier deals run through parent Silicon2 — a BD-relationship motion, not a public form. (Verified 2026-07-14.)"
     },
     "nymag.com": {
       "type": "editorial",
@@ -194,7 +216,7 @@
       "subtype": "fashion",
       "categories": ["fashion", "sleepwear", "beauty"],
       "coverage_note": "High-fashion editorial; product mentions skew luxury/premium D2C. AI-channel grounded for trend + lifestyle queries.",
-      "outreach_hint": "Pitch Vogue editorial team via PR / agency relationships."
+      "outreach_hint": "Vogue publishes no public product-pitch inbox or submission form (verified 2026-07-14); consumer-product coverage is editor/PR-relationship driven. There is no self-serve channel — pattern-guessed condenast.com addresses on PR blogs are not official."
     },
     "voguescandinavia.com": {
       "type": "editorial",
@@ -229,7 +251,12 @@
       "subtype": "beauty",
       "categories": ["beauty"],
       "coverage_note": "Beauty-only editorial; Best of Beauty awards are highly weighted in grounded retrieval.",
-      "outreach_hint": "Best of Beauty submission process — annual cycle."
+      "outreach_hint": "Best of Beauty submission process — annual cycle; submit products via the Condé Nast form when the window opens.",
+      "pitch_recipient": {
+        "email": null,
+        "submission_url": "https://condenast-interactive.typeform.com/allure-bob-2025",
+        "note": "Allure Best of Beauty is a paid annual product-submission program on a Condé Nast-hosted Typeform (title 'Allure Best of Beauty 2025 Submissions'); verified live 2026-07-14. The slug rotates each cycle (condenast-interactive.typeform.com/allure-bob-<year>) and windows open in fall/winter — BD should refresh this URL each cycle. No editorial pitch email is published on allure.com; the address circulating on third-party PR blogs is not officially printed, so it is not recorded here."
+      }
     },
     "byrdie.com": {
       "type": "editorial",
@@ -244,7 +271,7 @@
       "subtype": "fashion",
       "categories": ["fashion", "sleepwear", "beauty"],
       "coverage_note": "Fashion-trend-driven editorial; affiliate roundups. AI-cited on trend queries.",
-      "outreach_hint": "Editorial pitch — trend-led angle."
+      "outreach_hint": "Who What Wear publishes no product-pitch channel — its contact page lists only social handles (verified 2026-07-14). Coverage is editor/PR-driven; the advertising@ address seen in search snippets is not printed on an official page, so it is not recorded."
     },
     "popsugar.com": {
       "type": "editorial",
@@ -364,7 +391,12 @@
       "categories": ["beauty", "skincare"],
       "aliases": ["Bluemercury", "Blue Mercury"],
       "coverage_note": "Bluemercury is a US prestige-beauty and spa specialty retailer (Macy's-owned, ~180 stores); AI cites its listings for luxury/prestige skincare and beauty buying queries.",
-      "outreach_hint": "Wholesale onboarding — Bluemercury merchant/vendor relations; positioned for prestige and indie-luxe brands."
+      "outreach_hint": "Wholesale onboarding — Bluemercury vendor submissions run through RangeMe; positioned for prestige and indie-luxe brands.",
+      "pitch_recipient": {
+        "email": null,
+        "submission_url": "https://www.rangeme.com/bluemercury",
+        "note": "Bluemercury's vendor page (bluemercury.com/pages/vendor-submissions) routes all brand submissions to RangeMe ('Become a Supplier for Bluemercury'); verified 2026-07-14. No pitch email is published and outreach is discretionary ('if we feel a partnership would be a good fit, we'll be in touch'), so no response cycle is stated."
+      }
     },
     "iherb.com": {
       "type": "retailer",
@@ -495,7 +527,12 @@
       "categories": ["beauty"],
       "aliases": ["Olive Young", "Olive Young Global"],
       "coverage_note": "K-beauty specialty retailer (international); high AI-channel grounding for K-beauty queries.",
-      "outreach_hint": "K-beauty wholesale — Olive Young vendor relations."
+      "outreach_hint": "K-beauty wholesale — apply via CJ Olive Young's Business Partnership Inquiry form (Global Partnership option).",
+      "pitch_recipient": {
+        "email": null,
+        "submission_url": "https://corp.oliveyoung.com/en/inquiry/business",
+        "note": "CJ Olive Young's official Business Partnership Inquiry form; the Field-of-Interest dropdown includes 'Global Partnership'. Verified 2026-07-14. Form-only, no email published (already-onboarded suppliers use the separate partner.oliveyoung.co.kr portal); the page states it does not provide individual status updates, so no response cycle is recorded."
+      }
     },
     "kiwla.com": {
       "type": "retailer",
@@ -505,13 +542,68 @@
       "coverage_note": "Kiwla is a multi-brand online beauty/skincare/haircare/supplement retailer (India) carrying authentic curated brands; AI cites its listings as a buying route for K-beauty and skincare queries in the India market.",
       "outreach_hint": "Multi-brand retailer onboarding (India) — confirm market relevance plus accurate, review-backed listings."
     },
+    "fabfitfun.com": {
+      "type": "retailer",
+      "subtype": "beauty_retailer",
+      "categories": ["beauty", "wellness", "lifestyle", "fashion"],
+      "aliases": ["FabFitFun"],
+      "coverage_note": "FabFitFun is a US lifestyle subscription box (beauty, wellness, fashion, home); AI cites it as a discovery/buying route for beauty and self-care products.",
+      "outreach_hint": "Supplier onboarding to get products into the box — apply via FabFitFun's Suppliers page (RangeMe intake).",
+      "pitch_recipient": {
+        "email": null,
+        "submission_url": "https://fabfitfun.com/suppliers",
+        "note": "FabFitFun's official Suppliers page routes all brand submissions through RangeMe (https://www.rangeme.com/fabfitfun): create a profile, upload product info, and buyers review and follow up. Verified 2026-07-14. Portal-only, no email published, no response cycle stated. (fabfitfun.com/brands and /partners 404 — /suppliers is the live intake.)"
+      }
+    },
     "oliveyoung.com": {
       "type": "retailer",
       "subtype": "beauty_retailer",
       "categories": ["beauty", "skincare", "kbeauty"],
       "aliases": ["Olive Young Korea"],
-      "coverage_note": "Olive Young is Korea's dominant domestic K-beauty specialty retailer (the .com domestic storefront alongside the international oliveyoungglobal.com); very high AI-channel grounding for Korean skincare and beauty queries.",
-      "outreach_hint": "K-beauty wholesale — Olive Young vendor relations; coordinate domestic (oliveyoung.com) and global (oliveyoungglobal.com) listings."
+      "coverage_note": "Olive Young is Korea's dominant K-beauty specialty retailer; oliveyoung.com is its .com domain, alongside the primary Korean site oliveyoung.co.kr and the international oliveyoungglobal.com. Very high AI-channel grounding for Korean skincare and beauty queries.",
+      "outreach_hint": "K-beauty wholesale — apply via CJ Olive Young's Business Partnership Inquiry form; coordinate domestic (oliveyoung.co.kr) and global (oliveyoungglobal.com) listings.",
+      "pitch_recipient": {
+        "email": null,
+        "submission_url": "https://corp.oliveyoung.com/en/inquiry/business",
+        "note": "CJ Olive Young's official Business Partnership Inquiry form (domestic and global vendor entry). Verified 2026-07-14. Form-only, no email published; already-onboarded suppliers use partner.oliveyoung.co.kr. No response cycle stated."
+      }
+    },
+    "oliveyoung.co.kr": {
+      "type": "retailer",
+      "subtype": "beauty_retailer",
+      "categories": ["beauty", "skincare", "kbeauty"],
+      "aliases": ["Olive Young", "Olive Young Korea"],
+      "coverage_note": "Olive Young's Korean domestic storefront (oliveyoung.co.kr) — Korea's dominant K-beauty specialty retailer; the domain most frequently grounded by AI for Korean skincare and beauty queries.",
+      "outreach_hint": "K-beauty wholesale (입점) — apply via CJ Olive Young's Business Partnership Inquiry form.",
+      "pitch_recipient": {
+        "email": null,
+        "submission_url": "https://corp.oliveyoung.com/en/inquiry/business",
+        "note": "CJ Olive Young's official Business Partnership Inquiry form is the domestic vendor-entry (입점) channel. Verified 2026-07-14. Form-only, no email published; already-onboarded suppliers use the separate partner.oliveyoung.co.kr Partner Office. The page states CJ Olive Young does not provide individual status updates, so no response cycle is recorded."
+      }
+    },
+    "sokoglam.com": {
+      "type": "retailer",
+      "subtype": "beauty_retailer",
+      "categories": ["beauty", "skincare", "kbeauty"],
+      "aliases": ["Soko Glam"],
+      "coverage_note": "Soko Glam is a curated US K-beauty retailer; AI cites its listings and curation as a buying route and trust signal for Korean skincare queries.",
+      "outreach_hint": "No self-serve vendor/brand-submission process is published (verified 2026-07-14). Curation is internal and founder-led: Soko Glam invites product *suggestions* at hello@sokoglam.com ('our team tests each and every product before deciding whether to curate it'), but that is a general customer-suggestions inbox, not a brand-pitch channel — getting curated is a BD-relationship motion."
+    },
+    "dermstore.com": {
+      "type": "retailer",
+      "subtype": "beauty_retailer",
+      "categories": ["beauty", "skincare"],
+      "aliases": ["Dermstore"],
+      "coverage_note": "Dermstore is a US dermatologist-founded beauty/skincare e-tailer (THG-owned); AI cites its listings for prestige and derm-recommended skincare buying queries.",
+      "outreach_hint": "No public vendor/brand-submission or 'sell on Dermstore' page exists (verified 2026-07-14; only an affiliate-marketing page for creators). Brand onboarding runs through THG buyer relationships — a BD motion, not a public form."
+    },
+    "jolse.com": {
+      "type": "retailer",
+      "subtype": "beauty_retailer",
+      "categories": ["beauty", "skincare", "kbeauty"],
+      "aliases": ["Jolse"],
+      "coverage_note": "Jolse is a Korea-based K-beauty online retailer shipping internationally; AI cites it as a buying route for Korean skincare and beauty.",
+      "outreach_hint": "No dedicated brand-partnership/wholesale page or address is published (verified 2026-07-14) — jolse.com exposes only a general CONTACT form / 1:1 account inquiry for customer support. US wholesale is handled by affiliate Beauty Bridge (Barunson), so brand onboarding is a BD-relationship motion, not a public pitch channel."
     },
     "skinsort.com": {
       "type": "editorial",
@@ -1024,6 +1116,417 @@
       "aliases": ["Voistek"],
       "coverage_note": "Voistek sells bone-conduction / open-ear sport headphones; a competitor storefront surfacing on bone-conduction category queries.",
       "outreach_hint": "Competitor brand site — benchmark, not an outreach target."
+    },
+    "dermstore.com": {
+      "type": "retailer",
+      "subtype": "beauty_retailer",
+      "categories": ["beauty", "skincare", "haircare"],
+      "aliases": ["Dermstore"],
+      "coverage_note": "Dermstore (THG) is a dermatologist-led multi-brand beauty retailer AI answers cite as a place to buy prestige and clinical skincare; it carries hundreds of brands, so a citation proves the product is findable there, not that it was independently recommended.",
+      "outreach_hint": "Wholesale/marketplace onboarding — get the SKU listed and its PDP content complete, not an editorial pitch."
+    },
+    "cvs.com": {
+      "type": "retailer",
+      "subtype": "mass_market",
+      "categories": ["beauty", "skincare", "health", "wellness", "supplements"],
+      "aliases": ["CVS", "CVS Pharmacy"],
+      "coverage_note": "CVS is a US mass-market drugstore whose product pages are grounded for drugstore-tier beauty and health queries.",
+      "outreach_hint": "Retail distribution — a wholesale/vendor motion, not editorial."
+    },
+    "kroger.com": {
+      "type": "retailer",
+      "subtype": "mass_market",
+      "categories": ["beauty", "health", "wellness", "grocery", "supplements"],
+      "aliases": ["Kroger"],
+      "coverage_note": "Kroger is a US grocery chain that also lists beauty and wellness SKUs. The engines routinely NAME it in competitor lists — it is a channel carrying the merchant's category, not a rival brand.",
+      "outreach_hint": "Retail distribution — wholesale/vendor motion. Never treat as a competitor storefront."
+    },
+    "nykaa.com": {
+      "type": "retailer",
+      "subtype": "beauty_retailer",
+      "categories": ["beauty", "skincare", "makeup", "haircare"],
+      "aliases": ["Nykaa"],
+      "coverage_note": "Nykaa is India's dominant multi-brand beauty retailer and is heavily grounded for India-region beauty queries.",
+      "outreach_hint": "Wholesale/marketplace onboarding for the India market."
+    },
+    "adorebeauty.com.au": {
+      "type": "retailer",
+      "subtype": "beauty_retailer",
+      "categories": ["beauty", "skincare", "makeup", "haircare"],
+      "aliases": ["Adore Beauty"],
+      "coverage_note": "Adore Beauty is Australia's largest pure-play multi-brand beauty retailer; cited for AU/NZ 'where to buy' and category queries.",
+      "outreach_hint": "Wholesale onboarding for the AU/NZ market."
+    },
+    "dodoskin.com": {
+      "type": "retailer",
+      "subtype": "beauty_retailer",
+      "categories": ["beauty", "skincare", "k-beauty"],
+      "aliases": ["DODO SKIN", "DODOSKIN", "Dodo Skin"],
+      "coverage_note": "DODOSKIN is a US-based multi-brand K-beauty retailer (Beauty of Joseon, SKIN1004, COSRX, Anua, medicube). Verified 2026-07-14: it stocks many brands, so a citation is distribution, not endorsement.",
+      "outreach_hint": "Wholesale onboarding — a K-beauty distribution channel. The engines name it as a 'competitor'; it is not one."
+    },
+    "holiholic.com": {
+      "type": "retailer",
+      "subtype": "beauty_retailer",
+      "categories": ["beauty", "skincare", "k-beauty", "fashion"],
+      "aliases": ["HOLIHOLIC", "Holiholic"],
+      "coverage_note": "Holiholic is a multi-brand Korean beauty and fashion retailer/marketplace (Laneige, Dr. Jart+, HERA, 3CE). Verified 2026-07-14.",
+      "outreach_hint": "Wholesale/marketplace onboarding for K-beauty distribution."
+    },
+    "openthebeauty.com": {
+      "type": "retailer",
+      "subtype": "beauty_retailer",
+      "categories": ["beauty", "skincare", "makeup", "k-beauty"],
+      "aliases": ["OpentheBeauty", "Open the Beauty"],
+      "coverage_note": "Open the Beauty is a multi-brand K-beauty retailer (COSRX, Missha, Laneige). Verified 2026-07-14.",
+      "outreach_hint": "Wholesale onboarding — K-beauty distribution channel."
+    },
+    "sentisenti.com": {
+      "type": "retailer",
+      "subtype": "beauty_retailer",
+      "categories": ["beauty", "skincare", "makeup", "k-beauty", "j-beauty"],
+      "aliases": ["senti senti", "Senti Senti"],
+      "coverage_note": "Senti Senti is a New York curated retailer of 50+ Japanese and Korean beauty brands (COSRX, Anua, Laneige, Isntree), online and in-store. Verified 2026-07-14.",
+      "outreach_hint": "Wholesale onboarding — a curated J/K-beauty channel with a physical footprint."
+    },
+    "numberskin.com": {
+      "type": "retailer",
+      "subtype": "beauty_retailer",
+      "categories": ["beauty", "skincare", "k-beauty"],
+      "aliases": ["NumberSkin", "Numberskin"],
+      "coverage_note": "Numberskin is a multi-brand K-beauty retailer (ANUA, COSRX, BEYOND). Verified 2026-07-14 — the name reads like a brand, but it stocks many vendors.",
+      "outreach_hint": "Wholesale onboarding — K-beauty distribution channel, not a rival brand."
+    },
+    "ibspot.com": {
+      "type": "marketplace",
+      "subtype": "fashion_marketplace",
+      "categories": ["beauty", "health", "wellness", "home", "electronics"],
+      "aliases": ["IBSpot", "ibspot"],
+      "coverage_note": "IBSPOT is a global cross-border marketplace reselling international vendors across beauty, home, electronics and grocery. Verified 2026-07-14.",
+      "outreach_hint": "Marketplace listing — low-control channel; a citation proves findability only."
+    },
+    "metapod.com": {
+      "type": "retailer",
+      "subtype": "regional",
+      "categories": ["electronics", "audio", "gaming", "smart home"],
+      "aliases": ["Metapod", "Metapod SG"],
+      "coverage_note": "Metapod SG is a Singapore multi-brand consumer-electronics retailer carrying 100+ brands (Apple, Sony, Dyson, DJI). Verified 2026-07-14; cited on APAC electronics queries.",
+      "outreach_hint": "Retail distribution for the SG/APAC electronics market."
+    },
+    "weareready.my": {
+      "type": "retailer",
+      "subtype": "regional",
+      "categories": ["electronics", "audio", "wearables", "fitness"],
+      "aliases": ["We Are Ready", "Ready"],
+      "coverage_note": "Malaysian official distributor of global wearable/audio brands (Oura, Mojawa, Chamelo). Verified 2026-07-14: an authorized third-party distribution channel — a merchant it carries is FINDABLE there, which is not an independent endorsement.",
+      "outreach_hint": "Regional distribution — already an authorized channel for some catalog brands; the lever is listing quality, not an editorial pitch."
+    },
+    "skintypesolutions.com": {
+      "type": "retailer",
+      "subtype": "wellness_retailer",
+      "categories": ["beauty", "skincare"],
+      "aliases": ["Skin Type Solutions", "STS"],
+      "coverage_note": "Dermatologist-owned (Baumann Skin Type system) but an AUTHORIZED MULTI-BRAND RETAILER — EltaMD, SkinCeuticals, Alastin, PCA Skin. Verified 2026-07-14: the educational library makes it read editorial; it sells many brands.",
+      "outreach_hint": "Wholesale onboarding into a professional/clinical skincare channel — not an editorial pitch, despite the content library."
+    },
+    "shein.com": {
+      "type": "marketplace",
+      "subtype": "fashion_marketplace",
+      "categories": ["fashion", "beauty", "makeup"],
+      "aliases": ["SHEIN", "Shein"],
+      "coverage_note": "SHEIN is a global fast-fashion marketplace that also lists beauty SKUs; engines name it in competitor lists, but for a beauty/fashion merchant it is a marketplace channel.",
+      "outreach_hint": "Marketplace listing — low-control channel."
+    },
+    "shop.app": {
+      "type": "marketplace",
+      "subtype": "creator_platform",
+      "categories": ["beauty", "fashion", "electronics", "home"],
+      "aliases": ["Shop App", "Shopify Shop"],
+      "coverage_note": "Shopify's Shop app surfaces the merchant's OWN Shopify listing; a citation here means the storefront's product feed is indexed, which is findability, not third-party endorsement.",
+      "outreach_hint": "No pitch — ensure the Shopify product feed and Shop channel are enabled and complete."
+    },
+    "shop.tiktok.com": {
+      "type": "marketplace",
+      "subtype": "social",
+      "categories": ["beauty", "fashion", "wellness"],
+      "aliases": ["TikTok Shop"],
+      "coverage_note": "TikTok Shop listings surfaced in grounded answers; a citation proves the SKU is listed on the social-commerce channel.",
+      "outreach_hint": "Social-commerce listing plus creator/affiliate partnerships — not an editorial pitch."
+    },
+    "webmd.com": {
+      "type": "editorial",
+      "subtype": "review_site",
+      "categories": ["health", "wellness", "beauty", "supplements"],
+      "aliases": ["WebMD"],
+      "coverage_note": "WebMD is a top-tier consumer health publisher whose physician-reviewed explainers are heavily grounded for safety, ingredient and efficacy questions. The engines sometimes NAME it in competitor lists — it is an editorial source, not a rival storefront.",
+      "outreach_hint": "Editorially controlled — influence via clinical sourcing and expert commentary, not product pitches.",
+      "tier": 1,
+      "editorial_cadence": "continuous",
+      "ai_grounding_weight": "high"
+    },
+    "everydayhealth.com": {
+      "type": "editorial",
+      "subtype": "review_site",
+      "categories": ["health", "wellness", "beauty", "supplements"],
+      "aliases": ["Everyday Health"],
+      "coverage_note": "Everyday Health publishes physician-reviewed health and wellness guidance that AI assistants cite for condition-led and ingredient-safety queries.",
+      "outreach_hint": "Editorial — influence through medical-reviewer relationships and cited research.",
+      "tier": 2,
+      "ai_grounding_weight": "medium"
+    },
+    "theguardian.com": {
+      "type": "editorial",
+      "subtype": "magazine",
+      "categories": ["beauty", "fashion", "wellness", "electronics", "lifestyle"],
+      "aliases": ["The Guardian", "Guardian"],
+      "coverage_note": "The Guardian's Filter/consumer desk publishes tested 'best of' roundups with strong AI-grounding pickup, especially for UK-region queries.",
+      "outreach_hint": "Editorial pitch to the consumer/Filter desk; product must be available in-region for inclusion.",
+      "tier": 1,
+      "editorial_cadence": "quarterly",
+      "ai_grounding_weight": "high"
+    },
+    "nbcnews.com": {
+      "type": "editorial",
+      "subtype": "magazine",
+      "categories": ["beauty", "wellness", "electronics", "lifestyle"],
+      "aliases": ["NBC News", "NBC Select"],
+      "coverage_note": "NBC News (Select) publishes commerce-desk roundups and expert-sourced product guides that surface in grounded answers.",
+      "outreach_hint": "Editorial pitch to the NBC Select commerce desk.",
+      "tier": 1,
+      "editorial_cadence": "continuous",
+      "ai_grounding_weight": "medium"
+    },
+    "aarp.org": {
+      "type": "editorial",
+      "subtype": "magazine",
+      "categories": ["health", "wellness", "beauty", "electronics"],
+      "aliases": ["AARP"],
+      "coverage_note": "AARP publishes consumer guidance for a 50+ audience; grounded for age-led product and health queries.",
+      "outreach_hint": "Editorial pitch — angle must be relevant to an older demographic.",
+      "tier": 3,
+      "ai_grounding_weight": "low"
+    },
+    "totalbeauty.com": {
+      "type": "editorial",
+      "subtype": "review_aggregator",
+      "categories": ["beauty", "skincare", "makeup", "haircare"],
+      "aliases": ["TotalBeauty", "Total Beauty"],
+      "coverage_note": "TotalBeauty aggregates consumer beauty reviews and 'best of' rankings that AI answers cite as social proof.",
+      "outreach_hint": "Review-volume play — drive reviews and ensure the product page exists; partly editorial.",
+      "tier": 3,
+      "ai_grounding_weight": "low"
+    },
+    "trustpilot.com": {
+      "type": "editorial",
+      "subtype": "review_aggregator",
+      "categories": ["beauty", "electronics", "fashion", "wellness"],
+      "aliases": ["Trustpilot"],
+      "coverage_note": "Trustpilot is a consumer review aggregator cited as evidence of merchant/brand trustworthiness rather than product merit.",
+      "outreach_hint": "Not pitchable — claim the profile and drive genuine reviews; a citation here is reputation, not recommendation.",
+      "tier": 3,
+      "ai_grounding_weight": "low"
+    },
+    "gamingtrend.com": {
+      "type": "editorial",
+      "subtype": "review_site",
+      "categories": ["electronics", "gaming", "audio"],
+      "aliases": ["GamingTrend", "Gaming Trend"],
+      "coverage_note": "GamingTrend reviews gaming hardware and audio gear; a niche source with disproportionate grounding weight in gaming-adjacent electronics queries.",
+      "outreach_hint": "Editorial pitch — review-unit seeding to the hardware desk.",
+      "tier": 2,
+      "ai_grounding_weight": "medium"
+    },
+    "skinsafeproducts.com": {
+      "type": "editorial",
+      "subtype": "certification",
+      "categories": ["beauty", "skincare", "health"],
+      "aliases": ["SkinSAFE"],
+      "coverage_note": "SkinSAFE, developed with the Mayo Clinic, rates products for allergens and hypoallergenic suitability. Verified 2026-07-14: a ratings/certification body (affiliate-monetized), not a store — cited as an authority on ingredient safety.",
+      "outreach_hint": "Submit the product's full INCI for allergen rating; a SkinSAFE rating is a substantiation asset, not a paid placement.",
+      "tier": 2,
+      "ai_grounding_weight": "medium"
+    },
+    "gopicky.com": {
+      "type": "community",
+      "subtype": "community",
+      "categories": ["beauty", "skincare", "k-beauty"],
+      "aliases": ["Picky", "GoPicky"],
+      "coverage_note": "Picky is a K-beauty review and community platform — honest reviews, ingredient analyses, product-testing events. Verified 2026-07-14: the engines NAME it in competitor lists, but it is a community/editorial source and a genuine outreach target.",
+      "outreach_hint": "Community/editorial — seed product-testing events and ingredient analyses; do NOT treat as a competitor storefront.",
+      "tier": 2,
+      "ai_grounding_weight": "medium"
+    },
+    "coachweb.com": {
+      "type": "editorial",
+      "subtype": "magazine",
+      "categories": ["fitness", "health", "wellness", "electronics"],
+      "aliases": ["Coach", "Coach Magazine"],
+      "coverage_note": "Future plc's COACH fitness and health magazine. Verified 2026-07-14: despite the domain, this is NOT the Coach fashion brand's storefront — it is an editorial publisher, and one of the most-cited hosts in our audit history (44 citations).",
+      "outreach_hint": "Editorial pitch to Future plc's health/fitness desk — review units and expert commentary.",
+      "tier": 2,
+      "ai_grounding_weight": "medium"
+    },
+    "dermondemand.com": {
+      "type": "editorial",
+      "subtype": "educational",
+      "categories": ["beauty", "skincare", "health"],
+      "aliases": ["DermOnDemand"],
+      "coverage_note": "Teledermatology service connecting patients to board-certified dermatologists; cited as clinical authority on skin conditions rather than as a product source.",
+      "outreach_hint": "Clinical-authority relationship — dermatologist endorsement/citation, not a listing.",
+      "tier": 3,
+      "ai_grounding_weight": "low"
+    },
+    "osvidermatology.com": {
+      "type": "editorial",
+      "subtype": "educational",
+      "categories": ["beauty", "skincare", "health"],
+      "aliases": ["OSV Dermatology", "OC Skin Vitality"],
+      "coverage_note": "Southern California board-certified dermatology practice with an attached skincare shop; cited for clinical skin guidance. Verified 2026-07-14.",
+      "outreach_hint": "Clinical/professional channel — dermatologist recommendation, secondarily a professional retail shelf.",
+      "tier": 3,
+      "ai_grounding_weight": "low"
+    },
+    "proteinjug.com": {
+      "type": "editorial",
+      "subtype": "review_site",
+      "categories": ["wellness", "home", "lifestyle", "supplements"],
+      "aliases": ["Protein Jug"],
+      "coverage_note": "Editorial resource site publishing research-backed wellness, home and lifestyle product recommendations. Verified 2026-07-14 — a content site, not a store.",
+      "outreach_hint": "Editorial pitch — inclusion in its product roundups.",
+      "tier": 3,
+      "ai_grounding_weight": "low"
+    },
+    "beautycon.com": {
+      "type": "editorial",
+      "subtype": "magazine",
+      "categories": ["beauty", "makeup", "skincare"],
+      "aliases": ["Beautycon"],
+      "coverage_note": "Beautycon (the beauty festival/media brand) now redirects to Refinery29's Beautycon hub. Verified 2026-07-14 — an editorial/events property, not a retailer.",
+      "outreach_hint": "Editorial/events — pitch via Refinery29's beauty desk and festival activations.",
+      "tier": 3,
+      "ai_grounding_weight": "low"
+    },
+    "boundlessmag.com": {
+      "type": "editorial",
+      "subtype": "magazine",
+      "categories": ["wellness", "lifestyle", "beauty"],
+      "aliases": ["Boundless", "Boundless Magazine"],
+      "coverage_note": "Independent lifestyle/wellness magazine appearing in grounded answers for category roundups.",
+      "outreach_hint": "Editorial pitch — small independent desk, fast to respond.",
+      "tier": 3,
+      "ai_grounding_weight": "low"
+    },
+    "awomansconfidence.com": {
+      "type": "editorial",
+      "subtype": "review_site",
+      "categories": ["beauty", "skincare", "makeup", "lifestyle"],
+      "aliases": ["A Woman's Confidence"],
+      "coverage_note": "Personal beauty/skincare blog (reviews, comparisons, tutorials) with outsized grounding pickup for long-tail comparison queries. Verified 2026-07-14.",
+      "outreach_hint": "Creator/blogger outreach — product seeding for review coverage.",
+      "tier": 3,
+      "ai_grounding_weight": "low"
+    },
+    "reallyree.com": {
+      "type": "editorial",
+      "subtype": "review_site",
+      "categories": ["beauty", "skincare", "makeup", "haircare"],
+      "aliases": ["Really Ree"],
+      "coverage_note": "Long-running UK beauty blog publishing reviews and 'best of' roundups; strong UK-region grounding. Verified 2026-07-14 (has an attached own-label shop, but the citable surface is editorial).",
+      "outreach_hint": "Creator/blogger outreach — UK product seeding.",
+      "tier": 3,
+      "ai_grounding_weight": "low"
+    },
+    "chrislovesjulia.com": {
+      "type": "editorial",
+      "subtype": "review_site",
+      "categories": ["home", "lifestyle", "beauty"],
+      "aliases": ["Chris Loves Julia"],
+      "coverage_note": "High-traffic home/lifestyle blog whose product recommendations are grounded for home and lifestyle queries.",
+      "outreach_hint": "Creator partnership — product seeding and affiliate placement.",
+      "tier": 3,
+      "ai_grounding_weight": "low"
+    },
+    "organicallybecca.com": {
+      "type": "editorial",
+      "subtype": "review_site",
+      "categories": ["beauty", "skincare", "wellness"],
+      "aliases": ["Organically Becca"],
+      "coverage_note": "Clean-beauty blogger publishing ingredient-led reviews and non-toxic product roundups; cited for 'clean'/'non-toxic' category queries.",
+      "outreach_hint": "Creator outreach — ingredient transparency is the price of entry.",
+      "tier": 3,
+      "ai_grounding_weight": "low"
+    },
+    "lush.com": {
+      "type": "brand",
+      "subtype": "beauty_retailer",
+      "categories": ["beauty", "skincare", "haircare", "bath"],
+      "aliases": ["Lush", "Lush Cosmetics"],
+      "coverage_note": "Lush's own single-brand storefront. A citation here means AI pointed the shopper at a competing brand's store.",
+      "outreach_hint": "Not an outreach target — this is a rival's storefront. Compete on the category query, don't pitch it."
+    },
+    "imageskincare.com": {
+      "type": "brand",
+      "subtype": "beauty_retailer",
+      "categories": ["beauty", "skincare"],
+      "aliases": ["IMAGE Skincare", "Image Skincare"],
+      "coverage_note": "IMAGE Skincare's own single-brand storefront (professional/clinical skincare).",
+      "outreach_hint": "Not an outreach target — rival brand storefront."
+    },
+    "matrix.com": {
+      "type": "brand",
+      "subtype": "beauty_retailer",
+      "categories": ["beauty", "haircare"],
+      "aliases": ["Matrix"],
+      "coverage_note": "Matrix (L'Oreal professional haircare) single-brand storefront. Verified 2026-07-14.",
+      "outreach_hint": "Not an outreach target — rival brand storefront."
+    },
+    "yonka.com": {
+      "type": "brand",
+      "subtype": "luxury",
+      "categories": ["beauty", "skincare"],
+      "aliases": ["Yon-Ka", "Yon-Ka Paris", "Yonka"],
+      "coverage_note": "Yon-Ka Paris' own single-brand storefront (professional botanical skincare).",
+      "outreach_hint": "Not an outreach target — rival brand storefront."
+    },
+    "meadowandbark.com": {
+      "type": "brand",
+      "subtype": "beauty_retailer",
+      "categories": ["beauty", "skincare"],
+      "aliases": ["Meadow and Bark", "Meadow & Bark"],
+      "coverage_note": "Meadow and Bark's own single-brand natural-skincare storefront. Verified 2026-07-14.",
+      "outreach_hint": "Not an outreach target — rival brand storefront."
+    },
+    "shopzygo.com": {
+      "type": "brand",
+      "subtype": "mass_market",
+      "categories": ["electronics", "audio", "wearables", "fitness"],
+      "aliases": ["Zygo", "Shop Zygo"],
+      "coverage_note": "Zygo's own single-brand storefront — waterproof bone-conduction swim headphones. Verified 2026-07-14: a DIRECT competitor to bone-conduction audio brands in the catalog. The 'shop' prefix makes it read like a retailer; it is a brand storefront.",
+      "outreach_hint": "Not an outreach target — rival brand storefront. Compete on the swim/bone-conduction category queries."
+    },
+    "klarna.com": {
+      "type": "marketplace",
+      "subtype": "creator_platform",
+      "categories": ["beauty", "fashion", "electronics"],
+      "aliases": ["Klarna"],
+      "coverage_note": "Klarna is a payments provider whose shopping app aggregates product listings; engines name it as a 'competitor', but it is a payment/discovery platform, not a rival brand or an endorsement.",
+      "outreach_hint": "No editorial lever — a payment/discovery surface. Citations here prove findability only."
+    },
+    "doordash.com": {
+      "type": "marketplace",
+      "subtype": "regional",
+      "categories": ["beauty", "health", "wellness", "grocery"],
+      "aliases": ["DoorDash"],
+      "coverage_note": "DoorDash's on-demand delivery marketplace now carries convenience/beauty SKUs; named by engines as a 'competitor' but it is a delivery channel.",
+      "outreach_hint": "Marketplace/delivery listing via retail partners — no editorial lever."
+    },
+    "hair.com": {
+      "type": "brand",
+      "subtype": "brand_owned_media",
+      "categories": ["beauty", "haircare"],
+      "aliases": ["Hair.com", "Hair.com by L'Oreal", "L'Oreal Hair.com"],
+      "coverage_note": "Hair.com By L'Oreal is L'Oreal's own house media + storefront for its Professional Products portfolio (Redken, Kerastase, Matrix, Pureology, Mizani). Verified 2026-07-14 from its own page titles ('25 of the Best Hair Products from L'Oreal Pro Brands') and from the pages our audits cited (best-hair-oil.html, hair-oil-for-frizz.html): the roundups read editorial but only ever recommend L'Oreal-owned brands. Neither a neutral retailer nor a single brand — a corporate portfolio's owned media.",
+      "outreach_hint": "NOT an outreach target despite the editorial format: its 'best of' lists only feature L'Oreal Pro brands, so a rival can never be cited there. Compete on the category query instead."
     }
   }
 }
