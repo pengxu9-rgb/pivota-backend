@@ -383,6 +383,10 @@ _MAJOR_PUBLISHER_HOSTS = frozenset({
     "vogue.com", "forbes.com", "marieclaire.com", "allure.com", "elle.com",
     "cosmopolitan.com", "goodhousekeeping.com", "harpersbazaar.com", "glamour.com",
     "instyle.com", "refinery29.com", "womenshealthmag.com", "nytimes.com", "wsj.com",
+    # Consumer Reports buys every tested product anonymously at retail and
+    # accepts no pitches or samples — the crowd-review first_move its
+    # review_site subtype would otherwise get is dishonest for CR.
+    "consumerreports.org",
 })
 _REVIEW_BUILD_FIRST_MOVE = (
     "Earn authentic reviews and keep your product listing accurate in their "

@@ -171,6 +171,21 @@ def test_common_word_aliases_resolve_only_on_exact_match():
     hit = classify_host("Target", merchant_category="beauty")
     assert hit["host"] == "target.com"
     assert hit["type"] == "retailer"
+    # Generic magazine-title phrases must not fabricate a cited host from a
+    # coincidental citation title ("living between town and country in
+    # provence" is not townandcountrymag.com)...
+    for title, wrong_host in (
+        ("chrysler town and country review", "townandcountrymag.com"),
+        ("living between town and country in provence", "townandcountrymag.com"),
+        ("best travel and leisure gadgets for summer", "travelandleisure.com"),
+    ):
+        miss = classify_host(title)
+        assert miss["type"] == "unclassified", title
+        assert miss["host"] != wrong_host, title
+    # ...but the exact titles and the distinctive "&"/"+" forms still resolve.
+    assert classify_host("Town and Country")["host"] == "townandcountrymag.com"
+    assert classify_host("Town & Country")["host"] == "townandcountrymag.com"
+    assert classify_host("Travel + Leisure")["host"] == "travelandleisure.com"
 
 
 def test_applies_to_merchant_category_false_when_category_mismatch():
@@ -363,8 +378,9 @@ def test_major_magazine_titles_classified_with_magazine_subtype():
 def test_bluemercury_registered_as_profile_retailer_token():
     """'bluemercury' is a beauty retailer token (peer of sephora/ulta): the
     name-form must be recognized by the competitor filter, and regional /
-    subdomain host variants must classify as retailer via the profile-token
-    fallback even without a per-host registry entry."""
+    subdomain host variants must still classify as retailer (via the alias
+    substring path with the registry loaded; the profile-token fallback covers
+    the same variants if the registry entry is ever dropped)."""
     from services.cited_host_classifier import classify_host, is_profile_retailer_name
 
     assert is_profile_retailer_name("Bluemercury")

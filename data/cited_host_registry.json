@@ -537,7 +537,7 @@
       "type": "editorial",
       "subtype": "review_aggregator",
       "categories": ["beauty", "skincare", "kbeauty"],
-      "aliases": ["Glowpick", "글로우픽"],
+      "aliases": ["Glowpick"],
       "coverage_note": "Glowpick (글로우픽) is a leading Korean cosmetics review-and-ranking platform (peer of Hwahae) whose consumer-review-driven rankings and Glowpick Awards AI grounds for K-beauty 'best X' and product-rating queries.",
       "outreach_hint": "Editorial / database channel — earn authentic consumer reviews and keep product listings accurate; rankings and awards are review-driven, not a paid-placement surface."
     },
@@ -579,7 +579,7 @@
       "type": "editorial",
       "subtype": "magazine",
       "categories": ["fashion", "beauty", "lifestyle"],
-      "aliases": ["GQ"],
+      "aliases": ["GQ Magazine"],
       "coverage_note": "Condé Nast men's magazine; its Grooming Awards and best-of roundups are AI-grounded for men's grooming, skincare, and style queries.",
       "outreach_hint": "Editorial pitch via PR / agency relationships — major-publisher desk, realistic mainly for established brands."
     },

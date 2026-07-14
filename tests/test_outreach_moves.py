@@ -128,9 +128,13 @@ def test_anuko_hosts_route_to_specific_playbooks_not_catchall():
     assert moves["glowpick.com"]["first_move"] == _REVIEW_BUILD_FIRST_MOVE
     assert moves["glowpick.com"]["realism"] == "reachable"
 
-    # Review site → editorial outreach, reachable.
+    # Consumer Reports buys tested products anonymously and takes no pitches —
+    # it's in _MAJOR_PUBLISHER_HOSTS so the crowd-review first_move its
+    # review_site subtype would otherwise get (dishonest for CR) is replaced by
+    # the indirect-path reframe.
     assert moves["consumerreports.org"]["lever"] == "editorial_outreach"
-    assert moves["consumerreports.org"]["realism"] == "reachable"
+    assert moves["consumerreports.org"]["realism"] == "hard"
+    assert moves["consumerreports.org"]["first_move"] == _MAJOR_PUBLISHER_FIRST_MOVE
 
     # Magazine subtype → major-publisher realism gate: no cold-pitch advice.
     assert moves["cntraveler.com"]["realism"] == "hard"
