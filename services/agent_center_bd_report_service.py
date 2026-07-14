@@ -7978,6 +7978,44 @@ def _flag_competitor_by_name(row: Dict[str, Any], competitor_aliases: frozenset)
     return False
 
 
+def _strip_own_brand_competitors(names, brand_lower: str, brand_aliases) -> List[str]:
+    """Drop the merchant's own brand / known aliases from a raw
+    ``competitors_listed`` list before those names reach a cited host's
+    ``competitors_named`` or the run-level competitor pool.
+
+    Engines sometimes name the merchant itself among "competitors" in their
+    grounded self-report. Left unfiltered, the merchant's own brand leaks into
+    ``competitors_named`` and — post-#1382 — trips the ``recommends_rival``
+    outreach move with the "rival" actually being the merchant.
+
+    Matching mirrors the ``_brand_in`` own-brand test used for RunFacts: a
+    word-boundary match once the brand is long enough to be specific
+    (``len >= 4``), substring only for very short brands, plus the shared
+    alias-boundary matcher. The word boundary stops a short/common-word brand
+    (e.g. "Glow") from erasing a genuine rival ("Glow Recipe") now that these
+    names feed an outreach surface — the plain bidirectional substring the
+    run-brand tally uses would over-strip here."""
+    use_word_boundary = bool(brand_lower) and len(brand_lower) >= 4
+    brand_pattern = (
+        re.compile(r"\b" + re.escape(brand_lower) + r"\b") if use_word_boundary else None
+    )
+    out: List[str] = []
+    for name in names or ():
+        if not isinstance(name, str) or not name.strip():
+            continue
+        name_lower = name.strip().lower()
+        if brand_lower:
+            if brand_pattern is not None:
+                if brand_pattern.search(name_lower) is not None:
+                    continue  # the merchant's own brand (word-boundary)
+            elif brand_lower in name_lower:
+                continue  # short brand: substring, boundary FP class already moot
+        if brand_aliases and text_mentions_brand(name_lower, brand_aliases):
+            continue  # an alias of the merchant, not a rival
+        out.append(name)
+    return out
+
+
 def _citation_role(
     host_type: Optional[str],
     first_party: bool,
@@ -8225,6 +8263,10 @@ def build_authority_map(
         merchant_host,
         _clean_identity_tuple(merchant_vendors),
     )
+    # Lowercased merchant brand for the own-brand competitor skip below (mirrors
+    # the run-brand tally's `brand_lower`), so an engine that lists the merchant
+    # among its "competitors" can't surface the merchant as its own rival.
+    brand_lower = (merchant_brand or "").strip().lower()
 
     sku_entries: List[Dict[str, Any]] = []
     host_matrix: Dict[str, Dict[str, Any]] = {}
@@ -8256,7 +8298,15 @@ def build_authority_map(
             parsed = run.get("parsed") if isinstance(run.get("parsed"), dict) else {}
             url_match = run.get("url_match") if isinstance(run.get("url_match"), dict) else {}
             llm_report = url_match.get("llm_self_report") if isinstance(url_match.get("llm_self_report"), dict) else {}
-            competitors = parsed.get("competitors_listed") or parsed.get("competitors_appearing") or run.get("competitors_listed") or []
+            # Strip the merchant's own brand/aliases first: an engine that lists
+            # the merchant among its "competitors" must not surface the merchant
+            # as its own rival (or trip a recommends_rival outreach move) — the
+            # run-brand tally already applies the same own-brand skip.
+            competitors = _strip_own_brand_competitors(
+                parsed.get("competitors_listed") or parsed.get("competitors_appearing") or run.get("competitors_listed") or [],
+                brand_lower,
+                brand_aliases,
+            )
             run_competitor_brands.update(
                 c for c in competitors if isinstance(c, str) and c.strip()
             )
