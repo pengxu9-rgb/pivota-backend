@@ -57,13 +57,29 @@
       "coverage_note": "Women's Health covers supplements, beauty-from-within, and fitness products in frequently-cited roundups.",
       "outreach_hint": "Editorial pitch to the health/beauty desk; creator and expert tie-ins help."
     },
+    "cosmopolitan.com": {
+      "type": "editorial",
+      "subtype": "review_site",
+      "categories": ["beauty", "fashion", "wellness", "lifestyle"],
+      "aliases": ["Cosmopolitan", "Cosmo"],
+      "coverage_note": "Cosmopolitan (Hearst) runs beauty/lifestyle product roundups and reviews that AI grounds for 'best {beauty/lifestyle}' queries.",
+      "outreach_hint": "Coverage is beauty/commerce-editor and PR-relationship driven — Hearst publishes no public product-pitch inbox or submission form that could be verified (2026-07-14). Treat as an editor-relationship target, not a self-serve channel."
+    },
+    "health.clevelandclinic.org": {
+      "type": "editorial",
+      "subtype": "educational",
+      "categories": ["health", "wellness", "supplements", "skincare", "beauty"],
+      "aliases": ["Cleveland Clinic", "Cleveland Clinic Health Essentials"],
+      "coverage_note": "Cleveland Clinic Health Essentials is the hospital's clinician-driven consumer-health content site; AI treats it as high-authority grounding for health, supplement, and ingredient-safety queries.",
+      "outreach_hint": "No product-pitch path exists: articles are written with and medically approved by Cleveland Clinic experts, and the site states explicit editorial independence ('does not endorse any of the products and services advertised'). Its published inboxes (editorial@ccf.org for content questions, healthessentials@ccf.org for the newsletter) are not product-submission channels. The honest lever is clinical/ingredient evidence a Cleveland Clinic expert might independently cite — not outreach."
+    },
     "stylevana.com": {
       "type": "retailer",
       "subtype": "beauty_retailer",
       "categories": ["beauty", "skincare", "kbeauty"],
       "aliases": ["Stylevana"],
       "coverage_note": "Stylevana is a major K-beauty cross-border retailer; AI routes K-beauty buying queries (Korean collagen, sunscreen, skincare) through its listings.",
-      "outreach_hint": "Wholesale/marketplace onboarding plus accurate listing titles, stock, and reviews."
+      "outreach_hint": "No public brand-supplier or 'sell with us' channel is published on stylevana.com (only customer support and an affiliate/blogger program); Stylevana sources via distributors, so brand onboarding is a BD-relationship motion, not a public form. (Verified 2026-07-14.)"
     },
     "yesstyle.com": {
       "type": "retailer",
@@ -71,7 +87,12 @@
       "categories": ["beauty", "skincare", "kbeauty", "fashion"],
       "aliases": ["YesStyle"],
       "coverage_note": "YesStyle is a large Asian beauty and fashion retailer frequently cited by AI as a buying route for K-beauty skincare and supplements.",
-      "outreach_hint": "Marketplace onboarding plus listing optimization (title, attributes, availability, reviews)."
+      "outreach_hint": "Marketplace onboarding via YesStyle's Business Opportunities form, plus listing optimization (title, attributes, availability, reviews).",
+      "pitch_recipient": {
+        "email": null,
+        "submission_url": "https://www.yesstyle.com/en/about-us/business-opportunities.html",
+        "note": "YesStyle's official Business Opportunities page is a self-serve brand/supplier submission form ('our business development team will review the information and contact potential partners shortly'); verified 2026-07-14. Form-only, no email published; timeline stated only as 'shortly', so no cycle is recorded. The separate asianbeautywholesale.com, affiliate, and influencer programs are distinct channels."
+      }
     },
     "stylekorean.com": {
       "type": "retailer",
@@ -79,7 +100,7 @@
       "categories": ["beauty", "skincare", "kbeauty"],
       "aliases": ["StyleKorean"],
       "coverage_note": "StyleKorean is a K-beauty retailer and brand aggregator AI cites for Korean skincare and beauty-supplement purchase routes.",
-      "outreach_hint": "Wholesale/retailer onboarding plus accurate, review-backed product listings."
+      "outreach_hint": "No self-serve brand-supplier channel is published on stylekorean.com: its wholesale.stylekorean.com page is a buy-side reseller account (retailers/shops purchasing in bulk), not brand onboarding. Brand-supplier deals run through parent Silicon2 — a BD-relationship motion, not a public form. (Verified 2026-07-14.)"
     },
     "nymag.com": {
       "type": "editorial",
@@ -194,7 +215,7 @@
       "subtype": "fashion",
       "categories": ["fashion", "sleepwear", "beauty"],
       "coverage_note": "High-fashion editorial; product mentions skew luxury/premium D2C. AI-channel grounded for trend + lifestyle queries.",
-      "outreach_hint": "Pitch Vogue editorial team via PR / agency relationships."
+      "outreach_hint": "Vogue publishes no public product-pitch inbox or submission form (verified 2026-07-14); consumer-product coverage is editor/PR-relationship driven. There is no self-serve channel — pattern-guessed condenast.com addresses on PR blogs are not official."
     },
     "voguescandinavia.com": {
       "type": "editorial",
@@ -229,7 +250,12 @@
       "subtype": "beauty",
       "categories": ["beauty"],
       "coverage_note": "Beauty-only editorial; Best of Beauty awards are highly weighted in grounded retrieval.",
-      "outreach_hint": "Best of Beauty submission process — annual cycle."
+      "outreach_hint": "Best of Beauty submission process — annual cycle; submit products via the Condé Nast form when the window opens.",
+      "pitch_recipient": {
+        "email": null,
+        "submission_url": "https://condenast-interactive.typeform.com/allure-bob-2025",
+        "note": "Allure Best of Beauty is a paid annual product-submission program on a Condé Nast-hosted Typeform (title 'Allure Best of Beauty 2025 Submissions'); verified live 2026-07-14. The slug rotates each cycle (condenast-interactive.typeform.com/allure-bob-<year>) and windows open in fall/winter — BD should refresh this URL each cycle. No editorial pitch email is published on allure.com; the address circulating on third-party PR blogs is not officially printed, so it is not recorded here."
+      }
     },
     "byrdie.com": {
       "type": "editorial",
@@ -244,7 +270,7 @@
       "subtype": "fashion",
       "categories": ["fashion", "sleepwear", "beauty"],
       "coverage_note": "Fashion-trend-driven editorial; affiliate roundups. AI-cited on trend queries.",
-      "outreach_hint": "Editorial pitch — trend-led angle."
+      "outreach_hint": "Who What Wear publishes no product-pitch channel — its contact page lists only social handles (verified 2026-07-14). Coverage is editor/PR-driven; the advertising@ address seen in search snippets is not printed on an official page, so it is not recorded."
     },
     "popsugar.com": {
       "type": "editorial",
@@ -364,7 +390,12 @@
       "categories": ["beauty", "skincare"],
       "aliases": ["Bluemercury", "Blue Mercury"],
       "coverage_note": "Bluemercury is a US prestige-beauty and spa specialty retailer (Macy's-owned, ~180 stores); AI cites its listings for luxury/prestige skincare and beauty buying queries.",
-      "outreach_hint": "Wholesale onboarding — Bluemercury merchant/vendor relations; positioned for prestige and indie-luxe brands."
+      "outreach_hint": "Wholesale onboarding — Bluemercury vendor submissions run through RangeMe; positioned for prestige and indie-luxe brands.",
+      "pitch_recipient": {
+        "email": null,
+        "submission_url": "https://www.rangeme.com/bluemercury",
+        "note": "Bluemercury's vendor page (bluemercury.com/pages/vendor-submissions) routes all brand submissions to RangeMe ('Become a Supplier for Bluemercury'); verified 2026-07-14. No pitch email is published and outreach is discretionary ('if we feel a partnership would be a good fit, we'll be in touch'), so no response cycle is stated."
+      }
     },
     "iherb.com": {
       "type": "retailer",
@@ -495,7 +526,12 @@
       "categories": ["beauty"],
       "aliases": ["Olive Young", "Olive Young Global"],
       "coverage_note": "K-beauty specialty retailer (international); high AI-channel grounding for K-beauty queries.",
-      "outreach_hint": "K-beauty wholesale — Olive Young vendor relations."
+      "outreach_hint": "K-beauty wholesale — apply via CJ Olive Young's Business Partnership Inquiry form (Global Partnership option).",
+      "pitch_recipient": {
+        "email": null,
+        "submission_url": "https://corp.oliveyoung.com/en/inquiry/business",
+        "note": "CJ Olive Young's official Business Partnership Inquiry form; the Field-of-Interest dropdown includes 'Global Partnership'. Verified 2026-07-14. Form-only, no email published (already-onboarded suppliers use the separate partner.oliveyoung.co.kr portal); the page states it does not provide individual status updates, so no response cycle is recorded."
+      }
     },
     "kiwla.com": {
       "type": "retailer",
@@ -505,13 +541,68 @@
       "coverage_note": "Kiwla is a multi-brand online beauty/skincare/haircare/supplement retailer (India) carrying authentic curated brands; AI cites its listings as a buying route for K-beauty and skincare queries in the India market.",
       "outreach_hint": "Multi-brand retailer onboarding (India) — confirm market relevance plus accurate, review-backed listings."
     },
+    "fabfitfun.com": {
+      "type": "retailer",
+      "subtype": "beauty_retailer",
+      "categories": ["beauty", "wellness", "lifestyle", "fashion"],
+      "aliases": ["FabFitFun"],
+      "coverage_note": "FabFitFun is a US lifestyle subscription box (beauty, wellness, fashion, home); AI cites it as a discovery/buying route for beauty and self-care products.",
+      "outreach_hint": "Supplier onboarding to get products into the box — apply via FabFitFun's Suppliers page (RangeMe intake).",
+      "pitch_recipient": {
+        "email": null,
+        "submission_url": "https://fabfitfun.com/suppliers",
+        "note": "FabFitFun's official Suppliers page routes all brand submissions through RangeMe (https://www.rangeme.com/fabfitfun): create a profile, upload product info, and buyers review and follow up. Verified 2026-07-14. Portal-only, no email published, no response cycle stated. (fabfitfun.com/brands and /partners 404 — /suppliers is the live intake.)"
+      }
+    },
     "oliveyoung.com": {
       "type": "retailer",
       "subtype": "beauty_retailer",
       "categories": ["beauty", "skincare", "kbeauty"],
       "aliases": ["Olive Young Korea"],
-      "coverage_note": "Olive Young is Korea's dominant domestic K-beauty specialty retailer (the .com domestic storefront alongside the international oliveyoungglobal.com); very high AI-channel grounding for Korean skincare and beauty queries.",
-      "outreach_hint": "K-beauty wholesale — Olive Young vendor relations; coordinate domestic (oliveyoung.com) and global (oliveyoungglobal.com) listings."
+      "coverage_note": "Olive Young is Korea's dominant domestic K-beauty specialty retailer (the .com domestic storefront alongside the international oliveyoungglobal.com and the .co.kr Korean site); very high AI-channel grounding for Korean skincare and beauty queries.",
+      "outreach_hint": "K-beauty wholesale — apply via CJ Olive Young's Business Partnership Inquiry form; coordinate domestic (oliveyoung.co.kr) and global (oliveyoungglobal.com) listings.",
+      "pitch_recipient": {
+        "email": null,
+        "submission_url": "https://corp.oliveyoung.com/en/inquiry/business",
+        "note": "CJ Olive Young's official Business Partnership Inquiry form (domestic and global vendor entry). Verified 2026-07-14. Form-only, no email published; already-onboarded suppliers use partner.oliveyoung.co.kr. No response cycle stated."
+      }
+    },
+    "oliveyoung.co.kr": {
+      "type": "retailer",
+      "subtype": "beauty_retailer",
+      "categories": ["beauty", "skincare", "kbeauty"],
+      "aliases": ["Olive Young", "Olive Young Korea"],
+      "coverage_note": "Olive Young's Korean domestic storefront (oliveyoung.co.kr) — Korea's dominant K-beauty specialty retailer; the domain most frequently grounded by AI for Korean skincare and beauty queries.",
+      "outreach_hint": "K-beauty wholesale (입점) — apply via CJ Olive Young's Business Partnership Inquiry form.",
+      "pitch_recipient": {
+        "email": null,
+        "submission_url": "https://corp.oliveyoung.com/en/inquiry/business",
+        "note": "CJ Olive Young's official Business Partnership Inquiry form is the domestic vendor-entry (입점) channel. Verified 2026-07-14. Form-only, no email published; already-onboarded suppliers use the separate partner.oliveyoung.co.kr Partner Office. The page states CJ Olive Young does not provide individual status updates, so no response cycle is recorded."
+      }
+    },
+    "sokoglam.com": {
+      "type": "retailer",
+      "subtype": "beauty_retailer",
+      "categories": ["beauty", "skincare", "kbeauty"],
+      "aliases": ["Soko Glam"],
+      "coverage_note": "Soko Glam is a curated US K-beauty retailer; AI cites its listings and curation as a buying route and trust signal for Korean skincare queries.",
+      "outreach_hint": "No self-serve vendor/brand-submission process is published (verified 2026-07-14). Curation is internal and founder-led: Soko Glam invites product *suggestions* at hello@sokoglam.com ('our team tests each and every product before deciding whether to curate it'), but that is a general customer-suggestions inbox, not a brand-pitch channel — getting curated is a BD-relationship motion."
+    },
+    "dermstore.com": {
+      "type": "retailer",
+      "subtype": "beauty_retailer",
+      "categories": ["beauty", "skincare"],
+      "aliases": ["Dermstore"],
+      "coverage_note": "Dermstore is a US dermatologist-founded beauty/skincare e-tailer (THG-owned); AI cites its listings for prestige and derm-recommended skincare buying queries.",
+      "outreach_hint": "No public vendor/brand-submission or 'sell on Dermstore' page exists (verified 2026-07-14; only an affiliate-marketing page for creators). Brand onboarding runs through THG buyer relationships — a BD motion, not a public form."
+    },
+    "jolse.com": {
+      "type": "retailer",
+      "subtype": "beauty_retailer",
+      "categories": ["beauty", "skincare", "kbeauty"],
+      "aliases": ["Jolse"],
+      "coverage_note": "Jolse is a Korea-based K-beauty online retailer shipping internationally; AI cites it as a buying route for Korean skincare and beauty.",
+      "outreach_hint": "No dedicated brand-partnership/wholesale page or address is published (verified 2026-07-14) — jolse.com exposes only a general CONTACT form / 1:1 account inquiry for customer support. US wholesale is handled by affiliate Beauty Bridge (Barunson), so brand onboarding is a BD-relationship motion, not a public pitch channel."
     },
     "skinsort.com": {
       "type": "editorial",

@@ -284,3 +284,92 @@ def test_defensive_on_garbage_input():
         per_sku_reports=[None, {"sku_key": "a"}, 7],
         authority_map={"skus": [None, 3]},
     )["available"] is False
+
+
+def _allure_fixture() -> Dict[str, Any]:
+    """A losing category query grounded in allure.com — an editorial beauty host
+    whose pitch_recipient was populated in the 2026-07-14 registry fill (the
+    Best of Beauty submission form). Editorial beauty maps to a playbook with a
+    pitch_template, so the win plan renders a paste-ready submission draft.
+    Exercises the exact production path off the REAL registry."""
+    per_sku_reports = [
+        {
+            "sku_key": "collagen",
+            "sku_title": "Tofu Collagen Jelly Cream",
+            "failing_prompts": [
+                {
+                    "query": "best collagen cream for glow",
+                    "axis": "category",
+                    "grounding_sources": [_src("vx://allure-1")],
+                    "competitors_named": ["Vital Proteins"],
+                },
+            ],
+        }
+    ]
+    authority_map = {
+        "skus": [
+            {
+                "sku_key": "collagen",
+                "authority_hosts": [
+                    _host_row("allure.com", "editorial_review", ["vx://allure-1"]),
+                ],
+            }
+        ]
+    }
+    return {"per_sku_reports": per_sku_reports, "authority_map": authority_map}
+
+
+def test_newly_filled_editorial_host_flips_ladder_and_renders_draft():
+    # Regression for the 2026-07-14 pitch_recipient fill: allure.com was
+    # target_only; it must now reach submission_only off the REAL registry and
+    # render a paste-ready pitch_draft via the playbook engine
+    # (build_pitch_draft_for_host) on the honest submission_form channel —
+    # never a fabricated mailto (recipient_email stays None).
+    fx = _allure_fixture()
+    plan = build_win_plan(merchant_name="Aruen", merchant_category="beauty", **fx)
+    q = _query(_collagen_plan(plan), "best collagen cream for glow")
+    allure = next(t["outreach"] for t in q["grounds_in"] if t["host"] == "allure.com")
+
+    assert allure["state"] == OUTREACH_SUBMISSION_ONLY
+    assert allure["recipient"]["submission_url"]        # real registry form URL
+    assert allure["recipient"]["email"] is None         # no fabricated email
+    draft = allure["pitch_draft"]
+    assert draft is not None                             # rendered via playbook
+    assert draft["channel"] == "submission_form"
+    assert draft["recipient_email"] is None
+    assert draft["submission_url"] == allure["recipient"]["submission_url"]
+    assert "Aruen" in draft["body"]                      # keyed to the merchant
+    assert "Vital Proteins" in draft["body"]             # this query's benchmark
+
+    # Rollup: a rendered draft makes allure pitch-ready without being emailable
+    # (draft_ready stays an email-only registry fact).
+    roll = plan["rollup"]
+    assert "allure.com" in roll["pitch_ready_hosts"]
+    assert "allure.com" not in roll["draft_ready_hosts"]
+
+
+def test_newly_filled_retailer_host_reaches_submission_only_without_fabrication():
+    # The retailer fills (e.g. oliveyoung.co.kr vendor-inquiry form) flip the
+    # outreach ladder to submission_only off the REAL registry via classify_host,
+    # with no fabricated email. The wholesale playbook carries no pitch_template,
+    # so build_pitch_draft_for_host honestly renders no one-click draft — the
+    # ladder still advances past target_only, which is the win-plan gate.
+    from services.cited_host_classifier import classify_host, reset_registry_cache
+    from services.audit_playbook_engine import build_pitch_draft_for_host
+    from services.win_plan_builder import _outreach_from_meta
+
+    reset_registry_cache()
+    meta = classify_host("oliveyoung.co.kr", merchant_category="beauty")
+    recipient = meta.get("pitch_recipient")
+    assert recipient and recipient.get("submission_url")   # real vendor form
+    assert recipient.get("email") is None                  # no fabricated email
+
+    outreach = _outreach_from_meta(meta)
+    assert outreach["state"] == OUTREACH_SUBMISSION_ONLY    # flipped off target_only
+
+    # No pitch_template for the wholesale playbook -> honest "no draft".
+    assert build_pitch_draft_for_host(
+        meta, merchant_name="Aruen", merchant_category="beauty",
+        example_query="best k-beauty collagen", competitors_named=["Vital Proteins"],
+        allow_submission_channel=True,
+    ) is None
