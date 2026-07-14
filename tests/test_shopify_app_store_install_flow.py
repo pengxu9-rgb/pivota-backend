@@ -263,3 +263,58 @@ def test_resolve_shopify_app_falls_back_to_single_creds(monkeypatch: pytest.Monk
     assert a.client_id == "single_id" and a.client_secret == "single_secret"
     b = module.resolve_shopify_app("merchant_portal")
     assert b.client_id == "single_id" and b.client_secret == "single_secret"
+
+
+def _callback_request(query: str) -> Request:
+    scope = {
+        "type": "http",
+        "method": "GET",
+        "path": "/integrations/shopify/oauth/callback",
+        "query_string": query.encode("utf-8"),
+        "headers": [],
+    }
+    return Request(scope)
+
+
+@pytest.mark.asyncio
+async def test_shopify_oauth_callback_redirects_instead_of_rendering_json(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The callback is loaded by a browser, so a failure must never render JSON.
+
+    Shopify review flags a raw/pretty-printed JSON page as a display error (2.1.1);
+    every failure path must 302 to the portal's install-error page instead.
+    """
+    import routes.merchant_store_connections as module
+    from fastapi import HTTPException
+    from fastapi.responses import RedirectResponse
+
+    monkeypatch.setattr(module.settings, "merchant_portal_base_url", "https://merchant.example.com")
+
+    # Each internal failure -> its own non-leaky reason slug on a 302.
+    cases = [
+        (HTTPException(status_code=400, detail="Invalid or expired OAuth state (reason=state_not_found)"), "state_not_found"),
+        (HTTPException(status_code=400, detail="Invalid or expired OAuth state (reason=state_already_used)"), "state_already_used"),
+        (HTTPException(status_code=401, detail="Invalid Shopify OAuth signature"), "invalid_signature"),
+        (HTTPException(status_code=400, detail="Failed to exchange Shopify access token"), "token_exchange_failed"),
+        (HTTPException(status_code=500, detail="Shopify OAuth is not configured"), "not_configured"),
+        (RuntimeError("boom"), "install_failed"),  # unexpected crash must also redirect
+    ]
+
+    for raised, expected_reason in cases:
+        async def fake_impl(_request, _raised=raised):
+            raise _raised
+
+        monkeypatch.setattr(module, "_shopify_oauth_callback_impl", fake_impl)
+
+        response = await module.shopify_oauth_callback(
+            _callback_request("shop=demo-shop.myshopify.com&code=c&state=s")
+        )
+
+        assert isinstance(response, RedirectResponse), f"{expected_reason} did not redirect"
+        assert response.status_code == 302
+        location = response.headers["location"]
+        assert location.startswith("https://merchant.example.com/app/install/error?"), location
+        assert f"reason={expected_reason}" in location, location
+        # The internal detail must not leak into the browser URL.
+        assert "Shopify" not in location and "OAuth" not in location
