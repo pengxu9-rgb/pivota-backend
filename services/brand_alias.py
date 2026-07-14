@@ -56,6 +56,52 @@ _PUBLIC_SECOND_LEVEL = frozenset({
 _MIN_ALIAS_LEN = 3
 
 
+# Precomposed Latin letters that carry a diacritic (Latin-1 Supplement through
+# Latin Extended-B; Latin Extended Additional / Vietnamese), plus the combining
+# marks themselves (text that arrives already decomposed). A string containing
+# NONE of these cannot gain a single ASCII character from a canonical fold, so
+# the fold is skipped — which keeps it off Hangul/CJK copy, where NFD explodes
+# Korean syllables into jamo (~4x slower on the hot path) and can never produce
+# an ASCII alias match anyway.
+_FOLDABLE_LATIN_RE = re.compile(r"[À-ɏ̀-ͯḀ-ỿ]")
+
+
+def _fold_diacritics(s: str, *, compat: bool = False) -> str:
+    """Fold accented letters to their ASCII base letter: decompose, then drop
+    the combining marks. 'kérastase' → 'kerastase'.
+
+    `compat` selects the decomposition, and the two callers genuinely need
+    different ones:
+
+      - _normalize (the ALIAS side) passes compat=True for NFKD, because it also
+        has to normalize a fullwidth trademark spelling ('Brand（ｔｍ）') into the
+        ASCII '(tm)' that it knows how to strip.
+      - text_mentions_brand (the TEXT side) must NOT use NFKD. Besides the 246
+        accented letters we want, NFKD maps ~1,100 NON-alphanumeric codepoints
+        INTO [a-z0-9] — 'º' '¹' '②' 'ﬁ' '½' — which manufactures brand mentions
+        out of unrelated copy: alias 'no7' would match the Spanish "serum nº7",
+        and 'the creme' (the stripped core of "The Creme Shop") would match "the
+        crème brûlée". Those false positives cut BOTH ways — they over-credit
+        own-brand visibility, and where a merchant's own aliases are used to
+        filter a rival list they would silently DROP a real competitor. NFD
+        folds the accents and leaves the symbols alone.
+
+    ASCII input is returned untouched (both decompositions are the identity on
+    it), which is the hot path: answer copy is nearly always plain ASCII.
+
+    Does NOT lowercase. NFKD maps compatibility symbols to UPPERCASE ('™' →
+    'TM'), and both callers depend on that staying uppercase so the
+    lowercase-only alnum class / alias patterns scrub it rather than reading it
+    as a real token.
+    """
+    if s.isascii():
+        return s
+    if not compat and not _FOLDABLE_LATIN_RE.search(s):
+        return s
+    decomposed = unicodedata.normalize("NFKD" if compat else "NFD", s)
+    return "".join(ch for ch in decomposed if not unicodedata.combining(ch))
+
+
 def _normalize(text: Optional[str]) -> str:
     """Lowercase, fold diacritics to their ASCII base letter (NFKD, combining
     marks dropped), strip ®/™/(r)/(tm), reduce to alnum tokens joined by single
@@ -75,8 +121,7 @@ def _normalize(text: Optional[str]) -> str:
     # 'Brand（ｔｍ）' → '(tm)' → stripped. (Stripping first would leave a bogus
     # 'tm' token behind.) The literal '™' needs no such care either way — NFKD
     # maps it to UPPERCASE 'TM', which the lowercase-only class below scrubs.
-    t = unicodedata.normalize("NFKD", t)
-    t = "".join(ch for ch in t if not unicodedata.combining(ch))
+    t = _fold_diacritics(t, compat=True)
     for mark in ("®", "™"):
         t = t.replace(mark, " ")
     t = re.sub(r"\(\s*(?:r|tm)\s*\)", " ", t)
@@ -172,10 +217,32 @@ def _alias_pattern(alias: str) -> Pattern[str]:
 
 def text_mentions_brand(text_lower: str, aliases: Tuple[str, ...]) -> bool:
     """True if any alias appears in `text_lower` as a bounded token. The
-    caller MUST lowercase `text_lower` (matches the engine's convention)."""
+    caller MUST lowercase `text_lower` (matches the engine's convention).
+
+    The text side is folded the same way the alias side is (`_fold_diacritics`),
+    because the brands that need this spell themselves WITH the accents in
+    exactly the copy we match against: aliases are ASCII ('kerastase', 'estee
+    lauder') but the answer text and cited source titles say 'kérastase elixir
+    ultime' / 'estée lauder advanced night repair'. Folding only the aliases
+    (PR #1391) fixed the rival-storefront direction and left this one silently
+    under-counting own-brand visibility and attribution.
+
+    We search the folded text and, when the fold actually changed something, the
+    raw text too. The second pass costs nothing on the ASCII hot path (the fold
+    is identity there, so there is no second string) and it keeps the module's
+    only-ADDS-matches invariant airtight: an accented letter is NOT in the
+    patterns' [a-z0-9] boundary class but its folded base letter IS, so folding
+    can destroy a word boundary the raw text had — 'bb labé' matches the alias
+    'bb lab' before the fold and 'bb labe' does not match after it.
+    """
     if not text_lower or not aliases:
         return False
+    folded = _fold_diacritics(text_lower)
+    haystacks = (folded,) if folded == text_lower else (folded, text_lower)
     for alias in aliases:
-        if len(alias) >= _MIN_ALIAS_LEN and _alias_pattern(alias).search(text_lower):
+        if len(alias) < _MIN_ALIAS_LEN:
+            continue
+        pattern = _alias_pattern(alias)
+        if any(pattern.search(h) for h in haystacks):
             return True
     return False

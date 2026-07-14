@@ -91,6 +91,74 @@ def test_folded_alias_matches_ascii_text():
     assert text_mentions_brand("best kerastase dupes for bond repair", aliases)
 
 
+def test_accented_text_matches_brand_either_spelling():
+    """The symmetric half: these brands SPELL THEMSELVES WITH THE ACCENTS in the
+    copy we match against (grounded answer text, cited source titles, competitor
+    names). Folding only the alias side left this direction silently failing, so
+    own-brand visibility + attribution under-counted — the same class of bug the
+    module was written to fix."""
+    for brand in ("Kérastase", "Kerastase"):
+        aliases = derive_brand_aliases(brand)
+        assert text_mentions_brand("kérastase elixir ultime hair oil review", aliases), brand
+    estee = derive_brand_aliases("Estée Lauder")
+    assert text_mentions_brand("estée lauder advanced night repair", estee)
+    assert text_mentions_brand("estee lauder advanced night repair", estee)
+    creme = derive_brand_aliases("Crème de la Mer")
+    assert text_mentions_brand("crème de la mer moisturizing cream | sephora", creme)
+
+
+def test_text_fold_still_only_adds_matches():
+    """Design invariant: folding the text side must never REMOVE a match the
+    literal compare already made. An accented letter is NOT in the pattern's
+    [a-z0-9] boundary class but its folded base letter IS, so the fold can
+    destroy a boundary the raw text had — 'bb labé' matches 'bb lab', 'bb labe'
+    does not. The raw text is searched too, so the pre-fold match survives."""
+    aliases = derive_brand_aliases("BB Lab Global")
+    assert text_mentions_brand("bb labé collagen", aliases)   # boundary only in raw text
+    assert text_mentions_brand("bb lab collagen", aliases)    # plain ASCII, unchanged
+
+
+def test_text_fold_does_not_invent_matches():
+    """The fold must not manufacture a brand mention out of unrelated copy."""
+    aliases = derive_brand_aliases("Kérastase")
+    assert not text_mentions_brand("kerastasey conditioner", aliases)  # boundary holds
+    assert not text_mentions_brand("kérastasey conditioner", aliases)
+    assert not text_mentions_brand("a totally unrelated sentence", aliases)
+
+
+def test_text_fold_is_canonical_only_no_symbol_to_alnum_false_positives():
+    """The TEXT side folds NFD, not NFKD. NFKD maps non-alphanumeric symbols
+    INTO [a-z0-9] ('º'→'o', '¹'→'1', 'ﬁ'→'fi'), which would invent brand
+    mentions in unrelated copy. That over-credits own-brand visibility AND, where
+    a merchant's own aliases filter a rival list, silently drops a real
+    competitor — so it must not happen."""
+    no7 = derive_brand_aliases("No7")
+    assert not text_mentions_brand("el mejor serum nº7 de la lista", no7)  # 'nº7' is "number 7"
+    fifty = derive_brand_aliases("Brand 12")
+    assert not text_mentions_brand("brand ½ off this week", fifty)  # NFKD would give '1', '2'
+
+    # The fold's job is to make ACCENTED copy behave exactly like the ASCII
+    # spelling of the same words — no better, no worse. "The Creme Shop" strips
+    # to the generic core 'the creme', which already over-matches dessert copy in
+    # plain ASCII on main today; folding must not change that verdict either way.
+    creme_shop = derive_brand_aliases("The Creme Shop")
+    assert "the creme" in creme_shop
+    ascii_verdict = text_mentions_brand("i ordered the creme brulee for dessert", creme_shop)
+    accent_verdict = text_mentions_brand("i ordered the crème brûlée for dessert", creme_shop)
+    assert accent_verdict == ascii_verdict
+
+
+def test_accented_brand_matches_next_to_a_footnote_marker():
+    """Grounded, citation-bearing answer copy puts superscripts and footnote
+    markers right up against a brand name. The marker must stay a word boundary
+    (it does under NFD; NFKD would fold '¹'→'1' and glue it into the name,
+    killing the match this whole fix exists to make)."""
+    kerastase = derive_brand_aliases("Kérastase")
+    assert text_mentions_brand("kérastase¹ ranked first for bond repair", kerastase)
+    estee = derive_brand_aliases("Estée Lauder")
+    assert text_mentions_brand("estée lauder² night repair", estee)
+
+
 # --------------------------------------------------------------------------
 # text_mentions_brand
 # --------------------------------------------------------------------------
