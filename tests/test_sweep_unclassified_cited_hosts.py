@@ -319,10 +319,18 @@ def test_already_classified_hosts_are_excluded_and_counted():
 
 def test_real_classifier_excludes_registered_hosts():
     # No classify= injection: the real registry must already know healthline.com,
-    # so only the unregistered long-tail host is proposed.
-    runs = [_run("m1", "r1", [_host_row("healthline.com"), _host_row("jolse.com")])]
+    # so only the unregistered host is proposed.
+    #
+    # The unregistered host is a RESERVED example domain, deliberately. This test
+    # first used jolse.com — and the first batch of proposals this sweep produced
+    # then registered jolse.com, which turned the test red on main. Any real host
+    # named here is a host the loop is designed to eventually classify, so the
+    # assertion has to rest on a domain that can never be registered.
+    runs = [_run("m1", "r1", [
+        _host_row("healthline.com"), _host_row("never-registered.example"),
+    ])]
     doc = build_proposals(runs)
-    assert [p["host"] for p in doc["proposals"]] == ["jolse.com"]
+    assert [p["host"] for p in doc["proposals"]] == ["never-registered.example"]
 
 
 def test_min_merchants_filter_and_review_metadata():
