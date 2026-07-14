@@ -660,7 +660,21 @@ def _where_youre_losing(
     vertical_profile: VerticalProfile = BEAUTY_PROFILE,
 ) -> Dict[str, Any]:
     endorsed_category = bool(summary.get("independently_recommended_for_category"))
+    # Category-preferred set: names the hosts for the "earns independent category
+    # recommendation from …" copy below, which is specifically about CATEGORY
+    # endorsement — so category hosts lead, falling back to any endorsers.
     endorsement_hosts = list(summary.get("endorsement_category_hosts") or summary.get("endorsement_hosts") or [])
+    # FULL endorser set (branded + category) for outreach-move suppression. A host
+    # that endorsed the merchant only on BRANDED queries lives in endorsement_hosts
+    # but not endorsement_category_hosts; the category-preferred set above would
+    # drop it, so it could still be framed as "recommends a competitor over you" —
+    # the exact defect #1382 fixed, surviving for branded-only endorsers. Union
+    # both explicitly (the two lists are re-sourced independently by the RunFacts
+    # overlay, so neither is guaranteed a subset of the other).
+    all_endorsement_hosts = list(dict.fromkeys(
+        (summary.get("endorsement_hosts") or [])
+        + (summary.get("endorsement_category_hosts") or [])
+    ))
     findable = bool(summary.get("findability_hosts"))
     if endorsed_category:
         text = (
@@ -700,14 +714,18 @@ def _where_youre_losing(
         # Off-platform outreach moves derived from those cited hosts — pitch the
         # editorial sites / get carried by the retailers / engage the
         # communities AI grounds in. No connected store required.
-        # endorsement_hosts keeps a host that already independently recommends
-        # the merchant from being framed as "recommends a competitor over you".
-        "outreach_moves": _outreach_moves(who, endorsement_hosts=endorsement_hosts),
+        # all_endorsement_hosts keeps a host that already independently recommends
+        # the merchant — on branded OR category queries — from being framed as
+        # "recommends a competitor over you".
+        "outreach_moves": _outreach_moves(who, endorsement_hosts=all_endorsement_hosts),
         # Phase-4 T5 — the vertical's standing pitch-target list (profile
         # authority_hosts), status-stamped against this audit. Empty list for
         # verticals without a curated list (beauty today) — the panel hides it.
+        # Uses the SAME full endorser set as outreach_moves so the two panels
+        # never disagree about whether a host already endorses you — a branded-
+        # only endorser must read as already_endorses_you in both.
         "pitch_targets": _vertical_pitch_targets(
-            vertical_profile, who, endorsement_hosts
+            vertical_profile, who, all_endorsement_hosts
         ),
         # Fix 4 — the path to winning the category recommendation back, rolled
         # up from the per-SKU win-plan. None when there's no plan to show.
