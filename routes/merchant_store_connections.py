@@ -25,7 +25,7 @@ import secrets
 from urllib.parse import urlparse, urlencode
 
 from db.database import database
-from utils.auth import get_current_user
+from utils.auth import get_current_user, hash_password, verify_password as verify_bcrypt_password
 from config.settings import settings
 
 logger = logging.getLogger(__name__)
@@ -241,6 +241,148 @@ def _marketplace_install_success_url(platform: str) -> str:
     return f"{settings.merchant_portal_base_url.rstrip('/')}{_MARKETPLACE_INSTALL_SUCCESS_PATH}"
 
 
+_SHOPIFY_CLAIM_TOKEN_TTL_SECONDS = 60 * 60
+
+
+def _claim_signing_key() -> str:
+    return (settings.jwt_secret_key or "").strip()
+
+
+def _b64url(data: bytes) -> str:
+    import base64
+
+    return base64.urlsafe_b64encode(data).decode("utf-8").rstrip("=")
+
+
+def _b64url_decode(data: str) -> bytes:
+    import base64
+
+    s = (data or "").strip()
+    pad = "=" * ((4 - (len(s) % 4)) % 4)
+    return base64.urlsafe_b64decode(s + pad)
+
+
+def _sign_claim_token(payload: Dict[str, Any]) -> str:
+    """base64url(json) + "." + base64url(hmac_sha256(msg, key))."""
+    raw = json.dumps(payload, separators=(",", ":"), ensure_ascii=False).encode("utf-8")
+    msg = _b64url(raw)
+    sig = hmac.new(_claim_signing_key().encode("utf-8"), msg.encode("utf-8"), hashlib.sha256).digest()
+    return f"{msg}.{_b64url(sig)}"
+
+
+def _verify_claim_token(token: str) -> Dict[str, Any]:
+    parts = (token or "").split(".")
+    if len(parts) != 2:
+        raise HTTPException(status_code=400, detail="Invalid claim token")
+    msg, sig = parts
+    try:
+        expected = hmac.new(
+            _claim_signing_key().encode("utf-8"), msg.encode("utf-8"), hashlib.sha256
+        ).digest()
+        got = _b64url_decode(sig)
+    except Exception:
+        raise HTTPException(status_code=400, detail="Invalid claim token")
+    if not hmac.compare_digest(expected, got):
+        raise HTTPException(status_code=401, detail="Invalid claim token signature")
+    try:
+        payload = json.loads(_b64url_decode(msg).decode("utf-8"))
+    except Exception:
+        raise HTTPException(status_code=400, detail="Invalid claim token")
+    if not isinstance(payload, dict) or payload.get("typ") != "pivota_shopify_claim":
+        raise HTTPException(status_code=400, detail="Invalid claim token")
+    return payload
+
+
+async def _reassign_store_to_merchant(
+    *, from_merchant_id: str, to_merchant_id: str, shop_domain: str
+) -> None:
+    """Move a freshly-installed Shopify store off the shell merchant onto a real one.
+
+    Used when the person claiming the install already runs a Pivota merchant: they
+    keep their own merchant_id and simply gain the store.
+    """
+    # If they somehow already have this shop, drop the shell duplicate instead of
+    # violating the (merchant_id, platform, domain) uniqueness.
+    already = await database.fetch_one(
+        """
+        SELECT store_id FROM merchant_stores
+        WHERE merchant_id = :to_merchant_id AND platform = 'shopify' AND domain = :domain
+        """,
+        {"to_merchant_id": to_merchant_id, "domain": shop_domain},
+    )
+    if already:
+        await database.execute(
+            """
+            DELETE FROM merchant_stores
+            WHERE merchant_id = :from_merchant_id AND platform = 'shopify' AND domain = :domain
+            """,
+            {"from_merchant_id": from_merchant_id, "domain": shop_domain},
+        )
+        return
+
+    await database.execute(
+        """
+        UPDATE merchant_stores
+        SET merchant_id = :to_merchant_id
+        WHERE merchant_id = :from_merchant_id AND platform = 'shopify' AND domain = :domain
+        """,
+        {
+            "to_merchant_id": to_merchant_id,
+            "from_merchant_id": from_merchant_id,
+            "domain": shop_domain,
+        },
+    )
+
+
+async def _merchant_has_owner(merchant_id: str) -> bool:
+    """True once a real user account is bound to this merchant."""
+    try:
+        row = await database.fetch_one(
+            "SELECT 1 AS ok FROM users WHERE merchant_id = :merchant_id LIMIT 1",
+            {"merchant_id": merchant_id},
+        )
+        return bool(row)
+    except Exception:
+        # Fail closed: if we cannot tell, do not hand out a claim token.
+        logger.warning("merchant owner lookup failed merchant=%s", merchant_id, exc_info=True)
+        return True
+
+
+async def _mint_store_claim_token(*, merchant_id: str, shop_domain: str) -> Optional[str]:
+    """Best-effort: an install must still succeed even if claim-token minting fails."""
+    try:
+        jti = secrets.token_urlsafe(24)
+        now = datetime.now(timezone.utc)
+        exp = now + timedelta(seconds=_SHOPIFY_CLAIM_TOKEN_TTL_SECONDS)
+        token = _sign_claim_token(
+            {
+                "typ": "pivota_shopify_claim",
+                "jti": jti,
+                "merchant_id": merchant_id,
+                "shop_domain": shop_domain,
+                "iat": int(now.timestamp()),
+                "exp": int(exp.timestamp()),
+            }
+        )
+        await database.execute(
+            """
+            INSERT INTO shopify_store_claim_tokens (jti_sha256, merchant_id, shop_domain, expires_at)
+            VALUES (:jti_sha256, :merchant_id, :shop_domain, :expires_at)
+            ON CONFLICT (jti_sha256) DO NOTHING
+            """,
+            {
+                "jti_sha256": hashlib.sha256(jti.encode("utf-8")).hexdigest(),
+                "merchant_id": merchant_id,
+                "shop_domain": shop_domain,
+                "expires_at": exp,
+            },
+        )
+        return token
+    except Exception:
+        logger.warning("shopify claim-token mint failed merchant=%s", merchant_id, exc_info=True)
+        return None
+
+
 _INSTALL_ERROR_REASON_RE = re.compile(r"reason=([a-z0-9_]+)")
 
 
@@ -292,16 +434,17 @@ async def _ensure_shopify_oauth_tables() -> None:
             )
             """
         )
+        # One-time tokens that let whoever completed an App Store install bind the
+        # freshly-created shell merchant to a real Pivota account (see /shopify/claim).
         await database.execute(
             """
-            CREATE TABLE IF NOT EXISTS shopify_install_tokens (
+            CREATE TABLE IF NOT EXISTS shopify_store_claim_tokens (
                 jti_sha256 VARCHAR(64) PRIMARY KEY,
                 merchant_id VARCHAR(50) NOT NULL,
                 shop_domain VARCHAR(255) NOT NULL,
                 created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP,
                 expires_at TIMESTAMP WITH TIME ZONE NOT NULL,
-                used_at TIMESTAMP WITH TIME ZONE,
-                used_request_id TEXT
+                used_at TIMESTAMP WITH TIME ZONE
             )
             """
         )
@@ -869,6 +1012,19 @@ async def _shopify_oauth_callback_impl(request: Request):
         merchant_id, canonical_myshopify_domain, store_id, install_source or "?", payload,
     )
     redirect_target = return_to or _marketplace_install_success_url("shopify")
+
+    # An App Store install mints a SHELL merchant with a placeholder contact_email
+    # and no user row, so nobody can actually sign in to it. Hand the installer a
+    # one-time claim token so they can bind this store to a real Pivota account
+    # (sign in or create one) instead of dead-ending on the landing page.
+    claim_params: Dict[str, str] = {}
+    if not await _merchant_has_owner(merchant_id):
+        claim_token = await _mint_store_claim_token(
+            merchant_id=merchant_id, shop_domain=canonical_myshopify_domain
+        )
+        if claim_token:
+            claim_params["claim_token"] = claim_token
+
     return RedirectResponse(
         url=_append_query_params(
             redirect_target,
@@ -878,10 +1034,151 @@ async def _shopify_oauth_callback_impl(request: Request):
                 "shop": canonical_myshopify_domain,
                 "store_id": store_id,
                 "status": "success",
+                **claim_params,
             },
         ),
         status_code=302,
     )
+
+
+class ShopifyStoreClaimRequest(BaseModel):
+    claim_token: str
+    email: EmailStr
+    password: str
+    full_name: Optional[str] = None
+
+
+@router.post("/shopify/claim")
+async def claim_shopify_store(body: ShopifyStoreClaimRequest):
+    """
+    Bind an App Store-installed Shopify store to a real Pivota account.
+
+    An App Store install creates a SHELL merchant (placeholder contact_email, no
+    user row), so without this the installer lands on the success page and has no
+    way to sign in. The one-time claim token issued by the OAuth callback proves
+    they completed the install for this shop; they may either sign in to an
+    existing account or create one, and the store binds to it.
+    """
+    # Imported lazily: auth_routes owns the portal's JWT shape and email normalisation.
+    from routes.auth_routes import create_jwt_token, normalize_email
+
+    payload = _verify_claim_token(body.claim_token)
+
+    shell_merchant_id = str(payload.get("merchant_id") or "").strip()
+    shop_domain = str(payload.get("shop_domain") or "").strip().lower()
+    jti = str(payload.get("jti") or "").strip()
+    if not shell_merchant_id or not shop_domain or not jti:
+        raise HTTPException(status_code=400, detail="Invalid claim token")
+    try:
+        if int(datetime.now(timezone.utc).timestamp()) > int(payload.get("exp") or 0):
+            raise HTTPException(status_code=400, detail="This link has expired. Reinstall the app to get a new one.")
+    except (TypeError, ValueError):
+        raise HTTPException(status_code=400, detail="Invalid claim token")
+
+    password = body.password or ""
+    if len(password) < 8:
+        raise HTTPException(status_code=400, detail="Password must be at least 8 characters")
+
+    email = normalize_email(str(body.email))
+    await _ensure_shopify_oauth_tables()
+
+    # Consume the token FIRST (atomic, one-time) so a replay cannot re-bind the store.
+    consumed = await database.fetch_one(
+        """
+        UPDATE shopify_store_claim_tokens
+        SET used_at = NOW()
+        WHERE jti_sha256 = :jti_sha256
+          AND used_at IS NULL
+          AND expires_at > NOW()
+          AND merchant_id = :merchant_id
+          AND shop_domain = :shop_domain
+        RETURNING merchant_id
+        """,
+        {
+            "jti_sha256": hashlib.sha256(jti.encode("utf-8")).hexdigest(),
+            "merchant_id": shell_merchant_id,
+            "shop_domain": shop_domain,
+        },
+    )
+    if not consumed:
+        raise HTTPException(
+            status_code=400,
+            detail="This link has already been used or expired. Reinstall the app to get a new one.",
+        )
+
+    existing = await database.fetch_one(
+        "SELECT id, email, password_hash, full_name, role, active, merchant_id FROM users WHERE email = :email",
+        {"email": email},
+    )
+    user = dict(existing) if existing else None
+
+    if user:
+        # Existing account: authenticate before binding anything to it.
+        if not user.get("password_hash") or not verify_bcrypt_password(password, user["password_hash"]):
+            raise HTTPException(status_code=401, detail="Incorrect password for this account")
+        if user.get("active") is False:
+            raise HTTPException(status_code=403, detail="Account has been deactivated")
+
+        target_merchant_id = (user.get("merchant_id") or "").strip() or shell_merchant_id
+        if target_merchant_id != shell_merchant_id:
+            # They already run a merchant: move the store onto it rather than
+            # repointing their account at the throwaway shell merchant.
+            await _reassign_store_to_merchant(
+                from_merchant_id=shell_merchant_id,
+                to_merchant_id=target_merchant_id,
+                shop_domain=shop_domain,
+            )
+        else:
+            await database.execute(
+                "UPDATE users SET merchant_id = :merchant_id WHERE id = :id",
+                {"merchant_id": shell_merchant_id, "id": user["id"]},
+            )
+        role = user.get("role") or "merchant"
+    else:
+        # New account: it owns the shell merchant outright.
+        target_merchant_id = shell_merchant_id
+        role = "merchant"
+        await database.execute(
+            """
+            INSERT INTO users (email, password_hash, full_name, role, active, merchant_id)
+            VALUES (:email, :password_hash, :full_name, 'merchant', TRUE, :merchant_id)
+            """,
+            {
+                "email": email,
+                "password_hash": hash_password(password),
+                "full_name": (body.full_name or "").strip() or shop_domain,
+                "merchant_id": shell_merchant_id,
+            },
+        )
+
+    # Replace the placeholder shopify-install+...@pivota.invalid contact with the real one.
+    if target_merchant_id == shell_merchant_id:
+        await database.execute(
+            """
+            UPDATE merchant_onboarding
+            SET contact_email = :email, updated_at = CURRENT_TIMESTAMP
+            WHERE merchant_id = :merchant_id
+            """,
+            {"email": email, "merchant_id": shell_merchant_id},
+        )
+
+    logger.info(
+        "shopify_store_claimed merchant=%s shop=%s email=%s new_account=%s",
+        target_merchant_id, shop_domain, email, user is None,
+    )
+
+    token = create_jwt_token(email, role, email, {"merchant_id": target_merchant_id})
+    return {
+        "status": "success",
+        "token": token,
+        "user": {
+            "email": email,
+            "role": role,
+            "merchant_id": target_merchant_id,
+            "full_name": (body.full_name or "").strip() or (user or {}).get("full_name") or shop_domain,
+        },
+        "shop_domain": shop_domain,
+    }
 
 
 class ShopifySyncRequest(BaseModel):
