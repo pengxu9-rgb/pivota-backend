@@ -9,9 +9,12 @@ competitor-storefront match that turns a rival's site into a type=brand proposal
 
 from __future__ import annotations
 
+import json
+from pathlib import Path
 from typing import Any, Dict, List
 
 from scripts.sweep_unclassified_cited_hosts import (
+    REGISTRY_PATH,
     aggregate_hosts,
     build_proposals,
     competitor_aliases,
@@ -319,10 +322,26 @@ def test_already_classified_hosts_are_excluded_and_counted():
 
 def test_real_classifier_excludes_registered_hosts():
     # No classify= injection: the real registry must already know healthline.com,
-    # so only the unregistered long-tail host is proposed.
-    runs = [_run("m1", "r1", [_host_row("healthline.com"), _host_row("jolse.com")])]
+    # so only the unregistered long-tail host is proposed. The long-tail fixture
+    # must stay OUT of the registry — the assertions below pin both preconditions
+    # so a registry PR that adds either host fails here, at the precondition,
+    # instead of at the proposal assertion (jolse.com got registered on
+    # 2026-07-14 and silently broke the previous fixture choice).
+    registry_hosts = json.loads(
+        (Path(__file__).resolve().parent.parent / REGISTRY_PATH).read_text()
+    )["hosts"]
+    assert "healthline.com" in registry_hosts
+    assert "longtail-fixture-host.com" not in registry_hosts
+
+    runs = [
+        _run(
+            "m1",
+            "r1",
+            [_host_row("healthline.com"), _host_row("longtail-fixture-host.com")],
+        )
+    ]
     doc = build_proposals(runs)
-    assert [p["host"] for p in doc["proposals"]] == ["jolse.com"]
+    assert [p["host"] for p in doc["proposals"]] == ["longtail-fixture-host.com"]
 
 
 def test_min_merchants_filter_and_review_metadata():
