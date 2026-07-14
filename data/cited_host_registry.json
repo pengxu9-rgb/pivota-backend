@@ -559,7 +559,7 @@
       "subtype": "beauty_retailer",
       "categories": ["beauty", "skincare", "kbeauty"],
       "aliases": ["Olive Young Korea"],
-      "coverage_note": "Olive Young is Korea's dominant domestic K-beauty specialty retailer (the .com domestic storefront alongside the international oliveyoungglobal.com and the .co.kr Korean site); very high AI-channel grounding for Korean skincare and beauty queries.",
+      "coverage_note": "Olive Young is Korea's dominant K-beauty specialty retailer; oliveyoung.com is its .com domain, alongside the primary Korean site oliveyoung.co.kr and the international oliveyoungglobal.com. Very high AI-channel grounding for Korean skincare and beauty queries.",
       "outreach_hint": "K-beauty wholesale — apply via CJ Olive Young's Business Partnership Inquiry form; coordinate domestic (oliveyoung.co.kr) and global (oliveyoungglobal.com) listings.",
       "pitch_recipient": {
         "email": null,
