@@ -1399,6 +1399,85 @@ def test_build_authority_map_folds_in_merchant_owned_domains():
     }
 
 
+def test_build_authority_map_strips_merchant_own_brand_from_competitors():
+    """Follow-up to #1382: an engine's grounded self-report sometimes lists the
+    merchant itself among "competitors". That own-brand name must be stripped
+    before it reaches a cited host's competitors_named — otherwise it surfaces as
+    a named rival and (post-#1382) fires a `recommends_rival` outreach move whose
+    "rival" is actually the merchant. A genuine rival on another host must
+    survive so the filter isn't over-stripping."""
+    from services.agent_center_bd_report_service import build_authority_map
+    from services.merchant_narrative_builder import (
+        _outreach_moves,
+        _who_ai_cites_instead,
+    )
+
+    probe_runs = [
+        {
+            "provider": "gemini",
+            "probe_run_id": "probe-self",
+            "raw_runs": [
+                {
+                    # goodhousekeeping.com was cited with ONLY the merchant's own
+                    # name (and an aliased form) listed as a "competitor".
+                    "query": "best vitamin c serum",
+                    "parsed": {
+                        "product_visible": True,
+                        "correct_sku": True,
+                        "competitors_listed": ["GlowCo", "GlowCo Skincare"],
+                    },
+                    "grounding_sources": [
+                        {"uri": "https://www.goodhousekeeping.com/beauty/serums", "title": "goodhousekeeping.com"},
+                    ],
+                    "url_match": {"in_grounding": False},
+                },
+                {
+                    # allure.com was cited with a GENUINE rival (plus the merchant
+                    # again) — the rival must be retained.
+                    "query": "top rated vitamin c serums",
+                    "parsed": {
+                        "product_visible": True,
+                        "competitors_listed": ["Rival Beauty", "GlowCo"],
+                    },
+                    "grounding_sources": [
+                        {"uri": "https://www.allure.com/gallery/best-vitamin-c-serums", "title": "allure.com"},
+                    ],
+                    "url_match": {"in_grounding": False},
+                },
+            ],
+        }
+    ]
+    authority_map = build_authority_map(
+        [{"sku_key": "sku-1", "product_key": "prod-1"}],
+        {"sku-1": probe_runs},
+        merchant_host="glowco.com",
+        merchant_brand="GlowCo",
+    )
+
+    # The merchant's own brand / alias never surfaces as a named competitor.
+    all_named = [
+        c
+        for sku in authority_map["skus"]
+        for row in sku["authority_hosts"]
+        for c in (row.get("competitors_named") or [])
+    ]
+    assert "GlowCo" not in all_named
+    assert "GlowCo Skincare" not in all_named
+    # The genuine rival is retained (no over-stripping).
+    assert "Rival Beauty" in all_named
+
+    # goodhousekeeping.com had only the merchant's own name as a "competitor", so
+    # its outreach move must NOT claim it recommends a rival; allure.com kept a
+    # real rival, so its move still does.
+    who = _who_ai_cites_instead(authority_map)
+    moves = {m["host"]: m for m in _outreach_moves(who)}
+    assert "goodhousekeeping.com" in moves
+    assert "recommends a competitor over you" not in moves["goodhousekeeping.com"]["why"]
+    assert not moves["goodhousekeeping.com"].get("competitors_named")
+    assert "allure.com" in moves
+    assert "recommends a competitor over you" in moves["allure.com"]["why"]
+
+
 def _gemini_redirector_run(query: str, title: str) -> Dict[str, Any]:
     """A Gemini grounding run whose only source is delivered as a Vertex
     redirector URI with the REAL publisher domain in `title` — the prod v3
