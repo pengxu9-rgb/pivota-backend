@@ -637,3 +637,73 @@ def test_narrative_cited_via_retailer_is_not_invisible():
     # Inverse: a brand cited NOWHERE still reads as invisible.
     not_cited = {**summary, "cited_via_hosts": False}
     assert "invisible" in _headline_story("Anuko", not_cited).lower()
+
+
+def test_who_ai_cites_ranks_recommends_class_over_unclassified_ties():
+    """Grounding defect 2 (Anuko run 549ace84): the pre-cap sort broke
+    1-citation ties alphabetically, so womenshealthmag.com (recommends-class
+    editorial, cited on the category query, named in the win plan's
+    independent_hosts_to_win) was truncated out of the [:8] cap while
+    alphabetically-earlier unclassified 1-cite blogs survived — the outreach
+    panel contradicted the win-plan panel. Ties must break by endorsement
+    weight before the cap."""
+    from services.merchant_narrative_builder import _who_ai_cites_instead
+    blogs = [
+        {"host": f"blog-{c}.com", "citation_role": "unclassified",
+         "recommendation_class": "unknown", "prompts_cited_count": 1,
+         "cited_on_category_query": False}
+        for c in "abcdefgh"  # 8 unclassified 1-cite hosts, all sort before "w"
+    ]
+    editorial = {
+        "host": "womenshealthmag.com", "citation_role": "editorial_review",
+        "recommendation_class": "recommends", "prompts_cited_count": 1,
+        "cited_on_category_query": True,
+    }
+    who = _who_ai_cites_instead({"hosts": blogs + [editorial], "skus": []})
+    cited = [h["host"] for h in who["cited_hosts"]]
+    assert len(cited) == 8  # cap still applies
+    assert "womenshealthmag.com" in cited  # no longer truncated by the tie
+    assert cited[0] == "womenshealthmag.com"  # endorsement weight wins the tie
+    # Citation frequency still dominates classification: a 3-cite unclassified
+    # host outranks the 1-cite editorial.
+    frequent = {"host": "zzz-frequent.com", "citation_role": "unclassified",
+                "recommendation_class": "unknown", "prompts_cited_count": 3,
+                "cited_on_category_query": False}
+    who2 = _who_ai_cites_instead({"hosts": blogs + [editorial, frequent], "skus": []})
+    assert [h["host"] for h in who2["cited_hosts"]][0] == "zzz-frequent.com"
+
+
+def test_endorsing_host_outreach_move_not_framed_as_rival_recommendation():
+    """Grounding defect 1 end-to-end: an editorial that independently endorses
+    the merchant on a category query (endorsement_hosts) while also grounding
+    answers that named competitors must NOT produce an outreach move claiming
+    it 'recommends a competitor over you' — the move is reframed to extend the
+    won coverage. Built through build_authority_map so the endorsement rollup,
+    per-host competitor names, and the narrative all come from one real path."""
+    am = _authority_map(
+        [
+            _run("buy Aruen", "aruen.com"),
+            _editorial("best collagen supplement", "goodhousekeeping.com", "Aruen",
+                       comps=["Vital Proteins", "Ancient Nutrition"]),
+        ],
+        host="aruen.com",
+        brand="Aruen",
+    )
+    narr = build_merchant_narrative(
+        merchant_name="Aruen", per_sku_reports=[], authority_map=am,
+        providers=["gemini"], verify_providers=["deepseek"],
+    )
+    where = narr["where_youre_losing"]
+    assert "goodhousekeeping.com" in where["endorsement_hosts"]
+    # The cited-host row now carries the grounded per-host competitor names.
+    gh_row = next(
+        h for h in where["who_ai_cites_instead"]["cited_hosts"]
+        if h["host"] == "goodhousekeeping.com"
+    )
+    assert set(gh_row["competitors_named"]) == {"Vital Proteins", "Ancient Nutrition"}
+    moves = {m["host"]: m for m in where["outreach_moves"]}
+    gh = moves["goodhousekeeping.com"]
+    assert gh["already_endorses_you"] is True
+    assert "recommends a competitor" not in gh["why"]
+    assert "already recommends you" in gh["why"]
+    assert gh["headline"] == "Build on goodhousekeeping.com"

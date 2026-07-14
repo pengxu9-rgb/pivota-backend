@@ -144,7 +144,6 @@ def _who_ai_cites_instead(
                 "prompts_cited_count": row.get("prompts_cited_count") or 0,
                 "cited_on_category_query": bool(row.get("cited_on_category_query")),
             })
-    cited_hosts.sort(key=lambda h: (-(h["prompts_cited_count"] or 0), h["host"]))
 
     # Competitor brand names live on the per-SKU authority hosts (the brand-level
     # rollup doesn't carry them). Aggregate from there — real grounded names only.
@@ -157,9 +156,16 @@ def _who_ai_cites_instead(
     # relevant names). It is not surfaced.
     competitor_skus: Dict[str, set] = {}
     competitor_prominence: Dict[str, int] = {}
+    # Per-host grounded competitor names (same brand-only filter). The brand-level
+    # host rollup doesn't carry competitors_named, so this is what lets the
+    # outreach layer say "this host grounded an answer that named a rival" as a
+    # fact about THAT host — recommendation_class alone can't (it's a host-TYPE
+    # property, silent on who got recommended).
+    host_competitors: Dict[str, List[str]] = {}
     for sku in (authority_map.get("skus") if isinstance(authority_map, dict) else None) or []:
         sku_key = sku.get("sku_key") if isinstance(sku, dict) else None
         for row in (sku.get("authority_hosts") if isinstance(sku, dict) else None) or []:
+            row_host = str(row.get("host") or "").strip().lower() if isinstance(row, dict) else ""
             for comp in (row.get("competitors_named") if isinstance(row, dict) else None) or []:
                 name = str(comp or "").strip()
                 # For CATEGORY questions ("best collagen", "best magnesium") the
@@ -176,6 +182,32 @@ def _who_ai_cites_instead(
                 ):
                     competitor_skus.setdefault(name, set()).add(sku_key)
                     competitor_prominence[name] = competitor_prominence.get(name, 0) + 1
+                    if row_host:
+                        bucket = host_competitors.setdefault(row_host, [])
+                        if name not in bucket:
+                            bucket.append(name)
+    for h in cited_hosts:
+        h["competitors_named"] = host_competitors.get(
+            str(h["host"]).strip().lower(), []
+        )[:8]
+    # Rank BEFORE the [:8] cap, classification-aware. The old
+    # (-prompts_cited_count, host) key broke 1-citation ties alphabetically, so
+    # a recommends-class editorial cited on the category query (the host the
+    # win plan says to win) could be truncated out while unclassified 1-cite
+    # blogs survived — making this panel contradict the win-plan panel. Count
+    # still dominates; ties break by endorsement weight: recommends-class,
+    # then category-query citation, then any known citation role, then host.
+    def _cited_host_rank(h: Dict[str, Any]) -> Tuple:
+        recommends = str(h.get("recommendation_class") or "").strip().lower() == "recommends"
+        classified = str(h.get("citation_role") or "").strip().lower() not in {"", "unclassified"}
+        return (
+            -(h["prompts_cited_count"] or 0),
+            0 if recommends else 1,
+            0 if h.get("cited_on_category_query") else 1,
+            0 if classified else 1,
+            h["host"],
+        )
+    cited_hosts.sort(key=_cited_host_rank)
     competitors = [
         {"name": name, "times_named": len(competitor_skus[name])}
         for name in sorted(
@@ -398,6 +430,11 @@ _MAJOR_PUBLISHER_FIRST_MOVE = (
     "review-site listings and authentic community/Reddit presence first — "
     "editorial coverage follows the signals they pick up."
 )
+_ALREADY_ENDORSES_FIRST_MOVE = (
+    "Keep the coverage that earned the endorsement accurate and current, then "
+    "pitch the specific category queries this host grounds where you're not "
+    "yet the recommendation — extending won coverage beats cold outreach."
+)
 
 
 def _move_realism(host: str, htype: str, subtype: str) -> str:
@@ -420,13 +457,23 @@ def _move_realism(host: str, htype: str, subtype: str) -> str:
     return "investigate"
 
 
-def _outreach_moves(who: Dict[str, Any]) -> List[Dict[str, Any]]:
+def _outreach_moves(
+    who: Dict[str, Any],
+    endorsement_hosts: Optional[List[str]] = None,
+) -> List[Dict[str, Any]]:
     """Turn the 'who AI cites instead' hosts into concrete off-platform moves —
     no connected store required. Each host is classified (editorial / retailer /
     marketplace / community / creator) and routed to the right verb + playbook
     lever; hosts that aren't outreach-actionable (cdn, bare competitor domains,
-    unclassified) are skipped. Ranked: actively-recommends-a-rival first, then
-    category-query citations, then citation frequency."""
+    unclassified) are skipped. Ranked: grounds-a-rival-recommendation first,
+    then category-query citations, then citation frequency. Hosts that already
+    independently endorse the merchant (endorsement_hosts) are never framed as
+    recommending a rival — their move is to extend the won coverage."""
+    endorsed = {
+        str(e or "").strip().lower()
+        for e in (endorsement_hosts or [])
+        if str(e or "").strip()
+    }
     moves: List[Dict[str, Any]] = []
     for h in (who.get("cited_hosts") if isinstance(who, dict) else None) or []:
         host = str((h or {}).get("host") or "").strip()
@@ -450,44 +497,66 @@ def _outreach_moves(who: Dict[str, Any]) -> List[Dict[str, Any]]:
             )}
         verb, lever = routed
         realism = _move_realism(host, htype, subtype)
-        recommends = str(h.get("recommendation_class") or "").strip().lower() == "recommends"
+        # recommendation_class is a HOST-TYPE property (editorial/video sources
+        # recommend rather than list) — it says the host's citations carry
+        # endorsement weight, NOT that a rival was endorsed. Claiming
+        # "recommends a competitor over you" additionally requires a competitor
+        # actually named in answers this host grounded, and that the host isn't
+        # one that already independently recommends THIS merchant.
+        recommends_class = str(h.get("recommendation_class") or "").strip().lower() == "recommends"
+        already_endorses = host.lower() in endorsed
+        recommends_rival = (
+            recommends_class
+            and bool(h.get("competitors_named"))
+            and not already_endorses
+        )
         cited_n = int(h.get("prompts_cited_count") or 0)
         category = bool(h.get("cited_on_category_query"))
-        why = f"AI cites {host}"
-        if recommends:
-            why += " and it recommends a competitor over you"
-        elif cited_n:
-            why += f" in {cited_n} of your tested prompt{'s' if cited_n != 1 else ''}"
-        if category:
-            why += " on category questions"
-        why += " — getting in front of it is how you get cited there too."
+        if already_endorses:
+            why = (
+                f"{host} already recommends you independently — the move isn't "
+                "to win it over but to extend that coverage to the category "
+                "queries it grounds."
+            )
+        else:
+            why = f"AI cites {host}"
+            if recommends_rival:
+                why += " and it recommends a competitor over you"
+            elif cited_n:
+                why += f" in {cited_n} of your tested prompts"
+            if category:
+                why += " on category questions"
+            why += " — getting in front of it is how you get cited there too."
         moves.append({
             "host": host,
             "host_type": htype or "unclassified",
             "host_subtype": cls.get("subtype"),
-            "action_verb": verb,
+            "action_verb": "Build on" if already_endorses else verb,
             "lever": lever,
             "recommendation_class": h.get("recommendation_class"),
             "prompts_cited_count": cited_n,
             "cited_on_category_query": category,
-            "headline": f"{verb} {host}",
+            "already_endorses_you": already_endorses,
+            "headline": f"{'Build on' if already_endorses else verb} {host}",
             "why": why,
-            # Reframe the action to what's actually doable: review-building for
-            # review aggregators, the indirect path for major publishers (don't
-            # tell a long-tail brand to "pitch Vogue").
+            # Reframe the action to what's actually doable: extend-the-win for
+            # hosts that already endorse you, review-building for review
+            # aggregators, the indirect path for major publishers (don't tell a
+            # long-tail brand to "pitch Vogue").
             "first_move": (
-                _MAJOR_PUBLISHER_FIRST_MOVE if realism == "hard"
+                _ALREADY_ENDORSES_FIRST_MOVE if already_endorses
+                else _MAJOR_PUBLISHER_FIRST_MOVE if realism == "hard"
                 else _REVIEW_BUILD_FIRST_MOVE if subtype in {"review_aggregator", "review_site"}
                 else cls.get("outreach_hint") or _FIRST_MOVE_BY_LEVER.get(lever)
             ),
             "realism": realism,
             "pitch_recipient": cls.get("pitch_recipient"),
-            # A host that actively recommends a RIVAL is the sharpest move
+            # A host that grounds a RIVAL's recommendation is the sharpest move
             # (you're losing the endorsement, not just absent) — weight it well
             # above raw citation frequency. But de-prioritise "hard" (major-
             # publisher) moves a long-tail brand can't realistically land, so
             # reachable/DIY moves (reviews, Reddit/community) surface first.
-            "_priority": (5 if recommends else 0) + (1 if category else 0) + cited_n
+            "_priority": (5 if recommends_rival else 0) + (1 if category else 0) + cited_n
             - (4 if realism == "hard" else 0),
         })
     moves.sort(key=lambda m: -m["_priority"])
@@ -614,7 +683,9 @@ def _where_youre_losing(
         # Off-platform outreach moves derived from those cited hosts — pitch the
         # editorial sites / get carried by the retailers / engage the
         # communities AI grounds in. No connected store required.
-        "outreach_moves": _outreach_moves(who),
+        # endorsement_hosts keeps a host that already independently recommends
+        # the merchant from being framed as "recommends a competitor over you".
+        "outreach_moves": _outreach_moves(who, endorsement_hosts=endorsement_hosts),
         # Phase-4 T5 — the vertical's standing pitch-target list (profile
         # authority_hosts), status-stamped against this audit. Empty list for
         # verticals without a curated list (beauty today) — the panel hides it.
