@@ -624,9 +624,9 @@ def test_since_last_audit_passthrough_and_absence():
         "headline": "Visibility improved materially since your last audit.",
         "movements": [
             {"signal": "visibility", "label": "AI visibility", "from": 20,
-             "to": 33, "material": True, "direction": "improved"},
+             "to": 33, "is_material": True, "direction": "improved"},
             {"signal": "attribution", "label": "Attribution", "from": 46,
-             "to": 47, "material": False, "direction": "stable"},
+             "to": 47, "is_material": False, "direction": "stable"},
         ],
         "measurement_basis": {"same": True},
     }
@@ -649,3 +649,36 @@ def test_unknown_gap_has_no_impact_never_guessed():
     report["merchant_narrative"]["prioritized_actions"][0]["primary_gap"] = "novel_gap"
     out = build_report_summary(report)
     assert out["top_actions"][0]["impact"] is None
+
+
+def test_reaudit_delta_end_to_end_on_real_per_sku_shape():
+    # Review P0 guard: feed GENUINE per-SKU brand reports (per_sku_reports,
+    # no per_product/merchant_view) through build_reaudit_delta — movements
+    # must carry real numbers, not None→None.
+    from services.audit_delta import build_reaudit_delta
+
+    prior = _brand_report()
+    prior["per_sku_reports"][0]["scores"] = {
+        "citation": {"score": 20},
+        "identity": {"score": 30},
+    }
+    current = _brand_report()
+    current["per_sku_reports"][0]["scores"] = {
+        "citation": {"score": 46},
+        "identity": {"score": 33},
+    }
+    delta = build_reaudit_delta(
+        current_report=current,
+        prior_report=prior,
+        prior_row=None,
+        days_since=7,
+    )
+    moves = {m["signal"]: m for m in delta["movements"] if "signal" in m}
+    # visibility = weakest dim (20 -> 33), attribution = citation (20 -> 46)
+    assert moves["visibility"]["from"] == 20 and moves["visibility"]["to"] == 33
+    assert moves["attribution"]["from"] == 20 and moves["attribution"]["to"] == 46
+    assert moves["attribution"]["is_material"] is True
+    # And the contract counter reads the real key end-to-end.
+    current["reaudit_delta"] = delta
+    out = build_report_summary(current)["since_last_audit"]
+    assert out["material_movements"] >= 1

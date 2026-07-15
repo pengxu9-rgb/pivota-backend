@@ -221,6 +221,15 @@ def _primary_report(report: Optional[Mapping[str, Any]]) -> Dict[str, Any]:
             if isinstance(item, Mapping):
                 return dict(item)
         return {}
+    # Per-SKU brand report (the production wedge shape) — same treatment
+    # _prompt_set_id already got; without this branch every movement read
+    # None scores and the delta shipped dead (review P0, wave-1).
+    per_sku = report.get("per_sku_reports")
+    if isinstance(per_sku, list):
+        for item in per_sku:
+            if isinstance(item, Mapping):
+                return dict(item)
+        return {}
     return dict(report)
 
 
@@ -231,6 +240,10 @@ def _merchant_view(report: Mapping[str, Any]) -> Mapping[str, Any]:
 
 def _next_best_action(report: Mapping[str, Any]) -> Mapping[str, Any]:
     nba = _merchant_view(report).get("next_best_action")
+    if not isinstance(nba, Mapping):
+        # Per-SKU report entries carry next_best_action at the TOP level
+        # (they have no merchant_view).
+        nba = report.get("next_best_action")
     return nba if isinstance(nba, Mapping) else {}
 
 
@@ -239,7 +252,7 @@ def _scores(report: Mapping[str, Any]) -> Dict[str, Optional[int]]:
     headline_scores = _as_mapping(headline.get("scores"))
     verdict = _as_mapping(report.get("verdict"))
     category = _as_mapping(report.get("category_visibility"))
-    return {
+    out = {
         "visibility": _int_or_none(
             headline_scores.get("visibility", verdict.get("visibility_score"))
         ),
@@ -253,6 +266,22 @@ def _scores(report: Mapping[str, Any]) -> Dict[str, Optional[int]]:
             )
         ),
     }
+    if all(v is None for v in out.values()):
+        # Per-SKU report entry: mirror _per_sku_run_aggregate's documented
+        # semantics — visibility = weakest dimension, attribution = citation
+        # dimension, category not measured in per-SKU mode.
+        dims = _as_mapping(report.get("scores"))
+        values = [
+            payload.get("score")
+            for payload in dims.values()
+            if isinstance(payload, Mapping)
+            and isinstance(payload.get("score"), (int, float))
+        ]
+        if values:
+            out["visibility"] = _int_or_none(min(values))
+            citation = _as_mapping(dims.get("citation"))
+            out["attribution"] = _int_or_none(citation.get("score"))
+    return out
 
 
 def _stable_fields(report: Mapping[str, Any]) -> Dict[str, Optional[str]]:
@@ -275,6 +304,8 @@ def _stable_fields(report: Mapping[str, Any]) -> Dict[str, Optional[str]]:
             headline.get("verdict_label"),
             verdict.get("label"),
             report.get("verdict_label"),
+            # Per-SKU entry: band_display.label is the merchant-safe verdict.
+            _as_mapping(report.get("band_display")).get("label"),
         ),
     }
 

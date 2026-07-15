@@ -530,7 +530,9 @@ def _since_last_audit(report: Mapping[str, Any]) -> Optional[Dict[str, Any]]:
         "days_since_last": delta.get("days_since_last"),
         "headline": delta.get("headline"),
         "movements": movements,
-        "material_movements": sum(1 for m in movements if m.get("material")),
+        # Producer emits is_material (review P1: reading "material" made this
+        # counter permanently zero on real passthrough data).
+        "material_movements": sum(1 for m in movements if m.get("is_material")),
         "basis_same": (_as_dict(delta.get("measurement_basis"))).get("same"),
     }
 

@@ -15482,19 +15482,23 @@ async def _attach_outreach_outcomes_per_sku(
         if isinstance(row, dict) and row.get("status") == "succeeded"
     ]
     if not succeeded:
-        report["outreach_outcomes"] = build_outreach_outcomes(
-            current_report=report,
-            prior_report=None,
-            measurement_basis=measurement_basis_between(report, None),
-        )
-        # Wave-1 A1: the "Since your last audit" layer rides the same prior
-        # context — first audit attaches the honest baseline shape.
-        report["reaudit_delta"] = build_reaudit_delta(
-            current_report=report,
-            prior_report=None,
-            prior_row=None,
-            days_since=None,
-        )
+        # Best-effort like the success branch (review P2: this path was
+        # unprotected — a raise here would sink the whole audit).
+        try:
+            report["outreach_outcomes"] = build_outreach_outcomes(
+                current_report=report,
+                prior_report=None,
+                measurement_basis=measurement_basis_between(report, None),
+            )
+            # Wave-1 A1: first audit attaches the honest baseline shape.
+            report["reaudit_delta"] = build_reaudit_delta(
+                current_report=report,
+                prior_report=None,
+                prior_row=None,
+                days_since=None,
+            )
+        except Exception:  # noqa: BLE001 - history must never sink the audit
+            logger.warning("first-audit outcome/delta attach failed", exc_info=True)
         return report
     prior_row = succeeded[0]
     prior_run_id = str(prior_row.get("run_id") or "").strip()
