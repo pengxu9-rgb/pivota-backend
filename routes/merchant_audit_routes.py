@@ -1030,6 +1030,16 @@ _WEDGE_RUN_STALE_TTL_S = int(_os.getenv("WEDGE_RUN_STALE_TTL_S", "900"))
 # Engine-side _BRAND_REPORT_MAX_PRODUCTS=50 stays the hard ceiling.
 _WEDGE_MAX_PRODUCTS_FREE = int(_os.getenv("WEDGE_MAX_PRODUCTS_FREE", "5"))
 _WEDGE_MAX_PRODUCTS_PAID = int(_os.getenv("WEDGE_MAX_PRODUCTS_PAID", "20"))
+# Per-SKU merchant prompts (custom_prompts_by_url): capped per product AND
+# across the whole set so a 20-product paid run can't fan 20×N extra grounded
+# probes per provider. Each one is billed like any probed prompt (counted into
+# per_provider_probes below) and pinned into its SKU's basis on the next run.
+_WEDGE_CUSTOM_PROMPTS_PER_SKU = int(
+    _os.getenv("WEDGE_CUSTOM_PROMPTS_PER_SKU", "2")
+)
+_WEDGE_CUSTOM_PROMPTS_TOTAL = int(
+    _os.getenv("WEDGE_CUSTOM_PROMPTS_TOTAL", "10")
+)
 
 # Per-product (per-SKU) URL audit: each pasted URL is audited as its own SKU
 # through the durable per-SKU pipeline. prompts_per_sku at 18 (vs the readiness
@@ -1110,6 +1120,18 @@ class MerchantUrlAuditRequest(BaseModel):
             "entry). Probed once (brand-level, like the readiness audit) and "
             "surfaced as 'Your prompts' — whether AI cited you, the sources it "
             "grounded in, and which competitors it named instead."
+        ),
+    )
+    custom_prompts_by_url: Optional[Dict[str, List[str]]] = Field(
+        default=None,
+        description=(
+            "Merchant prompts attached to a SPECIFIC product: keyed by the "
+            "exact URL from product_urls (2 per product, 10 total by "
+            "default; env-tunable). Unlike the brand-level custom_prompts "
+            "panel, these are probed INSIDE that product's audit context, so "
+            "the results join its per-prompt table / win plan / evidence "
+            "chain, and they're pinned into that product's measurement basis "
+            "— your niche gets tracked week over week on re-runs."
         ),
     )
     refresh: bool = Field(
@@ -1597,16 +1619,75 @@ async def run_merchant_url_audit(
             },
         )
 
+    # 1c. Per-SKU merchant prompts: validate + clean BEFORE the per-URL network
+    #     fetch (same review-A1 rule as the tier cap — no outbound spend on a
+    #     request we're about to 422). Keys must be URLs from this request;
+    #     caps are explicit 422s, not silent truncation, so the merchant never
+    #     pays for prompts that quietly didn't run.
+    submitted_urls = set(body.product_urls)
+    custom_by_url_clean: Dict[str, List[str]] = {}
+    for _url, _prompts in (body.custom_prompts_by_url or {}).items():
+        if _url not in submitted_urls:
+            raise HTTPException(
+                status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+                detail={
+                    "code": "custom_prompts_url_mismatch",
+                    "message": (
+                        "custom_prompts_by_url keys must be URLs from "
+                        f"product_urls (got a key not in the set: {_url})."
+                    ),
+                },
+            )
+        _seen_pu: set = set()
+        _clean_pu: List[str] = []
+        for _p in _prompts or []:
+            _t = str(_p or "").strip()
+            if _t and _t.lower() not in _seen_pu:
+                _seen_pu.add(_t.lower())
+                _clean_pu.append(_t)
+        if len(_clean_pu) > _WEDGE_CUSTOM_PROMPTS_PER_SKU:
+            raise HTTPException(
+                status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+                detail={
+                    "code": "custom_prompts_per_product_cap",
+                    "message": (
+                        f"Up to {_WEDGE_CUSTOM_PROMPTS_PER_SKU} prompts per "
+                        f"product (got {len(_clean_pu)} for {_url})."
+                    ),
+                    "cap_per_product": _WEDGE_CUSTOM_PROMPTS_PER_SKU,
+                },
+            )
+        if _clean_pu:
+            custom_by_url_clean[_url] = _clean_pu
+    total_sku_customs = sum(len(v) for v in custom_by_url_clean.values())
+    if total_sku_customs > _WEDGE_CUSTOM_PROMPTS_TOTAL:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail={
+                "code": "custom_prompts_total_cap",
+                "message": (
+                    f"Up to {_WEDGE_CUSTOM_PROMPTS_TOTAL} per-product prompts "
+                    f"across the set (got {total_sku_customs})."
+                ),
+                "cap_total": _WEDGE_CUSTOM_PROMPTS_TOTAL,
+            },
+        )
+
     # 2. Fetch each merchant-provided product URL into a clean audit product.
     #    We audit exactly what the merchant chose — no discovery, no guessing.
     fetched = await asyncio.gather(
         *[fetch_curated_audit_product(u) for u in body.product_urls]
     )
     audit_products: List[Dict[str, Any]] = []
+    # The submitted URL each resolved product came from (aligned with
+    # audit_products) — the fetch may normalize pdp_url, but the merchant's
+    # custom_prompts_by_url keys are the URLs they SUBMITTED.
+    requested_urls: List[str] = []
     unresolved: List[Dict[str, str]] = []
     for raw_url, (product, reason) in zip(body.product_urls, fetched):
         if product:
             audit_products.append(product)
+            requested_urls.append(raw_url)
         else:
             unresolved.append(
                 {"url": raw_url, "reason": reason or "could not resolve"}
@@ -1623,6 +1704,25 @@ async def run_merchant_url_audit(
                 "unresolved": unresolved,
             },
         )
+
+    # Per-SKU merchant prompts re-keyed from the submitted URL to the minted
+    # synthetic sku_key — the shape the probe fan-out consumes. Built from
+    # RESOLVED products only, so prompts on an unresolved URL are neither
+    # probed nor billed (the URL itself is reported in `unresolved`). Two
+    # submitted URLs minting the same key (duplicate product) merge with a
+    # case-insensitive dedupe so billing can't exceed what actually runs.
+    custom_prompts_by_sku: Dict[str, List[str]] = {}
+    for p, requested_url in zip(audit_products, requested_urls):
+        sku_customs = custom_by_url_clean.get(requested_url) or []
+        if not sku_customs:
+            continue
+        key = _synthetic_url_sku_key(merchant_id, p["pdp_url"])
+        merged = custom_prompts_by_sku.setdefault(key, [])
+        seen_merged = {m.lower() for m in merged}
+        for text in sku_customs:
+            if text.lower() not in seen_merged:
+                seen_merged.add(text.lower())
+                merged.append(text)
 
     # NOTE: the commerce-index auto-seed runs in the
     # BACKGROUND task (_run_wedge_audit_background), not here, so it adds no
@@ -1661,12 +1761,15 @@ async def run_merchant_url_audit(
         from services.credit_consumption_service import estimate_probe_credits
 
         # Per-SKU pricing: each resolved URL is probed prompts_per_sku times per
-        # provider; custom prompts add ONE probe each per provider (brand-level,
-        # not per product). Price against the SAME provider set + probe count the
-        # worker will actually run so billing matches cost.
+        # provider; brand-level custom prompts add ONE probe each per provider,
+        # and per-SKU merchant prompts (custom_prompts_by_url) add one probe
+        # each per provider inside their product's context. Price against the
+        # SAME provider set + probe count the worker will actually run so
+        # billing matches cost (only RESOLVED products' prompts count).
         per_provider_probes = (
             len(audit_products) * max(1, _WEDGE_PROMPTS_PER_SKU)
             + len(custom_prompts_clean)
+            + sum(len(v) for v in custom_prompts_by_sku.values())
         )
         wedge_probe_count = per_provider_probes * max(1, len(providers_for_launch))
         metered_credits, metered_cogs = estimate_probe_credits(
@@ -1896,6 +1999,10 @@ async def run_merchant_url_audit(
                 "verify_providers": list(_WEDGE_VERIFY_PROVIDERS),
                 "prompts_per_sku": _WEDGE_PROMPTS_PER_SKU,
                 "custom_prompts": custom_prompts_clean,
+                # Per-SKU merchant prompts (custom_prompts_by_url re-keyed to
+                # sku_key): probed inside their SKU's context and pinned into
+                # its basis — the merchant's niche tracks week over week.
+                "custom_prompts_by_sku": custom_prompts_by_sku,
                 # Probe winnable SPECIFIC discovery prompts (LLM value-prop
                 # extraction), not just generic category heads — this is the
                 # demand a store-less brand can realistically win in AI.

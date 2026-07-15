@@ -244,6 +244,121 @@ def test_custom_prompts_dedupe_into_launch(client):
     ]
 
 
+# --- POST: per-SKU merchant prompts (custom_prompts_by_url) -------------------
+def test_custom_prompts_by_url_rekeyed_to_synthetic_sku(client):
+    client.state["used"] = 0
+    res = client.post(_URL, json={
+        **_BODY,
+        "custom_prompts_by_url": {
+            "https://merch.example/products/b": [
+                "  collagen jelly for red-eye flights ",
+                "collagen jelly for red-eye flights",  # dup (trim/case)
+                "",  # blank dropped
+            ],
+        },
+    })
+    assert res.status_code == 200, res.text
+    launch = client.enqueued[-1]["request_options_jsonb"]["launch"]
+    by_sku = launch["custom_prompts_by_sku"]
+    # Re-keyed from the submitted URL to the minted synthetic sku_key of
+    # EXACTLY that product (products/b is the second synthetic product).
+    sku_b = launch["synthetic_products"][1]["sku_key"]
+    assert launch["synthetic_products"][1]["pdp_url"].endswith("/products/b")
+    assert by_sku == {sku_b: ["collagen jelly for red-eye flights"]}
+    # Brand-level slots unaffected.
+    assert launch["custom_prompts"] == []
+
+
+def test_custom_prompts_by_url_unknown_key_422(client):
+    client.state["used"] = 0
+    res = client.post(_URL, json={
+        **_BODY,
+        "custom_prompts_by_url": {
+            "https://elsewhere.example/products/z": ["some prompt"],
+        },
+    })
+    assert res.status_code == 422
+    assert res.json()["detail"]["code"] == "custom_prompts_url_mismatch"
+    assert client.enqueued == []
+
+
+def test_custom_prompts_by_url_per_product_cap_422(client, monkeypatch):
+    monkeypatch.setattr(mar, "_WEDGE_CUSTOM_PROMPTS_PER_SKU", 2)
+    client.state["used"] = 0
+    res = client.post(_URL, json={
+        **_BODY,
+        "custom_prompts_by_url": {
+            "https://merch.example/products/a": ["p one", "p two", "p three"],
+        },
+    })
+    assert res.status_code == 422
+    assert res.json()["detail"]["code"] == "custom_prompts_per_product_cap"
+    assert client.enqueued == []
+
+
+def test_custom_prompts_by_url_total_cap_422(client, monkeypatch):
+    monkeypatch.setattr(mar, "_WEDGE_CUSTOM_PROMPTS_PER_SKU", 2)
+    monkeypatch.setattr(mar, "_WEDGE_CUSTOM_PROMPTS_TOTAL", 3)
+    client.state["used"] = 0
+    res = client.post(_URL, json={
+        **_BODY,
+        "custom_prompts_by_url": {
+            "https://merch.example/products/a": ["a one", "a two"],
+            "https://merch.example/products/b": ["b one", "b two"],
+        },
+    })
+    assert res.status_code == 422
+    assert res.json()["detail"]["code"] == "custom_prompts_total_cap"
+    assert client.enqueued == []
+
+
+def test_custom_prompts_by_url_billed_per_probe(client, monkeypatch):
+    """Metered path: per-SKU merchant prompts count into per_provider_probes
+    exactly like the prompts the worker will actually run."""
+    captured = {}
+
+    def fake_estimate(pairs):
+        captured["pairs"] = pairs
+        return 42, 1.5
+
+    import services.credit_consumption_service as _ccs_mod
+    monkeypatch.setattr(_ccs_mod, "estimate_probe_credits", fake_estimate)
+    client.state["used"] = 5  # past the free allowance -> metered
+    res = client.post(_URL, json={
+        **_BODY,
+        "custom_prompts": ["brand slot prompt"],
+        "custom_prompts_by_url": {
+            "https://merch.example/products/a": ["niche a"],
+            "https://merch.example/products/b": ["niche b"],
+        },
+    })
+    assert res.status_code == 200, res.text
+    expected_per_provider = (
+        2 * mar._WEDGE_PROMPTS_PER_SKU  # 2 resolved products
+        + 1  # brand-level slot
+        + 2  # per-SKU merchant prompts
+    )
+    assert [p[1] for p in captured["pairs"]] == [
+        expected_per_provider for _ in captured["pairs"]
+    ]
+
+
+def test_custom_prompts_on_unresolved_url_not_launched(client):
+    """Prompts keyed to a URL that fails to resolve are neither probed nor
+    billed — the URL itself is already reported in `unresolved`."""
+    client.state["used"] = 0
+    res = client.post(_URL, json={
+        "product_urls": ["https://merch.example/products/a", "not-a-url"],
+        "custom_prompts_by_url": {"not-a-url": ["orphan prompt"]},
+    })
+    assert res.status_code == 200, res.text
+    launch = client.enqueued[-1]["request_options_jsonb"]["launch"]
+    assert launch["custom_prompts_by_sku"] == {}
+    assert [u["url"] for u in res.json()["methodology"]["unresolved_urls"]] == [
+        "not-a-url"
+    ]
+
+
 def test_post_vendor_fallback_when_absent(client, monkeypatch):
     client.state["used"] = 0
 

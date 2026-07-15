@@ -64,6 +64,11 @@ def test_broad_head_detection():
     assert not _is_broad_head_query(
         "best waterproof headphones", prompt_source="llm_winnable"
     )
+    # a merchant-authored prompt is a deliberate test — never dropped as head
+    # pressure, even when it's head-shaped
+    assert not _is_broad_head_query(
+        "best headphones", prompt_source="merchant_custom"
+    )
 
 
 def _plan_for(query, prompt_source=None):

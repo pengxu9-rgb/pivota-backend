@@ -386,3 +386,105 @@ async def test_custom_prompts_run_once_on_first_sku_only(monkeypatch) -> None:
 
     assert "my niche lane prompt" in seen.get(sku_a, [])
     assert "my niche lane prompt" not in seen.get(sku_b, [])
+
+
+async def test_per_sku_custom_prompts_probe_on_their_own_sku(monkeypatch) -> None:
+    """custom_prompts_by_sku attaches merchant prompts to a SPECIFIC SKU: the
+    prompt probes inside THAT SKU's context (joining its per-prompt results),
+    not on the first SKU like the brand-level slots."""
+    sku_a, sku_b = "p1::v::a", "p1::v::b"
+
+    async def _fake_sku_keys(products, merchant_id):
+        return [sku_a, sku_b]
+
+    async def _fake_load_ctx(sku_key, merchant_id):
+        c = _sku_ctx()
+        c["sku_key"] = sku_key
+        return c
+
+    seen: dict = {}
+
+    async def _fake_probe(*, scan_mode, scan_target_id, merchant_id, store_id,
+                          context, provider, max_runs, model=None,
+                          model_is_override=False):
+        body = scan_target_id[len("run_by_sku:"):].rsplit(":per_sku:", 1)[0]
+        sk = body.rsplit(":", 1)[0]
+        seen.setdefault(sk, []).extend(context.get("queries") or [])
+        return {"provider": provider,
+                "raw_runs": [{"query": q} for q in context.get("queries") or []]}
+
+    monkeypatch.setattr(bd, "_sku_keys_for_per_sku_mode", _fake_sku_keys)
+    monkeypatch.setattr(bd, "load_sku_context", _fake_load_ctx)
+    monkeypatch.setattr(bd.llm_client, "probe", _fake_probe)
+
+    out = await bd.run_per_sku_audit_probe_fanout(
+        merchant_id=MERCHANT,
+        audit_run_id="run_by_sku",
+        products=[{"product_key": "p1"}],
+        coverage_profile="pilot_gemini",
+        prompts_per_sku=PROMPTS,
+        custom_prompts_by_sku={sku_b: ["collagen jelly for red-eye flights"]},
+    )
+
+    assert "collagen jelly for red-eye flights" not in seen.get(sku_a, [])
+    assert "collagen jelly for red-eye flights" in seen.get(sku_b, [])
+
+    # The probed row carries the merchant stamp downstream consumers key on:
+    # axis="custom" + axis_metadata.prompt_source="merchant_custom" (evidence
+    # selector exemption + UI badge).
+    rows = [
+        r for r in bd._flatten_probe_runs(out[sku_b])
+        if r.get("query") == "collagen jelly for red-eye flights"
+    ]
+    assert rows, "per-SKU custom prompt missing from persisted probe runs"
+    meta = rows[0].get("axis_metadata") or {}
+    assert meta.get("axis") == "custom"
+    assert meta.get("prompt_source") == "merchant_custom"
+
+
+async def test_per_sku_customs_pinned_into_basis_brand_customs_not(monkeypatch) -> None:
+    """Pinning contract: this SKU's own merchant prompts join _selected_specs_out
+    (the set persisted as the next run's pinned basis -> week-over-week
+    comparability); the brand-level one-shot slots do NOT."""
+    ctxs: list = []
+
+    async def _fake_sku_keys(products, merchant_id):
+        return [SKU_KEY]
+
+    async def _fake_load_ctx(sku_key, merchant_id):
+        c = _sku_ctx()
+        ctxs.append(c)
+        return c
+
+    async def _fake_probe(*, scan_mode, scan_target_id, merchant_id, store_id,
+                          context, provider, max_runs, model=None,
+                          model_is_override=False):
+        return {"provider": provider,
+                "raw_runs": [{"query": q} for q in context.get("queries") or []]}
+
+    monkeypatch.setattr(bd, "_sku_keys_for_per_sku_mode", _fake_sku_keys)
+    monkeypatch.setattr(bd, "load_sku_context", _fake_load_ctx)
+    monkeypatch.setattr(bd.llm_client, "probe", _fake_probe)
+
+    await bd.run_per_sku_audit_probe_fanout(
+        merchant_id=MERCHANT,
+        audit_run_id="run_pin_test",
+        products=[{"product_key": "p1"}],
+        coverage_profile="pilot_gemini",
+        prompts_per_sku=PROMPTS,
+        custom_prompts=["brand level one-shot prompt"],
+        custom_prompts_by_sku={SKU_KEY: ["my pinned niche prompt"]},
+    )
+
+    assert ctxs, "fanout never loaded the sku ctx"
+    selected = ctxs[0].get("_selected_specs_out") or []
+    selected_queries = {str(r.get("query")) for r in selected}
+    assert "my pinned niche prompt" in selected_queries
+    assert "brand level one-shot prompt" not in selected_queries
+    # And the pinned record keeps its stamps, so a pinned re-run re-probes it
+    # with the same axis + prompt_source (basis identity, badge included).
+    pinned = next(
+        r for r in selected if r.get("query") == "my pinned niche prompt"
+    )
+    assert pinned.get("axis") == "custom"
+    assert pinned.get("source") == "merchant_custom"
