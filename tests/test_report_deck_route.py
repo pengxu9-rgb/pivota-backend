@@ -254,17 +254,52 @@ def test_share_disabled_flag_404s_everything(patched, monkeypatch):
     assert client.get("/api/public/audit-share/whatever").status_code == 404
 
 
-def test_share_public_read_redacts_pitch_emails(patched, monkeypatch):
+def test_share_public_read_leaks_no_email_anywhere(patched, monkeypatch):
+    # Security review round 2: the REAL builder shapes carry full
+    # pitch_recipient dicts on outreach_moves AND pitch_targets, in both
+    # where_youre_losing and merchant_narrative.where_youre_losing. The
+    # public body must contain NO email string anywhere, ever.
+    import re
+
     fake_db = _FakeShareDB()
     import db.database as dbmod
     monkeypatch.setattr(dbmod, "database", fake_db)
     row = _row()
-    row["report_jsonb"]["merchant_narrative"]["where_youre_losing"]["outreach_moves"] = [
-        {"host": "byrdie.com", "pitch_email": "tips@byrdie.com", "pitch_state": "draft_ready"}
+    losing = row["report_jsonb"]["merchant_narrative"]["where_youre_losing"]
+    losing["outreach_moves"] = [
+        {
+            "host": "soundguys.com",
+            "pitch_email": "pr@soundguys.com",
+            "pitch_recipient": {"email": "pr@soundguys.com", "note": "x"},
+            "pitch_state": "draft_ready",
+        }
+    ]
+    losing["pitch_targets"] = [
+        {
+            "host": "forbes.com",
+            "pitch_recipient": {
+                "email": "vetted@forbes.com",
+                "submission_url": "https://forbes.com/tips",
+            },
+        }
     ]
     patched["row"] = row
     client = _share_client(monkeypatch)
     token = client.post("/api/merchant-center/audit/url-readiness/r-1/share").json()["token"]
-    body = client.get(f"/api/public/audit-share/{token}").json()
+    res = client.get(f"/api/public/audit-share/{token}")
+    raw = res.text
+    assert not re.search(r"[\w.+-]+@[\w-]+\.[\w.]+", raw), raw[:400]
+    body = res.json()
+    # the structural rows survive (host + state), only routing data is gone
     moves = body["where_youre_losing"]["outreach_moves"]
-    assert moves and "pitch_email" not in moves[0]
+    assert moves[0]["host"] == "soundguys.com"
+    assert "pitch_recipient" not in moves[0] and "pitch_email" not in moves[0]
+    assert "pitch_recipient" not in body["where_youre_losing"]["pitch_targets"][0]
+    # allowlist: nothing outside the approved key set
+    allowed = set(mar._SHARE_ALLOWED_TOP_KEYS) | {"shared_view"}
+    assert set(body.keys()) <= allowed, set(body.keys()) - allowed
+
+
+def test_share_revoke_requires_flag(patched, monkeypatch):
+    client = _share_client(monkeypatch, enabled=False)
+    assert client.delete("/api/merchant-center/audit/url-readiness/r-1/share").status_code == 404

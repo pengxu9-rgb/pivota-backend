@@ -44,7 +44,7 @@ import re
 import time
 from collections import Counter
 from datetime import datetime, timezone
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 from urllib.parse import urlparse
 
 from fastapi import APIRouter, Depends, HTTPException, Response, status
@@ -1992,31 +1992,56 @@ _SHARE_LINKS_ENABLED = (
     _os.getenv("AUDIT_SHARE_LINKS_ENABLED", "false").strip().lower() == "true"
 )
 _SHARE_LINK_TTL_DAYS = int(_os.getenv("AUDIT_SHARE_LINK_TTL_DAYS", "30"))
-# Keys a PUBLIC share must never carry: billing/funnel chrome, the
-# merchant's own test prompts, and outreach recipient PII (pitch emails are
-# curated for the MERCHANT to use, not for the open web).
-_SHARE_REDACT_TOP_KEYS = (
-    "custom_prompts",
-    "billing",
-    "billing_mode",
-    "credits_charged",
-    "free_audits_allowed",
-    "free_audits_used",
-    "free_audits_remaining",
-    "merchant_context",
-    "brand_report",
+# PUBLIC share = ALLOWLIST, not denylist (security review round 2: a
+# denylist on an unauthenticated surface ships every future key by default,
+# and the first version leaked registry pitch_recipient emails through
+# where_youre_losing.outreach_moves[] and pitch_targets[]). Only these
+# top-level keys may leave the building:
+_SHARE_ALLOWED_TOP_KEYS = (
+    "status",
+    "run_id",
+    "audit_run_id",
+    "tier",
+    "per_sku_reports",
+    "brand_rollup",
+    "authority_map",
+    "where_you_can_win",
+    "suggested_prompts",
+    "where_youre_losing",
+    "merchant_narrative",
+    "catalog_dimensions_available",
+    "methodology",
+    "audited_products",
+    "report_summary",
+)
+
+# Curated outreach routing is for the MERCHANT, never the open web. These
+# key names are scrubbed RECURSIVELY from the whole allowlisted payload so
+# no present-or-future nesting (moves, pitch_targets, win-plan folds) can
+# resurface them.
+_SHARE_SCRUB_KEYS = frozenset(
+    {"pitch_recipient", "pitch_email", "pitch_submission_url", "pitch_draft"}
 )
 
 
+def _deep_scrub(node: Any) -> Any:
+    if isinstance(node, dict):
+        return {
+            k: _deep_scrub(v)
+            for k, v in node.items()
+            if k not in _SHARE_SCRUB_KEYS
+        }
+    if isinstance(node, list):
+        return [_deep_scrub(item) for item in node]
+    return node
+
+
 def _redact_shared_report(shaped: Dict[str, Any]) -> Dict[str, Any]:
-    out = {k: v for k, v in shaped.items() if k not in _SHARE_REDACT_TOP_KEYS}
-    losing = out.get("where_youre_losing")
-    if isinstance(losing, dict):
-        moves = losing.get("outreach_moves")
-        if isinstance(moves, list):
-            for move in moves:
-                if isinstance(move, dict):
-                    move.pop("pitch_email", None)
+    out = {
+        k: _deep_scrub(v)
+        for k, v in shaped.items()
+        if k in _SHARE_ALLOWED_TOP_KEYS
+    }
     out["shared_view"] = True
     return out
 
@@ -2046,15 +2071,22 @@ async def create_url_audit_share_link(
         )
     from db.database import database
 
-    existing = await database.fetch_one(
-        """
-        SELECT token, expires_at FROM audit_share_tokens
-        WHERE run_id = :r AND merchant_id = :m
-          AND revoked_at IS NULL AND expires_at > now()
-        ORDER BY created_at DESC LIMIT 1
-        """,
-        {"r": run_id, "m": merchant_id},
-    )
+    try:
+        existing = await database.fetch_one(
+            """
+            SELECT token, expires_at FROM audit_share_tokens
+            WHERE run_id = :r AND merchant_id = :m
+              AND revoked_at IS NULL AND expires_at > now()
+            ORDER BY created_at DESC LIMIT 1
+            """,
+            {"r": run_id, "m": merchant_id},
+        )
+    except Exception:  # noqa: BLE001 — table not provisioned yet -> clean 503
+        logger.warning("audit_share_tokens mint lookup failed", exc_info=True)
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail={"code": "share_links_unavailable"},
+        )
     if existing:
         token = existing["token"]
         expires_at = existing["expires_at"]
@@ -2083,6 +2115,11 @@ async def revoke_url_audit_share_link(
     run_id: str,
     merchant_id: str = Depends(get_current_merchant),
 ) -> Dict[str, Any]:
+    if not _SHARE_LINKS_ENABLED:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail={"code": "share_links_disabled"},
+        )
     from db.database import database
 
     await database.execute(
@@ -2092,6 +2129,9 @@ async def revoke_url_audit_share_link(
         """,
         {"r": run_id, "m": merchant_id},
     )
+    # Revocation is immediate: drop the (tiny, 60s-TTL) public response cache
+    # wholesale rather than letting a revoked link serve until expiry.
+    _SHARE_CACHE.clear()
     return {"revoked": True}
 
 
@@ -2100,19 +2140,44 @@ async def revoke_url_audit_share_link(
 public_share_router = APIRouter(prefix="/api/public", tags=["public-share"])
 
 
+# 60s in-memory response cache: a leaked/hammered valid token replays a
+# cached body instead of re-running full report shaping every hit (review
+# P2 — unauthenticated CPU amplification). Tiny + bounded; revocation takes
+# effect within the TTL.
+_SHARE_CACHE: "Dict[str, Tuple[float, bytes]]" = {}
+_SHARE_CACHE_TTL_S = 60.0
+_SHARE_CACHE_MAX = 256
+
+
 @public_share_router.get("/audit-share/{token}")
 async def read_shared_audit(token: str) -> Response:
     if not _SHARE_LINKS_ENABLED:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND)
+    import time as _time
+
+    cached = _SHARE_CACHE.get(token)
+    if cached and cached[0] > _time.monotonic():
+        return Response(
+            content=cached[1],
+            media_type="application/json",
+            headers={"X-Robots-Tag": "noindex, nofollow"},
+        )
     from db.database import database
 
-    row = await database.fetch_one(
-        """
-        SELECT run_id FROM audit_share_tokens
-        WHERE token = :t AND revoked_at IS NULL AND expires_at > now()
-        """,
-        {"t": token},
-    )
+    try:
+        row = await database.fetch_one(
+            """
+            SELECT run_id FROM audit_share_tokens
+            WHERE token = :t AND revoked_at IS NULL AND expires_at > now()
+            """,
+            {"t": token},
+        )
+    except Exception:  # noqa: BLE001 — table not provisioned yet -> clean 503
+        logger.warning("audit_share_tokens lookup failed", exc_info=True)
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail={"code": "share_links_unavailable"},
+        )
     if not row:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND)
     run = await fetch_audit_run_by_id(run_id=row["run_id"])
@@ -2121,8 +2186,12 @@ async def read_shared_audit(token: str) -> Response:
     shaped = _redact_shared_report(_shape_url_audit_response(run))
     import json as _json
 
+    body = _json.dumps(shaped, default=str).encode()
+    if len(_SHARE_CACHE) >= _SHARE_CACHE_MAX:
+        _SHARE_CACHE.clear()
+    _SHARE_CACHE[token] = (_time.monotonic() + _SHARE_CACHE_TTL_S, body)
     return Response(
-        content=_json.dumps(shaped, default=str),
+        content=body,
         media_type="application/json",
         headers={"X-Robots-Tag": "noindex, nofollow"},
     )
