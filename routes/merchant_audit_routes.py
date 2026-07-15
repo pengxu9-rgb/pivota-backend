@@ -1402,7 +1402,13 @@ def _shape_url_audit_response(row: Dict[str, Any]) -> Dict[str, Any]:
     # 3-page portal view / PPT export / homepage hero will consume. No
     # renderer reads it yet; a build failure must never sink the response.
     try:
-        out["report_summary"] = build_report_summary(report)
+        # URL wedge = no connected catalog -> routability signals (serving
+        # eligibility / orderability) are unmeasurable; exclude them from the
+        # displayed weakest-link score (calibration decision a — same reason
+        # this envelope stamps catalog_dimensions_available=False above).
+        out["report_summary"] = build_report_summary(
+            report, unmeasured_dimensions=("routability",)
+        )
     except Exception:  # noqa: BLE001
         logger.warning("report_summary build failed", exc_info=True)
         out["report_summary"] = None

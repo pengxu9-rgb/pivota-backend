@@ -550,3 +550,65 @@ def test_chip_builder_preserves_prompt_source():
         {"query": "best swim mp3", "prompt_source": "llm_winnable"}
     )
     assert chip["prompt_source"] == "llm_winnable"
+
+
+def test_unmeasured_dimensions_excluded_from_weakest_link():
+    # Calibration decision (a), live-Mojawa shape: citation 46 / identity 23 /
+    # content 46 / routability 6 with no connected catalog. Routability is
+    # unmeasurable, not zero — overall = min(46, 23, 46) = 23, not 6.
+    report = _brand_report()
+    report["per_sku_reports"][0]["scores"] = {
+        "citation": {"score": 46},
+        "identity": {"score": 23},
+        "content_richness": {"score": 46},
+        "routability": {"score": 6},
+    }
+    out = build_report_summary(
+        report, unmeasured_dimensions=("routability",)
+    )
+    score = out["score"]
+    assert score["raw"] == 23.0
+    assert score["display"] == 2.3
+    assert score["unmeasured_excluded"] == ["routability"]
+    assert score["weakest_dimension"]["key"] == "identity"
+    assert score["weakest_dimension"]["display"] == 2.3
+    explainer = score["explainer"]
+    assert "weakest" in explainer.lower()
+    assert "product identity" in explainer
+    assert "routability" in explainer
+    assert "connected catalog" in explainer
+    # Old-semantics run-over-run delta is dropped once exclusions changed the
+    # number — never compare apples to oranges.
+    assert score["delta"] is None
+    # SKU row mirrors the same semantics.
+    assert out["sku_summaries"][0]["score"]["raw"] == 23
+
+
+def test_no_exclusions_keeps_historical_semantics():
+    # Default () — the persisted run_scores number is NEVER overridden;
+    # weakest/explainer are still derived so the popover works everywhere.
+    out = build_report_summary(_brand_report())
+    score = out["score"]
+    assert score["raw"] == 42.0  # persisted, untouched
+    assert score["unmeasured_excluded"] == []
+    assert score["weakest_dimension"]["key"] == "routability"
+    assert score["explainer"] and "Not counted" not in score["explainer"]
+    assert score["delta"] is not None
+
+
+def test_wedge_route_declares_routability_unmeasurable():
+    from routes.merchant_audit_routes import _shape_url_audit_response
+
+    report = _brand_report()
+    report["per_sku_reports"][0]["scores"] = {
+        "citation": {"score": 46},
+        "routability": {"score": 6},
+    }
+    row = {
+        "run_id": "r1",
+        "report_jsonb": report,
+        "partial_result_jsonb": {},
+    }
+    out = _shape_url_audit_response(row)
+    assert out["report_summary"]["score"]["raw"] == 46.0
+    assert out["report_summary"]["score"]["unmeasured_excluded"] == ["routability"]
