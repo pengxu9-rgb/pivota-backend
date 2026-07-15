@@ -2025,6 +2025,7 @@ async def export_url_audit_deck(
     billing_mode = "preview_only"
     credits_charged = 0
     executive_bullets = None
+    llm_tokens = None
 
     if paid:
         billing_mode = "included"
@@ -2037,36 +2038,11 @@ async def export_url_audit_deck(
             generated = None
         if generated:
             executive_bullets, in_tok, out_tok = generated
-            credits, usd_cogs = credits_for_tokens(
-                DECK_LLM_PROVIDER,
-                input_tokens=in_tok,
-                output_tokens=out_tok,
-                multiple=DECK_TOKEN_PRICE_MULTIPLE,
-            )
-            if credits > 0:
-                try:
-                    result = await consume_credits(
-                        merchant_id,
-                        "report_deck_export",
-                        f"report_deck:{run_id}",
-                        credits=credits,
-                        usd_cogs=usd_cogs,
-                    )
-                except InsufficientCreditsError:
-                    raise HTTPException(
-                        status_code=status.HTTP_402_PAYMENT_REQUIRED,
-                        detail={
-                            "code": "insufficient_credits",
-                            "message": (
-                                "Not enough credits to export the deck — top up "
-                                "or upgrade your plan."
-                            ),
-                            "credits_required": credits,
-                        },
-                    )
-                billing_mode = "metered"
-                credits_charged = int(result.get("credits") or 0)
+            llm_tokens = (in_tok, out_tok)
 
+    # Render BEFORE any debit: if python-pptx is missing this 503s with no
+    # money moved ("never charge for work that didn't run" applies to the
+    # deck itself, not just the LLM step — review fix, PR #1411 round 2).
     deck = build_report_deck(
         summary,
         executive_bullets=executive_bullets,
@@ -2080,6 +2056,41 @@ async def export_url_audit_deck(
                 "message": "Deck export isn't available on this deployment yet.",
             },
         )
+
+    if paid and llm_tokens:
+        in_tok, out_tok = llm_tokens
+        credits, usd_cogs = credits_for_tokens(
+            DECK_LLM_PROVIDER,
+            input_tokens=in_tok,
+            output_tokens=out_tok,
+            multiple=DECK_TOKEN_PRICE_MULTIPLE,
+        )
+        if credits > 0:
+            try:
+                result = await consume_credits(
+                    merchant_id,
+                    "report_deck_export",
+                    f"report_deck:{run_id}",
+                    credits=credits,
+                    usd_cogs=usd_cogs,
+                )
+            except InsufficientCreditsError:
+                # NOTE: fires for merchants the balance layer treats as
+                # non-overage; plan-tier merchants may instead accrue overage
+                # per the billing system's paid-tier semantics.
+                raise HTTPException(
+                    status_code=status.HTTP_402_PAYMENT_REQUIRED,
+                    detail={
+                        "code": "insufficient_credits",
+                        "message": (
+                            "Not enough credits to export the deck — top up "
+                            "or upgrade your plan."
+                        ),
+                        "credits_required": credits,
+                    },
+                )
+            billing_mode = "metered"
+            credits_charged = int(result.get("credits") or 0)
     filename = f"pivota-ai-readiness-{run_id}.pptx"
     return Response(
         content=deck,
