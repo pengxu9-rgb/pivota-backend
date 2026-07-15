@@ -15487,6 +15487,14 @@ async def _attach_outreach_outcomes_per_sku(
             prior_report=None,
             measurement_basis=measurement_basis_between(report, None),
         )
+        # Wave-1 A1: the "Since your last audit" layer rides the same prior
+        # context — first audit attaches the honest baseline shape.
+        report["reaudit_delta"] = build_reaudit_delta(
+            current_report=report,
+            prior_report=None,
+            prior_row=None,
+            days_since=None,
+        )
         return report
     prior_row = succeeded[0]
     prior_run_id = str(prior_row.get("run_id") or "").strip()
@@ -15509,6 +15517,16 @@ async def _attach_outreach_outcomes_per_sku(
             # audit_delta's single source of truth, never re-derived here.
             measurement_basis=measurement_basis_between(report, prior_report),
             completed_actions=await _completed_outreach_actions(merchant_id),
+        )
+        # Wave-1 A1: per-SKU sibling of the legacy merchant_view attach —
+        # TOP-LEVEL, same prior fetch, score movements + basis verdict.
+        report["reaudit_delta"] = build_reaudit_delta(
+            current_report=report,
+            prior_report=prior_report,
+            prior_row=prior_row,
+            days_since=_days_between(
+                str(prior_row.get("requested_at") or "") or None
+            ),
         )
     except Exception as exc:  # noqa: BLE001 - audit must not fail on history
         logger.warning(

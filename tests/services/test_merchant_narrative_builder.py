@@ -1064,3 +1064,32 @@ def test_outreach_moves_carry_losing_query_evidence():
         "open ear headphones for triathlon training",
     ]
     assert by_move_host["coachweb.com"]["losing_queries"] == []
+
+
+def test_annotate_outreach_moves_with_pitch_paths(monkeypatch):
+    from services import merchant_narrative_builder as mnb
+
+    def fake_classify(host, **kw):
+        if host == "healthline.com":
+            return {"pitch_recipient": {"email": "tips@healthline.com"}}
+        if host == "byrdie.com":
+            return {"pitch_recipient": {"submission_url": "https://byrdie.com/write-for-us"}}
+        return {}
+
+    import services.cited_host_classifier as chc
+    monkeypatch.setattr(chc, "classify_host", fake_classify)
+    moves = [
+        {"host": "healthline.com"},
+        {"host": "byrdie.com"},
+        {"host": "unknown.example"},
+        "junk",
+    ]
+    out = mnb.annotate_outreach_moves_with_pitch_paths(moves)
+    assert out[0]["pitch_state"] == "draft_ready"
+    assert out[0]["pitch_email"] == "tips@healthline.com"
+    assert out[1]["pitch_state"] == "submission_only"
+    assert out[1]["pitch_submission_url"] == "https://byrdie.com/write-for-us"
+    assert out[2]["pitch_state"] == "target_only"
+    assert out[2]["pitch_email"] is None
+    # non-dict entries and non-list inputs degrade silently
+    assert mnb.annotate_outreach_moves_with_pitch_paths(None) is None

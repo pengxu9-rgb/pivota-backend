@@ -644,6 +644,42 @@ def _outreach_moves(
 _BRAND_OWNED_MEDIA_SUBTYPES = frozenset({"brand_owned_media"})
 
 
+def annotate_outreach_moves_with_pitch_paths(
+    moves: Any,
+) -> Any:
+    """Wave-1 C1 (serve-time): stamp each outreach move with the registry's
+    verified pitch path so the portal can deep-link instead of dumping the
+    merchant on a homepage. Tiering mirrors win_plan._outreach_from_meta:
+    email -> draft_ready, submission_url -> submission_only, else
+    target_only (render falls back to the homepage — a GUESSED contact URL
+    never ships). Serve-time + registry-driven, so historical runs pick up
+    newly curated paths without a re-run. Mutates and returns `moves`."""
+    from services.cited_host_classifier import classify_host
+
+    if not isinstance(moves, list):
+        return moves
+    for move in moves:
+        if not isinstance(move, dict) or not move.get("host"):
+            continue
+        try:
+            meta = classify_host(move["host"]) or {}
+        except Exception:  # noqa: BLE001 — annotation must never sink serving
+            continue
+        recipient = meta.get("pitch_recipient")
+        recipient = recipient if isinstance(recipient, dict) else {}
+        email = (recipient.get("email") or "").strip() or None
+        submission_url = (recipient.get("submission_url") or "").strip() or None
+        if email:
+            move["pitch_state"] = "draft_ready"
+        elif submission_url:
+            move["pitch_state"] = "submission_only"
+        else:
+            move["pitch_state"] = "target_only"
+        move["pitch_email"] = email
+        move["pitch_submission_url"] = submission_url
+    return moves
+
+
 def _closed_channels(authority_map: Dict[str, Any]) -> List[Dict[str, Any]]:
     """Cited hosts that look like an outreach target but can never cite you,
     because a competitor owns them.

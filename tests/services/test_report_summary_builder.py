@@ -612,3 +612,40 @@ def test_wedge_route_declares_routability_unmeasurable():
     out = _shape_url_audit_response(row)
     assert out["report_summary"]["score"]["raw"] == 46.0
     assert out["report_summary"]["score"]["unmeasured_excluded"] == ["routability"]
+
+
+def test_since_last_audit_passthrough_and_absence():
+    # Absent on reports that predate the per-SKU attach (presence-gated).
+    assert build_report_summary(_brand_report())["since_last_audit"] is None
+    report = _brand_report()
+    report["reaudit_delta"] = {
+        "is_first_audit": False,
+        "days_since_last": 7,
+        "headline": "Visibility improved materially since your last audit.",
+        "movements": [
+            {"signal": "visibility", "label": "AI visibility", "from": 20,
+             "to": 33, "material": True, "direction": "improved"},
+            {"signal": "attribution", "label": "Attribution", "from": 46,
+             "to": 47, "material": False, "direction": "stable"},
+        ],
+        "measurement_basis": {"same": True},
+    }
+    out = build_report_summary(report)["since_last_audit"]
+    assert out["days_since_last"] == 7
+    assert out["material_movements"] == 1
+    assert out["basis_same"] is True
+    assert out["movements"][0]["label"] == "AI visibility"  # verbatim
+
+
+def test_action_impact_dimension_stamped():
+    out = build_report_summary(_brand_report())
+    action = out["top_actions"][0]
+    # fixture primary_gap = get_indexed -> routability
+    assert action["impact"] == {"dimension": "routability", "label": "routability"}
+
+
+def test_unknown_gap_has_no_impact_never_guessed():
+    report = _brand_report()
+    report["merchant_narrative"]["prioritized_actions"][0]["primary_gap"] = "novel_gap"
+    out = build_report_summary(report)
+    assert out["top_actions"][0]["impact"] is None
