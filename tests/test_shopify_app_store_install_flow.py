@@ -321,6 +321,115 @@ async def test_shopify_oauth_callback_redirects_instead_of_rendering_json(
 
 
 @pytest.mark.asyncio
+async def test_shopify_app_store_install_redirects_instead_of_rendering_json(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The app entrypoint is loaded by a browser (Shopify appends ?shop=), so a
+    missing/malformed shop must never render a raw JSON validation error (2.1.1)
+    — it must 302 to the portal's install-error page like the OAuth callback.
+    """
+    import routes.merchant_store_connections as module
+    from fastapi.responses import RedirectResponse
+
+    monkeypatch.setattr(module.settings, "merchant_portal_base_url", "https://merchant.example.com")
+
+    cases = [
+        (None, "missing_shop"),
+        ("", "missing_shop"),
+        ("   ", "missing_shop"),
+        ("not-a-shop", "invalid_shop"),
+        ("https://evil.example.com/", "invalid_shop"),
+    ]
+
+    for shop, expected_reason in cases:
+        response = await module.shopify_app_store_install(
+            request=object(), shop=shop, host=None, embedded=None, redirect=None
+        )
+
+        assert isinstance(response, RedirectResponse), f"shop={shop!r} did not redirect"
+        assert response.status_code == 302
+        location = response.headers["location"]
+        assert location.startswith("https://merchant.example.com/app/install/error?"), location
+        assert f"reason={expected_reason}" in location, location
+        # The internal detail must not leak into the browser URL.
+        assert "myshopify" not in location and "required" not in location
+
+
+@pytest.mark.asyncio
+async def test_shopify_app_store_install_crash_redirects_to_error_page(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """An unexpected crash on the entrypoint must also 302, never render JSON."""
+    import routes.merchant_store_connections as module
+    from fastapi.responses import RedirectResponse
+
+    monkeypatch.setattr(module.settings, "merchant_portal_base_url", "https://merchant.example.com")
+
+    async def boom(domain: str) -> str:
+        raise RuntimeError("boom")
+
+    monkeypatch.setattr(module, "_ensure_shopify_marketplace_shell_merchant", boom)
+
+    response = await module.shopify_app_store_install(
+        request=object(), shop="demo-shop.myshopify.com", host=None, embedded=None, redirect=None
+    )
+
+    assert isinstance(response, RedirectResponse)
+    assert response.status_code == 302
+    assert response.headers["location"] == (
+        "https://merchant.example.com/app/install/error?reason=install_failed"
+    )
+
+
+@pytest.mark.asyncio
+async def test_shopify_app_store_install_default_redirects_to_shopify_oauth(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """With a valid shop and no ?redirect= override, the entrypoint must 302 to
+    Shopify's OAuth authorize URL (the normal App Store install path)."""
+    import routes.merchant_store_connections as module
+    from fastapi.responses import RedirectResponse
+
+    async def fake_ensure_shell_merchant(domain: str) -> str:
+        return "merch_shopify_public"
+
+    async def fake_insert_state(**kwargs):
+        return None
+
+    monkeypatch.setattr(module.settings, "shopify_client_id", "shopify_client_id")
+    monkeypatch.setattr(module.settings, "shopify_client_secret", "shopify_secret")
+    monkeypatch.setattr(module.settings, "shopify_redirect_uri", "https://api.example.com/integrations/shopify/oauth/callback")
+    monkeypatch.setattr(module.settings, "shopify_scopes", "read_products,write_webhooks")
+    monkeypatch.setattr(module.settings, "merchant_portal_base_url", "https://merchant.example.com")
+    monkeypatch.setattr(module, "_ensure_shopify_marketplace_shell_merchant", fake_ensure_shell_merchant)
+    monkeypatch.setattr(module, "_insert_shopify_oauth_state", fake_insert_state)
+
+    response = await module.shopify_app_store_install(
+        request=object(), shop="demo-shop.myshopify.com", host=None, embedded=None, redirect=None
+    )
+
+    assert isinstance(response, RedirectResponse)
+    assert response.status_code == 302
+    assert response.headers["location"].startswith(
+        "https://demo-shop.myshopify.com/admin/oauth/authorize?"
+    )
+
+
+def test_wants_shopify_oauth_redirect_is_lenient() -> None:
+    """A malformed ?redirect= value must default to redirecting, not 422."""
+    import routes.merchant_store_connections as module
+
+    assert module._wants_shopify_oauth_redirect(None) is True
+    assert module._wants_shopify_oauth_redirect(True) is True
+    assert module._wants_shopify_oauth_redirect(False) is False
+    assert module._wants_shopify_oauth_redirect("false") is False
+    assert module._wants_shopify_oauth_redirect("0") is False
+    assert module._wants_shopify_oauth_redirect("no") is False
+    assert module._wants_shopify_oauth_redirect("true") is True
+    assert module._wants_shopify_oauth_redirect("banana") is True
+
+
+@pytest.mark.asyncio
 async def test_claim_token_roundtrip_and_tamper_rejection(monkeypatch: pytest.MonkeyPatch) -> None:
     """The claim token must be unforgeable — it is the only proof of install."""
     import routes.merchant_store_connections as module
