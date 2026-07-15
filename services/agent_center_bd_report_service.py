@@ -36,7 +36,8 @@ from typing import AbstractSet, Any, Dict, Iterable, List, Mapping, Optional, Tu
 from urllib.parse import urlparse
 
 from services import agent_center_llm_client as llm_client
-from services.audit_delta import build_reaudit_delta
+from services.audit_delta import build_reaudit_delta, measurement_basis_between
+from services.outreach_outcomes import build_outreach_outcomes
 from services.prompt_basis import basis_meta_from_probe_runs
 from services.audit_facts import (
     QUERY_CLASS_BRANDED,
@@ -12412,7 +12413,7 @@ async def run_brand_report(
             )
         except Exception:  # noqa: BLE001
             logger.warning("per_sku run_facts stamp failed", exc_info=True)
-        return {
+        brand_report = {
             "audit_run_id": audit_run_id,
             "merchant_id": str(merchant_id),
             "merchant_name": merchant_name,
@@ -12449,6 +12450,18 @@ async def run_brand_report(
             "legacy_verdict": legacy_label,
             "cost_summary": cost_summary,
         }
+        # Audit→action→outcome loop (per-SKU, the production mode): what
+        # changed at the hosts the PRIOR run's win_plan / outreach moves told
+        # the merchant to target. Attached TOP-LEVEL (beside win_plan /
+        # merchant_narrative — the per-SKU report has no brand merchant_view).
+        # Mode purity mirrors the trend above: only per_sku priors are
+        # comparable. Best-effort like every sibling enrichment.
+        await _attach_outreach_outcomes_per_sku(
+            brand_report,
+            merchant_id=str(merchant_id),
+            prior_runs=_per_sku_prior_runs(prior_runs) if prior_runs is not None else None,
+        )
+        return brand_report
 
     if len(products) > _BRAND_REPORT_MAX_PRODUCTS:
         raise ValueError(
@@ -15174,6 +15187,16 @@ async def _attach_reaudit_delta(
             prior_row=None,
             days_since=None,
         )
+        # Audit→action→outcome loop: first audit has no prior targets, so the
+        # section degrades to an honest empty baseline (mirrors reaudit_delta's
+        # is_first_audit contract).
+        merchant_view["outreach_outcomes"] = build_outreach_outcomes(
+            current_report=report,
+            prior_report=None,
+            measurement_basis=merchant_view["reaudit_delta"].get(
+                "measurement_basis"
+            ),
+        )
         return report
     prior_row = succeeded[0]
     prior_run_id = str(prior_row.get("run_id") or "").strip()
@@ -15195,9 +15218,123 @@ async def _attach_reaudit_delta(
             prior_row=prior_row,
             days_since=_days_between(prior_row.get("requested_at")),
         )
+        # Audit→action→outcome loop: what changed at the hosts the PRIOR
+        # report told the merchant to target. Reuses the measurement basis
+        # build_reaudit_delta just computed (query-level claims are only
+        # licensed on the same pinned prompt set — never re-derived here).
+        # The merchant's own done-marked tasks are surfaced as facts on
+        # matching targets ("you marked this done N days before this run"),
+        # never as causation.
+        merchant_view["outreach_outcomes"] = build_outreach_outcomes(
+            current_report=report,
+            prior_report=prior_report,
+            measurement_basis=merchant_view["reaudit_delta"].get(
+                "measurement_basis"
+            ),
+            completed_actions=await _completed_outreach_actions(merchant_id),
+        )
     except Exception as exc:  # noqa: BLE001 - audit must not fail on history
         logger.warning(
             "reaudit_delta attach failed merchant_id=%s prior_run_id=%s: %s",
+            merchant_id, prior_run_id, str(exc)[:200],
+        )
+    return report
+
+
+async def _completed_outreach_actions(
+    merchant_id: Optional[str],
+) -> Optional[List[Dict[str, Any]]]:
+    """The merchant's done-marked task-queue rows that name a target host —
+    passed to build_outreach_outcomes so a matching target carries the
+    "you marked this done N days before this run" FACT (never a causal
+    claim). Best-effort: a task-queue read failure must not sink the
+    outcomes section, let alone the audit; None = lookup unavailable."""
+    if not merchant_id:
+        return None
+    try:
+        from db.merchant_tasks import list_tasks_for_merchant
+
+        done_rows = await list_tasks_for_merchant(
+            merchant_id=str(merchant_id),
+            status_filter=["done"],
+            limit=50,
+        )
+        return [
+            {
+                "host": (row.get("evidence_jsonb") or {}).get("target_host"),
+                "title": row.get("title"),
+                "completed_at": row.get("completed_at"),
+            }
+            for row in done_rows
+            if isinstance(row.get("evidence_jsonb"), dict)
+            and (row.get("evidence_jsonb") or {}).get("target_host")
+        ]
+    except Exception:  # noqa: BLE001
+        logger.warning(
+            "outreach_outcomes completed-task lookup failed merchant_id=%s",
+            merchant_id, exc_info=True,
+        )
+        return None
+
+
+async def _attach_outreach_outcomes_per_sku(
+    report: Dict[str, Any],
+    *,
+    merchant_id: Optional[str],
+    prior_runs: Optional[List[Dict[str, Any]]],
+) -> Dict[str, Any]:
+    """Attach the audit→action→outcome section to a PER-SKU brand report,
+    best-effort — the per-SKU sibling of _attach_reaudit_delta's outcomes
+    attach (which only runs on the legacy per-product path).
+
+    Attached TOP-LEVEL as report["outreach_outcomes"] (beside win_plan /
+    merchant_narrative): the per-SKU brand report has no brand merchant_view,
+    and its portal sections all read from the report root.
+
+    ``prior_runs`` must already be mode-filtered by the caller
+    (_per_sku_prior_runs) — only a per_sku prior carries the win_plan /
+    authority_map shape the outcomes module compares against. ``None`` means
+    no history context was provided, so the section is omitted; an empty list
+    is a real first audit and attaches the honest baseline degrade.
+    """
+    if not isinstance(report, dict) or prior_runs is None:
+        return report
+    succeeded = [
+        row for row in prior_runs
+        if isinstance(row, dict) and row.get("status") == "succeeded"
+    ]
+    if not succeeded:
+        report["outreach_outcomes"] = build_outreach_outcomes(
+            current_report=report,
+            prior_report=None,
+            measurement_basis=measurement_basis_between(report, None),
+        )
+        return report
+    prior_row = succeeded[0]
+    prior_run_id = str(prior_row.get("run_id") or "").strip()
+    if not prior_run_id or not merchant_id:
+        return report
+    try:
+        from db.merchant_audit_runs import fetch_audit_run_by_id
+
+        prior_full = await fetch_audit_run_by_id(run_id=prior_run_id)
+        prior_report = (
+            prior_full.get("report_jsonb")
+            if isinstance(prior_full, dict) else None
+        )
+        if not isinstance(prior_report, dict):
+            return report
+        report["outreach_outcomes"] = build_outreach_outcomes(
+            current_report=report,
+            prior_report=prior_report,
+            # Same W2 basis verdict build_reaudit_delta computes — via
+            # audit_delta's single source of truth, never re-derived here.
+            measurement_basis=measurement_basis_between(report, prior_report),
+            completed_actions=await _completed_outreach_actions(merchant_id),
+        )
+    except Exception as exc:  # noqa: BLE001 - audit must not fail on history
+        logger.warning(
+            "outreach_outcomes attach failed merchant_id=%s prior_run_id=%s: %s",
             merchant_id, prior_run_id, str(exc)[:200],
         )
     return report

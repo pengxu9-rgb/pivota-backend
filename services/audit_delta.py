@@ -120,6 +120,24 @@ def build_reaudit_delta(
     }
 
 
+def measurement_basis_between(
+    current_report: Optional[Mapping[str, Any]],
+    prior_report: Optional[Mapping[str, Any]],
+) -> Dict[str, Any]:
+    """The W2 measurement-basis verdict for an arbitrary report pair, exactly
+    as build_reaudit_delta computes it — for callers (e.g. the per-SKU
+    outreach-outcomes attach) that need the basis without the score-delta
+    layer. Single source of truth: any consumer gating query-level claims on
+    "same pinned prompt set?" must go through here (or build_reaudit_delta),
+    never re-derive."""
+    return _measurement_basis(
+        current_report,
+        prior_report,
+        _primary_report(current_report),
+        _primary_report(prior_report),
+    )
+
+
 def _basis_id(basis: Mapping[str, Any]) -> Optional[str]:
     """The strongest measurement-basis identity a `prompt_basis` block carries:
     W2.1 `selected_set_id` (the FULL probed set — the true "measured the same

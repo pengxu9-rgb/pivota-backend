@@ -2240,6 +2240,230 @@ async def test_attach_reaudit_delta_fetches_full_prior_report(monkeypatch) -> No
     assert movement["direction"] == "improved"
     assert movement["is_material"] is True
 
+    # Audit→action→outcome loop rides the same attach: a legacy prior report
+    # carries no win_plan/outreach targets, so the section degrades honestly
+    # (present, not available) instead of fabricating host outcomes.
+    outcomes = current["merchant_view"]["outreach_outcomes"]
+    assert outcomes["is_first_audit"] is False
+    assert outcomes["available"] is False
+    assert outcomes["targets"] == []
+
+
+@pytest.mark.asyncio
+async def test_attach_reaudit_delta_attaches_outreach_outcomes_from_prior_targets(
+    monkeypatch,
+) -> None:
+    """A per-SKU prior report with win-plan targets + a per-SKU-shaped current
+    report produce classified outreach outcomes on the merchant view."""
+    from db import merchant_audit_runs as mar
+    from db import merchant_tasks as mt
+    from services.agent_center_bd_report_service import _attach_reaudit_delta
+
+    prior_report = {
+        "win_plan": {
+            "sku_plans": [
+                {
+                    "sku_key": "sku1",
+                    "losing_queries": [
+                        {
+                            "query": "best hair care",
+                            "axis": "category",
+                            "grounds_in": [
+                                {"host": "hwahae.com", "outreach": {"state": "draft_ready"}}
+                            ],
+                        }
+                    ],
+                }
+            ]
+        },
+        "authority_map": {
+            "hosts": [],
+            "host_attribution_summary": {"endorsement_hosts": []},
+        },
+    }
+    current = _basic_report()
+    current["per_sku_reports"] = [
+        {"sku_key": "sku1", "failing_prompts": []}
+    ]
+    current["authority_map"] = {
+        "skus": [{"sku_key": "sku1", "authority_hosts": []}],
+        "hosts": [{"host": "hwahae.com", "cites_exact_sku": True,
+                   "citation_role": "independent_endorsement",
+                   "prompts_cited_count": 2}],
+        "host_attribution_summary": {
+            "endorsement_hosts": ["hwahae.com"],
+            "endorsement_category_hosts": ["hwahae.com"],
+        },
+    }
+
+    async def fake_fetch(*, run_id: str) -> Dict[str, Any]:
+        return {"report_jsonb": prior_report}
+
+    async def fake_tasks(**kwargs) -> list:
+        assert kwargs.get("status_filter") == ["done"]
+        return [
+            {
+                "title": "Pitch hwahae.com",
+                "status": "done",
+                "completed_at": "2026-07-10T00:00:00+00:00",
+                "evidence_jsonb": {"target_host": "hwahae.com"},
+            }
+        ]
+
+    monkeypatch.setattr(mar, "fetch_audit_run_by_id", fake_fetch)
+    monkeypatch.setattr(mt, "list_tasks_for_merchant", fake_tasks)
+
+    await _attach_reaudit_delta(
+        current,
+        merchant_id="merchant_123",
+        prior_runs=[
+            {
+                "run_id": "prior-run",
+                "status": "succeeded",
+                "requested_at": "2026-07-08T00:00:00+00:00",
+            }
+        ],
+    )
+
+    outcomes = current["merchant_view"]["outreach_outcomes"]
+    assert outcomes["available"] is True
+    row = next(t for t in outcomes["targets"] if t["host"] == "hwahae.com")
+    # hwahae entered the endorsement set — reported as a win even though the
+    # basis is unknown (endorsement transitions are basis-independent facts).
+    assert row["outcome"] == "won"
+    assert row["reason"] == "host_now_endorses"
+    # The merchant's done-marked task is surfaced as fact, never causation.
+    assert row["merchant_action"]["title"] == "Pitch hwahae.com"
+    assert "caused" not in row["merchant_action"]["note"].lower()
+
+
+def _per_sku_brand_report(*, basis_id: str = "sel_w2") -> Dict[str, Any]:
+    """Minimal per-SKU brand-report shape: prompt_basis rides on the per-SKU
+    rows (W2.1), win_plan/authority_map at the root — production mode."""
+    return {
+        "audit_mode": "per_sku",
+        "timestamp": "2026-07-14T00:00:00+00:00",
+        "per_sku_reports": [
+            {
+                "sku_key": "sku1",
+                "prompt_basis": {"selected_set_id": basis_id},
+                "failing_prompts": [],
+                "opportunity": {"per_prompt": [{"query": "best hair care"}]},
+            }
+        ],
+        "authority_map": {
+            "skus": [{"sku_key": "sku1", "authority_hosts": []}],
+            "hosts": [
+                {
+                    "host": "hwahae.com",
+                    "citation_role": "independent_endorsement",
+                    "cites_exact_sku": True,
+                    "prompts_cited_count": 2,
+                }
+            ],
+            "host_attribution_summary": {
+                "endorsement_hosts": ["hwahae.com"],
+                "endorsement_category_hosts": ["hwahae.com"],
+            },
+        },
+        "win_plan": {"sku_plans": []},
+        "merchant_narrative": {"where_youre_losing": {"outreach_moves": []}},
+    }
+
+
+@pytest.mark.asyncio
+async def test_attach_outreach_outcomes_per_sku_classifies_prior_targets(
+    monkeypatch,
+) -> None:
+    """Per-SKU production mode: prior per-SKU report's win-plan targets get
+    classified on the current per-SKU brand report, attached TOP-LEVEL
+    (no brand merchant_view exists), with same-basis query claims licensed."""
+    from db import merchant_audit_runs as mar
+    from db import merchant_tasks as mt
+    from services.agent_center_bd_report_service import (
+        _attach_outreach_outcomes_per_sku,
+    )
+
+    prior_report = _per_sku_brand_report()
+    prior_report["win_plan"] = {
+        "sku_plans": [
+            {
+                "sku_key": "sku1",
+                "losing_queries": [
+                    {
+                        "query": "best hair care",
+                        "axis": "category",
+                        "grounds_in": [
+                            {"host": "hwahae.com", "outreach": {"state": "draft_ready"}}
+                        ],
+                    }
+                ],
+            }
+        ]
+    }
+    prior_report["authority_map"]["host_attribution_summary"] = {
+        "endorsement_hosts": [],
+        "endorsement_category_hosts": [],
+    }
+    current = _per_sku_brand_report()  # same basis id → same-basis comparison
+
+    async def fake_fetch(*, run_id: str) -> Dict[str, Any]:
+        assert run_id == "prior-per-sku-run"
+        return {"report_jsonb": prior_report}
+
+    async def fake_tasks(**kwargs) -> list:
+        return []
+
+    monkeypatch.setattr(mar, "fetch_audit_run_by_id", fake_fetch)
+    monkeypatch.setattr(mt, "list_tasks_for_merchant", fake_tasks)
+
+    await _attach_outreach_outcomes_per_sku(
+        current,
+        merchant_id="merchant_123",
+        prior_runs=[
+            {
+                "run_id": "prior-per-sku-run",
+                "status": "succeeded",
+                "audit_mode": "per_sku",
+                "requested_at": "2026-07-08T00:00:00+00:00",
+            }
+        ],
+    )
+
+    outcomes = current["outreach_outcomes"]
+    assert "merchant_view" not in current  # top-level attach, per-SKU contract
+    assert outcomes["available"] is True
+    assert outcomes["comparable"] is True  # basis resolved from per_sku rows
+    row = next(t for t in outcomes["targets"] if t["host"] == "hwahae.com")
+    # The losing query left the failing set AND is in the probed-prompt list,
+    # so the same-basis query-level win claim is licensed.
+    assert row["outcome"] == "won"
+    assert row["reason"] == "query_now_cited"
+
+
+@pytest.mark.asyncio
+async def test_attach_outreach_outcomes_per_sku_first_audit_and_no_context() -> None:
+    from services.agent_center_bd_report_service import (
+        _attach_outreach_outcomes_per_sku,
+    )
+
+    # prior_runs=None → no history context was provided → section omitted.
+    no_context = _per_sku_brand_report()
+    await _attach_outreach_outcomes_per_sku(
+        no_context, merchant_id="merchant_123", prior_runs=None
+    )
+    assert "outreach_outcomes" not in no_context
+
+    # prior_runs=[] → a real first audit → honest empty baseline attaches.
+    first = _per_sku_brand_report()
+    await _attach_outreach_outcomes_per_sku(
+        first, merchant_id="merchant_123", prior_runs=[]
+    )
+    outcomes = first["outreach_outcomes"]
+    assert outcomes["is_first_audit"] is True
+    assert outcomes["available"] is False
+    assert outcomes["targets"] == []
+
 
 def test_discovery_lift_layer1_pivota_status_points_to_pdp_baseline_artifact() -> None:
     """Layer 1's pivota_status cites the canonical pivota-pdp-baseline.md
