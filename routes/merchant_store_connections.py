@@ -401,6 +401,8 @@ def _install_error_reason(detail: Any) -> str:
         return "token_exchange_failed"
     if "verification failed" in lowered or "shop response" in lowered:
         return "shop_verification_failed"
+    if "myshopify.com" in lowered and "domain" in lowered:
+        return "invalid_shop"
     if "shop" in lowered and "required" in lowered:
         return "missing_shop"
     if "missing required oauth params" in lowered:
@@ -757,21 +759,64 @@ async def shopify_oauth_start(
     }
 
 
+def _wants_shopify_oauth_redirect(raw: Any) -> bool:
+    """Lenient parse of the ?redirect= debug flag — a malformed value must not
+    surface a raw validation error on this browser-loaded route."""
+    if isinstance(raw, bool):
+        return raw
+    if raw is None:
+        return True
+    return str(raw).strip().lower() not in {"0", "false", "no"}
+
+
 @router.get("/shopify/app")
 @router.get("/shopify/install")
 async def shopify_app_store_install(
     request: Request,
-    shop: str = Query(..., description="Shop domain provided by Shopify, e.g. your-shop.myshopify.com"),
+    shop: Optional[str] = Query(None, description="Shop domain provided by Shopify, e.g. your-shop.myshopify.com"),
     host: Optional[str] = Query(None),
     embedded: Optional[str] = Query(None),
-    redirect: bool = Query(True, description="If true, 302 redirect to Shopify OAuth"),
+    redirect: Optional[str] = Query(None, description="Set to 'false' to return JSON instead of a 302 to Shopify OAuth"),
 ):
     """
     Public Shopify App Store entrypoint.
     Shopify calls this without a Pivota JWT, so we bind OAuth state to an
     existing merchant for that shop when present or create a shell merchant.
+
+    Like the OAuth callback below, this URL is loaded by a BROWSER, so it must
+    NEVER render a JSON error body (Shopify 2.1.1). `shop` is validated inside
+    the impl rather than by FastAPI so a missing/malformed value 302s to the
+    portal install-error page instead of raising a raw validation envelope.
     """
-    shop_domain = _validate_myshopify_domain(shop)
+    try:
+        return await _shopify_app_store_install_impl(
+            shop=shop,
+            host=host,
+            embedded=embedded,
+            redirect=_wants_shopify_oauth_redirect(redirect),
+        )
+    except HTTPException as exc:
+        reason = _install_error_reason(exc.detail)
+        logger.warning(
+            "shopify_app_store_install failed status=%s reason=%s detail=%s shop=%s",
+            exc.status_code, reason, exc.detail, shop,
+        )
+        return RedirectResponse(url=_marketplace_install_error_url(reason), status_code=302)
+    except Exception:
+        logger.exception("shopify_app_store_install crashed shop=%s", shop)
+        return RedirectResponse(
+            url=_marketplace_install_error_url("install_failed"), status_code=302
+        )
+
+
+async def _shopify_app_store_install_impl(
+    *,
+    shop: Optional[str],
+    host: Optional[str],
+    embedded: Optional[str],
+    redirect: bool,
+):
+    shop_domain = _validate_myshopify_domain(shop or "")
     merchant_id = await _ensure_shopify_marketplace_shell_merchant(shop_domain)
 
     state = secrets.token_urlsafe(32)
