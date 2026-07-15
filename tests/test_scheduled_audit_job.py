@@ -201,6 +201,14 @@ async def test_list_due_merchants_filters_disabled_and_recent(monkeypatch):
 
 @pytest.mark.asyncio
 async def test_re_audit_merchant_updates_apm_last_run_at_on_success(monkeypatch):
+    # Wave-3 B1 added a credit preflight before the run — stub it green so
+    # this test keeps exercising the apm_last_run_at update it exists for.
+    import jobs.scheduled_audit_job as _job
+
+    async def _ok_preflight(_mid, _products):
+        return {"ok": True, "credits": 0, "usd_cogs": 0, "available": 99, "paid_tier": True}
+
+    monkeypatch.setattr(_job, "_scheduled_credit_preflight", _ok_preflight)
     import db.apm_config as apm_config_module
     import db.database as database_module
     import db.merchant_audit_runs as audit_runs_module
@@ -518,18 +526,26 @@ def test_apm_digest_email_builds_from_reaudit_delta(monkeypatch):
     import db.database as dbmod
     monkeypatch.setattr(dbmod, "database", FakeDB())
 
+    # The REAL legacy shape the scheduled path emits: the delta lives at
+    # per_product[i].merchant_view.reaudit_delta (review round 2 — a
+    # top-level merchant_view fixture masked a dead feature).
     report = {
-        "merchant_view": {
-            "reaudit_delta": {
-                "headline": "Visibility improved materially since your last audit.",
-                "movements": [
-                    {"label": "AI visibility", "from": 20, "to": 33,
-                     "is_material": True, "direction": "improved"},
-                    {"label": "Attribution", "from": 46, "to": 47,
-                     "is_material": False, "direction": "stable"},
-                ],
+        "per_product": [
+            {
+                "product": {"title": "Hydra Serum"},
+                "merchant_view": {
+                    "reaudit_delta": {
+                        "headline": "Visibility improved materially since your last audit.",
+                        "movements": [
+                            {"label": "AI visibility", "from": 20, "to": 33,
+                             "is_material": True, "direction": "improved"},
+                            {"label": "Attribution", "from": 46, "to": 47,
+                             "is_material": False, "direction": "stable"},
+                        ],
+                    }
+                },
             }
-        }
+        ]
     }
     asyncio.run(job._send_apm_digest_email(merchant_id="m-1", report=report))
     assert sent["to_email"] == "owner@brand.com"
@@ -538,6 +554,74 @@ def test_apm_digest_email_builds_from_reaudit_delta(monkeypatch):
     assert "AI visibility: 20 -> 33 (up)" in body
     assert "Attribution" not in body  # immaterial movements stay out
     assert "Turn them off any time" in body
+
+
+def test_apm_digest_multi_product_prefixes_titles(monkeypatch):
+    import asyncio
+    import jobs.scheduled_audit_job as job
+
+    sent = {}
+    monkeypatch.setattr(job, "_APM_DIGEST_EMAIL_ENABLED", True)
+    monkeypatch.setattr(job, "_deliver_email", _capture_async(sent))
+
+    class FakeDB:
+        async def fetch_one(self, *_a, **_k):
+            return {"contact_email": "owner@brand.com"}
+
+    import db.database as dbmod
+    monkeypatch.setattr(dbmod, "database", FakeDB())
+
+    def _delta(label, frm, to):
+        return {"merchant_view": {"reaudit_delta": {"headline": "x", "movements": [
+            {"label": label, "from": frm, "to": to, "is_material": True,
+             "direction": "improved"}]}}}
+
+    report = {"per_product": [
+        {"product": {"title": "Serum A"}, **_delta("AI visibility", 10, 30)},
+        {"product": {"title": "Serum B"}, **_delta("AI visibility", 20, 40)},
+    ]}
+    asyncio.run(job._send_apm_digest_email(merchant_id="m-1", report=report))
+    body = sent["text_body"]
+    assert "Serum A · AI visibility: 10 -> 30 (up)" in body
+    assert "Serum B · AI visibility: 20 -> 40 (up)" in body
+
+
+def _capture_async(store):
+    async def _fake(**kw):
+        store.update(kw)
+    return _fake
+
+
+def test_scheduled_credit_preflight_skips_free_tier_short_balance(monkeypatch):
+    import asyncio
+    import jobs.scheduled_audit_job as job
+
+    import services.credit_consumption_service as ccs
+    import services.merchant_credit_balance_service as mcb
+    monkeypatch.setattr(ccs, "estimate_probe_credits", lambda probes: (9, 0.05))
+
+    async def fake_balance(_mid):
+        return {"credits": 3, "plan_tier": "free"}
+
+    monkeypatch.setattr(mcb, "get_balance", fake_balance)
+    out = asyncio.run(job._scheduled_credit_preflight("m-1", [{}, {}]))
+    assert out["ok"] is False and out["credits"] == 9 and out["available"] == 3
+
+
+def test_scheduled_credit_preflight_paid_tier_proceeds(monkeypatch):
+    import asyncio
+    import jobs.scheduled_audit_job as job
+
+    import services.credit_consumption_service as ccs
+    import services.merchant_credit_balance_service as mcb
+    monkeypatch.setattr(ccs, "estimate_probe_credits", lambda probes: (9, 0.05))
+
+    async def fake_balance(_mid):
+        return {"credits": 0, "plan_tier": "growth"}
+
+    monkeypatch.setattr(mcb, "get_balance", fake_balance)
+    out = asyncio.run(job._scheduled_credit_preflight("m-1", [{}]))
+    assert out["ok"] is True and out["paid_tier"] is True
 
 
 def test_apm_digest_email_disabled_by_default(monkeypatch):
