@@ -522,6 +522,16 @@ def _sku_summary(
 
 _SOV_COMPETITOR_CAP = 5
 
+# Brand-named prompt classes are excluded from share-of-voice ENTIRELY
+# (user verification feedback: 'the winning prompts are the ones that name
+# Mojawa'). A brand trivially wins its own navigational/review prompts, so
+# counting them inflates brand share while competitors are only ever named
+# on discovery prompts — apples-to-oranges. SoV = discovery prompts only,
+# same denominator both sides.
+_SOV_BRANDED_AXES = frozenset(
+    {"intent", "review", "navigational", "trust", "branded_navigational", "nav"}
+)
+
 
 def _share_of_voice(
     report: Mapping[str, Any],
@@ -546,6 +556,8 @@ def _share_of_voice(
             row = _as_dict(row)
             query = str(row.get("query") or "").strip()
             if not query:
+                continue
+            if str(row.get("axis") or "").strip().lower() in _SOV_BRANDED_AXES:
                 continue
             entry = prompts.setdefault(
                 query.casefold(), {"cited": False, "named": set()}
@@ -580,6 +592,7 @@ def _share_of_voice(
     )[:_SOV_COMPETITOR_CAP]
     return {
         "available": True,
+        "basis": "discovery_prompts",
         "prompts_probed": total,
         "brand": {
             "name": report.get("merchant_name"),
