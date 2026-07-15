@@ -92,6 +92,7 @@ from services.merchant_credit_balance_service import (
     InsufficientCreditsError,
     get_balance,
 )
+from services.report_summary_builder import build_report_summary
 from services.llm_providers.deepseek_probe import (
     DeepseekProbeError,
     answer_grounded_question,
@@ -1390,6 +1391,15 @@ def _shape_url_audit_response(row: Dict[str, Any]) -> Dict[str, Any]:
         for key, value in base.items():
             out.setdefault(key, value)
 
+    # Report Summary Contract v1 (dark, additive) — the condensed layer the
+    # 3-page portal view / PPT export / homepage hero will consume. No
+    # renderer reads it yet; a build failure must never sink the response.
+    try:
+        out["report_summary"] = build_report_summary(report)
+    except Exception:  # noqa: BLE001
+        logger.warning("report_summary build failed", exc_info=True)
+        out["report_summary"] = None
+
     # Honest coverage: overwrite the static planned budget in the persisted
     # methodology with what the providers ACTUALLY ran (read from the per-SKU
     # results). Keeps the header's "N buyer-intent queries (X grounded search)"
@@ -1896,6 +1906,7 @@ async def _merchant_audit_context(merchant_id: str) -> Dict[str, Any]:
 async def get_merchant_url_audit(
     run_id: str,
     merchant_id: str = Depends(get_current_merchant),
+    summary_only: bool = False,
 ) -> Dict[str, Any]:
     """Poll a free URL-audit wedge run kicked off by POST /url-readiness.
 
@@ -1903,6 +1914,10 @@ async def get_merchant_url_audit(
     full result (`status: 'succeeded'` + brand_report + methodology + …) or
     `{status: 'failed', error}`. Scoped to the calling merchant + the wedge
     subject_type so it can't read another merchant's or a synced run.
+
+    `summary_only=true` returns just {status, run_id, audit_run_id,
+    report_summary} — for surfaces (the portal homepage hero) that only need
+    the condensed contract and must not pull the multi-hundred-KB full report.
     """
     row = await fetch_audit_run_by_id(run_id=run_id)
     if (
@@ -1920,6 +1935,13 @@ async def get_merchant_url_audit(
         # + authority_map). Reshape it into the URL-audit envelope the client
         # expects (status/run_id/per_sku_reports/methodology/…).
         shaped = _shape_url_audit_response(row)
+        if summary_only:
+            return {
+                "status": "succeeded",
+                "run_id": run_id,
+                "audit_run_id": run_id,
+                "report_summary": shaped.get("report_summary"),
+            }
         # merchant_context lets the page stop pushing the "free sample / connect
         # your store / buy credits" funnel at a subscribed, connected merchant.
         shaped["merchant_context"] = await _merchant_audit_context(merchant_id)
