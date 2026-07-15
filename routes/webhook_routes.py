@@ -3055,7 +3055,7 @@ async def register_shopify_webhooks(
                     }
                 }
                 
-                url = f"https://{shop_domain_canon}/admin/api/2024-07/webhooks.json"
+                url = f"https://{shop_domain_canon}/admin/api/2025-10/webhooks.json"
                 headers = {
                     "X-Shopify-Access-Token": access_token,
                     "Content-Type": "application/json"

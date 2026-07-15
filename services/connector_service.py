@@ -137,7 +137,7 @@ async def validate_credentials(
         if not shop_domain or not access_token:
             raise CredentialsError("Shopify credentials missing (shop_domain/access_token)")
 
-        url = f"https://{shop_domain}/admin/api/2024-07/shop.json"
+        url = f"https://{shop_domain}/admin/api/2025-10/shop.json"
         try:
             async with httpx.AsyncClient(timeout=10.0) as client:
                 resp = await client.get(url, headers={"X-Shopify-Access-Token": access_token})
@@ -229,7 +229,7 @@ async def prepare_import_job(
     # Connector-specific configuration
     if connector == "shopify":
         job_config["import_config"]["resource_types"] = ["products", "variants"]
-        job_config["import_config"]["api_version"] = "2024-01"
+        job_config["import_config"]["api_version"] = "2025-10"
     
     elif connector == "linnworks":
         job_config["import_config"]["channels"] = options.get("channels", ["all"])

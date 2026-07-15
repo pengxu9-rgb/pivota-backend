@@ -109,7 +109,7 @@ async def shopify_health(merchant_id: str):
         storefront_http_status = None
         if storefront_token:
             try:
-                sf_url = f"https://{domain}/api/2024-07/graphql.json"
+                sf_url = f"https://{domain}/api/2025-10/graphql.json"
                 sf_headers = {
                     "X-Shopify-Storefront-Access-Token": storefront_token,
                     "Content-Type": "application/json",
@@ -125,7 +125,7 @@ async def shopify_health(merchant_id: str):
         headers = {}
         if token:
             headers["X-Shopify-Access-Token"] = token
-        url = f"https://{domain}/admin/api/2023-10/shop.json"
+        url = f"https://{domain}/admin/api/2025-10/shop.json"
 
         http_status = None
         try:

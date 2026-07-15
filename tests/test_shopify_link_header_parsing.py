@@ -3,7 +3,7 @@ from adapters.product_adapters import extract_shopify_next_page_token
 
 def test_extract_shopify_next_page_token_from_valid_link_header() -> None:
     link = (
-        '<https://test-shop.myshopify.com/admin/api/2024-07/products.json'
+        '<https://test-shop.myshopify.com/admin/api/2025-10/products.json'
         '?limit=250&page_info=abc123>; rel="next"'
     )
     token, has_next, parse_error = extract_shopify_next_page_token(link)
@@ -13,7 +13,7 @@ def test_extract_shopify_next_page_token_from_valid_link_header() -> None:
 
 
 def test_extract_shopify_next_page_token_reports_missing_page_info() -> None:
-    link = '<https://test-shop.myshopify.com/admin/api/2024-07/products.json?limit=250>; rel="next"'
+    link = '<https://test-shop.myshopify.com/admin/api/2025-10/products.json?limit=250>; rel="next"'
     token, has_next, parse_error = extract_shopify_next_page_token(link)
     assert token is None
     assert has_next is True

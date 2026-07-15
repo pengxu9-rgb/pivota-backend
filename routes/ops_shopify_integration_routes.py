@@ -85,7 +85,7 @@ async def ops_verify_shopify(
     report = await verify_shopify_integration(
         merchant_id=merchant_id,
         callback_base_url=request.callback_base_url,
-        api_version=request.api_version or "2024-07",
+        api_version=request.api_version or "2025-10",
     )
     return {"status": "success", "report": report, "requested_by": current_user.get("sub")}
 
@@ -160,7 +160,7 @@ async def ops_resubscribe_shopify_webhooks(
                 merchant_id=merchant_id,
                 callback_base_url=request.callback_base_url,
                 topics=topics,
-                api_version=request.api_version or "2024-07",
+                api_version=request.api_version or "2025-10",
             )
         )
     except Exception as e:
@@ -187,7 +187,7 @@ async def ops_resubscribe_all_shopify_webhooks(
     store's failure — errors are collected per-merchant. Capped by `limit`
     (default 200).
     """
-    api_version = (request.api_version or "2024-07").strip() or "2024-07"
+    api_version = (request.api_version or "2025-10").strip() or "2025-10"
 
     rows = await database.fetch_all(
         """
@@ -277,7 +277,7 @@ async def ops_sync_shopify_returns(
             merchant_id=merchant_id,
             shop_domain=shop_domain,
             access_token=access_token,
-            api_version=request.api_version or "2024-07",
+            api_version=request.api_version or "2025-10",
             limit=request.limit,
         )
     except Exception as e:

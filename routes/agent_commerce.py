@@ -82,7 +82,7 @@ class CheckoutRefundBody(BaseModel):
 
 
 class CheckoutReturnBody(BaseModel):
-    api_version: Optional[str] = Field(default="2025-01", max_length=16)
+    api_version: Optional[str] = Field(default="2025-10", max_length=16)
     limit: int = Field(20, ge=1, le=100)
 
 
@@ -477,7 +477,7 @@ async def sync_checkout_returns(
         merchant_id=merchant_id,
         shop_domain=shop_domain,
         access_token=access_token,
-        api_version=body.api_version or "2025-01",
+        api_version=body.api_version or "2025-10",
         limit=body.limit,
     )
     eligibility = None
@@ -486,7 +486,7 @@ async def sync_checkout_returns(
         eligibility = await probe_shopify_return_eligibility_best_effort(
             shop_domain=shop_domain,
             access_token=access_token,
-            api_version=body.api_version or "2025-01",
+            api_version=body.api_version or "2025-10",
             shopify_order_id=shopify_order_id,
         )
 

@@ -40,7 +40,7 @@ from services.shopify_graphql_client import ShopifyGraphQLError, shopify_admin_g
 
 logger = logging.getLogger(__name__)
 
-SHOPIFY_API_VERSION = os.getenv("SHOPIFY_API_VERSION", "2024-07")
+SHOPIFY_API_VERSION = os.getenv("SHOPIFY_API_VERSION", "2025-10")
 SHOPIFY_PRICE_RULE_PAGE_LIMIT = 250
 SHOPIFY_DISCOUNT_NODE_PAGE_LIMIT = 50
 
@@ -190,7 +190,7 @@ def _parse_shopify_next_page_info(link_header: Optional[str]) -> Optional[str]:
     """
     Parse Shopify Link header to extract `page_info` cursor for pagination.
     Example:
-      <https://shop.myshopify.com/admin/api/2024-07/price_rules.json?limit=250&page_info=XYZ>; rel=\"next\"
+      <https://shop.myshopify.com/admin/api/2025-10/price_rules.json?limit=250&page_info=XYZ>; rel=\"next\"
     """
     if not link_header:
         return None

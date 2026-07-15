@@ -10,7 +10,7 @@ from services.return_records_service import upsert_shopify_return_record_best_ef
 from utils.logger import logger
 
 
-FALLBACK_ADMIN_API_VERSIONS = ["2025-01", "2024-10", "2024-07"]
+FALLBACK_ADMIN_API_VERSIONS = ["2025-10"]
 
 _INTROSPECT_TYPE_FIELDS_QUERY = """
 query TypeFields($name: String!) {
@@ -284,7 +284,7 @@ async def probe_shopify_return_eligibility_best_effort(
     queryroot_fields: List[str] = []
     order_fields: List[str] = []
     shop_fields: List[str] = []
-    diag_version = versions_to_try[0] if versions_to_try else (api_version or "2024-07")
+    diag_version = versions_to_try[0] if versions_to_try else (api_version or "2025-10")
     try:
         queryroot_fields = await _introspect_type_fields(
             shop_domain=shop_domain,

@@ -104,7 +104,7 @@ async def _shopify_upsert_metafield(
     """POST /admin/api/.../products/{id}/metafields.json to create the
     metafield, OR PUT to update if it already exists. Returns
     (ok, metafield_id)."""
-    base = f"https://{shop_domain}/admin/api/2024-07"
+    base = f"https://{shop_domain}/admin/api/2025-10"
     headers = {"X-Shopify-Access-Token": access_token, "Content-Type": "application/json"}
     async with httpx.AsyncClient(timeout=30.0) as client:
         # See if it already exists.
@@ -146,7 +146,7 @@ async def _shopify_delete_metafield(
     metafield_id: int,
 ) -> bool:
     headers = {"X-Shopify-Access-Token": access_token}
-    url = f"https://{shop_domain}/admin/api/2024-07/metafields/{metafield_id}.json"
+    url = f"https://{shop_domain}/admin/api/2025-10/metafields/{metafield_id}.json"
     async with httpx.AsyncClient(timeout=30.0) as client:
         resp = await client.delete(url, headers=headers)
     return resp.status_code in (200, 204)

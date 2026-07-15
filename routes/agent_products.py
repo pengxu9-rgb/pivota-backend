@@ -1004,7 +1004,7 @@ async def get_product_details(
             )
 
         # Fetch product from Shopify
-        url = f"https://{shop_domain}/admin/api/2024-01/products/{product_id}.json"
+        url = f"https://{shop_domain}/admin/api/2025-10/products/{product_id}.json"
         headers = {
             "X-Shopify-Access-Token": access_token,
             "Content-Type": "application/json",
@@ -1235,7 +1235,7 @@ async def get_product_details_by_variant(
 
     product_id = str(cached_pid or "").strip() or None
     if not product_id:
-        url = f"https://{shop_domain}/admin/api/2024-01/variants/{variant_id}.json"
+        url = f"https://{shop_domain}/admin/api/2025-10/variants/{variant_id}.json"
         headers = {
             "X-Shopify-Access-Token": access_token,
             "Content-Type": "application/json",

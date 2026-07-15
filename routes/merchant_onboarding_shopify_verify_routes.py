@@ -85,7 +85,7 @@ async def merchant_onboarding_verify_shopify(
     report = await verify_shopify_integration(
         merchant_id=merchant_id,
         callback_base_url=request.callback_base_url,
-        api_version=request.api_version or "2024-07",
+        api_version=request.api_version or "2025-10",
     )
 
     redacted = {

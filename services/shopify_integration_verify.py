@@ -19,7 +19,7 @@ from services.shopify_policy_service import (
 logger = logging.getLogger(__name__)
 
 
-DEFAULT_API_VERSION = "2024-07"
+DEFAULT_API_VERSION = "2025-10"
 
 # v0.1 minimal required scopes for PCS ingestion + webhook registration.
 REQUIRED_SCOPES = [

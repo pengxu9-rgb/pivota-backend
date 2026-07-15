@@ -76,7 +76,7 @@ class ShopifyPricingService:
     but used as P0 engine for quote-first).
     """
 
-    def __init__(self, api_version: str = "2024-07", timeout_seconds: float = 20.0):
+    def __init__(self, api_version: str = "2025-10", timeout_seconds: float = 20.0):
         self.api_version = api_version
         self.timeout_seconds = timeout_seconds
 

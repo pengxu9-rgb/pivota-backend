@@ -16,7 +16,7 @@
 - Install flow: managed install (`use_legacy_install_flow=false`). Shopify grants
   the scopes declared in the app config at install time; the app authenticates
   immediately after approval.
-- Webhook API version: 2024-07 (pinned in `shopify.app.toml` to match the version
+- Webhook API version: 2025-10 (pinned in `shopify.app.toml` to match the version
   the backend registers/calls).
 
 ## Installation Instructions

@@ -1091,7 +1091,7 @@ async def list_returns(
 async def sync_returns(
     merchant_id: str = Query(..., alias="merchantId"),
     limit: int = Query(20, ge=1, le=100),
-    api_version: str = Query("2025-01", alias="apiVersion"),
+    api_version: str = Query("2025-10", alias="apiVersion"),
     _: None = Depends(require_admin_key),
 ) -> Dict[str, Any]:
     """

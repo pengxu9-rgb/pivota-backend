@@ -57,11 +57,11 @@ async def test_shopify_live_source_builds_real_merchant_dataset(monkeypatch):
     assert dataset.payment_capabilities["merchant_native_checkout_supported"] is True
     assert dataset.capability_status["checkout"] == "ready"
     assert dataset.source_of_truth["catalog"] == "shopify_cache.standard_product.v1"
-    assert dataset.source_of_truth["price"] == "shopify_admin.products.v2024-07"
-    assert dataset.source_of_truth["inventory"] == "shopify_admin.inventory.v2024-07"
+    assert dataset.source_of_truth["price"] == "shopify_admin.products.v2025-10"
+    assert dataset.source_of_truth["inventory"] == "shopify_admin.inventory.v2025-10"
     assert dataset.source_of_truth["reviews_confidence"] == "reviews_center.review_group.v1"
     assert dataset.capability_status["reviews_confidence"] == "ready"
     assert len(dataset.products) == 2
     assert dataset.merchant_blockers == []
-    assert dataset.variant_diagnostics["431000000003"]["field_sources"]["inventory"]["source"] == "shopify_admin.inventory.v2024-07"
+    assert dataset.variant_diagnostics["431000000003"]["field_sources"]["inventory"]["source"] == "shopify_admin.inventory.v2025-10"
     assert dataset.product_review_summaries["9886500749640"]["review_count"] == 27

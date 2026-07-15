@@ -8,7 +8,7 @@ import httpx
 
 logger = logging.getLogger(__name__)
 
-DEFAULT_API_VERSION = "2024-01"
+DEFAULT_API_VERSION = "2025-10"
 
 
 class ShopifyTransactionSyncError(Exception):

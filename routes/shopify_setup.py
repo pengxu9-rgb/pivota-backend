@@ -51,7 +51,7 @@ async def configure_shopify(
     # Validate env credentials before writing them to DB.
     shop_domain = shopify_store.replace("https://", "").replace("http://", "").strip().strip("/").lower()
     try:
-        url = f"https://{shop_domain}/admin/api/2024-07/shop.json"
+        url = f"https://{shop_domain}/admin/api/2025-10/shop.json"
         async with httpx.AsyncClient(timeout=10.0) as client:
             resp = await client.get(url, headers={"X-Shopify-Access-Token": shopify_token})
         if resp.status_code != 200:

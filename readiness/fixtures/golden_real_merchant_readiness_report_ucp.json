@@ -21,9 +21,9 @@
     "catalog": "shopify_cache.standard_product.v1",
     "checkout_capability": "readiness.checkout_capability.v1",
     "fulfillment_policy": "readiness.alpha_policy_config.v1",
-    "inventory": "shopify_admin.inventory.v2024-07",
+    "inventory": "shopify_admin.inventory.v2025-10",
     "order_status": "readiness.order_sync.v2",
-    "price": "shopify_admin.products.v2024-07",
+    "price": "shopify_admin.products.v2025-10",
     "reviews_confidence": "reviews_center.review_group.v1"
   }
 }

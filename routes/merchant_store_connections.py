@@ -80,7 +80,7 @@ async def _create_storefront_access_token_best_effort(*, shop_domain: str, acces
             if denied_until and denied_until > time.time():
                 return None
 
-        url = f"https://{shop_domain}/admin/api/2024-07/storefront_access_tokens.json"
+        url = f"https://{shop_domain}/admin/api/2025-10/storefront_access_tokens.json"
         headers = {"X-Shopify-Access-Token": access_token, "Content-Type": "application/json"}
         payload = {"storefront_access_token": {"title": "Pivota Pricing"}}
         async with httpx.AsyncClient(timeout=12.0) as client:
@@ -964,7 +964,7 @@ async def _shopify_oauth_callback_impl(request: Request):
     # Fetch canonical shop info (myshopify_domain + name).
     async with httpx.AsyncClient(timeout=12.0) as client:
         shop_resp = await client.get(
-            f"https://{shop_domain}/admin/api/2024-07/shop.json",
+            f"https://{shop_domain}/admin/api/2025-10/shop.json",
             headers={"X-Shopify-Access-Token": access_token},
         )
     if shop_resp.status_code != 200:
@@ -1027,7 +1027,7 @@ async def _shopify_oauth_callback_impl(request: Request):
                     merchant_id=merchant_id,
                     callback_base_url=callback_base_url,
                     topics=list(_SHOPIFY_OAUTH_REQUIRED_WEBHOOK_TOPICS),
-                    api_version="2024-07",
+                    api_version="2025-10",
                 )
             ),
         }
@@ -1285,7 +1285,7 @@ async def shopify_token_diagnostic(
             scopes = [str(s.get("handle")) for s in (data.get("access_scopes") or []) if s.get("handle")]
 
         shop_resp = await client.get(
-            f"https://{shop_domain}/admin/api/2024-07/shop.json",
+            f"https://{shop_domain}/admin/api/2025-10/shop.json",
             headers={"X-Shopify-Access-Token": access_token},
         )
         shop_status = shop_resp.status_code
@@ -1480,7 +1480,7 @@ async def merchant_connect_shopify(
             effective_access_token = exchanged_token
 
         # Test Shopify API connection
-        test_url = f"https://{request.shop_domain}/admin/api/2024-07/shop.json"
+        test_url = f"https://{request.shop_domain}/admin/api/2025-10/shop.json"
         headers = {"X-Shopify-Access-Token": effective_access_token}
         
         async with httpx.AsyncClient(timeout=10.0) as client:
@@ -1577,7 +1577,7 @@ async def merchant_connect_shopify(
 
         if storefront_token:
             try:
-                sf_url = f"https://{canonical_myshopify_domain}/api/2024-07/graphql.json"
+                sf_url = f"https://{canonical_myshopify_domain}/api/2025-10/graphql.json"
                 sf_payload = {"query": "query { shop { name } }"}
                 async with httpx.AsyncClient(timeout=8.0) as client:
                     sf_resp = await client.post(
@@ -1740,7 +1740,7 @@ async def merchant_connect_shopify(
                 merchant_id=request.merchant_id,
                 callback_base_url=callback_base_url,
                 topics=list(_SHOPIFY_OAUTH_REQUIRED_WEBHOOK_TOPICS),
-                api_version="2024-07",
+                api_version="2025-10",
             )
             webhooks_report = {"attempted": True, "callback_base_url": callback_base_url, **report}
             # `created` is a list of {"topic", "webhook_id"}; `already_exists` is a list of topic strings.
@@ -1818,7 +1818,7 @@ async def merchant_verify_shopify_integration(
         report = await verify_shopify_integration(
             merchant_id=request.merchant_id,
             callback_base_url=request.callback_base_url,
-            api_version=request.api_version or "2024-07",
+            api_version=request.api_version or "2025-10",
         )
         return {"status": "success", "report": report}
     except ValueError as e:

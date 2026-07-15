@@ -96,7 +96,7 @@ async def test_mcp_connection(
             has_connections = stores and stores["total"] > 0
             
             api_version_by_platform = {
-                "shopify": "2024-01",
+                "shopify": "2025-10",
                 "wix": "v1",
                 "woocommerce": "wc/v3",
                 "bigcommerce": "v3",

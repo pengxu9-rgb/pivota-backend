@@ -100,7 +100,7 @@ async def test_shopify_app_store_callback_redirect_includes_merchant_context(
             return FakeResponse(200, {"access_token": "admin-token"})
 
         async def get(self, url: str, headers: dict):
-            assert url == "https://demo-shop.myshopify.com/admin/api/2024-07/shop.json"
+            assert url == "https://demo-shop.myshopify.com/admin/api/2025-10/shop.json"
             assert headers["X-Shopify-Access-Token"] == "admin-token"
             return FakeResponse(
                 200,
