@@ -112,6 +112,12 @@ def clean_selected_specs(records: Any) -> List[Dict[str, Any]]:
         source = record.get("source")
         if source:
             spec["source"] = str(source).strip()
+        # Merchant-prompt scope ("sku" vs "brand") must survive pinning: a
+        # pinned per-SKU custom re-probes on later runs and the brand-level
+        # "Your prompts" panel excludes it by this key.
+        custom_scope = record.get("custom_scope")
+        if custom_scope:
+            spec["custom_scope"] = str(custom_scope).strip()
         basis = record.get("attribute_basis")
         if isinstance(basis, (list, tuple)):
             spec["attribute_basis"] = [str(b) for b in basis if b]

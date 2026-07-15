@@ -6225,6 +6225,14 @@ def _custom_prompt_runs_by_prompt(
             ).strip().lower()
             if axis != "custom":
                 continue
+            # Per-SKU merchant prompts (custom_prompts_by_url, incl. their
+            # pinned re-probes on later runs) belong to the per-SKU surfaces —
+            # keep them out of the brand-level "Your prompts" panel.
+            if (
+                isinstance(meta, dict)
+                and str(meta.get("custom_scope") or "").strip().lower() == "sku"
+            ):
+                continue
             prompt = str(run.get("query") or "").strip()
             if not prompt:
                 continue
@@ -9690,12 +9698,25 @@ def _query_metadata_from_records(
             continue
         entry: Dict[str, Any] = {
             "axis": str(record.get("axis") or "sidewalk"),
-            "attribute_basis": list(record.get("attribute_basis") or []),
-            "evidence": list(record.get("evidence") or []),
-            "intent_weight": float(record.get("intent_weight") or 0.0),
         }
+        # Sidewalk/LLM records carry a REAL generator weight + basis. Merchant
+        # records don't — emitting a hardcoded 0.0 here used to flow into
+        # sidewalk_intent_weight and force every merchant prompt's opportunity
+        # score to zero (the passthrough beats the heuristic classifier), so a
+        # merchant record contributes only its axis/stamps and the heuristic
+        # intent stays in charge downstream.
+        if record.get("axis") == "sidewalk" or prompt_source in _LLM_PROMPT_SOURCES:
+            entry.update({
+                "attribute_basis": list(record.get("attribute_basis") or []),
+                "evidence": list(record.get("evidence") or []),
+                "intent_weight": float(record.get("intent_weight") or 0.0),
+            })
         if is_stamped_prompt:
             entry["prompt_source"] = prompt_source
+        if record.get("custom_scope"):
+            # "sku" (custom_prompts_by_url) vs "brand" (the one-shot slots) —
+            # lets the brand-level "Your prompts" panel exclude per-SKU rows.
+            entry["custom_scope"] = str(record["custom_scope"])
         metadata[query] = entry
     return metadata
 
@@ -9853,21 +9874,28 @@ def _normalize_per_sku_probe_payload(
         })
         sidewalk_meta = metadata_by_query.get(query.lower())
         if sidewalk_meta:
-            meta.update({
-                "sidewalk_attribute_basis": list(
-                    sidewalk_meta.get("attribute_basis") or []
-                ),
-                "sidewalk_evidence": list(sidewalk_meta.get("evidence") or []),
-                "sidewalk_intent_weight": float(
-                    sidewalk_meta.get("intent_weight") or 0.0
-                ),
-            })
-            # Generator stamp (llm_winnable / llm_scenario): lets the lane
-            # classifier tell a SPECIFIC LLM discovery prompt from a generic
-            # head term (both are axis="category"). Distinct key from the
-            # pipeline `source` set just above.
+            # Only sidewalk/LLM entries carry a real generator weight — a
+            # merchant-prompt entry has none, and stamping a synthetic 0.0
+            # would zero its opportunity score (the passthrough in
+            # sku_opportunity beats the heuristic intent classifier).
+            if "intent_weight" in sidewalk_meta:
+                meta.update({
+                    "sidewalk_attribute_basis": list(
+                        sidewalk_meta.get("attribute_basis") or []
+                    ),
+                    "sidewalk_evidence": list(sidewalk_meta.get("evidence") or []),
+                    "sidewalk_intent_weight": float(
+                        sidewalk_meta.get("intent_weight") or 0.0
+                    ),
+                })
+            # Generator stamp (llm_winnable / llm_scenario / merchant_custom):
+            # lets the lane classifier tell a SPECIFIC LLM discovery prompt (or
+            # a deliberate merchant test) from a generic head term. Distinct
+            # key from the pipeline `source` set just above.
             if sidewalk_meta.get("prompt_source"):
                 meta["prompt_source"] = str(sidewalk_meta["prompt_source"])
+            if sidewalk_meta.get("custom_scope"):
+                meta["custom_scope"] = str(sidewalk_meta["custom_scope"])
         row["axis_metadata"] = meta
         if not isinstance(row.get("url_match"), dict):
             row["url_match"] = {
@@ -9985,9 +10013,15 @@ async def _probe_per_sku_ctx(
     for prompt in pinned_custom_prompts or []:
         text = str(prompt or "").strip()
         if text and text.lower() not in existing:
-            query_records.append(
-                {"query": text, "axis": "custom", "source": _MERCHANT_PROMPT_SOURCE}
-            )
+            query_records.append({
+                "query": text,
+                "axis": "custom",
+                "source": _MERCHANT_PROMPT_SOURCE,
+                # Scope keeps per-SKU rows OUT of the brand-level "Your
+                # prompts" panel (they live in the per-SKU surfaces).
+                # Whitelisted in clean_selected_specs so it survives pinning.
+                "custom_scope": "sku",
+            })
             existing.add(text.lower())
     # Record the set to persist as the next run's pinned basis: the auto set
     # plus this SKU's merchant prompts (they join the comparable weekly set).
@@ -9998,9 +10032,12 @@ async def _probe_per_sku_ctx(
     for prompt in custom_prompts or []:
         text = str(prompt or "").strip()
         if text and text.lower() not in existing:
-            query_records.append(
-                {"query": text, "axis": "custom", "source": _MERCHANT_PROMPT_SOURCE}
-            )
+            query_records.append({
+                "query": text,
+                "axis": "custom",
+                "source": _MERCHANT_PROMPT_SOURCE,
+                "custom_scope": "brand",
+            })
             existing.add(text.lower())
     query_specs = [
         (str(record.get("query") or ""), str(record.get("axis") or "intent"))

@@ -445,7 +445,13 @@ def _is_head_prompt_pressure(row: Mapping[str, Any]) -> bool:
     # A specific LLM discovery prompt is never head pressure, even when its
     # phrasing starts with "best ..." — specificity comes from the generator
     # contract (anchored to the product's own differentiators), not the prefix.
+    # A merchant-authored prompt (merchant_custom) is a deliberate test — it
+    # must never land in do_not_chase_yet as "broad category pressure" (same
+    # contract as win_plan_builder._NEVER_HEAD_PROMPT_SOURCES; the two
+    # classifiers must not disagree about the merchant's own prompt).
     if _row_prompt_source(row) in LLM_PROMPT_SOURCES:
+        return False
+    if _row_prompt_source(row) == "merchant_custom":
         return False
     query_class = _state(row.get("query_class"))
     axis = _state(row.get("axis"))

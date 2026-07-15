@@ -440,6 +440,38 @@ async def test_per_sku_custom_prompts_probe_on_their_own_sku(monkeypatch) -> Non
     meta = rows[0].get("axis_metadata") or {}
     assert meta.get("axis") == "custom"
     assert meta.get("prompt_source") == "merchant_custom"
+    # Scope keeps per-SKU rows out of the brand-level "Your prompts" panel.
+    assert meta.get("custom_scope") == "sku"
+    # Review round: a merchant prompt has NO generator weight — stamping a
+    # synthetic 0.0 sidewalk_intent_weight zeroed its opportunity score (the
+    # metadata passthrough beats the heuristic intent classifier downstream).
+    assert "sidewalk_intent_weight" not in meta
+    # And the brand-level panel grouping excludes per-SKU rows entirely.
+    panel_prompts = set(bd._custom_prompt_runs_by_prompt(out))
+    assert "collagen jelly for red-eye flights" not in panel_prompts
+
+
+async def test_brand_custom_prompts_stay_in_brand_panel(monkeypatch) -> None:
+    """Brand-level slots keep flowing to the 'Your prompts' panel (scope
+    'brand'), with no synthetic intent weight stamped on them either."""
+    _install(monkeypatch, fail_on=set())
+    out = await bd.run_per_sku_audit_probe_fanout(
+        merchant_id=MERCHANT,
+        audit_run_id="run_scope_test",
+        products=[{"product_key": "p1"}],
+        coverage_profile="pilot_gemini",
+        prompts_per_sku=PROMPTS,
+        custom_prompts=["my brand slot prompt"],
+    )
+    rows = [
+        r for r in bd._flatten_probe_runs(out[SKU_KEY])
+        if r.get("query") == "my brand slot prompt"
+    ]
+    assert rows, "brand custom prompt missing from persisted probe runs"
+    meta = rows[0].get("axis_metadata") or {}
+    assert meta.get("custom_scope") == "brand"
+    assert "sidewalk_intent_weight" not in meta
+    assert "my brand slot prompt" in set(bd._custom_prompt_runs_by_prompt(out))
 
 
 async def test_per_sku_customs_pinned_into_basis_brand_customs_not(monkeypatch) -> None:
@@ -488,3 +520,14 @@ async def test_per_sku_customs_pinned_into_basis_brand_customs_not(monkeypatch) 
     )
     assert pinned.get("axis") == "custom"
     assert pinned.get("source") == "merchant_custom"
+    assert pinned.get("custom_scope") == "sku"
+    # clean_selected_specs (durable storage) must preserve the scope, or the
+    # pinned re-probe would resurface in the brand-level panel next run.
+    from services.prompt_basis import clean_selected_specs
+
+    stored = clean_selected_specs(selected)
+    stored_custom = next(
+        r for r in stored if r.get("query") == "my pinned niche prompt"
+    )
+    assert stored_custom.get("custom_scope") == "sku"
+    assert stored_custom.get("source") == "merchant_custom"
