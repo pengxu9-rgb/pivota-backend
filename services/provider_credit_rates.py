@@ -7,7 +7,7 @@ provider-price drift can be handled by config review rather than code edits.
 from __future__ import annotations
 
 import json
-from decimal import Decimal, ROUND_HALF_UP
+from decimal import Decimal, ROUND_CEILING, ROUND_HALF_UP
 from functools import lru_cache
 from pathlib import Path
 from typing import Any, Dict, Mapping
@@ -176,8 +176,6 @@ def credits_for_tokens(
     credit_to_usd and ceiled to whole credits (any non-zero usage bills at
     least 1 credit). Returns (credits:int, usd_cogs:Decimal).
     """
-    import math
-
     if multiple <= 0:
         raise ValueError("multiple must be > 0")
     config = load_provider_credit_config()
@@ -189,5 +187,11 @@ def credits_for_tokens(
     )
     if usd_cogs <= 0:
         return 0, usd_cogs
-    credits = int(math.ceil(float(usd_cogs * _decimal(multiple) / credit_to_usd)))
+    # Ceil in pure Decimal: a float round-trip can nudge an exact integer
+    # boundary up a hair (2.0 -> 2.0000000000000004 -> ceil 3) and overcharge.
+    credits = int(
+        (usd_cogs * _decimal(multiple) / credit_to_usd).to_integral_value(
+            rounding=ROUND_CEILING
+        )
+    )
     return max(credits, 1), usd_cogs

@@ -151,3 +151,30 @@ def test_paid_tier_empty_wallet_402(patched):
     detail = res.json()["detail"]
     assert detail["code"] == "insufficient_credits"
     assert detail["credits_required"] == 1
+
+
+def test_renderer_unavailable_503_never_debits(patched, monkeypatch):
+    # Review P1 (round 2): the deck must render BEFORE any debit — a missing
+    # python-pptx on the serving image 503s with no money moved.
+    patched["paid"] = True
+    patched["exec"] = (["bullet"], 3000, 500)
+    monkeypatch.setattr(mar, "build_report_deck", lambda *a, **k: None)
+    res = _client().post("/api/merchant-center/audit/url-readiness/r-1/deck")
+    assert res.status_code == 503
+    assert res.json()["detail"]["code"] == "deck_renderer_unavailable"
+    assert patched["consumed"] == []
+
+
+def test_404_for_wrong_subject_type(patched):
+    patched["row"] = {**_row(), "subject_type": "merchant"}
+    res = _client().post("/api/merchant-center/audit/url-readiness/r-1/deck")
+    assert res.status_code == 404
+
+
+def test_409_when_summary_unavailable(patched):
+    row = _row()
+    row["report_jsonb"] = {}  # no scores, no narrative -> nothing renderable
+    patched["row"] = row
+    res = _client().post("/api/merchant-center/audit/url-readiness/r-1/deck")
+    assert res.status_code == 409
+    assert res.json()["detail"]["code"] == "summary_unavailable"
