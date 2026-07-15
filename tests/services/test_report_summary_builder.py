@@ -199,7 +199,10 @@ def test_top_actions_carry_supporting_prompts_via_real_join():
     assert action["supporting_prompts"][0]["evidence_run_id"] == "run-9"
 
 
-def test_action_evidence_chips_preferred_over_sku_failing_prompts():
+def test_action_evidence_merges_chips_and_failing_prompts():
+    # Chips lead (dedup precedence) but the sku failing_prompts fill the cap —
+    # chips alone are a [:5] slice of a provider-grouped list and can be
+    # single-engine (live Mojawa run: 5/5 Gemini).
     chips = [
         {
             "query": "best serum with hyaluronic acid",
@@ -217,8 +220,43 @@ def test_action_evidence_chips_preferred_over_sku_failing_prompts():
     ]
     out = build_report_summary(report)
     prompts = out["top_actions"][0]["supporting_prompts"]
-    assert [p["query"] for p in prompts] == ["best serum with hyaluronic acid"]
+    # Chip first; then provider round-robin pulls the openai row before the
+    # second gemini row.
+    assert [p["query"] for p in prompts] == [
+        "best serum with hyaluronic acid",
+        "hydra serum reviews",
+        "best hydrating serum for dry skin",
+    ]
     assert prompts[0]["competitors_named"] == ["CeraVe"]
+
+
+def test_evidence_shows_every_engine_that_measured_a_loss():
+    # Live-Mojawa regression: gemini rows precede chatgpt rows in the grouped
+    # list; the capped selection must still surface both engines.
+    failing = [
+        {"query": "bone conduction open-ear daily sports no pressure", "provider": "gemini"},
+        {"query": "gemini niche loss two attributes stacked", "provider": "gemini"},
+        {"query": "gemini niche loss three attributes stacked", "provider": "gemini"},
+        {"query": "ip68 waterproof headphones for competitive swimmers", "provider": "chatgpt"},
+    ]
+    report = _brand_report()
+    report["per_sku_reports"] = [_sku_report(failing_prompts=failing)]
+    out = build_report_summary(report)
+    providers = [p["provider"] for p in out["top_actions"][0]["supporting_prompts"]]
+    assert "chatgpt" in providers and "gemini" in providers
+
+
+def test_interleave_by_provider_round_robins():
+    from services.win_plan_builder import interleave_by_provider
+
+    rows = [
+        {"provider": "gemini", "n": 1},
+        {"provider": "gemini", "n": 2},
+        {"provider": "chatgpt", "n": 3},
+        {"provider": "chatgpt", "n": 4},
+    ]
+    assert [r["n"] for r in interleave_by_provider(rows)] == [1, 3, 2, 4]
+    assert interleave_by_provider([]) == []
 
 
 def test_no_join_means_no_prompts_never_inferred():

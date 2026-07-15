@@ -20,7 +20,7 @@ prompt-level evidence when a real join exists —
 
 from typing import Any, Dict, List, Mapping, Optional, Tuple
 
-from services.win_plan_builder import is_broad_head_query
+from services.win_plan_builder import interleave_by_provider, is_broad_head_query
 
 # 1.1: supporting-prompt selection is niche-first (broad head terms are only
 # shown when they are literally all that was measured) + rows carry
@@ -148,18 +148,35 @@ def _supporting_prompts(
     build_sku_next_best_action classified the gap from). Both are
     'evidence_used'; anything else is 'none' + empty."""
     evidence = _as_dict(next_best_action.get("evidence_used"))
+    # UNION of both sources (chips lead for dedup precedence): the chips are
+    # a [:5] slice of a provider-GROUPED list, so alone they can be single-
+    # engine (live Mojawa run: 5/5 Gemini while ChatGPT losses existed).
+    # failing_prompts is the same measured population, so merging stays
+    # 'evidence_used'; dedup on (query, provider).
+    merged: List[Dict[str, Any]] = []
+    seen = set()
     for candidate in (
         evidence.get("failing_prompt_examples"),
         sku_report.get("failing_prompts"),
     ):
-        prompts = [
-            p
-            for p in (_prompt_evidence(e) for e in _as_list(candidate))
-            if p
-        ]
-        if prompts:
-            return _niche_first(prompts)[:_SUPPORTING_PROMPTS_CAP], "evidence_used"
-    return [], "none"
+        for entry in _as_list(candidate):
+            prompt = _prompt_evidence(entry)
+            if not prompt:
+                continue
+            key = (
+                prompt["query"].lower(),
+                str(prompt.get("provider") or "").lower(),
+            )
+            if key in seen:
+                continue
+            seen.add(key)
+            merged.append(prompt)
+    if not merged:
+        return [], "none"
+    # Niche-first, then provider round-robin so the cap shows every engine
+    # that measured a loss, not just the one that sorts first.
+    pool = interleave_by_provider(_niche_first(merged))
+    return pool[:_SUPPORTING_PROMPTS_CAP], "evidence_used"
 
 
 def _niche_first(prompts: List[Dict[str, Any]]) -> List[Dict[str, Any]]:

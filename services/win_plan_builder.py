@@ -215,6 +215,25 @@ _WHAT_SHOULD_I_BUY_RE = re.compile(
 _LLM_PROMPT_SOURCES = {"llm_winnable", "llm_scenario"}
 
 
+def interleave_by_provider(rows: list) -> list:
+    """Round-robin rows across providers (first-seen order). Failing-prompt
+    lists are grouped by provider, so any plain [:N] slice shows one engine
+    only — evidence consumers interleave first so a Gemini-heavy head of the
+    list can't crowd ChatGPT rows out of a capped selection."""
+    buckets: Dict[str, list] = {}
+    for row in rows:
+        provider = str((row or {}).get("provider") or "").strip().lower()
+        buckets.setdefault(provider, []).append(row)
+    out: list = []
+    while buckets:
+        for provider in list(buckets):
+            bucket = buckets[provider]
+            out.append(bucket.pop(0))
+            if not bucket:
+                del buckets[provider]
+    return out
+
+
 def is_broad_head_query(query: str, *, prompt_source: Any = None) -> bool:
     """Public alias: True for broad head terms ("best headphones", "what X
     should I buy") that big-budget brands own. Spec-matched LLM-generated
