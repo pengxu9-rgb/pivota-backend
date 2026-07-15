@@ -533,16 +533,23 @@ def _share_of_voice(
     presence = the answer named that competitor. A competitor named twice in
     one answer still counts once for that prompt. Not a market-share claim —
     the basis (prompts_probed) ships on the block."""
-    total = 0
-    brand_prompts = 0
-    named: Dict[str, Dict[str, Any]] = {}
+    # The unit is the DISTINCT prompt (review P1): in multi-SKU runs the same
+    # buyer-intent query is probed once per SKU — counting each (SKU, prompt)
+    # row inflated the denominator and weighted competitors by SKU fan-out,
+    # contradicting the on-block claim. A prompt counts once; the brand wins
+    # it if ANY SKU's answer cited them; a competitor is named on it if ANY
+    # SKU's answer named them.
+    prompts: Dict[str, Dict[str, Any]] = {}
     for sku in per_sku_reports:
         opportunity = _as_dict(sku.get("opportunity"))
         for row in _as_list(opportunity.get("per_prompt")):
             row = _as_dict(row)
-            if not row.get("query"):
+            query = str(row.get("query") or "").strip()
+            if not query:
                 continue
-            total += 1
+            entry = prompts.setdefault(
+                query.casefold(), {"cited": False, "named": set()}
+            )
             summary = _as_dict(row.get("source_summary"))
             try:
                 cited = int(summary.get("merchant_cited_runs") or 0) > 0 or (
@@ -550,19 +557,20 @@ def _share_of_voice(
                 )
             except (TypeError, ValueError):
                 cited = False
-            if cited:
-                brand_prompts += 1
-            seen_this_prompt = set()
+            entry["cited"] = entry["cited"] or cited
             for name in _as_list(row.get("competitors")):
                 label = str(name or "").strip()
-                key = label.casefold()
-                if not label or key in seen_this_prompt:
-                    continue
-                seen_this_prompt.add(key)
-                bucket = named.setdefault(key, {"name": label, "prompts_named": 0})
-                bucket["prompts_named"] += 1
+                if label:
+                    entry["named"].add((label.casefold(), label))
+    total = len(prompts)
     if total == 0:
         return {"available": False, "prompts_probed": 0}
+    brand_prompts = sum(1 for e in prompts.values() if e["cited"])
+    named: Dict[str, Dict[str, Any]] = {}
+    for entry in prompts.values():
+        for key, label in entry["named"]:
+            bucket = named.setdefault(key, {"name": label, "prompts_named": 0})
+            bucket["prompts_named"] += 1
 
     def _pct(count: int) -> float:
         return round(100.0 * count / total, 1)

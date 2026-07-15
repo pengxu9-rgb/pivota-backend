@@ -719,3 +719,27 @@ def test_share_of_voice_prompt_level_counts():
 def test_share_of_voice_unavailable_without_prompts():
     sov = build_report_summary(_brand_report())["share_of_voice"]
     assert sov == {"available": False, "prompts_probed": 0}
+
+
+def test_share_of_voice_dedups_prompts_across_skus():
+    # Review P1: the same query probed for two SKUs is ONE prompt — the
+    # denominator and competitor weights must not scale with SKU fan-out.
+    report = _brand_report()
+    shared = {
+        "query": "best hydrating serum for dry skin",
+        "source_summary": {"merchant_cited_runs": 0},
+        "competitors": ["CeraVe"],
+    }
+    sku_a = _sku_report(sku_key="sku-1", sku_title="Serum A")
+    sku_a["opportunity"] = {"per_prompt": [dict(shared)]}
+    sku_b = _sku_report(sku_key="sku-2", sku_title="Serum B")
+    sku_b["opportunity"] = {
+        "per_prompt": [
+            {**shared, "source_summary": {"sku_cited_runs": 1}},  # B won it
+        ]
+    }
+    report["per_sku_reports"] = [sku_a, sku_b]
+    sov = build_report_summary(report)["share_of_voice"]
+    assert sov["prompts_probed"] == 1  # one distinct prompt, not two rows
+    assert sov["brand"]["prompts_cited"] == 1  # any-SKU citation wins the prompt
+    assert sov["competitors"][0]["prompts_named"] == 1  # not doubled by fan-out
