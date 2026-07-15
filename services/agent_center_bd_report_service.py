@@ -5480,6 +5480,54 @@ _CERT_CLAIM_TERMS = (
     "gluten-free", "paraben-free", "sulfate-free", "fragrance-free", "non-gmo",
     "clinically-tested", "fair-trade", "fairtrade", "fda", "gmp",
 )
+# Measurable SPEC claims (electronics/wearables) — the beauty-centric lists
+# above missed them entirely, so an IP68 swim headphone rendered a generic
+# evidence ask with zero specifics (Mojawa verification feedback).
+_SPEC_CLAIM_TERMS = (
+    "waterproof", "water-resistant", "water resistant", "ip68", "ip67",
+    "ipx8", "ipx7", "ip rating", "battery life", "fast charge",
+    "fast-charging", "noise-cancelling", "noise cancelling", "mil-spec",
+    "drop-tested", "sweatproof",
+)
+# claim term -> WHAT PROVES IT (deterministic; the merchant asked 'what
+# point should I prove?' — every listed claim gets a concrete answer).
+_CLAIM_PROOF_HINTS = (
+    (("ip68", "ip67", "ipx8", "ipx7", "ip rating", "waterproof",
+      "water-resistant", "water resistant", "sweatproof"),
+     "the IP-rating test certificate from an accredited lab (name, report "
+     "number, date)"),
+    (("battery life", "fast charge", "fast-charging"),
+     "a manufacturer or third-party test report with the measured figures "
+     "and test conditions"),
+    (("noise-cancelling", "noise cancelling"),
+     "a lab measurement report (attenuation dB across frequencies)"),
+    (("mil-spec", "drop-tested"),
+     "the MIL-STD test report or drop-test certification"),
+    (("vegan", "cruelty-free"),
+     "the certifying body's certificate (e.g. Leaping Bunny / Vegan Society "
+     "— name + license number)"),
+    (("organic",),
+     "the USDA / ECOCERT / COSMOS certificate for the certified ingredients"),
+    (("dermatologist", "dermatologist-tested", "hypoallergenic",
+      "clinically-tested", "clinical", "clinically"),
+     "the study or test report (who ran it, N, protocol, result)"),
+    (("fda", "gmp"),
+     "the registration / facility certificate number"),
+    (("paraben-free", "sulfate-free", "fragrance-free", "gluten-free",
+      "non-gmo", "non-toxic", "nontoxic"),
+     "the full ingredient list (INCI) or a certificate of analysis"),
+)
+
+
+def _proof_hint_for(term: str) -> str:
+    low = term.lower()
+    for keys, hint in _CLAIM_PROOF_HINTS:
+        if low in keys:
+            return hint
+    return (
+        "third-party proof: a lab test, certification, study, or the "
+        "underlying spec/ingredient data"
+    )
 
 
 def _detect_claim_terms(text: str, terms: Tuple[str, ...]) -> List[str]:
@@ -5508,8 +5556,9 @@ def build_evidence_play(
     ) if v)
     efficacy = _detect_claim_terms(text, _EFFICACY_CLAIM_TERMS)
     certs = _detect_claim_terms(text, _CERT_CLAIM_TERMS)
+    specs = _detect_claim_terms(text, _SPEC_CLAIM_TERMS)
     flagged = int((verify_summary or {}).get("flagged") or 0)
-    present = bool(efficacy or certs or flagged) and not already
+    present = bool(efficacy or certs or specs or flagged) and not already
     moves: List[str] = []
     if present:
         if efficacy:
@@ -5536,10 +5585,34 @@ def build_evidence_play(
                 "certifications) for Pivota to publish as grounded claims on your "
                 "canonical PDP."
             )
+    # Per-claim proof checklist: 'what point should I prove, with what?'
+    all_claims = list(dict.fromkeys(specs + efficacy + certs))
+    evidence_checklist = [
+        {"claim": term, "prove_with": _proof_hint_for(term)}
+        for term in all_claims[:6]
+    ]
+    # The SPECIFIC answers verify flagged (query + why), so 'N answers
+    # unsupported' is actionable instead of a bare count.
+    flagged_answers = [
+        {
+            "query": q,
+            "why": (
+                "the answer misstates facts about your product"
+                if probe.get("misstates_facts")
+                else "the answer couldn't support recommending you"
+            ),
+            "note": str(probe.get("note") or "").strip()[:300],
+        }
+        for probe in ((verify_summary or {}).get("flagged_probes") or [])
+        if isinstance(probe, Mapping)
+        and (q := str(probe.get("query") or "").strip())
+    ][:3]
     return {
         "present": present,
         "already_substantiated": already,
-        "claims_to_substantiate": efficacy[:5] + certs[:5],
+        "claims_to_substantiate": specs[:5] + efficacy[:5] + certs[:5],
+        "evidence_checklist": evidence_checklist,
+        "flagged_answers": flagged_answers,
         "unsubstantiated_in_ai": flagged,
         "moves": moves,
         "pivota_value": (

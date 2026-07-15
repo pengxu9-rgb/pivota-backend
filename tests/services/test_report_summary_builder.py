@@ -708,12 +708,38 @@ def test_share_of_voice_prompt_level_counts():
     }
     sov = build_report_summary(report)["share_of_voice"]
     assert sov["available"] is True
+    assert sov["basis"] == "discovery_prompts"
     assert sov["prompts_probed"] == 3  # one shared denominator
     assert sov["brand"] == {"name": "GlowLab", "prompts_cited": 2, "pct": 66.7}
     top = sov["competitors"][0]
     # CeraVe: named on 2 prompts (dup within one answer counts once)
     assert top["name"] == "CeraVe" and top["prompts_named"] == 2 and top["pct"] == 66.7
     assert sov["competitors"][1]["prompts_named"] == 1
+
+
+def test_share_of_voice_excludes_brand_named_prompts():
+    # Mojawa verification feedback: a brand trivially wins its own
+    # navigational/review prompts — they must not inflate SoV on either side.
+    report = _brand_report()
+    report["per_sku_reports"][0]["opportunity"] = {
+        "per_prompt": [
+            {"query": "mojawa purra swim review", "axis": "review",
+             "source_summary": {"merchant_cited_runs": 2}, "competitors": []},
+            {"query": "mojawa headphones", "axis": "intent",
+             "source_summary": {"merchant_cited_runs": 2}, "competitors": []},
+            {"query": "ip68 waterproof swimming headphones", "axis": "sidewalk",
+             "source_summary": {"merchant_cited_runs": 0},
+             "competitors": ["Shokz"]},
+            {"query": "best headphones", "axis": "category",
+             "source_summary": {"merchant_cited_runs": 1},
+             "competitors": ["Shokz"]},
+        ]
+    }
+    sov = build_report_summary(report)["share_of_voice"]
+    # denominator = the 2 discovery prompts only
+    assert sov["prompts_probed"] == 2
+    assert sov["brand"]["prompts_cited"] == 1  # branded wins don't count
+    assert sov["competitors"][0]["prompts_named"] == 2
 
 
 def test_share_of_voice_unavailable_without_prompts():
@@ -743,3 +769,36 @@ def test_share_of_voice_dedups_prompts_across_skus():
     assert sov["prompts_probed"] == 1  # one distinct prompt, not two rows
     assert sov["brand"]["prompts_cited"] == 1  # any-SKU citation wins the prompt
     assert sov["competitors"][0]["prompts_named"] == 1  # not doubled by fan-out
+
+
+def test_evidence_play_spec_claims_and_checklist():
+    # Mojawa feedback: 'what point should I prove?' — spec claims (IP68 etc.)
+    # are detected and every claim carries a concrete prove_with.
+    from services.agent_center_bd_report_service import build_evidence_play
+
+    play = build_evidence_play(
+        product={
+            "title": "Purra Swim IP68 Waterproof Swimming Headphones",
+            "description": "waterproof bone conduction, 10h battery life",
+        },
+        sku_ctx={},
+        verify_summary={
+            "flagged": 1,
+            "flagged_probes": [
+                {
+                    "query": "are purra swim headphones good for lap swimming",
+                    "misstates_facts": False,
+                    "supports_recommendation": False,
+                    "note": "answer gave no substantiated reason to recommend",
+                }
+            ],
+        },
+    )
+    assert play["present"] is True
+    claims = {c["claim"]: c["prove_with"] for c in play["evidence_checklist"]}
+    assert "ip68" in claims and "IP-rating test certificate" in claims["ip68"]
+    assert "battery life" in claims and "test report" in claims["battery life"]
+    fa = play["flagged_answers"][0]
+    assert fa["query"].startswith("are purra swim")
+    assert fa["why"] == "the answer couldn't support recommending you"
+    assert "substantiated reason" in fa["note"]
