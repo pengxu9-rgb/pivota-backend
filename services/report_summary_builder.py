@@ -165,9 +165,16 @@ def _match_sku_report(
     next_best_action, so headline equality is an exact join; sku_title is the
     fallback when headlines were deduped across SKUs."""
     headline = str(action.get("headline") or "").strip()
+    action_gap = str(action.get("primary_gap") or "").strip().lower()
     for report in per_sku_reports:
         nba = _as_dict(report.get("next_best_action"))
         if headline and str(nba.get("headline") or "").strip() == headline:
+            nba_gap = str(nba.get("primary_gap") or "").strip().lower()
+            # Producer dedup keys actions on (gap, headline) — mirror it so a
+            # headline shared across two gaps can't attach the wrong SKU's
+            # evidence. Missing gap on either side degrades to headline-only.
+            if action_gap and nba_gap and action_gap != nba_gap:
+                continue
             return report
     sku_title = str(action.get("sku_title") or "").strip()
     for report in per_sku_reports:
@@ -300,15 +307,23 @@ def _sku_summary(report: Mapping[str, Any]) -> Dict[str, Any]:
     values = [
         payload.get("score")
         for payload in scores.values()
-        if isinstance(payload, dict) and payload.get("score") is not None
+        if isinstance(payload, dict)
+        and isinstance(payload.get("score"), (int, float))
     ]
     raw = min(values) if values else None
     nba = _as_dict(report.get("next_best_action"))
     prompts, basis = _supporting_prompts(nba, report)
+    sku_score = _score_payload(raw)
+    # No contract band at SKU level: the per-SKU card's band (band_display,
+    # thresholds in _band_for_score) and the contract band (_band_for) use
+    # different cutoffs, so emitting both let one product read "pass" and
+    # "Needs work" at once. band_display stays the single per-SKU authority
+    # until the calibration decision (doc §7) reconciles the two ladders.
+    sku_score.pop("band", None)
     return {
         "sku_key": report.get("sku_key"),
         "sku_title": report.get("sku_title"),
-        "score": _score_payload(raw),
+        "score": sku_score,
         # Existing merchant-safe copy ({band, label, meaning}) — reused so the
         # summary can never disagree with the full per-SKU card.
         "band_display": _as_dict(report.get("band_display")) or None,

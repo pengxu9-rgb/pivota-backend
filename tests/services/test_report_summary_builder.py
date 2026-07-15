@@ -288,11 +288,55 @@ def test_sku_summary_uses_weakest_dimension():
     # citation 40, routability 20 → overall = min = 20 (mirrors _overall_score).
     assert sku["score"]["raw"] == 20
     assert sku["score"]["display"] == 2.0
-    assert sku["score"]["band"] == "needs_work"
+    # No contract band at SKU level: band_display (the per-SKU card's own
+    # ladder) is the single authority, so the two can never contradict.
+    assert "band" not in sku["score"]
     assert sku["band_display"]["label"] == "Not yet visible"
     assert sku["action_headline"] == (
         "Get Hydra Serum indexed so AI can find it."
     )
+
+
+def test_sku_summary_ignores_non_numeric_dimension_scores():
+    # One malformed dimension must degrade THAT value, not raise TypeError in
+    # min() and nuke the whole summary to null via the route's blanket except.
+    report = _brand_report()
+    report["per_sku_reports"][0]["scores"] = {
+        "citation": {"score": 40},
+        "routability": {"score": "corrupt"},
+    }
+    out = build_report_summary(report)
+    assert out["sku_summaries"][0]["score"]["raw"] == 40
+
+
+def test_action_match_requires_gap_agreement():
+    # Two SKUs share a headline but carry different primary gaps (the producer
+    # dedup key is (gap, headline), so both survive). Each action must attach
+    # its OWN SKU's evidence, never the first headline hit's.
+    report = _brand_report()
+    first = report["per_sku_reports"][0]
+    second = _sku_report(
+        sku_key="sku-2",
+        sku_title="Other Serum",
+        headline=first["next_best_action"]["headline"],
+        failing_prompts=[
+            {"query": "other sku query", "axis": "trust", "provider": "gemini"}
+        ],
+    )
+    second["next_best_action"]["primary_gap"] = "open_lane_capture"
+    report["per_sku_reports"].append(second)
+    report["merchant_narrative"]["prioritized_actions"].append(
+        {
+            "sku_title": "Other Serum",
+            "primary_gap": "open_lane_capture",
+            "headline": first["next_best_action"]["headline"],
+        }
+    )
+    out = build_report_summary(report)
+    assert out["top_actions"][1]["target_sku_key"] == "sku-2"
+    assert [p["query"] for p in out["top_actions"][1]["supporting_prompts"]] == [
+        "other sku query"
+    ]
 
 
 def test_empty_report_degrades_without_raising():
@@ -358,3 +402,34 @@ def test_shape_url_audit_response_attaches_report_summary():
     # Dark + additive: the existing envelope keys are untouched.
     assert out["status"] == "succeeded"
     assert out["per_sku_reports"] == _brand_report()["per_sku_reports"]
+
+
+def test_get_run_summary_only_returns_slim_payload():
+    import asyncio
+
+    import routes.merchant_audit_routes as mar
+
+    row = {
+        "run_id": "r1",
+        "merchant_id": "m-1",
+        "subject_type": "merchant_url",
+        "status": "succeeded",
+        "report_jsonb": _brand_report(),
+        "partial_result_jsonb": {},
+    }
+
+    async def fake_fetch(*, run_id):
+        return row
+
+    orig = mar.fetch_audit_run_by_id
+    mar.fetch_audit_run_by_id = fake_fetch
+    try:
+        out = asyncio.run(
+            mar.get_merchant_url_audit("r1", merchant_id="m-1", summary_only=True)
+        )
+    finally:
+        mar.fetch_audit_run_by_id = orig
+    assert set(out.keys()) == {"status", "run_id", "audit_run_id", "report_summary"}
+    assert out["report_summary"]["contract_version"] == CONTRACT_VERSION
+    # The heavy keys must NOT ride along on the homepage-hero path.
+    assert "per_sku_reports" not in out and "brand_report" not in out
