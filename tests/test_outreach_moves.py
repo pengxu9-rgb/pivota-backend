@@ -244,3 +244,44 @@ def test_endorsed_major_publisher_not_penalized_as_cold_pitch(monkeypatch):
     assert endorsed["already_endorses_you"] is True
     assert endorsed["realism"] == "hard"  # host difficulty stays honest
     assert "extending won coverage" in endorsed["first_move"].lower()
+
+
+def test_single_citation_moves_labeled_weak_signal(monkeypatch):
+    """A host seen in exactly one grounded answer is a lead, not a proven
+    channel — empirically, on the first same-basis re-audit pair every
+    1-citation target vanished from the next run's sample while repeated
+    hosts recurred. The move carries signal_strength=single_sighting + an
+    honest note; multi-citation moves are 'repeated' with no note."""
+    _patch_classifier(monkeypatch, {
+        "onceblog.com": {"type": "editorial", "subtype": "review_site"},
+        "hwahae.com": {"type": "editorial", "subtype": "review_aggregator"},
+    })
+    who = {"cited_hosts": [
+        {"host": "onceblog.com", "recommendation_class": "unknown",
+         "prompts_cited_count": 1, "cited_on_category_query": True},
+        {"host": "hwahae.com", "recommendation_class": "recommends",
+         "prompts_cited_count": 11, "cited_on_category_query": True},
+    ]}
+    moves = {m["host"]: m for m in mnb._outreach_moves(who)}
+    weak = moves["onceblog.com"]
+    assert weak["signal_strength"] == "single_sighting"
+    assert weak["signal_note"] and "once" in weak["signal_note"].lower()
+    strong = moves["hwahae.com"]
+    assert strong["signal_strength"] == "repeated"
+    assert strong["signal_note"] is None
+
+
+def test_endorsing_host_never_weak_signal_even_at_one_citation(monkeypatch):
+    """Endorsement is standing, basis-independent evidence from the run
+    summary — a host that already recommends the merchant is not a 'single
+    sighting' even when this run's sample cited it once."""
+    _patch_classifier(monkeypatch, {
+        "hwahae.com": {"type": "editorial", "subtype": "review_aggregator"},
+    })
+    who = {"cited_hosts": [
+        {"host": "hwahae.com", "recommendation_class": "recommends",
+         "prompts_cited_count": 1, "cited_on_category_query": False},
+    ]}
+    moves = mnb._outreach_moves(who, endorsement_hosts=["hwahae.com"])
+    assert moves[0]["signal_strength"] == "repeated"
+    assert moves[0]["signal_note"] is None
