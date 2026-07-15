@@ -1540,7 +1540,7 @@ async def run_merchant_url_audit(
     merchant_id: str = Depends(get_current_merchant),
 ) -> Dict[str, Any]:
     """Free URL-audit wedge (Tier 1), merchant-CURATED + ASYNC. The merchant
-    gives us their brand site + up to 3 product URLs (their own hero SKUs); we
+    gives us their brand site + product URLs (5 free / 20 paid tiers); we
     FETCH each for clean, real data and audit exactly those — NO catalog sync,
     NO auto-discovery.
 
@@ -1567,6 +1567,35 @@ async def run_merchant_url_audit(
         merchant_id=merchant_id, subject_type="merchant_url",
     )
     over_free = _FREE_URL_AUDITS_PER_MERCHANT > 0 and used >= _FREE_URL_AUDITS_PER_MERCHANT
+
+    # 1b. Tiered product cap — checked BEFORE the per-URL network fetch
+    #     (review A1: gating after the fetch spent 6-20 outbound requests on a
+    #     request we were about to 422). Balance resolved once here and reused
+    #     for provider selection + metering below.
+    balance = await get_balance(merchant_id)
+    paid_tier = str(balance.get("plan_tier") or "free").lower() != "free"
+    tier_cap = _WEDGE_MAX_PRODUCTS_PAID if paid_tier else _WEDGE_MAX_PRODUCTS_FREE
+    if len(body.product_urls) > tier_cap:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail={
+                "code": "product_cap_exceeded",
+                "message": (
+                    f"Your plan audits up to {tier_cap} products per run "
+                    f"(you sent {len(body.product_urls)}). "
+                    + (
+                        "Upgrade to track up to "
+                        f"{_WEDGE_MAX_PRODUCTS_PAID} products in one "
+                        "comparable weekly set."
+                        if not paid_tier
+                        else "Split the set or contact us to raise the limit."
+                    )
+                ),
+                "cap": tier_cap,
+                "paid_cap": _WEDGE_MAX_PRODUCTS_PAID,
+                "upgrade_path": None if paid_tier else "/dashboard/billing",
+            },
+        )
 
     # 2. Fetch each merchant-provided product URL into a clean audit product.
     #    We audit exactly what the merchant chose — no discovery, no guessing.
@@ -1622,34 +1651,6 @@ async def run_merchant_url_audit(
     # divergence ("Gemini cites you, ChatGPT doesn't"); the free wedge stays
     # Gemini-only to bound the absorbed cost. Resolve the balance once here and
     # reuse it for the metering gate below.
-    balance = await get_balance(merchant_id)
-    paid_tier = str(balance.get("plan_tier") or "free").lower() != "free"
-    # Tiered product cap: free keeps the original 5 (COGS guard); paid fits
-    # the whole tracked portfolio in one set so the weekly re-audit compares
-    # the SAME set week over week (founder decision — 5 forced set rotation
-    # and made weekly deltas ambiguous). Honest 422 with the upgrade path.
-    tier_cap = _WEDGE_MAX_PRODUCTS_PAID if paid_tier else _WEDGE_MAX_PRODUCTS_FREE
-    if len(body.product_urls) > tier_cap:
-        raise HTTPException(
-            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
-            detail={
-                "code": "product_cap_exceeded",
-                "message": (
-                    f"Your plan audits up to {tier_cap} products per run "
-                    f"(you sent {len(body.product_urls)}). "
-                    + (
-                        "Upgrade to track up to "
-                        f"{_WEDGE_MAX_PRODUCTS_PAID} products in one "
-                        "comparable weekly set."
-                        if not paid_tier
-                        else "Split the set or contact us to raise the limit."
-                    )
-                ),
-                "cap": tier_cap,
-                "paid_cap": _WEDGE_MAX_PRODUCTS_PAID,
-                "upgrade_path": None if paid_tier else "/dashboard/billing",
-            },
-        )
     providers_for_launch = list(_WEDGE_PROVIDERS)
     if paid_tier:
         for prov in _WEDGE_PAID_PROVIDERS:
