@@ -1023,6 +1023,13 @@ _FREE_URL_AUDITS_PER_MERCHANT = int(
 # 1-sample verdicts; the LLM probe timeout is sized for grounded searches.
 _WEDGE_MAX_RUNS = int(_os.getenv("WEDGE_MAX_RUNS", "2"))
 _WEDGE_RUN_STALE_TTL_S = int(_os.getenv("WEDGE_RUN_STALE_TTL_S", "900"))
+# Tiered product cap (founder decision 2026-07-15: 5 was too small — a >5-SKU
+# merchant rotated product sets between runs, so the weekly re-audit compared
+# different sets and week-over-week reads were ambiguous). Free keeps the
+# original COGS guard; paid fits the whole tracked portfolio in ONE set.
+# Engine-side _BRAND_REPORT_MAX_PRODUCTS=50 stays the hard ceiling.
+_WEDGE_MAX_PRODUCTS_FREE = int(_os.getenv("WEDGE_MAX_PRODUCTS_FREE", "5"))
+_WEDGE_MAX_PRODUCTS_PAID = int(_os.getenv("WEDGE_MAX_PRODUCTS_PAID", "20"))
 
 # Per-product (per-SKU) URL audit: each pasted URL is audited as its own SKU
 # through the durable per-SKU pipeline. prompts_per_sku at 18 (vs the readiness
@@ -1071,11 +1078,12 @@ class MerchantUrlAuditRequest(BaseModel):
     product_urls: List[str] = Field(
         ...,
         min_length=1,
-        max_length=5,
+        max_length=20,
         description=(
-            "1–5 product page URLs the merchant wants audited (their hero "
-            "SKUs). We fetch each for clean title / vendor / type data and "
-            "audit each as its own per-product report."
+            "Product page URLs to audit — up to 5 on the free plan, up to "
+            "20 on paid plans (tier enforced in the handler; the schema cap "
+            "is the paid ceiling). Each URL is audited as its own "
+            "per-product report."
         ),
     )
     website: Optional[str] = Field(
@@ -1616,6 +1624,32 @@ async def run_merchant_url_audit(
     # reuse it for the metering gate below.
     balance = await get_balance(merchant_id)
     paid_tier = str(balance.get("plan_tier") or "free").lower() != "free"
+    # Tiered product cap: free keeps the original 5 (COGS guard); paid fits
+    # the whole tracked portfolio in one set so the weekly re-audit compares
+    # the SAME set week over week (founder decision — 5 forced set rotation
+    # and made weekly deltas ambiguous). Honest 422 with the upgrade path.
+    tier_cap = _WEDGE_MAX_PRODUCTS_PAID if paid_tier else _WEDGE_MAX_PRODUCTS_FREE
+    if len(body.product_urls) > tier_cap:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail={
+                "code": "product_cap_exceeded",
+                "message": (
+                    f"Your plan audits up to {tier_cap} products per run "
+                    f"(you sent {len(body.product_urls)}). "
+                    + (
+                        "Upgrade to track up to "
+                        f"{_WEDGE_MAX_PRODUCTS_PAID} products in one "
+                        "comparable weekly set."
+                        if not paid_tier
+                        else "Split the set or contact us to raise the limit."
+                    )
+                ),
+                "cap": tier_cap,
+                "paid_cap": _WEDGE_MAX_PRODUCTS_PAID,
+                "upgrade_path": None if paid_tier else "/dashboard/billing",
+            },
+        )
     providers_for_launch = list(_WEDGE_PROVIDERS)
     if paid_tier:
         for prov in _WEDGE_PAID_PROVIDERS:

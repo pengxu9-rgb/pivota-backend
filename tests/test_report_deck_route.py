@@ -303,3 +303,24 @@ def test_share_public_read_leaks_no_email_anywhere(patched, monkeypatch):
 def test_share_revoke_requires_flag(patched, monkeypatch):
     client = _share_client(monkeypatch, enabled=False)
     assert client.delete("/api/merchant-center/audit/url-readiness/r-1/share").status_code == 404
+
+
+# ── Tiered product cap (wave: weekly-comparability feedback) ─────────────────
+
+
+def test_wedge_product_cap_free_vs_paid(monkeypatch):
+    from routes.merchant_audit_routes import (
+        _WEDGE_MAX_PRODUCTS_FREE,
+        _WEDGE_MAX_PRODUCTS_PAID,
+        MerchantUrlAuditRequest,
+    )
+
+    # Schema ceiling = paid cap; free enforcement is handler-side.
+    assert _WEDGE_MAX_PRODUCTS_FREE == 5
+    assert _WEDGE_MAX_PRODUCTS_PAID == 20
+    urls = [f"https://x.com/p{i}" for i in range(20)]
+    assert len(MerchantUrlAuditRequest(product_urls=urls).product_urls) == 20
+    import pydantic
+    import pytest as _pytest
+    with _pytest.raises(pydantic.ValidationError):
+        MerchantUrlAuditRequest(product_urls=urls + ["https://x.com/p21"])
