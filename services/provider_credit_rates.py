@@ -138,3 +138,56 @@ def credits_for_probe(
     quant = Decimal("1") if places <= 0 else Decimal("1").scaleb(-places)
     rounded = credits.quantize(quant, rounding=ROUND_HALF_UP)
     return float(rounded)
+
+
+def token_cost_usd(
+    provider: str,
+    *,
+    input_tokens: int,
+    output_tokens: int,
+) -> Decimal:
+    """Actual-usage COGS for one ungrounded LLM call: measured token counts
+    priced at the provider's per-1M rates. No grounding surcharge — callers
+    metering grounded probes use provider_probe_cost_usd instead."""
+    entry = provider_rate_entry(provider)
+    return (
+        _decimal(max(int(input_tokens), 0))
+        / Decimal("1000000")
+        * _decimal(entry.get("input_cost_usd_per_1m_tokens", 0))
+    ) + (
+        _decimal(max(int(output_tokens), 0))
+        / Decimal("1000000")
+        * _decimal(entry.get("output_cost_usd_per_1m_tokens", 0))
+    )
+
+
+def credits_for_tokens(
+    provider: str,
+    *,
+    input_tokens: int,
+    output_tokens: int,
+    multiple: Decimal,
+) -> tuple:
+    """Credits + USD COGS for ACTUAL token usage at a caller-chosen markup.
+
+    Unlike credits_for_probe (estimated representative probe x the global
+    flat_multiple), this prices what the provider actually billed us for:
+    customer price = measured token COGS x `multiple`, converted to credits at
+    credit_to_usd and ceiled to whole credits (any non-zero usage bills at
+    least 1 credit). Returns (credits:int, usd_cogs:Decimal).
+    """
+    import math
+
+    if multiple <= 0:
+        raise ValueError("multiple must be > 0")
+    config = load_provider_credit_config()
+    credit_to_usd = _decimal(config.get("credit_to_usd"))
+    if credit_to_usd <= 0:
+        raise ValueError("credit_to_usd must be > 0")
+    usd_cogs = token_cost_usd(
+        provider, input_tokens=input_tokens, output_tokens=output_tokens
+    )
+    if usd_cogs <= 0:
+        return 0, usd_cogs
+    credits = int(math.ceil(float(usd_cogs * _decimal(multiple) / credit_to_usd)))
+    return max(credits, 1), usd_cogs
