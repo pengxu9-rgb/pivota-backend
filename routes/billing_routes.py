@@ -111,6 +111,19 @@ async def require_approved_merchant(
         if not merchant:
             raise HTTPException(status_code=404, detail="Merchant not found")
         merchant_status = str(merchant.get("status") or "").lower()
+        # Billing-exempt merchants (App Store / read-only) have NO off-platform
+        # billing to manage, so the approval gate is meaningless for them — and
+        # App Store shell merchants start life as `pending_verification`. Gating
+        # them here 403s the plans endpoint before it can report they're exempt,
+        # so the portal falls back to the paid/Stripe billing UI (a 1.2.1 risk).
+        # Let them through; the endpoints return the "nothing to manage" state.
+        if await _merchant_is_billing_free(merchant_id):
+            return {
+                "merchant_id": merchant_id,
+                "status": merchant_status or "billing_exempt",
+                "contact_email": merchant.get("contact_email"),
+                "billing_exempt": True,
+            }
         if merchant_status != "approved":
             raise HTTPException(
                 status_code=403,
