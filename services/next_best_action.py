@@ -1117,6 +1117,12 @@ def _sku_failing_prompt_chip(prompt: Any) -> Optional[Dict[str, Any]]:
         "provider": prompt.get("provider"),
         "grounding_sources": _as_list(prompt.get("grounding_sources"))[:3],
         "competitors_named": _as_list(prompt.get("competitors_named"))[:5],
+        # Generator stamp (llm_winnable/llm_scenario) — MUST survive into the
+        # chip: the report-summary evidence selector exempts spec-matched
+        # prompts from head-term filtering by this stamp, and the chips are
+        # its PREFERRED input (review P1: dropping it here silently killed
+        # the exemption on the primary path).
+        "prompt_source": prompt.get("prompt_source"),
     }
 
 

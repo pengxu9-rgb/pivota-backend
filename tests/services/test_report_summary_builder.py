@@ -483,3 +483,32 @@ def test_spec_matched_prompt_source_exempts_short_queries():
     prompts = out["top_actions"][0]["supporting_prompts"]
     assert [p["query"] for p in prompts] == ["best swim mp3"]
     assert prompts[0]["prompt_source"] == "llm_winnable"
+
+
+def test_spec_matched_exemption_survives_the_chips_path():
+    # Review P1 guard: the action's embedded chips are the PREFERRED evidence
+    # input — the llm_winnable exemption must hold there too, not just on the
+    # sku failing_prompts fallback.
+    chips = [
+        {"query": "best headphones", "provider": "gemini"},
+        {
+            "query": "best swim mp3",
+            "provider": "gemini",
+            "prompt_source": "llm_winnable",
+        },
+    ]
+    report = _brand_report()
+    report["per_sku_reports"] = [_sku_report(evidence_chips=chips)]
+    out = build_report_summary(report)
+    prompts = out["top_actions"][0]["supporting_prompts"]
+    assert [p["query"] for p in prompts] == ["best swim mp3"]
+    assert prompts[0]["prompt_source"] == "llm_winnable"
+
+
+def test_chip_builder_preserves_prompt_source():
+    from services.next_best_action import _sku_failing_prompt_chip
+
+    chip = _sku_failing_prompt_chip(
+        {"query": "best swim mp3", "prompt_source": "llm_winnable"}
+    )
+    assert chip["prompt_source"] == "llm_winnable"

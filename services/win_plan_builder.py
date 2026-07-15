@@ -230,6 +230,8 @@ def _is_broad_head_query(query: str, *, prompt_source: Any = None) -> bool:
     q = " ".join(str(query or "").lower().split())
     if not q:
         return False
+    # Deliberately length-independent (unlike the prefix rule below): "what
+    # <anything> should I buy" is a buy-advice head shape at any length.
     if _WHAT_SHOULD_I_BUY_RE.match(q):
         return True
     return len(q.split()) <= 3 and q.startswith(_BROAD_HEAD_PREFIXES)
