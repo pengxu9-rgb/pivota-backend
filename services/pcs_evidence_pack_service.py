@@ -212,7 +212,7 @@ async def create_order_snapshot_evidence_pack(order_id: str, *, triggered_by: st
                 merchant_id=merchant_id,
                 shop_domain=store_info.get("domain"),
                 access_token=store_info.get("api_key"),
-                api_version="2024-07",
+                api_version="2025-10",
             )
             latest_policy_rows = await get_latest_policy_hashes(merchant_id)
         except Exception as e:

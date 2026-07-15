@@ -73,7 +73,7 @@ async def test_sync_shopify_returns_best_effort_upserts_graphql_nodes_without_ti
         merchant_id="merch_test",
         shop_domain="shop.myshopify.com",
         access_token="token",
-        api_version="2024-07",
+        api_version="2025-10",
         limit=5,
     )
 

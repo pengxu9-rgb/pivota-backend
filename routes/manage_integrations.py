@@ -241,7 +241,7 @@ async def update_store(
                 if not domain or not admin_token:
                     raise HTTPException(status_code=400, detail="Shopify domain/token missing")
                 try:
-                    url = f"https://{domain}/admin/api/2024-07/shop.json"
+                    url = f"https://{domain}/admin/api/2025-10/shop.json"
                     async with httpx.AsyncClient(timeout=10.0) as client:
                         resp = await client.get(url, headers={"X-Shopify-Access-Token": admin_token})
                     if resp.status_code != 200:
@@ -271,7 +271,7 @@ async def update_store(
                 domain = store_row.get("domain")
                 token = merged.get("storefront_access_token")
                 try:
-                    url = f"https://{domain}/api/2024-07/graphql.json"
+                    url = f"https://{domain}/api/2025-10/graphql.json"
                     headers = {"X-Shopify-Storefront-Access-Token": token, "Content-Type": "application/json"}
                     payload = {"query": "query { shop { name } }"}
                     async with httpx.AsyncClient(timeout=8.0) as client:

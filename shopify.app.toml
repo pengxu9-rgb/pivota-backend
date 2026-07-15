@@ -8,9 +8,9 @@ embedded = false
 [webhooks]
 # Pinned to match the version the backend registers/calls everywhere
 # (DEFAULT_API_VERSION in services/shopify_integration_verify.py; the
-# /admin/api/2024-07/webhooks.json REST path in routes/webhook_routes.py).
+# /admin/api/2025-10/webhooks.json REST path in routes/webhook_routes.py).
 # Keep this in lockstep with the code when bumping (audit D3, resolved).
-api_version = "2024-07"
+api_version = "2025-10"
 
   [[webhooks.subscriptions]]
   uri = "https://api.pivota.cc/webhooks/shopify/gdpr"

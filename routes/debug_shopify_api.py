@@ -52,7 +52,7 @@ async def test_shopify_api(merchant_id: str):
         logger.info(f"🔍 Testing Shopify API: domain={shop_domain}, has_token={bool(access_token)}")
         
         # 2. 直接调用 Shopify API
-        url = f"https://{shop_domain}/admin/api/2024-07/products.json"
+        url = f"https://{shop_domain}/admin/api/2025-10/products.json"
         headers = {"X-Shopify-Access-Token": access_token}
         params = {"limit": 250}
         

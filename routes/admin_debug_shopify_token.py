@@ -103,7 +103,7 @@ async def debug_shopify_token(merchant_id: str, current_user: dict = Depends(req
             try:
                 async with httpx.AsyncClient(timeout=10.0) as client:
                     resp = await client.get(
-                        f"https://{store['domain']}/admin/api/2024-01/shop.json",
+                        f"https://{store['domain']}/admin/api/2025-10/shop.json",
                         headers={"X-Shopify-Access-Token": parsed_token}
                     )
                     

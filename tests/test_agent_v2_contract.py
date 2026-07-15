@@ -193,7 +193,7 @@ async def test_agent_v2_merchant_capabilities_exposes_access_scope_flags(
                 "mcp_platform": "shopify",
                 "psp_connected": True,
                 "psp_type": "stripe",
-                "shopify_api_version": "2024-07",
+                "shopify_api_version": "2025-10",
                 "scopes_json": {
                     "access_scopes": ["read_products", "read_discounts", "write_discounts", "read_customers"],
                     "missing_required_scopes": [],

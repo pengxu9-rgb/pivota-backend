@@ -113,7 +113,7 @@ def main() -> int:
     parser.add_argument("--order-id", required=True)
     parser.add_argument("--database-url", default=os.getenv("DATABASE_URL", ""))
     parser.add_argument("--database-url-file", default=os.getenv("DATABASE_URL_FILE", ""))
-    parser.add_argument("--shopify-api-version", default="2024-07")
+    parser.add_argument("--shopify-api-version", default="2025-10")
     parser.add_argument("--merchant-id", default="")
     parser.add_argument("--verbose", action="store_true")
     args = parser.parse_args()

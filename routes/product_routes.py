@@ -353,7 +353,7 @@ async def get_single_product_realtime(
         
         # Shopify 单个产品 API
         import httpx
-        url = f"https://{shop_domain}/admin/api/2024-07/products/{product_id}.json"
+        url = f"https://{shop_domain}/admin/api/2025-10/products/{product_id}.json"
         headers = {"X-Shopify-Access-Token": access_token}
         
         try:

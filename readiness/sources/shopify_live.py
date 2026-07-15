@@ -316,9 +316,9 @@ class ShopifyLiveMerchantSource:
                     "inventory_last_refreshed_at": cached_at,
                     "cache_expires_at": expires_at,
                     "field_sources": {
-                        "catalog": {"source": source, "fallback_source": "shopify_admin.products.v2024-07"},
-                        "price": {"source": "shopify_cache.variant_offer.v1", "fallback_source": "shopify_admin.products.v2024-07"},
-                        "inventory": {"source": "shopify_cache.inventory.v1", "fallback_source": "shopify_admin.inventory.v2024-07"},
+                        "catalog": {"source": source, "fallback_source": "shopify_admin.products.v2025-10"},
+                        "price": {"source": "shopify_cache.variant_offer.v1", "fallback_source": "shopify_admin.products.v2025-10"},
+                        "inventory": {"source": "shopify_cache.inventory.v1", "fallback_source": "shopify_admin.inventory.v2025-10"},
                     },
                 }
                 for variant in product.variants or []:
@@ -329,9 +329,9 @@ class ShopifyLiveMerchantSource:
                         "inventory_last_refreshed_at": cached_at,
                         "shipping_profile": policy.get("shipping_profile") or "alpha_default",
                         "field_sources": {
-                            "catalog": {"source": source, "fallback_source": "shopify_admin.products.v2024-07"},
-                            "price": {"source": "shopify_cache.variant_offer.v1", "fallback_source": "shopify_admin.products.v2024-07"},
-                            "inventory": {"source": "shopify_cache.inventory.v1", "fallback_source": "shopify_admin.inventory.v2024-07"},
+                            "catalog": {"source": source, "fallback_source": "shopify_admin.products.v2025-10"},
+                            "price": {"source": "shopify_cache.variant_offer.v1", "fallback_source": "shopify_admin.products.v2025-10"},
+                            "inventory": {"source": "shopify_cache.inventory.v1", "fallback_source": "shopify_admin.inventory.v2025-10"},
                         },
                     }
 
@@ -367,9 +367,9 @@ class ShopifyLiveMerchantSource:
                             "price_last_refreshed_at": now_iso,
                             "inventory_last_refreshed_at": now_iso,
                             "field_sources": {
-                                "catalog": {"source": "shopify_admin.products.v2024-07"},
-                                "price": {"source": "shopify_admin.products.v2024-07"},
-                                "inventory": {"source": "shopify_admin.inventory.v2024-07", "fallback_source": "shopify_cache.inventory.v1"},
+                                "catalog": {"source": "shopify_admin.products.v2025-10"},
+                                "price": {"source": "shopify_admin.products.v2025-10"},
+                                "inventory": {"source": "shopify_admin.inventory.v2025-10", "fallback_source": "shopify_cache.inventory.v1"},
                             },
                         }
                     else:
@@ -377,8 +377,8 @@ class ShopifyLiveMerchantSource:
                         diag["price_last_refreshed_at"] = now_iso
                         diag["inventory_last_refreshed_at"] = now_iso
                         field_sources = diag.setdefault("field_sources", {})
-                        field_sources["price"] = {"source": "shopify_admin.products.v2024-07", "fallback_source": "shopify_cache.variant_offer.v1"}
-                        field_sources["inventory"] = {"source": "shopify_admin.inventory.v2024-07", "fallback_source": "shopify_cache.inventory.v1"}
+                        field_sources["price"] = {"source": "shopify_admin.products.v2025-10", "fallback_source": "shopify_cache.variant_offer.v1"}
+                        field_sources["inventory"] = {"source": "shopify_admin.inventory.v2025-10", "fallback_source": "shopify_cache.inventory.v1"}
 
                     for variant in product.variants or []:
                         if variant.id not in variant_diagnostics:
@@ -389,9 +389,9 @@ class ShopifyLiveMerchantSource:
                                 "inventory_last_refreshed_at": now_iso,
                                 "shipping_profile": policy.get("shipping_profile") or "alpha_default",
                                 "field_sources": {
-                                    "catalog": {"source": "shopify_admin.products.v2024-07"},
-                                    "price": {"source": "shopify_admin.products.v2024-07"},
-                                    "inventory": {"source": "shopify_admin.inventory.v2024-07", "fallback_source": "shopify_cache.inventory.v1"},
+                                    "catalog": {"source": "shopify_admin.products.v2025-10"},
+                                    "price": {"source": "shopify_admin.products.v2025-10"},
+                                    "inventory": {"source": "shopify_admin.inventory.v2025-10", "fallback_source": "shopify_cache.inventory.v1"},
                                 },
                             }
                         else:
@@ -400,8 +400,8 @@ class ShopifyLiveMerchantSource:
                             diag["inventory_last_refreshed_at"] = now_iso
                             diag.setdefault("shipping_profile", policy.get("shipping_profile") or "alpha_default")
                             field_sources = diag.setdefault("field_sources", {})
-                            field_sources["price"] = {"source": "shopify_admin.products.v2024-07", "fallback_source": "shopify_cache.variant_offer.v1"}
-                            field_sources["inventory"] = {"source": "shopify_admin.inventory.v2024-07", "fallback_source": "shopify_cache.inventory.v1"}
+                            field_sources["price"] = {"source": "shopify_admin.products.v2025-10", "fallback_source": "shopify_cache.variant_offer.v1"}
+                            field_sources["inventory"] = {"source": "shopify_admin.inventory.v2025-10", "fallback_source": "shopify_cache.inventory.v1"}
             if live_error:
                 live_fetch_error = live_error
         if live_fetch_error:
@@ -468,9 +468,9 @@ class ShopifyLiveMerchantSource:
         }
 
         source_of_truth = {
-            "catalog": "shopify_cache.standard_product.v1" if cached_rows else "shopify_admin.products.v2024-07",
-            "price": "shopify_admin.products.v2024-07" if used_live_overlay else ("shopify_cache.variant_offer.v1" if cached_rows else "shopify_admin.products.v2024-07"),
-            "inventory": "shopify_admin.inventory.v2024-07" if used_live_overlay else ("shopify_cache.inventory.v1" if cached_rows else "shopify_admin.inventory.v2024-07"),
+            "catalog": "shopify_cache.standard_product.v1" if cached_rows else "shopify_admin.products.v2025-10",
+            "price": "shopify_admin.products.v2025-10" if used_live_overlay else ("shopify_cache.variant_offer.v1" if cached_rows else "shopify_admin.products.v2025-10"),
+            "inventory": "shopify_admin.inventory.v2025-10" if used_live_overlay else ("shopify_cache.inventory.v1" if cached_rows else "shopify_admin.inventory.v2025-10"),
             "fulfillment_policy": str(policy.get("policy_source") or "readiness.alpha_policy_config.v1"),
             "checkout_capability": "readiness.checkout_capability.v1",
             "order_status": "readiness.order_sync.v2",

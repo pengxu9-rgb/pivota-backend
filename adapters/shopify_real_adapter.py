@@ -25,7 +25,7 @@ class ShopifyRealAdapter:
         
         self.access_token = access_token
         self.session = None
-        self.base_url = f"https://{self.shop_domain}/admin/api/2023-10"
+        self.base_url = f"https://{self.shop_domain}/admin/api/2025-10"
         
         logger.info(f"Shopify adapter initialized for shop: {self.shop_domain}")
 

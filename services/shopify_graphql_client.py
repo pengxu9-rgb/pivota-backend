@@ -39,7 +39,7 @@ async def shopify_admin_graphql(
     access_token: str,
     query: str,
     variables: Optional[Dict[str, Any]] = None,
-    api_version: str = "2024-07",
+    api_version: str = "2025-10",
     timeout_s: float = 15.0,
 ) -> Dict[str, Any]:
     """

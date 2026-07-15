@@ -39,18 +39,18 @@ FIELD_FAMILY_RULES: Dict[str, FieldFamilyRule] = {
     "catalog": FieldFamilyRule(
         family="catalog",
         canonical_source="shopify_cache.standard_product.v1",
-        fallback_source="shopify_admin.products.v2024-07",
+        fallback_source="shopify_admin.products.v2025-10",
         max_age_hours=24,
     ),
     "price": FieldFamilyRule(
         family="price",
         canonical_source="shopify_cache.variant_offer.v1",
-        fallback_source="shopify_admin.products.v2024-07",
+        fallback_source="shopify_admin.products.v2025-10",
         max_age_hours=1,
     ),
     "inventory": FieldFamilyRule(
         family="inventory",
-        canonical_source="shopify_admin.inventory.v2024-07",
+        canonical_source="shopify_admin.inventory.v2025-10",
         fallback_source="shopify_cache.inventory.v1",
         max_age_hours=0.25,
     ),

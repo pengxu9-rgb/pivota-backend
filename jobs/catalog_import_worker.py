@@ -60,7 +60,7 @@ from services.amazon_sp_api_service import (
 
 logger = logging.getLogger(__name__)
 
-SHOPIFY_API_VERSION = "2024-07"
+SHOPIFY_API_VERSION = "2025-10"
 SHOPIFY_IMPORT_LIMIT = 250
 SHOPIFY_MAX_RETRY_ATTEMPTS = int(os.getenv("SHOPIFY_MAX_RETRY_ATTEMPTS", "5"))
 ORDERS_REQUIRED_COLUMNS = {
@@ -180,7 +180,7 @@ def _parse_shopify_next_page_info(link_header: Optional[str]) -> Optional[str]:
     Parse Shopify Link header to extract next page_info cursor.
 
     Example Link header:
-    <https://shop.myshopify.com/admin/api/2024-07/products.json?limit=50&page_info=XYZ>; rel="next"
+    <https://shop.myshopify.com/admin/api/2025-10/products.json?limit=50&page_info=XYZ>; rel="next"
     """
     if not link_header:
         return None

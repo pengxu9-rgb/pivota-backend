@@ -1860,7 +1860,7 @@ async def check_inventory_availability(
             return True, {"message": "Shop credentials missing, skipping inventory check"}
         
         # 获取所有产品和变体
-        url = f"https://{shop_domain}/admin/api/2024-01/products.json"
+        url = f"https://{shop_domain}/admin/api/2025-10/products.json"
         headers = {
             "X-Shopify-Access-Token": access_token,
             "Content-Type": "application/json"
@@ -2735,7 +2735,7 @@ async def _fetch_shopify_order_reconciliation_payload_best_effort(
         return None
 
     url = (
-        f"https://{shop_domain}/admin/api/2024-01/orders/{shopify_order_id}.json"
+        f"https://{shop_domain}/admin/api/2025-10/orders/{shopify_order_id}.json"
         "?status=any&fields=id,current_total_price,total_price,current_total_discounts,total_discounts,"
         "total_price_set,total_discounts_set"
     )
@@ -2787,7 +2787,7 @@ async def _create_shopify_draft_order_from_quote(
 ) -> Dict[str, Any]:
     from services.shopify_graphql_client import shopify_admin_graphql
 
-    api_version = str(os.getenv("SHOPIFY_DRAFT_ORDER_GRAPHQL_API_VERSION", "2025-07") or "").strip() or "2025-07"
+    api_version = str(os.getenv("SHOPIFY_DRAFT_ORDER_GRAPHQL_API_VERSION", "2025-10") or "").strip() or "2025-10"
     draft_order_input = _build_shopify_draft_order_input(
         order_id=order_id,
         order=order,
@@ -3013,7 +3013,7 @@ async def _cancel_orphan_shopify_order_without_refund_best_effort(
         "annotation": annotation_result,
     }
     try:
-        url = f"https://{shop_domain}/admin/api/2024-01/orders/{shopify_order_id}/cancel.json"
+        url = f"https://{shop_domain}/admin/api/2025-10/orders/{shopify_order_id}/cancel.json"
         async with httpx.AsyncClient(timeout=12.0) as client:
             response = await client.post(
                 url,
@@ -6114,7 +6114,7 @@ async def _create_shopify_order_impl(order_id: str) -> bool:
                     access_token=access_token,
                     query=query,
                     variables={"query": f"tag:{pivota_tag}"},
-                    api_version="2024-07",
+                    api_version="2025-10",
                     timeout_s=10.0,
                 )
                 orders_node = data.get("orders") if isinstance(data, dict) else None
@@ -6642,7 +6642,7 @@ async def _create_shopify_order_impl(order_id: str) -> bool:
                             shopify_order_payload=draft_result.get("order_payload"),
                         )
 
-                    url = f"https://{shop_domain}/admin/api/2024-01/orders.json"
+                    url = f"https://{shop_domain}/admin/api/2025-10/orders.json"
                     headers = {"X-Shopify-Access-Token": access_token, "Content-Type": "application/json"}
 
                     # Retry once on transient upstream failures.

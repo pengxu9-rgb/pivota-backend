@@ -143,7 +143,7 @@ async def sync_shopify_promotions_get(
 )
 async def preflight_shopify_discount_nodes_access(
     merchant_id: str = Path(..., description="Internal merchant ID"),
-    api_version: str = Query("2024-07", description="Shopify Admin API version to probe."),
+    api_version: str = Query("2025-10", description="Shopify Admin API version to probe."),
     _: None = Depends(require_shopify_promotions_admin),
 ) -> Dict[str, Any]:
     """

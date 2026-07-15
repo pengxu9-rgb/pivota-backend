@@ -75,7 +75,7 @@ async def connect_shopify_legacy(
 
     # Validate credentials by calling /shop.json
     canon_domain = shop_domain.replace("https://", "").replace("http://", "").strip().strip("/").lower()
-    url = f"https://{canon_domain}/admin/api/2024-07/shop.json"
+    url = f"https://{canon_domain}/admin/api/2025-10/shop.json"
     try:
         async with httpx.AsyncClient(timeout=10.0) as client:
             r = await client.get(url, headers={"X-Shopify-Access-Token": access_token})

@@ -653,7 +653,7 @@ async def _rotate_storefront_token_best_effort(
     This helps when Storefront scopes were enabled AFTER the original token was issued.
     """
     try:
-        url = f"https://{shop_domain}/admin/api/2024-07/storefront_access_tokens.json"
+        url = f"https://{shop_domain}/admin/api/2025-10/storefront_access_tokens.json"
         headers = {"X-Shopify-Access-Token": admin_access_token, "Content-Type": "application/json"}
         payload = {"storefront_access_token": {"title": "Pivota Pricing"}}
         async with httpx.AsyncClient(timeout=12.0) as client:

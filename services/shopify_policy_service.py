@@ -195,7 +195,7 @@ async def fetch_and_store_shop_policies(
     merchant_id: str,
     shop_domain: str,
     access_token: str,
-    api_version: str = "2024-07",
+    api_version: str = "2025-10",
 ) -> Dict[str, Dict[str, Any]]:
     """
     Fetch shop policies and upsert a snapshot into pcs_shop_policies (append-only by hash).

@@ -282,7 +282,7 @@ async def _get_shopify_credentials_for_merchant(merchant_id: str) -> Optional[di
 
 
 async def _shopify_get_order(shop_domain: str, access_token: str, shopify_order_id: str) -> Optional[dict]:
-    url = f"https://{shop_domain}/admin/api/2024-01/orders/{shopify_order_id}.json"
+    url = f"https://{shop_domain}/admin/api/2025-10/orders/{shopify_order_id}.json"
     headers = {"X-Shopify-Access-Token": access_token, "Content-Type": "application/json"}
     async with httpx.AsyncClient(timeout=10.0) as client:
         resp = await client.get(url, headers=headers)
@@ -295,7 +295,7 @@ async def _shopify_get_order(shop_domain: str, access_token: str, shopify_order_
 
 
 async def _shopify_get_transactions(shop_domain: str, access_token: str, shopify_order_id: str) -> list[dict]:
-    url = f"https://{shop_domain}/admin/api/2024-01/orders/{shopify_order_id}/transactions.json"
+    url = f"https://{shop_domain}/admin/api/2025-10/orders/{shopify_order_id}/transactions.json"
     headers = {"X-Shopify-Access-Token": access_token, "Content-Type": "application/json"}
     async with httpx.AsyncClient(timeout=10.0) as client:
         resp = await client.get(url, headers=headers)
@@ -318,7 +318,7 @@ async def _shopify_create_transaction(
     status: str = "success",
     parent_id: Optional[int] = None,
 ) -> Optional[dict]:
-    url = f"https://{shop_domain}/admin/api/2024-01/orders/{shopify_order_id}/transactions.json"
+    url = f"https://{shop_domain}/admin/api/2025-10/orders/{shopify_order_id}/transactions.json"
     headers = {"X-Shopify-Access-Token": access_token, "Content-Type": "application/json"}
     tx: dict[str, Any] = {"kind": kind, "status": status, "amount": amount, "gateway": gateway}
     if parent_id is not None:
@@ -387,7 +387,7 @@ async def _shopify_create_manual_refund_best_effort(
         parent_tx_id = await _shopify_ensure_manual_sale_transaction_best_effort(shop_domain, access_token, shopify_order_id)
         refund_amount = str(Decimal(str(amount)).quantize(Decimal("0.01")))
 
-        url = f"https://{shop_domain}/admin/api/2024-01/orders/{shopify_order_id}/refunds.json"
+        url = f"https://{shop_domain}/admin/api/2025-10/orders/{shopify_order_id}/refunds.json"
         headers = {"X-Shopify-Access-Token": access_token, "Content-Type": "application/json"}
         refund_tx: dict[str, Any] = {
             "kind": "refund",
@@ -741,7 +741,7 @@ async def _create_shopify_manual_refund_best_effort(
             if restock:
                 # Fetch Shopify line items so we can restock all quantities.
                 order_url = (
-                    f"https://{shop_domain}/admin/api/2024-01/orders/{shopify_order_id}.json"
+                    f"https://{shop_domain}/admin/api/2025-10/orders/{shopify_order_id}.json"
                     "?fields=line_items"
                 )
                 resp = await client.get(
@@ -769,7 +769,7 @@ async def _create_shopify_manual_refund_best_effort(
                             continue
 
             # Create refund record (gateway=manual so it does not hit PSP again).
-            refunds_url = f"https://{shop_domain}/admin/api/2024-01/orders/{shopify_order_id}/refunds.json"
+            refunds_url = f"https://{shop_domain}/admin/api/2025-10/orders/{shopify_order_id}/refunds.json"
             body: Dict[str, Any] = {
                 "refund": {
                     "note": f"Pivota after-sales case {case_id}: {reason}".strip()[:240],

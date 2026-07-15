@@ -1194,7 +1194,7 @@ async def sync_returns_for_checkout(
         merchant_id=merchant_id,
         shop_domain=shop_domain,
         access_token=access_token,
-        api_version=str(api_version or shopify_cfg.get("api_version") or "2024-07"),
+        api_version=str(api_version or shopify_cfg.get("api_version") or "2025-10"),
         limit=limit,
         db=database,
     )
@@ -1339,7 +1339,7 @@ async def probe_return_eligibility_for_checkout(
     platform_probe = await probe_shopify_return_eligibility_best_effort(
         shop_domain=shop_domain,
         access_token=access_token,
-        api_version=str(api_version or shopify_cfg.get("api_version") or "2024-07"),
+        api_version=str(api_version or shopify_cfg.get("api_version") or "2025-10"),
         shopify_order_id=str(order_row.get("shopify_order_id") or ""),
     )
     audit = await build_order_sync_audit(
@@ -2298,7 +2298,7 @@ async def _create_shopify_order_for_checkout(
             "tags": "pivota,readiness-alpha",
         }
     }
-    url = f"https://{shop_domain}/admin/api/2024-07/orders.json"
+    url = f"https://{shop_domain}/admin/api/2025-10/orders.json"
     async with httpx.AsyncClient(timeout=12.0) as client:
         response = await client.post(
             url,

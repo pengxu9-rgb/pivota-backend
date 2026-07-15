@@ -257,7 +257,7 @@ def main() -> int:
     ap.add_argument("--order-id", required=True, help="Pivota order id, e.g. ORD_...")
     ap.add_argument("--database-url", default=os.getenv("DATABASE_URL", ""), help="Postgres DATABASE_URL (overrides --database-url-file)")
     ap.add_argument("--database-url-file", default=os.getenv("DATABASE_URL_FILE", ""), help="File containing postgresql://... (can include extra text)")
-    ap.add_argument("--api-version", default="2024-07", help="Shopify Admin API version (default: 2024-07)")
+    ap.add_argument("--api-version", default="2025-10", help="Shopify Admin API version (default: 2025-10)")
     ap.add_argument("--client-secret", default="", help="Shopify app client secret (fallback: env SHOPIFY_CLIENT_SECRET)")
     args = ap.parse_args()
 

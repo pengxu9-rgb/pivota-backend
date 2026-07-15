@@ -240,7 +240,7 @@ async def _test_single_store_api(platform: str, domain: str, api_key: str, name:
             try:
                 async with httpx.AsyncClient(timeout=10.0) as client:
                     resp = await client.get(
-                        f"https://{domain}/admin/api/2024-01/shop.json",
+                        f"https://{domain}/admin/api/2025-10/shop.json",
                         headers={"X-Shopify-Access-Token": token}
                     )
                     
@@ -615,7 +615,7 @@ async def _test_single_store_api(platform: str, domain: str, api_key: str, name:
         try:
             async with httpx.AsyncClient(timeout=10.0) as client:
                 resp = await client.get(
-                    f"https://{domain}/admin/api/2024-01/shop.json",
+                    f"https://{domain}/admin/api/2025-10/shop.json",
                     headers={"X-Shopify-Access-Token": token}
                 )
                 if resp.status_code == 200:

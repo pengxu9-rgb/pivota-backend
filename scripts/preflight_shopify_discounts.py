@@ -60,7 +60,7 @@ def _args() -> argparse.Namespace:
         ),
         help="Internal admin key used only for the read-only discountNodes access probe.",
     )
-    parser.add_argument("--api-version", default=os.getenv("SHOPIFY_API_VERSION", "2024-07"))
+    parser.add_argument("--api-version", default=os.getenv("SHOPIFY_API_VERSION", "2025-10"))
     parser.add_argument("--output-dir", default=os.getenv("SHOPIFY_DISCOUNT_PREFLIGHT_OUTPUT_DIR"))
     parser.add_argument("--fail-on-blocked", action="store_true", help="Return non-zero when any check is blocked.")
     return parser.parse_args()

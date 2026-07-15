@@ -482,7 +482,7 @@ async def process_refund(
                 if not is_partial:
                     import httpx
 
-                    url = f"https://{shop_domain}/admin/api/2024-01/orders/{order['shopify_order_id']}/cancel.json"
+                    url = f"https://{shop_domain}/admin/api/2025-10/orders/{order['shopify_order_id']}/cancel.json"
                     headers_shopify = {
                         "X-Shopify-Access-Token": access_token,
                         "Content-Type": "application/json",

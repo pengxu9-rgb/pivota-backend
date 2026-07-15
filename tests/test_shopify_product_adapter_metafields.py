@@ -140,7 +140,7 @@ async def test_fetch_metafields_returns_per_product_lists():
         headers={"X-Shopify-Access-Token": "tok"}, products=products,
     )
     # Single GraphQL POST regardless of N products.
-    assert captured["url"] == "https://shop.example/admin/api/2024-07/graphql.json"
+    assert captured["url"] == "https://shop.example/admin/api/2025-10/graphql.json"
     assert set(captured["json"]["variables"]["ids"]) == {
         "gid://shopify/Product/100", "gid://shopify/Product/200",
     }

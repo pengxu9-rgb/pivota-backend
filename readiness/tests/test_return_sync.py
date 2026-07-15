@@ -41,7 +41,7 @@ async def test_sync_returns_for_checkout_runs_shopify_sync_and_audit(monkeypatch
         }
 
     async def fake_get_shopify_cfg(_merchant_id: str):
-        return {"shop_domain": "alpha-beauty-demo.myshopify.com", "api_version": "2024-07"}
+        return {"shop_domain": "alpha-beauty-demo.myshopify.com", "api_version": "2025-10"}
 
     async def fake_resolve_token(**_kwargs):
         return "tok_alpha", {"refreshed": False}
@@ -159,7 +159,7 @@ async def test_probe_return_eligibility_for_checkout_marks_likely_eligible(monke
         }
 
     async def fake_get_shopify_cfg(_merchant_id: str):
-        return {"shop_domain": "alpha-beauty-demo.myshopify.com", "api_version": "2024-07"}
+        return {"shop_domain": "alpha-beauty-demo.myshopify.com", "api_version": "2025-10"}
 
     async def fake_resolve_token(**_kwargs):
         return "tok_alpha", {"refreshed": False}
@@ -260,7 +260,7 @@ async def test_probe_return_eligibility_for_checkout_flags_unfulfilled_or_refund
         }
 
     async def fake_get_shopify_cfg(_merchant_id: str):
-        return {"shop_domain": "alpha-beauty-demo.myshopify.com", "api_version": "2024-07"}
+        return {"shop_domain": "alpha-beauty-demo.myshopify.com", "api_version": "2025-10"}
 
     async def fake_resolve_token(**_kwargs):
         return "tok_alpha", {"refreshed": False}
@@ -357,7 +357,7 @@ async def test_probe_return_eligibility_for_checkout_treats_shipped_as_fulfilled
         }
 
     async def fake_get_shopify_cfg(_merchant_id: str):
-        return {"shop_domain": "alpha-beauty-demo.myshopify.com", "api_version": "2024-07"}
+        return {"shop_domain": "alpha-beauty-demo.myshopify.com", "api_version": "2025-10"}
 
     async def fake_resolve_token(**_kwargs):
         return "tok_alpha", {"refreshed": False}

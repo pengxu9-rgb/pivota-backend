@@ -92,7 +92,7 @@ async def _fetch_shop_currency(
     client: httpx.AsyncClient,
     shop_domain: str,
     headers: Dict[str, str],
-    api_version: str = "2024-07",
+    api_version: str = "2025-10",
 ) -> Optional[str]:
     """
     Fetch the shop's base currency from Shopify.
@@ -227,7 +227,7 @@ class ShopifyProductAdapter:
           }
         }
         """
-        url = f"https://{shop_domain}/admin/api/2024-07/graphql.json"
+        url = f"https://{shop_domain}/admin/api/2025-10/graphql.json"
         try:
             resp = await client.post(
                 url,
@@ -288,7 +288,7 @@ class ShopifyProductAdapter:
         *,
         shop_domain: str,
         access_token: str,
-        api_version: str = "2024-07",
+        api_version: str = "2025-10",
     ) -> Optional[str]:
         """
         Fetch and cache Shopify shop currency (EUR/USD/etc.) for a shop domain.
@@ -325,7 +325,7 @@ class ShopifyProductAdapter:
         access_token: str,
         merchant_id: str,
         product_id: str,
-        api_version: str = "2024-07",
+        api_version: str = "2025-10",
     ) -> Tuple[Optional[StandardProduct], Optional[str]]:
         """
         Fetch a single product from Shopify Admin REST by numeric product id.
@@ -394,7 +394,7 @@ class ShopifyProductAdapter:
         Returns:
             (products, next_page_token, error_message)
         """
-        url = f"https://{shop_domain}/admin/api/2024-07/products.json"
+        url = f"https://{shop_domain}/admin/api/2025-10/products.json"
         # Use published_status=any only on the first page. Shopify does not
         # allow published_status together with page_info pagination.
         params = {"limit": min(limit, 250)}

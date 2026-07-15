@@ -233,7 +233,7 @@ This repo currently supports **signals + ops visibility** (not a full CS/returns
 Backend (pivota-backend):
 - `GET /agent/internal/disputes`
 - `GET /agent/internal/returns`
-- `POST /agent/internal/returns/sync?merchantId=...&limit=20&apiVersion=2024-07`
+- `POST /agent/internal/returns/sync?merchantId=...&limit=20&apiVersion=2025-10`
 
 Gateway (PIVOTA-Agent):
 - `GET /api/merchant/disputes`
