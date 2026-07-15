@@ -1023,6 +1023,13 @@ _FREE_URL_AUDITS_PER_MERCHANT = int(
 # 1-sample verdicts; the LLM probe timeout is sized for grounded searches.
 _WEDGE_MAX_RUNS = int(_os.getenv("WEDGE_MAX_RUNS", "2"))
 _WEDGE_RUN_STALE_TTL_S = int(_os.getenv("WEDGE_RUN_STALE_TTL_S", "900"))
+# Tiered product cap (founder decision 2026-07-15: 5 was too small — a >5-SKU
+# merchant rotated product sets between runs, so the weekly re-audit compared
+# different sets and week-over-week reads were ambiguous). Free keeps the
+# original COGS guard; paid fits the whole tracked portfolio in ONE set.
+# Engine-side _BRAND_REPORT_MAX_PRODUCTS=50 stays the hard ceiling.
+_WEDGE_MAX_PRODUCTS_FREE = int(_os.getenv("WEDGE_MAX_PRODUCTS_FREE", "5"))
+_WEDGE_MAX_PRODUCTS_PAID = int(_os.getenv("WEDGE_MAX_PRODUCTS_PAID", "20"))
 
 # Per-product (per-SKU) URL audit: each pasted URL is audited as its own SKU
 # through the durable per-SKU pipeline. prompts_per_sku at 18 (vs the readiness
@@ -1071,11 +1078,12 @@ class MerchantUrlAuditRequest(BaseModel):
     product_urls: List[str] = Field(
         ...,
         min_length=1,
-        max_length=5,
+        max_length=20,
         description=(
-            "1–5 product page URLs the merchant wants audited (their hero "
-            "SKUs). We fetch each for clean title / vendor / type data and "
-            "audit each as its own per-product report."
+            "Product page URLs to audit — up to 5 on the free plan, up to "
+            "20 on paid plans (tier enforced in the handler; the schema cap "
+            "is the paid ceiling). Each URL is audited as its own "
+            "per-product report."
         ),
     )
     website: Optional[str] = Field(
@@ -1532,7 +1540,7 @@ async def run_merchant_url_audit(
     merchant_id: str = Depends(get_current_merchant),
 ) -> Dict[str, Any]:
     """Free URL-audit wedge (Tier 1), merchant-CURATED + ASYNC. The merchant
-    gives us their brand site + up to 3 product URLs (their own hero SKUs); we
+    gives us their brand site + product URLs (5 free / 20 paid tiers); we
     FETCH each for clean, real data and audit exactly those — NO catalog sync,
     NO auto-discovery.
 
@@ -1559,6 +1567,35 @@ async def run_merchant_url_audit(
         merchant_id=merchant_id, subject_type="merchant_url",
     )
     over_free = _FREE_URL_AUDITS_PER_MERCHANT > 0 and used >= _FREE_URL_AUDITS_PER_MERCHANT
+
+    # 1b. Tiered product cap — checked BEFORE the per-URL network fetch
+    #     (review A1: gating after the fetch spent 6-20 outbound requests on a
+    #     request we were about to 422). Balance resolved once here and reused
+    #     for provider selection + metering below.
+    balance = await get_balance(merchant_id)
+    paid_tier = str(balance.get("plan_tier") or "free").lower() != "free"
+    tier_cap = _WEDGE_MAX_PRODUCTS_PAID if paid_tier else _WEDGE_MAX_PRODUCTS_FREE
+    if len(body.product_urls) > tier_cap:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail={
+                "code": "product_cap_exceeded",
+                "message": (
+                    f"Your plan audits up to {tier_cap} products per run "
+                    f"(you sent {len(body.product_urls)}). "
+                    + (
+                        "Upgrade to track up to "
+                        f"{_WEDGE_MAX_PRODUCTS_PAID} products in one "
+                        "comparable weekly set."
+                        if not paid_tier
+                        else "Split the set or contact us to raise the limit."
+                    )
+                ),
+                "cap": tier_cap,
+                "paid_cap": _WEDGE_MAX_PRODUCTS_PAID,
+                "upgrade_path": None if paid_tier else "/dashboard/billing",
+            },
+        )
 
     # 2. Fetch each merchant-provided product URL into a clean audit product.
     #    We audit exactly what the merchant chose — no discovery, no guessing.
@@ -1614,8 +1651,6 @@ async def run_merchant_url_audit(
     # divergence ("Gemini cites you, ChatGPT doesn't"); the free wedge stays
     # Gemini-only to bound the absorbed cost. Resolve the balance once here and
     # reuse it for the metering gate below.
-    balance = await get_balance(merchant_id)
-    paid_tier = str(balance.get("plan_tier") or "free").lower() != "free"
     providers_for_launch = list(_WEDGE_PROVIDERS)
     if paid_tier:
         for prov in _WEDGE_PAID_PROVIDERS:
