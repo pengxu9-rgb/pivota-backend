@@ -25,7 +25,12 @@ from services.win_plan_builder import interleave_by_provider, is_broad_head_quer
 # 1.1: supporting-prompt selection is niche-first (broad head terms are only
 # shown when they are literally all that was measured) + rows carry
 # prompt_source so renderers can badge spec-matched evidence.
-CONTRACT_VERSION = "1.1"
+# 1.2: calibration decision (a)+(c) — dimensions the run CANNOT measure
+# (URL wedge without a connected catalog: routability) are excluded from the
+# weakest-link score, and the score block carries a prewritten `explainer`
+# (+ weakest_dimension / unmeasured_excluded) for the ⓘ popover. Unmeasurable
+# is not zero; the displayed score only counts what was actually measured.
+CONTRACT_VERSION = "1.2"
 
 # Display banding on the 0-100 raw scale, mirrored onto the 0-10 display
 # ("6 = pass"). Anchor calibration is an OPEN decision (contract doc §7) —
@@ -80,9 +85,112 @@ def _score_payload(raw: Any) -> Dict[str, Any]:
     }
 
 
-def _score_block(brand_rollup: Mapping[str, Any]) -> Dict[str, Any]:
+_DIMENSION_LABELS = {
+    "citation": "AI citations",
+    "identity": "product identity",
+    "content_richness": "content richness",
+    "routability": "routability",
+}
+
+
+def _dimension_label(key: str) -> str:
+    return _DIMENSION_LABELS.get(key, str(key).replace("_", " "))
+
+
+def _measurable_dimensions(
+    sku_report: Mapping[str, Any],
+    unmeasured: Tuple[str, ...],
+) -> Dict[str, float]:
+    """Numeric dimension scores minus the ones this run type cannot measure.
+    Unmeasurable != zero: a URL-wedge run has no catalog, so catalog-dependent
+    dimensions (routability) score near-zero for lack of signal, not lack of
+    merit — counting them in the weakest-link overall punished merchants for
+    something the run could not see (calibration decision a)."""
+    scores = _as_dict(sku_report.get("scores"))
+    out: Dict[str, float] = {}
+    for key, payload in scores.items():
+        if key in unmeasured:
+            continue
+        if isinstance(payload, dict) and isinstance(
+            payload.get("score"), (int, float)
+        ):
+            out[str(key)] = float(payload["score"])
+    return out
+
+
+def _recomputed_overall(
+    per_sku_reports: List[Dict[str, Any]],
+    unmeasured: Tuple[str, ...],
+) -> Tuple[Optional[float], Optional[Dict[str, Any]]]:
+    """(brand raw, weakest-dimension descriptor) with unmeasured dims
+    excluded. Brand raw = mean over SKUs of min(measurable dims) — the same
+    weakest-link semantics as _overall_score, minus what wasn't measurable.
+    Weakest descriptor = the argmin dimension of the lowest-scoring SKU."""
+    overalls: List[float] = []
+    weakest: Optional[Dict[str, Any]] = None
+    for report in per_sku_reports:
+        dims = _measurable_dimensions(report, unmeasured)
+        if not dims:
+            continue
+        key = min(dims, key=lambda k: dims[k])
+        value = dims[key]
+        overalls.append(value)
+        if weakest is None or value < float(weakest["raw"]):
+            weakest = {
+                "key": key,
+                "label": _dimension_label(key),
+                "raw": value,
+                "display": _display_score(value),
+            }
+    if not overalls:
+        return None, None
+    return round(sum(overalls) / len(overalls), 2), weakest
+
+
+def _score_explainer(
+    weakest: Optional[Mapping[str, Any]],
+    excluded: Tuple[str, ...],
+) -> Optional[str]:
+    """Prewritten copy for the score's ⓘ popover (calibration decision c).
+    States the weakest-link method, names this run's weakest measured
+    dimension, and discloses what was NOT counted and why — never a number
+    the run didn't measure."""
+    if not weakest:
+        return None
+    parts = [
+        "How this score works: each product is scored on its weakest "
+        "measured dimension, and the brand score averages your products. "
+        f"Weakest measured dimension this run: {weakest.get('label')} "
+        f"({weakest.get('display')}/10)."
+    ]
+    if excluded:
+        labels = ", ".join(_dimension_label(k) for k in excluded)
+        parts.append(
+            f"Not counted: {labels} — these signals can't be measured "
+            "without a connected catalog. Connect your store to measure "
+            "and improve them."
+        )
+    return " ".join(parts)
+
+
+def _score_block(
+    brand_rollup: Mapping[str, Any],
+    per_sku_reports: Optional[List[Dict[str, Any]]] = None,
+    unmeasured: Tuple[str, ...] = (),
+) -> Dict[str, Any]:
     run_scores = _as_dict(brand_rollup.get("run_scores"))
     raw = run_scores.get("avg_visibility")
+    raw_persisted = raw
+    weakest: Optional[Dict[str, Any]] = None
+    excluded_applied: Tuple[str, ...] = ()
+    if per_sku_reports:
+        # weakest is always derived (feeds the explainer); the persisted raw
+        # is only OVERRIDDEN when the caller declared unmeasurable dimensions
+        # — default () keeps historical numbers byte-identical.
+        recomputed, weakest = _recomputed_overall(per_sku_reports, unmeasured)
+        if unmeasured and recomputed is not None:
+            raw = recomputed
+            excluded_applied = tuple(unmeasured)
     subscores = []
     for key, source in (
         ("visibility", "avg_visibility"),
@@ -109,7 +217,15 @@ def _score_block(brand_rollup: Mapping[str, Any]) -> Dict[str, Any]:
     out = _score_payload(raw)
     out["band_thresholds"] = [t / 10.0 for t in _BAND_THRESHOLDS]
     out["subscores"] = subscores
-    out["delta"] = delta
+    # The persisted run-over-run delta compares OLD-semantics numbers; once
+    # exclusions actually change the displayed score the comparison is
+    # apples-to-oranges, so it's dropped rather than shown wrong.
+    out["delta"] = (
+        None if (excluded_applied and raw != raw_persisted) else delta
+    )
+    out["weakest_dimension"] = weakest
+    out["unmeasured_excluded"] = list(excluded_applied)
+    out["explainer"] = _score_explainer(weakest, excluded_applied)
     return out
 
 
@@ -339,18 +455,15 @@ def _competitive_snapshot(narrative: Mapping[str, Any]) -> Dict[str, Any]:
     }
 
 
-def _sku_summary(report: Mapping[str, Any]) -> Dict[str, Any]:
+def _sku_summary(
+    report: Mapping[str, Any],
+    unmeasured: Tuple[str, ...] = (),
+) -> Dict[str, Any]:
     """Per-SKU condensed row for the 3-page per-product view. Overall raw =
-    the SKU's weakest dimension (mirrors _overall_score / _sku_band — the
-    headline AI-readiness semantics, never a flattering average)."""
-    scores = _as_dict(report.get("scores"))
-    values = [
-        payload.get("score")
-        for payload in scores.values()
-        if isinstance(payload, dict)
-        and isinstance(payload.get("score"), (int, float))
-    ]
-    raw = min(values) if values else None
+    the SKU's weakest MEASURED dimension (mirrors _overall_score semantics,
+    minus dimensions this run type cannot measure — see _score_block)."""
+    dims = _measurable_dimensions(report, unmeasured)
+    raw = min(dims.values()) if dims else None
     nba = _as_dict(report.get("next_best_action"))
     prompts, basis = _supporting_prompts(nba, report)
     sku_score = _score_payload(raw)
@@ -374,10 +487,16 @@ def _sku_summary(report: Mapping[str, Any]) -> Dict[str, Any]:
     }
 
 
-def build_report_summary(report: Mapping[str, Any]) -> Dict[str, Any]:
-    """Assemble the contract-v1 summary from an already-built per-SKU brand
-    report (report_jsonb shape). Additive + dark: no renderer consumes it yet;
-    attaching it must never change any existing report field."""
+def build_report_summary(
+    report: Mapping[str, Any],
+    *,
+    unmeasured_dimensions: Tuple[str, ...] = (),
+) -> Dict[str, Any]:
+    """Assemble the contract summary from an already-built per-SKU brand
+    report (report_jsonb shape). `unmeasured_dimensions` names dimensions the
+    RUN TYPE cannot measure (URL wedge without a catalog: routability) — they
+    are excluded from the displayed weakest-link score and disclosed in the
+    explainer. Default () keeps historical semantics byte-identical."""
     report = _as_dict(report)
     narrative = _as_dict(report.get("merchant_narrative"))
     brand_rollup = _as_dict(report.get("brand_rollup"))
@@ -395,7 +514,9 @@ def build_report_summary(report: Mapping[str, Any]) -> Dict[str, Any]:
             "merchant_id": report.get("merchant_id"),
             "merchant_name": report.get("merchant_name"),
         },
-        "score": _score_block(brand_rollup),
+        "score": _score_block(
+            brand_rollup, per_sku_reports, unmeasured_dimensions
+        ),
         "verdict": {
             "headline": narrative.get("headline_story"),
             "label": narrative.get("verdict_label")
@@ -408,7 +529,9 @@ def build_report_summary(report: Mapping[str, Any]) -> Dict[str, Any]:
         "top_findings": _top_findings(narrative),
         "top_actions": actions,
         "competitive_snapshot": _competitive_snapshot(narrative),
-        "sku_summaries": [_sku_summary(r) for r in per_sku_reports],
+        "sku_summaries": [
+            _sku_summary(r, unmeasured_dimensions) for r in per_sku_reports
+        ],
         "meta": {
             "source": "per_sku_brand_report",
             "audit_mode": report.get("audit_mode"),
