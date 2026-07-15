@@ -133,6 +133,7 @@ Never LLM-inferred linkage. If none of the three applies, the action ships with 
 - Slide map: ① cover — brand, score band + display score, "data as of {generated_at}", Pivota branding; ② verdict + competitive snapshot; ③–⑤ one action per slide (`headline` / `why_this_first` / `expected_outcome`); ⑥ methodology + how-to-read (honesty slide).
 - Net-new machinery: **python-pptx** (nothing exists; only HTML→PDF via lazy weasyprint in `audit_html_renderer.py`). Endpoint modeled on `cold_start_audit_export` (`routes/agent_center_bd_routes.py`) but gated with `require_approved_merchant` (`routes/billing_routes.py`) + `merchant_is_paid_tier` (`services/credit_consumption_service.py`) — the established `preview_only` pattern from `citation_draft_service.py`.
 - Gating shape: **free = single watermarked summary slide** (distribution loop stays alive), **paid = full deck**.
+- Billing (decided 2026-07-15): the deck's one LLM step (executive-summary slide) bills on **actual token usage x 1.6** (`DECK_TOKEN_PRICE_MULTIPLE`, vs the 1.2 probe flat_multiple) via `credits_for_tokens` -> `consume(operation_type="report_deck_export")`, ceil, min 1 credit. Idempotency key `report_deck:{run_id}` — one charge per run, re-exports replay. Deterministic rendering costs 0; if the LLM doesn't run, nothing bills.
 
 ### 5c. Homepage hero (feedback item 5)
 - Nav order is single-sourced in `pivota-merchants-portal/lib/merchant-navigation.ts`; promote the AI-readiness group above Primary, feature-flag the Workflows group hidden (don't delete).

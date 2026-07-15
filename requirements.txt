@@ -27,3 +27,4 @@ prometheus-client
 boto3
 Pillow
 apscheduler  # PR-1b: weekly/monthly scheduled re-audit cron
+python-pptx==1.0.2

@@ -47,6 +47,9 @@ _OPERATION_CATEGORY: Dict[str, str] = {
     "agent_citation_draft": "execution",
     # Provider-aware citation operator: grounded probes fanned across providers per scan.
     "agent_citation_scan": "execution",
+    # Leadership-deck (PPTX) export: LLM executive summary billed on ACTUAL
+    # token usage x DECK_TOKEN_PRICE_MULTIPLE (see report_deck_builder).
+    "report_deck_export": "execution",
 }
 
 
