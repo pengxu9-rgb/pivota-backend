@@ -1988,6 +1988,146 @@ async def get_merchant_url_audit(
     return {"status": "running", "run_id": run_id}
 
 
+_SHARE_LINKS_ENABLED = (
+    _os.getenv("AUDIT_SHARE_LINKS_ENABLED", "false").strip().lower() == "true"
+)
+_SHARE_LINK_TTL_DAYS = int(_os.getenv("AUDIT_SHARE_LINK_TTL_DAYS", "30"))
+# Keys a PUBLIC share must never carry: billing/funnel chrome, the
+# merchant's own test prompts, and outreach recipient PII (pitch emails are
+# curated for the MERCHANT to use, not for the open web).
+_SHARE_REDACT_TOP_KEYS = (
+    "custom_prompts",
+    "billing",
+    "billing_mode",
+    "credits_charged",
+    "free_audits_allowed",
+    "free_audits_used",
+    "free_audits_remaining",
+    "merchant_context",
+    "brand_report",
+)
+
+
+def _redact_shared_report(shaped: Dict[str, Any]) -> Dict[str, Any]:
+    out = {k: v for k, v in shaped.items() if k not in _SHARE_REDACT_TOP_KEYS}
+    losing = out.get("where_youre_losing")
+    if isinstance(losing, dict):
+        moves = losing.get("outreach_moves")
+        if isinstance(moves, list):
+            for move in moves:
+                if isinstance(move, dict):
+                    move.pop("pitch_email", None)
+    out["shared_view"] = True
+    return out
+
+
+@router.post("/url-readiness/{run_id}/share")
+async def create_url_audit_share_link(
+    run_id: str,
+    merchant_id: str = Depends(get_current_merchant),
+) -> Dict[str, Any]:
+    """Mint (or return the existing) read-only share token for a completed
+    run. Idempotent per run: one live token at a time; revoke to rotate."""
+    if not _SHARE_LINKS_ENABLED:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail={"code": "share_links_disabled"},
+        )
+    row = await fetch_audit_run_by_id(run_id=run_id)
+    if (
+        not row
+        or row.get("merchant_id") != merchant_id
+        or row.get("subject_type") != "merchant_url"
+        or (row.get("status") or "") != "succeeded"
+    ):
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail={"code": "audit_run_not_found"},
+        )
+    from db.database import database
+
+    existing = await database.fetch_one(
+        """
+        SELECT token, expires_at FROM audit_share_tokens
+        WHERE run_id = :r AND merchant_id = :m
+          AND revoked_at IS NULL AND expires_at > now()
+        ORDER BY created_at DESC LIMIT 1
+        """,
+        {"r": run_id, "m": merchant_id},
+    )
+    if existing:
+        token = existing["token"]
+        expires_at = existing["expires_at"]
+    else:
+        import secrets
+        from datetime import timedelta as _td
+
+        token = secrets.token_urlsafe(32)
+        expires_at = datetime.now(timezone.utc) + _td(days=_SHARE_LINK_TTL_DAYS)
+        await database.execute(
+            """
+            INSERT INTO audit_share_tokens (token, run_id, merchant_id, expires_at)
+            VALUES (:t, :r, :m, :e)
+            """,
+            {"t": token, "r": run_id, "m": merchant_id, "e": expires_at},
+        )
+    return {
+        "token": token,
+        "share_path": f"/share/r/{token}",
+        "expires_at": str(expires_at),
+    }
+
+
+@router.delete("/url-readiness/{run_id}/share")
+async def revoke_url_audit_share_link(
+    run_id: str,
+    merchant_id: str = Depends(get_current_merchant),
+) -> Dict[str, Any]:
+    from db.database import database
+
+    await database.execute(
+        """
+        UPDATE audit_share_tokens SET revoked_at = now()
+        WHERE run_id = :r AND merchant_id = :m AND revoked_at IS NULL
+        """,
+        {"r": run_id, "m": merchant_id},
+    )
+    return {"revoked": True}
+
+
+# Public, UNAUTHENTICATED read of a shared report. Separate router so the
+# merchant-auth dependency of `router` never applies here.
+public_share_router = APIRouter(prefix="/api/public", tags=["public-share"])
+
+
+@public_share_router.get("/audit-share/{token}")
+async def read_shared_audit(token: str) -> Response:
+    if not _SHARE_LINKS_ENABLED:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND)
+    from db.database import database
+
+    row = await database.fetch_one(
+        """
+        SELECT run_id FROM audit_share_tokens
+        WHERE token = :t AND revoked_at IS NULL AND expires_at > now()
+        """,
+        {"t": token},
+    )
+    if not row:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND)
+    run = await fetch_audit_run_by_id(run_id=row["run_id"])
+    if not run or (run.get("status") or "") != "succeeded":
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND)
+    shaped = _redact_shared_report(_shape_url_audit_response(run))
+    import json as _json
+
+    return Response(
+        content=_json.dumps(shaped, default=str),
+        media_type="application/json",
+        headers={"X-Robots-Tag": "noindex, nofollow"},
+    )
+
+
 @router.post("/url-readiness/{run_id}/deck")
 async def export_url_audit_deck(
     run_id: str,

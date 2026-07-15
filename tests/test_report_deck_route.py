@@ -178,3 +178,93 @@ def test_409_when_summary_unavailable(patched):
     res = _client().post("/api/merchant-center/audit/url-readiness/r-1/deck")
     assert res.status_code == 409
     assert res.json()["detail"]["code"] == "summary_unavailable"
+
+
+# ── Wave-3 B2: share links ───────────────────────────────────────────────────
+
+
+def _share_client(monkeypatch, *, enabled=True):
+    monkeypatch.setattr(mar, "_SHARE_LINKS_ENABLED", enabled)
+    app = FastAPI()
+    app.include_router(mar.router)
+    app.include_router(mar.public_share_router)
+    app.dependency_overrides[get_current_merchant] = lambda: "m-1"
+    return TestClient(app)
+
+
+class _FakeShareDB:
+    def __init__(self):
+        self.rows = {}
+
+    async def fetch_one(self, query, values=None):
+        q = " ".join(str(query).split())
+        if "FROM audit_share_tokens" in q and "run_id = :r" in q:
+            for t, r in self.rows.items():
+                if r["run_id"] == values["r"] and not r["revoked"]:
+                    return {"token": t, "expires_at": "2026-08-14"}
+            return None
+        if "WHERE token = :t" in q:
+            r = self.rows.get(values["t"])
+            return {"run_id": r["run_id"]} if r and not r["revoked"] else None
+        return None
+
+    async def execute(self, query, values=None):
+        q = " ".join(str(query).split())
+        if q.startswith("INSERT INTO audit_share_tokens"):
+            self.rows[values["t"]] = {"run_id": values["r"], "revoked": False}
+        if q.startswith("UPDATE audit_share_tokens"):
+            for r in self.rows.values():
+                if r["run_id"] == values["r"]:
+                    r["revoked"] = True
+
+
+def test_share_mint_public_read_and_revoke(patched, monkeypatch):
+    fake_db = _FakeShareDB()
+    import db.database as dbmod
+    monkeypatch.setattr(dbmod, "database", fake_db)
+    client = _share_client(monkeypatch)
+
+    minted = client.post("/api/merchant-center/audit/url-readiness/r-1/share")
+    assert minted.status_code == 200
+    token = minted.json()["token"]
+    assert minted.json()["share_path"] == f"/share/r/{token}"
+
+    # idempotent: second mint returns the same live token
+    again = client.post("/api/merchant-center/audit/url-readiness/r-1/share")
+    assert again.json()["token"] == token
+
+    # public read: no auth, redacted, noindex
+    pub = client.get(f"/api/public/audit-share/{token}")
+    assert pub.status_code == 200
+    assert pub.headers["x-robots-tag"] == "noindex, nofollow"
+    body = pub.json()
+    assert body["shared_view"] is True
+    assert "custom_prompts" not in body and "brand_report" not in body
+    assert "merchant_context" not in body
+    assert body["report_summary"]["contract_version"]
+
+    # revoke kills the public read
+    assert client.delete("/api/merchant-center/audit/url-readiness/r-1/share").status_code == 200
+    assert client.get(f"/api/public/audit-share/{token}").status_code == 404
+
+
+def test_share_disabled_flag_404s_everything(patched, monkeypatch):
+    client = _share_client(monkeypatch, enabled=False)
+    assert client.post("/api/merchant-center/audit/url-readiness/r-1/share").status_code == 404
+    assert client.get("/api/public/audit-share/whatever").status_code == 404
+
+
+def test_share_public_read_redacts_pitch_emails(patched, monkeypatch):
+    fake_db = _FakeShareDB()
+    import db.database as dbmod
+    monkeypatch.setattr(dbmod, "database", fake_db)
+    row = _row()
+    row["report_jsonb"]["merchant_narrative"]["where_youre_losing"]["outreach_moves"] = [
+        {"host": "byrdie.com", "pitch_email": "tips@byrdie.com", "pitch_state": "draft_ready"}
+    ]
+    patched["row"] = row
+    client = _share_client(monkeypatch)
+    token = client.post("/api/merchant-center/audit/url-readiness/r-1/share").json()["token"]
+    body = client.get(f"/api/public/audit-share/{token}").json()
+    moves = body["where_youre_losing"]["outreach_moves"]
+    assert moves and "pitch_email" not in moves[0]
