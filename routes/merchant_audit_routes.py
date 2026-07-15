@@ -93,6 +93,13 @@ from services.merchant_credit_balance_service import (
     get_balance,
 )
 from services.report_summary_builder import build_report_summary
+from services.provider_credit_rates import credits_for_tokens
+from services.report_deck_builder import (
+    DECK_LLM_PROVIDER,
+    DECK_TOKEN_PRICE_MULTIPLE,
+    build_report_deck,
+    generate_executive_summary,
+)
 from services.llm_providers.deepseek_probe import (
     DeepseekProbeError,
     answer_grounded_question,
@@ -1960,6 +1967,143 @@ async def get_merchant_url_audit(
     # with the worker). Truly-abandoned runs are reaped by
     # fail_abandoned_runs() (30-min TTL, no-live-lease) instead.
     return {"status": "running", "run_id": run_id}
+
+
+@router.post("/url-readiness/{run_id}/deck")
+async def export_url_audit_deck(
+    run_id: str,
+    merchant_id: str = Depends(get_current_merchant),
+) -> Response:
+    """Export a completed URL-audit run as a leadership deck (PPTX).
+
+    Tiering + billing (PR-4):
+      - Free tier: a single watermarked preview slide (cover + score). No LLM
+        runs and nothing is billed — the preview is the distribution hook.
+      - Paid tier: the full deck. Its one LLM step (the executive-summary
+        slide) bills on ACTUAL token usage at DECK_TOKEN_PRICE_MULTIPLE (1.6x
+        measured token COGS -> credits, ceil, min 1). When the LLM is
+        unavailable the deck ships without that slide and costs 0 credits —
+        never charge for work that didn't run.
+      - Idempotency: one charge per run (key report_deck:{run_id}); re-exports
+        replay the debit instead of double-charging.
+    402 on insufficient credits; 409 when the run has no renderable summary;
+    503 when python-pptx isn't installed on the serving image.
+    """
+    row = await fetch_audit_run_by_id(run_id=run_id)
+    if (
+        not row
+        or row.get("merchant_id") != merchant_id
+        or row.get("subject_type") != "merchant_url"
+    ):
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail={"code": "audit_run_not_found", "message": "No such audit run."},
+        )
+    if (row.get("status") or "") != "succeeded":
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail={
+                "code": "audit_not_finished",
+                "message": "The audit hasn't finished yet — export once it succeeds.",
+            },
+        )
+    shaped = _shape_url_audit_response(row)
+    summary = shaped.get("report_summary")
+    if not isinstance(summary, dict) or not (
+        (summary.get("score") or {}).get("display") is not None
+        or (summary.get("verdict") or {}).get("headline")
+    ):
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail={
+                "code": "summary_unavailable",
+                "message": "This run has no report summary to export — re-run the audit.",
+            },
+        )
+
+    paid = await merchant_is_paid_tier(merchant_id)
+    billing_mode = "preview_only"
+    credits_charged = 0
+    executive_bullets = None
+    llm_tokens = None
+
+    if paid:
+        billing_mode = "included"
+        # The deck's only LLM step. Failure -> deck ships without the slide,
+        # nothing billed (never charge for work that didn't run).
+        try:
+            generated = await generate_executive_summary(summary)
+        except Exception:  # noqa: BLE001
+            logger.warning("deck executive summary failed", exc_info=True)
+            generated = None
+        if generated:
+            executive_bullets, in_tok, out_tok = generated
+            llm_tokens = (in_tok, out_tok)
+
+    # Render BEFORE any debit: if python-pptx is missing this 503s with no
+    # money moved ("never charge for work that didn't run" applies to the
+    # deck itself, not just the LLM step — review fix, PR #1411 round 2).
+    deck = build_report_deck(
+        summary,
+        executive_bullets=executive_bullets,
+        preview_only=not paid,
+    )
+    if deck is None:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail={
+                "code": "deck_renderer_unavailable",
+                "message": "Deck export isn't available on this deployment yet.",
+            },
+        )
+
+    if paid and llm_tokens:
+        in_tok, out_tok = llm_tokens
+        credits, usd_cogs = credits_for_tokens(
+            DECK_LLM_PROVIDER,
+            input_tokens=in_tok,
+            output_tokens=out_tok,
+            multiple=DECK_TOKEN_PRICE_MULTIPLE,
+        )
+        if credits > 0:
+            try:
+                result = await consume_credits(
+                    merchant_id,
+                    "report_deck_export",
+                    f"report_deck:{run_id}",
+                    credits=credits,
+                    usd_cogs=usd_cogs,
+                )
+            except InsufficientCreditsError:
+                # NOTE: fires for merchants the balance layer treats as
+                # non-overage; plan-tier merchants may instead accrue overage
+                # per the billing system's paid-tier semantics.
+                raise HTTPException(
+                    status_code=status.HTTP_402_PAYMENT_REQUIRED,
+                    detail={
+                        "code": "insufficient_credits",
+                        "message": (
+                            "Not enough credits to export the deck — top up "
+                            "or upgrade your plan."
+                        ),
+                        "credits_required": credits,
+                    },
+                )
+            billing_mode = "metered"
+            credits_charged = int(result.get("credits") or 0)
+    filename = f"pivota-ai-readiness-{run_id}.pptx"
+    return Response(
+        content=deck,
+        media_type=(
+            "application/vnd.openxmlformats-officedocument."
+            "presentationml.presentation"
+        ),
+        headers={
+            "Content-Disposition": f'attachment; filename="{filename}"',
+            "X-Pivota-Billing-Mode": billing_mode,
+            "X-Pivota-Credits-Charged": str(credits_charged),
+        },
+    )
 
 
 # Keep references to in-flight background audits so the event loop doesn't GC
