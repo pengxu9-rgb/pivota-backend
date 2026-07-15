@@ -475,9 +475,12 @@ def _build_sku_evidence_used(
         "demand_state_summary": opportunity.get("demand_state_summary"),
         "intent_ladder": dict(_as_mapping(opportunity.get("intent_ladder"))),
         "sideways_wedge": dict(sideways_wedge),
+        # Interleaved by provider BEFORE the slice: failing_prompts is
+        # provider-grouped, so a plain [:5] persisted single-engine chips
+        # (live Mojawa run: 5/5 Gemini while ChatGPT losses existed).
         "failing_prompt_examples": [
             _sku_failing_prompt_chip(prompt)
-            for prompt in failing_prompts[:5]
+            for prompt in _interleave_failing_prompts(failing_prompts)[:5]
             if _sku_failing_prompt_chip(prompt)
         ],
         "verify_summary": dict(verify_summary),
@@ -1103,6 +1106,12 @@ def _normalize_host_value(value: Any) -> str:
     if host.startswith("www."):
         host = host[4:]
     return host if "." in host else ""
+
+
+def _interleave_failing_prompts(failing_prompts: List[Any]) -> List[Any]:
+    from services.win_plan_builder import interleave_by_provider
+
+    return interleave_by_provider([p for p in failing_prompts if isinstance(p, Mapping)])
 
 
 def _sku_failing_prompt_chip(prompt: Any) -> Optional[Dict[str, Any]]:
