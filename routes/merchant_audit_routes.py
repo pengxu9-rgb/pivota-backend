@@ -92,6 +92,9 @@ from services.merchant_credit_balance_service import (
     InsufficientCreditsError,
     get_balance,
 )
+from services.merchant_narrative_builder import (
+    annotate_outreach_moves_with_pitch_paths,
+)
 from services.report_summary_builder import build_report_summary
 from services.provider_credit_rates import credits_for_tokens
 from services.report_deck_builder import (
@@ -1344,6 +1347,13 @@ def _providers_attempted(per_sku_reports: List[Dict[str, Any]]) -> bool:
     return False
 
 
+def _with_pitch_paths(where_losing: Dict[str, Any]) -> Dict[str, Any]:
+    """Serve-time registry annotation for the get-cited section (wave-1 C1)."""
+    if isinstance(where_losing, dict):
+        annotate_outreach_moves_with_pitch_paths(where_losing.get("outreach_moves"))
+    return where_losing
+
+
 def _shape_url_audit_response(row: Dict[str, Any]) -> Dict[str, Any]:
     """Reshape a completed per_sku run row into the URL-audit response envelope.
 
@@ -1383,7 +1393,10 @@ def _shape_url_audit_response(row: Dict[str, Any]) -> Dict[str, Any]:
         "custom_prompts": report.get("custom_prompts") or [],
         # Competitive landscape + off-platform outreach moves (who AI cites
         # instead of you, and the pitch/engage/list actions to get cited there).
-        "where_youre_losing": (
+        # Outreach moves get their registry pitch paths stamped at SERVE time
+        # (wave-1 C1) — historical runs pick up newly curated recipients /
+        # submission URLs without a re-run.
+        "where_youre_losing": _with_pitch_paths(
             (report.get("merchant_narrative") or {}).get("where_youre_losing") or {}
         ),
         # The full merchant-grade narrative the pipeline already computes:

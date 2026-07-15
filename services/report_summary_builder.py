@@ -30,7 +30,11 @@ from services.win_plan_builder import interleave_by_provider, is_broad_head_quer
 # weakest-link score, and the score block carries a prewritten `explainer`
 # (+ weakest_dimension / unmeasured_excluded) for the ⓘ popover. Unmeasurable
 # is not zero; the displayed score only counts what was actually measured.
-CONTRACT_VERSION = "1.2"
+# 1.3 (wave-1): `since_last_audit` (verbatim reaudit_delta movements — the
+# time dimension the 2026 monitoring competitors lead with) + per-action
+# `impact` (which dimension the move lifts — Lighthouse-style, direction
+# only, never a fabricated numeric estimate).
+CONTRACT_VERSION = "1.3"
 
 # Display banding on the 0-100 raw scale, mirrored onto the 0-10 display
 # ("6 = pass"). Anchor calibration is an OPEN decision (contract doc §7) —
@@ -83,6 +87,24 @@ def _score_payload(raw: Any) -> Dict[str, Any]:
         "scale_max": 10,
         "band": _band_for(raw),
     }
+
+
+# Which dimension a primary_gap's action lifts (wave-1 A4). Direction only —
+# a numeric lift estimate would be fabrication; the dimension mapping is the
+# same one the gap classifier reasons over.
+_GAP_IMPACT_DIMENSION = {
+    "get_indexed": "routability",
+    "integration_completion_gap": "routability",
+    "source_route_repair": "routability",
+    "retrieval_foundation_gap": "content_richness",
+    "content_revision_gap": "content_richness",
+    "category_discovery_gap": "citation",
+    "competitor_source_gap": "citation",
+    "first_party_defense": "citation",
+    "open_lane_capture": "citation",
+    "substitution_leak": "citation",
+    "retailer_route_leak": "citation",
+}
 
 
 _DIMENSION_LABELS = {
@@ -353,9 +375,16 @@ def _top_actions(
         nba = _as_dict(sku_report.get("next_best_action"))
         prompts, basis = _supporting_prompts(nba, sku_report)
         cta = _as_dict(nba.get("cta"))
+        gap_key = str(action.get("primary_gap") or "").strip().lower()
+        impact_dim = _GAP_IMPACT_DIMENSION.get(gap_key)
         out.append(
             {
                 "action_id": None,  # Surface B FK, absent on wedge reports
+                "impact": (
+                    {"dimension": impact_dim, "label": _dimension_label(impact_dim)}
+                    if impact_dim
+                    else None
+                ),
                 "headline": action.get("headline"),
                 "why_this_first": action.get("why_this_first")
                 or nba.get("why_this_first"),
@@ -487,6 +516,27 @@ def _sku_summary(
     }
 
 
+def _since_last_audit(report: Mapping[str, Any]) -> Optional[Dict[str, Any]]:
+    """Verbatim passthrough of the persisted reaudit_delta (wave-1 A1) —
+    movements already carry merchant-safe labels and the W2 materiality
+    verdicts; this layer never re-derives them. Absent on runs that predate
+    the per-SKU attach (presence-gated rendering, the 1.1/1.2 convention)."""
+    delta = report.get("reaudit_delta")
+    if not isinstance(delta, dict):
+        return None
+    movements = [m for m in _as_list(delta.get("movements")) if isinstance(m, dict)]
+    return {
+        "is_first_audit": bool(delta.get("is_first_audit")),
+        "days_since_last": delta.get("days_since_last"),
+        "headline": delta.get("headline"),
+        "movements": movements,
+        # Producer emits is_material (review P1: reading "material" made this
+        # counter permanently zero on real passthrough data).
+        "material_movements": sum(1 for m in movements if m.get("is_material")),
+        "basis_same": (_as_dict(delta.get("measurement_basis"))).get("same"),
+    }
+
+
 def build_report_summary(
     report: Mapping[str, Any],
     *,
@@ -526,6 +576,7 @@ def build_report_summary(
             or report.get("brand_verdict_explanation"),
             "primary_gap": actions[0].get("primary_gap") if actions else None,
         },
+        "since_last_audit": _since_last_audit(report),
         "top_findings": _top_findings(narrative),
         "top_actions": actions,
         "competitive_snapshot": _competitive_snapshot(narrative),

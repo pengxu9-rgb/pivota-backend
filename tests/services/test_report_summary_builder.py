@@ -612,3 +612,73 @@ def test_wedge_route_declares_routability_unmeasurable():
     out = _shape_url_audit_response(row)
     assert out["report_summary"]["score"]["raw"] == 46.0
     assert out["report_summary"]["score"]["unmeasured_excluded"] == ["routability"]
+
+
+def test_since_last_audit_passthrough_and_absence():
+    # Absent on reports that predate the per-SKU attach (presence-gated).
+    assert build_report_summary(_brand_report())["since_last_audit"] is None
+    report = _brand_report()
+    report["reaudit_delta"] = {
+        "is_first_audit": False,
+        "days_since_last": 7,
+        "headline": "Visibility improved materially since your last audit.",
+        "movements": [
+            {"signal": "visibility", "label": "AI visibility", "from": 20,
+             "to": 33, "is_material": True, "direction": "improved"},
+            {"signal": "attribution", "label": "Attribution", "from": 46,
+             "to": 47, "is_material": False, "direction": "stable"},
+        ],
+        "measurement_basis": {"same": True},
+    }
+    out = build_report_summary(report)["since_last_audit"]
+    assert out["days_since_last"] == 7
+    assert out["material_movements"] == 1
+    assert out["basis_same"] is True
+    assert out["movements"][0]["label"] == "AI visibility"  # verbatim
+
+
+def test_action_impact_dimension_stamped():
+    out = build_report_summary(_brand_report())
+    action = out["top_actions"][0]
+    # fixture primary_gap = get_indexed -> routability
+    assert action["impact"] == {"dimension": "routability", "label": "routability"}
+
+
+def test_unknown_gap_has_no_impact_never_guessed():
+    report = _brand_report()
+    report["merchant_narrative"]["prioritized_actions"][0]["primary_gap"] = "novel_gap"
+    out = build_report_summary(report)
+    assert out["top_actions"][0]["impact"] is None
+
+
+def test_reaudit_delta_end_to_end_on_real_per_sku_shape():
+    # Review P0 guard: feed GENUINE per-SKU brand reports (per_sku_reports,
+    # no per_product/merchant_view) through build_reaudit_delta — movements
+    # must carry real numbers, not None→None.
+    from services.audit_delta import build_reaudit_delta
+
+    prior = _brand_report()
+    prior["per_sku_reports"][0]["scores"] = {
+        "citation": {"score": 20},
+        "identity": {"score": 30},
+    }
+    current = _brand_report()
+    current["per_sku_reports"][0]["scores"] = {
+        "citation": {"score": 46},
+        "identity": {"score": 33},
+    }
+    delta = build_reaudit_delta(
+        current_report=current,
+        prior_report=prior,
+        prior_row=None,
+        days_since=7,
+    )
+    moves = {m["signal"]: m for m in delta["movements"] if "signal" in m}
+    # visibility = weakest dim (20 -> 33), attribution = citation (20 -> 46)
+    assert moves["visibility"]["from"] == 20 and moves["visibility"]["to"] == 33
+    assert moves["attribution"]["from"] == 20 and moves["attribution"]["to"] == 46
+    assert moves["attribution"]["is_material"] is True
+    # And the contract counter reads the real key end-to-end.
+    current["reaudit_delta"] = delta
+    out = build_report_summary(current)["since_last_audit"]
+    assert out["material_movements"] >= 1
