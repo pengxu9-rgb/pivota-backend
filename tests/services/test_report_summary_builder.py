@@ -682,3 +682,40 @@ def test_reaudit_delta_end_to_end_on_real_per_sku_shape():
     current["reaudit_delta"] = delta
     out = build_report_summary(current)["since_last_audit"]
     assert out["material_movements"] >= 1
+
+
+def test_share_of_voice_prompt_level_counts():
+    report = _brand_report()
+    report["per_sku_reports"][0]["opportunity"] = {
+        "per_prompt": [
+            {
+                "query": "best hydrating serum for dry skin",
+                "source_summary": {"merchant_cited_runs": 0, "sku_cited_runs": 0},
+                "competitors": ["CeraVe", "The Ordinary", "CeraVe"],  # dup in one answer
+            },
+            {
+                "query": "fragrance-free serum sensitive skin",
+                "source_summary": {"merchant_cited_runs": 1},
+                "competitors": ["cerave"],  # case-folds into CeraVe
+            },
+            {
+                "query": "hydra serum reviews",
+                "source_summary": {"sku_cited_runs": 2},
+                "competitors": [],
+            },
+            {"query": ""},  # empty query rows don't count toward the basis
+        ]
+    }
+    sov = build_report_summary(report)["share_of_voice"]
+    assert sov["available"] is True
+    assert sov["prompts_probed"] == 3  # one shared denominator
+    assert sov["brand"] == {"name": "GlowLab", "prompts_cited": 2, "pct": 66.7}
+    top = sov["competitors"][0]
+    # CeraVe: named on 2 prompts (dup within one answer counts once)
+    assert top["name"] == "CeraVe" and top["prompts_named"] == 2 and top["pct"] == 66.7
+    assert sov["competitors"][1]["prompts_named"] == 1
+
+
+def test_share_of_voice_unavailable_without_prompts():
+    sov = build_report_summary(_brand_report())["share_of_voice"]
+    assert sov == {"available": False, "prompts_probed": 0}

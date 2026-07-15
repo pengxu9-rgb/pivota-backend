@@ -34,7 +34,11 @@ from services.win_plan_builder import interleave_by_provider, is_broad_head_quer
 # time dimension the 2026 monitoring competitors lead with) + per-action
 # `impact` (which dimension the move lifts — Lighthouse-style, direction
 # only, never a fabricated numeric estimate).
-CONTRACT_VERSION = "1.3"
+# 1.4 (wave-2 A2): `share_of_voice` — of the prompts THIS RUN probed, how
+# often the brand vs each named competitor appeared in the grounded answers.
+# Prompt-level counts with one shared denominator (prompts_probed), stated
+# on-block; never extrapolated beyond what was measured.
+CONTRACT_VERSION = "1.4"
 
 # Display banding on the 0-100 raw scale, mirrored onto the 0-10 display
 # ("6 = pass"). Anchor calibration is an OPEN decision (contract doc §7) —
@@ -516,6 +520,70 @@ def _sku_summary(
     }
 
 
+_SOV_COMPETITOR_CAP = 5
+
+
+def _share_of_voice(
+    report: Mapping[str, Any],
+    per_sku_reports: List[Dict[str, Any]],
+) -> Dict[str, Any]:
+    """Wave-2 A2 — the category's headline metric, computed honestly: one
+    denominator (every prompt this run probed), prompt-level presence counts.
+    Brand presence = the grounded answer cited the merchant/SKU; competitor
+    presence = the answer named that competitor. A competitor named twice in
+    one answer still counts once for that prompt. Not a market-share claim —
+    the basis (prompts_probed) ships on the block."""
+    total = 0
+    brand_prompts = 0
+    named: Dict[str, Dict[str, Any]] = {}
+    for sku in per_sku_reports:
+        opportunity = _as_dict(sku.get("opportunity"))
+        for row in _as_list(opportunity.get("per_prompt")):
+            row = _as_dict(row)
+            if not row.get("query"):
+                continue
+            total += 1
+            summary = _as_dict(row.get("source_summary"))
+            try:
+                cited = int(summary.get("merchant_cited_runs") or 0) > 0 or (
+                    int(summary.get("sku_cited_runs") or 0) > 0
+                )
+            except (TypeError, ValueError):
+                cited = False
+            if cited:
+                brand_prompts += 1
+            seen_this_prompt = set()
+            for name in _as_list(row.get("competitors")):
+                label = str(name or "").strip()
+                key = label.casefold()
+                if not label or key in seen_this_prompt:
+                    continue
+                seen_this_prompt.add(key)
+                bucket = named.setdefault(key, {"name": label, "prompts_named": 0})
+                bucket["prompts_named"] += 1
+    if total == 0:
+        return {"available": False, "prompts_probed": 0}
+
+    def _pct(count: int) -> float:
+        return round(100.0 * count / total, 1)
+
+    competitors = sorted(
+        named.values(), key=lambda b: (-b["prompts_named"], b["name"].casefold())
+    )[:_SOV_COMPETITOR_CAP]
+    return {
+        "available": True,
+        "prompts_probed": total,
+        "brand": {
+            "name": report.get("merchant_name"),
+            "prompts_cited": brand_prompts,
+            "pct": _pct(brand_prompts),
+        },
+        "competitors": [
+            {**b, "pct": _pct(b["prompts_named"])} for b in competitors
+        ],
+    }
+
+
 def _since_last_audit(report: Mapping[str, Any]) -> Optional[Dict[str, Any]]:
     """Verbatim passthrough of the persisted reaudit_delta (wave-1 A1) —
     movements already carry merchant-safe labels and the W2 materiality
@@ -577,6 +645,7 @@ def build_report_summary(
             "primary_gap": actions[0].get("primary_gap") if actions else None,
         },
         "since_last_audit": _since_last_audit(report),
+        "share_of_voice": _share_of_voice(report, per_sku_reports),
         "top_findings": _top_findings(narrative),
         "top_actions": actions,
         "competitive_snapshot": _competitive_snapshot(narrative),
