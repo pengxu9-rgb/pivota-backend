@@ -178,3 +178,128 @@ def test_409_when_summary_unavailable(patched):
     res = _client().post("/api/merchant-center/audit/url-readiness/r-1/deck")
     assert res.status_code == 409
     assert res.json()["detail"]["code"] == "summary_unavailable"
+
+
+# ── Wave-3 B2: share links ───────────────────────────────────────────────────
+
+
+def _share_client(monkeypatch, *, enabled=True):
+    monkeypatch.setattr(mar, "_SHARE_LINKS_ENABLED", enabled)
+    app = FastAPI()
+    app.include_router(mar.router)
+    app.include_router(mar.public_share_router)
+    app.dependency_overrides[get_current_merchant] = lambda: "m-1"
+    return TestClient(app)
+
+
+class _FakeShareDB:
+    def __init__(self):
+        self.rows = {}
+
+    async def fetch_one(self, query, values=None):
+        q = " ".join(str(query).split())
+        if "FROM audit_share_tokens" in q and "run_id = :r" in q:
+            for t, r in self.rows.items():
+                if r["run_id"] == values["r"] and not r["revoked"]:
+                    return {"token": t, "expires_at": "2026-08-14"}
+            return None
+        if "WHERE token = :t" in q:
+            r = self.rows.get(values["t"])
+            return {"run_id": r["run_id"]} if r and not r["revoked"] else None
+        return None
+
+    async def execute(self, query, values=None):
+        q = " ".join(str(query).split())
+        if q.startswith("INSERT INTO audit_share_tokens"):
+            self.rows[values["t"]] = {"run_id": values["r"], "revoked": False}
+        if q.startswith("UPDATE audit_share_tokens"):
+            for r in self.rows.values():
+                if r["run_id"] == values["r"]:
+                    r["revoked"] = True
+
+
+def test_share_mint_public_read_and_revoke(patched, monkeypatch):
+    fake_db = _FakeShareDB()
+    import db.database as dbmod
+    monkeypatch.setattr(dbmod, "database", fake_db)
+    client = _share_client(monkeypatch)
+
+    minted = client.post("/api/merchant-center/audit/url-readiness/r-1/share")
+    assert minted.status_code == 200
+    token = minted.json()["token"]
+    assert minted.json()["share_path"] == f"/share/r/{token}"
+
+    # idempotent: second mint returns the same live token
+    again = client.post("/api/merchant-center/audit/url-readiness/r-1/share")
+    assert again.json()["token"] == token
+
+    # public read: no auth, redacted, noindex
+    pub = client.get(f"/api/public/audit-share/{token}")
+    assert pub.status_code == 200
+    assert pub.headers["x-robots-tag"] == "noindex, nofollow"
+    body = pub.json()
+    assert body["shared_view"] is True
+    assert "custom_prompts" not in body and "brand_report" not in body
+    assert "merchant_context" not in body
+    assert body["report_summary"]["contract_version"]
+
+    # revoke kills the public read
+    assert client.delete("/api/merchant-center/audit/url-readiness/r-1/share").status_code == 200
+    assert client.get(f"/api/public/audit-share/{token}").status_code == 404
+
+
+def test_share_disabled_flag_404s_everything(patched, monkeypatch):
+    client = _share_client(monkeypatch, enabled=False)
+    assert client.post("/api/merchant-center/audit/url-readiness/r-1/share").status_code == 404
+    assert client.get("/api/public/audit-share/whatever").status_code == 404
+
+
+def test_share_public_read_leaks_no_email_anywhere(patched, monkeypatch):
+    # Security review round 2: the REAL builder shapes carry full
+    # pitch_recipient dicts on outreach_moves AND pitch_targets, in both
+    # where_youre_losing and merchant_narrative.where_youre_losing. The
+    # public body must contain NO email string anywhere, ever.
+    import re
+
+    fake_db = _FakeShareDB()
+    import db.database as dbmod
+    monkeypatch.setattr(dbmod, "database", fake_db)
+    row = _row()
+    losing = row["report_jsonb"]["merchant_narrative"]["where_youre_losing"]
+    losing["outreach_moves"] = [
+        {
+            "host": "soundguys.com",
+            "pitch_email": "pr@soundguys.com",
+            "pitch_recipient": {"email": "pr@soundguys.com", "note": "x"},
+            "pitch_state": "draft_ready",
+        }
+    ]
+    losing["pitch_targets"] = [
+        {
+            "host": "forbes.com",
+            "pitch_recipient": {
+                "email": "vetted@forbes.com",
+                "submission_url": "https://forbes.com/tips",
+            },
+        }
+    ]
+    patched["row"] = row
+    client = _share_client(monkeypatch)
+    token = client.post("/api/merchant-center/audit/url-readiness/r-1/share").json()["token"]
+    res = client.get(f"/api/public/audit-share/{token}")
+    raw = res.text
+    assert not re.search(r"[\w.+-]+@[\w-]+\.[\w.]+", raw), raw[:400]
+    body = res.json()
+    # the structural rows survive (host + state), only routing data is gone
+    moves = body["where_youre_losing"]["outreach_moves"]
+    assert moves[0]["host"] == "soundguys.com"
+    assert "pitch_recipient" not in moves[0] and "pitch_email" not in moves[0]
+    assert "pitch_recipient" not in body["where_youre_losing"]["pitch_targets"][0]
+    # allowlist: nothing outside the approved key set
+    allowed = set(mar._SHARE_ALLOWED_TOP_KEYS) | {"shared_view"}
+    assert set(body.keys()) <= allowed, set(body.keys()) - allowed
+
+
+def test_share_revoke_requires_flag(patched, monkeypatch):
+    client = _share_client(monkeypatch, enabled=False)
+    assert client.delete("/api/merchant-center/audit/url-readiness/r-1/share").status_code == 404
