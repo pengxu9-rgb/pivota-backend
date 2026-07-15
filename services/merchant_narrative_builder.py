@@ -464,6 +464,19 @@ def _move_realism(host: str, htype: str, subtype: str) -> str:
     return "investigate"
 
 
+# Weak-signal caveat, empirically earned: on the first same-basis re-audit pair
+# measured by outreach_outcomes (runs 549ace84 → 83e8fcb4), 5 of the 8 targeted
+# hosts vanished from the next run's grounding sample — and every one was a
+# single-citation host, while the repeated hosts all recurred. One grounded
+# answer citing a source is a LEAD, not a proven channel; label it so the
+# merchant spends effort on repeated sources first without hiding the lead.
+_WEAK_SIGNAL_NOTE = (
+    "Seen once in this run's sample — a single grounded answer cited this "
+    "source. It may not recur on a re-audit; verify it matters for your "
+    "category before investing beyond a quick look."
+)
+
+
 def _outreach_moves(
     who: Dict[str, Any],
     endorsement_hosts: Optional[List[str]] = None,
@@ -526,6 +539,10 @@ def _outreach_moves(
         )
         cited_n = int(h.get("prompts_cited_count") or 0)
         category = bool(h.get("cited_on_category_query"))
+        # An endorsement is standing, basis-independent evidence (it comes from
+        # the run summary, not this count), so an endorsed host is never a
+        # single sighting even at cited_n == 1.
+        weak_signal = cited_n <= 1 and not already_endorses
         if already_endorses:
             why = (
                 f"{host} already recommends you independently — the move isn't "
@@ -564,6 +581,8 @@ def _outreach_moves(
                 else cls.get("outreach_hint") or _FIRST_MOVE_BY_LEVER.get(lever)
             ),
             "realism": realism,
+            "signal_strength": "single_sighting" if weak_signal else "repeated",
+            "signal_note": _WEAK_SIGNAL_NOTE if weak_signal else None,
             "pitch_recipient": cls.get("pitch_recipient"),
             # A host that grounds a RIVAL's recommendation is the sharpest move
             # (you're losing the endorsement, not just absent) — weight it well
