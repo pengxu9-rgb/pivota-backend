@@ -802,7 +802,15 @@ app.add_middleware(
         "X-Pivota-Brief-Id",
         "X-Pivota-Brief-Schema-Version",
     ],
-    expose_headers=["X-Request-Id", "X-Total-Count"],
+    expose_headers=[
+        "X-Request-Id",
+        "X-Total-Count",
+        # Deck export (PR #1411): the portal reads billing feedback + the
+        # download filename off the PPTX response cross-origin.
+        "Content-Disposition",
+        "X-Pivota-Billing-Mode",
+        "X-Pivota-Credits-Charged",
+    ],
 )
 
 # Log CORS configuration for debugging
