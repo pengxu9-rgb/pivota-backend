@@ -27,6 +27,7 @@ Out of scope for PR-1b (defer to PR-1c if needed):
 from __future__ import annotations
 
 import asyncio
+import os
 import logging
 from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, List, Optional
@@ -345,6 +346,33 @@ async def _re_audit_merchant_locked(
         summary["reason"] = "no products extracted from prior report"
         return summary
 
+    # Wave-3 B1: the merchant-facing switch promises 'bills standard credits;
+    # skipped — never silently drained — when the balance can't cover one'.
+    # Pre-flight BEFORE any run row exists; skip is notified, never silent.
+    try:
+        preflight = await _scheduled_credit_preflight(merchant_id, products)
+    except Exception:  # noqa: BLE001 — billing infra down must not run unbilled
+        logger.warning(
+            "scheduled_audit_job: credit preflight failed for %s; skipping",
+            merchant_id, exc_info=True,
+        )
+        summary["reason"] = "credit preflight failed; skipped"
+        return summary
+    if not preflight["ok"]:
+        summary["reason"] = (
+            f"insufficient credits ({preflight['available']}/"
+            f"{preflight['credits']}); skipped"
+        )
+        try:
+            await _send_apm_skip_email(
+                merchant_id=merchant_id,
+                required=preflight["credits"],
+                available=preflight["available"],
+            )
+        except Exception:  # noqa: BLE001
+            logger.warning("apm skip email failed for %s", merchant_id, exc_info=True)
+        return summary
+
     # Run the audit lifecycle the same way the HTTP handler does.
     product_keys = [
         p.get("product_key") or p.get("pdp_url") or p.get("title")
@@ -412,6 +440,19 @@ async def _re_audit_merchant_locked(
             exc,
         )
     summary["status"] = "succeeded"
+    # Wave-3 B1: debit AFTER success (a failed run never charges), idempotent
+    # on the run_id; then the change-digest email (env-flagged, best-effort).
+    await _bill_scheduled_run(
+        merchant_id=merchant_id,
+        run_id=str(run_id),
+        credits=int(preflight["credits"]),
+        usd_cogs=preflight["usd_cogs"],
+    )
+    summary["credits_charged"] = int(preflight["credits"])
+    try:
+        await _send_apm_digest_email(merchant_id=merchant_id, report=out)
+    except Exception:  # noqa: BLE001
+        logger.warning("apm digest email failed for %s", merchant_id, exc_info=True)
     summary["run_id"] = run_id
     summary["visibility"] = agg.get("avg_visibility")
     summary["attribution"] = agg.get("avg_attribution")
@@ -446,6 +487,194 @@ def _extract_products_from_prior_report(
             "product_type": product.get("product_type"),
         })
     return out
+
+
+_APM_DIGEST_EMAIL_ENABLED = (
+    os.getenv("APM_DIGEST_EMAIL_ENABLED", "false").strip().lower() == "true"
+)
+
+
+def _collect_reaudit_deltas(report: Any) -> list:
+    """Every (product_title, reaudit_delta) the report actually carries:
+    per-SKU top-level, and the legacy per-product merchant_view site the
+    scheduled path produces."""
+    out: list = []
+    if not isinstance(report, dict):
+        return out
+    top = report.get("reaudit_delta")
+    if isinstance(top, dict):
+        out.append((None, top))
+    for product in report.get("per_product") or []:
+        if not isinstance(product, dict):
+            continue
+        delta = (product.get("merchant_view") or {}).get("reaudit_delta")
+        if isinstance(delta, dict):
+            title = (
+                (product.get("product") or {}).get("title")
+                if isinstance(product.get("product"), dict)
+                else None
+            ) or product.get("title")
+            out.append((str(title) if title else None, delta))
+    return out
+
+
+# Mirror of the cron's run_brand_report(provider="gemini", max_runs=3) call —
+# the estimate must price the probes the run will actually fire.
+_SCHEDULED_PROVIDER = "gemini"
+_SCHEDULED_RUNS_PER_PRODUCT = 3
+
+
+async def _scheduled_credit_preflight(
+    merchant_id: str, products: list
+) -> Dict[str, Any]:
+    """Wave-3 B1: the switch promises 'bills standard credits; skipped —
+    never silently drained — when the balance can't cover one'. This is that
+    mechanism. Free-plan merchants with an insufficient balance are SKIPPED
+    (+ notified when the digest flag is on); paid tiers proceed (the balance
+    layer's overage semantics apply, same as every other metered surface)."""
+    from services.credit_consumption_service import estimate_probe_credits
+    from services.merchant_credit_balance_service import get_balance
+
+    probe_count = max(1, len(products)) * _SCHEDULED_RUNS_PER_PRODUCT
+    credits, cogs = estimate_probe_credits(
+        [(_SCHEDULED_PROVIDER, probe_count, True)]
+    )
+    balance = await get_balance(merchant_id)
+    available = int(balance.get("credits") or 0)
+    paid_tier = str(balance.get("plan_tier") or "free").lower() != "free"
+    return {
+        "ok": paid_tier or credits <= available,
+        "credits": credits,
+        "usd_cogs": cogs,
+        "available": available,
+        "paid_tier": paid_tier,
+    }
+
+
+async def _bill_scheduled_run(
+    *, merchant_id: str, run_id: str, credits: int, usd_cogs: Any
+) -> None:
+    """Debit AFTER the run succeeds (unlike the route's pre-debit): a failed
+    scheduled run must never charge. Idempotent on the run_id."""
+    if credits <= 0:
+        return
+    from services import credit_consumption_service as _ccs
+
+    try:
+        await _ccs.consume(
+            merchant_id,
+            "audit",
+            idempotency_key=f"apm_scheduled:{run_id}",
+            credits=credits,
+            usd_cogs=usd_cogs,
+        )
+    except Exception:  # noqa: BLE001 — billing failure must not flip the run
+        logger.warning(
+            "scheduled_audit_job: credit debit failed merchant=%s run=%s",
+            merchant_id, run_id, exc_info=True,
+        )
+
+
+async def _send_apm_skip_email(
+    *, merchant_id: str, required: int, available: int
+) -> None:
+    """Insufficient-credit skips are NOTIFIED, never silent (decision B1)."""
+    if not _APM_DIGEST_EMAIL_ENABLED:
+        return
+    from db.database import database
+
+    row = await database.fetch_one(
+        "SELECT contact_email FROM merchant_onboarding WHERE merchant_id = :m",
+        {"m": merchant_id},
+    )
+    to_email = (row and row["contact_email"] or "").strip()
+    if not to_email:
+        return
+    await _deliver_email(
+        to_email=to_email,
+        subject="Weekly AI-visibility re-audit skipped — not enough credits",
+        text_body=(
+            "Your weekly re-audit was skipped this week: it needs "
+            f"{required} credits and your balance is {available}. Nothing was "
+            "charged. Top up credits to resume: "
+            "https://merchant.pivota.cc/dashboard/billing\n\n"
+            "You get this because weekly re-audits are enabled for your "
+            "account. Turn them off any time from the AI visibility page."
+        ),
+        tags={"kind": "apm_skip", "merchant_id": merchant_id},
+    )
+
+
+async def _deliver_email(**kwargs: Any) -> None:
+    """send_email is sync (blocking requests.post) — run it off the loop, and
+    surface provider-level ok=False results in the log (review P2s)."""
+    import asyncio
+
+    from utils import email_sender
+
+    result = await asyncio.to_thread(email_sender.send_email, **kwargs)
+    ok = getattr(result, "ok", None)
+    if ok is False:
+        logger.warning(
+            "scheduled_audit_job: email send returned not-ok: %s",
+            getattr(result, "error", None) or result,
+        )
+
+
+async def _send_apm_digest_email(*, merchant_id: str, report: Any) -> None:
+    """Wave-3 B1: after a SCHEDULED re-audit, mail the merchant what changed.
+
+    Copy is built verbatim from the report's reaudit_delta (headline +
+    material movements) — the same honest layer the portal renders; nothing
+    is re-derived or embellished for the email. Env-flagged off by default;
+    silently skipped when the merchant has no contact email."""
+    if not _APM_DIGEST_EMAIL_ENABLED or not isinstance(report, dict):
+        return
+    from db.database import database
+
+    row = await database.fetch_one(
+        "SELECT contact_email FROM merchant_onboarding WHERE merchant_id = :m",
+        {"m": merchant_id},
+    )
+    to_email = (row and row["contact_email"] or "").strip()
+    if not to_email:
+        return
+    # Where the delta ACTUALLY lives (review round 2): the legacy shape the
+    # scheduled path produces attaches it PER PRODUCT at
+    # per_product[i].merchant_view.reaudit_delta — there is no top-level
+    # merchant_view. Per-SKU runs attach it top-level. Read all real sites,
+    # never re-derive.
+    deltas = _collect_reaudit_deltas(report)
+    single_headline = (
+        str(deltas[0][1].get("headline") or "").strip() if len(deltas) == 1 else ""
+    )
+    headline = single_headline or "Your scheduled AI-visibility re-audit finished."
+    lines = [headline, ""]
+    for title, delta in deltas:
+        for move in delta.get("movements") or []:
+            if not isinstance(move, dict) or not move.get("is_material"):
+                continue
+            arrow = "up" if move.get("direction") == "improved" else "down"
+            prefix = f"{title} · " if title and len(deltas) > 1 else ""
+            lines.append(
+                f"- {prefix}{move.get('label')}: "
+                f"{move.get('from')} -> {move.get('to')} ({arrow})"
+            )
+    if len(lines) == 2:
+        lines.append("- No material movement since your last audit.")
+    lines += [
+        "",
+        "Open the full report: https://merchant.pivota.cc/dashboard/agent-center/url-audit",
+        "",
+        "You get this because weekly re-audits are enabled for your account. "
+        "Turn them off any time from the AI visibility page.",
+    ]
+    await _deliver_email(
+        to_email=to_email,
+        subject="Your weekly AI-visibility check: " + headline[:80],
+        text_body="\n".join(lines),
+        tags={"kind": "apm_digest", "merchant_id": merchant_id},
+    )
 
 
 async def run_scheduled_audits() -> Dict[str, Any]:
