@@ -528,8 +528,12 @@ _SOV_COMPETITOR_CAP = 5
 # counting them inflates brand share while competitors are only ever named
 # on discovery prompts — apples-to-oranges. SoV = discovery prompts only,
 # same denominator both sides.
+# Raw wedge axes ('intent'/'review'/'price'/'brand'/'identity') + their
+# normalized intent names ('navigational'/'trust') — review note: this is a
+# hand list mirroring the branded set _scan_mode_for_query_spec keys off;
+# keep both in sync if the axis vocabulary grows.
 _SOV_BRANDED_AXES = frozenset(
-    {"intent", "review", "navigational", "trust", "branded_navigational", "nav"}
+    {"intent", "review", "price", "brand", "identity", "navigational", "trust"}
 )
 
 
