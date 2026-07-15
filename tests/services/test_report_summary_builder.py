@@ -1,0 +1,360 @@
+from __future__ import annotations
+
+from typing import Any, Dict
+
+from services.report_summary_builder import (
+    CONTRACT_VERSION,
+    build_report_summary,
+)
+
+
+def _sku_report(
+    *,
+    sku_key: str = "sku-1",
+    sku_title: str = "Hydra Serum",
+    headline: str = "Get Hydra Serum indexed so AI can find it.",
+    citation_score: int = 40,
+    routability_score: int = 20,
+    failing_prompts: Any = None,
+    evidence_chips: Any = None,
+) -> Dict[str, Any]:
+    nba: Dict[str, Any] = {
+        "primary_gap": "get_indexed",
+        "headline": headline,
+        "why_this_first": "It is not live in the AI surface yet.",
+        "first_move": "Get it live and crawlable.",
+        "evidence_summary": "Not indexed yet.",
+        "how_to_track": ["indexing status", "citation rate"],
+        "cta": {"label": "Get this product indexed", "target_sku_key": sku_key},
+        "evidence_used": {},
+    }
+    if evidence_chips is not None:
+        nba["evidence_used"]["failing_prompt_examples"] = evidence_chips
+    report: Dict[str, Any] = {
+        "sku_key": sku_key,
+        "sku_title": sku_title,
+        "scores": {
+            "citation": {"score": citation_score},
+            "routability": {"score": routability_score},
+        },
+        "band": "blocked",
+        "band_display": {
+            "band": "blocked",
+            "label": "Not yet visible",
+            "meaning": "AI cannot recommend this yet.",
+        },
+        "next_best_action": nba,
+    }
+    if failing_prompts is not None:
+        report["failing_prompts"] = failing_prompts
+    return report
+
+
+def _brand_report(**overrides: Any) -> Dict[str, Any]:
+    failing = [
+        {
+            "query": "best hydrating serum for dry skin",
+            "axis": "category_discovery",
+            "reason": "no first-party or correct-SKU grounded citation",
+            "provider": "gemini",
+            "evidence_run_id": "run-9",
+        },
+        {
+            "query": "hydra serum reviews",
+            "axis": "trust",
+            "reason": "no first-party or correct-SKU grounded citation",
+            "provider": "openai",
+            "evidence_run_id": "run-10",
+        },
+    ]
+    report: Dict[str, Any] = {
+        "audit_run_id": "audit-1",
+        "merchant_id": "m-1",
+        "merchant_name": "GlowLab",
+        "timestamp": "2026-07-15T00:00:00+00:00",
+        "audit_mode": "per_sku",
+        "providers": ["gemini", "openai"],
+        "verify_providers": ["deepseek"],
+        "per_sku_reports": [_sku_report(failing_prompts=failing)],
+        "brand_rollup": {
+            "brand_verdict_label": "Not yet recommended",
+            "run_scores": {
+                "avg_visibility": 42.0,
+                "avg_attribution": 30.0,
+                "avg_category_visibility": None,
+            },
+            "tracking": {
+                "history": {
+                    "most_recent_audit": {"run_id": "audit-0"},
+                    "delta_from_most_recent": {
+                        "visibility": 5,
+                        "days_since_last_audit": 14,
+                    },
+                }
+            },
+        },
+        "merchant_narrative": {
+            "headline_story": "GlowLab is invisible to AI shopping agents today.",
+            "verdict_label": "Not yet recommended",
+            "verdict_explanation": "No independent source cites the brand.",
+            "whats_working": {"summary": "Listed on amazon.com."},
+            "where_youre_losing": {
+                "summary": "No independent source recommends GlowLab.",
+                "independently_recommended_for_category": False,
+                "who_ai_cites_instead": {
+                    "available": True,
+                    "cited_hosts": [
+                        {"host": "byrdie.com", "prompts_cited_count": 3},
+                        {"host": "allure.com", "prompts_cited_count": 1},
+                    ],
+                    "competitors": [
+                        {"name": "CeraVe", "times_named": 2},
+                    ],
+                    "note": None,
+                },
+            },
+            "verify_summary_plain": {
+                "text": "We fact-checked 2 of 3 cited answers; 1 flagged.",
+                "flagged": 1,
+            },
+            "prioritized_actions": [
+                {
+                    "sku_title": "Hydra Serum",
+                    "primary_gap": "get_indexed",
+                    "headline": "Get Hydra Serum indexed so AI can find it.",
+                    "first_move": "Get it live and crawlable.",
+                    "why_this_first": "It is not live in the AI surface yet.",
+                    "growth_phase": "create_and_distribute",
+                },
+            ],
+            "honest_limits": ["Provider coverage: grounded on gemini, openai."],
+        },
+    }
+    report.update(overrides)
+    return report
+
+
+def test_contract_envelope_and_score_block():
+    out = build_report_summary(_brand_report())
+    assert out["contract_version"] == CONTRACT_VERSION
+    assert out["audit_run_id"] == "audit-1"
+    assert out["subject"] == {
+        "type": "brand",
+        "merchant_id": "m-1",
+        "merchant_name": "GlowLab",
+    }
+    score = out["score"]
+    assert score["raw"] == 42.0
+    assert score["display"] == 4.2  # one decimal, never int-rounded
+    assert score["scale_max"] == 10
+    assert score["band"] == "needs_work"
+    assert score["band_thresholds"] == [6.0, 7.5, 9.0]
+    # None subscores (category_visibility on per_sku runs) are omitted, not zeroed.
+    assert [s["key"] for s in score["subscores"]] == ["visibility", "attribution"]
+    assert score["delta"] == {
+        "raw": 5,
+        "previous_audit_run_id": "audit-0",
+        "days_since_last_audit": 14,
+    }
+
+
+def test_display_score_preserves_small_deltas():
+    low = build_report_summary(
+        _brand_report(
+            brand_rollup={"run_scores": {"avg_visibility": 42.0}},
+        )
+    )
+    high = build_report_summary(
+        _brand_report(
+            brand_rollup={"run_scores": {"avg_visibility": 47.0}},
+        )
+    )
+    assert low["score"]["display"] == 4.2
+    assert high["score"]["display"] == 4.7
+
+
+def test_verdict_reuses_narrative_verbatim():
+    out = build_report_summary(_brand_report())
+    verdict = out["verdict"]
+    assert verdict["headline"] == (
+        "GlowLab is invisible to AI shopping agents today."
+    )
+    assert verdict["label"] == "Not yet recommended"
+    assert verdict["primary_gap"] == "get_indexed"
+
+
+def test_top_actions_carry_supporting_prompts_via_real_join():
+    out = build_report_summary(_brand_report())
+    actions = out["top_actions"]
+    assert len(actions) == 1
+    action = actions[0]
+    assert action["headline"] == "Get Hydra Serum indexed so AI can find it."
+    assert action["target_sku_key"] == "sku-1"
+    assert action["supporting_prompts_basis"] == "evidence_used"
+    assert [p["query"] for p in action["supporting_prompts"]] == [
+        "best hydrating serum for dry skin",
+        "hydra serum reviews",
+    ]
+    assert action["supporting_prompts"][0]["axis"] == "category_discovery"
+    assert action["supporting_prompts"][0]["evidence_run_id"] == "run-9"
+
+
+def test_action_evidence_chips_preferred_over_sku_failing_prompts():
+    chips = [
+        {
+            "query": "best serum with hyaluronic acid",
+            "reason": "no first-party citation",
+            "provider": "gemini",
+            "competitors_named": ["CeraVe"],
+        }
+    ]
+    report = _brand_report()
+    report["per_sku_reports"] = [
+        _sku_report(
+            failing_prompts=report["per_sku_reports"][0]["failing_prompts"],
+            evidence_chips=chips,
+        )
+    ]
+    out = build_report_summary(report)
+    prompts = out["top_actions"][0]["supporting_prompts"]
+    assert [p["query"] for p in prompts] == ["best serum with hyaluronic acid"]
+    assert prompts[0]["competitors_named"] == ["CeraVe"]
+
+
+def test_no_join_means_no_prompts_never_inferred():
+    report = _brand_report()
+    report["per_sku_reports"] = [_sku_report(failing_prompts=[])]
+    out = build_report_summary(report)
+    action = out["top_actions"][0]
+    assert action["supporting_prompts"] == []
+    assert action["supporting_prompts_basis"] == "none"
+
+
+def test_supporting_prompts_capped_at_three():
+    failing = [
+        {"query": f"query {i}", "axis": "intent", "provider": "gemini"}
+        for i in range(5)
+    ]
+    report = _brand_report()
+    report["per_sku_reports"] = [_sku_report(failing_prompts=failing)]
+    out = build_report_summary(report)
+    assert len(out["top_actions"][0]["supporting_prompts"]) == 3
+
+
+def test_actions_capped_and_truncation_disclosed():
+    report = _brand_report()
+    actions = [
+        {
+            "sku_title": f"SKU {i}",
+            "primary_gap": "get_indexed",
+            "headline": f"Action {i}",
+        }
+        for i in range(5)
+    ]
+    report["merchant_narrative"]["prioritized_actions"] = actions
+    out = build_report_summary(report)
+    assert len(out["top_actions"]) == 3
+    assert out["meta"]["actions_total"] == 5
+
+
+def test_top_findings_map_narrative_sections():
+    out = build_report_summary(_brand_report())
+    findings = out["top_findings"]
+    assert [f["kind"] for f in findings] == [
+        "independent_endorsement",
+        "findability",
+        "answer_quality",
+    ]
+    # Not category-endorsed → the losing finding is high severity; one flagged
+    # verify answer → answer-quality is medium.
+    assert findings[0]["severity"] == "high"
+    assert findings[2]["severity"] == "medium"
+    assert findings[0]["evidence_summary"] == (
+        "No independent source recommends GlowLab."
+    )
+
+
+def test_competitive_snapshot_hosts_and_competitors():
+    out = build_report_summary(_brand_report())
+    snapshot = out["competitive_snapshot"]
+    assert snapshot["available"] is True
+    assert snapshot["top_cited_hosts"] == ["byrdie.com", "allure.com"]
+    assert snapshot["competitors_named"] == ["CeraVe"]
+
+
+def test_sku_summary_uses_weakest_dimension():
+    out = build_report_summary(_brand_report())
+    sku = out["sku_summaries"][0]
+    # citation 40, routability 20 → overall = min = 20 (mirrors _overall_score).
+    assert sku["score"]["raw"] == 20
+    assert sku["score"]["display"] == 2.0
+    assert sku["score"]["band"] == "needs_work"
+    assert sku["band_display"]["label"] == "Not yet visible"
+    assert sku["action_headline"] == (
+        "Get Hydra Serum indexed so AI can find it."
+    )
+
+
+def test_empty_report_degrades_without_raising():
+    out = build_report_summary({})
+    assert out["contract_version"] == CONTRACT_VERSION
+    assert out["score"]["raw"] is None
+    assert out["score"]["display"] is None
+    assert out["score"]["band"] is None
+    assert out["top_findings"] == []
+    assert out["top_actions"] == []
+    assert out["sku_summaries"] == []
+    assert out["verdict"]["headline"] is None
+    assert out["competitive_snapshot"]["available"] is False
+
+
+def test_malformed_sections_degrade_without_raising():
+    out = build_report_summary(
+        {
+            "merchant_narrative": "not-a-dict",
+            "brand_rollup": ["not", "a", "dict"],
+            "per_sku_reports": [None, "junk", {"scores": "junk"}],
+        }
+    )
+    assert out["top_actions"] == []
+    assert len(out["sku_summaries"]) == 1  # only the dict entry survives
+    assert out["sku_summaries"][0]["score"]["raw"] is None
+
+
+def test_band_boundaries():
+    def band_of(raw: float) -> str:
+        return build_report_summary(
+            _brand_report(brand_rollup={"run_scores": {"avg_visibility": raw}})
+        )["score"]["band"]
+
+    assert band_of(59.9) == "needs_work"
+    assert band_of(60.0) == "pass"
+    assert band_of(75.0) == "good"
+    assert band_of(90.0) == "excellent"
+
+
+def test_meta_disclosures():
+    out = build_report_summary(_brand_report())
+    meta = out["meta"]
+    assert meta["products_audited"] == 1
+    assert meta["providers"] == ["gemini", "openai"]
+    assert meta["honest_limits"] == [
+        "Provider coverage: grounded on gemini, openai."
+    ]
+
+
+def test_shape_url_audit_response_attaches_report_summary():
+    from routes.merchant_audit_routes import _shape_url_audit_response
+
+    row = {
+        "run_id": "r1",
+        "report_jsonb": _brand_report(),
+        "partial_result_jsonb": {},
+    }
+    out = _shape_url_audit_response(row)
+    summary = out["report_summary"]
+    assert summary["contract_version"] == CONTRACT_VERSION
+    assert summary["subject"]["type"] == "brand"
+    # Dark + additive: the existing envelope keys are untouched.
+    assert out["status"] == "succeeded"
+    assert out["per_sku_reports"] == _brand_report()["per_sku_reports"]

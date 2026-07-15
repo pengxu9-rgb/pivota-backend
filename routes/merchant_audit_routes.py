@@ -92,6 +92,7 @@ from services.merchant_credit_balance_service import (
     InsufficientCreditsError,
     get_balance,
 )
+from services.report_summary_builder import build_report_summary
 from services.llm_providers.deepseek_probe import (
     DeepseekProbeError,
     answer_grounded_question,
@@ -1389,6 +1390,15 @@ def _shape_url_audit_response(row: Dict[str, Any]) -> Dict[str, Any]:
     if isinstance(base, dict):
         for key, value in base.items():
             out.setdefault(key, value)
+
+    # Report Summary Contract v1 (dark, additive) — the condensed layer the
+    # 3-page portal view / PPT export / homepage hero will consume. No
+    # renderer reads it yet; a build failure must never sink the response.
+    try:
+        out["report_summary"] = build_report_summary(report)
+    except Exception:  # noqa: BLE001
+        logger.warning("report_summary build failed", exc_info=True)
+        out["report_summary"] = None
 
     # Honest coverage: overwrite the static planned budget in the persisted
     # methodology with what the providers ACTUALLY ran (read from the per-SKU
