@@ -27,7 +27,10 @@ from db.merchant_onboarding import get_merchant_onboarding
 from routes.payment_execution_routes import verify_merchant_api_key
 from services.activation_event_service import activate_brands_for_merchant
 from services.billing import monthly_brand_statements_service
-from services.merchant_store_service import get_primary_store, parse_api_credentials
+from services.merchant_store_service import (
+    get_merchant_active_stores,
+    parse_api_credentials,
+)
 from utils.auth import decode_token, get_current_merchant, optional_security
 from utils.logger import logger
 
@@ -152,11 +155,22 @@ async def _merchant_is_billing_free(merchant_id: str) -> bool:
     if merchant_id in _billing_exempt_merchant_ids():
         return True
     try:
-        store = await get_primary_store(merchant_id)
+        stores = await get_merchant_active_stores(merchant_id)
     except Exception:
-        store = None
-    if store:
-        creds = parse_api_credentials(str(store.get("api_key") or ""))
+        stores = []
+    # Exempt when ANY connected store was installed via the App Store, not just the
+    # "primary" one — a merchant who already had a store and then installs App A
+    # must still be billed only through Shopify.
+    #
+    # NOTE: get_merchant_active_stores() rewrites each row's `api_key` to the bare
+    # access token and keeps the original JSON blob (which is where install_source
+    # lives) in `api_key_raw`. Parse the raw blob, not the token, or the source is
+    # always lost and no App Store merchant is ever exempt.
+    for store in stores or []:
+        raw = store.get("api_key_raw")
+        if raw is None:
+            raw = store.get("api_key")
+        creds = parse_api_credentials(str(raw or ""))
         if isinstance(creds, dict) and str(creds.get("install_source") or "").strip().lower() == "app_store":
             return True
     return False
