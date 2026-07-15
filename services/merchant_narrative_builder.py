@@ -477,9 +477,37 @@ _WEAK_SIGNAL_NOTE = (
 )
 
 
+def _losing_queries_by_host(win_plan: Optional[Dict[str, Any]]) -> Dict[str, List[str]]:
+    """Invert the win plan's query->grounds_in join: for each independent
+    host, the LOSING category queries whose grounded answers cited it. This is
+    the measured 'why pitch this host' evidence the outreach moves carry —
+    real probe outcomes, never inferred."""
+    by_host: Dict[str, List[str]] = {}
+    if not isinstance(win_plan, dict) or not win_plan.get("available"):
+        return by_host
+    for plan in win_plan.get("sku_plans") or []:
+        if not isinstance(plan, dict):
+            continue
+        for lq in plan.get("losing_queries") or []:
+            if not isinstance(lq, dict):
+                continue
+            query = str(lq.get("query") or "").strip()
+            if not query:
+                continue
+            for target in lq.get("grounds_in") or []:
+                host = str((target or {}).get("host") or "").strip().lower()
+                if not host:
+                    continue
+                bucket = by_host.setdefault(host, [])
+                if query not in bucket:
+                    bucket.append(query)
+    return by_host
+
+
 def _outreach_moves(
     who: Dict[str, Any],
     endorsement_hosts: Optional[List[str]] = None,
+    losing_queries_by_host: Optional[Dict[str, List[str]]] = None,
 ) -> List[Dict[str, Any]]:
     """Turn the 'who AI cites instead' hosts into concrete off-platform moves —
     no connected store required. Each host is classified (editorial / retailer /
@@ -570,6 +598,14 @@ def _outreach_moves(
             "already_endorses_you": already_endorses,
             "headline": f"{'Build on' if already_endorses else verb} {host}",
             "why": why,
+            # The measured reason to work this host: the losing category
+            # queries whose grounded answers cited it (win-plan join). [] when
+            # the win plan grounded no losing query here — the move still
+            # stands on prompts_cited_count/why, but carries no query list
+            # rather than an inferred one.
+            "losing_queries": (losing_queries_by_host or {}).get(
+                host.strip().lower(), []
+            )[:3],
             # Reframe the action to what's actually doable: extend-the-win for
             # hosts that already endorse you, review-building for review
             # aggregators, the indirect path for major publishers (don't tell a
@@ -816,7 +852,11 @@ def _where_youre_losing(
         # all_endorsement_hosts keeps a host that already independently recommends
         # the merchant — on branded OR category queries — from being framed as
         # "recommends a competitor over you".
-        "outreach_moves": _outreach_moves(who, endorsement_hosts=all_endorsement_hosts),
+        "outreach_moves": _outreach_moves(
+            who,
+            endorsement_hosts=all_endorsement_hosts,
+            losing_queries_by_host=_losing_queries_by_host(win_plan),
+        ),
         # Cited hosts that _outreach_moves correctly refuses to pitch because a
         # rival owns them — surfaced rather than silently dropped, so "why do the
         # roundups never include me?" has an honest answer.

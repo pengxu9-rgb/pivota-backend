@@ -215,6 +215,15 @@ _WHAT_SHOULD_I_BUY_RE = re.compile(
 _LLM_PROMPT_SOURCES = {"llm_winnable", "llm_scenario"}
 
 
+def is_broad_head_query(query: str, *, prompt_source: Any = None) -> bool:
+    """Public alias: True for broad head terms ("best headphones", "what X
+    should I buy") that big-budget brands own. Spec-matched LLM-generated
+    prompts (llm_winnable/llm_scenario) are exempt by construction. The
+    report-summary evidence selector shares this ONE classifier so "what we
+    showcase" and "what the win plan targets" can never disagree."""
+    return _is_broad_head_query(query, prompt_source=prompt_source)
+
+
 def _is_broad_head_query(query: str, *, prompt_source: Any = None) -> bool:
     if str(prompt_source or "").strip().lower() in _LLM_PROMPT_SOURCES:
         return False

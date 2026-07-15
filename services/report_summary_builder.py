@@ -20,7 +20,12 @@ prompt-level evidence when a real join exists —
 
 from typing import Any, Dict, List, Mapping, Optional, Tuple
 
-CONTRACT_VERSION = "1.0"
+from services.win_plan_builder import is_broad_head_query
+
+# 1.1: supporting-prompt selection is niche-first (broad head terms are only
+# shown when they are literally all that was measured) + rows carry
+# prompt_source so renderers can badge spec-matched evidence.
+CONTRACT_VERSION = "1.1"
 
 # Display banding on the 0-100 raw scale, mirrored onto the 0-10 display
 # ("6 = pass"). Anchor calibration is an OPEN decision (contract doc §7) —
@@ -125,6 +130,7 @@ def _prompt_evidence(entry: Any) -> Optional[Dict[str, Any]]:
         "reason",
         "evidence_run_id",
         "competitors_named",
+        "prompt_source",
     ):
         value = row.get(key)
         if value not in (None, "", []):
@@ -152,8 +158,25 @@ def _supporting_prompts(
             if p
         ]
         if prompts:
-            return prompts[:_SUPPORTING_PROMPTS_CAP], "evidence_used"
+            return _niche_first(prompts)[:_SUPPORTING_PROMPTS_CAP], "evidence_used"
     return [], "none"
+
+
+def _niche_first(prompts: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """Never showcase broad head terms ("best headphones") as an action's
+    evidence while spec-matched losses exist: mid/long-tail brands win NICHE
+    prompts that match their product's attributes — head terms are big-budget
+    turf. Shares the win plan's classifier (one definition of "head"). Head
+    rows survive only when they are literally all that was measured — some
+    honest evidence beats none."""
+    niche = [
+        p
+        for p in prompts
+        if not is_broad_head_query(
+            p.get("query"), prompt_source=p.get("prompt_source")
+        )
+    ]
+    return niche if niche else prompts
 
 
 def _match_sku_report(

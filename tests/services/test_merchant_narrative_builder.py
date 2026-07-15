@@ -1001,3 +1001,66 @@ def test_outreach_and_pitch_targets_agree_on_endorser_status():
     pitch = {t["host"]: t for t in where["pitch_targets"]}
     for host in ("wirecutter.com", "rtings.com"):
         assert pitch[host]["status"] == "already_endorses_you", host
+
+
+def test_outreach_moves_carry_losing_query_evidence():
+    """Get-cited moves carry the MEASURED reason to work each host: the losing
+    category queries whose grounded answers cited it (win-plan join, inverted).
+    Hosts the win plan never grounded get [] — never an inferred list."""
+    from services.merchant_narrative_builder import (
+        _losing_queries_by_host,
+        _outreach_moves,
+    )
+
+    win_plan = {
+        "available": True,
+        "sku_plans": [
+            {
+                "losing_queries": [
+                    {
+                        "query": "waterproof mp3 headphones for lap swimming",
+                        "grounds_in": [{"host": "Rtings.com"}, {"host": "techradar.com"}],
+                    },
+                    {
+                        "query": "open ear headphones for triathlon training",
+                        "grounds_in": [{"host": "rtings.com"}],
+                    },
+                ]
+            }
+        ],
+    }
+    by_host = _losing_queries_by_host(win_plan)
+    assert by_host["rtings.com"] == [
+        "waterproof mp3 headphones for lap swimming",
+        "open ear headphones for triathlon training",
+    ]
+
+    who = {
+        "cited_hosts": [
+            {
+                "host": "rtings.com",
+                "citation_role": "editorial_review",
+                "recommendation_class": "recommends",
+                "prompts_cited_count": 3,
+                "cited_on_category_query": True,
+                "competitors_named": ["Shokz"],
+            },
+            {
+                "host": "coachweb.com",
+                "citation_role": "editorial_review",
+                "recommendation_class": "recommends",
+                "prompts_cited_count": 1,
+                "cited_on_category_query": False,
+                "competitors_named": [],
+            },
+        ],
+        "competitors": [],
+        "available": True,
+    }
+    moves = _outreach_moves(who, losing_queries_by_host=by_host)
+    by_move_host = {m["host"]: m for m in moves}
+    assert by_move_host["rtings.com"]["losing_queries"] == [
+        "waterproof mp3 headphones for lap swimming",
+        "open ear headphones for triathlon training",
+    ]
+    assert by_move_host["coachweb.com"]["losing_queries"] == []

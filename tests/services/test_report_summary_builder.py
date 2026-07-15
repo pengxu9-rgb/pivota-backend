@@ -433,3 +433,53 @@ def test_get_run_summary_only_returns_slim_payload():
     assert out["report_summary"]["contract_version"] == CONTRACT_VERSION
     # The heavy keys must NOT ride along on the homepage-hero path.
     assert "per_sku_reports" not in out and "brand_report" not in out
+
+
+def test_supporting_prompts_prefer_niche_over_head_terms():
+    # Strategy guard (partner feedback): mid/long-tail brands win spec-matched
+    # niche prompts — broad head terms must never be showcased as an action's
+    # evidence while niche losses exist.
+    failing = [
+        {"query": "best headphones", "provider": "gemini"},
+        {"query": "what headphones should I buy", "provider": "gemini"},
+        {
+            "query": "bone conduction headphones open-ear no water trapped daily sports",
+            "provider": "gemini",
+            "axis": "constraint",
+        },
+    ]
+    report = _brand_report()
+    report["per_sku_reports"] = [_sku_report(failing_prompts=failing)]
+    out = build_report_summary(report)
+    prompts = out["top_actions"][0]["supporting_prompts"]
+    assert [p["query"] for p in prompts] == [
+        "bone conduction headphones open-ear no water trapped daily sports"
+    ]
+
+
+def test_supporting_prompts_head_only_still_shows_honest_evidence():
+    failing = [
+        {"query": "best headphones", "provider": "gemini"},
+        {"query": "top earbuds", "provider": "openai"},
+    ]
+    report = _brand_report()
+    report["per_sku_reports"] = [_sku_report(failing_prompts=failing)]
+    out = build_report_summary(report)
+    prompts = out["top_actions"][0]["supporting_prompts"]
+    # All-head loss is still the measured truth — shown rather than hidden.
+    assert [p["query"] for p in prompts] == ["best headphones", "top earbuds"]
+
+
+def test_spec_matched_prompt_source_exempts_short_queries():
+    # A short llm_winnable prompt is spec-matched by construction — the
+    # generator stamp, not query length, decides.
+    failing = [
+        {"query": "best headphones", "provider": "gemini"},
+        {"query": "best swim mp3", "provider": "gemini", "prompt_source": "llm_winnable"},
+    ]
+    report = _brand_report()
+    report["per_sku_reports"] = [_sku_report(failing_prompts=failing)]
+    out = build_report_summary(report)
+    prompts = out["top_actions"][0]["supporting_prompts"]
+    assert [p["query"] for p in prompts] == ["best swim mp3"]
+    assert prompts[0]["prompt_source"] == "llm_winnable"
