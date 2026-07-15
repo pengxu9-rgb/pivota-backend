@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from services.audit_delta import build_reaudit_delta
+from services.audit_delta import build_reaudit_delta, measurement_basis_between
 
 
 def _report(
@@ -275,6 +275,48 @@ def test_tracked_metric_results_map_only_stored_signals():
     checkout = _metric(delta, "Checkout starts")
     assert checkout["status"] == "not_measurable"
     assert "not stored" in checkout["note"]
+
+
+def test_measurement_basis_between_matches_build_reaudit_delta():
+    """The standalone basis wrapper must agree with build_reaudit_delta for
+    the same report pair — it exists so per-SKU consumers can gate query-level
+    claims without the score-delta layer."""
+    prior = _report(prompt_basis={"selected_set_id": "sel_abc"})
+    current = _report(prompt_basis={"selected_set_id": "sel_abc"})
+
+    delta = build_reaudit_delta(
+        current_report=current,
+        prior_report=prior,
+        prior_row={"run_id": "prior"},
+        days_since=7,
+    )
+
+    assert measurement_basis_between(current, prior) == delta["measurement_basis"]
+    assert measurement_basis_between(current, prior)["same"] is True
+
+
+def test_measurement_basis_between_reads_per_sku_reports_shape():
+    """Per-SKU brand reports carry prompt_basis on per_sku_reports rows, not
+    at the root — the wrapper must resolve it there (same tolerance as
+    build_reaudit_delta's _prompt_set_id)."""
+    prior = {
+        "per_sku_reports": [{"prompt_basis": {"selected_set_id": "sel_w2"}}]
+    }
+    current = {
+        "per_sku_reports": [{"prompt_basis": {"selected_set_id": "sel_w2"}}]
+    }
+
+    assert measurement_basis_between(current, prior)["same"] is True
+    changed = {
+        "per_sku_reports": [{"prompt_basis": {"selected_set_id": "sel_new"}}]
+    }
+    assert measurement_basis_between(changed, prior)["same"] is False
+
+
+def test_measurement_basis_between_none_prior_is_baseline():
+    basis = measurement_basis_between(_report(), None)
+    assert basis["same"] is None
+    assert "establishes the measurement basis" in basis["note"]
 
 
 def test_full_brand_report_shape_uses_first_per_product_report():
