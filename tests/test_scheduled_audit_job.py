@@ -495,3 +495,58 @@ async def test_re_audit_merchant_releases_lock_when_body_raises(monkeypatch):
     assert releases == ["merch_alpha"], (
         "Lock release must fire even when the locked body raises"
     )
+
+
+def test_apm_digest_email_builds_from_reaudit_delta(monkeypatch):
+    """Wave-3 B1: digest content comes verbatim from reaudit_delta (either
+    shape), sends only when flagged + a contact email exists."""
+    import asyncio
+    import jobs.scheduled_audit_job as job
+
+    sent = {}
+
+    def fake_send_email(**kw):
+        sent.update(kw)
+
+    class FakeDB:
+        async def fetch_one(self, *_a, **_k):
+            return {"contact_email": "owner@brand.com"}
+
+    monkeypatch.setattr(job, "_APM_DIGEST_EMAIL_ENABLED", True)
+    import utils.email_sender as es
+    monkeypatch.setattr(es, "send_email", fake_send_email)
+    import db.database as dbmod
+    monkeypatch.setattr(dbmod, "database", FakeDB())
+
+    report = {
+        "merchant_view": {
+            "reaudit_delta": {
+                "headline": "Visibility improved materially since your last audit.",
+                "movements": [
+                    {"label": "AI visibility", "from": 20, "to": 33,
+                     "is_material": True, "direction": "improved"},
+                    {"label": "Attribution", "from": 46, "to": 47,
+                     "is_material": False, "direction": "stable"},
+                ],
+            }
+        }
+    }
+    asyncio.run(job._send_apm_digest_email(merchant_id="m-1", report=report))
+    assert sent["to_email"] == "owner@brand.com"
+    assert "Visibility improved materially" in sent["subject"]
+    body = sent["text_body"]
+    assert "AI visibility: 20 -> 33 (up)" in body
+    assert "Attribution" not in body  # immaterial movements stay out
+    assert "Turn them off any time" in body
+
+
+def test_apm_digest_email_disabled_by_default(monkeypatch):
+    import asyncio
+    import jobs.scheduled_audit_job as job
+
+    called = {}
+    import utils.email_sender as es
+    monkeypatch.setattr(es, "send_email", lambda **kw: called.update(kw))
+    # flag left at default (False) -> no DB hit, no send
+    asyncio.run(job._send_apm_digest_email(merchant_id="m-1", report={"reaudit_delta": {}}))
+    assert called == {}

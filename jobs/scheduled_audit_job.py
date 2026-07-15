@@ -27,6 +27,7 @@ Out of scope for PR-1b (defer to PR-1c if needed):
 from __future__ import annotations
 
 import asyncio
+import os
 import logging
 from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, List, Optional
@@ -412,6 +413,13 @@ async def _re_audit_merchant_locked(
             exc,
         )
     summary["status"] = "succeeded"
+    # Wave-3 B1: change-digest email (env-flagged, best-effort — a mail
+    # failure must never mark the audit errored). Content = the same
+    # reaudit_delta the report attaches: honest movements, no re-derivation.
+    try:
+        await _send_apm_digest_email(merchant_id=merchant_id, report=out)
+    except Exception:  # noqa: BLE001
+        logger.warning("apm digest email failed for %s", merchant_id, exc_info=True)
     summary["run_id"] = run_id
     summary["visibility"] = agg.get("avg_visibility")
     summary["attribution"] = agg.get("avg_attribution")
@@ -446,6 +454,63 @@ def _extract_products_from_prior_report(
             "product_type": product.get("product_type"),
         })
     return out
+
+
+_APM_DIGEST_EMAIL_ENABLED = (
+    os.getenv("APM_DIGEST_EMAIL_ENABLED", "false").strip().lower() == "true"
+)
+
+
+async def _send_apm_digest_email(*, merchant_id: str, report: Any) -> None:
+    """Wave-3 B1: after a SCHEDULED re-audit, mail the merchant what changed.
+
+    Copy is built verbatim from the report's reaudit_delta (headline +
+    material movements) — the same honest layer the portal renders; nothing
+    is re-derived or embellished for the email. Env-flagged off by default;
+    silently skipped when the merchant has no contact email."""
+    if not _APM_DIGEST_EMAIL_ENABLED or not isinstance(report, dict):
+        return
+    from db.database import database
+    from utils.email_sender import send_email
+
+    row = await database.fetch_one(
+        "SELECT contact_email FROM merchant_onboarding WHERE merchant_id = :m",
+        {"m": merchant_id},
+    )
+    to_email = (row and row["contact_email"] or "").strip()
+    if not to_email:
+        return
+    # Scheduled runs produce the legacy shape (delta under merchant_view);
+    # per-SKU runs attach it top-level. Read both, never re-derive.
+    delta = (
+        report.get("reaudit_delta")
+        or (report.get("merchant_view") or {}).get("reaudit_delta")
+        or {}
+    )
+    headline = str(delta.get("headline") or "Your scheduled AI-visibility re-audit finished.")
+    lines = [headline, ""]
+    for move in (delta.get("movements") or []):
+        if not isinstance(move, dict) or not move.get("is_material"):
+            continue
+        arrow = "up" if move.get("direction") == "improved" else "down"
+        lines.append(
+            f"- {move.get('label')}: {move.get('from')} -> {move.get('to')} ({arrow})"
+        )
+    if len(lines) == 2:
+        lines.append("- No material movement since your last audit.")
+    lines += [
+        "",
+        "Open the full report: https://merchant.pivota.cc/dashboard/agent-center/url-audit",
+        "",
+        "You get this because weekly re-audits are enabled for your account. "
+        "Turn them off any time from the AI visibility page.",
+    ]
+    send_email(
+        to_email=to_email,
+        subject="Your weekly AI-visibility check: " + headline[:80],
+        text_body="\n".join(lines),
+        tags={"kind": "apm_digest", "merchant_id": merchant_id},
+    )
 
 
 async def run_scheduled_audits() -> Dict[str, Any]:
