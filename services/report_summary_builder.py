@@ -414,14 +414,23 @@ def _top_findings(narrative: Mapping[str, Any]) -> List[Dict[str, Any]]:
     findings: List[Dict[str, Any]] = []
     losing = _as_dict(narrative.get("where_youre_losing"))
     if losing.get("summary"):
+        # Title must match the content: when the brand IS independently
+        # recommended, the summary line is endorsement-plus-open-losses —
+        # filing it under "Who AI recommends instead" made a win read as a
+        # loss headline (holistic review 2026-07-16).
+        endorsed = bool(losing.get("independently_recommended_for_category"))
         findings.append(
             {
                 "finding_id": None,
                 "kind": "independent_endorsement",
-                "title": "Who AI recommends instead",
+                "title": (
+                    "Independent endorsement — and what it doesn't cover yet"
+                    if endorsed
+                    else "Who AI recommends instead"
+                ),
                 "severity": (
                     "info"
-                    if losing.get("independently_recommended_for_category")
+                    if endorsed
                     else "high"
                 ),
                 "evidence_summary": losing.get("summary"),

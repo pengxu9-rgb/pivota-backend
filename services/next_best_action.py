@@ -601,11 +601,16 @@ def _sku_prescription_for_gap(
             # attribute-stacked probe spec reads like the SKU title reworded,
             # and "add a FAQ that answers <your own title>" confused the
             # exact merchant this reframe is for.
-            _basis = [
+            _basis_all = [
                 str(b).strip()
                 for b in (beachhead.get("attribute_basis") or [])
                 if str(b or "").strip()
             ]
+            # Phrase length cap: an attribute item can be a whole clause
+            # ("no ear pressure no water trapped in ears") — prefer the
+            # short, name-like attributes for the lane phrase and skip
+            # clause-length ones while shorter alternatives exist.
+            _basis = [b for b in _basis_all if len(b) <= 32] or _basis_all[:1]
             lane_phrase = (
                 f"the {', '.join(_basis[:3])} ask"
                 if _basis
