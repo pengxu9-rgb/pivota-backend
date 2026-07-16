@@ -536,6 +536,62 @@ def build_report_deck(
                 ev.append(("  ·  ".join(bits), 12, False, _MUTED, 2))
             text_box(slide, 0.9, 5.3, 11.5, 1.7, ev)
 
+    # ── Where to earn citations: the off-platform channel moves. ───────────
+    cited_moves = [
+        _as_dict(m) for m in _as_list(summary.get("get_cited_moves"))
+        if _as_dict(m).get("host")
+    ]
+    if cited_moves:
+        slide = add_slide()
+        text_box(slide, 0.9, 0.6, 11.5, 0.8, [("Where to earn citations", 34, True, _NAVY, 0)])
+        text_box(
+            slide, 0.9, 1.4, 11.5, 0.5,
+            [("AI recommends independent sources, not your own page. These are the ones it "
+              "grounds on for your category — earn a mention on each.", 13, False, _MUTED, 0)],
+        )
+        y = 2.15
+        for m in cited_moves[:5]:
+            host = str(m.get("host") or "")
+            verb = "Build on" if m.get("already_endorses_you") else "Pitch"
+            qs = [str(q) for q in _as_list(m.get("for_questions")) if q]
+            head = f"{verb} {host}"
+            if qs:
+                head += f"  —  for “{qs[0]}”" + (f" +{len(qs)-1}" if len(qs) > 1 else "")
+            text_box(slide, 0.9, y, 11.5, 0.4, [(head, 16, True, _INK, 2)])
+            why = str(m.get("first_move") or m.get("why") or "").strip()
+            if why:
+                text_box(slide, 1.2, y + 0.4, 11.2, 0.5, [(why[:150], 12, False, _MUTED, 0)])
+            y += 1.0
+            if y > 6.6:
+                break
+
+    # ── Lanes you can win: the specific winnable demand. ───────────────────
+    lanes = [
+        _as_dict(l) for l in _as_list(summary.get("winnable_lanes"))
+        if _as_dict(l).get("query")
+    ]
+    if lanes:
+        slide = add_slide()
+        text_box(slide, 0.9, 0.6, 11.5, 0.8, [("Lanes you can win", 34, True, _NAVY, 0)])
+        text_box(
+            slide, 0.9, 1.4, 11.5, 0.5,
+            [("Specific shopper questions you're positioned to own — not the big-budget head "
+              "terms. Win these first; each is tracked week over week.", 13, False, _MUTED, 0)],
+        )
+        y = 2.15
+        _path_label = {"own_content": "Win with your own page", "publisher": "Get cited on a publisher"}
+        for l in lanes[:5]:
+            q = str(l.get("query") or "")
+            text_box(slide, 0.9, y, 11.5, 0.4, [(f"“{q}”", 16, True, _INK, 2)])
+            path = _path_label.get(str(l.get("win_path") or ""), "")
+            hosts = [str(h) for h in _as_list(l.get("target_hosts")) if h]
+            tail = path + (("  ·  via " + ", ".join(hosts[:3])) if hosts else "")
+            if tail:
+                text_box(slide, 1.2, y + 0.4, 11.2, 0.4, [(tail, 12, False, _MUTED, 0)])
+            y += 0.92
+            if y > 6.6:
+                break
+
     # ── Per-product scorecard (multi-SKU only). ─────────────────────────────
     sku_rows = [
         s for s in (_as_dict(x) for x in _as_list(summary.get("sku_summaries")))

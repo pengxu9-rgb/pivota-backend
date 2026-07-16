@@ -802,3 +802,47 @@ def test_evidence_play_spec_claims_and_checklist():
     assert fa["query"].startswith("are purra swim")
     assert fa["why"] == "the answer couldn't support recommending you"
     assert "substantiated reason" in fa["note"]
+
+
+def test_get_cited_moves_and_winnable_lanes_in_contract():
+    """The full move inventory (off-platform channels + winnable lanes) reaches
+    the contract, head-gated, so the deck can show the whole plan (2026-07-16)."""
+    from services.report_summary_builder import _get_cited_moves, _winnable_lanes
+
+    narrative = {
+        "where_youre_losing": {
+            "outreach_moves": [
+                {"host": "swimswam.com", "headline": "Pitch swimswam.com",
+                 "losing_queries": ["what headphones are good for lap swimming workouts?",
+                                    "best headphones"]},  # head one is gated out
+                {"host": "rtings.com", "already_endorses_you": True,
+                 "losing_queries": ["best headphones"]},  # head-only → no question shown
+            ],
+        },
+    }
+    moves = _get_cited_moves(narrative)
+    assert [m["host"] for m in moves] == ["swimswam.com", "rtings.com"]
+    assert moves[0]["for_questions"] == ["what headphones are good for lap swimming workouts?"]
+    assert moves[1]["for_questions"] == []  # "best headphones" head-gated
+    assert moves[1]["already_endorses_you"] is True
+
+    report = {
+        "win_plan": {
+            "available": True,
+            "sku_plans": [{
+                "losing_queries": [
+                    {"query": "ip68 headphones for swimmers", "win_path": "own_content",
+                     "broad_head_prompt": False, "grounds_in": []},
+                    {"query": "best headphones", "win_path": "publisher",
+                     "broad_head_prompt": True, "grounds_in": [{"host": "rtings.com"}]},
+                    {"query": "lap swim headphones", "win_path": "publisher",
+                     "broad_head_prompt": False, "grounds_in": [{"host": "swimswam.com"}]},
+                ],
+            }],
+        },
+    }
+    lanes = _winnable_lanes(report)
+    # head term excluded; specific lanes kept with path + hosts
+    assert [l["query"] for l in lanes] == ["ip68 headphones for swimmers", "lap swim headphones"]
+    assert lanes[1]["win_path"] == "publisher"
+    assert lanes[1]["target_hosts"] == ["swimswam.com"]

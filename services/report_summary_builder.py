@@ -520,6 +520,75 @@ def _competitive_snapshot(narrative: Mapping[str, Any]) -> Dict[str, Any]:
     }
 
 
+_MOVES_CAP = 5
+
+
+def _get_cited_moves(narrative: Mapping[str, Any]) -> List[Dict[str, Any]]:
+    """The off-platform citation moves the report already computed (pitch these
+    independent sources AI grounds on) — condensed for the contract so the deck
+    and any consumer surface the FULL move inventory, not just the 1-3 NBA
+    actions. Order is the narrative's (already-endorsing + reachable first);
+    each carries the specific, niche-first losing questions the host grounds."""
+    moves: List[Dict[str, Any]] = []
+    for m in _as_list(_as_dict(narrative.get("where_youre_losing")).get("outreach_moves")):
+        m = _as_dict(m)
+        host = str(m.get("host") or "").strip()
+        if not host:
+            continue
+        # Head-gate the per-host questions: a leadership move must not read
+        # "pitch swimswam for 'best headphones'" (the parked head fight).
+        questions = [
+            q for q in _as_list(m.get("losing_queries"))
+            if isinstance(q, str) and q.strip() and not is_broad_head_query(q)
+        ][:2]
+        moves.append({
+            "host": host,
+            "headline": m.get("headline") or f"Pitch {host}",
+            "why": m.get("why"),
+            "first_move": m.get("first_move"),
+            "realism": m.get("realism"),
+            "already_endorses_you": bool(m.get("already_endorses_you")),
+            "for_questions": questions,
+        })
+        if len(moves) >= _MOVES_CAP:
+            break
+    return moves
+
+
+def _winnable_lanes(report: Mapping[str, Any]) -> List[Dict[str, Any]]:
+    """The SPECIFIC losing queries the win plan says the brand can realistically
+    win (head terms excluded — those are the parked big-budget fights), with the
+    path (own content vs get cited) and the target hosts. Distinct from
+    get_cited_moves: lanes are the DEMAND to win; moves are the CHANNELS."""
+    lanes: List[Dict[str, Any]] = []
+    seen: set = set()
+    win_plan = _as_dict(report.get("win_plan"))
+    if not win_plan.get("available"):
+        return lanes
+    for plan in _as_list(win_plan.get("sku_plans")):
+        for lq in _as_list(_as_dict(plan).get("losing_queries")):
+            lq = _as_dict(lq)
+            query = str(lq.get("query") or "").strip()
+            key = query.lower()
+            if not query or key in seen or lq.get("broad_head_prompt"):
+                continue
+            seen.add(key)
+            hosts = [
+                h for h in (
+                    _as_dict(t).get("host") for t in _as_list(lq.get("grounds_in"))
+                ) if h
+            ][:3]
+            lanes.append({
+                "query": query,
+                "win_path": lq.get("win_path"),  # "own_content" | "publisher"
+                "win_condition": lq.get("win_condition"),
+                "target_hosts": hosts,
+            })
+            if len(lanes) >= _MOVES_CAP:
+                return lanes
+    return lanes
+
+
 def _sku_summary(
     report: Mapping[str, Any],
     unmeasured: Tuple[str, ...] = (),
@@ -705,6 +774,12 @@ def build_report_summary(
         "share_of_voice": _share_of_voice(report, per_sku_reports),
         "top_findings": _top_findings(narrative),
         "top_actions": actions,
+        # The FULL move inventory beyond the 1-3 NBA actions: off-platform
+        # citation channels (pitch these hosts) + the specific winnable lanes.
+        # The engine already computes both; surfacing them in the contract lets
+        # the deck (and any consumer) show the whole plan, not one slice.
+        "get_cited_moves": _get_cited_moves(narrative),
+        "winnable_lanes": _winnable_lanes(report),
         "competitive_snapshot": _competitive_snapshot(narrative),
         "sku_summaries": [
             _sku_summary(r, unmeasured_dimensions) for r in per_sku_reports

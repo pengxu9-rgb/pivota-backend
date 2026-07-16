@@ -247,3 +247,50 @@ def test_deck_single_sku_has_no_scorecard():
     s["sku_summaries"] = s["sku_summaries"][:1]
     slides = _slide_texts(build_report_deck(s))
     assert not any("Product-by-product" in x for x in slides)
+
+
+# ── More moves: the full inventory reaches the deck, not just NBA actions ────
+
+def _moves_summary():
+    s = _rich_summary()
+    s["get_cited_moves"] = [
+        {"host": "swimswam.com", "headline": "Pitch swimswam.com",
+         "first_move": "Earn a review here.", "realism": "reachable",
+         "already_endorses_you": False,
+         "for_questions": ["what headphones are good for lap swimming workouts?"]},
+        {"host": "wired.com", "headline": "Build on wired.com",
+         "first_move": "Extend the coverage.", "already_endorses_you": True,
+         "for_questions": []},
+    ]
+    s["winnable_lanes"] = [
+        {"query": "ip68 waterproof headphones for competitive swimmers",
+         "win_path": "own_content", "win_condition": "Publish a spec page.", "target_hosts": []},
+        {"query": "what headphones are good for lap swimming workouts?",
+         "win_path": "publisher", "win_condition": "Get cited.", "target_hosts": ["swimswam.com"]},
+    ]
+    return s
+
+
+def test_deck_has_where_to_earn_citations_slide():
+    slides = _slide_texts(build_report_deck(_moves_summary()))
+    s = next(x for x in slides if "Where to earn citations" in x)
+    assert "Pitch swimswam.com" in s
+    assert "what headphones are good for lap swimming workouts?" in s
+    assert "Build on wired.com" in s  # already-endorses → "Build on", not "Pitch"
+
+
+def test_deck_has_winnable_lanes_slide_with_paths():
+    slides = _slide_texts(build_report_deck(_moves_summary()))
+    s = next(x for x in slides if "Lanes you can win" in x)
+    assert "ip68 waterproof headphones for competitive swimmers" in s
+    assert "Win with your own page" in s
+    assert "Get cited on a publisher" in s and "swimswam.com" in s
+
+
+def test_deck_move_slides_absent_when_no_moves():
+    s = _moves_summary()
+    s["get_cited_moves"] = []
+    s["winnable_lanes"] = []
+    slides = _slide_texts(build_report_deck(s))
+    assert not any("Where to earn citations" in x for x in slides)
+    assert not any("Lanes you can win" in x for x in slides)
