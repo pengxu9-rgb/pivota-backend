@@ -231,7 +231,8 @@ def test_evidence_play_recommends_supplying_proof_to_commerce_index():
     assert ep["already_substantiated"] is False
     assert "repair" in ep["claims_to_substantiate"] and "vegan" in ep["claims_to_substantiate"]
     assert any("Pivota publishes" in m for m in ep["moves"])
-    assert any("flagged 3" in m for m in ep["moves"])  # verify gap -> evidence action
+    # verify gap -> evidence action (factual-only copy: names wrong facts)
+    assert any("wrong facts" in m and "3" in m for m in ep["moves"])
 
 
 def test_evidence_play_silent_when_substantiated_or_no_claims():

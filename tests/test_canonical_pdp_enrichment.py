@@ -360,6 +360,36 @@ def test_audit_flagged_intents_extracts_only_lost_rec():
     assert _audit_flagged_intents_by_product_key("{bad json") == {}
 
 
+def test_flagged_intents_read_raw_verify_outputs_post_factual_gate():
+    """The flag gate went factual-only (2026-07-16): editorial-only verdicts
+    (supports=False, misstates=False) — this lane's PRIMARY target — no longer
+    enter flagged_probes on new runs. The executor must read the raw
+    verify_outputs (verdict-nested shape) so its targeting doesn't silently
+    starve; flagged_probes stays as the legacy-report fallback (flat shape,
+    covered by the test above)."""
+    report = {
+        "per_sku_reports": [
+            {
+                "product_key": "m1|shopify|a",
+                # New-run shape: full outputs, verdict nested, editorial-only
+                # entry present even though flagged_probes is EMPTY.
+                "verify_outputs": [
+                    {"query": "halal collagen",
+                     "verdict": {"supports_recommendation": False,
+                                 "misstates_facts": False}},
+                    {"query": "collagen dosage",
+                     "verdict": {"supports_recommendation": True,
+                                 "misstates_facts": True}},
+                ],
+                "verify_summary": {"flagged_probes": []},
+            },
+        ]
+    }
+    assert _audit_flagged_intents_by_product_key(report) == {
+        "m1|shopify|a": ["halal collagen"],
+    }
+
+
 @pytest.mark.asyncio
 async def test_resolve_candidates_attaches_target_intents_no_leak():
     """Each candidate carries ITS sku's lost-rec intents (joined by product_key,

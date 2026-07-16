@@ -189,7 +189,17 @@ def _audit_flagged_intents_by_product_key(audit_report: Any) -> Dict[str, List[s
         pk = r.get("product_key")
         if not pk:
             continue
-        probes = ((r.get("verify_summary") or {}).get("flagged_probes")) or []
+        # Primary source: the FULL raw verify outputs. The flag gate went
+        # factual-only (2026-07-16) — editorial-only verdicts (supports=False,
+        # misstates=False), this lane's main target, no longer enter
+        # flagged_probes; only verify_outputs still carries them on new runs.
+        # flagged_probes remains as the fallback for old persisted reports
+        # that predate the verify_outputs field.
+        probes = (
+            r.get("verify_outputs")
+            or ((r.get("verify_summary") or {}).get("flagged_probes"))
+            or []
+        )
         intents: List[str] = []
         seen: set = set()
         for p in probes:
@@ -197,8 +207,10 @@ def _audit_flagged_intents_by_product_key(audit_report: Any) -> Dict[str, List[s
                 continue
             # Only the "mention, no rec" gap. supports_recommendation must be
             # exactly False (not None/missing) — a skipped/unparsed verdict is not
-            # a recommendation gap.
-            if p.get("supports_recommendation") is not False:
+            # a recommendation gap. verify_outputs nests it under `verdict`;
+            # legacy flagged_probes carry it flat.
+            verdict = p.get("verdict") if isinstance(p.get("verdict"), dict) else p
+            if verdict.get("supports_recommendation") is not False:
                 continue
             q = str(p.get("query") or "").strip()
             ql = q.lower()

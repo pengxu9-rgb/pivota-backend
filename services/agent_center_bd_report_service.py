@@ -5616,10 +5616,13 @@ def build_evidence_play(
                 "publish as verifiable claims AI engines can cite."
             )
         if flagged:
+            # Flags are factual-only now — say what was actually found (wrong
+            # facts in AI answers), not "unsupported" (the retired editorial
+            # framing), and pitch evidence as the correction channel.
             moves.append(
-                f"AI flagged {flagged} answer(s) about your product as unsupported — "
-                "supplying evidence is what closes the 'can't substantiate' gap "
-                "and earns the citation."
+                f"AI stated wrong facts about your product in {flagged} "
+                "checked answer(s) — publishing your evidenced facts on the "
+                "canonical page gives AI a source to correct against."
             )
         if not moves:
             moves.append(
