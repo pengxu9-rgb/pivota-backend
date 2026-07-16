@@ -35,15 +35,21 @@ import asyncio
 import json
 import os
 import sys
-from typing import Any, Dict, List
+import time
+from typing import Any, Dict, List, Optional, Tuple
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from db.database import database  # noqa: E402
 from scripts.attach_retailer_offer import (  # noqa: E402
-    attach_retailer_offer,
+    _INSERT_SQL as _OFFER_INSERT_SQL,
+    RETAILER_REFRESH_SOURCE,
     build_retailer_offer_row,
 )
+from services.agent_pdp_view_assembler import (  # noqa: E402
+    refresh_agent_pdp_view_for_content_key,
+)
+from services.catalog_enrichment_agent.bulk_writer import bulk_upsert  # noqa: E402
 from services.pdp_matcher.retailer_match import (  # noqa: E402
     build_match_index,
     match_record,
@@ -51,6 +57,10 @@ from services.pdp_matcher.retailer_match import (  # noqa: E402
 )
 from services.retailer_ingest import brand_official as bo  # noqa: E402
 from services.retailer_ingest import stylekorean as sk  # noqa: E402
+from services.retailer_ingest.single_writer_lock import (  # noqa: E402
+    SingleWriterLockError,
+    retailer_ingest_lock,
+)
 from services.retailer_ingest.sitemap_crawler import crawl_products  # noqa: E402
 
 
@@ -122,16 +132,30 @@ def _pick_offer_per_product(items: List[Dict[str, Any]]) -> tuple[List[Dict[str,
 
 
 async def _attach_offer_items(items: List[Dict[str, Any]]) -> tuple[int, int]:
-    """Attach one deterministic StyleKorean offer per matched canonical.
-    Returns (applied, skipped) where skipped = ineligible (no/zero/non-USD
-    price) + collapsed size/bundle variants."""
+    """Attach one deterministic StyleKorean offer per matched canonical, in BULK.
+
+    Restructured for round-trip elimination over the high-latency proxy: instead
+    of one insert + full agent_pdp_view refresh (~8 queries) PER offer, this
+    (1) builds every offer row via the sanctioned `build_retailer_offer_row`
+    (unchanged offer_id / row shape), (2) upserts them all in one bulk statement
+    reusing attach_retailer_offer's `_INSERT_SQL`, (3) resolves the affected
+    content_keys in ONE query, and (4) refreshes each DISTINCT content_key ONCE.
+
+    Returns (applied, skipped) where skipped = ineligible (no/zero/non-USD price)
+    + collapsed size/bundle variants (same meaning callers already print)."""
     eligible_missing = sum(
         1 for p in items if p.get("matched_product_key") and not _offer_eligible(p)
     )
     winners, collapsed = _pick_offer_per_product(items)
     if collapsed:
         print(f"      ({collapsed} size/bundle variants collapsed onto {len(winners)} product offers)")
-    applied = 0
+    if not winners:
+        return 0, eligible_missing + collapsed
+
+    # (1) build the offer rows. catalog_offers has no merchant_name column, so drop
+    # it before binding — exactly what attach_retailer_offer does per row.
+    offer_rows: List[Dict[str, Any]] = []
+    winner_pks: List[str] = []
     for p in winners:
         row = build_retailer_offer_row(
             product_key=p["matched_product_key"],
@@ -139,9 +163,40 @@ async def _attach_offer_items(items: List[Dict[str, Any]]) -> tuple[int, int]:
             retailer_url=p["url"], market=sk.MARKET, currency=p.get("currency") or "USD",
             price=float(p["price"]), availability=p["record"]["offers"][0]["availability"],
         )
-        await attach_retailer_offer(row)
-        applied += 1
-    return applied, eligible_missing + collapsed
+        offer_rows.append({k: v for k, v in row.items() if k != "merchant_name"})
+        winner_pks.append(p["matched_product_key"])
+
+    # (3, done first for the orphan guard) resolve product_key -> content_key ONCE.
+    # Only offers whose product actually exists in catalog_products are upserted —
+    # catalog_offers has no FK, so this is what prevents a fake/orphan offer.
+    ck_rows = await database.fetch_all(
+        "SELECT product_key, content_key FROM catalog_products WHERE product_key = ANY(:pks)",
+        {"pks": list(dict.fromkeys(winner_pks))},
+    )
+    pk_to_ck = {dict(r)["product_key"]: dict(r)["content_key"] for r in ck_rows}
+    verified_rows = [r for r in offer_rows if r["product_key"] in pk_to_ck]
+    orphan_dropped = len(offer_rows) - len(verified_rows)
+    if orphan_dropped:
+        print(f"      ({orphan_dropped} offers skipped: matched product_key absent from catalog_products)")
+
+    # (2) upsert every verified offer in one bulk statement (same _INSERT_SQL).
+    upserted, insert_skipped, _skipped_rows = await bulk_upsert(
+        database, _OFFER_INSERT_SQL, verified_rows, label="retailer_offers"
+    )
+
+    # (4) deferred + deduped view refresh: each DISTINCT affected content_key ONCE.
+    # There is NO scheduled full view refresher on prod, so this pass is what makes
+    # the freshly-upserted offers serve. Count/verify reads go to catalog_offers,
+    # never agent_pdp_view (stale until this loop runs).
+    distinct_cks = sorted({
+        pk_to_ck[r["product_key"]] for r in verified_rows if pk_to_ck.get(r["product_key"])
+    })
+    for ck in distinct_cks:
+        await refresh_agent_pdp_view_for_content_key(ck, refresh_source=RETAILER_REFRESH_SOURCE)
+
+    print(f"      upserted {upserted} offers into catalog_offers; refreshed {len(distinct_cks)} content_key view(s)"
+          + (f" ({insert_skipped} bad rows skipped)" if insert_skipped else ""))
+    return upserted, eligible_missing + collapsed
 
 
 def _like_escape(value: str) -> str:
@@ -165,12 +220,67 @@ async def _load_our_rows(brands: List[str]) -> List[Dict[str, Any]]:
     return [dict(r) for r in rows]
 
 
+# Fetch the ~10k-URL product sitemaps ONCE per process (they were re-downloaded
+# per brand run). Keyed nothing — the sitemap set is process-global.
+_SITEMAP_TEXTS_CACHE: Optional[Tuple[List[str], List[str]]] = None
+
+
+def _load_product_sitemaps() -> Tuple[List[str], List[str]]:
+    """(sitemap_urls, sitemap_texts), fetched once and memoized for the process."""
+    global _SITEMAP_TEXTS_CACHE
+    if _SITEMAP_TEXTS_CACHE is None:
+        index_xml = sk.fetch_text(sk.SITEMAP_INDEX)
+        product_sitemaps = sk.product_sitemap_urls(index_xml)
+        texts = [sk.fetch_text(u) for u in product_sitemaps]
+        _SITEMAP_TEXTS_CACHE = (product_sitemaps, texts)
+    return _SITEMAP_TEXTS_CACHE
+
+
+_CRAWL_CACHE_MAX_AGE_S = 6 * 3600
+
+
+def _crawl_cache_path(args: argparse.Namespace) -> str:
+    base = args.cache_dir or (
+        os.path.dirname(os.path.abspath(args.out)) if args.out else os.getcwd()
+    )
+    os.makedirs(base, exist_ok=True)
+    limit_tag = str(args.limit) if args.limit else "all"
+    return os.path.join(base, f"sk_crawl_{args.brand}_{limit_tag}.json")
+
+
+def _load_crawl_cache(path: str) -> Optional[Dict[str, Any]]:
+    """Return a cached crawl ({records, failures}) if it exists and is < 6h old."""
+    try:
+        age = time.time() - os.stat(path).st_mtime
+    except OSError:
+        return None
+    if age > _CRAWL_CACHE_MAX_AGE_S:
+        return None
+    try:
+        with open(path) as f:
+            data = json.load(f)
+    except Exception:  # noqa: BLE001 — a corrupt cache just forces a re-crawl
+        return None
+    if isinstance(data, dict) and isinstance(data.get("records"), list):
+        return {"records": data["records"], "failures": data.get("failures") or []}
+    return None
+
+
+def _save_crawl_cache(path: str, crawled: Dict[str, Any]) -> None:
+    try:
+        with open(path, "w") as f:
+            json.dump(
+                {"records": crawled["records"], "failures": crawled["failures"]},
+                f, ensure_ascii=False, default=str,
+            )
+    except Exception as exc:  # noqa: BLE001 — caching is best-effort
+        print(f"      (crawl cache write failed: {exc})")
+
+
 async def _drive(args: argparse.Namespace) -> int:
-    # 1) enumerate this brand's PDP URLs from the sitemaps
+    # 1) enumerate this brand's PDP URLs from the (process-cached) sitemaps
     print(f"[1/5] enumerating StyleKorean sitemaps for brand '{args.brand}' ...", flush=True)
-    index_xml = sk.fetch_text(sk.SITEMAP_INDEX)
-    product_sitemaps = sk.product_sitemap_urls(index_xml)
-    sitemap_texts = [sk.fetch_text(u) for u in product_sitemaps]
+    product_sitemaps, sitemap_texts = _load_product_sitemaps()
     urls = sk.brand_product_urls(args.brand, sitemap_texts)
     if args.limit:
         urls = urls[: args.limit]
@@ -179,12 +289,20 @@ async def _drive(args: argparse.Namespace) -> int:
         print("no product URLs — check the brand slug against sitemap-brands.xml")
         return 1
 
-    # 2) crawl + extract (deterministic JSON-LD)
-    print(f"[2/5] crawling {len(urls)} PDPs (concurrency={args.concurrency}) ...", flush=True)
-    crawled = crawl_products(
-        urls, concurrency=args.concurrency,
-        on_progress=lambda i, n: (i % 25 == 0) and print(f"      {i}/{n}", flush=True),
-    )
+    # 2) crawl + extract (deterministic JSON-LD), cached per brand for 6h so a
+    #    DB-retry re-run skips the re-crawl entirely (--no-cache forces a fresh one)
+    cache_path = _crawl_cache_path(args)
+    crawled = None if args.no_cache else _load_crawl_cache(cache_path)
+    if crawled is not None:
+        print(f"[2/5] using cached crawl: {len(crawled['records'])} records "
+              f"<- {cache_path} (--no-cache to force)", flush=True)
+    else:
+        print(f"[2/5] crawling {len(urls)} PDPs (concurrency={args.concurrency}) ...", flush=True)
+        crawled = crawl_products(
+            urls, concurrency=args.concurrency,
+            on_progress=lambda i, n: (i % 25 == 0) and print(f"      {i}/{n}", flush=True),
+        )
+        _save_crawl_cache(cache_path, crawled)
     records = crawled["records"]
     print(f"      extracted {len(records)} ({len(crawled['failures'])} failed/no-product)")
 
@@ -192,6 +310,18 @@ async def _drive(args: argparse.Namespace) -> int:
     print("[3/5] matching to canonical catalog ...", flush=True)
     await database.connect()
     try:
+        async with retailer_ingest_lock(database):
+            return await _drive_db(args, records)
+    except SingleWriterLockError as exc:
+        print(f"[lock] {exc} — exiting without writes.")
+        return 1
+    finally:
+        await database.disconnect()
+
+
+async def _drive_db(args: argparse.Namespace, records: List[Dict[str, Any]]) -> int:
+    """The DB phase, run under the single-writer advisory lock."""
+    if True:
         our_rows = await _load_our_rows(_brand_tokens(records))
         index = build_match_index(our_rows)
         plan: List[Dict[str, Any]] = []
@@ -272,7 +402,7 @@ async def _drive(args: argparse.Namespace) -> int:
 
         summary = await bo.ingest_brand_official(
             official_records=net_new, brand=brand_name, domain=args.brand_official_domain,
-            apply=True, db=database,
+            apply=True, db=database, batch=True,
         )
         print(f"      ingested {len(net_new)} NET-NEW brand-official canonicals: {summary['applied']}")
         print(f"      ({len(already_have)} already-have skipped to avoid duplicate canonicals)")
@@ -290,8 +420,6 @@ async def _drive(args: argparse.Namespace) -> int:
             a, s = await _attach_offer_items(newly)
             print(f"      attached {a} StyleKorean offers to brand-official canonicals ({s} skipped: no price)")
         print(f"      residue still unmatched (flag for review): {len(mint) - len(newly)}")
-    finally:
-        await database.disconnect()
     return 0
 
 
@@ -300,6 +428,8 @@ def _parse_args() -> argparse.Namespace:
     p.add_argument("--brand", required=True, help="StyleKorean brand slug, e.g. cosrx (see sitemap-brands.xml)")
     p.add_argument("--limit", type=int, default=0, help="cap number of PDPs (0 = all)")
     p.add_argument("--concurrency", type=int, default=6)
+    p.add_argument("--cache-dir", default=None, help="dir for the per-brand crawl cache (default: alongside --out, else cwd)")
+    p.add_argument("--no-cache", action="store_true", help="ignore + overwrite the crawl cache (force a fresh crawl)")
     p.add_argument("--out", default=None, help="write the attach/mint plan as JSONL")
     p.add_argument("--apply-offers", action="store_true", help="write the ATTACH lane (retailer offers on matched canonicals).")
     p.add_argument("--brand-official-domain", default=None, help="brand's official Shopify domain (e.g. cosrx.com) — enables the MINT lane.")

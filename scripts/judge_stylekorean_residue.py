@@ -34,6 +34,10 @@ from scripts.ingest_stylekorean_brand import (  # noqa: E402
 from services.pdp_matcher.retailer_match import build_match_index, match_record  # noqa: E402
 from services.retailer_ingest import stylekorean as sk  # noqa: E402
 from services.retailer_ingest.brand_official import fetch_official_records  # noqa: E402
+from services.retailer_ingest.single_writer_lock import (  # noqa: E402
+    SingleWriterLockError,
+    retailer_ingest_lock,
+)
 from services.retailer_ingest.official_match_judge import (  # noqa: E402
     AUTO_ATTACH_THRESHOLD,
     judge_residue_items,
@@ -96,7 +100,11 @@ async def _drive_apply_from(args: argparse.Namespace) -> int:
         return 0
     await database.connect()
     try:
-        await _attach_auto_verdicts(auto)
+        async with retailer_ingest_lock(database):
+            await _attach_auto_verdicts(auto)
+    except SingleWriterLockError as exc:
+        print(f"[lock] {exc} — exiting without writes.")
+        return 1
     finally:
         await database.disconnect()
     return 0
@@ -139,7 +147,11 @@ async def _drive(args: argparse.Namespace) -> int:
 
     await database.connect()
     try:
-        await _attach_auto_verdicts(result["auto"])
+        async with retailer_ingest_lock(database):
+            await _attach_auto_verdicts(result["auto"])
+    except SingleWriterLockError as exc:
+        print(f"[lock] {exc} — exiting without writes.")
+        return 1
     finally:
         await database.disconnect()
     return 0

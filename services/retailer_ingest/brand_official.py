@@ -149,9 +149,14 @@ async def ingest_brand_official(
     domain: str,
     apply: bool = False,
     db: Any = None,
+    batch: bool = False,
 ) -> Dict[str, Any]:
     """Build the canonical-chain plan from brand-official records and (if apply)
-    execute it through the sanctioned Path-C writer. Returns a summary."""
+    execute it through the sanctioned Path-C writer. Returns a summary.
+
+    `batch=True` routes the apply through the round-trip-eliminating executor
+    (identical SQL/guard/audit) — used by the StyleKorean CLI where the plan is
+    written from a laptop over the high-latency Railway public proxy."""
     plan = ingest_validated_jsonl(official_records, source_jsonl=f"brand_official:{domain}")
     summary: Dict[str, Any] = {
         "domain": domain,
@@ -164,6 +169,6 @@ async def ingest_brand_official(
     }
     if apply:
         summary["applied"] = await apply_ingest_plan(
-            plan, batch_label=f"brand_official:{brand or domain}", db=db
+            plan, batch_label=f"brand_official:{brand or domain}", db=db, batch=batch
         )
     return summary
