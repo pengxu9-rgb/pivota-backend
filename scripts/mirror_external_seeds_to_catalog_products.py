@@ -699,17 +699,28 @@ missing AS (
   -- seed.external_product_id (brand:hash) in DIFFERENT formats, so the
   -- (platform, source_product_id) join alone can never see that mirror. Without
   -- this conjunct every Path-C ingest spawned a merch_obs_* shadow product on the
-  -- next materialization tick (39 COSRX shadows, 2026-07-16). If the attached
-  -- target row is gone, the seed becomes mirrorable again (self-heal preserved).
+  -- next materialization tick (39 COSRX shadows, 2026-07-16).
+  --
+  -- The attachment check is GROUP-level (NOT EXISTS over active_all by
+  -- external_product_id), not just the `ranked` rn=1 winner: duplicate active
+  -- seeds sharing an external_product_id can differ in attachment (the mirror's
+  -- own post-hoc backlink step can leave mixed groups after partial failures),
+  -- and ranking may prefer the unattached duplicate — which would mint the
+  -- shadow anyway. If every attached target row is gone, the group becomes
+  -- mirrorable again (self-heal preserved).
   SELECT c.*
   FROM candidates c
   LEFT JOIN catalog_products cp
     ON cp.platform = 'external_seed'
    AND cp.source_product_id = c.external_product_id
-  LEFT JOIN catalog_products cp_attached
-    ON cp_attached.product_key = c.attached_product_key
   WHERE cp.product_key IS NULL
-    AND cp_attached.product_key IS NULL
+    AND NOT EXISTS (
+      SELECT 1
+      FROM active_all a
+      JOIN catalog_products cp_attached
+        ON cp_attached.product_key = a.attached_product_key
+      WHERE a.external_product_id = c.external_product_id
+    )
 )
 """
 
@@ -750,6 +761,11 @@ async def _build_report(*, sample_limit: int, limit: int, apply: bool) -> Dict[s
           (SELECT count(*) FROM candidates WHERE length(coalesce(mirrored_description, '')) >= 50) AS candidates_with_description_50,
           (SELECT count(*) FROM candidates WHERE nullif(btrim(coalesce(image_url, '')), '') IS NOT NULL AND length(coalesce(mirrored_description, '')) >= 50) AS candidates_visible_quality_ready,
           (SELECT count(*) FROM missing) AS missing_catalog_products,
+          (SELECT count(*) FROM candidates c WHERE EXISTS (
+             SELECT 1 FROM active_all a
+             JOIN catalog_products x ON x.product_key = a.attached_product_key
+             WHERE a.external_product_id = c.external_product_id
+          )) AS candidates_attached_present,
           (SELECT count(*) FROM catalog_products) AS catalog_products_total,
           (SELECT count(*) FROM catalog_products WHERE pivota_signature_id IS NOT NULL) AS catalog_products_with_sig,
           (SELECT count(*) FROM catalog_products WHERE merchant_id = 'external_seed' AND platform = 'external_seed') AS catalog_products_external_seed,
