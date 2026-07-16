@@ -244,9 +244,18 @@ async def _drive(args: argparse.Namespace) -> int:
         # Only NET-NEW brand-official products are safe to ingest — re-ingesting one
         # we already have would derive a new product_key from the storefront's drifted
         # title and duplicate the canonical (ingestion.derive_product_key has no strip).
-        net_new, already_have = bo.filter_net_new(official, our_rows)
-        print(f"      brand-official products: {len(official)}  (already have {len(already_have)}, NET-NEW {len(net_new)})")
+        # suspect_drift (title-token containment vs an existing row, e.g. official
+        # "Madagascar Centella Ampoule" vs our "Centella Ampoule") is propose-only:
+        # routed to the residue/Gemini lane, never auto-minted.
+        net_new, already_have, suspect_drift = bo.filter_net_new(official, our_rows)
+        print(f"      brand-official products: {len(official)}  (already have {len(already_have)}, NET-NEW {len(net_new)}, suspect-drift {len(suspect_drift)})")
         print(f"      of {len(mint)} MINT SKUs → {len(resolved)} resolve to a brand-official product, {len(residue)} residue")
+        for s in suspect_drift:
+            residue.append({
+                "brand": (s.get("pdp") or {}).get("brand"),
+                "title": (s.get("pdp") or {}).get("product_name"),
+                "record": s,
+            })
 
         if args.residue_candidates:
             _write_residue_candidates(args.residue_candidates, residue,
