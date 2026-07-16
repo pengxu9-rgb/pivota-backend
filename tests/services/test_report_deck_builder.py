@@ -142,3 +142,108 @@ def test_deck_degrades_on_empty_summary():
     slides = _slide_texts(deck)
     assert len(slides) >= 2  # cover + methodology bookend, no crash
     assert "— / 10" in slides[0]
+
+
+# ── Deck-quality round: the highlights leadership actually needs ─────────────
+
+def _rich_summary():
+    """A summary carrying share-of-voice, subscores, real trend, curated
+    actions, and multiple SKUs — the fields the early deck ignored."""
+    return {
+        "generated_at": "2026-07-16",
+        "subject": {"merchant_name": "Mojawa"},
+        "score": {
+            "display": 2.3, "scale_max": 10, "band": "needs_work",
+            "subscores": [
+                {"key": "visibility", "display": 0.6},
+                {"key": "attribution", "display": 4.6},
+            ],
+            "weakest_dimension": {"key": "identity", "label": "product identity", "display": 2.3},
+            "delta": None,  # the field the old cover read — must NOT gate trend
+        },
+        "verdict": {"headline": "Independently endorsed, but not agent-ready."},
+        "since_last_audit": {
+            "headline": "Material change since your last audit earlier today",
+            "movements": [
+                {"signal": "attribution", "label": "First-party citation",
+                 "from": 39, "to": 46, "direction": "improved", "is_material": True},
+                {"signal": "visibility", "label": "AI visibility",
+                 "from": 6, "to": 6, "direction": "stable", "is_material": False},
+            ],
+        },
+        "share_of_voice": {
+            "available": True, "basis": "discovery_prompts", "prompts_probed": 11,
+            "brand": {"name": "Mojawa", "prompts_cited": 8, "pct": 72.7},
+            "competitors": [
+                {"name": "Shokz", "pct": 100.0},
+                {"name": "Suunto", "pct": 81.8},
+                {"name": "Bose", "pct": 45.5},
+            ],
+        },
+        "top_findings": [
+            {"title": "Independent endorsement", "severity": "info",
+             "evidence_summary": "wired.com already recommends Mojawa."},
+        ],
+        "top_actions": [
+            {"headline": "Win the vs-Shokz swimming lane", "action_source": "primary",
+             "why_this_first": "AI names Shokz on the specific ask.",
+             "first_move": "Publish the comparison."},
+            {"headline": "Re-test failed SKU prompt: bone conduction …",
+             "action_source": "secondary",
+             "why_this_first": "Named in the failing prompt evidence.",
+             "first_move": "Revise the PDP, re-run the prompt."},
+        ],
+        "competitive_snapshot": {"available": True, "top_cited_hosts": ["wired.com"]},
+        "sku_summaries": [
+            {"sku_title": "Purra Swim Headphones", "score": {"display": 2.3, "scale_max": 10},
+             "band_display": {"label": "Found by AI, but not agent-ready"}},
+            {"sku_title": "Run Plus Open-Ear", "score": {"display": 5.1, "scale_max": 10},
+             "band_display": {"label": "Recommended, but not agent-ready"}},
+        ],
+        "meta": {"providers": ["gemini", "chatgpt"], "products_audited": 2,
+                 "honest_limits": ["Sample coverage."]},
+    }
+
+
+def test_deck_has_share_of_voice_slide_with_rank():
+    slides = _slide_texts(build_report_deck(_rich_summary()))
+    sov = next(s for s in slides if "Where you rank in AI answers" in s)
+    assert "You rank #3 of 4 brands named." in sov  # Shokz, Suunto, Mojawa, Bose
+    assert "Shokz" in sov and "100%" in sov
+    assert "Mojawa  (you)" in sov and "73%" in sov
+
+
+def test_deck_cover_shows_subscores_and_real_trend():
+    cover = _slide_texts(build_report_deck(_rich_summary()))[0]
+    assert "AI visibility 0.6" in cover
+    assert "First-party citation 4.6" in cover
+    # Real movement from since_last_audit, NOT the null score.delta.
+    assert "First-party citation 39 → 46 ▲" in cover
+
+
+def test_deck_leads_with_weakest_dimension_diagnosis():
+    found = next(s for s in _slide_texts(build_report_deck(_rich_summary()))
+                 if "What we found" in s)
+    assert "Biggest drag on your score: Product identity (2.3/10)." in found
+
+
+def test_deck_drops_secondary_qa_actions():
+    slides = _slide_texts(build_report_deck(_rich_summary()))
+    assert any("Win the vs-Shokz swimming lane" in s for s in slides)
+    # The QA re-test secondary is a portal to-do, never a boardroom slide.
+    assert not any("Re-test failed SKU prompt" in s for s in slides)
+
+
+def test_deck_has_per_product_scorecard_when_multi_sku():
+    slides = _slide_texts(build_report_deck(_rich_summary()))
+    card = next(s for s in slides if "Product-by-product" in s)
+    assert "Purra Swim Headphones" in card and "2.3/10" in card
+    assert "Run Plus Open-Ear" in card and "5.1/10" in card
+    assert "Recommended, but not agent-ready" in card
+
+
+def test_deck_single_sku_has_no_scorecard():
+    s = _rich_summary()
+    s["sku_summaries"] = s["sku_summaries"][:1]
+    slides = _slide_texts(build_report_deck(s))
+    assert not any("Product-by-product" in x for x in slides)

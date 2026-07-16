@@ -408,6 +408,11 @@ def _top_actions(
                     else None
                 ),
                 "headline": action.get("headline"),
+                # Re-emit the primary/secondary tier (consumed above to gate
+                # evidence) so downstream surfaces can curate — the leadership
+                # deck leads with strategic primaries and drops secondary/QA
+                # moves that make weak boardroom slides.
+                "action_source": "secondary" if is_secondary else "primary",
                 "why_this_first": action.get("why_this_first")
                 or nba.get("why_this_first"),
                 "first_move": action.get("first_move") or nba.get("first_move"),
