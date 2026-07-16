@@ -27,11 +27,10 @@ from typing import Any, Dict, List
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from db.database import database  # noqa: E402
-from scripts.attach_retailer_offer import (  # noqa: E402
-    attach_retailer_offer,
-    build_retailer_offer_row,
+from scripts.ingest_stylekorean_brand import (  # noqa: E402
+    _attach_offer_items,
+    _load_our_rows,
 )
-from scripts.ingest_stylekorean_brand import _load_our_rows, _offer_eligible  # noqa: E402
 from services.pdp_matcher.retailer_match import build_match_index, match_record  # noqa: E402
 from services.retailer_ingest import stylekorean as sk  # noqa: E402
 from services.retailer_ingest.brand_official import fetch_official_records  # noqa: E402
@@ -79,28 +78,43 @@ async def _drive(args: argparse.Namespace) -> int:
         brands = sorted({str(r["item"].get("brand")) for r in result["auto"] if r["item"].get("brand")})
         our_rows = await _load_our_rows(brands)
         index = build_match_index(our_rows)
-        attached = no_target = skipped = 0
+
+        # Resolve each auto verdict to a catalog target, stamping matched_product_key
+        # onto the plan item so the DETERMINISTIC picker can dedup (B1): one offer
+        # slot exists per (product_key, merchant), so N residue size-variants that
+        # auto-match one official product must NOT last-write-wins.
+        candidates: List[Dict[str, Any]] = []
+        no_target = 0
+        target_pks = set()
         for r in result["auto"]:
             pdp = r["official"].get("pdp") or {}
             target = match_record(index, pdp.get("brand"), pdp.get("product_name"))
             if not target:
-                # official product not (yet) a catalog row — e.g. a drift-suspect
-                # that was never minted. Needs mint/merge first; report, don't guess.
+                # official not (yet) a catalog row (e.g. an un-minted drift suspect).
+                # Needs mint/merge first; report, never guess a target.
                 no_target += 1
                 continue
-            item = r["item"]
-            if not _offer_eligible(item):
-                skipped += 1
-                continue
-            row = build_retailer_offer_row(
-                product_key=target["product_key"], merchant_id=sk.MERCHANT_ID,
-                merchant_name=sk.MERCHANT_NAME, retailer_url=item["url"], market=sk.MARKET,
-                currency=item.get("currency") or "USD", price=float(item["price"]),
-                availability=item.get("record", {}).get("offers", [{}])[0].get("availability", "in_stock"),
+            item = {**r["item"], "matched_product_key": target["product_key"]}
+            candidates.append(item)
+            target_pks.add(target["product_key"])
+
+        # Don't clobber the ATTACH lane: if a target already carries a StyleKorean
+        # offer (its deterministic pick from the direct-match lane), leave it — the
+        # judge lane only fills canonicals the ATTACH lane didn't reach.
+        already = set()
+        if target_pks:
+            rows = await database.fetch_all(
+                "SELECT DISTINCT product_key FROM catalog_offers "
+                "WHERE merchant_id = :m AND product_key = ANY(:pks)",
+                {"m": sk.MERCHANT_ID, "pks": list(target_pks)},
             )
-            await attach_retailer_offer(row)
-            attached += 1
-        print(f"      attached {attached} offers | no catalog target {no_target} | ineligible {skipped}")
+            already = {dict(r)["product_key"] for r in rows}
+        fresh = [c for c in candidates if c["matched_product_key"] not in already]
+        skipped_existing = len(candidates) - len(fresh)
+
+        applied, skipped = await _attach_offer_items(fresh)
+        print(f"      attached {applied} offers | no catalog target {no_target} | "
+              f"already-had-SK-offer {skipped_existing} | ineligible/collapsed {skipped}")
     finally:
         await database.disconnect()
     return 0

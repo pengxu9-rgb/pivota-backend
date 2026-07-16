@@ -21,6 +21,8 @@ from __future__ import annotations
 
 import json
 import logging
+import math
+import re
 from typing import Any, Awaitable, Callable, Dict, List, Mapping, Optional, Sequence, Tuple
 
 import httpx
@@ -81,15 +83,24 @@ def shortlist_candidates(
     return scored[:k]
 
 
+def _clean(value: Any, cap: int = 200) -> str:
+    """Flatten crawled text before embedding it in the prompt: collapse newlines/
+    whitespace and cap length, so a hostile product title can't forge candidate
+    lines or inject instructions. Blast radius is already bounded (index must be
+    in the deterministic shortlist, confidence clamped, bad JSON -> review), but
+    this closes the forging surface cheaply."""
+    return re.sub(r"\s+", " ", str(value or "")).strip()[:cap]
+
+
 def build_judge_message(
     sk_brand: Optional[str],
     sk_title: Optional[str],
     candidates: Sequence[Mapping[str, Any]],
 ) -> str:
-    lines = [f"Retailer listing: [{sk_brand}] {sk_title}", "", "Official catalog candidates:"]
+    lines = [f"Retailer listing: [{_clean(sk_brand, 80)}] {_clean(sk_title)}", "", "Official catalog candidates:"]
     for i, rec in enumerate(candidates):
         pdp = rec.get("pdp") or {}
-        lines.append(f"  {i}: {pdp.get('product_name')}")
+        lines.append(f"  {i}: {_clean(pdp.get('product_name'))}")
     lines += [
         "",
         'Return JSON only: {"match_index": <candidate number, or -1 if none is the '
@@ -103,13 +114,24 @@ def parse_judge_response(payload: Any, n_candidates: int) -> Optional[Dict[str, 
     with match_index=None for a no-match verdict; None when unparseable."""
     if not isinstance(payload, dict):
         return None
+    raw_idx = payload.get("match_index")
+    # bool is an int subclass — reject True/False so they don't select candidate 1/0.
+    if isinstance(raw_idx, bool):
+        return None
+    # a non-integer float (0.9) would truncate to a different candidate — reject.
+    if isinstance(raw_idx, float) and not raw_idx.is_integer():
+        return None
     try:
-        idx = int(payload.get("match_index"))
+        idx = int(raw_idx)
     except (TypeError, ValueError):
         return None
     try:
         conf = float(payload.get("confidence"))
     except (TypeError, ValueError):
+        return None
+    # NaN/inf would survive min/max (nan comparisons are False) and auto-attach at
+    # 1.0 — reject degenerate confidence outright.
+    if not math.isfinite(conf):
         return None
     conf = max(0.0, min(1.0, conf))
     if idx < -1 or idx >= n_candidates:
@@ -146,15 +168,18 @@ async def _call_deepseek_judge(user_message: str, *, timeout_s: float = 20.0) ->
                 json=body,
                 headers={"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"},
             )
-    except (httpx.TimeoutException, httpx.NetworkError) as exc:
+    except httpx.HTTPError as exc:
+        # every transport failure (timeout, network, RemoteProtocolError, ...) is
+        # an HTTPError — catch the base so one bad response can't abort the batch.
         logger.warning("official_match_judge.transport_fail err=%s", exc)
         return None
     if resp.status_code >= 400:
         logger.warning("official_match_judge.http_%d body=%s", resp.status_code, resp.text[:200])
         return None
     try:
+        # content can be null on a malformed 200 -> json.loads(None) raises TypeError.
         return json.loads(resp.json()["choices"][0]["message"]["content"])
-    except (KeyError, IndexError, ValueError, json.JSONDecodeError) as exc:
+    except (KeyError, IndexError, TypeError, ValueError, json.JSONDecodeError) as exc:
         logger.warning("official_match_judge.parse_fail err=%s", exc)
         return None
 
