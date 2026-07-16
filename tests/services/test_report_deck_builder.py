@@ -294,3 +294,42 @@ def test_deck_move_slides_absent_when_no_moves():
     slides = _slide_texts(build_report_deck(s))
     assert not any("Where to earn citations" in x for x in slides)
     assert not any("Lanes you can win" in x for x in slides)
+
+
+# ── Continuous-use: the outcome loop (what moved since last audit) ──────────
+
+def test_deck_progress_slide_shows_wins():
+    s = _rich_summary()
+    s["progress"] = {
+        "available": True, "is_first_audit": False,
+        "note": "Observed re-audit facts; not proof of causation.",
+        "summary": {"won": 2, "progress": 1, "no_change": 3, "no_longer_grounded": 0},
+        "wins": [{"host": "swimswam.com", "what_changed": "swimswam.com now recommends you.", "query": None}],
+        "in_progress": [{"host": "rtings.com", "what_changed": "rtings.com now names you.", "query": None}],
+    }
+    slides = _slide_texts(build_report_deck(s))
+    p = next(x for x in slides if "What moved since last audit" in x)
+    assert "2 hosts now recommend you" in p
+    assert "swimswam.com now recommends you." in p
+    assert "not proof of causation" in p  # honesty note carried
+
+
+def test_deck_progress_slide_honest_when_nothing_moved():
+    s = _rich_summary()
+    s["progress"] = {
+        "available": True, "is_first_audit": False, "note": None,
+        "summary": {"won": 0, "progress": 0, "no_change": 3, "no_longer_grounded": 1},
+        "wins": [], "in_progress": [],
+    }
+    p = next(x for x in _slide_texts(build_report_deck(s)) if "What moved since last audit" in x)
+    assert "No new citations landed at your targets yet" in p
+    assert "1 dropped off" in p  # regressions surfaced, not hidden
+    assert "Working the moves below is what moves this" in p
+
+
+def test_deck_no_progress_slide_on_first_audit():
+    s = _rich_summary()
+    s["progress"] = {"available": False, "is_first_audit": True, "note": "First audit.",
+                     "summary": {"won": 0, "progress": 0, "no_change": 0, "no_longer_grounded": 0},
+                     "wins": [], "in_progress": []}
+    assert not any("What moved since last audit" in x for x in _slide_texts(build_report_deck(s)))

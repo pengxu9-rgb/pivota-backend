@@ -846,3 +846,34 @@ def test_get_cited_moves_and_winnable_lanes_in_contract():
     assert [l["query"] for l in lanes] == ["ip68 headphones for swimmers", "lap swim headphones"]
     assert lanes[1]["win_path"] == "publisher"
     assert lanes[1]["target_hosts"] == ["swimswam.com"]
+
+
+def test_progress_block_reads_root_outreach_outcomes():
+    """The audit→action→outcome loop reaches the contract from the report ROOT
+    (where the engine attaches it, beside win_plan) — not per-SKU (2026-07-16)."""
+    from services.report_summary_builder import _progress
+
+    report = {
+        "outreach_outcomes": {
+            "available": True, "is_first_audit": False,
+            "note": "Observed facts, not proof.",
+            "summary": {"won": 1, "progress": 1, "no_change": 2, "no_longer_grounded": 1},
+            "targets": [
+                {"host": "swimswam.com", "outcome": "won",
+                 "what_changed": "swimswam.com now recommends you."},
+                {"host": "rtings.com", "outcome": "progress",
+                 "what_changed": "rtings.com now names you."},
+                {"host": "x.com", "outcome": "no_change", "what_changed": "unchanged."},
+            ],
+        },
+    }
+    p = _progress(report)
+    assert p["available"] is True
+    assert p["summary"] == {"won": 1, "progress": 1, "no_change": 2, "no_longer_grounded": 1}
+    assert [w["host"] for w in p["wins"]] == ["swimswam.com"]
+    assert [w["host"] for w in p["in_progress"]] == ["rtings.com"]
+    assert p["note"] == "Observed facts, not proof."
+
+    # First audit / absent → empty, no crash.
+    assert _progress({})["available"] is False
+    assert _progress({"outreach_outcomes": {"is_first_audit": True}})["is_first_audit"] is True

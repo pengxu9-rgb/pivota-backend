@@ -418,6 +418,40 @@ def build_report_deck(
             text_box(slide, 11.3, y - 0.04, 1.1, 0.4, [(f"{r['pct']:.0f}%", 13, r["you"], color, 0)])
             y += 0.56
 
+    # ── What moved since last audit: the outcome loop. ─────────────────────
+    progress = _as_dict(summary.get("progress"))
+    prog_sum = _as_dict(progress.get("summary"))
+    prog_wins = [_as_dict(w) for w in _as_list(progress.get("wins"))]
+    prog_prog = [_as_dict(p) for p in _as_list(progress.get("in_progress"))]
+    if progress.get("available") and (
+        any(prog_sum.get(k) for k in ("won", "progress", "no_change", "no_longer_grounded"))
+    ):
+        slide = add_slide()
+        text_box(slide, 0.9, 0.6, 11.5, 0.8, [("What moved since last audit", 34, True, _NAVY, 0)])
+        won, prog, nch = prog_sum.get("won", 0), prog_sum.get("progress", 0), prog_sum.get("no_change", 0)
+        nlg = prog_sum.get("no_longer_grounded", 0)
+        # A "what moved" slide must not hide regressions: surface lost
+        # citations in both branches (review P3).
+        dropped = f", {nlg} dropped off" if nlg else ""
+        headline = (
+            f"{won} host{'s' if won != 1 else ''} now recommend you, "
+            f"{prog} started naming you, {nch} unchanged{dropped}."
+            if won or prog else
+            f"No new citations landed at your targets yet — {nch} unchanged"
+            f"{dropped}. Working the moves below is what moves this."
+        )
+        color = _GREEN if (won or prog) else _MUTED
+        text_box(slide, 0.9, 1.5, 11.5, 0.6, [(headline, 18, True, color, 0)])
+        y = 2.4
+        for row in (prog_wins + prog_prog)[:6]:
+            wc = str(row.get("what_changed") or row.get("host") or "").strip()
+            if wc:
+                text_box(slide, 0.9, y, 11.5, 0.5, [(f"✓  {wc[:150]}", 14, False, _INK, 0)])
+                y += 0.6
+        note = str(progress.get("note") or "").strip()
+        if note:
+            text_box(slide, 0.9, 6.7, 11.5, 0.5, [(note[:180], 10, False, _MUTED, 0)])
+
     # ── What we found: findings + who AI cites instead. ────────────────────
     findings = [
         f for f in (_as_dict(x) for x in _as_list(summary.get("top_findings")))

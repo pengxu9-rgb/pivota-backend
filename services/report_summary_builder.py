@@ -38,7 +38,7 @@ from services.win_plan_builder import interleave_by_provider, is_broad_head_quer
 # often the brand vs each named competitor appeared in the grounded answers.
 # Prompt-level counts with one shared denominator (prompts_probed), stated
 # on-block; never extrapolated beyond what was measured.
-CONTRACT_VERSION = "1.4"
+CONTRACT_VERSION = "1.5"  # +get_cited_moves, +winnable_lanes, +progress
 
 # Display banding on the 0-100 raw scale, mirrored onto the 0-10 display
 # ("6 = pass"). Anchor calibration is an OPEN decision (contract doc §7) —
@@ -555,6 +555,42 @@ def _get_cited_moves(narrative: Mapping[str, Any]) -> List[Dict[str, Any]]:
     return moves
 
 
+def _progress(report: Mapping[str, Any]) -> Dict[str, Any]:
+    """The audit→action→outcome loop: of the citation targets a PRIOR audit
+    surfaced, what the CURRENT run observed at each host (now endorses you /
+    now names you / no change / no longer grounded). The reason to come back —
+    the report's proof that working the plan moves the needle. Reuses the
+    brand-root `outreach_outcomes` the engine already computes (careful about
+    causation — carries its own no-proof note); empty on a first audit."""
+    oo = _as_dict(report.get("outreach_outcomes"))
+    src = _as_dict(oo.get("summary"))
+    summary = {
+        k: int(src.get(k) or 0)
+        for k in ("won", "progress", "no_change", "no_longer_grounded")
+    }
+    wins: List[Dict[str, Any]] = []
+    in_progress: List[Dict[str, Any]] = []
+    for t in _as_list(oo.get("targets")):
+        t = _as_dict(t)
+        host = str(t.get("host") or "").strip()
+        if not host:
+            continue
+        row = {"host": host, "what_changed": t.get("what_changed"),
+               "query": t.get("query") or None}
+        if t.get("outcome") == "won":
+            wins.append(row)
+        elif t.get("outcome") == "progress":
+            in_progress.append(row)
+    return {
+        "available": bool(oo.get("available")),
+        "is_first_audit": bool(oo.get("is_first_audit")),
+        "note": oo.get("note"),
+        "summary": summary,
+        "wins": wins[:5],
+        "in_progress": in_progress[:5],
+    }
+
+
 def _winnable_lanes(report: Mapping[str, Any]) -> List[Dict[str, Any]]:
     """The SPECIFIC losing queries the win plan says the brand can realistically
     win (head terms excluded — those are the parked big-budget fights), with the
@@ -780,6 +816,9 @@ def build_report_summary(
         # the deck (and any consumer) show the whole plan, not one slice.
         "get_cited_moves": _get_cited_moves(narrative),
         "winnable_lanes": _winnable_lanes(report),
+        # The audit→action→outcome loop: what moved at your targets since last
+        # audit (the reason to keep running Pivota). Empty on a first audit.
+        "progress": _progress(report),
         "competitive_snapshot": _competitive_snapshot(narrative),
         "sku_summaries": [
             _sku_summary(r, unmeasured_dimensions) for r in per_sku_reports
