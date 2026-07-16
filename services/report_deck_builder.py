@@ -95,9 +95,25 @@ async def generate_executive_summary(
     if not api_key:
         return None
     # Only the fields leadership copy may draw from — strips sku_summaries etc.
+    # Share-of-voice + subscores are included so the summary can reference the
+    # competitive rank and which dimension is the drag (the whole point of the
+    # deck) — before this they were absent, so the LLM couldn't name either.
+    _score = _as_dict(summary.get("score"))
     grounding = {
-        "score": _as_dict(summary.get("score")),
+        "score": {
+            "display": _score.get("display"),
+            "scale_max": _score.get("scale_max"),
+            "band": _score.get("band"),
+            "subscores": _as_list(_score.get("subscores")),
+            "weakest_dimension": _as_dict(_score.get("weakest_dimension")),
+        },
         "verdict": _as_dict(summary.get("verdict")),
+        "share_of_voice": _as_dict(summary.get("share_of_voice")),
+        "since_last_audit": {
+            k: v
+            for k, v in _as_dict(summary.get("since_last_audit")).items()
+            if k in ("headline", "movements")
+        },
         "top_findings": _as_list(summary.get("top_findings")),
         "top_actions": [
             {
@@ -153,6 +169,58 @@ def _fmt_display(score: Mapping[str, Any]) -> str:
     return f"{display:.1f}"
 
 
+# Subscore/movement keys → leadership-facing labels (match the portal's
+# since_last_audit vocabulary so the deck never renames a metric mid-report).
+_DIMENSION_LABEL = {
+    "visibility": "AI visibility",
+    "attribution": "First-party citation",
+    "category_visibility": "Category visibility",
+    "identity": "Product identity",
+    "content_richness": "Content depth",
+    "routability": "Routability",
+}
+
+
+def _dim_label(key: Any, fallback: Any = None) -> str:
+    k = str(key or "").strip().lower()
+    if k in _DIMENSION_LABEL:
+        return _DIMENSION_LABEL[k]
+    return str(fallback or key or "").strip().replace("_", " ").title()
+
+
+def _subscore_line(score: Mapping[str, Any]) -> Optional[str]:
+    """"AI visibility 0.6 · First-party citation 4.6" — the composite score's
+    breakdown so leadership sees WHICH dimension drags, not a bare number."""
+    parts: List[str] = []
+    for sub in _as_list(score.get("subscores")):
+        sub = _as_dict(sub)
+        disp = sub.get("display")
+        if isinstance(disp, (int, float)):
+            parts.append(f"{_dim_label(sub.get('key'))} {disp:.1f}")
+    return "   ·   ".join(parts) if parts else None
+
+
+def _material_movements(since: Mapping[str, Any]) -> List[str]:
+    """Human trend lines from since_last_audit's MATERIAL movements only —
+    "First-party citation 39 → 46 ▲". The old cover read score.delta (a
+    different, usually-null field), so a re-audit deck showed no progress even
+    when the report measured real movement."""
+    out: List[str] = []
+    _arrow = {"improved": "▲", "regressed": "▼"}
+    for m in _as_list(since.get("movements")):
+        m = _as_dict(m)
+        if not m.get("is_material"):
+            continue
+        frm, to = m.get("from"), m.get("to")
+        label = _dim_label(m.get("signal"), m.get("label"))
+        arrow = _arrow.get(str(m.get("direction") or ""), "→")
+        if isinstance(frm, (int, float)) and isinstance(to, (int, float)):
+            out.append(f"{label} {frm:g} → {to:g} {arrow}")
+        elif m.get("direction") == "changed":
+            out.append(f"{label} changed")
+    return out
+
+
 def build_report_deck(
     summary: Mapping[str, Any],
     *,
@@ -168,6 +236,7 @@ def build_report_deck(
     try:
         from pptx import Presentation
         from pptx.dml.color import RGBColor
+        from pptx.enum.shapes import MSO_SHAPE
         from pptx.enum.text import PP_ALIGN
         from pptx.util import Emu, Inches, Pt
     except ImportError:
@@ -257,17 +326,22 @@ def build_report_deck(
             )
         ],
     )
+    # Subscore breakdown under the composite: the score is a weakest-link
+    # number, so leadership needs to see which dimension it comes from.
+    subscore_line = _subscore_line(score)
+    if subscore_line:
+        text_box(cover, 0.9, 3.25, 11.5, 0.5, [(subscore_line, 17, False, _ICE, 0)])
     cover_lines = []
     if verdict.get("headline"):
-        cover_lines.append((str(verdict["headline"]), 22, False, _ICE, 10))
-    delta = _as_dict(score.get("delta"))
-    if isinstance(delta.get("raw"), (int, float)):
-        moved = float(delta["raw"]) / 10
-        cover_lines.append(
-            (f"{moved:+.1f} on the {scale_max}-point scale since the last audit", 14, False, _ICE, 0)
-        )
+        cover_lines.append((str(verdict["headline"]), 20, False, _ICE, 10))
+    # Real trend: material movements from since_last_audit (the old cover read
+    # score.delta, a different, usually-null field, so re-audits showed no
+    # progress even when the report measured it).
+    trend = _material_movements(_as_dict(summary.get("since_last_audit")))
+    if trend:
+        cover_lines.append(("Since your last audit:  " + "    ".join(trend[:3]), 14, False, _ICE, 0))
     if cover_lines:
-        text_box(cover, 0.9, 4.1, 11.5, 1.8, cover_lines)
+        text_box(cover, 0.9, 4.0, 11.5, 1.9, cover_lines)
     footer = f"Pivota AI-readiness audit · data as of {generated_at}" if generated_at else "Pivota AI-readiness audit"
     text_box(cover, 0.9, 6.7, 11.5, 0.4, [(footer, 11, False, _ICE, 0)])
 
@@ -296,6 +370,54 @@ def build_report_deck(
         prs.save(buf)
         return buf.getvalue()
 
+    def bar(slide, x, y, w, h, frac, color):
+        frac = max(0.0, min(1.0, float(frac)))
+        # Track (full-width, faint) + fill (scaled). Zero-width fills crash
+        # python-pptx, so a floor keeps a sliver visible.
+        track = slide.shapes.add_shape(MSO_SHAPE.RECTANGLE, Inches(x), Inches(y), Inches(w), Inches(h))
+        track.fill.solid(); track.fill.fore_color.rgb = rgb(_ICE); track.line.fill.background()
+        fill_w = max(0.04, w * frac)
+        f = slide.shapes.add_shape(MSO_SHAPE.RECTANGLE, Inches(x), Inches(y), Inches(fill_w), Inches(h))
+        f.fill.solid(); f.fill.fore_color.rgb = rgb(color); f.line.fill.background()
+
+    # ── Where you rank: Share of Voice — the competitive marquee. ──────────
+    sov = _as_dict(summary.get("share_of_voice"))
+    sov_brand = _as_dict(sov.get("brand"))
+    sov_comps = [_as_dict(c) for c in _as_list(sov.get("competitors"))]
+    if sov.get("available") and isinstance(sov_brand.get("pct"), (int, float)):
+        slide = add_slide()
+        text_box(slide, 0.9, 0.6, 11.5, 0.8, [("Where you rank in AI answers", 34, True, _NAVY, 0)])
+        probed = sov.get("prompts_probed")
+        sub = (
+            f"Share of voice across {probed} category questions we tested — "
+            "how often each brand is named when shoppers ask AI, not searching by name."
+            if isinstance(probed, int)
+            else "Share of voice — how often each brand is named when shoppers ask AI."
+        )
+        text_box(slide, 0.9, 1.35, 11.5, 0.5, [(sub, 13, False, _MUTED, 0)])
+        # One ranked list including the brand, brand row highlighted. Sorted by
+        # pct desc; brand pct = prompts_cited fraction.
+        rows = [
+            {"name": str(sov_brand.get("name") or brand), "pct": float(sov_brand.get("pct") or 0), "you": True}
+        ]
+        for c in sov_comps:
+            if isinstance(c.get("pct"), (int, float)) and c.get("name"):
+                rows.append({"name": str(c["name"]), "pct": float(c["pct"]), "you": False})
+        rows.sort(key=lambda r: -r["pct"])
+        you_rank = next((i + 1 for i, r in enumerate(rows) if r["you"]), None)
+        if you_rank:
+            text_box(
+                slide, 0.9, 1.95, 11.5, 0.5,
+                [(f"You rank #{you_rank} of {len(rows)} brands named.", 16, True, _NAVY, 0)],
+            )
+        y = 2.7
+        for r in rows[:7]:
+            color = _NAVY if r["you"] else _MUTED
+            text_box(slide, 0.9, y - 0.02, 3.1, 0.4, [(r["name"] + ("  (you)" if r["you"] else ""), 13, r["you"], color, 0)])
+            bar(slide, 4.1, y, 7.0, 0.28, r["pct"] / 100.0, _NAVY if r["you"] else _MUTED)
+            text_box(slide, 11.3, y - 0.04, 1.1, 0.4, [(f"{r['pct']:.0f}%", 13, r["you"], color, 0)])
+            y += 0.56
+
     # ── What we found: findings + who AI cites instead. ────────────────────
     findings = [
         f for f in (_as_dict(x) for x in _as_list(summary.get("top_findings")))
@@ -304,7 +426,19 @@ def build_report_deck(
     snapshot = _as_dict(summary.get("competitive_snapshot"))
     slide = add_slide()
     text_box(slide, 0.9, 0.6, 11.5, 0.8, [("What we found", 34, True, _NAVY, 0)])
-    y = 1.7
+    y = 1.55
+    # Lead with the score diagnosis: which measured dimension is the drag.
+    weakest = _as_dict(score.get("weakest_dimension"))
+    if isinstance(weakest.get("display"), (int, float)):
+        text_box(
+            slide, 0.9, y, 11.5, 0.5,
+            [(
+                f"Biggest drag on your score: {_dim_label(weakest.get('key'), weakest.get('label'))} "
+                f"({weakest['display']:.1f}/{scale_max}).",
+                16, True, _NAVY, 0,
+            )],
+        )
+        y += 0.65
     for f in findings[:3]:
         sev_color = _SEVERITY_COLOR.get(str(f.get("severity") or ""), _MUTED)
         lines = []
@@ -359,10 +493,15 @@ def build_report_deck(
         )
 
     # ── One slide per top action. ───────────────────────────────────────────
-    actions = [
+    all_actions = [
         a for a in (_as_dict(x) for x in _as_list(summary.get("top_actions")))
         if a.get("headline")
     ]
+    # Leadership curation: lead with strategic PRIMARY moves; a re-test / QA
+    # secondary ("Re-test failed SKU prompt: …") is a portal to-do, not a
+    # boardroom slide. Fall back to all actions if curation would empty the
+    # plan (never ship a deck with no moves).
+    actions = [a for a in all_actions if a.get("action_source") != "secondary"] or all_actions
     for i, action in enumerate(actions[:3], start=1):
         slide = add_slide()
         text_box(
@@ -396,6 +535,32 @@ def build_report_deck(
                     bits.append(str(p["reason"]))
                 ev.append(("  ·  ".join(bits), 12, False, _MUTED, 2))
             text_box(slide, 0.9, 5.3, 11.5, 1.7, ev)
+
+    # ── Per-product scorecard (multi-SKU only). ─────────────────────────────
+    sku_rows = [
+        s for s in (_as_dict(x) for x in _as_list(summary.get("sku_summaries")))
+        if s.get("sku_title")
+    ]
+    if len(sku_rows) > 1:
+        slide = add_slide()
+        text_box(slide, 0.9, 0.6, 11.5, 0.8, [("Product-by-product", 34, True, _NAVY, 0)])
+        text_box(
+            slide, 0.9, 1.4, 11.5, 0.4,
+            [("Each product's weakest-link score and status.", 13, False, _MUTED, 0)],
+        )
+        y = 2.1
+        for s in sku_rows[:8]:
+            sscore = _as_dict(s.get("score"))
+            disp = _fmt_display(sscore)
+            status = str(_as_dict(s.get("band_display")).get("label") or "")
+            title = str(s.get("sku_title") or "")
+            title = title[:58] + "…" if len(title) > 58 else title
+            text_box(slide, 0.9, y, 7.3, 0.4, [(title, 14, True, _INK, 0)])
+            text_box(slide, 8.4, y, 1.3, 0.4, [(f"{disp}/{scale_max}", 14, True, _NAVY, 0)])
+            text_box(slide, 9.9, y, 2.5, 0.4, [(status, 12, False, _MUTED, 0)])
+            y += 0.52
+            if y > 6.6:
+                break
 
     # ── Methodology / honesty close (navy bookend). ─────────────────────────
     slide = add_slide(_NAVY)
