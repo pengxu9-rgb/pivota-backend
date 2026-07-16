@@ -40,6 +40,22 @@ def test_mirror_query_includes_attached_seed_rows() -> None:
     assert "FROM active_mirrorable eps" in COMMON_CTES
 
 
+def test_mirror_missing_treats_attached_existing_canonical_as_present() -> None:
+    """A seed whose attached_product_key resolves to an existing catalog row must
+    NOT be re-mirrored: the enrichment agent mints pdp.source_product_id (slug)
+    and seed.external_product_id (brand:hash) in different formats, so the
+    (platform, source_product_id) join alone misses that mirror — every Path-C
+    ingest spawned a merch_obs_* shadow product on the next tick (39 COSRX
+    shadows, 2026-07-16). The check is GROUP-level (NOT EXISTS over active_all
+    by external_product_id), not just the ranked rn=1 winner — mixed
+    attached/unattached duplicate groups would otherwise mint the shadow via
+    the unattached winner. Self-heal preserved: if every attached target row
+    is gone, the NOT EXISTS passes and the group is mirrorable again."""
+    assert "cp_attached.product_key = a.attached_product_key" in COMMON_CTES
+    assert "NOT EXISTS" in COMMON_CTES
+    assert "a.external_product_id = c.external_product_id" in COMMON_CTES
+
+
 def test_mirror_insert_mints_canonical_signature_on_new_rows() -> None:
     """New Path B catalog mirror rows should be addressable by sig_* as soon
     as they are created. Public serving is still controlled elsewhere."""
