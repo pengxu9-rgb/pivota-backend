@@ -94,7 +94,7 @@ from services.cited_host_classifier import (
     ROLE_RELATIVE_UNCLASSIFIED,
 )
 from services.merchant_narrative_builder import build_merchant_narrative
-from services.win_plan_builder import build_win_plan
+from services.win_plan_builder import build_win_plan, is_broad_head_query
 from services.coverage_profiles import (
     resolve_coverage_profile,
     resolve_provider_models,
@@ -5454,11 +5454,23 @@ def _per_model_discovery(
                 "query": q,
                 "won": [m for m in graded if wins[m]],
                 "lost": [m for m in graded if not wins[m]],
+                # Rides the entry so the niche-first ordering below (and any
+                # renderer badge) can exempt spec-matched/merchant prompts.
+                "prompt_source": r.get("prompt_source"),
             })
     for slot in by_model.values():
         slot["rate"] = (
             round(slot["appeared"] / slot["total"], 3) if slot["total"] else None
         )
+    # Niche-first: divergence[0] is quoted verbatim in the engine-playbook
+    # note ('for category queries like "…"') — a specific divergent query
+    # makes that example actionable; a head baseline makes it read like the
+    # engine gap is about "best headphones".
+    divergence.sort(
+        key=lambda d: is_broad_head_query(
+            d.get("query"), prompt_source=d.get("prompt_source")
+        )
+    )
     return by_model, divergence[:8]
 
 
@@ -5687,7 +5699,9 @@ def build_product_competitiveness(per_prompt: Optional[List[Dict[str, Any]]]) ->
             else:
                 q = str(r.get("query") or "").strip()
                 if q:
-                    missed.append(q)
+                    # Keep the row's generator stamp so the niche-first
+                    # ordering below can exempt spec-matched/merchant prompts.
+                    missed.append((q, r.get("prompt_source")))
             for comp in (r.get("competitors") or []):
                 label = _competitor_brand_label(comp)
                 if not label:
@@ -5724,7 +5738,17 @@ def build_product_competitiveness(per_prompt: Optional[List[Dict[str, Any]]]) ->
             "appeared_recommended": disc_appeared_recommended,
             "appeared_listing": disc_appeared_listing,
             "ungrounded": disc_ungrounded,
-            "missed": missed[:8],
+            # Niche-first: missed arrives in probe order (head baselines
+            # first), and downstream surfaces read missed[0] as "the category
+            # ask to go win" (e.g. the get-cited category hint) — a specific
+            # missed query must lead; head rows trail as honest measurements.
+            "missed": [
+                q
+                for q, src in sorted(
+                    missed,
+                    key=lambda t: is_broad_head_query(t[0], prompt_source=t[1]),
+                )
+            ][:8],
             "top_competitors": top_competitors,
         },
         "branded": {

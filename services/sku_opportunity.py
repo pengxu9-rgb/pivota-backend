@@ -1626,6 +1626,8 @@ def _intent_ladder(per_prompt: List[Dict[str, Any]]) -> Dict[str, Dict[str, Any]
 
 
 def _top_open_lanes(per_prompt: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    from services.win_plan_builder import is_broad_head_query
+
     lanes = [
         row
         for row in per_prompt
@@ -1635,6 +1637,15 @@ def _top_open_lanes(per_prompt: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
         # are scaffolding, not real demand, and must never surface as a lane the
         # merchant is told to "own".
         and not is_synthetic_probe_query(row.get("query"))
+        # Never headline "Own the answer to <head term> while it's still up
+        # for grabs": the query_class gate above uses a narrower head rule
+        # than the shared classifier, so shapes like "popular headphones" /
+        # "what headphones should I buy" classed as category/attribute and
+        # stayed lane-eligible. One classifier, everywhere (spec-matched and
+        # merchant prompts stay exempt via prompt_source).
+        and not is_broad_head_query(
+            row.get("query"), prompt_source=row.get("prompt_source")
+        )
     ]
     lanes.sort(
         key=lambda row: (

@@ -585,27 +585,112 @@ def _sku_prescription_for_gap(
             # phrase would blur into circular "category question" copy).
             _bh_raw = str(beachhead.get("query") or "").strip()
             _alert_raw = str(substitution.get("prompt") or "").strip()
-            beachhead_query = (
-                _sku_query_phrase(_bh_raw)
-                if (
-                    _bh_raw
-                    and _bh_raw.lower() != _alert_raw.lower()
-                    and not is_synthetic_probe_query(_bh_raw)
-                    and not is_broad_head_query(
-                        _bh_raw, prompt_source=beachhead.get("prompt_source"),
-                    )
+            beachhead_usable = bool(
+                _bh_raw
+                and _bh_raw.lower() != _alert_raw.lower()
+                and not is_synthetic_probe_query(_bh_raw)
+                and not is_broad_head_query(
+                    _bh_raw, prompt_source=beachhead.get("prompt_source"),
                 )
-                else None
             )
-            first_move = (
-                f"Win {beachhead_query} first — add a page section and FAQ "
-                "that answer it."
-                if beachhead_query
-                else (
+            # Phrase the lane from its evidenced attributes ("the IP68
+            # waterproof certified, open-ear, daily sports ask") — the raw
+            # attribute-stacked probe spec reads like the SKU title reworded,
+            # and "add a FAQ that answers <your own title>" confused the
+            # exact merchant this reframe is for.
+            _basis = [
+                str(b).strip()
+                for b in (beachhead.get("attribute_basis") or [])
+                if str(b or "").strip()
+            ]
+            lane_phrase = (
+                f"the {', '.join(_basis[:3])} ask"
+                if _basis
+                else _sku_query_phrase(_bh_raw)
+            ) if beachhead_usable else None
+            # The DETAIL move depends on what the lane's measurement actually
+            # says — not a one-size "add a section and FAQ":
+            #   third-party routed — AI already surfaces the product here, but
+            #     buyers resolve to a marketplace/retailer listing; the move
+            #     is winning the ROUTE (why-buy-direct), not the answer.
+            #   open lane — nobody owns it; create the answer, and say WHAT
+            #     to write (the evidenced attributes).
+            #   competitor-owned — take it with a section that leads with the
+            #     evidenced attributes the competitor's page can't claim.
+            _ownership = str(beachhead.get("ownership_state") or "").strip().lower()
+            _route_host = str(beachhead.get("who_owns") or "").strip() or next(
+                (str(c) for c in (beachhead.get("controllers") or []) if c), "",
+            )
+            _basis_words = ", ".join(_basis[:4]) if _basis else "your evidenced product facts"
+            if beachhead_usable and _ownership in {
+                "marketplace-owned", "retailer-owned", "publisher-owned", "forum-owned",
+            } and _route_host:
+                first_move = (
+                    f"AI already surfaces you for {lane_phrase} — but buyers "
+                    f"get routed through {_route_host}. Make your own page "
+                    "the cited, buyable answer."
+                )
+                lane_actions = [
+                    (
+                        f"Add a why-buy-direct block to the product page — "
+                        "guarantee, returns, support, a first-order offer — "
+                        f"so choosing you over {_route_host} is obvious."
+                    ),
+                    (
+                        f"Put the lane's facts on YOUR page in plain buyer "
+                        f"words ({_basis_words}) so AI can ground the answer "
+                        "on you directly instead of the listing."
+                    ),
+                ]
+            elif beachhead_usable and _ownership == "competitor-owned" and _route_host:
+                first_move = (
+                    f"Take {lane_phrase} from {_route_host}: publish a page "
+                    f"section that leads with {_basis_words}."
+                )
+                lane_actions = [
+                    (
+                        f"Write the section in plain buyer words, leading "
+                        f"with {_basis_words} — the evidenced facts "
+                        f"{_route_host}'s page can't claim."
+                    ),
+                    (
+                        "Back it with proof AI can cite: a couple of real "
+                        "reviews and one use-case comparison for this ask."
+                    ),
+                ]
+            elif beachhead_usable:
+                first_move = (
+                    f"Create the answer for {lane_phrase}: a page section + "
+                    f"FAQ leading with {_basis_words}."
+                )
+                lane_actions = [
+                    (
+                        f"Answer {_sku_query_phrase(_bh_raw)} on your product "
+                        f"page in plain buyer words, leading with {_basis_words}."
+                    ),
+                    (
+                        "Give AI a reason to cite you there: a couple of real "
+                        "reviews and one use-case comparison page — not a "
+                        f"head-on {substitute} fight."
+                    ),
+                ]
+            else:
+                first_move = (
                     "Win a specific buyer question first — pick one from "
                     "your prompt table and answer it on your page."
                 )
-            )
+                lane_actions = [
+                    (
+                        "Pick the most specific losing question in your "
+                        "prompt table and answer it on your product page "
+                        "in plain buyer words."
+                    ),
+                    (
+                        "Give AI a reason to cite you there: a couple of real "
+                        "reviews and one use-case comparison page — not a "
+                        f"head-on {substitute} fight."
+                    ),
+                ]
             return _base_payload(
                 primary_gap=primary_gap,
                 headline=(
@@ -620,24 +705,7 @@ def _sku_prescription_for_gap(
                     "visibility follows brands that own their niches."
                 ),
                 first_move=first_move,
-                self_serve_actions=[
-                    (
-                        f"Answer {beachhead_query} on your product page in "
-                        "plain buyer words, leading with what makes you the "
-                        "match."
-                        if beachhead_query
-                        else (
-                            "Pick the most specific losing question in your "
-                            "prompt table and answer it on your product page "
-                            "in plain buyer words."
-                        )
-                    ),
-                    (
-                        "Give AI a reason to cite you there: a couple of real "
-                        "reviews and one use-case comparison page — not a "
-                        f"head-on {substitute} fight."
-                    ),
-                ],
+                self_serve_actions=lane_actions,
                 pivota_path=first_pivota_path,
                 evidence_used=evidence,
                 cta=_sku_cta("Win the specific ask AI already gets"),
@@ -1189,9 +1257,22 @@ def _normalize_host_value(value: Any) -> str:
 
 
 def _interleave_failing_prompts(failing_prompts: List[Any]) -> List[Any]:
+    """Niche-first, then provider-fair: specific failing prompts fill the
+    capped evidence slots before any head baseline (which otherwise sat at
+    the head of its provider bucket and always took a slot), and within each
+    partition providers interleave so no engine crowds the other out."""
     from services.win_plan_builder import interleave_by_provider
 
-    return interleave_by_provider([p for p in failing_prompts if isinstance(p, Mapping)])
+    rows = [p for p in failing_prompts if isinstance(p, Mapping)]
+    specific = [
+        r for r in rows
+        if not is_broad_head_query(r.get("query"), prompt_source=r.get("prompt_source"))
+    ]
+    head = [
+        r for r in rows
+        if is_broad_head_query(r.get("query"), prompt_source=r.get("prompt_source"))
+    ]
+    return interleave_by_provider(specific) + interleave_by_provider(head)
 
 
 def _sku_failing_prompt_chip(prompt: Any) -> Optional[Dict[str, Any]]:
@@ -1976,12 +2057,24 @@ def _sku_canonical_page_play(
     )
 
 
+def _first_specific_query(queries: List[str]) -> str:
+    """First example query that isn't a broad head term. These brand-level
+    example strings arrive in attribution-run order (head baselines first)
+    and carry no prompt_source — a plain [0] made "best headphones" THE lane
+    of the canonical-page play and operator moves. Text classifier only;
+    falls back to the first query when every example is head-shaped."""
+    for q in queries:
+        if not is_broad_head_query(q):
+            return q
+    return queries[0] if queries else ""
+
+
 def _brand_canonical_page_play(
     evidence: Mapping[str, Any],
     merchant_path: Mapping[str, Any],
 ) -> Dict[str, Any]:
     queries = _query_examples(evidence.get("failed_query_examples"))
-    lane = (queries[0].strip("\"") if queries else "") or "the retailer-routed demand"
+    lane = _first_specific_query(queries).strip("\"") or "the retailer-routed demand"
     return _canonical_page_play(
         lane=lane,
         controllers=_host_names(evidence.get("retailer_hosts")),
@@ -1998,7 +2091,7 @@ def _brand_operator_moves(
 ) -> List[Dict[str, Any]]:
     queries = _query_examples(evidence.get("failed_query_examples"))
     hosts = _host_names(evidence.get("retailer_hosts"))
-    lane = queries[0] if queries else "the retailer-routed questions"
+    lane = _first_specific_query(queries) or "the retailer-routed questions"
     page = _merchant_page_label(merchant_path)
     destination = _merchant_destination(merchant_path)
     controller = _phrase(hosts, "the cited retailers")
@@ -2118,7 +2211,9 @@ def _sku_secondary_moves(
         if len(moves) >= 2:
             return moves
 
-    for prompt in failing_prompts:
+    # Niche-first + provider-fair (was raw failing_prompts[0], i.e. probe
+    # order: the head baseline became the prescribed PDP-revision target).
+    for prompt in _interleave_failing_prompts(failing_prompts):
         chip = _sku_failing_prompt_chip(prompt)
         if not chip:
             continue

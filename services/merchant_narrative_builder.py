@@ -482,9 +482,9 @@ def _losing_queries_by_host(win_plan: Optional[Dict[str, Any]]) -> Dict[str, Lis
     host, the LOSING category queries whose grounded answers cited it. This is
     the measured 'why pitch this host' evidence the outreach moves carry —
     real probe outcomes, never inferred."""
-    by_host: Dict[str, List[str]] = {}
+    collected: Dict[str, List[tuple]] = {}
     if not isinstance(win_plan, dict) or not win_plan.get("available"):
-        return by_host
+        return {}
     for plan in win_plan.get("sku_plans") or []:
         if not isinstance(plan, dict):
             continue
@@ -498,10 +498,18 @@ def _losing_queries_by_host(win_plan: Optional[Dict[str, Any]]) -> Dict[str, Lis
                 host = str((target or {}).get("host") or "").strip().lower()
                 if not host:
                     continue
-                bucket = by_host.setdefault(host, [])
-                if query not in bucket:
-                    bucket.append(query)
-    return by_host
+                bucket = collected.setdefault(host, [])
+                if query not in (q for q, _ in bucket):
+                    bucket.append((query, bool(lq.get("broad_head_prompt"))))
+    # Niche-first per host: the moves slice [:3] of this list as "the measured
+    # reason to work this host" — a specific losing query must never be
+    # crowded out of that slice by a head baseline ("best headphones") that
+    # happens to be grounded in the same host. Stable: specific rows keep
+    # win-plan order and lead; head rows trail (kept — honest measurement).
+    return {
+        host: [q for q, _ in sorted(bucket, key=lambda t: t[1])]
+        for host, bucket in collected.items()
+    }
 
 
 def _outreach_moves(

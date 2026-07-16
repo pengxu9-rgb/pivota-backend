@@ -769,6 +769,79 @@ def test_sku_nba_head_only_substitution_skips_head_shaped_beachhead():
     assert "specific" in nba["first_move"].lower()
 
 
+def test_sku_nba_head_reframe_routed_lane_prescribes_why_buy_direct():
+    """Detail-move contract: when the beachhead lane is already CITED but the
+    buyer path resolves to a marketplace listing, the first move is winning
+    the ROUTE (why-buy-direct on the merchant's own page) — not "add a FAQ
+    that answers <the lane>", which reads as answering their own title. The
+    lane is phrased from its evidenced attributes, not the raw probe spec."""
+    opportunity = _sku_base_opportunity()
+    opportunity["substitution_alert"] = {
+        "present": True,
+        "prompt": "best headphones",
+        "substituted_by": "Bose",
+        "engines": ["gemini"],
+        "kind": "category",
+        "broad_head_prompt": True,
+    }
+    opportunity["sideways_wedge"] = {
+        "recommended_beachhead_lane": {
+            "query": "ip68 waterproof certified bone conduction headphones open-ear daily sports",
+            "ownership_state": "marketplace-owned",
+            "who_owns": "ebay.com",
+            "controllers": ["ebay.com", "mojawa.com"],
+            "attribute_basis": [
+                "ip68 waterproof certified", "bone conduction headphones",
+                "open-ear", "daily sports",
+            ],
+        },
+    }
+
+    nba = build_sku_next_best_action(
+        opportunity=opportunity,
+        scores=_sku_scores(),
+        identity=_sku_identity(),
+        sku_title="Purra Swim Headphones",
+    )
+    assert "owns the broad" in nba["headline"]
+    assert "routed through ebay.com" in nba["first_move"]
+    # Lane phrased from attributes; the raw stacked spec never quoted.
+    assert "the ip68 waterproof certified, bone conduction headphones, open-ear ask" in nba["first_move"]
+    assert "open-ear daily sports" not in nba["first_move"]
+    actions = " ".join(nba["self_serve_actions"])
+    assert "why-buy-direct" in actions
+    assert "ebay.com" in actions
+
+
+def test_sku_nba_head_reframe_competitor_owned_lane_leads_with_basis():
+    opportunity = _sku_base_opportunity()
+    opportunity["substitution_alert"] = {
+        "present": True,
+        "prompt": "best headphones",
+        "substituted_by": "Bose",
+        "engines": ["gemini"],
+        "kind": "category",
+        "broad_head_prompt": True,
+    }
+    opportunity["sideways_wedge"] = {
+        "recommended_beachhead_lane": {
+            "query": "bone conduction headphones for lap swimming",
+            "ownership_state": "competitor-owned",
+            "who_owns": "shokz.com",
+            "attribute_basis": ["bone conduction", "lap swimming"],
+        },
+    }
+
+    nba = build_sku_next_best_action(
+        opportunity=opportunity,
+        scores=_sku_scores(),
+        identity=_sku_identity(),
+        sku_title="Purra Swim Headphones",
+    )
+    assert "Take the bone conduction, lap swimming ask from shokz.com" in nba["first_move"]
+    assert "bone conduction, lap swimming" in " ".join(nba["self_serve_actions"])
+
+
 def test_sku_nba_head_only_substitution_without_beachhead_stays_specific():
     """No measured beachhead lane -> the reframe still avoids the vs-flagship
     prescription and points at the prompt table's specific asks."""

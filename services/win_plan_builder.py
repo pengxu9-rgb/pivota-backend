@@ -250,6 +250,38 @@ def is_broad_head_query(query: str, *, prompt_source: Any = None) -> bool:
     return _is_broad_head_query(query, prompt_source=prompt_source)
 
 
+def sort_specific_first(
+    rows: List[Dict[str, Any]],
+    *,
+    query_key: str = "query",
+    source_key: str = "prompt_source",
+) -> List[Dict[str, Any]]:
+    """Stable niche-first partition for any showcased-query pool: specific
+    rows keep their order and lead; broad head rows keep their order and
+    trail. Probe pools arrive in run order with the 1-2 head BASELINE probes
+    up front, so every surface that takes row[0] / [:N] without this partition
+    showcases the flagship fight first ('best headphones' -> Bose) — the exact
+    head-term trap the evidence selector, win plan, lane priority, and
+    substitution alert each had to fix separately. Head rows are kept (they
+    are honest measurements) — they just never crowd a specific row out of a
+    capped slice."""
+    specific: List[Dict[str, Any]] = []
+    head: List[Dict[str, Any]] = []
+    for row in rows:
+        if not isinstance(row, dict):
+            specific.append(row)
+            continue
+        bucket = (
+            head
+            if _is_broad_head_query(
+                row.get(query_key), prompt_source=row.get(source_key)
+            )
+            else specific
+        )
+        bucket.append(row)
+    return specific + head
+
+
 def _is_broad_head_query(query: str, *, prompt_source: Any = None) -> bool:
     if str(prompt_source or "").strip().lower() in _NEVER_HEAD_PROMPT_SOURCES:
         return False
@@ -269,6 +301,7 @@ def _losing_query_plan(
     *,
     merchant_name: Optional[str],
     merchant_category: Optional[str],
+    defer_head: bool = False,
 ) -> Dict[str, Any]:
     query = str(failing_prompt.get("query") or "").strip()
     resolved = _resolve_query_hosts(failing_prompt.get("grounding_sources") or [], uri_index)
@@ -308,6 +341,20 @@ def _losing_query_plan(
         None if broad_head else "own_content"
     )
     win_condition = _win_condition(query, targets)
+    # Niche-first prescription: a head term with publisher targets used to
+    # emit 'Get cited in techradar for "best headphones"' — selling a
+    # mid/long-tail brand the most expensive fight on the board. When the
+    # plan has specific losing queries (defer_head), the head row keeps its
+    # factual targets but its win condition reads as an explicit park-it:
+    # win the niches first, revisit the head term from a position of
+    # strength. Head-only plans keep the old copy (some plan beats none).
+    if broad_head and defer_head and targets:
+        hosts = " / ".join(t["host"] for t in targets[:3] if t.get("host"))
+        win_condition = (
+            f'{hosts} control this answer today, and "{query}" is a '
+            "big-budget head term — park it. Win your specific lanes first; "
+            "revisit this once your niches are cited."
+        )
     if not targets:
         # No independent target we can name for this query. Be specific about
         # WHY using only real resolved hosts — never invent a target. But a
@@ -358,6 +405,11 @@ def _losing_query_plan(
         "win_condition": win_condition,
         "win_path": win_path,
         "limit": limit,
+        # Classifier inputs/outcome ride the row so downstream consumers
+        # (outreach_moves' per-host losing_queries join, renderers) can order
+        # and badge without re-deriving the head classification.
+        "prompt_source": failing_prompt.get("prompt_source"),
+        "broad_head_prompt": broad_head,
     }
 
 
@@ -411,14 +463,29 @@ def _sku_plan(
             row["providers"].append(provider)
 
     uri_index = _uri_to_host_row(authority_hosts)
+    # Niche-first: the merge preserves probe order, which front-loads the 1-2
+    # head baseline probes — unsorted, "best headphones" led losing_queries[0]
+    # (and could crowd specific losses out of the cap entirely). Specific
+    # queries lead and fill the cap first; head rows trail as honest
+    # measurements. `defer_head` tells the row builder a specific alternative
+    # exists, so a head row's win_condition reads as an explicit
+    # park-this-for-now instead of a "get cited for <head>" prescription.
+    ordered_rows = sort_specific_first([merged[qk] for qk in order])
+    has_specific = any(
+        not _is_broad_head_query(
+            r.get("query"), prompt_source=r.get("prompt_source")
+        )
+        for r in ordered_rows
+    )
     losing_queries = [
         _losing_query_plan(
-            merged[query_key],
+            row,
             uri_index,
             merchant_name=merchant_name,
             merchant_category=merchant_category,
+            defer_head=has_specific,
         )
-        for query_key in order[:_MAX_LOSING_QUERIES_PER_SKU]
+        for row in ordered_rows[:_MAX_LOSING_QUERIES_PER_SKU]
     ]
 
     with_target = [q for q in losing_queries if q["grounds_in"]]
