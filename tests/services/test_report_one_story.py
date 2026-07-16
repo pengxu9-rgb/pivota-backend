@@ -339,3 +339,29 @@ def test_head_reframe_lane_phrase_skips_clause_length_attributes():
     )
     assert "no ear pressure no water trapped in ears" not in nba["first_move"]
     assert "the bone conduction headphones, open ear ask" in nba["first_move"]
+
+
+# --- verify flags are factual-only --------------------------------------------
+
+def test_verify_flag_gate_is_factual_only():
+    """Founder decision 2026-07-16 (the 'is Mojawa legit' misfire): an
+    editorial supports_recommendation=False alone must NOT flag — it's one
+    LLM's opinion of another LLM's answer and produced a provably-wrong
+    merchant-facing flag. Only a factual misstatement flags (and de-weights
+    the answer-quality score)."""
+    from services.agent_center_bd_report_service import _verify_output_flagged
+
+    editorial_only = {"verdict": {
+        "supports_recommendation": False, "misstates_facts": False,
+    }}
+    assert _verify_output_flagged(editorial_only) is False
+
+    factual = {"verdict": {
+        "supports_recommendation": True, "misstates_facts": True,
+    }}
+    assert _verify_output_flagged(factual) is True
+
+    clean = {"verdict": {
+        "supports_recommendation": True, "misstates_facts": False,
+    }}
+    assert _verify_output_flagged(clean) is False

@@ -1086,7 +1086,8 @@ def _verify_plain(verify_summary: Optional[Dict[str, Any]]) -> Dict[str, Any]:
             f"{reason_phrase}; accuracy is unconfirmed."
         )
     # The actual flagged citations: which query AI answered and WHY DeepSeek
-    # flagged it (misstates facts / doesn't support recommending you, + its note).
+    # flagged it (factual-only gate: misstates_facts; the editorial field
+    # survives for old persisted summaries, + its note).
     # Surfaced so "N flagged" is actionable, not just a count. Merchant-safe subset
     # of verify_summary.flagged_probes (already aggregated + capped upstream).
     flagged_examples = [

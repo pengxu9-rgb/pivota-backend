@@ -228,7 +228,8 @@ logger = logging.getLogger(__name__)
 _ANSWER_QUALITY_VERIFY_DEWEIGHT_RULE = (
     "answer_quality_rate is scored ONLY over verified prompts: of the "
     "citation-positive answers DeepSeek actually checked, the fraction that "
-    "held up (supports_recommendation!=false and not misstates_facts). "
+    "held up (not misstates_facts; the editorial supports_recommendation "
+    "axis is informational and does not flag or de-weight). "
     "Flagged verified prompts contribute 0; UNVERIFIED prompts are excluded "
     "from both numerator and denominator (so a tier that runs no verify — "
     "e.g. the free URL-wedge — scores 0 here rather than earning unchecked "
@@ -3699,11 +3700,17 @@ def _answer_quality_positive(run: Dict[str, Any]) -> bool:
 
 
 def _verify_output_flagged(output: Mapping[str, Any]) -> bool:
+    """Factual-only flag gate (founder decision 2026-07-16): a verify output
+    counts as flagged ONLY when DeepSeek found a factual misstatement about
+    the product. The editorial axis (supports_recommendation) is one LLM's
+    opinion about another LLM's answer — it duplicated what the intent/
+    citation classifiers already measure deterministically and produced a
+    provably-wrong merchant-facing flag ("only lists competitors" on an
+    answer with none). It stays in the payload as an internal signal (the
+    canonical-PDP enrichment executor targets on it) but never flags, never
+    de-weights the answer-quality score, and never reaches merchant copy."""
     verdict = output.get("verdict") if isinstance(output.get("verdict"), Mapping) else {}
-    return (
-        verdict.get("supports_recommendation") is False
-        or verdict.get("misstates_facts") is True
-    )
+    return verdict.get("misstates_facts") is True
 
 
 def _verify_outputs_by_prompt_key(
@@ -5609,10 +5616,13 @@ def build_evidence_play(
                 "publish as verifiable claims AI engines can cite."
             )
         if flagged:
+            # Flags are factual-only now — say what was actually found (wrong
+            # facts in AI answers), not "unsupported" (the retired editorial
+            # framing), and pitch evidence as the correction channel.
             moves.append(
-                f"AI flagged {flagged} answer(s) about your product as unsupported — "
-                "supplying evidence is what closes the 'can't substantiate' gap "
-                "and earns the citation."
+                f"AI stated wrong facts about your product in {flagged} "
+                "checked answer(s) — publishing your evidenced facts on the "
+                "canonical page gives AI a source to correct against."
             )
         if not moves:
             moves.append(
@@ -5627,7 +5637,8 @@ def build_evidence_play(
         for term in all_claims[:6]
     ]
     # The SPECIFIC answers verify flagged (query + why), so 'N answers
-    # unsupported' is actionable instead of a bare count.
+    # flagged' is actionable instead of a bare count. Flags are factual-only
+    # now; the else-branch survives defensively for old persisted summaries.
     flagged_answers = [
         {
             "query": q,
