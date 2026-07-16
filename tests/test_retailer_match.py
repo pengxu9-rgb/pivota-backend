@@ -62,6 +62,22 @@ def test_leading_brand_prefix_in_title_stripped():
     assert "cosrx" in retailer_match_key("COSRX", "Official COSRX Snail Cream")
 
 
+def test_storefront_official_vendor_matches_plain_brand():
+    # Shopify vendor "COSRX Official" must key the same as catalog "COSRX",
+    # including the brand-prefix-in-title strip firing on both sides.
+    assert retailer_match_key("COSRX Official", "COSRX Red Rice Inositol Pore Wash") == \
+           retailer_match_key("COSRX", "Red Rice Inositol Pore Wash 150ml")
+
+
+def test_descriptor_strip_does_not_corrupt_real_brands():
+    # 'shop'/'beauty'/'store' are real brand words — never stripped.
+    from services.pdp_matcher.retailer_match import match_brand
+    assert match_brand("The Face Shop") == "the face shop"
+    assert match_brand("Huda Beauty") == "huda beauty"
+    assert match_brand("COSRX Official") == "cosrx"
+    assert match_brand("Official") == "official"  # never strips to empty
+
+
 def test_empty_when_brand_or_title_missing():
     assert retailer_match_key(None, "Some Toner") == ""
     assert retailer_match_key("COSRX", "") == ""
