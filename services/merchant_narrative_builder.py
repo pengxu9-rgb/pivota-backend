@@ -480,6 +480,17 @@ _WEAK_SIGNAL_NOTE = (
 )
 
 
+def _has_losing_queries(win_plan: Optional[Dict[str, Any]]) -> bool:
+    if not isinstance(win_plan, dict) or not win_plan.get("available"):
+        return False
+    return any(
+        isinstance(lq, dict) and str(lq.get("query") or "").strip()
+        for plan in win_plan.get("sku_plans") or []
+        if isinstance(plan, dict)
+        for lq in plan.get("losing_queries") or []
+    )
+
+
 def _top_specific_losing_query(win_plan: Optional[Dict[str, Any]]) -> Optional[str]:
     """The strongest SPECIFIC losing query in the win plan (rows are already
     niche-first, so the first non-head row is the top one). None when the plan
@@ -868,16 +879,28 @@ def _where_youre_losing(
         # plan measured one; the endorsement-only copy remains the honest
         # fallback when nothing was actually lost.
         top_loss = _top_specific_losing_query(win_plan)
+        shown_hosts = endorsement_hosts[:4]
+        recommends = "recommend" if len(shown_hosts) > 1 else "recommends"
         if top_loss:
             text = (
-                f"{', '.join(endorsement_hosts[:4])} already recommends "
+                f"{', '.join(shown_hosts)} already {recommends} "
                 f"{merchant_name or 'the brand'} — the open losses are the "
                 f'asks nobody grounds you for yet, like "{top_loss}".'
+            )
+        elif _has_losing_queries(win_plan):
+            # Every measured loss was a broad head baseline — saying "no
+            # measured category loss" here would contradict the win-plan
+            # summary's losing-query count on the same panel.
+            text = (
+                f"{', '.join(shown_hosts)} already {recommends} "
+                f"{merchant_name or 'the brand'} — the only measured "
+                "category losses are broad head terms; park those and "
+                "defend the specific lanes you own."
             )
         else:
             text = (
                 f"{merchant_name or 'The brand'} earns independent category "
-                f"recommendation from {', '.join(endorsement_hosts[:4])} — "
+                f"recommendation from {', '.join(shown_hosts)} — "
                 "no measured category loss this run."
             )
     elif findable:
@@ -1152,6 +1175,10 @@ def _prioritized_actions(per_sku_reports: List[Dict[str, Any]]) -> List[Dict[str
                 "why_this_first": move.get("reason"),
                 "growth_phase": phase,
                 "growth_phase_label": _GROWTH_PHASE_LABEL.get(phase, phase),
+                # Marks rows built from NBA secondary_moves — the summary's
+                # top_actions must NOT attach the primary NBA's evidence/CTA
+                # to these (the sku_title fallback join would).
+                "action_source": "secondary",
             })
     return actions[:5]
 

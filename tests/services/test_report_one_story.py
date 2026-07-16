@@ -216,6 +216,84 @@ def test_prioritized_actions_surface_secondary_moves():
     assert any(h.startswith("Re-test failed SKU prompt") for h in headlines)
 
 
+def test_losing_summary_head_only_losses_dont_claim_no_loss():
+    """Every measured loss being a head baseline must not read as 'no measured
+    category loss' — the win-plan summary on the same panel counts them."""
+    from services.merchant_narrative_builder import _where_youre_losing
+
+    head_only_plan = {
+        "available": True,
+        "sku_plans": [{
+            "losing_queries": [
+                {"query": "best headphones", "broad_head_prompt": True,
+                 "grounds_in": []},
+            ],
+        }],
+    }
+    out = _where_youre_losing(
+        "Mojawa", {"hosts": []}, _endorsed_summary(), win_plan=head_only_plan,
+    )
+    text = str(out.get("summary") or "")
+    assert "broad head terms" in text
+    assert "no measured category loss" not in text
+
+
+def test_losing_summary_pluralizes_multiple_endorsers():
+    from services.merchant_narrative_builder import _where_youre_losing
+
+    summary = _endorsed_summary()
+    summary["endorsement_category_hosts"] = ["wired.com", "rtings.com"]
+    summary["endorsement_hosts"] = ["wired.com", "rtings.com"]
+    out = _where_youre_losing(
+        "Mojawa", {"hosts": []}, summary, win_plan=_win_plan_with_loss(),
+    )
+    text = str(out.get("summary") or "")
+    assert "wired.com, rtings.com already recommend Mojawa" in text
+
+
+def test_top_actions_secondary_rows_never_inherit_primary_evidence():
+    """Review P1: the sku_title fallback join attached the PRIMARY NBA's
+    evidence, tracking, and CTA to secondary-move rows — duplicated,
+    wrongly-attributed evidence whose CTA performed the primary's action."""
+    from services.report_summary_builder import _top_actions
+
+    narrative = {
+        "prioritized_actions": [
+            {"sku_title": "Purra Swim", "primary_gap": "citation",
+             "headline": "Primary headline", "first_move": "Primary move",
+             "why_this_first": "…", "growth_phase": "create_and_distribute"},
+            {"sku_title": "Purra Swim", "primary_gap": None,
+             "headline": "Add the missing product facts",
+             "first_move": "Add specs to the PDP.",
+             "why_this_first": "Named in the gap evidence.",
+             "growth_phase": "evidence_intake",
+             "action_source": "secondary"},
+        ],
+    }
+    per_sku = [{
+        "sku_key": "sku-1",
+        "sku_title": "Purra Swim",
+        "next_best_action": {
+            "headline": "Primary headline",
+            "primary_gap": "citation",
+            "evidence_summary": "PRIMARY EVIDENCE",
+            "how_to_track": ["track primary"],
+            "cta": {"label": "Do the primary", "target_sku_key": "sku-1"},
+        },
+    }]
+    rows = _top_actions(narrative, per_sku)
+    primary = next(r for r in rows if r["headline"] == "Primary headline")
+    secondary = next(
+        r for r in rows if r["headline"] == "Add the missing product facts"
+    )
+    assert primary["evidence_summary"] == "PRIMARY EVIDENCE"
+    assert primary["cta"]
+    assert secondary["evidence_summary"] is None
+    assert secondary["cta"] is None
+    assert secondary["how_to_track"] == []
+    assert secondary["first_move"] == "Add specs to the PDP."
+
+
 # --- attribute phrase cap ----------------------------------------------------------
 
 def test_head_reframe_lane_phrase_skips_clause_length_attributes():

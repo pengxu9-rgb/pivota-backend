@@ -377,6 +377,16 @@ def _top_actions(
             continue
         sku_report = _match_sku_report(action, per_sku_reports)
         nba = _as_dict(sku_report.get("next_best_action"))
+        # Secondary rows (NBA secondary_moves surfaced into the plan) carry
+        # their own first_move/reason — the sku_title fallback join above
+        # would otherwise attach the PRIMARY action's evidence, tracking, and
+        # CTA under a secondary headline (duplicated, wrongly-attributed
+        # evidence; the CTA would even perform the primary's action).
+        is_secondary = (
+            str(action.get("action_source") or "").strip() == "secondary"
+        )
+        if is_secondary:
+            nba = {}
         prompts, basis = _supporting_prompts(nba, sku_report)
         cta = _as_dict(nba.get("cta"))
         gap_key = str(action.get("primary_gap") or "").strip().lower()
@@ -400,7 +410,7 @@ def _top_actions(
                 "sku_title": action.get("sku_title"),
                 "target_sku_key": cta.get("target_sku_key")
                 or sku_report.get("sku_key"),
-                "cta": cta or None,
+                "cta": (cta or None) if not is_secondary else None,
                 "supporting_prompts": prompts,
                 "supporting_prompts_basis": basis,
             }
