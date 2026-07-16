@@ -698,6 +698,103 @@ def test_sku_nba_substitution_names_substitute_in_first_move():
     _assert_70_30(nba)
 
 
+def test_sku_nba_head_only_substitution_reframes_not_vs_flagship():
+    """Niche-first reframe: when the only substitution evidence is a broad
+    head prompt (Bose owns "best headphones"), the action must NOT prescribe
+    a vs-flagship comparison as the first move — it names the reality and
+    points at the measured beachhead lane instead."""
+    opportunity = _sku_base_opportunity()
+    opportunity["substitution_alert"] = {
+        "present": True,
+        "prompt": "best headphones",
+        "substituted_by": "Bose",
+        "engines": ["chatgpt", "gemini"],
+        "kind": "category",
+        "broad_head_prompt": True,
+    }
+    opportunity["sideways_wedge"] = {
+        "recommended_beachhead_lane": {
+            "query": "bone conduction headphones for lap swimming",
+        },
+    }
+
+    nba = build_sku_next_best_action(
+        opportunity=opportunity,
+        scores=_sku_scores(),
+        identity=_sku_identity(),
+        sku_title="Purra Swim Headphones",
+    )
+
+    assert nba["primary_gap"] == PRIMARY_SKU_SUBSTITUTION_LEAK
+    # Names the reality without selling the head fight...
+    assert "Bose" in nba["headline"]
+    assert "owns the broad" in nba["headline"]
+    # ...and the first move is the winnable beachhead, not a comparison page.
+    assert "bone conduction headphones for lap swimming" in nba["first_move"]
+    assert "comparison —" not in nba["first_move"]
+    assert "vs" not in nba["first_move"].lower().split()
+    # Review round: the tracking metric must not tell the merchant to track a
+    # comparison page the same card told them not to build.
+    tracking = " ".join(nba.get("how_to_track") or nba.get("tracking_metrics") or [])
+    assert "comparison page" not in tracking.lower()
+    _assert_70_30(nba)
+
+
+def test_sku_nba_head_only_substitution_skips_head_shaped_beachhead():
+    """The beachhead is picked by a different classifier than the head flag —
+    when the recommended lane IS the flagged head prompt (or head-shaped
+    itself), the reframe must not render "X owns Q — win Q first"."""
+    opportunity = _sku_base_opportunity()
+    opportunity["substitution_alert"] = {
+        "present": True,
+        "prompt": "best waterproof earbuds",
+        "substituted_by": "Shokz",
+        "engines": ["gemini"],
+        "kind": "category",
+        "broad_head_prompt": True,
+    }
+    opportunity["sideways_wedge"] = {
+        "recommended_beachhead_lane": {"query": "best waterproof earbuds"},
+    }
+
+    nba = build_sku_next_best_action(
+        opportunity=opportunity,
+        scores=_sku_scores(),
+        identity=_sku_identity(),
+        sku_title="Purra Swim Headphones",
+    )
+    assert "owns the broad" in nba["headline"]
+    # Falls back to the generic specific-ask copy, never "win <head Q> first".
+    assert 'Win "best waterproof earbuds" first' not in nba["first_move"]
+    assert "specific" in nba["first_move"].lower()
+
+
+def test_sku_nba_head_only_substitution_without_beachhead_stays_specific():
+    """No measured beachhead lane -> the reframe still avoids the vs-flagship
+    prescription and points at the prompt table's specific asks."""
+    opportunity = _sku_base_opportunity()
+    opportunity["substitution_alert"] = {
+        "present": True,
+        "prompt": "best headphones",
+        "substituted_by": "Bose",
+        "engines": ["gemini"],
+        "kind": "category",
+        "broad_head_prompt": True,
+    }
+
+    nba = build_sku_next_best_action(
+        opportunity=opportunity,
+        scores=_sku_scores(),
+        identity=_sku_identity(),
+        sku_title="Purra Swim Headphones",
+    )
+
+    assert nba["primary_gap"] == PRIMARY_SKU_SUBSTITUTION_LEAK
+    assert "owns the broad" in nba["headline"]
+    assert "specific" in nba["first_move"].lower()
+    assert "comparison —" not in nba["first_move"]
+
+
 def test_blocked_thin_content_leads_with_foundation_not_substitution():
     """#9 (ANUKO 2026-07-02): a blocked SKU (content 14) with a substitution
     alert must lead with the content foundation fix, not a 'vs competitor'

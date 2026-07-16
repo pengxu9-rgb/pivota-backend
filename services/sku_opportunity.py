@@ -1668,23 +1668,46 @@ def _substitution_alert(per_prompt: List[Dict[str, Any]]) -> Dict[str, Any]:
     ]
     if not alerts:
         return {"present": False}
+    # Niche-first showcase: a broad head prompt ("best headphones") carries the
+    # highest demand_signal by construction, so sorting on demand alone made
+    # the alert lead with the hardest possible fight on every audit (the basis
+    # deliberately keeps 1-2 head baseline probes). Prefer the strongest
+    # NON-head substitution — shared win-plan classifier; LLM spec-matched and
+    # merchant-authored prompts are exempt via prompt_source — and fall back
+    # to a head prompt only when it is the ONLY substitution evidence, flagged
+    # so the action copy reframes ("a big-budget fight — win your specific
+    # lane first") instead of prescribing a vs-flagship comparison first move.
+    from services.win_plan_builder import is_broad_head_query
+
+    def _is_head(row: Dict[str, Any]) -> bool:
+        return is_broad_head_query(
+            row.get("query"), prompt_source=row.get("prompt_source"),
+        )
+
     alerts.sort(
         key=lambda row: (
+            _is_head(row),
             -float(row.get("demand_signal") or 0),
             -len(row.get("substitution", {}).get("engines") or []),
             str(row.get("query") or "").lower(),
         )
     )
-    sub = alerts[0]["substitution"]
+    top_row = alerts[0]
+    sub = top_row["substitution"]
     return {
         "present": True,
-        "prompt": sub.get("prompt") or alerts[0].get("query"),
+        "prompt": sub.get("prompt") or top_row.get("query"),
         "substituted_by": sub.get("substituted_by"),
         "engines": sub.get("engines") or [],
         # "category" = displaced organically in its own category lane;
         # "branded" = brand named in the query but loses. Lets the UI phrase it
         # ("AI recommends X for <category>" vs "…when buyers search your name").
         "kind": sub.get("kind"),
+        # True only when EVERY substitution row was a broad head prompt (the
+        # sort puts any non-head row first) — the showcased loss is then a
+        # flagship-owned head term, and the action copy must not sell it as
+        # the winnable first move.
+        "broad_head_prompt": _is_head(top_row),
     }
 
 

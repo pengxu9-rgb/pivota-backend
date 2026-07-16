@@ -28,6 +28,7 @@ from services.sku_lane_priority import (
     is_third_party_controlled_lane,
     prioritize_lanes,
 )
+from services.win_plan_builder import is_broad_head_query
 
 
 logger = logging.getLogger(__name__)
@@ -562,6 +563,85 @@ def _sku_prescription_for_gap(
     if primary_gap == PRIMARY_SKU_SUBSTITUTION_LEAK:
         substitute = str(substitution.get("substituted_by") or "a competitor").strip()
         prompt = _sku_query_phrase(substitution.get("prompt"))
+        # Niche-first reframe: when the ONLY substitution evidence is a broad
+        # head prompt ("best headphones" -> Bose), a "publish a vs-Bose
+        # comparison" first move sells a mid/long-tail brand the hardest
+        # possible fight. Name the reality (flagship owns the head question)
+        # and point the first move at the specific lane the brand can win —
+        # the measured beachhead lane when one exists, the specific buyer
+        # asks in the prompt table otherwise. Specific-prompt substitutions
+        # keep the comparison play below (there the fight IS winnable).
+        if substitution.get("broad_head_prompt"):
+            beachhead = _as_mapping(
+                sideways_wedge.get("recommended_beachhead_lane")
+            )
+            # The beachhead is picked by a DIFFERENT classifier (axis/lane
+            # shape) than the head flag (query text shape) — an attribute-axis
+            # prompt like "best waterproof earbuds" can be both the flagged
+            # head prompt AND the beachhead, which would render "X owns the
+            # broad Q — win Q first". Only pivot to a beachhead that is
+            # specific by the SAME text classifier, isn't the alert prompt
+            # itself, and isn't a synthetic padding query (which _sku_query_
+            # phrase would blur into circular "category question" copy).
+            _bh_raw = str(beachhead.get("query") or "").strip()
+            _alert_raw = str(substitution.get("prompt") or "").strip()
+            beachhead_query = (
+                _sku_query_phrase(_bh_raw)
+                if (
+                    _bh_raw
+                    and _bh_raw.lower() != _alert_raw.lower()
+                    and not is_synthetic_probe_query(_bh_raw)
+                    and not is_broad_head_query(
+                        _bh_raw, prompt_source=beachhead.get("prompt_source"),
+                    )
+                )
+                else None
+            )
+            first_move = (
+                f"Win {beachhead_query} first — add a page section and FAQ "
+                "that answer it."
+                if beachhead_query
+                else (
+                    "Win a specific buyer question first — pick one from "
+                    "your prompt table and answer it on your page."
+                )
+            )
+            return _base_payload(
+                primary_gap=primary_gap,
+                headline=(
+                    f"{substitute} owns the broad {prompt} question — "
+                    "win your specific lane first."
+                ),
+                why_this_first=(
+                    f"On {prompt}, AI answers with {substitute}. That's a "
+                    "big-budget head term — outranking them there is the "
+                    "most expensive first fight you can pick. The faster win "
+                    "is the specific ask you're already a match for; head "
+                    "visibility follows brands that own their niches."
+                ),
+                first_move=first_move,
+                self_serve_actions=[
+                    (
+                        f"Answer {beachhead_query} on your product page in "
+                        "plain buyer words, leading with what makes you the "
+                        "match."
+                        if beachhead_query
+                        else (
+                            "Pick the most specific losing question in your "
+                            "prompt table and answer it on your product page "
+                            "in plain buyer words."
+                        )
+                    ),
+                    (
+                        "Give AI a reason to cite you there: a couple of real "
+                        "reviews and one use-case comparison page — not a "
+                        f"head-on {substitute} fight."
+                    ),
+                ],
+                pivota_path=first_pivota_path,
+                evidence_used=evidence,
+                cta=_sku_cta("Win the specific ask AI already gets"),
+            )
         # If the grounded winner probe assessed THIS substitute, fold in the
         # decision factors AI credits them with so the comparison meets them
         # head-on instead of a generic "vs" page. Only when the names match, so
@@ -2693,6 +2773,14 @@ def _tracking_metrics_for_gap(
             "Answers citing the official SKU page instead of leaving the lane unowned.",
         ]
     if primary_gap == PRIMARY_SKU_SUBSTITUTION_LEAK:
+        # Head-reframed action (broad_head_prompt): the copy told the merchant
+        # NOT to build a vs-flagship comparison page — the tracked artifact is
+        # the specific-lane answer, not a comparison page it advised against.
+        if _as_mapping(evidence.get("substitution_alert")).get("broad_head_prompt"):
+            return [
+                "Repeat check of the specific lane you targeted — answers naming this SKU there.",
+                f"Answers citing your page for that lane instead of defaulting to {substitute}.",
+            ]
         return [
             f"Alternative prompts that name this SKU instead of {substitute}.",
             "Answers citing the official comparison page or product proof.",
