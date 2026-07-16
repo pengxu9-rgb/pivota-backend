@@ -95,11 +95,14 @@ def _first_branded_excerpt(per_sku_reports: List[Dict[str, Any]]) -> Optional[Di
             # signal degrade to None rather than guessing.
             if not ev.get("product_visible"):
                 continue
-            source_labels = [
+            # Dedupe: grounded answers often cite the same host several
+            # times — "mojawa.com, mojawa.com, mojawa.com, mojawa.com" read
+            # as a rendering bug.
+            source_labels = list(dict.fromkeys(
                 (s.get("title") or s.get("uri") or "").strip()
                 for s in sources
                 if isinstance(s, dict) and (s.get("title") or s.get("uri"))
-            ]
+            ))
             return {
                 "sku_title": report.get("sku_title"),
                 "query": ev.get("query"),
@@ -477,6 +480,34 @@ _WEAK_SIGNAL_NOTE = (
 )
 
 
+def _has_losing_queries(win_plan: Optional[Dict[str, Any]]) -> bool:
+    if not isinstance(win_plan, dict) or not win_plan.get("available"):
+        return False
+    return any(
+        isinstance(lq, dict) and str(lq.get("query") or "").strip()
+        for plan in win_plan.get("sku_plans") or []
+        if isinstance(plan, dict)
+        for lq in plan.get("losing_queries") or []
+    )
+
+
+def _top_specific_losing_query(win_plan: Optional[Dict[str, Any]]) -> Optional[str]:
+    """The strongest SPECIFIC losing query in the win plan (rows are already
+    niche-first, so the first non-head row is the top one). None when the plan
+    is unavailable or every loss was a head baseline."""
+    if not isinstance(win_plan, dict) or not win_plan.get("available"):
+        return None
+    for plan in win_plan.get("sku_plans") or []:
+        if not isinstance(plan, dict):
+            continue
+        for lq in plan.get("losing_queries") or []:
+            if isinstance(lq, dict) and not lq.get("broad_head_prompt"):
+                query = str(lq.get("query") or "").strip()
+                if query:
+                    return query
+    return None
+
+
 def _losing_queries_by_host(win_plan: Optional[Dict[str, Any]]) -> Dict[str, List[str]]:
     """Invert the win plan's query->grounds_in join: for each independent
     host, the LOSING category queries whose grounded answers cited it. This is
@@ -840,10 +871,38 @@ def _where_youre_losing(
     ))
     findable = bool(summary.get("findability_hosts"))
     if endorsed_category:
-        text = (
-            f"{merchant_name or 'The brand'} earns independent category "
-            f"recommendation from {', '.join(endorsement_hosts[:4])}."
-        )
+        # This summary heads the "where you're losing" section (and the
+        # summary top-finding) — it must LEAD with a loss. The endorsement is
+        # real and stays in the sentence, but an endorsement-only line here
+        # made the losing section open with a win (holistic review
+        # 2026-07-16). Lead with the top specific losing query when the win
+        # plan measured one; the endorsement-only copy remains the honest
+        # fallback when nothing was actually lost.
+        top_loss = _top_specific_losing_query(win_plan)
+        shown_hosts = endorsement_hosts[:4]
+        recommends = "recommend" if len(shown_hosts) > 1 else "recommends"
+        if top_loss:
+            text = (
+                f"{', '.join(shown_hosts)} already {recommends} "
+                f"{merchant_name or 'the brand'} — the open losses are the "
+                f'asks nobody grounds you for yet, like "{top_loss}".'
+            )
+        elif _has_losing_queries(win_plan):
+            # Every measured loss was a broad head baseline — saying "no
+            # measured category loss" here would contradict the win-plan
+            # summary's losing-query count on the same panel.
+            text = (
+                f"{', '.join(shown_hosts)} already {recommends} "
+                f"{merchant_name or 'the brand'} — the only measured "
+                "category losses are broad head terms; park those and "
+                "defend the specific lanes you own."
+            )
+        else:
+            text = (
+                f"{merchant_name or 'The brand'} earns independent category "
+                f"recommendation from {', '.join(shown_hosts)} — "
+                "no measured category loss this run."
+            )
     elif findable:
         text = (
             "When shoppers ask the category question, no independent source "
@@ -1007,10 +1066,14 @@ def _verify_plain(verify_summary: Optional[Dict[str, Any]]) -> Dict[str, Any]:
             if flagged == 0
             else f"{flagged} flagged for accuracy"
         )
+        closer = (
+            "reach is real and accuracy checked out on this sample."
+            if flagged == 0
+            else "reach is real, accuracy is the watch item."
+        )
         text = (
             f"DeepSeek answer-quality verify checked {checked} of {candidates} "
-            f"cited answers: {held} held up, {accuracy} — reach is real, "
-            "accuracy is the watch item."
+            f"cited answers: {held} held up, {accuracy} — {closer}"
         )
     elif status in {"completed", "partial"}:
         text = (
@@ -1080,6 +1143,43 @@ def _prioritized_actions(per_sku_reports: List[Dict[str, Any]]) -> List[Dict[str
     # evidence intake; stable within phase by SKU order.
     phase_order = {"create_and_distribute": 0, "evidence_intake": 1}
     actions.sort(key=lambda a: phase_order.get(a["growth_phase"], 9))
+    # Holistic review 2026-07-16: a single-SKU audit rendered exactly ONE
+    # action — each NBA's secondary moves (next-biggest gap repairs + prompt
+    # re-tests) were computed but never reached the plan. Append them AFTER
+    # the primaries (never ahead: the primary is the diagnosed first move).
+    for report in per_sku_reports or []:
+        if not isinstance(report, dict):
+            continue
+        nba = report.get("next_best_action")
+        nba = nba if isinstance(nba, dict) else {}
+        for move in nba.get("secondary_moves") or []:
+            if not isinstance(move, dict):
+                continue
+            title = str(move.get("title") or "").strip()
+            if not title:
+                continue
+            key = ("secondary", title.lower())
+            if key in seen:
+                continue
+            seen.add(key)
+            phase = (
+                "create_and_distribute"
+                if str(move.get("lever") or "") == "sku_prompt_retest"
+                else "evidence_intake"
+            )
+            actions.append({
+                "sku_title": report.get("sku_title"),
+                "primary_gap": None,
+                "headline": title,
+                "first_move": move.get("concrete_next_step"),
+                "why_this_first": move.get("reason"),
+                "growth_phase": phase,
+                "growth_phase_label": _GROWTH_PHASE_LABEL.get(phase, phase),
+                # Marks rows built from NBA secondary_moves — the summary's
+                # top_actions must NOT attach the primary NBA's evidence/CTA
+                # to these (the sku_title fallback join would).
+                "action_source": "secondary",
+            })
     return actions[:5]
 
 

@@ -1188,6 +1188,8 @@ def _explain_verdict(
     visibility_score: int,
     attribution_score: int,
     evidence: Dict[str, Any],
+    *,
+    metric_label: Optional[str] = None,
 ) -> str:
     """Compose the merchant-facing diagnostic paragraph for a verdict.
 
@@ -1203,6 +1205,24 @@ def _explain_verdict(
     minimal generic sentence that's still data-bound on score values
     and still pitch-free.
     """
+    # Lens labeling: the per-SKU path derives BOTH numbers from the citation
+    # median (the legacy dual-metric vocabulary predates it), so printing
+    # "visibility 48/100, attribution 48/100" collided with the summary score
+    # block's differently-defined visibility subscore in the same report.
+    # metric_label names the single metric honestly ("citation score 48/100").
+    scores_phrase = (
+        f"{metric_label} score {visibility_score}/100"
+        if metric_label
+        else (
+            f"visibility {visibility_score}/100, "
+            f"attribution {attribution_score}/100"
+        )
+    )
+    vis_phrase = (
+        f"{metric_label} score {visibility_score}/100"
+        if metric_label
+        else f"visibility {visibility_score}/100"
+    )
     runs_total = evidence.get("attribution_runs_total")
     cited = evidence.get("merchant_cited_runs")
     top_retailers: List[str] = evidence.get("top_retailers") or []
@@ -1283,8 +1303,8 @@ def _explain_verdict(
         if has_evidence:
             losing = max(0, (runs_total or 0) - (cited or 0))
             base = (
-                f"AI agents surface your product (visibility "
-                f"{visibility_score}/100). {your_url_label} was cited "
+                f"AI agents surface your product ({vis_phrase}). "
+                f"{your_url_label} was cited "
                 f"in {cited} of {runs_total} buyer-intent queries"
             )
             if losing > 0 and retailers_phrase:
@@ -1401,8 +1421,7 @@ def _explain_verdict(
         if mention_only:
             return (
                 f"AI names your brand in {cited} of {runs_total} buyer-intent "
-                f"queries (visibility {visibility_score}/100, attribution "
-                f"{attribution_score}/100), but your own page is cited in none "
+                f"queries ({scores_phrase}), but your own page is cited in none "
                 "of them — buyers are routed to third-party listings, not your "
                 "site. The open lever is turning those brand mentions into "
                 "citations of your own page and independent endorsements — see "
@@ -1435,8 +1454,7 @@ def _explain_verdict(
                 else "AI agents reliably surface this product for "
             )
             ratio_clause = (
-                f"buyer-intent queries (visibility {visibility_score}/100, "
-                f"attribution {attribution_score}/100) — "
+                f"buyer-intent queries ({scores_phrase}) — "
                 if has_evidence
                 else "branded buyer-intent queries AND cite your URL — "
             )
@@ -1451,8 +1469,7 @@ def _explain_verdict(
         if has_evidence:
             return (
                 f"AI agents cite your URL in {url_cited_count} of {runs_total} "
-                f"buyer-intent queries (visibility {visibility_score}/100, "
-                f"attribution {attribution_score}/100). Both discovery "
+                f"buyer-intent queries ({scores_phrase}). Both discovery "
                 "and attribution are at goal state. Remaining leverage "
                 "points are post-discovery — conversion friction, schema "
                 "drift detection, new-competitor early warning."
@@ -1467,8 +1484,7 @@ def _explain_verdict(
     if has_evidence:
         losing = max(0, (runs_total or 0) - (cited or 0))
         base = (
-            f"Mixed result — visibility {visibility_score}/100, "
-            f"attribution {attribution_score}/100. Of {runs_total} "
+            f"Mixed result — {scores_phrase}. Of {runs_total} "
             f"buyer-intent queries, {cited} cited {your_url_label.lower()}"
         )
         if losing > 0 and retailers_phrase:
@@ -1552,8 +1568,13 @@ def _per_sku_brand_verdict(
             return BRAND_STATE_BLOCKED_PRE_INDEX, label, explanation
         label, explanation = _BRAND_VERDICT_INSUFFICIENT_SIGNAL
         return BRAND_STATE_INSUFFICIENT_SIGNAL, label, explanation
+    # Both args are the CITATION median (this path has no separate
+    # visibility measurement) — metric_label makes the copy say so instead
+    # of borrowing the legacy "visibility X/100, attribution Y/100" pair,
+    # which collided with the summary score block's visibility subscore.
     label, explanation = verdict_for(
         int(median_citation), int(median_citation), evidence=evidence,
+        metric_label="citation",
     )
     return BRAND_STATE_SCORED, label, explanation
 
@@ -1565,6 +1586,7 @@ def verdict_for(
     *,
     category_visibility_score: Optional[int] = None,
     evidence: Optional[Dict[str, Any]] = None,
+    metric_label: Optional[str] = None,
 ) -> Tuple[str, str]:
     """Categorize the (visibility, attribution) pair into a verdict
     verdicts and emit an evidence-bound diagnostic paragraph. Returns
@@ -1654,7 +1676,8 @@ def verdict_for(
         # this run's cited hosts aren't classified as retailers. Do NOT
         # downgrade the gap-driven verdict to PARTIAL on host classification.
     explanation = _explain_verdict(
-        label, visibility_score, attribution_score, evidence_dict
+        label, visibility_score, attribution_score, evidence_dict,
+        metric_label=metric_label,
     )
     return label, peer_prefix + explanation
 
@@ -6773,14 +6796,33 @@ _BLOCKED_BUT_CITED_BAND_DISPLAY: Dict[str, str] = {
     "meaning": "AI already recommends this sometimes, but gaps elsewhere keep it from being reliably identified and bought.",
 }
 
+# Same softening for the found-not-endorsed case: nonzero citations, but every
+# discovery appearance came via a LISTING retrieval (recommended 0). Saying
+# "AI already recommends this" beside a discovery panel showing recommended
+# 0/N read as the report disagreeing with itself — "recommended" must mean the
+# same thing in the label as in the split it sits next to.
+_BLOCKED_BUT_FOUND_BAND_DISPLAY: Dict[str, str] = {
+    "label": "Found by AI, but not agent-ready",
+    "meaning": (
+        "AI already finds this product — mostly via your listings, not yet as "
+        "an independent recommendation — and gaps elsewhere keep it from being "
+        "reliably identified and bought."
+    ),
+}
+
 
 def _band_display(
-    band: str, scores: Optional[Dict[str, Any]] = None
+    band: str,
+    scores: Optional[Dict[str, Any]] = None,
+    *,
+    listing_only: Optional[bool] = None,
 ) -> Dict[str, str]:
     """Merchant-safe {band, label, meaning} for a SKU-level (or rollup) band.
 
     Pass the SKU's `scores` to enable the blocked-but-cited softening; omit it
-    (default) for a plain enum→copy map.
+    (default) for a plain enum→copy map. `listing_only=True` (discovery
+    appearances were all listing retrievals, zero independent recommendations)
+    swaps "Recommended" for the honest "Found by AI" variant.
     """
     copy_ = _BAND_DISPLAY.get(band, _BAND_DISPLAY["blocked"])
     label, meaning = copy_["label"], copy_["meaning"]
@@ -6788,8 +6830,13 @@ def _band_display(
         citation = scores.get("citation")
         citation_score = citation.get("score") if isinstance(citation, dict) else None
         if citation_score is not None and _band_for_score(citation_score) != "blocked":
-            label = _BLOCKED_BUT_CITED_BAND_DISPLAY["label"]
-            meaning = _BLOCKED_BUT_CITED_BAND_DISPLAY["meaning"]
+            softened = (
+                _BLOCKED_BUT_FOUND_BAND_DISPLAY
+                if listing_only
+                else _BLOCKED_BUT_CITED_BAND_DISPLAY
+            )
+            label = softened["label"]
+            meaning = softened["meaning"]
     return {"band": band, "label": label, "meaning": meaning}
 
 
@@ -7202,6 +7249,20 @@ async def build_per_sku_report(
             ).prompts
         }
 
+    # Hoisted (was inline in the dict): the band label needs the discovery
+    # recommended-vs-listing split — "Recommended, but not agent-ready" beside
+    # a discovery panel showing recommended 0/8 read as the report disagreeing
+    # with itself. listing_only=True when every discovery appearance came via
+    # a listing retrieval, i.e. found-not-endorsed.
+    _pc = build_product_competitiveness(
+        opportunity.get("per_prompt") if isinstance(opportunity, dict) else None
+    )
+    _pc_disc = _pc.get("discovery") or {}
+    _pc_listing_only = bool(
+        (_pc_disc.get("appeared") or 0) > 0
+        and not (_pc_disc.get("appeared_recommended") or 0)
+    )
+
     report = {
         "sku_key": sku_key,
         "product_key": _seed_pk or sku_ctx.get("product_key") or product.get("product_key"),
@@ -7220,8 +7281,12 @@ async def build_per_sku_report(
         # Merchant-safe label + meaning for the SKU-level band so the frontend
         # never renders the raw enum (e.g. "band: agent_ready"). `scores` is
         # passed so a blocked band with partial+ citation gets the coherent
-        # blocked-but-cited copy instead of "Not yet visible".
-        "band_display": _band_display(sku_band, scores),
+        # blocked-but-cited copy instead of "Not yet visible"; listing_only
+        # keeps that copy honest ("Found by AI" vs "Recommended") next to the
+        # discovery recommended-vs-listing split.
+        "band_display": _band_display(
+            sku_band, scores, listing_only=_pc_listing_only
+        ),
         "primary_gaps": primary_gaps,
         # W2 pinned measurement basis: the LLM-generated prompt lists this SKU
         # was measured against, with a stable prompt_set_id. The NEXT run's
@@ -7255,9 +7320,7 @@ async def build_per_sku_report(
         # discovery demand ("best hair oil for damaged hair") — where the brand
         # gains new buyers — and who AI recommends instead. Branded name queries
         # reported separately as low-value. Leads the card (channel is context).
-        "product_competitiveness": build_product_competitiveness(
-            opportunity.get("per_prompt") if isinstance(opportunity, dict) else None
-        ),
+        "product_competitiveness": _pc,
         # Channel-by-channel appearance: across this product's probed queries,
         # where it shows up in AI answers — the brand's own site vs each retailer
         # AI cites instead. Leads the merchant with brand-product status +

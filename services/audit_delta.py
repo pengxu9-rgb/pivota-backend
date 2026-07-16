@@ -535,6 +535,10 @@ def _first_host(value: Any) -> Optional[str]:
 def _day_phrase(days_since: Optional[int]) -> str:
     if days_since is None:
         return ""
+    if days_since == 0:
+        # Same-day re-runs happen (verification, weekly + manual) — "0 days
+        # ago" read like a bug.
+        return " earlier today"
     unit = "day" if days_since == 1 else "days"
     return f" {days_since} {unit} ago"
 
