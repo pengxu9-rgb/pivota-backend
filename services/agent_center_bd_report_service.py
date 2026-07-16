@@ -5660,7 +5660,9 @@ def build_product_competitiveness(per_prompt: Optional[List[Dict[str, Any]]]) ->
     # all 7 are the brand's own listing surfacing.
     disc_appeared_recommended = disc_appeared_listing = 0
     br_total = br_appeared = 0
-    missed: List[str] = []
+    # (query, prompt_source) pairs — ordered niche-first + flattened to
+    # strings at payload build.
+    missed: List[Tuple[str, Any]] = []
     comp_counts: Dict[str, Dict[str, Any]] = {}
     for r in rows:
         intent = _intent_axis_for(r.get("normalized_query") or r.get("query"), r.get("axis"))

@@ -463,6 +463,9 @@ def _build_sku_evidence_used(
         "competitor_intel": _sku_competitor_intel_chip(competitor_intel),
         "sku_title": _sku_title(identity=identity, sku_title=sku_title),
         "identity": dict(identity),
+        # The merchant's own host — copy that names "the host buyers get
+        # routed through" must never name the merchant to themselves.
+        "merchant_host": merchant_host,
         "merchant_path": _merchant_path(identity=identity, opportunity=opportunity),
         "scores": _sku_scores(scores),
         "top_open_lane": _sku_lane_chip(_sku_top_open_lane(opportunity)),
@@ -618,12 +621,35 @@ def _sku_prescription_for_gap(
             #   competitor-owned — take it with a section that leads with the
             #     evidenced attributes the competitor's page can't claim.
             _ownership = str(beachhead.get("ownership_state") or "").strip().lower()
-            _route_host = str(beachhead.get("who_owns") or "").strip() or next(
-                (str(c) for c in (beachhead.get("controllers") or []) if c), "",
+            # who_owns is host-or-LIST (ties on times_cited persist as a
+            # list — test-pinned shape); normalize to ONE host and never
+            # name the merchant's own domain as the thing buyers are
+            # "routed through" (controllers can include the first-party
+            # host — the chip builder doesn't exclude it).
+            _merchant_host = str(
+                evidence.get("merchant_host") or ""
+            ).strip().lower()
+
+            def _owner_host(value: Any) -> str:
+                if isinstance(value, (list, tuple)):
+                    value = next((v for v in value if v), "")
+                host = str(value or "").strip().lower()
+                return "" if (host and host == _merchant_host) else host
+
+            _route_host = _owner_host(beachhead.get("who_owns")) or next(
+                (
+                    h
+                    for h in (
+                        _owner_host(c)
+                        for c in (beachhead.get("controllers") or [])
+                    )
+                    if h
+                ),
+                "",
             )
             _basis_words = ", ".join(_basis[:4]) if _basis else "your evidenced product facts"
             if beachhead_usable and _ownership in {
-                "marketplace-owned", "retailer-owned", "publisher-owned", "forum-owned",
+                "marketplace-owned", "retailer-owned",
             } and _route_host:
                 first_move = (
                     f"AI already surfaces you for {lane_phrase} — but buyers "
@@ -640,6 +666,27 @@ def _sku_prescription_for_gap(
                         f"Put the lane's facts on YOUR page in plain buyer "
                         f"words ({_basis_words}) so AI can ground the answer "
                         "on you directly instead of the listing."
+                    ),
+                ]
+            elif beachhead_usable and _ownership in {
+                "publisher-owned", "forum-owned",
+            } and _route_host:
+                # Publishers/forums don't sell — "why buy direct vs
+                # healthline.com" reads as nonsense. The play there is
+                # getting INTO the source AI grounds on.
+                first_move = (
+                    f"AI answers {lane_phrase} from {_route_host} — get "
+                    f"cited there: pitch them with your evidenced facts."
+                )
+                lane_actions = [
+                    (
+                        f"Pitch {_route_host} to include you for this ask, "
+                        f"leading with {_basis_words} — the facts their "
+                        "current answer is missing."
+                    ),
+                    (
+                        f"Put the same facts on your own page ({_basis_words}) "
+                        "so AI can also ground the answer on you directly."
                     ),
                 ]
             elif beachhead_usable and _ownership == "competitor-owned" and _route_host:
@@ -2062,9 +2109,14 @@ def _first_specific_query(queries: List[str]) -> str:
     example strings arrive in attribution-run order (head baselines first)
     and carry no prompt_source — a plain [0] made "best headphones" THE lane
     of the canonical-page play and operator moves. Text classifier only;
-    falls back to the first query when every example is head-shaped."""
+    falls back to the first query when every example is head-shaped.
+
+    _query_examples wraps each query in literal double quotes — strip them
+    before classifying, or the leading quote defeats the prefix rules and
+    every quoted head term classifies as specific (review P1: the whole
+    fix was a no-op without this)."""
     for q in queries:
-        if not is_broad_head_query(q):
+        if not is_broad_head_query(str(q or "").strip().strip('"')):
             return q
     return queries[0] if queries else ""
 
