@@ -63,16 +63,18 @@ def _write_residue_candidates(path: str, items: List[Dict[str, Any]], *, domain:
     the existing Gemini PDP-resolution + Path-C ingest
     (scripts/run_catalog_enrichment.py) — the fuzzy/LLM lane for brand-official
     names that deterministic matching can't safely bridge (line-name/version drift)."""
+    # FLAT shape — the runner + gemini_url_validator.validate_candidate read
+    # brand/product_name at the TOP level (like every other category candidates
+    # file). The nested {"pdp": {...}} form silently sends empty-brand prompts
+    # to Gemini (caught in residue batch 1, 2026-07-16).
     with open(path, "w") as f:
         for p in items:
             cand = {
-                "pdp": {
-                    "brand": p.get("brand"),
-                    "product_name": p.get("title"),
-                    "category_path": category_path,
-                    "attribute_summary": (p.get("record", {}).get("pdp", {}) or {}).get("attribute_summary", ""),
-                    "source_domain": domain,
-                },
+                "brand": p.get("brand"),
+                "product_name": p.get("title"),
+                "category_path": category_path,
+                "attribute_summary": (p.get("record", {}).get("pdp", {}) or {}).get("attribute_summary", ""),
+                "source_domain": domain,
                 "expected_url_domains": [domain],
             }
             f.write(json.dumps(cand, ensure_ascii=False, default=str) + "\n")
