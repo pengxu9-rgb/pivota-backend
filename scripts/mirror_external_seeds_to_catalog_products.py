@@ -692,12 +692,24 @@ missing AS (
   -- already mirrored under the bucket is treated as present and is NOT
   -- re-mirrored under a fresh observed identity — re-keying existing rows is the
   -- A9-4 parity backfill, explicitly out of scope here (ADR-009 D4).
+  --
+  -- A seed whose attached_product_key points at an EXISTING catalog_products row
+  -- is also present: attached_product_key is the authoritative back-link, and the
+  -- catalog_enrichment_agent path mints pdp.source_product_id (title slug) and
+  -- seed.external_product_id (brand:hash) in DIFFERENT formats, so the
+  -- (platform, source_product_id) join alone can never see that mirror. Without
+  -- this conjunct every Path-C ingest spawned a merch_obs_* shadow product on the
+  -- next materialization tick (39 COSRX shadows, 2026-07-16). If the attached
+  -- target row is gone, the seed becomes mirrorable again (self-heal preserved).
   SELECT c.*
   FROM candidates c
   LEFT JOIN catalog_products cp
     ON cp.platform = 'external_seed'
    AND cp.source_product_id = c.external_product_id
+  LEFT JOIN catalog_products cp_attached
+    ON cp_attached.product_key = c.attached_product_key
   WHERE cp.product_key IS NULL
+    AND cp_attached.product_key IS NULL
 )
 """
 
