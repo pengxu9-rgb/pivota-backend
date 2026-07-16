@@ -733,7 +733,40 @@ def test_sku_nba_head_only_substitution_reframes_not_vs_flagship():
     assert "bone conduction headphones for lap swimming" in nba["first_move"]
     assert "comparison —" not in nba["first_move"]
     assert "vs" not in nba["first_move"].lower().split()
+    # Review round: the tracking metric must not tell the merchant to track a
+    # comparison page the same card told them not to build.
+    tracking = " ".join(nba.get("how_to_track") or nba.get("tracking_metrics") or [])
+    assert "comparison page" not in tracking.lower()
     _assert_70_30(nba)
+
+
+def test_sku_nba_head_only_substitution_skips_head_shaped_beachhead():
+    """The beachhead is picked by a different classifier than the head flag —
+    when the recommended lane IS the flagged head prompt (or head-shaped
+    itself), the reframe must not render "X owns Q — win Q first"."""
+    opportunity = _sku_base_opportunity()
+    opportunity["substitution_alert"] = {
+        "present": True,
+        "prompt": "best waterproof earbuds",
+        "substituted_by": "Shokz",
+        "engines": ["gemini"],
+        "kind": "category",
+        "broad_head_prompt": True,
+    }
+    opportunity["sideways_wedge"] = {
+        "recommended_beachhead_lane": {"query": "best waterproof earbuds"},
+    }
+
+    nba = build_sku_next_best_action(
+        opportunity=opportunity,
+        scores=_sku_scores(),
+        identity=_sku_identity(),
+        sku_title="Purra Swim Headphones",
+    )
+    assert "owns the broad" in nba["headline"]
+    # Falls back to the generic specific-ask copy, never "win <head Q> first".
+    assert 'Win "best waterproof earbuds" first' not in nba["first_move"]
+    assert "specific" in nba["first_move"].lower()
 
 
 def test_sku_nba_head_only_substitution_without_beachhead_stays_specific():

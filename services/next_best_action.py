@@ -28,6 +28,7 @@ from services.sku_lane_priority import (
     is_third_party_controlled_lane,
     prioritize_lanes,
 )
+from services.win_plan_builder import is_broad_head_query
 
 
 logger = logging.getLogger(__name__)
@@ -574,9 +575,26 @@ def _sku_prescription_for_gap(
             beachhead = _as_mapping(
                 sideways_wedge.get("recommended_beachhead_lane")
             )
+            # The beachhead is picked by a DIFFERENT classifier (axis/lane
+            # shape) than the head flag (query text shape) — an attribute-axis
+            # prompt like "best waterproof earbuds" can be both the flagged
+            # head prompt AND the beachhead, which would render "X owns the
+            # broad Q — win Q first". Only pivot to a beachhead that is
+            # specific by the SAME text classifier, isn't the alert prompt
+            # itself, and isn't a synthetic padding query (which _sku_query_
+            # phrase would blur into circular "category question" copy).
+            _bh_raw = str(beachhead.get("query") or "").strip()
+            _alert_raw = str(substitution.get("prompt") or "").strip()
             beachhead_query = (
-                _sku_query_phrase(beachhead.get("query"))
-                if str(beachhead.get("query") or "").strip()
+                _sku_query_phrase(_bh_raw)
+                if (
+                    _bh_raw
+                    and _bh_raw.lower() != _alert_raw.lower()
+                    and not is_synthetic_probe_query(_bh_raw)
+                    and not is_broad_head_query(
+                        _bh_raw, prompt_source=beachhead.get("prompt_source"),
+                    )
+                )
                 else None
             )
             first_move = (
@@ -2755,6 +2773,14 @@ def _tracking_metrics_for_gap(
             "Answers citing the official SKU page instead of leaving the lane unowned.",
         ]
     if primary_gap == PRIMARY_SKU_SUBSTITUTION_LEAK:
+        # Head-reframed action (broad_head_prompt): the copy told the merchant
+        # NOT to build a vs-flagship comparison page — the tracked artifact is
+        # the specific-lane answer, not a comparison page it advised against.
+        if _as_mapping(evidence.get("substitution_alert")).get("broad_head_prompt"):
+            return [
+                "Repeat check of the specific lane you targeted — answers naming this SKU there.",
+                f"Answers citing your page for that lane instead of defaulting to {substitute}.",
+            ]
         return [
             f"Alternative prompts that name this SKU instead of {substitute}.",
             "Answers citing the official comparison page or product proof.",
