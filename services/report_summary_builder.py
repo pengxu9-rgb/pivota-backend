@@ -387,7 +387,15 @@ def _top_actions(
         )
         if is_secondary:
             nba = {}
-        prompts, basis = _supporting_prompts(nba, sku_report)
+        # Secondary rows also get NO supporting-prompt list: the union in
+        # _supporting_prompts includes the SKU-LEVEL failing_prompts pool, so
+        # every action from one SKU rendered the SAME "why this" evidence
+        # (founder report: 'all evidences under each action repeat'). The
+        # measured evidence belongs to the PRIMARY action it was diagnosed
+        # from; a secondary's own reason is its why_this_first.
+        prompts, basis = (
+            ([], "none") if is_secondary else _supporting_prompts(nba, sku_report)
+        )
         cta = _as_dict(nba.get("cta"))
         gap_key = str(action.get("primary_gap") or "").strip().lower()
         impact_dim = _GAP_IMPACT_DIMENSION.get(gap_key)

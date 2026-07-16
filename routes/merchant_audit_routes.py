@@ -3545,6 +3545,46 @@ def _ask_sku_slice(sku: Dict[str, Any]) -> Dict[str, Any]:
     return slice_
 
 
+def _action_placement(
+    report: Dict[str, Any],
+    product_key: Optional[str],
+    *,
+    is_outreach: bool,
+    channel_host: Optional[str],
+) -> Dict[str, Any]:
+    """WHERE the drafted deliverable goes — founder feedback: a draft with no
+    placement ("I have no idea what is our target media or where to update")
+    is a confusing artifact. Outreach drafts target the channel host; on-page
+    drafts target the SKU's own page (canonical/pdp URL from the report)."""
+    if is_outreach:
+        # Channel-kind even when the host is missing (lever-only requests are
+        # valid per the request model): an outreach draft must never claim
+        # "Your product page" as its destination.
+        host = str(channel_host or "").strip()
+        return {
+            "kind": "channel",
+            "label": f"Send to {host}" if host else "Send to your outreach target",
+            "url": None,
+            "target_host": host or None,
+        }
+    url = None
+    _, per_sku = _ask_report_root(report)
+    sku = _ask_find_sku(per_sku, product_key)
+    if isinstance(sku, dict):
+        anchors = (sku.get("identity") or {}).get("anchors") or {}
+        url = (
+            str(anchors.get("canonical_url") or "").strip()
+            or str(anchors.get("pdp_url") or "").strip()
+            or None
+        )
+    return {
+        "kind": "own_page",
+        "label": "Your product page",
+        "url": url,
+        "target_host": None,
+    }
+
+
 def _build_ask_context(report: Dict[str, Any], product_key: Optional[str]) -> Dict[str, Any]:
     narrative, per_sku = _ask_report_root(report)
     ctx: Dict[str, Any] = {}
@@ -3861,6 +3901,13 @@ async def start_merchant_audit_action(
             "status": "exists",
             "task_id": existing[0].get("task_id"),
             "draft": prior_draft,
+            "placement": (
+                ev.get("placement") if isinstance(ev, dict) else None
+            ) or _action_placement(
+                report,
+                _action_product_key_by_title(report, body.sku_title),
+                is_outreach=is_outreach, channel_host=body.channel_host,
+            ),
             "credits_charged": 0,
         }
 
@@ -3873,6 +3920,10 @@ async def start_merchant_audit_action(
     charged = 0
     product_key = _action_product_key_by_title(report, body.sku_title)
     context = _build_ask_context(report, product_key)
+    placement = _action_placement(
+        report, product_key,
+        is_outreach=is_outreach, channel_host=body.channel_host,
+    )
     cost_credits, _ = estimate_probe_credits(_ASK_PROBE_SPEC)
     can_draft = bool(context)
     draft_idem = "action_draft:" + hashlib.sha256(
@@ -3952,8 +4003,15 @@ async def start_merchant_audit_action(
             "channel_type": body.channel_type,
             "query": body.query,
             "draft": draft,
+            "placement": placement,
         },
     )
     if not task_id:
         raise HTTPException(status_code=500, detail="Could not create the follow-up task.")
-    return {"status": "success", "task_id": task_id, "draft": draft, "credits_charged": charged}
+    return {
+        "status": "success",
+        "task_id": task_id,
+        "draft": draft,
+        "placement": placement,
+        "credits_charged": charged,
+    }

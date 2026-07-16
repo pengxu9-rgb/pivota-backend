@@ -372,3 +372,65 @@ async def test_action_insufficient_credits_skips_draft_but_creates_task(actions_
     assert out["credits_charged"] == 0
     assert out["draft"] is None
     assert out["task_id"] == "task-1"
+
+
+@pytest.mark.asyncio
+async def test_action_draft_returns_placement(actions_env, monkeypatch):
+    """Founder feedback: a draft with no WHERE ('I have no idea what is our
+    target media or where to update') is a confusing artifact. On-page drafts
+    carry the SKU's own page; outreach drafts carry the channel host."""
+    mar_routes = actions_env.routes
+
+    async def fake_fetch(run_id):
+        return {
+            "merchant_id": "m1",
+            "report_jsonb": {
+                "per_sku_reports": [{
+                    "sku_key": "sku-1",
+                    "sku_title": "Test SKU",
+                    "identity": {"anchors": {
+                        "canonical_url": "https://mojawa.com/products/purra-swim",
+                    }},
+                }],
+            },
+        }
+
+    monkeypatch.setattr(mar_routes, "fetch_audit_run_by_id", fake_fetch)
+    monkeypatch.setattr(
+        mar_routes, "_action_product_key_by_title", lambda report, t: "sku-1",
+    )
+    out = await mar_routes.start_merchant_audit_action(
+        _action_body(mar_routes), merchant_id="m1",
+    )
+    assert out["placement"] == {
+        "kind": "own_page",
+        "label": "Your product page",
+        "url": "https://mojawa.com/products/purra-swim",
+        "target_host": None,
+    }
+
+    outreach = mar_routes.MerchantAuditActionStartRequest(
+        run_id="run-12345678",
+        headline="Pitch wired.com",
+        first_move="Send the pitch",
+        sku_title="Test SKU",
+        channel_host="wired.com",
+        channel_lever="editorial_outreach",
+    )
+    out2 = await mar_routes.start_merchant_audit_action(outreach, merchant_id="m1")
+    assert out2["placement"]["kind"] == "channel"
+    assert out2["placement"]["target_host"] == "wired.com"
+    assert "wired.com" in out2["placement"]["label"]
+
+    # Lever-only outreach (no host) stays channel-kind — an outreach draft
+    # must never claim "Your product page" as its destination.
+    lever_only = mar_routes.MerchantAuditActionStartRequest(
+        run_id="run-12345678",
+        headline="Pitch the channel",
+        first_move="Send the pitch",
+        sku_title="Test SKU",
+        channel_lever="editorial_outreach",
+    )
+    out3 = await mar_routes.start_merchant_audit_action(lever_only, merchant_id="m1")
+    assert out3["placement"]["kind"] == "channel"
+    assert out3["placement"]["target_host"] is None
