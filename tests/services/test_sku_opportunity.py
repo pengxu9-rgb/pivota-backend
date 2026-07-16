@@ -277,6 +277,9 @@ def test_sku_opportunity_scores_bb_lab_prompt_cases():
         "substituted_by": "Vital Proteins",
         "engines": ["deepseek", "gemini"],
         "kind": "branded",
+        # A branded/specific prompt, not a broad head term — the comparison
+        # play stays the prescribed move.
+        "broad_head_prompt": False,
     }
 
     assert opportunity["top_open_lanes"][0]["query"] == "halal collagen sticks before bed"
@@ -1267,3 +1270,79 @@ def test_substitution_drops_ingredient_only_competitors():
     top = rows["top hair butter"]["substitution"]
     assert top["present"] is True
     assert top["substituted_by"] == "Aunt Jackie's"
+
+
+def test_substitution_alert_prefers_specific_prompt_over_head_term():
+    """Niche-first showcase: the head baseline probe ("best headphones")
+    carries the highest demand_signal by construction, so demand-only sorting
+    showcased the flagship fight on every audit. A specific losing prompt must
+    win the alert slot; the head row only surfaces when it's the sole
+    evidence — and is then flagged for the copy reframe."""
+    from services.sku_opportunity import _substitution_alert
+
+    head_row = {
+        "query": "best headphones",
+        "demand_signal": 3.0,
+        "substitution": {
+            "present": True,
+            "prompt": "best headphones",
+            "substituted_by": "Bose",
+            "engines": ["chatgpt", "gemini"],
+            "kind": "category",
+        },
+    }
+    specific_row = {
+        "query": "bone conduction headphones for lap swimming",
+        "demand_signal": 1.0,
+        "substitution": {
+            "present": True,
+            "prompt": "bone conduction headphones for lap swimming",
+            "substituted_by": "Shokz",
+            "engines": ["gemini"],
+            "kind": "category",
+        },
+    }
+
+    alert = _substitution_alert([head_row, specific_row])
+    assert alert["prompt"] == "bone conduction headphones for lap swimming"
+    assert alert["substituted_by"] == "Shokz"
+    assert alert["broad_head_prompt"] is False
+
+    head_only = _substitution_alert([head_row])
+    assert head_only["prompt"] == "best headphones"
+    assert head_only["broad_head_prompt"] is True
+
+
+def test_substitution_alert_merchant_custom_head_prompt_not_deprioritized():
+    """A merchant-authored prompt is a deliberate test: even head-shaped, it
+    keeps its demand-ranked slot (prompt_source exemption) and is never
+    flagged as a broad head term."""
+    from services.sku_opportunity import _substitution_alert
+
+    merchant_head = {
+        "query": "best headphones",
+        "prompt_source": "merchant_custom",
+        "demand_signal": 3.0,
+        "substitution": {
+            "present": True,
+            "prompt": "best headphones",
+            "substituted_by": "Bose",
+            "engines": ["gemini"],
+            "kind": "category",
+        },
+    }
+    specific_row = {
+        "query": "bone conduction headphones for lap swimming",
+        "demand_signal": 1.0,
+        "substitution": {
+            "present": True,
+            "prompt": "bone conduction headphones for lap swimming",
+            "substituted_by": "Shokz",
+            "engines": ["gemini"],
+            "kind": "category",
+        },
+    }
+
+    alert = _substitution_alert([merchant_head, specific_row])
+    assert alert["prompt"] == "best headphones"
+    assert alert["broad_head_prompt"] is False
