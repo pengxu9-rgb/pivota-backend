@@ -73,26 +73,52 @@ def predict_official_matches(
     return resolved, residue
 
 
+def _key_tokens(key: str) -> frozenset:
+    """Title-token set of a retailer_match_key ('brand::title words' -> words)."""
+    _, _, title = key.partition("::")
+    return frozenset(title.split())
+
+
 def filter_net_new(
     official_records: List[Mapping[str, Any]],
     our_rows: List[Mapping[str, Any]],
-) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
-    """Split brand-official records into (net_new, already_have) vs our catalog,
-    by retailer_match_key. ONLY net_new is safe to ingest: re-ingesting a product
-    we already have would derive a fresh product_key from the storefront's
-    (drifted) title and create a DUPLICATE canonical — ingestion.derive_product_key
-    has no title-normalization, unlike the match layer. already_have is returned
-    for reporting (candidates for a GTIN-refresh path, not a re-INSERT)."""
+) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]], List[Dict[str, Any]]]:
+    """Split brand-official records into (net_new, already_have, suspect_drift)
+    vs our catalog. ONLY net_new is safe to ingest: re-ingesting a product we
+    already have would derive a fresh product_key from the storefront's (drifted)
+    title and create a DUPLICATE canonical — ingestion.derive_product_key has no
+    title-normalization, unlike the match layer.
+
+    suspect_drift is the line-name-drift guard (SKIN1004 pilot: official
+    "Madagascar Centella Ampoule" vs our old "Centella Ampoule" — no key match,
+    but MINTING it duplicates the product). An official record is suspect when
+    its title tokens CONTAIN or ARE CONTAINED BY an existing our-row's title
+    tokens (both sides >= 2 tokens, same brand universe). Suspects are
+    propose-only — route them to the residue/Gemini lane, never auto-mint.
+
+    already_have is returned for reporting (GTIN-refresh candidates, not a
+    re-INSERT)."""
     our_index = build_match_index(
         [{"brand": r.get("brand"), "title": r.get("title"), "pdp_scope": r.get("pdp_scope")} for r in our_rows]
     )
+    our_token_sets = [_key_tokens(k) for k in our_index if len(_key_tokens(k)) >= 2]
     net_new: List[Dict[str, Any]] = []
     already: List[Dict[str, Any]] = []
+    suspects: List[Dict[str, Any]] = []
     for rec in official_records:
         pdp = rec.get("pdp") or {}
         key = retailer_match_key(pdp.get("brand"), pdp.get("product_name"))
-        (already if key in our_index else net_new).append(dict(rec))
-    return net_new, already
+        if key in our_index:
+            already.append(dict(rec))
+            continue
+        toks = _key_tokens(key)
+        if len(toks) >= 2 and any(
+            toks >= ours or toks <= ours for ours in our_token_sets
+        ):
+            suspects.append(dict(rec))
+        else:
+            net_new.append(dict(rec))
+    return net_new, already, suspects
 
 
 async def fetch_official_records(

@@ -56,9 +56,36 @@ def test_filter_net_new_excludes_already_owned_across_drift():
         _official("COSRX Official", "COSRX Advanced Snail 96 Mucin Power Essence 100ml"),  # we HAVE this
         _official("COSRX Official", "COSRX 5 PDRN NAD+ Multi Repair Cream"),               # NET-NEW
     ]
-    net_new, already = filter_net_new(official, our_rows)
-    assert len(already) == 1 and len(net_new) == 1
+    net_new, already, suspects = filter_net_new(official, our_rows)
+    assert len(already) == 1 and len(net_new) == 1 and suspects == []
     assert "NAD+" in net_new[0]["pdp"]["product_name"]
+
+
+def test_filter_net_new_flags_line_name_drift_as_suspect_not_mint():
+    # SKIN1004 pilot: official prefixes the line name; our old rows don't.
+    # Minting would duplicate the product — must be SUSPECT (propose-only).
+    our_rows = [
+        {"brand": "SKIN1004", "title": "Centella Ampoule", "pdp_scope": "merchant_owned"},
+        {"brand": "COSRX", "title": "Propolis Synergy Toner", "pdp_scope": "merchant_owned"},
+    ]
+    official = [
+        _official("SKIN1004", "Madagascar Centella Ampoule 100ml"),      # superset of ours -> suspect
+        _official("COSRX", "Full Fit Propolis Synergy Toner"),           # superset of ours -> suspect
+        _official("SKIN1004", "Tone Brightening Capsule Ampoule"),       # genuinely new -> mint
+    ]
+    net_new, already, suspects = filter_net_new(official, our_rows)
+    assert len(suspects) == 2
+    assert len(net_new) == 1 and "Brightening" in net_new[0]["pdp"]["product_name"]
+    assert already == []
+
+
+def test_filter_net_new_single_shared_token_is_not_suspect():
+    # One overlapping token must not trigger the containment guard —
+    # 'Centella Cream' vs 'Centella Toner' are different products.
+    our_rows = [{"brand": "SKIN1004", "title": "Centella Cream", "pdp_scope": "merchant_owned"}]
+    official = [_official("SKIN1004", "Centella Toner")]
+    net_new, already, suspects = filter_net_new(official, our_rows)
+    assert len(net_new) == 1 and suspects == [] and already == []
 
 
 def test_dominant_brand():

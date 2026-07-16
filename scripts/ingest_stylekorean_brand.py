@@ -63,16 +63,18 @@ def _write_residue_candidates(path: str, items: List[Dict[str, Any]], *, domain:
     the existing Gemini PDP-resolution + Path-C ingest
     (scripts/run_catalog_enrichment.py) — the fuzzy/LLM lane for brand-official
     names that deterministic matching can't safely bridge (line-name/version drift)."""
+    # FLAT shape — the runner + gemini_url_validator.validate_candidate read
+    # brand/product_name at the TOP level (like every other category candidates
+    # file). The nested {"pdp": {...}} form silently sends empty-brand prompts
+    # to Gemini (caught in residue batch 1, 2026-07-16).
     with open(path, "w") as f:
         for p in items:
             cand = {
-                "pdp": {
-                    "brand": p.get("brand"),
-                    "product_name": p.get("title"),
-                    "category_path": category_path,
-                    "attribute_summary": (p.get("record", {}).get("pdp", {}) or {}).get("attribute_summary", ""),
-                    "source_domain": domain,
-                },
+                "brand": p.get("brand"),
+                "product_name": p.get("title"),
+                "category_path": category_path,
+                "attribute_summary": (p.get("record", {}).get("pdp", {}) or {}).get("attribute_summary", ""),
+                "source_domain": domain,
                 "expected_url_domains": [domain],
             }
             f.write(json.dumps(cand, ensure_ascii=False, default=str) + "\n")
@@ -244,9 +246,18 @@ async def _drive(args: argparse.Namespace) -> int:
         # Only NET-NEW brand-official products are safe to ingest — re-ingesting one
         # we already have would derive a new product_key from the storefront's drifted
         # title and duplicate the canonical (ingestion.derive_product_key has no strip).
-        net_new, already_have = bo.filter_net_new(official, our_rows)
-        print(f"      brand-official products: {len(official)}  (already have {len(already_have)}, NET-NEW {len(net_new)})")
+        # suspect_drift (title-token containment vs an existing row, e.g. official
+        # "Madagascar Centella Ampoule" vs our "Centella Ampoule") is propose-only:
+        # routed to the residue/Gemini lane, never auto-minted.
+        net_new, already_have, suspect_drift = bo.filter_net_new(official, our_rows)
+        print(f"      brand-official products: {len(official)}  (already have {len(already_have)}, NET-NEW {len(net_new)}, suspect-drift {len(suspect_drift)})")
         print(f"      of {len(mint)} MINT SKUs → {len(resolved)} resolve to a brand-official product, {len(residue)} residue")
+        for s in suspect_drift:
+            residue.append({
+                "brand": (s.get("pdp") or {}).get("brand"),
+                "title": (s.get("pdp") or {}).get("product_name"),
+                "record": s,
+            })
 
         if args.residue_candidates:
             _write_residue_candidates(args.residue_candidates, residue,
