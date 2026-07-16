@@ -6225,6 +6225,14 @@ def _custom_prompt_runs_by_prompt(
             ).strip().lower()
             if axis != "custom":
                 continue
+            # Per-SKU merchant prompts (custom_prompts_by_url, incl. their
+            # pinned re-probes on later runs) belong to the per-SKU surfaces —
+            # keep them out of the brand-level "Your prompts" panel.
+            if (
+                isinstance(meta, dict)
+                and str(meta.get("custom_scope") or "").strip().lower() == "sku"
+            ):
+                continue
             prompt = str(run.get("query") or "").strip()
             if not prompt:
                 continue
@@ -9665,6 +9673,13 @@ def _build_per_sku_audit_query_records(
 # as head-prompt pressure and tell the merchant NOT to chase them.
 _LLM_PROMPT_SOURCES = frozenset({"llm_winnable", "llm_scenario"})
 
+# Generator stamp for merchant-authored prompts (brand-level slots + the
+# per-SKU custom_prompts_by_url lane). Threaded into axis_metadata like the
+# LLM stamps so (a) the evidence selector never drops a deliberately-head
+# merchant test as "broad head pressure" and (b) renderers can badge the
+# merchant's own prompts in the per-prompt table.
+_MERCHANT_PROMPT_SOURCE = "merchant_custom"
+
 
 def _query_metadata_from_records(
     records: List[Dict[str, Any]],
@@ -9672,20 +9687,36 @@ def _query_metadata_from_records(
     metadata: Dict[str, Dict[str, Any]] = {}
     for record in records:
         prompt_source = str(record.get("source") or "").strip()
-        is_llm_prompt = prompt_source in _LLM_PROMPT_SOURCES
-        if record.get("axis") != "sidewalk" and not is_llm_prompt:
+        is_stamped_prompt = (
+            prompt_source in _LLM_PROMPT_SOURCES
+            or prompt_source == _MERCHANT_PROMPT_SOURCE
+        )
+        if record.get("axis") != "sidewalk" and not is_stamped_prompt:
             continue
         query = str(record.get("query") or "").strip()
         if not query:
             continue
         entry: Dict[str, Any] = {
             "axis": str(record.get("axis") or "sidewalk"),
-            "attribute_basis": list(record.get("attribute_basis") or []),
-            "evidence": list(record.get("evidence") or []),
-            "intent_weight": float(record.get("intent_weight") or 0.0),
         }
-        if is_llm_prompt:
+        # Sidewalk/LLM records carry a REAL generator weight + basis. Merchant
+        # records don't — emitting a hardcoded 0.0 here used to flow into
+        # sidewalk_intent_weight and force every merchant prompt's opportunity
+        # score to zero (the passthrough beats the heuristic classifier), so a
+        # merchant record contributes only its axis/stamps and the heuristic
+        # intent stays in charge downstream.
+        if record.get("axis") == "sidewalk" or prompt_source in _LLM_PROMPT_SOURCES:
+            entry.update({
+                "attribute_basis": list(record.get("attribute_basis") or []),
+                "evidence": list(record.get("evidence") or []),
+                "intent_weight": float(record.get("intent_weight") or 0.0),
+            })
+        if is_stamped_prompt:
             entry["prompt_source"] = prompt_source
+        if record.get("custom_scope"):
+            # "sku" (custom_prompts_by_url) vs "brand" (the one-shot slots) —
+            # lets the brand-level "Your prompts" panel exclude per-SKU rows.
+            entry["custom_scope"] = str(record["custom_scope"])
         metadata[query] = entry
     return metadata
 
@@ -9843,21 +9874,28 @@ def _normalize_per_sku_probe_payload(
         })
         sidewalk_meta = metadata_by_query.get(query.lower())
         if sidewalk_meta:
-            meta.update({
-                "sidewalk_attribute_basis": list(
-                    sidewalk_meta.get("attribute_basis") or []
-                ),
-                "sidewalk_evidence": list(sidewalk_meta.get("evidence") or []),
-                "sidewalk_intent_weight": float(
-                    sidewalk_meta.get("intent_weight") or 0.0
-                ),
-            })
-            # Generator stamp (llm_winnable / llm_scenario): lets the lane
-            # classifier tell a SPECIFIC LLM discovery prompt from a generic
-            # head term (both are axis="category"). Distinct key from the
-            # pipeline `source` set just above.
+            # Only sidewalk/LLM entries carry a real generator weight — a
+            # merchant-prompt entry has none, and stamping a synthetic 0.0
+            # would zero its opportunity score (the passthrough in
+            # sku_opportunity beats the heuristic intent classifier).
+            if "intent_weight" in sidewalk_meta:
+                meta.update({
+                    "sidewalk_attribute_basis": list(
+                        sidewalk_meta.get("attribute_basis") or []
+                    ),
+                    "sidewalk_evidence": list(sidewalk_meta.get("evidence") or []),
+                    "sidewalk_intent_weight": float(
+                        sidewalk_meta.get("intent_weight") or 0.0
+                    ),
+                })
+            # Generator stamp (llm_winnable / llm_scenario / merchant_custom):
+            # lets the lane classifier tell a SPECIFIC LLM discovery prompt (or
+            # a deliberate merchant test) from a generic head term. Distinct
+            # key from the pipeline `source` set just above.
             if sidewalk_meta.get("prompt_source"):
                 meta["prompt_source"] = str(sidewalk_meta["prompt_source"])
+            if sidewalk_meta.get("custom_scope"):
+                meta["custom_scope"] = str(sidewalk_meta["custom_scope"])
         row["axis_metadata"] = meta
         if not isinstance(row.get("url_match"), dict):
             row["url_match"] = {
@@ -9936,8 +9974,16 @@ async def _probe_per_sku_ctx(
     prompts_per_sku: int,
     audit_run_id: Optional[str],
     custom_prompts: Optional[List[str]] = None,
+    pinned_custom_prompts: Optional[List[str]] = None,
 ) -> List[Dict[str, Any]]:
-    """Run the normalized per-SKU audit probe loop for an already-built ctx."""
+    """Run the normalized per-SKU audit probe loop for an already-built ctx.
+
+    `custom_prompts` are brand-level merchant slots: probed this run, NOT
+    pinned into the basis. `pinned_custom_prompts` are this SKU's own merchant
+    prompts (custom_prompts_by_url): probed inside this SKU's context AND
+    recorded into `_selected_specs_out`, so they enter the pinned measurement
+    basis and gain week-over-week comparability.
+    """
     safe_ctx = sku_ctx if isinstance(sku_ctx, dict) else {}
     sku_key = str(safe_ctx.get("sku_key") or "").strip() or "sku"
     target_prompts = max(1, int(prompts_per_sku or 0))
@@ -9957,18 +10003,42 @@ async def _probe_per_sku_ctx(
         )
     else:
         query_records = _build_per_sku_audit_query_records(safe_ctx, target_prompts)
-    # Record the auto set actually probed (pre-custom) so the fan-out can
-    # persist it as the pinned basis for the next run.
+    existing = {str(r.get("query") or "").strip().lower() for r in query_records}
+    existing.discard("")
+    # This SKU's own merchant prompts (custom_prompts_by_url): probed INSIDE
+    # the SKU's context so results join opportunity.per_prompt / win plan /
+    # evidence chain, and recorded into the pinned basis below. The
+    # source stamp keeps a deliberately-head merchant test out of the
+    # broad-head evidence drop and lets the UI badge it.
+    for prompt in pinned_custom_prompts or []:
+        text = str(prompt or "").strip()
+        if text and text.lower() not in existing:
+            query_records.append({
+                "query": text,
+                "axis": "custom",
+                "source": _MERCHANT_PROMPT_SOURCE,
+                # Scope keeps per-SKU rows OUT of the brand-level "Your
+                # prompts" panel (they live in the per-SKU surfaces).
+                # Whitelisted in clean_selected_specs so it survives pinning.
+                "custom_scope": "sku",
+            })
+            existing.add(text.lower())
+    # Record the set to persist as the next run's pinned basis: the auto set
+    # plus this SKU's merchant prompts (they join the comparable weekly set).
+    # The brand-level slots appended below stay one-shot — NOT pinned.
     safe_ctx["_selected_specs_out"] = [dict(r) for r in query_records]
-    # Append merchant-input prompt slots so they're actually probed (deduped
-    # against the auto set). axis="custom" keeps them identifiable downstream.
-    if custom_prompts:
-        existing = {str(r.get("query") or "").strip().lower() for r in query_records}
-        for prompt in custom_prompts:
-            text = str(prompt or "").strip()
-            if text and text.lower() not in existing:
-                query_records.append({"query": text, "axis": "custom"})
-                existing.add(text.lower())
+    # Append brand-level merchant-input prompt slots so they're actually probed
+    # (deduped against the set). axis="custom" keeps them identifiable downstream.
+    for prompt in custom_prompts or []:
+        text = str(prompt or "").strip()
+        if text and text.lower() not in existing:
+            query_records.append({
+                "query": text,
+                "axis": "custom",
+                "source": _MERCHANT_PROMPT_SOURCE,
+                "custom_scope": "brand",
+            })
+            existing.add(text.lower())
     query_specs = [
         (str(record.get("query") or ""), str(record.get("axis") or "intent"))
         for record in query_records
@@ -11855,6 +11925,7 @@ async def run_per_sku_audit_probe_fanout(
     model_overrides: Optional[Mapping[str, Any]] = None,
     prompts_per_sku: Optional[int] = None,
     custom_prompts: Optional[List[str]] = None,
+    custom_prompts_by_sku: Optional[Mapping[str, List[str]]] = None,
     winnable_prompts: bool = False,
     refresh_prompt_basis: bool = False,
 ) -> Dict[str, List[Dict[str, Any]]]:
@@ -11869,6 +11940,11 @@ async def run_per_sku_audit_probe_fanout(
     They're brand-level, so they're probed ONCE (attached to the first SKU) to
     avoid an N-SKU × providers multiplier (see feedback_llm_call_multipliers),
     while still actually running — they were billed-but-never-probed before.
+
+    `custom_prompts_by_sku` (keyed by sku_key) attaches merchant prompts to a
+    SPECIFIC SKU: each list is probed inside that SKU's context — joining its
+    per-prompt table / win plan / evidence chain — and pinned into that SKU's
+    measurement basis for week-over-week comparability.
     """
     if not merchant_id or not str(merchant_id).strip():
         raise ValueError("merchant_id is required for per-SKU probe fan-out")
@@ -11886,6 +11962,13 @@ async def run_per_sku_audit_probe_fanout(
     clean_custom = [
         str(p).strip() for p in (custom_prompts or []) if str(p or "").strip()
     ]
+    clean_custom_by_sku: Dict[str, List[str]] = {}
+    for _key, _prompts in (custom_prompts_by_sku or {}).items():
+        _clean = [
+            str(p).strip() for p in (_prompts or []) if str(p or "").strip()
+        ]
+        if _clean:
+            clean_custom_by_sku[str(_key)] = _clean
     out: Dict[str, List[Dict[str, Any]]] = {}
     for idx, sku_key in enumerate(sku_keys):
         sku_ctx = await load_sku_context(sku_key, str(merchant_id))
@@ -11985,6 +12068,8 @@ async def run_per_sku_audit_probe_fanout(
             audit_run_id=audit_run_id,
             # Brand-level merchant prompts run once, on the first SKU only.
             custom_prompts=clean_custom if idx == 0 else None,
+            # This SKU's own merchant prompts: probed in-context + pinned.
+            pinned_custom_prompts=clean_custom_by_sku.get(str(sku_key)),
         )
         # W2: ride the basis meta on the PERSISTED probe payload. The report
         # phase resets the sku-context cache and reloads sku_ctx fresh, so a

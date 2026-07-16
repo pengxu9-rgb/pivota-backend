@@ -244,6 +244,247 @@ def test_custom_prompts_dedupe_into_launch(client):
     ]
 
 
+# --- POST: per-SKU merchant prompts (custom_prompts_by_url) -------------------
+def test_custom_prompts_by_url_rekeyed_to_synthetic_sku(client):
+    client.state["used"] = 0
+    res = client.post(_URL, json={
+        **_BODY,
+        "custom_prompts_by_url": {
+            "https://merch.example/products/b": [
+                "  collagen jelly for red-eye flights ",
+                "collagen jelly for red-eye flights",  # dup (trim/case)
+                "",  # blank dropped
+            ],
+        },
+    })
+    assert res.status_code == 200, res.text
+    launch = client.enqueued[-1]["request_options_jsonb"]["launch"]
+    by_sku = launch["custom_prompts_by_sku"]
+    # Re-keyed from the submitted URL to the minted synthetic sku_key of
+    # EXACTLY that product (products/b is the second synthetic product).
+    sku_b = launch["synthetic_products"][1]["sku_key"]
+    assert launch["synthetic_products"][1]["pdp_url"].endswith("/products/b")
+    assert by_sku == {sku_b: ["collagen jelly for red-eye flights"]}
+    # Brand-level slots unaffected.
+    assert launch["custom_prompts"] == []
+
+
+def test_custom_prompts_by_url_unknown_key_422(client):
+    client.state["used"] = 0
+    res = client.post(_URL, json={
+        **_BODY,
+        "custom_prompts_by_url": {
+            "https://elsewhere.example/products/z": ["some prompt"],
+        },
+    })
+    assert res.status_code == 422
+    assert res.json()["detail"]["code"] == "custom_prompts_url_mismatch"
+    assert client.enqueued == []
+
+
+def test_custom_prompts_by_url_per_product_cap_422(client, monkeypatch):
+    monkeypatch.setattr(mar, "_WEDGE_CUSTOM_PROMPTS_PER_SKU", 2)
+    client.state["used"] = 0
+    res = client.post(_URL, json={
+        **_BODY,
+        "custom_prompts_by_url": {
+            "https://merch.example/products/a": ["p one", "p two", "p three"],
+        },
+    })
+    assert res.status_code == 422
+    assert res.json()["detail"]["code"] == "custom_prompts_per_product_cap"
+    assert client.enqueued == []
+
+
+def test_custom_prompts_by_url_total_cap_422(client, monkeypatch):
+    monkeypatch.setattr(mar, "_WEDGE_CUSTOM_PROMPTS_PER_SKU", 2)
+    monkeypatch.setattr(mar, "_WEDGE_CUSTOM_PROMPTS_TOTAL", 3)
+    client.state["used"] = 0
+    res = client.post(_URL, json={
+        **_BODY,
+        "custom_prompts_by_url": {
+            "https://merch.example/products/a": ["a one", "a two"],
+            "https://merch.example/products/b": ["b one", "b two"],
+        },
+    })
+    assert res.status_code == 422
+    assert res.json()["detail"]["code"] == "custom_prompts_total_cap"
+    assert client.enqueued == []
+
+
+def test_custom_prompts_by_url_billed_per_probe(client, monkeypatch):
+    """Metered path: per-SKU merchant prompts count into per_provider_probes
+    exactly like the prompts the worker will actually run."""
+    captured = {}
+
+    def fake_estimate(pairs):
+        captured["pairs"] = pairs
+        return 42, 1.5
+
+    import services.credit_consumption_service as _ccs_mod
+    monkeypatch.setattr(_ccs_mod, "estimate_probe_credits", fake_estimate)
+    client.state["used"] = 5  # past the free allowance -> metered
+    res = client.post(_URL, json={
+        **_BODY,
+        "custom_prompts": ["brand slot prompt"],
+        "custom_prompts_by_url": {
+            "https://merch.example/products/a": ["niche a"],
+            "https://merch.example/products/b": ["niche b"],
+        },
+    })
+    assert res.status_code == 200, res.text
+    expected_per_provider = (
+        2 * mar._WEDGE_PROMPTS_PER_SKU  # 2 resolved products
+        + 1  # brand-level slot
+        + 2  # per-SKU merchant prompts
+    )
+    assert [p[1] for p in captured["pairs"]] == [
+        expected_per_provider for _ in captured["pairs"]
+    ]
+
+
+def test_custom_prompt_too_long_422(client):
+    client.state["used"] = 0
+    res = client.post(_URL, json={
+        **_BODY,
+        "custom_prompts_by_url": {
+            "https://merch.example/products/a": ["x" * 301],
+        },
+    })
+    assert res.status_code == 422
+    assert res.json()["detail"]["code"] == "custom_prompt_too_long"
+    assert client.enqueued == []
+
+
+def test_custom_prompts_url_alias_merge_respects_per_product_cap(client, monkeypatch):
+    """Two case-variant URLs mint the SAME synthetic sku_key (the key digest
+    lowercases pdp_url) — their prompts merge, and the merged list must not
+    exceed the per-product cap via the alias loophole."""
+    monkeypatch.setattr(mar, "_WEDGE_CUSTOM_PROMPTS_PER_SKU", 2)
+    client.state["used"] = 0
+    res = client.post(_URL, json={
+        "product_urls": [
+            "https://merch.example/products/a",
+            "https://merch.example/products/A",
+        ],
+        "custom_prompts_by_url": {
+            "https://merch.example/products/a": ["p one", "p two"],
+            "https://merch.example/products/A": ["p three", "p four"],
+        },
+    })
+    assert res.status_code == 422
+    assert res.json()["detail"]["code"] == "custom_prompts_per_product_cap"
+
+
+def test_pinned_basis_prices_reprobed_customs(client, monkeypatch):
+    """Review round (billing drift): a pinned re-run reprobes the prior run's
+    FULL pinned set (auto + previously pinned merchant prompts), so pricing
+    uses the recovered pinned set — not the static planned budget — plus only
+    the NEW prompts not already pinned."""
+    captured = {}
+
+    def fake_estimate(pairs):
+        captured["pairs"] = pairs
+        return 42, 1.5
+
+    import services.credit_consumption_service as _ccs_mod
+    monkeypatch.setattr(_ccs_mod, "estimate_probe_credits", fake_estimate)
+
+    pinned_a = [f"auto prompt {i}" for i in range(14)] + [
+        "already pinned niche", "second pinned niche",
+    ]
+
+    async def fake_pinned(merchant_id, sku_keys, max_reports=3):
+        # Product A has a 16-spec pinned basis; product B has none (first run).
+        return {sku_keys[0]: [q.lower() for q in pinned_a]}
+
+    monkeypatch.setattr(mar, "_pinned_selected_queries_by_sku", fake_pinned)
+    client.state["used"] = 5  # metered
+    res = client.post(_URL, json={
+        **_BODY,
+        "custom_prompts_by_url": {
+            # One already in A's pinned set (free — it reprobes anyway),
+            # one genuinely new (priced).
+            "https://merch.example/products/a": [
+                "Already Pinned Niche", "brand new niche",
+            ],
+        },
+    })
+    assert res.status_code == 200, res.text
+    # A: 16 pinned + 1 new custom; B: planned budget (no basis).
+    expected = 16 + 1 + mar._WEDGE_PROMPTS_PER_SKU
+    assert [p[1] for p in captured["pairs"]] == [
+        expected for _ in captured["pairs"]
+    ]
+
+
+def test_refresh_run_prices_planned_budget_not_pinned(client, monkeypatch):
+    """refresh=True regenerates the basis — pricing must NOT read the pinned
+    set (the scan is skipped entirely)."""
+    captured = {}
+
+    def fake_estimate(pairs):
+        captured["pairs"] = pairs
+        return 42, 1.5
+
+    async def fake_pinned(merchant_id, sku_keys, max_reports=3):
+        raise AssertionError("pinned-basis scan must be skipped on refresh")
+
+    import services.credit_consumption_service as _ccs_mod
+    monkeypatch.setattr(_ccs_mod, "estimate_probe_credits", fake_estimate)
+    monkeypatch.setattr(mar, "_pinned_selected_queries_by_sku", fake_pinned)
+    client.state["used"] = 5
+    res = client.post(_URL, json={**_BODY, "refresh": True})
+    assert res.status_code == 200, res.text
+    expected = 2 * mar._WEDGE_PROMPTS_PER_SKU
+    assert [p[1] for p in captured["pairs"]] == [
+        expected for _ in captured["pairs"]
+    ]
+
+
+def test_idempotency_key_varies_with_custom_prompts(client):
+    """Review round: re-POSTing the same URLs with DIFFERENT prompts must not
+    replay the in-flight run (which would silently drop the new prompts).
+    Same URLs + same prompts still dedupe; no-customs keys are unchanged."""
+    client.state["used"] = 0
+    body_a = {
+        **_BODY,
+        "custom_prompts_by_url": {
+            "https://merch.example/products/a": ["niche one"],
+        },
+    }
+    assert client.post(_URL, json=body_a).status_code == 200
+    assert client.post(_URL, json=body_a).status_code == 200
+    body_b = {
+        **_BODY,
+        "custom_prompts_by_url": {
+            "https://merch.example/products/a": ["a different niche"],
+        },
+    }
+    assert client.post(_URL, json=body_b).status_code == 200
+    assert client.post(_URL, json=_BODY).status_code == 200  # no customs
+    keys = [e["idempotency_key"] for e in client.enqueued]
+    assert keys[0] == keys[1], "identical requests must share a dedup key"
+    assert keys[2] != keys[0], "different prompts must mint a new key"
+    assert keys[3] != keys[0], "customs key differs from the no-customs key"
+
+
+def test_custom_prompts_on_unresolved_url_not_launched(client):
+    """Prompts keyed to a URL that fails to resolve are neither probed nor
+    billed — the URL itself is already reported in `unresolved`."""
+    client.state["used"] = 0
+    res = client.post(_URL, json={
+        "product_urls": ["https://merch.example/products/a", "not-a-url"],
+        "custom_prompts_by_url": {"not-a-url": ["orphan prompt"]},
+    })
+    assert res.status_code == 200, res.text
+    launch = client.enqueued[-1]["request_options_jsonb"]["launch"]
+    assert launch["custom_prompts_by_sku"] == {}
+    assert [u["url"] for u in res.json()["methodology"]["unresolved_urls"]] == [
+        "not-a-url"
+    ]
+
+
 def test_post_vendor_fallback_when_absent(client, monkeypatch):
     client.state["used"] = 0
 

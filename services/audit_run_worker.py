@@ -509,6 +509,12 @@ async def _process_one_audit_run_inner(
                         # Merchant-input prompt slots (debited as prompt credits
                         # at enqueue). Probe them so they aren't billed-but-dropped.
                         custom_prompts=launch_options.get("custom_prompts"),
+                        # Per-SKU merchant prompts (custom_prompts_by_url):
+                        # probed inside their SKU's context + pinned into its
+                        # basis for week-over-week tracking.
+                        custom_prompts_by_sku=launch_options.get(
+                            "custom_prompts_by_sku"
+                        ),
                         # LLM value-prop extraction -> probe winnable SPECIFIC
                         # discovery prompts, not just generic heads. Default ON
                         # (settings.prompt_gen_enabled, env-killable); a launch

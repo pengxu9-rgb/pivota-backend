@@ -1030,6 +1030,22 @@ _WEDGE_RUN_STALE_TTL_S = int(_os.getenv("WEDGE_RUN_STALE_TTL_S", "900"))
 # Engine-side _BRAND_REPORT_MAX_PRODUCTS=50 stays the hard ceiling.
 _WEDGE_MAX_PRODUCTS_FREE = int(_os.getenv("WEDGE_MAX_PRODUCTS_FREE", "5"))
 _WEDGE_MAX_PRODUCTS_PAID = int(_os.getenv("WEDGE_MAX_PRODUCTS_PAID", "20"))
+# Per-SKU merchant prompts (custom_prompts_by_url): capped per product AND
+# across the whole set so a 20-product paid run can't fan 20×N extra grounded
+# probes per provider. Each one is billed like any probed prompt (counted into
+# per_provider_probes below) and pinned into its SKU's basis on the next run.
+_WEDGE_CUSTOM_PROMPTS_PER_SKU = int(
+    _os.getenv("WEDGE_CUSTOM_PROMPTS_PER_SKU", "2")
+)
+_WEDGE_CUSTOM_PROMPTS_TOTAL = int(
+    _os.getenv("WEDGE_CUSTOM_PROMPTS_TOTAL", "10")
+)
+# Matches prompt_basis._MAX_PROMPT_CHARS: a prompt longer than the persistence
+# truncation would probe full-length this run but pin truncated — the next run
+# would probe DIFFERENT text and a resubmission wouldn't dedupe against it.
+_WEDGE_CUSTOM_PROMPT_MAX_CHARS = int(
+    _os.getenv("WEDGE_CUSTOM_PROMPT_MAX_CHARS", "300")
+)
 
 # Per-product (per-SKU) URL audit: each pasted URL is audited as its own SKU
 # through the durable per-SKU pipeline. prompts_per_sku at 18 (vs the readiness
@@ -1110,6 +1126,18 @@ class MerchantUrlAuditRequest(BaseModel):
             "entry). Probed once (brand-level, like the readiness audit) and "
             "surfaced as 'Your prompts' — whether AI cited you, the sources it "
             "grounded in, and which competitors it named instead."
+        ),
+    )
+    custom_prompts_by_url: Optional[Dict[str, List[str]]] = Field(
+        default=None,
+        description=(
+            "Merchant prompts attached to a SPECIFIC product: keyed by the "
+            "exact URL from product_urls (2 per product, 10 total by "
+            "default; env-tunable). Unlike the brand-level custom_prompts "
+            "panel, these are probed INSIDE that product's audit context, so "
+            "the results join its per-prompt table / win plan / evidence "
+            "chain, and they're pinned into that product's measurement basis "
+            "— your niche gets tracked week over week on re-runs."
         ),
     )
     refresh: bool = Field(
@@ -1225,6 +1253,65 @@ def _synthetic_url_sku_key(merchant_id: str, pdp_url: str) -> str:
         f"{merchant_id}|{(pdp_url or '').strip().lower()}".encode("utf-8")
     ).hexdigest()[:16]
     return f"{URL_WEDGE_SKU_PREFIX}{digest}"
+
+
+async def _pinned_selected_queries_by_sku(
+    merchant_id: str,
+    sku_keys: List[str],
+    max_reports: int = 3,
+) -> Dict[str, List[str]]:
+    """Best-effort pricing input: for each sku_key, the prior run's PINNED
+    selected-spec queries (lowercased). A pinned re-run reprobes that FULL set
+    (auto specs + previously pinned merchant prompts), so billing must price by
+    it — the planned per-SKU budget undercounts once merchant prompts have
+    entered the basis. Shares the recent-run report fetches across all SKUs
+    (load_prior_prompt_basis would refetch per SKU). Never raises; a SKU with
+    no recoverable basis is simply absent (caller falls back to the planned
+    budget, exactly like the worker regenerates)."""
+    out: Dict[str, List[str]] = {}
+    if not sku_keys:
+        return out
+    try:
+        from db.merchant_audit_runs import (
+            COMPLETED_RUN_STATUSES,
+            fetch_audit_run_by_id,
+            recent_runs_for_merchant,
+        )
+        from services.prompt_basis import harvest_prompt_basis
+
+        runs = await recent_runs_for_merchant(
+            merchant_id=merchant_id,
+            limit=max(1, max_reports) + 2,
+            subject_type="merchant_url",
+        )
+        reports: List[Dict[str, Any]] = []
+        for run in runs or []:
+            if str(run.get("status") or "") not in COMPLETED_RUN_STATUSES:
+                continue
+            row = await fetch_audit_run_by_id(run_id=str(run.get("run_id")))
+            report = (row or {}).get("report_jsonb")
+            if isinstance(report, dict):
+                reports.append(report)
+            if len(reports) >= max_reports:
+                break
+        for key in sku_keys:
+            for report in reports:
+                basis = harvest_prompt_basis(report, sku_key=key) or {}
+                specs = basis.get("selected_specs") or []
+                queries = [
+                    str(s.get("query") or "").strip().lower()
+                    for s in specs
+                    if isinstance(s, dict) and str(s.get("query") or "").strip()
+                ]
+                if queries:
+                    out[key] = queries
+                    break
+    except Exception:  # noqa: BLE001 — pricing scan must never block the audit
+        logger.warning(
+            "pinned-basis pricing scan failed merchant=%s", merchant_id,
+            exc_info=True,
+        )
+    return out
 
 
 # Merchant-facing model display names for the honest methodology rewrite.
@@ -1597,16 +1684,92 @@ async def run_merchant_url_audit(
             },
         )
 
+    # 1c. Per-SKU merchant prompts: validate + clean BEFORE the per-URL network
+    #     fetch (same review-A1 rule as the tier cap — no outbound spend on a
+    #     request we're about to 422). Keys must be URLs from this request;
+    #     caps are explicit 422s, not silent truncation, so the merchant never
+    #     pays for prompts that quietly didn't run.
+    submitted_urls = set(body.product_urls)
+    custom_by_url_clean: Dict[str, List[str]] = {}
+    for _url, _prompts in (body.custom_prompts_by_url or {}).items():
+        if _url not in submitted_urls:
+            raise HTTPException(
+                status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+                detail={
+                    "code": "custom_prompts_url_mismatch",
+                    "message": (
+                        "custom_prompts_by_url keys must be URLs from "
+                        f"product_urls (got a key not in the set: {_url})."
+                    ),
+                },
+            )
+        _seen_pu: set = set()
+        _clean_pu: List[str] = []
+        for _p in _prompts or []:
+            _t = str(_p or "").strip()
+            # Length cap = the basis-persistence truncation limit: a longer
+            # prompt would probe full-length this run but pin TRUNCATED, so
+            # the next run probes different text (basis identity churn) and a
+            # resubmission double-probes. Explicit 422, never silent trimming.
+            if len(_t) > _WEDGE_CUSTOM_PROMPT_MAX_CHARS:
+                raise HTTPException(
+                    status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+                    detail={
+                        "code": "custom_prompt_too_long",
+                        "message": (
+                            f"Each prompt must be at most "
+                            f"{_WEDGE_CUSTOM_PROMPT_MAX_CHARS} characters "
+                            f"(one for {_url} has {len(_t)})."
+                        ),
+                        "cap_chars": _WEDGE_CUSTOM_PROMPT_MAX_CHARS,
+                    },
+                )
+            if _t and _t.lower() not in _seen_pu:
+                _seen_pu.add(_t.lower())
+                _clean_pu.append(_t)
+        if len(_clean_pu) > _WEDGE_CUSTOM_PROMPTS_PER_SKU:
+            raise HTTPException(
+                status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+                detail={
+                    "code": "custom_prompts_per_product_cap",
+                    "message": (
+                        f"Up to {_WEDGE_CUSTOM_PROMPTS_PER_SKU} prompts per "
+                        f"product (got {len(_clean_pu)} for {_url})."
+                    ),
+                    "cap_per_product": _WEDGE_CUSTOM_PROMPTS_PER_SKU,
+                },
+            )
+        if _clean_pu:
+            custom_by_url_clean[_url] = _clean_pu
+    total_sku_customs = sum(len(v) for v in custom_by_url_clean.values())
+    if total_sku_customs > _WEDGE_CUSTOM_PROMPTS_TOTAL:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail={
+                "code": "custom_prompts_total_cap",
+                "message": (
+                    f"Up to {_WEDGE_CUSTOM_PROMPTS_TOTAL} per-product prompts "
+                    f"across the set (got {total_sku_customs})."
+                ),
+                "cap_total": _WEDGE_CUSTOM_PROMPTS_TOTAL,
+            },
+        )
+
     # 2. Fetch each merchant-provided product URL into a clean audit product.
     #    We audit exactly what the merchant chose — no discovery, no guessing.
     fetched = await asyncio.gather(
         *[fetch_curated_audit_product(u) for u in body.product_urls]
     )
     audit_products: List[Dict[str, Any]] = []
+    # The submitted URL each resolved product came from (aligned with
+    # audit_products) — the fetch may normalize pdp_url, but the merchant's
+    # custom_prompts_by_url keys are the URLs they SUBMITTED.
+    requested_urls: List[str] = []
     unresolved: List[Dict[str, str]] = []
     for raw_url, (product, reason) in zip(body.product_urls, fetched):
         if product:
             audit_products.append(product)
+            requested_urls.append(raw_url)
         else:
             unresolved.append(
                 {"url": raw_url, "reason": reason or "could not resolve"}
@@ -1623,6 +1786,45 @@ async def run_merchant_url_audit(
                 "unresolved": unresolved,
             },
         )
+
+    # Per-SKU merchant prompts re-keyed from the submitted URL to the minted
+    # synthetic sku_key — the shape the probe fan-out consumes. Built from
+    # RESOLVED products only, so prompts on an unresolved URL are neither
+    # probed nor billed (the URL itself is reported in `unresolved`). Two
+    # submitted URLs minting the same key (duplicate product) merge with a
+    # case-insensitive dedupe so billing can't exceed what actually runs.
+    custom_prompts_by_sku: Dict[str, List[str]] = {}
+    for p, requested_url in zip(audit_products, requested_urls):
+        sku_customs = custom_by_url_clean.get(requested_url) or []
+        if not sku_customs:
+            continue
+        key = _synthetic_url_sku_key(merchant_id, p["pdp_url"])
+        merged = custom_prompts_by_sku.setdefault(key, [])
+        seen_merged = {m.lower() for m in merged}
+        for text in sku_customs:
+            if text.lower() not in seen_merged:
+                seen_merged.add(text.lower())
+                merged.append(text)
+        # Re-enforce the per-product cap AFTER merging: two submitted URL
+        # variants of the SAME product page (case variants / fetch-normalized
+        # aliases) each pass the per-URL check but mint one sku_key — without
+        # this, the merge doubles the per-product cap. Explicit 422 (the
+        # fetch is already spent, but a capped-but-silently-truncated probe
+        # set would misbill), consistent with the pre-fetch checks.
+        if len(merged) > _WEDGE_CUSTOM_PROMPTS_PER_SKU:
+            raise HTTPException(
+                status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+                detail={
+                    "code": "custom_prompts_per_product_cap",
+                    "message": (
+                        f"Up to {_WEDGE_CUSTOM_PROMPTS_PER_SKU} prompts per "
+                        f"product — two of your URLs resolve to the same "
+                        f"product page ({p['pdp_url']}), and their prompts "
+                        f"combine to {len(merged)}."
+                    ),
+                    "cap_per_product": _WEDGE_CUSTOM_PROMPTS_PER_SKU,
+                },
+            )
 
     # NOTE: the commerce-index auto-seed runs in the
     # BACKGROUND task (_run_wedge_audit_background), not here, so it adds no
@@ -1660,14 +1862,37 @@ async def run_merchant_url_audit(
     if over_free:
         from services.credit_consumption_service import estimate_probe_credits
 
-        # Per-SKU pricing: each resolved URL is probed prompts_per_sku times per
-        # provider; custom prompts add ONE probe each per provider (brand-level,
-        # not per product). Price against the SAME provider set + probe count the
-        # worker will actually run so billing matches cost.
-        per_provider_probes = (
-            len(audit_products) * max(1, _WEDGE_PROMPTS_PER_SKU)
-            + len(custom_prompts_clean)
-        )
+        # Per-SKU pricing against what the worker will ACTUALLY run: a pinned
+        # re-run reprobes the prior run's FULL pinned set (auto specs plus any
+        # merchant prompts already pinned into the basis), so each resolved
+        # product is priced by its recovered pinned set when one exists —
+        # falling back to the planned per-SKU budget on a first audit, an
+        # explicit refresh (which regenerates the basis), or a failed scan.
+        # This request's NEW per-SKU prompts (not already pinned) add one
+        # probe each; brand-level custom prompts add one each per provider.
+        # Known small over-count: a custom that duplicates an auto-generated
+        # query is deduped at probe time but still priced (the fresh auto set
+        # isn't knowable here) — bounded by the per-product cap.
+        pricing_sku_keys = list(dict.fromkeys(
+            _synthetic_url_sku_key(merchant_id, p["pdp_url"])
+            for p in audit_products
+        ))
+        pinned_by_sku: Dict[str, List[str]] = {}
+        if not body.refresh:
+            pinned_by_sku = await _pinned_selected_queries_by_sku(
+                merchant_id, pricing_sku_keys,
+            )
+        per_provider_probes = len(custom_prompts_clean)
+        for _key in pricing_sku_keys:
+            _pinned = pinned_by_sku.get(_key) or []
+            _pinned_set = set(_pinned)
+            per_provider_probes += (
+                len(_pinned) if _pinned else max(1, _WEDGE_PROMPTS_PER_SKU)
+            )
+            per_provider_probes += sum(
+                1 for q in (custom_prompts_by_sku.get(_key) or [])
+                if q.lower() not in _pinned_set
+            )
         wedge_probe_count = per_provider_probes * max(1, len(providers_for_launch))
         metered_credits, metered_cogs = estimate_probe_credits(
             [(prov, per_provider_probes, True)
@@ -1849,9 +2074,23 @@ async def run_merchant_url_audit(
     #    avoids a race where the worker claims the queued run and starts probing
     #    before a failed debit can mark it failed. consume() is idempotent on
     #    the key, so a double-submit within the window charges once.
+    # Custom prompts join the dedup identity: without this, re-POSTing the
+    # same URLs with DIFFERENT prompts inside the window replays the in-flight
+    # run and the new prompts silently never probe. Same URLs + same prompts
+    # still dedupe (the digest is deterministic); requests with no customs
+    # keep their pre-existing keys.
+    idem_product_keys = [sp["product_key"] for sp in synthetic_products]
+    if custom_prompts_clean or custom_prompts_by_sku:
+        customs_digest = hashlib.sha256(
+            json.dumps(
+                {"brand": custom_prompts_clean, "by_sku": custom_prompts_by_sku},
+                sort_keys=True,
+            ).encode("utf-8")
+        ).hexdigest()[:16]
+        idem_product_keys = idem_product_keys + [f"customs:{customs_digest}"]
     idempotency_key = compute_audit_idempotency_key(
         merchant_id=merchant_id,
-        product_keys=[sp["product_key"] for sp in synthetic_products],
+        product_keys=idem_product_keys,
         subject_type="merchant_url",
     )
     if over_free and metered_credits > 0:
@@ -1896,6 +2135,10 @@ async def run_merchant_url_audit(
                 "verify_providers": list(_WEDGE_VERIFY_PROVIDERS),
                 "prompts_per_sku": _WEDGE_PROMPTS_PER_SKU,
                 "custom_prompts": custom_prompts_clean,
+                # Per-SKU merchant prompts (custom_prompts_by_url re-keyed to
+                # sku_key): probed inside their SKU's context and pinned into
+                # its basis — the merchant's niche tracks week over week.
+                "custom_prompts_by_sku": custom_prompts_by_sku,
                 # Probe winnable SPECIFIC discovery prompts (LLM value-prop
                 # extraction), not just generic category heads — this is the
                 # demand a store-less brand can realistically win in AI.

@@ -80,6 +80,15 @@ def test_best_prefixed_llm_prompt_not_head_pressure():
     assert not _is_head_prompt_pressure(row)
 
 
+def test_merchant_custom_prompt_never_head_pressure():
+    # A merchant-authored prompt is a deliberate test — even a head-shaped one
+    # ("best headphones") must not land in do_not_chase_yet as broad category
+    # pressure. Same contract as win_plan_builder's exemption; the two
+    # classifiers must not disagree about the merchant's own prompt.
+    row = _row("best headphones", prompt_source="merchant_custom")
+    assert not _is_head_prompt_pressure(row)
+
+
 # --- 2. wedge integration: winnable prompts never land in do_not_chase -----
 
 def test_winnable_prompt_not_in_do_not_chase():
