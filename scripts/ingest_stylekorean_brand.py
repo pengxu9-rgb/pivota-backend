@@ -78,16 +78,59 @@ def _write_residue_candidates(path: str, items: List[Dict[str, Any]], *, domain:
             f.write(json.dumps(cand, ensure_ascii=False, default=str) + "\n")
 
 
-async def _attach_offer_items(items: List[Dict[str, Any]]) -> tuple[int, int]:
-    """Attach a StyleKorean retailer offer for each plan item that has a matched
-    canonical product_key + a price. Returns (applied, skipped_no_price)."""
-    applied = skipped = 0
+def _offer_eligible(p: Dict[str, Any]) -> bool:
+    """A plan item may become an offer only with a positive USD price. A "0"/
+    negative price or a non-USD currency (crawler landed on a non-Global locale)
+    must never reach attach_retailer_offer — it would stamp estimated_best_price
+    + price_confidence=0.9 with garbage under market=US."""
+    try:
+        price = float(p.get("price"))
+    except (TypeError, ValueError):
+        return False
+    if price <= 0:
+        return False
+    currency = (p.get("currency") or "").strip().upper()
+    return currency in ("", "USD")
+
+
+def _pick_offer_per_product(items: List[Dict[str, Any]]) -> tuple[List[Dict[str, Any]], int]:
+    """One offer slot exists per (product_key, merchant) — attach_retailer_offer's
+    offer_id hashes exactly that — so N retailer listings matching one canonical
+    (size variants, Double-Duo bundles) would otherwise UPSERT over each other
+    last-write-wins in crawl-completion order: nondeterministic, and a bundle
+    price can land on a single item. Pick deterministically instead: in-stock
+    first, then lowest price (base item beats bundle), then shortest title, then
+    URL as a stable tiebreak. Returns (winners, collapsed_count)."""
+    by_pk: Dict[str, List[Dict[str, Any]]] = {}
     for p in items:
-        if not p.get("matched_product_key"):
-            continue
-        if p.get("price") in (None, ""):
-            skipped += 1
-            continue
+        if p.get("matched_product_key") and _offer_eligible(p):
+            by_pk.setdefault(p["matched_product_key"], []).append(p)
+    winners: List[Dict[str, Any]] = []
+    collapsed = 0
+    for pk, group in by_pk.items():
+        group.sort(key=lambda p: (
+            0 if p["record"]["offers"][0]["availability"] == "in_stock" else 1,
+            float(p["price"]),
+            len(str(p.get("title") or "")),
+            str(p.get("url") or ""),
+        ))
+        winners.append(group[0])
+        collapsed += len(group) - 1
+    return winners, collapsed
+
+
+async def _attach_offer_items(items: List[Dict[str, Any]]) -> tuple[int, int]:
+    """Attach one deterministic StyleKorean offer per matched canonical.
+    Returns (applied, skipped) where skipped = ineligible (no/zero/non-USD
+    price) + collapsed size/bundle variants."""
+    eligible_missing = sum(
+        1 for p in items if p.get("matched_product_key") and not _offer_eligible(p)
+    )
+    winners, collapsed = _pick_offer_per_product(items)
+    if collapsed:
+        print(f"      ({collapsed} size/bundle variants collapsed onto {len(winners)} product offers)")
+    applied = 0
+    for p in winners:
         row = build_retailer_offer_row(
             product_key=p["matched_product_key"],
             merchant_id=sk.MERCHANT_ID, merchant_name=sk.MERCHANT_NAME,
@@ -96,7 +139,14 @@ async def _attach_offer_items(items: List[Dict[str, Any]]) -> tuple[int, int]:
         )
         await attach_retailer_offer(row)
         applied += 1
-    return applied, skipped
+    return applied, eligible_missing + collapsed
+
+
+def _like_escape(value: str) -> str:
+    """Escape LIKE wildcards in a crawled brand string (backslash is Postgres's
+    default LIKE escape). Injection-safe already (bound params); this prevents a
+    stray %/_ in a scraped brand from turning the pattern into a table scan."""
+    return value.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
 
 
 async def _load_our_rows(brands: List[str]) -> List[Dict[str, Any]]:
@@ -104,7 +154,7 @@ async def _load_our_rows(brands: List[str]) -> List[Dict[str, Any]]:
     if not brands:
         return []
     clauses = " OR ".join(f"lower(brand) LIKE :b{i}" for i in range(len(brands)))
-    params = {f"b{i}": f"%{b.lower()}%" for i, b in enumerate(brands)}
+    params = {f"b{i}": f"%{_like_escape(b.lower())}%" for i, b in enumerate(brands)}
     rows = await database.fetch_all(
         f"SELECT product_key, content_key, brand, title, pdp_scope "
         f"FROM catalog_products WHERE title IS NOT NULL AND ({clauses})",
@@ -245,7 +295,10 @@ def _parse_args() -> argparse.Namespace:
     p.add_argument("--category-path", default="beauty/skincare", help="taxonomy category_path for brand-official ingest.")
     p.add_argument("--apply-mint", action="store_true", help="ingest the brand-official catalog as canonicals (MINT). Requires --brand-official-domain.")
     p.add_argument("--residue-candidates", default=None, help="write residue SKUs as catalog_enrichment_agent candidates JSONL (Gemini PDP-resolution handoff).")
-    return p.parse_args()
+    args = p.parse_args()
+    if args.apply_mint and not args.brand_official_domain:
+        p.error("--apply-mint requires --brand-official-domain")
+    return args
 
 
 if __name__ == "__main__":

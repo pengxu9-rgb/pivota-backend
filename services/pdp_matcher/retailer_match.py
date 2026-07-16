@@ -63,10 +63,14 @@ def match_brand(brand: Optional[str]) -> str:
 
 
 # Bundle / promo / marketing words that don't carry product identity.
+# Deliberately NOT here (they ARE product-line identity; stripping them silently
+# merged distinct SKUs — 2026-07-16 review): "refill" (different SKU/packaging),
+# "double" (Etude "Double Lasting" line), "plus" (reformulations, "X Plus").
+# A missed match falls to the residue/Gemini lane — the safe direction.
 _PROMO = frozenset({
-    "freegift", "free", "gift", "duo", "double", "bundle", "pack",
+    "freegift", "free", "gift", "duo", "bundle", "pack",
     "special", "edition", "renewal", "planet", "holiday", "limited",
-    "value", "big", "jumbo", "refill", "plus", "set", "kit", "new",
+    "value", "big", "jumbo", "set", "kit", "new",
 })
 
 
@@ -84,13 +88,16 @@ def retailer_match_key(brand: Optional[str], title: Optional[str]) -> str:
     t = _SIZE_RE.sub(" ", title_norm)
     t = _XPACK_RE.sub(" ", t)
     t = _STRAY_X_RE.sub(" ", t)
-    tokens = [w for w in t.split() if w not in _PROMO]
-    # Drop a leading brand prefix in the title. Brand-official storefronts often
-    # prefix the brand ("COSRX Advanced Snail ..."), while retailers/our canonical
-    # do not — without this they key differently and never match.
+    tokens = t.split()
+    # Drop a leading brand prefix in the title BEFORE promo filtering — a brand
+    # containing a promo-ish token ("Double Dare") would otherwise lose part of
+    # its prefix to the filter and never prefix-strip. Brand-official storefronts
+    # often prefix the brand ("COSRX Advanced Snail ..."), while retailers/our
+    # canonical do not — without this they key differently and never match.
     brand_tokens = brand_norm.split()
     if brand_tokens and tokens[: len(brand_tokens)] == brand_tokens:
         tokens = tokens[len(brand_tokens):]
+    tokens = [w for w in tokens if w not in _PROMO]
     stripped = " ".join(tokens).strip()
     if not stripped:
         # Title was ALL packaging/promo (e.g. "Favorites Set") — fall back to the

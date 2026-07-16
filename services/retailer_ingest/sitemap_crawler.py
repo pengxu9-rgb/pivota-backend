@@ -14,6 +14,8 @@ schema.org markup.
 from __future__ import annotations
 
 import re
+import time
+import urllib.error
 import urllib.request
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import Any, Callable, Dict, List, Optional
@@ -27,6 +29,14 @@ from services.external_offers_service import (
 USER_AGENT = "Mozilla/5.0 (compatible; PivotaBot/1.0; +https://pivota.cc)"
 _MAX_BODY_BYTES = 2_000_000
 _FETCH_TIMEOUT_S = 25
+# Per-request politeness delay (each pool worker sleeps this long before its
+# fetch) and the retry/backoff for transient rejections. 429/503 honor
+# Retry-After when the server sends one, capped so a hostile header can't hang
+# a worker.
+_POLITENESS_DELAY_S = 0.2
+_RETRY_STATUS = {429, 500, 502, 503}
+_RETRY_BACKOFF_S = 2.0
+_RETRY_AFTER_CAP_S = 15.0
 
 _LDJSON_RE = re.compile(
     r'<script[^>]*type="application/ld\+json"[^>]*>(.*?)</script>',
@@ -36,9 +46,24 @@ _LOC_RE = re.compile(r"<loc>\s*([^<\s]+)\s*</loc>", re.I)
 
 
 def fetch_text(url: str, *, user_agent: str = USER_AGENT, timeout: int = _FETCH_TIMEOUT_S) -> str:
+    """Fetch with one retry on transient rejections (429/5xx), honoring a sane
+    Retry-After. StyleKorean intermittently 500s on valid PDPs — a single retry
+    recovers most of those without hammering."""
     req = urllib.request.Request(url, headers={"User-Agent": user_agent})
-    with urllib.request.urlopen(req, timeout=timeout) as resp:  # noqa: S310 (trusted retailer host)
-        return resp.read(_MAX_BODY_BYTES).decode("utf-8", "ignore")
+    for attempt in (1, 2):
+        try:
+            with urllib.request.urlopen(req, timeout=timeout) as resp:  # noqa: S310 (trusted retailer host)
+                return resp.read(_MAX_BODY_BYTES).decode("utf-8", "ignore")
+        except urllib.error.HTTPError as e:
+            if attempt == 2 or e.code not in _RETRY_STATUS:
+                raise
+            retry_after = _RETRY_BACKOFF_S
+            try:
+                retry_after = min(float(e.headers.get("Retry-After", "")), _RETRY_AFTER_CAP_S)
+            except (TypeError, ValueError):
+                pass
+            time.sleep(max(retry_after, _RETRY_BACKOFF_S))
+    raise RuntimeError("unreachable")  # pragma: no cover
 
 
 def sitemap_locs(xml_text: str) -> List[str]:
@@ -86,6 +111,7 @@ def crawl_products(
 
     def _one(u: str) -> Dict[str, Any]:
         try:
+            time.sleep(_POLITENESS_DELAY_S)  # per-worker pacing, not just a pool bound
             prod = extract_product(fetch_text(u, user_agent=user_agent))
             if not prod:
                 return {"_status": "no_product", "url": u}

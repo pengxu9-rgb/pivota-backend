@@ -12,8 +12,14 @@ This module:
      the variant **barcode/GTIN**, the strongest identity basis);
   2. predicts, in memory and WITHOUT writing, which of the retailer's MINT SKUs
      resolve to a brand-official product (same `retailer_match_key`); and
-  3. on apply, ingests those canonicals through the sanctioned Path-C executor
-     (`ingest_validated_jsonl` → `apply_ingest_plan`).
+  3. on apply, ingests the brand's ENTIRE net-new official catalog (not just the
+     records that resolve retailer MINT SKUs) through the sanctioned Path-C
+     executor (`ingest_validated_jsonl` → `apply_ingest_plan`). Deliberate,
+     per ADR-001 canonical-first: once we touch a brand, its full brand-official
+     catalog becomes canonical anchors; the retailer's SKUs are just the offers
+     that triggered it. Only NET-NEW records are ingested (see filter_net_new —
+     re-ingesting already-owned products under drifted storefront titles would
+     duplicate canonicals).
 
 Only Shopify-hosted brand domains are enumerable this way (non-Shopify →
 `records_for_brand` returns []). Retailer SKUs with no brand-official match are

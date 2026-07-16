@@ -21,9 +21,32 @@ def test_size_suffix_stripped_so_retailer_aligns_with_canonical():
 
 
 def test_pack_and_promo_noise_stripped():
-    a = retailer_match_key("COSRX", "Low pH Good Morning Gel Cleanser Double Duo (150ml + 50ml freegift)")
+    a = retailer_match_key("COSRX", "Low pH Good Morning Gel Cleanser Special Set (150ml + 50ml freegift)")
     b = retailer_match_key("COSRX", "Low pH Good Morning Gel Cleanser")
     assert a == b
+
+
+def test_line_identity_tokens_not_stripped():
+    # "refill"/"double"/"plus" carry SKU/line identity — stripping them silently
+    # merged distinct products (2026-07-16 review). Missed matches fall to the
+    # residue/Gemini lane, which is the safe direction.
+    assert retailer_match_key("COSRX", "Advanced Snail 96 Mucin Power Essence Refill 100ml") != \
+           retailer_match_key("COSRX", "Advanced Snail 96 Mucin Power Essence 100ml")
+    assert retailer_match_key("Etude", "Double Lasting Foundation") != \
+           retailer_match_key("Etude", "Lasting Foundation")
+    assert retailer_match_key("iUNIK", "Propolis Vitamin Synergy Serum Plus") != \
+           retailer_match_key("iUNIK", "Propolis Vitamin Synergy Serum")
+    # ...while a "Double Duo" bundle no longer collapses onto the base item
+    # (a bundle is not the base product's offer).
+    assert retailer_match_key("COSRX", "Low pH Good Morning Gel Cleanser Double Duo (150ml+150ml)") != \
+           retailer_match_key("COSRX", "Low pH Good Morning Gel Cleanser")
+
+
+def test_brand_prefix_strip_runs_before_promo_filter():
+    # Brand "Double Dare" contains a promo-ish token; the prefix must still strip
+    # cleanly instead of leaving a stray "dare" behind.
+    assert retailer_match_key("Double Dare", "Double Dare OMG 2in1 Kit") == \
+           retailer_match_key("Double Dare", "OMG 2in1")
 
 
 def test_pack_count_stripped():

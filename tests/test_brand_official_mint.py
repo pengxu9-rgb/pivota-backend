@@ -19,10 +19,14 @@ def test_mint_sku_resolves_to_brand_official_across_size_drift():
     ]
     mint = [
         {"brand": "COSRX", "title": "Advanced Snail 96 Mucin Power Essence 100ml"},
-        {"brand": "COSRX", "title": "Low pH Good Morning Gel Cleanser Double Duo (150ml + 50ml)"},
+        {"brand": "COSRX", "title": "Low pH Good Morning Gel Cleanser Special Set (150ml + 50ml)"},
+        # a Double-Duo BUNDLE is not the base product — stays residue by design
+        # ("double" is line identity, 2026-07-16 review)
+        {"brand": "COSRX", "title": "Low pH Good Morning Gel Cleanser Double Duo (150ml+150ml)"},
     ]
     resolved, residue = predict_official_matches(mint, official)
-    assert len(resolved) == 2 and residue == []
+    assert len(resolved) == 2
+    assert len(residue) == 1 and "Double Duo" in residue[0]["title"]
     assert resolved[0]["official"]["pdp"]["product_name"] == "Advanced Snail 96 Mucin Power Essence"
 
 
