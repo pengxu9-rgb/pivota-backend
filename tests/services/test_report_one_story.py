@@ -273,6 +273,12 @@ def test_top_actions_secondary_rows_never_inherit_primary_evidence():
     per_sku = [{
         "sku_key": "sku-1",
         "sku_title": "Purra Swim",
+        # SKU-level pool: _supporting_prompts unions this into EVERY action
+        # from the SKU — the founder-reported "all evidences repeat".
+        "failing_prompts": [
+            {"query": "ip68 headphones for lap swimming",
+             "provider": "gemini", "competitors_named": []},
+        ],
         "next_best_action": {
             "headline": "Primary headline",
             "primary_gap": "citation",
@@ -288,6 +294,9 @@ def test_top_actions_secondary_rows_never_inherit_primary_evidence():
     )
     assert primary["evidence_summary"] == "PRIMARY EVIDENCE"
     assert primary["cta"]
+    # measured evidence renders ONCE, under the action it was diagnosed from
+    assert primary["supporting_prompts"], "primary keeps its measured evidence"
+    assert secondary["supporting_prompts"] == []
     assert secondary["evidence_summary"] is None
     assert secondary["cta"] is None
     assert secondary["how_to_track"] == []
