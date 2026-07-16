@@ -473,6 +473,14 @@ def _sideways_wedge_lane_chip(row: Mapping[str, Any], *, lane_type: str) -> Dict
         "controllers": _lane_controllers(row),
         "opportunity_score": row.get("opportunity_score"),
         "demand_signal": row.get("demand_signal"),
+        # The evidenced attributes behind this lane — merchant-facing copy
+        # phrases the lane from these ("the IP68-waterproof, open-ear ask")
+        # instead of quoting the raw attribute-stacked probe spec, which
+        # reads like the SKU title reworded.
+        "attribute_basis": _clean_list(row.get("attribute_basis")),
+        # Who owns the answer today (host) — lets copy name the route
+        # ("AI routes buyers through ebay.com").
+        "who_owns": row.get("who_owns"),
     }
     for key in (
         "lane_priority_score",

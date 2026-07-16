@@ -108,6 +108,76 @@ def test_winnable_stamp_overrides_head_prefix():
     assert row["win_path"] == "own_content"
 
 
+def _plan_for_prompts(fps):
+    plan = build_win_plan(
+        per_sku_reports=[{"sku_key": "s", "sku_title": "S", "failing_prompts": fps}],
+        authority_map={"skus": [{"sku_key": "s", "authority_hosts": []}]},
+        merchant_name="Mojawa",
+        merchant_category="Headphones",
+    )
+    return plan["sku_plans"][0]["losing_queries"]
+
+
+def test_losing_queries_specific_first_head_trails():
+    """Niche-first losing_queries: probe order front-loads the head baseline,
+    but a specific losing query must lead the list (and the cap) — the head
+    row trails as an honest measurement, stamped for downstream consumers."""
+    fps = [
+        {"query": "best headphones", "axis": "category", "provider": "gemini",
+         "grounding_sources": [], "competitors_named": []},
+        {"query": "ip68 waterproof headphones for competitive swimmers",
+         "axis": "category", "provider": "gemini",
+         "grounding_sources": [], "competitors_named": []},
+    ]
+    rows = _plan_for_prompts(fps)
+    assert rows[0]["query"] == "ip68 waterproof headphones for competitive swimmers"
+    assert rows[0]["broad_head_prompt"] is False
+    assert rows[1]["query"] == "best headphones"
+    assert rows[1]["broad_head_prompt"] is True
+
+
+def test_head_with_targets_defers_when_specific_exists():
+    """A head term WITH publisher targets used to prescribe 'Get cited in
+    <host> for "best headphones"'. With a specific losing query in the plan,
+    the head row keeps its factual targets but the win condition reads as an
+    explicit park-it, never a get-cited-for-the-head-term prescription."""
+    host_row = {
+        "host": "techradar.com",
+        "citation_role": "editorial_review",
+        "evidence_urls": ["https://techradar.com/best-headphones"],
+    }
+    fps = [
+        {"query": "best headphones", "axis": "category", "provider": "gemini",
+         "grounding_sources": [{"uri": "https://techradar.com/best-headphones"}],
+         "competitors_named": []},
+        {"query": "ip68 waterproof headphones for competitive swimmers",
+         "axis": "category", "provider": "gemini",
+         "grounding_sources": [], "competitors_named": []},
+    ]
+    plan = build_win_plan(
+        per_sku_reports=[{"sku_key": "s", "sku_title": "S", "failing_prompts": fps}],
+        authority_map={"skus": [{"sku_key": "s", "authority_hosts": [host_row]}]},
+        merchant_name="Mojawa",
+        merchant_category="Headphones",
+    )
+    rows = plan["sku_plans"][0]["losing_queries"]
+    head_row = next(r for r in rows if r["query"] == "best headphones")
+    assert head_row["grounds_in"], "factual targets must be kept"
+    wc = head_row["win_condition"] or ""
+    assert "park it" in wc.lower()
+    assert "get cited" not in wc.lower()
+    # Head-only plan keeps the old get-cited copy (some plan beats none).
+    only_head = build_win_plan(
+        per_sku_reports=[{"sku_key": "s", "sku_title": "S",
+                          "failing_prompts": [fps[0]]}],
+        authority_map={"skus": [{"sku_key": "s", "authority_hosts": [host_row]}]},
+        merchant_name="Mojawa",
+        merchant_category="Headphones",
+    )
+    only_row = only_head["sku_plans"][0]["losing_queries"][0]
+    assert "Get cited in" in (only_row["win_condition"] or "")
+
+
 # --- 3. suggested_prompts empty-state rationale --------------------------------
 
 def test_suggested_prompts_empty_state_is_honest():

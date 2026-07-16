@@ -187,12 +187,23 @@ def _example_query_for_host(
     example ('for "best pajamas under $100", they listed Lunya, ...')."""
     if not host:
         return None
+    from services.win_plan_builder import is_broad_head_query
+
     h_lower = host.strip().lower()
-    for fq in failed_queries_detailed or []:
-        cited = (fq.get("top_cited_host") or "").lower()
-        if cited == h_lower:
+    matches = [
+        fq
+        for fq in failed_queries_detailed or []
+        if (fq.get("top_cited_host") or "").lower() == h_lower
+    ]
+    # Niche-first example: a specific failed query makes the pitch concrete
+    # ("for <specific ask>, they listed X"); a head baseline makes the pitch
+    # generic. Head examples survive only when they're the only match.
+    for fq in matches:
+        if not is_broad_head_query(
+            fq.get("query"), prompt_source=fq.get("prompt_source")
+        ):
             return fq
-    return None
+    return matches[0] if matches else None
 
 
 def _competitors_phrase(competitors: List[str]) -> str:
