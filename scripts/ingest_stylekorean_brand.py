@@ -191,7 +191,11 @@ async def _drive(args: argparse.Namespace) -> int:
             domain=args.brand_official_domain, brand=brand_name, category_path=args.category_path,
         )
         resolved, residue = bo.predict_official_matches(mint, official)
-        print(f"      brand-official products: {len(official)}")
+        # Only NET-NEW brand-official products are safe to ingest — re-ingesting one
+        # we already have would derive a new product_key from the storefront's drifted
+        # title and duplicate the canonical (ingestion.derive_product_key has no strip).
+        net_new, already_have = bo.filter_net_new(official, our_rows)
+        print(f"      brand-official products: {len(official)}  (already have {len(already_have)}, NET-NEW {len(net_new)})")
         print(f"      of {len(mint)} MINT SKUs → {len(resolved)} resolve to a brand-official product, {len(residue)} residue")
 
         if args.residue_candidates:
@@ -206,10 +210,11 @@ async def _drive(args: argparse.Namespace) -> int:
             return 0
 
         summary = await bo.ingest_brand_official(
-            official_records=official, brand=brand_name, domain=args.brand_official_domain,
+            official_records=net_new, brand=brand_name, domain=args.brand_official_domain,
             apply=True, db=database,
         )
-        print(f"      ingested brand-official: {summary['applied']}")
+        print(f"      ingested {len(net_new)} NET-NEW brand-official canonicals: {summary['applied']}")
+        print(f"      ({len(already_have)} already-have skipped to avoid duplicate canonicals)")
         # re-match the MINT SKUs against the refreshed catalog and attach SK offers
         our_rows2 = await _load_our_rows(_brand_tokens(records))
         index2 = build_match_index(our_rows2)

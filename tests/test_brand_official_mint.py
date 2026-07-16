@@ -2,6 +2,7 @@
 
 from services.retailer_ingest.brand_official import (
     dominant_brand,
+    filter_net_new,
     predict_official_matches,
 )
 
@@ -40,6 +41,20 @@ def test_no_official_records_all_residue():
     mint = [{"brand": "COSRX", "title": "Anything 50ml"}]
     resolved, residue = predict_official_matches(mint, [])
     assert resolved == [] and len(residue) == 1
+
+
+def test_filter_net_new_excludes_already_owned_across_drift():
+    # our catalog uses plain brand + no size; cosrx.com uses "Official" + brand-in-title + size
+    our_rows = [
+        {"brand": "COSRX", "title": "Advanced Snail 96 Mucin Power Essence", "pdp_scope": "merchant_owned"},
+    ]
+    official = [
+        _official("COSRX Official", "COSRX Advanced Snail 96 Mucin Power Essence 100ml"),  # we HAVE this
+        _official("COSRX Official", "COSRX 5 PDRN NAD+ Multi Repair Cream"),               # NET-NEW
+    ]
+    net_new, already = filter_net_new(official, our_rows)
+    assert len(already) == 1 and len(net_new) == 1
+    assert "NAD+" in net_new[0]["pdp"]["product_name"]
 
 
 def test_dominant_brand():

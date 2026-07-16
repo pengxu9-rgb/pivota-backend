@@ -67,6 +67,28 @@ def predict_official_matches(
     return resolved, residue
 
 
+def filter_net_new(
+    official_records: List[Mapping[str, Any]],
+    our_rows: List[Mapping[str, Any]],
+) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
+    """Split brand-official records into (net_new, already_have) vs our catalog,
+    by retailer_match_key. ONLY net_new is safe to ingest: re-ingesting a product
+    we already have would derive a fresh product_key from the storefront's
+    (drifted) title and create a DUPLICATE canonical — ingestion.derive_product_key
+    has no title-normalization, unlike the match layer. already_have is returned
+    for reporting (candidates for a GTIN-refresh path, not a re-INSERT)."""
+    our_index = build_match_index(
+        [{"brand": r.get("brand"), "title": r.get("title"), "pdp_scope": r.get("pdp_scope")} for r in our_rows]
+    )
+    net_new: List[Dict[str, Any]] = []
+    already: List[Dict[str, Any]] = []
+    for rec in official_records:
+        pdp = rec.get("pdp") or {}
+        key = retailer_match_key(pdp.get("brand"), pdp.get("product_name"))
+        (already if key in our_index else net_new).append(dict(rec))
+    return net_new, already
+
+
 async def fetch_official_records(
     *,
     domain: str,
