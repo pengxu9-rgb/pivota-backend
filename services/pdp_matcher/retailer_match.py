@@ -67,6 +67,12 @@ def retailer_match_key(brand: Optional[str], title: Optional[str]) -> str:
     t = _XPACK_RE.sub(" ", t)
     t = _STRAY_X_RE.sub(" ", t)
     tokens = [w for w in t.split() if w not in _PROMO]
+    # Drop a leading brand prefix in the title. Brand-official storefronts often
+    # prefix the brand ("COSRX Advanced Snail ..."), while retailers/our canonical
+    # do not — without this they key differently and never match.
+    brand_tokens = brand_norm.split()
+    if brand_tokens and tokens[: len(brand_tokens)] == brand_tokens:
+        tokens = tokens[len(brand_tokens):]
     stripped = " ".join(tokens).strip()
     if not stripped:
         # Title was ALL packaging/promo (e.g. "Favorites Set") — fall back to the

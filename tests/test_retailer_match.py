@@ -51,6 +51,17 @@ def test_brand_normalization_folds_suffixes():
            retailer_match_key("Glow Recipe", "Watermelon Glow Toner")
 
 
+def test_leading_brand_prefix_in_title_stripped():
+    # brand-official storefront prefixes the brand; retailer/canonical do not.
+    assert retailer_match_key("COSRX", "COSRX Advanced Snail 96 Mucin Power Essence") == \
+           retailer_match_key("COSRX", "Advanced Snail 96 Mucin Power Essence 100ml")
+    # multi-word brand prefix
+    assert retailer_match_key("Beauty of Joseon", "Beauty of Joseon Glow Serum 30ml") == \
+           retailer_match_key("Beauty of Joseon", "Glow Serum")
+    # brand appearing mid-title is NOT stripped (only a leading prefix)
+    assert "cosrx" in retailer_match_key("COSRX", "Official COSRX Snail Cream")
+
+
 def test_empty_when_brand_or_title_missing():
     assert retailer_match_key(None, "Some Toner") == ""
     assert retailer_match_key("COSRX", "") == ""
