@@ -53,11 +53,15 @@ class AP2SecurityMiddleware(BaseHTTPMiddleware):
             "/ap2/consent/grant",
         ]
         
-        # Check if this is a public endpoint
+        # Check if this is a public endpoint. The prefix exemptions are
+        # GET-only on purpose: only read routes live under these prefixes today
+        # (GET /ap2/transaction/{id}, GET /ap2/receipt/{id}), so any future write
+        # route added under them fails closed (stays authenticated) instead of
+        # silently inheriting public status.
         is_public = (
             request.url.path in public_endpoints or
             (request.url.path.startswith("/ap2/transaction/") and request.method == "GET") or
-            request.url.path.startswith("/ap2/receipt/") or
+            (request.url.path.startswith("/ap2/receipt/") and request.method == "GET") or
             request.url.path == "/ap2/x402/quote"
         )
         

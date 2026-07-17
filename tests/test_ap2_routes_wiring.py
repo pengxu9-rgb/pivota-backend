@@ -153,3 +153,19 @@ def test_public_status_endpoint_open_under_enforcement(enforced_client):
     res = enforced_client.get("/ap2/status")
     assert res.status_code == 200
     assert res.json().get("protocol") == "AP2"
+
+
+def test_receipt_get_is_public_but_non_get_fails_closed(enforced_client):
+    # GET /ap2/receipt/{id} is a read route and is exempt: it reaches the handler
+    # (empty DB -> 404 from the route), NOT blocked by the middleware.
+    got = enforced_client.get("/ap2/receipt/txn-xyz")
+    assert got.status_code == 404
+    assert got.json().get("detail") == "Transaction not found"
+
+    # The receipt-prefix exemption is GET-only: a (hypothetical future) non-GET
+    # under the same prefix must fail closed at the middleware, not inherit public
+    # status. Today there is no POST route there, so the middleware's auth check
+    # is what answers — proving the exemption did not leak to other methods.
+    posted = enforced_client.post("/ap2/receipt/txn-xyz", json={})
+    assert posted.status_code == 401
+    assert posted.json().get("error") == "Missing X-Agent-Consent header"
