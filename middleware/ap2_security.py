@@ -144,25 +144,24 @@ async def verify_ap2_consent(request: Request) -> dict:
     Raises:
         HTTPException: If consent is invalid
     """
-    consent_token = getattr(request.state, "consent_token", None)
-    
+    consent_token = getattr(request.state, "consent_token", None) or \
+        request.headers.get("X-Agent-Consent")
+
     if not consent_token:
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
             detail="Missing agent consent"
         )
-    
-    # TODO: Validate consent token with consent_service
-    # from services.consent_service import consent_service
-    # consent_data = await consent_service.verify_consent(consent_token)
-    
-    # Mock validation for now
-    logger.warning("AP2 consent validation not yet implemented")
-    return {
-        "agent_id": "agent_001",
-        "scope": ["read", "write"],
-        "expiry": "2025-12-31T23:59:59Z"
-    }
+
+    from services.consent_service import consent_service
+
+    try:
+        return await consent_service.verify_consent(consent_token)
+    except ValueError as e:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail=str(e)
+        )
 
 
 async def verify_ap2_signature(request: Request) -> bool:
@@ -175,20 +174,60 @@ async def verify_ap2_signature(request: Request) -> bool:
     Raises:
         HTTPException: If signature is invalid
     """
-    signature = getattr(request.state, "signature", None)
-    
+    signature = getattr(request.state, "signature", None) or \
+        request.headers.get("X-AP2-Signature")
+    nonce = getattr(request.state, "nonce", None) or \
+        request.headers.get("X-AP2-Nonce")
+
     if not signature:
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
             detail="Missing request signature"
         )
-    
-    # TODO: Validate signature with crypto_service
-    # from services.crypto_service import crypto_service
-    # is_valid = crypto_service.verify_agent_signature(...)
-    
-    # Mock validation for now
-    logger.warning("AP2 signature verification not yet implemented")
+
+    from services.consent_service import consent_service
+    from services.crypto_service import crypto_service
+
+    consent = await verify_ap2_consent(request)
+    agent_id = consent["agent_id"]
+
+    try:
+        public_key = await consent_service.get_agent_public_key(agent_id)
+    except LookupError:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Unknown agent"
+        )
+
+    if not public_key:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Agent has no registered public key for AP2 signature verification"
+        )
+
+    try:
+        body = await request.json()
+    except Exception:
+        body = {}
+    if not isinstance(body, dict):
+        body = {}
+
+    payload = {**body, "nonce": nonce}
+    algorithm = body.get("algorithm", "ES256")
+
+    is_valid = crypto_service.verify_agent_signature(
+        public_key=public_key,
+        signature=signature,
+        payload=payload,
+        algorithm=algorithm
+    )
+
+    if not is_valid:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Invalid signature"
+        )
+
     return True
 
 

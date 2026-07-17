@@ -16,9 +16,37 @@ from services.crypto_service import crypto_service
 logger = logging.getLogger(__name__)
 
 
+class InvalidSignatureError(ValueError):
+    """Signature did not verify against the agent's registered public key."""
+
+
+class NonceReplayError(ValueError):
+    """Nonce has already been used (replay protection)."""
+
+
 class ConsentService:
     """Manage AP2 consent tokens and nonce tracking"""
-    
+
+    async def get_agent_public_key(self, agent_id: str) -> Optional[str]:
+        """
+        Fetch the agent's registered AP2 public key (agents.public_key,
+        migration 021). Signatures must only ever be verified against a
+        key registered ahead of time — never one supplied by the caller.
+
+        Returns:
+            The registered key (PEM/base64), or None if the agent has none
+
+        Raises:
+            LookupError: If the agent does not exist
+        """
+        row = await database.fetch_one(
+            "SELECT public_key FROM agents WHERE agent_id = :agent_id",
+            {"agent_id": agent_id}
+        )
+        if not row:
+            raise LookupError(f"Agent not found: {agent_id}")
+        return row["public_key"]
+
     async def create_consent(
         self,
         agent_id: str,
@@ -61,8 +89,8 @@ class ConsentService:
             )
             
             if not is_valid:
-                raise ValueError("Invalid signature")
-            
+                raise InvalidSignatureError("Invalid signature")
+
             logger.info(f"✅ Signature verified for agent {agent_id}")
         
         # Verify nonce uniqueness
@@ -72,7 +100,7 @@ class ConsentService:
                 {"nonce": nonce}
             )
             if existing_nonce:
-                raise ValueError("Nonce already used")
+                raise NonceReplayError("Nonce already used")
             
             await database.execute(
                 """INSERT INTO nonce_tracker (nonce, used_at, request_path)
