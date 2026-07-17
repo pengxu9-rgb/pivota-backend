@@ -342,3 +342,65 @@ def test_grant_with_did_web_identity(monkeypatch):
     assert res.status_code == 200, res.text
     assert res.json()["consent_token"].startswith("consent_")
     assert len(fake.consents) == 1
+
+
+# --------------------------------------------------------------------------- #
+# transport failures fail closed as ValueError (not an uncaught 500)
+# --------------------------------------------------------------------------- #
+
+class _RaisingClient:
+    """Fake httpx.AsyncClient whose .get raises a transport error."""
+
+    def __init__(self, *a, **k):
+        pass
+
+    async def __aenter__(self):
+        return self
+
+    async def __aexit__(self, *a):
+        return False
+
+    async def get(self, *a, **k):
+        import httpx
+        raise httpx.ConnectError("connection refused")
+
+
+async def test_default_fetch_wraps_transport_error_as_valueerror(monkeypatch):
+    import httpx
+    # Bypass the SSRF DNS check (covered elsewhere) to isolate the transport path.
+    monkeypatch.setattr(ap2_did_web, "_assert_public_host", lambda host: None)
+    monkeypatch.setattr(httpx, "AsyncClient", _RaisingClient)
+
+    with pytest.raises(ValueError):
+        await ap2_did_web._default_fetch(
+            "https://agents.example.com/.well-known/did.json"
+        )
+
+
+def test_grant_did_web_network_failure_is_401(monkeypatch):
+    # A did:web agent whose DID document is unreachable must fail CLOSED as 401,
+    # not escape as a 500 — through the real _default_fetch (transport error →
+    # ValueError → create_consent InvalidSignatureError → 401).
+    import httpx
+    ap2_did_web._clear_cache()
+    monkeypatch.setattr(ap2_did_web, "_assert_public_host", lambda host: None)
+    monkeypatch.setattr(httpx, "AsyncClient", _RaisingClient)
+
+    did = "did:web:agents.example.com:down"
+    fake = _FakeDB({did: did})
+    from db.database import database
+    monkeypatch.setattr(database, "fetch_one", fake.fetch_one)
+    monkeypatch.setattr(database, "execute", fake.execute)
+
+    from routes.ap2_routes import router as ap2_router
+    app = FastAPI()
+    app.include_router(ap2_router)
+    client = TestClient(app)
+
+    res = client.post(
+        "/ap2/consent/grant",
+        json={"agent_id": did, "scope": ["read"], "duration_hours": 24},
+        headers={"X-AP2-Signature": "AA==", "X-AP2-Nonce": "down-1"},
+    )
+    assert res.status_code == 401, res.text
+    assert fake.consents == []
