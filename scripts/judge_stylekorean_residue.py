@@ -33,7 +33,10 @@ from scripts.ingest_stylekorean_brand import (  # noqa: E402
 )
 from services.pdp_matcher.retailer_match import build_match_index, match_record  # noqa: E402
 from services.retailer_ingest import stylekorean as sk  # noqa: E402
-from services.retailer_ingest.brand_official import fetch_official_records  # noqa: E402
+from services.retailer_ingest.brand_official import (  # noqa: E402
+    dominant_brand,
+    fetch_official_records,
+)
 from services.retailer_ingest.single_writer_lock import (  # noqa: E402
     SingleWriterLockError,
     retailer_ingest_lock,
@@ -60,6 +63,15 @@ async def _attach_auto_verdicts(auto_rows: List[Dict[str, Any]]) -> None:
     for r in auto_rows:
         pdp = (r.get("official") or {}).get("pdp") or {}
         target = match_record(index, pdp.get("brand"), pdp.get("product_name"))
+        if not target:
+            # Vendor-brand fallback: a Shopify vendor string can drift from our
+            # catalog brand beyond what match_brand strips ("Anua US"/"Anua
+            # Global" vs "Anua" — the anua 20/20 no-target anomaly, 2026-07-17).
+            # The verdict already certifies item == official, and the mint lane
+            # ingests officials under the ITEM-side dominant brand, so re-keying
+            # the official title with the item's brand is deterministic parity,
+            # not a guess.
+            target = match_record(index, r["item"].get("brand"), pdp.get("product_name"))
         if not target:
             # official not (yet) a catalog row (e.g. an un-minted drift suspect).
             # Needs mint/merge first; report, never guess a target.
@@ -115,13 +127,21 @@ async def _drive(args: argparse.Namespace) -> int:
         return await _drive_apply_from(args)
     plan = [json.loads(l) for l in open(args.plan) if l.strip()]
     mint = [p for p in plan if p.get("decision") == "mint"]
+    # brand from the FULL plan (before --limit), mirroring the MINT lane's
+    # dominant_brand(mint) or dominant_brand(attach) fallback chain.
+    brand_name = dominant_brand(mint) or dominant_brand(plan)
     if args.limit:
         mint = mint[: args.limit]
     print(f"[1/4] plan {args.plan}: {len(plan)} rows, judging {len(mint)} MINT residue items")
 
-    print(f"[2/4] enumerating brand-official catalog {args.brand_official_domain} ...")
+    # Brand parity with the MINT lane (ingest_stylekorean_brand step [5/5]): fetch
+    # officials under the plan's dominant brand, not the raw Shopify vendor —
+    # minted canonicals carry the dominant brand, so vendor-branded records
+    # ("Anua US") would never resolve a catalog target at attach time.
+    print(f"[2/4] enumerating brand-official catalog {args.brand_official_domain} "
+          f"(brand={brand_name!r}) ...")
     official = await fetch_official_records(
-        domain=args.brand_official_domain, brand=None, category_path=args.category_path,
+        domain=args.brand_official_domain, brand=brand_name, category_path=args.category_path,
     )
     print(f"      {len(official)} official products")
 
