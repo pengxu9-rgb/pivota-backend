@@ -296,3 +296,36 @@ async def test_hitl_apply_skips_merges_and_unapproved(tmp_path, monkeypatch, cap
     assert called == []  # merge skipped, pending mint skipped — zero writes
     out = capsys.readouterr().out
     assert "SKIPPING 1 merge_duplicate" in out
+
+
+# --- wave3 orchestrator pure helpers ------------------------------------------
+
+def test_wave3_candidate_domains_and_vendor_verification():
+    from scripts.wave3_stylekorean_longtail import candidate_domains, vendor_matches_brand
+
+    cands = candidate_domains("Beauty of Joseon", "beauty-of-joseon")
+    assert "beautyofjoseon.com" in cands
+    assert cands.index("beautyofjoseon.com") == 0  # display-name flat comes first
+    assert any(c.startswith("beauty-of-joseon.") for c in cands)
+
+    # vendor verification: containment either way, never empty, never unrelated
+    assert vendor_matches_brand("Anua US", "Anua")
+    assert vendor_matches_brand("BOJ", "BOJ")
+    assert vendor_matches_brand("Beauty of Joseon", "Beauty of Joseon UK")
+    assert not vendor_matches_brand("Glow Recipe", "Abib")
+    assert not vendor_matches_brand("", "Abib")
+
+
+def test_wave3_plan_stats(tmp_path):
+    import json as _json
+
+    from scripts.wave3_stylekorean_longtail import _plan_stats
+
+    p = tmp_path / "plan.jsonl"
+    with open(p, "w") as f:
+        f.write(_json.dumps({"decision": "attach", "brand": "Abib"}) + "\n")
+        f.write(_json.dumps({"decision": "mint", "brand": "Abib"}) + "\n")
+        f.write(_json.dumps({"decision": "mint", "brand": "Abib"}) + "\n")
+    s = _plan_stats(str(p))
+    assert s == {"attach": 1, "mint": 2, "brand_display": "Abib"}
+    assert _plan_stats(str(tmp_path / "missing.jsonl"))["attach"] == 0
