@@ -131,16 +131,21 @@ def test_ingest_record_builds_pdp_and_seed_rows():
 
 
 def test_runner_persists_canonical_signature_fields():
-    source = (
-        Path(__file__).resolve().parents[1] / "scripts" / "run_catalog_enrichment.py"
-    ).read_text()
+    # The upsert SQL lives in the shared FK-order executor (apply._PDP_UPSERT_SQL),
+    # which both the CLI and the programmatic runner route through.
+    from services.catalog_enrichment_agent.apply import _PDP_UPSERT_SQL
 
-    assert "pivota_signature_id, pivota_canonical_url, pivota_signature_minted_at" in source
-    assert ":pivota_signature_id, :pivota_canonical_url, :pivota_signature_minted_at" in source
+    assert "pivota_signature_id, pivota_canonical_url, pivota_signature_minted_at" in _PDP_UPSERT_SQL
+    assert ":pivota_signature_id, :pivota_canonical_url, :pivota_signature_minted_at" in _PDP_UPSERT_SQL
     assert (
         "pivota_signature_id = COALESCE(catalog_products.pivota_signature_id, "
         "EXCLUDED.pivota_signature_id)"
-    ) in source
+    ) in _PDP_UPSERT_SQL
+
+    runner_source = (
+        Path(__file__).resolve().parents[1] / "scripts" / "run_catalog_enrichment.py"
+    ).read_text()
+    assert "from services.catalog_enrichment_agent.apply import apply_ingest_plan" in runner_source
 
 
 def test_ingest_record_handles_multiple_offers():
