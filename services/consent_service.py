@@ -17,6 +17,7 @@ from services.ap2_signing import (
     build_ap2_signed_payload,
     is_supported_ap2_algorithm,
 )
+from services.ap2_did import is_did_key, resolve_did_key
 
 logger = logging.getLogger(__name__)
 
@@ -92,6 +93,18 @@ class ConsentService:
 
         # Verify signature if provided
         if signature and public_key:
+            # did:key identities carry the verification key in the identifier
+            # itself (ADR-012, first DID slice). Resolve it to a PEM and take
+            # the algorithm FROM the DID — the DID, not the caller, is
+            # authoritative about the key type. A malformed DID fails closed.
+            if is_did_key(public_key):
+                try:
+                    public_key, algorithm = resolve_did_key(public_key)
+                except ValueError as exc:
+                    raise InvalidSignatureError(
+                        f"Unresolvable did:key identity: {exc}"
+                    )
+
             if not is_supported_ap2_algorithm(algorithm):
                 raise UnsupportedAlgorithmError(
                     f"Unsupported algorithm: {algorithm} "
