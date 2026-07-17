@@ -174,7 +174,10 @@ def _payload_for(row: Dict[str, Any]) -> Dict[str, Any]:
 
 
 async def run(apply: bool, limit: int) -> int:
-    await database.connect()
+    # initial connect through the same healer as mid-run reconnects —
+    # a proxy TLS bad-window at process start must not burn a whole
+    # stage attempt (observed 2026-07-17).
+    await _reconnect()
 
     # 0. APV heal — refresh views whose description lags the catalog row.
     if apply:

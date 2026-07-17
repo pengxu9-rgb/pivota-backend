@@ -133,7 +133,10 @@ async def _load_body_map(domain: str, max_products: int) -> Dict[str, str]:
 
 
 async def run(apply: bool, domains_filter: List[str], max_products: int) -> int:
-    await database.connect()
+    # initial connect through the same healer as mid-run reconnects —
+    # a proxy TLS bad-window at process start must not burn a whole
+    # stage attempt (observed 2026-07-17).
+    await _reconnect()
     rows: List[Dict[str, Any]] = []
     for attempt in range(1, 4):
         try:
