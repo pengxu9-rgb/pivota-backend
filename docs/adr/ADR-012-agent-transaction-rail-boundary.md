@@ -3,8 +3,11 @@
 **Status:** Proposed
 **Date:** 2026-07-17
 **Deciders:** Founder (peng) — positioning + Commerce/Trust owners
-**Builds on:** ADR-007 (citable index vs commerce overlay — settled the *read* side), ADR-009 (seller-of-record identity). Companion: `docs/AP2_ENABLEMENT.md` (enablement checklist + blockers), issue [#1442](https://github.com/pengxu9-rgb/pivota-backend/issues/1442) (agent signing-key registration).
-**Scope:** the *transact/pay* leg for **external** agents. This ADR does **not** touch discovery/read (ADR-007 owns that) and changes no serving behavior.
+**Builds on:** ADR-007 (citable index vs commerce overlay — settled the *read* side), ADR-009 (seller-of-record identity). Companion: `docs/AP2_ENABLEMENT.md` (enablement checklist + blockers), issue [#1442](https://github.com/pengxu9-rgb/pivota-backend/issues/1442) (agent identity provisioning — re-scoped, see below).
+**Scope:** the *transact/pay* leg for **external** agents, plus **how that rail roots agent identity**. This ADR does **not** touch discovery/read (ADR-007 owns that) and changes no serving behavior.
+
+**Revisions:**
+- *2026-07-17 (rev 2):* Review of rev 1 caught that the signed rail was still bootstrapped by a **platform-issued API key** (an uploaded PEM under `X-API-Key` auth) — contradicting the very "external/untrusted agent" premise the rail exists for, and diverging from where ACP/UCP/MCP/AP2 actually root identity (tokens / verifiable credentials, not platform secrets). Identity rooting is now a **first-class axis** of this ADR, decided as **DID/VC**, sequenced did:key → did:web → VC/mandates. The first slice (`did:key`) is implemented in [#1452](https://github.com/pengxu9-rgb/pivota-backend/pull/1452). See "Identity rooting" below. The rail-boundary decision (Option A) is unchanged.
 
 ---
 
@@ -23,7 +26,7 @@ What ADR-007 did **not** settle: when an **external** agent wants to **act** (bu
 - `/ap2/consent/grant` (signed, scoped, nonce-guarded) → `/ap2/transaction/initiate` → `/ap2/transaction/confirm` (wallet-bound) → `/ap2/receipt/{id}` (platform-signed)
 - payment backing: **agent wallets + x402 stablecoin** settlement (`agents.x402_enabled` = "can initiate X-402 stablecoin payments", migration 021). `/ap2/x402/exchange` is still `501 Not Implemented`.
 
-**The problem:** these are two divergent payment paths for the same economic action. Rail 2's payment leg (`/ap2/transaction/*`) duplicates Rail 1's (`/orders/*`). If AP2 is enabled without deciding the boundary, we ship two order/payment systems with different identity models, different settlement backing, and different receipt semantics — and no rule for which an agent should use. The signing-key identity primitive Rail 2 needs (`agents.public_key`) has **no writer today** (#1442), so the question is still cheap to settle before anything depends on it.
+**The problem:** these are two divergent payment paths for the same economic action. Rail 2's payment leg (`/ap2/transaction/*`) duplicates Rail 1's (`/orders/*`). If AP2 is enabled without deciding the boundary, we ship two order/payment systems with different identity models, different settlement backing, and different receipt semantics — and no rule for which an agent should use. And Rail 2's identity primitive had **no source at all** — `agents.public_key` was read but never written — so *how* that key is rooted was still fully open (and is the second decision this ADR makes; see "Identity rooting"). Both questions are cheap to settle now, before anything depends on either.
 
 ### Forces at play
 - **Trust asymmetry.** Read/cite is safe to open maximally (ADR-007). *Money movement* is where non-repudiation, per-action authorization, and replay protection actually matter — which is exactly what AP2's signature + nonce + scoped consent provide and what a bearer API key does not.
@@ -36,7 +39,7 @@ What ADR-007 did **not** settle: when an **external** agent wants to **act** (bu
 **Adopt Option A: AP2/x402 is the signed rail for external + stablecoin-settled transactions; API-key ACP remains the rail for first-party/partner + PSP-settled transactions. Discovery stays unified on the ADR-007 read surface. The two payment legs stay explicitly separate and are selected by *caller class × settlement type*, not offered as interchangeable.**
 
 Concretely:
-- **Identity.** AP2 requires a registered agent **signing key** (`agents.public_key`, #1442) — a strong, rotatable, per-agent cryptographic identity. API-key ACP keeps bearer-key identity. An agent on the AP2 rail is a *distinct, higher-assurance identity* even if it maps to the same `agent_id`.
+- **Identity.** AP2 identifies an agent by a **DID** and verifies each request against the key resolved from that DID (see "Identity rooting" below) — self-sovereign, rotatable, no platform-issued secret. API-key ACP keeps bearer-key identity. An agent on the AP2 rail is a *distinct, higher-assurance identity* even if it maps to the same `agent_id`.
 - **Rail selection is a property of the caller + settlement, not a free choice:**
   - first-party Pivota Agent, and onboarded **partner** agents paying via **merchant PSP** → **API-key ACP** (`/orders/*`).
   - external/third-party agents, and/or **stablecoin (x402)** settlement → **AP2** (`/ap2/transaction/*`).
@@ -45,9 +48,29 @@ Concretely:
 
 The intended external-agent journey:
 
-> register signing key (#1442) → **discover** via the read surface (ADR-007) → **grant AP2 consent** (signed, scoped, nonce) → **initiate** AP2 transaction referencing the resolved product/merchant → **confirm** against the agent wallet → **platform-signed receipt**.
+> present a **DID** (identity resolves to the verification key) → **discover** via the read surface (ADR-007) → **grant AP2 consent** (signed, scoped, nonce) → **initiate** AP2 transaction referencing the resolved product/merchant → **confirm** against the agent wallet → **platform-signed receipt**. Later slices carry the user→agent authorization as a **verifiable-credential mandate** rather than an opaque scope list.
 
-## Options Considered
+## Identity rooting (how the signed rail knows the agent)
+
+This is the second decision in this ADR, added in rev 2. It is **orthogonal** to the rail boundary above: it governs *how Pivota comes to trust a key for an agent*, not *which rail carries the money*.
+
+**Decision: root the signed rail in self-sovereign DID/VC identity — never a platform-issued API key.** `agent_id` maps to a **DID**; Pivota resolves the DID → verification key and checks the AP2 signature against it. Authorization (user→agent delegation) travels as **verifiable credentials / AP2 mandates** (Intent → Cart → Payment), validated against a trusted-issuer registry. `agents.public_key` demotes from "an uploaded secret" to "a place that may hold a DID (or a cached resolved key)". Sequenced in shippable slices:
+
+| Slice | What | Status |
+|---|---|---|
+| **`did:key`** | Self-contained, offline-resolvable DID; the public key *is* the identifier. No network, no registry. | ✅ implemented — [#1452](https://github.com/pengxu9-rgb/pivota-backend/pull/1452) (`services/ap2_did.py`; `did:key` in `agents.public_key` resolves in the grant flow) |
+| **`did:web`** | Domain-rooted DID resolved from the agent's `.well-known/did.json`; rotation owned by the agent. Adds a resolver with caching + fail-closed timeouts. | ⬜ next |
+| **VC / mandate chain** | W3C Verifiable Credentials + AP2 Intent/Cart/Payment mandates + trusted-issuer registry — the authority layer. | ⬜ strategic end-state |
+
+### Identity-rooting options considered
+
+- **(rejected) Platform API-key upload** — agent authenticates with a Pivota `X-API-Key` and uploads a PEM to `agents.public_key`. This was rev 1's implicit approach (and a drafted `#1442` endpoint). Rejected: it roots a *cryptographic-identity, non-repudiation* rail in a *platform bearer secret*, which (a) external/frontier agents don't hold, and (b) is exactly what ACP/UCP/MCP/AP2 move away from. May survive only as an explicit first-party/partner **pilot** backfill, never the external model.
+- **(intermediate) JWKS** — `agent_id` → a JWKS URI + `kid`; Pivota fetches the key from the agent's JWKS. Federated and rotation-friendly; a reasonable bridge, and a subset of what `did:web` gives. Folded into the `did:web` slice rather than built separately.
+- **(chosen) DID / VC** — self-sovereign identity, no platform secret, matches real AP2's identity layer (DIDs + verifiable mandates). Larger build, sequenced above so each slice ships independently.
+
+**Why:** the entire reason the signed rail exists is non-repudiation for the *least-trusted* callers moving money. Rooting that in a secret Pivota hands out is self-defeating; rooting it in the agent's own DID/credential is the point.
+
+## Options Considered (rail boundary)
 
 ### Option A: Two rails, boundary by caller-class × settlement (this ADR)
 | Dimension | Assessment |
@@ -94,12 +117,14 @@ Decisive factor: **non-repudiation belongs where money moves and the caller is l
 **Becomes easier**
 - Enabling AP2 for a *pilot* cohort of external/stablecoin agents without touching the live partner order path.
 - Reasoning about risk: signed rail ⇒ money-moving external agent; bearer rail ⇒ trusted partner PSP order.
-- Implementing #1442 as a *standalone* key-registration primitive (it's needed under A regardless of later boundary widening).
+- Rolling out agent identity in slices: `did:key` (done, #1452) needs no infra; `did:web` and VC/mandates land independently without touching the rail boundary.
+- No platform secret to issue, store, or rotate for external agents — key rotation is the agent's own concern (its DID doc / JWKS), removing a whole class of credential-management burden.
 
 **Becomes harder / must be maintained**
 - **Two payment legs must stay coherent**: receipts, refunds, cancellation, and financial reconciliation have to reconcile `x402_transactions` (AP2) and the `/orders/*` PSP path into one economic ledger. This is the main ongoing cost of A and must be owned.
+- **DID/VC infrastructure** beyond `did:key`: a `did:web` resolver means outbound HTTPS at verify time — needs caching, timeouts, and **fail-closed** behaviour on resolution failure. The VC/mandate slice needs a **trusted-issuer registry** and revocation/status checking. `did:key` (shipped) avoids all of this by being offline.
 - **"Caller class" needs a precise definition** so routing is deterministic (e.g. an `agent_type` / trust-tier attribute, or `x402_enabled` as the switch). Ambiguity here re-introduces the "two interchangeable rails" problem.
-- A single `agent_id` may hold both a bearer key and a signing key — the identity mapping and audit trail must make the active rail unambiguous per transaction.
+- **DID ↔ agent record association** must be decided: is `agent_id` itself the DID, or does an `agents.did` column map one to the other? Until then, the pilot stores the DID in `agents.public_key`. A single `agent_id` may also hold both a bearer key and a DID — the audit trail must make the active rail + identity unambiguous per transaction.
 
 **Must revisit if**
 - Partner agents start requiring signed non-repudiation for PSP orders → widen AP2 toward Option B incrementally (partner-signed PSP orders), which A leaves open.
@@ -107,12 +132,14 @@ Decisive factor: **non-repudiation belongs where money moves and the caller is l
 
 ## Action Items
 
-1. [ ] **Founder sign-off on the boundary** (Option A) — the caller-class × settlement rule, and that AP2 is *not* a general replacement for `/orders/*`. Move this ADR to Accepted on sign-off.
+1. [ ] **Founder sign-off** — on both decisions: the rail boundary (Option A — caller-class × settlement, AP2 *not* a general replacement for `/orders/*`) **and** DID/VC identity rooting. Move this ADR to Accepted on sign-off.
 2. [ ] **Define "caller class" concretely** — decide the routing attribute (proposed: `agents.x402_enabled` and/or an agent trust-tier) that deterministically selects rail. Document it in `docs/AP2_ENABLEMENT.md`.
-3. [ ] **Implement #1442** — standalone agent signing-key registration into `agents.public_key` (endpoint + ORM column + tests), distinct from PSP `public_key`. Prerequisite for the signed rail under A. *(Proceeding in parallel; needed regardless of A/B.)*
-4. [ ] **Reconciliation owner** — assign ownership of the combined `x402_transactions` + `/orders/*` financial ledger before AP2 carries real money.
-5. [ ] **Clear the remaining `AP2_ENABLEMENT.md` blockers** for the pilot scope (middleware header contract on `revoke`/`transaction/*`, `verify_ap2_signature` reconciliation, schema applied) — tracked separately; not gated by this ADR.
-6. [ ] **Confirm discovery stays off AP2** — no discovery endpoints added to `ap2_routes.py`; external discovery remains on the ADR-007 read surface.
+3. [x] **`did:key` identity slice** — offline DID resolution wired into the grant flow. Done: [#1452](https://github.com/pengxu9-rgb/pivota-backend/pull/1452) (`services/ap2_did.py`).
+4. [ ] **Re-scope #1442** — from "API-key upload endpoint" to "DID/VC agent identity." Next: `did:web` resolver (cached, fail-closed) and the DID↔agent association (`agent_id`-as-DID vs `agents.did`).
+5. [ ] **VC / mandate authority layer** — Intent/Cart/Payment mandates + trusted-issuer registry; replaces the opaque scope list as the delegation proof. (Later slice.)
+6. [ ] **Reconciliation owner** — assign ownership of the combined `x402_transactions` + `/orders/*` financial ledger before AP2 carries real money.
+7. [ ] **Clear the remaining `AP2_ENABLEMENT.md` blockers** for the pilot scope (middleware header contract on `revoke`/`transaction/*`, `verify_ap2_signature` reconciliation, schema applied) — tracked separately; not gated by this ADR.
+8. [ ] **Confirm discovery stays off AP2** — no discovery endpoints added to `ap2_routes.py`; external discovery remains on the ADR-007 read surface.
 
 ## Rollback
 
