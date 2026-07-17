@@ -34,13 +34,85 @@ from scripts.ingest_stylekorean_brand import (  # noqa: E402
 from services.pdp_matcher.retailer_match import build_match_index, match_record  # noqa: E402
 from services.retailer_ingest import stylekorean as sk  # noqa: E402
 from services.retailer_ingest.brand_official import fetch_official_records  # noqa: E402
+from services.retailer_ingest.single_writer_lock import (  # noqa: E402
+    SingleWriterLockError,
+    retailer_ingest_lock,
+)
 from services.retailer_ingest.official_match_judge import (  # noqa: E402
     AUTO_ATTACH_THRESHOLD,
     judge_residue_items,
 )
 
 
+async def _attach_auto_verdicts(auto_rows: List[Dict[str, Any]]) -> None:
+    """Attach SK offers for AUTO verdicts. Shared by the live judge path and the
+    --apply-from path so both go through the SAME B1-safe machinery: resolve each
+    verdict's official product to a catalog target, stamp matched_product_key,
+    dedup via the deterministic picker, and never clobber an offer the ATTACH
+    lane already placed. Each row is {"item": <plan row>, "official": <record>}."""
+    brands = sorted({str(r["item"].get("brand")) for r in auto_rows if r["item"].get("brand")})
+    our_rows = await _load_our_rows(brands)
+    index = build_match_index(our_rows)
+
+    candidates: List[Dict[str, Any]] = []
+    no_target = 0
+    target_pks = set()
+    for r in auto_rows:
+        pdp = (r.get("official") or {}).get("pdp") or {}
+        target = match_record(index, pdp.get("brand"), pdp.get("product_name"))
+        if not target:
+            # official not (yet) a catalog row (e.g. an un-minted drift suspect).
+            # Needs mint/merge first; report, never guess a target.
+            no_target += 1
+            continue
+        candidates.append({**r["item"], "matched_product_key": target["product_key"]})
+        target_pks.add(target["product_key"])
+
+    # Don't clobber the ATTACH lane: if a target already carries a StyleKorean
+    # offer (its deterministic pick from the direct-match lane), leave it — the
+    # judge lane only fills canonicals the ATTACH lane didn't reach.
+    already = set()
+    if target_pks:
+        rows = await database.fetch_all(
+            "SELECT DISTINCT product_key FROM catalog_offers "
+            "WHERE merchant_id = :m AND product_key = ANY(:pks)",
+            {"m": sk.MERCHANT_ID, "pks": list(target_pks)},
+        )
+        already = {dict(r)["product_key"] for r in rows}
+    fresh = [c for c in candidates if c["matched_product_key"] not in already]
+    skipped_existing = len(candidates) - len(fresh)
+
+    applied, skipped = await _attach_offer_items(fresh)
+    print(f"      attached {applied} offers | no catalog target {no_target} | "
+          f"already-had-SK-offer {skipped_existing} | ineligible/collapsed {skipped}")
+
+
+async def _drive_apply_from(args: argparse.Namespace) -> int:
+    """Attach offers from a saved DRY proposals file — applies EXACTLY the auto
+    verdicts already produced/reviewed, with no re-judge (no DeepSeek re-spend,
+    no LLM nondeterminism)."""
+    auto = [
+        json.loads(l) for l in open(args.apply_from)
+        if l.strip() and json.loads(l).get("bucket") == "auto"
+    ]
+    print(f"[apply-from] {args.apply_from}: {len(auto)} AUTO verdicts to attach")
+    if not auto:
+        return 0
+    await database.connect()
+    try:
+        async with retailer_ingest_lock(database):
+            await _attach_auto_verdicts(auto)
+    except SingleWriterLockError as exc:
+        print(f"[lock] {exc} — exiting without writes.")
+        return 1
+    finally:
+        await database.disconnect()
+    return 0
+
+
 async def _drive(args: argparse.Namespace) -> int:
+    if args.apply_from:
+        return await _drive_apply_from(args)
     plan = [json.loads(l) for l in open(args.plan) if l.strip()]
     mint = [p for p in plan if p.get("decision") == "mint"]
     if args.limit:
@@ -75,46 +147,11 @@ async def _drive(args: argparse.Namespace) -> int:
 
     await database.connect()
     try:
-        brands = sorted({str(r["item"].get("brand")) for r in result["auto"] if r["item"].get("brand")})
-        our_rows = await _load_our_rows(brands)
-        index = build_match_index(our_rows)
-
-        # Resolve each auto verdict to a catalog target, stamping matched_product_key
-        # onto the plan item so the DETERMINISTIC picker can dedup (B1): one offer
-        # slot exists per (product_key, merchant), so N residue size-variants that
-        # auto-match one official product must NOT last-write-wins.
-        candidates: List[Dict[str, Any]] = []
-        no_target = 0
-        target_pks = set()
-        for r in result["auto"]:
-            pdp = r["official"].get("pdp") or {}
-            target = match_record(index, pdp.get("brand"), pdp.get("product_name"))
-            if not target:
-                # official not (yet) a catalog row (e.g. an un-minted drift suspect).
-                # Needs mint/merge first; report, never guess a target.
-                no_target += 1
-                continue
-            item = {**r["item"], "matched_product_key": target["product_key"]}
-            candidates.append(item)
-            target_pks.add(target["product_key"])
-
-        # Don't clobber the ATTACH lane: if a target already carries a StyleKorean
-        # offer (its deterministic pick from the direct-match lane), leave it — the
-        # judge lane only fills canonicals the ATTACH lane didn't reach.
-        already = set()
-        if target_pks:
-            rows = await database.fetch_all(
-                "SELECT DISTINCT product_key FROM catalog_offers "
-                "WHERE merchant_id = :m AND product_key = ANY(:pks)",
-                {"m": sk.MERCHANT_ID, "pks": list(target_pks)},
-            )
-            already = {dict(r)["product_key"] for r in rows}
-        fresh = [c for c in candidates if c["matched_product_key"] not in already]
-        skipped_existing = len(candidates) - len(fresh)
-
-        applied, skipped = await _attach_offer_items(fresh)
-        print(f"      attached {applied} offers | no catalog target {no_target} | "
-              f"already-had-SK-offer {skipped_existing} | ineligible/collapsed {skipped}")
+        async with retailer_ingest_lock(database):
+            await _attach_auto_verdicts(result["auto"])
+    except SingleWriterLockError as exc:
+        print(f"[lock] {exc} — exiting without writes.")
+        return 1
     finally:
         await database.disconnect()
     return 0
@@ -122,15 +159,21 @@ async def _drive(args: argparse.Namespace) -> int:
 
 def _parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    p.add_argument("--plan", required=True, help="brand plan JSONL from ingest_stylekorean_brand --out")
-    p.add_argument("--brand-official-domain", required=True)
+    p.add_argument("--plan", help="brand plan JSONL from ingest_stylekorean_brand --out (judge mode)")
+    p.add_argument("--brand-official-domain", help="brand's official Shopify domain (judge mode)")
     p.add_argument("--category-path", default="beauty/skincare")
     p.add_argument("--threshold", type=float, default=AUTO_ATTACH_THRESHOLD)
     p.add_argument("--limit", type=int, default=0, help="judge only the first N residue items")
     p.add_argument("--out", default=None, help="write judged proposals JSONL (all buckets)")
     p.add_argument("--apply-offers", action="store_true",
                    help="attach SK offers for AUTO verdicts with an existing catalog target")
-    return p.parse_args()
+    p.add_argument("--apply-from", default=None,
+                   help="attach offers from a saved proposals JSONL (applies exactly its AUTO "
+                        "verdicts; no re-judge). Mutually exclusive with judge mode.")
+    args = p.parse_args()
+    if not args.apply_from and (not args.plan or not args.brand_official_domain):
+        p.error("judge mode requires --plan and --brand-official-domain (or use --apply-from)")
+    return args
 
 
 if __name__ == "__main__":
