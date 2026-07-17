@@ -222,6 +222,7 @@ async def verify_ap2_signature(request: Request) -> bool:
         build_ap2_signed_payload,
         is_supported_ap2_algorithm,
     )
+    from services.ap2_identity import is_did, resolve_agent_identity
 
     consent = await verify_ap2_consent(request)
     agent_id = consent["agent_id"]
@@ -240,6 +241,21 @@ async def verify_ap2_signature(request: Request) -> bool:
             detail="Agent has no registered public key for AP2 signature verification"
         )
 
+    # A DID identity (ADR-012) carries the verification key IN the identity:
+    # resolve it to a PEM and take the algorithm FROM the DID (authoritative),
+    # mirroring the consent-grant path (consent_service.create_consent). Without
+    # this the transaction/* routes 401 every DID agent — they could grant
+    # consent but never sign a transaction. Anything unresolvable fails closed.
+    resolved_algorithm = None
+    if is_did(public_key):
+        try:
+            public_key, resolved_algorithm = await resolve_agent_identity(public_key)
+        except ValueError as exc:
+            raise HTTPException(
+                status_code=status.HTTP_401_UNAUTHORIZED,
+                detail=f"Unresolvable DID identity: {exc}",
+            )
+
     # Parse the body for the signed payload. A missing/invalid body is treated as
     # an empty object so the payload is still {nonce: ...} rather than an error.
     try:
@@ -249,7 +265,9 @@ async def verify_ap2_signature(request: Request) -> bool:
     if not isinstance(body, dict):
         body = {}
 
-    algorithm = body.get("algorithm", "ES256")
+    # For a DID agent the DID's key type is authoritative; a raw-PEM (pilot)
+    # agent falls back to the body's declared algorithm.
+    algorithm = resolved_algorithm or body.get("algorithm", "ES256")
     if not is_supported_ap2_algorithm(algorithm):
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
