@@ -92,3 +92,72 @@ def test_dominant_brand():
     items = [{"brand": "COSRX"}, {"brand": "COSRX"}, {"brand": "Cosrx"}, {"brand": None}]
     assert dominant_brand(items) == "COSRX"
     assert dominant_brand([]) is None
+
+
+# --- body_html → attribute_summary (draft-canonical promotion, 2026-07-17) ----
+# Minted rows previously carried attribute_summary=product_type ("Toner"), so
+# description landed < 50 chars, is_candidate_ready failed, and every
+# brand-official canonical sat at pdp_lifecycle_stage='draft', trust-blocked.
+
+def test_body_html_to_text_strips_tags_entities_and_caps():
+    from services.curated_brand_feed import BODY_TEXT_MAX_LEN, body_html_to_text
+
+    assert body_html_to_text("<p>Rich &amp; <b>gentle</b><br>toner</p>") == "Rich & gentle toner"
+    assert body_html_to_text(None) == ""
+    assert body_html_to_text("   <div>  </div> ") == ""
+    assert len(body_html_to_text("x" * (BODY_TEXT_MAX_LEN + 500))) == BODY_TEXT_MAX_LEN
+
+
+def test_body_html_to_text_drops_script_style_comment_blocks():
+    """Page-builder body_html carries <style>/<script> blocks whose INNER text
+    is code — it must never become a served 'brand description'."""
+    from services.curated_brand_feed import BODY_TEXT_MAX_LEN, body_html_to_text
+
+    html_in = ("<style>.x{color:red;font-size:12px}</style>"
+               "<p>Real brand copy</p>"
+               "<script type='text/javascript'>var a = 1;</script>"
+               "<!-- internal note --> more copy")
+    assert body_html_to_text(html_in) == "Real brand copy more copy"
+    # cap lands on a word boundary, never mid-token
+    long = " ".join(["hydrating"] * 400)
+    out = body_html_to_text(f"<p>{long}</p>")
+    assert len(out) <= BODY_TEXT_MAX_LEN and out.endswith("hydrating")
+
+
+def test_record_prefers_body_copy_over_product_type():
+    from services.curated_brand_feed import shopify_product_to_record
+
+    product = {
+        "title": "Snail Essence", "handle": "snail-essence", "vendor": "COSRX",
+        "product_type": "Essence",
+        "body_html": "<p>A lightweight essence with 96% snail secretion filtrate "
+                     "to repair and soothe stressed skin.</p>",
+        "variants": [{"price": "17.50", "available": True, "barcode": ""}],
+        "images": [{"src": "https://cosrx.com/i.jpg"}], "tags": ["soothing"],
+    }
+    rec = shopify_product_to_record(product, domain="cosrx.com", category_path="beauty/skincare")
+    summary = rec["pdp"]["attribute_summary"]
+    assert summary.startswith("A lightweight essence")
+    assert len(summary) >= 50  # clears is_candidate_ready's description floor
+
+
+def test_record_falls_back_to_product_type_when_no_body():
+    from services.curated_brand_feed import shopify_product_to_record
+
+    product = {
+        "title": "Snail Essence", "handle": "snail-essence", "vendor": "COSRX",
+        "product_type": "Essence", "body_html": "",
+        "variants": [{"price": "17.50", "available": True}],
+        "images": [], "tags": [],
+    }
+    rec = shopify_product_to_record(product, domain="cosrx.com", category_path="beauty/skincare")
+    assert rec["pdp"]["attribute_summary"] == "Essence"
+
+
+def test_backfill_handle_from_url():
+    from scripts.backfill_brand_official_descriptions import handle_from_url
+
+    assert handle_from_url("https://www.cosrx.com/products/snail-essence") == ("cosrx.com", "snail-essence")
+    assert handle_from_url("https://misshaus.com/products/time-revolution?variant=1") == ("misshaus.com", "time-revolution")
+    assert handle_from_url("https://cosrx.com/pages/about") == ("cosrx.com", "")
+    assert handle_from_url("") == ("", "")

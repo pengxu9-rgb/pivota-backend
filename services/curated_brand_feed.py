@@ -16,7 +16,9 @@ caller runs `ingest_validated_jsonl` + `apply_ingest_plan` (gated).
 
 from __future__ import annotations
 
+import html
 import logging
+import re
 from typing import Any, Dict, List, Optional
 
 import httpx
@@ -69,6 +71,31 @@ async def fetch_shopify_products(
 
 def _first(seq: Any) -> Optional[Dict[str, Any]]:
     return seq[0] if isinstance(seq, list) and seq and isinstance(seq[0], dict) else None
+
+
+# <script>/<style> INNER TEXT is code, not prose — page-builder exports
+# (PageFly/GemPages) routinely embed style blocks in body_html; a naive
+# tag-strip would keep the CSS soup and could auto-publish it as the brand's
+# words. Strip whole blocks (and comments) BEFORE the tag pass.
+_HTML_BLOCK_RE = re.compile(r"(?is)<(script|style)\b.*?</\1\s*>|<!--.*?-->")
+_HTML_TAG_RE = re.compile(r"<[^>]+>")
+BODY_TEXT_MAX_LEN = 2000  # PDP prose field, not a document store
+
+
+def body_html_to_text(body_html: Optional[str]) -> str:
+    """Deterministic Shopify body_html → plain text: drop script/style/comment
+    blocks, strip tags, unescape entities, collapse whitespace, cap at a word
+    boundary. Output is the brand's own words or ''."""
+    if not body_html:
+        return ""
+    text = _HTML_BLOCK_RE.sub(" ", str(body_html))
+    text = _HTML_TAG_RE.sub(" ", text)
+    text = html.unescape(text)
+    text = re.sub(r"\s+", " ", text).strip()
+    if len(text) > BODY_TEXT_MAX_LEN:
+        cut = text[:BODY_TEXT_MAX_LEN]
+        text = cut.rsplit(" ", 1)[0] if " " in cut else cut
+    return text
 
 
 def _to_float(value: Any) -> Optional[float]:
@@ -133,7 +160,15 @@ def shopify_product_to_record(
             "brand": brand,
             "product_name": title,
             "category_path": category_path,
-            "attribute_summary": str(product.get("product_type") or "").strip(),
+            # Brand-authored body copy when present (it becomes the row's
+            # description and feeds the lifecycle candidate gate + taxonomy
+            # extractors); product_type alone otherwise. Rows minted without
+            # body copy land 'draft' and rely on the description backfill /
+            # LLM enrichment lane to promote.
+            "attribute_summary": (
+                body_html_to_text(product.get("body_html"))
+                or str(product.get("product_type") or "").strip()
+            ),
             "barcode": barcode,  # real GTIN when the brand fills it — strongest deposit basis
             "source_domain": host,
             "tags": tags,
