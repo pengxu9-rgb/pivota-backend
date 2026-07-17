@@ -173,7 +173,7 @@ Decisive factor: **non-repudiation belongs where money moves and the caller is l
 8. [ ] **Reconciliation owner** — assign ownership of the combined `x402_transactions` + `/orders/*` financial ledger before AP2 carries real money.
 9. [ ] **Clear the remaining `AP2_ENABLEMENT.md` blockers** for the pilot scope (middleware header contract on `revoke`/`transaction/*`, `verify_ap2_signature` reconciliation, schema applied) — tracked separately; not gated by this ADR.
 10. [ ] **Confirm discovery stays off AP2** — no discovery endpoints added to `ap2_routes.py`; external discovery remains on the ADR-007 read surface.
-11. [ ] **ES256 signature encoding — accept JOSE-raw (P1363), not only DER.** `crypto_service.verify_agent_signature` verifies ASN.1 **DER** ES256; standards-based DID/VC/JOSE/WebCrypto agents emit raw `r‖s` (64-byte, IEEE P1363). Since the whole point of this ADR is standards-based external agents, the verifier must accept raw sigs (detect 64-byte → convert to DER) or DID/AP2 agents can't interoperate. Affects both the signed rail and `verify_mandate`. Concrete interop blocker before pilot.
+11. [x] **ES256 signature encoding — accept JOSE-raw (P1363), not only DER.** DONE — `crypto_service._verify_es256` now accepts both ASN.1 DER and raw `r‖s` (64-byte, IEEE P1363): tries DER, then for a 64-byte sig converts raw→DER (no false negatives). Standards-based DID/VC/JOSE/WebCrypto agents emit the raw form; this unblocks the signed rail **and** `verify_mandate` (both verify through `crypto_service`). Regression-safe (DER path unchanged).
 
 ## Rollback
 
