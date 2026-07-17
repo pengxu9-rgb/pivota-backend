@@ -126,48 +126,91 @@ async def grant_consent(request: Request):
     - X-AP2-Signature: Agent signature
     - X-AP2-Nonce: Unique nonce
     
+    The signature must be the base64 signature over the canonical JSON of
+    {"agent_id", "scope", "duration_hours", "nonce"}, made with the private
+    key matching the agent's registered public key (agents.public_key).
+
     Returns consent token for subsequent requests
     """
-    from services.consent_service import consent_service
-    
+    from services.consent_service import (
+        consent_service,
+        InvalidSignatureError,
+        NonceReplayError,
+    )
+
     # Extract headers
     signature = request.headers.get("X-AP2-Signature")
     nonce = request.headers.get("X-AP2-Nonce")
-    
+
     if not signature or not nonce:
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
             detail="Missing required headers (X-AP2-Signature, X-AP2-Nonce)"
         )
-    
+
     # Parse request body
     body = await request.json()
     agent_id = body.get("agent_id")
     scope = body.get("scope", ["read"])
     duration_hours = body.get("duration_hours", 24)
-    
+    algorithm = body.get("algorithm", "ES256")
+
     if not agent_id:
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
             detail="Missing agent_id"
         )
-    
+
+    if algorithm not in ("ES256", "Ed25519"):
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=f"Unsupported algorithm: {algorithm} (expected ES256 or Ed25519)"
+        )
+
+    # Resolve the agent's registered public key — the signature is only
+    # meaningful against a key we already trust, never one the caller sends.
     try:
-        # Create consent
+        public_key = await consent_service.get_agent_public_key(agent_id)
+    except LookupError:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Unknown agent"
+        )
+
+    if not public_key:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Agent has no registered public key for AP2 signature verification"
+        )
+
+    try:
+        # Create consent (verifies the signature against the registered key)
         consent_data = await consent_service.create_consent(
             agent_id=agent_id,
             scope=scope,
             duration_hours=duration_hours,
             signature=signature,
-            nonce=nonce
+            nonce=nonce,
+            public_key=public_key,
+            algorithm=algorithm
         )
-        
+
         return {
             "consent_token": consent_data["token"],
             "expires_at": consent_data["expires_at"],
             "scope": consent_data["scope"]
         }
-        
+
+    except InvalidSignatureError:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Invalid signature"
+        )
+    except NonceReplayError:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail="Nonce already used"
+        )
     except Exception as e:
         logger.error(f"Consent grant failed: {e}")
         raise HTTPException(
