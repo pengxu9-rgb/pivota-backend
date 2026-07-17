@@ -42,6 +42,7 @@ from typing import Any, Dict, Iterable, List, Optional, Tuple
 from services.beauty_external_ranking import (
     normalize_external_seed_structured_ingredient_ids,
 )
+from services.category_kind import resolve_category_kind
 from services.catalog_identity import make_content_key
 from services.catalog_sync_service import make_pivota_canonical_fields
 from services.pdp_lifecycle import compute_lifecycle_stage
@@ -239,6 +240,18 @@ def _build_pdp_insert(
         "product_type": pdp_payload.get("category_path", "").split("/")[-1] or None,
         "category": pdp_payload.get("category_path", "").split("/")[-1] or None,
         "category_path": pdp_payload.get("category_path") or None,
+        # Durable category_kind (skincare/haircare/supplement) — drives
+        # claim-safety, required disclaimers, and the serving gate. Resolved from
+        # the same authoritative category_path the row is stamped with; None
+        # ("unknown") when the path isn't a contract kind (makeup, tools, etc.),
+        # never text-guessed for skincare/haircare. Previously omitted, so every
+        # Path-C mint landed category_kind NULL.
+        "category_kind": resolve_category_kind(
+            category_path=pdp_payload.get("category_path"),
+            product_type=pdp_payload.get("category_path", "").split("/")[-1] or None,
+            title=pdp_payload["product_name"],
+            tags=pdp_payload.get("tags"),
+        ),
         "category_confidence": DEFAULT_CATEGORY_CONFIDENCE,
         "category_label_source": DEFAULT_CATEGORY_LABEL_SOURCE,
         "canonical_url": canonical_url or None,

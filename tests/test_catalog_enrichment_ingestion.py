@@ -111,6 +111,9 @@ def test_ingest_record_builds_pdp_and_seed_rows():
     assert pdp["title"] == "Ruby Woo Matte Lipstick"
     assert pdp["category_path"] == "beauty/makeup/lip/lipstick"
     assert pdp["category"] == "lipstick"
+    # A color cosmetic is not a contract category_kind — stays None, never
+    # text-guessed into skincare.
+    assert pdp["category_kind"] is None
     assert pdp["catalog_track"] == "external_referral"
     assert pdp["category_label_source"] == "enrichment_agent_v1"
     assert 0.0 <= pdp["category_confidence"] <= 1.0
@@ -128,6 +131,30 @@ def test_ingest_record_builds_pdp_and_seed_rows():
     assert seed["tool"] == AGENT_VERSION
     assert seed["domain"] == "maccosmetics.com"
     assert seed["price_amount"] == 21.0
+
+
+def test_ingest_record_sets_category_kind_from_path():
+    # Skincare path → durable skincare kind (drives claim-safety + serving gate).
+    skin = ingest_validated_record(
+        _record(product_name="Advanced Snail Mucin Serum",
+                category_path="beauty/skincare/serum")
+    )
+    assert skin is not None
+    assert skin["pdp"]["category_kind"] == "skincare"
+
+    # Haircare path → haircare.
+    hair = ingest_validated_record(
+        _record(product_name="Repair Hair Mask", category_path="beauty/haircare/mask")
+    )
+    assert hair["pdp"]["category_kind"] == "haircare"
+
+    # Ingestible inner-beauty (no discriminating path) → supplement via
+    # conservative dosage-form + ingestible-active detection.
+    supp = ingest_validated_record(
+        _record(product_name="Low Molecular Collagen Sticks",
+                category_path="beauty", attribute_summary="collagen powder, 30 sticks")
+    )
+    assert supp["pdp"]["category_kind"] == "supplement"
 
 
 def test_runner_persists_canonical_signature_fields():
