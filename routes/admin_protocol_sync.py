@@ -436,8 +436,11 @@ async def list_nonces(limit: int = 100):
     
     Admin only - no authentication implemented yet
     """
+    # nonce_tracker has no nonce_id column (see migration 021) and nothing
+    # writes one — `nonce` is the primary key. Selecting a phantom nonce_id
+    # would raise "column does not exist" the moment AP2 is enabled.
     query = """
-        SELECT nonce_id, nonce, used_at, request_path
+        SELECT nonce, agent_id, used_at, request_path
         FROM nonce_tracker
         ORDER BY used_at DESC
         LIMIT :limit
