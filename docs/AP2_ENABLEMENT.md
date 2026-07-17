@@ -111,12 +111,63 @@ intended contract for: `revoke`, `x402/exchange`, `wallet/balance`.
 enforce consent + signature + nonce via `Depends(verify_ap2_signature)`,
 consistent with the middleware.)
 
-### 4. Confirm the backing tables exist in the target environment
+### 4. Confirm the backing schema exists in the target environment
 
-`agent_consents`, `nonce_tracker`, `x402_transactions`, `agent_wallets`,
-`x402_exchange_rates`, plus the `agents.public_key` column — all from migration
-021 (and the x402 migrations). Ensure they are applied in the environment before
-enabling, or the routes will 500 on first use.
+The AP2 surface depends on tables/columns spread across several migrations —
+**all of them must be applied** before enabling, or the routes 500 (or wrongly
+403) on first use:
+
+| Migration | Provides |
+| --- | --- |
+| `021_ap2_security.sql` | `agent_consents`, `nonce_tracker`, `agents.public_key`, `agents.x402_enabled` |
+| `022_wallet_infrastructure.sql` | `agent_wallets`, `merchant_wallets` |
+| `023_x402_protocol.sql` | `x402_transactions`, `x402_exchange_rates` |
+| `182_nonce_tracker_request_path.sql` | **corrective** — adds `nonce_tracker.request_path` that 021 omitted but the AP2 nonce paths INSERT (#1443). Idempotent (`ADD COLUMN IF NOT EXISTS`). |
+
+**These are NOT applied at boot.** The AP2 schema is `schema_guard`-exempt (not
+in `db/schema_guard.py`'s prod fast-mode startup) precisely because the surface
+is disabled everywhere. Apply the full set **on demand via the admin migration
+runner** (`routes/admin_run_migration.py` / `routes/admin_migrations.py`) as an
+explicit enablement step — do not rely on startup self-heal. `182` is
+idempotent, so re-applying it against an env that already has the column is safe.
+
+Verify before flipping the flag:
+
+```sql
+SELECT to_regclass('public.agent_consents')      IS NOT NULL AS agent_consents,
+       to_regclass('public.nonce_tracker')       IS NOT NULL AS nonce_tracker,
+       to_regclass('public.agent_wallets')        IS NOT NULL AS agent_wallets,
+       to_regclass('public.x402_transactions')    IS NOT NULL AS x402_transactions,
+       to_regclass('public.x402_exchange_rates')  IS NOT NULL AS x402_exchange_rates,
+       EXISTS (SELECT 1 FROM information_schema.columns
+               WHERE table_name='nonce_tracker' AND column_name='request_path') AS nonce_request_path,
+       EXISTS (SELECT 1 FROM information_schema.columns
+               WHERE table_name='agents' AND column_name='public_key') AS agents_public_key;
+```
+
+### 5. Provision agent wallets for the confirm path
+
+`POST /ap2/transaction/confirm` authorizes the caller-supplied `X-Wallet-Address`
+via `WalletService.verify_agent_wallet(agent_id, wallet_address)` (added in
+#1447). It returns true **only** when that address is registered to the agent
+(resolved from the consent token) **and** the wallet row is `status = 'active'`
+in `agent_wallets`; otherwise the route returns `403 "Wallet not authorized"`.
+Note the column is `agent_wallets.address` (not `wallet_address`).
+
+So for any pilot agent that will confirm transactions, an **active** wallet row
+must exist. Until then, `confirm` fails closed at 403 (the signature/consent
+checks still pass — this is authorization, not authentication). Verify:
+
+```sql
+-- Each pilot agent that confirms must have an active wallet on the network it uses.
+SELECT agent_id, network, address, status
+FROM agent_wallets
+WHERE agent_id IN ( /* AP2 pilot agent_ids */ )
+ORDER BY agent_id;
+```
+
+`initiate` does not need a wallet row; only `confirm` (and the wallet/balance /
+exchange routes, once implemented) do.
 
 ## Reviewer sign-off (required before the `ENABLE_AP2_ROUTES` flip)
 
@@ -134,8 +185,11 @@ confirmed their blocker is cleared:
 - [ ] **Middleware header contract** — owner confirms each non-public write route
       (`revoke`, `transaction/*`, `x402/exchange`, `wallet/balance`) is consistent
       with the middleware's required headers for the pilot scope. (Blocker 3)
-- [ ] **Schema applied** — owner confirms migration 021 (+ x402 tables) is applied
-      in the target environment. (Blocker 4)
+- [ ] **Schema applied** — owner confirms migrations `021` + `022` + `023` + `182`
+      are applied via the admin migration runner and the verify SQL returns true for
+      every column/table (incl. `nonce_tracker.request_path`). (Blocker 4)
+- [ ] **Agent wallets provisioned** — owner confirms every pilot agent that will
+      `confirm` has an `active` row in `agent_wallets`, else confirm → 403. (Blocker 5)
 - [ ] **Deploy/on-call sign-off** — the deploying engineer acknowledges the rollback
       path (set the flag false + redeploy) before the flip.
 
@@ -144,15 +198,26 @@ auditable.
 
 ## Enablement steps (once blockers are cleared)
 
-1. Apply migration `021_ap2_security.sql` (and x402 table migrations) to the
-   target DB.
-2. Register `agents.public_key` for the pilot agents (item 1) and verify with
-   the SQL above.
-3. Confirm items 2–4 are resolved for whichever routes the pilot will exercise.
-4. Collect the reviewer sign-offs listed above.
-5. Set `ENABLE_AP2_ROUTES=true` and redeploy.
-6. Smoke check: `GET /ap2/status` → 200; `POST /ap2/consent/grant` with a valid
-   signature for a registered agent → 200 with a `consent_token`.
+1. Apply the AP2 schema to the target DB via the admin migration runner —
+   `021_ap2_security.sql`, `022_wallet_infrastructure.sql`,
+   `023_x402_protocol.sql`, and the corrective `182_nonce_tracker_request_path.sql`
+   — then run the Blocker 4 verify SQL and confirm every column/table is true
+   (Blocker 4). It is not applied at boot; this step is mandatory.
+2. Register `agents.public_key` for the pilot agents (Blocker 1) and verify with
+   the SQL in that section.
+3. Provision an `active` `agent_wallets` row for every pilot agent that will
+   `confirm` (Blocker 5) and verify with that SQL.
+4. Confirm Blocker 3 (middleware header contract) is resolved for whichever
+   routes the pilot will exercise.
+5. Collect the reviewer sign-offs listed above.
+6. Set `ENABLE_AP2_ROUTES=true` and redeploy.
+7. Smoke check end-to-end:
+   - `GET /ap2/status` → 200.
+   - `POST /ap2/consent/grant` (valid signature, registered agent) → 200 with a
+     `consent_token`.
+   - `POST /ap2/transaction/initiate` (consent + signature + nonce) → 200 `pending`.
+   - `POST /ap2/transaction/confirm` (same, `X-Wallet-Address` = the agent's
+     active wallet) → 200 `completed`; an unregistered address → 403.
 
 ## Rollback
 
