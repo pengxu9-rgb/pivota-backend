@@ -109,6 +109,30 @@ intended contract for: `revoke`, `transaction/initiate`, `transaction/confirm`,
 021 (and the x402 migrations). Ensure they are applied in the environment before
 enabling, or the routes will 500 on first use.
 
+## Reviewer sign-off (required before the `ENABLE_AP2_ROUTES` flip)
+
+Flipping `ENABLE_AP2_ROUTES=true` is the point of no return for this surface —
+treat it as a gated change that needs explicit sign-off, not a routine config
+tweak. Do not set the flag true in any shared environment until each owner has
+confirmed their blocker is cleared:
+
+- [ ] **Agent key registration** — owner confirms a path writes `agents.public_key`
+      (or the pilot cohort is backfilled) and the verify SQL returns `has_key = true`
+      for every AP2 agent. (Blocker 1)
+- [ ] **`verify_ap2_signature` reconciliation** — the sibling AP2 follow-up owner
+      confirms the payload-contract + nonce-replay issues are resolved, or confirms
+      no enabled route depends on the helper. (Blocker 2)
+- [ ] **Middleware header contract** — owner confirms each non-public write route
+      (`revoke`, `transaction/*`, `x402/exchange`, `wallet/balance`) is consistent
+      with the middleware's required headers for the pilot scope. (Blocker 3)
+- [ ] **Schema applied** — owner confirms migration 021 (+ x402 tables) is applied
+      in the target environment. (Blocker 4)
+- [ ] **Deploy/on-call sign-off** — the deploying engineer acknowledges the rollback
+      path (set the flag false + redeploy) before the flip.
+
+Record the sign-offs (PR approval, deploy ticket, or change log) so the flip is
+auditable.
+
 ## Enablement steps (once blockers are cleared)
 
 1. Apply migration `021_ap2_security.sql` (and x402 table migrations) to the
@@ -116,8 +140,9 @@ enabling, or the routes will 500 on first use.
 2. Register `agents.public_key` for the pilot agents (item 1) and verify with
    the SQL above.
 3. Confirm items 2–4 are resolved for whichever routes the pilot will exercise.
-4. Set `ENABLE_AP2_ROUTES=true` and redeploy.
-5. Smoke check: `GET /ap2/status` → 200; `POST /ap2/consent/grant` with a valid
+4. Collect the reviewer sign-offs listed above.
+5. Set `ENABLE_AP2_ROUTES=true` and redeploy.
+6. Smoke check: `GET /ap2/status` → 200; `POST /ap2/consent/grant` with a valid
    signature for a registered agent → 200 with a `consent_token`.
 
 ## Rollback
