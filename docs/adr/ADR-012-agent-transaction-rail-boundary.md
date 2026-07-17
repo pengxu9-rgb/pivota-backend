@@ -59,7 +59,7 @@ This is the second decision in this ADR, added in rev 2. It is **orthogonal** to
 | Slice | What | Status |
 |---|---|---|
 | **`did:key`** | Self-contained, offline-resolvable DID; the public key *is* the identifier. No network, no registry. | ✅ implemented — [#1452](https://github.com/pengxu9-rgb/pivota-backend/pull/1452) (`services/ap2_did.py`; `did:key` in `agents.public_key` resolves in the grant flow) |
-| **`did:web`** | Domain-rooted DID resolved from the agent's `.well-known/did.json`; rotation owned by the agent. Adds a resolver with caching + fail-closed timeouts. | ⬜ next |
+| **`did:web`** | Domain-rooted DID resolved from the agent's `.well-known/did.json`; rotation owned by the agent. Resolver with SSRF guard, redirect refusal, TTL cache, fail-closed timeouts; `publicKeyMultibase` + `publicKeyJwk`. | ✅ implemented — [#1453](https://github.com/pengxu9-rgb/pivota-backend/pull/1453) (stacked on #1452) |
 | **VC / mandate chain** | W3C Verifiable Credentials + AP2 Intent/Cart/Payment mandates + trusted-issuer registry — the authority layer. | ⬜ strategic end-state |
 
 ### Identity-rooting options considered
@@ -135,11 +135,13 @@ Decisive factor: **non-repudiation belongs where money moves and the caller is l
 1. [ ] **Founder sign-off** — on both decisions: the rail boundary (Option A — caller-class × settlement, AP2 *not* a general replacement for `/orders/*`) **and** DID/VC identity rooting. Move this ADR to Accepted on sign-off.
 2. [ ] **Define "caller class" concretely** — decide the routing attribute (proposed: `agents.x402_enabled` and/or an agent trust-tier) that deterministically selects rail. Document it in `docs/AP2_ENABLEMENT.md`.
 3. [x] **`did:key` identity slice** — offline DID resolution wired into the grant flow. Done: [#1452](https://github.com/pengxu9-rgb/pivota-backend/pull/1452) (`services/ap2_did.py`).
-4. [ ] **Re-scope #1442** — from "API-key upload endpoint" to "DID/VC agent identity." Next: `did:web` resolver (cached, fail-closed) and the DID↔agent association (`agent_id`-as-DID vs `agents.did`).
-5. [ ] **VC / mandate authority layer** — Intent/Cart/Payment mandates + trusted-issuer registry; replaces the opaque scope list as the delegation proof. (Later slice.)
-6. [ ] **Reconciliation owner** — assign ownership of the combined `x402_transactions` + `/orders/*` financial ledger before AP2 carries real money.
-7. [ ] **Clear the remaining `AP2_ENABLEMENT.md` blockers** for the pilot scope (middleware header contract on `revoke`/`transaction/*`, `verify_ap2_signature` reconciliation, schema applied) — tracked separately; not gated by this ADR.
-8. [ ] **Confirm discovery stays off AP2** — no discovery endpoints added to `ap2_routes.py`; external discovery remains on the ADR-007 read surface.
+4. [x] **`did:web` identity slice** — DID-document resolution over HTTPS with SSRF guard + TTL cache, fail-closed. Done: [#1453](https://github.com/pengxu9-rgb/pivota-backend/pull/1453) (`services/ap2_did_web.py`, `ap2_identity.py`).
+5. [ ] **DID ↔ agent association** — decide `agent_id`-as-DID vs a new `agents.did` column (today the pilot stores the DID in `agents.public_key`). Re-scope #1442 to this.
+6. [ ] **VC / mandate authority layer** — Intent/Cart/Payment mandates + trusted-issuer registry; replaces the opaque scope list as the delegation proof. (Final slice.)
+7. [ ] **SSRF hardening for self-registration** — if agents self-register `did:web`, pin the resolved IP into the connection (close the check-then-fetch TOCTOU gap noted in `ap2_did_web.py`).
+8. [ ] **Reconciliation owner** — assign ownership of the combined `x402_transactions` + `/orders/*` financial ledger before AP2 carries real money.
+9. [ ] **Clear the remaining `AP2_ENABLEMENT.md` blockers** for the pilot scope (middleware header contract on `revoke`/`transaction/*`, `verify_ap2_signature` reconciliation, schema applied) — tracked separately; not gated by this ADR.
+10. [ ] **Confirm discovery stays off AP2** — no discovery endpoints added to `ap2_routes.py`; external discovery remains on the ADR-007 read surface.
 
 ## Rollback
 
