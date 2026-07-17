@@ -308,12 +308,16 @@ def test_wave3_candidate_domains_and_vendor_verification():
     assert cands.index("beautyofjoseon.com") == 0  # display-name flat comes first
     assert any(c.startswith("beauty-of-joseon.") for c in cands)
 
-    # vendor verification: containment either way, never empty, never unrelated
-    assert vendor_matches_brand("Anua US", "Anua")
-    assert vendor_matches_brand("BOJ", "BOJ")
-    assert vendor_matches_brand("Beauty of Joseon", "Beauty of Joseon UK")
+    # vendor verification: extension free, subset needs >=2 tokens
+    assert vendor_matches_brand("Anua US", "Anua")            # b ⊆ v extension
+    assert vendor_matches_brand("BOJ", "BOJ")                 # equality
+    assert vendor_matches_brand("Abib Cosmetics", "Abib")     # b ⊆ v extension
+    assert vendor_matches_brand("Beauty of Joseon", "Beauty of Joseon UK")  # v ⊆ b, 3 tokens
+    # single generic token is NOT brand identity (a10fb047 finding 2)
+    assert not vendor_matches_brand("Beauty", "Beauty of Joseon")
     assert not vendor_matches_brand("Glow Recipe", "Abib")
     assert not vendor_matches_brand("", "Abib")
+    assert not vendor_matches_brand("TEST", "Tonymoly")       # junk row vendor
 
 
 def test_wave3_plan_stats(tmp_path):
