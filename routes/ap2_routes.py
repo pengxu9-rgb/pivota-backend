@@ -9,6 +9,7 @@ from typing import Optional
 from fastapi import APIRouter, Request, HTTPException, Depends, status
 from pydantic import BaseModel, Field
 from db.database import database
+from middleware.ap2_security import verify_ap2_signature
 
 logger = logging.getLogger(__name__)
 
@@ -126,9 +127,10 @@ async def grant_consent(request: Request):
     - X-AP2-Signature: Agent signature
     - X-AP2-Nonce: Unique nonce
     
-    The signature must be the base64 signature over the canonical JSON of
-    {"agent_id", "scope", "duration_hours", "nonce"}, made with the private
-    key matching the agent's registered public key (agents.public_key).
+    The signature must be the base64 signature over the canonical AP2 payload
+    (see services/ap2_signing.py) -- for this route that is the canonical JSON
+    of {agent_id, scope, duration_hours, nonce} -- made with the private key
+    matching the agent's registered public key (agents.public_key).
 
     Returns consent token for subsequent requests
     """
@@ -136,7 +138,9 @@ async def grant_consent(request: Request):
         consent_service,
         InvalidSignatureError,
         NonceReplayError,
+        UnsupportedAlgorithmError,
     )
+    from services.ap2_signing import ALLOWED_AP2_ALGORITHMS, is_supported_ap2_algorithm
 
     # Extract headers
     signature = request.headers.get("X-AP2-Signature")
@@ -161,10 +165,13 @@ async def grant_consent(request: Request):
             detail="Missing agent_id"
         )
 
-    if algorithm not in ("ES256", "Ed25519"):
+    if not is_supported_ap2_algorithm(algorithm):
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
-            detail=f"Unsupported algorithm: {algorithm} (expected ES256 or Ed25519)"
+            detail=(
+                f"Unsupported algorithm: {algorithm} "
+                f"(expected one of {', '.join(ALLOWED_AP2_ALGORITHMS)})"
+            ),
         )
 
     # Resolve the agent's registered public key — the signature is only
@@ -205,6 +212,11 @@ async def grant_consent(request: Request):
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
             detail="Invalid signature"
+        )
+    except UnsupportedAlgorithmError as e:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=str(e)
         )
     except NonceReplayError:
         raise HTTPException(
@@ -256,42 +268,28 @@ async def revoke_consent(request: Request):
 @router.post("/transaction/initiate", response_model=AP2TransactionResponse)
 async def initiate_transaction(
     payment: AP2PaymentRequest,
-    request: Request
+    request: Request,
+    _sig: bool = Depends(verify_ap2_signature),
 ):
     """
     Initiate AP2 payment transaction
-    
-    Requires:
+
+    Requires (all enforced by Depends(verify_ap2_signature)):
     - X-Agent-Consent: Valid consent token
-    - X-AP2-Signature: Request signature
-    - X-AP2-Nonce: Unique nonce
+    - X-AP2-Signature: signature over the canonical payload of the request body
+      + nonce (see services/ap2_signing.py), against the agent's registered key
+    - X-AP2-Nonce: Unique nonce (verified, then consumed, by the dependency)
     """
     from services.consent_service import consent_service
     from services.crypto_service import crypto_service
-    
-    # Verify consent
+
+    # Signature, consent, nonce-replay and nonce consumption are all handled by
+    # verify_ap2_signature above. Resolve the agent id for the transaction row.
     consent_token = request.headers.get("X-Agent-Consent")
-    if not consent_token:
-        raise HTTPException(
-            status_code=status.HTTP_401_UNAUTHORIZED,
-            detail="Missing agent consent"
-        )
-    
     consent_data = await consent_service.verify_consent(consent_token)
     agent_id = consent_data["agent_id"]
-    
-    # Verify nonce
     nonce = request.headers.get("X-AP2-Nonce")
-    if not nonce:
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail="Missing nonce"
-        )
-    
-    # Check nonce uniqueness
-    from middleware.ap2_security import verify_ap2_nonce
-    await verify_ap2_nonce(request, nonce)
-    
+
     # Create transaction
     transaction_id = f"ap2_txn_{datetime.utcnow().strftime('%Y%m%d%H%M%S')}_{nonce[:8]}"
     
@@ -351,24 +349,25 @@ async def initiate_transaction(
 
 
 @router.post("/transaction/confirm")
-async def confirm_transaction(request: Request):
+async def confirm_transaction(
+    request: Request,
+    _sig: bool = Depends(verify_ap2_signature),
+):
     """
     Confirm pending transaction
-    
-    Requires:
+
+    Requires (signature/consent/nonce enforced by Depends(verify_ap2_signature)):
     - X-Agent-Consent: Valid consent token
+    - X-AP2-Signature: signature over the canonical payload of the request body
+      ({transaction_id}) + nonce, against the agent's registered key
+    - X-AP2-Nonce: Unique nonce (verified, then consumed, by the dependency)
     - X-Wallet-Address: Agent wallet address
     """
     from services.wallet_service import wallet_service
-    
-    # Verify consent
+
+    # Signature, consent and nonce-replay are handled by verify_ap2_signature.
     consent_token = request.headers.get("X-Agent-Consent")
-    if not consent_token:
-        raise HTTPException(
-            status_code=status.HTTP_401_UNAUTHORIZED,
-            detail="Missing agent consent"
-        )
-    
+
     # Parse body
     body = await request.json()
     transaction_id = body.get("transaction_id")

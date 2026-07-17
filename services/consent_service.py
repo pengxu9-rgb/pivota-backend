@@ -12,6 +12,11 @@ from decimal import Decimal
 
 from db.database import database
 from services.crypto_service import crypto_service
+from services.ap2_signing import (
+    ALLOWED_AP2_ALGORITHMS,
+    build_ap2_signed_payload,
+    is_supported_ap2_algorithm,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -22,6 +27,10 @@ class InvalidSignatureError(ValueError):
 
 class NonceReplayError(ValueError):
     """Nonce has already been used (replay protection)."""
+
+
+class UnsupportedAlgorithmError(ValueError):
+    """Requested signature algorithm is not in ALLOWED_AP2_ALGORITHMS."""
 
 
 class ConsentService:
@@ -72,28 +81,49 @@ class ConsentService:
         Returns:
             Consent data including consent_id and expiry
         """
+        # A signature without a key to check it against must FAIL CLOSED, never
+        # silently skip verification and still mint a token. (The grant route
+        # already 401s a keyless agent before calling this, but the primitive
+        # must not degrade to "no verification" for any caller.)
+        if signature and not public_key:
+            raise InvalidSignatureError(
+                "Signature provided without a registered public key to verify against"
+            )
+
         # Verify signature if provided
         if signature and public_key:
-            payload = {
-                "agent_id": agent_id,
-                "scope": scope,
-                "duration_hours": duration_hours,
-                "nonce": nonce
-            }
-            
+            if not is_supported_ap2_algorithm(algorithm):
+                raise UnsupportedAlgorithmError(
+                    f"Unsupported algorithm: {algorithm} "
+                    f"(expected one of {', '.join(ALLOWED_AP2_ALGORITHMS)})"
+                )
+
+            # Canonical AP2 signed payload (see services/ap2_signing.py). For the
+            # grant body {agent_id, scope, duration_hours} this is exactly the
+            # historical four-key shape {agent_id, scope, duration_hours, nonce}.
+            payload = build_ap2_signed_payload(
+                {
+                    "agent_id": agent_id,
+                    "scope": scope,
+                    "duration_hours": duration_hours,
+                },
+                nonce,
+            )
+
             is_valid = crypto_service.verify_agent_signature(
                 public_key=public_key,
                 signature=signature,
                 payload=payload,
                 algorithm=algorithm
             )
-            
+
             if not is_valid:
                 raise InvalidSignatureError("Invalid signature")
 
             logger.info(f"✅ Signature verified for agent {agent_id}")
-        
-        # Verify nonce uniqueness
+
+        # Verify nonce uniqueness. NB: verification above runs BEFORE the nonce
+        # is consumed, so a bad signature can never burn a victim's nonce.
         if nonce:
             existing_nonce = await database.fetch_one(
                 "SELECT nonce FROM nonce_tracker WHERE nonce = :nonce",
