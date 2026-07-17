@@ -111,6 +111,11 @@ def retailer_match_key(brand: Optional[str], title: Optional[str]) -> str:
 # merchant_owned duplicate.
 _SCOPE_RANK = {"multi_merchant_canonical": 2, "merchant_owned": 1}
 
+# Sentinel index entry carrying alias keys blocked for ALIAS-lane lookups
+# (alias-vs-primary cross-product collisions). "\x00" prefix cannot collide
+# with a real match key (normalize output is printable tokens).
+ALIAS_BLOCKED_SENTINEL = "\x00alias_blocked"
+
 
 def _scope_rank(row: Mapping[str, Any]) -> int:
     return _SCOPE_RANK.get(str(row.get("pdp_scope") or ""), 0)
@@ -122,14 +127,46 @@ def build_match_index(rows: Iterable[Mapping[str, Any]]) -> dict[str, dict[str, 
     rows: mappings with at least 'brand' and 'title' (optional 'pdp_scope').
     On key collision, keeps the highest scope rank (canonical > merchant_owned).
     Rows whose key is "" are skipped."""
+    row_list = [dict(r) for r in rows]
     index: dict[str, dict[str, Any]] = {}
-    for row in rows:
+    for row in row_list:
         key = retailer_match_key(row.get("brand"), row.get("title"))
         if not key:
             continue
         existing = index.get(key)
         if existing is None or _scope_rank(row) > _scope_rank(existing):
-            index[key] = dict(row)
+            index[key] = row
+
+    # Line-alias entries (services/pdp_matcher/line_alias.py) — ADDITIVE ONLY:
+    # a primary key is never shadowed, and an alias key claimed by two
+    # different products is dropped entirely (a wrong deterministic attach is
+    # worse than a residue row). A row whose alias key collides with a
+    # DIFFERENT product's PRIMARY key blocks that key for ALIAS lookups too
+    # (primary-key lookups keep working): the primary owner and the alias
+    # claimant are two products one alias-stripped title away from each
+    # other, so an alias-lane query on that key is ambiguous by construction.
+    from services.pdp_matcher.line_alias import alias_match_keys
+
+    alias_owner: dict[str, dict[str, Any]] = {}
+    ambiguous: set = set()
+    for row in row_list:
+        for akey in alias_match_keys(row.get("brand"), row.get("title")):
+            owner = index.get(akey)
+            if owner is not None:
+                if owner.get("product_key") != row.get("product_key"):
+                    ambiguous.add(akey)
+                continue
+            prev = alias_owner.get(akey)
+            if prev is not None:
+                if prev.get("product_key") != row.get("product_key"):
+                    ambiguous.add(akey)
+                continue
+            alias_owner[akey] = row
+    for akey, row in alias_owner.items():
+        if akey not in ambiguous and akey not in index:
+            index[akey] = {**row, "_alias_indexed": True}
+    if ambiguous:
+        index[ALIAS_BLOCKED_SENTINEL] = {"keys": frozenset(ambiguous)}
     return index
 
 
@@ -138,9 +175,29 @@ def match_record(
     brand: Optional[str],
     title: Optional[str],
 ) -> Optional[dict[str, Any]]:
-    """Return the canonical row matching (brand, title), or None. Pure lookup."""
+    """Return the canonical row matching (brand, title), or None. Pure lookup.
+    Primary key first; on a miss, the query's line-alias form (both sides
+    collapse to the same alias-canonical key, so this bridges a phrase carried
+    by either side)."""
     key = retailer_match_key(brand, title)
     if not key:
         return None
     hit = index.get(key)
-    return dict(hit) if hit is not None else None
+    if hit is not None:
+        return dict(hit)
+    from services.pdp_matcher.line_alias import alias_match_keys, spf_rating_conflict
+
+    blocked = (index.get(ALIAS_BLOCKED_SENTINEL) or {}).get("keys") or frozenset()
+    for akey in alias_match_keys(brand, title):
+        if akey in blocked:
+            continue
+        hit = index.get(akey)
+        if hit is None:
+            continue
+        # never alias-attach across explicit, DIFFERENT SPF ratings — an
+        # SPF30 listing must not land on an SPF50 canonical.
+        hit_key = retailer_match_key(hit.get("brand"), hit.get("title"))
+        if spf_rating_conflict(key, hit_key):
+            continue
+        return {**hit, "_alias_matched": True}
+    return None

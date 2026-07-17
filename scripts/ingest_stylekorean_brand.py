@@ -224,8 +224,12 @@ async def _load_our_rows(brands: List[str]) -> List[Dict[str, Any]]:
     clauses = " OR ".join(f"lower(brand) LIKE :b{i}" for i in range(len(brands)))
     params = {f"b{i}": f"%{_like_escape(b.lower())}%" for i, b in enumerate(brands)}
     rows = await database.fetch_all(
+        # ORDER BY makes same-scope primary-key collisions deterministic
+        # (first row wins in build_match_index; unordered scans can flip
+        # the winner between runs).
         f"SELECT product_key, content_key, brand, title, pdp_scope "
-        f"FROM catalog_products WHERE title IS NOT NULL AND ({clauses})",
+        f"FROM catalog_products WHERE title IS NOT NULL AND ({clauses}) "
+        f"ORDER BY product_key",
         params,
     )
     return [dict(r) for r in rows]

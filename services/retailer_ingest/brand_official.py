@@ -46,6 +46,9 @@ def _official_index_rows(official_records: List[Mapping[str, Any]]) -> List[Dict
         rows.append({
             "brand": pdp.get("brand"),
             "title": pdp.get("product_name"),
+            # identity for the line-alias ambiguity guard — without a distinct
+            # per-row key the guard compares None == None and never fires.
+            "product_key": f"official::{pdp.get('brand')}::{pdp.get('product_name')}",
             "record": rec,
         })
     return rows
@@ -99,7 +102,11 @@ def filter_net_new(
     already_have is returned for reporting (GTIN-refresh candidates, not a
     re-INSERT)."""
     our_index = build_match_index(
-        [{"brand": r.get("brand"), "title": r.get("title"), "pdp_scope": r.get("pdp_scope")} for r in our_rows]
+        [{"brand": r.get("brand"), "title": r.get("title"),
+          "pdp_scope": r.get("pdp_scope"),
+          # identity for the line-alias ambiguity guard (see _official_index_rows)
+          "product_key": r.get("product_key") or f"row::{r.get('brand')}::{r.get('title')}"}
+         for r in our_rows]
     )
     our_token_sets = [_key_tokens(k) for k in our_index if len(_key_tokens(k)) >= 2]
     net_new: List[Dict[str, Any]] = []
