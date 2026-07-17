@@ -6,7 +6,7 @@ import json
 import logging
 from datetime import datetime
 from typing import Optional, List
-from fastapi import APIRouter, HTTPException, status
+from fastapi import APIRouter, HTTPException, Query, status
 from pydantic import BaseModel, Field
 from db.database import database
 
@@ -455,7 +455,7 @@ async def list_nonces(limit: int = 100):
 
 
 @router.delete("/nonces/cleanup")
-async def cleanup_old_nonces(days: int = 7):
+async def cleanup_old_nonces(days: int = Query(7, ge=1)):
     """
     Cleanup old nonces (older than specified days)
     
