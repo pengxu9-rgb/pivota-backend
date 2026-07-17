@@ -118,6 +118,20 @@ consistent with the middleware.)
 021 (and the x402 migrations). Ensure they are applied in the environment before
 enabling, or the routes will 500 on first use.
 
+### 5. Implement `WalletService.verify_agent_wallet` (transaction/confirm 500s without it)
+
+`POST /ap2/transaction/confirm` calls
+`wallet_service.verify_agent_wallet(agent_id, wallet_address)`
+(`routes/ap2_routes.py`), but `WalletService` (`services/wallet_service.py`)
+defines **no such method** (it has `get_agent_wallet`, `validate_address`, …), so
+the call raises `AttributeError` and the route 500s. The current test
+(`tests/test_ap2_transaction_signature.py`) monkeypatches the method into
+existence, so CI is green while production has no implementation. Implement the
+real authorization check (likely on top of `get_agent_wallet`) and drop the
+monkeypatch before enabling.
+
+Tracked in [#1448](https://github.com/pengxu9-rgb/pivota-backend/issues/1448).
+
 ## Reviewer sign-off (required before the `ENABLE_AP2_ROUTES` flip)
 
 Flipping `ENABLE_AP2_ROUTES=true` is the point of no return for this surface —
@@ -136,6 +150,9 @@ confirmed their blocker is cleared:
       with the middleware's required headers for the pilot scope. (Blocker 3)
 - [ ] **Schema applied** — owner confirms migration 021 (+ x402 tables) is applied
       in the target environment. (Blocker 4)
+- [ ] **Wallet authorization implemented** — owner confirms
+      `WalletService.verify_agent_wallet` exists and `transaction/confirm` enforces it
+      without a test monkeypatch. (Blocker 5 — [#1448](https://github.com/pengxu9-rgb/pivota-backend/issues/1448))
 - [ ] **Deploy/on-call sign-off** — the deploying engineer acknowledges the rollback
       path (set the flag false + redeploy) before the flip.
 
