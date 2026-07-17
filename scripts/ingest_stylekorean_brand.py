@@ -191,10 +191,21 @@ async def _attach_offer_items(items: List[Dict[str, Any]]) -> tuple[int, int]:
     distinct_cks = sorted({
         pk_to_ck[r["product_key"]] for r in verified_rows if pk_to_ck.get(r["product_key"])
     })
+    refreshed = 0
+    refresh_failed: List[str] = []
     for ck in distinct_cks:
-        await refresh_agent_pdp_view_for_content_key(ck, refresh_source=RETAILER_REFRESH_SOURCE)
+        try:
+            await refresh_agent_pdp_view_for_content_key(ck, refresh_source=RETAILER_REFRESH_SOURCE)
+            refreshed += 1
+        except Exception as exc:  # noqa: BLE001 — offers are already committed; one
+            # content_key's refresh failure must not leave every LATER key stale.
+            refresh_failed.append(ck)
+            print(f"      WARN view refresh failed for {ck}: {type(exc).__name__}: {str(exc)[:150]}")
+    if refresh_failed:
+        print(f"      WARN {len(refresh_failed)} content_key view(s) failed to refresh — "
+              f"their offers serve STALE until re-refreshed: {' '.join(refresh_failed)}")
 
-    print(f"      upserted {upserted} offers into catalog_offers; refreshed {len(distinct_cks)} content_key view(s)"
+    print(f"      upserted {upserted} offers into catalog_offers; refreshed {refreshed}/{len(distinct_cks)} content_key view(s)"
           + (f" ({insert_skipped} bad rows skipped)" if insert_skipped else ""))
     return upserted, eligible_missing + collapsed
 

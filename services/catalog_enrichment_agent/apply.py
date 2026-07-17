@@ -445,7 +445,7 @@ async def _apply_ingest_plan_batched(
     counts: Dict[str, int] = {
         "merchants": 0, "pdps": 0, "skus": 0, "offers": 0, "seeds": 0,
         "offers_skipped": 0, "pdps_skipped_identity": 0, "pdps_skipped_insert": 0,
-        "products_fully_skipped": 0,
+        "products_fully_skipped": 0, "seeds_skipped_derivation": 0,
     }
     audit = WriterAuditAccumulator(
         writer_name=AGENT_VERSION,
@@ -535,7 +535,17 @@ async def _apply_ingest_plan_batched(
     # 5. external_product_seeds — per-row seller derivation (ADR-009 D3), then bulk.
     seed_rows = []
     for seed in seeds:
-        seller_ref, seed_kind = await _derive_seed_seller_for_plan_row(seed)
+        try:
+            seller_ref, seed_kind = await _derive_seed_seller_for_plan_row(seed)
+        except Exception as exc:  # noqa: BLE001 — same skip semantics as the per-row
+            # path: one seed's derivation failure must not abort the apply AFTER
+            # pdps/skus/offers are committed, nor lose the writer-audit row below.
+            logger.exception(
+                "seed seller derivation failed for id=%s — seed skipped: %s",
+                seed.get("id"), exc,
+            )
+            counts["seeds_skipped_derivation"] += 1
+            continue
         seed_rows.append({**seed, "seller_ref": seller_ref, "seed_kind": seed_kind})
     counts["seeds"], _, _ = await bulk_upsert(database, _SEED_UPSERT_SQL, seed_rows, label="seeds")
 

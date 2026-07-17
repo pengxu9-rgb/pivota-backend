@@ -26,9 +26,10 @@ CONTRACT (matches the per-row executor it replaces, plus the founder addendum):
      caller is responsible for the ON CONFLICT target.
 
 Rows passed in MUST be "clean" — their keys are exactly the columns the SQL
-binds (the same projection the single-row path already required). An unclean row
-fails the chunk's bind step and is safely skipped in per-row replay; it is never
-silently coerced.
+binds (the same projection the single-row path already required). A row missing
+any referenced key is rejected BEFORE binding (counted + returned in
+skipped_rows): binding it would silently pass NULL for the missing column, which
+an `ON CONFLICT ... DO UPDATE` could then write over existing data.
 """
 
 from __future__ import annotations
@@ -85,6 +86,10 @@ def split_upsert_sql(sql: str) -> Tuple[str, str, str]:
     values_tuple = values_tuple.strip()
     if not (values_tuple.startswith("(") and values_tuple.endswith(")")):
         raise ValueError("bulk_upsert could not isolate the VALUES tuple")
+    if "::" in values_tuple:
+        # ':param' rewriting would corrupt a '::type' cast (':type' looks like a
+        # param). The ingest SQLs use CAST(... AS type) instead.
+        raise ValueError("bulk_upsert VALUES tuple must use CAST(...), not '::' casts")
     conflict_tail = ("ON CONFLICT" + conflict).strip() if csep else ""
     return head.strip() + " VALUES", values_tuple, conflict_tail
 
@@ -113,7 +118,7 @@ async def _write_chunk_multirow(
     for i, row in enumerate(chunk):
         parts.append(_suffix_tuple(values_tuple, i))
         for key in referenced:
-            params[f"{key}__{i}"] = row.get(key)
+            params[f"{key}__{i}"] = row[key]
     sql = f"{head} {','.join(parts)} {conflict}".strip()
 
     attempt = 0
@@ -198,6 +203,26 @@ async def bulk_upsert(
     applied = 0
     skipped = 0
     skipped_rows: List[Dict[str, Any]] = []
+
+    # Row-key pre-validation: never bind a row missing a referenced key — row[key]
+    # would otherwise have to default the value, and a silent NULL can overwrite
+    # real data through the DO UPDATE arm. Rejected rows are returned in
+    # skipped_rows so callers' orphan guards see them like any other skipped row.
+    valid_rows: List[Dict[str, Any]] = []
+    for row in row_list:
+        missing = [k for k in referenced if k not in row]
+        if missing:
+            row_id = (row.get("product_key") or row.get("offer_id") or row.get("id")
+                      or row.get("sku_key") or row.get("merchant_id"))
+            logger.error(
+                "bulk_upsert[%s] row rejected pre-bind (row id=%s) — missing key(s) %s",
+                label, row_id, missing,
+            )
+            skipped += 1
+            skipped_rows.append(row)
+            continue
+        valid_rows.append(row)
+    row_list = valid_rows
     for start in range(0, len(row_list), max(1, chunk_size)):
         chunk = row_list[start:start + max(1, chunk_size)]
         ok = await _write_chunk_multirow(
