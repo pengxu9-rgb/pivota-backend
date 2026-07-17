@@ -13,6 +13,7 @@ slice. Revocation flips ``status`` (the audit row is kept, not deleted).
 """
 from __future__ import annotations
 
+import json
 from typing import Any, Dict, List, Optional, Set
 
 from db.database import database
@@ -29,12 +30,16 @@ async def add_trusted_issuer(
     """
     await database.execute(
         """
-        INSERT INTO ap2_trusted_issuers (agent_id, issuer_did, status, created_at)
-        VALUES (:agent_id, :issuer_did, 'active', NOW())
+        INSERT INTO ap2_trusted_issuers (agent_id, issuer_did, status, created_at, metadata)
+        VALUES (:agent_id, :issuer_did, 'active', NOW(), :metadata)
         ON CONFLICT (agent_id, issuer_did)
         DO UPDATE SET status = 'active', revoked_at = NULL
         """,
-        {"agent_id": agent_id, "issuer_did": issuer_did},
+        {
+            "agent_id": agent_id,
+            "issuer_did": issuer_did,
+            "metadata": json.dumps(metadata) if metadata is not None else None,
+        },
     )
 
 

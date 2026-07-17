@@ -27,7 +27,25 @@ async def test_add_trusted_issuer_upserts_active(monkeypatch):
     assert "INSERT INTO ap2_trusted_issuers" in captured["query"]
     assert "ON CONFLICT (agent_id, issuer_did)" in captured["query"]
     assert "status = 'active'" in captured["query"]  # reactivate on conflict
-    assert captured["values"] == {"agent_id": "agent_1", "issuer_did": "did:key:zIssuer"}
+    assert captured["values"] == {
+        "agent_id": "agent_1", "issuer_did": "did:key:zIssuer", "metadata": None,
+    }
+
+
+async def test_add_trusted_issuer_stores_metadata(monkeypatch):
+    import json
+    captured = {}
+
+    async def fake_execute(query, values=None):
+        captured["values"] = values
+
+    from db.database import database
+    monkeypatch.setattr(database, "execute", fake_execute)
+
+    await reg.add_trusted_issuer("agent_1", "did:key:zIssuer",
+                                 metadata={"provisioned_by": "admin"})
+    assert "metadata" in captured["values"]
+    assert json.loads(captured["values"]["metadata"]) == {"provisioned_by": "admin"}
 
 
 async def test_revoke_trusted_issuer_updates_status(monkeypatch):
