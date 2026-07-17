@@ -60,7 +60,7 @@ This is the second decision in this ADR, added in rev 2. It is **orthogonal** to
 |---|---|---|
 | **`did:key`** | Self-contained, offline-resolvable DID; the public key *is* the identifier. No network, no registry. | ✅ implemented — [#1452](https://github.com/pengxu9-rgb/pivota-backend/pull/1452) (`services/ap2_did.py`; `did:key` in `agents.public_key` resolves in the grant flow) |
 | **`did:web`** | Domain-rooted DID resolved from the agent's `.well-known/did.json`; rotation owned by the agent. Resolver with SSRF guard, redirect refusal, TTL cache, fail-closed timeouts; `publicKeyMultibase` + `publicKeyJwk`. | ✅ implemented — [#1453](https://github.com/pengxu9-rgb/pivota-backend/pull/1453) (stacked on #1452) |
-| **VC / mandate chain** | W3C Verifiable Credentials + AP2 Intent/Cart/Payment mandates + trusted-issuer registry — the authority layer. | ⬜ strategic end-state |
+| **VC / mandate chain** | W3C Verifiable Credentials + AP2 Intent/Cart/Payment mandates + trusted-issuer registry — the authority layer. | 🟡 in progress — verification **primitive** shipped [#1455](https://github.com/pengxu9-rgb/pivota-backend/pull/1455) (`services/ap2_mandate.py`); chain linkage + registry + grant wiring remain |
 
 ### Identity-rooting options considered
 
@@ -80,6 +80,26 @@ On the AP2 rail the agent presents its **DID**; Pivota (a) resolves the DID → 
 - **(rejected) Make `agent_id` itself the DID.** Would rewrite the primary identifier and every FK, break the live API-key rail, and force a migration of all existing agents — a one-way door for no benefit, since the mapping column achieves the same external-identity property additively.
 
 **Transitional note:** the shipped did:key/did:web slices store the DID in `agents.public_key` keyed by `agent_id` (no schema change needed to demo resolution). The `agents.did` column is the durable home; the grant flow re-keys onto DID-presented identity as a follow-up (does not block the resolver slices).
+
+### VC / mandate authority layer (design)
+
+Identity answers *who the agent is*; **mandates** answer *what the user authorized it to do*. AP2 carries that authorization as a chain of signed Verifiable Credentials, replacing today's opaque `scope` list:
+
+| Mandate | Issuer → Subject | Authorizes | Key fields (beyond the common envelope) |
+|---|---|---|---|
+| **Intent** | user DID → agent DID | the agent to transact within limits | `constraints` = `actions`, `max_amount`, `currency`, `merchants`, validity window |
+| **Cart** | user (or agent) DID → agent DID | a *specific* cart under an intent | `intent_ref`, `cart_hash`, `total`, `currency`, `merchant_id` |
+| **Payment** | user DID → agent DID | the actual payment for a cart | `cart_ref`, `amount`, `currency`, `settlement` (psp \| x402) |
+
+**Common envelope** (every mandate): `type`, `issuer` (DID), `subject` (DID), `issued_at`, `expires_at`, optional `nonce`; a **detached signature** over the canonical JSON, verified against the key resolved from the **issuer DID** — i.e. the authority layer reuses the *identity* layer (`services/ap2_identity.py`) and adds no new trust root.
+
+**Chain linkage** (each step must reference and stay within the prior): `Cart.intent_ref == Intent.id` **and** `Cart.total ≤ Intent.constraints.max_amount` (and currency/merchant within intent); `Payment.cart_ref == Cart.id` **and** `Payment.amount == Cart.total`. Subject must be the **presenting agent's DID** at every step (binding), and every mandate must be unexpired.
+
+**Trusted-issuer registry:** the issuer (the user's DID) must be one Pivota recognizes as the account's authorizing party — otherwise anyone with a resolvable DID could mint an intent. The registry maps *account → authorized issuer DID(s)* with revocation/status; the verification primitive already accepts a `trusted_issuers` set so the registry can be dropped in without touching the crypto.
+
+**Wiring** (later slice): the grant/transaction flow accepts a mandate (or chain) instead of a raw `scope`; `verify_mandate` + `check_mandate_constraints` gate the action, and the enforced constraints — not a caller-supplied list — become the consent's authority. Kept out of the resolver PRs to avoid churning `consent_service` mid-review.
+
+**Shipped vs remaining:** the verification **primitive** + constraint enforcement is in [#1455](https://github.com/pengxu9-rgb/pivota-backend/pull/1455) (single-mandate verify, fail-closed, DID-rooted). Remaining: chain-linkage validation, the trusted-issuer registry (+ revocation), and the grant-flow wiring.
 
 ## Options Considered (rail boundary)
 
@@ -148,7 +168,7 @@ Decisive factor: **non-repudiation belongs where money moves and the caller is l
 3. [x] **`did:key` identity slice** — offline DID resolution wired into the grant flow. Done: [#1452](https://github.com/pengxu9-rgb/pivota-backend/pull/1452) (`services/ap2_did.py`).
 4. [x] **`did:web` identity slice** — DID-document resolution over HTTPS with SSRF guard + TTL cache, fail-closed. Done: [#1453](https://github.com/pengxu9-rgb/pivota-backend/pull/1453) (`services/ap2_did_web.py`, `ap2_identity.py`).
 5. [x] **DID ↔ agent association — decided:** separate `agents.did` column (unique), `agent_id` stays internal + FK-consistent (see "DID ↔ agent association" above). Foundation (migration + ORM column + `get_agent_by_did` helper) in progress; grant re-keying onto DID-presented identity is the wiring follow-up. Re-scopes #1442.
-6. [ ] **VC / mandate authority layer** — Intent/Cart/Payment mandates + trusted-issuer registry; replaces the opaque scope list as the delegation proof. (Final slice.)
+6. [~] **VC / mandate authority layer** — verification primitive + constraint enforcement shipped ([#1455](https://github.com/pengxu9-rgb/pivota-backend/pull/1455), `services/ap2_mandate.py`); **remaining:** Intent→Cart→Payment chain linkage, trusted-issuer registry (+ revocation), and grant-flow wiring. Design in "VC / mandate authority layer" above.
 7. [ ] **SSRF hardening for self-registration** — if agents self-register `did:web`, pin the resolved IP into the connection (close the check-then-fetch TOCTOU gap noted in `ap2_did_web.py`).
 8. [ ] **Reconciliation owner** — assign ownership of the combined `x402_transactions` + `/orders/*` financial ledger before AP2 carries real money.
 9. [ ] **Clear the remaining `AP2_ENABLEMENT.md` blockers** for the pilot scope (middleware header contract on `revoke`/`transaction/*`, `verify_ap2_signature` reconciliation, schema applied) — tracked separately; not gated by this ADR.
