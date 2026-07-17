@@ -118,12 +118,19 @@ async def _default_fetch(url: str) -> Dict[str, Any]:
     import httpx
 
     _assert_public_host(urlparse(url).netloc)
-    async with httpx.AsyncClient(
-        timeout=_HTTP_TIMEOUT_SECONDS, follow_redirects=False
-    ) as client:
-        resp = await client.get(
-            url, headers={"Accept": "application/did+json, application/json"}
-        )
+    try:
+        async with httpx.AsyncClient(
+            timeout=_HTTP_TIMEOUT_SECONDS, follow_redirects=False
+        ) as client:
+            resp = await client.get(
+                url, headers={"Accept": "application/did+json, application/json"}
+            )
+    except httpx.HTTPError as exc:
+        # Connect/read timeout, TLS failure, connection refused, protocol error —
+        # every httpx transport failure. Re-raise as ValueError so resolution
+        # FAILS CLOSED: the consent, transaction, and mandate paths all catch
+        # ValueError and map it to 401, never let it escape as an uncaught 500.
+        raise ValueError(f"did:web fetch failed: {exc.__class__.__name__}")
     if resp.status_code != 200:
         raise ValueError(f"did:web fetch returned HTTP {resp.status_code}")
     if len(resp.content) > _MAX_DOC_BYTES:
