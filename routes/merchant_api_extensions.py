@@ -1309,15 +1309,143 @@ async def update_merchant_profile(
     profile_data: Dict[str, Any] = Body(...),
     current_user: dict = Depends(get_current_user)
 ):
-    """Update merchant profile"""
+    """Update merchant profile.
+
+    Contact fields persist to merchant_onboarding. Changing contact_email is a
+    login-email change: it must move users.email, auth_identities, and
+    merchant_onboarding.contact_email together, or the merchant can no longer
+    log in with the address the portal shows them.
+    """
     if current_user["role"] != "merchant":
         raise HTTPException(status_code=403, detail="Not authorized")
-    
-    # In a real implementation, this would update the database
+
+    merchant_id = await get_merchant_id_from_user(current_user)
+
+    merchant = await database.fetch_one(
+        """
+        SELECT merchant_id, business_name, contact_email, contact_phone, website
+        FROM merchant_onboarding
+        WHERE merchant_id = :merchant_id
+        """,
+        {"merchant_id": merchant_id},
+    )
+    if not merchant:
+        raise HTTPException(status_code=404, detail="Merchant not found")
+
+    from db.auth_identity import normalize_email, record_identity_event
+
+    # The address this session authenticated with — the row we are allowed to move.
+    login_email = normalize_email(current_user.get("email") or "")
+    current_contact = normalize_email(merchant["contact_email"] or "")
+
+    new_email_raw = (profile_data.get("contact_email") or "").strip()
+    new_email = normalize_email(new_email_raw)
+    email_changed = bool(new_email) and new_email not in (login_email, current_contact)
+
+    if email_changed:
+        try:
+            from email_validator import validate_email
+
+            validate_email(new_email_raw, check_deliverability=False)
+        except Exception:
+            raise HTTPException(status_code=422, detail="Invalid email address")
+
+        existing_user = await database.fetch_one(
+            "SELECT id FROM users WHERE LOWER(email) = :email LIMIT 1",
+            {"email": new_email},
+        )
+        existing_identity = await database.fetch_one(
+            "SELECT identity_id FROM auth_identities WHERE email_normalized = :email LIMIT 1",
+            {"email": new_email},
+        )
+        if existing_user or existing_identity:
+            raise HTTPException(
+                status_code=409,
+                detail="An account with this email already exists",
+            )
+
+    def _field(key: str) -> Optional[str]:
+        # A key absent from the payload keeps its current value; an explicit
+        # empty string clears the (nullable) column.
+        if key not in profile_data:
+            return merchant[key]
+        value = profile_data.get(key)
+        return str(value).strip() if value is not None else None
+
+    updates = {
+        "business_name": _field("business_name") or merchant["business_name"],
+        "contact_phone": _field("contact_phone"),
+        "website": _field("website"),
+        "contact_email": new_email_raw if email_changed else (merchant["contact_email"] or login_email),
+        "merchant_id": merchant_id,
+    }
+
+    async with database.transaction():
+        await database.execute(
+            """
+            UPDATE merchant_onboarding
+            SET business_name = :business_name,
+                contact_email = :contact_email,
+                contact_phone = :contact_phone,
+                website = :website,
+                updated_at = CURRENT_TIMESTAMP
+            WHERE merchant_id = :merchant_id
+            """,
+            updates,
+        )
+        if email_changed:
+            old_email = login_email or current_contact
+            await database.execute(
+                "UPDATE users SET email = :new_email WHERE LOWER(email) = :old_email",
+                {"new_email": new_email, "old_email": old_email},
+            )
+            await database.execute(
+                """
+                UPDATE auth_identities
+                SET email = :new_email,
+                    email_normalized = :new_email,
+                    updated_at = CURRENT_TIMESTAMP
+                WHERE email_normalized = :old_email
+                """,
+                {"new_email": new_email, "old_email": old_email},
+            )
+
+    if email_changed:
+        try:
+            await record_identity_event(
+                event_type="login_email_changed",
+                email=new_email,
+                identity_id=current_user.get("identity_id") or current_user.get("sub"),
+                details={
+                    "merchant_id": merchant_id,
+                    "old_email": login_email or current_contact,
+                    "source": "merchant_portal_settings",
+                },
+            )
+        except Exception as exc:
+            logger.warning("[MerchantProfile] Failed to record identity event: %s", exc)
+        logger.info(
+            "[MerchantProfile] Login email changed for merchant %s: %s -> %s",
+            merchant_id,
+            login_email or current_contact,
+            new_email,
+        )
+
     return {
         "status": "success",
-        "message": "Profile updated successfully",
-        "data": profile_data
+        "message": (
+            "Profile updated. Your login email has changed — please sign in again."
+            if email_changed
+            else "Profile updated successfully"
+        ),
+        "login_email_changed": email_changed,
+        "data": {
+            "merchant_id": merchant_id,
+            "business_name": updates["business_name"],
+            "contact_email": updates["contact_email"],
+            "contact_phone": updates["contact_phone"],
+            "website": updates["website"],
+        },
     }
 
 @router.post("/merchant/integrations/shopify/sync")
