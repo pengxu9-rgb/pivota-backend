@@ -196,7 +196,11 @@ def _select_key_from_doc(doc: Dict[str, Any], kid: Optional[str]) -> Tuple[str, 
             if "publicKeyMultibase" in vm:
                 decoded = decode_multibase_base58btc(vm["publicKeyMultibase"])
                 return multicodec_bytes_to_pem(decoded)
-        except ValueError as exc:
+        except (ValueError, KeyError, TypeError, AttributeError) as exc:
+            # A malformed verification method (missing JWK coordinate, non-string
+            # multibase, etc.) must SKIP to the next candidate — not abort the
+            # loop — and must surface as ValueError so the caller fails closed
+            # (401), never as an uncaught KeyError/AttributeError (500).
             last_err = exc
             continue
     raise ValueError(

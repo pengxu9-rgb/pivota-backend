@@ -247,6 +247,41 @@ async def test_unsupported_jwk_fails_closed():
         await resolve_did_web(did, fetcher=_fetcher_returning(doc))
 
 
+async def test_malformed_vm_before_valid_is_skipped():
+    # A malformed verification method (missing JWK coordinates -> KeyError) must
+    # be SKIPPED, not abort the loop, so the following valid method resolves.
+    priv = ec.generate_private_key(ec.SECP256R1())
+    did = "did:web:example.com"
+    doc = {
+        "id": did,
+        "verificationMethod": [
+            {"id": did + "#bad", "publicKeyJwk": {"kty": "EC", "crv": "P-256"}},
+            {"id": did + "#good", "publicKeyMultibase": _multibase_p256(priv)},
+        ],
+    }
+    pem, alg = await resolve_did_web(did, fetcher=_fetcher_returning(doc))
+    assert alg == "ES256"
+    payload = {"agent_id": did, "scope": ["read"], "nonce": "n1"}
+    msg = crypto_service.canonicalize_json(payload).encode()
+    sig = base64.b64encode(priv.sign(msg, ec.ECDSA(hashes.SHA256()))).decode()
+    assert crypto_service.verify_agent_signature(pem, sig, payload, "ES256")
+
+
+async def test_only_malformed_vms_fail_closed_as_valueerror():
+    # Non-string multibase (AttributeError) + missing-coordinate JWK (KeyError)
+    # must surface as ValueError (-> 401 fail closed), never a raw 500-class error.
+    did = "did:web:example.com"
+    doc = {
+        "id": did,
+        "verificationMethod": [
+            {"id": did + "#a", "publicKeyMultibase": 12345},
+            {"id": did + "#b", "publicKeyJwk": {"kty": "OKP", "crv": "Ed25519"}},
+        ],
+    }
+    with pytest.raises(ValueError):
+        await resolve_did_web(did, fetcher=_fetcher_returning(doc))
+
+
 # --------------------------------------------------------------------------- #
 # end-to-end grant via did:web (module fetcher patched)
 # --------------------------------------------------------------------------- #
