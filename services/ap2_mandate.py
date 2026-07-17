@@ -14,6 +14,16 @@ deliberately not yet wired into the grant/transaction flow, and the full
 Intent→Cart→Payment chain-linkage + trusted-issuer *registry* are later slices
 (see ADR-012). Everything here **fails closed**: any structural, signature,
 temporal, binding, or constraint problem raises ``MandateError``.
+
+SECURITY — the primitive's *defaults are permissive by design* and the money-
+gating wiring layer MUST tighten them, never rely on them:
+- ``verify_mandate(trusted_issuers=None)`` **skips** the issuer-trust check. The
+  wiring layer MUST pass the trusted-issuer set — otherwise a well-formed mandate
+  self-signed by ANY attacker-generated DID verifies.
+- ``check_mandate_constraints`` treats an **absent** constraint dimension as
+  *unconstrained* (permit). At the authority boundary the caller MUST require a
+  ``constraints`` block and treat "no applicable constraint" as **deny**, not
+  allow. (A malformed constraint value is already rejected here.)
 """
 from __future__ import annotations
 
@@ -81,7 +91,10 @@ async def verify_mandate(
     if missing:
         raise MandateError(f"mandate missing fields: {', '.join(missing)}")
 
-    if mandate["type"] not in _MANDATE_TYPES:
+    # isinstance guard first: `mandate["type"]` is attacker-controlled and an
+    # unhashable value ([]/{}) would raise TypeError on the frozenset membership
+    # test — a non-MandateError escape at the pre-signature boundary.
+    if not isinstance(mandate["type"], str) or mandate["type"] not in _MANDATE_TYPES:
         raise MandateError(f"unknown mandate type: {mandate['type']!r}")
 
     issuer = mandate["issuer"]
@@ -103,6 +116,8 @@ async def verify_mandate(
     now_ts = now.timestamp()
     issued_at = _parse_ts(mandate["issued_at"], "issued_at")
     expires_at = _parse_ts(mandate["expires_at"], "expires_at")
+    if issued_at.timestamp() > expires_at.timestamp():
+        raise MandateError("mandate issued_at is after expires_at")
     if expires_at.timestamp() <= now_ts:
         raise MandateError("mandate has expired")
     if issued_at.timestamp() > now_ts + leeway_seconds:
@@ -110,9 +125,13 @@ async def verify_mandate(
 
     # Resolve the issuer's key from its DID and verify the detached signature over
     # the canonical mandate. The DID is authoritative about the algorithm.
+    # Catch broadly: a did:web issuer resolves over the network, so the resolver
+    # can raise non-ValueError transport errors (httpx). At this authority
+    # boundary every resolver failure must fail CLOSED as MandateError, never
+    # escape as an uncaught 500.
     try:
         issuer_pem, algorithm = await resolver(issuer)
-    except ValueError as exc:
+    except Exception as exc:
         raise MandateError(f"unresolvable issuer DID: {exc}")
 
     ok = crypto_service.verify_agent_signature(
@@ -144,14 +163,25 @@ def check_mandate_constraints(
     - ``max_amount``:          numeric ceiling           → ``amount`` must be ≤ it
     - ``currency``:            required currency          → ``currency`` must match
     - ``merchants``:           merchant allowlist         → ``merchant_id`` must be in it
+
+    A malformed constraint (wrong type) raises MandateError — it never degrades
+    to a looser check. In particular an allowlist MUST be a list/tuple/set: a
+    bare string would otherwise make ``in`` a *substring* test and permit actions
+    that were never granted (widening — the dangerous direction).
     """
+    if not isinstance(mandate, dict):
+        raise MandateError("mandate must be an object")
+
     constraints = mandate.get("constraints") or {}
     if not isinstance(constraints, dict):
         raise MandateError("mandate constraints must be an object")
 
     allowed = constraints.get("actions", constraints.get("scope"))
-    if allowed is not None and action is not None and action not in allowed:
-        raise MandateError(f"action '{action}' not permitted by mandate")
+    if allowed is not None and action is not None:
+        if not isinstance(allowed, (list, tuple, set)):
+            raise MandateError("mandate constraints.actions must be a list")
+        if action not in allowed:
+            raise MandateError(f"action '{action}' not permitted by mandate")
 
     if "max_amount" in constraints and amount is not None:
         try:
@@ -170,5 +200,8 @@ def check_mandate_constraints(
         )
 
     merchants = constraints.get("merchants")
-    if merchants is not None and merchant_id is not None and merchant_id not in merchants:
-        raise MandateError(f"merchant {merchant_id} not in mandate allowlist")
+    if merchants is not None and merchant_id is not None:
+        if not isinstance(merchants, (list, tuple, set)):
+            raise MandateError("mandate constraints.merchants must be a list")
+        if merchant_id not in merchants:
+            raise MandateError(f"merchant {merchant_id} not in mandate allowlist")

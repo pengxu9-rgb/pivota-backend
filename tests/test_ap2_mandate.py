@@ -204,3 +204,64 @@ def test_constraints_absent_are_permissive():
     # A mandate with no constraints block does not constrain anything.
     check_mandate_constraints({}, action="anything", amount=Decimal("1000000"),
                               currency="XYZ", merchant_id="whatever")  # no raise
+
+
+# ---- fail-closed on malformed input (review B1-B4) -------------------------- #
+
+async def test_non_string_type_is_mandateerror_not_typeerror():
+    # B1: an unhashable `type` must raise MandateError, not TypeError, at the
+    # pre-signature boundary.
+    priv = ec.generate_private_key(ec.SECP256R1())
+    m = _intent(_did_key_es256(priv), type=[])
+    with pytest.raises(MandateError):
+        await verify_mandate(m, "AA==", now=NOW)
+
+
+async def test_issued_after_expiry_rejected():
+    # N3: issued_at strictly after expires_at is structurally invalid.
+    priv = ec.generate_private_key(ec.SECP256R1())
+    m = _intent(
+        _did_key_es256(priv),
+        issued_at=(NOW - timedelta(hours=1)).isoformat(),
+        expires_at=(NOW - timedelta(hours=2)).isoformat(),
+    )
+    with pytest.raises(MandateError):
+        await verify_mandate(m, "AA==", now=NOW)
+
+
+def test_constraints_non_dict_mandate_rejected():
+    # B3: a non-dict mandate must raise MandateError, not AttributeError.
+    with pytest.raises(MandateError):
+        check_mandate_constraints(["not", "a", "dict"], action="x")
+
+
+def test_constraints_non_iterable_actions_rejected():
+    # B2: a non-iterable allowlist must raise MandateError, not TypeError.
+    with pytest.raises(MandateError):
+        check_mandate_constraints({"constraints": {"actions": 123}}, action="x")
+
+
+def test_constraints_non_iterable_merchants_rejected():
+    with pytest.raises(MandateError):
+        check_mandate_constraints({"constraints": {"merchants": 5}}, merchant_id="m")
+
+
+def test_constraints_string_actions_does_not_substring_permit():
+    # B4 (fail-open guard): "pay" is a substring of "create_payment" but a bare
+    # string allowlist must NOT permit it — malformed constraints never widen.
+    with pytest.raises(MandateError):
+        check_mandate_constraints(
+            {"constraints": {"actions": "create_payment"}}, action="pay"
+        )
+
+
+async def test_resolver_non_valueerror_fails_closed_as_mandateerror():
+    # N1: a did:web issuer resolves over the network; a non-ValueError transport
+    # failure must fail closed as MandateError, not escape as a raw 500-class error.
+    async def boom(did):
+        raise RuntimeError("network down")
+
+    priv = ec.generate_private_key(ec.SECP256R1())
+    m = _intent(_did_key_es256(priv))
+    with pytest.raises(MandateError):
+        await verify_mandate(m, "AA==", now=NOW, resolver=boom)
