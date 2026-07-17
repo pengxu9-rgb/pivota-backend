@@ -176,13 +176,26 @@ async def verify_ap2_consent(request: Request) -> dict:
 
 async def verify_ap2_signature(request: Request) -> bool:
     """
-    Dependency function to verify AP2 request signature
-    
+    Dependency function to verify an AP2 request signature.
+
+    Enforces the SAME signed-payload contract as the consent-grant path
+    (services/ap2_signing.py): the signature is checked over the canonical JSON
+    of the request body with ``nonce`` injected from the ``X-AP2-Nonce`` header
+    and ``algorithm`` excluded. The signing agent is resolved from the consent
+    token (via verify_ap2_consent) and the signature is verified against that
+    agent's REGISTERED public key (agents.public_key) -- never a caller-supplied
+    key.
+
+    Ordering matters: the signature is verified BEFORE the nonce is consumed, so
+    a bad signature can never burn a victim's nonce (a replay-style DoS).
+
     Returns:
-        True if signature is valid
-    
+        True if the signature is valid.
+
     Raises:
-        HTTPException: If signature is invalid
+        HTTPException: 401 (missing/invalid signature, unknown/keyless agent,
+            invalid consent), 400 (missing nonce or unsupported algorithm),
+            409 (nonce replay).
     """
     signature = getattr(request.state, "signature", None) or \
         request.headers.get("X-AP2-Signature")
@@ -195,8 +208,20 @@ async def verify_ap2_signature(request: Request) -> bool:
             detail="Missing request signature"
         )
 
+    if not nonce:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Missing X-AP2-Nonce header"
+        )
+
+    from db.database import database
     from services.consent_service import consent_service
     from services.crypto_service import crypto_service
+    from services.ap2_signing import (
+        ALLOWED_AP2_ALGORITHMS,
+        build_ap2_signed_payload,
+        is_supported_ap2_algorithm,
+    )
 
     consent = await verify_ap2_consent(request)
     agent_id = consent["agent_id"]
@@ -215,6 +240,8 @@ async def verify_ap2_signature(request: Request) -> bool:
             detail="Agent has no registered public key for AP2 signature verification"
         )
 
+    # Parse the body for the signed payload. A missing/invalid body is treated as
+    # an empty object so the payload is still {nonce: ...} rather than an error.
     try:
         body = await request.json()
     except Exception:
@@ -222,8 +249,29 @@ async def verify_ap2_signature(request: Request) -> bool:
     if not isinstance(body, dict):
         body = {}
 
-    payload = {**body, "nonce": nonce}
     algorithm = body.get("algorithm", "ES256")
+    if not is_supported_ap2_algorithm(algorithm):
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=(
+                f"Unsupported algorithm: {algorithm} "
+                f"(expected one of {', '.join(ALLOWED_AP2_ALGORITHMS)})"
+            ),
+        )
+
+    payload = build_ap2_signed_payload(body, nonce)
+
+    # Reject an already-used nonce up front. This SELECT does not consume the
+    # nonce, so doing it before signature verification is safe.
+    existing = await database.fetch_one(
+        "SELECT 1 AS present FROM nonce_tracker WHERE nonce = :nonce",
+        {"nonce": nonce},
+    )
+    if existing:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail="Nonce already used (replay attack detected)"
+        )
 
     is_valid = crypto_service.verify_agent_signature(
         public_key=public_key,
@@ -238,6 +286,15 @@ async def verify_ap2_signature(request: Request) -> bool:
             detail="Invalid signature"
         )
 
+    # Consume the nonce only AFTER the signature verifies (mirrors create_consent
+    # and verify_ap2_nonce). A bad signature above returns without inserting.
+    await database.execute(
+        """INSERT INTO nonce_tracker (nonce, used_at, request_path)
+           VALUES (:nonce, NOW(), :path)""",
+        {"nonce": nonce, "path": request.url.path},
+    )
+
+    logger.info(f"✅ AP2 signature verified for agent {agent_id}")
     return True
 
 

@@ -126,9 +126,10 @@ async def grant_consent(request: Request):
     - X-AP2-Signature: Agent signature
     - X-AP2-Nonce: Unique nonce
     
-    The signature must be the base64 signature over the canonical JSON of
-    {"agent_id", "scope", "duration_hours", "nonce"}, made with the private
-    key matching the agent's registered public key (agents.public_key).
+    The signature must be the base64 signature over the canonical AP2 payload
+    (see services/ap2_signing.py) -- for this route that is the canonical JSON
+    of {agent_id, scope, duration_hours, nonce} -- made with the private key
+    matching the agent's registered public key (agents.public_key).
 
     Returns consent token for subsequent requests
     """
@@ -136,7 +137,9 @@ async def grant_consent(request: Request):
         consent_service,
         InvalidSignatureError,
         NonceReplayError,
+        UnsupportedAlgorithmError,
     )
+    from services.ap2_signing import ALLOWED_AP2_ALGORITHMS, is_supported_ap2_algorithm
 
     # Extract headers
     signature = request.headers.get("X-AP2-Signature")
@@ -161,10 +164,13 @@ async def grant_consent(request: Request):
             detail="Missing agent_id"
         )
 
-    if algorithm not in ("ES256", "Ed25519"):
+    if not is_supported_ap2_algorithm(algorithm):
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
-            detail=f"Unsupported algorithm: {algorithm} (expected ES256 or Ed25519)"
+            detail=(
+                f"Unsupported algorithm: {algorithm} "
+                f"(expected one of {', '.join(ALLOWED_AP2_ALGORITHMS)})"
+            ),
         )
 
     # Resolve the agent's registered public key — the signature is only
@@ -205,6 +211,11 @@ async def grant_consent(request: Request):
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
             detail="Invalid signature"
+        )
+    except UnsupportedAlgorithmError as e:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=str(e)
         )
     except NonceReplayError:
         raise HTTPException(

@@ -224,3 +224,19 @@ def test_unsupported_algorithm_rejected_400(client, fake_db, keypair):
 
     assert res.status_code == 400
     assert "Unsupported algorithm" in res.json()["detail"]
+
+
+def test_algorithm_selector_excluded_from_signed_payload(client, fake_db, keypair):
+    """
+    `algorithm` is a scheme selector, not signed content (services/ap2_signing.py).
+    A signature over the 4-key payload verifies even when the body advertises
+    `algorithm`, so the canonical contract stays identical to the middleware's.
+    """
+    private_key, _ = keypair
+    scope = ["read"]
+    signature = _sign_consent_payload(private_key, AGENT_ID, scope, 24, "nonce-009")
+
+    res = _grant(client, signature=signature, nonce="nonce-009", scope=scope,
+                 algorithm="ES256")
+
+    assert res.status_code == 200
