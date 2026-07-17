@@ -18,6 +18,7 @@ from middleware.rate_limiter import RateLimitMiddleware
 from middleware.usage_logger import UsageLoggerMiddleware
 from middleware.structured_logging import StructuredLoggingMiddleware
 from middleware.error_handler import ErrorHandlerMiddleware
+from middleware.ap2_security import AP2SecurityMiddleware
 from fastapi.staticfiles import StaticFiles
 from fastapi.responses import HTMLResponse, JSONResponse
 
@@ -761,6 +762,14 @@ app.add_middleware(StructuredLoggingMiddleware)
 # Add unified error handler middleware (formats errors + includes request id)
 app.add_middleware(ErrorHandlerMiddleware)
 
+# AP2 protocol security middleware. Enforces agent-consent / signature / nonce
+# headers on non-public /ap2/* routes. Inert unless ENABLE_AP2_ROUTES=true — the
+# same flag that mounts the AP2 router below — so this is a no-op by default and
+# never touches non-/ap2 traffic. Do NOT enable in any environment before working
+# through docs/AP2_ENABLEMENT.md (agent public-key registration + the sibling
+# verify_ap2_signature reconciliation).
+app.add_middleware(AP2SecurityMiddleware, enabled=settings.enable_ap2_routes)
+
 # Handle CORS preflight (OPTIONS) for any path in middleware rather than via a
 # catch-all `@app.options("/{full_path:path}")` route. A catch-all OPTIONS route
 # makes every path "match" by path, so non-OPTIONS requests to unknown paths
@@ -932,6 +941,20 @@ app.include_router(agent_protocol_test_router)  # Agent protocol testing (must b
 app.include_router(agent_protocol_router)  # Agent-specific protocol management
 app.include_router(employee_protocol_router)  # Employee protocol monitoring
 app.include_router(employee_routing_dashboard_router)  # Employee PSP routing dashboard
+
+# AP2 protocol surface (agent consent grant/revoke, transactions, X-402, wallet).
+# Gated by ENABLE_AP2_ROUTES (default false) so it stays off until the enablement
+# checklist in docs/AP2_ENABLEMENT.md is satisfied. POST /ap2/consent/grant
+# self-authenticates — it resolves agents.public_key and fails closed on an
+# unknown/keyless agent or bad signature — so the router is safe to mount without
+# relying on AP2SecurityMiddleware enforcement, and no route depends on the
+# not-yet-reconciled verify_ap2_signature helper.
+if settings.enable_ap2_routes:
+    from routes.ap2_routes import router as ap2_router
+    app.include_router(ap2_router)
+    logger.info("✅ AP2 protocol routes registered (ENABLE_AP2_ROUTES=true)")
+else:
+    logger.info("⏭️  AP2 protocol routes disabled (ENABLE_AP2_ROUTES=false)")
 
 # [Phase 4++] Dual-side routing and AP2 adapter
 app.include_router(routing_governance_router)  # Routing policy management

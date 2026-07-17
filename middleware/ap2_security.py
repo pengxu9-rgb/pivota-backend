@@ -45,6 +45,12 @@ class AP2SecurityMiddleware(BaseHTTPMiddleware):
         public_endpoints = [
             "/ap2/status",
             "/ap2/protocols",
+            # Consent bootstrap: /ap2/consent/grant is the endpoint that ISSUES a
+            # consent token, so it cannot require X-Agent-Consent. It authenticates
+            # itself by verifying X-AP2-Signature against the agent's registered
+            # public key (agents.public_key) and fails closed, so it is exempt from
+            # the middleware's consent-token requirement rather than left unguarded.
+            "/ap2/consent/grant",
         ]
         
         # Check if this is a public endpoint
