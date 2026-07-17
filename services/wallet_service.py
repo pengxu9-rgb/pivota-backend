@@ -129,6 +129,36 @@ class WalletService:
             logger.error(f"Error fetching agent wallet: {e}")
             return None
 
+    async def verify_agent_wallet(
+        self,
+        agent_id: str,
+        wallet_address: str
+    ) -> bool:
+        """
+        Authorize an agent-supplied wallet address for a payment action.
+
+        Returns True only when the address is registered to THIS agent and the
+        wallet is active. A caller-supplied address that belongs to another
+        agent, is unknown, or is not active must not be authorized. Fails
+        closed (returns False) on missing input or any query error.
+        """
+        if not agent_id or not wallet_address:
+            return False
+
+        try:
+            wallet = await database.fetch_one(
+                """SELECT wallet_id FROM agent_wallets
+                   WHERE agent_id = :agent_id
+                   AND address = :address
+                   AND status = 'active'
+                   LIMIT 1""",
+                {"agent_id": agent_id, "address": wallet_address}
+            )
+            return wallet is not None
+        except Exception as e:
+            logger.error(f"Error verifying agent wallet: {e}")
+            return False
+
 
 # Singleton instance
 wallet_service = WalletService()

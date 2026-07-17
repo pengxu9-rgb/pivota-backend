@@ -10,8 +10,6 @@ import json
 import sys
 from datetime import datetime, timedelta
 from pathlib import Path
-from unittest.mock import AsyncMock
-
 import pytest
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
@@ -26,6 +24,7 @@ if str(BACKEND_ROOT) not in sys.path:
 
 AGENT_ID = "agent_txn_test"
 CONSENT_TOKEN = "consent_txn_token"
+WALLET_ADDRESS = "0xWALLET"
 
 
 def _keypair():
@@ -45,9 +44,11 @@ def _sign(priv, payload: dict) -> str:
 
 
 class FakeDB:
-    def __init__(self, agents, consents):
+    def __init__(self, agents, consents, agent_wallets=None):
         self.agents = agents
         self.consents = consents
+        # (agent_id, address) pairs that are registered + active for the agent.
+        self.agent_wallets = set(agent_wallets or set())
         self.used_nonces = set()
         self.tx_inserts = []
         self.tx_updates = []
@@ -58,6 +59,10 @@ class FakeDB:
         if "FROM agents" in query:
             aid = values["agent_id"]
             return {"public_key": self.agents[aid]} if aid in self.agents else None
+        if "FROM agent_wallets" in query:
+            # WalletService.verify_agent_wallet ownership + active-status check.
+            key = (values.get("agent_id"), values.get("address"))
+            return {"wallet_id": "w_1"} if key in self.agent_wallets else None
         if "FROM nonce_tracker" in query:
             return {"present": 1} if values["nonce"] in self.used_nonces else None
         return None
@@ -89,7 +94,11 @@ def keypair():
 @pytest.fixture
 def fake_db(keypair, monkeypatch):
     _, pub = keypair
-    fake = FakeDB(agents={AGENT_ID: pub}, consents={CONSENT_TOKEN: _active_consent()})
+    fake = FakeDB(
+        agents={AGENT_ID: pub},
+        consents={CONSENT_TOKEN: _active_consent()},
+        agent_wallets={(AGENT_ID, WALLET_ADDRESS)},
+    )
     from db.database import database
     monkeypatch.setattr(database, "fetch_one", fake.fetch_one)
     monkeypatch.setattr(database, "execute", fake.execute)
@@ -171,27 +180,35 @@ def test_initiate_replayed_nonce_rejected_409(client, fake_db, keypair):
 
 # ---- confirm ---------------------------------------------------------------
 
-def test_confirm_valid_signature_passes_guard_and_completes(client, fake_db, keypair, monkeypatch):
+def test_confirm_valid_signature_passes_guard_and_completes(client, fake_db, keypair):
     priv, _ = keypair
-    # NOTE: WalletService has no `verify_agent_wallet` method — the confirm route
-    # is broken downstream of the signature check (pre-existing bug, tracked
-    # separately). We inject it (raising=False) purely to prove that a VALID
-    # signature passes the new Depends(verify_ap2_signature) guard and control
-    # reaches the route body.
-    from services.wallet_service import wallet_service
-    monkeypatch.setattr(wallet_service, "verify_agent_wallet",
-                        AsyncMock(return_value=True), raising=False)
-
+    # A valid signature passes the Depends(verify_ap2_signature) guard, and the
+    # confirming wallet (registered + active in fake_db) is authorized by the
+    # real WalletService.verify_agent_wallet — so the transaction completes.
     body = {"transaction_id": "ap2_txn_x"}
     signature = _sign(priv, {**body, "nonce": "cf-001"})
 
     res = client.post("/ap2/transaction/confirm", json=body,
-                      headers=_headers(signature, "cf-001", wallet="0xWALLET"))
+                      headers=_headers(signature, "cf-001", wallet=WALLET_ADDRESS))
 
     assert res.status_code == 200
     assert res.json()["status"] == "completed"
     assert len(fake_db.tx_updates) == 1
     assert "cf-001" in fake_db.used_nonces
+
+
+def test_confirm_valid_signature_unregistered_wallet_rejected_403(client, fake_db, keypair):
+    priv, _ = keypair
+    # Signature is valid (passes the guard), but the wallet is NOT registered to
+    # this agent, so the real verify_agent_wallet rejects it: 403, no update.
+    body = {"transaction_id": "ap2_txn_x"}
+    signature = _sign(priv, {**body, "nonce": "cf-003"})
+
+    res = client.post("/ap2/transaction/confirm", json=body,
+                      headers=_headers(signature, "cf-003", wallet="0xNOTMINE"))
+
+    assert res.status_code == 403
+    assert fake_db.tx_updates == []
 
 
 def test_confirm_bad_signature_rejected_no_update(client, fake_db):
