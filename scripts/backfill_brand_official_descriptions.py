@@ -40,6 +40,7 @@ from db.database import database  # noqa: E402
 from services.agent_pdp_view_assembler import (  # noqa: E402
     refresh_agent_pdp_view_for_content_key,
 )
+from services.catalog_enrichment_agent.bulk_writer import is_transport_error  # noqa: E402
 from services.curated_brand_feed import (  # noqa: E402
     body_html_to_text,
     fetch_shopify_products,
@@ -84,8 +85,46 @@ def handle_from_url(canonical_url: str) -> tuple[str, str]:
     return host, handle
 
 
+def _should_heal(exc: BaseException) -> bool:
+    """Transport failure OR the databases-lib poisoned-connection state (a bare
+    AssertionError 'Connection is already acquired') — both mean the shared
+    connection is unusable and a reconnect can save the rest of the batch."""
+    return is_transport_error(exc) or "already acquired" in str(exc)
+
+
+async def _reconnect() -> None:
+    try:
+        await database.disconnect()
+    except Exception:  # noqa: BLE001
+        pass
+    for attempt in range(1, 6):
+        try:
+            await database.connect()
+            return
+        except Exception as exc:  # noqa: BLE001
+            print(f"  (reconnect attempt {attempt} failed: {str(exc)[:100]})")
+            await asyncio.sleep(5 * attempt)
+    raise RuntimeError("could not re-establish DB connection")
+
+
 async def _load_body_map(domain: str, max_products: int) -> Dict[str, str]:
-    products = await fetch_shopify_products(domain, max_products=max_products)
+    # fetch_shopify_products swallows errors into [] — a transient network
+    # failure would silently mark a whole domain "not_in_feed" (4 domains, 292
+    # rows on the first prod run). It also returns a PARTIAL list when
+    # pagination dies mid-feed, which looks like an exact multiple of the
+    # 250-item page size. Retry both shapes before accepting the result.
+    products: List[Dict[str, Any]] = []
+    for attempt in range(1, 4):
+        products = await fetch_shopify_products(domain, max_products=max_products)
+        suspect_truncated = (
+            products and len(products) < max_products and len(products) % 250 == 0
+        )
+        if products and not suspect_truncated:
+            break
+        if attempt < 3:
+            shape = "empty" if not products else f"suspiciously page-aligned ({len(products)})"
+            print(f"  ({domain}: {shape} feed on attempt {attempt} — retrying)")
+            await asyncio.sleep(10 * attempt)
     return {
         str(p.get("handle") or "").strip(): body_html_to_text(p.get("body_html"))
         for p in products
@@ -95,7 +134,16 @@ async def _load_body_map(domain: str, max_products: int) -> Dict[str, str]:
 
 async def run(apply: bool, domains_filter: List[str], max_products: int) -> int:
     await database.connect()
-    rows = [dict(r) for r in await database.fetch_all(_SELECT_ROWS)]
+    rows: List[Dict[str, Any]] = []
+    for attempt in range(1, 4):
+        try:
+            rows = [dict(r) for r in await database.fetch_all(_SELECT_ROWS)]
+            break
+        except Exception as exc:  # noqa: BLE001
+            if not _should_heal(exc) or attempt == 3:
+                raise
+            print(f"  (population fetch attempt {attempt} failed: {str(exc)[:100]} — reconnecting)")
+            await _reconnect()
     by_domain: Dict[str, List[Dict[str, Any]]] = {}
     foreign_domain = 0
     for r in rows:
@@ -141,19 +189,26 @@ async def run(apply: bool, domains_filter: List[str], max_products: int) -> int:
             totals[new_stage] = totals.get(new_stage, 0) + 1
             filled += 1
             if apply:
-                try:
-                    await database.execute(_UPDATE_ROW, {
-                        "description": body,
-                        "stage": new_stage,
-                        "product_key": r["product_key"],
-                    })
-                    if r.get("content_key"):
-                        touched_cks.append(str(r["content_key"]))
-                except Exception as exc:  # noqa: BLE001 — one bad row must not
-                    # abort the domain; report and continue.
-                    totals["update_failed"] += 1
-                    print(f"  WARN update failed pk={r['product_key']}: "
-                          f"{type(exc).__name__}: {str(exc)[:150]}")
+                for attempt in (1, 2):
+                    try:
+                        await database.execute(_UPDATE_ROW, {
+                            "description": body,
+                            "stage": new_stage,
+                            "product_key": r["product_key"],
+                        })
+                        if r.get("content_key"):
+                            touched_cks.append(str(r["content_key"]))
+                        break
+                    except Exception as exc:  # noqa: BLE001 — heal a poisoned
+                        # connection and retry once; a bad row must not abort
+                        # the domain (this is the primary write path).
+                        if attempt == 1 and _should_heal(exc):
+                            await _reconnect()
+                            continue
+                        totals["update_failed"] += 1
+                        print(f"  WARN update failed pk={r['product_key']}: "
+                              f"{type(exc).__name__}: {str(exc)[:150]}")
+                        break
         totals["filled"] += filled
         totals["no_body"] += no_body
         totals["not_in_feed"] += not_in_feed
@@ -164,11 +219,20 @@ async def run(apply: bool, domains_filter: List[str], max_products: int) -> int:
         distinct = sorted(set(touched_cks))
         print(f"[view] refreshing {len(distinct)} content_key view(s) ...")
         for ck in distinct:
-            try:
-                await refresh_agent_pdp_view_for_content_key(ck, refresh_source=REFRESH_SOURCE)
-            except Exception as exc:  # noqa: BLE001 — isolate per key
-                totals["refresh_failed"] += 1
-                print(f"  WARN view refresh failed for {ck}: {str(exc)[:120]}")
+            for attempt in (1, 2):
+                try:
+                    await refresh_agent_pdp_view_for_content_key(ck, refresh_source=REFRESH_SOURCE)
+                    break
+                except Exception as exc:  # noqa: BLE001 — a transport failure
+                    # poisons the pinned connection ("Connection is already
+                    # acquired" cascade, 511 refreshes lost on the first prod
+                    # run) — heal it and retry once before skipping the key.
+                    if attempt == 1 and _should_heal(exc):
+                        await _reconnect()
+                        continue
+                    totals["refresh_failed"] += 1
+                    print(f"  WARN view refresh failed for {ck}: {str(exc)[:120]}")
+                    break
 
     await database.disconnect()
     print(f"[done] {totals}")

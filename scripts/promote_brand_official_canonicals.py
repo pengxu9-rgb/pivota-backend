@@ -44,6 +44,10 @@ from typing import Any, Dict, List
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from db.database import database  # noqa: E402
+from services.agent_pdp_view_assembler import (  # noqa: E402
+    refresh_agent_pdp_view_for_content_key,
+)
+from services.catalog_enrichment_agent.bulk_writer import is_transport_error  # noqa: E402
 from services.catalog_row_trust_upserter import upsert_catalog_row_trust_many  # noqa: E402
 from services.external_seed_servability import build_servable_quality_payload  # noqa: E402
 from services.index_pipeline_state_service import recompute_serving_eligibility  # noqa: E402
@@ -51,11 +55,14 @@ from services.product_quality_service import full_quality_eval, preview_quality 
 
 PROMOTION_REASON = "brand_official_promotion_v1"
 TRUST_CHUNK = 100
+PAGE_SIZE = 150
 
 # Population: live enrichment-minted rows that do not yet hold a
 # serving-eligible index_pipeline_state row. Includes rows with NO ips row at
-# all (the common case — nothing creates one at ingest).
-_SELECT_ROWS = """
+# all (the common case — nothing creates one at ingest). Keyset-paginated:
+# one 969-row fetch of description-wide rows over the ~530ms proxy died
+# mid-stream repeatedly (2026-07-17); small pages + reconnect survive weather.
+_SELECT_ROWS_PAGE = """
     SELECT p.product_key, p.content_key, p.source_product_id, p.merchant_id,
            p.platform, p.title, p.description, p.brand, p.product_type,
            p.category, p.image_url, p.pdp_lifecycle_stage,
@@ -69,10 +76,73 @@ _SELECT_ROWS = """
     WHERE p.source_system = 'catalog_enrichment_agent_v1'
       AND p.sync_status = 'live'
       AND p.content_key IS NOT NULL
+      AND p.product_key > :after
       AND NOT EXISTS (SELECT 1 FROM index_pipeline_state i
                        WHERE i.content_key = p.content_key
                          AND i.serving_eligible = TRUE)
+    ORDER BY p.product_key
+    LIMIT :page
 """
+
+# Step 0 (APV heal): the serving classifier reads agent_pdp_view.description,
+# so a cohort row whose catalog description is real but whose view row is
+# missing/stale would classify short_description forever. Refresh exactly those.
+_SELECT_STALE_APV = """
+    SELECT DISTINCT p.content_key
+    FROM catalog_products p
+    LEFT JOIN agent_pdp_view a ON a.content_key = p.content_key
+    WHERE p.source_system = 'catalog_enrichment_agent_v1'
+      AND p.sync_status = 'live'
+      AND p.content_key IS NOT NULL
+      AND length(coalesce(p.description, '')) >= 50
+      AND (a.content_key IS NULL OR length(coalesce(a.description, '')) < 50)
+"""
+
+
+def _should_heal(exc: BaseException) -> bool:
+    """Transport failure OR the databases-lib poisoned-connection state (a bare
+    AssertionError 'Connection is already acquired') — both mean the shared
+    connection is unusable and a reconnect can save the rest of the batch."""
+    return is_transport_error(exc) or "already acquired" in str(exc)
+
+
+async def _reconnect() -> None:
+    try:
+        await database.disconnect()
+    except Exception:  # noqa: BLE001
+        pass
+    for attempt in range(1, 6):
+        try:
+            await database.connect()
+            return
+        except Exception as exc:  # noqa: BLE001
+            print(f"  (reconnect attempt {attempt} failed: {str(exc)[:100]})")
+            await asyncio.sleep(5 * attempt)
+    raise RuntimeError("could not re-establish DB connection")
+
+
+async def _fetch_all_hardened(sql: str, values: Dict[str, Any] | None = None) -> List[Dict[str, Any]]:
+    for attempt in range(1, 5):
+        try:
+            return [dict(r) for r in await database.fetch_all(sql, values)]
+        except Exception as exc:  # noqa: BLE001
+            if not _should_heal(exc) or attempt == 4:
+                raise
+            print(f"  (fetch transport error, attempt {attempt}: {str(exc)[:100]} — reconnecting)")
+            await _reconnect()
+    return []
+
+
+async def _fetch_population(limit: int) -> List[Dict[str, Any]]:
+    rows: List[Dict[str, Any]] = []
+    after = ""
+    while True:
+        page = await _fetch_all_hardened(_SELECT_ROWS_PAGE, {"after": after, "page": PAGE_SIZE})
+        rows.extend(page)
+        if len(page) < PAGE_SIZE or (limit and len(rows) >= limit):
+            break
+        after = str(page[-1]["product_key"])
+    return rows[:limit] if limit else rows
 
 _BLOCKER_CENSUS = """
     SELECT i.serving_eligible, i.blocker_code, count(*) AS n
@@ -105,9 +175,30 @@ def _payload_for(row: Dict[str, Any]) -> Dict[str, Any]:
 
 async def run(apply: bool, limit: int) -> int:
     await database.connect()
-    rows = [dict(r) for r in await database.fetch_all(_SELECT_ROWS)]
-    if limit:
-        rows = rows[:limit]
+
+    # 0. APV heal — refresh views whose description lags the catalog row.
+    if apply:
+        stale_cks = [r["content_key"] for r in await _fetch_all_hardened(_SELECT_STALE_APV)]
+        print(f"[apv-heal] {len(stale_cks)} content_key view(s) missing/stale vs catalog description")
+        healed = 0
+        for i, ck in enumerate(stale_cks, 1):
+            for attempt in (1, 2):
+                try:
+                    await refresh_agent_pdp_view_for_content_key(ck, refresh_source=PROMOTION_REASON)
+                    healed += 1
+                    break
+                except Exception as exc:  # noqa: BLE001 — heal the connection, then
+                    # one retry; a still-failing ck stays stale (honest-blocked later).
+                    if attempt == 1 and _should_heal(exc):
+                        await _reconnect()
+                        continue
+                    print(f"  WARN apv heal failed for {ck}: {str(exc)[:120]}")
+                    break
+            if i % 50 == 0:
+                print(f"  [apv-heal] {i}/{len(stale_cks)}")
+        print(f"[apv-heal] refreshed {healed}/{len(stale_cks)}")
+
+    rows = await _fetch_population(limit)
     print(f"[population] {len(rows)} enrichment-minted rows without serving-eligible IPS "
           f"(apply={apply})")
 
@@ -126,18 +217,25 @@ async def run(apply: bool, limit: int) -> int:
     # 1. quality snapshots (idempotent: latest snapshot wins on read).
     scored = 0
     for i, row in enumerate(rows, 1):
-        try:
-            await full_quality_eval(
-                merchant_id=str(row["merchant_id"]),
-                platform=str(row["platform"]),
-                platform_product_id=str(row["source_product_id"]),
-                geo_code="default",
-                payload=_payload_for(row),
-                score_source_backed_components=True,
-            )
-            scored += 1
-        except Exception as exc:  # noqa: BLE001 — one row must not stop the batch
-            print(f"  WARN quality eval failed pk={row['product_key']}: {str(exc)[:150]}")
+        for attempt in (1, 2):
+            try:
+                await full_quality_eval(
+                    merchant_id=str(row["merchant_id"]),
+                    platform=str(row["platform"]),
+                    platform_product_id=str(row["source_product_id"]),
+                    geo_code="default",
+                    payload=_payload_for(row),
+                    score_source_backed_components=True,
+                )
+                scored += 1
+                break
+            except Exception as exc:  # noqa: BLE001 — one row must not stop the
+                # batch; a transport error heals the connection and retries once.
+                if attempt == 1 and _should_heal(exc):
+                    await _reconnect()
+                    continue
+                print(f"  WARN quality eval failed pk={row['product_key']}: {str(exc)[:150]}")
+                break
         if i % 50 == 0:
             print(f"  [quality] {i}/{len(rows)}")
 
@@ -146,12 +244,18 @@ async def run(apply: bool, limit: int) -> int:
     eligible = 0
     recompute_failed = 0
     for i, ck in enumerate(cks, 1):
-        try:
-            if await recompute_serving_eligibility(ck, reason=PROMOTION_REASON):
-                eligible += 1
-        except Exception as exc:  # noqa: BLE001 — isolate per key
-            recompute_failed += 1
-            print(f"  WARN ips recompute failed ck={ck}: {str(exc)[:150]}")
+        for attempt in (1, 2):
+            try:
+                if await recompute_serving_eligibility(ck, reason=PROMOTION_REASON):
+                    eligible += 1
+                break
+            except Exception as exc:  # noqa: BLE001 — isolate per key
+                if attempt == 1 and _should_heal(exc):
+                    await _reconnect()
+                    continue
+                recompute_failed += 1
+                print(f"  WARN ips recompute failed ck={ck}: {str(exc)[:150]}")
+                break
         if i % 50 == 0:
             print(f"  [ips] {i}/{len(cks)} (eligible so far: {eligible})")
 
@@ -160,17 +264,23 @@ async def run(apply: bool, limit: int) -> int:
     trusted = 0
     for start in range(0, len(pks), TRUST_CHUNK):
         chunk = pks[start:start + TRUST_CHUNK]
-        try:
-            trusted += await upsert_catalog_row_trust_many(db=database, product_keys=chunk)
-        except Exception as exc:  # noqa: BLE001
-            print(f"  WARN trust chunk failed ({start}..): {str(exc)[:150]}")
+        for attempt in (1, 2):
+            try:
+                trusted += await upsert_catalog_row_trust_many(db=database, product_keys=chunk)
+                break
+            except Exception as exc:  # noqa: BLE001
+                if attempt == 1 and _should_heal(exc):
+                    await _reconnect()
+                    continue
+                print(f"  WARN trust chunk failed ({start}..): {str(exc)[:150]}")
+                break
 
     # Census — what actually happened, straight from the tables.
     print(f"[applied] quality={scored}/{len(rows)}  ips_recomputed={len(cks) - recompute_failed}"
           f"/{len(cks)} serving_eligible={eligible}  trust_writes={trusted}")
-    for r in await database.fetch_all(_BLOCKER_CENSUS, {"cks": cks}):
+    for r in await _fetch_all_hardened(_BLOCKER_CENSUS, {"cks": cks}):
         print(f"  ips  {dict(r)}")
-    for r in await database.fetch_all(_TRUST_CENSUS, {"pks": pks}):
+    for r in await _fetch_all_hardened(_TRUST_CENSUS, {"pks": pks}):
         print(f"  trust {dict(r)}")
 
     await database.disconnect()

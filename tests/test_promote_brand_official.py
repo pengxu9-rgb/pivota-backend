@@ -58,9 +58,16 @@ async def test_apply_isolates_failures_and_orders_stages(monkeypatch, capsys):
         async def connect(self): pass
         async def disconnect(self): pass
         async def fetch_all(self, sql: str, values: Any = None):
+            if "agent_pdp_view" in sql:
+                return []  # apv-heal population (step 0): nothing stale
             if "FROM catalog_products" in sql:
+                if values and values.get("after"):
+                    return []  # keyset pagination: single page
                 return rows
             return []  # censuses
+
+    async def fake_refresh(ck: str, *, refresh_source: str):
+        calls.append(("apv", ck))
 
     async def fake_eval(**kw: Any):
         calls.append(("quality", kw["platform_product_id"]))
@@ -79,6 +86,7 @@ async def test_apply_isolates_failures_and_orders_stages(monkeypatch, capsys):
         return len(list(product_keys))
 
     monkeypatch.setattr(promote, "database", FakeDB())
+    monkeypatch.setattr(promote, "refresh_agent_pdp_view_for_content_key", fake_refresh)
     monkeypatch.setattr(promote, "full_quality_eval", fake_eval)
     monkeypatch.setattr(promote, "recompute_serving_eligibility", fake_recompute)
     monkeypatch.setattr(promote, "upsert_catalog_row_trust_many", fake_trust)
