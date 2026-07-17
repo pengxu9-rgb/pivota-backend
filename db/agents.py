@@ -351,6 +351,37 @@ async def create_agent(
     }
 
 
+async def get_agent_by_did(did: str) -> Optional[Dict[str, Any]]:
+    """
+    Look up an agent by its AP2 DID (agents.did, migration 183 / ADR-012).
+
+    The DID is the agent's self-sovereign external identity on the signed rail;
+    this maps it back to the internal agent row (for x402_enabled, wallet
+    binding, and rate/quota limits). Returns the row as a dict, or None if no
+    agent claims this DID. ``agent_id`` remains the internal identifier.
+    """
+    if not did:
+        return None
+    row = await database.fetch_one(
+        "SELECT * FROM agents WHERE did = :did",
+        {"did": did},
+    )
+    return dict(row) if row else None
+
+
+async def set_agent_did(agent_id: str, did: str) -> None:
+    """
+    Associate a DID with an existing agent (agents.did). Overwrites any prior
+    value (DID rotation for that agent). The DID is unique across agents
+    (partial unique index, migration 183), so a DID already claimed by another
+    agent raises a uniqueness error at the DB layer — callers must handle it.
+    """
+    await database.execute(
+        "UPDATE agents SET did = :did, updated_at = NOW() WHERE agent_id = :agent_id",
+        {"did": did, "agent_id": agent_id},
+    )
+
+
 async def get_agent_by_key(api_key: str, metrics_out: Optional[Dict[str, Any]] = None) -> Optional[Dict[str, Any]]:
     """通过 API Key 获取 Agent（用于认证）
 
