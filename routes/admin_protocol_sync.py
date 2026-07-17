@@ -461,9 +461,13 @@ async def cleanup_old_nonces(days: int = 7):
     
     Admin only - no authentication implemented yet
     """
+    # :days must be bound as an integer and multiplied by a 1-day interval.
+    # Interpolating it inside the INTERVAL string literal ('INTERVAL ':days days'')
+    # never binds — Postgres parses the literal ":days days" and raises
+    # "invalid input syntax for type interval", so the endpoint always errored.
     delete_query = """
         DELETE FROM nonce_tracker
-        WHERE used_at < NOW() - INTERVAL ':days days'
+        WHERE used_at < NOW() - (:days * INTERVAL '1 day')
     """
     
     result = await database.execute(delete_query, {"days": days})
