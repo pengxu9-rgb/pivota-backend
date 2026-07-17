@@ -25,9 +25,13 @@ true in any environment.
   - replayed nonce → `409 "Nonce already used"`.
   It does **not** depend on `AP2SecurityMiddleware` enforcement, so mounting the
   router is safe on its own.
-- **No route uses `Depends(verify_ap2_signature)`.** The only reference to that
-  helper is a docstring example, so its known problems (below) do not affect any
-  live route today.
+- **`verify_ap2_signature` is reconciled, and the transaction write routes use it
+  safely.** As of #1441 the `Depends(verify_ap2_signature)` helper enforces the
+  same canonical signed-payload contract as the grant path
+  (`services/ap2_signing.py`), resolves the agent from the consent token, verifies
+  against the registered `agents.public_key`, and checks the signature *before*
+  consuming the nonce (no replay-DoS). `POST /ap2/transaction/initiate` and
+  `/ap2/transaction/confirm` adopt it. (This was Blocker 2 — see below.)
 - **The middleware exempts the consent bootstrap.** `/ap2/consent/grant` is in
   the middleware's public list, so enabling enforcement does not block the very
   endpoint that issues consent tokens.
@@ -77,22 +81,21 @@ signed payload is the canonical JSON of
 separators) — see `services/consent_service.py::create_consent` and the
 `_sign_consent_payload` helper in `tests/test_ap2_consent_grant_route.py`.
 
-### 2. Reconcile `verify_ap2_signature` before any route adopts it
+### 2. ~~Reconcile `verify_ap2_signature` before any route adopts it~~ — ✅ RESOLVED (#1441)
 
-`middleware/ap2_security.py::verify_ap2_signature` (the `Depends` helper — not
-the grant path) is **not** safe to attach to a route yet. Coordinate with the
-sibling AP2 follow-up first:
+**Resolved** by #1441 (with follow-ups #1443 — `nonce_tracker` schema reconcile,
+and #1445 — `cleanup_old_nonces` interval param bind).
+`middleware/ap2_security.py::verify_ap2_signature` now:
 
-- **Inconsistent signed-payload contract.** It verifies over
-  `{**request_body, "nonce": nonce}` (the whole body), whereas the grant path /
-  `create_consent` verify over the fixed canonical subset
-  `{"agent_id", "scope", "duration_hours", "nonce"}`. An agent cannot satisfy
-  both with one signature. Pick one contract and make both sides use it.
-- **No nonce-replay check.** `verify_ap2_signature` verifies the signature but
-  never records/consumes the nonce (`verify_ap2_nonce` is a separate call). A
-  route guarded only by this helper would be replayable.
+- **Uses one canonical signed-payload contract** shared with the grant path via
+  `services/ap2_signing.py` — the earlier split (`{**body, "nonce"}` in the helper
+  vs the canonical subset in `create_consent`) is gone, so an agent signs one
+  payload for both paths.
+- **Guards against nonce replay**, verifying the signature *before* the nonce is
+  consumed so a bad signature can't burn a victim's nonce.
 
-Until both are fixed, do not add `Depends(verify_ap2_signature)` to any route.
+`POST /ap2/transaction/initiate` and `/ap2/transaction/confirm` now adopt
+`Depends(verify_ap2_signature)`. No further action for this blocker.
 
 ### 3. Reconcile the middleware header contract for the other write routes
 
@@ -103,8 +106,10 @@ with that requirement — e.g. `POST /ap2/consent/revoke` sends only
 `X-Agent-Consent`, so with enforcement on it would be rejected for a missing
 signature/nonce. Before enabling, either align each route's header usage with
 the middleware, or narrow the middleware's per-route requirements. Confirm the
-intended contract for: `revoke`, `transaction/initiate`, `transaction/confirm`,
-`x402/exchange`, `wallet/balance`.
+intended contract for: `revoke`, `x402/exchange`, `wallet/balance`.
+(`transaction/initiate` and `transaction/confirm` were reconciled in #1441 — they
+enforce consent + signature + nonce via `Depends(verify_ap2_signature)`,
+consistent with the middleware.)
 
 ### 4. Confirm the backing tables exist in the target environment
 
@@ -123,9 +128,9 @@ confirmed their blocker is cleared:
 - [ ] **Agent key registration** — owner confirms a path writes `agents.public_key`
       (or the pilot cohort is backfilled) and the verify SQL returns `has_key = true`
       for every AP2 agent. (Blocker 1 — [#1442](https://github.com/pengxu9-rgb/pivota-backend/issues/1442))
-- [ ] **`verify_ap2_signature` reconciliation** — the sibling AP2 follow-up owner
-      confirms the payload-contract + nonce-replay issues are resolved, or confirms
-      no enabled route depends on the helper. (Blocker 2)
+- [x] **`verify_ap2_signature` reconciliation** — ✅ resolved in #1441: one
+      canonical contract (`services/ap2_signing.py`) + nonce-replay guard; the
+      transaction routes adopt the helper. (Blocker 2)
 - [ ] **Middleware header contract** — owner confirms each non-public write route
       (`revoke`, `transaction/*`, `x402/exchange`, `wallet/balance`) is consistent
       with the middleware's required headers for the pilot scope. (Blocker 3)
