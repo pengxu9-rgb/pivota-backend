@@ -10,6 +10,7 @@ import os
 
 from cryptography.hazmat.primitives import hashes, serialization
 from cryptography.hazmat.primitives.asymmetric import ec, ed25519
+from cryptography.hazmat.primitives.asymmetric.utils import encode_dss_signature
 from cryptography.hazmat.primitives.ciphers.aead import AESGCM
 from cryptography.exceptions import InvalidSignature
 
@@ -50,7 +51,41 @@ class CryptoService:
             Canonical JSON string
         """
         return json.dumps(data, sort_keys=True, separators=(',', ':'))
-    
+
+    @staticmethod
+    def _verify_es256(public_key_obj, signature_bytes: bytes, message_bytes: bytes) -> bool:
+        """
+        Verify an ES256 (ECDSA P-256 / SHA-256) signature accepting BOTH encodings:
+
+        - **ASN.1 DER** — OpenSSL's default and what this service's own
+          ``sign_receipt`` produces; and
+        - **raw r||s (IEEE P1363)** — a fixed 64-byte concatenation, the form
+          emitted by JOSE (RFC 7515), WebCrypto, and essentially every
+          standards-based DID/VC agent.
+
+        The bytes are tried as DER first, then — only for a 64-byte signature —
+        as raw r||s converted to DER. Returns True on the first that verifies.
+        No false negatives: a genuine DER signature verifies on the first branch,
+        a genuine raw one on the second; the 64-byte raw form is not valid DER,
+        so the ordering can't mask it. Invalid signatures fail both and return
+        False (never raises).
+        """
+        candidates = [signature_bytes]
+        if len(signature_bytes) == 64:
+            r = int.from_bytes(signature_bytes[:32], "big")
+            s = int.from_bytes(signature_bytes[32:], "big")
+            candidates.append(encode_dss_signature(r, s))
+
+        for candidate in candidates:
+            try:
+                public_key_obj.verify(candidate, message_bytes, ec.ECDSA(hashes.SHA256()))
+                return True
+            except (InvalidSignature, ValueError):
+                # ValueError: `candidate` wasn't parseable as DER (e.g. raw bytes
+                # fed to the DER branch) — try the next candidate.
+                continue
+        return False
+
     def verify_agent_signature(
         self,
         public_key: str,
@@ -95,19 +130,17 @@ class CryptoService:
                         logger.error("Public key is not an EC key for ES256")
                         return False
                     
-                    # Verify signature
-                    public_key_obj.verify(
-                        signature_bytes,
-                        message_bytes,
-                        ec.ECDSA(hashes.SHA256())
-                    )
-                    
-                    logger.info("✅ ES256 signature verified successfully")
-                    return True
-                    
-                except InvalidSignature:
+                    # Accept BOTH ASN.1 DER and raw r||s (JOSE / WebCrypto / DID,
+                    # 64-byte) ES256 signatures. Standards-based external agents —
+                    # exactly the callers the AP2 signed rail targets — emit the
+                    # raw form, which the DER-only verify silently rejected.
+                    if self._verify_es256(public_key_obj, signature_bytes, message_bytes):
+                        logger.info("✅ ES256 signature verified successfully")
+                        return True
+
                     logger.warning("ES256 signature verification failed: Invalid signature")
                     return False
+
                 except Exception as e:
                     logger.error(f"ES256 verification error: {e}")
                     return False
