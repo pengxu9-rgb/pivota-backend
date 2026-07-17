@@ -216,9 +216,15 @@ def _require_str(mandate: Dict[str, Any], field: str, label: str) -> str:
 
 def _as_decimal(value: object, field: str) -> Decimal:
     try:
-        return Decimal(str(value))
+        parsed = Decimal(str(value))
     except (InvalidOperation, TypeError, ValueError):
         raise MandateError(f"{field} is not a valid amount")
+    # Reject Infinity / -Infinity / NaN — an amount must be a finite number, else
+    # 'Infinity' acts as a blank cheque and NaN can escape as a non-MandateError
+    # in downstream comparisons.
+    if not parsed.is_finite():
+        raise MandateError(f"{field} must be a finite amount")
+    return parsed
 
 
 async def verify_mandate_chain(
@@ -262,6 +268,17 @@ async def verify_mandate_chain(
         raise MandateError(
             "verify_mandate_chain requires trusted_issuers (deny by default)"
         )
+    # Symmetric to the trusted_issuers guard: a missing agent_did would pass
+    # expected_subject=None into verify_mandate, whose binding check is a
+    # permissive default (skip when None) — making the subject binding a no-op on
+    # ALL THREE mandates. Require a real DID so a chain can only ever bind to a
+    # concrete presenting agent.
+    if not is_did(agent_did):
+        raise MandateError(
+            "verify_mandate_chain requires a DID agent_did (subject binding)"
+        )
+    if not action:
+        raise MandateError("verify_mandate_chain requires an action")
 
     # 1. Verify each mandate individually, bound to the presenting agent.
     verified: Dict[str, Dict[str, Any]] = {}
@@ -299,6 +316,8 @@ async def verify_mandate_chain(
     # 3. Amount + currency consistency across cart and payment.
     cart_total = _as_decimal(cart.get("total"), "cart.total")
     payment_amount = _as_decimal(payment.get("amount"), "payment.amount")
+    if cart_total <= 0:
+        raise MandateError("cart.total must be a positive amount")
     if payment_amount != cart_total:
         raise MandateError(
             f"payment.amount {payment_amount} != cart.total {cart_total}"
@@ -308,11 +327,19 @@ async def verify_mandate_chain(
         raise MandateError("payment.currency does not match cart.currency")
     cart_merchant = _require_str(cart, "merchant_id", "cart")
 
-    # 4. Deny by default: the Intent MUST carry constraints, and the concrete
-    # cart must satisfy them (max_amount, currency, merchants, actions).
+    # 4. Deny by default: the Intent MUST carry constraints, and for a MONETARY
+    # chain the money-relevant dimensions must be present — an omitted ceiling is
+    # otherwise a signed blank cheque, and a ceiling without a currency is
+    # meaningless. (merchants/actions stay optional: an intent may legitimately
+    # authorize any merchant/action within the amount+currency cap.)
     constraints = intent.get("constraints")
     if not isinstance(constraints, dict) or not constraints:
         raise MandateError("intent mandate must carry a non-empty constraints block")
+    for required in ("max_amount", "currency"):
+        if required not in constraints:
+            raise MandateError(
+                f"intent constraints must set '{required}' for a monetary chain"
+            )
     check_mandate_constraints(
         intent,
         action=action,

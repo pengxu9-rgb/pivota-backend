@@ -214,3 +214,53 @@ async def test_tampered_mandate_rejected():
             intent, isig, cart, csig, payment, psig,
             agent_did=AGENT_DID, trusted_issuers={did}, now=NOW,
         )
+
+
+# ------------------------- hardening (review B1/B2) ------------------------- #
+
+async def test_agent_did_none_rejected():
+    # agent_did=None must NOT skip subject binding — fail closed (B1).
+    priv, did = _issuer()
+    with pytest.raises(MandateError):
+        await _verify(_intent(did), _cart(did), _payment(did), priv, did, agent=None)
+
+
+async def test_action_none_rejected():
+    priv, did = _issuer()
+    intent, cart, payment = _intent(did), _cart(did), _payment(did)
+    with pytest.raises(MandateError):
+        await verify_mandate_chain(
+            intent, _sign(intent, priv), cart, _sign(cart, priv),
+            payment, _sign(payment, priv),
+            agent_did=AGENT_DID, trusted_issuers={did}, now=NOW, action=None,
+        )
+
+
+async def test_intent_without_max_amount_rejected():
+    # A signed intent with no ceiling is a blank cheque — deny (B2).
+    priv, did = _issuer()
+    intent = _intent(did, constraints={"currency": "USD", "merchants": ["m_1"]})
+    with pytest.raises(MandateError):
+        await _verify(intent, _cart(did), _payment(did), priv, did)
+
+
+async def test_intent_without_currency_rejected():
+    # A ceiling without a currency is meaningless — deny (B2).
+    priv, did = _issuer()
+    intent = _intent(did, constraints={"max_amount": "100.00", "merchants": ["m_1"]})
+    with pytest.raises(MandateError):
+        await _verify(intent, _cart(did), _payment(did), priv, did)
+
+
+async def test_infinity_amount_rejected():
+    priv, did = _issuer()
+    with pytest.raises(MandateError):
+        await _verify(_intent(did), _cart(did, total="Infinity"),
+                      _payment(did, amount="Infinity"), priv, did)
+
+
+async def test_negative_amount_rejected():
+    priv, did = _issuer()
+    with pytest.raises(MandateError):
+        await _verify(_intent(did), _cart(did, total="-50.00"),
+                      _payment(did, amount="-50.00"), priv, did)
