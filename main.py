@@ -768,6 +768,13 @@ app.add_middleware(ErrorHandlerMiddleware)
 # never touches non-/ap2 traffic. Do NOT enable in any environment before working
 # through docs/AP2_ENABLEMENT.md (agent public-key registration + the sibling
 # verify_ap2_signature reconciliation).
+#
+# Deliberately added AFTER ErrorHandlerMiddleware, i.e. it wraps *outside* it, so
+# AP2's own rejections keep their protocol-shaped body ({error, protocol, version}
+# from AP2SecurityMiddleware.dispatch) instead of being reformatted by the unified
+# error handler. The trade-off is those AP2 responses skip the handler's request-id
+# injection; that is intentional, not an ordering bug — leave it after the error
+# handler and inside CORS (added below) so CORS headers still apply.
 app.add_middleware(AP2SecurityMiddleware, enabled=settings.enable_ap2_routes)
 
 # Handle CORS preflight (OPTIONS) for any path in middleware rather than via a
