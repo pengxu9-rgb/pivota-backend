@@ -205,3 +205,120 @@ def check_mandate_constraints(
             raise MandateError("mandate constraints.merchants must be a list")
         if merchant_id not in merchants:
             raise MandateError(f"merchant {merchant_id} not in mandate allowlist")
+
+
+def _require_str(mandate: Dict[str, Any], field: str, label: str) -> str:
+    value = mandate.get(field)
+    if not isinstance(value, str) or not value:
+        raise MandateError(f"{label} mandate missing string '{field}'")
+    return value
+
+
+def _as_decimal(value: object, field: str) -> Decimal:
+    try:
+        return Decimal(str(value))
+    except (InvalidOperation, TypeError, ValueError):
+        raise MandateError(f"{field} is not a valid amount")
+
+
+async def verify_mandate_chain(
+    intent: Dict[str, Any],
+    intent_signature: str,
+    cart: Dict[str, Any],
+    cart_signature: str,
+    payment: Dict[str, Any],
+    payment_signature: str,
+    *,
+    agent_did: str,
+    trusted_issuers: Iterable[str],
+    action: str = "create_payment",
+    now: Optional[datetime] = None,
+    leeway_seconds: int = 60,
+    resolver: Resolver = resolve_agent_identity,
+) -> Dict[str, Dict[str, Any]]:
+    """
+    Verify a full AP2 Intent→Cart→Payment mandate chain and return the validated
+    ``{"intent", "cart", "payment"}`` on success. Raises MandateError on any
+    failure. This is the money-gating authority check, so it is **deny by
+    default**: it REQUIRES ``trusted_issuers`` and REQUIRES the Intent to carry a
+    non-empty ``constraints`` block.
+
+    Each mandate is first verified individually (signature over the issuer-DID
+    key, temporal window, subject bound to ``agent_did``, issuer in
+    ``trusted_issuers``, correct type). Then the chain is linked and bounded:
+
+    - **linkage:** ``cart.intent_ref == intent.id`` and ``payment.cart_ref ==
+      cart.id`` (ids are inside the signed envelopes, so tamper-proof);
+    - **amount:** ``payment.amount == cart.total`` and ``cart.total`` within the
+      Intent's ``max_amount`` (via ``check_mandate_constraints``);
+    - **currency:** ``payment.currency == cart.currency`` (and the Intent's
+      required currency, if any);
+    - **merchant + action:** ``cart.merchant_id`` and ``action`` satisfy the
+      Intent's ``merchants`` / ``actions`` constraints.
+
+    ``now``/``resolver`` are injectable for tests.
+    """
+    if trusted_issuers is None:
+        raise MandateError(
+            "verify_mandate_chain requires trusted_issuers (deny by default)"
+        )
+
+    # 1. Verify each mandate individually, bound to the presenting agent.
+    verified: Dict[str, Dict[str, Any]] = {}
+    for mandate, signature, expected_type, label in (
+        (intent, intent_signature, INTENT_MANDATE, "intent"),
+        (cart, cart_signature, CART_MANDATE, "cart"),
+        (payment, payment_signature, PAYMENT_MANDATE, "payment"),
+    ):
+        vm = await verify_mandate(
+            mandate,
+            signature,
+            now=now,
+            expected_subject=agent_did,
+            trusted_issuers=trusted_issuers,
+            leeway_seconds=leeway_seconds,
+            resolver=resolver,
+        )
+        if vm.get("type") != expected_type:
+            raise MandateError(
+                f"{label} mandate has wrong type {vm.get('type')!r} "
+                f"(expected {expected_type})"
+            )
+        verified[label] = vm
+
+    intent, cart, payment = verified["intent"], verified["cart"], verified["payment"]
+
+    # 2. Linkage — ids and refs (all inside the signed envelopes).
+    intent_id = _require_str(intent, "id", "intent")
+    cart_id = _require_str(cart, "id", "cart")
+    if _require_str(cart, "intent_ref", "cart") != intent_id:
+        raise MandateError("cart.intent_ref does not match intent.id")
+    if _require_str(payment, "cart_ref", "payment") != cart_id:
+        raise MandateError("payment.cart_ref does not match cart.id")
+
+    # 3. Amount + currency consistency across cart and payment.
+    cart_total = _as_decimal(cart.get("total"), "cart.total")
+    payment_amount = _as_decimal(payment.get("amount"), "payment.amount")
+    if payment_amount != cart_total:
+        raise MandateError(
+            f"payment.amount {payment_amount} != cart.total {cart_total}"
+        )
+    cart_currency = _require_str(cart, "currency", "cart")
+    if _require_str(payment, "currency", "payment") != cart_currency:
+        raise MandateError("payment.currency does not match cart.currency")
+    cart_merchant = _require_str(cart, "merchant_id", "cart")
+
+    # 4. Deny by default: the Intent MUST carry constraints, and the concrete
+    # cart must satisfy them (max_amount, currency, merchants, actions).
+    constraints = intent.get("constraints")
+    if not isinstance(constraints, dict) or not constraints:
+        raise MandateError("intent mandate must carry a non-empty constraints block")
+    check_mandate_constraints(
+        intent,
+        action=action,
+        amount=cart_total,
+        currency=cart_currency,
+        merchant_id=cart_merchant,
+    )
+
+    return {"intent": intent, "cart": cart, "payment": payment}
