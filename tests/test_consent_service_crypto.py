@@ -89,3 +89,24 @@ async def test_create_consent_rejects_invalid_signature():
 
     # Rejected before any nonce/consent writes
     assert mock_execute.await_count == 0
+
+
+async def test_create_consent_signature_without_key_fails_closed():
+    """A signature with no public_key must be rejected, never silently skipped."""
+    _, signature = _keypair_and_signature()
+
+    with patch("services.consent_service.database.fetch_one", new=AsyncMock(return_value=None)), patch(
+        "services.consent_service.database.execute", new=AsyncMock()
+    ) as mock_execute:
+        with pytest.raises(ValueError, match="without a registered public key"):
+            await ConsentService().create_consent(
+                agent_id=AGENT_ID,
+                scope=SCOPE,
+                duration_hours=DURATION_HOURS,
+                signature=signature,
+                nonce=NONCE,
+                public_key=None,
+            )
+
+    # Fail closed BEFORE any nonce/consent writes
+    assert mock_execute.await_count == 0

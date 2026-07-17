@@ -81,6 +81,15 @@ class ConsentService:
         Returns:
             Consent data including consent_id and expiry
         """
+        # A signature without a key to check it against must FAIL CLOSED, never
+        # silently skip verification and still mint a token. (The grant route
+        # already 401s a keyless agent before calling this, but the primitive
+        # must not degrade to "no verification" for any caller.)
+        if signature and not public_key:
+            raise InvalidSignatureError(
+                "Signature provided without a registered public key to verify against"
+            )
+
         # Verify signature if provided
         if signature and public_key:
             if not is_supported_ap2_algorithm(algorithm):
