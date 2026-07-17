@@ -70,6 +70,17 @@ This is the second decision in this ADR, added in rev 2. It is **orthogonal** to
 
 **Why:** the entire reason the signed rail exists is non-repudiation for the *least-trusted* callers moving money. Rooting that in a secret Pivota hands out is self-defeating; rooting it in the agent's own DID/credential is the point.
 
+### DID ↔ agent association (decided)
+
+How does a DID relate to a Pivota `agents` row? **Decision: add a dedicated `agents.did` column (unique, indexed, nullable). `agent_id` stays the internal identifier; the DID is the agent's AP2 external identity.** The two are mapped, not merged.
+
+On the AP2 rail the agent presents its **DID**; Pivota (a) resolves the DID → verification key (did:key/did:web, already shipped) and (b) resolves the DID → internal agent row via `agents.did`, from which it draws `x402_enabled`, wallet binding, and rate/quota limits. Consent and transaction rows continue to store the **internal `agent_id`** so every existing foreign key (`agent_consents.agent_id`, `agent_wallets`, `nonce_tracker`, `x402_transactions`) stays valid. `agents.public_key` reverts to *only* a raw-PEM pilot fallback; DID agents carry no stored key (the DID is the key source).
+
+- **(chosen) Separate `agents.did` column.** Additive, non-breaking; keeps the API-key rail and all FKs intact; cleanly separates "internal account id" from "self-sovereign external identity." A single agent may hold both a bearer key (`agent_id` rail) and a DID (AP2 rail); the audit trail records which identity authorized each transaction.
+- **(rejected) Make `agent_id` itself the DID.** Would rewrite the primary identifier and every FK, break the live API-key rail, and force a migration of all existing agents — a one-way door for no benefit, since the mapping column achieves the same external-identity property additively.
+
+**Transitional note:** the shipped did:key/did:web slices store the DID in `agents.public_key` keyed by `agent_id` (no schema change needed to demo resolution). The `agents.did` column is the durable home; the grant flow re-keys onto DID-presented identity as a follow-up (does not block the resolver slices).
+
 ## Options Considered (rail boundary)
 
 ### Option A: Two rails, boundary by caller-class × settlement (this ADR)
@@ -136,7 +147,7 @@ Decisive factor: **non-repudiation belongs where money moves and the caller is l
 2. [ ] **Define "caller class" concretely** — decide the routing attribute (proposed: `agents.x402_enabled` and/or an agent trust-tier) that deterministically selects rail. Document it in `docs/AP2_ENABLEMENT.md`.
 3. [x] **`did:key` identity slice** — offline DID resolution wired into the grant flow. Done: [#1452](https://github.com/pengxu9-rgb/pivota-backend/pull/1452) (`services/ap2_did.py`).
 4. [x] **`did:web` identity slice** — DID-document resolution over HTTPS with SSRF guard + TTL cache, fail-closed. Done: [#1453](https://github.com/pengxu9-rgb/pivota-backend/pull/1453) (`services/ap2_did_web.py`, `ap2_identity.py`).
-5. [ ] **DID ↔ agent association** — decide `agent_id`-as-DID vs a new `agents.did` column (today the pilot stores the DID in `agents.public_key`). Re-scope #1442 to this.
+5. [x] **DID ↔ agent association — decided:** separate `agents.did` column (unique), `agent_id` stays internal + FK-consistent (see "DID ↔ agent association" above). Foundation (migration + ORM column + `get_agent_by_did` helper) in progress; grant re-keying onto DID-presented identity is the wiring follow-up. Re-scopes #1442.
 6. [ ] **VC / mandate authority layer** — Intent/Cart/Payment mandates + trusted-issuer registry; replaces the opaque scope list as the delegation proof. (Final slice.)
 7. [ ] **SSRF hardening for self-registration** — if agents self-register `did:web`, pin the resolved IP into the connection (close the check-then-fetch TOCTOU gap noted in `ap2_did_web.py`).
 8. [ ] **Reconciliation owner** — assign ownership of the combined `x402_transactions` + `/orders/*` financial ledger before AP2 carries real money.
