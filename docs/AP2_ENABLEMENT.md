@@ -36,6 +36,10 @@ true in any environment.
 
 ### 1. Register agent public keys (grant fails closed without them)
 
+> **Tracked in [#1442](https://github.com/pengxu9-rgb/pivota-backend/issues/1442).**
+> This blocker is the prerequisite for the `ENABLE_AP2_ROUTES` flip; see that
+> issue for the implementation plan and acceptance criteria.
+
 `db/migrations/021_ap2_security.sql` adds `agents.public_key` (and
 `agents.x402_enabled`) but **no code path currently writes `agents.public_key`.**
 Every other `public_key` in the codebase (`routes/agent_api.py`,
@@ -118,7 +122,7 @@ confirmed their blocker is cleared:
 
 - [ ] **Agent key registration** — owner confirms a path writes `agents.public_key`
       (or the pilot cohort is backfilled) and the verify SQL returns `has_key = true`
-      for every AP2 agent. (Blocker 1)
+      for every AP2 agent. (Blocker 1 — [#1442](https://github.com/pengxu9-rgb/pivota-backend/issues/1442))
 - [ ] **`verify_ap2_signature` reconciliation** — the sibling AP2 follow-up owner
       confirms the payload-contract + nonce-replay issues are resolved, or confirms
       no enabled route depends on the helper. (Blocker 2)
