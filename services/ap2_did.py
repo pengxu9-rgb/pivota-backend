@@ -67,6 +67,44 @@ def _read_varint(data: bytes) -> Tuple[int, int]:
     raise ValueError("truncated multicodec varint")
 
 
+def decode_multibase_base58btc(multibase: str) -> bytes:
+    """Decode a base58btc multibase string (leading ``z``) to raw bytes."""
+    if not multibase.startswith("z"):
+        raise ValueError("expected base58btc multibase ('z' prefix)")
+    return _b58decode(multibase[1:])
+
+
+def multicodec_bytes_to_pem(data: bytes) -> Tuple[str, str]:
+    """
+    Decode ``<multicodec-varint><public-key-bytes>`` to ``(pem, algorithm)``.
+
+    Shared by did:key (its method-specific id) and did:web (a verification
+    method's ``publicKeyMultibase``) — both use the identical encoding.
+
+    Raises ValueError on empty, malformed, or unsupported input.
+    """
+    if not data:
+        raise ValueError("empty multicodec payload")
+
+    code, consumed = _read_varint(data)
+    key_bytes = data[consumed:]
+
+    if code == _MULTICODEC_ED25519:
+        if len(key_bytes) != 32:
+            raise ValueError(f"Ed25519 key must be 32 bytes, got {len(key_bytes)}")
+        return _to_pem(ed25519.Ed25519PublicKey.from_public_bytes(key_bytes)), "Ed25519"
+
+    if code == _MULTICODEC_P256:
+        # Compressed EC point (33 bytes for P-256).
+        try:
+            key = ec.EllipticCurvePublicKey.from_encoded_point(ec.SECP256R1(), key_bytes)
+        except Exception as exc:  # invalid/short point, wrong length, etc.
+            raise ValueError(f"invalid P-256 point: {exc}")
+        return _to_pem(key), "ES256"
+
+    raise ValueError(f"unsupported multicodec: 0x{code:x}")
+
+
 def resolve_did_key(did: str) -> Tuple[str, str]:
     """
     Resolve a did:key to ``(public_key_pem, algorithm)``.
@@ -81,34 +119,8 @@ def resolve_did_key(did: str) -> Tuple[str, str]:
     if not is_did_key(did):
         raise ValueError("not a did:key")
 
-    multibase = did[len(_DID_KEY_PREFIX):]
-    if not multibase.startswith("z"):
-        raise ValueError("did:key must use base58btc multibase ('z')")
-
-    decoded = _b58decode(multibase[1:])
-    if not decoded:
-        raise ValueError("empty did:key payload")
-
-    code, consumed = _read_varint(decoded)
-    key_bytes = decoded[consumed:]
-
-    if code == _MULTICODEC_ED25519:
-        if len(key_bytes) != 32:
-            raise ValueError(f"Ed25519 key must be 32 bytes, got {len(key_bytes)}")
-        key = ed25519.Ed25519PublicKey.from_public_bytes(key_bytes)
-        return _to_pem(key), "Ed25519"
-
-    if code == _MULTICODEC_P256:
-        # did:key encodes the COMPRESSED EC point (33 bytes for P-256).
-        try:
-            key = ec.EllipticCurvePublicKey.from_encoded_point(
-                ec.SECP256R1(), key_bytes
-            )
-        except Exception as exc:  # invalid/short point, wrong length, etc.
-            raise ValueError(f"invalid P-256 point: {exc}")
-        return _to_pem(key), "ES256"
-
-    raise ValueError(f"unsupported did:key multicodec: 0x{code:x}")
+    decoded = decode_multibase_base58btc(did[len(_DID_KEY_PREFIX):])
+    return multicodec_bytes_to_pem(decoded)
 
 
 def _to_pem(key) -> str:
