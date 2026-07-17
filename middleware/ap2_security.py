@@ -45,13 +45,23 @@ class AP2SecurityMiddleware(BaseHTTPMiddleware):
         public_endpoints = [
             "/ap2/status",
             "/ap2/protocols",
+            # Consent bootstrap: /ap2/consent/grant is the endpoint that ISSUES a
+            # consent token, so it cannot require X-Agent-Consent. It authenticates
+            # itself by verifying X-AP2-Signature against the agent's registered
+            # public key (agents.public_key) and fails closed, so it is exempt from
+            # the middleware's consent-token requirement rather than left unguarded.
+            "/ap2/consent/grant",
         ]
         
-        # Check if this is a public endpoint
+        # Check if this is a public endpoint. The prefix exemptions are
+        # GET-only on purpose: only read routes live under these prefixes today
+        # (GET /ap2/transaction/{id}, GET /ap2/receipt/{id}), so any future write
+        # route added under them fails closed (stays authenticated) instead of
+        # silently inheriting public status.
         is_public = (
             request.url.path in public_endpoints or
             (request.url.path.startswith("/ap2/transaction/") and request.method == "GET") or
-            request.url.path.startswith("/ap2/receipt/") or
+            (request.url.path.startswith("/ap2/receipt/") and request.method == "GET") or
             request.url.path == "/ap2/x402/quote"
         )
         
