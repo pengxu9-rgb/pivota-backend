@@ -44,6 +44,10 @@ def _env_float(name: str, default: float, *, min_value: float, max_value: float)
         value = float(raw) if raw else default
     except Exception:
         value = default
+    if value != value or value in (float("inf"), float("-inf")):
+        # NaN/inf survive min/max clamping (NaN comparisons are False, so
+        # min(cap, nan) keeps the cap) — resolve non-finite to the default.
+        value = default
     return max(min_value, min(max_value, value))
 
 
@@ -104,6 +108,16 @@ if IS_POSTGRES:
     }
     if database_kwargs["max_size"] < database_kwargs["min_size"]:
         database_kwargs["max_size"] = database_kwargs["min_size"]
+    # Optional per-statement ceiling (asyncpg `command_timeout`). asyncpg has NO
+    # default statement timeout, so a socket that dies without RST leaves an
+    # await hanging forever — a CLI run over the Railway public proxy hung 36
+    # minutes on 0.3s of CPU this way (2026-07-17). Unset (the default) keeps
+    # current behavior everywhere, incl. prod; ops CLIs opt in via env.
+    _command_timeout = _env_float(
+        "DB_COMMAND_TIMEOUT_SECONDS", 0.0, min_value=0.0, max_value=600.0
+    )
+    if _command_timeout > 0:
+        database_kwargs["command_timeout"] = _command_timeout
 
 database = Database(DATABASE_URL, **database_kwargs)
 # Lazy asyncpg pool for legacy helpers (Postgres only)
@@ -123,7 +137,12 @@ async def get_db_pool():
         # Lazy import to avoid hard-failing local dev when asyncpg wheels are broken/unavailable.
         import asyncpg  # type: ignore
 
-        _asyncpg_pool = await asyncpg.create_pool(DATABASE_URL)
+        _pool_kwargs = {}
+        if database_kwargs.get("command_timeout"):
+            # Same opt-in statement ceiling as the primary `database` object —
+            # legacy-pool callers must not retain the infinite-hang behavior.
+            _pool_kwargs["command_timeout"] = database_kwargs["command_timeout"]
+        _asyncpg_pool = await asyncpg.create_pool(DATABASE_URL, **_pool_kwargs)
     return _asyncpg_pool
 
 
