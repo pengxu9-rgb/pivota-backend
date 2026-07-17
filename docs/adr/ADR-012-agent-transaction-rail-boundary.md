@@ -60,7 +60,7 @@ This is the second decision in this ADR, added in rev 2. It is **orthogonal** to
 |---|---|---|
 | **`did:key`** | Self-contained, offline-resolvable DID; the public key *is* the identifier. No network, no registry. | ✅ implemented — [#1452](https://github.com/pengxu9-rgb/pivota-backend/pull/1452) (`services/ap2_did.py`; `did:key` in `agents.public_key` resolves in the grant flow) |
 | **`did:web`** | Domain-rooted DID resolved from the agent's `.well-known/did.json`; rotation owned by the agent. Resolver with SSRF guard, redirect refusal, TTL cache, fail-closed timeouts; `publicKeyMultibase` + `publicKeyJwk`. | ✅ implemented — [#1453](https://github.com/pengxu9-rgb/pivota-backend/pull/1453) (stacked on #1452) |
-| **VC / mandate chain** | W3C Verifiable Credentials + AP2 Intent/Cart/Payment mandates + trusted-issuer registry — the authority layer. | 🟡 in progress — verification **primitive** shipped [#1455](https://github.com/pengxu9-rgb/pivota-backend/pull/1455) (`services/ap2_mandate.py`); chain linkage + registry + grant wiring remain |
+| **VC / mandate chain** | W3C Verifiable Credentials + AP2 Intent/Cart/Payment mandates + trusted-issuer registry — the authority layer. | 🟡 in progress — verification **primitive** proposed in open PR [#1455](https://github.com/pengxu9-rgb/pivota-backend/pull/1455) (`services/ap2_mandate.py`, in review); chain linkage + registry + grant wiring remain |
 
 ### Identity-rooting options considered
 
@@ -99,14 +99,14 @@ Identity answers *who the agent is*; **mandates** answer *what the user authoriz
 
 **Wiring** (later slice): the grant/transaction flow accepts a mandate (or chain) instead of a raw `scope`; `verify_mandate` + `check_mandate_constraints` gate the action, and the enforced constraints — not a caller-supplied list — become the consent's authority. Kept out of the resolver PRs to avoid churning `consent_service` mid-review.
 
-**Shipped vs remaining:** the verification **primitive** + constraint enforcement is in [#1455](https://github.com/pengxu9-rgb/pivota-backend/pull/1455) (single-mandate verify, fail-closed, DID-rooted). Remaining: chain-linkage validation, the trusted-issuer registry (+ revocation), and the grant-flow wiring.
+**Shipped vs remaining:** the verification **primitive** + constraint enforcement is proposed in open PR [#1455](https://github.com/pengxu9-rgb/pivota-backend/pull/1455) (in review — single-mandate verify, fail-closed, DID-rooted). Remaining: chain-linkage validation, the trusted-issuer registry (+ revocation, + **how the account→issuer binding is first established** — enrollment / proof-of-control / out-of-band; this provenance is the highest-risk unspecified piece before mandates carry authority), and the grant-flow wiring.
 
 ## Options Considered (rail boundary)
 
 ### Option A: Two rails, boundary by caller-class × settlement (this ADR)
 | Dimension | Assessment |
 |---|---|
-| Complexity | Medium — keeps both rails, adds an explicit selection rule + the #1442 identity primitive |
+| Complexity | Medium — keeps both rails, adds an explicit selection rule + the DID identity stack |
 | Strategic fit | High — matches ADR-007's "different callers on different lanes"; non-repudiation lives exactly where money moves |
 | Reversibility | High — AP2 stays flag-gated; boundary can widen later without a rewrite |
 | Team familiarity | High — API-key rail unchanged; AP2 additive |
@@ -155,7 +155,7 @@ Decisive factor: **non-repudiation belongs where money moves and the caller is l
 - **Two payment legs must stay coherent**: receipts, refunds, cancellation, and financial reconciliation have to reconcile `x402_transactions` (AP2) and the `/orders/*` PSP path into one economic ledger. This is the main ongoing cost of A and must be owned.
 - **DID/VC infrastructure** beyond `did:key`: a `did:web` resolver means outbound HTTPS at verify time — needs caching, timeouts, and **fail-closed** behaviour on resolution failure. The VC/mandate slice needs a **trusted-issuer registry** and revocation/status checking. `did:key` (shipped) avoids all of this by being offline.
 - **"Caller class" needs a precise definition** so routing is deterministic (e.g. an `agent_type` / trust-tier attribute, or `x402_enabled` as the switch). Ambiguity here re-introduces the "two interchangeable rails" problem.
-- **DID ↔ agent record association** must be decided: is `agent_id` itself the DID, or does an `agents.did` column map one to the other? Until then, the pilot stores the DID in `agents.public_key`. A single `agent_id` may also hold both a bearer key and a DID — the audit trail must make the active rail + identity unambiguous per transaction.
+- **Dual identity per agent** — with the DID↔agent association decided (`agents.did`; see above), the residual cost is that a single `agent_id` may hold both a bearer key (API-key rail) and a DID (AP2 rail). The audit trail must record which identity + rail authorized each transaction so the two never blur.
 
 **Must revisit if**
 - Partner agents start requiring signed non-repudiation for PSP orders → widen AP2 toward Option B incrementally (partner-signed PSP orders), which A leaves open.
@@ -168,11 +168,12 @@ Decisive factor: **non-repudiation belongs where money moves and the caller is l
 3. [x] **`did:key` identity slice** — offline DID resolution wired into the grant flow. Done: [#1452](https://github.com/pengxu9-rgb/pivota-backend/pull/1452) (`services/ap2_did.py`).
 4. [x] **`did:web` identity slice** — DID-document resolution over HTTPS with SSRF guard + TTL cache, fail-closed. Done: [#1453](https://github.com/pengxu9-rgb/pivota-backend/pull/1453) (`services/ap2_did_web.py`, `ap2_identity.py`).
 5. [x] **DID ↔ agent association — decided:** separate `agents.did` column (unique), `agent_id` stays internal + FK-consistent (see "DID ↔ agent association" above). Foundation (migration + ORM column + `get_agent_by_did` helper) in progress; grant re-keying onto DID-presented identity is the wiring follow-up. Re-scopes #1442.
-6. [~] **VC / mandate authority layer** — verification primitive + constraint enforcement shipped ([#1455](https://github.com/pengxu9-rgb/pivota-backend/pull/1455), `services/ap2_mandate.py`); **remaining:** Intent→Cart→Payment chain linkage, trusted-issuer registry (+ revocation), and grant-flow wiring. Design in "VC / mandate authority layer" above.
+6. [~] **VC / mandate authority layer** — verification primitive + constraint enforcement proposed in open PR [#1455](https://github.com/pengxu9-rgb/pivota-backend/pull/1455) (`services/ap2_mandate.py`, in review); **remaining:** Intent→Cart→Payment chain linkage, trusted-issuer registry (+ revocation + binding provenance), and grant-flow wiring. Design in "VC / mandate authority layer" above.
 7. [ ] **SSRF hardening for self-registration** — if agents self-register `did:web`, pin the resolved IP into the connection (close the check-then-fetch TOCTOU gap noted in `ap2_did_web.py`).
 8. [ ] **Reconciliation owner** — assign ownership of the combined `x402_transactions` + `/orders/*` financial ledger before AP2 carries real money.
 9. [ ] **Clear the remaining `AP2_ENABLEMENT.md` blockers** for the pilot scope (middleware header contract on `revoke`/`transaction/*`, `verify_ap2_signature` reconciliation, schema applied) — tracked separately; not gated by this ADR.
 10. [ ] **Confirm discovery stays off AP2** — no discovery endpoints added to `ap2_routes.py`; external discovery remains on the ADR-007 read surface.
+11. [ ] **ES256 signature encoding — accept JOSE-raw (P1363), not only DER.** `crypto_service.verify_agent_signature` verifies ASN.1 **DER** ES256; standards-based DID/VC/JOSE/WebCrypto agents emit raw `r‖s` (64-byte, IEEE P1363). Since the whole point of this ADR is standards-based external agents, the verifier must accept raw sigs (detect 64-byte → convert to DER) or DID/AP2 agents can't interoperate. Affects both the signed rail and `verify_mandate`. Concrete interop blocker before pilot.
 
 ## Rollback
 
