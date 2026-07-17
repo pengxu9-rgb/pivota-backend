@@ -64,6 +64,22 @@ _PRODUCT_JOIN_CTES = """
       created_at DESC NULLS LAST,
       id DESC
   ),
+  minted_seed_one AS (
+    -- Path-C minted canonicals (catalog_enrichment_agent_v1) attach one seed
+    -- PER OFFER to the same product_key, so their seed join must be keyed by
+    -- attached_product_key and deduped here (best/most-recent seed wins) or
+    -- the product join would fan out per offer.
+    SELECT DISTINCT ON (attached_product_key)
+      id, external_product_id, status, domain, attached_product_key, updated_at
+    FROM external_product_seeds
+    WHERE attached_product_key IS NOT NULL
+    ORDER BY
+      attached_product_key,
+      (status = 'active') DESC,
+      updated_at DESC NULLS LAST,
+      created_at DESC NULLS LAST,
+      id DESC
+  ),
   merchant_store_one AS (
     SELECT DISTINCT ON (merchant_id, platform)
       merchant_id, platform, domain, status, last_sync
@@ -121,11 +137,11 @@ _PRODUCT_JOIN_SELECT = """
     pil.product_line_id,
     pil.review_family_id,
 
-    eps.id                   AS eps_id,
-    eps.status               AS eps_status,
-    eps.domain               AS eps_domain,
-    eps.attached_product_key AS eps_attached_product_key,
-    eps.updated_at           AS eps_last_seen_at,
+    COALESCE(eps.id, epm.id)                                     AS eps_id,
+    COALESCE(eps.status, epm.status)                             AS eps_status,
+    COALESCE(eps.domain, epm.domain)                             AS eps_domain,
+    COALESCE(eps.attached_product_key, epm.attached_product_key) AS eps_attached_product_key,
+    COALESCE(eps.updated_at, epm.updated_at)                     AS eps_last_seen_at,
 
     ms.merchant_id           AS ms_merchant_id,
     ms.platform              AS ms_platform,
@@ -140,9 +156,6 @@ _PRODUCT_JOIN_SELECT = """
   FROM catalog_products cp
   LEFT JOIN index_pipeline_state ips
     ON ips.content_key = cp.content_key
-  LEFT JOIN pdp_identity_listing pil
-    ON pil.merchant_id = cp.merchant_id
-   AND pil.product_id = cp.source_product_id
   LEFT JOIN external_seed_one eps
     -- ADR-009: match the external-seed mirror by source_system, NOT the legacy
     -- merchant_id='external_seed' bucket. External seeds now mirror under
@@ -151,6 +164,24 @@ _PRODUCT_JOIN_SELECT = """
     -- 'unknown' and a disabled merch_obs_ seed never emitted its inactive block.
     ON cp.source_system = 'external_product_seeds_mirror_v1'
    AND eps.external_product_id = cp.source_product_id
+  LEFT JOIN minted_seed_one epm
+    -- Path-C minted canonicals: seeds attach by attached_product_key (their
+    -- source_product_id is a canonical name slug, not a seed id).
+    ON cp.source_system = 'catalog_enrichment_agent_v1'
+   AND epm.attached_product_key = cp.product_key
+  LEFT JOIN pdp_identity_listing pil
+    -- Identity rows for external-seed supply are keyed by the SEED id
+    -- (pil.product_id = eps.external_product_id). Mirror rows carry that id
+    -- in cp.source_product_id; minted rows must route through their attached
+    -- seed (epm) or the pil join silently misses and trust re-derives
+    -- IDENTITY_CONFIDENCE_NULL forever (the shadow-forever bug on the Jul-16
+    -- minted cohort).
+    ON pil.merchant_id = cp.merchant_id
+   AND pil.product_id = CASE
+         WHEN cp.source_system = 'catalog_enrichment_agent_v1'
+           THEN epm.external_product_id
+         ELSE cp.source_product_id
+       END
   LEFT JOIN merchant_store_one ms
     ON ms.merchant_id = cp.merchant_id AND ms.platform = cp.platform
   LEFT JOIN identity_override_one pio
@@ -180,6 +211,7 @@ _SELECT_BY_QUARANTINE_DOMAIN_SQL = (
     + _PRODUCT_JOIN_SELECT
     + """  WHERE lower(coalesce(cp.source_domain,
                             eps.domain,
+                            epm.domain,
                             ms.domain,
                             '')) = lower(:match_value)
   ORDER BY cp.product_key
