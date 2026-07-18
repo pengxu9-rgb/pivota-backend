@@ -281,3 +281,21 @@ def test_real_foreign_seller_keyed_click_is_not_adopted(real_primitive):
     (subject, _order), _params = next(iter(fake.edges.items()))
     assert subject == MERCHANT_ID
     assert subject != "seller_S"
+
+
+def test_real_anchor_owned_cross_seed_click_does_not_squat_sellers_edge(real_primitive):
+    # #1482 review NEW-1: the reporter OWNS the click row (it is the cross-seed
+    # ANCHOR, click.merchant_id == reporter) but the click is destined for a
+    # DIFFERENT seller (context.seller_ref == seller_S). A self-report must NOT
+    # re-subject to seller_S — otherwise it squats seller_S's (subject, order)
+    # idempotency slot and seller_S's real close is silently dropped as a replay.
+    anchor_owned = {"click_id": "clk_anchor", "merchant_id": MERCHANT_ID, "interaction_id": "int_a",
+                    "context": {"seller_ref": "seller_S", "seed_kind": "cross"}}
+    fake = real_primitive(click_row=anchor_owned)
+    res = _post(_client(), {"external_order_id": "7005", "click_id": "clk_anchor", "gross_amount_cents": 3000})
+    assert res.status_code == 200, res.text
+    assert res.json()["click_matched"] is False, "a cross-seed click for another seller must not be adopted"
+    assert len(fake.edges) == 1
+    (subject, _order), _params = next(iter(fake.edges.items()))
+    assert subject == MERCHANT_ID, "edge must be subject to the REPORTER, never seller_S"
+    assert ("seller_S", "7005") not in fake.edges, "seller_S's idempotency slot must be untouched"
