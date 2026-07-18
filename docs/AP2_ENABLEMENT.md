@@ -189,7 +189,7 @@ grant/transaction auth.
 | Tier | Requires | Routes |
 | --- | --- | --- |
 | **public** | nothing | `status`, `protocols`, `consent/grant` (self-authenticating), `GET transaction/{id}`, `GET receipt/{id}`, `x402/quote` |
-| **consent-only** | `X-Agent-Consent` (+ the route's own ownership check) | `GET wallet/balance` — a per-request nonce on an idempotent read would make each balance check single-use |
+| **consent-only** | `X-Agent-Consent` | `GET wallet/balance` — a per-request nonce on an idempotent read would make each balance check single-use. (The handler is presently a `501` stub — §6; the consent gate is enforced by the middleware and the route's own ownership check returns when the balance handler is built.) |
 | **full (write)** | `X-Agent-Consent` + `X-AP2-Signature` + `X-AP2-Nonce` | `consent/revoke`, `transaction/initiate`, `transaction/confirm`, `x402/exchange` |
 
 Enforced at the **route level** (`Depends(verify_ap2_signature)` — the real gate,
@@ -199,18 +199,30 @@ since the middleware is flag-gated) and mirrored by the middleware.
 
 The **pilot path is** grant → initiate → confirm (+ the GET transaction/receipt
 reads), all functional once the schema (incl. migration 185) and provisioning are
-in place. Two routes are **not** functional yet — their auth tiers are correct,
-but the handlers are not:
+in place. Two routes are **not** built yet; both now fail honestly with **501 Not
+Implemented** — their auth tiers are correct and the handlers are deliberate
+stubs (they can no longer 500):
 
-- **`GET /ap2/wallet/balance`** — the handler `SELECT`s `balance, currency,
-  last_updated … WHERE wallet_address = …`, but `agent_wallets` (migration 022) is
-  an address registry with none of those columns (it has `address`, `status`,
-  `network`, …), so the read 500s. `agent_wallets` has **no balance store at all**;
-  fixing this needs a decision on where a balance comes from (on-chain / custodian
-  / a new column populated by settlement). Tracked as a separate follow-up. Do not
-  advertise wallet/balance in the pilot.
-- **`POST /ap2/x402/exchange`** — `501 Not Implemented` (stablecoin exchange
-  execution not built).
+- **`GET /ap2/wallet/balance` → `501`.** `agent_wallets` (migration 022) is an
+  ADDRESS REGISTRY (`address`, `network`, `status`, `custodian`,
+  `custodian_account_id`, …) with **no balance store**, and **no balance source is
+  wired anywhere** in the codebase (no on-chain RPC, no custodian client) — so
+  there is nothing to read a balance from. The prior handler `SELECT`ed
+  non-existent columns (`balance`, `currency`, `last_updated`) filtered on a
+  non-existent column (`wallet_address`; the real column is `address`), so it
+  **500'd** against real Postgres while its FakeDB unit test passed. Resolved to
+  an explicit `501` (mirroring `x402/exchange`) rather than a fabricated or
+  always-zero balance — see the route docstring and
+  `tests/test_ap2_wallet_balance.py`, which now builds `agent_wallets` from the
+  **real** migration-022 DDL on SQLite (not a FakeDB) and exercises the live
+  `verify_agent_wallet` query, so this class of schema drift is caught. **No
+  corrective migration was added** — a speculative `balance` column with no
+  settlement source would always read 0. **To build it**, first decide a balance
+  source: (a) a live on-chain/custodian read keyed by `network`+`address` (or
+  `custodian`+`custodian_account_id`), or (b) a settlement-populated ledger; then
+  restore the consent-only gate (the prior consent check is in git history). Do
+  **not** advertise wallet/balance in the pilot.
+- **`POST /ap2/x402/exchange` → `501`.** Stablecoin exchange execution not built.
 
 ## Reviewer / owner sign-off (required before the flip)
 

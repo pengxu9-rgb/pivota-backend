@@ -149,5 +149,7 @@ def test_disabled_middleware_is_passthrough(fake_db):
     """When disabled, the middleware does not gate anything (route handles it)."""
     client = _app(enabled=False)
     res = client.get("/ap2/wallet/balance")
-    # Reaches the route, which requires its own headers -> 400 (not middleware 401).
-    assert res.status_code == 400
+    # Reaches the route, which is an honest 501 not-implemented stub (no balance
+    # source; see docs/AP2_ENABLEMENT.md §6) -- NOT the middleware's 401. Proves
+    # the disabled middleware passed the request through to the route.
+    assert res.status_code == 501
