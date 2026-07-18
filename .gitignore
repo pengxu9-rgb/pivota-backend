@@ -29,6 +29,12 @@ yarn-error.log*
 # local env files
 .env*.local
 
+# python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+
 # local sqlite scratch DB created by some dev scripts
 pivota.db
 *.sqlite
