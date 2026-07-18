@@ -628,8 +628,17 @@ async def get_wallet_balance(request: Request):
             status_code=status.HTTP_400_BAD_REQUEST,
             detail="Missing required headers"
         )
-    
-    consent_data = await consent_service.verify_consent(consent_token)
+
+    # Consent is the primary auth for this consent-only read — a bogus/expired
+    # token must fail closed as 401 (like verify_ap2_consent), not an uncaught
+    # ValueError -> 500.
+    try:
+        consent_data = await consent_service.verify_consent(consent_token)
+    except ValueError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail=str(exc)
+        )
     agent_id = consent_data["agent_id"]
     
     # Query wallet balance
