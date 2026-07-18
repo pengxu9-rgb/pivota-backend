@@ -682,6 +682,15 @@ ON CONFLICT (merchant_id, external_order_id) DO NOTHING
 RETURNING edge_id
 """
 
+# Reconciliation re-read (self-report replay path only): fetch the STORED attributed
+# gross for an already-closed edge so a merchant replay reporting a DIFFERENT gross
+# can be surfaced. The first close wins (idempotent — never overwritten); this only
+# READS. Keyed on the same (merchant_id, external_order_id) guard as the insert.
+_SELECT_EXTERNAL_EDGE_GMV_SQL = (
+    "SELECT gross_attributed_gmv_cents FROM commerce_attribution_edges "
+    "WHERE merchant_id = :merchant_id AND external_order_id = :external_order_id"
+)
+
 
 async def close_external_order_conversion(
     *,
@@ -693,6 +702,7 @@ async def close_external_order_conversion(
     converted_at: Optional[datetime] = None,
     note_attrs_or_payload: Optional[Dict[str, Any]] = None,
     converting_shop_domain: Optional[str] = None,
+    is_self_report: bool = False,
 ) -> Optional[Dict[str, Any]]:
     """Materialize a `converted` external attribution edge from an orders/paid webhook.
 
@@ -732,6 +742,17 @@ async def close_external_order_conversion(
       supplies no domain the edge is stamped
       ``metadata.seller_domain_unverified=true`` and still counted (unknown is
       neither a silent pass nor an exclusion).
+    - **``is_self_report`` (untrusted merchant self-report path, #1482):** when a
+      MERCHANT reports its own settled order over the signed conversion-report API,
+      the edge SUBJECT is forced to the reporter and it may adopt only a click whose
+      seller-of-record IS the reporter (or is absent) — NEVER one destined for a
+      different seller, even one the reporter anchors as a cross seed. So a report
+      can never re-subject or squat another seller's edge (cross-merchant pre-
+      emption). It also opts into a replay re-read of the STORED gross so a report
+      disagreeing with the first close surfaces a reconciliation signal
+      (``gross_attributed_gmv_cents`` on the replay return). Server-polled/webhook
+      callers leave it ``False`` → seller-keyed adoption and the zero-extra-query
+      replay path are both UNCHANGED.
     """
     merchant_id = str(merchant_id or "").strip()
     external_order_id = str(external_order_id or "").strip()
@@ -767,7 +788,27 @@ async def close_external_order_conversion(
             # legitimate cross-seed closes — integrity is instead enforced by the
             # converting==seller_ref IDENTITY check below (a forged click_id on a
             # store that is not the seller mismatches and is excluded).
-            if (not click_merchant) or (str(click_merchant) == merchant_id) or candidate_seller_ref:
+            if is_self_report:
+                # A merchant SELF-report (is_self_report, #1482) is DEFINITIONALLY a
+                # report of the reporter's OWN sale, so it may adopt ONLY a click
+                # whose seller-of-record IS the reporter (self seed) or is absent
+                # (own / unscoped, non-seller-keyed) — NEVER one destined for a
+                # different seller. This holds even when the reporter legitimately
+                # owns the click row as the cross-seed ANCHOR: adopting it would let
+                # the report re-subject to (and squat the idempotency slot of) the
+                # other seller's edge (#1482 review NEW-1). The trusted seller-keyed
+                # adoption below is for server-polled / webhook closes only.
+                adopt = (
+                    (candidate_seller_ref is None or str(candidate_seller_ref) == merchant_id)
+                    and ((not click_merchant) or str(click_merchant) == merchant_id)
+                )
+            else:
+                adopt = (
+                    (not click_merchant)
+                    or (str(click_merchant) == merchant_id)
+                    or bool(candidate_seller_ref)
+                )
+            if adopt:
                 click_row = candidate
     click_matched = click_row is not None
 
@@ -786,6 +827,12 @@ async def close_external_order_conversion(
     # subject is stable across redeliveries. A DIFFERENT converting store replaying
     # the same (seller, order) collides on the same guard (still one edge).
     subject_merchant_id = click_seller_ref or merchant_id
+    if is_self_report:
+        # Belt-and-suspenders (the adoption clause above already excludes any
+        # foreign-seller click): a self-report NEVER re-subjects to another seller,
+        # so the (merchant_id, external_order_id) idempotency key + the replay
+        # re-read stay bound to the reporter — no cross-seller edge squatting.
+        subject_merchant_id = merchant_id
 
     edge_id, synthetic_order_id = _ext_edge_keys(subject_merchant_id, external_order_id)
 
@@ -942,6 +989,21 @@ async def close_external_order_conversion(
             subject_merchant_id,
             external_order_id,
         )
+        # Self-report replay: re-read the STORED gross (subject == merchant_id on
+        # this path) so the caller can reconcile a report that disagrees with the
+        # first close. Server-polled/webhook callers skip this — no extra round-trip
+        # on the hot at-least-once replay path.
+        recorded_gmv: Optional[int] = None
+        if is_self_report:
+            stored = await database.fetch_one(
+                _SELECT_EXTERNAL_EDGE_GMV_SQL,
+                {
+                    "merchant_id": subject_merchant_id,
+                    "external_order_id": external_order_id,
+                },
+            )
+            if stored is not None:
+                recorded_gmv = dict(stored).get("gross_attributed_gmv_cents")
         return {
             "edge_id": edge_id,
             "merchant_id": subject_merchant_id,
@@ -950,6 +1012,7 @@ async def close_external_order_conversion(
             "click_matched": click_matched,
             "seller_mismatch": seller_mismatch,
             "seller_domain_unverified": seller_domain_unverified,
+            "gross_attributed_gmv_cents": recorded_gmv,
             **seller_fields,
             "replayed": True,
         }
