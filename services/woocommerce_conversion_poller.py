@@ -307,6 +307,7 @@ async def poll_wc_conversions_for_merchant(
     summary["modified_after"] = modified_after.astimezone(timezone.utc).isoformat()
 
     page = 1
+    fetch_failed = False
     while summary["pages"] < MAX_PAGES:
         try:
             orders = await _fetch_wc_orders_page(
@@ -318,6 +319,7 @@ async def poll_wc_conversions_for_merchant(
             )
         except Exception as e:
             summary["errors"] += 1
+            fetch_failed = True
             logger.warning("woo_conversion_poller: fetch failed merchant=%s err=%s", merchant_id, str(e)[:200])
             break
 
@@ -351,7 +353,19 @@ async def poll_wc_conversions_for_merchant(
             break
         page += 1
 
-    await _write_poll_watermark(watermark_key, run_started, summary["closed"])
+    # Advance the watermark only if we scanned the whole window — a FETCH failure
+    # means orders in [modified_after, run_started] were never fetched; advancing
+    # past them would drop those conversions forever. Hold the watermark and
+    # re-poll the window next tick. A per-ORDER close failure does NOT hold it back.
+    if fetch_failed:
+        summary["watermark_held"] = True
+        logger.warning(
+            "woo_conversion_poller: holding watermark merchant=%s "
+            "(fetch failed; window re-polled next tick)",
+            merchant_id,
+        )
+    else:
+        await _write_poll_watermark(watermark_key, run_started, summary["closed"])
     return summary
 
 

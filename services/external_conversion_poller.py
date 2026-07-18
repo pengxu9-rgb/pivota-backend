@@ -280,6 +280,7 @@ async def poll_external_conversions_for_merchant(
     }
 
     page_info: Optional[str] = None
+    fetch_failed = False
     while summary["pages"] < MAX_PAGES:
         # Shopify forbids other filter params alongside a page_info cursor, so
         # subsequent pages carry only limit + page_info (same rule the
@@ -294,6 +295,7 @@ async def poll_external_conversions_for_merchant(
             )
         except Exception as e:
             summary["errors"] += 1
+            fetch_failed = True
             logger.warning("external_conversion_poller: fetch failed merchant=%s err=%s", merchant_id, str(e)[:200])
             break
 
@@ -327,8 +329,22 @@ async def poll_external_conversions_for_merchant(
             break
         page_info = next_cursor
 
-    # Persist the watermark even on a zero-close run so the window advances.
-    await _write_poll_watermark(merchant_id, run_started, summary["closed"])
+    # Advance the watermark only if we scanned the WHOLE window. A FETCH failure
+    # (429 / timeout / 5xx) leaves orders in [updated_at_min, run_started] never
+    # fetched — advancing past them would drop those conversions forever
+    # (idempotency dedups replays but cannot recover an unscanned window), so hold
+    # the watermark and re-poll the window next tick. A per-ORDER close failure does
+    # NOT hold it back — idempotency retries that order. Persist even on a
+    # zero-close run so the window advances.
+    if fetch_failed:
+        summary["watermark_held"] = True
+        logger.warning(
+            "external_conversion_poller: holding watermark merchant=%s "
+            "(fetch failed; window re-polled next tick)",
+            merchant_id,
+        )
+    else:
+        await _write_poll_watermark(merchant_id, run_started, summary["closed"])
     return summary
 
 
