@@ -57,7 +57,7 @@ CREATE TABLE x402_transactions (
     wallet_network TEXT,
     wallet_address TEXT,
     tx_hash TEXT,
-    status TEXT CHECK (status IN ('pending','completed','failed','authorized','captured','settled','refunded','voided')),
+    status TEXT CHECK (status IN ('pending','completed','failed','cancelled','authorized','captured','settled','refunded','voided')),
     created_at TEXT,
     updated_at TEXT,
     metadata TEXT,
@@ -89,6 +89,14 @@ _GET_SELECT = """
            status, created_at, confirmed_at
     FROM x402_transactions
     WHERE transaction_id = :transaction_id
+"""
+
+# admin_protocol_sync.cancel_transaction — only reachable once a 'pending' row can
+# exist, which this migration is what first makes possible.
+_CANCEL_UPDATE = """
+    UPDATE x402_transactions
+    SET status = 'cancelled'
+    WHERE transaction_id = :transaction_id AND status = 'pending'
 """
 
 
@@ -123,11 +131,24 @@ def test_reconciled_schema_supports_the_full_lifecycle():
     assert row[7] is not None         # confirmed_at set
 
 
+def test_reconciled_schema_permits_cancelling_a_pending_transaction():
+    # The migration first makes 'pending' rows possible; the cancel path must then
+    # be able to move one to 'cancelled' without tripping the status CHECK.
+    conn = _conn(_FIXED_DDL)
+    conn.execute(_INITIATE_INSERT, _params())
+    conn.commit()
+    conn.execute(_CANCEL_UPDATE, {"transaction_id": "t1"})
+    conn.commit()
+    row = conn.execute(_GET_SELECT, {"transaction_id": "t1"}).fetchone()
+    assert row[5] == "cancelled"      # status
+
+
 def test_migration_185_reconciles_the_schema():
     sql = (BACKEND_ROOT / "db" / "migrations" /
            "185_x402_transactions_reconcile.sql").read_text()
     assert "ADD COLUMN IF NOT EXISTS product_id" in sql
     assert "ADD COLUMN IF NOT EXISTS confirmed_at" in sql
     assert "authorization_code DROP NOT NULL" in sql
-    # status CHECK must now permit the route's lifecycle values
-    assert "'pending'" in sql and "'completed'" in sql
+    # status CHECK must now permit every status the AP2 routes write:
+    # initiate 'pending', confirm 'completed', admin cancel 'cancelled'.
+    assert "'pending'" in sql and "'completed'" in sql and "'cancelled'" in sql

@@ -31,9 +31,14 @@ ALTER TABLE IF EXISTS x402_transactions
 
 -- Replace the status CHECK so the route lifecycle values are permitted. 023's
 -- CHECK is inline/unnamed (Postgres auto-names it), so drop whatever CHECK
--- references `status` by discovered name, then add a permissive one covering both
--- the original x402 vocabulary and the routes' pending/completed/failed. The
--- drop-then-add makes re-runs idempotent (ADD CONSTRAINT has no IF NOT EXISTS).
+-- references `status` by discovered name, then add a permissive one covering the
+-- original x402 vocabulary AND every status the AP2 routes write:
+--   * ap2_routes initiate -> 'pending', confirm -> 'completed';
+--   * admin_protocol_sync cancel_transaction -> 'cancelled'.
+-- 'cancelled' matters specifically because this migration first makes 'pending'
+-- rows possible; cancel's `WHERE status='pending'` can now match a real row, so
+-- omitting 'cancelled' would turn the cancel UPDATE into a CheckViolation.
+-- The drop-then-add makes re-runs idempotent (ADD CONSTRAINT has no IF NOT EXISTS).
 DO $$
 DECLARE constraint_name text;
 BEGIN
@@ -51,7 +56,7 @@ BEGIN
     ALTER TABLE x402_transactions
       ADD CONSTRAINT x402_transactions_status_check
       CHECK (status IN (
-        'pending', 'completed', 'failed',
+        'pending', 'completed', 'failed', 'cancelled',
         'authorized', 'captured', 'settled', 'refunded', 'voided'
       ));
 END $$;
