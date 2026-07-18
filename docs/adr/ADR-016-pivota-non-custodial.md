@@ -75,12 +75,24 @@ Decisive factor: **the moat and the margins are in information and trust; custod
 **Must revisit if**
 - A pilot shows attribution is impossible outside the fund flow (parties systematically evade the record) → reconsider a *thin, non-custodial* settlement-orchestration role — but only after attribution has genuinely failed as an information problem, and with counsel.
 
+## Attribution — current state (audited 2026-07-18)
+
+Because attribution is now the revenue mechanism, we audited whether the read→sale proof loop closes. **It closes only for the Pivota-*orchestrated* order path, and breaks exactly where a non-custodial, pure-info-broker Pivota needs it most.** Key reframe: **Pivota does not need to see the money to attribute — it needs to see the ORDER.** Attribution is anchored on a Pivota-minted `pvt_click_id` that must physically round-trip into the order (order metadata for Pivota-created orders, or a Shopify cart-permalink `note_attribute` for external ones); if it doesn't, `upsert_order_attribution_edge` self-gates and writes nothing (only a silent-reject metric).
+
+The gaps that matter for *this* positioning, ordered:
+1. **The AP2/x402 rail has zero attribution linkage** — `x402_transactions` carries no `click_id`/`surface`, and `ap2_routes` writes no edge and doesn't even set `order_id`. If agentic commerce moves onto AP2/x402, that GMV is 100% unattributable today.
+2. **The one genuinely non-custodial closure isn't reliably running** — merchant settles on their own store, Pivota never touches money — but it covers only connected Shopify (`orders/paid` webhook, cart-permalink mode); the WooCommerce/read-orders pollers exist yet are **scheduled nowhere** (only tests call them); `referral_only` (non-Shopify) has no inbound closure. And there is **no merchant self-report / receipt-ingest conversion API** — the natural non-custodial closure for a pure-info flow.
+3. **Attribution is all-or-nothing on a propagated token** — drop `pvt_click_id` and the order silently produces no edge (reject metric only); there is no `agent_id`+product+window fallback, so coverage degrades silently to well-behaved callers.
+4. **Plain PDP reads and `agent_api` search record no attributable event of their own** — a read is provable only if the agent later follows a Pivota redirect/cart-permalink and echoes the ids back.
+
+**Implication:** the positioning we chose (facilitate + attribute, non-custodial) is the one attribution currently supports *least*. Closing it does **not** require custody — it requires Pivota to *see the order without the money*: schedule the pollers + cover non-Shopify, add a **conversion-report / receipt-ingest API** so parties report settlement referencing the Pivota click/receipt (the **signed receipt is the natural join key**), and wire the AP2 rail to carry `pvt_*` + write the edge on confirm. This is the crown-jewel work — it warrants its own ADR (item 5).
+
 ## Action Items
 1. [ ] **Founder sign-off** on the non-custodial money boundary. Move to Accepted; mark ADR-013 **Superseded by ADR-016**.
 2. [ ] **Stop ledger/custodian work** and update ADR-013's status line to Superseded.
 3. [ ] **Re-scope AP2:** `confirm` records + attests + routes (no value movement); reframe `debit_within_limit` as an authorization ceiling (attestation, not a fund debit); add **settlement routing** (merchant network + address / PSP endpoint) to the transaction record.
 4. [ ] **Correct `AP2_ENABLEMENT.md`:** the auth rail is complete *and* settlement was never Pivota's deliverable — the "moves money / Bar 2" scope is out by design.
-5. [ ] **Attribution audit → ADR:** determine whether the read → decision → transaction → proof loop closes today (in progress), then own attribution integrity as a product in its own ADR.
+5. [ ] **Attribution integrity → ADR-017:** the audit (see "Attribution — current state") is done — the loop closes only in the orchestrated path. Own attribution for a non-custodial Pivota as **ADR-017**: schedule the non-custodial pollers + cover non-Shopify, add a merchant **conversion-report / receipt-ingest API** (signed receipt as join key), wire the AP2/x402 rail to carry `pvt_*` + write the edge on confirm, and add a token-drop fallback join + silent-reject observability.
 6. [ ] **ADR-014 settlement port:** document that it *routes*, never *executes*.
 7. [ ] **Monetization surfaces:** define attribution/referral (merchant) + identity/authorization/receipt (agent/protocol) pricing on top of the two artifacts.
 
