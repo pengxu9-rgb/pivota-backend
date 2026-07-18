@@ -481,7 +481,6 @@ class Settings(BaseSettings):
     
     # AP2 Protocol (Phase 4++)
     enable_ap2_routes: bool = os.getenv("ENABLE_AP2_ROUTES", "false").lower() == "true"
-    enable_admin_auth: bool = os.getenv("ENABLE_ADMIN_AUTH", "false").lower() == "true"
     admin_api_token: Optional[str] = os.getenv("ADMIN_API_TOKEN")  # Admin authentication token
     platform_signing_key: Optional[str] = os.getenv("PLATFORM_SIGNING_KEY")  # For receipt signing
     

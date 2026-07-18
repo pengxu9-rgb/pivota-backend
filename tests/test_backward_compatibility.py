@@ -12,7 +12,6 @@ import json
 from models.order import OrderResponse, CreateOrderRequest, OrderItem, ShippingAddress
 from models.standard_product import StandardProduct, StandardProductVariant
 from utils.error_codes import ErrorCode, PivotaAPIError
-from middleware.response_wrapper import ResponseWrapperMiddleware, ResponseWrapperConfig
 from middleware.error_handler import ErrorHandlerMiddleware
 
 
@@ -23,11 +22,6 @@ def app():
     
     # Add middleware
     app.add_middleware(ErrorHandlerMiddleware)
-    app.add_middleware(
-        ResponseWrapperMiddleware,
-        config=ResponseWrapperConfig(enabled_paths=[])  # Not enabled by default
-    )
-    
     # Legacy endpoints (simulating existing API behavior)
     @app.get("/api/v1/products/{product_id}")
     async def get_product_legacy(product_id: str):
@@ -229,35 +223,6 @@ class TestCORSBackwardCompatibility:
         # Would have CORS headers if middleware is properly configured
 
 
-class TestResponseWrapperBackwardCompatibility:
-    """Test response wrapper doesn't affect existing endpoints"""
-    
-    def test_unwrapped_by_default(self, client):
-        """Responses are not wrapped by default"""
-        response = client.get("/api/v1/products/test-123")
-        assert response.status_code == 200
-        
-        data = response.json()
-        # Should be direct response, not wrapped
-        assert "status" not in data or data.get("status") != "success"
-        assert "data" not in data
-        assert "id" in data  # Direct field access
-    
-    def test_opt_in_wrapping(self, client):
-        """Can opt-in to wrapped responses via header"""
-        response = client.get(
-            "/api/v1/products/test-123",
-            headers={"X-Wrapped-Response": "true"}
-        )
-        assert response.status_code == 200
-        
-        data = response.json()
-        # Should be wrapped when requested
-        assert data["status"] == "success"
-        assert "data" in data
-        assert data["data"]["id"] == "test-123"
-
-
 class TestPaymentCompatibility:
     """Test payment processing backward compatibility"""
     
@@ -383,23 +348,6 @@ class TestMigrationPath:
         new_product = {"product_id": "prod-123", "title": "Product"}
         assert new_product["product_id"] == "prod-123"
     
-    def test_header_based_versioning(self, client):
-        """Clients can test new features via headers"""
-        # Old behavior
-        old_response = client.get("/api/v1/products/test-123")
-        old_data = old_response.json()
-        assert "id" in old_data
-        
-        # New behavior via header
-        new_response = client.get(
-            "/api/v1/products/test-123",
-            headers={"X-Wrapped-Response": "true"}
-        )
-        new_data = new_response.json()
-        assert new_data["status"] == "success"
-        assert new_data["data"]["id"] == old_data["id"]
-
-
 # Summary test to ensure nothing is broken
 def test_all_improvements_are_backward_compatible(client):
     """

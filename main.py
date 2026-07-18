@@ -46,9 +46,6 @@ from utils.database_readiness import DatabaseUnavailableError, ensure_database_r
 SERVICE_STARTED_AT = datetime.now(timezone.utc).replace(microsecond=0).isoformat().replace("+00:00", "Z")
 SERVICE_NAME = (os.getenv("PIVOTA_SERVICE_NAME") or os.getenv("SERVICE_NAME") or "pivota-backend").strip() or "pivota-backend"
 
-INTERNAL_PSP_MAINTENANCE_ROUTES_ENABLED = (
-    os.getenv("ENABLE_INTERNAL_PSP_MAINTENANCE_ROUTES", "false").lower() == "true"
-)
 
 
 def _guard_single_order_routes_py() -> None:
@@ -93,13 +90,7 @@ from routes.dashboard_routes import router as dashboard_router
 from routes.dashboard_api import router as dashboard_api_router
 # payment_routes already imported above, removed duplicate
 from routes.demo_data_routes import router as demo_data_router
-# ============================================================================
-# [LINE 35-36 PERMANENTLY DELETED] test_data_routes import removed
-# This file does not exist in Git and causes: ModuleNotFoundError
-# If you see this comment, Railway is using the LATEST code (commit: f1db95e9+)
-# ============================================================================
 from routes.simple_ws_routes import router as simple_ws_router
-from routes.agent_metrics_routes import router as agent_metrics_router
 from routes.auth_routes import router as auth_router
 from routes.auth import router as auth_api_router  # API auth endpoints
 from routes.mcp_oauth_as import router as mcp_oauth_as_router  # MCP OAuth Authorization Server (flag-gated)
@@ -199,10 +190,6 @@ from routes.merchant_onboarding_shopify_verify_routes import router as merchant_
 from routes.admin_simple_fix import router as admin_simple_fix_router
 from routes.admin_cleanup_rebuild import router as admin_cleanup_rebuild_router
 from routes.admin_cleanup_stores import router as admin_cleanup_stores_router
-from routes.admin_create_test_orders import router as admin_create_test_orders_router
-from routes.debug_current_user import router as debug_current_user_router
-from routes.admin_bind_wix import router as admin_bind_wix_router
-from routes.public_test_orders import router as public_test_orders_router
 from routes.admin_sql_quick import router as admin_sql_router
 from routes.admin_agents_debug import router as admin_agents_debug_router
 from routes.agent_health import router as agent_health_router
@@ -225,9 +212,6 @@ from routes.product_routes_v2 import router as product_router_v2
 from routes.product_sync import router as product_sync_router
 from routes.universal_product_sync import router as universal_sync_router
 from routes.sync_all_platforms import router as sync_all_router
-# Temporary debug endpoints removed - v2 endpoint is now stable
-# from routes.products_no_auth import router as products_debug_router
-# from routes.public_products_temp import router as public_products_router
 from routes.product_sync_monitoring import router as product_monitoring_router
 from routes.admin_reset_employee import router as admin_reset_employee_router
 from routes.admin_cleanup_duplicates import router as admin_cleanup_duplicates_router
@@ -247,8 +231,6 @@ from routes.employee_products import router as employee_products_router
 from routes.employee_pdp_governance import router as employee_pdp_governance_router
 from routes.employee_content import router as employee_content_router
 from routes.employee_kb_monitoring import router as employee_kb_monitoring_router
-from routes.employee_agents_management import router as employee_agents_management_router
-from routes.employee_agents_simple import router as employee_agents_simple_router
 from routes.admin_psp_integrity import router as admin_psp_integrity_router
 from routes.admin_orphan_orders import router as admin_orphan_orders_router
 from routes.admin_run_migration import router as admin_run_migration_router
@@ -373,18 +355,6 @@ from routes.reviews_invitation_issuer import router as reviews_invitation_issuer
 from routes.reviews_invitation_shortlink import router as reviews_invitation_shortlink_router
 
 # Service routers (only include what exists)
-try:
-    from routes.simple_mapping_routes import router as simple_mapping_router
-    SIMPLE_MAPPING_AVAILABLE = True
-except ImportError:
-    SIMPLE_MAPPING_AVAILABLE = False
-
-try:
-    from routes.end_to_end_routes import router as end_to_end_router
-    E2E_AVAILABLE = True
-except ImportError:
-    E2E_AVAILABLE = False
-
 try:
     from routes.mcp_routes import router as mcp_router
     MCP_AVAILABLE = True
@@ -928,8 +898,6 @@ app.include_router(admin_debug_shopify_token_router)  # Admin debug Shopify toke
 app.include_router(employee_agent_mgmt_router)
 app.include_router(employee_settlement_router)
 app.include_router(employee_content_router)
-# TEMPORARILY DISABLED - causing "Failed to fetch agents: get" error
-# app.include_router(employee_agents_management_router)  # Employee agents management
 app.include_router(admin_fix_agents_router)  # Admin fix agents data
 app.include_router(admin_fix_agent_metrics_router)  # Admin fix agent metrics
 app.include_router(admin_fix_agent_metrics_v2_router)  # Admin fix agent metrics v2 (from orders)
@@ -1088,8 +1056,6 @@ app.include_router(universal_sync_router)
 app.include_router(sync_all_router)  # Universal product sync (new)
 app.include_router(product_monitoring_router)  # Product sync monitoring and metrics
 # Temporary debug endpoints commented out - v2 is stable now
-# app.include_router(products_debug_router)  # Debug products endpoint (no auth)
-# app.include_router(public_products_router)  # Public test endpoint
 app.include_router(order_router)  # Order processing
 app.include_router(accounts_orders_router)  # Accounts & Orders API (customer-facing)
 app.include_router(buyer_router)  # Buyer Vault API (unified buyer account)
@@ -1143,16 +1109,7 @@ app.include_router(dashboard_api_router)  # New Dashboard API
 app.include_router(demo_data_router)  # Demo data management
 # [DELETED] test_data_router router registration removed (file not in Git)
 app.include_router(simple_ws_router)  # Simple WebSocket
-# agent_metrics_router already included above on line 195
 app.include_router(product_quality_router)  # Internal product quality preview (Merchant Portal)
-
-if SIMPLE_MAPPING_AVAILABLE:
-    app.include_router(simple_mapping_router)
-    logger.info("✅ Simple mapping router included")
-
-if E2E_AVAILABLE:
-    app.include_router(end_to_end_router)
-    logger.info("✅ End-to-end router included")
 
 if MCP_AVAILABLE:
     app.include_router(mcp_router)
@@ -1236,14 +1193,6 @@ async def startup():
         init_sentry()
     except Exception as e:
         logger.warning(f"⚠️ Sentry initialization skipped: {e}")
-    
-    # 初始化 R2 存储 - 功能推迟实现
-    # try:
-    #     from utils.r2_storage import startup as r2_startup
-    #     r2_startup()
-    #     logger.info("✅ R2 storage client initialized")
-    # except Exception as e:
-    #     logger.warning(f"⚠️ R2 storage initialization skipped: {e}")
     
     try:
         logger.info("📡 Connecting to database...")
@@ -1751,22 +1700,6 @@ async def startup():
         
         # Initialize services if available
         logger.info("🔌 Initializing optional services...")
-        if SIMPLE_MAPPING_AVAILABLE:
-            try:
-                from services.simple_persistent_mapping import initialize_simple_mapping_service
-                await initialize_simple_mapping_service()
-                logger.info("Simple Persistent Mapping Service initialized ✅")
-            except Exception as e:
-                logger.warning(f"Could not initialize simple mapping service: {e}")
-        
-        if E2E_AVAILABLE:
-            try:
-                from integrations.end_to_end_service import initialize_e2e_service
-                await initialize_e2e_service()
-                logger.info("End-to-End Integration Service initialized ✅")
-            except Exception as e:
-                logger.warning(f"Could not initialize E2E service: {e}")
-        
         logger.info("✅ All services initialized successfully!")
         logger.info("🚀 Application startup complete!")
         logger.info("=" * 80)
@@ -1837,7 +1770,7 @@ async def root():
     
     return {
         "message": "Pivota Infrastructure Dashboard API",
-        "version": "0.2.1-fixed",  # test_data_routes removed
+        "version": "0.2.1-fixed",
         "status": "healthy",
         "db_status": db_status,
         "timestamp": time.time(),

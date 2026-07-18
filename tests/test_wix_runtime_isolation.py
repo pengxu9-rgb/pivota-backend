@@ -17,12 +17,9 @@ def test_legacy_wix_sync_fix_route_stays_unmounted() -> None:
 
 
 def test_wix_admin_store_mutation_routes_are_runtime_gated() -> None:
-    admin_bind_source = _read("routes/admin_bind_wix.py")
     cleanup_source = _read("routes/admin_cleanup_stores.py")
 
-    assert "ALLOW_PROD_ADMIN_STORE_MUTATION" in admin_bind_source
     assert "ALLOW_PROD_ADMIN_STORE_MUTATION" in cleanup_source
-    assert "Superadmin access required" in admin_bind_source
     assert "Superadmin access required" in cleanup_source
 
 
