@@ -57,6 +57,42 @@ class ConsentService:
             raise LookupError(f"Agent not found: {agent_id}")
         return row["public_key"]
 
+    async def get_agent_identity(self, agent_id: str) -> Optional[str]:
+        """
+        Resolve the agent's AP2 identity/verification material (ADR-012).
+
+        The DID is the agent's stable identity; verification keys are resolved
+        FROM it (did:key offline, did:web fetched+cached). So the source of record
+        is **agents.did** (migration 183). This prefers agents.did and falls back
+        to a DID-or-PEM stored in agents.public_key, keeping every existing agent
+        working during the transition:
+
+        - agents.did set to a DID          -> that DID (identity; caller resolves the key),
+        - else agents.public_key is a DID  -> that DID (legacy pilot placement),
+        - else agents.public_key is a PEM  -> that PEM (raw-key pilot fallback),
+        - neither                           -> None (fail closed: no registered identity).
+
+        Callers keep the existing `is_did(...)` branch: a DID is resolved to a key
+        via resolve_agent_identity; a PEM is used directly.
+
+        Raises:
+            LookupError: If the agent does not exist
+        """
+        row = await database.fetch_one(
+            "SELECT did, public_key FROM agents WHERE agent_id = :agent_id",
+            {"agent_id": agent_id}
+        )
+        if not row:
+            raise LookupError(f"Agent not found: {agent_id}")
+        # dict() first, then .get — the SELECT always includes `did` in
+        # production; converting to a dict makes the access safe for both
+        # asyncpg Records and any legacy row shape without it.
+        row = dict(row)
+        did = row.get("did")
+        if did and is_did(did):
+            return did
+        return row.get("public_key")
+
     async def create_consent(
         self,
         agent_id: str,

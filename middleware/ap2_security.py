@@ -228,7 +228,7 @@ async def verify_ap2_signature(request: Request) -> bool:
     agent_id = consent["agent_id"]
 
     try:
-        public_key = await consent_service.get_agent_public_key(agent_id)
+        public_key = await consent_service.get_agent_identity(agent_id)
     except LookupError:
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,

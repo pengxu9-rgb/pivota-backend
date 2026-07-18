@@ -192,10 +192,11 @@ async def grant_consent(request: Request):
             ),
         )
 
-    # Resolve the agent's registered public key — the signature is only
-    # meaningful against a key we already trust, never one the caller sends.
+    # Resolve the agent's registered AP2 identity — a DID (agents.did preferred;
+    # the key is resolved from it) or a legacy raw PEM. Verification is only
+    # meaningful against material we already trust, never one the caller sends.
     try:
-        public_key = await consent_service.get_agent_public_key(agent_id)
+        public_key = await consent_service.get_agent_identity(agent_id)
     except LookupError:
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
@@ -321,12 +322,12 @@ async def initiate_transaction(
         from decimal import Decimal
 
         # A mandate's `subject` is the agent's DID. Resolve the agent's DID
-        # identity from agents.public_key (which holds the did:key:/did:web:
-        # string for DID agents — the SAME value verify_ap2_signature verified
-        # the request signature against). agent_id is the INTERNAL id (VARCHAR-50,
-        # too short to be a DID), so it must NOT be used as the subject. The
-        # trusted-issuer registry stays keyed by the internal agent_id.
-        agent_did = await consent_service.get_agent_public_key(agent_id)
+        # identity (agents.did preferred, legacy DID-in-public_key as fallback —
+        # the SAME value verify_ap2_signature verified the request signature
+        # against). agent_id is the INTERNAL id (VARCHAR-50, too short to be a
+        # DID), so it must NOT be used as the subject. The trusted-issuer
+        # registry stays keyed by the internal agent_id.
+        agent_did = await consent_service.get_agent_identity(agent_id)
         if not is_did(agent_did):
             raise HTTPException(
                 status_code=status.HTTP_403_FORBIDDEN,

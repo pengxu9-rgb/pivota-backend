@@ -123,6 +123,8 @@ The AP2 surface depends on tables/columns spread across several migrations —
 | `022_wallet_infrastructure.sql` | `agent_wallets`, `merchant_wallets` |
 | `023_x402_protocol.sql` | `x402_transactions`, `x402_exchange_rates` |
 | `182_nonce_tracker_request_path.sql` | **corrective** — adds `nonce_tracker.request_path` that 021 omitted but the AP2 nonce paths INSERT (#1443). Idempotent (`ADD COLUMN IF NOT EXISTS`). |
+| `183_agents_did.sql` | `agents.did` (#1454). The AP2 identity readers now `SELECT did` (source of record for DID agents); without it every grant/signature/transaction read errors on the undefined column (fail-closed 500). Idempotent. |
+| `184_ap2_trusted_issuers.sql` | `ap2_trusted_issuers` (#1461) — the mandate authority registry. `POST /ap2/transaction/initiate` with a mandate chain reads it; without it mandate authorization errors. Idempotent. |
 
 **These are NOT applied at boot.** The AP2 schema is `schema_guard`-exempt (not
 in `db/schema_guard.py`'s prod fast-mode startup) precisely because the surface
@@ -134,8 +136,9 @@ self-heal. For each migration number `NNN`:
 - `GET /admin/migrations/pending/{NNN}` — inspect (resolves `db/migrations/NNN_*.sql`, reports size, no writes).
 - `POST /admin/migrations/pending/{NNN}/run` with body `{"mode": "apply"}` — applies it. **Both require admin auth, and the run endpoint DEFAULTS TO DRY-RUN** (any `mode` other than `"apply"` just reports and writes nothing), so a missing `mode` silently no-ops. Postgres only (skipped on sqlite).
 
-Apply in order `021`, `022`, `023`, `182`. `182` is idempotent (`ADD COLUMN IF
-NOT EXISTS`), so re-applying it against an env that already has the column is safe.
+Apply in order `021`, `022`, `023`, `182`, `183`, `184`. All are idempotent
+(`ADD COLUMN`/`CREATE TABLE ... IF [NOT] EXISTS`), so re-applying against an env
+that already has them is safe.
 
 Verify before flipping the flag:
 
@@ -192,9 +195,10 @@ confirmed their blocker is cleared:
       (`revoke`, `transaction/*`, `x402/exchange`, `wallet/balance`) is consistent
       with the middleware's required headers for the pilot scope. (Blocker 3)
 - [ ] **Schema applied** — owner confirms migrations `021` + `022` + `023` + `182`
-      are applied (via `POST /admin/migrations/pending/{NNN}/run`, `mode: "apply"`)
-      and the verify SQL returns true for every column/table (incl.
-      `nonce_tracker.request_path`). (Blocker 4)
+      + `183` + `184` are applied (via `POST /admin/migrations/pending/{NNN}/run`,
+      `mode: "apply"`) and the verify SQL returns true for every column/table
+      (incl. `nonce_tracker.request_path`, `agents.did`, `ap2_trusted_issuers`).
+      (Blocker 4)
 - [ ] **Agent wallets provisioned** — owner confirms every pilot agent that will
       `confirm` has an `active` row in `agent_wallets`, else confirm → 403. (Blocker 5)
 - [ ] **Deploy/on-call sign-off** — the deploying engineer acknowledges the rollback
@@ -207,7 +211,7 @@ auditable.
 
 1. Apply the AP2 schema to the target DB via the by-number migration runner
    (`POST /admin/migrations/pending/{NNN}/run` with `{"mode": "apply"}`; see
-   Blocker 4) — numbers `021`, `022`, `023`, then `182` — then run the Blocker 4
+   Blocker 4) — numbers `021`, `022`, `023`, `182`, `183`, `184` — then run the Blocker 4
    verify SQL and confirm every column/table is true. It is not applied at boot
    and the runner defaults to dry-run, so this step is mandatory and each call
    must pass `mode: "apply"`.
