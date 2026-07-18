@@ -45,7 +45,7 @@ closes their conversions:
 | Shopify store with a registered `orders/paid` **webhook** | Webhook (`routes/webhook_routes.py`) recovers `pivota_click_id` from `note_attributes` (cart-permalink) | **live** — no flag |
 | Shopify store with `read_orders` but **no** webhook (App-Store installs; the connected TEST merchant) | **Shopify read-orders poller** (this runbook) recovers `pivota_click_id` from `note_attributes` | `EXTERNAL_CONVERSION_POLLER_ENABLED` |
 | Connected **WooCommerce** store (WC 8.5+ Order Attribution) | **Woo poller** (this runbook) recovers the click id from `_wc_order_attribution_utm_content` order meta | `EXTERNAL_CONVERSION_POLLER_ENABLED` |
-| `referral_only` **bare link** — no store connection at all | **Conversion-report API** — the merchant POSTs the settled order (#1486); see below | live — no flag (endpoint mounted) |
+| `referral_only` **bare link** — no store connection at all | **Conversion-report API** — an onboarded merchant with an issued api_key POSTs the settled order, signed (#1486); see the prerequisite below | live — no flag (endpoint mounted) |
 
 `referral_only` redirects already carry the click id as a `utm_content` landing
 param (`append_referral_click_param`, `services/outbound_links_service.py`; #1226),
@@ -62,9 +62,22 @@ closure is the signed **conversion-report API**:
   double-counting. No funds are touched — Pivota sees the *order report*, not the
   money.
 
+> **Prerequisite (not turnkey).** The report API authenticates by HMAC keyed on the
+> reporting merchant's `merchant_onboarding.api_key`, which is **nullable and NOT
+> provisioned at onboarding** — it is issued only by PSP connect
+> (`setup_psp_connection`) or the authenticated dashboard endpoint
+> `POST /merchant/api-credentials/rotate` (`role=merchant` login). A merchant whose
+> `api_key` is NULL gets a `401` (`routes/attribution_conversions.py`). So a
+> bare-link partner must first be an **onboarded Pivota merchant with an issued
+> api_key** and must **sign requests client-side**. There is no merchant-facing SDK
+> for this yet, so it is a *defined* closure — not a zero-setup one, and not usable
+> by a partner who has no Pivota merchant record at all.
+
 So **acceptance criterion 3 is satisfied**: `referral_only` conversions have a
-defined closure (Woo `utm_content` join for connected stores; the report API for
-bare links) — not merely "documented as unsupported."
+*defined* closure — the Woo `utm_content` join for connected stores, and the report
+API (subject to the api_key prerequisite above) for onboarded bare-link merchants —
+rather than being left undefined. A truly unintegrated partner with no merchant
+record remains out of scope until it is onboarded and issued an api_key.
 
 ## What's built and verified (no action needed)
 
@@ -183,7 +196,9 @@ watermarks simply stop advancing. Rollback is safe at any time.
   idempotent, non-custodial primitive (closure map + "what's built").
 - **"`referral_only` conversions have a defined closure, or are explicitly
   documented as report-API-only."** → the closure map: connected stores via the
-  Woo `utm_content` join; bare links via the conversion-report API (#1486).
+  Woo `utm_content` join; onboarded bare-link merchants via the conversion-report
+  API (#1486), **subject to the api_key prerequisite** noted there. A partner with
+  no Pivota merchant record is explicitly out of scope until onboarded.
 
 ## References
 
