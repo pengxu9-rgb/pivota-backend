@@ -3,6 +3,7 @@
 **Status:** Proposed
 **Date:** 2026-07-17
 **Deciders:** Founder (peng) — positioning + Commerce/Trust owners
+**Part of:** the agent-protocol interoperability model — **ADR-014** (meta). ADR-012 is its **identity-layer** instance (plus the transaction rail boundary): DID / bearer / wallet-key are edge identities resolved to the internal `agent_id`.
 **Builds on:** ADR-007 (citable index vs commerce overlay — settled the *read* side), ADR-009 (seller-of-record identity). Companion: `docs/AP2_ENABLEMENT.md` (enablement checklist + blockers), issue [#1442](https://github.com/pengxu9-rgb/pivota-backend/issues/1442) (agent identity provisioning — re-scoped, see below).
 **Scope:** the *transact/pay* leg for **external** agents, plus **how that rail roots agent identity**. This ADR does **not** touch discovery/read (ADR-007 owns that) and changes no serving behavior.
 

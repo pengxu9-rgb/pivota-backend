@@ -2,6 +2,7 @@
 
 **Status:** **Accepted** (2026-06-24 — both founder questions resolved, see "Founder decisions" below; slices 1–3 merged to `main`) · adversarial review 2026-06-23 → GO-WITH-CHANGES, corrections folded into Action Items · **Date:** 2026-06-23 · **Scope:** `pivota-backend` index/serving pipeline + agent read surfaces · **Supersedes:** the offer-minting approach in the verify-to-serve spec (`pivota-merchants-portal#117`)
 **Deciders:** founder (positioning) + backend (index pipeline)
+**Part of:** the agent-protocol interoperability model — **ADR-014** (meta). ADR-007 is its **discovery / read-layer** instance: the single unified read surface across MCP / ACP / UCP / API-key agents (no protocol adds its own discovery endpoints).
 
 ---
 
