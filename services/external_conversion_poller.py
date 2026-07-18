@@ -139,6 +139,67 @@ async def _write_poll_watermark(merchant_id: str, last_polled_at: datetime, clos
         logger.warning("external_conversion_poller: watermark write failed merchant=%s err=%s", merchant_id, str(e)[:200])
 
 
+# When a merchant's watermark has been unable to advance for at least this long,
+# a HOLD stops being transient (a passing 429) and becomes a stuck connection a
+# human must unstick — a persistently page-capped window (raise MAX_PAGES /
+# backfill) or a broken credential. Escalate to ERROR so it isn't lost in the
+# per-tick WARNING stream (F2, #1485). A first run that already exceeds the page
+# cap (no watermark yet) is stuck by definition.
+STALE_WATERMARK_ALERT_DAYS = 2
+
+
+def _note_watermark_hold(
+    summary: Dict[str, Any],
+    *,
+    merchant_id: str,
+    now: datetime,
+    watermark: Optional[datetime],
+    page_cap_hit: bool,
+    log: logging.Logger,
+) -> None:
+    """Mark ``summary`` as held (watermark NOT advanced) and log it — escalating a
+    merchant that has been stuck long enough to need operator intervention.
+
+    A hold means the window ``[watermark, now]`` was only partially scanned, so
+    advancing past it would drop the unscanned orders forever (the #1484 / F1 data-
+    loss class). We re-poll the same window next tick instead. The trade-off: a
+    merchant whose window genuinely exceeds MAX_PAGES holds every tick (data safety
+    over liveness) — hence the escalation, which tells an operator to raise
+    MAX_PAGES or backfill rather than letting the stall stay silent.
+    """
+    summary["watermark_held"] = True
+    summary["page_cap_hit"] = bool(page_cap_hit)
+    reason = "page cap hit (window exceeds MAX_PAGES)" if page_cap_hit else "fetch failed"
+    held_age_days = (now - watermark).days if watermark is not None else None
+    # "Stuck" = the watermark has been unable to advance long enough to need a
+    # human. Detected by AGE, so it fires for BOTH hold reasons — a persistently
+    # page-capped window (raise MAX_PAGES / backfill) AND a persistently failing
+    # fetch (e.g. a revoked credential). A first run already over the page cap is
+    # stuck by definition (its oversized window won't fix itself); a first-run
+    # *fetch* failure has no age yet and may be transient, so it rides the batch
+    # held/errors counts until a watermark exists to age from.
+    stuck = (held_age_days is not None and held_age_days >= STALE_WATERMARK_ALERT_DAYS) or (
+        page_cap_hit and watermark is None
+    )
+    if stuck:
+        summary["watermark_stuck"] = True
+        remedy = "raise MAX_PAGES or backfill" if page_cap_hit else "check the merchant credential / connection"
+        log.error(
+            "holding watermark merchant=%s STUCK — %s; the window has not advanced "
+            "(watermark_age_days=%s) so conversions in it are NOT closed. Operator: %s.",
+            merchant_id,
+            reason,
+            held_age_days,
+            remedy,
+        )
+    else:
+        log.warning(
+            "holding watermark merchant=%s (%s; window re-polled next tick)",
+            merchant_id,
+            reason,
+        )
+
+
 # --- Shopify order fetch (reuses the promotions-sync client/pagination shape) --
 
 
@@ -281,6 +342,7 @@ async def poll_external_conversions_for_merchant(
 
     page_info: Optional[str] = None
     fetch_failed = False
+    scan_complete = False
     while summary["pages"] < MAX_PAGES:
         # Shopify forbids other filter params alongside a page_info cursor, so
         # subsequent pages carry only limit + page_info (same rule the
@@ -326,22 +388,30 @@ async def poll_external_conversions_for_merchant(
                 summary["skipped_unpaid"] += 1
 
         if not next_cursor:
+            scan_complete = True  # genuinely no more pages — the window is fully scanned
             break
         page_info = next_cursor
 
-    # Advance the watermark only if we scanned the WHOLE window. A FETCH failure
-    # (429 / timeout / 5xx) leaves orders in [updated_at_min, run_started] never
-    # fetched — advancing past them would drop those conversions forever
-    # (idempotency dedups replays but cannot recover an unscanned window), so hold
-    # the watermark and re-poll the window next tick. A per-ORDER close failure does
-    # NOT hold it back — idempotency retries that order. Persist even on a
-    # zero-close run so the window advances.
-    if fetch_failed:
-        summary["watermark_held"] = True
-        logger.warning(
-            "external_conversion_poller: holding watermark merchant=%s "
-            "(fetch failed; window re-polled next tick)",
-            merchant_id,
+    # Advance the watermark only if we scanned the WHOLE window. Two ways it wasn't:
+    #  - a FETCH failure (429 / timeout / 5xx) left orders in [updated_at_min,
+    #    run_started] never fetched;
+    #  - a MAX_PAGES cap exit with a page still pending (page_cap_hit, F1 #1485)
+    #    left the tail past the cap never fetched (Shopify 20×250 = 5000 orders).
+    # Either way, advancing past the unscanned orders would drop them forever
+    # (idempotency dedups replays but cannot recover an unscanned window), so HOLD
+    # the watermark and re-poll the window next tick. Only a genuine end-of-pages
+    # exit (next_cursor is None) advances. A per-ORDER close failure does NOT hold —
+    # idempotency retries that order; the window WAS fully scanned. Persist even on
+    # a zero-close run so the window advances.
+    page_cap_hit = (not fetch_failed) and (not scan_complete)
+    if fetch_failed or page_cap_hit:
+        _note_watermark_hold(
+            summary,
+            merchant_id=merchant_id,
+            now=now,
+            watermark=watermark,
+            page_cap_hit=page_cap_hit,
+            log=logger,
         )
     else:
         await _write_poll_watermark(merchant_id, run_started, summary["closed"])
@@ -413,6 +483,23 @@ async def poll_external_conversions_batch(
                 result["total_closed"] += int(res.get("closed") or 0)
         except Exception as e:
             logger.warning("external_conversion_poller: woo lane failed err=%s", str(e)[:200])
+
+        # One structured batch metric across BOTH lanes so flipping the enable flag
+        # is observable (F2 / #1485): held = merchants whose window couldn't fully
+        # scan this tick (fetch failure or page cap → NOT advanced); stuck = held
+        # long enough to need operator action. A rising held/stuck count is the
+        # signal that MAX_PAGES / a credential needs attention.
+        result["merchants_held"] = sum(1 for r in result["results"] if r.get("watermark_held"))
+        result["merchants_stuck"] = sum(1 for r in result["results"] if r.get("watermark_stuck"))
+        result["total_errors"] = sum(int(r.get("errors") or 0) for r in result["results"])
+        logger.info(
+            "external_conversion_poller batch: merchants=%d closed=%d held=%d stuck=%d errors=%d",
+            result["merchants_polled"],
+            result["total_closed"],
+            result["merchants_held"],
+            result["merchants_stuck"],
+            result["total_errors"],
+        )
     except Exception as e:  # the batch entry must never raise out
         logger.warning("external_conversion_poller: batch aborted err=%s", str(e)[:200])
         result["ok"] = False
