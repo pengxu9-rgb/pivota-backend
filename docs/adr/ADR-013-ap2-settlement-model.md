@@ -1,6 +1,6 @@
 # ADR-013: AP2 Settlement Model — how an AP2 transaction actually moves value
 
-**Status:** Proposed
+**Status:** **Superseded by [ADR-016](ADR-016-pivota-non-custodial.md)** (was Proposed) — its Option A (a Pivota-held agent ledger) has Pivota custody agent funds, which contradicts Pivota's non-custodial positioning. The settlement decision now lives in ADR-016 (delegate to the parties; Pivota routes + records + attests, never holds funds). Retained for its trade-off analysis.
 **Date:** 2026-07-18
 **Deciders:** Founder (peng) — settlement strategy; Commerce / Trust / Finance owners
 **Part of:** the agent-protocol interoperability model — **ADR-014** (meta). ADR-013 is its **settlement-layer** instance: the rails an adapter's `select_settlement` chooses (ledger / PSP / on-chain), x402 being one such rail.
@@ -34,6 +34,8 @@ This ADR decides the settlement mechanism, distinguishing the **pilot** (a small
 - **Don't re-litigate ADR-012's boundary.** PSP-settled transactions were routed to the **API-key ACP rail** (`/orders/*`). A settlement model that puts card/PSP settlement *under AP2* re-opens the boundary ADR-012 drew.
 
 ## Decision
+
+> ⚠️ **SUPERSEDED by [ADR-016](ADR-016-pivota-non-custodial.md).** The decision below makes Pivota custody agent funds (an internal ledger) — which contradicts Pivota's non-custodial positioning. Under ADR-016, AP2 settles **directly between the parties** (x402 wallet-to-wallet / merchant PSP) and Pivota routes + records + attests, never holds funds. This section is retained for its trade-off analysis only; do not implement the ledger.
 
 **Adopt Option A: settle AP2 transactions against an internal, Pivota-held agent ledger — a real balance that `confirm` debits atomically and `wallet/balance` reads. Treat this as the off-chain accounting layer that the ADR-012 stablecoin north-star (Option C — custodian/on-chain) later *backs*, not a throwaway. Do not settle AP2 via PSP/card (Option B) — that is the API-key ACP rail's job per ADR-012.**
 
