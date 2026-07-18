@@ -69,6 +69,8 @@ class FakeDB:
                 "agent_id": AGENT_ID,
                 "scope": json.dumps({"actions": ["read", "create_payment"]}),
                 "status": "active",
+                "spending_limit": None,
+                "spent_amount": 0,
                 "expires_at": datetime.utcnow() + timedelta(hours=1),
             }
         }
