@@ -3,6 +3,7 @@
 **Status:** Proposed
 **Date:** 2026-07-18
 **Deciders:** Founder (peng) — settlement strategy; Commerce / Trust / Finance owners
+**Part of:** the agent-protocol interoperability model — **ADR-014** (meta). ADR-013 is its **settlement-layer** instance: the rails an adapter's `select_settlement` chooses (ledger / PSP / on-chain), x402 being one such rail.
 **Builds on:** ADR-012 (agent transaction rail boundary) — which decided *that* AP2 is the signed rail for external + stablecoin-settled transactions and how it roots identity, but **explicitly deferred how settlement executes** (ADR-012 Action Item #8 "reconciliation owner … before AP2 carries real money"; and "Must revisit if x402/wallet settlement proves unviable"). Companion: `docs/AP2_ENABLEMENT.md` (§6 known limitations); [PR #1471](https://github.com/pengxu9-rgb/pivota-backend/pull/1471) (wallet/balance → `501`).
 **Scope:** the **settlement leg** of the AP2 rail only — what `/ap2/transaction/confirm` does to move value, and where `/ap2/wallet/balance` reads a balance from. Out of scope: identity/mandates (ADR-012), discovery (ADR-007), and the API-key ACP rail's existing PSP settlement.
 

@@ -159,7 +159,7 @@ Decisive factor: **multi-protocol is the product, the protocols are unsettled, a
 5. [ ] **Author the protocol-conformance matrix** (protocol × layer → native / adapted / n-a) beside `docs/AP2_ENABLEMENT.md` — with a **named owner** and an update trigger (the adapter-PR template requires a matrix update), so it cannot silently go stale the way `AP2_ENABLEMENT.md` §6 did.
 6. [ ] **Refactor incrementally — characterization tests first.** Before migrating any existing `protocol_name` branching (`agent_payment_sdk` / `payment_execution` / kill-switch) behind the registry, pin the current guard behavior — especially the kill-switch's fail-closed semantics — with characterization tests; then migrate one protocol at a time with no behavior change. **New protocols enter through the registry first; live Rail-1 paths migrate last.**
 7. [ ] **Governance rule — mechanical, not tribal:** a new protocol ⇒ a new adapter under `services/protocols/`, mapped to canonical layers, core untouched. Enforce with an automated check (CI grep / import-linter) rejecting `protocol_name` literals in the delimited core module set (item 2); the reviewer checklist is the backstop, not the mechanism.
-8. [ ] **Cross-link** ADR-007/012/013 to this ADR as their parent framework.
+8. [x] **Cross-link** ADR-007/012/013 to this ADR as their parent framework — each carries a `**Part of:**` header naming the layer it instantiates (discovery / identity / settlement).
 
 ## Rollback
 
