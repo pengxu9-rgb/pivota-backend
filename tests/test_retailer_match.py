@@ -20,6 +20,32 @@ def test_size_suffix_stripped_so_retailer_aligns_with_canonical():
            retailer_match_key("COSRX", "Advanced Snail 96 Mucin Power Essence")
 
 
+def test_decimal_imperial_size_dotted_units_stripped():
+    # 2026-07-18 HITL miss: normalize_title splits "3.38" into "3 38", so the
+    # post-normalization size strip orphaned the "3" ("dynasty cream 3") and the
+    # official title failed to match our size-agnostic canonical.
+    canonical = retailer_match_key("Sulwhasoo", "Dynasty Cream")
+    assert retailer_match_key("Sulwhasoo", "Dynasty Cream 3.38 fl.oz.(100ml)") == canonical
+    assert retailer_match_key("Sulwhasoo", "Dynasty Cream 3.38 fl. oz. (100ml)") == canonical
+    assert retailer_match_key("Sulwhasoo", "Dynasty Cream 3.38fl.oz") == canonical
+    assert retailer_match_key("Sulwhasoo", "Dynasty Cream 1.69 oz.") == canonical
+
+
+def test_decimal_metric_size_stripped():
+    assert retailer_match_key("COSRX", "Advanced Snail 96 Mucin Power Essence 3.38 oz / 100ml") == \
+           retailer_match_key("COSRX", "Advanced Snail 96 Mucin Power Essence")
+    assert retailer_match_key("Beauty of Joseon", "Relief Sun Rice Probiotics 1.69 fl oz (50ml)") == \
+           retailer_match_key("Beauty of Joseon", "Relief Sun Rice Probiotics 50ml")
+
+
+def test_decimal_active_strengths_survive_raw_strip():
+    # Decimal identity numbers carry NO size unit — the raw decimal strip is
+    # unit-anchored, so they must survive intact.
+    assert "54 2" in retailer_match_key("Benton", "Aloe BHA 54.2 Skin Toner")
+    assert retailer_match_key("By Wishtrend", "Vitamin C 21.5 Advanced Serum 30ml") != \
+           retailer_match_key("By Wishtrend", "Vitamin C 15 Advanced Serum 30ml")
+
+
 def test_pack_and_promo_noise_stripped():
     a = retailer_match_key("COSRX", "Low pH Good Morning Gel Cleanser Special Set (150ml + 50ml freegift)")
     b = retailer_match_key("COSRX", "Low pH Good Morning Gel Cleanser")
