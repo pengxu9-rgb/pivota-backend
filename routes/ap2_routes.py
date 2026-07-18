@@ -251,23 +251,26 @@ async def grant_consent(request: Request):
 
 
 @router.post("/consent/revoke")
-async def revoke_consent(request: Request):
+async def revoke_consent(
+    request: Request,
+    _sig: bool = Depends(verify_ap2_signature),
+):
     """
-    Revoke agent consent
-    
-    Requires:
-    - X-Agent-Consent: Valid consent token
+    Revoke agent consent.
+
+    Revocation is a mutating lifecycle action, so it is signature-authenticated
+    like the transaction routes — not merely token-bearing. Requires (all enforced
+    by Depends(verify_ap2_signature)):
+    - X-Agent-Consent: the consent token to revoke (also identifies the agent),
+    - X-AP2-Signature: proves the consent's own agent (verified against its
+      resolved key), so a leaked token alone cannot revoke,
+    - X-AP2-Nonce: replay protection.
     """
     from services.consent_service import consent_service
-    
+
+    # verify_ap2_signature already resolved + verified the agent from this token.
     consent_token = request.headers.get("X-Agent-Consent")
-    
-    if not consent_token:
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail="Missing X-Agent-Consent header"
-        )
-    
+
     try:
         await consent_service.revoke_consent(consent_token)
         return {"status": "revoked"}
@@ -587,12 +590,14 @@ async def get_exchange_quote(exchange_request: AP2ExchangeRateRequest):
 async def execute_exchange(request: Request):
     """
     Execute currency exchange (X-402 protocol)
-    
-    Requires:
-    - X-Agent-Consent: Valid consent token
-    - X-Wallet-Address: Agent wallet address
+
+    Not yet implemented. When built, this is a money-moving WRITE and must adopt
+    the full signed contract like the transaction routes — add
+    ``Depends(verify_ap2_signature)`` (consent + X-AP2-Signature + X-AP2-Nonce).
+    Until then it returns 501; the middleware already header-gates it as a
+    non-public write route.
     """
-    # TODO: Implement X-402 exchange execution
+    # TODO: Implement X-402 exchange execution (with Depends(verify_ap2_signature)).
     raise HTTPException(
         status_code=status.HTTP_501_NOT_IMPLEMENTED,
         detail="X-402 exchange execution not yet implemented"
