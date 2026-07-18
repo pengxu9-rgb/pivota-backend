@@ -37,8 +37,21 @@ _UNIT = (
     r"sheets?|patches|patch|pads?|masks?|"
     r"set|sets|kit|kits|tablets?|capsules?|caps|softgels?|sticks?)"
 )
-# '100ml', '3 ea', '24 patches', '3.52 oz'
+# '100ml', '3 ea', '24 patches' — runs on normalize_title output, where dotted
+# unit spellings ("fl.oz.", "fl. oz.", "oz.") have already collapsed to
+# "fl oz" / "oz", so they need no cases here.
 _SIZE_RE = re.compile(rf"\b\d+(?:\.\d+)?\s*{_UNIT}\b")
+# DECIMAL sizes ('3.38 fl.oz.(100ml)', '1.69 oz.', '6.5g') must be stripped
+# from the RAW title: normalize_title drops '.' and splits "3.38" into "3 38",
+# so _SIZE_RE then eats "38 fl oz" but orphans the "3" into the key — real miss
+# 2026-07-18 HITL: "Dynasty Cream 3.38 fl.oz.(100ml)" keyed "dynasty cream 3"
+# and failed to match the "Dynasty Cream" canonical. Volume/weight units only,
+# and still unit-anchored: decimal active strengths carry no unit ("aloe 54.2",
+# "vitamin c 21.5"), so identity numbers cannot match here.
+_RAW_DECIMAL_SIZE_RE = re.compile(
+    r"(?<![\w.])\d+\.\d+\s*(?:fl\.?\s?oz|oz|ml|mg|kg|g|l)\.?(?!\w)",
+    re.IGNORECASE,
+)
 # 'x 24' / '3 x 24' leftovers from 'NxM' pack notation
 _XPACK_RE = re.compile(r"\b\d*\s*x\s*\d+\b")
 # stray single 'x' left after size tokens around it are removed
@@ -83,9 +96,13 @@ def retailer_match_key(brand: Optional[str], title: Optional[str]) -> str:
     title_norm = normalize_title(title)
     if not brand_norm or not title_norm:
         return ""
-    # Size units first ("3ea", "24 patches"), so a 'NxM' pack note collapses to a
+    # Decimal sizes first, on the RAW title (normalize_title splits "3.38" into
+    # "3 38" — see _RAW_DECIMAL_SIZE_RE); title_norm above stays un-stripped so
+    # the all-packaging fallback below keeps its collision protection.
+    t = normalize_title(_RAW_DECIMAL_SIZE_RE.sub(" ", title))
+    # Then size units ("3ea", "24 patches"), so a 'NxM' pack note collapses to a
     # stray 'x' that _STRAY_X_RE clears — rather than orphaning the unit word.
-    t = _SIZE_RE.sub(" ", title_norm)
+    t = _SIZE_RE.sub(" ", t)
     t = _XPACK_RE.sub(" ", t)
     t = _STRAY_X_RE.sub(" ", t)
     tokens = t.split()
