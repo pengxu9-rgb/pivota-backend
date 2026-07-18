@@ -349,7 +349,7 @@ def test_grant_with_did_web_identity(monkeypatch):
 # --------------------------------------------------------------------------- #
 
 class _RaisingClient:
-    """Fake httpx.AsyncClient whose .get raises a transport error."""
+    """Fake httpx.AsyncClient whose .stream() raises a transport error on entry."""
 
     def __init__(self, *a, **k):
         pass
@@ -360,9 +360,17 @@ class _RaisingClient:
     async def __aexit__(self, *a):
         return False
 
-    async def get(self, *a, **k):
+    def stream(self, method, url, headers=None):
         import httpx
-        raise httpx.ConnectError("connection refused")
+
+        class _Ctx:
+            async def __aenter__(self_inner):
+                raise httpx.ConnectError("connection refused")
+
+            async def __aexit__(self_inner, *a):
+                return False
+
+        return _Ctx()
 
 
 async def test_default_fetch_wraps_transport_error_as_valueerror(monkeypatch):
@@ -375,6 +383,79 @@ async def test_default_fetch_wraps_transport_error_as_valueerror(monkeypatch):
         await ap2_did_web._default_fetch(
             "https://agents.example.com/.well-known/did.json"
         )
+
+
+# --------------------------------------------------------------------------- #
+# streaming size cap + bounded cache
+# --------------------------------------------------------------------------- #
+
+class _StreamResp:
+    def __init__(self, status, chunks):
+        self.status_code = status
+        self._chunks = chunks
+
+    async def aiter_bytes(self):
+        for c in self._chunks:
+            yield c
+
+
+def _stream_client(status, chunks):
+    resp = _StreamResp(status, chunks)
+
+    class _Ctx:
+        async def __aenter__(self):
+            return resp
+
+        async def __aexit__(self, *a):
+            return False
+
+    class _Client:
+        def __init__(self, *a, **k):
+            pass
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *a):
+            return False
+
+        def stream(self, method, url, headers=None):
+            return _Ctx()
+
+    return _Client
+
+
+async def test_default_fetch_streaming_size_cap(monkeypatch):
+    import httpx
+    monkeypatch.setattr(ap2_did_web, "_assert_public_host", lambda host: None)
+    # Two chunks whose combined size exceeds the cap → rejected mid-stream.
+    big = b"x" * (ap2_did_web._MAX_DOC_BYTES // 2 + 1)
+    monkeypatch.setattr(httpx, "AsyncClient", _stream_client(200, [big, big]))
+    with pytest.raises(ValueError):
+        await ap2_did_web._default_fetch("https://agents.example.com/.well-known/did.json")
+
+
+async def test_default_fetch_streams_valid_json(monkeypatch):
+    import httpx
+    monkeypatch.setattr(ap2_did_web, "_assert_public_host", lambda host: None)
+    monkeypatch.setattr(httpx, "AsyncClient", _stream_client(200, [b'{"id":', b'"did:web:x"}']))
+    doc = await ap2_did_web._default_fetch("https://agents.example.com/.well-known/did.json")
+    assert doc == {"id": "did:web:x"}
+
+
+def test_cache_store_purges_expired_and_bounds_size(monkeypatch):
+    ap2_did_web._clear_cache()
+    monkeypatch.setattr(ap2_did_web, "_CACHE_MAX_ENTRIES", 3)
+    now = 1000.0
+    for i in range(3):
+        ap2_did_web._cache_store((f"did:web:e{i}", None), ("pem", "ES256"), now)
+    assert len(ap2_did_web._cache) == 3
+
+    # An already-expired entry is purged on the next store, and size stays bounded.
+    ap2_did_web._cache[("did:web:old", None)] = (now - 1, ("pem", "ES256"))
+    ap2_did_web._cache_store(("did:web:new", None), ("pem", "ES256"), now)
+    assert ("did:web:old", None) not in ap2_did_web._cache
+    assert len(ap2_did_web._cache) <= 3
 
 
 def test_grant_did_web_network_failure_is_401(monkeypatch):
