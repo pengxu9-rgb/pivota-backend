@@ -171,19 +171,26 @@ def _note_watermark_hold(
     summary["page_cap_hit"] = bool(page_cap_hit)
     reason = "page cap hit (window exceeds MAX_PAGES)" if page_cap_hit else "fetch failed"
     held_age_days = (now - watermark).days if watermark is not None else None
-    # First-run-over-cap (no watermark) or a long-stale held watermark = stuck.
-    stuck = page_cap_hit and (
-        watermark is None or (held_age_days is not None and held_age_days >= STALE_WATERMARK_ALERT_DAYS)
+    # "Stuck" = the watermark has been unable to advance long enough to need a
+    # human. Detected by AGE, so it fires for BOTH hold reasons — a persistently
+    # page-capped window (raise MAX_PAGES / backfill) AND a persistently failing
+    # fetch (e.g. a revoked credential). A first run already over the page cap is
+    # stuck by definition (its oversized window won't fix itself); a first-run
+    # *fetch* failure has no age yet and may be transient, so it rides the batch
+    # held/errors counts until a watermark exists to age from.
+    stuck = (held_age_days is not None and held_age_days >= STALE_WATERMARK_ALERT_DAYS) or (
+        page_cap_hit and watermark is None
     )
     if stuck:
         summary["watermark_stuck"] = True
+        remedy = "raise MAX_PAGES or backfill" if page_cap_hit else "check the merchant credential / connection"
         log.error(
-            "holding watermark merchant=%s STUCK — %s; the window has not fully "
-            "scanned (watermark_age_days=%s) so conversions past the scanned prefix "
-            "are NOT closed. Raise MAX_PAGES or backfill this merchant.",
+            "holding watermark merchant=%s STUCK — %s; the window has not advanced "
+            "(watermark_age_days=%s) so conversions in it are NOT closed. Operator: %s.",
             merchant_id,
             reason,
             held_age_days,
+            remedy,
         )
     else:
         log.warning(

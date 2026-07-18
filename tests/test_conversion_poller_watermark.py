@@ -13,7 +13,7 @@ NOT on a per-*order* close failure (the window WAS scanned; idempotency retries 
 bad order). These tests pin both halves for the Shopify and WooCommerce lanes.
 """
 import sys
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 import pytest
@@ -180,6 +180,39 @@ async def test_shopify_page_cap_first_run_escalates_stuck(monkeypatch):
     assert summary.get("watermark_held") is True
     assert summary.get("page_cap_hit") is True
     assert summary.get("watermark_stuck") is True, "a first-run window over the page cap is stuck"
+    assert writes == []
+
+
+@pytest.mark.asyncio
+async def test_shopify_stale_fetch_failure_escalates_stuck(monkeypatch):
+    # A merchant that scanned successfully before, then a persistent fetch failure
+    # (e.g. a revoked credential) holds every tick — its watermark AGES. Once it
+    # crosses the stale threshold it must escalate to stuck, even though this is a
+    # fetch failure, not a page cap (the review-flagged broken-credential case).
+    from services import external_conversion_poller as ecp
+
+    writes = []
+    stale = _NOW - timedelta(days=3)  # > STALE_WATERMARK_ALERT_DAYS
+
+    async def stale_watermark(*_a, **_k):
+        return stale
+
+    async def fake_write(*args, **_k):
+        writes.append(args)
+
+    async def raising_fetch(**_kw):
+        raise RuntimeError("shopify 401 Unauthorized (revoked token)")
+
+    monkeypatch.setattr(ecp, "_read_poll_watermark", stale_watermark)
+    monkeypatch.setattr(ecp, "_write_poll_watermark", fake_write)
+    monkeypatch.setattr(ecp, "_fetch_orders_page", raising_fetch)
+
+    summary = await ecp.poll_external_conversions_for_merchant(
+        merchant_id="m1", credentials=_SHOPIFY_CREDS, now=_NOW,
+    )
+    assert summary.get("watermark_held") is True
+    assert summary.get("page_cap_hit") is not True          # it's a fetch failure, not a cap
+    assert summary.get("watermark_stuck") is True, "a long-stale fetch-failure hold must escalate"
     assert writes == []
 
 
