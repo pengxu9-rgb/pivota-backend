@@ -21,7 +21,13 @@ _MIRROR_ENV = "EXTERNAL_SEED_MIRROR_MAKE_SERVABLE"
 
 
 class _FakeDB:
+    def __init__(self):
+        # Every (sql, params) issued, so tests can assert the --no-serving
+        # lifecycle cap UPDATE is (or isn't) emitted.
+        self.executed = []
+
     async def execute(self, sql, params=None):
+        self.executed.append((sql, params))
         return None
 
     async def fetch_one(self, sql, params=None):
@@ -46,9 +52,10 @@ _COHORT = [{
 def spies(monkeypatch):
     """Stub every DB-touching dependency of _onboard and record which of the two
     serving steps get called."""
+    db = _FakeDB()
     calls = {"resolve_pdp_scope": 0, "make_servable": 0, "mirror": 0, "inci": 0,
-             "mirror_env": "unset"}
-    monkeypatch.setattr(onboard, "database", _FakeDB())
+             "mirror_env": "unset", "db": db}
+    monkeypatch.setattr(onboard, "database", db)
     # Baseline: prod has the mirror's serving pass ON. monkeypatch restores it
     # after the test, so the onboard's direct os.environ mutation can't leak.
     monkeypatch.setenv(_MIRROR_ENV, "1")
@@ -98,6 +105,17 @@ def spies(monkeypatch):
     return calls
 
 
+def _cap_updates(db):
+    """The --no-serving lifecycle-cap UPDATEs issued against catalog_products:
+    UPDATE ... SET pdp_lifecycle_stage='candidate' ... WHERE ... IN ('validated','published')."""
+    return [
+        (sql, params)
+        for sql, params in db.executed
+        if "pdp_lifecycle_stage='candidate'" in sql
+        and "IN ('validated','published')" in sql
+    ]
+
+
 async def test_no_serving_skips_both_serving_steps(spies):
     await onboard._onboard(_COHORT, [], serve=False)
     # identity/mirror/INCI half still ran...
@@ -111,6 +129,41 @@ async def test_no_serving_skips_both_serving_steps(spies):
     assert spies["mirror_env"] == "0"
 
 
+async def test_no_serving_caps_lifecycle_to_candidate(spies):
+    """The recall lane (_fetch_canonical_search_rows) gates on pdp_lifecycle_stage,
+    not serving_eligible. A content-rich held-out row (title+image+description+
+    category_path+tags) would otherwise compute 'validated' via the mirror and leak
+    into cross-merchant recall (the hoverair_x1_combo incident). --no-serving must
+    cap it back to 'candidate' so the "held-out ⇒ not recall-visible" invariant holds.
+    One cap UPDATE per cohort product, targeting the product_key, only demoting
+    validated/published."""
+    await onboard._onboard(_COHORT, [], serve=False)
+    caps = _cap_updates(spies["db"])
+    assert len(caps) == len(_COHORT)
+    _sql, params = caps[0]
+    assert params["pk"] == _PK
+
+
+def test_content_rich_row_computes_validated_precondition():
+    """The cap exists because content ALONE reaches 'validated' — the leak
+    precondition. A held-out row with title+image+description+category_path+a
+    taxonomy tag computes 'validated' (which the recall lane treats as visible),
+    with no serving artifacts involved. This is exactly the shape hoverair_x1_combo
+    had after the drone category classifier gave it a category_path + tag."""
+    from services.pdp_lifecycle import compute_lifecycle_stage
+
+    row = {
+        "title": "HOVERAir X1 Combo Self-Flying Camera",
+        "description": "A pocket-sized self-flying camera drone for hands-free aerial video.",
+        "image_url": "https://example.com/x1-combo.jpg",
+        "category_path": "electronics/drone",
+        "tags": ["drone"],
+        "pdp_scope": None,
+        "source_system": "external_brand_crawl",
+    }
+    assert compute_lifecycle_stage(row) == "validated"
+
+
 async def test_default_runs_both_serving_steps(spies):
     await onboard._onboard(_COHORT, [], serve=True)
     assert spies["mirror"] == 1
@@ -120,3 +173,6 @@ async def test_default_runs_both_serving_steps(spies):
     assert spies["make_servable"] == 1
     # default must NOT touch the mirror's serving-pass env (prod baseline "1" stands).
     assert spies["mirror_env"] == "1"
+    # and the serving posture must NOT cap lifecycle — servable rows are allowed to
+    # reach validated/published and enter recall.
+    assert _cap_updates(spies["db"]) == []

@@ -543,6 +543,29 @@ async def _onboard(
     report = await ingest_crawled_inci_items(inci_items, dry_run=False, db=database)
     print(f"inci ingest: written={report.get('inci_written')} actives={report.get('actives_filled')} skipped={report.get('skipped')}")
     if not serve:
+        # Cap the held-out rows' lifecycle so they can NEVER enter cross-merchant
+        # recall. The recall lane services/pivot_query_service.py
+        # `_fetch_canonical_search_rows` gates on pdp_lifecycle_stage IN
+        # ('validated','published') OR IS NULL — it trusts lifecycle, NOT
+        # serving_eligible. But the mirror computed pdp_lifecycle_stage from CONTENT
+        # (compute_lifecycle_stage): a row with a title+image+description PLUS a
+        # category_path and any taxonomy tag lands at 'validated' independent of the
+        # serving artifacts we deliberately skip below. So a --no-serving row that is
+        # content-rich would leak into recall even though it's held out of serving.
+        # (Live: hoverair_x1_combo did exactly this once the drone category
+        # classifier gave held-out rows a category_path + a description-derived tag →
+        # 'validated' → recall, while its 'candidate' siblings stayed hidden.)
+        # Cap to 'candidate' (the row is content-complete; we only need it BELOW the
+        # recall lane's validated/published threshold — 'draft' would understate it).
+        # Idempotent + per-row (ON CONFLICT in the mirror is DO NOTHING, so it never
+        # rewrites an existing row's stage; this cap is the explicit correction).
+        for p in cohort:
+            _merchant_id, product_key = keys[p["external_product_id"]]
+            await database.execute(
+                "UPDATE catalog_products SET pdp_lifecycle_stage='candidate', updated_at=NOW() "
+                "WHERE product_key=:pk AND pdp_lifecycle_stage IN ('validated','published')",
+                {"pk": product_key},
+            )
         # Decision-grade-only onboard (--no-serving). Everything above is written:
         # the per-brand observed seller identity, the external_product_seeds rows,
         # the catalog_products + catalog_skus mirror (with content_key), the
