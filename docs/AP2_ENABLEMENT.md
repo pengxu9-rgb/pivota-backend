@@ -23,7 +23,7 @@ surface; treat it as a gated change.
 | | Item | State |
 |---|---|---|
 | ✅ | Identity, signature, header-contract, mandate authority (see "What's built") | DONE — merged & reviewed |
-| ⬜ | **Apply schema** (migrations `021/022/023/182/183/184`) | ops — section 1 |
+| ⬜ | **Apply schema** (migrations `021/022/023/182/183/184/185`) | ops — section 1 |
 | ⬜ | **Provision agent identity** (`agents.did` per pilot agent) | ops — section 2 |
 | ⬜ | **Provision agent wallets** (confirm path) | ops — section 3 |
 | ⬜ | **`PLATFORM_SIGNING_KEY`** (receipt signing) | config — section 4 |
@@ -75,6 +75,7 @@ applied**, or routes 500 (fail-closed) on first use:
 | `182_nonce_tracker_request_path.sql` | corrective — `nonce_tracker.request_path` (#1443) |
 | `183_agents_did.sql` | `agents.did` (#1454) — the identity readers `SELECT did`; without it every AP2 read errors on the undefined column |
 | `184_ap2_trusted_issuers.sql` | `ap2_trusted_issuers` (#1461) — the mandate authority registry (read by `transaction/initiate` when a mandate chain is present) |
+| `185_x402_transactions_reconcile.sql` | **corrective** — reconciles `x402_transactions` with the transaction routes: adds `product_id` + `confirmed_at`, makes `authorization_code` nullable, and widens the `status` CHECK to permit `pending`/`completed`. **Without it `initiate`/`confirm` and the GET transaction/receipt reads 500** (023's committed shape rejects what the routes write). Idempotent. |
 
 **Not applied at boot** — the AP2 schema is `schema_guard`-exempt (surface is off
 everywhere). Apply on demand via the by-number migration runner
@@ -86,7 +87,7 @@ everywhere). Apply on demand via the by-number migration runner
   `mode` ≠ `"apply"` writes nothing), so a missing `mode` silently no-ops.
   Postgres only.
 
-Apply in order `021`, `022`, `023`, `182`, `183`, `184`. All are idempotent
+Apply in order `021`, `022`, `023`, `182`, `183`, `184`, `185`. All are idempotent
 (`ADD COLUMN`/`CREATE TABLE ... IF [NOT] EXISTS`) — safe to re-apply. Verify:
 
 ```sql
@@ -99,8 +100,17 @@ SELECT to_regclass('public.agent_consents')      IS NOT NULL AS agent_consents,
        EXISTS (SELECT 1 FROM information_schema.columns
                WHERE table_name='nonce_tracker' AND column_name='request_path') AS nonce_request_path,
        EXISTS (SELECT 1 FROM information_schema.columns
-               WHERE table_name='agents' AND column_name='did') AS agents_did;
+               WHERE table_name='agents' AND column_name='did') AS agents_did,
+       -- migration 185: the transaction routes 500 without these
+       EXISTS (SELECT 1 FROM information_schema.columns
+               WHERE table_name='x402_transactions' AND column_name='product_id') AS x402_product_id,
+       EXISTS (SELECT 1 FROM information_schema.columns
+               WHERE table_name='x402_transactions' AND column_name='confirmed_at') AS x402_confirmed_at;
 ```
+
+**Existence alone is not enough** for `x402_transactions` — migration 023 creates
+the table but with the wrong shape; the `product_id`/`confirmed_at` column checks
+above are what confirm migration 185 was applied.
 
 ### 2. Provision agent identity (`agents.did`)
 
@@ -184,7 +194,23 @@ grant/transaction auth.
 
 Enforced at the **route level** (`Depends(verify_ap2_signature)` — the real gate,
 since the middleware is flag-gated) and mirrored by the middleware.
-`x402/exchange` is `501`; when implemented it adopts the full signed contract.
+
+## 6. Known limitations (not pilot-ready — do not rely on these)
+
+The **pilot path is** grant → initiate → confirm (+ the GET transaction/receipt
+reads), all functional once the schema (incl. migration 185) and provisioning are
+in place. Two routes are **not** functional yet — their auth tiers are correct,
+but the handlers are not:
+
+- **`GET /ap2/wallet/balance`** — the handler `SELECT`s `balance, currency,
+  last_updated … WHERE wallet_address = …`, but `agent_wallets` (migration 022) is
+  an address registry with none of those columns (it has `address`, `status`,
+  `network`, …), so the read 500s. `agent_wallets` has **no balance store at all**;
+  fixing this needs a decision on where a balance comes from (on-chain / custodian
+  / a new column populated by settlement). Tracked as a separate follow-up. Do not
+  advertise wallet/balance in the pilot.
+- **`POST /ap2/x402/exchange`** — `501 Not Implemented` (stablecoin exchange
+  execution not built).
 
 ## Reviewer / owner sign-off (required before the flip)
 
@@ -192,7 +218,7 @@ Do not set `ENABLE_AP2_ROUTES=true` in any shared environment until each owner
 confirms their item, and record the sign-offs (PR approval, deploy ticket, or
 change log) so the flip is auditable:
 
-- [ ] **Schema applied** — migrations `021/022/023/182/183/184` applied and the
+- [ ] **Schema applied** — migrations `021/022/023/182/183/184/185` applied and the
       section-1 verify SQL is all true. (Section 1)
 - [ ] **Agent identity provisioned** — every pilot agent has `agents.did` (or a
       legacy PEM) set; the section-2 verify SQL returns `has_identity = true`. If
