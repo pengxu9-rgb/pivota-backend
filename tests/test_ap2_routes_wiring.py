@@ -149,6 +149,33 @@ def test_enabled_middleware_still_guards_protected_route(enforced_client):
     assert res.json().get("error") == "Missing X-Agent-Consent header"
 
 
+def test_wallet_balance_is_consent_only(enforced_client):
+    # GET /ap2/wallet/balance is an authenticated READ: consent-gated but NOT
+    # signature/nonce-gated (a nonce on an idempotent read would make it
+    # single-use). With a consent token present but no signature/nonce, the
+    # middleware must let it reach the route, which answers with its OWN 400
+    # (missing wallet address) — proving the middleware did not block on a
+    # missing signature.
+    res = enforced_client.get(
+        "/ap2/wallet/balance",
+        headers={"X-Agent-Consent": "consent-xyz"},
+    )
+    assert res.status_code == 400
+    assert res.json().get("detail") == "Missing required headers"
+
+
+def test_revoke_is_full_tier_requires_signature(enforced_client):
+    # POST /ap2/consent/revoke is a mutating WRITE — signature-authenticated, not
+    # token-only. With a consent token but no signature, the middleware blocks it
+    # (full tier), proving revoke is NOT treated as consent-only.
+    res = enforced_client.post(
+        "/ap2/consent/revoke",
+        headers={"X-Agent-Consent": "consent-xyz"},
+    )
+    assert res.status_code == 401
+    assert res.json().get("error") == "Missing X-AP2-Signature header"
+
+
 def test_public_status_endpoint_open_under_enforcement(enforced_client):
     res = enforced_client.get("/ap2/status")
     assert res.status_code == 200

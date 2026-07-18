@@ -97,19 +97,24 @@ and #1445 — `cleanup_old_nonces` interval param bind).
 `POST /ap2/transaction/initiate` and `/ap2/transaction/confirm` now adopt
 `Depends(verify_ap2_signature)`. No further action for this blocker.
 
-### 3. Reconcile the middleware header contract for the other write routes
+### 3. Middleware header contract — RESOLVED
 
-The middleware requires `X-Agent-Consent` **and** `X-AP2-Signature` **and**
-`X-AP2-Nonce` on every non-public `/ap2/*` route. Only `/ap2/consent/grant` is
-exempted (item above). The remaining write routes are **not** all consistent
-with that requirement — e.g. `POST /ap2/consent/revoke` sends only
-`X-Agent-Consent`, so with enforcement on it would be rejected for a missing
-signature/nonce. Before enabling, either align each route's header usage with
-the middleware, or narrow the middleware's per-route requirements. Confirm the
-intended contract for: `revoke`, `x402/exchange`, `wallet/balance`.
-(`transaction/initiate` and `transaction/confirm` were reconciled in #1441 — they
-enforce consent + signature + nonce via `Depends(verify_ap2_signature)`,
-consistent with the middleware.)
+The contract is now decided per route and the middleware + routes agree (three
+tiers), so this is no longer a blocker:
+
+| Tier | Requires | Routes |
+| --- | --- | --- |
+| **public** | nothing | `status`, `protocols`, `consent/grant` (self-authenticating), `GET transaction/{id}`, `GET receipt/{id}`, `x402/quote` |
+| **consent-only** | `X-Agent-Consent` (+ the route's own ownership check) | `GET wallet/balance` — an idempotent READ; a per-request nonce would make each balance check single-use |
+| **full (write)** | `X-Agent-Consent` + `X-AP2-Signature` + `X-AP2-Nonce` | `consent/revoke`, `transaction/initiate`, `transaction/confirm`, `x402/exchange` |
+
+Decisions: **`revoke`** was aligned **up** — it is a mutating lifecycle action, so
+it now enforces a signature via `Depends(verify_ap2_signature)` (a leaked token
+alone cannot revoke; replay-protected). **`wallet/balance`** was aligned **down**
+— the middleware gained a *consent-only* tier for it. **`x402/exchange`** is 501;
+when implemented it adopts the full signed contract (`Depends(verify_ap2_signature)`).
+`transaction/initiate`/`confirm` were already full (#1441). Enforced at the route
+level (the real gate, since the middleware is flag-gated) and by the middleware.
 
 ### 4. Confirm the backing schema exists in the target environment
 
@@ -191,9 +196,10 @@ confirmed their blocker is cleared:
 - [x] **`verify_ap2_signature` reconciliation** — ✅ resolved in #1441: one
       canonical contract (`services/ap2_signing.py`) + nonce-replay guard; the
       transaction routes adopt the helper. (Blocker 2)
-- [ ] **Middleware header contract** — owner confirms each non-public write route
-      (`revoke`, `transaction/*`, `x402/exchange`, `wallet/balance`) is consistent
-      with the middleware's required headers for the pilot scope. (Blocker 3)
+- [x] **Middleware header contract** — RESOLVED (Blocker 3): three tiers
+      (public / consent-only / full) with middleware + routes in agreement;
+      `revoke` is now signature-enforced, `wallet/balance` is consent-only. See
+      section 3.
 - [ ] **Schema applied** — owner confirms migrations `021` + `022` + `023` + `182`
       + `183` + `184` are applied (via `POST /admin/migrations/pending/{NNN}/run`,
       `mode: "apply"`) and the verify SQL returns true for every column/table

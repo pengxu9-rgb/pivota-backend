@@ -64,33 +64,44 @@ class AP2SecurityMiddleware(BaseHTTPMiddleware):
             (request.url.path.startswith("/ap2/receipt/") and request.method == "GET") or
             request.url.path == "/ap2/x402/quote"
         )
-        
+
+        # Consent-only endpoints: authenticated READS that need a valid consent
+        # token but NOT a per-request signature/nonce. A nonce on an idempotent GET
+        # would make each read single-use; these are gated by consent plus the
+        # route's own ownership check (e.g. wallet ownership). Write routes are
+        # never consent-only — they require the full signature + nonce.
+        is_consent_only = (
+            request.url.path == "/ap2/wallet/balance" and request.method == "GET"
+        )
+
         try:
             # Extract headers
             consent_token = request.headers.get("X-Agent-Consent")
             signature = request.headers.get("X-AP2-Signature")
             nonce = request.headers.get("X-AP2-Nonce")
             wallet_address = request.headers.get("X-Wallet-Address")
-            
-            # Validate required headers (for non-public endpoints only)
+
+            # Required headers. Non-public routes always need a consent token; the
+            # full (write) tier additionally needs X-AP2-Signature + X-AP2-Nonce.
             if not is_public:
                 if not consent_token:
                     raise HTTPException(
                         status_code=status.HTTP_401_UNAUTHORIZED,
                         detail="Missing X-Agent-Consent header"
                     )
-                
-                if not signature:
-                    raise HTTPException(
-                        status_code=status.HTTP_401_UNAUTHORIZED,
-                        detail="Missing X-AP2-Signature header"
-                    )
-                
-                if not nonce:
-                    raise HTTPException(
-                        status_code=status.HTTP_400_BAD_REQUEST,
-                        detail="Missing X-AP2-Nonce header"
-                    )
+
+                if not is_consent_only:
+                    if not signature:
+                        raise HTTPException(
+                            status_code=status.HTTP_401_UNAUTHORIZED,
+                            detail="Missing X-AP2-Signature header"
+                        )
+
+                    if not nonce:
+                        raise HTTPException(
+                            status_code=status.HTTP_400_BAD_REQUEST,
+                            detail="Missing X-AP2-Nonce header"
+                        )
             
             # Attach headers to request state for route handlers
             request.state.consent_token = consent_token
