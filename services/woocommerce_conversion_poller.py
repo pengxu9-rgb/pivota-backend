@@ -51,6 +51,7 @@ from services.external_conversion_poller import (
     _note_watermark_hold,
     _read_poll_watermark,
     _sleep,
+    _touch_poll_attempt,
     _write_poll_watermark,
 )
 from services.outbound_links_service import normalize_shop_host
@@ -379,6 +380,9 @@ async def poll_wc_conversions_for_merchant(
             page_cap_hit=page_cap_hit,
             log=logger,
         )
+        # Record the attempt (not the watermark) so a held merchant still rotates
+        # through the per-tick fair-share queue. Keyed on the woo:: namespace.
+        await _touch_poll_attempt(watermark_key, run_started)
     else:
         await _write_poll_watermark(watermark_key, run_started, summary["closed"])
     return summary
@@ -386,7 +390,8 @@ async def poll_wc_conversions_for_merchant(
 
 # --- batch candidates ---------------------------------------------------------------
 
-# Least-recently-polled first so the per-tick cap is a fair rotation (see the
+# Least-recently-ATTEMPTED first (last_run_at, bumped on every poll incl. holds) so
+# the per-tick cap is a fair rotation a held merchant can't monopolize (see the
 # Shopify lane). The watermark for this lane lives under the 'woo::<merchant_id>'
 # namespace, so the LEFT JOIN keys on that prefixed id.
 _WOO_CANDIDATE_MERCHANTS_SQL = """
@@ -401,7 +406,7 @@ LEFT JOIN external_conversion_poll_state ps
 WHERE s.merchant_id IS NOT NULL
   AND COALESCE(s.last_click_at, s.created_at) >= :cutoff
 GROUP BY s.merchant_id
-ORDER BY MIN(ps.last_polled_at) ASC NULLS FIRST
+ORDER BY MIN(ps.last_run_at) ASC NULLS FIRST
 """
 
 

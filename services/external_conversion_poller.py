@@ -77,10 +77,10 @@ _MAX_RETRY_AFTER_S = 15.0
 # enabled. The 429 backoff above is always-on regardless of these.
 _INTER_PAGE_SLEEP_ENV = "EXTERNAL_CONVERSION_POLLER_INTER_PAGE_SLEEP_S"
 _INTER_MERCHANT_SLEEP_ENV = "EXTERNAL_CONVERSION_POLLER_INTER_MERCHANT_SLEEP_S"
-# Bound the merchants polled PER LANE per tick (fair-share: least-recently-polled
-# first — see the ORDER BY in the candidate SQL — with the remainder carried to the
-# next tick, since an un-polled merchant keeps its stale/absent watermark and sorts
-# first next time). 0 / unset = unlimited.
+# Bound the merchants polled PER LANE per tick (fair-share: least-recently-
+# ATTEMPTED first — see the ORDER BY in the candidate SQL — with the remainder
+# carried to the next tick, since an un-attempted merchant keeps its older
+# last_run_at and sorts first next time). 0 / unset = unlimited.
 _MAX_MERCHANTS_PER_TICK_ENV = "EXTERNAL_CONVERSION_POLLER_MAX_MERCHANTS_PER_TICK"
 
 # Trim the payload: only the fields the closure needs.
@@ -225,6 +225,34 @@ async def _write_poll_watermark(merchant_id: str, last_polled_at: datetime, clos
         )
     except Exception as e:  # never let watermark persistence abort a poll
         logger.warning("external_conversion_poller: watermark write failed merchant=%s err=%s", merchant_id, str(e)[:200])
+
+
+# Record that we ATTEMPTED a merchant this tick WITHOUT advancing the watermark
+# (last_polled_at). On a HOLD the watermark is deliberately not advanced (the
+# #1484/#1485 data-safety rule), so ordering the per-tick fair-share queue by
+# last_polled_at would let a perpetually-held merchant keep a NULL/stale watermark,
+# sort first forever, and starve healthy merchants under a finite cap. Bumping
+# last_run_at on every attempt (success writes it too) makes the queue order by
+# ATTEMPT recency, so a held merchant rotates to the back. On a first-ever-hold the
+# INSERT leaves last_polled_at NULL (nullable), so the watermark read still returns
+# "first run".
+_TOUCH_POLL_ATTEMPT_SQL = """
+INSERT INTO external_conversion_poll_state (merchant_id, last_run_at, updated_at)
+VALUES (:merchant_id, :now, :now)
+ON CONFLICT (merchant_id) DO UPDATE SET
+  last_run_at = EXCLUDED.last_run_at,
+  updated_at = EXCLUDED.updated_at
+"""
+
+
+async def _touch_poll_attempt(merchant_id: str, now: datetime) -> None:
+    """Bump last_run_at (attempt recency) without touching the watermark — best
+    effort. ``merchant_id`` is the namespaced watermark key for the lane (plain for
+    Shopify, ``woo::<id>`` for Woo)."""
+    try:
+        await database.execute(_TOUCH_POLL_ATTEMPT_SQL, {"merchant_id": merchant_id, "now": now})
+    except Exception as e:  # never let the fair-share bookkeeping abort a poll
+        logger.warning("external_conversion_poller: attempt-touch failed merchant=%s err=%s", merchant_id, str(e)[:200])
 
 
 # When a merchant's watermark has been unable to advance for at least this long,
@@ -507,6 +535,9 @@ async def poll_external_conversions_for_merchant(
             page_cap_hit=page_cap_hit,
             log=logger,
         )
+        # Record the attempt (not the watermark) so a held merchant still rotates
+        # through the per-tick fair-share queue instead of monopolizing the cap.
+        await _touch_poll_attempt(merchant_id, run_started)
     else:
         await _write_poll_watermark(merchant_id, run_started, summary["closed"])
     return summary
@@ -514,10 +545,11 @@ async def poll_external_conversions_for_merchant(
 
 # --- batch entry (candidate scoping) ------------------------------------------
 
-# Least-recently-polled first (NULL watermark = never polled → first), so a
-# per-tick cap is a fair rotation: the merchants most behind are polled this tick
-# and the rest carry to the next (they keep their stale/absent watermark). The
-# LEFT JOIN keys on the plain merchant_id (the Shopify lane's watermark namespace).
+# Least-recently-ATTEMPTED first (last_run_at, bumped on every poll incl. holds;
+# NULL = never attempted → first). Ordering by attempt recency (not the watermark
+# last_polled_at, which a held merchant never advances) makes a per-tick cap a fair
+# rotation that can't be monopolized by perpetually-held merchants. The LEFT JOIN
+# keys on the plain merchant_id (the Shopify lane's watermark namespace).
 _CANDIDATE_MERCHANTS_SQL = """
 SELECT s.merchant_id AS merchant_id
 FROM surface_click_events s
@@ -530,7 +562,7 @@ LEFT JOIN external_conversion_poll_state ps
 WHERE s.merchant_id IS NOT NULL
   AND COALESCE(s.last_click_at, s.created_at) >= :cutoff
 GROUP BY s.merchant_id
-ORDER BY MIN(ps.last_polled_at) ASC NULLS FIRST
+ORDER BY MIN(ps.last_run_at) ASC NULLS FIRST
 """
 
 
@@ -546,7 +578,7 @@ async def poll_external_conversions_batch(
     """
     now = now or _now()
     result: Dict[str, Any] = {
-        "ok": True, "merchants_polled": 0, "total_closed": 0, "merchants_deferred": 0, "results": [],
+        "ok": True, "merchants_polled": 0, "total_closed": 0, "shopify_merchants_deferred": 0, "results": [],
     }
 
     if not _poller_enabled():
@@ -566,7 +598,7 @@ async def poll_external_conversions_batch(
         candidates = list(rows or [])
         cap = _env_int(_MAX_MERCHANTS_PER_TICK_ENV)
         if cap and len(candidates) > cap:
-            result["merchants_deferred"] = len(candidates) - cap
+            result["shopify_merchants_deferred"] = len(candidates) - cap
             logger.info(
                 "external_conversion_poller: per-tick cap=%d — polling %d, deferring %d to next tick",
                 cap, cap, len(candidates) - cap,
@@ -612,13 +644,13 @@ async def poll_external_conversions_batch(
         result["total_errors"] = sum(int(r.get("errors") or 0) for r in result["results"])
         logger.info(
             "external_conversion_poller batch: merchants=%d closed=%d held=%d stuck=%d "
-            "errors=%d deferred=%d",
+            "errors=%d shopify_deferred=%d",
             result["merchants_polled"],
             result["total_closed"],
             result["merchants_held"],
             result["merchants_stuck"],
             result["total_errors"],
-            result["merchants_deferred"],  # Shopify lane; the Woo lane logs its own deferral
+            result["shopify_merchants_deferred"],  # Shopify lane only; the Woo lane logs its own deferral
         )
     except Exception as e:  # the batch entry must never raise out
         logger.warning("external_conversion_poller: batch aborted err=%s", str(e)[:200])

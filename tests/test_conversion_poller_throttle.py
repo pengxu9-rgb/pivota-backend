@@ -194,7 +194,7 @@ async def test_batch_per_tick_cap_and_inter_merchant_throttle(monkeypatch):
     result = await ecp.poll_external_conversions_batch(now=_NOW)
     assert polled == ["m0", "m1"], "only the cap's worth of (most-stale-first) merchants are polled"
     assert result["merchants_polled"] == 2
-    assert result["merchants_deferred"] == 3, "the remainder is deferred to the next tick"
+    assert result["shopify_merchants_deferred"] == 3, "the remainder is deferred to the next tick"
     assert sleeps == [0.01, 0.01], "one inter-merchant sleep after each polled merchant"
 
 
