@@ -44,6 +44,7 @@ from services.commerce_attribution_service import close_external_order_conversio
 from services.external_conversion_poller import (
     CLICK_RECENCY_WINDOW_DAYS,
     FIRST_RUN_LOOKBACK_DAYS,
+    _note_watermark_hold,
     _read_poll_watermark,
     _write_poll_watermark,
 )
@@ -308,6 +309,7 @@ async def poll_wc_conversions_for_merchant(
 
     page = 1
     fetch_failed = False
+    scan_complete = False
     while summary["pages"] < MAX_PAGES:
         try:
             orders = await _fetch_wc_orders_page(
@@ -350,19 +352,26 @@ async def poll_wc_conversions_for_merchant(
                 summary["skipped_unpaid"] += 1
 
         if len(orders) < ORDERS_PAGE_LIMIT:
+            scan_complete = True  # short final page → the window is fully scanned
             break
         page += 1
 
-    # Advance the watermark only if we scanned the whole window — a FETCH failure
-    # means orders in [modified_after, run_started] were never fetched; advancing
-    # past them would drop those conversions forever. Hold the watermark and
-    # re-poll the window next tick. A per-ORDER close failure does NOT hold it back.
-    if fetch_failed:
-        summary["watermark_held"] = True
-        logger.warning(
-            "woo_conversion_poller: holding watermark merchant=%s "
-            "(fetch failed; window re-polled next tick)",
-            merchant_id,
+    # Advance the watermark only if we scanned the whole window. Two ways it wasn't:
+    #  - a FETCH failure left orders in [modified_after, run_started] never fetched;
+    #  - a MAX_PAGES cap exit with a full final page (page_cap_hit, F1 #1485) left
+    #    the tail past the cap never fetched (Woo 20×100 = 2000 orders).
+    # Advancing past the unscanned orders would drop those conversions forever, so
+    # HOLD and re-poll next tick. A per-ORDER close failure does NOT hold it back —
+    # the window WAS fully scanned; idempotency retries that order.
+    page_cap_hit = (not fetch_failed) and (not scan_complete)
+    if fetch_failed or page_cap_hit:
+        _note_watermark_hold(
+            summary,
+            merchant_id=merchant_id,
+            now=now,
+            watermark=watermark,
+            page_cap_hit=page_cap_hit,
+            log=logger,
         )
     else:
         await _write_poll_watermark(watermark_key, run_started, summary["closed"])
