@@ -177,6 +177,25 @@ def test_initiate_valid_signature_creates_transaction(client, fake_db, keypair):
     assert "txn-001" in fake_db.used_nonces
 
 
+def test_initiate_serializes_metadata_for_jsonb(client, fake_db, keypair):
+    # metadata must be bound as a JSON *string* (CAST(:metadata AS JSONB)) — asyncpg
+    # has no jsonb codec here, so a raw dict would 500 every tagged (pvt_*) initiate
+    # in prod. Also proves order_id is set at initiate (= transaction_id, the edge key).
+    priv, _ = keypair
+    body = {"merchant_id": "m_1", "amount": 25, "currency": "USD",
+            "metadata": {"pvt_click_id": "clk_abc"}}
+    signature = _sign(priv, {**body, "nonce": "txn-meta"})
+
+    res = client.post("/ap2/transaction/initiate", json=body,
+                      headers=_headers(signature, "txn-meta"))
+    assert res.status_code == 200, res.text
+    assert len(fake_db.tx_inserts) == 1
+    ins = fake_db.tx_inserts[0]
+    assert isinstance(ins["metadata"], str), "metadata must be json.dumps'd for JSONB (not a dict)"
+    assert json.loads(ins["metadata"])["pvt_click_id"] == "clk_abc"
+    assert ins["order_id"] == ins["transaction_id"]
+
+
 def test_initiate_bad_signature_rejected_and_no_side_effects(client, fake_db, keypair):
     body = {"merchant_id": "m_1", "amount": 25, "currency": "USD"}
     # A consent token alone must NOT be enough — garbage signature is rejected.

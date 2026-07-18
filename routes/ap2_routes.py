@@ -403,7 +403,7 @@ async def initiate_transaction(
             :currency,
             :product_id,
             'pending',
-            :metadata,
+            CAST(:metadata AS JSONB),
             NOW()
         )
     """
@@ -421,7 +421,10 @@ async def initiate_transaction(
             "amount": Decimal(str(payment.amount)),
             "currency": payment.currency,
             "product_id": payment.product_id,
-            "metadata": payment.metadata
+            # Bind JSONB as a JSON string (+ CAST above): asyncpg has no jsonb codec
+            # registered in this repo, so a raw dict would raise. Matches the house
+            # pattern (commerce_attribution_service). None -> SQL NULL.
+            "metadata": json.dumps(payment.metadata) if payment.metadata is not None else None,
         }
     )
     
