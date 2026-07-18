@@ -27,7 +27,9 @@ _WOO_CREDS = {"store_url": "https://store.example.com", "consumer_key": "ck", "c
 
 
 def _patch_watermark(monkeypatch, module):
-    """Stub the watermark read/write on `module`; return the captured writes list."""
+    """Stub the watermark read/write on `module`; return the captured writes list.
+    (The attempt-touch lives in the batch loop, not the per-merchant poll, so the
+    direct per-merchant tests below never reach it.)"""
     writes = []
 
     async def fake_read(*_a, **_k):
@@ -291,7 +293,11 @@ async def test_batch_aggregates_held_and_stuck(monkeypatch):
     async def no_woo(*_a, **_k):
         return []
 
+    async def noop_touch(*_a, **_k):
+        return None
+
     monkeypatch.setattr(ecp, "poll_external_conversions_for_merchant", fake_poll)
+    monkeypatch.setattr(ecp, "_touch_poll_attempt", noop_touch)
     monkeypatch.setattr(woo, "poll_wc_conversions_batch_lane", no_woo)
 
     result = await ecp.poll_external_conversions_batch(now=_NOW)

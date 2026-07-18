@@ -37,15 +37,21 @@ from datetime import datetime, timedelta, timezone
 from decimal import Decimal
 from typing import Any, Dict, List, Optional, Tuple
 
-import httpx
-
 from db.database import database
 from services.commerce_attribution_service import close_external_order_conversion
 from services.external_conversion_poller import (
     CLICK_RECENCY_WINDOW_DAYS,
     FIRST_RUN_LOOKBACK_DAYS,
+    _INTER_MERCHANT_SLEEP_ENV,
+    _INTER_PAGE_SLEEP_ENV,
+    _MAX_MERCHANTS_PER_TICK_ENV,
+    _env_float,
+    _env_int,
+    _get_with_backoff,
     _note_watermark_hold,
     _read_poll_watermark,
+    _sleep,
+    _touch_poll_attempt,
     _write_poll_watermark,
 )
 from services.outbound_links_service import normalize_shop_host
@@ -212,11 +218,11 @@ async def _fetch_wc_orders_page(
         "modified_after": modified_after.astimezone(timezone.utc).replace(tzinfo=None).isoformat(),
         "status": "any",
     }
-    async with httpx.AsyncClient(timeout=timeout_s) as client:
-        resp = await client.get(url, params=params)
+    resp = await _get_with_backoff(url, params=params, headers=None, timeout_s=timeout_s, log=logger)
     if resp.status_code in (401, 403):
         raise RuntimeError(f"WooCommerce orders auth failed (status={resp.status_code})")
     if resp.status_code != 200:
+        # includes a 429 whose backoff was exhausted → fetch failure → watermark hold
         raise RuntimeError(f"WooCommerce orders fetch failed (status={resp.status_code})")
     data = resp.json() if resp.content else []
     return data if isinstance(data, list) else []
@@ -355,6 +361,7 @@ async def poll_wc_conversions_for_merchant(
             scan_complete = True  # short final page → the window is fully scanned
             break
         page += 1
+        await _sleep(_env_float(_INTER_PAGE_SLEEP_ENV))  # optional inter-page throttle (default off)
 
     # Advance the watermark only if we scanned the whole window. Two ways it wasn't:
     #  - a FETCH failure left orders in [modified_after, run_started] never fetched;
@@ -373,6 +380,8 @@ async def poll_wc_conversions_for_merchant(
             page_cap_hit=page_cap_hit,
             log=logger,
         )
+        # NB: the ATTEMPT (last_run_at, for fair rotation) is recorded by the batch
+        # lane for EVERY dispatched merchant (see poll_wc_conversions_batch_lane).
     else:
         await _write_poll_watermark(watermark_key, run_started, summary["closed"])
     return summary
@@ -380,15 +389,23 @@ async def poll_wc_conversions_for_merchant(
 
 # --- batch candidates ---------------------------------------------------------------
 
+# Least-recently-ATTEMPTED first (last_run_at, bumped on every poll incl. holds) so
+# the per-tick cap is a fair rotation a held merchant can't monopolize (see the
+# Shopify lane). The watermark for this lane lives under the 'woo::<merchant_id>'
+# namespace, so the LEFT JOIN keys on that prefixed id.
 _WOO_CANDIDATE_MERCHANTS_SQL = """
-SELECT DISTINCT s.merchant_id AS merchant_id
+SELECT s.merchant_id AS merchant_id
 FROM surface_click_events s
 JOIN merchant_stores ms
   ON ms.merchant_id = s.merchant_id
  AND ms.platform = 'woocommerce'
  AND LOWER(COALESCE(ms.status, '')) IN ('active', 'connected')
+LEFT JOIN external_conversion_poll_state ps
+  ON ps.merchant_id = 'woo::' || s.merchant_id
 WHERE s.merchant_id IS NOT NULL
   AND COALESCE(s.last_click_at, s.created_at) >= :cutoff
+GROUP BY s.merchant_id
+ORDER BY MIN(ps.last_run_at) ASC NULLS FIRST
 """
 
 
@@ -409,7 +426,19 @@ async def poll_wc_conversions_batch_lane(
         except Exception as e:
             logger.warning("woo_conversion_poller: candidate query failed err=%s", str(e)[:200])
             return results
-        for row in rows or []:
+        # Per-tick cap (fair rotation — least-recently-polled first). Applied per
+        # lane; the remainder carries to the next tick.
+        candidates = list(rows or [])
+        cap = _env_int(_MAX_MERCHANTS_PER_TICK_ENV)
+        if cap and len(candidates) > cap:
+            logger.info(
+                "woo_conversion_poller: per-tick cap=%d — polling %d, deferring %d to next tick",
+                cap, cap, len(candidates) - cap,
+            )
+            candidates = candidates[:cap]
+
+        inter_merchant_s = _env_float(_INTER_MERCHANT_SLEEP_ENV)
+        for row in candidates:
             merchant_id = dict(row).get("merchant_id")
             if not merchant_id:
                 continue
@@ -418,7 +447,11 @@ async def poll_wc_conversions_batch_lane(
             except Exception as e:
                 logger.warning("woo_conversion_poller: merchant poll raised merchant=%s err=%s", merchant_id, str(e)[:200])
                 res = {"merchant_id": str(merchant_id), "platform": "woocommerce", "ok": False, "error": str(e)[:200], "closed": 0}
+            # Record the attempt for EVERY dispatched merchant (success/hold/cred-miss/
+            # raise) under the woo:: namespace, so none monopolizes the cap (#1490).
+            await _touch_poll_attempt(_woo_watermark_key(str(merchant_id)), now)
             results.append(res)
+            await _sleep(inter_merchant_s)  # optional inter-merchant throttle (default off)
     except Exception as e:
         logger.warning("woo_conversion_poller: lane aborted err=%s", str(e)[:200])
     return results
