@@ -20,7 +20,7 @@ The layer has three native authorization primitives across Pivota's rails — al
 
 ### Current state (grounded — and it is inconsistent)
 - **The mandate path binds, but inline.** `initiate_transaction` verifies the mandate chain and binds it to the concrete transaction — `cart.merchant_id == payment.merchant_id`, `cart.total == payment.amount`, `cart.currency == payment.currency` (`routes/ap2_routes.py:354-359`). Correct, but the logic lives in the route, not a reusable gate.
-- **The consent-scope path enforces nothing on the transaction.** `agent_consents` carries `scope`, `spending_limit`, `spent_amount` (migration 021), and `consent_service.validate_consent_action` checks *action ∈ scope* **and** *amount ≤ (spending_limit − spent_amount)*. **But nothing calls it.** Every AP2 route (`initiate` :311, `confirm` :458, `wallet/balance` :636) calls only `verify_consent`, which returns identity + scope and enforces *neither* the action *nor* the limit. So a plain consent→pay authorizes on **token validity alone**, `validate_consent_action` is effectively dead code, and `spent_amount` is never decremented (no cumulative-spend tracking).
+- **The consent-scope path enforces nothing on the transaction.** `agent_consents` carries `scope`, `spending_limit`, `spent_amount` (migration 021), and `consent_service.validate_consent` checks *action ∈ scope* **and** *amount ≤ (spending_limit − spent_amount)*. **But nothing calls it.** Every AP2 route (`initiate` :311, `confirm` :458, `wallet/balance` :636) calls only `verify_consent`, which returns identity + scope and enforces *neither* the action *nor* the limit. So a plain consent→pay authorizes on **token validity alone**. Worse, the correct pieces *exist but are dead code*: `validate_consent` (action + limit) has **zero callers**, and so does `increment_usage` (the `spent_amount += amount` tracker) — so even the spending limit that is written at grant time is never enforced or accumulated.
 - **ACP** would add a *third* authorization enforcement path if built as its own vertical.
 
 So authorization is enforced inconsistently (mandate: bound; consent: not; ACP: absent), the enforcement primitives that *do* exist are unwired, and there is **no canonical object and no single gate.** This is the worst layer to leave in that state.
@@ -81,7 +81,7 @@ For every transaction, in the core, deny by default:
 | Fit with ADR-014 | **High** — it *is* the authorization port's canonical output |
 | Reversibility | **High** — the gate is additive; adapters map onto it |
 
-**Pros:** one place to reason about "can this agent move this money"; the CAA is exactly what the ADR-013 settlement gate and ADR-014 pipeline consume; new protocols map to the CAA with the gate untouched; **fixes the live consent-path gap and revives the dead `validate_consent_action`.**
+**Pros:** one place to reason about "can this agent move this money"; the CAA is exactly what the ADR-013 settlement gate and ADR-014 pipeline consume; new protocols map to the CAA with the gate untouched; **fixes the live consent-path gap and revives the dead `validate_consent`.**
 **Cons:** requires designing the CAA carefully (exact-vs-ceiling amount, presence, single-use); a genuinely novel authorization primitive that doesn't reduce to the envelope forces a CAA extension.
 
 ### Option B: Per-protocol authorization enforcement (status quo trajectory)
@@ -113,7 +113,7 @@ The invariant ("transaction ⊆ what the human authorized") is **identical acros
 **Becomes easier**
 - One place to reason about and audit "can this agent move this money"; the CAA is what ADR-013 settlement and the ADR-014 pipeline consume.
 - New protocols map their primitive → CAA; the gate is untouched.
-- Closes the live consent-path authorization gap and revives `validate_consent_action`.
+- Closes the live consent-path authorization gap and revives `validate_consent`.
 - Non-repudiation: `source_protocol` + `authorization_ref` persisted on every transaction.
 
 **Becomes harder / must be owned**
@@ -130,8 +130,8 @@ The invariant ("transaction ⊆ what the human authorized") is **identical acros
 
 1. [ ] **Founder / Security sign-off.** Move to Accepted; ticks ADR-014 action item 4.
 2. [ ] **Define the CAA object** — pilot-minimal subset first: `agent_id`, `action`, `amount | max_amount`, `currency`, `merchants`, `presence`, `expires_at`, `single_use`, `source_protocol` + `authorization_ref`.
-3. [ ] **Build the single gate + wire it:** extract the inline mandate binding (`ap2_routes.py:354-359`) into the gate, and route the plain consent path through it — wiring `consent_service.validate_consent_action` (action + `spending_limit`), which is currently dead code w.r.t. payments.
-4. [ ] **Atomic spend-tracking:** decrement `agent_consents.spent_amount` (or the CAA budget) in the same DB transaction as settlement (ADR-013); prevents replay/concurrent over-spend.
+3. [ ] **Build the single gate + wire it:** extract the inline mandate binding (`ap2_routes.py:354-359`) into the gate, and route the plain consent path through it — wiring `consent_service.validate_consent` (action + `spending_limit`), which is currently dead code w.r.t. payments.
+4. [ ] **Atomic spend-tracking:** wire the existing `consent_service.increment_usage` (`agent_consents.spent_amount += amount`), currently dead code, into settlement — in the **same DB transaction** as the ADR-013 debit; prevents replay/concurrent over-spend.
 5. [ ] **Presence:** make `presence` a CAA field; the ADR-014 core pipeline uses it for off-session capture + the kill-switch; enforce that off-session capture requires an off-session-authorized CAA (MIT).
 6. [ ] **Refund/reversal:** define a distinct `action=refund` CAA; a `pay` authorization never authorizes a refund (aligns with ADR-013's reversal action item).
 7. [ ] **ACP mapping (when the ACP adapter lands, ADR-014):** map the delegated token → CAA; no separate enforcement path.
