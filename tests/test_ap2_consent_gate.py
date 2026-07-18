@@ -3,12 +3,13 @@ Real-schema (SQLite, NOT FakeDB) coverage for the AP2 consent authorization gate
 (#1473).
 
 The AP2 transaction routes used to authorize a payment on consent-token validity
-ALONE — `validate_consent` (action + spending-limit) and `increment_usage`
-(spent-amount tracking) existed but had zero callers. `initiate`/`confirm` now
-enforce them. These tests build `agent_consents` from the ACTUAL migration-021
-DDL (not a FakeDB that could fabricate columns) and exercise the live service
-methods against it, so a drift in `scope`/`spending_limit`/`spent_amount`/
-`status`/`expires_at` breaks the test — and they check the confirm settle guard's
+ALONE — `validate_consent` (action + spending-limit) and the spend-tracking write
+existed but had zero callers. `initiate`/`confirm` now enforce them, with the
+limit debited atomically via `debit_within_limit`. These tests build
+`agent_consents` from the ACTUAL migration-021 DDL (not a FakeDB that could
+fabricate columns) and exercise the live service methods against it, so a drift in
+`scope`/`spending_limit`/`spent_amount`/`status`/`expires_at` breaks the test —
+and they check the atomic conditional debit and the confirm settle guard's
 idempotency.
 """
 import asyncio
@@ -67,9 +68,10 @@ async def _seed_consent(db, consent_id, actions, spending_limit=None, spent_amou
 
 
 def test_consent_gate_action_and_limit_against_real_schema(monkeypatch):
-    """The live gate (validate_consent + increment_usage) that initiate/confirm now
-    enforce, run over agent_consents built from the REAL migration-021 DDL — the
-    authorization the routes previously skipped (they called only verify_consent)."""
+    """The live gate (validate_consent + debit_within_limit) that initiate/confirm
+    now enforce, run over agent_consents built from the REAL migration-021 DDL —
+    the authorization the routes previously skipped (they called only
+    verify_consent)."""
     from db.database import database as global_db
     from services.consent_service import consent_service
 
@@ -93,8 +95,11 @@ def test_consent_gate_action_and_limit_against_real_schema(monkeypatch):
             out["over_limit"] = await consent_service.validate_consent("c_pay", "create_payment", Decimal("150"))
             out["within"] = await consent_service.validate_consent("c_pay", "create_payment", Decimal("60"))
             out["nolimit"] = await consent_service.validate_consent("c_nolimit", "create_payment", Decimal("999999"))
-            # accumulate spend; the remaining budget must shrink accordingly
-            await consent_service.increment_usage("c_pay", Decimal("60"))
+            # atomic conditional debit — enforces the limit IN the write. The first
+            # debit (0 -> 60) succeeds; the second (60 + 60 > 100) is rejected in
+            # the UPDATE, so a second transaction can't overshoot a stale read.
+            out["debit_ok"] = await consent_service.debit_within_limit("c_pay", Decimal("60"))
+            out["debit_over"] = await consent_service.debit_within_limit("c_pay", Decimal("60"))
             out["after_spend"] = await consent_service.validate_consent("c_pay", "create_payment", Decimal("60"))
             row = await db.fetch_one("SELECT spent_amount FROM agent_consents WHERE consent_id='c_pay'")
             out["spent"] = row["spent_amount"]
@@ -112,10 +117,44 @@ def test_consent_gate_action_and_limit_against_real_schema(monkeypatch):
     assert r["within"][0] is True
     # a NULL spending_limit means no cap (backward compatible with today's grants)
     assert r["nolimit"][0] is True
-    # AC#3 — spend accumulates, shrinking the remaining budget (60 spent of 100,
-    # so a further 60 is now rejected)
-    assert r["after_spend"][0] is False
+    # AC#3 — the atomic debit applies once (0 -> 60) and the over-limit second
+    # debit is rejected IN the write (the concurrency-safe guard: a second txn
+    # can't overshoot a stale read); the rejected debit must not have applied.
+    assert r["debit_ok"] is True
+    assert r["debit_over"] is False
     assert Decimal(str(r["spent"])) == Decimal("60")
+    # and validate_consent's non-atomic pre-check agrees the budget is spent
+    assert r["after_spend"][0] is False
+
+
+def test_debit_within_limit_edge_limits(monkeypatch):
+    """spending_limit=0 means "allow nothing" (a falsy 0 must NOT read as
+    unlimited); a NULL spending_limit means no cap."""
+    from db.database import database as global_db
+    from services.consent_service import consent_service
+
+    async def scenario():
+        fd, path = tempfile.mkstemp(suffix=".db")
+        os.close(fd)
+        db = None
+        try:
+            db = await _open_consents_db(path)
+            monkeypatch.setattr(global_db, "fetch_one", db.fetch_one)
+            monkeypatch.setattr(global_db, "execute", db.execute)
+            await _seed_consent(db, "c_zero", ["create_payment"], spending_limit=0)
+            await _seed_consent(db, "c_null", ["create_payment"])  # NULL limit
+            return {
+                "zero": await consent_service.debit_within_limit("c_zero", Decimal("1")),
+                "null": await consent_service.debit_within_limit("c_null", Decimal("999999")),
+            }
+        finally:
+            if db is not None:
+                await db.disconnect()
+            os.unlink(path)
+
+    r = asyncio.run(scenario())
+    assert r["zero"] is False, "spending_limit=0 must reject any positive debit"
+    assert r["null"] is True, "NULL spending_limit = no cap"
 
 
 def test_confirm_settle_update_is_idempotent():

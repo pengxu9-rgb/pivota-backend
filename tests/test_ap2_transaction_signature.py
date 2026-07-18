@@ -72,6 +72,11 @@ class FakeDB:
                 self.tx_updates.append(values)
                 return {"transaction_id": values["transaction_id"]}
             return None
+        if "UPDATE agent_consents" in query and "RETURNING" in query:
+            # debit_within_limit: the fixture consent is unlimited (spending_limit
+            # None), so the atomic conditional debit always succeeds -> return a row.
+            # (Real limit enforcement is covered by tests/test_ap2_consent_gate.py.)
+            return {"spent_amount": 0}
         if "FROM x402_transactions" in query:
             return self.transactions.get(values["transaction_id"])
         if "FROM agent_consents" in query:

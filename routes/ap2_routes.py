@@ -412,7 +412,7 @@ async def initiate_transaction(
             "transaction_id": transaction_id,
             "agent_id": agent_id,
             "merchant_id": payment.merchant_id,
-            "amount": payment.amount,
+            "amount": Decimal(str(payment.amount)),
             "currency": payment.currency,
             "product_id": payment.product_id,
             "metadata": payment.metadata
@@ -512,11 +512,12 @@ async def confirm_transaction(
                 detail=f"Transaction is already {txn['status']}",
             )
 
-        # Re-authorize at settle time against the CURRENT remaining limit — other
-        # confirms since initiate may have consumed budget. Fails closed (403).
+        # Re-check the consent is still active and permits the action (e.g. not
+        # revoked/expired since initiate). The AUTHORITATIVE, race-safe limit
+        # enforcement is the atomic debit below — a non-atomic amount check here
+        # would let concurrent confirms of different txns both pass a stale read.
         ok, reason, _ = await consent_service.validate_consent(
-            consent_token, action="create_payment",
-            amount=Decimal(str(txn["amount"])), agent_id=agent_id,
+            consent_token, action="create_payment", agent_id=agent_id,
         )
         if not ok:
             raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail=reason)
@@ -542,9 +543,15 @@ async def confirm_transaction(
                 detail="Transaction already completed",
             )
 
-        # We won the settlement — debit the consent's spending budget exactly once,
-        # in the same transaction as the status flip.
-        await consent_service.increment_usage(consent_token, Decimal(str(txn["amount"])))
+        # We won the settlement — atomically debit the spending budget, enforcing
+        # the limit IN the write (spent_amount + amount <= spending_limit). Zero
+        # rows => the debit would exceed the limit (a concurrent confirm consumed
+        # it since initiate), so fail closed — raising rolls back the settle above.
+        if not await consent_service.debit_within_limit(consent_token, Decimal(str(txn["amount"]))):
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail="Insufficient spending limit",
+            )
 
     return {
         "transaction_id": transaction_id,

@@ -246,7 +246,10 @@ class ConsentService:
         if not consent:
             raise ValueError("Consent not found or inactive")
         
-        if consent["expires_at"] and consent["expires_at"] < datetime.utcnow():
+        expires_at = consent["expires_at"]
+        if isinstance(expires_at, str):
+            expires_at = datetime.fromisoformat(expires_at)
+        if expires_at and expires_at < datetime.utcnow():
             raise ValueError("Consent has expired")
         
         return {"agent_id": consent["agent_id"], "scope": json.loads(consent["scope"])["actions"]}
@@ -331,17 +334,21 @@ class ConsentService:
             if action not in allowed_actions:
                 return False, f"Action '{action}' not permitted", None
             
-            # Check spending limit
-            if amount and consent["spending_limit"]:
-                remaining = Decimal(consent["spending_limit"]) - Decimal(consent["spent_amount"])
+            # Check spending limit. Guard on `is not None` — a spending_limit of 0
+            # ("allow nothing") is falsy and must NOT skip the check. This is a
+            # non-atomic pre-check for a clean early rejection; the authoritative,
+            # race-safe limit enforcement is debit_within_limit at settle time.
+            if amount is not None and consent["spending_limit"] is not None:
+                remaining = Decimal(str(consent["spending_limit"])) - Decimal(str(consent["spent_amount"] or 0))
                 if amount > remaining:
                     return False, f"Insufficient spending limit (remaining: {remaining})", None
-            
+
             return True, None, dict(consent)
-            
+
         except Exception as e:
             logger.error(f"Consent validation error: {e}")
-            return False, str(e), None
+            # Fail closed with a generic reason — don't leak internal error text.
+            return False, "Consent validation failed", None
     
     async def check_nonce(
         self,
@@ -382,28 +389,33 @@ class ConsentService:
             logger.error(f"Nonce check error: {e}")
             return False, str(e)
     
-    async def increment_usage(
+    async def debit_within_limit(
         self,
         consent_id: str,
-        amount: Decimal
-    ):
+        amount: Decimal,
+    ) -> bool:
         """
-        Update consent usage after successful transaction
-        
-        Args:
-            consent_id: Consent ID
-            amount: Transaction amount
+        Atomically add `amount` to the consent's spent_amount, but ONLY if it
+        stays within spending_limit (a NULL limit means no cap). Returns True if
+        the debit was applied, False if it would exceed the limit.
+
+        The limit check and the increment are a SINGLE statement, so two
+        concurrent debits on the same consent cannot both pass a stale read and
+        overshoot the cap (the failure a separate SELECT-then-UPDATE would allow).
+        Amount is bound as a Decimal (asyncpg numeric); exceptions PROPAGATE —
+        callers settle inside a DB transaction that must roll back if the debit
+        fails, so this must not swallow errors.
         """
-        try:
-            await database.execute(
-                """UPDATE agent_consents 
-                   SET spent_amount = spent_amount + :amount,
-                       nonce_counter = nonce_counter + 1
-                   WHERE consent_id = :consent_id""",
-                {"consent_id": consent_id, "amount": float(amount)}
-            )
-        except Exception as e:
-            logger.error(f"Failed to update consent usage: {e}")
+        row = await database.fetch_one(
+            """UPDATE agent_consents
+               SET spent_amount = spent_amount + :amount,
+                   nonce_counter = nonce_counter + 1
+               WHERE consent_id = :consent_id
+                 AND (spending_limit IS NULL OR spent_amount + :amount <= spending_limit)
+               RETURNING spent_amount""",
+            {"consent_id": consent_id, "amount": amount},
+        )
+        return row is not None
     
     async def revoke_consent(
         self,
