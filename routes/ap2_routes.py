@@ -385,6 +385,7 @@ async def initiate_transaction(
     insert_query = """
         INSERT INTO x402_transactions (
             transaction_id,
+            order_id,
             agent_id,
             merchant_id,
             amount,
@@ -395,6 +396,7 @@ async def initiate_transaction(
             created_at
         ) VALUES (
             :transaction_id,
+            :order_id,
             :agent_id,
             :merchant_id,
             :amount,
@@ -405,11 +407,15 @@ async def initiate_transaction(
             NOW()
         )
     """
-    
+
     await database.execute(
         insert_query,
         {
             "transaction_id": transaction_id,
+            # The AP2 transaction IS the order — order_id keys the attribution edge
+            # (commerce_attribution_edges) written on confirm. Non-custodial: it
+            # records that a Pivota-driven read led to the sale; Pivota moves no money.
+            "order_id": transaction_id,
             "agent_id": agent_id,
             "merchant_id": payment.merchant_id,
             "amount": Decimal(str(payment.amount)),
@@ -488,7 +494,8 @@ async def confirm_transaction(
     # un-debited, and a replay/concurrent confirm can never double-count.
     async with database.transaction():
         txn = await database.fetch_one(
-            """SELECT transaction_id, agent_id, amount, currency, status
+            """SELECT transaction_id, order_id, agent_id, merchant_id, product_id,
+                      amount, currency, status, metadata
                FROM x402_transactions WHERE transaction_id = :transaction_id""",
             {"transaction_id": transaction_id},
         )
@@ -552,6 +559,36 @@ async def confirm_transaction(
                 status_code=status.HTTP_403_FORBIDDEN,
                 detail="Insufficient spending limit",
             )
+
+    # Attribution (non-custodial — ADR-016/017): record that a Pivota-driven read
+    # led to this sale, keyed on the agent-supplied pvt_* click id. Best-effort and
+    # OUTSIDE the settle transaction — a failed edge write must NEVER un-settle a
+    # confirmed payment. Pre-gated on has_attribution_signal (parity with the ACP
+    # rail): an untagged transaction produces no edge. Pivota moves no money here.
+    try:
+        from services.commerce_attribution_service import (
+            has_attribution_signal,
+            upsert_order_attribution_edge,
+        )
+
+        txn_metadata = txn["metadata"]
+        if isinstance(txn_metadata, str):
+            txn_metadata = json.loads(txn_metadata) if txn_metadata else {}
+        attribution_meta = {
+            **(txn_metadata or {}),
+            "merchant_id": txn["merchant_id"],
+            "agent_id": agent_id,
+            "product_id": txn["product_id"],
+            "protocol_name": "ap2",
+        }
+        if has_attribution_signal(attribution_meta):
+            await upsert_order_attribution_edge(
+                order_id=txn["order_id"] or transaction_id,
+                merchant_id=txn["merchant_id"],
+                metadata=attribution_meta,
+            )
+    except Exception as exc:  # attribution is best-effort — never break settlement
+        logger.warning("AP2 attribution edge write failed for %s: %s", transaction_id, exc)
 
     return {
         "transaction_id": transaction_id,
