@@ -402,16 +402,21 @@ class ConsentService:
         The limit check and the increment are a SINGLE statement, so two
         concurrent debits on the same consent cannot both pass a stale read and
         overshoot the cap (the failure a separate SELECT-then-UPDATE would allow).
-        Amount is bound as a Decimal (asyncpg numeric); exceptions PROPAGATE —
-        callers settle inside a DB transaction that must roll back if the debit
-        fails, so this must not swallow errors.
+        The predicate also requires the consent be active + unexpired, so a
+        concurrent revoke — or an expiry crossing — between the caller's re-check
+        and this write is caught here too (zero rows -> fail closed). Amount is
+        bound as a Decimal (asyncpg numeric); exceptions PROPAGATE — callers settle
+        inside a DB transaction that must roll back if the debit fails, so this
+        must not swallow errors.
         """
         row = await database.fetch_one(
             """UPDATE agent_consents
-               SET spent_amount = spent_amount + :amount,
+               SET spent_amount = COALESCE(spent_amount, 0) + :amount,
                    nonce_counter = nonce_counter + 1
                WHERE consent_id = :consent_id
-                 AND (spending_limit IS NULL OR spent_amount + :amount <= spending_limit)
+                 AND status = 'active'
+                 AND (expires_at IS NULL OR expires_at > CURRENT_TIMESTAMP)
+                 AND (spending_limit IS NULL OR COALESCE(spent_amount, 0) + :amount <= spending_limit)
                RETURNING spent_amount""",
             {"consent_id": consent_id, "amount": amount},
         )

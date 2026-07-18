@@ -143,9 +143,14 @@ def test_debit_within_limit_edge_limits(monkeypatch):
             monkeypatch.setattr(global_db, "execute", db.execute)
             await _seed_consent(db, "c_zero", ["create_payment"], spending_limit=0)
             await _seed_consent(db, "c_null", ["create_payment"])  # NULL limit
+            # a revoked consent must NOT be debitable — the debit predicate checks
+            # status, so settlement is atomic w.r.t. a concurrent revoke.
+            await _seed_consent(db, "c_revoked", ["create_payment"], spending_limit=100)
+            await db.execute("UPDATE agent_consents SET status='revoked' WHERE consent_id='c_revoked'")
             return {
                 "zero": await consent_service.debit_within_limit("c_zero", Decimal("1")),
                 "null": await consent_service.debit_within_limit("c_null", Decimal("999999")),
+                "revoked": await consent_service.debit_within_limit("c_revoked", Decimal("1")),
             }
         finally:
             if db is not None:
@@ -155,6 +160,7 @@ def test_debit_within_limit_edge_limits(monkeypatch):
     r = asyncio.run(scenario())
     assert r["zero"] is False, "spending_limit=0 must reject any positive debit"
     assert r["null"] is True, "NULL spending_limit = no cap"
+    assert r["revoked"] is False, "a revoked consent must not be debitable"
 
 
 def test_confirm_settle_update_is_idempotent():
