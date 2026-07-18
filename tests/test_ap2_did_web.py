@@ -428,11 +428,43 @@ def _stream_client(status, chunks):
 async def test_default_fetch_streaming_size_cap(monkeypatch):
     import httpx
     monkeypatch.setattr(ap2_did_web, "_assert_public_host", lambda host: None)
-    # Two chunks whose combined size exceeds the cap → rejected mid-stream.
+    # Half-cap+1 chunks: the cap is crossed at the 2nd. Track consumption to prove
+    # EARLY termination — the stream is abandoned, not buffered whole then checked.
     big = b"x" * (ap2_did_web._MAX_DOC_BYTES // 2 + 1)
-    monkeypatch.setattr(httpx, "AsyncClient", _stream_client(200, [big, big]))
+    consumed = {"n": 0}
+
+    class _CountingResp:
+        status_code = 200
+
+        async def aiter_bytes(self):
+            for _ in range(10):  # 10 chunks queued; must stop reading at 2
+                consumed["n"] += 1
+                yield big
+
+    class _Ctx:
+        async def __aenter__(self):
+            return _CountingResp()
+
+        async def __aexit__(self, *a):
+            return False
+
+    class _Client:
+        def __init__(self, *a, **k):
+            pass
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *a):
+            return False
+
+        def stream(self, method, url, headers=None):
+            return _Ctx()
+
+    monkeypatch.setattr(httpx, "AsyncClient", _Client)
     with pytest.raises(ValueError):
         await ap2_did_web._default_fetch("https://agents.example.com/.well-known/did.json")
+    assert consumed["n"] == 2  # stopped mid-stream, did not read all 10 chunks
 
 
 async def test_default_fetch_streams_valid_json(monkeypatch):
