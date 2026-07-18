@@ -168,6 +168,34 @@ def _run_cli(args: List[str], *, timeout_s: int = 2400) -> Tuple[int, str]:
     return proc.returncode, (proc.stdout + proc.stderr)[-6000:]
 
 
+# Transient DB/proxy failure signatures: a flaky public-proxy window makes the
+# per-brand CLI fail its DB acquire at ~30s. Retrying the same brand recovers
+# (2026-07-18: 24/30 apply failures were transient — the same brands succeeded
+# on manual re-run seconds later). Non-transient failures (real bugs) are NOT
+# matched, so they fail fast and are marked for review.
+_TRANSIENT_MARKERS = (
+    "TimeoutError", "connection was closed", "Connection is already acquired",
+    "ConnectionDoesNotExist", "pool", "acquire", "temporarily unavailable",
+    "Cannot connect", "start_tls", "EOF occurred",
+)
+
+
+def _is_transient(out: str) -> bool:
+    return any(mark in out for mark in _TRANSIENT_MARKERS)
+
+
+def _run_cli_retry(args: List[str], *, attempts: int = 3, timeout_s: int = 2400) -> Tuple[int, str]:
+    """Run a CLI step, retrying ONLY on transient DB/proxy signatures (never on
+    a clean non-zero that looks like a real error)."""
+    rc, out = 0, ""
+    for attempt in range(1, attempts + 1):
+        rc, out = _run_cli(args, timeout_s=timeout_s)
+        if rc == 0 or not _is_transient(out) or attempt == attempts:
+            return rc, out
+        time.sleep(15 * attempt)
+    return rc, out
+
+
 def _plan_stats(plan_path: str) -> Dict[str, Any]:
     attach = mint = 0
     brand_display = ""
@@ -196,8 +224,8 @@ def process_brand(slug: str, *, workdir: str, apply: bool,
     judged_path = os.path.join(workdir, f"judged_{slug}.jsonl")
 
     # 1. crawl + plan (dry — also warms the crawl cache for step 3)
-    rc, out = _run_cli(["scripts/ingest_stylekorean_brand.py", "--brand", slug,
-                        "--out", plan_path])
+    rc, out = _run_cli_retry(["scripts/ingest_stylekorean_brand.py", "--brand", slug,
+                              "--out", plan_path])
     if rc != 0:
         if "0 product URLs" in out or "no product URLs" in out:
             return {"status": "empty", "note": "no SK product URLs for slug"}
@@ -229,24 +257,24 @@ def process_brand(slug: str, *, workdir: str, apply: bool,
 
     # 3. mint-first (mapped) or attach-only (unmapped)
     if domain:
-        rc, out = _run_cli(["scripts/ingest_stylekorean_brand.py", "--brand", slug,
-                            "--brand-official-domain", domain, "--apply-mint",
-                            "--apply-offers", "--residue-candidates", resid_path,
-                            "--out", plan_path])
+        rc, out = _run_cli_retry(["scripts/ingest_stylekorean_brand.py", "--brand", slug,
+                                  "--brand-official-domain", domain, "--apply-mint",
+                                  "--apply-offers", "--residue-candidates", resid_path,
+                                  "--out", plan_path])
         if rc != 0:
             return {**result, "status": "failed", "step": "mint", "log": out[-800:]}
         result["mint_log"] = out[-500:]
         # 4. judge residue (DeepSeek) + auto-attach AUTO verdicts
         if stats["mint"] > 0:
-            rc, out = _run_cli(["scripts/judge_stylekorean_residue.py",
-                                "--plan", plan_path, "--brand-official-domain", domain,
-                                "--out", judged_path, "--apply-offers"])
+            rc, out = _run_cli_retry(["scripts/judge_stylekorean_residue.py",
+                                      "--plan", plan_path, "--brand-official-domain", domain,
+                                      "--out", judged_path, "--apply-offers"])
             if rc != 0:
                 return {**result, "status": "failed", "step": "judge", "log": out[-800:]}
             result["judge_log"] = out[-500:]
     else:
-        rc, out = _run_cli(["scripts/ingest_stylekorean_brand.py", "--brand", slug,
-                            "--apply-offers", "--out", plan_path])
+        rc, out = _run_cli_retry(["scripts/ingest_stylekorean_brand.py", "--brand", slug,
+                                  "--apply-offers", "--out", plan_path])
         if rc != 0:
             return {**result, "status": "failed", "step": "attach", "log": out[-800:]}
         result["attach_log"] = out[-500:]
