@@ -107,6 +107,10 @@ async def list_supported_protocols():
     
     Public endpoint - no authentication required
     """
+    # Advertise only functional endpoints. `/ap2/wallet/balance` and
+    # `/ap2/x402/exchange` exist but return 501 (not-implemented stubs), so they
+    # are intentionally omitted from this catalog — do not re-add until built
+    # (see docs/AP2_ENABLEMENT.md §6).
     return {
         "protocols": [
             {
@@ -115,8 +119,7 @@ async def list_supported_protocols():
                 "description": "Agent Payment Protocol v2",
                 "endpoints": [
                     "/ap2/transaction/initiate",
-                    "/ap2/transaction/confirm",
-                    "/ap2/wallet/balance"
+                    "/ap2/transaction/confirm"
                 ]
             },
             {
@@ -124,8 +127,7 @@ async def list_supported_protocols():
                 "version": "0.1",
                 "description": "Payment Required Protocol",
                 "endpoints": [
-                    "/ap2/x402/quote",
-                    "/ap2/x402/exchange"
+                    "/ap2/x402/quote"
                 ]
             }
         ]
@@ -612,57 +614,32 @@ async def execute_exchange(request: Request):
 async def get_wallet_balance(request: Request):
     """
     Get agent wallet balance
-    
-    Requires:
-    - X-Agent-Consent: Valid consent token
-    - X-Wallet-Address: Wallet address
-    """
-    from services.consent_service import consent_service
-    
-    # Verify consent
-    consent_token = request.headers.get("X-Agent-Consent")
-    wallet_address = request.headers.get("X-Wallet-Address")
-    
-    if not consent_token or not wallet_address:
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail="Missing required headers"
-        )
 
-    # Consent is the primary auth for this consent-only read — a bogus/expired
-    # token must fail closed as 401 (like verify_ap2_consent), not an uncaught
-    # ValueError -> 500.
-    try:
-        consent_data = await consent_service.verify_consent(consent_token)
-    except ValueError as exc:
-        raise HTTPException(
-            status_code=status.HTTP_401_UNAUTHORIZED,
-            detail=str(exc)
-        )
-    agent_id = consent_data["agent_id"]
-    
-    # Query wallet balance
-    query = """
-        SELECT wallet_id, balance, currency, status, last_updated
-        FROM agent_wallets
-        WHERE agent_id = :agent_id AND wallet_address = :wallet_address
+    Not yet implemented. `agent_wallets` (migration 022) is an ADDRESS REGISTRY —
+    it records which wallet addresses belong to an agent (columns: `address`,
+    `network`, `status`, `custodian`, `custodian_account_id`, …) and has NO
+    balance store. There is also no balance *source* wired anywhere in this
+    codebase (no on-chain RPC, no custodian client), so there is nothing to read
+    a balance from. The prior handler `SELECT`ed non-existent columns
+    (`balance`, `currency`, `last_updated`) filtered on a non-existent column
+    (`wallet_address`; the real column is `address`), so it 500'd against real
+    Postgres — and its unit test passed only because a FakeDB fabricated the row.
+
+    Returning a fabricated or always-zero balance would be worse than none, so
+    this fails honestly with 501 — mirroring `x402/exchange`. When built it needs
+    a real balance source (a live on-chain/custodian read keyed by
+    `agent_wallets.network` + `address`, or `custodian` + `custodian_account_id`,
+    or a settlement-populated ledger) and must keep the consent-only gate: re-add
+    the consent verification (the prior handler is in git history) or a
+    ``Depends(...)``. Until then the middleware already header-gates this path as
+    a consent-only read (see `middleware/ap2_security.py`). See
+    `docs/AP2_ENABLEMENT.md` §6.
     """
-    
-    wallet = await database.fetch_one(
-        query,
-        {
-            "agent_id": agent_id,
-            "wallet_address": wallet_address
-        }
+    # TODO: Implement wallet balance once a real balance source exists (see docstring).
+    raise HTTPException(
+        status_code=status.HTTP_501_NOT_IMPLEMENTED,
+        detail="Wallet balance is not available (no balance source wired)",
     )
-    
-    if not wallet:
-        raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND,
-            detail="Wallet not found"
-        )
-    
-    return dict(wallet)
 
 
 @router.get("/receipt/{transaction_id}")

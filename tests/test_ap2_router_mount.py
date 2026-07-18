@@ -105,6 +105,20 @@ def test_public_status_open_when_enabled(fake_db):
     assert res.headers.get("X-AP2-Version") == "0.1"
 
 
+def test_protocols_advertises_only_functional_endpoints(fake_db):
+    """The /protocols catalog must not advertise the 501 not-implemented stubs
+    (`wallet/balance`, `x402/exchange`) — we don't promise unbuilt endpoints.
+    Functional routes stay advertised."""
+    client = _app(enabled=True)
+    res = client.get("/ap2/protocols")
+    assert res.status_code == 200
+    advertised = {e for p in res.json()["protocols"] for e in p["endpoints"]}
+    assert "/ap2/wallet/balance" not in advertised
+    assert "/ap2/x402/exchange" not in advertised
+    # sanity: the functional endpoints are still advertised
+    assert {"/ap2/transaction/initiate", "/ap2/x402/quote"} <= advertised
+
+
 def test_grant_reachable_through_enabled_middleware(fake_db, keypair):
     """The consent-bootstrap route must pass the middleware without a token."""
     priv, _ = keypair
@@ -149,5 +163,7 @@ def test_disabled_middleware_is_passthrough(fake_db):
     """When disabled, the middleware does not gate anything (route handles it)."""
     client = _app(enabled=False)
     res = client.get("/ap2/wallet/balance")
-    # Reaches the route, which requires its own headers -> 400 (not middleware 401).
-    assert res.status_code == 400
+    # Reaches the route, which is an honest 501 not-implemented stub (no balance
+    # source; see docs/AP2_ENABLEMENT.md §6) -- NOT the middleware's 401. Proves
+    # the disabled middleware passed the request through to the route.
+    assert res.status_code == 501

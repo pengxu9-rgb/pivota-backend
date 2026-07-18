@@ -153,15 +153,16 @@ def test_wallet_balance_is_consent_only(enforced_client):
     # GET /ap2/wallet/balance is an authenticated READ: consent-gated but NOT
     # signature/nonce-gated (a nonce on an idempotent read would make it
     # single-use). With a consent token present but no signature/nonce, the
-    # middleware must let it reach the route, which answers with its OWN 400
-    # (missing wallet address) — proving the middleware did not block on a
-    # missing signature.
+    # middleware must let it reach the route, which answers with its OWN 501 —
+    # the handler is an honest not-implemented stub (no balance source; see
+    # docs/AP2_ENABLEMENT.md §6). A route-level 501 still proves the middleware
+    # did not block on the missing signature.
     res = enforced_client.get(
         "/ap2/wallet/balance",
         headers={"X-Agent-Consent": "consent-xyz"},
     )
-    assert res.status_code == 400
-    assert res.json().get("detail") == "Missing required headers"
+    assert res.status_code == 501
+    assert res.json().get("detail") == "Wallet balance is not available (no balance source wired)"
 
 
 def test_revoke_is_full_tier_requires_signature(enforced_client):
