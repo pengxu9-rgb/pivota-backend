@@ -8,7 +8,9 @@ write, queued here for a human decision:
       product, but that official product has no catalog row (it was a drift
       suspect routed to residue, or outside the net-new mint set). Approving
       mints the official record through the sanctioned brand-official ingest
-      (canonical-first, ADR-001) and attaches the SK offer(s).
+      (canonical-first, ADR-001) and attaches the SK offer(s). Emit annotates,
+      and apply hard-skips, any proposal whose official is a price-marked bundle
+      certified equal to a base single (services/retailer_ingest/bundle_guard).
 
   merge_duplicate — two canonicals for one physical product (e.g. the missha
       cross-lane pairs: SK-titled vs official-titled, different content_keys,
@@ -51,6 +53,7 @@ from services.pdp_matcher.retailer_match import (  # noqa: E402
     retailer_match_key,
 )
 from services.retailer_ingest import brand_official as bo  # noqa: E402
+from services.retailer_ingest.bundle_guard import bundle_price_guard  # noqa: E402
 from services.retailer_ingest.single_writer_lock import (  # noqa: E402
     SingleWriterLockError,
     retailer_ingest_lock,
@@ -93,19 +96,32 @@ async def _emit(args: argparse.Namespace) -> int:
             by_official[_official_identity(r["official"])].append(r)
 
     proposals: List[Dict[str, Any]] = []
+    bundle_flagged = 0
     for ident, group in sorted(by_official.items()):
+        official = group[0]["official"]
+        items = [g["item"] for g in group]
+        # bundle-vs-base price flag: certifies an SK single == an official whose
+        # slug/title marks it a bundle at a bundle-multiple price. Surfaced so the
+        # reviewer sees it BEFORE approving; apply enforces it as a hard skip.
+        is_bundle, reason = bundle_price_guard(official, items)
+        if is_bundle:
+            bundle_flagged += 1
         proposals.append({
             "kind": "mint_and_attach",
             "status": "pending",
-            "official": group[0]["official"],
-            "items": [g["item"] for g in group],
+            "official": official,
+            "items": items,
             "verdict_confidences": [
                 (g.get("verdict") or {}).get("confidence") for g in group
             ],
             "source_files": sorted({g["_source_file"] for g in group}),
+            "bundle_price_flag": {"flagged": is_bundle, "reason": reason},
         })
     print(f"[emit] mint_and_attach proposals: {len(proposals)} official product(s) "
           f"({sum(len(p['items']) for p in proposals)} SK verdicts)")
+    if bundle_flagged:
+        print(f"[emit] ⚠ {bundle_flagged} proposal(s) carry a bundle-vs-base price flag "
+              "— review before approving (apply will hard-skip these).")
 
     # merge_duplicate: same-brand canonicals collapsing to one match key (or
     # line-alias key) under DIFFERENT content_keys = duplicate canonicals.
@@ -162,6 +178,7 @@ async def _apply(args: argparse.Namespace) -> int:
     if not mints:
         return 0
 
+    guarded = 0
     await database.connect()
     try:
         async with retailer_ingest_lock(database):
@@ -172,6 +189,15 @@ async def _apply(args: argparse.Namespace) -> int:
                 domain = pdp.get("source_domain") or ""
                 if not brand:
                     print("  WARN approved row has no brand — skipped (malformed proposal)")
+                    continue
+                # bundle-vs-base price guard — recomputed at apply time (never trust
+                # a possibly-stale emit-time flag): an SK single certified equal to a
+                # bundle official must not mint/attach onto a base canonical.
+                is_bundle, reason = bundle_price_guard(official, p.get("items") or [])
+                if is_bundle:
+                    guarded += 1
+                    print(f"  GUARD {brand} | {pdp.get('product_name', '')[:48]} — "
+                          f"bundle-vs-base: {reason} — SKIPPED (re-review)")
                     continue
                 print(f"  MINT {brand} | {pdp.get('product_name', '')[:56]}")
                 # already-have guard: never duplicate a canonical someone minted
@@ -207,6 +233,9 @@ async def _apply(args: argparse.Namespace) -> int:
         return 1
     finally:
         await database.disconnect()
+    if guarded:
+        print(f"[apply] {guarded} approved proposal(s) hard-skipped by the "
+              "bundle-vs-base price guard — re-review those officials.")
     return 0
 
 
