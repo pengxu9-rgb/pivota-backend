@@ -88,23 +88,29 @@ def _agent_wallets_ddl_for_sqlite() -> str:
 async def _open_seeded_db(path: str) -> databases.Database:
     db = databases.Database(f"sqlite+aiosqlite:///{path}")
     await db.connect()
-    await db.execute(_agent_wallets_ddl_for_sqlite())
-    # active wallet owned by agent_a
-    await db.execute(
-        "INSERT INTO agent_wallets (wallet_id, agent_id, network, address, status) "
-        "VALUES ('w_active', 'agent_a', 'ethereum', '0xAAA', 'active')"
-    )
-    # a non-active (pending) wallet owned by agent_a
-    await db.execute(
-        "INSERT INTO agent_wallets (wallet_id, agent_id, network, address, status) "
-        "VALUES ('w_pending', 'agent_a', 'ethereum', '0xBBB', 'pending')"
-    )
-    # active wallet owned by a DIFFERENT agent
-    await db.execute(
-        "INSERT INTO agent_wallets (wallet_id, agent_id, network, address, status) "
-        "VALUES ('w_other', 'agent_b', 'ethereum', '0xCCC', 'active')"
-    )
-    return db
+    try:
+        await db.execute(_agent_wallets_ddl_for_sqlite())
+        # active wallet owned by agent_a
+        await db.execute(
+            "INSERT INTO agent_wallets (wallet_id, agent_id, network, address, status) "
+            "VALUES ('w_active', 'agent_a', 'ethereum', '0xAAA', 'active')"
+        )
+        # a non-active (pending) wallet owned by agent_a
+        await db.execute(
+            "INSERT INTO agent_wallets (wallet_id, agent_id, network, address, status) "
+            "VALUES ('w_pending', 'agent_a', 'ethereum', '0xBBB', 'pending')"
+        )
+        # active wallet owned by a DIFFERENT agent
+        await db.execute(
+            "INSERT INTO agent_wallets (wallet_id, agent_id, network, address, status) "
+            "VALUES ('w_other', 'agent_b', 'ethereum', '0xCCC', 'active')"
+        )
+        return db
+    except Exception:
+        # If seeding fails after connect, close the connection before propagating
+        # so the caller's temp-file cleanup isn't left holding an open handle.
+        await db.disconnect()
+        raise
 
 
 def test_agent_wallets_real_schema_is_an_address_registry():
@@ -117,12 +123,14 @@ def test_agent_wallets_real_schema_is_an_address_registry():
     async def scenario():
         fd, path = tempfile.mkstemp(suffix=".db")
         os.close(fd)
-        db = await _open_seeded_db(path)
+        db = None
         try:
+            db = await _open_seeded_db(path)
             rows = await db.fetch_all("PRAGMA table_info(agent_wallets)")
             return {r["name"] for r in rows}
         finally:
-            await db.disconnect()
+            if db is not None:
+                await db.disconnect()
             os.unlink(path)
 
     cols = asyncio.run(scenario())
@@ -145,8 +153,9 @@ def test_verify_agent_wallet_runs_against_real_schema(monkeypatch):
     async def scenario():
         fd, path = tempfile.mkstemp(suffix=".db")
         os.close(fd)
-        db = await _open_seeded_db(path)
+        db = None
         try:
+            db = await _open_seeded_db(path)
             # Delegate the global singleton's method to the real SQLite engine —
             # patch the METHOD on the object, never swap the object (a rebind
             # would poison the module-level binder session-wide).
@@ -158,7 +167,8 @@ def test_verify_agent_wallet_runs_against_real_schema(monkeypatch):
                 "absent": await wallet_service.verify_agent_wallet("agent_a", "0xZZZ"),
             }
         finally:
-            await db.disconnect()
+            if db is not None:
+                await db.disconnect()
             os.unlink(path)
 
     r = asyncio.run(scenario())
