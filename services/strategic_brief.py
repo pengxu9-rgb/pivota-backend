@@ -40,7 +40,13 @@ from services.sku_lane_priority import (
     is_third_party_controlled_lane,
     prioritize_lanes,
 )
-from services.vertical_profiles import BEAUTY_PROFILE, BriefRules, get_profile, resolve_vertical
+from services.vertical_profiles import (
+    BEAUTY_PROFILE,
+    BriefRules,
+    get_profile,
+    resolve_profile_for_vertical,
+    resolve_vertical,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -259,7 +265,12 @@ def _brief_profile_for_evidence(evidence: Mapping[str, Any]) -> Any:
     beauty SKU that resolved ambiguously never loses the INCI/claims guard."""
     vertical = str((evidence or {}).get("vertical") or "").strip().lower()
     if vertical == "electronics":
-        return get_profile("electronics")
+        # Sub-split electronics into drone vs audio from the evidence text so a
+        # drone brief gets the drone claim/regulatory rules, not audio's.
+        ev = evidence if isinstance(evidence, Mapping) else None
+        return resolve_profile_for_vertical(
+            "electronics", ev, title=(evidence or {}).get("title")
+        )
     return BEAUTY_PROFILE
 
 

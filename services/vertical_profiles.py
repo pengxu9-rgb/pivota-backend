@@ -40,7 +40,7 @@ from __future__ import annotations
 
 import re
 from dataclasses import dataclass, field
-from typing import Any, Mapping, Optional, Tuple
+from typing import Any, List, Mapping, Optional, Tuple
 
 # The competitor ingredient / category-form token sets live in
 # competitor_brand_filter (150+ safety-sensitive tokens with their own
@@ -149,17 +149,24 @@ _ELECTRONICS_CATEGORY_KEYWORDS: Tuple[str, ...] = (
     "headphone", "headphones", "earphone", "earphones", "earbud", "earbuds",
     "airpods", "speaker", "speakers", "audio", "soundbar", "microphone",
     "bluetooth", "wireless", "kindle", "kobo", "boox", "ereader",
+    # Aerial imaging / drones (Phase-1b drone sub-vertical). Verified: none is a
+    # substring of any beauty/supplement word. "camera" (above) already caught
+    # HoverAir's "self-flying camera"; these catch drone-only text (e.g. "DJI
+    # Neo camera drone", a bare "quadcopter").
+    "drone", "drones", "quadcopter", "quadcopters", "fpv",
 )
 # Short/ambiguous electronics tokens matched WHOLE-WORD only, so "anc" does not
 # fire inside "fragrance"/"radiance"/"balance" and "tv" does not fire inside
-# arbitrary words.
-_ELECTRONICS_WORD_KEYWORDS = frozenset({"anc", "tws", "tv"})
+# arbitrary words. "uav" is whole-word so it never fires inside another token.
+_ELECTRONICS_WORD_KEYWORDS = frozenset({"anc", "tws", "tv", "uav"})
 # Multi-word electronics phrases matched against the normalized (hyphen->space)
-# text — the niche audio signals a bare token set misses.
+# text — the niche audio signals a bare token set misses, plus the drone phrases
+# that carry no standalone electronics token ("self flying camera").
 _ELECTRONICS_PHRASES: Tuple[str, ...] = (
     "bone conduction", "noise cancelling", "noise cancellation", "open ear",
     "true wireless", "galaxy buds", "studio buds", "e reader", "ebook reader",
     "over ear", "in ear",
+    "self flying", "flying camera", "camera drone", "follow me drone",
 )
 
 # Only ELECTRONICS demotes an incidental weak-beauty match. The Phase-0 pilot is
@@ -540,10 +547,107 @@ ELECTRONICS_AUDIO_PROFILE = VerticalProfile(
 )
 
 
+# --------------------------------------------------------------------------- #
+# electronics_drone sub-profile (Phase-1b — self-flying camera drones; HoverAir
+# pilot). A drone resolves to the `electronics` vertical (SAME persisted column
+# value as audio) but must NOT inherit the audio profile's authority hosts /
+# competitor type-filter / brief rules. The drone-vs-audio split is a RUNTIME
+# profile choice made by ``resolve_profile`` from drone tokens in the SKU text;
+# audio stays the default electronics sub-profile when no drone signal is present.
+# --------------------------------------------------------------------------- #
+
+# Drone TYPE tokens + phrases. A drone SKU carries at least one of these; an audio
+# SKU carries none, so the two electronics sub-profiles never collide. Kept in
+# sync with the drone additions to _ELECTRONICS_CATEGORY_KEYWORDS/_PHRASES above.
+_DRONE_TYPE_TOKENS = frozenset({
+    "drone", "drones", "quadcopter", "quadcopters", "uav", "fpv",
+})
+_DRONE_PHRASES: Tuple[str, ...] = (
+    "self flying", "flying camera", "camera drone", "follow me drone",
+)
+
+_ELECTRONICS_DRONE_HEAD_NOUNS = frozenset({
+    "drone", "drones", "quadcopter", "quadcopters", "camera", "uav",
+})
+# Modifiers that pair before the head-noun ("self-flying camera", "foldable
+# drone", "follow-me drone", "mini drone", "pocket drone").
+_ELECTRONICS_DRONE_MODIFIERS = frozenset({
+    "self", "flying", "foldable", "follow", "me", "mini", "pocket", "aerial",
+    "cinematic", "compact", "portable", "gimbal",
+})
+# TYPE + descriptor tokens: a "competitor" name built ENTIRELY of these is a
+# product type, not a brand ("camera drone", "mini drone", "self-flying camera").
+# A real brand (DJI, Autel, Skydio, HoverAir, Insta360) carries an identity token
+# and survives the type-name filter.
+_ELECTRONICS_DRONE_TYPE_TOKENS = frozenset({
+    "drone", "drones", "quadcopter", "quadcopters", "uav", "fpv", "camera",
+    "cam", "self", "flying", "follow", "me", "foldable", "mini", "pocket",
+    "aerial", "cinematic", "compact", "portable", "gimbal", "4k", "8k",
+})
+_ELECTRONICS_DRONE_RETAILER_TOKENS = frozenset({
+    "bestbuy", "bhphoto", "adorama", "amazon", "walmart", "costco", "target",
+    "ebay", "newegg", "aliexpress", "temu",
+})
+# Drone authority hosts — where citations are valued AND the outreach pitch-target
+# list. faa.gov is first-class here: the sub-250g registration rule is a genuine
+# buying-decision lever for this category (ADR-002 decision intelligence).
+_ELECTRONICS_DRONE_AUTHORITY_HOSTS = (
+    "engadget.com", "thedronegirl.com", "dronexl.co", "dronesgator.com",
+    "dpreview.com", "uavcoach.com", "pilotinstitute.com", "tomsguide.com",
+    "techradar.com", "theverge.com", "faa.gov",
+)
+_ELECTRONICS_DRONE_PUBLISHER_AVOID = (
+    "The Verge", "Engadget", "DPReview", "Tom's Guide", "TechRadar",
+    "The Drone Girl",
+)
+
+ELECTRONICS_DRONE_PROFILE = VerticalProfile(
+    name="electronics_drone",
+    category_head_nouns=_ELECTRONICS_DRONE_HEAD_NOUNS,
+    category_modifiers=_ELECTRONICS_DRONE_MODIFIERS,
+    category_fallbacks=(),          # no beauty-style fallbacks; unknown -> ""
+    noisy_prompt_tokens=frozenset(),
+    retailer_tokens=_ELECTRONICS_DRONE_RETAILER_TOKENS,
+    competitor_ingredient_tokens=frozenset(),   # drones have no "ingredients"
+    competitor_form_tokens=_ELECTRONICS_DRONE_TYPE_TOKENS,
+    attribute_strategy="llm_extractor",
+    brief_rules=BriefRules(
+        claim_rules=(
+            '- SPECS: name specs in plain buyer terms and say what they DO for the '
+            'buyer ("125g so it is exempt from FAA registration", "8K video so you '
+            'can crop and reframe in post", "palm takeoff so there is no controller '
+            'to learn", "obstacle avoidance so it dodges branches while tracking"). '
+            'Do NOT dump a spec sheet or model-number soup.\n'
+            '- REGULATORY: the sub-250g / FAA-registration line is a real buying '
+            'decision lever — state it only when the exact takeoff weight is in '
+            'EVIDENCE, and never imply a heavier model is registration-exempt.\n'
+            '- CLAIMS: a hard spec (takeoff weight, flight time, tracking speed, '
+            'video resolution) is fine when it appears in EVIDENCE — state the '
+            'evidenced number, never inflate it. Frame subjective superlatives '
+            '("best tracking", "cinematic") as positioning, not proven fact, and do '
+            'NOT use safety-critical absolutes ("crash-proof", "cannot fail").'
+        ),
+        cold_pitch_publishers="The Drone Girl, DroneXL, Engadget, DPReview, etc.",
+    ),
+    publisher_avoid_list=_ELECTRONICS_DRONE_PUBLISHER_AVOID,
+    authority_hosts=_ELECTRONICS_DRONE_AUTHORITY_HOSTS,
+    health_sensitive=False,
+    # Drone use-cases are activities/product types ("vlogging", "hiking"), not
+    # concerns — "what helps with a vlogging drone" is junk, so drop the
+    # problem-framed discovery shape (same rationale as audio).
+    problem_framed_prompts=False,
+    evidence_bindings="none",
+    grounded_coverage_disclosure=(
+        "grounded-evidence dimensions are unavailable for this category"
+    ),
+)
+
+
 VERTICAL_PROFILES: Mapping[str, VerticalProfile] = {
     "beauty": BEAUTY_PROFILE,
     "generic": GENERIC_PROFILE,
     "electronics_audio": ELECTRONICS_AUDIO_PROFILE,
+    "electronics_drone": ELECTRONICS_DRONE_PROFILE,
 }
 
 # How a resolved vertical (resolve_vertical's return) maps to a registered
@@ -565,3 +669,61 @@ def get_profile(vertical: Optional[str]) -> VerticalProfile:
     if key in VERTICAL_PROFILES:
         return VERTICAL_PROFILES[key]
     return VERTICAL_PROFILES.get(_VERTICAL_TO_PROFILE.get(key, "generic"), GENERIC_PROFILE)
+
+
+def _electronics_is_drone(*texts: Any) -> bool:
+    """True when any SKU text blob carries a drone TYPE signal. Splits the
+    ``electronics`` vertical into its drone vs audio sub-profile. Audio is the
+    default electronics sub-profile, so a text with no drone token stays audio —
+    byte-identical to the pre-drone behavior for a genuine audio SKU."""
+    for raw in texts:
+        text = _normalize(raw)
+        if not text:
+            continue
+        tokens = set(re.findall(r"[a-z0-9]+", text))
+        if tokens & _DRONE_TYPE_TOKENS:
+            return True
+        if any(phrase in text for phrase in _DRONE_PHRASES):
+            return True
+    return False
+
+
+def resolve_profile_for_vertical(
+    vertical: Optional[str],
+    product: Optional[Mapping[str, Any]] = None,
+    *,
+    title: Optional[str] = None,
+) -> VerticalProfile:
+    """Map an already-resolved vertical STRING to its VerticalProfile, applying
+    the electronics drone/audio sub-split when product text is available.
+
+    This is the profile-selection counterpart to ``resolve_vertical`` (which owns
+    the beauty|fashion|electronics|other decision). The drone/audio split is a
+    RUNTIME profile choice only — it is never persisted; ``resolved_vertical``
+    stays ``electronics`` for both (exactly as audio does today). A caller that
+    passes no product text gets the audio profile for electronics (unchanged)."""
+    key = str(vertical or "").strip().lower()
+    if key == "electronics":
+        blobs: List[Any] = [title]
+        if isinstance(product, Mapping):
+            blobs.extend(
+                product.get(k)
+                for k in ("product_type", "category", "category_path", "title", "raw_title")
+            )
+        if _electronics_is_drone(*blobs):
+            return ELECTRONICS_DRONE_PROFILE
+    return get_profile(key)
+
+
+def resolve_profile(
+    product: Mapping[str, Any],
+    *,
+    override: Optional[str] = None,
+    title: Optional[str] = None,
+) -> VerticalProfile:
+    """One-shot: resolve a SKU's vertical then its VerticalProfile (including the
+    electronics drone/audio sub-split). Convenience wrapper over
+    ``resolve_vertical`` + ``resolve_profile_for_vertical`` for call sites that
+    hold the product mapping."""
+    vertical = resolve_vertical(product, override=override, title=title)
+    return resolve_profile_for_vertical(vertical, product, title=title)
