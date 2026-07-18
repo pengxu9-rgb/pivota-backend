@@ -128,6 +128,8 @@ from services.vertical_profiles import (
     BEAUTY_PROFILE,
     VerticalProfile,
     get_profile,
+    resolve_profile,
+    resolve_profile_for_vertical,
     resolve_vertical,
 )
 from services.llm_attribute_extractor import (
@@ -2260,8 +2262,14 @@ def _profile_for_sku_ctx(
     product: Optional[Mapping[str, Any]],
 ) -> VerticalProfile:
     """The VerticalProfile for a SKU-context. Beauty -> beauty profile (identical
-    behavior); unknown -> generic (never beauty-as-fallback)."""
-    return get_profile(_resolved_vertical_for_ctx(sku_ctx, product))
+    behavior); unknown -> generic (never beauty-as-fallback). The `electronics`
+    vertical is sub-split into its drone vs audio profile from the SKU text (the
+    resolved vertical stays `electronics` either way)."""
+    vertical = _resolved_vertical_for_ctx(sku_ctx, product)
+    prod = product if isinstance(product, Mapping) else {}
+    return resolve_profile_for_vertical(
+        vertical, prod, title=_sku_vertical_signal_text(prod)
+    )
 
 
 def _merchant_profile_from_reports(
@@ -2278,14 +2286,16 @@ def _merchant_profile_from_reports(
     for report in per_sku_reports or []:
         if not isinstance(report, Mapping):
             continue
-        vertical = resolve_vertical(
+        # Count PROFILE names (not raw verticals) so a drone-dominant run resolves
+        # the drone profile, not the electronics_audio default.
+        profile = resolve_profile(
             {
                 "product_type": report.get("product_type"),
                 "category": report.get("product_type"),
             },
             title=report.get("title"),
         )
-        counts[vertical] += 1
+        counts[profile.name] += 1
     if not counts:
         return BEAUTY_PROFILE
     return get_profile(counts.most_common(1)[0][0])

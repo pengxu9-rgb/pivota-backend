@@ -27,6 +27,14 @@ _SUNSCREEN_RE = re.compile(
 # (category_label, taxonomy_path, regex). Order matters — more specific
 # patterns appear earlier; the first match wins.
 CATEGORY_PATTERNS: List[Tuple[str, str, "re.Pattern[str]"]] = [
+    # ----- Electronics: camera drones (electronics_drone sub-vertical) -----
+    # First so a "self-flying camera" / "camera drone" gets an electronics path
+    # instead of falling through to a beauty/fashion rule or NULL. Tokens are
+    # drone-specific (no bare "camera"), so no beauty SKU is miscategorized.
+    ("Camera Drone", "electronics/drones/camera-drone", re.compile(
+        r"\b(drones?|quadcopters?|fpv\s+drone|uav|self[-\s]?flying\s+camera|"
+        r"flying\s+camera|camera\s+drone|follow[-\s]?me\s+drone)\b",
+        re.IGNORECASE)),
     ("Makeup Sponge", "beauty/tools/sponge", re.compile(
         r"\b(makeup sponge|beauty sponge|sponge\s*/\s*puff|powder puff|blender sponge)\b",
         re.IGNORECASE)),
