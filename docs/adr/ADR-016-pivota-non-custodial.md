@@ -12,7 +12,7 @@
 
 ## Context
 
-Pivota is the **neutral commerce index + decision layer** that connects agents and merchants — an **information flow** between two parties. **By design Pivota does not touch money.** The API-key ACP rail already embodies this: the *merchant's* PSP settles; Pivota orchestrates the checkout and never holds funds.
+Pivota is the **neutral commerce index + decision layer** that connects agents and merchants — an **information flow** between two parties. **By design Pivota does not touch the buyer→merchant transaction funds** — it never holds, routes-through, or takes a cut of them. (Pivota's own channel-partner rev-share *payouts* are a separate, intentional rail — see Consequences.) The API-key ACP rail already embodies this: the *merchant's* PSP settles; Pivota orchestrates the checkout and never holds funds.
 
 ADR-013 (Proposed, same session) drifted from that. Framed as "how an AP2 transaction moves value," it adopted **Option A: an internal Pivota-held agent ledger that `confirm` debits, backed later by a custodian** — making Pivota a **custodian of agent funds** (money transmission, stored value, the full regulatory surface), the exact thing the positioning rejects. The drift was invisible because the question was "how does *Pivota* settle," when the correct question is "**does Pivota settle at all?**" — and the answer is **no**.
 
@@ -62,7 +62,7 @@ Decisive factor: **the moat and the margins are in information and trust; custod
 ## Consequences
 
 **Becomes easier / de-risked**
-- The entire money-transmitter / custody / reserves regulatory track **disappears**.
+- The money-transmitter / custody / reserves regulatory track **on transaction funds disappears**. (Pivota's existing channel-partner rev-share **payout** rail — `services/partner_settlement_service.py`, Stripe Connect — is a separate, intentional flow distributing Pivota's *own* revenue, not custody of transaction funds; it is unaffected.)
 - ADR-013's ledger / custodian / FX-execution build is **dropped** — roadmap reclaimed.
 - `wallet/balance` `501` and "no balance source" stop being gaps — they are the correct answer.
 - One coherent money boundary across ACP (merchant PSP) and AP2 (x402 direct).
@@ -81,7 +81,7 @@ Because attribution is now the revenue mechanism, we audited whether the read→
 
 The gaps that matter for *this* positioning, ordered:
 1. **The AP2/x402 rail has zero attribution linkage** — `x402_transactions` carries no `click_id`/`surface`, and `ap2_routes` writes no edge and doesn't even set `order_id`. If agentic commerce moves onto AP2/x402, that GMV is 100% unattributable today.
-2. **The one genuinely non-custodial closure isn't reliably running** — merchant settles on their own store, Pivota never touches money — but it covers only connected Shopify (`orders/paid` webhook, cart-permalink mode); the WooCommerce/read-orders pollers exist yet are **scheduled nowhere** (only tests call them); `referral_only` (non-Shopify) has no inbound closure. And there is **no merchant self-report / receipt-ingest conversion API** — the natural non-custodial closure for a pure-info flow.
+2. **The one genuinely non-custodial closure isn't reliably running** — merchant settles on their own store, Pivota never touches money — but it covers only connected Shopify (`orders/paid` webhook, cart-permalink mode); the WooCommerce/read-orders pollers are **wired to the scheduler (15-min interval) but flag-gated off** (`EXTERNAL_CONVERSION_POLLER_ENABLED`, default off — `services/audit_scheduler.py:188`); `referral_only` (non-Shopify) has no inbound closure. And there is **no merchant self-report / receipt-ingest conversion API** — the natural non-custodial closure for a pure-info flow.
 3. **Attribution is all-or-nothing on a propagated token** — drop `pvt_click_id` and the order silently produces no edge (reject metric only); there is no `agent_id`+product+window fallback, so coverage degrades silently to well-behaved callers.
 4. **Plain PDP reads and `agent_api` search record no attributable event of their own** — a read is provable only if the agent later follows a Pivota redirect/cart-permalink and echoes the ids back.
 

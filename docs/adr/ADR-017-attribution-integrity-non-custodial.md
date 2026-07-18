@@ -16,7 +16,7 @@ ADR-016 decided Pivota is non-custodial and captures value from **attribution** 
 The attribution-loop audit found it **closes only for the Pivota-orchestrated order path**, and breaks where the non-custodial positioning points:
 - attribution is anchored on a Pivota-minted `pvt_click_id` that must round-trip into the order; if it doesn't, `upsert_order_attribution_edge` self-gates and writes nothing (only a silent-reject metric);
 - the **AP2/x402 rail carries no attribution linkage at all** (and `initiate` doesn't even set `order_id`);
-- the one genuinely non-custodial closure (merchant settles on their own store) runs only for connected Shopify; the WooCommerce/read-orders **pollers are scheduled nowhere**; `referral_only` has no closure; there is **no merchant conversion-report / receipt-ingest API**;
+- the one genuinely non-custodial closure (merchant settles on their own store) runs only for connected Shopify; the WooCommerce/read-orders pollers are **wired to the scheduler but flag-gated off** (`EXTERNAL_CONVERSION_POLLER_ENABLED`, default off); `referral_only` has no closure; there is **no merchant conversion-report / receipt-ingest API**;
 - coverage silently degrades to well-behaved callers (no fallback join).
 
 **The core problem:** Pivota must attribute orders **it did not create and whose money it never sees.** Today's attribution assumes Pivota orchestrated the checkout (so it controls the order metadata). The non-custodial, pure-info-broker positioning removes that assumption.
@@ -34,7 +34,7 @@ The attribution-loop audit found it **closes only for the Pivota-orchestrated or
 Four workstreams:
 
 1. **Conversion-report / receipt-ingest API — the primary non-custodial closure.** A verified endpoint where a merchant, platform, or settlement rail reports a settled order referencing the Pivota `pvt_click_id` and/or the AP2 **signed receipt**. Pivota verifies the report (per-merchant HMAC / signature over the receipt), binds it to the existing edge (or creates one), and stamps attributed GMV — all outside the fund flow. This is the closure for merchants Pivota does **not** orchestrate. Reconcile reported vs. expected to bound under-reporting.
-2. **Run + broaden the existing closure.** Schedule the WooCommerce/read-orders pollers (they exist but run nowhere); add a `referral_only` join key that survives to the merchant's order; keep the Shopify `orders/paid` webhook. The automatic channels for connected platforms.
+2. **Run + broaden the existing closure.** **Enable** the WooCommerce/read-orders pollers — already wired to the 15-min scheduler but flag-gated off (`EXTERNAL_CONVERSION_POLLER_ENABLED`, default off); add a `referral_only` join key that survives to the merchant's order; keep the Shopify `orders/paid` webhook. The automatic channels for connected platforms.
 3. **AP2/x402 rail attribution parity.** Carry `pvt_*` on the x402 transaction, set `order_id`, and write the attribution edge on `confirm` (dovetails with ADR-016's re-scope: confirm records + attests + routes). The future rail must be attributable from day one — and the AP2 receipt is the report artifact for workstream 1.
 4. **Fallback join + observability.** When `pvt_click_id` is absent, a secondary join (authenticated `agent_id` + `canonical_product_id` + bounded window) recovers coverage; instrument the silent-reject/drop rate so attribution coverage is a *known* number before it is billed. Emit a lightweight read/decision event from plain PDP reads + `agent_api` search so a read is attributable even without a later Pivota link.
 
@@ -82,7 +82,7 @@ Decisive factor: **for a non-custodial Pivota, attribution is an information-int
 ## Action Items
 *(tracked as issues; the two that gate any real non-custodial attribution are under the Pilot milestone)*
 1. [ ] **AP2/x402 attribution parity** — carry `pvt_*`, set `order_id`, write the edge on `confirm`. *(Pilot; dovetails ADR-016's AP2 re-scope)*
-2. [ ] **Run + broaden the existing closure** — schedule the Woo/read-orders pollers; add a `referral_only` join key. *(Pilot)*
+2. [ ] **Enable + broaden the existing closure** — flip `EXTERNAL_CONVERSION_POLLER_ENABLED` (the Woo/read-orders pollers are already scheduler-wired); add a `referral_only` join key. *(Pilot)*
 3. [ ] **Fallback join + observability** — `agent_id`+product+window fallback; silent-reject/drop-rate metrics; read/decision event on plain PDP + search.
 4. [ ] **Conversion-report / receipt-ingest API** — verified endpoint, `pvt_click_id`/signed-receipt join, reconciliation. *(the primary non-custodial closure — highest leverage; scope for the pilot cohort next)*
 5. [ ] **Founder sign-off**; move to Accepted; define attribution/referral pricing on the resulting (measured) coverage.
