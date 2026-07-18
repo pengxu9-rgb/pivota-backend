@@ -30,6 +30,7 @@ Reuse (no re-invention):
 
 from __future__ import annotations
 
+import asyncio
 import logging
 import os
 from datetime import datetime, timedelta, timezone
@@ -62,6 +63,26 @@ FIRST_RUN_LOOKBACK_DAYS = CLICK_RECENCY_WINDOW_DAYS
 ORDERS_PAGE_LIMIT = 250
 MAX_PAGES = 20
 
+# --- rate-limit backoff + throttle (Rank-2, #1489) ----------------------------
+# A 429 is transient: honor Retry-After with a bounded, capped backoff and retry
+# the page IN-TICK instead of aborting the merchant to a watermark hold. The cap
+# stops a hostile / huge Retry-After from stalling the whole tick; if the retries
+# are exhausted the caller still sees a 429 → fetch failure → hold (safe fallback).
+_MAX_429_RETRIES = 3
+_DEFAULT_RETRY_AFTER_S = 2.0
+_MAX_RETRY_AFTER_S = 15.0
+
+# Optional throttle knobs (seconds), OFF by default so there is no surprise
+# latency; an operator tunes them to the platform API budget once the poller is
+# enabled. The 429 backoff above is always-on regardless of these.
+_INTER_PAGE_SLEEP_ENV = "EXTERNAL_CONVERSION_POLLER_INTER_PAGE_SLEEP_S"
+_INTER_MERCHANT_SLEEP_ENV = "EXTERNAL_CONVERSION_POLLER_INTER_MERCHANT_SLEEP_S"
+# Bound the merchants polled PER LANE per tick (fair-share: least-recently-polled
+# first — see the ORDER BY in the candidate SQL — with the remainder carried to the
+# next tick, since an un-polled merchant keeps its stale/absent watermark and sorts
+# first next time). 0 / unset = unlimited.
+_MAX_MERCHANTS_PER_TICK_ENV = "EXTERNAL_CONVERSION_POLLER_MAX_MERCHANTS_PER_TICK"
+
 # Trim the payload: only the fields the closure needs.
 _ORDER_FIELDS = (
     "id,name,order_number,financial_status,note_attributes,"
@@ -90,6 +111,73 @@ def _parse_dt(value: Any) -> Optional[datetime]:
         return dt.replace(tzinfo=timezone.utc) if dt.tzinfo is None else dt.astimezone(timezone.utc)
     except Exception:
         return None
+
+
+# --- rate-limit backoff + throttle helpers (shared by both lanes) -------------
+
+
+async def _sleep(seconds: float) -> None:
+    """Single backoff/throttle indirection so tests stub it (no wall-clock waits)."""
+    if seconds and seconds > 0:
+        await asyncio.sleep(seconds)
+
+
+def _env_float(name: str, default: float = 0.0) -> float:
+    try:
+        return max(0.0, float(os.getenv(name) or default))
+    except (TypeError, ValueError):
+        return default
+
+
+def _env_int(name: str, default: int = 0) -> int:
+    try:
+        return max(0, int(os.getenv(name) or default))
+    except (TypeError, ValueError):
+        return default
+
+
+def _parse_retry_after(value: Optional[str], *, default: float, cap: float) -> float:
+    """Seconds to wait from a ``Retry-After`` header. Supports the common
+    delta-seconds form, clamps to ``[0, cap]``, and falls back to ``default`` when
+    the header is absent or unparseable (an HTTP-date Retry-After is uncommon for
+    rate limits and is treated as the default)."""
+    if value is not None:
+        try:
+            return max(0.0, min(float(str(value).strip()), cap))
+        except (TypeError, ValueError):
+            pass
+    return min(default, cap)
+
+
+async def _get_with_backoff(
+    url: str,
+    *,
+    params: Dict[str, Any],
+    headers: Optional[Dict[str, str]] = None,
+    timeout_s: float = 15.0,
+    log: logging.Logger = logger,
+) -> httpx.Response:
+    """One GET that honors a 429 ``Retry-After`` with a bounded, capped backoff and
+    retries the request in-tick (one client, reused across retries). Returns the
+    FINAL response — still 429 if the retries are exhausted, so the caller decides
+    how to surface it (both pollers raise → fetch failure → watermark hold)."""
+    async with httpx.AsyncClient(timeout=timeout_s) as client:
+        resp = await client.get(url, params=params, headers=headers)
+        for attempt in range(_MAX_429_RETRIES):
+            if resp.status_code != 429:
+                return resp
+            wait_s = _parse_retry_after(
+                resp.headers.get("Retry-After"),
+                default=_DEFAULT_RETRY_AFTER_S,
+                cap=_MAX_RETRY_AFTER_S,
+            )
+            log.info(
+                "rate-limited (429); backing off %.1fs then retry %d/%d",
+                wait_s, attempt + 1, _MAX_429_RETRIES,
+            )
+            await _sleep(wait_s)
+            resp = await client.get(url, params=params, headers=headers)
+    return resp
 
 
 # --- per-merchant watermark (external_conversion_poll_state) ------------------
@@ -217,9 +305,14 @@ async def _fetch_orders_page(
     header auth, same 429/401/403 handling, same Link-header cursor parse.
     """
     url = f"https://{shop_domain}/admin/api/{api_version}/orders.json"
-    async with httpx.AsyncClient(timeout=timeout_s) as client:
-        resp = await client.get(url, params=params, headers={"X-Shopify-Access-Token": access_token})
-    if resp.status_code == 429:
+    resp = await _get_with_backoff(
+        url,
+        params=params,
+        headers={"X-Shopify-Access-Token": access_token},
+        timeout_s=timeout_s,
+        log=logger,
+    )
+    if resp.status_code == 429:  # backoff exhausted — surface as a fetch failure (hold)
         raise RuntimeError("Shopify orders rate limit exceeded (status=429)")
     if resp.status_code in (401, 403):
         raise RuntimeError(f"Shopify orders auth failed (status={resp.status_code})")
@@ -391,6 +484,7 @@ async def poll_external_conversions_for_merchant(
             scan_complete = True  # genuinely no more pages — the window is fully scanned
             break
         page_info = next_cursor
+        await _sleep(_env_float(_INTER_PAGE_SLEEP_ENV))  # optional inter-page throttle (default off)
 
     # Advance the watermark only if we scanned the WHOLE window. Two ways it wasn't:
     #  - a FETCH failure (429 / timeout / 5xx) left orders in [updated_at_min,
@@ -420,15 +514,23 @@ async def poll_external_conversions_for_merchant(
 
 # --- batch entry (candidate scoping) ------------------------------------------
 
+# Least-recently-polled first (NULL watermark = never polled → first), so a
+# per-tick cap is a fair rotation: the merchants most behind are polled this tick
+# and the rest carry to the next (they keep their stale/absent watermark). The
+# LEFT JOIN keys on the plain merchant_id (the Shopify lane's watermark namespace).
 _CANDIDATE_MERCHANTS_SQL = """
-SELECT DISTINCT s.merchant_id AS merchant_id
+SELECT s.merchant_id AS merchant_id
 FROM surface_click_events s
 JOIN merchant_stores ms
   ON ms.merchant_id = s.merchant_id
  AND ms.platform = 'shopify'
  AND LOWER(COALESCE(ms.status, '')) IN ('active', 'connected')
+LEFT JOIN external_conversion_poll_state ps
+  ON ps.merchant_id = s.merchant_id
 WHERE s.merchant_id IS NOT NULL
   AND COALESCE(s.last_click_at, s.created_at) >= :cutoff
+GROUP BY s.merchant_id
+ORDER BY MIN(ps.last_polled_at) ASC NULLS FIRST
 """
 
 
@@ -443,7 +545,9 @@ async def poll_external_conversions_batch(
     batch. NEVER raises.
     """
     now = now or _now()
-    result: Dict[str, Any] = {"ok": True, "merchants_polled": 0, "total_closed": 0, "results": []}
+    result: Dict[str, Any] = {
+        "ok": True, "merchants_polled": 0, "total_closed": 0, "merchants_deferred": 0, "results": [],
+    }
 
     if not _poller_enabled():
         result.update(skipped="disabled")
@@ -457,7 +561,20 @@ async def poll_external_conversions_batch(
             logger.warning("external_conversion_poller: candidate query failed err=%s", str(e)[:200])
             return {"ok": False, "reason": "candidate_query_failed", "merchants_polled": 0, "total_closed": 0, "results": []}
 
-        for row in rows or []:
+        # Per-tick cap (fair rotation — candidates are ordered least-recently-polled
+        # first). The remainder carries to the next tick. Applied per lane.
+        candidates = list(rows or [])
+        cap = _env_int(_MAX_MERCHANTS_PER_TICK_ENV)
+        if cap and len(candidates) > cap:
+            result["merchants_deferred"] = len(candidates) - cap
+            logger.info(
+                "external_conversion_poller: per-tick cap=%d — polling %d, deferring %d to next tick",
+                cap, cap, len(candidates) - cap,
+            )
+            candidates = candidates[:cap]
+
+        inter_merchant_s = _env_float(_INTER_MERCHANT_SLEEP_ENV)
+        for row in candidates:
             merchant_id = dict(row).get("merchant_id")
             if not merchant_id:
                 continue
@@ -469,6 +586,7 @@ async def poll_external_conversions_batch(
             result["results"].append(res)
             result["merchants_polled"] += 1
             result["total_closed"] += int(res.get("closed") or 0)
+            await _sleep(inter_merchant_s)  # optional inter-merchant throttle (default off)
 
         # T2-2c: WooCommerce lane — same flag, same batch tick, own candidate
         # scoping + woo:: watermark namespace. Import here (not module level) so
@@ -493,12 +611,14 @@ async def poll_external_conversions_batch(
         result["merchants_stuck"] = sum(1 for r in result["results"] if r.get("watermark_stuck"))
         result["total_errors"] = sum(int(r.get("errors") or 0) for r in result["results"])
         logger.info(
-            "external_conversion_poller batch: merchants=%d closed=%d held=%d stuck=%d errors=%d",
+            "external_conversion_poller batch: merchants=%d closed=%d held=%d stuck=%d "
+            "errors=%d deferred=%d",
             result["merchants_polled"],
             result["total_closed"],
             result["merchants_held"],
             result["merchants_stuck"],
             result["total_errors"],
+            result["merchants_deferred"],  # Shopify lane; the Woo lane logs its own deferral
         )
     except Exception as e:  # the batch entry must never raise out
         logger.warning("external_conversion_poller: batch aborted err=%s", str(e)[:200])
