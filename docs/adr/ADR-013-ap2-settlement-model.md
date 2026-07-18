@@ -17,7 +17,7 @@ Today it does not move at all. Verified 2026-07-18:
 
 - **`/ap2/transaction/initiate`** = `INSERT` a `pending` row into `x402_transactions` + sign a receipt.
 - **`/ap2/transaction/confirm`** = verify the caller's wallet is registered, then `UPDATE x402_transactions SET status='completed'`. **No debit, no transfer, no external call.**
-- **`/ap2/wallet/balance`** → `501` (previously a query against phantom columns; [PR #1471]).
+- **`/ap2/wallet/balance`** → **errors** on phantom columns today (`SELECT balance, currency, last_updated …` against a table that has none); becomes an honest `501` once [PR #1471] lands — the 501 baseline the rest of this ADR assumes.
 - **`/ap2/x402/exchange`** → `501`; **`/ap2/x402/quote`** reads a manually-fed rate table.
 - **`agent_wallets`** is an address registry with **no balance store**; there is **no on-chain RPC, no custodian client, and no settlement service** anywhere in the codebase. `adapters/ap2_payment_adapter.py` exists but is wired to nothing (referenced by no route).
 
@@ -115,7 +115,7 @@ Decisive factor: **the pilot needs a real, controllable value loop today, and a 
 - Reconciliation (ADR-012 #8) gets a home: the agent ledger is the AP2 side of the combined economic ledger.
 
 **Becomes harder / must be owned**
-- **Custody/regulatory:** holding agent float is a money-transmission/stored-value surface. Needs a compliance owner and a bounded pilot (ideally Pivota-funded test credits) before real external funds.
+- **Custody/regulatory:** holding agent float is a money-transmission/stored-value surface. Several US state money-transmitter regimes have **no de-minimis exemption** — holding *any* customer float can trigger licensing regardless of pilot size — so this must be validated with **counsel before phase 1**, not in parallel with it. Needs a compliance owner; prefer a bounded, Pivota-funded test-credit pilot (no external customer funds) until cleared.
 - **`confirm` correctness is now load-bearing:** it must be **atomic** (debit+status in one DB txn), **idempotent** (a replayed confirm settles once), and **authorized** (transaction belongs to the consenting agent, is `pending`, amount matches the mandate/authorized amount). The current agent-unscoped, guard-less `UPDATE` must be replaced.
 - **A funding on-ramp** must exist even for pilot (manual/admin credit or Stripe top-up) — small, but real.
 - **Merchant payout:** the credited merchant-payable balance needs an eventual payout path (out-of-band for pilot; reconciled with the `/orders/*` ledger long-term). This is where custody risk actually **concentrates** — merchant-payable float accumulates with every settled transaction — so the payout path needs an owner *before* real external funds move, not after.
@@ -129,7 +129,7 @@ Decisive factor: **the pilot needs a real, controllable value loop today, and a 
 ## Action Items
 
 1. [ ] **Founder sign-off** on Option A + the phased path (0→1→2). Move to Accepted on sign-off.
-2. [ ] **Compliance owner** for pilot-scale custody/float (money-transmission review); define the pilot funding source (recommend Pivota-funded test credits).
+2. [ ] **Compliance owner + counsel review** of custody/float **before phase 1** (money-transmission licensing has no de-minimis in several states, so "bounded at pilot scale" is not self-evidently safe); define the pilot funding source (recommend Pivota-funded test credits — no external customer funds until cleared).
 3. [ ] **Phase 0 (now):** scope an **auth-only pilot** — grant→initiate→confirm as a signed record, settlement out-of-band; keep `wallet/balance` `501` and documented. Validates the ADR-012 auth rail without settlement.
 4. [ ] **Phase 1 — ledger schema:** `agent_ledger` (balance + entries keyed to `transaction_id`; agent-debit + merchant-payable-credit), modeled on `credit_ledger` / `partner_settlement_service`. **Single-currency (USD) for the pilot** — non-USD rejected at `initiate`, not converted. New migration.
 5. [ ] **Phase 1 — settle in `confirm`:** atomic debit + status flip in one DB transaction; **idempotent** on `transaction_id`; **authorized** (transaction belongs to the consenting agent, is `pending`, amount matches the mandate/authorized amount). Fixes the current unscoped/guard-less `UPDATE`.

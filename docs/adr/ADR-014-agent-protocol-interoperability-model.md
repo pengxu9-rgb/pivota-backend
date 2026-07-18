@@ -6,7 +6,7 @@
 **Relationship:** **Meta-ADR.** Sits *above* and generalizes ADR-007 (read surface), ADR-012 (transaction rail boundary + identity rooting), ADR-013 (settlement model). Those three are the per-layer instances of the framework this ADR names; it does not override them.
 **Scope:** the framework for supporting *multiple* agent-commerce protocols (AP2, x402, ACP, MCP, UCP, and successors) **together** — how they compose, where their code lives, and the one rule that keeps the core coherent. **Not** a decision to adopt or drop any specific protocol (those are the per-layer ADRs).
 
-**Landscape note (confidence):** AP2 = Google (open, mandate-based, payment-agnostic); x402 = Coinbase (HTTP-402 stablecoin); ACP = OpenAI/Stripe (full-stack agentic checkout); MCP = Anthropic (model↔tool/context). In *this* repo, **UCP** reads as Pivota's own internal commerce surface (`UCP_INTERNAL_API_KEY`; "ACP and UCP API endpoints"), not a public standard — its status under this framework is decided below ("UCP's place": spine-side, no adapter). The framework does not depend on these attributions.
+**Landscape note (confidence):** AP2 = Google (open, mandate-based, payment-agnostic); x402 = Coinbase (HTTP-402 stablecoin); ACP = OpenAI/Stripe (full-stack agentic checkout); MCP = Anthropic (model↔tool/context). In *this* repo, **UCP** reads as Pivota's own internal commerce surface (`UCP_INTERNAL_API_KEY`; "ACP and UCP API endpoints"), not a public standard — its status under this framework is decided below ("UCP's place": spine-side, no adapter). The framework does not depend on these attributions. **On "ACP" specifically:** in *this* repo today "ACP" is a `protocol_name` **tier** on the API-key-authenticated charge path (`GUARDED_PROTOCOLS = {acp, ucp, ap2}` in `services/agent_checkout_kill_switch.py`), **not** a separately-implemented OpenAI-ACP adapter — so "the API-key ACP rail" (ADR-012/013) and "ACP" (below) name the *same* Rail-1 lane viewed as auth-primitive vs. protocol-tier. External OpenAI/Stripe ACP would get its own adapter if/when integrated.
 
 ---
 
@@ -60,7 +60,7 @@ Concretely:
 
 ### The transact-side port (implemented by protocols that speak the transaction layers)
 
-This is the port behind the registry, covering the identity / authorization / settlement layers. Discovery has its own surface (ADR-007) and is not part of this contract — **MCP therefore implements no method below.** Names illustrative; the shape is the point — and the shape must be **derived from the three transact-capable shapes already live in the code** (API-key, ACP, AP2), not speculatively generalized for protocols that haven't arrived:
+This is the port behind the registry, covering the identity / authorization / settlement layers. Discovery has its own surface (ADR-007) and is not part of this contract — **MCP therefore implements no method below.** Names illustrative; the shape is the point — and the shape must be **derived from the transact-capable shapes already live in the code** (the API-key rail — which today carries the `acp`/`ucp` protocol tiers — plus AP2; see the landscape note on "ACP"), not speculatively generalized for protocols that haven't arrived:
 
 | Port method | Returns (canonical) | AP2 | ACP | API-key |
 |---|---|---|---|---|
@@ -89,7 +89,7 @@ UCP is Pivota's **own** surface, not an external standard — so it is **spine-s
 | Reversibility | **High** — adapters are additive and removable |
 
 **Pros:** absorbs new protocols by adding an adapter, not rewiring; one place for fraud/receipts/reconciliation; ADR-007/012/013 compose cleanly under it; smallest step from where the code already is (unified execution + `protocol_name`).
-**Cons:** requires designing a vendor-neutral canonical model and a disciplined adapter boundary; the port is derived from only three live shapes, so expect one honest revision when the first genuinely external protocol lands; a genuinely novel protocol primitive that no canonical layer models forces a core extension, not just an adapter — a real, if rare, cost.
+**Cons:** requires designing a vendor-neutral canonical model and a disciplined adapter boundary; the port is derived from only the shapes live today, so expect one honest revision when the first genuinely external protocol lands; a genuinely novel protocol primitive that no canonical layer models forces a core extension, not just an adapter — a real, if rare, cost.
 
 ### Option B: Per-protocol vertical stacks (point-to-point) — the emergent status quo
 Each protocol gets its own end-to-end path (own identity, order, settlement, receipts).
@@ -154,7 +154,7 @@ Decisive factor: **multi-protocol is the product, the protocols are unsettled, a
 
 1. [ ] **Founder sign-off** on the meta-model (canonical spine + per-layer edge ports; never fork the core), including the **UCP-is-spine-side** call. Move to Accepted; re-frame ADR-007/012/013 as its instances.
 2. [ ] **Name the canonical layers + spine explicitly** in docs — the per-layer ports, the invariant pipeline they wrap, and the **delimited core module set** (the list the automated boundary check in item 7 enforces). Spine of record: `payment_execution_routes` today, + the ADR-013 ledger once built.
-3. [ ] **Define the transact-side port interface** (`resolve_identity` / `verify_authorization` / `to_canonical_order` / `select_settlement` / `render_receipt`) and a registry keyed by protocol, homed in `services/protocols/` — **derived from the three existing shapes** (API-key, ACP, AP2), with **unknown-protocol lookups failing closed**.
+3. [ ] **Define the transact-side port interface** (`resolve_identity` / `verify_authorization` / `to_canonical_order` / `select_settlement` / `render_receipt`) and a registry keyed by protocol, homed in `services/protocols/` — **derived from the shapes live today** (the API-key rail incl. its `acp`/`ucp` tiers, plus AP2), with **unknown-protocol lookups failing closed**.
 4. [x] **ADR-015 — canonical authorized action** (drafted, Proposed). Specifies the authorization layer's canonical object (the CAA — agent, action, amount|ceiling, currency, merchants, **presence**, validity, single-use, provenance) and the mandate / delegated-token / consent-scope mappings + a single deny-by-default enforcement gate. Sign-off pending.
 5. [ ] **Author the protocol-conformance matrix** (protocol × layer → native / adapted / n-a) beside `docs/AP2_ENABLEMENT.md` — with a **named owner** and an update trigger (the adapter-PR template requires a matrix update), so it cannot silently go stale the way `AP2_ENABLEMENT.md` §6 did.
 6. [ ] **Refactor incrementally — characterization tests first.** Before migrating any existing `protocol_name` branching (`agent_payment_sdk` / `payment_execution` / kill-switch) behind the registry, pin the current guard behavior — especially the kill-switch's fail-closed semantics — with characterization tests; then migrate one protocol at a time with no behavior change. **New protocols enter through the registry first; live Rail-1 paths migrate last.**
