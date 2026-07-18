@@ -316,8 +316,22 @@ async def initiate_transaction(
     # behavior is unchanged (consent-scope based) for backward compatibility.
     if payment.mandate_chain is not None:
         from services.ap2_mandate import verify_mandate_chain, MandateError
+        from services.ap2_identity import is_did
         from db.ap2_trusted_issuers import get_trusted_issuers
         from decimal import Decimal
+
+        # A mandate's `subject` is the agent's DID. Resolve the agent's DID
+        # identity from agents.public_key (which holds the did:key:/did:web:
+        # string for DID agents — the SAME value verify_ap2_signature verified
+        # the request signature against). agent_id is the INTERNAL id (VARCHAR-50,
+        # too short to be a DID), so it must NOT be used as the subject. The
+        # trusted-issuer registry stays keyed by the internal agent_id.
+        agent_did = await consent_service.get_agent_public_key(agent_id)
+        if not is_did(agent_did):
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail="Mandate authorization requires a DID-identity agent",
+            )
 
         mc = payment.mandate_chain
         trusted_issuers = await get_trusted_issuers(agent_id)
@@ -326,7 +340,7 @@ async def initiate_transaction(
                 mc.intent, mc.intent_signature,
                 mc.cart, mc.cart_signature,
                 mc.payment, mc.payment_signature,
-                agent_did=agent_id,            # DID-identity agent: agent_id is the DID
+                agent_did=agent_did,           # the agent's resolved DID (subject binding)
                 trusted_issuers=trusted_issuers,  # pass directly — empty set = deny all
                 action="create_payment",
             )

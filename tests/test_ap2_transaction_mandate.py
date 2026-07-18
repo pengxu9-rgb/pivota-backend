@@ -29,6 +29,9 @@ from services.crypto_service import crypto_service  # noqa: E402
 _B58 = b"123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz"
 CONSENT_TOKEN = "consent_txn_mandate"
 NONCE = "txn-mandate-1"
+# Realistic identity shape: agent_id is the INTERNAL id (VARCHAR-50), the DID
+# lives in agents.public_key. A did:key (~57 chars) cannot BE the agent_id.
+AGENT_ID = "agent_internal_txn"
 
 
 def _b58(data: bytes) -> str:
@@ -49,6 +52,15 @@ def _keypair():
     return priv, "did:key:z" + _b58(b"\x80\x24" + comp)
 
 
+def _pem_keypair():
+    priv = ec.generate_private_key(ec.SECP256R1())
+    pem = priv.public_key().public_bytes(
+        encoding=serialization.Encoding.PEM,
+        format=serialization.PublicFormat.SubjectPublicKeyInfo,
+    ).decode("utf-8")
+    return priv, pem
+
+
 def _es256(priv, message: bytes) -> str:
     return base64.b64encode(priv.sign(message, ec.ECDSA(hashes.SHA256()))).decode()
 
@@ -58,8 +70,13 @@ def _sign_obj(priv, obj) -> str:
 
 
 class FakeDB:
-    def __init__(self, agent_did, trusted_issuer_dids):
-        self.agent_did = agent_did
+    def __init__(self, agent_did, trusted_issuer_dids, *, agent_id=AGENT_ID,
+                 public_key=None):
+        self.agent_id = agent_id                       # internal id (in consent)
+        self.agent_did = agent_did                     # subject the mandates bind to
+        # agents.public_key holds the DID for a DID agent (default), but a
+        # raw-PEM pilot agent has a non-DID public_key.
+        self.public_key = public_key if public_key is not None else agent_did
         self.trusted = set(trusted_issuer_dids)
         self.used_nonces = set()
         self.tx = []
@@ -67,13 +84,13 @@ class FakeDB:
     async def fetch_one(self, query, values=None):
         if "FROM agent_consents" in query:
             return {
-                "consent_id": CONSENT_TOKEN, "agent_id": self.agent_did,
+                "consent_id": CONSENT_TOKEN, "agent_id": self.agent_id,
                 "scope": json.dumps({"actions": ["read", "create_payment"]}),
                 "status": "active",
                 "expires_at": datetime.utcnow() + timedelta(hours=1),
             }
         if "FROM agents" in query:
-            return {"public_key": self.agent_did} if values["agent_id"] == self.agent_did else None
+            return {"public_key": self.public_key} if values["agent_id"] == self.agent_id else None
         if "FROM nonce_tracker" in query:
             return {"present": 1} if values["nonce"] in self.used_nonces else None
         return None
@@ -186,3 +203,20 @@ def test_initiate_without_mandate_chain_unchanged(monkeypatch):
     res = _post(client, agent_priv, body)
     assert res.status_code == 200, res.text
     assert len(fake.tx) == 1
+
+
+def test_initiate_non_did_agent_with_chain_rejected_403(monkeypatch):
+    # A raw-PEM (non-DID) agent cannot use mandate authority — a mandate's subject
+    # is a DID, so agent_did must resolve to one. Reaches the mandate block (the
+    # request signature verifies against the PEM), then 403s on the DID guard.
+    agent_priv, agent_pem = _pem_keypair()
+    issuer_priv, issuer_did = _keypair()
+    fake = FakeDB("did:key:zUnusedSubject", {issuer_did}, public_key=agent_pem)
+    client = _client(fake, monkeypatch)
+
+    body = {"merchant_id": "m_1", "amount": 50.0, "currency": "USD",
+            "mandate_chain": _chain(issuer_priv, issuer_did, "did:key:zUnusedSubject")}
+    res = _post(client, agent_priv, body)
+    assert res.status_code == 403, res.text
+    assert "DID-identity agent" in res.json()["detail"]
+    assert fake.tx == []
