@@ -1,7 +1,7 @@
 """
 Admin endpoint to apply the Agent Center V1 migration (067_agent_center_v1.sql).
 
-Mirrors the webhook_events migration pattern (see admin_apply_webhook_migration.py):
+Mirrors the webhook_events migration pattern:
 - POST /admin/migrations/apply-agent-center-v1 — idempotent CREATE … IF NOT EXISTS,
   callable repeatedly without harm.
 - GET  /admin/migrations/verify-agent-center-v1 — checks all 7 tables exist.

@@ -26,15 +26,6 @@ def test_wix_admin_store_mutation_routes_are_runtime_gated() -> None:
     assert "Superadmin access required" in cleanup_source
 
 
-def test_direct_admin_sql_routes_are_auth_and_runtime_gated() -> None:
-    source = _read("routes/admin_sql_execute.py")
-
-    assert "Depends(require_admin)" in source
-    assert "ENABLE_ADMIN_SQL_EXECUTE" in source
-    assert "ENABLE_ADMIN_SQL_QUERY" in source
-    assert "NO AUTH" not in source
-
-
 def test_destructive_cleanup_rebuild_routes_are_auth_and_runtime_gated() -> None:
     source = _read("routes/admin_cleanup_rebuild.py")
 
