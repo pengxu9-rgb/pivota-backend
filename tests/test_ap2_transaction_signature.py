@@ -127,8 +127,9 @@ def fake_db(keypair, monkeypatch):
         agent_wallets={(AGENT_ID, WALLET_ADDRESS)},
         transactions={
             "ap2_txn_x": {
-                "transaction_id": "ap2_txn_x", "agent_id": AGENT_ID,
-                "amount": 25, "currency": "USD", "status": "pending",
+                "transaction_id": "ap2_txn_x", "order_id": "ap2_txn_x",
+                "agent_id": AGENT_ID, "merchant_id": "m_1", "product_id": None,
+                "amount": 25, "currency": "USD", "status": "pending", "metadata": None,
             }
         },
     )
@@ -174,6 +175,25 @@ def test_initiate_valid_signature_creates_transaction(client, fake_db, keypair):
     assert len(fake_db.tx_inserts) == 1
     assert fake_db.tx_inserts[0]["agent_id"] == AGENT_ID
     assert "txn-001" in fake_db.used_nonces
+
+
+def test_initiate_serializes_metadata_for_jsonb(client, fake_db, keypair):
+    # metadata must be bound as a JSON *string* (CAST(:metadata AS JSONB)) — asyncpg
+    # has no jsonb codec here, so a raw dict would 500 every tagged (pvt_*) initiate
+    # in prod. Also proves order_id is set at initiate (= transaction_id, the edge key).
+    priv, _ = keypair
+    body = {"merchant_id": "m_1", "amount": 25, "currency": "USD",
+            "metadata": {"pvt_click_id": "clk_abc"}}
+    signature = _sign(priv, {**body, "nonce": "txn-meta"})
+
+    res = client.post("/ap2/transaction/initiate", json=body,
+                      headers=_headers(signature, "txn-meta"))
+    assert res.status_code == 200, res.text
+    assert len(fake_db.tx_inserts) == 1
+    ins = fake_db.tx_inserts[0]
+    assert isinstance(ins["metadata"], str), "metadata must be json.dumps'd for JSONB (not a dict)"
+    assert json.loads(ins["metadata"])["pvt_click_id"] == "clk_abc"
+    assert ins["order_id"] == ins["transaction_id"]
 
 
 def test_initiate_bad_signature_rejected_and_no_side_effects(client, fake_db, keypair):
@@ -342,3 +362,61 @@ def test_confirm_already_completed_rejected_409(client, fake_db, keypair):
     assert res.status_code == 409, res.text
     assert "already" in res.json()["detail"].lower()
     assert fake_db.tx_updates == []
+
+
+# ---- attribution parity (#1479): the AP2 rail records who drove the sale --------
+
+def test_confirm_deposits_attribution_edge(client, fake_db, keypair, monkeypatch):
+    # A confirmed AP2 transaction carrying a Pivota pvt_click_id records a
+    # commerce_attribution_edge (non-custodial — ADR-016/017): Pivota proves it
+    # drove the sale without touching money. order_id (set at initiate) is the key.
+    priv, _ = keypair
+    edge_calls = []
+
+    async def fake_upsert(*, order_id, merchant_id, metadata):
+        edge_calls.append({"order_id": order_id, "merchant_id": merchant_id, "metadata": dict(metadata)})
+        return {"edge_id": "cae_test", "order_id": order_id}
+
+    monkeypatch.setattr(
+        "services.commerce_attribution_service.upsert_order_attribution_edge", fake_upsert
+    )
+    fake_db.transactions["ap2_txn_attr"] = {
+        "transaction_id": "ap2_txn_attr", "order_id": "ap2_txn_attr",
+        "agent_id": AGENT_ID, "merchant_id": "m_1", "product_id": "prod_9",
+        "amount": 25, "currency": "USD", "status": "pending",
+        "metadata": {"pvt_click_id": "clk_abc", "pvt_surface": "chatgpt"},
+    }
+    body = {"transaction_id": "ap2_txn_attr"}
+    signature = _sign(priv, {**body, "nonce": "cf-attr"})
+
+    res = client.post("/ap2/transaction/confirm", json=body,
+                      headers=_headers(signature, "cf-attr", wallet=WALLET_ADDRESS))
+    assert res.status_code == 200, res.text
+    assert len(edge_calls) == 1, "a tagged AP2 confirm must deposit exactly one edge"
+    c = edge_calls[0]
+    assert c["order_id"] == "ap2_txn_attr"            # order_id set at initiate
+    assert c["merchant_id"] == "m_1"
+    assert c["metadata"]["pvt_click_id"] == "clk_abc"
+    assert c["metadata"]["protocol_name"] == "ap2"
+
+
+def test_confirm_untagged_transaction_writes_no_edge(client, fake_db, keypair, monkeypatch):
+    # No attribution signal (no pvt_*, no product) → no edge is fabricated (parity
+    # with the ACP rail). The default "ap2_txn_x" fixture carries no signal.
+    priv, _ = keypair
+    edge_calls = []
+
+    async def fake_upsert(*, order_id, merchant_id, metadata):
+        edge_calls.append(order_id)
+        return None
+
+    monkeypatch.setattr(
+        "services.commerce_attribution_service.upsert_order_attribution_edge", fake_upsert
+    )
+    body = {"transaction_id": "ap2_txn_x"}
+    signature = _sign(priv, {**body, "nonce": "cf-untagged"})
+
+    res = client.post("/ap2/transaction/confirm", json=body,
+                      headers=_headers(signature, "cf-untagged", wallet=WALLET_ADDRESS))
+    assert res.status_code == 200, res.text
+    assert edge_calls == [], "an untagged AP2 confirm must not fabricate an edge"
