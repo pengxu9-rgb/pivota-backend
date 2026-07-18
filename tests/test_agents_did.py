@@ -18,13 +18,19 @@ async def test_get_agent_by_did_returns_row(monkeypatch):
     async def fake_fetch_one(query, values=None):
         captured["query"] = query
         captured["values"] = values
-        return {"agent_id": "agent_1", "did": "did:key:z6Mk", "x402_enabled": True}
+        return {
+            "agent_id": "agent_1", "did": "did:key:z6Mk", "x402_enabled": True,
+            "api_key": "ak_secret", "api_key_hash": "hash_secret",
+        }
 
     from db.database import database
     monkeypatch.setattr(database, "fetch_one", fake_fetch_one)
 
     row = await agents_db.get_agent_by_did("did:key:z6Mk")
     assert row["agent_id"] == "agent_1"
+    # Authentication secrets must be stripped from a DID lookup.
+    assert "api_key" not in row
+    assert "api_key_hash" not in row
     assert "WHERE did = :did" in captured["query"]
     assert captured["values"] == {"did": "did:key:z6Mk"}
 

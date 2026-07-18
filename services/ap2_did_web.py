@@ -39,9 +39,23 @@ _DID_WEB_PREFIX = "did:web:"
 _HTTP_TIMEOUT_SECONDS = 5.0
 _MAX_DOC_BYTES = 100_000
 _CACHE_TTL_SECONDS = 300.0
+_CACHE_MAX_ENTRIES = 1024
 
 # (did, kid) -> (expires_at_monotonic, (pem, algorithm))
 _cache: Dict[Tuple[str, Optional[str]], Tuple[float, Tuple[str, str]]] = {}
+
+
+def _cache_store(key: Tuple[str, Optional[str]], result: Tuple[str, str], now: float) -> None:
+    """
+    Insert a resolution into the cache, keeping it bounded: purge expired entries
+    first, then if still at capacity evict the soonest-to-expire. Without this the
+    cache grew unbounded with distinct DIDs.
+    """
+    for expired in [k for k, (exp, _) in _cache.items() if exp <= now]:
+        _cache.pop(expired, None)
+    if len(_cache) >= _CACHE_MAX_ENTRIES:
+        _cache.pop(min(_cache, key=lambda k: _cache[k][0]), None)
+    _cache[key] = (now + _CACHE_TTL_SECONDS, result)
 
 # An async callable that fetches a URL and returns the parsed JSON document.
 # Injectable so tests never touch the network.
@@ -115,6 +129,8 @@ def _assert_public_host(host_with_optional_port: str) -> None:
 
 
 async def _default_fetch(url: str) -> Dict[str, Any]:
+    import json as _json
+
     import httpx
 
     _assert_public_host(urlparse(url).netloc)
@@ -122,21 +138,30 @@ async def _default_fetch(url: str) -> Dict[str, Any]:
         async with httpx.AsyncClient(
             timeout=_HTTP_TIMEOUT_SECONDS, follow_redirects=False
         ) as client:
-            resp = await client.get(
-                url, headers={"Accept": "application/did+json, application/json"}
-            )
+            # Stream so the size cap is enforced WHILE reading — a hostile domain
+            # can't force us to buffer an unbounded body before the check.
+            async with client.stream(
+                "GET", url,
+                headers={"Accept": "application/did+json, application/json"},
+            ) as resp:
+                if resp.status_code != 200:
+                    raise ValueError(f"did:web fetch returned HTTP {resp.status_code}")
+                chunks = []
+                total = 0
+                async for chunk in resp.aiter_bytes():
+                    total += len(chunk)
+                    if total > _MAX_DOC_BYTES:
+                        raise ValueError("did:web document too large")
+                    chunks.append(chunk)
     except httpx.HTTPError as exc:
         # Connect/read timeout, TLS failure, connection refused, protocol error —
         # every httpx transport failure. Re-raise as ValueError so resolution
         # FAILS CLOSED: the consent, transaction, and mandate paths all catch
         # ValueError and map it to 401, never let it escape as an uncaught 500.
         raise ValueError(f"did:web fetch failed: {exc.__class__.__name__}")
-    if resp.status_code != 200:
-        raise ValueError(f"did:web fetch returned HTTP {resp.status_code}")
-    if len(resp.content) > _MAX_DOC_BYTES:
-        raise ValueError("did:web document too large")
+
     try:
-        return resp.json()
+        return _json.loads(b"".join(chunks))
     except Exception as exc:
         raise ValueError(f"did:web document is not JSON: {exc}")
 
@@ -252,7 +277,7 @@ async def resolve_did_web(
 
     result = _select_key_from_doc(doc, kid)
     if use_cache:
-        _cache[cache_key] = (now + _CACHE_TTL_SECONDS, result)
+        _cache_store(cache_key, result, now)
     return result
 
 

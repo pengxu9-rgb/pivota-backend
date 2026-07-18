@@ -366,7 +366,14 @@ async def get_agent_by_did(did: str) -> Optional[Dict[str, Any]]:
         "SELECT * FROM agents WHERE did = :did",
         {"did": did},
     )
-    return dict(row) if row else None
+    if row is None:
+        return None
+    agent = dict(row)
+    # Never surface authentication secrets from a DID lookup — a route that
+    # returns this dict must not leak the agent's API key / hash.
+    agent.pop("api_key", None)
+    agent.pop("api_key_hash", None)
+    return agent
 
 
 async def set_agent_did(agent_id: str, did: str) -> None:
