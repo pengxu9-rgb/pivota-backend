@@ -178,6 +178,7 @@ async def grant_consent(request: Request):
     scope = body.get("scope", ["read"])
     duration_hours = body.get("duration_hours", 24)
     algorithm = body.get("algorithm", "ES256")
+    spending_limit = body.get("spending_limit")  # optional cap (USD, pilot); None = no limit
 
     if not agent_id:
         raise HTTPException(
@@ -220,7 +221,8 @@ async def grant_consent(request: Request):
             signature=signature,
             nonce=nonce,
             public_key=public_key,
-            algorithm=algorithm
+            algorithm=algorithm,
+            spending_limit=spending_limit,
         )
 
         return {
@@ -304,15 +306,26 @@ async def initiate_transaction(
       + nonce (see services/ap2_signing.py), against the agent's registered key
     - X-AP2-Nonce: Unique nonce (verified, then consumed, by the dependency)
     """
+    from decimal import Decimal
     from services.consent_service import consent_service
     from services.crypto_service import crypto_service
 
-    # Signature, consent, nonce-replay and nonce consumption are all handled by
-    # verify_ap2_signature above. Resolve the agent id for the transaction row.
     consent_token = request.headers.get("X-Agent-Consent")
-    consent_data = await consent_service.verify_consent(consent_token)
-    agent_id = consent_data["agent_id"]
     nonce = request.headers.get("X-AP2-Nonce")
+
+    # Authorize the payment against the CONSENT — not just token validity. The
+    # signature was already verified against the agent resolved from this token
+    # (verify_ap2_signature); validate_consent additionally enforces that the
+    # consent is active + unexpired, its scope permits `create_payment`, and the
+    # amount is within the remaining spending limit (spending_limit - spent_amount).
+    # Fails closed (403). Merchant/currency scoping is the mandate path's job
+    # (below), not the plain consent's — the consent primitive carries neither.
+    ok, reason, consent_row = await consent_service.validate_consent(
+        consent_token, action="create_payment", amount=Decimal(str(payment.amount))
+    )
+    if not ok:
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail=reason)
+    agent_id = consent_row["agent_id"]
 
     # AP2 mandate authority (ADR-012 slice 3): if the request carries a
     # user-signed Intent→Cart→Payment mandate chain, it must authorize THIS
@@ -399,7 +412,7 @@ async def initiate_transaction(
             "transaction_id": transaction_id,
             "agent_id": agent_id,
             "merchant_id": payment.merchant_id,
-            "amount": payment.amount,
+            "amount": Decimal(str(payment.amount)),
             "currency": payment.currency,
             "product_id": payment.product_id,
             "metadata": payment.metadata
@@ -456,38 +469,94 @@ async def confirm_transaction(
         )
     
     # Verify wallet
+    from decimal import Decimal
     from services.consent_service import consent_service
     consent_data = await consent_service.verify_consent(consent_token)
     agent_id = consent_data["agent_id"]
-    
+
     is_valid = await wallet_service.verify_agent_wallet(agent_id, wallet_address)
     if not is_valid:
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN,
             detail="Wallet not authorized"
         )
-    
-    # Update transaction status
-    update_query = """
-        UPDATE x402_transactions
-        SET status = 'completed',
-            wallet_address = :wallet_address,
-            confirmed_at = NOW()
-        WHERE transaction_id = :transaction_id
-    """
-    
-    await database.execute(
-        update_query,
-        {
-            "transaction_id": transaction_id,
-            "wallet_address": wallet_address
-        }
-    )
-    
+
+    confirmed_at = datetime.utcnow()
+
+    # Settle atomically: the status flip AND the consent spend-tracking commit
+    # together, so a completed transaction can never leave the spending limit
+    # un-debited, and a replay/concurrent confirm can never double-count.
+    async with database.transaction():
+        txn = await database.fetch_one(
+            """SELECT transaction_id, agent_id, amount, currency, status
+               FROM x402_transactions WHERE transaction_id = :transaction_id""",
+            {"transaction_id": transaction_id},
+        )
+        if not txn:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail="Transaction not found",
+            )
+        # The transaction must belong to the consenting agent — a valid consent
+        # for agent A must not confirm agent B's transaction. (The prior handler
+        # matched on transaction_id ALONE.)
+        if str(txn["agent_id"]) != str(agent_id):
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail="Transaction does not belong to this agent",
+            )
+        # Idempotency / replay guard: only a pending transaction can be settled.
+        if txn["status"] != "pending":
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail=f"Transaction is already {txn['status']}",
+            )
+
+        # Re-check the consent is still active and permits the action (e.g. not
+        # revoked/expired since initiate). The AUTHORITATIVE, race-safe limit
+        # enforcement is the atomic debit below — a non-atomic amount check here
+        # would let concurrent confirms of different txns both pass a stale read.
+        ok, reason, _ = await consent_service.validate_consent(
+            consent_token, action="create_payment", agent_id=agent_id,
+        )
+        if not ok:
+            raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail=reason)
+
+        # Flip to completed only if STILL pending; RETURNING tells us whether WE
+        # settled it (vs a concurrent confirm that won the race).
+        settled = await database.fetch_one(
+            """UPDATE x402_transactions
+               SET status = 'completed', wallet_address = :wallet_address,
+                   confirmed_at = :confirmed_at
+               WHERE transaction_id = :transaction_id AND status = 'pending'
+               RETURNING transaction_id""",
+            {
+                "transaction_id": transaction_id,
+                "wallet_address": wallet_address,
+                "confirmed_at": confirmed_at,
+            },
+        )
+        if settled is None:
+            # Lost the race — another confirm settled it first. Do NOT debit again.
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail="Transaction already completed",
+            )
+
+        # We won the settlement — atomically debit the spending budget, enforcing
+        # the limit IN the write (spent_amount + amount <= spending_limit). Zero
+        # rows => the debit would exceed the limit (a concurrent confirm consumed
+        # it since initiate), so fail closed — raising rolls back the settle above.
+        if not await consent_service.debit_within_limit(consent_token, Decimal(str(txn["amount"]))):
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail="Insufficient spending limit",
+            )
+
     return {
         "transaction_id": transaction_id,
         "status": "completed",
-        "timestamp": datetime.utcnow().isoformat()
+        "timestamp": confirmed_at.isoformat(),
     }
 
 

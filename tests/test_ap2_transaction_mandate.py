@@ -87,6 +87,8 @@ class FakeDB:
                 "consent_id": CONSENT_TOKEN, "agent_id": self.agent_id,
                 "scope": json.dumps({"actions": ["read", "create_payment"]}),
                 "status": "active",
+                "spending_limit": None,
+                "spent_amount": 0,
                 "expires_at": datetime.utcnow() + timedelta(hours=1),
             }
         if "FROM agents" in query:

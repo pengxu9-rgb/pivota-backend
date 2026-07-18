@@ -101,11 +101,12 @@ class ConsentService:
         signature: str = None,
         nonce: str = None,
         public_key: str = None,
-        algorithm: str = "ES256"
+        algorithm: str = "ES256",
+        spending_limit: Optional[float] = None,
     ) -> Dict[str, Any]:
         """
         Create new agent consent with signature verification
-        
+
         Args:
             agent_id: Agent identifier
             scope: List of permitted actions
@@ -114,7 +115,11 @@ class ConsentService:
             nonce: Unique nonce
             public_key: Agent's public key (PEM)
             algorithm: ES256 or Ed25519
-            
+            spending_limit: Optional cap on total spend authorized by this consent
+                (assumed USD for the pilot, per ADR-013's single-currency ledger).
+                None = no limit. Enforced at initiate/confirm via validate_consent
+                against (spending_limit - spent_amount).
+
         Returns:
             Consent data including consent_id and expiry
         """
@@ -194,14 +199,15 @@ class ConsentService:
         
         await database.execute(
             """INSERT INTO agent_consents (
-                   consent_id, agent_id, scope, status, created_at, expires_at
+                   consent_id, agent_id, scope, status, spending_limit, created_at, expires_at
                ) VALUES (
-                   :consent_id, :agent_id, :scope, 'active', NOW(), :expires_at
+                   :consent_id, :agent_id, :scope, 'active', :spending_limit, NOW(), :expires_at
                )""",
             {
                 "consent_id": consent_id,
                 "agent_id": agent_id,
                 "scope": json.dumps({"actions": scope}),
+                "spending_limit": spending_limit,
                 "expires_at": expires_at
             }
         )
@@ -240,7 +246,10 @@ class ConsentService:
         if not consent:
             raise ValueError("Consent not found or inactive")
         
-        if consent["expires_at"] and consent["expires_at"] < datetime.utcnow():
+        expires_at = consent["expires_at"]
+        if isinstance(expires_at, str):
+            expires_at = datetime.fromisoformat(expires_at)
+        if expires_at and expires_at < datetime.utcnow():
             raise ValueError("Consent has expired")
         
         return {"agent_id": consent["agent_id"], "scope": json.loads(consent["scope"])["actions"]}
@@ -259,30 +268,44 @@ class ConsentService:
     
     async def validate_consent(
         self,
-        agent_id: str,
         consent_token: str,
         action: str,
-        amount: Optional[Decimal] = None
+        amount: Optional[Decimal] = None,
+        agent_id: Optional[str] = None,
     ) -> Tuple[bool, Optional[str], Optional[Dict]]:
         """
-        Validate consent token and check permissions
-        
+        Validate a consent token and authorize an action against it.
+
+        Checks the consent is active + unexpired, that its scope permits `action`,
+        and (when both an amount and a spending_limit are set) that the amount is
+        within the remaining limit (spending_limit - spent_amount). The agent id
+        is derived from the consent row; pass `agent_id` to additionally require
+        the token belong to that agent (defense-in-depth).
+
         Args:
-            agent_id: Agent ID
-            consent_token: Consent token ID
+            consent_token: Consent token ID (== consent_id)
             action: Action to perform (e.g., 'create_payment')
             amount: Transaction amount (if applicable)
-            
+            agent_id: Optional expected owner; when given, the token must belong to it
+
         Returns:
-            (is_valid, error_message, consent_data)
+            (is_valid, error_message, consent_row_dict)
         """
         try:
-            # Query consent
-            consent = await database.fetch_one(
-                """SELECT * FROM agent_consents 
-                   WHERE consent_id = :consent_id AND agent_id = :agent_id""",
-                {"consent_id": consent_token, "agent_id": agent_id}
-            )
+            # Query consent. agent_id is derived from the row (the request's
+            # signature was already verified against the agent resolved from this
+            # token); pass agent_id only to additionally pin ownership.
+            if agent_id is not None:
+                consent = await database.fetch_one(
+                    """SELECT * FROM agent_consents
+                       WHERE consent_id = :consent_id AND agent_id = :agent_id""",
+                    {"consent_id": consent_token, "agent_id": agent_id},
+                )
+            else:
+                consent = await database.fetch_one(
+                    "SELECT * FROM agent_consents WHERE consent_id = :consent_id",
+                    {"consent_id": consent_token},
+                )
             
             if not consent:
                 return False, "Consent not found", None
@@ -291,8 +314,15 @@ class ConsentService:
             if consent["status"] != "active":
                 return False, f"Consent is {consent['status']}", None
             
-            # Check expiration
-            if consent["expires_at"] and consent["expires_at"] < datetime.now():
+            # Check expiration (UTC — consents are stored and checked in
+            # datetime.utcnow()). On SQLite the timestamp round-trips as a string,
+            # so coerce it; asyncpg (prod/Postgres) already returns a datetime.
+            # Comparing against naive local datetime.now() would also spuriously
+            # expire fresh consents on any host not on UTC.
+            expires_at = consent["expires_at"]
+            if isinstance(expires_at, str):
+                expires_at = datetime.fromisoformat(expires_at)
+            if expires_at and expires_at < datetime.utcnow():
                 return False, "Consent has expired", None
             
             # Check scope
@@ -304,17 +334,21 @@ class ConsentService:
             if action not in allowed_actions:
                 return False, f"Action '{action}' not permitted", None
             
-            # Check spending limit
-            if amount and consent["spending_limit"]:
-                remaining = Decimal(consent["spending_limit"]) - Decimal(consent["spent_amount"])
+            # Check spending limit. Guard on `is not None` — a spending_limit of 0
+            # ("allow nothing") is falsy and must NOT skip the check. This is a
+            # non-atomic pre-check for a clean early rejection; the authoritative,
+            # race-safe limit enforcement is debit_within_limit at settle time.
+            if amount is not None and consent["spending_limit"] is not None:
+                remaining = Decimal(str(consent["spending_limit"])) - Decimal(str(consent["spent_amount"] or 0))
                 if amount > remaining:
                     return False, f"Insufficient spending limit (remaining: {remaining})", None
-            
+
             return True, None, dict(consent)
-            
+
         except Exception as e:
             logger.error(f"Consent validation error: {e}")
-            return False, str(e), None
+            # Fail closed with a generic reason — don't leak internal error text.
+            return False, "Consent validation failed", None
     
     async def check_nonce(
         self,
@@ -355,28 +389,38 @@ class ConsentService:
             logger.error(f"Nonce check error: {e}")
             return False, str(e)
     
-    async def increment_usage(
+    async def debit_within_limit(
         self,
         consent_id: str,
-        amount: Decimal
-    ):
+        amount: Decimal,
+    ) -> bool:
         """
-        Update consent usage after successful transaction
-        
-        Args:
-            consent_id: Consent ID
-            amount: Transaction amount
+        Atomically add `amount` to the consent's spent_amount, but ONLY if it
+        stays within spending_limit (a NULL limit means no cap). Returns True if
+        the debit was applied, False if it would exceed the limit.
+
+        The limit check and the increment are a SINGLE statement, so two
+        concurrent debits on the same consent cannot both pass a stale read and
+        overshoot the cap (the failure a separate SELECT-then-UPDATE would allow).
+        The predicate also requires the consent be active + unexpired, so a
+        concurrent revoke — or an expiry crossing — between the caller's re-check
+        and this write is caught here too (zero rows -> fail closed). Amount is
+        bound as a Decimal (asyncpg numeric); exceptions PROPAGATE — callers settle
+        inside a DB transaction that must roll back if the debit fails, so this
+        must not swallow errors.
         """
-        try:
-            await database.execute(
-                """UPDATE agent_consents 
-                   SET spent_amount = spent_amount + :amount,
-                       nonce_counter = nonce_counter + 1
-                   WHERE consent_id = :consent_id""",
-                {"consent_id": consent_id, "amount": float(amount)}
-            )
-        except Exception as e:
-            logger.error(f"Failed to update consent usage: {e}")
+        row = await database.fetch_one(
+            """UPDATE agent_consents
+               SET spent_amount = COALESCE(spent_amount, 0) + :amount,
+                   nonce_counter = nonce_counter + 1
+               WHERE consent_id = :consent_id
+                 AND status = 'active'
+                 AND (expires_at IS NULL OR expires_at > CURRENT_TIMESTAMP)
+                 AND (spending_limit IS NULL OR COALESCE(spent_amount, 0) + :amount <= spending_limit)
+               RETURNING spent_amount""",
+            {"consent_id": consent_id, "amount": amount},
+        )
+        return row is not None
     
     async def revoke_consent(
         self,

@@ -84,7 +84,8 @@ async def issue_consent(
             scope=consent_request.scope,
             duration_hours=consent_request.duration_hours,
             signature=None,  # Admin bypass
-            nonce=None  # Admin bypass
+            nonce=None,  # Admin bypass
+            spending_limit=consent_request.spending_limit,
         )
         
         # Record audit log
@@ -157,7 +158,8 @@ async def issue_batch_consents(
                 scope=consent_req.scope,
                 duration_hours=consent_req.duration_hours,
                 signature=None,
-                nonce=None
+                nonce=None,
+                spending_limit=consent_req.spending_limit,
             )
             
             results.append({
