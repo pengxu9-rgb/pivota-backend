@@ -5,7 +5,7 @@ Implements Agent Payment Protocol v2 endpoints for payment processing
 import json
 import logging
 from datetime import datetime
-from typing import Optional
+from typing import Optional, Dict, Any
 from fastapi import APIRouter, Request, HTTPException, Depends, status
 from pydantic import BaseModel, Field
 from db.database import database
@@ -23,6 +23,20 @@ router = APIRouter(
 # Request/Response Models
 # ========================
 
+class AP2MandateChain(BaseModel):
+    """
+    A user-signed AP2 Intent→Cart→Payment mandate chain authorizing a transaction
+    (ADR-012 authority layer). Each mandate is a signed object; the *_signature
+    fields are the issuer's detached base64 signatures over them.
+    """
+    intent: Dict[str, Any]
+    intent_signature: str
+    cart: Dict[str, Any]
+    cart_signature: str
+    payment: Dict[str, Any]
+    payment_signature: str
+
+
 class AP2PaymentRequest(BaseModel):
     """AP2 payment request"""
     merchant_id: str = Field(..., description="Target merchant ID")
@@ -30,6 +44,10 @@ class AP2PaymentRequest(BaseModel):
     currency: str = Field(..., description="Currency code (USD, EUR, etc.)")
     product_id: Optional[str] = Field(None, description="Product ID if purchasing product")
     metadata: Optional[dict] = Field(None, description="Additional payment metadata")
+    mandate_chain: Optional[AP2MandateChain] = Field(
+        None,
+        description="Optional AP2 Intent→Cart→Payment mandate chain authorizing this transaction"
+    )
 
 
 class AP2TransactionResponse(BaseModel):
@@ -289,6 +307,58 @@ async def initiate_transaction(
     consent_data = await consent_service.verify_consent(consent_token)
     agent_id = consent_data["agent_id"]
     nonce = request.headers.get("X-AP2-Nonce")
+
+    # AP2 mandate authority (ADR-012 slice 3): if the request carries a
+    # user-signed Intent→Cart→Payment mandate chain, it must authorize THIS
+    # transaction. Deny by default — the presenting agent's trusted-issuer set is
+    # passed straight through (an empty set denies every mandate; it is NEVER
+    # coerced to None, which would skip the issuer-trust check). Absent a chain,
+    # behavior is unchanged (consent-scope based) for backward compatibility.
+    if payment.mandate_chain is not None:
+        from services.ap2_mandate import verify_mandate_chain, MandateError
+        from services.ap2_identity import is_did
+        from db.ap2_trusted_issuers import get_trusted_issuers
+        from decimal import Decimal
+
+        # A mandate's `subject` is the agent's DID. Resolve the agent's DID
+        # identity from agents.public_key (which holds the did:key:/did:web:
+        # string for DID agents — the SAME value verify_ap2_signature verified
+        # the request signature against). agent_id is the INTERNAL id (VARCHAR-50,
+        # too short to be a DID), so it must NOT be used as the subject. The
+        # trusted-issuer registry stays keyed by the internal agent_id.
+        agent_did = await consent_service.get_agent_public_key(agent_id)
+        if not is_did(agent_did):
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail="Mandate authorization requires a DID-identity agent",
+            )
+
+        mc = payment.mandate_chain
+        trusted_issuers = await get_trusted_issuers(agent_id)
+        try:
+            verified = await verify_mandate_chain(
+                mc.intent, mc.intent_signature,
+                mc.cart, mc.cart_signature,
+                mc.payment, mc.payment_signature,
+                agent_did=agent_did,           # the agent's resolved DID (subject binding)
+                trusted_issuers=trusted_issuers,  # pass directly — empty set = deny all
+                action="create_payment",
+            )
+            # Bind the signed authority to THIS concrete transaction — a valid
+            # chain for a different cart must not authorize this one.
+            cart = verified["cart"]
+            if str(cart.get("merchant_id")) != str(payment.merchant_id):
+                raise MandateError("cart.merchant_id does not match the transaction merchant")
+            if Decimal(str(cart.get("total"))) != Decimal(str(payment.amount)):
+                raise MandateError("cart.total does not match the transaction amount")
+            if str(cart.get("currency")) != str(payment.currency):
+                raise MandateError("cart.currency does not match the transaction currency")
+        except MandateError as exc:
+            logger.warning(f"AP2 mandate authorization failed for agent {agent_id}: {exc}")
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail=f"Mandate authorization failed: {exc}",
+            )
 
     # Create transaction
     transaction_id = f"ap2_txn_{datetime.utcnow().strftime('%Y%m%d%H%M%S')}_{nonce[:8]}"
