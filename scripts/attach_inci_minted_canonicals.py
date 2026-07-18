@@ -122,6 +122,7 @@ async def _run(args: argparse.Namespace) -> int:
         # connection and enriches + refreshes agent_pdp_view per item.
         agg = {"n": 0, "inci_written": 0, "actives_filled": 0, "claims_written": 0,
                "skipped": 0, "skipped_outranked": 0, "skipped_unresolved_seller": 0}
+        abandoned = 0
         for i in range(0, len(items), 40):
             batch = items[i:i + 40]
             for attempt in range(3):
@@ -142,8 +143,11 @@ async def _run(args: argparse.Namespace) -> int:
                         pass
                     await asyncio.sleep(15)
                     await _connect_with_retry()
-        print(f"[done] {agg}", flush=True)
-        return 0
+            else:
+                abandoned += 1
+                print(f"  [ingest] batch {i} ABANDONED after 3 attempts ({len(batch)} items skipped)", flush=True)
+        print(f"[done] {agg} | abandoned_batches: {abandoned}", flush=True)
+        return 1 if abandoned else 0
     finally:
         if own and bool(getattr(database, "is_connected", False)):
             await database.disconnect()

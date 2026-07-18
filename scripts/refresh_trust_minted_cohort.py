@@ -55,6 +55,7 @@ async def main() -> int:
         keys = [r["product_key"] for r in await database.fetch_all(_KEYS_SQL)]
         print(f"[population] {len(keys)} minted product_keys", flush=True)
         written = 0
+        abandoned = 0
         for i in range(0, len(keys), CHUNK):
             chunk = keys[i:i + CHUNK]
             for attempt in range(3):
@@ -69,13 +70,16 @@ async def main() -> int:
                         pass
                     await asyncio.sleep(15)
                     await _connect_with_retry()
+            else:
+                abandoned += 1
+                print(f"  [chunk {i}] ABANDONED after 3 attempts ({len(chunk)} keys skipped)", flush=True)
             if (i // CHUNK) % 4 == 0:
                 print(f"  [trust] {min(i+CHUNK, len(keys))}/{len(keys)} written={written}", flush=True)
-        print(f"[done] trust rows written: {written}", flush=True)
+        print(f"[done] trust rows written: {written} | abandoned_chunks: {abandoned}", flush=True)
         print("[census]", flush=True)
         for r in await database.fetch_all(_CENSUS_SQL):
             print(f"  {dict(r)}", flush=True)
-        return 0
+        return 1 if abandoned else 0
     finally:
         if bool(getattr(database, "is_connected", False)):
             await database.disconnect()
