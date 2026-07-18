@@ -682,6 +682,15 @@ ON CONFLICT (merchant_id, external_order_id) DO NOTHING
 RETURNING edge_id
 """
 
+# Reconciliation re-read (self-report replay path only): fetch the STORED attributed
+# gross for an already-closed edge so a merchant replay reporting a DIFFERENT gross
+# can be surfaced. The first close wins (idempotent — never overwritten); this only
+# READS. Keyed on the same (merchant_id, external_order_id) guard as the insert.
+_SELECT_EXTERNAL_EDGE_GMV_SQL = (
+    "SELECT gross_attributed_gmv_cents FROM commerce_attribution_edges "
+    "WHERE merchant_id = :merchant_id AND external_order_id = :external_order_id"
+)
+
 
 async def close_external_order_conversion(
     *,
@@ -693,6 +702,7 @@ async def close_external_order_conversion(
     converted_at: Optional[datetime] = None,
     note_attrs_or_payload: Optional[Dict[str, Any]] = None,
     converting_shop_domain: Optional[str] = None,
+    is_self_report: bool = False,
 ) -> Optional[Dict[str, Any]]:
     """Materialize a `converted` external attribution edge from an orders/paid webhook.
 
@@ -732,6 +742,15 @@ async def close_external_order_conversion(
       supplies no domain the edge is stamped
       ``metadata.seller_domain_unverified=true`` and still counted (unknown is
       neither a silent pass nor an exclusion).
+    - **``is_self_report`` (untrusted merchant self-report path, #1482):** when a
+      MERCHANT reports its own settled order over the signed conversion-report API,
+      it may adopt only its OWN or an unscoped click — NEVER a foreign seller-keyed
+      one — so a report can never re-subject another seller's edge (cross-merchant
+      pre-emption). It also opts into a replay re-read of the STORED gross so a
+      report disagreeing with the first close surfaces a reconciliation signal
+      (``gross_attributed_gmv_cents`` on the replay return). Server-polled/webhook
+      callers leave it ``False`` → seller-keyed adoption and the zero-extra-query
+      replay path are both UNCHANGED.
     """
     merchant_id = str(merchant_id or "").strip()
     external_order_id = str(external_order_id or "").strip()
@@ -767,7 +786,16 @@ async def close_external_order_conversion(
             # legitimate cross-seed closes — integrity is instead enforced by the
             # converting==seller_ref IDENTITY check below (a forged click_id on a
             # store that is not the seller mismatches and is excluded).
-            if (not click_merchant) or (str(click_merchant) == merchant_id) or candidate_seller_ref:
+            # A merchant SELF-report (is_self_report, #1482) may adopt ONLY its own
+            # or an unscoped click — never a foreign seller-keyed one — so an
+            # untrusted report can't re-subject another seller's edge (cross-merchant
+            # pre-emption). The seller-keyed adoption below is for server-polled /
+            # webhook closes, whose input is trusted.
+            if (
+                (not click_merchant)
+                or (str(click_merchant) == merchant_id)
+                or (candidate_seller_ref and not is_self_report)
+            ):
                 click_row = candidate
     click_matched = click_row is not None
 
@@ -942,6 +970,21 @@ async def close_external_order_conversion(
             subject_merchant_id,
             external_order_id,
         )
+        # Self-report replay: re-read the STORED gross (subject == merchant_id on
+        # this path) so the caller can reconcile a report that disagrees with the
+        # first close. Server-polled/webhook callers skip this — no extra round-trip
+        # on the hot at-least-once replay path.
+        recorded_gmv: Optional[int] = None
+        if is_self_report:
+            stored = await database.fetch_one(
+                _SELECT_EXTERNAL_EDGE_GMV_SQL,
+                {
+                    "merchant_id": subject_merchant_id,
+                    "external_order_id": external_order_id,
+                },
+            )
+            if stored is not None:
+                recorded_gmv = dict(stored).get("gross_attributed_gmv_cents")
         return {
             "edge_id": edge_id,
             "merchant_id": subject_merchant_id,
@@ -950,6 +993,7 @@ async def close_external_order_conversion(
             "click_matched": click_matched,
             "seller_mismatch": seller_mismatch,
             "seller_domain_unverified": seller_domain_unverified,
+            "gross_attributed_gmv_cents": recorded_gmv,
             **seller_fields,
             "replayed": True,
         }

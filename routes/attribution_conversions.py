@@ -23,6 +23,13 @@ logger = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/attribution/conversions", tags=["Attribution"])
 
+# A merchant in one of these lifecycle states is NOT a live merchant and may not
+# report attribution — critically ``deleted``, since soft-delete tombstones the
+# record but does NOT clear the api_key (so a valid signature alone is not enough).
+# ``rejected`` is a KYC-refused merchant. Mirrors the house ``status != "deleted"``
+# liveness convention in db.merchant_onboarding.get_all_merchant_onboardings.
+_INACTIVE_MERCHANT_STATUSES = {"deleted", "rejected"}
+
 
 @router.post("/report")
 async def report_conversion(
@@ -37,7 +44,9 @@ async def report_conversion(
     `currency`, `converting_shop_domain` (optional).
 
     401 on missing/invalid signature or unknown merchant (same status — no oracle
-    for which merchant ids exist). 400 on a bad body / missing `external_order_id`.
+    for which merchant ids exist). 403 when the (authenticated) merchant is inactive
+    (soft-deleted / KYC-refused). 400 on a bad body, a missing `external_order_id`,
+    or a non-numeric / negative `gross_amount_cents`.
     """
     from db.merchant_onboarding import get_merchant_onboarding
     from services.commerce_attribution_service import close_external_order_conversion
@@ -63,6 +72,14 @@ async def report_conversion(
     if not expected or not hmac.compare_digest(str(x_pivota_signature), expected):
         raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid signature")
 
+    # A valid signature proves key possession but NOT that the merchant is still
+    # live: soft-delete leaves the api_key intact. Reject tombstoned / KYC-refused
+    # merchants here (403 — the caller already holds the key, so no existence oracle
+    # is leaked). Checked AFTER the HMAC so an attacker without the key learns
+    # nothing about merchant state.
+    if str((merchant or {}).get("status") or "").strip() in _INACTIVE_MERCHANT_STATUSES:
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Merchant is not active")
+
     merchant_id = merchant["merchant_id"]
 
     try:
@@ -77,7 +94,17 @@ async def report_conversion(
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Missing external_order_id")
 
     reported_cents = payload.get("gross_amount_cents")
-    reported_cents = int(reported_cents) if reported_cents is not None else None
+    if reported_cents is not None:
+        # A merchant-supplied gross must be a non-negative integer count of cents;
+        # a non-numeric or negative value is a client error (400), not a 500.
+        if isinstance(reported_cents, bool):
+            raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="gross_amount_cents must be an integer")
+        try:
+            reported_cents = int(reported_cents)
+        except (TypeError, ValueError):
+            raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="gross_amount_cents must be an integer")
+        if reported_cents < 0:
+            raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="gross_amount_cents must be non-negative")
 
     # Bind the reported order to its Pivota click → attribution edge. Idempotent
     # (ON CONFLICT on (merchant_id, external_order_id)); records even an unknown
@@ -91,9 +118,15 @@ async def report_conversion(
         currency=payload.get("currency"),
         converting_shop_domain=payload.get("converting_shop_domain"),
         note_attrs_or_payload={"source": "merchant_report"},
+        # Untrusted self-report: bind only to THIS merchant's own/unscoped click
+        # (no cross-merchant seller-keyed pre-emption) and re-read the stored gross
+        # on replay so a disagreeing report surfaces a reconciliation signal.
+        is_self_report=True,
     )
     if result is None:
-        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Missing external_order_id")
+        # Defensive: the primitive only returns None on empty keys, which we already
+        # validated (order id above, merchant id from the authenticated record).
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Could not record conversion")
 
     # Reconciliation (AC3): if this order was already closed with a DIFFERENT gross,
     # the merchant is reporting a value that disagrees with what Pivota recorded.
