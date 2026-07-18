@@ -105,6 +105,20 @@ def test_public_status_open_when_enabled(fake_db):
     assert res.headers.get("X-AP2-Version") == "0.1"
 
 
+def test_protocols_advertises_only_functional_endpoints(fake_db):
+    """The /protocols catalog must not advertise the 501 not-implemented stubs
+    (`wallet/balance`, `x402/exchange`) — we don't promise unbuilt endpoints.
+    Functional routes stay advertised."""
+    client = _app(enabled=True)
+    res = client.get("/ap2/protocols")
+    assert res.status_code == 200
+    advertised = {e for p in res.json()["protocols"] for e in p["endpoints"]}
+    assert "/ap2/wallet/balance" not in advertised
+    assert "/ap2/x402/exchange" not in advertised
+    # sanity: the functional endpoints are still advertised
+    assert {"/ap2/transaction/initiate", "/ap2/x402/quote"} <= advertised
+
+
 def test_grant_reachable_through_enabled_middleware(fake_db, keypair):
     """The consent-bootstrap route must pass the middleware without a token."""
     priv, _ = keypair

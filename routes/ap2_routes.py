@@ -107,6 +107,10 @@ async def list_supported_protocols():
     
     Public endpoint - no authentication required
     """
+    # Advertise only functional endpoints. `/ap2/wallet/balance` and
+    # `/ap2/x402/exchange` exist but return 501 (not-implemented stubs), so they
+    # are intentionally omitted from this catalog — do not re-add until built
+    # (see docs/AP2_ENABLEMENT.md §6).
     return {
         "protocols": [
             {
@@ -115,8 +119,7 @@ async def list_supported_protocols():
                 "description": "Agent Payment Protocol v2",
                 "endpoints": [
                     "/ap2/transaction/initiate",
-                    "/ap2/transaction/confirm",
-                    "/ap2/wallet/balance"
+                    "/ap2/transaction/confirm"
                 ]
             },
             {
@@ -124,8 +127,7 @@ async def list_supported_protocols():
                 "version": "0.1",
                 "description": "Payment Required Protocol",
                 "endpoints": [
-                    "/ap2/x402/quote",
-                    "/ap2/x402/exchange"
+                    "/ap2/x402/quote"
                 ]
             }
         ]
