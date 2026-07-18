@@ -27,8 +27,9 @@ _WOO_CREDS = {"store_url": "https://store.example.com", "consumer_key": "ck", "c
 
 
 def _patch_watermark(monkeypatch, module):
-    """Stub the watermark read/write + attempt-touch on `module`; return the
-    captured writes list (the touch is a no-op here — its own test asserts it)."""
+    """Stub the watermark read/write on `module`; return the captured writes list.
+    (The attempt-touch lives in the batch loop, not the per-merchant poll, so the
+    direct per-merchant tests below never reach it.)"""
     writes = []
 
     async def fake_read(*_a, **_k):
@@ -37,12 +38,8 @@ def _patch_watermark(monkeypatch, module):
     async def fake_write(*args, **_k):
         writes.append(args)
 
-    async def fake_touch(*_a, **_k):
-        return None
-
     monkeypatch.setattr(module, "_read_poll_watermark", fake_read)
     monkeypatch.setattr(module, "_write_poll_watermark", fake_write)
-    monkeypatch.setattr(module, "_touch_poll_attempt", fake_touch)
     return writes
 
 
@@ -171,12 +168,8 @@ async def test_shopify_page_cap_first_run_escalates_stuck(monkeypatch):
     async def fake_write(*args, **_k):
         writes.append(args)
 
-    async def fake_touch(*_a, **_k):
-        return None
-
     monkeypatch.setattr(ecp, "_read_poll_watermark", no_watermark)
     monkeypatch.setattr(ecp, "_write_poll_watermark", fake_write)
-    monkeypatch.setattr(ecp, "_touch_poll_attempt", fake_touch)
 
     async def always_more(**_kw):
         return ([], "cursor")
@@ -212,12 +205,8 @@ async def test_shopify_stale_fetch_failure_escalates_stuck(monkeypatch):
     async def raising_fetch(**_kw):
         raise RuntimeError("shopify 401 Unauthorized (revoked token)")
 
-    async def fake_touch(*_a, **_k):
-        return None
-
     monkeypatch.setattr(ecp, "_read_poll_watermark", stale_watermark)
     monkeypatch.setattr(ecp, "_write_poll_watermark", fake_write)
-    monkeypatch.setattr(ecp, "_touch_poll_attempt", fake_touch)
     monkeypatch.setattr(ecp, "_fetch_orders_page", raising_fetch)
 
     summary = await ecp.poll_external_conversions_for_merchant(
@@ -277,45 +266,6 @@ async def test_woo_holds_watermark_on_page_cap(monkeypatch):
     assert writes == [], "a full final page at MAX_PAGES is an incomplete scan → hold"
 
 
-# --- #1490 review: a held merchant records an ATTEMPT (fair rotation) ---------
-
-@pytest.mark.asyncio
-async def test_hold_records_poll_attempt_but_not_watermark(monkeypatch):
-    # On a hold the watermark (last_polled_at) must NOT advance — but the ATTEMPT
-    # (last_run_at) IS recorded, so a perpetually-held merchant rotates through the
-    # per-tick cap instead of monopolizing it (starvation fix). The candidate SQL
-    # orders by last_run_at for exactly this reason.
-    from services import external_conversion_poller as ecp
-
-    writes = []
-    touches = []
-
-    async def read_wm(*_a, **_k):
-        return _PRIOR_WATERMARK
-
-    async def write_wm(*args, **_k):
-        writes.append(args)
-
-    async def touch(*args, **_k):
-        touches.append(args)
-
-    async def always_more(**_kw):
-        return ([], "cursor")  # page-cap hold
-
-    monkeypatch.setattr(ecp, "_read_poll_watermark", read_wm)
-    monkeypatch.setattr(ecp, "_write_poll_watermark", write_wm)
-    monkeypatch.setattr(ecp, "_touch_poll_attempt", touch)
-    monkeypatch.setattr(ecp, "_fetch_orders_page", always_more)
-
-    summary = await ecp.poll_external_conversions_for_merchant(
-        merchant_id="m1", credentials=_SHOPIFY_CREDS, now=_NOW,
-    )
-    assert summary.get("watermark_held") is True
-    assert writes == [], "a hold must NOT advance the watermark (data safety)"
-    assert len(touches) == 1, "a hold MUST record the attempt (last_run_at) for fair rotation"
-    assert touches[0][0] == "m1"
-
-
 # --- F2 (#1485): batch surfaces held / stuck counts across both lanes ---------
 
 @pytest.mark.asyncio
@@ -343,7 +293,11 @@ async def test_batch_aggregates_held_and_stuck(monkeypatch):
     async def no_woo(*_a, **_k):
         return []
 
+    async def noop_touch(*_a, **_k):
+        return None
+
     monkeypatch.setattr(ecp, "poll_external_conversions_for_merchant", fake_poll)
+    monkeypatch.setattr(ecp, "_touch_poll_attempt", noop_touch)
     monkeypatch.setattr(woo, "poll_wc_conversions_batch_lane", no_woo)
 
     result = await ecp.poll_external_conversions_batch(now=_NOW)

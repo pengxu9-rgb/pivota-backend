@@ -186,9 +186,13 @@ async def test_batch_per_tick_cap_and_inter_merchant_throttle(monkeypatch):
     async def no_woo(*_a, **_k):
         return []
 
+    async def noop_touch(*_a, **_k):
+        return None
+
     monkeypatch.setattr(ecp.database, "fetch_all", fake_candidates)
     monkeypatch.setattr(ecp, "poll_external_conversions_for_merchant", fake_poll)
     monkeypatch.setattr(ecp, "_sleep", rec_sleep)
+    monkeypatch.setattr(ecp, "_touch_poll_attempt", noop_touch)
     monkeypatch.setattr(woo, "poll_wc_conversions_batch_lane", no_woo)
 
     result = await ecp.poll_external_conversions_batch(now=_NOW)
@@ -214,10 +218,74 @@ async def test_woo_lane_per_tick_cap(monkeypatch):
     async def rec_sleep(_seconds):
         return None
 
+    async def noop_touch(*_a, **_k):
+        return None
+
     monkeypatch.setattr(woo.database, "fetch_all", fake_candidates)
     monkeypatch.setattr(woo, "poll_wc_conversions_for_merchant", fake_poll)
     monkeypatch.setattr(woo, "_sleep", rec_sleep)
+    monkeypatch.setattr(woo, "_touch_poll_attempt", noop_touch)
 
     results = await woo.poll_wc_conversions_batch_lane(now=_NOW)
     assert polled == ["w0"], "woo lane also caps per tick (most-stale-first)"
     assert len(results) == 1
+
+
+# --- #1490 review: every dispatched merchant records an attempt (no starvation) ---
+
+@pytest.mark.asyncio
+async def test_batch_touches_every_dispatched_merchant(monkeypatch):
+    # The residual starvation vector: a merchant that returns early (no credentials)
+    # must STILL record an attempt (last_run_at) so it can't keep a stale value,
+    # re-sort to the front, and monopolize the cap. The batch touches EVERY
+    # dispatched merchant regardless of outcome (success / hold / cred-miss).
+    monkeypatch.setattr(ecp, "_poller_enabled", lambda: True)
+
+    async def fake_candidates(*_a, **_k):
+        return [{"merchant_id": "ok1"}, {"merchant_id": "held1"}, {"merchant_id": "credmiss1"}]
+
+    async def fake_poll(*, merchant_id, now):
+        if merchant_id == "held1":
+            return {"merchant_id": merchant_id, "closed": 0, "watermark_held": True}
+        if merchant_id == "credmiss1":
+            return {"merchant_id": merchant_id, "ok": False, "reason": "no_shopify_credentials", "closed": 0}
+        return {"merchant_id": merchant_id, "closed": 1}
+
+    touches = []
+
+    async def rec_touch(merchant_id, now):
+        touches.append(merchant_id)
+
+    async def no_woo(*_a, **_k):
+        return []
+
+    monkeypatch.setattr(ecp.database, "fetch_all", fake_candidates)
+    monkeypatch.setattr(ecp, "poll_external_conversions_for_merchant", fake_poll)
+    monkeypatch.setattr(ecp, "_touch_poll_attempt", rec_touch)
+    monkeypatch.setattr(woo, "poll_wc_conversions_batch_lane", no_woo)
+
+    await ecp.poll_external_conversions_batch(now=_NOW)
+    assert touches == ["ok1", "held1", "credmiss1"], "every dispatched merchant rotates (records an attempt)"
+
+
+@pytest.mark.asyncio
+async def test_woo_batch_touches_under_namespace(monkeypatch):
+    async def fake_candidates(*_a, **_k):
+        return [{"merchant_id": "wok"}, {"merchant_id": "wcredmiss"}]
+
+    async def fake_poll(*, merchant_id, now):
+        if merchant_id == "wcredmiss":
+            return {"merchant_id": merchant_id, "ok": False, "reason": "no_woocommerce_credentials", "closed": 0}
+        return {"merchant_id": merchant_id, "closed": 0}
+
+    touches = []
+
+    async def rec_touch(key, now):
+        touches.append(key)
+
+    monkeypatch.setattr(woo.database, "fetch_all", fake_candidates)
+    monkeypatch.setattr(woo, "poll_wc_conversions_for_merchant", fake_poll)
+    monkeypatch.setattr(woo, "_touch_poll_attempt", rec_touch)
+
+    await woo.poll_wc_conversions_batch_lane(now=_NOW)
+    assert touches == ["woo::wok", "woo::wcredmiss"], "woo lane records attempts under the woo:: namespace"

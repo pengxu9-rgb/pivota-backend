@@ -228,14 +228,14 @@ async def _write_poll_watermark(merchant_id: str, last_polled_at: datetime, clos
 
 
 # Record that we ATTEMPTED a merchant this tick WITHOUT advancing the watermark
-# (last_polled_at). On a HOLD the watermark is deliberately not advanced (the
-# #1484/#1485 data-safety rule), so ordering the per-tick fair-share queue by
-# last_polled_at would let a perpetually-held merchant keep a NULL/stale watermark,
-# sort first forever, and starve healthy merchants under a finite cap. Bumping
-# last_run_at on every attempt (success writes it too) makes the queue order by
-# ATTEMPT recency, so a held merchant rotates to the back. On a first-ever-hold the
-# INSERT leaves last_polled_at NULL (nullable), so the watermark read still returns
-# "first run".
+# (last_polled_at). The batch loop calls this for EVERY dispatched merchant, so the
+# per-tick fair-share queue can order by ATTEMPT recency (last_run_at). Ordering by
+# the watermark instead would let a merchant that never advances it — a perpetual
+# hold (data-safety rule #1484/#1485) OR an early cred-miss return — keep a
+# NULL/stale value, sort first forever, and starve healthy merchants under a finite
+# cap. Every dispatched merchant bumping last_run_at rotates it to the back. On a
+# first-ever attempt the INSERT leaves last_polled_at NULL (nullable), so the
+# watermark read still returns "first run".
 _TOUCH_POLL_ATTEMPT_SQL = """
 INSERT INTO external_conversion_poll_state (merchant_id, last_run_at, updated_at)
 VALUES (:merchant_id, :now, :now)
@@ -535,9 +535,9 @@ async def poll_external_conversions_for_merchant(
             page_cap_hit=page_cap_hit,
             log=logger,
         )
-        # Record the attempt (not the watermark) so a held merchant still rotates
-        # through the per-tick fair-share queue instead of monopolizing the cap.
-        await _touch_poll_attempt(merchant_id, run_started)
+        # NB: the ATTEMPT (last_run_at, for fair rotation) is recorded by the batch
+        # loop for EVERY dispatched merchant — success, hold, or an early cred-miss
+        # return — so no merchant can re-sort to the front and monopolize the cap.
     else:
         await _write_poll_watermark(merchant_id, run_started, summary["closed"])
     return summary
@@ -615,6 +615,11 @@ async def poll_external_conversions_batch(
             except Exception as e:  # defense-in-depth; per-merchant already best-effort
                 logger.warning("external_conversion_poller: merchant poll raised merchant=%s err=%s", merchant_id, str(e)[:200])
                 res = {"merchant_id": str(merchant_id), "ok": False, "error": str(e)[:200], "closed": 0}
+            # Record the attempt for EVERY dispatched merchant regardless of outcome
+            # (success, hold, cred-miss early return, or a raise) so none can keep a
+            # stale last_run_at, re-sort to the front, and monopolize the per-tick
+            # cap (#1490 review). The watermark (last_polled_at) is untouched.
+            await _touch_poll_attempt(str(merchant_id), now)
             result["results"].append(res)
             result["merchants_polled"] += 1
             result["total_closed"] += int(res.get("closed") or 0)

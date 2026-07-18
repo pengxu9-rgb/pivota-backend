@@ -380,9 +380,8 @@ async def poll_wc_conversions_for_merchant(
             page_cap_hit=page_cap_hit,
             log=logger,
         )
-        # Record the attempt (not the watermark) so a held merchant still rotates
-        # through the per-tick fair-share queue. Keyed on the woo:: namespace.
-        await _touch_poll_attempt(watermark_key, run_started)
+        # NB: the ATTEMPT (last_run_at, for fair rotation) is recorded by the batch
+        # lane for EVERY dispatched merchant (see poll_wc_conversions_batch_lane).
     else:
         await _write_poll_watermark(watermark_key, run_started, summary["closed"])
     return summary
@@ -448,6 +447,9 @@ async def poll_wc_conversions_batch_lane(
             except Exception as e:
                 logger.warning("woo_conversion_poller: merchant poll raised merchant=%s err=%s", merchant_id, str(e)[:200])
                 res = {"merchant_id": str(merchant_id), "platform": "woocommerce", "ok": False, "error": str(e)[:200], "closed": 0}
+            # Record the attempt for EVERY dispatched merchant (success/hold/cred-miss/
+            # raise) under the woo:: namespace, so none monopolizes the cap (#1490).
+            await _touch_poll_attempt(_woo_watermark_key(str(merchant_id)), now)
             results.append(res)
             await _sleep(inter_merchant_s)  # optional inter-merchant throttle (default off)
     except Exception as e:
