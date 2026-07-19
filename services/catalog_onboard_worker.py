@@ -97,6 +97,9 @@ async def _process_curated_brand(payload: Dict[str, Any], *, apply: bool, db: An
         domain=payload.get("domain"),
         category_path=payload.get("category_path") or "",
         brand=payload.get("brand"),
+        # NEW brand-official mints recover INCI from the PDP metafield/accordion
+        # when body_html has none (the cohort keeps INCI out of /products.json).
+        enrich_missing_inci=True,
     )
     if not records:
         return {"records": 0, "applied": None, "note": "no products enumerated"}

@@ -16,12 +16,16 @@ caller runs `ingest_validated_jsonl` + `apply_ingest_plan` (gated).
 
 from __future__ import annotations
 
+import asyncio
 import html
+import json
 import logging
 import re
 from typing import Any, Dict, List, Optional
 
 import httpx
+
+from services.retailer_ingest.sitemap_crawler import _looks_like_inci_list
 
 logger = logging.getLogger("curated_brand_feed")
 
@@ -137,6 +141,154 @@ def inci_from_body_html(body_html: Optional[str]) -> Optional[str]:
     return tail or None
 
 
+# --- Rendered-PDP INCI (the metafield / accordion source) ------------------
+# The K-beauty cohort keeps its full INCI OUT of `/products.json` body_html — it
+# lives in a Shopify product METAFIELD that the theme renders into the PDP either
+# as a visible <p> inside a "Full Ingredients" popup/accordion/modal (cosrx,
+# axis-y, iunik, skin1004 confirmed 2026-07-19) or as a JSON string inside a data
+# island (rich-text `{"type":"text","value":"Water, ..."}`, or an escaped-HTML
+# metafield string). Neither is in `/products.json`, so body_html capture
+# recovered INCI for only ~4.6% of the cohort. This extractor reads the RENDERED
+# PDP HTML from BOTH surfaces and recovers the list deterministically — never
+# fabricated; re-validated by the canonical INCI intake before it can write.
+_PDP_STRIP_RE = re.compile(r"(?is)<(script|style|template|noscript)\b.*?</\1\s*>|<!--.*?-->")
+_PDP_BLOCK_BOUNDARY_RE = re.compile(r"(?is)</(p|div|li|td|section|h[1-6])>|<br\s*/?>")
+# A leading "Full Ingredients:" / "INCI —" label sometimes shares the <p>/value
+# with the list (cosrx); strip it so the written value is the list itself.
+_PDP_INCI_LABEL_RE = re.compile(
+    r"(?i)^\s*(?:full\s+|all\s+|key\s+|active\s+|main\s+)?ingredients?(?:\s+list)?\s*[:\-–—]?\s*"
+)
+# A full INCI opens with the highest-concentration ingredient, which for an
+# aqueous cosmetic is water/aqua (regulatory descending-order). REQUIRING this
+# does two jobs: it tells a full INCI from a short "key ingredients" highlight
+# (which opens with an active) when a PDP carries both, AND it rejects comma-heavy
+# non-INCI noise that can slip the list gate (image srcset URLs, JS arrays). The
+# cost is anhydrous products (oil cleansers/balms) whose list opens with an oil —
+# they stay null (counted), never mis-filled. The whole cohort is aqueous.
+_PDP_SOLVENT_OPENER_RE = re.compile(
+    r"(?i)^\s*(?:purified\s+|deionized\s+|distilled\s+)?(?:aqua|water|eau)\b"
+)
+# JSON string literals in a data island; pre-filtered to comma-bearing strings
+# that plausibly contain the solvent before the (costlier) decode+gate.
+_PDP_JSON_STR_RE = re.compile(r'"((?:[^"\\]|\\.){20,8000})"')
+_PDP_SOLVENT_HINT_RE = re.compile(r"(?i)(?:aqua|water|eau)")
+
+
+def _pdp_visible_segments(page_html: str) -> List[str]:
+    """Block-level VISIBLE text lines: drop code/comment blocks, turn block-closers
+    into newlines (so a self-contained <p> INCI is its own line), strip tags,
+    unescape entities, collapse whitespace. Covers the accordion/modal/rich-text
+    <div> surface."""
+    view = _PDP_STRIP_RE.sub(" ", page_html)
+    view = _PDP_BLOCK_BOUNDARY_RE.sub("\n", view)
+    view = _HTML_TAG_RE.sub(" ", view)
+    view = html.unescape(view)
+    out: List[str] = []
+    for line in view.split("\n"):
+        line = re.sub(r"\s+", " ", line).strip()
+        if line:
+            out.append(line)
+    return out
+
+
+def _pdp_json_island_segments(page_html: str) -> List[str]:
+    """Candidate lines from JSON string literals in a data island (including inside
+    <script> JSON), covering the metafield-as-JSON surface: a rich-text text node
+    (`{"type":"text","value":"Water, ..."}`) or an escaped-HTML metafield string
+    (`"\\u003cp\\u003eWater, ...\\u003c/p\\u003e"`). Each candidate string is
+    JSON-decoded, tag-stripped, and split on rich-text paragraph breaks."""
+    if not _PDP_SOLVENT_HINT_RE.search(page_html):
+        return []
+    out: List[str] = []
+    for m in _PDP_JSON_STR_RE.finditer(page_html):
+        raw = m.group(1)
+        if "," not in raw or not _PDP_SOLVENT_HINT_RE.search(raw):
+            continue
+        try:
+            decoded = json.loads('"' + raw + '"')
+        except Exception:  # noqa: BLE001 — a non-JSON match just isn't a candidate
+            continue
+        decoded = html.unescape(_HTML_TAG_RE.sub(" ", decoded))
+        for chunk in re.split(r"\n\s*\n|\r", decoded):
+            chunk = re.sub(r"\s+", " ", chunk).strip()
+            if chunk:
+                out.append(chunk)
+    return out
+
+
+def inci_from_pdp_html(page_html: Optional[str]) -> Optional[str]:
+    """Deterministic INCI extraction from a RENDERED brand PDP.
+
+    Scans BOTH the visible block text (accordion/modal/rich-text div) and the JSON
+    data island (metafield rendered as a JSON string) for text that clears the
+    strong INCI-list gate (`_looks_like_inci_list` — the same reseller-tier safety
+    net the crawled-INCI lane relies on) AND opens with the solvent (a real full
+    INCI, per INCI descending-order; this also rejects srcset/JS-array noise).
+    Then, so we never guess or fabricate:
+
+      * exactly one distinct full INCI -> return it;
+      * >1 distinct full INCI (a bundle / related-product cards) -> None (ambiguous);
+      * none -> None.
+
+    Whatever it returns is re-validated by
+    `canonical_inci_intake.ingest_canonical_inci` before any write."""
+    if not page_html:
+        return None
+    page_html = str(page_html)
+    # Normalized-key dedup: the same list rendered on two surfaces (visible <p> and
+    # a JSON island, or mobile+desktop DOM) must collapse to one candidate, not read
+    # as an ambiguous pair. Keep the longest raw string for a given key.
+    by_key: Dict[str, str] = {}
+    for seg in (*_pdp_visible_segments(page_html), *_pdp_json_island_segments(page_html)):
+        cand = _PDP_INCI_LABEL_RE.sub("", seg).strip().rstrip(". ").strip()
+        if not _PDP_SOLVENT_OPENER_RE.match(cand):
+            continue
+        if not _looks_like_inci_list(cand):
+            continue
+        key = re.sub(r"[^a-z0-9]", "", cand.lower())
+        if key and (key not in by_key or len(cand) > len(by_key[key])):
+            by_key[key] = cand
+    if len(by_key) == 1:
+        return next(iter(by_key.values()))
+    return None  # 0 = none published; >1 = ambiguous (which product's list?)
+
+
+async def fetch_pdp_inci(
+    domain: str,
+    handle: str,
+    *,
+    client: Optional[httpx.AsyncClient] = None,
+    timeout_s: float = 15.0,
+) -> Optional[str]:
+    """Fetch a single brand PDP and recover its INCI via `inci_from_pdp_html`.
+
+    The polite, additive fallback for the (very common) cohort product whose
+    `/products.json` body_html carries no ingredients. Returns None on any
+    network/parse failure or when the PDP doesn't publish a recoverable INCI — a
+    brand site hiccup must never fabricate or raise into the mint/backfill loop."""
+    host = _clean_domain(domain)
+    handle = str(handle or "").strip().strip("/")
+    if not host or not handle:
+        return None
+    url = f"https://{host}/products/{handle}"
+    timeout = httpx.Timeout(timeout_s, connect=5.0)
+    headers = {"User-Agent": _UA, "Accept": "text/html"}
+    try:
+        if client is not None:
+            resp = await client.get(url)
+        else:
+            async with httpx.AsyncClient(
+                follow_redirects=True, timeout=timeout, headers=headers
+            ) as c:
+                resp = await c.get(url)
+        if resp.status_code != 200:
+            return None
+        return inci_from_pdp_html(resp.text)
+    except Exception as exc:  # noqa: BLE001 — a brand PDP being down must not break the batch
+        logger.debug("fetch_pdp_inci failed for %s/%s: %s", host, handle, str(exc)[:160])
+        return None
+
+
 def _to_float(value: Any) -> Optional[float]:
     """Coerce Shopify's string prices (e.g. '56.00') to float; None if absent/invalid.
     Numeric columns (catalog_offers.*_price, external_product_seeds.price_amount) reject
@@ -241,14 +393,39 @@ async def records_for_brand(
     category_path: str,
     brand: Optional[str] = None,
     max_products: int = 500,
+    enrich_missing_inci: bool = False,
+    max_pdp_inci_fetches: int = 300,
+    pdp_delay_s: float = 0.3,
 ) -> List[Dict[str, Any]]:
-    """Fetch a curated brand's storefront and return Path-C validated records."""
+    """Fetch a curated brand's storefront and return Path-C validated records.
+
+    When `enrich_missing_inci` is set, records whose body_html carried no INCI get
+    a SECOND, polite try: fetch the product's own PDP and recover the metafield /
+    accordion INCI via `fetch_pdp_inci` (the cohort keeps INCI out of body_html).
+    Additive — body_html INCI stays the first try and is never overwritten here;
+    the fetch is capped, delayed, and best-effort (a miss leaves raw_inci None)."""
     products = await fetch_shopify_products(domain, max_products=max_products)
     records: List[Dict[str, Any]] = []
+    pairs: List[Dict[str, Any]] = []  # (product, record) needing a PDP INCI try
     for p in products:
         rec = shopify_product_to_record(
             p, domain=domain, category_path=category_path, brand_override=brand
         )
-        if rec:
-            records.append(rec)
+        if not rec:
+            continue
+        records.append(rec)
+        if enrich_missing_inci and not (rec.get("pdp") or {}).get("raw_inci"):
+            handle = str((p or {}).get("handle") or "").strip()
+            if handle:
+                pairs.append({"handle": handle, "rec": rec})
+    if enrich_missing_inci and pairs:
+        timeout = httpx.Timeout(15.0, connect=5.0)
+        headers = {"User-Agent": _UA, "Accept": "text/html"}
+        async with httpx.AsyncClient(follow_redirects=True, timeout=timeout, headers=headers) as client:
+            for i, pair in enumerate(pairs[:max_pdp_inci_fetches]):
+                inci = await fetch_pdp_inci(domain, pair["handle"], client=client)
+                if inci:
+                    pair["rec"]["pdp"]["raw_inci"] = inci
+                if pdp_delay_s and i + 1 < min(len(pairs), max_pdp_inci_fetches):
+                    await asyncio.sleep(pdp_delay_s)
     return records
