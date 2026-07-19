@@ -71,6 +71,16 @@ def _resolve_acp_bearer_token() -> str:
     """
     token = settings.platform_orders_acp_token
     if token:
+        # Fail loud on a placeholder/weak token (#1296) — e.g. an unexpanded `$TOK`
+        # — instead of sending it and letting a misconfigured peer accept it.
+        from utils.service_token import validate_service_token
+        try:
+            validate_service_token(token, label="PLATFORM_ORDERS_ACP_TOKEN")
+        except ValueError as e:
+            raise HTTPException(
+                status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+                detail=f"platform_orders_acp_token_misconfigured: {e}",
+            )
         return token
     is_prod = (
         os.getenv("ENVIRONMENT", "").lower() == "production"

@@ -80,6 +80,17 @@ def _resolve_bearer_token() -> str:
     AcpClientError instead of HTTPException)."""
     token = settings.platform_orders_acp_token
     if token:
+        # Fail loud on a placeholder/weak token (#1296) instead of shipping it as a
+        # Bearer and letting a misconfigured peer accept it — same guard as the route.
+        from utils.service_token import validate_service_token
+        try:
+            validate_service_token(token, label="PLATFORM_ORDERS_ACP_TOKEN")
+        except ValueError as e:
+            raise AcpClientError(
+                f"platform_orders_acp_token_misconfigured: {e}",
+                status_code=503,
+                code="acp_token_misconfigured",
+            )
         return token
     is_prod = (
         os.getenv("ENVIRONMENT", "").lower() == "production"
