@@ -1,14 +1,13 @@
 """
-AP2 agent signing-key registration (#1442) — Blocker 1 for ENABLE_AP2_ROUTES.
+AP2 agent signing-key ADMIN backfill (#1442) — first-party/partner pilot
+provisioning (ADR-012 carve-out; NOT agent self-serve).
 
-`POST /agent/ap2/signing-key` persists an agent's ES256/Ed25519 signing public key
-into `agents.public_key` (read by `consent_service.get_agent_identity`), so the
-consent-grant path stops failing closed. These tests cover:
-  - the key validator (a validated key is provably verifiable — no broken key),
-  - the endpoint's SECURITY binding (the key is written for the AUTHENTICATED
-    agent only; a body `agent_id` is ignored),
-  - validation / auth rejection,
-  - the writer's SQL (drift guard on the `agents.public_key` column).
+`POST /admin/ap2/agent-signing-key` (admin-gated) persists a named pilot agent's
+ES256/Ed25519 signing PEM into `agents.public_key` (read by
+`consent_service.get_agent_identity`). These tests cover the key validator (a
+validated key is provably verifiable), admin-gating, the explicit-agent_id +
+existence check, validation rejection, and the writer's SQL (drift guard on the
+`agents.public_key` column).
 """
 import base64
 import json
@@ -29,6 +28,7 @@ if str(BACKEND_ROOT) not in sys.path:
 os.environ.setdefault("DATABASE_URL", "sqlite:///:memory:")
 
 from services.crypto_service import crypto_service  # noqa: E402
+from utils.auth import get_current_employee  # noqa: E402
 
 
 # --- helpers ------------------------------------------------------------------
@@ -47,11 +47,15 @@ def _ed25519_pem():
     ).decode()
 
 
-def _client():
+def _client(*, as_admin=True):
+    """A TestClient for the router. `as_admin` overrides the admin dependency;
+    when False the real gate runs (used for the unauthenticated-rejection test)."""
     from routes.ap2_agent_registration import router
 
     app = FastAPI()
     app.include_router(router)
+    if as_admin:
+        app.dependency_overrides[get_current_employee] = lambda: {"id": "emp_test"}
     return TestClient(app)
 
 
@@ -92,7 +96,7 @@ def test_validate_rejects_unsupported_algorithm():
 
 def test_validated_es256_key_actually_verifies():
     # The whole point: a key that passes validate_public_key must be usable by the
-    # verify path — otherwise an agent could register a key that then 401s grants.
+    # verify path — otherwise provisioning could store a key that then 401s grants.
     priv, pem = _es256_keypair()
     crypto_service.validate_public_key(pem, "ES256")
     payload = {"agent_id": "agent_x", "scope": ["pay"], "duration_hours": 24, "nonce": "n1"}
@@ -123,71 +127,88 @@ async def test_writer_updates_public_key_column(monkeypatch):
     assert captured["values"] == {"public_key": pem, "agent_id": "agent_x"}
 
 
-# --- endpoint: auth binding + validation --------------------------------------
+# --- endpoint: admin backfill -------------------------------------------------
+
+class _Calls(list):
+    """A list that also carries mutable `state` (a plain list can't hold attrs)."""
+    state: dict
+
 
 @pytest.fixture
-def stub_writer(monkeypatch):
-    """Capture set_agent_public_key calls without a DB."""
-    calls = []
+def stub_db(monkeypatch):
+    """Stub get_agent (exists) + set_agent_public_key (capture). Returns the calls
+    list; set `stub_db.state["exists"]=False` to model an unknown agent."""
+    calls = _Calls()
+    calls.state = {"exists": True}
+
+    async def fake_get_agent(agent_id):
+        return {"agent_id": agent_id} if calls.state["exists"] else None
 
     async def fake_set(agent_id, public_key):
         calls.append((agent_id, public_key))
 
+    monkeypatch.setattr("db.agents.get_agent", fake_get_agent)
     monkeypatch.setattr("db.agents.set_agent_public_key", fake_set)
     return calls
 
 
-def test_register_stores_key_for_authenticated_agent(stub_writer):
+def test_admin_backfill_stores_key_for_named_agent(stub_db):
     _, pem = _es256_keypair()
     res = _client().post(
-        "/agent/ap2/signing-key",
-        json={"public_key": pem, "algorithm": "ES256"},
-        headers={"X-API-Key": "test-agent-key"},  # test-bypass → agent_id "agent_test"
+        "/admin/ap2/agent-signing-key",
+        json={"agent_id": "agent_pilot_1", "public_key": pem, "algorithm": "ES256"},
     )
     assert res.status_code == 200, res.text
     body = res.json()
     assert body["status"] == "registered"
-    assert body["agent_id"] == "agent_test"
-    assert stub_writer == [("agent_test", pem.strip())]  # route strips surrounding whitespace
+    assert body["agent_id"] == "agent_pilot_1"
+    assert stub_db == [("agent_pilot_1", pem.strip())]  # route strips surrounding whitespace
 
 
-def test_register_ignores_body_agent_id(stub_writer):
-    # SECURITY: an agent_id in the body must NOT let a caller set another agent's
-    # key — the write is bound to the authenticated identity only.
+def test_missing_agent_id_400(stub_db):
+    _, pem = _es256_keypair()
+    res = _client().post("/admin/ap2/agent-signing-key", json={"public_key": pem})
+    assert res.status_code == 400
+    assert stub_db == []
+
+
+def test_unknown_agent_404(stub_db):
+    stub_db.state["exists"] = False  # type: ignore[attr-defined]
     _, pem = _es256_keypair()
     res = _client().post(
-        "/agent/ap2/signing-key",
-        json={"agent_id": "victim_agent", "public_key": pem},
-        headers={"X-API-Key": "test-agent-key"},
+        "/admin/ap2/agent-signing-key",
+        json={"agent_id": "ghost", "public_key": pem},
     )
-    assert res.status_code == 200, res.text
-    assert stub_writer == [("agent_test", pem.strip())]
-    assert stub_writer[0][0] != "victim_agent"
+    assert res.status_code == 404
+    assert stub_db == [], "a write must never reach an agent that doesn't exist"
 
 
-def test_register_rejects_invalid_key_400(stub_writer):
+def test_rejects_invalid_key_400(stub_db):
     res = _client().post(
-        "/agent/ap2/signing-key",
-        json={"public_key": "not-a-real-pem"},
-        headers={"X-API-Key": "test-agent-key"},
+        "/admin/ap2/agent-signing-key",
+        json={"agent_id": "agent_pilot_1", "public_key": "not-a-real-pem"},
     )
     assert res.status_code == 400
-    assert stub_writer == [], "an invalid key must never reach the writer"
+    assert stub_db == [], "an invalid key must never reach the writer"
 
 
-def test_register_rejects_unsupported_algorithm_400(stub_writer):
+def test_rejects_unsupported_algorithm_400(stub_db):
     _, pem = _es256_keypair()
     res = _client().post(
-        "/agent/ap2/signing-key",
-        json={"public_key": pem, "algorithm": "RS256"},
-        headers={"X-API-Key": "test-agent-key"},
+        "/admin/ap2/agent-signing-key",
+        json={"agent_id": "agent_pilot_1", "public_key": pem, "algorithm": "RS256"},
     )
     assert res.status_code == 400
-    assert stub_writer == []
+    assert stub_db == []
 
 
-def test_register_requires_auth_401(stub_writer):
+def test_requires_admin_auth(stub_db):
+    # Without the admin dependency override, the real get_current_employee gate runs
+    # and rejects an unauthenticated caller (never reaching the writer).
     _, pem = _es256_keypair()
-    res = _client().post("/agent/ap2/signing-key", json={"public_key": pem})  # no credential
-    assert res.status_code == 401
-    assert stub_writer == [], "an unauthenticated caller must never reach the writer"
+    res = _client(as_admin=False).post(
+        "/admin/ap2/agent-signing-key",
+        json={"agent_id": "agent_pilot_1", "public_key": pem},
+    )
+    assert res.status_code in (401, 403)
+    assert stub_db == [], "an unauthenticated caller must never reach the writer"
