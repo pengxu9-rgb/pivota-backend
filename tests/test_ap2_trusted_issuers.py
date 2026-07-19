@@ -77,8 +77,96 @@ async def test_get_trusted_issuers_returns_active_set(monkeypatch):
 
     result = await reg.get_trusted_issuers("agent_1")
     assert result == {"did:key:zA", "did:web:example.com"}
-    assert "WHERE agent_id = :agent_id AND status = 'active'" in captured["query"]
-    assert captured["values"] == {"agent_id": "agent_1"}
+    # Union of the agent's own issuers AND the platform-global tier (#1495).
+    assert "WHERE agent_id IN (:agent_id, :global_key) AND status = 'active'" in captured["query"]
+    assert captured["values"] == {"agent_id": "agent_1", "global_key": reg.GLOBAL_SCOPE_AGENT_ID}
+
+
+# --- #1495: platform-global tier + list ---------------------------------------
+
+async def test_add_global_trusted_issuer_uses_sentinel(monkeypatch):
+    captured = {}
+
+    async def fake_execute(query, values=None):
+        captured["values"] = values
+
+    from db.database import database
+    monkeypatch.setattr(database, "execute", fake_execute)
+
+    await reg.add_global_trusted_issuer("did:web:openai.com")
+    assert captured["values"]["agent_id"] == reg.GLOBAL_SCOPE_AGENT_ID
+    assert captured["values"]["issuer_did"] == "did:web:openai.com"
+
+
+async def test_revoke_global_trusted_issuer_uses_sentinel(monkeypatch):
+    captured = {}
+
+    async def fake_execute(query, values=None):
+        captured["values"] = values
+
+    from db.database import database
+    monkeypatch.setattr(database, "execute", fake_execute)
+
+    await reg.revoke_global_trusted_issuer("did:web:openai.com")
+    assert captured["values"] == {"agent_id": reg.GLOBAL_SCOPE_AGENT_ID, "issuer_did": "did:web:openai.com"}
+
+
+async def test_get_trusted_issuers_unions_global_and_per_agent(monkeypatch):
+    # A fake that returns a per-agent row AND a global row (as the union query
+    # would) — the result is the union, proving a global issuer covers this agent
+    # even though it has no per-agent binding to it.
+    async def fake_fetch_all(query, values=None):
+        assert values == {"agent_id": "agent_1", "global_key": reg.GLOBAL_SCOPE_AGENT_ID}
+        return [{"issuer_did": "did:key:zAgentOwn"}, {"issuer_did": "did:web:openai.com"}]
+
+    from db.database import database
+    monkeypatch.setattr(database, "fetch_all", fake_fetch_all)
+
+    assert await reg.get_trusted_issuers("agent_1") == {"did:key:zAgentOwn", "did:web:openai.com"}
+
+
+async def test_get_trusted_issuers_excludes_revoked_via_status_filter(monkeypatch):
+    # The union query filters status='active', so a revoked row (per-agent OR
+    # global) never reaches the returned set. Emulate the DB applying that filter:
+    # the fake returns only active rows, and we assert the query carries the filter.
+    async def fake_fetch_all(query, values=None):
+        assert "status = 'active'" in query  # revoked rows are excluded at the DB
+        return []  # both the agent's row and the global row are revoked → nothing active
+
+    from db.database import database
+    monkeypatch.setattr(database, "fetch_all", fake_fetch_all)
+
+    # Empty active set → deny-by-default even though a (revoked) global row exists.
+    assert await reg.get_trusted_issuers("agent_1") == set()
+
+
+async def test_get_trusted_issuers_denies_when_no_active_rows(monkeypatch):
+    # Non-empty agent_id but zero matching active rows → empty set (fail closed).
+    async def fake_fetch_all(query, values=None):
+        return []
+
+    from db.database import database
+    monkeypatch.setattr(database, "fetch_all", fake_fetch_all)
+
+    assert await reg.get_trusted_issuers("agent_real") == set()
+
+
+async def test_list_trusted_issuers_labels_scope(monkeypatch):
+    async def fake_fetch_all(query, values=None):
+        return [
+            {"agent_id": reg.GLOBAL_SCOPE_AGENT_ID, "issuer_did": "did:web:openai.com", "status": "active"},
+            {"agent_id": "agent_1", "issuer_did": "did:key:zUser", "status": "active"},
+        ]
+
+    from db.database import database
+    monkeypatch.setattr(database, "fetch_all", fake_fetch_all)
+
+    rows = await reg.list_trusted_issuers("agent_1")
+    by_did = {r["issuer_did"]: r for r in rows}
+    assert by_did["did:web:openai.com"]["scope"] == "global"
+    assert by_did["did:web:openai.com"]["agent_id"] is None
+    assert by_did["did:key:zUser"]["scope"] == "agent"
+    assert by_did["did:key:zUser"]["agent_id"] == "agent_1"
 
 
 async def test_get_trusted_issuers_empty_agent_short_circuits(monkeypatch):
