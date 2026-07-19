@@ -3,7 +3,7 @@ from __future__ import annotations
 import json
 import logging
 import uuid
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from decimal import Decimal, InvalidOperation
 from typing import Any, Dict, Optional
 from urllib.parse import parse_qsl, urlencode, urlparse, urlunparse
@@ -13,6 +13,7 @@ from sqlalchemy import select
 from db.commerce_attribution import commerce_attribution_edges, surface_click_events
 from db.database import database
 from observability.reliability_metrics import (
+    record_commerce_attribution_inferred_recovered,
     record_commerce_attribution_silent_reject,
     record_traffic_taxonomy,
 )
@@ -309,6 +310,66 @@ async def record_surface_event(
     return values
 
 
+# Bounded window for the token-less fallback join (#1481). Tighter than the
+# poller's click-recency window: an inference over a long gap is weak, and this
+# only recovers COVERAGE (inferred edges are never billed).
+INFERRED_FALLBACK_WINDOW_HOURS = 72
+
+# Most-recent agent→merchant click within the window — the fallback join key when a
+# propagated pvt_click_id never reached the order. Keyed on (agent_id, merchant_id):
+# the order carries no product signal (that is why it dropped), so we recover the
+# agent's most recent click context on this merchant.
+_INFERRED_CLICK_LOOKUP_SQL = (
+    "SELECT canonical_product_id, canonical_variant_id, surface, commerce_surface, "
+    "source_channel, source_family, query_source, prompt_cluster "
+    "FROM surface_click_events "
+    "WHERE agent_id = :agent_id AND merchant_id = :merchant_id "
+    "AND COALESCE(last_click_at, created_at) >= :cutoff "
+    "ORDER BY COALESCE(last_click_at, created_at) DESC LIMIT 1"
+)
+
+
+async def _infer_attribution_from_recent_click(
+    payload: Dict[str, Any], merchant_id: str, now: datetime
+) -> Optional[Dict[str, Any]]:
+    """Fallback when the order carries no attribution signal (#1481): recover the
+    most recent agent→merchant click within the window as an INFERRED context. Not
+    token-proven, so the caller flags the edge inferred and it is NOT billed. Returns
+    the recovered click context, or None (no agent / no recent click / lookup error).
+    """
+    agent_id = str(_first_nonempty(payload, "agent_id", "agentId") or "").strip()
+    if not agent_id or not merchant_id:
+        return None
+    try:
+        row = await database.fetch_one(
+            _INFERRED_CLICK_LOOKUP_SQL,
+            {
+                "agent_id": agent_id,
+                "merchant_id": merchant_id,
+                "cutoff": now - timedelta(hours=INFERRED_FALLBACK_WINDOW_HOURS),
+            },
+        )
+    except Exception as e:  # best-effort — a lookup failure is just "no recovery"
+        logger.warning("commerce_attribution: inferred-fallback lookup failed merchant=%s err=%s", merchant_id, str(e)[:200])
+        return None
+    if row is None:
+        return None
+    r = dict(row)
+    if not (r.get("canonical_product_id") or r.get("surface")):
+        return None  # nothing usable to attribute to
+    return {
+        "agent_id": agent_id,
+        "canonical_product_id": r.get("canonical_product_id"),
+        "canonical_variant_id": r.get("canonical_variant_id"),
+        "surface": r.get("surface"),
+        "commerce_surface": r.get("commerce_surface"),
+        "source_channel": r.get("source_channel"),
+        "source_family": r.get("source_family"),
+        "query_source": r.get("query_source"),
+        "prompt_cluster": r.get("prompt_cluster"),
+    }
+
+
 async def upsert_order_attribution_edge(
     *,
     order_id: str,
@@ -316,21 +377,41 @@ async def upsert_order_attribution_edge(
     metadata: Optional[Dict[str, Any]],
 ) -> Optional[Dict[str, Any]]:
     payload = dict(metadata or {})
+    # The `inferred` flag GATES billing (inferred edges are excluded), so it is
+    # server-controlled only — strip any caller-supplied value from the order
+    # metadata so a caller can't tag its own edge out of GMV billing.
+    payload.pop("inferred", None)
+    payload.pop("inferred_via", None)
+    inferred = False
     if not has_attribution_signal(payload):
-        # Surface gate rejections so Stage 1 can size the direct-checkout gap
-        # instead of treating "no edge" as zero events.
-        logger.warning(
-            "commerce_attribution: skipping edge order_id=%s merchant_id=%s "
-            "reason=no_attribution_signal metadata_keys=%s",
-            order_id,
-            merchant_id,
-            sorted(payload.keys()) if payload else [],
+        # Fallback (#1481): before dropping a token-less order, try to recover the
+        # agent's most recent click on this merchant (a propagated pvt_click_id that
+        # didn't reach the order). A recovery is INFERRED — recorded + flagged, but
+        # NEVER billed (the billing/outcome queries exclude metadata.inferred).
+        recovered = await _infer_attribution_from_recent_click(payload, merchant_id, _now())
+        if recovered is None:
+            # Genuine drop — surface it so coverage (matched/inferred/dropped) is a
+            # known number instead of treating "no edge" as zero events.
+            logger.warning(
+                "commerce_attribution: skipping edge order_id=%s merchant_id=%s "
+                "reason=no_attribution_signal metadata_keys=%s",
+                order_id,
+                merchant_id,
+                sorted(payload.keys()) if payload else [],
+            )
+            record_commerce_attribution_silent_reject(
+                merchant_id=merchant_id,
+                reason="no_attribution_signal",
+            )
+            return None
+        payload = {**payload, **{k: v for k, v in recovered.items() if v is not None}}
+        inferred = True
+        record_commerce_attribution_inferred_recovered(merchant_id=merchant_id)
+        logger.info(
+            "commerce_attribution: RECOVERED token-less order via fallback (inferred, "
+            "not billed) order_id=%s merchant_id=%s agent=%s",
+            order_id, merchant_id, recovered.get("agent_id"),
         )
-        record_commerce_attribution_silent_reject(
-            merchant_id=merchant_id,
-            reason="no_attribution_signal",
-        )
-        return None
     attribution = materialize_attribution_context(
         payload,
         default_surface=_first_nonempty(payload, PVT_SURFACE, "surface"),
@@ -359,7 +440,12 @@ async def upsert_order_attribution_edge(
         "llm_model": attribution.get("llm_model"),
         "caller_id": attribution.get("caller_id"),
         "checkout_started_at": now,
-        "metadata": attach_traffic_taxonomy({**payload_with_taxonomy, **attribution}, attribution),
+        "metadata": {
+            **attach_traffic_taxonomy({**payload_with_taxonomy, **attribution}, attribution),
+            # Flag a fallback-recovered edge so billing/outcome queries EXCLUDE it
+            # (#1481) — recorded for coverage, never billed as token-proven GMV.
+            **({"inferred": True, "inferred_via": "agent_merchant_window"} if inferred else {}),
+        },
         "updated_at": now,
     }
     interaction_event = await record_commerce_event_best_effort(

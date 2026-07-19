@@ -32,6 +32,9 @@ FROM commerce_attribution_edges e
 WHERE (e.created_at AT TIME ZONE 'UTC')::date = :date
   AND (CAST(:merchant_id AS TEXT) IS NULL OR e.merchant_id = CAST(:merchant_id AS TEXT))
   AND e.gross_attributed_gmv_cents IS NOT NULL
+  -- Exclude fallback-INFERRED edges (#1481): token-less recoveries are recorded for
+  -- coverage but never billed. NULL-safe (real edges lack the key → counted).
+  AND (e.metadata->>'inferred')::boolean IS NOT TRUE
 GROUP BY (e.created_at AT TIME ZONE 'UTC')::date, e.merchant_id, e.agent_id, e.channel_partner_id
 """
 

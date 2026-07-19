@@ -237,6 +237,16 @@ try:
     except ValueError:
         commerce_attribution_silent_reject_total = _existing_collector("commerce_attribution_silent_reject_total")
 
+    try:
+        commerce_attribution_inferred_recovered_total = Counter(
+            "commerce_attribution_inferred_recovered_total",
+            "Order attribution edges RECOVERED via the token-less fallback join "
+            "(agent+merchant+window). Recorded + flagged inferred, EXCLUDED from billing (#1481).",
+            ["merchant_id"],
+        )
+    except ValueError:
+        commerce_attribution_inferred_recovered_total = _existing_collector("commerce_attribution_inferred_recovered_total")
+
 except Exception:  # pragma: no cover
     Counter = Gauge = Histogram = None  # type: ignore
     payment_attempt_total = None
@@ -262,6 +272,7 @@ except Exception:  # pragma: no cover
     traffic_taxonomy_missing_total = None
     traffic_taxonomy_diagnostics_warning_total = None
     commerce_attribution_silent_reject_total = None
+    commerce_attribution_inferred_recovered_total = None
 
 
 def record_payment_attempt(
@@ -462,4 +473,15 @@ def record_commerce_attribution_silent_reject(
     commerce_attribution_silent_reject_total.labels(
         merchant_id=str(merchant_id or "unknown"),
         reason=str(reason or "unknown"),
+    ).inc()
+
+
+def record_commerce_attribution_inferred_recovered(*, merchant_id: Optional[str]) -> None:
+    """A token-less order was recovered via the fallback join (#1481) — recorded as
+    an inferred edge (NOT billed). Together with the silent-reject counter this makes
+    attribution coverage a known number: matched vs inferred-recovered vs dropped."""
+    if commerce_attribution_inferred_recovered_total is None:
+        return
+    commerce_attribution_inferred_recovered_total.labels(
+        merchant_id=str(merchant_id or "unknown"),
     ).inc()
