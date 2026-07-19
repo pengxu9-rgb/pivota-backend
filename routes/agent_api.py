@@ -4688,6 +4688,12 @@ async def agent_create_acp_checkout_session(
     service_token = str(os.getenv("ACP_SERVICE_TOKEN") or os.getenv("ACP_API_KEY") or "").strip()
     if not service_token:
         raise HTTPException(status_code=500, detail="Missing ACP_SERVICE_TOKEN")
+    # Fail loud on a placeholder/weak token (#1296) instead of silently authenticating.
+    try:
+        from utils.service_token import validate_service_token
+        validate_service_token(service_token, label="ACP_SERVICE_TOKEN")
+    except ValueError as e:
+        raise HTTPException(status_code=500, detail=f"ACP_SERVICE_TOKEN misconfigured: {e}")
 
     # Normalize items into ACP schema: {id, quantity}
     acp_items = []
