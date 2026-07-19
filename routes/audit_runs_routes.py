@@ -542,9 +542,10 @@ def _audit_metering(
     # Build the provider-probe set, then price it through the shared per-probe
     # estimator (credit_consumption_service) so audit and any future metered
     # workflow bill identically per probe. Model overrides intentionally do not
-    # alter audit credits yet — ChatGPT stays on the single conservative
-    # provider rate (~5.4 credits/probe) until per-model rate mapping becomes a
-    # separate productized follow-up.
+    # alter audit credits yet — each provider bills at its single config rate
+    # (config/provider_credit_rates.json; grounded ChatGPT ~11.7 credits/probe
+    # on its measured ~15k-token representative probe, #1506) until per-model
+    # rate mapping becomes a separate productized follow-up.
     total_prompts = int(sku_count) * int(prompts_per_sku)
     probes: List[Tuple[str, int, bool]] = []
     for provider in providers:
