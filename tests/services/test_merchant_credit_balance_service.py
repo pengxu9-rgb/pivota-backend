@@ -1184,6 +1184,9 @@ def test_credits_for_probe_uses_seeded_provider_config():
     from services.provider_credit_rates import credits_for_probe
 
     # Pricing: COGS x flat_multiple(1.2) / credit_to_usd(0.01); gpt-5.5 output $30.
+    # ChatGPT is priced on its measured grounded input (~15k tok/probe via
+    # web_search_preview), not the flat 2000 that under-recovered COGS — see the
+    # audit-billing-cogs fix (#1506). Gemini/DeepSeek keep the shared 2000/500.
     assert credits_for_probe("gemini", grounded=True) == pytest.approx(4.4)
-    assert credits_for_probe("chatgpt", grounded=True) == pytest.approx(4.8)
+    assert credits_for_probe("chatgpt", grounded=True) == pytest.approx(11.7)
     assert credits_for_probe("deepseek", grounded=False) == pytest.approx(0.1)
