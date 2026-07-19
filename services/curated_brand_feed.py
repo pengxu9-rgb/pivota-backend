@@ -193,11 +193,22 @@ _PDP_FULL_INCI_MIN_PARTS = 10
 # words, no sentence punctuation. Rejects a product-name/heading that a join-<br>
 # pass may prepend to a list (e.g. "GLOW LAYERING FIT CUSHION (NO.17 IVORY) WATER").
 _PDP_INGREDIENT_TOKEN_RE = re.compile(r"^[A-Za-z0-9 ()\-./+'&]+$")
-# Two distinct full lists on one page are shade variants of the SAME product (near-
-# identical ingredient sets — reordered / differ only in the pigment tail) vs a
-# bundle or a neighbor/related-product's list (largely disjoint). This Jaccard floor
-# separates them cleanly (measured 2026-07-19: shade groups 0.90–0.98; bundle 0.10).
-_PDP_SHADE_SIM_MIN = 0.7
+# When several distinct full lists appear on one page they are EITHER shade variants
+# of the SAME product (collapse to one) OR different products — a bundle/kit, or a
+# neighbor/related-product's list carried in a recommendations JSON island (stay
+# ambiguous -> None, never attribute another product's list to this page). The
+# separation is tight and precision-critical: measured 2026-07-20, real shade groups
+# score ingredient-set Jaccard 0.90 (misshaus cushion, min pairwise) to 0.98
+# (dasique balm), while two GENUINELY DIFFERENT same-line K-beauty products that
+# share a large aqueous base score only ~0.67–0.73. A 0.7 floor (the first cut of
+# this fix) wrongly collapsed those neighbors and, picking the longest, PUBLISHED the
+# neighbor's list. The floor is raised to 0.85 (well above the ~0.73 different-product
+# ceiling, below the 0.90 shade floor) AND gated by two corroborating signals that a
+# shared-base neighbor fails: identical opening ingredient and near-identical length.
+_PDP_SHADE_SIM_MIN = 0.85
+# Shade variants are the same formula (reordered / pigment-tail only), so their
+# ingredient COUNT barely moves; a different product (toner vs serum) differs more.
+_PDP_SHADE_LEN_RATIO = 1.15
 
 
 def _pdp_visible_segments(page_html: str, *, join_br: bool = False) -> List[str]:
@@ -285,83 +296,153 @@ def _pdp_is_full_inci(cand: str) -> bool:
     return any(_PDP_SOLVENT_OPENER_RE.match(p) for p in parts)
 
 
+def _pdp_norm_key(text: str) -> str:
+    """Alphanumeric-only lowercase fingerprint of a list (for dedup / substring tests)."""
+    return re.sub(r"[^a-z0-9]", "", text.lower())
+
+
+def _pdp_parts(text: str) -> List[str]:
+    return [p.strip() for p in text.split(",") if p.strip()]
+
+
+def _pdp_solvent_opener_count(cand: str) -> int:
+    """How many comma-parts are a solvent opener (water/aqua/eau at the start of the
+    part). A real INCI has EXACTLY ONE solvent entry; two means two lists were
+    concatenated (a kit/routine block whose per-product lists were joined across a
+    bare <br>). Note the first solvent may be mid-list — a Centella serum opens with
+    the extract and lists Water at #4 — so we count occurrences, not position."""
+    return sum(1 for p in _pdp_parts(cand) if _PDP_SOLVENT_OPENER_RE.match(p))
+
+
 def _pdp_inci_similarity(a: str, b: str) -> float:
     """Jaccard overlap of two lists' normalized ingredient SETS (order-independent —
     shade variants reorder ingredients). 1.0 = identical set, 0.0 = disjoint."""
     def _set(text: str) -> set:
-        return {
-            re.sub(r"[^a-z0-9]", "", p.lower())
-            for p in text.split(",")
-            if re.sub(r"[^a-z0-9]", "", p.lower())
-        }
+        return {_pdp_norm_key(p) for p in text.split(",") if _pdp_norm_key(p)}
     sa, sb = _set(a), _set(b)
     if not sa or not sb:
         return 0.0
     return len(sa & sb) / len(sa | sb)
 
 
+def _pdp_collapse_shades(cands: List[str]) -> Optional[str]:
+    """Given >1 distinct full lists, return one ONLY when they are shade variants of
+    the SAME product; else None (never guess which product's list to attribute).
+
+    Three corroborating signals must ALL hold vs the longest (most complete) list —
+    a shared-base neighbor or a bundle component fails at least one:
+      * ingredient-set Jaccard >= _PDP_SHADE_SIM_MIN (near-identical formula);
+      * identical opening ingredient (same #1 by concentration);
+      * ingredient count within _PDP_SHADE_LEN_RATIO (a variant barely changes size).
+    Comparing every candidate to the longest ref (not just the top two) means one odd
+    list out of many still forces None."""
+    ref = max(cands, key=len)
+    ref_parts = _pdp_parts(ref)
+    if not ref_parts:
+        return None
+    ref_opener = _pdp_norm_key(ref_parts[0])
+    for cand in cands:
+        if cand is ref:
+            continue
+        parts = _pdp_parts(cand)
+        if not parts or _pdp_norm_key(parts[0]) != ref_opener:
+            return None
+        lo, hi = sorted((len(parts), len(ref_parts)))
+        if lo == 0 or hi > lo * _PDP_SHADE_LEN_RATIO:
+            return None
+        if _pdp_inci_similarity(ref, cand) < _PDP_SHADE_SIM_MIN:
+            return None
+    return ref
+
+
 def inci_from_pdp_html(page_html: Optional[str]) -> Optional[str]:
     """Deterministic INCI extraction from a RENDERED brand PDP.
 
-    Scans the visible block text (accordion/modal/rich-text div — with <br> both as
-    a line break and, in a second pass, joined so a <br>-wrapped list is reassembled)
-    AND the JSON data island (metafield rendered as a JSON string). A segment is a
-    candidate when it clears the strong INCI-list gate (`_looks_like_inci_list` — the
-    same reseller-tier safety net the crawled-INCI lane relies on) AND reads as a
-    FULL list (`_pdp_is_full_inci`: solvent opener, or a long list that contains
-    water and opens with a real ingredient). Then, so we never guess or fabricate:
+    Scans the visible block text (accordion/modal/rich-text div) and the JSON data
+    island (metafield rendered as a JSON string) for FULL ingredient lists. A segment
+    is a candidate when it clears the strong INCI-list gate (`_looks_like_inci_list` —
+    the reseller-tier safety net) AND reads as a FULL list (`_pdp_is_full_inci`) AND
+    is a SINGLE list (exactly one solvent opener; two = two products concatenated).
+    Then, so we never guess or fabricate:
 
       * exactly one distinct full INCI -> return it;
-      * several full INCIs that are shade variants of ONE product (near-identical
-        ingredient sets) -> return the longest (one real, complete list);
-      * several genuinely different full INCIs (a bundle, or a neighbor/related-
-        product's list) -> None (ambiguous — never attribute another product's list);
+      * several that are shade variants of ONE product -> the longest (via
+        `_pdp_collapse_shades`; near-identical set + opener + length);
+      * several genuinely different lists (a bundle, or a neighbor/related-product's
+        list in a recommendations island) -> None (never attribute another's list);
       * none -> None.
+
+    The <br> handling is deliberately two-tier for precision. The DEFAULT visible pass
+    breaks on <br>, so two products separated by a bare <br> in one block become two
+    SEPARATE candidates (their ambiguity is then visible). A SECOND join-<br> pass
+    reassembles a single list a theme wrapped across many <br> — but it may only
+    REPAIR: a join candidate is adopted only when it strictly contains exactly ONE
+    trusted (default/JSON) candidate (the <br>-shredded fragment made whole). A join
+    candidate that spans TWO trusted candidates is a concatenation, not a repair, and
+    is discarded — so join-<br> can never fabricate a franken list the strict passes
+    didn't already see as separate.
 
     Whatever it returns is re-validated by
     `canonical_inci_intake.ingest_canonical_inci` before any write."""
     if not page_html:
         return None
     page_html = str(page_html)
-    # Normalized-key dedup: the same list rendered on two surfaces (visible <p> and
-    # a JSON island, or mobile+desktop DOM, or both <br> modes) must collapse to one
-    # candidate, not read as an ambiguous pair. Keep the longest raw string per key.
-    by_key: Dict[str, str] = {}
-    segments = (
+
+    def _collect(segments) -> Dict[str, str]:
+        out: Dict[str, str] = {}
+        for seg in segments:
+            cand = _PDP_INCI_LABEL_RE.sub("", seg).strip().rstrip(". ").strip()
+            if not _looks_like_inci_list(cand):
+                continue
+            if not _pdp_is_full_inci(cand):
+                continue
+            if _pdp_solvent_opener_count(cand) >= 2:
+                continue  # two lists concatenated into one string -> not a single INCI
+            key = _pdp_norm_key(cand)
+            if key and (key not in out or len(cand) > len(out[key])):
+                out[key] = cand
+        return out
+
+    # Trusted candidates come from REAL block/JSON boundaries.
+    base = _collect((
         *_pdp_visible_segments(page_html),
-        *_pdp_visible_segments(page_html, join_br=True),
         *_pdp_json_island_segments(page_html),
-    )
-    for seg in segments:
-        cand = _PDP_INCI_LABEL_RE.sub("", seg).strip().rstrip(". ").strip()
-        if not _looks_like_inci_list(cand):
+    ))
+    # Reassembly candidates come from collapsing <br> to a space within a block.
+    joined = _collect(_pdp_visible_segments(page_html, join_br=True))
+
+    pool: Dict[str, str] = dict(base)
+    for jkey, jcand in joined.items():
+        contained = [bkey for bkey in base if bkey != jkey and bkey in jkey]
+        if len(contained) >= 2:
+            # The reassembled string strictly contains TWO OR MORE distinct trusted
+            # lists -> it concatenated separate products (a kit/routine block), not a
+            # single <br>-wrapped list. Discard it and keep the trusted lists apart so
+            # the ambiguity check sees them. (Aqueous+aqueous concatenations are
+            # already rejected upstream by the two-solvent-opener guard; this also
+            # catches a concatenation whose second list is anhydrous.)
             continue
-        if not _pdp_is_full_inci(cand):
-            continue
-        key = re.sub(r"[^a-z0-9]", "", cand.lower())
-        if key and (key not in by_key or len(cand) > len(by_key[key])):
-            by_key[key] = cand
-    if not by_key:
+        # 0 or 1 trusted fragment inside: a single list the theme wrapped across <br>.
+        # Adopt the reassembled whole; drop the lone shredded fragment if base saw one.
+        for bkey in contained:
+            pool.pop(bkey, None)
+        pool[jkey] = jcand
+
+    if not pool:
         return None
-    # Drop fragments: a candidate whose normalized key is a proper substring of
-    # another's is the SAME list, partial — the <br>-broken sublist that the
-    # join-<br> pass also reassembled whole. Keep the superset only.
-    keys = list(by_key)
+    # Same-list cleanup among trusted candidates: drop a candidate that is a contiguous
+    # substring of another (e.g. a JSON-island whole vs a visible partial of the SAME
+    # list). Concatenations were already rejected above, so a substring here is a
+    # genuine partial of one list, never a distinct product.
+    keys = list(pool)
     survivors = [
         cand
-        for key, cand in by_key.items()
+        for key, cand in pool.items()
         if not any(other != key and key in other for other in keys)
     ]
     if len(survivors) == 1:
         return survivors[0]
-    # Multiple distinct full lists. Shade variants of one product have near-identical
-    # ingredient sets -> collapse to the longest (a real, complete list). If any
-    # candidate is largely disjoint from the longest it is a different product (a
-    # bundle component / a neighbor list) -> ambiguous, so None (never guess).
-    ref = max(survivors, key=len)
-    if all(_pdp_inci_similarity(ref, cand) >= _PDP_SHADE_SIM_MIN for cand in survivors):
-        return ref
-    return None  # >1 genuinely different lists = ambiguous (which product's?)
+    return _pdp_collapse_shades(survivors)
 
 
 async def fetch_pdp_inci(

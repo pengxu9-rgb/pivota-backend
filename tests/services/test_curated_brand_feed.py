@@ -326,6 +326,90 @@ def test_pdp_neighbor_product_list_not_attributed():
     assert inci_from_pdp_html(html) is None
 
 
+# --- Adversarial precision guards (the recall recovery must NOT fabricate) ------
+# A large shared aqueous base makes two GENUINELY DIFFERENT same-line K-beauty
+# products (a Centella toner vs a Vitamin C serum) measure ingredient-set Jaccard
+# ~0.73 — far above the 0.7 the first cut of this fix collapsed on. They must stay
+# ambiguous. Base is 15 ingredients; each product adds 3 distinct actives.
+_SHARED_BASE_15 = (
+    "Water, Glycerin, Butylene Glycol, 1,2-Hexanediol, Niacinamide, Panthenol, "
+    "Sodium Hyaluronate, Betaine, Allantoin, Carbomer, Tromethamine, Phenoxyethanol, "
+    "Ethylhexylglycerin, Disodium EDTA, Xanthan Gum"
+)
+_CENTELLA_TONER = _SHARED_BASE_15 + ", Centella Asiatica Extract, Madecassoside, Asiaticoside"
+_VITC_SERUM = _SHARED_BASE_15 + ", Ascorbic Acid, Ferulic Acid, Sodium Ascorbyl Phosphate"
+
+
+def test_pdp_high_overlap_different_products_stay_none():
+    # PRECISION GUARD (Blocker 1): two DIFFERENT products sharing a big aqueous base
+    # (Jaccard ~0.73, same solvent opener, equal length) must NOT collapse — a 0.7
+    # floor mis-attributed one to the other. The raised 0.85 floor keeps them apart.
+    from services.curated_brand_feed import _pdp_inci_similarity
+    assert 0.70 <= _pdp_inci_similarity(_CENTELLA_TONER, _VITC_SERUM) <= 0.75
+    html = (
+        "<html><body>"
+        "<div class='a'><p>" + _CENTELLA_TONER + "</p></div>"
+        "<div class='b'><p>" + _VITC_SERUM + "</p></div>"
+        "</body></html>"
+    )
+    assert inci_from_pdp_html(html) is None
+
+
+def test_pdp_neighbor_in_recommendations_island_at_high_overlap_stays_none():
+    # PRECISION GUARD (Blocker 1, island path): the page's own list plus a NEIGHBOR's
+    # LONGER list in a product-recommendations JSON island, at ~0.73 overlap. Picking
+    # the longest would PUBLISH the neighbor's Ascorbic/Ferulic Acid for this page —
+    # must stay None.
+    html = (
+        "<html><body>"
+        "<div class='product-main'><p>" + _CENTELLA_TONER + "</p></div>"
+        "<div class='recommendations'><script type='application/json'>"
+        '{"rec":{"handle":"vitamin-c-serum","ingredients":{"type":"text","value":"'
+        + _VITC_SERUM + '"}}}'
+        "</script></div>"
+        "</body></html>"
+    )
+    assert inci_from_pdp_html(html) is None
+
+
+def test_pdp_br_adjacent_two_products_no_franken():
+    # PRECISION GUARD (Blocker 2): two products' lists sit in ONE block-level element
+    # separated by a bare <br> (a kit/routine metafield). The join-<br> pass would
+    # concatenate them into one franken list (opens with A's Water, also carries B's
+    # Mica/Iron Oxides); the two-solvent-opener guard rejects that, and the default
+    # pass sees the two lists separately -> ambiguous -> None. No franken is published.
+    list_a = (
+        "Water, Glycerin, Niacinamide, Butylene Glycol, 1,2-Hexanediol, Panthenol, "
+        "Adenosine, Sodium Hyaluronate, Carbomer, Phenoxyethanol, Tocopherol, Disodium EDTA"
+    )
+    list_b = (
+        "Water, Dimethicone, Mica, Titanium Dioxide, Iron Oxides, Talc, Zinc Stearate, "
+        "Caprylyl Glycol, Phenoxyethanol, Ethylhexylglycerin, Silica, Boron Nitride"
+    )
+    html = "<html><body><div class='kit-meta'>" + list_a + "<br>" + list_b + "</div></body></html>"
+    assert inci_from_pdp_html(html) is None
+
+
+def test_pdp_two_solvent_openers_rejected():
+    # A single string carrying TWO water-opener runs is two lists concatenated (never
+    # a real INCI, which has exactly one solvent entry) -> None even as a lone block.
+    two = (
+        "Water, Glycerin, Niacinamide, Panthenol, Adenosine, Carbomer, Phenoxyethanol, "
+        "Water, Dimethicone, Mica, Iron Oxides, Talc, Silica, Ethylhexylglycerin"
+    )
+    html = "<html><body><p>" + two + "</p></body></html>"
+    assert inci_from_pdp_html(html) is None
+
+
+def test_pdp_shade_variant_captured_alongside_guards():
+    # Sanity: the shade-collapse the guards are tightening must still FIRE for real
+    # variants — near-identical set, same opener, near-identical length -> the longest.
+    shade_a = _ALLCAPS_INCI + ", IRON OXIDES (CI 77492)"
+    shade_b = _ALLCAPS_INCI + ", IRON OXIDES (CI 77491), MICA"
+    html = "<html><body><div><p>" + shade_a + "</p></div><div><p>" + shade_b + "</p></div></body></html>"
+    assert inci_from_pdp_html(html) == shade_b
+
+
 # --- records_for_brand PDP-INCI enrichment (ingest capture; no live network) ---
 
 def _shopify_product(handle="snail-essence", *, body_html="<p>Hydrating essence.</p>"):
