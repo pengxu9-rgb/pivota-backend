@@ -226,6 +226,10 @@ def _product_sql(window_key: str) -> str:
         FROM commerce_attribution_edges cae
         LEFT JOIN orders o ON o.order_id = cae.order_id
         WHERE cae.canonical_product_id IS NOT NULL
+          -- Exclude fallback-INFERRED edges (#1481): token-less recoveries are
+          -- recorded for coverage but EXCLUDED from the product outcome signal, same
+          -- as the seller_mismatch gate. NULL-safe (real edges lack the key).
+          AND (cae.metadata->>'inferred')::boolean IS NOT TRUE
           {_window_expr_clause(window_key, 'COALESCE(o.created_at, cae.converted_at, cae.created_at)')}
         GROUP BY cae.canonical_product_id
         HAVING count(*) FILTER (WHERE {_PROD_TRANSACTED_PREDICATE}) > 0

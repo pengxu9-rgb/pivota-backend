@@ -649,6 +649,8 @@ async def _gmv_attribution_for_month(
           AND created_at >= :period_start
           AND created_at < :period_end
           AND net_attributed_gmv_cents > 0
+          -- Exclude fallback-INFERRED edges (#1481): recorded for coverage, not billed.
+          AND (metadata->>'inferred')::boolean IS NOT TRUE
         """,
         {
             "merchant_id": merchant_id,

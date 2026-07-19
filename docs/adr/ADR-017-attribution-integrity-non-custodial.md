@@ -83,7 +83,7 @@ Decisive factor: **for a non-custodial Pivota, attribution is an information-int
 *(tracked as issues; the two that gate any real non-custodial attribution are under the Pilot milestone)*
 1. [ ] **AP2/x402 attribution parity** — carry `pvt_*`, set `order_id`, write the edge on `confirm`. *(Pilot; dovetails ADR-016's AP2 re-scope)*
 2. [ ] **Enable + broaden the existing closure** — flip `EXTERNAL_CONVERSION_POLLER_ENABLED` (the Woo/read-orders pollers are already scheduler-wired); add a `referral_only` join key. *(Pilot)*
-3. [ ] **Fallback join + observability** — `agent_id`+product+window fallback; silent-reject/drop-rate metrics; read/decision event on plain PDP + search.
+3. [~] **Fallback join + observability** (#1481) — DONE: a token-less fallback join (`agent_id` + merchant + bounded window) recovers a dropped order as an **inferred** edge — recorded for coverage but **not billed** (flagged `metadata.inferred`, EXCLUDED from partner rev-share / monthly statements / product-outcome, mirroring the `seller_mismatch` gate; decision: record-but-don't-bill, since inferred attribution isn't token-proven). A `commerce_attribution_inferred_recovered_total` counter alongside the existing silent-reject counter makes coverage a known number (matched / inferred / dropped). **Deferred:** the read/decision event on plain PDP + `agent_api` search (would populate fallback data for never-clicked-through flows).
 4. [ ] **Conversion-report / receipt-ingest API** — verified endpoint, `pvt_click_id`/signed-receipt join, reconciliation. *(the primary non-custodial closure — highest leverage; scope for the pilot cohort next)*
 5. [ ] **Founder sign-off**; move to Accepted; define attribution/referral pricing on the resulting (measured) coverage.
 
