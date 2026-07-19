@@ -402,10 +402,14 @@ def _vendor_is_merchant(vendor: Any, merchant_own_aliases: frozenset) -> bool:
     return bool(frozenset(derive_brand_aliases(str(vendor))) & merchant_own_aliases)
 
 
+OPERATING_MODE_STORE_LESS = "store_less"
+
+
 def _audit_merchant_vendors(
     merchant_name: Optional[str],
     merchant_host: Optional[str],
     product_vendors: List[Any],
+    operating_mode: Optional[str] = None,
 ) -> Tuple[Tuple[str, ...], bool]:
     """Retailer-aware merchant identity (R1). Fold a product's vendor into the
     merchant's identity ONLY when that vendor IS the merchant (a D2C brand selling
@@ -416,6 +420,14 @@ def _audit_merchant_vendors(
 
     Returns (identity_tuple, is_reseller). is_reseller = the merchant carries ≥1
     product whose brand isn't the merchant — derived from the catalog (no schema).
+
+    `operating_mode` is the durable account-level signal from
+    merchant_onboarding: a `store_less` signup IS a brand by definition (it has no
+    retail storefront), so it is NEVER classified as a reseller regardless of its
+    catalog vendor mix. Without this, a store-less brand whose demo catalog carries
+    foreign-looking vendor names re-derived as `reseller` on every fresh audit
+    (there was no account-level field to anchor it). `storefront` / None leave the
+    catalog-derived behavior byte-identical.
     """
     merchant_own = frozenset(derive_brand_aliases(merchant_name, merchant_host))
     folded: List[Any] = [merchant_name]
@@ -427,6 +439,9 @@ def _audit_merchant_vendors(
             folded.append(v)
         else:
             saw_foreign_brand = True
+    if str(operating_mode or "").strip().lower() == OPERATING_MODE_STORE_LESS:
+        # A store-less account is a brand by definition — never a reseller.
+        saw_foreign_brand = False
     return _merchant_identity_tuple(*folded), saw_foreign_brand
 
 
@@ -12893,10 +12908,25 @@ async def run_brand_report(
         _merchant_host = normalize_host(merchant_domain or "") or (
             (merchant_domain or "").strip() or None
         )
+        # Durable account-level brand signal: a store_less signup IS a brand (no
+        # retail storefront), so it must never re-derive as reseller from its
+        # catalog vendor mix on every audit. Best-effort — a lookup failure leaves
+        # the catalog-derived classification unchanged (byte-identical to before).
+        _operating_mode: Optional[str] = None
+        if merchant_id:
+            try:
+                from db.merchant_onboarding import get_merchant_onboarding
+
+                _onboarding = await get_merchant_onboarding(str(merchant_id))
+                if isinstance(_onboarding, dict):
+                    _operating_mode = _onboarding.get("operating_mode")
+            except Exception:  # noqa: BLE001
+                logger.warning("operating_mode load failed", exc_info=True)
         _merchant_vendors, _merchant_is_reseller = _audit_merchant_vendors(
             merchant_name,
             _merchant_host,
             [p.get("vendor") for p in products if isinstance(p, dict)],
+            operating_mode=_operating_mode,
         )
         # R2 signal: carry the derived merchant type so the report can frame
         # findability/endorsement honestly for a reseller (the brands it carries
