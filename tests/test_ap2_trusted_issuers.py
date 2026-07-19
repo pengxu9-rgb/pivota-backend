@@ -125,6 +125,32 @@ async def test_get_trusted_issuers_unions_global_and_per_agent(monkeypatch):
     assert await reg.get_trusted_issuers("agent_1") == {"did:key:zAgentOwn", "did:web:openai.com"}
 
 
+async def test_get_trusted_issuers_excludes_revoked_via_status_filter(monkeypatch):
+    # The union query filters status='active', so a revoked row (per-agent OR
+    # global) never reaches the returned set. Emulate the DB applying that filter:
+    # the fake returns only active rows, and we assert the query carries the filter.
+    async def fake_fetch_all(query, values=None):
+        assert "status = 'active'" in query  # revoked rows are excluded at the DB
+        return []  # both the agent's row and the global row are revoked → nothing active
+
+    from db.database import database
+    monkeypatch.setattr(database, "fetch_all", fake_fetch_all)
+
+    # Empty active set → deny-by-default even though a (revoked) global row exists.
+    assert await reg.get_trusted_issuers("agent_1") == set()
+
+
+async def test_get_trusted_issuers_denies_when_no_active_rows(monkeypatch):
+    # Non-empty agent_id but zero matching active rows → empty set (fail closed).
+    async def fake_fetch_all(query, values=None):
+        return []
+
+    from db.database import database
+    monkeypatch.setattr(database, "fetch_all", fake_fetch_all)
+
+    assert await reg.get_trusted_issuers("agent_real") == set()
+
+
 async def test_list_trusted_issuers_labels_scope(monkeypatch):
     async def fake_fetch_all(query, values=None):
         return [

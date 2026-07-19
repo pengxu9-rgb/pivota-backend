@@ -48,7 +48,9 @@ async def enroll_trusted_issuer(
     from db.ap2_trusted_issuers import add_global_trusted_issuer, add_trusted_issuer
 
     issuer_did = str((body or {}).get("issuer_did") or "").strip()
-    scope = str((body or {}).get("scope") or "global").strip().lower()
+    # scope is REQUIRED (no default): a scope-less request must not silently grant
+    # the broadest trust. 'global' is fleet-wide; 'agent' is a single binding.
+    scope = str((body or {}).get("scope") or "").strip().lower()
     agent_id = str((body or {}).get("agent_id") or "").strip()
 
     if not issuer_did or not is_did(issuer_did):
@@ -56,7 +58,7 @@ async def enroll_trusted_issuer(
                             detail="issuer_did must be a DID (did:key:… / did:web:…)")
     if scope not in _SCOPES:
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST,
-                            detail="scope must be 'global' or 'agent'")
+                            detail="scope is required and must be 'global' or 'agent'")
     if scope == "agent" and not agent_id:
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST,
                             detail="scope='agent' requires agent_id")
@@ -80,6 +82,16 @@ async def enroll_trusted_issuer(
             raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=f"No such agent: {agent_id}")
         await add_trusted_issuer(agent_id, issuer_did, metadata={"enrolled_by": admin_id})
     else:
+        # A did:key's proof-of-control is vacuous (self-certifying — anyone can mint
+        # one), so trusting a bare did:key FLEET-WIDE trusts whoever holds that key
+        # to vouch for EVERY agent. Prefer did:web (domain-anchored) for a global
+        # issuer; log loudly so the audit trail flags it.
+        if issuer_did.startswith("did:key:"):
+            logger.warning(
+                "ap2 trusted-issuer GLOBAL enrollment of a bare did:key issuer=%s by_admin=%s "
+                "— did:key proof-of-control is vacuous; a did:web issuer is preferred for a "
+                "fleet-wide trust grant", issuer_did, admin_id,
+            )
         await add_global_trusted_issuer(issuer_did, metadata={"enrolled_by": admin_id})
 
     logger.info(
@@ -101,13 +113,14 @@ async def revoke_trusted_issuer_route(
     from db.ap2_trusted_issuers import revoke_global_trusted_issuer, revoke_trusted_issuer
 
     issuer_did = str((body or {}).get("issuer_did") or "").strip()
-    scope = str((body or {}).get("scope") or "global").strip().lower()
+    scope = str((body or {}).get("scope") or "").strip().lower()  # required (no default)
     agent_id = str((body or {}).get("agent_id") or "").strip()
 
     if not issuer_did:
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Missing issuer_did")
     if scope not in _SCOPES:
-        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="scope must be 'global' or 'agent'")
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST,
+                            detail="scope is required and must be 'global' or 'agent'")
     if scope == "agent" and not agent_id:
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="scope='agent' requires agent_id")
 

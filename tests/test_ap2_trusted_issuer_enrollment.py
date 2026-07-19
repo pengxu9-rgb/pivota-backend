@@ -92,10 +92,12 @@ def test_enroll_global_issuer(stubs):
     assert stubs.adds == [("global", None, _DID_WEB)]
 
 
-def test_enroll_defaults_to_global(stubs):
+def test_enroll_requires_explicit_scope_400(stubs):
+    # A scope-less request must NOT silently grant the broadest (global) trust.
     res = _client().post("/admin/ap2/trusted-issuers", json={"issuer_did": _DID_KEY})
-    assert res.status_code == 200, res.text
-    assert stubs.adds == [("global", None, _DID_KEY)]
+    assert res.status_code == 400
+    assert "scope is required" in res.json()["detail"]
+    assert stubs.adds == []
 
 
 def test_enroll_agent_scoped(stubs):
@@ -109,7 +111,7 @@ def test_enroll_agent_scoped(stubs):
 
 def test_enroll_rejects_unresolvable_did_400(stubs):
     stubs.resolvable = False  # proof-of-control fails
-    res = _client().post("/admin/ap2/trusted-issuers", json={"issuer_did": _DID_WEB})
+    res = _client().post("/admin/ap2/trusted-issuers", json={"issuer_did": _DID_WEB, "scope": "global"})
     assert res.status_code == 400
     assert "proof-of-control" in res.json()["detail"]
     assert stubs.adds == [], "an unresolvable issuer must never be trusted"
