@@ -489,8 +489,11 @@ def test_per_sku_prompts_include_unbranded_multivitamin_discovery():
     assert "multivitamin for women" in queries
     assert "iron-free multivitamin" in queries
     assert "vegan multivitamin" in queries
-    # 2 navigational + 3 trust prompts name the brand/identity (Step 1 added the trust axis).
-    assert sum("Ritual" in query for query in queries) == 5
+    # Brand-naming (branded) prompts are now CAPPED at a minority share of the
+    # 14-prompt budget (#1521: default 30% cap = 4, floor 2). Was 5 (2 nav + 3
+    # trust) before the rebalance; the surplus trust prompt is dropped in favour
+    # of unbranded discovery. This is the deliberate mix change.
+    assert sum("Ritual" in query for query in queries) == 4
 
 
 @pytest.mark.asyncio

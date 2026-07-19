@@ -38,7 +38,7 @@ from urllib.parse import urlparse
 from services import agent_center_llm_client as llm_client
 from services.audit_delta import build_reaudit_delta, measurement_basis_between
 from services.outreach_outcomes import build_outreach_outcomes
-from services.prompt_basis import basis_meta_from_probe_runs
+from services.prompt_basis import basis_meta_from_probe_runs, PROMPT_BASIS_VERSION
 from services.audit_facts import (
     QUERY_CLASS_BRANDED,
     QUERY_CLASS_CATEGORY,
@@ -8064,6 +8064,22 @@ def build_brand_rollup(
         # Step 2 — brand-level citation rate by fine intent axis (rolls up the
         # per-SKU citation_by_intent). Snapshot-only; additive.
         "citation_by_intent": _brand_citation_by_intent(per_sku_reports),
+        # #1521 — per-run prompt-mix telemetry (branded vs unbranded by axis) so a
+        # reviewer can confirm the ≤30%-branded target held this run.
+        "prompt_mix": _brand_prompt_mix(per_sku_reports),
+        # #1521 — score-semantics annotation. Score MATH is unchanged; this stamps
+        # the prompt-basis version + a note so a cross-version citation/visibility
+        # delta (branded share drops → cited rate drops mechanically) is read as a
+        # measurement-basis change, not a regression.
+        "prompt_mix_version": PROMPT_BASIS_VERSION,
+        "prompt_mix_note": (
+            "Prompt mix rebalanced (#1521): product/brand-naming (branded) prompts "
+            "are capped at a minority share so the audit measures unbranded "
+            "discovery demand, not just ~100% branded recall. Citation/visibility "
+            "scores are NOT directly comparable across a prompt_mix_version change "
+            "— a lower branded share mechanically lowers the cited rate. Compare "
+            "deltas only within the same prompt_mix_version."
+        ),
     }
 
 
@@ -9762,6 +9778,170 @@ def _budgeted_wedge_query_records(
     )
 
 
+# --- Prompt-mix rebalance (#1521) -------------------------------------------
+# Real buyers overwhelmingly ask WITHOUT naming a target product. Branded prompts
+# (navigational/trust — "where can I buy {title}", "{title} reviews", "is {brand}
+# legit") are ~always cited (findability ≈ 100%), so a branded-heavy set
+# over-measures recall and under-measures the unbranded discovery demand that
+# actually decides AI visibility. We CAP branded prompts at a minority SHARE of
+# the per-SKU budget and give the remainder to unbranded discovery/category/
+# problem/sidewalk shapes. A branded FLOOR preserves a minimal identity/trust
+# baseline. Both are config knobs (env-overridable) so the ratio isn't hardcoded.
+_BRANDED_PROMPT_CAP_DEFAULT = 0.3
+_BRANDED_PROMPT_FLOOR_DEFAULT = 2
+_BRANDED_PROMPT_CAP_ENV = "AGENT_AUDIT_BRANDED_PROMPT_CAP"
+_BRANDED_PROMPT_FLOOR_ENV = "AGENT_AUDIT_BRANDED_PROMPT_FLOOR"
+
+
+def _branded_prompt_cap_share() -> float:
+    """Max branded SHARE of the per-SKU budget (default 0.3). Env-overridable via
+    AGENT_AUDIT_BRANDED_PROMPT_CAP; a malformed/out-of-range value falls back to
+    the default and is clamped to [0, 1] so a bad env can't invert the intent."""
+    import os
+
+    raw = os.getenv(_BRANDED_PROMPT_CAP_ENV)
+    if raw is None or not str(raw).strip():
+        return _BRANDED_PROMPT_CAP_DEFAULT
+    try:
+        val = float(raw)
+    except (TypeError, ValueError):
+        return _BRANDED_PROMPT_CAP_DEFAULT
+    return min(1.0, max(0.0, val))
+
+
+def _branded_prompt_floor() -> int:
+    """Min branded prompts kept for the identity/trust baseline (default 2).
+    Env-overridable via AGENT_AUDIT_BRANDED_PROMPT_FLOOR."""
+    import os
+
+    raw = os.getenv(_BRANDED_PROMPT_FLOOR_ENV)
+    if raw is None or not str(raw).strip():
+        return _BRANDED_PROMPT_FLOOR_DEFAULT
+    try:
+        return max(0, int(raw))
+    except (TypeError, ValueError):
+        return _BRANDED_PROMPT_FLOOR_DEFAULT
+
+
+def _is_branded_record(record: Mapping[str, Any]) -> bool:
+    """True when a prompt NAMES the product/brand (navigational or trust intent) —
+    the findability-recall lane the audit over-weighted before #1521. Reuses the
+    canonical `_intent_axis_for` classifier so it stays in lockstep with scoring."""
+    intent = _intent_axis_for(
+        record.get("normalized_query") or record.get("query"), record.get("axis")
+    )
+    return intent in _BRANDED_INTENTS
+
+
+def _branded_prompt_budget(target: int) -> int:
+    """Max branded prompts for a `target`-prompt SKU budget: a capped SHARE
+    (default 30%) but never below the identity/trust FLOOR (default 2) and never
+    above the whole budget. #1521."""
+    target = max(0, int(target or 0))
+    if target <= 0:
+        return 0
+    cap = int(target * _branded_prompt_cap_share())
+    floor = min(_branded_prompt_floor(), target)
+    return min(target, max(floor, cap))
+
+
+def _enforce_prompt_mix(
+    records: List[Dict[str, Any]],
+    *,
+    target: int,
+    unbranded_backfill: List[Dict[str, Any]],
+) -> List[Dict[str, Any]]:
+    """Cap branded prompts at `_branded_prompt_budget` and backfill the freed
+    slots with UNBRANDED discovery prompts. Order-preserving: keeps the FIRST
+    branded records (the navigational+trust baseline the spine emits first) and
+    drops the surplus, so the identity/trust floor is always the retained set.
+    #1521."""
+    branded_budget = _branded_prompt_budget(target)
+    kept: List[Dict[str, Any]] = []
+    dropped_branded: List[Dict[str, Any]] = []
+    branded_kept = 0
+    for record in records:
+        if _is_branded_record(record):
+            if branded_kept >= branded_budget:
+                dropped_branded.append(record)  # surplus — try to replace below
+                continue
+            branded_kept += 1
+        kept.append(record)
+    # Prefer UNBRANDED discovery prompts for the freed slots.
+    if len(kept) < target and unbranded_backfill:
+        unbranded_only = [
+            record for record in unbranded_backfill if not _is_branded_record(record)
+        ]
+        _append_records(kept, unbranded_only, limit=target)
+    # Last resort: if unbranded demand is exhausted, RESTORE surplus branded rather
+    # than SHRINK the probe set — a genuinely branded-only thin SKU keeps its
+    # coverage. The cap only bites when there is unbranded demand to measure
+    # instead, which is exactly the case #1521 targets.
+    if len(kept) < target and dropped_branded:
+        _append_records(kept, dropped_branded, limit=target)
+    return kept[:target]
+
+
+def _prompt_mix_summary(records: List[Dict[str, Any]]) -> Dict[str, Any]:
+    """Branded vs unbranded counts by intent axis for a single SKU's probe set.
+    Rolled up per run into `brand_rollup.prompt_mix` (#1521)."""
+    by_axis: Dict[str, int] = {}
+    branded = 0
+    unbranded = 0
+    for record in records or []:
+        if not isinstance(record, Mapping):
+            continue
+        intent = _intent_axis_for(
+            record.get("normalized_query") or record.get("query"),
+            record.get("axis"),
+        )
+        by_axis[intent] = by_axis.get(intent, 0) + 1
+        if intent in _BRANDED_INTENTS:
+            branded += 1
+        else:
+            unbranded += 1
+    total = branded + unbranded
+    return {
+        "branded": branded,
+        "unbranded": unbranded,
+        "total": total,
+        "branded_share": round(branded / total, 3) if total else 0.0,
+        "unbranded_share": round(unbranded / total, 3) if total else 0.0,
+        "by_axis": by_axis,
+    }
+
+
+def _brand_prompt_mix(per_sku_reports: List[Dict[str, Any]]) -> Dict[str, Any]:
+    """Per-RUN prompt-mix telemetry (#1521): how the probe budget split across
+    branded (navigational/trust — name the product) vs unbranded (discovery /
+    category / problem / constraint) intents, by axis. Rolls up the per-SKU
+    `citation_by_intent` totals — no new probes. Lets a reviewer confirm the
+    ≤30%-branded target and makes cross-version score deltas interpretable."""
+    by_intent = _brand_citation_by_intent(per_sku_reports)
+    by_axis: Dict[str, int] = {}
+    branded = 0
+    unbranded = 0
+    for intent, stats in by_intent.items():
+        total = int((stats or {}).get("total") or 0)
+        by_axis[intent] = total
+        if intent in _BRANDED_INTENTS:
+            branded += total
+        else:
+            unbranded += total
+    grand = branded + unbranded
+    return {
+        "branded": branded,
+        "unbranded": unbranded,
+        "total": grand,
+        "branded_share": round(branded / grand, 3) if grand else 0.0,
+        "unbranded_share": round(unbranded / grand, 3) if grand else 0.0,
+        "by_axis": by_axis,
+        "branded_axes": sorted(_BRANDED_INTENTS),
+        "cap_share": _branded_prompt_cap_share(),
+        "floor": _branded_prompt_floor(),
+    }
+
+
 def _build_per_sku_audit_query_records(
     sku_ctx: Dict[str, Any],
     prompts_per_sku: int,
@@ -9830,6 +10010,20 @@ def _build_per_sku_audit_query_records(
             filler_pool=filler_pool,
             priority_queries=llm_prompt_queries,
         )
+    # #1521: cap branded (product/brand-naming) prompts at a minority share of the
+    # budget and backfill the freed slots with unbranded discovery prompts. The
+    # budgeter/filler above compose the set for lane coverage; this is the final
+    # mix gate so a branded-heavy base can't dominate. Unbranded backfill pool =
+    # non-branded base prompts + the full sidewalk long-tail + category filler.
+    records = _enforce_prompt_mix(
+        records,
+        target=target,
+        unbranded_backfill=(
+            [record for record in base_records if not _is_branded_record(record)]
+            + list(sidewalk_records)
+            + list(filler_pool or [])
+        ),
+    )
     # Stamp LLM-generated discovery prompts so per-model prompt quality is
     # comparable across runs (records keep their coarse "category" axis; the
     # source key is additive observability, mirroring "sidewalk_candidate").
