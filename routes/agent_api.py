@@ -4651,6 +4651,21 @@ def variant_in_stock(variant: Dict[str, Any]) -> Optional[bool]:
         return None
 
 
+def _require_valid_acp_service_token() -> str:
+    """Load + validate the ACP service-to-service token (#1296). Missing → 500; a
+    placeholder / weak token (e.g. an unexpanded ``$TOK``) → 500 loudly instead of
+    silently authenticating. Returns the validated token."""
+    from utils.service_token import validate_service_token
+    token = str(os.getenv("ACP_SERVICE_TOKEN") or os.getenv("ACP_API_KEY") or "").strip()
+    if not token:
+        raise HTTPException(status_code=500, detail="Missing ACP_SERVICE_TOKEN")
+    try:
+        validate_service_token(token, label="ACP_SERVICE_TOKEN")
+    except ValueError as e:
+        raise HTTPException(status_code=500, detail=f"ACP_SERVICE_TOKEN misconfigured: {e}")
+    return token
+
+
 @router.post("/checkout/acp-session")
 async def agent_create_acp_checkout_session(
     payload: Dict[str, Any],
@@ -4685,15 +4700,7 @@ async def agent_create_acp_checkout_session(
 
     acp_url = str(os.getenv("ACP_URL") or "https://pivota-acp-production.up.railway.app").rstrip("/")
     api_version = str(os.getenv("ACP_API_VERSION") or "2025-09-29").strip()
-    service_token = str(os.getenv("ACP_SERVICE_TOKEN") or os.getenv("ACP_API_KEY") or "").strip()
-    if not service_token:
-        raise HTTPException(status_code=500, detail="Missing ACP_SERVICE_TOKEN")
-    # Fail loud on a placeholder/weak token (#1296) instead of silently authenticating.
-    try:
-        from utils.service_token import validate_service_token
-        validate_service_token(service_token, label="ACP_SERVICE_TOKEN")
-    except ValueError as e:
-        raise HTTPException(status_code=500, detail=f"ACP_SERVICE_TOKEN misconfigured: {e}")
+    service_token = _require_valid_acp_service_token()  # #1296: missing/placeholder → loud 500
 
     # Normalize items into ACP schema: {id, quantity}
     acp_items = []

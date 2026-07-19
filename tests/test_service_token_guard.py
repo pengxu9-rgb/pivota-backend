@@ -6,7 +6,6 @@ shell var); because they matched, auth silently "worked". These tests pin the gu
 that now rejects that class — an unexpanded shell var, or a weak token in prod —
 at the point the token is used, in both the sender and the receiver.
 """
-import inspect
 import sys
 from pathlib import Path
 from types import SimpleNamespace
@@ -76,10 +75,43 @@ def test_sender_returns_valid_token(monkeypatch):
     assert mod._resolve_acp_bearer_token() == _STRONG
 
 
-# --- receiver wiring (routes/agent_api ACP handler) ---------------------------
+# --- receiver (routes/agent_api._require_valid_acp_service_token) -------------
 
-def test_receiver_wires_the_guard():
-    import routes.agent_api as m
-    src = inspect.getsource(m)
-    assert 'validate_service_token(service_token, label="ACP_SERVICE_TOKEN")' in src, \
-        "the ACP receiver must validate its service token"
+def test_receiver_missing_token_500(monkeypatch):
+    monkeypatch.delenv("ACP_SERVICE_TOKEN", raising=False)
+    monkeypatch.delenv("ACP_API_KEY", raising=False)
+    from routes.agent_api import _require_valid_acp_service_token
+    with pytest.raises(HTTPException) as ei:
+        _require_valid_acp_service_token()
+    assert ei.value.status_code == 500 and "Missing" in str(ei.value.detail)
+
+
+def test_receiver_rejects_placeholder_token_500(monkeypatch):
+    monkeypatch.setenv("ACP_SERVICE_TOKEN", "$TOK")
+    from routes.agent_api import _require_valid_acp_service_token
+    with pytest.raises(HTTPException) as ei:
+        _require_valid_acp_service_token()
+    assert ei.value.status_code == 500 and "misconfigured" in str(ei.value.detail)
+
+
+def test_receiver_returns_valid_token(monkeypatch):
+    monkeypatch.setenv("ACP_SERVICE_TOKEN", _STRONG)
+    from routes.agent_api import _require_valid_acp_service_token
+    assert _require_valid_acp_service_token() == _STRONG
+
+
+# --- third consumer: services/pivota_acp_client._resolve_bearer_token (#1499 review F1)
+
+def test_acp_client_rejects_placeholder_token(monkeypatch):
+    from services import pivota_acp_client as cli
+    monkeypatch.setattr(cli, "settings", SimpleNamespace(platform_orders_acp_token="$TOK"))
+    with pytest.raises(cli.AcpClientError) as ei:
+        cli._resolve_bearer_token()
+    assert ei.value.status_code == 503
+    assert "misconfigured" in ei.value.message
+
+
+def test_acp_client_returns_valid_token(monkeypatch):
+    from services import pivota_acp_client as cli
+    monkeypatch.setattr(cli, "settings", SimpleNamespace(platform_orders_acp_token=_STRONG))
+    assert cli._resolve_bearer_token() == _STRONG
