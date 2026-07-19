@@ -53,12 +53,15 @@ def test_premium_providers_registered_with_cost_rates():
     real cost_usd instead of NULL/$0 (regression: get_provider('chatgpt') was
     None, so chatgpt audit cost recorded as $0 even with real tokens)."""
     from services.llm_providers.provider_registry import get_provider
-    for pid, exp_in, exp_out in (("chatgpt", 0.005, 0.02), ("claude", 0.003, 0.015)):
+    # Expected per-1k rates are derived from config/provider_credit_rates.json
+    # (#1508): chatgpt gpt-5.5 = $5/$30 per 1M => 0.005/0.03; claude
+    # claude-sonnet-4 = $3/$15 per 1M => 0.003/0.015.
+    for pid, exp_in, exp_out in (("chatgpt", 0.005, 0.03), ("claude", 0.003, 0.015)):
         p = get_provider(pid)
         assert p is not None, f"{pid} must be registered for cost telemetry"
         rates = p.rate_for_model(None)
-        assert rates["input_per_1k"] == exp_in
-        assert rates["output_per_1k"] == exp_out
+        assert rates["input_per_1k"] == pytest.approx(exp_in)
+        assert rates["output_per_1k"] == pytest.approx(exp_out)
 
 
 def test_premium_providers_not_auto_selected():
@@ -206,8 +209,10 @@ def test_rate_for_model_deepseek_chat_uses_flash_rate():
     from services.llm_providers.provider_registry import get_provider
     deepseek = get_provider("deepseek")
     rates = deepseek.rate_for_model("deepseek-chat")
-    assert rates["input_per_1k"] == 0.00014
-    assert rates["output_per_1k"] == 0.00028
+    # Config-derived ($0.14/$0.28 per 1M => /1000); approx absorbs the float
+    # round-trip from the per-1M -> per-1k division (#1508).
+    assert rates["input_per_1k"] == pytest.approx(0.00014)
+    assert rates["output_per_1k"] == pytest.approx(0.00028)
 
 
 def test_rate_for_model_deepseek_reasoner_uses_pro_rate():
@@ -423,8 +428,9 @@ def test_estimate_strategy_cost_single_best():
         scan_mode="category_visibility_test",
         strategy=STRATEGY_SINGLE_BEST,
     )
-    # Gemini at default 500 in / 300 out tokens
-    expected = (0.5 * 0.00035) + (0.3 * 0.00105)
+    # Gemini at default 500 in / 300 out tokens, priced from config
+    # (gemini-2.5-flash: $0.30/$2.50 per 1M => 0.0003/0.0025 per 1k) — #1508.
+    expected = (0.5 * 0.0003) + (0.3 * 0.0025)
     assert abs(cost - expected) < 1e-9
 
 
