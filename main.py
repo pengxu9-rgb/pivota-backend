@@ -346,6 +346,7 @@ from routes.shopify_products_sync_api import router as shopify_products_sync_rou
 from routes.platform_products_sync_api import router as platform_products_sync_router
 from routes.outbound_links import router as outbound_links_router
 from routes.attribution_conversions import router as attribution_conversions_router
+from routes.ap2_agent_registration import router as ap2_agent_registration_router
 from routes.external_offers import router as external_offers_router
 from routes.prometheus_metrics import router as prometheus_metrics_router
 from routes.employee_reviews import router as employee_reviews_router
@@ -1030,6 +1031,7 @@ app.include_router(admin_cleanup_rebuild_router)  # Admin cleanup and rebuild
 app.include_router(admin_cleanup_stores_router)  # Admin cleanup stores
 app.include_router(outbound_links_router)  # Outbound links (resolve + redirect + ops config)
 app.include_router(attribution_conversions_router)  # Non-custodial conversion-report / receipt-ingest API (#1482)
+app.include_router(ap2_agent_registration_router)  # AP2 agent signing-key registration (#1442) — pre-flip provisioning
 app.include_router(external_offers_router)  # External offers (fetch/cache OG/JSON-LD for external-only products)
 app.include_router(simple_test_orders_router)  # Simple test orders generation
 app.include_router(migrate_employees_password_router)  # Migrate employees table

@@ -193,7 +193,54 @@ class CryptoService:
         except Exception as e:
             logger.error(f"Signature verification failed: {e}")
             return False
-    
+
+    def validate_public_key(self, public_key: str, algorithm: str = "ES256") -> None:
+        """Raise ``ValueError`` unless ``public_key`` is loadable for ``algorithm``
+        the SAME way ``verify_agent_signature`` loads it — so a key that validates
+        here is provably usable for verification (no "registered but broken" key).
+
+        - ``ES256``: a PEM SubjectPublicKeyInfo EC key on the **P-256** curve.
+        - ``Ed25519``: a raw 32-byte key, base64 of 32 bytes, or a PEM Ed25519 key
+          (mirrors the formats ``verify_agent_signature`` accepts).
+        """
+        if not isinstance(public_key, str) or not public_key.strip():
+            raise ValueError("public_key must be a non-empty string")
+
+        if algorithm == "ES256":
+            try:
+                obj = serialization.load_pem_public_key(public_key.encode("utf-8"))
+            except Exception as e:
+                raise ValueError(f"ES256 public_key must be a PEM SubjectPublicKeyInfo key: {e}")
+            if not isinstance(obj, ec.EllipticCurvePublicKey):
+                raise ValueError("ES256 public_key is not an EC key")
+            if not isinstance(obj.curve, ec.SECP256R1):
+                raise ValueError("ES256 public_key must use the P-256 (secp256r1) curve")
+            return
+
+        if algorithm == "Ed25519":
+            # Raw 32 bytes carried as latin1 (matches verify_agent_signature).
+            if len(public_key) == 32:
+                ed25519.Ed25519PublicKey.from_public_bytes(public_key.encode("latin1"))
+                return
+            # base64 of exactly 32 bytes.
+            try:
+                raw = base64.b64decode(public_key, validate=True)
+            except Exception:
+                raw = None
+            if raw is not None and len(raw) == 32:
+                ed25519.Ed25519PublicKey.from_public_bytes(raw)
+                return
+            # PEM Ed25519.
+            try:
+                obj = serialization.load_pem_public_key(public_key.encode("utf-8"))
+            except Exception as e:
+                raise ValueError(f"Ed25519 public_key must be raw-32 / base64-32 / PEM: {e}")
+            if not isinstance(obj, ed25519.Ed25519PublicKey):
+                raise ValueError("Ed25519 public_key is not an Ed25519 key")
+            return
+
+        raise ValueError(f"Unsupported algorithm: {algorithm} (use ES256 or Ed25519)")
+
     def sign_receipt(
         self,
         receipt_data: Dict[str, Any],
