@@ -414,7 +414,9 @@ def test_post_accepts_chatgpt_model_override(client, stub):
     }
     assert launch["model_overrides"] == {"chatgpt": "gpt-5.5-mini"}
     # Provider-level credit metering stays unchanged by model overrides.
-    assert stub.debits[0]["amount"] == 368
+    # 644 (was 368) after the audit-billing-cogs fix (#1506): grounded ChatGPT
+    # is priced on ~15k measured input tokens/probe, not the flat 2000.
+    assert stub.debits[0]["amount"] == 644
 
 
 def test_post_rejects_cross_tenant_merchant_id(client, stub):
@@ -778,7 +780,8 @@ def test_preview_us_shopper_sums_gemini_and_chatgpt_per_prompt(client, stub):
     assert res.status_code == 200, res.text
     body = res.json()
     assert body["providers"] == ["gemini", "chatgpt"]
-    assert body["estimated_audit_credits"] == 368
+    # 644 (was 368) — grounded ChatGPT priced on ~15k measured input tokens (#1506).
+    assert body["estimated_audit_credits"] == 644
 
 
 def test_preview_dedups_cost_computation_for_same_scope(client, stub):

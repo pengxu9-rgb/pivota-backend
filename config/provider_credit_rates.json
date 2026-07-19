@@ -1,13 +1,14 @@
 {
   "credit_to_usd": 0.01,
   "flat_multiple": 1.2,
-  "pricing_note": "Customer price = provider COGS (tokens x model price + grounding) x flat_multiple, converted to credits at credit_to_usd. flat_multiple=1.2 => 20% markup over COGS. Supersedes the legacy provider_cost_fraction=0.65 (~1.538x markup).",
+  "pricing_note": "Customer price = provider COGS (tokens x model price + grounding) x flat_multiple, converted to credits at credit_to_usd. flat_multiple=1.2 => 20% markup over COGS. Supersedes the legacy provider_cost_fraction=0.65 (~1.538x markup). Per-provider representative_input_tokens/representative_output_tokens (added 2026-07-19, #1506) override the shared representative_probe ONLY for the client-side web-search lanes (ChatGPT/Claude) whose grounding tools ingest retrieved page content as INPUT tokens (~15k/probe measured, n=1443) — not the flat 2000 — so the markup actually clears COGS. Gemini/DeepSeek keep the shared default: Gemini grounds server-side (input stays ~350, and its cost is grounding-fee-dominated anyway) and DeepSeek is a cheap ungrounded verify.",
   "rounding_decimal_places": 1,
   "representative_probe": {
     "input_tokens": 2000,
     "output_tokens": 500,
     "grounded_search_calls": 1,
-    "deepseek_verify_prompt_fraction": 0.25
+    "deepseek_verify_prompt_fraction": 0.25,
+    "_note": "Shared FALLBACK token counts. A provider entry's representative_input_tokens/representative_output_tokens override these; grounded_search_calls still applies to all."
   },
   "provider_credit_rates": {
     "gemini": {
@@ -29,7 +30,9 @@
       "input_cost_usd_per_1m_tokens": 5.00,
       "output_cost_usd_per_1m_tokens": 30.00,
       "grounding_cost_usd_per_call": 0.0150,
-      "notes": "gpt-5.5 real list price $5/$30 per 1M (in/out) confirmed Jun 2026. Cached input ($0.50/1M) and batch/flex ($2.50/$15) can lower this once implemented."
+      "notes": "gpt-5.5 real list price $5/$30 per 1M (in/out) confirmed Jun 2026. Cached input ($0.50/1M) and batch/flex ($2.50/$15) can lower this once implemented. web_search_preview grounding stuffs retrieved page content into input context: measured avg ~15,078 input tok/probe (median 8,729, p90 39,241, n=1443) — NOT 2000. representative_input_tokens reflects the avg so the 1.2x markup clears COGS.",
+      "representative_input_tokens": 15000,
+      "representative_output_tokens": 260
     },
     "claude": {
       "aliases": ["anthropic_claude_sonnet_grounded"],
@@ -39,7 +42,10 @@
       "prompt_fraction": 1.0,
       "input_cost_usd_per_1m_tokens": 3.00,
       "output_cost_usd_per_1m_tokens": 15.00,
-      "grounding_cost_usd_per_call": 0.0100
+      "grounding_cost_usd_per_call": 0.0100,
+      "representative_input_tokens": 15000,
+      "representative_output_tokens": 260,
+      "notes": "Grounded premium model. No production probes yet (ANTHROPIC_API_KEY unset on the agent). Tokens ESTIMATED from the ChatGPT grounded analog (~15k input); recalibrate from real Claude probe telemetry once the lane is enabled."
     },
     "deepseek": {
       "aliases": ["deepseek_verify"],

@@ -10,7 +10,7 @@ import json
 from decimal import Decimal, ROUND_CEILING, ROUND_HALF_UP
 from functools import lru_cache
 from pathlib import Path
-from typing import Any, Dict, Mapping
+from typing import Any, Dict, Mapping, Optional
 
 
 _CONFIG_PATH = (
@@ -66,16 +66,29 @@ def provider_probe_cost_usd(
     provider: str,
     *,
     grounded: bool,
-    input_tokens: int = 2000,
-    output_tokens: int = 500,
+    input_tokens: Optional[int] = None,
+    output_tokens: Optional[int] = None,
 ) -> Decimal:
-    """Return provider COGS for one representative probe."""
-    if int(input_tokens) < 0 or int(output_tokens) < 0:
-        raise ValueError("token counts must be >= 0")
+    """Return provider COGS for one representative probe.
 
+    When token counts are not passed explicitly they resolve PER PROVIDER from
+    the rate entry's ``representative_input_tokens`` / ``representative_output_tokens``,
+    falling back to the shared ``representative_probe`` block, then to 2000/500.
+    Grounded providers differ enormously: ChatGPT's ``web_search_preview`` stuffs
+    the retrieved page content into the input context (~15k tokens/probe measured),
+    while Gemini grounds server-side (~350). Pricing every provider as a flat
+    2000-token probe under-recovered COGS on the ChatGPT/Claude lanes; resolving
+    per provider keeps the flat_multiple markup actually clearing cost.
+    """
     config = load_provider_credit_config()
     rep = config.get("representative_probe") or {}
     entry = provider_rate_entry(provider)
+    if input_tokens is None:
+        input_tokens = entry.get("representative_input_tokens", rep.get("input_tokens", 2000))
+    if output_tokens is None:
+        output_tokens = entry.get("representative_output_tokens", rep.get("output_tokens", 500))
+    if int(input_tokens) < 0 or int(output_tokens) < 0:
+        raise ValueError("token counts must be >= 0")
     input_cost = (
         _decimal(input_tokens)
         / Decimal("1000000")
@@ -101,8 +114,8 @@ def credits_for_probe(
     provider: str,
     *,
     grounded: bool,
-    input_tokens: int = 2000,
-    output_tokens: int = 500,
+    input_tokens: Optional[int] = None,
+    output_tokens: Optional[int] = None,
 ) -> float:
     """Convert a provider probe's COGS into abstract Pivota credits.
 

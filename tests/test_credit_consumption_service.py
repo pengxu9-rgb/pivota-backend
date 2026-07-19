@@ -23,8 +23,11 @@ def test_estimate_probe_credits_matches_audit_pricing():
     from routes.audit_runs_routes import _audit_metering
 
     # The probe set the audit path builds for 1 SKU / 1 prompt, gemini+chatgpt,
-    # deepseek verify @ 0.25 sample. At flat_multiple=1.2 (gpt-5.5 output $30)
-    # this is 10 credits (was 12 at the legacy 1.538x markup).
+    # deepseek verify @ 0.25 sample. At flat_multiple=1.2, priced on PER-PROVIDER
+    # measured tokens (grounded ChatGPT ingests ~15k input tokens/probe via
+    # web_search_preview, not the flat 2000), this is 17 credits — up from 10 when
+    # every provider was mis-priced at 2000 input tokens and the ChatGPT lane
+    # under-recovered COGS. See the audit-billing-cogs fix (#1506).
     audit_credits, _ = _audit_metering(
         sku_count=1,
         prompts_per_sku=1,
@@ -32,7 +35,25 @@ def test_estimate_probe_credits_matches_audit_pricing():
         verify_providers=["deepseek"],
         verify_sample={"positive_fraction": 0.25, "max_per_sku": None},
     )
-    assert audit_credits == 10
+    assert audit_credits == 17
+
+
+def test_per_provider_representative_tokens_price_grounded_lanes_realistically():
+    """#1506: grounded ChatGPT/Claude are priced on their real measured token
+    usage (ChatGPT ~15k input via web_search_preview), not the flat 2000-token
+    representative_probe that under-recovered COGS. Gemini stays grounding-
+    dominated; explicit tokens still override (back-compat)."""
+    from services.provider_credit_rates import credits_for_probe, provider_probe_cost_usd
+
+    # ChatGPT grounded: 15000 in x $5/1M + 260 out x $30/1M + $0.015 grounding.
+    assert round(float(provider_probe_cost_usd("chatgpt", grounded=True)), 4) == 0.0978
+    assert credits_for_probe("chatgpt", grounded=True) == 11.7   # was 5.4 at flat 2000
+    assert credits_for_probe("claude", grounded=True) == 7.1
+    # Gemini unchanged — the $0.035 grounding fee dominates, token delta is noise.
+    assert credits_for_probe("gemini", grounded=True) == 4.4
+    # Explicit tokens override the per-provider default (the OLD flat-2000 price).
+    old_flat = provider_probe_cost_usd("chatgpt", grounded=True, input_tokens=2000, output_tokens=500)
+    assert round(float(old_flat), 4) == 0.04
 
 
 def test_estimate_zero_and_negative_probes_are_ignored():
