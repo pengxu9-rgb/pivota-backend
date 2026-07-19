@@ -54,6 +54,12 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional
 
+# Single source of truth for provider token prices is the billing config
+# (config/provider_credit_rates.json), loaded via this leaf module (stdlib-only
+# deps, so no import cycle). The registry DERIVES its per-1k telemetry rates from
+# it (#1508) so llm_probe_runs.cost_usd can't drift off what we actually bill.
+from services.provider_credit_rates import provider_rate_entry
+
 
 # Suitability rating constants for clarity at call sites.
 SUITABILITY_EXCELLENT = "excellent"
@@ -219,17 +225,54 @@ def update_provider_health(provider_id: str, health_status: str) -> None:
 # Default provider seed — registered at module import time.
 # ---------------------------------------------------------------------------
 
+def _config_rate_per_1k(provider_id: str) -> Optional[Dict[str, float]]:
+    """Per-1k input/output token USD rates for `provider_id`, derived from the
+    billing config (config/provider_credit_rates.json).
+
+    The config stores prices per 1M tokens (input_cost_usd_per_1m_tokens /
+    output_cost_usd_per_1m_tokens); the registry meters per 1k, so divide by
+    1000. Returns None when the provider (or its price fields) is absent from the
+    config — the caller then falls back to a hardcoded constant. Deriving here is
+    what keeps registry cost_per_1k_* from silently disagreeing with the rates we
+    actually bill against (#1508)."""
+    try:
+        entry = provider_rate_entry(provider_id)
+    except ValueError:
+        # Provider not in the billing config (e.g. "mock", or a future provider
+        # priced only in code) — let the caller use its constant fallback.
+        return None
+    in_1m = entry.get("input_cost_usd_per_1m_tokens")
+    out_1m = entry.get("output_cost_usd_per_1m_tokens")
+    if in_1m is None or out_1m is None:
+        return None
+    return {
+        "input_per_1k": float(in_1m) / 1000.0,
+        "output_per_1k": float(out_1m) / 1000.0,
+    }
+
+
+def _rates_or(provider_id: str, *, fallback_in: float, fallback_out: float) -> Dict[str, float]:
+    """Config-derived per-1k rates for `provider_id`, or the given constants when
+    the provider isn't in the billing config."""
+    derived = _config_rate_per_1k(provider_id)
+    if derived is not None:
+        return derived
+    return {"input_per_1k": fallback_in, "output_per_1k": fallback_out}
+
+
 def _seed_default_providers() -> None:
     """Pre-register the providers Pivota supports today. New
     providers (ChatGPT, Claude, etc.) get appended here as they
     ship; the orchestrator picks them up automatically."""
     # Gemini (via PIVOTA-Agent codex stack)
+    # Rates derived from config (gemini-2.5-flash: $0.30/$2.50 per 1M).
+    _gemini_rates = _rates_or("gemini", fallback_in=0.00035, fallback_out=0.00105)
     register_provider(LLMProvider(
         id="gemini",
         display_name="Google Gemini Grounded",
         backend=BACKEND_PIVOTA_AGENT_UPSTREAM,
-        cost_per_1k_input_tokens_usd=0.00035,    # Gemini 1.5 Flash with grounding
-        cost_per_1k_output_tokens_usd=0.00105,
+        cost_per_1k_input_tokens_usd=_gemini_rates["input_per_1k"],   # gemini-2.5-flash (config)
+        cost_per_1k_output_tokens_usd=_gemini_rates["output_per_1k"],
         avg_latency_ms_per_probe=2400,
         rate_limit_per_minute=60,
         health_status=HEALTH_HEALTHY,
@@ -249,6 +292,10 @@ def _seed_default_providers() -> None:
     ))
 
     # Deepseek V4 (backend-direct, post-PR-3a)
+    # Provider-level + headline SKU (deepseek-chat, V4 Flash) rate = config
+    # (deepseek-v4-flash: $0.14/$0.28 per 1M). deepseek-reasoner is a distinct
+    # SKU NOT in the billing config, so it keeps its code-owned constant.
+    _deepseek_rates = _rates_or("deepseek", fallback_in=0.00014, fallback_out=0.00028)
     register_provider(LLMProvider(
         id="deepseek",
         display_name="Deepseek V4",
@@ -258,8 +305,8 @@ def _seed_default_providers() -> None:
         # operator points DEEPSEEK_MODEL at one of them, telemetry
         # uses the right rate. Unknown model ids fall back to these
         # provider-level numbers.
-        cost_per_1k_input_tokens_usd=0.00014,    # deepseek-chat (V4 Flash)
-        cost_per_1k_output_tokens_usd=0.00028,
+        cost_per_1k_input_tokens_usd=_deepseek_rates["input_per_1k"],    # deepseek-chat (config)
+        cost_per_1k_output_tokens_usd=_deepseek_rates["output_per_1k"],
         avg_latency_ms_per_probe=1800,
         rate_limit_per_minute=120,
         health_status=HEALTH_HEALTHY,
@@ -284,11 +331,8 @@ def _seed_default_providers() -> None:
         # pricing page changes). Cache-hit pricing is a separate axis
         # not modeled here.
         model_rates={
-            "deepseek-chat": {       # V4 Flash
-                "input_per_1k": 0.00014,
-                "output_per_1k": 0.00028,
-            },
-            "deepseek-reasoner": {   # V4 Pro / reasoner SKU
+            "deepseek-chat": _deepseek_rates,   # V4 Flash — config-derived
+            "deepseek-reasoner": {   # V4 Pro / reasoner SKU (not in billing config)
                 "input_per_1k": 0.00055,
                 "output_per_1k": 0.00219,
             },
@@ -301,12 +345,14 @@ def _seed_default_providers() -> None:
     # and every ChatGPT probe recorded $0 even with real tokens. Token rates
     # mirror config/provider_credit_rates.json; the per-call web_search fee is
     # priced there (grounding_cost_usd_per_call) and in the gateway estimate.
+    # Rates derived from config (gpt-5.5: $5.00/$30.00 per 1M).
+    _chatgpt_rates = _rates_or("chatgpt", fallback_in=0.005, fallback_out=0.03)
     register_provider(LLMProvider(
         id="chatgpt",
         display_name="OpenAI ChatGPT Grounded",
         backend=BACKEND_PIVOTA_AGENT_UPSTREAM,
-        cost_per_1k_input_tokens_usd=0.005,      # $5.00 / 1M input
-        cost_per_1k_output_tokens_usd=0.02,      # $20.00 / 1M output
+        cost_per_1k_input_tokens_usd=_chatgpt_rates["input_per_1k"],   # $5.00 / 1M input (config)
+        cost_per_1k_output_tokens_usd=_chatgpt_rates["output_per_1k"], # $30.00 / 1M output (config)
         avg_latency_ms_per_probe=14000,
         rate_limit_per_minute=60,
         health_status=HEALTH_HEALTHY,
@@ -326,18 +372,21 @@ def _seed_default_providers() -> None:
         # Promote these once entitlement-aware auto-selection ships.
         suitable_for_scan_modes={},
         model_rates={
-            "chat-latest": {"input_per_1k": 0.005, "output_per_1k": 0.02},
+            # Headline model (gpt-5.5) — config-derived.
+            "chat-latest": _chatgpt_rates,
         },
     ))
 
     # Claude (Anthropic Messages + web_search, via PIVOTA-Agent upstream).
     # Premium/paid-tier provider. Same rationale as ChatGPT above.
+    # Rates derived from config (claude-sonnet-4: $3.00/$15.00 per 1M).
+    _claude_rates = _rates_or("claude", fallback_in=0.003, fallback_out=0.015)
     register_provider(LLMProvider(
         id="claude",
         display_name="Anthropic Claude Grounded",
         backend=BACKEND_PIVOTA_AGENT_UPSTREAM,
-        cost_per_1k_input_tokens_usd=0.003,      # $3.00 / 1M input
-        cost_per_1k_output_tokens_usd=0.015,     # $15.00 / 1M output
+        cost_per_1k_input_tokens_usd=_claude_rates["input_per_1k"],    # $3.00 / 1M input (config)
+        cost_per_1k_output_tokens_usd=_claude_rates["output_per_1k"],  # $15.00 / 1M output (config)
         avg_latency_ms_per_probe=12000,
         rate_limit_per_minute=60,
         health_status=HEALTH_HEALTHY,
@@ -352,7 +401,8 @@ def _seed_default_providers() -> None:
         # selectable and cost-visible.
         suitable_for_scan_modes={},
         model_rates={
-            "claude-sonnet-4": {"input_per_1k": 0.003, "output_per_1k": 0.015},
+            # Headline model (claude-sonnet-4) — config-derived.
+            "claude-sonnet-4": _claude_rates,
         },
     ))
 
