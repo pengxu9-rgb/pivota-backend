@@ -7425,10 +7425,16 @@ async def build_per_sku_report(
         # the engine built from this SKU's evidenced attributes but didn't probe —
         # the niches to test next. [] when every generated prompt already ran (no
         # padding). Rolled up to the brand via build_suggested_prompts.
+        # #1503: suggestions consume the PROBE graph (lexicon + any stashed
+        # LLM-grounded attributes already paid for during the fan-out) rather
+        # than the bare lexicon graph — flag-off/no-stash it is byte-identical
+        # to build_sku_attribute_graph, so beauty output is unchanged.
         "suggested_prompts": _suggested_prompts_for_sku(
             sku_ctx,
             opportunity=opportunity if isinstance(opportunity, dict) else {},
-            attribute_graph=attribute_graph,
+            attribute_graph=_attribute_graph_for_probes(
+                sku_ctx, _get_product(sku_ctx or {})
+            ),
         ),
         "next_best_action": next_best_action,
     }
@@ -9459,10 +9465,18 @@ def _suggested_prompts_for_sku(
     we subtract every query that WAS probed (any axis), so a thin SKU whose every
     generated prompt already ran yields [] — no synthetic padding, no re-listing
     what the audit already measured.
+
+    #1503: deliberately NOT gated on `attributes_raw` — catalog_products rows
+    have no such column, so that gate silently emptied suggested_prompts for
+    EVERY connected-catalog SKU in every vertical (only url-audit synthetic
+    contexts carry attributes_raw). The generator reads title/product_type/
+    description off the product itself and an empty spec list already returns
+    [] — the gate was strictly stricter than the generator's real inputs. The
+    probe lane (`_sidewalk_query_records_for_sku`) keeps its gate: probe-set
+    composition is priced/pinned behavior and changes there need their own
+    review.
     """
     product = _get_product(sku_ctx or {})
-    if not _product_has_attributes_raw(product):
-        return []
     title = resolve_sku_identity(sku_ctx or {}).get("name") or (
         _get_sku(sku_ctx or {}).get("title") or product.get("title") or ""
     )
