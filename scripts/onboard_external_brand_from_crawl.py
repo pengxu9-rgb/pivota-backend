@@ -342,7 +342,14 @@ async def _upsert_seed(
           domain=EXCLUDED.domain,
           seller_ref=COALESCE(EXCLUDED.seller_ref, external_product_seeds.seller_ref),
           seed_kind=COALESCE(EXCLUDED.seed_kind, external_product_seeds.seed_kind),
-          seed_data=EXCLUDED.seed_data, status='active', updated_at=NOW()
+          -- MERGE, don't REPLACE (#1516): a re-run must not wipe enrichment keys
+          -- written to seed_data AFTER onboarding (e.g. curated electronics_meta).
+          -- `||` is a shallow, per-top-level-key merge: EXCLUDED wins for every
+          -- top-level key the cohort actually carries (snapshot, pdp_description_raw,
+          -- inci_list, …) — those are fully replaced per key, which is intended —
+          -- while stored-only enrichment keys the cohort never writes survive.
+          seed_data=COALESCE(external_product_seeds.seed_data, '{}'::jsonb) || EXCLUDED.seed_data,
+          status='active', updated_at=NOW()
         """,
         {"id": _seed_id(p["external_product_id"]), "epid": p["external_product_id"], "tool": TOOL,
          "domain": _seed_domain(p) or None,
