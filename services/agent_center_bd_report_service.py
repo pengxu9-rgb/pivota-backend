@@ -32,7 +32,7 @@ import json
 import logging
 import math
 import re
-from typing import AbstractSet, Any, Dict, Iterable, List, Mapping, Optional, Tuple
+from typing import AbstractSet, Any, Dict, FrozenSet, Iterable, List, Mapping, Optional, Tuple
 from urllib.parse import urlparse
 
 from services import agent_center_llm_client as llm_client
@@ -6618,6 +6618,35 @@ _GAP_DISPLAY: Dict[Tuple[str, str], Dict[str, str]] = {
 }
 
 
+# Buckets that measure Pivota's OWN serving/pipeline readiness, not the brand's
+# organic AI visibility. For a product deliberately held out of serving
+# (decision-grade / BD audits) these score 0 and — because _fixability_for gives
+# routability a 1.0 weight — dominate primary_gaps and lead the fix narrative,
+# conflating "Pivota hasn't served this" with "brand isn't AI-visible" (#1504).
+# We KEEP the gap (score math unchanged — a repricing change is out of scope) but
+# annotate it (internal_state + an honest `why`) and stop it from headlining.
+# Single source of truth for both the annotation and the narrative demotion.
+_INTERNAL_STATE_GAPS: FrozenSet[Tuple[str, str]] = frozenset(
+    {("routability", "serving_eligibility")}
+)
+
+# Overrides the merchant-safe _GAP_DISPLAY `why` for an internal-state gap so the
+# copy can't be misread as an organic-visibility failure. Must stay clear of the
+# banned internal-jargon substrings enforced by tests/test_audit_gap_labels.py
+# (no "score", "/", "_", "pipeline", …) since _primary_gaps emits it verbatim.
+_INTERNAL_STATE_WHY = (
+    "This reflects whether Pivota has made the product live in the AI shopping "
+    "surface yet — a read on our own serving readiness, not on how visible or "
+    "cited the brand is. It stays low whenever a product is deliberately held "
+    "back from serving, so treat it as an internal serving-state note rather than "
+    "an organic AI-visibility gap."
+)
+
+
+def _is_internal_state_gap(dimension: Any, bucket: Any) -> bool:
+    return (str(dimension), str(bucket)) in _INTERNAL_STATE_GAPS
+
+
 def _humanize_bucket(bucket: str) -> str:
     """Last-resort merchant-safe label for an unmapped bucket.
 
@@ -6650,7 +6679,7 @@ def _primary_gaps(scores: Dict[str, Any], cap: int = 3) -> List[Dict[str, Any]]:
             if gap <= 0:
                 continue
             display = _gap_display(str(dimension), str(bucket))
-            gaps.append({
+            gap_entry = {
                 "dimension": dimension,
                 "bucket": bucket,
                 "points": points,
@@ -6660,7 +6689,16 @@ def _primary_gaps(scores: Dict[str, Any], cap: int = 3) -> List[Dict[str, Any]]:
                 # scoring vocabulary and is intentionally NOT surfaced here.
                 "label": display["label"],
                 "why": display["why"],
-            })
+            }
+            # #1504: a gap that measures Pivota's own serving readiness (only
+            # present when the product is NOT serving-eligible) is flagged so the
+            # narrative doesn't read "held out of serving" as "not AI-visible".
+            # Score fields (points/max/gap) are untouched. A serving-eligible SKU
+            # has no such gap, so its primary_gaps stay byte-identical.
+            if _is_internal_state_gap(dimension, bucket):
+                gap_entry["internal_state"] = True
+                gap_entry["why"] = _INTERNAL_STATE_WHY
+            gaps.append(gap_entry)
     gaps.sort(key=lambda g: (-g["gap"], g["dimension"], g["bucket"]))
     return gaps[:cap]
 
@@ -7976,7 +8014,19 @@ def build_brand_rollup(
                 "priority_score": priority,
                 "reason": gap.get("reason"),
             })
-    priority_queue.sort(key=lambda row: row.get("priority_score") or 0, reverse=True)
+    # #1504: internal serving-state gaps (only present for products held out of
+    # serving) must never HEADLINE the fix queue — they measure Pivota readiness,
+    # not organic AI visibility, yet _fixability_for weights routability at 1.0 so
+    # they'd otherwise top it. Demote them below all non-internal gaps; within
+    # each group, priority_score desc with insertion-order tie-break (identical to
+    # the prior sort for an all-non-internal cohort, so serving SKUs are
+    # byte-identical). No new row key, so row shape is unchanged either.
+    priority_queue.sort(
+        key=lambda row: (
+            1 if _is_internal_state_gap(row.get("dimension"), row.get("bucket")) else 0,
+            -(row.get("priority_score") or 0),
+        )
+    )
 
     return {
         "merchant_id": merchant_id,
