@@ -24,7 +24,7 @@ surface; treat it as a gated change.
 |---|---|---|
 | ✅ | Identity, signature, header-contract, mandate authority (see "What's built") | DONE — merged & reviewed |
 | ⬜ | **Apply schema** (migrations `021/022/023/182/183/184/185`) | ops — section 1 |
-| ⬜ | **Provision agent identity** (`agents.did` per pilot agent) | ops — section 2 |
+| ⬜ | **Provision agent identity** — admin `agents.did`, or agents self-register `agents.public_key` (#1442, §2b) | ops — section 2 |
 | ⬜ | **Provision agent wallets** (confirm path) | ops — section 3 |
 | ⬜ | **`PLATFORM_SIGNING_KEY`** (receipt signing) | config — section 4 |
 | ⬜ | **Reviewer + founder sign-off** (ADR-012 → Accepted) | governance |
@@ -116,10 +116,19 @@ above are what confirm migration 185 was applied.
 
 **This is the prerequisite that makes the grant path work.** The grant fails
 closed for any agent with no resolvable identity (`401 "…no registered public
-key…"`). The `agents.did` column exists (migration 183) but is provisioned
-per-agent as an enablement step — for the pilot, **admin-provisioned** (self-serve
-proof-of-control enrollment is a later slice; this supersedes the old
-[#1442](https://github.com/pengxu9-rgb/pivota-backend/issues/1442) PEM-upload plan).
+key…"`). An identity can be provisioned two ways — **either is sufficient** for
+`get_agent_identity` to resolve a verification key:
+
+- **`agents.did`** — an admin-provisioned DID (preferred for the pilot; the key is
+  resolved *from* the DID). See the DID methods below.
+- **`agents.public_key`** — a raw ES256/Ed25519 **signing** PEM, either
+  **self-registered by the agent** via `POST /agent/ap2/signing-key`
+  ([#1442](https://github.com/pengxu9-rgb/pivota-backend/issues/1442); §2b below) or
+  admin-set. `get_agent_identity` uses it when `agents.did` is unset.
+
+DID provisioning for the pilot is admin-driven (full self-serve DID
+proof-of-control enrollment is a later slice); the raw-PEM path (§2b) is agent
+self-serve today.
 
 For each pilot agent, set `agents.did` to its DID (via `db.agents.set_agent_did`
 or SQL). Two DID methods:
@@ -146,7 +155,34 @@ FROM agents
 WHERE agent_id IN ( /* AP2 pilot agent_ids */ );
 ```
 
-#### 2b. (Only if the pilot uses mandate authority) trusted issuers
+#### 2b. Self-register a raw signing key — `POST /agent/ap2/signing-key` (#1442)
+
+An agent provisions its own `agents.public_key` by calling this endpoint,
+authenticated with its normal agent credential (the `ak_live_…` API key via
+`X-API-Key` — the same `get_agent_context` auth as the rest of the agent SDK). The
+key is written for the **authenticated** agent only; any `agent_id` in the body is
+ignored, so an agent can never register another agent's key. It is validated with
+the SAME loader the verify path uses (ES256 = PEM SubjectPublicKeyInfo on P-256;
+Ed25519 = PEM / base64-32 / raw-32), so a stored key is provably usable — no
+"registered but broken" key. It overwrites any prior value (key rotation), and is
+**always mounted**, independent of `ENABLE_AP2_ROUTES`, since provisioning must
+precede the flip.
+
+```
+POST /agent/ap2/signing-key
+X-API-Key: ak_live_…
+{ "public_key": "-----BEGIN PUBLIC KEY-----\n…\n-----END PUBLIC KEY-----", "algorithm": "ES256" }
+→ 200 { "status": "registered", "agent_id": "<caller>", "algorithm": "ES256" }
+```
+
+`400` on a missing/invalid key or unsupported algorithm; `401` if the caller isn't
+an authenticated agent; `503` if the write fails (e.g. migration 021 not applied on
+this env). The agent then signs consent/transaction requests with the matching
+**private** key (default `ES256`; send `"algorithm":"Ed25519"` in the grant /
+transaction body for Ed25519). For an admin backfill instead, the same writer is
+`db.agents.set_agent_public_key(agent_id, pem)`.
+
+#### 2c. (Only if the pilot uses mandate authority) trusted issuers
 
 If pilot transactions carry an Intent→Cart→Payment `mandate_chain`, each agent's
 **authorizing issuer DID(s)** must be registered in `ap2_trusted_issuers`

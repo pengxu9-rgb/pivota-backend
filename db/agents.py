@@ -389,6 +389,20 @@ async def set_agent_did(agent_id: str, did: str) -> None:
     )
 
 
+async def set_agent_public_key(agent_id: str, public_key: str) -> None:
+    """
+    Persist an agent's AP2 **signing** public key into ``agents.public_key`` (the
+    raw-PEM pilot key read by ``consent_service.get_agent_identity``; migration
+    021). Overwrites any prior value (key rotation for that agent). This is NOT a
+    PSP publishable key. Authorization is the CALLER's responsibility — this helper
+    binds nothing; pass only an ``agent_id`` the caller is authenticated as.
+    """
+    await database.execute(
+        "UPDATE agents SET public_key = :public_key, updated_at = NOW() WHERE agent_id = :agent_id",
+        {"public_key": public_key, "agent_id": agent_id},
+    )
+
+
 async def get_agent_by_key(api_key: str, metrics_out: Optional[Dict[str, Any]] = None) -> Optional[Dict[str, Any]]:
     """通过 API Key 获取 Agent（用于认证）
 
