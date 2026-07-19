@@ -209,6 +209,46 @@ async def test_l2_writes_clamped_rating_and_reseller_inci(monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_l2_reseller_inci_outranked_is_counted_not_gained(monkeypatch):
+    """When ingest_canonical_inci rejects a reseller write as outranked (an
+    existing brand_official INCI, written_skus=[]), the backfill counts it as
+    skipped_outranked, does NOT mark the row gained, and does NOT refresh the
+    view for it (review SHOULD-FIX 4 — the backfill's precedence-handling side)."""
+    calls = []
+
+    async def _outranked(product_key, raw_inci, source, *, dry_run=False):
+        calls.append(source)
+        return {"status": "ok", "written_skus": []}  # precedence rejected
+
+    monkeypatch.setattr(bf, "ingest_canonical_inci", _outranked)
+    db = _FakeDB()
+    monkeypatch.setattr(bf, "database", db)
+    # page has INCI but NO rating, so only the INCI path runs
+    monkeypatch.setattr(bf, "fetch_text", lambda url: _sk_pdp(with_rating=False, inci=_INCI))
+
+    row = {"product_key": "pk_or", "content_key": "ck_or",
+           "sk_url": "https://www.stylekorean.com/product/x/1", "rating_value": 4.0, "has_inci": False}
+    totals = _fresh_totals()
+    touched: set = set()
+    await bf._process_l2_row(row, cache={}, delay=0.0, apply=True, totals=totals, touched=touched)
+
+    assert calls == [bf.INCI_SOURCE_RESELLER]
+    assert totals["l2_inci_skipped_outranked"] == 1
+    assert totals["l2_inci_written"] == 0
+    assert "ck_or" not in touched  # not gained -> no view refresh
+
+
+@pytest.mark.asyncio
+async def test_l2_non_stylekorean_source_ref_is_skipped(monkeypatch):
+    """defense-in-depth (review NIT 6): a mis-attached non-SK source_ref is never
+    crawled."""
+    fetched = []
+    monkeypatch.setattr(bf, "fetch_text", lambda url: (fetched.append(url), _sk_pdp())[1])
+    got = await bf._crawl_sk("https://evil-retailer.example/product/x", cache={}, delay=0.0)
+    assert got is None and fetched == []
+
+
+@pytest.mark.asyncio
 async def test_l2_no_signals_on_page_stays_null(monkeypatch):
     calls = _capture_intake(monkeypatch)
     db = _FakeDB()

@@ -135,7 +135,8 @@ _L1_COUNT = """
 # missing a rating OR still missing any INCI (so a row that already has BOTH is
 # skipped — idempotent). Keyset by product_key.
 _L2_COHORT = """
-    SELECT cp.product_key, cp.content_key, cp.rating_value,
+    SELECT DISTINCT ON (cp.product_key)
+           cp.product_key, cp.content_key, cp.rating_value,
            o.source_ref AS sk_url,
            EXISTS (
              SELECT 1 FROM beauty_sku_ingredients bsi
@@ -286,7 +287,11 @@ async def _process_l1_row(
     if not host or not handle:
         totals["l1_no_handle"] += 1
         return
-    if host != str(r.get("source_domain") or "").strip().lower():
+    # www.-insensitive compare: handle_from_url strips a leading www. but
+    # source_domain is stored un-normalized, so a www.-prefixed brand row would
+    # otherwise be wrongly counted foreign and skipped (review SHOULD-FIX 1).
+    src_domain = str(r.get("source_domain") or "").strip().lower().removeprefix("www.")
+    if host.removeprefix("www.") != src_domain:
         totals["l1_foreign_domain"] += 1
         return
     inci_map = await _load_inci_map(host, cache, max_products)
@@ -321,6 +326,12 @@ async def _crawl_sk(url: str, cache: Dict[str, Optional[Dict[str, Any]]], delay:
     urllib call off the event loop."""
     if url in cache:
         return cache[url]
+    # defense-in-depth: only ever crawl StyleKorean (the cohort filters on the
+    # SK merchant, but guard against a mis-attached offer URL; review NIT 6).
+    if "stylekorean" not in (url or "").lower():
+        print(f"  WARN skipping non-StyleKorean source_ref: {url[:80]}")
+        cache[url] = None
+        return None
     if delay > 0:
         await asyncio.sleep(delay)
     try:
@@ -353,12 +364,15 @@ async def _process_l2_row(
         rv = _coerce_rating_value(extracted.get("rating_value"))
         rc = _coerce_rating_count(extracted.get("rating_count"))
         if rv is not None:
+            ok = True
             if apply:
                 ok = await _healed_execute(_RATING_UPDATE, {"rv": rv, "rc": rc, "pk": r["product_key"]})
-                if not ok:
-                    totals["l2_rating_failed"] += 1
-            totals["l2_rating_written"] += 1
-            gained = True
+            if ok:
+                # only count/refresh a rating that actually landed (review SHOULD-FIX 3)
+                totals["l2_rating_written"] += 1
+                gained = True
+            else:
+                totals["l2_rating_failed"] += 1
         else:
             totals["l2_no_rating_on_page"] += 1
 
