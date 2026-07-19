@@ -80,8 +80,12 @@ async def admin_set_agent_signing_key(
             detail="Could not persist the signing key (is the AP2 agent schema applied? migration 021_ap2_security.sql)",
         )
 
+    _admin = admin or {}
     logger.info(
         "ap2 signing-key backfilled agent=%s algorithm=%s by_admin=%s",
-        agent_id, algorithm, (admin or {}).get("id") or (admin or {}).get("employee_id") or "?",
+        agent_id, algorithm,
+        # get_current_employee returns the JWT payload — canonical id is `sub`
+        # (or camelCase `employeeId`); keep the older keys as a fallback.
+        _admin.get("sub") or _admin.get("employeeId") or _admin.get("employee_id") or _admin.get("id") or "?",
     )
     return {"status": "registered", "agent_id": agent_id, "algorithm": algorithm}
