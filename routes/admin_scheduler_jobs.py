@@ -145,3 +145,32 @@ async def manage_scheduler_job(
         state.get("next_run_time"),
     )
     return {"action": action, **state}
+
+
+@router.post("/admin/scheduler/restart", response_model=None)
+async def restart_whole_scheduler(
+    current_admin: dict = Depends(require_admin),
+):
+    """Force a clean re-init of the ENTIRE scheduler (recovery lever for the
+    silent-stall class where all jobs came up with next_run_time=None). Shuts
+    down the current instance and re-runs start_scheduler(); returns the
+    post-restart diagnostics (state_name + fireable_job_count). Admin-only."""
+    from services.audit_scheduler import restart_scheduler
+
+    try:
+        diag = await restart_scheduler()
+    except Exception as exc:  # noqa: BLE001
+        logger.error(
+            "scheduler restart failed admin=%s: %s",
+            (current_admin or {}).get("email"), exc, exc_info=True,
+        )
+        return JSONResponse(
+            status_code=500,
+            content={"error": "scheduler_restart_failed", "message": str(exc)},
+        )
+    logger.warning(
+        "scheduler RESTART by admin=%s -> state=%s fireable=%s",
+        (current_admin or {}).get("email"),
+        diag.get("state_name"), diag.get("fireable_job_count"),
+    )
+    return {"restarted": True, **diag}

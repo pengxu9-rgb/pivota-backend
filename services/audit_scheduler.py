@@ -51,6 +51,42 @@ logger = logging.getLogger(__name__)
 
 _SCHEDULER = None  # type: Optional[object]
 
+# Boot diagnostics surfaced by /__scheduler_health. APScheduler's `running`
+# property is `state != STOPPED`, which is TRUE even when PAUSED — so a paused
+# scheduler (every job next_run_time=None, nothing fires) reports "running:True"
+# and looks healthy. These capture the REAL state + any boot exception so the
+# silent-stall class (all 26 jobs next_run=None, 2026-07) is visible without
+# log-spelunking on Railway (where INFO logs are filtered).
+_BOOT_ERROR = None  # type: Optional[str]
+_BOOT_DIAG = None   # type: Optional[dict]
+
+_STATE_NAMES = {0: "STOPPED", 1: "RUNNING", 2: "PAUSED"}
+
+
+def scheduler_diagnostics() -> dict:
+    """Read-only report of the scheduler's real runtime state for
+    /__scheduler_health — state name, boot error, worker gate, and how many
+    registered jobs actually have a next_run_time (0 => firing nothing)."""
+    sched = _SCHEDULER
+    state = getattr(sched, "state", None) if sched is not None else None
+    jobs = []
+    fireable = 0
+    try:
+        for job in (sched.get_jobs() if sched is not None else []):
+            nrt = getattr(job, "next_run_time", None)
+            if nrt is not None:
+                fireable += 1
+    except Exception:  # noqa: BLE001
+        pass
+    return {
+        "state": state,
+        "state_name": _STATE_NAMES.get(state, "UNKNOWN") if state is not None else "NOT_STARTED",
+        "boot_error": _BOOT_ERROR,
+        "boot_diag": _BOOT_DIAG,
+        "worker_enabled": _queue_worker_enabled(),
+        "fireable_job_count": fireable,
+    }
+
 
 def _queue_worker_enabled() -> bool:
     """Whether THIS process should drain the shared async-run queues
@@ -88,7 +124,7 @@ def get_scheduler():
 async def start_scheduler() -> None:
     """Initialize APScheduler + register all cron jobs. Idempotent —
     safe to call multiple times (subsequent calls are no-ops)."""
-    global _SCHEDULER
+    global _SCHEDULER, _BOOT_ERROR, _BOOT_DIAG
     if _SCHEDULER is not None:
         logger.info("audit_scheduler: already started; skipping")
         return
@@ -670,6 +706,45 @@ async def start_scheduler() -> None:
 
         scheduler.start()
         _SCHEDULER = scheduler
+
+        # SELF-HEAL + DIAGNOSE the silent-stall class. `scheduler.start()` can
+        # leave the scheduler in STATE_PAUSED (its `running` property is still
+        # True), or otherwise fail to compute next_run_time for its jobs — in
+        # both cases every job has next_run_time=None and NOTHING ever fires,
+        # while /__scheduler_health reports "running:True". Detect it, resume if
+        # paused, and record the outcome for the health endpoint.
+        _BOOT_ERROR = None
+        try:
+            from apscheduler.schedulers.base import STATE_PAUSED
+
+            resumed = False
+            if getattr(scheduler, "state", None) == STATE_PAUSED:
+                logger.warning(
+                    "audit_scheduler: came up PAUSED (running property masks it) "
+                    "— resuming so jobs actually fire"
+                )
+                scheduler.resume()
+                resumed = True
+
+            all_jobs = scheduler.get_jobs()
+            fireable = [j for j in all_jobs if getattr(j, "next_run_time", None) is not None]
+            _BOOT_DIAG = {
+                "state": getattr(scheduler, "state", None),
+                "resumed_from_paused": resumed,
+                "job_count": len(all_jobs),
+                "fireable_job_count": len(fireable),
+            }
+            if all_jobs and not fireable:
+                # Registered but not schedulable — the exact silent stall. Surface
+                # loudly; logs are filtered on prod so the health endpoint carries it.
+                logger.error(
+                    "audit_scheduler: %d jobs registered but NONE have a "
+                    "next_run_time (state=%s) — scheduler is firing NOTHING",
+                    len(all_jobs), getattr(scheduler, "state", None),
+                )
+        except Exception as diag_exc:  # noqa: BLE001 — diagnostics must never break boot
+            logger.warning("audit_scheduler: self-heal/diag failed: %s", diag_exc)
+
         logger.info(
             "audit_scheduler: started with daily_audit_check (03:00 UTC) "
             "+ nightly_index_health (04:00 UTC) "
@@ -692,10 +767,28 @@ async def start_scheduler() -> None:
             "+ identity_reconcile_sweep (Mon 04:30 UTC, flag-gated ENABLE_IDENTITY_RECONCILE_SWEEP)"
         )
     except Exception as exc:  # noqa: BLE001
+        _BOOT_ERROR = repr(exc)
         logger.warning(
             "audit_scheduler: start failed (continuing degraded): %s",
             exc,
         )
+
+
+async def restart_scheduler() -> dict:
+    """Force a clean re-init of the scheduler without a redeploy: shut down the
+    current instance (if any), clear the module state, and re-run
+    start_scheduler(). Returns the post-restart diagnostics. Admin-triggered
+    recovery lever for the silent-stall class."""
+    global _SCHEDULER
+    old = _SCHEDULER
+    if old is not None:
+        try:
+            old.shutdown(wait=False)
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("audit_scheduler: shutdown during restart failed: %s", exc)
+    _SCHEDULER = None
+    await start_scheduler()
+    return scheduler_diagnostics()
 
 
 async def stop_scheduler() -> None:
