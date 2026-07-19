@@ -23,6 +23,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import time
+from decimal import Decimal
 from typing import Any, Dict, List, Mapping, Optional
 
 import httpx
@@ -50,6 +51,78 @@ def _summarize_error_reasons(
         text = str(error_reasons).strip()
     text = text or "all_runs_failed"
     return text[:max_len]
+
+
+def _grounded_call_count(
+    result: Optional[Dict[str, Any]],
+    usage: Optional[Mapping[str, Any]],
+) -> int:
+    """Number of grounded provider calls one probe response represents.
+
+    A single gateway probe bundles up to `runs_count` runs (see
+    _dispatch's max_runs cap), and `usage.input_tokens` is SUMMED across
+    them — so a flat per-call grounding surcharge must scale by the run
+    count, not be charged once. Prefer `succeeded_runs` (grounded calls
+    that actually returned; failed runs are left uncharged), falling back
+    to `runs_count`, then 1 for older gateway shapes that omit both."""
+    usage_block = usage if isinstance(usage, Mapping) else {}
+    res = result if isinstance(result, dict) else {}
+    for candidate in (usage_block.get("succeeded_runs"), res.get("succeeded_runs")):
+        if isinstance(candidate, int) and not isinstance(candidate, bool) and candidate >= 0:
+            return candidate
+    try:
+        runs_count = int(res.get("runs_count") or 0)
+    except (TypeError, ValueError):
+        runs_count = 0
+    if runs_count > 0:
+        return runs_count
+    return 1
+
+
+def _add_grounding_surcharge(
+    cost_usd: Optional[Decimal],
+    provider: str,
+    result: Optional[Dict[str, Any]],
+    usage: Optional[Mapping[str, Any]],
+) -> Optional[Decimal]:
+    """Add the server-side grounding surcharge to a token-based probe cost.
+
+    #1505: Gemini bills `google_search` grounding as a flat per-request
+    surcharge (~$0.035/grounded call) that is NOT captured in measured
+    tokens — unlike ChatGPT/Claude web_search, whose retrieved content
+    lands in input_tokens (so those must NOT get a separate fee, or COGS
+    double-counts). #1802 made the Agent count Gemini's tokens, but the
+    surcharge is still missing, understating Gemini per-provider cost ~50x.
+
+    Config drives the decision: only providers flagged
+    `grounding_fee_billed_separately` (Gemini today) get the additive fee,
+    applied once per grounded run. Token counts are never touched. Returns
+    cost_usd unchanged when there's no cost to add onto (None), the provider
+    isn't a separately-billed grounded lane, or no grounded run happened."""
+    if cost_usd is None:
+        return cost_usd
+    try:
+        from services.provider_credit_rates import (
+            provider_default_grounded,
+            provider_grounding_billed_separately,
+            provider_grounding_fee_usd_per_call,
+        )
+        if not (
+            provider_default_grounded(provider)
+            and provider_grounding_billed_separately(provider)
+        ):
+            return cost_usd
+        fee_per_call = provider_grounding_fee_usd_per_call(provider)
+        if fee_per_call <= 0:
+            return cost_usd
+        grounded_calls = _grounded_call_count(result, usage)
+        if grounded_calls <= 0:
+            return cost_usd
+        total = cost_usd + fee_per_call * Decimal(grounded_calls)
+        # Match Numeric(10, 6) precision of llm_probe_runs.cost_usd.
+        return total.quantize(Decimal("0.000001"))
+    except Exception:  # noqa: BLE001 — surcharge is best-effort like token cost
+        return cost_usd
 
 
 async def _record_probe_telemetry(
@@ -150,6 +223,9 @@ async def _record_probe_telemetry(
                         output_tokens=output_tokens,
                         cost_per_1k_input_tokens_usd=rates["input_per_1k"],
                         cost_per_1k_output_tokens_usd=rates["output_per_1k"],
+                    )
+                    cost_usd = _add_grounding_surcharge(
+                        cost_usd, provider, result, usage,
                     )
             except Exception:  # noqa: BLE001
                 pass  # cost is nice-to-have; row still records

@@ -19,7 +19,9 @@
       "prompt_fraction": 1.0,
       "input_cost_usd_per_1m_tokens": 0.30,
       "output_cost_usd_per_1m_tokens": 2.50,
-      "grounding_cost_usd_per_call": 0.0350
+      "grounding_cost_usd_per_call": 0.0350,
+      "grounding_fee_billed_separately": true,
+      "grounding_fee_note": "Gemini google_search grounding is a flat SERVER-SIDE surcharge (~$0.035/grounded request, Google list price confirmed via credit-metering path #1506/#1507) billed independent of tokens — NOT stuffed into input_tokens like ChatGPT/Claude web_search. #1802 made the Agent count Gemini prompt+tool+candidate tokens, but this per-call fee is still absent from measured cost_usd; grounding_fee_billed_separately=true tells the actual-usage cost path (#1505) to add grounding_cost_usd_per_call per grounded run on top of token COGS."
     },
     "chatgpt": {
       "aliases": ["openai_gpt_5_5_grounded", "gpt-5.5-grounded"],

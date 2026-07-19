@@ -62,6 +62,33 @@ def provider_default_grounded(provider: str) -> bool:
     return bool(entry.get("default_grounded", False))
 
 
+def provider_grounding_fee_usd_per_call(provider: str) -> Decimal:
+    """Server-side grounding surcharge for one grounded call, from config
+    (``grounding_cost_usd_per_call``). Decimal('0') when absent. Same value
+    the credit-metering path uses in ``provider_probe_cost_usd``; surfaced
+    here so the actual-usage cost path (db.llm_probe_runs.compute_cost_usd
+    callers) can add it too."""
+    entry = provider_rate_entry(provider)
+    return _decimal(entry.get("grounding_cost_usd_per_call", 0))
+
+
+def provider_grounding_billed_separately(provider: str) -> bool:
+    """True when the provider's grounding is a flat server-side per-call
+    surcharge that is NOT already reflected in measured token usage — e.g.
+    Gemini's ``google_search`` grounding (#1505), which Google bills per
+    grounded request independent of tokens. The actual-usage cost path must
+    add ``grounding_cost_usd_per_call`` on top of token COGS for these.
+
+    False for providers whose grounding is billed AS input tokens (ChatGPT
+    ``web_search_preview`` / Claude ``web_search`` stuff retrieved page
+    content into the prompt): their surcharge already shows up in measured
+    input_tokens, so adding a separate fee would over-count. Config-flagged
+    per provider via ``grounding_fee_billed_separately`` so a future
+    server-side-grounded provider opts in without a code change."""
+    entry = provider_rate_entry(provider)
+    return bool(entry.get("grounding_fee_billed_separately", False))
+
+
 def provider_probe_cost_usd(
     provider: str,
     *,
