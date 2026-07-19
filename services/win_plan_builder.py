@@ -458,9 +458,17 @@ def _sku_plan(
         row["competitors_named"].extend(fp.get("competitors_named") or [])
         if not row.get("prompt_source") and fp.get("prompt_source"):
             row["prompt_source"] = fp.get("prompt_source")
-        provider = str(fp.get("provider") or "").strip().lower()
-        if provider and provider not in row["providers"]:
-            row["providers"].append(provider)
+        # Provider union — tolerant of both entry shapes: the deduped source
+        # rows (#1502) carry a `providers` list (one row per unique query, all
+        # failing engines), while pre-fix rows (older stored reports) carry
+        # only the singular per-run `provider`.
+        fp_providers = [str(p).strip().lower() for p in (fp.get("providers") or [])]
+        singular = str(fp.get("provider") or "").strip().lower()
+        if singular:
+            fp_providers.append(singular)
+        for provider in fp_providers:
+            if provider and provider not in row["providers"]:
+                row["providers"].append(provider)
 
     uri_index = _uri_to_host_row(authority_hosts)
     # Niche-first: the merge preserves probe order, which front-loads the 1-2

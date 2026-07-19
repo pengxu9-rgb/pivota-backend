@@ -6215,7 +6215,22 @@ def _failing_prompts(
     brand_lower: str = "",
     brand_aliases: Tuple[str, ...] = (),
 ) -> List[Dict[str, Any]]:
+    """One entry per UNIQUE failing query (#1502).
+
+    Probes run per provider × per repeat, so a single failing query used to
+    emit one entry per failing RUN — merchant reports listed "best camera
+    drone" 2-3× per SKU, scaling with provider count (worst measured: 19
+    duplicate rows across one 3-SKU us_shopper run). The earlier duplicate fix
+    lived only in the win-plan CONSUMER (its per-query merge, win_plan_builder);
+    this dedupes at the source so every consumer (report UI, playbook,
+    outreach, summary) sees unique queries. Runs for a query already listed
+    still merge their evidence in: `providers` unions every failing engine
+    (win plan reads it, falling back to the legacy singular `provider`),
+    grounding_sources extend (host union is deduped downstream), and
+    competitors_named unions order-preserving. The cap counts unique queries.
+    """
     out: List[Dict[str, Any]] = []
+    by_query: Dict[str, Dict[str, Any]] = {}
     for run in _flatten_probe_runs(probe_runs):
         parsed = run.get("parsed") if isinstance(run.get("parsed"), dict) else {}
         url_match = run.get("url_match") if isinstance(run.get("url_match"), dict) else {}
@@ -6230,17 +6245,50 @@ def _failing_prompts(
         )
         if ok:
             continue
-        out.append({
+        provider = str(
+            run.get("_provider") or run.get("provider") or ""
+        ).strip().lower() or None
+        # Strip the merchant's own brand/aliases: this list feeds rival-
+        # framing copy (win-plan competitor benchmark, playbook pitch drafts
+        # + next_best_action competitor phrases via failed_queries_detailed),
+        # where surfacing the merchant as its own "competitor" reads as a
+        # bug. Same own-brand filter as the authority-map path (#1384).
+        competitors = _strip_own_brand_competitors(
+            parsed.get("competitors_listed")
+            or parsed.get("competitors_appearing")
+            or run.get("competitors_listed")
+            or [],
+            brand_lower,
+            brand_aliases,
+        )
+        query_key = re.sub(r"\s+", " ", str(run.get("query") or "").strip().lower())
+        existing = by_query.get(query_key) if query_key else None
+        if existing is not None:
+            # Duplicate failing run of an already-listed query — merge evidence.
+            if provider and provider not in existing["providers"]:
+                existing["providers"].append(provider)
+            existing["grounding_sources"] = list(existing.get("grounding_sources") or []) + list(run.get("grounding_sources") or [])
+            for name in competitors or []:
+                if name not in existing["competitors_named"]:
+                    existing["competitors_named"].append(name)
+            if not existing.get("prompt_source") and isinstance(run.get("axis_metadata"), dict):
+                existing["prompt_source"] = (run.get("axis_metadata") or {}).get("prompt_source")
+            continue
+        if len(out) >= cap:
+            # Cap reached for NEW queries; keep scanning so later duplicate
+            # runs of listed queries still merge their evidence above.
+            continue
+        entry = {
             "query": run.get("query"),
             "axis": (run.get("axis_metadata") or {}).get("axis") if isinstance(run.get("axis_metadata"), dict) else None,
             "reason": "no first-party or correct-SKU grounded citation",
             "evidence_run_id": run.get("_probe_run_id"),
-            # Which engine this failing run came from — the win plan merges the
-            # per-provider rows for one query into ONE labeled row (they used
-            # to render as unlabeled duplicates with contradictory limits).
-            "provider": str(
-                run.get("_provider") or run.get("provider") or ""
-            ).strip().lower() or None,
+            # Which engine(s) failed this query. `provider` (first engine)
+            # stays for back-compat (interleave_by_provider + old readers);
+            # `providers` carries the full failing-engine union for the win
+            # plan's label.
+            "provider": provider,
+            "providers": [provider] if provider else [],
             # Generator stamp (llm_winnable/llm_scenario) — the win plan uses
             # it to never treat a specific LLM discovery prompt as a bare head
             # term when gating the own-content win condition.
@@ -6250,22 +6298,11 @@ def _failing_prompts(
                 else None
             ),
             "grounding_sources": run.get("grounding_sources") or [],
-            # Strip the merchant's own brand/aliases: this list feeds rival-
-            # framing copy (win-plan competitor benchmark, playbook pitch drafts
-            # + next_best_action competitor phrases via failed_queries_detailed),
-            # where surfacing the merchant as its own "competitor" reads as a
-            # bug. Same own-brand filter as the authority-map path (#1384).
-            "competitors_named": _strip_own_brand_competitors(
-                parsed.get("competitors_listed")
-                or parsed.get("competitors_appearing")
-                or run.get("competitors_listed")
-                or [],
-                brand_lower,
-                brand_aliases,
-            ),
-        })
-        if len(out) >= cap:
-            break
+            "competitors_named": competitors,
+        }
+        if query_key:
+            by_query[query_key] = entry
+        out.append(entry)
     return out
 
 
