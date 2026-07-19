@@ -609,6 +609,19 @@ _ENDORSEMENT_ROLES = frozenset(
     {ROLE_INDEPENDENT_RETAILER, ROLE_EDITORIAL_REVIEW, ROLE_CREATOR, ROLE_FORUM}
 )
 
+# CHANNEL roles = hosts that are an actual SALES CHANNEL AI routes buyers to — a
+# retailer, a marketplace listing, or a competing store. These belong in the
+# "channels AI sends buyers to instead" section, where the competitive response is
+# a distribution/buy-path move (list your product there, or win the buy-path with
+# your Pivota canonical page). Editorial / review / creator / forum hosts are
+# AUTHORITY SOURCES, not channels: the engine GROUNDS on them, so the response is
+# "earn the citation" (win-plan / outreach), NOT "compete with them for the sale".
+# Unclassified is conservatively NOT a channel (unknown != sales channel). See
+# issue #1520.
+_CHANNEL_ROLES = frozenset(
+    {ROLE_MARKETPLACE_SELF_LISTING, ROLE_INDEPENDENT_RETAILER, ROLE_COMPETITOR}
+)
+
 
 def merchant_relative_role(
     host_type: Optional[str],
@@ -670,6 +683,16 @@ def is_endorsement_role(role: Optional[str]) -> bool:
     """True for roles that are a genuine independent recommendation (editorial /
     review / independent retailer / creator / community)."""
     return (role or "").strip().lower() in _ENDORSEMENT_ROLES
+
+
+def is_channel_role(role: Optional[str]) -> bool:
+    """True for roles that are an actual sales CHANNEL AI routes buyers to —
+    retailer / marketplace listing / competing store. False for authority sources
+    (editorial / review / creator / forum) and for unclassified hosts, which are
+    never a sales channel. Gates the "channels AI sends buyers to instead" section
+    so reviewer/publisher hosts don't render as places to "compete for the sale"
+    (issue #1520); those route to the win-plan "earn the citation" framing."""
+    return (role or "").strip().lower() in _CHANNEL_ROLES
 
 
 def reset_registry_cache() -> None:

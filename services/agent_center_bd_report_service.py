@@ -79,6 +79,7 @@ from services.buyer_path_controller_quality import (
 from services.cited_host_classifier import (
     classify_cited_hosts,
     classify_host,
+    is_channel_role,
     is_endorsement_role,
     is_findability_role,
     is_profile_retailer_name,
@@ -8455,7 +8456,13 @@ def _citation_signals(host_rows: List[Dict[str, Any]]) -> Dict[str, Any]:
     _channel_seen: set = set()
 
     def _note_channel(h: Optional[str], r: str, times_cited: int) -> None:
-        if not h or h in _channel_seen:
+        # #1520: only actual sales channels (retailer / marketplace / competing
+        # store) belong here. Editorial / review / creator / forum hosts are
+        # authority sources — they still surface in `cited_not_naming_hosts` and
+        # route to the win-plan "earn the citation" framing — and unclassified
+        # hosts default OUT (unknown != sales channel). Filtering here keeps the
+        # sibling `cited_not_naming_hosts` set (appended by callers) intact.
+        if not h or h in _channel_seen or not is_channel_role(r):
             return
         _channel_seen.add(h)
         entry: Dict[str, Any] = {"host": h, "times_cited": times_cited}
