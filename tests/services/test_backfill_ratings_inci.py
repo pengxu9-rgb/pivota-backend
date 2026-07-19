@@ -40,6 +40,24 @@ def _shopify_product(handle: str, *, with_inci: bool) -> dict:
     }
 
 
+def _brand_pdp(*, with_inci: bool) -> str:
+    """A brand PDP whose INCI (when present) lives in a 'Full Ingredients' modal
+    <p> — the metafield/accordion surface, NOT body_html — plus a marketing blurb
+    and a short 'key ingredients' highlight to exercise disambiguation."""
+    body = (
+        '<div class="product__desc"><p>A hydrating essence that absorbs quickly '
+        'and leaves your skin feeling fresh.</p></div>'
+        '<div class="key-ingredients"><h3>Key Ingredients</h3>'
+        '<p>Snail Secretion Filtrate, Betaine, Panthenol</p></div>'
+    )
+    if with_inci:
+        body += (
+            '<div class="more-popup__content"><h3>Full Ingredients</h3>'
+            "<p>" + _INCI + "</p></div>"
+        )
+    return "<html><body>" + body + "</body></html>"
+
+
 def _ld_block(with_rating: bool) -> str:
     obj = {
         "@context": "https://schema.org",
@@ -173,6 +191,83 @@ async def test_l1_dry_run_passes_dry_run_and_writes_nothing(monkeypatch):
     await bf._process_l1_row(row, cache={}, max_products=800, apply=False,
                              totals=totals, touched=set())
     assert len(calls) == 1 and calls[0]["dry_run"] is True  # ingest told not to write
+
+
+# --------------------------------------------------------------------------
+# Lane 3 — brand-official INCI from the rendered PDP (metafield/accordion)
+# --------------------------------------------------------------------------
+
+@pytest.mark.asyncio
+async def test_l3_pdp_writes_brand_official_inci(monkeypatch):
+    calls = _capture_intake(monkeypatch)
+    fetched = []
+    monkeypatch.setattr(bf, "fetch_text", lambda url: (fetched.append(url), _brand_pdp(with_inci=True))[1])
+
+    row = {"product_key": "pk_l3", "content_key": "ck_l3",
+           "canonical_url": "https://cosrx.com/products/snail-essence",
+           "source_domain": "cosrx.com"}
+    totals = _fresh_totals()
+    touched: set = set()
+    await bf._process_l3_row(row, cache={}, delay=0.0, apply=True, totals=totals, touched=touched)
+
+    # crawled the row's OWN brand PDP, wrote as brand_official via the real extractor
+    assert fetched == ["https://cosrx.com/products/snail-essence"]
+    assert len(calls) == 1
+    assert calls[0]["source"] == bf.INCI_SOURCE_BRAND_OFFICIAL
+    assert calls[0]["inci"] == _INCI          # the modal <p> list, not the highlight
+    assert calls[0]["dry_run"] is False
+    assert totals["l3_inci_written"] == 1
+    assert "ck_l3" in touched
+
+
+@pytest.mark.asyncio
+async def test_l3_provenance_guard_skips_foreign_domain(monkeypatch):
+    calls = _capture_intake(monkeypatch)
+    fetched = []
+    monkeypatch.setattr(bf, "fetch_text", lambda url: (fetched.append(url), _brand_pdp(with_inci=True))[1])
+
+    # canonical host (a retailer) != source_domain (the brand) -> never crawl/fill.
+    row = {"product_key": "pk_l3f", "content_key": "ck_l3f",
+           "canonical_url": "https://some-retailer.com/products/snail-essence",
+           "source_domain": "cosrx.com"}
+    totals = _fresh_totals()
+    await bf._process_l3_row(row, cache={}, delay=0.0, apply=True, totals=totals, touched=set())
+    assert fetched == [] and calls == []      # guard fires before any fetch
+    assert totals["l3_foreign_domain"] == 1
+
+
+@pytest.mark.asyncio
+async def test_l3_no_inci_on_pdp_stays_null(monkeypatch):
+    calls = _capture_intake(monkeypatch)
+    monkeypatch.setattr(bf, "fetch_text", lambda url: _brand_pdp(with_inci=False))
+
+    row = {"product_key": "pk_l3n", "content_key": "ck_l3n",
+           "canonical_url": "https://cosrx.com/products/snail-essence",
+           "source_domain": "cosrx.com"}
+    totals = _fresh_totals()
+    await bf._process_l3_row(row, cache={}, delay=0.0, apply=True, totals=totals, touched=set())
+    assert calls == []                        # never fabricate — no recoverable INCI
+    assert totals["l3_no_inci_on_pdp"] == 1
+
+
+@pytest.mark.asyncio
+async def test_l3_dry_run_passes_dry_run_and_caches(monkeypatch):
+    calls = _capture_intake(monkeypatch)
+    fetched = []
+    monkeypatch.setattr(bf, "fetch_text", lambda url: (fetched.append(url), _brand_pdp(with_inci=True))[1])
+
+    cache: dict = {}
+    row = {"product_key": "pk_l3d", "content_key": "ck_l3d",
+           "canonical_url": "https://cosrx.com/products/snail-essence",
+           "source_domain": "cosrx.com"}
+    totals = _fresh_totals()
+    await bf._process_l3_row(row, cache=cache, delay=0.0, apply=False, totals=totals, touched=set())
+    # a second row on the SAME url must hit the per-URL cache, not re-crawl
+    await bf._process_l3_row(dict(row, product_key="pk_l3d2"), cache=cache, delay=0.0,
+                             apply=False, totals=totals, touched=set())
+
+    assert fetched == ["https://cosrx.com/products/snail-essence"]  # crawled once, cached
+    assert len(calls) == 2 and all(c["dry_run"] is True for c in calls)  # ingest told not to write
 
 
 # --------------------------------------------------------------------------
@@ -321,6 +416,8 @@ def _fresh_totals() -> dict:
     return {k: 0 for k in (
         "l1_no_handle", "l1_foreign_domain", "l1_no_inci_on_storefront", "l1_rejected",
         "l1_inci_written", "l1_skipped_outranked",
+        "l3_no_handle", "l3_foreign_domain", "l3_no_inci_on_pdp", "l3_rejected",
+        "l3_inci_written", "l3_skipped_outranked",
         "l2_no_product", "l2_rating_written", "l2_rating_failed", "l2_no_rating_on_page",
         "l2_inci_written", "l2_inci_skipped_outranked", "l2_inci_rejected", "l2_no_inci_on_page",
     )}

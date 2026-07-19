@@ -9,15 +9,28 @@ the data using the SAME merged extraction functions, so nothing is fabricated an
 the decision-intelligence authoring pass (which reads INCI for evidence bullets)
 has something to read.
 
-Two lanes, prefer brand-official (ADR-001 precedence):
+Three lanes, prefer brand-official (ADR-001 precedence):
 
-  1. INCI (brand-official) — Shopify storefronts. For a cohort row whose
+  1. INCI (brand-official, body_html) — Shopify storefronts. For a cohort row whose
      canonical_url is https://{domain}/products/{handle} AND host==source_domain,
      fetch that domain's /products.json (cached per-domain like the description
      backfill), find the product by handle, run
      curated_brand_feed.inci_from_body_html(body_html), and write via
      canonical_inci_intake.ingest_canonical_inci(source='brand_official'). This is
-     the primary lane — a batched storefront read, not a web re-crawl.
+     the primary lane — a batched storefront read, not a web re-crawl. But the
+     K-beauty cohort keeps INCI OUT of body_html (~4.6% recovered), so most rows
+     fall through to lane 3.
+
+  3. INCI (brand-official, rendered PDP) — for a cohort row STILL missing
+     brand-official INCI after lane 1, POLITELY re-crawl the row's OWN brand PDP
+     (canonical_url, guarded host==source_domain) and run
+     curated_brand_feed.inci_from_pdp_html(html) — which recovers the INCI the
+     theme renders from a product metafield / "Full Ingredients" accordion (not in
+     /products.json). Same brand-official write + precedence. This is the missing
+     source: cohort discovery (2026-07-19) found 4/6 brands (cosrx, axis-y, iunik,
+     skin1004) expose per-product INCI here; beautyofjoseon (global glossary page)
+     and anua (client-rendered) do not, and stay null. Crawl is cached per-URL,
+     delayed, and run off the event loop (asyncio.to_thread) exactly like lane 2.
 
   2. Ratings + reseller INCI (StyleKorean) — for a cohort row carrying a
      stylekorean_global catalog_offers row, re-crawl that offer's SK PDP
@@ -84,6 +97,7 @@ from services.catalog_enrichment_agent.ingestion import (  # noqa: E402
 from services.curated_brand_feed import (  # noqa: E402
     fetch_shopify_products,
     inci_from_body_html,
+    inci_from_pdp_html,
 )
 from services.retailer_ingest.sitemap_crawler import (  # noqa: E402
     extract_product,
@@ -316,6 +330,67 @@ async def _process_l1_row(
 
 
 # --------------------------------------------------------------------------
+# Lane 3 — brand-official INCI from the rendered PDP (polite web re-crawl)
+# --------------------------------------------------------------------------
+
+async def _crawl_pdp_inci(url: str, cache: Dict[str, Optional[str]], delay: float) -> Optional[str]:
+    """Polite, cached brand-PDP fetch → inci_from_pdp_html. Returns the INCI string
+    or None. fetch_text carries the PivotaBot UA + Retry-After-aware retry; we add
+    an inter-request delay and run the blocking urllib call off the event loop
+    (exactly like lane 2's SK crawl)."""
+    if url in cache:
+        return cache[url]
+    if delay > 0:
+        await asyncio.sleep(delay)
+    try:
+        html = await asyncio.to_thread(fetch_text, url)
+        result = inci_from_pdp_html(html)
+    except Exception as exc:  # noqa: BLE001 — a dead PDP must not abort the lane
+        print(f"  WARN PDP crawl failed {url}: {type(exc).__name__}: {str(exc)[:120]}")
+        result = None
+    cache[url] = result
+    return result
+
+
+async def _process_l3_row(
+    r: Dict[str, Any],
+    *,
+    cache: Dict[str, Optional[str]],
+    delay: float,
+    apply: bool,
+    totals: Dict[str, int],
+    touched: set,
+) -> None:
+    host, handle = handle_from_url(r["canonical_url"])
+    # Same provenance guard as lane 1 (ADR-001): fill ONLY from the row's OWN brand
+    # storefront. A retailer canonical_url or NULL source_domain is skipped — a
+    # retailer PDP must never become a brand-official INCI list. www.-insensitive.
+    if not host or not handle:
+        totals["l3_no_handle"] += 1
+        return
+    src_domain = str(r.get("source_domain") or "").strip().lower().removeprefix("www.")
+    if host.removeprefix("www.") != src_domain:
+        totals["l3_foreign_domain"] += 1
+        return
+    inci = await _crawl_pdp_inci(str(r["canonical_url"]), cache, delay)
+    if not inci:
+        totals["l3_no_inci_on_pdp"] += 1
+        return
+    res = await ingest_canonical_inci(
+        r["product_key"], inci, INCI_SOURCE_BRAND_OFFICIAL, dry_run=not apply
+    )
+    if res.get("status") != "ok":
+        totals["l3_rejected"] += 1
+        return
+    if res.get("written_skus"):
+        totals["l3_inci_written"] += 1
+        if r.get("content_key"):
+            touched.add(str(r["content_key"]))
+    else:
+        totals["l3_skipped_outranked"] += 1
+
+
+# --------------------------------------------------------------------------
 # Lane 2 — StyleKorean ratings + reseller INCI (polite web re-crawl)
 # --------------------------------------------------------------------------
 
@@ -424,11 +499,13 @@ async def _paginate(query: str, base_params: Dict[str, Any], limit: Optional[int
 
 async def run(args: argparse.Namespace) -> int:
     await _reconnect()
-    lanes = {s.strip() for s in args.lanes.split(",") if s.strip()} or {"inci", "rating"}
+    lanes = {s.strip() for s in args.lanes.split(",") if s.strip()} or {"inci", "pdp", "rating"}
     apply = args.apply
     totals: Dict[str, int] = {k: 0 for k in (
         "l1_no_handle", "l1_foreign_domain", "l1_no_inci_on_storefront", "l1_rejected",
         "l1_inci_written", "l1_skipped_outranked",
+        "l3_no_handle", "l3_foreign_domain", "l3_no_inci_on_pdp", "l3_rejected",
+        "l3_inci_written", "l3_skipped_outranked",
         "l2_no_product", "l2_rating_written", "l2_rating_failed", "l2_no_rating_on_page",
         "l2_inci_written", "l2_inci_skipped_outranked", "l2_inci_rejected", "l2_no_inci_on_page",
     )}
@@ -454,6 +531,32 @@ async def run(args: argparse.Namespace) -> int:
               f"no_inci_on_storefront={totals['l1_no_inci_on_storefront']} "
               f"foreign_domain={totals['l1_foreign_domain']} "
               f"outranked={totals['l1_skipped_outranked']} rejected={totals['l1_rejected']}")
+
+    if "pdp" in lanes:
+        # Same cohort as lane 1 (brand-official Shopify rows still missing
+        # brand-official INCI). Run AFTER lane 1 so the cheap body_html fills land
+        # first and this per-PDP crawl only touches what body_html couldn't. The
+        # cohort SQL is stateless (NOT EXISTS brand-official INCI), so lane-1 writes
+        # in this same run fall out of lane 3's fresh query — resumable/idempotent.
+        n = (await _healed_fetch_all(_L1_COUNT, {"src": COHORT_SOURCE_SYSTEM}))[0]["n"]
+        print(f"[lane3/pdp] cohort = {n} brand-official rows still missing INCI  (apply={apply})")
+        cache3: Dict[str, Optional[str]] = {}
+        limit = args.sample if not apply else args.limit
+        i = 0
+        async for r in _paginate(_L1_COHORT, {"src": COHORT_SOURCE_SYSTEM}, limit):
+            i += 1
+            try:
+                await _process_l3_row(r, cache=cache3, delay=args.pdp_delay,
+                                      apply=apply, totals=totals, touched=touched)
+            except Exception as exc:  # noqa: BLE001 — one bad row never aborts the lane
+                if _should_heal(exc):
+                    await _reconnect()
+                print(f"  WARN l3 row pk={r.get('product_key')}: {type(exc).__name__}: {str(exc)[:120]}")
+        print(f"[lane3/pdp] processed {i} row(s): "
+              f"would_write_inci={totals['l3_inci_written']} "
+              f"no_inci_on_pdp={totals['l3_no_inci_on_pdp']} "
+              f"foreign_domain={totals['l3_foreign_domain']} "
+              f"outranked={totals['l3_skipped_outranked']} rejected={totals['l3_rejected']}")
 
     if "rating" in lanes:
         n = (await _healed_fetch_all(_L2_COUNT, {"src": COHORT_SOURCE_SYSTEM, "sk": SK_MERCHANT_ID}))[0]["n"]
@@ -500,14 +603,16 @@ def main() -> int:
         description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter
     )
     p.add_argument("--apply", action="store_true", help="write updates (default: dry-run)")
-    p.add_argument("--lanes", default="inci,rating",
-                   help="comma list of lanes to run: inci,rating (default both)")
+    p.add_argument("--lanes", default="inci,pdp,rating",
+                   help="comma list of lanes to run: inci,pdp,rating (default all)")
     p.add_argument("--sample", type=int, default=25,
                    help="dry-run: max rows PER LANE to probe (caps the crawl)")
     p.add_argument("--limit", type=int, default=None,
                    help="apply: cap total rows per lane (default: whole cohort)")
     p.add_argument("--sk-delay", type=float, default=0.5,
                    help="lane2: inter-request politeness delay, seconds")
+    p.add_argument("--pdp-delay", type=float, default=0.5,
+                   help="lane3: inter-request PDP-crawl politeness delay, seconds")
     p.add_argument("--max-products", type=int, default=800,
                    help="lane1: max products fetched per Shopify storefront")
     args = p.parse_args()
