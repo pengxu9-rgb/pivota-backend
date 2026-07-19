@@ -47,6 +47,16 @@ async def scheduler_health() -> Dict[str, Any]:
             "jobs": [],
         }
 
+    # Real runtime state — state_name distinguishes RUNNING from PAUSED, which
+    # the `running` flag below CANNOT (it is `state != STOPPED`, so a paused
+    # scheduler that fires nothing still reports running:True).
+    diag: Dict[str, Any] = {}
+    try:
+        from services.audit_scheduler import scheduler_diagnostics
+        diag = scheduler_diagnostics()
+    except Exception as exc:  # noqa: BLE001
+        diag = {"diag_error": str(exc)}
+
     scheduler = get_scheduler()
     if scheduler is None:
         return {
@@ -57,6 +67,7 @@ async def scheduler_health() -> Dict[str, Any]:
             ),
             "job_count": 0,
             "jobs": [],
+            **diag,
         }
 
     # APScheduler instance present; report registered jobs.
@@ -77,10 +88,12 @@ async def scheduler_health() -> Dict[str, Any]:
             "reason": f"get_jobs() raised: {exc!s}",
             "job_count": 0,
             "jobs": [],
+            **diag,
         }
 
     return {
         "running": bool(getattr(scheduler, "running", False)),
         "job_count": len(jobs),
         "jobs": jobs,
+        **diag,
     }

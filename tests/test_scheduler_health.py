@@ -127,3 +127,31 @@ def test_scheduler_health_does_not_500_when_get_jobs_raises(
     body = response.json()
     assert "reason" in body
     assert "unstable state" in body["reason"]
+
+
+def test_scheduler_health_surfaces_paused_silent_stall(client, monkeypatch):
+    """THE silent-stall class: a PAUSED scheduler whose every job has
+    next_run_time=None fires NOTHING, yet `running` (state != STOPPED) is
+    still True. The diagnostic must distinguish it: state_name='PAUSED' and
+    fireable_job_count=0, so operators aren't fooled by running:True."""
+    import services.audit_scheduler as audit_scheduler
+
+    class _Job:
+        def __init__(self, jid):
+            self.id = jid
+            self.next_run_time = None  # paused → no next fire
+            self.trigger = "cron[hour=4]"
+
+    class _PausedScheduler:
+        running = True          # state != STOPPED → property is True even paused
+        state = 2               # STATE_PAUSED
+        def get_jobs(self):
+            return [_Job("nightly_index_health"), _Job("audit_run_worker_tick")]
+
+    monkeypatch.setattr(audit_scheduler, "_SCHEDULER", _PausedScheduler())
+
+    body = client.get("/__scheduler_health").json()
+    assert body["running"] is True            # the misleading legacy flag
+    assert body["state_name"] == "PAUSED"     # the truth the diagnostic adds
+    assert body["fireable_job_count"] == 0    # nothing will fire
+    assert body["job_count"] == 2
