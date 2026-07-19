@@ -183,11 +183,35 @@ SQL/script backfill: `db.agents.set_agent_public_key(agent_id, pem)`.
 
 #### 2c. (Only if the pilot uses mandate authority) trusted issuers
 
-If pilot transactions carry an Intent→Cart→Payment `mandate_chain`, each agent's
-**authorizing issuer DID(s)** must be registered in `ap2_trusted_issuers`
-(`db.ap2_trusted_issuers.add_trusted_issuer(agent_id, issuer_did)`), else every
-mandate is denied (empty set = deny by default). Not needed for the plain
-consent-scope transaction path.
+If pilot transactions carry an Intent→Cart→Payment `mandate_chain`, the mandate's
+**authorizing issuer DID** must be trusted, else every mandate is denied (empty set
+= deny by default). Enroll issuers via the admin endpoint (#1495) — two scopes:
+
+```
+POST /admin/ap2/trusted-issuers            (admin auth)
+{ "issuer_did": "did:web:issuer.example.com", "scope": "global" }   # trusted for ANY agent's mandate
+{ "issuer_did": "did:key:z6Mk…", "scope": "agent", "agent_id": "agent_1" }   # trusted only for that agent
+→ 200 { "status": "trusted", "issuer_did": "…", "scope": "…", "agent_id": … }
+```
+
+- **`scope: global`** — a platform/frontier/app issuer trusted to authorize the
+  **whole fleet**: enroll once, no per-agent approval ("approve issuers, not
+  agents"). This is the external-agent scale path.
+- **`scope: agent`** — a per-agent binding (the user-as-issuer / personal-agent
+  case), requires an existing `agent_id`.
+
+The endpoint resolves the issuer DID as **proof-of-control** before trusting it (a
+`did:web` is honored only if its domain serves a `.well-known/did.json` binding that
+DID; a `did:key` is self-certifying) — a typo'd / dead / unowned issuer is refused
+(`400`). Revoke with `POST /admin/ap2/trusted-issuers/revoke` (effective on the next
+transaction — the trusted set is read live); list/audit with `GET
+/admin/ap2/trusted-issuers`. Not needed for the plain consent-scope transaction
+path. Equivalent low-level helpers: `db.ap2_trusted_issuers.add_global_trusted_issuer`
+/ `add_trusted_issuer(agent_id, …)`.
+
+The broader "outside agents at scale" workstream (self-serve issuer enrollment,
+account-level trust, SSRF IP-pinning) is tracked in
+[#1495](https://github.com/pengxu9-rgb/pivota-backend/issues/1495).
 
 ### 3. Provision agent wallets (confirm path)
 
