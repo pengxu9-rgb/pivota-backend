@@ -1128,6 +1128,15 @@ def build_sku_attribute_graph(product: dict) -> dict:
     return {"classes": classes, "evidence": evidence}
 
 
+# Tail-noun fallback stoplist (#1503): product_type tails that are container /
+# department words, not buyer-facing categories — "Beauty" must not become
+# "best beauty". Supplement stays excluded for the same reason as above.
+_TAIL_NOUN_STOPLIST = frozenset({
+    "beauty", "care", "misc", "general", "default", "other", "goods",
+    "merchandise", "accessories", "supplement", "supplements",
+})
+
+
 def _first_buyer_category(classes: Mapping[str, List[str]], product_type: str) -> Optional[str]:
     for category in classes.get("category") or []:
         cleaned = _clean_attr(category)
@@ -1141,6 +1150,22 @@ def _first_buyer_category(classes: Mapping[str, List[str]], product_type: str) -
             and category != "supplement"
         ):
             return category
+    # #1503 vertical-agnostic fallback: the lexicon above is beauty-fitted, so a
+    # non-beauty SKU ("Camera Drone", "Bone Conduction Headphones") resolved no
+    # category and the whole generator returned [] for every non-beauty vertical.
+    # Use the cleaned product_type's tail noun ("drone", "headphones") — the
+    # buyer-facing head of a "<modifiers> <noun>" product type — guarded by a
+    # container-word stoplist so "Beauty"/"Supplements" never become categories.
+    tail_tokens = re.findall(r"[a-z0-9]+", product_type_text)
+    if tail_tokens:
+        tail = tail_tokens[-1]
+        if (
+            len(tail) >= 4
+            and not tail.isdigit()
+            and tail not in _GENERIC_CATEGORIES
+            and tail not in _TAIL_NOUN_STOPLIST
+        ):
+            return tail
     return None
 
 
@@ -1456,6 +1481,24 @@ def generate_sidewalk_query_specs(
 
     for proof in proofs[:3]:
         add(f"{proof} {category}", [proof, category], 0.82)
+
+    # #1503 chooser fallback: every shape above stacks the category with a
+    # SECONDARY evidenced attribute, so a category-only graph (thin beauty SKU,
+    # any non-beauty vertical whose attributes the beauty lexicons can't see)
+    # produced ZERO candidates and suggested_prompts stayed empty. When the
+    # attribute shapes yielded nothing, emit a small deterministic chooser set —
+    # generic buyer-decision queries any category supports. Low intent_weight
+    # ranks them below every attribute-stacked shape; the probed-set subtraction
+    # upstream still removes any of these the audit already ran. No behavior
+    # change for SKUs with a single attribute-stacked candidate or more.
+    if not candidates:
+        for query, weight in (
+            (f"best {category}", 0.40),
+            (f"how to choose a {category}", 0.38),
+            (f"{category} buying guide", 0.36),
+            (f"best {category} for beginners", 0.34),
+        ):
+            add(query, [category], weight)
 
     deduped: Dict[str, Dict[str, Any]] = {}
     for item in candidates:
