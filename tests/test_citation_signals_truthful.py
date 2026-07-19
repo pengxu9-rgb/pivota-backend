@@ -104,21 +104,57 @@ def test_channel_competition_advice_by_role():
 
 
 def test_channels_ai_cites_instead_carries_role_and_advice():
+    # #1520: the channels section is retailer/marketplace/competitor ONLY. An
+    # editorial host that grounded a category answer is an AUTHORITY source, not a
+    # sales channel — it stays in `cited_not_naming_hosts` (and routes to win-plan
+    # outreach) but must NOT render as a place to "compete for the sale".
     sig = _citation_signals([
         _row("aruen.com", "own_domain", exact=True),                              # own — not a channel
         _row("target.com", "marketplace_self_listing", exact=True),               # named — findability, not a channel
-        _row("gnc.com", "independent_retailer", exact=False, count=4),            # cited-instead retailer
-        _row("goodhousekeeping.com", "editorial_review", category=True),          # cited-instead editorial
-        _row("rivalstore.com", "competitor", count=7),                            # competitor
+        _row("gnc.com", "independent_retailer", exact=False, count=4),            # cited-instead retailer -> channel
+        _row("goodhousekeeping.com", "editorial_review", category=True),          # editorial -> NOT a channel
+        _row("rivalstore.com", "competitor", count=7),                            # competitor -> channel
     ])
     chans = {c["host"]: c for c in sig["channels_ai_cites_instead"]}
     assert "aruen.com" not in chans and "target.com" not in chans
-    assert set(chans) == {"gnc.com", "goodhousekeeping.com", "rivalstore.com"}
+    # editorial excluded from channels but still tracked as "cited instead"
+    assert "goodhousekeeping.com" not in chans
+    assert "goodhousekeeping.com" in sig["cited_not_naming_hosts"]
+    assert set(chans) == {"gnc.com", "rivalstore.com"}
     assert chans["gnc.com"]["role_label"] == "Retailer"
     assert chans["gnc.com"]["times_cited"] == 4
     assert chans["rivalstore.com"]["role_label"] == "Competing store"
     assert "buy-path" in chans["rivalstore.com"]["how_to_compete"].lower()
-    assert chans["goodhousekeeping.com"]["how_to_compete"]
+
+
+def test_channels_exclude_reviewer_publisher_hosts_drone_vertical():
+    # #1520 drone-report acceptance: reviewer/publisher hosts (thedronegirl,
+    # techradar-class editorial + a YouTube reviewer + a forum) must NOT appear in
+    # the channels section, while retail/marketplace channels (amazon, bestbuy)
+    # remain. The excluded hosts still surface as "cited instead" for the win-plan.
+    sig = _citation_signals([
+        _row("amazon.com", "marketplace_self_listing", exact=False, count=9),     # channel
+        _row("bestbuy.com", "independent_retailer", exact=False, count=6),        # channel
+        _row("thedronegirl.com", "editorial_review", category=True, count=5),     # authority, NOT channel
+        _row("techradar.com", "editorial_review", category=True, count=8),        # authority, NOT channel
+        _row("youtube.com", "creator", category=True, count=4),                   # authority, NOT channel
+        _row("reddit.com", "forum", category=True, count=3),                      # authority, NOT channel
+    ])
+    chans = {c["host"] for c in sig["channels_ai_cites_instead"]}
+    assert chans == {"amazon.com", "bestbuy.com"}
+    # the reviewer/publisher hosts are still tracked as "cited instead" (win-plan)
+    assert {"thedronegirl.com", "techradar.com", "youtube.com", "reddit.com"} <= set(
+        sig["cited_not_naming_hosts"]
+    )
+
+
+def test_channels_exclude_unclassified_hosts():
+    # #1520: unknown != sales channel — an unclassified host defaults OUT.
+    sig = _citation_signals([
+        _row("amazon.com", "marketplace_self_listing", exact=False, count=2),
+        _row("mystery.example", "unclassified", exact=False, count=2),
+    ])
+    assert {c["host"] for c in sig["channels_ai_cites_instead"]} == {"amazon.com"}
 
 
 def test_channels_ai_cites_instead_deduped_by_host():
