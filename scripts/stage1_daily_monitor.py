@@ -139,6 +139,10 @@ def _check_a3_rollup_reconciliation(cur) -> CheckResult:
           FROM commerce_attribution_edges cae
           WHERE (cae.created_at AT TIME ZONE 'UTC')::date = gad.date
             AND cae.merchant_id = gad.merchant_id
+            -- Match the gated rollup (#1481): inferred edges are excluded there, so
+            -- excluding them here too keeps the reconciliation from flagging their
+            -- (never-billed) GMV as drift.
+            AND (cae.metadata->>'inferred')::boolean IS NOT TRUE
         ) cae_sum ON TRUE
         WHERE gad.date >= CURRENT_DATE - INTERVAL '7 days'
           AND {_CLOCK_FILTER_SQL.replace("merchant_id", "gad.merchant_id")}
@@ -188,6 +192,7 @@ def _check_future_date_dryrun(cur) -> CheckResult:
           WHERE (e.created_at AT TIME ZONE 'UTC')::date = CURRENT_DATE + INTERVAL '30 days'
             AND (CAST(NULL AS TEXT) IS NULL OR e.merchant_id = CAST(NULL AS TEXT))
             AND e.gross_attributed_gmv_cents IS NOT NULL
+            AND (e.metadata->>'inferred')::boolean IS NOT TRUE  -- mirror the gated rollup (#1481)
           GROUP BY (e.created_at AT TIME ZONE 'UTC')::date, e.merchant_id
         )
         SELECT COUNT(*) AS rollup_count FROM rollup;
