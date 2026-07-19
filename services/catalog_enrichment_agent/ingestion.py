@@ -183,10 +183,43 @@ def _build_pdp_payload(record: Dict[str, Any]) -> Dict[str, Any]:
         "source_domain": source_domain,
         "tags": tags,
         "agent_version": AGENT_VERSION,
+        # Optional review signal → catalog_products.rating_value/rating_count.
+        # Absent/unparseable stays None (never fabricated); ingest is never
+        # blocked on a missing rating.
+        "rating_value": _coerce_rating_value(pdp.get("rating_value")),
+        "rating_count": _coerce_rating_count(pdp.get("rating_count")),
+        # Optional published INCI → beauty_sku_ingredients at apply time, with
+        # its provenance tier (brand_official > reseller_listing). Kept out of the
+        # catalog_products columns on purpose — INCI lives in the beauty tables.
+        "raw_inci": (str(pdp.get("raw_inci")).strip() or None) if pdp.get("raw_inci") else None,
+        "inci_source": str(pdp.get("inci_source") or "").strip() or None,
     }
     if not payload["brand"] or not payload["product_name"]:
         return {}
     return payload
+
+
+def _coerce_rating_value(value: Any) -> Optional[float]:
+    """Coerce to a 0–5 star rating; NULL outside that range (defense-in-depth for
+    a hand-authored Path-C JSONL that bypasses the JSON-LD parser's range guard —
+    a mis-scaled/negative rating is dropped, never stored)."""
+    if value is None or value == "":
+        return None
+    try:
+        rating = float(str(value).strip())
+    except (TypeError, ValueError):
+        return None
+    return rating if 0 <= rating <= 5 else None
+
+
+def _coerce_rating_count(value: Any) -> Optional[int]:
+    if value is None or value == "":
+        return None
+    try:
+        count = int(float(str(value).strip()))
+    except (TypeError, ValueError):
+        return None
+    return count if count >= 0 else None
 
 
 def _build_pdp_insert(
@@ -291,6 +324,11 @@ def _build_pdp_insert(
             pdp_payload.get("product_name"),
             pdp_payload.get("gtin") or None,
         ),
+        # Review signal columns (mig 186). Additive + nullable — a product with no
+        # reviews lands NULL, and these never touch offer pricing. Consumed by the
+        # decision-intelligence lane as rating_value / rating_count.
+        "rating_value": pdp_payload.get("rating_value"),
+        "rating_count": pdp_payload.get("rating_count"),
     }
 
 
@@ -692,15 +730,43 @@ def ingest_validated_record(record: Dict[str, Any], *, source_jsonl: Optional[st
         pdp_payload=pdp_payload,
         offers=offers,
     )
+    inci_row = _build_inci_row(
+        product_key=pdp_row["product_key"],
+        sku_key=sku_row["sku_key"],
+        pdp_payload=pdp_payload,
+    )
     return {
         "pdp": pdp_row,
         "sku": sku_row,
         "merchants": merchant_rows,
         "offers": offer_rows,
         "seeds": seed_rows,
+        "inci": inci_row,
         "audit_reasons": _identifier_audit_reasons(
             extract_strong_identifier(pdp_payload.get("strong_identity"))
         ),
+    }
+
+
+def _build_inci_row(
+    *,
+    product_key: str,
+    sku_key: str,
+    pdp_payload: Dict[str, Any],
+) -> Optional[Dict[str, Any]]:
+    """One optional beauty_sku_ingredients write intent per PDP that carried a
+    published INCI list. sku_key is the canonical SKU (product_key || '::canonical').
+    None when the record exposed no INCI — ingest is never blocked on it. Source
+    precedence (brand_official > reseller_listing) is enforced by the apply-time
+    writer (canonical_inci_intake.may_write), not here."""
+    raw_inci = pdp_payload.get("raw_inci")
+    if not raw_inci:
+        return None
+    return {
+        "product_key": product_key,
+        "sku_key": sku_key,
+        "raw_inci": str(raw_inci),
+        "source": pdp_payload.get("inci_source") or "reseller_listing",
     }
 
 
@@ -722,6 +788,7 @@ def ingest_validated_jsonl(
     merchant_rows: List[Dict[str, Any]] = []
     offer_rows: List[Dict[str, Any]] = []
     seed_rows: List[Dict[str, Any]] = []
+    inci_rows: List[Dict[str, Any]] = []
     audit_reasons: Dict[str, int] = {}
     skipped = 0
     for record in rows:
@@ -734,6 +801,8 @@ def ingest_validated_jsonl(
         merchant_rows.extend(result["merchants"])
         offer_rows.extend(result["offers"])
         seed_rows.extend(result["seeds"])
+        if result.get("inci"):
+            inci_rows.append(result["inci"])
         for reason, count in (result.get("audit_reasons") or {}).items():
             audit_reasons[reason] = audit_reasons.get(reason, 0) + int(count or 0)
 
@@ -752,6 +821,7 @@ def ingest_validated_jsonl(
         "merchants": _dedupe(merchant_rows, "merchant_id"),
         "offers": _dedupe(offer_rows, "offer_id"),
         "seeds": _dedupe(seed_rows, "id"),
+        "incis": _dedupe(inci_rows, "sku_key"),
         "skipped": skipped,
         "audit_reasons": audit_reasons,
     }

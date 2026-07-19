@@ -70,6 +70,12 @@ def to_validated_record(crawled: Dict[str, Any]) -> Dict[str, Any]:
         price = float(price_raw) if price_raw not in (None, "") else None
     except (TypeError, ValueError):
         price = None
+    # Optional review + ingredient signals off the PDP. Both stay null when the
+    # page didn't expose them (never invented). rating_value/rating_count feed the
+    # catalog_products review columns; raw_inci feeds beauty_sku_ingredients at
+    # ingest. StyleKorean is a SUPPLIER (ADR-001), so its INCI is tagged
+    # reseller-tier — it can seed an empty canonical but never downgrades a
+    # brand-official/supplier list.
     return {
         "pdp": {
             "brand": crawled.get("brand"),
@@ -78,6 +84,10 @@ def to_validated_record(crawled: Dict[str, Any]) -> Dict[str, Any]:
             "image_url": crawled.get("image_url"),
             "source_domain": SOURCE_DOMAIN,
             "gtin": None,  # StyleKorean does not expose GTIN; hardened via brand-official enrich
+            "rating_value": crawled.get("rating_value"),
+            "rating_count": crawled.get("rating_count"),
+            "raw_inci": crawled.get("raw_inci"),
+            "inci_source": "reseller_listing",
         },
         "offers": [
             {

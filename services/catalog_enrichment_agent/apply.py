@@ -64,7 +64,7 @@ _PDP_UPSERT_SQL = """
                    price_tier, use_case_tags, lifestyle_tags, demographic,
                    pdp_lifecycle_stage,
                    pdp_scope, pdp_scope_source, pdp_scope_set_at,
-                   content_key, gtin)
+                   content_key, gtin, rating_value, rating_count)
                 VALUES
                   (:product_key, :merchant_id, :platform, :source_product_id,
                    :pivota_signature_id, :pivota_canonical_url, :pivota_signature_minted_at,
@@ -79,7 +79,7 @@ _PDP_UPSERT_SQL = """
                    :demographic,
                    :pdp_lifecycle_stage,
                    :pdp_scope, :pdp_scope_source, NOW(),
-                   :content_key, :gtin)
+                   :content_key, :gtin, :rating_value, :rating_count)
                 ON CONFLICT (product_key) DO UPDATE SET
                   pivota_signature_id = COALESCE(catalog_products.pivota_signature_id, EXCLUDED.pivota_signature_id),
                   pivota_canonical_url = COALESCE(catalog_products.pivota_canonical_url, EXCLUDED.pivota_canonical_url),
@@ -103,6 +103,10 @@ _PDP_UPSERT_SQL = """
                   pdp_scope_set_at = NOW(),
                   content_key = COALESCE(EXCLUDED.content_key, catalog_products.content_key),
                   gtin = COALESCE(EXCLUDED.gtin, catalog_products.gtin),
+                  -- Review signal: a fresh value wins, but a NULL re-derivation
+                  -- (page dropped its aggregateRating) never blanks a captured one.
+                  rating_value = COALESCE(EXCLUDED.rating_value, catalog_products.rating_value),
+                  rating_count = COALESCE(EXCLUDED.rating_count, catalog_products.rating_count),
                   updated_at = NOW()
                 """
 
@@ -303,6 +307,46 @@ def _filter_children_of_skipped(
     return skus, offers, seeds
 
 
+async def _apply_inci_rows(
+    inci_rows: list,
+    *,
+    database: Any,
+    skipped_product_keys: set,
+) -> Dict[str, int]:
+    """Write each captured INCI list into beauty_sku_ingredients via the canonical
+    INCI intake (source-precedence + verified-actives + serving recompute). Runs
+    AFTER products + skus land so the intake can resolve the product's canonical
+    SKU. INCI is OPTIONAL: a row for a skipped/failed product is dropped, a
+    non-INCI blob is rejected by the intake, and any per-row failure is logged and
+    counted — never aborts the apply."""
+    counts = {"inci_written": 0, "inci_skipped": 0}
+    if not inci_rows:
+        return counts
+    from services.canonical_inci_intake import ingest_canonical_inci
+
+    for row in inci_rows:
+        pk = row.get("product_key")
+        if not pk or pk in skipped_product_keys:
+            counts["inci_skipped"] += 1
+            continue
+        try:
+            res = await ingest_canonical_inci(
+                pk,
+                str(row.get("raw_inci") or ""),
+                str(row.get("source") or "reseller_listing"),
+                db=database,
+            )
+            if res.get("status") == "ok" and res.get("written_skus"):
+                counts["inci_written"] += 1
+            else:
+                counts["inci_skipped"] += 1
+        except Exception as exc:  # noqa: BLE001 — INCI is best-effort; products/offers already landed
+            counts["inci_skipped"] += 1
+            logger.warning("apply_ingest_plan INCI write failed for product_key=%s — %s",
+                           pk, str(exc)[:200])
+    return counts
+
+
 async def apply_ingest_plan(
     plan: Dict[str, Any],
     *,
@@ -415,6 +459,15 @@ async def apply_ingest_plan(
             counts["seeds"] += 1
         except Exception as exc:  # noqa: BLE001
             logger.exception("insert seed failed for id=%s — %s", seed.get("id"), exc)
+
+    # 6. beauty_sku_ingredients — optional INCI capture (after skus exist).
+    counts.update(
+        await _apply_inci_rows(
+            plan.get("incis") or [],
+            database=database,
+            skipped_product_keys=skipped_product_keys,
+        )
+    )
 
     await write_writer_audit_log(audit)
     logger.info("apply_ingest_plan applied: %s", counts)
@@ -549,6 +602,17 @@ async def _apply_ingest_plan_batched(
             continue
         seed_rows.append({**seed, "seller_ref": seller_ref, "seed_kind": seed_kind})
     counts["seeds"], _, _ = await bulk_upsert(database, _SEED_UPSERT_SQL, seed_rows, label="seeds")
+
+    # 6. beauty_sku_ingredients — optional INCI capture (after skus exist). Uses
+    #    the same per-row canonical intake as the non-batched path (precedence +
+    #    verified actives + serving recompute); best-effort, never aborts.
+    counts.update(
+        await _apply_inci_rows(
+            plan.get("incis") or [],
+            database=database,
+            skipped_product_keys=skipped_product_keys,
+        )
+    )
 
     await write_writer_audit_log(audit)
     logger.info("apply_ingest_plan(batch) applied: %s", counts)
