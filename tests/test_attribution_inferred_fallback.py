@@ -118,6 +118,19 @@ async def test_signal_present_is_not_inferred(monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_caller_supplied_inferred_flag_is_stripped(monkeypatch):
+    # A caller must not tag its own edge inferred (which would exclude it from
+    # billing) — the flag is server-controlled. A signal-present order stays billed.
+    _wire(monkeypatch, click_row=None)
+    result = await svc.upsert_order_attribution_edge(
+        order_id="o5", merchant_id="m1",
+        metadata={"click_id": "clk_abc", "agent_id": "a1", "inferred": True, "inferred_via": "forged"},
+    )
+    assert result is not None
+    assert "inferred" not in result["metadata"], "caller-supplied inferred flag must be stripped"
+
+
+@pytest.mark.asyncio
 async def test_infer_helper_needs_agent(monkeypatch):
     _wire(monkeypatch, _CLICK)
     assert await svc._infer_attribution_from_recent_click({}, "m1", svc._now()) is None

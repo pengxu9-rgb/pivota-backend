@@ -377,6 +377,11 @@ async def upsert_order_attribution_edge(
     metadata: Optional[Dict[str, Any]],
 ) -> Optional[Dict[str, Any]]:
     payload = dict(metadata or {})
+    # The `inferred` flag GATES billing (inferred edges are excluded), so it is
+    # server-controlled only — strip any caller-supplied value from the order
+    # metadata so a caller can't tag its own edge out of GMV billing.
+    payload.pop("inferred", None)
+    payload.pop("inferred_via", None)
     inferred = False
     if not has_attribution_signal(payload):
         # Fallback (#1481): before dropping a token-less order, try to recover the
