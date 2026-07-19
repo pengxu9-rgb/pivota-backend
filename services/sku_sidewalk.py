@@ -1134,6 +1134,11 @@ def build_sku_attribute_graph(product: dict) -> dict:
 _TAIL_NOUN_STOPLIST = frozenset({
     "beauty", "care", "misc", "general", "default", "other", "goods",
     "merchandise", "accessories", "supplement", "supplements",
+    # Packaging/collection words: "Gift Bundle", "Value Pack", "Essentials"
+    # describe how a product is sold, not what it is.
+    "bundle", "bundles", "pack", "packs", "collection", "collections",
+    "essentials", "set", "sets", "kit", "kits", "box", "boxes",
+    "assortment", "variety", "value",
 })
 
 
