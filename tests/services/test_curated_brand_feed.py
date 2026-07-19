@@ -186,6 +186,146 @@ def test_pdp_ignores_srcset_and_empty():
     assert inci_from_pdp_html(None) is None
 
 
+# --- Under-capture fixes (each mirrors a real 2026-07-19 static-HTML MISS shape
+# that inci_from_pdp_html wrongly returned None on despite the main product's INCI
+# being present) — plus the precision guards that MUST still decline. -----------
+
+# A Centella serum whose full INCI opens with the extract, not water (centellian24
+# vital-capsule-serum). Water is #4; the list must still be captured.
+_EXTRACT_OPENER_INCI = (
+    "Centella Asiatica Extract, Glycerin, Butylene Glycol, Water, Ceteareth-20, "
+    "Niacinamide, Propanediol, Hydrogenated Lecithin, 1,2-Hexanediol, Pentylene "
+    "Glycol, Panthenol, Asiaticoside, Madecassic Acid, Adenosine, Xanthan Gum, "
+    "Disodium EDTA, Phenoxyethanol"
+)
+
+# An all-caps sunscreen-cushion list (misshaus glow-layering-fit-cushion).
+_ALLCAPS_INCI = (
+    "WATER, ZINC OXIDE, TRIETHOXYCAPRYLYLSILANE, HOMOSALATE, DIMETHICONE, "
+    "ETHYLHEXYL SALICYLATE, GLYCERIN, PHENYL TRIMETHICONE, TITANIUM DIOXIDE, "
+    "STEARIC ACID, ALUMINA, TOCOPHEROL, NIACINAMIDE, ADENOSINE, 1,2-HEXANEDIOL, "
+    "SODIUM HYALURONATE, BUTYLENE GLYCOL, ETHYLHEXYLGLYCERIN, PHENOXYETHANOL"
+)
+
+
+def test_pdp_inci_extract_opener_captured():
+    # MISS shape #1 (centellian24): a real full INCI whose highest-concentration
+    # ingredient is the hero extract, not water. The solvent-opener requirement used
+    # to reject it; the length + water-present secondary path now captures it.
+    html = "<html><body><div class='rte'><p><span class='metafield-multi_line_text_field'>" + _EXTRACT_OPENER_INCI + "</span></p></div></body></html>"
+    assert inci_from_pdp_html(html) == _EXTRACT_OPENER_INCI
+
+
+def test_pdp_inci_all_caps_captured():
+    # MISS shape #2 (misshaus): an ALL-CAPS list behind a <strong>NAME</strong><br>
+    # heading. The <br> line-break splits the name off; case is folded by the gate.
+    html = (
+        "<html><body><div class='details-content'><div>"
+        "<p><strong>GLOW LAYERING FIT CUSHION (NO.17 IVORY)</strong><br>"
+        + _ALLCAPS_INCI + "</p></div></div></body></html>"
+    )
+    assert inci_from_pdp_html(html) == _ALLCAPS_INCI
+
+
+def test_pdp_inci_bracket_label_and_dual_solvent_opener_captured():
+    # MISS shape #3 (barr-cosmetics): a bracketed "[INGREDIENTS]" heading joined to
+    # the list inside one JSON-island string, and a "Water/Aqua" dual-name opener.
+    # The label (incl. brackets) is stripped; "Water/Aqua" still reads as the solvent.
+    inci = (
+        "Water/Aqua, Dibutyl Adipate, Propanediol, Polymethylsilsesquioxane, "
+        "Diethylamino Hydroxybenzoyl Hexyl Benzoate, Ethylhexyl Triazone, "
+        "Niacinamide, Coco-Caprylate/Caprate, Caprylyl Methicone, Glycerin, "
+        "Butylene Glycol, Tocopherol, Phenoxyethanol"
+    )
+    # Rendered as an escaped-HTML metafield string in a data island (h4 label + p).
+    value = "\\u003ch4\\u003e[INGREDIENTS]\\u003c/h4\\u003e\\u003cp\\u003e" + inci + "\\u003c/p\\u003e"
+    html = (
+        "<html><body><script type='application/json' id='ProductJson'>"
+        '{"metafield":{"type":"text","value":"' + value + '"}}'
+        "</script></body></html>"
+    )
+    assert inci_from_pdp_html(html) == inci
+
+
+def test_pdp_inci_br_wrapped_list_reassembled_captured():
+    # MISS shape #4 (dasique melting-candy-balm): an anhydrous balm whose single
+    # list is wrapped across many <br> tags (even mid-ingredient-name). The join-<br>
+    # pass reassembles it whole; the non-water opener (a wax) is fine because the
+    # list is long and contains water.
+    reassembled = (
+        "Hydrogenated Polyisobutene, Dipentaerythrityl Tetrahydroxystearate/"
+        "Tetraisostearate, Ethylhexyl Hydroxystearate, Synthetic Wax, Paraffin, "
+        "Argania Spinosa Kernel Oil, Simmondsia Chinensis (Jojoba) Seed Oil, "
+        "Microcrystalline Wax, Cera Microcristallina (EU), Polyglyceryl-2 "
+        "Triisostearate, Water, Butylene Glycol, Ethylhexylglycerin, "
+        "Phenoxyethanol, Titanium Dioxide (CI 77891), Red 7 Lake (CI 15850)"
+    )
+    br = (
+        "Hydrogenated Polyisobutene,<br/>Dipentaerythrityl Tetrahydroxystearate/"
+        "Tetraisostearate, Ethylhexyl<br/>Hydroxystearate, Synthetic Wax, Paraffin,"
+        "<br/>Argania Spinosa Kernel Oil, Simmondsia Chinensis (Jojoba) Seed Oil,"
+        "<br/>Microcrystalline Wax, Cera Microcristallina (EU),<br/>Polyglyceryl-2 "
+        "Triisostearate, Water, Butylene Glycol, Ethylhexylglycerin, Phenoxyethanol, "
+        "Titanium Dioxide (CI 77891), Red 7 Lake (CI 15850)"
+    )
+    html = "<html><body><div class='accordion__content rte'><p><strong>11 Cotton Candy</strong></p><p>" + br + "</p></div></body></html>"
+    assert inci_from_pdp_html(html) == reassembled
+
+
+def test_pdp_shade_variants_collapse_to_one():
+    # A cushion/balm PDP renders several shades whose lists are the SAME formula,
+    # reordered / differing only in the pigment tail. That is one product, not a
+    # bundle — collapse to the longest complete list, don't read as ambiguous.
+    shade_a = _ALLCAPS_INCI + ", IRON OXIDES (CI 77492)"
+    shade_b = _ALLCAPS_INCI + ", IRON OXIDES (CI 77491), MICA"
+    html = (
+        "<html><body>"
+        "<div class='shade'><p>" + shade_a + "</p></div>"
+        "<div class='shade'><p>" + shade_b + "</p></div>"
+        "</body></html>"
+    )
+    assert inci_from_pdp_html(html) == shade_b  # longest, a real complete shade list
+
+
+def test_pdp_tag_array_stays_none():
+    # PRECISION GUARD (misshaus super-aqua kit): a marketing-tag JSON array
+    # (`"Aqua","Women's Day Sale!","xml-pricing-feed", ...`) is NOT an INCI. Each tag
+    # is its own JSON string literal, so no comma-joined ingredient candidate ever
+    # forms; the only comma-bearing aqua string is prose that fails the list gate.
+    html = (
+        "<html><body>"
+        "<script type='application/json'>"
+        '{"tags":["Aqua","Women\'s Day Sale!","xml-pricing-feed","Winter Routine","hydration"]}'
+        "</script>"
+        "<div class='desc'><p>Experience ultimate hydration with our NEW Super Aqua "
+        "Hydrating Kit! Here's to your new skincare routine, made for you.</p></div>"
+        "</body></html>"
+    )
+    assert inci_from_pdp_html(html) is None
+
+
+def test_pdp_neighbor_product_list_not_attributed():
+    # PRECISION GUARD: the page's own list PLUS a recommended/related product's list
+    # (a different formula) appear in the HTML. They are largely disjoint, so which
+    # is the page product's is ambiguous — return None, never attribute a neighbor's.
+    own = _ALLCAPS_INCI
+    neighbor = (
+        "Water, Sodium Cocoyl Isethionate, Cocamidopropyl Betaine, Glycerin, "
+        "Sodium Chloride, Citric Acid, Houttuynia Cordata Extract, Salicylic Acid, "
+        "Menthol, Sodium Benzoate, Disodium EDTA, Fragrance, Phenoxyethanol"
+    )
+    html = (
+        "<html><body>"
+        "<div class='product-main'><p>" + own + "</p></div>"
+        "<div class='recommended'><script type='application/json'>"
+        '{"related":{"handle":"heartleaf-low-ph-deep-cleansing","ingredients":'
+        '{"type":"text","value":"' + neighbor + '"}}}'
+        "</script></div>"
+        "</body></html>"
+    )
+    assert inci_from_pdp_html(html) is None
+
+
 # --- records_for_brand PDP-INCI enrichment (ingest capture; no live network) ---
 
 def _shopify_product(handle="snail-essence", *, body_html="<p>Hydrating essence.</p>"):

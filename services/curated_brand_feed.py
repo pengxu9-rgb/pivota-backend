@@ -153,18 +153,31 @@ def inci_from_body_html(body_html: Optional[str]) -> Optional[str]:
 # fabricated; re-validated by the canonical INCI intake before it can write.
 _PDP_STRIP_RE = re.compile(r"(?is)<(script|style|template|noscript)\b.*?</\1\s*>|<!--.*?-->")
 _PDP_BLOCK_BOUNDARY_RE = re.compile(r"(?is)</(p|div|li|td|section|h[1-6])>|<br\s*/?>")
-# A leading "Full Ingredients:" / "INCI —" label sometimes shares the <p>/value
-# with the list (cosrx); strip it so the written value is the list itself.
+# Block-level closers WITHOUT <br>, plus the <br> tag alone. Used by the join-<br>
+# segmentation variant: some themes wrap ONE continuous ingredient list across
+# several visual lines with <br> (even mid-ingredient-name, e.g. dasique's
+# "Ethylhexyl<br/>Hydroxystearate"), so treating <br> as a break shreds the list.
+# The join variant collapses <br> to a space and only breaks on real block tags.
+_PDP_BLOCK_ONLY_RE = re.compile(r"(?is)</(p|div|li|td|section|h[1-6])>")
+_PDP_BR_RE = re.compile(r"(?is)<br\s*/?>")
+# A leading "Full Ingredients:" / "INCI —" / "[INGREDIENTS]" label sometimes shares
+# the <p>/value with the list (cosrx / barr-cosmetics); strip it (incl. surrounding
+# brackets/parens) so the written value is the list itself.
 _PDP_INCI_LABEL_RE = re.compile(
-    r"(?i)^\s*(?:full\s+|all\s+|key\s+|active\s+|main\s+)?ingredients?(?:\s+list)?\s*[:\-–—]?\s*"
+    r"(?i)^\s*[\[(]?\s*"
+    r"(?:full\s+|all\s+|key\s+|active\s+|main\s+)?"
+    r"(?:ingredients?(?:\s+list)?|inci)"
+    r"\s*[\])]?\s*[:\-–—]?\s*"
 )
 # A full INCI opens with the highest-concentration ingredient, which for an
-# aqueous cosmetic is water/aqua (regulatory descending-order). REQUIRING this
-# does two jobs: it tells a full INCI from a short "key ingredients" highlight
-# (which opens with an active) when a PDP carries both, AND it rejects comma-heavy
-# non-INCI noise that can slip the list gate (image srcset URLs, JS arrays). The
-# cost is anhydrous products (oil cleansers/balms) whose list opens with an oil —
-# they stay null (counted), never mis-filled. The whole cohort is aqueous.
+# aqueous cosmetic is water/aqua (regulatory descending-order). Matching this is
+# the FAST qualifier: it cleanly tells a full INCI from a short "key ingredients"
+# highlight (which opens with an active) and rejects comma-heavy noise. But it is
+# NOT required — a real full INCI can open with a non-water ingredient (a Centella
+# serum whose extract outranks water; an anhydrous balm/cushion that opens with a
+# wax/oil). Those qualify via `_pdp_is_full_inci`'s secondary path instead, so we
+# no longer leave them null. The same regex also tests an individual comma-part for
+# "is this ingredient the solvent?" (used to require water be PRESENT in the list).
 _PDP_SOLVENT_OPENER_RE = re.compile(
     r"(?i)^\s*(?:purified\s+|deionized\s+|distilled\s+)?(?:aqua|water|eau)\b"
 )
@@ -172,15 +185,39 @@ _PDP_SOLVENT_OPENER_RE = re.compile(
 # that plausibly contain the solvent before the (costlier) decode+gate.
 _PDP_JSON_STR_RE = re.compile(r'"((?:[^"\\]|\\.){20,8000})"')
 _PDP_SOLVENT_HINT_RE = re.compile(r"(?i)(?:aqua|water|eau)")
+# A full INCI lists many ingredients; a "key ingredients" highlight is short. The
+# secondary (non-water-opener) qualifier requires at least this many parts so a
+# short active-forward highlight can never be mistaken for a full list.
+_PDP_FULL_INCI_MIN_PARTS = 10
+# Shape of a real INCI opening token: a short noun phrase of chemical/botanical
+# words, no sentence punctuation. Rejects a product-name/heading that a join-<br>
+# pass may prepend to a list (e.g. "GLOW LAYERING FIT CUSHION (NO.17 IVORY) WATER").
+_PDP_INGREDIENT_TOKEN_RE = re.compile(r"^[A-Za-z0-9 ()\-./+'&]+$")
+# Two distinct full lists on one page are shade variants of the SAME product (near-
+# identical ingredient sets — reordered / differ only in the pigment tail) vs a
+# bundle or a neighbor/related-product's list (largely disjoint). This Jaccard floor
+# separates them cleanly (measured 2026-07-19: shade groups 0.90–0.98; bundle 0.10).
+_PDP_SHADE_SIM_MIN = 0.7
 
 
-def _pdp_visible_segments(page_html: str) -> List[str]:
+def _pdp_visible_segments(page_html: str, *, join_br: bool = False) -> List[str]:
     """Block-level VISIBLE text lines: drop code/comment blocks, turn block-closers
     into newlines (so a self-contained <p> INCI is its own line), strip tags,
     unescape entities, collapse whitespace. Covers the accordion/modal/rich-text
-    <div> surface."""
+    <div> surface.
+
+    Two <br> modes, both run by the extractor: the default treats <br> as a line
+    break (separates a product-name heading from its list — misshaus's
+    `<strong>NAME</strong><br>WATER, ...`); `join_br=True` treats <br> as a space
+    so a single list wrapped across many <br> lines is reassembled whole (dasique's
+    `Ethylhexyl<br/>Hydroxystearate, ...`). Fragments from the break mode that are
+    sub-strings of the reassembled list are dropped downstream."""
     view = _PDP_STRIP_RE.sub(" ", page_html)
-    view = _PDP_BLOCK_BOUNDARY_RE.sub("\n", view)
+    if join_br:
+        view = _PDP_BR_RE.sub(" ", view)
+        view = _PDP_BLOCK_ONLY_RE.sub("\n", view)
+    else:
+        view = _PDP_BLOCK_BOUNDARY_RE.sub("\n", view)
     view = _HTML_TAG_RE.sub(" ", view)
     view = html.unescape(view)
     out: List[str] = []
@@ -216,18 +253,69 @@ def _pdp_json_island_segments(page_html: str) -> List[str]:
     return out
 
 
+def _pdp_ingredient_like(part: str) -> bool:
+    """Does a comma-part look like a single INCI ingredient (short chemical/botanical
+    noun phrase) rather than a product-name/heading or a sentence? Guards the opener
+    of a non-water-opening list so a join-<br> pass can't smuggle a leading heading
+    ("GLOW LAYERING FIT CUSHION (NO.17 IVORY) WATER") in as the first "ingredient"."""
+    p = part.strip()
+    if not p or len(p.split()) > 6:
+        return False
+    if not _PDP_INGREDIENT_TOKEN_RE.match(p):
+        return False
+    return bool(re.search(r"[A-Za-z]{3}", p))
+
+
+def _pdp_is_full_inci(cand: str) -> bool:
+    """A candidate that already cleared `_looks_like_inci_list` is a FULL product
+    INCI when EITHER it opens with the solvent (aqueous product, INCI descending-
+    order — the fast, high-precision path) OR it is unambiguously a full list that
+    happens to open with a non-water ingredient: a clean ingredient opener, MANY
+    ingredients, and water/aqua present somewhere as an ingredient. The secondary
+    path recovers Centella serums, balms and cushions (opener is an extract/wax/oil)
+    without admitting a short "key ingredients" highlight (few parts, active opener,
+    typically no water)."""
+    if _PDP_SOLVENT_OPENER_RE.match(cand):
+        return True
+    parts = [p.strip() for p in cand.split(",") if p.strip()]
+    if len(parts) < _PDP_FULL_INCI_MIN_PARTS:
+        return False
+    if not _pdp_ingredient_like(parts[0]):
+        return False
+    return any(_PDP_SOLVENT_OPENER_RE.match(p) for p in parts)
+
+
+def _pdp_inci_similarity(a: str, b: str) -> float:
+    """Jaccard overlap of two lists' normalized ingredient SETS (order-independent —
+    shade variants reorder ingredients). 1.0 = identical set, 0.0 = disjoint."""
+    def _set(text: str) -> set:
+        return {
+            re.sub(r"[^a-z0-9]", "", p.lower())
+            for p in text.split(",")
+            if re.sub(r"[^a-z0-9]", "", p.lower())
+        }
+    sa, sb = _set(a), _set(b)
+    if not sa or not sb:
+        return 0.0
+    return len(sa & sb) / len(sa | sb)
+
+
 def inci_from_pdp_html(page_html: Optional[str]) -> Optional[str]:
     """Deterministic INCI extraction from a RENDERED brand PDP.
 
-    Scans BOTH the visible block text (accordion/modal/rich-text div) and the JSON
-    data island (metafield rendered as a JSON string) for text that clears the
-    strong INCI-list gate (`_looks_like_inci_list` — the same reseller-tier safety
-    net the crawled-INCI lane relies on) AND opens with the solvent (a real full
-    INCI, per INCI descending-order; this also rejects srcset/JS-array noise).
-    Then, so we never guess or fabricate:
+    Scans the visible block text (accordion/modal/rich-text div — with <br> both as
+    a line break and, in a second pass, joined so a <br>-wrapped list is reassembled)
+    AND the JSON data island (metafield rendered as a JSON string). A segment is a
+    candidate when it clears the strong INCI-list gate (`_looks_like_inci_list` — the
+    same reseller-tier safety net the crawled-INCI lane relies on) AND reads as a
+    FULL list (`_pdp_is_full_inci`: solvent opener, or a long list that contains
+    water and opens with a real ingredient). Then, so we never guess or fabricate:
 
       * exactly one distinct full INCI -> return it;
-      * >1 distinct full INCI (a bundle / related-product cards) -> None (ambiguous);
+      * several full INCIs that are shade variants of ONE product (near-identical
+        ingredient sets) -> return the longest (one real, complete list);
+      * several genuinely different full INCIs (a bundle, or a neighbor/related-
+        product's list) -> None (ambiguous — never attribute another product's list);
       * none -> None.
 
     Whatever it returns is re-validated by
@@ -236,21 +324,44 @@ def inci_from_pdp_html(page_html: Optional[str]) -> Optional[str]:
         return None
     page_html = str(page_html)
     # Normalized-key dedup: the same list rendered on two surfaces (visible <p> and
-    # a JSON island, or mobile+desktop DOM) must collapse to one candidate, not read
-    # as an ambiguous pair. Keep the longest raw string for a given key.
+    # a JSON island, or mobile+desktop DOM, or both <br> modes) must collapse to one
+    # candidate, not read as an ambiguous pair. Keep the longest raw string per key.
     by_key: Dict[str, str] = {}
-    for seg in (*_pdp_visible_segments(page_html), *_pdp_json_island_segments(page_html)):
+    segments = (
+        *_pdp_visible_segments(page_html),
+        *_pdp_visible_segments(page_html, join_br=True),
+        *_pdp_json_island_segments(page_html),
+    )
+    for seg in segments:
         cand = _PDP_INCI_LABEL_RE.sub("", seg).strip().rstrip(". ").strip()
-        if not _PDP_SOLVENT_OPENER_RE.match(cand):
-            continue
         if not _looks_like_inci_list(cand):
+            continue
+        if not _pdp_is_full_inci(cand):
             continue
         key = re.sub(r"[^a-z0-9]", "", cand.lower())
         if key and (key not in by_key or len(cand) > len(by_key[key])):
             by_key[key] = cand
-    if len(by_key) == 1:
-        return next(iter(by_key.values()))
-    return None  # 0 = none published; >1 = ambiguous (which product's list?)
+    if not by_key:
+        return None
+    # Drop fragments: a candidate whose normalized key is a proper substring of
+    # another's is the SAME list, partial — the <br>-broken sublist that the
+    # join-<br> pass also reassembled whole. Keep the superset only.
+    keys = list(by_key)
+    survivors = [
+        cand
+        for key, cand in by_key.items()
+        if not any(other != key and key in other for other in keys)
+    ]
+    if len(survivors) == 1:
+        return survivors[0]
+    # Multiple distinct full lists. Shade variants of one product have near-identical
+    # ingredient sets -> collapse to the longest (a real, complete list). If any
+    # candidate is largely disjoint from the longest it is a different product (a
+    # bundle component / a neighbor list) -> ambiguous, so None (never guess).
+    ref = max(survivors, key=len)
+    if all(_pdp_inci_similarity(ref, cand) >= _PDP_SHADE_SIM_MIN for cand in survivors):
+        return ref
+    return None  # >1 genuinely different lists = ambiguous (which product's?)
 
 
 async def fetch_pdp_inci(
