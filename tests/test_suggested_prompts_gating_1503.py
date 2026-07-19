@@ -50,6 +50,22 @@ def test_tail_noun_fallback_is_vertical_agnostic():
     assert _first_buyer_category({}, "") is None
 
 
+def test_tail_noun_fallback_blocks_packaging_words():
+    # Packaging/collection words describe how a product is sold, not what it
+    # is — they must not become pseudo-categories ("best bundle" queries).
+    assert _first_buyer_category({}, "Gift Bundle") is None
+    assert _first_buyer_category({}, "Value Pack") is None
+    assert _first_buyer_category({}, "2 Pack") is None
+    assert _first_buyer_category({}, "Collection") is None
+    assert _first_buyer_category({}, "Essentials") is None
+    assert _first_buyer_category({}, "Gift Set") is None
+    assert _first_buyer_category({}, "Starter Kit") is None
+    assert _first_buyer_category({}, "Subscription Box") is None
+    assert _first_buyer_category({}, "Variety Packs") is None
+    # A real tail noun after a packaging modifier still resolves.
+    assert _first_buyer_category({}, "Travel Kit Toothbrush") == "toothbrush"
+
+
 def test_thin_beauty_sku_gets_chooser_suggestions():
     # The Shiso case: category resolves ("shampoo") but no secondary lexicon
     # attribute — previously zero candidates.
