@@ -274,8 +274,14 @@ async def test_fanout_matches_shared_probe_per_sku_ctx(monkeypatch) -> None:
     assert fanout == {SKU_KEY: direct}
     assert fanout[SKU_KEY][0]["scan_mode"] == "per_sku_audit"
     assert fanout[SKU_KEY][0]["provider"] == "gemini"
-    assert fanout[SKU_KEY][0]["runs_count"] == 4
-    assert len(calls) == 2
+    # #1521: the 4-prompt budget now rebalances to 2 branded + 2 unbranded (was
+    # 4 branded), which the scan-mode partition routes into two probe groups
+    # (findability vs organic). The whole 4-prompt budget is still probed — assert
+    # on the preserved TOTAL rather than a single group's run count.
+    assert sum(r["runs_count"] for r in fanout[SKU_KEY]) == 4
+    # Two scan-mode partitions × two paths (fanout + direct) = 4 upstream calls
+    # (was 2 when the thin SKU produced a single all-branded partition).
+    assert len(calls) == 4
 
 
 async def test_scan_mode_routes_by_query_intent(monkeypatch) -> None:

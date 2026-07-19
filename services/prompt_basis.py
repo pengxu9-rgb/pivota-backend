@@ -48,7 +48,13 @@ logger = logging.getLogger(__name__)
 # electronics), and a budget reorder floating LLM winnable/scenario prompts ahead
 # of the generic category-template tail. SKUs pinned to a v1 basis (already-
 # audited partners) must regenerate to actually receive the fixed prompts.
-PROMPT_BASIS_VERSION = 2
+# v3 (#1521): branded (navigational/trust — product/brand-naming) prompts are now
+# CAPPED at a minority share of the per-SKU budget (default 30%, floor 2) with the
+# remainder rebalanced to unbranded discovery/category/problem/sidewalk shapes.
+# This changes the generated/selected set materially, so SKUs pinned to a v2
+# branded-heavy basis must regenerate to receive the rebalanced mix (otherwise a
+# re-audit would replay the old ~50%-branded set and mask the change).
+PROMPT_BASIS_VERSION = 3
 
 _MAX_PROMPTS_PER_LIST = 12
 _MAX_PROMPT_CHARS = 300
