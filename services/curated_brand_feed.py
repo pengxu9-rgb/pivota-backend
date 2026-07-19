@@ -98,6 +98,45 @@ def body_html_to_text(body_html: Optional[str]) -> str:
     return text
 
 
+# Brand storefronts routinely list the INCI under an "Ingredients" heading inside
+# body_html. Capture it deterministically (no LLM): find the label, take the
+# following text, and stop at the next section heading. Null when absent — never
+# fabricated; the downstream INCI intake re-validates it parses as a real list.
+_INCI_LABEL_RE = re.compile(
+    r"(?is)\b(?:full\s+|all\s+|key\s+)?ingredients?\b(?:\s*list)?\s*[:\-]\s*(.{15,3000})"
+)
+_INCI_STOP_RE = re.compile(
+    r"(?is)\b(?:how\s+to\s+use|directions|how\s+to\s+apply|usage|warnings?|caution|"
+    r"about\s+the\s+brand|shipping|net\s+wt|precautions)\b"
+)
+
+
+def inci_from_body_html(body_html: Optional[str]) -> Optional[str]:
+    """Deterministic INCI extraction from a Shopify body_html: strip tags, find an
+    'Ingredients:' label, capture the following list, and cut at the next section
+    heading. Returns None when there's no label or the captured text isn't a
+    comma-delimited list (a single blob / prose is rejected here and again by the
+    canonical INCI intake)."""
+    if not body_html:
+        return None
+    text = _HTML_BLOCK_RE.sub(" ", str(body_html))
+    text = _HTML_TAG_RE.sub(" ", text)
+    text = html.unescape(text)
+    text = re.sub(r"\s+", " ", text).strip()
+    m = _INCI_LABEL_RE.search(text)
+    if not m:
+        return None
+    tail = m.group(1).strip()
+    stop = _INCI_STOP_RE.search(tail)
+    if stop:
+        tail = tail[: stop.start()].strip()
+    tail = tail.rstrip(". ").strip()
+    # A real INCI is a comma-delimited list of several ingredients, not a blurb.
+    if len([p for p in tail.split(",") if p.strip()]) < 2:
+        return None
+    return tail or None
+
+
 def _to_float(value: Any) -> Optional[float]:
     """Coerce Shopify's string prices (e.g. '56.00') to float; None if absent/invalid.
     Numeric columns (catalog_offers.*_price, external_product_seeds.price_amount) reject
@@ -172,6 +211,15 @@ def shopify_product_to_record(
             "barcode": barcode,  # real GTIN when the brand fills it — strongest deposit basis
             "source_domain": host,
             "tags": tags,
+            # Brand-official INCI when the storefront lists it under an Ingredients
+            # heading (many don't — None then, ingest skips it). brand_official is
+            # the top INCI authority tier (ADR-001) so it outranks reseller lists.
+            "raw_inci": inci_from_body_html(product.get("body_html")),
+            "inci_source": "brand_official",
+            # Shopify /products.json exposes no review aggregate — ratings stay null
+            # on this lane (captured on the retailer-PDP lane instead).
+            "rating_value": None,
+            "rating_count": None,
         },
         "offers": [
             {

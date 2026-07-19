@@ -991,6 +991,59 @@ def _image_resolution_score(url: str) -> float:
     return score
 
 
+def _parse_aggregate_rating(node: Any) -> tuple[Optional[float], Optional[int]]:
+    """Pull (rating_value, rating_count) from a schema.org node's optional
+    `aggregateRating` block, normalized to a 0–5 star scale. Returns (None, None)
+    when absent/unparseable — a product without reviews stays null, never
+    invented. `reviewCount` is preferred, `ratingCount` is the schema.org
+    fallback some stores emit.
+
+    Range safety (rating_value feeds the decision-intelligence lane with no CHECK
+    constraint): a value outside [0, 5] is rejected as NULL rather than written as
+    a mis-scaled number — a 0–10/0–100 scale or a negative is "no data", not 87
+    stars. When `bestRating` says the page isn't on a 5-point scale we also NULL
+    the value (we don't guess a rescale). A negative reviewCount is dropped."""
+    if not isinstance(node, dict):
+        return None, None
+    agg = node.get("aggregateRating")
+    if not isinstance(agg, dict):
+        return None, None
+
+    best_rating: Optional[float] = None
+    raw_best = agg.get("bestRating")
+    if raw_best is not None:
+        try:
+            best_rating = float(str(raw_best).strip())
+        except (TypeError, ValueError):
+            best_rating = None
+
+    rating_value: Optional[float] = None
+    raw_value = agg.get("ratingValue")
+    if raw_value is not None:
+        try:
+            rating_value = float(str(raw_value).strip())
+        except (TypeError, ValueError):
+            rating_value = None
+    if rating_value is not None:
+        if rating_value < 0 or rating_value > 5:
+            rating_value = None  # out of the 5-star range → mis-scaled / no data
+        elif best_rating is not None and abs(best_rating - 5.0) > 1e-9:
+            rating_value = None  # page isn't on a 5-point scale — don't guess
+
+    rating_count: Optional[int] = None
+    raw_count = agg.get("reviewCount")
+    if raw_count is None:
+        raw_count = agg.get("ratingCount")
+    if raw_count is not None:
+        try:
+            rating_count = int(float(str(raw_count).strip()))
+        except (TypeError, ValueError):
+            rating_count = None
+    if rating_count is not None and rating_count < 0:
+        rating_count = None
+    return rating_value, rating_count
+
+
 def _extract_jsonld_offer(parsed_objs: list[Any]) -> Dict[str, Any]:
     best: Dict[str, Any] = {}
     for root in parsed_objs:
@@ -1040,6 +1093,7 @@ def _extract_jsonld_offer(parsed_objs: list[Any]) -> Dict[str, Any]:
                 score += 1
 
             if score and score > best.get("_score", 0):
+                rating_value, rating_count = _parse_aggregate_rating(node)
                 best = {
                     "_score": score,
                     "title": str(name).strip() if name else None,
@@ -1049,6 +1103,10 @@ def _extract_jsonld_offer(parsed_objs: list[Any]) -> Dict[str, Any]:
                     "price_raw": str(price).strip() if price is not None else None,
                     "currency": str(currency).strip().upper() if currency else None,
                     "availability_raw": str(availability).strip() if availability else None,
+                    # Optional review signal off the winning Product node — null when
+                    # the page carries no aggregateRating (never fabricated).
+                    "rating_value": rating_value,
+                    "rating_count": rating_count,
                 }
 
     best.pop("_score", None)

@@ -1167,6 +1167,26 @@ async def ensure_required_schema_light() -> None:
                     "ADD COLUMN IF NOT EXISTS resolved_at TIMESTAMPTZ NULL;"
                 )
             )
+            # mig 186: product REVIEW signal (aggregateRating) on the canonical
+            # record + served view. catalog_products and agent_pdp_view are both
+            # SELECT-*'d at runtime, so both need the self-heal or the next
+            # Table.select() crashes on prod (Railway skips db/migrations/).
+            # Additive + nullable; the decision-intelligence lane reads exactly
+            # rating_value / rating_count. Never touches offer pricing.
+            await database.execute(
+                text(
+                    "ALTER TABLE IF EXISTS catalog_products "
+                    "ADD COLUMN IF NOT EXISTS rating_value NUMERIC, "
+                    "ADD COLUMN IF NOT EXISTS rating_count INTEGER;"
+                )
+            )
+            await database.execute(
+                text(
+                    "ALTER TABLE IF EXISTS agent_pdp_view "
+                    "ADD COLUMN IF NOT EXISTS rating_value NUMERIC, "
+                    "ADD COLUMN IF NOT EXISTS rating_count INTEGER;"
+                )
+            )
             # ---------------------------------------------------------------
             # schema-guard-coverage backfill (migrations 103-165).
             # Railway fast-mode skips db/migrations/, so every ADD COLUMN from

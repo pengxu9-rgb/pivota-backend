@@ -13,6 +13,7 @@ schema.org markup.
 
 from __future__ import annotations
 
+import json
 import re
 import time
 import urllib.error
@@ -43,6 +44,150 @@ _LDJSON_RE = re.compile(
     re.S | re.I,
 )
 _LOC_RE = re.compile(r"<loc>\s*([^<\s]+)\s*</loc>", re.I)
+
+# Next.js RSC "flight" streaming: the payload is split across
+# `self.__next_f.push([1,"<chunk>"])` calls; concatenating the JS-unescaped
+# chunk bodies reconstructs the flight. Rows are `<id>:<Type><data>`; text rows
+# are `<id>:T<hexlen>,<bytes>` where hexlen is the BYTE length. A field can
+# reference a row by value `"$<id>"`. StyleKorean PDPs carry the published
+# ingredient list in an `allIngredients` field (inline, or a `$<id>` reference
+# resolved out of the flight). No LLM, no fabrication — this reads the page's own
+# text; empty/absent/ambiguous/not-INCI → None.
+_NEXT_FLIGHT_RE = re.compile(r'self\.__next_f\.push\(\[1,"((?:[^"\\]|\\.)*)"\]\)', re.S)
+_ALL_INGREDIENTS_RE = re.compile(r'"allIngredients":"(\$[0-9a-f]+|[^"]*)"')
+# A flight row boundary is a newline followed by `<hexid>:<TypeLetter>` — used to
+# stop a text slice from bleeding into the next row when the declared byte length
+# is loose (defense-in-depth over the byte-accurate slice).
+_FLIGHT_ROW_BOUNDARY_RE = re.compile(r"\n[0-9a-f]+:[A-Za-z]")
+
+# Recognizable INCI morphemes/ingredients. A real ingredient list contains at
+# least one; prose ("this serum hydrates deeply") contains none. Substring match,
+# so "sodium hyaluronate", "-extract", "seed oil", "(ci 77499)" all hit.
+_INCI_ANCHOR_TOKENS = (
+    "water", "aqua", "glycerin", "glycol", "sodium", "acid", "extract", "oil",
+    "butylene", "niacinamide", "hyaluron", "dimethicone", "alcohol", "citric",
+    "panthenol", "tocopher", "phenoxyethanol", "cetyl", "stearyl", "stear",
+    "carbomer", "xanthan", "propanediol", "ceramide", "allantoin", "adenosine",
+    "caprylyl", "ethylhexyl", "butyrospermum", "centella", "peptide", "retinol",
+    "polysorbate", "lecithin", "squalane", "parfum", "fragrance", "seed", "leaf",
+    "root", "flower", "fruit", "butter", "benzoate", "salicyl", "glyceryl",
+    "sorbitan", "peg-", "ppg-", "laur", "ci 77", "ci 4", "ci 1", "hydroxide",
+    "chloride", "gluconate", "edta", "carrageenan", "cellulose", "silica",
+)
+# Prose/marketing words: their density flags a sentence, not a delimited list.
+_INCI_PROSE_STOPWORDS = frozenset({
+    "the", "and", "is", "are", "this", "that", "with", "your", "you", "our",
+    "for", "helps", "help", "made", "best", "will", "ever", "try", "from", "have",
+    "has", "was", "were", "to", "of", "in", "on", "it", "its", "absorbs", "hydrates",
+    "hydrate", "lightweight", "deeply", "fast", "gently", "leaves", "feeling",
+    "perfect", "designed", "formulated", "provides", "delivers",
+})
+
+
+def _reconstruct_next_flight(html: str) -> str:
+    """Concatenate the JS-unescaped bodies of every `__next_f.push` chunk into the
+    raw RSC flight string. Returns '' when the page isn't a Next.js RSC stream."""
+    parts: List[str] = []
+    for m in _NEXT_FLIGHT_RE.finditer(html):
+        body = m.group(1)
+        try:
+            parts.append(json.loads('"' + body + '"'))
+        except Exception:  # noqa: BLE001 — a malformed chunk just contributes raw
+            parts.append(body)
+    return "".join(parts)
+
+
+def _resolve_flight_text_row(flight: str, row_id: str) -> Optional[str]:
+    """Resolve a `$<row_id>` reference to its text-row payload. The row id is
+    ANCHORED to a row boundary (start-of-flight or a preceding newline) so ref
+    `$51` never matches inside an earlier `151:T…` row. The declared length is in
+    BYTES, so the slice is taken on the utf-8 encoding (a ™/°/Korean glyph can't
+    push it into the next row), then trimmed at the next row marker as a backstop.
+    None when the row is absent."""
+    m = re.search(r"(?:^|\n)" + re.escape(row_id) + r":T([0-9a-f]+),", flight)
+    if not m:
+        return None
+    char_start = m.end()
+    byte_len = int(m.group(1), 16)
+    encoded = flight.encode("utf-8")
+    byte_start = len(flight[:char_start].encode("utf-8"))
+    text = encoded[byte_start:byte_start + byte_len].decode("utf-8", "ignore")
+    boundary = _FLIGHT_ROW_BOUNDARY_RE.search(text)
+    if boundary:
+        text = text[: boundary.start()]
+    return text
+
+
+def _clean_inci_text(text: Optional[str]) -> Optional[str]:
+    """Normalize a captured ingredient string: unescape stray CR/LF, collapse
+    whitespace, and drop a leading product-name label ('<Name> (1step): Water,
+    ...') when the pre-colon segment carries no comma (a real INCI list has no
+    bare label). Returns None when nothing usable remains — never invents text."""
+    if not text:
+        return None
+    s = text.replace("\\r", " ").replace("\\n", " ").replace("\r", " ").replace("\n", " ")
+    s = re.sub(r"\s+", " ", s).strip()
+    if not s:
+        return None
+    head, sep, tail = s.partition(":")
+    if sep and "," not in head and "," in tail:
+        s = tail.strip()
+    return s or None
+
+
+def _looks_like_inci_list(text: Optional[str]) -> bool:
+    """Stronger-than-`>=2-commas` gate for RESELLER-tier INCI: a real ingredient
+    list is a comma-delimited run of short noun phrases, contains at least one
+    recognizable ingredient morpheme, and is not prose. This is the safety net the
+    ref-resolution + byte-slice fixes rely on — a stray prose/next-row leak that
+    slips through must still be rejected before it can fill an empty canonical."""
+    if not text:
+        return False
+    parts = [p.strip() for p in text.split(",") if p.strip()]
+    if len(parts) < 3:
+        return False  # a genuine INCI lists several ingredients
+    # Ingredient tokens are short noun phrases, not sentences.
+    long_parts = sum(1 for p in parts if len(p.split()) > 6)
+    if long_parts > max(1, len(parts) // 4):
+        return False
+    low = text.lower()
+    if not any(tok in low for tok in _INCI_ANCHOR_TOKENS):
+        return False  # no recognizable ingredient → not an INCI list
+    words = re.findall(r"[a-z]+", low)
+    if words:
+        stop = sum(1 for w in words if w in _INCI_PROSE_STOPWORDS)
+        if stop > len(words) * 0.15:
+            return False  # sentence/marketing prose, not a list
+    return True
+
+
+def extract_inci_from_next_rsc(html: str) -> Optional[str]:
+    """Deterministic ingredient-list extraction from a Next.js RSC PDP.
+
+    Resolves every `allIngredients` value (a `$<id>` flight reference — anchored,
+    byte-accurate — or an inline string), cleans it, and keeps only those that
+    clear the strong INCI gate. Returns the list ONLY when exactly one distinct
+    valid INCI resolves: a page with related-product cards can carry several
+    `allIngredients`, and without a product binding we must not guess which is the
+    PDP's own — ambiguity yields None. Never fabricated; validated again downstream."""
+    flight = _reconstruct_next_flight(html)
+    if not flight:
+        return None
+    found: List[str] = []
+    for value in _ALL_INGREDIENTS_RE.findall(flight):
+        if value.startswith("$"):
+            raw = _resolve_flight_text_row(flight, value[1:])
+        elif "," in value:
+            raw = value
+        else:
+            raw = None
+        candidate = _clean_inci_text(raw)
+        if candidate and _looks_like_inci_list(candidate):
+            found.append(candidate)
+    distinct = list(dict.fromkeys(found))
+    if len(distinct) == 1:
+        return distinct[0]
+    return None  # 0 = none published; >1 = ambiguous (which product's list?)
 
 
 def fetch_text(url: str, *, user_agent: str = USER_AGENT, timeout: int = _FETCH_TIMEOUT_S) -> str:
@@ -76,7 +221,9 @@ def extract_product(html: str) -> Optional[Dict[str, Any]]:
     None when the page carries no usable Product markup.
 
     Keys: title, brand, description, image_url, price_raw, currency,
-    availability (normalized)."""
+    availability (normalized), rating_value, rating_count, raw_inci. The last
+    three are OPTIONAL — null when the page exposes no review block / ingredient
+    list, and never fabricated."""
     blocks = _LDJSON_RE.findall(html)
     if not blocks:
         return None
@@ -91,6 +238,11 @@ def extract_product(html: str) -> Optional[Dict[str, Any]]:
         "price_raw": best.get("price_raw"),
         "currency": best.get("currency"),
         "availability": _availability_from_raw(best.get("availability_raw")),
+        # Optional review signal from the JSON-LD aggregateRating block.
+        "rating_value": best.get("rating_value"),
+        "rating_count": best.get("rating_count"),
+        # Optional published INCI list from the Next.js RSC payload.
+        "raw_inci": extract_inci_from_next_rsc(html),
     }
 
 

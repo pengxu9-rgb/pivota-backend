@@ -106,6 +106,8 @@ async def fetch_products_for_key(content_key: str, *, db: Any = None) -> List[Di
           cp.size_guide,
           cp.size_guide_source,
           cp.size_guide_confidence,
+          cp.rating_value,
+          cp.rating_count,
           pgm.product_group_id,
           pgm.is_primary AS group_is_primary
         FROM catalog_products cp
@@ -876,6 +878,11 @@ def assemble_row(
         "size_guide": fashion["size_guide"],
         "size_guide_source": fashion["size_guide_source"],
         "size_guide_confidence": fashion["size_guide_confidence"],
+        # Review signal surfaced verbatim from the canonical (mig 186) — the
+        # decision-intelligence lane consumes rating_value / rating_count. Null
+        # when the canonical has no captured rating.
+        "rating_value": canonical.get("rating_value"),
+        "rating_count": canonical.get("rating_count"),
         "refresh_source": refresh_source,
     }
 
@@ -893,6 +900,7 @@ UPSERT_SQL = """
       material, material_source, material_confidence,
       care, care_source, care_confidence,
       size_guide, size_guide_source, size_guide_confidence,
+      rating_value, rating_count,
       refreshed_at, refresh_source, refreshed_by_proposal_id
     ) VALUES (
       :content_key, :pivota_signature_id, :product_group_id,
@@ -907,6 +915,7 @@ UPSERT_SQL = """
       :material, :material_source, :material_confidence,
       :care, :care_source, :care_confidence,
       CAST(:size_guide AS jsonb), :size_guide_source, :size_guide_confidence,
+      :rating_value, :rating_count,
       NOW(), :refresh_source, :refreshed_by_proposal_id
     )
     ON CONFLICT (content_key) DO UPDATE SET
@@ -944,6 +953,8 @@ UPSERT_SQL = """
       size_guide = EXCLUDED.size_guide,
       size_guide_source = EXCLUDED.size_guide_source,
       size_guide_confidence = EXCLUDED.size_guide_confidence,
+      rating_value = EXCLUDED.rating_value,
+      rating_count = EXCLUDED.rating_count,
       refreshed_at = NOW(),
       refresh_source = EXCLUDED.refresh_source,
       refreshed_by_proposal_id = EXCLUDED.refreshed_by_proposal_id
