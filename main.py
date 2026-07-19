@@ -1031,7 +1031,7 @@ app.include_router(admin_cleanup_rebuild_router)  # Admin cleanup and rebuild
 app.include_router(admin_cleanup_stores_router)  # Admin cleanup stores
 app.include_router(outbound_links_router)  # Outbound links (resolve + redirect + ops config)
 app.include_router(attribution_conversions_router)  # Non-custodial conversion-report / receipt-ingest API (#1482)
-app.include_router(ap2_agent_registration_router)  # AP2 agent signing-key registration (#1442) — pre-flip provisioning
+app.include_router(ap2_agent_registration_router)  # AP2 agent signing-key ADMIN backfill (#1442) — pilot provisioning (ADR-012 carve-out)
 app.include_router(external_offers_router)  # External offers (fetch/cache OG/JSON-LD for external-only products)
 app.include_router(simple_test_orders_router)  # Simple test orders generation
 app.include_router(migrate_employees_password_router)  # Migrate employees table
