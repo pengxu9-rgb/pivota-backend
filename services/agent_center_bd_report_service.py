@@ -9333,7 +9333,7 @@ def _unbranded_category_specs(
         if not concern or _term_repeats_category(concern, category, profile=profile):
             continue
         specs.append((f"best {category} for {concern}", "category"))
-        if problem_framed:
+        if problem_framed and not is_scenario_slug(concern):
             specs.append((f"what helps with {concern}", "category"))
     for spec in (getattr(profile, "seed_spec_terms", ()) or ()):
         spec = _clean_prompt_term(spec)

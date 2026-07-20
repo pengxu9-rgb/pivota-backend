@@ -895,7 +895,7 @@ BEAUTY_DEVICE_HAIR_PROFILE = VerticalProfile(
     # provides → attribute-framed ("dual voltage flat iron"), never problem-framed.
     seed_concern_terms=(
         "frizzy hair", "heat damage", "fine hair", "thick hair", "curly hair",
-        "color-treated hair", "flat hair",
+        "color-treated hair", "damaged hair",
     ),
     seed_spec_terms=(
         "dual voltage", "ceramic plates", "tourmaline plates", "adjustable heat",
