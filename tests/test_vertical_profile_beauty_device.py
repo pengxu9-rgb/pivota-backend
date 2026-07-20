@@ -342,6 +342,40 @@ def test_strategic_brief_applies_device_split():
     ).name == "electronics_drone"
 
 
+def test_device_audit_prompts_split_specs_from_concerns():
+    # The device audit config: hardware SPECS get the attribute shape and are NEVER
+    # problem-framed ("what helps with dual voltage" is junk); buyer CONCERNS get
+    # the problem-framed shape ("what helps with frizzy hair"). Even when a spec is
+    # mis-classified into use_case, it's routed to the attribute shape.
+    import services.agent_center_bd_report_service as R
+    product = {
+        "title": "VODANA Softbar Flat Iron 1 inch Ceramic Straightener",
+        "brand": "VODANA", "vendor": "VODANA",
+        "product_type": "Flat Iron", "category": "Hair Styling Tools",
+        "category_path": "beauty/devices/hair-styling",
+        "attributes_raw": {"tags": ["dual voltage", "ceramic plates", "fine hair"]},
+    }
+    specs, _t, _cat = R._build_per_sku_base_query_specs({"product": product, "sku": {"title": "1 inch"}})
+    joined = " || ".join(q for q, _ in specs).lower()
+    # specs → attribute shape, never problem-framed
+    assert "dual voltage flat iron" in joined
+    assert "what helps with dual voltage" not in joined
+    assert "what helps with ceramic plates" not in joined
+    # seeded concerns → problem-framed
+    assert "what helps with frizzy hair" in joined
+    assert "what helps with heat damage" in joined
+
+
+def test_topical_beauty_carries_no_device_seed_terms():
+    from services.vertical_profiles import BEAUTY_PROFILE, BEAUTY_DEVICE_HAIR_PROFILE
+    # Topical/electronics profiles have empty seed sets → prompt output unchanged.
+    assert BEAUTY_PROFILE.seed_concern_terms == ()
+    assert BEAUTY_PROFILE.seed_spec_terms == ()
+    # The device profile carries its decision space.
+    assert "frizzy hair" in BEAUTY_DEVICE_HAIR_PROFILE.seed_concern_terms
+    assert "dual voltage" in BEAUTY_DEVICE_HAIR_PROFILE.seed_spec_terms
+
+
 def test_classifier_does_not_steal_makeup_brush_or_topical_haircare():
     assert classify("Makeup Brush Pouch") == ("Brush Pouch", "beauty/tools/brush-accessory")
     assert classify("Foundation Brush")[1] == "beauty/tools/brush"

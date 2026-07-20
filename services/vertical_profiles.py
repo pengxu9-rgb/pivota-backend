@@ -567,6 +567,18 @@ class VerticalProfile:
     # off there. Default True preserves the historical beauty behavior.
     problem_framed_prompts: bool = True
 
+    # Device decision-space CONFIG PACK (per category). A beauty DEVICE mixes two
+    # kinds of attribute — buyer CONCERNS the tool solves ("frizzy hair", "heat
+    # damage") and hardware SPECS ("dual voltage", "ceramic plates"). They need
+    # OPPOSITE prompt shapes: a concern is problem-framed ("what helps with frizzy
+    # hair"); a spec is attribute-framed ("dual voltage flat iron") and must NEVER
+    # be problem-framed ("what helps with dual voltage" is junk). These two sets
+    # (a) SEED the category's decision space so the audit probes it even before
+    # deep extraction, and (b) let the engine route a mis-classified extracted spec
+    # to the attribute shape. Empty for topical/electronics profiles (no change).
+    seed_concern_terms: Tuple[str, ...] = ()
+    seed_spec_terms: Tuple[str, ...] = ()
+
 
 BEAUTY_PROFILE = VerticalProfile(
     name="beauty",
@@ -878,6 +890,17 @@ BEAUTY_DEVICE_HAIR_PROFILE = VerticalProfile(
     # medical efficacy). Heat-damage is a claim lever, handled in brief_rules.
     health_sensitive=False,
     problem_framed_prompts=True,
+    # Hair-styling-tool decision space (config pack). CONCERNS the buyer wants
+    # solved → problem-framed ("what helps with frizzy hair"); SPECS the hardware
+    # provides → attribute-framed ("dual voltage flat iron"), never problem-framed.
+    seed_concern_terms=(
+        "frizzy hair", "heat damage", "fine hair", "thick hair", "curly hair",
+        "color-treated hair", "damaged hair",
+    ),
+    seed_spec_terms=(
+        "dual voltage", "ceramic plates", "tourmaline plates", "adjustable heat",
+        "ionic", "cordless",
+    ),
     evidence_bindings="none",
     grounded_coverage_disclosure=(
         "grounded-evidence dimensions are unavailable for this category"
