@@ -35,6 +35,20 @@ CATEGORY_PATTERNS: List[Tuple[str, str, "re.Pattern[str]"]] = [
         r"\b(drones?|quadcopters?|fpv\s+drone|uav|self[-\s]?flying\s+camera|"
         r"flying\s+camera|camera\s+drone|follow[-\s]?me\s+drone)\b",
         re.IGNORECASE)),
+    # ----- Beauty devices: hair-styling tools (beauty_device sub-profile) -----
+    # BEFORE the makeup "Brush" and generic "Hair Care" patterns so a
+    # "straightening brush" is a heat-styling DEVICE (not a makeup brush), and a
+    # "flat iron" / "hair straightener" gets a real tool path instead of
+    # collapsing to generic haircare or NULL. Tokens are device-specific (heat /
+    # styling appliances) — no bare "brush" or "hair", so no topical haircare SKU
+    # (hair oil, hair mask) is stolen. VODANA cross-category (beauty x 3C) pilot.
+    ("Hair Styling Tool", "beauty/tools/hair-styling-tool", re.compile(
+        r"\b(flat\s*iron|hair\s+straightener|straightening\s+brush|"
+        r"curling\s+(?:iron|wand|brush)|hair\s+curler|hair\s+dryer|"
+        r"blow[-\s]?dry(?:er)?(?:\s+brush)?|hot\s+air\s+brush|hot\s+brush|"
+        r"air\s+styler|hair\s+styler|styling\s+(?:iron|wand)|"
+        r"hair\s+styling\s+tool|straightener|styler)\b",
+        re.IGNORECASE)),
     ("Makeup Sponge", "beauty/tools/sponge", re.compile(
         r"\b(makeup sponge|beauty sponge|sponge\s*/\s*puff|powder puff|blender sponge)\b",
         re.IGNORECASE)),
