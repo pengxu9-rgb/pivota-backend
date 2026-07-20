@@ -137,6 +137,53 @@ def test_device_tech_named_topical_aftercare_stays_topical(title):
     assert not prof.name.startswith("beauty_device"), f"{title!r} -> {prof.name} (should be topical)"
 
 
+@pytest.mark.parametrize("title", [
+    "VODANA Professional Triple Flow Ceramic Hair Waver",
+    "VODANA Compact Wave Iron 1.5 inch Beach Waves",
+    "Beachwaver S1",                 # one-token brand still routes device
+    "Double Barrel Hair Waver",      # routes via "waver"/"hair waver", not "barrel"
+    # bare-word "waver" the only beauty signal — must resolve beauty (whole-word
+    # resolver token) THEN route device; these regressed once and must stay covered.
+    "3 Barrel Waver",
+    "Revlon Triple Barrel Waver",
+    "VODANA Triple Flow Waver",
+])
+def test_hair_wavers_route_device(title):
+    prof = resolve_profile({"product_type": ""}, title=title)
+    assert prof.name == "beauty_device_hair", f"{title!r} -> {prof.name}"
+    assert classify(title) == ("Hair Styling Tool", "beauty/devices/hair-styling")
+
+
+def test_waver_vocab_does_not_steal_topical_wave_products():
+    # "wave"-family TOPICALS (styling sprays/creams) must NOT become a device —
+    # only "waver"/"wave iron", never bare "wave".
+    for t in ["Beach Wave Spray", "Sea Salt Wave Mist", "Wave Defining Cream"]:
+        assert not resolve_profile({"product_type": ""}, title=t).name.startswith("beauty_device"), t
+        hit = classify(t)
+        assert hit is None or not hit[1].startswith("beauty/devices/"), t
+
+
+@pytest.mark.parametrize("title,not_vertical", [
+    # Finding 1: bare "double/triple barrel" must NOT pull non-hair products to device.
+    ("Double Barrel Espresso Machine", "beauty"),
+    ("Triple Barrel Bourbon Whiskey", "beauty"),
+    ("Double Barrel Watch Winder", "beauty"),
+    # Finding 2: "waver" substring must NOT flag "Waverly"/"unwavering" as beauty,
+    # and must not flip a fashion SKU to beauty.
+    ("Waverly Floral Curtains", "beauty"),
+    ("Unwavering Steel Kitchen Knife", "beauty"),
+])
+def test_waver_barrel_substring_false_positives_fixed(title, not_vertical):
+    assert resolve_vertical({"product_type": ""}, title=title) != not_vertical, title
+    assert not resolve_profile({"product_type": ""}, title=title).name.startswith("beauty_device"), title
+
+
+def test_waverly_wave_sweater_stays_fashion():
+    # The one true regression the review found: a fashion SKU flipped to beauty.
+    row = {"product_type": "Wave Knit Sweater", "category": "Sweaters"}
+    assert resolve_vertical(row, title="Waverly Wave Knit Sweater") == "fashion"
+
+
 def test_under_tagged_ipl_row_resolves_beauty_then_routes_hair_removal():
     # S2: a bare "IPL" + category "Hair Removal" row (no "beauty" word) must resolve
     # the beauty vertical (via the "hair removal" resolver keyword) so the router

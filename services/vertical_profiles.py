@@ -129,13 +129,18 @@ _BEAUTY_DEVICE_TOPICAL_GUARD = frozenset({
 
 # class: hair-styling (VODANA)
 _BEAUTY_DEVICE_HAIR_TOKENS = frozenset({
-    "straightener", "straighteners", "hairdryer", "blowdryer",
+    "straightener", "straighteners", "hairdryer", "blowdryer", "waver", "wavers",
+    "beachwaver",
 })
 _BEAUTY_DEVICE_HAIR_PHRASES: Tuple[str, ...] = (
     "flat iron", "hair straightener", "straightening brush", "curling iron",
     "curling wand", "curling brush", "hair curler", "hair dryer", "blow dryer",
     "blow dry brush", "hot air brush", "hot brush", "air styler", "hair styler",
     "styling iron", "styling wand", "hair styling tool",
+    # wavers / deep-wave irons (VODANA Triple Flow; Beachwaver-style). Deliberately
+    # NOT bare "double/triple barrel" — those match shotguns / espresso machines /
+    # watch winders; a real barrel waver carries "waver"/"wave iron" too.
+    "hair waver", "wave iron", "deep waver",
 )
 # class: skincare energy/light (LED, microcurrent, RF, microneedling).
 # NOTE: bare "led" is NOT a token — a "UV LED nail lamp" is a nail device, not a
@@ -212,7 +217,10 @@ _BEAUTY_DEVICE_CLASS_ORDER: Tuple[Tuple[str, frozenset, Tuple[str, ...]], ...] =
 # whole-word matching. Kept SEPARATE from the migrated ``_BEAUTY_CATEGORY_KEYWORDS``
 # so the Phase-0 golden guard is unchanged.
 _BEAUTY_DEVICE_KEYWORDS: frozenset = (
-    _BEAUTY_DEVICE_HAIR_TOKENS
+    # "waver"/"wavers" are whole-word ROUTER tokens only — as SUBSTRINGS they fire
+    # inside "unwavering"/"Waverly" (a home-decor + fashion brand), so keep them
+    # OUT of this substring-matched resolver union. "beachwaver" is substring-safe.
+    (_BEAUTY_DEVICE_HAIR_TOKENS - {"waver", "wavers"})
     | frozenset(_BEAUTY_DEVICE_HAIR_PHRASES)
     | _BEAUTY_DEVICE_SKINCARE_TOKENS
     | frozenset(_BEAUTY_DEVICE_SKINCARE_PHRASES)
@@ -228,6 +236,13 @@ _BEAUTY_DEVICE_KEYWORDS: frozenset = (
     # differs.
     | frozenset({"hair removal"})
 )
+
+# WHOLE-WORD beauty resolver tokens (matched against the tokenized text, NOT as
+# substrings — mirrors _ELECTRONICS_WORD_KEYWORDS). "waver"/"wavers" MUST be
+# whole-word: as substrings they fire inside "Waverly"/"unwavering"/"wavering", but
+# a bare-word waver title ("3 Barrel Waver", "VODANA Triple Flow Waver") still needs
+# to resolve `beauty` so the router can read its "waver" device signal.
+_BEAUTY_DEVICE_WORD_KEYWORDS = frozenset({"waver", "wavers"})
 
 
 # --------------------------------------------------------------------------- #
@@ -350,6 +365,7 @@ def _classify(text: str, *, beauty_keywords: frozenset) -> str:
     tokens = set(re.findall(r"[a-z0-9]+", text))
 
     matched_beauty = _matched_beauty(text, keywords=beauty_keywords)
+    matched_beauty |= tokens & _BEAUTY_DEVICE_WORD_KEYWORDS   # whole-word "waver(s)"
     matched_fashion = _matched_substr(text, _FASHION_CATEGORY_KEYWORDS)
     matched_electronics = _matched_electronics(text, tokens)
 
@@ -817,7 +833,7 @@ _BEAUTY_DEVICE_HAIR_COMPETITOR_TYPE_TOKENS = frozenset({
     "flat", "iron", "hair", "straightener", "straightening", "curling", "curler",
     "wand", "dryer", "blow", "hot", "air", "styler", "styling", "tool", "brush",
     "comb", "ionic", "ceramic", "tourmaline", "cordless", "professional", "salon",
-    "device", "appliance",
+    "device", "appliance", "waver",
 })
 _BEAUTY_DEVICE_HAIR_AUTHORITY_HOSTS = (
     "allure.com", "byrdie.com", "wirecutter.com", "goodhousekeeping.com",
