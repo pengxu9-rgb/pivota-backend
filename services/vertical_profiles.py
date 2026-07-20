@@ -164,13 +164,32 @@ _BEAUTY_DEVICE_NAIL_PHRASES: Tuple[str, ...] = (
     "electric nail file", "nail drill",
 )
 # generic device tail — class-agnostic APPLIANCE nouns for the long tail
-# (cleansing brushes, steamers, whatever we crawl next). Kept narrow.
-_BEAUTY_DEVICE_GENERIC_TOKENS = frozenset({"handset", "appliance"})
+# (cleansing brushes, steamers, massagers, whatever we crawl next). Kept
+# narrow-but-aligned with the classifier's beauty/devices/facial-cleansing regex.
+# "sonic" is a whole-word generic device signal (sonic cleanser / brush / device);
+# a topical "sonic cleansing FOAM" is still saved by the form-noun veto.
+_BEAUTY_DEVICE_GENERIC_TOKENS = frozenset({"handset", "appliance", "sonic"})
 _BEAUTY_DEVICE_GENERIC_PHRASES: Tuple[str, ...] = (
     "beauty device", "skincare device", "skin care device", "facial device",
     "beauty tool device", "cleansing brush", "facial cleansing brush",
-    "sonic cleansing", "facial steamer",
+    "sonic cleansing", "sonic cleanser", "facial cleansing device",
+    "facial steamer", "facial massager", "scalp massager", "blackhead remover",
+    "pore vacuum", "gua sha device",
 )
+# HARD device-head nouns — words that ARE the device itself (never a modifier of a
+# formulation). Their presence means a topical FORM noun in the same text is an
+# ACCESSORY ("microcurrent device WITH gel", "IPL handset WITH cooling gel", "LED
+# mask serum-compatible", "gel LAMP"), not the product — so it must NOT veto the
+# device class. NOT included: iron/straightener/dryer/curler/styler/brush/roller,
+# which legitimately pair with a form noun in a TOPICAL name ("flat iron spray",
+# "straightener serum") and so must still veto. See _beauty_device_class.
+_BEAUTY_DEVICE_HARD_HEADS = frozenset({
+    "device", "devices", "handset", "handsets", "machine", "appliance",
+    "mask", "lamp", "epilator", "epilators", "steamer", "microcurrent",
+    "nanocurrent", "ipl", "laser", "radiofrequency",
+})
+# ("microdermabrasion" is intentionally NOT a hard head — a "microdermabrasion
+# scrub/serum" is a topical exfoliant; a real device says device/machine/tool.)
 
 # Router order — most-specific / most-safety-critical first. hair_removal before
 # hair-styling and skincare so an "IPL hair removal" (carries "hair") lands on the
@@ -197,6 +216,13 @@ _BEAUTY_DEVICE_KEYWORDS: frozenset = (
     | frozenset(_BEAUTY_DEVICE_HAIR_REMOVAL_PHRASES)
     | frozenset(_BEAUTY_DEVICE_NAIL_PHRASES)
     | frozenset(_BEAUTY_DEVICE_GENERIC_PHRASES)
+    # Bare "hair removal" (substring-safe) pulls an under-tagged IPL/epilator row
+    # (category just "Hair Removal", no "beauty" word) into the `beauty` vertical so
+    # the whole-word router can then read its "ipl"/"epilator" signal. A depilatory
+    # "hair removal cream" also lands here, but the router's form-noun veto keeps it
+    # topical — resolving the vertical is correct (it IS beauty), only the profile
+    # differs.
+    | frozenset({"hair removal"})
 )
 
 
@@ -866,15 +892,19 @@ BEAUTY_DEVICE_SKINCARE_PROFILE = VerticalProfile(
             'and deeper firmness", "microcurrent up to 335µA so it stimulates facial '
             'muscles", "10-minute session so it fits a routine"). Do NOT dump a '
             'spec sheet.\n'
-            '- REGULATORY / SAFETY: FDA clearance (or its absence) is a real buying '
-            'lever — state it only when it appears in EVIDENCE. ALWAYS surface '
-            'contraindications when present (pregnancy, photosensitizing medication, '
-            'epilepsy/seizure history for flashing light, active skin cancer, '
-            'implanted electronics for microcurrent) and eye-protection guidance.\n'
-            '- CLAIMS: frame benefits as CLINICALLY STUDIED / supports, never as a '
-            'medical cure ("clears acne", "removes wrinkles", "treats" a condition). '
-            'State an evidenced number; never inflate. Subjective superlatives are '
-            'positioning, not proven fact.'
+            '- REGULATORY / SAFETY: FDA clearance and specific contraindications '
+            '(pregnancy, photosensitizing medication, epilepsy/seizure history, '
+            'active skin conditions, implanted electronics) are real buying levers, '
+            'but only state a regulatory status or a named medical contraindication '
+            'when it appears VERBATIM in EVIDENCE — do NOT introduce a medical, '
+            'regulatory, or condition term the evidence does not contain. When the '
+            'evidence is thin, keep safety guidance generic and non-medical (e.g. '
+            '"follow the included usage and eye-protection instructions; check '
+            'suitability if you have a medical condition").\n'
+            '- CLAIMS: describe benefits as what the device is DESIGNED to do or is '
+            'STUDIED for ONLY when evidenced, never as a medical cure ("clears acne", '
+            '"removes wrinkles", "treats" a condition). State an evidenced number; '
+            'never inflate. Subjective superlatives are positioning, not proven fact.'
         ),
         cold_pitch_publishers="Allure, Byrdie, Harper's Bazaar, Good Housekeeping, etc.",
     ),
@@ -910,16 +940,19 @@ BEAUTY_DEVICE_HAIR_REMOVAL_PROFILE = VerticalProfile(
     brief_rules=BriefRules(
         claim_rules=(
             '- ELIGIBILITY IS THE HEADLINE: light-based hair removal works on a '
-            'RANGE of skin tones and hair colors — state the supported Fitzpatrick '
-            'skin-tone range and hair colors from EVIDENCE, and NEVER imply it is '
-            'safe or effective for all skin tones / hair colors (it is not for very '
-            'dark skin or light/grey/red hair on most IPL).\n'
+            'RANGE of skin tones and hair colors — state the supported skin-tone / '
+            'hair-color range from EVIDENCE, and NEVER imply it is safe or effective '
+            'for all skin tones / hair colors (most IPL is not for very dark skin or '
+            'light/grey/red hair). Name a specific Fitzpatrick range or regulatory '
+            'status only when it appears VERBATIM in evidence.\n'
             '- SPECS: energy (joules), flash/pulse count and lamp life, treatment '
             'cadence, corded vs cordless — in plain buyer terms.\n'
-            '- SAFETY: FDA clearance when evidenced; ALWAYS surface eye protection '
-            'and contraindications (tattoos, moles, recent sun/tan, photosensitizing '
-            'meds). Say "permanent hair REDUCTION", NEVER "permanent removal", and '
-            'never use medical-cure language.'
+            '- SAFETY: surface eye protection and eligibility; mention a named '
+            'contraindication (tattoos, moles, recent sun/tan, photosensitizing '
+            'medication) only when it is in EVIDENCE — otherwise keep it generic '
+            '("follow the eligibility and safety instructions provided"). Always say '
+            'hair "REDUCTION", never permanent "removal", and never use medical-cure '
+            'language.'
         ),
         cold_pitch_publishers="Allure, Byrdie, Wirecutter, Good Housekeeping, etc.",
     ),
@@ -1044,16 +1077,19 @@ def _beauty_device_class(*texts: Any) -> Optional[str]:
     supplement.
 
     Two-part decision:
-      * VETO — if any blob carries a topical FORM noun (``_BEAUTY_DEVICE_TOPICAL_GUARD``)
-        the SKU is a topical that merely names a tool ("flat iron spray", "curl
-        styler cream", "hair removal cream"), NOT a device; return ``None``. The
-        veto wins regardless of blob order so a mislabeled product_type can't
-        override a formulation title.
-      * ROUTE — otherwise return the first matching class in
-        ``_BEAUTY_DEVICE_CLASS_ORDER`` (most-specific/safety-critical first).
-        Whole-word TYPE tokens (so "led"/"ipl" never fire inside "controlled"/
-        "multiple") plus space-delimited PHRASES (so "led mask" does not match
-        inside "controlled mask")."""
+      * ROUTE — find the first matching class in ``_BEAUTY_DEVICE_CLASS_ORDER``
+        (most-specific/safety-critical first). Whole-word TYPE tokens (so "led"/
+        "ipl" never fire inside "controlled"/"multiple") plus space-delimited
+        PHRASES (so "led mask" does not match inside "controlled mask"). No match
+        → topical (``None``).
+      * VETO — a topical FORM noun (``_BEAUTY_DEVICE_TOPICAL_GUARD``) means the SKU
+        is a topical that merely NAMES a tool ("flat iron spray", "curl styler
+        cream") UNLESS the form noun is an ACCESSORY of a real device. It is an
+        accessory when a HARD device-head noun (device/handset/mask/lamp/ipl/…) is
+        present ("microcurrent DEVICE with gel", "IPL HANDSET with cooling gel")
+        or the form noun is itself part of the matched device phrase ("gel LAMP").
+        Without a hard head, a form noun not in the device phrase vetoes — so
+        "flat iron spray" and "hair removal cream" stay topical."""
     blobs: List[Tuple[str, set]] = []
     for raw in texts:
         text = _normalize(raw)
@@ -1061,15 +1097,34 @@ def _beauty_device_class(*texts: Any) -> Optional[str]:
             blobs.append((text, set(re.findall(r"[a-z0-9]+", text))))
     if not blobs:
         return None
-    for text, tokens in blobs:
-        if tokens & _BEAUTY_DEVICE_TOPICAL_GUARD:
-            return None   # topical formulation — not a device
+
+    matched_cls: Optional[str] = None
+    phrase_words: frozenset = frozenset()
     for cls, type_tokens, phrases in _BEAUTY_DEVICE_CLASS_ORDER:
         for text, tokens in blobs:
+            if tokens & type_tokens:
+                matched_cls = cls
+                break
             padded = f" {text} "
-            if tokens & type_tokens or any(f" {p} " in padded for p in phrases):
-                return cls
-    return None
+            hit = next((p for p in phrases if f" {p} " in padded), None)
+            if hit:
+                matched_cls, phrase_words = cls, frozenset(hit.split())
+                break
+        if matched_cls:
+            break
+    if matched_cls is None:
+        return None   # no device signal — topical
+
+    # A hard device-head anywhere means any FORM noun is an accessory, not the
+    # product — so it does not veto (that is the whole "device + gel" case).
+    if any(tokens & _BEAUTY_DEVICE_HARD_HEADS for _, tokens in blobs):
+        return matched_cls
+    # No hard head: a FORM noun that is NOT part of the matched device phrase means
+    # the form noun IS the product (a topical that merely names a tool) — veto.
+    for _text, tokens in blobs:
+        if (tokens & _BEAUTY_DEVICE_TOPICAL_GUARD) - phrase_words:
+            return None
+    return matched_cls
 
 
 def _beauty_device_profile(*texts: Any) -> Optional[VerticalProfile]:

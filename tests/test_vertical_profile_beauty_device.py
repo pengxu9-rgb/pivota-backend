@@ -99,6 +99,37 @@ def test_future_device_classes_route_and_are_never_inci_grounded():
         assert prof.evidence_bindings == "none", f"{title!r} wrongly inci-grounded"
 
 
+@pytest.mark.parametrize("title,expected", [
+    # A real DEVICE that ships with an accessory SUBSTANCE (gel/serum) must still
+    # route to its device class — the form noun is the accessory, not the product.
+    ("ZIIP Microcurrent Device + Conductive Gel", "beauty_device_skincare_energy"),
+    ("NuFACE Microcurrent Device with Aqua Gel Primer", "beauty_device_skincare_energy"),
+    ("Ulike IPL Hair Removal Handset with Cooling Gel", "beauty_device_hair_removal"),
+    ("Omnilux LED Face Mask serum compatible", "beauty_device_skincare_energy"),
+    ("UV Gel Nail Lamp 48W", "beauty_device_generic"),   # "gel lamp" is the device name
+])
+def test_device_with_accessory_substance_still_routes_device(title, expected):
+    prof = resolve_profile({"product_type": ""}, title=title)
+    assert prof.name == expected, f"{title!r} -> {prof.name}"
+    assert prof.evidence_bindings == "none"
+
+
+def test_form_noun_is_the_product_still_vetoes_even_with_device_word():
+    # No HARD device head: the form noun IS the product (a topical that names a
+    # tool), so it stays topical even though a device phrase is present.
+    assert not resolve_profile({"product_type": ""}, title="Flat Iron Spray with Argan Oil").name.startswith("beauty_device")
+    assert not resolve_profile({"product_type": ""}, title="Brazilian Straightener Serum").name.startswith("beauty_device")
+
+
+def test_under_tagged_ipl_row_resolves_beauty_then_routes_hair_removal():
+    # S2: a bare "IPL" + category "Hair Removal" row (no "beauty" word) must resolve
+    # the beauty vertical (via the "hair removal" resolver keyword) so the router
+    # reads its "ipl" signal — instead of collapsing to other/electronics.
+    row = {"product_type": "IPL", "category": "Hair Removal"}
+    assert resolve_vertical(row, title="Braun Silk-expert Pro 5 IPL") == "beauty"
+    assert resolve_profile(row, title="Braun Silk-expert Pro 5 IPL").name == "beauty_device_hair_removal"
+
+
 def test_energy_and_hair_removal_devices_are_health_sensitive():
     # Safety-critical: LED/microcurrent/RF and IPL/laser carry contraindications,
     # so their profiles must flag health_sensitive=True. Hair-styling does NOT.
