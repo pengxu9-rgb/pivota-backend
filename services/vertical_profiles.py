@@ -237,6 +237,13 @@ _BEAUTY_DEVICE_KEYWORDS: frozenset = (
     | frozenset({"hair removal"})
 )
 
+# WHOLE-WORD beauty resolver tokens (matched against the tokenized text, NOT as
+# substrings — mirrors _ELECTRONICS_WORD_KEYWORDS). "waver"/"wavers" MUST be
+# whole-word: as substrings they fire inside "Waverly"/"unwavering"/"wavering", but
+# a bare-word waver title ("3 Barrel Waver", "VODANA Triple Flow Waver") still needs
+# to resolve `beauty` so the router can read its "waver" device signal.
+_BEAUTY_DEVICE_WORD_KEYWORDS = frozenset({"waver", "wavers"})
+
 
 # --------------------------------------------------------------------------- #
 # Resolver keyword sets — the UNION of the three resolvers.
@@ -358,6 +365,7 @@ def _classify(text: str, *, beauty_keywords: frozenset) -> str:
     tokens = set(re.findall(r"[a-z0-9]+", text))
 
     matched_beauty = _matched_beauty(text, keywords=beauty_keywords)
+    matched_beauty |= tokens & _BEAUTY_DEVICE_WORD_KEYWORDS   # whole-word "waver(s)"
     matched_fashion = _matched_substr(text, _FASHION_CATEGORY_KEYWORDS)
     matched_electronics = _matched_electronics(text, tokens)
 

@@ -142,6 +142,11 @@ def test_device_tech_named_topical_aftercare_stays_topical(title):
     "VODANA Compact Wave Iron 1.5 inch Beach Waves",
     "Beachwaver S1",                 # one-token brand still routes device
     "Double Barrel Hair Waver",      # routes via "waver"/"hair waver", not "barrel"
+    # bare-word "waver" the only beauty signal — must resolve beauty (whole-word
+    # resolver token) THEN route device; these regressed once and must stay covered.
+    "3 Barrel Waver",
+    "Revlon Triple Barrel Waver",
+    "VODANA Triple Flow Waver",
 ])
 def test_hair_wavers_route_device(title):
     prof = resolve_profile({"product_type": ""}, title=title)
