@@ -176,20 +176,24 @@ _BEAUTY_DEVICE_GENERIC_PHRASES: Tuple[str, ...] = (
     "facial steamer", "facial massager", "scalp massager", "blackhead remover",
     "pore vacuum", "gua sha device",
 )
-# HARD device-head nouns — words that ARE the device itself (never a modifier of a
-# formulation). Their presence means a topical FORM noun in the same text is an
-# ACCESSORY ("microcurrent device WITH gel", "IPL handset WITH cooling gel", "LED
-# mask serum-compatible", "gel LAMP"), not the product — so it must NOT veto the
-# device class. NOT included: iron/straightener/dryer/curler/styler/brush/roller,
-# which legitimately pair with a form noun in a TOPICAL name ("flat iron spray",
-# "straightener serum") and so must still veto. See _beauty_device_class.
+# HARD device-head nouns — UNAMBIGUOUS nouns that ARE the device itself and never
+# modify a formulation. Their presence means a topical FORM noun in the same text
+# is an ACCESSORY ("microcurrent DEVICE with gel", "IPL HANDSET with cooling gel",
+# "LED MASK serum-compatible", "gel LAMP"), not the product — so it must NOT veto
+# the device class.
+#
+# DELIBERATELY EXCLUDED — tokens that are the device TYPE signal but ALSO appear as
+# modifiers in TOPICAL aftercare names, so letting them cancel the veto would
+# misroute a topical to a device: ipl / laser / epilator / microcurrent /
+# radiofrequency ("IPL Aftercare Gel", "Laser Hair Removal Soothing Gel",
+# "Epilator Cooling Gel" are all topicals), and iron / straightener / dryer /
+# curler / styler / brush / roller ("flat iron spray", "straightener serum").
+# Those still veto unless a real device NOUN below is also present. (A genuine
+# IPL/microcurrent device names itself device/handset/machine in its title.)
 _BEAUTY_DEVICE_HARD_HEADS = frozenset({
     "device", "devices", "handset", "handsets", "machine", "appliance",
-    "mask", "lamp", "epilator", "epilators", "steamer", "microcurrent",
-    "nanocurrent", "ipl", "laser", "radiofrequency",
+    "mask", "lamp", "steamer",
 })
-# ("microdermabrasion" is intentionally NOT a hard head — a "microdermabrasion
-# scrub/serum" is a topical exfoliant; a real device says device/machine/tool.)
 
 # Router order — most-specific / most-safety-critical first. hair_removal before
 # hair-styling and skincare so an "IPL hair removal" (carries "hair") lands on the

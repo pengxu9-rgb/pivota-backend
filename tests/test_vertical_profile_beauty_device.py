@@ -121,6 +121,22 @@ def test_form_noun_is_the_product_still_vetoes_even_with_device_word():
     assert not resolve_profile({"product_type": ""}, title="Brazilian Straightener Serum").name.startswith("beauty_device")
 
 
+@pytest.mark.parametrize("title", [
+    # Topical AFTERCARE formulations that merely NAME a device technology. The
+    # tech token (ipl/laser/epilator/microcurrent) is a modifier, and there is NO
+    # unambiguous device NOUN — so the form noun is the product → stay topical.
+    "IPL Aftercare Soothing Gel",
+    "Post-IPL Calming Serum",
+    "Laser Hair Removal Aftercare Cream",
+    "Laser Hair Removal Soothing Gel",
+    "Epilator Cooling Gel",
+    "Microcurrent Conductivity Gel",
+])
+def test_device_tech_named_topical_aftercare_stays_topical(title):
+    prof = resolve_profile({"product_type": ""}, title=title)
+    assert not prof.name.startswith("beauty_device"), f"{title!r} -> {prof.name} (should be topical)"
+
+
 def test_under_tagged_ipl_row_resolves_beauty_then_routes_hair_removal():
     # S2: a bare "IPL" + category "Hair Removal" row (no "beauty" word) must resolve
     # the beauty vertical (via the "hair removal" resolver keyword) so the router
