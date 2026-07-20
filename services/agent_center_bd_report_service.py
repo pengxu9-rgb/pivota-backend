@@ -9283,7 +9283,20 @@ def _unbranded_category_specs(
     # whose use-cases are genuine concerns (beauty). Electronics use-cases are
     # activities/product types, so the profile gates it off entirely.
     problem_framed = bool(getattr(profile, "problem_framed_prompts", True))
+    # A DEVICE SPEC that got mis-classified into use_case (e.g. "dual voltage",
+    # "ceramic plates") must NOT be problem-framed — "what helps with dual voltage"
+    # is junk. Route a pure-spec term to the attribute shape instead. spec_vocab is
+    # the profile's own spec vocabulary (empty for topical/electronics → no change).
+    _spec_vocab = {
+        tok
+        for term in (getattr(profile, "seed_spec_terms", ()) or ())
+        for tok in re.findall(r"[a-z0-9]+", str(term).lower())
+    }
     for use_case in use_cases[:3]:
+        uc_tokens = set(re.findall(r"[a-z0-9]+", str(use_case).lower()))
+        if _spec_vocab and uc_tokens and uc_tokens <= _spec_vocab:
+            specs.append((f"{use_case} {category}", "attribute"))
+            continue
         specs.append((f"best {category} for {use_case}", "category"))
         if problem_framed and not is_scenario_slug(use_case):
             specs.append((f"what helps with {use_case}", "category"))
@@ -9309,6 +9322,23 @@ def _unbranded_category_specs(
             constraint_terms.append(cleaned)
     for attr in constraint_terms[:5]:
         specs.append((f"{attr} {category}", "attribute"))
+
+    # Seed the category DECISION SPACE (per-category config pack) so the audit
+    # probes it even before deep extraction: buyer CONCERNS the device solves →
+    # problem-framed ("what helps with frizzy hair"); hardware SPECS → attribute
+    # shape ("dual voltage flat iron"), never problem-framed. Empty for
+    # topical/electronics profiles, so their prompts are byte-unchanged. Deduped.
+    for concern in (getattr(profile, "seed_concern_terms", ()) or ()):
+        concern = _clean_prompt_term(concern)
+        if not concern or _term_repeats_category(concern, category, profile=profile):
+            continue
+        specs.append((f"best {category} for {concern}", "category"))
+        if problem_framed:
+            specs.append((f"what helps with {concern}", "category"))
+    for spec in (getattr(profile, "seed_spec_terms", ()) or ()):
+        spec = _clean_prompt_term(spec)
+        if spec and spec not in category:
+            specs.append((f"{spec} {category}", "attribute"))
 
     return _dedupe_query_specs(specs)
 
