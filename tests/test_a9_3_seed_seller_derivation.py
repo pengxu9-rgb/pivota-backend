@@ -122,6 +122,66 @@ async def test_derive_self_when_anchor_owns_destination(monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_derive_retailer_destination_is_cross_not_self(monkeypatch):
+    # A KNOWN-RETAILER destination is NEVER 'self', even when the anchor "owns" it
+    # (an observed seller minted from the retailer host). It must be 'cross' so the
+    # trust policy requires identity coverage (→ shadow) instead of serving the seed
+    # brand-official/PUBLIC. Regression: VODANA no-D2C crawled from Amazon minted
+    # self→public (2026-07-20).
+    async def _owns(anchor: str, registrable: str) -> bool:
+        return True  # pre-fix this alone forced 'self'
+
+    async def _mint(**_: Any) -> str:
+        return "merch_obs_retailerseller"
+
+    monkeypatch.setattr(si, "_anchor_owns_domain", _owns)
+    monkeypatch.setattr(si, "ensure_observed_seller", _mint)
+    for dest in (
+        "https://www.amazon.com/dp/B08LV4KT49",
+        "https://global.oliveyoung.com/product/detail?prdtNo=GA241026123",
+        "https://www.stylekorean.com/brand/vodana",
+    ):
+        seller_ref, seed_kind = await si.derive_seed_seller(
+            anchor_merchant_id="merch_anchor",
+            brand="VODANA",
+            destination_domain=dest,
+            source_system="test",
+        )
+        assert seed_kind == "cross", f"{dest} must be cross, got {seed_kind}"
+        assert seller_ref == "merch_obs_retailerseller"
+
+
+@pytest.mark.asyncio
+async def test_derive_self_still_holds_for_brand_own_domain(monkeypatch):
+    # A brand's OWN (non-retailer) domain still resolves 'self' → public — unchanged
+    # for D2C brands (e.g. the StyleKorean-pilot Shopify mints). The retailer guard
+    # must not touch this path.
+    async def _owns(anchor: str, registrable: str) -> bool:
+        return True
+
+    async def _mint(**_: Any) -> str:
+        raise AssertionError("self path must not mint an observed seller")
+
+    monkeypatch.setattr(si, "_anchor_owns_domain", _owns)
+    monkeypatch.setattr(si, "ensure_observed_seller", _mint)
+    seller_ref, seed_kind = await si.derive_seed_seller(
+        anchor_merchant_id="merch_anchor",
+        brand="Anuko",
+        destination_domain="https://anuko.com/p/1",
+        source_system="test",
+    )
+    assert (seller_ref, seed_kind) == ("merch_anchor", "self")
+
+
+def test_stylekorean_is_now_a_known_retailer():
+    from services.offer_seller_identity import is_known_retailer
+    assert is_known_retailer("stylekorean.com")
+    assert is_known_retailer("www.stylekorean.com")
+    assert is_known_retailer("global.oliveyoung.com")
+    assert not is_known_retailer("anuko.com")  # a brand's own domain is not a retailer
+
+
+@pytest.mark.asyncio
 async def test_derive_cross_mints_observed_seller(monkeypatch):
     async def _owns(anchor: str, registrable: str) -> bool:
         return False

@@ -55,7 +55,7 @@ _QUARANTINE_BULK_MAX = 5_000
 _PRODUCT_JOIN_CTES = """
   WITH external_seed_one AS (
     SELECT DISTINCT ON (external_product_id)
-      id, external_product_id, status, domain, attached_product_key, updated_at
+      id, external_product_id, status, domain, attached_product_key, updated_at, seed_kind
     FROM external_product_seeds
     ORDER BY
       external_product_id,
@@ -74,7 +74,7 @@ _PRODUCT_JOIN_CTES = """
     -- re-derive IDENTITY_CONFIDENCE_NULL nondeterministically as updated_at
     -- values move.
     SELECT DISTINCT ON (s.attached_product_key)
-      s.id, s.external_product_id, s.status, s.domain, s.attached_product_key, s.updated_at
+      s.id, s.external_product_id, s.status, s.domain, s.attached_product_key, s.updated_at, s.seed_kind
     FROM external_product_seeds s
     LEFT JOIN pdp_identity_listing spl
       ON spl.product_id = s.external_product_id
@@ -149,6 +149,7 @@ _PRODUCT_JOIN_SELECT = """
     COALESCE(eps.domain, epm.domain)                             AS eps_domain,
     COALESCE(eps.attached_product_key, epm.attached_product_key) AS eps_attached_product_key,
     COALESCE(eps.updated_at, epm.updated_at)                     AS eps_last_seen_at,
+    COALESCE(eps.seed_kind, epm.seed_kind)                       AS eps_seed_kind,
 
     ms.merchant_id           AS ms_merchant_id,
     ms.platform              AS ms_platform,
@@ -510,6 +511,9 @@ def _joined_row_to_inputs(
             "sync_status": _row_get(row, "sync_status"),
             "suppression_reason": _row_get(row, "suppression_reason"),
             "last_seen_in_sync_at": _row_get(row, "last_seen_in_sync_at"),
+            # seed_kind='cross' (retailer-sourced observed seller) must NOT get the
+            # observed-seller public-passthrough exemption; 'self'/NULL keeps it.
+            "seed_kind": _row_get(row, "eps_seed_kind"),
         },
         "identity": (
             {

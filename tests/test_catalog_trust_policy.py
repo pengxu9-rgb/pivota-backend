@@ -172,6 +172,28 @@ def call_observed_seller(**overrides):
 # ---- HAPPY PATH -------------------------------------------------------------
 
 
+def test_retailer_sourced_observed_seller_stays_shadow():
+    # A RETAILER-sourced observed seller (seed_kind='cross' — a no-D2C brand
+    # crawled from a marketplace, e.g. VODANA→Amazon) is NOT the brand's own
+    # crawl, so it does NOT get the observed-seller public-passthrough exemption:
+    # with no identity coverage it stays SHADOW, not public. (Incident 2026-07-20.)
+    trust = call_observed_seller(
+        product=observed_seller_product(seed_kind="cross"), identity=None
+    )
+    assert trust["serving_decision"] == "shadow"
+
+
+def test_own_crawl_observed_seller_public_and_no_demotion_on_legacy_seed_kind():
+    # A brand's OWN crawl (seed_kind='self') stays exempt → public. A missing /
+    # legacy-NULL seed_kind ALSO stays exempt → public, so gating on the explicit
+    # 'cross' demotes NO existing public observed-seller row.
+    for sk in ("self", None):
+        trust = call_observed_seller(
+            product=observed_seller_product(seed_kind=sk), identity=None
+        )
+        assert trust["serving_decision"] == "public", f"seed_kind={sk!r} must stay public"
+
+
 def test_approved_merchant_row_with_eligible_ips_resolves_to_public():
     trust = call()
     assert trust["serving_decision"] == "public"

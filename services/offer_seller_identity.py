@@ -32,6 +32,7 @@ DEFAULT_KNOWN_RETAILER_DOMAINS = (
     "amazon.com", "amazon.co.uk", "amazon.co.jp", "amazon.de", "amazon.ca", "amzn.to", "amzn.com",
     "sephora.com", "walmart.com",
     "oliveyoung.com", "global.oliveyoung.com", "oliveyoung.co.kr",
+    "stylekorean.com",
     "nordstrom.com", "macys.com", "dermstore.com", "lookfantastic.com",
     "cultbeauty.com", "cultbeauty.co.uk", "yesstyle.com", "stylevana.com",
     "iherb.com", "ebay.com", "kohls.com", "jcpenney.com", "beautylish.com",

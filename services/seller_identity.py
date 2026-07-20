@@ -47,6 +47,7 @@ from db.database import database
 from services.brand_claim_service import _PUBLIC_SUFFIXES, normalize_host
 from services.catalog_identity import normalize_brand
 from services.catalog_sync_service import upsert_catalog_merchant
+from services.offer_seller_identity import is_known_retailer
 
 logger = logging.getLogger(__name__)
 
@@ -308,8 +309,11 @@ async def derive_seed_seller(
     """Derive `(seller_ref, seed_kind)` for a NEW external_product_seeds row.
 
     Returns:
-      - `(anchor_merchant_id, 'self')` when the destination belongs to the anchor;
-      - `(observed_seller_id, 'cross')` when it belongs to a different seller;
+      - `(anchor_merchant_id, 'self')` when the destination belongs to the anchor
+        AND is not a known retailer/marketplace host;
+      - `(observed_seller_id, 'cross')` when it belongs to a different seller OR is
+        a known-retailer host (a marketplace is never a brand's own store, so it
+        must not become a brand-official 'self'/public seed);
       - `(None, None)` when unresolvable (leave the columns NULL — pre-A9-4 state).
 
     ``destination_domain`` may be a bare host or a full URL; it is reduced to its
@@ -335,8 +339,21 @@ async def derive_seed_seller(
         )
         return (None, None)
 
+    # A KNOWN-RETAILER / marketplace destination (Amazon, Olive Young, StyleKorean,
+    # …) is NEVER a brand's own store — even when an observed seller was minted from
+    # that host (which stamps the host as the seller's domain and would otherwise
+    # satisfy _anchor_owns_domain → 'self'). A 'self' seed is treated brand-official
+    # and served PUBLIC by the trust policy (PUBLIC_PASSTHROUGH); a retailer-sourced
+    # seed must be 'cross' so trust requires identity coverage (→ shadow) instead of
+    # public-passthrough. (VODANA 2026-07-20: a no-D2C brand crawled from Amazon
+    # minted self→public.) So a retailer host skips the self branch and falls
+    # through to the CROSS mint below; a brand's OWN domain is unaffected.
     anchor = str(anchor_merchant_id or "").strip() or None
-    if anchor and await _anchor_owns_domain(anchor, registrable):
+    if (
+        anchor
+        and not is_known_retailer(registrable)
+        and await _anchor_owns_domain(anchor, registrable)
+    ):
         return (anchor, "self")
 
     try:
