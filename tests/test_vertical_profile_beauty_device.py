@@ -140,8 +140,8 @@ def test_device_tech_named_topical_aftercare_stays_topical(title):
 @pytest.mark.parametrize("title", [
     "VODANA Professional Triple Flow Ceramic Hair Waver",
     "VODANA Compact Wave Iron 1.5 inch Beach Waves",
-    "Beachwaver S1 Deep Waver",
-    "Double Barrel Hair Waver",
+    "Beachwaver S1",                 # one-token brand still routes device
+    "Double Barrel Hair Waver",      # routes via "waver"/"hair waver", not "barrel"
 ])
 def test_hair_wavers_route_device(title):
     prof = resolve_profile({"product_type": ""}, title=title)
@@ -151,11 +151,32 @@ def test_hair_wavers_route_device(title):
 
 def test_waver_vocab_does_not_steal_topical_wave_products():
     # "wave"-family TOPICALS (styling sprays/creams) must NOT become a device —
-    # only "waver"/"wave iron"/"barrel", never bare "wave".
+    # only "waver"/"wave iron", never bare "wave".
     for t in ["Beach Wave Spray", "Sea Salt Wave Mist", "Wave Defining Cream"]:
         assert not resolve_profile({"product_type": ""}, title=t).name.startswith("beauty_device"), t
         hit = classify(t)
         assert hit is None or not hit[1].startswith("beauty/devices/"), t
+
+
+@pytest.mark.parametrize("title,not_vertical", [
+    # Finding 1: bare "double/triple barrel" must NOT pull non-hair products to device.
+    ("Double Barrel Espresso Machine", "beauty"),
+    ("Triple Barrel Bourbon Whiskey", "beauty"),
+    ("Double Barrel Watch Winder", "beauty"),
+    # Finding 2: "waver" substring must NOT flag "Waverly"/"unwavering" as beauty,
+    # and must not flip a fashion SKU to beauty.
+    ("Waverly Floral Curtains", "beauty"),
+    ("Unwavering Steel Kitchen Knife", "beauty"),
+])
+def test_waver_barrel_substring_false_positives_fixed(title, not_vertical):
+    assert resolve_vertical({"product_type": ""}, title=title) != not_vertical, title
+    assert not resolve_profile({"product_type": ""}, title=title).name.startswith("beauty_device"), title
+
+
+def test_waverly_wave_sweater_stays_fashion():
+    # The one true regression the review found: a fashion SKU flipped to beauty.
+    row = {"product_type": "Wave Knit Sweater", "category": "Sweaters"}
+    assert resolve_vertical(row, title="Waverly Wave Knit Sweater") == "fashion"
 
 
 def test_under_tagged_ipl_row_resolves_beauty_then_routes_hair_removal():

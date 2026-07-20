@@ -79,7 +79,7 @@ CATEGORY_PATTERNS: List[Tuple[str, str, "re.Pattern[str]"]] = [
         r"blow[-\s]?dryer|blow[-\s]?dry\s+brush|hot\s+air\s+brush|hot\s+brush|"
         r"air\s+styler|hair\s+styler|styling\s+(?:iron|wand)|"
         r"hair\s+styling\s+tool|straightener|"
-        r"hair\s+waver|wave\s+iron|deep\s+waver|(?:double|triple)\s+barrel|waver)\b",
+        r"hair\s+waver|wave\s+iron|deep\s+waver|beachwaver|waver)\b",
         re.IGNORECASE)),
     ("Makeup Sponge", "beauty/tools/sponge", re.compile(
         r"\b(makeup sponge|beauty sponge|sponge\s*/\s*puff|powder puff|blender sponge)\b",
