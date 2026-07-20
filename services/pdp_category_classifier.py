@@ -35,6 +35,51 @@ CATEGORY_PATTERNS: List[Tuple[str, str, "re.Pattern[str]"]] = [
         r"\b(drones?|quadcopters?|fpv\s+drone|uav|self[-\s]?flying\s+camera|"
         r"flying\s+camera|camera\s+drone|follow[-\s]?me\s+drone)\b",
         re.IGNORECASE)),
+    # ===== Beauty DEVICE family (beauty_device_* sub-profiles). =====
+    # Own beauty/devices/* subtree, distinct from beauty/tools/* (makeup
+    # applicators) and topical beauty/skincare|haircare. All are BEFORE the makeup
+    # "Brush" / generic "Hair Care" / "Mask" patterns so a heat/energy/light
+    # device is a DEVICE, not a topical mask/brush. Each has a leading negative
+    # lookahead for topical FORM nouns so a formulation that merely names a tool
+    # ("hair removal cream", "led-boosting serum", "flat iron spray") falls through
+    # to its real topical pattern. hair-removal + skincare FIRST because they carry
+    # "hair"/"mask"/"facial" that lower topical patterns would otherwise grab.
+    ("Hair Removal Device", "beauty/devices/hair-removal", re.compile(
+        r"^(?!.*\b(?:cream|wax|gel|foam|lotion|spray|serum|mousse|strips?)\b)"
+        r".*\b(ipl(?:\s+hair\s+removal)?|laser\s+hair\s+removal|"
+        r"hair\s+removal\s+(?:device|handset|system)|epilator)\b",
+        re.IGNORECASE)),
+    ("Skincare Device", "beauty/devices/skincare-energy", re.compile(
+        r"^(?!.*\b(?:sheet\s+mask|cream|serum|ampoule|essence|toner|spray)\b)"
+        r".*\b(led\s+(?:face\s+)?mask|light\s+therapy\s+(?:mask|device)|"
+        r"red\s+light\s+therapy|microcurrent|nanocurrent|"
+        r"radio\s?frequency\s+(?:device|wand)|high[-\s]?frequency\s+wand|"
+        r"microdermabrasion|derma\s?roller|microneedl\w*|"
+        r"skin\s+tightening\s+device|facial\s+toning\s+device)\b",
+        re.IGNORECASE)),
+    ("Facial Cleansing Device", "beauty/devices/facial-cleansing", re.compile(
+        r"^(?!.*\b(?:cream|gel|foam|oil|balm|milk|powder)\b)"
+        r".*\b(facial\s+cleansing\s+brush|cleansing\s+brush|"
+        r"sonic\s+(?:facial\s+)?cleanser|facial\s+cleansing\s+device)\b",
+        re.IGNORECASE)),
+    ("Nail Device", "beauty/devices/nail", re.compile(
+        r"\b(uv[-\s/]?led\s+(?:nail\s+)?lamp|nail\s+lamp|gel\s+lamp|nail\s+dryer|"
+        r"electric\s+nail\s+file|nail\s+drill)\b",
+        re.IGNORECASE)),
+    # Hair-styling tools (VODANA cross-category, beauty x 3C). Negative lookahead
+    # vetoes "flat iron spray" / "blow dry primer" / "curl styler cream"; no bare
+    # "brush"/"hair"/"styler"; bare "straightener" survives only under the veto;
+    # "blow dry" requires "dryer"/"brush"; "flat[\s-]+iron" so "flatiron" (place
+    # names) does not match.
+    ("Hair Styling Tool", "beauty/devices/hair-styling", re.compile(
+        r"^(?!.*\b(?:spray|serum|balm|primer|cream|gel|paste|mist|lotion|mousse|"
+        r"wax|pomade|treatment|oil|protectant|pencil|mascara|essence|ampoule)\b)"
+        r".*\b(flat[\s-]+iron|hair\s+straightener|straightening\s+brush|"
+        r"curling\s+(?:iron|wand|brush)|hair\s+curler|hair\s+dryer|"
+        r"blow[-\s]?dryer|blow[-\s]?dry\s+brush|hot\s+air\s+brush|hot\s+brush|"
+        r"air\s+styler|hair\s+styler|styling\s+(?:iron|wand)|"
+        r"hair\s+styling\s+tool|straightener)\b",
+        re.IGNORECASE)),
     ("Makeup Sponge", "beauty/tools/sponge", re.compile(
         r"\b(makeup sponge|beauty sponge|sponge\s*/\s*puff|powder puff|blender sponge)\b",
         re.IGNORECASE)),

@@ -104,6 +104,133 @@ BEAUTY_RETAILER_TOKENS = frozenset({
 
 
 # --------------------------------------------------------------------------- #
+# Beauty DEVICE family — detection vocabulary (VODANA pilot + forward-looking).
+# Beauty devices are a FAMILY (hair-styling, skincare energy/light, hair removal,
+# nail, …), not one profile. All are the ``beauty`` VERTICAL (same persisted
+# column) but NONE has INCI, so none may run through the ingredient-grounded
+# machinery. The topical-vs-device split — and WHICH device class — is a RUNTIME
+# profile choice (mirrors the electronics audio/drone split); see
+# ``_beauty_device_class`` + the ``BEAUTY_DEVICE_*_PROFILE`` family below.
+#
+# Resolver vs profile do DIFFERENT jobs. A topical formulation that merely NAMES a
+# tool ("flat iron spray", "curl styler cream", "hair removal cream") is genuinely
+# a ``beauty`` product, so it SHOULD resolve the beauty vertical via these
+# keywords — but it is NOT a device, so ``_beauty_device_class`` vetoes any SKU
+# whose text carries a topical FORM noun (``_BEAUTY_DEVICE_TOPICAL_GUARD``). That
+# veto — not substring purity — keeps creams/serums/depilatories on the topical
+# profile. Bare "iron"/"styler" were dropped as tokens (clothes iron; brow
+# styler); qualified phrases remain. Short tokens ("led", "ipl") are safe in the
+# whole-word class ROUTER but are kept OUT of the substring RESOLVER union.
+_BEAUTY_DEVICE_TOPICAL_GUARD = frozenset({
+    "spray", "serum", "balm", "primer", "cream", "gel", "paste", "mist",
+    "lotion", "mousse", "wax", "pomade", "treatment", "oil", "protectant",
+    "pencil", "mascara", "essence", "ampoule", "butter", "foam", "strips",
+})
+
+# class: hair-styling (VODANA)
+_BEAUTY_DEVICE_HAIR_TOKENS = frozenset({
+    "straightener", "straighteners", "hairdryer", "blowdryer",
+})
+_BEAUTY_DEVICE_HAIR_PHRASES: Tuple[str, ...] = (
+    "flat iron", "hair straightener", "straightening brush", "curling iron",
+    "curling wand", "curling brush", "hair curler", "hair dryer", "blow dryer",
+    "blow dry brush", "hot air brush", "hot brush", "air styler", "hair styler",
+    "styling iron", "styling wand", "hair styling tool",
+)
+# class: skincare energy/light (LED, microcurrent, RF, microneedling).
+# NOTE: bare "led" is NOT a token — a "UV LED nail lamp" is a nail device, not a
+# skincare one. LED skincare is matched by the phrases below ("led mask" etc.).
+_BEAUTY_DEVICE_SKINCARE_TOKENS = frozenset({
+    "microcurrent", "radiofrequency", "dermaroller", "microneedling",
+    "microneedle", "microdermabrasion", "dermabrasion", "nanocurrent",
+})
+_BEAUTY_DEVICE_SKINCARE_PHRASES: Tuple[str, ...] = (
+    "led mask", "led face mask", "light therapy mask", "light therapy device",
+    "red light therapy", "led light therapy", "microcurrent device",
+    "radio frequency", "high frequency wand", "high-frequency wand",
+    "ultrasonic skin", "facial toning device", "skin tightening device",
+    "derma roller",
+)
+# class: hair removal (IPL, laser, epilator)
+_BEAUTY_DEVICE_HAIR_REMOVAL_TOKENS = frozenset({"ipl", "epilator", "epilators"})
+_BEAUTY_DEVICE_HAIR_REMOVAL_PHRASES: Tuple[str, ...] = (
+    "laser hair removal", "ipl hair removal", "hair removal handset",
+    "hair removal device", "hair removal system", "light based hair removal",
+)
+# class: nail (UV/LED lamps, e-files) — phrase-only for now
+_BEAUTY_DEVICE_NAIL_TOKENS: frozenset = frozenset()
+_BEAUTY_DEVICE_NAIL_PHRASES: Tuple[str, ...] = (
+    "nail lamp", "uv led lamp", "uv lamp", "gel lamp", "nail dryer",
+    "electric nail file", "nail drill",
+)
+# generic device tail — class-agnostic APPLIANCE nouns for the long tail
+# (cleansing brushes, steamers, massagers, whatever we crawl next). Kept
+# narrow-but-aligned with the classifier's beauty/devices/facial-cleansing regex.
+# "sonic" is a whole-word generic device signal (sonic cleanser / brush / device);
+# a topical "sonic cleansing FOAM" is still saved by the form-noun veto.
+_BEAUTY_DEVICE_GENERIC_TOKENS = frozenset({"handset", "appliance", "sonic"})
+_BEAUTY_DEVICE_GENERIC_PHRASES: Tuple[str, ...] = (
+    "beauty device", "skincare device", "skin care device", "facial device",
+    "beauty tool device", "cleansing brush", "facial cleansing brush",
+    "sonic cleansing", "sonic cleanser", "facial cleansing device",
+    "facial steamer", "facial massager", "scalp massager", "blackhead remover",
+    "pore vacuum", "gua sha device",
+)
+# HARD device-head nouns — UNAMBIGUOUS nouns that ARE the device itself and never
+# modify a formulation. Their presence means a topical FORM noun in the same text
+# is an ACCESSORY ("microcurrent DEVICE with gel", "IPL HANDSET with cooling gel",
+# "LED MASK serum-compatible", "gel LAMP"), not the product — so it must NOT veto
+# the device class.
+#
+# DELIBERATELY EXCLUDED — tokens that are the device TYPE signal but ALSO appear as
+# modifiers in TOPICAL aftercare names, so letting them cancel the veto would
+# misroute a topical to a device: ipl / laser / epilator / microcurrent /
+# radiofrequency ("IPL Aftercare Gel", "Laser Hair Removal Soothing Gel",
+# "Epilator Cooling Gel" are all topicals), and iron / straightener / dryer /
+# curler / styler / brush / roller ("flat iron spray", "straightener serum").
+# Those still veto unless a real device NOUN below is also present. (A genuine
+# IPL/microcurrent device names itself device/handset/machine in its title.)
+_BEAUTY_DEVICE_HARD_HEADS = frozenset({
+    "device", "devices", "handset", "handsets", "machine", "appliance",
+    "mask", "lamp", "steamer",
+})
+
+# Router order — most-specific / most-safety-critical first. hair_removal before
+# hair-styling and skincare so an "IPL hair removal" (carries "hair") lands on the
+# health-sensitive removal profile, not on styling or skincare.
+_BEAUTY_DEVICE_CLASS_ORDER: Tuple[Tuple[str, frozenset, Tuple[str, ...]], ...] = (
+    ("hair_removal", _BEAUTY_DEVICE_HAIR_REMOVAL_TOKENS, _BEAUTY_DEVICE_HAIR_REMOVAL_PHRASES),
+    ("skincare_energy", _BEAUTY_DEVICE_SKINCARE_TOKENS, _BEAUTY_DEVICE_SKINCARE_PHRASES),
+    ("hair", _BEAUTY_DEVICE_HAIR_TOKENS, _BEAUTY_DEVICE_HAIR_PHRASES),
+    ("nail", _BEAUTY_DEVICE_NAIL_TOKENS, _BEAUTY_DEVICE_NAIL_PHRASES),
+    ("generic", _BEAUTY_DEVICE_GENERIC_TOKENS, _BEAUTY_DEVICE_GENERIC_PHRASES),
+)
+
+# Union consulted by the resolver's beauty match (SUBSTRING-based). Only
+# substring-SAFE members: the short token "ipl" is excluded (it fires inside
+# "multiple"/"principle"); the whole-word router still detects it via phrases /
+# whole-word matching. Kept SEPARATE from the migrated ``_BEAUTY_CATEGORY_KEYWORDS``
+# so the Phase-0 golden guard is unchanged.
+_BEAUTY_DEVICE_KEYWORDS: frozenset = (
+    _BEAUTY_DEVICE_HAIR_TOKENS
+    | frozenset(_BEAUTY_DEVICE_HAIR_PHRASES)
+    | _BEAUTY_DEVICE_SKINCARE_TOKENS
+    | frozenset(_BEAUTY_DEVICE_SKINCARE_PHRASES)
+    | (_BEAUTY_DEVICE_HAIR_REMOVAL_TOKENS - {"ipl"})
+    | frozenset(_BEAUTY_DEVICE_HAIR_REMOVAL_PHRASES)
+    | frozenset(_BEAUTY_DEVICE_NAIL_PHRASES)
+    | frozenset(_BEAUTY_DEVICE_GENERIC_PHRASES)
+    # Bare "hair removal" (substring-safe) pulls an under-tagged IPL/epilator row
+    # (category just "Hair Removal", no "beauty" word) into the `beauty` vertical so
+    # the whole-word router can then read its "ipl"/"epilator" signal. A depilatory
+    # "hair removal cream" also lands here, but the router's form-noun veto keeps it
+    # topical — resolving the vertical is correct (it IS beauty), only the profile
+    # differs.
+    | frozenset({"hair removal"})
+)
+
+
+# --------------------------------------------------------------------------- #
 # Resolver keyword sets — the UNION of the three resolvers.
 # --------------------------------------------------------------------------- #
 
@@ -122,7 +249,7 @@ _BEAUTY_WEAK_KEYWORDS = frozenset({"wellness", "supplement", "vitamin"})
 # fallback triggers, so a title-only beauty product ("Marine Collagen",
 # "Sleep Gummies") still resolves beauty and its category fallback fires exactly
 # as it did before this refactor. Only consulted on the title tier (see below).
-_BEAUTY_TITLE_KEYWORDS: frozenset = frozenset(_BEAUTY_CATEGORY_KEYWORDS) | BEAUTY_CATEGORY_HEAD_NOUNS | {
+_BEAUTY_TITLE_KEYWORDS: frozenset = frozenset(_BEAUTY_CATEGORY_KEYWORDS) | BEAUTY_CATEGORY_HEAD_NOUNS | _BEAUTY_DEVICE_KEYWORDS | {
     tok for tokens, _ in BEAUTY_CATEGORY_FALLBACKS for tok in tokens
 }
 
@@ -274,7 +401,10 @@ def resolve_vertical(
         if norm == "generic":
             return "other"
 
-    result = _classify(_category_text(product), beauty_keywords=frozenset(_BEAUTY_CATEGORY_KEYWORDS))
+    result = _classify(
+        _category_text(product),
+        beauty_keywords=frozenset(_BEAUTY_CATEGORY_KEYWORDS) | _BEAUTY_DEVICE_KEYWORDS,
+    )
     if result != "other":
         return result
 
@@ -643,8 +773,263 @@ ELECTRONICS_DRONE_PROFILE = VerticalProfile(
 )
 
 
+# --------------------------------------------------------------------------- #
+# beauty_device FAMILY (VODANA pilot + forward-looking). Beauty devices are a
+# FAMILY, not one profile. Every member resolves to the `beauty` VERTICAL (same
+# persisted column as a topical cosmetic — the topical/device split is a RUNTIME
+# choice), and NONE has INCI, so none may inherit BEAUTY_PROFILE's
+# `inci_grounded` / `lexicon_first`. It is the beauty-side mirror of the
+# electronics audio/drone split — but wider, because the classes DIFFER in their
+# decision drivers, authority hosts, and — critically — HEALTH-SENSITIVITY:
+#   * hair-styling (VODANA)      — heat; NOT health-sensitive (reduced-damage lever)
+#   * skincare energy/light      — LED / microcurrent / RF; health-sensitive TRUE
+#     (photosensitivity, eye safety, pregnancy/epilepsy contraindications)
+#   * hair removal (IPL/laser)   — health-sensitive TRUE (skin-tone/hair-color
+#     eligibility, burns, eye safety; "permanent reduction" not "removal")
+# ``_beauty_device_class`` routes a SKU to its class (or None = topical); an
+# UNMODELED class falls to BEAUTY_DEVICE_GENERIC_PROFILE — degraded (no class
+# dossier) but SAFE (no INCI), never silently mis-grounded as a topical. All
+# members KEEP `problem_framed_prompts=True`: "what helps with frizzy hair /
+# wrinkles / unwanted hair" is a genuine buyer concern (the beauty × device
+# hybrid — spec-driven like electronics, concern-framed like beauty).
+# --------------------------------------------------------------------------- #
+
+# (Detection token/phrase sets + the class router order are defined once, up top
+# with _BEAUTY_DEVICE_TOPICAL_GUARD, because the resolver union references them
+# before this point. Below is per-class PROFILE content only.)
+
+_BEAUTY_DEVICE_RETAILER_TOKENS = frozenset({
+    "amazon", "oliveyoung", "coupang", "sephora", "ulta", "target", "walmart",
+    "bestbuy", "costco", "yesstyle", "stylevana", "stylekorean", "qoo10", "ebay",
+    "dermstore", "currentbody",
+})
+
+# ---- class: hair-styling (VODANA) ----
+_BEAUTY_DEVICE_HAIR_HEAD_NOUNS = frozenset({
+    "straightener", "iron", "dryer", "curler", "wand", "styler", "brush",
+    "comb", "tool",
+})
+_BEAUTY_DEVICE_HAIR_MODIFIERS = frozenset({
+    "flat", "hair", "curling", "straightening", "blow", "hot", "air",
+    "styling", "ionic", "ceramic", "tourmaline", "cordless",
+})
+_BEAUTY_DEVICE_HAIR_COMPETITOR_TYPE_TOKENS = frozenset({
+    "flat", "iron", "hair", "straightener", "straightening", "curling", "curler",
+    "wand", "dryer", "blow", "hot", "air", "styler", "styling", "tool", "brush",
+    "comb", "ionic", "ceramic", "tourmaline", "cordless", "professional", "salon",
+    "device", "appliance",
+})
+_BEAUTY_DEVICE_HAIR_AUTHORITY_HOSTS = (
+    "allure.com", "byrdie.com", "wirecutter.com", "goodhousekeeping.com",
+    "instyle.com", "cosmopolitan.com", "harpersbazaar.com", "refinery29.com",
+    "nytimes.com", "goodhousekeeping.co.uk",
+)
+
+BEAUTY_DEVICE_HAIR_PROFILE = VerticalProfile(
+    name="beauty_device_hair",
+    category_head_nouns=_BEAUTY_DEVICE_HAIR_HEAD_NOUNS,
+    category_modifiers=_BEAUTY_DEVICE_HAIR_MODIFIERS,
+    category_fallbacks=(),          # a device is never a "beauty supplement"
+    noisy_prompt_tokens=frozenset(),
+    retailer_tokens=_BEAUTY_DEVICE_RETAILER_TOKENS,
+    competitor_ingredient_tokens=frozenset(),   # devices have no "ingredients"
+    competitor_form_tokens=_BEAUTY_DEVICE_HAIR_COMPETITOR_TYPE_TOKENS,
+    attribute_strategy="llm_extractor",         # specs, NOT the beauty lexicon
+    brief_rules=BriefRules(
+        claim_rules=(
+            '- SPECS: name device specs in plain buyer terms and say what they DO '
+            'for the hair ("dual voltage 110-240V so it works on any trip", '
+            '"ceramic/tourmaline plates so heat spreads evenly and snags less", '
+            '"adjustable heat 150-230C so fine hair can stay on a low setting", '
+            '"silicone Softbar so it glides without tugging"). Do NOT dump a spec '
+            'sheet or model-number soup.\n'
+            '- HAIR OUTCOMES: frizz control, shine, style longevity, and hair-type '
+            'suitability (fine / thick / curly / color-treated) are the real '
+            'decision levers — state them only when they appear in EVIDENCE, and '
+            'frame heat-damage protection as reduced-damage styling, never as a '
+            'repair or medical claim.\n'
+            '- CLAIMS: a hard spec (wattage, plate temperature, voltage) is fine '
+            'when it appears in EVIDENCE — state the evidenced number, never inflate '
+            'it. Frame subjective superlatives ("salon-quality", "best straightener") '
+            'as positioning, not proven fact, and do NOT use medical or '
+            'health-efficacy language ("heals", "repairs damage") for a styling tool.'
+        ),
+        cold_pitch_publishers="Allure, Byrdie, Wirecutter, Good Housekeeping, etc.",
+    ),
+    publisher_avoid_list=("Allure", "Byrdie", "Wirecutter", "Good Housekeeping", "InStyle"),
+    authority_hosts=_BEAUTY_DEVICE_HAIR_AUTHORITY_HOSTS,
+    # Heat, but not health-sensitive in the topical sense (no ingredient safety /
+    # medical efficacy). Heat-damage is a claim lever, handled in brief_rules.
+    health_sensitive=False,
+    problem_framed_prompts=True,
+    evidence_bindings="none",
+    grounded_coverage_disclosure=(
+        "grounded-evidence dimensions are unavailable for this category"
+    ),
+)
+
+# ---- class: skincare energy/light (LED, microcurrent, RF, ultrasonic) ----
+# HEALTH-SENSITIVE: at-home energy/light devices carry real contraindications.
+_BEAUTY_DEVICE_SKINCARE_COMPETITOR_TYPE_TOKENS = frozenset({
+    "led", "mask", "light", "therapy", "microcurrent", "nanocurrent", "device",
+    "facial", "rf", "radiofrequency", "radio", "frequency", "ultrasonic", "high",
+    "wand", "handset", "skin", "skincare", "tightening", "toning", "roller",
+    "derma", "steamer", "cleansing", "brush", "sonic", "red", "infrared",
+})
+BEAUTY_DEVICE_SKINCARE_PROFILE = VerticalProfile(
+    name="beauty_device_skincare_energy",
+    category_head_nouns=frozenset({"mask", "device", "wand", "roller", "steamer", "tool"}),
+    category_modifiers=frozenset({
+        "led", "light", "red", "infrared", "microcurrent", "radio", "frequency",
+        "high", "ultrasonic", "facial", "skin", "derma", "sonic", "cleansing",
+    }),
+    category_fallbacks=(),
+    noisy_prompt_tokens=frozenset(),
+    retailer_tokens=_BEAUTY_DEVICE_RETAILER_TOKENS,
+    competitor_ingredient_tokens=frozenset(),
+    competitor_form_tokens=_BEAUTY_DEVICE_SKINCARE_COMPETITOR_TYPE_TOKENS,
+    attribute_strategy="llm_extractor",
+    brief_rules=BriefRules(
+        claim_rules=(
+            '- SPECS: name the device specs in plain buyer terms and say what they '
+            'DO ("633nm red + 830nm near-infrared so it targets both surface tone '
+            'and deeper firmness", "microcurrent up to 335µA so it stimulates facial '
+            'muscles", "10-minute session so it fits a routine"). Do NOT dump a '
+            'spec sheet.\n'
+            '- REGULATORY / SAFETY: FDA clearance and specific contraindications '
+            '(pregnancy, photosensitizing medication, epilepsy/seizure history, '
+            'active skin conditions, implanted electronics) are real buying levers, '
+            'but only state a regulatory status or a named medical contraindication '
+            'when it appears VERBATIM in EVIDENCE — do NOT introduce a medical, '
+            'regulatory, or condition term the evidence does not contain. When the '
+            'evidence is thin, keep safety guidance generic and non-medical (e.g. '
+            '"follow the included usage and eye-protection instructions; check '
+            'suitability if you have a medical condition").\n'
+            '- CLAIMS: describe benefits as what the device is DESIGNED to do or is '
+            'STUDIED for ONLY when evidenced, never as a medical cure ("clears acne", '
+            '"removes wrinkles", "treats" a condition). State an evidenced number; '
+            'never inflate. Subjective superlatives are positioning, not proven fact.'
+        ),
+        cold_pitch_publishers="Allure, Byrdie, Harper's Bazaar, Good Housekeeping, etc.",
+    ),
+    publisher_avoid_list=("Allure", "Byrdie", "Harper's Bazaar", "Good Housekeeping"),
+    authority_hosts=(
+        "allure.com", "byrdie.com", "harpersbazaar.com", "goodhousekeeping.com",
+        "wirecutter.com", "nytimes.com", "realself.com", "healthline.com", "fda.gov",
+    ),
+    health_sensitive=True,   # contraindications + eye safety are real
+    problem_framed_prompts=True,
+    evidence_bindings="none",
+    grounded_coverage_disclosure=(
+        "grounded-evidence dimensions are unavailable for this category"
+    ),
+)
+
+# ---- class: hair removal (IPL, laser, epilator) ----
+# HEALTH-SENSITIVE: skin-tone/hair-color eligibility + burns + eye safety.
+_BEAUTY_DEVICE_HAIR_REMOVAL_COMPETITOR_TYPE_TOKENS = frozenset({
+    "ipl", "laser", "epilator", "hair", "removal", "device", "handset", "system",
+    "light", "based", "pulsed", "intense", "at", "home", "cordless",
+})
+BEAUTY_DEVICE_HAIR_REMOVAL_PROFILE = VerticalProfile(
+    name="beauty_device_hair_removal",
+    category_head_nouns=frozenset({"epilator", "handset", "device", "system", "ipl"}),
+    category_modifiers=frozenset({"ipl", "laser", "hair", "removal", "pulsed", "at", "home"}),
+    category_fallbacks=(),
+    noisy_prompt_tokens=frozenset(),
+    retailer_tokens=_BEAUTY_DEVICE_RETAILER_TOKENS,
+    competitor_ingredient_tokens=frozenset(),
+    competitor_form_tokens=_BEAUTY_DEVICE_HAIR_REMOVAL_COMPETITOR_TYPE_TOKENS,
+    attribute_strategy="llm_extractor",
+    brief_rules=BriefRules(
+        claim_rules=(
+            '- ELIGIBILITY IS THE HEADLINE: light-based hair removal works on a '
+            'RANGE of skin tones and hair colors — state the supported skin-tone / '
+            'hair-color range from EVIDENCE, and NEVER imply it is safe or effective '
+            'for all skin tones / hair colors (most IPL is not for very dark skin or '
+            'light/grey/red hair). Name a specific Fitzpatrick range or regulatory '
+            'status only when it appears VERBATIM in evidence.\n'
+            '- SPECS: energy (joules), flash/pulse count and lamp life, treatment '
+            'cadence, corded vs cordless — in plain buyer terms.\n'
+            '- SAFETY: surface eye protection and eligibility; mention a named '
+            'contraindication (tattoos, moles, recent sun/tan, photosensitizing '
+            'medication) only when it is in EVIDENCE — otherwise keep it generic '
+            '("follow the eligibility and safety instructions provided"). Always say '
+            'hair "REDUCTION", never permanent "removal", and never use medical-cure '
+            'language.'
+        ),
+        cold_pitch_publishers="Allure, Byrdie, Wirecutter, Good Housekeeping, etc.",
+    ),
+    publisher_avoid_list=("Allure", "Byrdie", "Wirecutter", "Good Housekeeping"),
+    authority_hosts=(
+        "allure.com", "byrdie.com", "wirecutter.com", "goodhousekeeping.com",
+        "nytimes.com", "realself.com", "healthline.com", "fda.gov",
+    ),
+    health_sensitive=True,
+    problem_framed_prompts=True,
+    evidence_bindings="none",
+    grounded_coverage_disclosure=(
+        "grounded-evidence dimensions are unavailable for this category"
+    ),
+)
+
+# ---- generic device fallback (unmodeled classes: nail lamps, cleansing brushes,
+# steamers, whatever we crawl next). Degraded but SAFE: no INCI, no class dossier,
+# non-INCI brief so it never gets the ingredient prompt. health_sensitive stays
+# unknown (None) so the topical heuristic decides conservatively. ----
+BEAUTY_DEVICE_GENERIC_PROFILE = VerticalProfile(
+    name="beauty_device_generic",
+    category_head_nouns=frozenset({"device", "tool", "handset", "appliance", "wand"}),
+    category_modifiers=frozenset({"beauty", "facial", "skin", "skincare", "electric", "rechargeable"}),
+    category_fallbacks=(),
+    noisy_prompt_tokens=frozenset(),
+    retailer_tokens=_BEAUTY_DEVICE_RETAILER_TOKENS,
+    competitor_ingredient_tokens=frozenset(),
+    competitor_form_tokens=frozenset({
+        "device", "tool", "handset", "appliance", "beauty", "facial", "skin",
+        "skincare", "electric", "rechargeable", "cordless",
+    }),
+    attribute_strategy="llm_extractor",
+    brief_rules=BriefRules(
+        claim_rules=(
+            '- SPECS: name the device specs in plain buyer terms and say what they '
+            'DO for the buyer. Do NOT dump a spec sheet.\n'
+            '- CLAIMS: this is a DEVICE, not a formulation — do NOT describe it with '
+            'ingredient / INCI language. State an evidenced spec, never inflate it, '
+            'and do NOT use medical or health-efficacy language ("treats", "cures", '
+            '"heals"). If the device uses energy / light / heat, surface any '
+            'evidenced safety or contraindication guidance.'
+        ),
+        cold_pitch_publishers="Allure, Byrdie, Wirecutter, Good Housekeeping, etc.",
+    ),
+    publisher_avoid_list=("Allure", "Byrdie", "Wirecutter", "Good Housekeeping"),
+    authority_hosts=(
+        "allure.com", "byrdie.com", "wirecutter.com", "goodhousekeeping.com", "nytimes.com",
+    ),
+    health_sensitive=None,   # unknown class -> let the topical heuristic decide
+    problem_framed_prompts=True,
+    evidence_bindings="none",
+    grounded_coverage_disclosure=(
+        "grounded-evidence dimensions are unavailable for this category"
+    ),
+)
+
+# class name -> profile. nail routes to generic until it earns a full profile.
+_BEAUTY_DEVICE_PROFILE_BY_CLASS: Mapping[str, VerticalProfile] = {
+    "hair": BEAUTY_DEVICE_HAIR_PROFILE,
+    "skincare_energy": BEAUTY_DEVICE_SKINCARE_PROFILE,
+    "hair_removal": BEAUTY_DEVICE_HAIR_REMOVAL_PROFILE,
+    "nail": BEAUTY_DEVICE_GENERIC_PROFILE,
+    "generic": BEAUTY_DEVICE_GENERIC_PROFILE,
+}
+
+
 VERTICAL_PROFILES: Mapping[str, VerticalProfile] = {
     "beauty": BEAUTY_PROFILE,
+    "beauty_device_hair": BEAUTY_DEVICE_HAIR_PROFILE,
+    "beauty_device_skincare_energy": BEAUTY_DEVICE_SKINCARE_PROFILE,
+    "beauty_device_hair_removal": BEAUTY_DEVICE_HAIR_REMOVAL_PROFILE,
+    "beauty_device_generic": BEAUTY_DEVICE_GENERIC_PROFILE,
     "generic": GENERIC_PROFILE,
     "electronics_audio": ELECTRONICS_AUDIO_PROFILE,
     "electronics_drone": ELECTRONICS_DRONE_PROFILE,
@@ -688,6 +1073,73 @@ def _electronics_is_drone(*texts: Any) -> bool:
     return False
 
 
+def _beauty_device_class(*texts: Any) -> Optional[str]:
+    """Return the beauty-device CLASS for a SKU, or ``None`` when it is a topical
+    (not a device). Splits the ``beauty`` vertical into its topical vs device
+    sub-profiles. Topical is the default, so a SKU with no device signal returns
+    ``None`` — byte-identical to the pre-device behavior for a cream / serum /
+    supplement.
+
+    Two-part decision:
+      * ROUTE — find the first matching class in ``_BEAUTY_DEVICE_CLASS_ORDER``
+        (most-specific/safety-critical first). Whole-word TYPE tokens (so "led"/
+        "ipl" never fire inside "controlled"/"multiple") plus space-delimited
+        PHRASES (so "led mask" does not match inside "controlled mask"). No match
+        → topical (``None``).
+      * VETO — a topical FORM noun (``_BEAUTY_DEVICE_TOPICAL_GUARD``) means the SKU
+        is a topical that merely NAMES a tool ("flat iron spray", "curl styler
+        cream") UNLESS the form noun is an ACCESSORY of a real device. It is an
+        accessory when a HARD device-head noun (device/handset/mask/lamp/ipl/…) is
+        present ("microcurrent DEVICE with gel", "IPL HANDSET with cooling gel")
+        or the form noun is itself part of the matched device phrase ("gel LAMP").
+        Without a hard head, a form noun not in the device phrase vetoes — so
+        "flat iron spray" and "hair removal cream" stay topical."""
+    blobs: List[Tuple[str, set]] = []
+    for raw in texts:
+        text = _normalize(raw)
+        if text:
+            blobs.append((text, set(re.findall(r"[a-z0-9]+", text))))
+    if not blobs:
+        return None
+
+    matched_cls: Optional[str] = None
+    phrase_words: frozenset = frozenset()
+    for cls, type_tokens, phrases in _BEAUTY_DEVICE_CLASS_ORDER:
+        for text, tokens in blobs:
+            if tokens & type_tokens:
+                matched_cls = cls
+                break
+            padded = f" {text} "
+            hit = next((p for p in phrases if f" {p} " in padded), None)
+            if hit:
+                matched_cls, phrase_words = cls, frozenset(hit.split())
+                break
+        if matched_cls:
+            break
+    if matched_cls is None:
+        return None   # no device signal — topical
+
+    # A hard device-head anywhere means any FORM noun is an accessory, not the
+    # product — so it does not veto (that is the whole "device + gel" case).
+    if any(tokens & _BEAUTY_DEVICE_HARD_HEADS for _, tokens in blobs):
+        return matched_cls
+    # No hard head: a FORM noun that is NOT part of the matched device phrase means
+    # the form noun IS the product (a topical that merely names a tool) — veto.
+    for _text, tokens in blobs:
+        if (tokens & _BEAUTY_DEVICE_TOPICAL_GUARD) - phrase_words:
+            return None
+    return matched_cls
+
+
+def _beauty_device_profile(*texts: Any) -> Optional[VerticalProfile]:
+    """The device sub-profile for a beauty SKU, or ``None`` if it is topical.
+    An unmodeled class routes to the generic device profile (safe: no INCI)."""
+    cls = _beauty_device_class(*texts)
+    if cls is None:
+        return None
+    return _BEAUTY_DEVICE_PROFILE_BY_CLASS.get(cls, BEAUTY_DEVICE_GENERIC_PROFILE)
+
+
 def resolve_profile_for_vertical(
     vertical: Optional[str],
     product: Optional[Mapping[str, Any]] = None,
@@ -698,19 +1150,24 @@ def resolve_profile_for_vertical(
     the electronics drone/audio sub-split when product text is available.
 
     This is the profile-selection counterpart to ``resolve_vertical`` (which owns
-    the beauty|fashion|electronics|other decision). The drone/audio split is a
-    RUNTIME profile choice only — it is never persisted; ``resolved_vertical``
-    stays ``electronics`` for both (exactly as audio does today). A caller that
-    passes no product text gets the audio profile for electronics (unchanged)."""
+    the beauty|fashion|electronics|other decision). Both sub-splits — beauty
+    topical/device and electronics audio/drone — are RUNTIME profile choices only;
+    they are never persisted (``resolved_vertical`` stays ``beauty`` /
+    ``electronics`` respectively). A caller that passes no product text gets the
+    default sub-profile (topical for beauty, audio for electronics), unchanged."""
     key = str(vertical or "").strip().lower()
-    if key == "electronics":
+    if key in ("beauty", "electronics"):
         blobs: List[Any] = [title]
         if isinstance(product, Mapping):
             blobs.extend(
                 product.get(k)
                 for k in ("product_type", "category", "category_path", "title", "raw_title")
             )
-        if _electronics_is_drone(*blobs):
+        if key == "beauty":
+            device_profile = _beauty_device_profile(*blobs)
+            if device_profile is not None:
+                return device_profile
+        if key == "electronics" and _electronics_is_drone(*blobs):
             return ELECTRONICS_DRONE_PROFILE
     return get_profile(key)
 
