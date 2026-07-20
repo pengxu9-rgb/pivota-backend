@@ -137,6 +137,27 @@ def test_device_tech_named_topical_aftercare_stays_topical(title):
     assert not prof.name.startswith("beauty_device"), f"{title!r} -> {prof.name} (should be topical)"
 
 
+@pytest.mark.parametrize("title", [
+    "VODANA Professional Triple Flow Ceramic Hair Waver",
+    "VODANA Compact Wave Iron 1.5 inch Beach Waves",
+    "Beachwaver S1 Deep Waver",
+    "Double Barrel Hair Waver",
+])
+def test_hair_wavers_route_device(title):
+    prof = resolve_profile({"product_type": ""}, title=title)
+    assert prof.name == "beauty_device_hair", f"{title!r} -> {prof.name}"
+    assert classify(title) == ("Hair Styling Tool", "beauty/devices/hair-styling")
+
+
+def test_waver_vocab_does_not_steal_topical_wave_products():
+    # "wave"-family TOPICALS (styling sprays/creams) must NOT become a device —
+    # only "waver"/"wave iron"/"barrel", never bare "wave".
+    for t in ["Beach Wave Spray", "Sea Salt Wave Mist", "Wave Defining Cream"]:
+        assert not resolve_profile({"product_type": ""}, title=t).name.startswith("beauty_device"), t
+        hit = classify(t)
+        assert hit is None or not hit[1].startswith("beauty/devices/"), t
+
+
 def test_under_tagged_ipl_row_resolves_beauty_then_routes_hair_removal():
     # S2: a bare "IPL" + category "Hair Removal" row (no "beauty" word) must resolve
     # the beauty vertical (via the "hair removal" resolver keyword) so the router

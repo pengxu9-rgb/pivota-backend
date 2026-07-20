@@ -129,13 +129,15 @@ _BEAUTY_DEVICE_TOPICAL_GUARD = frozenset({
 
 # class: hair-styling (VODANA)
 _BEAUTY_DEVICE_HAIR_TOKENS = frozenset({
-    "straightener", "straighteners", "hairdryer", "blowdryer",
+    "straightener", "straighteners", "hairdryer", "blowdryer", "waver", "wavers",
 })
 _BEAUTY_DEVICE_HAIR_PHRASES: Tuple[str, ...] = (
     "flat iron", "hair straightener", "straightening brush", "curling iron",
     "curling wand", "curling brush", "hair curler", "hair dryer", "blow dryer",
     "blow dry brush", "hot air brush", "hot brush", "air styler", "hair styler",
     "styling iron", "styling wand", "hair styling tool",
+    # wavers / deep-wave irons (VODANA Triple Flow; Beachwaver-style)
+    "hair waver", "wave iron", "deep waver", "double barrel", "triple barrel",
 )
 # class: skincare energy/light (LED, microcurrent, RF, microneedling).
 # NOTE: bare "led" is NOT a token — a "UV LED nail lamp" is a nail device, not a
@@ -817,7 +819,7 @@ _BEAUTY_DEVICE_HAIR_COMPETITOR_TYPE_TOKENS = frozenset({
     "flat", "iron", "hair", "straightener", "straightening", "curling", "curler",
     "wand", "dryer", "blow", "hot", "air", "styler", "styling", "tool", "brush",
     "comb", "ionic", "ceramic", "tourmaline", "cordless", "professional", "salon",
-    "device", "appliance",
+    "device", "appliance", "waver", "wave", "barrel",
 })
 _BEAUTY_DEVICE_HAIR_AUTHORITY_HOSTS = (
     "allure.com", "byrdie.com", "wirecutter.com", "goodhousekeeping.com",
