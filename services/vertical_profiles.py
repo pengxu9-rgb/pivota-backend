@@ -115,21 +115,39 @@ BEAUTY_RETAILER_TOKENS = frozenset({
 # These tokens ALSO join the beauty *resolver* keyword set (``_BEAUTY_DEVICE_KEYWORDS``
 # is unioned into both resolver tiers) so an under-tagged device row — category
 # just "Hair Styling Tools", no "beauty" word — still resolves ``beauty`` instead
-# of collapsing to ``other``. Every entry is hair-tool-specific and verified NOT
-# to be a substring of any topical-beauty/supplement word, so a cream / serum /
-# supplement is never pulled to the device profile. (Bare "iron" is deliberately
-# EXCLUDED — it is a clothes iron / iron supplement; only the phrase "flat iron"
-# and the joined token "flatiron" qualify.)
+# of collapsing to ``other``.
+#
+# IMPORTANT — the resolver vs the profile do different jobs here. A topical
+# formulation that merely NAMES a tool ("flat iron spray", "curl styler cream")
+# is genuinely a ``beauty`` product, so it SHOULD resolve the beauty vertical via
+# these keywords. It is NOT a device, so it must NOT get the device profile —
+# ``_beauty_is_device`` therefore vetoes any SKU whose text also carries a topical
+# FORM noun (``_BEAUTY_DEVICE_TOPICAL_GUARD``). That veto — not substring purity —
+# is what keeps creams/serums/brow-stylers on the INCI-grounded topical profile.
+# (Bare "iron" is excluded — clothes iron / iron supplement; only the phrase
+# "flat iron" qualifies. Bare "styler"/"straightener"-alone were dropped as TYPE
+# tokens because "brow styler", "curl styler cream", "straightener serum" are
+# topical; the qualified phrases "hair/air styler", "hair straightener" remain,
+# and bare "straightener" survives only in the profile via the form-noun veto.)
 _BEAUTY_DEVICE_TYPE_TOKENS = frozenset({
-    "straightener", "straighteners", "styler", "stylers", "hairdryer",
-    "blowdryer", "flatiron",
+    "straightener", "straighteners", "hairdryer", "blowdryer",
 })
 _BEAUTY_DEVICE_PHRASES: Tuple[str, ...] = (
     "flat iron", "hair straightener", "straightening brush", "curling iron",
     "curling wand", "curling brush", "hair curler", "hair dryer", "blow dryer",
     "blow dry brush", "hot air brush", "hot brush", "air styler", "hair styler",
-    "styling iron", "styling wand", "hair styling tool", "hot styling",
+    "styling iron", "styling wand", "hair styling tool",
 )
+# Topical FORM nouns. A styling APPLIANCE's short fields (product_type / category
+# / title) do not carry one; a topical formulation that names a tool does ("flat
+# iron spray", "blow dry primer", "curl styler cream", "straightener serum",
+# "brow styler pencil"). Their presence VETOES the device profile — the SKU is a
+# topical cosmetic (INCI-bearing). See ``_beauty_is_device``.
+_BEAUTY_DEVICE_TOPICAL_GUARD = frozenset({
+    "spray", "serum", "balm", "primer", "cream", "gel", "paste", "mist",
+    "lotion", "mousse", "wax", "pomade", "treatment", "oil", "protectant",
+    "pencil", "mascara", "essence", "ampoule", "butter",
+})
 # Union consulted by the resolver's beauty match (substring-based, like the rest
 # of the beauty keyword set). Kept SEPARATE from the migrated
 # ``_BEAUTY_CATEGORY_KEYWORDS`` so the Phase-0 golden guard keeps covering the
@@ -829,25 +847,33 @@ def _electronics_is_drone(*texts: Any) -> bool:
 
 
 def _beauty_is_device(*texts: Any) -> bool:
-    """True when any SKU text blob carries a beauty-DEVICE signal (hair-styling
-    appliance). Splits the ``beauty`` vertical into its topical vs device
-    sub-profile. Topical is the default beauty sub-profile, so a text with no
-    device token stays topical — byte-identical to the pre-device behavior for a
-    genuine cream / serum / supplement SKU.
+    """True when a SKU is a hair-styling APPLIANCE (not a topical formulation).
+    Splits the ``beauty`` vertical into its topical vs device sub-profile. Topical
+    is the default, so a SKU with no device token stays topical — byte-identical to
+    the pre-device behavior for a genuine cream / serum / supplement.
 
-    Single TYPE tokens are matched WHOLE-WORD (so "styler" never fires inside an
-    unrelated word); the multi-word phrases are matched as substrings of the
-    hyphen-normalized text ("flat-iron" -> "flat iron")."""
+    Two-part decision:
+      * VETO — if any blob carries a topical FORM noun (``_BEAUTY_DEVICE_TOPICAL_GUARD``)
+        the SKU is a topical that merely names a tool ("flat iron spray", "curl
+        styler cream", "straightener serum"), NOT a device; return False. The veto
+        wins regardless of blob order so a mislabeled product_type can't override
+        a formulation title.
+      * SIGNAL — otherwise, a whole-word TYPE token or a device PHRASE marks a
+        device. (Single tokens are whole-word so they never fire inside an
+        unrelated word; phrases are substrings of the hyphen-normalized text.)"""
+    device_hit = False
     for raw in texts:
         text = _normalize(raw)
         if not text:
             continue
         tokens = set(re.findall(r"[a-z0-9]+", text))
-        if tokens & _BEAUTY_DEVICE_TYPE_TOKENS:
-            return True
-        if any(phrase in text for phrase in _BEAUTY_DEVICE_PHRASES):
-            return True
-    return False
+        if tokens & _BEAUTY_DEVICE_TOPICAL_GUARD:
+            return False   # topical formulation — veto the device profile
+        if tokens & _BEAUTY_DEVICE_TYPE_TOKENS or any(
+            phrase in text for phrase in _BEAUTY_DEVICE_PHRASES
+        ):
+            device_hit = True
+    return device_hit
 
 
 def resolve_profile_for_vertical(

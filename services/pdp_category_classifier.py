@@ -39,15 +39,23 @@ CATEGORY_PATTERNS: List[Tuple[str, str, "re.Pattern[str]"]] = [
     # BEFORE the makeup "Brush" and generic "Hair Care" patterns so a
     # "straightening brush" is a heat-styling DEVICE (not a makeup brush), and a
     # "flat iron" / "hair straightener" gets a real tool path instead of
-    # collapsing to generic haircare or NULL. Tokens are device-specific (heat /
-    # styling appliances) — no bare "brush" or "hair", so no topical haircare SKU
-    # (hair oil, hair mask) is stolen. VODANA cross-category (beauty x 3C) pilot.
+    # collapsing to generic haircare or NULL. VODANA cross-category (beauty x 3C).
+    #
+    # The leading negative lookahead VETOES a topical formulation that merely
+    # names a tool ("flat iron spray", "blow dry primer", "curl styler cream",
+    # "straightener serum", "brow styler pencil") — those carry a FORM noun and
+    # must fall through to their real topical pattern. No bare "brush"/"hair" and
+    # (post-review) no bare "styler"; bare "straightener" survives only under the
+    # form-noun veto. "blow dry" requires "dryer"/"brush" so a "blow dry" styling
+    # ACTION doesn't match.
     ("Hair Styling Tool", "beauty/tools/hair-styling-tool", re.compile(
-        r"\b(flat\s*iron|hair\s+straightener|straightening\s+brush|"
+        r"^(?!.*\b(?:spray|serum|balm|primer|cream|gel|paste|mist|lotion|mousse|"
+        r"wax|pomade|treatment|oil|protectant|pencil|mascara|essence|ampoule)\b)"
+        r".*\b(flat[\s-]+iron|hair\s+straightener|straightening\s+brush|"
         r"curling\s+(?:iron|wand|brush)|hair\s+curler|hair\s+dryer|"
-        r"blow[-\s]?dry(?:er)?(?:\s+brush)?|hot\s+air\s+brush|hot\s+brush|"
+        r"blow[-\s]?dryer|blow[-\s]?dry\s+brush|hot\s+air\s+brush|hot\s+brush|"
         r"air\s+styler|hair\s+styler|styling\s+(?:iron|wand)|"
-        r"hair\s+styling\s+tool|straightener|styler)\b",
+        r"hair\s+styling\s+tool|straightener)\b",
         re.IGNORECASE)),
     ("Makeup Sponge", "beauty/tools/sponge", re.compile(
         r"\b(makeup sponge|beauty sponge|sponge\s*/\s*puff|powder puff|blender sponge)\b",

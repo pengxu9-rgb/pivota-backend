@@ -163,6 +163,71 @@ def test_classifier_gives_hair_tool_device_path(text):
     assert (label, path) == ("Hair Styling Tool", "beauty/tools/hair-styling-tool")
 
 
+# --------------------- topical look-alikes (adversarial review) --------------------- #
+
+# Topical / makeup products whose NAMES contain a device-ish token but that carry
+# a FORM noun (spray/serum/cream/pencil/...) — they must stay on the topical
+# BEAUTY profile (INCI-grounded) and must NOT get the device category_path.
+@pytest.mark.parametrize("text", [
+    "Flat Iron Sleek Spray",            # heat-protectant spray, not an iron
+    "Flat Iron Heat Protectant",
+    "Blow Dry Primer",                  # styling action, not a dryer
+    "Blowout Cream",
+    "Curl Styler Cream",                # topical curl cream
+    "Bounce Curl Styler",               # bare "styler" is no longer a device token
+    "Brow Styler",                      # makeup, not a hair tool
+    "Brow Styler Pencil",
+    "Brazilian Straightener Serum",     # keratin serum, not an appliance
+    "Flatiron District Candle",         # non-beauty place name, not "flat iron"
+])
+def test_topical_lookalikes_never_get_device_profile_or_path(text):
+    prof = resolve_profile({"product_type": text})
+    assert prof.name != "beauty_device", f"{text!r} wrongly got the device profile"
+    hit = classify(text)
+    assert hit is None or hit[1] != "beauty/tools/hair-styling-tool", (
+        f"{text!r} wrongly classified as a hair-styling tool"
+    )
+
+
+def test_real_device_with_topical_word_still_device_when_no_form_noun():
+    # Guard is FORM-noun-specific: "ceramic straightener" (a material, not a form)
+    # is still a device; only a formulation word (serum/spray/cream) vetoes.
+    assert resolve_profile({"product_type": "Ceramic Straightener"}).name == "beauty_device"
+    assert classify("Ionic Ceramic Straightener") == (
+        "Hair Styling Tool", "beauty/tools/hair-styling-tool"
+    )
+
+
+# --------------------- strategic-brief routing (trust-critical path) --------------------- #
+
+def test_strategic_brief_applies_device_split():
+    from services.strategic_brief import _brief_profile_for_evidence, _render_system_prompt
+
+    device = _brief_profile_for_evidence(
+        {"vertical": "beauty", "title": "VODANA Professional Softbar Flat Iron Ceramic Straightener"}
+    )
+    assert device.name == "beauty_device"
+    device_prompt = _render_system_prompt(device)
+    assert "voltage" in device_prompt.lower()          # device claim rules are live
+
+    topical = _brief_profile_for_evidence(
+        {"vertical": "beauty", "title": "COSRX Advanced Snail 96 Mucin Power Essence"}
+    )
+    assert topical.name == "beauty"
+    assert "voltage" not in _render_system_prompt(topical).lower()  # incumbent INCI prompt
+
+    # A topical look-alike keeps the incumbent (INCI) prompt — the conservative
+    # choice for the trust-critical brief.
+    assert _brief_profile_for_evidence(
+        {"vertical": "beauty", "title": "Flat Iron Sleek Spray"}
+    ).name == "beauty"
+
+    # Electronics routing is unchanged.
+    assert _brief_profile_for_evidence(
+        {"vertical": "electronics", "title": "HoverAir X1 self-flying camera drone"}
+    ).name == "electronics_drone"
+
+
 def test_classifier_does_not_steal_makeup_brush_or_topical_haircare():
     # A makeup brush is still a makeup brush (device pattern needs a heat/styling
     # qualifier before "brush").

@@ -43,7 +43,6 @@ from services.sku_lane_priority import (
 from services.vertical_profiles import (
     BEAUTY_PROFILE,
     BriefRules,
-    get_profile,
     resolve_profile_for_vertical,
     resolve_vertical,
 )
@@ -259,17 +258,21 @@ def _render_system_prompt(profile: Any) -> str:
 
 
 def _brief_profile_for_evidence(evidence: Mapping[str, Any]) -> Any:
-    """Choose the brief profile. ONLY an affirmatively-electronics vertical swaps
-    to a non-beauty prompt; beauty / fashion / other / unknown keep the incumbent
-    (beauty) prompt — the conservative choice for a trust-critical LLM prompt, so a
-    beauty SKU that resolved ambiguously never loses the INCI/claims guard."""
+    """Choose the brief profile. An affirmatively-electronics or -beauty vertical
+    applies its runtime sub-split from the evidence text (electronics -> drone vs
+    audio; beauty -> topical vs hair-styling device); fashion / other / unknown
+    keep the incumbent (beauty) prompt.
+
+    Beauty stays on the incumbent INCI/claims prompt UNLESS the SKU is
+    affirmatively a hair-styling DEVICE — a device has no INCI, so it must get the
+    device spec/claim rules, never the ingredient guard. The topical/device split
+    (``_beauty_is_device``) is conservative: any topical FORM noun keeps the SKU
+    on the incumbent prompt, so an ambiguous beauty SKU never loses the guard."""
     vertical = str((evidence or {}).get("vertical") or "").strip().lower()
-    if vertical == "electronics":
-        # Sub-split electronics into drone vs audio from the evidence text so a
-        # drone brief gets the drone claim/regulatory rules, not audio's.
+    if vertical in ("electronics", "beauty"):
         ev = evidence if isinstance(evidence, Mapping) else None
         return resolve_profile_for_vertical(
-            "electronics", ev, title=(evidence or {}).get("title")
+            vertical, ev, title=(evidence or {}).get("title")
         )
     return BEAUTY_PROFILE
 
@@ -873,18 +876,21 @@ def assemble_sku_brief_evidence(
     brand = _clean_str(anchors.get("brand"))
     # Resolve the SKU vertical ONCE for the brief (Principle 1). Signal = category
     # + title + the attribute values (ingredients / specs) the brief reasons over.
-    # Only an affirmatively-electronics vertical changes the prompt / disclaimers;
-    # see _brief_profile_for_evidence.
-    _brief_vertical = resolve_vertical(
-        {
-            "product_type": _clean_str(anchors.get("category")),
-            "category": _clean_str(anchors.get("category")),
-        },
-        title=" ".join(
-            [title, brand, *[item for values in attributes.values() for item in values]]
-        ),
+    # See _brief_profile_for_evidence for how the vertical changes the prompt.
+    _brief_signal = {
+        "product_type": _clean_str(anchors.get("category")),
+        "category": _clean_str(anchors.get("category")),
+    }
+    _brief_signal_title = " ".join(
+        [title, brand, *[item for values in attributes.values() for item in values]]
     )
-    _brief_profile = get_profile(_brief_vertical)
+    _brief_vertical = resolve_vertical(_brief_signal, title=_brief_signal_title)
+    # Apply the runtime sub-split (electronics audio/drone, beauty topical/device)
+    # so a device brief reads the device profile's health_sensitive flag, not the
+    # topical/audio default.
+    _brief_profile = resolve_profile_for_vertical(
+        _brief_vertical, _brief_signal, title=_brief_signal_title
+    )
     merchant_path = _merchant_path(identity=identity_map, opportunity=opportunity_map)
     product_evidence = _as_mapping(opportunity_map.get("product_evidence")) or build_lane_product_evidence(
         product={"title": title, "brand": brand, "category": anchors.get("category")},
