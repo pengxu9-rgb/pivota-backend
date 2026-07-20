@@ -105,12 +105,13 @@ def is_makeup(
     return bool(_MAKEUP_RE.search(str(title or "").lower()))
 
 
-# Clearly-topical, non-ingestible beauty subcategories. A path under one of
-# these is never one of the three contract kinds, and must NOT fall through to
-# supplement text-detection (a makeup "stick" / setting "powder" is not a dose).
+# Non-ingestible beauty subcategories that are never one of the three contract
+# kinds and must NOT fall through to supplement text-detection (a makeup "stick"
+# / setting "powder" is not a dose; a beauty DEVICE is not a topical or a dose).
 _TOPICAL_BEAUTY_PREFIXES = (
     "beauty/makeup",
     "beauty/tools",
+    "beauty/devices",   # beauty_device family (hair-styling / skincare-energy / …)
     "beauty/fragrance",
     "beauty/nail",
     "beauty/body",

@@ -264,9 +264,10 @@ def _brief_profile_for_evidence(evidence: Mapping[str, Any]) -> Any:
     keep the incumbent (beauty) prompt.
 
     Beauty stays on the incumbent INCI/claims prompt UNLESS the SKU is
-    affirmatively a hair-styling DEVICE — a device has no INCI, so it must get the
-    device spec/claim rules, never the ingredient guard. The topical/device split
-    (``_beauty_is_device``) is conservative: any topical FORM noun keeps the SKU
+    affirmatively a DEVICE — a device has no INCI, so it must get its device
+    class's spec/claim rules (hair-styling / skincare-energy / hair-removal /
+    generic), never the ingredient guard. The topical/device split
+    (``_beauty_device_class``) is conservative: any topical FORM noun keeps the SKU
     on the incumbent prompt, so an ambiguous beauty SKU never loses the guard."""
     vertical = str((evidence or {}).get("vertical") or "").strip().lower()
     if vertical in ("electronics", "beauty"):
