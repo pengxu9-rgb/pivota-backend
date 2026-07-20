@@ -580,8 +580,20 @@ def _derive_serving_decision(
     # authoritative for its own content). The legacy anonymous 'external_seed'
     # lump stays subject. review_required and IDENTITY_CONFLICT still apply to
     # everyone (explicit moderation/data-quality signals, not coverage gaps).
+    #
+    # BUT an observed seller is only "the brand's own crawl" when the seed is
+    # seed_kind='self'. A RETAILER-sourced observed seller — a no-D2C brand crawled
+    # from a marketplace (VODANA→Amazon), tagged seed_kind='cross' by
+    # derive_seed_seller — is NOT authoritative for its own content and must stay
+    # subject to the shadow gate (else it serves PUBLIC as brand-official). Gate on
+    # the EXPLICIT 'cross' only: a missing / 'self' / legacy-NULL seed_kind stays
+    # exempt, so no existing public observed-seller row is demoted.
+    _seed_kind = (
+        str(_get(product, "seed_kind") or "").strip().lower() if product is not None else ""
+    )
+    is_observed_seller_exempt = is_observed_seller and _seed_kind != "cross"
     is_identity_coverage_exempt = product is not None and (
-        not is_external_seed_content or is_observed_seller
+        not is_external_seed_content or is_observed_seller_exempt
     )
 
     if identity_decision["status"] == "review_required":
