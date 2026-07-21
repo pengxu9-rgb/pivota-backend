@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import os
 import sys
+import tempfile
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -30,3 +31,10 @@ if "DATABASE_URL" not in os.environ:
     # Fresh slate per pytest process; only when we own the file.
     _TEST_DB_PATH.unlink(missing_ok=True)
     os.environ["DATABASE_URL"] = f"sqlite+aiosqlite:///{_TEST_DB_PATH}"
+
+# On sqlite, mvp.events falls back to its file sink, which appends to
+# mvp_events.jsonl in the cwd — keep test runs from littering the repo root.
+os.environ.setdefault(
+    "MVP_EVENTS_FILE",
+    os.path.join(tempfile.gettempdir(), f"mvp_events_test_{os.getpid()}.jsonl"),
+)
