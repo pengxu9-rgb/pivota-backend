@@ -126,11 +126,27 @@ class CreateAuditRequest(BaseModel):
             "always enqueues a new run."
         ),
     )
-    prompts_per_sku: int = Field(
-        40,
+    prompts_per_sku: Optional[int] = Field(
+        None,
         ge=1,
         le=200,
-        description="Prompt fan-out estimate used for credit preview.",
+        description=(
+            "Explicit prompt fan-out override (internal/testing knob). Omit "
+            "to use the tier's budget — standard 40, deep 80. When omitted "
+            "the worker resolves the count from audit_tier, so a deep run "
+            "never probes a standard budget against a deep-pinned basis."
+        ),
+    )
+    audit_tier: str = Field(
+        "standard",
+        max_length=16,
+        description=(
+            "Audit depth tier: 'standard' (40 prompts/SKU/provider) or "
+            "'deep' (Deep Landscape Scan, 80). Deep requires "
+            "AUDIT_DEEP_TIER_ENABLED and is rejected (422) when the flag is "
+            "off — never silently downgraded at launch, so the merchant is "
+            "never billed for a tier the worker won't run."
+        ),
     )
     custom_prompts: Optional[List[str]] = Field(
         default=None,
@@ -184,7 +200,10 @@ class AuditPreviewScope(BaseModel):
 class AuditPreviewRequest(BaseModel):
     merchant_id: str
     scope: AuditPreviewScope
-    prompts_per_sku: int = Field(default=40, ge=1, le=200)
+    # None = the tier's budget (standard 40, deep 80) — mirrors
+    # CreateAuditRequest so preview and launch always price the same count.
+    prompts_per_sku: Optional[int] = Field(default=None, ge=1, le=200)
+    audit_tier: str = Field(default="standard", max_length=16)
     custom_prompts: Optional[List[str]] = Field(default=None, max_length=10)
     coverage_profile: str = Field(
         default_factory=default_coverage_profile,
@@ -483,6 +502,50 @@ def _resolve_audit_provider_models(
         providers,
         model_overrides=model_overrides,
     )
+
+
+def _resolve_request_audit_tier(value: Any) -> str:
+    """Normalize the requested tier and enforce the deep-tier flag at the
+    LAUNCH boundary: with AUDIT_DEEP_TIER_ENABLED off, a deep request is a
+    422 — never a silent downgrade, so preview/billing/worker can't disagree
+    about which tier actually ran. (The worker keeps its own degrade-to-
+    standard fallback for hand-enqueued runs that bypass this route.)"""
+    from config.settings import settings
+    from services.prompt_basis import AUDIT_TIER_DEEP, normalize_audit_tier
+
+    raw = str(value or "").strip().lower()
+    tier = normalize_audit_tier(raw)
+    if raw and raw != tier:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail=f"Unknown audit_tier {raw!r}. Valid values: standard, deep.",
+        )
+    if tier == AUDIT_TIER_DEEP and not getattr(
+        settings, "audit_deep_tier_enabled", False
+    ):
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail=(
+                "audit_tier='deep' (Deep Landscape Scan) is not enabled on "
+                "this environment."
+            ),
+        )
+    return tier
+
+
+def _effective_prompts_per_sku(
+    explicit: Optional[int], audit_tier: str
+) -> int:
+    """The count everything downstream prices and runs: the explicit
+    internal/testing override when provided, else the tier's budget. This is
+    the route-side half of the worker's _launch_prompts_per_sku contract —
+    the route no longer persists a defaulted 40 into launch options, so the
+    tier budget is actually reachable (see _launch_prompts_per_sku CAUTION)."""
+    from services.prompt_basis import prompts_per_sku_for_tier
+
+    if explicit is not None:
+        return max(1, int(explicit))
+    return prompts_per_sku_for_tier(audit_tier)
 
 
 def _credit_requirements(
@@ -824,18 +887,23 @@ async def preview_audit_run(
         merchant_id=body.merchant_id,
         scope=body.scope,
     )
+    audit_tier = _resolve_request_audit_tier(body.audit_tier)
     try:
         coverage = _resolve_audit_coverage(
             coverage_profile=body.coverage_profile,
             providers=body.providers,
         )
-        return await _build_preview(
+        preview = await _build_preview(
             merchant_id=body.merchant_id,
             sku_keys=sku_keys,
-            prompts_per_sku=body.prompts_per_sku,
+            prompts_per_sku=_effective_prompts_per_sku(
+                body.prompts_per_sku, audit_tier
+            ),
             custom_prompts=body.custom_prompts,
             coverage=coverage,
         )
+        preview["audit_tier"] = audit_tier
+        return preview
     except ValueError as exc:
         raise HTTPException(
             status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
@@ -945,6 +1013,13 @@ async def create_audit_run(
             subject_type=body.subject_type,
         )
 
+    # Tier resolution BEFORE metering: billing, launch options, and the worker
+    # must all agree on the count (deep w/ flag off is a 422 up in the model
+    # helper, so a merchant is never billed for a tier that won't run).
+    audit_tier = _resolve_request_audit_tier(body.audit_tier)
+    effective_prompts_per_sku = _effective_prompts_per_sku(
+        body.prompts_per_sku, audit_tier
+    )
     try:
         coverage = _resolve_audit_coverage(
             coverage_profile=body.coverage_profile,
@@ -964,7 +1039,7 @@ async def create_audit_run(
         )
         audit_required, audit_usd_cogs = _audit_metering(
             sku_count=len(_normalize_nonempty(body.product_keys)),
-            prompts_per_sku=body.prompts_per_sku,
+            prompts_per_sku=effective_prompts_per_sku,
             providers=providers,
             verify_providers=verify_providers,
             verify_sample=verify_sample,
@@ -1103,7 +1178,17 @@ async def create_audit_run(
                         for provider, payload in provider_models.items()
                         if payload.get("model_is_override")
                     },
-                    "prompts_per_sku": int(body.prompts_per_sku),
+                    # The depth tier drives the worker's probe budget AND
+                    # scopes basis pinning. prompts_per_sku is persisted ONLY
+                    # when explicitly overridden — a defaulted count here used
+                    # to shadow the tier budget (see _launch_prompts_per_sku
+                    # CAUTION), probing 40 against a deep-pinned basis.
+                    "audit_tier": audit_tier,
+                    **(
+                        {"prompts_per_sku": int(body.prompts_per_sku)}
+                        if body.prompts_per_sku is not None
+                        else {}
+                    ),
                     # Merchant-input prompt slots are debited as prompt credits
                     # above; persist them here so the worker actually PROBES them
                     # (they were billed-but-never-probed before this).

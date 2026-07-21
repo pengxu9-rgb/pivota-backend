@@ -182,6 +182,157 @@ async def load_prior_competitor_brands(
     return [name for name, _ in counts.most_common(max(0, max_names))]
 
 
+_ROLLUP_MAX_QUERY_ROWS = 40
+_ROLLUP_MAX_COMPETITORS = 10
+
+
+def _run_mentions_merchant(run: Mapping[str, Any], own_brand: str) -> bool:
+    """Merchant presence in one comparison answer. Mirrors the coarse OK
+    logic the failing-prompts surface uses (parsed/self-report/grounding
+    flags), plus a brand-name scan of the raw answer — comparison prompts are
+    brand-level questions, so a brand mention without SKU verification still
+    counts as 'AI brings the merchant up'."""
+    parsed = run.get("parsed") if isinstance(run.get("parsed"), Mapping) else {}
+    url_match = (
+        run.get("url_match") if isinstance(run.get("url_match"), Mapping) else {}
+    )
+    llm_report = (
+        url_match.get("llm_self_report")
+        if isinstance(url_match.get("llm_self_report"), Mapping) else {}
+    )
+    if (
+        parsed.get("correct_sku") is True
+        or parsed.get("sku_mentioned") is True
+        or parsed.get("brand_mentioned") is True
+        or llm_report.get("correct_sku") is True
+        or llm_report.get("sku_mentioned") is True
+        or url_match.get("in_grounding") is True
+        or run.get("product_visible") is True
+    ):
+        return True
+    brand = str(own_brand or "").strip().lower()
+    if not brand:
+        return False
+    raw = str(run.get("raw") or "").lower()
+    return brand in raw
+
+
+def build_deep_landscape_rollup(
+    runs: Sequence[Mapping[str, Any]],
+    *,
+    own_brand: str = "",
+) -> Optional[Dict[str, Any]]:
+    """Substitution-rate rollup + Defend/Contest/Skip contest map from one
+    SKU's INTERNAL comparison runs (spec 2026-07-21 §5). Pure; returns None
+    when the run set carries no internal comparison probes (every standard
+    run), so callers can stamp it conditionally.
+
+    INTERNAL-FIRST: the output names competitors, so it must only ever be
+    stored under the `deep_landscape_internal` key, which the merchant-response
+    sanitizer strips. Verdict rule per anchored competitor: merchant cited in
+    >=50% of that competitor's prompts -> defend; >0 -> contest; 0 -> skip."""
+    comparison_runs = [
+        run for run in (runs or []) if run_is_internal_comparison(run)
+    ]
+    if not comparison_runs:
+        return None
+
+    per_query: Dict[str, Dict[str, Any]] = {}
+    answer_names: Counter = Counter()
+    total_runs = 0
+    merchant_cited_runs = 0
+    substitution_runs = 0
+    for run in comparison_runs:
+        query = str(run.get("query") or "").strip()
+        if not query:
+            continue
+        row = per_query.setdefault(query, {
+            "query": query,
+            "providers": [],
+            "runs": 0,
+            "merchant_cited_runs": 0,
+            "competitors_cited": [],
+        })
+        row["runs"] += 1
+        total_runs += 1
+        provider = str(run.get("_provider") or run.get("provider") or "").strip()
+        if provider and provider not in row["providers"]:
+            row["providers"].append(provider)
+        merchant_here = _run_mentions_merchant(run, own_brand)
+        if merchant_here:
+            row["merchant_cited_runs"] += 1
+            merchant_cited_runs += 1
+        parsed = (
+            run.get("parsed") if isinstance(run.get("parsed"), Mapping) else {}
+        )
+        competitor_here = False
+        for name in parsed.get("competitors_appearing") or []:
+            cleaned = _clean_brand_name(name)
+            if not cleaned or _is_own_brand(cleaned, own_brand):
+                continue
+            competitor_here = True
+            answer_names[cleaned] += 1
+            if cleaned not in row["competitors_cited"]:
+                row["competitors_cited"].append(cleaned)
+        # Substitution is a PER-RUN fact: THIS answer recommended a competitor
+        # and not the merchant. A row-level union would count a nobody-cited
+        # run as substitution whenever a sibling run named a competitor,
+        # inflating the headline rate on sparse-answer categories.
+        if competitor_here and not merchant_here:
+            substitution_runs += 1
+
+    rows = list(per_query.values())
+
+    # Contest map: each competitor ANCHORED IN A QUERY ("{title} vs GHD",
+    # "is GHD worth it") — the deep blocks render seed names verbatim, so a
+    # substring scan recovers the anchor. Answer-only names (cited but never
+    # asked about) are reported separately, not contested.
+    anchored: Dict[str, Dict[str, int]] = {}
+    known_names = list(answer_names)
+    for row in rows:
+        q = row["query"].lower()
+        for name in {n for n in known_names + row["competitors_cited"]}:
+            if name.lower() in q:
+                stats = anchored.setdefault(name, {"runs": 0, "merchant_cited_runs": 0})
+                stats["runs"] += row["runs"]
+                stats["merchant_cited_runs"] += row["merchant_cited_runs"]
+    contest_map = []
+    for name, stats in sorted(
+        anchored.items(), key=lambda item: -item[1]["runs"]
+    )[:_ROLLUP_MAX_COMPETITORS]:
+        rate = (
+            stats["merchant_cited_runs"] / stats["runs"] if stats["runs"] else 0.0
+        )
+        contest_map.append({
+            "competitor": name,
+            "runs": stats["runs"],
+            "merchant_cited_runs": stats["merchant_cited_runs"],
+            "merchant_cited_rate": round(rate, 3),
+            "verdict": (
+                "defend" if rate >= 0.5 else ("contest" if rate > 0 else "skip")
+            ),
+        })
+
+    return {
+        "version": 1,
+        "total_comparison_runs": total_runs,
+        "merchant_cited_runs": merchant_cited_runs,
+        "substitution_runs": substitution_runs,
+        "substitution_rate": (
+            round(substitution_runs / total_runs, 3) if total_runs else 0.0
+        ),
+        "contest_map": contest_map,
+        "answer_only_competitors": [
+            {"name": name, "citations": count}
+            for name, count in answer_names.most_common(_ROLLUP_MAX_COMPETITORS)
+            if name not in anchored
+        ],
+        "per_query": sorted(
+            rows, key=lambda row: row["query"]
+        )[:_ROLLUP_MAX_QUERY_ROWS],
+    }
+
+
 def _format_shape(template: str, *, title: str, category: str) -> str:
     """Render a profile routine/compat template; a template referencing a
     field this SKU lacks yields "" (shape omitted, never a broken prompt)."""
