@@ -6834,6 +6834,20 @@ def sanitize_report_for_merchant(report: Any) -> Any:
     return clone
 
 
+def strip_internal_deep_tier_for_response(payload: Any) -> Any:
+    """Deep-copied payload with ONLY the internal deep-tier surfaces removed
+    (deep_landscape_internal keys + internal comparison runs in raw_runs).
+
+    For response boundaries that must not otherwise change shape — e.g. the
+    wedge/share endpoints, which predate sanitize_report_for_merchant and whose
+    clients may rely on fields the full sanitizer strips."""
+    if not isinstance(payload, (dict, list)):
+        return payload
+    clone = copy.deepcopy(payload)
+    _strip_internal_deep_tier(clone)
+    return clone
+
+
 def _strip_internal_deep_tier(node: Any, depth: int = 0) -> None:
     """In-place: remove `deep_landscape_internal` keys and filter internal
     deep-tier comparison runs out of any `raw_runs` list, wherever they sit

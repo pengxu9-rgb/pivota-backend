@@ -1164,22 +1164,18 @@ def _launch_audit_mode(launch_options: Dict[str, Any]) -> str:
 
 
 def _launch_audit_tier(launch_options: Dict[str, Any]) -> str:
-    """Depth tier for this run. Deep is flag-gated (AUDIT_DEEP_TIER_ENABLED):
-    with the flag off a deep request falls back to standard — the run still
-    completes rather than erroring, and the log line is the breadcrumb."""
-    from config.settings import settings
-    from services.prompt_basis import AUDIT_TIER_DEEP, AUDIT_TIER_STANDARD, normalize_audit_tier
+    """Depth tier for this run — the PERSISTED launch tier, trusted as-is.
 
-    tier = normalize_audit_tier((launch_options or {}).get("audit_tier"))
-    if tier == AUDIT_TIER_DEEP and not getattr(
-        settings, "audit_deep_tier_enabled", False
-    ):
-        logger.warning(
-            "audit_run_worker: deep tier requested but AUDIT_DEEP_TIER_ENABLED "
-            "is off — running standard tier"
-        )
-        return AUDIT_TIER_STANDARD
-    return tier
+    AUDIT_DEEP_TIER_ENABLED is enforced at the LAUNCH boundary
+    (routes/audit_runs_routes._resolve_request_audit_tier, a 422 before any
+    debit), not re-checked here: the launch was gate-checked AND billed at the
+    deep budget, so a claim-time degrade (flag flipped between enqueue and
+    claim, or a replica missing the env var — the PIVOTA_AGENT_INTERNAL_API_KEY
+    incident's exact drift shape) would silently deliver a standard run against
+    a deep debit. Unknown/absent values normalize to standard."""
+    from services.prompt_basis import normalize_audit_tier
+
+    return normalize_audit_tier((launch_options or {}).get("audit_tier"))
 
 
 def _launch_prompts_per_sku(

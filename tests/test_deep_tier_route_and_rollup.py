@@ -125,6 +125,20 @@ def test_rollup_substitution_rate_and_contest_verdicts():
     assert "BB Lab" not in verdicts and "BB Lab" not in answer_only
 
 
+def test_substitution_is_per_run_not_per_query_union():
+    # Same query, two providers: run 1 cites merchant AND GHD; run 2 cites
+    # NOBODY. A row-level union would call run 2 a substitution (a competitor
+    # appears somewhere on the row) — per-run attribution must not.
+    runs = [
+        _cmp_run("BB Lab collagen vs GHD", merchant=True, competitors=("GHD",)),
+        _cmp_run("BB Lab collagen vs GHD", provider="chatgpt"),
+    ]
+    rollup = build_deep_landscape_rollup(runs, own_brand="BB Lab")
+    assert rollup["total_comparison_runs"] == 2
+    assert rollup["substitution_runs"] == 0
+    assert rollup["substitution_rate"] == 0.0
+
+
 def test_rollup_contest_verdict_partial_is_contest():
     runs = [
         _cmp_run("BB Lab collagen vs GHD", merchant=True, competitors=("GHD",)),

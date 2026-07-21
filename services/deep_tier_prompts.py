@@ -239,6 +239,9 @@ def build_deep_landscape_rollup(
 
     per_query: Dict[str, Dict[str, Any]] = {}
     answer_names: Counter = Counter()
+    total_runs = 0
+    merchant_cited_runs = 0
+    substitution_runs = 0
     for run in comparison_runs:
         query = str(run.get("query") or "").strip()
         if not query:
@@ -251,32 +254,34 @@ def build_deep_landscape_rollup(
             "competitors_cited": [],
         })
         row["runs"] += 1
+        total_runs += 1
         provider = str(run.get("_provider") or run.get("provider") or "").strip()
         if provider and provider not in row["providers"]:
             row["providers"].append(provider)
-        if _run_mentions_merchant(run, own_brand):
+        merchant_here = _run_mentions_merchant(run, own_brand)
+        if merchant_here:
             row["merchant_cited_runs"] += 1
+            merchant_cited_runs += 1
         parsed = (
             run.get("parsed") if isinstance(run.get("parsed"), Mapping) else {}
         )
+        competitor_here = False
         for name in parsed.get("competitors_appearing") or []:
             cleaned = _clean_brand_name(name)
             if not cleaned or _is_own_brand(cleaned, own_brand):
                 continue
+            competitor_here = True
             answer_names[cleaned] += 1
             if cleaned not in row["competitors_cited"]:
                 row["competitors_cited"].append(cleaned)
+        # Substitution is a PER-RUN fact: THIS answer recommended a competitor
+        # and not the merchant. A row-level union would count a nobody-cited
+        # run as substitution whenever a sibling run named a competitor,
+        # inflating the headline rate on sparse-answer categories.
+        if competitor_here and not merchant_here:
+            substitution_runs += 1
 
     rows = list(per_query.values())
-    total_runs = sum(row["runs"] for row in rows)
-    merchant_cited_runs = sum(row["merchant_cited_runs"] for row in rows)
-    # Substitution: the answer recommends SOMEONE (a competitor appears) and
-    # the merchant is absent — the shopper was captured by a substitute.
-    substitution_runs = sum(
-        row["runs"] - row["merchant_cited_runs"]
-        for row in rows
-        if row["competitors_cited"] and row["merchant_cited_runs"] < row["runs"]
-    )
 
     # Contest map: each competitor ANCHORED IN A QUERY ("{title} vs GHD",
     # "is GHD worth it") — the deep blocks render seed names verbatim, so a
