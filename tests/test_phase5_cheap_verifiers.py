@@ -103,10 +103,13 @@ def _patch_product_loader(monkeypatch, product=None):
     )
 
 
-def _patch_httpx_for(module, *, response=None, raise_exc=None):
+def _patch_httpx_for(monkeypatch, module, *, response=None, raise_exc=None):
     """Replace httpx.AsyncClient in a verifier module with a fake.
-    Returns the fake so tests can assert what URLs were hit."""
-    import httpx
+    Returns the fake so tests can assert what URLs were hit.
+
+    NOTE: verifier modules do a plain `import httpx`, so `module.httpx`
+    is the global httpx module — the patch must go through monkeypatch
+    or it leaks into every later test in the session."""
     fake = _FakeAsyncClient(response=response, raise_exc=raise_exc)
 
     class _Factory:
@@ -119,7 +122,7 @@ def _patch_httpx_for(module, *, response=None, raise_exc=None):
         async def __aexit__(self_inner, *args):
             return False
 
-    module.httpx.AsyncClient = _Factory  # type: ignore[attr-defined]
+    monkeypatch.setattr(module.httpx, "AsyncClient", _Factory)
     return fake
 
 
@@ -159,6 +162,7 @@ async def test_pdp_renders_succeeded_when_status_200_with_markers(
         "</head><body>Wellness Greens Gummies by Test Brand</body></html>"
     )
     fake = _patch_httpx_for(
+        monkeypatch,
         pdp_renders,
         response=_FakeResponse(status_code=200, text=html),
     )
@@ -179,6 +183,7 @@ async def test_pdp_renders_failed_when_markers_missing(monkeypatch):
     _patch_product_loader(monkeypatch, product=_sample_product())
     html = "<html><body>Wellness Greens Gummies</body></html>"  # no JSON-LD
     _patch_httpx_for(
+        monkeypatch,
         pdp_renders,
         response=_FakeResponse(status_code=200, text=html),
     )
@@ -195,6 +200,7 @@ async def test_pdp_renders_blocked_on_404(monkeypatch):
     from services.verifiers import pdp_renders
     _patch_product_loader(monkeypatch, product=_sample_product())
     _patch_httpx_for(
+        monkeypatch,
         pdp_renders,
         response=_FakeResponse(status_code=404, text="not found"),
     )
@@ -209,6 +215,7 @@ async def test_pdp_renders_failed_on_5xx(monkeypatch):
     from services.verifiers import pdp_renders
     _patch_product_loader(monkeypatch, product=_sample_product())
     _patch_httpx_for(
+        monkeypatch,
         pdp_renders,
         response=_FakeResponse(status_code=503, text="bad gateway"),
     )
@@ -236,6 +243,7 @@ async def test_pdp_renders_failed_on_timeout(monkeypatch):
     from services.verifiers import pdp_renders
     _patch_product_loader(monkeypatch, product=_sample_product())
     _patch_httpx_for(
+        monkeypatch,
         pdp_renders,
         raise_exc=httpx.TimeoutException("timed out"),
     )
@@ -259,6 +267,7 @@ async def test_pdp_in_sitemap_succeeded_when_url_present(monkeypatch):
       <url><loc>https://agent.pivota.cc/products/sig_abc123</loc></url>
     </urlset>"""
     _patch_httpx_for(
+        monkeypatch,
         pdp_in_sitemap,
         response=_FakeResponse(status_code=200, text=sitemap),
     )
@@ -280,6 +289,7 @@ async def test_pdp_in_sitemap_failed_when_url_missing(monkeypatch):
       <url><loc>https://agent.pivota.cc/products/sig_other</loc></url>
     </urlset>"""
     _patch_httpx_for(
+        monkeypatch,
         pdp_in_sitemap,
         response=_FakeResponse(status_code=200, text=sitemap),
     )
@@ -295,6 +305,7 @@ async def test_pdp_in_sitemap_failed_on_sitemap_error(monkeypatch):
     from services.verifiers import pdp_in_sitemap
     _patch_product_loader(monkeypatch, product=_sample_product())
     _patch_httpx_for(
+        monkeypatch,
         pdp_in_sitemap,
         response=_FakeResponse(status_code=500),
     )
@@ -357,6 +368,7 @@ async def test_internal_retrieval_succeeded_on_roundtrip_match(
         "updated_at": "2026-05-12T10:00:00+00:00",
     }
     _patch_httpx_for(
+        monkeypatch,
         pivota_internal_retrieval,
         response=_FakeResponse(
             status_code=200, text="", json_body=body,
@@ -379,6 +391,7 @@ async def test_internal_retrieval_blocked_on_404(monkeypatch):
     _patch_product_loader(monkeypatch, product=_sample_product())
     _patch_backend_url(monkeypatch)  # P5.8.5
     _patch_httpx_for(
+        monkeypatch,
         pivota_internal_retrieval,
         response=_FakeResponse(status_code=404),
     )
@@ -408,6 +421,7 @@ async def test_internal_retrieval_blocked_on_roundtrip_mismatch(
         },
     }
     _patch_httpx_for(
+        monkeypatch,
         pivota_internal_retrieval,
         response=_FakeResponse(
             status_code=200, text="", json_body=body,
@@ -429,6 +443,7 @@ async def test_internal_retrieval_failed_on_5xx(monkeypatch):
     _patch_product_loader(monkeypatch, product=_sample_product())
     _patch_backend_url(monkeypatch)  # P5.8.5
     _patch_httpx_for(
+        monkeypatch,
         pivota_internal_retrieval,
         response=_FakeResponse(status_code=503),
     )

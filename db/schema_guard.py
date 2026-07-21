@@ -203,6 +203,13 @@ async def check_required_schema() -> Dict[str, List[str]]:
             elif IS_SQLITE:
                 # PRAGMA table_info returns columns: cid, name, type, notnull, dflt_value, pk
                 rows = await database.fetch_all(f"PRAGMA table_info({spec.table});")
+                if not rows:
+                    # Table absent entirely. On sqlite (dev/test only) that
+                    # means the feature was never exercised locally — several
+                    # required tables are created by Postgres migrations that
+                    # never run on sqlite. Only column gaps on EXISTING tables
+                    # are drift here; prod (Postgres) keeps the strict check.
+                    continue
                 present = {str(r["name"]) for r in rows}  # type: ignore[index]
             else:
                 present = set()
@@ -1552,87 +1559,31 @@ async def ensure_required_schema_light() -> None:
             return
 
         if IS_SQLITE:
-            # These two REQUIRED_SCHEMA tables have no startup DDL on sqlite:
-            # external_product_seeds is created lazily by routes/employee_products.py
-            # (Postgres-dialect DDL) and merchant_credit_balance only by migration
-            # 089 — neither runs on a fresh sqlite boot, so /health would 503.
-            # Sqlite-dialect mirrors of those schemas, created before column heal.
-            await database.execute(
-                text(
-                    """
-                    CREATE TABLE IF NOT EXISTS external_product_seeds (
-                      id TEXT PRIMARY KEY,
-                      external_product_id TEXT NULL,
-                      market TEXT NOT NULL,
-                      tool TEXT NOT NULL DEFAULT '*',
-                      utm_template TEXT NULL,
-                      partner_type TEXT NULL,
-                      disclosure_text TEXT NULL,
-                      destination_url TEXT NOT NULL,
-                      canonical_url TEXT NULL,
-                      domain TEXT NULL,
-                      title TEXT NULL,
-                      image_url TEXT NULL,
-                      price_amount DOUBLE PRECISION NULL,
-                      price_currency TEXT NULL,
-                      availability TEXT NULL,
-                      seed_data TEXT NOT NULL DEFAULT '{}',
-                      status TEXT NOT NULL DEFAULT 'active',
-                      notes TEXT NULL,
-                      created_by_employee_id TEXT NULL,
-                      attached_product_key TEXT NULL,
-                      attached_variant_id TEXT NULL,
-                      seller_ref TEXT NULL,
-                      seed_kind TEXT NULL,
-                      created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
-                      updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP
-                    );
-                    """
-                )
-            )
-            await database.execute(
-                text(
-                    """
-                    CREATE TABLE IF NOT EXISTS merchant_credit_balance (
-                      merchant_id        TEXT PRIMARY KEY,
-                      audit_credits      INTEGER NOT NULL DEFAULT 0,
-                      prompt_credits     INTEGER NOT NULL DEFAULT 0,
-                      execution_credits  INTEGER NOT NULL DEFAULT 0,
-                      plan_tier          TEXT NOT NULL DEFAULT 'free',
-                      purchased_credits  BIGINT NOT NULL DEFAULT 0,
-                      overage_pending_credits BIGINT NOT NULL DEFAULT 0,
-                      overage_charged_credits BIGINT NOT NULL DEFAULT 0,
-                      overage_blocked_until_payment BOOLEAN NOT NULL DEFAULT FALSE,
-                      overage_last_payment_intent_id TEXT,
-                      overage_last_failed_at TIMESTAMP,
-                      updated_at         TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
-                      version            INTEGER NOT NULL DEFAULT 0
-                    );
-                    """
-                )
-            )
-            missing = await check_required_schema()
-            sqlite_column_ddl = {
+            # Self-heal EVERY table in REQUIRED_SCHEMA, not a hardcoded subset:
+            # /health fails closed on any missing required column, so a spec
+            # entry without a matching heal here leaves a fresh sqlite dev/test
+            # DB permanently unhealthy (503).
+            sqlite_type = {
                 ("merchant_stores", "is_primary"): "BOOLEAN DEFAULT FALSE",
                 ("merchant_stores", "order_writeback_status"): "TEXT DEFAULT 'disabled'",
-                ("catalog_merchants", "indexable"): "BOOLEAN DEFAULT TRUE",
-                ("merchant_credit_balance", "purchased_credits"): "BIGINT DEFAULT 0",
-                ("merchant_credit_balance", "overage_pending_credits"): "BIGINT DEFAULT 0",
-                ("merchant_credit_balance", "overage_charged_credits"): "BIGINT DEFAULT 0",
-                (
-                    "merchant_credit_balance",
-                    "overage_blocked_until_payment",
-                ): "BOOLEAN DEFAULT FALSE",
+                ("catalog_merchants", "indexable"): "BOOLEAN DEFAULT FALSE",
+                ("merchant_credit_balance", "purchased_credits"): "NUMERIC DEFAULT 0",
+                ("merchant_credit_balance", "overage_pending_credits"): "NUMERIC DEFAULT 0",
+                ("merchant_credit_balance", "overage_charged_credits"): "NUMERIC DEFAULT 0",
+                ("merchant_credit_balance", "overage_blocked_until_payment"): "BOOLEAN DEFAULT FALSE",
             }
-            for spec in REQUIRED_SCHEMA:
-                for col in sorted(missing.get(spec.table) or []):
-                    col_ddl = sqlite_column_ddl.get((spec.table, col), "TEXT")
+            missing = await check_required_schema()
+            for table, cols in missing.items():
+                for col in sorted(cols or []):
                     try:
                         await database.execute(
-                            text(f"ALTER TABLE {spec.table} ADD COLUMN {col} {col_ddl};")
+                            text(
+                                f"ALTER TABLE {table} ADD COLUMN {col} "
+                                f"{sqlite_type.get((table, col), 'TEXT')};"
+                            )
                         )
                     except Exception:
-                        # Ignore duplicate-column / missing-table variations.
+                        # Ignore duplicate-column / unsupported variations.
                         continue
             return
     except Exception:
