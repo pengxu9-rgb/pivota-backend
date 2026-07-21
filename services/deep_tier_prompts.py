@@ -456,14 +456,15 @@ def build_deep_tier_specs(
     specs: List[Tuple[str, str]] = []
 
     # Block A — comparison & substitution (internal-first axis).
+    # NOTE: no "is {title} better than {c}" shape — it measured the same thing
+    # as "{title} vs {c}" (0.75 token overlap, HBN pilot prompt-quality
+    # review), and both live in the echo lane anyway. One slot reclaimed.
     if title:
         for competitor in seeds:
             specs.append((f"{title} vs {competitor}", COMPARISON_AXIS))
     for competitor in seeds:
         specs.append((f"best alternatives to {competitor}", COMPARISON_AXIS))
     if seeds:
-        if title:
-            specs.append((f"is {title} better than {seeds[0]}", COMPARISON_AXIS))
         specs.append((f"cheaper alternative to {seeds[0]}", COMPARISON_AXIS))
 
     # Block B — incumbent-branded contest: questions ABOUT the incumbent;
