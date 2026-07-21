@@ -296,6 +296,9 @@ def test_all_skip_carries_no_beachhead_note_not_give_up():
     note = out["no_beachhead_note"]
     assert "head term" in note
     assert "wedge" in note
+    # Merchant-facing copy: no template braces, no internal payload keys.
+    assert "{" not in note and "}" not in note
+    assert "suggested_prompts" not in note
 
 
 def test_no_skip_no_notes():

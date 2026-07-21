@@ -7881,9 +7881,10 @@ def build_where_you_can_win(
         out["no_beachhead_note"] = (
             "Every probed query was a head term another brand or platform "
             "already owns — that measures where you can't win, not where you "
-            "can. Probe wedge lanes next: differentiator/outcome queries, "
-            "price-band queries, and alternative-to-{incumbent} queries (see "
-            "suggested_prompts, or add them as custom prompts on the next run)."
+            "can. Probe wedge lanes next: outcome and differentiator queries, "
+            "price-band queries, and alternative-to-incumbent queries. Add "
+            "them as custom prompts on your next run, or use the suggested "
+            "prompts in your report."
         )
     return out
 
@@ -9291,6 +9292,22 @@ def _wedge_price_band_usd(sku_ctx: Dict[str, Any]) -> Optional[int]:
     return None
 
 
+def _outcome_repeats_category(outcome: str, category: str) -> bool:
+    """True when a profile-level outcome term collides with THIS category —
+    the outcome shape would read as a tautology ("curling iron that also curls
+    hair"). Word-stem overlap: any 4+-char alnum token in the outcome sharing a
+    4-char prefix with a 4+-char category token ("curls"/"curling") collides.
+    Conservative by design: dropping a plausible outcome costs one wedge probe;
+    emitting a tautology burns merchant-visible credit on junk."""
+    outcome_tokens = [t for t in re.findall(r"[a-z0-9]+", str(outcome or "").lower()) if len(t) >= 4]
+    category_tokens = [t for t in re.findall(r"[a-z0-9]+", str(category or "").lower()) if len(t) >= 4]
+    for o_tok in outcome_tokens:
+        for c_tok in category_tokens:
+            if o_tok[:4] == c_tok[:4]:
+                return True
+    return False
+
+
 def _unbranded_category_specs(
     *,
     category: str,
@@ -9324,14 +9341,26 @@ def _unbranded_category_specs(
     # wedge portfolio -> 4 targets incl. beachhead, run 7b345df0). Three
     # shapes: buyer-outcome ("{cat} that doesn't snag or pull hair"),
     # price-anchored ("best {cat} under $70"), and alternative-seeker
-    # ("affordable GHD alternative"). Empty config + no price -> byte-unchanged.
-    for outcome in (getattr(profile, "seed_outcome_terms", ()) or ())[:3]:
+    # ("affordable GHD alternative"). ALL gated on the profile carrying wedge
+    # config — probe-set composition is pinned behavior, so a priced SKU in an
+    # unconfigured vertical must stay byte-unchanged (incl. the price shape).
+    _wedge_outcomes = tuple(getattr(profile, "seed_outcome_terms", ()) or ())
+    _wedge_incumbents = tuple(getattr(profile, "wedge_incumbent_brands", ()) or ())
+    for outcome in _wedge_outcomes[:3]:
         outcome = _clean_prompt_term(outcome)
-        if outcome:
+        # A profile's outcome terms are class-wide but a category is specific:
+        # "also curls hair" reads as a wedge for a flat iron and as a
+        # tautology for a curling iron. Stem-overlap guard drops the
+        # tautological pairing (a shared 4-char word stem, "curl"/"curling").
+        if outcome and not _outcome_repeats_category(outcome, category):
             specs.append((f"{category} that {outcome}", "category"))
-    if price_band_usd and int(price_band_usd) > 0:
+    if (
+        (_wedge_outcomes or _wedge_incumbents)
+        and price_band_usd
+        and int(price_band_usd) > 0
+    ):
         specs.append((f"best {category} under ${int(price_band_usd)}", "category"))
-    for incumbent in (getattr(profile, "wedge_incumbent_brands", ()) or ())[:2]:
+    for incumbent in _wedge_incumbents[:2]:
         incumbent = str(incumbent or "").strip()
         if incumbent:
             specs.append((f"affordable {incumbent} alternative", "category"))

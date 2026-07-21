@@ -71,6 +71,25 @@ def test_price_band_shape_only_with_band():
     assert not any("under $" in q for q in without)
 
 
+def test_outcome_terms_never_tautological_for_sibling_categories():
+    # The profile's outcome terms are class-wide; the category is specific.
+    # "also curls hair" is a wedge for a flat iron but a tautology for a
+    # curling iron — the stem guard drops the colliding pairing only.
+    curler = [
+        q for q, _ in m._unbranded_category_specs(
+            category="curling iron",
+            graph={},
+            topics=[],
+            bullets=[],
+            profile=BEAUTY_DEVICE_HAIR_PROFILE,
+        )
+    ]
+    assert "curling iron that also curls hair" not in curler
+    # non-colliding outcomes still emit for the sibling category
+    assert "curling iron that works abroad with dual voltage" in curler
+    assert "curling iron that doesn't snag or pull hair" in curler
+
+
 # --- 2. price band derivation ------------------------------------------------
 
 def test_wedge_price_band_picks_smallest_band_at_or_above_price():
@@ -106,6 +125,9 @@ def test_wedge_price_band_uses_best_price_across_offers():
 # --- 3. unconfigured profiles are byte-unchanged -----------------------------
 
 def test_profile_without_wedge_config_is_unchanged():
+    # Byte-unchanged for unconfigured profiles EVEN WITH a priced SKU: probe-set
+    # composition is pinned behavior, so the price shape is gated on the
+    # profile carrying wedge config, not just on a price existing.
     kwargs = dict(
         category="hair oil",
         graph={"classes": {"use_case": ["damaged hair"]}},
@@ -115,10 +137,12 @@ def test_profile_without_wedge_config_is_unchanged():
     )
     before = m._unbranded_category_specs(**kwargs)
     with_default_band = m._unbranded_category_specs(**kwargs, price_band_usd=None)
-    assert before == with_default_band
+    with_priced_sku = m._unbranded_category_specs(**kwargs, price_band_usd=25)
+    assert before == with_default_band == with_priced_sku
     queries = [q for q, _ in before]
     assert not any(" that " in q for q in queries)
     assert not any(q.startswith("affordable ") for q in queries)
+    assert not any("under $" in q for q in queries)
 
 
 # --- 4. end-to-end: base specs for a VODANA-like SKU -------------------------
