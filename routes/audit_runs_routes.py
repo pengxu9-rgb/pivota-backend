@@ -161,7 +161,20 @@ class CreateAuditRequest(BaseModel):
             "competitive lane on, ahead of the automatic cited-competitor "
             "harvest. Lets the audit target rivals AI answers don't cite yet "
             "(e.g. brands investing in AI visibility). Ignored on standard "
-            "runs; sanitized server-side (own brand and junk names dropped)."
+            "runs; sanitized server-side (own brand, junk, and prose-shaped "
+            "names dropped). NOTE: a re-audit replays its pinned question "
+            "set for comparability, so newly declared competitors take "
+            "effect only with refresh_prompt_basis=true (or on a first "
+            "deep audit)."
+        ),
+    )
+    refresh_prompt_basis: bool = Field(
+        False,
+        description=(
+            "Regenerate the pinned measurement basis for this run instead of "
+            "replaying the prior run's question set. Resets re-audit "
+            "comparability (a new baseline starts); required for newly "
+            "declared competitors to take effect on a re-audit."
         ),
     )
     coverage_profile: str = Field(
@@ -1209,6 +1222,9 @@ async def create_audit_run(
                     "declared_competitors": _normalize_nonempty(
                         body.declared_competitors
                     ),
+                    # Explicit basis regeneration (baseline reset) — required
+                    # for newly declared competitors on a re-audit.
+                    "refresh_prompt_basis": bool(body.refresh_prompt_basis),
                     "estimated_audit_credits": int(audit_required),
                     "estimated_prompt_credits": int(prompt_required),
                     "debited": [

@@ -1147,7 +1147,9 @@ class MerchantUrlAuditRequest(BaseModel):
             "Deep tier only: up to 5 competitor brand names to anchor the "
             "competitive lane on, ahead of the automatic cited-competitor "
             "harvest — targets rivals AI answers don't cite yet. Ignored on "
-            "standard runs; sanitized server-side."
+            "standard runs; sanitized server-side. NOTE: a re-audit replays "
+            "its pinned question set, so newly declared competitors take "
+            "effect only with refresh=true (or on a first deep audit)."
         ),
     )
     custom_prompts_by_url: Optional[Dict[str, List[str]]] = Field(

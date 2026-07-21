@@ -12861,10 +12861,21 @@ async def run_per_sku_audit_probe_fanout(
             if _run_tier != _TIER_DEEP:
                 sku_ctx.pop("_deep_competitor_seeds", None)
                 sku_ctx.pop("_deep_tier_queries", None)
-            elif not sku_ctx.get("_pinned_selected_specs"):
+            elif sku_ctx.get("_pinned_selected_specs"):
+                # Pinned re-run: the prior selected set replays VERBATIM, so
+                # declared competitors cannot take effect this run. Loud
+                # breadcrumb — the route docs tell callers to pass
+                # refresh_prompt_basis=true to re-anchor.
+                if declared_competitors:
+                    logger.info(
+                        "deep-tier: declared_competitors ignored on pinned "
+                        "re-run (pass refresh_prompt_basis=true to re-anchor) "
+                        "merchant=%s sku=%s", merchant_id, sku_key,
+                    )
+            else:
                 from services.deep_tier_prompts import (
-                    MAX_ANCHOR_SEEDS,
                     load_prior_competitor_brands,
+                    resolve_deep_anchor_seeds,
                     sanitize_declared_competitors,
                 )
 
@@ -12877,21 +12888,16 @@ async def run_per_sku_audit_probe_fanout(
                 # knows who is gunning for the shelf — including AEO-active
                 # brands the answer harvest structurally cannot see yet. The
                 # evidence-ranked harvest fills the remaining slots.
-                _declared = sanitize_declared_competitors(
-                    declared_competitors, own_brand=_own_brand,
+                sku_ctx["_deep_competitor_seeds"] = resolve_deep_anchor_seeds(
+                    sanitize_declared_competitors(
+                        declared_competitors, own_brand=_own_brand,
+                    ),
+                    await load_prior_competitor_brands(
+                        merchant_id=str(merchant_id),
+                        sku_key=str(sku_key),
+                        own_brand=_own_brand,
+                    ),
                 )
-                _declared_keys = {d.lower() for d in _declared}
-                _harvested = await load_prior_competitor_brands(
-                    merchant_id=str(merchant_id),
-                    sku_key=str(sku_key),
-                    own_brand=_own_brand,
-                )
-                sku_ctx["_deep_competitor_seeds"] = (
-                    _declared + [
-                        name for name in _harvested
-                        if name.lower() not in _declared_keys
-                    ]
-                )[:MAX_ANCHOR_SEEDS]
         out[sku_key] = await _probe_per_sku_ctx(
             sku_ctx=sku_ctx,
             merchant_id=str(merchant_id),
