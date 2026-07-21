@@ -1129,6 +1129,17 @@ class MerchantUrlAuditRequest(BaseModel):
             "grounded in, and which competitors it named instead."
         ),
     )
+    audit_tier: str = Field(
+        default="standard",
+        max_length=16,
+        description=(
+            "Audit depth tier: 'standard' (the wedge's focused "
+            "budget) or 'deep' (Deep Landscape Scan — the ~80-prompt ceiling "
+            "incl. comparison/market blocks; realistic yield on a URL-only "
+            "SKU is ~40-50 prompts). Deep requires AUDIT_DEEP_TIER_ENABLED "
+            "and is rejected (422) when off — never silently downgraded."
+        ),
+    )
     custom_prompts_by_url: Optional[Dict[str, List[str]]] = Field(
         default=None,
         description=(
@@ -1653,6 +1664,41 @@ async def run_merchant_url_audit(
     from services.bd_cold_start_service import fetch_curated_audit_product
     from services.idempotency import compute_audit_idempotency_key
 
+    # 0. Depth tier — resolved BEFORE pricing so metering, launch options,
+    #    and the worker agree on the budget (mirrors audit_runs_routes:
+    #    deep w/ flag off is a 422, never a silent downgrade).
+    from config.settings import settings as _settings
+    from services.prompt_basis import (
+        AUDIT_TIER_DEEP,
+        normalize_audit_tier,
+        prompts_per_sku_for_tier,
+    )
+
+    _raw_tier = str(body.audit_tier or "").strip().lower()
+    audit_tier = normalize_audit_tier(_raw_tier)
+    if _raw_tier and _raw_tier != audit_tier:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail=f"Unknown audit_tier {_raw_tier!r}. Valid values: standard, deep.",
+        )
+    if audit_tier == AUDIT_TIER_DEEP and not getattr(
+        _settings, "audit_deep_tier_enabled", False
+    ):
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail=(
+                "audit_tier='deep' (Deep Landscape Scan) is not enabled on "
+                "this environment."
+            ),
+        )
+    # The per-product budget everything below prices and displays: the wedge's
+    # focused set on standard, the deep ceiling on deep.
+    wedge_budget = (
+        prompts_per_sku_for_tier(audit_tier)
+        if audit_tier == AUDIT_TIER_DEEP
+        else _WEDGE_PROMPTS_PER_SKU
+    )
+
     # 1. Free-allowance: the first N URL audits per merchant run free. Beyond
     #    that we do NOT hard-block a merchant who can pay — we METER the audit
     #    against their credit balance (the credit pre-flight + debit happens
@@ -1896,7 +1942,7 @@ async def run_merchant_url_audit(
             _pinned = pinned_by_sku.get(_key) or []
             _pinned_set = set(_pinned)
             per_provider_probes += (
-                len(_pinned) if _pinned else max(1, _WEDGE_PROMPTS_PER_SKU)
+                len(_pinned) if _pinned else max(1, wedge_budget)
             )
             per_provider_probes += sum(
                 1 for q in (custom_prompts_by_sku.get(_key) or [])
@@ -2041,14 +2087,14 @@ async def run_merchant_url_audit(
             # MEASURED coverage; this copy is what the "running" poll and the
             # rare all-providers-failed path show, so it must name the real
             # launch set (not a hardcoded "Gemini") and read as a plan ("up to").
-            "queries_per_product": _WEDGE_PROMPTS_PER_SKU,
+            "queries_per_product": wedge_budget,
             # Display-ready header label from the PLANNED launch set — the
             # measured reshape overwrites it; this is what a legacy report shape
             # (no per-provider signal) falls back to, still naming real models.
             "grounded_search_label": _grounded_search_label(providers_for_launch),
             "what_we_checked": (
                 "Each product URL you gave us is audited on its own: we run up "
-                f"to {_WEDGE_PROMPTS_PER_SKU} AI shopping-agent buyer-intent "
+                f"to {wedge_budget} AI shopping-agent buyer-intent "
                 "queries per product on "
                 f"{_humanize_provider_list(providers_for_launch)} (grounded "
                 "search) and check whether your URL is cited, which competitors "
@@ -2142,7 +2188,16 @@ async def run_merchant_url_audit(
                 "coverage_profile": _WEDGE_COVERAGE_PROFILE,
                 "providers": providers_for_launch,
                 "verify_providers": list(_WEDGE_VERIFY_PROVIDERS),
-                "prompts_per_sku": _WEDGE_PROMPTS_PER_SKU,
+                # Depth tier: on deep the explicit count is OMITTED so the
+                # worker resolves the tier budget (a persisted default would
+                # shadow it — see _launch_prompts_per_sku CAUTION); the
+                # standard wedge keeps its focused budget byte-unchanged.
+                "audit_tier": audit_tier,
+                **(
+                    {}
+                    if audit_tier == AUDIT_TIER_DEEP
+                    else {"prompts_per_sku": _WEDGE_PROMPTS_PER_SKU}
+                ),
                 "custom_prompts": custom_prompts_clean,
                 # Per-SKU merchant prompts (custom_prompts_by_url re-keyed to
                 # sku_key): probed inside their SKU's context and pinned into
