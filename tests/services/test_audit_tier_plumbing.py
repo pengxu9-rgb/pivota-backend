@@ -68,17 +68,21 @@ def _set_deep_flag(monkeypatch, value: bool) -> None:
     monkeypatch.setattr(settings, "audit_deep_tier_enabled", value, raising=False)
 
 
-def test_launch_audit_tier_is_flag_gated(monkeypatch):
+def test_launch_audit_tier_trusts_the_persisted_launch_tier(monkeypatch):
+    # The flag is enforced at the LAUNCH boundary (route 422 before any
+    # debit — _resolve_request_audit_tier). The worker honors the persisted
+    # tier even with the flag off: a claim-time degrade would deliver a
+    # standard run against a deep debit (flag flipped between enqueue and
+    # claim, or a replica missing the env var).
     from services.audit_run_worker import _launch_audit_tier
 
     _set_deep_flag(monkeypatch, False)
     assert _launch_audit_tier({}) == AUDIT_TIER_STANDARD
-    # Flag off: a deep request degrades to a completed standard run.
-    assert _launch_audit_tier({"audit_tier": "deep"}) == AUDIT_TIER_STANDARD
+    assert _launch_audit_tier({"audit_tier": "deep"}) == AUDIT_TIER_DEEP
+    assert _launch_audit_tier({"audit_tier": "bogus"}) == AUDIT_TIER_STANDARD
 
     _set_deep_flag(monkeypatch, True)
     assert _launch_audit_tier({"audit_tier": "deep"}) == AUDIT_TIER_DEEP
-    assert _launch_audit_tier({"audit_tier": "bogus"}) == AUDIT_TIER_STANDARD
 
 
 def test_launch_prompts_per_sku_follows_tier_unless_overridden():

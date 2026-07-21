@@ -13,10 +13,10 @@ See PIVOTA-Agent/docs/ai_readiness_query_axes_build_plan.md.
 
 from services import agent_center_bd_report_service as m
 
-# "sidewalk" joined the coarse vocabulary with the per-SKU AI-visibility
-# lanes (#742) + per-intent-axis scoring (#929): every downstream consumer
-# maps it (_intent_axis_for → "constraint"). Anything OUTSIDE this set is
-# still a leak.
+# "sidewalk" joined the coarse vocabulary with the specific-long-tail budget
+# inversion (#937): downstream consumers handle it (_intent_axis_for maps it
+# like "attribute"), and test_budget_inversion_specific_is_majority asserts it
+# is the majority axis of the final records.
 _COARSE_AXES = {"category", "attribute", "intent", "review", "identity", "sidewalk"}
 
 

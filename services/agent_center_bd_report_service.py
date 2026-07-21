@@ -5135,8 +5135,14 @@ async def load_per_sku_probe_runs(
     sku_key: str,
     merchant_id: str,
     audit_run_id: Optional[str],
+    include_internal_comparison: bool = False,
 ) -> List[Dict[str, Any]]:
-    """Best-effort read of persisted per_sku_audit probe payloads."""
+    """Best-effort read of persisted per_sku_audit probe payloads.
+
+    Default excludes internal deep-tier comparison runs (the merchant-visible
+    set). `include_internal_comparison=True` is for the internal rollup only
+    (build_per_sku_report computes deep_landscape_internal from the raw set,
+    then hands every merchant-facing surface the filtered one)."""
     if not audit_run_id:
         return []
     row = await _fetch_one_dict(
@@ -5178,6 +5184,8 @@ async def load_per_sku_probe_runs(
         await resolve_grounding_redirects_in_runs(_flatten_probe_runs(out))
     except Exception as exc:  # noqa: BLE001 — never sink the report build
         logger.warning("grounding redirect unwrap skipped: %s", exc)
+    if include_internal_comparison:
+        return out
     return _merchant_visible_probe_payloads(out)
 
 
@@ -6808,17 +6816,58 @@ def _strip_score_breakdowns(node: Any) -> None:
 def sanitize_report_for_merchant(report: Any) -> Any:
     """Return a merchant-safe deep copy of an assembled audit report.
 
-    Drops internal score `breakdown` blocks from the response only. The stored
-    report_jsonb and all server-side consumers (playbook engine,
-    next_best_action, strategic_brief, re-audit delta) run on the intact report
-    during worker assembly and are unaffected. Safe on the full per_sku payload,
-    the brand_report, or None.
+    Drops internal score `breakdown` blocks and every internal deep-tier
+    surface (the `deep_landscape_internal` rollup + raw internal comparison
+    runs riding probe payloads — GET /api/audits/{run_id} returns
+    partial_result_jsonb, so the response boundary must strip what the
+    report-assembly loader strips) from the response only. The stored
+    report_jsonb/partial_result_jsonb and all server-side consumers (playbook
+    engine, next_best_action, strategic_brief, re-audit delta, the internal
+    rollup) run on the intact data and are unaffected. Safe on the full
+    per_sku payload, the brand_report, the whole run row, or None.
     """
     if not isinstance(report, (dict, list)):
         return report
     clone = copy.deepcopy(report)
     _strip_score_breakdowns(clone)
+    _strip_internal_deep_tier(clone)
     return clone
+
+
+def strip_internal_deep_tier_for_response(payload: Any) -> Any:
+    """Deep-copied payload with ONLY the internal deep-tier surfaces removed
+    (deep_landscape_internal keys + internal comparison runs in raw_runs).
+
+    For response boundaries that must not otherwise change shape — e.g. the
+    wedge/share endpoints, which predate sanitize_report_for_merchant and whose
+    clients may rely on fields the full sanitizer strips."""
+    if not isinstance(payload, (dict, list)):
+        return payload
+    clone = copy.deepcopy(payload)
+    _strip_internal_deep_tier(clone)
+    return clone
+
+
+def _strip_internal_deep_tier(node: Any, depth: int = 0) -> None:
+    """In-place: remove `deep_landscape_internal` keys and filter internal
+    deep-tier comparison runs out of any `raw_runs` list, wherever they sit
+    in the payload (report_jsonb, partial_result_jsonb.per_sku_probe_runs,
+    audience projections). Depth-capped defensively; payloads are JSON-shaped
+    and shallow relative to the cap."""
+    if depth > 16:
+        return
+    if isinstance(node, dict):
+        node.pop("deep_landscape_internal", None)
+        raw_runs = node.get("raw_runs")
+        if isinstance(raw_runs, list):
+            node["raw_runs"] = [
+                run for run in raw_runs if not run_is_internal_comparison(run)
+            ]
+        for value in node.values():
+            _strip_internal_deep_tier(value, depth + 1)
+    elif isinstance(node, list):
+        for value in node:
+            _strip_internal_deep_tier(value, depth + 1)
 
 
 def _band_for_score(score: Optional[int]) -> str:
@@ -7197,8 +7246,24 @@ async def build_per_sku_report(
     verify_summary: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
     sku_ctx = await load_sku_context(sku_key, merchant_id)
-    probe_runs = await load_per_sku_probe_runs(sku_key, merchant_id, audit_run_id)
+    # Load RAW (incl. internal comparison runs) exactly once: the deep-tier
+    # rollup needs them; every other surface below reads the merchant-visible
+    # filtered set.
+    raw_probe_runs = await load_per_sku_probe_runs(
+        sku_key, merchant_id, audit_run_id, include_internal_comparison=True,
+    )
+    probe_runs = _merchant_visible_probe_payloads(raw_probe_runs)
     product = _get_product(sku_ctx)
+    deep_landscape_internal = None
+    try:
+        from services.deep_tier_prompts import build_deep_landscape_rollup
+
+        deep_landscape_internal = build_deep_landscape_rollup(
+            _flatten_probe_runs(raw_probe_runs),
+            own_brand=str(product.get("brand") or product.get("vendor") or ""),
+        )
+    except Exception:  # noqa: BLE001 — the rollup must never sink the report
+        logger.warning("deep-landscape rollup skipped", exc_info=True)
     provider_models = _probe_run_provider_model_metadata(
         probe_runs,
         fallback=provider_model_metadata,
@@ -7477,6 +7542,11 @@ async def build_per_sku_report(
         "verbatim_grounding_evidence": _grounding_evidence(probe_runs),
         "axis_coverage": _axis_coverage(probe_runs),
         "query_class_coverage": _query_class_coverage(probe_runs),
+        # INTERNAL-FIRST (founder 2026-07-21): substitution-rate + contest map
+        # from the deep-tier comparison probes. Names competitors, so the
+        # merchant-response sanitizer strips this exact key; ops read it via
+        # DB/BD tooling. None on every standard run.
+        "deep_landscape_internal": deep_landscape_internal,
         # Step 2 — citation rate by fine intent axis (head/problem/constraint/trust/
         # nav). Snapshot of WHERE this SKU is cited by question type. Additive.
         "citation_by_intent": _citation_by_intent(

@@ -969,7 +969,7 @@ async def test_build_per_sku_report_end_to_end_with_mocked_loaders(monkeypatch):
         ctx["merchant_id"] = merchant_id
         return ctx
 
-    async def fake_load_runs(sku_key: str, merchant_id: str, audit_run_id: str) -> List[Dict[str, Any]]:
+    async def fake_load_runs(sku_key: str, merchant_id: str, audit_run_id: str, include_internal_comparison: bool = False) -> List[Dict[str, Any]]:
         return _multi_provider_probe_runs()
 
     monkeypatch.setattr(bd, "load_sku_context", fake_load_sku_context)
@@ -1028,7 +1028,7 @@ async def test_run_brand_report_per_sku_runs_bounded_deepseek_verify(monkeypatch
         ctx["merchant_id"] = merchant_id
         return ctx
 
-    async def fake_load_runs(sku_key: str, merchant_id: str, audit_run_id: str) -> List[Dict[str, Any]]:
+    async def fake_load_runs(sku_key: str, merchant_id: str, audit_run_id: str, include_internal_comparison: bool = False) -> List[Dict[str, Any]]:
         return _positive_probe_runs(count=4)
 
     async def fake_probe(**kwargs):
@@ -1114,7 +1114,7 @@ async def test_run_brand_report_skips_verify_when_deepseek_key_missing(monkeypat
         ctx["merchant_id"] = merchant_id
         return ctx
 
-    async def fake_load_runs(sku_key: str, merchant_id: str, audit_run_id: str) -> List[Dict[str, Any]]:
+    async def fake_load_runs(sku_key: str, merchant_id: str, audit_run_id: str, include_internal_comparison: bool = False) -> List[Dict[str, Any]]:
         return _positive_probe_runs(count=2)
 
     async def fail_probe(**kwargs):
@@ -1161,7 +1161,7 @@ async def test_per_sku_report_and_cost_summary_stamp_model_override(monkeypatch)
         ctx["merchant_id"] = merchant_id
         return ctx
 
-    async def fake_load_runs(sku_key: str, merchant_id: str, audit_run_id: str) -> List[Dict[str, Any]]:
+    async def fake_load_runs(sku_key: str, merchant_id: str, audit_run_id: str, include_internal_comparison: bool = False) -> List[Dict[str, Any]]:
         runs = _multi_provider_probe_runs()
         runs[1]["model"] = "gpt-5.5-mini"
         runs[1]["model_is_override"] = True

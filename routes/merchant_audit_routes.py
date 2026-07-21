@@ -73,6 +73,7 @@ from services.agent_center_bd_report_service import (
     run_brand_report,
     run_wedge_hero_sku_intelligence,
     sanitize_report_for_merchant,
+    strip_internal_deep_tier_for_response,
 )
 from services.agent_readiness_score import compute_agent_readiness_score
 from services.audit_index_intake import (
@@ -1466,6 +1467,14 @@ def _shape_url_audit_response(row: Dict[str, Any]) -> Dict[str, Any]:
     """
     run_id = row.get("run_id")
     report = row.get("report_jsonb")
+    # Merchant-response boundary (one of three callers is the UNAUTHENTICATED
+    # share-token endpoint): strip internal deep-tier surfaces
+    # (deep_landscape_internal + internal comparison runs). Surgical strip —
+    # NOT the full merchant sanitizer — so the wedge envelope's existing shape
+    # is untouched; the wedge path is standard-tier-only today, this is
+    # defense in depth against a future merchant_url deep lane shipping the
+    # competitor rollup publicly.
+    report = strip_internal_deep_tier_for_response(report)
     report = report if isinstance(report, dict) else {}
     partial = row.get("partial_result_jsonb")
     launch = (partial.get("launch") or {}) if isinstance(partial, dict) else {}
