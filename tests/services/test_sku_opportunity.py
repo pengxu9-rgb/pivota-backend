@@ -1099,7 +1099,7 @@ async def test_build_per_sku_report_preserves_prior_keys_and_adds_opportunity(mo
         ctx["merchant_id"] = merchant_id
         return ctx
 
-    async def fake_load_runs(sku_key: str, merchant_id: str, audit_run_id: str) -> List[Dict[str, Any]]:
+    async def fake_load_runs(sku_key: str, merchant_id: str, audit_run_id: str, include_internal_comparison: bool = False) -> List[Dict[str, Any]]:
         return _bb_lab_probe_runs()
 
     monkeypatch.setattr(bd, "load_sku_context", fake_load_sku_context)
@@ -1144,7 +1144,7 @@ async def test_build_per_sku_report_attaches_optional_strategic_brief(monkeypatc
         ctx["merchant_id"] = merchant_id
         return ctx
 
-    async def fake_load_runs(sku_key: str, merchant_id: str, audit_run_id: str) -> List[Dict[str, Any]]:
+    async def fake_load_runs(sku_key: str, merchant_id: str, audit_run_id: str, include_internal_comparison: bool = False) -> List[Dict[str, Any]]:
         return _bb_lab_probe_runs()
 
     attach_calls: List[Dict[str, Any]] = []
