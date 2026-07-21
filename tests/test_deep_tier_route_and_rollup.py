@@ -147,6 +147,18 @@ def test_rollup_echo_only_competitor_is_insufficient_data_not_defend():
     assert rollup["substitution_rate"] == 0.0
 
 
+def test_echo_detection_is_word_boundary_not_substring():
+    # Brand "Native" hides inside the template word "alternatives" — the run
+    # must stay VOLUNTEERED (a substring match would silently withhold the
+    # competitor's verdict as insufficient_data).
+    run = _cmp_run("best alternatives to GHD", competitors=("GHD",))
+    rollup = build_deep_landscape_rollup(
+        [run], own_brand="Native", title="Native Glow Serum",
+    )
+    assert rollup["volunteered_runs"] == 1
+    assert rollup["contest_map"][0]["verdict"] == "skip"  # not insufficient_data
+
+
 def test_mention_detection_ignores_negations_in_raw_text():
     # HBN pilot failure shape: the probe's raw answer embeds its own analysis
     # ("the brand HBN is not mentioned in the search results") — raw-text
