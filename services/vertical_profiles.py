@@ -593,6 +593,12 @@ class VerticalProfile:
     # Empty for profiles without the config (no prompt change).
     seed_outcome_terms: Tuple[str, ...] = ()
     wedge_incumbent_brands: Tuple[str, ...] = ()
+    # Deep-tier Block F (routine/compatibility — spec 2026-07-21): templates
+    # rendered with {title}/{category} into axis="attribute" probes, ONLY on
+    # deep-tier runs (standard probe sets stay byte-unchanged regardless of
+    # this field). Beauty gets routine-integration shapes, devices get
+    # compat/accessory shapes; empty for profiles without the config.
+    deep_routine_shapes: Tuple[str, ...] = ()
 
 
 BEAUTY_PROFILE = VerticalProfile(
@@ -607,6 +613,11 @@ BEAUTY_PROFILE = VerticalProfile(
     attribute_strategy="lexicon_first",
     evidence_bindings="inci_grounded",
     grounded_coverage_disclosure=None,
+    deep_routine_shapes=(
+        "what order do I apply {category} in a routine",
+        "what should I pair with {title}",
+        "is {title} safe for sensitive skin",
+    ),
 )
 
 # Default for an unknown vertical. Neutral: no beauty head-nouns, no category
@@ -809,6 +820,12 @@ ELECTRONICS_DRONE_PROFILE = VerticalProfile(
     # concerns — "what helps with a vlogging drone" is junk, so drop the
     # problem-framed discovery shape (same rationale as audio).
     problem_framed_prompts=False,
+    # Deep-tier Block F: accessory/compat shapes (spare batteries and parts are
+    # a real drone decision driver; routine shapes are topical junk here).
+    deep_routine_shapes=(
+        "accessories for {title}",
+        "spare batteries for {title}",
+    ),
     evidence_bindings="none",
     grounded_coverage_disclosure=(
         "grounded-evidence dimensions are unavailable for this category"
@@ -926,6 +943,13 @@ BEAUTY_DEVICE_HAIR_PROFILE = VerticalProfile(
         "works abroad with dual voltage",
     ),
     wedge_incumbent_brands=("GHD", "Dyson Airwrap"),
+    # Deep-tier Block F: devices get compat/usage shapes, not topical-routine
+    # ones ("what order do I apply" is topical junk for a flat iron).
+    deep_routine_shapes=(
+        "is {title} safe for daily use",
+        "does {title} work on all hair types",
+        "accessories for {title}",
+    ),
     evidence_bindings="none",
     grounded_coverage_disclosure=(
         "grounded-evidence dimensions are unavailable for this category"

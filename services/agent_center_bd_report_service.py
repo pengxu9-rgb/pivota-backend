@@ -67,6 +67,14 @@ from services.competitor_brand_filter import (
     filter_competitor_brands,
     is_ingredient_or_category_type,
 )
+# Deep-tier blocks (spec 2026-07-21). The source stamp is what carries a deep
+# record's axis into axis_metadata — without it, a comparison-axis record
+# would reach the report with no axis and dodge the internal-first filters.
+from services.deep_tier_prompts import (
+    COMPARISON_AXIS as _COMPARISON_AXIS,
+    run_is_internal_comparison,
+    DEEP_TIER_PROMPT_SOURCE as _DEEP_TIER_PROMPT_SOURCE,
+)
 from services.buyer_path_stable_controllers import (
     stable_buyer_path_controller_hosts,
     stable_buyer_path_controllers_for_row,
@@ -851,6 +859,12 @@ def extract_category_competitors(
         _clean_identity_tuple(merchant_vendors),
     )
     for run in runs or []:
+        # Deep-tier comparison probes NAME a competitor in the question, so
+        # counting their answers here would let the probe set inflate the
+        # merchant-visible category-competitor panel ("best alternatives to X"
+        # guarantees X appears). Organic panels count organic runs only.
+        if _run_is_internal_comparison(run):
+            continue
         parsed = run.get("parsed") or {}
         run_brands = set()
         for raw_brand in parsed.get("competitors_appearing") or []:
@@ -5164,7 +5178,40 @@ async def load_per_sku_probe_runs(
         await resolve_grounding_redirects_in_runs(_flatten_probe_runs(out))
     except Exception as exc:  # noqa: BLE001 — never sink the report build
         logger.warning("grounding redirect unwrap skipped: %s", exc)
-    return out
+    return _merchant_visible_probe_payloads(out)
+
+
+def _merchant_visible_probe_payloads(
+    payloads: List[Dict[str, Any]],
+) -> List[Dict[str, Any]]:
+    """INTERNAL-FIRST (founder 2026-07-21): strip deep-tier comparison runs at
+    the single boundary where report assembly loads probe runs — so every
+    downstream surface (authority map, grounding evidence, citation-score
+    denominators, RunFacts, opportunity, coverage counts) is coherent about
+    the same merchant-visible run set, instead of each surface needing its own
+    gate. The RAW payloads stay untouched in partial_result_jsonb (the loader
+    is read-only; the report phase persists only brand_report), so
+    substitution data accrues from the first deep run and flipping the surface
+    later needs no re-probe. The per-surface gates (_failing_prompts,
+    _query_class_coverage, extract_category_competitors,
+    build_sku_opportunity) stay as defense in depth for callers that hand
+    those functions unloaded run lists. Payload dicts are copied, never
+    mutated, and non-run keys (e.g. the riding prompt_basis_meta) carry over."""
+    filtered: List[Dict[str, Any]] = []
+    for payload in payloads:
+        raw_runs = payload.get("raw_runs") if isinstance(payload, dict) else None
+        if isinstance(raw_runs, list) and any(
+            run_is_internal_comparison(run) for run in raw_runs
+        ):
+            payload = {
+                **payload,
+                "raw_runs": [
+                    run for run in raw_runs
+                    if not run_is_internal_comparison(run)
+                ],
+            }
+        filtered.append(payload)
+    return filtered
 
 
 def _axis_coverage(probe_runs: Any) -> Dict[str, int]:
@@ -5181,12 +5228,20 @@ def _axis_coverage(probe_runs: Any) -> Dict[str, int]:
 # and re-imported at the top of this module.
 
 
+# Internal-first gate for deep-tier comparison probes — shared with
+# sku_opportunity via services.deep_tier_prompts (single definition, no cycle).
+_run_is_internal_comparison = run_is_internal_comparison
+
+
 def _query_class_coverage(probe_runs: Any) -> Dict[str, int]:
     """Probe counts split into branded/navigational vs category/discovery, so
     the report never conflates "found when shoppers name you" with "found when
-    shoppers ask the category question"."""
+    shoppers ask the category question". Comparison-axis probes are excluded:
+    internal-first, and the coarse classifier would miscount them as branded."""
     counts = {QUERY_CLASS_BRANDED: 0, QUERY_CLASS_CATEGORY: 0}
     for run in _flatten_probe_runs(probe_runs):
+        if _run_is_internal_comparison(run):
+            continue
         counts[_run_query_class(run)] += 1
     return counts
 
@@ -6248,6 +6303,11 @@ def _failing_prompts(
     out: List[Dict[str, Any]] = []
     by_query: Dict[str, Dict[str, Any]] = {}
     for run in _flatten_probe_runs(probe_runs):
+        # Internal-first: a failing comparison probe would surface competitor
+        # names in the merchant's failing-prompts list — exactly the prose the
+        # v1 gate exists to hold back.
+        if _run_is_internal_comparison(run):
+            continue
         parsed = run.get("parsed") if isinstance(run.get("parsed"), dict) else {}
         url_match = run.get("url_match") if isinstance(run.get("url_match"), dict) else {}
         llm_report = url_match.get("llm_self_report") if isinstance(url_match.get("llm_self_report"), dict) else {}
@@ -9565,6 +9625,50 @@ def _build_per_sku_base_query_specs(
             (f"buy {title} ({variant_label}) online", "identity"),
         ])
 
+    # Deep tier only (spec 2026-07-21): the market-referential blocks —
+    # comparison/substitution, incumbent contest, price band, market
+    # availability, recency, routine/compat. Standard runs never reach this
+    # (the fanout stashes _audit_tier only on deep runs), so their probe set
+    # stays byte-unchanged. The dedupe below absorbs overlaps with the
+    # challenger-wedge shapes (e.g. the price-band prompt).
+    if str((sku_ctx or {}).get("_audit_tier") or "").strip().lower() == "deep":
+        from services.deep_tier_prompts import build_deep_tier_specs
+
+        # Seeds = prior-run cited-competitor harvest first (evidence-ranked),
+        # topped up from the profile's configured incumbents — so a merchant's
+        # FIRST deep audit (no prior runs) still fires Blocks A/B against the
+        # brands that own the head terms (GHD/Dyson on the VODANA pilot).
+        _deep_seeds = [
+            str(s).strip()
+            for s in ((sku_ctx or {}).get("_deep_competitor_seeds") or [])
+            if str(s or "").strip()
+        ]
+        _seen_seeds = {s.lower() for s in _deep_seeds}
+        for _incumbent in (getattr(profile, "wedge_incumbent_brands", ()) or ()):
+            if len(_deep_seeds) >= 3:
+                break
+            _incumbent = str(_incumbent or "").strip()
+            if _incumbent and _incumbent.lower() not in _seen_seeds:
+                _deep_seeds.append(_incumbent)
+                _seen_seeds.add(_incumbent.lower())
+        deep_specs = build_deep_tier_specs(
+            title=title,
+            category=str(unbranded_category or ""),
+            competitors=_deep_seeds,
+            price_band_usd=_wedge_price_band_usd(sku_ctx or {}),
+            origin_terms=_graph_class_values(attribute_graph, "geography"),
+            market="US",
+            year=datetime.now(timezone.utc).year,
+            routine_shapes=getattr(profile, "deep_routine_shapes", ()) or (),
+        )
+        specs.extend(deep_specs)
+        # Stash for the budgeter: deep blocks must win leftover slots over the
+        # generic template tail (same float the LLM discovery prompts get) and
+        # get their source stamp for observability + axis_metadata emission.
+        sku_ctx["_deep_tier_queries"] = sorted(
+            {q.strip().lower() for q, _axis in deep_specs if q.strip()}
+        )
+
     specs = _dedupe_query_specs(specs)
     return specs, title, str(product_type or unbranded_category or "product")
 
@@ -10148,6 +10252,15 @@ def _build_per_sku_audit_query_records(
         )
         if str(q or "").strip()
     )
+    # Deep-tier blocks share the leftover-slot float: they're the tier's
+    # raison d'être, so they must beat the generic template tail exactly like
+    # the LLM discovery prompts do. Empty set on standard runs (no stash).
+    deep_tier_queries = frozenset(
+        str(q or "").strip().lower()
+        for q in ((sku_ctx or {}).get("_deep_tier_queries") or ())
+        if str(q or "").strip()
+    )
+    llm_prompt_queries = llm_prompt_queries | deep_tier_queries
     if not sidewalk_records:
         records = _fill_per_sku_query_records(
             base_records,
@@ -10209,6 +10322,15 @@ def _build_per_sku_audit_query_records(
                 if "scenario:elicited" not in basis:
                     basis.append("scenario:elicited")
                 record["attribute_basis"] = basis
+    # Deep-tier records: the source stamp is what carries their axis (incl.
+    # the internal-first "comparison") into axis_metadata -> probe payloads ->
+    # report-side filters. LLM stamps above win on the (rare) query collision.
+    if deep_tier_queries:
+        for record in records:
+            if record.get("source"):
+                continue
+            if str(record.get("query") or "").strip().lower() in deep_tier_queries:
+                record["source"] = _DEEP_TIER_PROMPT_SOURCE
     # P0 scenario-coverage metric (scenario-demand plan): how much of the probe
     # budget tests scenario/occasion buy-trigger demand. Baseline was 0.
     scenario_count = sum(
@@ -10253,6 +10375,7 @@ def _query_metadata_from_records(
         is_stamped_prompt = (
             prompt_source in _LLM_PROMPT_SOURCES
             or prompt_source == _MERCHANT_PROMPT_SOURCE
+            or prompt_source == _DEEP_TIER_PROMPT_SOURCE
         )
         if record.get("axis") != "sidewalk" and not is_stamped_prompt:
             continue
@@ -12627,6 +12750,32 @@ async def run_per_sku_audit_probe_fanout(
                 sku_ctx["_prompt_basis_meta"] = _basis["meta"]
             except Exception:  # noqa: BLE001 - never block probing on the LLM step
                 logger.warning("prompt-basis resolution skipped", exc_info=True)
+        # Deep tier: stash the tier + competitor seeds for the spec builder
+        # (Blocks A-F, services/deep_tier_prompts). Seeds load only when the
+        # spec set will actually be rebuilt — a pinned selected set (W2.1)
+        # reprobes verbatim, so the prior-run scan would be wasted DB work.
+        from services.prompt_basis import AUDIT_TIER_DEEP as _TIER_DEEP
+
+        if (
+            str(audit_tier or "").strip().lower() == _TIER_DEEP
+            and isinstance(sku_ctx, dict)
+        ):
+            sku_ctx["_audit_tier"] = _TIER_DEEP
+            if not sku_ctx.get("_pinned_selected_specs"):
+                from services.deep_tier_prompts import load_prior_competitor_brands
+
+                _own_brand = str(
+                    (_get_product(sku_ctx) or {}).get("brand")
+                    or (_get_product(sku_ctx) or {}).get("vendor")
+                    or ""
+                )
+                sku_ctx["_deep_competitor_seeds"] = (
+                    await load_prior_competitor_brands(
+                        merchant_id=str(merchant_id),
+                        sku_key=str(sku_key),
+                        own_brand=_own_brand,
+                    )
+                )
         out[sku_key] = await _probe_per_sku_ctx(
             sku_ctx=sku_ctx,
             merchant_id=str(merchant_id),
