@@ -2291,6 +2291,12 @@ _SHARE_ALLOWED_TOP_KEYS = (
     "methodology",
     "audited_products",
     "report_summary",
+    # Momentum data for the shared view (charts parity with the authed
+    # report): the merchant_url tracking series + the prior run's dimension
+    # medians. Both are built by _shared_momentum_payload, which already
+    # minimizes them (no run ids, no per-SKU series, no merchant id).
+    "visibility_tracking",
+    "prior_brand_dimensions",
 )
 
 # Curated outreach routing is for the MERCHANT, never the open web. These
@@ -2427,6 +2433,77 @@ _SHARE_CACHE_TTL_S = 60.0
 _SHARE_CACHE_MAX = 256
 
 
+async def _shared_momentum_payload(run: Dict[str, Any]) -> Dict[str, Any]:
+    """Momentum data for the PUBLIC shared view — chart parity with the authed
+    report's Momentum card, which the share page can't get from the authed
+    /tracking + /history endpoints.
+
+      visibility_tracking     — the merchant_url tracking series (same builder
+                                as GET /tracking), minimized for the open web:
+                                run_id is nulled on every point (other runs'
+                                ids are not the reader's business), and the
+                                per-SKU mini-series / merchant_id never leave.
+      prior_brand_dimensions  — the immediately-previous completed run's
+                                brand_rollup.dimensions (the dumbbell
+                                baseline). None when this is the first run.
+
+    Best-effort by construction: any failure here returns {} and the share
+    read ships without momentum, never 500s because of it."""
+    try:
+        merchant_id = run.get("merchant_id")
+        if not merchant_id:
+            return {}
+        from db.merchant_audit_runs import score_history_for_merchant
+        from services.audit_tracking_series import build_tracking_series
+
+        rows = await score_history_for_merchant(
+            merchant_id=merchant_id, limit=50, subject_type="merchant_url",
+        )
+        out: Dict[str, Any] = {}
+        series = build_tracking_series(rows)
+        out["visibility_tracking"] = {
+            "points": [
+                {**p, "run_id": None} for p in (series.get("points") or [])
+            ],
+            "basis_changes": series.get("basis_changes") or [],
+            "panel_changes": series.get("panel_changes") or [],
+            "segments": series.get("segments") or [],
+            "is_baseline_only": series.get("is_baseline_only", True),
+        }
+
+        # Prior run = the row immediately before this run in the (oldest-first)
+        # history. When the shared run is older than the 50-run window, fall
+        # back to the newest row strictly older than it — never a newer run.
+        cur_id = run.get("run_id")
+        prior_row = None
+        idx = next(
+            (i for i, r in enumerate(rows) if r.get("run_id") == cur_id), None,
+        )
+        if idx is not None:
+            prior_row = rows[idx - 1] if idx > 0 else None
+        else:
+            cur_at = run.get("requested_at")
+            cur_dt = (
+                datetime.fromisoformat(cur_at) if isinstance(cur_at, str) else None
+            )
+            if cur_dt is not None:
+                older = [
+                    r for r in rows
+                    if r.get("requested_at") and r["requested_at"] < cur_dt
+                ]
+                prior_row = older[-1] if older else None
+        dims = (
+            ((prior_row or {}).get("report_jsonb") or {})
+            .get("brand_rollup", {})
+            .get("dimensions")
+        )
+        out["prior_brand_dimensions"] = dims or None
+        return out
+    except Exception:  # noqa: BLE001 — momentum is additive, never load-bearing
+        logger.warning("shared momentum payload failed", exc_info=True)
+        return {}
+
+
 @public_share_router.get("/audit-share/{token}")
 async def read_shared_audit(token: str) -> Response:
     if not _SHARE_LINKS_ENABLED:
@@ -2461,7 +2538,9 @@ async def read_shared_audit(token: str) -> Response:
     run = await fetch_audit_run_by_id(run_id=row["run_id"])
     if not run or (run.get("status") or "") != "succeeded":
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND)
-    shaped = _redact_shared_report(_shape_url_audit_response(run))
+    shaped = _shape_url_audit_response(run)
+    shaped.update(await _shared_momentum_payload(run))
+    shaped = _redact_shared_report(shaped)
     import json as _json
 
     body = _json.dumps(shaped, default=str).encode()
