@@ -7,6 +7,12 @@ import services.agent_pdp_view_assembler as asm
 import services.audit_index_intake as intake
 import services.catalog_sync_service as css
 import services.index_pipeline_state_service as ips
+# Imported EAGERLY so _wire can patch its module-level upsert_catalog_merchant
+# binding. upsert_audited_sku_to_index imports this module lazily; if the first
+# import happened while css.upsert_catalog_merchant was monkeypatched, the stub
+# leaked into seller_identity's namespace forever — and if it happened in an
+# unpatched test first, the REAL upsert ran here and inflated the execute count.
+import services.seller_identity as seller_identity
 
 
 def _audit_product():
@@ -60,6 +66,7 @@ def _wire(monkeypatch, *, fetch_one, enqueue_spy=None):
     monkeypatch.setattr(asm, "refresh_agent_pdp_view_for_content_key", _fake_refresh)
     monkeypatch.setattr(intake, "enqueue_audit_identity_review", enqueue_spy or _fake_enqueue)
     monkeypatch.setattr(css, "upsert_catalog_merchant", _fake_upsert_merchant)
+    monkeypatch.setattr(seller_identity, "upsert_catalog_merchant", _fake_upsert_merchant)
     monkeypatch.setattr(ips, "recompute_serving_eligibility", _fake_recompute)
     return calls
 

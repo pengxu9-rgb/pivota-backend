@@ -37,6 +37,7 @@ __pycache__/
 
 # local sqlite scratch DB created by some dev scripts
 pivota.db
+pivota_test.db
 *.sqlite
 *.sqlite3
 

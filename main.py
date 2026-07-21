@@ -1210,9 +1210,10 @@ async def startup():
         logger.info("✅ Database connected successfully")
         
         # Ensure all tables exist (important for PostgreSQL)
-        from sqlalchemy import create_engine
-        from db.database import metadata
-        engine = create_engine(str(database.url))
+        # Reuse db.database's sync engine: building one from database.url
+        # picks up the async sqlite driver (sqlite+aiosqlite) and dies with
+        # MissingGreenlet when used synchronously.
+        from db.database import engine, metadata
         metadata.create_all(engine)
         logger.info("✅ All database tables verified/created")
         
@@ -1704,6 +1705,20 @@ async def startup():
         except Exception as migration_err:
             logger.warning(f"⚠️ Migration warning (may be already applied): {migration_err}")
         
+        # Re-run the light schema guard now that ALL tables exist. The first
+        # pass (above) runs before the heavy init creates the remaining
+        # tables — on a fresh sqlite dev/test DB its per-column ALTERs no-op
+        # against tables that don't exist yet, leaving /health failing closed
+        # on missing required columns.
+        try:
+            from db.schema_guard import ensure_required_schema_light
+
+            post_guard_timeout = float(os.getenv("SCHEMA_GUARD_STARTUP_TIMEOUT_S", "12"))
+            await asyncio.wait_for(ensure_required_schema_light(), timeout=post_guard_timeout)
+            logger.info("✅ Schema guard: post-init required columns ensured")
+        except Exception as schema_guard_err:
+            logger.warning(f"Schema guard (post-init) warning: {schema_guard_err}")
+
         # Initialize services if available
         logger.info("🔌 Initializing optional services...")
         logger.info("✅ All services initialized successfully!")
