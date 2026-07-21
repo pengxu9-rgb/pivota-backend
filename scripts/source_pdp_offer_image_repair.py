@@ -137,6 +137,17 @@ VARIANT_TOKENS = {
 }
 
 
+# Pack / count / bundle indicators. VARIANT_TOKENS above covers only shades, so
+# these are checked separately by the opt-in source-superset relaxation to keep
+# a single unit from matching a bundle / multi-count page (or vice-versa).
+PACK_COUNT_TOKENS = {
+    "set", "sets", "bundle", "bundles", "kit", "kits", "pack", "packs",
+    "ea", "pcs", "pc", "box", "boxes", "duo", "trio", "pair", "count", "ct",
+    "sheet", "sheets", "type", "types", "color", "colors", "colour", "colours",
+    "shade", "shades", "edition", "gift", "special", "value",
+}
+
+
 CANDIDATE_QUERY = """
 WITH product_rows AS (
   SELECT
@@ -421,7 +432,13 @@ def _variant_token_set(value: Any, *, brand: Optional[str] = None) -> Set[str]:
     return token_set(value, brand=brand) & VARIANT_TOKENS
 
 
-def title_gate(target_title: Any, extracted_title: Any, *, brand: Optional[str] = None) -> Dict[str, Any]:
+def title_gate(
+    target_title: Any,
+    extracted_title: Any,
+    *,
+    brand: Optional[str] = None,
+    allow_source_superset: bool = False,
+) -> Dict[str, Any]:
     target_tokens = token_set(target_title, brand=brand)
     source_tokens = token_set(extracted_title, brand=brand)
     target_variant_tokens = _variant_token_set(target_title, brand=brand)
@@ -458,7 +475,21 @@ def title_gate(target_title: Any, extracted_title: Any, *, brand: Optional[str] 
             }
 
     source_extra_tokens = source_tokens - target_tokens
-    if source_extra_tokens and not exact:
+    # Opt-in safe-direction relaxation: accept when our title is FULLY contained
+    # in the source (target ⊆ source) and the source's extra tokens are purely
+    # descriptive — no digits and none of the pack/count indicators. This admits
+    # "…Lotion" vs "…Lotion with Birch Sap" (SK feed titles are abbreviated) while
+    # still rejecting single-unit → bundle or cross-count mismatches. Variant
+    # (shade) tokens were already required equal by the check above.
+    safe_superset = (
+        bool(source_extra_tokens)
+        and not exact
+        and allow_source_superset
+        and target_tokens <= source_tokens
+        and not (source_extra_tokens & PACK_COUNT_TOKENS)
+        and not any(ch.isdigit() for tok in source_extra_tokens for ch in tok)
+    )
+    if source_extra_tokens and not exact and not safe_superset:
         return {
             "ok": False,
             "reason": "source_title_extra_tokens",
@@ -469,7 +500,7 @@ def title_gate(target_title: Any, extracted_title: Any, *, brand: Optional[str] 
             "source_extra_tokens": sorted(source_extra_tokens),
         }
 
-    if exact:
+    if exact or safe_superset:
         ok = True
     else:
         ok = containment >= 0.75 and jaccard >= 0.45
@@ -556,10 +587,14 @@ def evaluate_candidate(
     extracted: Dict[str, Any],
     *,
     market: str,
+    allow_source_superset: bool = False,
 ) -> Dict[str, Any]:
     target_title = row.get("apv_title") or row.get("title")
     extracted_title = extracted.get("title") or ""
-    title = title_gate(target_title, extracted_title, brand=row.get("brand"))
+    title = title_gate(
+        target_title, extracted_title, brand=row.get("brand"),
+        allow_source_superset=allow_source_superset,
+    )
     source_url = row.get("canonical_url") or ""
     extracted_canonical = extracted.get("canonical_url") or source_url
     host_ok = same_host_family(source_url, extracted_canonical)
@@ -662,7 +697,9 @@ async def fetch_candidate_rows(
     return [dict(row) for row in rows or []]
 
 
-async def probe_one(row: Dict[str, Any], *, market: str) -> Dict[str, Any]:
+async def probe_one(
+    row: Dict[str, Any], *, market: str, allow_source_superset: bool = False
+) -> Dict[str, Any]:
     url = compact(row.get("canonical_url"))
     base: Dict[str, Any] = {
         "content_key": row.get("content_key"),
@@ -690,7 +727,10 @@ async def probe_one(row: Dict[str, Any], *, market: str) -> Dict[str, Any]:
     return {
         **base,
         "status": "ok",
-        **evaluate_candidate(row, extracted, market=market),
+        **evaluate_candidate(
+            row, extracted, market=market,
+            allow_source_superset=allow_source_superset,
+        ),
         "_row": row,
         "_extracted": extracted,
     }
@@ -915,6 +955,16 @@ def _parse_args(argv: Optional[Iterable[str]] = None) -> argparse.Namespace:
             "or low_quality. Default targets only current no_image/no_price blockers."
         ),
     )
+    parser.add_argument(
+        "--allow-source-superset",
+        action="store_true",
+        help=(
+            "Accept a source page whose title fully CONTAINS our title plus only "
+            "descriptive extra tokens (no digits, no pack/count words) — e.g. an "
+            "abbreviated feed title vs the brand's fuller product name. Shade and "
+            "pack/count mismatches still reject. Default off (strict)."
+        ),
+    )
     parser.add_argument("--apply", action="store_true", help="Write approved repairs. Default is dry-run.")
     parser.add_argument("--output-json", default=None)
     return parser.parse_args(argv)
@@ -934,7 +984,10 @@ async def run(args: argparse.Namespace) -> Dict[str, Any]:
 
         async def guarded(row: Dict[str, Any]) -> Dict[str, Any]:
             async with semaphore:
-                return await probe_one(row, market=args.market)
+                return await probe_one(
+                    row, market=args.market,
+                    allow_source_superset=bool(args.allow_source_superset),
+                )
 
         results = await asyncio.gather(*(guarded(row) for row in rows))
         if args.apply:
