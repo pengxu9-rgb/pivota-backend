@@ -485,10 +485,9 @@ def run_errored(run: Any) -> bool:
     provider lane erroring wholesale otherwise dilutes every mention rate
     (2026-07-21 scale smoke, run 509cf81c — all 143 Gemini runs errored).
 
-    Exported as the canonical predicate; the per-module copies
-    (``audit_run_worker._run_errored``, the god module's ``_run_is_error``,
-    ``deep_tier_prompts._rollup_run_errored``) can consolidate onto this one —
-    this module is a pure leaf they may all import."""
+    The canonical predicate — audit_run_worker, the report service, and
+    deep_tier_prompts all import it from here; this module is a pure leaf
+    they may all import."""
     if not isinstance(run, Mapping):
         return False
     if run.get("error"):

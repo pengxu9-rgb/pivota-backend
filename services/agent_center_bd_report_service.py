@@ -54,6 +54,7 @@ from services.audit_facts import (
     own_url_cited_runs_any,
     parity_check,
     parity_measure,
+    run_errored as _run_is_error,
     query_class_for_axis as _query_class_for_axis,
     run_query_class as _run_query_class,
 )
@@ -4509,19 +4510,6 @@ def _any_provider_probe_runs(
         "provider": "coverage_profile_any",
         "raw_runs": merged_runs,
     }] if merged_runs else []
-
-
-def _run_is_error(run: Any) -> bool:
-    """True when a single grounded run carried an upstream error instead of a
-    real answer. The gateway returns HTTP 200 with the run's `raw` prefixed
-    `__error__:` (e.g. an OpenAI 429 quota error) rather than raising, so these
-    runs must not be mistaken for a real "answered but didn't cite" run."""
-    if not isinstance(run, dict):
-        return False
-    if run.get("error"):
-        return True
-    raw = run.get("raw")
-    return isinstance(raw, str) and raw.startswith("__error__")
 
 
 def _provider_probe_run_health(probes: Any) -> Tuple[int, int]:
