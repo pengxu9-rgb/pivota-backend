@@ -36,6 +36,7 @@ import re
 from typing import Any, Dict, List, Optional
 
 import httpx
+from services import vertex_gemini
 
 logger = logging.getLogger(__name__)
 
@@ -93,8 +94,8 @@ async def _resolve_competitor_domain(
         "generationConfig": {"temperature": 0.0, "maxOutputTokens": 256},
         "tools": [{"google_search": {}}],
     }
-    url = "https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent"
-    headers = {"Content-Type": "application/json", "x-goog-api-key": key}
+    url = vertex_gemini.generate_content_url("gemini-2.5-flash")
+    headers = await vertex_gemini.auth_headers(key)
     try:
         async with httpx.AsyncClient(timeout=timeout_s) as client:
             r = await client.post(url, headers=headers, json=body)

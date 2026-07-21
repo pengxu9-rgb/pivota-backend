@@ -42,6 +42,7 @@ import re
 from typing import Any, Dict, List, Optional
 
 import httpx
+from services import vertex_gemini
 
 
 logger = logging.getLogger("pdp_label_agent")
@@ -429,8 +430,8 @@ async def classify_pdp(
         },
     }
 
-    url = f"{base_url}/models/{model}:generateContent"
-    headers = {"Content-Type": "application/json", "x-goog-api-key": resolved_key}
+    url = vertex_gemini.generate_content_url(model, base_url=base_url)
+    headers = await vertex_gemini.auth_headers(resolved_key)
 
     client_cm = http_client if http_client is not None else httpx.AsyncClient(timeout=timeout_s)
 

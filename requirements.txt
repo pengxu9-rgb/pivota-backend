@@ -22,6 +22,7 @@ python-multipart  # for form data handling
 pypdf>=4.0  # lab-report (PDF) text extraction for evidence intake (pure-Python)
 cryptography  # for JWT and security
 requests  # for HTTP requests (backup to httpx)
+google-auth  # ADC/Workload Identity token minting for Vertex AI (services/vertex_gemini.py)
 bcrypt
 prometheus-client
 boto3

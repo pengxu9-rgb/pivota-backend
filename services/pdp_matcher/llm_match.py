@@ -24,6 +24,7 @@ from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional, Sequence
 
 import httpx
+from services import vertex_gemini
 
 logger = logging.getLogger("pdp_matcher.llm_match")
 
@@ -214,8 +215,8 @@ async def llm_match_seed(
         "contents": [{"role": "user", "parts": [{"text": prompt}]}],
         "generationConfig": {"temperature": 0.0, "maxOutputTokens": 512},
     }
-    url = f"{base_url}/models/{model}:generateContent"
-    headers = {"Content-Type": "application/json", "x-goog-api-key": resolved_key}
+    url = vertex_gemini.generate_content_url(model, base_url=base_url)
+    headers = await vertex_gemini.auth_headers(resolved_key)
 
     async with httpx.AsyncClient(timeout=timeout_s) as client:
         response = await client.post(url, headers=headers, json=request_body)

@@ -12,6 +12,7 @@ from typing import Any, Dict, Mapping, Optional
 import httpx
 
 from config.settings import settings
+from services import vertex_gemini
 
 
 class LLMSynthesisError(RuntimeError):
@@ -47,7 +48,6 @@ _PROVIDER_ALIASES = {
     "google": "gemini",
 }
 _DEFAULT_TIMEOUT_S = 30.0
-_GEMINI_BASE_URL = "https://generativelanguage.googleapis.com/v1beta"
 
 
 def normalize_provider(provider: str) -> str:
@@ -294,12 +294,9 @@ async def _call_gemini_generate_content(
         "contents": [{"role": "user", "parts": [{"text": user}]}],
         "generationConfig": generation_config,
     }
-    headers = {
-        "Content-Type": "application/json",
-        "x-goog-api-key": api_key,
-    }
+    headers = await vertex_gemini.auth_headers(api_key)
     payload = await _post_json(
-        url=f"{_GEMINI_BASE_URL}/models/{model}:generateContent",
+        url=vertex_gemini.generate_content_url(model),
         body=body,
         headers=headers,
         provider="gemini",

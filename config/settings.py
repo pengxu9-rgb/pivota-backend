@@ -278,6 +278,17 @@ class Settings(BaseSettings):
     gemini_synthesis_model: str = os.getenv(
         "GEMINI_SYNTHESIS_MODEL", "gemini-2.5-flash"
     )
+    # Vertex AI cutover — see services/vertex_gemini.py. OFF by default: this
+    # flag redirects every backend Gemini call from the AI Studio endpoint +
+    # GEMINI_API_KEY to Vertex + ADC, so usage bills the GCP project (the point
+    # being the promotional credits). Staged per env because merges to main
+    # auto-deploy prod, and both transports stay live for instant rollback.
+    vertex_ai_enabled: bool = (
+        os.getenv("VERTEX_AI_ENABLED", "false").lower() == "true"
+    )
+    vertex_project_id: str = os.getenv("GOOGLE_CLOUD_PROJECT", "")
+    # "global" is also valid, and carries higher quota than any single region.
+    vertex_location: str = os.getenv("GOOGLE_CLOUD_LOCATION", "us-central1")
     strategic_brief_enabled: bool = (
         os.getenv("STRATEGIC_BRIEF_ENABLED", "false").lower() == "true"
     )

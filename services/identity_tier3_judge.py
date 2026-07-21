@@ -39,6 +39,7 @@ import re
 from typing import Any, Dict, List, Optional, Sequence
 
 import httpx
+from services import vertex_gemini
 
 logger = logging.getLogger("identity_tier3_judge")
 
@@ -168,11 +169,11 @@ def judge_group(
     if not key:
         return None
     prompt = build_judge_prompt(rows)
-    url = f"{base_url}/models/{model}:generateContent"
+    url = vertex_gemini.generate_content_url(model, base_url=base_url)
     try:
         resp = httpx.post(
             url,
-            params={"key": key},
+            headers=vertex_gemini.auth_headers_sync(key),
             json={
                 "contents": [{"parts": [{"text": prompt}]}],
                 "generationConfig": {"temperature": 0.0, "maxOutputTokens": 4096},
