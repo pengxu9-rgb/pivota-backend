@@ -237,54 +237,55 @@ def test_universal_product_sync_allows_admin_cross_tenant(monkeypatch) -> None:
     assert response.json()["merchant_id"] == "merch_b"
 
 
-def test_pending_commissions_rejects_cross_tenant_before_db_read(monkeypatch) -> None:
+# The legacy commission endpoints were retired (non-custodial direction:
+# "legacy commission endpoints retired; use Stage-1 monetization endpoints").
+# They now tombstone with 410 for EVERY caller — merchant, cross-tenant, or
+# admin — and must never reach the commission lookup. These tests pin the
+# tombstone so a resurrected handler (the tenant-scoping bug class fix07
+# guarded against) shows up as a red build.
+
+def test_pending_commissions_retired_returns_410_before_db_read(monkeypatch) -> None:
     client, module = _build_payouts_client(
         {"role": "merchant", "merchant_id": "merch_a"}
     )
 
     async def fail_if_called(*_args, **_kwargs):
-        raise AssertionError("tenant guard should run before commission lookup")
+        raise AssertionError("retired endpoint must not reach the commission lookup")
 
     monkeypatch.setattr(module, "_fetch_unpaid_commission_entries", fail_if_called)
 
     response = client.get("/merchants/merch_b/payouts/pending-commissions")
 
-    assert response.status_code == 403
-    assert response.json()["detail"] == "cannot access another merchant's payouts"
+    assert response.status_code == 410
+    assert response.json()["detail"]["status"] == "gone"
 
 
-def test_generate_from_commissions_rejects_cross_tenant_before_db_read(monkeypatch) -> None:
+def test_generate_from_commissions_retired_returns_410_before_db_read(monkeypatch) -> None:
     client, module = _build_payouts_client(
         {"role": "merchant", "merchant_id": "merch_a"}
     )
 
     async def fail_if_called(*_args, **_kwargs):
-        raise AssertionError("tenant guard should run before commission lookup")
+        raise AssertionError("retired endpoint must not reach the commission lookup")
 
     monkeypatch.setattr(module, "_fetch_unpaid_commission_entries", fail_if_called)
 
     response = client.post("/merchants/merch_b/payouts/generate-from-commissions")
 
-    assert response.status_code == 403
-    assert response.json()["detail"] == "cannot access another merchant's payouts"
+    assert response.status_code == 410
+    assert response.json()["detail"]["status"] == "gone"
 
 
-def test_merchant_payouts_allow_admin_cross_tenant(monkeypatch) -> None:
+def test_merchant_payouts_retired_even_for_admin(monkeypatch) -> None:
     client, module = _build_payouts_client({"role": "admin"})
 
-    async def fake_fetch_unpaid_commission_entries(**_kwargs):
-        return {}
+    async def fail_if_called(*_args, **_kwargs):
+        raise AssertionError("retired endpoint must not reach the commission lookup")
 
-    monkeypatch.setattr(
-        module,
-        "_fetch_unpaid_commission_entries",
-        fake_fetch_unpaid_commission_entries,
-    )
+    monkeypatch.setattr(module, "_fetch_unpaid_commission_entries", fail_if_called)
 
     pending_response = client.get("/merchants/merch_b/payouts/pending-commissions")
     generate_response = client.post("/merchants/merch_b/payouts/generate-from-commissions")
 
-    assert pending_response.status_code == 200
-    assert pending_response.json()["summary"]["unique_agents"] == 0
-    assert generate_response.status_code == 200
-    assert generate_response.json()["payouts_created"] == 0
+    assert pending_response.status_code == 410
+    assert generate_response.status_code == 410

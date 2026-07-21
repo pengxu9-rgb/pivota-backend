@@ -4,9 +4,13 @@ from datetime import datetime, timedelta, timezone
 
 import pytest
 
-from readiness.flags import DEFAULT_ALPHA_MERCHANT_ID
 from readiness.sources import shopify_live
-from readiness.tests.conftest import build_live_shopify_products, build_review_summaries, load_real_merchant_fixture
+from readiness.tests.conftest import (
+    ALPHA_MERCHANT_ID as DEFAULT_ALPHA_MERCHANT_ID,
+    build_live_shopify_products,
+    build_review_summaries,
+    load_real_merchant_fixture,
+)
 
 
 @pytest.mark.asyncio

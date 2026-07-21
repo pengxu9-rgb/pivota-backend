@@ -133,10 +133,19 @@ def _fetch_external_seed_rows_sync(
         where.append("market = :market")
         values["market"] = normalized_market
 
+    # The seed_data recall arms use PostgreSQL JSON path operators (->, #>>)
+    # that sqlite can't parse. The sync path accepts any --database-url, so on
+    # a sqlite connection restrict matching to the inline columns
+    # (url/domain/title) instead of failing the whole audit.
+    columns_only = (
+        getattr(getattr(connection, "dialect", None), "name", "") == "sqlite"
+    )
+
     text_clause, text_values = build_external_seed_text_clause(
         raw_query=query,
-        include_seed_data_text_match=include_seed_data_text_match,
+        include_seed_data_text_match=include_seed_data_text_match and not columns_only,
         param_prefix="q",
+        lean_columns=columns_only,
     )
     if text_clause:
         where.append(text_clause)
@@ -144,8 +153,9 @@ def _fetch_external_seed_rows_sync(
 
     rank_sql, rank_values = build_external_seed_prefer_terms_rank_sql(
         prefer_terms=seed_search_terms(query),
-        include_seed_data_text_match=include_seed_data_text_match,
+        include_seed_data_text_match=include_seed_data_text_match and not columns_only,
         param_prefix="prefer",
+        columns_only=columns_only,
     )
     values.update(rank_values)
     query_sql = text(

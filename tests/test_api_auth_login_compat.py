@@ -55,7 +55,12 @@ async def test_api_auth_login_accepts_legacy_employee_table_when_users_row_missi
     response = await auth.login(auth.LoginRequest(email="reviewer@pivota.com", password=password))
 
     assert response.success is True
-    assert response.user["id"] == "emp_test"
+    # Identity-first contract: user.id is the canonical identity_id. A
+    # legacy-employees-table login with no users/auth_identities rows gets the
+    # synthesized fallback identity ("legacy:<email>"); the employee_id claim
+    # still carries the legacy row's key.
+    assert response.user["id"] == "legacy:reviewer@pivota.com"
+    assert response.user["identity_id"] == "legacy:reviewer@pivota.com"
     assert response.user["employee_id"] == "emp_test"
     assert response.user["role"] == "employee"
 

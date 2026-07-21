@@ -218,7 +218,14 @@ async def test_contract_agent_payments_response_shape(
                 "city": "SF",
                 "state": "CA",
             },
-            "metadata": {},
+            # Quote-first contract: /agent/v1/payments 409s unless the order
+            # was created from a live-validated quote that hasn't expired.
+            "metadata": {
+                "pricing_quote": {
+                    "quote_id": "quote_contract_1",
+                    "live_validation": {"status": "validated"},
+                }
+            },
         }
 
     async def fake_update_payment_info(**kwargs: Any) -> None:
@@ -226,6 +233,11 @@ async def test_contract_agent_payments_response_shape(
 
     async def fake_get_merchant_onboarding(merchant_id: str) -> Dict[str, Any]:
         return {"merchant_id": merchant_id, "psp_connected": True}
+
+    async def fake_get_primary_store(merchant_id: str) -> Dict[str, Any]:
+        # Only the shopify platform resolves to the pivota_direct_quote_first
+        # commerce path that allows public agent PSP creation.
+        return {"merchant_id": merchant_id, "platform": "shopify"}
 
     async def fake_select_psp(self, *, agent_id: str, merchant_id: str, amount: float, currency: str):
         return "stripe", {
@@ -257,6 +269,7 @@ async def test_contract_agent_payments_response_shape(
     monkeypatch.setattr(payment_module, "get_order", fake_get_order)
     monkeypatch.setattr(payment_module, "update_payment_info", fake_update_payment_info)
     monkeypatch.setattr(payment_module, "get_merchant_onboarding", fake_get_merchant_onboarding)
+    monkeypatch.setattr(payment_module, "get_primary_store", fake_get_primary_store)
     monkeypatch.setattr(payment_module.PaymentRoutingService, "select_psp", fake_select_psp)
     monkeypatch.setattr(payment_module, "create_payment_with_failover", fake_create_payment_with_failover)
     monkeypatch.setattr(database_obj, "fetch_one", fake_fetch_one)
@@ -321,11 +334,23 @@ async def test_contract_agent_payments_times_out_with_structured_error(
                 "city": "SF",
                 "state": "CA",
             },
-            "metadata": {},
+            # Quote-first contract: /agent/v1/payments 409s unless the order
+            # was created from a live-validated quote that hasn't expired.
+            "metadata": {
+                "pricing_quote": {
+                    "quote_id": "quote_contract_1",
+                    "live_validation": {"status": "validated"},
+                }
+            },
         }
 
     async def fake_get_merchant_onboarding(merchant_id: str) -> Dict[str, Any]:
         return {"merchant_id": merchant_id, "psp_connected": True}
+
+    async def fake_get_primary_store(merchant_id: str) -> Dict[str, Any]:
+        # Only the shopify platform resolves to the pivota_direct_quote_first
+        # commerce path that allows public agent PSP creation.
+        return {"merchant_id": merchant_id, "platform": "shopify"}
 
     async def fake_select_psp(self, *, agent_id: str, merchant_id: str, amount: float, currency: str):
         return "stripe", {
@@ -352,6 +377,7 @@ async def test_contract_agent_payments_times_out_with_structured_error(
     monkeypatch.setattr(payment_module, "log_agent_request", noop_log_agent_request)
     monkeypatch.setattr(payment_module, "get_order", fake_get_order)
     monkeypatch.setattr(payment_module, "get_merchant_onboarding", fake_get_merchant_onboarding)
+    monkeypatch.setattr(payment_module, "get_primary_store", fake_get_primary_store)
     monkeypatch.setattr(payment_module.PaymentRoutingService, "select_psp", fake_select_psp)
     monkeypatch.setattr(payment_module, "create_payment_with_failover", fake_create_payment_with_failover)
     monkeypatch.setattr(payment_module, "AGENT_PAYMENT_INITIATION_TIMEOUT_SECONDS", 0.01)

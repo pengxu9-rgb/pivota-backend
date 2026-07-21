@@ -12,6 +12,12 @@ sys.path.insert(0, str(_repo_root))
 os.environ.setdefault("DATABASE_URL", "postgresql://postgres:postgres@localhost:5432/pivota_test")
 os.environ.setdefault("READINESS_ALLOW_UNAUTHED_DEV", "true")
 
+# The (retired) alpha test-rig merchant the golden fixtures were captured
+# from. Fixture-only: readiness/flags.py no longer bakes in a default (the
+# runtime-hardcode guard forbids real merchant ids in runtime files); tests
+# set READINESS_ALPHA_MERCHANT_ID to this value explicitly.
+ALPHA_MERCHANT_ID = "merch_efbc46b4619cfbdf"
+
 
 def load_real_merchant_fixture() -> dict:
     fixture_path = _repo_root / "readiness" / "fixtures" / "real_merchant_alpha_shopify.json"

@@ -2,8 +2,6 @@ from __future__ import annotations
 
 import os
 
-DEFAULT_ALPHA_MERCHANT_ID = "merch_efbc46b4619cfbdf"
-
 
 def _env_flag(name: str) -> bool:
     return (os.getenv(name, "").strip().lower() in ("1", "true", "yes", "on"))
@@ -62,4 +60,8 @@ def readiness_return_sync_enabled() -> bool:
 
 
 def readiness_alpha_merchant_id() -> str:
-    return os.getenv("READINESS_ALPHA_MERCHANT_ID", DEFAULT_ALPHA_MERCHANT_ID).strip()
+    # No baked-in default: the original alpha merchant (the merch_efbc test
+    # rig) was retired (#1332), and the runtime-hardcode guard forbids real
+    # merchant ids in runtime files. Unset env → "" → every alpha-gated path
+    # fails closed (callers all check truthiness before comparing).
+    return os.getenv("READINESS_ALPHA_MERCHANT_ID", "").strip()

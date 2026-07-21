@@ -5,8 +5,8 @@ from pathlib import Path
 
 import pytest
 
-from readiness.flags import DEFAULT_ALPHA_MERCHANT_ID
 from readiness.service import build_channel_export, build_readiness_snapshot
+from readiness.tests.conftest import ALPHA_MERCHANT_ID as DEFAULT_ALPHA_MERCHANT_ID
 from readiness.tests.test_routes import _install_live_source_mocks
 
 
