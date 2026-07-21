@@ -7,14 +7,9 @@ query has >=2 significant tokens; byte-identical (no ctok params/clause) otherwi
 
 from __future__ import annotations
 
-import os
 from typing import Any, Dict, List
 
 import pytest
-
-os.environ.setdefault(
-    "DATABASE_URL", "postgresql://postgres:postgres@localhost:5432/postgres"
-)
 
 import services.pivot_query_service as pqs
 

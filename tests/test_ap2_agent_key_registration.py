@@ -11,7 +11,6 @@ existence check, validation rejection, and the writer's SQL (drift guard on the
 """
 import base64
 import json
-import os
 import sys
 from pathlib import Path
 
@@ -24,8 +23,6 @@ from fastapi.testclient import TestClient
 BACKEND_ROOT = Path(__file__).resolve().parents[1]
 if str(BACKEND_ROOT) not in sys.path:
     sys.path.insert(0, str(BACKEND_ROOT))
-
-os.environ.setdefault("DATABASE_URL", "sqlite:///:memory:")
 
 from services.crypto_service import crypto_service  # noqa: E402
 from utils.auth import get_current_employee  # noqa: E402

@@ -1,8 +1,3 @@
-import os
-
-
-os.environ.setdefault("DATABASE_URL", "postgresql://user:pass@localhost:5432/test")
-
 from scripts.check_discount_order_canaries import _audit_order
 
 

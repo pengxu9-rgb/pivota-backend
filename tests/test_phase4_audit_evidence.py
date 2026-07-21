@@ -8,11 +8,7 @@ SQLite — verified against real Postgres in the P4.3+ dual-write flow).
 
 from __future__ import annotations
 
-import os
-
 import pytest
-
-os.environ.setdefault("DATABASE_URL", "sqlite:///:memory:")
 
 
 # =====================================================================

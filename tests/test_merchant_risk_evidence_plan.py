@@ -12,7 +12,6 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
-os.environ.setdefault("DATABASE_URL", "postgresql://postgres:postgres@localhost:5432/postgres")
 os.environ.setdefault("ADMIN_API_KEY", "admin_test_key")
 os.chdir(REPO_ROOT)
 

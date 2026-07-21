@@ -9,12 +9,9 @@ is pure (preview scoring); I/O boundaries are faked.
 
 from __future__ import annotations
 
-import os
 from typing import Any, Dict, List
 
 import pytest
-
-os.environ.setdefault("DATABASE_URL", "sqlite+aiosqlite:///./pivota_test.db")
 
 import scripts.promote_brand_official_canonicals as promote  # noqa: E402
 

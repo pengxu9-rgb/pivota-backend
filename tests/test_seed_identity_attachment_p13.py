@@ -13,12 +13,9 @@ seed lane). Covers:
 
 from __future__ import annotations
 
-import os
 from typing import Any, Dict, List, Optional
 
 import pytest
-
-os.environ.setdefault("DATABASE_URL", "postgresql://user:pass@localhost:5432/testdb")
 
 import services.seed_identity_attachment as sia  # noqa: E402
 

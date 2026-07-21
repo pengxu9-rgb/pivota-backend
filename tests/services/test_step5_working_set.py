@@ -9,10 +9,7 @@ multi-domain residue, and the demo / orphan-mirror exclusions.
 
 from __future__ import annotations
 
-import os
 from typing import Any, Dict
-
-os.environ.setdefault("DATABASE_URL", "postgresql://user:pass@localhost:5432/testdb")
 
 from scripts.step5_working_set import (  # noqa: E402
     build_report,

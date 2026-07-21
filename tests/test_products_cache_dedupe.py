@@ -1,9 +1,3 @@
-import os
-
-
-os.environ.setdefault("DATABASE_URL", "postgresql://user:pass@localhost:5432/testdb")
-
-
 def test_dedupe_cached_products_rows_keeps_first_seen():
     from db.products import _dedupe_cached_products_rows
 

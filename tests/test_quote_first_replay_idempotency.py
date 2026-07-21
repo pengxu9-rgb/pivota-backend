@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import os
 import sys
 from datetime import datetime, timezone
 from decimal import Decimal
@@ -16,11 +15,6 @@ import pytest
 BACKEND_ROOT = Path(__file__).resolve().parents[1]
 if str(BACKEND_ROOT) not in sys.path:
     sys.path.insert(0, str(BACKEND_ROOT))
-
-
-# Many modules import `db.database` at import-time and require DATABASE_URL to be set.
-# Use a placeholder Postgres URL for unit/integration tests that monkeypatch DB calls.
-os.environ.setdefault("DATABASE_URL", "postgresql://postgres:postgres@localhost:5432/postgres")
 
 
 class _TestAgentContext:

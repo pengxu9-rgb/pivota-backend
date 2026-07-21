@@ -26,8 +26,6 @@ from typing import Any, Dict, List
 
 import pytest
 
-os.environ.setdefault("DATABASE_URL", "sqlite:///:memory:")
-
 WORKER_SRC = Path("services/audit_run_worker.py").read_text()
 
 

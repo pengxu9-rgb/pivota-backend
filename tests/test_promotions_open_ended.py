@@ -1,8 +1,5 @@
-import os
 from datetime import datetime, timedelta
 
-
-os.environ.setdefault("DATABASE_URL", "postgresql://user:pass@localhost:5432/test")
 
 from services.promotions_service import PromotionStatus, PromotionUpdate, _compute_status
 

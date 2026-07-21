@@ -6,12 +6,9 @@ against real Stripe — that requires the deployed test-mode canary.
 
 from __future__ import annotations
 
-import os
 from types import SimpleNamespace
 
 import pytest
-
-os.environ.setdefault("DATABASE_URL", "postgresql://user:pass@localhost:5432/testdb")
 
 from services import acp_offsession_capture as cap  # noqa: E402
 

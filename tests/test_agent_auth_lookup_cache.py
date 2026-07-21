@@ -123,6 +123,9 @@ async def test_get_agent_by_key_uses_agent_api_keys_when_present(
     agents_module._clear_auth_key_table_cache()
     monkeypatch.setattr(agents_module, "_AGENT_AUTH_ENABLE_LEGACY_API_KEY_FALLBACK", False)
     monkeypatch.setattr(agents_module, "_AGENT_AUTH_KEY_TABLE_MODE", "auto")
+    # "auto" key-table detection only runs on Postgres; force the flag so the
+    # test doesn't depend on the process-wide DATABASE_URL (fetch_one is faked).
+    monkeypatch.setattr(agents_module, "IS_POSTGRES", True)
 
     api_key = "ak_" + ("d" * 64)
     key_hash = hashlib.sha256(api_key.encode("utf-8")).hexdigest()
@@ -171,6 +174,9 @@ async def test_get_agent_by_key_auto_legacy_when_no_key_table(
     agents_module._clear_auth_key_table_cache()
     monkeypatch.setattr(agents_module, "_AGENT_AUTH_ENABLE_LEGACY_API_KEY_FALLBACK", False)
     monkeypatch.setattr(agents_module, "_AGENT_AUTH_KEY_TABLE_MODE", "auto")
+    # "auto" key-table detection only runs on Postgres; force the flag so the
+    # test doesn't depend on the process-wide DATABASE_URL (fetch_one is faked).
+    monkeypatch.setattr(agents_module, "IS_POSTGRES", True)
 
     calls = {"detect": 0, "legacy": 0}
     api_key = "ak_" + ("e" * 64)

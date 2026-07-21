@@ -1,9 +1,4 @@
-import os
-
 import pytest
-
-
-os.environ.setdefault("DATABASE_URL", "postgresql://user:pass@localhost:5432/testdb")
 
 
 @pytest.mark.asyncio

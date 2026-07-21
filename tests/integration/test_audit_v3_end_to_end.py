@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import asyncio
-import os
 from copy import deepcopy
 from datetime import datetime, timezone
 from decimal import Decimal
@@ -10,8 +9,6 @@ from typing import Any, Dict, List, Optional
 import httpx
 import pytest
 from fastapi import FastAPI
-
-os.environ.setdefault("DATABASE_URL", "postgresql://user:pass@localhost:5432/testdb")
 
 
 _ACTIVE_STAGES = {

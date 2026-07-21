@@ -9,12 +9,9 @@ INERT until the flag flips (P5).
 """
 from __future__ import annotations
 
-import os
 from typing import Any, Dict, List
 
 import pytest
-
-os.environ.setdefault("DATABASE_URL", "sqlite:///:memory:")
 
 
 @pytest.mark.asyncio

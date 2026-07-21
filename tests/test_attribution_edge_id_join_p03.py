@@ -10,12 +10,9 @@ direct-checkout order with no edge would abort the link INSERT.
 
 from __future__ import annotations
 
-import os
 from typing import Any, Dict, Optional
 
 import pytest
-
-os.environ.setdefault("DATABASE_URL", "postgresql://user:pass@localhost:5432/testdb")
 
 import services.commerce_attribution_service as cas  # noqa: E402
 

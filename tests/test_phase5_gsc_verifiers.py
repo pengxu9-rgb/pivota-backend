@@ -9,13 +9,10 @@ post-condition state.
 
 from __future__ import annotations
 
-import os
 from datetime import datetime, timezone
 from typing import Any, Dict, Optional
 
 import pytest
-
-os.environ.setdefault("DATABASE_URL", "sqlite:///:memory:")
 
 
 # =====================================================================

@@ -9,11 +9,7 @@ Covers the routing-gate invariants:
 
 from __future__ import annotations
 
-import os
-
 import pytest
-
-os.environ.setdefault("DATABASE_URL", "postgresql://user:pass@localhost:5432/testdb")
 
 
 # --- protocol matrix --------------------------------------------------------

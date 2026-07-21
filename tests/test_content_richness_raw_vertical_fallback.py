@@ -14,10 +14,6 @@ pointing at the enrichment artifacts.
 
 from __future__ import annotations
 
-import os
-
-os.environ.setdefault("DATABASE_URL", "sqlite:///:memory:")
-
 from services.agent_center_bd_report_service import (  # noqa: E402
     build_synthetic_sku_context,
     compute_content_richness_score,

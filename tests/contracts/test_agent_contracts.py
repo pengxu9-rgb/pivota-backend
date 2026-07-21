@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import asyncio
-import os
 from datetime import datetime, timezone
 from types import SimpleNamespace
 from typing import Any, Dict
@@ -10,8 +9,6 @@ from unittest.mock import AsyncMock
 import httpx
 import pytest
 
-
-os.environ.setdefault("DATABASE_URL", "postgresql://postgres:postgres@localhost:5432/postgres")
 
 from main import app
 

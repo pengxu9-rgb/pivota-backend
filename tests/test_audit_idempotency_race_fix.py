@@ -30,12 +30,9 @@ single-return shim, and the schema_guard self-heal.
 
 from __future__ import annotations
 
-import os
 from typing import Any, Dict, List, Optional
 
 import pytest
-
-os.environ.setdefault("DATABASE_URL", "postgresql://user:pass@localhost:5432/testdb")
 
 
 @pytest.mark.asyncio

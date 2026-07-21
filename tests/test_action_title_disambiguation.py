@@ -4,12 +4,6 @@ canonical PDPs") don't render as N identical-looking rows. Titles that already
 name the product are left alone.
 """
 
-import os
-
-os.environ.setdefault(
-    "DATABASE_URL", "postgresql://postgres:postgres@localhost:5432/postgres"
-)
-
 from services.task_queue_service import _extract_action_items
 
 

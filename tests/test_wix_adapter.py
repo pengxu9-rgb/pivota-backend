@@ -1,13 +1,9 @@
 from __future__ import annotations
 
-import os
 from contextlib import asynccontextmanager
 from typing import Any, Dict
 
 import pytest
-
-
-os.environ.setdefault("DATABASE_URL", "postgresql://user:pass@localhost:5432/testdb")
 
 
 class DummyResponse:

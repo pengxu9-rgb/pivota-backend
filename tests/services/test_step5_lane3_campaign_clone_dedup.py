@@ -2,10 +2,7 @@
 
 from __future__ import annotations
 
-import os
 from typing import Any, Dict, List
-
-os.environ.setdefault("DATABASE_URL", "postgresql://user:pass@localhost:5432/testdb")
 
 from scripts.step5_lane3_campaign_clone_dedup import (  # noqa: E402
     CAMPAIGN_MARKER_RE,

@@ -3,12 +3,9 @@
 from __future__ import annotations
 
 import json
-import os
 from typing import Any, Dict, List, Optional
 
 import pytest
-
-os.environ.setdefault("DATABASE_URL", "postgresql://user:pass@localhost:5432/testdb")
 
 from services.identity_resolution import (  # noqa: E402
     DEACTIVATE_SEEDS_SQL,

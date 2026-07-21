@@ -3,9 +3,6 @@
 from __future__ import annotations
 
 import json
-import os
-
-os.environ.setdefault("DATABASE_URL", "postgresql://user:pass@localhost:5432/testdb")
 
 from services.identity_reconcile_sweep import (  # noqa: E402
     AUTO_APPROVE_STRATEGIES,

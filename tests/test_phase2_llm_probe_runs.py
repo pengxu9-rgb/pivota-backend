@@ -12,13 +12,10 @@ returns no rows for the audit_run_id.
 
 from __future__ import annotations
 
-import os
 from decimal import Decimal
 from typing import Any, Dict, Optional
 
 import pytest
-
-os.environ.setdefault("DATABASE_URL", "sqlite:///:memory:")
 
 
 # =====================================================================

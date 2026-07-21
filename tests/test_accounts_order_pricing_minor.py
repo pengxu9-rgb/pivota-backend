@@ -9,7 +9,6 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
-os.environ.setdefault("DATABASE_URL", "postgresql://postgres:postgres@localhost:5432/postgres")
 os.chdir(REPO_ROOT)
 
 from routes.accounts_orders_api import _extract_order_pricing_minor  # noqa: E402

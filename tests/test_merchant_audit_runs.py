@@ -17,14 +17,10 @@ provider) are out of scope here — covered by tests/test_merchant_audit_routes.
 from __future__ import annotations
 
 import asyncio
-import os
 from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, List
 
 import pytest
-
-# Force SQLite for these tests so we don't need a Postgres connection.
-os.environ.setdefault("DATABASE_URL", "sqlite:///:memory:")
 
 
 # ---------------------------------------------------------------------

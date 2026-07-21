@@ -7,12 +7,9 @@ flow including the retry path.
 
 from __future__ import annotations
 
-import os
 from typing import Any, Dict, List, Optional
 
 import pytest
-
-os.environ.setdefault("DATABASE_URL", "sqlite:///:memory:")
 
 
 # =====================================================================

@@ -18,15 +18,10 @@ wholesale when python-pptx isn't installed, and nothing here needs pptx.
 
 from __future__ import annotations
 
-import os
 from datetime import datetime, timezone
 from typing import Any, Dict
 
 import pytest
-
-os.environ.setdefault(
-    "DATABASE_URL", "postgresql://postgres:postgres@localhost:5432/postgres"
-)
 
 from fastapi import FastAPI
 from fastapi.testclient import TestClient

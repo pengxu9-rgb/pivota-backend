@@ -2,10 +2,6 @@
 
 from __future__ import annotations
 
-import os
-
-os.environ.setdefault("DATABASE_URL", "postgresql://user:pass@localhost:5432/testdb")
-
 from services.identity_tier3_judge import (  # noqa: E402
     CONFIDENCE_FLOOR,
     JUDGE_VERSION,

@@ -7,11 +7,7 @@ conversion event logged, and it must be idempotent on an already-paid order.
 
 from __future__ import annotations
 
-import os
-
 import pytest
-
-os.environ.setdefault("DATABASE_URL", "postgresql://user:pass@localhost:5432/testdb")
 
 
 @pytest.mark.asyncio

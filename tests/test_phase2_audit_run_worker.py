@@ -11,12 +11,9 @@ testing that the WORKER calls the accessors with the right
 
 from __future__ import annotations
 
-import os
 from typing import Any, Dict, List, Optional, Tuple
 
 import pytest
-
-os.environ.setdefault("DATABASE_URL", "sqlite:///:memory:")
 
 
 # =====================================================================

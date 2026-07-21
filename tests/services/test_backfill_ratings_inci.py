@@ -11,9 +11,6 @@ mock of the parser — is what's under test.
 from __future__ import annotations
 
 import json
-import os
-
-os.environ.setdefault("DATABASE_URL", "sqlite+aiosqlite:///./pivota_test.db")
 
 import pytest  # noqa: E402
 

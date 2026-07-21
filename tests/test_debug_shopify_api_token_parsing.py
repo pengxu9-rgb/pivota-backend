@@ -1,11 +1,4 @@
-import os
-
 import pytest
-
-
-# `db.database` requires a PostgreSQL DATABASE_URL at import time.
-# Use a dummy local URL so unit tests can import modules without a real DB.
-os.environ.setdefault("DATABASE_URL", "postgresql://user:pass@localhost:5432/testdb")
 
 
 @pytest.mark.asyncio

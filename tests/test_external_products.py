@@ -1,5 +1,4 @@
 import asyncio
-import os
 import time
 from datetime import datetime, timezone
 from typing import Any, Optional
@@ -10,8 +9,6 @@ from fastapi import BackgroundTasks, HTTPException
 from fastapi.testclient import TestClient
 from starlette.requests import Request
 
-
-os.environ.setdefault("DATABASE_URL", "postgresql://postgres:postgres@localhost:5432/postgres")
 
 from main import app
 

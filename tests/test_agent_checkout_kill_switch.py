@@ -7,11 +7,7 @@ ceiling only opens when submit_payment is explicitly enabled.
 
 from __future__ import annotations
 
-import os
-
 import pytest
-
-os.environ.setdefault("DATABASE_URL", "postgresql://user:pass@localhost:5432/testdb")
 
 from services.agent_checkout_kill_switch import (  # noqa: E402
     GUARDED_PROTOCOLS,

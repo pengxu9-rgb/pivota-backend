@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import asyncio
 import json
-import os
 import sys
 from datetime import datetime, timezone
 from decimal import Decimal
@@ -17,8 +16,6 @@ from fastapi import BackgroundTasks, HTTPException
 BACKEND_ROOT = Path(__file__).resolve().parents[1]
 if str(BACKEND_ROOT) not in sys.path:
     sys.path.insert(0, str(BACKEND_ROOT))
-
-os.environ.setdefault("DATABASE_URL", "postgresql://postgres:postgres@localhost:5432/postgres")
 
 
 CREATED_AT = datetime(2026, 1, 2, 3, 4, 5, tzinfo=timezone.utc)

@@ -28,12 +28,9 @@ public request_sku_indexing surface, rather than faking the whole builder.
 """
 from __future__ import annotations
 
-import os
 from typing import Any, Dict, List, Optional
 
 import pytest
-
-os.environ.setdefault("DATABASE_URL", "sqlite:///:memory:")
 
 from services.audit_index_intake import PLATFORM_URL_AUDIT, stable_source_id
 from services.catalog_sync_service import (

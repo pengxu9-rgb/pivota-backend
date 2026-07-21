@@ -10,12 +10,9 @@ the db.executor_runs accessors, assert what got enqueued.
 
 from __future__ import annotations
 
-import os
 from typing import Any, Dict, List, Optional
 
 import pytest
-
-os.environ.setdefault("DATABASE_URL", "sqlite:///:memory:")
 
 
 # =====================================================================

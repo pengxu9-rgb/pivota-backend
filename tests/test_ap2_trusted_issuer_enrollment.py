@@ -6,7 +6,6 @@ supporting a platform-GLOBAL tier (approve a frontier/app issuer once → covers
 whole agent fleet) and per-agent bindings. Covers auth, scope handling, the
 proof-of-control gate, the agent existence check, revoke, and list.
 """
-import os
 import sys
 from pathlib import Path
 
@@ -17,8 +16,6 @@ from fastapi.testclient import TestClient
 BACKEND_ROOT = Path(__file__).resolve().parents[1]
 if str(BACKEND_ROOT) not in sys.path:
     sys.path.insert(0, str(BACKEND_ROOT))
-
-os.environ.setdefault("DATABASE_URL", "sqlite:///:memory:")
 
 from utils.auth import get_current_employee  # noqa: E402
 

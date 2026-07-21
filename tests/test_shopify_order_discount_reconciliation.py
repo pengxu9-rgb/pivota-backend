@@ -1,8 +1,5 @@
-import os
 from decimal import Decimal
 
-
-os.environ.setdefault("DATABASE_URL", "postgresql://user:pass@localhost:5432/test")
 
 from routes import order_routes
 

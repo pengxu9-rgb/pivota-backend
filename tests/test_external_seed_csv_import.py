@@ -1,12 +1,8 @@
-import os
 from typing import Any, Dict, Optional, Tuple
 from unittest.mock import AsyncMock
 
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
-
-
-os.environ.setdefault("DATABASE_URL", "postgresql://postgres:postgres@localhost:5432/postgres")
 
 
 def test_employee_external_seeds_import_csv_upsert_is_idempotent(monkeypatch) -> None:

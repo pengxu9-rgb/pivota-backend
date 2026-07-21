@@ -1,4 +1,3 @@
-import os
 from unittest.mock import AsyncMock
 
 import pytest
@@ -6,7 +5,6 @@ from fastapi import FastAPI
 from fastapi.testclient import TestClient
 
 
-os.environ.setdefault("DATABASE_URL", "postgresql://postgres:postgres@localhost:5432/postgres")
 from utils.auth import get_current_employee
 
 

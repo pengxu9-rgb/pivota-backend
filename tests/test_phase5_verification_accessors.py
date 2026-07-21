@@ -8,11 +8,7 @@ indexes don't round-trip cleanly on SQLite).
 
 from __future__ import annotations
 
-import os
-
 import pytest
-
-os.environ.setdefault("DATABASE_URL", "sqlite:///:memory:")
 
 
 # =====================================================================

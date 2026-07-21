@@ -9,11 +9,7 @@ in the executor_run_worker integration flow that lands in P3.2).
 
 from __future__ import annotations
 
-import os
-
 import pytest
-
-os.environ.setdefault("DATABASE_URL", "sqlite:///:memory:")
 
 
 # =====================================================================

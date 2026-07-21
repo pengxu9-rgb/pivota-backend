@@ -18,12 +18,9 @@ contract.
 
 from __future__ import annotations
 
-import os
 from typing import Any, Dict, List
 
 import pytest
-
-os.environ.setdefault("DATABASE_URL", "sqlite:///:memory:")
 
 
 # ---------------------------------------------------------------------------
