@@ -28,7 +28,9 @@ one to another is an env change with no code change.
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
+import os
 import threading
 from typing import Dict, Optional
 
@@ -94,9 +96,23 @@ def _load_credentials():
         if _credentials_failed:
             raise VertexAuthError("google credentials previously failed to resolve")
         try:
-            import google.auth
+            # Railway (and anything not on GCP) can only hand us env vars, and
+            # google.auth.default() reads GOOGLE_APPLICATION_CREDENTIALS as a
+            # FILE PATH. Accept the key material inline so a deployment does not
+            # need a bootstrap step that writes it to disk.
+            raw_json = os.getenv("GOOGLE_APPLICATION_CREDENTIALS_JSON", "").strip()
+            if raw_json:
+                from google.oauth2 import service_account
 
-            creds, resolved_project = google.auth.default(scopes=_SCOPES)
+                info = json.loads(raw_json)
+                creds = service_account.Credentials.from_service_account_info(
+                    info, scopes=_SCOPES
+                )
+                resolved_project = info.get("project_id")
+            else:
+                import google.auth
+
+                creds, resolved_project = google.auth.default(scopes=_SCOPES)
         except Exception as exc:  # noqa: BLE001 - surfaced as VertexAuthError
             _credentials_failed = True
             raise VertexAuthError(f"could not resolve ADC: {exc}") from exc
