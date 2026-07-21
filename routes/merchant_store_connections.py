@@ -1298,13 +1298,13 @@ async def shopify_auto_session(body: ShopifyAutoSessionRequest):
         )
 
     onboarding = await database.fetch_one(
-        "SELECT business_name, contact_email FROM merchant_onboarding WHERE merchant_id = :merchant_id",
+        "SELECT business_name FROM merchant_onboarding WHERE merchant_id = :merchant_id",
         {"merchant_id": merchant_id},
     )
     display_name = str((onboarding or {}).get("business_name") or shop_domain)
 
     # Reuse an existing user for this merchant if one is already provisioned;
-    # otherwise create a passwordless one bound to the shop's placeholder contact.
+    # otherwise create a passwordless one.
     existing_user = await database.fetch_one(
         "SELECT id, email, full_name, role FROM users WHERE merchant_id = :merchant_id ORDER BY id ASC LIMIT 1",
         {"merchant_id": merchant_id},
@@ -1314,16 +1314,23 @@ async def shopify_auto_session(body: ShopifyAutoSessionRequest):
         role = str(existing_user.get("role") or "merchant")
         full_name = str(existing_user.get("full_name") or display_name)
     else:
-        email = str(
-            (onboarding or {}).get("contact_email") or f"shopify-install@{shop_domain}"
-        ).strip().lower()
+        # The auto-provisioned identity is ALWAYS a shop-scoped, non-routable
+        # .invalid address (same shape as the shell merchant's placeholder
+        # contact), so it can never collide with a real user's email. We
+        # deliberately do NOT provision under merchant_onboarding.contact_email:
+        # that column can hold a REAL address, and this branch only runs when no
+        # user owns this merchant — so any email collision here is necessarily
+        # with a user belonging to a DIFFERENT merchant. Binding to such a row
+        # would repoint somebody else's account with no authentication.
+        digest = hashlib.sha256(f"shopify:{shop_domain}".encode("utf-8")).hexdigest()[:12]
+        email = f"shopify-install+{digest}@pivota.invalid"
         role = "merchant"
         full_name = display_name
         await database.execute(
             """
             INSERT INTO users (email, password_hash, full_name, role, active, merchant_id)
             VALUES (:email, :password_hash, :full_name, 'merchant', TRUE, :merchant_id)
-            ON CONFLICT (email) DO UPDATE SET merchant_id = EXCLUDED.merchant_id
+            ON CONFLICT (email) DO NOTHING
             """,
             {
                 "email": email,
@@ -1334,6 +1341,26 @@ async def shopify_auto_session(body: ShopifyAutoSessionRequest):
                 "merchant_id": merchant_id,
             },
         )
+        # Never silently repoint an existing account: re-read the row and refuse
+        # if the address is somehow already owned by a different merchant.
+        provisioned = await database.fetch_one(
+            "SELECT full_name, role, merchant_id FROM users WHERE email = :email",
+            {"email": email},
+        )
+        if not provisioned:
+            raise HTTPException(
+                status_code=500, detail="Could not provision the Shopify account"
+            )
+        if str(provisioned.get("merchant_id") or "").strip() != merchant_id:
+            raise HTTPException(
+                status_code=409,
+                detail=(
+                    "This Shopify store is already linked to another Pivota account. "
+                    "Sign in to that account to continue."
+                ),
+            )
+        role = str(provisioned.get("role") or "merchant")
+        full_name = str(provisioned.get("full_name") or display_name)
 
     logger.info(
         "shopify_auto_session merchant=%s shop=%s new_user=%s",
