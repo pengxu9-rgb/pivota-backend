@@ -10320,6 +10320,13 @@ def _build_per_sku_audit_query_records(
         )
         else []
     )
+    # Deep tier: cap the generic filler at 2. The deep budget is BILLED and its
+    # 80 is a ceiling, not a promise — on a thin SKU the standard filler pool
+    # let 7 near-duplicate superlative variants ("top/recommended/best rated
+    # {cat}") pad the billed set (HBN pilot: 14% of probes). Underfill honestly
+    # instead; standard runs keep the full pool byte-unchanged.
+    if str((sku_ctx or {}).get("_audit_tier") or "").strip().lower() == "deep":
+        filler_pool = filler_pool[:2]
     # LLM value-prop prompts (winnable + scenario-elicited): the SPECIFIC,
     # content-grounded discovery queries Gemini generated. They must win the
     # budgeter's leftover slots over the generic category-template tail — see
@@ -12831,18 +12838,24 @@ async def run_per_sku_audit_probe_fanout(
                 sku_ctx["_prompt_basis_meta"] = _basis["meta"]
             except Exception:  # noqa: BLE001 - never block probing on the LLM step
                 logger.warning("prompt-basis resolution skipped", exc_info=True)
-        # Deep tier: stash the tier + competitor seeds for the spec builder
-        # (Blocks A-F, services/deep_tier_prompts). Seeds load only when the
-        # spec set will actually be rebuilt — a pinned selected set (W2.1)
-        # reprobes verbatim, so the prior-run scan would be wasted DB work.
+        # Depth tier: stash the tier + competitor seeds for the spec builder
+        # (Blocks A-F, services/deep_tier_prompts). The stamp is written for
+        # EVERY tier, not just deep: URL-wedge synthetic contexts deliberately
+        # survive reset_sku_context_cache, so a deep audit followed by a
+        # standard audit of the same URL in one process would otherwise reuse
+        # a ctx carrying the stale deep stamp and inject the deep blocks into
+        # a standard run. Seeds load only when the spec set will actually be
+        # rebuilt — a pinned selected set (W2.1) reprobes verbatim, so the
+        # prior-run scan would be wasted DB work.
         from services.prompt_basis import AUDIT_TIER_DEEP as _TIER_DEEP
 
-        if (
-            str(audit_tier or "").strip().lower() == _TIER_DEEP
-            and isinstance(sku_ctx, dict)
-        ):
-            sku_ctx["_audit_tier"] = _TIER_DEEP
-            if not sku_ctx.get("_pinned_selected_specs"):
+        if isinstance(sku_ctx, dict):
+            _run_tier = str(audit_tier or "").strip().lower()
+            sku_ctx["_audit_tier"] = _run_tier or "standard"
+            if _run_tier != _TIER_DEEP:
+                sku_ctx.pop("_deep_competitor_seeds", None)
+                sku_ctx.pop("_deep_tier_queries", None)
+            elif not sku_ctx.get("_pinned_selected_specs"):
                 from services.deep_tier_prompts import load_prior_competitor_brands
 
                 _own_brand = str(

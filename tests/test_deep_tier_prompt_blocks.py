@@ -48,8 +48,10 @@ def test_block_a_comparison_shapes_from_seeds():
     axis_by_query = dict(_full_specs())
     assert axis_by_query["VODANA Triple Flow Iron vs GHD"] == "comparison"
     assert axis_by_query["best alternatives to Dyson Airwrap"] == "comparison"
-    assert axis_by_query["is VODANA Triple Flow Iron better than GHD"] == "comparison"
     assert axis_by_query["cheaper alternative to GHD"] == "comparison"
+    # Pruned as redundant (prompt-quality review): "is X better than c"
+    # measured the same thing as "X vs c", both echo-lane.
+    assert not any("better than" in q for q in axis_by_query)
 
 
 def test_block_b_incumbent_contest_shapes():
@@ -168,6 +170,29 @@ def test_deep_records_stamped_and_carry_axis_metadata():
     entry = metadata[comparison[0]["query"]]
     assert entry["axis"] == "comparison"
     assert entry["prompt_source"] == "deep_tier"
+
+
+_FILLER_HEADS = ("top ", "recommended ", "best rated ", "popular ", "compare ")
+
+
+def test_deep_tier_caps_generic_filler_at_two():
+    # HBN pilot: 7 near-duplicate superlative fillers padded the BILLED deep
+    # set on a thin SKU. Deep underfills honestly instead (cap 2); the
+    # standard path keeps the full pool byte-unchanged.
+    deep_records = m._build_per_sku_audit_query_records(_deep_ctx(), 80)
+    deep_filler = [
+        r["query"] for r in deep_records
+        if any(r["query"].lower().startswith(h) for h in _FILLER_HEADS)
+    ]
+    assert len(deep_filler) <= 2, deep_filler
+
+    standard_ctx = {k: v for k, v in _deep_ctx().items() if not k.startswith("_")}
+    standard_records = m._build_per_sku_audit_query_records(standard_ctx, 80)
+    standard_filler = [
+        r["query"] for r in standard_records
+        if any(r["query"].lower().startswith(h) for h in _FILLER_HEADS)
+    ]
+    assert len(standard_filler) >= 4  # full pool still reachable on standard
 
 
 def test_standard_records_at_40_have_no_deep_stamps():
