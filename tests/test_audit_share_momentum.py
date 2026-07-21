@@ -168,6 +168,26 @@ def test_share_prior_falls_back_to_older_run_when_window_misses(share_env, monke
     assert body["prior_brand_dimensions"] == older_dims
 
 
+def test_share_first_run_has_null_prior(share_env, monkeypatch):
+    # The shared run IS the merchant's first run: no baseline to compare
+    # against — prior_brand_dimensions must be null, never fabricated.
+    import db.merchant_audit_runs as runs_db
+
+    rows = [_history_row("r-1", 15, 45, dims={"identity": {"median": 60}})]
+
+    async def fake_history(**_kw):
+        return rows
+
+    monkeypatch.setattr(runs_db, "score_history_for_merchant", fake_history)
+    client = _share_client(monkeypatch)
+    token = client.post(
+        "/api/merchant-center/audit/url-readiness/r-1/share"
+    ).json()["token"]
+    body = client.get(f"/api/public/audit-share/{token}").json()
+    assert body["prior_brand_dimensions"] is None
+    assert len(body["visibility_tracking"]["points"]) == 1
+
+
 def test_share_public_read_survives_momentum_failure(share_env, monkeypatch):
     import db.merchant_audit_runs as runs_db
 
