@@ -540,6 +540,12 @@ async def _process_one_audit_run_inner(
                         # basis pinning (a deep run never reuses a standard
                         # basis — tier switch = baseline reset).
                         audit_tier=audit_tier,
+                        # Merchant/BD-declared competitors: lead the deep-tier
+                        # anchor list ahead of the answer harvest (sanitized in
+                        # the fanout; inert on standard runs).
+                        declared_competitors=launch_options.get(
+                            "declared_competitors"
+                        ),
                     )
                     await mar.record_partial_result(
                         run_id=run_id,

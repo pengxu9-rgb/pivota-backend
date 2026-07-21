@@ -1140,6 +1140,18 @@ class MerchantUrlAuditRequest(BaseModel):
             "and is rejected (422) when off — never silently downgraded."
         ),
     )
+    declared_competitors: Optional[List[str]] = Field(
+        default=None,
+        max_length=5,
+        description=(
+            "Deep tier only: up to 5 competitor brand names to anchor the "
+            "competitive lane on, ahead of the automatic cited-competitor "
+            "harvest — targets rivals AI answers don't cite yet. Ignored on "
+            "standard runs; sanitized server-side. NOTE: a re-audit replays "
+            "its pinned question set, so newly declared competitors take "
+            "effect only with refresh=true (or on a first deep audit)."
+        ),
+    )
     custom_prompts_by_url: Optional[Dict[str, List[str]]] = Field(
         default=None,
         description=(
@@ -2220,6 +2232,12 @@ async def run_merchant_url_audit(
                     if audit_tier == AUDIT_TIER_DEEP
                     else {"prompts_per_sku": _WEDGE_PROMPTS_PER_SKU}
                 ),
+                # Deep-tier competitive anchors (sanitized again worker-side;
+                # inert on standard runs).
+                "declared_competitors": [
+                    str(c).strip() for c in (body.declared_competitors or [])
+                    if str(c or "").strip()
+                ],
                 "custom_prompts": custom_prompts_clean,
                 # Per-SKU merchant prompts (custom_prompts_by_url re-keyed to
                 # sku_key): probed inside their SKU's context and pinned into
