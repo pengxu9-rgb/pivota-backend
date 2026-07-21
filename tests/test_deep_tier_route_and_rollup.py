@@ -199,6 +199,36 @@ def test_substitution_is_per_run_not_per_query_union():
     assert rollup["substitution_rate"] == 0.0
 
 
+def test_rollup_excludes_upstream_errored_runs_from_all_denominators():
+    # 2026-07-21 scale smoke (run 509cf81c): the entire Gemini lane came back
+    # `__error__:`-prefixed (HTTP 200, no answer). Those runs scored as
+    # "volunteered, not cited, no substitution" and diluted substitution
+    # rates ~2x (serum 0.312 vs the clean-run 0.75). Errored runs are not
+    # evidence and must not sit in ANY denominator — even if a stale `parsed`
+    # payload rides along, nothing in it may count.
+    errored_raw = _cmp_run("problems with GHD", competitors=("GHD",))
+    errored_raw["raw"] = "__error__: 429 RESOURCE_EXHAUSTED"
+    errored_key = _cmp_run("is GHD worth it")
+    errored_key["error"] = "upstream timeout"
+    good = _cmp_run(
+        "problems with GHD", competitors=("GHD",), provider="chatgpt",
+    )
+    rollup = build_deep_landscape_rollup(
+        [errored_raw, errored_key, good], own_brand="BB Lab",
+    )
+    assert rollup["total_comparison_runs"] == 1
+    assert rollup["volunteered_runs"] == 1
+    assert rollup["substitution_runs"] == 1
+    assert rollup["substitution_rate"] == 1.0
+    row = rollup["contest_map"][0]
+    assert row["competitor"] == "GHD"
+    assert row["volunteered_runs"] == 1  # errored runs never reach the map
+    # A comparison set that errored WHOLESALE is no data, not 0% substitution.
+    assert build_deep_landscape_rollup(
+        [errored_raw, errored_key], own_brand="BB Lab",
+    ) is None
+
+
 def test_rollup_contest_verdict_partial_is_contest():
     runs = [
         _cmp_run("is GHD worth it", merchant=True, competitors=("GHD",)),
