@@ -39,6 +39,8 @@ import traceback
 import uuid
 from typing import Any, Dict, List, Optional
 
+from services.audit_facts import run_errored
+
 logger = logging.getLogger(__name__)
 
 
@@ -121,19 +123,6 @@ async def process_one_audit_run() -> bool:
         )
 
 
-def _run_errored(run: Any) -> bool:
-    """True when a grounded run carried an upstream error instead of an answer.
-    The gateway returns HTTP 200 with `raw` prefixed `__error__:` (e.g. an
-    OpenAI 429 quota error) rather than raising, so such a run is NOT real
-    grounded evidence."""
-    if not isinstance(run, dict):
-        return False
-    if run.get("error"):
-        return True
-    raw = run.get("raw")
-    return isinstance(raw, str) and raw.startswith("__error__")
-
-
 def _all_per_sku_probes_failed(
     probe_runs_by_sku: Dict[str, Any],
 ) -> bool:
@@ -175,7 +164,7 @@ def _all_per_sku_probes_failed(
             else:
                 # Older gateway response without per-run health: infer from the
                 # `__error__:` markers on the raw runs themselves.
-                ok = sum(1 for r in raw_runs if not _run_errored(r))
+                ok = sum(1 for r in raw_runs if not run_errored(r))
                 total_success_runs += ok
                 if raw_runs and ok == 0:
                     saw_failure = True

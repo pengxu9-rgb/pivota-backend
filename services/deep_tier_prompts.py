@@ -35,6 +35,7 @@ import re
 from collections import Counter
 from typing import Any, Dict, List, Mapping, Optional, Sequence, Tuple
 
+from services.audit_facts import run_errored
 from services.prompt_basis import subject_type_for_sku_key
 
 logger = logging.getLogger(__name__)
@@ -261,22 +262,6 @@ _ROLLUP_MAX_QUERY_ROWS = 40
 _ROLLUP_MAX_COMPETITORS = 10
 
 
-def _rollup_run_errored(run: Mapping[str, Any]) -> bool:
-    """True when a probe run carried an upstream error instead of an answer —
-    the gateway returns HTTP 200 with `raw` prefixed `__error__:` (e.g. a 429
-    quota error) rather than raising. Such a run is not evidence in EITHER
-    direction, so it must not sit in any rollup denominator: the 2026-07-21
-    scale smoke lost its whole Gemini lane to errors and the not-cited zeros
-    diluted substitution rates ~2x. Mirrors audit_run_worker._run_errored
-    (imported would drag the worker's stack into this pure prompt module)."""
-    if not isinstance(run, Mapping):
-        return False
-    if run.get("error"):
-        return True
-    raw = run.get("raw")
-    return isinstance(raw, str) and raw.startswith("__error__")
-
-
 def _run_mentions_merchant(
     run: Mapping[str, Any],
     own_brand: str,
@@ -383,7 +368,7 @@ def build_deep_landscape_rollup(
     0%-substitution rollup."""
     comparison_runs = [
         run for run in (runs or [])
-        if run_is_internal_comparison(run) and not _rollup_run_errored(run)
+        if run_is_internal_comparison(run) and not run_errored(run)
     ]
     if not comparison_runs:
         return None
