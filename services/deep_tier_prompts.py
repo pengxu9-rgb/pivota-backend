@@ -261,6 +261,22 @@ _ROLLUP_MAX_QUERY_ROWS = 40
 _ROLLUP_MAX_COMPETITORS = 10
 
 
+def _rollup_run_errored(run: Mapping[str, Any]) -> bool:
+    """True when a probe run carried an upstream error instead of an answer —
+    the gateway returns HTTP 200 with `raw` prefixed `__error__:` (e.g. a 429
+    quota error) rather than raising. Such a run is not evidence in EITHER
+    direction, so it must not sit in any rollup denominator: the 2026-07-21
+    scale smoke lost its whole Gemini lane to errors and the not-cited zeros
+    diluted substitution rates ~2x. Mirrors audit_run_worker._run_errored
+    (imported would drag the worker's stack into this pure prompt module)."""
+    if not isinstance(run, Mapping):
+        return False
+    if run.get("error"):
+        return True
+    raw = run.get("raw")
+    return isinstance(raw, str) and raw.startswith("__error__")
+
+
 def _run_mentions_merchant(
     run: Mapping[str, Any],
     own_brand: str,
@@ -357,9 +373,17 @@ def build_deep_landscape_rollup(
     INTERNAL-FIRST: the output names competitors, so it must only ever be
     stored under the `deep_landscape_internal` key, which the merchant-response
     sanitizer strips. Verdict rule per anchored competitor (volunteered lane):
-    merchant cited >=50% -> defend; >0 -> contest; 0 -> skip."""
+    merchant cited >=50% -> defend; >0 -> contest; 0 -> skip.
+
+    Upstream-errored runs (`__error__:`-prefixed raw / `error` key) are
+    excluded from every count: they're not evidence in either direction, and a
+    provider lane erroring wholesale otherwise halves the substitution rate
+    (2026-07-21 scale smoke, run 509cf81c: serum 0.312 vs the clean 0.75).
+    A run set whose comparison runs ALL errored yields None — no data, not a
+    0%-substitution rollup."""
     comparison_runs = [
-        run for run in (runs or []) if run_is_internal_comparison(run)
+        run for run in (runs or [])
+        if run_is_internal_comparison(run) and not _rollup_run_errored(run)
     ]
     if not comparison_runs:
         return None
