@@ -41,6 +41,9 @@ pivota_test.db
 *.sqlite
 *.sqlite3
 
+# mvp.events file-sink fallback (sqlite/dev runs append to cwd)
+mvp_events.jsonl
+
 # vercel
 .vercel
 
