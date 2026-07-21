@@ -203,6 +203,13 @@ async def check_required_schema() -> Dict[str, List[str]]:
             elif IS_SQLITE:
                 # PRAGMA table_info returns columns: cid, name, type, notnull, dflt_value, pk
                 rows = await database.fetch_all(f"PRAGMA table_info({spec.table});")
+                if not rows:
+                    # Table absent entirely. On sqlite (dev/test only) that
+                    # means the feature was never exercised locally — several
+                    # required tables are created by Postgres migrations that
+                    # never run on sqlite. Only column gaps on EXISTING tables
+                    # are drift here; prod (Postgres) keeps the strict check.
+                    continue
                 present = {str(r["name"]) for r in rows}  # type: ignore[index]
             else:
                 present = set()
@@ -1552,44 +1559,32 @@ async def ensure_required_schema_light() -> None:
             return
 
         if IS_SQLITE:
-            missing = await check_required_schema()
-            orders_missing = set(missing.get("orders") or [])
-            for col in sorted(orders_missing):
-                try:
-                    await database.execute(text(f"ALTER TABLE orders ADD COLUMN {col} TEXT;"))
-                except Exception:
-                    # Ignore duplicate-column / unsupported variations.
-                    continue
-            psp_missing = set(missing.get("merchant_psps") or [])
+            # Self-heal EVERY table in REQUIRED_SCHEMA, not a hardcoded subset:
+            # /health fails closed on any missing required column, so a spec
+            # entry without a matching heal here leaves a fresh sqlite dev/test
+            # DB permanently unhealthy (503).
             sqlite_type = {
-                "provider_config": "TEXT",
-                "last_validated_at": "TEXT",
+                ("merchant_stores", "is_primary"): "BOOLEAN DEFAULT FALSE",
+                ("merchant_stores", "order_writeback_status"): "TEXT DEFAULT 'disabled'",
+                ("catalog_merchants", "indexable"): "BOOLEAN DEFAULT FALSE",
+                ("merchant_credit_balance", "purchased_credits"): "NUMERIC DEFAULT 0",
+                ("merchant_credit_balance", "overage_pending_credits"): "NUMERIC DEFAULT 0",
+                ("merchant_credit_balance", "overage_charged_credits"): "NUMERIC DEFAULT 0",
+                ("merchant_credit_balance", "overage_blocked_until_payment"): "BOOLEAN DEFAULT FALSE",
             }
-            for col in sorted(psp_missing):
-                try:
-                    await database.execute(
-                        text(
-                            f"ALTER TABLE merchant_psps ADD COLUMN {col} "
-                            f"{sqlite_type.get(col, 'TEXT')};"
+            missing = await check_required_schema()
+            for table, cols in missing.items():
+                for col in sorted(cols or []):
+                    try:
+                        await database.execute(
+                            text(
+                                f"ALTER TABLE {table} ADD COLUMN {col} "
+                                f"{sqlite_type.get((table, col), 'TEXT')};"
+                            )
                         )
-                    )
-                except Exception:
-                    continue
-            store_missing = set(missing.get("merchant_stores") or [])
-            store_sqlite_type = {
-                "is_primary": "BOOLEAN DEFAULT FALSE",
-                "order_writeback_status": "TEXT DEFAULT 'disabled'",
-            }
-            for col in sorted(store_missing):
-                try:
-                    await database.execute(
-                        text(
-                            f"ALTER TABLE merchant_stores ADD COLUMN {col} "
-                            f"{store_sqlite_type.get(col, 'TEXT')};"
-                        )
-                    )
-                except Exception:
-                    continue
+                    except Exception:
+                        # Ignore duplicate-column / unsupported variations.
+                        continue
             return
     except Exception:
         # Best-effort only; callers should not depend on this always succeeding.

@@ -28,6 +28,67 @@ from services.pdp_governance_service import (
 from utils.auth import get_current_employee, get_current_user
 
 
+async def _ensure_product_group_members_schema():
+    """Create product_group_members, then backstop columns other test modules
+    omit — with a shared test DB their CREATE TABLE IF NOT EXISTS may win with
+    a narrower shape (e.g. test_index_pipeline_state_service has no
+    is_primary/updated_at)."""
+    await database.execute(
+        """
+        CREATE TABLE IF NOT EXISTS product_group_members (
+          product_group_id TEXT,
+          merchant_id TEXT,
+          platform TEXT,
+          platform_product_id TEXT,
+          is_primary BOOLEAN DEFAULT FALSE,
+          updated_at DATETIME DEFAULT CURRENT_TIMESTAMP
+        )
+        """
+    )
+    for ddl in [
+        "ALTER TABLE product_group_members ADD COLUMN is_primary BOOLEAN DEFAULT FALSE",
+        "ALTER TABLE product_group_members ADD COLUMN updated_at DATETIME",
+    ]:
+        try:
+            await database.execute(ddl)
+        except Exception:
+            pass
+
+
+async def _ensure_external_product_seeds_schema():
+    """Same backstop pattern for external_product_seeds: another module's
+    narrower CREATE TABLE IF NOT EXISTS may win in the shared test DB, and the
+    hydration query orders by created_at."""
+    await database.execute(
+        """
+        CREATE TABLE IF NOT EXISTS external_product_seeds (
+          id TEXT PRIMARY KEY,
+          external_product_id TEXT NULL,
+          market TEXT NOT NULL,
+          tool TEXT DEFAULT '*',
+          destination_url TEXT,
+          canonical_url TEXT NULL,
+          domain TEXT NULL,
+          title TEXT NULL,
+          image_url TEXT NULL,
+          status TEXT DEFAULT 'active',
+          created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+          updated_at DATETIME DEFAULT CURRENT_TIMESTAMP
+        )
+        """
+    )
+    for ddl in [
+        "ALTER TABLE external_product_seeds ADD COLUMN tool TEXT DEFAULT '*'",
+        "ALTER TABLE external_product_seeds ADD COLUMN image_url TEXT",
+        "ALTER TABLE external_product_seeds ADD COLUMN created_at DATETIME",
+        "ALTER TABLE external_product_seeds ADD COLUMN updated_at DATETIME",
+    ]:
+        try:
+            await database.execute(ddl)
+        except Exception:
+            pass
+
+
 def _employee_user(role: str = "admin"):
     return {
         "sub": "employee-test",
@@ -429,18 +490,7 @@ async def test_hydration_indexes_grouped_ungrouped_and_external_subjects():
     if not database.is_connected:
         await database.connect()
     try:
-        await database.execute(
-            """
-            CREATE TABLE IF NOT EXISTS product_group_members (
-              product_group_id TEXT,
-              merchant_id TEXT,
-              platform TEXT,
-              platform_product_id TEXT,
-              is_primary BOOLEAN DEFAULT FALSE,
-              updated_at DATETIME DEFAULT CURRENT_TIMESTAMP
-            )
-            """
-        )
+        await _ensure_product_group_members_schema()
         await database.execute(
             """
             CREATE TABLE IF NOT EXISTS products_cache (
@@ -484,24 +534,7 @@ async def test_hydration_indexes_grouped_ungrouped_and_external_subjects():
             )
             """
         )
-        await database.execute(
-            """
-            CREATE TABLE IF NOT EXISTS external_product_seeds (
-              id TEXT PRIMARY KEY,
-              external_product_id TEXT NULL,
-              market TEXT NOT NULL,
-              tool TEXT DEFAULT '*',
-              destination_url TEXT,
-              canonical_url TEXT NULL,
-              domain TEXT NULL,
-              title TEXT NULL,
-              image_url TEXT NULL,
-              status TEXT DEFAULT 'active',
-              created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
-              updated_at DATETIME DEFAULT CURRENT_TIMESTAMP
-            )
-            """
-        )
+        await _ensure_external_product_seeds_schema()
         await database.execute("DELETE FROM product_group_members WHERE merchant_id = 'hydrate-merchant'")
         await database.execute("DELETE FROM products_cache WHERE merchant_id = 'hydrate-merchant'")
         await database.execute("DELETE FROM canonical_products WHERE merchant_id = 'hydrate-merchant'")
@@ -527,15 +560,25 @@ async def test_hydration_indexes_grouped_ungrouped_and_external_subjects():
             """,
             {"ungrouped_payload": json.dumps({"title": "Ungrouped Hydration Product"})},
         )
+        # The app-boot metadata shape of canonical_products (db/canonical_commerce.py)
+        # has NOT NULL source_payload_hash; the local CREATE above does not. Insert
+        # column-adaptively so the test works against whichever shape won the
+        # shared test DB.
+        canonical_cols = {
+            str(dict(row).get("name"))
+            for row in await database.fetch_all("PRAGMA table_info(canonical_products)")
+        }
+        extra_col = ", source_payload_hash" if "source_payload_hash" in canonical_cols else ""
+        extra_val = ", 'test-hash'" if extra_col else ""
         await database.execute(
-            """
+            f"""
             INSERT INTO canonical_products (
               canonical_product_id, merchant_id, platform, platform_product_id, title,
-              standard_product_data, expires_at
+              standard_product_data, expires_at{extra_col}
             )
             VALUES (
               'canonical-hydrate-1', 'hydrate-merchant', 'shopify', 'canonical-product',
-              'Canonical Hydration Product', :canonical_payload, '2999-01-01 00:00:00'
+              'Canonical Hydration Product', :canonical_payload, '2999-01-01 00:00:00'{extra_val}
             )
             """,
             {"canonical_payload": json.dumps({"title": "Canonical Hydration Product"})},
@@ -574,18 +617,7 @@ async def test_offer_reconciliation_counts_only_live_internal_seller_offers():
     if not database.is_connected:
         await database.connect()
     try:
-        await database.execute(
-            """
-            CREATE TABLE IF NOT EXISTS product_group_members (
-              product_group_id TEXT,
-              merchant_id TEXT,
-              platform TEXT,
-              platform_product_id TEXT,
-              is_primary BOOLEAN DEFAULT FALSE,
-              updated_at DATETIME DEFAULT CURRENT_TIMESTAMP
-            )
-            """
-        )
+        await _ensure_product_group_members_schema()
         await database.execute(
             """
             CREATE TABLE IF NOT EXISTS products_cache (
@@ -613,24 +645,7 @@ async def test_offer_reconciliation_counts_only_live_internal_seller_offers():
                 await database.execute(ddl)
             except Exception:
                 pass
-        await database.execute(
-            """
-            CREATE TABLE IF NOT EXISTS external_product_seeds (
-              id TEXT PRIMARY KEY,
-              external_product_id TEXT NULL,
-              market TEXT NOT NULL,
-              tool TEXT DEFAULT '*',
-              destination_url TEXT,
-              canonical_url TEXT NULL,
-              domain TEXT NULL,
-              title TEXT NULL,
-              image_url TEXT NULL,
-              status TEXT DEFAULT 'active',
-              created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
-              updated_at DATETIME DEFAULT CURRENT_TIMESTAMP
-            )
-            """
-        )
+        await _ensure_external_product_seeds_schema()
         await database.execute("DELETE FROM product_group_members WHERE product_group_id = 'pg_offer_live_only'")
         await database.execute("DELETE FROM products_cache WHERE merchant_id IN ('stale-offer-merchant', 'live-offer-merchant')")
 
@@ -684,18 +699,7 @@ async def test_offer_reconciliation_exposes_identity_signals_without_blocking_ca
     if not database.is_connected:
         await database.connect()
     try:
-        await database.execute(
-            """
-            CREATE TABLE IF NOT EXISTS product_group_members (
-              product_group_id TEXT,
-              merchant_id TEXT,
-              platform TEXT,
-              platform_product_id TEXT,
-              is_primary BOOLEAN DEFAULT FALSE,
-              updated_at DATETIME DEFAULT CURRENT_TIMESTAMP
-            )
-            """
-        )
+        await _ensure_product_group_members_schema()
         await database.execute(
             """
             CREATE TABLE IF NOT EXISTS products_cache (
@@ -781,18 +785,7 @@ async def test_identity_audit_job_creates_non_blocking_identity_review_task():
     if not database.is_connected:
         await database.connect()
     try:
-        await database.execute(
-            """
-            CREATE TABLE IF NOT EXISTS product_group_members (
-              product_group_id TEXT,
-              merchant_id TEXT,
-              platform TEXT,
-              platform_product_id TEXT,
-              is_primary BOOLEAN DEFAULT FALSE,
-              updated_at DATETIME DEFAULT CURRENT_TIMESTAMP
-            )
-            """
-        )
+        await _ensure_product_group_members_schema()
         await database.execute(
             """
             CREATE TABLE IF NOT EXISTS products_cache (
@@ -925,18 +918,7 @@ async def test_senior_product_group_correction_replaces_wrong_confirmed_seller()
     if not database.is_connected:
         await database.connect()
     try:
-        await database.execute(
-            """
-            CREATE TABLE IF NOT EXISTS product_group_members (
-              product_group_id TEXT,
-              merchant_id TEXT,
-              platform TEXT,
-              platform_product_id TEXT,
-              is_primary BOOLEAN DEFAULT FALSE,
-              updated_at DATETIME DEFAULT CURRENT_TIMESTAMP
-            )
-            """
-        )
+        await _ensure_product_group_members_schema()
         await database.execute(
             """
             CREATE TABLE IF NOT EXISTS products_cache (

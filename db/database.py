@@ -81,12 +81,19 @@ else:
     # so metadata.create_all does not fail.
     try:
         from sqlalchemy.dialects.postgresql import JSONB as _PG_JSONB  # type: ignore
+        from sqlalchemy.dialects.postgresql import UUID as _PG_UUID  # type: ignore
         from sqlalchemy.sql.sqltypes import ARRAY as _SA_ARRAY  # type: ignore
         from sqlalchemy.ext.compiler import compiles  # type: ignore
 
         @compiles(_PG_JSONB, "sqlite")  # type: ignore[misc]
         def _compile_jsonb_sqlite(_type, _compiler, **_kw):  # type: ignore[no-untyped-def]
             return "JSON"
+
+        # Some tables declare Postgres UUID columns (e.g. merchant_audit_runs.run_id).
+        # SQLite has no UUID type; store as text so metadata.create_all does not fail.
+        @compiles(_PG_UUID, "sqlite")  # type: ignore[misc]
+        def _compile_uuid_sqlite(_type, _compiler, **_kw):  # type: ignore[no-untyped-def]
+            return "CHAR(36)"
 
         # Some tables declare ARRAY columns (Postgres-only). For local SQLite dev,
         # compile ARRAY as JSON so metadata.create_all does not fail.
