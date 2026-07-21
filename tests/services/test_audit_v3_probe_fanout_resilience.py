@@ -188,27 +188,34 @@ async def test_refresh_prompt_basis_threads_to_resolver(monkeypatch) -> None:
     exactly as before."""
     _install(monkeypatch, fail_on=set())
     captured: List[bool] = []
+    captured_tiers: List[str] = []
 
     async def _fake_resolve(*, merchant_id, sku_key, generate_winnable,
-                            generate_scenario, refresh=False):
+                            generate_scenario, refresh=False,
+                            audit_tier="standard"):
         captured.append(refresh)
+        captured_tiers.append(audit_tier)
         return {"winnable": [], "scenario": [], "selected_specs": [], "meta": {}}
 
     # resolve_prompt_basis is imported inside the fan-out at call time.
     monkeypatch.setattr("services.prompt_basis.resolve_prompt_basis", _fake_resolve)
 
-    async def _run_with(refresh_flag: bool):
+    async def _run_with(refresh_flag: bool, **fanout_kwargs):
         captured.clear()
+        captured_tiers.clear()
         await bd.run_per_sku_audit_probe_fanout(
             merchant_id=MERCHANT, audit_run_id="r",
             products=[{"product_key": "p1"}], coverage_profile="pilot_gemini",
             prompts_per_sku=PROMPTS, winnable_prompts=True,
-            refresh_prompt_basis=refresh_flag,
+            refresh_prompt_basis=refresh_flag, **fanout_kwargs,
         )
         return captured[:]
 
     assert await _run_with(False) == [False], "default must pin (refresh=False)"
+    assert captured_tiers == ["standard"], "tier default must stay standard"
     assert await _run_with(True) == [True], "refresh must thread through to the resolver"
+    await _run_with(False, audit_tier="deep")
+    assert captured_tiers == ["deep"], "audit_tier must thread through to the resolver"
 
 
 async def test_fanout_matches_shared_probe_per_sku_ctx(monkeypatch) -> None:

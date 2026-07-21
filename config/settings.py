@@ -254,6 +254,14 @@ class Settings(BaseSettings):
     prompt_gen_enabled: bool = (
         os.getenv("AUDIT_LLM_PROMPT_GEN_ENABLED", "true").lower() == "true"
     )
+    # Deep Landscape Scan tier (~80 prompts/SKU/provider vs standard 40) — OFF
+    # by default: it's a 2× probe multiplier on runs already near the lease
+    # limit, so it stays dark until the staging load test + VODANA pilot pass
+    # (deep-tier spec 2026-07-21). With the flag off, a deep launch option
+    # falls back to a standard run rather than failing.
+    audit_deep_tier_enabled: bool = (
+        os.getenv("AUDIT_DEEP_TIER_ENABLED", "false").lower() == "true"
+    )
     # Default generator = Gemini Flash (founder call 2026-07-03): stronger
     # Korean + more consistent output language than deepseek on K-beauty PDPs,
     # cheap, and the key is already provisioned (content-brief agent). When the
