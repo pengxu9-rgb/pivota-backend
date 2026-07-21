@@ -12491,6 +12491,7 @@ async def run_per_sku_audit_probe_fanout(
     custom_prompts_by_sku: Optional[Mapping[str, List[str]]] = None,
     winnable_prompts: bool = False,
     refresh_prompt_basis: bool = False,
+    audit_tier: str = "standard",
 ) -> Dict[str, List[Dict[str, Any]]]:
     """Run and shape v3 per-SKU citation probes before report assembly.
 
@@ -12611,6 +12612,10 @@ async def run_per_sku_audit_probe_fanout(
                     # reflect newly-grounded attributes in the probed query set,
                     # rather than reuse the frozen pre-change basis).
                     refresh=refresh_prompt_basis,
+                    # Tier scopes pinning: only a same-tier prior basis is
+                    # reused, and the tier's list cap decides how much of the
+                    # LLM discovery lists survives (standard 12, deep 18).
+                    audit_tier=audit_tier,
                 )
                 sku_ctx["_winnable_prompts"] = _basis["winnable"]
                 sku_ctx["_scenario_elicited"] = _basis["scenario"]

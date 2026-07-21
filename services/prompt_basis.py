@@ -58,13 +58,41 @@ PROMPT_BASIS_VERSION = 3
 
 _MAX_PROMPTS_PER_LIST = 12
 _MAX_PROMPT_CHARS = 300
-# The probe budget per SKU is small (wedge 14, readiness 40). Cap generously so
-# a pinned set can never bloat the stored report, and drop malformed records.
-_MAX_SELECTED_SPECS = 64
+# Probe budget per SKU: wedge 14, standard readiness 40, deep landscape 80. Cap
+# above the deepest tier (80 + headroom) so a pinned set can never bloat the
+# stored report, and drop malformed records. At 64 a deep-tier selected set
+# would silently truncate and the re-pinned basis would drift from what was
+# actually probed.
+_MAX_SELECTED_SPECS = 96
 # Record keys worth preserving on a pinned spec — enough to reprobe identically
 # AND keep the downstream sidewalk-metadata seam faithful (axis + attribute
 # basis + evidence + weight). Anything else on a record is regenerable.
 _SELECTED_SPEC_KEYS = ("query", "axis", "source", "attribute_basis", "evidence", "intent_weight")
+
+# Audit depth tiers (deep-tier spec 2026-07-21). The tier is a NAMED product
+# unit, never a raw merchant-facing count; it decides the per-SKU probe budget
+# and how much of the LLM discovery lists (winnable/scenario) survives the cap.
+# The basis is pinned PER TIER: a deep run never reuses a standard basis (or
+# vice versa) — different question sets are non-comparable by construction, so
+# a tier switch is an explicit baseline reset, not a delta.
+AUDIT_TIER_STANDARD = "standard"
+AUDIT_TIER_DEEP = "deep"
+_TIER_PROMPTS_PER_SKU = {AUDIT_TIER_STANDARD: 40, AUDIT_TIER_DEEP: 80}
+_TIER_MAX_PROMPTS_PER_LIST = {AUDIT_TIER_STANDARD: _MAX_PROMPTS_PER_LIST, AUDIT_TIER_DEEP: 18}
+
+
+def normalize_audit_tier(value: Any) -> str:
+    """Coerce any launch-option/stored value to a known tier; unknown → standard."""
+    tier = str(value or "").strip().lower()
+    return tier if tier in _TIER_PROMPTS_PER_SKU else AUDIT_TIER_STANDARD
+
+
+def prompts_per_sku_for_tier(audit_tier: Any) -> int:
+    return _TIER_PROMPTS_PER_SKU[normalize_audit_tier(audit_tier)]
+
+
+def max_prompts_per_list_for_tier(audit_tier: Any) -> int:
+    return _TIER_MAX_PROMPTS_PER_LIST[normalize_audit_tier(audit_tier)]
 
 # Namespace of the URL-wedge synthetic SKU keys (routes/merchant_audit_routes
 # mints them via _synthetic_url_sku_key, deterministic on (merchant_id,
@@ -84,7 +112,7 @@ def subject_type_for_sku_key(sku_key: str) -> str:
     )
 
 
-def _clean_prompts(values: Any) -> List[str]:
+def _clean_prompts(values: Any, max_prompts: int = _MAX_PROMPTS_PER_LIST) -> List[str]:
     out: List[str] = []
     seen = set()
     for value in values if isinstance(values, (list, tuple)) else []:
@@ -93,7 +121,7 @@ def _clean_prompts(values: Any) -> List[str]:
         if text and key not in seen:
             seen.add(key)
             out.append(text)
-        if len(out) >= _MAX_PROMPTS_PER_LIST:
+        if len(out) >= max_prompts:
             break
     return out
 
@@ -183,10 +211,15 @@ def harvest_prompt_basis(
     report_jsonb: Mapping[str, Any],
     *,
     sku_key: str,
+    audit_tier: str = AUDIT_TIER_STANDARD,
 ) -> Optional[Dict[str, Any]]:
     """Pull the pinned prompt basis for `sku_key` out of one prior run's
     report. Returns the stored basis dict, or None when absent/unusable
-    (wrong version, empty, malformed). Pure + synchronous."""
+    (wrong version, wrong tier, empty, malformed). Pure + synchronous.
+
+    A basis stamped before tiers existed carries no `audit_tier` and reads as
+    standard — so already-audited SKUs keep their pinned standard basis, while
+    a first deep run regenerates (the deliberate tier-switch baseline reset)."""
     report = report_jsonb if isinstance(report_jsonb, Mapping) else {}
     brand_report = report.get("brand_report")
     if isinstance(brand_report, Mapping):
@@ -204,12 +237,17 @@ def harvest_prompt_basis(
             return None
         if int(basis.get("basis_version") or 0) != PROMPT_BASIS_VERSION:
             return None  # generators changed — explicit regeneration event
-        winnable = _clean_prompts(basis.get("winnable"))
-        scenario = _clean_prompts(basis.get("scenario"))
+        tier = normalize_audit_tier(audit_tier)
+        if normalize_audit_tier(basis.get("audit_tier")) != tier:
+            return None  # tier switch — explicit baseline reset, never pin across
+        list_cap = max_prompts_per_list_for_tier(tier)
+        winnable = _clean_prompts(basis.get("winnable"), max_prompts=list_cap)
+        scenario = _clean_prompts(basis.get("scenario"), max_prompts=list_cap)
         selected_specs = clean_selected_specs(basis.get("selected_specs"))
         if not winnable and not scenario and not selected_specs:
             return None  # never pin an empty basis (e.g. a prior LLM outage)
         return {
+            "audit_tier": tier,
             "winnable": winnable,
             "scenario": scenario,
             # W2.1: the full probed set from the prior run (may be empty for a
@@ -234,6 +272,7 @@ async def load_prior_prompt_basis(
     merchant_id: str,
     sku_key: str,
     max_runs: int = 3,
+    audit_tier: str = AUDIT_TIER_STANDARD,
 ) -> Optional[Dict[str, Any]]:
     """Best-effort: scan the merchant's most recent completed runs (newest
     first) and return the first pinned basis found for this sku_key, tagged
@@ -270,7 +309,9 @@ async def load_prior_prompt_basis(
             report = row.get("report_jsonb")
             if not isinstance(report, Mapping):
                 continue
-            basis = harvest_prompt_basis(report, sku_key=sku_key)
+            basis = harvest_prompt_basis(
+                report, sku_key=sku_key, audit_tier=audit_tier,
+            )
             if basis:
                 basis["pinned_from_run_id"] = str(run.get("run_id") or "")
                 return basis
@@ -324,6 +365,7 @@ async def resolve_prompt_basis(
     generate_winnable: Callable[[], Awaitable[List[str]]],
     generate_scenario: Callable[[], Awaitable[List[str]]],
     refresh: bool = False,
+    audit_tier: str = AUDIT_TIER_STANDARD,
 ) -> Dict[str, Any]:
     """THE prompt-basis decision for one SKU in one run.
 
@@ -339,15 +381,17 @@ async def resolve_prompt_basis(
     Returns {"winnable": [...], "scenario": [...], "meta": {...}} where meta is
     the JSON-safe `prompt_basis` payload to stamp on the per-SKU report.
     """
+    tier = normalize_audit_tier(audit_tier)
     if not refresh:
         prior = await load_prior_prompt_basis(
-            merchant_id=merchant_id, sku_key=sku_key,
+            merchant_id=merchant_id, sku_key=sku_key, audit_tier=tier,
         )
         if prior:
             selected_specs = prior.get("selected_specs") or []
             meta = {
                 "prompt_set_id": prior["prompt_set_id"],
                 "basis_version": PROMPT_BASIS_VERSION,
+                "audit_tier": tier,
                 "source": "pinned",
                 "winnable": prior["winnable"],
                 "scenario": prior["scenario"],
@@ -374,17 +418,19 @@ async def resolve_prompt_basis(
 
     winnable: List[str] = []
     scenario: List[str] = []
+    list_cap = max_prompts_per_list_for_tier(tier)
     try:
-        winnable = _clean_prompts(await generate_winnable())
+        winnable = _clean_prompts(await generate_winnable(), max_prompts=list_cap)
     except Exception:  # noqa: BLE001 — never block probing on the LLM step
         logger.warning("winnable-prompt extraction skipped", exc_info=True)
     try:
-        scenario = _clean_prompts(await generate_scenario())
+        scenario = _clean_prompts(await generate_scenario(), max_prompts=list_cap)
     except Exception:  # noqa: BLE001 — never block probing on the LLM step
         logger.warning("scenario elicitation skipped", exc_info=True)
     meta = {
         "prompt_set_id": build_prompt_set_id(winnable, scenario),
         "basis_version": PROMPT_BASIS_VERSION,
+        "audit_tier": tier,
         "source": "refreshed" if refresh else "fresh",
         "winnable": winnable,
         "scenario": scenario,

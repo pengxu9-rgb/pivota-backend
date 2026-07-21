@@ -487,7 +487,10 @@ async def _process_one_audit_run_inner(
                     launch_options.get("coverage_profile")
                     or "us_shopper"
                 )
-                prompts_per_sku = _launch_prompts_per_sku(launch_options)
+                audit_tier = _launch_audit_tier(launch_options)
+                prompts_per_sku = _launch_prompts_per_sku(
+                    launch_options, audit_tier
+                )
                 prior_runs = await mar.recent_runs_for_merchant(
                     merchant_id=merchant_id, limit=5,
                 )
@@ -533,6 +536,10 @@ async def _process_one_audit_run_inner(
                         refresh_prompt_basis=bool(
                             launch_options.get("refresh_prompt_basis", False)
                         ),
+                        # Depth tier: decides the probe budget above AND scopes
+                        # basis pinning (a deep run never reuses a standard
+                        # basis — tier switch = baseline reset).
+                        audit_tier=audit_tier,
                     )
                     await mar.record_partial_result(
                         run_id=run_id,
@@ -541,6 +548,7 @@ async def _process_one_audit_run_inner(
                             "per_sku_probe_runs": probe_runs_by_sku,
                             "probing": {
                                 "audit_mode": "per_sku",
+                                "audit_tier": audit_tier,
                                 "prompts_per_sku": prompts_per_sku,
                                 "per_sku_probe_payloads_persisted": sum(
                                     len(v) for v in probe_runs_by_sku.values()
@@ -1155,11 +1163,37 @@ def _launch_audit_mode(launch_options: Dict[str, Any]) -> str:
     return "per_sku" if mode == "per_sku" else "legacy"
 
 
-def _launch_prompts_per_sku(launch_options: Dict[str, Any]) -> int:
+def _launch_audit_tier(launch_options: Dict[str, Any]) -> str:
+    """Depth tier for this run. Deep is flag-gated (AUDIT_DEEP_TIER_ENABLED):
+    with the flag off a deep request falls back to standard — the run still
+    completes rather than erroring, and the log line is the breadcrumb."""
+    from config.settings import settings
+    from services.prompt_basis import AUDIT_TIER_DEEP, AUDIT_TIER_STANDARD, normalize_audit_tier
+
+    tier = normalize_audit_tier((launch_options or {}).get("audit_tier"))
+    if tier == AUDIT_TIER_DEEP and not getattr(
+        settings, "audit_deep_tier_enabled", False
+    ):
+        logger.warning(
+            "audit_run_worker: deep tier requested but AUDIT_DEEP_TIER_ENABLED "
+            "is off — running standard tier"
+        )
+        return AUDIT_TIER_STANDARD
+    return tier
+
+
+def _launch_prompts_per_sku(
+    launch_options: Dict[str, Any], audit_tier: str = "standard"
+) -> int:
+    """Explicit prompts_per_sku (internal/testing knob) wins; otherwise the
+    tier decides (standard 40, deep 80). Merchants never set a raw count."""
+    from services.prompt_basis import prompts_per_sku_for_tier
+
+    default = prompts_per_sku_for_tier(audit_tier)
     try:
-        return max(1, int((launch_options or {}).get("prompts_per_sku") or 40))
+        return max(1, int((launch_options or {}).get("prompts_per_sku") or default))
     except (TypeError, ValueError):
-        return 40
+        return default
 
 
 def _launch_debit_items(launch_options: Dict[str, Any]) -> List[Dict[str, Any]]:
