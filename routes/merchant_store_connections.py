@@ -1226,6 +1226,134 @@ async def claim_shopify_store(body: ShopifyStoreClaimRequest):
     }
 
 
+class ShopifyAutoSessionRequest(BaseModel):
+    claim_token: str
+
+
+@router.post("/shopify/session")
+async def shopify_auto_session(body: ShopifyAutoSessionRequest):
+    """
+    Passwordless portal session for an App Store install.
+
+    A completed App Store OAuth install already proves control of the shop, so
+    the installer must land in a working, authenticated portal WITHOUT a separate
+    email+password step — otherwise a reviewer opening the app in a fresh /
+    incognito session hits a login wall and the app looks broken (Shopify review
+    item 1.1.1: the app must function without relying on pre-existing cookies /
+    localStorage). The one-time claim token minted by the OAuth callback is that
+    proof; here we exchange it for a session bound to the shop's own
+    (deterministic, shop-keyed) shell merchant, auto-provisioning a passwordless
+    user the first time.
+
+    Re-authentication happens by re-launching the app from Shopify admin (which
+    re-runs OAuth and re-issues a claim token), so no password is ever required.
+    Password login stays disabled for auto-provisioned accounts (the stored hash
+    is of a random, unrecoverable secret) until the owner sets one via the normal
+    password-reset flow. This is strictly narrower than /shopify/claim, which
+    accepts the same proof to bind the store to ANY account and therefore also
+    requires a password; auto-session only ever targets the shop's own merchant.
+    """
+    # Imported lazily: auth_routes owns the portal's JWT shape.
+    from routes.auth_routes import create_jwt_token
+
+    payload = _verify_claim_token(body.claim_token)
+    merchant_id = str(payload.get("merchant_id") or "").strip()
+    shop_domain = str(payload.get("shop_domain") or "").strip().lower()
+    jti = str(payload.get("jti") or "").strip()
+    if not merchant_id or not shop_domain or not jti:
+        raise HTTPException(status_code=400, detail="Invalid claim token")
+    try:
+        if int(datetime.now(timezone.utc).timestamp()) > int(payload.get("exp") or 0):
+            raise HTTPException(
+                status_code=400,
+                detail="This link has expired. Reopen the app from your Shopify admin to continue.",
+            )
+    except (TypeError, ValueError):
+        raise HTTPException(status_code=400, detail="Invalid claim token")
+
+    await _ensure_shopify_oauth_tables()
+
+    # Consume the token FIRST (atomic, one-time) so it cannot be replayed.
+    consumed = await database.fetch_one(
+        """
+        UPDATE shopify_store_claim_tokens
+        SET used_at = NOW()
+        WHERE jti_sha256 = :jti_sha256
+          AND used_at IS NULL
+          AND expires_at > NOW()
+          AND merchant_id = :merchant_id
+          AND shop_domain = :shop_domain
+        RETURNING merchant_id
+        """,
+        {
+            "jti_sha256": hashlib.sha256(jti.encode("utf-8")).hexdigest(),
+            "merchant_id": merchant_id,
+            "shop_domain": shop_domain,
+        },
+    )
+    if not consumed:
+        raise HTTPException(
+            status_code=400,
+            detail="This link has already been used or expired. Reopen the app from your Shopify admin to continue.",
+        )
+
+    onboarding = await database.fetch_one(
+        "SELECT business_name, contact_email FROM merchant_onboarding WHERE merchant_id = :merchant_id",
+        {"merchant_id": merchant_id},
+    )
+    display_name = str((onboarding or {}).get("business_name") or shop_domain)
+
+    # Reuse an existing user for this merchant if one is already provisioned;
+    # otherwise create a passwordless one bound to the shop's placeholder contact.
+    existing_user = await database.fetch_one(
+        "SELECT id, email, full_name, role FROM users WHERE merchant_id = :merchant_id ORDER BY id ASC LIMIT 1",
+        {"merchant_id": merchant_id},
+    )
+    if existing_user:
+        email = str(existing_user.get("email") or "").strip().lower()
+        role = str(existing_user.get("role") or "merchant")
+        full_name = str(existing_user.get("full_name") or display_name)
+    else:
+        email = str(
+            (onboarding or {}).get("contact_email") or f"shopify-install@{shop_domain}"
+        ).strip().lower()
+        role = "merchant"
+        full_name = display_name
+        await database.execute(
+            """
+            INSERT INTO users (email, password_hash, full_name, role, active, merchant_id)
+            VALUES (:email, :password_hash, :full_name, 'merchant', TRUE, :merchant_id)
+            ON CONFLICT (email) DO UPDATE SET merchant_id = EXCLUDED.merchant_id
+            """,
+            {
+                "email": email,
+                # Random, unrecoverable — disables password login; owner re-enters
+                # via Shopify launch (or sets a password through reset).
+                "password_hash": hash_password(secrets.token_urlsafe(32)),
+                "full_name": full_name,
+                "merchant_id": merchant_id,
+            },
+        )
+
+    logger.info(
+        "shopify_auto_session merchant=%s shop=%s new_user=%s",
+        merchant_id, shop_domain, existing_user is None,
+    )
+
+    token = create_jwt_token(email, role, email, {"merchant_id": merchant_id})
+    return {
+        "status": "success",
+        "token": token,
+        "user": {
+            "email": email,
+            "role": role,
+            "merchant_id": merchant_id,
+            "full_name": full_name,
+        },
+        "shop_domain": shop_domain,
+    }
+
+
 class ShopifySyncRequest(BaseModel):
     merchant_id: Optional[str] = None
 
