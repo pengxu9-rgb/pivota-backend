@@ -942,7 +942,11 @@ BEAUTY_DEVICE_HAIR_PROFILE = VerticalProfile(
         "also curls hair",
         "works abroad with dual voltage",
     ),
-    wedge_incumbent_brands=("GHD", "Dyson Airwrap"),
+    # Order matters: the STANDARD wedge's alternative-seeker shape takes the
+    # first two only (byte-unchanged), while deep-tier anchors take up to five
+    # — Shark FlexStyle and T3 hold the contested value-alternative middle per
+    # the AEO incumbent research (~/dev/AEO_Incumbent_Packs_Beauty_2026-07-21.md).
+    wedge_incumbent_brands=("GHD", "Dyson Airwrap", "Shark FlexStyle", "T3"),
     # Deep-tier Block F: devices get compat/usage shapes, not topical-routine
     # ones ("what order do I apply" is topical junk for a flat iron).
     deep_routine_shapes=(

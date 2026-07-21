@@ -65,6 +65,38 @@ def run_is_internal_comparison(run: Any) -> bool:
 
 
 _MAX_COMPETITOR_SEEDS = 6
+# Anchor cap for Blocks A/B: how many competitors get their own probe sets.
+# 5 anchors ≈ 15 comparison prompts — fits the deep ceiling (80) comfortably;
+# on explicit smaller budgets the budgeter trims the comparison tail naturally.
+MAX_ANCHOR_SEEDS = 5
+# Merchant/BD-declared competitor slots per request. Declared names lead the
+# seed list (the merchant knows who is gunning for their shelf — including
+# AEO-active brands the answer harvest cannot see yet); the prior-run harvest
+# fills the remaining anchor slots.
+MAX_DECLARED_COMPETITORS = 5
+
+
+def sanitize_declared_competitors(
+    values: Any,
+    *,
+    own_brand: str = "",
+) -> List[str]:
+    """Clean a request's declared-competitor list: real-looking brand names
+    only, deduped case-insensitively, never the merchant's own brand, capped
+    at MAX_DECLARED_COMPETITORS. Order-preserving (declaration order is
+    priority order)."""
+    out: List[str] = []
+    seen: set = set()
+    for value in values if isinstance(values, (list, tuple)) else []:
+        cleaned = _clean_brand_name(value)[:80].strip()
+        key = cleaned.lower()
+        if not cleaned or key in seen or _is_own_brand(cleaned, own_brand):
+            continue
+        seen.add(key)
+        out.append(cleaned)
+        if len(out) >= MAX_DECLARED_COMPETITORS:
+            break
+    return out
 # Never anchor a probe on a mumbled fragment: competitor names must look like
 # a brand (2+ chars, has a letter, not a bare category word).
 _MIN_NAME_CHARS = 2
@@ -452,7 +484,7 @@ def build_deep_tier_specs(
     seeds = [
         _clean_brand_name(name) for name in (competitors or [])
     ]
-    seeds = [name for name in seeds if name][:3]
+    seeds = [name for name in seeds if name][:MAX_ANCHOR_SEEDS]
     specs: List[Tuple[str, str]] = []
 
     # Block A — comparison & substitution (internal-first axis).

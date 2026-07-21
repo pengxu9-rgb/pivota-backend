@@ -153,6 +153,17 @@ class CreateAuditRequest(BaseModel):
         max_length=10,
         description="Merchant-input prompt slots; each consumes prompt credits.",
     )
+    declared_competitors: Optional[List[str]] = Field(
+        default=None,
+        max_length=5,
+        description=(
+            "Deep tier only: up to 5 competitor brand names to anchor the "
+            "competitive lane on, ahead of the automatic cited-competitor "
+            "harvest. Lets the audit target rivals AI answers don't cite yet "
+            "(e.g. brands investing in AI visibility). Ignored on standard "
+            "runs; sanitized server-side (own brand and junk names dropped)."
+        ),
+    )
     coverage_profile: str = Field(
         default_factory=default_coverage_profile,
         max_length=64,
@@ -1193,6 +1204,11 @@ async def create_audit_run(
                     # above; persist them here so the worker actually PROBES them
                     # (they were billed-but-never-probed before this).
                     "custom_prompts": _normalize_nonempty(body.custom_prompts),
+                    # Deep-tier competitive anchors (sanitized again worker-side;
+                    # inert on standard runs).
+                    "declared_competitors": _normalize_nonempty(
+                        body.declared_competitors
+                    ),
                     "estimated_audit_credits": int(audit_required),
                     "estimated_prompt_credits": int(prompt_required),
                     "debited": [

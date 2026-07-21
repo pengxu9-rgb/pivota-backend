@@ -9715,10 +9715,15 @@ def _build_per_sku_base_query_specs(
     if str((sku_ctx or {}).get("_audit_tier") or "").strip().lower() == "deep":
         from services.deep_tier_prompts import build_deep_tier_specs
 
-        # Seeds = prior-run cited-competitor harvest first (evidence-ranked),
-        # topped up from the profile's configured incumbents — so a merchant's
-        # FIRST deep audit (no prior runs) still fires Blocks A/B against the
-        # brands that own the head terms (GHD/Dyson on the VODANA pilot).
+        # Seed priority: declared competitors lead (the merchant/BD knows who
+        # is gunning for the shelf, incl. AEO-active brands the answer harvest
+        # cannot see yet — the fanout stash puts them ahead of the prior-run
+        # harvest), then the evidence-ranked harvest, topped up from the
+        # profile's configured incumbents — so a merchant's FIRST deep audit
+        # (no prior runs) still fires Blocks A/B against the brands that own
+        # the head terms (GHD/Dyson on the VODANA pilot).
+        from services.deep_tier_prompts import MAX_ANCHOR_SEEDS
+
         _deep_seeds = [
             str(s).strip()
             for s in ((sku_ctx or {}).get("_deep_competitor_seeds") or [])
@@ -9726,7 +9731,7 @@ def _build_per_sku_base_query_specs(
         ]
         _seen_seeds = {s.lower() for s in _deep_seeds}
         for _incumbent in (getattr(profile, "wedge_incumbent_brands", ()) or ()):
-            if len(_deep_seeds) >= 3:
+            if len(_deep_seeds) >= MAX_ANCHOR_SEEDS:
                 break
             _incumbent = str(_incumbent or "").strip()
             if _incumbent and _incumbent.lower() not in _seen_seeds:
@@ -12703,6 +12708,7 @@ async def run_per_sku_audit_probe_fanout(
     winnable_prompts: bool = False,
     refresh_prompt_basis: bool = False,
     audit_tier: str = "standard",
+    declared_competitors: Optional[List[str]] = None,
 ) -> Dict[str, List[Dict[str, Any]]]:
     """Run and shape v3 per-SKU citation probes before report assembly.
 
@@ -12856,20 +12862,36 @@ async def run_per_sku_audit_probe_fanout(
                 sku_ctx.pop("_deep_competitor_seeds", None)
                 sku_ctx.pop("_deep_tier_queries", None)
             elif not sku_ctx.get("_pinned_selected_specs"):
-                from services.deep_tier_prompts import load_prior_competitor_brands
+                from services.deep_tier_prompts import (
+                    MAX_ANCHOR_SEEDS,
+                    load_prior_competitor_brands,
+                    sanitize_declared_competitors,
+                )
 
                 _own_brand = str(
                     (_get_product(sku_ctx) or {}).get("brand")
                     or (_get_product(sku_ctx) or {}).get("vendor")
                     or ""
                 )
-                sku_ctx["_deep_competitor_seeds"] = (
-                    await load_prior_competitor_brands(
-                        merchant_id=str(merchant_id),
-                        sku_key=str(sku_key),
-                        own_brand=_own_brand,
-                    )
+                # Declared competitors LEAD the anchor list: the merchant/BD
+                # knows who is gunning for the shelf — including AEO-active
+                # brands the answer harvest structurally cannot see yet. The
+                # evidence-ranked harvest fills the remaining slots.
+                _declared = sanitize_declared_competitors(
+                    declared_competitors, own_brand=_own_brand,
                 )
+                _declared_keys = {d.lower() for d in _declared}
+                _harvested = await load_prior_competitor_brands(
+                    merchant_id=str(merchant_id),
+                    sku_key=str(sku_key),
+                    own_brand=_own_brand,
+                )
+                sku_ctx["_deep_competitor_seeds"] = (
+                    _declared + [
+                        name for name in _harvested
+                        if name.lower() not in _declared_keys
+                    ]
+                )[:MAX_ANCHOR_SEEDS]
         out[sku_key] = await _probe_per_sku_ctx(
             sku_ctx=sku_ctx,
             merchant_id=str(merchant_id),
