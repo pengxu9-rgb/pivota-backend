@@ -1210,11 +1210,14 @@ async def startup():
         logger.info("✅ Database connected successfully")
         
         # Ensure all tables exist (important for PostgreSQL)
-        from sqlalchemy import create_engine
-        from db.database import metadata
-        engine = create_engine(str(database.url))
-        metadata.create_all(engine)
-        logger.info("✅ All database tables verified/created")
+        # Reuse db.database's sync engine: database.url may carry an async
+        # driver (sqlite+aiosqlite) that create_engine can't use synchronously.
+        from db.database import metadata, engine
+        try:
+            metadata.create_all(engine)
+            logger.info("✅ All database tables verified/created")
+        except Exception as create_all_err:
+            logger.warning(f"⚠️ metadata.create_all failed (continuing): {create_all_err}")
         
         # Test the connection
         await asyncio.wait_for(database.execute("SELECT 1"), timeout=10)
@@ -1303,7 +1306,7 @@ async def startup():
                     use_case TEXT,
                     api_key VARCHAR(255) UNIQUE,
                     status VARCHAR(50) DEFAULT 'active',
-                    created_at TIMESTAMP WITH TIME ZONE DEFAULT NOW(),
+                    created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP,
                     last_active TIMESTAMP WITH TIME ZONE,
                     last_key_rotation TIMESTAMP WITH TIME ZONE,
                     deactivated_at TIMESTAMP WITH TIME ZONE,
@@ -1344,7 +1347,7 @@ async def startup():
                     status VARCHAR(50) NOT NULL,
                     idempotency_key VARCHAR(255) UNIQUE,
                     agent_id VARCHAR(50),
-                    created_at TIMESTAMP WITH TIME ZONE DEFAULT NOW(),
+                    created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP,
                     updated_at TIMESTAMP WITH TIME ZONE,
                     metadata JSONB
                 )
@@ -1366,7 +1369,7 @@ async def startup():
                     error_message TEXT,
                     order_id VARCHAR(50),
                     order_amount NUMERIC(10,2),
-                    timestamp TIMESTAMPTZ DEFAULT NOW()
+                    timestamp TIMESTAMPTZ DEFAULT CURRENT_TIMESTAMP
                 )
             """)
             
@@ -1440,7 +1443,7 @@ async def startup():
                 CREATE TABLE IF NOT EXISTS agent_merchants (
                     agent_id VARCHAR(50),
                     merchant_id VARCHAR(50),
-                    connected_at TIMESTAMP WITH TIME ZONE DEFAULT NOW(),
+                    connected_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP,
                     permissions TEXT,
                     PRIMARY KEY (agent_id, merchant_id)
                 )
@@ -1458,6 +1461,13 @@ async def startup():
                     connected_at TIMESTAMP WITH TIME ZONE,
                     last_sync TIMESTAMP WITH TIME ZONE,
                     product_count INTEGER DEFAULT 0,
+                    is_primary BOOLEAN DEFAULT FALSE,
+                    order_writeback_status TEXT DEFAULT 'disabled',
+                    order_writeback_enabled_at TIMESTAMP WITH TIME ZONE,
+                    order_writeback_canary_order_id TEXT,
+                    order_writeback_last_canary_order_id TEXT,
+                    order_writeback_last_verified_at TIMESTAMP WITH TIME ZONE,
+                    order_writeback_last_error TEXT,
                     created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP
                 )
             """)
@@ -1504,7 +1514,7 @@ async def startup():
                     account_id VARCHAR(255),
                     secret_key TEXT,
                     environment VARCHAR(20) DEFAULT 'unknown',
-                    provider_config JSONB DEFAULT '{}'::jsonb,
+                    provider_config JSONB DEFAULT '{}',
                     validation_status VARCHAR(20) DEFAULT 'unknown',
                     validation_error TEXT,
                     last_validated_at TIMESTAMP WITH TIME ZONE,
@@ -1514,12 +1524,20 @@ async def startup():
                     created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP
                 )
             """)
-            await database.execute("ALTER TABLE merchant_psps ADD COLUMN IF NOT EXISTS secret_key TEXT")
-            await database.execute("ALTER TABLE merchant_psps ADD COLUMN IF NOT EXISTS environment VARCHAR(20) DEFAULT 'unknown'")
-            await database.execute("ALTER TABLE merchant_psps ADD COLUMN IF NOT EXISTS provider_config JSONB DEFAULT '{}'::jsonb")
-            await database.execute("ALTER TABLE merchant_psps ADD COLUMN IF NOT EXISTS validation_status VARCHAR(20) DEFAULT 'unknown'")
-            await database.execute("ALTER TABLE merchant_psps ADD COLUMN IF NOT EXISTS validation_error TEXT")
-            await database.execute("ALTER TABLE merchant_psps ADD COLUMN IF NOT EXISTS last_validated_at TIMESTAMP WITH TIME ZONE")
+            # Postgres-only backfill for pre-existing deployments; sqlite lacks
+            # ADD COLUMN IF NOT EXISTS and gets these columns from the CREATE above.
+            for statement in (
+                "ALTER TABLE merchant_psps ADD COLUMN IF NOT EXISTS secret_key TEXT",
+                "ALTER TABLE merchant_psps ADD COLUMN IF NOT EXISTS environment VARCHAR(20) DEFAULT 'unknown'",
+                "ALTER TABLE merchant_psps ADD COLUMN IF NOT EXISTS provider_config JSONB DEFAULT '{}'::jsonb",
+                "ALTER TABLE merchant_psps ADD COLUMN IF NOT EXISTS validation_status VARCHAR(20) DEFAULT 'unknown'",
+                "ALTER TABLE merchant_psps ADD COLUMN IF NOT EXISTS validation_error TEXT",
+                "ALTER TABLE merchant_psps ADD COLUMN IF NOT EXISTS last_validated_at TIMESTAMP WITH TIME ZONE",
+            ):
+                try:
+                    await database.execute(statement)
+                except Exception:
+                    pass
             
             # Create indexes
             await database.execute("CREATE INDEX IF NOT EXISTS idx_merchant_stores_merchant_id ON merchant_stores(merchant_id)")
@@ -1553,7 +1571,10 @@ async def startup():
         except Exception as e:
             logger.warning(f"⚠️ Could not include accounts tables in metadata.create_all: {e}")
         from db.database import metadata, engine
-        metadata.create_all(engine)
+        try:
+            metadata.create_all(engine)
+        except Exception as create_all_err:
+            logger.warning(f"⚠️ metadata.create_all failed (continuing): {create_all_err}")
         logger.info("✅ Tables created:")
         logger.info("   - Core: merchants, kyb_documents, merchant_onboarding, payment_router_config, orders")
         logger.info("   - Agents: agents, agent_usage_logs")
@@ -1578,9 +1599,10 @@ async def startup():
                     # Execute the entire file as one transaction to preserve $$ blocks
                     # PostgreSQL functions use $$ delimiters which shouldn't be split
                     try:
-                        # Use raw connection for complex SQL with functions
-                        from sqlalchemy import create_engine
-                        engine = create_engine(str(database.url))
+                        # Use raw connection for complex SQL with functions.
+                        # Reuse db.database's sync engine — database.url may
+                        # carry an async driver (sqlite+aiosqlite) that a fresh
+                        # create_engine here binds sync-side (MissingGreenlet).
                         # AUTOCOMMIT isolation: each DDL statement commits implicitly.
                         # Required because some migrations use CREATE INDEX CONCURRENTLY,
                         # which Postgres forbids inside a transaction block. The previous

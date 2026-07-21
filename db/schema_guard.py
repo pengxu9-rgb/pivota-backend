@@ -1552,44 +1552,88 @@ async def ensure_required_schema_light() -> None:
             return
 
         if IS_SQLITE:
+            # These two REQUIRED_SCHEMA tables have no startup DDL on sqlite:
+            # external_product_seeds is created lazily by routes/employee_products.py
+            # (Postgres-dialect DDL) and merchant_credit_balance only by migration
+            # 089 — neither runs on a fresh sqlite boot, so /health would 503.
+            # Sqlite-dialect mirrors of those schemas, created before column heal.
+            await database.execute(
+                text(
+                    """
+                    CREATE TABLE IF NOT EXISTS external_product_seeds (
+                      id TEXT PRIMARY KEY,
+                      external_product_id TEXT NULL,
+                      market TEXT NOT NULL,
+                      tool TEXT NOT NULL DEFAULT '*',
+                      utm_template TEXT NULL,
+                      partner_type TEXT NULL,
+                      disclosure_text TEXT NULL,
+                      destination_url TEXT NOT NULL,
+                      canonical_url TEXT NULL,
+                      domain TEXT NULL,
+                      title TEXT NULL,
+                      image_url TEXT NULL,
+                      price_amount DOUBLE PRECISION NULL,
+                      price_currency TEXT NULL,
+                      availability TEXT NULL,
+                      seed_data TEXT NOT NULL DEFAULT '{}',
+                      status TEXT NOT NULL DEFAULT 'active',
+                      notes TEXT NULL,
+                      created_by_employee_id TEXT NULL,
+                      attached_product_key TEXT NULL,
+                      attached_variant_id TEXT NULL,
+                      seller_ref TEXT NULL,
+                      seed_kind TEXT NULL,
+                      created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                      updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP
+                    );
+                    """
+                )
+            )
+            await database.execute(
+                text(
+                    """
+                    CREATE TABLE IF NOT EXISTS merchant_credit_balance (
+                      merchant_id        TEXT PRIMARY KEY,
+                      audit_credits      INTEGER NOT NULL DEFAULT 0,
+                      prompt_credits     INTEGER NOT NULL DEFAULT 0,
+                      execution_credits  INTEGER NOT NULL DEFAULT 0,
+                      plan_tier          TEXT NOT NULL DEFAULT 'free',
+                      purchased_credits  BIGINT NOT NULL DEFAULT 0,
+                      overage_pending_credits BIGINT NOT NULL DEFAULT 0,
+                      overage_charged_credits BIGINT NOT NULL DEFAULT 0,
+                      overage_blocked_until_payment BOOLEAN NOT NULL DEFAULT FALSE,
+                      overage_last_payment_intent_id TEXT,
+                      overage_last_failed_at TIMESTAMP,
+                      updated_at         TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                      version            INTEGER NOT NULL DEFAULT 0
+                    );
+                    """
+                )
+            )
             missing = await check_required_schema()
-            orders_missing = set(missing.get("orders") or [])
-            for col in sorted(orders_missing):
-                try:
-                    await database.execute(text(f"ALTER TABLE orders ADD COLUMN {col} TEXT;"))
-                except Exception:
-                    # Ignore duplicate-column / unsupported variations.
-                    continue
-            psp_missing = set(missing.get("merchant_psps") or [])
-            sqlite_type = {
-                "provider_config": "TEXT",
-                "last_validated_at": "TEXT",
+            sqlite_column_ddl = {
+                ("merchant_stores", "is_primary"): "BOOLEAN DEFAULT FALSE",
+                ("merchant_stores", "order_writeback_status"): "TEXT DEFAULT 'disabled'",
+                ("catalog_merchants", "indexable"): "BOOLEAN DEFAULT TRUE",
+                ("merchant_credit_balance", "purchased_credits"): "BIGINT DEFAULT 0",
+                ("merchant_credit_balance", "overage_pending_credits"): "BIGINT DEFAULT 0",
+                ("merchant_credit_balance", "overage_charged_credits"): "BIGINT DEFAULT 0",
+                (
+                    "merchant_credit_balance",
+                    "overage_blocked_until_payment",
+                ): "BOOLEAN DEFAULT FALSE",
             }
-            for col in sorted(psp_missing):
-                try:
-                    await database.execute(
-                        text(
-                            f"ALTER TABLE merchant_psps ADD COLUMN {col} "
-                            f"{sqlite_type.get(col, 'TEXT')};"
+            for spec in REQUIRED_SCHEMA:
+                for col in sorted(missing.get(spec.table) or []):
+                    col_ddl = sqlite_column_ddl.get((spec.table, col), "TEXT")
+                    try:
+                        await database.execute(
+                            text(f"ALTER TABLE {spec.table} ADD COLUMN {col} {col_ddl};")
                         )
-                    )
-                except Exception:
-                    continue
-            store_missing = set(missing.get("merchant_stores") or [])
-            store_sqlite_type = {
-                "is_primary": "BOOLEAN DEFAULT FALSE",
-                "order_writeback_status": "TEXT DEFAULT 'disabled'",
-            }
-            for col in sorted(store_missing):
-                try:
-                    await database.execute(
-                        text(
-                            f"ALTER TABLE merchant_stores ADD COLUMN {col} "
-                            f"{store_sqlite_type.get(col, 'TEXT')};"
-                        )
-                    )
-                except Exception:
-                    continue
+                    except Exception:
+                        # Ignore duplicate-column / missing-table variations.
+                        continue
             return
     except Exception:
         # Best-effort only; callers should not depend on this always succeeding.
