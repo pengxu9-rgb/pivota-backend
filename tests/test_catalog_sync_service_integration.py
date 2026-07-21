@@ -118,8 +118,10 @@ class _PruneFakeDatabase:
 
     async def fetch_all(self, query, values=None):
         sql = str(query)
-        if "FROM stale_catalog_products" in sql and "LIMIT 10" in sql:
-            return [{"product_key": key} for key in sorted(self.stale_product_keys)[:10]]
+        # The prune now fetches ALL stale keys (first 10 feed the audit
+        # sample; the full list feeds the post-commit trust-row recompute).
+        if "FROM stale_catalog_products" in sql:
+            return [{"product_key": key} for key in sorted(self.stale_product_keys)]
         return []
 
     async def fetch_val(self, query, values=None):

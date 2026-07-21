@@ -132,8 +132,9 @@ async def _record_send_log(
     """Best-effort partner_send_log row so the invite appears in Recent sends.
 
     Never raises to the caller — a log-write failure must not affect the email
-    result. cc_emails defaults to '[]' (no bind), avoiding the :param::jsonb
-    cast footgun.
+    result. cc_emails defaults to '[]' (no bind), avoiding the param-then-
+    double-colon jsonb cast footgun (use CAST(... AS JSONB) if a bind is ever
+    needed).
     """
 
     try:

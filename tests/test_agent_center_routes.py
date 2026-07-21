@@ -459,11 +459,14 @@ def bd_env(monkeypatch: pytest.MonkeyPatch) -> Tuple[TestClient, FakeDB]:
     from services import agent_center_bd_report_service as bd_service
 
     async def _fake_probe(**kwargs):
+        # provider must classify as REAL (_classify_provider): the route
+        # refuses to render BD-facing prose from mock-derived runs (503
+        # upstream_mock_fallback), so the canned shapes claim gemini.
         scan_mode = kwargs.get("scan_mode")
         if scan_mode == "open_product_visibility_test":
             return {
                 "scan_mode": scan_mode,
-                "provider": "mock",
+                "provider": "gemini",
                 "scores": {"visibility_score": 33, "attribution_echo_rate": 0},
                 "runs_count": 3,
                 "raw_runs": [
@@ -489,7 +492,7 @@ def bd_env(monkeypatch: pytest.MonkeyPatch) -> Tuple[TestClient, FakeDB]:
         # attribution
         return {
             "scan_mode": scan_mode,
-            "provider": "mock",
+            "provider": "gemini",
             "scores": {"visibility_score": 0, "attribution_echo_rate": 0},
             "runs_count": 3,
             "raw_runs": [
@@ -543,7 +546,7 @@ def test_bd_external_merchant_report_returns_structured_report(
             "product_title": "Cloud Paint",
             "product_vendor": "Glossier",
             "product_type": "blush",
-            "provider": "mock",
+            "provider": "gemini",
             "max_runs": 3,
         },
     )

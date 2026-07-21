@@ -113,9 +113,32 @@ def test_report_is_competitor_flag_does_not_readmit_a_known_retailer():
 
 
 def test_name_match_across_many_merchants_refuses_to_guess():
-    # dermstore.com matches the name "Dermstore" the engines listed, but it is
-    # cited for 3 merchants — retailer behaviour, not one rival's storefront.
-    # Asserting type=brand here would delete a real channel from the playbook.
+    # lumasilk.com matches the name "Lumasilk" the engines listed, but it is
+    # cited for 3 merchants — retailer/platform behaviour, not one rival's
+    # storefront. Asserting type=brand here would delete a real channel from
+    # the playbook, so the sweep refuses to guess. (The host must NOT be on
+    # the curated non-brand/retailer-token lists — a curated name like
+    # "Dermstore" now short-circuits to a confident type=retailer proposal,
+    # covered by the known-non-brand test above.)
+    runs = [
+        _run(f"m{i}", f"r{i}", [
+            _host_row("allure.com", competitors_named=["Lumasilk"]),
+            _host_row("lumasilk.com", prompts_cited_count=5),
+        ])
+        for i in (1, 2, 3)
+    ]
+    doc = build_proposals(runs, classify=_classify_all_unclassified)
+    entry = {p["host"]: p for p in doc["proposals"]}["lumasilk.com"]
+    assert entry["type"] is None
+    assert entry["proposed_by"] == "heuristic:competitor_name_match_ambiguous"
+    assert entry["evidence"]["competitor_names_matched"] == ["Lumasilk"]
+
+
+def test_curated_retailer_name_cited_across_merchants_proposes_retailer():
+    # dermstore.com is on the curated retailer-token list, so even when the
+    # engines list "Dermstore" as a competitor across several merchants the
+    # sweep proposes type=retailer — registering it CORRECTS the audit's
+    # competitor mis-flag instead of leaving a real channel unclassified.
     runs = [
         _run(f"m{i}", f"r{i}", [
             _host_row("allure.com", competitors_named=["Dermstore"]),
@@ -125,9 +148,8 @@ def test_name_match_across_many_merchants_refuses_to_guess():
     ]
     doc = build_proposals(runs, classify=_classify_all_unclassified)
     entry = {p["host"]: p for p in doc["proposals"]}["dermstore.com"]
-    assert entry["type"] is None
-    assert entry["proposed_by"] == "heuristic:competitor_name_match_ambiguous"
-    assert entry["evidence"]["competitor_names_matched"] == ["Dermstore"]
+    assert entry["type"] == "retailer"
+    assert entry["proposed_by"] == "heuristic:known_non_brand_name"
 
 
 def test_grounding_redirector_is_not_a_registry_candidate():

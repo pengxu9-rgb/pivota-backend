@@ -35,6 +35,7 @@ import re
 from dataclasses import dataclass
 from typing import Any, Awaitable, Callable, Dict, List, Mapping, Optional, Sequence
 
+from services.llm_io import parse_llm_object
 from services.promo_terms import is_promo_term
 from services.sku_sidewalk import ATTRIBUTE_CLASSES, _iter_product_sources
 
@@ -271,18 +272,13 @@ def _parse_attributes(raw_text: str) -> List[Mapping[str, Any]]:
     text = str(raw_text or "").strip()
     if not text:
         return []
-    # Tolerate a fenced code block around the JSON.
-    fence = re.search(r"```(?:json)?\s*(\{.*\})\s*```", text, re.DOTALL)
-    if fence:
-        text = fence.group(1)
-    try:
-        data = json.loads(text)
-    except (json.JSONDecodeError, ValueError):
+    data = parse_llm_object(text, label="llm_attribute_extractor")
+    if data is None:
         # Truncated/partial JSON (e.g. the response hit the output-token cap
         # mid-array). Rather than drop EVERYTHING, salvage the complete attribute
         # objects that did arrive. Defense-in-depth behind the raised token cap.
         return _salvage_attribute_objects(text)
-    attrs = data.get("attributes") if isinstance(data, Mapping) else None
+    attrs = data.get("attributes")
     return [a for a in attrs if isinstance(a, Mapping)] if isinstance(attrs, list) else []
 
 

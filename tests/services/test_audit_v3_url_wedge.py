@@ -635,8 +635,23 @@ def test_product_urls_required(client):
     client.state["used"] = 0
     assert client.post(_URL, json={}).status_code == 422
     assert client.post(_URL, json={"product_urls": []}).status_code == 422
-    too_many = [f"https://m.example/p/{i}" for i in range(6)]
-    assert client.post(_URL, json={"product_urls": too_many}).status_code == 422
+    # Schema ceiling is the PAID cap (20); beyond it is a 422 regardless of tier.
+    over_schema_cap = [f"https://m.example/p/{i}" for i in range(21)]
+    assert client.post(_URL, json={"product_urls": over_schema_cap}).status_code == 422
+
+
+def test_product_urls_free_tier_cap_is_5(client):
+    # The 5-URL cap is tier-enforced in the handler: free plans 422 with an
+    # upgrade path, paid plans (the fixture default, "growth") go up to 20.
+    client.state["used"] = 0
+    client.state["balance"] = {"credits": 0, "plan_tier": "free"}
+    six = [f"https://m.example/p/{i}" for i in range(6)]
+    res = client.post(_URL, json={"product_urls": six})
+    assert res.status_code == 422
+    detail = res.json()["detail"]
+    assert detail["code"] == "product_cap_exceeded"
+    assert detail["cap"] == 5
+    assert detail["upgrade_path"]
 
 
 # --- background runner -------------------------------------------------------

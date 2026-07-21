@@ -13,7 +13,11 @@ See PIVOTA-Agent/docs/ai_readiness_query_axes_build_plan.md.
 
 from services import agent_center_bd_report_service as m
 
-_COARSE_AXES = {"category", "attribute", "intent", "review", "identity"}
+# "sidewalk" joined the coarse vocabulary with the per-SKU AI-visibility
+# lanes (#742) + per-intent-axis scoring (#929): every downstream consumer
+# maps it (_intent_axis_for → "constraint"). Anything OUTSIDE this set is
+# still a leak.
+_COARSE_AXES = {"category", "attribute", "intent", "review", "identity", "sidewalk"}
 
 
 def _collagen_sku_ctx():

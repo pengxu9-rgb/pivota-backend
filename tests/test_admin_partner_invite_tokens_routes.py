@@ -68,6 +68,9 @@ def test_issue_token_returns_raw_token_and_signup_url(
         "issued_by": "admin@example.com",
         "expires_in_days": 90,
         "notes": "q3 push",
+        # Multi-use invite links: max_uses is an optional cap, None = single
+        # default behavior decided by the service.
+        "max_uses": None,
     }
 
 

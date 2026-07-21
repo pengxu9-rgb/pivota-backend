@@ -80,7 +80,10 @@ def test_cited_open_lane_low_competition() -> None:
     assert row["runs"] == 1
     assert row["runs_cited"] == 1
     assert any("BB Lab" in s for s in row["cited_sources"])
-    assert "Sephora" in row["competitors"]
+    # Competitors are keyed by the resolved publisher DOMAIN, not the source
+    # display title (extract_cited_hosts: OpenAI web_search titles are page
+    # headlines that would leak into top_cited_hosts as fake hosts).
+    assert "sephora.com" in row["competitors"]
     assert row["evidence_excerpt"].startswith("BB Lab Good Night")
 
 
@@ -119,7 +122,9 @@ def test_absent_lane_competitors_own_it() -> None:
     assert out[0]["cited"] is False
     assert out[0]["lane"] == "absent"
     assert out[0]["cited_sources"] == []
-    assert "Olive Young Global" in out[0]["competitors"]
+    # Domain-keyed (see test_cited_open_lane_low_competition).
+    assert "oliveyoung.com" in out[0]["competitors"]
+    assert "sephora.com" in out[0]["competitors"]
 
 
 def test_no_signal_when_no_grounding() -> None:

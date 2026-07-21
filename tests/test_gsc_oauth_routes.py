@@ -367,23 +367,36 @@ async def test_submit_audit_canonical_urls_skips_when_flag_off(monkeypatch):
     assert result == []
 
 
+# submit_audit_canonical_urls now delegates to the Pivota-credential batch
+# helper (ADR-006): canonical PDPs live on agent.pivota.cc, so they are
+# submitted under Pivota's service account — never the merchant's OAuth, and
+# with NO is_gsc_integrated() gate. The batch mechanics (dedupe, single token
+# mint, all-error-on-no-token, credential routing) are pinned in
+# tests/test_gsc_pivota_submission.py; these cover the audit-report walk.
+
+def _pivota_submit_enabled(monkeypatch):
+    from config import settings as settings_module
+    monkeypatch.setattr(settings_module.settings, "gsc_pivota_submit_enabled", True)
+
+
 @pytest.mark.asyncio
-async def test_submit_audit_canonical_urls_skips_non_pivota_canonical(enabled_settings):
+async def test_submit_audit_canonical_urls_skips_non_pivota_canonical(
+    enabled_settings, monkeypatch,
+):
     """Only url_source=pivota_canonical_pdp gets submitted. External
     URLs / merchant.com URLs flow through different auth (they need
     per-merchant OAuth on the merchant's own domain)."""
     from services import gsc_integration as mod
 
-    async def _integrated(_merchant_id):
-        return True
+    _pivota_submit_enabled(monkeypatch)
 
     submit_calls = []
-    async def _fake_submit(merchant_id, url, *, audit_run_id=None):
+    async def _fake_submit(url, *, merchant_id, audit_run_id=None, access_token=None):
         submit_calls.append(url)
         return {"status": "submitted", "url": url}
 
-    with patch.object(mod, "is_gsc_integrated", AsyncMock(side_effect=_integrated)):
-        with patch.object(mod, "submit_url_to_gsc", AsyncMock(side_effect=_fake_submit)):
+    with patch.object(mod, "_get_pivota_access_token", AsyncMock(return_value="tok")):
+        with patch.object(mod, "submit_pivota_canonical_url", AsyncMock(side_effect=_fake_submit)):
             result = await mod.submit_audit_canonical_urls(
                 merchant_id="m",
                 brand_report={
@@ -406,51 +419,45 @@ async def test_submit_audit_canonical_urls_skips_non_pivota_canonical(enabled_se
 
 
 @pytest.mark.asyncio
-async def test_submit_audit_canonical_urls_skips_when_no_token(enabled_settings):
-    """Merchant hasn't granted access → no submissions attempted.
-    Saves Google API calls + avoids fabricating gsc_url_submissions
-    rows with errors."""
+async def test_submit_audit_canonical_urls_noop_when_flag_off(enabled_settings, monkeypatch):
+    """GSC_PIVOTA_SUBMIT_ENABLED=false → no submissions attempted, empty
+    result — the audit response succeeds without touching Google."""
+    from config import settings as settings_module
     from services import gsc_integration as mod
 
-    async def _not_integrated(_merchant_id):
-        return False
+    monkeypatch.setattr(settings_module.settings, "gsc_pivota_submit_enabled", False)
 
-    submit_calls = []
-    async def _fake_submit(*a, **kw):
-        submit_calls.append(a)
-        return {"status": "submitted"}
-
-    with patch.object(mod, "is_gsc_integrated", AsyncMock(side_effect=_not_integrated)):
-        with patch.object(mod, "submit_url_to_gsc", AsyncMock(side_effect=_fake_submit)):
-            result = await mod.submit_audit_canonical_urls(
-                merchant_id="m",
-                brand_report={
-                    "per_product": [
-                        {
-                            "merchant_pdp_url": "https://agent.pivota.cc/products/sig_a",
-                            "merchant_view": {"headline": {"url_source": "pivota_canonical_pdp"}},
-                        },
-                    ],
-                },
-            )
+    submit = AsyncMock(return_value={"status": "submitted"})
+    with patch.object(mod, "submit_pivota_canonical_url", submit):
+        result = await mod.submit_audit_canonical_urls(
+            merchant_id="m",
+            brand_report={
+                "per_product": [
+                    {
+                        "merchant_pdp_url": "https://agent.pivota.cc/products/sig_a",
+                        "merchant_view": {"headline": {"url_source": "pivota_canonical_pdp"}},
+                    },
+                ],
+            },
+        )
     assert result == []
-    assert submit_calls == []
+    submit.assert_not_awaited()
 
 
 @pytest.mark.asyncio
-async def test_submit_audit_canonical_urls_dedupes(enabled_settings):
+async def test_submit_audit_canonical_urls_dedupes(enabled_settings, monkeypatch):
     """Same URL across per_product reports submitted once."""
     from services import gsc_integration as mod
 
-    async def _integrated(_): return True
+    _pivota_submit_enabled(monkeypatch)
 
     submit_calls = []
-    async def _fake_submit(merchant_id, url, *, audit_run_id=None):
+    async def _fake_submit(url, *, merchant_id, audit_run_id=None, access_token=None):
         submit_calls.append(url)
         return {"status": "submitted"}
 
-    with patch.object(mod, "is_gsc_integrated", AsyncMock(side_effect=_integrated)):
-        with patch.object(mod, "submit_url_to_gsc", AsyncMock(side_effect=_fake_submit)):
+    with patch.object(mod, "_get_pivota_access_token", AsyncMock(return_value="tok")):
+        with patch.object(mod, "submit_pivota_canonical_url", AsyncMock(side_effect=_fake_submit)):
             await mod.submit_audit_canonical_urls(
                 merchant_id="m",
                 brand_report={
@@ -470,20 +477,22 @@ async def test_submit_audit_canonical_urls_dedupes(enabled_settings):
 
 
 @pytest.mark.asyncio
-async def test_submit_audit_canonical_urls_swallows_per_url_failures(enabled_settings):
+async def test_submit_audit_canonical_urls_swallows_per_url_failures(
+    enabled_settings, monkeypatch,
+):
     """If one URL fails, others still get submitted. Failures are
     caught + logged, never raised — audit response succeeds."""
     from services import gsc_integration as mod
 
-    async def _integrated(_): return True
+    _pivota_submit_enabled(monkeypatch)
 
-    async def _fake_submit(merchant_id, url, *, audit_run_id=None):
+    async def _fake_submit(url, *, merchant_id, audit_run_id=None, access_token=None):
         if "fail" in url:
             raise RuntimeError("simulated network failure")
         return {"status": "submitted"}
 
-    with patch.object(mod, "is_gsc_integrated", AsyncMock(side_effect=_integrated)):
-        with patch.object(mod, "submit_url_to_gsc", AsyncMock(side_effect=_fake_submit)):
+    with patch.object(mod, "_get_pivota_access_token", AsyncMock(return_value="tok")):
+        with patch.object(mod, "submit_pivota_canonical_url", AsyncMock(side_effect=_fake_submit)):
             results = await mod.submit_audit_canonical_urls(
                 merchant_id="m",
                 brand_report={

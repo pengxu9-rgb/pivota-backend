@@ -33,6 +33,15 @@ def _should_skip(path: Path) -> bool:
     if rel in {
         "scripts/audit_runtime_hardcodes.py",
         "scripts/inventory_legacy_test_merchants.py",
+        # One-off operator scripts whose PAYLOAD is a specific historical
+        # merchant (backfills / dedup / retirement of the merch_efbc test
+        # rig). They are not runtime code and cannot be parameterized without
+        # losing their audit trail. Never add a routes/services/config file
+        # here — the guard exists for runtime defaults.
+        "scripts/backfill_catalog_source_domain.py",
+        "scripts/stage2_backfill_attribution_edges.py",
+        "scripts/step5_lane1_dedup_92sfrj.py",
+        "scripts/retire_test_rig_merch_efbc.py",
     }:
         return True
     parts = rel.split("/")
