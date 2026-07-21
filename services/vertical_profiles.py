@@ -579,6 +579,21 @@ class VerticalProfile:
     seed_concern_terms: Tuple[str, ...] = ()
     seed_spec_terms: Tuple[str, ...] = ()
 
+    # Challenger-wedge decision-space (per category). A medium/long-tail brand
+    # loses every head term to the entrenched incumbent, so a head-only prompt
+    # portfolio measures only where the brand CAN'T win (VODANA pilot run
+    # 452d9394: 0 targets / 5 skip — a give-up list). These two sets generate
+    # the wedge lanes a challenger can realistically win:
+    #   - seed_outcome_terms: job-to-be-done outcomes, phrased to read after
+    #     "that" — "{category} that {outcome}" ("flat iron that doesn't snag or
+    #     pull hair"). Buyer-outcome framing, never spec-sheet framing.
+    #   - wedge_incumbent_brands: the REAL flagship brands/products that own the
+    #     head terms, used for alternative-seeker prompts ("affordable
+    #     {incumbent} alternative"). Real brand names only — never type-words.
+    # Empty for profiles without the config (no prompt change).
+    seed_outcome_terms: Tuple[str, ...] = ()
+    wedge_incumbent_brands: Tuple[str, ...] = ()
+
 
 BEAUTY_PROFILE = VerticalProfile(
     name="beauty",
@@ -901,6 +916,16 @@ BEAUTY_DEVICE_HAIR_PROFILE = VerticalProfile(
         "dual voltage", "ceramic plates", "tourmaline plates", "adjustable heat",
         "ionic", "cordless",
     ),
+    # Challenger wedge (VODANA pilot evidence, run 7b345df0): outcome-framed
+    # lanes were the winnable ones — the sideways wedge chased "doesn't snag or
+    # pull hair" / "also curls hair" / dual-voltage-travel while every head term
+    # stayed incumbent-owned. Outcomes read after "that".
+    seed_outcome_terms=(
+        "doesn't snag or pull hair",
+        "also curls hair",
+        "works abroad with dual voltage",
+    ),
+    wedge_incumbent_brands=("GHD", "Dyson Airwrap"),
     evidence_bindings="none",
     grounded_coverage_disclosure=(
         "grounded-evidence dimensions are unavailable for this category"
