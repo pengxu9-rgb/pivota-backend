@@ -7,14 +7,9 @@ script's DB layer is exercised end-to-end via railway run.
 from __future__ import annotations
 
 import argparse
-import os
 from typing import Any, Dict, List
 
 import pytest
-
-os.environ.setdefault(
-    "DATABASE_URL", "postgresql://postgres:postgres@localhost:5432/postgres"
-)
 
 
 class _FakeTxn:

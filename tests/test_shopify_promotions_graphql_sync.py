@@ -1,8 +1,3 @@
-import os
-
-
-os.environ.setdefault("DATABASE_URL", "postgresql://user:pass@localhost:5432/test")
-
 from services.shopify_promotions_sync import _map_discount_node_to_promotion
 
 

@@ -8,7 +8,6 @@ guard) without touching Postgres.
 
 from __future__ import annotations
 
-import os
 import json
 from decimal import Decimal
 from typing import Any, Dict, List, Optional
@@ -16,8 +15,6 @@ from typing import Any, Dict, List, Optional
 import pytest
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
-
-os.environ.setdefault("DATABASE_URL", "sqlite:///:memory:")
 
 
 # =====================================================================

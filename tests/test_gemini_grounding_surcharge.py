@@ -15,12 +15,9 @@ Claude web_search grounding is billed AS input tokens, so they must stay unchang
 from __future__ import annotations
 
 import copy
-import os
 from typing import Any, Dict
 
 import pytest
-
-os.environ.setdefault("DATABASE_URL", "sqlite:///:memory:")
 
 
 def _result(

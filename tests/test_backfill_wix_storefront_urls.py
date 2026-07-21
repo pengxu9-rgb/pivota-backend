@@ -7,15 +7,12 @@ so the upserted payload shape is exactly what organic sync writes.
 
 from __future__ import annotations
 
-import os
 import sys
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any, Dict, List, Optional
 
 import pytest
-
-os.environ.setdefault("DATABASE_URL", "postgresql://user:pass@localhost:5432/testdb")
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 

@@ -1,10 +1,7 @@
 import asyncio
-import os
 
 import pytest
 from fastapi.testclient import TestClient
-
-os.environ.setdefault("DATABASE_URL", "postgresql://postgres:postgres@localhost:5432/postgres")
 
 
 def test_external_seed_query_timeout_is_visible_in_route_health(

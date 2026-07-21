@@ -1,13 +1,10 @@
 from __future__ import annotations
 
-import os
 from typing import Any, Dict
 
 import pytest
 from fastapi import HTTPException
 
-
-os.environ.setdefault("DATABASE_URL", "postgresql://postgres:postgres@localhost:5432/postgres")
 
 import services.buyer_reviews_service as buyer_reviews_service
 

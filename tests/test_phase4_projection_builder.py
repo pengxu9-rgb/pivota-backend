@@ -10,14 +10,11 @@ FastAPI TestClient.
 
 from __future__ import annotations
 
-import os
 from typing import Any, Dict, List, Optional
 
 import pytest
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
-
-os.environ.setdefault("DATABASE_URL", "sqlite:///:memory:")
 
 
 # =====================================================================

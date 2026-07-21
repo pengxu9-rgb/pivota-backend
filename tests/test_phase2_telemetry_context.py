@@ -10,12 +10,9 @@ deepseek_probe, bd_brand_signals) reads from the context correctly.
 from __future__ import annotations
 
 import asyncio
-import os
 from typing import Any, Dict, List, Optional
 
 import pytest
-
-os.environ.setdefault("DATABASE_URL", "sqlite:///:memory:")
 
 
 # =====================================================================

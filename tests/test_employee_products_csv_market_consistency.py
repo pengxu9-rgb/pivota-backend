@@ -11,13 +11,10 @@ so the data never reaches external_product_seeds.
 
 from __future__ import annotations
 
-import os
 import sys
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
-
-os.environ.setdefault("DATABASE_URL", "postgresql://user:pass@localhost:5432/testdb")
 
 from routes.employee_products import (  # noqa: E402
     MARKET_EXPECTED_CURRENCY,

@@ -6,12 +6,6 @@ pivota_canonical_pdp_url / make_pivota_canonical_fields).
 
 from __future__ import annotations
 
-import os
-
-os.environ.setdefault(
-    "DATABASE_URL", "postgresql://postgres:postgres@localhost:5432/postgres"
-)
-
 import pytest
 
 

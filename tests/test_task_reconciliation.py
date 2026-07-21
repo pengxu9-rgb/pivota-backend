@@ -6,13 +6,7 @@ SCOPE-AWARE, so an audit of SKU-B never closes SKU-A's still-valid tasks, and
 in-progress / standing tasks are never touched.
 """
 
-import os
-
 import pytest
-
-os.environ.setdefault(
-    "DATABASE_URL", "postgresql://postgres:postgres@localhost:5432/postgres"
-)
 
 from services import task_queue_service as tqs
 

@@ -9,12 +9,9 @@ side only, and SPF/PA suffixes drift on sunscreen titles.
 
 from __future__ import annotations
 
-import os
 from typing import Any, Dict
 
 import pytest
-
-os.environ.setdefault("DATABASE_URL", "sqlite+aiosqlite:///./pivota_test.db")
 
 from services.pdp_matcher.line_alias import alias_match_keys  # noqa: E402
 from services.pdp_matcher.retailer_match import (  # noqa: E402

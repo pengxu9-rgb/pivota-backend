@@ -12,11 +12,8 @@ absent on the page -> null / skipped, never fabricated, never blocks ingest.
 from __future__ import annotations
 
 import json
-import os
 
 import pytest
-
-os.environ.setdefault("DATABASE_URL", "sqlite+aiosqlite:///./pivota_test.db")
 
 from services.catalog_enrichment_agent import apply as apply_mod  # noqa: E402
 from services.catalog_enrichment_agent.ingestion import ingest_validated_jsonl  # noqa: E402

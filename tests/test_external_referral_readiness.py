@@ -1,10 +1,6 @@
-import os
 from datetime import datetime, timedelta, timezone
 
 import pytest
-
-
-os.environ.setdefault("DATABASE_URL", "postgresql://postgres:postgres@localhost:5432/postgres")
 
 
 def _iso_days_ago(days: int) -> str:

@@ -15,13 +15,10 @@ conversion. Covers, for BOTH builders (decoding the real signed token):
 
 from __future__ import annotations
 
-import os
 from typing import Any, Dict, Optional
 from urllib.parse import parse_qs, urlparse
 
 import pytest
-
-os.environ.setdefault("DATABASE_URL", "postgresql://user:pass@localhost:5432/testdb")
 
 from services.outbound_links_service import parse_and_verify_redirect_token  # noqa: E402
 

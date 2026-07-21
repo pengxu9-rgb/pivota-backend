@@ -7,10 +7,6 @@ skips the pair rather than risk collapsing two real products.
 
 from __future__ import annotations
 
-import os
-
-os.environ.setdefault("DATABASE_URL", "sqlite+aiosqlite:///./pivota_test.db")
-
 from scripts.merge_duplicate_canonicals import (  # noqa: E402
     _target_offer_id,
     resolve_winner_loser,

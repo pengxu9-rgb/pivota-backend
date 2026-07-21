@@ -20,15 +20,12 @@ a numeric variant id upgrades the join to cart_permalink (order-side join).
 from __future__ import annotations
 
 import json
-import os
 import sys
 from pathlib import Path
 from typing import Any, Dict, List
 from urllib.parse import parse_qs, urlparse
 
 import pytest
-
-os.environ.setdefault("DATABASE_URL", "postgresql://user:pass@localhost:5432/testdb")
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 

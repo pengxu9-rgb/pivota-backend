@@ -17,12 +17,9 @@ from __future__ import annotations
 
 import argparse
 import json
-import os
 from typing import Any, Dict, List
 
 import pytest
-
-os.environ.setdefault("DATABASE_URL", "sqlite+aiosqlite:///./pivota_test.db")
 
 import scripts.judge_stylekorean_residue as judge_cli  # noqa: E402
 

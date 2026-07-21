@@ -12,12 +12,9 @@ catalog_track/truth_tier/readiness_tier, which stamp the FIRST-PARTY label
 
 from __future__ import annotations
 
-import os
 from typing import Any, Dict, List, Optional
 
 import pytest
-
-os.environ.setdefault("DATABASE_URL", "postgresql://user:pass@localhost:5432/testdb")
 
 import services.audit_index_intake as intake  # noqa: E402
 

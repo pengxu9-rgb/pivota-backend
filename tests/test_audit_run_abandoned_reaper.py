@@ -20,8 +20,6 @@ from datetime import datetime, timedelta, timezone
 
 import pytest
 
-os.environ.setdefault("DATABASE_URL", "sqlite:///:memory:")
-
 
 @pytest.fixture
 async def sqlite_db(monkeypatch):

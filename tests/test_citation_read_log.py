@@ -4,14 +4,9 @@
 from __future__ import annotations
 
 import asyncio
-import os
 from typing import Any, List
 
 import pytest
-
-os.environ.setdefault(
-    "DATABASE_URL", "postgresql://postgres:postgres@localhost:5432/postgres"
-)
 
 import db.citation_read_log as crl
 

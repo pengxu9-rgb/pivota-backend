@@ -11,11 +11,8 @@ renders null scores + zero citations even though probes ran (and cost money).
 from __future__ import annotations
 
 import asyncio
-import os
 
 import pytest
-
-os.environ.setdefault("DATABASE_URL", "sqlite:///:memory:")
 
 MID = "merch_test"
 ITEM = {

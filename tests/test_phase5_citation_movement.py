@@ -7,12 +7,9 @@ calls services.agent_center_llm_client.probe, and compares scores.
 
 from __future__ import annotations
 
-import os
 from typing import Any, Dict, Optional
 
 import pytest
-
-os.environ.setdefault("DATABASE_URL", "sqlite:///:memory:")
 
 
 # =====================================================================

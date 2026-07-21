@@ -20,14 +20,9 @@ Coverage:
 
 from __future__ import annotations
 
-import os
 from typing import Any, Dict, List
 
 import pytest
-
-os.environ.setdefault(
-    "DATABASE_URL", "postgresql://postgres:postgres@localhost:5432/postgres"
-)
 
 from fastapi import FastAPI
 from fastapi.testclient import TestClient

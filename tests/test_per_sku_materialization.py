@@ -6,12 +6,6 @@ ZERO tasks — the action plan never reflected the audits merchants actually run
 This bridges each SKU's `next_best_action` into one task.
 """
 
-import os
-
-os.environ.setdefault(
-    "DATABASE_URL", "postgresql://postgres:postgres@localhost:5432/postgres"
-)
-
 from services.task_queue_service import _extract_action_items, _per_sku_action_items
 
 

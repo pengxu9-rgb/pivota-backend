@@ -7,11 +7,7 @@ charge so the lane is inert by default.
 
 from __future__ import annotations
 
-import os
-
 import pytest
-
-os.environ.setdefault("DATABASE_URL", "postgresql://user:pass@localhost:5432/testdb")
 
 from services import tier2_acp_lane as lane  # noqa: E402
 from services.tier2_acp_lane import (  # noqa: E402

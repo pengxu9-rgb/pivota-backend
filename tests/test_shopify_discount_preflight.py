@@ -1,8 +1,3 @@
-import os
-
-
-os.environ.setdefault("DATABASE_URL", "postgresql://user:pass@localhost:5432/test")
-
 import pytest
 
 from scripts.preflight_shopify_discounts import _baseline_result, _scenario_blocker

@@ -16,13 +16,10 @@ re-extraction lands. See routes/employee_products.py."""
 
 from __future__ import annotations
 
-import os
 import sys
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
-
-os.environ.setdefault("DATABASE_URL", "postgresql://user:pass@localhost:5432/testdb")
 
 from routes.employee_products import (  # noqa: E402
     _SEED_DATA_REVIEW_PRESERVE_KEYS,

@@ -1,9 +1,6 @@
-import os
 from decimal import Decimal
 
 import pytest
-
-os.environ.setdefault("DATABASE_URL", "postgresql://user:pass@localhost:5432/test")
 
 from services.shopify_storefront_pricing_service import (
     ShopifyStorefrontPricingService,

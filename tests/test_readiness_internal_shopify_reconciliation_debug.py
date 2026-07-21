@@ -1,10 +1,6 @@
-import os
-
 import pytest
 from starlette.requests import Request
 
-
-os.environ.setdefault("DATABASE_URL", "postgresql://user:pass@localhost:5432/testdb")
 
 from routes import readiness_internal
 

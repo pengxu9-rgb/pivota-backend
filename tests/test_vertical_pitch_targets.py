@@ -10,10 +10,6 @@ merchant-facing payload.
 
 from __future__ import annotations
 
-import os
-
-os.environ.setdefault("DATABASE_URL", "sqlite:///:memory:")
-
 from services.merchant_narrative_builder import (  # noqa: E402
     _vertical_pitch_targets,
     _where_youre_losing,

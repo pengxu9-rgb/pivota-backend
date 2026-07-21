@@ -3,14 +3,9 @@
 from __future__ import annotations
 
 import asyncio
-import os
 from typing import Any, Dict, Optional
 
 import pytest
-
-os.environ.setdefault(
-    "DATABASE_URL", "postgresql://postgres:postgres@localhost:5432/postgres"
-)
 
 from fastapi import FastAPI
 from fastapi.testclient import TestClient

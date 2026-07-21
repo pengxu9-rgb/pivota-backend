@@ -14,12 +14,9 @@ re-plumbs (audit / brand-authored / enrichment), including:
 
 from __future__ import annotations
 
-import os
 from typing import Any, Dict, List, Optional
 
 import pytest
-
-os.environ.setdefault("DATABASE_URL", "postgresql://user:pass@localhost:5432/testdb")
 
 import services.intake_identity as ii  # noqa: E402
 

@@ -8,12 +8,9 @@ httpx at the client boundary; no network.
 from __future__ import annotations
 
 import asyncio
-import os
 
 import httpx
 import pytest
-
-os.environ.setdefault("DATABASE_URL", "sqlite:///:memory:")
 
 import services.grounding_redirect_resolver as R  # noqa: E402
 

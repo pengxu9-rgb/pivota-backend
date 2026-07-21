@@ -6,13 +6,7 @@ per-SKU audit closes the audited product's legacy leftovers (page-usability Step
 residual found by live eyeball).
 """
 
-import os
-
 import pytest
-
-os.environ.setdefault(
-    "DATABASE_URL", "postgresql://postgres:postgres@localhost:5432/postgres"
-)
 
 from services import task_queue_service as tqs
 

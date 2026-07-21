@@ -8,10 +8,6 @@ crash-loop the app. These exercise the property's parsing directly.
 
 from __future__ import annotations
 
-import os
-
-os.environ.setdefault("DATABASE_URL", "postgresql://u:p@localhost:5432/testdb")
-
 from config.settings import Settings  # noqa: E402
 
 

@@ -1,11 +1,7 @@
 from __future__ import annotations
 
-import os
-
 import pytest
 
-
-os.environ.setdefault("DATABASE_URL", "postgresql://postgres:postgres@localhost:5432/postgres")
 
 import routes.employee_reviews as employee_reviews_routes
 

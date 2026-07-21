@@ -7,10 +7,6 @@ item so the session persists them to /complete.
 
 from __future__ import annotations
 
-import os
-
-os.environ.setdefault("DATABASE_URL", "postgresql://user:pass@localhost:5432/testdb")
-
 from services.pivota_acp_client import _acp_items  # noqa: E402
 
 

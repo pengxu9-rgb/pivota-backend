@@ -1,12 +1,5 @@
-import os
 import json
-import tempfile
 from contextlib import asynccontextmanager
-
-os.environ.setdefault(
-    "DATABASE_URL",
-    f"sqlite+aiosqlite:///{os.path.join(tempfile.gettempdir(), f'pivota_pdp_routes_{os.getpid()}.db')}",
-)
 
 from fastapi import FastAPI
 from fastapi.testclient import TestClient

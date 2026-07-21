@@ -4,13 +4,7 @@ action-plan scope surfaced an accumulated pile of identical pending tasks the ol
 latest_completed scope was masking; this self-heals it on read.
 """
 
-import os
-
 import pytest
-
-os.environ.setdefault(
-    "DATABASE_URL", "postgresql://postgres:postgres@localhost:5432/postgres"
-)
 
 from db import merchant_tasks as mt
 

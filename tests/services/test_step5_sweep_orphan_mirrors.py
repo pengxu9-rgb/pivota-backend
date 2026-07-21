@@ -8,10 +8,7 @@ summary shape.
 from __future__ import annotations
 
 import json
-import os
 from typing import Any, Dict
-
-os.environ.setdefault("DATABASE_URL", "postgresql://user:pass@localhost:5432/testdb")
 
 from scripts.step5_sweep_orphan_mirrors import (  # noqa: E402
     SUPPRESSION_REASON,

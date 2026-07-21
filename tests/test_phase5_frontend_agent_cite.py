@@ -6,12 +6,9 @@ Validates the JSON-LD extraction + brand-match logic.
 from __future__ import annotations
 
 import json
-import os
 from typing import Any, Dict, Optional
 
 import pytest
-
-os.environ.setdefault("DATABASE_URL", "sqlite:///:memory:")
 
 
 # =====================================================================

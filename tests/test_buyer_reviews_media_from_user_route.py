@@ -1,14 +1,11 @@
 from __future__ import annotations
 
-import os
 from typing import Any, Dict
 
 import pytest
 from fastapi import FastAPI, HTTPException
 from fastapi.testclient import TestClient
 
-
-os.environ.setdefault("DATABASE_URL", "postgresql://postgres:postgres@localhost:5432/postgres")
 
 from routes.accounts_orders_api import AccountsPrincipal, get_accounts_or_guest_principal_ugc
 from routes.buyer_reviews import router as buyer_reviews_router

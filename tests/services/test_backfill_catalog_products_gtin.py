@@ -8,12 +8,9 @@ when there's no usable barcode.
 from __future__ import annotations
 
 import argparse
-import os
 from typing import Any, Dict, List
 
 import pytest
-
-os.environ.setdefault("DATABASE_URL", "postgresql://user:pass@localhost:5432/testdb")
 
 import scripts.backfill_catalog_products_gtin as bf  # noqa: E402
 

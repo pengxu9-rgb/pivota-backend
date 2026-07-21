@@ -1,9 +1,3 @@
-import os
-
-
-os.environ.setdefault("DATABASE_URL", "postgresql://postgres:postgres@localhost:5432/postgres")
-
-
 def test_should_overwrite_seed_variants_allows_equal_score_when_more_variants() -> None:
     from routes.employee_products import _should_overwrite_seed_variants
 

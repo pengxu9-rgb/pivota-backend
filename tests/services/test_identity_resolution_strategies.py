@@ -2,10 +2,7 @@
 
 from __future__ import annotations
 
-import os
 from typing import Any, Dict, List
-
-os.environ.setdefault("DATABASE_URL", "postgresql://user:pass@localhost:5432/testdb")
 
 from services.identity_resolution_strategies import (  # noqa: E402
     JUNK_URL_RE,

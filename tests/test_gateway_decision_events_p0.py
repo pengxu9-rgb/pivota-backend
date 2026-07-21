@@ -14,12 +14,9 @@ Plus `derive_protocol_for_surface` unit coverage.
 from __future__ import annotations
 
 import asyncio
-import os
 from typing import Any, Dict, List
 
 import pytest
-
-os.environ.setdefault("DATABASE_URL", "postgresql://user:pass@localhost:5432/testdb")
 
 import routes.agent_shop_gateway as gw  # noqa: E402
 from services import agent_decision_event_store as store  # noqa: E402

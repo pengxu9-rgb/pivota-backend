@@ -1,8 +1,3 @@
-import os
-
-# Ensure db/database.py doesn't fail import-time validation in unit tests.
-os.environ.setdefault("DATABASE_URL", "postgresql://user:pass@localhost:5432/test")
-
 import json
 from decimal import Decimal
 

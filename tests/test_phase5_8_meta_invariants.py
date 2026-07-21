@@ -30,8 +30,6 @@ import re
 
 import pytest
 
-os.environ.setdefault("DATABASE_URL", "sqlite:///:memory:")
-
 
 _REPO_ROOT = pathlib.Path(__file__).resolve().parent.parent
 

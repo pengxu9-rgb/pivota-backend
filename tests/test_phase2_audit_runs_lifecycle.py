@@ -19,13 +19,9 @@ covered by integration tests against Postgres.
 from __future__ import annotations
 
 import asyncio
-import os
 from datetime import datetime, timedelta, timezone
 
 import pytest
-
-# Force SQLite before any module that touches db/database.py imports.
-os.environ.setdefault("DATABASE_URL", "sqlite:///:memory:")
 
 
 # =====================================================================

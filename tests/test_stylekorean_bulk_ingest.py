@@ -14,13 +14,10 @@ DB with real jsonb SQL, so they use fake DBs + string-level assertions:
 
 from __future__ import annotations
 
-import os
 import re
 from typing import Any, Dict, List
 
 import pytest
-
-os.environ.setdefault("DATABASE_URL", "sqlite+aiosqlite:///./pivota_test.db")
 
 from services.catalog_enrichment_agent import apply as apply_mod  # noqa: E402
 from services.catalog_enrichment_agent.bulk_writer import bulk_upsert, split_upsert_sql  # noqa: E402

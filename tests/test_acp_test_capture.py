@@ -7,11 +7,7 @@ production (flag-off) charge.
 
 from __future__ import annotations
 
-import os
-
 import pytest
-
-os.environ.setdefault("DATABASE_URL", "postgresql://user:pass@localhost:5432/testdb")
 
 from services.agent_checkout_kill_switch import resolve_acp_test_capture  # noqa: E402
 

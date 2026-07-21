@@ -16,14 +16,11 @@ reasons as error_message, while still recording genuine successes as
 
 from __future__ import annotations
 
-import os
 from typing import Any, Dict
 from unittest.mock import patch
 
 import httpx
 import pytest
-
-os.environ.setdefault("DATABASE_URL", "sqlite:///:memory:")
 
 
 def _result(
