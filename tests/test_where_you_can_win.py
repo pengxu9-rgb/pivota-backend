@@ -254,3 +254,57 @@ def test_reports_without_wedge_keep_legacy_behavior():
     out = build_where_you_can_win(reports)
     assert [s["query"] for s in out["skip"]] == ["best vitamin c serum"]
     assert out["targets"] == []
+
+
+# --- Challenger deliverable framing (founder review of the VODANA pilot,
+# run 452d9394: "Skip 5 / Contest 0 / Defend 0 basically tells the brand to
+# give up"). targets are the WIN-HERE bucket; skip is budget protection, and
+# an all-skip result must say the portfolio was head-only, not "give up".
+
+def test_targets_carry_win_here_bucket_and_skip_carries_framing():
+    reports = [
+        _report("BB Lab", "sku_b", [
+            {"query": "collagen for sleep", "normalized_query": "collagen for sleep",
+             "open_lane": True, "opportunity_score": 80.0, "attribute_fit": 0.9,
+             "demand_state": "open-lane", "attribute_basis": ["collagen", "sleep"]},
+            {"query": "best collagen", "normalized_query": "best collagen",
+             "open_lane": False, "ownership_state": "retailer-owned", "demand_signal": 0.9,
+             "who_owns": "sephora.com", "cited_evidence": {"competitors_named": ["Vital Proteins"]}},
+        ]),
+    ]
+    out = build_where_you_can_win(reports)
+    assert all(t["bucket"] == "win_here" for t in out["targets"])
+    assert all(s["bucket"] == "dont_burn_budget" for s in out["skip"])
+    # skip is framed as budget protection, not the deliverable...
+    assert "don't burn budget" in out["skip_note"]
+    # ...and with a real beachhead present there is no portfolio-gap note.
+    assert "no_beachhead_note" not in out
+
+
+def test_all_skip_carries_no_beachhead_note_not_give_up():
+    reports = [
+        _report("X", "sku_x", [
+            {"query": "best flat iron", "normalized_query": "best flat iron",
+             "open_lane": False, "ownership_state": "publisher-owned", "demand_signal": 0.9,
+             "who_owns": "forbes.com", "cited_evidence": {"competitors_named": ["GHD"]}},
+        ]),
+    ]
+    out = build_where_you_can_win(reports)
+    assert out["has_targets"] is False
+    # The all-skip case names the PORTFOLIO gap and the wedge lanes to probe
+    # next — never a bare give-up list.
+    note = out["no_beachhead_note"]
+    assert "head term" in note
+    assert "wedge" in note
+
+
+def test_no_skip_no_notes():
+    reports = [
+        _report("A", "sku_a", [
+            {"query": "niche q", "normalized_query": "niche q", "open_lane": True,
+             "opportunity_score": 40.0, "attribute_fit": 0.7, "attribute_basis": ["x"]},
+        ]),
+    ]
+    out = build_where_you_can_win(reports)
+    assert "skip_note" not in out
+    assert "no_beachhead_note" not in out

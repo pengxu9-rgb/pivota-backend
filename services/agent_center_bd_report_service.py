@@ -7848,17 +7848,44 @@ def build_where_you_can_win(
     skip = sorted(
         skip_by_q.values(), key=lambda s: -float(s.get("demand_signal") or 0)
     )[:max_skip]
+    # Explicit bucket semantics (founder review of the VODANA pilot: "Skip 5 /
+    # Contest 0 / Defend 0 basically tells the brand to give up"). targets ARE
+    # the deliverable — the beachhead lanes to win — so they carry the
+    # "win_here" bucket; skip is a budget-protection note, not the plan.
+    for t in targets:
+        t["bucket"] = "win_here"
+    for s in skip:
+        s["bucket"] = "dont_burn_budget"
     # demand_proxies: which ranking signals the operator can choose between.
     # 'probe' (single-audit probe demand, the default rank) is always available;
     # 'recurrence' (cross-merchant) is populated by attach_niche_recurrence when
     # the history table has data; 'community' is a future method.
-    return {
+    out: Dict[str, Any] = {
         "targets": targets,
         "skip": skip,
         "has_targets": bool(targets),
         "demand_proxies": ["probe"],
         "demand_proxy_default": "probe",
     }
+    if skip:
+        out["skip_note"] = (
+            "These head terms are controlled by an incumbent or platform today "
+            "— don't burn budget here yet. Win the win-here lanes first, then "
+            "re-audit to see the heads from a position of strength."
+        )
+    if not targets and skip:
+        # All-skip with no beachhead is a portfolio gap, not a verdict on the
+        # brand: every probed lane was an owned head term. Say so, and point at
+        # the wedge lanes to probe next (suggested_prompts / custom prompts)
+        # instead of handing the merchant a give-up list.
+        out["no_beachhead_note"] = (
+            "Every probed query was a head term another brand or platform "
+            "already owns — that measures where you can't win, not where you "
+            "can. Probe wedge lanes next: differentiator/outcome queries, "
+            "price-band queries, and alternative-to-{incumbent} queries (see "
+            "suggested_prompts, or add them as custom prompts on the next run)."
+        )
+    return out
 
 
 async def attach_niche_recurrence(
@@ -9235,6 +9262,35 @@ def _term_repeats_category(
     return bool(head_nouns & term_tokens)
 
 
+# Common "best X under $N" bands shoppers actually ask in. The wedge picks the
+# smallest band at/above the SKU's best-known price; above the top band there is
+# no budget-wedge story (a $450 tool is not an "under $N" pitch), so no shape.
+_WEDGE_PRICE_BANDS_USD = (25, 40, 50, 70, 100, 150, 200)
+
+
+def _wedge_price_band_usd(sku_ctx: Dict[str, Any]) -> Optional[int]:
+    """Price-anchored wedge band for this SKU: the smallest common "under $N"
+    band >= its best-known offer price. None without a usable price (or when
+    a non-USD currency is stated) — the shape is omitted, never guessed."""
+    prices: List[float] = []
+    for offer in _get_offers(sku_ctx or {}):
+        currency = str(offer.get("currency") or "").strip().upper()
+        if currency and currency != "USD":
+            continue
+        for key in ("merchant_effective_price", "estimated_best_price", "list_price"):
+            value = _as_number(offer.get(key))
+            if value is not None and value > 0:
+                prices.append(float(value))
+                break
+    if not prices:
+        return None
+    best = min(prices)
+    for band in _WEDGE_PRICE_BANDS_USD:
+        if best <= band:
+            return band
+    return None
+
+
 def _unbranded_category_specs(
     *,
     category: str,
@@ -9242,6 +9298,7 @@ def _unbranded_category_specs(
     topics: List[str],
     bullets: List[str],
     profile: VerticalProfile = BEAUTY_PROFILE,
+    price_band_usd: Optional[int] = None,
 ) -> List[Tuple[str, str]]:
     category = _clean_prompt_term(category)
     if not category or category in _GENERIC_CONTAINER_CATEGORIES:
@@ -9259,6 +9316,25 @@ def _unbranded_category_specs(
         (f"best {category}", "category"),
         (f"what {category} should I buy", "category"),
     ]
+
+    # Challenger-wedge shapes (profile config pack + SKU price), emitted right
+    # after the two diagnostic head terms so a small prompts_per_sku budget
+    # still probes lanes a challenger can WIN, not only the heads an incumbent
+    # owns (head-only portfolio -> 0 targets / 5 skip, VODANA run 452d9394;
+    # wedge portfolio -> 4 targets incl. beachhead, run 7b345df0). Three
+    # shapes: buyer-outcome ("{cat} that doesn't snag or pull hair"),
+    # price-anchored ("best {cat} under $70"), and alternative-seeker
+    # ("affordable GHD alternative"). Empty config + no price -> byte-unchanged.
+    for outcome in (getattr(profile, "seed_outcome_terms", ()) or ())[:3]:
+        outcome = _clean_prompt_term(outcome)
+        if outcome:
+            specs.append((f"{category} that {outcome}", "category"))
+    if price_band_usd and int(price_band_usd) > 0:
+        specs.append((f"best {category} under ${int(price_band_usd)}", "category"))
+    for incumbent in (getattr(profile, "wedge_incumbent_brands", ()) or ())[:2]:
+        incumbent = str(incumbent or "").strip()
+        if incumbent:
+            specs.append((f"affordable {incumbent} alternative", "category"))
 
     use_cases = [
         cleaned
@@ -9424,6 +9500,7 @@ def _build_per_sku_base_query_specs(
             topics=topics,
             bullets=bullets,
             profile=profile,
+            price_band_usd=_wedge_price_band_usd(sku_ctx or {}),
         )
     )
     # LLM value-prop discovery prompts (extract_winnable_prompts, stashed on

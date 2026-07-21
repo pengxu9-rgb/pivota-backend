@@ -65,6 +65,54 @@ OUTREACH_DRAFT_READY = "draft_ready"
 OUTREACH_SUBMISSION_ONLY = "submission_only"
 OUTREACH_TARGET_ONLY = "target_only"
 
+# Earnable-first ladder. The win plan exists only over queries the brand is
+# LOSING, so its reader is by construction a brand with no visibility on those
+# lanes — and for that brand the old prestige-first ordering inverted the real
+# path: it told a challenger to pitch Forbes before the Reddit thread / YouTube
+# review / retailer review section AI actually grounds shopping answers on and
+# that the brand can earn this quarter (VODANA run 452d9394 ranked forbes.com
+# first). Lower rank = more earnable = surfaced first. Prestige editorial
+# (tier 1) is the long game and sorts last among classified hosts.
+_EARNABILITY_COMMUNITY = 0      # forum / reddit / community threads
+_EARNABILITY_CREATOR = 1        # creator / video / social reviews
+_EARNABILITY_RETAIL = 2         # retailer / marketplace / review aggregators
+_EARNABILITY_EDITORIAL = 3      # niche + mid-tier editorial (tier >= 2)
+_EARNABILITY_PRESTIGE = 4       # tier-1 editorial (Forbes, GH, ...)
+_EARNABILITY_UNKNOWN = 5
+_EARNABILITY_BY_TYPE = {
+    "forum": _EARNABILITY_COMMUNITY,
+    "reddit": _EARNABILITY_COMMUNITY,
+    "community": _EARNABILITY_COMMUNITY,
+    "creator": _EARNABILITY_CREATOR,
+    "video": _EARNABILITY_CREATOR,
+    "social": _EARNABILITY_CREATOR,
+    "review_aggregator": _EARNABILITY_RETAIL,
+    "retailer": _EARNABILITY_RETAIL,
+    "marketplace": _EARNABILITY_RETAIL,
+    "editorial": _EARNABILITY_EDITORIAL,
+    "trade": _EARNABILITY_EDITORIAL,
+}
+
+
+def earnability_rank(meta: Dict[str, Any]) -> int:
+    """How earnable a cited host is for a brand that is currently losing the
+    query — the sort key for win-plan targets and the rollup host list. Reads
+    the registry classification (`classify_host` meta): community first, then
+    creator, then retail surfaces, then editorial — with tier-1 editorial
+    demoted to prestige (last among classified). Unknown hosts sort last."""
+    host_type = str((meta or {}).get("type") or "").strip().lower()
+    rank = _EARNABILITY_BY_TYPE.get(host_type)
+    if rank is None:
+        return _EARNABILITY_UNKNOWN
+    if rank == _EARNABILITY_EDITORIAL:
+        tier = (meta or {}).get("tier")
+        try:
+            if tier is not None and int(tier) <= 1:
+                return _EARNABILITY_PRESTIGE
+        except (TypeError, ValueError):
+            pass
+    return rank
+
 
 def _is_category_axis(axis: Optional[str]) -> bool:
     return str(axis or "").strip().lower() in _CATEGORY_DISCOVERY_AXES
@@ -180,6 +228,7 @@ def _target(
         "host": host,
         "role": row.get("citation_role"),
         "tier": meta.get("tier"),
+        "earnability": earnability_rank(meta),
         "applies_to_merchant_category": meta.get("applies_to_merchant_category"),
         "outreach": outreach,
     }
@@ -322,9 +371,18 @@ def _losing_query_plan(
         )
         for r in endorsement_rows
     ]
-    # Tier-then-host so the highest-leverage publisher leads even at a single
-    # cite (ADR-004 open Q2); unknown tier sorts last.
-    targets.sort(key=lambda t: (t.get("tier") is None, t.get("tier") or 0, t.get("host") or ""))
+    # Earnable-first (was tier-then-host, which led with prestige): community /
+    # creator / retail surfaces the losing brand can actually earn lead; tier-1
+    # editorial trails as the long game. Within a class, tier (when present)
+    # then host keeps the order stable.
+    targets.sort(
+        key=lambda t: (
+            t.get("earnability", _EARNABILITY_UNKNOWN),
+            t.get("tier") is None,
+            t.get("tier") or 0,
+            t.get("host") or "",
+        )
+    )
     targets = targets[:_MAX_TARGETS_PER_QUERY]
 
     limit: Optional[str] = None
@@ -547,13 +605,18 @@ def build_win_plan(
             sku_plans.append(plan)
 
     losing_total = sum(p["coverage"]["losing_category_queries"] for p in sku_plans)
-    hosts_to_win: set = set()
+    # host -> best (lowest) earnability across every query it grounds, so the
+    # rollup list leads with the surfaces the brand can earn (was plain
+    # sorted(), which ranked forbes.com first by alphabet).
+    hosts_to_win: Dict[str, int] = {}
     draft_ready_hosts: set = set()
     pitch_ready_hosts: set = set()
     for p in sku_plans:
         for q in p["losing_queries"]:
             for t in q["grounds_in"]:
-                hosts_to_win.add(t["host"])
+                rank = t.get("earnability", _EARNABILITY_UNKNOWN)
+                prev = hosts_to_win.get(t["host"])
+                hosts_to_win[t["host"]] = rank if prev is None else min(prev, rank)
                 if t["outreach"]["state"] == OUTREACH_DRAFT_READY:
                     draft_ready_hosts.add(t["host"])
                 if t["outreach"].get("pitch_draft"):
@@ -580,7 +643,13 @@ def build_win_plan(
         "sku_plans": sku_plans,
         "rollup": {
             "losing_category_queries": losing_total,
-            "independent_hosts_to_win": sorted(hosts_to_win),
+            # Earnable-first, then host for stability — see earnability_rank.
+            "independent_hosts_to_win": [
+                host
+                for host, _rank in sorted(
+                    hosts_to_win.items(), key=lambda kv: (kv[1], kv[0])
+                )
+            ],
             # draft_ready_hosts = an emailable recipient exists (registry fact);
             # pitch_ready_hosts = a one-click draft actually rendered (email +
             # matching playbook template). The latter is the true "act now" count.

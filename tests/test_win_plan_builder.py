@@ -139,14 +139,67 @@ def test_outreach_state_degrades_off_real_registry():
     assert byrdie["outreach"]["recipient"] is None
 
 
-def test_targets_ordered_tier_then_host():
+def test_targets_ordered_earnable_first():
     fx = _aruen_fixture()
     plan = build_win_plan(**fx)
     q = _query(_collagen_plan(plan), "best collagen cream")
     hosts = [t["host"] for t in q["grounds_in"]]
-    # tier-1 publishers lead (byrdie/forbes, alpha within tier), tier-3 GH last.
-    assert hosts.index("byrdie.com") < hosts.index("goodhousekeeping.com")
-    assert hosts.index("forbes.com") < hosts.index("goodhousekeeping.com")
+    # Earnable-first: tier-3 GH (attainable mid-tier editorial) leads; the
+    # tier-1 prestige publishers (byrdie/forbes) trail as the long game. The
+    # win plan's reader is by construction a brand LOSING these queries —
+    # prestige-first told a challenger to pitch Forbes before anything it
+    # could actually earn (VODANA run 452d9394).
+    assert hosts.index("goodhousekeeping.com") < hosts.index("byrdie.com")
+    assert hosts.index("goodhousekeeping.com") < hosts.index("forbes.com")
+    # Every target carries its earnability rank for renderers.
+    assert all(isinstance(t["earnability"], int) for t in q["grounds_in"])
+
+
+def test_community_and_creator_targets_lead_prestige_editorial():
+    # A losing query grounded across the whole ladder: community (reddit),
+    # creator (youtube), and tier-1 editorial (forbes). The challenger ordering
+    # surfaces the earnable surfaces first and prestige last — in the per-query
+    # targets, the win condition, and the rollup host list.
+    per_sku_reports = [
+        {
+            "sku_key": "flatiron",
+            "sku_title": "Softbar Flat Iron",
+            "failing_prompts": [
+                {
+                    "query": "best flat iron for fine hair",
+                    "axis": "category",
+                    "grounding_sources": [
+                        _src("vx://forbes-1"),
+                        _src("vx://reddit-1"),
+                        _src("vx://youtube-1"),
+                    ],
+                    "competitors_named": ["GHD"],
+                }
+            ],
+        }
+    ]
+    authority_map = {
+        "skus": [
+            {
+                "sku_key": "flatiron",
+                "authority_hosts": [
+                    _host_row("forbes.com", "editorial_review", ["vx://forbes-1"]),
+                    _host_row("reddit.com", "forum", ["vx://reddit-1"]),
+                    _host_row("youtube.com", "creator", ["vx://youtube-1"]),
+                ],
+            }
+        ]
+    }
+    plan = build_win_plan(per_sku_reports=per_sku_reports, authority_map=authority_map)
+    q = plan["sku_plans"][0]["losing_queries"][0]
+    assert [t["host"] for t in q["grounds_in"]] == [
+        "reddit.com", "youtube.com", "forbes.com",
+    ]
+    # The win condition names the earnable surfaces first, not Forbes-first.
+    assert q["win_condition"].startswith("Get cited in reddit.com / youtube.com")
+    assert plan["rollup"]["independent_hosts_to_win"] == [
+        "reddit.com", "youtube.com", "forbes.com",
+    ]
 
 
 def test_competitor_benchmark_and_win_condition():
@@ -213,10 +266,12 @@ def test_coverage_and_rollup_counts():
     assert cov["queries_with_draft_ready_target"] == 1         # forbes on that query
     roll = plan["rollup"]
     assert roll["losing_category_queries"] == 2
+    # Earnable-first: GH (tier 3, attainable) leads; byrdie/forbes (tier-1
+    # prestige) trail alphabetically within their rank.
     assert roll["independent_hosts_to_win"] == [
+        "goodhousekeeping.com",
         "byrdie.com",
         "forbes.com",
-        "goodhousekeeping.com",
     ]
     assert roll["draft_ready_hosts"] == ["forbes.com"]
 
