@@ -238,7 +238,14 @@ def harvest_prompt_basis(
         if int(basis.get("basis_version") or 0) != PROMPT_BASIS_VERSION:
             return None  # generators changed — explicit regeneration event
         tier = normalize_audit_tier(audit_tier)
-        if normalize_audit_tier(basis.get("audit_tier")) != tier:
+        # Compare the RAW stored tier (missing key = legacy = standard), not a
+        # normalized one: a tier stamped by newer code ("ultra") must read as
+        # unusable here — pinning it into a standard run during a mixed deploy
+        # would be the exact cross-tier reuse this gate exists to prevent.
+        stored_tier = (
+            str(basis.get("audit_tier") or AUDIT_TIER_STANDARD).strip().lower()
+        )
+        if stored_tier != tier:
             return None  # tier switch — explicit baseline reset, never pin across
         list_cap = max_prompts_per_list_for_tier(tier)
         winnable = _clean_prompts(basis.get("winnable"), max_prompts=list_cap)

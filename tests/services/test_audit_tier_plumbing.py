@@ -136,6 +136,18 @@ def test_tier_stamped_basis_pins_only_its_own_tier():
     assert pinned is not None and pinned["audit_tier"] == AUDIT_TIER_DEEP
 
 
+def test_unknown_stored_tier_is_unusable_not_standard():
+    # A tier stamped by NEWER code ("ultra") must not collapse into standard
+    # during a mixed deploy — unusable (None) is the safe reading, mirroring
+    # the version-mismatch treatment.
+    report = _report_with_basis("sku-1", _basis(audit_tier="ultra"))
+    assert harvest_prompt_basis(report, sku_key="sku-1") is None
+    assert (
+        harvest_prompt_basis(report, sku_key="sku-1", audit_tier=AUDIT_TIER_DEEP)
+        is None
+    )
+
+
 def test_deep_harvest_keeps_18_item_lists():
     winnable = [f"winnable prompt {i}" for i in range(25)]
     report = _report_with_basis(
@@ -146,6 +158,89 @@ def test_deep_harvest_keeps_18_item_lists():
     )
     assert pinned is not None
     assert len(pinned["winnable"]) == 18  # deep cap, not the standard 12
+
+
+@pytest.fixture()
+def _patched_run_store(monkeypatch):
+    """Patch the db module load_prior_prompt_basis imports lazily (mirrors
+    tests/services/test_prompt_basis.py); the test fills store['reports']."""
+    import db.merchant_audit_runs as mar
+
+    store: Dict[str, Any] = {"runs": [], "reports": {}}
+
+    async def fake_recent(**_kwargs):
+        return store["runs"]
+
+    async def fake_fetch(*, run_id: str):
+        report = store["reports"].get(run_id)
+        return {"run_id": run_id, "report_jsonb": report} if report else None
+
+    monkeypatch.setattr(mar, "recent_runs_for_merchant", fake_recent)
+    monkeypatch.setattr(mar, "fetch_audit_run_by_id", fake_fetch)
+    return store
+
+
+@pytest.mark.asyncio
+async def test_resolve_pinned_path_is_tier_scoped(_patched_run_store):
+    """THE invariant, end-to-end through resolve_prompt_basis: a stored
+    STANDARD basis must not pin a deep run (deep generates fresh), while the
+    same store pins a standard run. Guards the audit_tier= threading into
+    load_prior_prompt_basis — dropping it would silently default to standard
+    and reintroduce cross-tier reuse."""
+    _patched_run_store["runs"] = [
+        {"run_id": "run-1", "status": "succeeded", "subject_type": "merchant",
+         "product_keys": []},
+    ]
+    _patched_run_store["reports"]["run-1"] = _report_with_basis(
+        "sku-1", _basis()  # legacy/standard basis
+    )
+
+    async def gen(_prefix: str):
+        return [f"{_prefix} prompt {i}" for i in range(3)]
+
+    async def gen_winnable():
+        return await gen("winnable")
+
+    async def gen_scenario():
+        return await gen("scenario")
+
+    deep = await resolve_prompt_basis(
+        merchant_id="m1", sku_key="sku-1",
+        generate_winnable=gen_winnable, generate_scenario=gen_scenario,
+        audit_tier=AUDIT_TIER_DEEP,
+    )
+    assert deep["meta"]["source"] == "fresh"  # baseline reset, no cross-tier pin
+    assert deep["meta"]["audit_tier"] == AUDIT_TIER_DEEP
+
+    standard = await resolve_prompt_basis(
+        merchant_id="m1", sku_key="sku-1",
+        generate_winnable=gen_winnable, generate_scenario=gen_scenario,
+    )
+    assert standard["meta"]["source"] == "pinned"
+    assert standard["meta"]["audit_tier"] == AUDIT_TIER_STANDARD
+    assert standard["winnable"] == _basis()["winnable"]
+
+
+@pytest.mark.asyncio
+async def test_resolve_pinned_path_reuses_same_tier_deep_basis(_patched_run_store):
+    _patched_run_store["runs"] = [
+        {"run_id": "run-1", "status": "succeeded", "subject_type": "merchant",
+         "product_keys": []},
+    ]
+    _patched_run_store["reports"]["run-1"] = _report_with_basis(
+        "sku-1", _basis(audit_tier="deep")
+    )
+
+    async def boom():
+        raise AssertionError("pinned path must not call generators")
+
+    pinned = await resolve_prompt_basis(
+        merchant_id="m1", sku_key="sku-1",
+        generate_winnable=boom, generate_scenario=boom,
+        audit_tier=AUDIT_TIER_DEEP,
+    )
+    assert pinned["meta"]["source"] == "pinned"
+    assert pinned["meta"]["audit_tier"] == AUDIT_TIER_DEEP
 
 
 @pytest.mark.asyncio

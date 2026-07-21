@@ -1186,7 +1186,14 @@ def _launch_prompts_per_sku(
     launch_options: Dict[str, Any], audit_tier: str = "standard"
 ) -> int:
     """Explicit prompts_per_sku (internal/testing knob) wins; otherwise the
-    tier decides (standard 40, deep 80). Merchants never set a raw count."""
+    tier decides (standard 40, deep 80). Merchants never set a raw count.
+
+    CAUTION for the slice that wires audit_tier into a launch route:
+    routes/audit_runs_routes.py today ALWAYS persists prompts_per_sku (Pydantic
+    default 40), which this precedence reads as an operator override — a deep
+    launch through that route unchanged would probe 40 prompts while pinning a
+    deep-scoped basis. That route must omit prompts_per_sku when it equals the
+    standard default (or stop sending it) before it sends audit_tier."""
     from services.prompt_basis import prompts_per_sku_for_tier
 
     default = prompts_per_sku_for_tier(audit_tier)
