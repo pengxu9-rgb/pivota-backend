@@ -102,6 +102,17 @@ def build_sku_opportunity(
     product = _get_product(sku_ctx)
     graph = attribute_graph if isinstance(attribute_graph, dict) else {}
     runs = _flatten_probe_runs(probe_runs)
+    # Deep-tier comparison probes are INTERNAL-FIRST (founder 2026-07-21):
+    # dropped here — the single choke point every merchant-facing per-prompt
+    # surface (competitiveness, channel appearance, playbook, win plan,
+    # substitution alert, aggregates below) reads from — until competitor-name
+    # quality is validated on the pilot. Raw probe payloads keep the runs, so
+    # substitution data accrues and flipping the surface needs no re-probe.
+    # Gate = deep-tier source stamp AND comparison axis; a bare
+    # axis="comparison" from any other path keeps its existing behavior.
+    from services.deep_tier_prompts import run_is_internal_comparison
+
+    runs = [run for run in runs if not run_is_internal_comparison(run)]
     groups = _group_runs_by_query(runs)
     all_providers = _expected_providers(runs)
 
