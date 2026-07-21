@@ -46,6 +46,7 @@ from services.executor_agents.base import (
 # Single source of truth for the Gemini key resolution (GEMINI_API_KEY /
 # PIVOTA_GEMINI_API_KEY) — shared with the content-brief executor.
 from services.executor_agents.content_brief import _resolve_gemini_api_key
+from services import vertex_gemini
 
 logger = logging.getLogger(__name__)
 
@@ -69,7 +70,6 @@ _CONTENT_THIN_SCORE = 70
 _MIN_GENERATED_DESCRIPTION_CHARS = 200
 
 _GEMINI_MODEL = "gemini-2.5-flash"
-_GEMINI_BASE_URL = "https://generativelanguage.googleapis.com/v1beta"
 _GEMINI_TIMEOUT_S = 30.0
 # R4 reliability: ~55% of single-attempt grounded calls failed — grounded
 # gemini-2.5-flash wraps JSON in prose/citations or truncates the JSON when
@@ -454,8 +454,8 @@ async def _generate_enrichment(
         },
         "tools": [{"google_search": {}}],
     }
-    url = f"{_GEMINI_BASE_URL}/models/{_GEMINI_MODEL}:generateContent"
-    headers = {"Content-Type": "application/json", "x-goog-api-key": api_key}
+    url = vertex_gemini.generate_content_url(_GEMINI_MODEL)
+    headers = await vertex_gemini.auth_headers(api_key)
     sid = candidate.get("source_product_id")
     last_reason = "unknown"
     for attempt in range(1, max_attempts + 1):

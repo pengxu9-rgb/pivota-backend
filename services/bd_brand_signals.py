@@ -36,6 +36,7 @@ from urllib.parse import urlparse
 from xml.etree import ElementTree as ET
 
 import httpx
+from services import vertex_gemini
 
 logger = logging.getLogger(__name__)
 
@@ -59,7 +60,6 @@ _GEMINI_MODEL = "gemini-2.5-flash"
 # fallback); until that lands it just points at the stable flash model.
 # Full write-up: ~/tmp/social-grounding-check/verdict.md.
 _GEMINI_SOCIAL_MODEL = "gemini-2.5-flash"
-_GEMINI_BASE_URL = "https://generativelanguage.googleapis.com/v1beta"
 # A grounded call that actually runs a web search legitimately takes
 # longer than a from-memory answer — and the Pro tier longer still. The
 # old flat 20s timeout was the dominant social-probe failure mode (43%
@@ -879,8 +879,8 @@ async def _gemini_extract_call(
         "contents": [{"role": "user", "parts": [{"text": prompt}]}],
         "generationConfig": {"temperature": 0.1, "maxOutputTokens": 4096},
     }
-    url = f"{_GEMINI_BASE_URL}/models/{model}:generateContent"
-    headers = {"Content-Type": "application/json", "x-goog-api-key": api_key}
+    url = vertex_gemini.generate_content_url(model)
+    headers = await vertex_gemini.auth_headers(api_key)
     r = None
     last_exc: Optional[BaseException] = None
     for attempt in (1, 2):

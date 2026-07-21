@@ -28,6 +28,7 @@ from services.executor_agents.base import (
 )
 # Single source of truth for the Gemini key resolution.
 from services.executor_agents.content_brief import _resolve_gemini_api_key
+from services import vertex_gemini
 
 logger = logging.getLogger(__name__)
 
@@ -37,7 +38,6 @@ _MAX_QUERIES = 8
 _MAX_COMPETITORS_PER_QUERY = 5
 
 _GEMINI_MODEL = "gemini-2.5-flash"
-_GEMINI_BASE_URL = "https://generativelanguage.googleapis.com/v1beta"
 _GEMINI_TIMEOUT_S = 25.0
 
 
@@ -154,8 +154,8 @@ async def _extract_win_reasons(
         "contents": [{"role": "user", "parts": [{"text": _build_prompt(rows)}]}],
         "generationConfig": {"temperature": 0.2, "maxOutputTokens": 2048},
     }
-    url = f"{_GEMINI_BASE_URL}/models/{_GEMINI_MODEL}:generateContent"
-    headers = {"Content-Type": "application/json", "x-goog-api-key": api_key}
+    url = vertex_gemini.generate_content_url(_GEMINI_MODEL)
+    headers = await vertex_gemini.auth_headers(api_key)
     try:
         async with httpx.AsyncClient(timeout=timeout_s) as client:
             r = await client.post(url, headers=headers, json=body)
