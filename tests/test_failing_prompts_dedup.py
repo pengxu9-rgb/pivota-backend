@@ -78,3 +78,22 @@ def test_win_plan_merge_reads_both_entry_shapes():
     }
     assert plan_providers(new_shape) == ["chatgpt", "gemini"]  # sorted label
     assert plan_providers(old_shape) == ["chatgpt"]
+
+
+def test_errored_runs_are_not_failing_evidence():
+    """An upstream-errored run (`__error__:` raw / `error` key) never answered,
+    so it is not evidence the engine failed to cite — pre-fix a wholesale-
+    errored provider lane listed every one of its prompts as failing and
+    stamped itself into `providers` (2026-07-21 scale smoke, run 509cf81c)."""
+    out = _failing_prompts([
+        _fail("best camera drone", "gemini"),
+        {"query": "best camera drone", "_provider": "chatgpt",
+         "raw": "__error__:429 You exceeded your current quota", "parsed": None},
+        {"query": "drone for travel", "_provider": "chatgpt",
+         "raw": "__error__:429 You exceeded your current quota"},
+        {"query": "drone under 500", "_provider": "gemini", "error": "quota"},
+    ])
+    # Only the genuinely-answered failing run survives; the errored chatgpt
+    # run neither adds queries nor joins the failing-engine union.
+    assert [e["query"] for e in out] == ["best camera drone"]
+    assert out[0]["providers"] == ["gemini"]

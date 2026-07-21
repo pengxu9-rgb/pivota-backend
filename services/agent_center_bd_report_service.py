@@ -4154,7 +4154,16 @@ def compute_citation_score(
     """
     product = _get_product(sku_ctx or {})
     sku = _get_sku(sku_ctx or {})
-    runs = _flatten_probe_runs(per_sku_probe_runs)
+    # Upstream-errored runs (`__error__:` raw / `error` key) are excluded from
+    # every rate: an errored run is not a real "answered but didn't cite" run,
+    # so it must not sit in the denominator diluting first_party/sku_mention
+    # rates (same rule as the deep rollup, #1550). A provider whose runs ALL
+    # errored therefore falls through to the no-signal path below — matching
+    # the probe_failed handling in build_citation_by_provider.
+    runs = [
+        r for r in _flatten_probe_runs(per_sku_probe_runs)
+        if not _run_is_error(r)
+    ]
     breakdown: Dict[str, Any] = {}
     missing: List[str] = []
     denominator = len(runs)
@@ -4484,6 +4493,12 @@ def _any_provider_probe_runs(
 ) -> List[Dict[str, Any]]:
     grouped_runs: Dict[Tuple[str, str, str], List[Dict[str, Any]]] = defaultdict(list)
     for run in _flatten_probe_runs(per_sku_probe_runs):
+        # Drop upstream-errored runs BEFORE the merge: an errored run seeding
+        # the merged row (dict(runs[0])) would carry its `__error__:` raw as
+        # the merged answer text, and a prompt whose runs all errored would
+        # inflate the any-provider prompt denominator (#1550's rule).
+        if _run_is_error(run):
+            continue
         grouped_runs[_citation_prompt_key(run)].append(run)
     merged_runs = [
         _merge_runs_for_any_provider(runs, sku_ctx=sku_ctx)
@@ -4614,7 +4629,11 @@ def build_citation_by_provider(
         out[provider] = {
             "score": score,
             "breakdown": breakdown,
-            "prompts": len(_flatten_probe_runs(probes)),
+            # Only runs that produced a real answer count as measured prompts —
+            # a partially-errored lane must not report inflated coverage.
+            "prompts": sum(
+                1 for r in _flatten_probe_runs(probes) if not _run_is_error(r)
+            ),
         }
     return out
 
@@ -5223,8 +5242,14 @@ def _merchant_visible_probe_payloads(
 
 
 def _axis_coverage(probe_runs: Any) -> Dict[str, int]:
+    """Probe counts per coarse axis. Upstream-errored runs are excluded — a
+    `__error__:` run measured nothing, so a provider lane erroring wholesale
+    (2026-07-21 scale smoke: all 143 Gemini runs) must not read as covered
+    axes. Mirrors the deep-rollup exclusion (#1550)."""
     counts: Counter = Counter()
     for run in _flatten_probe_runs(probe_runs):
+        if _run_is_error(run):
+            continue
         meta = run.get("axis_metadata") if isinstance(run.get("axis_metadata"), dict) else {}
         axis = str(meta.get("axis") or "unknown").strip() or "unknown"
         counts[axis] += 1
@@ -5249,6 +5274,10 @@ def _query_class_coverage(probe_runs: Any) -> Dict[str, int]:
     counts = {QUERY_CLASS_BRANDED: 0, QUERY_CLASS_CATEGORY: 0}
     for run in _flatten_probe_runs(probe_runs):
         if _run_is_internal_comparison(run):
+            continue
+        # Upstream-errored runs measured nothing — same exclusion as
+        # _axis_coverage / the deep rollup (#1550).
+        if _run_is_error(run):
             continue
         counts[_run_query_class(run)] += 1
     return counts
@@ -6316,6 +6345,12 @@ def _failing_prompts(
         # v1 gate exists to hold back.
         if _run_is_internal_comparison(run):
             continue
+        # An upstream-errored run is not evidence the engine failed to cite —
+        # the engine never answered. Without this, a provider lane erroring
+        # wholesale lists every one of its prompts as "failing" and stamps
+        # that engine into `providers` on queries it never actually answered.
+        if _run_is_error(run):
+            continue
         parsed = run.get("parsed") if isinstance(run.get("parsed"), dict) else {}
         url_match = run.get("url_match") if isinstance(run.get("url_match"), dict) else {}
         llm_report = url_match.get("llm_self_report") if isinstance(url_match.get("llm_self_report"), dict) else {}
@@ -6496,6 +6531,10 @@ def build_custom_prompt_results(
             run
             for run in runs_by_prompt.get(prompt, [])
             if str(run.get("status") or "") != "probe_failed"
+            # An `__error__:` run measured nothing: it must not count in
+            # `runs`/`runs_cited` or flip the lane verdict to "absent" — a
+            # prompt whose runs all errored reads honestly as no_signal.
+            and not _run_is_error(run)
         ]
         if not runs:
             results.append({
