@@ -214,3 +214,21 @@ def test_empty_input_returns_empty_list() -> None:
     assert _build({}) == []
     assert _build({"sku_a": []}) == []
     assert _build({}, custom_prompts=[]) == []
+
+
+def test_errored_runs_excluded_from_lane_counts() -> None:
+    """An `__error__:`-prefixed run measured nothing: it must not count in
+    runs/runs_cited, and a prompt whose runs ALL errored reads as no_signal —
+    never as an "absent" verdict the engine did not actually deliver."""
+    err = _run("lane that only errored")
+    err["raw"] = "__error__:429 You exceeded your current quota"
+    mixed_err = _run("mixed lane")
+    mixed_err["raw"] = "__error__:429 You exceeded your current quota"
+    good = _run("mixed lane", sources=[_src("BB Lab", MERCHANT_HOST)])
+
+    out = _build({"sku_a": [_payload([err, mixed_err, good])]})
+    by_prompt = {r["prompt"]: r for r in out}
+    assert by_prompt["lane that only errored"]["lane"] == "no_signal"
+    assert by_prompt["lane that only errored"]["runs"] == 0
+    assert by_prompt["mixed lane"]["runs"] == 1
+    assert by_prompt["mixed lane"]["cited"] is True

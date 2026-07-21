@@ -2055,6 +2055,98 @@ def test_models_cited_excludes_unavailable_provider():
     assert _models_cited_for_sku(cbp)["of"] == 1
 
 
+# ---------------------------------------------------------------------------
+# Upstream-errored runs must not sit in ANY count/rate denominator (#1550's
+# rule, applied to the report-service surfaces). Reproduces the 2026-07-21
+# scale smoke (run 509cf81c): all 143 Gemini runs errored and inflated per-SKU
+# axis/query-class coverage and diluted citation rates.
+# ---------------------------------------------------------------------------
+
+
+def test_axis_coverage_excludes_errored_runs():
+    from services.agent_center_bd_report_service import _axis_coverage
+
+    clean = _probe_runs()
+    mixed = _probe_runs() + _chatgpt_all_429_probe_runs(count=5)
+    # The 5 errored intent runs measured nothing → coverage identical to clean.
+    assert _axis_coverage(mixed) == _axis_coverage(clean)
+    assert _axis_coverage(mixed) == {"intent": 1, "concern": 1}
+    # A wholesale-errored lane covers NO axes at all.
+    assert _axis_coverage(_chatgpt_all_429_probe_runs(count=5)) == {}
+
+
+def test_query_class_coverage_excludes_errored_runs():
+    from services.agent_center_bd_report_service import _query_class_coverage
+
+    clean = _probe_runs()
+    mixed = _probe_runs() + _chatgpt_all_429_probe_runs(count=5)
+    assert _query_class_coverage(mixed) == _query_class_coverage(clean)
+    assert sum(_query_class_coverage(mixed).values()) == 2
+    assert sum(
+        _query_class_coverage(_chatgpt_all_429_probe_runs(count=5)).values()
+    ) == 0
+
+
+def test_citation_score_denominator_excludes_errored_runs():
+    from services.agent_center_bd_report_service import compute_citation_score
+
+    clean_score, clean_breakdown = compute_citation_score(
+        _base_sku_ctx(), _probe_runs()
+    )
+    mixed_score, mixed_breakdown = compute_citation_score(
+        _base_sku_ctx(), _probe_runs() + _chatgpt_all_429_probe_runs(count=5)
+    )
+    # 5 errored runs must not dilute the rate denominators or the score.
+    assert mixed_breakdown["first_party_rate"]["denominator"] == 2
+    assert mixed_breakdown["first_party_rate"] == clean_breakdown["first_party_rate"]
+    assert mixed_score == clean_score
+
+    # ALL runs errored → measured nothing → score None (no signal), never a
+    # diluted real 0 — mirrors the [] / probe_failed path.
+    err_score, err_breakdown = compute_citation_score(
+        _base_sku_ctx(), _chatgpt_all_429_probe_runs(count=5)
+    )
+    assert err_score is None
+    assert err_breakdown["no_probes"] is True
+
+
+def test_citation_by_provider_prompts_count_excludes_errored_runs():
+    from services.agent_center_bd_report_service import build_citation_by_provider
+
+    # 2 answered + 3 errored runs in ONE gemini payload (partial 429 lane).
+    partial = _probe_runs()
+    errored_runs = _chatgpt_all_429_probe_runs(count=3)[0]["raw_runs"]
+    partial[0]["raw_runs"] = list(partial[0]["raw_runs"]) + errored_runs
+    partial[0]["usage"] = {"succeeded_runs": 2, "failed_runs": 3}
+    cbp = build_citation_by_provider(_base_sku_ctx(), partial)
+    entry = cbp["gemini"]
+    # Not wholesale-failed (2 real answers) but prompts must count ONLY them.
+    assert entry.get("status") != "probe_failed"
+    assert entry["prompts"] == 2
+    assert entry["breakdown"]["first_party_rate"]["denominator"] == 2
+
+
+def test_any_provider_merge_drops_errored_runs():
+    from services.agent_center_bd_report_service import _any_provider_probe_runs
+
+    query = "where can I buy Bright Skin Serum"
+    good = _probe_runs()
+    good[0]["raw_runs"] = [r for r in good[0]["raw_runs"] if r["query"] == query]
+    errored = _chatgpt_all_429_probe_runs(count=1)
+    errored[0]["raw_runs"][0]["query"] = query
+
+    merged_payloads = _any_provider_probe_runs(good + errored)
+    merged_runs = merged_payloads[0]["raw_runs"]
+    assert len(merged_runs) == 1
+    # The errored sibling was dropped BEFORE the merge, so the merged row keeps
+    # the real answer (never an `__error__:` raw) and only the answering engine.
+    assert not str(merged_runs[0].get("raw") or "").startswith("__error__")
+    assert merged_runs[0]["_providers"] == ["gemini"]
+
+    # A prompt whose runs ALL errored contributes no merged row at all.
+    assert _any_provider_probe_runs(_chatgpt_all_429_probe_runs(count=3)) == []
+
+
 def test_brand_rollup_surfaces_coverage_unavailable_provider():
     from services.agent_center_bd_report_service import _brand_citation_by_provider
 
