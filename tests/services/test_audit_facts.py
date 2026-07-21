@@ -148,6 +148,93 @@ def test_aggregate_run_facts_folds_counters():
     assert aggregate_run_facts([no_host])["own_url_cited_runs"] is None
 
 
+def _errored_run(query: str, provider: str = "gemini", *, via_key: bool = False):
+    """A gateway run that carried an upstream error instead of an answer —
+    HTTP 200 with `raw` prefixed `__error__:` (or an explicit `error` key),
+    mirroring tests/services/test_agent_center_bd_per_sku._chatgpt_all_429_probe_runs."""
+    run = {"query": query, "_provider": provider, "grounding_sources": []}
+    if via_key:
+        run["error"] = "upstream 429"
+    else:
+        run["raw"] = (
+            "__error__:429 You exceeded your current quota, please check "
+            "your plan and billing details."
+        )
+    return run
+
+
+def test_run_errored_predicate():
+    from services.audit_facts import run_errored
+
+    assert run_errored(_errored_run("q")) is True
+    assert run_errored(_errored_run("q", via_key=True)) is True
+    assert run_errored(_run("q", [])) is False
+    assert run_errored({"raw": "a real answer"}) is False
+    assert run_errored(None) is False
+    assert run_errored("not a mapping") is False
+
+
+def test_errored_runs_excluded_from_all_rollups():
+    """The 2026-07-21 scale-smoke shape (run 509cf81c): a provider lane errors
+    wholesale. Errored runs are no evidence in either direction, so they must
+    not inflate run_count / provider_coverage / prompt groups — the facts over
+    a polluted set equal the facts over the clean set."""
+    errored = [
+        # Same query as a clean run — must not inflate that prompt group.
+        _errored_run("best vitamin c serum", "gemini"),
+        # Errored-only query — must not yield a false not-cited PromptFacts row.
+        _errored_run("glow brand vs competitors", "gemini"),
+        # Wholesale-errored provider — must not appear in provider_coverage.
+        _errored_run("best vitamin c serum", "perplexity"),
+        _errored_run("glow brand serum reviews", "perplexity", via_key=True),
+    ]
+    clean = compute_run_facts(RUNS, **IDENTITY)
+    polluted = compute_run_facts(RUNS + errored, **IDENTITY)
+
+    assert polluted.to_dict() == clean.to_dict()
+    assert polluted.run_count == 4
+    assert polluted.provider_coverage == {"gemini": 2, "openai": 2}
+    assert "glow brand vs competitors" not in {p.query for p in polluted.prompts}
+    by_query = {p.query: p for p in polluted.prompts}
+    assert by_query["best vitamin c serum"].run_count == 2
+    assert "perplexity" not in by_query["best vitamin c serum"].provider_verdicts
+
+
+def test_all_errored_runs_yield_empty_facts():
+    """A run set that errored wholesale measured nothing: zero denominators and
+    no prompt rows, never a plausible-looking all-zeros verdict table."""
+    facts = compute_run_facts(
+        [_errored_run("best vitamin c serum"), _errored_run("q2", via_key=True)],
+        **IDENTITY,
+    )
+    assert facts.run_count == 0
+    assert facts.prompts == ()
+    assert facts.provider_coverage == {}
+    assert facts.brand_mentioned_runs == 0
+    assert facts.runs_with_citations == 0
+    assert facts.own_url_cited_runs == 0  # host present -> 0, not None
+
+
+def test_parity_anchors_hold_with_errored_runs():
+    """The docstring's parity anchors compare cited-run NUMERATORS; an errored
+    run has no grounding sources, so legacy (unfiltered) and RunFacts
+    (filtered) stay equal even on a polluted run set."""
+    from services.agent_center_bd_report_service import extract_cited_hosts
+    from services.audit_facts import _own_url_cited_runs
+
+    polluted = RUNS + [
+        _errored_run("best vitamin c serum", "gemini"),
+        _errored_run("glow brand vs competitors", "perplexity"),
+    ]
+    facts = compute_run_facts(polluted, **IDENTITY)
+    _, legacy_cited, legacy_any = extract_cited_hosts(polluted, **IDENTITY)
+    legacy_own = _own_url_cited_runs(polluted, merchant_host="glowbrand.com")
+
+    assert facts.brand_mentioned_runs == legacy_cited
+    assert facts.runs_with_citations == legacy_any
+    assert facts.own_url_cited_runs == legacy_own
+
+
 def test_parity_check_logs_only_on_drift(caplog):
     with caplog.at_level(logging.WARNING, logger="services.audit_facts"):
         assert parity_check("site.x", 3, 3) is True

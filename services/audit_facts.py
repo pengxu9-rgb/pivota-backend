@@ -417,7 +417,9 @@ class RunFacts:
     Denominators are explicit: ``*_runs`` counters are over RUNS (provider ×
     query executions), ``prompt_count_by_class`` is over PROMPT GROUPS, and
     ``provider_coverage`` states how many runs each provider contributed —
-    the three bases the legacy implementations silently mixed.
+    the three bases the legacy implementations silently mixed. Every base
+    counts only runs that returned a real answer: upstream-errored runs
+    (:func:`run_errored`) are excluded before any counting.
     """
 
     prompts: Tuple[PromptFacts, ...]
@@ -475,6 +477,26 @@ def _source_fact(
     )
 
 
+def run_errored(run: Any) -> bool:
+    """True when a probe run carried an upstream error instead of an answer —
+    the gateway returns HTTP 200 with `raw` prefixed `__error__:` (e.g. a 429
+    quota error) rather than raising. Such a run is not grounded evidence in
+    EITHER direction, so it must never sit in a fact-layer denominator: a
+    provider lane erroring wholesale otherwise dilutes every mention rate
+    (2026-07-21 scale smoke, run 509cf81c — all 143 Gemini runs errored).
+
+    Exported as the canonical predicate; the per-module copies
+    (``audit_run_worker._run_errored``, the god module's ``_run_is_error``,
+    ``deep_tier_prompts._rollup_run_errored``) can consolidate onto this one —
+    this module is a pure leaf they may all import."""
+    if not isinstance(run, Mapping):
+        return False
+    if run.get("error"):
+        return True
+    raw = run.get("raw")
+    return isinstance(raw, str) and raw.startswith("__error__")
+
+
 def compute_run_facts(
     raw_runs: Sequence[Mapping[str, Any]],
     *,
@@ -488,12 +510,22 @@ def compute_run_facts(
     runs without a query share the ``""`` group (they still count in run-level
     rollups). Within-run source dedup follows ``_identify_run_sources``.
 
+    Upstream-errored runs (:func:`run_errored`) are excluded from EVERY rollup:
+    ``run_count``, ``provider_coverage``, and prompt grouping (a query whose
+    runs all errored yields no PromptFacts row at all, never a false
+    own_url_cited=False / brand_mentioned=False verdict). An errored run is no
+    evidence in either direction, so counting it dilutes every rate consumers
+    derive from these denominators.
+
     Parity anchors (what each rollup must equal during the phase-1 window):
       * ``own_url_cited_runs``   == legacy ``_own_url_cited_runs``          (T1)
       * ``brand_mentioned_runs`` == ``extract_cited_hosts``'s
         ``merchant_cited_runs``                                             (T3)
       * ``runs_with_citations``  == ``extract_cited_hosts``'s
         ``runs_with_any_citation``
+    These compare cited-run NUMERATORS; an errored run carries no grounding
+    sources, so it can never contribute to either side and the anchors hold
+    with or without the exclusion.
     """
     own_host = normalize_host(merchant_host) if merchant_host else None
     vendors = _clean_identity_tuple(merchant_vendors)
@@ -509,6 +541,8 @@ def compute_run_facts(
 
     for run in raw_runs or []:
         if not isinstance(run, Mapping):
+            continue
+        if run_errored(run):
             continue
         run_count += 1
         provider = (
