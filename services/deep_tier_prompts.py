@@ -254,7 +254,11 @@ def build_deep_tier_specs(
         specs.append((f"affordable {category} that actually works", "category"))
         specs.append((f"best budget {category}", "category"))
     if title:
-        specs.append((f"is {title} worth the money", "category"))
+        # Branded value question — axis "intent" keeps it in the branded
+        # query class (audit_facts treats every category-axis query as
+        # unbranded discovery; a prompt naming the merchant's own product
+        # would inflate the discovery/endorsement split).
+        specs.append((f"is {title} worth the money", "intent"))
 
     # Block D — market/availability. Korean-origin shapes are origin-gated
     # (the K-beauty US-visibility wedge); the ship-to shapes are not.

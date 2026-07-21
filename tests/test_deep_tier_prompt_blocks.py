@@ -63,7 +63,9 @@ def test_block_b_incumbent_contest_shapes():
 def test_blocks_c_d_e_f_axes_and_gating():
     axis_by_query = dict(_full_specs())
     assert axis_by_query["best flat iron under $70"] == "category"
-    assert axis_by_query["is VODANA Triple Flow Iron worth the money"] == "category"
+    # Branded value question stays in the branded class (intent), never
+    # category discovery.
+    assert axis_by_query["is VODANA Triple Flow Iron worth the money"] == "intent"
     assert axis_by_query["best korean flat iron available in the US"] == "intent"
     assert axis_by_query["does VODANA Triple Flow Iron ship to the US"] == "intent"
     assert axis_by_query["best flat iron 2026"] == "category"
@@ -173,6 +175,43 @@ def test_standard_records_at_40_have_no_deep_stamps():
     records = m._build_per_sku_audit_query_records(ctx, 40)
     assert not any(r.get("source") == "deep_tier" for r in records)
     assert not any(r.get("axis") == "comparison" for r in records)
+
+
+def test_first_deep_audit_seeds_from_profile_incumbents():
+    # No prior runs → empty harvested seeds. The profile's configured
+    # incumbents (GHD / Dyson Airwrap on beauty_device_hair) must still fire
+    # Blocks A/B — the pilot's flagship case is a FIRST deep audit.
+    ctx = {
+        "product": {
+            "title": "Professional Softbar Flat Iron",
+            "brand": "VODANA",
+            "product_type": "Flat Iron",
+            "attributes_raw": {"benefits": "smooth styling"},
+        },
+        "sku": {"title": "Mint"},
+        "sku_title": "Mint",
+        "sku_key": "vd-softbar",
+        "vertical": "beauty",
+        "_audit_tier": "deep",
+        "_deep_competitor_seeds": [],
+    }
+    specs, title, _ = m._build_per_sku_base_query_specs(ctx)
+    axis_by_query = dict(specs)
+    assert axis_by_query.get(f"{title} vs GHD") == "comparison"
+    assert axis_by_query.get("is GHD worth it") == "comparison"
+
+
+def test_loader_filter_strips_internal_comparison_but_keeps_payload_keys():
+    payloads = [{
+        "provider": "gemini",
+        "prompt_basis_meta": {"prompt_set_id": "ps_x"},
+        "raw_runs": [_comparison_run(), _category_run()],
+    }]
+    visible = m._merchant_visible_probe_payloads(payloads)
+    assert [r["query"] for r in visible[0]["raw_runs"]] == ["best collagen"]
+    # Riding keys (basis meta) survive; the original payload is not mutated.
+    assert visible[0]["prompt_basis_meta"] == {"prompt_set_id": "ps_x"}
+    assert len(payloads[0]["raw_runs"]) == 2
 
 
 def test_comparison_records_survive_basis_pinning_with_stamp():

@@ -5178,7 +5178,40 @@ async def load_per_sku_probe_runs(
         await resolve_grounding_redirects_in_runs(_flatten_probe_runs(out))
     except Exception as exc:  # noqa: BLE001 — never sink the report build
         logger.warning("grounding redirect unwrap skipped: %s", exc)
-    return out
+    return _merchant_visible_probe_payloads(out)
+
+
+def _merchant_visible_probe_payloads(
+    payloads: List[Dict[str, Any]],
+) -> List[Dict[str, Any]]:
+    """INTERNAL-FIRST (founder 2026-07-21): strip deep-tier comparison runs at
+    the single boundary where report assembly loads probe runs — so every
+    downstream surface (authority map, grounding evidence, citation-score
+    denominators, RunFacts, opportunity, coverage counts) is coherent about
+    the same merchant-visible run set, instead of each surface needing its own
+    gate. The RAW payloads stay untouched in partial_result_jsonb (the loader
+    is read-only; the report phase persists only brand_report), so
+    substitution data accrues from the first deep run and flipping the surface
+    later needs no re-probe. The per-surface gates (_failing_prompts,
+    _query_class_coverage, extract_category_competitors,
+    build_sku_opportunity) stay as defense in depth for callers that hand
+    those functions unloaded run lists. Payload dicts are copied, never
+    mutated, and non-run keys (e.g. the riding prompt_basis_meta) carry over."""
+    filtered: List[Dict[str, Any]] = []
+    for payload in payloads:
+        raw_runs = payload.get("raw_runs") if isinstance(payload, dict) else None
+        if isinstance(raw_runs, list) and any(
+            run_is_internal_comparison(run) for run in raw_runs
+        ):
+            payload = {
+                **payload,
+                "raw_runs": [
+                    run for run in raw_runs
+                    if not run_is_internal_comparison(run)
+                ],
+            }
+        filtered.append(payload)
+    return filtered
 
 
 def _axis_coverage(probe_runs: Any) -> Dict[str, int]:
@@ -9601,10 +9634,27 @@ def _build_per_sku_base_query_specs(
     if str((sku_ctx or {}).get("_audit_tier") or "").strip().lower() == "deep":
         from services.deep_tier_prompts import build_deep_tier_specs
 
+        # Seeds = prior-run cited-competitor harvest first (evidence-ranked),
+        # topped up from the profile's configured incumbents — so a merchant's
+        # FIRST deep audit (no prior runs) still fires Blocks A/B against the
+        # brands that own the head terms (GHD/Dyson on the VODANA pilot).
+        _deep_seeds = [
+            str(s).strip()
+            for s in ((sku_ctx or {}).get("_deep_competitor_seeds") or [])
+            if str(s or "").strip()
+        ]
+        _seen_seeds = {s.lower() for s in _deep_seeds}
+        for _incumbent in (getattr(profile, "wedge_incumbent_brands", ()) or ()):
+            if len(_deep_seeds) >= 3:
+                break
+            _incumbent = str(_incumbent or "").strip()
+            if _incumbent and _incumbent.lower() not in _seen_seeds:
+                _deep_seeds.append(_incumbent)
+                _seen_seeds.add(_incumbent.lower())
         deep_specs = build_deep_tier_specs(
             title=title,
             category=str(unbranded_category or ""),
-            competitors=(sku_ctx or {}).get("_deep_competitor_seeds") or [],
+            competitors=_deep_seeds,
             price_band_usd=_wedge_price_band_usd(sku_ctx or {}),
             origin_terms=_graph_class_values(attribute_graph, "geography"),
             market="US",
