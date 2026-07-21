@@ -98,31 +98,91 @@ def test_rollup_none_without_internal_comparison_runs():
     assert build_deep_landscape_rollup([], own_brand="BB Lab") is None
 
 
-def test_rollup_substitution_rate_and_contest_verdicts():
+def test_rollup_v2_volunteered_lane_drives_verdicts_and_rate():
     runs = [
-        # GHD-anchored: merchant cited in 2/2 -> defend.
+        # ECHO lane: the prompt names the merchant — cited, but that's not
+        # visibility and must not count toward GHD's verdict.
         _cmp_run("BB Lab collagen vs GHD", merchant=True, competitors=("GHD",)),
+        # VOLUNTEERED lane, GHD-anchored, merchant cited -> 1/1 -> defend.
         _cmp_run("is GHD worth it", merchant=True, competitors=("GHD",),
                  provider="chatgpt"),
-        # Vital Proteins-anchored: merchant absent, competitor cited -> skip,
-        # and both runs are substitutions.
+        # VOLUNTEERED, Vital Proteins-anchored: merchant absent, competitor
+        # cited -> skip, and both runs are substitutions.
         _cmp_run("best alternatives to Vital Proteins",
                  competitors=("Vital Proteins", "Sports Research")),
         _cmp_run("problems with Vital Proteins", competitors=("Vital Proteins",)),
     ]
     rollup = build_deep_landscape_rollup(runs, own_brand="BB Lab")
+    assert rollup["version"] == 2
     assert rollup["total_comparison_runs"] == 4
     assert rollup["merchant_cited_runs"] == 2
+    assert rollup["volunteered_runs"] == 3
+    assert rollup["volunteered_merchant_cited_runs"] == 1
+    # Substitution rate is volunteered-lane only: 2 of 3.
     assert rollup["substitution_runs"] == 2
-    assert rollup["substitution_rate"] == 0.5
-    verdicts = {row["competitor"]: row["verdict"] for row in rollup["contest_map"]}
-    assert verdicts["GHD"] == "defend"
-    assert verdicts["Vital Proteins"] == "skip"
+    assert rollup["substitution_rate"] == 0.667
+    by_comp = {row["competitor"]: row for row in rollup["contest_map"]}
+    assert by_comp["GHD"]["verdict"] == "defend"
+    assert by_comp["GHD"]["volunteered_runs"] == 1
+    assert by_comp["GHD"]["echo_runs"] == 1  # tallied, never verdict-bearing
+    assert by_comp["Vital Proteins"]["verdict"] == "skip"
     # Cited in answers but never anchored in a query -> reported separately.
     answer_only = {row["name"] for row in rollup["answer_only_competitors"]}
     assert "Sports Research" in answer_only
     # Own brand never appears as a competitor anywhere.
-    assert "BB Lab" not in verdicts and "BB Lab" not in answer_only
+    assert "BB Lab" not in by_comp and "BB Lab" not in answer_only
+
+
+def test_rollup_echo_only_competitor_is_insufficient_data_not_defend():
+    # HBN pilot failure shape: a competitor probed ONLY via merchant-anchored
+    # prompts. v1 called this "defend"; v2 must refuse a verdict.
+    runs = [
+        _cmp_run("BB Lab collagen vs Anua", merchant=True, competitors=("Anua",)),
+    ]
+    rollup = build_deep_landscape_rollup(runs, own_brand="BB Lab")
+    row = rollup["contest_map"][0]
+    assert row["competitor"] == "Anua"
+    assert row["verdict"] == "insufficient_data"
+    assert rollup["volunteered_runs"] == 0
+    assert rollup["substitution_rate"] == 0.0
+
+
+def test_echo_detection_is_word_boundary_not_substring():
+    # Brand "Native" hides inside the template word "alternatives" — the run
+    # must stay VOLUNTEERED (a substring match would silently withhold the
+    # competitor's verdict as insufficient_data).
+    run = _cmp_run("best alternatives to GHD", competitors=("GHD",))
+    rollup = build_deep_landscape_rollup(
+        [run], own_brand="Native", title="Native Glow Serum",
+    )
+    assert rollup["volunteered_runs"] == 1
+    assert rollup["contest_map"][0]["verdict"] == "skip"  # not insufficient_data
+
+
+def test_mention_detection_ignores_negations_in_raw_text():
+    # HBN pilot failure shape: the probe's raw answer embeds its own analysis
+    # ("the brand HBN is not mentioned in the search results") — raw-text
+    # scanning counted that as a citation. v2 uses grounding-source facts.
+    run = _cmp_run("is Paula's Choice worth it", competitors=())
+    run["raw"] = (
+        "The search results focused on Paula's Choice products. The merchant "
+        "brand HBN is not mentioned in the provided search results."
+    )
+    rollup = build_deep_landscape_rollup([run], own_brand="HBN")
+    assert rollup["merchant_cited_runs"] == 0
+
+
+def test_mention_detection_counts_grounding_source_naming_brand():
+    # The production-trusted positive signal: a cited grounding source whose
+    # title names the brand.
+    run = _cmp_run("is Paula's Choice worth it", competitors=())
+    run["grounding_sources"] = [{
+        "uri": "https://example.com/reviews/hbn-double-retinol",
+        "title": "HBN Double Retinol Serum review",
+    }]
+    run["grounding_chunks"] = [run["grounding_sources"][0]["uri"]]
+    rollup = build_deep_landscape_rollup([run], own_brand="HBN")
+    assert rollup["merchant_cited_runs"] == 1
 
 
 def test_substitution_is_per_run_not_per_query_union():
@@ -141,14 +201,27 @@ def test_substitution_is_per_run_not_per_query_union():
 
 def test_rollup_contest_verdict_partial_is_contest():
     runs = [
-        _cmp_run("BB Lab collagen vs GHD", merchant=True, competitors=("GHD",)),
-        _cmp_run("is GHD worth it", competitors=("GHD",)),
+        _cmp_run("is GHD worth it", merchant=True, competitors=("GHD",)),
         _cmp_run("problems with GHD", competitors=("GHD",)),
+        _cmp_run("GHD reviews", competitors=("GHD",)),
     ]
     rollup = build_deep_landscape_rollup(runs, own_brand="BB Lab")
     row = rollup["contest_map"][0]
     assert row["competitor"] == "GHD"
-    assert row["verdict"] == "contest"  # 1/3 cited: >0 but <0.5
+    assert row["verdict"] == "contest"  # 1/3 volunteered cited: >0 but <0.5
+
+
+# ---- wedge-route deep tier ---------------------------------------------------
+
+def test_wedge_request_model_accepts_audit_tier():
+    from routes.merchant_audit_routes import MerchantUrlAuditRequest
+
+    body = MerchantUrlAuditRequest(product_urls=["https://x.com/p"])
+    assert body.audit_tier == "standard"
+    body = MerchantUrlAuditRequest(
+        product_urls=["https://x.com/p"], audit_tier="deep",
+    )
+    assert body.audit_tier == "deep"
 
 
 # ---- merchant-response sanitizer --------------------------------------------

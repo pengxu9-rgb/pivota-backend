@@ -7261,6 +7261,17 @@ async def build_per_sku_report(
         deep_landscape_internal = build_deep_landscape_rollup(
             _flatten_probe_runs(raw_probe_runs),
             own_brand=str(product.get("brand") or product.get("vendor") or ""),
+            # v2 echo-lane detection needs the probe identity too — comparison
+            # prompts embed the resolved title, not just the brand.
+            title=str(product.get("title") or ""),
+            # Vendor aliases close the gap with the verdict path's RunFacts
+            # call (a source label naming the vendor still counts).
+            merchant_vendors=tuple(
+                v for v in (
+                    str(product.get("vendor") or "").strip(),
+                    str(product.get("brand") or "").strip(),
+                ) if v
+            ),
         )
     except Exception:  # noqa: BLE001 — the rollup must never sink the report
         logger.warning("deep-landscape rollup skipped", exc_info=True)

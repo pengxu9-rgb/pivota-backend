@@ -186,7 +186,11 @@ _ROLLUP_MAX_QUERY_ROWS = 40
 _ROLLUP_MAX_COMPETITORS = 10
 
 
-def _run_mentions_merchant(run: Mapping[str, Any], own_brand: str) -> bool:
+def _run_mentions_merchant(
+    run: Mapping[str, Any],
+    own_brand: str,
+    merchant_vendors: Tuple[str, ...] = (),
+) -> bool:
     """Merchant presence in one comparison answer. Mirrors the coarse OK
     logic the failing-prompts surface uses (parsed/self-report/grounding
     flags), plus a brand-name scan of the raw answer — comparison prompts are
@@ -210,27 +214,75 @@ def _run_mentions_merchant(run: Mapping[str, Any], own_brand: str) -> bool:
         or run.get("product_visible") is True
     ):
         return True
-    brand = str(own_brand or "").strip().lower()
+    brand = str(own_brand or "").strip()
     if not brand:
         return False
-    raw = str(run.get("raw") or "").lower()
-    return brand in raw
+    # NO raw-text scan (HBN pilot 2026-07-21): the probe's raw answer embeds
+    # its own analysis narrative, which names the merchant inside NEGATIONS
+    # ("the brand HBN is not mentioned in the search results") — any substring
+    # or word-boundary scan of raw text counts those as citations. Use the
+    # production-trusted RunFacts signal instead: a cited grounding SOURCE
+    # whose title/label names the brand (T3, parity-locked to the verdict
+    # path). Best-effort — a malformed run reads as not-cited, never raises.
+    try:
+        from services.audit_facts import compute_run_facts
+
+        facts = compute_run_facts(
+            [run],
+            merchant_host=None,
+            merchant_brand=brand,
+            merchant_vendors=tuple(merchant_vendors or ()),
+        )
+        return facts.brand_mentioned_runs > 0
+    except Exception:  # noqa: BLE001 — rollup must never sink the report
+        logger.warning("run-facts merchant check failed", exc_info=True)
+        return False
+
+
+def _query_names_merchant(query: str, own_brand: str, title: str) -> bool:
+    """True when the PROMPT itself names the merchant ("{title} vs GHD") —
+    the echo lane: the AI discussing a product it was explicitly asked about
+    is not visibility. Verdicts must come from the volunteered lane only.
+
+    Word-boundary match: a brand hiding inside a template word (brand
+    "Native" inside "best alternatives to X") must not reclassify a
+    volunteered run as echo — that silently withholds verdicts."""
+    q = str(query or "").lower()
+    for needle in (own_brand, title):
+        needle = str(needle or "").strip().lower()
+        if needle and re.search(
+            rf"(?<![a-z0-9]){re.escape(needle)}(?![a-z0-9])", q,
+        ):
+            return True
+    return False
 
 
 def build_deep_landscape_rollup(
     runs: Sequence[Mapping[str, Any]],
     *,
     own_brand: str = "",
+    title: str = "",
+    merchant_vendors: Tuple[str, ...] = (),
 ) -> Optional[Dict[str, Any]]:
     """Substitution-rate rollup + Defend/Contest/Skip contest map from one
     SKU's INTERNAL comparison runs (spec 2026-07-21 §5). Pure; returns None
     when the run set carries no internal comparison probes (every standard
     run), so callers can stamp it conditionally.
 
+    v2 (HBN pilot 2026-07-21): every run is split into the ECHO lane (the
+    prompt itself names the merchant — "{title} vs GHD"; the AI discussing a
+    product it was asked about is not visibility) and the VOLUNTEERED lane
+    (merchant absent from the prompt — "is GHD worth it"). Contest verdicts
+    and the headline substitution rate come from the volunteered lane ONLY;
+    v1's blended rate produced three implausible 'defend' verdicts for a
+    brand with zero US presence. A competitor with no volunteered prompts
+    gets verdict 'insufficient_data', never 'skip' (no data != AI never
+    volunteers the merchant).
+
     INTERNAL-FIRST: the output names competitors, so it must only ever be
     stored under the `deep_landscape_internal` key, which the merchant-response
-    sanitizer strips. Verdict rule per anchored competitor: merchant cited in
-    >=50% of that competitor's prompts -> defend; >0 -> contest; 0 -> skip."""
+    sanitizer strips. Verdict rule per anchored competitor (volunteered lane):
+    merchant cited >=50% -> defend; >0 -> contest; 0 -> skip."""
     comparison_runs = [
         run for run in (runs or []) if run_is_internal_comparison(run)
     ]
@@ -241,16 +293,20 @@ def build_deep_landscape_rollup(
     answer_names: Counter = Counter()
     total_runs = 0
     merchant_cited_runs = 0
-    substitution_runs = 0
+    volunteered_runs = 0
+    volunteered_cited_runs = 0
+    volunteered_substitution_runs = 0
     for run in comparison_runs:
         query = str(run.get("query") or "").strip()
         if not query:
             continue
+        echo = _query_names_merchant(query, own_brand, title)
         row = per_query.setdefault(query, {
             "query": query,
             "providers": [],
             "runs": 0,
             "merchant_cited_runs": 0,
+            "merchant_anchored": echo,
             "competitors_cited": [],
         })
         row["runs"] += 1
@@ -258,10 +314,16 @@ def build_deep_landscape_rollup(
         provider = str(run.get("_provider") or run.get("provider") or "").strip()
         if provider and provider not in row["providers"]:
             row["providers"].append(provider)
-        merchant_here = _run_mentions_merchant(run, own_brand)
+        merchant_here = _run_mentions_merchant(
+            run, own_brand, merchant_vendors=merchant_vendors,
+        )
         if merchant_here:
             row["merchant_cited_runs"] += 1
             merchant_cited_runs += 1
+        if not echo:
+            volunteered_runs += 1
+            if merchant_here:
+                volunteered_cited_runs += 1
         parsed = (
             run.get("parsed") if isinstance(run.get("parsed"), Mapping) else {}
         )
@@ -274,52 +336,72 @@ def build_deep_landscape_rollup(
             answer_names[cleaned] += 1
             if cleaned not in row["competitors_cited"]:
                 row["competitors_cited"].append(cleaned)
-        # Substitution is a PER-RUN fact: THIS answer recommended a competitor
-        # and not the merchant. A row-level union would count a nobody-cited
-        # run as substitution whenever a sibling run named a competitor,
-        # inflating the headline rate on sparse-answer categories.
-        if competitor_here and not merchant_here:
-            substitution_runs += 1
+        # Substitution is a PER-RUN fact on the VOLUNTEERED lane: this answer
+        # recommended a competitor, the merchant wasn't named in the prompt,
+        # and the answer didn't bring the merchant up — the shopper was
+        # captured by a substitute. Echo-lane runs can't be substitutions
+        # (the merchant is in the conversation by construction).
+        if competitor_here and not merchant_here and not echo:
+            volunteered_substitution_runs += 1
 
     rows = list(per_query.values())
 
-    # Contest map: each competitor ANCHORED IN A QUERY ("{title} vs GHD",
-    # "is GHD worth it") — the deep blocks render seed names verbatim, so a
-    # substring scan recovers the anchor. Answer-only names (cited but never
-    # asked about) are reported separately, not contested.
+    # Contest map: each competitor ANCHORED IN A QUERY ("is GHD worth it") —
+    # the deep blocks render seed names verbatim, so a substring scan recovers
+    # the anchor. Verdicts use volunteered rows only; echo rows are tallied
+    # for transparency. Answer-only names (cited but never asked about) are
+    # reported separately, not contested.
     anchored: Dict[str, Dict[str, int]] = {}
     known_names = list(answer_names)
     for row in rows:
         q = row["query"].lower()
         for name in {n for n in known_names + row["competitors_cited"]}:
-            if name.lower() in q:
-                stats = anchored.setdefault(name, {"runs": 0, "merchant_cited_runs": 0})
+            if name.lower() not in q:
+                continue
+            stats = anchored.setdefault(name, {
+                "runs": 0, "merchant_cited_runs": 0,
+                "echo_runs": 0, "echo_merchant_cited_runs": 0,
+            })
+            if row["merchant_anchored"]:
+                stats["echo_runs"] += row["runs"]
+                stats["echo_merchant_cited_runs"] += row["merchant_cited_runs"]
+            else:
                 stats["runs"] += row["runs"]
                 stats["merchant_cited_runs"] += row["merchant_cited_runs"]
     contest_map = []
     for name, stats in sorted(
-        anchored.items(), key=lambda item: -item[1]["runs"]
+        anchored.items(),
+        key=lambda item: -(item[1]["runs"] + item[1]["echo_runs"]),
     )[:_ROLLUP_MAX_COMPETITORS]:
         rate = (
             stats["merchant_cited_runs"] / stats["runs"] if stats["runs"] else 0.0
         )
         contest_map.append({
             "competitor": name,
-            "runs": stats["runs"],
-            "merchant_cited_runs": stats["merchant_cited_runs"],
+            "volunteered_runs": stats["runs"],
+            "volunteered_merchant_cited_runs": stats["merchant_cited_runs"],
             "merchant_cited_rate": round(rate, 3),
+            "echo_runs": stats["echo_runs"],
+            "echo_merchant_cited_runs": stats["echo_merchant_cited_runs"],
             "verdict": (
-                "defend" if rate >= 0.5 else ("contest" if rate > 0 else "skip")
+                "insufficient_data" if not stats["runs"]
+                else "defend" if rate >= 0.5
+                else "contest" if rate > 0
+                else "skip"
             ),
         })
 
     return {
-        "version": 1,
+        "version": 2,
         "total_comparison_runs": total_runs,
         "merchant_cited_runs": merchant_cited_runs,
-        "substitution_runs": substitution_runs,
+        # The headline metrics are VOLUNTEERED-lane only (v2).
+        "volunteered_runs": volunteered_runs,
+        "volunteered_merchant_cited_runs": volunteered_cited_runs,
+        "substitution_runs": volunteered_substitution_runs,
         "substitution_rate": (
-            round(substitution_runs / total_runs, 3) if total_runs else 0.0
+            round(volunteered_substitution_runs / volunteered_runs, 3)
+            if volunteered_runs else 0.0
         ),
         "contest_map": contest_map,
         "answer_only_competitors": [
