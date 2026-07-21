@@ -186,7 +186,11 @@ _ROLLUP_MAX_QUERY_ROWS = 40
 _ROLLUP_MAX_COMPETITORS = 10
 
 
-def _run_mentions_merchant(run: Mapping[str, Any], own_brand: str) -> bool:
+def _run_mentions_merchant(
+    run: Mapping[str, Any],
+    own_brand: str,
+    merchant_vendors: Tuple[str, ...] = (),
+) -> bool:
     """Merchant presence in one comparison answer. Mirrors the coarse OK
     logic the failing-prompts surface uses (parsed/self-report/grounding
     flags), plus a brand-name scan of the raw answer — comparison prompts are
@@ -224,7 +228,10 @@ def _run_mentions_merchant(run: Mapping[str, Any], own_brand: str) -> bool:
         from services.audit_facts import compute_run_facts
 
         facts = compute_run_facts(
-            [run], merchant_host=None, merchant_brand=brand,
+            [run],
+            merchant_host=None,
+            merchant_brand=brand,
+            merchant_vendors=tuple(merchant_vendors or ()),
         )
         return facts.brand_mentioned_runs > 0
     except Exception:  # noqa: BLE001 — rollup must never sink the report
@@ -235,11 +242,17 @@ def _run_mentions_merchant(run: Mapping[str, Any], own_brand: str) -> bool:
 def _query_names_merchant(query: str, own_brand: str, title: str) -> bool:
     """True when the PROMPT itself names the merchant ("{title} vs GHD") —
     the echo lane: the AI discussing a product it was explicitly asked about
-    is not visibility. Verdicts must come from the volunteered lane only."""
+    is not visibility. Verdicts must come from the volunteered lane only.
+
+    Word-boundary match: a brand hiding inside a template word (brand
+    "Native" inside "best alternatives to X") must not reclassify a
+    volunteered run as echo — that silently withholds verdicts."""
     q = str(query or "").lower()
     for needle in (own_brand, title):
         needle = str(needle or "").strip().lower()
-        if needle and needle in q:
+        if needle and re.search(
+            rf"(?<![a-z0-9]){re.escape(needle)}(?![a-z0-9])", q,
+        ):
             return True
     return False
 
@@ -249,6 +262,7 @@ def build_deep_landscape_rollup(
     *,
     own_brand: str = "",
     title: str = "",
+    merchant_vendors: Tuple[str, ...] = (),
 ) -> Optional[Dict[str, Any]]:
     """Substitution-rate rollup + Defend/Contest/Skip contest map from one
     SKU's INTERNAL comparison runs (spec 2026-07-21 §5). Pure; returns None
@@ -300,7 +314,9 @@ def build_deep_landscape_rollup(
         provider = str(run.get("_provider") or run.get("provider") or "").strip()
         if provider and provider not in row["providers"]:
             row["providers"].append(provider)
-        merchant_here = _run_mentions_merchant(run, own_brand)
+        merchant_here = _run_mentions_merchant(
+            run, own_brand, merchant_vendors=merchant_vendors,
+        )
         if merchant_here:
             row["merchant_cited_runs"] += 1
             merchant_cited_runs += 1

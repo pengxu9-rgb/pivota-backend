@@ -1271,6 +1271,7 @@ async def _pinned_selected_queries_by_sku(
     merchant_id: str,
     sku_keys: List[str],
     max_reports: int = 3,
+    audit_tier: str = "standard",
 ) -> Dict[str, List[str]]:
     """Best-effort pricing input: for each sku_key, the prior run's PINNED
     selected-spec queries (lowercased). A pinned re-run reprobes that FULL set
@@ -1308,7 +1309,13 @@ async def _pinned_selected_queries_by_sku(
                 break
         for key in sku_keys:
             for report in reports:
-                basis = harvest_prompt_basis(report, sku_key=key) or {}
+                # Tier-scoped, mirroring the worker: a deep request must price
+                # by a DEEP pinned basis (or fall back to the deep budget),
+                # never by a prior standard ~14-query set — that under-billed
+                # deep re-runs ~3-5x (slice-4 review finding 1).
+                basis = harvest_prompt_basis(
+                    report, sku_key=key, audit_tier=audit_tier,
+                ) or {}
                 specs = basis.get("selected_specs") or []
                 queries = [
                     str(s.get("query") or "").strip().lower()
@@ -1709,6 +1716,14 @@ async def run_merchant_url_audit(
         merchant_id=merchant_id, subject_type="merchant_url",
     )
     over_free = _FREE_URL_AUDITS_PER_MERCHANT > 0 and used >= _FREE_URL_AUDITS_PER_MERCHANT
+    # Deep Landscape Scan is ALWAYS metered — the free URL-audit allowance
+    # covers the standard wedge only. Without this, a free-tier merchant could
+    # run ~5.7x the standard wedge's absorbed cost per audit (and unlimited
+    # such audits when _FREE_URL_AUDITS_PER_MERCHANT is unset=0) behind
+    # nothing but the env flag. Founder may later carve a paid-tier allowance;
+    # defaulting to metered is the reversible choice.
+    if audit_tier == AUDIT_TIER_DEEP:
+        over_free = True
 
     # 1b. Tiered product cap — checked BEFORE the per-URL network fetch
     #     (review A1: gating after the fetch spent 6-20 outbound requests on a
@@ -1935,7 +1950,7 @@ async def run_merchant_url_audit(
         pinned_by_sku: Dict[str, List[str]] = {}
         if not body.refresh:
             pinned_by_sku = await _pinned_selected_queries_by_sku(
-                merchant_id, pricing_sku_keys,
+                merchant_id, pricing_sku_keys, audit_tier=audit_tier,
             )
         per_provider_probes = len(custom_prompts_clean)
         for _key in pricing_sku_keys:
@@ -2143,6 +2158,13 @@ async def run_merchant_url_audit(
             ).encode("utf-8")
         ).hexdigest()[:16]
         idem_product_keys = idem_product_keys + [f"customs:{customs_digest}"]
+    # The tier joins the dedup identity too: without this, a deep request on
+    # the same URLs inside the window silently replays an in-flight STANDARD
+    # run — the exact silent downgrade the tier gate exists to prevent (the
+    # response would even claim the deep budget over a 14-prompt run).
+    # Standard requests keep their pre-existing keys unchanged.
+    if audit_tier != "standard":
+        idem_product_keys = idem_product_keys + [f"tier:{audit_tier}"]
     idempotency_key = compute_audit_idempotency_key(
         merchant_id=merchant_id,
         product_keys=idem_product_keys,

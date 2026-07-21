@@ -394,7 +394,7 @@ def test_pinned_basis_prices_reprobed_customs(client, monkeypatch):
         "already pinned niche", "second pinned niche",
     ]
 
-    async def fake_pinned(merchant_id, sku_keys, max_reports=3):
+    async def fake_pinned(merchant_id, sku_keys, max_reports=3, audit_tier="standard"):
         # Product A has a 16-spec pinned basis; product B has none (first run).
         return {sku_keys[0]: [q.lower() for q in pinned_a]}
 
@@ -427,7 +427,7 @@ def test_refresh_run_prices_planned_budget_not_pinned(client, monkeypatch):
         captured["pairs"] = pairs
         return 42, 1.5
 
-    async def fake_pinned(merchant_id, sku_keys, max_reports=3):
+    async def fake_pinned(merchant_id, sku_keys, max_reports=3, audit_tier="standard"):
         raise AssertionError("pinned-basis scan must be skipped on refresh")
 
     import services.credit_consumption_service as _ccs_mod
