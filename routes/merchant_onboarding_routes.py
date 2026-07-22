@@ -52,6 +52,14 @@ DEFAULT_OPERATING_MODE = "storefront"
 # URL-based auto-KYB. Safe because downstream serving keeps their products
 # un-served until graduated/claimed.
 STORE_LESS_APPROVAL_CONFIDENCE = 0.2
+# Audit-funnel signups (marketing-site URL capture, signup_source below) are
+# audit-only accounts: approve at the same low-confidence floor as store_less
+# when auto-KYB fails, so the funnel never dead-ends in the document-upload
+# step. Adds no exposure beyond what store_less already allows (anyone can
+# register store_less auto-approved with NO URL at all); PSP connection still
+# live-validates real credentials before any transacting.
+AUDIT_FUNNEL_SIGNUP_SOURCE = "ai-readiness-audit"
+AUDIT_FUNNEL_APPROVAL_CONFIDENCE = STORE_LESS_APPROVAL_CONFIDENCE
 
 
 class MerchantRegisterRequest(BaseModel):
@@ -661,6 +669,35 @@ async def register_merchant(
                 traceback.print_exc()
                 # Continue without auto-approval
                 validation_result = {"approved": False, "confidence_score": 0, "validation_results": {}}
+
+            # Audit-funnel floor: an audit-only signup must never dead-end in
+            # manual review / mandatory documents just because auto-KYB could
+            # not verify the URL. Approve at the store_less low-confidence
+            # floor, keeping the original KYB findings on record and the
+            # 7-day full-KYB deadline.
+            if (
+                not validation_result.get("approved")
+                and merchant_data.signup_source == AUDIT_FUNNEL_SIGNUP_SOURCE
+            ):
+                print("🪜 Audit-funnel signup: applying low-confidence approval floor")
+                validation_result = {
+                    "approved": True,
+                    "confidence_score": AUDIT_FUNNEL_APPROVAL_CONFIDENCE,
+                    "validation_results": {
+                        **(validation_result.get("validation_results") or {}),
+                        "audit_funnel_floor": {
+                            "match": True,
+                            "message": (
+                                "Audit-funnel signup auto-approved at low "
+                                "confidence despite failed auto-KYB; PSP "
+                                "connection still requires live credential "
+                                "validation."
+                            ),
+                        },
+                    },
+                    "requires_full_kyb": True,
+                    "full_kyb_deadline": (datetime.utcnow() + timedelta(days=7)).isoformat(),
+                }
 
             # 3. 创建商户记录
             merchant_dict = merchant_data.dict()
