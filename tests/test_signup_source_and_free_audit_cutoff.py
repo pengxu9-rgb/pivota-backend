@@ -187,9 +187,12 @@ async def test_count_with_since_excludes_pre_cutoff_runs(sqlite_db):
     )
     assert used_all == 4
 
+    # Pass the tz-aware shape prod actually uses (_FREE_AUDIT_COUNT_SINCE is
+    # always tz-aware UTC); SQLAlchemy's SQLite processor strips tzinfo, so
+    # this exercises the same wall-clock comparison the route performs.
     used_since = await count_runs_for_merchant_by_subject(
         merchant_id="m1", subject_type="merchant_url",
-        since=cutoff.replace(tzinfo=None),
+        since=cutoff,
     )
     assert used_since == 2
 
