@@ -2139,10 +2139,26 @@ def resolve_sku_identity(sku_ctx: Dict[str, Any]) -> Dict[str, Any]:
     title_override = _s(enrichment.get("title_override"))
 
     def _with_brand(title: str) -> str:
-        # Brand-prefix unless already present (mirrors prompt identity, #713).
-        if brand and brand.lower() not in title.lower():
-            return f"{brand} {title}"
-        return title
+        # Brand-prefix unless the title already NAMES the brand (mirrors
+        # prompt identity, #713). Alias-based, not full-string: a decorated
+        # brand ("HoverAir (Category Demo)") never substring-matches a title
+        # that plainly starts with "HOVERAir", so the full-string check
+        # double-branded the identity name — and every headline built from it
+        # (live verify run efcdaf06).
+        if not brand or not title:
+            return title if title else brand
+        if brand.lower() in title.lower():
+            return title
+        # Also derive aliases from the UNDECORATED brand — a parenthetical
+        # decoration ("HoverAir (Category Demo)") otherwise glues into every
+        # alias ("hoverair category demo") and never matches the title.
+        undecorated = re.sub(r"\s*\([^)]*\)", "", brand).strip()
+        aliases = derive_brand_aliases(brand)
+        if undecorated and undecorated.lower() != brand.lower():
+            aliases = aliases + derive_brand_aliases(undecorated)
+        if text_mentions_brand(title.lower(), aliases):
+            return title
+        return f"{brand} {title}"
 
     if title_override:
         name, confidence, source = _with_brand(title_override), "high", "enrichment.title_override"
