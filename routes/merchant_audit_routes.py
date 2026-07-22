@@ -1509,6 +1509,117 @@ def _with_pitch_paths(where_losing: Dict[str, Any]) -> Dict[str, Any]:
     return where_losing
 
 
+# ── Free-tier actions paywall (WS-3, founder decision 2026-07-22) ────────────
+# The report's "what's wrong" layer (scores, verdict, share-of-voice, per-SKU
+# findings) stays free; the "what to do about it" layer (prioritized actions,
+# outreach/pitch moves, per-SKU playbooks) is the paid product. When the flag
+# is ON and the run's OWNING merchant is free-tier, the strip below empties
+# the action layers in place and stamps `actions_locked` + `locked_counts` +
+# `locked_teaser_headline` so the portal renders locked panels with honest
+# counts instead of empty space. Applied at every serve path of the wedge
+# envelope: authed poll (incl. summary_only), the public share view (keyed to
+# the OWNER's tier — a free owner's share link must not leak the paid layer),
+# and the deck export.
+_ACTIONS_PAYWALL_ENABLED = (
+    _os.getenv("AUDIT_ACTIONS_PAYWALL_ENABLED", "false").strip().lower() == "true"
+)
+
+_LOCKED_PER_SKU_ACTION_KEYS = ("next_best_action", "engine_playbook", "evidence_play")
+
+
+def _strip_actions_for_free_tier(shaped: Dict[str, Any]) -> Dict[str, Any]:
+    """In-place: empty the action layers, record counts, stamp the lock.
+
+    `shaped`'s merchant_narrative / where_youre_losing / per_sku_reports /
+    brand_report all alias sub-objects of ONE deep-copied report dict (see
+    _shape_url_audit_response), so stripping the shared objects once covers
+    every alias including brand_report. Idempotent; never mutates the DB row
+    (the report is deep-copied at shape time).
+    """
+    counts = {
+        "prioritized_actions": 0,
+        "outreach_moves": 0,
+        "pitch_targets": 0,
+        "top_actions": 0,
+    }
+    teaser_headline = None
+
+    narrative = shaped.get("merchant_narrative")
+    if isinstance(narrative, dict):
+        actions = narrative.get("prioritized_actions")
+        if isinstance(actions, list) and actions:
+            counts["prioritized_actions"] = len(actions)
+            for action in actions:
+                if isinstance(action, dict) and action.get("headline"):
+                    teaser_headline = action["headline"]
+                    break
+            narrative["prioritized_actions"] = []
+
+    # where_youre_losing usually aliases narrative["where_youre_losing"], but
+    # strip both defensively (idempotent) to cover the non-aliased empty case.
+    wyl_candidates = [shaped.get("where_youre_losing")]
+    if isinstance(narrative, dict):
+        wyl_candidates.append(narrative.get("where_youre_losing"))
+    for wyl in wyl_candidates:
+        if not isinstance(wyl, dict):
+            continue
+        moves = wyl.get("outreach_moves")
+        if isinstance(moves, list) and moves:
+            counts["outreach_moves"] = max(counts["outreach_moves"], len(moves))
+            wyl["outreach_moves"] = []
+        targets = wyl.get("pitch_targets")
+        if isinstance(targets, list) and targets:
+            counts["pitch_targets"] = max(counts["pitch_targets"], len(targets))
+            wyl["pitch_targets"] = []
+        if wyl.get("win_plan_summary"):
+            wyl["win_plan_summary"] = None
+
+    summary = shaped.get("report_summary")
+    if isinstance(summary, dict):
+        top = summary.get("top_actions")
+        if isinstance(top, list) and top:
+            counts["top_actions"] = len(top)
+            summary["top_actions"] = []
+        if isinstance(summary.get("get_cited_moves"), list):
+            summary["get_cited_moves"] = []
+
+    for sku in shaped.get("per_sku_reports") or []:
+        if not isinstance(sku, dict):
+            continue
+        for key in _LOCKED_PER_SKU_ACTION_KEYS:
+            if sku.get(key) is not None:
+                sku[key] = None
+
+    shaped["actions_locked"] = True
+    shaped["locked_counts"] = counts
+    shaped["locked_teaser_headline"] = teaser_headline
+    return shaped
+
+
+async def _apply_actions_paywall(
+    shaped: Dict[str, Any], owner_merchant_id: str
+) -> Dict[str, Any]:
+    """Strip the paid action layer when the OWNING merchant is free-tier and
+    the paywall flag is on. Tier-lookup failures fail CLOSED (treated as
+    free): a paying merchant briefly seeing a lock beats an unauthenticated
+    surface leaking the paid layer on a billing-service hiccup."""
+    if not _ACTIONS_PAYWALL_ENABLED:
+        return shaped
+    try:
+        balance = await get_balance(owner_merchant_id)
+        tier = str((balance or {}).get("plan_tier") or "free").strip().lower()
+    except Exception:  # noqa: BLE001
+        logger.warning(
+            "actions paywall: tier lookup failed for merchant_id=%s; "
+            "treating as free",
+            owner_merchant_id,
+        )
+        tier = "free"
+    if tier != "free":
+        return shaped
+    return _strip_actions_for_free_tier(shaped)
+
+
 def _shape_url_audit_response(row: Dict[str, Any]) -> Dict[str, Any]:
     """Reshape a completed per_sku run row into the URL-audit response envelope.
 
@@ -2373,12 +2484,22 @@ async def get_merchant_url_audit(
         # + authority_map). Reshape it into the URL-audit envelope the client
         # expects (status/run_id/per_sku_reports/methodology/…).
         shaped = _shape_url_audit_response(row)
+        shaped = await _apply_actions_paywall(shaped, merchant_id)
         if summary_only:
             return {
                 "status": "succeeded",
                 "run_id": run_id,
                 "audit_run_id": run_id,
                 "report_summary": shaped.get("report_summary"),
+                **(
+                    {
+                        "actions_locked": True,
+                        "locked_counts": shaped.get("locked_counts"),
+                        "locked_teaser_headline": shaped.get("locked_teaser_headline"),
+                    }
+                    if shaped.get("actions_locked")
+                    else {}
+                ),
             }
         # merchant_context lets the page stop pushing the "free sample / connect
         # your store / buy credits" funnel at a subscribed, connected merchant.
@@ -2431,6 +2552,12 @@ _SHARE_ALLOWED_TOP_KEYS = (
     # minimizes them (no run ids, no per-SKU series, no merchant id).
     "visibility_tracking",
     "prior_brand_dimensions",
+    # Free-tier actions paywall markers (counts + one headline teaser only —
+    # no action content): the shared view needs them to render locked panels
+    # instead of silently-empty sections.
+    "actions_locked",
+    "locked_counts",
+    "locked_teaser_headline",
 )
 
 # Curated outreach routing is for the MERCHANT, never the open web. These
@@ -2673,6 +2800,11 @@ async def read_shared_audit(token: str) -> Response:
     if not run or (run.get("status") or "") != "succeeded":
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND)
     shaped = _shape_url_audit_response(run)
+    # Paywall keyed to the OWNER's tier: a free-tier merchant's share link
+    # must not hand out the paid action layer the merchant themselves can't
+    # see. (Paid owners' shares keep the full report — e.g. the marketing
+    # sample report from a paid demo account.)
+    shaped = await _apply_actions_paywall(shaped, run.get("merchant_id") or "")
     shaped.update(await _shared_momentum_payload(run))
     shaped = _redact_shared_report(shaped)
     import json as _json
