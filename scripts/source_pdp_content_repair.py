@@ -357,6 +357,8 @@ def evaluate_candidate(
         "extracted_title": compact(extracted_title)[:180],
         "title_score": title["score"],
         "title_exact": title["exact"],
+        "title_superset_accepted": title.get("title_superset_accepted", False),
+        "source_extra_tokens": title.get("source_extra_tokens"),
         "title_gate_reason": title["reason"],
         "current_description_len": len(current_description),
         "current_description_mentions_title": current_description_mentions_title,

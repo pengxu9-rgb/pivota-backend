@@ -262,8 +262,10 @@ def test_source_superset_still_honours_similarity_floor() -> None:
     """The relaxation bypasses the extra-token veto, never the score floor."""
     gate = repair.title_gate(
         "Snail Mucin Essence",
-        "Snail Mucin Essence Plus Full Ritual Anti Aging Brightening Night Repair Complex",
+        "Snail Mucin Essence Plus Ritual Anti Aging Brightening Night Repair Complex",
         allow_source_superset=True,
     )
 
+    # must fail on the SCORE floor, not short-circuit on a pack/count token
     assert gate["ok"] is False
+    assert gate["reason"] == "title_mismatch"

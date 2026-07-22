@@ -157,7 +157,17 @@ PACK_COUNT_TOKENS = {
     # merchandising
     "type", "types", "color", "colors", "colour", "colours", "shade", "shades",
     "edition", "gift", "special", "value", "family", "promo", "deal", "bogo",
+    "oversized", "supersized", "boxed", "packed", "bundled", "twopack",
+    "sixpack", "sampler", "assortment", "case", "carton", "tray", "unit",
+    "collection",
 }
+
+
+def _is_pack_count_token(token: str) -> bool:
+    """Deny-set membership, plural-tolerant ("refills" -> "refill")."""
+    if token in PACK_COUNT_TOKENS:
+        return True
+    return token.endswith("s") and token[:-1] in PACK_COUNT_TOKENS
 
 
 CANDIDATE_QUERY = """
@@ -497,7 +507,9 @@ def title_gate(
     # STOPWORDS ("set") and GENERIC_PRODUCT_TOKENS ("pack", "size", "mini",
     # "shade"), so checking the filtered set would silently miss exactly the
     # bundle words we care about ("X Twin Pack" -> filtered extras {twin}).
-    raw_source_extra = set(_tokens(extracted_title)) - set(_tokens(target_title))
+    raw_source_extra = (
+        set(_tokens(extracted_title)) - set(_tokens(target_title)) - set(_tokens(brand))
+    )
     safe_superset = (
         bool(source_extra_tokens)
         and not exact
@@ -506,7 +518,7 @@ def title_gate(
         # minimum specificity: a 1-2 token target is too generic to trust as a
         # subset ("Toner" ⊆ "Rice Water Bright Toner").
         and len(target_tokens) >= 3
-        and not (raw_source_extra & PACK_COUNT_TOKENS)
+        and not any(_is_pack_count_token(t) for t in raw_source_extra)
         and not any(ch.isdigit() for tok in raw_source_extra for ch in tok)
     )
     if source_extra_tokens and not exact and not safe_superset:
@@ -665,6 +677,8 @@ def evaluate_candidate(
         "extracted_title": compact(extracted_title)[:180],
         "title_score": title["score"],
         "title_exact": title["exact"],
+        "title_superset_accepted": title.get("title_superset_accepted", False),
+        "source_extra_tokens": title.get("source_extra_tokens"),
         "title_gate_reason": title["reason"],
         "target_variant_tokens": title["target_variant_tokens"],
         "source_variant_tokens": title["source_variant_tokens"],
