@@ -134,6 +134,68 @@ def test_signup_source_sanitization():
     assert source_of("a" * 80) == "a" * 64
 
 
+# ---- (a2) audit-funnel approval floor ---------------------------------------
+
+def _patch_failed_auto_kyb(monkeypatch):
+    import utils.auto_kyb_validator as kyb
+
+    async def failed_kyb(business_name, store_url, region):
+        return {
+            "approved": False,
+            "confidence_score": 0.1,
+            "validation_results": {"url_validation": {"valid": False}},
+        }
+
+    monkeypatch.setattr(kyb, "auto_kyb_pre_approval", failed_kyb)
+
+
+@pytest.mark.asyncio
+async def test_funnel_signup_gets_low_confidence_floor_on_failed_kyb(monkeypatch):
+    """An audit-funnel storefront signup whose URL fails auto-KYB must still
+    auto-approve (store_less-style low-confidence floor) — the funnel must
+    never dead-end in manual review / mandatory documents."""
+    captured = {}
+    _patch_common(monkeypatch, captured)
+    _patch_failed_auto_kyb(monkeypatch)
+
+    req = MerchantRegisterRequest(
+        business_name="Funnel Floor Co",
+        region="US",
+        contact_email="floor@example.com",
+        password="hunter2hunter2",
+        store_url="https://unverifiable-store.example.com",
+        signup_source="ai-readiness-audit",
+    )
+
+    resp = await module.register_merchant(req, _DummyBackgroundTasks())
+
+    assert resp["auto_approved"] is True
+    assert resp["confidence_score"] == module.AUDIT_FUNNEL_APPROVAL_CONFIDENCE
+    assert "audit_funnel_floor" in resp["validation_details"]
+    # Original KYB findings stay on record alongside the floor note.
+    assert "url_validation" in resp["validation_details"]
+
+
+@pytest.mark.asyncio
+async def test_non_funnel_signup_unchanged_on_failed_kyb(monkeypatch):
+    """Without the funnel source, a failed auto-KYB still means NOT approved."""
+    captured = {}
+    _patch_common(monkeypatch, captured)
+    _patch_failed_auto_kyb(monkeypatch)
+
+    req = MerchantRegisterRequest(
+        business_name="Plain Store Co",
+        region="US",
+        contact_email="plain@example.com",
+        password="hunter2hunter2",
+        store_url="https://unverifiable-store.example.com",
+    )
+
+    resp = await module.register_merchant(req, _DummyBackgroundTasks())
+
+    assert resp["auto_approved"] is False
+
+
 # ---- (b) FREE_AUDIT_COUNT_SINCE cutoff --------------------------------------
 
 @pytest.fixture
