@@ -822,23 +822,25 @@ async def test_fail_close_also_clears_index_eligible() -> None:
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
-    "currency,expected_us_offer",
+    "case,currency,expected_us_offer",
     [
-        ("USD", True),
-        ("usd", True),      # case-insensitive
-        (" USD ", True),    # padded — writers persist crawl output verbatim
-        ("GBP", False),
-        ("INR", False),
-        (None, False),      # NULL is schema-legal; fail closed
-        ("", False),
+        (0, "USD", True),
+        (1, "usd", True),      # case-insensitive
+        (2, " USD ", True),    # padded — writers persist crawl output verbatim
+        (3, "GBP", False),
+        (4, "INR", False),
+        (5, None, False),      # NULL is schema-legal; fail closed
+        (6, "", False),
     ],
 )
 async def test_has_us_offer_derived_from_currency_via_sql(
-    currency: Optional[str], expected_us_offer: bool
+    case: int, currency: Optional[str], expected_us_offer: bool
 ) -> None:
     was_connected = await _prepare_db()
     try:
-        suffix = f"cur_{(currency or 'null').strip().lower() or 'empty'}"
+        # keyed on the case index: deriving it from the value collapsed
+        # "USD"/"usd"/" USD " onto one product_key
+        suffix = f"cur{case}"
         ids = await _insert_product(suffix)
         await database.execute(
             "UPDATE catalog_offers SET currency = :cur WHERE product_key = :pk",
@@ -848,6 +850,7 @@ async def test_has_us_offer_derived_from_currency_via_sql(
         assert rows, "eligibility query returned no rows"
         assert bool(rows[0].get("has_us_offer")) is expected_us_offer
     finally:
+        await _cleanup()
         if not was_connected:
             await database.disconnect()
 
@@ -878,5 +881,6 @@ async def test_non_usd_offer_blocks_serving_when_gate_enabled(monkeypatch) -> No
         assert row["blocker_code"] == gates.BLOCKER_NO_US_OFFER
         assert bool(row["index_eligible"]) is True
     finally:
+        await _cleanup()
         if not was_connected:
             await database.disconnect()
