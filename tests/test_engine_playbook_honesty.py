@@ -36,6 +36,10 @@ def test_unmeasured_engine_ships_no_moves():
         assert entry["status"] == "couldnt_measure", engine
         assert entry["measured"] is False
         assert entry["moves"] == [], engine
+        # The entry itself still ships — the portal renders an honest
+        # "not measured" card from label/how_it_cites, so those must survive.
+        assert entry["label"], engine
+        assert entry["how_it_cites"], engine
     assert pb["has_signal"] is False
 
 
@@ -75,6 +79,37 @@ def _buckets(report, vertical):
         (c.get("dimension"), c.get("bucket"))
         for c in _content_gap_candidates(report, vertical=vertical)
     }
+
+
+def _select_playbook_buckets(vertical_ctx: Dict[str, Any]) -> set:
+    """Drive the REAL select_playbooks seam (per_sku_reports +
+    sku_contexts_by_sku) and return the failing buckets of the produced
+    content-revision actions — the exact thread-through carrying the
+    default-closed regression risk."""
+    from services.audit_playbook_engine import select_playbooks
+
+    report = _thin_report()
+    report["sku_key"] = "sku-1"
+    report["sku_title"] = "Test SKU"
+    report["failing_prompts"] = [
+        {"query": "best thing", "evidence_run_id": "run-1", "provider": "gemini"},
+    ]
+    actions = select_playbooks(
+        cited_hosts_detailed=[],
+        failed_queries_detailed=[],
+        per_sku_reports=[report],
+        sku_contexts_by_sku={"sku-1": vertical_ctx},
+    )
+    return {a.get("failing_bucket") for a in actions}
+
+
+def test_select_playbooks_threads_vertical_from_sku_context():
+    assert "ingredient_dose_module" in _select_playbook_buckets({"vertical": "beauty"})
+    assert "ingredient_dose_module" not in _select_playbook_buckets({"vertical": "electronics"})
+    # alternate context shape: resolved_vertical fallback still resolves
+    assert "ingredient_dose_module" in _select_playbook_buckets({"resolved_vertical": "beauty"})
+    # missing contexts entirely -> default-closed, no formulation advice
+    assert "ingredient_dose_module" not in _select_playbook_buckets({})
 
 
 def test_ingredient_dose_module_fires_for_beauty_only():

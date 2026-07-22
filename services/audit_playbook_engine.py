@@ -673,9 +673,18 @@ def _select_content_revision_actions(
         if sku_key in authority_lookup:
             enriched_report["authority_hosts"] = authority_lookup[sku_key].get("authority_hosts") or []
         sku_ctx = (sku_contexts_by_sku or {}).get(sku_key, {})
+        # NOTE for future wiring: the ingredient gate below is default-closed —
+        # a caller that passes per_sku_reports but omits sku_contexts_by_sku
+        # (or builds contexts without a vertical) silently drops the ingredient
+        # playbook for beauty merchants. Read the canonical "vertical" with a
+        # resolved_vertical fallback so alternate context shapes still resolve.
         candidates = _content_gap_candidates(
             enriched_report,
-            vertical=str((sku_ctx or {}).get("vertical") or "").strip().lower() or None,
+            vertical=str(
+                (sku_ctx or {}).get("vertical")
+                or (sku_ctx or {}).get("resolved_vertical")
+                or ""
+            ).strip().lower() or None,
         )
         for dimension, bucket, reason in (
             (c.get("dimension"), c.get("bucket"), c.get("reason"))
