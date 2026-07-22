@@ -158,6 +158,9 @@ from routes.merchant_audit_routes import (
     public_share_router as audit_public_share_router,
     router as merchant_audit_router,
 )
+from routes.funnel_metrics_routes import (
+    router as funnel_metrics_router,
+)
 from routes.brand_claim_routes import (
     router as brand_claim_router,
 )
@@ -828,7 +831,8 @@ app.include_router(agent_center_sku_match_router)  # Agent Center: SKU Match Age
 app.include_router(agent_center_admin_router)  # Agent Center: stuck-run inspection / force-reset (admin-only)
 app.include_router(agent_center_bd_router)  # Agent Center: BD external-merchant AI visibility report
 app.include_router(channel_graph_router)  # BD Channel Graph: cross-merchant cited-host demand rollup (read-only)
-app.include_router(merchant_audit_router)  # Merchant self-service AI Commerce Readiness audit (legacy synchronous)
+app.include_router(merchant_audit_router)
+app.include_router(funnel_metrics_router)  # Admin audit-growth-funnel conversion metrics (WS-4)  # Merchant self-service AI Commerce Readiness audit (legacy synchronous)
 app.include_router(audit_public_share_router)  # Wave-3 B2: unauthenticated read-only audit shares (env-flagged)
 app.include_router(brand_claim_router)  # P1: brand claim write path (claim -> verify -> brand_direct), merchant-scoped
 app.include_router(substantiation_admin_router)  # P1: substantiation grading (employee-only, flag-gated)
