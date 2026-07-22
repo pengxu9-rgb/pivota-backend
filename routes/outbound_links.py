@@ -27,6 +27,13 @@ from services.outbound_links_service import (
     log_outbound_click,
     log_outbound_event,
 )
+from config.settings import settings
+from services.outbound_warm_handoff import (
+    evaluate_warm_eligibility,
+    memo_get,
+    memo_set,
+    resolve_warm_handoff,
+)
 
 
 api_router = APIRouter(prefix="/api/links", tags=["outbound-links"])
@@ -171,9 +178,53 @@ async def redirect_endpoint(req: Request, token: str = Query(..., min_length=10)
     # Attributed-redirect lane D3: a VALIDLY-SIGNED but EXPIRED token (e.g. a feed link cached by
     # an agent platform past the 7-day TTL) still 302s to its destination — a dead link punishes
     # the buyer and the merchant for our cache horizon — but the click is NOT logged, so expired
-    # links can never farm attribution. Bad signatures/shapes still 400 above.
+    # links can never farm attribution. Bad signatures/shapes still 400 above. Expired links also
+    # never attempt a warm handoff (no cart is ever built for a stale link).
     if is_expired:
         return RedirectResponse(url=dest, status_code=302)
+
+    # Warm-handoff click lane (Pivota_Warm_Handoff_Click_Lane_Spec_2026-07-22.md; flag-gated,
+    # DEFAULT OFF — flag off is byte-identical to the cold redirect below). An eligible cold
+    # brand redirect is upgraded at click time to a PRE-BUILT cart on the brand's own Shopify
+    # checkout via the gateway's internal resolve endpoint. Best-effort throughout: any miss
+    # (ineligible / unreachable / timeout / off-brand continue_url) falls back to `dest`, and
+    # the outcome is recorded on the click event ctx (`handoff` / `warm_reason`) — that pair is
+    # the substitution-rate instrument.
+    # (HEAD needs no handling here: the route is GET-only, so HEAD is a side-effect-free 405
+    # at the framework layer — no warm attempt, no cart, no click log.)
+    warm_redirect_url: Optional[str] = None
+    if settings.outbound_warm_handoff_enabled:
+        warm_ctx: Dict[str, str]
+        eligible, reason = evaluate_warm_eligibility(
+            dest=dest,
+            user_agent=req.headers.get("user-agent"),
+            token=token,
+            settings=settings,
+        )
+        if eligible:
+            # Per-token memo: agent-platform prefetch + the real human click build ONE cart,
+            # and the human click 302s instantly off the memo.
+            hit, resolved = memo_get(token)
+            if not hit:
+                resolved = await resolve_warm_handoff(
+                    dest=dest,
+                    ctx=payload.get("ctx") if isinstance(payload.get("ctx"), dict) else {},
+                    settings=settings,
+                )
+                memo_set(token, resolved)
+            if resolved and resolved.get("continue_url"):
+                warm_redirect_url = str(resolved["continue_url"])
+                warm_ctx = {"handoff": "warm", "warm_reason": "ok"}
+            else:
+                warm_ctx = {"handoff": "cold", "warm_reason": "unresolved"}
+        else:
+            warm_ctx = {"handoff": "cold", "warm_reason": reason}
+        try:
+            ctx_out = dict(payload.get("ctx")) if isinstance(payload.get("ctx"), dict) else {}
+            ctx_out.update(warm_ctx)
+            payload["ctx"] = ctx_out
+        except Exception:
+            pass
 
     # Best-effort click logging.
     try:
@@ -187,7 +238,7 @@ async def redirect_endpoint(req: Request, token: str = Query(..., min_length=10)
     except Exception:
         pass
 
-    return RedirectResponse(url=dest, status_code=302)
+    return RedirectResponse(url=warm_redirect_url or dest, status_code=302)
 
 
 class ImpressionRequest(BaseModel):
