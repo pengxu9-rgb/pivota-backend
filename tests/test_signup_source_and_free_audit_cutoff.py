@@ -150,35 +150,11 @@ def _patch_failed_auto_kyb(monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_funnel_signup_gets_low_confidence_floor_on_failed_kyb(monkeypatch):
-    """An audit-funnel storefront signup whose URL fails auto-KYB must still
-    auto-approve (store_less-style low-confidence floor) — the funnel must
-    never dead-end in manual review / mandatory documents."""
-    captured = {}
-    _patch_common(monkeypatch, captured)
-    _patch_failed_auto_kyb(monkeypatch)
-
-    req = MerchantRegisterRequest(
-        business_name="Funnel Floor Co",
-        region="US",
-        contact_email="floor@example.com",
-        password="hunter2hunter2",
-        store_url="https://unverifiable-store.example.com",
-        signup_source="ai-readiness-audit",
-    )
-
-    resp = await module.register_merchant(req, _DummyBackgroundTasks())
-
-    assert resp["auto_approved"] is True
-    assert resp["confidence_score"] == module.AUDIT_FUNNEL_APPROVAL_CONFIDENCE
-    assert "audit_funnel_floor" in resp["validation_details"]
-    # Original KYB findings stay on record alongside the floor note.
-    assert "url_validation" in resp["validation_details"]
-
-
-@pytest.mark.asyncio
-async def test_non_funnel_signup_unchanged_on_failed_kyb(monkeypatch):
-    """Without the funnel source, a failed auto-KYB still means NOT approved."""
+async def test_any_signup_gets_low_confidence_floor_on_failed_kyb(monkeypatch):
+    """EVERY storefront signup whose URL fails auto-KYB auto-approves at the
+    store_less-style low-confidence floor (registration-first policy,
+    2026-07-22) — no signup dead-ends in manual review / mandatory
+    documents. Funnel source not required."""
     captured = {}
     _patch_common(monkeypatch, captured)
     _patch_failed_auto_kyb(monkeypatch)
@@ -193,7 +169,46 @@ async def test_non_funnel_signup_unchanged_on_failed_kyb(monkeypatch):
 
     resp = await module.register_merchant(req, _DummyBackgroundTasks())
 
-    assert resp["auto_approved"] is False
+    assert resp["auto_approved"] is True
+    assert resp["confidence_score"] == module.APPROVAL_FLOOR_CONFIDENCE
+    assert "approval_floor" in resp["validation_details"]
+    # Original KYB findings stay on record alongside the floor note.
+    assert "url_validation" in resp["validation_details"]
+
+
+@pytest.mark.asyncio
+async def test_kyb_pass_keeps_its_own_confidence(monkeypatch):
+    """A signup that PASSES auto-KYB keeps the validator's confidence — the
+    floor only catches failures, it never overwrites a real approval."""
+    import utils.auto_kyb_validator as kyb
+
+    captured = {}
+    _patch_common(monkeypatch, captured)
+
+    async def passing_kyb(business_name, store_url, region):
+        return {
+            "approved": True,
+            "confidence_score": 0.91,
+            "validation_results": {"url_validation": {"valid": True}},
+            "requires_full_kyb": True,
+            "full_kyb_deadline": None,
+        }
+
+    monkeypatch.setattr(kyb, "auto_kyb_pre_approval", passing_kyb)
+
+    req = MerchantRegisterRequest(
+        business_name="Verified Store Co",
+        region="US",
+        contact_email="verified@example.com",
+        password="hunter2hunter2",
+        store_url="https://real-store.example.com",
+    )
+
+    resp = await module.register_merchant(req, _DummyBackgroundTasks())
+
+    assert resp["auto_approved"] is True
+    assert resp["confidence_score"] == 0.91
+    assert "approval_floor" not in resp["validation_details"]
 
 
 # ---- (b) FREE_AUDIT_COUNT_SINCE cutoff --------------------------------------
