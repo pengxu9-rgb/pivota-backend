@@ -117,3 +117,79 @@ def test_url_slug_matcher_ignores_short_and_hostname_hits():
     assert _url_slug_names_brand(
         "https://youtube.com/watch/the-hoverair-x1-review", aliases
     ) is True
+
+
+def test_url_slug_matcher_skips_vertex_redirector_uris():
+    """A redirector path is an opaque token — an alias landing inside it can
+    only be a false positive (review round 2)."""
+    uri = (
+        "https://vertexaisearch.cloud.google.com/grounding-api-redirect/"
+        "AUZIhoverairYs0m3Tok3n"
+    )
+    assert _url_slug_names_brand(uri, ("hoverair",)) is False
+
+
+def test_url_slug_matcher_is_boundary_anchored_not_substring():
+    """Compacted-substring matching hit across slug segments — boundary
+    matching must not (review round 2)."""
+    aliases = ("hoverair",)
+    assert _url_slug_names_brand(
+        "https://youtube.com/watch/best-hover-airplanes-2026", aliases
+    ) is False
+    assert _url_slug_names_brand(
+        "https://youtube.com/watch/whoverairbnb-tour", aliases
+    ) is False
+
+
+def test_url_slug_matcher_skips_dictionary_word_brands():
+    """A 4-char dictionary-word brand ("Glow") survives boundary matching in
+    category slugs — the slug arm requires >=5 compact chars; the URL just
+    stays in the pitch bucket."""
+    assert _url_slug_names_brand(
+        "https://youtube.com/watch/best-glow-serums", ("glow",)
+    ) is False
+
+
+def test_missing_axis_does_not_count_as_branded_evidence():
+    """run_query_class defaults BRANDED on a missing axis; a degraded run must
+    not inflate the amplify bucket (review round 2)."""
+    uri = "https://www.youtube.com/watch?v=abc123"
+    run = _run("best camera drone for travel", uri)
+    del run["axis_metadata"]
+    amap = _map([run])
+    row = _host_row(amap, "youtube.com")
+    assert row["evidence_urls_about_merchant"] == []
+
+
+def test_new_fields_survive_share_redaction():
+    """The whole point of the fields is the (public, allowlisted) share
+    payload — assert redaction keeps them."""
+    from routes.merchant_audit_routes import _redact_shared_report
+
+    uri = "https://www.youtube.com/watch?v=abc123"
+    thread_uri = (
+        "https://www.reddit.com/r/drones/comments/1atit33/"
+        "hoverair_x1_what_do_you_actually_do_with_it/"
+    )
+    amap = _map([
+        _run("is HoverAir legit", uri, axis="trust"),
+        _run("best camera drone", thread_uri, title="reddit.com"),
+    ])
+    shaped = {
+        "status": "succeeded",
+        "run_id": "r-1",
+        "authority_map": amap,
+        "per_sku_reports": [],
+    }
+    out = _redact_shared_report(shaped)
+    row = next(
+        r for r in out["authority_map"]["skus"][0]["authority_hosts"]
+        if r["host"] == "youtube.com"
+    )
+    assert row["evidence_urls_about_merchant"] == [uri]
+    threads = [
+        t
+        for sub in out["authority_map"]["skus"][0]["reddit"]["subreddits"]
+        for t in sub["threads"]
+    ]
+    assert any(t.get("about_merchant") is True for t in threads)

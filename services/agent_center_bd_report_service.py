@@ -8429,20 +8429,40 @@ def _url_slug_names_brand(uri: Any, brand_aliases: Tuple[str, ...]) -> bool:
     actually_do_with_it/) or an article/video slug. Grounding-source titles
     are unreliable (Gemini stamps the bare domain as the title), but a slug
     that spells the brand is direct evidence the linked content covers the
-    merchant. Aliases are compacted to alphanumerics; aliases shorter than 4
-    chars are skipped (too collision-prone inside slugs)."""
+    merchant.
+
+    Precision guards (review round 2):
+    - Vertex redirector URIs are skipped outright: their path is an opaque
+      token the real slug is hidden behind, so a match there can only ever be
+      a false positive.
+    - Matching is boundary-anchored via text_mentions_brand (separators
+      normalized to spaces) — the earlier compacted-substring form matched
+      across slug segments ("best-hover-airplanes" ⊃ "hoverair").
+    - Aliases under 5 compact chars are skipped: dictionary-word brands
+      ("Glow", "Bare") survive even boundary matching inside category slugs
+      ("best-glow-serums"). A miss here is safe — the URL just stays in the
+      pitch bucket.
+    """
     try:
-        path = urlparse(str(uri or "")).path
+        parts = urlparse(str(uri or ""))
     except ValueError:
         return False
-    slug = re.sub(r"[^a-z0-9]+", "", (path or "").lower())
-    if not slug:
+    host = (parts.netloc or "").split("@")[-1].split(":")[0].lower()
+    if host.startswith("www."):
+        host = host[4:]
+    if host in _VERTEX_REDIRECTOR_HOSTS:
         return False
-    for alias in brand_aliases or ():
-        compact = re.sub(r"[^a-z0-9]+", "", str(alias).lower())
-        if len(compact) >= 4 and compact in slug:
-            return True
-    return False
+    text = re.sub(r"[^a-z0-9]+", " ", (parts.path or "").lower()).strip()
+    if not text:
+        return False
+    slug_aliases = tuple(
+        alias
+        for alias in brand_aliases or ()
+        if len(re.sub(r"[^a-z0-9]", "", str(alias).lower())) >= 5
+    )
+    if not slug_aliases:
+        return False
+    return text_mentions_brand(text, slug_aliases)
 
 
 def _host_is_first_party(
@@ -8899,6 +8919,12 @@ def build_authority_map(
                 or llm_report.get("sku_mentioned") is True
             )
             near = parsed.get("authority_near_variant_found") is True or llm_report.get("authority_near_variant_found") is True
+            # run_query_class defaults BRANDED on a missing/empty axis — a
+            # degraded run must not count as positive covers-merchant
+            # evidence, so the branded arm below requires the axis to be
+            # explicitly stamped (review round 2).
+            _axis_meta = run.get("axis_metadata") if isinstance(run.get("axis_metadata"), dict) else {}
+            axis_explicit = bool(str(_axis_meta.get("axis") or "").strip())
             excerpt = run.get("evidence_excerpt") or parsed.get("evidence_excerpt") or parsed.get("evidence_text")
             for source in run.get("grounding_sources") or []:
                 if not isinstance(source, dict):
@@ -8931,7 +8957,7 @@ def build_authority_map(
                 covers_merchant = bool(
                     exact
                     or near
-                    or query_class == QUERY_CLASS_BRANDED
+                    or (axis_explicit and query_class == QUERY_CLASS_BRANDED)
                     or _url_slug_names_brand(uri, brand_aliases)
                 )
                 row = host_rows.setdefault(host, {
