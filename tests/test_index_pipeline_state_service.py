@@ -87,6 +87,7 @@ async def _ensure_schema() -> None:
             product_key TEXT,
             merchant_id TEXT,
             list_price REAL,
+            currency TEXT DEFAULT 'USD',
             suppressed_at TIMESTAMP
         )
         """,
@@ -147,6 +148,12 @@ async def _ensure_schema() -> None:
     offer_columns = await database.fetch_all("PRAGMA table_info(catalog_offers)")
     if "suppressed_at" not in {dict(row).get("name") for row in offer_columns}:
         await database.execute("ALTER TABLE catalog_offers ADD COLUMN suppressed_at TIMESTAMP")
+    # has_us_offer is derived from currency; backstop for test DBs created before
+    # the column existed (mirrors the suppressed_at backstop above).
+    if "currency" not in {dict(row).get("name") for row in offer_columns}:
+        await database.execute(
+            "ALTER TABLE catalog_offers ADD COLUMN currency TEXT DEFAULT 'USD'"
+        )
     # ADR-008 SLICE 1: backstop for test DBs created before index_eligible
     # existed (mirrors the suppressed_at backstop above).
     ips_columns = await database.fetch_all("PRAGMA table_info(index_pipeline_state)")

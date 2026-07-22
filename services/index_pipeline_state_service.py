@@ -515,14 +515,21 @@ _ELIGIBILITY_COLUMNS = f"""
           AND co.list_price > 0
         LIMIT 1
     )                           AS has_price,
-    (
-        SELECT TRUE
+    -- US-buyable offer. Derived from CURRENCY, not catalog_offers.market:
+    -- market is a NOT NULL DEFAULT 'US' (mig 149, "refine to real per-offer geo
+    -- when modeled") that the external-seed writers never set, so it is 'US' for
+    -- every row and carries no signal. currency IS written truthfully by every
+    -- writer (0 of 18,279 live priced offers have it null), which is exactly how
+    -- the INR/ZAR/GBP mispricing was detected. EXISTS (not SELECT TRUE) so the
+    -- value is TRUE/FALSE and never NULL — an ABSENT key then unambiguously means
+    -- "not computed by this query" rather than "no US offer".
+    EXISTS (
+        SELECT 1
         FROM catalog_offers co
         WHERE co.product_key = cp.product_key
           AND co.suppressed_at IS NULL
           AND co.list_price > 0
-          AND co.market = 'US'
-        LIMIT 1
+          AND upper(coalesce(co.currency, '')) = 'USD'
     )                           AS has_us_offer,
     -- Category concern list (skin concern for skincare, hair concern for
     -- haircare); both read the shared concerns_json. The category-attributes
@@ -732,7 +739,14 @@ SELECT
     -- (catalog_offers.market; beauty concerns/actives) are computed on the
     -- Postgres path; the agent-decision gate is flag-off in tests, and its logic
     -- is covered by the agent_decision_gates unit tests.
-    0 AS has_us_offer,
+    EXISTS (
+        SELECT 1
+        FROM catalog_offers co
+        WHERE co.product_key = cp.product_key
+          AND co.suppressed_at IS NULL
+          AND co.list_price > 0
+          AND upper(coalesce(co.currency, '')) = 'USD'
+    ) AS has_us_offer,
     NULL AS has_category_concern,
     NULL AS has_key_actives,
     EXISTS (
