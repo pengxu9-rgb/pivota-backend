@@ -26,9 +26,10 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import json
 import sys
 from pathlib import Path
-from typing import Optional
+from typing import Any, Optional
 
 ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
@@ -43,17 +44,38 @@ from services.product_quality_service import SOURCE_BACKED_COMPONENTS_RULES_VERS
 
 TOOL = "external_brand_crawl"
 
+# Scope: ANY seed-attached product, not just `external_brand_crawl::%`. The
+# original filter matched only one ingest path and silently skipped 2,404 of the
+# 4,072 seed-attached beauty rows (measured 2026-07-22) — they carry the same
+# payload shape and the same ~50 stalled score, they just arrived via a different
+# source_ref. `--tool-prefix` restores the old narrow behavior when needed.
 FETCH = """
     SELECT p.product_key, p.source_product_id, p.title, p.description, p.brand,
            p.product_type, p.category_kind, p.image_url,
-           eps.price_amount, bsi.raw_inci
+           eps.price_amount, bsi.raw_inci,
+           eps.seed_data -> 'pdp_details_sections' AS pdp_details_sections
     FROM catalog_products p
-    LEFT JOIN external_product_seeds eps ON eps.attached_product_key = p.product_key
+    JOIN external_product_seeds eps ON eps.attached_product_key = p.product_key
     LEFT JOIN beauty_sku_ingredients bsi
            ON bsi.sku_key = p.product_key || '::canonical'
-    WHERE p.source_ref LIKE 'external_brand_crawl::%'
+    WHERE (
+        CAST(:source_prefix AS TEXT) IS NULL
+        OR p.source_ref LIKE CAST(:source_prefix AS TEXT)
+    )
     ORDER BY p.product_key
 """
+
+
+def _coerce_sections(value: Any) -> Optional[list]:
+    """`seed_data->'pdp_details_sections'` arrives as JSON (str or list)."""
+    if value is None:
+        return None
+    if isinstance(value, str):
+        try:
+            value = json.loads(value)
+        except Exception:
+            return None
+    return list(value) if isinstance(value, (list, tuple)) else None
 
 
 async def _rescored_ids() -> set:
@@ -65,26 +87,39 @@ async def _rescored_ids() -> set:
     return {dict(r)["pid"] for r in rows}
 
 
-async def run(apply: bool, limit: Optional[int]) -> None:
+async def run(
+    apply: bool,
+    limit: Optional[int],
+    *,
+    source_prefix: Optional[str] = None,
+    force: bool = False,
+) -> None:
     await database.connect()
     try:
-        rows = [dict(r) for r in await database.fetch_all(FETCH)]
-        done = await _rescored_ids()
+        rows = [
+            dict(r)
+            for r in await database.fetch_all(FETCH, {"source_prefix": source_prefix})
+        ]
+        done = set() if force else await _rescored_ids()
         todo = [r for r in rows if r["source_product_id"] not in done]
         if limit:
             todo = todo[:limit]
         with_inci = sum(1 for r in rows if (r.get("raw_inci") or "").strip())
+        with_sections = sum(1 for r in rows if _coerce_sections(r.get("pdp_details_sections")))
         print(
             f"batch={len(rows)}  already-rescored={len(done)}  "
-            f"to-rescore={len(todo)}  (with INCI: {with_inci})",
+            f"to-rescore={len(todo)}  (with INCI: {with_inci}, "
+            f"with pdp_details_sections: {with_sections})",
             flush=True,
         )
 
         if not apply:
             for r in todo[:5]:
                 has_inci = "Y" if (r.get("raw_inci") or "").strip() else "N"
+                has_sec = "Y" if _coerce_sections(r.get("pdp_details_sections")) else "N"
                 print(f"  would rescore {r['source_product_id']} inci={has_inci} "
-                      f"cat={r['category_kind']} :: {(r['title'] or '')[:40]}")
+                      f"sections={has_sec} cat={r['category_kind']} "
+                      f":: {(r['title'] or '')[:40]}")
             print("DRY-RUN — pass --apply to write.")
             return
 
@@ -102,6 +137,7 @@ async def run(apply: bool, limit: Optional[int]) -> None:
                     price=r["price_amount"], image_url=r["image_url"],
                     brand=r["brand"], product_type=r["product_type"],
                     category=r["category_kind"], raw_inci=r["raw_inci"],
+                    pdp_details_sections=_coerce_sections(r.get("pdp_details_sections")),
                 )
                 # per-product timeout so a dead socket errors out, never hangs
                 await asyncio.wait_for(
@@ -129,8 +165,22 @@ def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument("--apply", action="store_true", help="write (default: dry-run)")
     ap.add_argument("--limit", type=int, default=None, help="cap rows this run")
+    ap.add_argument(
+        "--tool-prefix",
+        default=None,
+        help="restrict to one ingest path, e.g. 'external_brand_crawl::%%' "
+             "(default: ALL seed-attached products)",
+    )
+    ap.add_argument(
+        "--force",
+        action="store_true",
+        help="re-score even products already on the current rules version "
+             "(needed when the payload shape changes, e.g. pdp_details_sections)",
+    )
     args = ap.parse_args()
-    asyncio.run(run(args.apply, args.limit))
+    asyncio.run(
+        run(args.apply, args.limit, source_prefix=args.tool_prefix, force=args.force)
+    )
     return 0
 
 

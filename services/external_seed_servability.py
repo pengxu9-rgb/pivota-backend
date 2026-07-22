@@ -59,6 +59,7 @@ def build_servable_quality_payload(
     product_type: Optional[str] = None,
     category: Optional[str] = None,
     raw_inci: Optional[str] = None,
+    pdp_details_sections: Optional[Any] = None,
 ) -> Dict[str, Any]:
     """Shape the fields the deterministic quality scorer reads.
 
@@ -68,10 +69,18 @@ def build_servable_quality_payload(
     (fails the source-backed attributes component), so genuinely-stocked
     products score ~50 and never clear the serving threshold. We therefore:
       * fall back to ``category`` (e.g. category_kind) when product_type is null,
-        so the brand+category component can pass, and
+        so the brand+category component can pass,
       * attach the INCI to the payload's ``seed_data`` where
         ``source_backed_attribute_signal_count`` reads it, so a product with a
-        real ingredient list earns the attributes component.
+        real ingredient list earns the attributes component, and
+      * carry the crawled ``pdp_details_sections`` through to that same
+        ``seed_data`` slot. Both `score_source_backed_summary` and
+        `source_backed_attribute_signal_count` read those sections, but nothing
+        used to pass them here — so a product whose crawl DID capture its PDP
+        detail sections was still scored as if it had none, losing the summary
+        and attribute components it had already earned. Measured on 250 live
+        rows carrying sections (2026-07-22): 98% clear the 65 bar once they are
+        passed, vs 50% without, at +13.1 avg score.
     """
     payload = build_quality_payload(
         {
@@ -85,15 +94,21 @@ def build_servable_quality_payload(
         }
     )
 
+    # build_quality_payload does not carry source-backed content through; attach
+    # it to the top-level seed_data slot that _source_backed_roots() reads.
+    seed_data: Dict[str, Any] = {}
+
     inci = (raw_inci or "").strip()
     if inci:
         inci_list = [tok.strip() for tok in inci.split(",") if tok.strip()]
-        # build_quality_payload does not carry ingredients through; attach them
-        # to the top-level seed_data slot that _source_backed_roots() reads.
-        payload["seed_data"] = {
-            "inci_list": inci_list,
-            "pdp_ingredients_raw": inci,
-        }
+        seed_data["inci_list"] = inci_list
+        seed_data["pdp_ingredients_raw"] = inci
+
+    if isinstance(pdp_details_sections, (list, tuple)) and pdp_details_sections:
+        seed_data["pdp_details_sections"] = list(pdp_details_sections)
+
+    if seed_data:
+        payload["seed_data"] = seed_data
     return payload
 
 
