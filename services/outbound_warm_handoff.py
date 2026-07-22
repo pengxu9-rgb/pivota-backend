@@ -271,8 +271,11 @@ async def resolve_warm_handoff(
 
     # A shopper is waiting on the 302: `total_deadline` is a TRUE wall-clock ceiling via
     # asyncio.wait_for (httpx.Timeout alone is per-phase — connect+read could stack past it).
+    # Deliberately NO tighter connect sub-cap: wait_for already bounds the whole call, and a
+    # 1.0s connect cap proved flaky on high-RTT paths (TLS to the EU gateway from Asia
+    # exceeds 1s — E2E finding 2026-07-22) while adding nothing that wait_for doesn't.
     total_deadline = float(settings.outbound_warm_handoff_timeout_seconds or 2.5)
-    timeout = httpx.Timeout(total_deadline, connect=min(1.0, total_deadline))
+    timeout = httpx.Timeout(total_deadline)
     headers = {"X-Internal-Key": str(settings.outbound_warm_handoff_internal_key or "")}
 
     async def _post() -> Any:
