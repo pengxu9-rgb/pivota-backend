@@ -8423,6 +8423,28 @@ def _host_label_matches_brand_storefront(
     return False
 
 
+def _url_slug_names_brand(uri: Any, brand_aliases: Tuple[str, ...]) -> bool:
+    """True when the URL's *path* visibly names the merchant's brand — e.g. a
+    Reddit permalink slug (/r/drones/comments/x/hoverair_x1_what_do_you_
+    actually_do_with_it/) or an article/video slug. Grounding-source titles
+    are unreliable (Gemini stamps the bare domain as the title), but a slug
+    that spells the brand is direct evidence the linked content covers the
+    merchant. Aliases are compacted to alphanumerics; aliases shorter than 4
+    chars are skipped (too collision-prone inside slugs)."""
+    try:
+        path = urlparse(str(uri or "")).path
+    except ValueError:
+        return False
+    slug = re.sub(r"[^a-z0-9]+", "", (path or "").lower())
+    if not slug:
+        return False
+    for alias in brand_aliases or ():
+        compact = re.sub(r"[^a-z0-9]+", "", str(alias).lower())
+        if len(compact) >= 4 and compact in slug:
+            return True
+    return False
+
+
 def _host_is_first_party(
     host: Optional[str],
     merchant_hosts: frozenset,
@@ -8900,6 +8922,18 @@ def build_authority_map(
                 citation_role = _citation_role(host_type, first_party, is_competitor)
                 host_recommendation_class = recommendation_class(raw_host_type)
                 query_class = _run_query_class(run)
+                # Answer-level attribution for THIS cited URL: the content
+                # covers the merchant when the answer named the SKU (exact/
+                # near), the query itself was branded (an answer grounded for
+                # "is <brand> legit" is about the brand), or the URL slug
+                # spells the brand. Creator/community outreach splits on this:
+                # already-covers-you -> amplify, category-only -> pitch.
+                covers_merchant = bool(
+                    exact
+                    or near
+                    or query_class == QUERY_CLASS_BRANDED
+                    or _url_slug_names_brand(uri, brand_aliases)
+                )
                 row = host_rows.setdefault(host, {
                     "host": host,
                     "host_type": host_type,
@@ -8916,6 +8950,7 @@ def build_authority_map(
                     "providers": [],
                     "provider_counts": {},
                     "evidence_urls": [],
+                    "evidence_urls_about_merchant": [],
                     "evidence_excerpt": None,
                     "competitors_named": [],
                     "_queries": set(),
@@ -8943,6 +8978,12 @@ def build_authority_map(
                 )
                 if uri and uri not in row["evidence_urls"]:
                     row["evidence_urls"].append(uri)
+                if (
+                    uri
+                    and covers_merchant
+                    and uri not in row["evidence_urls_about_merchant"]
+                ):
+                    row["evidence_urls_about_merchant"].append(uri)
                 if excerpt and not row.get("evidence_excerpt"):
                     row["evidence_excerpt"] = str(excerpt)[:280]
                 for competitor in competitors or []:
@@ -8988,6 +9029,12 @@ def build_authority_map(
                         "provider": provider,
                         "sentiment": None,
                         "matched_sku": bool(exact or near),
+                        # Broader than matched_sku (answer-level SKU match):
+                        # also true on branded queries and brand-naming slugs,
+                        # so a thread literally titled after the product isn't
+                        # marked unrelated just because one answer skipped the
+                        # exact SKU name.
+                        "about_merchant": covers_merchant,
                     })
 
         authority_hosts = []
