@@ -55,13 +55,24 @@ def _shaped_fixture():
     per_sku[0]["opportunity"] = {"open_lanes": [{"query": "best beginner drone"}]}
     per_sku[0]["suggested_prompts"] = ["best drone under $300"]
     wcw = {"niches": [{"query": "travel drone", "action": "create_answer"}]}
-    brand_rollup = {"avg_visibility": 40, "where_you_can_win": wcw}
+    brand_rollup = {
+        "avg_visibility": 40,
+        "where_you_can_win": wcw,
+        # Reseller-only stocking recommendation — must be stripped when present.
+        "winning_products_not_carried": [
+            {"title": "DJI Mini 5", "recommend_stocking": True}
+        ],
+    }
     report = {
         "merchant_narrative": narrative,
         "per_sku_reports": per_sku,
         "brand_rollup": brand_rollup,
         "where_you_can_win": wcw,
-        "win_plan": {"sku_plans": [{"sku": "X1", "win_path": "own_content"}]},
+        "win_plan": {
+            "available": True,
+            "sku_plans": [{"sku": "X1", "win_path": "own_content"}],
+            "losing_queries": [{"query": "best travel drone", "win_path": "own_content"}],
+        },
     }
     return {
         "status": "succeeded",
@@ -139,6 +150,7 @@ _FORBIDDEN_ACTION_KEYS = {
     "get_cited_moves",
     "winnable_lanes",
     "pitch_recipient",
+    "winning_products_not_carried",
 }
 
 

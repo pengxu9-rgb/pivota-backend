@@ -1596,6 +1596,11 @@ def _strip_actions_for_free_tier(shaped: Dict[str, Any]) -> Dict[str, Any]:
     for home in wcw_homes:
         if isinstance(home, dict) and home.get("where_you_can_win") is not None:
             home["where_you_can_win"] = None
+        # Reseller-only stocking/sourcing recommendation (competitor products
+        # AI recommends that the reseller doesn't carry) — squarely the paid
+        # "what to do" layer when present.
+        if isinstance(home, dict) and home.get("winning_products_not_carried") is not None:
+            home["winning_products_not_carried"] = None
 
     # brand_report is the raw report dict — its narrative/per-SKU branches are
     # aliases (already stripped above), but the full win_plan is its own tree.
