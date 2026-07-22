@@ -199,6 +199,42 @@ def test_top_actions_carry_supporting_prompts_via_real_join():
     assert action["supporting_prompts"][0]["evidence_run_id"] == "run-9"
 
 
+def test_top_actions_collapsed_get_indexed_joins_via_sku_title_fallback():
+    """A collapsed merchant-level get_indexed action (repeated per-SKU
+    primaries merged into one, pivota-backend#1559) has a novel headline that
+    matches NO per-SKU nba.headline — _match_sku_report must fall through to
+    the sku_title join and attach the FIRST covered SKU's evidence + CTA, and
+    the sku_titles list must survive to the summary surface."""
+    report = _brand_report()
+    report["merchant_narrative"]["prioritized_actions"] = [
+        {
+            "sku_title": "Hydra Serum",
+            "sku_titles": ["Hydra Serum", "Glow Serum", "Calm Serum"],
+            "primary_gap": "get_indexed",
+            "headline": "Get your 3 products indexed so AI can find them.",
+            "first_move": (
+                "Get each one live and crawlable: confirm it's published, in "
+                "your sitemap, and has a canonical product page AI can reach."
+            ),
+            "why_this_first": "These products aren't live in the AI shopping surface yet.",
+            "growth_phase": "create_and_distribute",
+        },
+    ]
+    out = build_report_summary(report)
+    actions = out["top_actions"]
+    assert len(actions) == 1
+    action = actions[0]
+    assert action["headline"] == "Get your 3 products indexed so AI can find them."
+    assert action["sku_titles"] == ["Hydra Serum", "Glow Serum", "Calm Serum"]
+    # sku_title fallback join landed on the representative report:
+    assert action["target_sku_key"] == "sku-1"
+    assert action["cta"] == {"label": "Get this product indexed", "target_sku_key": "sku-1"}
+    assert action["supporting_prompts_basis"] == "evidence_used"
+    assert action["supporting_prompts"], "expected the first SKU's measured prompts"
+    # The collapsed action's own copy wins over the per-SKU NBA copy.
+    assert action["first_move"].startswith("Get each one live and crawlable")
+
+
 def test_action_evidence_merges_chips_and_failing_prompts():
     # Chips lead (dedup precedence) but the sku failing_prompts fill the cap —
     # chips alone are a [:5] slice of a provider-grouped list and can be

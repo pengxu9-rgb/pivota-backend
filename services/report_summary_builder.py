@@ -421,6 +421,9 @@ def _top_actions(
                 "primary_gap": action.get("primary_gap"),
                 "growth_phase": action.get("growth_phase"),
                 "sku_title": action.get("sku_title"),
+                # Collapsed merchant-level actions (repeated get_indexed
+                # primaries) carry every covered SKU; absent on per-SKU rows.
+                "sku_titles": action.get("sku_titles"),
                 "target_sku_key": cta.get("target_sku_key")
                 or sku_report.get("sku_key"),
                 "cta": (cta or None) if not is_secondary else None,

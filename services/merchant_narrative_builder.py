@@ -28,6 +28,7 @@ from services.cited_host_classifier import (
     is_findability_role,
 )
 from services.competitor_brand_filter import is_ingredient_or_category_type
+from services.next_best_action import PRIMARY_SKU_GET_INDEXED
 from services.vertical_profiles import BEAUTY_PROFILE, VerticalProfile
 
 # Probe axes that name the SKU/brand (branded/navigational) vs the non-branded
@@ -1114,6 +1115,49 @@ def _verify_plain(verify_summary: Optional[Dict[str, Any]]) -> Dict[str, Any]:
     }
 
 
+def _collapse_get_indexed_actions(actions: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """Collapse per-SKU get_indexed primaries into ONE merchant-level action.
+
+    The (gap, headline) dedup can't catch these — each headline embeds its SKU
+    title — so a 3-SKU cold-start run rendered the same "Get X indexed"
+    prescription three times (live HoverAir share report 2026-07-19). All N
+    SKUs share one underlying condition and one remediation, so they get one
+    action naming all of them. The collapsed row keeps the FIRST SKU's
+    sku_title so the summary's _match_sku_report join (headline first,
+    sku_title fallback) still lands on a representative report; the full list
+    rides in `sku_titles` for display."""
+    indexed = [a for a in actions if a.get("primary_gap") == PRIMARY_SKU_GET_INDEXED]
+    if len(indexed) < 2:
+        return actions
+    titles = [str(a.get("sku_title") or "").strip() for a in indexed]
+    titles = [t for t in titles if t]
+    first = indexed[0]
+    n = len(indexed)
+    collapsed = {
+        **first,
+        "headline": f"Get your {n} products indexed so AI can find them.",
+        "first_move": (
+            "Get each one live and crawlable: confirm it's published, in your "
+            "sitemap, and has a canonical product page AI can reach."
+        ),
+        "why_this_first": (
+            "These products aren't live in the AI shopping surface yet, so "
+            "assistants can't see or recommend them. Until they're indexed, "
+            "nothing else you do to their pages can move your visibility — "
+            "this is the first step."
+        ),
+        "sku_titles": titles or None,
+    }
+    out: List[Dict[str, Any]] = []
+    for action in actions:
+        if action.get("primary_gap") == PRIMARY_SKU_GET_INDEXED:
+            if action is first:
+                out.append(collapsed)
+            continue
+        out.append(action)
+    return out
+
+
 def _prioritized_actions(per_sku_reports: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
     seen = set()
     actions: List[Dict[str, Any]] = []
@@ -1144,6 +1188,7 @@ def _prioritized_actions(per_sku_reports: List[Dict[str, Any]]) -> List[Dict[str
     # evidence intake; stable within phase by SKU order.
     phase_order = {"create_and_distribute": 0, "evidence_intake": 1}
     actions.sort(key=lambda a: phase_order.get(a["growth_phase"], 9))
+    actions = _collapse_get_indexed_actions(actions)
     # Holistic review 2026-07-16: a single-SKU audit rendered exactly ONE
     # action — each NBA's secondary moves (next-biggest gap repairs + prompt
     # re-tests) were computed but never reached the plan. Append them AFTER

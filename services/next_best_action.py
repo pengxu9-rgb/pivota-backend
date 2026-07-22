@@ -2234,6 +2234,100 @@ def _brand_operator_moves(
     ]
 
 
+# Per-gap remediation copy for secondary moves, keyed (dimension, bucket).
+# The gap chips carry merchant-safe *scorecard labels* ("Mentioned by name",
+# "Discoverable by AI") — fine as chips, meaningless as action bullets (live
+# HoverAir share report: bullets read as pillar names with a "strengthen this
+# next" placeholder). Each entry is the gap restated as the move that closes
+# it. Unmapped buckets fall back to the label + generic step, never crash.
+_SKU_GAP_REPAIR_COPY: Dict[Tuple[str, str], Dict[str, str]] = {
+    ("identity", "pivota_signature"): {
+        "title": "Establish one canonical product page",
+        "step": "Consolidate to a single canonical product URL and point every listing of this product at it.",
+    },
+    ("identity", "content_key"): {
+        "title": "Give this product a stable identity",
+        "step": "Keep the product's core identifiers consistent so every system refers to the same product over time.",
+    },
+    ("identity", "identity_resolution"): {
+        "title": "Resolve this product to one identity",
+        "step": "Align the product's name, brand, and identifiers so every listing clearly refers to the same product.",
+    },
+    ("identity", "variant_identity"): {
+        "title": "Give each variant its own identifiers",
+        "step": "Add distinct identifiers for each size, shade, or option so AI can recommend the exact one a shopper wants.",
+    },
+    ("identity", "title_brand_category"): {
+        "title": "Clarify the title, brand, and category",
+        "step": "Rewrite the product title so name, brand, and category are unambiguous at a glance.",
+    },
+    ("identity", "collision_audit"): {
+        "title": "Separate this product from its lookalike",
+        "step": "Differentiate the listing's name and identifiers from the product it's being confused with.",
+    },
+    ("content_richness", "product_quality_score"): {
+        "title": "Deepen the product description",
+        "step": "Expand the description where shoppers ask the most questions — materials, fit, performance, comparisons.",
+    },
+    ("content_richness", "enrichment_coverage"): {
+        "title": "Complete the product story",
+        "step": "Add the missing summary, highlights, who it's for, and when to use it.",
+    },
+    ("content_richness", "vertical_structure"): {
+        "title": "Add the category-specific details",
+        "step": "Cover the specific details shoppers in this category compare products on.",
+    },
+    ("content_richness", "model_readiness"): {
+        "title": "Structure the page so AI can read it",
+        "step": "Organize the page into clear, labeled sections with plain product facts AI can quote.",
+    },
+    ("content_richness", "safety_claims"): {
+        "title": "Substantiate the product claims",
+        "step": "Back each claim with supporting detail or clear usage guidance so AI will repeat it.",
+    },
+    ("content_richness", "freshness_raw_pdp"): {
+        "title": "Refresh the product page",
+        "step": "Update stale copy and imagery on the core product page.",
+    },
+    ("routability", "offer_orderability"): {
+        "title": "Make the offer buyable",
+        "step": "Publish a clear, in-stock, orderable offer AI can hand a shopper to checkout.",
+    },
+    ("routability", "price_currency_confidence"): {
+        "title": "Firm up price and currency",
+        "step": "Publish complete, consistent price and currency detail so AI can quote this product confidently.",
+    },
+    ("routability", "merchant_trust_state"): {
+        "title": "Finish store verification",
+        "step": "Complete store verification and keep your catalog sync healthy.",
+    },
+    ("routability", "policy_jurisdiction"): {
+        "title": "Clarify shipping and policies",
+        "step": "Spell out shipping coverage and store policies for the markets you serve.",
+    },
+    ("routability", "variant_route_integrity"): {
+        "title": "Fix the variant-to-offer mapping",
+        "step": "Map each selectable option to its own buyable offer so checkout lands on the right variant.",
+    },
+    ("citation", "first_party_rate"): {
+        "title": "Become the page AI cites",
+        "step": "Strengthen your own page's facts and proof, and earn independent citations — the get-cited plan lists the exact targets.",
+    },
+    ("citation", "sku_mention_rate"): {
+        "title": "Get this product named in category answers",
+        "step": "Earn mentions in the independent reviews and threads AI cites for this category — the get-cited plan lists the exact targets.",
+    },
+    ("citation", "authority_near_variant_rate"): {
+        "title": "Earn coverage from trusted sources",
+        "step": "Pitch the authoritative sites AI already relies on for this category's answers — the get-cited plan lists them.",
+    },
+    ("citation", "answer_quality_rate"): {
+        "title": "Give AI stronger material to answer with",
+        "step": "Add clear facts, proof points, and FAQs to the page so the answers AI gives about this product hold up.",
+    },
+}
+
+
 def _sku_secondary_moves(
     *,
     primary_gap: str,
@@ -2245,17 +2339,33 @@ def _sku_secondary_moves(
     for gap in primary_gaps:
         if primary_gap == PRIMARY_SKU_CONTENT_REVISION_GAP and gap == primary_content_gap:
             continue
+        dimension = str(gap.get("dimension") or "").strip()
+        bucket = str(gap.get("bucket") or "").strip()
+        # A gap the primary move already owns must not re-appear as a
+        # "secondary": for a get_indexed SKU the serving-eligibility gap IS
+        # the primary diagnosis (live HoverAir report: bullet 4 "Discoverable
+        # by AI" restated bullet 1's why verbatim). Internal serving-state
+        # gaps (#1504) are Pivota's own pipeline read, not a merchant action —
+        # never prescribe them as a move either.
+        if gap.get("internal_state"):
+            continue
+        if (
+            primary_gap == PRIMARY_SKU_GET_INDEXED
+            and (dimension, bucket) == ("routability", "serving_eligibility")
+        ):
+            continue
         # Use the gap's merchant-safe label/why, NEVER the raw scoring
         # dimension.bucket ("citation.first_party_rate") or internal `reason` —
         # those are internal vocabulary and read as nonsense to a merchant.
         label = str(gap.get("label") or "").strip()
         why = str(gap.get("why") or "").strip()
+        repair = _SKU_GAP_REPAIR_COPY.get((dimension, bucket)) or {}
         moves.append({
-            "title": label or "Strengthen your next-biggest visibility gap",
+            "title": repair.get("title") or label or "Strengthen your next-biggest visibility gap",
             "severity": "medium" if _score(gap.get("gap")) < 20 else "high",
             "lever": "sku_gap_repair",
             "target_host": None,
-            "concrete_next_step": (
+            "concrete_next_step": repair.get("step") or (
                 "Strengthen this next, after the top-priority move above."
             ),
             "reason": why or (
