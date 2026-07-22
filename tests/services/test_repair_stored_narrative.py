@@ -151,6 +151,13 @@ def test_resolve_reportable_merchant_name_chain():
         _resolve_reportable_merchant_name(OBS_ID, products=None, merchant_domain=None)
         == "your brand"
     )
+    # multi-part TLD: registrable label, not the second-level TLD
+    assert (
+        _resolve_reportable_merchant_name(
+            OBS_ID, products=[], merchant_domain="hoverair.co.uk"
+        )
+        == "Hoverair"
+    )
     # a vendor that is itself an internal id never wins
     assert (
         _resolve_reportable_merchant_name(
@@ -159,6 +166,37 @@ def test_resolve_reportable_merchant_name_chain():
         )
         == "Bblab"
     )
+
+
+def test_shape_url_audit_response_applies_repair_but_keeps_keys():
+    """Wiring-effect regression at the REAL serve boundary (review round 2):
+    deleting the repair call in _shape_url_audit_response must fail a test.
+    Prose loses the internal id; structural sku_key values — which on the live
+    demo embed the same id ("prod::merch_obs_…::external_seed::…") — must
+    survive byte-identical for round-tripping consumers."""
+    from routes import merchant_audit_routes as mar
+
+    sku_key = f"prod::{OBS_ID}::external_seed::hoverair_x1_combo::canonical"
+    report = _stored_report()
+    report["merchant_narrative"]["per_sku_scorecard"] = [
+        {"sku_key": sku_key, "sku_title": "Drone A", "status": "blocked"},
+    ]
+    row = {
+        "run_id": "r-repair",
+        "status": "succeeded",
+        "report_jsonb": report,
+        "partial_result_jsonb": {"launch": {"wedge_base_payload": {}}},
+    }
+    shaped = mar._shape_url_audit_response(row)
+    narrative = shaped["merchant_narrative"]
+    assert OBS_ID in str(narrative["per_sku_scorecard"][0]["sku_key"])
+    assert narrative["per_sku_scorecard"][0]["sku_key"] == sku_key
+    prose = str({k: v for k, v in narrative.items() if k != "per_sku_scorecard"})
+    assert OBS_ID not in prose
+    headlines = [a["headline"] for a in narrative["prioritized_actions"]]
+    assert headlines[0] == "Get your 3 products indexed so AI can find them."
+    # the stored row itself is untouched
+    assert OBS_ID in report["merchant_narrative"]["headline_story"]
 
 
 def test_internal_id_regex_shape():

@@ -13270,11 +13270,19 @@ def _resolve_reportable_merchant_name(
         if vendor and not INTERNAL_MERCHANT_ID_RE.fullmatch(vendor):
             return vendor
     domain = str(merchant_domain or "").strip().lower()
+    # Tolerate a full URL being passed as the domain (scheme/path stripped).
+    if "//" in domain:
+        domain = domain.split("//", 1)[1]
+    domain = domain.split("/", 1)[0].split(":", 1)[0]
     if domain:
         parts = [p for p in domain.split(".") if p]
         # Registrable label, not the first one — "us.hoverair.com" must yield
-        # "Hoverair", not "Us".
+        # "Hoverair", not "Us" — and skip second-level TLD labels so
+        # "hoverair.co.uk" yields "Hoverair", not "Co".
+        _slds = {"co", "com", "net", "org", "gov", "ac", "edu"}
         label_src = parts[-2] if len(parts) >= 2 else (parts[0] if parts else "")
+        if len(parts) >= 3 and label_src in _slds:
+            label_src = parts[-3]
         label = label_src.replace("-", " ").strip().title()
         if label:
             return label

@@ -1187,13 +1187,23 @@ def _stored_secondary_repair_map() -> Dict[str, Dict[str, str]]:
     return out
 
 
+# Dict keys whose VALUES are structural identifiers, not prose — an internal
+# merchant id inside them is part of a compound key that consumers round-trip
+# (live demo: per_sku_scorecard[].sku_key = "prod::merch_obs_…::external_seed
+# ::…"). Substituting there would corrupt the key into a 404.
+_ID_BEARING_KEY_RE = re.compile(r"(_key|_id|_keys|_ids)$")
+
+
 def _replace_internal_ids(node: Any, display_name: str) -> Any:
     if isinstance(node, str):
         return INTERNAL_MERCHANT_ID_RE.sub(display_name, node)
     if isinstance(node, list):
         return [_replace_internal_ids(v, display_name) for v in node]
     if isinstance(node, dict):
-        return {k: _replace_internal_ids(v, display_name) for k, v in node.items()}
+        return {
+            k: (v if _ID_BEARING_KEY_RE.search(str(k)) else _replace_internal_ids(v, display_name))
+            for k, v in node.items()
+        }
     return node
 
 
