@@ -764,6 +764,8 @@ async def register_merchant(
                 # Retry once after reconnection
                 try:
                     merchant_dict = merchant_data.dict()
+                    # Remove password field as it's not in the merchant_onboarding table
+                    merchant_dict.pop('password', None)
                     merchant_id = await create_merchant_onboarding(merchant_dict)
                     background_tasks.add_task(auto_approve_kyc, merchant_id)
                     return {
