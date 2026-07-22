@@ -529,7 +529,7 @@ _ELIGIBILITY_COLUMNS = f"""
         WHERE co.product_key = cp.product_key
           AND co.suppressed_at IS NULL
           AND co.list_price > 0
-          AND upper(coalesce(co.currency, '')) = 'USD'
+          AND upper(trim(coalesce(co.currency, ''))) = 'USD'
     )                           AS has_us_offer,
     -- Category concern list (skin concern for skincare, hair concern for
     -- haircare); both read the shared concerns_json. The category-attributes
@@ -735,17 +735,18 @@ SELECT
           AND co.suppressed_at IS NULL
           AND co.list_price > 0
     ) AS has_price,
-    -- SQLite (test) path: column-independent placeholders. The real signals
-    -- (catalog_offers.market; beauty concerns/actives) are computed on the
-    -- Postgres path; the agent-decision gate is flag-off in tests, and its logic
-    -- is covered by the agent_decision_gates unit tests.
+    -- has_us_offer is computed for REAL on this path (same currency predicate as
+    -- Postgres) so the US-buyable gate is reachable in SQLite-backed tests; it
+    -- used to be a hardcoded 0, which made the gate untestable.
+    -- The two columns BELOW remain column-independent placeholders: beauty
+    -- concerns/actives are computed only on the Postgres path.
     EXISTS (
         SELECT 1
         FROM catalog_offers co
         WHERE co.product_key = cp.product_key
           AND co.suppressed_at IS NULL
           AND co.list_price > 0
-          AND upper(coalesce(co.currency, '')) = 'USD'
+          AND upper(trim(coalesce(co.currency, ''))) = 'USD'
     ) AS has_us_offer,
     NULL AS has_category_concern,
     NULL AS has_key_actives,
