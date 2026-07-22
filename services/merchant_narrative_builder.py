@@ -414,8 +414,16 @@ _FIRST_MOVE_BY_LEVER: Dict[str, str] = {
         "Join the threads where buyers ask about this category and answer with "
         "honest, useful detail — don't spam."
     ),
+    # Executable, measurement-anchored creator move — this lever only fires
+    # for a creator host AI MEASURABLY cited (unlike the suppressed
+    # creator_partnership playbooks, which were category-agnostic boilerplate
+    # with invented rate ranges). The get-cited panel lists the specific cited
+    # videos on this host's row, so point the merchant at those, not at cold
+    # outreach in the abstract.
     "creator_partnership": (
-        "Reach out to creators in your niche for an honest review or collab."
+        "Start with the creators AI already cites for your category: engage "
+        "their content, then offer a product for an honest review — never a "
+        "scripted placement."
     ),
 }
 
