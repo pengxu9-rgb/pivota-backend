@@ -84,3 +84,25 @@ def test_brand_not_doubled_when_title_already_branded() -> None:
     ident = resolve_sku_identity(ctx)
     assert ident["name"] == "Ownist Triple Collagen Orange"
     assert "Ownist Ownist" not in ident["name"]
+
+
+def test_with_brand_skips_prefix_when_title_names_brand_alias():
+    """Live verify run efcdaf06: brand "HoverAir (Category Demo)" + title
+    "HOVERAir X1 - …" produced the double-branded identity name "HoverAir
+    (Category Demo) HOVERAir X1 - …" (and every NBA headline built from it) —
+    the full-string containment check can't see that a decorated brand's CORE
+    already opens the title. Alias-based matching must skip the prefix."""
+    ident = resolve_sku_identity({
+        "product": {
+            "title": "HOVERAir X1 - Foldable Entry-Level Self-Flying Camera Drone",
+            "brand": "HoverAir (Category Demo)",
+        },
+        "sku": {},
+    })
+    assert ident["name"] == "HOVERAir X1 - Foldable Entry-Level Self-Flying Camera Drone"
+    # a title that does NOT name the brand still gets the prefix
+    ident2 = resolve_sku_identity({
+        "product": {"title": "X1 Foldable Camera Drone", "brand": "HoverAir"},
+        "sku": {},
+    })
+    assert ident2["name"] == "HoverAir X1 Foldable Camera Drone"
