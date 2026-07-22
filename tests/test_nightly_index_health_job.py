@@ -82,6 +82,12 @@ def _full_row(**overrides):
         "seed_data_json": {"title": "Test product", "review_summary": {"review_status": "no_issues_found"}},
         "seed_title": "Test product",
         "has_price": True,
+        # A fully-eligible baseline product is US-buyable. Without this the row
+        # fails the (flag-gated) US-offer gate the moment
+        # ENABLE_KBEAUTY_AGENT_DECISION_GATES is turned on, which would make the
+        # flag un-flippable in CI. Production rows always carry the column: the
+        # eligibility SQL computes it as EXISTS(...currency='USD').
+        "has_us_offer": True,
         "has_offer_snapshot": True,
         "product_group_id": "pg_001",
     }

@@ -87,6 +87,7 @@ async def _ensure_schema() -> None:
             product_key TEXT,
             merchant_id TEXT,
             list_price REAL,
+            currency TEXT DEFAULT 'USD',
             suppressed_at TIMESTAMP
         )
         """,
@@ -147,6 +148,12 @@ async def _ensure_schema() -> None:
     offer_columns = await database.fetch_all("PRAGMA table_info(catalog_offers)")
     if "suppressed_at" not in {dict(row).get("name") for row in offer_columns}:
         await database.execute("ALTER TABLE catalog_offers ADD COLUMN suppressed_at TIMESTAMP")
+    # has_us_offer is derived from currency; backstop for test DBs created before
+    # the column existed (mirrors the suppressed_at backstop above).
+    if "currency" not in {dict(row).get("name") for row in offer_columns}:
+        await database.execute(
+            "ALTER TABLE catalog_offers ADD COLUMN currency TEXT DEFAULT 'USD'"
+        )
     # ADR-008 SLICE 1: backstop for test DBs created before index_eligible
     # existed (mirrors the suppressed_at backstop above).
     ips_columns = await database.fetch_all("PRAGMA table_info(index_pipeline_state)")
@@ -319,10 +326,15 @@ async def _insert_product(
     if has_price:
         await database.execute(
             """
+            -- currency is set EXPLICITLY, not left to a DDL default: in a
+            -- full-suite run catalog_offers is created from the SQLAlchemy
+            -- metadata in db/catalog.py (currency String(16), no server_default),
+            -- so the CREATE TABLE IF NOT EXISTS below no-ops and a NULL currency
+            -- would make has_us_offer false for every baseline row.
             INSERT INTO catalog_offers (
-                offer_id, sku_key, product_key, merchant_id, list_price
+                offer_id, sku_key, product_key, merchant_id, list_price, currency
             ) VALUES (
-                :offer_id, :sku_key, :product_key, :merchant_id, 19.99
+                :offer_id, :sku_key, :product_key, :merchant_id, 19.99, 'USD'
             )
             """,
             {
@@ -799,3 +811,76 @@ async def test_fail_close_also_clears_index_eligible() -> None:
     finally:
         await _cleanup()
         await _disconnect_if_needed(was_connected)
+
+
+# --- has_us_offer is derived from currency (real SQL, both directions) --------
+#
+# These exercise the ACTUAL eligibility SQL against the DB. The string-level
+# assertions live in tests/test_has_us_offer_from_currency.py; without these the
+# negative direction (a non-USD offer) is never proven against real SQL.
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "case,currency,expected_us_offer",
+    [
+        (0, "USD", True),
+        (1, "usd", True),      # case-insensitive
+        (2, " USD ", True),    # padded — writers persist crawl output verbatim
+        (3, "GBP", False),
+        (4, "INR", False),
+        (5, None, False),      # NULL is schema-legal; fail closed
+        (6, "", False),
+    ],
+)
+async def test_has_us_offer_derived_from_currency_via_sql(
+    case: int, currency: Optional[str], expected_us_offer: bool
+) -> None:
+    was_connected = await _prepare_db()
+    try:
+        # keyed on the case index: deriving it from the value collapsed
+        # "USD"/"usd"/" USD " onto one product_key
+        suffix = f"cur{case}"
+        ids = await _insert_product(suffix)
+        await database.execute(
+            "UPDATE catalog_offers SET currency = :cur WHERE product_key = :pk",
+            {"cur": currency, "pk": ids["product_key"]},
+        )
+        rows = await svc._fetch_eligibility_inputs(ids["content_key"])
+        assert rows, "eligibility query returned no rows"
+        assert bool(rows[0].get("has_us_offer")) is expected_us_offer
+    finally:
+        await _cleanup()
+        if not was_connected:
+            await database.disconnect()
+
+
+@pytest.mark.asyncio
+async def test_non_usd_offer_blocks_serving_when_gate_enabled(monkeypatch) -> None:
+    """End-to-end at the DB level: a GBP-only row must not serve to US shoppers,
+    but must remain index_eligible (ADR-008 citation floor needs no US offer)."""
+    import services.agent_decision_gates as gates
+
+    # Both references must be patched: _classify_product calls the name imported
+    # into its own module, and evaluate_agent_decision_gates re-checks the flag
+    # through services.agent_decision_gates.
+    monkeypatch.setattr(svc, "agent_decision_gates_enabled", lambda: True)
+    monkeypatch.setattr(gates, "agent_decision_gates_enabled", lambda: True)
+    monkeypatch.setattr(gates, "evidence_gates_enabled", lambda: False)
+
+    was_connected = await _prepare_db()
+    try:
+        ids = await _insert_product("gbp_only")
+        await database.execute(
+            "UPDATE catalog_offers SET currency = 'GBP' WHERE product_key = :pk",
+            {"pk": ids["product_key"]},
+        )
+        await svc.recompute_serving_eligibility(ids["content_key"], reason="unit")
+        row = await _ips_row(ids["content_key"])
+        assert not row["serving_eligible"]   # sqlite stores booleans as 0/1
+        assert row["blocker_code"] == gates.BLOCKER_NO_US_OFFER
+        assert bool(row["index_eligible"]) is True
+    finally:
+        await _cleanup()
+        if not was_connected:
+            await database.disconnect()
