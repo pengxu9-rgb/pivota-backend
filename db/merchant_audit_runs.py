@@ -622,10 +622,17 @@ async def count_runs_for_merchant_by_subject(
     *,
     merchant_id: str,
     subject_type: str,
+    since: Optional[datetime] = None,
 ) -> int:
     """Count this merchant's DELIVERED-or-in-flight audit runs of a given
     `subject_type`. Used by the free URL-audit wedge to enforce its
     per-merchant free allowance (subject_type="merchant_url").
+
+    `since` restricts the count to runs requested at/after that instant.
+    The free-allowance gate passes FREE_AUDIT_COUNT_SINCE here so that
+    turning the allowance on for the first time does not retroactively
+    consume it with runs from the unmetered era (founder decision D3,
+    2026-07-22).
 
     Failed runs are excluded — the billing invariant is "charged (or a free
     credit consumed) iff a report was delivered", so a run that failed must
@@ -642,14 +649,17 @@ async def count_runs_for_merchant_by_subject(
     await ensure_merchant_audit_runs_table()
     try:
         from sqlalchemy.sql import func, select
+        conditions = [
+            merchant_audit_runs.c.merchant_id == merchant_id,
+            merchant_audit_runs.c.subject_type == subject_type,
+            merchant_audit_runs.c.status != "failed",
+        ]
+        if since is not None:
+            conditions.append(merchant_audit_runs.c.requested_at >= since)
         row = await database.fetch_one(
             select(func.count())
             .select_from(merchant_audit_runs)
-            .where(
-                merchant_audit_runs.c.merchant_id == merchant_id,
-                merchant_audit_runs.c.subject_type == subject_type,
-                merchant_audit_runs.c.status != "failed",
-            )
+            .where(*conditions)
         )
         if row is None:
             return 0

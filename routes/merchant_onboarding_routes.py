@@ -9,6 +9,7 @@ from pydantic import BaseModel, EmailStr, validator
 from typing import Optional, Dict, Any, List, Tuple
 from datetime import datetime, timedelta
 import asyncio
+import re
 import stripe
 import httpx
 
@@ -62,6 +63,7 @@ class MerchantRegisterRequest(BaseModel):
     website: Optional[str] = None  # Optional, for backward compatibility
     password: Optional[str] = None  # Password for merchant login (auto-generated if not provided)
     operating_mode: str = DEFAULT_OPERATING_MODE  # 'storefront' (default) or 'store_less'
+    signup_source: Optional[str] = None  # Acquisition attribution (e.g. 'ai-readiness-audit')
 
     @validator("operating_mode", pre=True, always=True)
     def _normalize_operating_mode(cls, v):
@@ -70,6 +72,18 @@ class MerchantRegisterRequest(BaseModel):
             return DEFAULT_OPERATING_MODE
         normalized = v.strip().lower()
         return normalized if normalized in VALID_OPERATING_MODES else DEFAULT_OPERATING_MODE
+
+    @validator("signup_source", pre=True, always=True)
+    def _normalize_signup_source(cls, v):
+        """Attribution slug only: lowercase [a-z0-9_-], capped at 64 chars.
+        Anything else becomes None rather than 422 — attribution must never
+        block a registration."""
+        if not v or not isinstance(v, str):
+            return None
+        normalized = v.strip().lower()[:64]
+        if not normalized or not re.fullmatch(r"[a-z0-9_-]+", normalized):
+            return None
+        return normalized
 
 class KYCUploadRequest(BaseModel):
     merchant_id: str

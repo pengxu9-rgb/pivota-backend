@@ -25,6 +25,10 @@ merchant_onboarding = Table(
     Column("operating_mode", String(32), nullable=False, server_default="storefront"),
     Column("website", String(500)),  # Optional, for additional info
     Column("region", String(50)),  # e.g., US, EU, APAC
+    # Acquisition source captured at registration (e.g. 'ai-readiness-audit'
+    # from the marketing-site URL-capture funnel). Attribution only — never
+    # gates behavior. Migration 187.
+    Column("signup_source", String(64), nullable=True),
     Column("contact_email", String(255), nullable=False),
     Column("contact_phone", String(50)),
     Column("auto_approved", Boolean, default=False),  # 是否自动批准
@@ -86,6 +90,13 @@ async def ensure_operating_mode_column() -> None:
         )
     except Exception as e:  # pragma: no cover - already exists / perms
         print(f"⚠️ operating_mode backstop (ADD COLUMN) skipped: {e}")
+    try:
+        await database.execute(
+            "ALTER TABLE merchant_onboarding "
+            "ADD COLUMN IF NOT EXISTS signup_source VARCHAR(64)"
+        )
+    except Exception as e:  # pragma: no cover - already exists / perms / sqlite
+        print(f"⚠️ signup_source backstop (ADD COLUMN) skipped: {e}")
     _operating_mode_backstop_done = True
 
 
