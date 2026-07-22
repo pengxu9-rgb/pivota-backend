@@ -96,6 +96,7 @@ from services.merchant_credit_balance_service import (
 from services.merchant_narrative_builder import (
     annotate_outreach_moves_with_pitch_paths,
 )
+from services.merchant_narrative_builder import repair_stored_narrative
 from services.report_summary_builder import build_report_summary
 from services.provider_credit_rates import credits_for_tokens
 from services.report_deck_builder import (
@@ -1693,6 +1694,13 @@ def _shape_url_audit_response(row: Dict[str, Any]) -> Dict[str, Any]:
     partial = row.get("partial_result_jsonb")
     launch = (partial.get("launch") or {}) if isinstance(partial, dict) else {}
     base = launch.get("wedge_base_payload") or {}
+    # Serve-time repair of the STORED narrative (frozen at generation): apply
+    # the current display-name + Start-here rules so pre-fix runs — including
+    # circulating share links — render like new ones. Same pattern as the
+    # serve-time report_summary rebuild and pitch-path stamping below.
+    report = repair_stored_narrative(
+        report, fallback_name=(base.get("merchant_name") if isinstance(base, dict) else None)
+    )
     brand_rollup = report.get("brand_rollup") or {}
     out: Dict[str, Any] = {
         "status": "succeeded",

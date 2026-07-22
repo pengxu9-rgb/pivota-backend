@@ -20,6 +20,8 @@ this module adds no probes and reads no DB.
 
 from __future__ import annotations
 
+import copy
+import re
 from typing import Any, Dict, List, Optional, Tuple
 
 from services.cited_host_classifier import (
@@ -1155,6 +1157,112 @@ def _collapse_get_indexed_actions(actions: List[Dict[str, Any]]) -> List[Dict[st
                 out.append(collapsed)
             continue
         out.append(action)
+    return out
+
+
+# An internal merchant id (merch_xxx / merch_obs_xxx) that leaked into
+# merchant-facing prose. Observed-merchant audit lanes passed merchant_id as
+# merchant_name (live HoverAir funnel demo: "Shoppers who already know
+# merch_obs_5a40… can find you"), and the claim flow patched only the envelope
+# name — 9 stored runs carry it in the narrative.
+INTERNAL_MERCHANT_ID_RE = re.compile(r"\bmerch(?:_obs)?_[0-9a-f]{8,32}\b")
+
+_SECONDARY_PLACEHOLDER_STEP = "Strengthen this next, after the top-priority move above."
+
+
+def _stored_secondary_repair_map() -> Dict[str, Dict[str, str]]:
+    """Scorecard pillar label (lowercased) -> the imperative repair copy the
+    generator now emits (#1559), so a report STORED before that fix renders
+    the same actionable bullets as a new run. Lazy imports: this module is
+    imported by agent_center_bd_report_service at module level."""
+    from services.agent_center_bd_report_service import _GAP_DISPLAY
+    from services.next_best_action import _SKU_GAP_REPAIR_COPY
+
+    out: Dict[str, Dict[str, str]] = {}
+    for key, display in _GAP_DISPLAY.items():
+        repair = _SKU_GAP_REPAIR_COPY.get(key)
+        label = str(display.get("label") or "").strip().lower()
+        if repair and label:
+            out[label] = repair
+    return out
+
+
+def _replace_internal_ids(node: Any, display_name: str) -> Any:
+    if isinstance(node, str):
+        return INTERNAL_MERCHANT_ID_RE.sub(display_name, node)
+    if isinstance(node, list):
+        return [_replace_internal_ids(v, display_name) for v in node]
+    if isinstance(node, dict):
+        return {k: _replace_internal_ids(v, display_name) for k, v in node.items()}
+    return node
+
+
+def repair_stored_narrative(
+    report: Dict[str, Any],
+    *,
+    fallback_name: Optional[str] = None,
+) -> Dict[str, Any]:
+    """Serve-time repair of a STORED report envelope (report_jsonb).
+
+    The narrative is frozen at generation time, so narrative fixes never reach
+    reports that already exist — including the shared funnel sample the
+    founder circulates. This applies, at read time, the exact rules the
+    generator now enforces, returning a patched shallow copy (the stored row
+    dict is never mutated):
+
+      1. display name — internal merchant ids leaked into prose are replaced
+         with the envelope's display name (or `fallback_name`); when every
+         candidate is itself an internal id (pure observed-merchant runs),
+         "your brand" — honest and generic — replaces it, envelope included.
+      2. "Start here" — repeated get_indexed primaries collapse into one
+         merchant-level action; "Discoverable by AI" secondary rows are
+         dropped (subsumed by the primary or Pivota-internal serving state);
+         other placeholder secondaries get the generator's repair copy
+         (#1559). Rows that don't match any known shape pass through as-is.
+    """
+    if not isinstance(report, dict):
+        return report
+    narrative = report.get("merchant_narrative")
+    if not isinstance(narrative, dict):
+        return report
+
+    out = dict(report)
+    narrative = copy.deepcopy(narrative)
+
+    display_name = "your brand"
+    for candidate in (report.get("merchant_name"), fallback_name):
+        text = str(candidate or "").strip()
+        if text and not INTERNAL_MERCHANT_ID_RE.fullmatch(text):
+            display_name = text
+            break
+    if INTERNAL_MERCHANT_ID_RE.fullmatch(str(out.get("merchant_name") or "").strip()):
+        out["merchant_name"] = display_name
+    narrative = _replace_internal_ids(narrative, display_name)
+
+    actions = [
+        dict(a) for a in narrative.get("prioritized_actions") or []
+        if isinstance(a, dict)
+    ]
+    actions = [
+        a for a in actions
+        if not (
+            str(a.get("action_source") or "") == "secondary"
+            and str(a.get("headline") or "").strip().lower() == "discoverable by ai"
+        )
+    ]
+    repair_map = _stored_secondary_repair_map()
+    for action in actions:
+        if (
+            str(action.get("action_source") or "") == "secondary"
+            and str(action.get("first_move") or "").strip() == _SECONDARY_PLACEHOLDER_STEP
+        ):
+            repair = repair_map.get(str(action.get("headline") or "").strip().lower())
+            if repair:
+                action["headline"] = repair["title"]
+                action["first_move"] = repair["step"]
+    narrative["prioritized_actions"] = _collapse_get_indexed_actions(actions)
+
+    out["merchant_narrative"] = narrative
     return out
 
 

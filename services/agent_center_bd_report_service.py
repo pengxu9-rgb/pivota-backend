@@ -13248,6 +13248,39 @@ def _legacy_citation_by_provider(
 _BRAND_REPORT_MAX_PRODUCTS = 50
 
 
+def _resolve_reportable_merchant_name(
+    merchant_name: str,
+    *,
+    products: Optional[List[Dict[str, Any]]] = None,
+    merchant_domain: Optional[str] = None,
+) -> str:
+    """Never let an internal merchant id (merch_* / merch_obs_*) become the
+    display name merchant-facing prose is written with. Resolution order:
+    the given name when it isn't an id -> first product vendor/brand -> a
+    title-cased domain label -> "your brand" (honest and generic)."""
+    from services.merchant_narrative_builder import INTERNAL_MERCHANT_ID_RE
+
+    text = str(merchant_name or "").strip()
+    if text and not INTERNAL_MERCHANT_ID_RE.fullmatch(text):
+        return text
+    for product in products or []:
+        if not isinstance(product, dict):
+            continue
+        vendor = str(product.get("vendor") or product.get("brand") or "").strip()
+        if vendor and not INTERNAL_MERCHANT_ID_RE.fullmatch(vendor):
+            return vendor
+    domain = str(merchant_domain or "").strip().lower()
+    if domain:
+        parts = [p for p in domain.split(".") if p]
+        # Registrable label, not the first one — "us.hoverair.com" must yield
+        # "Hoverair", not "Us".
+        label_src = parts[-2] if len(parts) >= 2 else (parts[0] if parts else "")
+        label = label_src.replace("-", " ").strip().title()
+        if label:
+            return label
+    return "your brand"
+
+
 async def run_brand_report(
     *,
     merchant_name: str,
@@ -13291,6 +13324,14 @@ async def run_brand_report(
     """
     if not merchant_name or not merchant_name.strip():
         raise ValueError("merchant_name is required")
+    # Observed-merchant lanes pass merchant_id as merchant_name (no onboarding
+    # row to resolve from) — an internal id must never become the name the
+    # narrative speaks to the merchant with ("Shoppers who already know
+    # merch_obs_5a40… can find you", live funnel demo). Resolve a displayable
+    # brand from the audited products / domain before anything reads it.
+    merchant_name = _resolve_reportable_merchant_name(
+        merchant_name, products=products, merchant_domain=merchant_domain
+    )
     if not products:
         raise ValueError("products is required (at least 1)")
     if audit_mode not in {"legacy", "per_sku"}:
