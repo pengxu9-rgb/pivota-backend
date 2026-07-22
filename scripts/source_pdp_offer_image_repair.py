@@ -137,6 +137,39 @@ VARIANT_TOKENS = {
 }
 
 
+# Pack / count / SIZE / format indicators. VARIANT_TOKENS above covers only
+# shades, so these are checked separately by the opt-in source-superset
+# relaxation to keep a single unit from matching a bundle, a multi-count page,
+# or a different size/format (or vice-versa).
+#
+# NOTE: this is matched against RAW tokens, not token_set() output — several of
+# these ("set", "pack", "size", "mini", "shade") are stripped by
+# STOPWORDS/GENERIC_PRODUCT_TOKENS and would be inert otherwise.
+PACK_COUNT_TOKENS = {
+    # count / bundle
+    "set", "sets", "bundle", "bundles", "kit", "kits", "pack", "packs",
+    "multipack", "multi", "combo", "duo", "trio", "twin", "double", "triple",
+    "pair", "count", "ct", "ea", "pcs", "pc", "piece", "pieces", "bulk",
+    "box", "boxes", "bottle", "bottles", "tube", "tubes", "sheet", "sheets",
+    # size / format
+    "size", "sized", "mini", "travel", "trial", "sample", "samples", "refill",
+    "jumbo", "supersize", "large", "small", "full", "deluxe", "starter",
+    # merchandising
+    "type", "types", "color", "colors", "colour", "colours", "shade", "shades",
+    "edition", "gift", "special", "value", "family", "promo", "deal", "bogo",
+    "oversized", "supersized", "boxed", "packed", "bundled", "twopack",
+    "sixpack", "sampler", "assortment", "case", "carton", "tray", "unit",
+    "collection",
+}
+
+
+def _is_pack_count_token(token: str) -> bool:
+    """Deny-set membership, plural-tolerant ("refills" -> "refill")."""
+    if token in PACK_COUNT_TOKENS:
+        return True
+    return token.endswith("s") and token[:-1] in PACK_COUNT_TOKENS
+
+
 CANDIDATE_QUERY = """
 WITH product_rows AS (
   SELECT
@@ -421,7 +454,13 @@ def _variant_token_set(value: Any, *, brand: Optional[str] = None) -> Set[str]:
     return token_set(value, brand=brand) & VARIANT_TOKENS
 
 
-def title_gate(target_title: Any, extracted_title: Any, *, brand: Optional[str] = None) -> Dict[str, Any]:
+def title_gate(
+    target_title: Any,
+    extracted_title: Any,
+    *,
+    brand: Optional[str] = None,
+    allow_source_superset: bool = False,
+) -> Dict[str, Any]:
     target_tokens = token_set(target_title, brand=brand)
     source_tokens = token_set(extracted_title, brand=brand)
     target_variant_tokens = _variant_token_set(target_title, brand=brand)
@@ -458,7 +497,31 @@ def title_gate(target_title: Any, extracted_title: Any, *, brand: Optional[str] 
             }
 
     source_extra_tokens = source_tokens - target_tokens
-    if source_extra_tokens and not exact:
+    # Opt-in safe-direction relaxation: accept when our title is FULLY contained
+    # in the source (target ⊆ source) and the source's extra tokens are purely
+    # descriptive. This admits "…Lotion" vs "…Lotion with Birch Sap" (feed titles
+    # are abbreviated) while still rejecting single-unit → bundle / size / count
+    # mismatches. Variant (shade) tokens were already required equal above.
+    #
+    # The pack/count check runs on RAW tokens, NOT token_set(): token_set strips
+    # STOPWORDS ("set") and GENERIC_PRODUCT_TOKENS ("pack", "size", "mini",
+    # "shade"), so checking the filtered set would silently miss exactly the
+    # bundle words we care about ("X Twin Pack" -> filtered extras {twin}).
+    raw_source_extra = (
+        set(_tokens(extracted_title)) - set(_tokens(target_title)) - set(_tokens(brand))
+    )
+    safe_superset = (
+        bool(source_extra_tokens)
+        and not exact
+        and allow_source_superset
+        and target_tokens <= source_tokens
+        # minimum specificity: a 1-2 token target is too generic to trust as a
+        # subset ("Toner" ⊆ "Rice Water Bright Toner").
+        and len(target_tokens) >= 3
+        and not any(_is_pack_count_token(t) for t in raw_source_extra)
+        and not any(ch.isdigit() for tok in raw_source_extra for ch in tok)
+    )
+    if source_extra_tokens and not exact and not safe_superset:
         return {
             "ok": False,
             "reason": "source_title_extra_tokens",
@@ -472,6 +535,10 @@ def title_gate(target_title: Any, extracted_title: Any, *, brand: Optional[str] 
     if exact:
         ok = True
     else:
+        # A superset match still must clear the normal similarity floor — it only
+        # bypasses the extra-token veto, never the score. Keeps "Lotion" vs
+        # "Lotion with Birch Sap" (jaccard .71) while dropping a generic target
+        # against a far more specific source.
         ok = containment >= 0.75 and jaccard >= 0.45
 
     return {
@@ -479,6 +546,7 @@ def title_gate(target_title: Any, extracted_title: Any, *, brand: Optional[str] 
         "reason": None if ok else "title_mismatch",
         "score": round(score, 3),
         "exact": exact,
+        "title_superset_accepted": bool(safe_superset and ok),
         "target_variant_tokens": sorted(target_variant_tokens),
         "source_variant_tokens": sorted(source_variant_tokens),
         "source_extra_tokens": sorted(source_extra_tokens),
@@ -556,10 +624,14 @@ def evaluate_candidate(
     extracted: Dict[str, Any],
     *,
     market: str,
+    allow_source_superset: bool = False,
 ) -> Dict[str, Any]:
     target_title = row.get("apv_title") or row.get("title")
     extracted_title = extracted.get("title") or ""
-    title = title_gate(target_title, extracted_title, brand=row.get("brand"))
+    title = title_gate(
+        target_title, extracted_title, brand=row.get("brand"),
+        allow_source_superset=allow_source_superset,
+    )
     source_url = row.get("canonical_url") or ""
     extracted_canonical = extracted.get("canonical_url") or source_url
     host_ok = same_host_family(source_url, extracted_canonical)
@@ -605,6 +677,8 @@ def evaluate_candidate(
         "extracted_title": compact(extracted_title)[:180],
         "title_score": title["score"],
         "title_exact": title["exact"],
+        "title_superset_accepted": title.get("title_superset_accepted", False),
+        "source_extra_tokens": title.get("source_extra_tokens"),
         "title_gate_reason": title["reason"],
         "target_variant_tokens": title["target_variant_tokens"],
         "source_variant_tokens": title["source_variant_tokens"],
@@ -662,7 +736,9 @@ async def fetch_candidate_rows(
     return [dict(row) for row in rows or []]
 
 
-async def probe_one(row: Dict[str, Any], *, market: str) -> Dict[str, Any]:
+async def probe_one(
+    row: Dict[str, Any], *, market: str, allow_source_superset: bool = False
+) -> Dict[str, Any]:
     url = compact(row.get("canonical_url"))
     base: Dict[str, Any] = {
         "content_key": row.get("content_key"),
@@ -690,7 +766,10 @@ async def probe_one(row: Dict[str, Any], *, market: str) -> Dict[str, Any]:
     return {
         **base,
         "status": "ok",
-        **evaluate_candidate(row, extracted, market=market),
+        **evaluate_candidate(
+            row, extracted, market=market,
+            allow_source_superset=allow_source_superset,
+        ),
         "_row": row,
         "_extracted": extracted,
     }
@@ -915,6 +994,16 @@ def _parse_args(argv: Optional[Iterable[str]] = None) -> argparse.Namespace:
             "or low_quality. Default targets only current no_image/no_price blockers."
         ),
     )
+    parser.add_argument(
+        "--allow-source-superset",
+        action="store_true",
+        help=(
+            "Accept a source page whose title fully CONTAINS our title plus only "
+            "descriptive extra tokens (no digits, no pack/count words) — e.g. an "
+            "abbreviated feed title vs the brand's fuller product name. Shade and "
+            "pack/count mismatches still reject. Default off (strict)."
+        ),
+    )
     parser.add_argument("--apply", action="store_true", help="Write approved repairs. Default is dry-run.")
     parser.add_argument("--output-json", default=None)
     return parser.parse_args(argv)
@@ -934,7 +1023,10 @@ async def run(args: argparse.Namespace) -> Dict[str, Any]:
 
         async def guarded(row: Dict[str, Any]) -> Dict[str, Any]:
             async with semaphore:
-                return await probe_one(row, market=args.market)
+                return await probe_one(
+                    row, market=args.market,
+                    allow_source_superset=bool(args.allow_source_superset),
+                )
 
         results = await asyncio.gather(*(guarded(row) for row in rows))
         if args.apply:

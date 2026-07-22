@@ -281,12 +281,20 @@ async def extract_source_content(url: str) -> Dict[str, Any]:
     }
 
 
-def evaluate_candidate(row: Dict[str, Any], extracted: Dict[str, Any]) -> Dict[str, Any]:
+def evaluate_candidate(
+    row: Dict[str, Any],
+    extracted: Dict[str, Any],
+    *,
+    allow_source_superset: bool = False,
+) -> Dict[str, Any]:
     current_description = clean_description(row.get("apv_description") or row.get("cp_description"))
     need_description = len(current_description) < MIN_EXISTING_DESCRIPTION_LENGTH
     source_url = row.get("canonical_url") or ""
     extracted_title = extracted.get("title") or ""
-    title = title_gate(row.get("apv_title") or row.get("title"), extracted_title, brand=row.get("brand"))
+    title = title_gate(
+        row.get("apv_title") or row.get("title"), extracted_title, brand=row.get("brand"),
+        allow_source_superset=allow_source_superset,
+    )
     host_ok = same_host_family(source_url, extracted.get("canonical_url") or source_url)
     description = usable_description(extracted.get("description"))
     current_description_mentions_title = description_mentions_product(
@@ -349,6 +357,8 @@ def evaluate_candidate(row: Dict[str, Any], extracted: Dict[str, Any]) -> Dict[s
         "extracted_title": compact(extracted_title)[:180],
         "title_score": title["score"],
         "title_exact": title["exact"],
+        "title_superset_accepted": title.get("title_superset_accepted", False),
+        "source_extra_tokens": title.get("source_extra_tokens"),
         "title_gate_reason": title["reason"],
         "current_description_len": len(current_description),
         "current_description_mentions_title": current_description_mentions_title,
@@ -379,7 +389,9 @@ async def fetch_candidate_rows(*, limit: int, content_key: Optional[str]) -> Lis
     return [dict(row) for row in rows or []]
 
 
-async def probe_one(row: Dict[str, Any]) -> Dict[str, Any]:
+async def probe_one(
+    row: Dict[str, Any], *, allow_source_superset: bool = False
+) -> Dict[str, Any]:
     url = compact(row.get("canonical_url"))
     base = {
         "content_key": row.get("content_key"),
@@ -396,7 +408,7 @@ async def probe_one(row: Dict[str, Any]) -> Dict[str, Any]:
     return {
         **base,
         "status": "ok",
-        **evaluate_candidate(row, extracted),
+        **evaluate_candidate(row, extracted, allow_source_superset=allow_source_superset),
         "_row": row,
         "_extracted": extracted,
     }
@@ -558,6 +570,15 @@ def _parse_args(argv: Optional[Iterable[str]] = None) -> argparse.Namespace:
     parser.add_argument("--limit", type=int, default=80, help="Candidate rows to probe; 0 means no SQL LIMIT.")
     parser.add_argument("--concurrency", type=int, default=6)
     parser.add_argument("--content-key", default=None)
+    parser.add_argument(
+        "--allow-source-superset",
+        action="store_true",
+        help=(
+            "Accept a source page whose title fully CONTAINS ours plus only descriptive "
+            "extra tokens (no digits, no pack/count words) — e.g. an abbreviated feed "
+            "title vs the brand's fuller product name. Shade/pack mismatches still reject."
+        ),
+    )
     parser.add_argument("--apply", action="store_true", help="Write approved repairs. Default is dry-run.")
     parser.add_argument("--output-json", default=None)
     return parser.parse_args(argv)
@@ -573,7 +594,9 @@ async def run(args: argparse.Namespace) -> Dict[str, Any]:
 
         async def guarded(row: Dict[str, Any]) -> Dict[str, Any]:
             async with semaphore:
-                return await probe_one(row)
+                return await probe_one(
+                    row, allow_source_superset=bool(args.allow_source_superset)
+                )
 
         results = await asyncio.gather(*(guarded(row) for row in rows))
         if args.apply:
