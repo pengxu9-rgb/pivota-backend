@@ -456,6 +456,59 @@ def test_prioritized_actions_mapped_to_growth_phases():
     assert {a["headline"] for a in actions} == {"Earn a citation", "Substantiate INCI"}
 
 
+def test_prioritized_actions_collapse_repeated_get_indexed():
+    """HoverAir share report 2026-07-19: a 3-SKU cold-start run rendered the
+    same 'Get X indexed' prescription three times — the (gap, headline) dedup
+    can't catch it because each headline embeds its SKU title. Repeated
+    get_indexed primaries collapse into ONE merchant-level action naming all
+    the SKUs; the first SKU's sku_title is kept so the summary's report join
+    still lands."""
+    per_sku = [
+        {
+            "sku_key": k,
+            "sku_title": t,
+            "next_best_action": {
+                "primary_gap": "get_indexed",
+                "headline": f"Get {t} indexed so AI can find it.",
+                "first_move": f"Get {t} live and crawlable.",
+                "why_this_first": f"{t} isn't live in the AI shopping surface yet.",
+            },
+        }
+        for k, t in [("a", "Drone A"), ("b", "Drone B"), ("c", "Drone C")]
+    ]
+    actions = build_merchant_narrative(
+        merchant_name="X", per_sku_reports=per_sku,
+        authority_map={"skus": [], "hosts": [], "host_attribution_summary": {}},
+    )["prioritized_actions"]
+    indexed = [a for a in actions if a.get("primary_gap") == "get_indexed"]
+    assert len(indexed) == 1
+    action = indexed[0]
+    assert action["headline"] == "Get your 3 products indexed so AI can find them."
+    assert action["sku_titles"] == ["Drone A", "Drone B", "Drone C"]
+    # Representative sku_title survives for the summary's fallback join.
+    assert action["sku_title"] == "Drone A"
+
+
+def test_prioritized_actions_single_get_indexed_not_collapsed():
+    """One get_indexed SKU keeps its specific per-SKU headline — the collapse
+    only fires on repetition."""
+    per_sku = [{
+        "sku_key": "a",
+        "sku_title": "Drone A",
+        "next_best_action": {
+            "primary_gap": "get_indexed",
+            "headline": "Get Drone A indexed so AI can find it.",
+            "first_move": "Get Drone A live and crawlable.",
+        },
+    }]
+    actions = build_merchant_narrative(
+        merchant_name="X", per_sku_reports=per_sku,
+        authority_map={"skus": [], "hosts": [], "host_attribution_summary": {}},
+    )["prioritized_actions"]
+    assert [a["headline"] for a in actions] == ["Get Drone A indexed so AI can find it."]
+    assert "sku_titles" not in actions[0]
+
+
 def _whats_working_excerpt(evidence_items):
     narr = build_merchant_narrative(
         merchant_name="A",

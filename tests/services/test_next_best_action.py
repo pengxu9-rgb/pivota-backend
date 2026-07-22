@@ -982,7 +982,9 @@ def test_sku_secondary_moves_never_leak_internal_metric_names():
     moves = nba["secondary_moves"]
     assert moves, "expected a secondary move from the citation gap"
     move = moves[0]
-    assert move["title"] == "Cited as the source"
+    # HoverAir 2026-07-19: the bare scorecard label as a title read as a
+    # meaningless bullet — mapped gaps now carry imperative remediation copy.
+    assert move["title"] == "Become the page AI cites"
     # No internal vocabulary anywhere in the merchant-facing move — INCLUDING the
     # evidence chip, which the sanitizer does not reach.
     blob = json.dumps(move).lower()
@@ -991,6 +993,115 @@ def test_sku_secondary_moves_never_leak_internal_metric_names():
     assert move["reason"].startswith("When AI answers")
     # The evidence chip carries only merchant-safe copy.
     assert set(move["evidence"]) <= {"label", "why"}
+
+
+def test_sku_secondary_moves_actionable_copy_not_placeholder():
+    """Live HoverAir share report 2026-07-19: secondary bullets rendered a bare
+    scorecard pillar label ('Mentioned by name') plus the placeholder
+    'Strengthen this next…' step — a score dimension wearing an action's
+    clothes. Mapped gaps must emit imperative remediation copy instead."""
+    opportunity = _sku_base_opportunity()
+    opportunity["substitution_alert"] = {
+        "present": True,
+        "prompt": "BB Lab collagen alternatives",
+        "substituted_by": "Vital Proteins",
+        "engines": ["gemini"],
+    }
+    gaps = [{
+        "dimension": "citation",
+        "bucket": "sku_mention_rate",
+        "points": 0,
+        "max": 20,
+        "gap": 20,
+        "label": "Mentioned by name",
+        "why": "AI seldom mentions this specific product when shoppers ask category questions.",
+    }]
+    nba = build_sku_next_best_action(
+        opportunity=opportunity,
+        primary_gaps=gaps,
+        scores=_sku_scores(),
+        identity=_sku_identity(),
+        sku_title="BB Lab Good Night Collagen",
+    )
+    move = nba["secondary_moves"][0]
+    assert move["title"] == "Get this product named in category answers"
+    assert "Strengthen this next" not in move["concrete_next_step"]
+    # The gap's measured why still rides along untouched.
+    assert move["reason"].startswith("AI seldom mentions")
+
+
+def test_sku_secondary_moves_skip_gap_subsumed_by_get_indexed_primary():
+    """HoverAir share report 2026-07-19: bullet 4 'Discoverable by AI' restated
+    bullet 1's get-indexed diagnosis verbatim — the serving-eligibility gap IS
+    the get_indexed primary, so it must never re-appear as a secondary."""
+    scores = _sku_scores()
+    scores["routability"] = {
+        "score": 0,
+        "breakdown": {"serving_eligibility": {"points": 0, "max": 10}},
+    }
+    gaps = [
+        {
+            "dimension": "routability",
+            "bucket": "serving_eligibility",
+            "points": 0,
+            "max": 10,
+            "gap": 10,
+            "label": "Discoverable by AI",
+            "why": "This product isn't live in the AI shopping surface yet, so assistants can't recommend it.",
+        },
+        {
+            "dimension": "citation",
+            "bucket": "sku_mention_rate",
+            "points": 0,
+            "max": 20,
+            "gap": 20,
+            "label": "Mentioned by name",
+            "why": "AI seldom mentions this specific product when shoppers ask category questions.",
+        },
+    ]
+    nba = build_sku_next_best_action(
+        opportunity=_sku_base_opportunity(),
+        primary_gaps=gaps,
+        scores=scores,
+        identity=_sku_identity(),
+        sku_title="BB Lab Good Night Collagen",
+    )
+    assert nba["primary_gap"] == "get_indexed"
+    labels = [m["evidence"].get("label") for m in nba["secondary_moves"] if m.get("lever") == "sku_gap_repair"]
+    assert "Discoverable by AI" not in labels
+    assert "Mentioned by name" in labels
+
+
+def test_sku_secondary_moves_skip_internal_state_gaps():
+    """#1504: a serving-eligibility gap on a deliberately held-out product is a
+    read on Pivota's own pipeline, not a merchant action — it must not be
+    prescribed as a secondary move under any primary."""
+    opportunity = _sku_base_opportunity()
+    opportunity["substitution_alert"] = {
+        "present": True,
+        "prompt": "BB Lab collagen alternatives",
+        "substituted_by": "Vital Proteins",
+        "engines": ["gemini"],
+    }
+    gaps = [{
+        "dimension": "routability",
+        "bucket": "serving_eligibility",
+        "points": 0,
+        "max": 10,
+        "gap": 10,
+        "internal_state": True,
+        "label": "Discoverable by AI",
+        "why": "internal serving-state note",
+    }]
+    nba = build_sku_next_best_action(
+        opportunity=opportunity,
+        primary_gaps=gaps,
+        scores=_sku_scores(),
+        identity=_sku_identity(),
+        sku_title="BB Lab Good Night Collagen",
+    )
+    labels = [m["evidence"].get("label") for m in nba["secondary_moves"] if m.get("lever") == "sku_gap_repair"]
+    assert "Discoverable by AI" not in labels
 
 
 def test_sku_nba_content_gap_uses_merchant_safe_display_copy():
