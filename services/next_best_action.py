@@ -2245,6 +2245,10 @@ _SKU_GAP_REPAIR_COPY: Dict[Tuple[str, str], Dict[str, str]] = {
         "title": "Establish one canonical product page",
         "step": "Consolidate to a single canonical product URL and point every listing of this product at it.",
     },
+    ("identity", "content_key"): {
+        "title": "Give this product a stable identity",
+        "step": "Keep the product's core identifiers consistent so every system refers to the same product over time.",
+    },
     ("identity", "identity_resolution"): {
         "title": "Resolve this product to one identity",
         "step": "Align the product's name, brand, and identifiers so every listing clearly refers to the same product.",
@@ -2307,7 +2311,7 @@ _SKU_GAP_REPAIR_COPY: Dict[Tuple[str, str], Dict[str, str]] = {
     },
     ("citation", "first_party_rate"): {
         "title": "Become the page AI cites",
-        "step": "Strengthen your own page's facts and proof, and earn the independent citations in the get-cited plan below.",
+        "step": "Strengthen your own page's facts and proof, and earn independent citations — the get-cited plan lists the exact targets.",
     },
     ("citation", "sku_mention_rate"): {
         "title": "Get this product named in category answers",
@@ -2315,7 +2319,7 @@ _SKU_GAP_REPAIR_COPY: Dict[Tuple[str, str], Dict[str, str]] = {
     },
     ("citation", "authority_near_variant_rate"): {
         "title": "Earn coverage from trusted sources",
-        "step": "Pitch the authoritative sites already grounding this category's answers — see the get-cited plan below.",
+        "step": "Pitch the authoritative sites AI already relies on for this category's answers — the get-cited plan lists them.",
     },
     ("citation", "answer_quality_rate"): {
         "title": "Give AI stronger material to answer with",

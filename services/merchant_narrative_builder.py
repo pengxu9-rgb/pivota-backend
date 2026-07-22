@@ -28,6 +28,7 @@ from services.cited_host_classifier import (
     is_findability_role,
 )
 from services.competitor_brand_filter import is_ingredient_or_category_type
+from services.next_best_action import PRIMARY_SKU_GET_INDEXED
 from services.vertical_profiles import BEAUTY_PROFILE, VerticalProfile
 
 # Probe axes that name the SKU/brand (branded/navigational) vs the non-branded
@@ -1125,7 +1126,7 @@ def _collapse_get_indexed_actions(actions: List[Dict[str, Any]]) -> List[Dict[st
     sku_title so the summary's _match_sku_report join (headline first,
     sku_title fallback) still lands on a representative report; the full list
     rides in `sku_titles` for display."""
-    indexed = [a for a in actions if a.get("primary_gap") == "get_indexed"]
+    indexed = [a for a in actions if a.get("primary_gap") == PRIMARY_SKU_GET_INDEXED]
     if len(indexed) < 2:
         return actions
     titles = [str(a.get("sku_title") or "").strip() for a in indexed]
@@ -1149,7 +1150,7 @@ def _collapse_get_indexed_actions(actions: List[Dict[str, Any]]) -> List[Dict[st
     }
     out: List[Dict[str, Any]] = []
     for action in actions:
-        if action.get("primary_gap") == "get_indexed":
+        if action.get("primary_gap") == PRIMARY_SKU_GET_INDEXED:
             if action is first:
                 out.append(collapsed)
             continue
