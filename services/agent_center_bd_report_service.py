@@ -5955,6 +5955,12 @@ def _cited_hosts_by_type(channel_appearance: Optional[Mapping[str, Any]]) -> Dic
 
 
 def _engine_moves(engine: str, status: str, hosts_by_type: Mapping[str, List[str]]) -> List[str]:
+    # Measured or silent: an engine this run never probed gets NO prescriptive
+    # moves — static advice under an unmeasured engine reads as a finding
+    # (founder scan 2026-07-22). The entry still ships (label + status) so the
+    # portal can render an honest "not measured" state.
+    if status == "couldnt_measure":
+        return []
     editorial = list(hosts_by_type.get("editorial") or [])
     community = list(hosts_by_type.get("community") or []) + list(hosts_by_type.get("forum") or [])
     if engine == "gemini":
@@ -5968,10 +5974,12 @@ def _engine_moves(engine: str, status: str, hosts_by_type: Mapping[str, List[str
                 f"cited for your category: {', '.join(editorial[:3])}."
             )
         else:
+            # Vertical-neutral: this fallback renders for EVERY category
+            # (drones included) — never name beauty evidence shapes here.
             moves.append(
                 "Earn placement in the independent review sources Google "
-                "surfaces for your category (ingredient/efficacy explainers and "
-                "'best of' roundups)."
+                "surfaces for your category — product explainers and "
+                "'best of' roundups."
             )
         moves.append(
             "Add product, review, and FAQ structured data so Google can extract "
@@ -6059,6 +6067,9 @@ def build_engine_playbook(
             "total": total,
             "rate": (round(appeared / total, 3) if total else None),
             "status": status,
+            # Explicit measurement flag (additive): the portal gates the
+            # per-engine card on this instead of inferring from status.
+            "measured": status != "couldnt_measure",
             "moves": _engine_moves(engine, status, hosts_by_type),
         }
     # Primary gap = the measured engine where the brand is weakest (most upside).

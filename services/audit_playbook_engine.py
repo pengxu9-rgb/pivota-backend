@@ -418,7 +418,11 @@ def _score_for_dimension(per_sku_report: Dict[str, Any], dimension: str) -> Opti
         return None
 
 
-def _content_gap_candidates(per_sku_report: Dict[str, Any]) -> List[Dict[str, Any]]:
+def _content_gap_candidates(
+    per_sku_report: Dict[str, Any],
+    *,
+    vertical: Optional[str] = None,
+) -> List[Dict[str, Any]]:
     """Return failing-dimension/bucket candidates for content_revision.
 
     Exact `primary_gaps` from the report win. We also map the scorecard
@@ -475,7 +479,13 @@ def _content_gap_candidates(per_sku_report: Dict[str, Any]) -> List[Dict[str, An
         _add("content_richness", "intent_header", "intent-shaped prompts failed")
 
     breakdown = ((per_sku_report.get("scores") or {}).get("content_richness") or {}).get("breakdown") or {}
-    if any(
+    # The ingredient/dose playbook's copy is formulation-specific (INCI,
+    # ingredient modules) — the vertical_structure/safety_claims buckets it
+    # keys on are generic (specs and safety claims fail for electronics too),
+    # so gate on an explicitly-resolved beauty vertical or a drone SKU gets
+    # INCI advice (founder scan 2026-07-22). Default-closed: unknown vertical
+    # skips it rather than risking formulation copy on the wrong category.
+    if str(vertical or "").strip().lower() == "beauty" and any(
         isinstance(detail, dict)
         and int(detail.get("points") or 0) < int(detail.get("max") or 0)
         for name, detail in breakdown.items()
@@ -663,7 +673,10 @@ def _select_content_revision_actions(
         if sku_key in authority_lookup:
             enriched_report["authority_hosts"] = authority_lookup[sku_key].get("authority_hosts") or []
         sku_ctx = (sku_contexts_by_sku or {}).get(sku_key, {})
-        candidates = _content_gap_candidates(enriched_report)
+        candidates = _content_gap_candidates(
+            enriched_report,
+            vertical=str((sku_ctx or {}).get("vertical") or "").strip().lower() or None,
+        )
         for dimension, bucket, reason in (
             (c.get("dimension"), c.get("bucket"), c.get("reason"))
             for c in candidates
