@@ -64,7 +64,7 @@ def client(monkeypatch):
     sku_intel_calls: list = []
     credit_ops: list = []
 
-    async def fake_count(*, merchant_id, subject_type):
+    async def fake_count(*, merchant_id, subject_type, since=None):
         return state["used"]
 
     async def fake_get_balance(merchant_id):

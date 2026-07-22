@@ -1020,6 +1020,35 @@ async def run_merchant_self_audit(
 _FREE_URL_AUDITS_PER_MERCHANT = int(
     _os.getenv("FREE_URL_AUDITS_PER_MERCHANT", "0")
 )
+
+
+def _parse_free_audit_count_since(raw: Optional[str]) -> Optional[datetime]:
+    """FREE_AUDIT_COUNT_SINCE: ISO date/datetime cutoff for the free-allowance
+    counter. Runs requested before this instant never consume the allowance —
+    without it, flipping FREE_URL_AUDITS_PER_MERCHANT on for the first time
+    would retroactively count every run from the unmetered era and instantly
+    402 long-standing merchants (founder decision D3, 2026-07-22). A bare date
+    is midnight UTC; naive datetimes are treated as UTC. Unparseable values
+    disable the cutoff loudly rather than silently blocking merchants."""
+    if not raw or not raw.strip():
+        return None
+    try:
+        parsed = datetime.fromisoformat(raw.strip())
+    except ValueError:
+        logger.error(
+            "FREE_AUDIT_COUNT_SINCE=%r is not ISO-8601; ignoring the cutoff "
+            "(free-allowance counting will include ALL historical runs).",
+            raw,
+        )
+        return None
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=timezone.utc)
+    return parsed
+
+
+_FREE_AUDIT_COUNT_SINCE = _parse_free_audit_count_since(
+    _os.getenv("FREE_AUDIT_COUNT_SINCE")
+)
 # Two sequential upstream runs keep a real evidence floor instead of binary
 # 1-sample verdicts; the LLM probe timeout is sized for grounded searches.
 _WEDGE_MAX_RUNS = int(_os.getenv("WEDGE_MAX_RUNS", "2"))
@@ -1726,6 +1755,7 @@ async def run_merchant_url_audit(
     #    free-tier merchant with no credits to cover the run.
     used = await count_runs_for_merchant_by_subject(
         merchant_id=merchant_id, subject_type="merchant_url",
+        since=_FREE_AUDIT_COUNT_SINCE,
     )
     over_free = _FREE_URL_AUDITS_PER_MERCHANT > 0 and used >= _FREE_URL_AUDITS_PER_MERCHANT
     # Deep Landscape Scan is ALWAYS metered — the free URL-audit allowance
