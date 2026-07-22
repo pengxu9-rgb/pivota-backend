@@ -203,3 +203,67 @@ def test_candidate_query_can_explicitly_include_upstream_blockers() -> None:
 
     assert "ips.blocker_code NOT IN ('not_live', 'non_core_product')" in sql
     assert "ips.blocker_code IN ('no_image', 'no_price')" not in sql
+
+
+# --- opt-in --allow-source-superset relaxation -------------------------------
+
+
+def test_source_superset_rejected_by_default() -> None:
+    """Flag off (default) keeps the strict source_title_extra_tokens veto."""
+    gate = repair.title_gate(
+        "Oil-Free Ultra-Moisturizing Lotion",
+        "Oil-Free Ultra-Moisturizing Lotion with Birch Sap",
+    )
+
+    assert gate["ok"] is False
+    assert gate["reason"] == "source_title_extra_tokens"
+
+
+def test_source_superset_accepted_when_opted_in() -> None:
+    """Abbreviated feed title vs the brand's fuller product name."""
+    gate = repair.title_gate(
+        "Oil-Free Ultra-Moisturizing Lotion",
+        "Oil-Free Ultra-Moisturizing Lotion with Birch Sap",
+        allow_source_superset=True,
+    )
+
+    assert gate["ok"] is True
+    assert gate["title_superset_accepted"] is True
+
+
+def test_source_superset_still_rejects_bundle_and_size_variants() -> None:
+    """Pack/size/count words must veto even when our title is fully contained.
+
+    These are matched on RAW tokens: "set"/"pack"/"size" are stripped by
+    STOPWORDS/GENERIC_PRODUCT_TOKENS, so a filtered-set check would miss them.
+    """
+    target = "COSRX Advanced Snail Mucin Power Essence"
+    for suffix in (
+        "Twin Pack", "Double Set", "Travel Size", "Refill", "Jumbo",
+        "Sample", "Multipack", "Combo Deal", "Starter Trial",
+    ):
+        gate = repair.title_gate(
+            target, f"{target} {suffix}", allow_source_superset=True
+        )
+        assert gate["ok"] is False, f"{suffix!r} must not pass as a superset match"
+
+
+def test_source_superset_rejects_generic_short_target() -> None:
+    """A 1-2 token target is too generic to trust as a subset match."""
+    gate = repair.title_gate(
+        "Toner", "Beauty of Joseon Rice Water Bright Toner",
+        allow_source_superset=True,
+    )
+
+    assert gate["ok"] is False
+
+
+def test_source_superset_still_honours_similarity_floor() -> None:
+    """The relaxation bypasses the extra-token veto, never the score floor."""
+    gate = repair.title_gate(
+        "Snail Mucin Essence",
+        "Snail Mucin Essence Plus Full Ritual Anti Aging Brightening Night Repair Complex",
+        allow_source_superset=True,
+    )
+
+    assert gate["ok"] is False

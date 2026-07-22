@@ -137,14 +137,26 @@ VARIANT_TOKENS = {
 }
 
 
-# Pack / count / bundle indicators. VARIANT_TOKENS above covers only shades, so
-# these are checked separately by the opt-in source-superset relaxation to keep
-# a single unit from matching a bundle / multi-count page (or vice-versa).
+# Pack / count / SIZE / format indicators. VARIANT_TOKENS above covers only
+# shades, so these are checked separately by the opt-in source-superset
+# relaxation to keep a single unit from matching a bundle, a multi-count page,
+# or a different size/format (or vice-versa).
+#
+# NOTE: this is matched against RAW tokens, not token_set() output — several of
+# these ("set", "pack", "size", "mini", "shade") are stripped by
+# STOPWORDS/GENERIC_PRODUCT_TOKENS and would be inert otherwise.
 PACK_COUNT_TOKENS = {
+    # count / bundle
     "set", "sets", "bundle", "bundles", "kit", "kits", "pack", "packs",
-    "ea", "pcs", "pc", "box", "boxes", "duo", "trio", "pair", "count", "ct",
-    "sheet", "sheets", "type", "types", "color", "colors", "colour", "colours",
-    "shade", "shades", "edition", "gift", "special", "value",
+    "multipack", "multi", "combo", "duo", "trio", "twin", "double", "triple",
+    "pair", "count", "ct", "ea", "pcs", "pc", "piece", "pieces", "bulk",
+    "box", "boxes", "bottle", "bottles", "tube", "tubes", "sheet", "sheets",
+    # size / format
+    "size", "sized", "mini", "travel", "trial", "sample", "samples", "refill",
+    "jumbo", "supersize", "large", "small", "full", "deluxe", "starter",
+    # merchandising
+    "type", "types", "color", "colors", "colour", "colours", "shade", "shades",
+    "edition", "gift", "special", "value", "family", "promo", "deal", "bogo",
 }
 
 
@@ -477,17 +489,25 @@ def title_gate(
     source_extra_tokens = source_tokens - target_tokens
     # Opt-in safe-direction relaxation: accept when our title is FULLY contained
     # in the source (target ⊆ source) and the source's extra tokens are purely
-    # descriptive — no digits and none of the pack/count indicators. This admits
-    # "…Lotion" vs "…Lotion with Birch Sap" (SK feed titles are abbreviated) while
-    # still rejecting single-unit → bundle or cross-count mismatches. Variant
-    # (shade) tokens were already required equal by the check above.
+    # descriptive. This admits "…Lotion" vs "…Lotion with Birch Sap" (feed titles
+    # are abbreviated) while still rejecting single-unit → bundle / size / count
+    # mismatches. Variant (shade) tokens were already required equal above.
+    #
+    # The pack/count check runs on RAW tokens, NOT token_set(): token_set strips
+    # STOPWORDS ("set") and GENERIC_PRODUCT_TOKENS ("pack", "size", "mini",
+    # "shade"), so checking the filtered set would silently miss exactly the
+    # bundle words we care about ("X Twin Pack" -> filtered extras {twin}).
+    raw_source_extra = set(_tokens(extracted_title)) - set(_tokens(target_title))
     safe_superset = (
         bool(source_extra_tokens)
         and not exact
         and allow_source_superset
         and target_tokens <= source_tokens
-        and not (source_extra_tokens & PACK_COUNT_TOKENS)
-        and not any(ch.isdigit() for tok in source_extra_tokens for ch in tok)
+        # minimum specificity: a 1-2 token target is too generic to trust as a
+        # subset ("Toner" ⊆ "Rice Water Bright Toner").
+        and len(target_tokens) >= 3
+        and not (raw_source_extra & PACK_COUNT_TOKENS)
+        and not any(ch.isdigit() for tok in raw_source_extra for ch in tok)
     )
     if source_extra_tokens and not exact and not safe_superset:
         return {
@@ -500,9 +520,13 @@ def title_gate(
             "source_extra_tokens": sorted(source_extra_tokens),
         }
 
-    if exact or safe_superset:
+    if exact:
         ok = True
     else:
+        # A superset match still must clear the normal similarity floor — it only
+        # bypasses the extra-token veto, never the score. Keeps "Lotion" vs
+        # "Lotion with Birch Sap" (jaccard .71) while dropping a generic target
+        # against a far more specific source.
         ok = containment >= 0.75 and jaccard >= 0.45
 
     return {
@@ -510,6 +534,7 @@ def title_gate(
         "reason": None if ok else "title_mismatch",
         "score": round(score, 3),
         "exact": exact,
+        "title_superset_accepted": bool(safe_superset and ok),
         "target_variant_tokens": sorted(target_variant_tokens),
         "source_variant_tokens": sorted(source_variant_tokens),
         "source_extra_tokens": sorted(source_extra_tokens),
