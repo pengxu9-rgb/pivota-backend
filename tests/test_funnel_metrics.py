@@ -113,7 +113,9 @@ async def _seed(db):
 @pytest.mark.asyncio
 async def test_funnel_metrics_story(sqlite_db):
     await _seed(sqlite_db)
-    out = await fms.compute_funnel_metrics(since=WINDOW_START, until=WINDOW_END)
+    out = await fms.compute_funnel_metrics(
+        since=WINDOW_START, until=WINDOW_END, free_audit_cap=2
+    )
 
     # Registrations: m1, m2, m3, m5 (m4 pre-window, mdel deleted).
     assert out["registrations"]["total"] == 4
@@ -130,7 +132,8 @@ async def test_funnel_metrics_story(sqlite_db):
 
     # Allowance exhaustion: m2 (2 succeeded) and m4 (succeeded + running —
     # running counts, failed doesn't).
-    assert out["quota"]["merchants_free_allowance_exhausted_in_window"] == 2
+    assert out["quota"]["allowance_enabled"] is True
+    assert out["quota"]["merchants_free_allowance_exhausted"] == 2
 
     # Upgrades: m2 subscribed, and it came from the funnel cohort.
     assert out["upgrades"]["subscriptions_created"] == 1
@@ -155,6 +158,8 @@ async def test_funnel_metrics_empty_window(sqlite_db):
         since=datetime(2030, 1, 1), until=datetime(2030, 2, 1)
     )
     assert out["registrations"]["total"] == 0
+    assert out["quota"]["allowance_enabled"] is False
+    assert out["quota"]["merchants_free_allowance_exhausted"] == 0
     assert out["conversion"]["registration_to_first_audit"] is None
     assert out["time_to_first_value_minutes"]["n"] == 0
     assert out["time_to_first_value_minutes"]["p50"] is None

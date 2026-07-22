@@ -50,8 +50,17 @@ def _rate(numerator: int, denominator: int) -> Optional[float]:
 
 
 async def compute_funnel_metrics(
-    *, since: datetime, until: datetime
+    *,
+    since: datetime,
+    until: datetime,
+    free_audit_cap: Optional[int] = None,
+    free_count_since: Optional[datetime] = None,
 ) -> Dict[str, Any]:
+    """`free_audit_cap` / `free_count_since` mirror the REAL allowance gate
+    (FREE_URL_AUDITS_PER_MERCHANT / FREE_AUDIT_COUNT_SINCE) — the route
+    passes the live values so quota.exhausted tracks the gate that actually
+    402s merchants, not a hardcoded approximation. cap None/<=0 = allowance
+    disabled -> exhausted reports 0."""
     params = {"since": since, "until": until}
 
     # -- Stage 2: registrations in window, attributed --------------------------
@@ -85,9 +94,10 @@ async def compute_funnel_metrics(
             "SELECT merchant_id, status, requested_at, completed_at "
             "FROM merchant_audit_runs "
             "WHERE subject_type = 'merchant_url' "
-            "AND requested_at >= :since "
+            "AND requested_at >= :since AND requested_at < :until "
             f"AND merchant_id IN ({placeholders})",
-            {"since": since, **{f"c{i}": mid for i, mid in enumerate(cohort_ids)}},
+            {"since": since, "until": until,
+             **{f"c{i}": mid for i, mid in enumerate(cohort_ids)}},
         )
         for row in run_rows:
             d = dict(row)
@@ -114,15 +124,21 @@ async def compute_funnel_metrics(
             ttfv_minutes.append(round((done - created).total_seconds() / 60, 1))
 
     # -- Free-allowance exhaustion (candidates for the 402 -> upgrade path) ----
-    exhausted_rows = await database.fetch_all(
-        "SELECT merchant_id, COUNT(*) AS runs "
-        "FROM merchant_audit_runs "
-        "WHERE subject_type = 'merchant_url' AND status != 'failed' "
-        "AND requested_at >= :since AND requested_at < :until "
-        "GROUP BY merchant_id HAVING COUNT(*) >= 2",
-        params,
-    )
-    exhausted_ids = {dict(r)["merchant_id"] for r in exhausted_rows}
+    # Mirrors count_runs_for_merchant_by_subject: counts since the gate's
+    # FREE_AUDIT_COUNT_SINCE cutoff (not the report window), bounded at
+    # `until` so historical windows stay reproducible.
+    exhausted_ids: set = set()
+    if free_audit_cap and free_audit_cap > 0:
+        gate_since = free_count_since or datetime(1970, 1, 1, tzinfo=timezone.utc)
+        exhausted_rows = await database.fetch_all(
+            "SELECT merchant_id, COUNT(*) AS runs "
+            "FROM merchant_audit_runs "
+            "WHERE subject_type = 'merchant_url' AND status != 'failed' "
+            "AND requested_at >= :gate_since AND requested_at < :until "
+            "GROUP BY merchant_id HAVING COUNT(*) >= :cap",
+            {"gate_since": gate_since, "until": until, "cap": free_audit_cap},
+        )
+        exhausted_ids = {dict(r)["merchant_id"] for r in exhausted_rows}
 
     # -- Stage 4: subscriptions created in window ------------------------------
     sub_rows = await database.fetch_all(
@@ -155,7 +171,9 @@ async def compute_funnel_metrics(
             "funnel_cohort_first_audit_started": started_funnel,
         },
         "quota": {
-            "merchants_free_allowance_exhausted_in_window": len(exhausted_ids),
+            "allowance_enabled": bool(free_audit_cap and free_audit_cap > 0),
+            "free_audit_cap": free_audit_cap,
+            "merchants_free_allowance_exhausted": len(exhausted_ids),
         },
         "upgrades": {
             "subscriptions_created": len(upgraded_ids),
@@ -176,7 +194,9 @@ async def compute_funnel_metrics(
         "notes": [
             "Stage 1 (marketing visitor -> URL submitted) is client-side "
             "analytics on pivota.cc and is not tracked server-side.",
-            "quota.exhausted counts merchants with >=2 non-failed URL-audit "
-            "runs in the window — the candidates for the 402 upgrade path.",
+            "quota.exhausted mirrors the live allowance gate (cap + "
+            "FREE_AUDIT_COUNT_SINCE cutoff), counted up to `until` — the "
+            "candidates for the 402 upgrade path. 0 when the allowance is "
+            "disabled.",
         ],
     }

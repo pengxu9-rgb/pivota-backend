@@ -49,4 +49,16 @@ async def get_funnel_metrics(
             status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
             detail="since must be before until",
         )
-    return await compute_funnel_metrics(since=since_dt, until=until_dt)
+    # Pass the LIVE allowance-gate parameters so quota.exhausted tracks the
+    # gate that actually 402s merchants.
+    from routes.merchant_audit_routes import (
+        _FREE_AUDIT_COUNT_SINCE,
+        _FREE_URL_AUDITS_PER_MERCHANT,
+    )
+
+    return await compute_funnel_metrics(
+        since=since_dt,
+        until=until_dt,
+        free_audit_cap=_FREE_URL_AUDITS_PER_MERCHANT,
+        free_count_since=_FREE_AUDIT_COUNT_SINCE,
+    )
