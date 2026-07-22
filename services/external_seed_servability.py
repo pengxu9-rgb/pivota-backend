@@ -74,13 +74,19 @@ def build_servable_quality_payload(
         ``source_backed_attribute_signal_count`` reads it, so a product with a
         real ingredient list earns the attributes component, and
       * carry the crawled ``pdp_details_sections`` through to that same
-        ``seed_data`` slot. Both `score_source_backed_summary` and
-        `source_backed_attribute_signal_count` read those sections, but nothing
-        used to pass them here — so a product whose crawl DID capture its PDP
-        detail sections was still scored as if it had none, losing the summary
-        and attribute components it had already earned. Measured on 250 live
-        rows carrying sections (2026-07-22): 98% clear the 65 bar once they are
-        passed, vs 50% without, at +13.1 avg score.
+        ``seed_data`` slot, where ``source_backed_attribute_signal_count`` reads
+        them. Nothing used to pass them here, so a product whose crawl DID
+        capture its PDP detail sections was scored as if it had none and
+        forfeited the attributes component it had already earned.
+
+    Scope of that last one, precisely: sections feed the ATTRIBUTES component
+    only — ``score_source_backed_summary`` reads ``summary`` / ``pdp_summary`` /
+    ``short_description`` / ``product_summary`` / ``product_intel``, NOT
+    sections. Attributes is also already maxed by a real ``raw_inci``, so the
+    lift is +1 component (~+14.3) for a sections-bearing product with NO INCI,
+    and exactly zero for one that already has INCI. Measured against the live
+    blocked-beauty pool (2026-07-23): 1,322 rows carry sections, of which 410
+    lack INCI and are the genuine beneficiaries.
     """
     payload = build_quality_payload(
         {

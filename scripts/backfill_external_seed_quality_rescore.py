@@ -49,20 +49,46 @@ TOOL = "external_brand_crawl"
 # 4,072 seed-attached beauty rows (measured 2026-07-22) — they carry the same
 # payload shape and the same ~50 stalled score, they just arrived via a different
 # source_ref. `--tool-prefix` restores the old narrow behavior when needed.
+#
+# Three safety properties are load-bearing here (review findings, 2026-07-23):
+#   * `eps.id AS seed_id` — the seed id must come from the ROW, never be
+#     rebuilt as `external_brand_crawl::{epid}`. Only the crawl path mints ids
+#     in that shape; for every widened-scope row a fabricated id silently
+#     matches no seed, so the backlink and the agent_pdp_view refresh become
+#     no-ops that still report success (and could, worst case, re-point another
+#     product's seed).
+#   * `NOT ips.serving_eligible` — restrict to rows that are ALREADY dark. A
+#     rescore can then only ever promote; a currently-public row cannot be
+#     demoted by a thinner field set (e.g. a NULL eps.price_amount costing the
+#     price component). `--include-eligible` opts out deliberately.
+#   * `DISTINCT ON (p.product_key)` — `attached_product_key` has no unique
+#     index, so a multi-seed product would otherwise be scored once per seed
+#     with a non-deterministic winner. Match the eligibility reader and take the
+#     most recently updated seed. (Postgres-only; this script is prod-only.)
 FETCH = """
-    SELECT p.product_key, p.source_product_id, p.title, p.description, p.brand,
+    SELECT DISTINCT ON (p.product_key)
+           p.product_key, p.source_product_id, p.title, p.description, p.brand,
            p.product_type, p.category_kind, p.image_url,
-           eps.price_amount, bsi.raw_inci,
-           eps.seed_data -> 'pdp_details_sections' AS pdp_details_sections
+           eps.id AS seed_id, eps.price_amount, bsi.raw_inci,
+           COALESCE(
+               eps.seed_data -> 'pdp_details_sections',
+               eps.seed_data -> 'snapshot' -> 'pdp_details_sections'
+           ) AS pdp_details_sections
     FROM catalog_products p
     JOIN external_product_seeds eps ON eps.attached_product_key = p.product_key
+    JOIN index_pipeline_state ips ON ips.content_key = p.content_key
     LEFT JOIN beauty_sku_ingredients bsi
            ON bsi.sku_key = p.product_key || '::canonical'
     WHERE (
         CAST(:source_prefix AS TEXT) IS NULL
         OR p.source_ref LIKE CAST(:source_prefix AS TEXT)
     )
-    ORDER BY p.product_key
+      -- snapshots are written under platform='external_seed'; the eligibility
+      -- lateral matches on platform, so scoring any other platform's rows here
+      -- writes snapshots nothing will ever read.
+      AND p.platform = 'external_seed'
+      AND (CAST(:include_eligible AS INTEGER) = 1 OR NOT ips.serving_eligible)
+    ORDER BY p.product_key, eps.updated_at DESC NULLS LAST, eps.id
 """
 
 
@@ -93,21 +119,32 @@ async def run(
     *,
     source_prefix: Optional[str] = None,
     force: bool = False,
+    include_eligible: bool = False,
+    offset: int = 0,
 ) -> None:
     await database.connect()
     try:
         rows = [
             dict(r)
-            for r in await database.fetch_all(FETCH, {"source_prefix": source_prefix})
+            for r in await database.fetch_all(
+                FETCH,
+                {
+                    "source_prefix": source_prefix,
+                    "include_eligible": 1 if include_eligible else 0,
+                },
+            )
         ]
         done = set() if force else await _rescored_ids()
         todo = [r for r in rows if r["source_product_id"] not in done]
+        if offset:
+            todo = todo[offset:]
         if limit:
             todo = todo[:limit]
         with_inci = sum(1 for r in rows if (r.get("raw_inci") or "").strip())
         with_sections = sum(1 for r in rows if _coerce_sections(r.get("pdp_details_sections")))
+        # `rows` is DISTINCT ON (product_key), so these are product counts.
         print(
-            f"batch={len(rows)}  already-rescored={len(done)}  "
+            f"batch={len(rows)} products  already-rescored={len(done)}  "
             f"to-rescore={len(todo)}  (with INCI: {with_inci}, "
             f"with pdp_details_sections: {with_sections})",
             flush=True,
@@ -128,8 +165,13 @@ async def run(
         for i, r in enumerate(todo, 1):
             epid = r["source_product_id"]
             if consec >= 5:
+                resume = (
+                    f"Re-run with --offset {offset + i - 1} to resume."
+                    if force
+                    else "Re-run to resume (already-rescored are skipped)."
+                )
                 print(f"[ABORT] {consec} consecutive failures — connection likely "
-                      f"dead. Re-run to resume (already-rescored are skipped).", flush=True)
+                      f"dead. {resume}", flush=True)
                 break
             try:
                 qp = build_servable_quality_payload(
@@ -142,7 +184,8 @@ async def run(
                 # per-product timeout so a dead socket errors out, never hangs
                 await asyncio.wait_for(
                     make_external_seed_servable(
-                        product_key=r["product_key"], seed_id=f"{TOOL}::{epid}",
+                        # seed_id comes from the row — NEVER rebuilt from TOOL.
+                        product_key=r["product_key"], seed_id=r["seed_id"],
                         source_product_id=epid, quality_payload=qp,
                         reason="rescore_ingredient_aware",
                     ),
@@ -174,12 +217,28 @@ def main() -> int:
     ap.add_argument(
         "--force",
         action="store_true",
-        help="re-score even products already on the current rules version "
-             "(needed when the payload shape changes, e.g. pdp_details_sections)",
+        help="re-score even products already on the current rules version. NOT "
+             "needed for a payload-shape change — bump "
+             "SOURCE_BACKED_COMPONENTS_RULES_VERSION instead, which keeps the "
+             "run resumable. --force restarts from row 1 every time.",
     )
+    ap.add_argument(
+        "--include-eligible",
+        action="store_true",
+        help="also re-score rows that are ALREADY serving-eligible. Off by "
+             "default so a rescore can only promote, never demote a public row.",
+    )
+    ap.add_argument("--offset", type=int, default=0, help="skip the first N rows")
     args = ap.parse_args()
     asyncio.run(
-        run(args.apply, args.limit, source_prefix=args.tool_prefix, force=args.force)
+        run(
+            args.apply,
+            args.limit,
+            source_prefix=args.tool_prefix,
+            force=args.force,
+            include_eligible=args.include_eligible,
+            offset=args.offset,
+        )
     )
     return 0
 

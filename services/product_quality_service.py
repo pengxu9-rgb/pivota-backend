@@ -34,7 +34,12 @@ QUALITY_SOURCE_SNAPSHOT = "snapshot"
 QUALITY_SOURCE_PREVIEW = "preview"
 QUALITY_SOURCE_NONE = "none"
 DEFAULT_QUALITY_RULES_VERSION = "v1-lite"
-SOURCE_BACKED_COMPONENTS_RULES_VERSION = "v1-source-backed-components"
+# v2 (2026-07-23): the servable payload now carries seed_data.pdp_details_sections
+# (services/external_seed_servability.build_servable_quality_payload). The payload
+# SHAPE changed, so v1-scored snapshots are not comparable and must be re-scored —
+# bumping the version is what keeps that resumable instead of needing a blind
+# --force sweep in scripts/backfill_external_seed_quality_rescore.py.
+SOURCE_BACKED_COMPONENTS_RULES_VERSION = "v2-source-backed-components"
 SOURCE_BACKED_OPTIONAL_COMPONENTS_FLAG = (
     "PDP_QUALITY_SCORE_SOURCE_BACKED_OPTIONAL_COMPONENTS"
 )
