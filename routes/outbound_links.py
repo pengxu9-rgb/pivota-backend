@@ -194,37 +194,39 @@ async def redirect_endpoint(req: Request, token: str = Query(..., min_length=10)
     # at the framework layer — no warm attempt, no cart, no click log.)
     warm_redirect_url: Optional[str] = None
     if settings.outbound_warm_handoff_enabled:
-        warm_ctx: Dict[str, str]
-        eligible, reason = evaluate_warm_eligibility(
-            dest=dest,
-            user_agent=req.headers.get("user-agent"),
-            token=token,
-            settings=settings,
-        )
-        if eligible:
-            # Per-token memo: agent-platform prefetch + the real human click build ONE cart,
-            # and the human click 302s instantly off the memo.
-            hit, resolved = memo_get(token)
-            if not hit:
-                resolved = await resolve_warm_handoff(
-                    dest=dest,
-                    ctx=payload.get("ctx") if isinstance(payload.get("ctx"), dict) else {},
-                    settings=settings,
-                )
-                memo_set(token, resolved)
-            if resolved and resolved.get("continue_url"):
-                warm_redirect_url = str(resolved["continue_url"])
-                warm_ctx = {"handoff": "warm", "warm_reason": "ok"}
-            else:
-                warm_ctx = {"handoff": "cold", "warm_reason": "unresolved"}
-        else:
-            warm_ctx = {"handoff": "cold", "warm_reason": reason}
+        # The WHOLE lane is throw-guarded: an unexpected error anywhere in eligibility,
+        # memo, or resolve must degrade to the cold redirect — never a 500 on a real click.
         try:
+            warm_ctx: Dict[str, str]
+            eligible, reason = evaluate_warm_eligibility(
+                dest=dest,
+                user_agent=req.headers.get("user-agent"),
+                token=token,
+                settings=settings,
+            )
+            if eligible:
+                # Per-token memo: agent-platform prefetch + the real human click build ONE
+                # cart, and the human click 302s instantly off the memo.
+                hit, resolved = memo_get(token)
+                if not hit:
+                    resolved = await resolve_warm_handoff(
+                        dest=dest,
+                        ctx=payload.get("ctx") if isinstance(payload.get("ctx"), dict) else {},
+                        settings=settings,
+                    )
+                    memo_set(token, resolved)
+                if resolved and resolved.get("continue_url"):
+                    warm_redirect_url = str(resolved["continue_url"])
+                    warm_ctx = {"handoff": "warm", "warm_reason": "ok"}
+                else:
+                    warm_ctx = {"handoff": "cold", "warm_reason": "unresolved"}
+            else:
+                warm_ctx = {"handoff": "cold", "warm_reason": reason}
             ctx_out = dict(payload.get("ctx")) if isinstance(payload.get("ctx"), dict) else {}
             ctx_out.update(warm_ctx)
             payload["ctx"] = ctx_out
         except Exception:
-            pass
+            warm_redirect_url = None
 
     # Best-effort click logging.
     try:

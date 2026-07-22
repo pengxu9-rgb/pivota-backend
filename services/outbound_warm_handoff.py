@@ -18,6 +18,7 @@ complete_checkout, never payment, never opening the continue_url server-side.
 
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import logging
 import re
@@ -207,17 +208,31 @@ def _validate_continue_url(continue_url: str, brand_host: str) -> bool:
     """The 302 target must be the brand's own storefront: https, and the host is either the
     brand domain (suffix match) or a *.myshopify.com storefront. Anything else is refused —
     the gateway is trusted infrastructure, but a redirect target gets belt-and-braces."""
+    raw = str(continue_url or "")
+    # Reject authority-confusion payloads BEFORE trusting urlparse's hostname: urlparse and
+    # the browser's WHATWG parser disagree on '\' (urlparse("https://evil.com\\@good.com")
+    # yields hostname good.com while a browser navigates to evil.com), and a real Shopify
+    # cart URL never carries backslashes, whitespace, control chars, or userinfo.
+    if "\\" in raw or any(ch.isspace() or ord(ch) < 0x20 for ch in raw):
+        return False
     try:
-        parsed = urlparse(str(continue_url or ""))
+        parsed = urlparse(raw)
     except Exception:
         return False
     if parsed.scheme != "https":
         return False
+    if "@" in (parsed.netloc or ""):
+        return False  # userinfo in a cart URL is never legitimate
     host = (parsed.hostname or "").lower()
     if not host:
         return False
     bare = host[4:] if host.startswith("www.") else host
-    if brand_host and (_host_matches(bare, brand_host) or _host_matches(brand_host, bare)):
+    if brand_host and _host_matches(bare, brand_host):
+        return True
+    # Reverse direction (dest host was a subdomain of the cart host, e.g. dest shop.cosrx.com
+    # -> cart cosrx.com): require the cart host to be a real registrable domain (>= 2 labels)
+    # so a bare public suffix like "com" can never validate.
+    if brand_host and "." in bare and _host_matches(brand_host, bare):
         return True
     return bare.endswith(".myshopify.com")
 
@@ -254,23 +269,29 @@ async def resolve_warm_handoff(
         # onto the order is the spec's Phase 0 empirical question; passing it costs nothing.
         payload["attribution"] = {"pivota_click_id": click_id}
 
-    timeout = httpx.Timeout(float(settings.outbound_warm_handoff_timeout_seconds or 2.5))
+    # A shopper is waiting on the 302: `total_deadline` is a TRUE wall-clock ceiling via
+    # asyncio.wait_for (httpx.Timeout alone is per-phase — connect+read could stack past it).
+    total_deadline = float(settings.outbound_warm_handoff_timeout_seconds or 2.5)
+    timeout = httpx.Timeout(total_deadline, connect=min(1.0, total_deadline))
     headers = {"X-Internal-Key": str(settings.outbound_warm_handoff_internal_key or "")}
-    try:
+
+    async def _post() -> Any:
         if client is not None:
-            response = await client.post(
+            return await client.post(
                 settings.outbound_warm_handoff_resolve_url,
                 json=payload,
                 headers=headers,
                 timeout=timeout,
             )
-        else:
-            async with httpx.AsyncClient(timeout=timeout) as owned:
-                response = await owned.post(
-                    settings.outbound_warm_handoff_resolve_url,
-                    json=payload,
-                    headers=headers,
-                )
+        async with httpx.AsyncClient(timeout=timeout) as owned:
+            return await owned.post(
+                settings.outbound_warm_handoff_resolve_url,
+                json=payload,
+                headers=headers,
+            )
+
+    try:
+        response = await asyncio.wait_for(_post(), timeout=total_deadline)
     except Exception as exc:  # noqa: BLE001 — the click path must never break on this lane
         logger.info("warm_handoff resolve call failed host=%s: %s", brand_host, str(exc)[:200])
         return None

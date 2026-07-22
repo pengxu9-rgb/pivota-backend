@@ -228,10 +228,32 @@ def test_rollout_bucket_is_stable_per_token() -> None:
         ("http://cosrx-renewal.myshopify.com/cart/c/x", "cosrx.com", False),  # not https
         ("https://evil.example.com/cart", "cosrx.com", False),  # off-brand host
         ("", "cosrx.com", False),
+        # Authority-confusion payloads: urlparse and the browser's WHATWG parser disagree on
+        # '\' (urlparse sees cosrx.com; the browser navigates to evil.com) — must be rejected
+        # before hostname is trusted.
+        ("https://evil.com\\@cosrx-renewal.myshopify.com/cart/c/x", "cosrx.com", False),
+        ("https://user@cosrx.com/cart/c/x", "cosrx.com", False),  # userinfo never legitimate
+        ("https://cosrx.com/cart/c/x y", "cosrx.com", False),  # whitespace never legitimate
+        ("https://com/cart", "cosrx.com", False),  # bare public suffix can never validate
     ],
 )
 def test_continue_url_host_validation(continue_url: str, brand_host: str, ok: bool) -> None:
     assert warm._validate_continue_url(continue_url, brand_host) is ok
+
+
+def test_throwing_lane_degrades_to_cold_redirect_not_500(monkeypatch) -> None:
+    # The whole flag-ON block is throw-guarded: an unexpected error inside the lane must
+    # degrade to the cold 302, never a 500 on a real click.
+    async def _boom(**kwargs):
+        raise RuntimeError("unexpected lane failure")
+
+    monkeypatch.setattr(outbound_routes, "resolve_warm_handoff", _boom)
+    logged = _spy_logger(monkeypatch)
+    client = TestClient(app)
+    res = client.get(f"/r?token={_mint_token()}", headers={"user-agent": HUMAN_UA}, follow_redirects=False)
+    assert res.status_code == 302
+    assert res.headers["location"] == BRAND_DEST
+    assert len(logged) == 1, "the click is still logged on a lane failure"
 
 
 @pytest.mark.asyncio
