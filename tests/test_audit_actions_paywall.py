@@ -18,9 +18,11 @@ import routes.merchant_audit_routes as mar
 
 
 def _shaped_fixture():
-    """A minimal shaped envelope with REAL aliasing: where_youre_losing and
-    brand_report.merchant_narrative share objects with merchant_narrative,
-    exactly as _shape_url_audit_response builds it."""
+    """A hand-built envelope covering EVERY known action surface, with the
+    same aliasing _shape_url_audit_response produces (where_youre_losing /
+    brand_report.merchant_narrative / brand_rollup share objects). The
+    real-shape leak test below complements this with an envelope built by
+    _shape_url_audit_response itself."""
     wyl = {
         "summary": "You lose on best-drone queries.",
         "outreach_moves": [
@@ -50,18 +52,39 @@ def _shaped_fixture():
             "citation_by_provider": {"gemini": {"cited": True}},
         }
     ]
-    report = {"merchant_narrative": narrative, "per_sku_reports": per_sku}
+    per_sku[0]["opportunity"] = {"open_lanes": [{"query": "best beginner drone"}]}
+    per_sku[0]["suggested_prompts"] = ["best drone under $300"]
+    wcw = {"niches": [{"query": "travel drone", "action": "create_answer"}]}
+    brand_rollup = {"avg_visibility": 40, "where_you_can_win": wcw}
+    report = {
+        "merchant_narrative": narrative,
+        "per_sku_reports": per_sku,
+        "brand_rollup": brand_rollup,
+        "where_you_can_win": wcw,
+        "win_plan": {"sku_plans": [{"sku": "X1", "win_path": "own_content"}]},
+    }
     return {
         "status": "succeeded",
         "run_id": "r1",
         "merchant_narrative": narrative,
         "where_youre_losing": wyl,
         "per_sku_reports": per_sku,
+        "brand_rollup": brand_rollup,
+        "where_you_can_win": wcw,
         "brand_report": report,
         "report_summary": {
             "score": {"display": 4.0},
             "top_actions": [{"headline": "Fix PDP variant clarity"}],
             "get_cited_moves": [{"host": "droneblog.com"}],
+            "winnable_lanes": [{"query": "travel drone", "win_path": "own_content"}],
+            "sku_summaries": [
+                {
+                    "sku_title": "X1 Drone",
+                    "score": 4.0,
+                    "action_headline": "Add FAQ",
+                    "supporting_prompts": [{"prompt": "best travel drone"}],
+                }
+            ],
             "top_findings": [{"headline": "ChatGPT never cites you"}],
         },
     }
@@ -92,6 +115,82 @@ def test_strip_empties_actions_and_stamps_lock():
     assert sku["next_best_action"] is None
     assert sku["engine_playbook"] is None
     assert sku["evidence_play"] is None
+
+
+# Keys whose non-empty presence in a stripped free-tier envelope means the
+# paywall leaked action content. Recursively swept below. (`first_move` /
+# `win_path` etc. only ever appear inside action objects.)
+_FORBIDDEN_ACTION_KEYS = {
+    "first_move",
+    "why_this_first",
+    "next_best_action",
+    "engine_playbook",
+    "evidence_play",
+    "opportunity",
+    "win_plan",
+    "win_path",
+    "win_condition",
+    "action_headline",
+    "where_you_can_win",
+    "outreach_moves",
+    "pitch_targets",
+    "win_plan_summary",
+    "top_actions",
+    "get_cited_moves",
+    "winnable_lanes",
+    "pitch_recipient",
+}
+
+
+def _find_leaks(node, path=""):
+    leaks = []
+    if isinstance(node, dict):
+        for k, v in node.items():
+            p = f"{path}.{k}" if path else k
+            # locked_counts intentionally reuses the key names as integer
+            # counts — numbers, not action content.
+            if k == "locked_counts":
+                continue
+            if k in _FORBIDDEN_ACTION_KEYS and v not in (None, [], {}, ""):
+                leaks.append(p)
+            leaks.extend(_find_leaks(v, p))
+    elif isinstance(node, list):
+        for i, item in enumerate(node):
+            leaks.extend(_find_leaks(item, f"{path}[{i}]"))
+    return leaks
+
+
+def test_no_action_key_survives_anywhere_in_stripped_envelope():
+    """Recursive sweep: after the strip, NO forbidden action key may carry
+    content anywhere in the envelope — including brand_report, brand_rollup,
+    and report_summary sub-trees."""
+    shaped = _shaped_fixture()
+    mar._strip_actions_for_free_tier(shaped)
+    leaks = _find_leaks(shaped)
+    assert leaks == [], f"paywall leaked action content at: {leaks}"
+
+
+def test_real_shape_then_strip_leaves_no_action_content():
+    """Build the envelope through the REAL _shape_url_audit_response (not a
+    hand fixture), then strip, then sweep — guards against future report keys
+    reaching the response through shaping paths the fixture doesn't model."""
+    fixture = _shaped_fixture()
+    row = {
+        "run_id": "r-real",
+        "status": "succeeded",
+        "report_jsonb": fixture["brand_report"],
+        "partial_result_jsonb": {"launch": {"wedge_base_payload": {
+            "methodology": {"queries_per_product": 14},
+            "audited_products": [{"title": "X1 Drone"}],
+        }}},
+    }
+    shaped = mar._shape_url_audit_response(row)
+    mar._strip_actions_for_free_tier(shaped)
+    leaks = _find_leaks(shaped)
+    assert leaks == [], f"paywall leaked action content at: {leaks}"
+    # And the free layer is still there.
+    assert shaped["merchant_narrative"]["headline_story"]
+    assert shaped["per_sku_reports"][0]["scores"] == {"visibility": 40}
 
 
 def test_strip_propagates_through_brand_report_alias():

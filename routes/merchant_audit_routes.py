@@ -1524,7 +1524,19 @@ _ACTIONS_PAYWALL_ENABLED = (
     _os.getenv("AUDIT_ACTIONS_PAYWALL_ENABLED", "false").strip().lower() == "true"
 )
 
-_LOCKED_PER_SKU_ACTION_KEYS = ("next_best_action", "engine_playbook", "evidence_play")
+# Per-SKU action layers. `opportunity` is the raw open-lane intelligence that
+# where_you_can_win is derived from — leaving it free would hand out the same
+# recommendation in raw form. Deliberately FREE (founder can veto):
+# `suggested_prompts` (queries to test, feeds the free custom-prompts
+# engagement loop — not a fix-it plan) and `checkout_handoff` (it funnels
+# into connecting a store, which is Pivota's own conversion, not merchant
+# work product).
+_LOCKED_PER_SKU_ACTION_KEYS = (
+    "next_best_action",
+    "engine_playbook",
+    "evidence_play",
+    "opportunity",
+)
 
 
 def _strip_actions_for_free_tier(shaped: Dict[str, Any]) -> Dict[str, Any]:
@@ -1574,6 +1586,23 @@ def _strip_actions_for_free_tier(shaped: Dict[str, Any]) -> Dict[str, Any]:
         if wyl.get("win_plan_summary"):
             wyl["win_plan_summary"] = None
 
+    # The sideways-wedge recommendation ("where you can win") lives in three
+    # places: the top-level key, brand_rollup, and the raw brand_report. The
+    # top-level usually aliases brand_rollup's object, so strip every home.
+    wcw_homes = [shaped, shaped.get("brand_rollup"), shaped.get("brand_report")]
+    rollup_in_report = (shaped.get("brand_report") or {}).get("brand_rollup")
+    if isinstance(rollup_in_report, dict):
+        wcw_homes.append(rollup_in_report)
+    for home in wcw_homes:
+        if isinstance(home, dict) and home.get("where_you_can_win") is not None:
+            home["where_you_can_win"] = None
+
+    # brand_report is the raw report dict — its narrative/per-SKU branches are
+    # aliases (already stripped above), but the full win_plan is its own tree.
+    brand_report = shaped.get("brand_report")
+    if isinstance(brand_report, dict) and brand_report.get("win_plan") is not None:
+        brand_report["win_plan"] = None
+
     summary = shaped.get("report_summary")
     if isinstance(summary, dict):
         top = summary.get("top_actions")
@@ -1582,6 +1611,16 @@ def _strip_actions_for_free_tier(shaped: Dict[str, Any]) -> Dict[str, Any]:
             summary["top_actions"] = []
         if isinstance(summary.get("get_cited_moves"), list):
             summary["get_cited_moves"] = []
+        if isinstance(summary.get("winnable_lanes"), list):
+            summary["winnable_lanes"] = []
+        # sku_summaries stay (scores/status) minus their action slice.
+        for sku_summary in summary.get("sku_summaries") or []:
+            if not isinstance(sku_summary, dict):
+                continue
+            if sku_summary.get("action_headline") is not None:
+                sku_summary["action_headline"] = None
+            if isinstance(sku_summary.get("supporting_prompts"), list):
+                sku_summary["supporting_prompts"] = []
 
     for sku in shaped.get("per_sku_reports") or []:
         if not isinstance(sku, dict):
