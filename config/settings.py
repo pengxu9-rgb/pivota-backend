@@ -441,6 +441,53 @@ class Settings(BaseSettings):
         os.getenv("AGENT_ACP_LIVE_MAX_CENTS", "200") or "200"
     )
 
+    # ---- Warm-handoff click lane (Pivota_Warm_Handoff_Click_Lane_Spec_2026-07-22.md) ----
+    # Upgrades the public GET /r attributed redirect from a cold brand link to a PRE-BUILT
+    # cart on the brand's own Shopify checkout, by calling the PIVOTA-Agent gateway's
+    # internal resolve endpoint at click time. Default OFF: flag off is byte-identical to
+    # today's redirect. Any miss (unreachable brand / timeout / error) falls back to the
+    # cold redirect — never a dead end. Cart-build only; never payment, never completion.
+    outbound_warm_handoff_enabled: bool = (
+        os.getenv("OUTBOUND_WARM_HANDOFF_ENABLED", "false").strip().lower() == "true"
+    )
+    outbound_warm_handoff_resolve_url: str = os.getenv(
+        "OUTBOUND_WARM_HANDOFF_RESOLVE_URL",
+        "https://pivota-agent-production.up.railway.app/internal/ucp/warm-handoff/resolve",
+    )
+    # Shared secret for the gateway's internal endpoint (X-Internal-Key). Unset = the
+    # click lane never attempts a warm handoff (fail-closed even with the flag on).
+    outbound_warm_handoff_internal_key: Optional[str] = os.getenv(
+        "OUTBOUND_WARM_HANDOFF_INTERNAL_KEY"
+    )
+    # Canary allowlist of brand domains (comma-separated, e.g. "cosrx.com,skin1004.com").
+    # Non-empty allowlist = ONLY those brands are warm-eligible. Empty allowlist = the
+    # percentage rollout below decides.
+    outbound_warm_handoff_brands_raw: str = os.getenv("OUTBOUND_WARM_HANDOFF_BRANDS", "")
+
+    @property
+    def outbound_warm_handoff_brands(self) -> frozenset:
+        raw = (self.outbound_warm_handoff_brands_raw or "").strip()
+        if not raw:
+            return frozenset()
+        out = set()
+        for b in raw.split(","):
+            host = b.strip().lower().lstrip(".")
+            if host.startswith("www."):
+                host = host[4:]
+            if host:
+                out.add(host)
+        return frozenset(out)
+
+    # Percentage rollout (0-100) used ONLY when the brand allowlist is empty. Assignment
+    # is a stable hash of the redirect token so prefetch + click land in the same bucket.
+    outbound_warm_handoff_rollout_pct: int = int(
+        os.getenv("OUTBOUND_WARM_HANDOFF_ROLLOUT_PCT", "0") or "0"
+    )
+    # Hard ceiling on the gateway resolve call — a shopper is waiting on the 302.
+    outbound_warm_handoff_timeout_seconds: float = float(
+        os.getenv("OUTBOUND_WARM_HANDOFF_TIMEOUT_SECONDS", "2.5") or "2.5"
+    )
+
     # ---- Capability-based checkout gate (Fix Plan A, option (ii)) ----
     # Lets a protocol-capable merchant (a row in pcs_merchant_capabilities) create an
     # order WITHOUT a merchant_psps row — for the protocol/deferred-payment lane only.
