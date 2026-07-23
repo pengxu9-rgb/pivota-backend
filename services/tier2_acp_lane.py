@@ -59,16 +59,42 @@ def _is_acp_test_canary(merchant_id: str, platform: Optional[str]) -> bool:
 logger = logging.getLogger("tier2_acp_lane")
 
 LANE_ACP_IN_CHAT = "acp_in_chat"
+LANE_NATIVE_HANDOFF = "native_handoff"
 LANE_REDIRECT_FLOOR = "redirect_floor"
 
 REASON_ACP_ENABLED = "acp_enabled"
 REASON_NOT_ACP_CAPABLE = "acp_not_capable"
 REASON_KILL_SWITCH_BLOCKED = "kill_switch_blocked"
+REASON_NATIVE_RAIL_AVAILABLE = "native_settlement_rail_available"
+
+
+def _available_native_rail(capability: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+    """The first AVAILABLE non-pivota_psp settlement rail, or None.
+
+    Mid-man routing (2026-07-23): when Pivota cannot (or may not) execute the
+    charge itself, a merchant whose OWN checkout is a verified rail
+    (platform_native / delegated_token, PR #1576) is a strictly better outcome
+    than the cold redirect — the transaction still completes on the merchant's
+    side with Pivota passing it through. pivota_psp is deliberately excluded:
+    that rail IS the charge lane, already ranked above this one.
+    """
+    for rail in capability.get("settlement_rails") or []:
+        if not isinstance(rail, dict):
+            continue
+        if rail.get("rail") == "pivota_psp":
+            continue
+        if rail.get("available") is True:
+            return rail
+    return None
+
+
+def _native_handoff_enabled() -> bool:
+    return bool(getattr(settings, "tier2_native_handoff_enabled", False))
 
 
 @dataclass(frozen=True)
 class AcpLaneDecision:
-    lane: str  # LANE_ACP_IN_CHAT | LANE_REDIRECT_FLOOR
+    lane: str  # LANE_ACP_IN_CHAT | LANE_NATIVE_HANDOFF | LANE_REDIRECT_FLOOR
     reason: str
     merchant_id: str
     protocol: Optional[str]  # "acp" only when lane == LANE_ACP_IN_CHAT
@@ -76,10 +102,16 @@ class AcpLaneDecision:
     psp: Optional[str]
     capability: Dict[str, Any] = field(default_factory=dict)
     kill_switch: Optional[Dict[str, Any]] = None
+    # The settlement rail backing a native_handoff decision (None otherwise).
+    settlement_rail: Optional[Dict[str, Any]] = None
 
     @property
     def is_acp(self) -> bool:
         return self.lane == LANE_ACP_IN_CHAT
+
+    @property
+    def is_native_handoff(self) -> bool:
+        return self.lane == LANE_NATIVE_HANDOFF
 
     def as_dict(self) -> Dict[str, Any]:
         return {
@@ -91,6 +123,7 @@ class AcpLaneDecision:
             "psp": self.psp,
             "capability": self.capability,
             "kill_switch": self.kill_switch,
+            "settlement_rail": self.settlement_rail,
         }
 
 
@@ -111,6 +144,25 @@ async def resolve_acp_lane_decision(
     mid = str(merchant_id or "").strip()
 
     def _redirect(reason: str, *, capability=None, kill_switch=None) -> AcpLaneDecision:
+        # Mid-man three-tier routing: before falling all the way to the cold
+        # redirect, offer the NATIVE HANDOFF when the merchant's own checkout is
+        # an available rail. Flag-dark (TIER2_NATIVE_HANDOFF_ENABLED, default
+        # OFF → byte-identical two-tier behavior). Only ever upgrades decisions
+        # that would have been redirects — the charge lane still outranks it.
+        if _native_handoff_enabled():
+            rail = _available_native_rail(capability or {})
+            if rail is not None:
+                return AcpLaneDecision(
+                    lane=LANE_NATIVE_HANDOFF,
+                    reason=f"{REASON_NATIVE_RAIL_AVAILABLE}:{rail.get('rail')}",
+                    merchant_id=mid,
+                    protocol=None,
+                    platform=(capability or {}).get("platform"),
+                    psp=(capability or {}).get("psp"),
+                    capability=capability or {},
+                    kill_switch=kill_switch,
+                    settlement_rail=rail,
+                )
         return AcpLaneDecision(
             lane=LANE_REDIRECT_FLOOR,
             reason=reason,

@@ -628,6 +628,25 @@ async def create_acp_checkout(
         store_id=req.store_id,
         platform_override=req.platform,
     )
+    if decision.is_native_handoff:
+        # Mid-man three-tier routing (flag-dark, TIER2_NATIVE_HANDOFF_ENABLED):
+        # Pivota cannot/may not charge, but the merchant's OWN checkout is a
+        # verified settlement rail — a strictly better destination than the cold
+        # redirect. Same response shape as the redirect fallback (agents that
+        # only know that shape keep working) plus the rail so a rail-aware agent
+        # can route the buyer to the merchant's native checkout.
+        return {
+            **_redirect_fallback(merchant_id, reason=decision.reason, platform=decision.platform),
+            "status": "requires_native_checkout_handoff",
+            "checkout_source": "native_handoff",
+            "lane": "native_handoff",
+            "settlement_rail": decision.settlement_rail,
+            "message": (
+                "In-chat charge is not available, but this merchant settles on "
+                "their own checkout. Route the buyer there (the transaction "
+                "completes merchant-side; Pivota passes it through)."
+            ),
+        }
     if not decision.is_acp:
         return _redirect_fallback(merchant_id, reason=decision.reason, platform=decision.platform)
 

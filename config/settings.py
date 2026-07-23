@@ -441,6 +441,17 @@ class Settings(BaseSettings):
         os.getenv("AGENT_ACP_LIVE_MAX_CENTS", "200") or "200"
     )
 
+    # ---- Tier-2 native-handoff lane (mid-man routing, 2026-07-23) ----
+    # Three-tier checkout routing: in-chat charge (pivota_psp) > NATIVE HANDOFF
+    # (the transaction completes on the merchant's OWN checkout — platform_native
+    # / delegated_token settlement rails from PR #1576) > redirect floor. Default
+    # OFF: with the flag off the lane decision is byte-identical to the two-tier
+    # charge-or-redirect behavior. Flag ON only changes merchants who would have
+    # hit the redirect floor anyway — the charge lane always outranks it.
+    tier2_native_handoff_enabled: bool = (
+        os.getenv("TIER2_NATIVE_HANDOFF_ENABLED", "false").strip().lower() == "true"
+    )
+
     # ---- Warm-handoff click lane (Pivota_Warm_Handoff_Click_Lane_Spec_2026-07-22.md) ----
     # Upgrades the public GET /r attributed redirect from a cold brand link to a PRE-BUILT
     # cart on the brand's own Shopify checkout, by calling the PIVOTA-Agent gateway's
