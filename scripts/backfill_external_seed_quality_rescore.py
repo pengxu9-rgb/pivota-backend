@@ -35,12 +35,17 @@ one timeout on row 1 silently voided the next 1,320 rows while still reporting
     which would tear the pool down per row and never stop under an alternating
     write/no-write pattern;
   * a write only counts when the snapshot PERSISTED *and* the identity lookup
-    resolved a content_key, so a snapshot written under the fallback merchant
-    (unfindable by the classifier, yet enough to make `_rescored_ids()` skip the
-    product forever) is treated as a no-write and stays resumable;
-  * hard failures and no-writes have SEPARATE breakers — legitimate `quality=False`
-    rows cluster because FETCH is ORDER BY product_key, so sharing one breaker
-    aborted healthy runs and blamed the connection;
+    resolved a content_key. A snapshot written under the FALLBACK merchant is
+    unfindable by the eligibility classifier, so it is booked as a no-write rather
+    than a success. It is NOT auto-resumable: that snapshot row already exists and
+    `_rescored_ids()` filters on rules_version with no merchant filter, so a plain
+    re-run still skips the product — recovering those needs --force;
+  * hard failures and no-writes have SEPARATE breakers with distinct messages, so
+    "nothing is raising but nothing is landing" doesn't send the operator to check
+    the connection when the cause is per-row;
+  * a run-level recycle budget (`_MAX_RECYCLES`) stops an n,n,w pattern from
+    recycling the pool indefinitely — the per-streak guards only bound
+    CONSECUTIVE recycles, and `consec_no_write` resets on any write;
   * progress reports `wrote` / `eligible` / `promoted` separately, so a step-1
     failure is distinguishable from a step-2 one.
 
@@ -148,20 +153,32 @@ async def _rescored_ids() -> set:
 # Bounds for the pool recycle (see _reset_connection).
 _DISCONNECT_TIMEOUT_S = 15
 _CONNECT_TIMEOUT_S = 30
-# A single no-write can be a legitimately bad row; only a RUN of them looks like a
-# poisoned connection. Recycling on every one would tear the pool down per row.
+# A single no-write can be a one-off; only a RUN of them looks like a poisoned
+# connection. Recycling on every one would tear the pool down per row.
 _NO_WRITE_RECYCLE_AFTER = 2
-# Separate breaker for no-writes: legitimate quality=False rows cluster (FETCH is
-# ORDER BY product_key, so same-brand rows are adjacent), so this must be looser
-# than the hard-failure breaker or a healthy run aborts on a bad brand.
-_NO_WRITE_ABORT_AFTER = 25
+# Breaker for no-writes. A no-write is ALWAYS a genuine failure: external_seed_
+# servability sets summary["quality"]=True whenever full_quality_eval returns,
+# regardless of score — a legitimately low-scoring row is quality=True +
+# serving_eligible=False, i.e. a WRITE. quality=False only ever means the insert
+# raised. So this stays tight; it is not absorbing "bad but valid" rows.
+_NO_WRITE_ABORT_AFTER = 8
+# Run-level recycle budget. The per-streak guards above bound CONSECUTIVE
+# recycles, but `consec_no_write` resets on any write — so an n,n,w pattern
+# recycles once every 3 rows forever without ever tripping a breaker (~440
+# teardowns over a 1,322-row batch, each rebuilding min_size connections to a
+# cross-region DB). This is the absolute stop.
+_MAX_RECYCLES = 20
 
 
 async def _public_count(product_keys: list[str]) -> int:
     """How many of these product_keys are currently `public`."""
     row = await database.fetch_one(
         "SELECT count(*) AS n FROM catalog_row_trust "
-        "WHERE product_key = ANY(:product_keys) AND serving_decision = 'public'",
+        "WHERE product_key = ANY(:product_keys) "
+        # catalog_row_trust is keyed (subject_type, subject_key); only 'product'
+        # is written today, but pin it so a future offer/listing row can't skew
+        # either side of the promotion delta.
+        "AND subject_type = 'product' AND serving_decision = 'public'",
         {"product_keys": product_keys},
     )
     return int(dict(row).get("n") or 0) if row else 0
@@ -196,8 +213,14 @@ async def _reset_connection() -> bool:
             pool = getattr(backend, "_pool", None)
             if pool is not None and hasattr(pool, "terminate"):
                 pool.terminate()
-            if backend is not None:
-                backend._pool = None
+                # Load-bearing: PostgresBackend.connect() opens with
+                # `assert self._pool is None` — without this the reconnect dies
+                # with "DatabaseBackend is already running". Kept INSIDE the
+                # terminate branch because the SQLite backend's connect() is a
+                # no-op that never recreates _pool, so nulling it there would
+                # brick every later query on a local dev run.
+                if backend is not None:
+                    backend._pool = None
             database.is_connected = False
         except Exception:  # noqa: BLE001 — best-effort teardown, never raise
             pass
@@ -302,6 +325,7 @@ async def run(
         consec_fail = 0      # hard exceptions in a row
         consec_no_write = 0  # summaries that persisted nothing, in a row
         promoted: list[str] = []  # product_keys that flipped serving_eligible
+        recycles = 0  # run-level pool-recycle budget (see _MAX_RECYCLES)
         trust_wrote = 0
         for i, r in enumerate(todo, 1):
             epid = r["source_product_id"]
@@ -375,6 +399,17 @@ async def run(
                     print(f"  NO-WRITE {epid}: persisted={persisted} "
                           f"identity_resolved={resolved} summary={summary}", flush=True)
                     if consec_no_write >= _NO_WRITE_RECYCLE_AFTER:
+                        # Publish what is already scored BEFORE touching the pool:
+                        # if the reconnect fails, the post-loop flush would run on
+                        # a dead pool, get swallowed, and silently drop every
+                        # promotion this run earned.
+                        trust_wrote += await _flush_trust(promoted)
+                        promoted = []
+                        recycles += 1
+                        if recycles > _MAX_RECYCLES:
+                            print(f"[ABORT] pool recycled {recycles} times — the "
+                                  f"connection is not recovering. {resume}", flush=True)
+                            break
                         if not await _reset_connection():
                             print(f"[ABORT] reconnect failed. {resume}", flush=True)
                             break
@@ -385,6 +420,13 @@ async def run(
                 # A cancelled (timeout) or errored query can leave the shared
                 # connection unusable for every subsequent row — recycle before
                 # continuing so one slow row can't silently void the whole run.
+                trust_wrote += await _flush_trust(promoted)
+                promoted = []
+                recycles += 1
+                if recycles > _MAX_RECYCLES:
+                    print(f"[ABORT] pool recycled {recycles} times — the connection "
+                          f"is not recovering. {resume}", flush=True)
+                    break
                 if not await _reset_connection():
                     print(f"[ABORT] reconnect failed. {resume}", flush=True)
                     break
