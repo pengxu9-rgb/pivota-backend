@@ -27,8 +27,11 @@ class _FakeDB:
         return None
 
     async def fetch_one(self, query, values=None):
-        # _flush_trust reads back how many keys are actually `public`.
-        return {"n": len(self.now_public)}
+        # _flush_trust reads back how many of THESE keys are `public`, before and
+        # after the upsert — so the fake must honour the key filter for the
+        # promotion delta to mean anything.
+        keys = set((values or {}).get("product_keys") or [])
+        return {"n": len(keys & set(self.now_public))}
 
     async def fetch_all(self, query, values=None):
         self._fetch_calls += 1
@@ -168,12 +171,19 @@ def test_dry_run_does_no_writes(monkeypatch):
 
 
 class _ResetSpyDB(_FakeDB):
+    """Counts pool lifecycle calls so the recycle guard can be pinned exactly."""
+
     def __init__(self, rows):
         super().__init__(rows)
-        self.reconnects = 0
+        self.connects = 0
+        self.disconnects = 0
 
     async def connect(self):
-        self.reconnects += 1
+        self.connects += 1
+        return None
+
+    async def disconnect(self):
+        self.disconnects += 1
         return None
 
 
@@ -181,7 +191,7 @@ def test_no_write_summary_is_not_counted_as_ok_and_trips_the_breaker(monkeypatch
     # 6 rows that all return a summary with quality=False (the poisoned-connection
     # signature): none may be promoted, and the breaker must abort rather than
     # grinding the whole batch as fake successes.
-    rows = [_row(f"pk_{i}", f"e_{i}") for i in range(6)]
+    rows = [_row(f"pk_{i}", f"e_{i}") for i in range(bf._NO_WRITE_ABORT_AFTER + 5)]
     db = _ResetSpyDB(rows)
     monkeypatch.setattr(bf, "database", db)
 
@@ -205,8 +215,9 @@ def test_no_write_summary_is_not_counted_as_ok_and_trips_the_breaker(monkeypatch
 
 
 def test_connection_is_recycled_after_a_timeout(monkeypatch):
-    # A per-row timeout must recycle the pool so the NEXT row can still write —
-    # without this, one timeout poisons every remaining row.
+    # A per-row timeout must recycle the pool. run() itself calls connect() once at
+    # startup, so the assertion pins the EXACT count (startup + one recycle) —
+    # `>= 1` would pass even if _reset_connection did nothing at all.
     rows = [_row("pk_slow", "e_slow"), _row("pk_ok", "e_ok")]
     db = _ResetSpyDB(rows)
     monkeypatch.setattr(bf, "database", db)
@@ -226,6 +237,93 @@ def test_connection_is_recycled_after_a_timeout(monkeypatch):
     monkeypatch.setattr(bf, "upsert_catalog_row_trust_many", fake_trust_many)
     asyncio.run(bf.run(apply=True, limit=None, force=True))
 
-    assert db.reconnects >= 1, "a timeout must recycle the connection"
+    assert db.connects == 2, "startup connect + exactly one recycle after the timeout"
+    assert db.disconnects >= 1, "the recycle must actually tear the pool down"
     flushed = [k for chunk in calls for k in chunk]
     assert flushed == ["pk_ok"], "the row after a timeout must still be able to write"
+
+
+def test_no_write_does_not_recycle_on_the_first_occurrence(monkeypatch):
+    # Recycling on EVERY no-write tears the pool down per row; on a cross-region DB
+    # that is seconds each, and an alternating write/no-write pattern would recycle
+    # forever without ever tripping the breaker.
+    rows = [_row("pk_bad", "e_bad"), _row("pk_ok", "e_ok")]
+    db = _ResetSpyDB(rows)
+    monkeypatch.setattr(bf, "database", db)
+
+    async def alternating(*, product_key, **_):
+        if product_key == "pk_bad":
+            return {"quality": False, "serving_eligible": None}
+        return {"quality": True, "serving_eligible": True}
+
+    monkeypatch.setattr(bf, "make_external_seed_servable", alternating)
+
+    async def fake_trust_many(*, db, product_keys, limit=None):
+        return len(product_keys)
+
+    monkeypatch.setattr(bf, "upsert_catalog_row_trust_many", fake_trust_many)
+    asyncio.run(bf.run(apply=True, limit=None, force=True))
+
+    assert db.connects == 1, "a single isolated no-write must NOT recycle the pool"
+
+
+def test_persisted_but_unresolved_identity_is_not_a_write(monkeypatch):
+    # quality=True with serving_eligible=None means the identity lookup failed, so
+    # the snapshot went under the fallback merchant — unfindable by the classifier,
+    # yet _rescored_ids() would mark the product done forever. Must count as a
+    # no-write so a resume can still fix it.
+    rows = [_row("pk_orphan", "e_orphan")]
+    db = _ResetSpyDB(rows)
+    monkeypatch.setattr(bf, "database", db)
+
+    async def orphan(**_):
+        return {"quality": True, "serving_eligible": None}
+
+    monkeypatch.setattr(bf, "make_external_seed_servable", orphan)
+    calls: List[List[str]] = []
+
+    async def fake_trust_many(*, db, product_keys, limit=None):
+        calls.append(list(product_keys))
+        return len(product_keys)
+
+    monkeypatch.setattr(bf, "upsert_catalog_row_trust_many", fake_trust_many)
+    import io, contextlib
+    buf = io.StringIO()
+    with contextlib.redirect_stdout(buf):
+        asyncio.run(bf.run(apply=True, limit=None, force=True))
+    out = buf.getvalue()
+    assert calls == [], "an orphaned snapshot must never be promoted"
+    # The load-bearing assertion: it must be booked as a NO-WRITE, not a write.
+    # Counting it as a write is what let _rescored_ids() skip the product forever.
+    assert "wrote=0" in out and "no_write=1" in out, (
+        f"orphaned snapshot must count as no_write, not wrote. got: {out}")
+
+
+def test_promotion_delta_excludes_already_public_rows(monkeypatch):
+    # The reported number must be a PROMOTION delta, not a post-state count: a row
+    # that was already public going in (possible under --include-eligible) must not
+    # be counted as newly promoted.
+    rows = [_row("pk_new", "e_new"), _row("pk_already", "e_already")]
+    db = _ResetSpyDB(rows)
+    db.now_public = ["pk_already"]  # already public BEFORE the run
+    monkeypatch.setattr(bf, "database", db)
+
+    async def servable(**_):
+        return {"quality": True, "serving_eligible": True}
+
+    monkeypatch.setattr(bf, "make_external_seed_servable", servable)
+
+    async def fake_trust_many(*, db, product_keys, limit=None):
+        # the upsert promotes pk_new; pk_already was public already
+        db.now_public = list(set(db.now_public) | {"pk_new"})
+        return len(product_keys)
+
+    monkeypatch.setattr(bf, "upsert_catalog_row_trust_many", fake_trust_many)
+
+    import io, contextlib
+    buf = io.StringIO()
+    with contextlib.redirect_stdout(buf):
+        asyncio.run(bf.run(apply=True, limit=None, force=True))
+    out = buf.getvalue()
+    assert "PROMOTED to public: 1" in out, (
+        f"must report the delta (1), not the post-state (2). got: {out}")

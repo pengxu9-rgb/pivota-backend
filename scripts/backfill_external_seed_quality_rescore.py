@@ -28,9 +28,21 @@ query on timeout, leaving the shared `databases` connection half-acquired, so ev
 LATER query dies with "Connection is already acquired". Because
 make_external_seed_servable swallows its own errors, those deaths were invisible —
 one timeout on row 1 silently voided the next 1,320 rows while still reporting
-`ok=1322 fail=1`. Two guards now: the pool is recycled after any failure or
-no-write, and progress counts PERSISTED writes (`summary['quality']`) rather than
-"the call didn't raise", so a poisoned run trips the breaker instead of lying.
+`ok=1322 fail=1`. Guards now:
+  * the pool is recycled (BOUNDED — `pool.close()` can itself park on a dead
+    socket, so it is capped and falls back to `terminate()`) after a hard failure,
+    or after `_NO_WRITE_RECYCLE_AFTER` consecutive no-writes — not every no-write,
+    which would tear the pool down per row and never stop under an alternating
+    write/no-write pattern;
+  * a write only counts when the snapshot PERSISTED *and* the identity lookup
+    resolved a content_key, so a snapshot written under the fallback merchant
+    (unfindable by the classifier, yet enough to make `_rescored_ids()` skip the
+    product forever) is treated as a no-write and stays resumable;
+  * hard failures and no-writes have SEPARATE breakers — legitimate `quality=False`
+    rows cluster because FETCH is ORDER BY product_key, so sharing one breaker
+    aborted healthy runs and blamed the connection;
+  * progress reports `wrote` / `eligible` / `promoted` separately, so a step-1
+    failure is distinguishable from a step-2 one.
 
 Designed to run as a Railway job against the INTERNAL DB:
   Dry-run:  python -m scripts.backfill_external_seed_quality_rescore
@@ -133,6 +145,28 @@ async def _rescored_ids() -> set:
     return {dict(r)["pid"] for r in rows}
 
 
+# Bounds for the pool recycle (see _reset_connection).
+_DISCONNECT_TIMEOUT_S = 15
+_CONNECT_TIMEOUT_S = 30
+# A single no-write can be a legitimately bad row; only a RUN of them looks like a
+# poisoned connection. Recycling on every one would tear the pool down per row.
+_NO_WRITE_RECYCLE_AFTER = 2
+# Separate breaker for no-writes: legitimate quality=False rows cluster (FETCH is
+# ORDER BY product_key, so same-brand rows are adjacent), so this must be looser
+# than the hard-failure breaker or a healthy run aborts on a bad brand.
+_NO_WRITE_ABORT_AFTER = 25
+
+
+async def _public_count(product_keys: list[str]) -> int:
+    """How many of these product_keys are currently `public`."""
+    row = await database.fetch_one(
+        "SELECT count(*) AS n FROM catalog_row_trust "
+        "WHERE product_key = ANY(:product_keys) AND serving_decision = 'public'",
+        {"product_keys": product_keys},
+    )
+    return int(dict(row).get("n") or 0) if row else 0
+
+
 async def _reset_connection() -> bool:
     """Recycle the shared `databases` pool after a failed/cancelled query.
 
@@ -146,13 +180,29 @@ async def _reset_connection() -> bool:
     (0 writes, 0 promotions, reported ``ok=1322 fail=1``).
 
     Returns True if the pool is usable again.
+
+    BOUNDED ON PURPOSE: `disconnect()` -> `asyncpg pool.close()` waits for every
+    holder to release and asyncpg's own docs advise wrapping it in a timeout — on
+    a dead socket the release we are recovering from can park forever, which would
+    turn "one slow row" into "the run hangs silently", strictly worse than the bug.
+    So the graceful close is capped and falls back to `pool.terminate()`.
     """
     try:
-        await database.disconnect()
-    except Exception:  # noqa: BLE001 — a dead pool often fails to close cleanly
-        pass
+        await asyncio.wait_for(database.disconnect(), timeout=_DISCONNECT_TIMEOUT_S)
+    except Exception:  # noqa: BLE001 — incl. TimeoutError on a parked close()
+        # Force the pool down without waiting on holders.
+        try:
+            backend = getattr(database, "_backend", None)
+            pool = getattr(backend, "_pool", None)
+            if pool is not None and hasattr(pool, "terminate"):
+                pool.terminate()
+            if backend is not None:
+                backend._pool = None
+            database.is_connected = False
+        except Exception:  # noqa: BLE001 — best-effort teardown, never raise
+            pass
     try:
-        await database.connect()
+        await asyncio.wait_for(database.connect(), timeout=_CONNECT_TIMEOUT_S)
         return True
     except Exception as exc:  # noqa: BLE001
         print(f"  RECONNECT FAILED: {type(exc).__name__}: {str(exc)[:80]}", flush=True)
@@ -169,28 +219,29 @@ async def _flush_trust(product_keys: list[str]) -> int:
     `blocked` until the phase-2d drift cron eventually catches it (proven live
     2026-07-23: 7/7 eligible rows went blocked->public the instant the trust
     upsert ran). Best-effort: a trust failure is logged inside the upserter and
-    never rolls back the score. Returns the number of trust rows the policy
-    Returns how many of those rows are ACTUALLY `public` afterwards."""
+    never rolls back the score.
+
+    Returns the number of rows this flush actually PROMOTED to public — measured
+    as an after-minus-before delta, not a post-state count. The upserter's own
+    return value is policy WRITE ATTEMPTS, and a recomputed row legitimately lands
+    `shadow` (IDENTITY_LIVE_READ_DISABLED when pdp_identity_listing.live_read_enabled
+    is false) or stays `blocked`; reporting attempts as promotions is how a run
+    showed "60 blocked->public" while public did not move at all. A post-state
+    count would also over-report under --include-eligible, where rows can already
+    be public going in.
+    """
     if not product_keys:
         return 0
     try:
+        before = await _public_count(product_keys)
         # Pass limit=len(keys) so the upserter's internal SELECT ... LIMIT (default
         # 5000) can never silently truncate an oversized chunk — self-consistent
         # regardless of --trust-flush-every.
         await upsert_catalog_row_trust_many(
             db=database, product_keys=product_keys, limit=len(product_keys)
         )
-        # The upserter returns policy WRITE ATTEMPTS, not promotions: a recomputed
-        # row can legitimately land `shadow` (e.g. IDENTITY_LIVE_READ_DISABLED when
-        # pdp_identity_listing.live_read_enabled is false) or stay `blocked`.
-        # Reporting attempts as promotions is how a run showed "60 blocked->public"
-        # while public did not move at all. Read the real decision back instead.
-        row = await database.fetch_one(
-            "SELECT count(*) AS n FROM catalog_row_trust "
-            "WHERE product_key = ANY(:product_keys) AND serving_decision = 'public'",
-            {"product_keys": product_keys},
-        )
-        return int(dict(row).get("n") or 0) if row else 0
+        after = await _public_count(product_keys)
+        return max(0, after - before)
     except Exception as exc:  # noqa: BLE001 -- trust flush must never abort the run
         print(f"  TRUST-FLUSH FAIL ({len(product_keys)} keys): "
               f"{type(exc).__name__}: {str(exc)[:80]}", flush=True)
@@ -247,19 +298,29 @@ async def run(
             return
 
         ok = fail = silent = 0
-        consec = 0
+        eligible = 0  # total rows that reached serving_eligible (step 1 succeeded)
+        consec_fail = 0      # hard exceptions in a row
+        consec_no_write = 0  # summaries that persisted nothing, in a row
         promoted: list[str] = []  # product_keys that flipped serving_eligible
         trust_wrote = 0
         for i, r in enumerate(todo, 1):
             epid = r["source_product_id"]
-            if consec >= 5:
-                resume = (
-                    f"Re-run with --offset {offset + i - 1} to resume."
-                    if force
-                    else "Re-run to resume (already-rescored are skipped)."
-                )
-                print(f"[ABORT] {consec} consecutive failures/no-writes — connection "
+            resume = (
+                f"Re-run with --offset {offset + i - 1} to resume."
+                if force
+                else "Re-run to resume (already-rescored are skipped)."
+            )
+            if consec_fail >= 5:
+                print(f"[ABORT] {consec_fail} consecutive hard failures — connection "
                       f"likely dead. {resume}", flush=True)
+                break
+            if consec_no_write >= _NO_WRITE_ABORT_AFTER:
+                # Distinct message: nothing is raising, the writes just aren't
+                # landing. Sending the operator to "check the connection" when the
+                # real cause is per-row data would waste the diagnosis.
+                print(f"[ABORT] {consec_no_write} consecutive rows persisted nothing "
+                      f"(no exceptions raised — check the NO-WRITE summaries above "
+                      f"for the cause, not the connection). {resume}", flush=True)
                 break
             try:
                 qp = build_servable_quality_payload(
@@ -284,43 +345,67 @@ async def run(
                 # authoritative signal: it is only True once the snapshot was
                 # persisted. Counting "didn't raise" is what let a poisoned
                 # connection report ok=1322 while writing nothing.
-                if bool((summary or {}).get("quality")):
+                # A write only counts when the snapshot persisted AND the identity
+                # lookup resolved a content_key. `serving_eligible is None` means
+                # that lookup failed, so the snapshot went under the FALLBACK
+                # merchant — unfindable by the eligibility classifier, yet
+                # _rescored_ids() would mark the product done forever. Treat it as
+                # a no-write so a resume can still fix it.
+                persisted = bool((summary or {}).get("quality"))
+                resolved = (summary or {}).get("serving_eligible") is not None
+                if persisted and resolved:
                     ok += 1
-                    consec = 0
+                    consec_fail = consec_no_write = 0
                     # Only rows that actually became serving_eligible need the
                     # trust flip — a row that stayed below the bar would just
                     # recompute to `blocked` again, so skip the needless work.
-                    if not skip_trust and (summary or {}).get("serving_eligible") is True:
-                        promoted.append(r["product_key"])
+                    if (summary or {}).get("serving_eligible") is True:
+                        eligible += 1
+                        if not skip_trust:
+                            promoted.append(r["product_key"])
                 else:
-                    # Nothing persisted. Almost always a poisoned connection —
-                    # recycle it, and let the breaker trip if it keeps happening
-                    # rather than grinding thousands of silent no-ops.
+                    # Nothing usable persisted. A single one is often just a bad
+                    # row; a RUN of them looks like a poisoned connection — so
+                    # recycle only after a couple in a row rather than tearing the
+                    # pool down per row (which on a cross-region DB costs seconds
+                    # each and, with an alternating write/no-write pattern, would
+                    # never stop).
                     silent += 1
-                    consec += 1
-                    print(f"  NO-WRITE {epid}: summary={summary}", flush=True)
-                    await _reset_connection()
+                    consec_no_write += 1
+                    print(f"  NO-WRITE {epid}: persisted={persisted} "
+                          f"identity_resolved={resolved} summary={summary}", flush=True)
+                    if consec_no_write >= _NO_WRITE_RECYCLE_AFTER:
+                        if not await _reset_connection():
+                            print(f"[ABORT] reconnect failed. {resume}", flush=True)
+                            break
             except Exception as e:  # noqa: BLE001 -- isolate per-product failures
                 fail += 1
-                consec += 1
+                consec_fail += 1
                 print(f"  FAIL {epid}: {type(e).__name__}: {str(e)[:80]}", flush=True)
                 # A cancelled (timeout) or errored query can leave the shared
                 # connection unusable for every subsequent row — recycle before
                 # continuing so one slow row can't silently void the whole run.
-                await _reset_connection()
+                if not await _reset_connection():
+                    print(f"[ABORT] reconnect failed. {resume}", flush=True)
+                    break
             # Flush trust in chunks so a long run promotes durably (and a mid-run
             # abort still publishes everything scored so far).
             if len(promoted) >= trust_flush_every:
                 trust_wrote += await _flush_trust(promoted)
                 promoted = []
             if i % 100 == 0:
-                print(f"  {i}/{len(todo)} wrote={ok} fail={fail} no_write={silent} "
-                      f"now_public={trust_wrote}", flush=True)
+                print(f"  {i}/{len(todo)} wrote={ok} eligible={eligible} "
+                      f"fail={fail} no_write={silent} now_public={trust_wrote}",
+                      flush=True)
         # Flush whatever is left — runs on normal completion AND after an abort break.
         trust_wrote += await _flush_trust(promoted)
         # `wrote` counts PERSISTED snapshots, not calls that merely didn't raise.
-        print(f"\nDONE: wrote={ok} fail={fail} no_write={silent} (of {len(todo)}); "
-              f"rows now PUBLIC after trust upsert: {trust_wrote}")
+        # wrote = persisted snapshots; eligible = reached serving_eligible (step 1);
+        # promoted = actually flipped to public (step 2). Keeping the three apart is
+        # what makes "wrote=1322 eligible=0 promoted=0" diagnosable instead of a
+        # mystery — step-1 and step-2 failures are otherwise indistinguishable.
+        print(f"\nDONE: wrote={ok} eligible={eligible} fail={fail} "
+              f"no_write={silent} (of {len(todo)}); PROMOTED to public: {trust_wrote}")
     finally:
         await database.disconnect()
 
