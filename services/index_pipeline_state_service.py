@@ -251,11 +251,22 @@ def _classify_product(
     merchant_has_active_store = bool(row.get("merchant_has_active_store"))
     merchant_store_retired = merchant_has_store and not merchant_has_active_store
 
+    # --- Row suppression ---
+    # catalog_products.suppressed_at is an editorial withdrawal (e.g. the
+    # demo_retired_2026_07 sweep). A suppressed ROW must never contribute an
+    # eligible state; a content_key whose OTHER rows still serve keeps its
+    # eligibility through those rows (_select_content_key_state prefers the
+    # eligible sibling), so this only flips identities that are fully withdrawn.
+    row_suppressed = row.get("suppressed_at") is not None
+
     # --- Determine blocker (first failing check wins) ---
     blocker_code = "none"
     blocker_detail: Optional[str] = None
 
-    if cp_sync_status and cp_sync_status != "live":
+    if row_suppressed:
+        blocker_code = "suppressed"
+        blocker_detail = "catalog_products.suppressed_at is set (row withdrawn from serving)"
+    elif cp_sync_status and cp_sync_status != "live":
         blocker_code = "not_live"
         blocker_detail = f"catalog_products.sync_status={cp_sync_status!r}"
     elif merchant_store_retired:
@@ -322,6 +333,7 @@ def _classify_product(
     # --- Serving eligibility (all criteria must pass) ---
     serving_eligible = (
         blocker_code == "none"
+        and not row_suppressed
         and cp_sync_status == "live"
         and not merchant_store_retired
         and bool(source_title)
@@ -361,7 +373,8 @@ def _classify_product(
     # predicates plus the non-core exclusion.
     non_core_product = _is_non_core_product(row, seed_title=seed_title)
     index_eligible = (
-        cp_sync_status == "live"
+        not row_suppressed
+        and cp_sync_status == "live"
         and not merchant_store_retired
         and source_document_present
         and bool(source_title)
@@ -492,6 +505,7 @@ _ELIGIBILITY_COLUMNS = f"""
     cp.source_product_id,
     cp.pdp_scope,
     cp.sync_status,
+    cp.suppressed_at,
     cp.canonical_url,
     cp.category_kind,
     pqs.content_quality_score,
@@ -659,6 +673,7 @@ SELECT
     cp.source_product_id,
     cp.pdp_scope,
     cp.sync_status,
+    cp.suppressed_at,
     cp.canonical_url,
     -- SQLite (test) path: placeholder; durable category_kind is read on the
     -- Postgres path. The category-aware disclaimer gate is flag-off in tests.

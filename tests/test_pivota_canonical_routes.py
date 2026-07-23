@@ -30,6 +30,9 @@ def _sitemap_row_eligible(r: Dict[str, Any]) -> bool:
     }
     if not r.get("content_key"):
         return False
+    # Suppressed rows are withdrawn from serving and never advertised.
+    if r.get("suppressed_at") is not None:
+        return False
     index_elig = r.get("index_eligible") is True
     # Merchant gate (mirrors the INNER/LEFT join). merchant_indexable=None models
     # a row with NO catalog_merchants entry (store-less brand): allowed only when
@@ -76,6 +79,7 @@ class FakeDb:
             if (
                 r.get("pivota_signature_id") == sig
                 and r.get("content_key")
+                and r.get("suppressed_at") is None
                 and r.get("serving_eligible") is True
                 and r.get("merchant_indexable", True) is True
                 and r.get("merchant_status", "active") in ("active", "observed")
@@ -186,6 +190,10 @@ def _row(sig_suffix: str, **overrides) -> Dict[str, Any]:
         "pivota_canonical_url": f"https://agent.pivota.cc/products/sig_{sig_suffix}",
         "content_key": f"ck_{sig_suffix}",
         "serving_eligible": True,
+        # Row-grain PDP renderability (approved + live_read_enabled identity
+        # listing). The feed exposes it; it does not filter on it.
+        "renderable": True,
+        "suppressed_at": None,
         "index_eligible": False,
         "blocker_code": None,
         "blocker_detail": None,
@@ -204,7 +212,10 @@ def env(monkeypatch: pytest.MonkeyPatch):
 
     rows = [
         _row("abc"),
-        _row("def", brand="Other Brand"),
+        # Eligible but its PDP would serve the generic shell (no approved
+        # live-read identity listing) — the advertised-but-dead shape. The
+        # feed still lists it, carrying renderable=False for the consumer.
+        _row("def", brand="Other Brand", renderable=False),
         _row("xyz", title="No-image SKU", image_url=None, serving_eligible=False, blocker_code="no_image"),
         _row("noimg", title="Eligible No-image SKU", image_url=None),
         # one row without a sig to confirm the list endpoint filters it out
@@ -241,6 +252,10 @@ def env(monkeypatch: pytest.MonkeyPatch):
             "index_eligible": True,
             "merchant_indexable": False,
         },
+        # Suppressed row (catalog_products.suppressed_at set, e.g. the
+        # demo_retired sweep): withdrawn from serving — excluded from the
+        # list AND 404 on the resolver even though serving_eligible is TRUE.
+        _row("supp", suppressed_at=datetime(2026, 7, 1, tzinfo=timezone.utc)),
     ]
     monkeypatch.setattr(pcr, "database", FakeDb(rows))
 
@@ -388,6 +403,29 @@ def test_list_canonical_pdps_excludes_inactive_merchant(env):
     assert body["total"] == 3
 
 
+def test_list_canonical_pdps_carries_renderable_without_filtering(env):
+    # Option (a) of the dead-PDP fix: the feed EXPOSES renderability so the
+    # sitemap generator can filter, but the endpoint itself does NOT shrink —
+    # existing consumers keep seeing every serving_eligible row.
+    client = env
+    res = client.get("/api/canonical/products")
+    assert res.status_code == 200
+    body = res.json()
+    by_sig = {i["sig_id"]: i for i in body["items"]}
+    assert by_sig["sig_abc"]["renderable"] is True
+    assert by_sig["sig_def"]["renderable"] is False  # listed, flagged dead
+    assert body["total"] == 3
+
+
+def test_suppressed_row_excluded_from_list_and_resolver(env):
+    client = env
+    body = client.get("/api/canonical/products").json()
+    assert "sig_supp" not in [i["sig_id"] for i in body["items"]]
+    assert body["total"] == 3  # suppressed row does not count as advertised
+    res = client.get("/api/canonical/products/sig_supp")
+    assert res.status_code == 404
+
+
 def test_list_canonical_pdps_last_modified_uses_content_changed_at(env):
     client = env
     res = client.get("/api/canonical/products")
@@ -529,6 +567,13 @@ def test_list_canonical_pdps_uses_index_pipeline_state_join(env):
     assert "catalog_products.pivota_signature_id ASC" in sql
     assert "catalog_products.content_key ASC" in sql
     assert "catalog_products.product_key ASC" in sql
+    # Row-grain renderability: correlated EXISTS on the identity listing,
+    # joined on (merchant_id, source_product_id), approved + live-read only.
+    assert "pdp_identity_listing" in sql
+    assert "live_read_enabled IS true" in sql
+    assert "identity_status = 'approved'" in sql
+    # Suppressed rows are withdrawn from the advertised feed.
+    assert "catalog_products.suppressed_at IS NULL" in sql
 
 
 # ---------------------------------------------------------------------------
