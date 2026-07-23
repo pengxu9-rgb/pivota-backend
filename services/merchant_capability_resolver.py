@@ -30,7 +30,10 @@ from db.database import database
 from db.merchant_onboarding import get_merchant_onboarding
 from services.merchant_psp_config_service import evaluate_psp_readiness
 from services.merchant_store_service import get_merchant_active_stores, get_primary_store
-from services.platform_capabilities import get_platform_protocols_for_store
+from services.platform_capabilities import (
+    get_platform_protocols_for_store,
+    get_platform_settlement_rails,
+)
 
 logger = logging.getLogger("merchant_capability_resolver")
 
@@ -123,6 +126,41 @@ async def _resolve_live_psp_provider(merchant_id: str) -> Optional[str]:
     return None
 
 
+async def _resolve_native_payments_fact(
+    merchant_id: str,
+) -> tuple[Optional[bool], Optional[Any]]:
+    """(has_shopify_payments, last_checked_at) from pcs_merchant_capabilities.
+
+    The Shopify integration verify has been collecting this fact all along
+    (services/shopify_integration_verify.py) — it is the literal "this merchant
+    can settle on their own platform checkout" signal — but until the settlement
+    rails no gate ever read it. Returns (None, None) when the merchant never went
+    through the verify or the read fails (best-effort; unknown is never yes).
+    `last_checked_at` rides along as fact provenance: a verified TRUE can go
+    stale, so consumers get the timestamp rather than blind trust.
+    """
+    merchant_value = str(merchant_id or "").strip()
+    if not merchant_value:
+        return None, None
+    try:
+        row = await database.fetch_one(
+            "SELECT has_shopify_payments, last_checked_at "
+            "FROM pcs_merchant_capabilities "
+            "WHERE merchant_id = :merchant_id",
+            {"merchant_id": merchant_value},
+        )
+    except Exception as exc:  # noqa: BLE001 — resolver must not break on pcs read
+        logger.warning(
+            "capability_resolver: pcs native-payments lookup failed merchant_id=%s: %s",
+            merchant_value, str(exc)[:200],
+        )
+        return None, None
+    if row is None:
+        return None, None
+    record = dict(row)
+    return bool(record.get("has_shopify_payments")), record.get("last_checked_at")
+
+
 async def _select_target_store(
     merchant_id: str,
     *,
@@ -191,6 +229,8 @@ async def resolve_merchant_capability(
             "psp": None,
             "has_live_psp": False,
             "protocols": [],
+            "has_native_payments": None,
+            "settlement_rails": [],
         }
 
     store = await _select_target_store(
@@ -207,6 +247,8 @@ async def resolve_merchant_capability(
             "psp": None,
             "has_live_psp": False,
             "protocols": [],
+            "has_native_payments": None,
+            "settlement_rails": [],
             "store_selector": {
                 "store_id": str(store_id or "").strip() or None,
                 "platform": str(platform_override or "").strip().lower() or None,
@@ -244,6 +286,31 @@ async def resolve_merchant_capability(
         platform, store, has_live_psp=has_live_psp
     )
 
+    # Settlement rails (mid-man alignment): the merchant-side rails a transaction
+    # can pass through on, orthogonal to the agent-side door. `protocols` above is
+    # UNCHANGED (the in-chat charge router's gate); rails are the wider truthful
+    # answer, including the merchant's OWN checkout (has_shopify_payments — a fact
+    # the Shopify verify collects and, before this, nothing consumed).
+    #
+    # The pcs read is PLATFORM-GATED to shopify: pcs rows can exist for
+    # non-Shopify merchants (dark-provision script has no platform gate; a
+    # Shopify→Wix migration leaves a stale row), and has_shopify_payments only
+    # means anything for a Shopify storefront. Gating also skips the extra DB
+    # round-trip on the live /acp decision path for every non-Shopify resolve.
+    has_native_payments: Optional[bool] = None
+    native_payments_as_of: Optional[Any] = None
+    if platform == "shopify":
+        has_native_payments, native_payments_as_of = (
+            await _resolve_native_payments_fact(merchant_id)
+        )
+    settlement_rails = get_platform_settlement_rails(
+        platform,
+        store,
+        has_live_psp=has_live_psp,
+        has_native_payments=has_native_payments,
+        native_payments_as_of=native_payments_as_of,
+    )
+
     result: Dict[str, Any] = {
         "merchant_id": merchant_id,
         "platform": platform or PLATFORM_SOURCE_UNKNOWN,
@@ -251,6 +318,8 @@ async def resolve_merchant_capability(
         "psp": live_psp,
         "has_live_psp": has_live_psp,
         "protocols": protocols,
+        "has_native_payments": has_native_payments,
+        "settlement_rails": settlement_rails,
     }
     if selector_requested:
         result["store_selector"] = {

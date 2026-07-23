@@ -206,6 +206,144 @@ def get_platform_protocols_for_store(
     return protocols
 
 
+# --- Settlement rails (mid-man alignment, 2026-07-23) --------------------------
+#
+# Founder-set frame: Pivota is a MID-MAN — it passes transactions and rich data
+# through protocols between agents and merchant offers; it is never buyer, seller,
+# merchant-of-record, or a custodian of funds. Under that frame the agent-side
+# protocol (which door the agent came through: MCP / ACP REST / UCP) is ORTHOGONAL
+# to the merchant-side settlement rail (how the money actually settles). The
+# legacy `protocols[]` matrix above conflates the two: it defines "protocol
+# capable" as "handed Pivota a chargeable PSP key" (`requires_active_psp`), which
+# is the LEAST mid-man rail and structurally excludes merchants who can settle on
+# their own infrastructure.
+#
+# The rails, most- to least-aligned with the mid-man thesis:
+#   platform_native  — the transaction completes on the merchant's OWN platform
+#                      checkout (e.g. Shopify Payments). Merchant gives Pivota
+#                      nothing. Signal: pcs_merchant_capabilities.has_shopify_
+#                      payments (collected by the Shopify verify, previously read
+#                      by nothing).
+#   delegated_token  — the transaction completes on the merchant's OWN native
+#                      agentic endpoint (e.g. their Shopify UCP server) under a
+#                      delegated payment authorization. Merchant gives Pivota
+#                      nothing. No stored reachability signal exists yet, so this
+#                      rail is modeled but never `available` until a probe feeds
+#                      it — honest, like every other gate in this module.
+#   pivota_psp       — Pivota executes the charge on PSP keys the merchant handed
+#                      over (today's ONLY wired mode; the Tier-2 ACP lane).
+#                      Correct as a fallback for merchants with no other rail,
+#                      wrong as the definition of protocol readiness.
+#
+# `get_platform_protocols*` above is UNCHANGED and still answers the narrower
+# question the in-chat charge router asks ("can Pivota itself settle this?").
+# This function answers the mid-man question: on which rails can a transaction
+# PASS THROUGH to this merchant, and is each rail usable with current facts?
+SETTLEMENT_PIVOTA_PSP = "pivota_psp"
+SETTLEMENT_PLATFORM_NATIVE = "platform_native"
+SETTLEMENT_DELEGATED_TOKEN = "delegated_token"
+
+# Platforms with a wired Pivota-side charge connector (the pivota-acp lane).
+_PIVOTA_PSP_CONNECTOR_PLATFORMS = frozenset({"shopify", "wix"})
+# Platforms whose merchants can expose a native agentic endpoint today.
+_DELEGATED_ENDPOINT_PLATFORMS = frozenset({"shopify"})
+
+
+def get_platform_settlement_rails(
+    platform: str | None,
+    store: Dict[str, Any] | None = None,
+    *,
+    has_live_psp: bool,
+    has_native_payments: bool | None = None,
+    native_payments_as_of: Any = None,
+    native_endpoint_reachable: bool = False,
+) -> list[Dict[str, Any]]:
+    """Truthful settlement rails for a merchant on `platform`.
+
+    Each rail: ``{"rail", "available", "requirement", "protocol_scope"}`` plus,
+    where meaningful, fact provenance (``source``/``as_of``) and the ``store_id``
+    the rail was resolved against. A rail is listed when the platform supports it
+    AT ALL, and ``available`` only when current facts satisfy its requirement —
+    `None` facts (unknown) are never treated as yes.
+
+    Contract notes (set now, while there are zero consumers):
+      * ``protocol_scope`` — which agent-side protocol lane can DRIVE this rail
+        for autonomous completion. Empty = door-agnostic (a handoff rail any
+        door can route to; the buyer completes on the merchant's checkout).
+      * ``as_of`` — when the underlying fact was last verified. A verified fact
+        can go stale (merchant later disables Shopify Payments); consumers apply
+        their own freshness floor rather than trusting `available` blindly.
+      * ``store_id`` — the Wix pivota_psp rail is per-store; ambiguous for
+        multi-store merchants without it.
+
+    `has_native_payments` is the pcs_merchant_capabilities.has_shopify_payments
+    fact (None = merchant never went through the Shopify verify). `store` matters
+    only for the Wix per-store pivota_psp gate, mirroring
+    `get_platform_protocols_for_store`.
+    """
+    key = str(platform or "").strip().lower()
+    rails: list[Dict[str, Any]] = []
+    if not key or key == "unknown":
+        return rails
+
+    caps = get_store_platform_capabilities(key)
+
+    if key in _PIVOTA_PSP_CONNECTOR_PLATFORMS:
+        chargeable = bool(
+            get_platform_protocols_for_store(key, store, has_live_psp=has_live_psp)
+        )
+        rail: Dict[str, Any] = {
+            "rail": SETTLEMENT_PIVOTA_PSP,
+            "available": chargeable,
+            "requirement": (
+                "live_charge_ready_psp_and_store_order_writeback_enabled"
+                if key == "wix"
+                else "live_charge_ready_psp"
+            ),
+            "protocol_scope": [PROTOCOL_ACP],
+        }
+        if key == "wix":
+            store_id = str((store or {}).get("store_id") or "").strip()
+            rail["store_id"] = store_id or None
+        rails.append(rail)
+
+    if caps.supports_platform_checkout:
+        if key == "shopify":
+            rails.append({
+                "rail": SETTLEMENT_PLATFORM_NATIVE,
+                # Strict identity check on purpose: only a verified TRUE fact
+                # lights the rail — unknown (None) and any truthy-non-True
+                # value are treated as not-verified.
+                "available": has_native_payments is True,
+                "requirement": "shopify_payments_verified_on_merchant_store",
+                # Door-agnostic handoff: any agent-side door can route to the
+                # merchant's own checkout; the buyer completes there.
+                "protocol_scope": [],
+                "source": "pcs_shopify_verify",
+                "as_of": native_payments_as_of,
+            })
+        else:
+            # WooCommerce / BigCommerce declare platform checkout support but
+            # per the matrix above still require external validation — no stored
+            # per-merchant fact exists, so the rail is listed and honestly dark.
+            rails.append({
+                "rail": SETTLEMENT_PLATFORM_NATIVE,
+                "available": False,
+                "requirement": caps.purchase_requirement,
+                "protocol_scope": [],
+            })
+
+    if key in _DELEGATED_ENDPOINT_PLATFORMS:
+        rails.append({
+            "rail": SETTLEMENT_DELEGATED_TOKEN,
+            "available": bool(native_endpoint_reachable),
+            "requirement": "merchant_native_agentic_endpoint_reachable_no_stored_signal_yet",
+            "protocol_scope": [PROTOCOL_UCP],
+        })
+
+    return rails
+
+
 def get_store_platform_capabilities(platform: str | None) -> StorePlatformCapabilities:
     key = str(platform or "").strip().lower()
     return _CAPABILITIES.get(
