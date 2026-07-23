@@ -19,9 +19,10 @@ on:
         default: "3"
         type: string
   schedule:
-    # Weekly, Monday 09:11 UTC. Auto-applies: the whole point is self-healing new
-    # mispriced ingest. The corrector is conservative (writes only when the store's
-    # real currency is KNOWN and DIFFERS). Change the apply flag below to gate it.
+    # Weekly, Monday 09:11 UTC. DRY-RUN ONLY — detects drift (new mispriced-ingest
+    # domains) and uploads the report; it never writes. base-currency != a US
+    # Markets buyer's price, so a human reviews the by-domain report and runs the
+    # workflow_dispatch with apply=true for any writes.
     - cron: "11 9 * * 1"
 
 concurrency:
@@ -58,9 +59,10 @@ jobs:
             echo "DATABASE_URL secret is required" >&2
             exit 1
           fi
-          # scheduled runs apply (self-heal); manual runs honor the apply input.
+          # scheduled runs are dry-run ONLY (detect drift); writes require an
+          # explicit workflow_dispatch with apply=true.
           apply_flag=""
-          if [[ "${{ github.event_name }}" == "schedule" || "${{ inputs.apply }}" == "true" ]]; then
+          if [[ "${{ github.event_name }}" == "workflow_dispatch" && "${{ inputs.apply }}" == "true" ]]; then
             apply_flag="--apply"
           fi
           min_offers="${{ inputs.min_offers || '3' }}"
