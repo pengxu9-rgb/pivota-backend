@@ -18,12 +18,17 @@ class _FakeDB:
     def __init__(self, rows: List[Dict[str, Any]]):
         self._rows = rows
         self._fetch_calls = 0
+        self.now_public: List[str] = []
 
     async def connect(self):  # noqa: D401
         return None
 
     async def disconnect(self):
         return None
+
+    async def fetch_one(self, query, values=None):
+        # _flush_trust reads back how many keys are actually `public`.
+        return {"n": len(self.now_public)}
 
     async def fetch_all(self, query, values=None):
         self._fetch_calls += 1
@@ -46,7 +51,9 @@ def _install(monkeypatch, rows, *, eligible_keys):
     monkeypatch.setattr(bf, "database", _FakeDB(rows))
 
     async def fake_servable(*, product_key, seed_id, source_product_id, quality_payload, reason):
-        return {"serving_eligible": product_key in eligible_keys}
+        # `quality=True` models a persisted snapshot — the script now treats it as
+        # the authoritative "this write landed" signal.
+        return {"quality": True, "serving_eligible": product_key in eligible_keys}
 
     monkeypatch.setattr(bf, "make_external_seed_servable", fake_servable)
 
@@ -91,7 +98,7 @@ def test_abort_still_flushes_pre_abort_promotions(monkeypatch):
 
     async def flaky_servable(*, product_key, **_):
         if product_key == "pk_ok":
-            return {"serving_eligible": True}
+            return {"quality": True, "serving_eligible": True}
         raise RuntimeError("dead socket")
 
     monkeypatch.setattr(bf, "make_external_seed_servable", flaky_servable)
@@ -116,7 +123,8 @@ def test_none_serving_eligible_is_not_promoted(monkeypatch):
     monkeypatch.setattr(bf, "database", _FakeDB(rows))
 
     async def servable(*, product_key, **_):
-        return {"serving_eligible": None if product_key == "pk_none" else True}
+        return {"quality": True,
+                "serving_eligible": None if product_key == "pk_none" else True}
 
     monkeypatch.setattr(bf, "make_external_seed_servable", servable)
     calls: List[List[str]] = []
@@ -150,3 +158,74 @@ def test_dry_run_does_no_writes(monkeypatch):
     monkeypatch.setattr(bf, "make_external_seed_servable", fail_servable)
     asyncio.run(bf.run(apply=False, limit=None, force=True))
     assert calls == [], "dry-run must not touch trust"
+
+
+# ---- connection-poisoning guards (2026-07-23 defect) -----------------------------
+# A wait_for timeout cancels the in-flight query and leaves the shared `databases`
+# connection half-acquired; make_external_seed_servable then swallows every later
+# failure and returns a summary with nothing written. One timeout silently voided
+# 1,320 rows while reporting ok=1322. These lock both guards.
+
+
+class _ResetSpyDB(_FakeDB):
+    def __init__(self, rows):
+        super().__init__(rows)
+        self.reconnects = 0
+
+    async def connect(self):
+        self.reconnects += 1
+        return None
+
+
+def test_no_write_summary_is_not_counted_as_ok_and_trips_the_breaker(monkeypatch, capsys):
+    # 6 rows that all return a summary with quality=False (the poisoned-connection
+    # signature): none may be promoted, and the breaker must abort rather than
+    # grinding the whole batch as fake successes.
+    rows = [_row(f"pk_{i}", f"e_{i}") for i in range(6)]
+    db = _ResetSpyDB(rows)
+    monkeypatch.setattr(bf, "database", db)
+
+    async def no_write_servable(**_):
+        return {"quality": False, "serving_eligible": None}
+
+    monkeypatch.setattr(bf, "make_external_seed_servable", no_write_servable)
+    calls: List[List[str]] = []
+
+    async def fake_trust_many(*, db, product_keys, limit=None):
+        calls.append(list(product_keys))
+        return len(product_keys)
+
+    monkeypatch.setattr(bf, "upsert_catalog_row_trust_many", fake_trust_many)
+    asyncio.run(bf.run(apply=True, limit=None, force=True))
+
+    out = capsys.readouterr().out
+    assert "wrote=0" in out, "a no-write summary must NOT count as a successful write"
+    assert "ABORT" in out, "consecutive no-writes must trip the circuit breaker"
+    assert calls == [], "nothing persisted -> nothing promoted"
+
+
+def test_connection_is_recycled_after_a_timeout(monkeypatch):
+    # A per-row timeout must recycle the pool so the NEXT row can still write —
+    # without this, one timeout poisons every remaining row.
+    rows = [_row("pk_slow", "e_slow"), _row("pk_ok", "e_ok")]
+    db = _ResetSpyDB(rows)
+    monkeypatch.setattr(bf, "database", db)
+
+    async def flaky(*, product_key, **_):
+        if product_key == "pk_slow":
+            raise asyncio.TimeoutError()
+        return {"quality": True, "serving_eligible": True}
+
+    monkeypatch.setattr(bf, "make_external_seed_servable", flaky)
+    calls: List[List[str]] = []
+
+    async def fake_trust_many(*, db, product_keys, limit=None):
+        calls.append(list(product_keys))
+        return len(product_keys)
+
+    monkeypatch.setattr(bf, "upsert_catalog_row_trust_many", fake_trust_many)
+    asyncio.run(bf.run(apply=True, limit=None, force=True))
+
+    assert db.reconnects >= 1, "a timeout must recycle the connection"
+    flushed = [k for chunk in calls for k in chunk]
+    assert flushed == ["pk_ok"], "the row after a timeout must still be able to write"
