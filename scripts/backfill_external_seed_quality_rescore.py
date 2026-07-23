@@ -139,8 +139,11 @@ async def _flush_trust(product_keys: list[str]) -> int:
     if not product_keys:
         return 0
     try:
+        # Pass limit=len(keys) so the upserter's internal SELECT ... LIMIT (default
+        # 5000) can never silently truncate an oversized chunk — self-consistent
+        # regardless of --trust-flush-every.
         return await upsert_catalog_row_trust_many(
-            db=database, product_keys=product_keys
+            db=database, product_keys=product_keys, limit=len(product_keys)
         )
     except Exception as exc:  # noqa: BLE001 -- trust flush must never abort the run
         print(f"  TRUST-FLUSH FAIL ({len(product_keys)} keys): "

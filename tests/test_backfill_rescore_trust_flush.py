@@ -52,7 +52,7 @@ def _install(monkeypatch, rows, *, eligible_keys):
 
     calls: List[List[str]] = []
 
-    async def fake_trust_many(*, db, product_keys):
+    async def fake_trust_many(*, db, product_keys, limit=None):
         keys = list(product_keys)
         calls.append(keys)
         return len(keys)
@@ -80,6 +80,55 @@ def test_trust_flush_chunks_and_final_flush(monkeypatch):
     # 5 eligible with flush-every=2 -> chunks [2, 2] mid-loop + [1] final flush.
     assert [len(c) for c in calls] == [2, 2, 1]
     assert sum(len(c) for c in calls) == 5
+
+
+def test_abort_still_flushes_pre_abort_promotions(monkeypatch):
+    # 1 eligible row, then 5 consecutive failures trip the circuit breaker. The
+    # pre-abort promotion MUST still be published by the post-loop final flush —
+    # the docstring's core guarantee.
+    rows = [_row("pk_ok", "e_ok")] + [_row(f"pk_fail_{i}", f"e_fail_{i}") for i in range(6)]
+    monkeypatch.setattr(bf, "database", _FakeDB(rows))
+
+    async def flaky_servable(*, product_key, **_):
+        if product_key == "pk_ok":
+            return {"serving_eligible": True}
+        raise RuntimeError("dead socket")
+
+    monkeypatch.setattr(bf, "make_external_seed_servable", flaky_servable)
+    calls: List[List[str]] = []
+
+    async def fake_trust_many(*, db, product_keys, limit=None):
+        calls.append(list(product_keys))
+        return len(product_keys)
+
+    monkeypatch.setattr(bf, "upsert_catalog_row_trust_many", fake_trust_many)
+
+    asyncio.run(bf.run(apply=True, limit=None, force=True))
+    flushed = [k for chunk in calls for k in chunk]
+    assert flushed == ["pk_ok"], "pre-abort promotion must survive the circuit-breaker break"
+
+
+def test_none_serving_eligible_is_not_promoted(monkeypatch):
+    # make_external_seed_servable returns serving_eligible=None when content_key is
+    # missing / recompute was skipped. `is True` must exclude it (locks the gate
+    # against a loosened truthy check).
+    rows = [_row("pk_none", "e_none"), _row("pk_true", "e_true")]
+    monkeypatch.setattr(bf, "database", _FakeDB(rows))
+
+    async def servable(*, product_key, **_):
+        return {"serving_eligible": None if product_key == "pk_none" else True}
+
+    monkeypatch.setattr(bf, "make_external_seed_servable", servable)
+    calls: List[List[str]] = []
+
+    async def fake_trust_many(*, db, product_keys, limit=None):
+        calls.append(list(product_keys))
+        return len(product_keys)
+
+    monkeypatch.setattr(bf, "upsert_catalog_row_trust_many", fake_trust_many)
+    asyncio.run(bf.run(apply=True, limit=None, force=True))
+    flushed = [k for chunk in calls for k in chunk]
+    assert flushed == ["pk_true"], "serving_eligible=None must not be promoted"
 
 
 def test_skip_trust_does_no_trust_calls(monkeypatch):
