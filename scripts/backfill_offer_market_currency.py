@@ -93,6 +93,7 @@ _UPDATE_OFFERS_SQL = """
                     (SELECT nullif(btrim(eps.domain), '') FROM external_product_seeds eps
                      WHERE eps.attached_product_key = o.product_key
                      ORDER BY eps.updated_at DESC LIMIT 1)) = :domain
+    RETURNING o.offer_id
 """
 
 
@@ -145,10 +146,12 @@ async def _run(args: argparse.Namespace) -> int:
 
         written = 0
         for c in corrections:
-            n = await database.execute(_UPDATE_OFFERS_SQL, {
+            # RETURNING + fetch_all: database.execute() yields None for an
+            # UPDATE without RETURNING, so counting its result reports 0.
+            updated = await database.fetch_all(_UPDATE_OFFERS_SQL, {
                 "cur": c["true_currency"], "mkt": c["true_market"] or "US",
                 "sources": list(_SEED_SOURCES), "domain": c["domain"]})
-            got = int(n or 0)
+            got = len(updated)
             written += got
             print(f"  relabelled {c['domain']}: {got} offers -> {c['true_currency']}", flush=True)
         print(f"\nAPPLIED: offers_relabelled={written}")
