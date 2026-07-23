@@ -88,8 +88,13 @@ def _available_native_rail(capability: Dict[str, Any]) -> Optional[Dict[str, Any
     return None
 
 
-def _native_handoff_enabled() -> bool:
-    return bool(getattr(settings, "tier2_native_handoff_enabled", False))
+def _native_handoff_allowed(merchant_id: str) -> bool:
+    """Flag + optional per-merchant allowlist (staged rollout, mirroring the
+    charge canary's convention: a non-empty allowlist narrows; empty = all)."""
+    if not bool(getattr(settings, "tier2_native_handoff_enabled", False)):
+        return False
+    allowlist = getattr(settings, "tier2_native_handoff_merchants", frozenset())
+    return not allowlist or merchant_id in allowlist
 
 
 @dataclass(frozen=True)
@@ -149,7 +154,7 @@ async def resolve_acp_lane_decision(
         # an available rail. Flag-dark (TIER2_NATIVE_HANDOFF_ENABLED, default
         # OFF → byte-identical two-tier behavior). Only ever upgrades decisions
         # that would have been redirects — the charge lane still outranks it.
-        if _native_handoff_enabled():
+        if _native_handoff_allowed(mid):
             rail = _available_native_rail(capability or {})
             if rail is not None:
                 return AcpLaneDecision(

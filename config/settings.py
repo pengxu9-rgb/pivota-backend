@@ -451,6 +451,20 @@ class Settings(BaseSettings):
     tier2_native_handoff_enabled: bool = (
         os.getenv("TIER2_NATIVE_HANDOFF_ENABLED", "false").strip().lower() == "true"
     )
+    # Staged-rollout allowlist mirroring the charge canary's convention: when
+    # non-empty, only listed merchants route to the native handoff (the global
+    # flag alone would move every rail-bearing merchant at once). Empty = no
+    # narrowing once the flag is on.
+    tier2_native_handoff_merchants_raw: str = os.getenv(
+        "TIER2_NATIVE_HANDOFF_MERCHANTS", ""
+    )
+
+    @property
+    def tier2_native_handoff_merchants(self) -> frozenset:
+        raw = (self.tier2_native_handoff_merchants_raw or "").strip()
+        if not raw:
+            return frozenset()
+        return frozenset(m.strip() for m in raw.split(",") if m.strip())
 
     # ---- Warm-handoff click lane (Pivota_Warm_Handoff_Click_Lane_Spec_2026-07-22.md) ----
     # Upgrades the public GET /r attributed redirect from a cold brand link to a PRE-BUILT

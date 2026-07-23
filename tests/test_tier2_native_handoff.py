@@ -129,3 +129,70 @@ async def test_capability_error_still_falls_to_redirect(monkeypatch):
     monkeypatch.setattr(settings, "tier2_native_handoff_enabled", True, raising=False)
     d = await resolve_acp_lane_decision("merch_x")
     assert d.lane == LANE_REDIRECT_FLOOR
+
+
+@pytest.mark.asyncio
+async def test_merchant_allowlist_narrows_the_handoff(monkeypatch):
+    # Staged rollout: with a non-empty allowlist, only listed merchants get the
+    # handoff; everyone else keeps the exact redirect behavior.
+    _patch(monkeypatch, _cap([], [_NATIVE_RAIL]))
+    monkeypatch.setattr(settings, "tier2_native_handoff_merchants_raw", "merch_other", raising=False)
+    d = await resolve_acp_lane_decision("merch_x")
+    assert d.lane == LANE_REDIRECT_FLOOR
+
+    monkeypatch.setattr(settings, "tier2_native_handoff_merchants_raw", "merch_x,merch_other", raising=False)
+    d2 = await resolve_acp_lane_decision("merch_x")
+    assert d2.lane == LANE_NATIVE_HANDOFF
+
+
+# --- route layer: the /acp response contract for the handoff branch -----------
+
+
+class _Ctx:
+    def can_access_merchant(self, merchant_id):
+        return True
+
+
+def _acp_req():
+    from routes.agent_checkout_intents import CreateAcpCheckoutRequest, CheckoutIntentItem
+
+    return CreateAcpCheckoutRequest(
+        items=[CheckoutIntentItem(product_id="p1", merchant_id="merch_x", sku="SKU1", quantity=1)],
+    )
+
+
+@pytest.mark.asyncio
+async def test_route_handoff_response_shape_sanitized_with_fallback(monkeypatch):
+    from routes import agent_checkout_intents as m
+    from services.tier2_acp_lane import AcpLaneDecision, LANE_NATIVE_HANDOFF
+
+    dirty_rail = {
+        **_NATIVE_RAIL,
+        "source": "pcs_shopify_verify",   # internal provenance — must not leak
+        "internal_debug": "secret",        # future internal field — must not leak
+    }
+
+    async def fake_decision(mid, *, store_id=None, platform_override=None):
+        return AcpLaneDecision(
+            lane=LANE_NATIVE_HANDOFF,
+            reason="native_settlement_rail_available:platform_native",
+            merchant_id="merch_x", protocol=None, platform="shopify", psp=None,
+            settlement_rail=dirty_rail,
+        )
+
+    monkeypatch.setattr(m, "resolve_acp_lane_decision", fake_decision)
+    out = await m.create_acp_checkout(_acp_req(), _Ctx())
+
+    assert out["status"] == "requires_native_checkout_handoff"
+    assert out["lane"] == "native_handoff"
+    assert out["checkout_source"] == "native_handoff"
+    # Whitelisted projection only — internal fields never auto-leak.
+    assert set(out["settlement_rail"].keys()) == {
+        "rail", "available", "requirement", "protocol_scope", "as_of"
+    }
+    assert "internal_debug" not in out["settlement_rail"]
+    assert "source" not in out["settlement_rail"]
+    # "Never a dead end": the actionable redirect floor rides along explicitly.
+    assert out["fallback"]["status"] == "requires_redirect_floor"
+    assert out["fallback"]["lane"] == "redirect_floor"
+    assert "external-platform" in out["fallback"]["message"]

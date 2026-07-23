@@ -632,19 +632,37 @@ async def create_acp_checkout(
         # Mid-man three-tier routing (flag-dark, TIER2_NATIVE_HANDOFF_ENABLED):
         # Pivota cannot/may not charge, but the merchant's OWN checkout is a
         # verified settlement rail — a strictly better destination than the cold
-        # redirect. Same response shape as the redirect fallback (agents that
-        # only know that shape keep working) plus the rail so a rail-aware agent
-        # can route the buyer to the merchant's native checkout.
+        # redirect for a rail-aware agent.
+        rail = decision.settlement_rail or {}
+        # Whitelisted projection: only these fields go to an external agent —
+        # future internal fields on the rail must opt in, never auto-leak.
+        rail_public = {
+            k: rail.get(k)
+            for k in ("rail", "available", "requirement", "protocol_scope", "as_of")
+        }
+        redirect = _redirect_fallback(
+            merchant_id, reason=decision.reason, platform=decision.platform
+        )
         return {
-            **_redirect_fallback(merchant_id, reason=decision.reason, platform=decision.platform),
+            **redirect,
             "status": "requires_native_checkout_handoff",
             "checkout_source": "native_handoff",
             "lane": "native_handoff",
-            "settlement_rail": decision.settlement_rail,
+            "settlement_rail": rail_public,
+            # "Never a dead end": an agent that cannot act on the rail must still
+            # have the actionable redirect floor — carried explicitly instead of
+            # being overridden away.
+            "fallback": {
+                "status": redirect["status"],
+                "lane": redirect["lane"],
+                "message": redirect["message"],
+            },
             "message": (
                 "In-chat charge is not available, but this merchant settles on "
-                "their own checkout. Route the buyer there (the transaction "
-                "completes merchant-side; Pivota passes it through)."
+                "their own checkout — route the buyer there (the transaction "
+                "completes merchant-side; Pivota passes it through). If you "
+                "cannot act on settlement_rail, use `fallback` (the standard "
+                "redirect floor)."
             ),
         }
     if not decision.is_acp:
