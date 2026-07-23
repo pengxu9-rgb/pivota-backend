@@ -30,6 +30,7 @@ from services.llm_synthesis import (
     MissingLLMKeyError,
     configured_key_for_provider,
     default_model_for_provider,
+    provider_available,
     normalize_provider,
     synthesize,
 )
@@ -1091,7 +1092,7 @@ def _resolve_brief_provider(provider: Optional[str]) -> Optional[str]:
         if canonical in seen:
             continue
         seen.add(canonical)
-        if configured_key_for_provider(canonical):
+        if provider_available(canonical):
             return canonical
     return None
 

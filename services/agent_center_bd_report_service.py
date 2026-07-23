@@ -2369,10 +2369,11 @@ def _resolve_extractor_provider() -> Tuple[Optional[str], Optional[str]]:
             configured_key_for_provider,
             default_model_for_provider,
             normalize_provider,
+            provider_available,
         )
         try:
             canonical = normalize_provider(explicit)
-            if configured_key_for_provider(canonical):
+            if provider_available(canonical):
                 return canonical, override_model or default_model_for_provider(canonical)
         except LLMSynthesisError:
             pass
@@ -11125,6 +11126,7 @@ def _strategic_brief_live_probe_enabled() -> bool:
         LLMSynthesisError,
         configured_key_for_provider,
         normalize_provider,
+        provider_available,
     )
 
     if not getattr(app_settings, "strategic_brief_enabled", False):
@@ -11133,7 +11135,7 @@ def _strategic_brief_live_probe_enabled() -> bool:
         provider = normalize_provider(app_settings.strategic_brief_provider)
     except LLMSynthesisError:
         return False
-    return bool(configured_key_for_provider(provider))
+    return provider_available(provider)
 
 
 _WINNABLE_PROMPTS_SYSTEM = """You are a search-demand strategist for an AI-shopping-visibility audit.
@@ -11173,6 +11175,7 @@ def _resolve_prompt_gen_provider() -> Tuple[Optional[str], str]:
         configured_key_for_provider,
         default_model_for_provider,
         normalize_provider,
+        provider_available,
     )
 
     candidate_chain = (
@@ -11197,7 +11200,7 @@ def _resolve_prompt_gen_provider() -> Tuple[Optional[str], str]:
         if canonical in seen_providers:
             continue
         seen_providers.add(canonical)
-        if configured_key_for_provider(canonical):
+        if provider_available(canonical):
             return canonical, (model_pref or default_model_for_provider(canonical))
         logger.warning(
             "prompt-gen: no API key for provider=%s — trying fallback",

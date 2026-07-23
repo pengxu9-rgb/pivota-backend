@@ -2144,23 +2144,26 @@ def test_resolve_brief_provider_defaults_gemini_then_falls_back(monkeypatch):
 
     monkeypatch.setattr(settings, "strategic_brief_provider", "gemini", raising=False)
 
-    # gemini key present -> gemini
-    monkeypatch.setattr(sb, "configured_key_for_provider", lambda p: "k", raising=False)
+    # Selection now gates on provider_available() (credential-aware, incl. Vertex
+    # ADC for gemini), so drive that rather than the raw configured-key layer.
+
+    # gemini available -> gemini
+    monkeypatch.setattr(sb, "provider_available", lambda p: True, raising=False)
     assert sb._resolve_brief_provider(None) == "gemini"
 
-    # gemini key absent -> deepseek fallback
+    # gemini unavailable -> deepseek fallback
     monkeypatch.setattr(
-        sb, "configured_key_for_provider",
-        lambda p: None if p == "gemini" else "k", raising=False,
+        sb, "provider_available",
+        lambda p: p != "gemini", raising=False,
     )
     assert sb._resolve_brief_provider(None) == "deepseek"
 
-    # no keys anywhere -> None (deterministic fallback path)
-    monkeypatch.setattr(sb, "configured_key_for_provider", lambda p: None, raising=False)
+    # nothing available -> None (deterministic fallback path)
+    monkeypatch.setattr(sb, "provider_available", lambda p: False, raising=False)
     assert sb._resolve_brief_provider(None) is None
 
     # explicit provider override wins
-    monkeypatch.setattr(sb, "configured_key_for_provider", lambda p: "k", raising=False)
+    monkeypatch.setattr(sb, "provider_available", lambda p: True, raising=False)
     assert sb._resolve_brief_provider("anthropic") == "anthropic"
 
 

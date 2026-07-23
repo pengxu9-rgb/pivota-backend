@@ -76,3 +76,26 @@ async def test_gemini_missing_key_raises_typed_error(monkeypatch):
             system="s", user="u", provider="gemini",
             model="gemini-2.5-flash", max_tokens=100,
         )
+
+
+def test_provider_available_gemini_uses_vertex_when_no_key(monkeypatch):
+    """Provider selection must treat gemini as available on Vertex even with no
+    GEMINI_API_KEY — otherwise retiring the key silently reroutes brief/prompt-gen
+    to deepseek. Off Vertex it stays gated on the configured key."""
+    from services import vertex_gemini
+
+    monkeypatch.setattr(settings, "gemini_api_key", "", raising=False)
+
+    # Vertex ADC available, no raw key -> gemini is selectable.
+    monkeypatch.setattr(vertex_gemini, "credentials_available", lambda *a, **k: True)
+    assert mod.provider_available("gemini") is True
+
+    # No credential of any kind -> not selectable (falls back).
+    monkeypatch.setattr(vertex_gemini, "credentials_available", lambda *a, **k: False)
+    assert mod.provider_available("gemini") is False
+
+    # Other providers remain gated purely on their configured key.
+    monkeypatch.setattr(mod, "configured_key_for_provider",
+                        lambda p: "k" if p == "deepseek" else "", raising=False)
+    assert mod.provider_available("deepseek") is True
+    assert mod.provider_available("openai") is False
