@@ -154,6 +154,13 @@ async def _ensure_schema() -> None:
         await database.execute(
             "ALTER TABLE catalog_offers ADD COLUMN currency TEXT DEFAULT 'USD'"
         )
+    # Row suppression: backstop for test DBs created before
+    # catalog_products.suppressed_at existed (mirrors the offer backstop above).
+    cp_columns = await database.fetch_all("PRAGMA table_info(catalog_products)")
+    if "suppressed_at" not in {dict(row).get("name") for row in cp_columns}:
+        await database.execute(
+            "ALTER TABLE catalog_products ADD COLUMN suppressed_at TIMESTAMP"
+        )
     # ADR-008 SLICE 1: backstop for test DBs created before index_eligible
     # existed (mirrors the suppressed_at backstop above).
     ips_columns = await database.fetch_all("PRAGMA table_info(index_pipeline_state)")
@@ -224,6 +231,7 @@ async def _insert_product(
     identity: bool = True,
     pdp_scope: str = "merchant_owned",
     regression: bool = False,
+    suppressed_at: Optional[datetime] = None,
 ) -> Dict[str, str]:
     ids = _ids(suffix)
     now = datetime.now(timezone.utc)
@@ -234,11 +242,11 @@ async def _insert_product(
         INSERT INTO catalog_products (
             product_key, merchant_id, platform, source_product_id, title,
             description, brand, pdp_scope, sync_status, canonical_url,
-            pivota_signature_id, content_key, updated_at
+            pivota_signature_id, content_key, updated_at, suppressed_at
         ) VALUES (
             :product_key, :merchant_id, 'shopify', :source_product_id, 'VIS2 Product',
             :description, 'VIS2', :pdp_scope, :sync_status, :canonical_url,
-            :signature_id, :content_key, :updated_at
+            :signature_id, :content_key, :updated_at, :suppressed_at
         )
         """,
         {
@@ -252,6 +260,7 @@ async def _insert_product(
             "sync_status": sync_status,
             "canonical_url": canonical_url,
             "updated_at": now,
+            "suppressed_at": suppressed_at,
         },
     )
 
@@ -442,6 +451,11 @@ async def test_recompute_happy_path_upserts_serving_eligible_true() -> None:
             "seed_audit_fail",
         ),
         ("extractor_regression", {"regression": True}, "extractor_regression"),
+        (
+            "suppressed",
+            {"suppressed_at": datetime(2026, 7, 1, tzinfo=timezone.utc)},
+            "suppressed",
+        ),
     ],
 )
 async def test_recompute_blocker_transitions(
@@ -460,6 +474,30 @@ async def test_recompute_blocker_transitions(
         assert row is not None
         assert bool(row["serving_eligible"]) is False
         assert row["blocker_code"] == expected_blocker
+    finally:
+        await _cleanup()
+        await _disconnect_if_needed(was_connected)
+
+
+@pytest.mark.asyncio
+async def test_suppressed_row_clears_index_eligible_too() -> None:
+    """Suppression is an editorial withdrawal: it must fail BOTH gates —
+    serving_eligible (commerce) and index_eligible (offer-free citation)."""
+    was_connected = await _prepare_db()
+    try:
+        ids = await _insert_product(
+            "suppboth",
+            suppressed_at=datetime(2026, 7, 1, tzinfo=timezone.utc),
+        )
+
+        result = await svc.recompute_serving_eligibility(ids["content_key"])
+
+        row = await _ips_row(ids["content_key"])
+        assert result is False
+        assert row is not None
+        assert bool(row["serving_eligible"]) is False
+        assert bool(row["index_eligible"]) is False
+        assert row["blocker_code"] == "suppressed"
     finally:
         await _cleanup()
         await _disconnect_if_needed(was_connected)

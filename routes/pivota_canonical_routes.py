@@ -129,6 +129,44 @@ agent_pdp_view = table(
     column("required_disclaimers"),
 )
 
+# PIVOTA-Agent-owned identity layer. The public PDP at
+# agent.pivota.cc/products/{sig} only renders when the sig's OWN source row has
+# an approved, live-read-enabled identity listing (row grain, not content_key
+# grain: a sibling row's listing does not make this sig render — verified
+# empirically 2026-07-23). The join key is (merchant_id, product_id) =
+# (cp.merchant_id, cp.source_product_id), the same pairing
+# catalog_row_trust_upserter uses.
+pdp_identity_listing = table(
+    "pdp_identity_listing",
+    column("merchant_id", String),
+    column("product_id", String),
+    column("live_read_enabled", Boolean),
+    column("identity_status", String),
+)
+
+
+def _renderable_column():
+    """EXISTS boolean: will agent.pivota.cc/products/{sig} actually render?
+
+    Exposed on the /products list so sitemap generation can stop advertising
+    serving_eligible rows whose PDP still serves the generic shell (the two
+    gates — serving_eligible here, live_read_enabled in PIVOTA-Agent — are
+    owned by different repos and had drifted 52% apart)."""
+    return (
+        select(pdp_identity_listing.c.product_id)
+        .where(
+            and_(
+                pdp_identity_listing.c.merchant_id == catalog_products.c.merchant_id,
+                pdp_identity_listing.c.product_id
+                == catalog_products.c.source_product_id,
+                pdp_identity_listing.c.live_read_enabled.is_(True),
+                pdp_identity_listing.c.identity_status == "approved",
+            )
+        )
+        .exists()
+        .label("renderable")
+    )
+
 
 def _flag_on(name: str) -> bool:
     return (os.getenv(name) or "").strip().lower() in {"1", "true", "yes", "on"}
@@ -315,6 +353,9 @@ async def get_canonical_pdp_by_signature(sig_id: str) -> Dict[str, Any]:
             and_(
                 catalog_products.c.pivota_signature_id == sig,
                 catalog_products.c.content_key.isnot(None),
+                # Suppressed rows are withdrawn from serving (see the list
+                # endpoint's matching filter); fail closed with a 404.
+                catalog_products.c.suppressed_at.is_(None),
                 # ADR-007 SLICE 1: by-signature PDP READ widens under
                 # INDEX_ELIGIBLE_READ (the citation read surface), NOT under
                 # the separate sitemap flag.
@@ -442,6 +483,11 @@ async def list_canonical_pdp_signatures(
         )
     eligibility_filter = and_(
         catalog_products.c.content_key.isnot(None),
+        # A suppressed row (catalog_products.suppressed_at set, e.g. the
+        # demo_retired_2026_07 sweep) is withdrawn from serving and must not
+        # be advertised, even while its content_key stays eligible through
+        # live sibling rows. Row-level, matching this endpoint's row grain.
+        catalog_products.c.suppressed_at.is_(None),
         identity_term,
         _eligibility_predicate(widen_with_index_eligible=widen_sitemap),
         merchant_gate,
@@ -506,6 +552,7 @@ async def list_canonical_pdp_signatures(
         index_pipeline_state.c.blocker_detail,
         index_pipeline_state.c.content_quality_score,
         index_pipeline_state.c.quality_scored_at,
+        _renderable_column(),
     ]
     if widen_sitemap:
         select_cols.append(index_pipeline_state.c.index_eligible)
@@ -537,6 +584,11 @@ async def list_canonical_pdp_signatures(
                 or (f"{_PDP_URL_PREFIX}{r['content_key']}" if r["content_key"] else None)
             ),
             "serving_eligible": bool(r["serving_eligible"]),
+            # Renderability of the public PDP (approved + live_read_enabled
+            # identity listing for THIS row). serving_eligible says "we want
+            # this public"; renderable says "the PDP will actually render" —
+            # sitemap generation must require both.
+            "renderable": bool(r["renderable"]),
             "index_eligible": (bool(r["index_eligible"]) if widen_sitemap else False),
             "blocker_code": r["blocker_code"],
             "blocker_detail": r["blocker_detail"],
