@@ -255,13 +255,26 @@ def get_platform_settlement_rails(
     *,
     has_live_psp: bool,
     has_native_payments: bool | None = None,
+    native_payments_as_of: Any = None,
     native_endpoint_reachable: bool = False,
 ) -> list[Dict[str, Any]]:
     """Truthful settlement rails for a merchant on `platform`.
 
-    Each rail: ``{"rail", "available", "requirement"}``. A rail is listed when
-    the platform supports it AT ALL, and ``available`` only when current facts
-    satisfy its requirement — `None` facts (unknown) are never treated as yes.
+    Each rail: ``{"rail", "available", "requirement", "protocol_scope"}`` plus,
+    where meaningful, fact provenance (``source``/``as_of``) and the ``store_id``
+    the rail was resolved against. A rail is listed when the platform supports it
+    AT ALL, and ``available`` only when current facts satisfy its requirement —
+    `None` facts (unknown) are never treated as yes.
+
+    Contract notes (set now, while there are zero consumers):
+      * ``protocol_scope`` — which agent-side protocol lane can DRIVE this rail
+        for autonomous completion. Empty = door-agnostic (a handoff rail any
+        door can route to; the buyer completes on the merchant's checkout).
+      * ``as_of`` — when the underlying fact was last verified. A verified fact
+        can go stale (merchant later disables Shopify Payments); consumers apply
+        their own freshness floor rather than trusting `available` blindly.
+      * ``store_id`` — the Wix pivota_psp rail is per-store; ambiguous for
+        multi-store merchants without it.
 
     `has_native_payments` is the pcs_merchant_capabilities.has_shopify_payments
     fact (None = merchant never went through the Shopify verify). `store` matters
@@ -279,7 +292,7 @@ def get_platform_settlement_rails(
         chargeable = bool(
             get_platform_protocols_for_store(key, store, has_live_psp=has_live_psp)
         )
-        rails.append({
+        rail: Dict[str, Any] = {
             "rail": SETTLEMENT_PIVOTA_PSP,
             "available": chargeable,
             "requirement": (
@@ -287,16 +300,27 @@ def get_platform_settlement_rails(
                 if key == "wix"
                 else "live_charge_ready_psp"
             ),
-        })
+            "protocol_scope": [PROTOCOL_ACP],
+        }
+        if key == "wix":
+            store_id = str((store or {}).get("store_id") or "").strip()
+            rail["store_id"] = store_id or None
+        rails.append(rail)
 
     if caps.supports_platform_checkout:
         if key == "shopify":
             rails.append({
                 "rail": SETTLEMENT_PLATFORM_NATIVE,
-                # Unknown (None) is not yes: only a verified Shopify-Payments
-                # fact makes the merchant's own checkout a usable rail.
+                # Strict identity check on purpose: only a verified TRUE fact
+                # lights the rail — unknown (None) and any truthy-non-True
+                # value are treated as not-verified.
                 "available": has_native_payments is True,
                 "requirement": "shopify_payments_verified_on_merchant_store",
+                # Door-agnostic handoff: any agent-side door can route to the
+                # merchant's own checkout; the buyer completes there.
+                "protocol_scope": [],
+                "source": "pcs_shopify_verify",
+                "as_of": native_payments_as_of,
             })
         else:
             # WooCommerce / BigCommerce declare platform checkout support but
@@ -306,6 +330,7 @@ def get_platform_settlement_rails(
                 "rail": SETTLEMENT_PLATFORM_NATIVE,
                 "available": False,
                 "requirement": caps.purchase_requirement,
+                "protocol_scope": [],
             })
 
     if key in _DELEGATED_ENDPOINT_PLATFORMS:
@@ -313,6 +338,7 @@ def get_platform_settlement_rails(
             "rail": SETTLEMENT_DELEGATED_TOKEN,
             "available": bool(native_endpoint_reachable),
             "requirement": "merchant_native_agentic_endpoint_reachable_no_stored_signal_yet",
+            "protocol_scope": [PROTOCOL_UCP],
         })
 
     return rails

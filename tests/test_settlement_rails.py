@@ -53,6 +53,39 @@ def test_shopify_unknown_native_payments_is_not_yes():
     assert rails[SETTLEMENT_PLATFORM_NATIVE]["available"] is False
 
 
+def test_shopify_truthy_non_true_native_payments_is_not_yes():
+    # The gate is a strict `is True` — a truthy-but-not-True value (e.g. a raw
+    # DB integer 1 or the string "yes" leaking through a future refactor) must
+    # NOT light the rail. Locks the identity check against a loosened truthy test.
+    for leaky in (1, "yes", "true", object()):
+        rails = _by_rail(get_platform_settlement_rails(
+            "shopify", has_live_psp=False, has_native_payments=leaky,  # type: ignore[arg-type]
+        ))
+        assert rails[SETTLEMENT_PLATFORM_NATIVE]["available"] is False, repr(leaky)
+
+
+def test_shopify_platform_native_carries_provenance():
+    # Contract fields set while there are zero consumers: `source` names the
+    # fact's producer and `as_of` its verification time, so the decision layer
+    # can apply a freshness floor instead of trusting `available` blindly.
+    rails = _by_rail(get_platform_settlement_rails(
+        "shopify", has_live_psp=False,
+        has_native_payments=True, native_payments_as_of="2026-07-01T00:00:00Z",
+    ))
+    native = rails[SETTLEMENT_PLATFORM_NATIVE]
+    assert native["source"] == "pcs_shopify_verify"
+    assert native["as_of"] == "2026-07-01T00:00:00Z"
+
+
+def test_protocol_scope_per_rail():
+    # pivota_psp is driven by the ACP lane; delegated_token by UCP;
+    # platform_native is a door-agnostic handoff (empty scope).
+    rails = _by_rail(get_platform_settlement_rails("shopify", has_live_psp=True))
+    assert rails[SETTLEMENT_PIVOTA_PSP]["protocol_scope"] == ["acp"]
+    assert rails[SETTLEMENT_DELEGATED_TOKEN]["protocol_scope"] == ["ucp"]
+    assert rails[SETTLEMENT_PLATFORM_NATIVE]["protocol_scope"] == []
+
+
 def test_shopify_delegated_token_needs_reachability_signal():
     dark = _by_rail(get_platform_settlement_rails("shopify", has_live_psp=False))
     assert dark[SETTLEMENT_DELEGATED_TOKEN]["available"] is False
@@ -94,6 +127,25 @@ def test_wix_has_no_native_rails():
     rails = _by_rail(get_platform_settlement_rails("wix", _wix_store(), has_live_psp=True))
     assert SETTLEMENT_PLATFORM_NATIVE not in rails
     assert SETTLEMENT_DELEGATED_TOKEN not in rails
+
+
+def test_wix_native_payments_fact_never_lights_a_wix_rail():
+    # A stale/dark-provisioned pcs row (has_shopify_payments=True) on a merchant
+    # whose platform is now wix must not conjure a platform_native rail — rails
+    # are platform-keyed, and the shopify fact means nothing for a Wix storefront.
+    rails = _by_rail(get_platform_settlement_rails(
+        "wix", _wix_store(), has_live_psp=False, has_native_payments=True,
+    ))
+    assert SETTLEMENT_PLATFORM_NATIVE not in rails
+
+
+def test_wix_pivota_psp_rail_is_store_scoped():
+    # The Wix charge gate is per-store; the rail must say WHICH store it was
+    # resolved against (ambiguous for multi-store merchants otherwise).
+    rails = _by_rail(get_platform_settlement_rails("wix", _wix_store(), has_live_psp=True))
+    assert rails[SETTLEMENT_PIVOTA_PSP]["store_id"] == "wix_store_1"
+    no_store = _by_rail(get_platform_settlement_rails("wix", None, has_live_psp=True))
+    assert no_store[SETTLEMENT_PIVOTA_PSP]["store_id"] is None
 
 
 # --- woocommerce / bigcommerce: platform checkout modeled, honestly dark -----
