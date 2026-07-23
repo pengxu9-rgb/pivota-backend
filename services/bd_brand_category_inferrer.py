@@ -143,7 +143,7 @@ async def infer_brand_category(
         return None
 
     resolved_key = api_key if api_key is not None else _resolve_api_key()
-    if not resolved_key:
+    if not vertex_gemini.credentials_available(resolved_key):
         logger.info(
             "bd_brand_category_inferrer: no GEMINI_API_KEY configured; "
             "skipping inference for brand=%r", brand,

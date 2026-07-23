@@ -1304,8 +1304,8 @@ async def infer_brand_context(brand: str, domain: str) -> Dict[str, Any]:
       }
     """
     api_key = _resolve_gemini_api_key()
-    if not api_key:
-        logger.info("brand_context: no GEMINI_API_KEY; skipping inference for %s", brand)
+    if not vertex_gemini.credentials_available(api_key):
+        logger.info("brand_context: no Gemini credentials; skipping inference for %s", brand)
         return {
             "retail_presence": None,
             "founder_story": None,
@@ -1958,8 +1958,8 @@ async def infer_social_intelligence(
         },
         "available": False,
     }
-    if not api_key:
-        logger.info("social_intelligence: no GEMINI_API_KEY; skipping for %s", brand)
+    if not vertex_gemini.credentials_available(api_key):
+        logger.info("social_intelligence: no Gemini credentials; skipping for %s", brand)
         return empty
     if not brand or not brand.strip() or not domain or not domain.strip():
         return empty

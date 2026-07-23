@@ -207,7 +207,7 @@ async def llm_match_seed(
     cand_subset = list(candidates)[:MAX_CANDIDATES_PER_CALL]
 
     resolved_key = _resolve_api_key(api_key)
-    if not resolved_key:
+    if not vertex_gemini.credentials_available(resolved_key):
         return _mock_match(seed=seed, candidates=cand_subset)
 
     prompt = _build_prompt(seed=seed, candidates=cand_subset)

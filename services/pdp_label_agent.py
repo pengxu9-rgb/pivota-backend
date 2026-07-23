@@ -416,7 +416,7 @@ async def classify_pdp(
     Phase O-3b ships the batch worker that does that.
     """
     resolved_key = _resolve_api_key(api_key)
-    if not resolved_key:
+    if not vertex_gemini.credentials_available(resolved_key):
         return {**_empty_result(drop_reason="no_api_key"), "model": model}
 
     prompt = build_label_prompt(row)

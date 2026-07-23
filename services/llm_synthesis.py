@@ -265,9 +265,9 @@ async def _call_gemini_generate_content(
     response_schema: Optional[Mapping[str, Any]] = None,
 ) -> Dict[str, Any]:
     api_key = settings.gemini_api_key
-    if not api_key:
+    if not vertex_gemini.credentials_available(api_key):
         raise MissingLLMKeyError(
-            "gemini API key is not configured",
+            "gemini credentials are not configured",
             provider="gemini",
         )
     generation_config: Dict[str, Any] = {
