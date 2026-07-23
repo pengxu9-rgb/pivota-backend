@@ -83,7 +83,7 @@ async def _resolve_competitor_domain(
     on any failure / unknown.
     """
     key = api_key if api_key is not None else _resolve_gemini_api_key()
-    if not key:
+    if not vertex_gemini.credentials_available(key):
         logger.info(
             "competitor_orchestrator: no GEMINI_API_KEY; "
             "cannot resolve domain for %r", brand,

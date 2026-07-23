@@ -198,7 +198,7 @@ class CompetitorInsightsAgent(BaseExecutorAgent):
     async def should_run(self, context: ExecutorContext) -> bool:
         if not context.merchant_id:
             return False
-        if not _resolve_gemini_api_key():
+        if not vertex_gemini.credentials_available(_resolve_gemini_api_key()):
             return False
         return len(_collect_competitor_evidence(context.audit_report)) > 0
 
@@ -206,9 +206,9 @@ class CompetitorInsightsAgent(BaseExecutorAgent):
         if not context.merchant_id:
             return ExecutorResult(status="skipped", error_message="merchant_id required")
         api_key = _resolve_gemini_api_key()
-        if not api_key:
+        if not vertex_gemini.credentials_available(api_key):
             return ExecutorResult(
-                status="skipped", error_message="no GEMINI_API_KEY configured"
+                status="skipped", error_message="no Gemini credentials configured"
             )
         rows = _collect_competitor_evidence(context.audit_report)
         if not rows:

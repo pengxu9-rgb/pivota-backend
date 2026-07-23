@@ -90,6 +90,27 @@ def configured_key_for_provider(provider: str) -> Optional[str]:
     return None
 
 
+def provider_available(provider: str) -> bool:
+    """Whether ``provider`` can authenticate — the truthiness the provider-
+    selection gates need, as opposed to the raw key string.
+
+    For gemini this includes Vertex ADC: on Vertex ``settings.gemini_api_key`` is
+    empty yet the call authenticates, so gating selection on the raw key would
+    silently drop gemini once the key is retired. Off Vertex it collapses to the
+    same ``bool(settings.gemini_api_key)`` the key gate gave. Other providers are
+    unchanged — their configured key is the whole story.
+    """
+    canonical = normalize_provider(provider)
+    if canonical == "gemini":
+        # Raw key OR Vertex ADC — either authenticates gemini. Off Vertex the
+        # second term collapses to the first (both read settings.gemini_api_key),
+        # so behavior and the configured-key mock layer are unchanged; on Vertex
+        # it adds the ADC credential so selection doesn't drop gemini once the
+        # key is retired.
+        return bool(configured_key_for_provider(canonical)) or vertex_gemini.credentials_available()
+    return bool(configured_key_for_provider(canonical))
+
+
 async def synthesize(
     *,
     system: str,
@@ -265,9 +286,9 @@ async def _call_gemini_generate_content(
     response_schema: Optional[Mapping[str, Any]] = None,
 ) -> Dict[str, Any]:
     api_key = settings.gemini_api_key
-    if not api_key:
+    if not vertex_gemini.credentials_available(api_key):
         raise MissingLLMKeyError(
-            "gemini API key is not configured",
+            "gemini credentials are not configured",
             provider="gemini",
         )
     generation_config: Dict[str, Any] = {

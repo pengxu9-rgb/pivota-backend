@@ -661,7 +661,7 @@ class CanonicalPdpEnrichmentAgent(BaseExecutorAgent):
         newest-thin catalog candidate). Cheap — capped at 1, no LLM call."""
         if not context.merchant_id:
             return False
-        if not _resolve_gemini_api_key():
+        if not vertex_gemini.credentials_available(_resolve_gemini_api_key()):
             return False
         candidates = await _resolve_candidates(context, cap=1)
         return len(candidates) > 0
@@ -672,9 +672,9 @@ class CanonicalPdpEnrichmentAgent(BaseExecutorAgent):
                 status="skipped", error_message="merchant_id required"
             )
         api_key = _resolve_gemini_api_key()
-        if not api_key:
+        if not vertex_gemini.credentials_available(api_key):
             return ExecutorResult(
-                status="skipped", error_message="no GEMINI_API_KEY configured"
+                status="skipped", error_message="no Gemini credentials configured"
             )
 
         candidates = await _resolve_candidates(context, cap=_MAX_ENRICH_PER_RUN)

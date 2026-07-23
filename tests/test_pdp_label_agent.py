@@ -433,3 +433,52 @@ async def test_classify_pdp_parse_drop_exhausts_retries(monkeypatch):
     result = await classify_pdp({"title": "x"}, max_retries=1, http_client=client)
     assert result["drop_reason"] == "gemini_json_no_balanced_block"
     assert len(client.calls) == 2
+
+
+@pytest.mark.asyncio
+async def test_classify_pdp_gate_follows_credentials_not_raw_key(monkeypatch):
+    """The gate must follow credentials_available(), not raw key presence: with a
+    key present but credentials unavailable, classify_pdp still returns no_api_key.
+    The old raw-key gate would have proceeded to a doomed call."""
+    monkeypatch.setenv("GEMINI_API_KEY", "present-but-unusable")
+    from services import vertex_gemini
+
+    monkeypatch.setattr(vertex_gemini, "credentials_available", lambda *a, **k: False)
+    result = await classify_pdp({"title": "x"})
+    assert result["drop_reason"] == "no_api_key"
+
+
+@pytest.mark.asyncio
+async def test_classify_pdp_proceeds_on_vertex_without_api_key(monkeypatch):
+    """The switch: on Vertex the credential is ADC, so a missing GEMINI_API_KEY
+    must NOT short-circuit as no_api_key. Gating on credentials_available() lets a
+    keyless Vertex call proceed to the model."""
+    monkeypatch.delenv("GEMINI_API_KEY", raising=False)
+    monkeypatch.delenv("PIVOTA_GEMINI_API_KEY", raising=False)
+    from services import vertex_gemini
+
+    monkeypatch.setattr(vertex_gemini, "credentials_available", lambda *a, **k: True)
+
+    async def _fake_auth_headers(api_key=None):
+        return {"content-type": "application/json"}
+
+    monkeypatch.setattr(vertex_gemini, "auth_headers", _fake_auth_headers)
+
+    classification = {
+        "demographic": "women",
+        "use_case_tags": ["daily"],
+        "lifestyle_tags": ["vegan"],
+        "category_path": "beauty/skincare/treat/serum",
+        "confidence": 0.9,
+        "reasoning": "ok",
+    }
+    ok = _MockResponse(
+        status_code=200,
+        json_payload={
+            "candidates": [{"content": {"parts": [{"text": json.dumps(classification)}]}}]
+        },
+    )
+    client = _MockHttpClient(responses=[ok])
+    result = await classify_pdp({"title": "Vegan Daily Cream"}, http_client=client)
+    assert result["drop_reason"] != "no_api_key"
+    assert len(client.calls) == 1  # reached the model despite no key

@@ -166,7 +166,7 @@ def judge_group(
     """Judge one group. Returns a validated verdict dict, or None (offline,
     HTTP failure, or unparseable reply — the judge never guesses)."""
     key = _resolve_api_key(api_key)
-    if not key:
+    if not vertex_gemini.credentials_available(key):
         return None
     prompt = build_judge_prompt(rows)
     url = vertex_gemini.generate_content_url(model, base_url=base_url)

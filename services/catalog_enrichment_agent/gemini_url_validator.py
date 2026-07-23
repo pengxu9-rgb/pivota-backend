@@ -185,7 +185,7 @@ async def validate_candidate(
         "attribute_summary": candidate.get("attribute_summary"),
     }
     resolved_key = api_key if api_key is not None else _resolve_api_key()
-    if not resolved_key:
+    if not vertex_gemini.credentials_available(resolved_key):
         result = _mock_validation(candidate)
         result_offers = [
             {**offer, "validated_at": datetime.now(timezone.utc).isoformat()}

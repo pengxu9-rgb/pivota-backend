@@ -375,7 +375,7 @@ class ContentBriefGeneratorAgent(BaseExecutorAgent):
         """
         if not context.merchant_id:
             return False
-        if not _resolve_gemini_api_key():
+        if not vertex_gemini.credentials_available(_resolve_gemini_api_key()):
             return False
         failed = _extract_failed_category_queries(
             context.audit_report, cap=1,  # short-circuit: existence check only
@@ -388,9 +388,9 @@ class ContentBriefGeneratorAgent(BaseExecutorAgent):
                 status="skipped", error_message="merchant_id required",
             )
         api_key = _resolve_gemini_api_key()
-        if not api_key:
+        if not vertex_gemini.credentials_available(api_key):
             return ExecutorResult(
-                status="skipped", error_message="no GEMINI_API_KEY configured",
+                status="skipped", error_message="no Gemini credentials configured",
             )
 
         failed_queries = _extract_failed_category_queries(
