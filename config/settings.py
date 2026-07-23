@@ -441,6 +441,31 @@ class Settings(BaseSettings):
         os.getenv("AGENT_ACP_LIVE_MAX_CENTS", "200") or "200"
     )
 
+    # ---- Tier-2 native-handoff lane (mid-man routing, 2026-07-23) ----
+    # Three-tier checkout routing: in-chat charge (pivota_psp) > NATIVE HANDOFF
+    # (the transaction completes on the merchant's OWN checkout — platform_native
+    # / delegated_token settlement rails from PR #1576) > redirect floor. Default
+    # OFF: with the flag off the lane decision is byte-identical to the two-tier
+    # charge-or-redirect behavior. Flag ON only changes merchants who would have
+    # hit the redirect floor anyway — the charge lane always outranks it.
+    tier2_native_handoff_enabled: bool = (
+        os.getenv("TIER2_NATIVE_HANDOFF_ENABLED", "false").strip().lower() == "true"
+    )
+    # Staged-rollout allowlist mirroring the charge canary's convention: when
+    # non-empty, only listed merchants route to the native handoff (the global
+    # flag alone would move every rail-bearing merchant at once). Empty = no
+    # narrowing once the flag is on.
+    tier2_native_handoff_merchants_raw: str = os.getenv(
+        "TIER2_NATIVE_HANDOFF_MERCHANTS", ""
+    )
+
+    @property
+    def tier2_native_handoff_merchants(self) -> frozenset:
+        raw = (self.tier2_native_handoff_merchants_raw or "").strip()
+        if not raw:
+            return frozenset()
+        return frozenset(m.strip() for m in raw.split(",") if m.strip())
+
     # ---- Warm-handoff click lane (Pivota_Warm_Handoff_Click_Lane_Spec_2026-07-22.md) ----
     # Upgrades the public GET /r attributed redirect from a cold brand link to a PRE-BUILT
     # cart on the brand's own Shopify checkout, by calling the PIVOTA-Agent gateway's
