@@ -7,7 +7,17 @@ backfill pulls each product's fields from catalog_products, its price from
 external_product_seeds, and its INCI from beauty_sku_ingredients, rebuilds the
 payload with build_servable_quality_payload(category=category_kind, raw_inci=...),
 and re-runs make_external_seed_servable -> fresh product_quality_snapshot +
-serving-eligibility recompute.
+serving-eligibility recompute -> catalog_row_trust upsert.
+
+TWO-STEP FLIP (the second step is why this script exists as a one-shot):
+  1. make_external_seed_servable sets index_pipeline_state.serving_eligible.
+  2. upsert_catalog_row_trust flips catalog_row_trust.serving_decision to
+     `public` — the field public READERS actually gate on. Step 1 alone leaves a
+     row serving_eligible-but-`blocked` until the phase-2d drift cron catches it
+     (proven live 2026-07-23). The trust upsert runs in chunks for rows that
+     actually became eligible, so a promotion is durable and a mid-run abort
+     still publishes everything scored so far. Pass --skip-trust to do step 1
+     only.
 
 Idempotent + RESUMABLE (skips products already on the source-backed rules
 version) + RESILIENT (one product's failure never aborts the run) + a
@@ -36,6 +46,7 @@ if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
 from db.database import database
+from services.catalog_row_trust_upserter import upsert_catalog_row_trust_many
 from services.external_seed_servability import (
     build_servable_quality_payload,
     make_external_seed_servable,
@@ -113,6 +124,33 @@ async def _rescored_ids() -> set:
     return {dict(r)["pid"] for r in rows}
 
 
+async def _flush_trust(product_keys: list[str]) -> int:
+    """Recompute catalog_row_trust for the just-promoted product_keys.
+
+    Rescoring sets index_pipeline_state.serving_eligible, but that is NOT what
+    public readers gate on — catalog_row_trust.serving_decision is derived by a
+    SEPARATE policy (services.catalog_trust_policy) and written only by the trust
+    upserter. Without this step a rescored row is serving_eligible yet stays
+    `blocked` until the phase-2d drift cron eventually catches it (proven live
+    2026-07-23: 7/7 eligible rows went blocked->public the instant the trust
+    upsert ran). Best-effort: a trust failure is logged inside the upserter and
+    never rolls back the score. Returns the number of trust rows the policy
+    wrote (idempotent, so ``<= len(product_keys)``)."""
+    if not product_keys:
+        return 0
+    try:
+        # Pass limit=len(keys) so the upserter's internal SELECT ... LIMIT (default
+        # 5000) can never silently truncate an oversized chunk — self-consistent
+        # regardless of --trust-flush-every.
+        return await upsert_catalog_row_trust_many(
+            db=database, product_keys=product_keys, limit=len(product_keys)
+        )
+    except Exception as exc:  # noqa: BLE001 -- trust flush must never abort the run
+        print(f"  TRUST-FLUSH FAIL ({len(product_keys)} keys): "
+              f"{type(exc).__name__}: {str(exc)[:80]}", flush=True)
+        return 0
+
+
 async def run(
     apply: bool,
     limit: Optional[int],
@@ -121,6 +159,8 @@ async def run(
     force: bool = False,
     include_eligible: bool = False,
     offset: int = 0,
+    trust_flush_every: int = 200,
+    skip_trust: bool = False,
 ) -> None:
     await database.connect()
     try:
@@ -162,6 +202,8 @@ async def run(
 
         ok = fail = 0
         consec = 0
+        promoted: list[str] = []  # product_keys that flipped serving_eligible
+        trust_wrote = 0
         for i, r in enumerate(todo, 1):
             epid = r["source_product_id"]
             if consec >= 5:
@@ -182,7 +224,7 @@ async def run(
                     pdp_details_sections=_coerce_sections(r.get("pdp_details_sections")),
                 )
                 # per-product timeout so a dead socket errors out, never hangs
-                await asyncio.wait_for(
+                summary = await asyncio.wait_for(
                     make_external_seed_servable(
                         # seed_id comes from the row — NEVER rebuilt from TOOL.
                         product_key=r["product_key"], seed_id=r["seed_id"],
@@ -193,13 +235,27 @@ async def run(
                 )
                 ok += 1
                 consec = 0
+                # Only rows that actually became serving_eligible need the trust
+                # flip — a row that stayed below the bar would just recompute to
+                # `blocked` again, so skip the needless trust recompute.
+                if not skip_trust and (summary or {}).get("serving_eligible") is True:
+                    promoted.append(r["product_key"])
             except Exception as e:  # noqa: BLE001 -- isolate per-product failures
                 fail += 1
                 consec += 1
                 print(f"  FAIL {epid}: {type(e).__name__}: {str(e)[:80]}", flush=True)
+            # Flush trust in chunks so a long run promotes durably (and a mid-run
+            # abort still publishes everything scored so far).
+            if len(promoted) >= trust_flush_every:
+                trust_wrote += await _flush_trust(promoted)
+                promoted = []
             if i % 100 == 0:
-                print(f"  {i}/{len(todo)} ok={ok} fail={fail}", flush=True)
-        print(f"\nDONE: rescored ok={ok} fail={fail} (of {len(todo)})")
+                print(f"  {i}/{len(todo)} ok={ok} fail={fail} "
+                      f"promoted_public={trust_wrote}", flush=True)
+        # Flush whatever is left — runs on normal completion AND after an abort break.
+        trust_wrote += await _flush_trust(promoted)
+        print(f"\nDONE: rescored ok={ok} fail={fail} (of {len(todo)}); "
+              f"trust rows written (blocked->public): {trust_wrote}")
     finally:
         await database.disconnect()
 
@@ -229,6 +285,19 @@ def main() -> int:
              "default so a rescore can only promote, never demote a public row.",
     )
     ap.add_argument("--offset", type=int, default=0, help="skip the first N rows")
+    ap.add_argument(
+        "--trust-flush-every",
+        type=int,
+        default=200,
+        help="chunk size for the catalog_row_trust upsert that flips promoted "
+             "rows to public (default 200)",
+    )
+    ap.add_argument(
+        "--skip-trust",
+        action="store_true",
+        help="rescore only; do NOT run the trust upsert. Promoted rows stay "
+             "serving_eligible-but-blocked until the drift cron catches them.",
+    )
     args = ap.parse_args()
     asyncio.run(
         run(
@@ -238,6 +307,8 @@ def main() -> int:
             force=args.force,
             include_eligible=args.include_eligible,
             offset=args.offset,
+            trust_flush_every=args.trust_flush_every,
+            skip_trust=args.skip_trust,
         )
     )
     return 0
