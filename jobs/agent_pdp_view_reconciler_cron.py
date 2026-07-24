@@ -37,8 +37,9 @@ should exist.
 Env vars:
   AGENT_PDP_VIEW_RECONCILE_ENABLED       default true — set false to pause
   AGENT_PDP_VIEW_RECONCILE_LIMIT         default 300 — content_keys per run
-      (each refresh is ~8 sequential queries; at the ~140ms app↔DB RTT a
-      full run stays under ~6 min, well inside the 6h cron cadence)
+      (each refresh is ~8 sequential queries PLUS one enrichment lookup per
+      cluster member, so ~1s+ per key at the ~140ms app↔DB RTT; a full run
+      stays in the minutes range, well inside the 6h cron cadence)
   AGENT_PDP_VIEW_DRIFT_ALERT_THRESHOLD   default 200 — ERROR-log when more
       stale+missing view rows than this remain after a pass
 """
@@ -98,14 +99,23 @@ def _drift_alert_threshold() -> int:
 # catalog_products/catalog_offers timestamps are naive TIMESTAMP (UTC by
 # server convention) while agent_pdp_view.refreshed_at is TIMESTAMPTZ, so
 # refreshed_at is normalized with AT TIME ZONE 'UTC' to keep the comparison
-# deterministic regardless of session timezone.
+# deterministic regardless of session timezone. (Invariant: those naive
+# columns hold UTC wall-clock — true for every writer today; a session-tz
+# drift would skew every staleness comparison at once, which the drift
+# alarm itself would surface as a sudden all-stale spike.)
 #
-# any_public gates only the MISSING side: a content_key with no view row is
-# real drift only when a member product is trust-public (fail-closed readers
-# are hiding it). Rows the assembler can't build (no catalog row with a
-# title) stay counted — an unservable public row is a defect to surface, not
-# smooth over. The STALE side applies to every existing view row: if we
-# serve it, it must track truth.
+# CANDIDACY MUST MATCH BUILDABILITY. The refresh primitive's product fetch
+# applies the source-quarantine anti-join and assemble_row declines keys
+# with no title — a key the assembler declines gets NO refreshed_at bump,
+# so if the truth CTE still selected it, it would sit at the head of the
+# stalest-first queue FOREVER, burning budget every pass and (at >= limit
+# stuck keys) starving the deterministic tail: exactly the #1578 class.
+# So the CTE mirrors both predicates: quarantined member rows are
+# anti-joined out before aggregation, and `buildable` requires a surviving
+# member with a non-empty title. Public-but-unbuildable contradictions are
+# the Phase 0b invariant sweep's job to surface, not this reconciler's job
+# to retry forever; residual assembler declines (predicate drift between
+# this CTE and the assembler) are WARNING-logged via skipped_no_row.
 
 _TRUTH_CTE = """
     WITH truth AS (
@@ -116,7 +126,8 @@ _TRUTH_CTE = """
                 MAX(cp.content_changed_at),
                 MAX(co.updated_at)
             ) AS truth_changed_at,
-            bool_or(crt.serving_decision = 'public') AS any_public
+            bool_or(crt.serving_decision = 'public') AS any_public,
+            bool_or(cp.title IS NOT NULL AND btrim(cp.title) <> '') AS buildable
         FROM catalog_products cp
         LEFT JOIN catalog_offers co
             ON co.product_key = cp.product_key
@@ -124,18 +135,36 @@ _TRUTH_CTE = """
             ON crt.subject_type = 'product'
            AND crt.subject_key  = cp.product_key
         WHERE cp.content_key IS NOT NULL AND cp.content_key <> ''
+        {quarantine_anti_join}
         GROUP BY cp.content_key
     )
 """
 
-_CANDIDATES_SQL = _TRUTH_CTE + """
+
+def _truth_cte() -> str:
+    # Same anti-join fragment (and the same cp.* expressions) the assembler's
+    # fetch_products_for_key uses — the two predicates must never diverge.
+    from services.source_quarantine import build_quarantine_anti_join_sql
+
+    return _TRUTH_CTE.format(
+        quarantine_anti_join=build_quarantine_anti_join_sql(
+            row_domain_expr="cp.source_domain",
+            row_merchant_expr="cp.merchant_id",
+            row_platform_expr="cp.platform",
+            row_source_system_expr="cp.source_system",
+            row_source_ref_expr="cp.source_ref",
+        )
+    )
+
+_CANDIDATES_TAIL = """
     SELECT t.content_key
     FROM truth t
     LEFT JOIN agent_pdp_view av
         ON av.content_key = t.content_key
-    WHERE (av.content_key IS NULL AND t.any_public)
-       OR (av.content_key IS NOT NULL
-           AND (av.refreshed_at AT TIME ZONE 'UTC') < t.truth_changed_at)
+    WHERE t.buildable
+      AND ((av.content_key IS NULL AND t.any_public)
+        OR (av.content_key IS NOT NULL
+            AND (av.refreshed_at AT TIME ZONE 'UTC') < t.truth_changed_at))
     ORDER BY
         (av.refreshed_at AT TIME ZONE 'UTC') ASC NULLS FIRST,
         t.truth_changed_at ASC,
@@ -143,7 +172,11 @@ _CANDIDATES_SQL = _TRUTH_CTE + """
     LIMIT :limit
 """
 
-_DRIFT_SQL = _TRUTH_CTE + """
+# Drift counts only divergence the reconciler can actually converge (same
+# buildable gate as candidacy) — so a healthy system reaches drift=0 and the
+# threshold alarm stays meaningful instead of pinning at a permanent floor
+# of unbuildable keys. Unservable-public contradictions surface in Phase 0b.
+_DRIFT_TAIL = """
     SELECT
         count(*) FILTER (
             WHERE av.content_key IS NULL AND t.any_public
@@ -155,7 +188,16 @@ _DRIFT_SQL = _TRUTH_CTE + """
     FROM truth t
     LEFT JOIN agent_pdp_view av
         ON av.content_key = t.content_key
+    WHERE t.buildable
 """
+
+
+def candidates_sql() -> str:
+    return _truth_cte() + _CANDIDATES_TAIL
+
+
+def drift_sql() -> str:
+    return _truth_cte() + _DRIFT_TAIL
 
 
 RefreshFn = Callable[..., Awaitable[bool]]
@@ -169,7 +211,7 @@ async def count_agent_pdp_view_drift(db: Any) -> Dict[str, int]:
     predates the newest upstream change. Consumed by /__catalog_health and
     the post-pass alarm below.
     """
-    row = await db.fetch_one(_DRIFT_SQL)
+    row = await db.fetch_one(drift_sql())
     missing = int((row["missing_public"] if row is not None else 0) or 0)
     stale = int((row["stale"] if row is not None else 0) or 0)
     return {"missing_public": missing, "stale": stale, "total": missing + stale}
@@ -189,6 +231,18 @@ async def reconcile_agent_pdp_view(
     the drift count when trust-public, which is the honest signal. ``errors``
     counts per-key failures — one poisoned key must never abort the pass
     (the #1574 lesson), and an errored key is NOT counted as refreshed.
+
+    Accepted race (documented, not guarded): the event pokes (catalog_sync,
+    seed writer, enrichment publish) call the SAME unconditional
+    read-assemble-upsert primitive concurrently. If an upstream write plus a
+    poke both land inside this pass's ~1s per-key read->write window, the
+    reconciler can overwrite the poke's fresher payload while stamping a
+    fresh refreshed_at, masking that key's staleness until the NEXT upstream
+    write re-flags it. This race is identical to the pre-existing
+    poke-vs-poke race (the primitive has never had a freshness CAS), the
+    window only contains keys that just changed (which keep changing, so
+    they self-heal), and a CAS belongs in the shared primitive for ALL
+    callers if it ever matters — not here.
     """
     if refresh is None:
         from services.agent_pdp_view_assembler import (
@@ -197,7 +251,7 @@ async def reconcile_agent_pdp_view(
 
         refresh = refresh_agent_pdp_view_for_content_key
 
-    rows = await db.fetch_all(_CANDIDATES_SQL, {"limit": max(1, int(limit))})
+    rows = await db.fetch_all(candidates_sql(), {"limit": max(1, int(limit))})
     content_keys = [r["content_key"] for r in rows if r["content_key"]]
     counters = {
         "candidates": len(content_keys),
@@ -248,6 +302,18 @@ async def run_agent_pdp_view_reconcile_tick(
             counters["skipped_no_row"],
             counters["errors"],
         )
+        if counters["skipped_no_row"]:
+            # Candidacy mirrors the assembler's buildability predicates
+            # (quarantine anti-join + title), so a decline here means the two
+            # have DRIFTED — such keys re-enter every pass without ever
+            # converging. WARNING (prod filters INFO): fix the predicate
+            # mirror, don't wait for the drift alarm.
+            logger.warning(
+                "agent_pdp_view_reconcile: %d candidate(s) declined by the "
+                "refresh primitive — candidate SQL and assembler buildability "
+                "predicates have drifted; these keys will churn every pass",
+                counters["skipped_no_row"],
+            )
 
         # Post-pass drift guard. After a pass, remaining drift should be at
         # most (drift_before - limit) plus rows touched mid-run; a count

@@ -45,6 +45,30 @@ _COHORT_SQL = """
 """
 
 
+# In-process TTL cache for the agent_pdp_view drift count. Errors are
+# returned but never cached, so a transient failure heals on the next hit.
+_APV_DRIFT_TTL_SECONDS = 300.0
+_apv_drift_cache: Dict[str, Any] = {"at": 0.0, "value": None}
+
+
+async def _cached_agent_pdp_view_drift(database: Any) -> Dict[str, Any]:
+    import time
+
+    now = time.monotonic()
+    cached = _apv_drift_cache["value"]
+    if cached is not None and (now - _apv_drift_cache["at"]) < _APV_DRIFT_TTL_SECONDS:
+        return {**cached, "cached": True}
+    try:
+        from jobs.agent_pdp_view_reconciler_cron import count_agent_pdp_view_drift
+
+        value = await count_agent_pdp_view_drift(database)
+    except Exception as exc:  # noqa: BLE001
+        return {"error": str(exc)}
+    _apv_drift_cache["value"] = value
+    _apv_drift_cache["at"] = now
+    return {**value, "cached": False}
+
+
 @router.get("/__catalog_health")
 async def catalog_health() -> Dict[str, Any]:
     from db.database import database
@@ -65,13 +89,11 @@ async def catalog_health() -> Dict[str, Any]:
         public = totals.get("public", 0)
         # ADR-012 Phase 1 — agent_pdp_view drift (stale + missing-vs-public
         # view rows). Same count the reconciler alarms on; best-effort so a
-        # drift-query failure never hides the funnel.
-        try:
-            from jobs.agent_pdp_view_reconciler_cron import count_agent_pdp_view_drift
-
-            apv_drift: Dict[str, Any] = await count_agent_pdp_view_drift(database)
-        except Exception as exc:  # noqa: BLE001
-            apv_drift = {"error": str(exc)}
+        # drift-query failure never hides the funnel. TTL-cached: the count
+        # only moves on the reconciler's 6h cadence (plus event pokes), and
+        # the query is a full truth-CTE aggregate on a 140ms-RTT shared DB —
+        # a polled health endpoint must not re-pay it every hit.
+        apv_drift = await _cached_agent_pdp_view_drift(database)
         return {
             "catalog_total": catalog_total,
             "serving_corpus": corpus,

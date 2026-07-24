@@ -158,6 +158,46 @@ async def test_drift_count_tolerates_no_row():
     assert drift == {"missing_public": 0, "stale": 0, "total": 0}
 
 
+class ConvergingFakeDb:
+    """Models the candidacy<->refresh coupling the plain FakeDb cannot: a key
+    stays a candidate until a LANDED refresh clears it. Lets the suite assert
+    the fixed-point property (bounded runs converge; a converged store yields
+    an empty candidate set) at the glue level. The real SQL semantics behind
+    the coupling are exercised by the Postgres integration test."""
+
+    def __init__(self, keys):
+        self.pending = list(keys)
+
+    async def fetch_all(self, query, values=None):
+        assert "LIMIT :limit" in query
+        limit = int((values or {}).get("limit"))
+        return [{"content_key": k} for k in self.pending[:limit]]
+
+    async def fetch_one(self, query, values=None):
+        return {"missing_public": 0, "stale": len(self.pending)}
+
+
+@pytest.mark.asyncio
+async def test_bounded_runs_converge_to_a_fixed_point():
+    """Full coverage over successive runs: with limit=2 over 5 keys, three
+    passes converge everything and a fourth is an empty no-op — the per-run
+    bound is a budget, never a coverage cap."""
+    db = ConvergingFakeDb([f"ck_{i}" for i in range(5)])
+
+    async def refresh(content_key, *, refresh_source, db):
+        db.pending.remove(content_key)
+        return True
+
+    per_pass = []
+    for _ in range(4):
+        counters = await reconcile_agent_pdp_view(db=db, limit=2, refresh=refresh)
+        per_pass.append((counters["candidates"], counters["refreshed"]))
+
+    assert per_pass == [(2, 2), (2, 2), (1, 1), (0, 0)]
+    assert db.pending == []
+    assert (await count_agent_pdp_view_drift(db))["total"] == 0
+
+
 # ---------------------------------------------------------------------------
 # Tick wrapper: env gates + drift alarm
 # ---------------------------------------------------------------------------
@@ -174,7 +214,8 @@ async def test_tick_error_logs_when_drift_exceeds_threshold(monkeypatch, caplog)
 
     errors = [r for r in caplog.records if r.levelno == logging.ERROR]
     assert len(errors) == 1
-    assert "13" in errors[0].getMessage()  # total drift
+    # Structured args, not a loose substring: (total, stale, missing, threshold).
+    assert errors[0].args[:3] == (13, 6, 7)
     assert refresh.calls  # the pass still ran
 
 
