@@ -46,6 +46,10 @@ from services.beauty_external_ranking import (
     rank_external_seed_rows,
 )
 from services.product_query_service import get_products_hybrid
+from services.test_merchant_policy import (
+    get_excluded_merchant_ids,
+    filter_out_test_merchants,
+)
 from services.external_seed_search import fetch_external_seed_rows
 from services.pivot_query_service import search_pivot_catalog
 from services.query_semantic_class import classify_query_semantic_class
@@ -7361,6 +7365,22 @@ async def _handle_find_products(
             continue
         visible.append(p)
 
+    # Test/demo rigs never surface publicly, even on an explicit merchant-scoped
+    # query. Mirrors the multi lane's exclusion; see services/test_merchant_policy.
+    try:
+        from db.database import database as _db
+        _excluded_ids = await get_excluded_merchant_ids(_db)
+        if _excluded_ids:
+            _before = len(visible)
+            visible = filter_out_test_merchants(visible, _excluded_ids)
+            if len(visible) != _before:
+                logger.info(
+                    "find_products.excluded_test_merchants",
+                    extra={"dropped": _before - len(visible), "merchant_id": merchant_id},
+                )
+    except Exception:
+        pass  # never let the rig filter break search
+
     # In-memory filtering based on query/category/price
     filtered: List[StandardProduct] = visible
 
@@ -7560,6 +7580,32 @@ async def _handle_find_products_multi(
     decision-layer ledger records exactly one event per SERVED slate, not the
     intermediate queries (which would pollute the behavioral baseline)."""
     result = await _handle_find_products_multi_inner(payload, request_metadata, background_tasks)
+    # Exclude test/demo rigs BEFORE redirect stamping + decision recording, so a
+    # rig is neither /r-attributed nor deposited in the behavioral ledger. This
+    # is the wrapper over EVERY inner return branch (cached, pivot, fallback,
+    # retry), so it is the single choke point for the connected_catalog /
+    # products_cache lane — which is gated only by _is_product_sellable and was
+    # serving Shopify's stock dev-store sample catalog on the UNAUTH public
+    # find_products_multi endpoint (2026-07-23). See services/test_merchant_policy.
+    try:
+        if isinstance(result, dict) and isinstance(result.get("products"), list):
+            from db.database import database as _db
+            excluded_ids = await get_excluded_merchant_ids(_db)
+            before = len(result["products"])
+            result["products"] = filter_out_test_merchants(result["products"], excluded_ids)
+            dropped = before - len(result["products"])
+            if dropped:
+                # Keep the counters honest so a shrunken slate is not read as a
+                # ranking regression.
+                if isinstance(result.get("total"), int):
+                    result["total"] = max(0, result["total"] - dropped)
+                result["page_size"] = len(result["products"])
+                logger.info(
+                    "find_products_multi.excluded_test_merchants",
+                    extra={"dropped": dropped, "surface": "find_products_multi"},
+                )
+    except Exception:
+        pass  # never let the rig filter break search
     try:
         if isinstance(result, dict):
             await _attach_connected_product_redirects(result.get("products"), tool="find_products_multi")
