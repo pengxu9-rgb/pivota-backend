@@ -54,7 +54,15 @@ class FakeDb:
         values = values or {}
         if "product_key = ANY" in query:
             keys = set(values.get("product_keys") or [])
-            return [r for r in self._joined_rows if r.get("product_key") in keys]
+            matched = [r for r in self._joined_rows if r.get("product_key") in keys]
+            # Honor the SQL's ORDER BY product_key + LIMIT :limit. The real
+            # query truncates — a fake that returns everything masked the
+            # bulk-truncation bug (806 rows starved in prod for weeks).
+            matched.sort(key=lambda r: str(r.get("product_key")))
+            fetch_limit = values.get("limit")
+            if fetch_limit is not None:
+                matched = matched[: int(fetch_limit)]
+            return matched
         if "lower(coalesce" in query:
             target = str(values.get("match_value") or "").lower()
             return [
@@ -205,6 +213,81 @@ async def test_bulk_upserts_all_supplied_keys():
     assert wrote == 3
     subjects = sorted(p["subject_key"] for _, p in db.executes)
     assert subjects == ["pk_a", "pk_b", "pk_c"]
+
+
+@pytest.mark.asyncio
+async def test_bulk_processes_every_key_beyond_one_fetch_batch():
+    """Regression: the bulk upserter must cover ALL supplied keys, not just
+    the first fetch-batch. Pre-fix, a single ``ORDER BY product_key LIMIT``
+    fetch dropped every key past ``limit`` — deterministically the same
+    alphabetical winners each cron run, so the tail never got a trust row."""
+    rows = [make_joined_row(product_key=f"pk_{i:03d}") for i in range(7)]
+    db = FakeDb(joined_rows=rows)
+
+    wrote = await upsert_catalog_row_trust_many(
+        db=db,
+        product_keys=[f"pk_{i:03d}" for i in range(7)],
+        now=NOW,
+        limit=3,  # force 3 fetch batches: 3 + 3 + 1
+    )
+
+    assert wrote == 7
+    subjects = sorted(p["subject_key"] for _, p in db.executes)
+    assert subjects == [f"pk_{i:03d}" for i in range(7)]
+
+
+@pytest.mark.asyncio
+async def test_bulk_batches_follow_caller_order_not_alphabetical():
+    """The cron passes keys stalest-first; batching must chunk that order,
+    not re-sort globally. With limit=1 each batch is one key, so the write
+    sequence IS the batch sequence."""
+    rows = [
+        make_joined_row(product_key="pk_zzz_stalest"),
+        make_joined_row(product_key="pk_aaa_freshest"),
+    ]
+    db = FakeDb(joined_rows=rows)
+
+    wrote = await upsert_catalog_row_trust_many(
+        db=db,
+        product_keys=["pk_zzz_stalest", "pk_aaa_freshest"],
+        now=NOW,
+        limit=1,
+    )
+
+    assert wrote == 2
+    write_order = [p["subject_key"] for _, p in db.executes]
+    assert write_order == ["pk_zzz_stalest", "pk_aaa_freshest"]
+
+
+@pytest.mark.asyncio
+async def test_bulk_failed_batch_does_not_abort_remaining_batches():
+    class FlakyDb(FakeDb):
+        def __init__(self, **kw):
+            super().__init__(**kw)
+            self.any_fetches = 0
+
+        async def fetch_all(self, query, values=None):
+            if "product_key = ANY" in query:
+                self.any_fetches += 1
+                if self.any_fetches == 1:
+                    raise RuntimeError("transient db error")
+            return await super().fetch_all(query, values)
+
+    rows = [
+        make_joined_row(product_key="pk_batch1"),
+        make_joined_row(product_key="pk_batch2"),
+    ]
+    db = FlakyDb(joined_rows=rows)
+
+    wrote = await upsert_catalog_row_trust_many(
+        db=db,
+        product_keys=["pk_batch1", "pk_batch2"],
+        now=NOW,
+        limit=1,
+    )
+
+    assert wrote == 1  # batch 1 lost (logged), batch 2 still processed
+    assert [p["subject_key"] for _, p in db.executes] == ["pk_batch2"]
 
 
 @pytest.mark.asyncio

@@ -15,8 +15,11 @@ policy_version has changed. Idle runs (no drift) execute the full SELECT
 but emit zero writes, keeping I/O proportional to actual drift.
 
 Env vars:
-  CATALOG_TRUST_BACKFILL_ENABLED   default true  — set false to pause
-  CATALOG_TRUST_BACKFILL_LIMIT     default 50000 — rows per run
+  CATALOG_TRUST_BACKFILL_ENABLED         default true  — set false to pause
+  CATALOG_TRUST_BACKFILL_LIMIT           default 50000 — rows per run
+  CATALOG_TRUST_DRIFT_ALERT_THRESHOLD    default 50    — ERROR-log when more
+      catalog rows than this still lack a trust row after a full pass
+      (readers gate fail-closed, so every such row is an invisible product)
 """
 
 from __future__ import annotations
@@ -27,8 +30,10 @@ import os
 logger = logging.getLogger(__name__)
 
 _DEFAULT_LIMIT = 50_000
+_DEFAULT_DRIFT_ALERT_THRESHOLD = 50
 _ENV_ENABLED = "CATALOG_TRUST_BACKFILL_ENABLED"
 _ENV_LIMIT = "CATALOG_TRUST_BACKFILL_LIMIT"
+_ENV_DRIFT_THRESHOLD = "CATALOG_TRUST_DRIFT_ALERT_THRESHOLD"
 
 
 def _is_enabled() -> bool:
@@ -44,6 +49,20 @@ def _limit() -> int:
     except (TypeError, ValueError):
         logger.warning("catalog_trust_backfill: invalid %s=%r; using %d", _ENV_LIMIT, raw, _DEFAULT_LIMIT)
         return _DEFAULT_LIMIT
+
+
+def _drift_alert_threshold() -> int:
+    raw = os.getenv(_ENV_DRIFT_THRESHOLD)
+    if raw is None:
+        return _DEFAULT_DRIFT_ALERT_THRESHOLD
+    try:
+        return max(0, int(raw))
+    except (TypeError, ValueError):
+        logger.warning(
+            "catalog_trust_backfill: invalid %s=%r; using %d",
+            _ENV_DRIFT_THRESHOLD, raw, _DEFAULT_DRIFT_ALERT_THRESHOLD,
+        )
+        return _DEFAULT_DRIFT_ALERT_THRESHOLD
 
 
 async def run_catalog_row_trust_backfill_tick() -> None:
@@ -77,9 +96,35 @@ async def run_catalog_row_trust_backfill_tick() -> None:
 
         wrote = await upsert_catalog_row_trust_many(db=database, product_keys=product_keys)
         logger.info(
-            "catalog_trust_backfill: processed %d keys, wrote %d trust rows",
+            "catalog_trust_backfill: derived %d keys, wrote %d trust rows",
             len(product_keys),
             wrote,
         )
+
+        # Post-pass drift guard. After a full pass every catalog row should
+        # have a trust row (modulo rows created mid-run); the agent-side
+        # readers gate on EXISTS serving_decision='public', so a row with no
+        # trust row is an invisible product. This exact class went unnoticed
+        # for weeks when the upserter silently truncated bulk batches — keep
+        # the count loud (prod filters INFO logs, so alert at ERROR).
+        _DRIFT_SQL = """
+            SELECT count(*) AS missing
+            FROM catalog_products cp
+            LEFT JOIN catalog_row_trust crt
+                ON crt.subject_type = 'product'
+               AND crt.subject_key  = cp.product_key
+            WHERE crt.subject_key IS NULL
+        """
+        drift_row = await database.fetch_one(_DRIFT_SQL)
+        missing = int((drift_row["missing"] if drift_row is not None else 0) or 0)
+        threshold = _drift_alert_threshold()
+        if missing > threshold:
+            logger.error(
+                "catalog_trust_backfill: %d catalog rows still have NO trust row "
+                "after a full pass (threshold %d) — fail-closed readers are "
+                "hiding these products",
+                missing,
+                threshold,
+            )
     except Exception:
         logger.exception("catalog_trust_backfill: tick failed")
