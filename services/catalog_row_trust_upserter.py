@@ -374,7 +374,7 @@ async def upsert_catalog_row_trust_many(
     batch_size = max(1, int(limit))
     quarantines: Optional[list] = None
     wrote = 0
-    fetched = 0
+    no_catalog_row = 0
     for start in range(0, len(keys), batch_size):
         chunk = keys[start : start + batch_size]
         try:
@@ -385,7 +385,7 @@ async def upsert_catalog_row_trust_many(
             )
             if quarantines is None:
                 quarantines = await _load_active_quarantines(db)
-            fetched += len(rows)
+            no_catalog_row += max(0, len(chunk) - len(rows))
             for row in rows:
                 try:
                     if await _compute_and_upsert(
@@ -404,13 +404,16 @@ async def upsert_catalog_row_trust_many(
                 start + len(chunk),
                 len(keys),
             )
-    if fetched < len(keys):
-        # product_key is the catalog_products PK, so a shortfall is exactly
-        # the keys with no catalog row anymore (deleted mid-flight). Expected
-        # in small numbers; surfaced so a coverage gap is never silent.
+    if no_catalog_row:
+        # Counted per SUCCESSFUL batch only (failed batches are logged
+        # above and say nothing about their keys). product_key is the
+        # catalog_products PK, so within a fetched batch a shortfall is
+        # exactly the keys with no catalog row anymore (deleted
+        # mid-flight). Expected in small numbers; surfaced so a coverage
+        # gap is never silent.
         logger.info(
             "catalog_row_trust bulk upsert: %d of %d keys had no catalog row",
-            len(keys) - fetched,
+            no_catalog_row,
             len(keys),
         )
     return wrote
