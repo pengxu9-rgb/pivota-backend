@@ -355,39 +355,68 @@ async def upsert_catalog_row_trust_many(
     now: Optional[datetime] = None,
     limit: int = _QUARANTINE_BULK_MAX,
 ) -> int:
-    """Recompute and UPSERT trust rows for a batch of ``product_keys``.
+    """Recompute and UPSERT trust rows for every supplied ``product_key``.
+
+    ``limit`` bounds each fetch BATCH, not total coverage: the keys are
+    processed in the caller's order, ``limit`` at a time, until the list is
+    exhausted. The caller's order is load-bearing — the backfill cron passes
+    keys stalest-first, and a bound that re-sorted or truncated the list
+    would starve the tail (rows past the bound never got a trust row, and
+    fail-closed readers made them permanently unservable).
 
     Returns the count of rows the policy emitted (write attempts; idempotent
-    UPSERT may not change all of them). Errors are logged per-row.
+    UPSERT may not change all of them). Errors are logged per row and per
+    batch; a failed batch never aborts the remaining batches.
     """
     keys = [str(k) for k in product_keys if k]
     if not keys:
         return 0
-    try:
-        rows = await _fetch_all(
-            db,
-            _SELECT_BY_PRODUCT_KEYS_SQL,
-            {"product_keys": keys, "limit": int(limit)},
+    batch_size = max(1, int(limit))
+    quarantines: Optional[list] = None
+    wrote = 0
+    no_catalog_row = 0
+    for start in range(0, len(keys), batch_size):
+        chunk = keys[start : start + batch_size]
+        try:
+            rows = await _fetch_all(
+                db,
+                _SELECT_BY_PRODUCT_KEYS_SQL,
+                {"product_keys": chunk, "limit": len(chunk)},
+            )
+            if quarantines is None:
+                quarantines = await _load_active_quarantines(db)
+            no_catalog_row += max(0, len(chunk) - len(rows))
+            for row in rows:
+                try:
+                    if await _compute_and_upsert(
+                        db=db, joined=row, quarantines=quarantines, now=now
+                    ):
+                        wrote += 1
+                except Exception:  # pragma: no cover
+                    logger.exception(
+                        "catalog_row_trust upsert failed for product_key=%s",
+                        _row_get(row, "product_key"),
+                    )
+        except Exception:  # pragma: no cover
+            logger.exception(
+                "catalog_row_trust bulk upsert: batch %d-%d of %d keys failed",
+                start,
+                start + len(chunk),
+                len(keys),
+            )
+    if no_catalog_row:
+        # Counted per SUCCESSFUL batch only (failed batches are logged
+        # above and say nothing about their keys). product_key is the
+        # catalog_products PK, so within a fetched batch a shortfall is
+        # exactly the keys with no catalog row anymore (deleted
+        # mid-flight). Expected in small numbers; surfaced so a coverage
+        # gap is never silent.
+        logger.info(
+            "catalog_row_trust bulk upsert: %d of %d keys had no catalog row",
+            no_catalog_row,
+            len(keys),
         )
-        quarantines = await _load_active_quarantines(db)
-        wrote = 0
-        for row in rows:
-            try:
-                if await _compute_and_upsert(
-                    db=db, joined=row, quarantines=quarantines, now=now
-                ):
-                    wrote += 1
-            except Exception:  # pragma: no cover
-                logger.exception(
-                    "catalog_row_trust upsert failed for product_key=%s",
-                    _row_get(row, "product_key"),
-                )
-        return wrote
-    except Exception:  # pragma: no cover
-        logger.exception(
-            "catalog_row_trust bulk upsert failed for %d keys", len(keys)
-        )
-        return 0
+    return wrote
 
 
 async def upsert_catalog_row_trust_for_quarantine_match(
