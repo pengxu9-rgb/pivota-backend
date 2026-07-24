@@ -63,6 +63,15 @@ async def catalog_health() -> Dict[str, Any]:
         # THIS is the denominator quality work should be measured against.
         corpus = catalog_total - totals.get("retired_by_design", 0) - totals.get("no_trust_row", 0)
         public = totals.get("public", 0)
+        # ADR-012 Phase 1 — agent_pdp_view drift (stale + missing-vs-public
+        # view rows). Same count the reconciler alarms on; best-effort so a
+        # drift-query failure never hides the funnel.
+        try:
+            from jobs.agent_pdp_view_reconciler_cron import count_agent_pdp_view_drift
+
+            apv_drift: Dict[str, Any] = await count_agent_pdp_view_drift(database)
+        except Exception as exc:  # noqa: BLE001
+            apv_drift = {"error": str(exc)}
         return {
             "catalog_total": catalog_total,
             "serving_corpus": corpus,
@@ -70,6 +79,7 @@ async def catalog_health() -> Dict[str, Any]:
             "serving_pct_of_corpus": round(100.0 * public / corpus, 1) if corpus else None,
             "cohorts": totals,
             "by_source_system": by_source,
+            "agent_pdp_view_drift": apv_drift,
         }
     except Exception as exc:  # noqa: BLE001 — ops endpoint never 500s
         return {"error": str(exc)}
