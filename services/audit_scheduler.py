@@ -660,6 +660,29 @@ async def start_scheduler() -> None:
             max_instances=1,
         )
 
+        # ADR-012 Phase 1 slice 1 — agent_pdp_view convergent reconciler.
+        # Sweeps stale/missing view rows back to catalog truth via the
+        # canonical refresh primitive; bounded per run, stalest-first, with
+        # a post-pass drift alarm (also on /__catalog_health). CRON trigger
+        # for the same restart-starvation reason as the trust backfill; :43
+        # offsets it from the :17 trust slots and the :00 crons so the two
+        # 6-hourly catalog sweeps never contend on the shared Postgres.
+        # Disable via AGENT_PDP_VIEW_RECONCILE_ENABLED=false without a deploy.
+        from jobs.agent_pdp_view_reconciler_cron import (
+            run_agent_pdp_view_reconcile_tick,
+        )
+        _add_job(
+            run_agent_pdp_view_reconcile_tick,
+            "cron",
+            hour="*/6",
+            minute=43,
+            id="agent_pdp_view_reconcile",
+            replace_existing=True,
+            misfire_grace_time=1800,
+            coalesce=True,
+            max_instances=1,
+        )
+
         # Onboarding→audit readiness: drain quality-backfill jobs enqueued at the
         # end of catalog sync. The scorer is deterministic (no LLM), so a 30s
         # interval is cheap; this populates product_quality_snapshot so a freshly
@@ -778,6 +801,7 @@ async def start_scheduler() -> None:
             "+ settlement_file_generate (day 5 02:00 UTC, ACTIVE) "
             "+ settlement_file_transfer (day 10 02:00 UTC, ACTIVE) "
             "+ catalog_row_trust_backfill (cron */6h :17, ACTIVE) "
+            "+ agent_pdp_view_reconcile (cron */6h :43, ACTIVE) "
             "+ payment_reconcile_tick (5min, flag-gated PAYMENT_RECONCILE_SWEEP_ENABLED) "
             "+ identity_reconcile_sweep (Mon 04:30 UTC, flag-gated ENABLE_IDENTITY_RECONCILE_SWEEP)"
         )
