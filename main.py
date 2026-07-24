@@ -854,6 +854,10 @@ app.include_router(admin_scheduler_jobs_router)
 from routes.__trust_health import router as trust_health_router
 app.include_router(trust_health_router)
 
+# ADR-012 Phase 0 — per-cohort catalog funnel + on-demand invariant checks.
+from routes.__catalog_health import router as catalog_health_router
+app.include_router(catalog_health_router)
+
 # Operational endpoint family for v1.3 monetization shakeout — wraps the
 # T6/T7/T9 cron tasks as synchronously-invokable HTTP endpoints so end-to-end
 # shakeout scripts (scripts/shakeout/c_full_order_pipeline.py et al.) can

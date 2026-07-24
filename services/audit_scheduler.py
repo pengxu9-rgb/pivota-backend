@@ -630,6 +630,21 @@ async def start_scheduler() -> None:
         # PIVOTA-Agent repo). A cron trigger fires at wall-clock slots regardless
         # of restart cadence; the job only needs to be alive at (or within
         # misfire_grace_time of) a slot.
+        # ADR-012 Phase 0b — daily serving-surface invariant sweep. CRON
+        # trigger for the same restart-starvation reason as the trust backfill.
+        from jobs.catalog_invariant_sweep_job import run_catalog_invariant_sweep_tick
+        _add_job(
+            run_catalog_invariant_sweep_tick,
+            "cron",
+            hour=4,
+            minute=50,  # after nightly_index_health (04:00) has reconciled IPS
+            id="catalog_invariant_sweep",
+            replace_existing=True,
+            misfire_grace_time=3600,
+            coalesce=True,
+            max_instances=1,
+        )
+
         from jobs.catalog_row_trust_backfill_cron import (
             run_catalog_row_trust_backfill_tick,
         )
