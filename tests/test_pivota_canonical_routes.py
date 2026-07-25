@@ -594,11 +594,15 @@ def test_renderable_excludes_rows_whose_external_seed_is_not_active(env):
 
     from routes import pivota_canonical_routes as pcr
 
-    sql = "\n".join(pcr.database.compiled_sql)
+    sql = " ".join(" ".join(pcr.database.compiled_sql).split())
     assert "external_product_seeds" in sql
-    # Correlated on catalog_products (a cartesian product here would make
-    # `renderable` a global constant instead of a per-row answer).
-    assert "FROM external_product_seeds \nWHERE catalog_products" in sql
+    # The seed subquery must be CORRELATED: its FROM names only
+    # external_product_seeds, with catalog_products supplied by the outer
+    # query. If catalog_products appeared in that FROM the subquery would be a
+    # cartesian product and `renderable` would collapse into a global constant
+    # instead of a per-row answer. Whitespace is normalized above so this does
+    # not depend on SQLAlchemy's line breaks.
+    assert "FROM external_product_seeds WHERE catalog_products" in sql
 
 
 # ---------------------------------------------------------------------------
@@ -655,7 +659,10 @@ def _renderable_for(renderable_engine, *, merchant_id, source_product_id, seeds)
     then evaluate the REAL `_renderable_column()` against it."""
     from sqlalchemy import select as sa_select
 
-    from routes.pivota_canonical_routes import _renderable_column
+    from routes.pivota_canonical_routes import (
+        _renderable_column,
+        catalog_products as real_catalog_products,
+    )
 
     engine, md = renderable_engine
     cp = md.tables["catalog_products"]
@@ -690,7 +697,17 @@ def _renderable_for(renderable_engine, *, merchant_id, source_product_id, seeds)
             )
 
     with engine.connect() as conn:
-        return bool(conn.execute(sa_select([_renderable_column()])).scalar())
+        # Pin the outer FROM to the SAME table object the expression references
+        # (the route module's, not this fixture's same-named one — mixing them
+        # emits both into FROM and SQLite rejects it as ambiguous).
+        #
+        # This is load-bearing, not cosmetic: without an explicit select_from
+        # the outer FROM is INFERRED from whichever catalog_products reference
+        # happens to sit outside a subquery. If that reference ever moved
+        # inside one, the EXISTS clauses would silently become uncorrelated and
+        # these tests would go VACUOUS rather than fail.
+        stmt = sa_select(_renderable_column()).select_from(real_catalog_products)
+        return bool(conn.execute(stmt).scalar())
 
 
 def test_renderable_false_for_external_seed_row_whose_only_seed_is_inactive(

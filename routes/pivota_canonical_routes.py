@@ -172,6 +172,11 @@ def _external_seed_lane():
     ``external_product_seeds.external_product_id``, and any of them could be
     falsely dropped from the sitemap the moment one of those seeds went
     inactive. (Zero such rows exist today — this is a guard, not a repair.)
+
+    Both columns are NOT NULL, so this stays two-valued. If that ever changes,
+    a NULL here would make the whole `renderable` expression NULL, which
+    ``bool(r["renderable"])`` would silently coerce to False and drop the row —
+    wrap in ``func.coalesce(..., True)`` at that point.
     """
     lowered_id = func.lower(func.trim(catalog_products.c.source_product_id))
     return or_(
@@ -211,7 +216,20 @@ def _seed_status_ok():
 
 
 def _seed_exists():
-    """EXISTS: any seed row at all for this row's source_product_id."""
+    """EXISTS: any seed row at all for this row's source_product_id.
+
+    KNOWN GAP (deliberate). The gateway's seed lookup tries three keys in
+    order: ``external_product_id = $1``, then ``id::text = $1``, then several
+    ``seed_data->>`` JSON paths. This mirrors only the first — the JSON paths
+    are unindexed and would turn a per-row correlated subquery on the sitemap
+    feed into a scan.
+
+    The gap direction is safe: matching fewer rows means we UNDER-block, so the
+    feed may still advertise a URL the gateway 404s. It never falsely drops a
+    live one. It is also empirically empty for the current cohort — this
+    predicate reproduced all 127 of the failing sitemap URLs exactly. Revisit
+    with an expression index if 404s reappear on rows this misses.
+    """
     return (
         select(external_product_seeds.c.external_product_id)
         .where(
