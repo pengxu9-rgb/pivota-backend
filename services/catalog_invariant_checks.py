@@ -15,16 +15,62 @@ import logging
 import os
 from typing import Any, Dict, List
 
+from sqlalchemy import String, and_, column, func, not_, select, table
+
+from db.catalog import catalog_products
+from services.pdp_renderability import compile_pg, pdp_renderable_expression
+
 logger = logging.getLogger(__name__)
 
 _SAMPLE_LIMIT = 5
 
+
+# --- public_not_renderable, built from the shared renderability predicate ----
+#
+# This check used to hand-write "no approved + live_read_enabled
+# pdp_identity_listing row exists" — the same belief the sitemap feed held, and
+# the same belief 29 live PDP fetches disproved on 2026-07-25 (rows with NO
+# identity listing at all render full 200s; rows with one render 500s). It now
+# compiles :func:`pdp_renderable_expression`, so the invariant and the feed
+# cannot disagree about what "renderable" means.
+_crt = table(
+    "catalog_row_trust",
+    column("subject_type", String),
+    column("subject_key", String),
+    column("serving_decision", String),
+)
+_cp = catalog_products.alias("cp")
+
+_NOT_RENDERABLE_PUBLIC_WHERE = and_(
+    _crt.c.subject_type == "product",
+    _crt.c.serving_decision == "public",
+    not_(pdp_renderable_expression(_cp)),
+)
+_NOT_RENDERABLE_PUBLIC_FROM = _crt.join(
+    _cp, _cp.c.product_key == _crt.c.subject_key
+)
+
+_PUBLIC_NOT_RENDERABLE_COUNT_SQL = compile_pg(
+    select(func.count().label("c"))
+    .select_from(_NOT_RENDERABLE_PUBLIC_FROM)
+    .where(_NOT_RENDERABLE_PUBLIC_WHERE)
+)
+_PUBLIC_NOT_RENDERABLE_SAMPLE_SQL = compile_pg(
+    select(_crt.c.subject_key)
+    .select_from(_NOT_RENDERABLE_PUBLIC_FROM)
+    .where(_NOT_RENDERABLE_PUBLIC_WHERE)
+    .limit(_SAMPLE_LIMIT)
+)
+
 # Each check: (name, threshold_env, default_threshold, description, count SQL,
 # sample SQL). Violation = count > threshold. Thresholds default to 0 except
-# PUBLIC_NOT_RENDERABLE: trust policy's first-party / observed-seller identity
-# exemption means public does NOT yet imply a row-grain approved+live_read
-# identity listing (the known c1.v0.5 gap) — threshold is env-tunable so the
-# sweep tracks the number without paging until the policy closes the gap.
+# PUBLIC_NOT_RENDERABLE: the trust policy still lets rows reach 'public' whose
+# PDP has no resolvable content route (measured 2026-07-25: 1,375 Path-C minted
+# rows whose seeds attach by attached_product_key, so the gateway's
+# external_product_id lookup never finds them, plus 1 audit-minted url_audit
+# row) — threshold is env-tunable so the sweep tracks the number without paging
+# until CATALOG_TRUST_RENDERABLE_GATE is flipped on or the P3 identity path for
+# catalog_enrichment_agent_v1 ships.
 _CHECKS: List[Dict[str, Any]] = [
     {
         "name": "public_but_suppressed",
@@ -104,40 +150,14 @@ _CHECKS: List[Dict[str, Any]] = [
     {
         "name": "public_not_renderable",
         "description": (
-            "trust says public but the row-grain identity listing is not "
-            "approved+live_read (PDP renders a shell) — known c1.v0.5 gap"
+            "trust says public but the gateway has no resolvable PDP content "
+            "route for the row (measured: hard HTTP 500, not a shell) — "
+            "c1.v0.5 gap"
         ),
         "env": "CATALOG_INVARIANT_RENDERABLE_THRESHOLD",
         "default_threshold": 500,
-        "count_sql": """
-            SELECT count(*) AS c
-            FROM catalog_row_trust crt
-            JOIN catalog_products cp ON cp.product_key = crt.subject_key
-            WHERE crt.subject_type = 'product'
-              AND crt.serving_decision = 'public'
-              AND NOT EXISTS (
-                  SELECT 1 FROM pdp_identity_listing pil
-                  WHERE pil.merchant_id = cp.merchant_id
-                    AND pil.product_id = cp.source_product_id
-                    AND pil.live_read_enabled IS TRUE
-                    AND pil.identity_status = 'approved'
-              )
-        """,
-        "sample_sql": """
-            SELECT crt.subject_key
-            FROM catalog_row_trust crt
-            JOIN catalog_products cp ON cp.product_key = crt.subject_key
-            WHERE crt.subject_type = 'product'
-              AND crt.serving_decision = 'public'
-              AND NOT EXISTS (
-                  SELECT 1 FROM pdp_identity_listing pil
-                  WHERE pil.merchant_id = cp.merchant_id
-                    AND pil.product_id = cp.source_product_id
-                    AND pil.live_read_enabled IS TRUE
-                    AND pil.identity_status = 'approved'
-              )
-            LIMIT 5
-        """,
+        "count_sql": _PUBLIC_NOT_RENDERABLE_COUNT_SQL,
+        "sample_sql": _PUBLIC_NOT_RENDERABLE_SAMPLE_SQL,
     },
     {
         "name": "orphan_trust_rows",

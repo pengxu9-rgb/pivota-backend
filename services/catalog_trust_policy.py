@@ -3,7 +3,7 @@
 Pure function: (inputs) -> catalog_row_trust shape.
 
 This is the Python parity port of PIVOTA-Agent/src/services/catalogTrustPolicy.js
-(POLICY_VERSION ``c1.v0.4``). Producer dual-write call sites in pivota-backend
+(POLICY_VERSION ``c1.v0.5``). Producer dual-write call sites in pivota-backend
 (catalog_sync_service, source_quarantine helpers) invoke ``derive_trust`` to
 populate ``catalog_row_trust`` so the reader contract stays live between
 periodic backfills.
@@ -30,7 +30,7 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Any, Iterable, Mapping, Optional
 
-POLICY_VERSION = "c1.v0.4"
+POLICY_VERSION = "c1.v0.5"
 
 # ---- Reason codes (authoritative vocabulary) -------------------------------
 #
@@ -64,6 +64,12 @@ POLICY_VERSION = "c1.v0.4"
 #   PUBLISH_STATE_NOT_PUBLIC         — catalog_products.publish_state != 'public'.
 #   IDENTITY_CONFLICT                — identity_status='conflict'.
 #   OFFER_SUPPRESSED                 — subject_type='offer' with offer.suppression_reason set.
+#   PDP_ROUTE_UNRESOLVABLE           — c1.v0.5. The gateway has no resolvable
+#     content route for the row, so its public PDP is a hard HTTP 500, not a
+#     shell (see services/pdp_renderability for the measured truth table).
+#     GATED on CATALOG_TRUST_RENDERABLE_GATE, default OFF: turning it on
+#     demotes 1,376 rows out of 'public' (measured 2026-07-25), which is a
+#     serving-surface decision for the founder, not a code default.
 
 
 class _ReasonCodes:
@@ -83,6 +89,7 @@ class _ReasonCodes:
     PUBLISH_STATE_NOT_PUBLIC = "PUBLISH_STATE_NOT_PUBLIC"
     IDENTITY_CONFLICT = "IDENTITY_CONFLICT"
     OFFER_SUPPRESSED = "OFFER_SUPPRESSED"
+    PDP_ROUTE_UNRESOLVABLE = "PDP_ROUTE_UNRESOLVABLE"
 
 
 REASON_CODES = _ReasonCodes()
@@ -106,6 +113,31 @@ def _index_eligible_read_enabled() -> bool:
         (os.getenv("INDEX_ELIGIBLE_READ") or "").strip().lower()
         in {"1", "true", "yes", "on"}
     )
+
+
+def _renderable_gate_enabled() -> bool:
+    """c1.v0.5 gate: does 'public' have to imply a renderable PDP?
+
+    Default OFF ⇒ byte-identical to c1.v0.4. Flipping it ON blocks every row
+    whose ``pdp_route_resolvable`` input is explicitly ``False``.
+
+    Why a flag and not a straight fix: the rows this catches are real,
+    quality-eligible products (measured 2026-07-25: 1,375 Path-C minted
+    canonicals whose seeds attach by ``attached_product_key`` so the gateway's
+    ``external_product_id`` lookup never finds them, plus 1 audit-minted
+    ``url_audit`` row). Their PDPs hard-500 today, so serving them is a broken
+    promise — but 1,011 of them have NO renderable sibling row, meaning the
+    product goes dark entirely, and public drops 3,937 → 2,561 (40% → 26% of
+    the serving corpus). The RIGHT fix is the P3 identity path that teaches the
+    gateway to resolve minted canonicals through ``attached_product_key``
+    (PIVOTA-Agent). This gate is the honest fallback, and which of the two
+    lands first is the founder's call.
+    """
+    return (
+        (os.getenv("CATALOG_TRUST_RENDERABLE_GATE") or "").strip().lower()
+        in {"1", "true", "yes", "on"}
+    )
+
 
 # Freshness thresholds (seconds). Tuned to keep external_seed which refreshes
 # ~24h in the 'fresh' bucket and to mark internal merchant catalog stale after
@@ -149,6 +181,14 @@ def derive_trust(inputs: Mapping[str, Any]) -> dict[str, Any]:
     external_seed = inputs.get("external_seed") or None
     merchant_store = inputs.get("merchant_store") or None
     override = inputs.get("override") or None
+    # c1.v0.5 tri-state. True = the gateway can resolve a PDP content route;
+    # False = it cannot (the PDP is a hard 500); None/absent = the caller did
+    # not compute it. Absence NEVER blocks, so any producer that has not been
+    # taught to supply it keeps its c1.v0.4 output exactly.
+    raw_route_resolvable = inputs.get("pdp_route_resolvable")
+    pdp_route_resolvable = (
+        None if raw_route_resolvable is None else bool(raw_route_resolvable)
+    )
     raw_quarantines = inputs.get("active_quarantines") or []
     active_quarantines = list(raw_quarantines) if isinstance(raw_quarantines, Iterable) else []
 
@@ -185,6 +225,7 @@ def derive_trust(inputs: Mapping[str, Any]) -> dict[str, Any]:
         ips=ips,
         source_lifecycle=source_lifecycle,
         identity_decision=identity_decision,
+        pdp_route_resolvable=pdp_route_resolvable,
         reasons=reasons,
     )
 
@@ -504,6 +545,7 @@ def _derive_serving_decision(
     ips: Optional[Mapping[str, Any]],
     source_lifecycle: Mapping[str, Any],
     identity_decision: Mapping[str, Any],
+    pdp_route_resolvable: Optional[bool] = None,
     reasons: list[str],
 ) -> dict[str, Any]:
     # Offer-specific block: suppressed offers never surface.
@@ -569,6 +611,15 @@ def _derive_serving_decision(
         if sync_status and sync_status != "live":
             reasons.append(REASON_CODES.PUBLISH_STATE_NOT_PUBLIC)
             return {"decision": "blocked"}
+
+    # c1.v0.5 renderability gate. Deliberately AFTER the lifecycle/index gates
+    # so a row that is already blocked keeps reporting its real reason, and
+    # only rows that would otherwise reach public/shadow are reclassified.
+    # Tri-state: only an explicit False blocks — an absent input (any producer
+    # that does not compute it) leaves the decision exactly as c1.v0.4.
+    if _renderable_gate_enabled() and pdp_route_resolvable is False:
+        reasons.append(REASON_CODES.PDP_ROUTE_UNRESOLVABLE)
+        return {"decision": "blocked"}
 
     # Shadow conditions — would have served under legacy gates, but the
     # contract gates them out of public reads.
