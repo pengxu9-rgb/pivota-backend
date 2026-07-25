@@ -35,6 +35,10 @@ from datetime import datetime, timezone
 from typing import Any, Iterable, Mapping, Optional, Sequence
 
 from services.catalog_trust_policy import derive_trust
+from services.pdp_renderability import (
+    pdp_route_resolvable,
+    seed_route_resolves_sql,
+)
 
 
 logger = logging.getLogger(__name__)
@@ -143,6 +147,14 @@ _PRODUCT_JOIN_SELECT = """
     pil.sellable_item_group_id,
     pil.product_line_id,
     pil.review_family_id,
+
+    -- c1.v0.5 renderability input. NOT the same question as the eps join
+    -- above: eps is restricted to source_system='external_product_seeds_mirror_v1',
+    -- while the gateway looks up external_product_id for EVERY row it routes
+    -- through seeds. Path-C minted rows (catalog_enrichment_agent_v1) join
+    -- their seed by attached_product_key and so answer FALSE here — which is
+    -- exactly why their PDPs 500.
+    """ + seed_route_resolves_sql("cp") + """ AS pdp_seed_route_ok,
 
     COALESCE(eps.id, epm.id)                                     AS eps_id,
     COALESCE(eps.status, epm.status)                             AS eps_status,
@@ -528,6 +540,21 @@ def _joined_row_to_inputs(
     return {
         "subject_type": "product",
         "subject_key": product_key,
+        # c1.v0.5. The lane test is pure row data; only the seed EXISTS needs
+        # SQL (pdp_seed_route_ok above). Tri-state: a row assembled without
+        # that column (hand-built test inputs, older callers) yields None and
+        # leaves the decision exactly as c1.v0.4.
+        "pdp_route_resolvable": (
+            None
+            if _row_get(row, "pdp_seed_route_ok") is None
+            else pdp_route_resolvable(
+                merchant_id=_row_get(row, "merchant_id"),
+                platform=_row_get(row, "platform"),
+                source_system=_row_get(row, "source_system"),
+                source_product_id=_row_get(row, "source_product_id"),
+                seed_route_ok=bool(_row_get(row, "pdp_seed_route_ok")),
+            )
+        ),
         "product": {
             "product_key": product_key,
             "content_key": _row_get(row, "content_key"),

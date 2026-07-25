@@ -110,6 +110,10 @@ def make_joined_row(**overrides):
         "sync_status": "live",
         "suppression_reason": None,
         "last_seen_in_sync_at": NOW,
+        # c1.v0.5 renderability input. The real product join ALWAYS selects
+        # this column, so the fixture must too — a fake that omits it would
+        # silently exercise the tri-state "absent" path and mask the gate.
+        "pdp_seed_route_ok": True,
         # IPS
         "serving_eligible": True,
         "pipeline_stage": "serving",
@@ -349,3 +353,129 @@ async def test_tombstoned_product_writes_blocked_decision():
     assert params["serving_decision"] == "blocked"
     assert params["source_lifecycle_state"] == "tombstoned"
     assert "ROW_TOMBSTONED" in params["serving_reason_codes"]
+
+
+# ---- c1.v0.5 renderability input threading ---------------------------------
+
+
+@pytest.mark.asyncio
+async def test_seed_route_column_reaches_the_policy_as_a_lane_aware_answer(
+    monkeypatch,
+):
+    """The SQL column is the RAW seed EXISTS; the LANE test is applied in
+    Python.
+
+    Prove the two halves are wired together — rather than the raw EXISTS being
+    passed straight through — by feeding a row whose lane and whose raw answer
+    DISAGREE: a merchant-synced shopify row with ``pdp_seed_route_ok=True``.
+    Raw passthrough would call it renderable; the lane test correctly does not,
+    because a merchant-synced row must never borrow a stranger seed's answer
+    (4,492 merchant rows collide with some seed's external_product_id) and the
+    merchant-synced lane is closed anyway (MERCHANT_SYNCED_LANE_RENDERABLE).
+    """
+    monkeypatch.setenv("CATALOG_TRUST_RENDERABLE_GATE", "1")
+    db = FakeDb(joined_rows=[make_joined_row(pdp_seed_route_ok=True)])
+
+    ok = await upsert_catalog_row_trust(db=db, product_key="pk_internal_1", now=NOW)
+
+    assert ok is True
+    _, params = db.executes[0]
+    assert params["serving_decision"] == "blocked"
+    assert "PDP_ROUTE_UNRESOLVABLE" in params["serving_reason_codes"]
+
+
+@pytest.mark.asyncio
+async def test_seed_routed_row_with_the_same_raw_true_stays_public(monkeypatch):
+    """Counterpart to the test above: same raw ``pdp_seed_route_ok=True``, but a
+    genuinely seed-routed row — so the assertion there is about the LANE and not
+    just "the gate blocks everything"."""
+    monkeypatch.setenv("CATALOG_TRUST_RENDERABLE_GATE", "1")
+    db = FakeDb(
+        joined_rows=[
+            make_joined_row(
+                merchant_id="external_seed",
+                platform="external_seed",
+                source_system="external_product_seeds_mirror_v1",
+                source_product_id="ext_a181155ef65de19f961ec40a",
+                pdp_seed_route_ok=True,
+                eps_id=1,
+                eps_status="active",
+                ms_merchant_id=None,
+                ms_platform=None,
+                ms_domain=None,
+                ms_status=None,
+                ms_last_sync=None,
+            )
+        ]
+    )
+
+    ok = await upsert_catalog_row_trust(db=db, product_key="pk_internal_1", now=NOW)
+
+    assert ok is True
+    _, params = db.executes[0]
+    assert params["serving_decision"] == "public"
+
+
+@pytest.mark.asyncio
+async def test_path_c_minted_row_with_no_seed_route_is_blocked_when_gated(
+    monkeypatch,
+):
+    """THE 1,375. A catalog_enrichment_agent_v1 row's seed attaches by
+    attached_product_key, so nothing answers on its source_product_id and the
+    PDP hard-500s."""
+    monkeypatch.setenv("CATALOG_TRUST_RENDERABLE_GATE", "1")
+    db = FakeDb(
+        joined_rows=[
+            make_joined_row(
+                merchant_id="external_seed",
+                platform="external_seed",
+                source_system="catalog_enrichment_agent_v1",
+                source_product_id="tower-28-beauty-sunnydays-tinted-spf-30",
+                pdp_seed_route_ok=False,
+                eps_id=1,
+                eps_status="active",
+                ms_merchant_id=None,
+                ms_platform=None,
+                ms_domain=None,
+                ms_status=None,
+                ms_last_sync=None,
+            )
+        ]
+    )
+
+    ok = await upsert_catalog_row_trust(db=db, product_key="pk_internal_1", now=NOW)
+
+    assert ok is True
+    _, params = db.executes[0]
+    assert params["serving_decision"] == "blocked"
+    assert "PDP_ROUTE_UNRESOLVABLE" in params["serving_reason_codes"]
+
+
+@pytest.mark.asyncio
+async def test_path_c_minted_row_stays_public_with_the_gate_off(monkeypatch):
+    """Same row, flag OFF: unchanged from c1.v0.4. This is what prod does today."""
+    monkeypatch.delenv("CATALOG_TRUST_RENDERABLE_GATE", raising=False)
+    db = FakeDb(
+        joined_rows=[
+            make_joined_row(
+                merchant_id="external_seed",
+                platform="external_seed",
+                source_system="catalog_enrichment_agent_v1",
+                source_product_id="tower-28-beauty-sunnydays-tinted-spf-30",
+                pdp_seed_route_ok=False,
+                eps_id=1,
+                eps_status="active",
+                ms_merchant_id=None,
+                ms_platform=None,
+                ms_domain=None,
+                ms_status=None,
+                ms_last_sync=None,
+            )
+        ]
+    )
+
+    ok = await upsert_catalog_row_trust(db=db, product_key="pk_internal_1", now=NOW)
+
+    assert ok is True
+    _, params = db.executes[0]
+    assert params["serving_decision"] == "public"

@@ -3,7 +3,7 @@
 Pure function: (inputs) -> catalog_row_trust shape.
 
 This is the Python parity port of PIVOTA-Agent/src/services/catalogTrustPolicy.js
-(POLICY_VERSION ``c1.v0.4``). Producer dual-write call sites in pivota-backend
+(POLICY_VERSION ``c1.v0.5``). Producer dual-write call sites in pivota-backend
 (catalog_sync_service, source_quarantine helpers) invoke ``derive_trust`` to
 populate ``catalog_row_trust`` so the reader contract stays live between
 periodic backfills.
@@ -30,7 +30,7 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Any, Iterable, Mapping, Optional
 
-POLICY_VERSION = "c1.v0.4"
+POLICY_VERSION = "c1.v0.5"
 
 # ---- Reason codes (authoritative vocabulary) -------------------------------
 #
@@ -64,6 +64,23 @@ POLICY_VERSION = "c1.v0.4"
 #   PUBLISH_STATE_NOT_PUBLIC         — catalog_products.publish_state != 'public'.
 #   IDENTITY_CONFLICT                — identity_status='conflict'.
 #   OFFER_SUPPRESSED                 — subject_type='offer' with offer.suppression_reason set.
+#   PDP_ROUTE_UNRESOLVABLE           — c1.v0.5. The gateway has no resolvable
+#     content route for the row, so its public PDP never answers with a real
+#     product page: it is either a hard HTTP 500 or a generic noindex shell
+#     carrying no product JSON-LD (both measured; see services/pdp_renderability
+#     for the truth table). GATED on CATALOG_TRUST_RENDERABLE_GATE, default OFF:
+#     turning it on demotes 1,376 rows out of 'public' (measured 2026-07-25),
+#     which is a serving-surface decision for the founder, not a code default.
+#
+#     ⚠️ THE FLAG IS PER-SERVICE AND THE TWINS SHARE ONE DATABASE. PIVOTA-Agent
+#     runs the same policy (src/services/catalogTrustPolicy.js) and writes the
+#     same catalog_row_trust table, from prod RUNTIME — pdpIdentityGraph calls
+#     upsertCatalogRowTrustForSourceListingRefs on every live-read promotion and
+#     identity override. Set CATALOG_TRUST_RENDERABLE_GATE on BOTH Railway
+#     services or NEITHER: with it on one side only, this backend blocks the
+#     1,376 and Node re-derives them public on the next identity event, so rows
+#     FLAP public<->blocked on the live serving surface. The same applies to
+#     POLICY_VERSION itself — ship the two repos back to back.
 
 
 class _ReasonCodes:
@@ -83,6 +100,7 @@ class _ReasonCodes:
     PUBLISH_STATE_NOT_PUBLIC = "PUBLISH_STATE_NOT_PUBLIC"
     IDENTITY_CONFLICT = "IDENTITY_CONFLICT"
     OFFER_SUPPRESSED = "OFFER_SUPPRESSED"
+    PDP_ROUTE_UNRESOLVABLE = "PDP_ROUTE_UNRESOLVABLE"
 
 
 REASON_CODES = _ReasonCodes()
@@ -101,11 +119,60 @@ def _index_eligible_read_enabled() -> bool:
     """ADR-008 SLICE 1 read flag. When ON, the index-pipeline serving gate in
     the trust policy widens from serving_eligible to
     (serving_eligible OR index_eligible) — the OFFER-FREE citation floor.
-    Default OFF ⇒ byte-identical to today (serving_eligible only)."""
+    Default OFF ⇒ byte-identical to today (serving_eligible only).
+
+    ⚠️ THIS ARM IS CURRENTLY UNREACHABLE FROM THE UPSERTERS, DELIBERATELY.
+    Neither ``services/catalog_row_trust_upserter`` nor the Node twin
+    (PIVOTA-Agent ``src/services/catalogRowTrustUpserter.js`` and its backfill)
+    selects ``ips.index_eligible``, so the ``index_eligible is True`` test is
+    never satisfied and both writers compute serving_eligible-only regardless of
+    this flag. That is what keeps them AGREEING, and agreement is the point:
+    they share one ``catalog_row_trust`` table and the UPSERT rewrites a row
+    whenever ``serving_decision`` differs.
+
+    Selecting the column would break that TODAY, because the flag is set
+    ASYMMETRICALLY in prod: ``INDEX_ELIGIBLE_READ=1`` on this service (`web`),
+    UNSET on the PIVOTA-Agent service (verified 2026-07-25). Wire the column up
+    and the ~100 prod rows with ``index_eligible IS TRUE AND serving_eligible IS
+    NOT TRUE`` would be derived ``public`` by this repo's 6h cron and ``blocked``
+    by Node on the next identity event — flapping forever.
+
+    Known consequence of leaving it unreachable: the citation READ path
+    (``services/pivot_query_service``) DOES honor ``index_eligible``, so those
+    ~100 rows are recall-eligible there while trust keeps blocking them.
+    Closing that gap is a founder call, not a code default, and it is a
+    THREE-part change — select the column in BOTH joins, and set
+    ``INDEX_ELIGIBLE_READ`` on BOTH Railway services in the same operation.
+    Do not do one part."""
     return (
         (os.getenv("INDEX_ELIGIBLE_READ") or "").strip().lower()
         in {"1", "true", "yes", "on"}
     )
+
+
+def _renderable_gate_enabled() -> bool:
+    """c1.v0.5 gate: does 'public' have to imply a renderable PDP?
+
+    Default OFF ⇒ byte-identical to c1.v0.4. Flipping it ON blocks every row
+    whose ``pdp_route_resolvable`` input is explicitly ``False``.
+
+    Why a flag and not a straight fix: the rows this catches are real,
+    quality-eligible products (measured 2026-07-25: 1,375 Path-C minted
+    canonicals whose seeds attach by ``attached_product_key`` so the gateway's
+    ``external_product_id`` lookup never finds them, plus 1 audit-minted
+    ``url_audit`` row). Their PDPs hard-500 today, so serving them is a broken
+    promise — but 1,011 of them have NO renderable sibling row, meaning the
+    product goes dark entirely, and public drops 3,937 → 2,561 (40% → 26% of
+    the serving corpus). The RIGHT fix is the P3 identity path that teaches the
+    gateway to resolve minted canonicals through ``attached_product_key``
+    (PIVOTA-Agent). This gate is the honest fallback, and which of the two
+    lands first is the founder's call.
+    """
+    return (
+        (os.getenv("CATALOG_TRUST_RENDERABLE_GATE") or "").strip().lower()
+        in {"1", "true", "yes", "on"}
+    )
+
 
 # Freshness thresholds (seconds). Tuned to keep external_seed which refreshes
 # ~24h in the 'fresh' bucket and to mark internal merchant catalog stale after
@@ -149,6 +216,14 @@ def derive_trust(inputs: Mapping[str, Any]) -> dict[str, Any]:
     external_seed = inputs.get("external_seed") or None
     merchant_store = inputs.get("merchant_store") or None
     override = inputs.get("override") or None
+    # c1.v0.5 tri-state. True = the gateway can resolve a PDP content route;
+    # False = it cannot (the PDP answers with a 500 or a bare noindex shell);
+    # None/absent = the caller did not compute it. Absence NEVER blocks, so any
+    # producer not yet taught to supply it keeps its c1.v0.4 output exactly.
+    raw_route_resolvable = inputs.get("pdp_route_resolvable")
+    pdp_route_resolvable = (
+        None if raw_route_resolvable is None else bool(raw_route_resolvable)
+    )
     raw_quarantines = inputs.get("active_quarantines") or []
     active_quarantines = list(raw_quarantines) if isinstance(raw_quarantines, Iterable) else []
 
@@ -185,6 +260,7 @@ def derive_trust(inputs: Mapping[str, Any]) -> dict[str, Any]:
         ips=ips,
         source_lifecycle=source_lifecycle,
         identity_decision=identity_decision,
+        pdp_route_resolvable=pdp_route_resolvable,
         reasons=reasons,
     )
 
@@ -504,6 +580,7 @@ def _derive_serving_decision(
     ips: Optional[Mapping[str, Any]],
     source_lifecycle: Mapping[str, Any],
     identity_decision: Mapping[str, Any],
+    pdp_route_resolvable: Optional[bool] = None,
     reasons: list[str],
 ) -> dict[str, Any]:
     # Offer-specific block: suppressed offers never surface.
@@ -569,6 +646,15 @@ def _derive_serving_decision(
         if sync_status and sync_status != "live":
             reasons.append(REASON_CODES.PUBLISH_STATE_NOT_PUBLIC)
             return {"decision": "blocked"}
+
+    # c1.v0.5 renderability gate. Deliberately AFTER the lifecycle/index gates
+    # so a row that is already blocked keeps reporting its real reason, and
+    # only rows that would otherwise reach public/shadow are reclassified.
+    # Tri-state: only an explicit False blocks — an absent input (any producer
+    # that does not compute it) leaves the decision exactly as c1.v0.4.
+    if _renderable_gate_enabled() and pdp_route_resolvable is False:
+        reasons.append(REASON_CODES.PDP_ROUTE_UNRESOLVABLE)
+        return {"decision": "blocked"}
 
     # Shadow conditions — would have served under legacy gates, but the
     # contract gates them out of public reads.

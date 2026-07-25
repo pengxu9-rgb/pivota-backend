@@ -680,3 +680,77 @@ def test_index_eligible_read_on_still_blocks_when_neither_eligible(monkeypatch):
     trust = call(ips=eligible_ips(serving_eligible=False, index_eligible=False))
     assert trust["serving_decision"] == "blocked"
     assert REASON_CODES.INDEX_NOT_SERVING_ELIGIBLE in trust["serving_reason_codes"]
+
+
+# ---- c1.v0.5: CATALOG_TRUST_RENDERABLE_GATE ---------------------------------
+#
+# The gap this closes: 1,825 rows were 'public' while the invariant said their
+# PDP could not render. Measured live 2026-07-25 — 449 of them render perfectly
+# (the invariant was wrong, fixed in services/pdp_renderability) and 1,376 serve
+# a hard HTTP 500, not a shell. Blocking those 1,376 darkens 1,011 products that
+# have no renderable sibling row, so it is flag-gated for the founder.
+
+
+def test_renderable_gate_off_by_default_leaves_an_unrenderable_row_public(monkeypatch):
+    """Default OFF ⇒ byte-identical to c1.v0.4, even with the input present."""
+    monkeypatch.delenv("CATALOG_TRUST_RENDERABLE_GATE", raising=False)
+    trust = call(pdp_route_resolvable=False)
+    assert trust["serving_decision"] == "public"
+    assert REASON_CODES.PDP_ROUTE_UNRESOLVABLE not in trust["serving_reason_codes"]
+
+
+def test_renderable_gate_on_blocks_a_row_with_no_pdp_content_route(monkeypatch):
+    monkeypatch.setenv("CATALOG_TRUST_RENDERABLE_GATE", "true")
+    trust = call(pdp_route_resolvable=False)
+    assert trust["serving_decision"] == "blocked"
+    assert REASON_CODES.PDP_ROUTE_UNRESOLVABLE in trust["serving_reason_codes"]
+
+
+def test_renderable_gate_on_leaves_a_renderable_row_public(monkeypatch):
+    monkeypatch.setenv("CATALOG_TRUST_RENDERABLE_GATE", "on")
+    trust = call(pdp_route_resolvable=True)
+    assert trust["serving_decision"] == "public"
+    assert REASON_CODES.PDP_ROUTE_UNRESOLVABLE not in trust["serving_reason_codes"]
+
+
+def test_renderable_gate_on_is_inert_when_the_input_is_absent(monkeypatch):
+    """Tri-state. A producer that has not been taught to compute the input
+    supplies nothing — that must never be read as "not renderable", or every
+    caller outside the upserter would mass-demote the catalog."""
+    monkeypatch.setenv("CATALOG_TRUST_RENDERABLE_GATE", "1")
+    trust = call()
+    assert trust["serving_decision"] == "public"
+    assert REASON_CODES.PDP_ROUTE_UNRESOLVABLE not in trust["serving_reason_codes"]
+
+
+def test_renderable_gate_does_not_mask_an_earlier_block_reason(monkeypatch):
+    """Ordering: a row already blocked upstream keeps its real reason, so the
+    reason-code histogram stays diagnostic rather than collapsing onto the
+    newest gate."""
+    monkeypatch.setenv("CATALOG_TRUST_RENDERABLE_GATE", "1")
+    trust = call(
+        ips=eligible_ips(serving_eligible=False),
+        pdp_route_resolvable=False,
+    )
+    assert trust["serving_decision"] == "blocked"
+    assert REASON_CODES.INDEX_NOT_SERVING_ELIGIBLE in trust["serving_reason_codes"]
+    assert REASON_CODES.PDP_ROUTE_UNRESOLVABLE not in trust["serving_reason_codes"]
+
+
+def test_policy_version_is_pinned_to_the_node_twin():
+    """A version MISMATCH between the twins is the catastrophic failure mode.
+
+    Both repos write the same ``catalog_row_trust`` table against one Postgres,
+    and the UPSERT refreshes a row whenever
+    ``policy_version <> EXCLUDED.policy_version``. pivota-backend stamps rows
+    from a 6h cron; PIVOTA-Agent stamps them from prod RUNTIME (pdpIdentityGraph
+    calls upsertCatalogRowTrustForSourceListingRefs on every live-read promotion
+    and identity override). A split-brain therefore rewrites ~14k rows forever
+    and makes /__trust_health's version_distribution a permanent false alarm.
+
+    Nothing pinned this string before, in either repo — reverting the bump left
+    every test green. Bump it here AND in
+    PIVOTA-Agent src/services/catalogTrustPolicy.js, and merge the two PRs back
+    to back (backend first).
+    """
+    assert POLICY_VERSION == "c1.v0.5"

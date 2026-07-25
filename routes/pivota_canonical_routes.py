@@ -50,6 +50,11 @@ from sqlalchemy import Boolean, DateTime, Float, String, Text, and_, column, fun
 from db.catalog import catalog_merchants, catalog_products
 from db.database import database
 from services.claim_safety import substantiated_claims
+from services.pdp_renderability import (
+    EXTERNAL_SEED_MERCHANT_ID as _EXTERNAL_SEED_MERCHANT_ID,
+    external_product_seeds,
+    pdp_renderable_expression,
+)
 from utils.logger import logger
 
 router = APIRouter(
@@ -129,161 +134,41 @@ agent_pdp_view = table(
     column("required_disclaimers"),
 )
 
-# PIVOTA-Agent-owned identity layer. The public PDP at
-# agent.pivota.cc/products/{sig} only renders when the sig's OWN source row has
-# an approved, live-read-enabled identity listing (row grain, not content_key
-# grain: a sibling row's listing does not make this sig render — verified
-# empirically 2026-07-23). The join key is (merchant_id, product_id) =
-# (cp.merchant_id, cp.source_product_id), the same pairing
-# catalog_row_trust_upserter uses.
-pdp_identity_listing = table(
-    "pdp_identity_listing",
-    column("merchant_id", String),
-    column("product_id", String),
-    column("live_read_enabled", Boolean),
-    column("identity_status", String),
-)
-
-# Bootstrap-content lane. get_pdp_v2 runs an external-seed status PRECHECK
-# before any identity resolution and hard-404s
-# (PRODUCT_NOT_FOUND / reason=external_seed_not_active) when the seed lookup
-# lands on a row that is not active.
-external_product_seeds = table(
-    "external_product_seeds",
-    column("external_product_id", String),
-    column("status", String),
-)
-
-# The merchant id the gateway treats as the external-seed lane.
-EXTERNAL_SEED_MERCHANT_ID = "external_seed"
-
-
-def _external_seed_lane():
-    """Is this row even subject to the gateway's seed precheck?
-
-    The precheck is gated — server.js runs it only when
-    ``isExternalSeedProductId(entryProductId) || requestedMerchantId ===
-    EXTERNAL_SEED_MERCHANT_ID``, where ``isExternalSeedProductId`` means the
-    lowercased id starts with ``ext_`` or ``ext:``. Merchant-owned rows never
-    reach it.
-
-    Without this gate the predicate would be BROADER than the gateway: 4,492
-    merchant-owned rows share a ``source_product_id`` with some
-    ``external_product_seeds.external_product_id``, and any of them could be
-    falsely dropped from the sitemap the moment one of those seeds went
-    inactive. (Zero such rows exist today — this is a guard, not a repair.)
-
-    Both columns are NOT NULL, so this stays two-valued. If that ever changes,
-    a NULL here would make the whole `renderable` expression NULL, which
-    ``bool(r["renderable"])`` would silently coerce to False and drop the row —
-    wrap in ``func.coalesce(..., True)`` at that point.
-    """
-    lowered_id = func.lower(func.trim(catalog_products.c.source_product_id))
-    return or_(
-        catalog_products.c.merchant_id == EXTERNAL_SEED_MERCHANT_ID,
-        lowered_id.startswith("ext_", autoescape=True),
-        lowered_id.startswith("ext:", autoescape=True),
-    )
-
-
-def _seed_status_ok():
-    """EXISTS: a seed row the gateway would accept (active, or a falsy status).
-
-    The gateway resolves ONE seed row, preferring active
-    (``ORDER BY CASE WHEN status='active' THEN 0 ELSE 1 END, updated_at DESC
-    LIMIT 1``), and only 404s if that winner is not active. Uniqueness is
-    enforced only on ``(market, tool, external_product_id) WHERE
-    status='active'``, so duplicates across markets/tools and any number of
-    non-active rows are legal.
-
-    That is why the block condition below is "a seed exists AND none of them
-    are acceptable" rather than "any non-active seed exists": the latter would
-    drop a live PDP that has a good active seed plus a stale inactive one.
-    """
-    return (
-        select(external_product_seeds.c.external_product_id)
-        .where(
-            and_(
-                external_product_seeds.c.external_product_id
-                == catalog_products.c.source_product_id,
-                func.coalesce(
-                    func.lower(func.trim(external_product_seeds.c.status)), ""
-                ).in_(["", "active"]),
-            )
-        )
-        .exists()
-    )
-
-
-def _seed_exists():
-    """EXISTS: any seed row at all for this row's source_product_id.
-
-    KNOWN GAP (deliberate). The gateway's seed lookup tries three keys in
-    order: ``external_product_id = $1``, then ``id::text = $1``, then several
-    ``seed_data->>`` JSON paths. This mirrors only the first — the JSON paths
-    are unindexed and would turn a per-row correlated subquery on the sitemap
-    feed into a scan.
-
-    The gap direction is safe: matching fewer rows means we UNDER-block, so the
-    feed may still advertise a URL the gateway 404s. It never falsely drops a
-    live one. It is also empirically empty for the current cohort — this
-    predicate reproduced all 127 of the failing sitemap URLs exactly. Revisit
-    with an expression index if 404s reappear on rows this misses.
-    """
-    return (
-        select(external_product_seeds.c.external_product_id)
-        .where(
-            external_product_seeds.c.external_product_id
-            == catalog_products.c.source_product_id
-        )
-        .exists()
-    )
-
-
-def _seed_blocks_render():
-    """Would the gateway's seed precheck hard-404 this row's PDP?
-
-    Only in the external-seed lane, only when a seed row exists, and only when
-    none of the matching rows is one the gateway would accept.
-    """
-    return and_(_external_seed_lane(), _seed_exists(), ~_seed_status_ok())
+# The merchant id the gateway treats as the external-seed lane. Re-exported
+# from the shared predicate module so callers of this route module keep working.
+EXTERNAL_SEED_MERCHANT_ID = _EXTERNAL_SEED_MERCHANT_ID
 
 
 def _renderable_column():
     """EXISTS boolean: will agent.pivota.cc/products/{sig} actually render?
 
     Exposed on the /products list so sitemap generation can stop advertising
-    serving_eligible rows whose PDP still serves the generic shell (the two
-    gates — serving_eligible here, live_read_enabled in PIVOTA-Agent — are
-    owned by different repos and had drifted 52% apart).
+    rows whose PDP cannot be built. The predicate itself lives in
+    :mod:`services.pdp_renderability` — shared verbatim with the
+    ``public_not_renderable`` invariant, which is the only way the two stop
+    drifting (they were 52% apart before #1575, and BOTH wrong after it).
 
-    TWO independent ways a PDP fails to render, and the sitemap must exclude
-    both:
+    HISTORY — why this stopped requiring an identity listing. #1575 encoded
+    "no approved + live_read_enabled ``pdp_identity_listing`` row ⇒ generic
+    shell". 29 live PDP fetches on 2026-07-25 disproved it in both directions:
+    rows with NO identity listing at all served full 200s with product JSON-LD
+    (3/3), rows with ``live_read_enabled=false`` served full 200s (12/12), and
+    rows WITH nothing wrong at the identity layer served hard 500s (12/12)
+    because no seed answered their content route. ``get_pdp_v2``'s serving gate
+    never reads ``pdp_identity_listing`` at all; ``live_read_enabled`` gates the
+    identity promotion lane, not the renderer. Net effect of the correction on
+    the live feed: 943 rows that render fine stop being withheld from the
+    sitemap, and 2,297 non-renderable rows stay out. (1,376 of those 2,297 are
+    the cohort that is ALSO trust-``public`` — the number
+    ``public_not_renderable`` counts; the remainder are non-renderable rows the
+    trust layer was already withholding for other reasons.)
 
-    1. No approved + live-read-enabled identity listing → generic shell.
-    2. An external_product_seeds row whose status is not 'active' → the
-       gateway's seed precheck hard-404s before identity is even consulted.
-
-    (2) was the miss that made ~127 of 1,901 sitemap URLs serve HTTP 500 after
-    pivota-agent-ui#269 flipped canonical PDPs to static/ISR: those rows pass
-    every gate here (serving_eligible, priced offers, agent_pdp_view,
-    approved+live_read identity) yet can never render, so the feed kept
-    advertising them. Note this cohort is DISJOINT from the
-    `public_not_renderable` invariant, which counts rows failing (1)."""
-    return and_(
-        select(pdp_identity_listing.c.product_id)
-        .where(
-            and_(
-                pdp_identity_listing.c.merchant_id == catalog_products.c.merchant_id,
-                pdp_identity_listing.c.product_id
-                == catalog_products.c.source_product_id,
-                pdp_identity_listing.c.live_read_enabled.is_(True),
-                pdp_identity_listing.c.identity_status == "approved",
-            )
-        )
-        .exists(),
-        ~_seed_blocks_render(),
-    ).label("renderable")
+    "Non-renderable" here means the URL does not answer with a real PDP: it is
+    either a hard HTTP 500 or a generic noindex shell carrying no product
+    JSON-LD (6/6 sampled non-renderable feed rows were the latter). Both are
+    worthless to a crawler; only the 500 is loud.
+    """
+    return pdp_renderable_expression(catalog_products).label("renderable")
 
 
 def _flag_on(name: str) -> bool:
@@ -702,10 +587,15 @@ async def list_canonical_pdp_signatures(
                 or (f"{_PDP_URL_PREFIX}{r['content_key']}" if r["content_key"] else None)
             ),
             "serving_eligible": bool(r["serving_eligible"]),
-            # Renderability of the public PDP (approved + live_read_enabled
-            # identity listing for THIS row). serving_eligible says "we want
-            # this public"; renderable says "the PDP will actually render" —
-            # sitemap generation must require both.
+            # Renderability of the public PDP: can the gateway resolve a
+            # CONTENT ROUTE for this row (an acceptable external_product_seeds
+            # row on external_product_id = source_product_id, or a
+            # merchant-synced upstream)? It is explicitly NOT an identity
+            # question — see _renderable_column's HISTORY note; the
+            # "approved + live_read_enabled identity listing" this comment used
+            # to describe is the exact belief #1584 disproved.
+            # serving_eligible says "we want this public"; renderable says "the
+            # PDP will actually render" — sitemap generation must require both.
             "renderable": bool(r["renderable"]),
             "index_eligible": (bool(r["index_eligible"]) if widen_sitemap else False),
             "blocker_code": r["blocker_code"],
