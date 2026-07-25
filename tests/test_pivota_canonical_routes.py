@@ -576,6 +576,40 @@ def test_list_canonical_pdps_uses_index_pipeline_state_join(env):
     assert "catalog_products.suppressed_at IS NULL" in sql
 
 
+def test_renderable_excludes_rows_whose_external_seed_is_not_active(env):
+    """The second way a PDP fails to render — and the cause of the 500s.
+
+    get_pdp_v2 runs an external-seed status precheck BEFORE identity
+    resolution and hard-404s (reason=external_seed_not_active) on any seed row
+    whose status is not 'active'. Those rows pass every other gate
+    (serving_eligible, priced offers, agent_pdp_view, approved + live_read
+    identity listing), so `renderable` reported True and the sitemap kept
+    advertising them. After pivota-agent-ui#269 made canonical PDPs
+    static/ISR, each one served a hard HTTP 500 instead of a thin 200 shell —
+    127 of the 1,901 live sitemap URLs, measured 2026-07-25.
+    """
+    client = env
+    res = client.get("/api/canonical/products")
+    assert res.status_code == 200
+
+    from routes import pivota_canonical_routes as pcr
+
+    sql = "\n".join(pcr.database.compiled_sql)
+    assert "external_product_seeds" in sql
+    # Correlated on the SAME key the gateway precheck resolves against.
+    assert (
+        "catalog_products.source_product_id = external_product_seeds.external_product_id"
+        in sql
+    )
+    # NOT EXISTS(bad seed) — never EXISTS(good seed), which would wrongly mark
+    # every merchant-owned row (which has no seed row at all) unrenderable.
+    assert "NOT (EXISTS" in sql
+    # Mirrors PIVOTA-Agent server.js: a falsy/empty status falls through as OK,
+    # anything else that is not 'active' is fatal. Case/whitespace-normalized.
+    assert "NOT IN ('', 'active')" in sql
+    assert "lower(trim(external_product_seeds.status))" in sql
+
+
 # ---------------------------------------------------------------------------
 # ADR-008 SLICE 1: by-signature READ vs sitemap LISTING flag separation
 # ---------------------------------------------------------------------------

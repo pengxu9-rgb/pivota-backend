@@ -144,6 +144,37 @@ pdp_identity_listing = table(
     column("identity_status", String),
 )
 
+# Bootstrap-content lane. get_pdp_v2 runs an external-seed status PRECHECK
+# before any identity resolution and hard-404s
+# (PRODUCT_NOT_FOUND / reason=external_seed_not_active) whenever the seed row
+# exists with a status other than 'active'. The predicate mirrors
+# PIVOTA-Agent server.js exactly: a MISSING seed row is fine (merchant-owned
+# rows have none), an empty/NULL status is fine (the gateway falls through on
+# a falsy status), any other non-'active' value is fatal.
+external_product_seeds = table(
+    "external_product_seeds",
+    column("external_product_id", String),
+    column("status", String),
+)
+
+
+def _seed_blocks_render():
+    """EXISTS boolean: does an inactive external seed hard-404 this row's PDP?"""
+    return (
+        select(external_product_seeds.c.external_product_id)
+        .where(
+            and_(
+                external_product_seeds.c.external_product_id
+                == catalog_products.c.source_product_id,
+                func.coalesce(
+                    func.lower(func.trim(external_product_seeds.c.status)), ""
+                )
+                .notin_(["", "active"]),
+            )
+        )
+        .exists()
+    )
+
 
 def _renderable_column():
     """EXISTS boolean: will agent.pivota.cc/products/{sig} actually render?
@@ -151,8 +182,22 @@ def _renderable_column():
     Exposed on the /products list so sitemap generation can stop advertising
     serving_eligible rows whose PDP still serves the generic shell (the two
     gates — serving_eligible here, live_read_enabled in PIVOTA-Agent — are
-    owned by different repos and had drifted 52% apart)."""
-    return (
+    owned by different repos and had drifted 52% apart).
+
+    TWO independent ways a PDP fails to render, and the sitemap must exclude
+    both:
+
+    1. No approved + live-read-enabled identity listing → generic shell.
+    2. An external_product_seeds row whose status is not 'active' → the
+       gateway's seed precheck hard-404s before identity is even consulted.
+
+    (2) was the miss that made ~127 of 1,901 sitemap URLs serve HTTP 500 after
+    pivota-agent-ui#269 flipped canonical PDPs to static/ISR: those rows pass
+    every gate here (serving_eligible, priced offers, agent_pdp_view,
+    approved+live_read identity) yet can never render, so the feed kept
+    advertising them. Note this cohort is DISJOINT from the
+    `public_not_renderable` invariant, which counts rows failing (1)."""
+    return and_(
         select(pdp_identity_listing.c.product_id)
         .where(
             and_(
@@ -163,9 +208,9 @@ def _renderable_column():
                 pdp_identity_listing.c.identity_status == "approved",
             )
         )
-        .exists()
-        .label("renderable")
-    )
+        .exists(),
+        ~_seed_blocks_render(),
+    ).label("renderable")
 
 
 def _flag_on(name: str) -> bool:
