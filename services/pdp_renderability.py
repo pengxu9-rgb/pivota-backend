@@ -45,10 +45,16 @@ for the row:
     ``source_product_id`` is a name slug — the keys never meet. (Requesting the
     seed's own ``external_product_id`` renders fine, which is the P3 fix, and
     is a PIVOTA-Agent change, not this one.)
-  * **Merchant-synced rows** (shopify/wix catalog sync) resolve their detail
-    from the merchant upstream, so they need no seed.
+  * **Merchant-synced rows** (shopify/wix catalog sync) were ASSUMED to resolve
+    their detail from the merchant upstream and so to need no seed. Measured,
+    that assumption is FALSE: 7/7 sampled shopify PDPs returned HTTP 500,
+    including under merchants with ``indexable=true``. The lane is therefore
+    non-renderable — see :data:`MERCHANT_SYNCED_LANE_RENDERABLE` for the
+    evidence, the zero-row blast radius, and how to re-enable it.
   * **Everything else** — today ``url_audit`` audit-minted rows and
     ``brand_authored`` stubs — has neither route and cannot render.
+
+Net: only the seed lane can currently answer True.
 
 The lane order matters: the seed lane is checked FIRST, so an ``ext_``-prefixed
 id sitting under a normal merchant is still seed-gated (that mirrors
@@ -94,7 +100,49 @@ SEED_ROUTED_SOURCE_SYSTEMS = (
 # with the sync services (services/catalog_sync_service.py and the Wix/Shopify
 # adapters). A platform missing here is treated as NOT renderable — see the
 # module docstring on the fail-closed direction.
+#
+# NOTE that this set is NARROWER than the platform sets the rest of the
+# codebase supports — services/merchant_commerce_readiness_service.py
+# (_SUPPORTED_COMMERCE_PLATFORMS) and
+# services/agent_center_sku_match_live_service.py (SUPPORTED_LIVE_PLATFORMS)
+# both carry {shopify, wix, woocommerce, bigcommerce}. woocommerce/bigcommerce
+# rows are therefore silently renderable=false here. That is the SAFE direction
+# (under-advertise, never falsely admit) and is latent today (no such rows are
+# serving), but it is a divergence, not an oversight:
+# tests/test_pdp_renderability.py pins this set against those two constants so
+# the gap has to be re-decided the moment either of them changes.
 MERCHANT_SYNCED_PLATFORMS = ("shopify", "wix")
+
+# …AND WHETHER THAT LANE RENDERS AT ALL. Answer today: NO.
+#
+# The first cut of this module assumed "platform has a sync adapter ⇒ the
+# gateway can serve detail from the merchant upstream ⇒ renderable", by
+# symmetry with the seed lane. That assumption was never measured, and when it
+# WAS measured it came back false: 7/7 shopify PDPs that the arm called
+# renderable returned **HTTP 500** (2,007 bytes, no product JSON-LD),
+# including rows under merchants with ``catalog_merchants.indexable = true``.
+#
+# So this lane is fail-CLOSED like every other unproven lane, rather than the
+# single fail-OPEN exception. Cost of being honest, measured 2026-07-25:
+#
+#   * merchant-synced-lane rows in prod ......................... 1,561
+#   * …that are trust-``public`` ................................     0
+#   * …that are unsuppressed AND index/serving-eligible .........     0
+#
+# i.e. ZERO rows change today. What it buys is that the landmine is defused:
+# the 763 rows under merch_efbc46b4619cfbdf (737 of them unsuppressed and
+# eligible) are held out of the sitemap ONLY by that merchant's
+# ``indexable=false`` bit, which is not part of this predicate. Flip that one
+# bit while this arm says True and 737 hard-500 URLs enter the sitemap while
+# ``public_not_renderable`` reports none of them — #1583's dead-URL bug
+# recreated on another lane, with the alarm switched off.
+#
+# TO RE-ENABLE: measure. Fetch a handful of PDPs for the lane, and if they
+# render with product JSON-LD, flip this to True in BOTH twins in one change
+# (pivota-backend services/pdp_renderability.py and PIVOTA-Agent
+# src/services/pdpRenderability.js). The right long-term fix is P3 — teach the
+# gateway to resolve these rows — not a wider predicate.
+MERCHANT_SYNCED_LANE_RENDERABLE = False
 
 
 def _lower_trim(col):
@@ -193,8 +241,8 @@ def pdp_renderable_expression(cp=None):
         (_seed_routed_lane(cp), _seed_route_resolves(cp)),
         (
             _lower_trim(cp.c.platform).in_(MERCHANT_SYNCED_PLATFORMS),
-            # Detail comes from the merchant's synced catalog — no seed needed.
-            True,
+            # MEASURED FALSE — see MERCHANT_SYNCED_LANE_RENDERABLE.
+            MERCHANT_SYNCED_LANE_RENDERABLE,
         ),
         # Neither a seed route nor a live merchant upstream: audit-minted
         # (url_audit) and brand_authored stubs. Measured: HTTP 500.
@@ -244,7 +292,10 @@ def pdp_route_resolvable(
     )
     if seed_routed:
         return bool(seed_route_ok)
-    return (platform or "").strip().lower() in MERCHANT_SYNCED_PLATFORMS
+    if (platform or "").strip().lower() in MERCHANT_SYNCED_PLATFORMS:
+        # MEASURED FALSE — see MERCHANT_SYNCED_LANE_RENDERABLE.
+        return MERCHANT_SYNCED_LANE_RENDERABLE
+    return False
 
 
 def compile_pg(stmt) -> str:

@@ -735,3 +735,22 @@ def test_renderable_gate_does_not_mask_an_earlier_block_reason(monkeypatch):
     assert trust["serving_decision"] == "blocked"
     assert REASON_CODES.INDEX_NOT_SERVING_ELIGIBLE in trust["serving_reason_codes"]
     assert REASON_CODES.PDP_ROUTE_UNRESOLVABLE not in trust["serving_reason_codes"]
+
+
+def test_policy_version_is_pinned_to_the_node_twin():
+    """A version MISMATCH between the twins is the catastrophic failure mode.
+
+    Both repos write the same ``catalog_row_trust`` table against one Postgres,
+    and the UPSERT refreshes a row whenever
+    ``policy_version <> EXCLUDED.policy_version``. pivota-backend stamps rows
+    from a 6h cron; PIVOTA-Agent stamps them from prod RUNTIME (pdpIdentityGraph
+    calls upsertCatalogRowTrustForSourceListingRefs on every live-read promotion
+    and identity override). A split-brain therefore rewrites ~14k rows forever
+    and makes /__trust_health's version_distribution a permanent false alarm.
+
+    Nothing pinned this string before, in either repo — reverting the bump left
+    every test green. Bump it here AND in
+    PIVOTA-Agent src/services/catalogTrustPolicy.js, and merge the two PRs back
+    to back (backend first).
+    """
+    assert POLICY_VERSION == "c1.v0.5"

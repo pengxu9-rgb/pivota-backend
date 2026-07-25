@@ -34,6 +34,8 @@ from sqlalchemy import (
 )
 
 from services.pdp_renderability import (
+    MERCHANT_SYNCED_LANE_RENDERABLE,
+    MERCHANT_SYNCED_PLATFORMS,
     pdp_renderable_expression,
     pdp_route_resolvable,
     seed_route_resolves_sql,
@@ -204,6 +206,9 @@ MATRIX = [
         False,
     ),
     (
+        # MEASURED FALSE, 7/7 HTTP 500 — see MERCHANT_SYNCED_LANE_RENDERABLE.
+        # The merchant-synced lane was the one arm that asserted renderable
+        # without evidence; it does not.
         "merchant-synced shopify row with no seed at all",
         {
             "merchant_id": "merch_a",
@@ -212,12 +217,14 @@ MATRIX = [
             "source_product_id": "shopify_12345",
         },
         [],
-        True,
+        False,
     ),
     (
         # 4,492 merchant-owned rows share a source_product_id with some seed's
-        # external_product_id. The gateway's precheck is lane-gated, so an
-        # unrelated seed going inactive must not drop them.
+        # external_product_id. The gateway's precheck is lane-gated, so the
+        # unrelated seed must not be what decides them either way — with the
+        # merchant-synced lane closed they read False on their OWN lane, not
+        # because a stranger's seed went inactive.
         "merchant-synced row colliding with an unrelated inactive seed",
         {
             "merchant_id": "merch_a",
@@ -226,7 +233,34 @@ MATRIX = [
             "source_product_id": "shopify_collides",
         },
         ["inactive"],
-        True,
+        False,
+    ),
+    (
+        # Same row, but now an ACTIVE stranger seed. Still False: the lane test
+        # runs before the seed test, so a merchant-synced row never borrows a
+        # seed's answer. Pins that the two lanes stay independent.
+        "merchant-synced row colliding with an unrelated ACTIVE seed",
+        {
+            "merchant_id": "merch_a",
+            "platform": "shopify",
+            "source_system": "shopify_products_sync",
+            "source_product_id": "shopify_collides_active",
+        },
+        ["active"],
+        False,
+    ),
+    (
+        # wix is in MERCHANT_SYNCED_PLATFORMS too and had no case at all —
+        # dropping 'wix' from the tuple used to pass the whole suite.
+        "merchant-synced wix row with no seed at all",
+        {
+            "merchant_id": "merch_wix",
+            "platform": "wix",
+            "source_system": "wix_products_sync",
+            "source_product_id": "wix_12345",
+        },
+        [],
+        False,
     ),
     (
         # isExternalSeedProductId() keys off the id prefix, not the merchant.
@@ -334,3 +368,132 @@ def test_identity_listing_is_not_consulted():
     )
     assert "pdp_identity_listing" not in sql
     assert "live_read_enabled" not in sql
+
+
+# ---------------------------------------------------------------------------
+# Status normalisation across the THREE twins.
+#
+# The MATRIX above only carries lowercase 'active'/'inactive'. Prod actually
+# holds retired_demo (21), review_blocked (7), disabled (2) and blocked (1),
+# and nothing stops a writer emitting whitespace or mixed case. These
+# parametrized cases exist so a change to the normalisation
+# (coalesce → lower → trim → IN ('', 'active')) in any one twin fails here.
+# ---------------------------------------------------------------------------
+
+
+_STATUS_ROW = {
+    "merchant_id": "external_seed",
+    "platform": "external_seed",
+    "source_system": "external_product_seeds_mirror_v1",
+    "source_product_id": "ext_status_norm",
+}
+
+
+@pytest.mark.parametrize(
+    "status",
+    ["INACTIVE", " Inactive ", "retired_demo", "review_blocked", "disabled", "blocked"],
+)
+def test_non_active_status_is_not_renderable_case_insensitively(engine, status):
+    _load(engine, _STATUS_ROW, [status])
+    assert _sqlalchemy_answer(engine) is False
+    assert _raw_sql_seed_answer(engine) is False
+    assert _python_answer(engine, _STATUS_ROW) is False
+
+
+@pytest.mark.parametrize("status", ["ACTIVE", " active ", "Active"])
+def test_active_status_is_renderable_case_and_whitespace_insensitively(engine, status):
+    _load(engine, _STATUS_ROW, [status])
+    assert _sqlalchemy_answer(engine) is True
+    assert _raw_sql_seed_answer(engine) is True
+    assert _python_answer(engine, _STATUS_ROW) is True
+
+
+def test_merchant_synced_lane_is_closed_until_it_is_measured():
+    """The lane that used to be the ONE fail-OPEN arm.
+
+    It asserted renderable=True purely by symmetry with the seed lane, with no
+    measurement behind it. When measured it came back false: 7/7 sampled
+    shopify PDPs returned HTTP 500, including under merchants with
+    catalog_merchants.indexable=true. Re-opening it is a deliberate act that
+    must be backed by fresh PDP samples AND mirrored in the Node twin
+    (PIVOTA-Agent src/services/pdpRenderability.js) in the same change.
+    """
+    assert MERCHANT_SYNCED_LANE_RENDERABLE is False, (
+        "re-opening the merchant-synced lane requires measured evidence that "
+        "those PDPs render, plus the same flip in the Node twin"
+    )
+    for platform in MERCHANT_SYNCED_PLATFORMS:
+        assert (
+            pdp_route_resolvable(
+                merchant_id="merch_a",
+                platform=platform,
+                source_system=f"{platform}_products_sync",
+                source_product_id=f"{platform}_1",
+                seed_route_ok=False,
+            )
+            is False
+        )
+
+
+def test_merchant_synced_platforms_stays_pinned_to_the_supported_platform_sets():
+    """This set is NARROWER than the platforms the rest of the codebase
+    supports: woocommerce/bigcommerce never even reach the lane test. With the
+    lane closed that is currently moot, but the set is load-bearing again the
+    moment MERCHANT_SYNCED_LANE_RENDERABLE flips — so pin it now, while the
+    stakes are zero, rather than discovering the drift later.
+    """
+    from services.agent_center_sku_match_live_service import SUPPORTED_LIVE_PLATFORMS
+    from services.merchant_commerce_readiness_service import (
+        _SUPPORTED_COMMERCE_PLATFORMS,
+    )
+
+    supported = set(SUPPORTED_LIVE_PLATFORMS) | set(_SUPPORTED_COMMERCE_PLATFORMS)
+    assert supported == {"shopify", "wix", "woocommerce", "bigcommerce"}, (
+        "a platform adapter list changed — re-decide MERCHANT_SYNCED_PLATFORMS "
+        "in services/pdp_renderability.py before updating this assertion"
+    )
+    assert set(MERCHANT_SYNCED_PLATFORMS) == {"shopify", "wix"}
+    assert set(MERCHANT_SYNCED_PLATFORMS) <= supported, (
+        "MERCHANT_SYNCED_PLATFORMS must never name a platform the sync layer "
+        "does not support — that direction fails OPEN once the lane re-opens"
+    )
+
+
+def test_seed_exists_stays_correlated_when_compiled_standalone():
+    """The seed EXISTS must stay CORRELATED in every compilation path.
+
+    If ``catalog_products`` leaks into the subquery's FROM the predicate becomes
+    a cartesian product: every row reads "renderable" as long as ONE acceptable
+    seed exists anywhere in the table, and the invariant silently reports ~0
+    forever. The hazard is worst when the predicate is compiled with nothing
+    else naming ``cp``, which is what this does.
+
+    NOTE ON WHAT THIS DOES AND DOES NOT PIN. It guards the compiled OUTPUT, not
+    the mechanism. ``_seed_route_resolves`` calls ``.correlate(cp)`` explicitly,
+    but SQLAlchemy's auto-correlation reaches the same output on every path we
+    can construct — deleting the explicit call leaves this test (and the
+    invariant SQL) green. That is fine and deliberate: the explicit correlate is
+    defence-in-depth against a future refactor, and the property worth failing
+    on is the SQL, which is asserted here and in
+    tests/test_catalog_invariant_checks.py.
+    """
+    from sqlalchemy import select as _select
+    from sqlalchemy.dialects import postgresql
+
+    from db.catalog import catalog_products as real_catalog_products
+
+    cp = real_catalog_products.alias("cp")
+    sql = str(
+        _select(pdp_renderable_expression(cp)).compile(
+            dialect=postgresql.dialect(), compile_kwargs={"literal_binds": True}
+        )
+    )
+    normalized = " ".join(sql.split())
+    # The seed subquery must name ONLY external_product_seeds in its FROM.
+    assert "FROM external_product_seeds WHERE cp." in normalized, (
+        "the seed EXISTS went UNCORRELATED — restore .correlate(cp) in "
+        "services/pdp_renderability._seed_route_resolves"
+    )
+    assert "external_product_seeds, catalog_products" not in normalized
+    # …and cp must appear exactly once as a FROM, in the OUTER select.
+    assert normalized.count("FROM catalog_products AS cp") == 1

@@ -71,6 +71,12 @@ _PUBLIC_NOT_RENDERABLE_SAMPLE_SQL = compile_pg(
 # row) — threshold is env-tunable so the sweep tracks the number without paging
 # until CATALOG_TRUST_RENDERABLE_GATE is flipped on or the P3 identity path for
 # catalog_enrichment_agent_v1 ships.
+#
+# That default is the MEASURED BASELINE (1,376 as of 2026-07-25), not an
+# aspirational 500. A threshold below the true count leaves the check
+# permanently red, and a permanently-red check cannot signal a NEW regression —
+# it is indistinguishable from the known gap. Lower it as P3 lands; raising it
+# needs a reason.
 _CHECKS: List[Dict[str, Any]] = [
     {
         "name": "public_but_suppressed",
@@ -151,11 +157,14 @@ _CHECKS: List[Dict[str, Any]] = [
         "name": "public_not_renderable",
         "description": (
             "trust says public but the gateway has no resolvable PDP content "
-            "route for the row (measured: hard HTTP 500, not a shell) — "
-            "c1.v0.5 gap"
+            "route for the row — the URL answers with an HTTP 500 or a generic "
+            "noindex shell carrying no product JSON-LD, never a real PDP "
+            "(c1.v0.5 gap)"
         ),
         "env": "CATALOG_INVARIANT_RENDERABLE_THRESHOLD",
-        "default_threshold": 500,
+        # Measured baseline 2026-07-25, NOT an aspiration — see the note above
+        # _CHECKS on why an under-set threshold destroys the signal.
+        "default_threshold": 1376,
         "count_sql": _PUBLIC_NOT_RENDERABLE_COUNT_SQL,
         "sample_sql": _PUBLIC_NOT_RENDERABLE_SAMPLE_SQL,
     },

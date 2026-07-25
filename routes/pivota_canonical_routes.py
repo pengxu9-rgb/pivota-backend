@@ -158,7 +158,15 @@ def _renderable_column():
     never reads ``pdp_identity_listing`` at all; ``live_read_enabled`` gates the
     identity promotion lane, not the renderer. Net effect of the correction on
     the live feed: 943 rows that render fine stop being withheld from the
-    sitemap, and the ~1,376 that 500 stay out.
+    sitemap, and 2,297 non-renderable rows stay out. (1,376 of those 2,297 are
+    the cohort that is ALSO trust-``public`` — the number
+    ``public_not_renderable`` counts; the remainder are non-renderable rows the
+    trust layer was already withholding for other reasons.)
+
+    "Non-renderable" here means the URL does not answer with a real PDP: it is
+    either a hard HTTP 500 or a generic noindex shell carrying no product
+    JSON-LD (6/6 sampled non-renderable feed rows were the latter). Both are
+    worthless to a crawler; only the 500 is loud.
     """
     return pdp_renderable_expression(catalog_products).label("renderable")
 
@@ -579,10 +587,15 @@ async def list_canonical_pdp_signatures(
                 or (f"{_PDP_URL_PREFIX}{r['content_key']}" if r["content_key"] else None)
             ),
             "serving_eligible": bool(r["serving_eligible"]),
-            # Renderability of the public PDP (approved + live_read_enabled
-            # identity listing for THIS row). serving_eligible says "we want
-            # this public"; renderable says "the PDP will actually render" —
-            # sitemap generation must require both.
+            # Renderability of the public PDP: can the gateway resolve a
+            # CONTENT ROUTE for this row (an acceptable external_product_seeds
+            # row on external_product_id = source_product_id, or a
+            # merchant-synced upstream)? It is explicitly NOT an identity
+            # question — see _renderable_column's HISTORY note; the
+            # "approved + live_read_enabled identity listing" this comment used
+            # to describe is the exact belief #1584 disproved.
+            # serving_eligible says "we want this public"; renderable says "the
+            # PDP will actually render" — sitemap generation must require both.
             "renderable": bool(r["renderable"]),
             "index_eligible": (bool(r["index_eligible"]) if widen_sitemap else False),
             "blocker_code": r["blocker_code"],

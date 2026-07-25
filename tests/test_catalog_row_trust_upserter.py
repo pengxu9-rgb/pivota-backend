@@ -362,12 +362,52 @@ async def test_tombstoned_product_writes_blocked_decision():
 async def test_seed_route_column_reaches_the_policy_as_a_lane_aware_answer(
     monkeypatch,
 ):
-    """The SQL column is the raw seed EXISTS; the LANE test is applied in
-    Python. A shopify row is merchant-synced, so it stays renderable even when
-    no seed answers — asserting the two halves are actually wired together and
-    not, say, passing the raw EXISTS straight through."""
+    """The SQL column is the RAW seed EXISTS; the LANE test is applied in
+    Python.
+
+    Prove the two halves are wired together — rather than the raw EXISTS being
+    passed straight through — by feeding a row whose lane and whose raw answer
+    DISAGREE: a merchant-synced shopify row with ``pdp_seed_route_ok=True``.
+    Raw passthrough would call it renderable; the lane test correctly does not,
+    because a merchant-synced row must never borrow a stranger seed's answer
+    (4,492 merchant rows collide with some seed's external_product_id) and the
+    merchant-synced lane is closed anyway (MERCHANT_SYNCED_LANE_RENDERABLE).
+    """
     monkeypatch.setenv("CATALOG_TRUST_RENDERABLE_GATE", "1")
-    db = FakeDb(joined_rows=[make_joined_row(pdp_seed_route_ok=False)])
+    db = FakeDb(joined_rows=[make_joined_row(pdp_seed_route_ok=True)])
+
+    ok = await upsert_catalog_row_trust(db=db, product_key="pk_internal_1", now=NOW)
+
+    assert ok is True
+    _, params = db.executes[0]
+    assert params["serving_decision"] == "blocked"
+    assert "PDP_ROUTE_UNRESOLVABLE" in params["serving_reason_codes"]
+
+
+@pytest.mark.asyncio
+async def test_seed_routed_row_with_the_same_raw_true_stays_public(monkeypatch):
+    """Counterpart to the test above: same raw ``pdp_seed_route_ok=True``, but a
+    genuinely seed-routed row — so the assertion there is about the LANE and not
+    just "the gate blocks everything"."""
+    monkeypatch.setenv("CATALOG_TRUST_RENDERABLE_GATE", "1")
+    db = FakeDb(
+        joined_rows=[
+            make_joined_row(
+                merchant_id="external_seed",
+                platform="external_seed",
+                source_system="external_product_seeds_mirror_v1",
+                source_product_id="ext_a181155ef65de19f961ec40a",
+                pdp_seed_route_ok=True,
+                eps_id=1,
+                eps_status="active",
+                ms_merchant_id=None,
+                ms_platform=None,
+                ms_domain=None,
+                ms_status=None,
+                ms_last_sync=None,
+            )
+        ]
+    )
 
     ok = await upsert_catalog_row_trust(db=db, product_key="pk_internal_1", now=NOW)
 
