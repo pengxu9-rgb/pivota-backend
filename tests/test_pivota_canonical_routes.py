@@ -596,18 +596,204 @@ def test_renderable_excludes_rows_whose_external_seed_is_not_active(env):
 
     sql = "\n".join(pcr.database.compiled_sql)
     assert "external_product_seeds" in sql
-    # Correlated on the SAME key the gateway precheck resolves against.
-    assert (
-        "catalog_products.source_product_id = external_product_seeds.external_product_id"
-        in sql
+    # Correlated on catalog_products (a cartesian product here would make
+    # `renderable` a global constant instead of a per-row answer).
+    assert "FROM external_product_seeds \nWHERE catalog_products" in sql
+
+
+# ---------------------------------------------------------------------------
+# EXECUTABLE semantics for `renderable`.
+#
+# The suite above asserts on compiled SQL text, which cannot catch a predicate
+# that compiles fine and answers wrongly (FakeDb serves `renderable` straight
+# from the fixture). These run the real expression against a real engine with
+# real rows, so each branch of the seed gate is pinned by behavior.
+# ---------------------------------------------------------------------------
+
+
+@pytest.fixture
+def renderable_engine():
+    """In-memory DB with the three tables `_renderable_column()` touches."""
+    from sqlalchemy import (
+        Boolean,
+        Column,
+        MetaData,
+        String,
+        Table,
+        create_engine,
     )
-    # NOT EXISTS(bad seed) — never EXISTS(good seed), which would wrongly mark
-    # every merchant-owned row (which has no seed row at all) unrenderable.
-    assert "NOT (EXISTS" in sql
-    # Mirrors PIVOTA-Agent server.js: a falsy/empty status falls through as OK,
-    # anything else that is not 'active' is fatal. Case/whitespace-normalized.
-    assert "NOT IN ('', 'active')" in sql
-    assert "lower(trim(external_product_seeds.status))" in sql
+
+    engine = create_engine("sqlite://")
+    md = MetaData()
+    Table(
+        "catalog_products",
+        md,
+        Column("product_key", String, primary_key=True),
+        Column("merchant_id", String),
+        Column("source_product_id", String),
+    )
+    Table(
+        "pdp_identity_listing",
+        md,
+        Column("merchant_id", String),
+        Column("product_id", String),
+        Column("live_read_enabled", Boolean),
+        Column("identity_status", String),
+    )
+    Table(
+        "external_product_seeds",
+        md,
+        Column("external_product_id", String),
+        Column("status", String),
+    )
+    md.create_all(engine)
+    return engine, md
+
+
+def _renderable_for(renderable_engine, *, merchant_id, source_product_id, seeds):
+    """Insert one product (with an approved identity listing) + its seed rows,
+    then evaluate the REAL `_renderable_column()` against it."""
+    from sqlalchemy import select as sa_select
+
+    from routes.pivota_canonical_routes import _renderable_column
+
+    engine, md = renderable_engine
+    cp = md.tables["catalog_products"]
+    pil = md.tables["pdp_identity_listing"]
+    eps = md.tables["external_product_seeds"]
+
+    with engine.begin() as conn:
+        conn.execute(cp.delete())
+        conn.execute(pil.delete())
+        conn.execute(eps.delete())
+        conn.execute(
+            cp.insert().values(
+                product_key="pk_1",
+                merchant_id=merchant_id,
+                source_product_id=source_product_id,
+            )
+        )
+        # Identity gate always satisfied, so the assertions isolate the seed gate.
+        conn.execute(
+            pil.insert().values(
+                merchant_id=merchant_id,
+                product_id=source_product_id,
+                live_read_enabled=True,
+                identity_status="approved",
+            )
+        )
+        for status in seeds:
+            conn.execute(
+                eps.insert().values(
+                    external_product_id=source_product_id, status=status
+                )
+            )
+
+    with engine.connect() as conn:
+        return bool(conn.execute(sa_select([_renderable_column()])).scalar())
+
+
+def test_renderable_false_for_external_seed_row_whose_only_seed_is_inactive(
+    renderable_engine,
+):
+    """The measured cohort: 127 of 1,901 sitemap URLs on 2026-07-25."""
+    assert not _renderable_for(
+        renderable_engine,
+        merchant_id="external_seed",
+        source_product_id="ext_a181155ef65de19f961ec40a",
+        seeds=["inactive"],
+    )
+
+
+def test_renderable_true_when_an_active_seed_coexists_with_a_stale_inactive_one(
+    renderable_engine,
+):
+    """The gateway resolves ONE seed row, preferring active, and only 404s if
+    that winner is not active. Uniqueness is enforced only on active rows, so a
+    live product may legitimately carry stale non-active seeds alongside a good
+    one. Blocking on "any inactive seed exists" would drop it from the sitemap.
+    """
+    assert _renderable_for(
+        renderable_engine,
+        merchant_id="external_seed",
+        source_product_id="ext_dupe",
+        seeds=["inactive", "active"],
+    )
+
+
+def test_renderable_true_for_merchant_owned_row_with_no_seed_at_all(
+    renderable_engine,
+):
+    assert _renderable_for(
+        renderable_engine,
+        merchant_id="merch_a",
+        source_product_id="shopify_12345",
+        seeds=[],
+    )
+
+
+def test_renderable_true_for_merchant_owned_row_colliding_with_an_inactive_seed(
+    renderable_engine,
+):
+    """The seed precheck is LANE-GATED: server.js runs it only for ext_/ext:
+    ids or merchant_id='external_seed'. 4,492 merchant-owned rows share a
+    source_product_id with some seed's external_product_id, so an ungated
+    predicate would falsely drop them the moment such a seed went inactive.
+    """
+    assert _renderable_for(
+        renderable_engine,
+        merchant_id="merch_a",
+        source_product_id="shopify_collides",
+        seeds=["inactive"],
+    )
+
+
+def test_renderable_false_for_ext_prefixed_id_even_under_a_normal_merchant(
+    renderable_engine,
+):
+    """isExternalSeedProductId() keys off the id prefix, not the merchant."""
+    assert not _renderable_for(
+        renderable_engine,
+        merchant_id="merch_a",
+        source_product_id="ext_orphaned",
+        seeds=["inactive"],
+    )
+
+
+@pytest.mark.parametrize("status", ["", "  ", None])
+def test_renderable_true_when_seed_status_is_falsy(renderable_engine, status):
+    """`if (externalSeedStatus && externalSeedStatus !== 'active')` — a falsy
+    status falls THROUGH the gateway precheck rather than 404ing."""
+    assert _renderable_for(
+        renderable_engine,
+        merchant_id="external_seed",
+        source_product_id="ext_blank_status",
+        seeds=[status],
+    )
+
+
+@pytest.mark.parametrize("status", ["INACTIVE", " Inactive ", "retired_demo", "blocked"])
+def test_renderable_false_for_any_non_active_status_case_insensitively(
+    renderable_engine, status
+):
+    assert not _renderable_for(
+        renderable_engine,
+        merchant_id="external_seed",
+        source_product_id="ext_weird_status",
+        seeds=[status],
+    )
+
+
+@pytest.mark.parametrize("status", ["ACTIVE", " active "])
+def test_renderable_true_for_active_status_case_insensitively(
+    renderable_engine, status
+):
+    assert _renderable_for(
+        renderable_engine,
+        merchant_id="external_seed",
+        source_product_id="ext_ok",
+        seeds=[status],
+    )
 
 
 # ---------------------------------------------------------------------------

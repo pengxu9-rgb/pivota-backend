@@ -146,20 +146,55 @@ pdp_identity_listing = table(
 
 # Bootstrap-content lane. get_pdp_v2 runs an external-seed status PRECHECK
 # before any identity resolution and hard-404s
-# (PRODUCT_NOT_FOUND / reason=external_seed_not_active) whenever the seed row
-# exists with a status other than 'active'. The predicate mirrors
-# PIVOTA-Agent server.js exactly: a MISSING seed row is fine (merchant-owned
-# rows have none), an empty/NULL status is fine (the gateway falls through on
-# a falsy status), any other non-'active' value is fatal.
+# (PRODUCT_NOT_FOUND / reason=external_seed_not_active) when the seed lookup
+# lands on a row that is not active.
 external_product_seeds = table(
     "external_product_seeds",
     column("external_product_id", String),
     column("status", String),
 )
 
+# The merchant id the gateway treats as the external-seed lane.
+EXTERNAL_SEED_MERCHANT_ID = "external_seed"
 
-def _seed_blocks_render():
-    """EXISTS boolean: does an inactive external seed hard-404 this row's PDP?"""
+
+def _external_seed_lane():
+    """Is this row even subject to the gateway's seed precheck?
+
+    The precheck is gated — server.js runs it only when
+    ``isExternalSeedProductId(entryProductId) || requestedMerchantId ===
+    EXTERNAL_SEED_MERCHANT_ID``, where ``isExternalSeedProductId`` means the
+    lowercased id starts with ``ext_`` or ``ext:``. Merchant-owned rows never
+    reach it.
+
+    Without this gate the predicate would be BROADER than the gateway: 4,492
+    merchant-owned rows share a ``source_product_id`` with some
+    ``external_product_seeds.external_product_id``, and any of them could be
+    falsely dropped from the sitemap the moment one of those seeds went
+    inactive. (Zero such rows exist today — this is a guard, not a repair.)
+    """
+    lowered_id = func.lower(func.trim(catalog_products.c.source_product_id))
+    return or_(
+        catalog_products.c.merchant_id == EXTERNAL_SEED_MERCHANT_ID,
+        lowered_id.startswith("ext_", autoescape=True),
+        lowered_id.startswith("ext:", autoescape=True),
+    )
+
+
+def _seed_status_ok():
+    """EXISTS: a seed row the gateway would accept (active, or a falsy status).
+
+    The gateway resolves ONE seed row, preferring active
+    (``ORDER BY CASE WHEN status='active' THEN 0 ELSE 1 END, updated_at DESC
+    LIMIT 1``), and only 404s if that winner is not active. Uniqueness is
+    enforced only on ``(market, tool, external_product_id) WHERE
+    status='active'``, so duplicates across markets/tools and any number of
+    non-active rows are legal.
+
+    That is why the block condition below is "a seed exists AND none of them
+    are acceptable" rather than "any non-active seed exists": the latter would
+    drop a live PDP that has a good active seed plus a stale inactive one.
+    """
     return (
         select(external_product_seeds.c.external_product_id)
         .where(
@@ -168,12 +203,32 @@ def _seed_blocks_render():
                 == catalog_products.c.source_product_id,
                 func.coalesce(
                     func.lower(func.trim(external_product_seeds.c.status)), ""
-                )
-                .notin_(["", "active"]),
+                ).in_(["", "active"]),
             )
         )
         .exists()
     )
+
+
+def _seed_exists():
+    """EXISTS: any seed row at all for this row's source_product_id."""
+    return (
+        select(external_product_seeds.c.external_product_id)
+        .where(
+            external_product_seeds.c.external_product_id
+            == catalog_products.c.source_product_id
+        )
+        .exists()
+    )
+
+
+def _seed_blocks_render():
+    """Would the gateway's seed precheck hard-404 this row's PDP?
+
+    Only in the external-seed lane, only when a seed row exists, and only when
+    none of the matching rows is one the gateway would accept.
+    """
+    return and_(_external_seed_lane(), _seed_exists(), ~_seed_status_ok())
 
 
 def _renderable_column():
