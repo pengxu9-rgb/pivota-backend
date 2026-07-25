@@ -210,16 +210,36 @@ def _seed_routed_lane(cp):
     )
 
 
-def _route_key_seed(cp, *, acceptable_only: bool):
+def _route_key_seed(cp, *, acceptable_only: bool, platform_guarded: bool = False):
     """LANE 0 — the seed keyed on ``external_product_id = source_product_id``.
 
     ``acceptable_only=False`` asks the weaker question "does lane 0 answer AT
     ALL", which is what decides whether the gateway ever falls through to lane
     1 (it ranks by lane before it ranks by status).
+
+    ``platform_guarded`` mirrors the gateway's LANE 0 ``WHERE cp.platform =
+    'external_seed'`` conjunct (PIVOTA-Agent src/server.js, the seed LATERAL in
+    ``resolveCatalogProductRefFromPivotaSignatureInner``).
+
+    IT IS OFF FOR THE ACCEPTANCE ARM, DELIBERATELY, AND THAT IS A PRE-EXISTING
+    GAP THIS CHANGE DOES NOT WIDEN. The acceptance arm has never carried the
+    guard, so a row whose ``source_product_id`` collides with some seed's
+    ``external_product_id`` while sitting on a non-``external_seed`` platform
+    reads renderable here even though the gateway's lane 0 would not match it.
+    Turning it on would change lanes this PR is otherwise additive to (an
+    ``ext_``-prefixed id under a shopify merchant, for one), so it stays a
+    stated PRECONDITION rather than a silent one: *the equivalence claim below
+    holds exactly on rows whose platform is* ``external_seed``, which is all
+    2,175 minted rows in prod and every seed-mirror row.
+
+    It IS on for the minted arm's lane-order guard, where correctness is this
+    PR's business: see :func:`_seed_route_resolves`.
     """
     conditions = [
         external_product_seeds.c.external_product_id == cp.c.source_product_id
     ]
+    if platform_guarded:
+        conditions.append(_lower_trim(cp.c.platform) == EXTERNAL_SEED_MERCHANT_ID)
     if acceptable_only:
         conditions.append(
             func.coalesce(
@@ -310,8 +330,22 @@ def _seed_route_resolves(cp):
     return or_(
         _route_key_seed(cp, acceptable_only=True),
         and_(
-            _lower_trim(cp.c.source_system) == MINTED_SOURCE_SYSTEM,
-            ~_route_key_seed(cp, acceptable_only=False),
+            # EXACT equality, mirroring the gateway's LANE 1
+            # `cp.source_system = 'catalog_enrichment_agent_v1'`. A
+            # lower/trim-normalised test here would be strictly WIDER than the
+            # gateway, and wider is the OVER-ADVERTISE direction: a row stored
+            # as ' Catalog_Enrichment_Agent_V1 ' would be called renderable
+            # while the gateway's arm never fired for it. (The lane test in
+            # :func:`_seed_routed_lane` does normalise, because it answers a
+            # different question — "is this row seed-routed at all" — where
+            # being generous only costs a False.)
+            cp.c.source_system == MINTED_SOURCE_SYSTEM,
+            # PLATFORM-GUARDED: the gateway falls through to lane 1 exactly when
+            # its OWN lane 0 matched nothing, and its lane 0 carries the
+            # platform conjunct. Without the guard a minted row on some other
+            # platform that happens to collide with a seed id would read as
+            # "lane 0 answered" here while the gateway went to lane 1 anyway.
+            ~_route_key_seed(cp, acceptable_only=False, platform_guarded=True),
             _minted_attached_seed(cp),
         ),
     )
@@ -362,10 +396,11 @@ def seed_route_resolves_sql(cp_alias: str = "cp") -> str:
         "(EXISTS (SELECT 1 FROM external_product_seeds _seed_route "
         f"WHERE _seed_route.external_product_id = {cp_alias}.source_product_id "
         "AND coalesce(lower(trim(_seed_route.status)), '') IN ('', 'active'))"
-        f" OR (lower(trim(coalesce({cp_alias}.source_system, ''))) "
-        f"= '{MINTED_SOURCE_SYSTEM}'"
+        f" OR ({cp_alias}.source_system = '{MINTED_SOURCE_SYSTEM}'"
         " AND NOT EXISTS (SELECT 1 FROM external_product_seeds _seed_route_any "
-        f"WHERE _seed_route_any.external_product_id = {cp_alias}.source_product_id)"
+        f"WHERE _seed_route_any.external_product_id = {cp_alias}.source_product_id "
+        f"AND lower(trim(coalesce({cp_alias}.platform, ''))) "
+        f"= '{EXTERNAL_SEED_MERCHANT_ID}')"
         " AND EXISTS (SELECT 1 FROM external_product_seeds _seed_route_minted "
         f"WHERE _seed_route_minted.attached_product_key = {cp_alias}.product_key "
         "AND coalesce(lower(trim(_seed_route_minted.status)), '') "

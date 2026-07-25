@@ -474,14 +474,15 @@ def test_seed_exists_is_evaluated_per_row_not_globally(engine):
 SEED_ROUTE_SQL_CP = (
     "(EXISTS (SELECT 1 FROM external_product_seeds _seed_route WHERE "
     "_seed_route.external_product_id = cp.source_product_id AND "
-    "coalesce(lower(trim(_seed_route.status)), '') IN ('', 'active')) OR "
-    "(lower(trim(coalesce(cp.source_system, ''))) = "
-    "'catalog_enrichment_agent_v1' AND NOT EXISTS (SELECT 1 FROM "
-    "external_product_seeds _seed_route_any WHERE "
-    "_seed_route_any.external_product_id = cp.source_product_id) AND EXISTS "
-    "(SELECT 1 FROM external_product_seeds _seed_route_minted WHERE "
-    "_seed_route_minted.attached_product_key = cp.product_key AND "
-    "coalesce(lower(trim(_seed_route_minted.status)), '') IN ('', 'active'))))"
+    "coalesce(lower(trim(_seed_route.status)), '') IN ('', 'active')) "
+    "OR (cp.source_system = 'catalog_enrichment_agent_v1' AND NOT "
+    "EXISTS (SELECT 1 FROM external_product_seeds _seed_route_any WHERE"
+    " _seed_route_any.external_product_id = cp.source_product_id AND "
+    "lower(trim(coalesce(cp.platform, ''))) = 'external_seed') AND "
+    "EXISTS (SELECT 1 FROM external_product_seeds _seed_route_minted "
+    "WHERE _seed_route_minted.attached_product_key = cp.product_key AND"
+    " coalesce(lower(trim(_seed_route_minted.status)), '') IN ('', "
+    "'active'))))"
 )
 
 
@@ -501,17 +502,100 @@ def test_minted_lane_is_gated_on_source_system_and_on_lane_0_answering_nothing()
     blocking.
     """
     sql = seed_route_resolves_sql("cp")
-    assert (
-        f"lower(trim(coalesce(cp.source_system, ''))) = '{MINTED_SOURCE_SYSTEM}'"
-        in sql
-    ), "the minted arm must be gated on source_system, so no other lane borrows it"
     assert sql.count("NOT EXISTS") == 1, (
         "exactly one NOT EXISTS — the lane-order guard, and nothing else"
     )
     assert (
         "NOT EXISTS (SELECT 1 FROM external_product_seeds _seed_route_any "
-        "WHERE _seed_route_any.external_product_id = cp.source_product_id)"
-    ) in sql
+        "WHERE _seed_route_any.external_product_id = cp.source_product_id "
+        "AND lower(trim(coalesce(cp.platform, ''))) = 'external_seed')"
+    ) in sql, (
+        "the lane-order guard must carry the gateway's LANE 0 platform "
+        "conjunct — without it a minted row on another platform reads as "
+        "'lane 0 answered' here while the gateway falls through to lane 1"
+    )
+    assert f"cp.source_system = '{MINTED_SOURCE_SYSTEM}'" in sql, (
+        "the minted arm must be gated on source_system so no other lane "
+        "borrows it, and must compare it EXACTLY like the gateway does; "
+        "normalising it here would be strictly wider = over-advertise"
+    )
+
+
+def test_every_subquery_is_evaluated_PER_ROW_across_two_rows(engine):
+    """The behavioural correlation pin — the one the compiled-SQL tests are not.
+
+    ``test_seed_exists_stays_correlated_when_compiled_standalone`` guards the
+    compiled OUTPUT, and it passes even with every ``.correlate(cp)`` deleted,
+    because SQLAlchemy's auto-correlation reaches the same string on the paths
+    we can construct. So it cannot fail for the reason it exists. This one can:
+    it loads TWO catalog rows whose answers must DIFFER and selects the
+    predicate per row. If any subquery goes uncorrelated the EXISTS collapses
+    to a table-wide constant and both rows come back the same.
+
+    All three subqueries are exercised at once:
+
+      * row A is a mirror row with its own ACTIVE route-key seed -> True;
+      * row B is a MINTED row with no route-key seed and an inactive attached
+        seed -> False. B is what makes the lane-order ``NOT EXISTS`` and the
+        attached EXISTS load-bearing: uncorrelated, B would see A's route seed
+        (killing the minted arm) or B's own attached row as a global constant.
+    """
+    from db.catalog import catalog_products as real_catalog_products
+
+    eng, md = engine
+    cp = md.tables["catalog_products"]
+    eps = md.tables["external_product_seeds"]
+    with eng.begin() as conn:
+        conn.execute(cp.delete())
+        conn.execute(eps.delete())
+        conn.execute(
+            cp.insert().values(
+                product_key="pk_renderable",
+                merchant_id="external_seed",
+                platform="external_seed",
+                source_system="external_product_seeds_mirror_v1",
+                source_product_id="ext_row_a",
+            )
+        )
+        conn.execute(
+            cp.insert().values(
+                product_key="pk_dead_minted",
+                merchant_id="external_seed",
+                platform="external_seed",
+                source_system=MINTED_SOURCE_SYSTEM,
+                source_product_id="minted-row-b-slug",
+            )
+        )
+        conn.execute(
+            eps.insert().values(
+                external_product_id="ext_row_a",
+                attached_product_key=None,
+                status="active",
+            )
+        )
+        conn.execute(
+            eps.insert().values(
+                external_product_id="brand:hash_b",
+                attached_product_key="pk_dead_minted",
+                status="inactive",
+            )
+        )
+
+        rows = dict(
+            conn.execute(
+                select(
+                    real_catalog_products.c.product_key,
+                    pdp_renderable_expression(real_catalog_products),
+                ).select_from(real_catalog_products)
+            ).all()
+        )
+
+    assert bool(rows["pk_renderable"]) is True
+    assert bool(rows["pk_dead_minted"]) is False, (
+        "a subquery went UNCORRELATED — the predicate collapsed into a "
+        "table-wide constant; restore .correlate(cp) in "
+        "services/pdp_renderability"
+    )
 
 
 def test_identity_listing_is_not_consulted():
@@ -635,13 +719,18 @@ def test_seed_exists_stays_correlated_when_compiled_standalone():
     else naming ``cp``, which is what this does.
 
     NOTE ON WHAT THIS DOES AND DOES NOT PIN. It guards the compiled OUTPUT, not
-    the mechanism. ``_seed_route_resolves`` calls ``.correlate(cp)`` explicitly,
-    but SQLAlchemy's auto-correlation reaches the same output on every path we
-    can construct — deleting the explicit call leaves this test (and the
-    invariant SQL) green. That is fine and deliberate: the explicit correlate is
-    defence-in-depth against a future refactor, and the property worth failing
-    on is the SQL, which is asserted here and in
-    tests/test_catalog_invariant_checks.py.
+    the mechanism. The subquery builders call ``.correlate(cp)`` explicitly, but
+    SQLAlchemy's auto-correlation reaches the same output on every path we can
+    construct — deleting the explicit calls leaves this test, the behavioural
+    two-row test above, AND the compiled invariant SQL byte-identical
+    (re-measured 2026-07-25 with all three arms mutated, including through
+    :func:`compile_pg`, which is the standalone path the hazard lives on). So
+    ``.correlate`` is defence-in-depth that no assertion can fail on, and
+    pretending otherwise would be a fake pin. The property worth failing on is
+    the SQL, asserted here across ALL THREE subqueries, plus the per-row
+    behaviour asserted in
+    ``test_every_subquery_is_evaluated_PER_ROW_across_two_rows`` — which DOES
+    fail if a future refactor pulls ``catalog_products`` into a subquery FROM.
     """
     from sqlalchemy import select as _select
     from sqlalchemy.dialects import postgresql
@@ -655,11 +744,21 @@ def test_seed_exists_stays_correlated_when_compiled_standalone():
         )
     )
     normalized = " ".join(sql.split())
-    # The seed subquery must name ONLY external_product_seeds in its FROM.
-    assert "FROM external_product_seeds WHERE cp." in normalized, (
-        "the seed EXISTS went UNCORRELATED — restore .correlate(cp) in "
-        "services/pdp_renderability._seed_route_resolves"
+    # EVERY seed subquery must name ONLY external_product_seeds in its FROM —
+    # there are three of them since P3 (route-key acceptance, the lane-order
+    # guard, and the minted attached lane).
+    assert normalized.count("FROM external_product_seeds WHERE cp.") == 3, (
+        "a seed EXISTS went UNCORRELATED — restore .correlate(cp) in "
+        "services/pdp_renderability"
     )
     assert "external_product_seeds, catalog_products" not in normalized
     # …and cp must appear exactly once as a FROM, in the OUTER select.
     assert normalized.count("FROM catalog_products AS cp") == 1
+
+    # Same assertion on the statement the INVARIANT actually runs, which is the
+    # compile path the cartesian-product hazard lives on.
+    from services.catalog_invariant_checks import _PUBLIC_NOT_RENDERABLE_COUNT_SQL
+
+    invariant = " ".join(_PUBLIC_NOT_RENDERABLE_COUNT_SQL.split())
+    assert invariant.count("FROM external_product_seeds WHERE cp.") == 3
+    assert "external_product_seeds, catalog_products" not in invariant

@@ -150,10 +150,12 @@ _PRODUCT_JOIN_SELECT = """
 
     -- c1.v0.5 renderability input. NOT the same question as the eps join
     -- above: eps is restricted to source_system='external_product_seeds_mirror_v1',
-    -- while the gateway looks up external_product_id for EVERY row it routes
-    -- through seeds. Path-C minted rows (catalog_enrichment_agent_v1) join
-    -- their seed by attached_product_key and so answer FALSE here — which is
-    -- exactly why their PDPs 500.
+    -- while the gateway routes through seeds on TWO keys and this answers for
+    -- both. Path-C minted rows (catalog_enrichment_agent_v1) join their seed by
+    -- attached_product_key, exactly like the minted_seed_one CTE above; since
+    -- P3 (2026-07-25) the gateway resolves that key too, so they answer TRUE
+    -- here whenever an acceptable attached seed exists and their PDPs render.
+    -- They answered FALSE — and 500ed — until P3 shipped.
     """ + seed_route_resolves_sql("cp") + """ AS pdp_seed_route_ok,
 
     COALESCE(eps.id, epm.id)                                     AS eps_id,
