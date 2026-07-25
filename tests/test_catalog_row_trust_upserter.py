@@ -420,9 +420,15 @@ async def test_seed_routed_row_with_the_same_raw_true_stays_public(monkeypatch):
 async def test_path_c_minted_row_with_no_seed_route_is_blocked_when_gated(
     monkeypatch,
 ):
-    """THE 1,375. A catalog_enrichment_agent_v1 row's seed attaches by
-    attached_product_key, so nothing answers on its source_product_id and the
-    PDP hard-500s."""
+    """The minted rows P3 does NOT rescue.
+
+    Pre-P3 this was all 1,375 of them: their seeds attach by
+    attached_product_key, nothing answered on source_product_id, and every PDP
+    hard-500ed. P3 taught the gateway the second key, so what remains is the
+    residual — measured on prod 2026-07-25, 112 minted rows carry no seed at
+    all and 124 carry no ACTIVE one. Those still have no content route, and the
+    gate must still catch them.
+    """
     monkeypatch.setenv("CATALOG_TRUST_RENDERABLE_GATE", "1")
     db = FakeDb(
         joined_rows=[
@@ -449,6 +455,46 @@ async def test_path_c_minted_row_with_no_seed_route_is_blocked_when_gated(
     _, params = db.executes[0]
     assert params["serving_decision"] == "blocked"
     assert "PDP_ROUTE_UNRESOLVABLE" in params["serving_reason_codes"]
+
+
+@pytest.mark.asyncio
+async def test_path_c_minted_row_with_a_resolvable_seed_route_stays_public_when_gated(
+    monkeypatch,
+):
+    """THE P3 FLIP, at the trust layer.
+
+    Same minted row shape, but the seed-route column now answers True because
+    services/pdp_renderability resolves the attached_product_key lane. Even
+    with the renderability gate ON, this row must stay public — it renders
+    (measured 12/12 404 -> 200 with real title/brand/image/price). If this ever
+    goes blocked, the gate has become a demotion of 2,051 live PDPs.
+    """
+    monkeypatch.setenv("CATALOG_TRUST_RENDERABLE_GATE", "1")
+    db = FakeDb(
+        joined_rows=[
+            make_joined_row(
+                merchant_id="external_seed",
+                platform="external_seed",
+                source_system="catalog_enrichment_agent_v1",
+                source_product_id="9wishes-centella-pdrn-calm-ampule",
+                pdp_seed_route_ok=True,
+                eps_id=1,
+                eps_status="active",
+                ms_merchant_id=None,
+                ms_platform=None,
+                ms_domain=None,
+                ms_status=None,
+                ms_last_sync=None,
+            )
+        ]
+    )
+
+    ok = await upsert_catalog_row_trust(db=db, product_key="pk_internal_1", now=NOW)
+
+    assert ok is True
+    _, params = db.executes[0]
+    assert params["serving_decision"] == "public"
+    assert "PDP_ROUTE_UNRESOLVABLE" not in params["serving_reason_codes"]
 
 
 @pytest.mark.asyncio

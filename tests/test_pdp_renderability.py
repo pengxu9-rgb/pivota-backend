@@ -36,10 +36,23 @@ from sqlalchemy import (
 from services.pdp_renderability import (
     MERCHANT_SYNCED_LANE_RENDERABLE,
     MERCHANT_SYNCED_PLATFORMS,
+    MINTED_SOURCE_SYSTEM,
     pdp_renderable_expression,
     pdp_route_resolvable,
     seed_route_resolves_sql,
 )
+
+# Seed-spec marker. A bare status string in a MATRIX row means "a seed keyed on
+# the ROUTE key (external_product_id = source_product_id)", which is what every
+# pre-P3 case means. ``attached(status)`` means "a seed keyed on
+# attached_product_key = product_key" — the P3 minted lane, whose
+# external_product_id is a brand:hash that deliberately matches NOTHING on the
+# route key, exactly as in prod.
+ATTACHED = "attached_product_key"
+
+
+def attached(status):
+    return (ATTACHED, status)
 
 
 @pytest.fixture
@@ -65,10 +78,28 @@ def engine():
         "external_product_seeds",
         md,
         Column("external_product_id", String),
+        Column("attached_product_key", String),
         Column("status", String),
     )
     md.create_all(eng)
     return eng, md
+
+
+def _seed_values(row, spec, ordinal):
+    """One MATRIX seed spec -> the external_product_seeds row it stands for."""
+    if isinstance(spec, tuple) and spec and spec[0] == ATTACHED:
+        return {
+            # A brand:hash id that matches no source_product_id anywhere —
+            # the whole point of the minted lane is that the route key misses.
+            "external_product_id": f"brand:hash{ordinal}",
+            "attached_product_key": "pk_1",
+            "status": spec[1],
+        }
+    return {
+        "external_product_id": row["source_product_id"],
+        "attached_product_key": None,
+        "status": spec,
+    }
 
 
 def _load(engine, row, seeds):
@@ -79,12 +110,8 @@ def _load(engine, row, seeds):
         conn.execute(cp.delete())
         conn.execute(eps.delete())
         conn.execute(cp.insert().values(product_key="pk_1", **row))
-        for status in seeds:
-            conn.execute(
-                eps.insert().values(
-                    external_product_id=row["source_product_id"], status=status
-                )
-            )
+        for ordinal, spec in enumerate(seeds):
+            conn.execute(eps.insert().values(**_seed_values(row, spec, ordinal)))
 
 
 def _sqlalchemy_answer(engine):
@@ -178,11 +205,10 @@ MATRIX = [
         True,
     ),
     (
-        # THE 1,375. Path-C minted canonicals: their seed attaches by
-        # attached_product_key and carries external_product_id='brand:hash',
-        # while source_product_id is a name slug — the keys never meet, so the
-        # gateway's lookup finds nothing and the PDP hard-500s (11/11 measured).
-        "Path-C minted canonical whose seed does not answer on its id",
+        # THE 1,375, pre-P3 shape: a minted canonical with NO seed at all, on
+        # either key. Nothing to render from, so it stays False — this is the
+        # 112-row slice that P3 does not rescue.
+        "Path-C minted canonical with no seed on either key",
         {
             "merchant_id": "external_seed",
             "platform": "external_seed",
@@ -190,6 +216,97 @@ MATRIX = [
             "source_product_id": "tower-28-beauty-sunnydays-tinted-spf-30",
         },
         [],
+        False,
+    ),
+    (
+        # THE P3 FLIP. Same row shape, but with the attached seed that prod
+        # actually has (2,063 of 2,175 minted rows do). The route key still
+        # misses — that is why this read False before P3 — and the gateway now
+        # falls through to attached_product_key and renders. Measured 12/12
+        # 404 -> 200 with real title/brand/image/price.
+        "Path-C minted canonical with an ACTIVE attached seed",
+        {
+            "merchant_id": "external_seed",
+            "platform": "external_seed",
+            "source_system": MINTED_SOURCE_SYSTEM,
+            "source_product_id": "9wishes-centella-pdrn-calm-ampule",
+        },
+        [attached("active")],
+        True,
+    ),
+    (
+        # 124 minted rows in prod have attached seeds but no ACTIVE one. The
+        # gateway's precheck 404s external_seed_not_active on them, so
+        # advertising them would recreate #1583's dead URLs on the new lane.
+        "Path-C minted canonical whose only attached seed is inactive",
+        {
+            "merchant_id": "external_seed",
+            "platform": "external_seed",
+            "source_system": MINTED_SOURCE_SYSTEM,
+            "source_product_id": "minted-dead-slug",
+        },
+        [attached("inactive")],
+        False,
+    ),
+    (
+        # A minted product_key legitimately carries one attached seed PER
+        # OFFER (31 on the widest row in prod). The gateway takes LIMIT 1 and
+        # prefers active; EXISTS collapses them the same way. Pins that a
+        # multi-offer product neither fans out nor gets dropped by a stale
+        # sibling.
+        "Path-C minted canonical with many attached seeds, one active",
+        {
+            "merchant_id": "external_seed",
+            "platform": "external_seed",
+            "source_system": MINTED_SOURCE_SYSTEM,
+            "source_product_id": "minted-multi-offer-slug",
+        },
+        [attached("inactive"), attached("retired_demo"), attached("active")],
+        True,
+    ),
+    (
+        # LANE ORDER. The gateway ranks by LANE before status: if the route key
+        # answers AT ALL, its winner is what the precheck judges, and the
+        # attached lane is never consulted. So an inactive route-key seed beats
+        # an active attached one and the row is NOT renderable. A flat
+        # `route_key OR attached` predicate would call this True and advertise a
+        # guaranteed external_seed_not_active 404.
+        "minted row with an INACTIVE route-key seed and an ACTIVE attached one",
+        {
+            "merchant_id": "external_seed",
+            "platform": "external_seed",
+            "source_system": MINTED_SOURCE_SYSTEM,
+            "source_product_id": "minted-with-routekey-seed",
+        },
+        ["inactive", attached("active")],
+        False,
+    ),
+    (
+        # The mirror image: route key answers and is ACTIVE, so lane 0 wins on
+        # its own merits and the attached lane is irrelevant. Renderable.
+        "minted row with an ACTIVE route-key seed and an inactive attached one",
+        {
+            "merchant_id": "external_seed",
+            "platform": "external_seed",
+            "source_system": MINTED_SOURCE_SYSTEM,
+            "source_product_id": "minted-with-active-routekey-seed",
+        },
+        ["active", attached("inactive")],
+        True,
+    ),
+    (
+        # The minted arm is gated on source_system. A MIRROR row that happens
+        # to carry an attached seed must NOT borrow it: mirror rows resolve on
+        # the route key only, and lending them the attached lane would advertise
+        # PDPs the gateway still 404s. This is the "purely additive" pin.
+        "mirror row with an attached seed but a dead route key",
+        {
+            "merchant_id": "external_seed",
+            "platform": "external_seed",
+            "source_system": "external_product_seeds_mirror_v1",
+            "source_product_id": "ext_mirror_no_route_seed",
+        },
+        [attached("active")],
         False,
     ),
     (
@@ -348,6 +465,139 @@ def test_seed_exists_is_evaluated_per_row_not_globally(engine):
     assert _sqlalchemy_answer(engine) is False
 
 
+# The literal both twins must emit, byte for byte. PIVOTA-Agent
+# tests/pdp_renderability.node.test.cjs asserts the SAME string against
+# src/services/pdpRenderability.seedRouteResolvesSql('cp'), so the two suites
+# fail together the moment either repo edits the fragment alone — which is the
+# one drift no runtime check can catch (the two services write ONE
+# catalog_row_trust table and would silently disagree per row).
+SEED_ROUTE_SQL_CP = (
+    "(EXISTS (SELECT 1 FROM external_product_seeds _seed_route WHERE "
+    "_seed_route.external_product_id = cp.source_product_id AND "
+    "coalesce(lower(trim(_seed_route.status)), '') IN ('', 'active')) "
+    "OR (cp.source_system = 'catalog_enrichment_agent_v1' AND NOT "
+    "EXISTS (SELECT 1 FROM external_product_seeds _seed_route_any WHERE"
+    " _seed_route_any.external_product_id = cp.source_product_id AND "
+    "lower(trim(coalesce(cp.platform, ''))) = 'external_seed') AND "
+    "EXISTS (SELECT 1 FROM external_product_seeds _seed_route_minted "
+    "WHERE _seed_route_minted.attached_product_key = cp.product_key AND"
+    " coalesce(lower(trim(_seed_route_minted.status)), '') IN ('', "
+    "'active'))))"
+)
+
+
+def test_seed_route_fragment_is_byte_identical_to_the_node_twin():
+    assert seed_route_resolves_sql("cp") == SEED_ROUTE_SQL_CP
+
+
+def test_minted_lane_is_gated_on_source_system_and_on_lane_0_answering_nothing():
+    """The gateway's seed LATERAL ranks by LANE before status.
+
+    Whenever the route key answers at all, ITS winner is what the precheck
+    judges — so the minted arm may only fire when the route key answers with
+    NOTHING. A flat ``routeKey OR attached`` would advertise a row whose
+    inactive route-key seed guarantees a 404 ``external_seed_not_active``,
+    which is #1583's dead-URL bug recreated on a new lane. The lane-order guard
+    must also stay UNFILTERED by status, or an inactive lane-0 seed stops
+    blocking.
+    """
+    sql = seed_route_resolves_sql("cp")
+    assert sql.count("NOT EXISTS") == 1, (
+        "exactly one NOT EXISTS — the lane-order guard, and nothing else"
+    )
+    assert (
+        "NOT EXISTS (SELECT 1 FROM external_product_seeds _seed_route_any "
+        "WHERE _seed_route_any.external_product_id = cp.source_product_id "
+        "AND lower(trim(coalesce(cp.platform, ''))) = 'external_seed')"
+    ) in sql, (
+        "the lane-order guard must carry the gateway's LANE 0 platform "
+        "conjunct — without it a minted row on another platform reads as "
+        "'lane 0 answered' here while the gateway falls through to lane 1"
+    )
+    assert f"cp.source_system = '{MINTED_SOURCE_SYSTEM}'" in sql, (
+        "the minted arm must be gated on source_system so no other lane "
+        "borrows it, and must compare it EXACTLY like the gateway does; "
+        "normalising it here would be strictly wider = over-advertise"
+    )
+
+
+def test_every_subquery_is_evaluated_PER_ROW_across_two_rows(engine):
+    """The behavioural correlation pin — the one the compiled-SQL tests are not.
+
+    ``test_seed_exists_stays_correlated_when_compiled_standalone`` guards the
+    compiled OUTPUT, and it passes even with every ``.correlate(cp)`` deleted,
+    because SQLAlchemy's auto-correlation reaches the same string on the paths
+    we can construct. So it cannot fail for the reason it exists. This one can:
+    it loads TWO catalog rows whose answers must DIFFER and selects the
+    predicate per row. If any subquery goes uncorrelated the EXISTS collapses
+    to a table-wide constant and both rows come back the same.
+
+    All three subqueries are exercised at once:
+
+      * row A is a mirror row with its own ACTIVE route-key seed -> True;
+      * row B is a MINTED row with no route-key seed and an inactive attached
+        seed -> False. B is what makes the lane-order ``NOT EXISTS`` and the
+        attached EXISTS load-bearing: uncorrelated, B would see A's route seed
+        (killing the minted arm) or B's own attached row as a global constant.
+    """
+    from db.catalog import catalog_products as real_catalog_products
+
+    eng, md = engine
+    cp = md.tables["catalog_products"]
+    eps = md.tables["external_product_seeds"]
+    with eng.begin() as conn:
+        conn.execute(cp.delete())
+        conn.execute(eps.delete())
+        conn.execute(
+            cp.insert().values(
+                product_key="pk_renderable",
+                merchant_id="external_seed",
+                platform="external_seed",
+                source_system="external_product_seeds_mirror_v1",
+                source_product_id="ext_row_a",
+            )
+        )
+        conn.execute(
+            cp.insert().values(
+                product_key="pk_dead_minted",
+                merchant_id="external_seed",
+                platform="external_seed",
+                source_system=MINTED_SOURCE_SYSTEM,
+                source_product_id="minted-row-b-slug",
+            )
+        )
+        conn.execute(
+            eps.insert().values(
+                external_product_id="ext_row_a",
+                attached_product_key=None,
+                status="active",
+            )
+        )
+        conn.execute(
+            eps.insert().values(
+                external_product_id="brand:hash_b",
+                attached_product_key="pk_dead_minted",
+                status="inactive",
+            )
+        )
+
+        rows = dict(
+            conn.execute(
+                select(
+                    real_catalog_products.c.product_key,
+                    pdp_renderable_expression(real_catalog_products),
+                ).select_from(real_catalog_products)
+            ).all()
+        )
+
+    assert bool(rows["pk_renderable"]) is True
+    assert bool(rows["pk_dead_minted"]) is False, (
+        "a subquery went UNCORRELATED — the predicate collapsed into a "
+        "table-wide constant; restore .correlate(cp) in "
+        "services/pdp_renderability"
+    )
+
+
 def test_identity_listing_is_not_consulted():
     """Regression pin for the correction this module exists to make.
 
@@ -469,13 +719,18 @@ def test_seed_exists_stays_correlated_when_compiled_standalone():
     else naming ``cp``, which is what this does.
 
     NOTE ON WHAT THIS DOES AND DOES NOT PIN. It guards the compiled OUTPUT, not
-    the mechanism. ``_seed_route_resolves`` calls ``.correlate(cp)`` explicitly,
-    but SQLAlchemy's auto-correlation reaches the same output on every path we
-    can construct — deleting the explicit call leaves this test (and the
-    invariant SQL) green. That is fine and deliberate: the explicit correlate is
-    defence-in-depth against a future refactor, and the property worth failing
-    on is the SQL, which is asserted here and in
-    tests/test_catalog_invariant_checks.py.
+    the mechanism. The subquery builders call ``.correlate(cp)`` explicitly, but
+    SQLAlchemy's auto-correlation reaches the same output on every path we can
+    construct — deleting the explicit calls leaves this test, the behavioural
+    two-row test above, AND the compiled invariant SQL byte-identical
+    (re-measured 2026-07-25 with all three arms mutated, including through
+    :func:`compile_pg`, which is the standalone path the hazard lives on). So
+    ``.correlate`` is defence-in-depth that no assertion can fail on, and
+    pretending otherwise would be a fake pin. The property worth failing on is
+    the SQL, asserted here across ALL THREE subqueries, plus the per-row
+    behaviour asserted in
+    ``test_every_subquery_is_evaluated_PER_ROW_across_two_rows`` — which DOES
+    fail if a future refactor pulls ``catalog_products`` into a subquery FROM.
     """
     from sqlalchemy import select as _select
     from sqlalchemy.dialects import postgresql
@@ -489,11 +744,21 @@ def test_seed_exists_stays_correlated_when_compiled_standalone():
         )
     )
     normalized = " ".join(sql.split())
-    # The seed subquery must name ONLY external_product_seeds in its FROM.
-    assert "FROM external_product_seeds WHERE cp." in normalized, (
-        "the seed EXISTS went UNCORRELATED — restore .correlate(cp) in "
-        "services/pdp_renderability._seed_route_resolves"
+    # EVERY seed subquery must name ONLY external_product_seeds in its FROM —
+    # there are three of them since P3 (route-key acceptance, the lane-order
+    # guard, and the minted attached lane).
+    assert normalized.count("FROM external_product_seeds WHERE cp.") == 3, (
+        "a seed EXISTS went UNCORRELATED — restore .correlate(cp) in "
+        "services/pdp_renderability"
     )
     assert "external_product_seeds, catalog_products" not in normalized
     # …and cp must appear exactly once as a FROM, in the OUTER select.
     assert normalized.count("FROM catalog_products AS cp") == 1
+
+    # Same assertion on the statement the INVARIANT actually runs, which is the
+    # compile path the cartesian-product hazard lives on.
+    from services.catalog_invariant_checks import _PUBLIC_NOT_RENDERABLE_COUNT_SQL
+
+    invariant = " ".join(_PUBLIC_NOT_RENDERABLE_COUNT_SQL.split())
+    assert invariant.count("FROM external_product_seeds WHERE cp.") == 3
+    assert "external_product_seeds, catalog_products" not in invariant

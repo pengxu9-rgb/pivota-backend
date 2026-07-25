@@ -24,6 +24,14 @@ MEASURED 2026-07-25 (29 live PDP fetches against prod, per cohort):
   url_audit row, no seed                       NONE AT ALL         500           (1/1)
   ==========================================  ==================  ============
 
+RE-MEASURED 2026-07-25 after PIVOTA-Agent P3 (the minted-lane seed route):
+
+  ==========================================  ==================  ============
+  row state                                    identity listing    HTTP
+  ==========================================  ==================  ============
+  catalog_enrichment_agent_v1, attached seed   NONE AT ALL         200 + JSON-LD (12/12)
+  ==========================================  ==================  ============
+
 The identity listing has NO bearing on whether the PDP renders. It never did:
 ``get_pdp_v2``'s serving gate (``fetchPdpServingEligibilityFromDb`` in
 PIVOTA-Agent ``src/server.js``) reads ``catalog_products`` +
@@ -35,16 +43,30 @@ What ACTUALLY decides it is whether the gateway can resolve a CONTENT ROUTE
 for the row:
 
   * **Seed-routed rows** (the whole external-seed world) resolve their detail
-    through ``external_product_seeds`` keyed by
-    ``external_product_id = catalog_products.source_product_id``. If no
-    acceptable seed answers on that key, the gateway 404s
+    through ``external_product_seeds``. TWO keys answer, in the gateway's own
+    order of preference:
+
+      1. ``external_product_id = catalog_products.source_product_id`` — the
+         mirror lane, where ``source_product_id`` already IS a seed id;
+      2. ``attached_product_key = catalog_products.product_key`` — the P3
+         minted lane, for ``catalog_enrichment_agent_v1`` rows whose seeds
+         attach by product_key and carry an ``external_product_id`` of the form
+         ``brand:hash`` while their own ``source_product_id`` is a name slug.
+
+    If no acceptable seed answers on either key, the gateway 404s
     ``PRODUCT_NOT_FOUND`` and the static/ISR PDP route turns that into a hard
-    500. This is why all 1,375 public ``catalog_enrichment_agent_v1`` rows are
-    dead: their seeds attach by ``attached_product_key`` and carry an
-    ``external_product_id`` of the form ``brand:hash``, while their
-    ``source_product_id`` is a name slug — the keys never meet. (Requesting the
-    seed's own ``external_product_id`` renders fine, which is the P3 fix, and
-    is a PIVOTA-Agent change, not this one.)
+    500.
+
+    Lane 2 is why the minted row in the second table above flipped. It read
+    500 for
+    every one of the 1,375 public ``catalog_enrichment_agent_v1`` rows,
+    because the gateway only ever tried key 1. PIVOTA-Agent P3 (2026-07-25) added key 2 to
+    ``get_pdp_v2``'s seed LATERAL and re-measured: 12/12 sampled minted PDPs
+    went 404 → 200 with a real title, brand, image and price, against prod
+    data, while 8 mirror / 4 shopify / 3 url_audit control rows answered
+    byte-identically before and after. The two changes ship together —
+    PIVOTA-Agent must be live before this predicate stops withholding the lane
+    from the sitemap.
   * **Merchant-synced rows** (shopify/wix catalog sync) were ASSUMED to resolve
     their detail from the merchant upstream and so to need no seed. Measured,
     that assumption is FALSE: 7/7 sampled shopify PDPs returned HTTP 500,
@@ -83,6 +105,7 @@ from db.catalog import catalog_products
 external_product_seeds = table(
     "external_product_seeds",
     column("external_product_id", String),
+    column("attached_product_key", String),
     column("status", String),
 )
 
@@ -94,6 +117,21 @@ SEED_ROUTED_SOURCE_SYSTEMS = (
     "external_product_seeds_mirror_v1",
     "catalog_enrichment_agent_v1",
 )
+
+# Path-C "minted canonical" rows. Their seed does NOT answer on the route key:
+# it attaches by ``external_product_seeds.attached_product_key =
+# catalog_products.product_key`` and carries a ``brand:hash``
+# external_product_id, while the minted row's own ``source_product_id`` is a
+# canonical name slug. Measured in prod 2026-07-25: 0 of 2,175 minted rows have
+# ANY seed on the route key, while 2,063 carry an attached seed (2,051 an active
+# one).
+#
+# P3 (PIVOTA-Agent, shipped alongside this change) taught ``get_pdp_v2`` to
+# resolve that second lane — see the LANE 1 arm of the seed LATERAL in
+# ``resolveCatalogProductRefFromPivotaSignatureInner`` — so the lane is now
+# renderable and this predicate has to say so, or the sitemap keeps withholding
+# ~1,375 PDPs that render fine.
+MINTED_SOURCE_SYSTEM = "catalog_enrichment_agent_v1"
 
 # Platforms with a live catalog-sync adapter: the gateway fetches product
 # detail from the merchant upstream, so no seed row is involved. Keep in step
@@ -172,6 +210,74 @@ def _seed_routed_lane(cp):
     )
 
 
+def _route_key_seed(cp, *, acceptable_only: bool, platform_guarded: bool = False):
+    """LANE 0 — the seed keyed on ``external_product_id = source_product_id``.
+
+    ``acceptable_only=False`` asks the weaker question "does lane 0 answer AT
+    ALL", which is what decides whether the gateway ever falls through to lane
+    1 (it ranks by lane before it ranks by status).
+
+    ``platform_guarded`` mirrors the gateway's LANE 0 ``WHERE cp.platform =
+    'external_seed'`` conjunct (PIVOTA-Agent src/server.js, the seed LATERAL in
+    ``resolveCatalogProductRefFromPivotaSignatureInner``).
+
+    IT IS OFF FOR THE ACCEPTANCE ARM, DELIBERATELY, AND THAT IS A PRE-EXISTING
+    GAP THIS CHANGE DOES NOT WIDEN. The acceptance arm has never carried the
+    guard, so a row whose ``source_product_id`` collides with some seed's
+    ``external_product_id`` while sitting on a non-``external_seed`` platform
+    reads renderable here even though the gateway's lane 0 would not match it.
+    Turning it on would change lanes this PR is otherwise additive to (an
+    ``ext_``-prefixed id under a shopify merchant, for one), so it stays a
+    stated PRECONDITION rather than a silent one: *the equivalence claim below
+    holds exactly on rows whose platform is* ``external_seed``, which is all
+    2,175 minted rows in prod and every seed-mirror row.
+
+    It IS on for the minted arm's lane-order guard, where correctness is this
+    PR's business: see :func:`_seed_route_resolves`.
+    """
+    conditions = [
+        external_product_seeds.c.external_product_id == cp.c.source_product_id
+    ]
+    if platform_guarded:
+        conditions.append(_lower_trim(cp.c.platform) == EXTERNAL_SEED_MERCHANT_ID)
+    if acceptable_only:
+        conditions.append(
+            func.coalesce(
+                func.lower(func.trim(external_product_seeds.c.status)), ""
+            ).in_(["", "active"])
+        )
+    return (
+        select(external_product_seeds.c.external_product_id)
+        .where(and_(*conditions))
+        # CORRELATE EXPLICITLY — see :func:`_seed_route_resolves`.
+        .correlate(cp)
+        .exists()
+    )
+
+
+def _minted_attached_seed(cp):
+    """LANE 1 — the P3 seed keyed on ``attached_product_key = product_key``.
+
+    Deduplication is the gateway's LIMIT 1, not ours: a minted product_key can
+    legitimately carry many attached seeds (one per offer; the widest in prod
+    carries 31), and EXISTS collapses them the same way the LATERAL does.
+    """
+    return (
+        select(external_product_seeds.c.external_product_id)
+        .where(
+            and_(
+                external_product_seeds.c.attached_product_key == cp.c.product_key,
+                func.coalesce(
+                    func.lower(func.trim(external_product_seeds.c.status)), ""
+                ).in_(["", "active"]),
+            )
+        )
+        # CORRELATE EXPLICITLY — see :func:`_seed_route_resolves`.
+        .correlate(cp)
+        .exists()
+    )
+
+
 def _seed_route_resolves(cp):
     """EXISTS: a seed the gateway would both FIND and ACCEPT on this row's key.
 
@@ -202,27 +308,46 @@ def _seed_route_resolves(cp):
     subquery on the sitemap feed into a scan. The gap direction is safe
     (under-advertise, never falsely drop) and empirically empty for the current
     corpus.
+
+    P3 (2026-07-25) added the SECOND lane. ``get_pdp_v2``'s seed LATERAL now
+    resolves ``attached_product_key = product_key`` for
+    ``catalog_enrichment_agent_v1`` rows, ordering by LANE FIRST and only then
+    by status — so lane 1 is reachable exactly when lane 0 answers with
+    NOTHING, and this predicate mirrors that shape rather than a plain OR. A
+    plain OR would over-advertise the (today empty, tomorrow possible) row that
+    has an inactive lane-0 seed AND an active attached one: the gateway would
+    pick the inactive lane-0 winner and 404 ``external_seed_not_active`` while
+    the sitemap called it renderable — #1583's dead-URL bug on a new lane.
+
+    Correlation note: auto-correlation only kicks in when the expression is
+    embedded in an enclosing SELECT that already names ``cp``;
+    :func:`compile_pg` compiles it standalone, where SQLAlchemy would otherwise
+    emit ``FROM external_product_seeds, catalog_products AS cp`` — a cartesian
+    product that turns a per-row answer into a global constant (every row
+    "renderable" as long as ONE active seed exists anywhere). Hence the
+    explicit ``.correlate(cp)`` on every arm.
     """
-    return (
-        select(external_product_seeds.c.external_product_id)
-        .where(
-            and_(
-                external_product_seeds.c.external_product_id
-                == cp.c.source_product_id,
-                func.coalesce(
-                    func.lower(func.trim(external_product_seeds.c.status)), ""
-                ).in_(["", "active"]),
-            )
-        )
-        # CORRELATE EXPLICITLY. Auto-correlation only kicks in when the
-        # expression is embedded in an enclosing SELECT that already names
-        # ``cp``; :func:`pdp_not_renderable_sql` compiles it standalone, where
-        # SQLAlchemy would otherwise emit ``FROM external_product_seeds,
-        # catalog_products AS cp`` — a cartesian product that turns a per-row
-        # answer into a global constant (every row "renderable" as long as ONE
-        # active seed exists anywhere).
-        .correlate(cp)
-        .exists()
+    return or_(
+        _route_key_seed(cp, acceptable_only=True),
+        and_(
+            # EXACT equality, mirroring the gateway's LANE 1
+            # `cp.source_system = 'catalog_enrichment_agent_v1'`. A
+            # lower/trim-normalised test here would be strictly WIDER than the
+            # gateway, and wider is the OVER-ADVERTISE direction: a row stored
+            # as ' Catalog_Enrichment_Agent_V1 ' would be called renderable
+            # while the gateway's arm never fired for it. (The lane test in
+            # :func:`_seed_routed_lane` does normalise, because it answers a
+            # different question — "is this row seed-routed at all" — where
+            # being generous only costs a False.)
+            cp.c.source_system == MINTED_SOURCE_SYSTEM,
+            # PLATFORM-GUARDED: the gateway falls through to lane 1 exactly when
+            # its OWN lane 0 matched nothing, and its lane 0 carries the
+            # platform conjunct. Without the guard a minted row on some other
+            # platform that happens to collide with a seed id would read as
+            # "lane 0 answered" here while the gateway went to lane 1 anyway.
+            ~_route_key_seed(cp, acceptable_only=False, platform_guarded=True),
+            _minted_attached_seed(cp),
+        ),
     )
 
 
@@ -260,11 +385,26 @@ def seed_route_resolves_sql(cp_alias: str = "cp") -> str:
     :func:`pdp_route_resolvable` — are pinned against each other by an
     executable parity test over a shared row matrix
     (``tests/test_pdp_renderability.py``). Change one, that test fails.
+
+    The second disjunct is the P3 minted lane; see :func:`_seed_route_resolves`
+    for why it is gated on "lane 0 answers with nothing" rather than OR-ed in
+    flat, and why the source_system test comes first (it is a free row-level
+    column read, so non-minted rows never pay for the two extra subqueries and
+    their plan is unchanged).
     """
     return (
-        "EXISTS (SELECT 1 FROM external_product_seeds _seed_route "
+        "(EXISTS (SELECT 1 FROM external_product_seeds _seed_route "
         f"WHERE _seed_route.external_product_id = {cp_alias}.source_product_id "
         "AND coalesce(lower(trim(_seed_route.status)), '') IN ('', 'active'))"
+        f" OR ({cp_alias}.source_system = '{MINTED_SOURCE_SYSTEM}'"
+        " AND NOT EXISTS (SELECT 1 FROM external_product_seeds _seed_route_any "
+        f"WHERE _seed_route_any.external_product_id = {cp_alias}.source_product_id "
+        f"AND lower(trim(coalesce({cp_alias}.platform, ''))) "
+        f"= '{EXTERNAL_SEED_MERCHANT_ID}')"
+        " AND EXISTS (SELECT 1 FROM external_product_seeds _seed_route_minted "
+        f"WHERE _seed_route_minted.attached_product_key = {cp_alias}.product_key "
+        "AND coalesce(lower(trim(_seed_route_minted.status)), '') "
+        "IN ('', 'active'))))"
     )
 
 
@@ -281,7 +421,11 @@ def pdp_route_resolvable(
     ``services/catalog_trust_policy`` derives over plain dicts, not SQL, so the
     trust gate needs the predicate in this shape. ``seed_route_ok`` is the one
     part that cannot be answered from a single row — the caller supplies it
-    from :func:`seed_route_resolves_sql`.
+    from :func:`seed_route_resolves_sql`, which since P3 answers for BOTH seed
+    lanes (route key and minted attached_product_key). That is why this
+    function needs no minted-lane branch of its own: the lane dispatch it does
+    here is unchanged, and the extra lane lives entirely inside the value it is
+    handed.
     """
     lowered_id = (source_product_id or "").strip().lower()
     seed_routed = (
@@ -328,6 +472,7 @@ def compile_pg(stmt) -> str:
 __all__ = [
     "EXTERNAL_SEED_MERCHANT_ID",
     "MERCHANT_SYNCED_PLATFORMS",
+    "MINTED_SOURCE_SYSTEM",
     "SEED_ROUTED_SOURCE_SYSTEMS",
     "compile_pg",
     "external_product_seeds",

@@ -158,10 +158,19 @@ def _renderable_column():
     never reads ``pdp_identity_listing`` at all; ``live_read_enabled`` gates the
     identity promotion lane, not the renderer. Net effect of the correction on
     the live feed: 943 rows that render fine stop being withheld from the
-    sitemap, and 2,297 non-renderable rows stay out. (1,376 of those 2,297 are
+    sitemap, and 2,297 non-renderable rows stay out. (1,376 of those 2,297 were
     the cohort that is ALSO trust-``public`` — the number
     ``public_not_renderable`` counts; the remainder are non-renderable rows the
     trust layer was already withholding for other reasons.)
+
+    P3, 2026-07-25 — the second correction, in the same direction. The minted
+    lane's seeds attach by ``attached_product_key``, and until PIVOTA-Agent's
+    ``get_pdp_v2`` learned that key nothing could render them. It now does
+    (12/12 sampled minted PDPs went 404 → 200 with real title/brand/image/price
+    against prod data), so this column admits them: corpus-wide 2,051 rows flip
+    to renderable and ZERO flip away, and ``public_not_renderable`` falls
+    1,376 → 1. The sitemap grows on its next 6h cron; a shrink guard exists,
+    growth is unguarded, which is the safe direction for this change.
 
     "Non-renderable" here means the URL does not answer with a real PDP: it is
     either a hard HTTP 500 or a generic noindex shell carrying no product
