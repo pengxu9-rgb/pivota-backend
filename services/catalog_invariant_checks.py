@@ -32,7 +32,9 @@ _SAMPLE_LIMIT = 5
 # the same belief 29 live PDP fetches disproved on 2026-07-25 (rows with NO
 # identity listing at all render full 200s; rows with one render 500s). It now
 # compiles :func:`pdp_renderable_expression`, so the invariant and the feed
-# cannot disagree about what "renderable" means.
+# cannot disagree about what "renderable" means — and so a fix to the predicate
+# (P3's minted lane) moves this count and the sitemap in one step, instead of
+# leaving the alarm calibrated to a gap that no longer exists.
 _crt = table(
     "catalog_row_trust",
     column("subject_type", String),
@@ -64,19 +66,22 @@ _PUBLIC_NOT_RENDERABLE_SAMPLE_SQL = compile_pg(
 
 # Each check: (name, threshold_env, default_threshold, description, count SQL,
 # sample SQL). Violation = count > threshold. Thresholds default to 0 except
-# PUBLIC_NOT_RENDERABLE: the trust policy still lets rows reach 'public' whose
-# PDP has no resolvable content route (measured 2026-07-25: 1,375 Path-C minted
-# rows whose seeds attach by attached_product_key, so the gateway's
-# external_product_id lookup never finds them, plus 1 audit-minted url_audit
-# row) — threshold is env-tunable so the sweep tracks the number without paging
-# until CATALOG_TRUST_RENDERABLE_GATE is flipped on or the P3 identity path for
-# catalog_enrichment_agent_v1 ships.
+# PUBLIC_NOT_RENDERABLE, which tracks the residual set of rows the trust policy
+# lets reach 'public' while the gateway has no resolvable PDP content route.
 #
-# That default is the MEASURED BASELINE (1,376 as of 2026-07-25), not an
-# aspirational 500. A threshold below the true count leaves the check
-# permanently red, and a permanently-red check cannot signal a NEW regression —
-# it is indistinguishable from the known gap. Lower it as P3 lands; raising it
-# needs a reason.
+# The default is the MEASURED BASELINE, never an aspiration. A threshold below
+# the true count leaves the check permanently red, and a permanently-red check
+# cannot signal a NEW regression — it is indistinguishable from the known gap.
+# Raising it needs a reason; lowering it is mandatory the moment the true count
+# drops, or the alarm goes deaf by exactly the size of the fix.
+#
+# 2026-07-25, P3: the baseline was 1,376 — 1,375 Path-C minted rows whose seeds
+# attach by attached_product_key (so the gateway's external_product_id lookup
+# never found them) plus 1 audit-minted url_audit row. PIVOTA-Agent P3 taught
+# get_pdp_v2 to resolve that second key and services/pdp_renderability now says
+# so, which re-measures the count at exactly 1 on prod: the url_audit row, and
+# nothing else. Corpus-wide the predicate change flipped 2,051 rows to
+# renderable and ZERO rows away from it.
 _CHECKS: List[Dict[str, Any]] = [
     {
         "name": "public_but_suppressed",
@@ -162,9 +167,14 @@ _CHECKS: List[Dict[str, Any]] = [
             "(c1.v0.5 gap)"
         ),
         "env": "CATALOG_INVARIANT_RENDERABLE_THRESHOLD",
-        # Measured baseline 2026-07-25, NOT an aspiration — see the note above
-        # _CHECKS on why an under-set threshold destroys the signal.
-        "default_threshold": 1376,
+        # Measured baseline 2026-07-25 AFTER P3, NOT an aspiration — see the
+        # note above _CHECKS on why an under-set threshold destroys the signal,
+        # and why leaving it at the pre-P3 1,376 would have been just as bad in
+        # the other direction (1,375 rows of head-room for a silent regression).
+        # The 1 is the single url_audit row: audit-minted, no seed, no sync
+        # adapter, measured HTTP 500. It goes to 0 when that row is either
+        # given a route or dropped out of 'public'.
+        "default_threshold": 1,
         "count_sql": _PUBLIC_NOT_RENDERABLE_COUNT_SQL,
         "sample_sql": _PUBLIC_NOT_RENDERABLE_SAMPLE_SQL,
     },

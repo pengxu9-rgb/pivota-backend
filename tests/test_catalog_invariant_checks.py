@@ -59,18 +59,33 @@ async def test_violation_over_threshold_carries_samples():
 
 @pytest.mark.asyncio
 async def test_count_at_threshold_is_not_violated():
-    # public_not_renderable's default threshold is the MEASURED c1.v0.5
-    # baseline (1,376 on 2026-07-25), not an aspirational number: a threshold
-    # under the true count leaves the check permanently red, which is
-    # indistinguishable from a new regression.
+    # public_not_renderable's default threshold is the MEASURED baseline, not
+    # an aspirational number: a threshold under the true count leaves the check
+    # permanently red, which is indistinguishable from a new regression.
+    #
+    # It was 1,376 pre-P3. P3 (PIVOTA-Agent) taught get_pdp_v2 to resolve the
+    # minted lane via attached_product_key and services/pdp_renderability now
+    # agrees, re-measuring prod at exactly 1 (the url_audit row). Leaving the
+    # threshold at 1,376 would have been the SAME mistake in the other
+    # direction: 1,375 rows of silent head-room for a fresh regression.
+    threshold = next(
+        c["default_threshold"]
+        for c in _CHECKS
+        if c["name"] == "public_not_renderable"
+    )
+    assert threshold == 1, (
+        "re-measure prod and move this with the threshold; the alarm is only "
+        "worth having while it sits ON the true count"
+    )
+
     report = await run_catalog_invariant_checks(
-        FakeDb({"public_not_renderable": 1376})
+        FakeDb({"public_not_renderable": threshold})
     )
     entry = next(c for c in report["checks"] if c["name"] == "public_not_renderable")
     assert entry["violated"] is False
 
     over = await run_catalog_invariant_checks(
-        FakeDb({"public_not_renderable": 1377})
+        FakeDb({"public_not_renderable": threshold + 1})
     )
     assert next(
         c for c in over["checks"] if c["name"] == "public_not_renderable"

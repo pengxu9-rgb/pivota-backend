@@ -687,8 +687,14 @@ def test_index_eligible_read_on_still_blocks_when_neither_eligible(monkeypatch):
 # The gap this closes: 1,825 rows were 'public' while the invariant said their
 # PDP could not render. Measured live 2026-07-25 — 449 of them render perfectly
 # (the invariant was wrong, fixed in services/pdp_renderability) and 1,376 serve
-# a hard HTTP 500, not a shell. Blocking those 1,376 darkens 1,011 products that
-# have no renderable sibling row, so it is flag-gated for the founder.
+# a hard HTTP 500, not a shell. Blocking those 1,376 would have darkened 1,011
+# products with no renderable sibling row, so it was flag-gated for the founder.
+#
+# P3 then made 1,375 of the 1,376 RENDER rather than hiding them (PIVOTA-Agent
+# taught get_pdp_v2 the attached_product_key lane; the predicate followed). The
+# gate now costs exactly ONE row. The tests below are unchanged on purpose:
+# they drive pdp_route_resolvable directly, so they pin the GATE MECHANICS,
+# which are what must survive the next lane that goes unrenderable.
 
 
 def test_renderable_gate_off_by_default_leaves_an_unrenderable_row_public(monkeypatch):

@@ -19,8 +19,20 @@ Contract: every reader downstream depends on (serving_decision,
 serving_reason_codes). The other fields are advisory and used for ranking,
 debugging, and shadow-comparison.
 
-Versioning: POLICY_VERSION must bump on any change to derivation logic.
-The backfill job uses POLICY_VERSION to detect stale rows.
+Versioning: POLICY_VERSION must bump on any change to derivation LOGIC — the
+mapping from inputs to a decision. It must NOT bump when only an INPUT the
+current logic cannot reach changes, because the backfill uses POLICY_VERSION to
+detect stale rows and the UPSERT rewrites on a version mismatch: a cosmetic bump
+costs a full ~14k-row rewrite and, worse, re-opens the split-brain window where
+the two services disagree on the version until both are deployed.
+
+Worked example — P3, 2026-07-25. It changed how ``pdp_route_resolvable`` is
+COMPUTED (services/pdp_renderability learned the minted attached_product_key
+lane, flipping 2,051 rows to renderable). That input is read in exactly one
+place, ``_derive_serving_decision``, behind ``_renderable_gate_enabled()``,
+which is default OFF in prod — so every derived decision and every reason code
+is byte-identical before and after, on all 14,104 rows. No bump. The version
+bumps the day the GATE flips, not the day the input gets more accurate.
 """
 
 from __future__ import annotations
@@ -68,9 +80,13 @@ POLICY_VERSION = "c1.v0.5"
 #     content route for the row, so its public PDP never answers with a real
 #     product page: it is either a hard HTTP 500 or a generic noindex shell
 #     carrying no product JSON-LD (both measured; see services/pdp_renderability
-#     for the truth table). GATED on CATALOG_TRUST_RENDERABLE_GATE, default OFF:
-#     turning it on demotes 1,376 rows out of 'public' (measured 2026-07-25),
-#     which is a serving-surface decision for the founder, not a code default.
+#     for the truth table). GATED on CATALOG_TRUST_RENDERABLE_GATE, default OFF.
+#     Blast radius, re-measured on prod after P3 (2026-07-25): turning it on now
+#     demotes exactly ONE row — the url_audit audit-minted row — taking public
+#     3,937 -> 3,936 and darkening 1 product. It was 1,376 rows / 1,011 dark
+#     products before P3 taught the gateway the minted lane, which is why the
+#     flip was a founder call then and is close to free now. Re-measure before
+#     flipping; the number is only as current as the last sweep.
 #
 #     ⚠️ THE FLAG IS PER-SERVICE AND THE TWINS SHARE ONE DATABASE. PIVOTA-Agent
 #     runs the same policy (src/services/catalogTrustPolicy.js) and writes the
@@ -78,9 +94,17 @@ POLICY_VERSION = "c1.v0.5"
 #     upsertCatalogRowTrustForSourceListingRefs on every live-read promotion and
 #     identity override. Set CATALOG_TRUST_RENDERABLE_GATE on BOTH Railway
 #     services or NEITHER: with it on one side only, this backend blocks the
-#     1,376 and Node re-derives them public on the next identity event, so rows
+#     rows and Node re-derives them public on the next identity event, so rows
 #     FLAP public<->blocked on the live serving surface. The same applies to
 #     POLICY_VERSION itself — ship the two repos back to back.
+#
+#     The SEED-ROUTE INPUT is the other half of that symmetry and is NOT
+#     env-gated: both repos compute pdp_seed_route_ok from their own copy of
+#     the renderability predicate (services/pdp_renderability.py and
+#     PIVOTA-Agent src/services/pdpRenderability.js). A predicate edit in one
+#     repo only is the same split-brain with no flag to blame, which is why the
+#     two files pin each other on a byte-identical SQL string in their test
+#     suites. P3 changed that predicate in both, in one merge pair.
 
 
 class _ReasonCodes:
@@ -156,17 +180,22 @@ def _renderable_gate_enabled() -> bool:
     Default OFF ⇒ byte-identical to c1.v0.4. Flipping it ON blocks every row
     whose ``pdp_route_resolvable`` input is explicitly ``False``.
 
-    Why a flag and not a straight fix: the rows this catches are real,
-    quality-eligible products (measured 2026-07-25: 1,375 Path-C minted
-    canonicals whose seeds attach by ``attached_product_key`` so the gateway's
-    ``external_product_id`` lookup never finds them, plus 1 audit-minted
-    ``url_audit`` row). Their PDPs hard-500 today, so serving them is a broken
-    promise — but 1,011 of them have NO renderable sibling row, meaning the
-    product goes dark entirely, and public drops 3,937 → 2,561 (40% → 26% of
-    the serving corpus). The RIGHT fix is the P3 identity path that teaches the
+    Why a flag and not a straight fix: when this shipped, the rows it caught
+    were real, quality-eligible products — 1,375 Path-C minted canonicals whose
+    seeds attach by ``attached_product_key`` so the gateway's
+    ``external_product_id`` lookup never found them, plus 1 audit-minted
+    ``url_audit`` row. Their PDPs hard-500ed, so serving them was a broken
+    promise, but 1,011 of them had NO renderable sibling row: flipping the gate
+    would have darkened the product entirely and dropped public 3,937 → 2,561
+    (40% → 26% of the serving corpus). The RIGHT fix was always P3 — teach the
     gateway to resolve minted canonicals through ``attached_product_key``
-    (PIVOTA-Agent). This gate is the honest fallback, and which of the two
-    lands first is the founder's call.
+    instead of hiding them — and the gate was the honest fallback if P3 slipped.
+
+    P3 SHIPPED 2026-07-25 (PIVOTA-Agent, the LANE 1 arm of the seed LATERAL in
+    ``resolveCatalogProductRefFromPivotaSignatureInner``). Re-measured after it:
+    this gate would now block ONE row, the url_audit one, for public 3,937 →
+    3,936. The flag stays — the lane it guards is real and a future source
+    system can repopulate it — but it is no longer holding back a fix.
     """
     return (
         (os.getenv("CATALOG_TRUST_RENDERABLE_GATE") or "").strip().lower()
