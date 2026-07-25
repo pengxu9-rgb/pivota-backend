@@ -189,6 +189,10 @@ def _row(sig_suffix: str, **overrides) -> Dict[str, Any]:
         "pivota_signature_id": f"sig_{sig_suffix}",
         "pivota_canonical_url": f"https://agent.pivota.cc/products/sig_{sig_suffix}",
         "content_key": f"ck_{sig_suffix}",
+        # Migration 181: the ONE elected sig for this content_key. Defaults to
+        # SELF, which is the shape of the 4,054 content_keys carrying a single
+        # candidate; override it to model a member of a duplicate group.
+        "canonical_sig_id": f"sig_{sig_suffix}",
         "serving_eligible": True,
         # Row-grain PDP renderability (approved + live_read_enabled identity
         # listing). The feed exposes it; it does not filter on it.
