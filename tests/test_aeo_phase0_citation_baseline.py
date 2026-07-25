@@ -112,15 +112,16 @@ def test_cited_domain_strips_www():
 # ---------------------------------------------------------------------------
 def _row(tier: str, provider: str = "gemini", *, cited: bool = False,
          exact: bool = False, sources: int = 3, domains: List[str] | None = None,
-         error: Any = None) -> Dict[str, Any]:
+         error: Any = None, unattributable: int = 0) -> Dict[str, Any]:
     return {
         "tier": tier,
         "provider": provider,
         "anchor": "a",
         "query": f"q-{tier}-{provider}-{cited}",
         "pivota_cited": cited,
-        "exact_pdp_in_grounding": exact,
+        "probe_url_match_in_grounding": exact,
         "grounding_source_count": sources,
+        "unattributable_source_count": unattributable,
         "cited_domains": domains if domains is not None else ["target.com"],
         "run_error": error,
     }
@@ -265,9 +266,208 @@ def test_render_markdown_lists_failed_requests():
     assert "RemoteDisconnected" in md
 
 
-def test_render_markdown_marks_no_cited_sources():
-    rows = [_row("sku", domains=[])]
-    payload = {"rows": rows, "request_errors": [], "requests_made": 1,
-               "prompts_selected": 1}
-    md = aeo.render_markdown(payload, aeo.aggregate(rows), _meta())
-    assert "(no cited sources)" in md
+# ---------------------------------------------------------------------------
+# run_baseline + the raw_runs -> row mapping.
+#
+# This layer had ZERO coverage in the first cut, and every blocker the review
+# found lived here. `post_probe` is the only thing stubbed; the mapping,
+# error detection, mock-fallback guard and blind-tier logic are all real.
+# ---------------------------------------------------------------------------
+class _Args:
+    def __init__(self, **kw):
+        self.agent_url = "https://probe.invalid"
+        self.providers = ["gemini"]
+        self.tiers = ["sku"]
+        self.batch_size = 1
+        self.timeout = 5
+        self.retries = 1
+        for k, v in kw.items():
+            setattr(self, k, v)
+
+
+def _run_with(monkey_payloads, **argkw):
+    """Drive run_baseline with a canned sequence of probe responses."""
+    calls = []
+    seq = list(monkey_payloads)
+
+    def fake_post(agent_url, key, **kw):
+        calls.append(kw)
+        return seq.pop(0) if seq else {"_error": "exhausted"}
+
+    orig = aeo.post_probe
+    aeo.post_probe = fake_post
+    try:
+        return aeo.run_baseline(_Args(**argkw), "k"), calls
+    finally:
+        aeo.post_probe = orig
+
+
+def _probe_ok(query, *, sources=None, raw="answer text", provider="gemini",
+              in_grounding=False):
+    return {
+        "result": {
+            "provider": provider,
+            "raw_runs": [{
+                "query": query,
+                "raw": raw,
+                "parsed": {},
+                "grounding_sources": sources if sources is not None else [
+                    {"uri": "https://www.ulta.com/p/x", "title": "Ulta"}],
+                "url_match": {"in_grounding": in_grounding},
+            }],
+        }
+    }
+
+
+def test_run_baseline_detects_error_encoded_in_raw():
+    """🚨 B1: the prober signals failure via raw='__error__:...', NOT an
+    'error' key. Grading those as honest 0% citations is the exact dilution
+    the script claims to avoid."""
+    q = aeo.PORTFOLIO[10]["query"]  # a sku-tier prompt
+    payload, _ = _run_with([_probe_ok(q, raw="__error__:LLM_PROBE_TIMEOUT",
+                                     sources=[])], tiers=["sku"], batch_size=1)
+    errored = [r for r in payload["rows"] if r["run_error"]]
+    assert len(errored) == 1, payload["rows"]
+    assert "TIMEOUT" in errored[0]["run_error"]
+    # and it must be EXCLUDED from the graded denominator
+    agg = aeo.aggregate(payload["rows"])
+    assert agg["overall"]["graded"] == 0
+    assert agg["overall"]["errored"] == 1
+    assert agg["overall"]["citation_rate_pct"] is None
+
+
+def test_run_baseline_treats_mock_fallback_as_unmeasured_not_zero():
+    """S6: a missing API key returns HTTP 200 with provider='mock_fallback_
+    no_openai_key' and empty raw_runs. That must never read as a measured 0%."""
+    q = aeo.PORTFOLIO[10]["query"]
+    resp = {"result": {"provider": "mock_fallback_no_openai_key", "raw_runs": []}}
+    payload, _ = _run_with([resp], tiers=["sku"], batch_size=1)
+    # No graded rows, and the fallback is recorded as a gap (the remaining
+    # canned responses are exhausted, which is irrelevant to the assertion).
+    assert payload["rows"] == []
+    first = payload["request_errors"][0]
+    assert first["error"] == "provider_fallback:mock_fallback_no_openai_key"
+    assert first["queries"]  # the lost prompts are named
+
+
+def test_run_baseline_records_empty_raw_runs_as_a_gap():
+    q = aeo.PORTFOLIO[10]["query"]
+    payload, _ = _run_with([{"result": {"provider": "gemini", "raw_runs": []}}],
+                           tiers=["sku"], batch_size=1)
+    assert payload["rows"] == []
+    assert "no_raw_runs" in payload["request_errors"][0]["error"]
+
+
+def test_run_baseline_maps_pivota_citation_from_real_sources():
+    q = aeo.PORTFOLIO[10]["query"]
+    srcs = [{"uri": "https://agent.pivota.cc/products/sig_x", "title": "Pivota"}]
+    payload, _ = _run_with([_probe_ok(q, sources=srcs)], tiers=["sku"])
+    row = payload["rows"][0]
+    assert row["pivota_cited"] is True
+    assert row["grounding_source_count"] == 1
+
+
+def test_run_baseline_counts_unattributable_sources():
+    q = aeo.PORTFOLIO[10]["query"]
+    srcs = [{"uri": "https://vertexaisearch.cloud.google.com/grounding-api-redirect/A",
+             "title": "Olive Young Global"}]  # human-readable, not a domain
+    payload, _ = _run_with([_probe_ok(q, sources=srcs)], tiers=["sku"])
+    row = payload["rows"][0]
+    assert row["cited_domains"] == []
+    assert row["unattributable_source_count"] == 1
+
+
+def test_run_baseline_blinds_open_tier_prompts():
+    """🚨 B3: the scan mode always injects `Product: <title>` into the prompt.
+    For an open category/concern query, sending the branded SKU name tells the
+    model the answer. Blind tiers must send the category descriptor instead."""
+    cat = next(p for p in aeo.PORTFOLIO if p["tier"] == "category")
+    _, calls = _run_with([_probe_ok(cat["query"])], tiers=["category"])
+    assert calls[0]["blind"] is True
+
+    sku = next(p for p in aeo.PORTFOLIO if p["tier"] == "sku")
+    _, calls2 = _run_with([_probe_ok(sku["query"])], tiers=["sku"])
+    assert calls2[0]["blind"] is False
+
+
+def test_blind_tiers_are_exactly_the_open_intent_tiers():
+    assert aeo.BLIND_TIERS == frozenset({"category", "ingredient_concern"})
+    for t in aeo.BLIND_TIERS:
+        assert t in aeo.TIER_ORDER
+
+
+def test_run_baseline_reports_expected_units():
+    """S5: without an expected count, a run that lost half its units renders
+    as a complete baseline."""
+    payload, _ = _run_with([], tiers=["sku"], providers=["gemini", "chatgpt"])
+    assert payload["expected_units"] == 5 * 2  # 5 sku prompts x 2 providers
+    assert payload["expected_by_tier"]["sku"] == 10
+
+
+def test_aggregate_keeps_a_wholly_lost_tier_visible():
+    # The wedge tier vanishing from the report is the worst case.
+    agg = aeo.aggregate([_row("sku")], {"sku": 2, "ingredient_concern": 10})
+    assert "ingredient_concern" in agg["by_tier"]
+    assert agg["by_tier"]["ingredient_concern"]["missing"] == 10
+    assert agg["by_tier"]["ingredient_concern"]["graded"] == 0
+    assert agg["by_tier"]["sku"]["missing"] == 1
+
+
+def test_render_markdown_warns_loudly_on_incomplete_run():
+    rows = [_row("sku")]
+    payload = {"rows": rows, "request_errors": [
+        {"provider": "gemini", "anchor": "a", "queries": ["lost prompt one"],
+         "error": "RemoteDisconnected"}],
+        "requests_made": 2, "prompts_selected": 5, "expected_units": 10,
+        "expected_by_tier": {"sku": 10}}
+    md = aeo.render_markdown(payload, aeo.aggregate(rows, {"sku": 10}), _meta())
+    assert "INCOMPLETE RUN" in md
+    assert "lost prompt one" in md  # the missing prompts must be NAMED
+
+
+# ---------------------------------------------------------------------------
+# _run_errored
+# ---------------------------------------------------------------------------
+def test_run_errored_reads_both_encodings():
+    assert aeo._run_errored({"raw": "__error__:boom"}) == "boom"
+    assert aeo._run_errored({"error": "explicit"}) == "explicit"
+    assert aeo._run_errored({"raw": "a normal answer"}) is None
+    assert aeo._run_errored({}) is None
+    assert aeo._run_errored({"raw": "__error__:"}) == "unknown"
+
+
+# ---------------------------------------------------------------------------
+# redirector handling (S4)
+# ---------------------------------------------------------------------------
+def test_both_vertex_redirector_hosts_are_unattributable():
+    for host in ("vertexaisearch.cloud.google.com",
+                 "vertex-ai-search.cloud.google.com"):
+        src = {"uri": f"https://{host}/grounding-api-redirect/x",
+               "title": "Some Long Page Title With Spaces"}
+        assert aeo._cited_domain(src) is None, host
+
+
+def test_pivota_ref_rejects_third_party_page_about_pivota():
+    """S10: a review OF pivota.cc hosted on trustpilot is not our surface
+    being cited."""
+    src = {"uri": "https://www.trustpilot.com/review/pivota.cc",
+           "title": "pivota.cc Reviews | Read Customer Reviews"}
+    assert aeo._is_pivota_ref(src) is False
+
+
+def test_pivota_ref_rejects_pivotal_substring_in_title():
+    src = {"uri": "https://vertexaisearch.cloud.google.com/grounding-api-redirect/x",
+           "title": "Pivotal role of niacinamide - healthline.com"}
+    assert aeo._is_pivota_ref(src) is False
+
+
+def test_render_markdown_distinguishes_nothing_cited_from_unresolvable():
+    # S11: an empty domain list means two very different things, and the
+    # headline's zero-grounding count only covers one of them.
+    nothing = _row("sku", domains=[], sources=0)
+    unresolvable = _row("brand", domains=[], sources=6)
+    payload = {"rows": [nothing, unresolvable], "request_errors": [],
+               "requests_made": 2, "prompts_selected": 2}
+    md = aeo.render_markdown(payload, aeo.aggregate([nothing, unresolvable]), _meta())
+    assert "(model cited nothing)" in md
+    assert "publisher unresolvable" in md
