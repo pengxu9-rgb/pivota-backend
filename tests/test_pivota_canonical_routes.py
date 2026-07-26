@@ -189,6 +189,10 @@ def _row(sig_suffix: str, **overrides) -> Dict[str, Any]:
         "pivota_signature_id": f"sig_{sig_suffix}",
         "pivota_canonical_url": f"https://agent.pivota.cc/products/sig_{sig_suffix}",
         "content_key": f"ck_{sig_suffix}",
+        # Migration 181: the ONE elected sig for this content_key. Defaults to
+        # SELF, which is the shape of the 4,054 content_keys carrying a single
+        # candidate; override it to model a member of a duplicate group.
+        "canonical_sig_id": f"sig_{sig_suffix}",
         "serving_eligible": True,
         # Row-grain PDP renderability (approved + live_read_enabled identity
         # listing). The feed exposes it; it does not filter on it.
@@ -575,6 +579,34 @@ def test_list_canonical_pdps_rejects_malformed_cursor(env):
         res = client.get(f"/api/canonical/products?cursor={bad}")
         assert res.status_code == 400, bad
         assert "cursor" in res.json()["detail"]
+
+
+def test_list_publishes_the_VALIDATED_election_not_the_raw_column(env):
+    """The feed must never emit an election it has not re-validated.
+
+    A stored election is durable; electability is live. If the elected sig has
+    stopped rendering, the sitemap correctly advertises a live sibling while an
+    unvalidated read would still hand that sibling the dead sig — so we would
+    submit URL B while B's own page canonicalised at a URL that 500s, and the
+    content_key would lose ALL index presence.
+
+    Asserted against the SQL THE ROUTE ISSUES, deliberately. The first version
+    of this test compiled `_elected_canonical_sig_column` on its own and passed
+    with the route reverted to `content_canonical_election.c.canonical_sig_id`,
+    because the helper still existed — it proved the helper worked, not that
+    anything called it.
+    """
+    client = env
+    assert client.get("/api/canonical/products").status_code == 200
+
+    from routes import pivota_canonical_routes as pcr
+
+    sql = "\n".join(pcr.database.compiled_sql)
+    # The guard re-asks the serving question of the ELECTED row, on its own
+    # alias — a raw column reference carries none of this.
+    assert "cp_elected" in sql, "the feed is publishing an UNVALIDATED election"
+    assert "cp_elected.suppression_reason IS NULL" in sql
+    assert "ips_elected.serving_eligible IS true" in sql
 
 
 def test_list_canonical_pdps_uses_index_pipeline_state_join(env):
