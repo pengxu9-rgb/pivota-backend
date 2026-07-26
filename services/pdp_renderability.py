@@ -434,12 +434,16 @@ def pdp_serving_gate_passes(cp=None):
     route than ``shouldFailClosedForMissingPdpServingEligibility``, and the
     distinction matters because getting it wrong hides the gap below. The
     gateway's eligibility query is ``FROM catalog_products cp LEFT JOIN
-    index_pipeline_state ips``, so a cp row with NO ips row still returns a row;
-    ``normalizePdpServingEligibilityRow`` turns it into a truthy object with
-    ``serving_eligible: false, index_row_found: false``; the ``isBlocked`` arm
-    then takes its ``servingEligibility ? serving_eligible !== true`` branch and
-    404s WITHOUT ever consulting the fail-closed helper. The helper only fires
-    when the query returns NOTHING — see the scope gap below.
+    index_pipeline_state ips LEFT JOIN catalog_merchants cm``, so a cp row with
+    NO ips row still returns a row; ``normalizePdpServingEligibilityRow`` turns
+    it into a truthy object with ``serving_eligible: false,
+    index_row_found: false``; the ``isBlocked`` arm then takes its
+    ``servingEligibility ? (serving_eligible !== true &&
+    !servingEligibilityOverrideReason)`` branch and 404s. The fail-closed helper
+    IS still called — unconditionally, just above ``isBlocked`` — but on this
+    path its answer cannot affect the outcome; it is re-read only as the fallback
+    reason string, and only when eligibility came back null. That null case is
+    the scope gap below.
 
     Content_key grain is correct, not an approximation:
     ``index_pipeline_state``'s PRIMARY KEY is ``(content_key)`` (migration 098),
@@ -454,11 +458,19 @@ def pdp_serving_gate_passes(cp=None):
 
     * ``fetchPdpServingEligibilityFromDb`` appends
       ``activeCatalogProductSourceWhere('cp','cm')`` — not-a-test-merchant AND
-      (``merchant_id='external_seed'`` OR (``cm.status IN (active, observed)``
-      AND (no ``merchant_stores`` rows at all OR an active store with a
-      non-empty domain and a matching platform))). A non-``external_seed`` row
-      under an indexable, active merchant that HAS ``merchant_stores`` rows but
-      none active-and-platform-matching makes that query return ZERO rows →
+      (``merchant_id='external_seed'`` OR
+      (``lower(coalesce(cm.status,'active')) IN ('active','observed')`` AND
+      (NO ``merchant_stores`` rows for the merchant at all, OR one with
+      ``status='active'`` and a non-empty ``domain`` whose platform matches))).
+      Two details that make this NARROWER than it first reads, both verified in
+      ``src/services/activeCatalogSourceSql.js``: the ``coalesce(…, 'active')``
+      means a row with NO ``catalog_merchants`` row PASSES rather than fails; and
+      the platform test is ``platformExpr = '' OR ms.platform = platformExpr``,
+      so a product whose own ``catalog_products.platform`` is blank/NULL matches
+      ANY active store with a non-empty domain. The reachable failure is
+      therefore: a non-``external_seed`` row with a NON-EMPTY platform, under a
+      merchant that HAS ``merchant_stores`` rows but none that are active with a
+      non-empty domain and a matching platform → the query returns ZERO rows →
       ``servingEligibility === null`` → the fail-closed helper (true in prod,
       since ``DATABASE_URL`` is set) → 404, while this predicate says renderable.
     * the same function's ``catch`` swallows any error naming

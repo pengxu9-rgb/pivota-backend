@@ -1088,9 +1088,15 @@ def test_the_offer_free_citation_floor_is_inert_while_the_conjunct_stands():
     on an UNCONDITIONAL relaxation. `pdp_serving_gate_passes` prescribes relaxing
     the conjunct *behind the same flag the gateway reads* — and under a
     flag-gated relaxation the flag is off in this test env, the composite still
-    returns False, and this passes silently while the prod flag makes both
-    inertness docstrings false. If you implement it flag-gated, parametrise this
-    test over the flag and assert both states, or the canary is decorative.
+    returns False, and this test passes silently while the prod flag makes both
+    inertness docstrings false. Verified: mutating the predicate to be
+    flag-gated leaves THIS test green.
+
+    That hole is closed by
+    `test_the_serving_conjunct_is_unconditional_and_reads_no_flag`, which pins
+    that the compiled SQL does not vary with any INDEX_ELIGIBLE_* var and DOES
+    fail under that same mutation. The two tests are a pair; do not delete one
+    without the other.
 
     Scoped deliberately to the ELIGIBILITY half of the widening. The widened
     identity and merchant terms are NOT inert (6 renderable sig-less rows in
@@ -1192,3 +1198,47 @@ def test_the_offer_free_citation_floor_is_inert_while_the_conjunct_stands():
             "docstrings on sitemap_widen_enabled() and pdp_serving_gate_passes() "
             "and delete this test."
         )
+
+
+def test_the_serving_conjunct_is_unconditional_and_reads_no_flag(monkeypatch):
+    """The serving gate must not become flag-gated without this failing.
+
+    Companion to the inertness canary above, and it closes the hole that one only
+    narrates. `pdp_serving_gate_passes` prescribes relaxing the conjunct "behind
+    the same flag the gateway reads" — and under a flag-gated relaxation the
+    inertness canary passes silently in a test env where the flag is off, while
+    prod (where INDEX_ELIGIBLE_SITEMAP=1) makes both inertness docstrings false.
+
+    Parametrising that canary over the flag is not implementable today: the
+    predicate reads no flag, so there would be nothing to parametrise against.
+    What IS implementable is pinning the property those docstrings actually rely
+    on — that the compiled SQL does not depend on any env var. This trips the
+    moment the relaxation is made flag-gated, whichever way the var points.
+    """
+    from db.catalog import catalog_products as real_catalog_products
+
+    cp = real_catalog_products.alias("cp")
+
+    def compiled():
+        return " ".join(compile_pg(select(pdp_will_render_expression(cp))).split())
+
+    for var in ("INDEX_ELIGIBLE_SITEMAP", "INDEX_ELIGIBLE_READ", "INDEX_ELIGIBLE_RECALL"):
+        monkeypatch.delenv(var, raising=False)
+    without_flags = compiled()
+
+    for var in ("INDEX_ELIGIBLE_SITEMAP", "INDEX_ELIGIBLE_READ", "INDEX_ELIGIBLE_RECALL"):
+        monkeypatch.setenv(var, "1")
+    with_flags = compiled()
+
+    assert without_flags == with_flags, (
+        "the renderability predicate now depends on an INDEX_ELIGIBLE_* flag. If "
+        "that is deliberate — get_pdp_v2 learned the offer-free floor and the "
+        "serving conjunct was relaxed behind the gateway's flag — then the "
+        "inertness claims on sitemap_widen_enabled() and pdp_serving_gate_passes() "
+        "are now FALSE in whichever environment has the flag on. Update both "
+        "docstrings and rewrite the inertness canary to assert per-flag-state, "
+        "then delete this test."
+    )
+    # The serving conjunct is present in both, i.e. the equality above is not
+    # trivially satisfied by the conjunct having vanished altogether.
+    assert "index_pipeline_state.serving_eligible IS true" in without_flags

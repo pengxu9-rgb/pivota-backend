@@ -259,8 +259,9 @@ def sitemap_candidate_filter(*, widen: bool, cp=None, ips=None, cm=None):
     NOTE this does NOT include renderability. Renderability is emitted as a
     per-row FIELD by the feed (consumers drop on explicit false) rather than
     filtered in SQL, so callers that need the narrower "will actually render"
-    set apply :func:`renderable_expression` themselves — see
-    :func:`sitemap_electable_filter`.
+    set conjoin
+    :func:`~services.pdp_renderability.pdp_will_render_expression` themselves —
+    see :func:`sitemap_electable_filter`, which is the only caller that does.
     """
     cp = catalog_products if cp is None else cp
     ips = index_pipeline_state if ips is None else ips
