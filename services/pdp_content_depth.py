@@ -61,6 +61,30 @@ DIRECTION OF ERROR: fail-OPEN, unlike ``pdp_renderability``. A row this
 predicate cannot evaluate stays in the sitemap. Withholding a good URL costs
 us a citation candidate; admitting a thin one costs a slice of crawl budget.
 With index presence still at zero, the first is the more expensive mistake.
+
+WHY ``catalog_products.description`` AND NOT ``pdp_description_raw``
+--------------------------------------------------------------------
+Review raised this as a likely fail-CLOSED bug: the gateway's
+``resolveProductDescriptionText`` reads ``product_payload->>'pdp_description_raw'``
+FIRST, so a row with seed narrative but an empty ``catalog_products.description``
+would be dropped while serving real prose. Checked against prod, 2026-07-25:
+
+  * rows in the sitemap with ``pdp_description_raw`` but NO
+    ``catalog_products.description`` .................................. **0**
+  * of the 364 rows this predicate drops, those carrying
+    ``pdp_description_raw`` / ``pdp_details_sections`` / ``brand_story`` /
+    a payload ``description`` .................. **0 / 0 / 0 / 0**
+
+``catalog_products.description`` is a strict superset today (2,950 rows vs
+1,317 with ``pdp_description_raw``), and the drop cohort has no payload prose
+of any kind. The concern is real in principle and empty in practice; re-check
+it if seed intake ever starts writing the payload field without the column.
+
+COST, measured on prod (EXPLAIN ANALYZE, one 1,001-row feed page):
+3.8 ms without this column, 66.4 ms with it — 1.7% of the route's 4 s
+per-query budget. The projection is evaluated after the LIMIT (Incremental
+Sort over ``idx_catalog_products_content_changed_at``), so it runs for one
+page's rows, not the whole eligible set.
 """
 
 from __future__ import annotations
@@ -147,10 +171,22 @@ def _has_dossier(cp):
     no Insights section. The three ``analysis`` shapes below are the three the
     gateway unwraps, in its own order of preference.
     """
+    # NULL guard on each arm, not decoration. ``pivota_signature_id`` is
+    # nullable, and Postgres' ``concat()`` treats NULL as the empty string — so
+    # a NULL-sig row would build the literal key ``'product:'`` and match any KB
+    # row that happened to be keyed that way, lending depth to a row that has
+    # none. No such kb_key exists in prod today (verified: 0 rows), so this is
+    # latent rather than live, but the cost of the guard is one predicate.
+    # Note the gateway has the same latent bug — ``firstNonEmptyString`` returns
+    # '' and ``push()`` accepts the resulting ``'product:'`` — so this is a
+    # deliberate divergence from the mirror, in the safe direction.
     kb_keys = [
-        func.concat(_KB_KEY_PREFIX, cp.c.pivota_signature_id),
-        func.concat(_KB_KEY_PREFIX, cp.c.product_key),
-        func.concat(_KB_KEY_PREFIX, cp.c.source_product_id),
+        and_(col.isnot(None), aurora_product_intel_kb.c.kb_key == func.concat(_KB_KEY_PREFIX, col))
+        for col in (
+            cp.c.pivota_signature_id,
+            cp.c.product_key,
+            cp.c.source_product_id,
+        )
     ]
     analysis = aurora_product_intel_kb.c.analysis
     # ``.as_string()`` matters and is not cosmetic. A bare
@@ -168,7 +204,7 @@ def _has_dossier(cp):
     return exists(
         select(1)
         .select_from(aurora_product_intel_kb)
-        .where(and_(aurora_product_intel_kb.c.kb_key.in_(kb_keys), core_present))
+        .where(and_(or_(*kb_keys), core_present))
         .correlate(cp)
     )
 

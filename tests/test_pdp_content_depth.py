@@ -225,6 +225,39 @@ def test_unrelated_kb_key_does_not_resolve(engine):
     assert _sqlalchemy_answer(engine) is False
 
 
+def test_null_signature_does_not_match_a_bare_product_key(engine):
+    """A NULL sig must not build the key ``'product:'`` and match on it.
+
+    ``pivota_signature_id`` is nullable and Postgres' ``concat()`` treats NULL
+    as the empty string, so an unguarded arm turns every NULL-sig row into a
+    lookup for the literal key ``'product:'``. If any KB row is ever keyed that
+    way — none is today — every NULL-sig row in the feed would score as deep.
+    """
+    eng, md = engine
+    cp = md.tables["catalog_products"]
+    kb = md.tables["aurora_product_intel_kb"]
+    with eng.begin() as conn:
+        conn.execute(cp.delete())
+        conn.execute(md.tables["beauty_sku_ingredients"].delete())
+        conn.execute(kb.delete())
+        conn.execute(
+            cp.insert().values(
+                product_key="pk_1",
+                pivota_signature_id=None,
+                source_product_id=None,
+                description=None,
+            )
+        )
+        # The poisoned row: a real dossier filed under the degenerate key.
+        conn.execute(
+            kb.insert().values(
+                kb_key="product:",
+                analysis={"product_intel_v1": {"product_intel_core": {"what_it_is": {"body": "x"}}}},
+            )
+        )
+    assert _sqlalchemy_answer(engine) is False
+
+
 def test_inci_from_another_product_does_not_resolve(engine):
     """INCI is joined on product_key; a sibling row must not leak depth."""
     eng, md = engine
