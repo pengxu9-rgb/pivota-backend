@@ -200,7 +200,7 @@ def _renderable_column():
     returned a hard HTTP 500 (77/77 on serial retry). All 77 had
     ``renderable=true`` from this column, ``serving_eligible=false``, and
     ``blocker_code='no_price'`` — in the sitemap only because
-    ``INDEX_ELIGIBLE_SITEMAP`` widens the eligibility filter to the ADR-008
+    ``INDEX_ELIGIBLE_SITEMAP`` widens the eligibility filter to the ADR-007
     SLICE 1 offer-free citation floor, which ``get_pdp_v2`` was never taught.
     This column now asks BOTH gates via
     :func:`pdp_will_render_expression`, so it stops advertising them.

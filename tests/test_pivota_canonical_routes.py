@@ -618,8 +618,27 @@ def test_list_canonical_pdps_uses_index_pipeline_state_join(env):
     # FakeDb never evaluates the expression — it returns canned rows, so a
     # `renderable` regression is invisible to every other test in this file.
     # Semantics live in tests/test_pdp_renderability.py.
-    renderable_exists = sql.split(") AS renderable")[0].rsplit("CASE WHEN", 1)[-1]
-    assert "index_pipeline_state.serving_eligible IS true" in renderable_exists
+    #
+    # ANCHOR THE SLICE FIRST. An earlier version of this pin split on
+    # `") AS renderable"` without checking it was present: under the route-only
+    # predicate the column ends `… END AS renderable`, so split() returned one
+    # element, `[0]` was the WHOLE statement, and the search then found
+    # `serving_eligible IS true` in the WHERE clause contributed by
+    # eligibility_predicate. It passed with the fix fully reverted. Verified by
+    # mutation both ways this time.
+    # Whitespace-normalise: SQLAlchemy wraps subqueries, so the EXISTS renders
+    # as `FROM index_pipeline_state \nWHERE …` and a raw substring check misses.
+    flat = " ".join(sql.split())
+    assert ") AS renderable" in flat, (
+        "the renderable column no longer ends in a parenthesised expression — "
+        "the composite was reverted to the bare route-only CASE"
+    )
+    renderable_expr = flat.split(") AS renderable")[0]
+    assert (
+        "FROM index_pipeline_state WHERE catalog_products.content_key"
+        in renderable_expr
+    ), "the renderable column dropped the correlated serving-gate EXISTS"
+    assert "index_pipeline_state.serving_eligible IS true" in renderable_expr
     # Suppressed rows are withdrawn from the advertised feed.
     assert "catalog_products.suppressed_at IS NULL" in sql
 

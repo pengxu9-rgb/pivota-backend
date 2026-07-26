@@ -317,15 +317,16 @@ def renderable_expression():
 
     2026-07-26: repointed from ``pdp_renderable_expression`` (the content-route
     half alone) to the composite that ALSO asks ``get_pdp_v2``'s
-    serving-eligibility gate. This is the landmine this module's own docstrings
-    warn about, and it was live: 77 of the 4,528 URLs in the prod sitemap were
-    route-resolvable, NOT serving-eligible (``blocker_code='no_price'``,
-    admitted by ``INDEX_ELIGIBLE_SITEMAP``), and served hard HTTP 500 — while
-    ``pdp_renderable_expression`` called every one of them renderable. 0 of the
-    474 duplicate groups contained such a row when measured, so no election
-    would have crowned one YET; the moment one did, the elected canonical would
-    be a dead URL and every live sibling PDP's ``rel=canonical`` would point at
-    it.
+    serving-eligibility gate, so that this helper cannot drift from
+    :func:`sitemap_electable_filter` and ``_renderable_column``.
+
+    NOTE THAT THIS FUNCTION CURRENTLY HAS NO CALLERS (it had none on ``main``
+    either) — it is kept as the module's named answer to "what does renderable
+    mean here", next to the eligibility helpers. The 77 dead sitemap URLs
+    measured on 2026-07-26 came through ``_renderable_column`` and
+    :func:`sitemap_electable_filter`, NOT through this function; see those two
+    for the incident. Repointed anyway, because a stale definition sitting
+    beside the live ones is exactly how the 52% drift started.
     """
     return pdp_will_render_expression(catalog_products)
 

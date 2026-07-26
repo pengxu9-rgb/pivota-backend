@@ -430,21 +430,58 @@ def pdp_serving_gate_passes(cp=None):
     ``isBlocked`` arm 404s ``PRODUCT_NOT_SERVABLE`` unless
     ``serving_eligible === true``.
 
-    MISSING ROW ⇒ FALSE, and that is the faithful mirror, not a convenience.
-    When the eligibility read comes back empty the gateway consults
-    ``shouldFailClosedForMissingPdpServingEligibility``, which returns true
-    whenever ``DATABASE_URL`` or ``PGHOST`` is set — always, in prod. So a row
-    with no ``index_pipeline_state`` row 404s, and EXISTS gives False for it
-    without a special case.
+    MISSING ROW ⇒ FALSE, and EXISTS gives that for free — but by a DIFFERENT
+    route than ``shouldFailClosedForMissingPdpServingEligibility``, and the
+    distinction matters because getting it wrong hides the gap below. The
+    gateway's eligibility query is ``FROM catalog_products cp LEFT JOIN
+    index_pipeline_state ips``, so a cp row with NO ips row still returns a row;
+    ``normalizePdpServingEligibilityRow`` turns it into a truthy object with
+    ``serving_eligible: false, index_row_found: false``; the ``isBlocked`` arm
+    then takes its ``servingEligibility ? serving_eligible !== true`` branch and
+    404s WITHOUT ever consulting the fail-closed helper. The helper only fires
+    when the query returns NOTHING — see the scope gap below.
 
-    Content_key grain is correct, not an approximation. ``serving_eligible``
-    lives on ``index_pipeline_state``, which is keyed by ``content_key``, so
-    every ``catalog_products`` row sharing a content_key gets the same answer —
-    which is also why the gateway's ``LIMIT 1`` over an OR of
-    (content_key | sig | merchant+product) cannot pick a row that disagrees.
+    Content_key grain is correct, not an approximation:
+    ``index_pipeline_state``'s PRIMARY KEY is ``(content_key)`` (migration 098),
+    and ``serving_eligible`` is ``NOT NULL DEFAULT FALSE`` there, so ``IS TRUE``
+    is exactly the gateway's ``=== true`` and at most one row can answer. EXISTS
+    and the gateway's ``LIMIT 1`` therefore coincide *for a given content_key*.
+
+    SCOPE GAP — THIS MIRRORS THE ips COLUMN, NOT THE WHOLE GATE. Two ways the
+    gateway can 404 that this predicate does not model, both PRE-EXISTING (the
+    route half never modelled them either) and both in the OVER-ADVERTISE
+    direction, so they are stated rather than silently inherited:
+
+    * ``fetchPdpServingEligibilityFromDb`` appends
+      ``activeCatalogProductSourceWhere('cp','cm')`` — not-a-test-merchant AND
+      (``merchant_id='external_seed'`` OR (``cm.status IN (active, observed)``
+      AND (no ``merchant_stores`` rows at all OR an active store with a
+      non-empty domain and a matching platform))). A non-``external_seed`` row
+      under an indexable, active merchant that HAS ``merchant_stores`` rows but
+      none active-and-platform-matching makes that query return ZERO rows →
+      ``servingEligibility === null`` → the fail-closed helper (true in prod,
+      since ``DATABASE_URL`` is set) → 404, while this predicate says renderable.
+    * the same function's ``catch`` swallows any error naming
+      ``catalog_products`` / ``index_pipeline_state`` / ``external_product_seeds``
+      and returns null, which is also fail-closed.
+
+    Unmeasured on the current corpus — sizing it needs the merchant_stores join
+    and is follow-up work, not a blocker for a change that strictly shrinks the
+    over-advertised set. The honest summary of this predicate is "the ips column
+    agrees", not "the URL will answer 200".
+
+    A related soft spot in the grain claim: the gateway passes
+    ``canonicalProductRef.content_key`` — the RESOLVED identity. When the
+    sig-exact resolve misses (it, too, is gated by
+    ``activeCatalogProductSourceWhere``) the code falls through to
+    ``resolveCanonicalCatalogEntityGroup`` and can carry a GROUP-level
+    content_key belonging to another row; the existence of
+    ``reconcileToOwnServingRow`` is evidence that drift is real. So the
+    coincidence above holds for a request whose resolved content_key is the
+    row's own, which is the normal case, not universally.
 
     WHY THIS IS THE RIGHT GATE TO MIRROR AND NOT THE RIGHT GATE TO WIDEN.
-    ADR-008 SLICE 1 introduced ``index_eligible`` — the full
+    ADR-007 SLICE 1 introduced ``index_eligible`` — the full
     ``serving_eligible`` predicate set MINUS ``has_price`` — as an OFFER-FREE
     citation floor, and widened three surfaces behind three flags:
     ``INDEX_ELIGIBLE_SITEMAP`` (this feed), ``INDEX_ELIGIBLE_READ`` (the
@@ -475,11 +512,15 @@ def pdp_serving_gate_passes(cp=None):
     the change here is to OR ``index_eligible`` into the EXISTS behind the same
     flag the gateway reads, and nothing else in this module moves.
 
-    SIDE EFFECT WORTH KNOWING ABOUT: this conjunct makes ADR-007's
-    ``INDEX_ELIGIBLE_SITEMAP`` widening add ZERO sitemap URLs and ZERO election
-    candidates while it stands, even though the flag is ON in prod. That is
-    intended, but it means the env var no longer describes the behaviour.
-    Measured numbers and the (two, separate) mechanisms are documented on
+    SIDE EFFECT WORTH KNOWING ABOUT: this conjunct makes the ELIGIBILITY half of
+    ADR-007's ``INDEX_ELIGIBLE_SITEMAP`` widening structurally inert — the rows
+    that half admits are exactly ``index_eligible ∧ ¬serving_eligible``, and all
+    of them now fail here. It does NOT by itself make the whole flag a no-op: the
+    widening also relaxes an identity term and a merchant join, and those still
+    admit 6 renderable rows in prod which are dropped downstream by unrelated
+    sig guards. Net effect at both consumers today is +0 URLs and +0 election
+    candidates, but only the first clause is this conjunct's doing. Measured
+    numbers and both mechanisms are on
     ``services.canonical_sitemap_candidates.sitemap_widen_enabled`` — read that
     before concluding the citation floor is live on the sitemap, and before
     "cleaning up" either the flag or this conjunct.

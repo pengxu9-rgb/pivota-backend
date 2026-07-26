@@ -1084,6 +1084,14 @@ def test_the_offer_free_citation_floor_is_inert_while_the_conjunct_stands():
     inertness, and a claim nothing asserts is a claim that rots. When it fails,
     re-read both docstrings and delete/rewrite them together with this test.
 
+    LIMIT OF THE CANARY, stated because it is easy to over-trust: it only trips
+    on an UNCONDITIONAL relaxation. `pdp_serving_gate_passes` prescribes relaxing
+    the conjunct *behind the same flag the gateway reads* — and under a
+    flag-gated relaxation the flag is off in this test env, the composite still
+    returns False, and this passes silently while the prod flag makes both
+    inertness docstrings false. If you implement it flag-gated, parametrise this
+    test over the flag and assert both states, or the canary is decorative.
+
     Scoped deliberately to the ELIGIBILITY half of the widening. The widened
     identity and merchant terms are NOT inert (6 renderable sig-less rows in
     prod, neutralised by independent sig guards in agent-ui and
