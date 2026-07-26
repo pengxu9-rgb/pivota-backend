@@ -24,7 +24,19 @@ from __future__ import annotations
 
 import os
 
-from sqlalchemy import Boolean, DateTime, Float, String, Text, and_, column, or_, table
+from sqlalchemy import (
+    Boolean,
+    DateTime,
+    Float,
+    String,
+    Text,
+    and_,
+    column,
+    literal_column,
+    or_,
+    select,
+    table,
+)
 
 from db.catalog import catalog_merchants, catalog_products
 from services.pdp_renderability import pdp_renderable_expression
@@ -49,7 +61,7 @@ def flag_on(name: str) -> bool:
     return (os.getenv(name) or "").strip().lower() in {"1", "true", "yes", "on"}
 
 
-def eligibility_predicate(*, widen_with_index_eligible: bool):
+def eligibility_predicate(*, widen_with_index_eligible: bool, ips=None):
     """SQLAlchemy boolean for the index-pipeline serving gate.
 
     Default: serving_eligible = TRUE (byte-identical to the pre-ADR-007 gate).
@@ -60,13 +72,18 @@ def eligibility_predicate(*, widen_with_index_eligible: bool):
     The by-signature PDP READ is widened by INDEX_ELIGIBLE_READ; the public
     /products SITEMAP listing is a separate content/SEO decision gated only by
     INDEX_ELIGIBLE_SITEMAP. The two callers pass their own flag so neither is
-    widened by the other."""
+    widened by the other.
+
+    ``ips`` defaults to the un-aliased table so existing callers emit exactly
+    the SQL they did before; pass an alias when asking the same question about a
+    second row in one statement (see :func:`electable_sig_exists`)."""
+    ips = index_pipeline_state if ips is None else ips
     if widen_with_index_eligible:
         return or_(
-            index_pipeline_state.c.serving_eligible.is_(True),
-            index_pipeline_state.c.index_eligible.is_(True),
+            ips.c.serving_eligible.is_(True),
+            ips.c.index_eligible.is_(True),
         )
-    return index_pipeline_state.c.serving_eligible.is_(True)
+    return ips.c.serving_eligible.is_(True)
 
 
 def sitemap_widen_enabled() -> bool:
@@ -103,7 +120,66 @@ def sitemap_candidate_join(*, widen: bool):
     )
 
 
-def sitemap_candidate_filter(*, widen: bool):
+def electable_sig_exists(sig_expression, *, widen: bool):
+    """EXISTS: is ``sig_expression`` a sig we would advertise RIGHT NOW?
+
+    Answers the question a stored election cannot answer for itself. An
+    election is a durable fact; electability is a live one, and the two drift
+    the moment the elected row loses ``renderable`` (P3 flipped 2,051 rows on
+    that field in a single day, and the reverse direction is just as available).
+
+    WHY THIS EXISTS — the failure it closes is worse than the bug the election
+    fixes. Say ck_x elects sig A, and A later stops rendering:
+
+      * the SITEMAP is structurally safe. Its renderable filter drops A before
+        the dedup ever runs, leaving sibling B the sole candidate, so it
+        advertises B — correct, no guard needed.
+      * the READERS of this table are NOT. They join on content_key alone, so
+        B's PDP would emit <link rel="canonical" href="/products/A"> — at a URL
+        that 500s.
+
+    Net: we submit B in the sitemap and B's own page disavows itself in favour
+    of a dead URL. That content_key loses ALL index presence — strictly worse
+    than the duplicate, and worse than a moved URL.
+
+    So every reader of ``content_canonical_election`` must intersect the stored
+    winner with the live electable set, and this is that intersection. Degrading
+    to NULL is the correct failure: NULL means "no election", every consumer
+    already falls back to self, and both surfaces fall back TOGETHER.
+
+    Aliased so the check can run over a second copy of catalog_products in the
+    same statement. Deliberately reuses the same filter the feed publishes
+    rather than restating it — a fourth hand-kept copy of this predicate is
+    precisely how the two sides would drift apart again.
+    """
+    cp_elected = catalog_products.alias("cp_elected")
+    ips_elected = index_pipeline_state.alias("ips_elected")
+    cm_elected = catalog_merchants.alias("cm_elected")
+
+    join = cp_elected.join(
+        ips_elected, cp_elected.c.content_key == ips_elected.c.content_key
+    )
+    join = (
+        join.outerjoin(cm_elected, cp_elected.c.merchant_id == cm_elected.c.merchant_id)
+        if widen
+        else join.join(
+            cm_elected, cp_elected.c.merchant_id == cm_elected.c.merchant_id
+        )
+    )
+    return (
+        select(literal_column("1"))
+        .select_from(join)
+        .where(
+            cp_elected.c.pivota_signature_id == sig_expression,
+            sitemap_electable_filter(
+                widen=widen, cp=cp_elected, ips=ips_elected, cm=cm_elected
+            ),
+        )
+        .exists()
+    )
+
+
+def sitemap_candidate_filter(*, widen: bool, cp=None, ips=None, cm=None):
     """WHERE clause for "this row is a publishable PDP URL".
 
     content_key is the always-required identity (it keys the served PDP). A
@@ -113,42 +189,50 @@ def sitemap_candidate_filter(*, widen: bool):
     drop the sig requirement wholesale: a serving row without a sig still
     doesn't qualify; only the index_eligible citation rows are added.
 
+    ``cp`` / ``ips`` / ``cm`` default to the un-aliased tables, so the feed and
+    the elector call this with no arguments and emit exactly the SQL they did
+    before aliasing existed. Pass aliases when the surrounding statement needs a
+    SECOND copy of the same question — :func:`electable_sig_exists` does, to ask
+    it about a different row in the same query.
+
     NOTE this does NOT include renderability. Renderability is emitted as a
     per-row FIELD by the feed (consumers drop on explicit false) rather than
     filtered in SQL, so callers that need the narrower "will actually render"
     set apply :func:`renderable_expression` themselves — see
     :func:`sitemap_electable_filter`.
     """
+    cp = catalog_products if cp is None else cp
+    ips = index_pipeline_state if ips is None else ips
+    cm = catalog_merchants if cm is None else cm
+
     sig_present = and_(
-        catalog_products.c.pivota_signature_id.isnot(None),
-        catalog_products.c.pivota_signature_id.like("sig_%"),
+        cp.c.pivota_signature_id.isnot(None),
+        cp.c.pivota_signature_id.like("sig_%"),
     )
     identity_term = (
-        or_(sig_present, index_pipeline_state.c.index_eligible.is_(True))
-        if widen
-        else sig_present
+        or_(sig_present, ips.c.index_eligible.is_(True)) if widen else sig_present
     )
     if widen:
         merchant_gate = or_(
             and_(
-                catalog_merchants.c.indexable.is_(True),
-                catalog_merchants.c.status.in_(["active", "observed"]),
+                cm.c.indexable.is_(True),
+                cm.c.status.in_(["active", "observed"]),
             ),
             and_(
-                catalog_merchants.c.merchant_id.is_(None),
-                index_pipeline_state.c.index_eligible.is_(True),
+                cm.c.merchant_id.is_(None),
+                ips.c.index_eligible.is_(True),
             ),
         )
     else:
         merchant_gate = and_(
-            catalog_merchants.c.indexable.is_(True),
+            cm.c.indexable.is_(True),
             # ADR-009 amendment (A9-2 review): merchant status is an IDENTITY-
             # LIFECYCLE field (observed -> claimed/active), not a serving
             # switch. Gate semantics = "not disabled".
-            catalog_merchants.c.status.in_(["active", "observed"]),
+            cm.c.status.in_(["active", "observed"]),
         )
     return and_(
-        catalog_products.c.content_key.isnot(None),
+        cp.c.content_key.isnot(None),
         # A suppressed row (catalog_products.suppressed_at set, e.g. the
         # demo_retired_2026_07 sweep) is withdrawn from serving and must not be
         # advertised, even while its content_key stays eligible through live
@@ -156,9 +240,9 @@ def sitemap_candidate_filter(*, widen: bool):
         # reason the election has to share this filter rather than approximate
         # it: a suppressed sibling is exactly the kind of row that looks
         # electable from the content_key's point of view and is not.
-        catalog_products.c.suppressed_at.is_(None),
+        cp.c.suppressed_at.is_(None),
         identity_term,
-        eligibility_predicate(widen_with_index_eligible=widen),
+        eligibility_predicate(widen_with_index_eligible=widen, ips=ips),
         merchant_gate,
     )
 
@@ -173,13 +257,52 @@ def renderable_expression():
     return pdp_renderable_expression(catalog_products)
 
 
-def sitemap_electable_filter(*, widen: bool):
-    """Eligibility AND renderability — the exact set the sitemap ADVERTISES.
+def not_tombstoned(cp=None):
+    """This row is not a step-5 dedupe LOSER.
 
-    This is the election's candidate set. The feed emits eligible rows and
-    lets the consumer drop non-renderable ones (so a backend that predates
+    ``suppression_reason`` without ``suppressed_at`` is a real and populated
+    state: step-5 tombstones set the reason (plus
+    ``suppression_metadata.keeper_product_key``) while leaving the row serving,
+    so 431 losers still answer HTTP 200 and 362 of them are live sitemap URLs.
+    Measured 2026-07-25: ZERO of the 3,326 advertised URLs are missing from the
+    feed, which is only possible if these rows pass the ``suppressed_at IS
+    NULL`` gate — they do.
+
+    WHY THE ELECTION MUST EXCLUDE THEM. PIVOTA-Agent#1833 points every
+    tombstoned loser's PDP at its keeper, and the keeper is inside the SAME
+    content_key (its LATERAL joins on ``keeper_cp.content_key =
+    cp.content_key``). So a tombstone and its keeper are two members of one
+    election group, and the two mechanisms canonicalise it in OPPOSITE
+    directions: #1833 sends loser -> keeper, while an incumbency-seeded election
+    would crown the LOSER (362 of them are the indexed URL) and send keeper ->
+    loser. Landing both would point a live keeper at a tombstoned duplicate and
+    silently undo a fix that is already in production.
+
+    Excluding tombstones makes the two agree by construction: the keeper is the
+    only electable member, so the election names it, the sitemap advertises it,
+    #1833 points the loser at it, and the keeper is self-canonical.
+
+    Deliberately scoped to ELECTABILITY, not to feed membership — whether a
+    tombstoned row should still be listed at all is #1833's question, not this
+    one. Here it simply stops being a candidate to HOLD the URL.
+    """
+    cp = catalog_products if cp is None else cp
+    return cp.c.suppression_reason.is_(None)
+
+
+def sitemap_electable_filter(*, widen: bool, cp=None, ips=None, cm=None):
+    """Eligibility AND renderability AND not-a-tombstone — the set that may HOLD
+    the canonical URL.
+
+    This is the election's candidate set. The feed emits eligible rows and lets
+    the consumer drop non-renderable ones (so a backend that predates
     ``renderable`` degrades safely); the elector has no such consumer, so it
     folds the same predicate into SQL here. The two therefore agree on which
     rows are advertisable, which is the property the whole design rests on.
     """
-    return and_(sitemap_candidate_filter(widen=widen), renderable_expression())
+    cp = catalog_products if cp is None else cp
+    return and_(
+        sitemap_candidate_filter(widen=widen, cp=cp, ips=ips, cm=cm),
+        pdp_renderable_expression(cp),
+        not_tombstoned(cp),
+    )

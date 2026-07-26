@@ -45,7 +45,7 @@ from datetime import datetime
 from typing import Any, Awaitable, Dict, Optional, TypeVar
 
 from fastapi import APIRouter, HTTPException, Query, status
-from sqlalchemy import String, and_, column, func, or_, select, table
+from sqlalchemy import String, and_, case, column, func, null, or_, select, table
 
 from db.catalog import catalog_merchants, catalog_products
 from db.database import database
@@ -57,6 +57,7 @@ from services.claim_safety import substantiated_claims
 # that module's header for why that failure is worse than the duplicate it
 # fixes.
 from services.canonical_sitemap_candidates import (
+    electable_sig_exists,
     eligibility_predicate as _eligibility_predicate,
     flag_on as _flag_on,
     index_pipeline_state,
@@ -189,6 +190,42 @@ def _renderable_column():
     worthless to a crawler; only the 500 is loud.
     """
     return pdp_renderable_expression(catalog_products).label("renderable")
+
+
+def _elected_canonical_sig_column(widen: bool):
+    """The elected canonical sig — but ONLY while it is still advertisable.
+
+    A stored election is a durable fact; electability is a live one. When the
+    elected sig stops rendering (P3 moved 2,051 rows on that field in a day, and
+    nothing stops the reverse), an unvalidated read produces the failure this
+    whole feature exists to prevent:
+
+      the sitemap correctly drops the dead sig and advertises its sibling, while
+      the sibling's PDP emits <link rel="canonical"> pointing AT the dead sig
+
+    We would then submit a URL that disavows itself in favour of a page that
+    500s, and the content_key loses all index presence — worse than the
+    duplicate, and worse than a moved URL. The sitemap is structurally immune
+    (its renderable filter runs before the dedup, so a dead sig is never a
+    candidate); every reader of this table has to earn the same immunity here.
+
+    Degrading to NULL is exactly right: NULL means "no election", which every
+    consumer already handles by falling back to self — so both surfaces fall
+    back TOGETHER, which is the invariant.
+    """
+    return (
+        case(
+            (
+                electable_sig_exists(
+                    content_canonical_election.c.canonical_sig_id, widen=widen
+                ),
+                content_canonical_election.c.canonical_sig_id,
+            ),
+            else_=null(),
+        )
+        .cast(String)
+        .label("canonical_sig_id")
+    )
 
 
 def _shape_product_for_pdp(row: Dict[str, Any]) -> Dict[str, Any]:
@@ -498,7 +535,7 @@ async def list_canonical_pdp_signatures(
         index_pipeline_state.c.content_quality_score,
         index_pipeline_state.c.quality_scored_at,
         _renderable_column(),
-        content_canonical_election.c.canonical_sig_id,
+        _elected_canonical_sig_column(widen_sitemap),
     ]
     if widen_sitemap:
         select_cols.append(index_pipeline_state.c.index_eligible)

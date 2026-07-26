@@ -1,0 +1,121 @@
+name: Content Canonical Election
+
+# Keeps ONE canonical URL elected per content_key (migration 181).
+#
+# 474 content_keys serve identical content under 2-7 sitemap-eligible sigs. The
+# election decides which one holds the URL; the sitemap advertises it and
+# get_pdp_v2 hands it to every sibling PDP as its <link rel="canonical">.
+#
+# WHY THIS HAS TO BE SCHEDULED, not run by hand. A stored winner is sticky, and
+# the ONLY thing that moves it is the winner ceasing to be a candidate. Until
+# this sweep runs, the readers hold a stale election — they are guarded (both
+# the feed and get_pdp_v2 intersect the stored winner with the live electable
+# set, degrading to "no election" rather than pointing at a dead URL), but a
+# guarded stale election means those content_keys silently lose their
+# cross-canonical and go back to being duplicates. This sweep is what repairs
+# them, so the repair interval IS the duplicate-exposure window.
+#
+# Runs --seed-from-sitemap every time, deliberately. Stored winners still
+# outrank incumbency, so seeding changes nothing for settled content_keys; it
+# only supplies the tiebreak for groups being elected for the FIRST time, and
+# for any group whose winner died. Without it, a re-election ignores which
+# sibling is already indexed and can move a live URL for no reason.
+
+on:
+  workflow_dispatch:
+    inputs:
+      apply:
+        description: "Write the elections (unchecked = dry-run report only)"
+        required: true
+        default: false
+        type: boolean
+      seed_from_sitemap:
+        description: "Sitemap URL/path to import incumbency from (blank = no seed)"
+        required: false
+        default: "https://agent.pivota.cc/sitemap-products.xml"
+        type: string
+  schedule:
+    # Every 6h at :52, trailing the sitemap cron so the incumbency it reads is
+    # the sitemap most recently published rather than the one about to be
+    # replaced. Offset off the hour to avoid the :00 runner crush.
+    - cron: "52 */6 * * *"
+
+jobs:
+  content-canonical-election:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    env:
+      DATABASE_URL: ${{ secrets.DATABASE_URL }}
+      DB_POOL_MIN_SIZE: "1"
+      DB_POOL_MAX_SIZE: "2"
+      PYTHONDONTWRITEBYTECODE: "1"
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: "pip"
+
+      - name: Install deps
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Elect canonicals (dry-run report)
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [[ -z "${DATABASE_URL:-}" ]]; then
+            echo "DATABASE_URL secret is required" >&2
+            exit 1
+          fi
+          out_dir="reports/workflow_ops/content-canonical-election/${{ github.run_id }}"
+          mkdir -p "${out_dir}"
+          seed="${{ github.event_name == 'workflow_dispatch' && inputs.seed_from_sitemap || 'https://agent.pivota.cc/sitemap-products.xml' }}"
+          python scripts/elect_content_canonicals.py \
+            ${seed:+--seed-from-sitemap "${seed}"} \
+            | tee "${out_dir}/dry_run.json"
+
+      - name: Elect canonicals (apply)
+        # Scheduled runs auto-apply — that is the point. Manual runs apply only
+        # when the box is checked.
+        if: ${{ github.event_name == 'schedule' || (github.event_name == 'workflow_dispatch' && inputs.apply) }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          out_dir="reports/workflow_ops/content-canonical-election/${{ github.run_id }}"
+          mkdir -p "${out_dir}"
+          seed="${{ github.event_name == 'workflow_dispatch' && inputs.seed_from_sitemap || 'https://agent.pivota.cc/sitemap-products.xml' }}"
+          python scripts/elect_content_canonicals.py \
+            --apply \
+            ${seed:+--seed-from-sitemap "${seed}"} \
+            | tee "${out_dir}/apply.json"
+
+      - name: Flag moved URLs
+        # Every replacement is a LIVE URL moving. On a healthy corpus this is
+        # zero; a non-zero count means either a winner genuinely died or
+        # something upstream is flapping `renderable`, and both are worth a
+        # human look rather than a silent line in a JSON artifact.
+        if: ${{ github.event_name == 'schedule' || (github.event_name == 'workflow_dispatch' && inputs.apply) }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          report="reports/workflow_ops/content-canonical-election/${{ github.run_id }}/apply.json"
+          moved=$(python -c "import json,sys; print(json.load(open(sys.argv[1]))['replacements'])" "${report}")
+          echo "replacements=${moved}" >> "${GITHUB_STEP_SUMMARY}"
+          if [[ "${moved}" != "0" ]]; then
+            echo "::warning::${moved} elected canonical URL(s) MOVED — each is a live URL changing. See the apply.json artifact."
+            python -c "import json,sys; [print(' ', r) for r in json.load(open(sys.argv[1]))['replaced']]" "${report}" \
+              >> "${GITHUB_STEP_SUMMARY}"
+          fi
+
+      - name: Upload artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: content-canonical-election-${{ github.run_id }}
+          path: reports/workflow_ops/content-canonical-election/${{ github.run_id }}
+          retention-days: 14

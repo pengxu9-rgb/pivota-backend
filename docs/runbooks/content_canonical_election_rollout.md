@@ -98,8 +98,21 @@ Must report `"replacements": 0` and `"new_elections": 0`. A steady-state sweep
 over an unchanged corpus writes nothing; if it does not, something upstream is
 flapping `renderable` and that is the bug to chase, not this.
 
-Schedule this sweep from here on. It elects newly-arrived content_keys and
-re-elects only where the stored winner has stopped being a candidate.
+From here on the sweep runs itself: `.github/workflows/content-canonical-election.yml`,
+every 6h, auto-applying on the schedule and warning in the job summary whenever a
+live URL moves. It elects newly-arrived content_keys and re-elects only where the
+stored winner has stopped being a candidate.
+
+**A stale election is guarded, not harmless.** Both readers — the feed
+(`_elected_canonical_sig_column`) and `get_pdp_v2`'s `cce_valid` lateral —
+intersect the stored winner with the live electable set and degrade to "no
+election" rather than naming a sig that no longer renders. That closes the
+dangerous failure (advertising URL B while B's page canonicalises at a dead A),
+but a guarded stale election still means those content_keys quietly lose their
+cross-canonical and go back to being duplicates. **The sweep interval is
+therefore the duplicate-exposure window** — that is why it is scheduled rather
+than run by hand, and why raising the interval is a real trade rather than a
+tidy-up.
 
 ### 4. Merge PIVOTA-Agent
 

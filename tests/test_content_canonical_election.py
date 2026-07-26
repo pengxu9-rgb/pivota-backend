@@ -16,7 +16,10 @@ this file is the gate.
 
 from __future__ import annotations
 
+import os
+
 import pytest
+from sqlalchemy import literal_column, select
 
 from services.content_canonical_election import (
     REASON_LEXICOGRAPHIC,
@@ -72,16 +75,72 @@ class TestPickWinner:
             REASON_SITEMAP_INCUMBENT,
         )
 
-    def test_two_incumbents_in_one_group_falls_through_rather_than_guessing(self):
-        """A pre-#280 sitemap can advertise both siblings. Don't coin-flip it.
+    def test_two_incumbents_narrow_the_pool_instead_of_falling_through(self):
+        """A pre-#280 sitemap can advertise both siblings — order AMONG them.
 
-        Measured: zero current groups look like this. If one ever does, the
-        deterministic layers give a stable answer instead of an arbitrary one.
+        This test previously asserted the opposite ("fall through rather than
+        guess"), which was wrong twice: falling through ordered the whole pool
+        INCLUDING non-incumbents, so a third, brand-new sig could beat two
+        already-indexed ones; and there was no guess to avoid, since layers 2-3
+        are a total order.
         """
-        assert pick_winner([SIG_A, SIG_F], incumbents={SIG_A, SIG_F}) == (
-            SIG_A,
-            REASON_LEXICOGRAPHIC,
+        third = "sig_" + "0" * 32  # sorts first, so it wins any un-narrowed pass
+        assert pick_winner(
+            [third, SIG_A, SIG_F], incumbents={SIG_A, SIG_F}
+        ) == (SIG_A, REASON_SITEMAP_INCUMBENT)
+
+    def test_parity_with_preferSitemapId_over_the_whole_combination_space(self):
+        """Differential test against the REAL sitemap ordering, in node.
+
+        The seed's job is to import the sitemap's answer. "Import" is only
+        meaningful if the two agree, and hand-reasoning about two orderings in
+        two languages is exactly how they drifted: an earlier version of this
+        picker disagreed on 60 of these 400 cases.
+        """
+        import itertools
+        import json
+        import shutil
+        import subprocess
+
+        node = shutil.which("node")
+        if not node:
+            pytest.skip("node is required for the differential parity test")
+
+        lib = "/Users/pengchydan/dev/pa-ui-canonical/scripts/sitemap_lib.mjs"
+        if not os.path.exists(lib):
+            pytest.skip("pivota-agent-ui worktree not present")
+
+        sigs = ["sig_" + c * 32 for c in "abc"] + ["sig_" + "d" * 24]
+        cases = []
+        for size in (2, 3, 4):
+            for combo in itertools.combinations(sigs, size):
+                for inc_size in range(len(combo) + 1):
+                    for inc in itertools.combinations(combo, inc_size):
+                        cases.append({"cands": list(combo), "inc": list(inc)})
+
+        script = (
+            f"import {{ preferSitemapId }} from {json.dumps(lib)};"
+            "const cases = JSON.parse(process.argv[1]);"
+            # Fold pairwise left-to-right — exactly how mergeDuplicateProduct
+            # reduces a group of 3+ siblings.
+            "console.log(JSON.stringify(cases.map(c =>"
+            "  c.cands.reduce((a,b) => preferSitemapId(a,b,new Set(c.inc),'')))));"
         )
+        js_winners = json.loads(
+            subprocess.run(
+                [node, "--input-type=module", "-e", script, json.dumps(cases)],
+                capture_output=True,
+                text=True,
+                check=True,
+            ).stdout
+        )
+
+        mismatches = [
+            (case, js, pick_winner(case["cands"], incumbents=set(case["inc"]) or None)[0])
+            for case, js in zip(cases, js_winners)
+            if pick_winner(case["cands"], incumbents=set(case["inc"]) or None)[0] != js
+        ]
+        assert not mismatches, f"{len(mismatches)}/{len(cases)} diverge: {mismatches[:3]}"
 
     def test_no_incumbent_in_group_falls_through(self):
         assert pick_winner([SIG_A, SIG_F], incumbents={"sig_unrelated"}) == (
@@ -170,18 +229,120 @@ class TestPlanElections:
         assert all(e.election_reason == REASON_SITEMAP_INCUMBENT for e in planned)
 
 
+def _compile(stmt) -> str:
+    from sqlalchemy.dialects import postgresql
+
+    return str(
+        stmt.compile(
+            dialect=postgresql.dialect(), compile_kwargs={"literal_binds": True}
+        )
+    )
+
+
+class TestElectableSigGuard:
+    """A stored election must never outlive the electability it was based on.
+
+    THE FAILURE THIS CLOSES. ck_x elects sig A; A later stops rendering. The
+    sitemap is structurally safe — its renderable filter runs BEFORE the dedup,
+    so A is not a candidate and sibling B is advertised. But a reader that joins
+    the election on content_key alone still hands B's PDP the string "A", and
+    B's page emits <link rel="canonical" href="/products/A"> at a URL that 500s.
+    We submit B and B disavows itself in favour of a dead page: the content_key
+    loses ALL index presence, which is worse than the duplicate AND worse than a
+    moved URL.
+
+    Not hypothetical — P3 moved 2,051 rows on `renderable` in one day, and
+    nothing prevents the reverse direction.
+    """
+
+    def test_guard_requires_the_elected_sig_to_be_electable(self):
+        from services.canonical_sitemap_candidates import electable_sig_exists
+
+        sql = _compile(
+            select(electable_sig_exists(literal_column("'sig_x'"), widen=False))
+        )
+        # It must re-ask the SAME question of the ELECTED row, on its own alias.
+        assert "cp_elected" in sql
+        assert "cp_elected.pivota_signature_id = 'sig_x'" in sql
+        assert "cp_elected.suppressed_at IS NULL" in sql
+        assert "ips_elected.serving_eligible IS true" in sql
+        assert "cm_elected.indexable IS true" in sql
+        # ...including renderability, which is the field that actually flaps.
+        assert "external_product_seeds" in sql
+
+    def test_guard_does_not_disturb_the_unaliased_callers(self):
+        """Adding the alias parameters must not change the feed's own SQL.
+
+        The aliasing exists only so the same predicate can be asked about a
+        second row in one statement. If it leaked into the default call, the
+        feed's eligibility would silently change — the exact drift the shared
+        module was created to prevent.
+        """
+        from services.canonical_sitemap_candidates import (
+            sitemap_candidate_filter,
+            catalog_products,
+        )
+
+        for widen in (False, True):
+            explicit = _compile(
+                select(literal_column("1")).where(
+                    sitemap_candidate_filter(
+                        widen=widen,
+                        cp=catalog_products,
+                        ips=None,
+                        cm=None,
+                    )
+                )
+            )
+            default = _compile(
+                select(literal_column("1")).where(
+                    sitemap_candidate_filter(widen=widen)
+                )
+            )
+            assert explicit == default
+
+
 class TestCandidateSetMatchesTheFeed:
     """The elector must not be able to crown a sig the feed will never emit."""
 
-    def _sql(self, **env) -> str:
-        from sqlalchemy.dialects import postgresql
+    def test_elector_and_feed_compile_the_same_eligibility(self):
+        """THE parity assertion — compare the two sides, don't grep one side.
 
-        return str(
-            candidates_query(**env).compile(
-                dialect=postgresql.dialect(),
-                compile_kwargs={"literal_binds": True},
-            )
+        The previous tests here asserted substrings of the ELECTOR's own SQL and
+        never compared it to the FEED's, so the class name overstated what it
+        checked: it would have passed with the strict merchant gate flipped
+        INNER->LEFT, with `suppressed_at IS NULL` dropped, or with the
+        `like('sig_%')` gone. This compiles both and asserts equality.
+        """
+        from services.canonical_sitemap_candidates import (
+            sitemap_candidate_filter,
+            sitemap_candidate_join,
         )
+
+        for widen in (False, True):
+            feed_side = _compile(
+                select(literal_column("1"))
+                .select_from(sitemap_candidate_join(widen=widen))
+                .where(sitemap_candidate_filter(widen=widen))
+            )
+            elector_side = _compile(candidates_query(widen=widen))
+            # The elector selects different columns and adds its own ordering +
+            # the sig-not-null narrowing, so compare the shared WHERE core.
+            for clause in (
+                "suppressed_at IS NULL",
+                "pivota_signature_id LIKE 'sig_%%'",
+                "serving_eligible IS true",
+                "catalog_merchants.status IN ('active', 'observed')",
+            ):
+                assert (clause in feed_side) == (clause in elector_side), (
+                    f"{clause!r} present on only one side (widen={widen})"
+                )
+            assert ("LEFT OUTER JOIN catalog_merchants" in feed_side) == (
+                "LEFT OUTER JOIN catalog_merchants" in elector_side
+            )
+
+    def _sql(self, **env) -> str:
+        return _compile(candidates_query(**env))
 
     def test_selects_through_the_same_gates_the_feed_uses(self):
         sql = self._sql(widen=False)

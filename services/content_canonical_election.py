@@ -140,20 +140,40 @@ def pick_winner(
     if len(pool) == 1:
         return pool[0], REASON_SOLE_CANDIDATE
 
+    narrowed_by_incumbency = False
     if incumbents:
         present = [sig for sig in pool if sig in set(incumbents)]
-        # Exactly one is the measured shape of every current duplicate group.
-        # Two would mean the live sitemap is itself advertising a duplicate —
-        # possible only against a sitemap generated before #280 — so fall
-        # through to the deterministic layers rather than guess.
-        if len(present) == 1:
-            return present[0], REASON_SITEMAP_INCUMBENT
+        # NARROW the pool to the incumbents rather than requiring exactly one.
+        #
+        # Exactly one is the measured shape of every current duplicate group,
+        # but two is reachable against a sitemap generated before #280 — and the
+        # earlier "fall through rather than guess" reading was wrong twice over.
+        # Falling through ordered the WHOLE pool including non-incumbents, so it
+        # could crown a brand-new sig over two already-indexed ones; and there
+        # was never a guess to avoid, because layers 2-3 are a total order and
+        # decide among incumbents perfectly well.
+        #
+        # Narrowing also restores parity with preferSitemapId, which applies
+        # incumbency PAIRWISE and therefore keeps ordering among the incumbents.
+        # A differential run over 400 candidate/incumbent combinations found 60
+        # mismatches, ALL in this >=2-incumbent class — e.g. candidates
+        # {A,B,C} with incumbents {B,C}: the sitemap picks B, the old code here
+        # picked A. Seed-time only (post-seed the stored value dominates both
+        # sides), so it was index-equity loss rather than an invariant break —
+        # but equity loss for no reason.
+        if present:
+            pool = present
+            narrowed_by_incumbency = True
 
     widest = max(_sig_hex_len(sig) for sig in pool)
     top = [sig for sig in pool if _sig_hex_len(sig) == widest]
-    if len(top) == 1:
-        return top[0], REASON_SIG_CLASS
-    return min(top), REASON_LEXICOGRAPHIC
+    winner = top[0] if len(top) == 1 else min(top)
+    if narrowed_by_incumbency:
+        # The incumbency layer is what confined the choice, even when a lower
+        # layer broke the final tie — report the layer that actually decided
+        # the outcome, or the audit column lies about why this URL was kept.
+        return winner, REASON_SITEMAP_INCUMBENT
+    return winner, REASON_SIG_CLASS if len(top) == 1 else REASON_LEXICOGRAPHIC
 
 
 def plan_elections(
