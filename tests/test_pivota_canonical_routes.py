@@ -638,6 +638,37 @@ def test_list_canonical_pdps_uses_index_pipeline_state_join(env):
     assert "pdp_identity_listing" not in sql
     assert "live_read_enabled" not in sql
     assert "external_product_seeds" in sql
+    # …and, since 2026-07-26, the OTHER gate get_pdp_v2 refuses at. The
+    # `renderable` column asked only the content-route question, so the 100
+    # widen-only rows (index_eligible, serving_eligible=false, no_price) were
+    # advertised as renderable and served hard 500s — 77 of them in the live
+    # sitemap. The column is now the composite, which means the list query
+    # carries a CORRELATED EXISTS over index_pipeline_state IN ADDITION to the
+    # join used for the eligibility filter. Pinned here because this suite's
+    # FakeDb never evaluates the expression — it returns canned rows, so a
+    # `renderable` regression is invisible to every other test in this file.
+    # Semantics live in tests/test_pdp_renderability.py.
+    #
+    # ANCHOR THE SLICE FIRST. An earlier version of this pin split on
+    # `") AS renderable"` without checking it was present: under the route-only
+    # predicate the column ends `… END AS renderable`, so split() returned one
+    # element, `[0]` was the WHOLE statement, and the search then found
+    # `serving_eligible IS true` in the WHERE clause contributed by
+    # eligibility_predicate. It passed with the fix fully reverted. Verified by
+    # mutation both ways this time.
+    # Whitespace-normalise: SQLAlchemy wraps subqueries, so the EXISTS renders
+    # as `FROM index_pipeline_state \nWHERE …` and a raw substring check misses.
+    flat = " ".join(sql.split())
+    assert ") AS renderable" in flat, (
+        "the renderable column no longer ends in a parenthesised expression — "
+        "the composite was reverted to the bare route-only CASE"
+    )
+    renderable_expr = flat.split(") AS renderable")[0]
+    assert (
+        "FROM index_pipeline_state WHERE catalog_products.content_key"
+        in renderable_expr
+    ), "the renderable column dropped the correlated serving-gate EXISTS"
+    assert "index_pipeline_state.serving_eligible IS true" in renderable_expr
     # Suppressed rows are withdrawn from the advertised feed.
     assert "catalog_products.suppressed_at IS NULL" in sql
 

@@ -409,6 +409,38 @@ class TestTheFixesAreActuallyWIRED:
     # reverted to the raw column, because the helper still existed. Testing the
     # helper proves the helper works, not that anything calls it.
 
+    def test_election_candidates_must_pass_the_serving_gate_too(self):
+        """The candidate set asks BOTH gates get_pdp_v2 refuses at.
+
+        Renderability was the content-route half only until 2026-07-26, and the
+        gap was live: 77 of the 4,528 URLs in the prod sitemap were
+        route-resolvable, NOT serving-eligible (blocker_code='no_price',
+        admitted by INDEX_ELIGIBLE_SITEMAP), and served hard HTTP 500 while the
+        feed called every one of them renderable. 0 of the 474 duplicate groups
+        contained such a row when measured, so nothing was crowned yet — but a
+        candidate set that admits a 500 is exactly the failure this module's
+        docstring calls "strictly worse than the duplicate we set out to fix".
+
+        Asserted on the CORRELATED EXISTS, not on the bare column name: the
+        eligibility filter already joins index_pipeline_state and mentions
+        serving_eligible, so a substring check over the whole statement would
+        still pass with renderability reverted to the route-only predicate. The
+        eligibility JOIN renders as ``JOIN index_pipeline_state ON``, so
+        ``FROM index_pipeline_state WHERE`` names the subquery and only the
+        subquery.
+        """
+        for widen in (False, True):
+            sql = " ".join(_compile(candidates_query(widen=widen)).split())
+            subquery = "FROM index_pipeline_state WHERE"
+            assert subquery in sql, (
+                f"the electable filter dropped the serving gate (widen={widen})"
+            )
+            gate = sql.split(subquery, 1)[1]
+            assert gate.startswith(
+                " catalog_products.content_key = index_pipeline_state.content_key "
+                "AND index_pipeline_state.serving_eligible IS true"
+            ), f"the serving gate is not the gate get_pdp_v2 applies (widen={widen})"
+
     def test_election_candidates_exclude_tombstoned_rows(self):
         """The BLOCKER fix: never crown a step-5 dedupe loser.
 

@@ -69,7 +69,7 @@ from services.canonical_sitemap_candidates import (
 from services.pdp_renderability import (
     EXTERNAL_SEED_MERCHANT_ID as _EXTERNAL_SEED_MERCHANT_ID,
     external_product_seeds,
-    pdp_renderable_expression,
+    pdp_will_render_expression,
 )
 from utils.logger import logger
 
@@ -189,8 +189,42 @@ def _renderable_column():
     either a hard HTTP 500 or a generic noindex shell carrying no product
     JSON-LD (6/6 sampled non-renderable feed rows were the latter). Both are
     worthless to a crawler; only the 500 is loud.
+
+    2026-07-26 — THE THIRD CORRECTION, and the first one in the RESTRICTING
+    direction. The two above both widened the column, and both were about the
+    same half of the question: can the gateway resolve a content ROUTE. They
+    left the OTHER gate unmodelled. ``get_pdp_v2`` checks serving eligibility
+    FIRST and 404s ``PRODUCT_NOT_SERVABLE`` before it ever looks for content, so
+    a row can pass the route question and still never render.
+
+    Measured against the live sitemap on 2026-07-26: 77 of 4,528 advertised URLs
+    returned a hard HTTP 500 (77/77 on serial retry). All 77 had
+    ``renderable=true`` from this column, ``serving_eligible=false``, and
+    ``blocker_code='no_price'`` — in the sitemap only because
+    ``INDEX_ELIGIBLE_SITEMAP`` widens the eligibility filter to the ADR-007
+    SLICE 1 offer-free citation floor, which ``get_pdp_v2`` was never taught.
+    This column now asks BOTH gates via
+    :func:`pdp_will_render_expression`, so it stops advertising them.
+
+    Direction of the change: the 100 widen-only rows in the feed (78 of them
+    previously ``renderable=true``) flip to ``renderable=false``; nothing that
+    is ``serving_eligible`` moves, because for those rows the added conjunct is
+    true by construction.
+
+    Operationally the sitemap goes 4,528 → 4,451 on its next 6h cron, and NO
+    agent-ui guard blocks it: ``sitemapCountGuard`` refuses below 50% of the
+    committed count (and an absolute floor of 1,000), and 1.7% is nowhere near
+    it; ``sitemapCoverageVerdict`` measures ROWS CONSUMED against the feed's
+    ``total``, which does not move at all — all 5,887 rows are still emitted,
+    77 of them now flagged unrenderable. Expect one
+    ``NOTE: 77 previously advertised URL(s) are not in this build`` line in the
+    cron log. That note is the intended outcome, not a warning to chase.
+
+    See :func:`pdp_serving_gate_passes` for why the fix is to stop advertising
+    these rather than to start serving them, and for the order of work that
+    would let them back in.
     """
-    return pdp_renderable_expression(catalog_products).label("renderable")
+    return pdp_will_render_expression(catalog_products).label("renderable")
 
 
 def _content_depth_column():
