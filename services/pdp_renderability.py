@@ -475,6 +475,15 @@ def pdp_serving_gate_passes(cp=None):
     the change here is to OR ``index_eligible`` into the EXISTS behind the same
     flag the gateway reads, and nothing else in this module moves.
 
+    SIDE EFFECT WORTH KNOWING ABOUT: this conjunct makes ADR-007's
+    ``INDEX_ELIGIBLE_SITEMAP`` widening add ZERO sitemap URLs and ZERO election
+    candidates while it stands, even though the flag is ON in prod. That is
+    intended, but it means the env var no longer describes the behaviour.
+    Measured numbers and the (two, separate) mechanisms are documented on
+    ``services.canonical_sitemap_candidates.sitemap_widen_enabled`` — read that
+    before concluding the citation floor is live on the sitemap, and before
+    "cleaning up" either the flag or this conjunct.
+
     DELIBERATELY NOT MODELLED: the gateway's one serving-gate override,
     ``shouldAllowPublishedPdpMissingQualitySnapshot``, which admits a row whose
     blocker is ``low_quality`` with detail "no quality snapshot found" and

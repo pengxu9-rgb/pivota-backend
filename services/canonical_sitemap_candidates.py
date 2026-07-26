@@ -92,6 +92,67 @@ def sitemap_widen_enabled() -> bool:
     ADR-007 SLICE 1: the public /products SITEMAP listing is a content/SEO
     decision distinct from the citation read surface. It is widened ONLY by
     INDEX_ELIGIBLE_SITEMAP — never by INDEX_ELIGIBLE_READ. Both default OFF.
+
+    ⚠️ THE FLAG IS ON IN PROD AND, SINCE 2026-07-26, CHANGES NOTHING AT EITHER
+    CONSUMER. Read that as a safety property, not as permission to ignore it —
+    and do not read `INDEX_ELIGIBLE_SITEMAP=1` on Railway `web` as evidence that
+    the offer-free citation floor is live on the sitemap. It is not, and it
+    cannot be until ``get_pdp_v2`` learns the floor.
+
+    MEASURED 2026-07-26 against prod, with widen ON vs OFF:
+
+      =========================================  =======  =======
+      surface                                    widen=F  widen=T
+      =========================================  =======  =======
+      feed rows emitted                            5,781    5,887
+      …of them renderable (the composite)          5,002    5,008
+      ``candidates_query`` rows (the election)      4,380    4,380
+      sitemap URLs advertised                          —   +0
+      =========================================  =======  =======
+
+    THE MECHANISM IS TWO SEPARATE THINGS, and conflating them will mislead the
+    next reader (an earlier review of #1589 did exactly that by concluding the
+    widening was a flat no-op at the predicate level — it is not):
+
+    1. **The citation floor proper is inert, and that is this PR's doing.** The
+       rows widening adds via :func:`eligibility_predicate` are exactly
+       ``index_eligible ∧ ¬serving_eligible`` — 100 rows in prod. Every one now
+       fails :func:`~services.pdp_renderability.pdp_will_render_expression`,
+       whose new conjunct requires ``serving_eligible IS TRUE``. So the offer-
+       free cohort can no longer reach the sitemap or the election. **This is
+       the part that becomes live again the moment that conjunct is relaxed** —
+       see ``pdp_serving_gate_passes`` for why relaxing it is blocked on the
+       Mintree/RED DANE INR-and-ZAR-priced-as-USD defect, and for the required
+       order of work.
+    2. **The residual widening is NOT inert and has nothing to do with this
+       PR.** Widening also relaxes the IDENTITY term (a row with no minted sig
+       is admitted on ``index_eligible``) and the MERCHANT join (INNER →
+       LEFT OUTER, for store-less brand rows). Measured: that still admits
+       **6 rows that ARE renderable** — all ``serving_eligible=true``,
+       ``blocker_code='none'``, under a live indexable merchant, and all with
+       ``pivota_signature_id IS NULL``. They add nothing only because TWO
+       INDEPENDENT sig guards drop them downstream: ``sitemap_lib.mjs``'s
+       ``if (!/^sig_.+/.test(sig)) return null`` (agent-ui), and
+       ``candidates_query``'s own sig-not-null + ``LIKE 'sig_%'`` conditions
+       (hence 4,380 == 4,380 above, with 0 null sigs on either side). Mint sigs
+       for those 6 and the flag starts adding URLs again, with or without the
+       serving conjunct. The store-less-merchant arm is empty today (all 6 carry
+       a ``catalog_merchants`` row).
+
+    WHY THE FLAG IS NOT SIMPLY TURNED OFF instead: OFF also narrows the merchant
+    JOIN back to INNER and re-tightens the identity term, which drops the 106
+    widen-admitted rows out of the FEED entirely rather than emitting them with
+    ``renderable=false``. The feed is a diagnostic surface as well as a sitemap
+    source, and losing the rows loses the evidence. Documented-and-on beats
+    silently-off.
+
+    PROVENANCE, stated because it surprised two independent reviewers: ADR-007
+    Slice 1 item 2 describes this flag only as a HOLD-BACK ("Public **sitemap**
+    held behind its own ``INDEX_ELIGIBLE_SITEMAP`` flag") so that the read
+    decision could not flip the sitemap by accident. Nothing in ``docs/``
+    records a decision to ENABLE it; whoever set it to 1 in prod did so without
+    an ADR entry. Turning it off is therefore a smaller change than it looks —
+    but it is still a founder call, not a cleanup.
     """
     return flag_on("INDEX_ELIGIBLE_SITEMAP")
 

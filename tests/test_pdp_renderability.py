@@ -29,7 +29,9 @@ from sqlalchemy import (
     String,
     Table,
     create_engine,
+    func,
     literal_column,
+    or_,
     select,
     text,
 )
@@ -94,6 +96,10 @@ def engine():
         md,
         Column("content_key", String, primary_key=True),
         Column("serving_eligible", Boolean),
+        # Not read by any predicate in this module. Present so the
+        # citation-floor inertness test can build the ADR-007 widened
+        # eligibility term over the same engine.
+        Column("index_eligible", Boolean),
     )
     md.create_all(eng)
     return eng, md
@@ -1060,3 +1066,121 @@ def test_public_not_renderable_invariant_stays_on_the_route_only_predicate():
     from services.catalog_invariant_checks import _PUBLIC_NOT_RENDERABLE_COUNT_SQL
 
     assert "index_pipeline_state" not in _PUBLIC_NOT_RENDERABLE_COUNT_SQL
+
+
+def test_the_offer_free_citation_floor_is_inert_while_the_conjunct_stands():
+    """ADR-007's sitemap widening cannot admit a renderable row today.
+
+    `INDEX_ELIGIBLE_SITEMAP` is ON in prod, so a reader can reasonably believe
+    the offer-free citation floor is live on the sitemap. It is not: the rows the
+    widened eligibility term adds are exactly `index_eligible ∧ ¬serving_eligible`,
+    and every one of them fails the serving conjunct in
+    `pdp_will_render_expression`. Measured on prod 2026-07-26: 100 such rows,
+    78 of which the OLD predicate called renderable, 0 under the new one.
+
+    THIS TEST IS DESIGNED TO FAIL when `get_pdp_v2` learns the floor and the
+    conjunct is relaxed. That is the point — the docs on
+    `sitemap_widen_enabled()` and `pdp_serving_gate_passes()` claim this
+    inertness, and a claim nothing asserts is a claim that rots. When it fails,
+    re-read both docstrings and delete/rewrite them together with this test.
+
+    Scoped deliberately to the ELIGIBILITY half of the widening. The widened
+    identity and merchant terms are NOT inert (6 renderable sig-less rows in
+    prod, neutralised by independent sig guards in agent-ui and
+    `candidates_query`) — that is separate from this conjunct and is documented,
+    not pinned here.
+    """
+    from db.catalog import catalog_products as real_catalog_products
+
+    eng = create_engine("sqlite://")
+    md = MetaData()
+    Table(
+        "catalog_products",
+        md,
+        Column("product_key", String, primary_key=True),
+        Column("merchant_id", String),
+        Column("platform", String),
+        Column("source_system", String),
+        Column("source_product_id", String),
+        Column("content_key", String),
+    )
+    Table(
+        "external_product_seeds",
+        md,
+        Column("external_product_id", String),
+        Column("attached_product_key", String),
+        Column("status", String),
+    )
+    Table(
+        "index_pipeline_state",
+        md,
+        Column("content_key", String, primary_key=True),
+        Column("serving_eligible", Boolean),
+        Column("index_eligible", Boolean),
+    )
+    md.create_all(eng)
+
+    cp, eps, ips = (
+        md.tables["catalog_products"],
+        md.tables["external_product_seeds"],
+        md.tables["index_pipeline_state"],
+    )
+    with eng.begin() as conn:
+        # A route-resolvable row that the citation floor — and ONLY the citation
+        # floor — admits: index_eligible, not serving_eligible. The prod cohort.
+        conn.execute(
+            cp.insert().values(
+                product_key="pk_floor",
+                merchant_id="external_seed",
+                platform="external_seed",
+                source_system="external_product_seeds_mirror_v1",
+                source_product_id="ext_floor",
+                content_key="ck_floor",
+            )
+        )
+        conn.execute(
+            eps.insert().values(
+                external_product_id="ext_floor",
+                attached_product_key=None,
+                status="active",
+            )
+        )
+        conn.execute(
+            ips.insert().values(
+                content_key="ck_floor", serving_eligible=False, index_eligible=True
+            )
+        )
+
+        # The widened eligibility term admits it (that is what the flag does)…
+        widened_eligibility = select(func.count()).select_from(ips).where(
+            or_(
+                ips.c.serving_eligible.is_(True),
+                ips.c.index_eligible.is_(True),
+            )
+        )
+        assert conn.execute(widened_eligibility).scalar() == 1, (
+            "the widened eligibility term no longer admits the offer-free "
+            "cohort — this test's premise is gone"
+        )
+
+        # …the content-route half still says yes…
+        assert bool(
+            conn.execute(
+                select(pdp_renderable_expression(real_catalog_products))
+                .select_from(real_catalog_products)
+            ).scalar()
+        ) is True
+
+        # …and the composite says no, which is what makes the flag inert.
+        assert bool(
+            conn.execute(
+                select(pdp_will_render_expression(real_catalog_products))
+                .select_from(real_catalog_products)
+            ).scalar()
+        ) is False, (
+            "the serving conjunct was relaxed: ADR-007's offer-free citation "
+            "floor is now LIVE on the sitemap and the election. Verify the "
+            "Mintree/RED DANE currency defect is fixed first, then update the "
+            "docstrings on sitemap_widen_enabled() and pdp_serving_gate_passes() "
+            "and delete this test."
+        )
