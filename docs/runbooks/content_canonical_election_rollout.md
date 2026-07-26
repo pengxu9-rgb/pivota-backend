@@ -69,24 +69,51 @@ DATABASE_URL=... python scripts/elect_content_canonicals.py \
   --seed-from-sitemap https://agent.pivota.cc/sitemap-products.xml
 ```
 
-Dry run first (that is the default). Expected against the 2026-07-25 corpus:
+Dry run first (that is the default). Expected against the 2026-07-26 corpus:
 
 ```
-"content_keys":     4528
-"duplicate_groups":  474
-"redundant_urls":    551
-"reasons": { "sole_candidate": 4054, "sitemap_incumbent": 474 }
-"replacements":        0
+"content_keys":        4528
+"duplicate_groups":     474
+"redundant_urls":       551
+"moved_from_sitemap":   340      <-- READ THIS ONE
+"replacements":           0      <-- structurally always 0 on a seed; ignore it
+"reasons": { "sole_candidate": ~4368, "sitemap_incumbent": ~131, ... }
 ```
 
-`replacements: 0` is the acceptance criterion — every replacement is a live URL
-moving, and on a seed run there should be none. Re-run with `--apply`.
+## ⚠️ THE SEED MOVES 340 LIVE URLs. That is a decision, not a no-op.
 
-The seed is exact, not approximate: all 474 duplicate groups have **exactly one**
-member in the live sitemap (zero have two, zero have none), so no group is a
-guess. Simulated end-to-end against the live feed + live sitemap before shipping:
-0 live URLs moved, and the same simulation with incumbency disabled moved 183 —
-reproducing #280's measured figure.
+An earlier version of this runbook called `"replacements": 0` the acceptance
+criterion and claimed the seed moved zero URLs. **Both were wrong**, and the
+gate could never have caught it: `replaced` is the PREVIOUSLY STORED winner, so
+on a seed run — the one run where hundreds of URLs move at once — the table is
+empty and `replacements` is structurally zero no matter what happens. The
+`moved_from_sitemap` counter exists because of that; it compares each elected
+winner against the URL the live sitemap advertises today, and it prints
+**before** `--apply`.
+
+Measured by fetching all 1,025 duplicate-group member PDPs live: **340 of 4,528
+sitemap URLs (7.5%) change**, every one of them because the currently-advertised
+sig is a step-5 dedupe TOMBSTONE, so the keeper is elected instead. Zero move for
+any other reason — the incumbency seed holds perfectly across the 127
+tombstone-free duplicate groups. Sitemap size stays 4,528.
+
+**Why this is right, and why it is not optional.** PIVOTA-Agent#1833 is already
+merged and deployed, so *today, in production*, those 340 URLs already serve
+`rel=canonical` pointing at a different URL. The contradiction — we advertise A
+while A disavows itself for B — is the CURRENT state, not something these PRs
+introduce. The only choice is which side to resolve it on:
+
+* **Follow the keeper (what this does).** Equity consolidates onto the row the
+  dedupe pipeline explicitly designated on 2026-07-10 via `keeper_product_key`.
+  The old URLs keep answering 200 with `rel=canonical` at the new one — the
+  standard consolidation pattern, and better than a 301 while the row still
+  serves.
+* **Follow incumbency instead.** Requires reverting #1833 as well, or the live
+  contradiction simply stays. Incumbency is an accident of crawl order;
+  `keeper_product_key` is a deliberate row-level decision — and 6 of these groups
+  are serving up to six self-canonical duplicate 200s of one product.
+
+Re-run with `--apply` once `moved_from_sitemap` matches what you expect.
 
 ### 3. Confirm convergence
 

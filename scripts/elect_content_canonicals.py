@@ -55,6 +55,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from db.database import database  # noqa: E402
 from services.content_canonical_election import (  # noqa: E402
+    KEEPER_SIGS_SQL,
     UPSERT_ELECTION_SQL,
     candidates_query,
     plan_elections,
@@ -134,15 +135,43 @@ async def run_election(
     stored_rows = await database.fetch_all(STORED_ELECTIONS_SQL)
     stored = {r["content_key"]: r["canonical_sig_id"] for r in stored_rows}
 
+    keeper_rows = await database.fetch_all(KEEPER_SIGS_SQL)
+    keepers = {r["content_key"]: r["keeper_sig_id"] for r in keeper_rows}
+
     planned = plan_elections(
         candidates_by_content_key=dict(candidates_by_content_key),
         stored_by_content_key=stored,
         incumbents=incumbents,
+        keeper_by_content_key=keepers,
     )
     replacements = [e for e in planned if e.replaced]
     duplicate_groups = sum(
         1 for sigs in candidates_by_content_key.values() if len(set(sigs)) > 1
     )
+
+    # THE NUMBER THAT ACTUALLY MATTERS, and the one `replacements` cannot give.
+    #
+    # `replaced` is the PREVIOUSLY STORED winner, so on a seed run — the only
+    # run where hundreds of URLs move at once — the table is empty and
+    # `replacements` is structurally ZERO no matter how much moves. The runbook
+    # called `replacements: 0` its acceptance criterion, which was therefore a
+    # gate that could never fail. Measured against prod, the seed moves 340 of
+    # 4,528 sitemap URLs (7.5%) and `replacements` still reports 0.
+    #
+    # This counts what the operator is actually deciding: elected winners that
+    # differ from the URL the live sitemap advertises today. Only computable
+    # when seeded, because the sitemap is where "what we advertise today" lives.
+    incumbent_set = set(incumbents or ())
+    moved_from_sitemap = []
+    if incumbent_set:
+        elected_now = {e.content_key: e.canonical_sig_id for e in planned}
+        for content_key, sigs in candidates_by_content_key.items():
+            advertised = [s for s in set(sigs) if s in incumbent_set]
+            elected = elected_now.get(content_key, stored.get(content_key))
+            if len(advertised) == 1 and elected and elected != advertised[0]:
+                moved_from_sitemap.append(
+                    {"content_key": content_key, "from": advertised[0], "to": elected}
+                )
 
     report: Dict[str, Any] = {
         "apply": apply,
@@ -167,6 +196,9 @@ async def run_election(
             }
             for e in replacements
         ],
+        # THE acceptance number for a seed run. See the note above.
+        "moved_from_sitemap": len(moved_from_sitemap),
+        "moved_from_sitemap_detail": moved_from_sitemap[:50],
         "reasons": {},
     }
     for election in planned:

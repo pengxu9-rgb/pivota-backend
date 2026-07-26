@@ -26,6 +26,7 @@ import pytest
 from sqlalchemy import literal_column, select
 
 from services.content_canonical_election import (
+    REASON_DEDUPE_KEEPER,
     REASON_LEXICOGRAPHIC,
     REASON_SIG_CLASS,
     REASON_SITEMAP_INCUMBENT,
@@ -75,6 +76,47 @@ class TestPickWinner:
         the sitemap side.
         """
         assert pick_winner([SIG_A, SIG_F], incumbents={SIG_F}) == (
+            SIG_F,
+            REASON_SITEMAP_INCUMBENT,
+        )
+
+    def test_dedupe_keeper_outranks_everything_including_stickiness(self):
+        """The 2-hop canonical CHAIN this closes.
+
+        Excluding tombstones removes the loser from the pool; it does NOT make
+        the election prefer the KEEPER. With one survivor those coincide (336 of
+        340 prod groups). With two they diverge, and lexicographic picked a
+        non-keeper in 6 of the 11 such groups:
+
+            tombstone T -> keeper K   (#1833 canonicalises T at K)
+            election    -> E != K
+            sitemap     -> E
+
+        T points at K, K points at E, we advertise E. Not a contradiction — E is
+        self-canonical — but a chain Google discounts, and free to avoid.
+
+        Ranked above `stored` on purpose: a stored non-keeper winner is exactly
+        the state that PRODUCES the chain, so honouring stickiness there would
+        make the defect permanent.
+        """
+        keeper = "sig_" + "e" * 32
+        assert pick_winner([SIG_A, keeper], keeper=keeper) == (
+            keeper,
+            REASON_DEDUPE_KEEPER,
+        )
+        # ...over a stored winner, over incumbency, over lexicographic.
+        assert pick_winner(
+            [SIG_A, keeper], stored=SIG_A, incumbents={SIG_A}, keeper=keeper
+        ) == (keeper, REASON_DEDUPE_KEEPER)
+
+    def test_a_keeper_that_is_not_a_candidate_is_ignored(self):
+        """The keeper lost the eligibility or renderable filter.
+
+        Honouring it would advertise a URL we just established is not
+        advertisable — the dead-URL shape, arriving through a new door.
+        """
+        gone = "sig_" + "e" * 32
+        assert pick_winner([SIG_A, SIG_F], keeper=gone, incumbents={SIG_F}) == (
             SIG_F,
             REASON_SITEMAP_INCUMBENT,
         )

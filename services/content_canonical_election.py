@@ -64,6 +64,7 @@ from services.canonical_sitemap_candidates import (
 # Re-election is deliberately NOT one of these: it is visible as
 # ``elected_at <> updated_at``, which keeps the reason column answering one
 # question instead of two.
+REASON_DEDUPE_KEEPER = "dedupe_keeper"
 REASON_SITEMAP_INCUMBENT = "sitemap_incumbent"
 REASON_SOLE_CANDIDATE = "sole_candidate"
 REASON_SIG_CLASS = "sig_class"
@@ -106,6 +107,7 @@ def pick_winner(
     *,
     stored: Optional[str] = None,
     incumbents: Optional[Iterable[str]] = None,
+    keeper: Optional[str] = None,
 ) -> Optional[Tuple[str, str]]:
     """Return ``(winning_sig, reason)`` for one content_key's candidate set.
 
@@ -133,6 +135,34 @@ def pick_winner(
     pool = sorted({str(c).strip() for c in candidates if str(c or "").strip()})
     if not pool:
         return None
+
+    # LAYER -1 — the step-5 KEEPER, above even stickiness.
+    #
+    # Excluding tombstones (`not_tombstoned`) removes the tombstone from the
+    # pool; it does NOT make the election prefer the KEEPER. With one survivor
+    # those are the same thing, which is why it looked sufficient — 336 of the
+    # 340 tombstone-bearing groups in prod have exactly one. With two survivors
+    # they diverge, and measured, lexicographic picks a non-keeper in 6 of the
+    # 11 such groups:
+    #
+    #   tombstone T -> keeper K   (#1833 canonicalises T at K)
+    #   election    -> E != K     (lexicographic over {K, E})
+    #   sitemap     -> E
+    #
+    # T points at K, K points at E, the sitemap advertises E. A two-hop
+    # canonical CHAIN — not a contradiction (E is self-canonical, so nothing
+    # points away from what we advertise) but Google discounts chains, and it is
+    # avoidable for free.
+    #
+    # Ranked above `stored` deliberately, breaking the stickiness rule that
+    # governs every other layer. The keeper is an explicit row-layer decision
+    # (suppression_metadata.keeper_product_key, 2026-07-10); disagreeing with it
+    # does not preserve equity, it splits equity across a chain. Where they
+    # conflict, agreeing with #1833 is worth more than holding a URL still —
+    # and a stored non-keeper winner is exactly the state that produces the
+    # chain, so refusing to move it would make the defect permanent.
+    if keeper and keeper in pool:
+        return keeper, REASON_DEDUPE_KEEPER
 
     if stored and stored in pool:
         return stored, REASON_STICKY
@@ -181,6 +211,7 @@ def plan_elections(
     candidates_by_content_key: Dict[str, List[str]],
     stored_by_content_key: Dict[str, str],
     incumbents: Optional[Iterable[str]] = None,
+    keeper_by_content_key: Optional[Dict[str, str]] = None,
 ) -> List[Election]:
     """Pure planner: candidate sets + current state -> the writes to make.
 
@@ -193,6 +224,7 @@ def plan_elections(
     so a steady-state sweep writes zero rows.
     """
     incumbent_set = set(incumbents or ())
+    keepers = keeper_by_content_key or {}
     planned: List[Election] = []
     for content_key, candidates in candidates_by_content_key.items():
         stored = stored_by_content_key.get(content_key)
@@ -200,6 +232,7 @@ def plan_elections(
             candidates,
             stored=stored,
             incumbents=incumbent_set or None,
+            keeper=keepers.get(content_key),
         )
         if chosen is None:
             # No advertisable URL right now. Leave any stored row untouched.
@@ -252,6 +285,33 @@ def candidates_query(*, widen: Optional[bool] = None):
             catalog_products.c.pivota_signature_id.asc(),
         )
     )
+
+
+# The step-5 keeper for every content_key that has one, as a SIG.
+#
+# Mirrors PIVOTA-Agent#1833's keeper LATERAL guard for guard — same join key
+# (`suppression_metadata->>'keeper_product_key'`), same three conditions (same
+# content_key, keeper not itself tombstoned, keeper has a sig). If the two ever
+# disagree about who the keeper is, #1833 points the tombstone at one sig while
+# this elects another, and the chain this exists to prevent comes back.
+#
+# DISTINCT because a group can hold several tombstones (up to 6 in prod) all
+# naming the same keeper; ordering by sig makes a group whose tombstones somehow
+# disagree resolve deterministically rather than by scan order.
+KEEPER_SIGS_SQL = """
+SELECT DISTINCT ON (loser.content_key)
+       loser.content_key,
+       keeper.pivota_signature_id AS keeper_sig_id
+FROM catalog_products loser
+JOIN catalog_products keeper
+  ON keeper.product_key = loser.suppression_metadata->>'keeper_product_key'
+ AND keeper.content_key = loser.content_key
+ AND keeper.suppression_reason IS NULL
+ AND keeper.pivota_signature_id IS NOT NULL
+WHERE loser.suppression_reason IS NOT NULL
+  AND loser.content_key IS NOT NULL
+ORDER BY loser.content_key, keeper.pivota_signature_id
+"""
 
 
 UPSERT_ELECTION_SQL = """
