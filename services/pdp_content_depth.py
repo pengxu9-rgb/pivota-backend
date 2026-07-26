@@ -171,17 +171,31 @@ def _has_dossier(cp):
     no Insights section. The three ``analysis`` shapes below are the three the
     gateway unwraps, in its own order of preference.
     """
-    # NULL guard on each arm, not decoration. ``pivota_signature_id`` is
-    # nullable, and Postgres' ``concat()`` treats NULL as the empty string — so
-    # a NULL-sig row would build the literal key ``'product:'`` and match any KB
-    # row that happened to be keyed that way, lending depth to a row that has
-    # none. No such kb_key exists in prod today (verified: 0 rows), so this is
-    # latent rather than live, but the cost of the guard is one predicate.
+    # Degenerate-key guard on each arm, not decoration. ``pivota_signature_id``
+    # is nullable, and Postgres' ``concat()`` treats NULL as the empty string —
+    # so a NULL-sig row would build the literal key ``'product:'`` and match any
+    # KB row keyed that way, lending depth to a row that has none.
+    #
+    # The guard is ``nullif(col, '')`` and NOT a bare ``col IS NOT NULL``,
+    # because BOTH degenerate values collapse to the same key: ``concat(prefix,
+    # NULL)`` and ``concat(prefix, '')`` are each exactly ``'product:'``. A NULL
+    # check alone closes half the hole and reads as if it closed all of it.
+    # ``nullif`` maps '' to NULL and the ``isnot(None)`` then rejects both.
+    #
+    # Latent, not live: prod has 0 KB rows keyed ``'product:'`` and 0 rows with
+    # an empty-string sig / product_key / source_product_id. Two of the three
+    # arms are provably dead today (``product_key`` is the primary key;
+    # ``source_product_id`` has 0 NULLs across all 14,104 rows) — kept for
+    # symmetry, at no measured cost.
+    #
     # Note the gateway has the same latent bug — ``firstNonEmptyString`` returns
     # '' and ``push()`` accepts the resulting ``'product:'`` — so this is a
     # deliberate divergence from the mirror, in the safe direction.
     kb_keys = [
-        and_(col.isnot(None), aurora_product_intel_kb.c.kb_key == func.concat(_KB_KEY_PREFIX, col))
+        and_(
+            func.nullif(col, "").isnot(None),
+            aurora_product_intel_kb.c.kb_key == func.concat(_KB_KEY_PREFIX, col),
+        )
         for col in (
             cp.c.pivota_signature_id,
             cp.c.product_key,

@@ -225,13 +225,19 @@ def test_unrelated_kb_key_does_not_resolve(engine):
     assert _sqlalchemy_answer(engine) is False
 
 
-def test_null_signature_does_not_match_a_bare_product_key(engine):
-    """A NULL sig must not build the key ``'product:'`` and match on it.
+@pytest.mark.parametrize("degenerate", [None, ""], ids=["null sig", "empty-string sig"])
+def test_degenerate_signature_does_not_match_a_bare_product_key(engine, degenerate):
+    """Neither a NULL nor an empty-string sig may match the key ``'product:'``.
 
-    ``pivota_signature_id`` is nullable and Postgres' ``concat()`` treats NULL
-    as the empty string, so an unguarded arm turns every NULL-sig row into a
-    lookup for the literal key ``'product:'``. If any KB row is ever keyed that
-    way — none is today — every NULL-sig row in the feed would score as deep.
+    ``pivota_signature_id`` is nullable, and Postgres' ``concat()`` treats NULL
+    as the empty string — so ``concat('product:', NULL)`` and
+    ``concat('product:', '')`` are BOTH exactly ``'product:'``. An unguarded arm
+    turns such a row into a lookup for that literal key; if any KB row is ever
+    filed under it — none is today — every degenerate-sig row in the feed would
+    score as deep and be advertised as a citable PDP while rendering a shell.
+
+    The empty-string case is the one a bare ``IS NOT NULL`` guard would miss,
+    which is why the predicate uses ``nullif(col, '')``.
     """
     eng, md = engine
     cp = md.tables["catalog_products"]
@@ -243,8 +249,8 @@ def test_null_signature_does_not_match_a_bare_product_key(engine):
         conn.execute(
             cp.insert().values(
                 product_key="pk_1",
-                pivota_signature_id=None,
-                source_product_id=None,
+                pivota_signature_id=degenerate,
+                source_product_id=degenerate,
                 description=None,
             )
         )
