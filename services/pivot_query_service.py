@@ -1213,6 +1213,17 @@ async def _fetch_citable_canonical_rows(
             p.source_product_id,
             p.canonical_url,
             p.pivota_canonical_url,
+            -- The citable sig, for the CitationItem's attribution.canonical_url
+            -- (routes/agent_citation_v1._search_row_to_citation). agent_pdp_view
+            -- FIRST because it is content_key-keyed and is the surface the
+            -- single-item citation read resolves from — so the search and
+            -- single-item endpoints emit the SAME URL for the same content_key,
+            -- which they would not if this picked whichever product_key won the
+            -- rank. Falls back to the product's own sig for a row with no apv row
+            -- yet (this lane reads catalog_products, so that is reachable).
+            -- NOTE: this SELECT is an f-string; never write a brace in here.
+            COALESCE(apv.pivota_signature_id, p.pivota_signature_id)
+                AS pivota_signature_id,
             p.catalog_track,
             p.truth_tier,
             p.readiness_tier,

@@ -380,9 +380,31 @@ def test_list_canonical_pdps_includes_storeless_when_sitemap_widened(
     assert storeless["sig_id"] is None
     assert storeless["serving_eligible"] is False
     assert storeless["index_eligible"] is True
-    assert storeless["canonical_url"] == "https://agent.pivota.cc/products/ck_storeless"
+    # A sig-less row has NO followable PDP, so it reports null rather than the
+    # content_key URL form this used to synthesize. Measured in prod 2026-07-26:
+    # agent.pivota.cc/products/{ck_*} is a hard HTTP 500 for 135/135 content_keys
+    # probed — the gateway's resolve keys on cp.pivota_signature_id, so no ck_*
+    # id can match. See the note at the top of routes/pivota_canonical_routes.
+    assert storeless["canonical_url"] is None
     # serving rows now also carry the index_eligible flag (False) for the UI gate
     assert by_ck["ck_abc"]["index_eligible"] is False
+
+
+def test_feed_never_emits_a_content_key_pdp_url(env, monkeypatch: pytest.MonkeyPatch):
+    """No row, widened or not, may advertise the ck URL form — it always 500s.
+
+    Pins the whole feed rather than one row: the old fallback fired for ANY row
+    whose pivota_canonical_url was null, so a single-row assertion would not
+    catch it coming back on a different lane.
+    """
+    monkeypatch.setenv("INDEX_ELIGIBLE_SITEMAP", "1")
+    body = env.get("/api/canonical/products").json()
+    for item in body["items"]:
+        url = item["canonical_url"]
+        if url is None:
+            continue
+        assert "/products/ck_" not in url, item
+        assert url.startswith("https://agent.pivota.cc/products/sig_"), item
 
 
 def test_list_canonical_pdps_excludes_non_indexable_merchant(env):

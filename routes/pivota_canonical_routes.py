@@ -77,10 +77,37 @@ router = APIRouter(
     tags=["canonical-pdp"],
 )
 
-# Public PDP URL base. Used to synthesize a canonical_url for offer-free
-# brand-authored rows that have no minted sig (their pivota_canonical_url may be
-# null) — the served PDP resolves by content_key, so the sitemap points there.
-_PDP_URL_PREFIX = "https://agent.pivota.cc/products/"
+# THERE IS NO content_key PDP URL FORM. A ``_PDP_URL_PREFIX`` used to live here
+# to synthesize a ``canonical_url`` for offer-free brand-authored rows with no
+# minted sig, on the stated belief that "the served PDP resolves by content_key,
+# so the sitemap points there".
+#
+# THAT BELIEF IS FALSE, measured against prod 2026-07-26:
+# ``agent.pivota.cc/products/{ck_*}`` returns a hard HTTP 500 (2,007 bytes, no
+# product JSON-LD) on every probe — 135 serial requests over 133 distinct
+# content_keys, including 34 rows this very feed calls ``renderable=true`` whose
+# own sig-form URL serves a real 54-67 KB PDP; plus 103 further distinct ck ids in
+# an independent adversarial re-measurement, 103/103 dead with zero 3xx. The
+# gateway's sig-exact resolve keys on ``cp.pivota_signature_id = $1``
+# (PIVOTA-Agent ``src/server.js``), so no ``ck_*`` id can match it and the ISR
+# route turns the miss into a 500.
+#
+# BLAST RADIUS HERE IS 7 ROWS, not the whole feed: `pivota_canonical_url` is
+# already populated with the sig form for 5,826 of 5,887 feed rows, so the
+# fallback only ever fired for the 7 sig-less ones. (A further 54 rows carry an
+# EXTERNAL merchant URL in that column — unrelated pre-existing data, untouched
+# here, but do not assume this field is always an agent.pivota.cc URL.) Those 7
+# now report ``canonical_url: null`` rather than a URL guaranteed to 500.
+#
+# Zero impact at the only consumer: agent-ui's
+# ``scripts/sitemap_lib.mjs`` builds from ``sig_id`` behind a ``/^sig_.+/`` guard
+# and never reads this field — it already carries the note that "get_pdp_v2
+# rejects a bare content_key with MISSING_MERCHANT_CONTEXT", i.e. that half of
+# this fix shipped there and this half was left behind. ``_encode_list_cursor``
+# is unaffected (it already returns None for a non-str sig).
+#
+# Do NOT reintroduce a content_key URL form without first re-measuring that the
+# gateway resolves one. The honest degradation for a sig-less row is null.
 
 T = TypeVar("T")
 
@@ -618,13 +645,14 @@ async def list_canonical_pdp_signatures(
         {
             "sig_id": r["pivota_signature_id"],
             "content_key": r["content_key"],
-            # SELF-referential, deliberately unchanged. It is this ROW's own
-            # URL and several consumers read it that way; the group-level
-            # answer is the separate field below.
-            "canonical_url": (
-                r["pivota_canonical_url"]
-                or (f"{_PDP_URL_PREFIX}{r['content_key']}" if r["content_key"] else None)
-            ),
+            # SELF-referential: this ROW's own URL, and several consumers read
+            # it that way; the group-level answer is the separate field below.
+            #
+            # No content_key fallback — see the note at the top of this module
+            # for the measurement that killed it (the ck form is a guaranteed
+            # 500, so the old fallback emitted a dead URL for the 7 sig-less
+            # feed rows). Null is the honest answer for a row with no sig.
+            "canonical_url": r["pivota_canonical_url"],
             # The ONE URL id for this row's content_key (migration 181), or
             # null when the content_key has not been elected yet.
             #

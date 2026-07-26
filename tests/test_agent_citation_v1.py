@@ -15,19 +15,26 @@ from routes import agent_citation_v1 as cite
 
 _CK_A = "ck_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
 _CK_B = "ck_bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+_SIG_A = "sig_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+_SIG_ITEM = "sig_0123456789abcdef0123456789abcdef"
 
 
 def _citable_rows():
     return [
         {
             "content_key": _CK_A,
+            # Threaded by _fetch_citable_canonical_rows as
+            # COALESCE(apv.pivota_signature_id, p.pivota_signature_id).
+            "pivota_signature_id": _SIG_A,
             "product_title": "Anuko Nourishing Hair Butter",
             "product_description": "Shea butter treatment. For damaged hair.",
             "brand": "Anuko",
             "product_image_url": "https://img.example/anuko.jpg",
         },
         {
+            # No sig minted → null attribution URL, never the ck form.
             "content_key": _CK_B,
+            "pivota_signature_id": None,
             "product_title": "SKIN1004 Centella Ampoule",
             "product_description": "Centella ampoule.",
             "brand": "SKIN1004",
@@ -39,7 +46,7 @@ def _citable_rows():
 def _row(**overrides: Any) -> Dict[str, Any]:
     base: Dict[str, Any] = {
         "content_key": "ck_0123456789abcdef0123456789abcdef",
-        "pivota_signature_id": None,
+        "pivota_signature_id": _SIG_ITEM,
         "title": "Anuko Nourishing Hair Butter",
         "brand": "Anuko",
         "description": "A rich shea butter treatment for damaged hair. Mixed berry scent.",
@@ -94,11 +101,13 @@ def test_citation_item_shape_and_invariants(client_for):
     assert body["buyable"] is False
     assert body["offers"] is None
     assert body["catalog_track"] == "citation"
-    # attribution — the moat
+    # attribution — the moat. The cited URL is the SIG form: the content_key form
+    # 500s at the gateway for every row (135/135 measured in prod 2026-07-26),
+    # which made every citation unfollowable while still demanding attribution.
     assert body["attribution"]["source"] == "Pivota"
     assert (
         body["attribution"]["canonical_url"]
-        == "https://agent.pivota.cc/products/ck_0123456789abcdef0123456789abcdef"
+        == f"https://agent.pivota.cc/products/{_SIG_ITEM}"
     )
     assert body["attribution"]["cite_as"] == "Pivota — agent.pivota.cc"
     assert body["attribution"]["attribution_required"] is True
@@ -145,6 +154,55 @@ def test_unknown_id_shape_is_404(client_for):
     assert res.status_code == 404
 
 
+# ── attribution.canonical_url: the sig form, never the content_key form ──────
+#
+# The regression these pin is not hypothetical: shipping
+# `PDP_URL_PREFIX + content_key` made attribution.canonical_url a hard 500 for
+# EVERY row this endpoint serves (135/135 content_keys measured in prod
+# 2026-07-26), including rows whose own sig-form PDP serves a real page — while
+# the same response carried attribution_required: true.
+
+
+def test_attribution_url_is_never_the_content_key_form(client_for):
+    """The ck form 500s at the gateway. It must not appear, in any field."""
+    ck = "ck_0123456789abcdef0123456789abcdef"
+    body = client_for(_row()).get(f"/agent/v1/citation/{ck}").json()
+    assert f"/products/{ck}" not in str(body)
+    assert body["attribution"]["canonical_url"] == f"https://agent.pivota.cc/products/{_SIG_ITEM}"
+    # content_key is still carried as an IDENTIFIER — it is only invalid as a URL.
+    assert body["content_key"] == ck
+
+
+def test_attribution_url_is_null_without_a_minted_sig(client_for):
+    """No sig ⇒ no followable PDP. Null, not a ck URL that is certain to 500.
+
+    attribution_required STAYS true and cite_as is unchanged: attribution is to
+    the SOURCE, which an agent can honour by name without a deep link. Dropping
+    the requirement here would hand away the moat on exactly the rows we cannot
+    yet link to.
+    """
+    body = (
+        client_for(_row(pivota_signature_id=None))
+        .get("/agent/v1/citation/ck_0123456789abcdef0123456789abcdef")
+        .json()
+    )
+    assert body["attribution"]["canonical_url"] is None
+    assert body["attribution"]["attribution_required"] is True
+    assert body["attribution"]["cite_as"] == "Pivota — agent.pivota.cc"
+    assert "/products/" not in str(body)
+
+
+@pytest.mark.parametrize("bad_sig", ["", "   ", "sig_", "ck_abc", "not-a-sig", None])
+def test_attribution_url_null_for_unusable_sig_values(client_for, bad_sig):
+    """A bare "sig_" is as dead as a ck URL (/products/sig_ errors the same way),
+    and it would pass a naive startswith check — the same trap agent-ui's
+    sitemap_lib.mjs documents with its `/^sig_.+/` (not `^sig_`) guard."""
+    body = client_for(_row(pivota_signature_id=bad_sig)).get(
+        "/agent/v1/citation/ck_0123456789abcdef0123456789abcdef"
+    ).json()
+    assert body["attribution"]["canonical_url"] is None
+
+
 # ── /search ─────────────────────────────────────────────────────────────────
 
 
@@ -167,7 +225,10 @@ def test_search_inform_returns_citation_items(client_for, monkeypatch: pytest.Mo
     assert item["offers"] is None
     assert item["catalog_track"] == "citation"
     assert item["attribution"]["source"] == "Pivota"
-    assert item["attribution"]["canonical_url"] == f"https://agent.pivota.cc/products/{_CK_A}"
+    # Sig form, and the SAME URL the single-item read would emit for this
+    # content_key — that agreement is why the recall query prefers
+    # apv.pivota_signature_id over whichever product_key won the rank.
+    assert item["attribution"]["canonical_url"] == f"https://agent.pivota.cc/products/{_SIG_A}"
     assert item["title"] == "Anuko Nourishing Hair Butter"
     assert item["brand"] == "Anuko"
     # recall rows are light → substantiation empty (full detail via single-item)

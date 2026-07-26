@@ -41,11 +41,11 @@ from routes.agent_pdp_v1 import (
     _query_for_id,
     _row_to_dict,
 )
+from services.catalog_sync_service import pivota_canonical_pdp_url
 from services.claim_safety import substantiated_claims
 
 router = APIRouter(prefix="/agent/v1/citation", tags=["agent-citation"])
 
-PDP_URL_PREFIX = "https://agent.pivota.cc/products/"
 CITE_AS = "Pivota — agent.pivota.cc"
 SUMMARY_MAX = 200
 
@@ -125,13 +125,96 @@ def _first_sentence(text: str, *, cap: int = SUMMARY_MAX) -> str:
 def project_citation_item(row: Dict[str, Any]) -> Dict[str, Any]:
     """Project an agent_pdp_view row into the offer-free CitationItem.
 
-    Invariants: buyable=False, offers=None, catalog_track='citation', attribution
-    always present. Never includes merchant id/email, internal scores, take-rate,
-    or raw competitor offers.
+    Invariants: buyable=False, offers=None, catalog_track='citation'. Never
+    includes merchant id/email, internal scores, take-rate, or raw competitor
+    offers.
+
+    The ``attribution`` BLOCK is always present, but its ``canonical_url`` is
+    NULLABLE — null for a row with no minted sig, because there is no followable
+    PDP for one. ``source``/``cite_as``/``attribution_required`` are
+    unconditional, so attribution to the source survives a null URL. The contract
+    doc's "``attribution.canonical_url`` is always present" rule
+    (pivota-merchants-portal/docs/external-citation-api-contract.md) predates the
+    measurement that the URL form it specified was a guaranteed 500, and needs
+    that follow-up edit; the doc's own EXAMPLE already shows the sig form this
+    now emits.
     """
     content_key = row.get("content_key")
     description = str(row.get("description") or "")
     claims = substantiated_claims(row.get("evidence_profile"))
+
+    # THE CITED URL MUST BE THE **SIG** FORM. It used to be
+    # ``PDP_URL_PREFIX + content_key``, which is a dead URL for EVERY row this
+    # endpoint serves — not just the unrenderable ones.
+    #
+    # MEASURED 2026-07-26 against prod: ``agent.pivota.cc/products/{ck_*}``
+    # returned a hard **HTTP 500** (2,007 bytes, no product JSON-LD) on every
+    # probe — 135 serial requests over **133 distinct content_keys**, 34 of them
+    # rows the sitemap feed calls ``renderable=true`` and whose OWN sig-form URL
+    # serves a real 54-67 KB PDP. Reproduced INDEPENDENTLY by an adversarial
+    # re-measurement the same day that set out to refute it: 103 further distinct
+    # ck ids, 103/103 dead, byte-identical 2,007-byte bodies, **zero 3xx** (so the
+    # old behaviour was broken, not merely a redirect), ``x-vercel-cache: MISS``
+    # on every one (500s are never cached, so no ck URL can warm into a 200), and
+    # a fabricated ``sig_0000…`` returning the SAME 500/2,007 — i.e. a ck id is
+    # indistinguishable from a nonexistent signature, exactly as the mechanism
+    # below predicts. The gateway's sig-exact resolve keys on
+    # ``cp.pivota_signature_id = $1`` (PIVOTA-Agent ``src/server.js``,
+    # ``resolveCatalogProductRefFromPivotaSignatureInner``); nothing there matches
+    # a ``ck_*`` id, so the ISR page route turns the miss into a 500. agent-ui
+    # already learned this and fixed its half — ``scripts/sitemap_lib.mjs`` drops
+    # any row whose ``sig_id`` fails ``/^sig_.+/`` and notes that "get_pdp_v2
+    # rejects a bare content_key with MISSING_MERCHANT_CONTEXT". This endpoint was
+    # the half that never got the memo.
+    #
+    # Why this is the worst place for that bug: the response also carries
+    # ``attribution_required: true``, so we tell a frontier agent it MUST
+    # attribute, and hand it a URL that 500s. ADR-007's premise is that a
+    # citation is followable; this made every citation unfollowable.
+    #
+    # Built via ``pivota_canonical_pdp_url`` rather than a local prefix so the
+    # URL is byte-identical to the one ``routes/agent_pdp_v1._row_as_product``
+    # emits as ``pivota_canonical_url``/``url`` for the same row. The two
+    # surfaces serve the same rows through the same gate and resolver; a citation
+    # that disagreed with the PDP read about its own URL would be a second
+    # drift of exactly the kind ``services/pdp_renderability`` exists to prevent.
+    #
+    # ONE COUPLING THAT COMES WITH THAT HELPER: it derives its host from
+    # ``CHECKOUT_UI_BASE_URL`` (services/catalog_sync_service.py), whereas
+    # ``CITE_AS`` above hardcodes "agent.pivota.cc". VERIFIED 2026-07-26 that prod
+    # resolves the env var to exactly ``https://agent.pivota.cc`` — read back off
+    # the live ``/api/agent/pdp/{sig}`` response, which builds its URL with this
+    # same helper — so the two agree today. If ``CHECKOUT_UI_BASE_URL`` is ever
+    # repointed at a checkout or staging host, ONE response would advertise two
+    # different hosts; move ``CITE_AS`` onto the same base at that point.
+    #
+    # NULL WHEN NO SIG IS MINTED, deliberately, matching
+    # ``services/agent_pdp_view_assembler`` (``pdp_url = ... if sig else None``).
+    # A row with no sig has no followable PDP at all — the ck fallback was never
+    # a weaker URL, it was a broken one — so emitting null is the honest answer
+    # and strictly better than a guaranteed 500. ``attribution_required`` STAYS
+    # TRUE and ``cite_as`` is unchanged: attribution is to the SOURCE ("Pivota —
+    # agent.pivota.cc"), which an agent can still honour by name without a deep
+    # link. Dropping the requirement instead would hand away the moat on exactly
+    # the rows we cannot yet link to.
+    #
+    # SCOPE — THIS FIXES THE URL **FORM**, NOT ITS RENDERABILITY. A minted sig
+    # whose PDP fails either of ``get_pdp_v2``'s gates still gets its own (dead)
+    # sig URL here. Measured on the live feed: 879 of 5,887 rows are
+    # non-renderable (779 that are ``serving_eligible`` but whose content route
+    # does not resolve, plus 100 offer-free ``no_price`` rows admitted by
+    # ``INDEX_ELIGIBLE_READ``), and this endpoint answers 200 for them. Teaching
+    # this projection ``services.pdp_renderability.pdp_will_render_expression``
+    # — and substituting the content_key's renderable sibling, which exists for
+    # 229 of the 245 affected content_keys — is the follow-up; it needs a
+    # ``catalog_products`` join this content_key-grain projection does not have.
+    signature_id = str(row.get("pivota_signature_id") or "").strip()
+    canonical_url = (
+        pivota_canonical_pdp_url(signature_id)
+        if signature_id.startswith("sig_") and len(signature_id) > len("sig_")
+        else None
+    )
+
     return {
         "content_key": content_key,
         "title": str(row.get("title") or ""),
@@ -152,9 +235,12 @@ def project_citation_item(row: Dict[str, Any]) -> Dict[str, Any]:
             "verify_coverage": None,
         },
         # ── attribution (REQUIRED for the moat) ──
+        # canonical_url is the sig-form PDP, or null when no sig is minted — see
+        # the measurement above the return for why the content_key form was a
+        # guaranteed 500 and why attribution_required stays true regardless.
         "attribution": {
             "source": "Pivota",
-            "canonical_url": f"{PDP_URL_PREFIX}{content_key}",
+            "canonical_url": canonical_url,
             "cite_as": CITE_AS,
             "attribution_required": True,
         },
@@ -178,6 +264,12 @@ def _search_row_to_citation(row: Dict[str, Any]) -> Dict[str, Any]:
     return project_citation_item(
         {
             "content_key": row.get("content_key"),
+            # Threaded so search emits the same sig-form attribution URL as the
+            # single-item read; selected as
+            # COALESCE(apv.pivota_signature_id, p.pivota_signature_id) by
+            # services/pivot_query_service._fetch_citable_canonical_rows. Absent
+            # ⇒ null canonical_url, never the ck form (a guaranteed 500).
+            "pivota_signature_id": row.get("pivota_signature_id"),
             "title": row.get("product_title"),
             "description": row.get("product_description"),
             "brand": row.get("brand"),
