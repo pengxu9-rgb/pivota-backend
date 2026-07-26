@@ -10,12 +10,16 @@ the elector selects through the SAME shared filter the feed does), or the winner
 can move for a reason the sitemap would not have moved it for (a stickiness
 break — guarded by the picker tests).
 
-pivota-backend CI has been dark since the 2026-07-14 Actions billing outage, so
-this file is the gate.
+pivota-backend CI is back (the 2026-07-14 Actions billing outage is resolved)
+but runs only a partial suite, so this file is still the real gate. Anything
+here that SKIPS is not a gate at all — which is why the parity claim is a
+checked-in golden with the live node differential as a secondary guard on the
+golden itself, rather than the other way round.
 """
 
 from __future__ import annotations
 
+import json
 import os
 
 import pytest
@@ -89,35 +93,83 @@ class TestPickWinner:
             [third, SIG_A, SIG_F], incumbents={SIG_A, SIG_F}
         ) == (SIG_A, REASON_SITEMAP_INCUMBENT)
 
-    def test_parity_with_preferSitemapId_over_the_whole_combination_space(self):
-        """Differential test against the REAL sitemap ordering, in node.
-
-        The seed's job is to import the sitemap's answer. "Import" is only
-        meaningful if the two agree, and hand-reasoning about two orderings in
-        two languages is exactly how they drifted: an earlier version of this
-        picker disagreed on 60 of these 400 cases.
+    # GOLDEN TABLE, generated from pivota-agent-ui's REAL `preferSitemapId` by
+    # folding it pairwise left-to-right exactly as `mergeDuplicateProduct` does.
+    # Each entry is [candidate indices, incumbent indices, expected winner
+    # index] into _PARITY_SIGS.
+    #
+    # This is checked in rather than computed because the live differential
+    # below only runs where a pivota-agent-ui worktree happens to exist — i.e.
+    # never in CI, and not even locally once the worktree is removed. A parity
+    # claim that silently skips is not a gate. Regenerate with the snippet in
+    # the live test when preferSitemapId's ordering changes on purpose.
+    _PARITY_SIGS = ["sig_" + c * 32 for c in "abc"] + ["sig_" + "d" * 24]
+    _PARITY_GOLDEN = json.loads(
         """
-        import itertools
-        import json
+        [[[0,1],[],0],[[0,1],[0],0],[[0,1],[1],1],[[0,1],[0,1],0],[[0,2],[],0],[[0,2
+        ],[0],0],[[0,2],[2],2],[[0,2],[0,2],0],[[0,3],[],0],[[0,3],[0],0],[[0,3],[3]
+        ,3],[[0,3],[0,3],0],[[1,2],[],1],[[1,2],[1],1],[[1,2],[2],2],[[1,2],[1,2],1]
+        ,[[1,3],[],1],[[1,3],[1],1],[[1,3],[3],3],[[1,3],[1,3],1],[[2,3],[],2],[[2,3
+        ],[2],2],[[2,3],[3],3],[[2,3],[2,3],2],[[0,1,2],[],0],[[0,1,2],[0],0],[[0,1,
+        2],[1],1],[[0,1,2],[2],2],[[0,1,2],[0,1],0],[[0,1,2],[0,2],0],[[0,1,2],[1,2]
+        ,1],[[0,1,2],[0,1,2],0],[[0,1,3],[],0],[[0,1,3],[0],0],[[0,1,3],[1],1],[[0,1
+        ,3],[3],3],[[0,1,3],[0,1],0],[[0,1,3],[0,3],0],[[0,1,3],[1,3],1],[[0,1,3],[0
+        ,1,3],0],[[0,2,3],[],0],[[0,2,3],[0],0],[[0,2,3],[2],2],[[0,2,3],[3],3],[[0,
+        2,3],[0,2],0],[[0,2,3],[0,3],0],[[0,2,3],[2,3],2],[[0,2,3],[0,2,3],0],[[1,2,
+        3],[],1],[[1,2,3],[1],1],[[1,2,3],[2],2],[[1,2,3],[3],3],[[1,2,3],[1,2],1],[
+        [1,2,3],[1,3],1],[[1,2,3],[2,3],2],[[1,2,3],[1,2,3],1],[[0,1,2,3],[],0],[[0,
+        1,2,3],[0],0],[[0,1,2,3],[1],1],[[0,1,2,3],[2],2],[[0,1,2,3],[3],3],[[0,1,2,
+        3],[0,1],0],[[0,1,2,3],[0,2],0],[[0,1,2,3],[0,3],0],[[0,1,2,3],[1,2],1],[[0,
+        1,2,3],[1,3],1],[[0,1,2,3],[2,3],2],[[0,1,2,3],[0,1,2],0],[[0,1,2,3],[0,1,3]
+        ,0],[[0,1,2,3],[0,2,3],0],[[0,1,2,3],[1,2,3],1],[[0,1,2,3],[0,1,2,3],0]]
+        """
+    )
+
+    def _golden_cases(self):
+        for cand_ix, inc_ix, want_ix in self._PARITY_GOLDEN:
+            yield (
+                [self._PARITY_SIGS[i] for i in cand_ix],
+                {self._PARITY_SIGS[i] for i in inc_ix},
+                self._PARITY_SIGS[want_ix],
+            )
+
+    def test_parity_with_preferSitemapId_golden(self):
+        """Runs EVERYWHERE, including CI. The gate that actually holds.
+
+        The seed's job is to import the sitemap's answer, and "import" is only
+        meaningful if the two agree. Hand-reasoning about two orderings in two
+        languages is exactly how they drifted: an earlier version of this picker
+        disagreed with the JS on 60 of these cases.
+        """
+        mismatches = [
+            (cands, sorted(inc), want, pick_winner(cands, incumbents=inc or None)[0])
+            for cands, inc, want in self._golden_cases()
+            if pick_winner(cands, incumbents=inc or None)[0] != want
+        ]
+        assert not mismatches, (
+            f"{len(mismatches)}/{len(self._PARITY_GOLDEN)} diverge from "
+            f"preferSitemapId: {mismatches[:3]}"
+        )
+
+    def test_golden_table_still_matches_the_live_preferSitemapId(self):
+        """Guards the GOLDEN itself against agent-ui changing its ordering.
+
+        Skips where no pivota-agent-ui worktree is present (CI, and any machine
+        that has not checked it out) — which is precisely why the golden above
+        exists and carries the real assertion.
+        """
         import shutil
         import subprocess
 
         node = shutil.which("node")
-        if not node:
-            pytest.skip("node is required for the differential parity test")
-
         lib = "/Users/pengchydan/dev/pa-ui-canonical/scripts/sitemap_lib.mjs"
-        if not os.path.exists(lib):
-            pytest.skip("pivota-agent-ui worktree not present")
+        if not node or not os.path.exists(lib):
+            pytest.skip("needs node + a pivota-agent-ui worktree; golden covers CI")
 
-        sigs = ["sig_" + c * 32 for c in "abc"] + ["sig_" + "d" * 24]
-        cases = []
-        for size in (2, 3, 4):
-            for combo in itertools.combinations(sigs, size):
-                for inc_size in range(len(combo) + 1):
-                    for inc in itertools.combinations(combo, inc_size):
-                        cases.append({"cands": list(combo), "inc": list(inc)})
-
+        cases = [
+            {"cands": cands, "inc": sorted(inc)}
+            for cands, inc, _ in self._golden_cases()
+        ]
         script = (
             f"import {{ preferSitemapId }} from {json.dumps(lib)};"
             "const cases = JSON.parse(process.argv[1]);"
@@ -126,7 +178,7 @@ class TestPickWinner:
             "console.log(JSON.stringify(cases.map(c =>"
             "  c.cands.reduce((a,b) => preferSitemapId(a,b,new Set(c.inc),'')))));"
         )
-        js_winners = json.loads(
+        live = json.loads(
             subprocess.run(
                 [node, "--input-type=module", "-e", script, json.dumps(cases)],
                 capture_output=True,
@@ -134,13 +186,8 @@ class TestPickWinner:
                 check=True,
             ).stdout
         )
-
-        mismatches = [
-            (case, js, pick_winner(case["cands"], incumbents=set(case["inc"]) or None)[0])
-            for case, js in zip(cases, js_winners)
-            if pick_winner(case["cands"], incumbents=set(case["inc"]) or None)[0] != js
-        ]
-        assert not mismatches, f"{len(mismatches)}/{len(cases)} diverge: {mismatches[:3]}"
+        expected = [want for _, _, want in self._golden_cases()]
+        assert live == expected, "preferSitemapId changed — regenerate _PARITY_GOLDEN"
 
     def test_no_incumbent_in_group_falls_through(self):
         assert pick_winner([SIG_A, SIG_F], incumbents={"sig_unrelated"}) == (
@@ -300,6 +347,48 @@ class TestElectableSigGuard:
                 )
             )
             assert explicit == default
+
+
+class TestTheFixesAreActuallyWIRED:
+    """Both round-1 fixes reverted silently with the whole suite green.
+
+    `TestElectableSigGuard` exercises the helper in isolation and
+    `sitemap_electable_filter` was only ever compiled through `candidates_query`
+    — so swapping the feed's column back to the raw
+    `content_canonical_election.c.canonical_sig_id`, or deleting
+    `not_tombstoned` outright, changed nothing any test could see. A fix nothing
+    asserts is a fix that comes back out on the next refactor.
+    """
+
+    # NOTE: the "feed publishes the guarded column" assertion deliberately lives
+    # in tests/test_pivota_canonical_routes.py, against the SQL the route
+    # actually issues. A version of it here — compiling
+    # `_elected_canonical_sig_column` directly — passed even with the route
+    # reverted to the raw column, because the helper still existed. Testing the
+    # helper proves the helper works, not that anything calls it.
+
+    def test_election_candidates_exclude_tombstoned_rows(self):
+        """The BLOCKER fix: never crown a step-5 dedupe loser.
+
+        #1833 points every tombstone at its keeper INSIDE the same content_key.
+        If the election could crown the tombstone, the two would canonicalise
+        one group in opposite directions and the live keeper would end up
+        pointing at the duplicate it replaced.
+        """
+        for widen in (False, True):
+            sql = _compile(candidates_query(widen=widen))
+            assert "suppression_reason IS NULL" in sql, (
+                f"tombstoned rows are electable (widen={widen})"
+            )
+
+    def test_the_guard_also_excludes_tombstones(self):
+        """Same rule on the read side, or a pre-existing election survives it."""
+        from services.canonical_sitemap_candidates import electable_sig_exists
+
+        sql = _compile(
+            select(electable_sig_exists(literal_column("'sig_x'"), widen=False))
+        )
+        assert "cp_elected.suppression_reason IS NULL" in sql
 
 
 class TestCandidateSetMatchesTheFeed:

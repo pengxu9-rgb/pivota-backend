@@ -45,7 +45,7 @@ from datetime import datetime
 from typing import Any, Awaitable, Dict, Optional, TypeVar
 
 from fastapi import APIRouter, HTTPException, Query, status
-from sqlalchemy import String, and_, case, column, func, null, or_, select, table
+from sqlalchemy import String, and_, column, func, or_, select, table
 
 from db.catalog import catalog_merchants, catalog_products
 from db.database import database
@@ -192,8 +192,12 @@ def _renderable_column():
     return pdp_renderable_expression(catalog_products).label("renderable")
 
 
-def _elected_canonical_sig_column(widen: bool):
-    """The elected canonical sig — but ONLY while it is still advertisable.
+def _elected_canonical_sig_note():
+    """WHY the feed's `canonical_sig_id` is validated, and where.
+
+    The validation itself is in the election JOIN's ON clause (see
+    ``list_canonical_pdp_signatures``); this note is the reasoning, kept next to
+    the other column helpers so it is findable.
 
     A stored election is a durable fact; electability is a live one. When the
     elected sig stops rendering (P3 moved 2,051 rows on that field in a day, and
@@ -213,19 +217,6 @@ def _elected_canonical_sig_column(widen: bool):
     consumer already handles by falling back to self — so both surfaces fall
     back TOGETHER, which is the invariant.
     """
-    return (
-        case(
-            (
-                electable_sig_exists(
-                    content_canonical_election.c.canonical_sig_id, widen=widen
-                ),
-                content_canonical_election.c.canonical_sig_id,
-            ),
-            else_=null(),
-        )
-        .cast(String)
-        .label("canonical_sig_id")
-    )
 
 
 def _shape_product_for_pdp(row: Dict[str, Any]) -> Dict[str, Any]:
@@ -535,7 +526,8 @@ async def list_canonical_pdp_signatures(
         index_pipeline_state.c.content_quality_score,
         index_pipeline_state.c.quality_scored_at,
         _renderable_column(),
-        _elected_canonical_sig_column(widen_sitemap),
+        # Already validated by the JOIN's ON clause below — see the note there.
+        content_canonical_election.c.canonical_sig_id,
     ]
     if widen_sitemap:
         select_cols.append(index_pipeline_state.c.index_eligible)
@@ -548,8 +540,28 @@ async def list_canonical_pdp_signatures(
         .select_from(
             serving_join.outerjoin(
                 content_canonical_election,
-                catalog_products.c.content_key
-                == content_canonical_election.c.content_key,
+                and_(
+                    catalog_products.c.content_key
+                    == content_canonical_election.c.content_key,
+                    # The validation lives in the ON clause, not the SELECT
+                    # list. Semantically identical — the EXISTS depends only on
+                    # cce.canonical_sig_id — but it is evaluated per MATCHED
+                    # ELECTION row instead of per product row, so the correlated
+                    # 3-table join plus pdp_renderable_expression's nested
+                    # EXISTS over external_product_seeds runs only where an
+                    # election actually exists. The feed pages up to 1000 rows
+                    # and already pays that predicate once per row for its own
+                    # `renderable` column; paying it twice per row would have
+                    # doubled the most expensive part of the query.
+                    #
+                    # A row whose election fails validation simply does not
+                    # match, so the LEFT JOIN yields NULL — which is exactly the
+                    # "no election" the consumer already falls back on.
+                    electable_sig_exists(
+                        content_canonical_election.c.canonical_sig_id,
+                        widen=widen_sitemap,
+                    ),
+                ),
             )
         )
         .where(where_clause)

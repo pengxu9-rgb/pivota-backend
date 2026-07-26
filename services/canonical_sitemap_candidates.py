@@ -278,13 +278,36 @@ def not_tombstoned(cp=None):
     loser. Landing both would point a live keeper at a tombstoned duplicate and
     silently undo a fix that is already in production.
 
-    Excluding tombstones makes the two agree by construction: the keeper is the
-    only electable member, so the election names it, the sitemap advertises it,
-    #1833 points the loser at it, and the keeper is self-canonical.
+    Excluding tombstones removes the DISAGREEMENT: the election can no longer
+    crown a loser, so it never points a keeper back at the duplicate it
+    replaced.
 
-    Deliberately scoped to ELECTABILITY, not to feed membership — whether a
-    tombstoned row should still be listed at all is #1833's question, not this
-    one. Here it simply stops being a candidate to HOLD the URL.
+    WHAT THIS DOES *NOT* FIX, stated plainly because an earlier version of this
+    docstring claimed it did. "The keeper is the only electable member" is false
+    whenever the keeper is not itself electable. Take a group of {T = tombstone,
+    renderable and eligible, carrying keeper -> K; K = keeper, clean but NOT
+    renderable}. Candidates are empty — T fails this predicate, K fails
+    renderability — so nothing is elected. But this rule is scoped to
+    ELECTABILITY, not to feed membership, so the feed still lists T with
+    renderable=true and the sitemap still advertises it; T's PDP gets no
+    election, #1833 fires, and T canonicalises at a K that 500s. That is the
+    dead-URL shape, arriving through #1833 rather than through here.
+
+    It is PRE-EXISTING — #1833 is already in production and its keeper LATERAL
+    has no renderability check at all — and it is not reachable through this
+    module, so closing it is #1833's follow-up, not a change to make quietly
+    here. The count of exposed rows is a one-query check: keeper-bearing
+    tombstones that are renderable+eligible whose in-group keeper is not
+    renderable.
+
+    Scope note on the field itself: `suppression_reason` is set without
+    `suppressed_at` by more writers than step-5 alone —
+    step5_duplicate_store_connection, step5_same_merchant_same_url_dup,
+    step5_campaign_clone_dup, cross_merchant_redundant_external_seed,
+    step5_orphan_seed_mirror, the d2_* identity-resolution reasons, and
+    external_brand_crawl_dup_listing. Every one is a dedupe/retirement marker,
+    so excluding all of them is right; stale_after_sync and
+    duplicate_canonical_merge_v1 DO set suppressed_at and were already out.
     """
     cp = catalog_products if cp is None else cp
     return cp.c.suppression_reason.is_(None)

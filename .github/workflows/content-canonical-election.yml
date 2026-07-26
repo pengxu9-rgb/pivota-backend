@@ -30,15 +30,50 @@ on:
         default: false
         type: boolean
       seed_from_sitemap:
-        description: "Sitemap URL/path to import incumbency from (blank = no seed)"
+        description: "Sitemap URL/path to import incumbency from"
         required: false
         default: "https://agent.pivota.cc/sitemap-products.xml"
         type: string
-  schedule:
-    # Every 6h at :52, trailing the sitemap cron so the incumbency it reads is
-    # the sitemap most recently published rather than the one about to be
-    # replaced. Offset off the hour to avoid the :00 runner crush.
-    - cron: "52 */6 * * *"
+      skip_seed:
+        # A separate boolean because BLANKING the field above does NOT disable
+        # seeding: GitHub's `A && B || C` yields C whenever B is falsy, and ''
+        # is falsy — so a blank input silently falls back to the default URL.
+        description: "Run WITHOUT importing sitemap incumbency"
+        required: false
+        default: false
+        type: boolean
+  # SCHEDULE DELIBERATELY DISABLED AT MERGE.
+  #
+  # Auto-applying would perform the runbook's one-time seeding step FOR the
+  # operator, and it would do so while the two counterpart PRs (PIVOTA-Agent
+  # #1832, pivota-agent-ui #283) are still unmerged — taking rollout ordering
+  # out of the operator's hands and contradicting
+  # docs/runbooks/content_canonical_election_rollout.md, which has the seed as a
+  # reviewed step 2 with a dry run first.
+  #
+  # ENABLE (uncomment) once both counterparts have merged AND deployed, and the
+  # seed has been applied and eyeballed once. Until then the sweep is available
+  # on demand via workflow_dispatch, which defaults to a dry run.
+  #
+  # The interval is the duplicate-exposure window: a stale election is guarded
+  # (readers degrade to "no election") but a guarded stale election means those
+  # content_keys quietly go back to being duplicates until this repairs them.
+  #
+  # schedule:
+  #   # Every 6h at :52. NOTE this LEADS agent-ui's sitemap cron
+  #   # (17 1,7,13,19 UTC) by ~25 minutes rather than trailing it, so the
+  #   # incumbency it reads is the sitemap about to be replaced. Convergence is
+  #   # unaffected — an out-of-order run falls through to the sig-class and
+  #   # lexicographic layers, which both sides compute identically — but if the
+  #   # ordering ever matters, move this to trail rather than lead.
+  #   - cron: "52 */6 * * *"
+
+# One sweep at a time. plan_elections reads its candidate snapshot OUTSIDE the
+# write transaction, so two overlapping runs could plan against the same state
+# and the later write would land on stale reasoning.
+concurrency:
+  group: content-canonical-election
+  cancel-in-progress: false
 
 jobs:
   content-canonical-election:
@@ -46,6 +81,12 @@ jobs:
     timeout-minutes: 15
     env:
       DATABASE_URL: ${{ secrets.DATABASE_URL }}
+      # Interpolated as an ENV VAR, never into the `run:` script text. A
+      # workflow_dispatch input spliced straight into bash is command injection
+      # against a job that holds the production DATABASE_URL — verified with
+      # `x"; echo $DATABASE_URL; #`, which printed the secret. Anyone with repo
+      # write can dispatch, so this is a write -> prod-credential escalation.
+      SEED_FROM_SITEMAP: ${{ (github.event_name == 'workflow_dispatch' && inputs.skip_seed) && '' || (github.event_name == 'workflow_dispatch' && inputs.seed_from_sitemap || 'https://agent.pivota.cc/sitemap-products.xml') }}
       DB_POOL_MIN_SIZE: "1"
       DB_POOL_MAX_SIZE: "2"
       PYTHONDONTWRITEBYTECODE: "1"
@@ -74,7 +115,8 @@ jobs:
           fi
           out_dir="reports/workflow_ops/content-canonical-election/${{ github.run_id }}"
           mkdir -p "${out_dir}"
-          seed="${{ github.event_name == 'workflow_dispatch' && inputs.seed_from_sitemap || 'https://agent.pivota.cc/sitemap-products.xml' }}"
+          # From the job env, NOT interpolated into this script. See the SEED_FROM_SITEMAP note above.
+          seed="${SEED_FROM_SITEMAP:-}"
           python scripts/elect_content_canonicals.py \
             ${seed:+--seed-from-sitemap "${seed}"} \
             | tee "${out_dir}/dry_run.json"
@@ -88,7 +130,8 @@ jobs:
           set -euo pipefail
           out_dir="reports/workflow_ops/content-canonical-election/${{ github.run_id }}"
           mkdir -p "${out_dir}"
-          seed="${{ github.event_name == 'workflow_dispatch' && inputs.seed_from_sitemap || 'https://agent.pivota.cc/sitemap-products.xml' }}"
+          # From the job env, NOT interpolated into this script. See the SEED_FROM_SITEMAP note above.
+          seed="${SEED_FROM_SITEMAP:-}"
           python scripts/elect_content_canonicals.py \
             --apply \
             ${seed:+--seed-from-sitemap "${seed}"} \
