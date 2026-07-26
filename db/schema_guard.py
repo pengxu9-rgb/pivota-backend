@@ -1194,6 +1194,33 @@ async def ensure_required_schema_light() -> None:
                     "ADD COLUMN IF NOT EXISTS rating_count INTEGER;"
                 )
             )
+            # mig 181: ONE canonical URL per content_key. 474 content_keys
+            # carry >1 sitemap-eligible renderable sig; every sibling serves
+            # identical content under a self-referential canonical tag. The
+            # sitemap and the gateway's `canonical` module must name the SAME
+            # winner, and the sticky answer (seeded from live sitemap
+            # incumbency) has to live somewhere both can read — here. See
+            # db/migrations/181_content_canonical_election.sql for the full
+            # rationale. Railway skips db/migrations/, so self-heal here.
+            await database.execute(
+                text(
+                    """
+                    CREATE TABLE IF NOT EXISTS content_canonical_election (
+                      content_key       TEXT PRIMARY KEY,
+                      canonical_sig_id  TEXT NOT NULL,
+                      election_reason   TEXT NOT NULL,
+                      elected_at        TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                      updated_at        TIMESTAMPTZ NOT NULL DEFAULT NOW()
+                    );
+                    """
+                )
+            )
+            await database.execute(
+                text(
+                    "CREATE INDEX IF NOT EXISTS idx_content_canonical_election_sig "
+                    "ON content_canonical_election (canonical_sig_id);"
+                )
+            )
             # ---------------------------------------------------------------
             # schema-guard-coverage backfill (migrations 103-165).
             # Railway fast-mode skips db/migrations/, so every ADD COLUMN from
