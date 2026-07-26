@@ -50,6 +50,7 @@ from sqlalchemy import Boolean, DateTime, Float, String, Text, and_, column, fun
 from db.catalog import catalog_merchants, catalog_products
 from db.database import database
 from services.claim_safety import substantiated_claims
+from services.pdp_content_depth import pdp_content_depth_expression
 from services.pdp_renderability import (
     EXTERNAL_SEED_MERCHANT_ID as _EXTERNAL_SEED_MERCHANT_ID,
     external_product_seeds,
@@ -178,6 +179,29 @@ def _renderable_column():
     worthless to a crawler; only the 500 is loud.
     """
     return pdp_renderable_expression(catalog_products).label("renderable")
+
+
+def _content_depth_column():
+    """EXISTS boolean: is there anything on this PDP worth citing?
+
+    The sibling question to ``renderable``, and independent of it: a URL can
+    render a perfect 200 and still be a chrome-only shell. Measured 2026-07-25
+    over all 3,326 live sitemap URLs, 364 of them (10.9%) carry no description,
+    no INCI and no dossier, and serve a median of 523 readable characters. No
+    rendering change can help them — there is no content behind them.
+
+    The predicate lives in :mod:`services.pdp_content_depth`; see that module
+    for why it is component-presence rather than a character threshold (the
+    threshold forms were measured and drop pages serving 1,210 readable chars),
+    and for why ``index_pipeline_state.content_quality_score`` cannot stand in
+    for it (70.9 average on the empty cohort vs 70.0 on the thin one).
+
+    Fail-OPEN: this is an ADVISORY field. It is emitted for the sitemap
+    generator to filter on; it does not gate ``serving_eligible`` and it does
+    not remove anything from this feed's own result set. Consumers drop on an
+    explicit ``false``, the same convention ``renderable`` uses.
+    """
+    return pdp_content_depth_expression(catalog_products).label("content_depth")
 
 
 def _flag_on(name: str) -> bool:
@@ -565,6 +589,7 @@ async def list_canonical_pdp_signatures(
         index_pipeline_state.c.content_quality_score,
         index_pipeline_state.c.quality_scored_at,
         _renderable_column(),
+        _content_depth_column(),
     ]
     if widen_sitemap:
         select_cols.append(index_pipeline_state.c.index_eligible)
@@ -606,6 +631,13 @@ async def list_canonical_pdp_signatures(
             # serving_eligible says "we want this public"; renderable says "the
             # PDP will actually render" — sitemap generation must require both.
             "renderable": bool(r["renderable"]),
+            # Content depth of the public PDP: does the row carry a
+            # description, an INCI list, or a published dossier — i.e. is there
+            # prose on the page, or only chrome? Independent of `renderable`:
+            # 364 of the 3,326 currently-advertised URLs render a clean 200 and
+            # are still a ~510-char shell. Advisory only; see
+            # _content_depth_column.
+            "content_depth": bool(r["content_depth"]),
             "index_eligible": (bool(r["index_eligible"]) if widen_sitemap else False),
             "blocker_code": r["blocker_code"],
             "blocker_detail": r["blocker_detail"],

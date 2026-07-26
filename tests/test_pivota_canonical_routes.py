@@ -193,6 +193,10 @@ def _row(sig_suffix: str, **overrides) -> Dict[str, Any]:
         # Row-grain PDP renderability (approved + live_read_enabled identity
         # listing). The feed exposes it; it does not filter on it.
         "renderable": True,
+        # Row-grain PDP content depth: description OR INCI OR dossier. Answers
+        # "is there prose on this page", where renderable answers "will the
+        # page answer at all". Also exposed, also unfiltered.
+        "content_depth": True,
         "suppressed_at": None,
         "index_eligible": False,
         "blocker_code": None,
@@ -414,6 +418,32 @@ def test_list_canonical_pdps_carries_renderable_without_filtering(env):
     by_sig = {i["sig_id"]: i for i in body["items"]}
     assert by_sig["sig_abc"]["renderable"] is True
     assert by_sig["sig_def"]["renderable"] is False  # listed, flagged dead
+    assert body["total"] == 3
+
+
+def test_list_canonical_pdps_carries_content_depth_without_filtering(env, monkeypatch):
+    """The thin-content floor is ADVISORY on this feed, exactly like renderable.
+
+    364 of the 3,326 URLs the sitemap advertised on 2026-07-25 answered a clean
+    200 and still served ~510 chars of chrome. The feed flags them so the
+    generator can drop them; it must not drop them itself, or every other
+    consumer of this endpoint silently loses rows it still needs.
+    """
+    from routes import pivota_canonical_routes as pcr
+
+    rows = list(pcr.database._rows)  # type: ignore[attr-defined]
+    rows[1] = {**rows[1], "renderable": True, "content_depth": False}
+    monkeypatch.setattr(pcr.database, "_rows", rows, raising=False)
+
+    res = env.get("/api/canonical/products")
+    assert res.status_code == 200
+    body = res.json()
+    by_sig = {i["sig_id"]: i for i in body["items"]}
+
+    assert by_sig["sig_abc"]["content_depth"] is True
+    # Renderable AND shallow: present in the feed, flagged for the generator.
+    assert by_sig["sig_def"]["content_depth"] is False
+    assert by_sig["sig_def"]["renderable"] is True
     assert body["total"] == 3
 
 
