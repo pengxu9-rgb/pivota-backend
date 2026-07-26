@@ -75,12 +75,21 @@ Dry run first (that is the default). Expected against the 2026-07-26 corpus:
 "content_keys":        4528
 "duplicate_groups":     474
 "redundant_urls":       551
-"moved_from_sitemap":   340      <-- READ THIS ONE
+"moved_from_sitemap":  ~340-360  <-- READ THIS ONE, and trust the run over this doc
 "replacements":           0      <-- structurally always 0 on a seed; ignore it
-"reasons": { "sole_candidate": ~4368, "sitemap_incumbent": ~131, ... }
+"reasons": { "sole_candidate": 4054, "dedupe_keeper": ~360, "sitemap_incumbent": ~114 }
 ```
 
-## ⚠️ THE SEED MOVES 340 LIVE URLs. That is a decision, not a no-op.
+## ⚠️ THE SEED MOVES ~350 LIVE URLs. That is a decision, not a no-op.
+
+Two independent measurements against prod, four hours apart, got **340** and
+**357**. Neither is authoritative — the corpus moves, and the tombstone set is
+derived by probing live PDPs — which is exactly why `moved_from_sitemap` exists:
+the dry run prints the real number for the corpus you are about to apply to.
+**Read it there, not here.** What both measurements agree on, and what matters:
+every single moved URL moves because the currently-advertised sig is a step-5
+dedupe TOMBSTONE, and **zero** move for any other reason. The incumbency seed
+holds perfectly everywhere else.
 
 An earlier version of this runbook called `"replacements": 0` the acceptance
 criterion and claimed the seed moved zero URLs. **Both were wrong**, and the
@@ -91,11 +100,11 @@ empty and `replacements` is structurally zero no matter what happens. The
 winner against the URL the live sitemap advertises today, and it prints
 **before** `--apply`.
 
-Measured by fetching all 1,025 duplicate-group member PDPs live: **340 of 4,528
-sitemap URLs (7.5%) change**, every one of them because the currently-advertised
-sig is a step-5 dedupe TOMBSTONE, so the keeper is elected instead. Zero move for
-any other reason — the incumbency seed holds perfectly across the 127
-tombstone-free duplicate groups. Sitemap size stays 4,528.
+Measured by fetching all 1,025 duplicate-group member PDPs live (#1833 is
+deployed, so a member whose live `rel=canonical` is not itself IS a tombstone,
+and the target is its keeper): **~350 of 4,528 sitemap URLs, about 7.5%,
+change** — every one because the currently-advertised sig is a step-5 dedupe
+TOMBSTONE, so the keeper is elected instead. Sitemap size stays 4,528.
 
 **Why this is right, and why it is not optional.** PIVOTA-Agent#1833 is already
 merged and deployed, so *today, in production*, those 340 URLs already serve
