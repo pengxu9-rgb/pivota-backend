@@ -238,7 +238,14 @@ def candidates_query(*, widen: Optional[bool] = None):
             # Rows with no minted sig pass the WIDENED identity term (they
             # qualify on content_key alone) but can never BE a URL, so they are
             # not candidates for holding one.
-            catalog_products.c.pivota_signature_id.isnot(None),
+            #
+            # LIKE, not just IS NOT NULL: under INDEX_ELIGIBLE_SITEMAP the
+            # identity term is satisfied by index_eligible alone, so a row whose
+            # pivota_signature_id is set but NOT sig_-shaped would otherwise be
+            # electable — and the stored value is what both readers hand to
+            # agent-ui to build a URL out of. The readers now re-check the shape
+            # too, but the right place to refuse is before it is stored.
+            catalog_products.c.pivota_signature_id.like("sig\\_%", escape="\\"),
         )
         .order_by(
             catalog_products.c.content_key.asc(),
