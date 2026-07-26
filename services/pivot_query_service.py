@@ -51,6 +51,9 @@ from services.offer_classification import (
 )
 from services.offer_seller_identity import derive_offer_seller_identity
 from services.pdp_category_classifier import category_path_prefix_for_query
+from services.pdp_renderability import (
+    sig_pdp_will_render_sql as _sig_pdp_will_render_sql,
+)
 from services.beauty_external_ranking import (
     BEAUTY_EXTERNAL_RANKING_AUDIT_VERSION,
     RankedExternalBeautyCandidate,
@@ -1119,6 +1122,14 @@ def _recall_relevance_v2_enabled() -> bool:
     )
 
 
+# Compiled once at import: "will the PDP for this sig answer 200?", keyed on the
+# citable lane's own sig expression. Module-level so the compile cost is paid at
+# import, not per query. See services.pdp_renderability.sig_pdp_will_render.
+_SIG_RENDERABLE_SQL = _sig_pdp_will_render_sql(
+    "COALESCE(apv.pivota_signature_id, p.pivota_signature_id)"
+)
+
+
 async def _fetch_citable_canonical_rows(
     *,
     query: str,
@@ -1224,6 +1235,15 @@ async def _fetch_citable_canonical_rows(
             -- NOTE: this SELECT is an f-string; never write a brace in here.
             COALESCE(apv.pivota_signature_id, p.pivota_signature_id)
                 AS pivota_signature_id,
+            -- Will the PDP for that exact sig answer 200? Both of get_pdp_v2's
+            -- gates. Keyed on the SAME COALESCE expression the URL is built from,
+            -- not on p's own sig — otherwise the flag could describe a different
+            -- row than the URL we emit, which is the precise class of lie this
+            -- signal exists to remove. Free here (this lane already reads
+            -- catalog_products); the single-item citation read pays a second
+            -- round trip instead, because its SQL is agent_pdp_v1's and that is
+            -- pinned to touch no catalog_products.
+            ({_SIG_RENDERABLE_SQL}) AS pdp_renderable,
             p.catalog_track,
             p.truth_tier,
             p.readiness_tier,

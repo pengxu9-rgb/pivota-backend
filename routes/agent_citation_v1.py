@@ -18,6 +18,7 @@ Contract: pivota-merchants-portal/docs/external-citation-api-contract.md
 from __future__ import annotations
 
 import asyncio
+import logging
 import os
 import time
 from typing import Any, Dict, Optional, Tuple
@@ -43,8 +44,10 @@ from routes.agent_pdp_v1 import (
 )
 from services.catalog_sync_service import pivota_canonical_pdp_url
 from services.claim_safety import substantiated_claims
+from services.pdp_renderability import sig_pdp_will_render_sql
 
 router = APIRouter(prefix="/agent/v1/citation", tags=["agent-citation"])
+logger = logging.getLogger(__name__)
 
 CITE_AS = "Pivota — agent.pivota.cc"
 SUMMARY_MAX = 200
@@ -198,16 +201,8 @@ def project_citation_item(row: Dict[str, Any]) -> Dict[str, Any]:
     # link. Dropping the requirement instead would hand away the moat on exactly
     # the rows we cannot yet link to.
     #
-    # SCOPE — THIS FIXES THE URL **FORM**, NOT ITS RENDERABILITY. A minted sig
-    # whose PDP fails either of ``get_pdp_v2``'s gates still gets its own (dead)
-    # sig URL here. Measured on the live feed: 879 of 5,887 rows are
-    # non-renderable (779 that are ``serving_eligible`` but whose content route
-    # does not resolve, plus 100 offer-free ``no_price`` rows admitted by
-    # ``INDEX_ELIGIBLE_READ``), and this endpoint answers 200 for them. Teaching
-    # this projection ``services.pdp_renderability.pdp_will_render_expression``
-    # — and substituting the content_key's renderable sibling, which exists for
-    # 229 of the 245 affected content_keys — is the follow-up; it needs a
-    # ``catalog_products`` join this content_key-grain projection does not have.
+    # #1592 fixed the URL's FORM. Whether that now-correct sig URL is FOLLOWABLE
+    # is a separate question, answered by ``attribution.url_renderable`` below.
     signature_id = str(row.get("pivota_signature_id") or "").strip()
     canonical_url = (
         pivota_canonical_pdp_url(signature_id)
@@ -241,6 +236,30 @@ def project_citation_item(row: Dict[str, Any]) -> Dict[str, Any]:
         "attribution": {
             "source": "Pivota",
             "canonical_url": canonical_url,
+            # CAN THE AGENT ACTUALLY FOLLOW canonical_url? Both of get_pdp_v2's
+            # gates, asked about the exact sig the URL above is built from
+            # (services.pdp_renderability.sig_pdp_will_render — the same predicate
+            # the sitemap feed and the canonical election use, so the three cannot
+            # disagree about one sig).
+            #
+            # THIS IS THE HONESTY SEAM ADR-007 NEEDS. A citation whose URL cannot
+            # be followed is not a citation, and until now this endpoint could not
+            # tell the difference: measured on the live feed 2026-07-26, 879 of
+            # 5,887 rows do not render (779 `serving_eligible` whose content route
+            # does not resolve, plus 100 offer-free `no_price` rows admitted by
+            # INDEX_ELIGIBLE_READ) and this endpoint answered 200 — with
+            # `attribution_required: true` — for every one of them.
+            #
+            # A SIGNAL, NOT A FILTER, and that asymmetry is the ADR: SLICE 1 exists
+            # so an offer-free row stays CITABLE, so we keep serving the content
+            # and tell the truth about the link. False means: quote and credit the
+            # CONTENT via `cite_as`, but do not emit the URL as a hyperlink.
+            #
+            # Null (not False) when there is no URL at all to characterise — a
+            # sig-less row. False would imply we checked a link we never had.
+            "url_renderable": (
+                bool(row.get("pdp_renderable")) if canonical_url else None
+            ),
             "cite_as": CITE_AS,
             "attribution_required": True,
         },
@@ -270,6 +289,10 @@ def _search_row_to_citation(row: Dict[str, Any]) -> Dict[str, Any]:
             # services/pivot_query_service._fetch_citable_canonical_rows. Absent
             # ⇒ null canonical_url, never the ck form (a guaranteed 500).
             "pivota_signature_id": row.get("pivota_signature_id"),
+            # Computed inline by that same query (it already reads
+            # catalog_products), keyed on the identical sig expression — so search
+            # never pays the single-item read's extra round trip.
+            "pdp_renderable": row.get("pdp_renderable"),
             "title": row.get("product_title"),
             "description": row.get("product_description"),
             "brand": row.get("brand"),
@@ -393,4 +416,54 @@ async def _resolve_citation_item(raw: str) -> Optional[Dict[str, Any]]:
     row = await database.fetch_one(sql, {"id": raw})
     if not row:
         return None
-    return project_citation_item(_row_to_dict(row))
+    row_dict = _row_to_dict(row)
+    row_dict["pdp_renderable"] = await _sig_renderable(
+        row_dict.get("pivota_signature_id")
+    )
+    return project_citation_item(row_dict)
+
+
+async def _sig_renderable(signature_id: Any) -> bool:
+    """Will the PDP for this sig answer 200? Both of get_pdp_v2's gates.
+
+    A SEPARATE ROUND TRIP, deliberately, rather than a column on the read above.
+    ``_query_for_id`` returns ``routes/agent_pdp_v1``'s SQL, and that module's
+    reads are pinned — by ``test_sql_uses_agent_pdp_view_indexed_lookup_paths`` —
+    to touch NONE of ``catalog_products`` / ``catalog_skus`` / ``catalog_offers``
+    / ``product_group_members`` / ``subject_resolve``. That pin is the entire
+    point of ``agent_pdp_view`` (migration 085: those five joins cost the old
+    gateway 200-700ms cold; the denormalized table targets <10ms p99), and a
+    second pin keeps the emergency
+    ``AGENT_PDP_V1_BYPASS_SERVING_ELIGIBILITY`` path free of
+    ``index_pipeline_state`` — the table it exists to bypass. Adding this
+    predicate to those SELECTs breaks both, so it does not go there.
+
+    Paying a second query HERE is fine and is not fine there: this endpoint is a
+    public, offer-free citation read with
+    ``Cache-Control: public, max-age=300, stale-while-revalidate=600`` in front of
+    it, so the cost is amortised across a 5-minute window per id, and it is not
+    the agent PDP render path.
+
+    FAIL-CLOSED on anything unexpected: no sig, a non-sig value, or a DB error ⇒
+    False, i.e. "do not follow this link". The alternative direction would claim a
+    URL is followable on the strength of a failed check.
+
+    The ``/api/agent/pdp`` route still emits its citable ``url`` with NO such
+    signal. Fixing that wants the flag MATERIALISED onto ``agent_pdp_view`` by the
+    assembler so the read stays one indexed SELECT — a schema + backfill change,
+    tracked separately rather than smuggled in here.
+    """
+    sig = str(signature_id or "").strip()
+    if not sig.startswith("sig_") or len(sig) <= len("sig_"):
+        return False
+    try:
+        value = await database.fetch_val(
+            f"SELECT ({sig_pdp_will_render_sql(':sig')}) AS pdp_renderable",
+            {"sig": sig},
+        )
+    except Exception:
+        logger.warning(
+            "citation_pdp_renderable_check_failed", exc_info=True, extra={"sig": sig}
+        )
+        return False
+    return bool(value)

@@ -126,6 +126,7 @@ from sqlalchemy import (
     case,
     column,
     func,
+    literal_column,
     or_,
     select,
     table,
@@ -623,6 +624,85 @@ def pdp_will_render_expression(cp=None):
     return and_(pdp_renderable_expression(cp), pdp_serving_gate_passes(cp))
 
 
+# Alias name for the correlated catalog_products lookup in
+# :func:`sig_pdp_will_render`. Distinctive on purpose: the compiled string is
+# embedded in hand-written SQL that already aliases catalog_products as ``p`` /
+# ``cp`` in places, and a collision would silently rebind the predicate to the
+# OUTER row (answering "does the outer row render" for every sig).
+_SIG_RENDER_CP_ALIAS = "_rsig_cp"
+
+
+def sig_pdp_will_render(sig_expr):
+    """EXISTS: will the PDP for THIS SIGNATURE answer HTTP 200?
+
+    :func:`pdp_will_render_expression` answers the same question but needs a
+    ``catalog_products`` row in scope. The READ surfaces do not have one — they
+    serve from ``agent_pdp_view``, which is ``content_key``-PRIMARY-KEY and
+    carries none of the columns the route half needs (``source_product_id``,
+    ``product_key``, ``platform``, ``source_system``, ``merchant_id``). This
+    wraps the composite in a correlated lookup keyed on the SIGNATURE so those
+    surfaces can ask it with nothing but a sig column.
+
+    WHY SIG GRAIN AND NOT content_key GRAIN — this is the load-bearing design
+    choice. A content_key can fan out to many ``catalog_products`` rows (up to 45
+    in prod), and "does ANY sibling render" is a DIFFERENT question from "does
+    the URL I just emitted render". The read surfaces emit a URL built from ONE
+    sig, so the honest signal is the one that describes THAT sig. Answering the
+    group question here would let a response say ``pdp_renderable: true`` next to
+    a ``canonical_url`` that 500s, merely because some other sibling is fine —
+    which is the same class of lie this whole line of work exists to remove.
+    (The group question is worth answering too, but as a SEPARATE field carrying
+    a sibling's URL — that is the substitution follow-up, not this signal.)
+
+    NULL / non-sig input ⇒ FALSE, for free: no ``catalog_products`` row has a
+    NULL ``pivota_signature_id`` matching a NULL comparand (SQL NULL semantics
+    make the ``=`` unknown, so EXISTS is false). That is the correct answer —
+    a row with no minted sig has no PDP URL at all, which is exactly why the
+    read surfaces now emit ``canonical_url: null`` for it (#1592).
+
+    ``sig_expr`` may be a column of an enclosing SELECT (e.g.
+    ``agent_pdp_view.c.pivota_signature_id``) or, for the hand-written-SQL
+    callers, a :func:`sqlalchemy.literal_column`. Correlation is safe either way
+    because the inner ``catalog_products`` alias lives in THIS subquery's own
+    FROM, so the nested EXISTS inside the composite bind to it rather than
+    escaping — the cartesian-product trap documented on
+    :func:`pdp_serving_gate_passes` does not apply here. Verified by compiling
+    the statement and asserting the alias never reaches an outer FROM
+    (tests/test_pdp_renderability.py).
+    """
+    cp = catalog_products.alias(_SIG_RENDER_CP_ALIAS)
+    return (
+        select(cp.c.product_key)
+        .where(
+            and_(
+                cp.c.pivota_signature_id == sig_expr,
+                pdp_will_render_expression(cp),
+            )
+        )
+        .exists()
+    )
+
+
+def sig_pdp_will_render_sql(sig_column: str) -> str:
+    """Raw-SQL twin of :func:`sig_pdp_will_render`, for hand-written SQL.
+
+    ``routes/agent_pdp_v1`` composes its reads as literal SQL strings (six
+    variants: the serving-gated, index_eligible-widened and emergency-bypass
+    forms of the content_key / signature / product_group lookups), so it cannot
+    take the SQLAlchemy expression. Compiled from the SAME expression rather
+    than hand-written, so the two cannot drift — the lesson from the three route
+    twins above, which needed an executable parity test precisely because they
+    WERE hand-kept.
+
+    ``sig_column`` is a SQL column reference in the caller's own scope, e.g.
+    ``"apv.pivota_signature_id"``. It is interpolated as SQL text, so it must be
+    a literal identifier the caller controls — never a request value.
+    """
+    return compile_pg(select(sig_pdp_will_render(literal_column(sig_column))))[
+        len("SELECT ") :
+    ].strip()
+
+
 def seed_route_resolves_sql(cp_alias: str = "cp") -> str:
     """Raw-SQL twin of :func:`_seed_route_resolves`, for hand-written SQL.
 
@@ -730,4 +810,6 @@ __all__ = [
     "pdp_serving_gate_passes",
     "pdp_will_render_expression",
     "seed_route_resolves_sql",
+    "sig_pdp_will_render",
+    "sig_pdp_will_render_sql",
 ]

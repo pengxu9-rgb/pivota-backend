@@ -71,21 +71,54 @@ def _row(**overrides: Any) -> Dict[str, Any]:
 
 
 class FakeDb:
-    def __init__(self, row: Optional[Dict[str, Any]]) -> None:
+    """Stub DB for the citation route.
+
+    ``fetch_val`` MUST exist even though only the renderability check uses it.
+    It did not, at first, and the consequence is worth recording: the route's
+    check is deliberately fail-closed (`except Exception -> False`), so a missing
+    method raised AttributeError, got swallowed, and every assertion about
+    `url_renderable` passed while the predicate never ran once. A fail-closed
+    guard and an incomplete stub silently agree on False.
+
+    ``renderable`` also accepts an exception instance, so the fail-closed path
+    can be tested on purpose rather than by accident.
+    """
+
+    def __init__(
+        self,
+        row: Optional[Dict[str, Any]],
+        *,
+        renderable: Any = True,
+    ) -> None:
         self._row = row
+        self._renderable = renderable
+        self.fetch_val_calls: list[Dict[str, Any]] = []
 
     async def fetch_one(self, query: Any, params: Any = None) -> Optional[Dict[str, Any]]:
         return self._row
 
+    async def fetch_val(self, query: Any, params: Any = None) -> Any:
+        self.fetch_val_calls.append({"query": query, "params": params})
+        if isinstance(self._renderable, BaseException):
+            raise self._renderable
+        return self._renderable
+
 
 @pytest.fixture
 def client_for(monkeypatch: pytest.MonkeyPatch):
-    def _make(row: Optional[Dict[str, Any]]) -> TestClient:
+    def _make(
+        row: Optional[Dict[str, Any]],
+        *,
+        renderable: Any = True,
+    ) -> TestClient:
         monkeypatch.setenv("INDEX_ELIGIBLE_READ", "1")
-        monkeypatch.setattr(cite, "database", FakeDb(row))
+        db = FakeDb(row, renderable=renderable)
+        monkeypatch.setattr(cite, "database", db)
         app = FastAPI()
         app.include_router(cite.router)
-        return TestClient(app)
+        client = TestClient(app)
+        client.fake_db = db  # type: ignore[attr-defined]
+        return client
 
     return _make
 
@@ -190,6 +223,81 @@ def test_attribution_url_is_null_without_a_minted_sig(client_for):
     assert body["attribution"]["attribution_required"] is True
     assert body["attribution"]["cite_as"] == "Pivota — agent.pivota.cc"
     assert "/products/" not in str(body)
+
+
+# ── attribution.url_renderable: is the cited URL actually followable? ────────
+
+
+def test_url_renderable_true_when_the_pdp_will_render(client_for):
+    client = client_for(_row(), renderable=True)
+    body = client.get("/agent/v1/citation/ck_0123456789abcdef0123456789abcdef").json()
+    assert body["attribution"]["url_renderable"] is True
+    # The predicate must actually have been consulted, keyed on the SAME sig the
+    # URL is built from. Without this the fail-closed `except` can hide a
+    # never-executed check (it did, before FakeDb grew fetch_val).
+    calls = client.fake_db.fetch_val_calls  # type: ignore[attr-defined]
+    assert len(calls) == 1
+    assert calls[0]["params"] == {"sig": _SIG_ITEM}
+    assert "catalog_products" in calls[0]["query"]
+    assert "index_pipeline_state" in calls[0]["query"]
+
+
+def test_url_renderable_false_when_the_pdp_will_not_render(client_for):
+    """The honesty seam: content still served, link flagged unfollowable.
+
+    879 of 5,887 live feed rows are in this state. The row must NOT be withheld —
+    ADR-007 SLICE 1 exists to keep offer-free rows citable — so the URL stays and
+    only the flag goes false.
+    """
+    client = client_for(_row(), renderable=False)
+    body = client.get("/agent/v1/citation/ck_0123456789abcdef0123456789abcdef").json()
+    assert body["attribution"]["url_renderable"] is False
+    # …and the citation is still fully usable as a CITATION.
+    assert body["attribution"]["canonical_url"] == f"https://agent.pivota.cc/products/{_SIG_ITEM}"
+    assert body["attribution"]["attribution_required"] is True
+    assert body["attribution"]["cite_as"] == "Pivota — agent.pivota.cc"
+    assert body["title"] and body["description"]
+
+
+def test_url_renderable_is_null_not_false_when_there_is_no_url(client_for):
+    """No URL to characterise ⇒ null. False would imply we checked a link."""
+    client = client_for(_row(pivota_signature_id=None), renderable=True)
+    body = client.get("/agent/v1/citation/ck_0123456789abcdef0123456789abcdef").json()
+    assert body["attribution"]["canonical_url"] is None
+    assert body["attribution"]["url_renderable"] is None
+    # No sig ⇒ the predicate is not even worth a round trip.
+    assert client.fake_db.fetch_val_calls == []  # type: ignore[attr-defined]
+
+
+def test_url_renderable_fails_closed_when_the_check_errors(client_for):
+    """A DB error must read as 'do not follow', never as followable."""
+    client = client_for(_row(), renderable=RuntimeError("pg down"))
+    body = client.get("/agent/v1/citation/ck_0123456789abcdef0123456789abcdef").json()
+    assert body["attribution"]["url_renderable"] is False
+    # The row is still served — a renderability check failure must not 500 a read.
+    assert body["title"].startswith("Anuko")
+
+
+def test_search_items_carry_url_renderable_from_the_recall_row(
+    client_for, monkeypatch: pytest.MonkeyPatch
+):
+    """Search gets the flag inline from its own catalog_products lane."""
+    client = client_for(_row())
+
+    async def fake_fetch(*, query, merchant_id, limit):
+        rows = _citable_rows()
+        rows[0]["pdp_renderable"] = True
+        rows[1]["pdp_renderable"] = False
+        return rows
+
+    monkeypatch.setattr(pqs, "_index_eligible_recall_enabled", lambda: True)
+    monkeypatch.setattr(pqs, "_fetch_citable_canonical_rows", fake_fetch)
+    items = client.get("/agent/v1/citation/search?q=hair&intent=inform").json()["items"]
+    assert items[0]["attribution"]["url_renderable"] is True
+    # Row B has no sig at all, so it has no URL to characterise → null, and the
+    # row's own pdp_renderable=False must not be mistaken for "we checked a link".
+    assert items[1]["attribution"]["canonical_url"] is None
+    assert items[1]["attribution"]["url_renderable"] is None
 
 
 @pytest.mark.parametrize("bad_sig", ["", "   ", "sig_", "ck_abc", "not-a-sig", None])
