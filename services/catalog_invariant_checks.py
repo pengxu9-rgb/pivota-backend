@@ -31,10 +31,28 @@ _SAMPLE_LIMIT = 5
 # pdp_identity_listing row exists" — the same belief the sitemap feed held, and
 # the same belief 29 live PDP fetches disproved on 2026-07-25 (rows with NO
 # identity listing at all render full 200s; rows with one render 500s). It now
-# compiles :func:`pdp_renderable_expression`, so the invariant and the feed
-# cannot disagree about what "renderable" means — and so a fix to the predicate
-# (P3's minted lane) moves this count and the sitemap in one step, instead of
-# leaving the alarm calibrated to a gap that no longer exists.
+# compiles :func:`pdp_renderable_expression`, so a fix to that predicate (P3's
+# minted lane) moves this count and the sitemap in one step, instead of leaving
+# the alarm calibrated to a gap that no longer exists.
+#
+# ⚠️ SINCE 2026-07-26 THIS CHECK AND THE FEED ASK DIFFERENT QUESTIONS, ON
+# PURPOSE. An earlier version of this comment claimed they "cannot disagree about
+# what renderable means". They now do, and the difference is deliberate: the
+# feed's `renderable` column compiles `pdp_will_render_expression` — the content
+# route AND get_pdp_v2's serving-eligibility gate — while this invariant stays on
+# the content-route half alone, because its threshold is a MEASURED baseline (1,
+# on prod) for the narrower question "the trust policy let this row reach 'public'
+# while the gateway has no resolvable content route". Folding the serving gate in
+# would redefine the alarm and decalibrate the threshold in one move, with no
+# re-measurement. Pinned by
+# test_public_not_renderable_invariant_stays_on_the_route_only_predicate.
+#
+# CONSEQUENCE, stated so it is not mistaken for coverage: nothing here alarms on a
+# row that is trust-`public` and fails the SERVING gate. With INDEX_ELIGIBLE_READ
+# on in prod, catalog_trust_policy can still promote an
+# `index_eligible AND NOT serving_eligible` row to 'public', so that class stops
+# being ADVERTISED (the feed drops it) without becoming MONITORED. A serving-gate
+# invariant is a separate check and needs its own measured baseline.
 _crt = table(
     "catalog_row_trust",
     column("subject_type", String),
