@@ -608,6 +608,18 @@ def test_list_canonical_pdps_uses_index_pipeline_state_join(env):
     assert "pdp_identity_listing" not in sql
     assert "live_read_enabled" not in sql
     assert "external_product_seeds" in sql
+    # …and, since 2026-07-26, the OTHER gate get_pdp_v2 refuses at. The
+    # `renderable` column asked only the content-route question, so the 100
+    # widen-only rows (index_eligible, serving_eligible=false, no_price) were
+    # advertised as renderable and served hard 500s — 77 of them in the live
+    # sitemap. The column is now the composite, which means the list query
+    # carries a CORRELATED EXISTS over index_pipeline_state IN ADDITION to the
+    # join used for the eligibility filter. Pinned here because this suite's
+    # FakeDb never evaluates the expression — it returns canned rows, so a
+    # `renderable` regression is invisible to every other test in this file.
+    # Semantics live in tests/test_pdp_renderability.py.
+    renderable_exists = sql.split(") AS renderable")[0].rsplit("CASE WHEN", 1)[-1]
+    assert "index_pipeline_state.serving_eligible IS true" in renderable_exists
     # Suppressed rows are withdrawn from the advertised feed.
     assert "catalog_products.suppressed_at IS NULL" in sql
 

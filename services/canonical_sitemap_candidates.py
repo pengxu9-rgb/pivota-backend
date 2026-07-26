@@ -39,7 +39,7 @@ from sqlalchemy import (
 )
 
 from db.catalog import catalog_merchants, catalog_products
-from services.pdp_renderability import pdp_renderable_expression
+from services.pdp_renderability import pdp_will_render_expression
 
 # Lightweight Core handle, mirroring the local-table pattern the canonical
 # routes already use rather than importing a full db.catalog Table (whose def
@@ -248,13 +248,25 @@ def sitemap_candidate_filter(*, widen: bool, cp=None, ips=None, cm=None):
 
 
 def renderable_expression():
-    """``pdp_renderable_expression`` over the un-aliased catalog_products.
+    """``pdp_will_render_expression`` over the un-aliased catalog_products.
 
     Kept here so the feed and the elector import renderability from the same
     place they import eligibility, and neither can pick up one without the
     other.
+
+    2026-07-26: repointed from ``pdp_renderable_expression`` (the content-route
+    half alone) to the composite that ALSO asks ``get_pdp_v2``'s
+    serving-eligibility gate. This is the landmine this module's own docstrings
+    warn about, and it was live: 77 of the 4,528 URLs in the prod sitemap were
+    route-resolvable, NOT serving-eligible (``blocker_code='no_price'``,
+    admitted by ``INDEX_ELIGIBLE_SITEMAP``), and served hard HTTP 500 — while
+    ``pdp_renderable_expression`` called every one of them renderable. 0 of the
+    474 duplicate groups contained such a row when measured, so no election
+    would have crowned one YET; the moment one did, the elected canonical would
+    be a dead URL and every live sibling PDP's ``rel=canonical`` would point at
+    it.
     """
-    return pdp_renderable_expression(catalog_products)
+    return pdp_will_render_expression(catalog_products)
 
 
 def not_tombstoned(cp=None):
@@ -322,10 +334,16 @@ def sitemap_electable_filter(*, widen: bool, cp=None, ips=None, cm=None):
     ``renderable`` degrades safely); the elector has no such consumer, so it
     folds the same predicate into SQL here. The two therefore agree on which
     rows are advertisable, which is the property the whole design rests on.
+
+    "The same predicate" is load-bearing and has to stay literally the same
+    function: :func:`pdp_will_render_expression`, which asks BOTH gates
+    ``get_pdp_v2`` refuses at. Asking only the content-route half here — which
+    is what this did until 2026-07-26 — is how the election could have crowned a
+    URL that returns 500. See :func:`renderable_expression`.
     """
     cp = catalog_products if cp is None else cp
     return and_(
         sitemap_candidate_filter(widen=widen, cp=cp, ips=ips, cm=cm),
-        pdp_renderable_expression(cp),
+        pdp_will_render_expression(cp),
         not_tombstoned(cp),
     )

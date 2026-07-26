@@ -23,6 +23,7 @@ from __future__ import annotations
 
 import pytest
 from sqlalchemy import (
+    Boolean,
     Column,
     MetaData,
     String,
@@ -37,8 +38,11 @@ from services.pdp_renderability import (
     MERCHANT_SYNCED_LANE_RENDERABLE,
     MERCHANT_SYNCED_PLATFORMS,
     MINTED_SOURCE_SYSTEM,
+    compile_pg,
     pdp_renderable_expression,
     pdp_route_resolvable,
+    pdp_serving_gate_passes,
+    pdp_will_render_expression,
     seed_route_resolves_sql,
 )
 
@@ -73,6 +77,10 @@ def engine():
         Column("platform", String),
         Column("source_system", String),
         Column("source_product_id", String),
+        # Only the serving-gate half reads this. The route-only twins never
+        # touch it, so the MATRIX rows leave it NULL and their answers are
+        # unaffected.
+        Column("content_key", String),
     )
     Table(
         "external_product_seeds",
@@ -80,6 +88,12 @@ def engine():
         Column("external_product_id", String),
         Column("attached_product_key", String),
         Column("status", String),
+    )
+    Table(
+        "index_pipeline_state",
+        md,
+        Column("content_key", String, primary_key=True),
+        Column("serving_eligible", Boolean),
     )
     md.create_all(eng)
     return eng, md
@@ -762,3 +776,287 @@ def test_seed_exists_stays_correlated_when_compiled_standalone():
     invariant = " ".join(_PUBLIC_NOT_RENDERABLE_COUNT_SQL.split())
     assert invariant.count("FROM external_product_seeds WHERE cp.") == 3
     assert "external_product_seeds, catalog_products" not in invariant
+
+
+# ---------------------------------------------------------------------------
+# THE SERVING-GATE HALF (2026-07-26). ``get_pdp_v2`` refuses at two gates; the
+# tests above cover only the content-route one. These cover the other, and the
+# composite that finally asks both.
+#
+# The cohort they pin: 77 of 4,528 live sitemap URLs served a hard HTTP 500 on
+# 2026-07-26 (77/77 on serial retry) while the feed called every one of them
+# renderable. Each passed the route gate and was rejected by the serving gate
+# with reason='no_price'. If the composite ever stops asking the serving gate,
+# the test named for that cohort fails.
+# ---------------------------------------------------------------------------
+
+# A route-resolvable mirror row — the route half is TRUE for every row here, so
+# whatever these tests measure is the serving half alone.
+_ROUTE_OK_ROW = {
+    "merchant_id": "external_seed",
+    "platform": "external_seed",
+    "source_system": "external_product_seeds_mirror_v1",
+    "source_product_id": "ext_serving_gate",
+    "content_key": "ck_1",
+}
+
+
+def _load_with_index_state(engine, *, content_key, serving_eligible, row=None):
+    """One route-resolvable catalog row + at most one index_pipeline_state row.
+
+    ``serving_eligible=None`` means NO index_pipeline_state row at all — the
+    fail-closed case, which is a different question from a row that exists and
+    says False.
+    """
+    eng, md = engine
+    cp = md.tables["catalog_products"]
+    eps = md.tables["external_product_seeds"]
+    ips = md.tables["index_pipeline_state"]
+    values = {**(row or _ROUTE_OK_ROW)}
+    with eng.begin() as conn:
+        conn.execute(cp.delete())
+        conn.execute(eps.delete())
+        conn.execute(ips.delete())
+        conn.execute(cp.insert().values(product_key="pk_1", **values))
+        conn.execute(
+            eps.insert().values(
+                external_product_id=values["source_product_id"],
+                attached_product_key=None,
+                status="active",
+            )
+        )
+        if serving_eligible is not None:
+            conn.execute(
+                ips.insert().values(
+                    content_key=content_key, serving_eligible=serving_eligible
+                )
+            )
+
+
+def _answers(engine):
+    """(route_only, serving_gate, composite) for the single loaded row."""
+    from db.catalog import catalog_products as real_catalog_products
+
+    eng, _ = engine
+    with eng.connect() as conn:
+        return tuple(
+            bool(x)
+            for x in conn.execute(
+                select(
+                    pdp_renderable_expression(real_catalog_products),
+                    pdp_serving_gate_passes(real_catalog_products),
+                    pdp_will_render_expression(real_catalog_products),
+                ).select_from(real_catalog_products)
+            ).one()
+        )
+
+
+def test_serving_eligible_row_renders(engine):
+    _load_with_index_state(engine, content_key="ck_1", serving_eligible=True)
+    assert _answers(engine) == (True, True, True)
+
+
+def test_the_no_price_cohort_is_route_resolvable_and_still_does_not_render(engine):
+    """THE REGRESSION PIN for the 77 dead sitemap URLs.
+
+    Route-resolvable (an active seed answers on its route key) and NOT
+    serving-eligible. The route-only predicate must keep saying True — the trust
+    layer and the three route twins depend on that answer and this change does
+    not touch it — while the composite the feed and the election read says
+    False.
+    """
+    _load_with_index_state(engine, content_key="ck_1", serving_eligible=False)
+    assert _answers(engine) == (True, False, False)
+
+
+def test_missing_index_pipeline_state_row_fails_closed(engine):
+    """No eligibility row ⇒ no render.
+
+    Mirrors ``shouldFailClosedForMissingPdpServingEligibility``, which returns
+    true whenever DATABASE_URL/PGHOST is set — i.e. always, in prod. A row the
+    index pipeline has never scored is not a row we may advertise.
+    """
+    _load_with_index_state(engine, content_key="ck_1", serving_eligible=None)
+    assert _answers(engine) == (True, False, False)
+
+
+def test_index_state_for_a_DIFFERENT_content_key_does_not_leak(engine):
+    """The join key is content_key, and it has to actually be checked.
+
+    A serving-eligible row for some OTHER content_key must not admit this one —
+    the failure mode a missing join predicate produces.
+    """
+    _load_with_index_state(engine, content_key="ck_somebody_else", serving_eligible=True)
+    assert _answers(engine) == (True, False, False)
+
+
+def test_serving_gate_cannot_rescue_a_dead_content_route(engine):
+    """serving_eligible=TRUE does not make an unroutable row renderable.
+
+    The composite is a conjunction; this pins that the route half survives it.
+    A url_audit row has neither a seed route nor a merchant upstream.
+    """
+    _load_with_index_state(
+        engine,
+        content_key="ck_1",
+        serving_eligible=True,
+        row={
+            "merchant_id": "merch_audit",
+            "platform": "url_audit",
+            "source_system": "url_audit",
+            "source_product_id": "audit-slug",
+            "content_key": "ck_1",
+        },
+    )
+    route_only, serving_gate, composite = _answers(engine)
+    assert (route_only, serving_gate, composite) == (False, True, False)
+
+
+def test_serving_gate_is_evaluated_PER_ROW_across_two_rows(engine):
+    """The behavioural correlation pin for the new EXISTS.
+
+    Same hazard as ``test_every_subquery_is_evaluated_PER_ROW_across_two_rows``:
+    uncorrelated, the serving EXISTS collapses to "some row somewhere is
+    serving_eligible" and admits the whole table. Two rows, both
+    route-resolvable, whose serving answers must DIFFER.
+    """
+    from db.catalog import catalog_products as real_catalog_products
+
+    eng, md = engine
+    cp = md.tables["catalog_products"]
+    eps = md.tables["external_product_seeds"]
+    ips = md.tables["index_pipeline_state"]
+    with eng.begin() as conn:
+        conn.execute(cp.delete())
+        conn.execute(eps.delete())
+        conn.execute(ips.delete())
+        for key, content_key, eligible in (
+            ("pk_live", "ck_live", True),
+            ("pk_no_price", "ck_no_price", False),
+        ):
+            conn.execute(
+                cp.insert().values(
+                    product_key=key,
+                    merchant_id="external_seed",
+                    platform="external_seed",
+                    source_system="external_product_seeds_mirror_v1",
+                    source_product_id=f"ext_{key}",
+                    content_key=content_key,
+                )
+            )
+            conn.execute(
+                eps.insert().values(
+                    external_product_id=f"ext_{key}",
+                    attached_product_key=None,
+                    status="active",
+                )
+            )
+            conn.execute(
+                ips.insert().values(
+                    content_key=content_key, serving_eligible=eligible
+                )
+            )
+
+        rows = dict(
+            conn.execute(
+                select(
+                    real_catalog_products.c.product_key,
+                    pdp_will_render_expression(real_catalog_products),
+                ).select_from(real_catalog_products)
+            ).all()
+        )
+
+    assert bool(rows["pk_live"]) is True
+    assert bool(rows["pk_no_price"]) is False, (
+        "the serving EXISTS went UNCORRELATED — it collapsed into a table-wide "
+        "constant; restore .correlate(cp) in services/pdp_renderability"
+    )
+
+
+def test_serving_exists_stays_correlated_when_compiled_standalone():
+    """compile_pg path: the serving EXISTS must name only index_pipeline_state.
+
+    Same cartesian-product hazard the seed EXISTS documents — an uncorrelated
+    compile emits ``FROM index_pipeline_state, catalog_products AS cp``, turning
+    a per-row answer into "is ANY row serving_eligible".
+
+    Compiles the COMPOSITE, not the serving predicate alone, and that is the
+    point rather than a convenience: the composite's CASE arm references ``cp``
+    outside every subquery, which is what gives the enclosing SELECT a FROM to
+    correlate against. Every real consumer has that property. The bare
+    predicate does NOT — see the correlation note in ``pdp_serving_gate_passes``
+    and the companion test below, which pins that limit rather than pretending
+    it away.
+    """
+    from db.catalog import catalog_products as real_catalog_products
+
+    cp = real_catalog_products.alias("cp")
+    normalized = " ".join(compile_pg(select(pdp_will_render_expression(cp))).split())
+    assert normalized.count("FROM index_pipeline_state WHERE cp.") == 1
+    assert "index_pipeline_state, catalog_products" not in normalized
+    assert normalized.count("FROM catalog_products AS cp") == 1
+
+
+def test_the_bare_serving_predicate_must_not_be_compiled_standalone():
+    """Pins the residual limit HONESTLY, so nobody rediscovers it in prod SQL.
+
+    ``.correlate(cp)`` needs an enclosing SELECT that already names ``cp``.
+    Compile the serving predicate BY ITSELF and there is nothing to correlate
+    to, so SQLAlchemy has to put catalog_products in the subquery's own FROM —
+    a cartesian product that answers "is ANY row serving_eligible", i.e. True
+    for every row as long as one row anywhere qualifies. ``correlate_except``
+    does not change this; verified.
+
+    Asserting the CURRENT (broken-in-isolation) output rather than a wish means
+    that if a future SQLAlchemy makes standalone compiles correlate properly,
+    this test fails and the warning in the docstring gets deleted deliberately
+    instead of rotting. Unreachable from any consumer — all of them select over
+    catalog_products — which is why this is a documented constraint and not a
+    bug to fix here.
+    """
+    from db.catalog import catalog_products as real_catalog_products
+
+    cp = real_catalog_products.alias("cp")
+    alone = " ".join(compile_pg(select(pdp_serving_gate_passes(cp))).split())
+    assert "FROM index_pipeline_state, catalog_products AS cp" in alone, (
+        "standalone compilation now correlates — delete the warning in "
+        "pdp_serving_gate_passes and this test together"
+    )
+
+    # …and the same predicate inside a query over catalog_products is correct.
+    inside = " ".join(
+        compile_pg(
+            select(cp.c.product_key, pdp_serving_gate_passes(cp)).select_from(cp)
+        ).split()
+    )
+    assert "FROM index_pipeline_state WHERE cp.content_key" in inside
+    assert "index_pipeline_state, catalog_products" not in inside
+
+
+def test_the_feed_column_asks_both_gates():
+    """The wiring pin: ``renderable`` on the feed is the COMPOSITE.
+
+    The whole defect was a consumer reading a route-only answer as though it
+    meant "this URL returns 200". Compiling the column and requiring the serving
+    EXISTS in it is what stops that regressing back to the narrow predicate.
+    """
+    from routes.pivota_canonical_routes import _renderable_column
+
+    normalized = " ".join(compile_pg(select(_renderable_column())).split()).lower()
+    assert "from index_pipeline_state" in normalized
+    assert "serving_eligible is true" in normalized
+
+
+def test_public_not_renderable_invariant_stays_on_the_route_only_predicate():
+    """The invariant is deliberately NOT repointed at the composite.
+
+    Its threshold is a measured baseline (1, on prod, post-P3) for the question
+    "trust says public but the gateway has no content route". Folding the
+    serving gate in would redefine the alarm and decalibrate the threshold in
+    one move, with no re-measurement. Kept as an explicit decision so a future
+    reader does not "fix" the inconsistency by accident — see
+    :func:`pdp_will_render_expression`'s docstring.
+    """
+    from services.catalog_invariant_checks import _PUBLIC_NOT_RENDERABLE_COUNT_SQL
+
+    assert "index_pipeline_state" not in _PUBLIC_NOT_RENDERABLE_COUNT_SQL
