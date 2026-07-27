@@ -240,6 +240,42 @@ def plan_elections(
         winner, reason = chosen
         if reason == REASON_STICKY:
             continue
+        # ALREADY CORRECT ⇒ NOT A PLANNED ELECTION, whatever rung chose it.
+        #
+        # REASON_STICKY above catches "we kept the stored winner", but the
+        # DEDUPE_KEEPER rung sits ABOVE stickiness and re-elects outright, so a
+        # group whose stored winner IS already the keeper reached this line and
+        # was planned as a write that changes nothing.
+        #
+        # Measured against prod after the 2026-07-26 seed: 587 of them. That
+        # single fact broke every counter in the sweep's report at once —
+        # `replacements` (fixed separately, in the Election below),
+        # `new_elections` = len(planned) - len(replacements), `already_correct`,
+        # and `written` = len(planned). The scheduled workflow alarms on
+        # `replacements` and the rollout runbook gates on BOTH `replacements: 0`
+        # AND `new_elections: 0`, so fixing only the first would have moved the
+        # unpassable gate rather than removed it: a converged corpus would still
+        # have printed `new_elections: 587, written: 587` while changing zero rows.
+        #
+        # This is the SAME question the write already asks server-side —
+        # UPSERT_ELECTION_SQL's `WHERE canonical_sig_id IS DISTINCT FROM
+        # EXCLUDED.canonical_sig_id` — so skipping here changes no write, only the
+        # report. It is what makes `written = len(planned)` true rather than
+        # merely plausible: every remaining row is a genuine change.
+        #
+        # Seed runs are unaffected: the table is empty, so `stored` is None
+        # everywhere and nothing is skipped.
+        #
+        # KNOWN CONSEQUENCE, deliberate: `election_reason` is no longer corrected
+        # when the sig stays put but the reason legitimately changes (e.g.
+        # `lexicographic` → `dedupe_keeper`), so that audit value can go stale.
+        # It already could — the conflict guard keys on `canonical_sig_id` alone,
+        # so the server would have discarded the reason update anyway. This makes
+        # it true by design instead of by accident. Correcting reasons needs the
+        # conflict guard widened to include `election_reason`, which is a separate
+        # decision about whether a reason-only change is worth a write.
+        if stored is not None and stored == winner:
+            continue
         planned.append(
             Election(
                 content_key=content_key,
@@ -265,10 +301,18 @@ def plan_elections(
                 # reaches the `REASON_STICKY` short-circuit above that would
                 # otherwise have skipped an unchanged winner.
                 #
-                # `written` was already honest — UPSERT_ELECTION_SQL carries
+                # The SQL was already honest — UPSERT_ELECTION_SQL carries
                 # `WHERE canonical_sig_id IS DISTINCT FROM EXCLUDED.canonical_sig_id`
-                # — which is why the DB was right while the report was not. This
-                # brings the report in line with the write.
+                # — so the DB was right while the report was not.
+                #
+                # `written` was NOT already honest, and an earlier draft of this
+                # comment claimed it was. It is `len(planned)` (see
+                # scripts/elect_content_canonicals.py), never a rowcount, so it
+                # counted no-op re-elections as writes; the "587 with written: 0"
+                # observation that seemed to prove otherwise came from a DRY RUN,
+                # where `written` is 0 unconditionally and says nothing about the
+                # apply path. The skip above is what actually makes it true, by
+                # removing no-ops from `planned` in the first place.
                 #
                 # Note this is the SECOND time this field has misled an operator in
                 # the opposite direction: on a SEED run the table is empty, so

@@ -311,11 +311,14 @@ class TestPlanElections:
             stored_by_content_key={"ck_1": keeper},
             keeper_by_content_key={"ck_1": keeper},
         )
-        assert len(planned) == 1
-        assert planned[0].election_reason == REASON_DEDUPE_KEEPER
-        assert planned[0].canonical_sig_id == keeper
-        # The winner did not move, so this is NOT a replacement.
-        assert planned[0].replaced is None
+        # NOT PLANNED AT ALL — stronger than "planned but not a replacement".
+        #
+        # An earlier fix only nulled `replaced`, which left the row in `planned`
+        # and merely moved the inflation to `new_elections` (= len(planned) -
+        # len(replacements)) and `written` (= len(planned)). The runbook gates on
+        # BOTH counters, so the unpassable gate had moved rather than gone. Now the
+        # no-op is dropped before it can reach any counter.
+        assert planned == []
 
     def test_a_genuine_keeper_move_is_still_recorded(self):
         """The counter must stay sensitive to real moves — not just quieter."""
@@ -715,3 +718,142 @@ class TestMultiRowUpsert:
 
         assert UPSERT_CHUNK_ROWS * 3 < 65535
         assert UPSERT_CHUNK_ROWS >= 100, "too small to meaningfully cut round trips"
+
+
+# ---------------------------------------------------------------------------
+# run_election's WRITE PATH — the code this whole change exists to alter
+# ---------------------------------------------------------------------------
+#
+# It had no coverage at all, and review mutation-testing proved the consequence:
+# slicing `planned[start : start + UPSERT_CHUNK_ROWS - 1]` (silently dropping one
+# election per chunk), and reverting to one execute per row (undoing the entire
+# fix), BOTH shipped with a green suite. These close that.
+
+
+class _FakeDb:
+    """Captures every (sql, params) the sweep issues. No server needed.
+
+    `transaction()` is an async context manager because the write is wrapped in
+    one, and that wrapping is itself part of the contract — all-or-nothing.
+    """
+
+    def __init__(self, *, candidates, stored=(), keepers=()):
+        self._candidates = candidates
+        self._stored = stored
+        self._keepers = keepers
+        self.executed: list = []
+        self.transactions = 0
+
+    async def fetch_all(self, query):
+        text = str(query)
+        if "content_canonical_election" in text:
+            return list(self._stored)
+        if "keeper" in text.lower():
+            return list(self._keepers)
+        return list(self._candidates)
+
+    async def execute(self, query, params=None):
+        self.executed.append((str(query), params or {}))
+
+    def transaction(self):
+        outer = self
+
+        class _Txn:
+            async def __aenter__(self):
+                outer.transactions += 1
+                return self
+
+            async def __aexit__(self, *exc):
+                return False
+
+        return _Txn()
+
+
+def _run_sweep(monkeypatch, *, rows, apply=True):
+    """Drive run_election against _FakeDb and return (report, fake)."""
+    import asyncio
+
+    import scripts.elect_content_canonicals as script
+
+    fake = _FakeDb(candidates=rows)
+    monkeypatch.setattr(script, "database", fake)
+    report = asyncio.run(script.run_election(apply=apply))
+    return report, fake
+
+
+class TestWritePath:
+    def _candidate_rows(self, n):
+        # One candidate per content_key -> one planned election each.
+        return [
+            {"content_key": f"ck_{i:05d}", "pivota_signature_id": "sig_" + f"{i:032x}"}
+            for i in range(n)
+        ]
+
+    def test_every_planned_election_is_written_exactly_once(self, monkeypatch):
+        """No election may be dropped by chunk arithmetic.
+
+        The mutation that motivated this (`+ UPSERT_CHUNK_ROWS - 1`) loses one row
+        per chunk — ~9 elections per sweep — and is invisible to any test that only
+        inspects the SQL builder.
+        """
+        from services.content_canonical_election import UPSERT_CHUNK_ROWS
+
+        n = UPSERT_CHUNK_ROWS * 2 + 7  # deliberately not a chunk multiple
+        report, fake = _run_sweep(monkeypatch, rows=self._candidate_rows(n))
+
+        assert report["written"] == n
+        written_keys = set()
+        for _sql, params in fake.executed:
+            written_keys |= {
+                v for k, v in params.items() if k.startswith("content_key_")
+            }
+        assert len(written_keys) == n
+        assert written_keys == {f"ck_{i:05d}" for i in range(n)}
+
+    def test_writes_are_batched_not_one_statement_per_row(self, monkeypatch):
+        """Pins the actual fix. Reverting to a per-row loop must fail here."""
+        from services.content_canonical_election import UPSERT_CHUNK_ROWS
+
+        n = UPSERT_CHUNK_ROWS * 2 + 7
+        _report, fake = _run_sweep(monkeypatch, rows=self._candidate_rows(n))
+
+        import math
+
+        expected = math.ceil(n / UPSERT_CHUNK_ROWS)
+        assert len(fake.executed) == expected, (
+            f"{n} elections issued {len(fake.executed)} statements; expected "
+            f"{expected}. A per-row loop would issue {n}."
+        )
+        # …and no chunk may exceed the cap.
+        for _sql, params in fake.executed:
+            assert len(params) <= UPSERT_CHUNK_ROWS * 3
+
+    def test_the_whole_write_is_one_transaction(self, monkeypatch):
+        _report, fake = _run_sweep(monkeypatch, rows=self._candidate_rows(1200))
+        assert fake.transactions == 1, "chunks must share one all-or-nothing txn"
+
+    def test_dry_run_writes_nothing(self, monkeypatch):
+        report, fake = _run_sweep(
+            monkeypatch, rows=self._candidate_rows(50), apply=False
+        )
+        assert fake.executed == []
+        assert fake.transactions == 0
+        assert report["written"] == 0
+
+
+class TestUpsertGuardsArePinnedNotJustDocumented:
+    def test_elected_at_is_never_overwritten_on_conflict(self):
+        """Migration 181 calls `elected_at == updated_at` the metric to alert on.
+
+        Adding `elected_at = NOW()` to the DO UPDATE SET destroys that signal and
+        was caught by nothing — the guarantee lived only in prose.
+        """
+        from services.content_canonical_election import (
+            _UPSERT_CONFLICT_TAIL,
+            upsert_elections_sql,
+        )
+
+        assert "elected_at" not in _UPSERT_CONFLICT_TAIL
+        head, _, tail = upsert_elections_sql(3).partition("ON CONFLICT")
+        assert "elected_at" in head, "still inserted on the INSERT path"
+        assert "elected_at" not in tail, "must not be touched on the UPDATE path"
