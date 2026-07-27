@@ -132,6 +132,26 @@ def _json_default(value: Any) -> Any:
     return str(value)
 
 
+def _clean_domain(value: Any) -> Optional[str]:
+    """Seed domain → the value `catalog_offers.source_domain` should carry.
+
+    Deliberately MINIMAL: trim, lowercase, empty→None. It does NOT strip `www.`
+    and does NOT parse URLs, because the consumers key on this column joined
+    against `external_product_seeds.domain` — the audit and the currency backfill
+    both read `coalesce(offer.source_domain, seed.domain)` as ONE key and group by
+    it. Normalising here but not there would split a single storefront into two
+    report rows and hide it under the per-domain `--min-offers` floor. Real seed
+    domains in prod include `www.jurlique.com`, so the `www.` is load-bearing for
+    that join.
+
+    Host normalisation belongs at the point of use, and already lives there:
+    `services.storefront_currency.normalize_domain` strips `www.` when building
+    the `/meta.json` URL. Store what the seed said; normalise when fetching.
+    """
+    text = str(value or "").strip().lower()
+    return text or None
+
+
 async def upsert_catalog_offer_from_seed_row(
     product_key: str,
     row_dict: Dict[str, Any],
@@ -186,6 +206,7 @@ async def upsert_catalog_offer_from_seed_row(
         list_price_value = float(raw_price) if raw_price is not None else None
     except (TypeError, ValueError):
         list_price_value = None
+
     offer_payload = {
         "source": OFFER_SOURCE_SYSTEM,
         "destination_url": row_dict.get("destination_url"),
@@ -202,14 +223,15 @@ async def upsert_catalog_offer_from_seed_row(
            offer_type, is_first_party, offer_mode,
            channel, availability, inventory_quantity, currency,
            list_price, merchant_effective_price, estimated_best_price,
-           price_confidence, source_system, source_ref, offer_payload)
+           price_confidence, source_system, source_ref, source_domain,
+           offer_payload)
         VALUES
           (:offer_id, :sku_key, :product_key, :merchant_id,
            :catalog_track, :truth_tier, :readiness_tier,
            :offer_type, :is_first_party, :offer_mode,
            :channel, :availability, :inventory_quantity, :currency,
            :list_price, :merchant_effective_price, :estimated_best_price,
-           :price_confidence, :source_system, :source_ref,
+           :price_confidence, :source_system, :source_ref, :source_domain,
            CAST(:offer_payload AS jsonb))
         ON CONFLICT (offer_id) DO UPDATE SET
           -- A KNOWN-retailer host is AUTHORITATIVE third-party evidence, so it
@@ -228,6 +250,11 @@ async def upsert_catalog_offer_from_seed_row(
           END,
           availability = EXCLUDED.availability,
           inventory_quantity = EXCLUDED.inventory_quantity,
+          -- FILL-ONLY (COALESCE keeps the stored value): this closes the audit
+          -- blind spot for new/refreshed rows without letting a re-seed clobber a
+          -- domain some other pass resolved more authoritatively. See below for
+          -- why writing it at all is the fix.
+          source_domain = COALESCE(catalog_offers.source_domain, EXCLUDED.source_domain),
           currency = EXCLUDED.currency,
           list_price = EXCLUDED.list_price,
           merchant_effective_price = EXCLUDED.merchant_effective_price,
@@ -259,6 +286,29 @@ async def upsert_catalog_offer_from_seed_row(
             ),
             "source_system": OFFER_SOURCE_SYSTEM,
             "source_ref": row_dict.get("id"),
+            # THE AUDIT BLIND SPOT, closed at the writer. This path never wrote
+            # source_domain, so its offers were invisible to
+            # scripts/audit_offer_currency.py — which scans live source_domains
+            # against each storefront's /meta.json. MEASURED on prod 2026-07-27:
+            # 4,718 of 18,809 live offers carry no source_domain, and 2,727 of
+            # those cannot be reached even through the backfill's attached-seed
+            # fallback. Those 2,727 are currency-unauditable.
+            #
+            # The value was already in hand — `domain` is in _SEED_OFFER_COLUMNS
+            # and is written into offer_payload two lines above — so this is
+            # provenance we were fetching, using, and then discarding at the
+            # column that the audit actually reads. No new network call, no new
+            # query: the only reason it was missing is that nobody wired it.
+            #
+            # Deliberately NOT derived: currency stays as the seed reports it.
+            # Resolving the store's real currency needs a live /meta.json fetch,
+            # and putting the network in this write path is the design prior
+            # reviews blocked (this function rides seed-write paths and must
+            # never raise). The founder chose the enrichment-pass design instead
+            # — scripts/backfill_offer_market_currency.py + its weekly cron —
+            # and writing source_domain here is precisely what lets that pass key
+            # on a real domain rather than guess through a seed join.
+            "source_domain": _clean_domain(row_dict.get("domain")),
             "offer_payload": json.dumps(
                 offer_payload, ensure_ascii=False, default=_json_default
             ),
