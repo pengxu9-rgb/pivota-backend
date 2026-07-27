@@ -20,14 +20,14 @@ def test_update_only_touches_usd_stamped_rows():
     # the currency='USD' guard is what makes it idempotent + mixed-currency-safe:
     # a row already bearing a real currency must be structurally untouchable.
     sql = mod._UPDATE_OFFERS_SQL.lower()
-    assert "upper(coalesce(o.currency,'')) = 'usd'" in sql
+    assert "upper(trim(coalesce(o.currency,''))) = 'usd'" in sql
     assert "set currency = :cur" in sql
     assert "source_system = any(:sources)" in sql
 
 
 def test_domain_scan_only_counts_usd_rows():
     sql = mod._DOMAINS_SQL.lower()
-    assert "upper(coalesce(o.currency, '')) = 'usd'" in sql
+    assert "upper(trim(coalesce(o.currency, ''))) = 'usd'" in sql
     assert "source_system = any(:sources)" in sql
 
 
@@ -68,7 +68,7 @@ def test_correct_only_guard_survives_both_scopes():
     """
     for live_only in (False, True):
         sql = mod.update_offers_sql(live_only).lower()
-        assert "upper(coalesce(o.currency,'')) = 'usd'" in sql
+        assert "upper(trim(coalesce(o.currency,''))) = 'usd'" in sql
         assert "source_system = any(:sources)" in sql
         assert "o.list_price > 0" in sql
 
@@ -117,3 +117,205 @@ def test_max_domains_and_apply_flags_exist():
     help_txt = buf.getvalue()
     assert "--max-domains" in help_txt
     assert "--apply" in help_txt
+
+
+# ---- BEHAVIOURAL tests --------------------------------------------------------
+# The tests above assert on SQL strings, which is enough for the predicates but
+# NOT for the operator controls. An adversarial review mutated `--only-domain`
+# to its exact INVERSE (write every domain EXCEPT the ones named), made
+# `--live-only` dead at runtime, disabled `--max-domains`, and swapped the
+# live/suppressed report columns — and the FULL suite stayed green through every
+# one of them. These drive `_run` end-to-end against a fake DB so that the
+# controls on a prod-writing script actually have coverage.
+
+import asyncio
+
+import pytest
+
+
+class _FakeDB:
+    """Minimal stand-in: answers the domain scan, records every UPDATE."""
+
+    is_connected = True
+
+    def __init__(self, scan_rows):
+        self._scan_rows = scan_rows
+        self.updates = []          # [(domain, currency, market, sql)]
+        self.scan_sql = None
+
+    async def connect(self):  # pragma: no cover - never called (is_connected)
+        pass
+
+    async def disconnect(self):  # pragma: no cover
+        pass
+
+    async def fetch_all(self, sql, params=None):
+        params = params or {}
+        if "UPDATE catalog_offers" in sql:
+            self.updates.append(
+                (params.get("domain"), params.get("cur"), params.get("mkt"), sql)
+            )
+            # RETURNING one row per relabelled offer; count is what the script prints
+            return [{"offer_id": "o1"}]
+        self.scan_sql = sql
+        return list(self._scan_rows)
+
+
+def _scan_row(domain, usd=10, live=0, suppressed=10):
+    return {
+        "domain": domain,
+        "usd_offers": usd,
+        "live_offers": live,
+        "suppressed_offers": suppressed,
+    }
+
+
+_META = {
+    "mintree.us": {"currency": "INR", "country": "IN"},
+    "reddane.co.za": {"currency": "ZAR", "country": "ZA"},
+    "lasavonneriedupilonduroy.com": {"currency": "EUR", "country": "FR"},
+}
+
+
+def _drive(monkeypatch, argv, scan_rows):
+    fake = _FakeDB(scan_rows)
+    monkeypatch.setattr(mod, "database", fake)
+
+    async def fake_meta(domain, **kwargs):
+        return _META.get(domain)
+
+    monkeypatch.setattr(mod, "fetch_storefront_meta", fake_meta)
+    rc = mod.main(argv)
+    return rc, fake
+
+
+def test_only_domain_writes_exactly_the_named_domains(monkeypatch):
+    """The inverse mutation (write everything EXCEPT the named domains) must fail
+    here. It survived the entire suite before this test existed."""
+    rc, fake = _drive(
+        monkeypatch,
+        ["--apply", "--max-domains", "5", "--only-domain", "mintree.us"],
+        [_scan_row("mintree.us"), _scan_row("reddane.co.za"),
+         _scan_row("lasavonneriedupilonduroy.com", live=57, suppressed=0)],
+    )
+    assert rc == 0
+    written = sorted(d for d, _c, _m, _s in fake.updates)
+    assert written == ["mintree.us"]
+
+
+def test_only_domain_is_case_insensitive(monkeypatch):
+    rc, fake = _drive(
+        monkeypatch,
+        ["--apply", "--max-domains", "5", "--only-domain", "MinTree.US"],
+        [_scan_row("mintree.us"), _scan_row("reddane.co.za")],
+    )
+    assert rc == 0
+    assert [d for d, *_ in fake.updates] == ["mintree.us"]
+
+
+def test_only_domain_repeats_accumulate(monkeypatch):
+    rc, fake = _drive(
+        monkeypatch,
+        ["--apply", "--max-domains", "5",
+         "--only-domain", "mintree.us", "--only-domain", "reddane.co.za"],
+        [_scan_row("mintree.us"), _scan_row("reddane.co.za"),
+         _scan_row("lasavonneriedupilonduroy.com", live=57, suppressed=0)],
+    )
+    assert rc == 0
+    assert sorted(d for d, *_ in fake.updates) == ["mintree.us", "reddane.co.za"]
+
+
+def test_only_domain_writes_the_currency_the_storefront_reported(monkeypatch):
+    """Correct-only is about WHICH rows; this is about WHAT value lands."""
+    _rc, fake = _drive(
+        monkeypatch,
+        ["--apply", "--max-domains", "5", "--only-domain", "reddane.co.za"],
+        [_scan_row("reddane.co.za")],
+    )
+    assert fake.updates[0][1] == "ZAR"
+    assert fake.updates[0][2] == "ZA"
+
+
+def test_dry_run_writes_nothing(monkeypatch):
+    _rc, fake = _drive(monkeypatch, [], [_scan_row("mintree.us")])
+    assert fake.updates == []
+
+
+def test_max_domains_refuses_and_writes_nothing(monkeypatch):
+    """The circuit breaker must actually break the circuit, not just print."""
+    rc, fake = _drive(
+        monkeypatch,
+        ["--apply", "--max-domains", "1"],
+        [_scan_row("mintree.us"), _scan_row("reddane.co.za")],
+    )
+    assert rc == 2
+    assert fake.updates == []
+
+
+def test_live_only_reaches_the_UPDATE_not_just_the_scan(monkeypatch):
+    """A `--live-only` honoured in the scan but dropped from the UPDATE survived
+    the whole suite. Assert the flag on the SQL that actually writes."""
+    _rc, fake = _drive(
+        monkeypatch,
+        ["--apply", "--max-domains", "5", "--live-only", "--only-domain", "mintree.us"],
+        [_scan_row("mintree.us")],
+    )
+    assert "o.suppressed_at IS NULL" in fake.scan_sql
+    assert "o.suppressed_at IS NULL" in fake.updates[0][3]
+
+
+def test_default_scope_reaches_the_UPDATE_without_the_filter(monkeypatch):
+    _rc, fake = _drive(
+        monkeypatch,
+        ["--apply", "--max-domains", "5", "--only-domain", "mintree.us"],
+        [_scan_row("mintree.us")],
+    )
+    assert "suppressed_at" not in fake.scan_sql or "IS NULL" not in fake.scan_sql
+    assert "suppressed_at" not in fake.updates[0][3]
+
+
+def test_unresolvable_storefront_is_never_written(monkeypatch):
+    """`fetch_storefront_meta` returning None means UNKNOWN. Never assume USD,
+    and never fabricate a currency — that is the bug this whole lane exists for."""
+    _rc, fake = _drive(
+        monkeypatch,
+        ["--apply", "--max-domains", "5"],
+        [_scan_row("loaskin.com")],   # absent from _META -> unresolved
+    )
+    assert fake.updates == []
+
+
+def test_usd_storefront_is_never_written(monkeypatch):
+    """A store that really IS USD is not a correction."""
+    monkeypatch.setitem(_META, "genuinely-us.com", {"currency": "USD", "country": "US"})
+    try:
+        _rc, fake = _drive(
+            monkeypatch, ["--apply", "--max-domains", "5"],
+            [_scan_row("genuinely-us.com")],
+        )
+        assert fake.updates == []
+    finally:
+        _META.pop("genuinely-us.com", None)
+
+
+def test_report_maps_live_and_suppressed_to_the_right_columns(monkeypatch, capsys):
+    """Swapping these two columns survived the suite. The 'you can see the domain
+    is entirely suppressed' safety argument rests entirely on this mapping."""
+    _drive(
+        monkeypatch, [],
+        [_scan_row("lasavonneriedupilonduroy.com", usd=57, live=57, suppressed=0)],
+    )
+    out = capsys.readouterr().out
+    assert "live=57 suppressed=0" in out
+
+
+def test_only_domain_typo_warns_loudly(monkeypatch, capsys):
+    """The silent failure mode is 'operator typed a domain, saw 0 written, read it
+    as already-corrected'."""
+    _rc, fake = _drive(
+        monkeypatch,
+        ["--apply", "--max-domains", "5", "--only-domain", "mintree.co"],
+        [_scan_row("mintree.us")],
+    )
+    assert fake.updates == []
+    assert "WARNING" in capsys.readouterr().out

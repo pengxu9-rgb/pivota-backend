@@ -49,6 +49,30 @@ US-converted price). currency-mismatch cannot tell that apart from a mislabelled
 foreign price, so the WEEKLY cron is DRY-RUN ONLY — a human reviews the by-domain
 report and runs --apply (workflow_dispatch) for the writes.
 
+KNOWN LIMIT OF THE DOMAIN ATTRIBUTION, stated because the correct-only guard does
+NOT cover it. "Correct-only" guarantees we only ever overwrite a DEFAULT-`USD`
+row; it does NOT guarantee the replacement currency is the right one, because the
+domain an offer is attributed to may not be its own. When `source_domain` is NULL
+the domain comes from a seed joined on `attached_product_key`, and the Path-C lane
+(`catalog_enrichment_agent_v1`) attaches SEVERAL seeds — with different domains —
+to one product_key. An offer can therefore be grouped under, and stamped with the
+currency of, a SIBLING seed's storefront.
+
+`ORDER BY eps.updated_at DESC, eps.id DESC` at least makes the choice
+deterministic and identical in the scan and the UPDATE. Without the `eps.id`
+tiebreaker two seeds sharing an `updated_at` could resolve differently between the
+dry-run a human reviewed and the --apply they then dispatched. It does not make
+the attribution CORRECT. Two consequences to hold in mind:
+  * a seed refresh between the dry-run and the apply can move offers between
+    domain groups — re-run the dry-run if the two are far apart in time;
+  * a domain's offer count can cross the `--min-offers` floor in either direction
+    as offers migrate, so a storefront reviewed last week can silently stop
+    appearing this week.
+The real fix is to attribute each offer to ITS OWN seed (`catalog_offers.
+source_ref` holds the seed id the dual-write projected from) rather than to the
+most-recent sibling. That changes which rows land in which group, so it needs its
+own measured change — it is not a scope tweak.
+
 Dry-run by default; --apply writes (guarded by --max-domains).
 
   DATABASE_URL=... python -m scripts.backfill_offer_market_currency
@@ -83,7 +107,7 @@ _SEED_SOURCES = (
 # `concat` parameter — Postgres cannot infer the type, SQLite never notices). A
 # constant clause chosen in Python has no type to infer.
 _LIVE_ONLY_FILTER = "AND o.suppressed_at IS NULL"
-_ALL_ROWS_FILTER = "-- suppressed rows IN SCOPE (data-honesty; see module docstring)"
+_ALL_ROWS_FILTER = "AND TRUE  /* suppressed rows IN SCOPE; see module docstring */"
 
 
 def _suppressed_filter(live_only: bool) -> str:
@@ -110,12 +134,12 @@ _DOMAINS_SQL_TEMPLATE = """
                         (SELECT nullif(btrim(eps.domain), '')
                          FROM external_product_seeds eps
                          WHERE eps.attached_product_key = o.product_key
-                         ORDER BY eps.updated_at DESC LIMIT 1)) AS domain
+                         ORDER BY eps.updated_at DESC, eps.id DESC LIMIT 1)) AS domain
         FROM catalog_offers o
         WHERE o.list_price > 0
           {suppressed_filter}
           AND o.source_system = ANY(:sources)
-          AND upper(coalesce(o.currency, '')) = 'USD'
+          AND upper(trim(coalesce(o.currency, ''))) = 'USD'
     ) t
     WHERE coalesce(domain, '') <> ''
     GROUP BY domain
@@ -134,11 +158,11 @@ _UPDATE_OFFERS_SQL_TEMPLATE = """
      WHERE o.source_system = ANY(:sources)
        AND o.list_price > 0
        {suppressed_filter}
-       AND upper(coalesce(o.currency,'')) = 'USD'
+       AND upper(trim(coalesce(o.currency,''))) = 'USD'
        AND coalesce(nullif(btrim(o.source_domain), ''),
                     (SELECT nullif(btrim(eps.domain), '') FROM external_product_seeds eps
                      WHERE eps.attached_product_key = o.product_key
-                     ORDER BY eps.updated_at DESC LIMIT 1)) = :domain
+                     ORDER BY eps.updated_at DESC, eps.id DESC LIMIT 1)) = :domain
     RETURNING o.offer_id
 """
 
@@ -216,7 +240,7 @@ async def _run(args: argparse.Namespace) -> int:
         print(f"=== {len(corrections)} domains to relabel ({total} USD-stamped offers); "
               f"{unresolved} domains unresolved (left as-is) ===")
         for c in corrections:
-            print(f"  {c['domain'][:32]:32} USD -> {c['true_currency']}/{c['true_market']} "
+            print(f"  {c['domain']:32} USD -> {c['true_currency']}/{c['true_market']} "
                   f"offers={c['usd_offers']} "
                   f"(live={c.get('live_offers', 0)} suppressed={c.get('suppressed_offers', 0)})")
         if not corrections:
@@ -256,8 +280,9 @@ def main(argv: Optional[List[str]] = None) -> int:
     p.add_argument("--max-domains", type=int, default=25,
                    help="refuse --apply if more than this many domains would be relabelled (0=off)")
     p.add_argument("--only-domain", action="append", metavar="DOMAIN",
-                   help="restrict --apply to this domain (repeatable). The dry-run "
-                        "still classifies everything; only the writes are narrowed.")
+                   help="restrict --apply to this domain (repeatable). Classification still "
+                        "runs over every domain; the selection and the writes are narrowed, "
+                        "and held-back domains are listed.")
     p.add_argument("--live-only", action="store_true",
                    help="pre-2026-07-27 scope: skip suppressed offers. Leaves rows "
                         "suppressed FOR a currency defect permanently mislabelled — "

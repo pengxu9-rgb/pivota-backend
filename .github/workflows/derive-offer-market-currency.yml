@@ -14,10 +14,25 @@ on:
         default: false
         type: boolean
       min_offers:
-        description: "Only consider domains with at least this many live offers"
+        description: "Only consider domains with at least this many offers"
         required: true
         default: "3"
         type: string
+      only_domains:
+        description: "Comma-separated domains to restrict the WRITES to (blank = all classified). Use this to apply a reviewed subset."
+        required: false
+        default: ""
+        type: string
+      max_domains:
+        description: "Refuse --apply if more than this many domains would be relabelled (0 = off)"
+        required: true
+        default: "25"
+        type: string
+      live_only:
+        description: "Skip suppressed offers (pre-2026-07-27 scope). Leaves rows suppressed FOR a currency defect permanently mislabelled."
+        required: false
+        default: false
+        type: boolean
   schedule:
     # Weekly, Monday 09:11 UTC. DRY-RUN ONLY — detects drift (new mispriced-ingest
     # domains) and uploads the report; it never writes. base-currency != a US
@@ -65,11 +80,29 @@ jobs:
           if [[ "${{ github.event_name }}" == "workflow_dispatch" && "${{ inputs.apply }}" == "true" ]]; then
             apply_flag="--apply"
           fi
+          live_only_flag=""
+          if [[ "${{ github.event_name }}" == "workflow_dispatch" && "${{ inputs.live_only }}" == "true" ]]; then
+            live_only_flag="--live-only"
+          fi
           min_offers="${{ inputs.min_offers || '3' }}"
+          max_domains="${{ inputs.max_domains || '25' }}"
+          # --only-domain is repeatable; expand the comma-separated input into one
+          # flag per domain. Built as an array so a stray space cannot word-split
+          # a domain into two bogus flags.
+          only_args=()
+          only_raw="${{ inputs.only_domains || '' }}"
+          if [[ -n "${only_raw}" ]]; then
+            IFS=',' read -ra _only <<< "${only_raw}"
+            for d in "${_only[@]}"; do
+              d="$(echo "${d}" | tr -d '[:space:]')"
+              [[ -n "${d}" ]] && only_args+=(--only-domain "${d}")
+            done
+          fi
           out_dir="reports/workflow_ops/derive-offer-market-currency/${{ github.run_id }}"
           mkdir -p "${out_dir}"
           python -m scripts.backfill_offer_market_currency \
-            --min-offers "${min_offers}" ${apply_flag} \
+            --min-offers "${min_offers}" --max-domains "${max_domains}" \
+            ${live_only_flag} "${only_args[@]+"${only_args[@]}"}" ${apply_flag} \
             | tee "${out_dir}/run.log"
 
       - name: Upload report
