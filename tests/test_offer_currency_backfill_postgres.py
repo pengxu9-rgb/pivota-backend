@@ -46,11 +46,51 @@ pytestmark = pytest.mark.skipif(
 # external_product_seeds is a lightweight `table()` construct, not a MetaData
 # Table, so `metadata.create_all` does not know it. Only the columns the
 # backfill's correlated subquery touches are needed.
-_LIGHTWEIGHT_DDL = """
-CREATE TABLE IF NOT EXISTS external_product_seeds (
-  id text, attached_product_key text, domain text, updated_at timestamp
-);
-"""
+#
+# CREATE TABLE IF NOT EXISTS IS NOT ENOUGH HERE, and assuming it was cost a red CI
+# run. The gate workflow runs EVERY `tests/test_*_postgres.py` file in ONE pytest
+# invocation against ONE database, and two sibling gates
+# (`test_citation_read_surfaces_postgres.py`, `test_pdp_content_depth_postgres.py`)
+# declare their own, DIFFERENT `external_product_seeds` — neither carries `id`,
+# `domain` or `updated_at`. Whichever file runs first wins; the others' CREATE
+# silently no-ops and their queries then die on `UndefinedColumnError`.
+# Alphabetical collection puts the citation gate first, so this file passed in
+# isolation locally and failed in CI: the exact "IF NOT EXISTS quietly did
+# nothing" trap, one level down from the defects this gate exists to catch.
+#
+# So: ADD COLUMN IF NOT EXISTS for every column, and for the SIBLINGS' columns
+# too, not just this gate's. Healing only our own columns is not enough — it fixes
+# the case where a sibling created the table, but breaks the mirror case where
+# THIS file creates it and the siblings' CREATE then no-ops (verified: running
+# this file first turns the other two red). The siblings have no ALTERs of their
+# own, so the union has to be guaranteed by whoever gets there first.
+#
+# Both siblings declare the same seven columns; ours are `id`, `domain`,
+# `updated_at`. Additive and safe in either direction — every gate inserts with an
+# explicit column list, so extra nullable columns are invisible to all of them.
+#
+# The real fix is one shared fixture in conftest instead of three files racing to
+# define the same table. That is a refactor across gates this PR does not own; the
+# union here makes the gate order-independent today, which is what unblocks it.
+_SEED_COLUMNS = (
+    # this gate's
+    ("id", "text"),
+    ("domain", "text"),
+    ("updated_at", "timestamp"),
+    # the sibling gates' (test_citation_read_surfaces / test_pdp_content_depth)
+    ("external_product_id", "text"),
+    ("attached_product_key", "text"),
+    ("status", "text"),
+    ("merchant_id", "text"),
+    ("source", "text"),
+    ("product_key", "text"),
+    ("source_product_id", "text"),
+)
+
+_LIGHTWEIGHT_DDL = "CREATE TABLE IF NOT EXISTS external_product_seeds (id text);\n" + "\n".join(
+    f"ALTER TABLE external_product_seeds ADD COLUMN IF NOT EXISTS {name} {typ};"
+    for name, typ in _SEED_COLUMNS
+)
 
 
 @pytest.fixture(scope="module")
