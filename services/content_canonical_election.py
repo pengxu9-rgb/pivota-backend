@@ -245,7 +245,39 @@ def plan_elections(
                 content_key=content_key,
                 canonical_sig_id=winner,
                 election_reason=reason,
-                replaced=stored,
+                # ONLY when the winner actually CHANGES. This was an unconditional
+                # `replaced=stored`, which made `replaced` truthy whenever a
+                # content_key had any stored winner — including when the newly
+                # chosen winner is that very same sig.
+                #
+                # It is not a cosmetic counter. `replacements` is what the
+                # scheduled workflow alarms on ("N elected canonical URL(s) MOVED
+                # — each is a live URL changing"), and what the rollout runbook
+                # names as its convergence gate. MEASURED against prod right after
+                # the 2026-07-26 seed: a steady-state sweep reported
+                # `replacements: 587` with `written: 0` — all 587 had
+                # `from == to`. So the alarm would have fired on EVERY 6h run
+                # forever, and the runbook's `replacements: 0` gate could never
+                # pass, on a corpus that is in fact perfectly converged.
+                #
+                # The 587 are the `dedupe_keeper` cohort specifically: that rung
+                # sits ABOVE the sticky rung, so it re-elects outright and never
+                # reaches the `REASON_STICKY` short-circuit above that would
+                # otherwise have skipped an unchanged winner.
+                #
+                # `written` was already honest — UPSERT_ELECTION_SQL carries
+                # `WHERE canonical_sig_id IS DISTINCT FROM EXCLUDED.canonical_sig_id`
+                # — which is why the DB was right while the report was not. This
+                # brings the report in line with the write.
+                #
+                # Note this is the SECOND time this field has misled an operator in
+                # the opposite direction: on a SEED run the table is empty, so
+                # `replacements` is structurally 0 no matter how many URLs move,
+                # which is why `moved_from_sitemap` had to be added. `replaced`
+                # answers "did the STORED value change", and it is only ever a
+                # proxy for "did a live URL move" — read `moved_from_sitemap` for
+                # the latter.
+                replaced=stored if stored and stored != winner else None,
             )
         )
     return planned

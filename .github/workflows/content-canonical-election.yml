@@ -89,6 +89,15 @@ jobs:
       SEED_FROM_SITEMAP: ${{ (github.event_name == 'workflow_dispatch' && inputs.skip_seed) && '' || (github.event_name == 'workflow_dispatch' && inputs.seed_from_sitemap || 'https://agent.pivota.cc/sitemap-products.xml') }}
       DB_POOL_MIN_SIZE: "1"
       DB_POOL_MAX_SIZE: "2"
+      # db/database.py defaults the asyncpg CONNECT timeout to 5s, which is tuned
+      # for in-cluster Railway (internal DNS, ~1ms RTT). This job runs on a GitHub
+      # runner and must reach Postgres over the PUBLIC proxy, where the TLS+auth
+      # handshake regularly exceeds 5s — measured 2026-07-26, an out-of-cluster
+      # seed failed at `database.connect()` with a bare TimeoutError on roughly
+      # half its attempts while a plain `asyncpg.connect(timeout=30)` to the same
+      # host succeeded every time. The failure is indistinguishable from an outage
+      # in the logs, so raise it rather than leave the sweep flaky.
+      DB_POOL_ACQUIRE_TIMEOUT_SECONDS: "45"
       PYTHONDONTWRITEBYTECODE: "1"
     steps:
       - name: Checkout

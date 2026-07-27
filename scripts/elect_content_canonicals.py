@@ -207,16 +207,48 @@ async def run_election(
         )
 
     if apply and planned:
+        # ONE PIPELINED BATCH, not a per-row await. This used to be
+        # `for election in planned: await database.execute(...)`, which is one
+        # network round trip per content_key — 4,266 of them on the seed run.
+        #
+        # MEASURED 2026-07-26, and it is not merely slow, it is FRAGILE: against
+        # prod over the Railway public proxy (~100ms RTT) the seed needed 7-10
+        # MINUTES, all of it inside a single transaction, and the script prints
+        # nothing until it finishes. Anything that interrupts the client mid-way —
+        # a CI job timeout, a laptop sleeping, an operator assuming it had hung —
+        # leaves an ORPHANED backend holding row locks on every content_key it had
+        # already inserted. Postgres does not notice the client is gone for many
+        # minutes (no TCP keepalive through the proxy), so the NEXT attempt blocks
+        # on those locks and looks like a connection hang, which invites another
+        # kill, which orphans another transaction. That is a self-amplifying
+        # failure and it cost this seed several attempts before the pattern was
+        # recognised (`idle in transaction`, 963s old, holding 2 locks, table
+        # still empty).
+        #
+        # `execute_many` sends the same statement with the same parameter sets
+        # over asyncpg's extended protocol, pipelined, so the wall clock stops
+        # scaling with RTT. Identical semantics: same SQL, same single
+        # transaction, same ON CONFLICT ... WHERE IS DISTINCT FROM (so a
+        # no-op re-election still writes nothing), and no return value was ever
+        # consulted per row — `written` has always been len(planned).
+        #
+        # The scheduled sweep gets the same benefit, which is the real point: its
+        # job has a 15-minute timeout, and a steady-state run writes ~0 rows so it
+        # never hit this, but the first run that has to re-elect a few thousand
+        # content_keys would have been one timeout away from the same lock pileup
+        # in CI, where nobody is watching to diagnose it.
         async with database.transaction():
-            for election in planned:
-                await database.execute(
-                    UPSERT_ELECTION_SQL,
+            await database.execute_many(
+                UPSERT_ELECTION_SQL,
+                [
                     {
                         "content_key": election.content_key,
                         "canonical_sig_id": election.canonical_sig_id,
                         "election_reason": election.election_reason,
-                    },
-                )
+                    }
+                    for election in planned
+                ],
+            )
         report["written"] = len(planned)
     else:
         report["written"] = 0

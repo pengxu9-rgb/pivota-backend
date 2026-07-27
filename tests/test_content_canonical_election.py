@@ -290,6 +290,44 @@ class TestPlanElections:
         assert planned[0].replaced == gone
         assert planned[0].canonical_sig_id == SIG_A
 
+    def test_re_electing_the_SAME_winner_is_not_a_replacement(self):
+        """`replaced` must mean the stored value CHANGED, not merely existed.
+
+        The dedupe_keeper rung sits above the sticky rung, so it re-elects
+        outright and never reaches the REASON_STICKY short-circuit that would skip
+        an unchanged winner. With an unconditional `replaced=stored` that made
+        every already-correct keeper look like a moved URL.
+
+        MEASURED against prod right after the 2026-07-26 seed: a steady-state
+        sweep reported `replacements: 587` alongside `written: 0`, and all 587 had
+        `from == to`. The scheduled workflow alarms on `replacements` ("N elected
+        canonical URL(s) MOVED — each is a live URL changing"), so it would have
+        warned on every 6h run forever, and the runbook's `replacements: 0`
+        convergence gate could never have passed, on a converged corpus.
+        """
+        keeper = "sig_" + "e" * 32
+        planned = plan_elections(
+            candidates_by_content_key={"ck_1": [SIG_A, keeper]},
+            stored_by_content_key={"ck_1": keeper},
+            keeper_by_content_key={"ck_1": keeper},
+        )
+        assert len(planned) == 1
+        assert planned[0].election_reason == REASON_DEDUPE_KEEPER
+        assert planned[0].canonical_sig_id == keeper
+        # The winner did not move, so this is NOT a replacement.
+        assert planned[0].replaced is None
+
+    def test_a_genuine_keeper_move_is_still_recorded(self):
+        """The counter must stay sensitive to real moves — not just quieter."""
+        keeper = "sig_" + "e" * 32
+        planned = plan_elections(
+            candidates_by_content_key={"ck_1": [SIG_A, keeper]},
+            stored_by_content_key={"ck_1": SIG_A},
+            keeper_by_content_key={"ck_1": keeper},
+        )
+        assert planned[0].canonical_sig_id == keeper
+        assert planned[0].replaced == SIG_A
+
     def test_content_key_with_zero_candidates_leaves_the_stored_row_alone(self):
         """Withdrawing the election would un-canonicalise every sibling page.
 
