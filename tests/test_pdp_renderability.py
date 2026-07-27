@@ -1242,3 +1242,136 @@ def test_the_serving_conjunct_is_unconditional_and_reads_no_flag(monkeypatch):
     # The serving conjunct is present in both, i.e. the equality above is not
     # trivially satisfied by the conjunct having vanished altogether.
     assert "index_pipeline_state.serving_eligible IS true" in without_flags
+
+
+# ---------------------------------------------------------------------------
+# sig_pdp_will_render — the read surfaces' entry point into the composite
+# ---------------------------------------------------------------------------
+#
+# These are Postgres-DIALECT COMPILE tests on purpose. The suite runs on SQLite,
+# and #1588 is the standing reminder of what that hides: a `func.concat` with an
+# untyped bind compiled fine, passed a green SQLite suite, and took
+# `GET /api/canonical/products` to a hard 500 in prod because Postgres could not
+# determine the parameter's type (reverted in #1590). Anything embedded in
+# hand-written SQL for a Postgres-only path needs a dialect-level pin.
+
+
+def test_sig_pdp_will_render_keeps_catalog_products_inside_the_exists():
+    """The correlated alias must never reach an OUTER FROM.
+
+    This is the cartesian trap documented on ``pdp_serving_gate_passes``: if the
+    inner ``catalog_products`` escapes to the enclosing FROM, the predicate stops
+    being per-sig and collapses into the global constant "does ANY renderable row
+    exist anywhere" — which is True in prod, so every row would report renderable
+    and the bug would be invisible in exactly the direction that matters.
+    """
+    from sqlalchemy import literal_column, select as _select
+
+    from services.pdp_renderability import compile_pg, sig_pdp_will_render
+
+    sql = " ".join(
+        compile_pg(
+            _select(
+                sig_pdp_will_render(
+                    literal_column("apv.pivota_signature_id")
+                ).label("pdp_renderable")
+            )
+        ).split()
+    )
+    # Whole statement is one SELECT of one EXISTS — no outer FROM at all.
+    assert sql.startswith("SELECT EXISTS (SELECT")
+    assert " AS pdp_renderable" in sql
+    assert "FROM catalog_products AS _rsig_cp" in sql
+    # The alias is referenced only inside the EXISTS; the outer statement has no
+    # FROM clause, so there is nothing for it to correlate wrongly against.
+    assert not sql.split(") AS pdp_renderable")[-1].strip().upper().startswith("FROM")
+    # It is keyed on the OUTER sig, not on a bind or a constant.
+    assert "_rsig_cp.pivota_signature_id = apv.pivota_signature_id" in sql
+
+
+def test_sig_pdp_will_render_asks_both_gates():
+    """Sig grain must not silently drop one of get_pdp_v2's two gates."""
+    from sqlalchemy import literal_column, select as _select
+
+    from services.pdp_renderability import compile_pg, sig_pdp_will_render
+
+    sql = " ".join(
+        compile_pg(
+            _select(sig_pdp_will_render(literal_column("apv.pivota_signature_id")))
+        ).split()
+    )
+    # Gate 1 — serving eligibility.
+    assert "index_pipeline_state.serving_eligible IS true" in sql
+    # Gate 2 — the content route, both seed lanes.
+    assert "external_product_seeds.external_product_id" in sql
+    assert "external_product_seeds.attached_product_key" in sql
+
+
+def test_sig_pdp_will_render_sql_is_an_embeddable_bare_expression():
+    """The raw-SQL twin must drop the SELECT and stay parenthesis-balanced.
+
+    It is interpolated into hand-written SELECT lists, so a stray leading SELECT
+    or an unbalanced paren is a syntax error at query time, not import time.
+
+    THE FIRST VERSION OF THIS TEST CHECKED ONLY THE HEAD, and that is where the
+    bug got through: SQLAlchemy labels an unlabelled expression automatically, so
+    slicing off `"SELECT "` left `... ) AS anon_1` on the tail. Every caller wraps
+    the fragment in parentheses, which puts a column alias inside a scalar
+    expression, and Postgres answers `syntax error at or near "AS"`. All four
+    original assertions passed. Nothing on SQLite ever executes these
+    Postgres-dialect strings, so the tail assertions below and
+    tests/test_citation_read_surfaces_postgres.py are the only things that see it.
+    """
+    from services.pdp_renderability import sig_pdp_will_render_sql
+
+    frag = sig_pdp_will_render_sql("apv.pivota_signature_id")
+    assert frag.startswith("EXISTS (")
+    assert not frag.upper().startswith("SELECT")
+    assert frag.count("(") == frag.count(")")
+    assert frag.endswith(")"), frag[-60:]
+    # Nothing may trail the closing paren — a label, an alias, anything.
+    assert frag.rsplit(")", 1)[-1] == ""
+    # No leftover format placeholders — these strings land in f-strings.
+    assert "{" not in frag and "}" not in frag
+    # It must be usable with a BIND too (the citation single-item read does this).
+    bound = sig_pdp_will_render_sql(":sig")
+    assert "_rsig_cp.pivota_signature_id = :sig" in bound
+
+
+def test_sig_pdp_will_render_matches_the_composite_it_wraps():
+    """The sig wrapper must not drift from pdp_will_render_expression.
+
+    Compares the wrapper's inner predicate against the composite compiled over
+    the same alias, so a change to either lane has to move both or fail here.
+    """
+    from sqlalchemy import literal_column, select as _select
+
+    from db.catalog import catalog_products as real_cp
+    from services.pdp_renderability import (
+        _SIG_RENDER_CP_ALIAS,
+        compile_pg,
+        pdp_will_render_expression,
+        sig_pdp_will_render,
+    )
+
+    composite = " ".join(
+        compile_pg(
+            _select(pdp_will_render_expression(real_cp.alias(_SIG_RENDER_CP_ALIAS)))
+        ).split()
+    )
+    # Strip the wrapper's own SELECT/FROM/key clause and compare the predicate body.
+    inner = " ".join(
+        compile_pg(
+            _select(sig_pdp_will_render(literal_column("apv.pivota_signature_id")))
+        ).split()
+    )
+    # Drop the SELECT keyword and SQLAlchemy's auto-generated column label; what
+    # remains is the predicate body, which must appear verbatim in the wrapper.
+    body = composite[len("SELECT ") :]
+    body = body.split(" FROM catalog_products AS ")[0]
+    body = body.rsplit(" AS anon_", 1)[0].strip()
+    assert body in inner, (
+        "sig_pdp_will_render no longer wraps pdp_will_render_expression verbatim; "
+        "the read surfaces would answer a different question from the sitemap "
+        "feed and the canonical election."
+    )

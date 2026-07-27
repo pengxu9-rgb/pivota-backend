@@ -290,6 +290,28 @@ def test_get_canonical_pdp_returns_product_for_existing_sig(env):
     assert p["platform"] == "shopify"
 
 
+def test_by_sig_read_tells_the_truth_about_its_own_canonical_url(env):
+    """The citation read must say whether the URL it emits is followable.
+
+    879 of 5,887 live feed rows do not render, and this route answered 200 with a
+    fully populated payload — canonical_url included — for every one of them. The
+    record was citable and the link was dead, which is worse than not serving it.
+
+    A SIGNAL, NOT A FILTER: `sig_def` is non-renderable and is still served with
+    full content, because ADR-007 SLICE 1 exists to keep such rows CITABLE.
+    """
+    renderable = env.get("/api/canonical/products/sig_abc").json()["product"]
+    assert renderable["renderable"] is True
+    assert renderable["canonical_url"] == "https://agent.pivota.cc/products/sig_abc"
+
+    dead = env.get("/api/canonical/products/sig_def")
+    assert dead.status_code == 200, "non-renderable rows stay CITABLE, not withheld"
+    dead_product = dead.json()["product"]
+    assert dead_product["renderable"] is False
+    # Content is still fully served — only the link is flagged.
+    assert dead_product["title"] and dead_product["brand"]
+
+
 def test_get_canonical_pdp_404_for_unknown_sig(env):
     client = env
     res = client.get("/api/canonical/products/sig_doesnotexist")

@@ -349,6 +349,28 @@ def _shape_product_for_pdp(row: Dict[str, Any]) -> Dict[str, Any]:
         "image_url": image or None,
         "main_image_url": image or None,
         "canonical_url": row.get("pivota_canonical_url"),
+        # WILL `canonical_url` ABOVE ACTUALLY ANSWER 200? Both of get_pdp_v2's
+        # gates, asked about THIS row's own sig — see
+        # services.pdp_renderability.sig_pdp_will_render.
+        #
+        # Why this field exists. This read is the CITATION surface: an agent that
+        # consumes it and follows canonical_url is the whole point of ADR-007.
+        # Measured on the live feed 2026-07-26, 879 of 5,887 rows do not render
+        # (779 that are serving_eligible but whose content route does not resolve,
+        # plus 100 offer-free `no_price` rows admitted by INDEX_ELIGIBLE_READ) and
+        # this route answered 200 with a fully populated payload for every one of
+        # them, canonical_url included. The record was citable; the URL was dead.
+        # A dead link attributed to us is worse than never having served the row.
+        #
+        # It is a SIGNAL, not a filter: the route deliberately still serves the
+        # row. ADR-007 SLICE 1 exists so an offer-free row stays CITABLE, and
+        # narrowing this gate to the renderer would make the citation floor
+        # uncitable — the opposite of the decoupling the ADR bought. So the honest
+        # move is to keep serving the content and tell the truth about the link.
+        #
+        # `renderable: false` means: cite the CONTENT, do not follow the URL.
+        # Consumers that need a followable URL should treat false as "no link".
+        "renderable": bool(row.get("renderable")),
         # Echo the merchant's own URL too (when set) so consumers can
         # link out to the storefront from the canonical PDP.
         "merchant_canonical_url": row.get("canonical_url"),
@@ -448,6 +470,15 @@ async def get_canonical_pdp_by_signature(sig_id: str) -> Dict[str, Any]:
             # surface substantiated, attributable claims for agents to cite.
             agent_pdp_view.c.evidence_profile,
             agent_pdp_view.c.required_disclaimers,
+            # Honest renderability of the canonical_url this response emits.
+            # Asked of catalog_products directly (this query already selects from
+            # it), so no extra join — unlike the agent_pdp_view-backed reads,
+            # which need sig_pdp_will_render's correlated lookup. Single-row
+            # read, so the nested EXISTS cost is negligible; the feed already
+            # pays the same predicate per row for up to 1,000 rows a page.
+            # Through the shared helper rather than a hand-copy: this expression
+            # drifting between its call sites is the documented failure mode.
+            _renderable_column(),
         )
         .select_from(
             catalog_products.join(

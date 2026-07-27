@@ -51,6 +51,22 @@ from services.offer_classification import (
 )
 from services.offer_seller_identity import derive_offer_seller_identity
 from services.pdp_category_classifier import category_path_prefix_for_query
+from services.canonical_sitemap_candidates import (
+    electable_sig_exists as _electable_sig_exists,
+)
+from services.pdp_renderability import (
+    compile_pg as _compile_pg,
+    sig_pdp_will_render_sql as _sig_pdp_will_render_sql,
+)
+from sqlalchemy import String as _SAString, and_ as _and_, column as _sacolumn
+from sqlalchemy import literal_column as _literal_column, select as _select, table as _satable
+
+# Migration 181, local Core handle (same pattern as the canonical routes).
+_cce = _satable(
+    "content_canonical_election",
+    _sacolumn("content_key", _SAString),
+    _sacolumn("canonical_sig_id", _SAString),
+)
 from services.beauty_external_ranking import (
     BEAUTY_EXTERNAL_RANKING_AUDIT_VERSION,
     RankedExternalBeautyCandidate,
@@ -1119,6 +1135,30 @@ def _recall_relevance_v2_enabled() -> bool:
     )
 
 
+# Compiled once at import: "will the PDP for this sig answer 200?", keyed on the
+# citable lane's own sig expression. Module-level so the compile cost is paid at
+# import, not per query. See services.pdp_renderability.sig_pdp_will_render.
+_SIG_RENDERABLE_SQL = _sig_pdp_will_render_sql(
+    "COALESCE(apv.pivota_signature_id, p.pivota_signature_id)"
+)
+
+# The content_key's elected canonical, validated against the live electable set —
+# correlated to this lane's own `p.content_key`, so it answers per row. Same
+# stored election (migration 181) and same validation helper the sitemap feed
+# uses; see routes/agent_citation_v1 for why a fourth independent opinion on
+# "which sibling holds the URL" is the thing to avoid.
+_ELECTED_CANONICAL_SIG_SQL = _compile_pg(
+    _select(_cce.c.canonical_sig_id)
+    .where(
+        _and_(
+            _cce.c.content_key == _literal_column("p.content_key"),
+            _electable_sig_exists(_cce.c.canonical_sig_id, widen=False),
+        )
+    )
+    .limit(1)
+)
+
+
 async def _fetch_citable_canonical_rows(
     *,
     query: str,
@@ -1224,6 +1264,21 @@ async def _fetch_citable_canonical_rows(
             -- NOTE: this SELECT is an f-string; never write a brace in here.
             COALESCE(apv.pivota_signature_id, p.pivota_signature_id)
                 AS pivota_signature_id,
+            -- Will the PDP for that exact sig answer 200? Both of get_pdp_v2's
+            -- gates. Keyed on the SAME COALESCE expression the URL is built from,
+            -- not on p's own sig — otherwise the flag could describe a different
+            -- row than the URL we emit, which is the precise class of lie this
+            -- signal exists to remove. Free here (this lane already reads
+            -- catalog_products); the single-item citation read pays a second
+            -- round trip instead, because its SQL is agent_pdp_v1's and that is
+            -- pinned to touch no catalog_products.
+            ({_SIG_RENDERABLE_SQL}) AS pdp_renderable,
+            -- The content_key's ELECTED canonical sig, intersected with the live
+            -- electable set, so a citable hit whose own PDP is dead can still be
+            -- given a URL that answers 200. Same stored election + same
+            -- validation the sitemap feed uses, so the cited URL is the
+            -- advertised URL. NULL today for every row: the table is unseeded.
+            ({_ELECTED_CANONICAL_SIG_SQL}) AS elected_canonical_sig,
             p.catalog_track,
             p.truth_tier,
             p.readiness_tier,
