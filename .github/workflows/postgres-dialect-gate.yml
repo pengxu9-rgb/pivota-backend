@@ -1,0 +1,285 @@
+name: Postgres Dialect Gate
+
+# THE GATE THAT WAS MISSING.
+#
+# This repo's test suite runs on SQLite. Every other CI job here proves the code
+# works against an engine production does not use. On 2026-07-26 that gap cost a
+# 16-minute prod outage: #1588 shipped a SQLAlchemy `concat` with an untyped bind
+# parameter, 149 tests passed, CI was green, two reviews signed off, and
+# `GET /api/canonical/products` returned a hard 500 to every caller the moment it
+# deployed (asyncpg `IndeterminateDatatypeError`). Reverted in #1590; relanded in
+# #1591 with the parameter typed.
+#
+# The failure class is *statement PREPARE*, not query results. Postgres refuses to
+# prepare a statement whose parameter type it cannot infer, and it refuses to
+# parse a fragment whose SQL is malformed. Neither is visible to SQLite, to a
+# dialect-compile assertion, or to code review — the 2026-07-27 sibling case
+# (#1593) was a compiled SQL fragment that still carried SQLAlchemy's implicit
+# `AS anon_1` label, so wrapping it in parens produced
+# `syntax error at or near "AS"` while 142 SQLite tests stayed green.
+#
+# (To be exact about the compile-assertion claim: a compile-level check CAN catch
+# a given regression once you know to write it — tests/test_pdp_content_depth.py
+# has one that would have. What it cannot do is catch the NEXT one, because the
+# assertion has to be authored against a defect you have already met. Executing
+# the statement needs no foreknowledge, which is the whole argument for this job.)
+#
+# So this job EXECUTES the real route against a real Postgres — today exactly one,
+# `list_canonical_pdp_signatures`, via the single gate file that exists. Empty
+# tables are deliberate: a populated fixture that is subtly wrong about
+# eligibility semantics produces exactly the false confidence this exists to
+# prevent. Row-level semantics stay in the SQLite matrices, which are the right
+# engine for them (fast, no server) — though note honestly that those matrices
+# are in no CI job either. That is a separate gap, not one this workflow closes.
+#
+# ── THE ONE GOTCHA ─────────────────────────────────────────────────────────────
+# `db/database.py` selects JSONB_TYPE from DATABASE_URL **at import time**. If
+# DATABASE_URL is not a Postgres URL before pytest imports anything, the modules
+# under test quietly bind generic JSON, the `pytestmark = skipif` in each gate
+# file skips the whole module, and this job goes GREEN having tested nothing.
+# That silent-skip is the only way this gate can lie, so: the preflight step
+# asserts the URL took effect, and the assertion step requires zero skips AND at
+# least one executed test per discovered gate module — `tests > 0` alone is not
+# enough, because the SQLite ride-along below satisfies it on its own.
+#
+# ── AND ITS MIRROR ─────────────────────────────────────────────────────────────
+# The same import-time selection runs the OTHER way here. Because DATABASE_URL is
+# Postgres for this whole job, the JSONB->JSON shim (db/database.py) is skipped,
+# so any test that builds its own SQLite fixture BREAKS under this env:
+#   tests/test_pdp_content_depth.py, sqlite : 38 passed
+#   tests/test_pdp_content_depth.py, here   :  3 passed, 35 errors
+#     CompileError: SQLiteTypeCompiler can't render element of type JSONB
+# So do NOT add a SQLite-fixture suite to the ride-along list without checking it
+# under a Postgres URL first. tests/test_pdp_renderability.py is on the list
+# precisely because it was checked and passes either way.
+#
+# ── ADDING A GATE FILE ─────────────────────────────────────────────────────────
+# Name it `tests/test_<something>_postgres.py` and it is picked up automatically.
+# Note the naming split, which is load-bearing:
+#   tests/test_*_postgres.py             -> dialect gates. Empty DB, run here.
+#   tests/test_*_postgres_integration.py -> heavier, need real data. NOT run here.
+
+on:
+  push:
+    branches:
+      - main
+  workflow_dispatch:
+  pull_request:
+    paths:
+      # Deliberately broad. The #1588 defect was one expression in one service,
+      # and a narrow path filter is how it would have skipped this gate. Anything
+      # that can end up inside a SQL statement belongs here.
+      - "routes/**"
+      - "services/**"
+      - "db/**"
+      - "models/**"
+      - "main.py"
+      # config/ SUPPLIES database_url — i.e. this gate's own premise — and
+      # utils/ is on the gated route's import path. Both were missing on the
+      # first cut, which is the narrow-filter mistake this comment warns about,
+      # made in the same file.
+      - "config/**"
+      - "utils/**"
+      - "tests/test_*_postgres.py"
+      # The compile-shape ride-along is not matched by the glob above, so it
+      # needs its own entry or a change to it would not run its own gate.
+      - "tests/test_pdp_renderability.py"
+      - "requirements.txt"
+      - "requirements-dev.txt"
+      - ".github/workflows/postgres-dialect-gate.yml"
+
+concurrency:
+  group: postgres-dialect-gate-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  postgres-dialect-gate:
+    name: execute real routes on real Postgres
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+
+    services:
+      postgres:
+        image: postgres:15
+        env:
+          POSTGRES_USER: postgres
+          POSTGRES_PASSWORD: postgres
+          POSTGRES_DB: pivota_dialect_check
+        ports:
+          - 5432:5432
+        # Without this the first connection races the container's own init.
+        options: >-
+          --health-cmd "pg_isready -U postgres"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+
+    env:
+      # Set at JOB level, not step level, so it is in the environment before
+      # pytest imports anything — see THE ONE GOTCHA above.
+      DATABASE_URL: postgresql://postgres:postgres@localhost:5432/pivota_dialect_check
+      PYTHONDONTWRITEBYTECODE: "1"
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: "pip"
+
+      - name: Install deps
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt -r requirements-dev.txt
+
+      - name: Preflight — prove the Postgres URL actually took effect
+        shell: bash
+        run: |
+          set -euo pipefail
+          python - <<'PY'
+          import os, sys
+
+          url = (os.getenv("DATABASE_URL") or "").strip()
+          if not url.startswith(("postgresql://", "postgres://")):
+              sys.exit(f"DATABASE_URL is not a Postgres URL: {url!r}")
+
+          # The import-time selection. If this is plain JSON, every module under
+          # test is bound to the wrong type and the gate proves nothing — which is
+          # precisely the state that let #1588 through, so fail here rather than
+          # pass a green run that tested SQLite semantics against a Postgres URL.
+          from db.database import IS_POSTGRES, JSONB_TYPE
+          from sqlalchemy.dialects.postgresql import JSONB
+
+          if not IS_POSTGRES:
+              sys.exit("db.database.IS_POSTGRES is False — the URL did not take effect")
+          if JSONB_TYPE is not JSONB:
+              sys.exit(f"JSONB_TYPE is {JSONB_TYPE!r}, expected postgresql.JSONB")
+          print("preflight ok: IS_POSTGRES=True, JSONB_TYPE=postgresql.JSONB")
+          PY
+
+      - name: Discover gate files
+        id: discover
+        shell: bash
+        run: |
+          set -euo pipefail
+          # `test_*_postgres.py` only — the `_postgres_integration.py` files need
+          # real data and are not dialect gates. See the header.
+          files=""
+          gate_modules=""
+          count=0
+          for f in tests/test_*_postgres.py; do
+            [ -e "$f" ] || continue
+            files="$files $f"
+            gate_modules="$gate_modules $(basename "$f" .py)"
+            count=$((count + 1))
+            echo "  $f"
+          done
+          if [ "$count" -eq 0 ]; then
+            echo "No tests/test_*_postgres.py files found." >&2
+            echo "This gate has nothing to run, which means it is not gating anything." >&2
+            exit 1
+          fi
+          echo "Found $count gate file(s)."
+          # The compile-shape guards ride along. They are SQLite-safe and cost
+          # under a second, and they are the other half of this story: a compiled
+          # SQL string can be malformed in ways only a shape assertion catches
+          # cheaply, and nothing else in CI runs them today either.
+          for f in tests/test_pdp_renderability.py; do
+            [ -e "$f" ] && files="$files $f"
+          done
+          echo "files=$files" >> "$GITHUB_OUTPUT"
+          # The gate modules alone, for the coverage assertion below. Bare module
+          # names, so the assertion can match junit `classname` attributes.
+          echo "gate_modules=$gate_modules" >> "$GITHUB_OUTPUT"
+
+      - name: Execute the routes on Postgres
+        id: run_gate
+        shell: bash
+        # Through `env:`, NOT interpolated straight into the script. `${{ }}` in a
+        # `run:` body is textual substitution before the shell ever sees it, so a
+        # file named `test_a;id;b_postgres.py` would EXECUTE `id`. Demonstrated,
+        # not theorised. Bounded here (pull_request, no secrets in this job) but
+        # it is the textbook pattern and costs one line to not have.
+        env:
+          GATE_FILES: ${{ steps.discover.outputs.files }}
+        run: |
+          set -euo pipefail
+          # shellcheck disable=SC2086  # word-splitting is intended: this is a file list
+          pytest -q -p no:cacheprovider \
+            --junitxml=pytest-postgres.xml \
+            $GATE_FILES
+
+      - name: Assert the gate actually gated
+        # Runs even when pytest failed, because a skipped run exits 0 and must
+        # still turn the job red. Skipped when the job is cancelled or when the
+        # run step never happened — otherwise an Install/Preflight failure would
+        # be masked by "could not read pytest-postgres.xml".
+        if: ${{ !cancelled() && steps.run_gate.conclusion != 'skipped' }}
+        shell: bash
+        env:
+          GATE_MODULES: ${{ steps.discover.outputs.gate_modules }}
+        run: |
+          set -euo pipefail
+          python - <<'PY'
+          import sys, xml.etree.ElementTree as ET
+
+          try:
+              root = ET.parse("pytest-postgres.xml").getroot()
+          except (OSError, ET.ParseError) as exc:
+              sys.exit(f"could not read pytest-postgres.xml: {exc}")
+
+          suites = root.findall("testsuite") or ([root] if root.tag == "testsuite" else [])
+          tests = sum(int(s.get("tests", 0)) for s in suites)
+          skipped = sum(int(s.get("skipped", 0)) for s in suites)
+          print(f"tests={tests} skipped={skipped}")
+
+          if tests == 0:
+              sys.exit("pytest collected 0 tests — the gate ran nothing")
+          if skipped:
+              sys.exit(
+                  f"{skipped} test(s) SKIPPED. The gate files skip themselves when "
+                  "DATABASE_URL is not a Postgres URL, so a skip here means this job "
+                  "is green while testing nothing."
+              )
+
+          # PER-MODULE COVERAGE. `tests > 0` is NOT sufficient and it is worth
+          # saying why: the SQLite compile-shape ride-along contributes ~50 of the
+          # ~51 tests here, so deleting every test function out of the Postgres
+          # gate file leaves this step green with tests=50, skipped=0 and ZERO
+          # statements executed against Postgres. Demonstrated, not theorised.
+          # Require each discovered gate module to have executed at least one
+          # test of its own.
+          import os
+
+          modules = [m for m in (os.getenv("GATE_MODULES") or "").split() if m]
+          if not modules:
+              sys.exit("GATE_MODULES is empty — the discover step produced no gate modules")
+
+          ran = set()
+          for case in root.iter("testcase"):
+              classname = case.get("classname") or ""
+              filename = case.get("file") or ""
+              for module in modules:
+                  if module in classname or module in filename:
+                      ran.add(module)
+
+          missing = [m for m in modules if m not in ran]
+          if missing:
+              sys.exit(
+                  "these gate modules executed no tests: "
+                  + ", ".join(missing)
+                  + ". The gate is green without having run anything against Postgres."
+              )
+          print(f"gate modules executed: {', '.join(sorted(ran))}")
+          PY
+
+      - name: Upload junit report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: postgres-dialect-gate-${{ github.run_id }}
+          path: pytest-postgres.xml
+          retention-days: 14
