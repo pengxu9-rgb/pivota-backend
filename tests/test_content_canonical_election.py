@@ -604,3 +604,114 @@ class TestSitemapParser:
         empty.write_text("<urlset></urlset>", encoding="utf-8")
         with pytest.raises(SystemExit, match="ZERO product URLs"):
             load_sitemap(str(empty))
+
+
+# ---------------------------------------------------------------------------
+# Multi-row upsert — one round trip per CHUNK, not per row
+# ---------------------------------------------------------------------------
+#
+# The sweep used to write one statement per content_key: 4,266 round trips on the
+# seed run, 7-30 minutes over the Railway public proxy, all in one transaction.
+# Interrupting that leaves an orphaned backend holding row locks, so the next
+# attempt blocks and looks like a connection hang — self-amplifying, and it cost
+# the 2026-07-26 seed several attempts.
+#
+# `databases.execute_many` is NOT a fix: its postgres backend loops over
+# `connection.execute` internally (verified in the installed 0.7.0 source). These
+# tests pin the real thing.
+
+
+class TestMultiRowUpsert:
+    def test_one_row_form_matches_the_single_row_statement(self):
+        """The two forms must stay the same statement, modulo param suffixes."""
+        from services.content_canonical_election import (
+            UPSERT_ELECTION_SQL,
+            upsert_elections_sql,
+        )
+
+        assert upsert_elections_sql(1).replace("_0", "") == UPSERT_ELECTION_SQL
+
+    def test_n_rows_produce_n_value_tuples_and_one_conflict_clause(self):
+        from services.content_canonical_election import upsert_elections_sql
+
+        sql = upsert_elections_sql(7)
+        assert sql.count("NOW(), NOW())") == 7
+        # ONE conflict clause for the whole statement — not one per row.
+        assert sql.count("ON CONFLICT") == 1
+        # The guard that keeps `written` honest must survive batching.
+        assert "IS DISTINCT FROM" in sql
+
+    def test_params_are_flat_and_positionally_suffixed(self):
+        from services.content_canonical_election import (
+            Election,
+            upsert_elections_params,
+            upsert_elections_sql,
+        )
+
+        rows = [
+            Election("ck_a", SIG_A, REASON_SOLE_CANDIDATE),
+            Election("ck_b", SIG_F, REASON_DEDUPE_KEEPER),
+        ]
+        params = upsert_elections_params(rows)
+        assert params == {
+            "content_key_0": "ck_a",
+            "canonical_sig_id_0": SIG_A,
+            "election_reason_0": REASON_SOLE_CANDIDATE,
+            "content_key_1": "ck_b",
+            "canonical_sig_id_1": SIG_F,
+            "election_reason_1": REASON_DEDUPE_KEEPER,
+        }
+        # Every placeholder in the SQL must have a value, and vice versa.
+        sql = upsert_elections_sql(len(rows))
+        for name in params:
+            assert f":{name}" in sql
+        import re
+
+        assert set(re.findall(r":([a-z_]+_\d+)", sql)) == set(params)
+
+    def test_duplicate_content_key_in_one_batch_is_refused(self):
+        """Postgres rejects a multi-row ON CONFLICT touching one target twice.
+
+        The per-row loop could never hit this, so batching introduces the failure
+        mode. `plan_elections` is keyed by content_key and cannot produce a
+        duplicate, but that is an invariant of another function — assert it here
+        rather than surfacing an opaque server error.
+        """
+        from services.content_canonical_election import (
+            Election,
+            upsert_elections_params,
+        )
+
+        with pytest.raises(ValueError, match="duplicate content_key"):
+            upsert_elections_params(
+                [
+                    Election("ck_dup", SIG_A, REASON_SOLE_CANDIDATE),
+                    Election("ck_dup", SIG_F, REASON_SOLE_CANDIDATE),
+                ]
+            )
+
+    def test_plan_elections_never_yields_a_duplicate_content_key(self):
+        """The upstream guarantee the batch write depends on."""
+        planned = plan_elections(
+            candidates_by_content_key={
+                "ck_1": [SIG_A, SIG_F],
+                "ck_2": [SIG_F],
+                "ck_3": [SIG_A, SIG_F, SIG_LEGACY],
+            },
+            stored_by_content_key={},
+        )
+        keys = [e.content_key for e in planned]
+        assert len(keys) == len(set(keys))
+
+    def test_row_count_must_be_positive(self):
+        from services.content_canonical_election import upsert_elections_sql
+
+        with pytest.raises(ValueError):
+            upsert_elections_sql(0)
+
+    def test_chunk_size_stays_under_the_postgres_parameter_cap(self):
+        """3 params per row; Postgres caps a statement at 65,535 binds."""
+        from services.content_canonical_election import UPSERT_CHUNK_ROWS
+
+        assert UPSERT_CHUNK_ROWS * 3 < 65535
+        assert UPSERT_CHUNK_ROWS >= 100, "too small to meaningfully cut round trips"

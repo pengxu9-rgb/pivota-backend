@@ -56,9 +56,11 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from db.database import database  # noqa: E402
 from services.content_canonical_election import (  # noqa: E402
     KEEPER_SIGS_SQL,
-    UPSERT_ELECTION_SQL,
+    UPSERT_CHUNK_ROWS,
     candidates_query,
     plan_elections,
+    upsert_elections_params,
+    upsert_elections_sql,
 )
 
 logger = logging.getLogger("elect_content_canonicals")
@@ -225,30 +227,36 @@ async def run_election(
         # recognised (`idle in transaction`, 963s old, holding 2 locks, table
         # still empty).
         #
-        # `execute_many` sends the same statement with the same parameter sets
-        # over asyncpg's extended protocol, pipelined, so the wall clock stops
-        # scaling with RTT. Identical semantics: same SQL, same single
-        # transaction, same ON CONFLICT ... WHERE IS DISTINCT FROM (so a
-        # no-op re-election still writes nothing), and no return value was ever
-        # consulted per row — `written` has always been len(planned).
+        # `databases.execute_many` IS NOT THE FIX, though it looks like it. Its
+        # postgres backend (0.7.0, verified in the installed source) is a plain
+        # Python loop over `connection.execute`, carrying the comment "asyncpg
+        # uses prepared statements under the hood, so we just loop through
+        # multiple executes here" — identical round-trip count, no pipelining.
+        # Reaching for it would have shipped a no-op wearing a fix's commit
+        # message.
+        #
+        # So: genuine multi-row INSERTs, chunked. 4,266 rows becomes 9 statements
+        # instead of 4,266, which takes the seed from tens of minutes to seconds
+        # and shrinks the interruption window with it.
+        #
+        # Same semantics as the loop it replaces: one transaction, the SAME
+        # ON CONFLICT ... WHERE IS DISTINCT FROM tail (shared verbatim via
+        # `_UPSERT_CONFLICT_TAIL`, so a no-op re-election still writes nothing),
+        # and no per-row return value was ever consulted — `written` has always
+        # been len(planned).
         #
         # The scheduled sweep gets the same benefit, which is the real point: its
-        # job has a 15-minute timeout, and a steady-state run writes ~0 rows so it
-        # never hit this, but the first run that has to re-elect a few thousand
+        # job has a 15-minute timeout and a steady-state run writes ~0 rows, so it
+        # never hit this — but the first run that has to re-elect a few thousand
         # content_keys would have been one timeout away from the same lock pileup
         # in CI, where nobody is watching to diagnose it.
         async with database.transaction():
-            await database.execute_many(
-                UPSERT_ELECTION_SQL,
-                [
-                    {
-                        "content_key": election.content_key,
-                        "canonical_sig_id": election.canonical_sig_id,
-                        "election_reason": election.election_reason,
-                    }
-                    for election in planned
-                ],
-            )
+            for start in range(0, len(planned), UPSERT_CHUNK_ROWS):
+                chunk = planned[start : start + UPSERT_CHUNK_ROWS]
+                await database.execute(
+                    upsert_elections_sql(len(chunk)),
+                    upsert_elections_params(chunk),
+                )
         report["written"] = len(planned)
     else:
         report["written"] = 0

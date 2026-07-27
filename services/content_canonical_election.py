@@ -48,7 +48,7 @@ that justifies moving a URL is that the current one has stopped working.
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Dict, Iterable, List, Optional, Sequence, Tuple
+from typing import Any, Dict, Iterable, List, Optional, Sequence, Set, Tuple
 
 from sqlalchemy import select
 
@@ -346,19 +346,94 @@ ORDER BY loser.content_key, keeper.pivota_signature_id
 """
 
 
-UPSERT_ELECTION_SQL = """
+_UPSERT_HEAD = """
 INSERT INTO content_canonical_election (
     content_key, canonical_sig_id, election_reason, elected_at, updated_at
-) VALUES (
-    :content_key, :canonical_sig_id, :election_reason, NOW(), NOW()
-)
+) VALUES """
+
+# ONE copy of the conflict clause, shared by the single-row and multi-row forms
+# below so they cannot drift. `elected_at` is NOT touched: it records when this
+# content_key FIRST got a canonical URL, so `elected_at = updated_at` stays a
+# clean "never moved" signal and a re-election is visible as the two diverging.
+#
+# The `IS DISTINCT FROM` guard is what makes `written` honest — a re-election that
+# picks the SAME sig updates nothing at all.
+_UPSERT_CONFLICT_TAIL = """
 ON CONFLICT (content_key) DO UPDATE SET
     canonical_sig_id = EXCLUDED.canonical_sig_id,
     election_reason  = EXCLUDED.election_reason,
-    -- elected_at is NOT touched: it records when this content_key FIRST got a
-    -- canonical URL, so `elected_at = updated_at` stays a clean "never moved"
-    -- signal and a re-election is visible as the two diverging.
     updated_at       = NOW()
 WHERE content_canonical_election.canonical_sig_id
       IS DISTINCT FROM EXCLUDED.canonical_sig_id
 """
+
+UPSERT_ELECTION_SQL = (
+    _UPSERT_HEAD
+    + "(:content_key, :canonical_sig_id, :election_reason, NOW(), NOW())"
+    + _UPSERT_CONFLICT_TAIL
+)
+
+# Postgres caps a statement at 65,535 bind parameters. At 3 per row that allows
+# ~21,845 rows, but chunk far below it: a smaller statement keeps the parse cost
+# and the peak memory sane, and bounds how much has to be re-sent if a chunk is
+# retried.
+UPSERT_CHUNK_ROWS = 500
+
+
+def upsert_elections_sql(row_count: int) -> str:
+    """Multi-row form of :data:`UPSERT_ELECTION_SQL` — ONE round trip for N rows.
+
+    WHY THIS EXISTS, and why the obvious alternative does not work. The sweep used
+    to write with ``for election in planned: await database.execute(UPSERT...)``,
+    i.e. one network round trip per content_key — 4,266 of them on the seed run,
+    which measured 7 to 30 MINUTES over the Railway public proxy with the whole
+    lot inside a single transaction. That is not merely slow: interrupt the client
+    mid-way and Postgres keeps an ORPHANED backend holding row locks on every
+    content_key already inserted (no TCP keepalive through the proxy), so the next
+    attempt blocks on those locks, looks like a connection hang, and invites
+    another kill. Self-amplifying; it cost the 2026-07-26 seed several attempts.
+
+    ``databases.Database.execute_many`` DOES NOT FIX THIS — verified against the
+    installed 0.7.0, whose postgres backend is a plain Python loop over
+    ``connection.execute`` with the comment "asyncpg uses prepared statements
+    under the hood, so we just loop through multiple executes here". Same round
+    trip count. Reaching for it is the intuitive fix and it is a no-op, so this
+    builds a genuine single-statement multi-row INSERT instead.
+
+    Parameters are named ``:content_key_0``, ``:canonical_sig_id_0``, … so the
+    caller can hand ``databases`` one flat dict; see
+    :func:`upsert_elections_params`.
+
+    CALLER MUST PASS AT MOST ONE ROW PER content_key. Postgres rejects a
+    multi-row ``ON CONFLICT DO UPDATE`` that would touch the same conflict target
+    twice ("cannot affect row a second time"), which the per-row loop could never
+    hit. ``plan_elections`` is keyed by content_key so it cannot produce a
+    duplicate, and :func:`upsert_elections_params` asserts it rather than trusting
+    that to stay true.
+    """
+    if row_count < 1:
+        raise ValueError("row_count must be >= 1")
+    values = ", ".join(
+        f"(:content_key_{i}, :canonical_sig_id_{i}, :election_reason_{i}, NOW(), NOW())"
+        for i in range(row_count)
+    )
+    return _UPSERT_HEAD + values + _UPSERT_CONFLICT_TAIL
+
+
+def upsert_elections_params(elections: Sequence["Election"]) -> Dict[str, Any]:
+    """Flatten elections into the bind dict :func:`upsert_elections_sql` expects."""
+    seen: Set[str] = set()
+    params: Dict[str, Any] = {}
+    for i, election in enumerate(elections):
+        if election.content_key in seen:
+            # Would make Postgres reject the whole statement; fail loudly here
+            # with the offending key rather than on an opaque server error.
+            raise ValueError(
+                "duplicate content_key in one upsert batch: "
+                f"{election.content_key!r}"
+            )
+        seen.add(election.content_key)
+        params[f"content_key_{i}"] = election.content_key
+        params[f"canonical_sig_id_{i}"] = election.canonical_sig_id
+        params[f"election_reason_{i}"] = election.election_reason
+    return params
