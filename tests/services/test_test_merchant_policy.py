@@ -43,6 +43,13 @@ def test_static_set_bakes_in_all_four_rigs():
     assert "merch_bbd34645bc1950cc" in ids
 
 
+def test_static_set_bakes_in_review_demo_3():
+    """pivota-review-demo-3 was a known rig in the agent repo's metrics
+    exclusion list but was never added to the serving denylists. It has no
+    merchant_stores row, so the domain resolver cannot reach it either."""
+    assert "merch_shopify_b20b5797f4181983c177" in pol.static_test_merchant_ids({})
+
+
 def test_static_set_bakes_in_the_ownist_fixture_merchant():
     """ADR-018 census (#1595): a fixture catalog with 4 serving_eligible rows
     and NO merchant_stores row, so the demo-domain resolver can never reach it

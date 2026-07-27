@@ -10,7 +10,9 @@ backlog with the exclusions later lanes must not double-count —
     gotcha: deactivating a seed does NOT tombstone its catalog_products
     mirror) are pulled OUT of the lane populations and reported separately
     as `orphan_mirrors`, the input to an explicit suppression sweep;
-  - demo-store rows (pivota-review-demo*) are excluded and counted.
+  - demo-store rows are excluded and counted — by storefront domain
+    (pivota-review-demo*) and, for rigs with no domain to match on, by
+    merchant_id (DEMO_MERCHANT_IDS).
 
 The remainder is classified into the plan's lanes:
 
@@ -95,13 +97,24 @@ DEMO_MERCHANT_IDS = frozenset({"merch_test_ownist_001"})
 # Python predicate cannot drift apart. Both legs are alias-free because every
 # consumer interpolates this into an unaliased `FROM catalog_products`, and the
 # whole thing is parenthesised so it stays correct next to an OR.
-_DEMO_MERCHANT_ID_SQL_LIST = ", ".join(
-    "'" + mid.replace("'", "''") + "'" for mid in sorted(DEMO_MERCHANT_IDS)
-)
-DEMO_EXCLUSION_SQL = (
-    "(COALESCE(source_domain, '') NOT LIKE '" + DEMO_DOMAIN_PREFIX + "%'"
-    " AND merchant_id NOT IN (" + _DEMO_MERCHANT_ID_SQL_LIST + "))"
-)
+def build_demo_exclusion_sql(prefix: str, merchant_ids: Any) -> str:
+    """Render the demo-exclusion predicate from the two constants.
+
+    The id leg is omitted entirely when the set is empty: `merchant_id NOT IN ()`
+    is a Postgres syntax error, and because this is built at import time the
+    module would still load cleanly — the break would only surface later, at
+    query time, in the identity_reconcile_sweep gauges.
+    """
+    domain_leg = "COALESCE(source_domain, '') NOT LIKE '" + prefix + "%'"
+    if not merchant_ids:
+        return "(" + domain_leg + ")"
+    id_list = ", ".join(
+        "'" + str(mid).replace("'", "''") + "'" for mid in sorted(merchant_ids)
+    )
+    return "(" + domain_leg + " AND merchant_id NOT IN (" + id_list + "))"
+
+
+DEMO_EXCLUSION_SQL = build_demo_exclusion_sql(DEMO_DOMAIN_PREFIX, DEMO_MERCHANT_IDS)
 
 # Seed linkage is bidirectional: the mirror door stamps the seed id into
 # catalog_products.source_ref, but the enrichment door (source_system

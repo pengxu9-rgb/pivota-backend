@@ -33,13 +33,15 @@ from typing import Any, Dict, Iterable, List, Optional, Set
 # whose domain starts with this is a rig regardless of its merchant_id.
 DEMO_DOMAIN_PREFIX = "pivota-review-demo"
 
-# Founder-confirmed rig merchant_ids (2026-07-24; ownist added 2026-07-27).
-# The three snowboard ids all resolve to pivota-review-demo*.myshopify.com and
-# would also be caught by the domain leg below; they are listed explicitly so
-# the fast path needs no DB lookup and so exclusion holds even if a store row
-# is momentarily absent. merch_test_ownist_001 is the opposite case — it has NO
-# merchant_stores row, so the domain leg can never reach it and this denylist
-# is load-bearing rather than belt-and-braces.
+# Founder-confirmed rig merchant_ids (2026-07-24; demo-3 and ownist added
+# 2026-07-27). The three connected snowboard ids resolve to
+# pivota-review-demo*.myshopify.com and would also be caught by the domain leg
+# below; they are listed explicitly so the fast path needs no DB lookup and so
+# exclusion holds even if a store row is momentarily absent.
+#
+# merch_shopify_b20b5797f4181983c177 and merch_test_ownist_001 are the opposite
+# case — neither has a merchant_stores row, so the domain resolver can NEVER
+# reach them and this denylist is load-bearing rather than belt-and-braces.
 KNOWN_TEST_MERCHANT_IDS: Set[str] = frozenset(
     {
         # 92sfrj-bi.myshopify.com — founder's test store (Winona "Test fixture
@@ -52,6 +54,14 @@ KNOWN_TEST_MERCHANT_IDS: Set[str] = frozenset(
         "merch_shopify_0584b37f7a8be00a5223",  # pivota-review-demo-2
         "merch_shopify_00d4a720d67d96c5dcba",  # pivota-review-demo
         "merch_bbd34645bc1950cc",              # pivota-review-demo (2nd connection)
+        # pivota-review-demo-3 — same App-review cohort, already listed as a rig
+        # in the agent repo's scripts/_utils/demoExclusions.cjs
+        # (REVIEW_DEMO_MERCHANT_IDS) but never added to the serving denylists.
+        # Inert today (0 catalog_products / products_cache / merchant_stores
+        # rows, verified in prod 2026-07-27) — but with no merchant_stores row
+        # the demo-domain resolver cannot reach it either, so a re-sync would
+        # serve it. Same blindness as merch_test_ownist_001 below.
+        "merch_shopify_b20b5797f4181983c177",  # pivota-review-demo-3
         # "Ownist Test Merchant" — a seeded fixture catalog, not a connected
         # store. All 4 rows carry source_system 'ownist_test_fixture_v1'
         # ("Triple Shine Grape", "Triple Collagen Orange", + two "Garden
