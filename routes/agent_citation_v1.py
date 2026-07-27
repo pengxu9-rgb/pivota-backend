@@ -524,6 +524,14 @@ _ELECTED_CANONICAL_SIG_SQL = compile_pg(
     .limit(1)
 )
 
+# Compiled ONCE at import, like `_ELECTED_CANONICAL_SIG_SQL` above and like
+# `services.pivot_query_service._SIG_RENDERABLE_SQL`. The first version built and
+# Postgres-compiled this expression inside the request handler — ~0.8 ms of
+# SQLAlchemy work on every citation read, for a string that never varies.
+# Compiling at import also means a malformed fragment fails the process at
+# startup instead of once per request behind a fail-closed except.
+_SIG_RENDERABLE_QUERY = f"SELECT ({sig_pdp_will_render_sql(':sig')}) AS pdp_renderable"
+
 
 async def _elected_canonical_sig(content_key: Any) -> Optional[str]:
     """The content_key's elected canonical sig, or None when there is no usable
@@ -589,12 +597,15 @@ async def _sig_renderable(signature_id: Any) -> bool:
     if not sig.startswith("sig_") or len(sig) <= len("sig_"):
         return False
     try:
-        value = await database.fetch_val(
-            f"SELECT ({sig_pdp_will_render_sql(':sig')}) AS pdp_renderable",
-            {"sig": sig},
-        )
+        value = await database.fetch_val(_SIG_RENDERABLE_QUERY, {"sig": sig})
     except Exception:
-        logger.warning(
+        # LOUD on purpose. This guard is fail-closed, so a broken query degrades
+        # to `url_renderable: false` on EVERY row rather than to a 500 — which is
+        # indistinguishable, from outside, from a catalog where nothing renders.
+        # The first version of the embedded fragment WAS invalid SQL, and this
+        # except would have turned that into a permanent silent lie. error, not
+        # warning, so it surfaces where a 500 would have.
+        logger.error(
             "citation_pdp_renderable_check_failed", exc_info=True, extra={"sig": sig}
         )
         return False

@@ -476,7 +476,9 @@ async def get_canonical_pdp_by_signature(sig_id: str) -> Dict[str, Any]:
             # which need sig_pdp_will_render's correlated lookup. Single-row
             # read, so the nested EXISTS cost is negligible; the feed already
             # pays the same predicate per row for up to 1,000 rows a page.
-            pdp_will_render_expression(catalog_products).label("renderable"),
+            # Through the shared helper rather than a hand-copy: this expression
+            # drifting between its call sites is the documented failure mode.
+            _renderable_column(),
         )
         .select_from(
             catalog_products.join(

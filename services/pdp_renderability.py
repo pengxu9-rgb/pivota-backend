@@ -683,24 +683,58 @@ def sig_pdp_will_render(sig_expr):
     )
 
 
+# The label the fragment compiler attaches and then strips. Explicit, because the
+# whole defect below was SQLAlchemy's IMPLICIT label surviving the strip.
+_SIG_RENDER_FRAGMENT_LABEL = "_sig_pdp_will_render"
+
+
 def sig_pdp_will_render_sql(sig_column: str) -> str:
     """Raw-SQL twin of :func:`sig_pdp_will_render`, for hand-written SQL.
 
-    ``routes/agent_pdp_v1`` composes its reads as literal SQL strings (six
-    variants: the serving-gated, index_eligible-widened and emergency-bypass
-    forms of the content_key / signature / product_group lookups), so it cannot
-    take the SQLAlchemy expression. Compiled from the SAME expression rather
-    than hand-written, so the two cannot drift — the lesson from the three route
+    ``services/pivot_query_service`` and ``routes/agent_citation_v1`` compose
+    parts of their reads as literal SQL strings, so they cannot take the
+    SQLAlchemy expression. Compiled from the SAME expression rather than
+    hand-written, so the two cannot drift — the lesson from the three route
     twins above, which needed an executable parity test precisely because they
     WERE hand-kept.
 
     ``sig_column`` is a SQL column reference in the caller's own scope, e.g.
-    ``"apv.pivota_signature_id"``. It is interpolated as SQL text, so it must be
-    a literal identifier the caller controls — never a request value.
+    ``"apv.pivota_signature_id"``, or a bind marker like ``":sig"``. It is
+    interpolated as SQL text, so it must be something the caller controls —
+    never a request value.
+
+    WHY THE LABEL DANCE. The first version of this compiled
+    ``select(<exists>)`` and sliced off ``"SELECT "``. SQLAlchemy labels an
+    unlabelled expression automatically, so the returned fragment still carried
+    a trailing ``AS anon_1``; every caller wraps the fragment in parentheses,
+    which puts a column alias inside a scalar expression and Postgres rejects
+    the whole statement with ``syntax error at or near "AS"``. The SQLite suite
+    could not see it (these are Postgres-dialect strings) and the shape test
+    only asserted on the HEAD of the string. So: label explicitly, strip the
+    label explicitly, and refuse to return anything that does not match — a
+    fragment that is wrong here is a 500 on every request to two routes, and
+    failing at import is strictly better than failing per-request.
     """
-    return compile_pg(select(sig_pdp_will_render(literal_column(sig_column))))[
-        len("SELECT ") :
-    ].strip()
+    labelled = sig_pdp_will_render(literal_column(sig_column)).label(
+        _SIG_RENDER_FRAGMENT_LABEL
+    )
+    compiled = compile_pg(select(labelled)).strip()
+    prefix = "SELECT "
+    suffix = f" AS {_SIG_RENDER_FRAGMENT_LABEL}"
+    if not compiled.startswith(prefix) or not compiled.endswith(suffix):
+        raise RuntimeError(
+            "sig_pdp_will_render_sql: compiled statement did not have the "
+            f"expected SELECT <expr> AS {_SIG_RENDER_FRAGMENT_LABEL} shape; "
+            "the embedded fragment would be invalid SQL. Got: "
+            f"{compiled[:80]!r}...{compiled[-40:]!r}"
+        )
+    fragment = compiled[len(prefix) : -len(suffix)].strip()
+    if not fragment.startswith("EXISTS (") or not fragment.endswith(")"):
+        raise RuntimeError(
+            "sig_pdp_will_render_sql: fragment is not a bare balanced EXISTS "
+            f"expression: {fragment[:60]!r}...{fragment[-40:]!r}"
+        )
+    return fragment
 
 
 def seed_route_resolves_sql(cp_alias: str = "cp") -> str:

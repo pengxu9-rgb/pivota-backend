@@ -1312,6 +1312,15 @@ def test_sig_pdp_will_render_sql_is_an_embeddable_bare_expression():
 
     It is interpolated into hand-written SELECT lists, so a stray leading SELECT
     or an unbalanced paren is a syntax error at query time, not import time.
+
+    THE FIRST VERSION OF THIS TEST CHECKED ONLY THE HEAD, and that is where the
+    bug got through: SQLAlchemy labels an unlabelled expression automatically, so
+    slicing off `"SELECT "` left `... ) AS anon_1` on the tail. Every caller wraps
+    the fragment in parentheses, which puts a column alias inside a scalar
+    expression, and Postgres answers `syntax error at or near "AS"`. All four
+    original assertions passed. Nothing on SQLite ever executes these
+    Postgres-dialect strings, so the tail assertions below and
+    tests/test_citation_read_surfaces_postgres.py are the only things that see it.
     """
     from services.pdp_renderability import sig_pdp_will_render_sql
 
@@ -1319,6 +1328,9 @@ def test_sig_pdp_will_render_sql_is_an_embeddable_bare_expression():
     assert frag.startswith("EXISTS (")
     assert not frag.upper().startswith("SELECT")
     assert frag.count("(") == frag.count(")")
+    assert frag.endswith(")"), frag[-60:]
+    # Nothing may trail the closing paren — a label, an alias, anything.
+    assert frag.rsplit(")", 1)[-1] == ""
     # No leftover format placeholders — these strings land in f-strings.
     assert "{" not in frag and "}" not in frag
     # It must be usable with a BIND too (the citation single-item read does this).
