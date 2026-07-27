@@ -123,7 +123,11 @@ async def test_resolve_connected_shopify_with_live_psp(monkeypatch):
     from services import merchant_capability_resolver as res
 
     async def fake_get_primary_store(mid):
-        return {"platform": "shopify", "domain": "brand.myshopify.com"}
+        return {"platform": "shopify", "domain": "brand.myshopify.com", "status": "active"}
+        # `status` is not decoration: `get_merchant_active_stores` always
+        # SELECTs it, and ADR-018's connection-layer ceiling reads it. A
+        # status-less fake silently scores ceiling 1 and stops meaning what
+        # this fixture's name says.
 
     async def fake_get_merchant_onboarding(mid):
         return {}
@@ -148,7 +152,11 @@ async def test_resolve_connected_shopify_without_live_psp(monkeypatch):
     from services import merchant_capability_resolver as res
 
     async def fake_get_primary_store(mid):
-        return {"platform": "shopify", "domain": "brand.myshopify.com"}
+        return {"platform": "shopify", "domain": "brand.myshopify.com", "status": "active"}
+        # `status` is not decoration: `get_merchant_active_stores` always
+        # SELECTs it, and ADR-018's connection-layer ceiling reads it. A
+        # status-less fake silently scores ceiling 1 and stops meaning what
+        # this fixture's name says.
 
     async def fake_get_merchant_onboarding(mid):
         return {}

@@ -205,12 +205,17 @@ def connection_layer_slug(layer: Any) -> str:
 
     Never raises — this feeds a protocol payload, and a ``ValueError`` from a
     stray string would take down the surrounding response for a cosmetic field.
+
+    Note the ``isinstance(layer, int)`` check rather than ``int(layer)``:
+    ``int(2.7)`` is ``2``, so a truncating conversion would answer
+    "product_synced" for a value that is not a layer at all. This function's
+    entire job is expressing the layer honestly, so a non-integral input gets
+    the floor rather than a rounded lie. ``bool`` is excluded because
+    ``True == 1`` would otherwise read as layer 1 by accident.
     """
-    try:
-        key = int(layer or 0)
-    except (TypeError, ValueError):
+    if isinstance(layer, bool) or not isinstance(layer, int):
         return CONNECTION_LAYER_SLUGS[LAYER_CRAWLED]
-    return CONNECTION_LAYER_SLUGS.get(key, CONNECTION_LAYER_SLUGS[LAYER_CRAWLED])
+    return CONNECTION_LAYER_SLUGS.get(layer, CONNECTION_LAYER_SLUGS[LAYER_CRAWLED])
 
 
 def resolve_execution_paths(
@@ -264,6 +269,13 @@ def resolve_execution_paths(
 #: ``_normalize_alias`` so the collision is impossible rather than documented.
 _RESERVED_INTERNAL_ALIASES = frozenset({"mo_cl", "mo_psp", "pmc_cl", "ms_cl"})
 
+#: The characters Python's ``str.strip()`` removes, as a Postgres E-string for
+#: ``btrim``'s second argument. **`btrim(x)` with one argument strips spaces
+#: only** — a one-argument form left tab/newline/CR-padded values untrimmed and
+#: put the SQL twin one layer below the Python twin. Spelled out so the two
+#: normalisations are the same set, not merely both "trimmed".
+_SQL_WHITESPACE = r"E' \t\n\r\f\v'"
+
 
 # Allowed SQL identifier (table alias). Anything else falls back to the default so
 # a caller can never inject SQL through the alias parameter. Same guard as the
@@ -308,9 +320,12 @@ def connection_layer_sql(
         NO row in ``merchant_onboarding`` ⇒ layer 1, and the ``NOT EXISTS`` leg
         below states that rather than leaving it to ``COALESCE``.
 
-    Deliberately NOT parameterized: every literal here is a constant of the
-    taxonomy, so there is nothing request-supplied to bind. The one caller-supplied
-    value (the alias) is identifier-validated above, never interpolated raw.
+    Deliberately NOT parameterized. Every string literal in the emitted SQL is
+    interpolated from a module constant — the two ``catalog_track`` values, the
+    ``LIVE_STORE_STATUSES`` list, and ``_SQL_WHITESPACE`` — so there is nothing
+    request-supplied to bind and a bind parameter would only reintroduce the
+    untyped-parameter class that broke #1588. The one caller-supplied value (the
+    alias) is identifier-validated above and never interpolated raw.
     """
     p = _normalize_alias(product_alias, "cp")
 
@@ -343,14 +358,23 @@ def connection_layer_sql(
     active_store = (
         "EXISTS (SELECT 1 FROM merchant_stores ms_cl "
         f"WHERE ms_cl.merchant_id = {p}.merchant_id "
-        f"AND lower(btrim(COALESCE(ms_cl.status, ''))) IN ({live_statuses}))"
+        f"AND lower(btrim(COALESCE(ms_cl.status, ''), {_SQL_WHITESPACE})) IN ({live_statuses}))"
     )
 
     # `btrim` is not decoration: the Python twin normalises with `.strip()`, so a
     # whitespace-padded `catalog_track` (' internal_merchant ') would classify as
     # layer 2 in Python and layer 1 in SQL without it. That divergence was
     # executed against real Postgres before this line existed.
-    track = f"lower(btrim(COALESCE({p}.catalog_track, '')))"
+    #
+    # The explicit character set is equally load-bearing: **single-argument
+    # `btrim(x)` strips SPACES ONLY**, while Python's `.strip()` also removes
+    # \t \n \r \f \v. With the one-argument form a tab-padded track still
+    # diverged (sql=1, py=2) — and the fixture row that was supposed to prove
+    # tabs were covered passed by COINCIDENCE, because the untrimmed value
+    # missed CASE arm 1 and fell through to arm 3, which returns 1 as well.
+    # A test that passes for the wrong reason is the exact failure this gate
+    # exists to prevent, so the character set is spelled out.
+    track = f"lower(btrim(COALESCE({p}.catalog_track, ''), {_SQL_WHITESPACE}))"
 
     return f"""
     (CASE

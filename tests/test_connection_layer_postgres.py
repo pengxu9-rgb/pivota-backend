@@ -125,7 +125,16 @@ _FIXTURE = [
     # SQL needs `btrim` to match. Without these rows the equality test cannot
     # see the divergence — it was executed and real: sql=1, py=2.
     ("pk_padded_internal", "merch_synced", " internal_merchant ", 2),
+    # ⚠️ `pk_padded_external` proves LESS than it looks like it proves, and is
+    # kept only with this warning attached. Single-argument `btrim` strips spaces
+    # only; when it left the tab in place this row still returned 1, because the
+    # untrimmed value missed CASE arm 1 and fell through to arm 3 — which also
+    # returns 1. It passed for the wrong reason. `pk_tab_internal` below is the
+    # row that actually exercises tab-stripping, because its expected value (2)
+    # is only reachable when the tabs are gone.
     ("pk_padded_external", "merch_synced", "external_referral\t", 1),
+    ("pk_tab_internal", "merch_synced", "\tinternal_merchant\t", 2),
+    ("pk_newline_internal", "merch_synced", "\ninternal_merchant\r\n", 2),
     # `connected` is a live store status everywhere else in this repo
     # (merchant_store_service: `status IN ('active','connected')`).
     ("pk_connected_status", "merch_connected", "internal_merchant", 2),
@@ -406,3 +415,28 @@ def test_python_twin_agrees_on_the_same_fixture(seeded):
             )
             == expected[product_key]
         ), product_key
+
+
+def test_reserved_alias_fallback_fails_loudly_rather_than_answering_wrongly(pg_engine):
+    """The alias guard trades a silent wrong answer for a hard error. Assert it.
+
+    A caller whose products table is aliased ``ms_cl`` gets the fallback alias
+    ``cp`` in the expression, which does not resolve in their FROM clause — so
+    Postgres refuses the statement instead of decorrelating the store subquery
+    into "does ANY live store exist anywhere" and returning a wrong layer. That
+    is the right trade, but nothing asserted it, and an unasserted trade is one
+    a future refactor can quietly reverse.
+    """
+    import sqlalchemy
+    from sqlalchemy import text
+
+    from services.connection_layer import connection_layer_sql
+
+    statement = (
+        f"SELECT {connection_layer_sql('ms_cl')} AS layer "
+        "FROM catalog_products ms_cl"
+    )
+    with pg_engine.connect() as conn:
+        with pytest.raises(sqlalchemy.exc.ProgrammingError) as excinfo:
+            conn.execute(text(statement))
+    assert "cp" in str(excinfo.value)

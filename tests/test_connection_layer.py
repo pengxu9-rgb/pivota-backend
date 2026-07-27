@@ -308,10 +308,18 @@ def test_reserved_internal_aliases_cannot_shadow_the_subquery_scope(reserved):
 def test_sql_trims_the_track_exactly_as_python_does():
     """The Python twin normalises with ``.strip()``. Without ``btrim`` in the
     SQL, ``' internal_merchant '`` is layer 2 in Python and layer 1 in SQL —
-    executed against real Postgres before this assertion existed."""
+    executed against real Postgres before this assertion existed.
+
+    The character set matters as much as the call: **single-argument
+    ``btrim(x)`` strips SPACES ONLY**, so a tab/newline-padded value still
+    diverged. Asserting on the second argument rather than on an exact
+    expression string keeps this from being reformat-brittle.
+    """
     sql = connection_layer_sql("cp")
-    assert "btrim" in sql
-    assert sql.count("lower(btrim(COALESCE(cp.catalog_track, '')))") == 2
+    assert sql.count("btrim(COALESCE(cp.catalog_track, '')") == 2
+    for whitespace in ("\\t", "\\n", "\\r", "\\f", "\\v"):
+        assert whitespace in sql, whitespace
+    assert sql.count("E' ") >= 2  # track + store status
 
 
 def test_sql_accepts_every_live_store_status():
@@ -327,6 +335,15 @@ def test_slug_never_raises_on_a_stray_value():
     assert connection_layer_slug("abc") == "crawled"
     assert connection_layer_slug([]) == "crawled"
     assert connection_layer_slug(None) == "crawled"
+
+
+@pytest.mark.parametrize("not_a_layer", [2.7, 3.0, "2", True, False])
+def test_slug_does_not_round_a_non_integer_into_a_layer(not_a_layer):
+    """``int(2.7)`` is 2, so a truncating conversion would answer
+    "product_synced" for a value that is not a layer. This function's job is
+    expressing the layer honestly — a non-integral input gets the floor, not a
+    rounded lie. ``True == 1`` is excluded for the same reason."""
+    assert connection_layer_slug(not_a_layer) == "crawled"
 
 
 def test_sql_states_the_missing_merchant_leg_explicitly():
