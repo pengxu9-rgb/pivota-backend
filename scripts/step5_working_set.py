@@ -66,13 +66,41 @@ from services.pdp_matcher.deterministic import normalize_canonical_url  # noqa: 
 # 'internal_merchant' drives first-party offer typing in
 # services/offer_classification.py). Demo-ness is instead THIS one shared
 # predicate, consumed by the working-set classifier and the sweep gauges —
-# add new demo storefronts here, nowhere else.
+# add new demo storefronts here (or, for a rig with no storefront domain,
+# to DEMO_MERCHANT_IDS just below), nowhere else.
 DEMO_DOMAIN_PREFIX = "pivota-review-demo"
 
+# Rigs that have no storefront domain to match on, so the prefix above can
+# never reach them. Kept in lockstep with the two serving-side twins
+# (services/test_merchant_policy.py KNOWN_TEST_MERCHANT_IDS and the agent
+# repo's src/services/testMerchantPolicy.js TEST_MERCHANT_IDS).
+#
+# merch_test_ownist_001 — "Ownist Test Merchant", a seeded fixture catalog
+# rather than a connected store: all 4 of its rows carry source_system
+# 'ownist_test_fixture_v1' and all 4 are serving_eligible = TRUE. It has NO
+# merchant_stores row and NO source_domain (verified in prod 2026-07-27), so
+# the domain prefix is structurally blind to it. Found by the ADR-018
+# connection-layer census (#1595); see docs/adr/ADR-018-connection-layer-and-
+# priced-serving-lane.md.
+#
+# Scope note: this set deliberately does NOT list the two serving-side rigs
+# that step5 has always counted (merch_efbc46b4619cfbdf and the snowboard
+# ids beyond the pivota-review-demo domain match). Adding them would move
+# ~1.5k rows out of the reconciliation backlog and re-baseline every gauge —
+# a separate, measured decision, not a side effect of this exclusion.
+DEMO_MERCHANT_IDS = frozenset({"merch_test_ownist_001"})
+
 # SQL twin of is_demo_row(); interpolate into any gauge that should read the
-# production catalog only.
+# production catalog only. Derived from the constants above so the SQL and the
+# Python predicate cannot drift apart. Both legs are alias-free because every
+# consumer interpolates this into an unaliased `FROM catalog_products`, and the
+# whole thing is parenthesised so it stays correct next to an OR.
+_DEMO_MERCHANT_ID_SQL_LIST = ", ".join(
+    "'" + mid.replace("'", "''") + "'" for mid in sorted(DEMO_MERCHANT_IDS)
+)
 DEMO_EXCLUSION_SQL = (
-    "COALESCE(source_domain, '') NOT LIKE 'pivota-review-demo%'"
+    "(COALESCE(source_domain, '') NOT LIKE '" + DEMO_DOMAIN_PREFIX + "%'"
+    " AND merchant_id NOT IN (" + _DEMO_MERCHANT_ID_SQL_LIST + "))"
 )
 
 # Seed linkage is bidirectional: the mirror door stamps the seed id into
@@ -142,7 +170,11 @@ WHERE cp.platform = 'external_seed'
 
 
 def is_demo_row(row: Dict[str, Any]) -> bool:
-    return str(row.get("source_domain") or "").startswith(DEMO_DOMAIN_PREFIX)
+    """Demo/rig row: a demo storefront domain, OR a rig merchant_id that has no
+    domain to match on (see DEMO_MERCHANT_IDS)."""
+    if str(row.get("source_domain") or "").startswith(DEMO_DOMAIN_PREFIX):
+        return True
+    return str(row.get("merchant_id") or "").strip() in DEMO_MERCHANT_IDS
 
 
 def is_orphan_mirror_row(row: Dict[str, Any]) -> bool:

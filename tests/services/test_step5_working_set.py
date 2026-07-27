@@ -12,6 +12,9 @@ from __future__ import annotations
 from typing import Any, Dict
 
 from scripts.step5_working_set import (  # noqa: E402
+    DEMO_DOMAIN_PREFIX,
+    DEMO_EXCLUSION_SQL,
+    DEMO_MERCHANT_IDS,
     build_report,
     classify_cross_merchant_group,
     classify_same_merchant_group,
@@ -125,6 +128,24 @@ class TestExclusions:
     def test_demo_row_detection(self):
         assert is_demo_row(_row(source_domain="pivota-review-demo-2.myshopify.com"))
         assert not is_demo_row(_row(source_domain="store.example"))
+
+    def test_demo_merchant_id_leg_catches_rigs_with_no_domain(self):
+        """merch_test_ownist_001 has no merchant_stores row and no
+        source_domain, so only the id leg can reach it (ADR-018 census)."""
+        assert is_demo_row(
+            _row(merchant_id="merch_test_ownist_001", source_domain=None)
+        )
+        assert is_demo_row(
+            _row(merchant_id="merch_test_ownist_001", source_domain="store.example")
+        )
+        assert not is_demo_row(_row(merchant_id="merch_a", source_domain="store.example"))
+
+    def test_demo_exclusion_sql_carries_both_legs(self):
+        # SQL twin must stay in step with the Python predicate.
+        assert DEMO_DOMAIN_PREFIX in DEMO_EXCLUSION_SQL
+        for mid in DEMO_MERCHANT_IDS:
+            assert "'" + mid + "'" in DEMO_EXCLUSION_SQL
+        assert "merchant_id NOT IN (" in DEMO_EXCLUSION_SQL
 
     def test_orphan_mirror_detection(self):
         assert is_orphan_mirror_row(_row(platform="external_seed", seed_status="inactive"))

@@ -33,10 +33,13 @@ from typing import Any, Dict, Iterable, List, Optional, Set
 # whose domain starts with this is a rig regardless of its merchant_id.
 DEMO_DOMAIN_PREFIX = "pivota-review-demo"
 
-# Founder-confirmed rig merchant_ids (2026-07-24). The three snowboard ids all
-# resolve to pivota-review-demo*.myshopify.com and would also be caught by the
-# domain leg below; they are listed explicitly so the fast path needs no DB
-# lookup and so exclusion holds even if a store row is momentarily absent.
+# Founder-confirmed rig merchant_ids (2026-07-24; ownist added 2026-07-27).
+# The three snowboard ids all resolve to pivota-review-demo*.myshopify.com and
+# would also be caught by the domain leg below; they are listed explicitly so
+# the fast path needs no DB lookup and so exclusion holds even if a store row
+# is momentarily absent. merch_test_ownist_001 is the opposite case — it has NO
+# merchant_stores row, so the domain leg can never reach it and this denylist
+# is load-bearing rather than belt-and-braces.
 KNOWN_TEST_MERCHANT_IDS: Set[str] = frozenset(
     {
         # 92sfrj-bi.myshopify.com — founder's test store (Winona "Test fixture
@@ -49,6 +52,23 @@ KNOWN_TEST_MERCHANT_IDS: Set[str] = frozenset(
         "merch_shopify_0584b37f7a8be00a5223",  # pivota-review-demo-2
         "merch_shopify_00d4a720d67d96c5dcba",  # pivota-review-demo
         "merch_bbd34645bc1950cc",              # pivota-review-demo (2nd connection)
+        # "Ownist Test Merchant" — a seeded fixture catalog, not a connected
+        # store. All 4 rows carry source_system 'ownist_test_fixture_v1'
+        # ("Triple Shine Grape", "Triple Collagen Orange", + two "Garden
+        # edition" twins) and all 4 are serving_eligible = TRUE.
+        #
+        # Found by the ADR-018 connection-layer census (#1595), which parked
+        # the exclusion for this PR. What holds the rows back today is DATA,
+        # not policy: the 4 catalog_products rows and their 4 offers all carry
+        # suppression_reason 'demo_retired_2026_07' (the offers are otherwise
+        # fully price-quotable — USD 41.00/65.60, out_of_stock). Clear that
+        # suppression with a re-sync and 4 rig SKUs reach a public,
+        # externally-ingested surface, because serving_eligible stays TRUE.
+        #
+        # The demo-domain resolver below CANNOT cover this one: it has no
+        # merchant_stores row at all (verified in prod 2026-07-27), so there
+        # is no storefront domain to match. The id denylist is the only leg.
+        "merch_test_ownist_001",  # added 2026-07-27, ADR-018 census
     }
 )
 
