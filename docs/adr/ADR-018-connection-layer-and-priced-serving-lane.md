@@ -32,7 +32,7 @@ The public ACP feed (`GET /acp/feed` — mounted by `AGENT_CHECKOUT_STRICT` + `A
 
 Two separate errors were folded into one story:
 
-1. **A category error.** We concluded "the feed is empty until a real merchant connects." Wrong on the founder's model: 12,514 crawled products from 53 sellers are real. The feed is empty because it is pointed at the *smallest, emptiest* lane.
+1. **A category error.** We concluded "the feed is empty until a real merchant connects." Wrong on the founder's model: 12,542 crawled products (`catalog_track='external_referral'`) from 53 sellers are real. The feed is empty because it is pointed at the *smallest, emptiest* lane.
 2. **A different, real constraint that was never the one we cited.** Shopping ingesters (ChatGPT / Google) reject price-less items. Until PIVOTA-Agent **#1824** (2026-07-24) every serving-eligible lane emitted `price: null` — `get_product_entity_index_feed` hardcoded `null` price/currency/availability and `canonicalCatalogSearch`'s `includeSkuOffers:false` branch selected `NULL::` placeholders. **Price, not merchant realness, is why the serving catalog was never pointed at the feed.** #1824 fixed both lanes; the constraint is gone and nothing re-measured after it.
 
 ### Measured ground truth (prod, 2026-07-27)
@@ -80,7 +80,9 @@ Read via the Railway public proxy against `catalog_products` / `catalog_offers` 
 |---|---|---:|---:|---|
 | **1 — crawled** | `catalog_track='external_referral'` | 12,542 | **4,467** | 53 sellers |
 | **2 — product synced** | `catalog_track='internal_merchant'` ∧ active store | 1,557 | **0** | **0** |
-| **3 — synced + PSP** | layer 2 ∧ `psp_connected` | 743 | **0** | **0** |
+| **3 — synced + PSP** | layer 2 ∧ `psp_connected` | 763 | **0** | **0** |
+
+(Layer 2's 1,557 = the 1,562 `internal_merchant` rows minus the 1 brand-authored row that was never synced and the 4 `ownist_test_fixture_v1` rows. Layer 3's 763 = every row of the one `psp_connected` merchant that has any, `merch_efbc46b4619cfbdf`: 743 Shopify + 20 Wix. Both counts are rigs end to end, which is why the *real* column is 0.)
 
 Executing the index-feed lane's exact predicate against prod (serving_eligible ∧ `sig_` signature ∧ `activeCatalogProductSourceWhere` ∧ a priced, currency-bearing, unsuppressed offer) yields **4,467 content_keys** — up from the 0 the feed serves today, and **100% Layer 1**.
 
