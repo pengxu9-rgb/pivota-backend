@@ -48,7 +48,7 @@ that justifies moving a URL is that the current one has stopped working.
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Dict, Iterable, List, Optional, Sequence, Tuple
+from typing import Any, Dict, Iterable, List, Optional, Sequence, Set, Tuple
 
 from sqlalchemy import select
 
@@ -240,12 +240,88 @@ def plan_elections(
         winner, reason = chosen
         if reason == REASON_STICKY:
             continue
+        # ALREADY CORRECT ⇒ NOT A PLANNED ELECTION, whatever rung chose it.
+        #
+        # REASON_STICKY above catches "we kept the stored winner", but the
+        # DEDUPE_KEEPER rung sits ABOVE stickiness and re-elects outright, so a
+        # group whose stored winner IS already the keeper reached this line and
+        # was planned as a write that changes nothing.
+        #
+        # Measured against prod after the 2026-07-26 seed: 587 of them. That
+        # single fact broke every counter in the sweep's report at once —
+        # `replacements` (fixed separately, in the Election below),
+        # `new_elections` = len(planned) - len(replacements), `already_correct`,
+        # and `written` = len(planned). The scheduled workflow alarms on
+        # `replacements` and the rollout runbook gates on BOTH `replacements: 0`
+        # AND `new_elections: 0`, so fixing only the first would have moved the
+        # unpassable gate rather than removed it: a converged corpus would still
+        # have printed `new_elections: 587, written: 587` while changing zero rows.
+        #
+        # This is the SAME question the write already asks server-side —
+        # UPSERT_ELECTION_SQL's `WHERE canonical_sig_id IS DISTINCT FROM
+        # EXCLUDED.canonical_sig_id` — so skipping here changes no write, only the
+        # report. It is what makes `written = len(planned)` true rather than
+        # merely plausible: every remaining row is a genuine change.
+        #
+        # Seed runs are unaffected: the table is empty, so `stored` is None
+        # everywhere and nothing is skipped.
+        #
+        # KNOWN CONSEQUENCE, deliberate: `election_reason` is no longer corrected
+        # when the sig stays put but the reason legitimately changes (e.g.
+        # `lexicographic` → `dedupe_keeper`), so that audit value can go stale.
+        # It already could — the conflict guard keys on `canonical_sig_id` alone,
+        # so the server would have discarded the reason update anyway. This makes
+        # it true by design instead of by accident. Correcting reasons needs the
+        # conflict guard widened to include `election_reason`, which is a separate
+        # decision about whether a reason-only change is worth a write.
+        if stored is not None and stored == winner:
+            continue
         planned.append(
             Election(
                 content_key=content_key,
                 canonical_sig_id=winner,
                 election_reason=reason,
-                replaced=stored,
+                # ONLY when the winner actually CHANGES. This was an unconditional
+                # `replaced=stored`, which made `replaced` truthy whenever a
+                # content_key had any stored winner — including when the newly
+                # chosen winner is that very same sig.
+                #
+                # It is not a cosmetic counter. `replacements` is what the
+                # scheduled workflow alarms on ("N elected canonical URL(s) MOVED
+                # — each is a live URL changing"), and what the rollout runbook
+                # names as its convergence gate. MEASURED against prod right after
+                # the 2026-07-26 seed: a steady-state sweep reported
+                # `replacements: 587` with `written: 0` — all 587 had
+                # `from == to`. So the alarm would have fired on EVERY 6h run
+                # forever, and the runbook's `replacements: 0` gate could never
+                # pass, on a corpus that is in fact perfectly converged.
+                #
+                # The 587 are the `dedupe_keeper` cohort specifically: that rung
+                # sits ABOVE the sticky rung, so it re-elects outright and never
+                # reaches the `REASON_STICKY` short-circuit above that would
+                # otherwise have skipped an unchanged winner.
+                #
+                # The SQL was already honest — UPSERT_ELECTION_SQL carries
+                # `WHERE canonical_sig_id IS DISTINCT FROM EXCLUDED.canonical_sig_id`
+                # — so the DB was right while the report was not.
+                #
+                # `written` was NOT already honest, and an earlier draft of this
+                # comment claimed it was. It is `len(planned)` (see
+                # scripts/elect_content_canonicals.py), never a rowcount, so it
+                # counted no-op re-elections as writes; the "587 with written: 0"
+                # observation that seemed to prove otherwise came from a DRY RUN,
+                # where `written` is 0 unconditionally and says nothing about the
+                # apply path. The skip above is what actually makes it true, by
+                # removing no-ops from `planned` in the first place.
+                #
+                # Note this is the SECOND time this field has misled an operator in
+                # the opposite direction: on a SEED run the table is empty, so
+                # `replacements` is structurally 0 no matter how many URLs move,
+                # which is why `moved_from_sitemap` had to be added. `replaced`
+                # answers "did the STORED value change", and it is only ever a
+                # proxy for "did a live URL move" — read `moved_from_sitemap` for
+                # the latter.
+                replaced=stored if stored and stored != winner else None,
             )
         )
     return planned
@@ -314,19 +390,94 @@ ORDER BY loser.content_key, keeper.pivota_signature_id
 """
 
 
-UPSERT_ELECTION_SQL = """
+_UPSERT_HEAD = """
 INSERT INTO content_canonical_election (
     content_key, canonical_sig_id, election_reason, elected_at, updated_at
-) VALUES (
-    :content_key, :canonical_sig_id, :election_reason, NOW(), NOW()
-)
+) VALUES """
+
+# ONE copy of the conflict clause, shared by the single-row and multi-row forms
+# below so they cannot drift. `elected_at` is NOT touched: it records when this
+# content_key FIRST got a canonical URL, so `elected_at = updated_at` stays a
+# clean "never moved" signal and a re-election is visible as the two diverging.
+#
+# The `IS DISTINCT FROM` guard is what makes `written` honest — a re-election that
+# picks the SAME sig updates nothing at all.
+_UPSERT_CONFLICT_TAIL = """
 ON CONFLICT (content_key) DO UPDATE SET
     canonical_sig_id = EXCLUDED.canonical_sig_id,
     election_reason  = EXCLUDED.election_reason,
-    -- elected_at is NOT touched: it records when this content_key FIRST got a
-    -- canonical URL, so `elected_at = updated_at` stays a clean "never moved"
-    -- signal and a re-election is visible as the two diverging.
     updated_at       = NOW()
 WHERE content_canonical_election.canonical_sig_id
       IS DISTINCT FROM EXCLUDED.canonical_sig_id
 """
+
+UPSERT_ELECTION_SQL = (
+    _UPSERT_HEAD
+    + "(:content_key, :canonical_sig_id, :election_reason, NOW(), NOW())"
+    + _UPSERT_CONFLICT_TAIL
+)
+
+# Postgres caps a statement at 65,535 bind parameters. At 3 per row that allows
+# ~21,845 rows, but chunk far below it: a smaller statement keeps the parse cost
+# and the peak memory sane, and bounds how much has to be re-sent if a chunk is
+# retried.
+UPSERT_CHUNK_ROWS = 500
+
+
+def upsert_elections_sql(row_count: int) -> str:
+    """Multi-row form of :data:`UPSERT_ELECTION_SQL` — ONE round trip for N rows.
+
+    WHY THIS EXISTS, and why the obvious alternative does not work. The sweep used
+    to write with ``for election in planned: await database.execute(UPSERT...)``,
+    i.e. one network round trip per content_key — 4,266 of them on the seed run,
+    which measured 7 to 30 MINUTES over the Railway public proxy with the whole
+    lot inside a single transaction. That is not merely slow: interrupt the client
+    mid-way and Postgres keeps an ORPHANED backend holding row locks on every
+    content_key already inserted (no TCP keepalive through the proxy), so the next
+    attempt blocks on those locks, looks like a connection hang, and invites
+    another kill. Self-amplifying; it cost the 2026-07-26 seed several attempts.
+
+    ``databases.Database.execute_many`` DOES NOT FIX THIS — verified against the
+    installed 0.7.0, whose postgres backend is a plain Python loop over
+    ``connection.execute`` with the comment "asyncpg uses prepared statements
+    under the hood, so we just loop through multiple executes here". Same round
+    trip count. Reaching for it is the intuitive fix and it is a no-op, so this
+    builds a genuine single-statement multi-row INSERT instead.
+
+    Parameters are named ``:content_key_0``, ``:canonical_sig_id_0``, … so the
+    caller can hand ``databases`` one flat dict; see
+    :func:`upsert_elections_params`.
+
+    CALLER MUST PASS AT MOST ONE ROW PER content_key. Postgres rejects a
+    multi-row ``ON CONFLICT DO UPDATE`` that would touch the same conflict target
+    twice ("cannot affect row a second time"), which the per-row loop could never
+    hit. ``plan_elections`` is keyed by content_key so it cannot produce a
+    duplicate, and :func:`upsert_elections_params` asserts it rather than trusting
+    that to stay true.
+    """
+    if row_count < 1:
+        raise ValueError("row_count must be >= 1")
+    values = ", ".join(
+        f"(:content_key_{i}, :canonical_sig_id_{i}, :election_reason_{i}, NOW(), NOW())"
+        for i in range(row_count)
+    )
+    return _UPSERT_HEAD + values + _UPSERT_CONFLICT_TAIL
+
+
+def upsert_elections_params(elections: Sequence["Election"]) -> Dict[str, Any]:
+    """Flatten elections into the bind dict :func:`upsert_elections_sql` expects."""
+    seen: Set[str] = set()
+    params: Dict[str, Any] = {}
+    for i, election in enumerate(elections):
+        if election.content_key in seen:
+            # Would make Postgres reject the whole statement; fail loudly here
+            # with the offending key rather than on an opaque server error.
+            raise ValueError(
+                "duplicate content_key in one upsert batch: "
+                f"{election.content_key!r}"
+            )
+        seen.add(election.content_key)
+        params[f"content_key_{i}"] = election.content_key
+        params[f"canonical_sig_id_{i}"] = election.canonical_sig_id
+        params[f"election_reason_{i}"] = election.election_reason
+    return params

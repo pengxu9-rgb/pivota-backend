@@ -290,6 +290,47 @@ class TestPlanElections:
         assert planned[0].replaced == gone
         assert planned[0].canonical_sig_id == SIG_A
 
+    def test_re_electing_the_SAME_winner_is_not_a_replacement(self):
+        """`replaced` must mean the stored value CHANGED, not merely existed.
+
+        The dedupe_keeper rung sits above the sticky rung, so it re-elects
+        outright and never reaches the REASON_STICKY short-circuit that would skip
+        an unchanged winner. With an unconditional `replaced=stored` that made
+        every already-correct keeper look like a moved URL.
+
+        MEASURED against prod right after the 2026-07-26 seed: a steady-state
+        sweep reported `replacements: 587` alongside `written: 0`, and all 587 had
+        `from == to`. The scheduled workflow alarms on `replacements` ("N elected
+        canonical URL(s) MOVED — each is a live URL changing"), so it would have
+        warned on every 6h run forever, and the runbook's `replacements: 0`
+        convergence gate could never have passed, on a converged corpus.
+        """
+        keeper = "sig_" + "e" * 32
+        planned = plan_elections(
+            candidates_by_content_key={"ck_1": [SIG_A, keeper]},
+            stored_by_content_key={"ck_1": keeper},
+            keeper_by_content_key={"ck_1": keeper},
+        )
+        # NOT PLANNED AT ALL — stronger than "planned but not a replacement".
+        #
+        # An earlier fix only nulled `replaced`, which left the row in `planned`
+        # and merely moved the inflation to `new_elections` (= len(planned) -
+        # len(replacements)) and `written` (= len(planned)). The runbook gates on
+        # BOTH counters, so the unpassable gate had moved rather than gone. Now the
+        # no-op is dropped before it can reach any counter.
+        assert planned == []
+
+    def test_a_genuine_keeper_move_is_still_recorded(self):
+        """The counter must stay sensitive to real moves — not just quieter."""
+        keeper = "sig_" + "e" * 32
+        planned = plan_elections(
+            candidates_by_content_key={"ck_1": [SIG_A, keeper]},
+            stored_by_content_key={"ck_1": SIG_A},
+            keeper_by_content_key={"ck_1": keeper},
+        )
+        assert planned[0].canonical_sig_id == keeper
+        assert planned[0].replaced == SIG_A
+
     def test_content_key_with_zero_candidates_leaves_the_stored_row_alone(self):
         """Withdrawing the election would un-canonicalise every sibling page.
 
@@ -566,3 +607,253 @@ class TestSitemapParser:
         empty.write_text("<urlset></urlset>", encoding="utf-8")
         with pytest.raises(SystemExit, match="ZERO product URLs"):
             load_sitemap(str(empty))
+
+
+# ---------------------------------------------------------------------------
+# Multi-row upsert — one round trip per CHUNK, not per row
+# ---------------------------------------------------------------------------
+#
+# The sweep used to write one statement per content_key: 4,266 round trips on the
+# seed run, 7-30 minutes over the Railway public proxy, all in one transaction.
+# Interrupting that leaves an orphaned backend holding row locks, so the next
+# attempt blocks and looks like a connection hang — self-amplifying, and it cost
+# the 2026-07-26 seed several attempts.
+#
+# `databases.execute_many` is NOT a fix: its postgres backend loops over
+# `connection.execute` internally (verified in the installed 0.7.0 source). These
+# tests pin the real thing.
+
+
+class TestMultiRowUpsert:
+    def test_one_row_form_matches_the_single_row_statement(self):
+        """The two forms must stay the same statement, modulo param suffixes."""
+        from services.content_canonical_election import (
+            UPSERT_ELECTION_SQL,
+            upsert_elections_sql,
+        )
+
+        assert upsert_elections_sql(1).replace("_0", "") == UPSERT_ELECTION_SQL
+
+    def test_n_rows_produce_n_value_tuples_and_one_conflict_clause(self):
+        from services.content_canonical_election import upsert_elections_sql
+
+        sql = upsert_elections_sql(7)
+        assert sql.count("NOW(), NOW())") == 7
+        # ONE conflict clause for the whole statement — not one per row.
+        assert sql.count("ON CONFLICT") == 1
+        # The guard that keeps `written` honest must survive batching.
+        assert "IS DISTINCT FROM" in sql
+
+    def test_params_are_flat_and_positionally_suffixed(self):
+        from services.content_canonical_election import (
+            Election,
+            upsert_elections_params,
+            upsert_elections_sql,
+        )
+
+        rows = [
+            Election("ck_a", SIG_A, REASON_SOLE_CANDIDATE),
+            Election("ck_b", SIG_F, REASON_DEDUPE_KEEPER),
+        ]
+        params = upsert_elections_params(rows)
+        assert params == {
+            "content_key_0": "ck_a",
+            "canonical_sig_id_0": SIG_A,
+            "election_reason_0": REASON_SOLE_CANDIDATE,
+            "content_key_1": "ck_b",
+            "canonical_sig_id_1": SIG_F,
+            "election_reason_1": REASON_DEDUPE_KEEPER,
+        }
+        # Every placeholder in the SQL must have a value, and vice versa.
+        sql = upsert_elections_sql(len(rows))
+        for name in params:
+            assert f":{name}" in sql
+        import re
+
+        assert set(re.findall(r":([a-z_]+_\d+)", sql)) == set(params)
+
+    def test_duplicate_content_key_in_one_batch_is_refused(self):
+        """Postgres rejects a multi-row ON CONFLICT touching one target twice.
+
+        The per-row loop could never hit this, so batching introduces the failure
+        mode. `plan_elections` is keyed by content_key and cannot produce a
+        duplicate, but that is an invariant of another function — assert it here
+        rather than surfacing an opaque server error.
+        """
+        from services.content_canonical_election import (
+            Election,
+            upsert_elections_params,
+        )
+
+        with pytest.raises(ValueError, match="duplicate content_key"):
+            upsert_elections_params(
+                [
+                    Election("ck_dup", SIG_A, REASON_SOLE_CANDIDATE),
+                    Election("ck_dup", SIG_F, REASON_SOLE_CANDIDATE),
+                ]
+            )
+
+    def test_plan_elections_never_yields_a_duplicate_content_key(self):
+        """The upstream guarantee the batch write depends on."""
+        planned = plan_elections(
+            candidates_by_content_key={
+                "ck_1": [SIG_A, SIG_F],
+                "ck_2": [SIG_F],
+                "ck_3": [SIG_A, SIG_F, SIG_LEGACY],
+            },
+            stored_by_content_key={},
+        )
+        keys = [e.content_key for e in planned]
+        assert len(keys) == len(set(keys))
+
+    def test_row_count_must_be_positive(self):
+        from services.content_canonical_election import upsert_elections_sql
+
+        with pytest.raises(ValueError):
+            upsert_elections_sql(0)
+
+    def test_chunk_size_stays_under_the_postgres_parameter_cap(self):
+        """3 params per row; Postgres caps a statement at 65,535 binds."""
+        from services.content_canonical_election import UPSERT_CHUNK_ROWS
+
+        assert UPSERT_CHUNK_ROWS * 3 < 65535
+        assert UPSERT_CHUNK_ROWS >= 100, "too small to meaningfully cut round trips"
+
+
+# ---------------------------------------------------------------------------
+# run_election's WRITE PATH — the code this whole change exists to alter
+# ---------------------------------------------------------------------------
+#
+# It had no coverage at all, and review mutation-testing proved the consequence:
+# slicing `planned[start : start + UPSERT_CHUNK_ROWS - 1]` (silently dropping one
+# election per chunk), and reverting to one execute per row (undoing the entire
+# fix), BOTH shipped with a green suite. These close that.
+
+
+class _FakeDb:
+    """Captures every (sql, params) the sweep issues. No server needed.
+
+    `transaction()` is an async context manager because the write is wrapped in
+    one, and that wrapping is itself part of the contract — all-or-nothing.
+    """
+
+    def __init__(self, *, candidates, stored=(), keepers=()):
+        self._candidates = candidates
+        self._stored = stored
+        self._keepers = keepers
+        self.executed: list = []
+        self.transactions = 0
+
+    async def fetch_all(self, query):
+        text = str(query)
+        if "content_canonical_election" in text:
+            return list(self._stored)
+        if "keeper" in text.lower():
+            return list(self._keepers)
+        return list(self._candidates)
+
+    async def execute(self, query, params=None):
+        self.executed.append((str(query), params or {}))
+
+    def transaction(self):
+        outer = self
+
+        class _Txn:
+            async def __aenter__(self):
+                outer.transactions += 1
+                return self
+
+            async def __aexit__(self, *exc):
+                return False
+
+        return _Txn()
+
+
+def _run_sweep(monkeypatch, *, rows, apply=True):
+    """Drive run_election against _FakeDb and return (report, fake)."""
+    import asyncio
+
+    import scripts.elect_content_canonicals as script
+
+    fake = _FakeDb(candidates=rows)
+    monkeypatch.setattr(script, "database", fake)
+    report = asyncio.run(script.run_election(apply=apply))
+    return report, fake
+
+
+class TestWritePath:
+    def _candidate_rows(self, n):
+        # One candidate per content_key -> one planned election each.
+        return [
+            {"content_key": f"ck_{i:05d}", "pivota_signature_id": "sig_" + f"{i:032x}"}
+            for i in range(n)
+        ]
+
+    def test_every_planned_election_is_written_exactly_once(self, monkeypatch):
+        """No election may be dropped by chunk arithmetic.
+
+        The mutation that motivated this (`+ UPSERT_CHUNK_ROWS - 1`) loses one row
+        per chunk — ~9 elections per sweep — and is invisible to any test that only
+        inspects the SQL builder.
+        """
+        from services.content_canonical_election import UPSERT_CHUNK_ROWS
+
+        n = UPSERT_CHUNK_ROWS * 2 + 7  # deliberately not a chunk multiple
+        report, fake = _run_sweep(monkeypatch, rows=self._candidate_rows(n))
+
+        assert report["written"] == n
+        written_keys = set()
+        for _sql, params in fake.executed:
+            written_keys |= {
+                v for k, v in params.items() if k.startswith("content_key_")
+            }
+        assert len(written_keys) == n
+        assert written_keys == {f"ck_{i:05d}" for i in range(n)}
+
+    def test_writes_are_batched_not_one_statement_per_row(self, monkeypatch):
+        """Pins the actual fix. Reverting to a per-row loop must fail here."""
+        from services.content_canonical_election import UPSERT_CHUNK_ROWS
+
+        n = UPSERT_CHUNK_ROWS * 2 + 7
+        _report, fake = _run_sweep(monkeypatch, rows=self._candidate_rows(n))
+
+        import math
+
+        expected = math.ceil(n / UPSERT_CHUNK_ROWS)
+        assert len(fake.executed) == expected, (
+            f"{n} elections issued {len(fake.executed)} statements; expected "
+            f"{expected}. A per-row loop would issue {n}."
+        )
+        # …and no chunk may exceed the cap.
+        for _sql, params in fake.executed:
+            assert len(params) <= UPSERT_CHUNK_ROWS * 3
+
+    def test_the_whole_write_is_one_transaction(self, monkeypatch):
+        _report, fake = _run_sweep(monkeypatch, rows=self._candidate_rows(1200))
+        assert fake.transactions == 1, "chunks must share one all-or-nothing txn"
+
+    def test_dry_run_writes_nothing(self, monkeypatch):
+        report, fake = _run_sweep(
+            monkeypatch, rows=self._candidate_rows(50), apply=False
+        )
+        assert fake.executed == []
+        assert fake.transactions == 0
+        assert report["written"] == 0
+
+
+class TestUpsertGuardsArePinnedNotJustDocumented:
+    def test_elected_at_is_never_overwritten_on_conflict(self):
+        """Migration 181 calls `elected_at == updated_at` the metric to alert on.
+
+        Adding `elected_at = NOW()` to the DO UPDATE SET destroys that signal and
+        was caught by nothing — the guarantee lived only in prose.
+        """
+        from services.content_canonical_election import (
+            _UPSERT_CONFLICT_TAIL,
+            upsert_elections_sql,
+        )
+
+        assert "elected_at" not in _UPSERT_CONFLICT_TAIL
+        head, _, tail = upsert_elections_sql(3).partition("ON CONFLICT")
+        assert "elected_at" in head, "still inserted on the INSERT path"
+        assert "elected_at" not in tail, "must not be touched on the UPDATE path"
