@@ -26,9 +26,16 @@ anything or the test silently exercises generic JSON and proves nothing.
     DATABASE_URL=postgresql://localhost/pivota_dialect_check \
         pytest tests/test_citation_read_surfaces_postgres.py
 
-Tables are created empty. The failure class is in PARSE/PREPARE, so zero rows are
-enough — and an empty fixture cannot be subtly wrong about eligibility semantics
-the way a populated one can. Row-level semantics stay in the SQLite matrices.
+Tables are created empty, because the failure class is in PARSE/PREPARE and zero
+rows are enough to detect it. ONE test is the exception and inserts three rows:
+every one of these statements sits behind a fail-closed `except`, so a broken
+query returns False/None rather than raising, and only a POSITIVE answer proves
+the statement ran at all. That test therefore encodes real eligibility semantics
+— an active seed on the content route plus `serving_eligible`, i.e. get_pdp_v2's
+two gates. Keep it at exactly that. A fixture that is subtly wrong about
+eligibility is how a Postgres gate manufactures false confidence, and the
+row-level matrix belongs in the SQLite suites, which are the right engine for it.
+
 Never point this at prod.
 """
 
@@ -136,52 +143,85 @@ async def test_sig_renderable_query_executes(db_connected):
 
 
 @pytest.mark.asyncio
-async def test_sig_renderable_reports_true_for_a_row_that_renders(db_connected):
-    """And it must be capable of answering True — a fail-closed guard that is
-    permanently broken also returns False, so False alone proves nothing."""
+async def test_sig_renderable_and_elected_lookup_answer_for_a_real_row(db_connected):
+    """Both embedded-SQL strings must be capable of a POSITIVE answer.
+
+    A fail-closed guard that is permanently broken also returns False/None, so a
+    negative result proves nothing about whether the statement ran. This is the
+    only test in the file that can tell "nothing renders" from "the check is
+    dead", which is why it is worth the fixture.
+
+    THE ONE PLACE THIS FILE ENCODES ROW SEMANTICS, deliberately and narrowly: an
+    active seed on the content route plus `serving_eligible`, i.e. exactly
+    get_pdp_v2's two gates and nothing else. Do not grow this into an eligibility
+    matrix — the SQLite suites own that, and a fixture that is subtly wrong about
+    eligibility is how a Postgres gate produces false confidence.
+    """
     from db.database import database
-    from routes.agent_citation_v1 import _sig_renderable
+    from routes.agent_citation_v1 import _elected_canonical_sig, _sig_renderable
 
     sig = "sig_" + "a" * 32
-    await database.execute(
-        (
-            "INSERT INTO catalog_products (product_key, content_key,"
-            " pivota_signature_id, merchant_id, platform, source_product_id,"
-            " title, source_system)"
-            " VALUES (:pk, :ck, :sig, 'external_seed', 'external_seed',"
-            " 'ext_render_probe', 'Render Probe', 'external_seed')"
-        ),
-        {"pk": "pk_render_probe", "ck": "ck_render_probe", "sig": sig},
-    )
-    await database.execute(
-        (
-            "INSERT INTO index_pipeline_state (content_key, serving_eligible,"
-            " index_eligible) VALUES (:ck, TRUE, TRUE)"
-        ),
-        {"ck": "ck_render_probe"},
-    )
-    await database.execute(
-        (
-            "INSERT INTO external_product_seeds (external_product_id,"
-            " attached_product_key, status, merchant_id, source, product_key,"
-            " source_product_id) VALUES ('ext_render_probe', 'pk_render_probe',"
-            " 'active', 'external_seed', 'external_seed', 'pk_render_probe',"
-            " 'ext_render_probe')"
-        )
-    )
+    elected = "sig_" + "b" * 32
+    # Every insert inside the try: a failure part-way through must still clean up,
+    # or `pk_render_probe` survives and wedges every later run on a duplicate key.
     try:
-        assert await _sig_renderable(sig) is True
-    finally:
         await database.execute(
-            ("DELETE FROM external_product_seeds WHERE product_key = :pk"),
-            {"pk": "pk_render_probe"},
+            (
+                "INSERT INTO catalog_products (product_key, content_key,"
+                " pivota_signature_id, merchant_id, platform, source_product_id,"
+                " title, source_system)"
+                " VALUES (:pk, :ck, :sig, 'external_seed', 'external_seed',"
+                " 'ext_render_probe', 'Render Probe', 'external_seed')"
+            ),
+            {"pk": "pk_render_probe", "ck": "ck_render_probe", "sig": sig},
         )
         await database.execute(
-            ("DELETE FROM index_pipeline_state WHERE content_key = :ck"),
+            (
+                "INSERT INTO index_pipeline_state (content_key, serving_eligible,"
+                " index_eligible) VALUES (:ck, TRUE, TRUE)"
+            ),
             {"ck": "ck_render_probe"},
         )
         await database.execute(
-            ("DELETE FROM catalog_products WHERE product_key = :pk"),
+            (
+                "INSERT INTO external_product_seeds (external_product_id,"
+                " attached_product_key, status, merchant_id, source, product_key,"
+                " source_product_id) VALUES ('ext_render_probe', 'pk_render_probe',"
+                " 'active', 'external_seed', 'external_seed', 'pk_render_probe',"
+                " 'ext_render_probe')"
+            )
+        )
+        assert await _sig_renderable(sig) is True
+
+        # The OTHER embedded string this change adds on the same route, behind the
+        # same shape of fail-closed except (returns None). Uncovered, it would be
+        # free to be silently broken in exactly the way the fragment was. The
+        # election names a sig that is NOT electable here (no row backs it), so
+        # the validated lookup must answer None — a bare table read would answer
+        # with the stored winner, which is the failure this validation prevents.
+        await database.execute(
+            (
+                "INSERT INTO content_canonical_election (content_key,"
+                " canonical_sig_id) VALUES (:ck, :elected)"
+            ),
+            {"ck": "ck_render_probe", "elected": elected},
+        )
+        assert await _elected_canonical_sig("ck_render_probe") is None
+    finally:
+        await database.execute(
+            "DELETE FROM content_canonical_election WHERE content_key = :ck",
+            {"ck": "ck_render_probe"},
+        )
+        await database.execute(
+            "DELETE FROM external_product_seeds WHERE product_key = :pk",
+            {"pk": "pk_render_probe"},
+        )
+        await database.execute(
+            "DELETE FROM index_pipeline_state WHERE content_key = :ck",
+            {"ck": "ck_render_probe"},
+        )
+        await database.execute(
+            "DELETE FROM catalog_products WHERE product_key = :pk",
             {"pk": "pk_render_probe"},
         )
 

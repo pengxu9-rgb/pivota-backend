@@ -729,7 +729,11 @@ def sig_pdp_will_render_sql(sig_column: str) -> str:
             f"{compiled[:80]!r}...{compiled[-40:]!r}"
         )
     fragment = compiled[len(prefix) : -len(suffix)].strip()
-    if not fragment.startswith("EXISTS (") or not fragment.endswith(")"):
+    if (
+        not fragment.startswith("EXISTS (")
+        or not fragment.endswith(")")
+        or fragment.count("(") != fragment.count(")")
+    ):
         raise RuntimeError(
             "sig_pdp_will_render_sql: fragment is not a bare balanced EXISTS "
             f"expression: {fragment[:60]!r}...{fragment[-40:]!r}"
