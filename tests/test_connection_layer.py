@@ -120,13 +120,15 @@ def test_verified_native_payments_also_lifts_to_layer_3():
     )
 
 
-@pytest.mark.parametrize("unknown", [None, False, 0, "", "true", 1])
+@pytest.mark.parametrize("unknown", [True, None, False, 0, "", "true", 1])
 def test_only_a_strict_true_psp_fact_lifts_the_layer(unknown):
-    """Unknown (None) and truthy-non-True are NOT yes.
+    """Unknown (None) and truthy-non-True are NOT yes; only ``True`` is.
 
     Mirrors ``get_platform_settlement_rails``' identity check: an unverified fact
     must never light a rail, and ``"true"``/``1`` are the shapes a JSON round-trip
-    produces from a source that was never actually verified.
+    produces from a source that was never actually verified. (``1 is True`` is
+    ``False`` in Python, so the ``1`` case genuinely exercises the negative arm —
+    ``True`` is in the list so the positive arm is reachable at all.)
     """
     expected = LAYER_SYNCED_PSP if unknown is True else LAYER_SYNCED
     assert (
@@ -260,11 +262,71 @@ def test_field_emission_flag_rejects_everything_else(value):
 # ---- SQL twin shape ---------------------------------------------------------
 
 
-def test_sql_alias_is_identifier_validated():
-    """The alias is the only caller-supplied token in the expression."""
-    injected = connection_layer_sql("cp; DROP TABLE catalog_products; --")
-    assert "DROP TABLE" not in injected
-    assert "cp.catalog_track" in injected
+@pytest.mark.parametrize(
+    "bad_alias",
+    [
+        "cp; DROP TABLE catalog_products; --",
+        "cp'--",
+        "cp)",
+        "1cp",
+        "",
+        "   ",
+        None,
+        0,
+    ],
+)
+def test_sql_alias_is_identifier_validated(bad_alias):
+    """The alias is the only caller-supplied token in the expression.
+
+    Asserting the absence of ``DROP TABLE`` alone would pass for ANY fallback,
+    so this asserts the emitted alias is exactly the default.
+    """
+    sql = connection_layer_sql(bad_alias)
+    assert "DROP TABLE" not in sql
+    assert "cp.catalog_track" in sql
+    assert "cp.merchant_id" in sql
+
+
+@pytest.mark.parametrize("reserved", ["ms_cl", "mo_cl", "mo_psp", "pmc_cl", "MS_CL"])
+def test_reserved_internal_aliases_cannot_shadow_the_subquery_scope(reserved):
+    """A caller alias equal to an internal one decorrelates the subquery.
+
+    ``connection_layer_sql('ms_cl')`` would emit
+    ``WHERE ms_cl.merchant_id = ms_cl.merchant_id`` — always true, so the store
+    leg silently becomes "does ANY live store exist anywhere" and the expression
+    returns a wrong layer with no error and no injection. Measured before the
+    guard existed.
+    """
+    sql = connection_layer_sql(reserved)
+    assert "ms_cl.merchant_id = ms_cl.merchant_id" not in sql
+    assert "mo_cl.merchant_id = mo_cl.merchant_id" not in sql
+    assert "mo_psp.merchant_id = mo_psp.merchant_id" not in sql
+    assert "pmc_cl.merchant_id = pmc_cl.merchant_id" not in sql
+    assert "cp.catalog_track" in sql
+
+
+def test_sql_trims_the_track_exactly_as_python_does():
+    """The Python twin normalises with ``.strip()``. Without ``btrim`` in the
+    SQL, ``' internal_merchant '`` is layer 2 in Python and layer 1 in SQL —
+    executed against real Postgres before this assertion existed."""
+    sql = connection_layer_sql("cp")
+    assert "btrim" in sql
+    assert sql.count("lower(btrim(COALESCE(cp.catalog_track, '')))") == 2
+
+
+def test_sql_accepts_every_live_store_status():
+    """A narrower set here than ``merchant_store_service``'s canonical
+    ``status IN ('active','connected')`` makes the twins disagree."""
+    sql = connection_layer_sql("cp")
+    assert "'active'" in sql
+    assert "'connected'" in sql
+
+
+def test_slug_never_raises_on_a_stray_value():
+    """This feeds a protocol payload; a ValueError would take the response with it."""
+    assert connection_layer_slug("abc") == "crawled"
+    assert connection_layer_slug([]) == "crawled"
+    assert connection_layer_slug(None) == "crawled"
 
 
 def test_sql_states_the_missing_merchant_leg_explicitly():

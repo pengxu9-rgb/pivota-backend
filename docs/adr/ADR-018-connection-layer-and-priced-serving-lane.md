@@ -5,7 +5,7 @@
 **Deciders:** Founder (peng) — policy; Commerce / Serving owners
 **Supersedes (a position, not an ADR):** "the ACP feed is empty by design until a real merchant connects." That position defined *real merchant* as *connected via product sync*. The founder rejects that definition.
 **Relationship:** applies **ADR-001** (Pivota owns the canonical record; merchants supply offers) to the *transactability* axis; consumes **ADR-016** (non-custodial) unchanged — nothing here puts Pivota in the fund flow; extends the settlement-rails vocabulary introduced in `services/platform_capabilities.get_platform_settlement_rails`. Companion to **ADR-007** (citable index) — this ADR is about the *commerce* projection of the same rows.
-**Scope:** how the three connection layers are represented, how they are expressed on ACP / UCP / MCP, and what the ACP product feed selects. **Out of scope:** opening the ACP checkout doors (`ACP_REST_ENABLED`, `ACP_SIGNING_SECRET`) — this ADR is about feed CONTENT.
+**Scope:** how the three connection layers are represented, how they are expressed on ACP / UCP / MCP, and what the ACP product feed selects. **Out of scope:** opening the ACP checkout doors (`AGENT_CHECKOUT_ACP_REST_ENABLED` + `AGENT_CHECKOUT_STRICT`, and the `ACP_SIGNING_SECRET` the adapter build requires) — this ADR is about feed CONTENT.
 
 ---
 
@@ -27,7 +27,7 @@ All three are transactable; the layer describes **how**, not **whether**.
 
 ### What was actually wrong
 
-The public ACP feed (`GET /acp/feed`, `ACP_PUBLIC_FEED=1`, checkout doors dark) returns `{"version":"2026-04-17","count":0,"products":[]}` — verified live 2026-07-27. Its source is
+The public ACP feed (`GET /acp/feed` — mounted by `AGENT_CHECKOUT_STRICT` + `AGENT_CHECKOUT_ACP_FEED_ENABLED`, served unsigned by `ACP_PUBLIC_FEED`, checkout doors dark) returns `{"version":"2026-04-17","count":0,"products":[]}` — verified live 2026-07-27. Its source is
 `invokeCommerceKernelRawUpstream('find_products', {})` → backend `_handle_find_products_multi` → the **connected_catalog** lane (live catalogs of connected Shopify stores), gated only by `_is_product_sellable`. Every connected store is a test rig, so `testMerchantPolicy` correctly empties it.
 
 Two separate errors were folded into one story:
@@ -102,7 +102,7 @@ The founder's model reads as a ladder: higher layer, better transaction. The cod
 
 - **Layer 1 today** executes via the attributed redirect (`/r?token=…`), and for six allowlisted brands (`cosrx.com, beautyofjoseon.com, skin1004.com, anua.us, medicube.us, mixsoon.us`) it upgrades at click time to a **warm handoff** — a pre-built cart on the brand's own Shopify checkout (`services/outbound_warm_handoff.py`).
 - **Layer 2** — synced but no PSP — executes via… the same attributed redirect. `_attach_connected_product_redirects` stamps a cart-permalink `/r` link on connected cards. Layer 2 is **not a distinct execution path in the code today**; it is a data-freshness and inventory-accuracy tier.
-- **Layer 3** would execute via the Pivota-orchestrated ACP checkout — which is **dark** (`ACP_REST_ENABLED` off, `POST /acp/checkout_sessions` returns 404, verified live). Layer 3 is presently the *least* transactable of the three through Pivota.
+- **Layer 3** would execute via the Pivota-orchestrated ACP checkout — which is **dark** (`AGENT_CHECKOUT_ACP_REST_ENABLED` off, so `POST /acp/checkout_sessions` returns 404, verified live). Layer 3 is presently the *least* transactable of the three through Pivota.
 
 And warm-handoff eligibility keys on **brand domain**, not on layer. A crawled Layer-1 COSRX product gets a strictly better execution path than a hypothetical Layer-2 product from a brand that is not allowlisted.
 
@@ -154,7 +154,19 @@ This is not new code. `src/services/productEntityIndexFeed.js::getProductEntityI
 
 **4. An item with no price is not emitted.** Price is the hard requirement. A row that survives every gate but has no currency-bearing priced offer is dropped from the feed rather than emitted with `price: null`. (Measured cost of this rule today: 0 rows — every serving-eligible row has `has_price`.)
 
-**5. Nothing about the money path changes.** `ACP_REST_ENABLED` and `ACP_SIGNING_SECRET` stay unset; `ACP_PUBLIC_FEED` alone stays the feed's gate. `POST /acp/checkout_sessions` continues to 404. Pivota remains a mid-man: the feed's `link` is a Pivota canonical PDP, `external_redirect_url` is the signed `/r` attribution link to the **merchant's own** destination, and settlement is the merchant's. **No lane in this design puts Pivota in the fund flow or makes it merchant-of-record** — `buildUcpProfile` already publishes `provider.merchant_of_record: false`, and that stays.
+**5. Nothing about the money path changes.** `AGENT_CHECKOUT_ACP_REST_ENABLED` and `ACP_SIGNING_SECRET` stay unset, and `POST /acp/checkout_sessions` continues to 404.
+
+Getting these flag names right matters, because an operator acting on the wrong one verifies nothing. As implemented in `src/acpFeedFlags.js`:
+
+| Flag | What it actually does |
+|---|---|
+| `AGENT_CHECKOUT_STRICT` | required for **any** `/acp` route to mount; without it everything 404s |
+| `AGENT_CHECKOUT_ACP_REST_ENABLED` | mounts the **5 checkout endpoints**; also implies the feed |
+| `AGENT_CHECKOUT_ACP_FEED_ENABLED` | mounts **`GET /acp/feed` only** — the decoupling that lets discovery ship without the money path |
+| `ACP_PUBLIC_FEED` | serves the feed **without an HMAC signature**. It is not a mount gate. |
+| `ACP_SIGNING_SECRET` | not part of the 404 gate at all — it is checked in the lazy adapter build, and its absence surfaces as **503 `MERCHANT_UNAVAILABLE`**, not 404 |
+
+So the feed's mount gate is `AGENT_CHECKOUT_STRICT` + `AGENT_CHECKOUT_ACP_FEED_ENABLED`; `ACP_PUBLIC_FEED` only removes the signature requirement. Pivota remains a mid-man: the feed's `link` is a Pivota canonical PDP, `external_redirect_url` is the signed `/r` attribution link to the **merchant's own** destination, and settlement is the merchant's. **No lane in this design puts Pivota in the fund flow or makes it merchant-of-record** — `buildUcpProfile` already publishes `provider.merchant_of_record: false`, and that stays.
 
 ---
 
@@ -243,7 +255,8 @@ Decisive factor: **this is a public, externally-ingested surface. A field that i
 - `classify_connection_layer(...)` — pure function over `(catalog_track, has_active_store, psp_connected, has_native_payments, merchant_known)`; returns layer + slug. Absence from `merchant_onboarding` is Layer 1 **by construction** (F3), never an unknown to be defaulted.
 - `resolve_execution_paths(...)` — the orthogonal axis: warm-handoff allowlist membership and door state, resolved from live facts, not from the layer.
 - `connection_layer_sql(...)` — the SQL twin of the classifier, for serving queries, kept in the same file as its Python twin so the two cannot drift silently.
-- `CONNECTION_LAYER_FIELD_ENABLED` — default-**off** flag guarding outward emission. The classifier is always importable; only the emission is flagged.
+- A caller alias equal to one of the expression's own internal subquery aliases (`ms_cl`, `mo_cl`, `mo_psp`, `pmc_cl`) would **shadow** the inner scope — `WHERE ms_cl.merchant_id = ms_cl.merchant_id` decorrelates the subquery into "does ANY live store exist anywhere" and silently returns a wrong layer, with no error and no injection. Those names are rejected by the alias validator rather than merely documented.
+- `CONNECTION_LAYER_FIELD_ENABLED` — a default-**off** flag reserved for the gateway emission in rollout step 3. **Nothing consults it yet**, and it is stated plainly here rather than described as protecting a surface it does not: the only thing this change emits is the merchant-scoped `connection_layer_ceiling` below, which is unconditional. That is safe because those keys reach no HTTP body — `resolve_merchant_capability`'s single consumer (`services/tier2_acp_lane`) stores the dict on `AcpLaneDecision.capability`, and `routes/agent_checkout_intents` projects only `platform` / `reason` / `settlement_rail` out of it.
 
 Wired additively into `services/merchant_capability_resolver.resolve_merchant_capability`, alongside `settlement_rails`, as **`connection_layer_ceiling`** (+ `_slug`). The `_ceiling` suffix is load-bearing: that resolver is merchant-scoped and has no `catalog_track`, so the only honest answer it can give is *the highest layer this merchant's own synced rows could reach* — a crawled row under the same merchant is still Layer 1. Present on **every** return path including the early ones, so no consumer learns to write `?? 3`.
 
@@ -251,8 +264,9 @@ Tests: `tests/test_connection_layer.py` (the classification matrix, incl. every 
 
 Two defects were found by writing the tests rather than by review, which is the point of the pairing:
 
-1. **The Python twin disagreed with the SQL twin on a NULL `catalog_track`.** An `if track and track != TRACK_INTERNAL_MERCHANT` guard let an empty/NULL track fall through to Layer 2/3 while the SQL's `lower(COALESCE(...)) <> 'internal_merchant'` correctly returned 1. Fixed; `test_sql_twin_agrees_with_the_python_twin_row_for_row` is the standing guard.
-2. **`postgres-dialect-gate` has a latent inter-file order dependence.** Every `tests/test_*_postgres.py` runs against ONE database in ONE pytest process, and the gate files declare overlapping lightweight tables with `CREATE TABLE IF NOT EXISTS` and *different* column sets — so whichever module runs first fixes the shape for the whole job. Adding a third gate file with a plain `CREATE` turned `test_pdp_content_depth_postgres` red with `column "has_price" does not exist`. This file therefore builds shared tables **additively** (`ADD COLUMN IF NOT EXISTS`) and declares the union; all three orderings were executed and are green. **Any future gate file sharing a lightweight table must do the same.**
+1. **The twins disagreed on `catalog_track` normalisation, twice.** An `if track and track != TRACK_INTERNAL_MERCHANT` guard let an empty/NULL track fall through to Layer 2/3 while the SQL correctly returned 1; and the Python normalised with `.strip()` while the SQL had no `btrim`, so `' internal_merchant '` was Layer 2 in Python and Layer 1 in Postgres. Both fixed. `test_sql_twin_agrees_with_the_python_twin_row_for_row` is the standing guard, and it is **not** vacuous — removing `btrim` from the expression makes it fail, which was executed rather than assumed.
+2. **The resolver's store check.** A first cut passed `has_active_store=bool(store)`. `get_merchant_active_stores`' legacy-MCP leg synthesises a store row whenever `mcp_platform` is set and stamps it `status = 'active' if mcp_connected else 'disconnected'` — appending it **either way** — so a merchant whose only connection is a *disconnected* legacy MCP link was labelled Layer 2 while the SQL twin (which sees no `merchant_stores` row at all) said Layer 1. The status is now checked against `LIVE_STORE_STATUSES`, which is `('active','connected')` — byte-identical to `merchant_store_service`'s canonical predicate, because a narrower set here would make this module disagree with every other read path about what "connected" means.
+3. **`postgres-dialect-gate` has a latent inter-file order dependence.** Every `tests/test_*_postgres.py` runs against ONE database in ONE pytest process, and the gate files declare overlapping lightweight tables with `CREATE TABLE IF NOT EXISTS` and *different* column sets — so whichever module runs first fixes the shape for the whole job. Adding a third gate file with a plain `CREATE` turned `test_pdp_content_depth_postgres` red with `column "has_price" does not exist`. This file therefore builds shared tables **additively** (`ADD COLUMN IF NOT EXISTS`) and declares the union; all three orderings were executed and are green. **Any future gate file sharing a lightweight table must do the same.**
 
 ### Handoff — PIVOTA-Agent (gateway). NOT implemented here.
 
@@ -271,11 +285,11 @@ Two defects were found by writing the tests rather than by review, which is the 
    execution_path:   o.execution_path,        // see ADR-018 §Decision 2
    ```
    and **drop any item whose resolved price is null** rather than emitting `price: null` (Decision 4).
-   Note: the shared protocol sanitizer must be taught to preserve these keys, or they are scrubbed — `resultSanitizer`'s `ATTRIBUTED_LINK_KEYS` is the precedent for a shape-gated preservation.
+   Note on where the keys would otherwise be lost: **not** the sanitizer. `sanitizeResult` is a *denylist* and `connection_layer` matches nothing in it, so it passes straight through (`ATTRIBUTED_LINK_KEYS` only exempts values from URL redaction — non-membership is not a drop). The keys are dropped by `buildAcpFeedItem`'s fixed object literal, which is why they must be added to it explicitly. An implementer who patches the sanitizer instead will change nothing.
 
 3. **`src/services/productEntityIndexFeed.js`** — emit the two fields. `connection_layer` derives from the row it already selects: `cp.catalog_track` is not currently in the `canonical_rows` projection and must be added. `execution_path` needs the warm-handoff brand allowlist, which the gateway already holds.
 
-4. **UCP** (`safety-kernel/src/protocol/ucpProfile.js`) — `buildUcpProfile` advertises capabilities but says nothing about execution paths. Add a `provider.execution_paths` array enumerating the paths this endpoint can actually deliver, so a UCP platform is not left inferring one-click from the presence of a `checkout` capability while `ACP_REST_ENABLED` is off. `provider.merchant_of_record: false` stays.
+4. **UCP** (`safety-kernel/src/protocol/ucpProfile.js`) — `buildUcpProfile` advertises capabilities but says nothing about execution paths. Add a `provider.execution_paths` array enumerating the paths this endpoint can actually deliver, so a UCP platform is not left inferring one-click from the presence of a `checkout` capability while `AGENT_CHECKOUT_ACP_REST_ENABLED` is off. `provider.merchant_of_record: false` stays.
 
 5. **MCP `get_product`** — verified live 2026-07-27: returns `price: {amount, currency}` but **no execution information at all** (no buy URL, no merchant, no path). An agent reading it cannot tell how to transact. Add `execution_path` and the attributed `/r` link to the structured content.
 

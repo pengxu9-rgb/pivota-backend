@@ -390,7 +390,7 @@ async def test_connection_layer_ceiling_is_3_for_connected_shopify_with_live_psp
     from services import merchant_capability_resolver as res
 
     async def fake_get_primary_store(mid):
-        return {"platform": "shopify", "domain": "brand.myshopify.com"}
+        return {"platform": "shopify", "domain": "brand.myshopify.com", "status": "active"}
 
     async def fake_get_merchant_onboarding(mid):
         return {}
@@ -412,7 +412,7 @@ async def test_connection_layer_ceiling_is_2_when_connected_without_a_psp(monkey
     from services import merchant_capability_resolver as res
 
     async def fake_get_primary_store(mid):
-        return {"platform": "shopify", "domain": "brand.myshopify.com"}
+        return {"platform": "shopify", "domain": "brand.myshopify.com", "status": "active"}
 
     async def fake_get_merchant_onboarding(mid):
         return {}
@@ -467,3 +467,63 @@ async def test_connection_layer_ceiling_present_on_every_early_return(monkeypatc
     unmatched = await resolve_merchant_capability("m", platform_override="bigcommerce")
     assert unmatched["store_selector"]["matched"] is False
     assert unmatched["connection_layer_ceiling"] == 1
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("status", ["active", "connected"])
+async def test_connection_layer_ceiling_accepts_both_live_store_statuses(monkeypatch, status):
+    """`connected` is a live status everywhere else in this repo
+    (`merchant_store_service`: `status IN ('active','connected')`). A narrower
+    set here would make this module disagree with every other read path."""
+    from services import merchant_capability_resolver as res
+
+    async def fake_get_primary_store(mid):
+        return {"platform": "shopify", "domain": "b.myshopify.com", "status": status}
+
+    async def fake_get_merchant_onboarding(mid):
+        return {}
+
+    async def fake_live_psp(mid):
+        return None
+
+    monkeypatch.setattr(res, "get_primary_store", fake_get_primary_store)
+    monkeypatch.setattr(res, "get_merchant_onboarding", fake_get_merchant_onboarding)
+    monkeypatch.setattr(res, "_resolve_live_psp_provider", fake_live_psp)
+
+    cap = await res.resolve_merchant_capability("merch_live")
+    assert cap["connection_layer_ceiling"] == 2
+
+
+@pytest.mark.asyncio
+async def test_disconnected_legacy_mcp_store_is_not_layer_2(monkeypatch):
+    """REGRESSION. `get_merchant_active_stores`' legacy-MCP leg synthesises a
+    store row whenever `mcp_platform` is set and stamps it
+    `status = 'active' if mcp_connected else 'disconnected'` — appending it
+    EITHER WAY. So a plain `bool(store)` test labels a merchant with NO live
+    connection layer 2, while the SQL twin (no `merchant_stores` row exists)
+    says layer 1. Two twins, two answers, no error.
+    """
+    from services import merchant_capability_resolver as res
+
+    async def fake_get_primary_store(mid):
+        return {
+            "store_id": f"legacy_{mid}",
+            "platform": "shopify",
+            "domain": "legacy.myshopify.com",
+            "status": "disconnected",
+            "source": "legacy_mcp",
+        }
+
+    async def fake_get_merchant_onboarding(mid):
+        return {"mcp_platform": "shopify", "mcp_connected": False}
+
+    async def fake_live_psp(mid):
+        return None
+
+    monkeypatch.setattr(res, "get_primary_store", fake_get_primary_store)
+    monkeypatch.setattr(res, "get_merchant_onboarding", fake_get_merchant_onboarding)
+    monkeypatch.setattr(res, "_resolve_live_psp_provider", fake_live_psp)
+
+    cap = await res.resolve_merchant_capability("merch_legacy_dead")
+    assert cap["connection_layer_ceiling"] == 1
+    assert cap["connection_layer_ceiling_slug"] == "crawled"

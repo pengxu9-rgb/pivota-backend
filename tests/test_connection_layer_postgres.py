@@ -121,6 +121,14 @@ _FIXTURE = [
     ("pk_native", "merch_native", "internal_merchant", 3),
     # A crawled ROW under a fully connected merchant stays layer 1 (ADR-001).
     ("pk_crawled_under_connected", "merch_psp", "external_referral", 1),
+    # Whitespace-padded tracks. The Python twin normalises with `.strip()`; the
+    # SQL needs `btrim` to match. Without these rows the equality test cannot
+    # see the divergence — it was executed and real: sql=1, py=2.
+    ("pk_padded_internal", "merch_synced", " internal_merchant ", 2),
+    ("pk_padded_external", "merch_synced", "external_referral\t", 1),
+    # `connected` is a live store status everywhere else in this repo
+    # (merchant_store_service: `status IN ('active','connected')`).
+    ("pk_connected_status", "merch_connected", "internal_merchant", 2),
 ]
 
 
@@ -163,6 +171,7 @@ def seeded(pg_engine):
             ("merch_no_store", True),
             ("merch_psp", True),
             ("merch_native", False),
+            ("merch_connected", None),
         ):
             conn.execute(
                 text(
@@ -179,6 +188,7 @@ def seeded(pg_engine):
             ("merch_no_store", "disconnected"),
             ("merch_psp", "active"),
             ("merch_native", "ACTIVE"),  # case-insensitivity is load-bearing
+            ("merch_connected", " connected "),  # padding + the second live status
         ):
             conn.execute(
                 text(
@@ -319,16 +329,51 @@ def test_both_sql_forms_agree_with_each_other(seeded):
     assert not mismatched, f"correlated and joined forms disagree: {mismatched}"
 
 
+def test_joined_form_requires_a_left_join(seeded):
+    """An INNER JOIN does not mislabel layer-1 rows — it ELIMINATES them.
+
+    Per the ADR-018 census that is 100% of the real serving catalog, i.e. a
+    silently empty feed. Executed rather than left as a docstring warning.
+    """
+    from sqlalchemy import text
+
+    from services.connection_layer import connection_layer_sql
+
+    expr = connection_layer_sql("cp", onboarding_alias="mo")
+    with seeded.connect() as conn:
+        left = conn.execute(
+            text(
+                f"SELECT count(*) FROM (SELECT {expr} AS layer FROM catalog_products cp "
+                "LEFT JOIN merchant_onboarding mo ON mo.merchant_id = cp.merchant_id) t"
+            )
+        ).scalar()
+        inner = conn.execute(
+            text(
+                f"SELECT count(*) FROM (SELECT {expr} AS layer FROM catalog_products cp "
+                "INNER JOIN merchant_onboarding mo ON mo.merchant_id = cp.merchant_id) t"
+            )
+        ).scalar()
+
+    assert inner < left, (
+        "the fixture no longer contains a merchant-less row, so this test can no "
+        "longer show that an INNER JOIN drops layer-1 rows"
+    )
+
+
 def test_python_twin_agrees_on_the_same_fixture(seeded):
     """Close the triangle: SQL == Python, computed from the same seeded facts."""
     from sqlalchemy import text
 
-    from services.connection_layer import classify_connection_layer
+    from services.connection_layer import LIVE_STORE_STATUSES, classify_connection_layer
+
+    # Built from the module's own constant so this fact-extraction query cannot
+    # drift from the predicate it is meant to reproduce.
+    live = ", ".join(f"'{status}'" for status in LIVE_STORE_STATUSES)
 
     with seeded.connect() as conn:
         facts = conn.execute(
             text(
-                """
+                f"""
                 SELECT
                   cp.product_key,
                   cp.catalog_track,
@@ -336,7 +381,7 @@ def test_python_twin_agrees_on_the_same_fixture(seeded):
                   EXISTS (
                     SELECT 1 FROM merchant_stores ms
                     WHERE ms.merchant_id = cp.merchant_id
-                      AND lower(COALESCE(ms.status, '')) = 'active'
+                      AND lower(btrim(COALESCE(ms.status, ''))) IN ({live})
                   ) AS has_active_store,
                   mo.psp_connected,
                   pmc.has_shopify_payments

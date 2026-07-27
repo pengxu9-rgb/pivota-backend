@@ -91,6 +91,13 @@ CONNECTION_LAYER_SLUGS: Dict[int, str] = {
 TRACK_EXTERNAL_REFERRAL = "external_referral"
 TRACK_INTERNAL_MERCHANT = "internal_merchant"
 
+#: ``merchant_stores.status`` values that count as a LIVE store connection.
+#: Byte-identical to the repo's canonical predicate in
+#: ``services/merchant_store_service`` (``status IN ('active','connected')``) —
+#: a narrower set here would make the SQL twin disagree with every other read
+#: path about what "connected" means.
+LIVE_STORE_STATUSES: tuple = ("active", "connected")
+
 # ---- the orthogonal axis: execution paths -----------------------------------
 
 #: Signed ``/r`` attribution link to the merchant's own destination. The floor —
@@ -152,9 +159,15 @@ def classify_connection_layer(
         offers; the row's provenance is the row's, not the merchant's).
     :param merchant_known: is there a ``merchant_onboarding`` row at all. False ⇒
         layer 1 by construction (F3), never an unknown to be defaulted.
-    :param has_active_store: a ``merchant_stores`` row with ``status='active'``.
+    :param has_active_store: a ``merchant_stores`` row whose status is live —
+        ``active`` OR ``connected``, matching the repo's canonical predicate in
+        ``services/merchant_store_service`` (``status IN ('active','connected')``).
         Sync without a live store connection is not layer 2 — the sync is stale by
-        definition once the store is disconnected.
+        definition once the store is disconnected. **Callers must check the
+        status, not merely that a store dict exists**: ``get_primary_store``'s
+        legacy-MCP leg synthesises a store row with ``status='disconnected'`` and
+        returns it, so ``bool(store)`` is true for a merchant with no live
+        connection at all.
     :param psp_connected: ``merchant_onboarding.psp_connected``. ``None`` = never
         went through the flow, which is not yes.
     :param has_native_payments: the ``pcs_merchant_capabilities.has_shopify_payments``
@@ -187,9 +200,17 @@ def classify_connection_layer(
     return LAYER_SYNCED
 
 
-def connection_layer_slug(layer: int) -> str:
-    """Slug for outward emission; unknown ints fall to the honest floor."""
-    return CONNECTION_LAYER_SLUGS.get(int(layer or 0), CONNECTION_LAYER_SLUGS[LAYER_CRAWLED])
+def connection_layer_slug(layer: Any) -> str:
+    """Slug for outward emission; ANY unrecognised input falls to the honest floor.
+
+    Never raises — this feeds a protocol payload, and a ``ValueError`` from a
+    stray string would take down the surrounding response for a cosmetic field.
+    """
+    try:
+        key = int(layer or 0)
+    except (TypeError, ValueError):
+        return CONNECTION_LAYER_SLUGS[LAYER_CRAWLED]
+    return CONNECTION_LAYER_SLUGS.get(key, CONNECTION_LAYER_SLUGS[LAYER_CRAWLED])
 
 
 def resolve_execution_paths(
@@ -235,14 +256,26 @@ def resolve_execution_paths(
 
 # ---- the SQL twin -----------------------------------------------------------
 
+#: Aliases the generated SQL uses for its OWN correlated subqueries. A caller
+#: alias equal to one of these would SHADOW the inner scope: the store leg would
+#: become ``WHERE ms_cl.merchant_id = ms_cl.merchant_id``, decorrelating the
+#: subquery into "does ANY active store exist anywhere" and silently returning a
+#: wrong layer — no error, no injection, just a wrong label. Rejected by
+#: ``_normalize_alias`` so the collision is impossible rather than documented.
+_RESERVED_INTERNAL_ALIASES = frozenset({"mo_cl", "mo_psp", "pmc_cl", "ms_cl"})
+
+
 # Allowed SQL identifier (table alias). Anything else falls back to the default so
 # a caller can never inject SQL through the alias parameter. Same guard as the
-# gateway's testMerchantPolicy/activeCatalogSourceSql helpers.
+# gateway's testMerchantPolicy/activeCatalogSourceSql helpers, plus the
+# shadowing check above.
 def _normalize_alias(alias: Any, fallback: str) -> str:
     text = str(alias or "").strip()
     ok = bool(text) and (text[0].isalpha() or text[0] == "_")
     if ok:
         ok = all(ch.isalnum() or ch == "_" for ch in text)
+    if ok and text.lower() in _RESERVED_INTERNAL_ALIASES:
+        ok = False
     return text if ok else fallback
 
 
@@ -262,7 +295,14 @@ def connection_layer_sql(
     statement Postgres refused to PREPARE while SQLite passed it.
 
     :param product_alias: alias holding ``catalog_track`` and ``merchant_id``.
-    :param onboarding_alias: alias of an already-joined ``merchant_onboarding``.
+        May not be one of ``_RESERVED_INTERNAL_ALIASES`` (it would shadow this
+        expression's own subquery scopes); such a value falls back to ``cp``.
+    :param onboarding_alias: alias of an already **LEFT**-joined
+        ``merchant_onboarding``. **An INNER JOIN is wrong and silent**: it does
+        not mislabel layer-1 rows, it ELIMINATES them — and per the ADR-018
+        census that is 100% of the real serving catalog, i.e. an empty feed.
+        ``tests/test_connection_layer_postgres.py`` executes that difference so
+        the constraint is checkable rather than folkloric.
         When omitted the expression uses correlated ``EXISTS``/scalar subqueries
         so it drops into any query with no join surgery. F3 applies either way:
         NO row in ``merchant_onboarding`` ⇒ layer 1, and the ``NOT EXISTS`` leg
@@ -299,17 +339,24 @@ def connection_layer_sql(
         "AND pmc_cl.has_shopify_payments = true)"
     )
 
+    live_statuses = ", ".join(f"'{status}'" for status in LIVE_STORE_STATUSES)
     active_store = (
         "EXISTS (SELECT 1 FROM merchant_stores ms_cl "
         f"WHERE ms_cl.merchant_id = {p}.merchant_id "
-        "AND lower(COALESCE(ms_cl.status, '')) = 'active')"
+        f"AND lower(btrim(COALESCE(ms_cl.status, ''))) IN ({live_statuses}))"
     )
+
+    # `btrim` is not decoration: the Python twin normalises with `.strip()`, so a
+    # whitespace-padded `catalog_track` (' internal_merchant ') would classify as
+    # layer 2 in Python and layer 1 in SQL without it. That divergence was
+    # executed against real Postgres before this line existed.
+    track = f"lower(btrim(COALESCE({p}.catalog_track, '')))"
 
     return f"""
     (CASE
-      WHEN lower(COALESCE({p}.catalog_track, '')) = '{TRACK_EXTERNAL_REFERRAL}' THEN {LAYER_CRAWLED}
+      WHEN {track} = '{TRACK_EXTERNAL_REFERRAL}' THEN {LAYER_CRAWLED}
       WHEN {merchant_missing} THEN {LAYER_CRAWLED}
-      WHEN lower(COALESCE({p}.catalog_track, '')) <> '{TRACK_INTERNAL_MERCHANT}' THEN {LAYER_CRAWLED}
+      WHEN {track} <> '{TRACK_INTERNAL_MERCHANT}' THEN {LAYER_CRAWLED}
       WHEN NOT {active_store} THEN {LAYER_CRAWLED}
       WHEN {psp_fact} OR {native_fact} THEN {LAYER_SYNCED_PSP}
       ELSE {LAYER_SYNCED}
@@ -324,6 +371,7 @@ __all__ = [
     "CONNECTION_LAYER_SLUGS",
     "TRACK_EXTERNAL_REFERRAL",
     "TRACK_INTERNAL_MERCHANT",
+    "LIVE_STORE_STATUSES",
     "EXECUTION_ATTRIBUTED_REDIRECT",
     "EXECUTION_WARM_HANDOFF",
     "EXECUTION_DELEGATED_CHECKOUT",

@@ -30,6 +30,7 @@ from db.database import database
 from db.merchant_onboarding import get_merchant_onboarding
 from services.connection_layer import (
     LAYER_CRAWLED,
+    LIVE_STORE_STATUSES,
     TRACK_INTERNAL_MERCHANT,
     classify_connection_layer,
     connection_layer_slug,
@@ -339,10 +340,20 @@ async def resolve_merchant_capability(
     # `merchant_known` is `merchant is not None`, which is the F3 distinction:
     # a crawled seller has no merchant_onboarding row at all and is layer 1 by
     # construction, never an unknown to be defaulted (services/connection_layer).
+    #
+    # ⚠️ The store's STATUS is checked, not merely that a store dict came back.
+    # `get_merchant_active_stores`' legacy-MCP leg synthesises a store row
+    # whenever `mcp_platform` is set and stamps it
+    # `status = 'active' if mcp_connected else 'disconnected'` — appending it
+    # EITHER WAY. So `bool(store)` is true for a merchant whose only connection
+    # is a disconnected legacy MCP link, and a plain truth test labelled that
+    # merchant layer 2 while the SQL twin (which sees no merchant_stores row at
+    # all) said layer 1. Measured, not theorised.
+    store_status = str((store or {}).get("status") or "").strip().lower()
     connection_layer_ceiling = classify_connection_layer(
         catalog_track=TRACK_INTERNAL_MERCHANT,
         merchant_known=merchant is not None,
-        has_active_store=bool(store),
+        has_active_store=store_status in LIVE_STORE_STATUSES,
         # `has_live_psp` is a resolved bool (a provider was found, or was not) —
         # a genuine negative, not an unknown, so it is passed as-is rather than
         # laundered through None.
