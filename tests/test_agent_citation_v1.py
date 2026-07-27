@@ -89,9 +89,11 @@ class FakeDb:
         row: Optional[Dict[str, Any]],
         *,
         renderable: Any = True,
+        elected_sig: Any = None,
     ) -> None:
         self._row = row
         self._renderable = renderable
+        self._elected_sig = elected_sig
         self.fetch_val_calls: list[Dict[str, Any]] = []
 
     async def fetch_one(self, query: Any, params: Any = None) -> Optional[Dict[str, Any]]:
@@ -99,9 +101,29 @@ class FakeDb:
 
     async def fetch_val(self, query: Any, params: Any = None) -> Any:
         self.fetch_val_calls.append({"query": query, "params": params})
-        if isinstance(self._renderable, BaseException):
-            raise self._renderable
-        return self._renderable
+        # The route issues two DIFFERENT fetch_val queries; keying on the target
+        # table keeps this stub from answering one with the other's value.
+        is_election = "content_canonical_election" in str(query)
+        value = self._elected_sig if is_election else self._renderable
+        if isinstance(value, BaseException):
+            raise value
+        return value
+
+    @property
+    def renderable_calls(self) -> list[Dict[str, Any]]:
+        return [
+            c
+            for c in self.fetch_val_calls
+            if "content_canonical_election" not in str(c["query"])
+        ]
+
+    @property
+    def election_calls(self) -> list[Dict[str, Any]]:
+        return [
+            c
+            for c in self.fetch_val_calls
+            if "content_canonical_election" in str(c["query"])
+        ]
 
 
 @pytest.fixture
@@ -110,9 +132,10 @@ def client_for(monkeypatch: pytest.MonkeyPatch):
         row: Optional[Dict[str, Any]],
         *,
         renderable: Any = True,
+        elected_sig: Any = None,
     ) -> TestClient:
         monkeypatch.setenv("INDEX_ELIGIBLE_READ", "1")
-        db = FakeDb(row, renderable=renderable)
+        db = FakeDb(row, renderable=renderable, elected_sig=elected_sig)
         monkeypatch.setattr(cite, "database", db)
         app = FastAPI()
         app.include_router(cite.router)
@@ -265,8 +288,89 @@ def test_url_renderable_is_null_not_false_when_there_is_no_url(client_for):
     body = client.get("/agent/v1/citation/ck_0123456789abcdef0123456789abcdef").json()
     assert body["attribution"]["canonical_url"] is None
     assert body["attribution"]["url_renderable"] is None
-    # No sig ⇒ the predicate is not even worth a round trip.
-    assert client.fake_db.fetch_val_calls == []  # type: ignore[attr-defined]
+    assert body["attribution"]["url_source"] is None
+    # No sig ⇒ the renderability predicate is not worth a round trip…
+    assert client.fake_db.renderable_calls == []  # type: ignore[attr-defined]
+    # …but the ELECTION still is: a sig-less row can have an elected sibling that
+    # renders, and that sibling's URL beats null. Here there is no election, so
+    # it degrades to null.
+    assert len(client.fake_db.election_calls) == 1  # type: ignore[attr-defined]
+
+
+# ── Step 2: substitute the elected renderable sibling ────────────────────────
+#
+# 229 of the 245 route-broken content_keys have a renderable sibling (12/12
+# sampled siblings served real 200s), so most dead citations can be given a live
+# URL rather than just a false flag. INERT until content_canonical_election is
+# seeded — it is empty in prod today — which is why every test here supplies the
+# election explicitly.
+
+_SIB = "sig_bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+
+
+def test_dead_own_pdp_cites_the_elected_sibling(client_for):
+    client = client_for(_row(), renderable=False, elected_sig=_SIB)
+    att = client.get(
+        "/agent/v1/citation/ck_0123456789abcdef0123456789abcdef"
+    ).json()["attribution"]
+    assert att["canonical_url"] == f"https://agent.pivota.cc/products/{_SIB}"
+    # Electability implies renderable, so the substituted URL is followable.
+    assert att["url_renderable"] is True
+    # …and the substitution is DISCLOSED, never silent.
+    assert att["url_source"] == "elected_canonical"
+
+
+def test_sig_less_row_also_gets_the_elected_sibling(client_for):
+    """No own URL at all is exactly when a sibling's URL is most valuable."""
+    client = client_for(_row(pivota_signature_id=None), elected_sig=_SIB)
+    att = client.get(
+        "/agent/v1/citation/ck_0123456789abcdef0123456789abcdef"
+    ).json()["attribution"]
+    assert att["canonical_url"] == f"https://agent.pivota.cc/products/{_SIB}"
+    assert att["url_renderable"] is True
+    assert att["url_source"] == "elected_canonical"
+
+
+def test_renderable_row_keeps_its_own_url_and_skips_the_election(client_for):
+    """Rung 1 must win, and must not pay for a lookup it cannot use."""
+    client = client_for(_row(), renderable=True, elected_sig=_SIB)
+    att = client.get(
+        "/agent/v1/citation/ck_0123456789abcdef0123456789abcdef"
+    ).json()["attribution"]
+    assert att["canonical_url"] == f"https://agent.pivota.cc/products/{_SIG_ITEM}"
+    assert att["url_source"] == "self"
+    assert client.fake_db.election_calls == []  # type: ignore[attr-defined]
+
+
+def test_unseeded_election_degrades_to_the_flagged_own_url(client_for):
+    """Today's prod state: table empty ⇒ behaviour identical to Step 1."""
+    client = client_for(_row(), renderable=False, elected_sig=None)
+    att = client.get(
+        "/agent/v1/citation/ck_0123456789abcdef0123456789abcdef"
+    ).json()["attribution"]
+    assert att["canonical_url"] == f"https://agent.pivota.cc/products/{_SIG_ITEM}"
+    assert att["url_renderable"] is False
+    assert att["url_source"] == "self"
+
+
+def test_election_lookup_failure_degrades_rather_than_500s(client_for):
+    client = client_for(_row(), renderable=False, elected_sig=RuntimeError("pg down"))
+    res = client.get("/agent/v1/citation/ck_0123456789abcdef0123456789abcdef")
+    assert res.status_code == 200
+    att = res.json()["attribution"]
+    assert att["url_renderable"] is False
+    assert att["url_source"] == "self"
+
+
+@pytest.mark.parametrize("junk", ["", "   ", "sig_", "ck_abc", "not-a-sig"])
+def test_unusable_elected_sig_is_ignored(client_for, junk):
+    """A stored winner that is not a usable sig must never become a URL."""
+    client = client_for(_row(pivota_signature_id=None), elected_sig=junk)
+    att = client.get(
+        "/agent/v1/citation/ck_0123456789abcdef0123456789abcdef"
+    ).json()["attribution"]
+    assert att["canonical_url"] is None
+    assert att["url_source"] is None
 
 
 def test_url_renderable_fails_closed_when_the_check_errors(client_for):

@@ -24,6 +24,7 @@ import time
 from typing import Any, Dict, Optional, Tuple
 
 from fastapi import APIRouter, Depends, HTTPException, Query, Request, Response, status
+from sqlalchemy import String, and_, column, literal_column, select, table
 
 from db.citation_read_log import (
     STATUS_DISABLED,
@@ -43,11 +44,20 @@ from routes.agent_pdp_v1 import (
     _row_to_dict,
 )
 from services.catalog_sync_service import pivota_canonical_pdp_url
+from services.canonical_sitemap_candidates import electable_sig_exists
 from services.claim_safety import substantiated_claims
-from services.pdp_renderability import sig_pdp_will_render_sql
+from services.pdp_renderability import compile_pg, sig_pdp_will_render_sql
 
 router = APIRouter(prefix="/agent/v1/citation", tags=["agent-citation"])
 logger = logging.getLogger(__name__)
+
+# Migration 181. Local Core handle, same lightweight pattern the canonical
+# routes use for this table.
+_content_canonical_election = table(
+    "content_canonical_election",
+    column("content_key", String),
+    column("canonical_sig_id", String),
+)
 
 CITE_AS = "Pivota — agent.pivota.cc"
 SUMMARY_MAX = 200
@@ -202,13 +212,65 @@ def project_citation_item(row: Dict[str, Any]) -> Dict[str, Any]:
     # the rows we cannot yet link to.
     #
     # #1592 fixed the URL's FORM. Whether that now-correct sig URL is FOLLOWABLE
-    # is a separate question, answered by ``attribution.url_renderable`` below.
+    # is a separate question — and when it is NOT, this row's content_key may
+    # still have a sibling that renders, so the citation can be given a URL it
+    # can actually follow instead of a dead one.
+    #
+    # THE LADDER, in order:
+    #   1. this row's own sig, when it renders            -> url_source "self"
+    #   2. the content_key's ELECTED canonical sig         -> "elected_canonical"
+    #   3. this row's own sig, dead, flagged unrenderable  -> "self"
+    #   4. no sig at all                                   -> null
+    #
+    # Step 2 is why 229 of the 245 route-broken content_keys can be given a live
+    # URL rather than a flag: measured 2026-07-26, that many have a renderable
+    # sibling, and 12/12 sampled siblings served real 200s. It reads the STORED
+    # election (migration 181) rather than picking a sibling itself, and the
+    # stored winner is intersected with the live electable set by
+    # ``electable_sig_exists`` — the SAME validation the sitemap feed applies —
+    # so the URL an agent is told to cite is exactly the URL the sitemap
+    # advertises. Computing our own preference here would be a fourth opinion on
+    # a question that already has three consumers, which is how the sitemap and
+    # the PDPs drifted apart in the first place.
+    #
+    # UNTIL THE ELECTION IS SEEDED THIS IS INERT, by construction and not by
+    # accident: ``content_canonical_election`` is empty in prod
+    # (``canonical_sig_id`` null on 5,887/5,887 feed rows), so rung 2 never fires
+    # and every row lands on 1, 3 or 4 exactly as it did before. Seeding is a
+    # separate operator decision — it moves ~350 live sitemap URLs, see
+    # docs/runbooks/content_canonical_election_rollout.md — and this ships safely
+    # ahead of it rather than waiting on it.
     signature_id = str(row.get("pivota_signature_id") or "").strip()
-    canonical_url = (
-        pivota_canonical_pdp_url(signature_id)
+    own_sig = (
+        signature_id
         if signature_id.startswith("sig_") and len(signature_id) > len("sig_")
         else None
     )
+    own_renders = bool(row.get("pdp_renderable"))
+    elected_sig = str(row.get("elected_canonical_sig") or "").strip() or None
+
+    if own_sig and own_renders:
+        canonical_url, url_renderable, url_source = (
+            pivota_canonical_pdp_url(own_sig),
+            True,
+            "self",
+        )
+    elif elected_sig and elected_sig != own_sig:
+        # Electability already implies renderable — that conjunct is inside
+        # electable_sig_exists — so this URL is followable by construction.
+        canonical_url, url_renderable, url_source = (
+            pivota_canonical_pdp_url(elected_sig),
+            True,
+            "elected_canonical",
+        )
+    elif own_sig:
+        canonical_url, url_renderable, url_source = (
+            pivota_canonical_pdp_url(own_sig),
+            False,
+            "self",
+        )
+    else:
+        canonical_url, url_renderable, url_source = None, None, None
 
     return {
         "content_key": content_key,
@@ -257,9 +319,15 @@ def project_citation_item(row: Dict[str, Any]) -> Dict[str, Any]:
             #
             # Null (not False) when there is no URL at all to characterise — a
             # sig-less row. False would imply we checked a link we never had.
-            "url_renderable": (
-                bool(row.get("pdp_renderable")) if canonical_url else None
-            ),
+            "url_renderable": url_renderable,
+            # WHICH rung of the ladder produced canonical_url: "self" (this row's
+            # own sig), "elected_canonical" (the content_key's elected sibling,
+            # substituted because this row's own PDP does not render), or null
+            # when there is no URL. Disclosed rather than silently swapped: an
+            # agent that cites a URL should be able to tell whether it points at
+            # the record it asked for or at that record's group canonical, and a
+            # substitution that could not be detected would be its own dishonesty.
+            "url_source": url_source,
             "cite_as": CITE_AS,
             "attribution_required": True,
         },
@@ -293,6 +361,11 @@ def _search_row_to_citation(row: Dict[str, Any]) -> Dict[str, Any]:
             # catalog_products), keyed on the identical sig expression — so search
             # never pays the single-item read's extra round trip.
             "pdp_renderable": row.get("pdp_renderable"),
+            # Elected canonical for this content_key, so a search hit whose own
+            # PDP is dead still cites a followable URL. Selected by the recall
+            # query (it already reads catalog_products and can validate
+            # electability inline), so search needs no extra round trip.
+            "elected_canonical_sig": row.get("elected_canonical_sig"),
             "title": row.get("product_title"),
             "description": row.get("product_description"),
             "brand": row.get("brand"),
@@ -420,7 +493,66 @@ async def _resolve_citation_item(raw: str) -> Optional[Dict[str, Any]]:
     row_dict["pdp_renderable"] = await _sig_renderable(
         row_dict.get("pivota_signature_id")
     )
+    # Only worth a lookup when the row's own URL is unusable — that is the only
+    # case where the elected sibling changes the answer, and it keeps the common
+    # path (a renderable row) at one extra query rather than two.
+    if not row_dict["pdp_renderable"]:
+        row_dict["elected_canonical_sig"] = await _elected_canonical_sig(
+            row_dict.get("content_key")
+        )
     return project_citation_item(row_dict)
+
+
+# The group's elected canonical, intersected with the live electable set. Built
+# from the SAME helper the sitemap feed validates its own `canonical_sig_id`
+# with, so the URL we tell an agent to cite is the URL the sitemap advertises.
+#
+# `widen=False` deliberately: electability here is a SITEMAP question (which sig
+# holds the public URL), not a citation-read question, and the feed's own
+# election JOIN is the thing this must agree with. INDEX_ELIGIBLE_READ widens who
+# may be READ; it has no bearing on which sibling holds the canonical URL.
+_ELECTED_CANONICAL_SIG_SQL = compile_pg(
+    select(_content_canonical_election.c.canonical_sig_id)
+    .where(
+        and_(
+            _content_canonical_election.c.content_key == literal_column(":ck"),
+            electable_sig_exists(
+                _content_canonical_election.c.canonical_sig_id, widen=False
+            ),
+        )
+    )
+    .limit(1)
+)
+
+
+async def _elected_canonical_sig(content_key: Any) -> Optional[str]:
+    """The content_key's elected canonical sig, or None when there is no usable
+    election.
+
+    None covers every degradation identically — no row in
+    ``content_canonical_election``, a stored winner that has stopped being
+    electable, or a failed query — because the caller's ladder already falls back
+    to the row's own (flagged) URL. That is the same "degrade to no election"
+    contract every other reader of this table honours; see
+    ``electable_sig_exists`` for why naming a stale winner is worse than naming
+    none.
+
+    Returns None for all 5,887 feed rows today: the table is unseeded.
+    """
+    ck = str(content_key or "").strip()
+    if not ck:
+        return None
+    try:
+        value = await database.fetch_val(_ELECTED_CANONICAL_SIG_SQL, {"ck": ck})
+    except Exception:
+        logger.warning(
+            "citation_elected_canonical_lookup_failed",
+            exc_info=True,
+            extra={"content_key": ck},
+        )
+        return None
+    sig = str(value or "").strip()
+    return sig if sig.startswith("sig_") and len(sig) > len("sig_") else None
 
 
 async def _sig_renderable(signature_id: Any) -> bool:
