@@ -375,3 +375,95 @@ async def test_override_unmatched_store_id_is_honest_unknown(monkeypatch):
     cap = await resolve_merchant_capability("m", store_id="st_nope")
     assert cap["platform"] == "unknown"
     assert cap["store_selector"]["matched"] is False
+
+
+# --- ADR-018: connection-layer ceiling --------------------------------------
+#
+# The resolver is MERCHANT-scoped and carries no `catalog_track`, so what it can
+# honestly answer is the CEILING — the highest layer this merchant's own synced
+# rows could reach. A crawled ROW under the same merchant stays layer 1
+# (ADR-001), which is why the key is `_ceiling` and not `connection_layer`.
+
+
+@pytest.mark.asyncio
+async def test_connection_layer_ceiling_is_3_for_connected_shopify_with_live_psp(monkeypatch):
+    from services import merchant_capability_resolver as res
+
+    async def fake_get_primary_store(mid):
+        return {"platform": "shopify", "domain": "brand.myshopify.com"}
+
+    async def fake_get_merchant_onboarding(mid):
+        return {}
+
+    async def fake_live_psp(mid):
+        return "stripe"
+
+    monkeypatch.setattr(res, "get_primary_store", fake_get_primary_store)
+    monkeypatch.setattr(res, "get_merchant_onboarding", fake_get_merchant_onboarding)
+    monkeypatch.setattr(res, "_resolve_live_psp_provider", fake_live_psp)
+
+    cap = await res.resolve_merchant_capability("merch_shop")
+    assert cap["connection_layer_ceiling"] == 3
+    assert cap["connection_layer_ceiling_slug"] == "product_synced_psp"
+
+
+@pytest.mark.asyncio
+async def test_connection_layer_ceiling_is_2_when_connected_without_a_psp(monkeypatch):
+    from services import merchant_capability_resolver as res
+
+    async def fake_get_primary_store(mid):
+        return {"platform": "shopify", "domain": "brand.myshopify.com"}
+
+    async def fake_get_merchant_onboarding(mid):
+        return {}
+
+    async def fake_live_psp(mid):
+        return None
+
+    monkeypatch.setattr(res, "get_primary_store", fake_get_primary_store)
+    monkeypatch.setattr(res, "get_merchant_onboarding", fake_get_merchant_onboarding)
+    monkeypatch.setattr(res, "_resolve_live_psp_provider", fake_live_psp)
+
+    cap = await res.resolve_merchant_capability("merch_shop_nopsp")
+    assert cap["connection_layer_ceiling"] == 2
+
+
+@pytest.mark.asyncio
+async def test_connection_layer_ceiling_is_1_for_a_crawl_merchant(monkeypatch):
+    """The founder's policy in one assertion: a crawled seller is REAL and
+    transactable — it is simply layer 1. No store connection, no PSP, still a
+    first-class row in the census."""
+    from services import merchant_capability_resolver as res
+
+    async def fake_get_primary_store(mid):
+        return None  # un-integrated / crawl merchant
+
+    async def fake_get_merchant_onboarding(mid):
+        return {"website": "https://indie.myshopify.com"}
+
+    async def fake_live_psp(mid):
+        return None
+
+    monkeypatch.setattr(res, "get_primary_store", fake_get_primary_store)
+    monkeypatch.setattr(res, "get_merchant_onboarding", fake_get_merchant_onboarding)
+    monkeypatch.setattr(res, "_resolve_live_psp_provider", fake_live_psp)
+
+    cap = await res.resolve_merchant_capability("merch_crawl")
+    # Fingerprinted platform, but nothing was ever synced from it.
+    assert cap["platform_source"] == "domain_fingerprint"
+    assert cap["connection_layer_ceiling"] == 1
+    assert cap["connection_layer_ceiling_slug"] == "crawled"
+
+
+@pytest.mark.asyncio
+async def test_connection_layer_ceiling_present_on_every_early_return(monkeypatch):
+    """A key that appears only on the happy path teaches consumers to default it."""
+    from services.merchant_capability_resolver import resolve_merchant_capability
+
+    empty = await resolve_merchant_capability("")
+    assert empty["connection_layer_ceiling"] == 1
+
+    _patch_multistore(monkeypatch)
+    unmatched = await resolve_merchant_capability("m", platform_override="bigcommerce")
+    assert unmatched["store_selector"]["matched"] is False
+    assert unmatched["connection_layer_ceiling"] == 1
