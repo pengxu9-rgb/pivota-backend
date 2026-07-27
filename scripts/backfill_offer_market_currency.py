@@ -38,8 +38,10 @@ Why including them is safe, and why it is the honest thing to do:
     "US-buyable" the instant suppression is lifted — reintroducing the original
     defect through the back door.
   * The correct-only guard is UNCHANGED and is what keeps this safe: the UPDATE
-    still requires `upper(coalesce(currency,'')) = 'USD'`, so a row already
-    bearing a real currency remains structurally untouchable, suppressed or not.
+    still requires `upper(trim(coalesce(currency,''))) = 'USD'` — the same
+    predicate `has_us_offer` uses, so the two cannot disagree about what counts
+    as USD — and a row already bearing a real currency remains structurally
+    untouchable, suppressed or not.
     Widening WHICH rows are visible must never widen WHICH rows are writable.
 `--live-only` restores the pre-fix behaviour if an operator ever wants it.
 
@@ -220,8 +222,11 @@ async def _run(args: argparse.Namespace) -> int:
         # next to a live storefront whose relabel WILL change what serves once the
         # currency-derived US-buyable gate is on. Forcing those into a single
         # atomic apply is what pushes an operator to either over-write or skip the
-        # run entirely. Filtering AFTER classification, so the dry-run still shows
-        # the full picture and the narrowing is visible in the output.
+        # run entirely. Filtering AFTER classification, so every domain is still
+        # resolved against its storefront and the narrowing is explicit in the
+        # output. NOTE the main `=== N domains to relabel ===` report counts only
+        # the SELECTION; what was dropped is recoverable from the HELD BACK lines
+        # printed just above it.
         only = {d.strip().lower() for d in (args.only_domain or []) if d.strip()}
         if only:
             skipped = [c for c in corrections if c["domain"].lower() not in only]

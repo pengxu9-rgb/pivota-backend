@@ -104,11 +104,8 @@ def test_live_only_and_only_domain_flags_are_wired():
 
 
 def test_max_domains_and_apply_flags_exist():
-    ns = mod.main.__wrapped__ if hasattr(mod.main, "__wrapped__") else None
-    # parse args to confirm the guard flags are wired
-    import argparse, contextlib, io
-    p = argparse.ArgumentParser()
-    # re-parse via the module's own parser by invoking with --help capture
+    import contextlib, io
+
     with contextlib.redirect_stdout(io.StringIO()) as buf:
         try:
             mod.main(["--help"])
@@ -182,7 +179,12 @@ def _drive(monkeypatch, argv, scan_rows):
     monkeypatch.setattr(mod, "database", fake)
 
     async def fake_meta(domain, **kwargs):
-        return _META.get(domain)
+        # lowercased lookup, matching the real resolver: fetch_storefront_meta
+        # runs the host through storefront_currency.normalize_domain, which
+        # lowercases (and strips `www.`) before building the /meta.json URL. A
+        # case-SENSITIVE fake would make an uppercase domain look unresolvable
+        # here for a reason that does not exist in production.
+        return _META.get(str(domain or "").strip().lower())
 
     monkeypatch.setattr(mod, "fetch_storefront_meta", fake_meta)
     rc = mod.main(argv)
@@ -203,7 +205,7 @@ def test_only_domain_writes_exactly_the_named_domains(monkeypatch):
     assert written == ["mintree.us"]
 
 
-def test_only_domain_is_case_insensitive(monkeypatch):
+def test_only_domain_is_case_insensitive_on_the_CLI_side(monkeypatch):
     rc, fake = _drive(
         monkeypatch,
         ["--apply", "--max-domains", "5", "--only-domain", "MinTree.US"],
@@ -211,6 +213,24 @@ def test_only_domain_is_case_insensitive(monkeypatch):
     )
     assert rc == 0
     assert [d for d, *_ in fake.updates] == ["mintree.us"]
+
+
+def test_only_domain_is_case_insensitive_on_the_ROW_side(monkeypatch):
+    """The other half, and the half that can actually regress.
+
+    The CLI values are lowercased at parse time, so dropping `.lower()` from the
+    ROW comparison leaves the sibling test above green — it was a test that could
+    not fail on the thing it named. Uppercase domain groups are real: the scan
+    groups on raw `source_domain` with no `lower()`, and the Path-C writer stores
+    that column `.strip()`-only.
+    """
+    rc, fake = _drive(
+        monkeypatch,
+        ["--apply", "--max-domains", "5", "--only-domain", "mintree.us"],
+        [_scan_row("MinTree.US"), _scan_row("reddane.co.za")],
+    )
+    assert rc == 0
+    assert [d for d, *_ in fake.updates] == ["MinTree.US"]
 
 
 def test_only_domain_repeats_accumulate(monkeypatch):
@@ -319,3 +339,55 @@ def test_only_domain_typo_warns_loudly(monkeypatch, capsys):
     )
     assert fake.updates == []
     assert "WARNING" in capsys.readouterr().out
+
+
+def test_only_domain_narrowing_can_bring_a_refused_run_under_max_domains(monkeypatch):
+    """`--max-domains` is checked AFTER `--only-domain` narrows, which is the
+    right order — but it means an operator who hits REFUSED can proceed by naming
+    a subset. That is the intended escape valve; pin the ordering so it does not
+    silently invert into "refuse based on the unnarrowed set", which would make
+    `--only-domain` useless exactly when it is needed."""
+    rows = [_scan_row("mintree.us"), _scan_row("reddane.co.za"),
+            _scan_row("lasavonneriedupilonduroy.com", live=57, suppressed=0)]
+
+    rc_wide, fake_wide = _drive(monkeypatch, ["--apply", "--max-domains", "1"], rows)
+    assert rc_wide == 2 and fake_wide.updates == []
+
+    rc_narrow, fake_narrow = _drive(
+        monkeypatch,
+        ["--apply", "--max-domains", "1", "--only-domain", "mintree.us"],
+        rows,
+    )
+    assert rc_narrow == 0
+    assert [d for d, *_ in fake_narrow.updates] == ["mintree.us"]
+
+
+def test_seed_fallback_carries_a_deterministic_tiebreaker():
+    """`ORDER BY eps.updated_at DESC` alone is nondeterministic when two seeds
+    share an `updated_at`, so the dry-run a human reviewed and the --apply they
+    then dispatched could resolve the SAME offer to DIFFERENT storefronts — and
+    stamp it with the wrong currency. The `eps.id` tiebreaker is the only thing
+    making the two statements agree; nothing else asserts it exists."""
+    for sql in (mod.domains_sql(), mod.domains_sql(True),
+                mod.update_offers_sql(), mod.update_offers_sql(True)):
+        flat = " ".join(sql.split()).lower()
+        assert "order by eps.updated_at desc, eps.id desc limit 1" in flat
+
+
+def test_scan_and_update_resolve_the_domain_identically():
+    """The two statements must agree on WHICH domain an offer belongs to. If the
+    scan groups an offer under domain A and the UPDATE matches it under B, the
+    operator approves one thing and writes another."""
+    import re
+
+    def _domain_expr(sql):
+        flat = " ".join(sql.split())
+        m = re.search(r"coalesce\(nullif\(btrim\(o\.source_domain\).*?LIMIT 1\)\)",
+                      flat, re.IGNORECASE)
+        assert m, "domain-resolution expression not found"
+        return m.group(0).lower()
+
+    for live_only in (False, True):
+        assert _domain_expr(mod.domains_sql(live_only)) == _domain_expr(
+            mod.update_offers_sql(live_only)
+        )

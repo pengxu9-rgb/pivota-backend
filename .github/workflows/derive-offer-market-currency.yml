@@ -68,6 +68,22 @@ jobs:
 
       - name: Derive market/currency
         shell: bash
+        # EVERY `${{ }}` value arrives through `env:`, NEVER interpolated into the
+        # script body. `${{ }}` in a `run:` is textual substitution performed
+        # BEFORE the shell parses anything, so an input of `"; echo PWNED; :; "`
+        # renders as executable shell — and this job's env carries the PRODUCTION
+        # `DATABASE_URL`. Demonstrated on this workflow, not theorised: the
+        # `only_domains`, `max_domains` and `min_offers` inputs all had it.
+        # `.github/workflows/postgres-dialect-gate.yml` already spells this rule
+        # out; it just had not been applied here.
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          IN_APPLY: ${{ inputs.apply }}
+          IN_LIVE_ONLY: ${{ inputs.live_only }}
+          IN_MIN_OFFERS: ${{ inputs.min_offers }}
+          IN_MAX_DOMAINS: ${{ inputs.max_domains }}
+          IN_ONLY_DOMAINS: ${{ inputs.only_domains }}
+          RUN_ID: ${{ github.run_id }}
         run: |
           set -euo pipefail
           if [[ -z "${DATABASE_URL:-}" ]]; then
@@ -77,20 +93,21 @@ jobs:
           # scheduled runs are dry-run ONLY (detect drift); writes require an
           # explicit workflow_dispatch with apply=true.
           apply_flag=""
-          if [[ "${{ github.event_name }}" == "workflow_dispatch" && "${{ inputs.apply }}" == "true" ]]; then
+          if [[ "${EVENT_NAME}" == "workflow_dispatch" && "${IN_APPLY:-}" == "true" ]]; then
             apply_flag="--apply"
           fi
           live_only_flag=""
-          if [[ "${{ github.event_name }}" == "workflow_dispatch" && "${{ inputs.live_only }}" == "true" ]]; then
+          if [[ "${EVENT_NAME}" == "workflow_dispatch" && "${IN_LIVE_ONLY:-}" == "true" ]]; then
             live_only_flag="--live-only"
           fi
-          min_offers="${{ inputs.min_offers || '3' }}"
-          max_domains="${{ inputs.max_domains || '25' }}"
+          min_offers="${IN_MIN_OFFERS:-3}"
+          max_domains="${IN_MAX_DOMAINS:-25}"
           # --only-domain is repeatable; expand the comma-separated input into one
           # flag per domain. Built as an array so a stray space cannot word-split
-          # a domain into two bogus flags.
+          # a domain into two bogus flags, and so an empty input expands to ZERO
+          # args rather than one empty one.
           only_args=()
-          only_raw="${{ inputs.only_domains || '' }}"
+          only_raw="${IN_ONLY_DOMAINS:-}"
           if [[ -n "${only_raw}" ]]; then
             IFS=',' read -ra _only <<< "${only_raw}"
             for d in "${_only[@]}"; do
@@ -98,7 +115,7 @@ jobs:
               [[ -n "${d}" ]] && only_args+=(--only-domain "${d}")
             done
           fi
-          out_dir="reports/workflow_ops/derive-offer-market-currency/${{ github.run_id }}"
+          out_dir="reports/workflow_ops/derive-offer-market-currency/${RUN_ID}"
           mkdir -p "${out_dir}"
           python -m scripts.backfill_offer_market_currency \
             --min-offers "${min_offers}" --max-domains "${max_domains}" \

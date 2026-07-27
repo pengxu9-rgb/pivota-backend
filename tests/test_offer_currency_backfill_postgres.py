@@ -139,9 +139,7 @@ async def test_update_prepares_and_executes(pg_schema, live_only):
     """The UPDATE ... RETURNING must PREPARE in both scope renderings.
 
     Empty table ⇒ zero rows written; the assertion is that Postgres accepted the
-    statement at all. `RETURNING` + fetch_all is the shape the script relies on
-    to count writes (`database.execute()` returns None for an UPDATE without
-    RETURNING — that gotcha already reported 0 while writing 664 rows).
+    statement at all.
     """
     from db.database import database
 
@@ -160,3 +158,89 @@ async def test_update_prepares_and_executes(pg_schema, live_only):
     finally:
         await database.disconnect()
     assert rows == []
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("live_only", [False, True])
+async def test_update_actually_returns_the_rows_it_wrote(pg_schema, live_only):
+    """`RETURNING` must be there AND must yield one row per write.
+
+    A review mutation deleted `RETURNING o.offer_id` and NOTHING went red: on an
+    empty table `assert rows == []` is satisfied identically by "prepared, matched
+    nothing" and by "the statement has no RETURNING clause at all". The unit file
+    cannot see it either — its fake DB hands back a hardcoded row for any UPDATE,
+    so the write count there is fiction.
+
+    That matters because the count IS the operator's only evidence: `database
+    .execute()` returns None for an UPDATE without RETURNING, and that exact
+    gotcha once reported `0` while writing 664 rows. So this seeds a real matching
+    row and asserts the row comes back — the only assertion that can tell the two
+    apart.
+    """
+    from sqlalchemy import text
+
+    from db.database import database
+
+    mod = _mod()
+    offer_id = f"gate-returning-{int(live_only)}"
+    engine = pg_schema
+    with engine.begin() as conn:
+        conn.execute(text("DELETE FROM catalog_offers WHERE offer_id = :o"), {"o": offer_id})
+        conn.execute(
+            text(
+                "INSERT INTO catalog_offers "
+                "(offer_id, sku_key, product_key, merchant_id, currency, market,"
+                " list_price, source_system, source_domain) VALUES "
+                "(:o, :sk, :pk, :m, 'USD', 'US', 10.0, :ss, :dom)"
+            ),
+            {
+                "o": offer_id,
+                "sk": f"{offer_id}::sku",
+                "pk": f"{offer_id}::pk",
+                "m": "external_seed",
+                "ss": mod._SEED_SOURCES[0],
+                "dom": "gate-returning.test",
+            },
+        )
+    try:
+        await database.connect()
+        try:
+            rows = await database.fetch_all(
+                mod.update_offers_sql(live_only),
+                {
+                    "cur": "INR",
+                    "mkt": "IN",
+                    "sources": list(mod._SEED_SOURCES),
+                    "domain": "gate-returning.test",
+                },
+            )
+        finally:
+            await database.disconnect()
+
+        assert len(rows) == 1, (
+            "RETURNING must yield one row per relabelled offer — the write count "
+            "the operator reads is derived from exactly this"
+        )
+        assert rows[0]["offer_id"] == offer_id
+
+        # and the correct-only guard means a second pass is a no-op: the row now
+        # carries a real currency and is structurally untouchable.
+        await database.connect()
+        try:
+            again = await database.fetch_all(
+                mod.update_offers_sql(live_only),
+                {
+                    "cur": "INR",
+                    "mkt": "IN",
+                    "sources": list(mod._SEED_SOURCES),
+                    "domain": "gate-returning.test",
+                },
+            )
+        finally:
+            await database.disconnect()
+        assert again == []
+    finally:
+        with engine.begin() as conn:
+            conn.execute(
+                text("DELETE FROM catalog_offers WHERE offer_id = :o"), {"o": offer_id}
+            )
