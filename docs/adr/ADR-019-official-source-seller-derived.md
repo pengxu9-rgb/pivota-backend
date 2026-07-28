@@ -3,12 +3,17 @@
 **Status:** Accepted (implementation ships behind `OFFICIAL_SOURCE_SELLER_DERIVED`, default OFF)
 **Date:** 2026-07-27
 **Supersedes the derivation in:** `services/pivot_query_service._build_canonical_offer_node`
+
+> **On the line numbers below:** they are a convenience, not the contract — cite the symbol when
+> they disagree. They have already rotted twice, once from this ADR's own follow-up edits, so
+> references to moving targets (model field comments, the inlined seller rule) are given by symbol
+> instead.
 **Related:** ADR-009 (seller-of-record identity), Fix Plan C (`services/offer_seller_identity.py`)
 
 ## Context
 
 `OfferNode.official_source` is the authenticity signal an agent sees. Its contract
-(`models/catalog.py:282-288`) is:
+(the `official_source` field comment in `models/catalog.py`) is:
 
 > True when the offer is served from the **BRAND'S OWN official domain** … A retailer or
 > marketplace mirror is **NOT** `official_source`. Lets the decision-grade `trust` dimension
@@ -16,7 +21,7 @@
 
 Two lanes compute it, and they disagree.
 
-**Lane A** — `services/pivot_query_service.py:637`, the canonical catalog offer:
+**Lane A** — `services/pivot_query_service.py:698-703`, the canonical catalog offer:
 
 ```python
 official_source = bool(is_first_party) or _is_official_brand_source(
@@ -25,9 +30,9 @@ official_source = bool(is_first_party) or _is_official_brand_source(
 )
 ```
 
-`_is_official_brand_source` (`:549`) is true when the two registrable hosts are equal.
+`_is_official_brand_source` (`:565`) is true when the two registrable hosts are equal.
 
-**Lane B** — `services/pivot_query_service.py:1749`, the external-seed candidate:
+**Lane B** — `services/pivot_query_service.py:1862`, the external-seed candidate:
 
 ```python
 official_source=bool(seller_identity["is_first_party"]),
@@ -39,10 +44,22 @@ official-domain match → brand token in domain → **unknown, do not guess**.
 
 ### The defect
 
-For an external-seed mirror row, `catalog_products.canonical_url` is written from the *same seed
-record* that `catalog_offers.source_domain` is written from
-(`scripts/mirror_external_seeds_to_catalog_products.py:1129,1268`). So lane A's comparison asks
-whether a value equals itself. **It is a tautology, not a signal.**
+For an external-seed mirror row the two sides are not merely from the same record — **one is a
+pure function of the other**:
+
+- `catalog_products.canonical_url` ← `external_product_seeds.destination_url`
+  (`scripts/mirror_external_seeds_to_catalog_products.py:1268`).
+- `catalog_offers.source_domain` is **not written by the mirror at all** — the dual-write's INSERT
+  column list omits it, and the domain rides only in `offer_payload` JSON. The column is populated
+  by `scripts/backfill_catalog_source_domain.py:180-230`, which resolves
+  `catalog_products.source_ref → external_product_seeds.id` and takes `eps.domain`.
+- And `external_product_seeds.domain` is itself *computed from the URL*:
+  `services/catalog_enrichment_agent/ingestion.py:463` → `_domain_of(canonical_url or
+  destination_url)`; `scripts/onboard_external_brand_from_crawl.py:247-251` →
+  `normalize_host(destination_url)`.
+
+So lane A's comparison asks whether a value equals a function of itself. **It is a tautology, not
+a signal** — which is why the measured hit rate below is exactly 100%.
 
 This is not hypothetical and not merely latent. Measured on prod 2026-07-27, over
 `catalog_track='external_referral'`, unsuppressed, `is_first_party=FALSE`, `source_domain`
@@ -69,10 +86,24 @@ offer_type='brand_direct' AND is_first_party=FALSE   ->  0 rows
 catalog_track='internal_merchant' AND is_first_party=FALSE  ->  0 rows
 ```
 
-Zero, and structurally so: `derive_offer_seller_identity` returns `brand_direct` and
-`is_first_party=True` **together**, from the same rules. There is no path that produces one
-without the other. So the disjunct has no legitimate live consumer on either track — its entire
-production effect is the 2,646 false positives above.
+Zero, and structurally so — though the structure lives in more than one place, which is worth
+stating precisely because the imprecise version sends the next reader to the wrong file.
+`derive_offer_seller_identity` does pair them on every return path
+(`services/offer_seller_identity.py:159-188`), but it is **not the writer** for these rows: its
+production callers are `scripts/onboard_external_brand_from_crawl.py:384` and lane B. The mirror
+lane's writer is a **second, inlined implementation** at
+`services/external_offer_dual_write.py` (the `evidence_domain` / `is_self_seed` block in `upsert_catalog_offer_from_seed_row`), which also pairs them. Every other writer
+checked (`scripts/attach_retailer_offer.py:97-98`,
+`services/retailer_ingest/stylekorean.py:96-97`, `services/catalog_sync_service.py:1397`)
+preserves the pairing or fails in the harmless direction.
+
+So the conclusion holds on every path — but it holds via a duplicated rule, not a single one.
+That duplication is a live drift risk, and it is mildly ironic given this ADR rejects Option 2
+below on exactly "two rules that can drift" grounds. Consolidating the two writers is follow-up
+work, not a blocker for this change.
+
+Either way the disjunct has no legitimate live consumer on either track — its entire production
+effect is the 2,646 false positives above.
 
 ### Why this blocks the `source_domain` blind spot fix
 
@@ -100,7 +131,11 @@ This makes lane A agree with lane B, and makes the signal mean what
 against the **declared brand** (and against a known-retailer list that preempts everything), not
 against a URL derived from the same record.
 
-`_is_official_brand_source` is retained but no longer consulted on the offer path, because the
+`_is_official_brand_source` is retained but — ONCE THE FLAG IS ON — no longer consulted on the
+offer path. While the flag is OFF, which is prod today, it is still the live path and still the
+code producing the false positives above. (Saying that plainly matters: an earlier draft of this
+ADR and the function's own docstring both described the end state as though it were current, which
+is the failure mode this repo keeps paying for.) It is retained because the
 comparison is still meaningful for any *future* caller that has two independently-sourced values.
 The lesson it encodes is worth keeping visible: the function is not wrong, its **inputs** were.
 
@@ -120,6 +155,19 @@ favour of consuming the stored result.
 **(3) Chosen: `official_source = is_first_party`.** One rule, one place, computed at write time,
 already mirrored in Node (`PIVOTA-Agent/src/services/offerSellerIdentity.js`).
 
+**Blast radius is external_referral-only for a STRUCTURAL reason, not just an observed one.**
+`services/catalog_sync_service.py:1385-1397` writes every internal_merchant offer
+`is_first_party=True` unconditionally, and the reader's fallback is
+`is_first_party_track('internal_merchant') → True`. So no internal_merchant row can flip to
+false. The 0-row measurement above agrees with the rule rather than standing in for it.
+
+**But be honest about what the field becomes: an ALIAS, not a repaired signal.** With the flag on,
+`official_source == is_first_party` exactly, so it inherits `is_first_party`'s own limitation — a
+Pivota-onboarded RESELLER merchant still reports `official_source=True`. That is not a regression
+(it is true today through the first disjunct too), and it is not the defect this ADR fixes. It
+does mean rollout step 5 should decide whether to **deprecate** the field rather than redefine it;
+see the note now carried on `models/catalog.py`.
+
 ### What breaks, per consumer
 
 Three consumers read the field. Under the change, `official_source` goes **true → false** for the
@@ -129,7 +177,7 @@ Three consumers read the field. Under the change, `official_source` goes **true 
 |---|---|---|---|
 | `services/decision_grade_eval.py:145` — `_score_trust` | `first_party or authenticity` passes for those 2,646 | `trust` dimension fails for them | **Correct.** They were passing on a fabricated signal. Expect the decision-grade trust rate to drop; that drop is the measurement becoming honest, not a regression. Re-baseline rather than "fix". |
 | `services/behavioral_eval.py:72` — `_fmt_offer` | prints "official brand source" | omits the phrase | **Correct.** That phrase in agent-facing text about a `ulta.com` offer is the actual harm this ADR removes. |
-| `models/catalog.py:288` — public `OfferNode.official_source` | `true` | `false` | Public contract field. Value changes, type and name do not. |
+| `models/catalog.py` — public `OfferNode.official_source` | `true` | `false` | Public contract field. Value changes, type and name do not. |
 
 Nothing gates checkout, pricing, or ranking on `official_source` — verified by inspection; it is a
 display/trust signal only. So the blast radius is the trust dimension and agent-facing prose.

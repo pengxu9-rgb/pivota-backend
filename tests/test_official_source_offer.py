@@ -117,3 +117,40 @@ def test_official_source_equals_is_first_party_when_seller_derived(monkeypatch):
                 _mirror_row(offer_is_first_party=first_party,
                             offer_source_domain=src, canonical_url=canon), [])
             assert node.official_source is first_party
+
+
+def test_the_fix_applies_to_EVERY_track_not_just_the_offending_one(monkeypatch):
+    """The universality of the fix, which nothing else pins.
+
+    Review mutation: gating the seller-derived branch on
+    `catalog_track == "external_referral"` (or `!= "internal_merchant"`) passed
+    the entire file, because every other fixture here is external_referral. That
+    scoping is precisely the option ADR-019 considered and REJECTED — leaving a
+    disjunct whose only live cohort is empty means dead code that reads as
+    load-bearing, and the next person adding a track has to rediscover why.
+
+    So: an internal_merchant row whose source_domain and canonical_url agree must
+    ALSO take its answer from is_first_party alone. Note this is observable only
+    with is_first_party=False, which no live internal_merchant row has today —
+    the point is that the RULE holds, not that the data happens to.
+    """
+    row = _mirror_row(
+        catalog_track="internal_merchant",
+        offer_catalog_track="internal_merchant",
+        offer_is_first_party=False,
+        offer_offer_type=None,
+        offer_source_domain="somebrand.com",
+        canonical_url="https://somebrand.com/products/x",
+    )
+    # Both directions, per the repo rule that a gate must be shown to answer both
+    # ways: OFF leaves this track untouched, ON applies the fix to it too.
+    monkeypatch.delenv("OFFICIAL_SOURCE_SELLER_DERIVED", raising=False)
+    assert _build_canonical_offer_node(row, []).official_source is True
+    monkeypatch.setenv("OFFICIAL_SOURCE_SELLER_DERIVED", "1")
+    assert _build_canonical_offer_node(row, []).official_source is False
+
+
+def test_flag_tolerates_surrounding_whitespace(monkeypatch):
+    """`.strip()` was untested. A value pasted from a dashboard often carries it."""
+    monkeypatch.setenv("OFFICIAL_SOURCE_SELLER_DERIVED", "  true  ")
+    assert _build_canonical_offer_node(_mirror_row(), []).official_source is False

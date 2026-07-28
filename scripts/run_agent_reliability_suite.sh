@@ -69,6 +69,12 @@ quick_tests=(
   "tests/services/test_test_merchant_policy.py"
   "tests/services/test_step5_working_set.py"
   "tests/services/test_identity_reconcile_sweep.py"
+  # ADR-019 official_source. Same reason as the three above: named in no gate.
+  # Worth wiring BEFORE the OFFICIAL_SOURCE_SELLER_DERIVED flip rather than
+  # after, because the flip's whole safety argument is "the OFF path is
+  # byte-identical and the ON path is is_first_party" — and the only thing that
+  # checks either claim is this file. ~0.3s, no DB.
+  "tests/test_official_source_offer.py"
 )
 
 full_extra_tests=(
