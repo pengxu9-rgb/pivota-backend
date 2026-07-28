@@ -812,3 +812,23 @@ def test_env_hatch_does_not_affect_the_trust_gate(monkeypatch):
     trust = call(product=active_merchant_product(merchant_id="merch_env_only_rig"))
     assert trust["serving_decision"] == "public"
     assert REASON_CODES.TEST_MERCHANT_EXCLUDED not in trust["serving_reason_codes"]
+
+
+def test_rig_in_the_shadow_lane_is_blocked():
+    """The transition the no-POLICY_VERSION-bump argument assumes is EMPTY in
+    prod, made explicit here so the assumption is testable rather than implied.
+
+    identity_status='review_required' shadows every row — there is no
+    first-party/observed-seller exemption from it (unlike the identity-COVERAGE
+    gates). So it is the one reachable path by which a rig could have been
+    'shadow' rather than 'blocked'. Census 2026-07-28, grouped by
+    serving_decision (not filtered to 'blocked'): all 1,561 rig rows are
+    'blocked', zero public AND zero shadow — which is what makes the output
+    byte-identical on every row that exists today. This test pins the behaviour
+    for the day one is not."""
+    trust = call(
+        product=active_merchant_product(merchant_id="merch_test_ownist_001"),
+        identity=approved_identity(identity_status="review_required"),
+    )
+    assert trust["serving_decision"] == "blocked"
+    assert REASON_CODES.TEST_MERCHANT_EXCLUDED in trust["serving_reason_codes"]
