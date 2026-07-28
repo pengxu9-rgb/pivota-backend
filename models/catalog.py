@@ -294,13 +294,22 @@ class OfferNode(BaseModel):
     # comparison derive from the same seed record, so it is a tautology. Measured on
     # prod 2026-07-27 it was True for 2,646 of 2,646 candidate rows — including 480
     # typed `retailer`. And the cohort it exists to serve (official-brand,
-    # correctly-not-first-party) is EMPTY, because every writer sets brand_direct and
-    # is_first_party together.
+    # correctly-not-first-party) is EMPTY: no writer produces brand_direct WITHOUT
+    # is_first_party. (Some do the reverse — catalog_sync_service.py:1383-1397 sets
+    # is_first_party=True and deliberately leaves offer_type NULL — but that is the
+    # harmless direction and does not create the cohort.)
     #
     # WITH THE FLAG ON: official_source == is_first_party, exactly. Be honest about
     # what that means — the field becomes an ALIAS, not a repaired signal, and so it
-    # inherits is_first_party's own limitation: a Pivota-onboarded RESELLER merchant
-    # still reports official_source=True. OPEN DECISION for the flip (ADR-019 rollout
+    # inherits is_first_party's own limitations. Two, and the second is closer to the
+    # defect being fixed than the first:
+    #   * a Pivota-onboarded RESELLER merchant still reports official_source=True;
+    #   * scripts/onboard_external_brand_from_crawl.py:390 coerces the seller
+    #     derivation's honest "unknown" (None) to brand_direct via `or "brand_direct"`,
+    #     so a crawl seed with NO positive brand evidence also reports True —
+    #     manufacturing a positive claim from nothing, which is precisely what this
+    #     change removes on the other lane.
+    # OPEN DECISION for the flip (ADR-019 rollout
     # step 5): DEPRECATE this field rather than redefine it. It is a public contract
     # field, so that should be chosen deliberately, not by letting an alias persist.
     official_source: bool = False

@@ -681,7 +681,7 @@ def _build_canonical_offer_node(
     # identity, which compares the offer domain against the DECLARED BRAND behind
     # a known-retailer list that preempts everything — and which returns "unknown"
     # rather than guessing. This also makes this lane agree with the external-seed
-    # lane below (~:1770), which already derives it exactly this way.
+    # lane below (~:1862), which already derives it exactly this way.
     #
     # OFF (legacy): additionally trusts source_domain == canonical PDP host. For
     # an external-seed mirror row BOTH of those are written from the same seed

@@ -134,7 +134,6 @@ def test_the_fix_applies_to_EVERY_track_not_just_the_offending_one(monkeypatch):
     with is_first_party=False, which no live internal_merchant row has today —
     the point is that the RULE holds, not that the data happens to.
     """
-    monkeypatch.setenv("OFFICIAL_SOURCE_SELLER_DERIVED", "1")
     row = _mirror_row(
         catalog_track="internal_merchant",
         offer_catalog_track="internal_merchant",
@@ -143,6 +142,11 @@ def test_the_fix_applies_to_EVERY_track_not_just_the_offending_one(monkeypatch):
         offer_source_domain="somebrand.com",
         canonical_url="https://somebrand.com/products/x",
     )
+    # Both directions, per the repo rule that a gate must be shown to answer both
+    # ways: OFF leaves this track untouched, ON applies the fix to it too.
+    monkeypatch.delenv("OFFICIAL_SOURCE_SELLER_DERIVED", raising=False)
+    assert _build_canonical_offer_node(row, []).official_source is True
+    monkeypatch.setenv("OFFICIAL_SOURCE_SELLER_DERIVED", "1")
     assert _build_canonical_offer_node(row, []).official_source is False
 
 
