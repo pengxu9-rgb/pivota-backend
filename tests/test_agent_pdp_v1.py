@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import logging
+import re
 import sys
 from datetime import datetime, timezone
 from decimal import Decimal
@@ -186,6 +187,49 @@ def _client(
     app = FastAPI()
     app.include_router(agent_pdp_v1.router)
     return TestClient(app), db
+
+
+def _outer_relations(sql: str) -> set:
+    """Every relation the OUTER query reads, whether joined or comma-joined.
+
+    WHY A WHITELIST AND NOT A BLACKLIST. The pin used to name five forbidden
+    tables (catalog_products / catalog_skus / catalog_offers /
+    product_group_members / subject_resolve) — the ones migration 085 removed. A
+    blacklist only ever bans what someone thought of: review demonstrated that
+    `LEFT JOIN catalog_variant_offers` sails through, and so would any future
+    heavy table. Asserting the FROM/JOIN set EXACTLY closes the class instead of
+    one name at a time.
+
+    The renderability EXISTS legitimately names catalog_products,
+    external_product_seeds and index_pipeline_state INSIDE itself, so it is
+    removed first — by exact match on the compiled fragment, so this cannot be
+    fooled by a hand-written lookalike — and whatever FROM/JOIN survives belongs
+    to the outer query.
+
+    Comma-joins are captured too, because `FROM agent_pdp_view apv,
+    catalog_products cp2` is a correlated join wearing a comma and a
+    `(?:FROM|JOIN)\\s+(\\w+)` regex sees only the first table. `JOIN LATERAL (`
+    surfaces as the literal `LATERAL`, which is not in any whitelist, so laterals
+    trip this as well.
+    """
+    from services.pdp_renderability import sig_pdp_will_render_sql
+
+    flat = " ".join(sql.split())
+    fragment = " ".join(sig_pdp_will_render_sql("apv.pivota_signature_id").split())
+    stripped = flat.replace(fragment, " ")
+    # Everything between the outer FROM and the first WHERE/ORDER/LIMIT is the
+    # relation list.
+    match = re.search(r"\bFROM\b(.*?)(?:\bWHERE\b|\bORDER BY\b|\bLIMIT\b|$)", stripped, re.I)
+    if not match:
+        return set()
+    relations = set()
+    # Split on JOIN keywords and on commas; the first token of each piece is the
+    # relation (or `LATERAL`, or `(` for an inline subquery — all non-whitelisted).
+    for piece in re.split(r"\b(?:INNER|LEFT|RIGHT|FULL|CROSS)?\s*\bJOIN\b|,", match.group(1), flags=re.I):
+        token = piece.strip().split()[0] if piece.strip() else ""
+        if token:
+            relations.add(token.strip("()").lower())
+    return relations
 
 
 def _canonical_product(body: Dict[str, Any]) -> Dict[str, Any]:
@@ -469,6 +513,14 @@ def test_sql_uses_agent_pdp_view_indexed_lookup_paths() -> None:
         # EXPLAIN (ANALYZE, BUFFERS) on prod it is **0.181 ms** and ~10 shared
         # buffers, all index lookups, i.e. ~2% of the p99 budget. It is asserted
         # positively below so the exemption cannot silently widen into a real join.
+        # THE OUTER QUERY READS EXACTLY TWO RELATIONS. This is the assertion that
+        # actually holds migration 085's line; the name-bans below are now
+        # belt-and-braces for the specific tables it called out. See
+        # _outer_relations for why a whitelist replaced the blacklist.
+        assert _outer_relations(sql) == {"agent_pdp_view", "index_pipeline_state"}, (
+            f"outer query reads {_outer_relations(sql)}; migration 085 exists so "
+            "this read touches agent_pdp_view + index_pipeline_state and nothing else"
+        )
         assert "catalog_skus" not in normalized
         assert "product_group_members" not in normalized
         assert "subject_resolve" not in normalized
@@ -741,3 +793,59 @@ def test_widened_and_group_lanes_also_carry_the_flag() -> None:
         agent_pdp_v1.INDEX_SELECT_BY_PRODUCT_GROUP_SQL,
     ):
         assert "AS pdp_renderable" in " ".join(sql.split())
+
+
+def test_pdp_renderable_is_a_real_boolean_not_a_truthy_passthrough(monkeypatch) -> None:
+    """`bool()` on the column is load-bearing for the WIRE type, not decoration.
+
+    asyncpg returns real booleans for a Postgres boolean, so dropping the `bool()`
+    is a no-op today — which is exactly why review found the mutation uncaught.
+    But this value is serialised into a public API contract as `true`/`false`, and
+    the column is a composed SQL expression, not a table column: a future edit that
+    wraps it in a COUNT, a COALESCE to 0/1, or an `int` cast would start emitting
+    `1` where every consumer expects `true`, silently. Pin the type, not just the
+    truthiness.
+    """
+    for raw, expected in ((1, True), (0, False), ("t", True)):
+        client, _db = _client(monkeypatch, [_row() | {"pdp_renderable": raw}])
+        value = _canonical_product(client.get(f"/api/agent/pdp/{CK_A}").json())[
+            "pdp_renderable"
+        ]
+        assert value is expected, f"raw {raw!r} serialised as {value!r}"
+        assert isinstance(value, bool)
+
+    # …and the null case stays None, never coerced to False.
+    client, _db = _client(monkeypatch, [_row()])  # key absent, as the bypass produces
+    assert _canonical_product(client.get(f"/api/agent/pdp/{CK_A}").json())[
+        "pdp_renderable"
+    ] is None
+
+
+def test_outer_relation_whitelist_catches_every_join_shape() -> None:
+    """The helper must see comma-joins and laterals, not just `JOIN <table>`.
+
+    Guards the guard: if `_outer_relations` silently returned an incomplete set the
+    pin above would pass on anything, so assert it against the three shapes review
+    used to slip past the old blacklist.
+    """
+    base = agent_pdp_v1.SELECT_BY_CONTENT_KEY_SQL
+    assert _outer_relations(base) == {"agent_pdp_view", "index_pipeline_state"}
+
+    comma = base.replace(
+        "FROM agent_pdp_view apv", "FROM agent_pdp_view apv, catalog_variant_offers cvo"
+    )
+    assert "catalog_variant_offers" in _outer_relations(comma)
+
+    plain = base.replace(
+        "INNER JOIN index_pipeline_state ips ON ips.content_key = apv.content_key",
+        "INNER JOIN index_pipeline_state ips ON ips.content_key = apv.content_key\n"
+        "    LEFT JOIN catalog_variant_offers cvo ON cvo.content_key = apv.content_key",
+    )
+    assert "catalog_variant_offers" in _outer_relations(plain)
+
+    lateral = base.replace(
+        "INNER JOIN index_pipeline_state ips ON ips.content_key = apv.content_key",
+        "INNER JOIN index_pipeline_state ips ON ips.content_key = apv.content_key\n"
+        "    LEFT JOIN LATERAL (SELECT 1 FROM catalog_products AS _x) _l ON TRUE",
+    )
+    assert _outer_relations(lateral) != {"agent_pdp_view", "index_pipeline_state"}
