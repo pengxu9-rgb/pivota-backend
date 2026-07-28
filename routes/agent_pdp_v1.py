@@ -78,9 +78,19 @@ _SELECT_APV_COLUMNS = ",\n      ".join(f"apv.{column}" for column in AGENT_PDP_V
 # share (services.pdp_renderability.sig_pdp_will_render).
 #
 # WHY THIS IS AFFORDABLE HERE, measured rather than assumed. On prod,
-# EXPLAIN (ANALYZE, BUFFERS) on this predicate for one signature:
-# **Execution Time 0.181 ms**, ~10 shared buffers, all index lookups. Against
-# migration 085's <10ms p99 target that is roughly 2%. The alternatives are both
+# EXPLAIN (ANALYZE, BUFFERS) over several signatures: **Execution Time 0.18-0.57
+# ms**, ~10 shared buffers, all index lookups — roughly 2-6% of migration 085's
+# <10ms p99 target.
+#
+# Stated precisely, because the raw EXPLAIN output is easy to misread: those runs
+# ALSO report Planning Time ~2.2 ms, and that does NOT recur per request. EXPLAIN
+# re-plans by definition; the serving path does not. asyncpg prepares and caches
+# statements per connection (statement_cache_size 100) and `databases` hands out
+# pooled connections, so planning is paid ONCE per statement per connection and
+# amortises to ~0. The honest caveat is the cold edge: the first request on a
+# freshly-opened pool connection pays that ~2.2 ms once.
+#
+# The alternatives are both
 # worse: materialising the flag onto agent_pdp_view costs a migration, assembler
 # wiring, a backfill AND a staleness failure mode (renderability moves with
 # index_pipeline_state and external_product_seeds, neither of which triggers an
