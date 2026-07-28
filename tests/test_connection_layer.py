@@ -315,7 +315,7 @@ def test_sql_alias_is_identifier_validated(bad_alias):
     assert "cp.merchant_id" in sql
 
 
-@pytest.mark.parametrize("reserved", ["ms_cl", "mo_cl", "mo_psp", "pmc_cl", "MS_CL"])
+@pytest.mark.parametrize("reserved", ["ms_cl", "mo_cl", "mo_psp", "MS_CL"])
 def test_reserved_internal_aliases_cannot_shadow_the_subquery_scope(reserved):
     """A caller alias equal to an internal one decorrelates the subquery.
 
@@ -325,8 +325,11 @@ def test_reserved_internal_aliases_cannot_shadow_the_subquery_scope(reserved):
     returns a wrong layer with no error and no injection. Measured before the
     guard existed.
     """
-    sql = connection_layer_sql(reserved)
-    assert "ms_cl.merchant_id = ms_cl.merchant_id" not in sql
+    # BOTH alias forms — the joined variant emits the ms_cl subquery too, so
+    # checking only the correlated form left half the surface unasserted.
+    for sql in (connection_layer_sql(reserved),
+                connection_layer_sql(reserved, onboarding_alias="mo")):
+        assert "ms_cl.merchant_id = ms_cl.merchant_id" not in sql
     assert "mo_cl.merchant_id = mo_cl.merchant_id" not in sql
     assert "mo_psp.merchant_id = mo_psp.merchant_id" not in sql
     assert "pmc_cl.merchant_id = pmc_cl.merchant_id" not in sql

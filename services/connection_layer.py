@@ -283,7 +283,7 @@ def resolve_execution_paths(
 #: subquery into "does ANY active store exist anywhere" and silently returning a
 #: wrong layer — no error, no injection, just a wrong label. Rejected by
 #: ``_normalize_alias`` so the collision is impossible rather than documented.
-_RESERVED_INTERNAL_ALIASES = frozenset({"mo_cl", "mo_psp", "pmc_cl", "ms_cl"})
+_RESERVED_INTERNAL_ALIASES = frozenset({"mo_cl", "mo_psp", "ms_cl"})
 
 #: The characters Python's ``str.strip()`` removes, as a Postgres E-string for
 #: ``btrim``'s second argument. **`btrim(x)` with one argument strips spaces

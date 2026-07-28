@@ -80,6 +80,8 @@ Read via the Railway public proxy against `catalog_products` / `catalog_offers` 
 |---|---|---:|---:|---|
 | **1 — crawled** | `catalog_track='external_referral'` | 12,542 | **4,467** | 53 sellers |
 | **2 — product synced** | `catalog_track='internal_merchant'` ∧ active store | 1,557 | **0** | **0** |
+
+> **Bucketing note — this table is CUMULATIVE, the census below is EXCLUSIVE.** Layer 2 here (1,557) counts every synced row, *including* the 763 that also satisfy layer 3. The exclusive layer-2 figure is `1,557 − 763 = 794`, which is what the resolved-ruling census reports. Both are correct; they answer different questions, and a reader going top-to-bottom would otherwise see a contradiction.
 | **3 — synced + PSP** | layer 2 ∧ `psp_connected` | 763 | **0** | **0** |
 
 (Layer 2's 1,557 = the 1,562 `internal_merchant` rows minus the 1 brand-authored row that was never synced and the 4 `ownist_test_fixture_v1` rows. Layer 3's 763 = every row of the one `psp_connected` merchant that has any, `merch_efbc46b4619cfbdf`: 743 Shopify + 20 Wix. Both counts are rigs end to end, which is why the *real* column is 0.)
@@ -123,7 +125,7 @@ The distinction is worth stating plainly, because conflating the two is exactly 
 
 The three-layer model is about **Pivota's connection depth to the merchant**, so the portal flag is the right axis and the merchant's own checkout capability is not a layer input at all. It remains load-bearing in `get_platform_settlement_rails`, which answers the different and wider question of *which rails a transaction can pass through* — untouched by this.
 
-**Census delta, measured rather than assumed: zero rows move.** Computing both definitions side by side over all 14,104 `catalog_products` rows, `CHANGED_BY_RULING = 0` for every layer. That is because `has_shopify_payments IS TRUE` for **0** merchants in prod — nobody has ever been through the Shopify verify — so the OR arm had never once fired. The layer census is byte-identical: layer 1 = 12,547 (12,543 non-rig), layer 2 = 794 (0 non-rig), layer 3 = 763 (0 non-rig).
+**Census delta, measured rather than assumed: zero rows move.** Computing both definitions side by side over all 14,104 `catalog_products` rows, `CHANGED_BY_RULING = 0` for every layer. That is because `has_shopify_payments IS TRUE` for **0** merchants in prod. The reason is stronger than "nobody has been verified": **exactly one** merchant has been through the Shopify verify — `merch_efbc46b4619cfbdf`, the founder's test rig, checked 2026-01-19 — and it came back **FALSE**. That merchant is *already* layer 3 through `psp_connected = true`. So the OR arm had never once fired **and could not have**: the only row that could ever have supplied it is false, and its merchant reaches layer 3 by the other arm anyway. The layer census is byte-identical: layer 1 = 12,547 (12,543 non-rig), layer 2 = 794 (0 non-rig), layer 3 = 763 (0 non-rig).
 
 ### F3 — "Merchant" is two different entities in the schema, and the founder's sentence spans both.
 
@@ -269,7 +271,7 @@ Decisive factor: **this is a public, externally-ingested surface. A field that i
 
 `services/connection_layer.py` — the single named authority for the taxonomy:
 
-- `classify_connection_layer(...)` — pure function over `(catalog_track, has_active_store, psp_connected, has_native_payments, merchant_known)`; returns layer + slug. Absence from `merchant_onboarding` is Layer 1 **by construction** (F3), never an unknown to be defaulted.
+- `classify_connection_layer(...)` — pure function over `(catalog_track, has_active_store, psp_connected, merchant_known)`; returns layer + slug. (`has_native_payments` remains in the signature for stability — existing callers pass it and the settlement-rails path still needs the fact — but since the 2026-07-28 ruling it is **not a layer input**.) Absence from `merchant_onboarding` is Layer 1 **by construction** (F3), never an unknown to be defaulted.
 - `resolve_execution_paths(...)` — the orthogonal axis: warm-handoff allowlist membership and door state, resolved from live facts, not from the layer.
 - `connection_layer_sql(...)` — the SQL twin of the classifier, for serving queries, kept in the same file as its Python twin so the two cannot drift silently.
 - A caller alias equal to one of the expression's own internal subquery aliases (`ms_cl`, `mo_cl`, `mo_psp`, `pmc_cl`) would **shadow** the inner scope — `WHERE ms_cl.merchant_id = ms_cl.merchant_id` decorrelates the subquery into "does ANY live store exist anywhere" and silently returns a wrong layer, with no error and no injection. Those names are rejected by the alias validator rather than merely documented.
