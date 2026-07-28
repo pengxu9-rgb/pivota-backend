@@ -43,6 +43,28 @@ def test_static_set_bakes_in_all_four_rigs():
     assert "merch_bbd34645bc1950cc" in ids
 
 
+def test_static_set_bakes_in_review_demo_3():
+    """pivota-review-demo-3 was a known rig in the agent repo's metrics
+    exclusion list but was never added to the serving denylists. It has no
+    merchant_stores row, so the domain resolver cannot reach it either."""
+    assert "merch_shopify_b20b5797f4181983c177" in pol.static_test_merchant_ids({})
+
+
+def test_static_set_bakes_in_the_ownist_fixture_merchant():
+    """ADR-018 census (#1595): a fixture catalog with 4 serving_eligible rows
+    and NO merchant_stores row, so the demo-domain resolver can never reach it
+    — the id denylist is the only leg that excludes it."""
+    assert "merch_test_ownist_001" in pol.static_test_merchant_ids({})
+
+
+async def test_ownist_is_excluded_without_any_store_row():
+    # Resolver returns nothing (no merchant_stores row for this rig at all);
+    # the exclusion must still hold from the static denylist.
+    db = _FakeDB(rows=[])
+    ids = await pol.get_excluded_merchant_ids(db, env={})
+    assert "merch_test_ownist_001" in ids
+
+
 def test_env_hatch_is_additive_only():
     ids = pol.static_test_merchant_ids({"PIVOTA_TEST_MERCHANT_IDS": "merch_new, merch_two"})
     assert "merch_new" in ids and "merch_two" in ids
