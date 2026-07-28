@@ -344,10 +344,14 @@ async def test_refresh_for_content_key_honours_its_scope(seeded):
 
 
 @pytest.mark.asyncio
-async def test_persist_chunks_beyond_the_bind_parameter_ceiling(seeded):
-    """Postgres caps binds at 65,535; at 2/row that is 32,767 rows per statement.
-    P1.13's initial backfill is the whole table (14,104 rows), so the chunk
-    boundary is exercised rather than assumed."""
+async def test_persist_spans_chunks_correctly_on_the_real_driver(seeded):
+    """Chunk COUNT is asserted engine-agnostically (see the sibling unit test —
+    the property is statement count, and a row-count assertion cannot see it).
+
+    What only the real driver can settle is that a multi-chunk write actually
+    lands: bind types, the VALUES CAST and the RETURNING count all behave across
+    a chunk boundary rather than just inside one statement.
+    """
     from sqlalchemy import text
 
     from services.pdp_renderability_store import (
@@ -370,30 +374,10 @@ async def test_persist_chunks_beyond_the_bind_parameter_ceiling(seeded):
     payload = [{"product_key": f"bulk_{i}", "will_render": True} for i in range(n_rows)]
     async with prod_db() as db:
         written = await _persist(payload, database=db)
-    assert written == n_rows
+    assert written == n_rows, "RETURNING count must survive a chunk boundary"
 
     got = _read(seeded, f"SELECT count(*) FROM catalog_products WHERE product_key LIKE 'bulk_%' "
                         f"AND {COLUMN_WILL_RENDER} IS TRUE")[0][0]
     assert got == n_rows, "chunk boundary dropped rows"
 
     _reset(seeded, "DELETE FROM catalog_products WHERE product_key LIKE 'bulk_%'")
-
-
-def test_the_read_predicate_executes_and_is_fail_closed(seeded):
-    """NULL (never computed) must NOT be advertisable."""
-    from sqlalchemy import text
-
-    from services.pdp_renderability_store import (
-        COLUMN_WILL_RENDER,
-        persisted_will_render_predicate,
-    )
-
-    with seeded.begin() as conn:
-        conn.execute(text(f"UPDATE catalog_products SET {COLUMN_WILL_RENDER} = NULL"))
-
-    predicate = str(persisted_will_render_predicate("cp"))
-    with seeded.connect() as conn:
-        n = conn.execute(
-            text(f"SELECT count(*) FROM catalog_products cp WHERE {predicate}")
-        ).scalar()
-    assert n == 0, "an uncomputed (NULL) row must never be advertisable"

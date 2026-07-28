@@ -236,11 +236,19 @@ async def refresh_for_product_keys(product_keys: Iterable[str], *, database=None
         return 0
 
 
-#: Rows per UPDATE. Postgres caps bind parameters at 65,535 (the Bind message
-#: length is int16); at 2 params per row that is 32,767 rows in one statement.
-#: P1.13's initial backfill is the whole table — 14,104 rows = 28,208 params and
-#: ~500KB of SQL, only ~2.3x headroom — so chunk now rather than discover the
-#: ceiling when the reconciler first runs.
+#: Rows per UPDATE statement.
+#:
+#: NOT set by the bind-parameter ceiling, and saying so matters because a
+#: correct number with a wrong reason is how the next person picks a wrong one.
+#: Postgres caps binds at 65,535 (int16 Bind message) = 32,767 rows at 2/row —
+#: at 1,000 rows we use 2,000, which is **32x under** the cap. The cap is not
+#: what binds.
+#:
+#: The operative trade-off is ROUND TRIPS vs STATEMENT SIZE. App and database are
+#: in different regions (~140ms RTT), so P1.13's full-table backfill of 14,104
+#: rows is 15 statements ≈ 2.1s at this size. Ten times larger would be ~1.5
+#: statements but a multi-megabyte statement; ten times smaller would be 141
+#: round trips ≈ 20s. 1,000 sits in the flat part of that curve.
 _PERSIST_CHUNK_ROWS = 1000
 
 
@@ -296,17 +304,27 @@ async def _persist(rows: List[Any], *, database) -> int:
             params[f"pk_{i}"] = pk
             params[f"wr_{i}"] = wr
 
-        await database.execute(
+        # RETURNING + fetch_all, not execute + len(chunk). The return value is
+        # rows WRITTEN, never rows OFFERED: offer one real key and one that does
+        # not exist and the naive count says 2 having written 1.
+        #
+        # This matters beyond tidiness. `refresh_for_content_key` returns this
+        # number, and P1.13's drift metric is the thing that decides whether the
+        # column is trustworthy enough to read. A drift number counting offers
+        # would make the column look healthier than it is — the precise failure
+        # the metric exists to catch.
+        rows_written = await database.fetch_all(
             f"""
             UPDATE catalog_products AS tgt
                SET {COLUMN_WILL_RENDER} = src.wr,
                    {COLUMN_COMPUTED_AT} = NOW()
               FROM (VALUES {values_sql}) AS src(pk, wr)
              WHERE tgt.product_key = src.pk
+         RETURNING 1
             """,
             params,
         )
-        written += len(chunk)
+        written += len(rows_written or [])
     return written
 
 

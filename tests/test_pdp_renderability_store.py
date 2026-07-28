@@ -147,3 +147,60 @@ async def test_refresh_is_a_noop_for_empty_input():
     assert await store.refresh_for_content_key("   ", database=Never()) == 0
     assert await store.refresh_for_product_keys([], database=Never()) == 0
     assert await store.refresh_for_product_keys([None, ""], database=Never()) == 0
+
+
+# ---- chunking: assert the property the NAME claims ---------------------------
+
+@pytest.mark.asyncio
+async def test_persist_issues_one_statement_per_chunk():
+    """THE PROPERTY IS THE STATEMENT COUNT, not the row count.
+
+    An earlier version of this test used CHUNK+5 rows and asserted all of them
+    were written. That is true WITH or WITHOUT chunking — 1,005 rows is 2,010
+    binds, comfortably one statement — so mutating the loop to a single
+    statement, or the chunk size to 1, both left it green. The name asserted a
+    property the body never checked.
+
+    The shape is the session's recurring one: *the fixture was too small to
+    exercise the property the name claimed*, exactly as the parity test's shim
+    never issued a PREPARE. Size the input to the property under test.
+    """
+    from services.pdp_renderability_store import _PERSIST_CHUNK_ROWS, _persist
+
+    calls = []
+
+    class _Spy:
+        async def fetch_all(self, sql, params=None):
+            calls.append(params or {})
+            # RETURNING 1 yields one row per row actually updated.
+            return [(1,)] * (len(params or {}) // 2)
+
+    n = 2 * _PERSIST_CHUNK_ROWS + 1
+    payload = [{"product_key": f"pk_{i}", "will_render": i % 2 == 0} for i in range(n)]
+    written = await _persist(payload, database=_Spy())
+
+    assert len(calls) == 3, f"{n} rows at chunk {_PERSIST_CHUNK_ROWS} must be 3 statements, got {len(calls)}"
+    assert [len(c) // 2 for c in calls] == [_PERSIST_CHUNK_ROWS, _PERSIST_CHUNK_ROWS, 1]
+    assert written == n
+
+
+@pytest.mark.asyncio
+async def test_persist_reports_rows_WRITTEN_not_rows_OFFERED():
+    """`refresh_*` returns this number and P1.13's drift metric consumes it.
+
+    Counting offers rather than writes would make the column look healthier than
+    it is — the precise failure the drift metric exists to catch.
+    """
+    from services.pdp_renderability_store import _persist
+
+    class _OnlyOneMatched:
+        async def fetch_all(self, sql, params=None):
+            assert "RETURNING" in sql, "the written-count must come from RETURNING"
+            return [(1,)]  # two offered, one actually updated
+
+    written = await _persist(
+        [{"product_key": "pk_real", "will_render": True},
+         {"product_key": "pk_does_not_exist", "will_render": True}],
+        database=_OnlyOneMatched(),
+    )
+    assert written == 1, "offered 2, matched 1 — must report 1"
