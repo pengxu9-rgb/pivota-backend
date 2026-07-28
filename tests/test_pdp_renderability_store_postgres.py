@@ -31,6 +31,7 @@ from __future__ import annotations
 import os
 
 import pytest
+from contextlib import asynccontextmanager
 
 DATABASE_URL = (os.getenv("DATABASE_URL") or "").strip()
 _IS_PG = DATABASE_URL.startswith("postgresql://") or DATABASE_URL.startswith("postgres://")
@@ -191,19 +192,58 @@ def test_serving_gate_and_missing_ips_both_fail_closed(seeded):
     assert rows["pk_noips"] is False, "no index_pipeline_state row must fail CLOSED"
 
 
-@pytest.mark.asyncio
-async def test_persisted_column_equals_the_live_expression_row_for_row(seeded):
-    """PARITY — the assertion this column's existence depends on.
+@asynccontextmanager
+async def prod_db():
+    """The PRODUCTION driver — `databases.Database` over asyncpg.
 
-    THIS TEST MUST CALL THE SHIPPED WRITE PATH. An earlier cut re-implemented the
-    UPDATE inline with its own ``text(...)``, so it validated the test's own SQL
-    and left ``_persist`` unreachable from the entire suite — a 12-mutant battery
-    then found that making ``_persist`` a silent no-op SURVIVED, i.e. the whole
-    column could have shipped inert behind this very test passing. Routing
-    through ``_persist`` is what makes the parity claim about the product.
+    ⚠️ USE THE GATE'S OWN PATTERN. NEVER HAND-ROLL A DB SHIM, AND NEVER HOLD THE
+    CONNECTION ACROSS TESTS.
+
+    An earlier cut wrapped SQLAlchemy's SYNC engine (psycopg2) in a bespoke async
+    shim to call `_persist`. It passed 32/32 while the shipped write path RAISED
+    on the production driver — `databases._build_query` hands a non-`str` with
+    values to `query.values(**values)`, and `TextClause` has no `.values()`. The
+    module would have shipped a silent no-op behind a fully green suite. A
+    hand-rolled shim re-introduces the whole driver-difference class the gate
+    exists to close, and does it invisibly, because it looks like MORE thorough
+    testing rather than less.
+
+    A second cut held one connection open in a module fixture. Under
+    `asyncio_mode=auto` each test gets its OWN event loop, so every test after
+    the first reused a connection bound to a dead loop. The gate files
+    (`test_pdp_content_depth_postgres:99`) connect and disconnect INSIDE each
+    test for exactly that reason — so this does too.
     """
+    from db.database import database
+
+    await database.connect()
+    try:
+        yield database
+    finally:
+        await database.disconnect()
+
+
+def _reset(seeded, sql):
     from sqlalchemy import text
 
+    with seeded.begin() as conn:
+        conn.execute(text(sql))
+
+
+def _read(seeded, sql):
+    from sqlalchemy import text
+
+    with seeded.connect() as conn:
+        return conn.execute(text(sql)).fetchall()
+
+
+@pytest.mark.asyncio
+async def test_persist_runs_on_the_PRODUCTION_driver(seeded):
+    """PARITY, executed through asyncpg — the assertion this column depends on.
+
+    Two things at once: the persisted value equals the live expression row for
+    row, AND the write path can actually EXECUTE where it will run.
+    """
     from services.pdp_renderability_store import (
         COLUMN_COMPUTED_AT,
         COLUMN_WILL_RENDER,
@@ -211,145 +251,132 @@ async def test_persisted_column_equals_the_live_expression_row_for_row(seeded):
         _persist,
     )
 
-    class _Db:
-        """Minimal async shim over the sync engine, so the real _persist runs."""
+    _reset(seeded, f"UPDATE catalog_products SET {COLUMN_WILL_RENDER} = NULL, "
+                   f"{COLUMN_COMPUTED_AT} = NULL")
 
-        def __init__(self, engine):
-            self._engine = engine
+    async with prod_db() as db:
+        rows = await db.fetch_all(_compute_select())
+        written = await _persist(rows, database=db)
 
-        async def fetch_all(self, stmt):
-            with self._engine.connect() as conn:
-                return conn.execute(stmt).fetchall()
-
-        async def execute(self, stmt, params=None):
-            with self._engine.begin() as conn:
-                return conn.execute(stmt, params or {})
-
-    db = _Db(seeded)
-
-    with seeded.begin() as conn:
-        conn.execute(text(
-            f"UPDATE catalog_products SET {COLUMN_WILL_RENDER} = NULL, {COLUMN_COMPUTED_AT} = NULL"
-        ))
-
-    rows = await db.fetch_all(_compute_select())
-    written = await _persist(rows, database=db)
     assert written == len(rows) > 0, "the write path must report what it wrote"
 
     with seeded.connect() as conn:
         live = {r._mapping["product_key"]: bool(r._mapping["will_render"])
                 for r in conn.execute(_compute_select()).fetchall()}
-        stored = {r[0]: r[1] for r in conn.execute(
-            text(f"SELECT product_key, {COLUMN_WILL_RENDER} FROM catalog_products")
-        ).fetchall()}
-        stamped = conn.execute(text(
-            f"SELECT count(*) FROM catalog_products WHERE {COLUMN_COMPUTED_AT} IS NULL"
-        )).scalar()
+    stored = dict(_read(seeded, f"SELECT product_key, {COLUMN_WILL_RENDER} FROM catalog_products"))
+    unstamped = _read(seeded, f"SELECT count(*) FROM catalog_products "
+                              f"WHERE {COLUMN_COMPUTED_AT} IS NULL")[0][0]
 
     assert stored == live, f"persisted column drifted from its source: {stored} != {live}"
-    # The staleness contract the whole read-gating story rests on. Unasserted,
-    # "never stamp computed_at" was a surviving mutant.
-    assert stamped == 0, "every written row must carry a computed_at stamp"
+    assert unstamped == 0, "every written row must carry a computed_at stamp"
 
 
 @pytest.mark.asyncio
 async def test_persist_updates_only_the_rows_it_was_given(seeded):
-    """`WHERE product_key = src.pk` is load-bearing.
-
-    A surviving mutant replaced the join predicate with `OR TRUE`, which set all
-    14,104 rows to a single row's value — silently, and with parity still
-    passing because parity re-read the same corrupted table.
-    """
-    from sqlalchemy import text
-
+    """`WHERE tgt.product_key = src.pk` is load-bearing — an `OR TRUE` mutant set
+    all 14,104 rows to one row's value, with parity still green because parity
+    re-read the same corrupted table."""
     from services.pdp_renderability_store import COLUMN_WILL_RENDER, _persist
 
-    class _Db:
-        def __init__(self, engine):
-            self._engine = engine
+    _reset(seeded, f"UPDATE catalog_products SET {COLUMN_WILL_RENDER} = NULL")
 
-        async def execute(self, stmt, params=None):
-            with self._engine.begin() as conn:
-                return conn.execute(stmt, params or {})
+    async with prod_db() as db:
+        await _persist([{"product_key": "pk_dead", "will_render": True}], database=db)
 
-    with seeded.begin() as conn:
-        conn.execute(text(f"UPDATE catalog_products SET {COLUMN_WILL_RENDER} = NULL"))
-
-    # Write TRUE for exactly one row; every other row must stay NULL.
-    await _persist([{"product_key": "pk_dead", "will_render": True}], database=_Db(seeded))
-
-    with seeded.connect() as conn:
-        rows = dict(conn.execute(text(
-            f"SELECT product_key, {COLUMN_WILL_RENDER} FROM catalog_products"
-        )).fetchall())
-
+    rows = dict(_read(seeded, f"SELECT product_key, {COLUMN_WILL_RENDER} FROM catalog_products"))
     assert rows["pk_dead"] is True
     others = {k: v for k, v in rows.items() if k != "pk_dead"}
-    assert all(v is None for v in others.values()), f"scope leaked to other rows: {others}"
+    assert all(v is None for v in others.values()), f"scope leaked: {others}"
 
 
 @pytest.mark.asyncio
 async def test_persist_writes_the_computed_value_not_a_constant(seeded):
-    """An inverted or constant value was another surviving mutant."""
-    from sqlalchemy import text
-
     from services.pdp_renderability_store import COLUMN_WILL_RENDER, _persist
 
-    class _Db:
-        def __init__(self, engine):
-            self._engine = engine
-
-        async def execute(self, stmt, params=None):
-            with self._engine.begin() as conn:
-                return conn.execute(stmt, params or {})
-
-    await _persist(
-        [{"product_key": "pk_live", "will_render": True},
-         {"product_key": "pk_dead", "will_render": False}],
-        database=_Db(seeded),
-    )
-    with seeded.connect() as conn:
-        rows = dict(conn.execute(text(
-            f"SELECT product_key, {COLUMN_WILL_RENDER} FROM catalog_products "
-            "WHERE product_key IN ('pk_live','pk_dead')"
-        )).fetchall())
+    async with prod_db() as db:
+        await _persist(
+            [{"product_key": "pk_live", "will_render": True},
+             {"product_key": "pk_dead", "will_render": False}],
+            database=db,
+        )
+    rows = dict(_read(
+        seeded,
+        f"SELECT product_key, {COLUMN_WILL_RENDER} FROM catalog_products "
+        "WHERE product_key IN ('pk_live','pk_dead')",
+    ))
     assert rows == {"pk_live": True, "pk_dead": False}
 
 
 @pytest.mark.asyncio
-async def test_refresh_for_content_key_honours_its_scope(seeded):
-    """`refresh_for_content_key` ignoring its scope was a surviving mutant."""
-    from sqlalchemy import text
+async def test_the_boolean_cast_is_required_by_the_real_driver(seeded):
+    """The CAST in `_persist`'s VALUES list is falsifiable ONLY on asyncpg.
 
+    psycopg2 interpolates client-side and never surfaces it; asyncpg does a real
+    PREPARE and refuses with `column "pdp_will_render" is of type boolean but
+    expression is of type text`. Asserting it against the production driver is
+    what makes the CAST a guard rather than a comment.
+    """
+    import asyncpg
+
+    sql = ("UPDATE catalog_products AS tgt SET pdp_will_render = src.wr "
+           "FROM (VALUES (:pk_0, :wr_0)) AS src(pk, wr) WHERE tgt.product_key = src.pk")
+    async with prod_db() as db:
+        with pytest.raises(asyncpg.exceptions.DatatypeMismatchError):
+            await db.execute(sql, {"pk_0": "pk_live", "wr_0": True})
+
+
+@pytest.mark.asyncio
+async def test_refresh_for_content_key_honours_its_scope(seeded):
     from services.pdp_renderability_store import (
         COLUMN_WILL_RENDER,
         refresh_for_content_key,
     )
 
-    class _Db:
-        def __init__(self, engine):
-            self._engine = engine
+    _reset(seeded, f"UPDATE catalog_products SET {COLUMN_WILL_RENDER} = NULL")
 
-        async def fetch_all(self, stmt):
-            with self._engine.connect() as conn:
-                return conn.execute(stmt).fetchall()
+    async with prod_db() as db:
+        n = await refresh_for_content_key("ck_blocked", database=db)
 
-        async def execute(self, stmt, params=None):
-            with self._engine.begin() as conn:
-                return conn.execute(stmt, params or {})
-
-    with seeded.begin() as conn:
-        conn.execute(text(f"UPDATE catalog_products SET {COLUMN_WILL_RENDER} = NULL"))
-
-    n = await refresh_for_content_key("ck_blocked", database=_Db(seeded))
     assert n == 1, f"expected exactly the one ck_blocked row, wrote {n}"
-
-    with seeded.connect() as conn:
-        rows = dict(conn.execute(text(
-            f"SELECT product_key, {COLUMN_WILL_RENDER} FROM catalog_products"
-        )).fetchall())
+    rows = dict(_read(seeded, f"SELECT product_key, {COLUMN_WILL_RENDER} FROM catalog_products"))
     assert rows["pk_blocked"] is False
     assert rows["pk_live"] is None, "rows outside the content_key must be untouched"
+
+
+@pytest.mark.asyncio
+async def test_persist_chunks_beyond_the_bind_parameter_ceiling(seeded):
+    """Postgres caps binds at 65,535; at 2/row that is 32,767 rows per statement.
+    P1.13's initial backfill is the whole table (14,104 rows), so the chunk
+    boundary is exercised rather than assumed."""
+    from sqlalchemy import text
+
+    from services.pdp_renderability_store import (
+        _PERSIST_CHUNK_ROWS,
+        COLUMN_WILL_RENDER,
+        _persist,
+    )
+
+    n_rows = _PERSIST_CHUNK_ROWS + 5
+    with seeded.begin() as conn:
+        conn.execute(text(f"UPDATE catalog_products SET {COLUMN_WILL_RENDER} = NULL"))
+        for i in range(n_rows):
+            conn.execute(
+                text("INSERT INTO catalog_products (product_key, merchant_id, platform, "
+                     "source_product_id, title, catalog_track) VALUES (:pk, 'external_seed', "
+                     "'external_seed', :pk, :pk, 'external_referral')"),
+                {"pk": f"bulk_{i}"},
+            )
+
+    payload = [{"product_key": f"bulk_{i}", "will_render": True} for i in range(n_rows)]
+    async with prod_db() as db:
+        written = await _persist(payload, database=db)
+    assert written == n_rows
+
+    got = _read(seeded, f"SELECT count(*) FROM catalog_products WHERE product_key LIKE 'bulk_%' "
+                        f"AND {COLUMN_WILL_RENDER} IS TRUE")[0][0]
+    assert got == n_rows, "chunk boundary dropped rows"
+
+    _reset(seeded, "DELETE FROM catalog_products WHERE product_key LIKE 'bulk_%'")
 
 
 def test_the_read_predicate_executes_and_is_fail_closed(seeded):

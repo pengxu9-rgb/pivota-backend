@@ -33,7 +33,8 @@ keys, 6/6 matching the row-grain prediction (sig_817ed740… 200 vs its sibling
 sig_aa918d2d… 404, and two more pairs like it).
 
 ═══════════════════════════════════════════════════════════════════════════════
-🚨 THE COLUMN IS WRITTEN BUT DELIBERATELY UNREAD. Do not add a consumer yet.
+🚨 THE COLUMN IS NEITHER WRITTEN NOR READ YET. It is 100% NULL in prod.
+   NULL reads as do-not-advertise, so that is harmless — but say it plainly.
 ═══════════════════════════════════════════════════════════════════════════════
 A stored composite is only as good as its invalidation, and NOTHING WRITES THIS
 COLUMN YET. Both refresh entry points below exist and are called by no
@@ -235,19 +236,38 @@ async def refresh_for_product_keys(product_keys: Iterable[str], *, database=None
         return 0
 
 
+#: Rows per UPDATE. Postgres caps bind parameters at 65,535 (the Bind message
+#: length is int16); at 2 params per row that is 32,767 rows in one statement.
+#: P1.13's initial backfill is the whole table — 14,104 rows = 28,208 params and
+#: ~500KB of SQL, only ~2.3x headroom — so chunk now rather than discover the
+#: ceiling when the reconciler first runs.
+_PERSIST_CHUNK_ROWS = 1000
+
+
 async def _persist(rows: List[Any], *, database) -> int:
     """Write the computed values, stamping computed_at so staleness is visible.
 
-    SET-BASED on purpose. The earlier per-row loop issued one sequentially
-    awaited UPDATE per row; with the app and database in different regions
-    (~140ms RTT) that is N round trips, and the caller that was going to use it
-    sits inside a for-loop over products. One statement with a VALUES list is
-    one round trip regardless of row count.
+    ⚠️ PASSES PLAIN SQL, NOT ``sa.text(...)``, AND THAT IS LOAD-BEARING.
+    Production runs ``databases.Database`` over **asyncpg**. Its ``_build_query``
+    gives a ``str`` the ``text(q).bindparams(**values)`` treatment, but hands a
+    non-``str`` WITH values to ``query.values(**values)`` — and ``TextClause``
+    has no ``.values()``. So ``sa.text(sql)`` plus a params dict raises
+    ``AttributeError: 'TextClause' object has no attribute 'values'`` on the
+    production driver, every time.
+
+    An earlier cut did exactly that. It passed 32/32 tests because the test shim
+    was SQLAlchemy's SYNC engine over psycopg2, which accepts the same call
+    happily — so the module would have shipped as a silent no-op in prod behind
+    a fully green suite. Same SQL, same Postgres, different ADAPTER. The tests
+    now drive ``databases.Database`` for exactly this reason.
+
+    SET-BASED, and chunked. One statement per chunk rather than one per row: the
+    app and database are in different regions (~140ms RTT), so a per-row loop is
+    N round trips.
 
     ``computed_at`` is stamped in the SAME statement as the boolean — never a
-    second pass — because a value whose freshness marker can be missing or
-    stale relative to it is worse than no marker at all: the whole
-    read-gating story rests on that timestamp.
+    second pass — because a freshness marker that can drift from the value it
+    describes is worse than none, and the whole read-gating story rests on it.
     """
     pairs = []
     for row in rows or []:
@@ -259,31 +279,35 @@ async def _persist(rows: List[Any], *, database) -> int:
     if not pairs:
         return 0
 
-    values_sql = ", ".join(
-        f"(:pk_{i}, CAST(:wr_{i} AS BOOLEAN))" for i in range(len(pairs))
-    )
-    params: Dict[str, Any] = {}
-    for i, (pk, wr) in enumerate(pairs):
-        params[f"pk_{i}"] = pk
-        params[f"wr_{i}"] = wr
+    written = 0
+    for offset in range(0, len(pairs), _PERSIST_CHUNK_ROWS):
+        chunk = pairs[offset:offset + _PERSIST_CHUNK_ROWS]
+        # CAST on EVERY tuple, not just the first. Without it Postgres types the
+        # VALUES column from the bind's text representation and refuses the
+        # UPDATE with `column "pdp_will_render" is of type boolean but
+        # expression is of type text`. Verified against asyncpg — psycopg2
+        # interpolates client-side and never surfaces it, which is precisely why
+        # this needs the real driver to be testable at all.
+        values_sql = ", ".join(
+            f"(:pk_{i}, CAST(:wr_{i} AS BOOLEAN))" for i in range(len(chunk))
+        )
+        params: Dict[str, Any] = {}
+        for i, (pk, wr) in enumerate(chunk):
+            params[f"pk_{i}"] = pk
+            params[f"wr_{i}"] = wr
 
-    # CAST on the first tuple's parameter is load-bearing: Postgres cannot infer
-    # a bare bind's type inside a VALUES list and refuses to PREPARE the
-    # statement (IndeterminateDatatypeError) — the exact class that took this
-    # repo's canonical feed down in #1588.
-    await database.execute(
-        sa.text(
+        await database.execute(
             f"""
             UPDATE catalog_products AS tgt
                SET {COLUMN_WILL_RENDER} = src.wr,
                    {COLUMN_COMPUTED_AT} = NOW()
               FROM (VALUES {values_sql}) AS src(pk, wr)
              WHERE tgt.product_key = src.pk
-            """
-        ),
-        params,
-    )
-    return len(pairs)
+            """,
+            params,
+        )
+        written += len(chunk)
+    return written
 
 
 __all__ = [

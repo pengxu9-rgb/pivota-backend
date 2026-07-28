@@ -1211,7 +1211,6 @@ async def recompute_serving_eligibility(
 
         await _upsert_index_pipeline_state(content_key, new_state)
 
-
         # IndexNow: when a page becomes newly serving-eligible (and has a minted
         # signature, so a canonical PDP exists), ask participating engines (Bing →
         # ChatGPT search, Yandex, …) to crawl it. Non-blocking + best-effort — it
