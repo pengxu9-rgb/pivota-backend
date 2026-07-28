@@ -38,12 +38,13 @@ ALTER TABLE catalog_products
 ALTER TABLE catalog_products
   ADD COLUMN IF NOT EXISTS pdp_will_render_computed_at TIMESTAMPTZ;
 
--- Partial index on the advertisable set only. Consumers ask
--- `WHERE pdp_will_render IS TRUE`, and on prod that is the minority side
--- (5,008 true / 9,096 false of 14,104 rows), so indexing only TRUE keeps it
--- small while covering every read this column exists for.
+-- Partial index on the advertisable set only. Keyed on pivota_signature_id,
+-- NOT product_key: the predicate is only ~35% selective, so an index keyed on
+-- the PK gives the planner nothing it does not already have and it will simply
+-- seq-scan. pivota_signature_id is what the ACP lane actually looks rows up by,
+-- so this covers the read the column exists for.
 CREATE INDEX IF NOT EXISTS idx_catalog_products_pdp_will_render_true
-  ON catalog_products (product_key)
+  ON catalog_products (pivota_signature_id)
   WHERE pdp_will_render IS TRUE;
 
 COMMENT ON COLUMN catalog_products.pdp_will_render IS

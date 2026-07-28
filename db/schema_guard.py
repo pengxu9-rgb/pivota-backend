@@ -942,14 +942,15 @@ async def ensure_required_schema_light() -> None:
                     """
                 )
             )
-            # Partial index on the advertisable side only — consumers ask
-            # `WHERE pdp_will_render IS TRUE`, and that is the minority side on
-            # prod (5,008 true / 9,096 false of 14,104 rows).
+            # Partial index on the advertisable side only, keyed on
+            # pivota_signature_id rather than the PK: the predicate is ~35%
+            # selective, so a PK-keyed index would just be seq-scanned. The sig
+            # is what the ACP lane looks rows up by.
             await database.execute(
                 text(
                     """
                     CREATE INDEX IF NOT EXISTS idx_catalog_products_pdp_will_render_true
-                      ON catalog_products (product_key)
+                      ON catalog_products (pivota_signature_id)
                       WHERE pdp_will_render IS TRUE;
                     """
                 )

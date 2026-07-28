@@ -191,25 +191,50 @@ def test_serving_gate_and_missing_ips_both_fail_closed(seeded):
     assert rows["pk_noips"] is False, "no index_pipeline_state row must fail CLOSED"
 
 
-def test_persisted_column_equals_the_live_expression_row_for_row(seeded):
+@pytest.mark.asyncio
+async def test_persisted_column_equals_the_live_expression_row_for_row(seeded):
     """PARITY — the assertion this column's existence depends on.
 
-    If the persisted value ever diverges from the live expression, the column
-    has become a fourth twin under a different name and the drift is invisible
-    because both sides look authoritative.
+    THIS TEST MUST CALL THE SHIPPED WRITE PATH. An earlier cut re-implemented the
+    UPDATE inline with its own ``text(...)``, so it validated the test's own SQL
+    and left ``_persist`` unreachable from the entire suite — a 12-mutant battery
+    then found that making ``_persist`` a silent no-op SURVIVED, i.e. the whole
+    column could have shipped inert behind this very test passing. Routing
+    through ``_persist`` is what makes the parity claim about the product.
     """
     from sqlalchemy import text
 
-    from services.pdp_renderability_store import COLUMN_WILL_RENDER, _compute_select
+    from services.pdp_renderability_store import (
+        COLUMN_COMPUTED_AT,
+        COLUMN_WILL_RENDER,
+        _compute_select,
+        _persist,
+    )
+
+    class _Db:
+        """Minimal async shim over the sync engine, so the real _persist runs."""
+
+        def __init__(self, engine):
+            self._engine = engine
+
+        async def fetch_all(self, stmt):
+            with self._engine.connect() as conn:
+                return conn.execute(stmt).fetchall()
+
+        async def execute(self, stmt, params=None):
+            with self._engine.begin() as conn:
+                return conn.execute(stmt, params or {})
+
+    db = _Db(seeded)
 
     with seeded.begin() as conn:
-        for row in conn.execute(_compute_select()).fetchall():
-            m = row._mapping
-            conn.execute(
-                text(f"UPDATE catalog_products SET {COLUMN_WILL_RENDER} = :wr, "
-                     f"pdp_will_render_computed_at = NOW() WHERE product_key = :pk"),
-                {"wr": bool(m["will_render"]), "pk": m["product_key"]},
-            )
+        conn.execute(text(
+            f"UPDATE catalog_products SET {COLUMN_WILL_RENDER} = NULL, {COLUMN_COMPUTED_AT} = NULL"
+        ))
+
+    rows = await db.fetch_all(_compute_select())
+    written = await _persist(rows, database=db)
+    assert written == len(rows) > 0, "the write path must report what it wrote"
 
     with seeded.connect() as conn:
         live = {r._mapping["product_key"]: bool(r._mapping["will_render"])
@@ -217,8 +242,114 @@ def test_persisted_column_equals_the_live_expression_row_for_row(seeded):
         stored = {r[0]: r[1] for r in conn.execute(
             text(f"SELECT product_key, {COLUMN_WILL_RENDER} FROM catalog_products")
         ).fetchall()}
+        stamped = conn.execute(text(
+            f"SELECT count(*) FROM catalog_products WHERE {COLUMN_COMPUTED_AT} IS NULL"
+        )).scalar()
 
     assert stored == live, f"persisted column drifted from its source: {stored} != {live}"
+    # The staleness contract the whole read-gating story rests on. Unasserted,
+    # "never stamp computed_at" was a surviving mutant.
+    assert stamped == 0, "every written row must carry a computed_at stamp"
+
+
+@pytest.mark.asyncio
+async def test_persist_updates_only_the_rows_it_was_given(seeded):
+    """`WHERE product_key = src.pk` is load-bearing.
+
+    A surviving mutant replaced the join predicate with `OR TRUE`, which set all
+    14,104 rows to a single row's value — silently, and with parity still
+    passing because parity re-read the same corrupted table.
+    """
+    from sqlalchemy import text
+
+    from services.pdp_renderability_store import COLUMN_WILL_RENDER, _persist
+
+    class _Db:
+        def __init__(self, engine):
+            self._engine = engine
+
+        async def execute(self, stmt, params=None):
+            with self._engine.begin() as conn:
+                return conn.execute(stmt, params or {})
+
+    with seeded.begin() as conn:
+        conn.execute(text(f"UPDATE catalog_products SET {COLUMN_WILL_RENDER} = NULL"))
+
+    # Write TRUE for exactly one row; every other row must stay NULL.
+    await _persist([{"product_key": "pk_dead", "will_render": True}], database=_Db(seeded))
+
+    with seeded.connect() as conn:
+        rows = dict(conn.execute(text(
+            f"SELECT product_key, {COLUMN_WILL_RENDER} FROM catalog_products"
+        )).fetchall())
+
+    assert rows["pk_dead"] is True
+    others = {k: v for k, v in rows.items() if k != "pk_dead"}
+    assert all(v is None for v in others.values()), f"scope leaked to other rows: {others}"
+
+
+@pytest.mark.asyncio
+async def test_persist_writes_the_computed_value_not_a_constant(seeded):
+    """An inverted or constant value was another surviving mutant."""
+    from sqlalchemy import text
+
+    from services.pdp_renderability_store import COLUMN_WILL_RENDER, _persist
+
+    class _Db:
+        def __init__(self, engine):
+            self._engine = engine
+
+        async def execute(self, stmt, params=None):
+            with self._engine.begin() as conn:
+                return conn.execute(stmt, params or {})
+
+    await _persist(
+        [{"product_key": "pk_live", "will_render": True},
+         {"product_key": "pk_dead", "will_render": False}],
+        database=_Db(seeded),
+    )
+    with seeded.connect() as conn:
+        rows = dict(conn.execute(text(
+            f"SELECT product_key, {COLUMN_WILL_RENDER} FROM catalog_products "
+            "WHERE product_key IN ('pk_live','pk_dead')"
+        )).fetchall())
+    assert rows == {"pk_live": True, "pk_dead": False}
+
+
+@pytest.mark.asyncio
+async def test_refresh_for_content_key_honours_its_scope(seeded):
+    """`refresh_for_content_key` ignoring its scope was a surviving mutant."""
+    from sqlalchemy import text
+
+    from services.pdp_renderability_store import (
+        COLUMN_WILL_RENDER,
+        refresh_for_content_key,
+    )
+
+    class _Db:
+        def __init__(self, engine):
+            self._engine = engine
+
+        async def fetch_all(self, stmt):
+            with self._engine.connect() as conn:
+                return conn.execute(stmt).fetchall()
+
+        async def execute(self, stmt, params=None):
+            with self._engine.begin() as conn:
+                return conn.execute(stmt, params or {})
+
+    with seeded.begin() as conn:
+        conn.execute(text(f"UPDATE catalog_products SET {COLUMN_WILL_RENDER} = NULL"))
+
+    n = await refresh_for_content_key("ck_blocked", database=_Db(seeded))
+    assert n == 1, f"expected exactly the one ck_blocked row, wrote {n}"
+
+    with seeded.connect() as conn:
+        rows = dict(conn.execute(text(
+            f"SELECT product_key, {COLUMN_WILL_RENDER} FROM catalog_products"
+        )).fetchall())
+    assert rows["pk_blocked"] is False
+    assert rows["pk_live"] is None, "rows outside the content_key must be untouched"
 
 
 def test_the_read_predicate_executes_and_is_fail_closed(seeded):

@@ -1211,18 +1211,6 @@ async def recompute_serving_eligibility(
 
         await _upsert_index_pipeline_state(content_key, new_state)
 
-        # TRIGGER (2) for the persisted row-grain renderability column.
-        # `serving_eligible` is one half of `pdp_will_render`, so flipping it
-        # here changes the answer for EVERY catalog_products row under this
-        # content_key — each still getting its own value, because the other half
-        # (the content route) is per row. Best-effort and never raising: a
-        # bookkeeping column must not be able to roll back the serving-eligibility
-        # write that triggered it. NOTE the other half of the contract: the
-        # row-change trigger is NOT wired, which is exactly why nothing reads
-        # this column yet. See services/pdp_renderability_store.
-        from services.pdp_renderability_store import refresh_for_content_key
-
-        await refresh_for_content_key(content_key)
 
         # IndexNow: when a page becomes newly serving-eligible (and has a minted
         # signature, so a canonical PDP exists), ask participating engines (Bing →

@@ -102,9 +102,25 @@ def test_compute_can_be_scoped_by_content_key_and_by_product_key():
 
 
 def test_empty_scope_selects_nothing_rather_than_everything():
-    """An empty key list must not degrade into a full-table rewrite."""
-    sql = str(store._compute_select(product_keys=[]))
-    assert "IN (" in sql.replace("IN(", "IN (")
+    """An empty key list must not degrade into a full-table rewrite.
+
+    Asserting that `"IN ("` merely APPEARS is a test that cannot fail: the
+    renderability composite contributes five `IN (` fragments of its own (seed
+    statuses, lane names, id prefixes), so removing the scope filter entirely
+    still passed. Confirmed by mutation. The assertion has to name the COLUMN.
+    """
+    scoped = str(store._compute_select(product_keys=[]))
+    unscoped = str(store._compute_select())
+    assert "product_key IN (" in scoped.replace("IN(", "IN ("), scoped
+    assert "product_key IN (" not in unscoped.replace("IN(", "IN ("), (
+        "the unscoped select must not carry a product_key filter — otherwise the "
+        "assertion above proves nothing about scoping"
+    )
+
+
+def test_content_key_scope_names_the_column_too():
+    scoped = str(store._compute_select(content_keys=["ck_a"]))
+    assert "content_key IN (" in scoped.replace("IN(", "IN ("), scoped
 
 
 @pytest.mark.asyncio
