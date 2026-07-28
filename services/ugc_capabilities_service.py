@@ -177,15 +177,16 @@ async def get_product_group_member_product_ids(product_group_id: str) -> Set[str
     await _ensure_database_connected()
     try:
         rows = await database.fetch_all(
-            text(
-                """
-                SELECT platform_product_id
-                FROM product_group_members
-                WHERE product_group_id = :pgid
-                  AND platform_product_id IS NOT NULL
-                  AND platform_product_id != ''
-                """
-            ),
+            # Plain string, not text(): databases.Database._build_query calls
+            # .values() on a ClauseElement when params are passed, and
+            # TextClause has no .values -> AttributeError.
+            """
+            SELECT platform_product_id
+            FROM product_group_members
+            WHERE product_group_id = :pgid
+              AND platform_product_id IS NOT NULL
+              AND platform_product_id != ''
+            """,
             {"pgid": pgid},
         )
     except Exception:
