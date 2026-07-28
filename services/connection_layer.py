@@ -173,11 +173,27 @@ def classify_connection_layer(
     :param has_native_payments: the ``pcs_merchant_capabilities.has_shopify_payments``
         fact. ``None`` = never verified, which is not yes.
 
-    Layer 3 admits EITHER a Pivota-side PSP connection OR a verified native
-    payments fact, because both mean "a real settlement rail exists on this
-    merchant" — which is what the founder's "PSP integrated" denotes. The two
-    differ in WHO orchestrates, and that difference lands in
-    ``resolve_execution_paths``, not here.
+    FOUNDER RULING 2026-07-28 — "PSP integrated" means ``psp_connected``, the
+    flag in the Pivota merchant portal. Layer 3 = Layer 2 ∧ ``psp_connected``,
+    and nothing else.
+
+    An earlier cut admitted EITHER ``psp_connected`` OR a verified
+    ``has_shopify_payments`` fact, on the reasoning that both mean "a real
+    settlement rail exists". That was flagged at the time as *a choice, not a
+    reading of the data*, and the founder has now made the reading.
+
+    The two are different facts about DIFFERENT PARTIES, which is exactly what
+    made the OR tempting:
+
+      * ``psp_connected``        — **Pivota** can orchestrate the charge.
+      * ``has_shopify_payments`` — the **merchant's own** checkout can settle.
+
+    The founder's three-layer model is about Pivota's connection DEPTH to the
+    merchant, so the portal flag is the right axis and the merchant's own
+    checkout capability is not a layer input at all. Where it still matters is
+    ``get_platform_settlement_rails``, which answers the different and wider
+    question of which rails a transaction can pass through — it is load-bearing
+    there and untouched.
     """
     track = str(catalog_track or "").strip().lower()
 
@@ -195,7 +211,7 @@ def classify_connection_layer(
         return LAYER_CRAWLED
     if not has_active_store:
         return LAYER_CRAWLED
-    if _truthy(psp_connected) or _truthy(has_native_payments):
+    if _truthy(psp_connected):
         return LAYER_SYNCED_PSP
     return LAYER_SYNCED
 
@@ -267,7 +283,7 @@ def resolve_execution_paths(
 #: subquery into "does ANY active store exist anywhere" and silently returning a
 #: wrong layer — no error, no injection, just a wrong label. Rejected by
 #: ``_normalize_alias`` so the collision is impossible rather than documented.
-_RESERVED_INTERNAL_ALIASES = frozenset({"mo_cl", "mo_psp", "pmc_cl", "ms_cl"})
+_RESERVED_INTERNAL_ALIASES = frozenset({"mo_cl", "mo_psp", "ms_cl"})
 
 #: The characters Python's ``str.strip()`` removes, as a Postgres E-string for
 #: ``btrim``'s second argument. **`btrim(x)` with one argument strips spaces
@@ -344,16 +360,10 @@ def connection_layer_sql(
             "AND COALESCE(mo_psp.psp_connected, false) = true)"
         )
 
-    # `has_shopify_payments` lives on pcs_merchant_capabilities. Referencing a
-    # relation that does not exist errors at PARSE time — before any runtime
-    # guard could fire — so this leg is only emitted where the table is part of
-    # the schema. It is, in prod and in the dialect gate's create_all.
-    native_fact = (
-        "EXISTS (SELECT 1 FROM pcs_merchant_capabilities pmc_cl "
-        f"WHERE pmc_cl.merchant_id = {p}.merchant_id "
-        "AND pmc_cl.has_shopify_payments = true)"
-    )
-
+    # NOTE: pcs_merchant_capabilities.has_shopify_payments is deliberately NOT
+    # referenced here any more (founder ruling 2026-07-28). Dropping the join
+    # also drops a correlated subquery from the hot path, and removes the only
+    # reason this expression needed that table to exist at all.
     live_statuses = ", ".join(f"'{status}'" for status in LIVE_STORE_STATUSES)
     active_store = (
         "EXISTS (SELECT 1 FROM merchant_stores ms_cl "
@@ -382,7 +392,7 @@ def connection_layer_sql(
       WHEN {merchant_missing} THEN {LAYER_CRAWLED}
       WHEN {track} <> '{TRACK_INTERNAL_MERCHANT}' THEN {LAYER_CRAWLED}
       WHEN NOT {active_store} THEN {LAYER_CRAWLED}
-      WHEN {psp_fact} OR {native_fact} THEN {LAYER_SYNCED_PSP}
+      WHEN {psp_fact} THEN {LAYER_SYNCED_PSP}
       ELSE {LAYER_SYNCED}
     END)
     """.strip()

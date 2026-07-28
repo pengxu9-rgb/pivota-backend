@@ -117,8 +117,14 @@ _FIXTURE = [
     ("pk_synced_no_store", "merch_no_store", "internal_merchant", 1),
     # Layer 3 via Pivota-side PSP.
     ("pk_psp", "merch_psp", "internal_merchant", 3),
-    # Layer 3 via a verified native-payments fact instead.
-    ("pk_native", "merch_native", "internal_merchant", 3),
+    # Layer 2, NOT 3 — founder ruling 2026-07-28. This merchant has a verified
+    # pcs_merchant_capabilities.has_shopify_payments fact and NO psp_connected.
+    # That means the MERCHANT'S OWN checkout can settle, which is a different
+    # fact about a different party from "Pivota can orchestrate the charge", and
+    # only the latter is a layer input. Kept in the fixture precisely because it
+    # is the arm the ruling changed: it pins the new semantics rather than
+    # deleting the case.
+    ("pk_native", "merch_native", "internal_merchant", 2),
     # A crawled ROW under a fully connected merchant stays layer 1 (ADR-001).
     ("pk_crawled_under_connected", "merch_psp", "external_referral", 1),
     # Whitespace-padded tracks. The Python twin normalises with `.strip()`; the
@@ -138,6 +144,12 @@ _FIXTURE = [
     # `connected` is a live store status everywhere else in this repo
     # (merchant_store_service: `status IN ('active','connected')`).
     ("pk_connected_status", "merch_connected", "internal_merchant", 2),
+    # F3 AT ROW LEVEL. The ADR's headline correctness claim — "absence from
+    # merchant_onboarding is layer 1 BY CONSTRUCTION" — was pinned only by a
+    # text assertion that the SQL contains NOT EXISTS. This row exercises the
+    # arm: a live store AND a synced track, but no onboarding row, so only the
+    # merchant_missing leg can produce the answer.
+    ("pk_ghost_with_store", "merch_ghost_store", "internal_merchant", 1),
 ]
 
 
@@ -196,8 +208,10 @@ def seeded(pg_engine):
             ("merch_psp_null", "active"),
             ("merch_no_store", "disconnected"),
             ("merch_psp", "active"),
-            ("merch_native", "ACTIVE"),  # case-insensitivity is load-bearing
+            ("merch_native", "\tactive\n"),  # TAB/NEWLINE: single-arg btrim strips SPACES ONLY,
+                                        # so this is the row that proves the charset
             ("merch_connected", " connected "),  # padding + the second live status
+            ("merch_ghost_store", "active"),  # live store, but NO merchant_onboarding row
         ):
             conn.execute(
                 text(
@@ -373,11 +387,21 @@ def test_python_twin_agrees_on_the_same_fixture(seeded):
     """Close the triangle: SQL == Python, computed from the same seeded facts."""
     from sqlalchemy import text
 
-    from services.connection_layer import LIVE_STORE_STATUSES, classify_connection_layer
+    from services.connection_layer import (
+        _SQL_WHITESPACE,
+        LIVE_STORE_STATUSES,
+        classify_connection_layer,
+    )
 
     # Built from the module's own constant so this fact-extraction query cannot
     # drift from the predicate it is meant to reproduce.
     live = ", ".join(f"'{status}'" for status in LIVE_STORE_STATUSES)
+    # The SAME trim charset the module uses. Built from its constant, not
+    # re-typed: this helper previously hard-coded single-argument `btrim`, which
+    # strips SPACES ONLY, so the moment a fixture row carried a TAB the helper
+    # disagreed with the expression it exists to check — and reported it as a
+    # twin divergence. The test's own SQL is as capable of drifting as the code's.
+    ws = _SQL_WHITESPACE
 
     with seeded.connect() as conn:
         facts = conn.execute(
@@ -390,7 +414,7 @@ def test_python_twin_agrees_on_the_same_fixture(seeded):
                   EXISTS (
                     SELECT 1 FROM merchant_stores ms
                     WHERE ms.merchant_id = cp.merchant_id
-                      AND lower(btrim(COALESCE(ms.status, ''))) IN ({live})
+                      AND lower(btrim(COALESCE(ms.status, ''), {ws})) IN ({live})
                   ) AS has_active_store,
                   mo.psp_connected,
                   pmc.has_shopify_payments
