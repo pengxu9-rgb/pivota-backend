@@ -566,32 +566,46 @@ async def _elected_canonical_sig(content_key: Any) -> Optional[str]:
 async def _sig_renderable(signature_id: Any) -> bool:
     """Will the PDP for this sig answer 200? Both of get_pdp_v2's gates.
 
-    A SEPARATE ROUND TRIP, deliberately, rather than a column on the read above.
-    ``_query_for_id`` returns ``routes/agent_pdp_v1``'s SQL, and that module's
-    reads are pinned — by ``test_sql_uses_agent_pdp_view_indexed_lookup_paths`` —
-    to touch NONE of ``catalog_products`` / ``catalog_skus`` / ``catalog_offers``
-    / ``product_group_members`` / ``subject_resolve``. That pin is the entire
-    point of ``agent_pdp_view`` (migration 085: those five joins cost the old
-    gateway 200-700ms cold; the denormalized table targets <10ms p99), and a
-    second pin keeps the emergency
-    ``AGENT_PDP_V1_BYPASS_SERVING_ELIGIBILITY`` path free of
-    ``index_pipeline_state`` — the table it exists to bypass. Adding this
-    predicate to those SELECTs breaks both, so it does not go there.
+    A SEPARATE ROUND TRIP here, rather than a column on the read above, because
+    ``_query_for_id`` returns ``routes/agent_pdp_v1``'s SQL and this endpoint can
+    absorb the extra hop: it is a public, offer-free citation read behind
+    ``Cache-Control: public, max-age=300, stale-while-revalidate=600``, so the cost
+    amortises across a 5-minute window per id, and it is not the agent PDP render
+    path.
 
-    Paying a second query HERE is fine and is not fine there: this endpoint is a
-    public, offer-free citation read with
-    ``Cache-Control: public, max-age=300, stale-while-revalidate=600`` in front of
-    it, so the cost is amortised across a 5-minute window per id, and it is not
-    the agent PDP render path.
+    HISTORY, because an earlier version of this docstring argued the opposite and
+    that argument is now WRONG. It claimed agent_pdp_v1's reads were pinned to
+    touch none of ``catalog_products`` / ``catalog_skus`` / ``catalog_offers`` /
+    ``product_group_members`` / ``subject_resolve``, that adding the predicate
+    there would break that pin, and that the fix "wants the flag MATERIALISED onto
+    ``agent_pdp_view`` by the assembler".
+
+    Measured, that was the wrong call twice over, and #1602 reversed it:
+
+      * the predicate costs **0.18-0.57 ms** execution (EXPLAIN ANALYZE on prod,
+        all index lookups) — roughly 2-6% of the <10ms p99 target, and NOT the
+        five-way join migration 085 removed, so the pin was relaxed to ban
+        ``JOIN catalog_products`` specifically rather than the table name;
+      * materialising would have been actively worse. ``agent_pdp_view`` has ZERO
+        triggers and is refreshed only by the application, and none of the four
+        ``serving_eligible`` writers nor any ``external_product_seeds.status``
+        writer touches the assembler — nor does the reconciler cron's staleness
+        CTE, which keys on ``catalog_products``/``catalog_offers`` timestamps. A
+        materialised flag would therefore go stale silently and stay stale.
+
+    So ``/api/agent/pdp`` now carries ``pdp_renderable`` INLINE. Only the second
+    pin still holds as written: the emergency
+    ``AGENT_PDP_V1_BYPASS_SERVING_ELIGIBILITY`` path stays free of
+    ``index_pipeline_state`` — the table it exists to bypass — which is why that
+    path emits ``pdp_renderable: null`` rather than a value.
 
     FAIL-CLOSED on anything unexpected: no sig, a non-sig value, or a DB error ⇒
     False, i.e. "do not follow this link". The alternative direction would claim a
-    URL is followable on the strength of a failed check.
-
-    The ``/api/agent/pdp`` route still emits its citable ``url`` with NO such
-    signal. Fixing that wants the flag MATERIALISED onto ``agent_pdp_view`` by the
-    assembler so the read stays one indexed SELECT — a schema + backfill change,
-    tracked separately rather than smuggled in here.
+    URL is followable on the strength of a failed check. NOTE the deliberate
+    asymmetry with agent_pdp_v1, which answers ``None`` on its bypass path: that is
+    a different question ("we could not run the check" vs "we ran nothing because
+    the operator overrode the gate the check reads"), and unknown is the honest
+    answer only in the second case.
     """
     sig = str(signature_id or "").strip()
     if not sig.startswith("sig_") or len(sig) <= len("sig_"):

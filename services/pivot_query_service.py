@@ -1317,8 +1317,11 @@ async def _fetch_citable_canonical_rows(
             -- row than the URL we emit, which is the precise class of lie this
             -- signal exists to remove. Free here (this lane already reads
             -- catalog_products); the single-item citation read pays a second
-            -- round trip instead, because its SQL is agent_pdp_v1's and that is
-            -- pinned to touch no catalog_products.
+            -- round trip instead because it can absorb one behind its 300s cache,
+            -- NOT because agent_pdp_v1 cannot carry the predicate — #1602 measured
+            -- it at 0.18-0.57ms and put it inline there. See
+            -- routes/agent_citation_v1._sig_renderable for why materialising the
+            -- flag was rejected.
             ({_SIG_RENDERABLE_SQL}) AS pdp_renderable,
             -- The content_key's ELECTED canonical sig, intersected with the live
             -- electable set, so a citable hit whose own PDP is dead can still be

@@ -469,19 +469,34 @@ def test_sql_uses_agent_pdp_view_indexed_lookup_paths() -> None:
         # EXPLAIN (ANALYZE, BUFFERS) on prod it is **0.181 ms** and ~10 shared
         # buffers, all index lookups, i.e. ~2% of the p99 budget. It is asserted
         # positively below so the exemption cannot silently widen into a real join.
-        assert "JOIN catalog_products" not in normalized
-        assert "FROM catalog_products apv" not in normalized
         assert "catalog_skus" not in normalized
-        assert "catalog_offers" not in normalized
         assert "product_group_members" not in normalized
         assert "subject_resolve" not in normalized
-        # The ONLY catalog_products reference allowed: the renderability EXISTS,
-        # aliased so it cannot be confused with a join, and keyed on apv's own sig.
+        # THE ONE catalog_products / catalog_offers REFERENCE ALLOWED is the
+        # renderability EXISTS. Counting the bare table NAME (not "JOIN x") is what
+        # actually closes the loophole: review demonstrated that
+        # `"JOIN catalog_products" not in sql` still admits a correlated COMMA-join
+        # (`FROM agent_pdp_view apv, catalog_products cp2 WHERE cp2.content_key =
+        # apv.content_key`) and a `LEFT JOIN LATERAL (… FROM catalog_products AS
+        # _rsig_cp …)` that reuses the blessed alias — both of them exactly the cost
+        # migration 085 removed, and both passing the substring form.
+        assert normalized.count("catalog_products") == 1
+        assert normalized.count("catalog_offers") == 0
         assert "AS pdp_renderable" in normalized
         assert "FROM catalog_products AS _rsig_cp" in normalized
         assert "_rsig_cp.pivota_signature_id = apv.pivota_signature_id" in normalized
-        # Exactly one such subquery — not one per lane, not a lateral per row.
-        assert normalized.count("FROM catalog_products") == 1
+
+        # AND IT MUST STILL ASK BOTH GATES. This is the highest-value assertion
+        # here: the outer query already INNER JOINs index_pipeline_state, so the
+        # EXISTS's own serving-eligibility conjunct reads as redundant and deleting
+        # it changes NOTHING on the default lane. It is not redundant. With
+        # INDEX_ELIGIBLE_READ on — which it is in prod — the outer gate widens to
+        # (serving_eligible OR index_eligible) while gate 1 of the predicate stays
+        # strict, and measured on prod that difference is exactly the 77 offer-free
+        # rows whose PDPs hard-500 (see services/pdp_renderability module docstring).
+        # Dropping it would report `pdp_renderable: true` for all 77.
+        assert "index_pipeline_state.serving_eligible IS true" in normalized
+        assert "external_product_seeds" in normalized, "gate 2 (content route)"
 
     assert "WHERE apv.content_key = :id" in " ".join(sql_by_kind["content_key"].split())
     assert "WHERE apv.pivota_signature_id = :id" in " ".join(sql_by_kind["signature"].split())

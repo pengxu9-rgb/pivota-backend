@@ -97,6 +97,16 @@ _SELECT_APV_COLUMNS = ",\n      ".join(f"apv.{column}" for column in AGENT_PDP_V
 # apv refresh) to save 0.18 ms; a second round trip — the pattern the citation
 # route uses, where a 300s cache absorbs it — would cost MORE than inlining.
 #
+# AVAILABILITY COUPLING, stated because the cost analysis alone does not cover it.
+# These reads now depend on `catalog_products` and `external_product_seeds` being
+# queryable, where migration 085's stated purpose was decoupling this read from
+# `catalog_products`. Concretely: an `ALTER TABLE catalog_products` takes ACCESS
+# EXCLUSIVE and will now block every gated agent PDP read for its duration, which
+# it did not before. Judged acceptable — those migrations are brief and this route
+# already hard-depends on `index_pipeline_state` via its INNER JOIN — but it IS a
+# new coupling, and the emergency bypass (which touches neither table) remains the
+# escape hatch if a long migration ever makes it bite.
+#
 # ONLY ON THE GATED SELECTS. The emergency-bypass variants below deliberately do
 # NOT carry it: they exist to serve when index_pipeline_state is the problem, and
 # gate 1 of this predicate reads that very table. A flag derived from the gate the
@@ -394,8 +404,15 @@ def _row_as_product(row: Dict[str, Any]) -> Dict[str, Any]:
     # …AND WHETHER THAT URL ANSWERS 200. Emitting a citable URL with no way to
     # tell whether it renders was the honesty gap #1592/#1593 closed on the
     # canonical and citation reads; this is the same fix on the last surface that
-    # still had it. Measured on the live feed 2026-07-26: 879 of 5,887 rows do not
-    # render, and this route answered 200 with a `url` for every one.
+    # still had it.
+    #
+    # Sized against THIS ROUTE's population, not the feed's. The feed figure —
+    # 879 non-renderable of 5,887 — is the wrong denominator here, because this
+    # route 404s anything that fails its eligibility gate, so most of those 879
+    # were never served. Measured on prod for the rows this route actually
+    # returns: **390 of 4,782 (8.2%)** on the default serving-only lane, and 489
+    # of 4,881 with INDEX_ELIGIBLE_READ on. Still ~1 in 12 reads handing out a
+    # dead link with no warning.
     #
     # THREE-STATE, and the third state is the point:
     #   True  — both of get_pdp_v2's gates pass; follow the link.
