@@ -42,31 +42,47 @@ on:
         required: false
         default: false
         type: boolean
-  # SCHEDULE DELIBERATELY DISABLED AT MERGE.
+  # SCHEDULE ENABLED 2026-07-27. It was deliberately disabled at merge until three
+  # preconditions held; all three now do, and each was verified rather than
+  # assumed:
   #
-  # Auto-applying would perform the runbook's one-time seeding step FOR the
-  # operator, and it would do so while the two counterpart PRs (PIVOTA-Agent
-  # #1832, pivota-agent-ui #283) are still unmerged — taking rollout ordering
-  # out of the operator's hands and contradicting
-  # docs/runbooks/content_canonical_election_rollout.md, which has the seed as a
-  # reviewed step 2 with a dry run first.
-  #
-  # ENABLE (uncomment) once both counterparts have merged AND deployed, and the
-  # seed has been applied and eyeballed once. Until then the sweep is available
-  # on demand via workflow_dispatch, which defaults to a dry run.
+  #   1. both counterpart PRs MERGED — PIVOTA-Agent #1832 and pivota-agent-ui #283,
+  #      both 2026-07-27 ~02:55 UTC;
+  #   2. both DEPLOYED — 8/8 sampled duplicate-group member PDPs served
+  #      `rel=canonical` pointing at a sibling rather than themselves, which is the
+  #      observable only the deployed gateway produces;
+  #   3. the seed APPLIED and EYEBALLED once — 4,266 elections written, and the
+  #      operator read `moved_from_sitemap` (2, against the runbook's stale ~350)
+  #      and both moved URLs before applying. A follow-up steady-state sweep
+  #      reported written 0 / new_elections 0 / replacements 0, i.e. converged.
   #
   # The interval is the duplicate-exposure window: a stale election is guarded
   # (readers degrade to "no election") but a guarded stale election means those
   # content_keys quietly go back to being duplicates until this repairs them.
   #
-  # schedule:
-  #   # Every 6h at :52. NOTE this LEADS agent-ui's sitemap cron
-  #   # (17 1,7,13,19 UTC) by ~25 minutes rather than trailing it, so the
-  #   # incumbency it reads is the sitemap about to be replaced. Convergence is
-  #   # unaffected — an out-of-order run falls through to the sig-class and
-  #   # lexicographic layers, which both sides compute identically — but if the
-  #   # ordering ever matters, move this to trail rather than lead.
-  #   - cron: "52 */6 * * *"
+  # SAFE TO AUTO-APPLY ONLY BECAUSE #1597 LANDED FIRST. Before it, a sweep that
+  # had to re-elect a few thousand content_keys wrote one row per round trip —
+  # 7-30 minutes against this job's 15-minute timeout — and a timeout mid-write
+  # orphaned a lock-holding transaction that made the NEXT run block and look like
+  # an outage. #1597 batched it (4,266 rows -> 9 statements), made `replacements`
+  # count only real moves so the "URL MOVED" warning below stops crying wolf on
+  # every run, and set DB_POOL_ACQUIRE_TIMEOUT_SECONDS because the 5s default is
+  # for in-cluster and this job reaches Postgres over the public proxy.
+  #
+  # REQUIRES the DATABASE_URL repo secret, set to the PUBLIC proxy URL — a GitHub
+  # runner cannot resolve `*.railway.internal`. Without it every scheduled run
+  # fails fast and harmlessly at the guard in the first step.
+  schedule:
+    # Every 6h at :52. This LEADS agent-ui's sitemap cron (17 1,7,13,19 UTC) by
+    # ~25 minutes rather than trailing it. Originally noted as a caveat — the
+    # incumbency it reads is the sitemap about to be replaced — but now that the
+    # election is SEEDED, leading is the better order: stored winners outrank
+    # incumbency, so incumbency only decides brand-new content_keys, while the
+    # sitemap (which since #283 takes this table as layer 0 of its dedup) gets a
+    # fresh election to read 25 minutes later. Convergence is unaffected either
+    # way; an out-of-order run falls through to the sig-class and lexicographic
+    # layers, which both sides compute identically.
+    - cron: "52 */6 * * *"
 
 # One sweep at a time. plan_elections reads its candidate snapshot OUTSIDE the
 # write transaction, so two overlapping runs could plan against the same state
