@@ -84,6 +84,7 @@ on:
       # The compile-shape ride-along is not matched by the glob above, so it
       # needs its own entry or a change to it would not run its own gate.
       - "tests/test_pdp_renderability.py"
+      - "tests/test_databases_textclause_params.py"
       - "requirements.txt"
       - "requirements-dev.txt"
       - ".github/workflows/postgres-dialect-gate.yml"
@@ -187,7 +188,17 @@ jobs:
           # under a second, and they are the other half of this story: a compiled
           # SQL string can be malformed in ways only a shape assertion catches
           # cheaply, and nothing else in CI runs them today either.
-          for f in tests/test_pdp_renderability.py; do
+          #
+          # test_databases_textclause_params.py rides along for the same reason,
+          # and was checked SQLite-safe under this job's Postgres URL per the
+          # header warning. It carries a repo-wide AST guard against
+          # `database.<method>(text(...), params)`, which `databases` 0.7.0 turns
+          # into an unconditional AttributeError (TextClause has no `.values()`).
+          # That call shape is only reachable from routes/services/db — exactly
+          # this job's path filter — and both known occurrences sat inside
+          # `except Exception`, so the symptom was a silent wrong answer rather
+          # than a 500 that CI or logs would ever surface.
+          for f in tests/test_pdp_renderability.py tests/test_databases_textclause_params.py; do
             [ -e "$f" ] && files="$files $f"
           done
           echo "files=$files" >> "$GITHUB_OUTPUT"

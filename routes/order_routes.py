@@ -2699,15 +2699,16 @@ async def _log_shopify_receipt_suppressed_once(
 ) -> None:
     try:
         existing = await database.fetch_val(
-            text(
-                """
-                SELECT 1
-                FROM order_events
-                WHERE order_id = :order_id
-                  AND event_type = 'shopify_receipt_suppressed'
-                LIMIT 1
-                """
-            ),
+            # Plain string, not text(): databases.Database._build_query calls
+            # .values() on a ClauseElement when params are passed, and
+            # TextClause has no .values -> AttributeError.
+            """
+            SELECT 1
+            FROM order_events
+            WHERE order_id = :order_id
+              AND event_type = 'shopify_receipt_suppressed'
+            LIMIT 1
+            """,
             {"order_id": order_id},
         )
         if existing:
