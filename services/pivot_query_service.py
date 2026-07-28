@@ -568,8 +568,14 @@ def _is_official_brand_source(
     """True when two INDEPENDENTLY-SOURCED hosts agree: an offer's serving domain
     and the canonical PDP host.
 
-    ⚠️ NO LONGER CONSULTED ON THE OFFER PATH — see ADR-019. The function is not
-    wrong; its INPUTS were. For an external-seed mirror row,
+    ⚠️ CONSULTED ONLY WHEN `OFFICIAL_SOURCE_SELLER_DERIVED` IS OFF — which is
+    the default, and therefore prod today. See ADR-019. So if you are chasing a
+    false `official_source`, THIS IS THE CODE PRODUCING IT; it becomes dead only
+    once that flag is flipped. (An earlier revision of this docstring said "no
+    longer consulted", which described the intended end state as though it were
+    the current one — the precise failure mode this codebase keeps paying for.)
+
+    The function is not wrong; its INPUTS were. For an external-seed mirror row,
     `catalog_products.canonical_url` is written from the SAME seed record as
     `catalog_offers.source_domain`, so this asks whether a value equals itself.
     Measured on prod 2026-07-27 it was True for 2,646 of 2,646 candidate rows —

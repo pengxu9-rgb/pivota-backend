@@ -155,7 +155,7 @@ net-new.**
 | Claim + source schema | `models/catalog.py:134` `ProductClaim` `{claim_text, source_ref, source_type, evidence_grade, substantiation_status}`; `EvidenceProfile.claims` | the unit of graded evidence |
 | Source precedence | `services/canonical_inci_intake.py` `may_write()` / `source_rank()` — `brand_official(3) > supplier_input/inci_database(2) > reseller(1)` | a supplier input never downgrades a brand-official fact (ADR-001 #3) |
 | Brand-official crawl → INCI | `services/crawled_inci_ingest.py`, `scripts/ingest_crawled_inci.py` | URL → canonical INCI, source-tagged |
-| Official-source check | `services/pivot_query_service.py:_is_official_brand_source()`, `OfferNode.official_source` | is this URL the brand's own domain? |
+| Official-source check | `OfferNode.official_source` — derived from the stored seller identity (`services/offer_seller_identity.py`) once `OFFICIAL_SOURCE_SELLER_DERIVED` is on; `_is_official_brand_source()` is the legacy path and is a tautology on the mirror lane, see ADR-019 | who is actually selling this offer? |
 | Ingredient → substantiated claim | `services/beauty_evidence.py` (`source_type="ingredient_mechanism"`, `evidence_grade="ingredient_inference"`) | INCI active → claim-safe cited benefit (no LLM) |
 | Claim-safety / screening | `services/claim_screening.py` (cosmetic-vs-drug per category), `services/claim_safety.py` (statuses `unverified\|substantiated\|flagged\|rejected`; FDA/DSHEA + per-category `required_disclaimers`) | blocks drug claims, attaches mandatory disclaimers |
 | Grading | `services/decision_grade_eval.py` — 5 dims (find / justify / trust / buy / compare); "justify" requires `source_ref` + `substantiation_status=="substantiated"` | the decision-grade verdict |

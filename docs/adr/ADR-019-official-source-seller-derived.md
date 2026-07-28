@@ -27,7 +27,7 @@ official_source = bool(is_first_party) or _is_official_brand_source(
 
 `_is_official_brand_source` (`:549`) is true when the two registrable hosts are equal.
 
-**Lane B** — `services/pivot_query_service.py:1749`, the external-seed candidate:
+**Lane B** — `services/pivot_query_service.py:1856`, the external-seed candidate:
 
 ```python
 official_source=bool(seller_identity["is_first_party"]),
@@ -39,10 +39,22 @@ official-domain match → brand token in domain → **unknown, do not guess**.
 
 ### The defect
 
-For an external-seed mirror row, `catalog_products.canonical_url` is written from the *same seed
-record* that `catalog_offers.source_domain` is written from
-(`scripts/mirror_external_seeds_to_catalog_products.py:1129,1268`). So lane A's comparison asks
-whether a value equals itself. **It is a tautology, not a signal.**
+For an external-seed mirror row the two sides are not merely from the same record — **one is a
+pure function of the other**:
+
+- `catalog_products.canonical_url` ← `external_product_seeds.destination_url`
+  (`scripts/mirror_external_seeds_to_catalog_products.py:1268`).
+- `catalog_offers.source_domain` is **not written by the mirror at all** — the dual-write's INSERT
+  column list omits it, and the domain rides only in `offer_payload` JSON. The column is populated
+  by `scripts/backfill_catalog_source_domain.py:180-230`, which resolves
+  `catalog_products.source_ref → external_product_seeds.id` and takes `eps.domain`.
+- And `external_product_seeds.domain` is itself *computed from the URL*:
+  `services/catalog_enrichment_agent/ingestion.py:463` → `_domain_of(canonical_url or
+  destination_url)`; `scripts/onboard_external_brand_from_crawl.py:247-251` →
+  `normalize_host(destination_url)`.
+
+So lane A's comparison asks whether a value equals a function of itself. **It is a tautology, not
+a signal** — which is why the measured hit rate below is exactly 100%.
 
 This is not hypothetical and not merely latent. Measured on prod 2026-07-27, over
 `catalog_track='external_referral'`, unsuppressed, `is_first_party=FALSE`, `source_domain`
@@ -69,10 +81,24 @@ offer_type='brand_direct' AND is_first_party=FALSE   ->  0 rows
 catalog_track='internal_merchant' AND is_first_party=FALSE  ->  0 rows
 ```
 
-Zero, and structurally so: `derive_offer_seller_identity` returns `brand_direct` and
-`is_first_party=True` **together**, from the same rules. There is no path that produces one
-without the other. So the disjunct has no legitimate live consumer on either track — its entire
-production effect is the 2,646 false positives above.
+Zero, and structurally so — though the structure lives in more than one place, which is worth
+stating precisely because the imprecise version sends the next reader to the wrong file.
+`derive_offer_seller_identity` does pair them on every return path
+(`services/offer_seller_identity.py:159-196`), but it is **not the writer** for these rows: its
+production callers are `scripts/onboard_external_brand_from_crawl.py:384` and lane B. The mirror
+lane's writer is a **second, inlined implementation** at
+`services/external_offer_dual_write.py:168-183`, which also pairs them. Every other writer
+checked (`scripts/attach_retailer_offer.py:97-98`,
+`services/retailer_ingest/stylekorean.py:96-97`, `services/catalog_sync_service.py:1397`)
+preserves the pairing or fails in the harmless direction.
+
+So the conclusion holds on every path — but it holds via a duplicated rule, not a single one.
+That duplication is a live drift risk, and it is mildly ironic given this ADR rejects Option 2
+below on exactly "two rules that can drift" grounds. Consolidating the two writers is follow-up
+work, not a blocker for this change.
+
+Either way the disjunct has no legitimate live consumer on either track — its entire production
+effect is the 2,646 false positives above.
 
 ### Why this blocks the `source_domain` blind spot fix
 
@@ -119,6 +145,19 @@ favour of consuming the stored result.
 
 **(3) Chosen: `official_source = is_first_party`.** One rule, one place, computed at write time,
 already mirrored in Node (`PIVOTA-Agent/src/services/offerSellerIdentity.js`).
+
+**Blast radius is external_referral-only for a STRUCTURAL reason, not just an observed one.**
+`services/catalog_sync_service.py:1385-1397` writes every internal_merchant offer
+`is_first_party=True` unconditionally, and the reader's fallback is
+`is_first_party_track('internal_merchant') → True`. So no internal_merchant row can flip to
+false. The 0-row measurement above agrees with the rule rather than standing in for it.
+
+**But be honest about what the field becomes: an ALIAS, not a repaired signal.** With the flag on,
+`official_source == is_first_party` exactly, so it inherits `is_first_party`'s own limitation — a
+Pivota-onboarded RESELLER merchant still reports `official_source=True`. That is not a regression
+(it is true today through the first disjunct too), and it is not the defect this ADR fixes. It
+does mean rollout step 5 should decide whether to **deprecate** the field rather than redefine it;
+see the note now carried on `models/catalog.py`.
 
 ### What breaks, per consumer
 
