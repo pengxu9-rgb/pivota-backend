@@ -42,6 +42,20 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Any, Iterable, Mapping, Optional
 
+# The rig denylist. Imported rather than inlined: a copy here would be a FIFTH
+# copy of the list, and a rig excluded everywhere but here is exactly the bug
+# the gate closes. test_merchant_policy imports only stdlib, so no cycle.
+from services.test_merchant_policy import KNOWN_TEST_MERCHANT_IDS
+
+# Worked example 2 — the test-merchant gate, 2026-07-27. It adds a NEW arm to
+# _derive_serving_decision (a real logic change), but the arm sits after the
+# lifecycle/index gates and every rig row in catalog_row_trust is already
+# 'blocked' by those (measured: 1,561/1,561). So every decision and every
+# reason code is byte-identical on all ~14k rows, and the same no-bump
+# reasoning as P3 applies: bumping would cost a full rewrite and re-open the
+# split-brain window for a change no row can currently observe. The version
+# bumps the day a rig row would actually reach 'public', not the day the
+# backstop is installed.
 POLICY_VERSION = "c1.v0.5"
 
 # ---- Reason codes (authoritative vocabulary) -------------------------------
@@ -68,6 +82,13 @@ POLICY_VERSION = "c1.v0.5"
 #     low-info.
 #
 # Blocked (no public surface):
+#   TEST_MERCHANT_EXCLUDED           — 2026-07-27. merchant_id is a known rig
+#     (services/test_merchant_policy KNOWN_TEST_MERCHANT_IDS). Evaluated after
+#     the lifecycle/index gates, so it only fires on a rig that would
+#     OTHERWISE have reached public/shadow — an already-blocked rig keeps its
+#     real reason. Fires on zero rows today; it is the backstop for the day a
+#     rig's suppression is cleared. Baked-in ids only, never the env hatch:
+#     this table is shared state written by both twins.
 #   SOURCE_QUARANTINED               — catalog_source_quarantine active match.
 #   ROW_TOMBSTONED                   — catalog_products.suppression_reason set.
 #   EXTERNAL_SEED_INACTIVE           — external_product_seeds.status != 'active'.
@@ -125,6 +146,7 @@ class _ReasonCodes:
     IDENTITY_CONFLICT = "IDENTITY_CONFLICT"
     OFFER_SUPPRESSED = "OFFER_SUPPRESSED"
     PDP_ROUTE_UNRESOLVABLE = "PDP_ROUTE_UNRESOLVABLE"
+    TEST_MERCHANT_EXCLUDED = "TEST_MERCHANT_EXCLUDED"
 
 
 REASON_CODES = _ReasonCodes()
@@ -674,6 +696,35 @@ def _derive_serving_decision(
         sync_status = str(_get(product, "sync_status") or "").lower()
         if sync_status and sync_status != "live":
             reasons.append(REASON_CODES.PUBLISH_STATE_NOT_PUBLIC)
+            return {"decision": "blocked"}
+
+    # Test/demo merchant gate. Placed here for the same reason as the
+    # renderability gate below: AFTER the lifecycle/index gates, so a rig that
+    # is already blocked keeps reporting its real reason (ROW_TOMBSTONED,
+    # MERCHANT_STORE_INACTIVE, …) and ONLY a rig that would otherwise reach
+    # public/shadow is reclassified. Measured 2026-07-27: all 1,561 rig rows in
+    # catalog_row_trust are already 'blocked', so this arm fires on zero rows
+    # today and every decision and reason code is byte-identical — which is
+    # exactly why POLICY_VERSION does NOT bump for this change (see the
+    # versioning note at the top of this file, and the P3 worked example).
+    #
+    # Why this gate exists at all: before it, the ONLY thing keeping a rig out
+    # of 'public' here was data — suppression_reason making the lifecycle
+    # 'tombstoned'. Clear the suppression and the rig derived straight through
+    # to 'public', while the serving-lane filters correctly excluded it
+    # everywhere else. That split-brain was the gap ADR-018's census left open.
+    #
+    # Reads the BAKED-IN frozenset only (KNOWN_TEST_MERCHANT_IDS), never
+    # static_test_merchant_ids() with its env hatch. catalog_row_trust is shared
+    # state written by BOTH this service and the agent-repo twin; a per-service
+    # env var would make the two derive different decisions for the same row and
+    # flap it public↔blocked — the same hazard documented for
+    # CATALOG_TRUST_RENDERABLE_GATE. Code-only inputs here; the env hatch still
+    # applies on the runtime serving lanes.
+    if product is not None:
+        _rig_id = str(_get(product, "merchant_id") or "").strip()
+        if _rig_id in KNOWN_TEST_MERCHANT_IDS:
+            reasons.append(REASON_CODES.TEST_MERCHANT_EXCLUDED)
             return {"decision": "blocked"}
 
     # c1.v0.5 renderability gate. Deliberately AFTER the lifecycle/index gates

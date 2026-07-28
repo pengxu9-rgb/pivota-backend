@@ -31,7 +31,7 @@ def active_merchant_product(**overrides):
         "product_key": "pk_internal_1",
         "content_key": "ck_internal_1",
         "source_domain": "chydan.myshopify.com",
-        "merchant_id": "merch_efbc46b4619cfbdf",
+        "merchant_id": "merch_first_party_seller_1",
         "platform": "shopify",
         "source_system": "shopify",
         "source_ref": "gid://shopify/Product/1",
@@ -46,7 +46,7 @@ def active_merchant_product(**overrides):
 
 def approved_identity(**overrides):
     base = {
-        "source_listing_ref": "merch_efbc46b4619cfbdf:1",
+        "source_listing_ref": "merch_first_party_seller_1:1",
         "identity_status": "approved",
         "identity_confidence": 0.95,
         "live_read_enabled": True,
@@ -74,7 +74,7 @@ def eligible_ips(**overrides):
 
 def active_merchant_store(**overrides):
     base = {
-        "merchant_id": "merch_efbc46b4619cfbdf",
+        "merchant_id": "merch_first_party_seller_1",
         "platform": "shopify",
         "domain": "chydan.myshopify.com",
         "status": "active",
@@ -760,3 +760,55 @@ def test_policy_version_is_pinned_to_the_node_twin():
     to back (backend first).
     """
     assert POLICY_VERSION == "c1.v0.5"
+
+
+# ---- TEST/DEMO MERCHANT GATE (2026-07-27) -----------------------------------
+#
+# Closes the Regime B gap from the ADR-018 census: before this arm, the only
+# thing keeping a rig out of 'public' HERE was suppression data, not policy.
+
+
+def test_rig_merchant_that_would_otherwise_be_public_is_blocked():
+    trust = call(product=active_merchant_product(merchant_id="merch_test_ownist_001"))
+    assert trust["serving_decision"] == "blocked"
+    assert REASON_CODES.TEST_MERCHANT_EXCLUDED in trust["serving_reason_codes"]
+
+
+def test_every_baked_in_rig_id_is_blocked_by_the_gate():
+    from services.test_merchant_policy import KNOWN_TEST_MERCHANT_IDS
+
+    for rig_id in KNOWN_TEST_MERCHANT_IDS:
+        trust = call(product=active_merchant_product(merchant_id=rig_id))
+        assert trust["serving_decision"] == "blocked", f"{rig_id} should be blocked"
+        assert REASON_CODES.TEST_MERCHANT_EXCLUDED in trust["serving_reason_codes"], rig_id
+
+
+def test_already_blocked_rig_keeps_its_real_reason():
+    """Pins the no-POLICY_VERSION-bump argument: an already-blocked rig must keep
+    reporting its REAL reason, so output stays byte-identical on every row that
+    exists in prod today (all 1,561 rig rows are already 'blocked')."""
+    trust = call(
+        product=active_merchant_product(
+            merchant_id="merch_test_ownist_001",
+            suppression_reason="demo_retired_2026_07",
+        ),
+    )
+    assert trust["serving_decision"] == "blocked"
+    assert trust["source_lifecycle_state"] == "tombstoned"
+    assert REASON_CODES.ROW_TOMBSTONED in trust["serving_reason_codes"]
+    assert REASON_CODES.TEST_MERCHANT_EXCLUDED not in trust["serving_reason_codes"]
+
+
+def test_non_rig_merchant_is_unaffected():
+    trust = call()
+    assert trust["serving_decision"] == "public"
+    assert REASON_CODES.TEST_MERCHANT_EXCLUDED not in trust["serving_reason_codes"]
+
+
+def test_env_hatch_does_not_affect_the_trust_gate(monkeypatch):
+    """catalog_row_trust is shared state written by both twins; a per-service env
+    var would make them disagree and flap rows public<->blocked."""
+    monkeypatch.setenv("PIVOTA_TEST_MERCHANT_IDS", "merch_env_only_rig")
+    trust = call(product=active_merchant_product(merchant_id="merch_env_only_rig"))
+    assert trust["serving_decision"] == "public"
+    assert REASON_CODES.TEST_MERCHANT_EXCLUDED not in trust["serving_reason_codes"]
