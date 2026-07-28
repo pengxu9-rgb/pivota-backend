@@ -52,16 +52,22 @@ jobs:
 
       - name: Reap orphans (dry-run report)
         shell: bash
+        # `${{ }}` in a `run:` body is TEXTUAL SUBSTITUTION performed before the
+        # shell parses anything, so a free-form input lands as executable shell in
+        # a job holding the production DATABASE_URL. Values arrive through `env:`.
+        env:
+          RUN_ID: ${{ github.run_id }}
+          REAP_LIMIT: ${{ github.event_name == 'workflow_dispatch' && inputs.limit || '0' }}
         run: |
           set -euo pipefail
           if [[ -z "${DATABASE_URL:-}" ]]; then
             echo "DATABASE_URL secret is required" >&2
             exit 1
           fi
-          out_dir="reports/workflow_ops/agent-pdp-orphan-reaper/${{ github.run_id }}"
+          out_dir="reports/workflow_ops/agent-pdp-orphan-reaper/${RUN_ID}"
           mkdir -p "${out_dir}"
           python -m scripts.reap_orphaned_agent_pdp_view \
-            --limit "${{ github.event_name == 'workflow_dispatch' && inputs.limit || '0' }}" \
+            --limit "${REAP_LIMIT}" \
             | tee "${out_dir}/dry_run.json"
 
       - name: Reap orphans (apply)
@@ -69,13 +75,16 @@ jobs:
         # when the apply box is checked.
         if: ${{ github.event_name == 'schedule' || (github.event_name == 'workflow_dispatch' && inputs.apply) }}
         shell: bash
+        env:
+          RUN_ID: ${{ github.run_id }}
+          REAP_LIMIT: ${{ github.event_name == 'workflow_dispatch' && inputs.limit || '0' }}
         run: |
           set -euo pipefail
-          out_dir="reports/workflow_ops/agent-pdp-orphan-reaper/${{ github.run_id }}"
+          out_dir="reports/workflow_ops/agent-pdp-orphan-reaper/${RUN_ID}"
           mkdir -p "${out_dir}"
           python -m scripts.reap_orphaned_agent_pdp_view \
             --apply \
-            --limit "${{ github.event_name == 'workflow_dispatch' && inputs.limit || '0' }}" \
+            --limit "${REAP_LIMIT}" \
             | tee "${out_dir}/apply.json"
 
       - name: Upload artifact
