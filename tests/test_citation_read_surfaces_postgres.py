@@ -252,3 +252,62 @@ async def test_canonical_by_sig_route_executes(db_connected):
     with pytest.raises(HTTPException) as exc:
         await get_canonical_pdp_by_signature("sig_" + "0" * 32)
     assert exc.value.status_code == 404
+
+
+@pytest.mark.asyncio
+async def test_agent_pdp_gated_lanes_execute_on_postgres(db_connected):
+    """`GET /api/agent/pdp/{id}` — all THREE gated lanes and both eligibility
+    variants, now that #1602 splices the renderability fragment into them inline.
+
+    THE BLAST RADIUS HERE IS WORSE THAN THE CITATION SURFACES ABOVE, which is why
+    this test exists rather than trusting the shape assertions. `_sig_renderable`
+    is fail-closed — a broken fragment there logs and returns False, so the
+    citation read still serves. These SELECTs have no such wrapper: a fragment
+    that fails to PARSE or PREPARE is a 500 on EVERY agent PDP read, on the
+    surface the gateway itself calls.
+
+    Executes rather than inspects, for exactly the reason this file opens with:
+    the fragment is a Postgres-dialect string, so nothing on the SQLite suite ever
+    parses it, and the first version of it was not valid SQL while 142 tests
+    passed.
+    """
+    from db.database import database
+    from routes import agent_pdp_v1
+
+    lanes = {
+        "content_key": (agent_pdp_v1.SELECT_BY_CONTENT_KEY_SQL, "ck_" + "0" * 32),
+        "signature": (agent_pdp_v1.SELECT_BY_SIGNATURE_SQL, "sig_" + "0" * 32),
+        "product_group": (agent_pdp_v1.SELECT_BY_PRODUCT_GROUP_SQL, "pg_" + "0" * 32),
+        # INDEX_ELIGIBLE_READ widened forms — a separate compiled string each.
+        "content_key/widened": (
+            agent_pdp_v1.INDEX_SELECT_BY_CONTENT_KEY_SQL,
+            "ck_" + "0" * 32,
+        ),
+        "signature/widened": (
+            agent_pdp_v1.INDEX_SELECT_BY_SIGNATURE_SQL,
+            "sig_" + "0" * 32,
+        ),
+        "product_group/widened": (
+            agent_pdp_v1.INDEX_SELECT_BY_PRODUCT_GROUP_SQL,
+            "pg_" + "0" * 32,
+        ),
+    }
+    for name, (sql, lookup_id) in lanes.items():
+        row = await database.fetch_one(sql, {"id": lookup_id})
+        assert row is None, f"{name} lane unexpectedly matched an empty table"
+
+
+@pytest.mark.asyncio
+async def test_agent_pdp_bypass_lanes_execute_on_postgres(db_connected):
+    """The emergency lanes must also prepare — they are what an operator reaches
+    for when the gated ones are failing, so a syntax error there is discovered at
+    the worst possible moment. They carry NO renderability fragment by design."""
+    from db.database import database
+    from routes import agent_pdp_v1
+
+    for sql, lookup_id in (
+        (agent_pdp_v1.BYPASS_SELECT_BY_CONTENT_KEY_SQL, "ck_" + "0" * 32),
+        (agent_pdp_v1.BYPASS_SELECT_BY_SIGNATURE_SQL, "sig_" + "0" * 32),
+        (agent_pdp_v1.BYPASS_SELECT_BY_PRODUCT_GROUP_SQL, "pg_" + "0" * 32),
+    ):
+        assert await database.fetch_one(sql, {"id": lookup_id}) is None
