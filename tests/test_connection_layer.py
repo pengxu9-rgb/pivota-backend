@@ -107,7 +107,16 @@ def test_psp_connected_lifts_to_layer_3():
     )
 
 
-def test_verified_native_payments_also_lifts_to_layer_3():
+def test_native_payments_alone_does_NOT_lift_to_layer_3():
+    """FOUNDER RULING 2026-07-28: "PSP integrated" means `psp_connected` — the
+    Pivota merchant-portal flag — and nothing else.
+
+    They are facts about DIFFERENT PARTIES, which is what made the old OR
+    tempting: `psp_connected` means PIVOTA can orchestrate the charge;
+    `has_shopify_payments` means the MERCHANT'S OWN checkout can settle. The
+    three-layer model is about Pivota's connection depth, so only the former is
+    a layer input. A verified merchant checkout, on its own, is layer 2.
+    """
     assert (
         classify_connection_layer(
             catalog_track="internal_merchant",
@@ -115,6 +124,25 @@ def test_verified_native_payments_also_lifts_to_layer_3():
             has_active_store=True,
             psp_connected=None,
             has_native_payments=True,
+        )
+        == LAYER_SYNCED
+    )
+
+
+def test_psp_connected_is_the_ONLY_arm_that_reaches_layer_3():
+    """Mutation guard: removing the `psp_connected` leg must turn this red.
+
+    A predicate whose only arm is untested is the shape that has cost this
+    project repeatedly, so the positive case is pinned explicitly alongside the
+    negative one above.
+    """
+    assert (
+        classify_connection_layer(
+            catalog_track="internal_merchant",
+            merchant_known=True,
+            has_active_store=True,
+            psp_connected=True,
+            has_native_payments=False,
         )
         == LAYER_SYNCED_PSP
     )
@@ -344,6 +372,16 @@ def test_slug_does_not_round_a_non_integer_into_a_layer(not_a_layer):
     expressing the layer honestly — a non-integral input gets the floor, not a
     rounded lie. ``True == 1`` is excluded for the same reason."""
     assert connection_layer_slug(not_a_layer) == "crawled"
+
+
+def test_sql_no_longer_references_the_capabilities_table():
+    """Founder ruling: has_shopify_payments is not a layer input, so the SQL twin
+    must not join pcs_merchant_capabilities. Dropping it also removes a
+    correlated subquery from the hot path."""
+    sql = connection_layer_sql("cp")
+    assert "pcs_merchant_capabilities" not in sql
+    assert "has_shopify_payments" not in sql
+    assert "psp_connected" in sql, "the one remaining layer-3 arm must still be there"
 
 
 def test_sql_states_the_missing_merchant_leg_explicitly():

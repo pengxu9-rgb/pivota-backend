@@ -117,8 +117,14 @@ _FIXTURE = [
     ("pk_synced_no_store", "merch_no_store", "internal_merchant", 1),
     # Layer 3 via Pivota-side PSP.
     ("pk_psp", "merch_psp", "internal_merchant", 3),
-    # Layer 3 via a verified native-payments fact instead.
-    ("pk_native", "merch_native", "internal_merchant", 3),
+    # Layer 2, NOT 3 — founder ruling 2026-07-28. This merchant has a verified
+    # pcs_merchant_capabilities.has_shopify_payments fact and NO psp_connected.
+    # That means the MERCHANT'S OWN checkout can settle, which is a different
+    # fact about a different party from "Pivota can orchestrate the charge", and
+    # only the latter is a layer input. Kept in the fixture precisely because it
+    # is the arm the ruling changed: it pins the new semantics rather than
+    # deleting the case.
+    ("pk_native", "merch_native", "internal_merchant", 2),
     # A crawled ROW under a fully connected merchant stays layer 1 (ADR-001).
     ("pk_crawled_under_connected", "merch_psp", "external_referral", 1),
     # Whitespace-padded tracks. The Python twin normalises with `.strip()`; the

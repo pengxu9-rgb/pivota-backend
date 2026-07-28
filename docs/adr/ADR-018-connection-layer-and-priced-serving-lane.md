@@ -110,6 +110,21 @@ And warm-handoff eligibility keys on **brand domain**, not on layer. A crawled L
 
 **Therefore this ADR does not advertise the layer as an execution promise.** It carries two orthogonal fields — a `connection_layer` (supply provenance) and an `execution_path` (what the agent actually gets) — and the second is the one an agent is allowed to act on. Collapsing them into one number would be exactly the execution-layer fallback the standing rule forbids: it would let a redirect-only item be read as one-click because its supply tier happened to be high.
 
+### ✅ RESOLVED 2026-07-28 (founder) — "PSP integrated" means `psp_connected`, and only that
+
+This ADR originally defined layer 3 as `psp_connected` **OR** a verified `pcs_merchant_capabilities.has_shopify_payments` fact, on the reasoning that both mean "a real settlement rail exists on this merchant". That was flagged when it shipped as *a choice, not a reading of the data*. The founder has now made the reading: **"PSP integrated" is `psp_connected` — the flag in the Pivota merchant portal.** The `has_shopify_payments` leg is dropped from the layer definition entirely.
+
+The distinction is worth stating plainly, because conflating the two is exactly what made the OR tempting — they are facts about **different parties**:
+
+| fact | means |
+|---|---|
+| `merchant_onboarding.psp_connected` | **Pivota** can orchestrate the charge |
+| `pcs_merchant_capabilities.has_shopify_payments` | the **merchant's own** checkout can settle |
+
+The three-layer model is about **Pivota's connection depth to the merchant**, so the portal flag is the right axis and the merchant's own checkout capability is not a layer input at all. It remains load-bearing in `get_platform_settlement_rails`, which answers the different and wider question of *which rails a transaction can pass through* — untouched by this.
+
+**Census delta, measured rather than assumed: zero rows move.** Computing both definitions side by side over all 14,104 `catalog_products` rows, `CHANGED_BY_RULING = 0` for every layer. That is because `has_shopify_payments IS TRUE` for **0** merchants in prod — nobody has ever been through the Shopify verify — so the OR arm had never once fired. The layer census is byte-identical: layer 1 = 12,547 (12,543 non-rig), layer 2 = 794 (0 non-rig), layer 3 = 763 (0 non-rig).
+
 ### F3 — "Merchant" is two different entities in the schema, and the founder's sentence spans both.
 
 `merchant_onboarding` holds parties who signed up (54 rows). Crawled sellers are not in it. Layer-1 products carry either the synthetic bucket id `merchant_id='external_seed'` (11,149 rows) or an ADR-009 **observed seller** `merch_obs_*` (45 distinct ids, 1,365 rows), plus 7 other ids over 28 rows.
@@ -127,7 +142,7 @@ The layer is already fully determined by columns that exist:
 ```
 layer 1  ⟸  catalog_track = 'external_referral'            (or merchant absent from merchant_onboarding)
 layer 2  ⟸  catalog_track = 'internal_merchant'  ∧  an active merchant_stores row
-layer 3  ⟸  layer 2  ∧  (psp_connected IS TRUE  ∨  a verified pcs has_shopify_payments fact)
+layer 3  ⟸  layer 2  ∧  merchant_onboarding.psp_connected IS TRUE
 ```
 
 Storing it would create a third thing to keep in sync with `catalog_track` and `merchant_stores.status`, both of which already move — and this repo has repeatedly been bitten by a stored derivative drifting from its source (`catalog_row_trust`, the minted/mirror trust split). Derivation costs one `CASE` and two `EXISTS` legs the serving queries already run for the source gate. **Prefer derivation; revisit only if a profile shows the `EXISTS` legs on the hot feed path.**
