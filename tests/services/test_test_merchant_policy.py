@@ -139,3 +139,28 @@ def test_filter_handles_object_products():
 def test_filter_empty_input():
     assert pol.filter_out_test_merchants(None, {"x"}) == []
     assert pol.filter_out_test_merchants([], {"x"}) == []
+
+
+# The two repos' rig lists must hold the SAME ids: both services write
+# catalog_row_trust from the same policy, so an id present in one and not the
+# other makes them derive different serving_decisions for the same row and flap
+# it public<->blocked on the live surface. Nothing can enforce that across repo
+# boundaries, so each side pins the exact set: adding a rig here fails this test
+# until the author consciously updates it, and the message says where else to go.
+EXPECTED_RIG_IDS = {
+    "merch_efbc46b4619cfbdf",
+    "merch_shopify_0584b37f7a8be00a5223",
+    "merch_shopify_00d4a720d67d96c5dcba",
+    "merch_bbd34645bc1950cc",
+    "merch_shopify_b20b5797f4181983c177",
+    "merch_test_ownist_001",
+}
+
+
+def test_rig_list_is_pinned_and_mirrors_the_gateway_twin():
+    assert set(pol.KNOWN_TEST_MERCHANT_IDS) == EXPECTED_RIG_IDS, (
+        "Rig list changed. Mirror it in PIVOTA-Agent "
+        "src/services/testMerchantPolicy.js TEST_MERCHANT_IDS (and its pinned "
+        "test) IN THE SAME DEPLOY — the two services share catalog_row_trust, "
+        "so a one-sided change flaps rows public<->blocked."
+    )
