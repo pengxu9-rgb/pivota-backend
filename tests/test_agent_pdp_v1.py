@@ -456,11 +456,32 @@ def test_sql_uses_agent_pdp_view_indexed_lookup_paths() -> None:
         assert "FROM agent_pdp_view apv" in normalized
         assert "INNER JOIN index_pipeline_state ips ON ips.content_key = apv.content_key" in normalized
         assert "ips.serving_eligible = TRUE" in normalized
-        assert "catalog_products" not in normalized
+        # THE FIVE JOINS migration 085 exists to have removed. The old gateway
+        # joined catalog_products x catalog_skus x catalog_offers x
+        # product_group_members x subject_resolve plus a 3-step fallback chain, at
+        # 200-700ms cold; agent_pdp_view is the denormalized answer, targeting
+        # <10ms p99. Reintroducing any of them as a JOIN is the regression.
+        #
+        # catalog_products is now permitted in ONE narrow shape and no other: the
+        # correlated existence check behind `pdp_renderable`
+        # (services.pdp_renderability.sig_pdp_will_render). That is not the join
+        # this pin was written against — measured with
+        # EXPLAIN (ANALYZE, BUFFERS) on prod it is **0.181 ms** and ~10 shared
+        # buffers, all index lookups, i.e. ~2% of the p99 budget. It is asserted
+        # positively below so the exemption cannot silently widen into a real join.
+        assert "JOIN catalog_products" not in normalized
+        assert "FROM catalog_products apv" not in normalized
         assert "catalog_skus" not in normalized
         assert "catalog_offers" not in normalized
         assert "product_group_members" not in normalized
         assert "subject_resolve" not in normalized
+        # The ONLY catalog_products reference allowed: the renderability EXISTS,
+        # aliased so it cannot be confused with a join, and keyed on apv's own sig.
+        assert "AS pdp_renderable" in normalized
+        assert "FROM catalog_products AS _rsig_cp" in normalized
+        assert "_rsig_cp.pivota_signature_id = apv.pivota_signature_id" in normalized
+        # Exactly one such subquery — not one per lane, not a lateral per row.
+        assert normalized.count("FROM catalog_products") == 1
 
     assert "WHERE apv.content_key = :id" in " ".join(sql_by_kind["content_key"].split())
     assert "WHERE apv.pivota_signature_id = :id" in " ".join(sql_by_kind["signature"].split())
@@ -607,3 +628,101 @@ def test_get_agent_pdp_independent_signals_empty_by_default(monkeypatch) -> None
     client, _ = _client(monkeypatch, [_row()])  # no citations
     product = _canonical_product(client.get(f"/api/agent/pdp/{CK_A}").json())
     assert product["independent_signals"] == []
+
+
+# ---------------------------------------------------------------------------
+# pdp_renderable — is the citable `url` this route emits followable?
+# ---------------------------------------------------------------------------
+#
+# The last read surface that emitted a citable URL with no way to tell whether it
+# renders. Measured on the live feed 2026-07-26: 879 of 5,887 rows do NOT render
+# and this route answered 200 with a `url` for every one.
+#
+# Three states, and the third is the point: True (follow it), False (cite the
+# content, not the link), None (unknown — no URL, or the emergency bypass served
+# the row and that path deliberately does not read index_pipeline_state, which
+# gate 1 of the predicate depends on).
+
+
+def test_pdp_renderable_true_when_both_gates_pass(monkeypatch) -> None:
+    client, _db = _client(monkeypatch, [_row() | {"pdp_renderable": True}])
+    body = client.get(f"/api/agent/pdp/{CK_A}").json()
+    product = _canonical_product(body)
+    assert product["pdp_renderable"] is True
+    assert product["url"] == f"https://agent.pivota.cc/products/{SIG_A}"
+
+
+def test_pdp_renderable_false_still_serves_the_row(monkeypatch) -> None:
+    """A signal, not a filter. The content stays citable; only the link is flagged."""
+    client, _db = _client(monkeypatch, [_row() | {"pdp_renderable": False}])
+    res = client.get(f"/api/agent/pdp/{CK_A}")
+    assert res.status_code == 200
+    product = _canonical_product(res.json())
+    assert product["pdp_renderable"] is False
+    # URL is still emitted — consumers decide, using the flag.
+    assert product["url"] == f"https://agent.pivota.cc/products/{SIG_A}"
+    assert product["title"]
+
+
+def test_pdp_renderable_is_null_when_no_sig_means_no_url(monkeypatch) -> None:
+    client, _db = _client(
+        monkeypatch, [_row(pivota_signature_id=None) | {"pdp_renderable": True}]
+    )
+    product = _canonical_product(client.get(f"/api/agent/pdp/{CK_A}").json())
+    assert product.get("url") in (None, "")
+    # Nothing to characterise ⇒ null, even though the column said True.
+    assert product["pdp_renderable"] is None
+
+
+def test_pdp_renderable_is_null_not_false_on_the_emergency_bypass(
+    monkeypatch,
+) -> None:
+    """The bypass overrides index_pipeline_state; the flag must not pretend.
+
+    The bypass SELECTs omit the column entirely, so the row genuinely lacks the
+    key — `.get` returning None is the signal, not a default. Reporting False here
+    would assert a check we did not run, against the very gate the operator
+    overrode.
+    """
+    monkeypatch.setenv("AGENT_PDP_V1_BYPASS_SERVING_ELIGIBILITY", "true")
+    client, db = _client(
+        monkeypatch,
+        [_row()],  # note: NO pdp_renderable key, as the bypass SQL produces
+        serving_eligible_by_content_key={CK_A: False},
+    )
+    res = client.get(f"/api/agent/pdp/{CK_A}")
+    assert res.status_code == 200
+    product = _canonical_product(res.json())
+    assert product["pdp_renderable"] is None
+    # …and the bypass query really is the one that ran, still free of ips.
+    assert "index_pipeline_state" not in db.calls[0]["query"]
+
+
+def test_bypass_sql_does_not_carry_the_renderability_predicate() -> None:
+    """Pins the asymmetry at the SQL level, not just the response.
+
+    Adding it to the bypass variants would reintroduce index_pipeline_state into
+    the one path that exists for when that table is the problem.
+    """
+    for sql in (
+        agent_pdp_v1.BYPASS_SELECT_BY_CONTENT_KEY_SQL,
+        agent_pdp_v1.BYPASS_SELECT_BY_SIGNATURE_SQL,
+        agent_pdp_v1.BYPASS_SELECT_BY_PRODUCT_GROUP_SQL,
+    ):
+        normalized = " ".join(sql.split())
+        assert "pdp_renderable" not in normalized
+        assert "index_pipeline_state" not in normalized
+        assert "catalog_products" not in normalized
+
+
+def test_widened_and_group_lanes_also_carry_the_flag() -> None:
+    """All THREE gated lanes, both eligibility variants — not just by-content_key."""
+    for sql in (
+        agent_pdp_v1.SELECT_BY_CONTENT_KEY_SQL,
+        agent_pdp_v1.SELECT_BY_SIGNATURE_SQL,
+        agent_pdp_v1.SELECT_BY_PRODUCT_GROUP_SQL,
+        agent_pdp_v1.INDEX_SELECT_BY_CONTENT_KEY_SQL,
+        agent_pdp_v1.INDEX_SELECT_BY_SIGNATURE_SQL,
+        agent_pdp_v1.INDEX_SELECT_BY_PRODUCT_GROUP_SQL,
+    ):
+        assert "AS pdp_renderable" in " ".join(sql.split())
