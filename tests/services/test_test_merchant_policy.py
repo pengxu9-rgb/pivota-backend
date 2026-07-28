@@ -99,9 +99,14 @@ async def test_resolver_caches_within_ttl():
 def test_none_db_returns_static_only():
     import asyncio
 
-    ids = asyncio.get_event_loop().run_until_complete(
-        pol.get_excluded_merchant_ids(None, env={})
-    )
+    # `asyncio.run`, not `get_event_loop().run_until_complete`: since 3.12 the
+    # latter no longer auto-creates a loop off the main thread, so it raises
+    # DeprecationWarning on 3.12 and RuntimeError on 3.14 — verified failing on
+    # 3.14 locally while CI's 3.11 stayed green. Wiring this file into the
+    # reliability suite (which is the point of the change shipping alongside)
+    # would otherwise plant a landmine that detonates on the next Python bump,
+    # in a test whose whole job is to be the tripwire.
+    ids = asyncio.run(pol.get_excluded_merchant_ids(None, env={}))
     assert ids == pol.static_test_merchant_ids({})
 
 

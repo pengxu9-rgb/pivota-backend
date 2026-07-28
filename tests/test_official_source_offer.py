@@ -19,3 +19,101 @@ def test_not_official_for_retailer_mirror_or_missing():
     assert _is_official_brand_source("sephora.com", "https://www.cosrx.com/products/x") is False
     assert _is_official_brand_source(None, "https://cosrx.com/x") is False
     assert _is_official_brand_source("cosrx.com", None) is False
+
+
+# ---- ADR-019: official_source is seller-derived --------------------------------
+# The comparison above is not wrong; its INPUTS were. On an external-seed mirror
+# row `catalog_products.canonical_url` and `catalog_offers.source_domain` are both
+# written from the SAME seed, so `_is_official_brand_source` asks whether a value
+# equals itself. Measured on prod 2026-07-27: true for 2,646 of 2,646 candidate
+# rows (100%), including 480 the seller-identity derivation typed `retailer`.
+
+import pytest
+
+from services.pivot_query_service import _build_canonical_offer_node
+
+
+def _mirror_row(**overrides):
+    """An external-seed mirror offer: source_domain and canonical_url agree
+    BECAUSE they come from the same seed, not because the seller is the brand."""
+    row = {
+        "offer_id": "off_1",
+        "catalog_track": "external_referral",
+        "offer_catalog_track": "external_referral",
+        "offer_is_first_party": False,
+        "offer_offer_type": "retailer",
+        "offer_source_domain": "ulta.com",
+        "canonical_url": "https://www.ulta.com/p/cosrx-snail-mucin",
+        "merchant_effective_price": "20.00",
+        "currency": "USD",
+    }
+    row.update(overrides)
+    return row
+
+
+def _node(row, monkeypatch, *, flag):
+    if flag:
+        monkeypatch.setenv("OFFICIAL_SOURCE_SELLER_DERIVED", "true")
+    else:
+        monkeypatch.delenv("OFFICIAL_SOURCE_SELLER_DERIVED", raising=False)
+    return _build_canonical_offer_node(row, [])
+
+
+def test_legacy_flag_off_reproduces_the_defect(monkeypatch):
+    """Pinning the CURRENT behaviour, so the fix is provably a change and the
+    default really is byte-identical to today."""
+    node = _node(_mirror_row(), monkeypatch, flag=False)
+    assert node.official_source is True  # <- the lie: a ulta.com retailer offer
+
+
+def test_retailer_mirror_is_not_official_when_seller_derived(monkeypatch):
+    node = _node(_mirror_row(), monkeypatch, flag=True)
+    assert node.official_source is False
+
+
+def test_unknown_seller_is_not_official_when_seller_derived(monkeypatch):
+    """The derivation returns NULL offer_type when it has no positive evidence —
+    'do not guess'. The read path must not manufacture a positive claim from it.
+    This is the larger prod cohort: 2,166 of the 2,646."""
+    row = _mirror_row(offer_offer_type=None, offer_source_domain="somebrand.com",
+                      canonical_url="https://somebrand.com/p/x")
+    assert _node(row, monkeypatch, flag=False).official_source is True
+    assert _node(row, monkeypatch, flag=True).official_source is False
+
+
+def test_brand_direct_stays_official_under_both_flags(monkeypatch):
+    """The change must cost nothing real. A brand_direct offer is is_first_party
+    (the derivation sets them together), so it is official either way — this is
+    why the flip has no legitimate blast radius."""
+    row = _mirror_row(offer_offer_type="brand_direct", offer_is_first_party=True,
+                      offer_source_domain="cosrx.com",
+                      canonical_url="https://cosrx.com/products/snail-96")
+    assert _node(row, monkeypatch, flag=False).official_source is True
+    assert _node(row, monkeypatch, flag=True).official_source is True
+
+
+@pytest.mark.parametrize("value", ["1", "true", "TRUE", "yes", "on"])
+def test_flag_accepts_the_repo_standard_truthy_values(monkeypatch, value):
+    monkeypatch.setenv("OFFICIAL_SOURCE_SELLER_DERIVED", value)
+    assert _build_canonical_offer_node(_mirror_row(), []).official_source is False
+
+
+@pytest.mark.parametrize("value", ["", "0", "false", "off", "no", "maybe"])
+def test_flag_is_off_for_anything_else(monkeypatch, value):
+    monkeypatch.setenv("OFFICIAL_SOURCE_SELLER_DERIVED", value)
+    assert _build_canonical_offer_node(_mirror_row(), []).official_source is True
+
+
+def test_official_source_equals_is_first_party_when_seller_derived(monkeypatch):
+    """The whole decision in one assertion: no independent derivation survives on
+    the read path. If someone reintroduces a URL comparison, this fails."""
+    monkeypatch.setenv("OFFICIAL_SOURCE_SELLER_DERIVED", "1")
+    for first_party in (True, False):
+        for src, canon in (("ulta.com", "https://ulta.com/p"),
+                           ("cosrx.com", "https://cosrx.com/p"),
+                           (None, None),
+                           ("a.com", "https://b.com/p")):
+            node = _build_canonical_offer_node(
+                _mirror_row(offer_is_first_party=first_party,
+                            offer_source_domain=src, canonical_url=canon), [])
+            assert node.official_source is first_party
