@@ -51,13 +51,32 @@ _QUALITY_SCORE_FIELDS = (
 )
 
 
-def _text_length_score(text: str, min_len: int, max_len: int) -> float:
+def _text_length_score(
+    text: str,
+    min_len: int,
+    max_len: int,
+    *,
+    penalize_over_max: bool = True,
+) -> float:
     """
     Score text length in [0, 1].
 
     - 0 if empty
     - best when between min_len and max_len
     - linearly decays outside that range
+
+    ``penalize_over_max=False`` removes the UPPER penalty only: anything at or
+    above ``min_len`` scores 1.0, and the short-side ramp is untouched.
+
+    WHY THAT SWITCH EXISTS. The over-length decay is right for a title or a
+    summary, where excess length is stuffing. It is exactly backwards for a
+    DESCRIPTION in an index whose entire purpose is being citable by an LLM: a
+    long, substantive description is the product we want, and this function was
+    scoring it *worse* than a medium one. Measured on prod 2026-07-28, in the
+    blocked cohort alone: **1,191 products at 600–1,799 chars were decaying and
+    460 at >=1,800 were pinned to the 0.4 floor** — 1,651 products penalised for
+    having the most content. Caller (`desc_score`) therefore opts out; title and
+    summary deliberately keep the penalty.
     """
     if not text:
         return 0.0
@@ -73,6 +92,10 @@ def _text_length_score(text: str, min_len: int, max_len: int) -> float:
     # Too short
     if length < min_len:
         return max(0.0, length / float(min_len))
+
+    # Over max, and this caller does not treat that as a defect.
+    if not penalize_over_max:
+        return 1.0
 
     # Too long
     # Simple linear decay from max_len to 3 * max_len
@@ -650,7 +673,12 @@ def preview_quality(
         or payload.get("description_raw")
         or ""
     )
-    desc_score = _text_length_score(description, min_len=40, max_len=600)
+    # No upper penalty: see `_text_length_score`. A long description is the
+    # asset here, not a defect — 1,651 blocked products were being marked down
+    # for having one.
+    desc_score = _text_length_score(
+        description, min_len=40, max_len=600, penalize_over_max=False
+    )
     if not description:
         problems.append({
             "field": "description_local",
@@ -739,10 +767,34 @@ def preview_quality(
 
     # Aggregate into a 0–100 content quality preview
     # This is intentionally simple and easy to tweak.
+    #
+    # `summary` USED TO BE HERE AND WAS DEAD. Measured on prod 2026-07-28 across
+    # 6,044 blocked content_keys and every rules_version: it scored 0.0 for
+    # 100% of rows — passing AND blocked alike — with exactly ONE non-zero row in
+    # the whole corpus. `source_backed_summary_text()` probes twelve fields
+    # (summary / pdp_summary / short_description / product_summary /
+    # product_intel.what_it_is, across seed_data, snapshot and product_payload)
+    # and the ingest lanes populate none of them.
+    #
+    # A permanently-zero term in an unweighted mean is not neutral: it capped the
+    # achievable score at 6/7 = 85.7, which made the 65 floor really 76% of
+    # achievable, and it dragged every product down 14.3 points for a signal
+    # nothing ever produced. The two most common blocked scores in prod were
+    # exactly 4/7 = 57.1 (1,794 rows) and 3/7 = 42.9 (1,662) — component counts,
+    # not a quality continuum.
+    #
+    # Removing it rescales every score by 7/6. That is a REAL WIDENING at a fixed
+    # threshold, so the floor has to be re-decided alongside — see
+    # QUALITY_SCORE_THRESHOLD in services/index_pipeline_state_service, and the
+    # sequencing note there about stored scores still being on the 7-term scale
+    # until a full rescore lands.
+    #
+    # To RESTORE a summary component, first make an ingest lane populate one of
+    # those twelve fields, then re-add the term AND re-baseline the floor. Do not
+    # re-add it "for completeness" — that is how it got here.
     raw_components: List[Tuple[str, float]] = [
         ("title", title_score),
         ("description", desc_score),
-        ("summary", summary_score),
         ("attributes", attribute_score),
         ("images", 1.0 if has_any_image else 0.0),
         ("brand_category", 1.0 if brand_present and category_present else 0.0),

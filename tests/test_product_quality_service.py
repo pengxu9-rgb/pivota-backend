@@ -1,6 +1,7 @@
 import pytest
 
 from services import product_quality_service as svc
+from services.index_pipeline_state_service import QUALITY_SCORE_THRESHOLD
 from services.product_quality_service import (
     QUALITY_SOURCE_PREVIEW,
     QUALITY_SOURCE_SNAPSHOT,
@@ -122,8 +123,11 @@ def _component_score(result, name):
 def test_source_backed_components_remain_zero_by_default() -> None:
     result = preview_quality(_source_backed_quality_payload())
 
-    assert result["content_quality_score"] == 71.4
-    assert _component_score(result, "summary") == 0.0
+    # 83.3 = 5 of 6 components (the 7th, `summary`, was removed 2026-07-28 —
+    # it scored 0.0 for 100% of prod rows, so it was a flat 14.3-point penalty
+    # rather than a signal). `summary` is therefore no longer a scored component.
+    assert result["content_quality_score"] == 83.3
+    assert not any(c["name"] == "summary" for c in result["components"])
     assert _component_score(result, "attributes") == 0.0
     assert "source_backed_fields" not in result
 
@@ -135,7 +139,9 @@ def test_scores_source_backed_summary_and_attributes_when_enabled() -> None:
     )
 
     assert result["content_quality_score"] == 100.0
-    assert _component_score(result, "summary") == 100.0
+    # `summary` is still COMPUTED (it feeds model_readiness_score) but is no
+    # longer one of the scored components — see product_quality_service.
+    assert not any(c["name"] == "summary" for c in result["components"])
     assert _component_score(result, "attributes") == 100.0
     assert result["source_backed_fields"] == {
         "optional_components_enabled": True,
@@ -158,9 +164,14 @@ def test_source_backed_attribute_signal_can_clear_quality_threshold() -> None:
     historical = preview_quality(payload, score_source_backed_components=False)
     lifted = preview_quality(payload, score_source_backed_components=True)
 
-    assert historical["content_quality_score"] == 57.1
-    assert lifted["content_quality_score"] == 67.1
+    # 6-component scale (summary dropped 2026-07-28). The test's point is
+    # sharper than before: without the source-backed signal this row sits at
+    # 4-of-6 = 66.7, BELOW the 71.4 floor; the attributes lift carries it over.
+    assert historical["content_quality_score"] == 66.7
+    assert lifted["content_quality_score"] == 78.3
     assert _component_score(lifted, "attributes") == 70.0
+    assert historical["content_quality_score"] < QUALITY_SCORE_THRESHOLD
+    assert lifted["content_quality_score"] >= QUALITY_SCORE_THRESHOLD
 
 
 @pytest.mark.asyncio
