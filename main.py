@@ -271,6 +271,7 @@ from routes.admin_creators import router as admin_creators_router
 from routes.admin_run_migration_152 import router as admin_run_migration_152_router
 from routes.admin_run_migration_164 import router as admin_run_migration_164_router
 from routes.admin_run_migration_165 import router as admin_run_migration_165_router
+from routes.admin_rescore_external_seed_quality import router as admin_rescore_external_seed_quality_router
 from routes.admin_run_migration_pending import (
     router as admin_run_migration_pending_router,
 )
@@ -949,6 +950,7 @@ app.include_router(admin_creators_router)  # Phase 3 — creator directory intak
 app.include_router(admin_run_migration_152_router)  # Run migration 152 - agent_pdp_view evidence columns
 app.include_router(admin_run_migration_164_router)  # Run migration 164 - merchant_onboarding.operating_mode (store-less brand)
 app.include_router(admin_run_migration_165_router)  # Run migration 165 - index_pipeline_state.index_eligible (ADR-007 SLICE 1)
+app.include_router(admin_rescore_external_seed_quality_router)  # In-cluster chunked external-seed quality rescore (proxy/ssh venues both unusable)
 app.include_router(admin_run_migration_pending_router)  # Generic: run db/migrations/<NNN>_*.sql by number (covers 161/162/163 + future)
 app.include_router(admin_seed_routing_logs_router)  # Seed test routing logs
 app.include_router(admin_cleanup_routing_router)  # Cleanup routing test data
