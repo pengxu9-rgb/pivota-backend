@@ -47,17 +47,24 @@ jobs:
 
       - name: Run external seed mirror dry-run
         shell: bash
+        # `${{ }}` in a `run:` body is TEXTUAL SUBSTITUTION performed before the
+        # shell parses anything, so a free-form input lands as executable shell in
+        # a job holding the production DATABASE_URL. Values arrive through `env:`.
+        env:
+          RUN_ID: ${{ github.run_id }}
+          IN_LIMIT: ${{ inputs.limit }}
+          IN_SAMPLE_LIMIT: ${{ inputs.sample_limit }}
         run: |
           set -euo pipefail
           if [[ -z "${DATABASE_URL:-}" ]]; then
             echo "DATABASE_URL secret is required" >&2
             exit 1
           fi
-          out_dir="reports/workflow_ops/external-seeds-catalog-products-mirror/${{ github.run_id }}"
+          out_dir="reports/workflow_ops/external-seeds-catalog-products-mirror/${RUN_ID}"
           mkdir -p "${out_dir}"
           python scripts/mirror_external_seeds_to_catalog_products.py \
-            --limit "${{ inputs.limit }}" \
-            --sample-limit "${{ inputs.sample_limit }}" \
+            --limit "${IN_LIMIT}" \
+            --sample-limit "${IN_SAMPLE_LIMIT}" \
             --output-json "${out_dir}/dry_run.json" \
             --output-md "${out_dir}/dry_run.md" \
             | tee "${out_dir}/dry_run.stdout.json"
@@ -65,14 +72,18 @@ jobs:
       - name: Apply mirror and canonical sig backfill
         if: ${{ inputs.apply }}
         shell: bash
+        env:
+          RUN_ID: ${{ github.run_id }}
+          IN_LIMIT: ${{ inputs.limit }}
+          IN_SAMPLE_LIMIT: ${{ inputs.sample_limit }}
         run: |
           set -euo pipefail
-          out_dir="reports/workflow_ops/external-seeds-catalog-products-mirror/${{ github.run_id }}"
+          out_dir="reports/workflow_ops/external-seeds-catalog-products-mirror/${RUN_ID}"
           mkdir -p "${out_dir}"
           python scripts/mirror_external_seeds_to_catalog_products.py \
             --apply \
-            --limit "${{ inputs.limit }}" \
-            --sample-limit "${{ inputs.sample_limit }}" \
+            --limit "${IN_LIMIT}" \
+            --sample-limit "${IN_SAMPLE_LIMIT}" \
             --output-json "${out_dir}/apply.json" \
             --output-md "${out_dir}/apply.md" \
             | tee "${out_dir}/apply.stdout.json"
@@ -85,8 +96,8 @@ jobs:
             | tee "${out_dir}/canonical_sig_backfill.log"
 
           python scripts/mirror_external_seeds_to_catalog_products.py \
-            --limit "${{ inputs.limit }}" \
-            --sample-limit "${{ inputs.sample_limit }}" \
+            --limit "${IN_LIMIT}" \
+            --sample-limit "${IN_SAMPLE_LIMIT}" \
             --output-json "${out_dir}/postcheck.json" \
             --output-md "${out_dir}/postcheck.md" \
             | tee "${out_dir}/postcheck.stdout.json"
