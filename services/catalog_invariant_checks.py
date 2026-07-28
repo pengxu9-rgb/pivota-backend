@@ -197,6 +197,76 @@ _CHECKS: List[Dict[str, Any]] = [
         "sample_sql": _PUBLIC_NOT_RENDERABLE_SAMPLE_SQL,
     },
     {
+        "name": "dead_quality_component",
+        "description": (
+            "a quality-scorer component is identically zero across every recent "
+            "snapshot — i.e. nothing in any ingest lane produces it, so it is "
+            "silently dragging every product's score down for a signal that does "
+            "not exist"
+        ),
+        "env": "CATALOG_INVARIANT_DEAD_COMPONENT_THRESHOLD",
+        # 0 = no component may be dead. This is the standing detector for the
+        # defect class that cost the most in this codebase: `summary` scored 0.0
+        # for 100% of rows across every rules_version for an unknown number of
+        # months, capping the achievable score at 6/7 and making the 65 floor
+        # really 76% of achievable. Nothing surfaced it, because a dead component
+        # is indistinguishable from uniformly bad content unless you ask THIS
+        # question. Removed from the mean 2026-07-28; this check is what stops
+        # the next one lasting as long.
+        "default_threshold": 0,
+        # Sampled over recent snapshots only: an old rules_version that genuinely
+        # lacked a component would otherwise pin this alarm on forever. Requires
+        # a real sample (>=200) so a quiet period cannot manufacture a violation
+        # out of two rows.
+        "count_sql": """
+            WITH recent AS (
+                SELECT details
+                FROM product_quality_snapshot
+                WHERE snapshot_date > NOW() - INTERVAL '30 days'
+                  AND details IS NOT NULL
+                ORDER BY id DESC
+                LIMIT 2000
+            ),
+            comps AS (
+                SELECT c->>'name' AS name,
+                       COALESCE((c->>'score')::float, 0) AS score
+                FROM recent,
+                     LATERAL jsonb_array_elements(
+                         (details::jsonb) -> 'components'
+                     ) AS c
+            )
+            SELECT count(*) AS c FROM (
+                SELECT name
+                FROM comps
+                GROUP BY name
+                HAVING count(*) >= 200 AND max(score) = 0
+            ) dead
+        """,
+        "sample_sql": """
+            WITH recent AS (
+                SELECT details
+                FROM product_quality_snapshot
+                WHERE snapshot_date > NOW() - INTERVAL '30 days'
+                  AND details IS NOT NULL
+                ORDER BY id DESC
+                LIMIT 2000
+            ),
+            comps AS (
+                SELECT c->>'name' AS name,
+                       COALESCE((c->>'score')::float, 0) AS score
+                FROM recent,
+                     LATERAL jsonb_array_elements(
+                         (details::jsonb) -> 'components'
+                     ) AS c
+            )
+            SELECT name
+            FROM comps
+            GROUP BY name
+            HAVING count(*) >= 200 AND max(score) = 0
+            LIMIT 5
+        """,
+    },
+    {
         "name": "orphan_trust_rows",
         "description": "trust rows whose catalog_products row no longer exists",
         "env": "CATALOG_INVARIANT_ORPHAN_THRESHOLD",

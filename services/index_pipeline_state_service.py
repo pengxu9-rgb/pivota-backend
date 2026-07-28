@@ -29,7 +29,32 @@ CONSOLIDATION_VERSION = "nightly_index_health_v1"
 
 # content_quality_score is on a 0-100 scale; see services/product_quality_service.py
 # (`round(avg_score * 100.0, 1)`). A threshold of 65 ~= "two-thirds of facets passed".
-QUALITY_SCORE_THRESHOLD = 65.0
+# Raised 65.0 -> 71.4 on 2026-07-28, IN LOCKSTEP with dropping the dead `summary`
+# component from the scorer (services/product_quality_service). The two are ONE
+# change and must never be split:
+#
+#   * removing a permanently-zero term from an unweighted mean rescales every
+#     score by 7/6, so holding the floor at 65 is a ~16% WIDENING. Measured
+#     effect of that alone: a bare brand-authored row goes 57.1 -> 66.7 and
+#     graduates, which tests/services/test_brand_verified_graduation catches;
+#   * conversely, raising the floor WITHOUT the rescale demotes everything scored
+#     between 65 and 71.4 — 2,010 currently serving_eligible rows measured on
+#     prod the day of this change.
+#
+# 71.4 is not arbitrary: on the 6-term scale it is the bar a row clears with
+# roughly 4.28 of 6 real components, versus 4-of-6 at 65. Chosen from the Phase 0
+# dry-run re-run against the post-rescore corpus, where 65 -> 71.4 costs only 250
+# products (805 -> 555) — it cost 2,320 before the corpus was repaired, which is
+# why the decision was deliberately deferred until after it.
+#
+# 🚨 DEPLOY ORDER IS LOAD-BEARING. Stored scores stay on the OLD 7-term scale
+# until a row is re-scored, and `jobs/nightly_index_health_job` reclassifies in
+# batches at 04:00 UTC using whatever is stored. Ship this, then IMMEDIATELY
+# re-score the corpus (POST /admin/rescore/external-seed-quality with
+# include_eligible=true) so stored scores reach the new scale before that job
+# runs. A row scored >= 61.2 on the old scale lands >= 71.4 on the new one, so a
+# completed rescore demotes nothing.
+QUALITY_SCORE_THRESHOLD = 71.4
 MIN_DESCRIPTION_LENGTH = 50
 
 # Seed audit statuses that do NOT block serving.
