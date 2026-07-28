@@ -43,7 +43,11 @@ on:
       - "scripts/**"
       - "docs/ops/SHOPIFY_DISCOUNT_DEV_STORE_VALIDATION.md"
       - "docs/shopify-discount-*.md"
-      - ".github/workflows/agent-reliability-suite.yml"
+      # ANY workflow change, not just this file's: the workflow-hygiene gate below
+      # polices `.github/workflows/**`, and a gate that does not run on the change
+      # class it exists to police is not a gate. A PR adding a brand-new workflow
+      # touches nothing else, so without this it would sail past every path filter.
+      - ".github/workflows/**"
 
 jobs:
   quick-reliability:
@@ -79,6 +83,17 @@ jobs:
       - name: Run quick reliability suite
         run: |
           ./scripts/run_agent_reliability_suite.sh quick
+
+      # Workflow hygiene — see the test's own docstring for why it exists.
+      # Placed in THIS job rather than the payment-safety one because it has
+      # nothing to do with payments, and a gate filed under the wrong heading is
+      # a gate nobody maintains. What makes it effective is this workflow's
+      # `paths:` filter, now widened to `.github/workflows/**`: a PR that adds a
+      # brand-new workflow touches nothing else, so before that widening the gate
+      # could not fire on the very change class it polices. Sub-second, no DB.
+      - name: Run workflow-hygiene gate
+        run: |
+          pytest -q tests/test_workflow_no_run_body_interpolation.py
 
   checkout-payment-safety:
     name: Checkout Payment Safety
