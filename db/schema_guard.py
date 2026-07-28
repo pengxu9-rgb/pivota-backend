@@ -925,6 +925,35 @@ async def ensure_required_schema_light() -> None:
                     """
                 )
             )
+            # P1.11 (migration 188): the persisted ROW-GRAIN renderability column.
+            # **Railway prod skips db/migrations/ entirely**, so the migration
+            # file alone would never reach production — this block is the path
+            # that actually runs. Additive + nullable with NO default on
+            # purpose: NULL means "never computed", which consumers must treat
+            # as do-not-advertise (`IS TRUE`, never `IS NOT FALSE`). A DEFAULT
+            # would erase the distinction between "computed false" and "never
+            # computed", which is the one distinction keeping it fail-closed.
+            await database.execute(
+                text(
+                    """
+                    ALTER TABLE IF EXISTS catalog_products
+                      ADD COLUMN IF NOT EXISTS pdp_will_render BOOLEAN,
+                      ADD COLUMN IF NOT EXISTS pdp_will_render_computed_at TIMESTAMPTZ;
+                    """
+                )
+            )
+            # Partial index on the advertisable side only — consumers ask
+            # `WHERE pdp_will_render IS TRUE`, and that is the minority side on
+            # prod (5,008 true / 9,096 false of 14,104 rows).
+            await database.execute(
+                text(
+                    """
+                    CREATE INDEX IF NOT EXISTS idx_catalog_products_pdp_will_render_true
+                      ON catalog_products (product_key)
+                      WHERE pdp_will_render IS TRUE;
+                    """
+                )
+            )
             # ADR-009 D3 seller-of-record threading (migration 169). external
             # seeds gain seller_ref (a catalog_merchants.merchant_id) + seed_kind
             # ('self'|'cross'); the T2-1 redirect stamps them onto the click and
