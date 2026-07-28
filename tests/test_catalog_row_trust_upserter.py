@@ -101,7 +101,7 @@ def make_joined_row(**overrides):
     base = {
         "product_key": "pk_internal_1",
         "content_key": "ck_internal_1",
-        "merchant_id": "merch_efbc46b4619cfbdf",
+        "merchant_id": "merch_first_party_seller_1",
         "platform": "shopify",
         "source_system": "shopify",
         "source_ref": "gid://shopify/Product/1",
@@ -122,7 +122,7 @@ def make_joined_row(**overrides):
         "quality_scored_at": NOW,
         "last_extracted_at": NOW,
         # Identity (approved/healthy)
-        "pil_source_listing_ref": "merch_efbc46b4619cfbdf:1",
+        "pil_source_listing_ref": "merch_first_party_seller_1:1",
         "identity_status": "approved",
         "identity_confidence": 0.95,
         "live_read_enabled": True,
@@ -137,7 +137,7 @@ def make_joined_row(**overrides):
         "eps_attached_product_key": None,
         "eps_last_seen_at": None,
         # Merchant store
-        "ms_merchant_id": "merch_efbc46b4619cfbdf",
+        "ms_merchant_id": "merch_first_party_seller_1",
         "ms_platform": "shopify",
         "ms_domain": "chydan.myshopify.com",
         "ms_status": "active",
