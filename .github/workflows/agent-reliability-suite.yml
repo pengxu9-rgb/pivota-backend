@@ -80,20 +80,26 @@ jobs:
           python -m pip install --upgrade pip
           pip install -r requirements.txt -r requirements-dev.txt
 
-      - name: Run quick reliability suite
-        run: |
-          ./scripts/run_agent_reliability_suite.sh quick
-
       # Workflow hygiene — see the test's own docstring for why it exists.
+      #
       # Placed in THIS job rather than the payment-safety one because it has
       # nothing to do with payments, and a gate filed under the wrong heading is
-      # a gate nobody maintains. What makes it effective is this workflow's
-      # `paths:` filter, now widened to `.github/workflows/**`: a PR that adds a
-      # brand-new workflow touches nothing else, so before that widening the gate
-      # could not fire on the very change class it polices. Sub-second, no DB.
+      # a gate nobody maintains.
+      #
+      # And placed BEFORE the reliability suite, not after: steps default to
+      # `if: success()`, so sitting downstream of 11 unrelated test files meant a
+      # flaky shopify/JWT/cache test would suppress this sub-second check and
+      # report "quick suite failed" instead of the hygiene violation. That could
+      # never let a violation merge — the job is red either way — but it is a
+      # smaller version of the exact "gate filed where it does not run" problem
+      # this commit exists to fix. It needs only checkout + Python + deps.
       - name: Run workflow-hygiene gate
         run: |
           pytest -q tests/test_workflow_no_run_body_interpolation.py
+
+      - name: Run quick reliability suite
+        run: |
+          ./scripts/run_agent_reliability_suite.sh quick
 
   checkout-payment-safety:
     name: Checkout Payment Safety

@@ -26,8 +26,15 @@ SCOPE — deliberately narrow, so this gate does not cry wolf:
     of which 113 were free-form and 67 were constrained (65 boolean + 2 choice) —
     flagging the constrained ones would have tripled the noise for zero security
     value.
-  * Only `run:` bodies. `if:`, `with:` and `env:` are EXPRESSION contexts,
-    evaluated rather than pasted into a shell, and are safe.
+  * Only `run:` bodies. `if:`, `with:` and `env:` BLOCKS are expression
+    contexts, evaluated rather than pasted into a shell, and are safe.
+  * But an `env.` READ inside a run body (`${{ env.X }}`) IS flagged — see
+    `_LAUNDERED`. Unconditionally, including a static literal defined in the
+    workflow's own `env:`, because nothing at this layer can distinguish a
+    literal from a laundered input. That is a deliberate false positive, and the
+    fix for it is the same one-character change as for the real case: write
+    `"$X"`. Measured at adoption: 0 hits across all 52 workflows in all three
+    repos, so the cost is zero today.
 
 THE FIX IS ALWAYS THE SAME: pass the value through the step's `env:` and
 reference it as `"${VAR}"`. Never quoting tricks — quoting inside a string that
@@ -63,8 +70,11 @@ _INPUT_REF = re.compile(r"\b(?:inputs|github\.event\.inputs)\.([A-Za-z0-9_-]+)")
 # caught. None of these shapes exist in the repo today; they are blocked so the
 # gate cannot be satisfied by moving the problem rather than solving it.
 _LAUNDERED = (
-    (re.compile(r"\benv\."), "`${{ env.X }}` in a run body is still textual "
-                             'substitution — reference the variable as "$X"'),
+    # Lookbehind so the pattern cannot fire inside an expression STRING
+    # LITERAL — `${{ hashFiles('.env.example') }}` is not an env read.
+    (re.compile(r"(?<![\w./'\"])env\."),
+     "`${{ env.X }}` in a run body is still textual substitution — reference "
+     'the variable as "$X"'),
     (re.compile(r"\bsteps\.[A-Za-z0-9_-]+\.outputs\."),
      "a step output can carry an unvalidated input — route it through `env:` "
      'and reference it as "$X"'),
@@ -260,8 +270,13 @@ on:
 
 
 def test_free_form_declaration_wins_when_a_name_is_declared_twice():
-    """Reason about the weakest guarantee, not the first one seen."""
-    doc = _doc(
+    """Reason about the weakest guarantee, not the first one seen.
+
+    BOTH orderings, because the loop visits workflow_dispatch first: one ordering
+    exercises the `continue` branch and the other the overwrite branch, and a
+    test that only covers one cannot tell correct precedence from lucky order.
+    """
+    dispatch_first = _doc(
         """
 on:
   workflow_dispatch:
@@ -272,7 +287,31 @@ on:
       dual: {type: boolean}
 """
     )
-    assert _declared_input_types(doc)["dual"] == "string"
+    call_first = _doc(
+        """
+on:
+  workflow_dispatch:
+    inputs:
+      dual: {type: boolean}
+  workflow_call:
+    inputs:
+      dual: {type: string}
+"""
+    )
+    assert _declared_input_types(dispatch_first)["dual"] == "string"
+    assert _declared_input_types(call_first)["dual"] == "string"
+
+
+def test_env_pattern_does_not_fire_inside_an_expression_string_literal():
+    """`${{ hashFiles('.env.example') }}` is not an env read. Without a
+    lookbehind the env-read pattern matches inside the quoted path and the gate
+    cries wolf on a common, safe expression."""
+    hits = lambda e: [w for pat, w in _LAUNDERED if pat.search(e)]
+    assert not hits("hashFiles('.env.example')")
+    assert not hits("hashFiles('**/requirements.txt')")
+    # ...but a real read still trips it
+    assert hits("env.LEAK")
+    assert hits("format('{0}', env.LEAK)")
 
 
 def test_on_key_parsed_as_boolean_true_is_handled():
