@@ -394,14 +394,17 @@ async def test_override_unmatched_store_id_is_honest_unknown(monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_connection_layer_ceiling_is_3_for_connected_shopify_with_live_psp(monkeypatch):
+async def test_connection_layer_ceiling_is_3_for_connected_shopify_with_portal_psp_flag(monkeypatch):
     from services import merchant_capability_resolver as res
 
     async def fake_get_primary_store(mid):
         return {"platform": "shopify", "domain": "brand.myshopify.com", "status": "active"}
 
     async def fake_get_merchant_onboarding(mid):
-        return {}
+        # The PORTAL flag is what makes this layer 3 (founder ruling 2026-07-28).
+        # This fixture used to return `{}` and rely on `fake_live_psp` — which
+        # passed only because the resolver was feeding the wrong fact.
+        return {"psp_connected": True}
 
     async def fake_live_psp(mid):
         return "stripe"
@@ -413,6 +416,90 @@ async def test_connection_layer_ceiling_is_3_for_connected_shopify_with_live_psp
     cap = await res.resolve_merchant_capability("merch_shop")
     assert cap["connection_layer_ceiling"] == 3
     assert cap["connection_layer_ceiling_slug"] == "product_synced_psp"
+
+
+# The two tests below are mirror images and exist to pin WHICH FACT decides the
+# layer, in both directions. Neither can pass while the resolver feeds
+# `has_live_psp`, and the pair is the only thing standing between the founder's
+# ruling and a silent re-drift back to the PSP-row fact.
+#
+# The first is the live prod divergence: measured 2026-07-28, 2 merchants hold an
+# active `merchant_psps` row with the portal flag unset. Both are ceiling 1 today
+# for want of a live store, so this fixture is what that pair becomes the day one
+# of them connects a store — which is precisely when nobody would be looking.
+
+
+@pytest.mark.asyncio
+async def test_connection_layer_ceiling_is_2_when_psp_row_is_active_but_portal_flag_unset(monkeypatch):
+    from services import merchant_capability_resolver as res
+
+    async def fake_get_primary_store(mid):
+        return {"platform": "shopify", "domain": "brand.myshopify.com", "status": "active"}
+
+    async def fake_get_merchant_onboarding(mid):
+        return {}  # never went through the portal flow — not yes
+
+    async def fake_live_psp(mid):
+        return "stripe"  # an active merchant_psps row DOES exist
+
+    monkeypatch.setattr(res, "get_primary_store", fake_get_primary_store)
+    monkeypatch.setattr(res, "get_merchant_onboarding", fake_get_merchant_onboarding)
+    monkeypatch.setattr(res, "_resolve_live_psp_provider", fake_live_psp)
+
+    cap = await res.resolve_merchant_capability("merch_psp_row_no_flag")
+    assert cap["connection_layer_ceiling"] == 2
+    assert cap["connection_layer_ceiling_slug"] == "product_synced"
+    # The PSP fact itself is unchanged and still reported — only the LAYER input
+    # moved. Without this line the test would also pass if `has_live_psp` were
+    # simply dropped from the resolver.
+    assert cap["has_live_psp"] is True
+
+
+@pytest.mark.asyncio
+async def test_connection_layer_ceiling_is_3_from_portal_flag_with_no_active_psp_row(monkeypatch):
+    from services import merchant_capability_resolver as res
+
+    async def fake_get_primary_store(mid):
+        return {"platform": "shopify", "domain": "brand.myshopify.com", "status": "active"}
+
+    async def fake_get_merchant_onboarding(mid):
+        return {"psp_connected": True}
+
+    async def fake_live_psp(mid):
+        return None  # no active merchant_psps row
+
+    monkeypatch.setattr(res, "get_primary_store", fake_get_primary_store)
+    monkeypatch.setattr(res, "get_merchant_onboarding", fake_get_merchant_onboarding)
+    monkeypatch.setattr(res, "_resolve_live_psp_provider", fake_live_psp)
+
+    cap = await res.resolve_merchant_capability("merch_flag_no_psp_row")
+    assert cap["connection_layer_ceiling"] == 3
+    assert cap["has_live_psp"] is False
+
+
+@pytest.mark.asyncio
+async def test_connection_layer_ceiling_treats_null_portal_flag_as_not_yes(monkeypatch):
+    """An explicit NULL must read as "not yes", matching the SQL twin's
+    ``COALESCE(mo.psp_connected, false)``. A `.get()` returning None and a column
+    that is NULL are the same case here, and coercing either to False in Python
+    would diverge from the twin the day the twin changes."""
+    from services import merchant_capability_resolver as res
+
+    async def fake_get_primary_store(mid):
+        return {"platform": "shopify", "domain": "brand.myshopify.com", "status": "active"}
+
+    async def fake_get_merchant_onboarding(mid):
+        return {"psp_connected": None}
+
+    async def fake_live_psp(mid):
+        return None
+
+    monkeypatch.setattr(res, "get_primary_store", fake_get_primary_store)
+    monkeypatch.setattr(res, "get_merchant_onboarding", fake_get_merchant_onboarding)
+    monkeypatch.setattr(res, "_resolve_live_psp_provider", fake_live_psp)
+
+    cap = await res.resolve_merchant_capability("merch_null_flag")
+    assert cap["connection_layer_ceiling"] == 2
 
 
 @pytest.mark.asyncio
@@ -535,3 +622,33 @@ async def test_disconnected_legacy_mcp_store_is_not_layer_2(monkeypatch):
     cap = await res.resolve_merchant_capability("merch_legacy_dead")
     assert cap["connection_layer_ceiling"] == 1
     assert cap["connection_layer_ceiling_slug"] == "crawled"
+
+
+@pytest.mark.asyncio
+async def test_onboarding_query_still_selects_psp_connected(monkeypatch):
+    """The layer input is `(merchant or {}).get("psp_connected")`, and `.get` on a
+    narrowed row is indistinguishable from a merchant who never connected a PSP.
+
+    Concrete failure this pins: `get_merchant_onboarding` currently SELECTs all
+    ~40 columns to read one flag, which is an obvious future perf trim. Narrow it
+    and `.get` returns None, EVERY merchant silently drops to ceiling 2, and every
+    other test in this file stays green — they all monkeypatch the function away,
+    so none of them can see its query. Assert on the query itself, which is the
+    only place the contract is observable.
+    """
+    from db import merchant_onboarding as mo
+
+    captured = {}
+
+    async def fake_fetch_one(query):
+        captured["sql"] = str(query)
+        return None
+
+    monkeypatch.setattr(mo.database, "fetch_one", fake_fetch_one)
+    await mo.get_merchant_onboarding("merch_query_shape")
+
+    assert "psp_connected" in captured["sql"], (
+        "get_merchant_onboarding no longer selects psp_connected — "
+        "services/merchant_capability_resolver reads it off this row to decide "
+        "the ADR-018 connection layer, and a missing column reads as 'no PSP'."
+    )
