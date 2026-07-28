@@ -39,7 +39,26 @@ DEFAULT_QUALITY_RULES_VERSION = "v1-lite"
 # SHAPE changed, so v1-scored snapshots are not comparable and must be re-scored —
 # bumping the version is what keeps that resumable instead of needing a blind
 # --force sweep in scripts/backfill_external_seed_quality_rescore.py.
-SOURCE_BACKED_COMPONENTS_RULES_VERSION = "v2-source-backed-components"
+#
+# v3 (2026-07-28): the COMPONENT SET changed — `summary` was removed after
+# measuring 0.0 on 100% of prod rows, so every score is rescaled by 7/6 and the
+# floor moved 65.0 -> 71.4 with it (#1612). v2 snapshots are therefore on a
+# different scale, not merely stale, and comparing the two silently mixes scales.
+#
+# 🚨 THE BUMP IS WHAT MAKES #1612 SAFE, and it is not cosmetic.
+# `backfill_external_seed_quality_rescore._rescored_ids()` skips any product
+# already carrying THIS constant's value. Left at v2, the post-#1612 rescore
+# would have skipped every row scored during the 2026-07-28 drain — ~2,700+
+# products — leaving them on 7-term scores while the gate compares against 71.4.
+# `jobs/nightly_index_health_job` reclassifies in batches at 04:00 UTC from
+# whatever is stored, so those rows would have been demoted wholesale. Bumping
+# makes the whole corpus eligible for rescore again, resumably, which is exactly
+# the mechanism the v2 note above describes.
+#
+# RULE FOR THE NEXT CHANGE: if you alter the component SET, the weights, or the
+# scale, bump this. If you only alter which payload fields feed an existing
+# component, bump it too — v2 exists for precisely that.
+SOURCE_BACKED_COMPONENTS_RULES_VERSION = "v3-six-components"
 SOURCE_BACKED_OPTIONAL_COMPONENTS_FLAG = (
     "PDP_QUALITY_SCORE_SOURCE_BACKED_OPTIONAL_COMPONENTS"
 )
