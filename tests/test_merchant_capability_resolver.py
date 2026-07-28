@@ -622,3 +622,33 @@ async def test_disconnected_legacy_mcp_store_is_not_layer_2(monkeypatch):
     cap = await res.resolve_merchant_capability("merch_legacy_dead")
     assert cap["connection_layer_ceiling"] == 1
     assert cap["connection_layer_ceiling_slug"] == "crawled"
+
+
+@pytest.mark.asyncio
+async def test_onboarding_query_still_selects_psp_connected(monkeypatch):
+    """The layer input is `(merchant or {}).get("psp_connected")`, and `.get` on a
+    narrowed row is indistinguishable from a merchant who never connected a PSP.
+
+    Concrete failure this pins: `get_merchant_onboarding` currently SELECTs all
+    ~40 columns to read one flag, which is an obvious future perf trim. Narrow it
+    and `.get` returns None, EVERY merchant silently drops to ceiling 2, and every
+    other test in this file stays green — they all monkeypatch the function away,
+    so none of them can see its query. Assert on the query itself, which is the
+    only place the contract is observable.
+    """
+    from db import merchant_onboarding as mo
+
+    captured = {}
+
+    async def fake_fetch_one(query):
+        captured["sql"] = str(query)
+        return None
+
+    monkeypatch.setattr(mo.database, "fetch_one", fake_fetch_one)
+    await mo.get_merchant_onboarding("merch_query_shape")
+
+    assert "psp_connected" in captured["sql"], (
+        "get_merchant_onboarding no longer selects psp_connected — "
+        "services/merchant_capability_resolver reads it off this row to decide "
+        "the ADR-018 connection layer, and a missing column reads as 'no PSP'."
+    )

@@ -375,6 +375,12 @@ async def resolve_merchant_capability(
         # through the flow" is not "went through it and failed", and `_truthy`
         # reads both as not-yes, matching the twin's COALESCE.
         psp_connected=(merchant or {}).get("psp_connected"),
+        # INERT since the 2026-07-28 ruling dropped the `has_shopify_payments`
+        # leg — `classify_connection_layer` accepts this and does not read it.
+        # Retained deliberately (docs/adr/ADR-018), but the call site gave a
+        # reader no way to know that, which is how an argument quietly becomes
+        # load-bearing again. It IS still read, and still matters, in
+        # `get_platform_settlement_rails` above — a different question.
         has_native_payments=has_native_payments,
     )
 
