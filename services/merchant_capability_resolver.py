@@ -354,10 +354,27 @@ async def resolve_merchant_capability(
         catalog_track=TRACK_INTERNAL_MERCHANT,
         merchant_known=merchant is not None,
         has_active_store=store_status in LIVE_STORE_STATUSES,
-        # `has_live_psp` is a resolved bool (a provider was found, or was not) —
-        # a genuine negative, not an unknown, so it is passed as-is rather than
-        # laundered through None.
-        psp_connected=has_live_psp,
+        # ⚠️ The PORTAL FLAG, not `has_live_psp`. These are different facts from
+        # different tables and this call site used to pass the wrong one:
+        #
+        #   merchant_onboarding.psp_connected  — the flag in the Pivota merchant
+        #                                        portal. THE founder ruling.
+        #   has_live_psp                       — derived from
+        #                                        `merchant_psps WHERE status='active'`
+        #
+        # `classify_connection_layer`'s docstring said "the portal flag" while the
+        # only caller fed "has an active PSP record", so one policy had two
+        # answers — precisely what `services/connection_layer` exists to prevent,
+        # and it agreed with its own SQL twin (`COALESCE(mo.psp_connected, false)`)
+        # only by luck. Measured on prod at the time of the fix: 2 merchants have
+        # an active `merchant_psps` row with the portal flag unset. Both are
+        # ceiling 1 today (no live store), so nothing diverged yet — the moment
+        # either connects a store, the resolver says 3 and the SQL twin says 2.
+        #
+        # NULL/absent stays NULL rather than being coerced to False: "never went
+        # through the flow" is not "went through it and failed", and `_truthy`
+        # reads both as not-yes, matching the twin's COALESCE.
+        psp_connected=(merchant or {}).get("psp_connected"),
         has_native_payments=has_native_payments,
     )
 
