@@ -163,9 +163,13 @@ def test_excludes_already_retired_rows(pg_engine):
 
 
 def test_excludes_the_hard_coded_dark_merchant_sync_lane(pg_engine):
-    """`MERCHANT_SYNCED_LANE_RENDERABLE = False` makes every shopify/wix row
-    non-renderable by construction. Counting a deliberate constant as drift is
-    noise — 1,474 rows of it on prod."""
+    """shopify is excluded because its lane verdict is a deliberate False
+    (7/7-500 measurement) — counting a constant as drift is noise. The wix case
+    below stays count==0 for a DIFFERENT reason since 2026-07-29: the wix
+    verdict flipped True on the pilot's evidence, so a serving-eligible wix row
+    is renderable and never enters the set at all. If the wix assertion ever
+    fails, a wix row managed to be serving-eligible AND non-renderable — which
+    is exactly a real finding, not a fixture problem."""
     with pg_engine.begin() as conn:
         _reset(conn)
         _row(conn, pk="pk_shop", ck="ck_shop", platform="shopify",

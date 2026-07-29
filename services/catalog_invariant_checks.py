@@ -128,9 +128,13 @@ _SERVING_NOT_RENDERABLE_WHERE = and_(
     not_(pdp_renderable_expression(_cp)),
     _cp.c.suppressed_at.is_(None),
     _cp.c.suppression_reason.is_(None),
+    # shopify ONLY since 2026-07-29: the wix half of the merchant-synced lane
+    # was measured renderable by the Wix pilot and its verdict flipped True, so
+    # a serving-eligible wix row is no longer dark-by-construction — if one
+    # ever fails renderability it is exactly what this check must count.
     not_(
         func.lower(func.btrim(func.coalesce(_cp.c.platform, ""))).in_(
-            ["shopify", "wix"]
+            ["shopify"]
         )
     ),
 )
