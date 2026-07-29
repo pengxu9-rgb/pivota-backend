@@ -7381,6 +7381,54 @@ async def _handle_find_products(
     except Exception:
         pass  # never let the rig filter break search
 
+    # Quarantined-source exclusion — the merchant-scoped twin of the gate in
+    # _handle_find_products_multi. Both are needed: `POST /agent/shop/v1/invoke`
+    # has NO auth dependency, and _normalize_find_products_payload routes a
+    # payload carrying a top-level merchant_id to THIS handler, so an unsigned
+    # `GET /acp/feed` body of {"query":{"merchant_id":"...","query":"serum"}}
+    # reaches here rather than the multi lane.
+    #
+    # ⚠️ SCOPE, stated honestly because the obvious reading is wrong. This lane
+    # sources rows from products_cache ONLY, as StandardProduct — which is
+    # extra='ignore', so seven of the eight URL fields the policy checks are
+    # structurally unreachable here. `online_store_url` is the only real one, and
+    # only the Wix adapter populates it (Shopify explicitly does not; WooCommerce
+    # keeps its permalink in platform_metadata). So on THIS lane a `domain`
+    # quarantine can fire for Wix merchants, and everything else is covered only
+    # by `merchant_platform` quarantines.
+    #
+    # It is still worth having — merchant_platform is a real, used match type, and
+    # the alternative is an unauthenticated door with no gate at all — but do not
+    # read this as closing the external-seed hole. No external-seed row can reach
+    # this handler; that is the multi lane's job. Giving Shopify rows a resolvable
+    # host (handle + connected shop domain) is the follow-up that would make this
+    # gate general.
+    try:
+        # Imported here rather than reusing the sibling block's `_db`: that name
+        # is only bound if the rig block's own import succeeded, so borrowing it
+        # would make this gate's availability depend on an unrelated try.
+        from db.database import database as _quarantine_db
+        from services.offer_currency_policy import (
+            filter_out_quarantined_rows,
+            get_quarantined_sources,
+        )
+
+        _quarantines = await get_quarantined_sources(_quarantine_db)
+        _before_q = len(visible)
+        visible = filter_out_quarantined_rows(visible, _quarantines)
+        if len(visible) != _before_q:
+            logger.info(
+                "find_products.excluded_quarantined",
+                extra={"dropped": _before_q - len(visible), "surface": "find_products"},
+            )
+    except Exception:
+        # Fail open so a gate hiccup cannot empty a merchant's own catalog —
+        # but never silently: failing open republishes mislabelled prices.
+        logger.warning(
+            "find_products.quarantine_filter_failed — slate served WITHOUT the gate",
+            exc_info=True,
+        )
+
     # In-memory filtering based on query/category/price
     filtered: List[StandardProduct] = visible
 
@@ -7606,6 +7654,58 @@ async def _handle_find_products_multi(
                 )
     except Exception:
         pass  # never let the rig filter break search
+    # Quarantined-source exclusion, at the SAME choke point and for the same
+    # reason. On 2026-07-28 this lane published seven Mintree rows priced
+    # 847-3927.70 and labelled "USD" on the public UNAUTHENTICATED ACP feed —
+    # rupee prices served as US dollars. Every other door blocks those stores;
+    # this lane read none of the gates. It cannot be folded into the rig filter
+    # above: merchant_id is explicitly None on external-seed rows, so that filter
+    # structurally cannot see them.
+    #
+    # See services/offer_currency_policy — the gate READS catalog_source_quarantine
+    # (the mechanism that has a writer, a revoke path and expiry, and that
+    # catalog_row_trust_upserter already reads) rather than restating the rule,
+    # because a fourth copy of a predicate is how the first three drifted.
+    #
+    # POSITION IS LOAD-BEARING: this must stay ABOVE _attach_connected_product_
+    # redirects and _record_gateway_decision_events, so a quarantined row is
+    # neither /r-attributed nor deposited in the behavioural ledger. Moving this
+    # block below them leaves the served slate correct and silently poisons both
+    # — a test asserts the ordering.
+    try:
+        if isinstance(result, dict) and isinstance(result.get("products"), list):
+            from db.database import database as _db
+            from services.offer_currency_policy import (
+                filter_out_quarantined_rows,
+                get_quarantined_sources,
+            )
+
+            quarantines = await get_quarantined_sources(_db)
+            before = len(result["products"])
+            result["products"] = filter_out_quarantined_rows(
+                result["products"], quarantines
+            )
+            dropped = before - len(result["products"])
+            if dropped:
+                # Keep the counters honest so a shrunken slate is not read as a
+                # ranking regression — same contract as the rig filter.
+                if isinstance(result.get("total"), int):
+                    result["total"] = max(0, result["total"] - dropped)
+                result["page_size"] = len(result["products"])
+                logger.info(
+                    "find_products_multi.excluded_quarantined",
+                    extra={"dropped": dropped, "surface": "find_products_multi"},
+                )
+    except Exception:
+        # Never break search — but never fail SILENTLY either. Failing open here
+        # means mislabelled prices are publishable again, which is precisely the
+        # state this gate exists to end; a bare `pass` would recreate the bug and
+        # leave nothing to notice it by.
+        logger.warning(
+            "find_products_multi.quarantine_filter_failed — "
+            "slate served WITHOUT the quarantine gate",
+            exc_info=True,
+        )
     try:
         if isinstance(result, dict):
             await _attach_connected_product_redirects(result.get("products"), tool="find_products_multi")
