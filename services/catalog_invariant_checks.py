@@ -111,12 +111,14 @@ _PUBLIC_NOT_RENDERABLE_SAMPLE_SQL = compile_pg(
 # convention above is explicit that a threshold is a measured baseline of the
 # UNEXPLAINED residual, and lowering it is mandatory as the residual shrinks.
 #
-# The shopify/wix exclusion is not a fudge: `MERCHANT_SYNCED_LANE_RENDERABLE` is
-# hard-coded False in services/pdp_renderability, so EVERY row on that lane is
-# non-renderable by construction and by decision. Counting a deliberate constant
-# as drift is noise. If that constant is ever flipped, those rows become
-# renderable and leave this set on their own — the exclusion cannot hide a fix.
-# A genuinely NEW dark lane on any other platform is still caught.
+# The shopify exclusion is not a fudge: its verdict in
+# `MERCHANT_SYNCED_RENDERABLE_BY_PLATFORM` is a measured, deliberate False, so
+# EVERY shopify merchant-synced row is non-renderable by construction and by
+# decision. Counting a deliberate constant as drift is noise. When a platform's
+# verdict flips True (wix did, 2026-07-29), its rows become renderable, leave
+# this set on their own, and the platform MUST leave this exclusion in the same
+# change — the exclusion cannot hide a fix, and a genuinely dark row on an open
+# or unknown platform is exactly what this check counts.
 #
 # PREDICATE NOTE: this asks `pdp_renderable_expression` (the CONTENT ROUTE half),
 # not the composite `pdp_will_render_expression`. The composite also asks the
@@ -128,9 +130,13 @@ _SERVING_NOT_RENDERABLE_WHERE = and_(
     not_(pdp_renderable_expression(_cp)),
     _cp.c.suppressed_at.is_(None),
     _cp.c.suppression_reason.is_(None),
+    # shopify ONLY since 2026-07-29: the wix half of the merchant-synced lane
+    # was measured renderable by the Wix pilot and its verdict flipped True, so
+    # a serving-eligible wix row is no longer dark-by-construction — if one
+    # ever fails renderability it is exactly what this check must count.
     not_(
         func.lower(func.btrim(func.coalesce(_cp.c.platform, ""))).in_(
-            ["shopify", "wix"]
+            ["shopify"]
         )
     ),
 )

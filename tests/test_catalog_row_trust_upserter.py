@@ -371,7 +371,7 @@ async def test_seed_route_column_reaches_the_policy_as_a_lane_aware_answer(
     Raw passthrough would call it renderable; the lane test correctly does not,
     because a merchant-synced row must never borrow a stranger seed's answer
     (4,492 merchant rows collide with some seed's external_product_id) and the
-    merchant-synced lane is closed anyway (MERCHANT_SYNCED_LANE_RENDERABLE).
+    shopify half of the merchant-synced lane is closed anyway (MERCHANT_SYNCED_RENDERABLE_BY_PLATFORM).
     """
     monkeypatch.setenv("CATALOG_TRUST_RENDERABLE_GATE", "1")
     db = FakeDb(joined_rows=[make_joined_row(pdp_seed_route_ok=True)])

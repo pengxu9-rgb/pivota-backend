@@ -94,16 +94,17 @@ for the row:
     byte-identically before and after. The two changes ship together —
     PIVOTA-Agent must be live before this predicate stops withholding the lane
     from the sitemap.
-  * **Merchant-synced rows** (shopify/wix catalog sync) were ASSUMED to resolve
-    their detail from the merchant upstream and so to need no seed. Measured,
-    that assumption is FALSE: 7/7 sampled shopify PDPs returned HTTP 500,
-    including under merchants with ``indexable=true``. The lane is therefore
-    non-renderable — see :data:`MERCHANT_SYNCED_LANE_RENDERABLE` for the
-    evidence, the zero-row blast radius, and how to re-enable it.
+  * **Merchant-synced rows** (shopify/wix catalog sync) resolve their detail
+    from the merchant upstream — or don't. The verdict is PER PLATFORM and
+    MEASURED, never assumed: shopify FALSE (7/7 sampled PDPs returned HTTP
+    500, including under merchants with ``indexable=true``), wix TRUE (the
+    2026-07-29 pilot: 8/8 gateway SUCCESS, 8/8 public PDP 200) — see
+    :data:`MERCHANT_SYNCED_RENDERABLE_BY_PLATFORM` for the evidence and the
+    procedure for opening a lane.
   * **Everything else** — today ``url_audit`` audit-minted rows and
     ``brand_authored`` stubs — has neither route and cannot render.
 
-Net: only the seed lane can currently answer True.
+Net: the seed lane and the open merchant-synced platforms can answer True.
 
 The lane order matters: the seed lane is checked FIRST, so an ``ext_``-prefixed
 id sitting under a normal merchant is still seed-gated (that mirrors
@@ -197,7 +198,27 @@ MINTED_SOURCE_SYSTEM = "catalog_enrichment_agent_v1"
 # serving), but it is a divergence, not an oversight:
 # tests/test_pdp_renderability.py pins this set against those two constants so
 # the gap has to be re-decided the moment either of them changes.
-MERCHANT_SYNCED_PLATFORMS = ("shopify", "wix")
+# Split PER PLATFORM on 2026-07-29. The single boolean this replaced was
+# measured FALSE for shopify (7/7 HTTP 500, 2026-07-25) and then assumed-by-
+# symmetry for wix — the exact inference this module's own docstring warns
+# against. The Wix pilot (merch_e68c20b0189746d0, runbook
+# ~/dev/PIVOTA_SYNC_LANE_PILOT_RUNBOOK.md) measured the wix lane end-to-end:
+# sync -> identity -> scoring -> eligibility -> gateway content phase, and the
+# content phase answered 8/8 get_pdp_v2 SUCCESS with real payloads and 8/8
+# public PDP HTTP 200 with product JSON-LD. wix is therefore TRUE on evidence;
+# shopify stays FALSE until its own pilot produces the same artifact (its 500s
+# were real, and the re-enable procedure below still applies to it verbatim).
+#
+# The Node twin (PIVOTA-Agent src/services/pdpRenderability.js) carries the
+# SAME per-platform split, shipped in the same change — the parity tests pin
+# both sides.
+MERCHANT_SYNCED_RENDERABLE_BY_PLATFORM = {
+    "shopify": False,  # MEASURED FALSE 2026-07-25: 7/7 HTTP 500
+    "wix": True,       # MEASURED TRUE 2026-07-29: pilot 8/8 gateway + 8/8 PDP 200
+}
+
+# Derived from the verdict map so membership and verdict can never disagree.
+MERCHANT_SYNCED_PLATFORMS = tuple(sorted(MERCHANT_SYNCED_RENDERABLE_BY_PLATFORM))
 
 # …AND WHETHER THAT LANE RENDERS AT ALL. Answer today: NO.
 #
@@ -228,7 +249,6 @@ MERCHANT_SYNCED_PLATFORMS = ("shopify", "wix")
 # (pivota-backend services/pdp_renderability.py and PIVOTA-Agent
 # src/services/pdpRenderability.js). The right long-term fix is P3 — teach the
 # gateway to resolve these rows — not a wider predicate.
-MERCHANT_SYNCED_LANE_RENDERABLE = False
 
 
 def _lower_trim(col):
@@ -412,11 +432,15 @@ def pdp_renderable_expression(cp=None):
         # Seed lane FIRST: an ext_/ext: id under a normal merchant is still
         # resolved by the gateway's external-seed path.
         (_seed_routed_lane(cp), _seed_route_resolves(cp)),
-        (
-            _lower_trim(cp.c.platform).in_(MERCHANT_SYNCED_PLATFORMS),
-            # MEASURED FALSE — see MERCHANT_SYNCED_LANE_RENDERABLE.
-            MERCHANT_SYNCED_LANE_RENDERABLE,
-        ),
+        # One arm per merchant-synced platform, each carrying its own measured
+        # verdict — see MERCHANT_SYNCED_RENDERABLE_BY_PLATFORM. Built from the
+        # dict so the SQL cannot drift from the Python helper below.
+        *[
+            (_lower_trim(cp.c.platform) == _plat, _verdict)
+            for _plat, _verdict in sorted(
+                MERCHANT_SYNCED_RENDERABLE_BY_PLATFORM.items()
+            )
+        ],
         # Neither a seed route nor a live merchant upstream: audit-minted
         # (url_audit) and brand_authored stubs. Measured: HTTP 500.
         else_=False,
@@ -802,9 +826,10 @@ def pdp_route_resolvable(
     )
     if seed_routed:
         return bool(seed_route_ok)
-    if (platform or "").strip().lower() in MERCHANT_SYNCED_PLATFORMS:
-        # MEASURED FALSE — see MERCHANT_SYNCED_LANE_RENDERABLE.
-        return MERCHANT_SYNCED_LANE_RENDERABLE
+    plat = (platform or "").strip().lower()
+    if plat in MERCHANT_SYNCED_PLATFORMS:
+        # Per-platform measured verdicts — see MERCHANT_SYNCED_RENDERABLE_BY_PLATFORM.
+        return MERCHANT_SYNCED_RENDERABLE_BY_PLATFORM[plat]
     return False
 
 
@@ -838,6 +863,7 @@ def compile_pg(stmt) -> str:
 __all__ = [
     "EXTERNAL_SEED_MERCHANT_ID",
     "MERCHANT_SYNCED_PLATFORMS",
+    "MERCHANT_SYNCED_RENDERABLE_BY_PLATFORM",
     "MINTED_SOURCE_SYSTEM",
     "SEED_ROUTED_SOURCE_SYSTEMS",
     "compile_pg",

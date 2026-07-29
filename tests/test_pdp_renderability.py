@@ -37,8 +37,8 @@ from sqlalchemy import (
 )
 
 from services.pdp_renderability import (
-    MERCHANT_SYNCED_LANE_RENDERABLE,
     MERCHANT_SYNCED_PLATFORMS,
+    MERCHANT_SYNCED_RENDERABLE_BY_PLATFORM,
     MINTED_SOURCE_SYSTEM,
     compile_pg,
     pdp_renderable_expression,
@@ -343,7 +343,7 @@ MATRIX = [
         False,
     ),
     (
-        # MEASURED FALSE, 7/7 HTTP 500 — see MERCHANT_SYNCED_LANE_RENDERABLE.
+        # MEASURED FALSE, 7/7 HTTP 500 — see MERCHANT_SYNCED_RENDERABLE_BY_PLATFORM.
         # The merchant-synced lane was the one arm that asserted renderable
         # without evidence; it does not.
         "merchant-synced shopify row with no seed at all",
@@ -387,8 +387,11 @@ MATRIX = [
         False,
     ),
     (
-        # wix is in MERCHANT_SYNCED_PLATFORMS too and had no case at all —
-        # dropping 'wix' from the tuple used to pass the whole suite.
+        # MEASURED TRUE 2026-07-29 — the Wix pilot (merch_e68c20b0189746d0)
+        # exercised the content phase end-to-end: 8/8 get_pdp_v2 SUCCESS with
+        # real payloads, 8/8 public PDP HTTP 200 with product JSON-LD. The
+        # verdict is PER PLATFORM now; shopify's arms above stay False on their
+        # own (real) 7/7-500 measurement.
         "merchant-synced wix row with no seed at all",
         {
             "merchant_id": "merch_wix",
@@ -397,7 +400,7 @@ MATRIX = [
             "source_product_id": "wix_12345",
         },
         [],
-        False,
+        True,
     ),
     (
         # isExternalSeedProductId() keys off the id prefix, not the merchant.
@@ -688,9 +691,22 @@ def test_merchant_synced_lane_is_closed_until_it_is_measured():
     must be backed by fresh PDP samples AND mirrored in the Node twin
     (PIVOTA-Agent src/services/pdpRenderability.js) in the same change.
     """
-    assert MERCHANT_SYNCED_LANE_RENDERABLE is False, (
-        "re-opening the merchant-synced lane requires measured evidence that "
-        "those PDPs render, plus the same flip in the Node twin"
+    # PER-PLATFORM since 2026-07-29. Each verdict is pinned to ITS OWN
+    # measurement; changing either side of this dict requires fresh evidence of
+    # the same shape, plus the identical flip in the Node twin
+    # (PIVOTA-Agent src/services/pdpRenderability.js) in the same change.
+    assert MERCHANT_SYNCED_RENDERABLE_BY_PLATFORM == {
+        # 7/7 sampled shopify PDPs returned HTTP 500 (2026-07-25), including
+        # under merchants with catalog_merchants.indexable=true. Stays False
+        # until a shopify pilot produces the wix pilot's artifact.
+        "shopify": False,
+        # Wix pilot merch_e68c20b0189746d0 (2026-07-29): 8/8 get_pdp_v2 SUCCESS
+        # with real payloads, 8/8 public PDP HTTP 200 with product JSON-LD —
+        # runbook ~/dev/PIVOTA_SYNC_LANE_PILOT_RUNBOOK.md, pass 2.
+        "wix": True,
+    }, (
+        "changing a lane verdict requires measured evidence of the same shape "
+        "as the pilot that set it, plus the same flip in the Node twin"
     )
     for platform in MERCHANT_SYNCED_PLATFORMS:
         assert (
@@ -701,7 +717,7 @@ def test_merchant_synced_lane_is_closed_until_it_is_measured():
                 source_product_id=f"{platform}_1",
                 seed_route_ok=False,
             )
-            is False
+            is MERCHANT_SYNCED_RENDERABLE_BY_PLATFORM[platform]
         )
 
 
@@ -709,7 +725,7 @@ def test_merchant_synced_platforms_stays_pinned_to_the_supported_platform_sets()
     """This set is NARROWER than the platforms the rest of the codebase
     supports: woocommerce/bigcommerce never even reach the lane test. With the
     lane closed that is currently moot, but the set is load-bearing again the
-    moment MERCHANT_SYNCED_LANE_RENDERABLE flips — so pin it now, while the
+    moment a platform verdict in MERCHANT_SYNCED_RENDERABLE_BY_PLATFORM flips — so pin it now, while the
     stakes are zero, rather than discovering the drift later.
     """
     from services.agent_center_sku_match_live_service import SUPPORTED_LIVE_PLATFORMS
