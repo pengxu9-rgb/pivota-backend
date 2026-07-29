@@ -48,9 +48,15 @@ jobs:
     runs-on: ubuntu-latest
     # Generous: it waits for the slowest real gate. The sweep is ~2min, the
     # audit gate longer. Well under the cost of a gate that cannot block.
-    timeout-minutes: 20
+    timeout-minutes: 25
     steps:
       - uses: actions/checkout@v4
+        with:
+          # F1: on workflow_dispatch the script diffs HEAD~1, which FAILS on a
+          # depth-1 checkout — returncode 128, empty file list, nothing expected,
+          # green tick having verified nothing. Full history plus the explicit
+          # returncode check below closes it.
+          fetch-depth: 0
       - uses: actions/setup-python@v5
         with:
           python-version: '3.11'
@@ -72,22 +78,47 @@ jobs:
           PR = os.environ.get('PR_NUMBER')
           SELF = 'CI Entrypoint'
 
-          def gh(path):
+          def gh_json(path):
+              """Every JSON document `gh api --paginate` emits, decoded.
+
+              F5: for an OBJECT-returning endpoint (check-runs) gh concatenates
+              one document per page with NO separator — measured: 4 objects, 0
+              newlines. Splitting on '\\n' therefore hands json.loads the whole
+              blob and raises `Extra data`, uncaught, above 100 check runs on one
+              SHA. (Array endpoints like pulls/N/files are merged by gh into one
+              valid array, so those were always fine.) raw_decode walks whatever
+              shape arrives.
+              """
               out = subprocess.run(['gh', 'api', path, '--paginate'],
                                    capture_output=True, text=True)
               if out.returncode != 0:
                   sys.exit(f"::error::gh api {path} failed: {out.stderr.strip()[:300]}")
-              return out.stdout
+              dec, idx, docs = json.JSONDecoder(), 0, []
+              raw = out.stdout.strip()
+              while idx < len(raw):
+                  obj, end = dec.raw_decode(raw, idx)
+                  docs.append(obj)
+                  idx = end
+                  while idx < len(raw) and raw[idx] in ' \\t\\r\\n':
+                      idx += 1
+              return docs
 
           # ---- 1. what changed -------------------------------------------------
           if PR:
-              files = []
-              for chunk in gh(f'repos/{REPO}/pulls/{PR}/files').split('\n'):
-                  if chunk.strip():
-                      files += [f['filename'] for f in json.loads(chunk)]
+              files = [f['filename']
+                       for doc in gh_json(f'repos/{REPO}/pulls/{PR}/files')
+                       for f in doc]
           else:
-              files = subprocess.run(['git', 'diff', '--name-only', 'HEAD~1'],
-                                     capture_output=True, text=True).stdout.split()
+              # RETURNCODE CHECKED. Unchecked, a failed diff yields '' -> no files
+              # -> nothing expected -> exit 0. A dispatch that verifies nothing
+              # while reporting success is the exact shape this job exists to
+              # catch, and the first version of it shipped that way.
+              d = subprocess.run(['git', 'diff', '--name-only', 'HEAD~1'],
+                                 capture_output=True, text=True)
+              if d.returncode != 0:
+                  sys.exit(f"::error::could not diff HEAD~1 ({d.stderr.strip()[:200]}) — "
+                           "refusing to report success having derived no changed files")
+              files = d.stdout.split()
           print(f"changed files: {len(files)}")
 
           # ---- 2. which gates should have run ----------------------------------
@@ -99,6 +130,7 @@ jobs:
               return fnmatch.fnmatch(path, pattern)
 
           expected = {}   # check name -> workflow file
+          skipped_by_shape = []   # jobs whose check-run NAME cannot be derived
           for wf in sorted(os.listdir('.github/workflows')):
               if not wf.endswith(('.yml', '.yaml')):
                   continue
@@ -109,20 +141,47 @@ jobs:
                            "reason about which gates should run")
               # PyYAML reads the `on:` key as the boolean True (YAML 1.1).
               triggers = doc.get(True) or doc.get('on') or {}
+              # `on: [push, pull_request]` is legal and yields a LIST. The first
+              # version `continue`d on it, so such a workflow's gates were never
+              # enforced and nothing was printed — silent, and the failure mode
+              # this job is for. List form carries no paths, so it always runs.
+              if isinstance(triggers, list):
+                  triggers = {t: {} for t in triggers}
               if not isinstance(triggers, dict) or 'pull_request' not in triggers:
                   continue
               pr_trigger = triggers.get('pull_request') or {}
               patterns = (pr_trigger or {}).get('paths')
-              names = [(spec or {}).get('name') or key
-                       for key, spec in (doc.get('jobs') or {}).items()]
-              if patterns is None:
-                  should = True          # unfiltered: always runs
-              else:
+              ignore = (pr_trigger or {}).get('paths-ignore')
+              # F4: GitHub names a MATRIX check run `job (v1, v2)` and a
+              # REUSABLE-workflow job `caller / callee`, neither of which equals
+              # the job key. Expecting the bare name would mark that gate
+              # permanently absent and hard-block every matching PR. None exist
+              # here today; they are excluded and PRINTED so the gap is visible
+              # rather than becoming a future outage.
+              names, unmatchable = [], []
+              for key, spec in (doc.get('jobs') or {}).items():
+                  spec = spec or {}
+                  label = spec.get('name') or key
+                  if (spec.get('strategy') or {}).get('matrix') or spec.get('uses') \
+                     or '${{' in str(label):
+                      unmatchable.append(label)
+                  else:
+                      names.append(label)
+              if patterns is not None:
                   should = any(matches(f, p) for f in files for p in patterns)
+              elif ignore is not None:
+                  # F3: `paths-ignore` runs UNLESS every changed file matches.
+                  # Read as unfiltered it would expect the gate on a PR that
+                  # touches only ignored paths, wait 20 minutes, and hard-block.
+                  should = any(not any(matches(f, p) for p in ignore) for f in files)
+              else:
+                  should = True          # genuinely unfiltered: always runs
               if should:
                   for n in names:
                       if n != SELF:
                           expected[n] = wf
+                  for n in unmatchable:
+                      skipped_by_shape.append(f"{n} ({wf})")
 
 
           if not expected:
@@ -133,15 +192,16 @@ jobs:
               print(f"  {n}  ({wf})")
 
           # ---- 3. wait for them, then assert -----------------------------------
-          # 12 minutes. An ABSENT gate is indistinguishable from a slow one, so
-          # this is the honest bound on "it is never coming". Real gates finish
-          # in 2-3 minutes.
-          DEADLINE = time.time() + 12 * 60
+          # 20 minutes: the LONGEST any gate is allowed to take
+          # (agent-reliability-suite jobs are timeout-minutes: 20; the rest 15).
+          # The first cut used 12, BELOW those ceilings — a queue backlog would
+          # have reported "NEVER STARTED" and blocked a PR whose gate then
+          # passed. Measured runs finish in 0-2 min, so this is headroom, not
+          # latency: the loop exits as soon as everything reports.
+          DEADLINE = time.time() + 20 * 60
           while True:
-              runs = []
-              for chunk in gh(f'repos/{REPO}/commits/{SHA}/check-runs?per_page=100').split('\n'):
-                  if chunk.strip():
-                      runs += json.loads(chunk).get('check_runs', [])
+              runs = [r for doc in gh_json(f'repos/{REPO}/commits/{SHA}/check-runs?per_page=100')
+                      for r in doc.get('check_runs', [])]
               seen = {r['name']: r for r in runs if r['name'] != SELF}
               pending = [n for n in expected
                          if n not in seen or seen[n]['status'] != 'completed']
