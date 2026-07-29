@@ -1,4 +1,6 @@
 """Wix Product Sync and Integration"""
+import asyncio
+
 from fastapi import APIRouter, Depends, HTTPException
 from typing import Optional
 from utils.auth import get_current_user
@@ -19,11 +21,17 @@ _PLATFORM_LABELS = {
 }
 
 
+# Keep strong references to in-flight background syncs: asyncio holds tasks
+# weakly, and a garbage-collected task dies mid-sync with no log at all.
+_BACKGROUND_SYNC_TASKS: set = set()
+
+
 async def _sync_connected_platform_products(
     *,
     platform: str,
     store_id: Optional[str],
     current_user: dict,
+    wait: bool = False,
 ):
     platform_label = _PLATFORM_LABELS.get(platform, platform.title())
 
@@ -78,32 +86,90 @@ async def _sync_connected_platform_products(
         platform=platform,
     )
 
-    sync_result = await sync_products(
-        request=sync_request,
-        background_tasks=BackgroundTasks(),
-        current_user=current_user,
-    )
-
-    if sync_result.status != "success":
-        raise HTTPException(
-            status_code=400,
-            detail=f"{platform_label} sync failed: {sync_result.message}",
+    # WHY THE SYNC NO LONGER RUNS INLINE. This handler used to await the full
+    # catalog sync inside the HTTP request. A sync's duration is dominated by
+    # per-product writes against a database ~140ms of RTT away, so any store
+    # big enough to matter exceeded the edge's idle timeout (~16s observed):
+    # the edge closed the connection with NO response, the portal showed
+    # "API Error: undefined … ERR_CONNECTION_CLOSED", and the sync — which the
+    # server happily finished after the client vanished — looked failed while
+    # succeeding. Both syncs of the 2026-07-29 Wix pilot hit exactly this
+    # (20/20 rows landed behind a scary error, verified in the DB each time).
+    # A merchant's very first interaction with the product was a fake failure.
+    #
+    # `wait=true` (below) preserves the inline behavior for scripts that rely
+    # on the old contract; the portal path returns `status: "started"`
+    # immediately and polls GET /merchant/integrations/sync-status until
+    # merchant_stores.last_sync advances past started_at — the durable
+    # completion signal universal_product_sync already writes, chosen over a
+    # new job table precisely so this fix needs no migration.
+    if wait:
+        sync_result = await sync_products(
+            request=sync_request,
+            background_tasks=BackgroundTasks(),
+            current_user=current_user,
         )
 
+        if sync_result.status != "success":
+            raise HTTPException(
+                status_code=400,
+                detail=f"{platform_label} sync failed: {sync_result.message}",
+            )
+
+        return {
+            "status": "success",
+            "message": sync_result.message,
+            "store_id": store_dict["store_id"],
+            "store_name": store_dict["name"],
+            "product_count": sync_result.products_synced,
+            "platform": sync_result.platform,
+            "synced_at": sync_result.sync_time,
+        }
+
+    started_at = datetime.utcnow()
+
+    async def _run_sync_in_background():
+        try:
+            result = await sync_products(
+                request=sync_request,
+                background_tasks=BackgroundTasks(),
+                current_user=current_user,
+            )
+            print(
+                f"[portal-sync] background {platform} sync finished "
+                f"merchant={merchant_id} status={result.status} "
+                f"synced={result.products_synced}"
+            )
+        except Exception as exc:  # noqa: BLE001 — log; the poll surface shows staleness
+            # A background failure has no response to land in. The portal's
+            # poll times out against a last_sync that never advances and shows
+            # "still running / retry", which is honest; the details live here.
+            print(
+                f"[portal-sync] background {platform} sync FAILED "
+                f"merchant={merchant_id}: {exc!r}"
+            )
+
+    task = asyncio.create_task(_run_sync_in_background())
+    _BACKGROUND_SYNC_TASKS.add(task)
+    task.add_done_callback(_BACKGROUND_SYNC_TASKS.discard)
+
     return {
-        "status": "success",
-        "message": sync_result.message,
+        "status": "started",
+        "message": (
+            f"{platform_label} sync started — poll "
+            f"/merchant/integrations/sync-status until last_sync passes started_at"
+        ),
         "store_id": store_dict["store_id"],
         "store_name": store_dict["name"],
-        "product_count": sync_result.products_synced,
-        "platform": sync_result.platform,
-        "synced_at": sync_result.sync_time,
+        "platform": platform,
+        "started_at": started_at.isoformat() + "Z",
     }
 
 
 @router.post("/merchant/integrations/wix/sync")
 async def sync_wix_products(
     store_id: Optional[str] = None,
+    wait: bool = False,
     current_user: dict = Depends(get_current_user)
 ):
     """Sync products from Wix store"""
@@ -112,6 +178,7 @@ async def sync_wix_products(
             platform="wix",
             store_id=store_id,
             current_user=current_user,
+            wait=wait,
         )
     except HTTPException:
         raise
@@ -123,6 +190,7 @@ async def sync_wix_products(
 @router.post("/merchant/integrations/woocommerce/sync")
 async def sync_woocommerce_products(
     store_id: Optional[str] = None,
+    wait: bool = False,
     current_user: dict = Depends(get_current_user)
 ):
     """Sync products from WooCommerce store"""
@@ -131,6 +199,7 @@ async def sync_woocommerce_products(
             platform="woocommerce",
             store_id=store_id,
             current_user=current_user,
+            wait=wait,
         )
     except HTTPException:
         raise
@@ -142,6 +211,7 @@ async def sync_woocommerce_products(
 @router.post("/merchant/integrations/bigcommerce/sync")
 async def sync_bigcommerce_products(
     store_id: Optional[str] = None,
+    wait: bool = False,
     current_user: dict = Depends(get_current_user)
 ):
     """Sync products from BigCommerce store"""
@@ -150,12 +220,67 @@ async def sync_bigcommerce_products(
             platform="bigcommerce",
             store_id=store_id,
             current_user=current_user,
+            wait=wait,
         )
     except HTTPException:
         raise
     except Exception as e:
         print(f"Error syncing BigCommerce products: {e}")
         raise HTTPException(status_code=500, detail=f"Failed to sync products: {str(e)}")
+
+
+@router.get("/merchant/integrations/sync-status")
+async def merchant_sync_status(
+    platform: str,
+    store_id: Optional[str] = None,
+    current_user: dict = Depends(get_current_user),
+):
+    """Completion poll for the background sync started by the sibling POSTs.
+
+    Reads the durable signal `universal_product_sync.update_sync_status`
+    already writes on completion (`merchant_stores.last_sync` +
+    `product_count`) — deliberately no new job table, no migration. The portal
+    compares `last_sync` against the `started_at` the POST returned: advanced
+    past it = the sync that produced this response has finished. A poll that
+    never advances means the background sync died; the server log carries the
+    exception ([portal-sync] lines), and the honest client message is
+    "still running or failed — retry", not a fabricated success.
+    """
+    if current_user["role"] not in ["merchant", "employee", "admin"]:
+        raise HTTPException(status_code=403, detail="Not authorized")
+
+    merchant_id = current_user.get("merchant_id")
+    if store_id:
+        row = await database.fetch_one(
+            """SELECT store_id, name, platform, status, last_sync, product_count
+               FROM merchant_stores WHERE store_id = :store_id AND platform = :platform""",
+            {"store_id": store_id, "platform": platform},
+        )
+    elif merchant_id:
+        row = await database.fetch_one(
+            """SELECT store_id, name, platform, status, last_sync, product_count
+               FROM merchant_stores
+               WHERE merchant_id = :merchant_id AND platform = :platform
+                 AND status IN ('active', 'connected')
+               LIMIT 1""",
+            {"merchant_id": merchant_id, "platform": platform},
+        )
+    else:
+        raise HTTPException(status_code=400, detail="store_id or merchant context is required")
+
+    if not row:
+        raise HTTPException(status_code=404, detail="store not found")
+
+    d = dict(row)
+    last_sync = d.get("last_sync")
+    return {
+        "store_id": d.get("store_id"),
+        "store_name": d.get("name"),
+        "platform": d.get("platform"),
+        "store_status": d.get("status"),
+        "last_sync": last_sync.isoformat() + "Z" if last_sync else None,
+        "product_count": d.get("product_count"),
+    }
 
 
 @router.post("/integrations/wix/connect-sync")
