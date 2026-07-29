@@ -20,7 +20,12 @@ from adapters.bigcommerce_adapter import (
 )
 from adapters.woocommerce_adapter import normalize_woocommerce_store_url
 from models.standard_product import StandardProduct, StandardProductVariant, ProductStatus
-from services.wix_connection import WIX_PRODUCTS_QUERY_URL, build_wix_catalog_headers
+from services.wix_connection import (
+    WIX_ALL_PRODUCTS_COLLECTION_ID,
+    WIX_COLLECTIONS_QUERY_URL,
+    WIX_PRODUCTS_QUERY_URL,
+    build_wix_catalog_headers,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -127,6 +132,28 @@ def _as_int(value: Any, default: int = 0) -> int:
         return int(float(value))
     except Exception:
         return default
+
+
+# Collections are a per-STORE resource, not per-product: a store has tens of
+# them, not thousands. These bounds exist so a pathological or hostile response
+# cannot spin the sync, not because real stores approach them.
+_WIX_COLLECTIONS_PAGE_LIMIT = 100
+_WIX_COLLECTIONS_MAX_PAGES = 10
+
+# Merchandising collections describe WHERE a product sits in the storefront, not
+# WHAT it is. They are legitimate collections — we just never want one as the
+# category when a semantic sibling exists, because everything downstream of
+# `product_type` (vertical resolution, beauty taxonomy, category probes) reads it
+# as the product's kind. Anchored at the start so "Sale" and "Sale Items" match
+# while "Salt Scrubs" does not.
+_WIX_MERCHANDISING_COLLECTION_RE = re.compile(
+    r"^\s*(all\b|shop\s+all\b|new\b|new\s+arrivals?\b|best\b|best\s*sell|top\s+sell"
+    r"|featured\b|sale\b|on\s+sale\b|clearance\b|trending\b|popular\b|gifts?\b"
+    # NOT "accessories": that is a real product kind, not a merchandising
+    # shelf, and it resolves to a correct vertical on its own.
+    r"|gift\s+(guide|ideas?)\b|bundles?\b|deals?\b)",
+    re.IGNORECASE,
+)
 
 
 def _wix_max_pages_override() -> Optional[int]:
@@ -848,7 +875,146 @@ class WixProductAdapter:
         return []
 
     @staticmethod
-    def _convert_product(wp: Dict[str, Any], merchant_id: str) -> Optional[StandardProduct]:
+    def _extract_wix_collection_ids(wp: Dict[str, Any]) -> List[str]:
+        """The collection ids on a Wix product, minus the implicit "All Products".
+
+        Wix has moved this field's spelling across catalog versions, so accept
+        the known aliases rather than pinning one and silently mapping nothing:
+        a wrong guess here does not raise, it just leaves every product
+        category-less exactly as before, which is indistinguishable from the
+        bug we are fixing.
+        """
+        raw: Any = None
+        for key in ("collectionIds", "collection_ids", "collectionIDs"):
+            if isinstance(wp.get(key), list):
+                raw = wp.get(key)
+                break
+        if raw is None:
+            return []
+        out: List[str] = []
+        for cid in raw:
+            text = str(cid or "").strip()
+            if text and text != WIX_ALL_PRODUCTS_COLLECTION_ID:
+                out.append(text)
+        return out
+
+    @staticmethod
+    def _pick_wix_product_type(
+        wp: Dict[str, Any],
+        collection_names: Optional[Dict[str, str]],
+    ) -> Optional[str]:
+        """Resolve a Wix product's category name from its collections.
+
+        A product can belong to many collections, so the choice must be
+        DETERMINISTIC: an unstable `product_type` churns the quality score (and
+        anything keyed off it) on every re-sync, turning a fixed field into a
+        source of drift.
+
+        But determinism is a TIE-BREAK rule, not a selection rule, and plain
+        alphabetical order is not neutral — merchandising collections cluster on
+        A/B/N/S ("Accessories", "Best Sellers", "New Arrivals", "Sale"), so
+        alphabetical-first is systematically biased toward them and away from the
+        semantic category. Measured on realistic pairs: {Best Sellers, Dog
+        Harnesses} -> "Best Sellers"; {New Arrivals, Vitamin C Serum} -> "New
+        Arrivals", which `resolve_vertical` then reads as `other` instead of
+        `beauty`, so beauty taxonomy rows are never written and category probes
+        generate queries for "New Arrivals".
+
+        That is the same valid-but-wrong failure the All-Products exclusion
+        exists to prevent, just softer: the score component fills either way,
+        which is exactly what makes it easy to miss. So deprioritise the
+        merchandising tier first, then sort alphabetically WITHIN the surviving
+        tier, and fall back to the full set only if the stoplist empties it —
+        a merchandising category still beats none for the score.
+        """
+        if not collection_names:
+            return None
+        names = sorted(
+            {
+                name.strip()
+                for cid in WixProductAdapter._extract_wix_collection_ids(wp)
+                if (name := str(collection_names.get(cid) or "").strip())
+            }
+        )
+        if not names:
+            return None
+        semantic = [n for n in names if not _WIX_MERCHANDISING_COLLECTION_RE.match(n)]
+        return (semantic or names)[0]
+
+    @staticmethod
+    async def _fetch_wix_collection_names(
+        client: "httpx.AsyncClient",
+        headers: Dict[str, str],
+        merchant_id: str,
+    ) -> Dict[str, str]:
+        """`{collection_id: name}` for the store, or `{}` if unavailable.
+
+        NEVER raises and never fails the sync. Categories are an enrichment:
+        losing them costs one of six score components, while letting this call
+        abort the run would cost the entire catalog. Degrading here reproduces
+        exactly the pre-2026-07-29 behaviour, which is a known, survivable state.
+
+        Degrades ALL-OR-NOTHING. A partial map is worse than no map: with 101
+        collections, a product in {"Zebra Print" (page 1), "Apparel" (page 2)}
+        resolves to "Apparel" on a complete fetch and "Zebra Print" when page 2
+        500s — a different, valid-looking category, with nothing to distinguish
+        it, that silently flips back on the next successful sync. That breaks the
+        determinism `_pick_wix_product_type` depends on. Returning {} instead
+        costs one component for one sync and trips the canary, which is a state
+        we can see.
+        """
+        names: Dict[str, str] = {}
+        try:
+            offset = 0
+            for _ in range(_WIX_COLLECTIONS_MAX_PAGES):
+                response = await client.post(
+                    WIX_COLLECTIONS_QUERY_URL,
+                    json={"query": {"paging": {"limit": _WIX_COLLECTIONS_PAGE_LIMIT, "offset": offset}}},
+                    headers=headers,
+                )
+                if response.status_code != 200:
+                    logger.warning(
+                        "Wix collections unavailable merchant_id=%s status=%s partial_pages=%s "
+                        "body=%s — DISCARDING %s partial results; products will sync WITHOUT "
+                        "a category",
+                        merchant_id,
+                        response.status_code,
+                        offset // _WIX_COLLECTIONS_PAGE_LIMIT,
+                        response.text[:200],
+                        len(names),
+                    )
+                    return {}
+                payload = response.json() or {}
+                page = payload.get("collections")
+                if not isinstance(page, list) or not page:
+                    break
+                for collection in page:
+                    if not isinstance(collection, dict):
+                        continue
+                    cid = str(collection.get("id") or "").strip()
+                    name = str(collection.get("name") or "").strip()
+                    if cid and name and cid != WIX_ALL_PRODUCTS_COLLECTION_ID:
+                        names[cid] = name
+                if len(page) < _WIX_COLLECTIONS_PAGE_LIMIT:
+                    break
+                offset += len(page)
+        except Exception as exc:  # noqa: BLE001 — see docstring: never fail the sync
+            logger.warning(
+                "Wix collections fetch failed merchant_id=%s error=%s — DISCARDING %s "
+                "partial results; products will sync WITHOUT a category",
+                merchant_id,
+                exc,
+                len(names),
+            )
+            return {}
+        return names
+
+    @staticmethod
+    def _convert_product(
+        wp: Dict[str, Any],
+        merchant_id: str,
+        collection_names: Optional[Dict[str, str]] = None,
+    ) -> Optional[StandardProduct]:
         if not wp or not isinstance(wp, dict):
             return None
 
@@ -981,6 +1147,19 @@ class WixProductAdapter:
             # `vendor`; this brings Wix to parity. Empty/whitespace collapses
             # to None so a blank Wix field behaves like an absent one.
             vendor=str(wp.get("brand") or "").strip() or None,
+            # Wix keeps categories in COLLECTIONS, a resource this adapter never
+            # called until 2026-07-29, so `product_type` was always None. That is
+            # not cosmetic: `product_quality_service` scores
+            # `brand_category = 1.0 if brand_present and category_present else 0.0`
+            # as one of six equal-weight components, so a category-less Wix row
+            # forfeits 16.7 points outright. Measured on the Wix pilot: scoring
+            # capped at 4-of-6 = 66.7 against a 71.4 floor — every product
+            # unservable, for a field the store already had. Writing
+            # product_type by hand onto those 20 rows moved them to 83.3 and
+            # 14/14 serving_eligible, which is the experiment this makes
+            # permanent. Shopify has always mapped `product_type`; this brings
+            # Wix to parity.
+            product_type=WixProductAdapter._pick_wix_product_type(wp, collection_names),
             merchant_id=merchant_id,
             status=ProductStatus.ACTIVE,
             variants=variants_out,
@@ -1034,7 +1213,21 @@ class WixProductAdapter:
             next_page_token = None
             truncated = False
 
+            products_with_collection_ids = 0
+            products_with_product_type = 0
+
             async with httpx.AsyncClient(timeout=30.0) as client:
+                # Once per sync, not per product. Must precede the product loop
+                # because every converted row reads it.
+                collection_names = await WixProductAdapter._fetch_wix_collection_names(
+                    client, headers, merchant_id
+                )
+                logger.info(
+                    "Wix collections merchant_id=%s resolved=%s",
+                    merchant_id,
+                    len(collection_names),
+                )
+
                 while total_raw_products < max_total_products and pages_fetched < max_pages:
                     current_limit = min(page_limit, max_total_products - total_raw_products)
                     payload = {
@@ -1089,9 +1282,17 @@ class WixProductAdapter:
 
                     for wp in wix_products:
                         try:
-                            product = WixProductAdapter._convert_product(wp, merchant_id=merchant_id)
+                            product = WixProductAdapter._convert_product(
+                                wp,
+                                merchant_id=merchant_id,
+                                collection_names=collection_names,
+                            )
                             if product:
                                 standard_products.append(product)
+                                if WixProductAdapter._extract_wix_collection_ids(wp):
+                                    products_with_collection_ids += 1
+                                if product.product_type:
+                                    products_with_product_type += 1
                         except Exception as product_error:
                             logger.error(f"Error converting Wix product: {product_error}")
                             continue
@@ -1122,6 +1323,58 @@ class WixProductAdapter:
                 truncated,
                 next_page_token,
             )
+
+            # CANARY. Category mapping fails SILENTLY by construction: every
+            # failure mode — wrong endpoint, renamed field, revoked permission,
+            # a store with no collections — produces `product_type=None`, which
+            # is byte-identical to the bug this replaced. Nothing downstream
+            # raises; the products merely score 16.7 lower and never serve, the
+            # way they did for months without anyone noticing.
+            #
+            # So emit a reading that distinguishes the cases, and make the one
+            # that means "the wiring is broken" a WARNING rather than a silence:
+            # products carrying collection ids while none resolved to a name is
+            # not a store without categories, it is a lookup that did not work.
+            if standard_products:
+                logger.info(
+                    "Wix category mapping merchant_id=%s products=%s with_collection_ids=%s "
+                    "with_product_type=%s collections_resolved=%s",
+                    merchant_id,
+                    len(standard_products),
+                    products_with_collection_ids,
+                    products_with_product_type,
+                    len(collection_names),
+                )
+                if products_with_collection_ids and not products_with_product_type:
+                    logger.warning(
+                        "Wix category mapping RESOLVED NOTHING merchant_id=%s: %s products carry "
+                        "collection ids but none matched a collection name (collections_resolved=%s). "
+                        "brand_category will score 0 for every row — check the collections "
+                        "endpoint, credentials scope, and the collectionIds field name.",
+                        merchant_id,
+                        products_with_collection_ids,
+                        len(collection_names),
+                    )
+                elif collection_names and not products_with_collection_ids:
+                    # The OTHER silent failure, and the likelier one: the store
+                    # has real collections but no product appears to belong to
+                    # any of them. A store genuinely organised that way is
+                    # possible; a `collectionIds` field RENAMED to a spelling
+                    # outside our accepted aliases looks exactly the same from
+                    # here — and the branch above structurally cannot see it,
+                    # because it requires products_with_collection_ids to be
+                    # non-zero, which is precisely what a rename drives to zero.
+                    logger.warning(
+                        "Wix category mapping SAW NO COLLECTION IDS merchant_id=%s: %s collections "
+                        "resolved but 0 of %s products carry collection ids. Either this store "
+                        "assigns no products to collections, or the product field changed name "
+                        "(accepted: collectionIds / collection_ids / collectionIDs). "
+                        "brand_category will score 0 for every row.",
+                        merchant_id,
+                        len(collection_names),
+                        len(standard_products),
+                    )
+
             return standard_products, next_page_token, None
                 
         except Exception as e:

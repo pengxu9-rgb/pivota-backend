@@ -10,6 +10,20 @@ from urllib.parse import parse_qs, unquote, urlparse
 import httpx
 
 WIX_PRODUCTS_QUERY_URL = "https://www.wixapis.com/stores-reader/v1/products/query"
+
+# Wix keeps a product's category in COLLECTIONS, which are a separate resource
+# from the product itself: `products/query` returns `collectionIds`, and the
+# human-readable name lives only here. Same reader API, same credentials, so
+# this costs one extra call per sync (not per product).
+WIX_COLLECTIONS_QUERY_URL = "https://www.wixapis.com/stores-reader/v1/collections/query"
+
+# Every Wix store has an implicit "All Products" collection that EVERY product
+# belongs to. Mapping it into `product_type` would hand every row in the store
+# the identical, meaningless category — which scores exactly as well as a real
+# one while telling a buyer, a crawler, and the index nothing. That is the
+# valid-but-wrong failure this codebase keeps re-learning, so it is excluded by
+# id at the only place that reads collections.
+WIX_ALL_PRODUCTS_COLLECTION_ID = "00000000-000000-000000-000000000001"
 _WIX_SITE_ID_QUERY_KEYS = (
     "siteId",
     "site_id",
