@@ -115,6 +115,30 @@ async def catalog_health() -> Dict[str, Any]:
         # only moves on the reconciler's 6h cadence (plus event pokes), and
         # the query is a full truth-CTE aggregate on a 140ms-RTT shared DB —
         # a polled health endpoint must not re-pay it every hit.
+        # WHY the 5,561-row question needed database credentials to answer.
+        # This endpoint reported `quality_blocked` as one number, and the only
+        # way to learn WHY those rows were blocked was a psql session against
+        # the Railway proxy — which is how the 2026-07-28 audit spent its first
+        # hour. blocker_code lives on index_pipeline_state (content_key grain,
+        # ~11k rows), so the histogram is one cheap GROUP BY; the expensive
+        # per-row renderability question deliberately stays OUT of it.
+        #
+        # Grain note, stated so the two numbers are not "reconciled" into a bug
+        # report: `cohorts` above counts catalog_products ROWS via trust;
+        # this counts index_pipeline_state CONTENT_KEYS. They will not match,
+        # and rows blocked by trust for row-level reasons (tombstones,
+        # quarantine) appear here under blocker='none' when their KEY is
+        # serving-eligible.
+        blocker_rows = await database.fetch_all(
+            """
+            SELECT COALESCE(blocker_code, '(null)') AS blocker, count(*) AS n
+            FROM index_pipeline_state
+            WHERE serving_eligible IS NOT TRUE
+            GROUP BY 1
+            ORDER BY 2 DESC
+            """
+        )
+        blocker_histogram = {r["blocker"]: int(r["n"] or 0) for r in blocker_rows}
         apv_drift = await _cached_agent_pdp_view_drift(database)
         # P1.13 — freshness of catalog_products.pdp_will_render. The store's own
         # instruction before any consumer reads that column is to "prove
@@ -134,6 +158,7 @@ async def catalog_health() -> Dict[str, Any]:
             "serving_pct_of_corpus": round(100.0 * public / corpus, 1) if corpus else None,
             "cohorts": totals,
             "by_source_system": by_source,
+            "blocker_histogram": blocker_histogram,
             "agent_pdp_view_drift": apv_drift,
             "pdp_will_render_drift": will_render_drift,
         }
