@@ -697,9 +697,22 @@ def _build_canonical_offer_node(
     if _official_source_seller_derived_enabled():
         official_source = bool(is_first_party)
     else:
-        official_source = bool(is_first_party) or _is_official_brand_source(
-            row.get("offer_source_domain") or row.get("source_domain"),
-            row.get("canonical_url"),
+        # The legacy disjunct is only evidence when its two hosts are
+        # INDEPENDENTLY sourced. On the external_referral lane they never are:
+        # both source_domain and canonical_url are written from the same seed
+        # record, so the comparison is the measured 100% tautology above — and
+        # source_domain is now stamped on every mirror offer (it used to be
+        # NULL on ~4,000 of them, which was the only thing keeping the false
+        # positive count at 2,646 instead of the whole lane). So the lane is
+        # excluded here, flag state notwithstanding: an observed redirect offer
+        # can only be "official" via its stored seller identity
+        # (is_first_party), never via a self-comparison.
+        official_source = bool(is_first_party) or (
+            catalog_track != "external_referral"
+            and _is_official_brand_source(
+                row.get("offer_source_domain") or row.get("source_domain"),
+                row.get("canonical_url"),
+            )
         )
     return OfferNode(
         offer_id=str(row.get("offer_id") or ""),

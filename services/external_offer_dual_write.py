@@ -42,6 +42,7 @@ from typing import Any, Dict, Optional
 
 from db.database import database
 from services.offer_seller_identity import host_from_url, is_known_retailer
+from services.storefront_currency import normalize_domain, plausible_domain
 
 logger = logging.getLogger(__name__)
 
@@ -194,6 +195,27 @@ async def upsert_catalog_offer_from_seed_row(
         "external_seed_id": row_dict.get("id"),
         "market": row_dict.get("market"),
     }
+    # source_domain makes the offer visible to the domain-keyed machinery
+    # (scripts/audit_offer_currency.py's scan keys on this column, and the
+    # trust upserter's `domain`-quarantine matching reaches offers through it
+    # directly rather than via its eps.domain fallback). It was never written
+    # on this path, which produced the 4,705-offer audit blind spot — every
+    # mirrored offer was invisible to the weekly currency audit. Each seed
+    # field is tried independently: a junk `domain` value ('N/A') must not
+    # shadow a perfectly good canonical/destination URL host, and a host that
+    # fails the plausibility gate is dropped rather than written forever
+    # (the ON CONFLICT below is fill-only, so junk would be permanent). None
+    # when the seed carries no domain evidence — never fabricated.
+    source_domain_value = None
+    for candidate in (
+        row_dict.get("domain"),
+        row_dict.get("canonical_url"),
+        row_dict.get("destination_url"),
+    ):
+        host = normalize_domain(candidate)
+        if plausible_domain(host):
+            source_domain_value = host
+            break
     await database.execute(
         """
         INSERT INTO catalog_offers
@@ -202,14 +224,15 @@ async def upsert_catalog_offer_from_seed_row(
            offer_type, is_first_party, offer_mode,
            channel, availability, inventory_quantity, currency,
            list_price, merchant_effective_price, estimated_best_price,
-           price_confidence, source_system, source_ref, offer_payload)
+           price_confidence, source_system, source_ref, source_domain,
+           offer_payload)
         VALUES
           (:offer_id, :sku_key, :product_key, :merchant_id,
            :catalog_track, :truth_tier, :readiness_tier,
            :offer_type, :is_first_party, :offer_mode,
            :channel, :availability, :inventory_quantity, :currency,
            :list_price, :merchant_effective_price, :estimated_best_price,
-           :price_confidence, :source_system, :source_ref,
+           :price_confidence, :source_system, :source_ref, :source_domain,
            CAST(:offer_payload AS jsonb))
         ON CONFLICT (offer_id) DO UPDATE SET
           -- A KNOWN-retailer host is AUTHORITATIVE third-party evidence, so it
@@ -233,6 +256,11 @@ async def upsert_catalog_offer_from_seed_row(
           merchant_effective_price = EXCLUDED.merchant_effective_price,
           estimated_best_price = EXCLUDED.estimated_best_price,
           price_confidence = EXCLUDED.price_confidence,
+          -- Fill-only: a source_domain already on the row (ingest-written or
+          -- audit-backfilled) is never clobbered — same correct-only posture as
+          -- the currency backfill. A later seed-domain edit is the audit's job
+          -- to reconcile, not this ingest upsert's.
+          source_domain = COALESCE(catalog_offers.source_domain, EXCLUDED.source_domain),
           offer_payload = EXCLUDED.offer_payload,
           updated_at = NOW()
         """,
@@ -259,6 +287,7 @@ async def upsert_catalog_offer_from_seed_row(
             ),
             "source_system": OFFER_SOURCE_SYSTEM,
             "source_ref": row_dict.get("id"),
+            "source_domain": source_domain_value,
             "offer_payload": json.dumps(
                 offer_payload, ensure_ascii=False, default=_json_default
             ),

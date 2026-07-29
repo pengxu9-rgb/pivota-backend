@@ -71,15 +71,17 @@ async def _run(args: argparse.Namespace) -> int:
     try:
         rows = [dict(r) for r in await database.fetch_all(
             _DOMAINS_SQL, {"min_offers": args.min_offers})]
-        # NOTE: external_product_seeds_mirror_v1 offers are written without
-        # source_domain, so they are invisible to this domain-keyed scan. That
-        # cohort needs its own currency audit keyed off the seed's domain — called
-        # out here rather than silently skipped.
+        # NOTE: offers written without source_domain (historically the whole
+        # external_product_seeds_mirror_v1 lane) are invisible to this
+        # domain-keyed scan. scripts/audit_domainless_offer_currency.py covers
+        # them by deriving the domain from seed provenance, and its --apply
+        # backfills source_domain so this count trends to zero.
         no_domain = await database.fetch_val(
             "SELECT count(*) FROM catalog_offers WHERE suppressed_at IS NULL "
             "AND list_price > 0 AND coalesce(source_domain,'') = ''")
         print(f"scanning {len(rows)} source domains (>= {args.min_offers} live offers)")
-        print(f"NOTE: {no_domain} live offers have no source_domain (not scanned here)\n")
+        print(f"NOTE: {no_domain} live offers have no source_domain (not scanned here — "
+              f"run scripts/audit_domainless_offer_currency.py for that cohort)\n")
 
         mismatches: List[Dict[str, Any]] = []
         wholesale: List[Dict[str, Any]] = []

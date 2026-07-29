@@ -201,3 +201,77 @@ async def test_sync_is_fail_soft(monkeypatch):
 
     monkeypatch.setattr(mod, "database", BoomDB())
     assert (await mod.sync_offer_for_seed("s1"))["status"] == "error"  # never raises
+
+
+# ---- source_domain stamping (the 4,705-offer audit blind spot fix) -----------
+# The projection historically wrote NO source_domain, which made every mirrored
+# offer invisible to the domain-keyed currency audit and to `domain` quarantine
+# matches. These pin the stamp and its precedence/normalization.
+
+
+@pytest.mark.asyncio
+async def test_offer_carries_normalized_source_domain(monkeypatch):
+    fake = FakeDB()
+    monkeypatch.setattr(mod, "database", fake)
+    await mod.upsert_catalog_offer_from_seed_row(
+        _REAL_PK,
+        {"id": "s1", "domain": "https://www.Oiad.com/", "price_amount": 12.0},
+        merchant_id=_REAL_SELLER,
+    )
+    call = fake.executed[0]
+    assert call["params"]["source_domain"] == "oiad.com"
+    assert "source_domain" in call["sql"]
+    # fill-only on conflict: an already-present source_domain is never clobbered
+    assert (
+        "source_domain = COALESCE(catalog_offers.source_domain, EXCLUDED.source_domain)"
+        in call["sql"]
+    )
+
+
+@pytest.mark.asyncio
+async def test_source_domain_falls_back_to_url_hosts(monkeypatch):
+    fake = FakeDB()
+    monkeypatch.setattr(mod, "database", fake)
+    await mod.upsert_catalog_offer_from_seed_row(
+        _REAL_PK,
+        {"id": "s1", "canonical_url": "https://shop.example/p/1", "price_amount": 12.0},
+        merchant_id=_REAL_SELLER,
+    )
+    assert fake.executed[0]["params"]["source_domain"] == "shop.example"
+
+
+@pytest.mark.asyncio
+async def test_domainless_seed_stamps_null_never_fabricates(monkeypatch):
+    fake = FakeDB()
+    monkeypatch.setattr(mod, "database", fake)
+    await mod.upsert_catalog_offer_from_seed_row(
+        _REAL_PK, {"id": "s1", "price_amount": 12.0}, merchant_id=_REAL_SELLER
+    )
+    assert fake.executed[0]["params"]["source_domain"] is None
+
+
+@pytest.mark.asyncio
+async def test_junk_seed_domain_does_not_shadow_a_good_url_host(monkeypatch):
+    """Review mutation G: reverting the per-candidate plausibility gate to the
+    old single-shot `normalize_domain(evidence_domain) or None` was caught by
+    nothing. A seed with domain='N/A' and a good canonical_url would then be
+    stamped source_domain='n' at ingest — permanently, because the ON CONFLICT
+    is fill-only — shadowing the usable host. Pin the fall-through."""
+    fake = FakeDB()
+    monkeypatch.setattr(mod, "database", fake)
+    await mod.upsert_catalog_offer_from_seed_row(
+        _REAL_PK,
+        {"id": "s1", "domain": "N/A",
+         "canonical_url": "https://shop.example/p/1", "price_amount": 12.0},
+        merchant_id=_REAL_SELLER,
+    )
+    assert fake.executed[0]["params"]["source_domain"] == "shop.example"
+
+    # junk everywhere -> NULL, never a fabricated or mangled host
+    fake2 = FakeDB()
+    monkeypatch.setattr(mod, "database", fake2)
+    await mod.upsert_catalog_offer_from_seed_row(
+        _REAL_PK, {"id": "s1", "domain": "unknown", "price_amount": 12.0},
+        merchant_id=_REAL_SELLER,
+    )
+    assert fake2.executed[0]["params"]["source_domain"] is None
