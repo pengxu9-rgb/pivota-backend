@@ -191,11 +191,13 @@ def test_sample_sql_returns_the_offending_keys(pg_engine):
 
 def test_threshold_is_the_measured_baseline_not_zero_and_not_the_raw_count():
     chk = _check()
-    assert chk["default_threshold"] == 4, (
-        "4 = the clean, unexplained residual measured on prod 2026-07-29. "
-        "0 would leave the check permanently red and therefore deaf; 2,265 (the "
-        "raw count) would bless the known-dark lane and the retired rows, making "
-        "it deaf to a 500-row regression."
+    assert chk["default_threshold"] == 0, (
+        "0 = the re-measured baseline after the four url_audit stubs were "
+        "retired on 2026-07-29 (reason 'url_audit_stub_retired_20260729'). "
+        "The threshold started at 4 — the clean unexplained residual at ship "
+        "time — and the module convention makes lowering mandatory the moment "
+        "the true count drops. If this assertion is being edited UPWARD, that "
+        "is a regression being blessed, not a baseline being corrected."
     )
     assert chk["env"] == "CATALOG_INVARIANT_SERVING_NOT_RENDERABLE_THRESHOLD"
 
