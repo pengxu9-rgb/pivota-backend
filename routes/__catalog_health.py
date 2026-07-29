@@ -21,6 +21,15 @@ router = APIRouter(tags=["catalog-health"])
 # One bucket per row. Precedence: no trust row first (invisible), then
 # retired-by-design (deliberate removals — never a quality gap), then the
 # decision tiers. 'quality_blocked' = the only recoverable blocked bucket.
+#
+# `foreign_market` split out 2026-07-29: keys blocked ONLY because no USD
+# offer exists (blocker_code = 'no_us_offer') are honestly-labelled foreign
+# sellers the founder ruled off the US surface (see the 2026-07-22/23 currency
+# audits) — a standing DECISION, not a recoverable quality gap. Leaving them in
+# `quality_blocked` overstated the workable backlog by ~800 keys and made the
+# 2026-07-28 audit re-derive the split from psql. The IPS join is on
+# content_key (the blocker's grain); a product row with no IPS row keeps its
+# trust-derived bucket.
 _COHORT_SQL = """
     SELECT
         COALESCE(cp.source_system, cp.platform, 'unknown') AS source_system,
@@ -33,6 +42,8 @@ _COHORT_SQL = """
             WHEN crt.serving_decision = 'public' THEN 'public'
             WHEN crt.serving_decision = 'shadow' THEN 'identity_gated'
             WHEN 'INDEX_NOT_SERVING_ELIGIBLE' = ANY(crt.serving_reason_codes)
+                 AND ips.blocker_code = 'no_us_offer' THEN 'foreign_market'
+            WHEN 'INDEX_NOT_SERVING_ELIGIBLE' = ANY(crt.serving_reason_codes)
                 THEN 'quality_blocked'
             ELSE 'lifecycle_blocked'
         END AS cohort,
@@ -41,6 +52,8 @@ _COHORT_SQL = """
     LEFT JOIN catalog_row_trust crt
         ON crt.subject_type = 'product'
        AND crt.subject_key  = cp.product_key
+    LEFT JOIN index_pipeline_state ips
+        ON ips.content_key = cp.content_key
     GROUP BY 1, 2
 """
 
@@ -107,7 +120,17 @@ async def catalog_health() -> Dict[str, Any]:
         catalog_total = sum(totals.values())
         # The serving corpus excludes deliberate removals and invisible rows —
         # THIS is the denominator quality work should be measured against.
-        corpus = catalog_total - totals.get("retired_by_design", 0) - totals.get("no_trust_row", 0)
+        # `foreign_market` is excluded for the same reason retired_by_design
+        # is: a key with only non-USD offers cannot serve the US surface by
+        # STANDING DECISION (2026-07-23 disposition), so counting it in the
+        # denominator makes the quality-work percentage answer a question
+        # nobody is working on. The bucket is still reported in `cohorts`.
+        corpus = (
+            catalog_total
+            - totals.get("retired_by_design", 0)
+            - totals.get("no_trust_row", 0)
+            - totals.get("foreign_market", 0)
+        )
         public = totals.get("public", 0)
         # ADR-012 Phase 1 — agent_pdp_view drift (stale + missing-vs-public
         # view rows). Same count the reconciler alarms on; best-effort so a
