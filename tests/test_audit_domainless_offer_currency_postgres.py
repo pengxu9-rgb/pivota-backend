@@ -127,7 +127,7 @@ def _seed_fixtures(engine):
              "src": _SOURCES_KEY, "ref": f"{_PREFIX}seed-b"})
 
         def offer(offer_id, product_key, source_ref=None, payload=None,
-                  source_domain=None, suppressed=False):
+                  source_domain=None, suppressed=False, source_system=_SOURCES_KEY):
             conn.execute(text(
                 "INSERT INTO catalog_offers (offer_id, sku_key, product_key, merchant_id,"
                 " currency, list_price, source_system, source_ref, source_domain,"
@@ -135,7 +135,7 @@ def _seed_fixtures(engine):
                 "(:o, :sk, :pk, 'external_seed_gate', 'USD', 400000.0, :ss, :ref,"
                 " :dom, CAST(:pl AS jsonb), CASE WHEN CAST(:sup AS boolean) THEN NOW() ELSE NULL END)"),
                 {"o": offer_id, "sk": f"{offer_id}::sku", "pk": product_key,
-                 "ss": _SOURCES_KEY, "ref": source_ref, "dom": source_domain,
+                 "ss": source_system, "ref": source_ref, "dom": source_domain,
                  "pl": json.dumps(payload) if payload is not None else None,
                  "sup": suppressed})
 
@@ -152,6 +152,11 @@ def _seed_fixtures(engine):
         # already has source_domain -> must NOT appear in the scan
         offer(f"{_PREFIX}offer-has-domain", f"{_PREFIX}pk-has-domain",
               source_domain="already.example")
+        # out-of-scope source_system (operator-curated currency lane) -> must
+        # NOT appear in the scan AND must be unreachable by the backfill even
+        # if a mapping names it
+        offer(f"{_PREFIX}offer-out-of-scope", f"{_PREFIX}pk-out-of-scope",
+              source_system="retailer_offer_attach_v1")
 
 
 def _mod():
@@ -210,6 +215,10 @@ async def test_backfill_writes_returns_and_stays_fill_only(pg_schema):
         # adversarial: mapping names a row that ALREADY has a domain — the
         # fill-only guard must make it a no-op, not an overwrite
         {"offer_id": f"{_PREFIX}offer-has-domain", "source_domain": "attacker.example"},
+        # adversarial: mapping names an out-of-scope source_system row — the
+        # `source_system = ANY(:sources)` predicate (not just the string
+        # assertion in the unit file) must keep it unreachable
+        {"offer_id": f"{_PREFIX}offer-out-of-scope", "source_domain": "attacker.example"},
     ]
     params = {"mappings": json.dumps(mapping, sort_keys=True),
               "sources": list(mod._SEED_SOURCES)}
@@ -235,6 +244,10 @@ async def test_backfill_writes_returns_and_stays_fill_only(pg_schema):
     assert got[f"{_PREFIX}offer-own-seed"] == "oiad.com"
     assert got[f"{_PREFIX}offer-has-domain"] == "already.example", (
         "fill-only guard breached: an existing source_domain was overwritten"
+    )
+    assert f"{_PREFIX}offer-out-of-scope" not in got, (
+        "source_system scope breached: the backfill wrote a row outside the "
+        "seed-source lanes despite the mapping naming it"
     )
 
     # and the backfilled row has left the domain-less cohort for good

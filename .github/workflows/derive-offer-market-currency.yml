@@ -128,8 +128,9 @@ jobs:
         # companion derives each such offer's storefront from seed provenance
         # and reports stamped-vs-actual currency. ALWAYS a dry-run here —
         # backfilling source_domain (its --apply) is a reviewed, token-gated
-        # manual step, never scheduled.
-        if: ${{ always() }}
+        # manual step, never scheduled. Default sequencing (no `if: always()`):
+        # if checkout/deps or the DATABASE_URL guard failed above, re-running
+        # against the same missing prerequisites would only add noise.
         shell: bash
         env:
           RUN_ID: ${{ github.run_id }}

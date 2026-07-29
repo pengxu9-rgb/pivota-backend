@@ -336,3 +336,29 @@ def test_price_alert_ignores_plausible_and_non_usd_rows(monkeypatch, capsys):
                  currency="JPY", list_price=22400.0)])
     out = capsys.readouterr().out
     assert "IMPLAUSIBLE-PRICE REVIEW LIST: 0" in out
+
+
+def test_backfill_does_not_bump_updated_at():
+    """source_domain is provenance metadata, not offer truth. Bumping
+    updated_at on ~4,000 rows would put every touched content_key into
+    multi-day PDP-reconciler drift for a write nothing renders."""
+    assert "updated_at" not in mod._BACKFILL_SQL
+
+
+def test_junk_domain_candidates_fall_through_never_written():
+    """normalize_domain parses placeholders into permanent-looking junk
+    ('N/A' -> 'n'). A junk value must not shadow a good URL host in a later
+    field, and junk-everywhere must stay unresolved (the backfill is fill-only,
+    so a junk write could never be corrected)."""
+    domain, rule = mod.derive_offer_domain(_row(
+        offer_seed_domain="N/A",
+        offer_seed_canonical_url="https://www.oiad.com/p/1"))
+    assert (domain, rule) == ("oiad.com", "offer_seed")
+
+    domain, rule = mod.derive_offer_domain(_row(offer_seed_domain="unknown"))
+    assert domain is None
+    assert rule == "unresolved"
+
+    domain, rule = mod.derive_offer_domain(_row(attached_domains=["N/A", "TBD"]))
+    assert domain is None
+    assert rule == "unresolved"

@@ -33,13 +33,18 @@ plus the `wholesale.*` channel flag.
 
 Dry-run by default; it never edits anything. `--apply` (gated on an explicit
 --confirm token, like the sibling scripts) performs the DURABLE fix: backfill
-`source_domain` onto the confidently-derived offers, which is what makes the
-weekly "Derive Offer Market/Currency from Storefront" audit — and the `domain`
-quarantine match, which also compares against source_domain — cover this cohort
-permanently. `--quarantine-mismatched` additionally quarantines the storefronts
-proven mispriced, mirroring the main audit's --apply (and, per the standing
-lesson: quarantine alone never clears the served surface — live_read is a
-separate lever).
+`source_domain` onto the confidently-derived offers. That makes the weekly
+"Derive Offer Market/Currency from Storefront" audit and scripts/
+audit_offer_currency.py's domain-keyed scan cover this cohort permanently, and
+lets the trust upserter's `domain`-quarantine matching reach these offers
+through the offers column directly (today it reaches them only via its
+eps.domain fallback; note the serving-side anti-join keys on
+catalog_products.source_domain, which this script does not fill — that
+product/sku-level backfill is scripts/backfill_catalog_source_domain.py's job).
+`--quarantine-mismatched` additionally quarantines the storefronts proven
+mispriced, mirroring the main audit's --apply (and, per the standing lesson:
+quarantine alone never clears the served surface — live_read is a separate
+lever).
 
   DATABASE_URL=... python -m scripts.audit_domainless_offer_currency
   DATABASE_URL=... python -m scripts.audit_domainless_offer_currency \
@@ -66,6 +71,7 @@ from services.storefront_currency import (  # noqa: E402
     currency_mismatch,
     fetch_storefront_meta,
     normalize_domain,
+    plausible_domain,
 )
 
 CONFIRM_TOKEN = "AUDIT_DOMAINLESS_OFFER_CURRENCY"
@@ -132,6 +138,13 @@ _SCAN_SQL = """
 # is what lands, even if a seed refreshes in between. The NULL/empty guard makes
 # it fill-only and idempotent: a row that already carries a source_domain
 # (ingest-written, or backfilled by an earlier run) is structurally untouchable.
+#
+# updated_at is deliberately NOT touched. source_domain is provenance metadata,
+# not offer truth — and the PDP reconciler treats MAX(co.updated_at) as
+# truth-changed, so bumping it on ~4,000 rows would put every touched
+# content_key into multi-day drift (300 keys per 6h cron pass) and hold the
+# drift count above the alert threshold the whole time, for a write that
+# changes nothing any PDP renders.
 _BACKFILL_SQL = """
     WITH mapping AS (
         SELECT offer_id, source_domain
@@ -139,8 +152,7 @@ _BACKFILL_SQL = """
              AS m(offer_id text, source_domain text)
     )
     UPDATE catalog_offers o
-       SET source_domain = m.source_domain,
-           updated_at = NOW()
+       SET source_domain = m.source_domain
       FROM mapping m
      WHERE o.offer_id = m.offer_id
        AND o.source_system = ANY(:sources)
@@ -183,11 +195,15 @@ def derive_offer_domain(row: Dict[str, Any]) -> Tuple[Optional[str], str]:
                           "product_seed_destination_url")),
     ):
         for field in fields:
+            # plausible_domain gates every candidate: the backfill is fill-only,
+            # so a placeholder that parses ('N/A' -> 'n', 'unknown') would be a
+            # PERMANENT junk write — and it must not shadow a good URL host in a
+            # later field either.
             domain = normalize_domain(row.get(field))
-            if domain:
+            if plausible_domain(domain):
                 return domain, rule
     attached = sorted({normalize_domain(d) for d in (row.get("attached_domains") or [])
-                       if normalize_domain(d)})
+                       if plausible_domain(normalize_domain(d))})
     if len(attached) == 1:
         return attached[0], "attached_seed_unique"
     if len(attached) > 1:
@@ -289,14 +305,19 @@ async def _run(args: argparse.Namespace) -> int:
         # price whose magnitude belongs to another currency. This never decides
         # anything (per the standing lesson: price is a detector, not a decision
         # basis) — it lists the rows a human should eyeball.
+        def _price(r: Dict[str, Any]) -> float:
+            try:
+                return float(r.get("list_price") or 0)
+            except (TypeError, ValueError):
+                return 0.0
+
         alerts = [(r, derive_offer_domain(r)[0]) for r in rows
-                  if r.get("currency") == "USD"
-                  and float(r.get("list_price") or 0) >= args.price_alert]
-        alerts.sort(key=lambda t: -float(t[0].get("list_price") or 0))
+                  if r.get("currency") == "USD" and _price(r) >= args.price_alert]
+        alerts.sort(key=lambda t: -_price(t[0]))
         print(f"\n=== IMPLAUSIBLE-PRICE REVIEW LIST: {len(alerts)} USD-stamped rows "
               f">= {args.price_alert:.0f} ===")
         for r, domain in alerts[:20]:
-            print(f"  {str(domain or '?')[:30]:30} {float(r['list_price']):>12.2f} USD "
+            print(f"  {str(domain or '?')[:30]:30} {_price(r):>12.2f} USD "
                   f"{'suppressed' if r['is_suppressed'] else 'live':>10} "
                   f"offer={r['offer_id']}")
         if len(alerts) > 20:

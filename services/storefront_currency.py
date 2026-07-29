@@ -50,6 +50,15 @@ def normalize_domain(value: Optional[str]) -> str:
     return host[4:] if host.startswith("www.") else host
 
 
+def plausible_domain(host: Optional[str]) -> bool:
+    """Sanity gate for PERMANENT domain writes (fill-only backfills can never be
+    corrected by a later pass). normalize_domain is a parser, not a validator:
+    it happily returns 'n' for 'N/A', 'unknown', or 'a b.com'. A storefront host
+    must carry at least one dot and no whitespace."""
+    h = str(host or "")
+    return bool(h) and "." in h and not any(c.isspace() for c in h)
+
+
 def parse_meta(raw: Optional[str]) -> Optional[Dict[str, Any]]:
     """Pull {currency, country, domain, name} out of a Shopify /meta.json body."""
     if not raw:

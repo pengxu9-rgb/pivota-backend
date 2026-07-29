@@ -42,7 +42,7 @@ from typing import Any, Dict, Optional
 
 from db.database import database
 from services.offer_seller_identity import host_from_url, is_known_retailer
-from services.storefront_currency import normalize_domain
+from services.storefront_currency import normalize_domain, plausible_domain
 
 logger = logging.getLogger(__name__)
 
@@ -196,13 +196,26 @@ async def upsert_catalog_offer_from_seed_row(
         "market": row_dict.get("market"),
     }
     # source_domain makes the offer visible to the domain-keyed machinery
-    # (scripts/audit_offer_currency.py's scan and the `domain` quarantine
-    # match, which both key on this column). It was never written on this
-    # path, which produced the 4,705-offer audit blind spot — every mirrored
-    # offer was invisible to the weekly currency audit. Normalized to the bare
-    # host so it groups with merchant-synced rows; None when the seed carries
-    # no domain evidence (never fabricated).
-    source_domain_value = normalize_domain(evidence_domain) or None
+    # (scripts/audit_offer_currency.py's scan keys on this column, and the
+    # trust upserter's `domain`-quarantine matching reaches offers through it
+    # directly rather than via its eps.domain fallback). It was never written
+    # on this path, which produced the 4,705-offer audit blind spot — every
+    # mirrored offer was invisible to the weekly currency audit. Each seed
+    # field is tried independently: a junk `domain` value ('N/A') must not
+    # shadow a perfectly good canonical/destination URL host, and a host that
+    # fails the plausibility gate is dropped rather than written forever
+    # (the ON CONFLICT below is fill-only, so junk would be permanent). None
+    # when the seed carries no domain evidence — never fabricated.
+    source_domain_value = None
+    for candidate in (
+        row_dict.get("domain"),
+        row_dict.get("canonical_url"),
+        row_dict.get("destination_url"),
+    ):
+        host = normalize_domain(candidate)
+        if plausible_domain(host):
+            source_domain_value = host
+            break
     await database.execute(
         """
         INSERT INTO catalog_offers
