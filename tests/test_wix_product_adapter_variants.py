@@ -368,3 +368,45 @@ def test_wix_convert_product_emits_explicit_empty_tags():
     # ingest_standard_products write into catalog_products.tags relies
     # on this being a list.
     assert product.tags == []
+
+
+def _brand_fixture(brand_value):
+    wp = {
+        "id": "prod_brand",
+        "name": "Arolinne Calming Dog Harness",
+        "description": "A padded, breathable harness for small dogs.",
+        "visible": True,
+        "priceData": {"price": 24.0, "currency": "USD"},
+        "stock": {"quantity": 5, "inStock": True, "trackQuantity": True},
+    }
+    if brand_value is not None:
+        wp["brand"] = brand_value
+    return wp
+
+
+def test_wix_convert_product_maps_brand_to_vendor():
+    """Wix stores-reader v1 carries `brand` top-level; dropping it starved the
+    identity layer of the ONE field it cannot live without.
+
+    catalog_sync derives brand from `product.vendor or metadata.brand`, and
+    `make_content_key(brand, title, barcode)` yields NO content_key for a
+    brandless row — which cascades: no index_pipeline_state row possible (its
+    PK is content_key), no eligibility, gateway gate 1 fails closed. Measured
+    on the 2026-07-29 Wix pilot: 20/20 synced rows arrived brandless with
+    content_key NULL and could never serve. Shopify has always mapped `vendor`.
+    """
+    product = WixProductAdapter._convert_product(
+        _brand_fixture("Arolinne"), merchant_id="merch_test"
+    )
+    assert product.vendor == "Arolinne"
+
+
+def test_wix_convert_product_brand_absent_or_blank_is_none():
+    # Blank must behave like absent: `""` would otherwise thread through
+    # catalog_sync's `str(product.vendor or ...)` and still produce no
+    # content_key, but as an empty-string brand rather than an honest None.
+    for value in (None, "", "   "):
+        product = WixProductAdapter._convert_product(
+            _brand_fixture(value), merchant_id="merch_test"
+        )
+        assert product.vendor is None, f"brand={value!r} must map to vendor=None"

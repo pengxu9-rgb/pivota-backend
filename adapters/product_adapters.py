@@ -967,6 +967,20 @@ class WixProductAdapter:
             barcode=variants_out[0].barcode if len(variants_out) == 1 else WixProductAdapter._pick_wix_identifier(wp),
             image_url=image_url,
             platform="wix",
+            # Wix stores-reader v1 carries the product's brand as a top-level
+            # string; until 2026-07-29 this adapter dropped it entirely — the
+            # ONLY StandardProduct field the identity layer cannot live
+            # without. catalog_sync derives brand from `product.vendor or
+            # metadata.brand`, and `make_content_key(brand, title, barcode)`
+            # yields NO content_key for a brandless row, which cascades:
+            # content_key NULL -> no index_pipeline_state row possible (PK
+            # content_key) -> no eligibility -> gateway gate 1 fails closed ->
+            # the row can never serve, score, or be elected, silently.
+            # Measured on the 2026-07-29 Wix pilot: 20/20 rows arrived
+            # brandless with content_key NULL. Shopify has always mapped
+            # `vendor`; this brings Wix to parity. Empty/whitespace collapses
+            # to None so a blank Wix field behaves like an absent one.
+            vendor=str(wp.get("brand") or "").strip() or None,
             merchant_id=merchant_id,
             status=ProductStatus.ACTIVE,
             variants=variants_out,
