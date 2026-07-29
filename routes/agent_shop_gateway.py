@@ -7606,6 +7606,49 @@ async def _handle_find_products_multi(
                 )
     except Exception:
         pass  # never let the rig filter break search
+    # Currency-defect exclusion, at the SAME choke point and for the same reason.
+    # On 2026-07-28 this lane published seven Mintree rows priced 847-3927.70 and
+    # labelled "USD" on the public UNAUTHENTICATED ACP feed — rupee prices served
+    # as US dollars. The suppression that blocks them on every other door lives on
+    # catalog_offers, and this lane reads none of it. It cannot be folded into the
+    # rig filter above: merchant_id is explicitly None on external-seed rows, so
+    # that filter structurally cannot see them. See services/offer_currency_policy
+    # — the gate READS catalog_offers rather than restating the rule, because a
+    # fourth copy of a predicate is how the first three drifted.
+    try:
+        if isinstance(result, dict) and isinstance(result.get("products"), list):
+            from db.database import database as _db
+            from services.offer_currency_policy import (
+                filter_out_currency_defect_rows,
+                get_currency_defect_domains,
+            )
+
+            defect_domains = await get_currency_defect_domains(_db)
+            before = len(result["products"])
+            result["products"] = filter_out_currency_defect_rows(
+                result["products"], defect_domains
+            )
+            dropped = before - len(result["products"])
+            if dropped:
+                # Keep the counters honest so a shrunken slate is not read as a
+                # ranking regression — same contract as the rig filter.
+                if isinstance(result.get("total"), int):
+                    result["total"] = max(0, result["total"] - dropped)
+                result["page_size"] = len(result["products"])
+                logger.info(
+                    "find_products_multi.excluded_currency_defect",
+                    extra={"dropped": dropped, "surface": "find_products_multi"},
+                )
+    except Exception:
+        # Never break search — but never fail SILENTLY either. Failing open here
+        # means mislabelled prices are publishable again, which is precisely the
+        # state this gate exists to end; a bare `pass` would recreate the bug and
+        # leave nothing to notice it by.
+        logger.warning(
+            "find_products_multi.currency_defect_filter_failed — "
+            "slate served WITHOUT the currency gate",
+            exc_info=True,
+        )
     try:
         if isinstance(result, dict):
             await _attach_connected_product_redirects(result.get("products"), tool="find_products_multi")
