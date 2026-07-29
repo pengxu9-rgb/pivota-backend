@@ -2,16 +2,24 @@ name: CI Entrypoint
 
 # THE ONE CHECK THAT ALWAYS RUNS — so that a required check can exist at all.
 #
-# WHY THIS IS NEEDED. On 2026-07-29 branch protection was configured on this repo
-# with three required status checks. It immediately blocked a legitimate PR
-# forever: `execute real routes on real Postgres` is path-filtered to
-# routes/services/db/models, the PR touched only `.github/workflows/`, so the
-# check never reported — and a required check that never reports never passes.
+# WHY THIS IS NEEDED. Branch protection was configured here 2026-07-29 with three
+# required status checks and immediately blocked a legitimate PR forever: the
+# required gate was path-filtered, the PR touched only `.github/workflows/`, so
+# the check never reported — and a required check that never reports never
+# passes. Every pytest workflow here is path-filtered, so no single one was safe
+# to require. `CI Entrypoint` is now the required check on this repo.
 #
-# Then the wider problem surfaced: EVERY pytest workflow in this repo is
-# path-filtered. So under classic branch protection there was no safe required
-# check at all, and the protection had to be removed. Force-push and deletion
-# protection remain; the ability to block a red PR did not.
+# ⚠️ THIS FILE IS SYNCED WITH `PIVOTA-Agent/.github/workflows/ci-entrypoint.yml`.
+# They were allowed to diverge for exactly one day and the divergence was NOT
+# cosmetic: the port to PIVOTA-Agent needed matrix expansion, and building it
+# there surfaced THREE defects that were sitting latent in this copy — branch
+# filters ignored (a stacked PR becomes permanently unmergeable), a dead warning
+# path, and a glob that contradicted its own comment. Two copies of one
+# predicate is the divergence ADR-012 names. Change both, or neither.
+#
+# The matrix expansion is carried even though this repo has no matrix jobs
+# today: the alternative is remembering to add it the day someone does, which is
+# precisely the bet that produced the 92%-uncovered test suite.
 #
 # This job has NO `paths:` filter. That is its entire reason to exist: it always
 # runs, so it can always report, so it can be required.
@@ -48,7 +56,7 @@ jobs:
     runs-on: ubuntu-latest
     # Generous: it waits for the slowest real gate. The sweep is ~2min, the
     # audit gate longer. Well under the cost of a gate that cannot block.
-    timeout-minutes: 25
+    timeout-minutes: 40
     steps:
       - uses: actions/checkout@v4
         with:
@@ -67,13 +75,15 @@ jobs:
           GH_TOKEN: ${{ github.token }}
           PR_NUMBER: ${{ github.event.pull_request.number }}
           HEAD_SHA: ${{ github.event.pull_request.head.sha || github.sha }}
+          BASE_REF: ${{ github.base_ref }}
           REPO: ${{ github.repository }}
         run: |
           python - <<'PY'
-          import fnmatch, json, os, subprocess, sys, time
+          import json, os, re, subprocess, sys, time
           import yaml
 
           REPO = os.environ['REPO']
+          BASE = os.environ.get('BASE_REF') or ''
           SHA = os.environ['HEAD_SHA']
           PR = os.environ.get('PR_NUMBER')
           SELF = 'CI Entrypoint'
@@ -132,10 +142,28 @@ jobs:
           # ---- 2. which gates should have run ----------------------------------
           # Read each workflow's OWN paths. No second copy to drift.
           def matches(path, pattern):
-              # GitHub path filters: `**` spans separators, `*` does not.
-              if '**' in pattern:
-                  return fnmatch.fnmatch(path, pattern.replace('**', '*'))
-              return fnmatch.fnmatch(path, pattern)
+              """GitHub filter semantics: `**` spans `/`, a single `*` does NOT.
+
+              The first cut asserted exactly that in a comment and then called
+              `fnmatch` for non-`**` patterns, where `*` DOES cross `/`. So
+              `src/*.js` would have matched `src/a/b.js`, expected a gate that
+              never ran, waited the full deadline and hard-blocked. Code and
+              comment disagreed and the comment was the correct one.
+
+              Translated to a regex instead so the two cannot diverge again.
+              No repo pattern exercises the difference today; that is luck, not
+              design.
+              """
+              rx, i = [], 0
+              while i < len(pattern):
+                  c = pattern[i]
+                  if pattern.startswith('**', i):
+                      rx.append('.*'); i += 2
+                  elif c == '*':
+                      rx.append('[^/]*'); i += 1
+                  else:
+                      rx.append(re.escape(c)); i += 1
+              return re.fullmatch(''.join(rx), path) is not None
 
           expected = {}   # check name -> workflow file
           skipped_by_shape = []   # jobs whose check-run NAME cannot be derived
@@ -160,6 +188,22 @@ jobs:
               pr_trigger = triggers.get('pull_request') or {}
               patterns = (pr_trigger or {}).get('paths')
               ignore = (pr_trigger or {}).get('paths-ignore')
+
+              # BRANCH FILTERS, which the first cut ignored entirely.
+              # `shopping-search-release-gate.yml` declares `branches: [main]`, so
+              # on a STACKED PR (base is a feature branch) GitHub does not trigger
+              # it — while a paths-only check still expected its three jobs, waited
+              # the full deadline, and hard-failed. Once this is the required
+              # check that PR is permanently unmergeable. This repo has live
+              # stacked PRs, so it was not hypothetical: it is the same
+              # structurally-cannot-report class this file exists to prevent.
+              br_only = (pr_trigger or {}).get('branches')
+              br_skip = (pr_trigger or {}).get('branches-ignore')
+              if BASE:
+                  if br_only is not None and not any(matches(BASE, b) for b in br_only):
+                      continue
+                  if br_skip is not None and any(matches(BASE, b) for b in br_skip):
+                      continue
               # F4: GitHub names a MATRIX check run `job (v1, v2)` and a
               # REUSABLE-workflow job `caller / callee`, neither of which equals
               # the job key. Expecting the bare name would mark that gate
@@ -170,11 +214,36 @@ jobs:
               for key, spec in (doc.get('jobs') or {}).items():
                   spec = spec or {}
                   label = spec.get('name') or key
-                  if (spec.get('strategy') or {}).get('matrix') or spec.get('uses') \
-                     or (DOLLAR_BRACE in str(label)):
+                  matrix = (spec.get('strategy') or {}).get('matrix')
+
+                  if spec.get('uses') or (DOLLAR_BRACE in str(label)):
+                      # Reusable-workflow jobs are named `caller / callee`, and a
+                      # templated name cannot be resolved without runtime context.
                       unmatchable.append(label)
-                  else:
-                      names.append(label)
+                      continue
+
+                  if matrix:
+                      # GitHub names a matrix check run `label (v1, v2)` in the
+                      # matrix's key order. A SINGLE key whose value is a plain
+                      # list is fully determined here, so expand it — that is the
+                      # 8 jest shards, this repo's primary gate.
+                      #
+                      # Anything else (multi-key, `include`/`exclude`, or a value
+                      # built by `fromJSON`) is NOT determined statically, so it
+                      # is excluded and warned about rather than guessed. A wrong
+                      # guess would expect a check that never appears and hard-
+                      # block every matching PR.
+                      keys = [k for k in matrix if k not in ('include', 'exclude')]
+                      if len(keys) == 1 and 'include' not in matrix and 'exclude' not in matrix \
+                         and isinstance(matrix[keys[0]], list) \
+                         and all(isinstance(v, (str, int, float, bool)) for v in matrix[keys[0]]):
+                          for v in matrix[keys[0]]:
+                              names.append(f"{label} ({v})")
+                      else:
+                          unmatchable.append(f"{label} (matrix not statically determined)")
+                      continue
+
+                  names.append(label)
               if patterns is not None:
                   should = any(matches(f, p) for f in files for p in patterns)
               elif ignore is not None:
@@ -198,15 +267,29 @@ jobs:
           print("gates that SHOULD run for this diff:")
           for n, wf in sorted(expected.items()):
               print(f"  {n}  ({wf})")
+          # THIS LOOP WAS MISSING. `skipped_by_shape` was declared, appended to,
+          # and never read — so the "excluded and PRINTED" mechanism this file's
+          # own comments advertise did not exist. Add `include:` to the jest
+          # matrix and all 8 shards would have left `expected` silently, leaving
+          # a green entrypoint enforcing one job. Dead warning code inside the
+          # file written to kill silent no-ops.
+          for entry in skipped_by_shape:
+              print(f"::warning::gate NOT enforceable — name cannot be derived "
+                    f"statically: {entry}")
 
           # ---- 3. wait for them, then assert -----------------------------------
-          # 20 minutes: the LONGEST any gate is allowed to take
-          # (agent-reliability-suite jobs are timeout-minutes: 20; the rest 15).
+          # 35 minutes. The first cut carried the backend's comment verbatim —
+          # "agent-reliability-suite jobs are timeout-minutes: 20" — and NO such
+          # workflow exists in this repo. Real ceilings here: jest shards and both
+          # runtime smokes 30, the Shopping unit gate has none at all (GitHub
+          # default 360), travel_plans 20, pr_lite/gate 15, node:test 10. So the
+          # deadline again sat BELOW the gates it waits on, which is the exact
+          # defect the comment claimed to have fixed.
           # The first cut used 12, BELOW those ceilings — a queue backlog would
           # have reported "NEVER STARTED" and blocked a PR whose gate then
           # passed. Measured runs finish in 0-2 min, so this is headroom, not
           # latency: the loop exits as soon as everything reports.
-          DEADLINE = time.time() + 20 * 60
+          DEADLINE = time.time() + 35 * 60
           while True:
               runs = [r for doc in gh_json(f'repos/{REPO}/commits/{SHA}/check-runs?per_page=100')
                       for r in doc.get('check_runs', [])]
