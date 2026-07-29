@@ -201,3 +201,50 @@ async def test_sync_is_fail_soft(monkeypatch):
 
     monkeypatch.setattr(mod, "database", BoomDB())
     assert (await mod.sync_offer_for_seed("s1"))["status"] == "error"  # never raises
+
+
+# ---- source_domain stamping (the 4,705-offer audit blind spot fix) -----------
+# The projection historically wrote NO source_domain, which made every mirrored
+# offer invisible to the domain-keyed currency audit and to `domain` quarantine
+# matches. These pin the stamp and its precedence/normalization.
+
+
+@pytest.mark.asyncio
+async def test_offer_carries_normalized_source_domain(monkeypatch):
+    fake = FakeDB()
+    monkeypatch.setattr(mod, "database", fake)
+    await mod.upsert_catalog_offer_from_seed_row(
+        _REAL_PK,
+        {"id": "s1", "domain": "https://www.Oiad.com/", "price_amount": 12.0},
+        merchant_id=_REAL_SELLER,
+    )
+    call = fake.executed[0]
+    assert call["params"]["source_domain"] == "oiad.com"
+    assert "source_domain" in call["sql"]
+    # fill-only on conflict: an already-present source_domain is never clobbered
+    assert (
+        "source_domain = COALESCE(catalog_offers.source_domain, EXCLUDED.source_domain)"
+        in call["sql"]
+    )
+
+
+@pytest.mark.asyncio
+async def test_source_domain_falls_back_to_url_hosts(monkeypatch):
+    fake = FakeDB()
+    monkeypatch.setattr(mod, "database", fake)
+    await mod.upsert_catalog_offer_from_seed_row(
+        _REAL_PK,
+        {"id": "s1", "canonical_url": "https://shop.example/p/1", "price_amount": 12.0},
+        merchant_id=_REAL_SELLER,
+    )
+    assert fake.executed[0]["params"]["source_domain"] == "shop.example"
+
+
+@pytest.mark.asyncio
+async def test_domainless_seed_stamps_null_never_fabricates(monkeypatch):
+    fake = FakeDB()
+    monkeypatch.setattr(mod, "database", fake)
+    await mod.upsert_catalog_offer_from_seed_row(
+        _REAL_PK, {"id": "s1", "price_amount": 12.0}, merchant_id=_REAL_SELLER
+    )
+    assert fake.executed[0]["params"]["source_domain"] is None
