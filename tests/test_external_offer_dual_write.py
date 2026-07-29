@@ -248,3 +248,30 @@ async def test_domainless_seed_stamps_null_never_fabricates(monkeypatch):
         _REAL_PK, {"id": "s1", "price_amount": 12.0}, merchant_id=_REAL_SELLER
     )
     assert fake.executed[0]["params"]["source_domain"] is None
+
+
+@pytest.mark.asyncio
+async def test_junk_seed_domain_does_not_shadow_a_good_url_host(monkeypatch):
+    """Review mutation G: reverting the per-candidate plausibility gate to the
+    old single-shot `normalize_domain(evidence_domain) or None` was caught by
+    nothing. A seed with domain='N/A' and a good canonical_url would then be
+    stamped source_domain='n' at ingest — permanently, because the ON CONFLICT
+    is fill-only — shadowing the usable host. Pin the fall-through."""
+    fake = FakeDB()
+    monkeypatch.setattr(mod, "database", fake)
+    await mod.upsert_catalog_offer_from_seed_row(
+        _REAL_PK,
+        {"id": "s1", "domain": "N/A",
+         "canonical_url": "https://shop.example/p/1", "price_amount": 12.0},
+        merchant_id=_REAL_SELLER,
+    )
+    assert fake.executed[0]["params"]["source_domain"] == "shop.example"
+
+    # junk everywhere -> NULL, never a fabricated or mangled host
+    fake2 = FakeDB()
+    monkeypatch.setattr(mod, "database", fake2)
+    await mod.upsert_catalog_offer_from_seed_row(
+        _REAL_PK, {"id": "s1", "domain": "unknown", "price_amount": 12.0},
+        merchant_id=_REAL_SELLER,
+    )
+    assert fake2.executed[0]["params"]["source_domain"] is None
