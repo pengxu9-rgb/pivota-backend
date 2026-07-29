@@ -1,0 +1,859 @@
+"""Tests for the one-canonical-URL-per-content_key election.
+
+The property under test is not "the code runs" but the cross-repo invariant:
+
+    the sig the sitemap advertises == the sig every sibling PDP canonicalises at
+
+Two things can break it. The elector can crown a sig the feed never emits (a
+candidate-set mismatch — guarded by the SQL tests at the bottom, which assert
+the elector selects through the SAME shared filter the feed does), or the winner
+can move for a reason the sitemap would not have moved it for (a stickiness
+break — guarded by the picker tests).
+
+pivota-backend CI is back (the 2026-07-14 Actions billing outage is resolved)
+but runs only a partial suite, so this file is still the real gate. Anything
+here that SKIPS is not a gate at all — which is why the parity claim is a
+checked-in golden with the live node differential as a secondary guard on the
+golden itself, rather than the other way round.
+"""
+
+from __future__ import annotations
+
+import json
+import os
+
+import pytest
+from sqlalchemy import literal_column, select
+
+from services.content_canonical_election import (
+    REASON_DEDUPE_KEEPER,
+    REASON_LEXICOGRAPHIC,
+    REASON_SIG_CLASS,
+    REASON_SITEMAP_INCUMBENT,
+    REASON_SOLE_CANDIDATE,
+    REASON_STICKY,
+    candidates_query,
+    pick_winner,
+    plan_elections,
+)
+
+# Two same-class sigs. `aaa…` sorts before `fff…`, which is what makes the
+# incumbency-vs-lexicographic tests meaningful.
+SIG_A = "sig_" + "a" * 32
+SIG_F = "sig_" + "f" * 32
+SIG_LEGACY = "sig_" + "b" * 24
+
+
+class TestPickWinner:
+    def test_no_candidates_returns_none(self):
+        assert pick_winner([]) is None
+        assert pick_winner(["", "  ", None]) is None
+
+    def test_sole_candidate_wins(self):
+        assert pick_winner([SIG_A]) == (SIG_A, REASON_SOLE_CANDIDATE)
+
+    def test_stored_winner_is_kept_even_when_lexicographically_worse(self):
+        """THE stickiness rule. A stored winner outranks every ordering layer.
+
+        This is the whole reason the table exists: `sig_fff…` sorts last and
+        would lose every tiebreak, but if it is the URL we already advertise it
+        keeps the URL. Anything else throws away real index equity to buy a
+        tidier id.
+        """
+        assert pick_winner([SIG_A, SIG_F], stored=SIG_F) == (SIG_F, REASON_STICKY)
+
+    def test_stored_winner_that_is_no_longer_a_candidate_is_replaced(self):
+        """The ONE condition that moves a URL: the incumbent stopped qualifying."""
+        gone = "sig_" + "9" * 32
+        assert pick_winner([SIG_A, SIG_F], stored=gone) == (SIG_A, REASON_LEXICOGRAPHIC)
+
+    def test_sitemap_incumbent_beats_lexicographic(self):
+        """Seeding imports the live sitemap's answer, not a fresh ordering.
+
+        Without this layer the 183 groups whose incumbent is not the
+        lexicographic minimum would each swap an indexed URL for a new one on
+        the first sweep — the exact regression pivota-agent-ui#280 prevented on
+        the sitemap side.
+        """
+        assert pick_winner([SIG_A, SIG_F], incumbents={SIG_F}) == (
+            SIG_F,
+            REASON_SITEMAP_INCUMBENT,
+        )
+
+    def test_dedupe_keeper_outranks_everything_including_stickiness(self):
+        """The 2-hop canonical CHAIN this closes.
+
+        Excluding tombstones removes the loser from the pool; it does NOT make
+        the election prefer the KEEPER. With one survivor those coincide (336 of
+        340 prod groups). With two they diverge, and lexicographic picked a
+        non-keeper in 6 of the 11 such groups:
+
+            tombstone T -> keeper K   (#1833 canonicalises T at K)
+            election    -> E != K
+            sitemap     -> E
+
+        T points at K, K points at E, we advertise E. Not a contradiction — E is
+        self-canonical — but a chain Google discounts, and free to avoid.
+
+        Ranked above `stored` on purpose: a stored non-keeper winner is exactly
+        the state that PRODUCES the chain, so honouring stickiness there would
+        make the defect permanent.
+        """
+        keeper = "sig_" + "e" * 32
+        assert pick_winner([SIG_A, keeper], keeper=keeper) == (
+            keeper,
+            REASON_DEDUPE_KEEPER,
+        )
+        # ...over a stored winner, over incumbency, over lexicographic.
+        assert pick_winner(
+            [SIG_A, keeper], stored=SIG_A, incumbents={SIG_A}, keeper=keeper
+        ) == (keeper, REASON_DEDUPE_KEEPER)
+
+    def test_a_keeper_that_is_not_a_candidate_is_ignored(self):
+        """The keeper lost the eligibility or renderable filter.
+
+        Honouring it would advertise a URL we just established is not
+        advertisable — the dead-URL shape, arriving through a new door.
+        """
+        gone = "sig_" + "e" * 32
+        assert pick_winner([SIG_A, SIG_F], keeper=gone, incumbents={SIG_F}) == (
+            SIG_F,
+            REASON_SITEMAP_INCUMBENT,
+        )
+
+    def test_two_incumbents_narrow_the_pool_instead_of_falling_through(self):
+        """A pre-#280 sitemap can advertise both siblings — order AMONG them.
+
+        This test previously asserted the opposite ("fall through rather than
+        guess"), which was wrong twice: falling through ordered the whole pool
+        INCLUDING non-incumbents, so a third, brand-new sig could beat two
+        already-indexed ones; and there was no guess to avoid, since layers 2-3
+        are a total order.
+        """
+        third = "sig_" + "0" * 32  # sorts first, so it wins any un-narrowed pass
+        assert pick_winner(
+            [third, SIG_A, SIG_F], incumbents={SIG_A, SIG_F}
+        ) == (SIG_A, REASON_SITEMAP_INCUMBENT)
+
+    # GOLDEN TABLE, generated from pivota-agent-ui's REAL `preferSitemapId` by
+    # folding it pairwise left-to-right exactly as `mergeDuplicateProduct` does.
+    # Each entry is [candidate indices, incumbent indices, expected winner
+    # index] into _PARITY_SIGS.
+    #
+    # This is checked in rather than computed because the live differential
+    # below only runs where a pivota-agent-ui worktree happens to exist — i.e.
+    # never in CI, and not even locally once the worktree is removed. A parity
+    # claim that silently skips is not a gate. Regenerate with the snippet in
+    # the live test when preferSitemapId's ordering changes on purpose.
+    _PARITY_SIGS = ["sig_" + c * 32 for c in "abc"] + ["sig_" + "d" * 24]
+    _PARITY_GOLDEN = json.loads(
+        """
+        [[[0,1],[],0],[[0,1],[0],0],[[0,1],[1],1],[[0,1],[0,1],0],[[0,2],[],0],[[0,2
+        ],[0],0],[[0,2],[2],2],[[0,2],[0,2],0],[[0,3],[],0],[[0,3],[0],0],[[0,3],[3]
+        ,3],[[0,3],[0,3],0],[[1,2],[],1],[[1,2],[1],1],[[1,2],[2],2],[[1,2],[1,2],1]
+        ,[[1,3],[],1],[[1,3],[1],1],[[1,3],[3],3],[[1,3],[1,3],1],[[2,3],[],2],[[2,3
+        ],[2],2],[[2,3],[3],3],[[2,3],[2,3],2],[[0,1,2],[],0],[[0,1,2],[0],0],[[0,1,
+        2],[1],1],[[0,1,2],[2],2],[[0,1,2],[0,1],0],[[0,1,2],[0,2],0],[[0,1,2],[1,2]
+        ,1],[[0,1,2],[0,1,2],0],[[0,1,3],[],0],[[0,1,3],[0],0],[[0,1,3],[1],1],[[0,1
+        ,3],[3],3],[[0,1,3],[0,1],0],[[0,1,3],[0,3],0],[[0,1,3],[1,3],1],[[0,1,3],[0
+        ,1,3],0],[[0,2,3],[],0],[[0,2,3],[0],0],[[0,2,3],[2],2],[[0,2,3],[3],3],[[0,
+        2,3],[0,2],0],[[0,2,3],[0,3],0],[[0,2,3],[2,3],2],[[0,2,3],[0,2,3],0],[[1,2,
+        3],[],1],[[1,2,3],[1],1],[[1,2,3],[2],2],[[1,2,3],[3],3],[[1,2,3],[1,2],1],[
+        [1,2,3],[1,3],1],[[1,2,3],[2,3],2],[[1,2,3],[1,2,3],1],[[0,1,2,3],[],0],[[0,
+        1,2,3],[0],0],[[0,1,2,3],[1],1],[[0,1,2,3],[2],2],[[0,1,2,3],[3],3],[[0,1,2,
+        3],[0,1],0],[[0,1,2,3],[0,2],0],[[0,1,2,3],[0,3],0],[[0,1,2,3],[1,2],1],[[0,
+        1,2,3],[1,3],1],[[0,1,2,3],[2,3],2],[[0,1,2,3],[0,1,2],0],[[0,1,2,3],[0,1,3]
+        ,0],[[0,1,2,3],[0,2,3],0],[[0,1,2,3],[1,2,3],1],[[0,1,2,3],[0,1,2,3],0]]
+        """
+    )
+
+    def _golden_cases(self):
+        for cand_ix, inc_ix, want_ix in self._PARITY_GOLDEN:
+            yield (
+                [self._PARITY_SIGS[i] for i in cand_ix],
+                {self._PARITY_SIGS[i] for i in inc_ix},
+                self._PARITY_SIGS[want_ix],
+            )
+
+    def test_parity_with_preferSitemapId_golden(self):
+        """Runs EVERYWHERE, including CI. The gate that actually holds.
+
+        The seed's job is to import the sitemap's answer, and "import" is only
+        meaningful if the two agree. Hand-reasoning about two orderings in two
+        languages is exactly how they drifted: an earlier version of this picker
+        disagreed with the JS on 60 of these cases.
+        """
+        mismatches = [
+            (cands, sorted(inc), want, pick_winner(cands, incumbents=inc or None)[0])
+            for cands, inc, want in self._golden_cases()
+            if pick_winner(cands, incumbents=inc or None)[0] != want
+        ]
+        assert not mismatches, (
+            f"{len(mismatches)}/{len(self._PARITY_GOLDEN)} diverge from "
+            f"preferSitemapId: {mismatches[:3]}"
+        )
+
+    def test_golden_table_still_matches_the_live_preferSitemapId(self):
+        """Guards the GOLDEN itself against agent-ui changing its ordering.
+
+        Skips where no pivota-agent-ui worktree is present (CI, and any machine
+        that has not checked it out) — which is precisely why the golden above
+        exists and carries the real assertion.
+        """
+        import shutil
+        import subprocess
+
+        node = shutil.which("node")
+        lib = "/Users/pengchydan/dev/pa-ui-canonical/scripts/sitemap_lib.mjs"
+        if not node or not os.path.exists(lib):
+            pytest.skip("needs node + a pivota-agent-ui worktree; golden covers CI")
+
+        cases = [
+            {"cands": cands, "inc": sorted(inc)}
+            for cands, inc, _ in self._golden_cases()
+        ]
+        script = (
+            f"import {{ preferSitemapId }} from {json.dumps(lib)};"
+            "const cases = JSON.parse(process.argv[1]);"
+            # Fold pairwise left-to-right — exactly how mergeDuplicateProduct
+            # reduces a group of 3+ siblings.
+            "console.log(JSON.stringify(cases.map(c =>"
+            "  c.cands.reduce((a,b) => preferSitemapId(a,b,new Set(c.inc),'')))));"
+        )
+        live = json.loads(
+            subprocess.run(
+                [node, "--input-type=module", "-e", script, json.dumps(cases)],
+                capture_output=True,
+                text=True,
+                check=True,
+            ).stdout
+        )
+        expected = [want for _, _, want in self._golden_cases()]
+        assert live == expected, "preferSitemapId changed — regenerate _PARITY_GOLDEN"
+
+    def test_no_incumbent_in_group_falls_through(self):
+        assert pick_winner([SIG_A, SIG_F], incumbents={"sig_unrelated"}) == (
+            SIG_A,
+            REASON_LEXICOGRAPHIC,
+        )
+
+    def test_sig_class_beats_lexicographic(self):
+        """32-hex over legacy 24-hex, matching preferSitemapId's layer 2.
+
+        Inert against today's corpus — zero duplicate groups mix classes — but
+        it has to agree with the sitemap's fallback for the window before a new
+        content_key's first election.
+        """
+        assert pick_winner([SIG_LEGACY, SIG_F]) == (SIG_F, REASON_SIG_CLASS)
+
+    def test_ordering_is_independent_of_input_order(self):
+        """Rows arrive in whatever order the database returns them."""
+        for candidates in ([SIG_A, SIG_F], [SIG_F, SIG_A]):
+            assert pick_winner(candidates)[0] == SIG_A
+
+    def test_handles_groups_larger_than_a_pair(self):
+        """Prod has groups of 3 (25), 4 (22), 5 (1) and 7 (1) — not just pairs."""
+        group = [f"sig_{str(i) * 32}" for i in range(7)]
+        assert pick_winner(group, incumbents={group[4]}) == (
+            group[4],
+            REASON_SITEMAP_INCUMBENT,
+        )
+
+    def test_duplicate_candidates_collapse(self):
+        assert pick_winner([SIG_A, SIG_A]) == (SIG_A, REASON_SOLE_CANDIDATE)
+
+
+class TestPlanElections:
+    def test_steady_state_writes_nothing(self):
+        """The signal that the stickiness rule is holding."""
+        planned = plan_elections(
+            candidates_by_content_key={"ck_1": [SIG_A, SIG_F]},
+            stored_by_content_key={"ck_1": SIG_F},
+        )
+        assert planned == []
+
+    def test_new_content_key_is_elected(self):
+        planned = plan_elections(
+            candidates_by_content_key={"ck_1": [SIG_A, SIG_F]},
+            stored_by_content_key={},
+        )
+        assert len(planned) == 1
+        assert planned[0].canonical_sig_id == SIG_A
+        assert planned[0].replaced is None
+
+    def test_replacement_records_what_it_replaced(self):
+        gone = "sig_" + "9" * 32
+        planned = plan_elections(
+            candidates_by_content_key={"ck_1": [SIG_A]},
+            stored_by_content_key={"ck_1": gone},
+        )
+        assert planned[0].replaced == gone
+        assert planned[0].canonical_sig_id == SIG_A
+
+    def test_re_electing_the_SAME_winner_is_not_a_replacement(self):
+        """`replaced` must mean the stored value CHANGED, not merely existed.
+
+        The dedupe_keeper rung sits above the sticky rung, so it re-elects
+        outright and never reaches the REASON_STICKY short-circuit that would skip
+        an unchanged winner. With an unconditional `replaced=stored` that made
+        every already-correct keeper look like a moved URL.
+
+        MEASURED against prod right after the 2026-07-26 seed: a steady-state
+        sweep reported `replacements: 587` alongside `written: 0`, and all 587 had
+        `from == to`. The scheduled workflow alarms on `replacements` ("N elected
+        canonical URL(s) MOVED — each is a live URL changing"), so it would have
+        warned on every 6h run forever, and the runbook's `replacements: 0`
+        convergence gate could never have passed, on a converged corpus.
+        """
+        keeper = "sig_" + "e" * 32
+        planned = plan_elections(
+            candidates_by_content_key={"ck_1": [SIG_A, keeper]},
+            stored_by_content_key={"ck_1": keeper},
+            keeper_by_content_key={"ck_1": keeper},
+        )
+        # NOT PLANNED AT ALL — stronger than "planned but not a replacement".
+        #
+        # An earlier fix only nulled `replaced`, which left the row in `planned`
+        # and merely moved the inflation to `new_elections` (= len(planned) -
+        # len(replacements)) and `written` (= len(planned)). The runbook gates on
+        # BOTH counters, so the unpassable gate had moved rather than gone. Now the
+        # no-op is dropped before it can reach any counter.
+        assert planned == []
+
+    def test_a_genuine_keeper_move_is_still_recorded(self):
+        """The counter must stay sensitive to real moves — not just quieter."""
+        keeper = "sig_" + "e" * 32
+        planned = plan_elections(
+            candidates_by_content_key={"ck_1": [SIG_A, keeper]},
+            stored_by_content_key={"ck_1": SIG_A},
+            keeper_by_content_key={"ck_1": keeper},
+        )
+        assert planned[0].canonical_sig_id == keeper
+        assert planned[0].replaced == SIG_A
+
+    def test_content_key_with_zero_candidates_leaves_the_stored_row_alone(self):
+        """Withdrawing the election would un-canonicalise every sibling page.
+
+        Renderability is deliberately conservative, so an empty candidate set is
+        more often a transient read than a dead product. Dropping the row would
+        make each still-serving sibling self-canonical again and re-expose the
+        duplicate — and it would do so at exactly the moment we have the least
+        information.
+        """
+        planned = plan_elections(
+            candidates_by_content_key={"ck_1": []},
+            stored_by_content_key={"ck_1": SIG_F},
+        )
+        assert planned == []
+
+    def test_seeding_a_whole_corpus_keeps_every_incumbent(self):
+        """The rollout case: N groups, one live URL each, nothing moves."""
+        groups = {f"ck_{i}": [SIG_A, SIG_F] for i in range(50)}
+        planned = plan_elections(
+            candidates_by_content_key=groups,
+            stored_by_content_key={},
+            incumbents={SIG_F},
+        )
+        assert len(planned) == 50
+        assert {e.canonical_sig_id for e in planned} == {SIG_F}
+        assert all(e.election_reason == REASON_SITEMAP_INCUMBENT for e in planned)
+
+
+def _compile(stmt) -> str:
+    from sqlalchemy.dialects import postgresql
+
+    return str(
+        stmt.compile(
+            dialect=postgresql.dialect(), compile_kwargs={"literal_binds": True}
+        )
+    )
+
+
+class TestElectableSigGuard:
+    """A stored election must never outlive the electability it was based on.
+
+    THE FAILURE THIS CLOSES. ck_x elects sig A; A later stops rendering. The
+    sitemap is structurally safe — its renderable filter runs BEFORE the dedup,
+    so A is not a candidate and sibling B is advertised. But a reader that joins
+    the election on content_key alone still hands B's PDP the string "A", and
+    B's page emits <link rel="canonical" href="/products/A"> at a URL that 500s.
+    We submit B and B disavows itself in favour of a dead page: the content_key
+    loses ALL index presence, which is worse than the duplicate AND worse than a
+    moved URL.
+
+    Not hypothetical — P3 moved 2,051 rows on `renderable` in one day, and
+    nothing prevents the reverse direction.
+    """
+
+    def test_guard_requires_the_elected_sig_to_be_electable(self):
+        from services.canonical_sitemap_candidates import electable_sig_exists
+
+        sql = _compile(
+            select(electable_sig_exists(literal_column("'sig_x'"), widen=False))
+        )
+        # It must re-ask the SAME question of the ELECTED row, on its own alias.
+        assert "cp_elected" in sql
+        assert "cp_elected.pivota_signature_id = 'sig_x'" in sql
+        assert "cp_elected.suppressed_at IS NULL" in sql
+        assert "ips_elected.serving_eligible IS true" in sql
+        assert "cm_elected.indexable IS true" in sql
+        # ...including renderability, which is the field that actually flaps.
+        assert "external_product_seeds" in sql
+
+    def test_guard_does_not_disturb_the_unaliased_callers(self):
+        """Adding the alias parameters must not change the feed's own SQL.
+
+        The aliasing exists only so the same predicate can be asked about a
+        second row in one statement. If it leaked into the default call, the
+        feed's eligibility would silently change — the exact drift the shared
+        module was created to prevent.
+        """
+        from services.canonical_sitemap_candidates import (
+            sitemap_candidate_filter,
+            catalog_products,
+        )
+
+        for widen in (False, True):
+            explicit = _compile(
+                select(literal_column("1")).where(
+                    sitemap_candidate_filter(
+                        widen=widen,
+                        cp=catalog_products,
+                        ips=None,
+                        cm=None,
+                    )
+                )
+            )
+            default = _compile(
+                select(literal_column("1")).where(
+                    sitemap_candidate_filter(widen=widen)
+                )
+            )
+            assert explicit == default
+
+
+class TestTheFixesAreActuallyWIRED:
+    """Both round-1 fixes reverted silently with the whole suite green.
+
+    `TestElectableSigGuard` exercises the helper in isolation and
+    `sitemap_electable_filter` was only ever compiled through `candidates_query`
+    — so swapping the feed's column back to the raw
+    `content_canonical_election.c.canonical_sig_id`, or deleting
+    `not_tombstoned` outright, changed nothing any test could see. A fix nothing
+    asserts is a fix that comes back out on the next refactor.
+    """
+
+    # NOTE: the "feed publishes the guarded column" assertion deliberately lives
+    # in tests/test_pivota_canonical_routes.py, against the SQL the route
+    # actually issues. A version of it here — compiling
+    # `_elected_canonical_sig_column` directly — passed even with the route
+    # reverted to the raw column, because the helper still existed. Testing the
+    # helper proves the helper works, not that anything calls it.
+
+    def test_election_candidates_must_pass_the_serving_gate_too(self):
+        """The candidate set asks BOTH gates get_pdp_v2 refuses at.
+
+        Renderability was the content-route half only until 2026-07-26, and the
+        gap was live: 77 of the 4,528 URLs in the prod sitemap were
+        route-resolvable, NOT serving-eligible (blocker_code='no_price',
+        admitted by INDEX_ELIGIBLE_SITEMAP), and served hard HTTP 500 while the
+        feed called every one of them renderable. 0 of the 474 duplicate groups
+        contained such a row when measured, so nothing was crowned yet — but a
+        candidate set that admits a 500 is exactly the failure this module's
+        docstring calls "strictly worse than the duplicate we set out to fix".
+
+        Asserted on the CORRELATED EXISTS, not on the bare column name: the
+        eligibility filter already joins index_pipeline_state and mentions
+        serving_eligible, so a substring check over the whole statement would
+        still pass with renderability reverted to the route-only predicate. The
+        eligibility JOIN renders as ``JOIN index_pipeline_state ON``, so
+        ``FROM index_pipeline_state WHERE`` names the subquery and only the
+        subquery.
+        """
+        for widen in (False, True):
+            sql = " ".join(_compile(candidates_query(widen=widen)).split())
+            subquery = "FROM index_pipeline_state WHERE"
+            assert subquery in sql, (
+                f"the electable filter dropped the serving gate (widen={widen})"
+            )
+            gate = sql.split(subquery, 1)[1]
+            assert gate.startswith(
+                " catalog_products.content_key = index_pipeline_state.content_key "
+                "AND index_pipeline_state.serving_eligible IS true"
+            ), f"the serving gate is not the gate get_pdp_v2 applies (widen={widen})"
+
+    def test_election_candidates_exclude_tombstoned_rows(self):
+        """The BLOCKER fix: never crown a step-5 dedupe loser.
+
+        #1833 points every tombstone at its keeper INSIDE the same content_key.
+        If the election could crown the tombstone, the two would canonicalise
+        one group in opposite directions and the live keeper would end up
+        pointing at the duplicate it replaced.
+        """
+        for widen in (False, True):
+            sql = _compile(candidates_query(widen=widen))
+            assert "suppression_reason IS NULL" in sql, (
+                f"tombstoned rows are electable (widen={widen})"
+            )
+
+    def test_the_guard_also_excludes_tombstones(self):
+        """Same rule on the read side, or a pre-existing election survives it."""
+        from services.canonical_sitemap_candidates import electable_sig_exists
+
+        sql = _compile(
+            select(electable_sig_exists(literal_column("'sig_x'"), widen=False))
+        )
+        assert "cp_elected.suppression_reason IS NULL" in sql
+
+
+class TestCandidateSetMatchesTheFeed:
+    """The elector must not be able to crown a sig the feed will never emit."""
+
+    def test_elector_and_feed_compile_the_same_eligibility(self):
+        """THE parity assertion — compare the two sides, don't grep one side.
+
+        The previous tests here asserted substrings of the ELECTOR's own SQL and
+        never compared it to the FEED's, so the class name overstated what it
+        checked: it would have passed with the strict merchant gate flipped
+        INNER->LEFT, with `suppressed_at IS NULL` dropped, or with the
+        `like('sig_%')` gone. This compiles both and asserts equality.
+        """
+        from services.canonical_sitemap_candidates import (
+            sitemap_candidate_filter,
+            sitemap_candidate_join,
+        )
+
+        for widen in (False, True):
+            feed_side = _compile(
+                select(literal_column("1"))
+                .select_from(sitemap_candidate_join(widen=widen))
+                .where(sitemap_candidate_filter(widen=widen))
+            )
+            elector_side = _compile(candidates_query(widen=widen))
+            # The elector selects different columns and adds its own ordering +
+            # the sig-not-null narrowing, so compare the shared WHERE core.
+            for clause in (
+                "suppressed_at IS NULL",
+                "pivota_signature_id LIKE 'sig_%%'",
+                "serving_eligible IS true",
+                "catalog_merchants.status IN ('active', 'observed')",
+            ):
+                assert (clause in feed_side) == (clause in elector_side), (
+                    f"{clause!r} present on only one side (widen={widen})"
+                )
+            assert ("LEFT OUTER JOIN catalog_merchants" in feed_side) == (
+                "LEFT OUTER JOIN catalog_merchants" in elector_side
+            )
+
+    def _sql(self, **env) -> str:
+        return _compile(candidates_query(**env))
+
+    def test_selects_through_the_same_gates_the_feed_uses(self):
+        sql = self._sql(widen=False)
+        assert "JOIN index_pipeline_state" in sql
+        assert "JOIN catalog_merchants" in sql
+        assert "serving_eligible IS true" in sql
+        assert "suppressed_at IS NULL" in sql
+
+    def test_requires_renderability(self):
+        """The feed publishes `renderable` as a field and the consumer drops on
+        it; the elector has no consumer, so it must filter in SQL or it will
+        crown sigs the sitemap silently discards."""
+        assert "external_product_seeds" in self._sql(widen=False)
+
+    def test_never_crowns_a_sigless_row(self):
+        """Widened, a row qualifies on content_key alone and carries no sig.
+        Such a row can never BE a URL, so it must not be a candidate for one."""
+        sql = self._sql(widen=True)
+        assert "pivota_signature_id IS NOT NULL" in sql
+
+    def test_widened_mode_left_joins_merchants(self):
+        assert "LEFT OUTER JOIN catalog_merchants" in self._sql(widen=True)
+
+
+class TestSitemapParser:
+    """The seed import has to read the same ids pivota-agent-ui wrote."""
+
+    def test_reads_product_locs_only(self):
+        from scripts.elect_content_canonicals import parse_sitemap_product_ids
+
+        xml = (
+            "<urlset>"
+            f"<url><loc>https://agent.pivota.cc/products/{SIG_A}</loc></url>"
+            "<url><loc>https://agent.pivota.cc/brands/acme</loc></url>"
+            f"<url><loc>https://agent.pivota.cc/products/{SIG_F}</loc></url>"
+            "</urlset>"
+        )
+        assert parse_sitemap_product_ids(xml) == {SIG_A, SIG_F}
+
+    def test_undoes_both_writers_in_order(self):
+        """productUrlEntries percent-encodes, then buildSitemapUrlsetXml escapes."""
+        from scripts.elect_content_canonicals import parse_sitemap_product_ids
+
+        xml = "<url><loc>https://agent.pivota.cc/products/o&apos;neill%20x</loc></url>"
+        assert parse_sitemap_product_ids(xml) == {"o'neill x"}
+
+    def test_empty_sitemap_reads_as_no_incumbents(self):
+        from scripts.elect_content_canonicals import parse_sitemap_product_ids
+
+        assert parse_sitemap_product_ids("") == set()
+        assert parse_sitemap_product_ids("<urlset></urlset>") == set()
+
+    def test_seeding_refuses_an_empty_read(self, tmp_path):
+        """A wrong path must not degrade seeding into a lexicographic sweep."""
+        from scripts.elect_content_canonicals import load_sitemap
+
+        empty = tmp_path / "sitemap-products.xml"
+        empty.write_text("<urlset></urlset>", encoding="utf-8")
+        with pytest.raises(SystemExit, match="ZERO product URLs"):
+            load_sitemap(str(empty))
+
+
+# ---------------------------------------------------------------------------
+# Multi-row upsert — one round trip per CHUNK, not per row
+# ---------------------------------------------------------------------------
+#
+# The sweep used to write one statement per content_key: 4,266 round trips on the
+# seed run, 7-30 minutes over the Railway public proxy, all in one transaction.
+# Interrupting that leaves an orphaned backend holding row locks, so the next
+# attempt blocks and looks like a connection hang — self-amplifying, and it cost
+# the 2026-07-26 seed several attempts.
+#
+# `databases.execute_many` is NOT a fix: its postgres backend loops over
+# `connection.execute` internally (verified in the installed 0.7.0 source). These
+# tests pin the real thing.
+
+
+class TestMultiRowUpsert:
+    def test_one_row_form_matches_the_single_row_statement(self):
+        """The two forms must stay the same statement, modulo param suffixes."""
+        from services.content_canonical_election import (
+            UPSERT_ELECTION_SQL,
+            upsert_elections_sql,
+        )
+
+        assert upsert_elections_sql(1).replace("_0", "") == UPSERT_ELECTION_SQL
+
+    def test_n_rows_produce_n_value_tuples_and_one_conflict_clause(self):
+        from services.content_canonical_election import upsert_elections_sql
+
+        sql = upsert_elections_sql(7)
+        assert sql.count("NOW(), NOW())") == 7
+        # ONE conflict clause for the whole statement — not one per row.
+        assert sql.count("ON CONFLICT") == 1
+        # The guard that keeps `written` honest must survive batching.
+        assert "IS DISTINCT FROM" in sql
+
+    def test_params_are_flat_and_positionally_suffixed(self):
+        from services.content_canonical_election import (
+            Election,
+            upsert_elections_params,
+            upsert_elections_sql,
+        )
+
+        rows = [
+            Election("ck_a", SIG_A, REASON_SOLE_CANDIDATE),
+            Election("ck_b", SIG_F, REASON_DEDUPE_KEEPER),
+        ]
+        params = upsert_elections_params(rows)
+        assert params == {
+            "content_key_0": "ck_a",
+            "canonical_sig_id_0": SIG_A,
+            "election_reason_0": REASON_SOLE_CANDIDATE,
+            "content_key_1": "ck_b",
+            "canonical_sig_id_1": SIG_F,
+            "election_reason_1": REASON_DEDUPE_KEEPER,
+        }
+        # Every placeholder in the SQL must have a value, and vice versa.
+        sql = upsert_elections_sql(len(rows))
+        for name in params:
+            assert f":{name}" in sql
+        import re
+
+        assert set(re.findall(r":([a-z_]+_\d+)", sql)) == set(params)
+
+    def test_duplicate_content_key_in_one_batch_is_refused(self):
+        """Postgres rejects a multi-row ON CONFLICT touching one target twice.
+
+        The per-row loop could never hit this, so batching introduces the failure
+        mode. `plan_elections` is keyed by content_key and cannot produce a
+        duplicate, but that is an invariant of another function — assert it here
+        rather than surfacing an opaque server error.
+        """
+        from services.content_canonical_election import (
+            Election,
+            upsert_elections_params,
+        )
+
+        with pytest.raises(ValueError, match="duplicate content_key"):
+            upsert_elections_params(
+                [
+                    Election("ck_dup", SIG_A, REASON_SOLE_CANDIDATE),
+                    Election("ck_dup", SIG_F, REASON_SOLE_CANDIDATE),
+                ]
+            )
+
+    def test_plan_elections_never_yields_a_duplicate_content_key(self):
+        """The upstream guarantee the batch write depends on."""
+        planned = plan_elections(
+            candidates_by_content_key={
+                "ck_1": [SIG_A, SIG_F],
+                "ck_2": [SIG_F],
+                "ck_3": [SIG_A, SIG_F, SIG_LEGACY],
+            },
+            stored_by_content_key={},
+        )
+        keys = [e.content_key for e in planned]
+        assert len(keys) == len(set(keys))
+
+    def test_row_count_must_be_positive(self):
+        from services.content_canonical_election import upsert_elections_sql
+
+        with pytest.raises(ValueError):
+            upsert_elections_sql(0)
+
+    def test_chunk_size_stays_under_the_postgres_parameter_cap(self):
+        """3 params per row; Postgres caps a statement at 65,535 binds."""
+        from services.content_canonical_election import UPSERT_CHUNK_ROWS
+
+        assert UPSERT_CHUNK_ROWS * 3 < 65535
+        assert UPSERT_CHUNK_ROWS >= 100, "too small to meaningfully cut round trips"
+
+
+# ---------------------------------------------------------------------------
+# run_election's WRITE PATH — the code this whole change exists to alter
+# ---------------------------------------------------------------------------
+#
+# It had no coverage at all, and review mutation-testing proved the consequence:
+# slicing `planned[start : start + UPSERT_CHUNK_ROWS - 1]` (silently dropping one
+# election per chunk), and reverting to one execute per row (undoing the entire
+# fix), BOTH shipped with a green suite. These close that.
+
+
+class _FakeDb:
+    """Captures every (sql, params) the sweep issues. No server needed.
+
+    `transaction()` is an async context manager because the write is wrapped in
+    one, and that wrapping is itself part of the contract — all-or-nothing.
+    """
+
+    def __init__(self, *, candidates, stored=(), keepers=()):
+        self._candidates = candidates
+        self._stored = stored
+        self._keepers = keepers
+        self.executed: list = []
+        self.transactions = 0
+
+    async def fetch_all(self, query):
+        text = str(query)
+        if "content_canonical_election" in text:
+            return list(self._stored)
+        if "keeper" in text.lower():
+            return list(self._keepers)
+        return list(self._candidates)
+
+    async def execute(self, query, params=None):
+        self.executed.append((str(query), params or {}))
+
+    def transaction(self):
+        outer = self
+
+        class _Txn:
+            async def __aenter__(self):
+                outer.transactions += 1
+                return self
+
+            async def __aexit__(self, *exc):
+                return False
+
+        return _Txn()
+
+
+def _run_sweep(monkeypatch, *, rows, apply=True):
+    """Drive run_election against _FakeDb and return (report, fake)."""
+    import asyncio
+
+    import scripts.elect_content_canonicals as script
+
+    fake = _FakeDb(candidates=rows)
+    monkeypatch.setattr(script, "database", fake)
+    report = asyncio.run(script.run_election(apply=apply))
+    return report, fake
+
+
+class TestWritePath:
+    def _candidate_rows(self, n):
+        # One candidate per content_key -> one planned election each.
+        return [
+            {"content_key": f"ck_{i:05d}", "pivota_signature_id": "sig_" + f"{i:032x}"}
+            for i in range(n)
+        ]
+
+    def test_every_planned_election_is_written_exactly_once(self, monkeypatch):
+        """No election may be dropped by chunk arithmetic.
+
+        The mutation that motivated this (`+ UPSERT_CHUNK_ROWS - 1`) loses one row
+        per chunk — ~9 elections per sweep — and is invisible to any test that only
+        inspects the SQL builder.
+        """
+        from services.content_canonical_election import UPSERT_CHUNK_ROWS
+
+        n = UPSERT_CHUNK_ROWS * 2 + 7  # deliberately not a chunk multiple
+        report, fake = _run_sweep(monkeypatch, rows=self._candidate_rows(n))
+
+        assert report["written"] == n
+        written_keys = set()
+        for _sql, params in fake.executed:
+            written_keys |= {
+                v for k, v in params.items() if k.startswith("content_key_")
+            }
+        assert len(written_keys) == n
+        assert written_keys == {f"ck_{i:05d}" for i in range(n)}
+
+    def test_writes_are_batched_not_one_statement_per_row(self, monkeypatch):
+        """Pins the actual fix. Reverting to a per-row loop must fail here."""
+        from services.content_canonical_election import UPSERT_CHUNK_ROWS
+
+        n = UPSERT_CHUNK_ROWS * 2 + 7
+        _report, fake = _run_sweep(monkeypatch, rows=self._candidate_rows(n))
+
+        import math
+
+        expected = math.ceil(n / UPSERT_CHUNK_ROWS)
+        assert len(fake.executed) == expected, (
+            f"{n} elections issued {len(fake.executed)} statements; expected "
+            f"{expected}. A per-row loop would issue {n}."
+        )
+        # …and no chunk may exceed the cap.
+        for _sql, params in fake.executed:
+            assert len(params) <= UPSERT_CHUNK_ROWS * 3
+
+    def test_the_whole_write_is_one_transaction(self, monkeypatch):
+        _report, fake = _run_sweep(monkeypatch, rows=self._candidate_rows(1200))
+        assert fake.transactions == 1, "chunks must share one all-or-nothing txn"
+
+    def test_dry_run_writes_nothing(self, monkeypatch):
+        report, fake = _run_sweep(
+            monkeypatch, rows=self._candidate_rows(50), apply=False
+        )
+        assert fake.executed == []
+        assert fake.transactions == 0
+        assert report["written"] == 0
+
+
+class TestUpsertGuardsArePinnedNotJustDocumented:
+    def test_elected_at_is_never_overwritten_on_conflict(self):
+        """Migration 181 calls `elected_at == updated_at` the metric to alert on.
+
+        Adding `elected_at = NOW()` to the DO UPDATE SET destroys that signal and
+        was caught by nothing — the guarantee lived only in prose.
+        """
+        from services.content_canonical_election import (
+            _UPSERT_CONFLICT_TAIL,
+            upsert_elections_sql,
+        )
+
+        assert "elected_at" not in _UPSERT_CONFLICT_TAIL
+        head, _, tail = upsert_elections_sql(3).partition("ON CONFLICT")
+        assert "elected_at" in head, "still inserted on the INSERT path"
+        assert "elected_at" not in tail, "must not be touched on the UPDATE path"

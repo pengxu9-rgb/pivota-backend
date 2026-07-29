@@ -15,7 +15,7 @@ import logging
 import os
 from typing import Any, Dict, List
 
-from sqlalchemy import String, and_, column, func, not_, select, table
+from sqlalchemy import Boolean, String, and_, column, func, not_, select, table
 
 from db.catalog import catalog_products
 from services.pdp_renderability import compile_pg, pdp_renderable_expression
@@ -31,10 +31,28 @@ _SAMPLE_LIMIT = 5
 # pdp_identity_listing row exists" — the same belief the sitemap feed held, and
 # the same belief 29 live PDP fetches disproved on 2026-07-25 (rows with NO
 # identity listing at all render full 200s; rows with one render 500s). It now
-# compiles :func:`pdp_renderable_expression`, so the invariant and the feed
-# cannot disagree about what "renderable" means — and so a fix to the predicate
-# (P3's minted lane) moves this count and the sitemap in one step, instead of
-# leaving the alarm calibrated to a gap that no longer exists.
+# compiles :func:`pdp_renderable_expression`, so a fix to that predicate (P3's
+# minted lane) moves this count and the sitemap in one step, instead of leaving
+# the alarm calibrated to a gap that no longer exists.
+#
+# ⚠️ SINCE 2026-07-26 THIS CHECK AND THE FEED ASK DIFFERENT QUESTIONS, ON
+# PURPOSE. An earlier version of this comment claimed they "cannot disagree about
+# what renderable means". They now do, and the difference is deliberate: the
+# feed's `renderable` column compiles `pdp_will_render_expression` — the content
+# route AND get_pdp_v2's serving-eligibility gate — while this invariant stays on
+# the content-route half alone, because its threshold is a MEASURED baseline (1,
+# on prod) for the narrower question "the trust policy let this row reach 'public'
+# while the gateway has no resolvable content route". Folding the serving gate in
+# would redefine the alarm and decalibrate the threshold in one move, with no
+# re-measurement. Pinned by
+# test_public_not_renderable_invariant_stays_on_the_route_only_predicate.
+#
+# CONSEQUENCE, stated so it is not mistaken for coverage: nothing here alarms on a
+# row that is trust-`public` and fails the SERVING gate. With INDEX_ELIGIBLE_READ
+# on in prod, catalog_trust_policy can still promote an
+# `index_eligible AND NOT serving_eligible` row to 'public', so that class stops
+# being ADVERTISED (the feed drops it) without becoming MONITORED. A serving-gate
+# invariant is a separate check and needs its own measured baseline.
 _crt = table(
     "catalog_row_trust",
     column("subject_type", String),
@@ -42,6 +60,15 @@ _crt = table(
     column("serving_decision", String),
 )
 _cp = catalog_products.alias("cp")
+
+# index_pipeline_state, declared locally for the same reason the other modules do
+# (its Core def in db.catalog predates several columns). Only the columns these
+# checks read.
+_ips = table(
+    "index_pipeline_state",
+    column("content_key", String),
+    column("serving_eligible", Boolean),
+)
 
 _NOT_RENDERABLE_PUBLIC_WHERE = and_(
     _crt.c.subject_type == "product",
@@ -61,6 +88,65 @@ _PUBLIC_NOT_RENDERABLE_SAMPLE_SQL = compile_pg(
     select(_crt.c.subject_key)
     .select_from(_NOT_RENDERABLE_PUBLIC_FROM)
     .where(_NOT_RENDERABLE_PUBLIC_WHERE)
+    .limit(_SAMPLE_LIMIT)
+)
+
+# ── serving_eligible but the gateway will not render ──────────────────────────
+# The gap NOTHING above can see. Every one of the six existing checks is anchored
+# on "trust says public", so a row the INDEX PIPELINE wants public — but that
+# trust has not (or not yet) promoted — is invisible to all of them. Measured on
+# prod 2026-07-29: 2,265 rows are `index_pipeline_state.serving_eligible` while
+# the gateway has no resolvable content route, and `public_not_renderable` counts
+# exactly 1 of them, because it asks about a different set.
+#
+# WHY THE SCOPE IS NARROWER THAN THAT 2,265, and why a 2,265 threshold would be
+# the wrong alarm:
+#
+#   shopify_products_sync ............. 1,474   known-dark lane, see below
+#   external_product_seeds_mirror_v1 ...  783   tombstoned/suppressed already
+#   url_audit ..........................    4   ← the genuinely unexplained set
+#
+# Only 4 of the 2,265 are CLEAN (neither `suppressed_at` nor `suppression_reason`
+# set). Blessing 2,265 would make this check deaf to a 500-row regression; the
+# convention above is explicit that a threshold is a measured baseline of the
+# UNEXPLAINED residual, and lowering it is mandatory as the residual shrinks.
+#
+# The shopify/wix exclusion is not a fudge: `MERCHANT_SYNCED_LANE_RENDERABLE` is
+# hard-coded False in services/pdp_renderability, so EVERY row on that lane is
+# non-renderable by construction and by decision. Counting a deliberate constant
+# as drift is noise. If that constant is ever flipped, those rows become
+# renderable and leave this set on their own — the exclusion cannot hide a fix.
+# A genuinely NEW dark lane on any other platform is still caught.
+#
+# PREDICATE NOTE: this asks `pdp_renderable_expression` (the CONTENT ROUTE half),
+# not the composite `pdp_will_render_expression`. The composite also asks the
+# serving gate, which the WHERE clause has already asserted — so the composite
+# would be self-referential here and reduce to exactly this. Same predicate
+# object as `public_not_renderable`, different ANCHOR, which is the whole point.
+_SERVING_NOT_RENDERABLE_WHERE = and_(
+    _ips.c.serving_eligible.is_(True),
+    not_(pdp_renderable_expression(_cp)),
+    _cp.c.suppressed_at.is_(None),
+    _cp.c.suppression_reason.is_(None),
+    not_(
+        func.lower(func.btrim(func.coalesce(_cp.c.platform, ""))).in_(
+            ["shopify", "wix"]
+        )
+    ),
+)
+_SERVING_NOT_RENDERABLE_FROM = _cp.join(
+    _ips, _ips.c.content_key == _cp.c.content_key
+)
+
+_SERVING_NOT_RENDERABLE_COUNT_SQL = compile_pg(
+    select(func.count().label("c"))
+    .select_from(_SERVING_NOT_RENDERABLE_FROM)
+    .where(_SERVING_NOT_RENDERABLE_WHERE)
+)
+_SERVING_NOT_RENDERABLE_SAMPLE_SQL = compile_pg(
+    select(_cp.c.product_key)
+    .select_from(_SERVING_NOT_RENDERABLE_FROM)
+    .where(_SERVING_NOT_RENDERABLE_WHERE)
     .limit(_SAMPLE_LIMIT)
 )
 
@@ -174,9 +260,109 @@ _CHECKS: List[Dict[str, Any]] = [
         # The 1 is the single url_audit row: audit-minted, no seed, no sync
         # adapter, measured HTTP 500. It goes to 0 when that row is either
         # given a route or dropped out of 'public'.
-        "default_threshold": 1,
+        # LOWERED 1 -> 0 on 2026-07-29. The baseline-1 was the HOVERAir X1
+        # url_audit stub; it was retired with the other three audit-minted stubs
+        # (reason 'url_audit_stub_retired_20260729') and the count re-measured 0.
+        "default_threshold": 0,
         "count_sql": _PUBLIC_NOT_RENDERABLE_COUNT_SQL,
         "sample_sql": _PUBLIC_NOT_RENDERABLE_SAMPLE_SQL,
+    },
+    {
+        "name": "dead_quality_component",
+        "description": (
+            "a quality-scorer component is identically zero across every recent "
+            "snapshot — i.e. nothing in any ingest lane produces it, so it is "
+            "silently dragging every product's score down for a signal that does "
+            "not exist"
+        ),
+        "env": "CATALOG_INVARIANT_DEAD_COMPONENT_THRESHOLD",
+        # 0 = no component may be dead. This is the standing detector for the
+        # defect class that cost the most in this codebase: `summary` scored 0.0
+        # for 100% of rows across every rules_version for an unknown number of
+        # months, capping the achievable score at 6/7 and making the 65 floor
+        # really 76% of achievable. Nothing surfaced it, because a dead component
+        # is indistinguishable from uniformly bad content unless you ask THIS
+        # question. Removed from the mean 2026-07-28; this check is what stops
+        # the next one lasting as long.
+        "default_threshold": 0,
+        # Sampled over recent snapshots only: an old rules_version that genuinely
+        # lacked a component would otherwise pin this alarm on forever. Requires
+        # a real sample (>=200) so a quiet period cannot manufacture a violation
+        # out of two rows.
+        "count_sql": """
+            WITH recent AS (
+                SELECT details
+                FROM product_quality_snapshot
+                WHERE snapshot_date > NOW() - INTERVAL '30 days'
+                  AND details IS NOT NULL
+                ORDER BY id DESC
+                LIMIT 2000
+            ),
+            comps AS (
+                SELECT c->>'name' AS name,
+                       COALESCE((c->>'score')::float, 0) AS score
+                FROM recent,
+                     LATERAL jsonb_array_elements(
+                         (details::jsonb) -> 'components'
+                     ) AS c
+            )
+            SELECT count(*) AS c FROM (
+                SELECT name
+                FROM comps
+                GROUP BY name
+                HAVING count(*) >= 200 AND max(score) = 0
+            ) dead
+        """,
+        "sample_sql": """
+            WITH recent AS (
+                SELECT details
+                FROM product_quality_snapshot
+                WHERE snapshot_date > NOW() - INTERVAL '30 days'
+                  AND details IS NOT NULL
+                ORDER BY id DESC
+                LIMIT 2000
+            ),
+            comps AS (
+                SELECT c->>'name' AS name,
+                       COALESCE((c->>'score')::float, 0) AS score
+                FROM recent,
+                     LATERAL jsonb_array_elements(
+                         (details::jsonb) -> 'components'
+                     ) AS c
+            )
+            SELECT name
+            FROM comps
+            GROUP BY name
+            HAVING count(*) >= 200 AND max(score) = 0
+            LIMIT 5
+        """,
+    },
+    {
+        "name": "serving_eligible_not_renderable",
+        "description": (
+            "index_pipeline_state says serve this row, but the gateway has no "
+            "resolvable PDP content route for it — a URL the index wants public "
+            "that answers 404/500. Distinct from public_not_renderable, which "
+            "asks the same predicate anchored on trust='public' and therefore "
+            "cannot see rows trust has not promoted"
+        ),
+        "env": "CATALOG_INVARIANT_SERVING_NOT_RENDERABLE_THRESHOLD",
+        # MEASURED BASELINE 2026-07-29, not an aspiration: 4 url_audit
+        # audit-minted stubs (Purra Swim, Purra Run, HaptiFit Terra, HOVERAir X1
+        # — the last is also the standing public_without_priced_offer violation).
+        # Excludes the 2,261 already-tombstoned/suppressed rows and the 1,474
+        # hard-coded-dark shopify lane; see the note above the SQL for why
+        # blessing 2,265 would make this check deaf.
+        #
+        # LOWERED 4 -> 0 on 2026-07-29: the four url_audit stubs were retired
+        # (suppression_reason='url_audit_stub_retired_20260729', suppressed_at
+        # set) and trust recomputed to `blocked` the same day. Re-measured: 0.
+        # The convention above is explicit that lowering is mandatory the moment
+        # the true count drops — a threshold left at 4 would wave through the
+        # next four regressions.
+        "default_threshold": 0,
+        "count_sql": _SERVING_NOT_RENDERABLE_COUNT_SQL,
+        "sample_sql": _SERVING_NOT_RENDERABLE_SAMPLE_SQL,
     },
     {
         "name": "orphan_trust_rows",

@@ -51,6 +51,28 @@ _APV_DRIFT_TTL_SECONDS = 300.0
 _apv_drift_cache: Dict[str, Any] = {"at": 0.0, "value": None}
 
 
+_PDP_WILL_RENDER_DRIFT_TTL_SECONDS = 300.0
+_will_render_drift_cache: Dict[str, Any] = {"at": 0.0, "value": None}
+
+
+async def _cached_pdp_will_render_drift(database: Any) -> Dict[str, Any]:
+    import time
+
+    now = time.monotonic()
+    cached = _will_render_drift_cache["value"]
+    if cached is not None and (now - _will_render_drift_cache["at"]) < _PDP_WILL_RENDER_DRIFT_TTL_SECONDS:
+        return {**cached, "cached": True}
+    try:
+        from jobs.pdp_renderability_reconciler_cron import count_pdp_will_render_drift
+
+        value = await count_pdp_will_render_drift(database)
+    except Exception as exc:  # noqa: BLE001
+        return {"error": str(exc)}
+    _will_render_drift_cache["value"] = value
+    _will_render_drift_cache["at"] = now
+    return {**value, "cached": False}
+
+
 async def _cached_agent_pdp_view_drift(database: Any) -> Dict[str, Any]:
     import time
 
@@ -93,7 +115,42 @@ async def catalog_health() -> Dict[str, Any]:
         # only moves on the reconciler's 6h cadence (plus event pokes), and
         # the query is a full truth-CTE aggregate on a 140ms-RTT shared DB —
         # a polled health endpoint must not re-pay it every hit.
+        # WHY the 5,561-row question needed database credentials to answer.
+        # This endpoint reported `quality_blocked` as one number, and the only
+        # way to learn WHY those rows were blocked was a psql session against
+        # the Railway proxy — which is how the 2026-07-28 audit spent its first
+        # hour. blocker_code lives on index_pipeline_state (content_key grain,
+        # ~11k rows), so the histogram is one cheap GROUP BY; the expensive
+        # per-row renderability question deliberately stays OUT of it.
+        #
+        # Grain note, stated so the two numbers are not "reconciled" into a bug
+        # report: `cohorts` above counts catalog_products ROWS via trust;
+        # this counts index_pipeline_state CONTENT_KEYS. They will not match,
+        # and rows blocked by trust for row-level reasons (tombstones,
+        # quarantine) appear here under blocker='none' when their KEY is
+        # serving-eligible.
+        blocker_rows = await database.fetch_all(
+            """
+            SELECT COALESCE(blocker_code, '(null)') AS blocker, count(*) AS n
+            FROM index_pipeline_state
+            WHERE serving_eligible IS NOT TRUE
+            GROUP BY 1
+            ORDER BY 2 DESC
+            """
+        )
+        blocker_histogram = {r["blocker"]: int(r["n"] or 0) for r in blocker_rows}
         apv_drift = await _cached_agent_pdp_view_drift(database)
+        # P1.13 — freshness of catalog_products.pdp_will_render. The store's own
+        # instruction before any consumer reads that column is to "prove
+        # freshness — not that the column is correct once, but that it STAYS
+        # correct under writes", and this number is that proof. `never_computed`
+        # falling to 0 says the reconciler has walked the table; `disagreeing`
+        # staying at ~0 afterwards says writers are not outrunning it.
+        #
+        # Best-effort and TTL-cached for the same reason as the view drift: it
+        # carries pdp_will_render_expression's correlated subqueries over the
+        # full table, and a polled health endpoint must not re-pay that per hit.
+        will_render_drift = await _cached_pdp_will_render_drift(database)
         return {
             "catalog_total": catalog_total,
             "serving_corpus": corpus,
@@ -101,7 +158,9 @@ async def catalog_health() -> Dict[str, Any]:
             "serving_pct_of_corpus": round(100.0 * public / corpus, 1) if corpus else None,
             "cohorts": totals,
             "by_source_system": by_source,
+            "blocker_histogram": blocker_histogram,
             "agent_pdp_view_drift": apv_drift,
+            "pdp_will_render_drift": will_render_drift,
         }
     except Exception as exc:  # noqa: BLE001 — ops endpoint never 500s
         return {"error": str(exc)}

@@ -307,6 +307,82 @@ def _extract_rich_content_for_payload(seed_data: Any) -> Dict[str, Any]:
     return out
 
 
+def _extract_source_backed_signals(seed_data: Any) -> Dict[str, Any]:
+    """The two source-backed signals the quality scorer's ATTRIBUTES component
+    reads, projected out of seed_data at the shape
+    ``build_servable_quality_payload`` expects.
+
+    WHY THIS EXISTS. Measured on prod 2026-07-28: this script was the only one of
+    the three ``build_servable_quality_payload`` call sites that passed neither
+    ``raw_inci`` nor ``pdp_details_sections`` nor ``category``
+    (``backfill_external_seed_quality_rescore`` and
+    ``onboard_external_brand_from_crawl`` pass them, with comments saying why).
+    So every row this ingest path mirrored was scored with an EMPTY attributes
+    component and, whenever product_type was null, an empty brand_category one —
+    capping it at 4-of-7 (57.1) or 3-of-7 (42.9). Those two scores were 3,456 of
+    the 5,114 ``low_quality`` rows in prod, i.e. the backlog was substantially
+    manufactured here, one 15-minute run at a time.
+
+    The content was never missing — ``pdp_content_depth`` (which reads the DB)
+    passes these same rows while the attributes component (which reads the
+    payload) scored 0. This closes that gap at the writer, so the fix is
+    "stop discarding what we already fetched", not new extraction.
+
+    INCI source, and why it is NOT ``beauty_sku_ingredients``: the rescore script
+    reads INCI from ``bsi.raw_inci``, but that table is populated by the
+    ingredient harvester, which runs AFTER mirroring — at this point in the
+    pipeline it has no row for this product. seed_data is what exists now, and it
+    already carries the crawled ingredient text under the keys force-fill writes
+    (both are in ``_SEED_DATA_RICH_CONTENT_KEYS``). A later harvester pass still
+    improves the row through the rescore path; this only ensures the row does not
+    start life at a manufactured 57.1.
+
+    ``pdp_ingredients_raw`` is preferred over ``inci_list`` because
+    ``build_servable_quality_payload`` splits the string on commas to rebuild the
+    list, so handing it the raw string is the lossless direction. Both the
+    top-level and ``snapshot`` nestings are checked, matching the COALESCE in
+    ``backfill_external_seed_quality_rescore.FETCH``.
+    """
+    if not isinstance(seed_data, dict):
+        return {}
+    snapshot = seed_data.get("snapshot")
+    roots = [seed_data, snapshot if isinstance(snapshot, dict) else {}]
+
+    raw_inci = ""
+    for root in roots:
+        candidate = root.get("pdp_ingredients_raw")
+        if isinstance(candidate, str) and candidate.strip():
+            raw_inci = candidate.strip()
+            break
+        tokens = root.get("inci_list")
+        if isinstance(tokens, (list, tuple)):
+            joined = ", ".join(
+                str(tok).strip() for tok in tokens if str(tok or "").strip()
+            )
+            if joined:
+                raw_inci = joined
+                break
+
+    sections: Optional[List[Any]] = None
+    for root in roots:
+        value = root.get("pdp_details_sections")
+        if isinstance(value, str):
+            try:
+                value = json.loads(value)
+            except Exception:
+                value = None
+        if isinstance(value, (list, tuple)) and value:
+            sections = list(value)
+            break
+
+    out: Dict[str, Any] = {}
+    if raw_inci:
+        out["raw_inci"] = raw_inci
+    if sections:
+        out["pdp_details_sections"] = sections
+    return out
+
+
 def _extract_variants_from_seed_data(seed_data: Any) -> List[Any]:
     if not isinstance(seed_data, dict):
         return []
@@ -1354,6 +1430,22 @@ async def _apply(limit: int) -> int:
                             image_url=row_dict.get("image_url"),
                             brand=row_dict.get("mirrored_brand"),
                             product_type=row_dict.get("mirrored_product_type"),
+                            # `mirrored_category` is already SELECTed and already
+                            # used at the catalog_products write below; only this
+                            # call was not passing it. product_type is null on
+                            # most crawled seeds, and the builder falls back
+                            # product_type -> category to populate
+                            # global_category_id, so without it the
+                            # brand_category component scores 0 on exactly the
+                            # rows that have a perfectly good category_kind.
+                            category=row_dict.get("mirrored_category"),
+                            # ATTRIBUTES component — see
+                            # _extract_source_backed_signals for why these were
+                            # absent and why seed_data (not beauty_sku_ingredients)
+                            # is the right source at this point in the pipeline.
+                            **_extract_source_backed_signals(
+                                row_dict.get("seed_data")
+                            ),
                         ),
                         reason="external_seed_mirror",
                     )

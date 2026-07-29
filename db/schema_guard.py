@@ -413,7 +413,46 @@ async def ensure_required_schema_light() -> None:
                       ADD COLUMN IF NOT EXISTS apm_cadence_days INTEGER NULL,
                       ADD COLUMN IF NOT EXISTS apm_scope_jsonb JSONB NULL,
                       ADD COLUMN IF NOT EXISTS apm_configured_at TIMESTAMPTZ NULL,
-                      ADD COLUMN IF NOT EXISTS apm_last_run_at TIMESTAMPTZ NULL;
+                      ADD COLUMN IF NOT EXISTS apm_last_run_at TIMESTAMPTZ NULL,
+                      -- signup_source (migration 187), here for the same
+                      -- reason the paragraph above gives.
+                      --
+                      -- WARNING - NO SEMICOLONS ANYWHERE IN THIS COMMENT. The
+                      -- coverage gate matches an ALTER body non-greedily up to
+                      -- the FIRST semicolon, so one in prose truncates the
+                      -- statement and every column after it stops counting as
+                      -- covered. Two slipped into the first draft of this note
+                      -- and the gate went red on a change whose DDL was correct.
+                      -- A third slipped into the warning about the first two.
+                      -- The gate caught all three, which is the argument for it.
+                      --
+                      -- It DOES reach prod today, but only through a LAZY
+                      -- backstop: db/merchant_onboarding.py has its own
+                      -- idempotent add inside ensure_operating_mode_column(),
+                      -- called at the top of create_merchant_onboarding() - i.e.
+                      -- on the FIRST MERCHANT SIGNUP of a process, behind a
+                      -- module-level done-flag.
+                      --
+                      -- That covers the column by CALL ORDER. Two read paths
+                      -- escape it:
+                      --   * merchant_onboarding.select() materializes every
+                      --     column, and get_merchant_onboarding() sits on the
+                      --     ADR-018 connection-layer path, and
+                      --   * services/funnel_metrics_service.py issues a RAW
+                      --     "SELECT merchant_id, signup_source, ..." from the
+                      --     admin funnel-metrics router. That one never touches
+                      --     create_merchant_onboarding() at all, so NO call
+                      --     order saves it - a fresh process against a DB
+                      --     without the column returns a hard
+                      --     "column does not exist".
+                      --
+                      -- Honest about the strength of this fix: the whole guard
+                      -- is best-effort (one try/except around the body, a 12s
+                      -- startup timeout, failures downgraded to a warning), so
+                      -- it CANNOT fail a deploy - which is the right trade. It
+                      -- makes the column independent of call order. It does not
+                      -- make it guaranteed.
+                      ADD COLUMN IF NOT EXISTS signup_source VARCHAR(64);
                     """
                 )
             )
@@ -925,6 +964,36 @@ async def ensure_required_schema_light() -> None:
                     """
                 )
             )
+            # P1.11 (migration 188): the persisted ROW-GRAIN renderability column.
+            # **Railway prod skips db/migrations/ entirely**, so the migration
+            # file alone would never reach production — this block is the path
+            # that actually runs. Additive + nullable with NO default on
+            # purpose: NULL means "never computed", which consumers must treat
+            # as do-not-advertise (`IS TRUE`, never `IS NOT FALSE`). A DEFAULT
+            # would erase the distinction between "computed false" and "never
+            # computed", which is the one distinction keeping it fail-closed.
+            await database.execute(
+                text(
+                    """
+                    ALTER TABLE IF EXISTS catalog_products
+                      ADD COLUMN IF NOT EXISTS pdp_will_render BOOLEAN,
+                      ADD COLUMN IF NOT EXISTS pdp_will_render_computed_at TIMESTAMPTZ;
+                    """
+                )
+            )
+            # Partial index on the advertisable side only, keyed on
+            # pivota_signature_id rather than the PK: the predicate is ~35%
+            # selective, so a PK-keyed index would just be seq-scanned. The sig
+            # is what the ACP lane looks rows up by.
+            await database.execute(
+                text(
+                    """
+                    CREATE INDEX IF NOT EXISTS idx_catalog_products_pdp_will_render_true
+                      ON catalog_products (pivota_signature_id)
+                      WHERE pdp_will_render IS TRUE;
+                    """
+                )
+            )
             # ADR-009 D3 seller-of-record threading (migration 169). external
             # seeds gain seller_ref (a catalog_merchants.merchant_id) + seed_kind
             # ('self'|'cross'); the T2-1 redirect stamps them onto the click and
@@ -1192,6 +1261,33 @@ async def ensure_required_schema_light() -> None:
                     "ALTER TABLE IF EXISTS agent_pdp_view "
                     "ADD COLUMN IF NOT EXISTS rating_value NUMERIC, "
                     "ADD COLUMN IF NOT EXISTS rating_count INTEGER;"
+                )
+            )
+            # mig 181: ONE canonical URL per content_key. 474 content_keys
+            # carry >1 sitemap-eligible renderable sig; every sibling serves
+            # identical content under a self-referential canonical tag. The
+            # sitemap and the gateway's `canonical` module must name the SAME
+            # winner, and the sticky answer (seeded from live sitemap
+            # incumbency) has to live somewhere both can read — here. See
+            # db/migrations/181_content_canonical_election.sql for the full
+            # rationale. Railway skips db/migrations/, so self-heal here.
+            await database.execute(
+                text(
+                    """
+                    CREATE TABLE IF NOT EXISTS content_canonical_election (
+                      content_key       TEXT PRIMARY KEY,
+                      canonical_sig_id  TEXT NOT NULL,
+                      election_reason   TEXT NOT NULL,
+                      elected_at        TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                      updated_at        TIMESTAMPTZ NOT NULL DEFAULT NOW()
+                    );
+                    """
+                )
+            )
+            await database.execute(
+                text(
+                    "CREATE INDEX IF NOT EXISTS idx_content_canonical_election_sig "
+                    "ON content_canonical_election (canonical_sig_id);"
                 )
             )
             # ---------------------------------------------------------------

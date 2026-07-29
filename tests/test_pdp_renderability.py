@@ -23,12 +23,15 @@ from __future__ import annotations
 
 import pytest
 from sqlalchemy import (
+    Boolean,
     Column,
     MetaData,
     String,
     Table,
     create_engine,
+    func,
     literal_column,
+    or_,
     select,
     text,
 )
@@ -37,8 +40,11 @@ from services.pdp_renderability import (
     MERCHANT_SYNCED_LANE_RENDERABLE,
     MERCHANT_SYNCED_PLATFORMS,
     MINTED_SOURCE_SYSTEM,
+    compile_pg,
     pdp_renderable_expression,
     pdp_route_resolvable,
+    pdp_serving_gate_passes,
+    pdp_will_render_expression,
     seed_route_resolves_sql,
 )
 
@@ -73,6 +79,10 @@ def engine():
         Column("platform", String),
         Column("source_system", String),
         Column("source_product_id", String),
+        # Only the serving-gate half reads this. The route-only twins never
+        # touch it, so the MATRIX rows leave it NULL and their answers are
+        # unaffected.
+        Column("content_key", String),
     )
     Table(
         "external_product_seeds",
@@ -80,6 +90,16 @@ def engine():
         Column("external_product_id", String),
         Column("attached_product_key", String),
         Column("status", String),
+    )
+    Table(
+        "index_pipeline_state",
+        md,
+        Column("content_key", String, primary_key=True),
+        Column("serving_eligible", Boolean),
+        # Not read by any predicate in this module. Present so the
+        # citation-floor inertness test can build the ADR-007 widened
+        # eligibility term over the same engine.
+        Column("index_eligible", Boolean),
     )
     md.create_all(eng)
     return eng, md
@@ -762,3 +782,596 @@ def test_seed_exists_stays_correlated_when_compiled_standalone():
     invariant = " ".join(_PUBLIC_NOT_RENDERABLE_COUNT_SQL.split())
     assert invariant.count("FROM external_product_seeds WHERE cp.") == 3
     assert "external_product_seeds, catalog_products" not in invariant
+
+
+# ---------------------------------------------------------------------------
+# THE SERVING-GATE HALF (2026-07-26). ``get_pdp_v2`` refuses at two gates; the
+# tests above cover only the content-route one. These cover the other, and the
+# composite that finally asks both.
+#
+# The cohort they pin: 77 of 4,528 live sitemap URLs served a hard HTTP 500 on
+# 2026-07-26 (77/77 on serial retry) while the feed called every one of them
+# renderable. Each passed the route gate and was rejected by the serving gate
+# with reason='no_price'. If the composite ever stops asking the serving gate,
+# the test named for that cohort fails.
+# ---------------------------------------------------------------------------
+
+# A route-resolvable mirror row — the route half is TRUE for every row here, so
+# whatever these tests measure is the serving half alone.
+_ROUTE_OK_ROW = {
+    "merchant_id": "external_seed",
+    "platform": "external_seed",
+    "source_system": "external_product_seeds_mirror_v1",
+    "source_product_id": "ext_serving_gate",
+    "content_key": "ck_1",
+}
+
+
+def _load_with_index_state(engine, *, content_key, serving_eligible, row=None):
+    """One route-resolvable catalog row + at most one index_pipeline_state row.
+
+    ``serving_eligible=None`` means NO index_pipeline_state row at all — the
+    fail-closed case, which is a different question from a row that exists and
+    says False.
+    """
+    eng, md = engine
+    cp = md.tables["catalog_products"]
+    eps = md.tables["external_product_seeds"]
+    ips = md.tables["index_pipeline_state"]
+    values = {**(row or _ROUTE_OK_ROW)}
+    with eng.begin() as conn:
+        conn.execute(cp.delete())
+        conn.execute(eps.delete())
+        conn.execute(ips.delete())
+        conn.execute(cp.insert().values(product_key="pk_1", **values))
+        conn.execute(
+            eps.insert().values(
+                external_product_id=values["source_product_id"],
+                attached_product_key=None,
+                status="active",
+            )
+        )
+        if serving_eligible is not None:
+            conn.execute(
+                ips.insert().values(
+                    content_key=content_key, serving_eligible=serving_eligible
+                )
+            )
+
+
+def _answers(engine):
+    """(route_only, serving_gate, composite) for the single loaded row."""
+    from db.catalog import catalog_products as real_catalog_products
+
+    eng, _ = engine
+    with eng.connect() as conn:
+        return tuple(
+            bool(x)
+            for x in conn.execute(
+                select(
+                    pdp_renderable_expression(real_catalog_products),
+                    pdp_serving_gate_passes(real_catalog_products),
+                    pdp_will_render_expression(real_catalog_products),
+                ).select_from(real_catalog_products)
+            ).one()
+        )
+
+
+def test_serving_eligible_row_renders(engine):
+    _load_with_index_state(engine, content_key="ck_1", serving_eligible=True)
+    assert _answers(engine) == (True, True, True)
+
+
+def test_the_no_price_cohort_is_route_resolvable_and_still_does_not_render(engine):
+    """THE REGRESSION PIN for the 77 dead sitemap URLs.
+
+    Route-resolvable (an active seed answers on its route key) and NOT
+    serving-eligible. The route-only predicate must keep saying True — the trust
+    layer and the three route twins depend on that answer and this change does
+    not touch it — while the composite the feed and the election read says
+    False.
+    """
+    _load_with_index_state(engine, content_key="ck_1", serving_eligible=False)
+    assert _answers(engine) == (True, False, False)
+
+
+def test_missing_index_pipeline_state_row_fails_closed(engine):
+    """No eligibility row ⇒ no render.
+
+    Mirrors ``shouldFailClosedForMissingPdpServingEligibility``, which returns
+    true whenever DATABASE_URL/PGHOST is set — i.e. always, in prod. A row the
+    index pipeline has never scored is not a row we may advertise.
+    """
+    _load_with_index_state(engine, content_key="ck_1", serving_eligible=None)
+    assert _answers(engine) == (True, False, False)
+
+
+def test_index_state_for_a_DIFFERENT_content_key_does_not_leak(engine):
+    """The join key is content_key, and it has to actually be checked.
+
+    A serving-eligible row for some OTHER content_key must not admit this one —
+    the failure mode a missing join predicate produces.
+    """
+    _load_with_index_state(engine, content_key="ck_somebody_else", serving_eligible=True)
+    assert _answers(engine) == (True, False, False)
+
+
+def test_serving_gate_cannot_rescue_a_dead_content_route(engine):
+    """serving_eligible=TRUE does not make an unroutable row renderable.
+
+    The composite is a conjunction; this pins that the route half survives it.
+    A url_audit row has neither a seed route nor a merchant upstream.
+    """
+    _load_with_index_state(
+        engine,
+        content_key="ck_1",
+        serving_eligible=True,
+        row={
+            "merchant_id": "merch_audit",
+            "platform": "url_audit",
+            "source_system": "url_audit",
+            "source_product_id": "audit-slug",
+            "content_key": "ck_1",
+        },
+    )
+    route_only, serving_gate, composite = _answers(engine)
+    assert (route_only, serving_gate, composite) == (False, True, False)
+
+
+def test_serving_gate_is_evaluated_PER_ROW_across_two_rows(engine):
+    """The behavioural correlation pin for the new EXISTS.
+
+    Same hazard as ``test_every_subquery_is_evaluated_PER_ROW_across_two_rows``:
+    uncorrelated, the serving EXISTS collapses to "some row somewhere is
+    serving_eligible" and admits the whole table. Two rows, both
+    route-resolvable, whose serving answers must DIFFER.
+    """
+    from db.catalog import catalog_products as real_catalog_products
+
+    eng, md = engine
+    cp = md.tables["catalog_products"]
+    eps = md.tables["external_product_seeds"]
+    ips = md.tables["index_pipeline_state"]
+    with eng.begin() as conn:
+        conn.execute(cp.delete())
+        conn.execute(eps.delete())
+        conn.execute(ips.delete())
+        for key, content_key, eligible in (
+            ("pk_live", "ck_live", True),
+            ("pk_no_price", "ck_no_price", False),
+        ):
+            conn.execute(
+                cp.insert().values(
+                    product_key=key,
+                    merchant_id="external_seed",
+                    platform="external_seed",
+                    source_system="external_product_seeds_mirror_v1",
+                    source_product_id=f"ext_{key}",
+                    content_key=content_key,
+                )
+            )
+            conn.execute(
+                eps.insert().values(
+                    external_product_id=f"ext_{key}",
+                    attached_product_key=None,
+                    status="active",
+                )
+            )
+            conn.execute(
+                ips.insert().values(
+                    content_key=content_key, serving_eligible=eligible
+                )
+            )
+
+        rows = dict(
+            conn.execute(
+                select(
+                    real_catalog_products.c.product_key,
+                    pdp_will_render_expression(real_catalog_products),
+                ).select_from(real_catalog_products)
+            ).all()
+        )
+
+    assert bool(rows["pk_live"]) is True
+    assert bool(rows["pk_no_price"]) is False, (
+        "the serving EXISTS went UNCORRELATED — it collapsed into a table-wide "
+        "constant; restore .correlate(cp) in services/pdp_renderability"
+    )
+
+
+def test_serving_exists_stays_correlated_when_compiled_standalone():
+    """compile_pg path: the serving EXISTS must name only index_pipeline_state.
+
+    Same cartesian-product hazard the seed EXISTS documents — an uncorrelated
+    compile emits ``FROM index_pipeline_state, catalog_products AS cp``, turning
+    a per-row answer into "is ANY row serving_eligible".
+
+    Compiles the COMPOSITE, not the serving predicate alone, and that is the
+    point rather than a convenience: the composite's CASE arm references ``cp``
+    outside every subquery, which is what gives the enclosing SELECT a FROM to
+    correlate against. Every real consumer has that property. The bare
+    predicate does NOT — see the correlation note in ``pdp_serving_gate_passes``
+    and the companion test below, which pins that limit rather than pretending
+    it away.
+    """
+    from db.catalog import catalog_products as real_catalog_products
+
+    cp = real_catalog_products.alias("cp")
+    normalized = " ".join(compile_pg(select(pdp_will_render_expression(cp))).split())
+    assert normalized.count("FROM index_pipeline_state WHERE cp.") == 1
+    assert "index_pipeline_state, catalog_products" not in normalized
+    assert normalized.count("FROM catalog_products AS cp") == 1
+
+
+def test_the_bare_serving_predicate_must_not_be_compiled_standalone():
+    """Pins the residual limit HONESTLY, so nobody rediscovers it in prod SQL.
+
+    ``.correlate(cp)`` needs an enclosing SELECT that already names ``cp``.
+    Compile the serving predicate BY ITSELF and there is nothing to correlate
+    to, so SQLAlchemy has to put catalog_products in the subquery's own FROM —
+    a cartesian product that answers "is ANY row serving_eligible", i.e. True
+    for every row as long as one row anywhere qualifies. ``correlate_except``
+    does not change this; verified.
+
+    Asserting the CURRENT (broken-in-isolation) output rather than a wish means
+    that if a future SQLAlchemy makes standalone compiles correlate properly,
+    this test fails and the warning in the docstring gets deleted deliberately
+    instead of rotting. Unreachable from any consumer — all of them select over
+    catalog_products — which is why this is a documented constraint and not a
+    bug to fix here.
+    """
+    from db.catalog import catalog_products as real_catalog_products
+
+    cp = real_catalog_products.alias("cp")
+    alone = " ".join(compile_pg(select(pdp_serving_gate_passes(cp))).split())
+    assert "FROM index_pipeline_state, catalog_products AS cp" in alone, (
+        "standalone compilation now correlates — delete the warning in "
+        "pdp_serving_gate_passes and this test together"
+    )
+
+    # …and the same predicate inside a query over catalog_products is correct.
+    inside = " ".join(
+        compile_pg(
+            select(cp.c.product_key, pdp_serving_gate_passes(cp)).select_from(cp)
+        ).split()
+    )
+    assert "FROM index_pipeline_state WHERE cp.content_key" in inside
+    assert "index_pipeline_state, catalog_products" not in inside
+
+
+def test_the_feed_column_asks_both_gates():
+    """The wiring pin: ``renderable`` on the feed is the COMPOSITE.
+
+    The whole defect was a consumer reading a route-only answer as though it
+    meant "this URL returns 200". Compiling the column and requiring the serving
+    EXISTS in it is what stops that regressing back to the narrow predicate.
+    """
+    from routes.pivota_canonical_routes import _renderable_column
+
+    normalized = " ".join(compile_pg(select(_renderable_column())).split()).lower()
+    assert "from index_pipeline_state" in normalized
+    assert "serving_eligible is true" in normalized
+
+
+def test_public_not_renderable_invariant_stays_on_the_route_only_predicate():
+    """The invariant is deliberately NOT repointed at the composite.
+
+    Its threshold is a measured baseline (1, on prod, post-P3) for the question
+    "trust says public but the gateway has no content route". Folding the
+    serving gate in would redefine the alarm and decalibrate the threshold in
+    one move, with no re-measurement. Kept as an explicit decision so a future
+    reader does not "fix" the inconsistency by accident — see
+    :func:`pdp_will_render_expression`'s docstring.
+    """
+    from services.catalog_invariant_checks import _PUBLIC_NOT_RENDERABLE_COUNT_SQL
+
+    assert "index_pipeline_state" not in _PUBLIC_NOT_RENDERABLE_COUNT_SQL
+
+
+def test_the_offer_free_citation_floor_is_inert_while_the_conjunct_stands():
+    """ADR-007's sitemap widening cannot admit a renderable row today.
+
+    `INDEX_ELIGIBLE_SITEMAP` is ON in prod, so a reader can reasonably believe
+    the offer-free citation floor is live on the sitemap. It is not: the rows the
+    widened eligibility term adds are exactly `index_eligible ∧ ¬serving_eligible`,
+    and every one of them fails the serving conjunct in
+    `pdp_will_render_expression`. Measured on prod 2026-07-26: 100 such rows,
+    78 of which the OLD predicate called renderable, 0 under the new one.
+
+    THIS TEST IS DESIGNED TO FAIL when `get_pdp_v2` learns the floor and the
+    conjunct is relaxed. That is the point — the docs on
+    `sitemap_widen_enabled()` and `pdp_serving_gate_passes()` claim this
+    inertness, and a claim nothing asserts is a claim that rots. When it fails,
+    re-read both docstrings and delete/rewrite them together with this test.
+
+    LIMIT OF THE CANARY, stated because it is easy to over-trust: it only trips
+    on an UNCONDITIONAL relaxation. `pdp_serving_gate_passes` prescribes relaxing
+    the conjunct *behind the same flag the gateway reads* — and under a
+    flag-gated relaxation the flag is off in this test env, the composite still
+    returns False, and this test passes silently while the prod flag makes both
+    inertness docstrings false. Verified: mutating the predicate to be
+    flag-gated leaves THIS test green.
+
+    That hole is closed by
+    `test_the_serving_conjunct_is_unconditional_and_reads_no_flag`, which pins
+    that the compiled SQL does not vary with any INDEX_ELIGIBLE_* var and DOES
+    fail under that same mutation. The two tests are a pair; do not delete one
+    without the other.
+
+    Scoped deliberately to the ELIGIBILITY half of the widening. The widened
+    identity and merchant terms are NOT inert (6 renderable sig-less rows in
+    prod, neutralised by independent sig guards in agent-ui and
+    `candidates_query`) — that is separate from this conjunct and is documented,
+    not pinned here.
+    """
+    from db.catalog import catalog_products as real_catalog_products
+
+    eng = create_engine("sqlite://")
+    md = MetaData()
+    Table(
+        "catalog_products",
+        md,
+        Column("product_key", String, primary_key=True),
+        Column("merchant_id", String),
+        Column("platform", String),
+        Column("source_system", String),
+        Column("source_product_id", String),
+        Column("content_key", String),
+    )
+    Table(
+        "external_product_seeds",
+        md,
+        Column("external_product_id", String),
+        Column("attached_product_key", String),
+        Column("status", String),
+    )
+    Table(
+        "index_pipeline_state",
+        md,
+        Column("content_key", String, primary_key=True),
+        Column("serving_eligible", Boolean),
+        Column("index_eligible", Boolean),
+    )
+    md.create_all(eng)
+
+    cp, eps, ips = (
+        md.tables["catalog_products"],
+        md.tables["external_product_seeds"],
+        md.tables["index_pipeline_state"],
+    )
+    with eng.begin() as conn:
+        # A route-resolvable row that the citation floor — and ONLY the citation
+        # floor — admits: index_eligible, not serving_eligible. The prod cohort.
+        conn.execute(
+            cp.insert().values(
+                product_key="pk_floor",
+                merchant_id="external_seed",
+                platform="external_seed",
+                source_system="external_product_seeds_mirror_v1",
+                source_product_id="ext_floor",
+                content_key="ck_floor",
+            )
+        )
+        conn.execute(
+            eps.insert().values(
+                external_product_id="ext_floor",
+                attached_product_key=None,
+                status="active",
+            )
+        )
+        conn.execute(
+            ips.insert().values(
+                content_key="ck_floor", serving_eligible=False, index_eligible=True
+            )
+        )
+
+        # The widened eligibility term admits it (that is what the flag does)…
+        widened_eligibility = select(func.count()).select_from(ips).where(
+            or_(
+                ips.c.serving_eligible.is_(True),
+                ips.c.index_eligible.is_(True),
+            )
+        )
+        assert conn.execute(widened_eligibility).scalar() == 1, (
+            "the widened eligibility term no longer admits the offer-free "
+            "cohort — this test's premise is gone"
+        )
+
+        # …the content-route half still says yes…
+        assert bool(
+            conn.execute(
+                select(pdp_renderable_expression(real_catalog_products))
+                .select_from(real_catalog_products)
+            ).scalar()
+        ) is True
+
+        # …and the composite says no, which is what makes the flag inert.
+        assert bool(
+            conn.execute(
+                select(pdp_will_render_expression(real_catalog_products))
+                .select_from(real_catalog_products)
+            ).scalar()
+        ) is False, (
+            "the serving conjunct was relaxed: ADR-007's offer-free citation "
+            "floor is now LIVE on the sitemap and the election. Verify the "
+            "Mintree/RED DANE currency defect is fixed first, then update the "
+            "docstrings on sitemap_widen_enabled() and pdp_serving_gate_passes() "
+            "and delete this test."
+        )
+
+
+def test_the_serving_conjunct_is_unconditional_and_reads_no_flag(monkeypatch):
+    """The serving gate must not become flag-gated without this failing.
+
+    Companion to the inertness canary above, and it closes the hole that one only
+    narrates. `pdp_serving_gate_passes` prescribes relaxing the conjunct "behind
+    the same flag the gateway reads" — and under a flag-gated relaxation the
+    inertness canary passes silently in a test env where the flag is off, while
+    prod (where INDEX_ELIGIBLE_SITEMAP=1) makes both inertness docstrings false.
+
+    Parametrising that canary over the flag is not implementable today: the
+    predicate reads no flag, so there would be nothing to parametrise against.
+    What IS implementable is pinning the property those docstrings actually rely
+    on — that the compiled SQL does not depend on any env var. This trips the
+    moment the relaxation is made flag-gated, whichever way the var points.
+    """
+    from db.catalog import catalog_products as real_catalog_products
+
+    cp = real_catalog_products.alias("cp")
+
+    def compiled():
+        return " ".join(compile_pg(select(pdp_will_render_expression(cp))).split())
+
+    for var in ("INDEX_ELIGIBLE_SITEMAP", "INDEX_ELIGIBLE_READ", "INDEX_ELIGIBLE_RECALL"):
+        monkeypatch.delenv(var, raising=False)
+    without_flags = compiled()
+
+    for var in ("INDEX_ELIGIBLE_SITEMAP", "INDEX_ELIGIBLE_READ", "INDEX_ELIGIBLE_RECALL"):
+        monkeypatch.setenv(var, "1")
+    with_flags = compiled()
+
+    assert without_flags == with_flags, (
+        "the renderability predicate now depends on an INDEX_ELIGIBLE_* flag. If "
+        "that is deliberate — get_pdp_v2 learned the offer-free floor and the "
+        "serving conjunct was relaxed behind the gateway's flag — then the "
+        "inertness claims on sitemap_widen_enabled() and pdp_serving_gate_passes() "
+        "are now FALSE in whichever environment has the flag on. Update both "
+        "docstrings and rewrite the inertness canary to assert per-flag-state, "
+        "then delete this test."
+    )
+    # The serving conjunct is present in both, i.e. the equality above is not
+    # trivially satisfied by the conjunct having vanished altogether.
+    assert "index_pipeline_state.serving_eligible IS true" in without_flags
+
+
+# ---------------------------------------------------------------------------
+# sig_pdp_will_render — the read surfaces' entry point into the composite
+# ---------------------------------------------------------------------------
+#
+# These are Postgres-DIALECT COMPILE tests on purpose. The suite runs on SQLite,
+# and #1588 is the standing reminder of what that hides: a `func.concat` with an
+# untyped bind compiled fine, passed a green SQLite suite, and took
+# `GET /api/canonical/products` to a hard 500 in prod because Postgres could not
+# determine the parameter's type (reverted in #1590). Anything embedded in
+# hand-written SQL for a Postgres-only path needs a dialect-level pin.
+
+
+def test_sig_pdp_will_render_keeps_catalog_products_inside_the_exists():
+    """The correlated alias must never reach an OUTER FROM.
+
+    This is the cartesian trap documented on ``pdp_serving_gate_passes``: if the
+    inner ``catalog_products`` escapes to the enclosing FROM, the predicate stops
+    being per-sig and collapses into the global constant "does ANY renderable row
+    exist anywhere" — which is True in prod, so every row would report renderable
+    and the bug would be invisible in exactly the direction that matters.
+    """
+    from sqlalchemy import literal_column, select as _select
+
+    from services.pdp_renderability import compile_pg, sig_pdp_will_render
+
+    sql = " ".join(
+        compile_pg(
+            _select(
+                sig_pdp_will_render(
+                    literal_column("apv.pivota_signature_id")
+                ).label("pdp_renderable")
+            )
+        ).split()
+    )
+    # Whole statement is one SELECT of one EXISTS — no outer FROM at all.
+    assert sql.startswith("SELECT EXISTS (SELECT")
+    assert " AS pdp_renderable" in sql
+    assert "FROM catalog_products AS _rsig_cp" in sql
+    # The alias is referenced only inside the EXISTS; the outer statement has no
+    # FROM clause, so there is nothing for it to correlate wrongly against.
+    assert not sql.split(") AS pdp_renderable")[-1].strip().upper().startswith("FROM")
+    # It is keyed on the OUTER sig, not on a bind or a constant.
+    assert "_rsig_cp.pivota_signature_id = apv.pivota_signature_id" in sql
+
+
+def test_sig_pdp_will_render_asks_both_gates():
+    """Sig grain must not silently drop one of get_pdp_v2's two gates."""
+    from sqlalchemy import literal_column, select as _select
+
+    from services.pdp_renderability import compile_pg, sig_pdp_will_render
+
+    sql = " ".join(
+        compile_pg(
+            _select(sig_pdp_will_render(literal_column("apv.pivota_signature_id")))
+        ).split()
+    )
+    # Gate 1 — serving eligibility.
+    assert "index_pipeline_state.serving_eligible IS true" in sql
+    # Gate 2 — the content route, both seed lanes.
+    assert "external_product_seeds.external_product_id" in sql
+    assert "external_product_seeds.attached_product_key" in sql
+
+
+def test_sig_pdp_will_render_sql_is_an_embeddable_bare_expression():
+    """The raw-SQL twin must drop the SELECT and stay parenthesis-balanced.
+
+    It is interpolated into hand-written SELECT lists, so a stray leading SELECT
+    or an unbalanced paren is a syntax error at query time, not import time.
+
+    THE FIRST VERSION OF THIS TEST CHECKED ONLY THE HEAD, and that is where the
+    bug got through: SQLAlchemy labels an unlabelled expression automatically, so
+    slicing off `"SELECT "` left `... ) AS anon_1` on the tail. Every caller wraps
+    the fragment in parentheses, which puts a column alias inside a scalar
+    expression, and Postgres answers `syntax error at or near "AS"`. All four
+    original assertions passed. Nothing on SQLite ever executes these
+    Postgres-dialect strings, so the tail assertions below and
+    tests/test_citation_read_surfaces_postgres.py are the only things that see it.
+    """
+    from services.pdp_renderability import sig_pdp_will_render_sql
+
+    frag = sig_pdp_will_render_sql("apv.pivota_signature_id")
+    assert frag.startswith("EXISTS (")
+    assert not frag.upper().startswith("SELECT")
+    assert frag.count("(") == frag.count(")")
+    assert frag.endswith(")"), frag[-60:]
+    # Nothing may trail the closing paren — a label, an alias, anything.
+    assert frag.rsplit(")", 1)[-1] == ""
+    # No leftover format placeholders — these strings land in f-strings.
+    assert "{" not in frag and "}" not in frag
+    # It must be usable with a BIND too (the citation single-item read does this).
+    bound = sig_pdp_will_render_sql(":sig")
+    assert "_rsig_cp.pivota_signature_id = :sig" in bound
+
+
+def test_sig_pdp_will_render_matches_the_composite_it_wraps():
+    """The sig wrapper must not drift from pdp_will_render_expression.
+
+    Compares the wrapper's inner predicate against the composite compiled over
+    the same alias, so a change to either lane has to move both or fail here.
+    """
+    from sqlalchemy import literal_column, select as _select
+
+    from db.catalog import catalog_products as real_cp
+    from services.pdp_renderability import (
+        _SIG_RENDER_CP_ALIAS,
+        compile_pg,
+        pdp_will_render_expression,
+        sig_pdp_will_render,
+    )
+
+    composite = " ".join(
+        compile_pg(
+            _select(pdp_will_render_expression(real_cp.alias(_SIG_RENDER_CP_ALIAS)))
+        ).split()
+    )
+    # Strip the wrapper's own SELECT/FROM/key clause and compare the predicate body.
+    inner = " ".join(
+        compile_pg(
+            _select(sig_pdp_will_render(literal_column("apv.pivota_signature_id")))
+        ).split()
+    )
+    # Drop the SELECT keyword and SQLAlchemy's auto-generated column label; what
+    # remains is the predicate body, which must appear verbatim in the wrapper.
+    body = composite[len("SELECT ") :]
+    body = body.split(" FROM catalog_products AS ")[0]
+    body = body.rsplit(" AS anon_", 1)[0].strip()
+    assert body in inner, (
+        "sig_pdp_will_render no longer wraps pdp_will_render_expression verbatim; "
+        "the read surfaces would answer a different question from the sitemap "
+        "feed and the canonical election."
+    )

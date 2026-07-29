@@ -51,6 +51,22 @@ from services.offer_classification import (
 )
 from services.offer_seller_identity import derive_offer_seller_identity
 from services.pdp_category_classifier import category_path_prefix_for_query
+from services.canonical_sitemap_candidates import (
+    electable_sig_exists as _electable_sig_exists,
+)
+from services.pdp_renderability import (
+    compile_pg as _compile_pg,
+    sig_pdp_will_render_sql as _sig_pdp_will_render_sql,
+)
+from sqlalchemy import String as _SAString, and_ as _and_, column as _sacolumn
+from sqlalchemy import literal_column as _literal_column, select as _select, table as _satable
+
+# Migration 181, local Core handle (same pattern as the canonical routes).
+_cce = _satable(
+    "content_canonical_election",
+    _sacolumn("content_key", _SAString),
+    _sacolumn("canonical_sig_id", _SAString),
+)
 from services.beauty_external_ranking import (
     BEAUTY_EXTERNAL_RANKING_AUDIT_VERSION,
     RankedExternalBeautyCandidate,
@@ -549,14 +565,42 @@ def _registrable_host(value: Optional[str]) -> Optional[str]:
 def _is_official_brand_source(
     source_domain: Optional[str], canonical_url: Optional[str]
 ) -> bool:
-    """True when the offer is served from the brand's OWN official domain — its
-    source_domain matches the canonical PDP host (e.g. an official-brand-DTC seed:
-    a cosrx.com offer on a cosrx.com canonical PDP). A retailer/marketplace mirror
-    has a different source_domain and is NOT official. Conservative: both hosts
-    must be present and registrable-domain equal."""
+    """True when two INDEPENDENTLY-SOURCED hosts agree: an offer's serving domain
+    and the canonical PDP host.
+
+    ⚠️ CONSULTED ONLY WHEN `OFFICIAL_SOURCE_SELLER_DERIVED` IS OFF — which is
+    the default, and therefore prod today. See ADR-019. So if you are chasing a
+    false `official_source`, THIS IS THE CODE PRODUCING IT; it becomes dead only
+    once that flag is flipped. (An earlier revision of this docstring said "no
+    longer consulted", which described the intended end state as though it were
+    the current one — the precise failure mode this codebase keeps paying for.)
+
+    The function is not wrong; its INPUTS were. For an external-seed mirror row,
+    `catalog_products.canonical_url` is written from the SAME seed record as
+    `catalog_offers.source_domain`, so this asks whether a value equals itself.
+    Measured on prod 2026-07-27 it was True for 2,646 of 2,646 candidate rows —
+    100%, which is what a tautology looks like — including 480 offers the
+    seller-identity derivation had explicitly typed `retailer`.
+
+    Kept because the comparison IS meaningful for any future caller holding two
+    genuinely independent values. Do not reintroduce it on the offer path: the
+    seller question is answered once, at write time, by
+    services/offer_seller_identity.derive_offer_seller_identity.
+    """
     src = _registrable_host(source_domain)
     canon = _registrable_host(canonical_url)
     return bool(src and canon and src == canon)
+
+
+def _official_source_seller_derived_enabled() -> bool:
+    """ADR-019. When ON, `official_source` IS the stored seller identity and
+    nothing else. Default OFF ⇒ byte-identical to today.
+
+    The OFF state is a KNOWN-FALSE signal, not a safe default: it is off only so
+    that flipping it is a separate, observable step from shipping the code."""
+    return os.getenv("OFFICIAL_SOURCE_SELLER_DERIVED", "").strip().lower() in {
+        "1", "true", "yes", "on",
+    }
 
 
 def _brand_direct_reader_enabled() -> bool:
@@ -630,14 +674,33 @@ def _build_canonical_offer_node(
         row.get("brand_relationship"),
         brand_direct_enabled=_brand_direct_reader_enabled(),
     )
-    # official_source: the offer is served from the brand's OWN official domain
-    # (offer source_domain == the product's canonical PDP host). This is the
-    # authenticity/trust signal for official-brand-DTC seeds that are correctly
-    # NOT is_first_party. Stored is_first_party offers are already official.
-    official_source = bool(is_first_party) or _is_official_brand_source(
-        row.get("offer_source_domain") or row.get("source_domain"),
-        row.get("canonical_url"),
-    )
+    # official_source — the authenticity signal an agent sees. ADR-019.
+    #
+    # ON (seller-derived): the stored seller identity IS the answer. It was
+    # computed once at write time by offer_seller_identity.derive_offer_seller_
+    # identity, which compares the offer domain against the DECLARED BRAND behind
+    # a known-retailer list that preempts everything — and which returns "unknown"
+    # rather than guessing. This also makes this lane agree with the external-seed
+    # lane below (~:1862), which already derives it exactly this way.
+    #
+    # OFF (legacy): additionally trusts source_domain == canonical PDP host. For
+    # an external-seed mirror row BOTH of those are written from the same seed
+    # record, so the comparison is a tautology. Measured on prod 2026-07-27 it
+    # fired on 2,646 of 2,646 candidate rows (100%), including 480 typed
+    # `retailer` and 2,166 the derivation had deliberately left unknown — telling
+    # agents a ulta.com offer is served from the brand's own official domain.
+    #
+    # The cohort the legacy disjunct exists for — "official brand, correctly not
+    # is_first_party" — is EMPTY in prod and structurally so: the derivation sets
+    # brand_direct and is_first_party together. So it has no legitimate consumer;
+    # its whole live effect is the false positives.
+    if _official_source_seller_derived_enabled():
+        official_source = bool(is_first_party)
+    else:
+        official_source = bool(is_first_party) or _is_official_brand_source(
+            row.get("offer_source_domain") or row.get("source_domain"),
+            row.get("canonical_url"),
+        )
     return OfferNode(
         offer_id=str(row.get("offer_id") or ""),
         catalog_track=catalog_track,
@@ -1119,6 +1182,30 @@ def _recall_relevance_v2_enabled() -> bool:
     )
 
 
+# Compiled once at import: "will the PDP for this sig answer 200?", keyed on the
+# citable lane's own sig expression. Module-level so the compile cost is paid at
+# import, not per query. See services.pdp_renderability.sig_pdp_will_render.
+_SIG_RENDERABLE_SQL = _sig_pdp_will_render_sql(
+    "COALESCE(apv.pivota_signature_id, p.pivota_signature_id)"
+)
+
+# The content_key's elected canonical, validated against the live electable set —
+# correlated to this lane's own `p.content_key`, so it answers per row. Same
+# stored election (migration 181) and same validation helper the sitemap feed
+# uses; see routes/agent_citation_v1 for why a fourth independent opinion on
+# "which sibling holds the URL" is the thing to avoid.
+_ELECTED_CANONICAL_SIG_SQL = _compile_pg(
+    _select(_cce.c.canonical_sig_id)
+    .where(
+        _and_(
+            _cce.c.content_key == _literal_column("p.content_key"),
+            _electable_sig_exists(_cce.c.canonical_sig_id, widen=False),
+        )
+    )
+    .limit(1)
+)
+
+
 async def _fetch_citable_canonical_rows(
     *,
     query: str,
@@ -1213,6 +1300,35 @@ async def _fetch_citable_canonical_rows(
             p.source_product_id,
             p.canonical_url,
             p.pivota_canonical_url,
+            -- The citable sig, for the CitationItem's attribution.canonical_url
+            -- (routes/agent_citation_v1._search_row_to_citation). agent_pdp_view
+            -- FIRST because it is content_key-keyed and is the surface the
+            -- single-item citation read resolves from — so the search and
+            -- single-item endpoints emit the SAME URL for the same content_key,
+            -- which they would not if this picked whichever product_key won the
+            -- rank. Falls back to the product's own sig for a row with no apv row
+            -- yet (this lane reads catalog_products, so that is reachable).
+            -- NOTE: this SELECT is an f-string; never write a brace in here.
+            COALESCE(apv.pivota_signature_id, p.pivota_signature_id)
+                AS pivota_signature_id,
+            -- Will the PDP for that exact sig answer 200? Both of get_pdp_v2's
+            -- gates. Keyed on the SAME COALESCE expression the URL is built from,
+            -- not on p's own sig — otherwise the flag could describe a different
+            -- row than the URL we emit, which is the precise class of lie this
+            -- signal exists to remove. Free here (this lane already reads
+            -- catalog_products); the single-item citation read pays a second
+            -- round trip instead because it can absorb one behind its 300s cache,
+            -- NOT because agent_pdp_v1 cannot carry the predicate — #1602 measured
+            -- it at 0.18-0.57ms and put it inline there. See
+            -- routes/agent_citation_v1._sig_renderable for why materialising the
+            -- flag was rejected.
+            ({_SIG_RENDERABLE_SQL}) AS pdp_renderable,
+            -- The content_key's ELECTED canonical sig, intersected with the live
+            -- electable set, so a citable hit whose own PDP is dead can still be
+            -- given a URL that answers 200. Same stored election + same
+            -- validation the sitemap feed uses, so the cited URL is the
+            -- advertised URL. NULL today for every row: the table is unseeded.
+            ({_ELECTED_CANONICAL_SIG_SQL}) AS elected_canonical_sig,
             p.catalog_track,
             p.truth_tier,
             p.readiness_tier,

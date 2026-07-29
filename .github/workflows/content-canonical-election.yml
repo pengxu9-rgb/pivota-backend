@@ -1,0 +1,189 @@
+name: Content Canonical Election
+
+# Keeps ONE canonical URL elected per content_key (migration 181).
+#
+# 474 content_keys serve identical content under 2-7 sitemap-eligible sigs. The
+# election decides which one holds the URL; the sitemap advertises it and
+# get_pdp_v2 hands it to every sibling PDP as its <link rel="canonical">.
+#
+# WHY THIS HAS TO BE SCHEDULED, not run by hand. A stored winner is sticky, and
+# the ONLY thing that moves it is the winner ceasing to be a candidate. Until
+# this sweep runs, the readers hold a stale election — they are guarded (both
+# the feed and get_pdp_v2 intersect the stored winner with the live electable
+# set, degrading to "no election" rather than pointing at a dead URL), but a
+# guarded stale election means those content_keys silently lose their
+# cross-canonical and go back to being duplicates. This sweep is what repairs
+# them, so the repair interval IS the duplicate-exposure window.
+#
+# Runs --seed-from-sitemap every time, deliberately. Stored winners still
+# outrank incumbency, so seeding changes nothing for settled content_keys; it
+# only supplies the tiebreak for groups being elected for the FIRST time, and
+# for any group whose winner died. Without it, a re-election ignores which
+# sibling is already indexed and can move a live URL for no reason.
+
+on:
+  workflow_dispatch:
+    inputs:
+      apply:
+        description: "Write the elections (unchecked = dry-run report only)"
+        required: true
+        default: false
+        type: boolean
+      seed_from_sitemap:
+        description: "Sitemap URL/path to import incumbency from"
+        required: false
+        default: "https://agent.pivota.cc/sitemap-products.xml"
+        type: string
+      skip_seed:
+        # A separate boolean because BLANKING the field above does NOT disable
+        # seeding: GitHub's `A && B || C` yields C whenever B is falsy, and ''
+        # is falsy — so a blank input silently falls back to the default URL.
+        description: "Run WITHOUT importing sitemap incumbency"
+        required: false
+        default: false
+        type: boolean
+  # SCHEDULE ENABLED 2026-07-27. It was deliberately disabled at merge until three
+  # preconditions held; all three now do, and each was verified rather than
+  # assumed:
+  #
+  #   1. both counterpart PRs MERGED — PIVOTA-Agent #1832 and pivota-agent-ui #283,
+  #      both 2026-07-27 ~02:55 UTC;
+  #   2. both DEPLOYED — 8/8 sampled duplicate-group member PDPs served
+  #      `rel=canonical` pointing at a sibling rather than themselves, which is the
+  #      observable only the deployed gateway produces;
+  #   3. the seed APPLIED and EYEBALLED once — 4,266 elections written, and the
+  #      operator read `moved_from_sitemap` (2, against the runbook's stale ~350)
+  #      and both moved URLs before applying. A follow-up steady-state sweep
+  #      reported written 0 / new_elections 0 / replacements 0, i.e. converged.
+  #
+  # The interval is the duplicate-exposure window: a stale election is guarded
+  # (readers degrade to "no election") but a guarded stale election means those
+  # content_keys quietly go back to being duplicates until this repairs them.
+  #
+  # SAFE TO AUTO-APPLY ONLY BECAUSE #1597 LANDED FIRST. Before it, a sweep that
+  # had to re-elect a few thousand content_keys wrote one row per round trip —
+  # 7-30 minutes against this job's 15-minute timeout — and a timeout mid-write
+  # orphaned a lock-holding transaction that made the NEXT run block and look like
+  # an outage. #1597 batched it (4,266 rows -> 9 statements), made `replacements`
+  # count only real moves so the "URL MOVED" warning below stops crying wolf on
+  # every run, and set DB_POOL_ACQUIRE_TIMEOUT_SECONDS because the 5s default is
+  # for in-cluster and this job reaches Postgres over the public proxy.
+  #
+  # REQUIRES the DATABASE_URL repo secret, set to the PUBLIC proxy URL — a GitHub
+  # runner cannot resolve `*.railway.internal`. Without it every scheduled run
+  # fails fast and harmlessly at the guard in the first step.
+  schedule:
+    # Every 6h at :52. This LEADS agent-ui's sitemap cron (17 1,7,13,19 UTC) by
+    # ~25 minutes rather than trailing it. Originally noted as a caveat — the
+    # incumbency it reads is the sitemap about to be replaced — but now that the
+    # election is SEEDED, leading is the better order: stored winners outrank
+    # incumbency, so incumbency only decides brand-new content_keys, while the
+    # sitemap (which since #283 takes this table as layer 0 of its dedup) gets a
+    # fresh election to read 25 minutes later. Convergence is unaffected either
+    # way; an out-of-order run falls through to the sig-class and lexicographic
+    # layers, which both sides compute identically.
+    - cron: "52 */6 * * *"
+
+# One sweep at a time. plan_elections reads its candidate snapshot OUTSIDE the
+# write transaction, so two overlapping runs could plan against the same state
+# and the later write would land on stale reasoning.
+concurrency:
+  group: content-canonical-election
+  cancel-in-progress: false
+
+jobs:
+  content-canonical-election:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    env:
+      DATABASE_URL: ${{ secrets.DATABASE_URL }}
+      # Interpolated as an ENV VAR, never into the `run:` script text. A
+      # workflow_dispatch input spliced straight into bash is command injection
+      # against a job that holds the production DATABASE_URL — verified with
+      # `x"; echo $DATABASE_URL; #`, which printed the secret. Anyone with repo
+      # write can dispatch, so this is a write -> prod-credential escalation.
+      SEED_FROM_SITEMAP: ${{ (github.event_name == 'workflow_dispatch' && inputs.skip_seed) && '' || (github.event_name == 'workflow_dispatch' && inputs.seed_from_sitemap || 'https://agent.pivota.cc/sitemap-products.xml') }}
+      DB_POOL_MIN_SIZE: "1"
+      DB_POOL_MAX_SIZE: "2"
+      # db/database.py defaults the asyncpg CONNECT timeout to 5s, which is tuned
+      # for in-cluster Railway (internal DNS, ~1ms RTT). This job runs on a GitHub
+      # runner and must reach Postgres over the PUBLIC proxy, where the TLS+auth
+      # handshake regularly exceeds 5s — measured 2026-07-26, an out-of-cluster
+      # seed failed at `database.connect()` with a bare TimeoutError on roughly
+      # half its attempts while a plain `asyncpg.connect(timeout=30)` to the same
+      # host succeeded every time. The failure is indistinguishable from an outage
+      # in the logs, so raise it rather than leave the sweep flaky.
+      DB_POOL_ACQUIRE_TIMEOUT_SECONDS: "45"
+      PYTHONDONTWRITEBYTECODE: "1"
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: "pip"
+
+      - name: Install deps
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Elect canonicals (dry-run report)
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [[ -z "${DATABASE_URL:-}" ]]; then
+            echo "DATABASE_URL secret is required" >&2
+            exit 1
+          fi
+          out_dir="reports/workflow_ops/content-canonical-election/${{ github.run_id }}"
+          mkdir -p "${out_dir}"
+          # From the job env, NOT interpolated into this script. See the SEED_FROM_SITEMAP note above.
+          seed="${SEED_FROM_SITEMAP:-}"
+          python scripts/elect_content_canonicals.py \
+            ${seed:+--seed-from-sitemap "${seed}"} \
+            | tee "${out_dir}/dry_run.json"
+
+      - name: Elect canonicals (apply)
+        # Scheduled runs auto-apply — that is the point. Manual runs apply only
+        # when the box is checked.
+        if: ${{ github.event_name == 'schedule' || (github.event_name == 'workflow_dispatch' && inputs.apply) }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          out_dir="reports/workflow_ops/content-canonical-election/${{ github.run_id }}"
+          mkdir -p "${out_dir}"
+          # From the job env, NOT interpolated into this script. See the SEED_FROM_SITEMAP note above.
+          seed="${SEED_FROM_SITEMAP:-}"
+          python scripts/elect_content_canonicals.py \
+            --apply \
+            ${seed:+--seed-from-sitemap "${seed}"} \
+            | tee "${out_dir}/apply.json"
+
+      - name: Flag moved URLs
+        # Every replacement is a LIVE URL moving. On a healthy corpus this is
+        # zero; a non-zero count means either a winner genuinely died or
+        # something upstream is flapping `renderable`, and both are worth a
+        # human look rather than a silent line in a JSON artifact.
+        if: ${{ github.event_name == 'schedule' || (github.event_name == 'workflow_dispatch' && inputs.apply) }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          report="reports/workflow_ops/content-canonical-election/${{ github.run_id }}/apply.json"
+          moved=$(python -c "import json,sys; print(json.load(open(sys.argv[1]))['replacements'])" "${report}")
+          echo "replacements=${moved}" >> "${GITHUB_STEP_SUMMARY}"
+          if [[ "${moved}" != "0" ]]; then
+            echo "::warning::${moved} elected canonical URL(s) MOVED — each is a live URL changing. See the apply.json artifact."
+            python -c "import json,sys; [print(' ', r) for r in json.load(open(sys.argv[1]))['replaced']]" "${report}" \
+              >> "${GITHUB_STEP_SUMMARY}"
+          fi
+
+      - name: Upload artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: content-canonical-election-${{ github.run_id }}
+          path: reports/workflow_ops/content-canonical-election/${{ github.run_id }}
+          retention-days: 14

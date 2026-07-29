@@ -28,6 +28,13 @@ from urllib.parse import urlparse
 
 from db.database import database
 from db.merchant_onboarding import get_merchant_onboarding
+from services.connection_layer import (
+    LAYER_CRAWLED,
+    LIVE_STORE_STATUSES,
+    TRACK_INTERNAL_MERCHANT,
+    classify_connection_layer,
+    connection_layer_slug,
+)
 from services.merchant_psp_config_service import evaluate_psp_readiness
 from services.merchant_store_service import get_merchant_active_stores, get_primary_store
 from services.platform_capabilities import (
@@ -231,6 +238,12 @@ async def resolve_merchant_capability(
             "protocols": [],
             "has_native_payments": None,
             "settlement_rails": [],
+            # No merchant at all → the honest floor, same as every other field
+            # on this branch. Kept on the early returns so the response SHAPE is
+            # constant; a key that appears only on the happy path is how a
+            # consumer learns to write `?.connection_layer_ceiling ?? 3`.
+            "connection_layer_ceiling": LAYER_CRAWLED,
+            "connection_layer_ceiling_slug": connection_layer_slug(LAYER_CRAWLED),
         }
 
     store = await _select_target_store(
@@ -249,6 +262,10 @@ async def resolve_merchant_capability(
             "protocols": [],
             "has_native_payments": None,
             "settlement_rails": [],
+            # Selector matched no active store → no store connection we are
+            # willing to act on, so the ceiling is the floor.
+            "connection_layer_ceiling": LAYER_CRAWLED,
+            "connection_layer_ceiling_slug": connection_layer_slug(LAYER_CRAWLED),
             "store_selector": {
                 "store_id": str(store_id or "").strip() or None,
                 "platform": str(platform_override or "").strip().lower() or None,
@@ -311,6 +328,62 @@ async def resolve_merchant_capability(
         native_payments_as_of=native_payments_as_of,
     )
 
+    # ADR-018 connection layer — the merchant-side CEILING, not a row's layer.
+    #
+    # The layer is a property of a catalog ROW (a crawled row stays layer 1 even
+    # under a fully connected merchant — ADR-001: the row's provenance is the
+    # row's, not the merchant's). This resolver is merchant-scoped and has no
+    # `catalog_track`, so what it can honestly answer is "the highest layer any
+    # of THIS merchant's own synced rows could reach" — hence the explicit
+    # `internal_merchant` track below and the `_ceiling` suffix on the key.
+    #
+    # `merchant_known` is `merchant is not None`, which is the F3 distinction:
+    # a crawled seller has no merchant_onboarding row at all and is layer 1 by
+    # construction, never an unknown to be defaulted (services/connection_layer).
+    #
+    # ⚠️ The store's STATUS is checked, not merely that a store dict came back.
+    # `get_merchant_active_stores`' legacy-MCP leg synthesises a store row
+    # whenever `mcp_platform` is set and stamps it
+    # `status = 'active' if mcp_connected else 'disconnected'` — appending it
+    # EITHER WAY. So `bool(store)` is true for a merchant whose only connection
+    # is a disconnected legacy MCP link, and a plain truth test labelled that
+    # merchant layer 2 while the SQL twin (which sees no merchant_stores row at
+    # all) said layer 1. Measured, not theorised.
+    store_status = str((store or {}).get("status") or "").strip().lower()
+    connection_layer_ceiling = classify_connection_layer(
+        catalog_track=TRACK_INTERNAL_MERCHANT,
+        merchant_known=merchant is not None,
+        has_active_store=store_status in LIVE_STORE_STATUSES,
+        # ⚠️ The PORTAL FLAG, not `has_live_psp`. These are different facts from
+        # different tables and this call site used to pass the wrong one:
+        #
+        #   merchant_onboarding.psp_connected  — the flag in the Pivota merchant
+        #                                        portal. THE founder ruling.
+        #   has_live_psp                       — derived from
+        #                                        `merchant_psps WHERE status='active'`
+        #
+        # `classify_connection_layer`'s docstring said "the portal flag" while the
+        # only caller fed "has an active PSP record", so one policy had two
+        # answers — precisely what `services/connection_layer` exists to prevent,
+        # and it agreed with its own SQL twin (`COALESCE(mo.psp_connected, false)`)
+        # only by luck. Measured on prod at the time of the fix: 2 merchants have
+        # an active `merchant_psps` row with the portal flag unset. Both are
+        # ceiling 1 today (no live store), so nothing diverged yet — the moment
+        # either connects a store, the resolver says 3 and the SQL twin says 2.
+        #
+        # NULL/absent stays NULL rather than being coerced to False: "never went
+        # through the flow" is not "went through it and failed", and `_truthy`
+        # reads both as not-yes, matching the twin's COALESCE.
+        psp_connected=(merchant or {}).get("psp_connected"),
+        # INERT since the 2026-07-28 ruling dropped the `has_shopify_payments`
+        # leg — `classify_connection_layer` accepts this and does not read it.
+        # Retained deliberately (docs/adr/ADR-018), but the call site gave a
+        # reader no way to know that, which is how an argument quietly becomes
+        # load-bearing again. It IS still read, and still matters, in
+        # `get_platform_settlement_rails` above — a different question.
+        has_native_payments=has_native_payments,
+    )
+
     result: Dict[str, Any] = {
         "merchant_id": merchant_id,
         "platform": platform or PLATFORM_SOURCE_UNKNOWN,
@@ -320,6 +393,8 @@ async def resolve_merchant_capability(
         "protocols": protocols,
         "has_native_payments": has_native_payments,
         "settlement_rails": settlement_rails,
+        "connection_layer_ceiling": connection_layer_ceiling,
+        "connection_layer_ceiling_slug": connection_layer_slug(connection_layer_ceiling),
     }
     if selector_requested:
         result["store_selector"] = {

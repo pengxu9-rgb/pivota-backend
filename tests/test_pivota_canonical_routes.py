@@ -189,10 +189,21 @@ def _row(sig_suffix: str, **overrides) -> Dict[str, Any]:
         "pivota_signature_id": f"sig_{sig_suffix}",
         "pivota_canonical_url": f"https://agent.pivota.cc/products/sig_{sig_suffix}",
         "content_key": f"ck_{sig_suffix}",
+        # Migration 181: the ONE elected sig for this content_key. Defaults to
+        # SELF, which is the shape of the 4,054 content_keys carrying a single
+        # candidate; override it to model a member of a duplicate group.
+        "canonical_sig_id": f"sig_{sig_suffix}",
         "serving_eligible": True,
         # Row-grain PDP renderability (approved + live_read_enabled identity
         # listing). The feed exposes it; it does not filter on it.
         "renderable": True,
+        # Row-grain PDP content depth: description OR INCI OR dossier. Answers
+        # "is there prose on this page", where renderable answers "will the
+        # page answer at all". Also exposed, also unfiltered.
+        "content_depth": True,
+        # Row-layer retirement flag (suppression_reason set, suppressed_at NULL).
+        # Default False = a live row; tests that need the tombstoned shape override.
+        "tombstoned": False,
         "suppressed_at": None,
         "index_eligible": False,
         "blocker_code": None,
@@ -280,6 +291,28 @@ def test_get_canonical_pdp_returns_product_for_existing_sig(env):
     assert p["canonical_url"] == "https://agent.pivota.cc/products/sig_abc"
     assert p["merchant_canonical_url"] == "https://example.com/p/abc"
     assert p["platform"] == "shopify"
+
+
+def test_by_sig_read_tells_the_truth_about_its_own_canonical_url(env):
+    """The citation read must say whether the URL it emits is followable.
+
+    879 of 5,887 live feed rows do not render, and this route answered 200 with a
+    fully populated payload — canonical_url included — for every one of them. The
+    record was citable and the link was dead, which is worse than not serving it.
+
+    A SIGNAL, NOT A FILTER: `sig_def` is non-renderable and is still served with
+    full content, because ADR-007 SLICE 1 exists to keep such rows CITABLE.
+    """
+    renderable = env.get("/api/canonical/products/sig_abc").json()["product"]
+    assert renderable["renderable"] is True
+    assert renderable["canonical_url"] == "https://agent.pivota.cc/products/sig_abc"
+
+    dead = env.get("/api/canonical/products/sig_def")
+    assert dead.status_code == 200, "non-renderable rows stay CITABLE, not withheld"
+    dead_product = dead.json()["product"]
+    assert dead_product["renderable"] is False
+    # Content is still fully served — only the link is flagged.
+    assert dead_product["title"] and dead_product["brand"]
 
 
 def test_get_canonical_pdp_404_for_unknown_sig(env):
@@ -376,9 +409,31 @@ def test_list_canonical_pdps_includes_storeless_when_sitemap_widened(
     assert storeless["sig_id"] is None
     assert storeless["serving_eligible"] is False
     assert storeless["index_eligible"] is True
-    assert storeless["canonical_url"] == "https://agent.pivota.cc/products/ck_storeless"
+    # A sig-less row has NO followable PDP, so it reports null rather than the
+    # content_key URL form this used to synthesize. Measured in prod 2026-07-26:
+    # agent.pivota.cc/products/{ck_*} is a hard HTTP 500 for 135/135 content_keys
+    # probed — the gateway's resolve keys on cp.pivota_signature_id, so no ck_*
+    # id can match. See the note at the top of routes/pivota_canonical_routes.
+    assert storeless["canonical_url"] is None
     # serving rows now also carry the index_eligible flag (False) for the UI gate
     assert by_ck["ck_abc"]["index_eligible"] is False
+
+
+def test_feed_never_emits_a_content_key_pdp_url(env, monkeypatch: pytest.MonkeyPatch):
+    """No row, widened or not, may advertise the ck URL form — it always 500s.
+
+    Pins the whole feed rather than one row: the old fallback fired for ANY row
+    whose pivota_canonical_url was null, so a single-row assertion would not
+    catch it coming back on a different lane.
+    """
+    monkeypatch.setenv("INDEX_ELIGIBLE_SITEMAP", "1")
+    body = env.get("/api/canonical/products").json()
+    for item in body["items"]:
+        url = item["canonical_url"]
+        if url is None:
+            continue
+        assert "/products/ck_" not in url, item
+        assert url.startswith("https://agent.pivota.cc/products/sig_"), item
 
 
 def test_list_canonical_pdps_excludes_non_indexable_merchant(env):
@@ -414,6 +469,32 @@ def test_list_canonical_pdps_carries_renderable_without_filtering(env):
     by_sig = {i["sig_id"]: i for i in body["items"]}
     assert by_sig["sig_abc"]["renderable"] is True
     assert by_sig["sig_def"]["renderable"] is False  # listed, flagged dead
+    assert body["total"] == 3
+
+
+def test_list_canonical_pdps_carries_content_depth_without_filtering(env, monkeypatch):
+    """The thin-content floor is ADVISORY on this feed, exactly like renderable.
+
+    364 of the 3,326 URLs the sitemap advertised on 2026-07-25 answered a clean
+    200 and still served ~510 chars of chrome. The feed flags them so the
+    generator can drop them; it must not drop them itself, or every other
+    consumer of this endpoint silently loses rows it still needs.
+    """
+    from routes import pivota_canonical_routes as pcr
+
+    rows = list(pcr.database._rows)  # type: ignore[attr-defined]
+    rows[1] = {**rows[1], "renderable": True, "content_depth": False}
+    monkeypatch.setattr(pcr.database, "_rows", rows, raising=False)
+
+    res = env.get("/api/canonical/products")
+    assert res.status_code == 200
+    body = res.json()
+    by_sig = {i["sig_id"]: i for i in body["items"]}
+
+    assert by_sig["sig_abc"]["content_depth"] is True
+    # Renderable AND shallow: present in the feed, flagged for the generator.
+    assert by_sig["sig_def"]["content_depth"] is False
+    assert by_sig["sig_def"]["renderable"] is True
     assert body["total"] == 3
 
 
@@ -547,6 +628,34 @@ def test_list_canonical_pdps_rejects_malformed_cursor(env):
         assert "cursor" in res.json()["detail"]
 
 
+def test_list_publishes_the_VALIDATED_election_not_the_raw_column(env):
+    """The feed must never emit an election it has not re-validated.
+
+    A stored election is durable; electability is live. If the elected sig has
+    stopped rendering, the sitemap correctly advertises a live sibling while an
+    unvalidated read would still hand that sibling the dead sig — so we would
+    submit URL B while B's own page canonicalised at a URL that 500s, and the
+    content_key would lose ALL index presence.
+
+    Asserted against the SQL THE ROUTE ISSUES, deliberately. The first version
+    of this test compiled `_elected_canonical_sig_column` on its own and passed
+    with the route reverted to `content_canonical_election.c.canonical_sig_id`,
+    because the helper still existed — it proved the helper worked, not that
+    anything called it.
+    """
+    client = env
+    assert client.get("/api/canonical/products").status_code == 200
+
+    from routes import pivota_canonical_routes as pcr
+
+    sql = "\n".join(pcr.database.compiled_sql)
+    # The guard re-asks the serving question of the ELECTED row, on its own
+    # alias — a raw column reference carries none of this.
+    assert "cp_elected" in sql, "the feed is publishing an UNVALIDATED election"
+    assert "cp_elected.suppression_reason IS NULL" in sql
+    assert "ips_elected.serving_eligible IS true" in sql
+
+
 def test_list_canonical_pdps_uses_index_pipeline_state_join(env):
     client = env
     res = client.get("/api/canonical/products")
@@ -576,6 +685,37 @@ def test_list_canonical_pdps_uses_index_pipeline_state_join(env):
     assert "pdp_identity_listing" not in sql
     assert "live_read_enabled" not in sql
     assert "external_product_seeds" in sql
+    # …and, since 2026-07-26, the OTHER gate get_pdp_v2 refuses at. The
+    # `renderable` column asked only the content-route question, so the 100
+    # widen-only rows (index_eligible, serving_eligible=false, no_price) were
+    # advertised as renderable and served hard 500s — 77 of them in the live
+    # sitemap. The column is now the composite, which means the list query
+    # carries a CORRELATED EXISTS over index_pipeline_state IN ADDITION to the
+    # join used for the eligibility filter. Pinned here because this suite's
+    # FakeDb never evaluates the expression — it returns canned rows, so a
+    # `renderable` regression is invisible to every other test in this file.
+    # Semantics live in tests/test_pdp_renderability.py.
+    #
+    # ANCHOR THE SLICE FIRST. An earlier version of this pin split on
+    # `") AS renderable"` without checking it was present: under the route-only
+    # predicate the column ends `… END AS renderable`, so split() returned one
+    # element, `[0]` was the WHOLE statement, and the search then found
+    # `serving_eligible IS true` in the WHERE clause contributed by
+    # eligibility_predicate. It passed with the fix fully reverted. Verified by
+    # mutation both ways this time.
+    # Whitespace-normalise: SQLAlchemy wraps subqueries, so the EXISTS renders
+    # as `FROM index_pipeline_state \nWHERE …` and a raw substring check misses.
+    flat = " ".join(sql.split())
+    assert ") AS renderable" in flat, (
+        "the renderable column no longer ends in a parenthesised expression — "
+        "the composite was reverted to the bare route-only CASE"
+    )
+    renderable_expr = flat.split(") AS renderable")[0]
+    assert (
+        "FROM index_pipeline_state WHERE catalog_products.content_key"
+        in renderable_expr
+    ), "the renderable column dropped the correlated serving-gate EXISTS"
+    assert "index_pipeline_state.serving_eligible IS true" in renderable_expr
     # Suppressed rows are withdrawn from the advertised feed.
     assert "catalog_products.suppressed_at IS NULL" in sql
 
@@ -725,3 +865,34 @@ def test_list_canonical_pdps_times_out_slow_database(monkeypatch: pytest.MonkeyP
 
     assert res.status_code == 504
     assert res.json()["detail"]["operation"] == "product_signature_count"
+
+
+def test_list_canonical_pdps_carries_tombstoned_without_filtering(env, monkeypatch):
+    """Row-layer retirement is ADVISORY here, exactly like renderable/content_depth.
+
+    `suppression_reason` set WITHOUT `suppressed_at` leaves a row serving, so it
+    passes every `suppressed_at IS NULL` filter including this feed's own
+    `sitemap_candidate_filter`. Measured 2026-07-29: 187 of the 7,509 advertised
+    URLs point at such a row, 135 of them retired for carrying the WRONG BRAND.
+
+    The feed must SAY SO and still emit the row — it is a diagnostic surface as
+    well as a sitemap source, and filtering here would destroy the evidence the
+    same way it would for renderable=false rows. The generator does the dropping.
+    """
+    from routes import pivota_canonical_routes as pcr
+
+    rows = list(pcr.database._rows)  # type: ignore[attr-defined]
+    rows[1] = {**rows[1], "renderable": True, "tombstoned": True}
+    monkeypatch.setattr(pcr.database, "_rows", rows, raising=False)
+
+    res = env.get("/api/canonical/products")
+    assert res.status_code == 200
+    body = res.json()
+    by_sig = {i["sig_id"]: i for i in body["items"]}
+
+    assert by_sig["sig_abc"]["tombstoned"] is False
+    # Retired but still renderable: PRESENT in the feed, flagged for the generator.
+    assert by_sig["sig_def"]["tombstoned"] is True
+    assert by_sig["sig_def"]["renderable"] is True, (
+        "the row must not be filtered out — flagging it is the whole point"
+    )

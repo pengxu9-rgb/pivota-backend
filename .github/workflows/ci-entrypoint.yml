@@ -1,0 +1,376 @@
+name: CI Entrypoint
+
+# THE ONE CHECK THAT ALWAYS RUNS — so that a required check can exist at all.
+#
+# WHY THIS IS NEEDED. Branch protection was configured here 2026-07-29 with three
+# required status checks and immediately blocked a legitimate PR forever: the
+# required gate was path-filtered, the PR touched only `.github/workflows/`, so
+# the check never reported — and a required check that never reports never
+# passes. Every pytest workflow here is path-filtered, so no single one was safe
+# to require. `CI Entrypoint` is now the required check on this repo.
+#
+# ⚠️ THIS FILE IS SYNCED WITH `PIVOTA-Agent/.github/workflows/ci-entrypoint.yml`.
+# They were allowed to diverge for exactly one day and the divergence was NOT
+# cosmetic: the port to PIVOTA-Agent needed matrix expansion, and building it
+# there surfaced THREE defects that were sitting latent in this copy — branch
+# filters ignored (a stacked PR becomes permanently unmergeable), a dead warning
+# path, and a glob that contradicted its own comment. Two copies of one
+# predicate is the divergence ADR-012 names. Change both, or neither.
+#
+# The matrix expansion is carried even though this repo has no matrix jobs
+# today: the alternative is remembering to add it the day someone does, which is
+# precisely the bet that produced the 92%-uncovered test suite.
+#
+# This job has NO `paths:` filter. That is its entire reason to exist: it always
+# runs, so it can always report, so it can be required.
+#
+# WHAT IT ACTUALLY CHECKS — not a rubber stamp:
+#   1. Which gates SHOULD have run, derived from this PR's changed files against
+#      each workflow's OWN declared `paths:`.
+#   2. That each of those gates DID run and concluded successfully.
+#   3. That a gate which should have run but is ABSENT is a failure — the
+#      "silently did not run" class that produced 92% uncovered tests, the
+#      unexecuted rig guards (#1600) and #1829's never-run error suite.
+#
+# 🚫 IT DOES NOT KEEP ITS OWN COPY OF THE PATH FILTERS. It reads them out of the
+# workflows at runtime. A second copy would drift from the first, which is the
+# per-consumer divergence ADR-012 names, and this file would become the next
+# hand-maintained list that silently stops matching.
+
+on:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  checks: read
+  contents: read
+  pull-requests: read
+
+concurrency:
+  group: ci-entrypoint-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  required:
+    name: CI Entrypoint
+    runs-on: ubuntu-latest
+    # Generous: it waits for the slowest real gate. The sweep is ~2min, the
+    # audit gate longer. Well under the cost of a gate that cannot block.
+    timeout-minutes: 40
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          # F1: on workflow_dispatch the script diffs HEAD~1, which FAILS on a
+          # depth-1 checkout — returncode 128, empty file list, nothing expected,
+          # green tick having verified nothing. Full history plus the explicit
+          # returncode check below closes it.
+          fetch-depth: 0
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - run: pip install --quiet pyyaml
+
+      - name: Verify every gate that should have run, did
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha || github.sha }}
+          BASE_REF: ${{ github.base_ref }}
+          REPO: ${{ github.repository }}
+        run: |
+          python - <<'PY'
+          import json, os, re, subprocess, sys, time
+          import yaml
+
+          REPO = os.environ['REPO']
+          BASE = os.environ.get('BASE_REF') or ''
+          SHA = os.environ['HEAD_SHA']
+          PR = os.environ.get('PR_NUMBER')
+          SELF = 'CI Entrypoint'
+          # BUILT FROM PARTS, NEVER WRITTEN LITERALLY. A `run:` body is scanned by
+          # the Actions TEMPLATE EVALUATOR before any shell exists, so a literal
+          # `${'{'}{` in this script is parsed as an expression — and an invalid one
+          # rejects the whole workflow at load time: zero jobs, `total_count: 0`,
+          # and a failure with no log to read. That is exactly how the previous
+          # commit broke this file, and it is the same trap the repo already
+          # documented for free-form workflow inputs.
+          DOLLAR_BRACE = chr(36) + '{' + '{'
+
+          def gh_json(path):
+              """Every JSON document `gh api --paginate` emits, decoded.
+
+              F5: for an OBJECT-returning endpoint (check-runs) gh concatenates
+              one document per page with NO separator — measured: 4 objects, 0
+              newlines. Splitting on '\\n' therefore hands json.loads the whole
+              blob and raises `Extra data`, uncaught, above 100 check runs on one
+              SHA. (Array endpoints like pulls/N/files are merged by gh into one
+              valid array, so those were always fine.) raw_decode walks whatever
+              shape arrives.
+              """
+              out = subprocess.run(['gh', 'api', path, '--paginate'],
+                                   capture_output=True, text=True)
+              if out.returncode != 0:
+                  sys.exit(f"::error::gh api {path} failed: {out.stderr.strip()[:300]}")
+              dec, idx, docs = json.JSONDecoder(), 0, []
+              raw = out.stdout.strip()
+              while idx < len(raw):
+                  obj, end = dec.raw_decode(raw, idx)
+                  docs.append(obj)
+                  idx = end
+                  while idx < len(raw) and raw[idx].isspace():
+                      idx += 1
+              return docs
+
+          # ---- 1. what changed -------------------------------------------------
+          if PR:
+              files = [f['filename']
+                       for doc in gh_json(f'repos/{REPO}/pulls/{PR}/files')
+                       for f in doc]
+          else:
+              # RETURNCODE CHECKED. Unchecked, a failed diff yields '' -> no files
+              # -> nothing expected -> exit 0. A dispatch that verifies nothing
+              # while reporting success is the exact shape this job exists to
+              # catch, and the first version of it shipped that way.
+              d = subprocess.run(['git', 'diff', '--name-only', 'HEAD~1'],
+                                 capture_output=True, text=True)
+              if d.returncode != 0:
+                  sys.exit(f"::error::could not diff HEAD~1 ({d.stderr.strip()[:200]}) — "
+                           "refusing to report success having derived no changed files")
+              files = d.stdout.split()
+          print(f"changed files: {len(files)}")
+
+          # ---- 2. which gates should have run ----------------------------------
+          # Read each workflow's OWN paths. No second copy to drift.
+          def matches(path, pattern):
+              """GitHub filter semantics: `**` spans `/`, a single `*` does NOT.
+
+              The first cut asserted exactly that in a comment and then called
+              `fnmatch` for non-`**` patterns, where `*` DOES cross `/`. So
+              `src/*.js` would have matched `src/a/b.js`, expected a gate that
+              never ran, waited the full deadline and hard-blocked. Code and
+              comment disagreed and the comment was the correct one.
+
+              Translated to a regex instead so the two cannot diverge again.
+              No repo pattern exercises the difference today; that is luck, not
+              design.
+              """
+              rx, i = [], 0
+              while i < len(pattern):
+                  c = pattern[i]
+                  if pattern.startswith('**', i):
+                      rx.append('.*'); i += 2
+                  elif c == '*':
+                      rx.append('[^/]*'); i += 1
+                  else:
+                      rx.append(re.escape(c)); i += 1
+              return re.fullmatch(''.join(rx), path) is not None
+
+          expected = {}   # check name -> workflow file
+          skipped_by_shape = []   # jobs whose check-run NAME cannot be derived
+          for wf in sorted(os.listdir('.github/workflows')):
+              if not wf.endswith(('.yml', '.yaml')):
+                  continue
+              try:
+                  doc = yaml.safe_load(open(f'.github/workflows/{wf}')) or {}
+              except Exception as e:
+                  sys.exit(f"::error::{wf} is not parseable YAML ({e}) — CI cannot "
+                           "reason about which gates should run")
+              # PyYAML reads the `on:` key as the boolean True (YAML 1.1).
+              triggers = doc.get(True) or doc.get('on') or {}
+              # `on: [push, pull_request]` is legal and yields a LIST. The first
+              # version `continue`d on it, so such a workflow's gates were never
+              # enforced and nothing was printed — silent, and the failure mode
+              # this job is for. List form carries no paths, so it always runs.
+              if isinstance(triggers, list):
+                  triggers = {t: {} for t in triggers}
+              if not isinstance(triggers, dict) or 'pull_request' not in triggers:
+                  continue
+              pr_trigger = triggers.get('pull_request') or {}
+              patterns = (pr_trigger or {}).get('paths')
+              ignore = (pr_trigger or {}).get('paths-ignore')
+
+              # BRANCH FILTERS, which the first cut ignored entirely.
+              # A gate declaring `branches: [main]` is not triggered when
+              # on a STACKED PR (base is a feature branch) GitHub does not trigger
+              # it — while a paths-only check still expected its jobs, waited the
+              # full deadline, and hard-failed. Where this is the required check
+              # that PR is permanently unmergeable. Observed on a real repo with
+              # live stacked PRs, not hypothesised: the same
+              # structurally-cannot-report class this file exists to prevent.
+              br_only = (pr_trigger or {}).get('branches')
+              br_skip = (pr_trigger or {}).get('branches-ignore')
+              if BASE:
+                  if br_only is not None and not any(matches(BASE, b) for b in br_only):
+                      continue
+                  if br_skip is not None and any(matches(BASE, b) for b in br_skip):
+                      continue
+              # F4: GitHub names a MATRIX check run `job (v1, v2)` and a
+              # REUSABLE-workflow job `caller / callee`, neither of which equals
+              # the job key. Expecting the bare name would mark that gate
+              # permanently absent and hard-block every matching PR. None exist
+              # here today; they are excluded and PRINTED so the gap is visible
+              # rather than becoming a future outage.
+              names, unmatchable = [], []
+              for key, spec in (doc.get('jobs') or {}).items():
+                  spec = spec or {}
+                  label = spec.get('name') or key
+                  matrix = (spec.get('strategy') or {}).get('matrix')
+
+                  if spec.get('uses') or (DOLLAR_BRACE in str(label)):
+                      # Reusable-workflow jobs are named `caller / callee`, and a
+                      # templated name cannot be resolved without runtime context.
+                      unmatchable.append(label)
+                      continue
+
+                  if matrix:
+                      # GitHub names a matrix check run `label (v1, v2)` in the
+                      # matrix's key order. A SINGLE key whose value is a plain
+                      # list is fully determined here, so expand it. Where a repo
+                      # runs a sharded suite this is its primary gate, and
+                      # excluding it would leave that gate unenforced while
+                      # reporting green.
+                      #
+                      # Anything else (multi-key, `include`/`exclude`, or a value
+                      # built by `fromJSON`) is NOT determined statically, so it
+                      # is excluded and warned about rather than guessed. A wrong
+                      # guess would expect a check that never appears and hard-
+                      # block every matching PR.
+                      keys = [k for k in matrix if k not in ('include', 'exclude')]
+                      if len(keys) == 1 and 'include' not in matrix and 'exclude' not in matrix \
+                         and isinstance(matrix[keys[0]], list) \
+                         and all(isinstance(v, (str, int, float, bool)) for v in matrix[keys[0]]):
+                          for v in matrix[keys[0]]:
+                              names.append(f"{label} ({v})")
+                      else:
+                          unmatchable.append(f"{label} (matrix not statically determined)")
+                      continue
+
+                  names.append(label)
+              if patterns is not None:
+                  should = any(matches(f, p) for f in files for p in patterns)
+              elif ignore is not None:
+                  # F3: `paths-ignore` runs UNLESS every changed file matches.
+                  # Read as unfiltered it would expect the gate on a PR that
+                  # touches only ignored paths, wait out the deadline, and hard-block.
+                  should = any(not any(matches(f, p) for p in ignore) for f in files)
+              else:
+                  should = True          # genuinely unfiltered: always runs
+              if should:
+                  for n in names:
+                      if n != SELF:
+                          expected[n] = wf
+                  for n in unmatchable:
+                      skipped_by_shape.append(f"{n} ({wf})")
+
+
+          # PRINTED BEFORE THE EARLY EXIT, not after. Review demonstrated the
+          # hole: a diff whose only matching job is unmatchable (reusable or a
+          # non-static matrix) leaves `expected` empty, so the exit fired first
+          # and the warning never printed — silently enforcing nothing, which is
+          # the narrower form of the very class this loop exists to surface.
+          for entry in skipped_by_shape:
+              print(f"::warning::gate NOT enforceable — name cannot be derived "
+                    f"statically: {entry}")
+
+          if not expected:
+              print("no path-filtered gate matched this diff — nothing to enforce")
+              sys.exit(0)
+          print("gates that SHOULD run for this diff:")
+          for n, wf in sorted(expected.items()):
+              print(f"  {n}  ({wf})")
+
+          # ---- 3. wait for them, then assert -----------------------------------
+          # THE DEADLINE MUST SIT ABOVE EVERY GATE'S OWN `timeout-minutes`, and
+          # the job's timeout above the deadline, so the diagnostic below fires
+          # before GitHub kills the job.
+          #
+          # ⚠️ REPO-NEUTRAL ON PURPOSE. This body is byte-identical across
+          # pivota-backend and PIVOTA-Agent. Two earlier versions each hard-coded
+          # the OTHER repo's workflow names into this comment and were therefore
+          # false wherever they were read — one of them asserted that a workflow
+          # "does not exist in this repo" while sitting in the repo that has it.
+          # A comment describing gates it cannot see is worse than no comment,
+          # because this file's whole value is that reading it tells you what is
+          # enforced.
+          #
+          # 🚨 THE DEADLINE DOES NOT COVER EVERY GATE, and grepping for
+          # `timeout-minutes` CANNOT TELL YOU THAT — a job with no such key gets
+          # GitHub's default of 360 minutes, so it is invisible to the grep and
+          # far above any deadline worth setting. The first version of this
+          # comment offered exactly that grep as the re-derivation recipe, which
+          # was blind to the only case that bites, and in writing it I deleted a
+          # line that had named the case correctly.
+          #
+          # Re-derive by listing jobs that LACK the key, not by sorting the ones
+          # that have it:
+          #   python - <<'EOF'
+          #   import glob, yaml
+          #   for f in glob.glob('.github/workflows/*.yml'):
+          #       d = yaml.safe_load(open(f)) or {}
+          #       t = d.get(True) or d.get('on') or {}
+          #       if not isinstance(t, dict) or 'pull_request' not in t: continue
+          #       for k, s in (d.get('jobs') or {}).items():
+          #           if (s or {}).get('timeout-minutes') is None:
+          #               print(f, k, '-> 360 (default)')
+          #   EOF
+          #
+          # A gate above the deadline means this job can report
+          # `timed out waiting` and HARD-BLOCK a PR whose gate then passes. The
+          # durable fix is to give those gates an explicit `timeout-minutes`,
+          # not to keep raising this number toward 360.
+          DEADLINE = time.time() + 35 * 60
+          while True:
+              runs = [r for doc in gh_json(f'repos/{REPO}/commits/{SHA}/check-runs?per_page=100')
+                      for r in doc.get('check_runs', [])]
+              seen = {r['name']: r for r in runs if r['name'] != SELF}
+              pending = [n for n in expected
+                         if n not in seen or seen[n]['status'] != 'completed']
+              if not pending:
+                  break
+              if time.time() > DEADLINE:
+                  print("::error::timed out waiting for gates to report:")
+                  for n in sorted(pending):
+                      state = seen.get(n, {}).get('status', 'NEVER STARTED')
+                      print(f"  {n}: {state}  ({expected[n]})")
+                  sys.exit(1)
+              print(f"  waiting on {len(pending)}: {', '.join(sorted(pending)[:4])}")
+              time.sleep(20)
+
+          # OUTCOME-BASED, not presence-of-`if:`-based. My first cut excluded any
+          # job carrying a job-level `if:` on the theory that it is conditional by
+          # design — which gutted the check: real gates commonly carry
+          # `if: github.event_name != 'workflow_dispatch' || ...`, which is TRUE
+          # on a pull request, so they genuinely run and genuinely should be
+          # enforced, while a dispatch-only job carries the inverse condition.
+          # Excluding by the presence of an `if:` was the wrong axis.
+          #
+          # So all matched jobs stay in the expected set and the CONCLUSION
+          # decides:
+          #   absent            -> FAIL. The whole point: a gate whose paths
+          #                       matched and which never reported is the
+          #                       silently-did-not-run class.
+          #   failure/cancelled -> FAIL.
+          #   skipped           -> TOLERATED, and printed. A job-level `if:`
+          #                       evaluated false; this script cannot evaluate
+          #                       that expression, so it must not assert on it —
+          #                       but it says so out loud rather than hiding it.
+          bad, skipped_jobs = [], []
+          for name, wf in sorted(expected.items()):
+              concl = seen[name].get('conclusion')
+              if concl == 'skipped':
+                  skipped_jobs.append(f"{name} ({wf})")
+                  print(f"  {name}: skipped — job-level `if:` false, NOT enforced")
+                  continue
+              print(f"  {name}: {concl}")
+              if concl not in ('success', 'neutral'):
+                  bad.append(f"{name} concluded '{concl}' ({wf})")
+          if skipped_jobs:
+              print("\nnot enforced this run (skipped by their own `if:`):")
+              for s_ in skipped_jobs:
+                  print(f"  {s_}")
+          if bad:
+              for b in bad:
+                  print(f"::error::{b}")
+              sys.exit("a gate that should have run for this diff did not pass")
+          print(f"\nall {len(expected)} expected gate(s) ran and passed")
+          PY

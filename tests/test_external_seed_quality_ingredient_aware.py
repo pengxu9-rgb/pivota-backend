@@ -7,6 +7,7 @@ separate ingredient list scored ~50 (three zeroed components: summary,
 attributes, brand+category) and never served.
 """
 from services.external_seed_servability import build_servable_quality_payload
+from services.index_pipeline_state_service import QUALITY_SCORE_THRESHOLD
 from services.product_quality_service import (
     preview_quality,
     source_backed_attribute_signal_count,
@@ -54,6 +55,9 @@ def test_enrichment_lifts_score_over_serving_threshold():
     rich = build_servable_quality_payload(**THIN, category="skincare", raw_inci=INCI)
     thin_score = preview_quality(thin, score_source_backed_components=True)["content_quality_score"]
     rich_score = preview_quality(rich, score_source_backed_components=True)["content_quality_score"]
+    # Reference the CONSTANT, not a literal: the floor moved 65.0 -> 71.4 on
+    # 2026-07-28 alongside dropping the dead `summary` component, and a hard-coded
+    # bar silently stops testing the policy the moment the policy changes.
     assert rich_score > thin_score
-    assert rich_score >= 65.0        # crosses the serving-eligibility gate
-    assert thin_score < 65.0         # baseline would NOT serve (regression guard)
+    assert rich_score >= QUALITY_SCORE_THRESHOLD   # crosses the serving gate
+    assert thin_score < QUALITY_SCORE_THRESHOLD    # baseline would NOT serve

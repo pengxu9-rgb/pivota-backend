@@ -63,17 +63,20 @@ async def test_count_at_threshold_is_not_violated():
     # an aspirational number: a threshold under the true count leaves the check
     # permanently red, which is indistinguishable from a new regression.
     #
-    # It was 1,376 pre-P3. P3 (PIVOTA-Agent) taught get_pdp_v2 to resolve the
-    # minted lane via attached_product_key and services/pdp_renderability now
-    # agrees, re-measuring prod at exactly 1 (the url_audit row). Leaving the
-    # threshold at 1,376 would have been the SAME mistake in the other
-    # direction: 1,375 rows of silent head-room for a fresh regression.
+    # Baseline history — each step is a re-measurement, never an aspiration:
+    #   1,376  pre-P3 (the minted lane get_pdp_v2 could not resolve)
+    #       1  post-P3 2026-07-25: only the HOVERAir url_audit stub remained
+    #       0  2026-07-29: that stub (and its three mojawa siblings) retired
+    #          with reason 'url_audit_stub_retired_20260729', trust recomputed
+    #          to `blocked`, count re-measured at exactly 0 on prod.
+    # Leaving it at 1 would have been one row of silent head-room — small, but
+    # the convention does not have a small-enough exception.
     threshold = next(
         c["default_threshold"]
         for c in _CHECKS
         if c["name"] == "public_not_renderable"
     )
-    assert threshold == 1, (
+    assert threshold == 0, (
         "re-measure prod and move this with the threshold; the alarm is only "
         "worth having while it sits ON the true count"
     )

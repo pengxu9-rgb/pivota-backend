@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import logging
+import re
 import sys
 from datetime import datetime, timezone
 from decimal import Decimal
@@ -186,6 +187,49 @@ def _client(
     app = FastAPI()
     app.include_router(agent_pdp_v1.router)
     return TestClient(app), db
+
+
+def _outer_relations(sql: str) -> set:
+    """Every relation the OUTER query reads, whether joined or comma-joined.
+
+    WHY A WHITELIST AND NOT A BLACKLIST. The pin used to name five forbidden
+    tables (catalog_products / catalog_skus / catalog_offers /
+    product_group_members / subject_resolve) — the ones migration 085 removed. A
+    blacklist only ever bans what someone thought of: review demonstrated that
+    `LEFT JOIN catalog_variant_offers` sails through, and so would any future
+    heavy table. Asserting the FROM/JOIN set EXACTLY closes the class instead of
+    one name at a time.
+
+    The renderability EXISTS legitimately names catalog_products,
+    external_product_seeds and index_pipeline_state INSIDE itself, so it is
+    removed first — by exact match on the compiled fragment, so this cannot be
+    fooled by a hand-written lookalike — and whatever FROM/JOIN survives belongs
+    to the outer query.
+
+    Comma-joins are captured too, because `FROM agent_pdp_view apv,
+    catalog_products cp2` is a correlated join wearing a comma and a
+    `(?:FROM|JOIN)\\s+(\\w+)` regex sees only the first table. `JOIN LATERAL (`
+    surfaces as the literal `LATERAL`, which is not in any whitelist, so laterals
+    trip this as well.
+    """
+    from services.pdp_renderability import sig_pdp_will_render_sql
+
+    flat = " ".join(sql.split())
+    fragment = " ".join(sig_pdp_will_render_sql("apv.pivota_signature_id").split())
+    stripped = flat.replace(fragment, " ")
+    # Everything between the outer FROM and the first WHERE/ORDER/LIMIT is the
+    # relation list.
+    match = re.search(r"\bFROM\b(.*?)(?:\bWHERE\b|\bORDER BY\b|\bLIMIT\b|$)", stripped, re.I)
+    if not match:
+        return set()
+    relations = set()
+    # Split on JOIN keywords and on commas; the first token of each piece is the
+    # relation (or `LATERAL`, or `(` for an inline subquery — all non-whitelisted).
+    for piece in re.split(r"\b(?:INNER|LEFT|RIGHT|FULL|CROSS)?\s*\bJOIN\b|,", match.group(1), flags=re.I):
+        token = piece.strip().split()[0] if piece.strip() else ""
+        if token:
+            relations.add(token.strip("()").lower())
+    return relations
 
 
 def _canonical_product(body: Dict[str, Any]) -> Dict[str, Any]:
@@ -456,11 +500,55 @@ def test_sql_uses_agent_pdp_view_indexed_lookup_paths() -> None:
         assert "FROM agent_pdp_view apv" in normalized
         assert "INNER JOIN index_pipeline_state ips ON ips.content_key = apv.content_key" in normalized
         assert "ips.serving_eligible = TRUE" in normalized
-        assert "catalog_products" not in normalized
+        # THE FIVE JOINS migration 085 exists to have removed. The old gateway
+        # joined catalog_products x catalog_skus x catalog_offers x
+        # product_group_members x subject_resolve plus a 3-step fallback chain, at
+        # 200-700ms cold; agent_pdp_view is the denormalized answer, targeting
+        # <10ms p99. Reintroducing any of them as a JOIN is the regression.
+        #
+        # catalog_products is now permitted in ONE narrow shape and no other: the
+        # correlated existence check behind `pdp_renderable`
+        # (services.pdp_renderability.sig_pdp_will_render). That is not the join
+        # this pin was written against — measured with
+        # EXPLAIN (ANALYZE, BUFFERS) on prod it is **0.181 ms** and ~10 shared
+        # buffers, all index lookups, i.e. ~2% of the p99 budget. It is asserted
+        # positively below so the exemption cannot silently widen into a real join.
+        # THE OUTER QUERY READS EXACTLY TWO RELATIONS. This is the assertion that
+        # actually holds migration 085's line; the name-bans below are now
+        # belt-and-braces for the specific tables it called out. See
+        # _outer_relations for why a whitelist replaced the blacklist.
+        assert _outer_relations(sql) == {"agent_pdp_view", "index_pipeline_state"}, (
+            f"outer query reads {_outer_relations(sql)}; migration 085 exists so "
+            "this read touches agent_pdp_view + index_pipeline_state and nothing else"
+        )
         assert "catalog_skus" not in normalized
-        assert "catalog_offers" not in normalized
         assert "product_group_members" not in normalized
         assert "subject_resolve" not in normalized
+        # THE ONE catalog_products / catalog_offers REFERENCE ALLOWED is the
+        # renderability EXISTS. Counting the bare table NAME (not "JOIN x") is what
+        # actually closes the loophole: review demonstrated that
+        # `"JOIN catalog_products" not in sql` still admits a correlated COMMA-join
+        # (`FROM agent_pdp_view apv, catalog_products cp2 WHERE cp2.content_key =
+        # apv.content_key`) and a `LEFT JOIN LATERAL (… FROM catalog_products AS
+        # _rsig_cp …)` that reuses the blessed alias — both of them exactly the cost
+        # migration 085 removed, and both passing the substring form.
+        assert normalized.count("catalog_products") == 1
+        assert normalized.count("catalog_offers") == 0
+        assert "AS pdp_renderable" in normalized
+        assert "FROM catalog_products AS _rsig_cp" in normalized
+        assert "_rsig_cp.pivota_signature_id = apv.pivota_signature_id" in normalized
+
+        # AND IT MUST STILL ASK BOTH GATES. This is the highest-value assertion
+        # here: the outer query already INNER JOINs index_pipeline_state, so the
+        # EXISTS's own serving-eligibility conjunct reads as redundant and deleting
+        # it changes NOTHING on the default lane. It is not redundant. With
+        # INDEX_ELIGIBLE_READ on — which it is in prod — the outer gate widens to
+        # (serving_eligible OR index_eligible) while gate 1 of the predicate stays
+        # strict, and measured on prod that difference is exactly the 77 offer-free
+        # rows whose PDPs hard-500 (see services/pdp_renderability module docstring).
+        # Dropping it would report `pdp_renderable: true` for all 77.
+        assert "index_pipeline_state.serving_eligible IS true" in normalized
+        assert "external_product_seeds" in normalized, "gate 2 (content route)"
 
     assert "WHERE apv.content_key = :id" in " ".join(sql_by_kind["content_key"].split())
     assert "WHERE apv.pivota_signature_id = :id" in " ".join(sql_by_kind["signature"].split())
@@ -607,3 +695,157 @@ def test_get_agent_pdp_independent_signals_empty_by_default(monkeypatch) -> None
     client, _ = _client(monkeypatch, [_row()])  # no citations
     product = _canonical_product(client.get(f"/api/agent/pdp/{CK_A}").json())
     assert product["independent_signals"] == []
+
+
+# ---------------------------------------------------------------------------
+# pdp_renderable — is the citable `url` this route emits followable?
+# ---------------------------------------------------------------------------
+#
+# The last read surface that emitted a citable URL with no way to tell whether it
+# renders. Measured on the live feed 2026-07-26: 879 of 5,887 rows do NOT render
+# and this route answered 200 with a `url` for every one.
+#
+# Three states, and the third is the point: True (follow it), False (cite the
+# content, not the link), None (unknown — no URL, or the emergency bypass served
+# the row and that path deliberately does not read index_pipeline_state, which
+# gate 1 of the predicate depends on).
+
+
+def test_pdp_renderable_true_when_both_gates_pass(monkeypatch) -> None:
+    client, _db = _client(monkeypatch, [_row() | {"pdp_renderable": True}])
+    body = client.get(f"/api/agent/pdp/{CK_A}").json()
+    product = _canonical_product(body)
+    assert product["pdp_renderable"] is True
+    assert product["url"] == f"https://agent.pivota.cc/products/{SIG_A}"
+
+
+def test_pdp_renderable_false_still_serves_the_row(monkeypatch) -> None:
+    """A signal, not a filter. The content stays citable; only the link is flagged."""
+    client, _db = _client(monkeypatch, [_row() | {"pdp_renderable": False}])
+    res = client.get(f"/api/agent/pdp/{CK_A}")
+    assert res.status_code == 200
+    product = _canonical_product(res.json())
+    assert product["pdp_renderable"] is False
+    # URL is still emitted — consumers decide, using the flag.
+    assert product["url"] == f"https://agent.pivota.cc/products/{SIG_A}"
+    assert product["title"]
+
+
+def test_pdp_renderable_is_null_when_no_sig_means_no_url(monkeypatch) -> None:
+    client, _db = _client(
+        monkeypatch, [_row(pivota_signature_id=None) | {"pdp_renderable": True}]
+    )
+    product = _canonical_product(client.get(f"/api/agent/pdp/{CK_A}").json())
+    assert product.get("url") in (None, "")
+    # Nothing to characterise ⇒ null, even though the column said True.
+    assert product["pdp_renderable"] is None
+
+
+def test_pdp_renderable_is_null_not_false_on_the_emergency_bypass(
+    monkeypatch,
+) -> None:
+    """The bypass overrides index_pipeline_state; the flag must not pretend.
+
+    The bypass SELECTs omit the column entirely, so the row genuinely lacks the
+    key — `.get` returning None is the signal, not a default. Reporting False here
+    would assert a check we did not run, against the very gate the operator
+    overrode.
+    """
+    monkeypatch.setenv("AGENT_PDP_V1_BYPASS_SERVING_ELIGIBILITY", "true")
+    client, db = _client(
+        monkeypatch,
+        [_row()],  # note: NO pdp_renderable key, as the bypass SQL produces
+        serving_eligible_by_content_key={CK_A: False},
+    )
+    res = client.get(f"/api/agent/pdp/{CK_A}")
+    assert res.status_code == 200
+    product = _canonical_product(res.json())
+    assert product["pdp_renderable"] is None
+    # …and the bypass query really is the one that ran, still free of ips.
+    assert "index_pipeline_state" not in db.calls[0]["query"]
+
+
+def test_bypass_sql_does_not_carry_the_renderability_predicate() -> None:
+    """Pins the asymmetry at the SQL level, not just the response.
+
+    Adding it to the bypass variants would reintroduce index_pipeline_state into
+    the one path that exists for when that table is the problem.
+    """
+    for sql in (
+        agent_pdp_v1.BYPASS_SELECT_BY_CONTENT_KEY_SQL,
+        agent_pdp_v1.BYPASS_SELECT_BY_SIGNATURE_SQL,
+        agent_pdp_v1.BYPASS_SELECT_BY_PRODUCT_GROUP_SQL,
+    ):
+        normalized = " ".join(sql.split())
+        assert "pdp_renderable" not in normalized
+        assert "index_pipeline_state" not in normalized
+        assert "catalog_products" not in normalized
+
+
+def test_widened_and_group_lanes_also_carry_the_flag() -> None:
+    """All THREE gated lanes, both eligibility variants — not just by-content_key."""
+    for sql in (
+        agent_pdp_v1.SELECT_BY_CONTENT_KEY_SQL,
+        agent_pdp_v1.SELECT_BY_SIGNATURE_SQL,
+        agent_pdp_v1.SELECT_BY_PRODUCT_GROUP_SQL,
+        agent_pdp_v1.INDEX_SELECT_BY_CONTENT_KEY_SQL,
+        agent_pdp_v1.INDEX_SELECT_BY_SIGNATURE_SQL,
+        agent_pdp_v1.INDEX_SELECT_BY_PRODUCT_GROUP_SQL,
+    ):
+        assert "AS pdp_renderable" in " ".join(sql.split())
+
+
+def test_pdp_renderable_is_a_real_boolean_not_a_truthy_passthrough(monkeypatch) -> None:
+    """`bool()` on the column is load-bearing for the WIRE type, not decoration.
+
+    asyncpg returns real booleans for a Postgres boolean, so dropping the `bool()`
+    is a no-op today — which is exactly why review found the mutation uncaught.
+    But this value is serialised into a public API contract as `true`/`false`, and
+    the column is a composed SQL expression, not a table column: a future edit that
+    wraps it in a COUNT, a COALESCE to 0/1, or an `int` cast would start emitting
+    `1` where every consumer expects `true`, silently. Pin the type, not just the
+    truthiness.
+    """
+    for raw, expected in ((1, True), (0, False), ("t", True)):
+        client, _db = _client(monkeypatch, [_row() | {"pdp_renderable": raw}])
+        value = _canonical_product(client.get(f"/api/agent/pdp/{CK_A}").json())[
+            "pdp_renderable"
+        ]
+        assert value is expected, f"raw {raw!r} serialised as {value!r}"
+        assert isinstance(value, bool)
+
+    # …and the null case stays None, never coerced to False.
+    client, _db = _client(monkeypatch, [_row()])  # key absent, as the bypass produces
+    assert _canonical_product(client.get(f"/api/agent/pdp/{CK_A}").json())[
+        "pdp_renderable"
+    ] is None
+
+
+def test_outer_relation_whitelist_catches_every_join_shape() -> None:
+    """The helper must see comma-joins and laterals, not just `JOIN <table>`.
+
+    Guards the guard: if `_outer_relations` silently returned an incomplete set the
+    pin above would pass on anything, so assert it against the three shapes review
+    used to slip past the old blacklist.
+    """
+    base = agent_pdp_v1.SELECT_BY_CONTENT_KEY_SQL
+    assert _outer_relations(base) == {"agent_pdp_view", "index_pipeline_state"}
+
+    comma = base.replace(
+        "FROM agent_pdp_view apv", "FROM agent_pdp_view apv, catalog_variant_offers cvo"
+    )
+    assert "catalog_variant_offers" in _outer_relations(comma)
+
+    plain = base.replace(
+        "INNER JOIN index_pipeline_state ips ON ips.content_key = apv.content_key",
+        "INNER JOIN index_pipeline_state ips ON ips.content_key = apv.content_key\n"
+        "    LEFT JOIN catalog_variant_offers cvo ON cvo.content_key = apv.content_key",
+    )
+    assert "catalog_variant_offers" in _outer_relations(plain)
+
+    lateral = base.replace(
+        "INNER JOIN index_pipeline_state ips ON ips.content_key = apv.content_key",
+        "INNER JOIN index_pipeline_state ips ON ips.content_key = apv.content_key\n"
+        "    LEFT JOIN LATERAL (SELECT 1 FROM catalog_products AS _x) _l ON TRUE",
+    )
+    assert _outer_relations(lateral) != {"agent_pdp_view", "index_pipeline_state"}

@@ -45,15 +45,31 @@ from datetime import datetime
 from typing import Any, Awaitable, Dict, Optional, TypeVar
 
 from fastapi import APIRouter, HTTPException, Query, status
-from sqlalchemy import Boolean, DateTime, Float, String, Text, and_, column, func, or_, select, table
+from sqlalchemy import String, and_, column, func, or_, select, table
 
 from db.catalog import catalog_merchants, catalog_products
 from db.database import database
 from services.claim_safety import substantiated_claims
+from services.pdp_content_depth import pdp_content_depth_expression
+# The sitemap-eligibility predicate and its index_pipeline_state handle live in
+# a shared module because the canonical ELECTION asks the same question of the
+# same rows (services/content_canonical_election). A second hand-kept copy of
+# this filter would let the elector crown a sig this feed never emits — see
+# that module's header for why that failure is worse than the duplicate it
+# fixes.
+from services.canonical_sitemap_candidates import (
+    electable_sig_exists,
+    eligibility_predicate as _eligibility_predicate,
+    flag_on as _flag_on,
+    index_pipeline_state,
+    sitemap_candidate_filter,
+    sitemap_candidate_join,
+    sitemap_widen_enabled,
+)
 from services.pdp_renderability import (
     EXTERNAL_SEED_MERCHANT_ID as _EXTERNAL_SEED_MERCHANT_ID,
     external_product_seeds,
-    pdp_renderable_expression,
+    pdp_will_render_expression,
 )
 from utils.logger import logger
 
@@ -62,10 +78,37 @@ router = APIRouter(
     tags=["canonical-pdp"],
 )
 
-# Public PDP URL base. Used to synthesize a canonical_url for offer-free
-# brand-authored rows that have no minted sig (their pivota_canonical_url may be
-# null) — the served PDP resolves by content_key, so the sitemap points there.
-_PDP_URL_PREFIX = "https://agent.pivota.cc/products/"
+# THERE IS NO content_key PDP URL FORM. A ``_PDP_URL_PREFIX`` used to live here
+# to synthesize a ``canonical_url`` for offer-free brand-authored rows with no
+# minted sig, on the stated belief that "the served PDP resolves by content_key,
+# so the sitemap points there".
+#
+# THAT BELIEF IS FALSE, measured against prod 2026-07-26:
+# ``agent.pivota.cc/products/{ck_*}`` returns a hard HTTP 500 (2,007 bytes, no
+# product JSON-LD) on every probe — 135 serial requests over 133 distinct
+# content_keys, including 34 rows this very feed calls ``renderable=true`` whose
+# own sig-form URL serves a real 54-67 KB PDP; plus 103 further distinct ck ids in
+# an independent adversarial re-measurement, 103/103 dead with zero 3xx. The
+# gateway's sig-exact resolve keys on ``cp.pivota_signature_id = $1``
+# (PIVOTA-Agent ``src/server.js``), so no ``ck_*`` id can match it and the ISR
+# route turns the miss into a 500.
+#
+# BLAST RADIUS HERE IS 7 ROWS, not the whole feed: `pivota_canonical_url` is
+# already populated with the sig form for 5,826 of 5,887 feed rows, so the
+# fallback only ever fired for the 7 sig-less ones. (A further 54 rows carry an
+# EXTERNAL merchant URL in that column — unrelated pre-existing data, untouched
+# here, but do not assume this field is always an agent.pivota.cc URL.) Those 7
+# now report ``canonical_url: null`` rather than a URL guaranteed to 500.
+#
+# Zero impact at the only consumer: agent-ui's
+# ``scripts/sitemap_lib.mjs`` builds from ``sig_id`` behind a ``/^sig_.+/`` guard
+# and never reads this field — it already carries the note that "get_pdp_v2
+# rejects a bare content_key with MISSING_MERCHANT_CONTEXT", i.e. that half of
+# this fix shipped there and this half was left behind. ``_encode_list_cursor``
+# is unaffected (it already returns None for a non-str sig).
+#
+# Do NOT reintroduce a content_key URL form without first re-measuring that the
+# gateway resolves one. The honest degradation for a sig-less row is null.
 
 T = TypeVar("T")
 
@@ -111,17 +154,14 @@ async def _bounded_db(awaitable: Awaitable[T], operation: str) -> T:
         ) from exc
 
 
-index_pipeline_state = table(
-    "index_pipeline_state",
+# Migration 181. ONE elected canonical sig per content_key — the shared answer
+# that keeps the sitemap's advertised URL and the gateway's <link
+# rel="canonical"> naming the same sig. Local Core handle, same pattern as the
+# other lightweight tables in this module.
+content_canonical_election = table(
+    "content_canonical_election",
     column("content_key", String),
-    column("serving_eligible", Boolean),
-    # ADR-007 SLICE 1: offer-free citation floor (migration 165). Referenced by
-    # the flag-gated eligibility filters below.
-    column("index_eligible", Boolean),
-    column("blocker_code", Text),
-    column("blocker_detail", Text),
-    column("content_quality_score", Float),
-    column("quality_scored_at", DateTime),
+    column("canonical_sig_id", String),
 )
 
 # Lightweight handle to the evidence columns (migration 152). Mirrors the local
@@ -176,32 +216,131 @@ def _renderable_column():
     either a hard HTTP 500 or a generic noindex shell carrying no product
     JSON-LD (6/6 sampled non-renderable feed rows were the latter). Both are
     worthless to a crawler; only the 500 is loud.
+
+    2026-07-26 — THE THIRD CORRECTION, and the first one in the RESTRICTING
+    direction. The two above both widened the column, and both were about the
+    same half of the question: can the gateway resolve a content ROUTE. They
+    left the OTHER gate unmodelled. ``get_pdp_v2`` checks serving eligibility
+    FIRST and 404s ``PRODUCT_NOT_SERVABLE`` before it ever looks for content, so
+    a row can pass the route question and still never render.
+
+    Measured against the live sitemap on 2026-07-26: 77 of 4,528 advertised URLs
+    returned a hard HTTP 500 (77/77 on serial retry). All 77 had
+    ``renderable=true`` from this column, ``serving_eligible=false``, and
+    ``blocker_code='no_price'`` — in the sitemap only because
+    ``INDEX_ELIGIBLE_SITEMAP`` widens the eligibility filter to the ADR-007
+    SLICE 1 offer-free citation floor, which ``get_pdp_v2`` was never taught.
+    This column now asks BOTH gates via
+    :func:`pdp_will_render_expression`, so it stops advertising them.
+
+    Direction of the change: the 100 widen-only rows in the feed (78 of them
+    previously ``renderable=true``) flip to ``renderable=false``; nothing that
+    is ``serving_eligible`` moves, because for those rows the added conjunct is
+    true by construction.
+
+    Operationally the sitemap goes 4,528 → 4,451 on its next 6h cron, and NO
+    agent-ui guard blocks it: ``sitemapCountGuard`` refuses below 50% of the
+    committed count (and an absolute floor of 1,000), and 1.7% is nowhere near
+    it; ``sitemapCoverageVerdict`` measures ROWS CONSUMED against the feed's
+    ``total``, which does not move at all — all 5,887 rows are still emitted,
+    77 of them now flagged unrenderable. Expect one
+    ``NOTE: 77 previously advertised URL(s) are not in this build`` line in the
+    cron log. That note is the intended outcome, not a warning to chase.
+
+    See :func:`pdp_serving_gate_passes` for why the fix is to stop advertising
+    these rather than to start serving them, and for the order of work that
+    would let them back in.
     """
-    return pdp_renderable_expression(catalog_products).label("renderable")
+    return pdp_will_render_expression(catalog_products).label("renderable")
 
 
-def _flag_on(name: str) -> bool:
-    return (os.getenv(name) or "").strip().lower() in {"1", "true", "yes", "on"}
+def _content_depth_column():
+    """EXISTS boolean: is there anything on this PDP worth citing?
+
+    The sibling question to ``renderable``, and independent of it: a URL can
+    render a perfect 200 and still be a chrome-only shell. Measured 2026-07-25
+    over all 3,326 live sitemap URLs, 364 of them (10.9%) carry no description,
+    no INCI and no dossier, and serve a median of 523 readable characters. No
+    rendering change can help them — there is no content behind them.
+
+    The predicate lives in :mod:`services.pdp_content_depth`; see that module
+    for why it is component-presence rather than a character threshold (the
+    threshold forms were measured and drop pages serving 1,210 readable chars),
+    and for why ``index_pipeline_state.content_quality_score`` cannot stand in
+    for it (70.9 average on the empty cohort vs 70.0 on the thin one).
+
+    Fail-OPEN: this is an ADVISORY field. It is emitted for the sitemap
+    generator to filter on; it does not gate ``serving_eligible`` and it does
+    not remove anything from this feed's own result set. Consumers drop on an
+    explicit ``false``, the same convention ``renderable`` uses.
+    """
+    return pdp_content_depth_expression(catalog_products).label("content_depth")
 
 
-def _eligibility_predicate(*, widen_with_index_eligible: bool):
-    """SQLAlchemy boolean for the index-pipeline serving gate.
+def _tombstoned_column():
+    """Boolean: has the row layer RETIRED this row, while it still serves?
 
-    Default: serving_eligible = TRUE (byte-identical to the pre-ADR-007 gate).
-    When ``widen_with_index_eligible`` is True (the relevant flag is ON), the
-    gate widens to (serving_eligible OR index_eligible) — the OFFER-FREE
-    citation floor from ADR-007 SLICE 1.
+    ``suppression_reason`` set WITHOUT ``suppressed_at`` is a real, populated
+    state — step-5 dedupe, cross-merchant redundancy, brand-namesake retirement
+    and the d2_* identity resolutions all mark a row this way and leave it
+    serving. The consequence is that **tombstoned rows pass every
+    ``suppressed_at IS NULL`` filter in the system**, including this feed's own
+    :func:`~services.canonical_sitemap_candidates.sitemap_candidate_filter`, and
+    are therefore advertised as though nothing had been decided about them.
 
-    The by-signature PDP READ is widened by INDEX_ELIGIBLE_READ; the public
-    /products SITEMAP listing is a separate content/SEO decision gated only by
-    INDEX_ELIGIBLE_SITEMAP. The two callers pass their own flag so neither is
-    widened by the other."""
-    if widen_with_index_eligible:
-        return or_(
-            index_pipeline_state.c.serving_eligible.is_(True),
-            index_pipeline_state.c.index_eligible.is_(True),
-        )
-    return index_pipeline_state.c.serving_eligible.is_(True)
+    Measured on the live 7,509-URL sitemap, 2026-07-29 — 187 advertised URLs
+    point at a tombstoned row:
+
+      ``wrong_brand_namesake_wave3_20260718``      135
+      ``cross_merchant_redundant_external_seed``    50
+      ``step5_campaign_clone_dup``                   2
+
+    The first group is the one that makes this urgent rather than tidy: those
+    rows were retired for carrying the WRONG BRAND, so serving them publishes a
+    PDP with incorrect brand attribution — the single claim an identity-led
+    index cannot get wrong.
+
+    WHY A FIELD AND NOT A FILTER. The canonical ELECTION already excludes these
+    via ``not_tombstoned()``; this feed deliberately does not, because it is a
+    diagnostic surface as well as a sitemap source and dropping the rows here
+    would destroy the evidence (the same reasoning that keeps
+    ``renderable=false`` rows in the result set rather than filtering them out).
+    So this follows the established contract: the feed states the fact, and the
+    sitemap generator drops on an explicit ``true``.
+
+    Fail-OPEN, matching ``renderable`` and ``content_depth``: a consumer that
+    predates the field sees nothing and behaves exactly as before.
+    """
+    return (
+        catalog_products.c.suppression_reason.isnot(None)
+    ).label("tombstoned")
+
+
+def _elected_canonical_sig_note():
+    """WHY the feed's `canonical_sig_id` is validated, and where.
+
+    The validation itself is in the election JOIN's ON clause (see
+    ``list_canonical_pdp_signatures``); this note is the reasoning, kept next to
+    the other column helpers so it is findable.
+
+    A stored election is a durable fact; electability is a live one. When the
+    elected sig stops rendering (P3 moved 2,051 rows on that field in a day, and
+    nothing stops the reverse), an unvalidated read produces the failure this
+    whole feature exists to prevent:
+
+      the sitemap correctly drops the dead sig and advertises its sibling, while
+      the sibling's PDP emits <link rel="canonical"> pointing AT the dead sig
+
+    We would then submit a URL that disavows itself in favour of a page that
+    500s, and the content_key loses all index presence — worse than the
+    duplicate, and worse than a moved URL. The sitemap is structurally immune
+    (its renderable filter runs before the dedup, so a dead sig is never a
+    candidate); every reader of this table has to earn the same immunity here.
+
+    Degrading to NULL is exactly right: NULL means "no election", which every
+    consumer already handles by falling back to self — so both surfaces fall
+    back TOGETHER, which is the invariant.
+    """
 
 
 def _shape_product_for_pdp(row: Dict[str, Any]) -> Dict[str, Any]:
@@ -249,6 +388,28 @@ def _shape_product_for_pdp(row: Dict[str, Any]) -> Dict[str, Any]:
         "image_url": image or None,
         "main_image_url": image or None,
         "canonical_url": row.get("pivota_canonical_url"),
+        # WILL `canonical_url` ABOVE ACTUALLY ANSWER 200? Both of get_pdp_v2's
+        # gates, asked about THIS row's own sig — see
+        # services.pdp_renderability.sig_pdp_will_render.
+        #
+        # Why this field exists. This read is the CITATION surface: an agent that
+        # consumes it and follows canonical_url is the whole point of ADR-007.
+        # Measured on the live feed 2026-07-26, 879 of 5,887 rows do not render
+        # (779 that are serving_eligible but whose content route does not resolve,
+        # plus 100 offer-free `no_price` rows admitted by INDEX_ELIGIBLE_READ) and
+        # this route answered 200 with a fully populated payload for every one of
+        # them, canonical_url included. The record was citable; the URL was dead.
+        # A dead link attributed to us is worse than never having served the row.
+        #
+        # It is a SIGNAL, not a filter: the route deliberately still serves the
+        # row. ADR-007 SLICE 1 exists so an offer-free row stays CITABLE, and
+        # narrowing this gate to the renderer would make the citation floor
+        # uncitable — the opposite of the decoupling the ADR bought. So the honest
+        # move is to keep serving the content and tell the truth about the link.
+        #
+        # `renderable: false` means: cite the CONTENT, do not follow the URL.
+        # Consumers that need a followable URL should treat false as "no link".
+        "renderable": bool(row.get("renderable")),
         # Echo the merchant's own URL too (when set) so consumers can
         # link out to the storefront from the canonical PDP.
         "merchant_canonical_url": row.get("canonical_url"),
@@ -348,6 +509,15 @@ async def get_canonical_pdp_by_signature(sig_id: str) -> Dict[str, Any]:
             # surface substantiated, attributable claims for agents to cite.
             agent_pdp_view.c.evidence_profile,
             agent_pdp_view.c.required_disclaimers,
+            # Honest renderability of the canonical_url this response emits.
+            # Asked of catalog_products directly (this query already selects from
+            # it), so no extra join — unlike the agent_pdp_view-backed reads,
+            # which need sig_pdp_will_render's correlated lookup. Single-row
+            # read, so the nested EXISTS cost is negligible; the feed already
+            # pays the same predicate per row for up to 1,000 rows a page.
+            # Through the shared helper rather than a hand-copy: this expression
+            # drifting between its call sites is the documented failure mode.
+            _renderable_column(),
         )
         .select_from(
             catalog_products.join(
@@ -441,69 +611,15 @@ async def list_canonical_pdp_signatures(
     # ADR-007 SLICE 1: the public /products SITEMAP listing is a content/SEO
     # decision distinct from the citation read surface. It is widened ONLY by
     # INDEX_ELIGIBLE_SITEMAP — never by INDEX_ELIGIBLE_READ. Both default OFF.
-    widen_sitemap = _flag_on("INDEX_ELIGIBLE_SITEMAP")
-    # content_key is the always-required identity (it keys the served PDP). A
-    # canonical sig qualifies a row as before; when widened to the offer-free
-    # citation index, store-less brand-authored rows (null pivota_signature_id,
-    # index_eligible) ALSO qualify — keyed on content_key, URL falling back to
-    # /products/{content_key}. We deliberately do NOT drop the sig requirement
-    # wholesale: a serving row without a sig still doesn't qualify; only the
-    # index_eligible citation rows are added.
-    sig_present = and_(
-        catalog_products.c.pivota_signature_id.isnot(None),
-        catalog_products.c.pivota_signature_id.like("sig_%"),
-    )
-    identity_term = (
-        or_(sig_present, index_pipeline_state.c.index_eligible.is_(True))
-        if widen_sitemap
-        else sig_present
-    )
-    # Merchant gate. Strict (flag-OFF): retail merchants must be indexable +
-    # active (INNER JOIN) — unchanged. Widened: store-less brand-authored rows
-    # have NO retail catalog_merchants row (onboarded via brand verification, not
-    # catalog_sync), so the INNER JOIN would drop them. LEFT JOIN and allow a
-    # missing merchant row through ONLY when index_eligible (the brand passed
-    # domain verification → inherently publishable). A retail merchant that IS
-    # present but hidden/inactive is still excluded.
-    base_join = catalog_products.join(
-        index_pipeline_state,
-        catalog_products.c.content_key == index_pipeline_state.c.content_key,
-    )
-    if widen_sitemap:
-        serving_join = base_join.outerjoin(
-            catalog_merchants,
-            catalog_products.c.merchant_id == catalog_merchants.c.merchant_id,
-        )
-        merchant_gate = or_(
-            and_(
-                catalog_merchants.c.indexable.is_(True),
-                catalog_merchants.c.status.in_(["active", "observed"]),
-            ),
-            and_(
-                catalog_merchants.c.merchant_id.is_(None),
-                index_pipeline_state.c.index_eligible.is_(True),
-            ),
-        )
-    else:
-        serving_join = base_join.join(
-            catalog_merchants,
-            catalog_products.c.merchant_id == catalog_merchants.c.merchant_id,
-        )
-        merchant_gate = and_(
-            catalog_merchants.c.indexable.is_(True),
-            catalog_merchants.c.status.in_(["active", "observed"]),
-        )
-    eligibility_filter = and_(
-        catalog_products.c.content_key.isnot(None),
-        # A suppressed row (catalog_products.suppressed_at set, e.g. the
-        # demo_retired_2026_07 sweep) is withdrawn from serving and must not
-        # be advertised, even while its content_key stays eligible through
-        # live sibling rows. Row-level, matching this endpoint's row grain.
-        catalog_products.c.suppressed_at.is_(None),
-        identity_term,
-        _eligibility_predicate(widen_with_index_eligible=widen_sitemap),
-        merchant_gate,
-    )
+    #
+    # The join and the filter are built by services/canonical_sitemap_candidates
+    # rather than inline, because the canonical ELECTION has to pick its winner
+    # from EXACTLY these rows. A second copy that drifted even slightly would
+    # let it crown a sig this feed never emits, and then the sitemap advertises
+    # one URL while that URL's own page canonicalises at another.
+    widen_sitemap = sitemap_widen_enabled()
+    serving_join = sitemap_candidate_join(widen=widen_sitemap)
+    eligibility_filter = sitemap_candidate_filter(widen=widen_sitemap)
 
     # The eligibility-filtered COUNT(*) scans the whole join, so it runs on
     # the first page only. Later pages return total=null; has_more (from the
@@ -565,12 +681,46 @@ async def list_canonical_pdp_signatures(
         index_pipeline_state.c.content_quality_score,
         index_pipeline_state.c.quality_scored_at,
         _renderable_column(),
+        _content_depth_column(),
+        _tombstoned_column(),
+        # Already validated by the JOIN's ON clause below — see the note there.
+        content_canonical_election.c.canonical_sig_id,
     ]
     if widen_sitemap:
         select_cols.append(index_pipeline_state.c.index_eligible)
     rows_q = (
         select(*select_cols)
-        .select_from(serving_join)
+        # LEFT JOIN, never INNER: a content_key that has not been elected yet
+        # (freshly minted, or the sweep has not run) must still appear in the
+        # feed. It gets a null canonical_sig_id and the consumer falls back to
+        # its own ordering — the same answer it computed before this existed.
+        .select_from(
+            serving_join.outerjoin(
+                content_canonical_election,
+                and_(
+                    catalog_products.c.content_key
+                    == content_canonical_election.c.content_key,
+                    # The validation lives in the ON clause, not the SELECT
+                    # list. Semantically identical — the EXISTS depends only on
+                    # cce.canonical_sig_id — but it is evaluated per MATCHED
+                    # ELECTION row instead of per product row, so the correlated
+                    # 3-table join plus pdp_renderable_expression's nested
+                    # EXISTS over external_product_seeds runs only where an
+                    # election actually exists. The feed pages up to 1000 rows
+                    # and already pays that predicate once per row for its own
+                    # `renderable` column; paying it twice per row would have
+                    # doubled the most expensive part of the query.
+                    #
+                    # A row whose election fails validation simply does not
+                    # match, so the LEFT JOIN yields NULL — which is exactly the
+                    # "no election" the consumer already falls back on.
+                    electable_sig_exists(
+                        content_canonical_election.c.canonical_sig_id,
+                        widen=widen_sitemap,
+                    ),
+                ),
+            )
+        )
         .where(where_clause)
         .order_by(
             catalog_products.c.content_changed_at.desc(),
@@ -591,10 +741,31 @@ async def list_canonical_pdp_signatures(
         {
             "sig_id": r["pivota_signature_id"],
             "content_key": r["content_key"],
-            "canonical_url": (
-                r["pivota_canonical_url"]
-                or (f"{_PDP_URL_PREFIX}{r['content_key']}" if r["content_key"] else None)
-            ),
+            # SELF-referential: this ROW's own URL, and several consumers read
+            # it that way; the group-level answer is the separate field below.
+            #
+            # No content_key fallback — see the note at the top of this module
+            # for the measurement that killed it (the ck form is a guaranteed
+            # 500, so the old fallback emitted a dead URL for the 7 sig-less
+            # feed rows). Null is the honest answer for a row with no sig.
+            "canonical_url": r["pivota_canonical_url"],
+            # The ONE URL id for this row's content_key (migration 181), or
+            # null when the content_key has not been elected yet.
+            #
+            # 474 content_keys carry more than one eligible+renderable sig (551
+            # redundant URLs; groups of 2, 3, 4, 5 and 7), every sibling serving
+            # identical content under a self-referential canonical tag. This
+            # field is the shared answer that resolves them: the sitemap
+            # advertises exactly this id, and get_pdp_v2's `canonical` module
+            # hands the same id to every sibling PDP to emit as its <link
+            # rel="canonical">. The two MUST agree — advertising URL A while A's
+            # page canonicalises at B tells the crawler to drop the URL we just
+            # submitted — which is why it is one stored value read twice rather
+            # than a rule computed twice.
+            #
+            # Null is a safe degradation, not an error: the consumer falls back
+            # to the ordering it used before this field existed.
+            "canonical_sig_id": r["canonical_sig_id"],
             "serving_eligible": bool(r["serving_eligible"]),
             # Renderability of the public PDP: can the gateway resolve a
             # CONTENT ROUTE for this row (an acceptable external_product_seeds
@@ -606,6 +777,18 @@ async def list_canonical_pdp_signatures(
             # serving_eligible says "we want this public"; renderable says "the
             # PDP will actually render" — sitemap generation must require both.
             "renderable": bool(r["renderable"]),
+            # Content depth of the public PDP: does the row carry a
+            # description, an INCI list, or a published dossier — i.e. is there
+            # prose on the page, or only chrome? Independent of `renderable`:
+            # 364 of the 3,326 currently-advertised URLs render a clean 200 and
+            # are still a ~510-char shell. Advisory only; see
+            # _content_depth_column.
+            "content_depth": bool(r["content_depth"]),
+            # Row-layer retirement (suppression_reason set, suppressed_at NULL).
+            # These pass every suppressed_at IS NULL filter and are advertised
+            # as if undecided — 187 live URLs on 2026-07-29, 135 of them retired
+            # for WRONG BRAND attribution. Advisory; see _tombstoned_column.
+            "tombstoned": bool(r["tombstoned"]),
             "index_eligible": (bool(r["index_eligible"]) if widen_sitemap else False),
             "blocker_code": r["blocker_code"],
             "blocker_detail": r["blocker_detail"],

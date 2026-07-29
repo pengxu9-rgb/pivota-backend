@@ -43,6 +43,28 @@ def test_static_set_bakes_in_all_four_rigs():
     assert "merch_bbd34645bc1950cc" in ids
 
 
+def test_static_set_bakes_in_review_demo_3():
+    """pivota-review-demo-3 was a known rig in the agent repo's metrics
+    exclusion list but was never added to the serving denylists. It has no
+    merchant_stores row, so the domain resolver cannot reach it either."""
+    assert "merch_shopify_b20b5797f4181983c177" in pol.static_test_merchant_ids({})
+
+
+def test_static_set_bakes_in_the_ownist_fixture_merchant():
+    """ADR-018 census (#1595): a fixture catalog with 4 serving_eligible rows
+    and NO merchant_stores row, so the demo-domain resolver can never reach it
+    — the id denylist is the only leg that excludes it."""
+    assert "merch_test_ownist_001" in pol.static_test_merchant_ids({})
+
+
+async def test_ownist_is_excluded_without_any_store_row():
+    # Resolver returns nothing (no merchant_stores row for this rig at all);
+    # the exclusion must still hold from the static denylist.
+    db = _FakeDB(rows=[])
+    ids = await pol.get_excluded_merchant_ids(db, env={})
+    assert "merch_test_ownist_001" in ids
+
+
 def test_env_hatch_is_additive_only():
     ids = pol.static_test_merchant_ids({"PIVOTA_TEST_MERCHANT_IDS": "merch_new, merch_two"})
     assert "merch_new" in ids and "merch_two" in ids
@@ -77,9 +99,14 @@ async def test_resolver_caches_within_ttl():
 def test_none_db_returns_static_only():
     import asyncio
 
-    ids = asyncio.get_event_loop().run_until_complete(
-        pol.get_excluded_merchant_ids(None, env={})
-    )
+    # `asyncio.run`, not `get_event_loop().run_until_complete`: since 3.12 the
+    # latter no longer auto-creates a loop off the main thread, so it raises
+    # DeprecationWarning on 3.12 and RuntimeError on 3.14 — verified failing on
+    # 3.14 locally while CI's 3.11 stayed green. Wiring this file into the
+    # reliability suite (which is the point of the change shipping alongside)
+    # would otherwise plant a landmine that detonates on the next Python bump,
+    # in a test whose whole job is to be the tripwire.
+    ids = asyncio.run(pol.get_excluded_merchant_ids(None, env={}))
     assert ids == pol.static_test_merchant_ids({})
 
 
@@ -112,3 +139,28 @@ def test_filter_handles_object_products():
 def test_filter_empty_input():
     assert pol.filter_out_test_merchants(None, {"x"}) == []
     assert pol.filter_out_test_merchants([], {"x"}) == []
+
+
+# The two repos' rig lists must hold the SAME ids: both services write
+# catalog_row_trust from the same policy, so an id present in one and not the
+# other makes them derive different serving_decisions for the same row and flap
+# it public<->blocked on the live surface. Nothing can enforce that across repo
+# boundaries, so each side pins the exact set: adding a rig here fails this test
+# until the author consciously updates it, and the message says where else to go.
+EXPECTED_RIG_IDS = {
+    "merch_efbc46b4619cfbdf",
+    "merch_shopify_0584b37f7a8be00a5223",
+    "merch_shopify_00d4a720d67d96c5dcba",
+    "merch_bbd34645bc1950cc",
+    "merch_shopify_b20b5797f4181983c177",
+    "merch_test_ownist_001",
+}
+
+
+def test_rig_list_is_pinned_and_mirrors_the_gateway_twin():
+    assert set(pol.KNOWN_TEST_MERCHANT_IDS) == EXPECTED_RIG_IDS, (
+        "Rig list changed. Mirror it in PIVOTA-Agent "
+        "src/services/testMerchantPolicy.js TEST_MERCHANT_IDS (and its pinned "
+        "test) IN THE SAME DEPLOY — the two services share catalog_row_trust, "
+        "so a one-sided change flaps rows public<->blocked."
+    )

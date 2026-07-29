@@ -20,6 +20,7 @@ from services.catalog_sync_service import pivota_canonical_pdp_url
 from services.claim_safety import substantiated_claims
 from services.independent_signals import independent_signals_for
 from services.offer_buyability import DEFAULT_SERVING_MARKET, annotate_offer_buyability
+from services.pdp_renderability import sig_pdp_will_render_sql
 from services.serving_freshness import serving_freshness
 
 
@@ -71,6 +72,54 @@ AGENT_PDP_VIEW_COLUMNS: Tuple[str, ...] = (
 _SELECT_COLUMNS = ",\n      ".join(AGENT_PDP_VIEW_COLUMNS)
 _SELECT_APV_COLUMNS = ",\n      ".join(f"apv.{column}" for column in AGENT_PDP_VIEW_COLUMNS)
 
+# Is the citable `url` this route emits actually followable? BOTH of
+# get_pdp_v2's gates, asked about apv's own signature — the exact sig the URL is
+# built from — via the predicate the sitemap feed and the canonical election
+# share (services.pdp_renderability.sig_pdp_will_render).
+#
+# WHY THIS IS AFFORDABLE HERE, measured rather than assumed. On prod,
+# EXPLAIN (ANALYZE, BUFFERS) over several signatures: **Execution Time 0.18-0.57
+# ms**, ~10 shared buffers, all index lookups — roughly 2-6% of migration 085's
+# <10ms p99 target.
+#
+# Stated precisely, because the raw EXPLAIN output is easy to misread: those runs
+# ALSO report Planning Time ~2.2 ms, and that does NOT recur per request. EXPLAIN
+# re-plans by definition; the serving path does not. asyncpg prepares and caches
+# statements per connection (statement_cache_size 100) and `databases` hands out
+# pooled connections, so planning is paid ONCE per statement per connection and
+# amortises to ~0. The honest caveat is the cold edge: the first request on a
+# freshly-opened pool connection pays that ~2.2 ms once.
+#
+# The alternatives are both
+# worse: materialising the flag onto agent_pdp_view costs a migration, assembler
+# wiring, a backfill AND a staleness failure mode (renderability moves with
+# index_pipeline_state and external_product_seeds, neither of which triggers an
+# apv refresh) to save 0.18 ms; a second round trip — the pattern the citation
+# route uses, where a 300s cache absorbs it — would cost MORE than inlining.
+#
+# AVAILABILITY COUPLING, stated because the cost analysis alone does not cover it.
+# These reads now depend on `catalog_products` and `external_product_seeds` being
+# queryable, where migration 085's stated purpose was decoupling this read from
+# `catalog_products`. Concretely: an `ALTER TABLE catalog_products` takes ACCESS
+# EXCLUSIVE and will now block every gated agent PDP read for its duration, which
+# it did not before. Judged acceptable — those migrations are brief and this route
+# already hard-depends on `index_pipeline_state` via its INNER JOIN — but it IS a
+# new coupling, and the emergency bypass (which touches neither table) remains the
+# escape hatch if a long migration ever makes it bite.
+#
+# ONLY ON THE GATED SELECTS. The emergency-bypass variants below deliberately do
+# NOT carry it: they exist to serve when index_pipeline_state is the problem, and
+# gate 1 of this predicate reads that very table. A flag derived from the gate the
+# operator just overrode is not a weaker answer, it is a meaningless one — so the
+# bypass omits the column entirely and `_row_as_product` emits null ("unknown"),
+# never False.
+_RENDERABLE_APV_SQL = (
+    f"({sig_pdp_will_render_sql('apv.pivota_signature_id')}) AS pdp_renderable"
+)
+_SELECT_APV_COLUMNS_WITH_RENDERABLE = (
+    f"{_SELECT_APV_COLUMNS},\n      {_RENDERABLE_APV_SQL}"
+)
+
 # ADR-007 SLICE 1: the citation read surface gates on serving_eligible today.
 # When INDEX_ELIGIBLE_READ is ON the gate widens to the OFFER-FREE
 # `index_eligible` floor as well (serving_eligible OR index_eligible). The two
@@ -81,7 +130,7 @@ _INDEX_ELIGIBLE_CLAUSE = "(ips.serving_eligible = TRUE OR ips.index_eligible = T
 
 SELECT_BY_CONTENT_KEY_SQL = f"""
     SELECT
-      {_SELECT_APV_COLUMNS}
+      {_SELECT_APV_COLUMNS_WITH_RENDERABLE}
     FROM agent_pdp_view apv
     INNER JOIN index_pipeline_state ips ON ips.content_key = apv.content_key
     WHERE apv.content_key = :id
@@ -91,7 +140,7 @@ SELECT_BY_CONTENT_KEY_SQL = f"""
 
 SELECT_BY_SIGNATURE_SQL = f"""
     SELECT
-      {_SELECT_APV_COLUMNS}
+      {_SELECT_APV_COLUMNS_WITH_RENDERABLE}
     FROM agent_pdp_view apv
     INNER JOIN index_pipeline_state ips ON ips.content_key = apv.content_key
     WHERE apv.pivota_signature_id = :id
@@ -101,7 +150,7 @@ SELECT_BY_SIGNATURE_SQL = f"""
 
 SELECT_BY_PRODUCT_GROUP_SQL = f"""
     SELECT
-      {_SELECT_APV_COLUMNS}
+      {_SELECT_APV_COLUMNS_WITH_RENDERABLE}
     FROM agent_pdp_view apv
     INNER JOIN index_pipeline_state ips ON ips.content_key = apv.content_key
     WHERE apv.product_group_id = :id
@@ -351,6 +400,39 @@ def _row_as_product(row: Dict[str, Any]) -> Dict[str, Any]:
         canonical_url = pivota_canonical_pdp_url(str(signature_id))
         product["pivota_canonical_url"] = canonical_url
         product["url"] = canonical_url
+
+    # …AND WHETHER THAT URL ANSWERS 200. Emitting a citable URL with no way to
+    # tell whether it renders was the honesty gap #1592/#1593 closed on the
+    # canonical and citation reads; this is the same fix on the last surface that
+    # still had it.
+    #
+    # Sized against THIS ROUTE's population, not the feed's. The feed figure —
+    # 879 non-renderable of 5,887 — is the wrong denominator here, because this
+    # route 404s anything that fails its eligibility gate, so most of those 879
+    # were never served. Measured on prod for the rows this route actually
+    # returns: **390 of 4,782 (8.2%)** on the default serving-only lane, and 489
+    # of 4,881 with INDEX_ELIGIBLE_READ on. Still ~1 in 12 reads handing out a
+    # dead link with no warning.
+    #
+    # THREE-STATE, and the third state is the point:
+    #   True  — both of get_pdp_v2's gates pass; follow the link.
+    #   False — it will not render; cite the CONTENT, do not emit the link.
+    #   None  — UNKNOWN. Either no sig was minted (so there is no URL to
+    #           characterise), or the emergency
+    #           AGENT_PDP_V1_BYPASS_SERVING_ELIGIBILITY path served this row, and
+    #           that path deliberately does not join index_pipeline_state — which
+    #           gate 1 of the predicate reads. Reporting False there would be
+    #           asserting a check we did not run against a gate the operator
+    #           explicitly overrode.
+    #
+    # `row` genuinely lacks the key on the bypass path (the column is absent from
+    # those SELECTs), so `.get` returning None IS the signal, not a default.
+    raw_renderable = row.get("pdp_renderable")
+    product["pdp_renderable"] = (
+        None
+        if raw_renderable is None or not product.get("url")
+        else bool(raw_renderable)
+    )
 
     # Serve gate: never leak the raw evidence_profile (it can carry unverified
     # claims); emit only substantiated claims + the required disclaimers.
