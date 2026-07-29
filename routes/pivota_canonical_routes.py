@@ -277,6 +277,45 @@ def _content_depth_column():
     return pdp_content_depth_expression(catalog_products).label("content_depth")
 
 
+def _tombstoned_column():
+    """Boolean: has the row layer RETIRED this row, while it still serves?
+
+    ``suppression_reason`` set WITHOUT ``suppressed_at`` is a real, populated
+    state — step-5 dedupe, cross-merchant redundancy, brand-namesake retirement
+    and the d2_* identity resolutions all mark a row this way and leave it
+    serving. The consequence is that **tombstoned rows pass every
+    ``suppressed_at IS NULL`` filter in the system**, including this feed's own
+    :func:`~services.canonical_sitemap_candidates.sitemap_candidate_filter`, and
+    are therefore advertised as though nothing had been decided about them.
+
+    Measured on the live 7,509-URL sitemap, 2026-07-29 — 187 advertised URLs
+    point at a tombstoned row:
+
+      ``wrong_brand_namesake_wave3_20260718``      135
+      ``cross_merchant_redundant_external_seed``    50
+      ``step5_campaign_clone_dup``                   2
+
+    The first group is the one that makes this urgent rather than tidy: those
+    rows were retired for carrying the WRONG BRAND, so serving them publishes a
+    PDP with incorrect brand attribution — the single claim an identity-led
+    index cannot get wrong.
+
+    WHY A FIELD AND NOT A FILTER. The canonical ELECTION already excludes these
+    via ``not_tombstoned()``; this feed deliberately does not, because it is a
+    diagnostic surface as well as a sitemap source and dropping the rows here
+    would destroy the evidence (the same reasoning that keeps
+    ``renderable=false`` rows in the result set rather than filtering them out).
+    So this follows the established contract: the feed states the fact, and the
+    sitemap generator drops on an explicit ``true``.
+
+    Fail-OPEN, matching ``renderable`` and ``content_depth``: a consumer that
+    predates the field sees nothing and behaves exactly as before.
+    """
+    return (
+        catalog_products.c.suppression_reason.isnot(None)
+    ).label("tombstoned")
+
+
 def _elected_canonical_sig_note():
     """WHY the feed's `canonical_sig_id` is validated, and where.
 
@@ -643,6 +682,7 @@ async def list_canonical_pdp_signatures(
         index_pipeline_state.c.quality_scored_at,
         _renderable_column(),
         _content_depth_column(),
+        _tombstoned_column(),
         # Already validated by the JOIN's ON clause below — see the note there.
         content_canonical_election.c.canonical_sig_id,
     ]
@@ -744,6 +784,11 @@ async def list_canonical_pdp_signatures(
             # are still a ~510-char shell. Advisory only; see
             # _content_depth_column.
             "content_depth": bool(r["content_depth"]),
+            # Row-layer retirement (suppression_reason set, suppressed_at NULL).
+            # These pass every suppressed_at IS NULL filter and are advertised
+            # as if undecided — 187 live URLs on 2026-07-29, 135 of them retired
+            # for WRONG BRAND attribution. Advisory; see _tombstoned_column.
+            "tombstoned": bool(r["tombstoned"]),
             "index_eligible": (bool(r["index_eligible"]) if widen_sitemap else False),
             "blocker_code": r["blocker_code"],
             "blocker_detail": r["blocker_detail"],

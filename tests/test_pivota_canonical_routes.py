@@ -201,6 +201,9 @@ def _row(sig_suffix: str, **overrides) -> Dict[str, Any]:
         # "is there prose on this page", where renderable answers "will the
         # page answer at all". Also exposed, also unfiltered.
         "content_depth": True,
+        # Row-layer retirement flag (suppression_reason set, suppressed_at NULL).
+        # Default False = a live row; tests that need the tombstoned shape override.
+        "tombstoned": False,
         "suppressed_at": None,
         "index_eligible": False,
         "blocker_code": None,
@@ -862,3 +865,34 @@ def test_list_canonical_pdps_times_out_slow_database(monkeypatch: pytest.MonkeyP
 
     assert res.status_code == 504
     assert res.json()["detail"]["operation"] == "product_signature_count"
+
+
+def test_list_canonical_pdps_carries_tombstoned_without_filtering(env, monkeypatch):
+    """Row-layer retirement is ADVISORY here, exactly like renderable/content_depth.
+
+    `suppression_reason` set WITHOUT `suppressed_at` leaves a row serving, so it
+    passes every `suppressed_at IS NULL` filter including this feed's own
+    `sitemap_candidate_filter`. Measured 2026-07-29: 187 of the 7,509 advertised
+    URLs point at such a row, 135 of them retired for carrying the WRONG BRAND.
+
+    The feed must SAY SO and still emit the row — it is a diagnostic surface as
+    well as a sitemap source, and filtering here would destroy the evidence the
+    same way it would for renderable=false rows. The generator does the dropping.
+    """
+    from routes import pivota_canonical_routes as pcr
+
+    rows = list(pcr.database._rows)  # type: ignore[attr-defined]
+    rows[1] = {**rows[1], "renderable": True, "tombstoned": True}
+    monkeypatch.setattr(pcr.database, "_rows", rows, raising=False)
+
+    res = env.get("/api/canonical/products")
+    assert res.status_code == 200
+    body = res.json()
+    by_sig = {i["sig_id"]: i for i in body["items"]}
+
+    assert by_sig["sig_abc"]["tombstoned"] is False
+    # Retired but still renderable: PRESENT in the feed, flagged for the generator.
+    assert by_sig["sig_def"]["tombstoned"] is True
+    assert by_sig["sig_def"]["renderable"] is True, (
+        "the row must not be filtered out — flagging it is the whole point"
+    )
