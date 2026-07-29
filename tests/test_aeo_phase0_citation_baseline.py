@@ -471,3 +471,43 @@ def test_render_markdown_distinguishes_nothing_cited_from_unresolvable():
     md = aeo.render_markdown(payload, aeo.aggregate([nothing, unresolvable]), _meta())
     assert "(model cited nothing)" in md
     assert "publisher unresolvable" in md
+
+
+# ===========================================================================
+# THE COMPARABILITY CONTRACT
+# ===========================================================================
+
+def test_portfolio_and_anchors_are_frozen():
+    """The prompts and anchors are the measurement instrument. Changing one
+    silently makes the next run incomparable to every previous one, which is
+    the ENTIRE value of this script.
+
+    Review demonstrated the contract was unenforced: rewriting a category
+    prompt, swapping an anchor's sig to zeros, and appending a 26th prompt each
+    left the whole suite 42/42 GREEN. The docstring says "keep the portfolio
+    frozen" and `render_markdown` prints "Portfolio is FROZEN in the script" —
+    neither is a guard.
+
+    ⚠️ IF THIS TEST FAILS, THAT IS THE QUESTION IT EXISTS TO ASK. Updating the
+    checksum is a DELIBERATE BASELINE RESET: every prior run becomes
+    incomparable and the next one is a new floor, not a delta. Do it knowingly,
+    say so in the commit, and re-state the baseline in the artifact — do not
+    paste the new hash to make CI green.
+    """
+    import hashlib
+    import json as _json
+
+    portfolio = [(p["tier"], p["anchor"], p["query"]) for p in aeo.PORTFOLIO]
+    anchors = [(k, v["sig"]) for k, v in aeo.ANCHORS.items()]
+    blob = _json.dumps({"portfolio": portfolio, "anchors": anchors}, sort_keys=True)
+    digest = hashlib.sha256(blob.encode()).hexdigest()
+
+    assert len(portfolio) == 25, f"portfolio is {len(portfolio)} prompts, frozen at 25"
+    assert len(anchors) == 8, f"{len(anchors)} anchors, frozen at 8"
+    assert digest == (
+        "c77fe327b45f4e56d30f1157851fadc5860e5f877c2b233fe17fb7cce788a504"
+    ), (
+        "the frozen portfolio changed — a prompt, a tier, an anchor key or an "
+        "anchor sig. The Aug 1 run would not be comparable to the 2026-07-25 "
+        "baseline. See this test's docstring before touching the hash."
+    )

@@ -118,6 +118,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import subprocess
 import os
 import sys
 import time
@@ -537,6 +538,16 @@ def run_baseline(args: argparse.Namespace, internal_key: str) -> Dict[str, Any]:
             for group in _chunks(anchor_prompts, args.batch_size):
                 queries = [g["query"] for g in group]
                 tier_of = {g["query"]: g["tier"] for g in group}
+                # POSITIONAL is primary, the string map is the fallback. Keying
+                # tiers on the ECHOED query is fragile: any upstream
+                # normalisation (a trailing space is enough) sends every row to
+                # "unknown", and because render_markdown iterates TIER_ORDER those
+                # rows vanish from BOTH the tier table and the per-prompt table
+                # while still counting in `overall`. The report would then claim a
+                # headline rate with every tier reading 0/0. Verified today that
+                # the probe echoes verbatim, so this is belt-and-braces - but with
+                # batch_size=1 (the default) position is exact and free.
+                tier_by_index = [g["tier"] for g in group]
                 print(
                     f"[{provider}] {anchor_key}"
                     f"{' (blind)' if blind else ''}: {len(queries)} query(ies)",
@@ -591,7 +602,7 @@ def run_baseline(args: argparse.Namespace, internal_key: str) -> Dict[str, Any]:
                     print("    NO RUNS RETURNED -- recorded as a gap", flush=True)
                     continue
 
-                for run in emitted:
+                for run_index, run in enumerate(emitted):
                     query = str(run.get("query") or "")
                     sources = [s for s in (run.get("grounding_sources") or []) if s]
                     url_match = run.get("url_match") or {}
@@ -601,7 +612,11 @@ def run_baseline(args: argparse.Namespace, internal_key: str) -> Dict[str, Any]:
                     unattributable = sum(1 for d in attributed if not d)
                     err = _run_errored(run)
                     row = {
-                        "tier": tier_of.get(query) or "unknown",
+                        "tier": (
+                            tier_by_index[run_index]
+                            if run_index < len(tier_by_index)
+                            else (tier_of.get(query) or "unknown")
+                        ),
                         "provider": provider,
                         "provider_reported": reported,
                         "anchor": anchor_key,
@@ -923,10 +938,48 @@ def main(argv: List[str]) -> int:
         "surface_note": args.surface_note,
     }
 
+    # WHICH CODE PRODUCED THESE NUMBERS. Review could not establish whether the
+    # 2026-07-25 reference run predated the blind-tier fix (973cdd65), which
+    # changed the request payload for 20 of 50 units - and nothing anywhere
+    # recorded the SHA. That ambiguity cost the per-tier detail of two tiers.
+    # Never again: stamp it into both artifacts.
+    try:
+        meta["script_git_sha"] = subprocess.run(
+            ["git", "rev-parse", "HEAD"],
+            capture_output=True, text=True, timeout=10,
+        ).stdout.strip() or "unknown"
+    except Exception:
+        meta["script_git_sha"] = "unknown"
+
     print("\n===== AEO PHASE 0 BASELINE =====")
     print(json.dumps({"overall": agg["overall"], "by_tier": agg["by_tier"],
                       "by_provider": agg["by_provider"]}, indent=2))
     print("top cited domains:", agg["top_cited_domains"][:12])
+
+    # ===== INSTRUMENT SUSPECT =====
+    # THE ONE FAILURE MODE THAT LOOKS EXACTLY LIKE A REAL RESULT.
+    #
+    # Every other degradation is separated from "not cited" and excluded from the
+    # graded denominator - auth failure, transport failure, per-run timeout,
+    # provider outage, missing API key, empty raw_runs. This one is not: if the
+    # gateway ever renames or empties `grounding_sources` while still returning a
+    # well-formed 200, EVERY unit grades "not cited", the run exits 0, and the
+    # artifact reports a clean 0.0% baseline. Simulated in review with all 25
+    # queries genuinely citing us: headline 0/25, errored 0, exit 0.
+    #
+    # Zero grounding on EVERY graded unit is not a plausible measurement. The
+    # 2026-07-25 reference run returned sources on 44 of 50. So say so loudly
+    # rather than leaving the operator to remember that number.
+    ov = agg["overall"]
+    if ov.get("graded", 0) > 0 and ov.get("runs_with_zero_grounding", 0) == ov["graded"]:
+        print("\n" + "=" * 62)
+        print("INSTRUMENT SUSPECT - DO NOT REPORT THIS AS A BASELINE")
+        print(f"  every one of {ov['graded']} graded units returned ZERO grounding")
+        print("  sources. A real 0% citation run still elicits sources (07-25:")
+        print("  44/50). This is the signature of a response-shape change -")
+        print("  check that the probe still emits `grounding_sources` per run")
+        print("  before treating the citation rate as a measurement.")
+        print("=" * 62)
 
     if args.json_output:
         with open(args.json_output, "w", encoding="utf-8") as fh:
