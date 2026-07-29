@@ -140,6 +140,21 @@ def _as_int(value: Any, default: int = 0) -> int:
 _WIX_COLLECTIONS_PAGE_LIMIT = 100
 _WIX_COLLECTIONS_MAX_PAGES = 10
 
+# Merchandising collections describe WHERE a product sits in the storefront, not
+# WHAT it is. They are legitimate collections — we just never want one as the
+# category when a semantic sibling exists, because everything downstream of
+# `product_type` (vertical resolution, beauty taxonomy, category probes) reads it
+# as the product's kind. Anchored at the start so "Sale" and "Sale Items" match
+# while "Salt Scrubs" does not.
+_WIX_MERCHANDISING_COLLECTION_RE = re.compile(
+    r"^\s*(all\b|shop\s+all\b|new\b|new\s+arrivals?\b|best\b|best\s*sell|top\s+sell"
+    r"|featured\b|sale\b|on\s+sale\b|clearance\b|trending\b|popular\b|gifts?\b"
+    # NOT "accessories": that is a real product kind, not a merchandising
+    # shelf, and it resolves to a correct vertical on its own.
+    r"|gift\s+(guide|ideas?)\b|bundles?\b|deals?\b)",
+    re.IGNORECASE,
+)
+
 
 def _wix_max_pages_override() -> Optional[int]:
     raw = os.getenv("WIX_MAX_PAGES")
@@ -893,10 +908,24 @@ class WixProductAdapter:
         A product can belong to many collections, so the choice must be
         DETERMINISTIC: an unstable `product_type` churns the quality score (and
         anything keyed off it) on every re-sync, turning a fixed field into a
-        source of drift. Alphabetically-first among the resolvable names is
-        stable as long as the store's collections are, and does not pretend to
-        a specificity ranking the reader API does not give us — `numberOfProducts`
-        is not returned by `collections/query`.
+        source of drift.
+
+        But determinism is a TIE-BREAK rule, not a selection rule, and plain
+        alphabetical order is not neutral — merchandising collections cluster on
+        A/B/N/S ("Accessories", "Best Sellers", "New Arrivals", "Sale"), so
+        alphabetical-first is systematically biased toward them and away from the
+        semantic category. Measured on realistic pairs: {Best Sellers, Dog
+        Harnesses} -> "Best Sellers"; {New Arrivals, Vitamin C Serum} -> "New
+        Arrivals", which `resolve_vertical` then reads as `other` instead of
+        `beauty`, so beauty taxonomy rows are never written and category probes
+        generate queries for "New Arrivals".
+
+        That is the same valid-but-wrong failure the All-Products exclusion
+        exists to prevent, just softer: the score component fills either way,
+        which is exactly what makes it easy to miss. So deprioritise the
+        merchandising tier first, then sort alphabetically WITHIN the surviving
+        tier, and fall back to the full set only if the stoplist empties it —
+        a merchandising category still beats none for the score.
         """
         if not collection_names:
             return None
@@ -907,7 +936,10 @@ class WixProductAdapter:
                 if (name := str(collection_names.get(cid) or "").strip())
             }
         )
-        return names[0] if names else None
+        if not names:
+            return None
+        semantic = [n for n in names if not _WIX_MERCHANDISING_COLLECTION_RE.match(n)]
+        return (semantic or names)[0]
 
     @staticmethod
     async def _fetch_wix_collection_names(
@@ -921,6 +953,15 @@ class WixProductAdapter:
         losing them costs one of six score components, while letting this call
         abort the run would cost the entire catalog. Degrading here reproduces
         exactly the pre-2026-07-29 behaviour, which is a known, survivable state.
+
+        Degrades ALL-OR-NOTHING. A partial map is worse than no map: with 101
+        collections, a product in {"Zebra Print" (page 1), "Apparel" (page 2)}
+        resolves to "Apparel" on a complete fetch and "Zebra Print" when page 2
+        500s — a different, valid-looking category, with nothing to distinguish
+        it, that silently flips back on the next successful sync. That breaks the
+        determinism `_pick_wix_product_type` depends on. Returning {} instead
+        costs one component for one sync and trips the canary, which is a state
+        we can see.
         """
         names: Dict[str, str] = {}
         try:
@@ -933,13 +974,16 @@ class WixProductAdapter:
                 )
                 if response.status_code != 200:
                     logger.warning(
-                        "Wix collections unavailable merchant_id=%s status=%s body=%s "
-                        "— products will sync WITHOUT a category",
+                        "Wix collections unavailable merchant_id=%s status=%s partial_pages=%s "
+                        "body=%s — DISCARDING %s partial results; products will sync WITHOUT "
+                        "a category",
                         merchant_id,
                         response.status_code,
+                        offset // _WIX_COLLECTIONS_PAGE_LIMIT,
                         response.text[:200],
+                        len(names),
                     )
-                    return names
+                    return {}
                 payload = response.json() or {}
                 page = payload.get("collections")
                 if not isinstance(page, list) or not page:
@@ -956,11 +1000,13 @@ class WixProductAdapter:
                 offset += len(page)
         except Exception as exc:  # noqa: BLE001 — see docstring: never fail the sync
             logger.warning(
-                "Wix collections fetch failed merchant_id=%s error=%s "
-                "— products will sync WITHOUT a category",
+                "Wix collections fetch failed merchant_id=%s error=%s — DISCARDING %s "
+                "partial results; products will sync WITHOUT a category",
                 merchant_id,
                 exc,
+                len(names),
             )
+            return {}
         return names
 
     @staticmethod
@@ -1308,6 +1354,25 @@ class WixProductAdapter:
                         merchant_id,
                         products_with_collection_ids,
                         len(collection_names),
+                    )
+                elif collection_names and not products_with_collection_ids:
+                    # The OTHER silent failure, and the likelier one: the store
+                    # has real collections but no product appears to belong to
+                    # any of them. A store genuinely organised that way is
+                    # possible; a `collectionIds` field RENAMED to a spelling
+                    # outside our accepted aliases looks exactly the same from
+                    # here — and the branch above structurally cannot see it,
+                    # because it requires products_with_collection_ids to be
+                    # non-zero, which is precisely what a rename drives to zero.
+                    logger.warning(
+                        "Wix category mapping SAW NO COLLECTION IDS merchant_id=%s: %s collections "
+                        "resolved but 0 of %s products carry collection ids. Either this store "
+                        "assigns no products to collections, or the product field changed name "
+                        "(accepted: collectionIds / collection_ids / collectionIDs). "
+                        "brand_category will score 0 for every row.",
+                        merchant_id,
+                        len(collection_names),
+                        len(standard_products),
                     )
 
             return standard_products, next_page_token, None

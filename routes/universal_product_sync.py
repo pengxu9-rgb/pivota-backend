@@ -255,7 +255,26 @@ async def universal_product_sync(
                         merchant_id=request.merchant_id,
                         platform=platform,
                         requested_by="universal_product_sync",
-                        force_refresh=False,
+                        # HONOUR the caller's force_refresh. This was hardcoded
+                        # False while `UniversalSyncRequest.force_refresh` existed
+                        # and was silently ignored, which made a whole CLASS of
+                        # fix undeliverable: the backfill skips any row that
+                        # already has a snapshot (product_quality_backfill_service
+                        # :102 — `missing_only and not force_refresh and
+                        # quality_row_has_scores(...)`), so re-syncing a merchant
+                        # whose products NEWLY GAINED a field could never move
+                        # their stored score.
+                        #
+                        # Concretely, and not hypothetically: a Wix merchant
+                        # scored 66.7 before category mapping existed. With this
+                        # hardcoded False, syncing after the mapping lands writes
+                        # the category correctly, enqueues the job, skips every
+                        # row, leaves the snapshot at 66.7, and returns success —
+                        # the products stay unservable while every signal says the
+                        # sync worked. Both `routes/wix_sync.py` and
+                        # `routes/platform_products_sync_api.py` pass
+                        # force_refresh=True and were silently downgraded here.
+                        force_refresh=bool(request.force_refresh),
                         missing_only=True,
                     )
                 except Exception as enqueue_error:  # noqa: BLE001 — best-effort

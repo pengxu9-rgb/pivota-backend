@@ -54,6 +54,58 @@ def test_universal_sync_enqueues_a_quality_backfill_job():
     assert "missing_only" in kw and "requested_by" in kw
 
 
+def test_enqueue_honours_the_caller_s_force_refresh():
+    """Enqueuing is not enough — the job must be allowed to actually rescore.
+
+    `force_refresh` was hardcoded False here while
+    `UniversalSyncRequest.force_refresh` existed and was silently ignored, and
+    both callers that set it (routes/wix_sync.py,
+    routes/platform_products_sync_api.py) were downgraded on the way through.
+
+    That made an entire CLASS of fix undeliverable. The backfill skips any row
+    that already has a snapshot, so when a merchant's products newly GAIN a
+    field, a re-sync writes the field, enqueues the job, skips every row, keeps
+    the old score, and returns success. Concretely: Wix merchants stuck at 66.7
+    for a missing category would have stayed at 66.7 after category mapping
+    landed, with every signal reporting success.
+    """
+    tree = ast.parse(ROUTE.read_text())
+    calls = _calls(tree, "create_quality_backfill_job")
+    assert calls, "the enqueue call disappeared — rewrite this guard"
+    for call in calls:
+        kws = {k.arg: k.value for k in call.keywords}
+        assert "force_refresh" in kws, "force_refresh is no longer passed at all"
+        node = kws["force_refresh"]
+        assert not (isinstance(node, ast.Constant) and node.value is False), (
+            "force_refresh is hardcoded False again. The caller's force_refresh is "
+            "then silently discarded and no already-scored row can ever be rescored "
+            "— a re-sync that adds a field reports success and changes nothing."
+        )
+        assert "force_refresh" in ast.dump(node), (
+            "force_refresh is not derived from the request; forward request.force_refresh."
+        )
+
+
+def test_the_skip_predicate_is_what_makes_force_refresh_load_bearing():
+    """Pin the behaviour the test above exists to protect.
+
+    Mirrors services/product_quality_backfill_service.py:102. If this predicate
+    changes, revisit the reasoning above rather than deleting the guard.
+    """
+    from services.product_quality_backfill_service import quality_row_has_scores
+
+    already_scored = {"content_quality_score": 66.7}
+    assert quality_row_has_scores(already_scored) is True
+
+    def row_skipped(missing_only: bool, force_refresh: bool) -> bool:
+        return bool(
+            missing_only and not force_refresh and quality_row_has_scores(already_scored)
+        )
+
+    assert row_skipped(True, False) is True, "a scored row is skipped without force_refresh"
+    assert row_skipped(True, True) is False, "force_refresh is what unskips it"
+
+
 def test_enqueue_failure_cannot_fail_the_sync():
     # The enqueue must sit inside its own try/except, same contract as the
     # sibling hook in run_catalog_sync_job: a scoring-enqueue failure must never

@@ -108,6 +108,51 @@ def test_pick_is_deterministic_across_id_order():
     assert a == b == "Collars"  # alphabetically first
 
 
+@pytest.mark.parametrize(
+    "collections,expected",
+    [
+        ({"c1": "Best Sellers", "c2": "Dog Harnesses"}, "Dog Harnesses"),
+        ({"c1": "New Arrivals", "c2": "Vitamin C Serum"}, "Vitamin C Serum"),
+        ({"c1": "All Products Shop", "c2": "Winter Coats"}, "Winter Coats"),
+        ({"c1": "Sale", "c2": "Zebra Print Leggings"}, "Zebra Print Leggings"),
+        ({"c1": "Gifts", "c2": "Toners"}, "Toners"),
+        ({"c1": "Clearance", "c2": "Bath Bombs"}, "Bath Bombs"),
+    ],
+)
+def test_merchandising_collections_lose_to_a_semantic_one(collections, expected):
+    """Alphabetical-first is BIASED, not neutral.
+
+    Merchandising names cluster on A/B/N/S, so plain sorting reliably picks the
+    storefront shelf over the product kind. The score component fills either
+    way -- which is what makes this easy to miss -- but everything downstream of
+    product_type degrades: resolve_vertical drops beauty/fashion to `other`, the
+    beauty taxonomy rows are never written, and category probes would generate
+    queries for "New Arrivals".
+    """
+    wp = _wix_product(collectionIds=list(collections))
+    assert WixProductAdapter._pick_wix_product_type(wp, collections) == expected
+
+
+def test_merchandising_is_still_better_than_no_category():
+    """The stoplist DEPRIORITISES; it must never veto the only candidate.
+
+    A merchandising category still fills brand_category, which is the whole
+    point of the change.
+    """
+    wp = _wix_product(collectionIds=["c1", "c2"])
+    assert WixProductAdapter._pick_wix_product_type(
+        wp, {"c1": "Sale", "c2": "Best Sellers"}
+    ) == "Best Sellers"
+
+
+@pytest.mark.parametrize("name", ["Salt Scrubs", "Newborn Sets", "Allergy Care", "Bestie Bundles Co"])
+def test_stoplist_does_not_swallow_real_categories(name):
+    """Anchored word-boundary matching: "Sale" must not eat "Salt Scrubs"."""
+    wp = _wix_product(collectionIds=["c1", "c2"])
+    picked = WixProductAdapter._pick_wix_product_type(wp, {"c1": name, "c2": "Zzz Last"})
+    assert picked == name, f"{name!r} was wrongly treated as a merchandising shelf"
+
+
 def test_unresolvable_ids_yield_none_not_the_id():
     """A raw id is not a category name.
 
@@ -197,15 +242,72 @@ class _FakeClient:
         self.calls: List[Dict[str, Any]] = []
 
     async def post(self, url: str, json: Optional[Dict[str, Any]] = None, headers=None):
-        self.calls.append({"url": url, "json": json})
+        # `headers` is recorded because a dropped Authorization header is a
+        # 403 -> {} -> the whole feature silently off. A mutation run showed
+        # that removing headers from the collections POST survived the suite.
+        self.calls.append({"url": url, "json": json, "headers": headers})
         nxt = self._responses.pop(0) if self._responses else _FakeResponse(200, {"collections": []})
         if isinstance(nxt, Exception):
             raise nxt
         return nxt
 
 
-def _fetch(client) -> Dict[str, str]:
-    return asyncio.run(WixProductAdapter._fetch_wix_collection_names(client, {}, "m1"))
+def _fetch(client, headers: Optional[Dict[str, str]] = None) -> Dict[str, str]:
+    return asyncio.run(
+        WixProductAdapter._fetch_wix_collection_names(client, headers or {}, "m1")
+    )
+
+
+def test_fetch_forwards_the_auth_headers():
+    """A dropped Authorization header is 403 -> {} -> the feature silently off."""
+    client = _FakeClient([_FakeResponse(200, {"collections": []})])
+    _fetch(client, {"Authorization": "tok", "wix-site-id": "site-1"})
+    assert client.calls[0]["headers"] == {"Authorization": "tok", "wix-site-id": "site-1"}
+
+
+def test_fetch_advances_the_paging_offset():
+    """Without a real advance, page 2 re-reads page 1 forever."""
+    full = [{"id": f"c{i}", "name": f"N{i}"} for i in range(100)]
+    client = _FakeClient([
+        _FakeResponse(200, {"collections": full}),
+        _FakeResponse(200, {"collections": [{"id": "c100", "name": "Last"}]}),
+    ])
+    names = _fetch(client)
+    assert client.calls[0]["json"]["query"]["paging"]["offset"] == 0
+    assert client.calls[1]["json"]["query"]["paging"]["offset"] == 100
+    assert names["c100"] == "Last"
+
+
+def test_fetch_sends_a_paging_body():
+    client = _FakeClient([_FakeResponse(200, {"collections": []})])
+    _fetch(client)
+    paging = client.calls[0]["json"]["query"]["paging"]
+    assert paging["limit"] == 100 and paging["offset"] == 0
+
+
+def test_partial_page_failure_discards_rather_than_returning_a_partial_map():
+    """A partial map is worse than none: it silently changes the category.
+
+    101 collections, product in {"Zebra Print" (page 1), "Apparel" (page 2)}.
+    A complete fetch picks "Apparel"; a partial one picks "Zebra Print" -- a
+    different, valid-looking value that flips back on the next good sync,
+    breaking the determinism _pick_wix_product_type relies on.
+    """
+    page1 = [{"id": f"c{i}", "name": f"Zebra Print {i}"} for i in range(100)]
+    client = _FakeClient([
+        _FakeResponse(200, {"collections": page1}),
+        _FakeResponse(500, text="boom"),
+    ])
+    assert _fetch(client) == {}
+
+
+def test_partial_transport_failure_also_discards():
+    page1 = [{"id": f"c{i}", "name": f"N{i}"} for i in range(100)]
+    client = _FakeClient([
+        _FakeResponse(200, {"collections": page1}),
+        RuntimeError("connection reset"),
+    ])
+    assert _fetch(client) == {}
 
 
 def test_fetch_builds_the_id_to_name_map():
@@ -289,6 +391,7 @@ class _SequencedClient:
         self._collections = collections
         self._product_pages = list(product_pages)
         self.urls: List[str] = []
+        self.calls: List[Dict[str, Any]] = []
 
     async def __aenter__(self):
         return self
@@ -298,19 +401,20 @@ class _SequencedClient:
 
     async def post(self, url: str, json: Optional[Dict[str, Any]] = None, headers=None):
         self.urls.append(url)
+        self.calls.append({"url": url, "json": json, "headers": headers})
         if url.endswith("/collections/query"):
             return self._collections
         page = self._product_pages.pop(0) if self._product_pages else _FakeResponse(200, {"products": []})
         return page
 
 
-def _run_fetch(monkeypatch, client) -> List[Any]:
+def _run_fetch(monkeypatch, client, limit: int = 50) -> List[Any]:
     import adapters.product_adapters as mod
 
     monkeypatch.setattr(mod.httpx, "AsyncClient", lambda *a, **k: client)
     products, _token, err = asyncio.run(
         WixProductAdapter.fetch_products(
-            site_id="site-1", api_key="key-1", merchant_id="m1", limit=50
+            site_id="site-1", api_key="key-1", merchant_id="m1", limit=limit
         )
     )
     assert err is None
@@ -345,21 +449,47 @@ def test_fetch_products_queries_collections_before_products(monkeypatch):
     assert client.urls[1].endswith("/products/query")
 
 
-def test_fetch_products_queries_collections_once_per_sync_not_per_product(monkeypatch):
-    """Collections are a per-store resource. Per-product would be N+1."""
+def test_fetch_products_queries_collections_once_across_MANY_product_pages(monkeypatch):
+    """Collections are a per-store resource. Re-fetching per page is N+1.
+
+    This test needs MULTIPLE product pages to mean anything. With a single-page
+    fixture it passed whether the fetch sat before the loop or inside it -- one
+    page, one call, either way -- and a mutation run confirmed the N+1 mutant
+    survived it. Three pages at limit=2 make the two implementations differ:
+    1 collections call vs 3.
+    """
+    page = lambda i: _FakeResponse(200, {  # noqa: E731
+        "products": [
+            _wix_product(id=f"p{i}a", sku=f"S{i}a", collectionIds=["c1"]),
+            _wix_product(id=f"p{i}b", sku=f"S{i}b", collectionIds=["c1"]),
+        ],
+        "totalResults": 6,
+    })
     client = _SequencedClient(
         collections=_FakeResponse(200, {"collections": [{"id": "c1", "name": "Dog Harness"}]}),
-        product_pages=[_FakeResponse(200, {
-            "products": [
-                _wix_product(id=f"p{i}", sku=f"S{i}", collectionIds=["c1"]) for i in range(5)
-            ],
-            "totalResults": 5,
-        })],
+        product_pages=[page(0), page(1), page(2)],
     )
-    products = _run_fetch(monkeypatch, client)
-    assert len(products) == 5
+    products = _run_fetch(monkeypatch, client, limit=2)
+
+    assert len(products) == 6, "the multi-page fixture did not actually page"
+    assert sum(1 for u in client.urls if u.endswith("/products/query")) == 3
     assert all(p.product_type == "Dog Harness" for p in products)
     assert sum(1 for u in client.urls if u.endswith("/collections/query")) == 1
+
+
+def test_fetch_products_forwards_auth_headers_to_collections(monkeypatch):
+    """Real credentials must reach the collections call, not just products."""
+    client = _SequencedClient(
+        collections=_FakeResponse(200, {"collections": [{"id": "c1", "name": "Dog Harness"}]}),
+        product_pages=[_FakeResponse(200, {"products": [_wix_product(collectionIds=["c1"])], "totalResults": 1})],
+    )
+    _run_fetch(monkeypatch, client)
+    collections_call = next(c for c in client.calls if c["url"].endswith("/collections/query"))
+    assert collections_call["headers"], "collections call went out with NO headers"
+    assert any(
+        "authorization" in str(k).lower() or "wix-site-id" in str(k).lower()
+        for k in collections_call["headers"]
+    ), f"no auth header on the collections call: {sorted(collections_call['headers'])}"
 
 
 def test_fetch_products_survives_a_dead_collections_endpoint(monkeypatch):
@@ -396,6 +526,37 @@ def test_fetch_products_warns_when_mapping_resolves_nothing(monkeypatch, caplog)
     )
 
 
+def test_canary_fires_when_collections_exist_but_no_product_claims_one(monkeypatch, caplog):
+    """The field-rename blind spot.
+
+    If Wix renames `collectionIds` to a spelling outside our aliases, every
+    product parses as having no collections. The "RESOLVED NOTHING" arm cannot
+    see that -- it requires products_with_collection_ids to be non-zero, which
+    is exactly what a rename drives to zero. A store with real collections whose
+    products all claim membership in none of them is anomalous, not empty.
+    """
+    import logging
+
+    client = _SequencedClient(
+        collections=_FakeResponse(200, {"collections": [
+            {"id": "c1", "name": "Harnesses"},
+            {"id": "c2", "name": "Collars"},
+        ]}),
+        product_pages=[_FakeResponse(200, {
+            # renamed field -> parses as "no collection ids"
+            "products": [_wix_product(collectionSlugs=["c1"])],
+            "totalResults": 1,
+        })],
+    )
+    with caplog.at_level(logging.WARNING):
+        products = _run_fetch(monkeypatch, client)
+    assert products[0].product_type is None
+    assert any("SAW NO COLLECTION IDS" in r.message for r in caplog.records), (
+        "a renamed collectionIds field produced no warning -- every product "
+        "ships category-less and nothing says so"
+    )
+
+
 def test_no_warning_when_the_store_genuinely_has_no_collections(monkeypatch, caplog):
     """The canary must answer BOTH ways, or it is noise that gets muted."""
     import logging
@@ -406,4 +567,12 @@ def test_no_warning_when_the_store_genuinely_has_no_collections(monkeypatch, cap
     )
     with caplog.at_level(logging.WARNING):
         _run_fetch(monkeypatch, client)
-    assert not any("RESOLVED NOTHING" in r.message for r in caplog.records)
+    # Assert on EVERY category-mapping warning, not just one string. Checking a
+    # single message let a mutant that fires the second arm unconditionally
+    # survive: a canary that always fires is a canary that gets muted, and then
+    # the real signal is gone too.
+    noisy = [
+        r.message for r in caplog.records
+        if "RESOLVED NOTHING" in r.message or "SAW NO COLLECTION IDS" in r.message
+    ]
+    assert not noisy, f"canary fired for a store that genuinely has no collections: {noisy}"
