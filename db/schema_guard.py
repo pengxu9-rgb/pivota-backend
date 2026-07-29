@@ -413,7 +413,25 @@ async def ensure_required_schema_light() -> None:
                       ADD COLUMN IF NOT EXISTS apm_cadence_days INTEGER NULL,
                       ADD COLUMN IF NOT EXISTS apm_scope_jsonb JSONB NULL,
                       ADD COLUMN IF NOT EXISTS apm_configured_at TIMESTAMPTZ NULL,
-                      ADD COLUMN IF NOT EXISTS apm_last_run_at TIMESTAMPTZ NULL;
+                      ADD COLUMN IF NOT EXISTS apm_last_run_at TIMESTAMPTZ NULL,
+                      -- signup_source (migration 187), here for exactly the
+                      -- reason the paragraph above describes. It DOES reach prod
+                      -- today, but only via a LAZY backstop:
+                      -- db/merchant_onboarding.py:96 issues its own
+                      -- ADD COLUMN IF NOT EXISTS inside
+                      -- ensure_operating_mode_column(), called at the top of
+                      -- create_merchant_onboarding() — i.e. on the FIRST MERCHANT
+                      -- SIGNUP of a process, behind a module-level done-flag.
+                      --
+                      -- So the column is covered by CALL ORDER, not by design.
+                      -- merchant_onboarding.select() materializes every column
+                      -- including this one, and get_merchant_onboarding() sits on
+                      -- the ADR-018 connection-layer path — a read that can
+                      -- precede the first signup in a fresh process or a fresh
+                      -- database. Healing it at startup makes the guarantee
+                      -- independent of call order, which is what the apm_enabled
+                      -- outage taught.
+                      ADD COLUMN IF NOT EXISTS signup_source VARCHAR(64);
                     """
                 )
             )
