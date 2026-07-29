@@ -77,6 +77,14 @@ jobs:
           SHA = os.environ['HEAD_SHA']
           PR = os.environ.get('PR_NUMBER')
           SELF = 'CI Entrypoint'
+          # BUILT FROM PARTS, NEVER WRITTEN LITERALLY. A `run:` body is scanned by
+          # the Actions TEMPLATE EVALUATOR before any shell exists, so a literal
+          # `${'{'}{` in this script is parsed as an expression — and an invalid one
+          # rejects the whole workflow at load time: zero jobs, `total_count: 0`,
+          # and a failure with no log to read. That is exactly how the previous
+          # commit broke this file, and it is the same trap the repo already
+          # documented for free-form workflow inputs.
+          DOLLAR_BRACE = chr(36) + '{' + '{'
 
           def gh_json(path):
               """Every JSON document `gh api --paginate` emits, decoded.
@@ -99,7 +107,7 @@ jobs:
                   obj, end = dec.raw_decode(raw, idx)
                   docs.append(obj)
                   idx = end
-                  while idx < len(raw) and raw[idx] in ' \\t\\r\\n':
+                  while idx < len(raw) and raw[idx].isspace():
                       idx += 1
               return docs
 
@@ -163,7 +171,7 @@ jobs:
                   spec = spec or {}
                   label = spec.get('name') or key
                   if (spec.get('strategy') or {}).get('matrix') or spec.get('uses') \
-                     or '${{' in str(label):
+                     or (DOLLAR_BRACE in str(label)):
                       unmatchable.append(label)
                   else:
                       names.append(label)
