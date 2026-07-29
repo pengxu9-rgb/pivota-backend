@@ -1,0 +1,177 @@
+name: Backend Test Sweep
+
+# 89.6% OF THIS REPO'S TESTS RAN IN NO CI JOB.
+#
+# Measured 2026-07-29 on `origin/main`: 876 test files exist, 91 are named by
+# some workflow, 7 belong to the Postgres dialect gate — leaving **785 (89.6%)**
+# that no CI job executed. A green PR check said almost nothing about this repo.
+#
+# It was not cost. The whole uncovered set runs in **62 seconds**: 8,267 passed,
+# 24 skipped, 6 failed. Sixty-two seconds of compute was the entire distance
+# between "CI is green" and "CI means something".
+#
+# WHY IT HAPPENED, AND WHY THIS JOB IS GLOBBED. Every existing pytest workflow
+# names its files by hand: `v3-audit-gate.yml` lists 26, `agent-reliability-
+# suite.yml` 16 plus 15 more in the shell script it calls. A hand-maintained list
+# only covers what someone remembered to add, and it silently fails to grow. The
+# same mechanism left the rig-exclusion guards unexecuted (#1600) and #1829's
+# error-taxonomy suite never run once. So this job takes a GLOB and a short,
+# justified DENYLIST — the inverse shape. A new test file is covered the moment
+# it lands; skipping it takes a deliberate edit here, in review.
+#
+# NOT included, deliberately: `tests/test_*_postgres.py`. Those belong to
+# `postgres-dialect-gate.yml` and need a live Postgres service container. Running
+# them here would either fail or, worse, silently skip.
+
+on:
+  pull_request:
+    paths:
+      - 'services/**'
+      - 'routes/**'
+      - 'db/**'
+      - 'scripts/**'
+      - 'tests/**'
+      - 'requirements*.txt'
+      - '.github/workflows/backend-test-sweep.yml'
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+jobs:
+  sweep:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: pip
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt -r requirements-dev.txt
+
+      # THE QUARANTINE. Visible, justified, and meant to SHRINK.
+      #
+      # Kept in the workflow rather than a dotfile precisely so it is reviewed:
+      # an invisible denylist just becomes the next hand-maintained list this job
+      # exists to replace. Each entry states what is wrong and who should fix it.
+      # Removing an entry is the definition of progress here.
+      #
+      #   test_runtime_hardcode_guard          — RED. Reports 3 hardcoded merchant
+      #     ids in comments (services/pdp_renderability.py:219 and two siblings).
+      #     A real finding; the guard is doing its job and the debt is unpaid.
+      #   test_schema_guard_migration_coverage — RED, and the most valuable of the
+      #     five: migration 187 adds `merchant_onboarding.signup_source` with no
+      #     `schema_guard.py` self-heal entry. Railway prod SKIPS db/migrations/,
+      #     so the column exists only because `ensure_operating_mode_column()`
+      #     lazily adds it on the FIRST merchant signup of a process. Covered by
+      #     accident of call order, not by design. Filed separately.
+      #   test_audit_scheduler_worker_env_gate — RED (2 tests). Appeared after the
+      #     2026-07-28 recon, so it is a recent regression, not ancient debt.
+      #   test_external_seed_csv_import        — RED alone AND in the sweep.
+      #   test_winnable_prompts                — ORDER-DEPENDENT: passes alone
+      #     (8/8), fails inside the sweep. Something earlier mutates
+      #     `config.settings` without restoring it. This is a real bug in test
+      #     isolation and the only entry here that the sweep itself created.
+      #
+      # FOUND BY THIS PR'S OWN STRAY-FILE GUARD: `readiness/tests/` is a whole
+      # sub-package — 17 files, 111 passing — that ran in NO CI job either. It is
+      # swept in here rather than deferred, because 111 tests of coverage now
+      # beats a tidier denylist later. Three of its files are red and join the
+      # quarantine:
+      #   readiness/tests/test_real_merchant_goldens.py
+      #   readiness/tests/test_routes.py          (2 route tests)
+      #   readiness/tests/test_shopify_live_source.py
+      #   readiness/tests/test_summary.py — ORDER-DEPENDENT, and found only by
+      #     combining the two trees: green running `readiness/tests` alone, red
+      #     inside the sweep. Exactly the effect the 2026-07-28 recon predicted —
+      #     "a globbed job runs a different set than the full suite, so
+      #     order-dependent tests flip in both directions". Two of the seven
+      #     quarantine entries are now this class.
+      #
+      # ⚠️ A denylist entry is a promise to come back, not a resolution. If this
+      # list is the same length in a month, this job has become the thing it
+      # replaced.
+      - name: Run the uncovered suite
+        id: sweep
+        run: |
+          set -o pipefail
+          python -m pytest tests readiness/tests \
+            --ignore=tests/test_runtime_hardcode_guard.py \
+            --ignore=tests/test_schema_guard_migration_coverage.py \
+            --ignore=tests/test_audit_scheduler_worker_env_gate.py \
+            --ignore=tests/test_external_seed_csv_import.py \
+            --ignore=tests/test_winnable_prompts.py \
+            --ignore=readiness/tests/test_real_merchant_goldens.py \
+            --ignore=readiness/tests/test_routes.py \
+            --ignore=readiness/tests/test_shopify_live_source.py \
+            --ignore=readiness/tests/test_summary.py \
+            --ignore-glob='tests/test_*_postgres.py' \
+            -q --no-header -p no:randomly \
+            --junitxml=sweep.xml 2>&1 | tee sweep.log
+
+      # ASSERT THE GATE ACTUALLY GATED.
+      #
+      # The sibling failure this guards against: a glob that matches nothing, or
+      # an --ignore typo'd into a directory, exits 0 having run almost nothing and
+      # reports green. `postgres-dialect-gate.yml` solves this by failing on ANY
+      # skip; that cannot work here, because this suite has ~24 LEGITIMATE
+      # env-gated skips (migration harness, Postgres e2e). So the equivalent
+      # protection is a FLOOR on tests actually executed.
+      #
+      # 7,500 against a measured 8,267: high enough that losing a directory trips
+      # it, low enough to absorb ordinary churn. Raise it when the real number
+      # grows; do not lower it to make a red build green.
+      - name: Assert the sweep actually ran
+        if: always()
+        run: |
+          python - <<'PY'
+          import re, sys, xml.etree.ElementTree as ET
+          FLOOR = 7500
+          try:
+              r = ET.parse('sweep.xml').getroot()
+          except Exception as e:
+              sys.exit(f"::error::could not read sweep.xml ({e}) — the sweep did not produce results")
+          suite = r if r.tag == 'testsuite' else r.find('testsuite')
+          total = int(suite.get('tests', 0))
+          skipped = int(suite.get('skipped', 0))
+          ran = total - skipped
+          print(f"collected={total} skipped={skipped} executed={ran} floor={FLOOR}")
+          if ran < FLOOR:
+              sys.exit(f"::error::only {ran} tests executed, floor is {FLOOR}. "
+                       "A glob or --ignore is matching more than intended — this job "
+                       "would have reported green having tested almost nothing.")
+          PY
+
+  # NEW TEST FILES MUST LAND INSIDE THE GLOB.
+  #
+  # The sweep covers `tests/**`, so the realistic way to create a new invisible
+  # test is to put it somewhere else. This is cheap insurance against the exact
+  # habit that produced the 89.6%.
+  new-tests-are-covered:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+      - name: Assert no test files live outside tests/
+        run: |
+          python - <<'PY'
+          import subprocess, sys, os
+          out = subprocess.run(
+              ['git', 'ls-files', '*test_*.py', '*_test.py'],
+              capture_output=True, text=True).stdout.split()
+          stray = [p for p in out
+                   if not p.startswith('tests/')
+                   and not p.startswith('safety-kernel/')      # JS/node, not pytest
+                   and not p.startswith('readiness/tests/')    # swept by the job above
+                   and os.path.basename(p).startswith('test_')]
+          if stray:
+              print("::error::test files outside tests/ are run by NO CI job:")
+              for p in stray:
+                  print(f"  {p}")
+              sys.exit(1)
+          print(f"clean — every test_*.py lives under tests/ ({len(out)} files checked)")
+          PY
