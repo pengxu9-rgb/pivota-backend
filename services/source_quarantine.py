@@ -77,11 +77,17 @@ def build_quarantine_anti_join_sql(
     if any(not str(expr or "").strip() for expr in expressions):
         raise ValueError("all row SQL expressions are required")
 
+    # CURRENT_TIMESTAMP, not now(): identical on Postgres (both give the
+    # transaction timestamp), but `now()` does not exist on SQLite — and this
+    # fragment is now embedded in `external_seed_search`, whose suite runs on
+    # SQLite. With now() that suite cannot EXECUTE the predicate at all, so the
+    # gate would be green-but-unexercised in the only place it is tested. That
+    # is the exact shape that cost a 16-minute prod feed outage in #1588.
     return f"""
 AND NOT EXISTS (
   SELECT 1 FROM catalog_source_quarantine q
   WHERE q.state = 'active'
-    AND (q.expires_at IS NULL OR q.expires_at > now())
+    AND (q.expires_at IS NULL OR q.expires_at > CURRENT_TIMESTAMP)
     AND (
       (q.match_type = 'domain' AND lower(q.match_value) = lower({row_domain_expr}))
       OR (q.match_type = 'merchant_platform' AND q.match_value = {row_merchant_expr} || ':' || {row_platform_expr})

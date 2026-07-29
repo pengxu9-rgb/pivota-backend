@@ -87,11 +87,50 @@ def test_build_quarantine_anti_join_sql_contains_all_match_types():
 
     assert "catalog_source_quarantine q" in sql
     assert "q.state = 'active'" in sql
-    assert "q.expires_at IS NULL OR q.expires_at > now()" in sql
+    # CURRENT_TIMESTAMP, not now(): identical on Postgres, but `now()` does not
+    # exist on SQLite — and this fragment is now embedded in
+    # external_seed_search, whose suite runs on SQLite. See
+    # test_anti_join_executes_on_sqlite below, which is the assertion that
+    # actually protects this; a string match alone would not have caught it.
+    assert "q.expires_at IS NULL OR q.expires_at > CURRENT_TIMESTAMP" in sql
+    assert "now()" not in sql
     assert "q.match_type = 'domain'" in sql
     assert "lower(q.match_value) = lower(p.source_domain)" in sql
     assert "q.match_type = 'merchant_platform'" in sql
     assert "q.match_type = 'source_system_ref'" in sql
+
+
+def test_anti_join_executes_on_sqlite():
+    """The fragment must RUN on the engine the suite uses, not merely read well.
+
+    Every other assertion in this file is a substring match, which is exactly
+    the kind of test that stays green while the SQL is unrunnable. `now()`
+    passed all of them and failed with `no such function: now` the first time
+    anything executed it.
+    """
+    import sqlite3
+
+    sql = build_quarantine_anti_join_sql(
+        "s.source_domain", "s.merchant_id", "s.platform", "s.source_system", "s.source_ref"
+    )
+    conn = sqlite3.connect(":memory:")
+    conn.execute(
+        "CREATE TABLE rows_under_test (id INTEGER, source_domain TEXT, merchant_id TEXT,"
+        " platform TEXT, source_system TEXT, source_ref TEXT)"
+    )
+    conn.execute(
+        "CREATE TABLE catalog_source_quarantine (quarantine_id INTEGER, match_type TEXT,"
+        " match_value TEXT, state TEXT, expires_at TEXT)"
+    )
+    conn.execute(
+        "INSERT INTO rows_under_test VALUES (1,'mintree.us',NULL,NULL,NULL,NULL),"
+        " (2,'beplain.com',NULL,NULL,NULL,NULL)"
+    )
+    conn.execute(
+        "INSERT INTO catalog_source_quarantine VALUES (1,'domain','mintree.us','active',NULL)"
+    )
+    got = [r[0] for r in conn.execute(f"SELECT id FROM rows_under_test s WHERE 1=1 {sql}")]
+    assert got == [2], f"quarantined row survived, or the SQL did not run: {got}"
 
 
 def test_domain_match_is_case_insensitive():

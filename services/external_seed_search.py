@@ -305,6 +305,61 @@ def _is_external_seed_query_timeout(exc: Exception) -> bool:
     )
 
 
+# The seed row's storefront, normalised to the convention the quarantine WRITER
+# uses (`services/storefront_currency.normalize_domain`, via
+# `scripts/audit_offer_currency.py`): lowercase, no leading `www.`.
+#
+# DELIBERATELY PORTABLE SQL — `CASE`/`LIKE`/`substr`/`lower`/`nullif` all behave
+# identically on Postgres and SQLite. The obvious spelling is
+# `regexp_replace(lower(domain), '^www\.', '')`, which is Postgres-only, and this
+# repo has already taken a 16-minute prod feed outage from PG-only SQL that a
+# green SQLite suite could not see (#1588). Portable means the suite that runs is
+# the suite that gates.
+#
+# `nullif(..., '')` is load-bearing twice over: a seed with no domain becomes
+# NULL rather than '', so it matches nothing — and, critically, a quarantine row
+# with a blank `match_value` (the migration declares `match_value TEXT NOT NULL`
+# with no non-empty CHECK, and these rows are inserted by direct SQL ops) cannot
+# match every domain-less seed in the corpus. Same trap the Python gate guards.
+#
+# Measured on prod 2026-07-29: 263 of 11,381 active seeds carry a `www.` prefix,
+# so the strip is load-bearing, not cosmetic. A `destination_url` fallback for
+# the 1,779 domain-less seeds was measured and rescues exactly 0 additional rows,
+# so it is deliberately NOT added — an unused branch is a untested branch.
+_SEED_QUARANTINE_DOMAIN_EXPR = (
+    "nullif("
+    "CASE WHEN lower(coalesce(domain, '')) LIKE 'www.%' "
+    "THEN substr(lower(coalesce(domain, '')), 5) "
+    "ELSE lower(coalesce(domain, '')) END"
+    ", '')"
+)
+
+
+def build_seed_quarantine_anti_join() -> str:
+    """The shared quarantine anti-join, scoped to what a seed row can supply.
+
+    `external_product_seeds` has no merchant_id / platform / source_system /
+    source_ref columns, so those three match types are passed NULL: `NULL || ':'
+    || NULL` is NULL on both engines, and `match_value = NULL` is never TRUE, so
+    they cannot match rather than matching wrongly.
+
+    That means only `domain` quarantines bite at this seam. Stated rather than
+    implied: an operator adding a `merchant_platform` quarantine expecting it to
+    stop external seeds would otherwise get a quarantine that reports success and
+    does nothing. The per-consumer Python gate in `services/offer_currency_policy`
+    still covers merchant_platform on the lanes it runs on.
+    """
+    from services.source_quarantine import build_quarantine_anti_join_sql
+
+    return build_quarantine_anti_join_sql(
+        row_domain_expr=_SEED_QUARANTINE_DOMAIN_EXPR,
+        row_merchant_expr="NULL",
+        row_platform_expr="NULL",
+        row_source_system_expr="NULL",
+        row_source_ref_expr="NULL",
+    )
+
+
 def _database_supports_statement_timeout(database: Any) -> bool:
     db_url = getattr(database, "url", None)
     if db_url is None:
@@ -386,6 +441,11 @@ async def fetch_external_seed_rows(
     if rank_enabled:
         query_values.update(rank_values)
 
+    # Applied to BOTH statements. A quarantine clause on the page query but not
+    # the count would make total_count advertise rows the page cannot contain —
+    # the caller then pages into a tail that is permanently empty.
+    quarantine_clause = build_seed_quarantine_anti_join()
+
     query_sql = f"""
                 SELECT
                   id, external_product_id, market, tool, utm_template, partner_type, disclosure_text,
@@ -399,6 +459,7 @@ async def fetch_external_seed_rows(
                   {rank_expr} AS brand_term_hit
                 FROM external_product_seeds
                 WHERE {" AND ".join(where)}
+                {quarantine_clause}
                 ORDER BY brand_term_hit DESC, created_at DESC, id DESC
                 LIMIT :limit OFFSET :offset
                 """
@@ -406,6 +467,7 @@ async def fetch_external_seed_rows(
                 SELECT COUNT(*) AS total_count
                 FROM external_product_seeds
                 WHERE {" AND ".join(where)}
+                {quarantine_clause}
                 """
     count_values: Dict[str, Any] = {
         k: v for k, v in values.items() if k not in {"limit", "offset"}
