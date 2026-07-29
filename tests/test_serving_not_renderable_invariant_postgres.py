@@ -87,7 +87,8 @@ def _reset(conn):
 
 
 def _row(conn, *, pk, ck="ck_x", platform="external_seed", serving=True,
-         with_seed=False, suppression_reason=None, suppressed=False):
+         with_seed=False, suppression_reason=None, suppressed=False,
+         merchant_id="external_seed"):
     from sqlalchemy import text
 
     conn.execute(
@@ -106,11 +107,12 @@ def _row(conn, *, pk, ck="ck_x", platform="external_seed", serving=True,
             "INSERT INTO catalog_products "
             "(product_key, merchant_id, platform, source_product_id, title, "
             " content_key, catalog_track, suppression_reason, suppressed_at) "
-            "VALUES (:pk, 'external_seed', :plat, :pk, :pk, :ck, "
+            "VALUES (:pk, :mid, :plat, :pk, :pk, :ck, "
             "        'external_referral', :reason, "
             f"        {'NOW()' if suppressed else 'NULL'})"
         ),
-        {"pk": pk, "plat": platform, "ck": ck, "reason": suppression_reason},
+        {"pk": pk, "mid": merchant_id, "plat": platform, "ck": ck,
+         "reason": suppression_reason},
     )
 
 
@@ -165,21 +167,36 @@ def test_excludes_already_retired_rows(pg_engine):
 def test_excludes_the_hard_coded_dark_merchant_sync_lane(pg_engine):
     """shopify is excluded because its lane verdict is a deliberate False
     (7/7-500 measurement) — counting a constant as drift is noise. The wix case
-    below stays count==0 for a DIFFERENT reason since 2026-07-29: the wix
-    verdict flipped True on the pilot's evidence, so a serving-eligible wix row
-    is renderable and never enters the set at all. If the wix assertion ever
-    fails, a wix row managed to be serving-eligible AND non-renderable — which
-    is exactly a real finding, not a fixture problem."""
+    stays count==0 for a DIFFERENT reason since 2026-07-29: the wix verdict
+    flipped True on the pilot's evidence, so a serving-eligible wix row on the
+    merchant-synced lane is renderable and never enters the set at all.
+
+    The rows here carry a REAL merchant_id: `_seed_routed_lane` claims any
+    `merchant_id='external_seed'` row for the seed lane BEFORE the platform
+    arms are consulted, so the fixture default would silently test the wrong
+    lane (that misfit is pinned separately below)."""
     with pg_engine.begin() as conn:
         _reset(conn)
         _row(conn, pk="pk_shop", ck="ck_shop", platform="shopify",
-             serving=True, with_seed=False)
+             merchant_id="merch_lane_pin", serving=True, with_seed=False)
         assert _count(conn) == 0
 
         _reset(conn)
         _row(conn, pk="pk_wix", ck="ck_wix", platform="wix",
-             serving=True, with_seed=False)
+             merchant_id="merch_lane_pin", serving=True, with_seed=False)
         assert _count(conn) == 0
+
+
+def test_counts_a_seed_lane_row_even_on_an_open_platform(pg_engine):
+    """A `merchant_id='external_seed'` row is seed-routed no matter what its
+    platform column says — the wix verdict being True cannot excuse a seed-lane
+    row whose seed is missing. This is the row shape the 2026-07-29 flip PR
+    tripped over in its own fixture; keep it counted on purpose."""
+    with pg_engine.begin() as conn:
+        _reset(conn)
+        _row(conn, pk="pk_wix_seedlane", ck="ck_wix_seedlane", platform="wix",
+             serving=True, with_seed=False)
+        assert _count(conn) == 1
 
 
 def test_sample_sql_returns_the_offending_keys(pg_engine):
