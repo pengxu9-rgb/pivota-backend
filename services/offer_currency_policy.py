@@ -1,75 +1,102 @@
-"""Currency-defect exclusion — the ONE serving-side predicate for "this row's
-currency LABEL cannot be trusted".
+"""Quarantined-source exclusion for the `find_products` connected/seed lane.
 
-Why this exists: on 2026-07-28 the public unauthenticated ACP feed
-(`GET /acp/feed` carrying a JSON body) served seven Mintree rows priced
-847-3927.70 and labelled ``"USD"``. Mintree is an Indian store
-(``mintree.us``, canonical ``vmintree.in``, ``country=IN``, ``currency=INR``):
-those were rupee prices published as US dollars. Rs1,058 presented as $1,058.
+Why this exists: on 2026-07-28 the public UNAUTHENTICATED ACP feed served seven
+Mintree rows priced 847-3927.70 and labelled ``"USD"``. Mintree is an Indian
+store (``mintree.us``, canonical ``vmintree.in``, ``country=IN``,
+``currency=INR``): those were rupee prices published as US dollars.
 
-The block was never broken. It was applied to the INDEX/serving path --
-``catalog_offers.suppressed_at`` + ``source_currency_or_channel_defect``,
-``index_pipeline_state.serving_eligible=false``, and the trust/renderability
-gates -- and every consumer that reads those is clean. Measured the same day:
+The containment was never broken. Measured the same day: canonical index feed
+0 rows, sitemap 0, PDP 404s correctly, **connected lane 20**. The block lives on
+the index/serving path, and ``find_products`` routes to the
+``connected_catalog`` / external-seed lane, which is gated only by
+``_is_product_sellable`` (status + orderable). Suppression, quarantine, serving
+eligibility and trust are all invisible to it -- a fifth storefront on the same
+catalog, born ungated. The ADR-012 thesis exactly.
 
-    canonical index feed (all 5,887 rows paged) ... 0 Mintree rows
-    public sitemap ............................... 0
-    PDP render ................................... 404s correctly
-    ACP connected lane (find_products) ........... 20   <- leaking
+WHICH SOURCE, AND WHY NOT THE OBVIOUS ONE
+-----------------------------------------
+The first version of this module read
+``catalog_offers.suppression_reason = 'source_currency_or_channel_defect'``.
+Review killed it, and the reasoning is worth keeping because it is the
+difference between a fix and a no-op wearing a fix's clothes:
 
-This lane reads none of those gates. ``find_products`` routes to the
-``connected_catalog`` / external-seed lane, gated only by
-``_is_product_sellable`` (status + orderable). Suppression, currency defect,
-serving eligibility and trust are all invisible to it. It is the fifth
-storefront on the same catalog, and it started ungated by default -- the
-ADR-012 thesis exactly: a derived-state gate enforced per-consumer rather than
-at a chokepoint, where each new consumer is born ungated and nothing detects it.
+  * **No writer.** ``git log -S`` over all refs finds only readers and docs for
+    that reason value. The rows carrying it were set by out-of-band data ops.
+    A gate keyed on a value nothing maintains decays silently.
+  * **The key is NULL on exactly the rows that matter.**
+    ``services/external_offer_dual_write`` -- the external-seed mirror writer --
+    does not populate ``source_domain`` at all; the domain rides in
+    ``offer_payload`` JSON. ~4,705 domain-less mirror offers are a known open
+    item, and Mintree's are among them. A resolver filtering
+    ``source_domain <> ''`` would have returned the empty set, and
+    "no quarantines" is runtime-indistinguishable from "resolver found nothing".
 
-WHY A DOMAIN SET AND NOT A PER-ROW CURRENCY CHECK. An INR price labelled
-``"USD"`` is indistinguishable from a genuine USD price by inspection -- the
-label IS the defect, so no amount of looking at the row detects it. The only
-thing that knows is the suppression state recorded against the offer, keyed by
-storefront. A store has one base currency, so the storefront is the right grain.
+``catalog_source_quarantine`` is the mechanism that actually blocks these
+stores on the doors that are clean. It has a real writer
+(``scripts/audit_offer_currency.py`` -> ``create_quarantine``), a revoke path,
+expiry, and it is what ``catalog_row_trust_upserter`` already reads to set
+``serving_decision``. Reading it makes this lane agree with the others by
+construction rather than by a restated rule.
 
-WHY THE SEED ROWS ARE STILL WRONG. ``scripts/backfill_offer_market_currency.py``
-corrected ``catalog_offers.currency`` to INR/ZAR for these stores. It is scoped,
-deliberately, to offers -- ``external_product_seeds.price_currency`` was never in
-its scope, and ``_external_seed_to_shop_product`` reads the SEED. Worse, that
-projection ends ``or "USD"``: a seed with no currency at all is stamped USD by a
-fallback rather than being treated as unknown. So correcting the offers did not
-and could not clean this lane.
+NOT A FOURTH COPY OF THE PREDICATE. Matching is delegated to
+``source_quarantine.quarantine_matches_source`` -- including its state and
+expiry handling, and its EXACT (not suffix) domain comparison. This module adds
+exactly one thing that module cannot do: pull a host out of a row that carries
+URLs rather than a bare domain. Deliberately no local match rule, no local
+denylist, no second normalisation of the match value.
 
-READS FROM THE SHARED SOURCE, does not restate the rule. The predicate lives in
-``catalog_offers`` and this module queries it. It is deliberately NOT a hand-kept
-denylist of domains: a fourth copy of a rule is how the first three drifted.
-Mirrors ``services/test_merchant_policy.py`` in shape -- resolve, cache, filter,
-fail soft -- because that module is the proven pattern for exactly this problem.
+FAILURE IS NOT EMPTINESS. A resolver error must not be cached as "nothing is
+quarantined" -- that would disable the gate for a full TTL after one transient
+blip, silently. See ``get_quarantined_sources``.
 """
 
 from __future__ import annotations
 
+import logging
 import time
-from typing import Any, Iterable, List, Optional, Set
+from typing import Any, Iterable, List, Optional, Sequence
 from urllib.parse import urlsplit
 
-# The suppression reason that means "this offer's currency/channel labelling is
-# not to be trusted". Set by the currency-defect workstream; read here.
-CURRENCY_DEFECT_SUPPRESSION_REASON = "source_currency_or_channel_defect"
+from services.source_quarantine import (
+    Quarantine,
+    load_active_quarantines,
+    quarantine_matches_source,
+)
 
-# Same window as test_merchant_policy: at most one catalog_offers scan per TTL,
-# not one per request.
+logger = logging.getLogger(__name__)
+
+# Same window as services/test_merchant_policy: at most one quarantine scan per
+# TTL, not one per request.
 _CACHE_TTL_SECONDS = 300.0
 
-_cache_value: Optional[Set[str]] = None
+_cache_value: Optional[List[Quarantine]] = None
 _cache_at: float = 0.0
 
+# Fields that may carry the storefront. Several, because the lane's projections
+# populate different ones: `_external_seed_to_shop_product` emits
+# `external_destination_url`, the pivot lane emits `canonical_url`, and
+# `_standard_to_shop_product` emits `online_store_url` only when the platform
+# sync captured one. A gate that reads a single field is a gate that silently
+# passes every row that happens not to carry it.
+_URL_FIELDS: Sequence[str] = (
+    "external_destination_url",
+    "canonical_url",
+    "destination_url",
+    "online_store_url",
+    "product_url",
+    "url",
+    "source_domain",
+    "domain",
+)
 
-def normalize_domain(value: Any) -> str:
-    """Bare lowercase host: no scheme, no ``www.``, no port, no path.
 
-    Accepts either a bare host or a full URL, because the two sides of this
-    comparison come from different places -- ``catalog_offers.source_domain``
-    holds a host, while a seed row holds a destination URL.
+def url_host(value: Any) -> str:
+    """Bare lowercase host from a URL or a bare domain.
+
+    The ONLY normalisation this module owns, and only because
+    ``quarantine_matches_source`` compares bare domains while these rows carry
+    URLs. ``www.`` is stripped so a row whose URL includes it still matches a
+    quarantine recorded without it.
     """
     raw = str(value or "").strip().lower()
     if not raw:
@@ -86,75 +113,42 @@ def normalize_domain(value: Any) -> str:
     return raw
 
 
-def domain_matches(host: str, defect_domains: Set[str]) -> bool:
-    """True when ``host`` IS a defect domain or a subdomain of one.
-
-    Label-boundary matching only (``shop.mintree.us`` matches ``mintree.us``;
-    ``notmintree.us`` does not). A plain substring test would over-match, and
-    over-matching here silently deletes a real merchant's products from search.
-    """
-    if not host or not defect_domains:
-        return False
-    if host in defect_domains:
-        return True
-    return any(host.endswith("." + d) for d in defect_domains)
-
-
-async def _resolve_currency_defect_domains(database) -> Set[str]:
-    """Storefronts with at least one currency-defect-suppressed offer.
-
-    Fail-soft: on any DB error return the empty set. A resolver hiccup must
-    never crash search -- but see the caller, which logs when that happens,
-    because failing open here means publishing prices again.
-    """
-    try:
-        rows = await database.fetch_all(
-            """
-            SELECT DISTINCT lower(trim(source_domain)) AS domain
-            FROM catalog_offers
-            WHERE suppressed_at IS NOT NULL
-              AND suppression_reason = :reason
-              AND coalesce(trim(source_domain), '') <> ''
-            """,
-            {"reason": CURRENCY_DEFECT_SUPPRESSION_REASON},
-        )
-    except Exception:
-        return set()
-    out: Set[str] = set()
-    for r in rows or []:
-        try:
-            value = r["domain"]
-        except Exception:
-            value = (dict(r).get("domain") if hasattr(r, "keys") else None)
-        host = normalize_domain(value)
-        if host:
-            out.add(host)
-    return out
-
-
-async def get_currency_defect_domains(
+async def get_quarantined_sources(
     database=None,
     *,
     now: Optional[float] = None,
-) -> Set[str]:
-    """The effective defect-domain set, cached for ``_CACHE_TTL_SECONDS``.
+) -> List[Quarantine]:
+    """Active quarantines, cached for ``_CACHE_TTL_SECONDS``.
 
-    Returns the empty set when ``database`` is None (pure/sync callers).
+    A FAILED resolve is never cached. Caching an error as the empty set would
+    turn one transient DB blip into 300 seconds of ungated serving, with no
+    exception for the caller to notice -- the same shape as the bug this gate
+    exists to close. On failure we keep the previous value if we have one and
+    retry on the next call.
     """
     global _cache_value, _cache_at
     if database is None:
-        return set()
+        return []
     ts = time.monotonic() if now is None else now
     if _cache_value is not None and (ts - _cache_at) < _CACHE_TTL_SECONDS:
-        return set(_cache_value)
-    resolved = await _resolve_currency_defect_domains(database)
-    _cache_value = resolved
+        return list(_cache_value)
+    try:
+        resolved = await load_active_quarantines(db=database)
+    except Exception:
+        logger.warning(
+            "offer_currency_policy: quarantine resolve FAILED — serving with "
+            "%s cached entries; the gate is degraded, not off",
+            len(_cache_value or []),
+            exc_info=True,
+        )
+        return list(_cache_value or [])
+    _cache_value = list(resolved)
     _cache_at = ts
-    return set(resolved)
+    return list(resolved)
 
 
 def reset_cache() -> None:
-    """Test hook — drop the memoized defect-domain set."""
+    """Test hook — drop the memoized quarantine set."""
     global _cache_value, _cache_at
     _cache_value = None
     _cache_at = 0.0
@@ -166,51 +160,55 @@ def _field(product: Any, name: str) -> Any:
     return getattr(product, name, None)
 
 
-def product_domains(product: Any) -> Set[str]:
-    """Every storefront host this row could be attributed to.
-
-    Checks several fields rather than one because the lane's own projection
-    populates different ones on different paths, and a gate that reads a field
-    the row happens not to carry is a gate that silently passes everything.
-    ``external_destination_url`` is the load-bearing one for external seeds --
-    ``merchant_id`` is explicitly ``None`` on those rows, which is why the
-    sibling rig filter cannot see them at all.
-    """
-    hosts: Set[str] = set()
-    for name in (
-        "external_destination_url",
-        "canonical_url",
-        "destination_url",
-        "source_domain",
-        "domain",
-        "online_store_url",
-        "product_url",
-        "url",
-    ):
-        host = normalize_domain(_field(product, name))
-        if host:
-            hosts.add(host)
+def product_hosts(product: Any) -> List[str]:
+    """Every storefront host this row could be attributed to."""
+    hosts: List[str] = []
+    for name in _URL_FIELDS:
+        host = url_host(_field(product, name))
+        if host and host not in hosts:
+            hosts.append(host)
     return hosts
 
 
-def is_currency_defect_row(product: Any, defect_domains: Set[str]) -> bool:
-    if not defect_domains:
+def is_quarantined_row(product: Any, quarantines: Sequence[Quarantine]) -> bool:
+    """True when any of the row's identities matches an active quarantine.
+
+    Passes merchant_id/platform through as well, so a ``merchant_platform``
+    quarantine is honoured on this lane too rather than only ``domain`` ones --
+    free, and it means adding a quarantine of any supported type takes effect
+    here without touching this file.
+    """
+    if not quarantines:
         return False
-    return any(domain_matches(h, defect_domains) for h in product_domains(product))
+    merchant_id = _field(product, "merchant_id")
+    platform = _field(product, "platform")
+    hosts = product_hosts(product) or [None]
+    for q in quarantines:
+        for host in hosts:
+            if quarantine_matches_source(
+                q,
+                domain=host,
+                merchant_id=merchant_id,
+                platform=platform,
+                source_system=_field(product, "source_system"),
+                source_ref=_field(product, "source_ref"),
+            ):
+                return True
+    return False
 
 
-def filter_out_currency_defect_rows(
+def filter_out_quarantined_rows(
     products: Optional[Iterable[Any]],
-    defect_domains: Set[str],
+    quarantines: Sequence[Quarantine],
 ) -> List[Any]:
-    """Drop rows from storefronts whose currency labelling is suppressed.
+    """Drop rows from quarantined sources.
 
-    A row with no resolvable domain is KEPT. This gate exists to stop a known
-    mislabelled storefront from publishing, not to require every row to prove
-    its provenance -- failing closed on an unknown domain would empty the lane.
+    A row with no resolvable identity is KEPT. This gate stops a known-bad
+    storefront from publishing; requiring every row to prove its provenance
+    would empty the lane instead.
     """
     if not products:
         return list(products or [])
-    if not defect_domains:
+    if not quarantines:
         return list(products)
-    return [p for p in products if not is_currency_defect_row(p, defect_domains)]
+    return [p for p in products if not is_quarantined_row(p, quarantines)]

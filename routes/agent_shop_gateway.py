@@ -7381,6 +7381,39 @@ async def _handle_find_products(
     except Exception:
         pass  # never let the rig filter break search
 
+    # Quarantined-source exclusion — the merchant-scoped twin of the gate in
+    # _handle_find_products_multi. Both are needed: `POST /agent/shop/v1/invoke`
+    # has NO auth dependency, and _normalize_find_products_payload routes a
+    # payload carrying a top-level merchant_id to THIS handler, so an unsigned
+    # `GET /acp/feed` body of {"query":{"merchant_id":"...","query":"serum"}}
+    # reaches here. Gating only the multi lane left that door open — review
+    # executed it and got the Mintree row back with the gate never invoked.
+    try:
+        # Imported here rather than reusing the sibling block's `_db`: that name
+        # is only bound if the rig block's own import succeeded, so borrowing it
+        # would make this gate's availability depend on an unrelated try.
+        from db.database import database as _quarantine_db
+        from services.offer_currency_policy import (
+            filter_out_quarantined_rows,
+            get_quarantined_sources,
+        )
+
+        _quarantines = await get_quarantined_sources(_quarantine_db)
+        _before_q = len(visible)
+        visible = filter_out_quarantined_rows(visible, _quarantines)
+        if len(visible) != _before_q:
+            logger.info(
+                "find_products.excluded_quarantined",
+                extra={"dropped": _before_q - len(visible), "surface": "find_products"},
+            )
+    except Exception:
+        # Fail open so a gate hiccup cannot empty a merchant's own catalog —
+        # but never silently: failing open republishes mislabelled prices.
+        logger.warning(
+            "find_products.quarantine_filter_failed — slate served WITHOUT the gate",
+            exc_info=True,
+        )
+
     # In-memory filtering based on query/category/price
     filtered: List[StandardProduct] = visible
 
@@ -7619,14 +7652,14 @@ async def _handle_find_products_multi(
         if isinstance(result, dict) and isinstance(result.get("products"), list):
             from db.database import database as _db
             from services.offer_currency_policy import (
-                filter_out_currency_defect_rows,
-                get_currency_defect_domains,
+                filter_out_quarantined_rows,
+                get_quarantined_sources,
             )
 
-            defect_domains = await get_currency_defect_domains(_db)
+            quarantines = await get_quarantined_sources(_db)
             before = len(result["products"])
-            result["products"] = filter_out_currency_defect_rows(
-                result["products"], defect_domains
+            result["products"] = filter_out_quarantined_rows(
+                result["products"], quarantines
             )
             dropped = before - len(result["products"])
             if dropped:
@@ -7636,7 +7669,7 @@ async def _handle_find_products_multi(
                     result["total"] = max(0, result["total"] - dropped)
                 result["page_size"] = len(result["products"])
                 logger.info(
-                    "find_products_multi.excluded_currency_defect",
+                    "find_products_multi.excluded_quarantined",
                     extra={"dropped": dropped, "surface": "find_products_multi"},
                 )
     except Exception:
@@ -7645,8 +7678,8 @@ async def _handle_find_products_multi(
         # state this gate exists to end; a bare `pass` would recreate the bug and
         # leave nothing to notice it by.
         logger.warning(
-            "find_products_multi.currency_defect_filter_failed — "
-            "slate served WITHOUT the currency gate",
+            "find_products_multi.quarantine_filter_failed — "
+            "slate served WITHOUT the quarantine gate",
             exc_info=True,
         )
     try:
