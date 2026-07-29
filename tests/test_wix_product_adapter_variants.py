@@ -163,6 +163,24 @@ def _dummy_httpx_client_factory(captured: dict, response_payload: dict):
 
 
 def _paginated_httpx_client_factory(captured: dict, responses: list):
+    """Fake client for the Wix PRODUCT paging tests.
+
+    Since 2026-07-29 a sync also issues one `collections/query` call to resolve
+    categories (see tests/test_wix_category_mapping.py). This fake is therefore
+    URL-AWARE, for two independent reasons:
+
+    1. An unrouted collections call consumes a queued product page, so the
+       paging under test never happens.
+    2. `captured["requests"]` must keep meaning *product* requests only. Every
+       assertion in this file reads product paging offsets out of that list,
+       and the collections call also carries `paging.offset: 0` -- letting it
+       in would turn those comparisons into passing-but-meaningless ones.
+
+    Collections are recorded under `captured["collection_requests"]` rather
+    than dropped, so the extra call stays visible instead of being swallowed by
+    the harness.
+    """
+
     class DummyAsyncClient:
         def __init__(self, *args, **kwargs):
             self._index = 0
@@ -174,6 +192,11 @@ def _paginated_httpx_client_factory(captured: dict, responses: list):
             return False
 
         async def post(self, url, json=None, headers=None):
+            if str(url).endswith("/collections/query"):
+                captured.setdefault("collection_requests", []).append(
+                    {"url": url, "json": json, "headers": headers}
+                )
+                return _dummy_httpx_response({"collections": []})
             captured.setdefault("requests", []).append(
                 {"url": url, "json": json, "headers": headers}
             )
