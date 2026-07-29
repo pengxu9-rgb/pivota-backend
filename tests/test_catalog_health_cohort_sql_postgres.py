@@ -8,6 +8,11 @@ cannot see a wrong join key, a fanout, or a precedence slip, which is exactly
 the class of defect the 2026-07-26 feed outage taught us SQLite/mocks wave
 through. So the statement itself runs here, on the production dialect.
 
+Seeded row-level assertions in a PG gate (the workflow header prefers those in
+the SQLite matrices): justified here because SQLite structurally cannot
+execute this statement at all — `= ANY(text[])`, `&&` and `ARRAY[]::text[]`
+have no SQLite home.
+
 🚨 THESE GATE FILES SHARE ONE DATABASE. `metadata.create_all` + DELETE only —
 never hand-roll DDL for a table `db.catalog` owns.
 """
@@ -52,6 +57,10 @@ def pg_engine():
         for stmt in filter(None, (s.strip() for s in _LIGHTWEIGHT_DDL.split(";"))):
             conn.execute(text(stmt))
     yield engine
+    # Leave the shared DB as found — a later gate module asserting an empty
+    # table must not depend on alphabetical run order for that to hold.
+    with engine.begin() as conn:
+        _reset(conn)
     engine.dispose()
 
 
@@ -138,10 +147,14 @@ def test_retirement_precedence_beats_the_foreign_market_arm(pg_engine):
 
 
 def test_public_row_is_unaffected_by_the_ips_join(pg_engine):
-    """One row per product, still: the added join must not fan out a public
-    row into extra cohort counts."""
+    """One row per product, still — and the arm ORDER above `public` is live:
+    with INDEX_ELIGIBLE_READ on, `index_eligible` derives from raw predicates
+    rather than blocker_code, so a trust-public row CAN carry
+    blocker_code='no_us_offer'. Seeding exactly that combination pins that the
+    foreign_market arm sits BELOW `public` — moving it up would misfile a
+    serving row."""
     with pg_engine.begin() as conn:
         _reset(conn)
         _seed(conn, pk="pk_pub", ck="ck_pub", decision="public", reasons=(),
-              blocker="none")
+              blocker="no_us_offer")
         assert _cohorts(conn) == {"public": 1}

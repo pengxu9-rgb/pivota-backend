@@ -26,7 +26,9 @@ router = APIRouter(tags=["catalog-health"])
 # offer exists (blocker_code = 'no_us_offer') are honestly-labelled foreign
 # sellers the founder ruled off the US surface (see the 2026-07-22/23 currency
 # audits) — a standing DECISION, not a recoverable quality gap. Leaving them in
-# `quality_blocked` overstated the workable backlog by ~800 keys and made the
+# `quality_blocked` overstated the workable backlog by ~800 rows (row grain —
+# duplicate content_keys make this read higher than the 823-KEY histogram
+# number; see the grain note further down) and made the
 # 2026-07-28 audit re-derive the split from psql. The IPS join is on
 # content_key (the blocker's grain); a product row with no IPS row keeps its
 # trust-derived bucket.
@@ -177,6 +179,9 @@ async def catalog_health() -> Dict[str, Any]:
         return {
             "catalog_total": catalog_total,
             "serving_corpus": corpus,
+            # Version marker for the denominator: lets a later reader tell a
+            # DEFINITION change from a data change when the pct steps.
+            "corpus_excludes": ["retired_by_design", "no_trust_row", "foreign_market"],
             "public": public,
             "serving_pct_of_corpus": round(100.0 * public / corpus, 1) if corpus else None,
             "cohorts": totals,
