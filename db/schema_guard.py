@@ -414,23 +414,44 @@ async def ensure_required_schema_light() -> None:
                       ADD COLUMN IF NOT EXISTS apm_scope_jsonb JSONB NULL,
                       ADD COLUMN IF NOT EXISTS apm_configured_at TIMESTAMPTZ NULL,
                       ADD COLUMN IF NOT EXISTS apm_last_run_at TIMESTAMPTZ NULL,
-                      -- signup_source (migration 187), here for exactly the
-                      -- reason the paragraph above describes. It DOES reach prod
-                      -- today, but only via a LAZY backstop:
-                      -- db/merchant_onboarding.py:96 issues its own
-                      -- ADD COLUMN IF NOT EXISTS inside
-                      -- ensure_operating_mode_column(), called at the top of
-                      -- create_merchant_onboarding() — i.e. on the FIRST MERCHANT
-                      -- SIGNUP of a process, behind a module-level done-flag.
+                      -- signup_source (migration 187), here for the same
+                      -- reason the paragraph above gives.
                       --
-                      -- So the column is covered by CALL ORDER, not by design.
-                      -- merchant_onboarding.select() materializes every column
-                      -- including this one, and get_merchant_onboarding() sits on
-                      -- the ADR-018 connection-layer path — a read that can
-                      -- precede the first signup in a fresh process or a fresh
-                      -- database. Healing it at startup makes the guarantee
-                      -- independent of call order, which is what the apm_enabled
-                      -- outage taught.
+                      -- WARNING - NO SEMICOLONS ANYWHERE IN THIS COMMENT. The
+                      -- coverage gate matches an ALTER body non-greedily up to
+                      -- the FIRST semicolon, so one in prose truncates the
+                      -- statement and every column after it stops counting as
+                      -- covered. Two slipped into the first draft of this note
+                      -- and the gate went red on a change whose DDL was correct.
+                      -- A third slipped into the warning about the first two.
+                      -- The gate caught all three, which is the argument for it.
+                      --
+                      -- It DOES reach prod today, but only through a LAZY
+                      -- backstop: db/merchant_onboarding.py has its own
+                      -- idempotent add inside ensure_operating_mode_column(),
+                      -- called at the top of create_merchant_onboarding() - i.e.
+                      -- on the FIRST MERCHANT SIGNUP of a process, behind a
+                      -- module-level done-flag.
+                      --
+                      -- That covers the column by CALL ORDER. Two read paths
+                      -- escape it:
+                      --   * merchant_onboarding.select() materializes every
+                      --     column, and get_merchant_onboarding() sits on the
+                      --     ADR-018 connection-layer path, and
+                      --   * services/funnel_metrics_service.py issues a RAW
+                      --     "SELECT merchant_id, signup_source, ..." from the
+                      --     admin funnel-metrics router. That one never touches
+                      --     create_merchant_onboarding() at all, so NO call
+                      --     order saves it - a fresh process against a DB
+                      --     without the column returns a hard
+                      --     "column does not exist".
+                      --
+                      -- Honest about the strength of this fix: the whole guard
+                      -- is best-effort (one try/except around the body, a 12s
+                      -- startup timeout, failures downgraded to a warning), so
+                      -- it CANNOT fail a deploy - which is the right trade. It
+                      -- makes the column independent of call order. It does not
+                      -- make it guaranteed.
                       ADD COLUMN IF NOT EXISTS signup_source VARCHAR(64);
                     """
                 )
