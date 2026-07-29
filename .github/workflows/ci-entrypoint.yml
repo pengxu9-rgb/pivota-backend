@@ -190,12 +190,12 @@ jobs:
               ignore = (pr_trigger or {}).get('paths-ignore')
 
               # BRANCH FILTERS, which the first cut ignored entirely.
-              # `shopping-search-release-gate.yml` declares `branches: [main]`, so
+              # A gate declaring `branches: [main]` is not triggered when
               # on a STACKED PR (base is a feature branch) GitHub does not trigger
-              # it — while a paths-only check still expected its three jobs, waited
-              # the full deadline, and hard-failed. Once this is the required
-              # check that PR is permanently unmergeable. This repo has live
-              # stacked PRs, so it was not hypothetical: it is the same
+              # it — while a paths-only check still expected its jobs, waited the
+              # full deadline, and hard-failed. Where this is the required check
+              # that PR is permanently unmergeable. Observed on a real repo with
+              # live stacked PRs, not hypothesised: the same
               # structurally-cannot-report class this file exists to prevent.
               br_only = (pr_trigger or {}).get('branches')
               br_skip = (pr_trigger or {}).get('branches-ignore')
@@ -225,8 +225,10 @@ jobs:
                   if matrix:
                       # GitHub names a matrix check run `label (v1, v2)` in the
                       # matrix's key order. A SINGLE key whose value is a plain
-                      # list is fully determined here, so expand it — that is the
-                      # 8 jest shards, this repo's primary gate.
+                      # list is fully determined here, so expand it. Where a repo
+                      # runs a sharded suite this is its primary gate, and
+                      # excluding it would leave that gate unenforced while
+                      # reporting green.
                       #
                       # Anything else (multi-key, `include`/`exclude`, or a value
                       # built by `fromJSON`) is NOT determined statically, so it
@@ -249,7 +251,7 @@ jobs:
               elif ignore is not None:
                   # F3: `paths-ignore` runs UNLESS every changed file matches.
                   # Read as unfiltered it would expect the gate on a PR that
-                  # touches only ignored paths, wait 20 minutes, and hard-block.
+                  # touches only ignored paths, wait out the deadline, and hard-block.
                   should = any(not any(matches(f, p) for p in ignore) for f in files)
               else:
                   should = True          # genuinely unfiltered: always runs
@@ -289,9 +291,33 @@ jobs:
           # "does not exist in this repo" while sitting in the repo that has it.
           # A comment describing gates it cannot see is worse than no comment,
           # because this file's whole value is that reading it tells you what is
-          # enforced. Re-derive the ceiling with:
-          #   grep -h 'timeout-minutes' .github/workflows/*.yml | sort -u
-          # and raise the two numbers if any gate exceeds them.
+          # enforced.
+          #
+          # 🚨 THE DEADLINE DOES NOT COVER EVERY GATE, and grepping for
+          # `timeout-minutes` CANNOT TELL YOU THAT — a job with no such key gets
+          # GitHub's default of 360 minutes, so it is invisible to the grep and
+          # far above any deadline worth setting. The first version of this
+          # comment offered exactly that grep as the re-derivation recipe, which
+          # was blind to the only case that bites, and in writing it I deleted a
+          # line that had named the case correctly.
+          #
+          # Re-derive by listing jobs that LACK the key, not by sorting the ones
+          # that have it:
+          #   python - <<'EOF'
+          #   import glob, yaml
+          #   for f in glob.glob('.github/workflows/*.yml'):
+          #       d = yaml.safe_load(open(f)) or {}
+          #       t = d.get(True) or d.get('on') or {}
+          #       if not isinstance(t, dict) or 'pull_request' not in t: continue
+          #       for k, s in (d.get('jobs') or {}).items():
+          #           if (s or {}).get('timeout-minutes') is None:
+          #               print(f, k, '-> 360 (default)')
+          #   EOF
+          #
+          # A gate above the deadline means this job can report
+          # `timed out waiting` and HARD-BLOCK a PR whose gate then passes. The
+          # durable fix is to give those gates an explicit `timeout-minutes`,
+          # not to keep raising this number toward 360.
           DEADLINE = time.time() + 35 * 60
           while True:
               runs = [r for doc in gh_json(f'repos/{REPO}/commits/{SHA}/check-runs?per_page=100')
@@ -312,11 +338,10 @@ jobs:
 
           # OUTCOME-BASED, not presence-of-`if:`-based. My first cut excluded any
           # job carrying a job-level `if:` on the theory that it is conditional by
-          # design — which gutted the check: `quick-reliability` and
-          # `Checkout Payment Safety` both carry
+          # design — which gutted the check: real gates commonly carry
           # `if: github.event_name != 'workflow_dispatch' || ...`, which is TRUE
           # on a pull request, so they genuinely run and genuinely should be
-          # enforced. Only `Shopify discount validation` is dispatch-only.
+          # enforced, while a dispatch-only job carries the inverse condition.
           # Excluding by the presence of an `if:` was the wrong axis.
           #
           # So all matched jobs stay in the expected set and the CONCLUSION
