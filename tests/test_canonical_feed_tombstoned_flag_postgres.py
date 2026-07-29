@@ -14,11 +14,16 @@ group is why this matters rather than being tidy: those rows were retired for
 carrying the WRONG BRAND, so serving them publishes a PDP with incorrect brand
 attribution.
 
-This is a Postgres gate because the feed's SELECT is Postgres-only (correlated
-EXISTS renderability + the LATERAL joins), and a flag that is silently always
-false would be indistinguishable from "no tombstones exist" — which is exactly
-the reading that let 187 of them stay advertised. So the tests below assert the
-flag answers BOTH ways on real rows.
+A flag that is silently always false is indistinguishable from "no tombstones
+exist" — exactly the reading that let 187 of them stay advertised — so the tests
+below assert it answers BOTH ways on real rows.
+
+🚨 THIS GATE SHARES ONE DATABASE WITH THE OTHER `test_*_postgres.py` FILES.
+An earlier cut of this file did `CREATE TABLE IF NOT EXISTS catalog_products
+(product_key, suppression_reason, suppressed_at)` and thereby created a
+three-column stub under a real table's name, which broke every sibling gate that
+inserts `merchant_id`. Use `metadata.create_all` and DELETE rows — never
+hand-roll DDL for a table `db.catalog` already owns.
 """
 
 from __future__ import annotations
@@ -26,7 +31,6 @@ from __future__ import annotations
 import os
 
 import pytest
-from sqlalchemy import create_engine, text
 
 DATABASE_URL = (os.getenv("DATABASE_URL") or "").strip()
 _IS_PG = DATABASE_URL.startswith("postgresql://") or DATABASE_URL.startswith("postgres://")
@@ -37,68 +41,72 @@ pytestmark = pytest.mark.skipif(
 )
 
 
-def _engine():
-    url = DATABASE_URL.replace("postgres://", "postgresql://", 1)
-    return create_engine(url.replace("postgresql://", "postgresql+psycopg2://", 1))
+@pytest.fixture(scope="module")
+def pg_engine():
+    import db.catalog  # noqa: F401  (registers catalog_products on the shared MetaData)
+    from sqlalchemy import create_engine
+
+    from db.database import metadata
+
+    engine = create_engine(DATABASE_URL)
+    metadata.create_all(engine, checkfirst=True)
+    yield engine
+    engine.dispose()
 
 
-def test_tombstoned_column_compiles_and_selects_on_postgres():
+def _insert(conn, *, pk, reason, suppressed_at_sql="NULL"):
+    from sqlalchemy import text
+
+    conn.execute(
+        text(
+            "INSERT INTO catalog_products "
+            "(product_key, merchant_id, platform, source_product_id, title, "
+            " content_key, catalog_track, suppression_reason, suppressed_at) "
+            f"VALUES (:pk, 'external_seed', 'external_seed', :pk, :pk, :ck, "
+            f"        'external_referral', :reason, {suppressed_at_sql})"
+        ),
+        {"pk": pk, "ck": f"ck_{pk}", "reason": reason},
+    )
+
+
+def test_tombstoned_column_compiles_and_selects_on_postgres(pg_engine):
     """PREPARE-time gate: the expression must compile into a real SELECT."""
-    from routes.pivota_canonical_routes import _tombstoned_column
-    from sqlalchemy import select
+    from sqlalchemy import select, text
 
     from db.catalog import catalog_products
+    from routes.pivota_canonical_routes import _tombstoned_column
 
-    stmt = select(_tombstoned_column()).select_from(catalog_products).limit(1)
-    eng = _engine()
-    with eng.begin() as conn:
-        conn.execute(
-            text(
-                "CREATE TABLE IF NOT EXISTS catalog_products ("
-                " product_key text, suppression_reason text, suppressed_at timestamp)"
-            )
-        )
+    with pg_engine.begin() as conn:
         conn.execute(text("DELETE FROM catalog_products"))
-        conn.execute(stmt).fetchall()
-    eng.dispose()
+        conn.execute(
+            select(_tombstoned_column()).select_from(catalog_products).limit(1)
+        ).fetchall()
 
 
-def test_flag_answers_both_ways():
+def test_flag_answers_both_ways(pg_engine):
     """A flag that is always false reads exactly like 'no tombstones exist'.
 
     That misreading is what kept 187 retired rows advertised, so both directions
     are asserted on real rows rather than only the positive case.
     """
-    from routes.pivota_canonical_routes import _tombstoned_column
-    from sqlalchemy import select
+    from sqlalchemy import select, text
 
     from db.catalog import catalog_products
+    from routes.pivota_canonical_routes import _tombstoned_column
 
-    eng = _engine()
-    with eng.begin() as conn:
-        conn.execute(
-            text(
-                "CREATE TABLE IF NOT EXISTS catalog_products ("
-                " product_key text, suppression_reason text, suppressed_at timestamp)"
-            )
-        )
+    with pg_engine.begin() as conn:
         conn.execute(text("DELETE FROM catalog_products"))
-        conn.execute(
-            text(
-                "INSERT INTO catalog_products (product_key, suppression_reason, suppressed_at)"
-                " VALUES ('clean', NULL, NULL),"
-                # The load-bearing shape: reason set, suppressed_at NULL. This is
-                # the row that passes every suppressed_at IS NULL filter.
-                "        ('retired', 'wrong_brand_namesake_wave3_20260718', NULL),"
-                "        ('dedupe',  'cross_merchant_redundant_external_seed', NULL)"
-            )
-        )
+        _insert(conn, pk="clean", reason=None)
+        # The load-bearing shape: reason set, suppressed_at NULL — the state that
+        # passes every suppressed_at IS NULL filter.
+        _insert(conn, pk="retired", reason="wrong_brand_namesake_wave3_20260718")
+        _insert(conn, pk="dedupe", reason="cross_merchant_redundant_external_seed")
         rows = conn.execute(
             select(catalog_products.c.product_key, _tombstoned_column())
             .select_from(catalog_products)
             .order_by(catalog_products.c.product_key)
         ).fetchall()
-    eng.dispose()
+        conn.execute(text("DELETE FROM catalog_products"))
 
     got = {r[0]: r[1] for r in rows}
     assert got["clean"] is False, "a live row must not be flagged"
@@ -109,39 +117,28 @@ def test_flag_answers_both_ways():
     )
 
 
-def test_suppressed_at_is_not_what_this_measures():
+def test_suppressed_at_alone_is_not_what_this_measures(pg_engine):
     """Guards the misreading that `suppressed_at IS NULL` already covers this.
 
     It does not, and believing it did is the whole defect: the two columns encode
-    different decisions and only `suppression_reason` marks the retire-but-keep-
-    serving state.
+    different decisions, and only `suppression_reason` marks the
+    retired-but-still-serving state.
     """
-    from routes.pivota_canonical_routes import _tombstoned_column
-    from sqlalchemy import select
+    from sqlalchemy import select, text
 
     from db.catalog import catalog_products
+    from routes.pivota_canonical_routes import _tombstoned_column
 
-    eng = _engine()
-    with eng.begin() as conn:
-        conn.execute(
-            text(
-                "CREATE TABLE IF NOT EXISTS catalog_products ("
-                " product_key text, suppression_reason text, suppressed_at timestamp)"
-            )
-        )
+    with pg_engine.begin() as conn:
         conn.execute(text("DELETE FROM catalog_products"))
-        conn.execute(
-            text(
-                "INSERT INTO catalog_products (product_key, suppression_reason, suppressed_at)"
-                " VALUES ('withdrawn', NULL, NOW())"
-            )
-        )
+        _insert(conn, pk="withdrawn", reason=None, suppressed_at_sql="NOW()")
         row = conn.execute(
             select(_tombstoned_column()).select_from(catalog_products)
         ).one()
-    eng.dispose()
+        conn.execute(text("DELETE FROM catalog_products"))
+
     assert row[0] is False, (
-        "suppressed_at alone is a different state (fully withdrawn) and is "
-        "already handled by sitemap_candidate_filter; this flag is only about "
-        "the retire-but-still-serving rows it cannot see"
+        "suppressed_at alone is a DIFFERENT state (fully withdrawn) already "
+        "handled by sitemap_candidate_filter; this flag is only about the "
+        "retired-but-still-serving rows that filter cannot see"
     )
