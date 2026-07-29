@@ -95,7 +95,13 @@ def test_build_quarantine_anti_join_sql_contains_all_match_types():
     assert "q.expires_at IS NULL OR q.expires_at > CURRENT_TIMESTAMP" in sql
     assert "now()" not in sql
     assert "q.match_type = 'domain'" in sql
-    assert "lower(q.match_value) = lower(p.source_domain)" in sql
+    # Both sides go through the SAME normaliser (lowercase, `www.` strip,
+    # empty-as-NULL). Normalising only the row side under-blocked a
+    # `www.`-prefixed match_value and split this gate from the Python matcher in
+    # services/offer_currency_policy, each blocking a pair the other let through.
+    assert "q.match_value" in sql and "p.source_domain" in sql
+    assert sql.count("LIKE 'www.%'") == 2, "www stripping must be applied to BOTH sides"
+    assert sql.count("nullif(") == 2, "empty-as-NULL must be applied to BOTH sides"
     assert "q.match_type = 'merchant_platform'" in sql
     assert "q.match_type = 'source_system_ref'" in sql
 

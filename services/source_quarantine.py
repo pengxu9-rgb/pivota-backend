@@ -49,6 +49,37 @@ class Quarantine:
     metadata: Optional[dict[str, Any]]
 
 
+def _sql_bare_domain(expr: str) -> str:
+    """Lowercase, `www.`-stripped, empty-as-NULL — applied to BOTH sides.
+
+    Stripping only the ROW side is an under-block that also splits this gate
+    from the Python one in `services/offer_currency_policy`, which normalises
+    both. Measured divergence before this was symmetric:
+
+        seed www.mintree.us + quarantine mintree.us      -> SQL blocked, Python did not
+        seed www.mintree.us + quarantine www.mintree.us  -> Python blocked, SQL did not
+
+    `create_quarantine` only `.strip()`s, so an operator can enter either form
+    and the API accepts it verbatim. A quarantine that reports success and
+    silently blocks nothing is the failure mode this whole workstream exists to
+    end, so normalise here rather than trusting the writer.
+
+    NULL-safe by construction: `nullif(...,'')` makes a blank match_value or a
+    domain-less row compare NULL, so neither can match everything. The migration
+    declares `match_value TEXT NOT NULL` with no non-empty CHECK and these rows
+    come from direct SQL ops, so that guard is load-bearing.
+
+    PORTABLE: CASE/LIKE/substr/lower/nullif behave identically on Postgres and
+    SQLite. `regexp_replace` would be Postgres-only, and this fragment is now
+    embedded in a code path whose suite runs on SQLite.
+    """
+    lowered = f"lower(coalesce({expr}, ''))"
+    return (
+        f"nullif(CASE WHEN {lowered} LIKE 'www.%' "
+        f"THEN substr({lowered}, 5) ELSE {lowered} END, '')"
+    )
+
+
 def build_quarantine_anti_join_sql(
     row_domain_expr: str,
     row_merchant_expr: str,
@@ -89,7 +120,7 @@ AND NOT EXISTS (
   WHERE q.state = 'active'
     AND (q.expires_at IS NULL OR q.expires_at > CURRENT_TIMESTAMP)
     AND (
-      (q.match_type = 'domain' AND lower(q.match_value) = lower({row_domain_expr}))
+      (q.match_type = 'domain' AND {_sql_bare_domain("q.match_value")} = {_sql_bare_domain(row_domain_expr)})
       OR (q.match_type = 'merchant_platform' AND q.match_value = {row_merchant_expr} || ':' || {row_platform_expr})
       OR (q.match_type = 'source_system_ref' AND q.match_value = {row_source_system_expr} || ':' || {row_source_ref_expr})
     )
@@ -258,7 +289,19 @@ def _required_text(value: Optional[str], name: str) -> str:
 
 
 def _normalize_domain(value: Optional[str]) -> str:
-    return str(value or "").strip().lower()
+    """Bare host: lowercase, no leading `www.`.
+
+    Applied to BOTH the quarantine's match_value and the row's domain, and kept
+    byte-equivalent to `_sql_bare_domain` above so the Python matcher and the
+    SQL anti-join can never disagree about the same pair. They did before:
+    a `www.mintree.us` quarantine matched nothing on either side while a
+    `mintree.us` one matched only on the side that happened to strip.
+
+    `create_quarantine` accepts whatever the operator types, so normalising at
+    read time covers rows already in the table as well as new ones.
+    """
+    text = str(value or "").strip().lower()
+    return text[4:] if text.startswith("www.") else text
 
 
 def _join_match_value(left: Optional[str], right: Optional[str]) -> Optional[str]:

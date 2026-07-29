@@ -47,6 +47,14 @@ def test_anti_join_matches_on_merchant_platform_and_domain() -> None:
     # one used to quarantine the review account (<merchant_id>:<platform>).
     frag = _SOURCE_QUARANTINE_ANTI_JOIN
     assert "q.match_value = cp.merchant_id || ':' || cp.platform" in frag
-    assert "lower(cp.source_domain)" in frag
+    # The domain comparison now normalises BOTH sides through one helper
+    # (lowercase, `www.` strip, empty-as-NULL) rather than a bare
+    # `lower(q.match_value) = lower(cp.source_domain)`. Stripping only the row
+    # side under-blocked a `www.`-prefixed match_value — which
+    # `create_quarantine` accepts verbatim — so such a quarantine reported
+    # success and blocked nothing.
+    assert "cp.source_domain" in frag
+    assert frag.count("LIKE 'www.%'") == 2, "www strip must apply to BOTH sides"
+    assert frag.count("nullif(") == 2, "empty-as-NULL must apply to BOTH sides"
     assert "q.state = 'active'" in frag
     assert "expires_at" in frag  # respects expiry

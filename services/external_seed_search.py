@@ -282,15 +282,26 @@ def build_external_seed_prefer_terms_rank_sql(
 
 
 def _is_missing_external_seed_table(exc: Exception) -> bool:
+    """Missing-table classifier for this query's tables — now BOTH of them.
+
+    The quarantine anti-join makes `catalog_source_quarantine` a hard dependency
+    of every seed-search route. Matching only on `external_product_seeds` meant a
+    database without migration 134 raised `relation "catalog_source_quarantine"
+    does not exist`, which this classifier did not recognise and the timeout
+    classifier did not either — so the exception escaped and every seed-search
+    route 500'd instead of degrading to empty.
+
+    Prod is unaffected (134 is applied, 15 quarantines live), but prod runs with
+    SKIP_HEAVY_STARTUP_INIT=true and manual psql migrations, so a fresh staging
+    DB is exactly the case that would have hit this.
+    """
     msg = str(exc or "")
-    return (
-        "external_product_seeds" in msg
-        and (
-            "does not exist" in msg
-            or "UndefinedTable" in msg
-            or "relation" in msg
-            or "no such table" in msg.lower()
-        )
+    names = ("external_product_seeds", "catalog_source_quarantine")
+    return any(name in msg for name in names) and (
+        "does not exist" in msg
+        or "UndefinedTable" in msg
+        or "relation" in msg
+        or "no such table" in msg.lower()
     )
 
 
@@ -305,34 +316,19 @@ def _is_external_seed_query_timeout(exc: Exception) -> bool:
     )
 
 
-# The seed row's storefront, normalised to the convention the quarantine WRITER
-# uses (`services/storefront_currency.normalize_domain`, via
-# `scripts/audit_offer_currency.py`): lowercase, no leading `www.`.
+# The seed row's storefront column, passed RAW.
 #
-# DELIBERATELY PORTABLE SQL — `CASE`/`LIKE`/`substr`/`lower`/`nullif` all behave
-# identically on Postgres and SQLite. The obvious spelling is
-# `regexp_replace(lower(domain), '^www\.', '')`, which is Postgres-only, and this
-# repo has already taken a 16-minute prod feed outage from PG-only SQL that a
-# green SQLite suite could not see (#1588). Portable means the suite that runs is
-# the suite that gates.
+# Normalisation (lowercase, `www.` strip, empty-as-NULL) lives in
+# `source_quarantine._sql_bare_domain` and is applied to BOTH sides of the
+# comparison there. An earlier version normalised only here — which under-blocked
+# a `www.`-prefixed quarantine value and split this gate from the Python matcher,
+# each blocking a pair the other let through. One normaliser, both sides, one
+# place: a second copy is how the first three drifted.
 #
-# `nullif(..., '')` is load-bearing twice over: a seed with no domain becomes
-# NULL rather than '', so it matches nothing — and, critically, a quarantine row
-# with a blank `match_value` (the migration declares `match_value TEXT NOT NULL`
-# with no non-empty CHECK, and these rows are inserted by direct SQL ops) cannot
-# match every domain-less seed in the corpus. Same trap the Python gate guards.
-#
-# Measured on prod 2026-07-29: 263 of 11,381 active seeds carry a `www.` prefix,
-# so the strip is load-bearing, not cosmetic. A `destination_url` fallback for
-# the 1,779 domain-less seeds was measured and rescues exactly 0 additional rows,
-# so it is deliberately NOT added — an unused branch is a untested branch.
-_SEED_QUARANTINE_DOMAIN_EXPR = (
-    "nullif("
-    "CASE WHEN lower(coalesce(domain, '')) LIKE 'www.%' "
-    "THEN substr(lower(coalesce(domain, '')), 5) "
-    "ELSE lower(coalesce(domain, '')) END"
-    ", '')"
-)
+# A `destination_url` fallback for the 1,779 domain-less seeds was measured on
+# prod and rescues exactly 0 additional rows, so it is deliberately NOT added —
+# an unused branch is an untested branch.
+_SEED_QUARANTINE_DOMAIN_EXPR = "domain"
 
 
 def build_seed_quarantine_anti_join() -> str:
