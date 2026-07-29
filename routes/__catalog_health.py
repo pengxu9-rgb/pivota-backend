@@ -51,6 +51,28 @@ _APV_DRIFT_TTL_SECONDS = 300.0
 _apv_drift_cache: Dict[str, Any] = {"at": 0.0, "value": None}
 
 
+_PDP_WILL_RENDER_DRIFT_TTL_SECONDS = 300.0
+_will_render_drift_cache: Dict[str, Any] = {"at": 0.0, "value": None}
+
+
+async def _cached_pdp_will_render_drift(database: Any) -> Dict[str, Any]:
+    import time
+
+    now = time.monotonic()
+    cached = _will_render_drift_cache["value"]
+    if cached is not None and (now - _will_render_drift_cache["at"]) < _PDP_WILL_RENDER_DRIFT_TTL_SECONDS:
+        return {**cached, "cached": True}
+    try:
+        from jobs.pdp_renderability_reconciler_cron import count_pdp_will_render_drift
+
+        value = await count_pdp_will_render_drift(database)
+    except Exception as exc:  # noqa: BLE001
+        return {"error": str(exc)}
+    _will_render_drift_cache["value"] = value
+    _will_render_drift_cache["at"] = now
+    return {**value, "cached": False}
+
+
 async def _cached_agent_pdp_view_drift(database: Any) -> Dict[str, Any]:
     import time
 
@@ -94,6 +116,17 @@ async def catalog_health() -> Dict[str, Any]:
         # the query is a full truth-CTE aggregate on a 140ms-RTT shared DB —
         # a polled health endpoint must not re-pay it every hit.
         apv_drift = await _cached_agent_pdp_view_drift(database)
+        # P1.13 — freshness of catalog_products.pdp_will_render. The store's own
+        # instruction before any consumer reads that column is to "prove
+        # freshness — not that the column is correct once, but that it STAYS
+        # correct under writes", and this number is that proof. `never_computed`
+        # falling to 0 says the reconciler has walked the table; `disagreeing`
+        # staying at ~0 afterwards says writers are not outrunning it.
+        #
+        # Best-effort and TTL-cached for the same reason as the view drift: it
+        # carries pdp_will_render_expression's correlated subqueries over the
+        # full table, and a polled health endpoint must not re-pay that per hit.
+        will_render_drift = await _cached_pdp_will_render_drift(database)
         return {
             "catalog_total": catalog_total,
             "serving_corpus": corpus,
@@ -102,6 +135,7 @@ async def catalog_health() -> Dict[str, Any]:
             "cohorts": totals,
             "by_source_system": by_source,
             "agent_pdp_view_drift": apv_drift,
+            "pdp_will_render_drift": will_render_drift,
         }
     except Exception as exc:  # noqa: BLE001 — ops endpoint never 500s
         return {"error": str(exc)}

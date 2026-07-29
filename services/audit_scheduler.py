@@ -683,6 +683,30 @@ async def start_scheduler() -> None:
             max_instances=1,
         )
 
+        # P1.13 — converge catalog_products.pdp_will_render with the live
+        # predicate. #1604 shipped the column and both refresh entry points with
+        # NO CALLER on purpose (per-writer invalidation was measured at ~14min
+        # per 1,000-product sync and produces a biased trickle); this is the
+        # drift reconciler that module asked for.
+        #
+        # :53 keeps it clear of the :17 trust slots, :43 agent_pdp_view and the
+        # :00 crons — the three 6-hourly catalog sweeps must not contend on the
+        # shared Postgres. Disable via PDP_WILL_RENDER_RECONCILE_ENABLED=false.
+        from jobs.pdp_renderability_reconciler_cron import (
+            run_pdp_will_render_reconcile_tick,
+        )
+        _add_job(
+            run_pdp_will_render_reconcile_tick,
+            "cron",
+            hour="*/6",
+            minute=53,
+            id="pdp_will_render_reconcile",
+            replace_existing=True,
+            misfire_grace_time=1800,
+            coalesce=True,
+            max_instances=1,
+        )
+
         # Onboarding→audit readiness: drain quality-backfill jobs enqueued at the
         # end of catalog sync. The scorer is deterministic (no LLM), so a 30s
         # interval is cheap; this populates product_quality_snapshot so a freshly
