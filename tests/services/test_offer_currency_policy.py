@@ -179,6 +179,28 @@ async def test_reads_catalog_source_quarantine_not_catalog_offers():
 
 
 @pytest.mark.asyncio
+async def test_the_resolver_returns_EVERY_quarantine_not_just_the_first():
+    """Prod holds 16 active quarantines. Everything else here uses one.
+
+    A mutant truncating the cached list to `[:1]` survived a suite that already
+    had a multi-quarantine test — because that test called the FILTER directly
+    with a hand-built list and never went through the resolver, which is where
+    the truncation lived. The layer under test has to be the mutated one.
+    """
+    db = _FakeDB([_row("mintree.us"), _row("reddane.co.za"), _row("bijin-shop.com")])
+    got = await get_quarantined_sources(db)
+    assert sorted(q.match_value for q in got) == [
+        "bijin-shop.com",
+        "mintree.us",
+        "reddane.co.za",
+    ]
+
+    # ...and the cached read must return all of them too, not just the first.
+    again = await get_quarantined_sources(db)
+    assert len(again) == 3, "the cache truncated the set"
+
+
+@pytest.mark.asyncio
 async def test_a_failed_resolve_is_not_cached_as_empty():
     """One transient blip must not disable the gate for a full TTL.
 
@@ -289,6 +311,40 @@ def test_filter_drops_only_quarantined_rows():
     assert [r.get("brand") or r.get("id") for r in kept] == ["Beplain", "no-domain"]
 
 
+def test_all_quarantines_are_enforced_not_just_the_first():
+    """Prod holds 16 active quarantines; every other test here uses ONE.
+
+    A mutant truncating the resolved list to `[:1]` passed the entire suite. In
+    production it would enforce mintree.us and silently leak the other fifteen
+    domains, including reddane.co.za and wholesale.publicgoods.com.
+    """
+    quarantines = [_q("mintree.us"), _q("reddane.co.za"), _q("bijin-shop.com")]
+    rows = [
+        _mintree_row(),
+        _mintree_row(external_destination_url="https://reddane.co.za/p/1", brand="RedDane"),
+        _mintree_row(external_destination_url="https://bijin-shop.com/p/1", brand="Bijin"),
+        _mintree_row(external_destination_url="https://beplain.com/p/1", brand="Beplain"),
+    ]
+    kept = filter_out_quarantined_rows(rows, quarantines)
+    assert [r["brand"] for r in kept] == ["Beplain"]
+
+
+def test_a_blank_match_value_does_not_drop_every_urlless_row():
+    """`match_value=''` would match every row that has no host.
+
+    The delegated comparison normalises both sides, so `"" == normalize(None)`
+    is True. The migration declares `match_value TEXT NOT NULL` with no
+    non-empty CHECK, and these rows are inserted by direct-SQL ops, so one bad
+    insert would erase every connected-merchant card from the unauthenticated
+    lane — logged as an ordinary exclusion, indistinguishable from a real drop.
+    """
+    urlless = {"id": "p1", "brand": "Beplain", "merchant_id": "m1", "platform": "shopify"}
+    assert is_quarantined_row(urlless, [_q(match_value="")]) is False
+    assert is_quarantined_row(urlless, [_q(match_value="   ")]) is False
+    # ...and a blank entry alongside a real one must not disable the real one.
+    assert is_quarantined_row(_mintree_row(), [_q(match_value=""), _q("mintree.us")]) is True
+
+
 def test_empty_quarantine_set_is_a_no_op():
     rows = [_mintree_row()]
     assert filter_out_quarantined_rows(rows, []) == rows
@@ -318,12 +374,26 @@ def _lane(monkeypatch):
             }
 
         monkeypatch.setattr(gw, "_handle_find_products_multi_inner", _fake_inner)
-        monkeypatch.setattr(gw, "_record_gateway_decision_events", lambda *a, **k: None)
 
-        async def _noop_redirects(products, tool=None):
+        # RECORDING stubs, not no-ops. With no-ops, moving the whole gate block
+        # BELOW redirect stamping and decision recording left the served slate
+        # correct and every test green -- while in production it would mint
+        # attributed /r links for quarantined rows and deposit them in the
+        # behavioural ledger. Ordering is only observable if the stubs remember.
+        seen: Dict[str, List[Any]] = {"redirects": [], "decisions": []}
+
+        def _record_decisions(result, *a, **k):
+            seen["decisions"].extend(
+                (result or {}).get("products", []) if isinstance(result, dict) else []
+            )
+
+        async def _record_redirects(products, tool=None):
+            seen["redirects"].extend(products or [])
             return None
 
-        monkeypatch.setattr(gw, "_attach_connected_product_redirects", _noop_redirects)
+        monkeypatch.setattr(gw, "_record_gateway_decision_events", _record_decisions)
+        monkeypatch.setattr(gw, "_attach_connected_product_redirects", _record_redirects)
+        gw._test_seen = seen  # read by the ordering test
 
         import db.database as dbmod
 
@@ -376,6 +446,33 @@ def test_wiring_also_holds_for_the_intermediate_configuration(_lane):
     assert result["products"] == []
 
 
+def test_wiring_gate_runs_BEFORE_redirect_stamping_and_decision_recording(_lane):
+    """Position, not just presence.
+
+    Moving the gate block below these two leaves the served slate correct and
+    passes every other test here — while minting attributed /r links for
+    quarantined rows and depositing them into the behavioural ledger, which is
+    exactly the attribution and eval pollution the ordering exists to prevent.
+    """
+    gw = _lane(
+        [_mintree_row(), _mintree_row(external_destination_url="https://beplain.com/p/1", brand="Beplain")],
+        quarantine_rows=[_row()],
+    )
+    _run_served(gw)
+    seen = gw._test_seen
+
+    redirect_brands = [p.get("brand") for p in seen["redirects"]]
+    decision_brands = [p.get("brand") for p in seen["decisions"]]
+    assert "Mintree" not in redirect_brands, (
+        f"a quarantined row reached redirect stamping — it will be /r-attributed: {redirect_brands}"
+    )
+    assert "Mintree" not in decision_brands, (
+        f"a quarantined row reached the decision ledger — it pollutes the eval baseline: {decision_brands}"
+    )
+    # The clean row must still reach both, or this would pass by doing nothing.
+    assert redirect_brands == ["Beplain"] and decision_brands == ["Beplain"]
+
+
 def test_wiring_keeps_counters_honest(_lane):
     gw = _lane(
         [_mintree_row(), _mintree_row(external_destination_url="https://beplain.com/p/1")],
@@ -416,7 +513,7 @@ def test_wiring_the_merchant_scoped_twin_is_also_gated(monkeypatch):
         price=1058.0,
         currency="USD",
         merchant_id="merch_real_indian_store",
-        platform="shopify",
+        platform="wix",
         status=ProductStatus.ACTIVE,
         online_store_url="https://mintree.us/products/kumkumadi-oil",
     )
@@ -426,7 +523,7 @@ def test_wiring_the_merchant_scoped_twin_is_also_gated(monkeypatch):
         price=20.0,
         currency="USD",
         merchant_id="merch_real_indian_store",
-        platform="shopify",
+        platform="wix",
         status=ProductStatus.ACTIVE,
         online_store_url="https://beplain.com/products/snail",
     )

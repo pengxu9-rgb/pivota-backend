@@ -173,10 +173,12 @@ def product_hosts(product: Any) -> List[str]:
 def is_quarantined_row(product: Any, quarantines: Sequence[Quarantine]) -> bool:
     """True when any of the row's identities matches an active quarantine.
 
-    Passes merchant_id/platform through as well, so a ``merchant_platform``
-    quarantine is honoured on this lane too rather than only ``domain`` ones --
-    free, and it means adding a quarantine of any supported type takes effect
-    here without touching this file.
+    Handles ``domain`` and ``merchant_platform`` quarantines.
+    ``source_system_ref`` is passed through but is currently INERT on this lane:
+    no card builder emits ``source_system`` / ``source_ref``, so such a
+    quarantine would silently match nothing. Said plainly rather than claimed
+    otherwise -- a future operator adding one would otherwise get a quarantine
+    that reports success and does nothing.
     """
     if not quarantines:
         return False
@@ -184,6 +186,15 @@ def is_quarantined_row(product: Any, quarantines: Sequence[Quarantine]) -> bool:
     platform = _field(product, "platform")
     hosts = product_hosts(product) or [None]
     for q in quarantines:
+        # A blank match_value matches EVERYTHING with no host: the delegated
+        # comparison normalises both sides, so `"" == normalize(None)` is True
+        # and every URL-less row (i.e. every connected-merchant card) would be
+        # dropped from the public lane, logged only as a normal exclusion.
+        # The migration declares `match_value TEXT NOT NULL` with no non-empty
+        # CHECK, and these rows are created by direct-SQL ops, so one bad insert
+        # is enough. Guard here rather than trusting the table.
+        if not str(q.match_value or "").strip():
+            continue
         for host in hosts:
             if quarantine_matches_source(
                 q,
