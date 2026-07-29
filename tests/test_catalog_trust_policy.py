@@ -390,12 +390,25 @@ def test_external_seed_ips_present_but_not_eligible_still_blocks():
     assert REASON_CODES.INDEX_NOT_SERVING_ELIGIBLE in trust["serving_reason_codes"]
 
 
-def test_first_party_no_ips_row_remains_public_under_c1_v0_4():
-    # MOYU/GR/PawStyle case — IPS coverage is sparse for first-party merchants
-    # by design. c1.v0.4 only tightens the IPS gate for external_seed.
+def test_first_party_no_ips_row_is_blocked_under_c1_v0_5():
+    """c1.v0.5 inverted c1.v0.4's first-party carve-out, deliberately.
+
+    The carve-out ("IPS coverage is sparse for first-party merchants by
+    design") described a corpus where every first-party merchant was a retired
+    test rig, already blocked upstream. The first REAL merchant-sync arrival
+    (the 2026-07-29 Wix pilot) synced 20 rows with content_key NULL — rows that
+    can structurally never have an IPS row — and every one went trust-public
+    with no quality gate; `public_not_renderable` went red within the hour, and
+    only the gateway's own fail-closed lookup kept them off the wire.
+
+    An unscored row must not be public. The lifecycle for a fresh sync is
+    blocked -> scored -> eligible -> public. If this assertion is being flipped
+    back to `public`, that lifecycle is being reopened — measure the blast
+    radius first (it was exactly 20 rows when the gate closed).
+    """
     trust = call(ips=None)
-    assert trust["serving_decision"] == "public"
-    assert REASON_CODES.INDEX_NOT_SERVING_ELIGIBLE not in trust["serving_reason_codes"]
+    assert trust["serving_decision"] == "blocked"
+    assert REASON_CODES.INDEX_NOT_SERVING_ELIGIBLE in trust["serving_reason_codes"]
 
 
 def test_first_party_ips_not_eligible_still_blocks_unchanged():

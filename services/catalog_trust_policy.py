@@ -692,7 +692,30 @@ def _derive_serving_decision(
     )
     is_observed_seller = _merchant_id.startswith("merch_obs_")
     if product is not None:
-        if is_external_seed_content and ips is None:
+        # c1.v0.5 (2026-07-29): a missing IPS row fails CLOSED for EVERY lane,
+        # not only external-seed content. The first-party carve-out below this
+        # line used to let `ips is None` fall through to public on the theory
+        # that "first-party merchants are the source of truth and IPS coverage
+        # there is sparse by design". Both halves of that theory failed the
+        # first time a real merchant-sync row arrived:
+        #
+        #   * Measured 2026-07-29 (Wix pilot merch_e68c20b0189746d0): 20 rows
+        #     synced with content_key NULL — structurally incapable of ever
+        #     having an IPS row — and every one went trust-public with NO
+        #     quality gate, no scoring, no eligibility. Only the gateway's own
+        #     fail-closed eligibility lookup kept them from serving, and
+        #     `public_not_renderable` went red (20 > 0) within the hour.
+        #   * "Sparse by design" described a corpus where every first-party
+        #     merchant was a retired test rig whose rows were already blocked
+        #     upstream. Blast radius of closing this measured on prod
+        #     2026-07-29: EXACTLY those 20 pilot rows and zero others.
+        #
+        # An unscored row must not be public — that is the single lesson this
+        # week's serving-coverage work keeps re-teaching (the 04:00 reclassify,
+        # the v3 rescore lockstep, the url_audit stubs). The correct lifecycle
+        # for a fresh sync is blocked -> scored -> eligible -> public, and rows
+        # without a content_key stay blocked until identity is repaired.
+        if ips is None:
             reasons.append(REASON_CODES.INDEX_NOT_SERVING_ELIGIBLE)
             return {"decision": "blocked"}
         if ips is not None:
