@@ -297,10 +297,15 @@ def _is_missing_external_seed_table(exc: Exception) -> bool:
     """
     msg = str(exc or "")
     names = ("external_product_seeds", "catalog_source_quarantine")
+    # NOT a bare `"relation" in msg`: that also matched
+    # `permission denied for relation catalog_source_quarantine`, which would be
+    # reported as table_missing and returned as an empty result — a silent total
+    # blackout of the seed corpus dressed as "no seeds". Postgres always says
+    # "does not exist" for a genuinely missing relation, and SQLite says
+    # "no such table", so nothing is lost by requiring one of those.
     return any(name in msg for name in names) and (
         "does not exist" in msg
         or "UndefinedTable" in msg
-        or "relation" in msg
         or "no such table" in msg.lower()
     )
 
@@ -328,7 +333,15 @@ def _is_external_seed_query_timeout(exc: Exception) -> bool:
 # A `destination_url` fallback for the 1,779 domain-less seeds was measured on
 # prod and rescues exactly 0 additional rows, so it is deliberately NOT added —
 # an unused branch is an untested branch.
-_SEED_QUARANTINE_DOMAIN_EXPR = "domain"
+# QUALIFIED, deliberately. Unqualified `domain` inside the correlated subquery
+# binds to the outer seed table only because `catalog_source_quarantine` happens
+# to have no `domain` column today. Add one — a plausible denormalisation — and
+# every call site silently rebinds to `q.domain`, making the predicate
+# `q.match_value = q.domain`, which matches nothing: the gate turns off
+# everywhere at once, with a green suite. Every other consumer of this builder
+# passes a qualified expression. All eight seed call sites use the unaliased
+# table name, so the table name itself is the qualifier.
+_SEED_QUARANTINE_DOMAIN_EXPR = "external_product_seeds.domain"
 
 
 def build_seed_quarantine_anti_join() -> str:

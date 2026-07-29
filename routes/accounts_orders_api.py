@@ -71,6 +71,9 @@ from services.merchant_psp_config_service import (
     build_runtime_adapter_kwargs,
     fetch_active_runtime_merchant_psp,
 )
+from services.external_seed_search import (
+    build_seed_quarantine_anti_join as _seed_quarantine_clause,
+)
 from services.refund_observability import build_order_refund_tracking_payload
 
 
@@ -1904,7 +1907,7 @@ async def _resolve_history_price_lookup(rows: List[Dict[str, Any]]) -> Dict[str,
     try:
         seed_rows = await asyncio.wait_for(
             database.fetch_all(
-                """
+                f"""
                 SELECT id, external_product_id, attached_product_key, attached_variant_id,
                        price_amount, price_currency, seed_data
                 FROM external_product_seeds
@@ -1915,6 +1918,7 @@ async def _resolve_history_price_lookup(rows: List[Dict[str, Any]]) -> Dict[str,
                     OR attached_product_key = ANY(:product_ids)
                     OR attached_variant_id = ANY(:product_ids)
                   )
+                  {_seed_quarantine_clause()}
                 ORDER BY updated_at DESC, created_at DESC
                 LIMIT :limit
                 """,

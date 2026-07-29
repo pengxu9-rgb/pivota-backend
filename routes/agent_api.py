@@ -4307,7 +4307,16 @@ async def _load_external_seed_product_by_product_id(*, req: Request, product_id:
         )
     except Exception as exc:
         msg = str(exc)
-        if "external_product_seeds" in msg and ("does not exist" in msg or "UndefinedTable" in msg or "relation" in msg):
+        # BOTH tables: the quarantine anti-join added to this query makes
+        # catalog_source_quarantine a hard dependency, so a database without
+        # migration 134 raises `relation "catalog_source_quarantine" does not
+        # exist` — which this classifier did not recognise, and the route 500'd
+        # instead of degrading. Prod has 134, but prod runs with
+        # SKIP_HEAVY_STARTUP_INIT=true and manual psql migrations, so a fresh
+        # staging DB is exactly the case that hits it.
+        if ("external_product_seeds" in msg or "catalog_source_quarantine" in msg) and (
+            "does not exist" in msg or "UndefinedTable" in msg or "no such table" in msg.lower()
+        ):
             return None
         # Backward compat: some deployments may have seed_data as TEXT.
         if "->>" in msg and ("operator does not exist" in msg or "UndefinedFunction" in msg):
