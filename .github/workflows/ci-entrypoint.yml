@@ -1,0 +1,265 @@
+name: CI Entrypoint
+
+# THE ONE CHECK THAT ALWAYS RUNS — so that a required check can exist at all.
+#
+# WHY THIS IS NEEDED. On 2026-07-29 branch protection was configured on this repo
+# with three required status checks. It immediately blocked a legitimate PR
+# forever: `execute real routes on real Postgres` is path-filtered to
+# routes/services/db/models, the PR touched only `.github/workflows/`, so the
+# check never reported — and a required check that never reports never passes.
+#
+# Then the wider problem surfaced: EVERY pytest workflow in this repo is
+# path-filtered. So under classic branch protection there was no safe required
+# check at all, and the protection had to be removed. Force-push and deletion
+# protection remain; the ability to block a red PR did not.
+#
+# This job has NO `paths:` filter. That is its entire reason to exist: it always
+# runs, so it can always report, so it can be required.
+#
+# WHAT IT ACTUALLY CHECKS — not a rubber stamp:
+#   1. Which gates SHOULD have run, derived from this PR's changed files against
+#      each workflow's OWN declared `paths:`.
+#   2. That each of those gates DID run and concluded successfully.
+#   3. That a gate which should have run but is ABSENT is a failure — the
+#      "silently did not run" class that produced 92% uncovered tests, the
+#      unexecuted rig guards (#1600) and #1829's never-run error suite.
+#
+# 🚫 IT DOES NOT KEEP ITS OWN COPY OF THE PATH FILTERS. It reads them out of the
+# workflows at runtime. A second copy would drift from the first, which is the
+# per-consumer divergence ADR-012 names, and this file would become the next
+# hand-maintained list that silently stops matching.
+
+on:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  checks: read
+  contents: read
+  pull-requests: read
+
+concurrency:
+  group: ci-entrypoint-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  required:
+    name: CI Entrypoint
+    runs-on: ubuntu-latest
+    # Generous: it waits for the slowest real gate. The sweep is ~2min, the
+    # audit gate longer. Well under the cost of a gate that cannot block.
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          # F1: on workflow_dispatch the script diffs HEAD~1, which FAILS on a
+          # depth-1 checkout — returncode 128, empty file list, nothing expected,
+          # green tick having verified nothing. Full history plus the explicit
+          # returncode check below closes it.
+          fetch-depth: 0
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - run: pip install --quiet pyyaml
+
+      - name: Verify every gate that should have run, did
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha || github.sha }}
+          REPO: ${{ github.repository }}
+        run: |
+          python - <<'PY'
+          import fnmatch, json, os, subprocess, sys, time
+          import yaml
+
+          REPO = os.environ['REPO']
+          SHA = os.environ['HEAD_SHA']
+          PR = os.environ.get('PR_NUMBER')
+          SELF = 'CI Entrypoint'
+          # BUILT FROM PARTS, NEVER WRITTEN LITERALLY. A `run:` body is scanned by
+          # the Actions TEMPLATE EVALUATOR before any shell exists, so a literal
+          # `${'{'}{` in this script is parsed as an expression — and an invalid one
+          # rejects the whole workflow at load time: zero jobs, `total_count: 0`,
+          # and a failure with no log to read. That is exactly how the previous
+          # commit broke this file, and it is the same trap the repo already
+          # documented for free-form workflow inputs.
+          DOLLAR_BRACE = chr(36) + '{' + '{'
+
+          def gh_json(path):
+              """Every JSON document `gh api --paginate` emits, decoded.
+
+              F5: for an OBJECT-returning endpoint (check-runs) gh concatenates
+              one document per page with NO separator — measured: 4 objects, 0
+              newlines. Splitting on '\\n' therefore hands json.loads the whole
+              blob and raises `Extra data`, uncaught, above 100 check runs on one
+              SHA. (Array endpoints like pulls/N/files are merged by gh into one
+              valid array, so those were always fine.) raw_decode walks whatever
+              shape arrives.
+              """
+              out = subprocess.run(['gh', 'api', path, '--paginate'],
+                                   capture_output=True, text=True)
+              if out.returncode != 0:
+                  sys.exit(f"::error::gh api {path} failed: {out.stderr.strip()[:300]}")
+              dec, idx, docs = json.JSONDecoder(), 0, []
+              raw = out.stdout.strip()
+              while idx < len(raw):
+                  obj, end = dec.raw_decode(raw, idx)
+                  docs.append(obj)
+                  idx = end
+                  while idx < len(raw) and raw[idx].isspace():
+                      idx += 1
+              return docs
+
+          # ---- 1. what changed -------------------------------------------------
+          if PR:
+              files = [f['filename']
+                       for doc in gh_json(f'repos/{REPO}/pulls/{PR}/files')
+                       for f in doc]
+          else:
+              # RETURNCODE CHECKED. Unchecked, a failed diff yields '' -> no files
+              # -> nothing expected -> exit 0. A dispatch that verifies nothing
+              # while reporting success is the exact shape this job exists to
+              # catch, and the first version of it shipped that way.
+              d = subprocess.run(['git', 'diff', '--name-only', 'HEAD~1'],
+                                 capture_output=True, text=True)
+              if d.returncode != 0:
+                  sys.exit(f"::error::could not diff HEAD~1 ({d.stderr.strip()[:200]}) — "
+                           "refusing to report success having derived no changed files")
+              files = d.stdout.split()
+          print(f"changed files: {len(files)}")
+
+          # ---- 2. which gates should have run ----------------------------------
+          # Read each workflow's OWN paths. No second copy to drift.
+          def matches(path, pattern):
+              # GitHub path filters: `**` spans separators, `*` does not.
+              if '**' in pattern:
+                  return fnmatch.fnmatch(path, pattern.replace('**', '*'))
+              return fnmatch.fnmatch(path, pattern)
+
+          expected = {}   # check name -> workflow file
+          skipped_by_shape = []   # jobs whose check-run NAME cannot be derived
+          for wf in sorted(os.listdir('.github/workflows')):
+              if not wf.endswith(('.yml', '.yaml')):
+                  continue
+              try:
+                  doc = yaml.safe_load(open(f'.github/workflows/{wf}')) or {}
+              except Exception as e:
+                  sys.exit(f"::error::{wf} is not parseable YAML ({e}) — CI cannot "
+                           "reason about which gates should run")
+              # PyYAML reads the `on:` key as the boolean True (YAML 1.1).
+              triggers = doc.get(True) or doc.get('on') or {}
+              # `on: [push, pull_request]` is legal and yields a LIST. The first
+              # version `continue`d on it, so such a workflow's gates were never
+              # enforced and nothing was printed — silent, and the failure mode
+              # this job is for. List form carries no paths, so it always runs.
+              if isinstance(triggers, list):
+                  triggers = {t: {} for t in triggers}
+              if not isinstance(triggers, dict) or 'pull_request' not in triggers:
+                  continue
+              pr_trigger = triggers.get('pull_request') or {}
+              patterns = (pr_trigger or {}).get('paths')
+              ignore = (pr_trigger or {}).get('paths-ignore')
+              # F4: GitHub names a MATRIX check run `job (v1, v2)` and a
+              # REUSABLE-workflow job `caller / callee`, neither of which equals
+              # the job key. Expecting the bare name would mark that gate
+              # permanently absent and hard-block every matching PR. None exist
+              # here today; they are excluded and PRINTED so the gap is visible
+              # rather than becoming a future outage.
+              names, unmatchable = [], []
+              for key, spec in (doc.get('jobs') or {}).items():
+                  spec = spec or {}
+                  label = spec.get('name') or key
+                  if (spec.get('strategy') or {}).get('matrix') or spec.get('uses') \
+                     or (DOLLAR_BRACE in str(label)):
+                      unmatchable.append(label)
+                  else:
+                      names.append(label)
+              if patterns is not None:
+                  should = any(matches(f, p) for f in files for p in patterns)
+              elif ignore is not None:
+                  # F3: `paths-ignore` runs UNLESS every changed file matches.
+                  # Read as unfiltered it would expect the gate on a PR that
+                  # touches only ignored paths, wait 20 minutes, and hard-block.
+                  should = any(not any(matches(f, p) for p in ignore) for f in files)
+              else:
+                  should = True          # genuinely unfiltered: always runs
+              if should:
+                  for n in names:
+                      if n != SELF:
+                          expected[n] = wf
+                  for n in unmatchable:
+                      skipped_by_shape.append(f"{n} ({wf})")
+
+
+          if not expected:
+              print("no path-filtered gate matched this diff — nothing to enforce")
+              sys.exit(0)
+          print("gates that SHOULD run for this diff:")
+          for n, wf in sorted(expected.items()):
+              print(f"  {n}  ({wf})")
+
+          # ---- 3. wait for them, then assert -----------------------------------
+          # 20 minutes: the LONGEST any gate is allowed to take
+          # (agent-reliability-suite jobs are timeout-minutes: 20; the rest 15).
+          # The first cut used 12, BELOW those ceilings — a queue backlog would
+          # have reported "NEVER STARTED" and blocked a PR whose gate then
+          # passed. Measured runs finish in 0-2 min, so this is headroom, not
+          # latency: the loop exits as soon as everything reports.
+          DEADLINE = time.time() + 20 * 60
+          while True:
+              runs = [r for doc in gh_json(f'repos/{REPO}/commits/{SHA}/check-runs?per_page=100')
+                      for r in doc.get('check_runs', [])]
+              seen = {r['name']: r for r in runs if r['name'] != SELF}
+              pending = [n for n in expected
+                         if n not in seen or seen[n]['status'] != 'completed']
+              if not pending:
+                  break
+              if time.time() > DEADLINE:
+                  print("::error::timed out waiting for gates to report:")
+                  for n in sorted(pending):
+                      state = seen.get(n, {}).get('status', 'NEVER STARTED')
+                      print(f"  {n}: {state}  ({expected[n]})")
+                  sys.exit(1)
+              print(f"  waiting on {len(pending)}: {', '.join(sorted(pending)[:4])}")
+              time.sleep(20)
+
+          # OUTCOME-BASED, not presence-of-`if:`-based. My first cut excluded any
+          # job carrying a job-level `if:` on the theory that it is conditional by
+          # design — which gutted the check: `quick-reliability` and
+          # `Checkout Payment Safety` both carry
+          # `if: github.event_name != 'workflow_dispatch' || ...`, which is TRUE
+          # on a pull request, so they genuinely run and genuinely should be
+          # enforced. Only `Shopify discount validation` is dispatch-only.
+          # Excluding by the presence of an `if:` was the wrong axis.
+          #
+          # So all matched jobs stay in the expected set and the CONCLUSION
+          # decides:
+          #   absent            -> FAIL. The whole point: a gate whose paths
+          #                       matched and which never reported is the
+          #                       silently-did-not-run class.
+          #   failure/cancelled -> FAIL.
+          #   skipped           -> TOLERATED, and printed. A job-level `if:`
+          #                       evaluated false; this script cannot evaluate
+          #                       that expression, so it must not assert on it —
+          #                       but it says so out loud rather than hiding it.
+          bad, skipped_jobs = [], []
+          for name, wf in sorted(expected.items()):
+              concl = seen[name].get('conclusion')
+              if concl == 'skipped':
+                  skipped_jobs.append(f"{name} ({wf})")
+                  print(f"  {name}: skipped — job-level `if:` false, NOT enforced")
+                  continue
+              print(f"  {name}: {concl}")
+              if concl not in ('success', 'neutral'):
+                  bad.append(f"{name} concluded '{concl}' ({wf})")
+          if skipped_jobs:
+              print("\nnot enforced this run (skipped by their own `if:`):")
+              for s_ in skipped_jobs:
+                  print(f"  {s_}")
+          if bad:
+              for b in bad:
+                  print(f"::error::{b}")
+              sys.exit("a gate that should have run for this diff did not pass")
+          print(f"\nall {len(expected)} expected gate(s) ran and passed")
+          PY
