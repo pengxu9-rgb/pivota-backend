@@ -343,7 +343,7 @@ MATRIX = [
         False,
     ),
     (
-        # MEASURED FALSE, 7/7 HTTP 500 — see MERCHANT_SYNCED_LANE_RENDERABLE.
+        # MEASURED FALSE, 7/7 HTTP 500 — see MERCHANT_SYNCED_RENDERABLE_BY_PLATFORM.
         # The merchant-synced lane was the one arm that asserted renderable
         # without evidence; it does not.
         "merchant-synced shopify row with no seed at all",
@@ -725,7 +725,7 @@ def test_merchant_synced_platforms_stays_pinned_to_the_supported_platform_sets()
     """This set is NARROWER than the platforms the rest of the codebase
     supports: woocommerce/bigcommerce never even reach the lane test. With the
     lane closed that is currently moot, but the set is load-bearing again the
-    moment MERCHANT_SYNCED_LANE_RENDERABLE flips — so pin it now, while the
+    moment a platform verdict in MERCHANT_SYNCED_RENDERABLE_BY_PLATFORM flips — so pin it now, while the
     stakes are zero, rather than discovering the drift later.
     """
     from services.agent_center_sku_match_live_service import SUPPORTED_LIVE_PLATFORMS

@@ -9,7 +9,7 @@ because it asks the same predicate of a different set.
 
 WHY THE THRESHOLD IS 4 AND NOT 2,265. Only 4 of those rows are CLEAN — neither
 `suppressed_at` nor `suppression_reason` set — and 1,474 are on the
-hard-coded-dark shopify lane (`MERCHANT_SYNCED_LANE_RENDERABLE = False`).
+hard-coded-dark shopify lane (`MERCHANT_SYNCED_RENDERABLE_BY_PLATFORM['shopify'] = False`).
 Blessing 2,265 would leave the check deaf to a 500-row regression. The module's
 own convention is explicit that a threshold is the measured baseline of the
 UNEXPLAINED residual.

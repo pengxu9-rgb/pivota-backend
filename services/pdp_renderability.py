@@ -94,16 +94,17 @@ for the row:
     byte-identically before and after. The two changes ship together —
     PIVOTA-Agent must be live before this predicate stops withholding the lane
     from the sitemap.
-  * **Merchant-synced rows** (shopify/wix catalog sync) were ASSUMED to resolve
-    their detail from the merchant upstream and so to need no seed. Measured,
-    that assumption is FALSE: 7/7 sampled shopify PDPs returned HTTP 500,
-    including under merchants with ``indexable=true``. The lane is therefore
-    non-renderable — see :data:`MERCHANT_SYNCED_LANE_RENDERABLE` for the
-    evidence, the zero-row blast radius, and how to re-enable it.
+  * **Merchant-synced rows** (shopify/wix catalog sync) resolve their detail
+    from the merchant upstream — or don't. The verdict is PER PLATFORM and
+    MEASURED, never assumed: shopify FALSE (7/7 sampled PDPs returned HTTP
+    500, including under merchants with ``indexable=true``), wix TRUE (the
+    2026-07-29 pilot: 8/8 gateway SUCCESS, 8/8 public PDP 200) — see
+    :data:`MERCHANT_SYNCED_RENDERABLE_BY_PLATFORM` for the evidence and the
+    procedure for opening a lane.
   * **Everything else** — today ``url_audit`` audit-minted rows and
     ``brand_authored`` stubs — has neither route and cannot render.
 
-Net: only the seed lane can currently answer True.
+Net: the seed lane and the open merchant-synced platforms can answer True.
 
 The lane order matters: the seed lane is checked FIRST, so an ``ext_``-prefixed
 id sitting under a normal merchant is still seed-gated (that mirrors
@@ -862,6 +863,7 @@ def compile_pg(stmt) -> str:
 __all__ = [
     "EXTERNAL_SEED_MERCHANT_ID",
     "MERCHANT_SYNCED_PLATFORMS",
+    "MERCHANT_SYNCED_RENDERABLE_BY_PLATFORM",
     "MINTED_SOURCE_SYSTEM",
     "SEED_ROUTED_SOURCE_SYSTEMS",
     "compile_pg",
