@@ -261,34 +261,37 @@ jobs:
                       skipped_by_shape.append(f"{n} ({wf})")
 
 
+          # PRINTED BEFORE THE EARLY EXIT, not after. Review demonstrated the
+          # hole: a diff whose only matching job is unmatchable (reusable or a
+          # non-static matrix) leaves `expected` empty, so the exit fired first
+          # and the warning never printed — silently enforcing nothing, which is
+          # the narrower form of the very class this loop exists to surface.
+          for entry in skipped_by_shape:
+              print(f"::warning::gate NOT enforceable — name cannot be derived "
+                    f"statically: {entry}")
+
           if not expected:
               print("no path-filtered gate matched this diff — nothing to enforce")
               sys.exit(0)
           print("gates that SHOULD run for this diff:")
           for n, wf in sorted(expected.items()):
               print(f"  {n}  ({wf})")
-          # THIS LOOP WAS MISSING. `skipped_by_shape` was declared, appended to,
-          # and never read — so the "excluded and PRINTED" mechanism this file's
-          # own comments advertise did not exist. Add `include:` to the jest
-          # matrix and all 8 shards would have left `expected` silently, leaving
-          # a green entrypoint enforcing one job. Dead warning code inside the
-          # file written to kill silent no-ops.
-          for entry in skipped_by_shape:
-              print(f"::warning::gate NOT enforceable — name cannot be derived "
-                    f"statically: {entry}")
 
           # ---- 3. wait for them, then assert -----------------------------------
-          # 35 minutes. The first cut carried the backend's comment verbatim —
-          # "agent-reliability-suite jobs are timeout-minutes: 20" — and NO such
-          # workflow exists in this repo. Real ceilings here: jest shards and both
-          # runtime smokes 30, the Shopping unit gate has none at all (GitHub
-          # default 360), travel_plans 20, pr_lite/gate 15, node:test 10. So the
-          # deadline again sat BELOW the gates it waits on, which is the exact
-          # defect the comment claimed to have fixed.
-          # The first cut used 12, BELOW those ceilings — a queue backlog would
-          # have reported "NEVER STARTED" and blocked a PR whose gate then
-          # passed. Measured runs finish in 0-2 min, so this is headroom, not
-          # latency: the loop exits as soon as everything reports.
+          # THE DEADLINE MUST SIT ABOVE EVERY GATE'S OWN `timeout-minutes`, and
+          # the job's timeout above the deadline, so the diagnostic below fires
+          # before GitHub kills the job.
+          #
+          # ⚠️ REPO-NEUTRAL ON PURPOSE. This body is byte-identical across
+          # pivota-backend and PIVOTA-Agent. Two earlier versions each hard-coded
+          # the OTHER repo's workflow names into this comment and were therefore
+          # false wherever they were read — one of them asserted that a workflow
+          # "does not exist in this repo" while sitting in the repo that has it.
+          # A comment describing gates it cannot see is worse than no comment,
+          # because this file's whole value is that reading it tells you what is
+          # enforced. Re-derive the ceiling with:
+          #   grep -h 'timeout-minutes' .github/workflows/*.yml | sort -u
+          # and raise the two numbers if any gate exceeds them.
           DEADLINE = time.time() + 35 * 60
           while True:
               runs = [r for doc in gh_json(f'repos/{REPO}/commits/{SHA}/check-runs?per_page=100')
