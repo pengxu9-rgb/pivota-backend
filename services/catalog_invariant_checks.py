@@ -260,7 +260,10 @@ _CHECKS: List[Dict[str, Any]] = [
         # The 1 is the single url_audit row: audit-minted, no seed, no sync
         # adapter, measured HTTP 500. It goes to 0 when that row is either
         # given a route or dropped out of 'public'.
-        "default_threshold": 1,
+        # LOWERED 1 -> 0 on 2026-07-29. The baseline-1 was the HOVERAir X1
+        # url_audit stub; it was retired with the other three audit-minted stubs
+        # (reason 'url_audit_stub_retired_20260729') and the count re-measured 0.
+        "default_threshold": 0,
         "count_sql": _PUBLIC_NOT_RENDERABLE_COUNT_SQL,
         "sample_sql": _PUBLIC_NOT_RENDERABLE_SAMPLE_SQL,
     },
@@ -351,10 +354,13 @@ _CHECKS: List[Dict[str, Any]] = [
         # hard-coded-dark shopify lane; see the note above the SQL for why
         # blessing 2,265 would make this check deaf.
         #
-        # LOWER THIS the moment those 4 are fixed. The convention above is
-        # explicit: a threshold left above the true count goes deaf by exactly
-        # the size of the fix.
-        "default_threshold": 4,
+        # LOWERED 4 -> 0 on 2026-07-29: the four url_audit stubs were retired
+        # (suppression_reason='url_audit_stub_retired_20260729', suppressed_at
+        # set) and trust recomputed to `blocked` the same day. Re-measured: 0.
+        # The convention above is explicit that lowering is mandatory the moment
+        # the true count drops — a threshold left at 4 would wave through the
+        # next four regressions.
+        "default_threshold": 0,
         "count_sql": _SERVING_NOT_RENDERABLE_COUNT_SQL,
         "sample_sql": _SERVING_NOT_RENDERABLE_SAMPLE_SQL,
     },
