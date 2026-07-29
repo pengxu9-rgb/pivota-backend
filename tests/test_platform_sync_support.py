@@ -284,11 +284,25 @@ def test_sync_woocommerce_route_delegates_to_universal_sync(monkeypatch) -> None
     monkeypatch.setattr(module.database, "fetch_one", fake_fetch_one)
     monkeypatch.setattr("routes.product_sync.sync_products", fake_sync_products)
 
+    # Default is now BACKGROUND (the inline form died at the edge timeout for
+    # any real store — see routes/wix_sync.py). The immediate response carries
+    # no product_count: claiming one before the sync ran would be a fabricated
+    # success. ?wait=true below still exercises the legacy inline contract.
     response = client.post("/merchant/integrations/woocommerce/sync")
 
     assert response.status_code == 200
     body = response.json()
     assert body["platform"] == "woocommerce"
+    assert body["status"] == "started"
+    assert body["started_at"]
+    assert "product_count" not in body
+
+    response = client.post("/merchant/integrations/woocommerce/sync?wait=true")
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body["platform"] == "woocommerce"
+    assert body["status"] == "success"
     assert body["product_count"] == 7
 
 
@@ -317,9 +331,10 @@ def test_sync_bigcommerce_route_delegates_to_universal_sync(monkeypatch) -> None
     monkeypatch.setattr(module.database, "fetch_one", fake_fetch_one)
     monkeypatch.setattr("routes.product_sync.sync_products", fake_sync_products)
 
-    response = client.post("/merchant/integrations/bigcommerce/sync")
+    response = client.post("/merchant/integrations/bigcommerce/sync?wait=true")
 
     assert response.status_code == 200
     body = response.json()
     assert body["platform"] == "bigcommerce"
+    assert body["status"] == "success"
     assert body["product_count"] == 5
