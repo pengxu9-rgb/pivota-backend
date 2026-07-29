@@ -116,8 +116,9 @@ jobs:
       #     combining the two trees: green running `readiness/tests` alone, red
       #     inside the sweep. Exactly the effect the 2026-07-28 recon predicted —
       #     "a globbed job runs a different set than the full suite, so
-      #     order-dependent tests flip in both directions". Two of the seven
-      #     quarantine entries are now this class.
+      #     order-dependent tests flip in both directions". Both are
+      #     `--deselect`s rather than `--ignore`s, so they suppress two TESTS
+      #     rather than two files.
       #
       # ⚠️ A denylist entry is a promise to come back, not a resolution. If this
       # list is the same length in a month, this job has become the thing it
@@ -158,7 +159,9 @@ jobs:
       # FILENAME in --ignore is harmless (pytest ignores nonexistent paths and
       # the test still runs), while a valid DIRECTORY is silent.
       #
-      # So: floor raised to 9,000 against a measured 9,244, AND per-subtree
+      # So: floor raised to 9,000 against a measured 9,257 (re-derived on this
+      # branch, not carried forward — see the calibration warning below), AND
+      # per-subtree
       # minimums, because a single global number cannot notice one tree leaving.
       # Raise these when the real numbers grow; never lower one to green a build.
       - name: Assert the sweep actually ran
