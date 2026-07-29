@@ -232,6 +232,38 @@ async def universal_product_sync(
                 )
                 if isinstance(catalog_result, dict):
                     catalog_synced = int(catalog_result.get("products_ingested") or 0)
+                # Onboarding→audit readiness: same hook run_catalog_sync_job has
+                # carried since it existed, and which THIS path — the one every
+                # portal sync button actually goes through (wix/shopify/
+                # woocommerce/bigcommerce routes → sync_products → here) — never
+                # got. Without it a portal-synced merchant's catalog is born with
+                # ZERO quality snapshots: the classifier stamps every content_key
+                # `low_quality` ("no quality snapshot found"), serving_eligible
+                # stays false, and nothing ever schedules the scoring that would
+                # change it. Measured on the 2026-07-29 Wix pilot
+                # (merch_e68c20b0189746d0): 20/20 rows ingested, identity minted,
+                # IPS classified — and product_quality_backfill_jobs contained
+                # NOTHING for the merchant. The 30s quality-drain tick can only
+                # drain what someone enqueues. Best-effort by the same contract
+                # as the sibling hook: a scoring-enqueue failure must never fail
+                # the sync that just succeeded.
+                try:
+                    from db.product_quality_backfill_jobs import (
+                        create_quality_backfill_job,
+                    )
+                    await create_quality_backfill_job(
+                        merchant_id=request.merchant_id,
+                        platform=platform,
+                        requested_by="universal_product_sync",
+                        force_refresh=False,
+                        missing_only=True,
+                    )
+                except Exception as enqueue_error:  # noqa: BLE001 — best-effort
+                    logger.warning(
+                        "universal_sync: quality-backfill enqueue failed merchant=%s: %s",
+                        request.merchant_id,
+                        enqueue_error,
+                    )
             except Exception as catalog_error:
                 catalog_error_message = str(catalog_error)
                 logger.error(
