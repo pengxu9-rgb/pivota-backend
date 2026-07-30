@@ -86,6 +86,59 @@ def sql_bare_domain(expr: str) -> str:
     )
 
 
+# The domain chain for a `catalog_products` row, as ONE expression.
+#
+# #1643: the four comparators over this table agreed on how to SPELL a domain
+# (#1641) but not on WHICH COLUMNS to read. The assembler and the reconciler
+# cron used `cp.source_domain` alone; `catalog_trust_policy` and
+# `catalog_row_trust_upserter` used the full chain. On a row with a NULL
+# `cp.source_domain` — 4,007 of 14,124 in prod — a quarantined storefront kept
+# its canonical pick while the trust layer marked it blocked, which is precisely
+# the shadowing the anti-join exists to prevent.
+#
+# Defined here, once, so the two cannot drift again. Lateral scalar subqueries
+# rather than CTE joins because the callers select by `content_key` first: a
+# handful of outer rows, each doing an index lookup. Measured on a prod-shaped
+# corpus (14,124 products / 11,381 seeds), median of 200:
+#
+#   cp.source_domain alone            0.118 ms
+#   this chain, no index              2.555 ms
+#   this chain + migration 189        0.172 ms
+#
+# migration 189 is what makes it affordable — the only pre-existing indexes on
+# `attached_product_key` were PARTIAL ones on `IS NULL`, the opposite lookup.
+#
+# ⚠️ MEASURED BLAST RADIUS ON PROD, 2026-07-30: widening changes **0 rows**
+# today — of the 4,007 NULL-`source_domain` rows, none resolve to a quarantined
+# domain via seed or store. This is convergence, not a live unblock. Do not
+# read a zero delta after deploy as the change having failed.
+# ⚠️ `nullif(..., '')` on EVERY leg, not just the outer wrapper. `coalesce`
+# treats an EMPTY STRING as a present value, so a row with
+# `cp.source_domain = ''` short-circuits the whole chain and the seed/store legs
+# never run — the row reads as having no domain and passes the gate. That is not
+# hypothetical: `catalog_row_trust_upserter`'s chain had the same shape and the
+# #1641 review measured it returning False for `cp EMPTY + ms set` while the
+# trust policy returned True. Both are fixed here; a test pins them together.
+CATALOG_PRODUCT_DOMAIN_SQL = """coalesce(
+      nullif(cp.source_domain, ''),
+      (SELECT nullif(s.domain, '') FROM external_product_seeds s
+        WHERE cp.source_system = 'external_product_seeds_mirror_v1'
+          AND s.external_product_id = cp.source_product_id
+        ORDER BY (s.status = 'active') DESC, s.updated_at DESC NULLS LAST, s.id DESC
+        LIMIT 1),
+      (SELECT nullif(s.domain, '') FROM external_product_seeds s
+        WHERE cp.source_system = 'catalog_enrichment_agent_v1'
+          AND s.attached_product_key = cp.product_key
+        ORDER BY (s.status = 'active') DESC, s.updated_at DESC NULLS LAST, s.id DESC
+        LIMIT 1),
+      (SELECT nullif(m.domain, '') FROM merchant_stores m
+        WHERE m.merchant_id = cp.merchant_id AND m.platform = cp.platform
+        ORDER BY m.is_primary DESC NULLS LAST, m.last_sync DESC NULLS LAST
+        LIMIT 1),
+      ''
+    )"""
+
+
 def build_quarantine_anti_join_sql(
     row_domain_expr: str,
     row_merchant_expr: str,

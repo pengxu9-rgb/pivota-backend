@@ -144,11 +144,14 @@ _TRUTH_CTE = """
 def _truth_cte() -> str:
     # Same anti-join fragment (and the same cp.* expressions) the assembler's
     # fetch_products_for_key uses — the two predicates must never diverge.
-    from services.source_quarantine import build_quarantine_anti_join_sql
+    from services.source_quarantine import (
+        CATALOG_PRODUCT_DOMAIN_SQL,
+        build_quarantine_anti_join_sql,
+    )
 
     return _TRUTH_CTE.format(
         quarantine_anti_join=build_quarantine_anti_join_sql(
-            row_domain_expr="cp.source_domain",
+            row_domain_expr=CATALOG_PRODUCT_DOMAIN_SQL,
             row_merchant_expr="cp.merchant_id",
             row_platform_expr="cp.platform",
             row_source_system_expr="cp.source_system",

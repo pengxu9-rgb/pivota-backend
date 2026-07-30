@@ -54,6 +54,7 @@ claim.
 
 from __future__ import annotations
 
+import re
 import sqlite3
 from datetime import datetime, timezone
 
@@ -138,6 +139,29 @@ def _verdict_trust_policy(row_domain, match_value) -> bool:
     )
 
 
+def _replace_balanced(sql: str, start_token: str, replacement: str) -> str:
+    """Replace the balanced-paren expression starting at `start_token`.
+
+    A regex cannot do this safely — a non-greedy one stops at the first `))`,
+    which is INSIDE the chain, and truncates the predicate mid-CASE. An exact
+    literal is worse: it silently stopped matching the moment the chain gained
+    `nullif(...)` per leg, and this harness then tested a different predicate
+    from the one that ships. Counting parens is the only version that cannot
+    drift quietly.
+    """
+    i = sql.index(start_token)
+    depth, j = 0, i + len("coalesce")
+    while True:
+        if sql[j] == "(":
+            depth += 1
+        elif sql[j] == ")":
+            depth -= 1
+            if depth == 0:
+                break
+        j += 1
+    return sql[:i] + replacement + sql[j + 1:]
+
+
 def _verdict_upserter_lookup(row_domain, match_value) -> bool:
     """(4) The trust upserter's by-domain lookup — selected == matched.
 
@@ -146,10 +170,16 @@ def _verdict_upserter_lookup(row_domain, match_value) -> bool:
     """
     where = _SELECT_BY_QUARANTINE_DOMAIN_SQL
     predicate = where[where.rindex("WHERE") + len("WHERE"):].split("ORDER BY")[0]
-    # The real query coalesces four sources; here only cp.source_domain exists.
-    predicate = predicate.replace(
-        "coalesce(cp.source_domain, eps.domain, epm.domain, ms.domain, '')", "r.domain"
-    )
+    # The real query coalesces four sources; this harness has only one column.
+    # Matched by REGEX, not by an exact literal: an exact-string replace silently
+    # stopped matching the moment the chain gained `nullif(...)` per leg, and the
+    # predicate then ran with `cp.source_domain` unresolved — 48 tests failed
+    # loudly, but a subtler edit could have left it merely wrong.
+    # ALL occurrences: sql_bare_domain expands its argument three times (both
+    # CASE branches plus the ELSE), so replacing only the first leaves the rest
+    # referencing columns this harness does not have.
+    while "coalesce(nullif(cp.source_domain" in predicate:
+        predicate = _replace_balanced(predicate, "coalesce(nullif(cp.source_domain", "r.domain")
     conn = sqlite3.connect(":memory:")
     conn.execute("CREATE TABLE r (id TEXT, domain TEXT)")
     conn.execute("INSERT INTO r VALUES ('x',?)", (row_domain,))
@@ -462,3 +492,113 @@ def test_create_quarantine_still_accepts_a_plain_hostname():
             )
         )
         assert db.written["match_value"] == raw
+
+
+# ---------------------------------------------------------------------------
+# THE CHAIN AXIS (#1643) — which COLUMNS each comparator reads
+# ---------------------------------------------------------------------------
+#
+# #1641 made all seven spell a domain the same way. It did NOT make them read
+# the same columns: the assembler and the reconciler cron used
+# `cp.source_domain` ALONE while the trust layer used the full chain. On a row
+# with a NULL source_domain — 4,007 of 14,124 in prod — a quarantined storefront
+# kept its canonical pick while trust marked it blocked.
+#
+# These tests parametrise over (cp, eps, epm, ms) TUPLES rather than a single
+# row_domain, which is what the previous version of this file could not see.
+
+CHAIN_SHAPES = [
+    # (label,          cp,             eps,            epm,            ms)
+    ("cp only",        "mintree.us",   None,           None,           None),
+    ("eps only",       None,           "mintree.us",   None,           None),
+    ("epm only",       None,           None,           "mintree.us",   None),
+    ("ms only",        None,           None,           None,           "mintree.us"),
+    ("cp empty + eps", "",             "mintree.us",   None,           None),
+    ("cp empty + ms",  "",             None,           None,           "mintree.us"),
+]
+
+
+def _catalog_chain_verdict(cp, eps, epm, ms, match_value="mintree.us") -> bool:
+    """Run the REAL assembler anti-join over a catalog_products-shaped row."""
+    from services.agent_pdp_view_assembler import _SOURCE_QUARANTINE_ANTI_JOIN
+
+    conn = sqlite3.connect(":memory:")
+    conn.execute(
+        "CREATE TABLE catalog_products (product_key TEXT, merchant_id TEXT, platform TEXT,"
+        " source_product_id TEXT, source_system TEXT, source_domain TEXT, source_ref TEXT)"
+    )
+    conn.execute(
+        "CREATE TABLE external_product_seeds (id TEXT, external_product_id TEXT, domain TEXT,"
+        " attached_product_key TEXT, status TEXT, updated_at TEXT)"
+    )
+    conn.execute(
+        "CREATE TABLE merchant_stores (merchant_id TEXT, platform TEXT, domain TEXT,"
+        " is_primary INT, last_sync TEXT)"
+    )
+    conn.execute(
+        "CREATE TABLE catalog_source_quarantine (quarantine_id INTEGER, match_type TEXT,"
+        " match_value TEXT, state TEXT, expires_at TEXT)"
+    )
+    # source_system decides WHICH seed leg applies, so pick it from the fixture.
+    system = "catalog_enrichment_agent_v1" if epm else "external_product_seeds_mirror_v1"
+    conn.execute(
+        "INSERT INTO catalog_products VALUES ('pk','m1','shopify','ext_1',?,?,NULL)",
+        (system, cp),
+    )
+    if eps:
+        conn.execute(
+            "INSERT INTO external_product_seeds VALUES ('s1','ext_1',?,NULL,'active','2026-01-01')",
+            (eps,),
+        )
+    if epm:
+        conn.execute(
+            "INSERT INTO external_product_seeds VALUES ('s2','ext_2',?,'pk','active','2026-01-01')",
+            (epm,),
+        )
+    if ms:
+        conn.execute("INSERT INTO merchant_stores VALUES ('m1','shopify',?,1,'2026-01-01')", (ms,))
+    conn.execute(
+        "INSERT INTO catalog_source_quarantine VALUES (1,'domain',?,'active',NULL)", (match_value,)
+    )
+    sql = f"SELECT product_key FROM catalog_products cp WHERE 1=1 {_SOURCE_QUARANTINE_ANTI_JOIN}"
+    return not conn.execute(sql).fetchall()
+
+
+@pytest.mark.parametrize("label,cp,eps,epm,ms", CHAIN_SHAPES, ids=[s[0] for s in CHAIN_SHAPES])
+def test_the_assembler_anti_join_reads_the_WHOLE_domain_chain(label, cp, eps, epm, ms):
+    """Every source the trust layer reads, the anti-join must read too.
+
+    Each shape here was a live divergence before #1643: the trust layer blocked
+    and the anti-join did not, so a quarantined storefront kept the canonical
+    pick and shadowed the real merchant's PDP.
+    """
+    assert _catalog_chain_verdict(cp, eps, epm, ms) is True, (
+        f"[{label}] the assembler's anti-join is blind to this domain source"
+    )
+
+
+@pytest.mark.parametrize("label,cp,eps,epm,ms", CHAIN_SHAPES, ids=[s[0] for s in CHAIN_SHAPES])
+def test_the_assembler_anti_join_answers_the_other_way(label, cp, eps, epm, ms):
+    """A predicate that always blocks is not a gate."""
+    assert _catalog_chain_verdict(cp, eps, epm, ms, match_value="unrelated.com") is False, (
+        f"[{label}] row blocked by an unrelated quarantine"
+    )
+
+
+def test_cp_source_domain_wins_over_the_fallback_legs():
+    """A product's own domain must outrank a seed's.
+
+    Otherwise a shared seed drags an unrelated product into a quarantine — the
+    same precedence the trust policy uses.
+    """
+    assert _catalog_chain_verdict("beplain.com", "mintree.us", None, None) is False
+
+
+def test_the_assembler_and_reconciler_use_THE_SAME_expression():
+    """Two call sites, one rule. They diverged for months; pin them together."""
+    from jobs.agent_pdp_view_reconciler_cron import _truth_cte
+    from services.agent_pdp_view_assembler import _SOURCE_QUARANTINE_ANTI_JOIN
+    from services.source_quarantine import CATALOG_PRODUCT_DOMAIN_SQL
+
+    assert CATALOG_PRODUCT_DOMAIN_SQL in _SOURCE_QUARANTINE_ANTI_JOIN
+    assert CATALOG_PRODUCT_DOMAIN_SQL in _truth_cte()

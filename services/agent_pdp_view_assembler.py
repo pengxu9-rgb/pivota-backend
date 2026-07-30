@@ -26,7 +26,10 @@ from typing import Any, Dict, List, Optional, Tuple
 from db.database import database
 from services.catalog_identity import normalize_gtin
 from services.claim_safety import ensure_category_disclaimers
-from services.source_quarantine import build_quarantine_anti_join_sql
+from services.source_quarantine import (
+    CATALOG_PRODUCT_DOMAIN_SQL,
+    build_quarantine_anti_join_sql,
+)
 from services.title_normalization import normalize_display_title
 
 logger = logging.getLogger(__name__)
@@ -58,7 +61,11 @@ BACKFILL_REFRESH_SOURCE = "backfill_3a_ii"
 # store) from winning the canonical pick and shadowing the real merchant's
 # enriched PDP. Pure SQL with hardcoded column refs — no user input.
 _SOURCE_QUARANTINE_ANTI_JOIN = build_quarantine_anti_join_sql(
-    row_domain_expr="cp.source_domain",
+    # The FULL domain chain, not cp.source_domain alone — see #1643 and the
+    # comment on CATALOG_PRODUCT_DOMAIN_SQL. 4,007 of 14,124 prod rows have a
+    # NULL source_domain; on those this predicate was blind to the quarantine
+    # while the trust layer was not.
+    row_domain_expr=CATALOG_PRODUCT_DOMAIN_SQL,
     row_merchant_expr="cp.merchant_id",
     row_platform_expr="cp.platform",
     row_source_system_expr="cp.source_system",

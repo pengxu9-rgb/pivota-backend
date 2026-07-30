@@ -242,7 +242,7 @@ _SELECT_BY_PRODUCT_KEYS_SQL = (
 _SELECT_BY_QUARANTINE_DOMAIN_SQL = (
     _PRODUCT_JOIN_CTES
     + _PRODUCT_JOIN_SELECT
-    + f"""  WHERE {sql_bare_domain("coalesce(cp.source_domain, eps.domain, epm.domain, ms.domain, '')")}
+    + f"""  WHERE {sql_bare_domain("coalesce(nullif(cp.source_domain, ''), nullif(eps.domain, ''), nullif(epm.domain, ''), nullif(ms.domain, ''), '')")}
         = {sql_bare_domain(":match_value")}
   ORDER BY cp.product_key
   LIMIT :limit
