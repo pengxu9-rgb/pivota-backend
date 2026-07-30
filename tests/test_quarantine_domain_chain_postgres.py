@@ -22,8 +22,9 @@ there and every fixture had ONE row per table — with one seed and one store
 there is no tie to break, so no ORDER BY leg is observable. This file exists to
 close both gaps: real Postgres, multi-row groups, differential assertion.
 
-Skipped without `PIVOTA_TEST_PG_URL`. That makes it invisible in CI, which is a
-real limitation and the reason the shared-constant design in
+Runs in the `Postgres Dialect Gate` workflow, which supplies DATABASE_URL and
+asserts this module executed at least one test — so it cannot silently skip.
+The shared-constant design in
 `services/source_quarantine` matters more than this test does: the constants
 make divergence impossible to express, and this proves the constants are wired.
 """
@@ -35,18 +36,38 @@ from datetime import datetime, timezone
 
 import pytest
 
-pytestmark = pytest.mark.asyncio
+# DATABASE_URL, matching every sibling `*_postgres.py` gate file — NOT a
+# bespoke env var. The "Postgres Dialect Gate" workflow auto-discovers these
+# modules and supplies DATABASE_URL, then asserts each discovered module
+# actually EXECUTED something. A first version of this file gated on
+# PIVOTA_TEST_PG_URL, so all 16 tests skipped inside the one job designed to
+# run them and the gate failed with "green while testing nothing" — which is
+# precisely the failure this file exists to catch, turned on the file itself.
+DATABASE_URL = (os.getenv("DATABASE_URL") or "").strip()
+_IS_PG = DATABASE_URL.startswith("postgresql://") or DATABASE_URL.startswith("postgres://")
 
-PG_URL = os.getenv("PIVOTA_TEST_PG_URL")
-pytest_skip = pytest.mark.skipif(
-    not PG_URL,
-    reason="set PIVOTA_TEST_PG_URL to a Postgres URL to run the chain differential",
-)
+pytestmark = [
+    pytest.mark.asyncio,
+    pytest.mark.skipif(
+        not _IS_PG,
+        reason="needs a Postgres DATABASE_URL — production-dialect gate",
+    ),
+]
 
+PG_URL = DATABASE_URL
+
+# ISOLATED IN ITS OWN POSTGRES SCHEMA.
+#
+# The dialect gate runs every `*_postgres.py` module in ONE pytest invocation
+# against ONE database, and five sibling gate files also use `catalog_products`.
+# Dropping it in the public schema would destroy their fixtures depending on
+# collection order — a cross-test failure that would look like a flake and be
+# blamed on them. `search_path` is per-connection, so this is airtight without
+# coordinating with any other file.
 SCHEMA = """
-DROP TABLE IF EXISTS catalog_products, external_product_seeds, merchant_stores,
-                     pdp_identity_listing, pdp_identity_override,
-                     catalog_source_quarantine CASCADE;
+DROP SCHEMA IF EXISTS quarantine_chain_test CASCADE;
+CREATE SCHEMA quarantine_chain_test;
+SET search_path TO quarantine_chain_test;
 CREATE TABLE catalog_products (
   product_key text PRIMARY KEY, content_key text, merchant_id text, platform text,
   source_product_id text, source_system text, source_domain text, source_ref text);
@@ -204,7 +225,6 @@ async def _cte_domain(conn) -> str | None:
     return await conn.fetchval(sql)
 
 
-@pytest_skip
 @pytest.mark.parametrize("label", sorted(SHAPES))
 async def test_both_chains_resolve_the_same_domain(label):
     """The differential. This is the assertion that would have caught #1644's
@@ -214,6 +234,7 @@ async def test_both_chains_resolve_the_same_domain(label):
     conn = await asyncpg.connect(PG_URL)
     try:
         await conn.execute(SCHEMA)
+        await conn.execute("SET search_path TO quarantine_chain_test")
         shape = SHAPES[label]
         await _load(conn, shape)
         lateral = await _lateral_domain(conn)
@@ -230,7 +251,6 @@ async def test_both_chains_resolve_the_same_domain(label):
         await conn.close()
 
 
-@pytest_skip
 @pytest.mark.parametrize("label", sorted(SHAPES))
 async def test_the_anti_join_blocks_exactly_the_resolved_domain(label):
     """End-to-end: quarantine the resolved domain and the row must disappear;
@@ -243,6 +263,7 @@ async def test_the_anti_join_blocks_exactly_the_resolved_domain(label):
     conn = await asyncpg.connect(PG_URL)
     try:
         await conn.execute(SCHEMA)
+        await conn.execute("SET search_path TO quarantine_chain_test")
         shape = SHAPES[label]
         await _load(conn, shape)
         sql = (
