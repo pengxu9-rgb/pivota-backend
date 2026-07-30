@@ -49,6 +49,13 @@ on:
       # touches nothing else, so without this it would sail past every path filter.
       - ".github/workflows/**"
 
+# Superseded PR pushes cancel the run for the commit they replaced. Dispatch
+# runs fall through to run_id — a group of one — so manual validation runs are
+# never cancelled or queued against each other.
+concurrency:
+  group: agent-reliability-suite-${{ github.event.pull_request.number || github.run_id }}
+  cancel-in-progress: true
+
 jobs:
   quick-reliability:
     if: ${{ github.event_name != 'workflow_dispatch' || !inputs.run_shopify_discount_validation }}

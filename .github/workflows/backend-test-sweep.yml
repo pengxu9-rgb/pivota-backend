@@ -62,6 +62,13 @@ on:
     branches: [main]
   workflow_dispatch:
 
+# Superseded PR pushes cancel the sweep for the commit they replaced. Non-PR
+# events fall through to run_id — a group of one — so push-to-main and dispatch
+# runs are never cancelled or queued: every main commit keeps its own result.
+concurrency:
+  group: backend-test-sweep-${{ github.event.pull_request.number || github.run_id }}
+  cancel-in-progress: true
+
 jobs:
   sweep:
     runs-on: ubuntu-latest
