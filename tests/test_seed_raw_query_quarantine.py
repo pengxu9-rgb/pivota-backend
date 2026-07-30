@@ -19,7 +19,7 @@ EXECUTE it against SQLite. Delete the clause from any site and the rendered
 string changes, so the corresponding test fails.
 
 The predicate is portable by design, which is the only reason this works — see
-services/source_quarantine._sql_bare_domain.
+services/source_quarantine.sql_bare_domain.
 """
 
 from __future__ import annotations

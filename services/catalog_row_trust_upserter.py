@@ -35,6 +35,7 @@ from datetime import datetime, timezone
 from typing import Any, Iterable, Mapping, Optional, Sequence
 
 from services.catalog_trust_policy import derive_trust
+from services.source_quarantine import sql_bare_domain
 from services.pdp_renderability import (
     pdp_route_resolvable,
     seed_route_resolves_sql,
@@ -228,14 +229,21 @@ _SELECT_BY_PRODUCT_KEYS_SQL = (
 )
 
 
+# Both sides through `sql_bare_domain` (lowercase + `www.` strip + empty-as-NULL),
+# the SAME helper the anti-join and the Python matcher use. A bare `lower()` on
+# each side made this lookup disagree with them — see #1639: a `www.mintree.us`
+# quarantine, which `create_quarantine` accepts verbatim, was honoured by the
+# anti-join and missed here, so the rows were excluded from serving while
+# `serving_decision` was never recomputed.
+#
+# `empty-as-NULL` matters as much as the strip: without it a blank `match_value`
+# would select every product whose domain sources are all NULL, and this query
+# feeds a trust WRITE.
 _SELECT_BY_QUARANTINE_DOMAIN_SQL = (
     _PRODUCT_JOIN_CTES
     + _PRODUCT_JOIN_SELECT
-    + """  WHERE lower(coalesce(cp.source_domain,
-                            eps.domain,
-                            epm.domain,
-                            ms.domain,
-                            '')) = lower(:match_value)
+    + f"""  WHERE {sql_bare_domain("coalesce(cp.source_domain, eps.domain, epm.domain, ms.domain, '')")}
+        = {sql_bare_domain(":match_value")}
   ORDER BY cp.product_key
   LIMIT :limit
 """

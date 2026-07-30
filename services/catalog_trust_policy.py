@@ -58,6 +58,7 @@ from typing import Any, Iterable, Mapping, Optional
 # The rig denylist. Imported rather than inlined: a copy here would be a FIFTH
 # copy of the list, and a rig excluded everywhere but here is exactly the bug
 # the gate closes. test_merchant_policy imports only stdlib, so no cycle.
+from services.source_quarantine import bare_domain
 from services.test_merchant_policy import KNOWN_TEST_MERCHANT_IDS
 
 # Worked example 2 — the test-merchant gate, 2026-07-27. It adds a NEW arm to
@@ -441,12 +442,19 @@ def _is_quarantined(
         return False
     now_ms = now.timestamp() * 1000.0
 
-    domain = str(
+    # Normalised through the SAME helper the SQL anti-join and the Python
+    # matcher use (lowercase + `www.` strip). A bare `.lower()` here made this
+    # comparator disagree with them: a `www.mintree.us` quarantine — which
+    # `create_quarantine` accepts verbatim — excluded the row from
+    # `fetch_products_for_key` while THIS check returned False, so
+    # `serving_decision` stayed `public` and the URL stayed in the sitemap.
+    # Sitemap advertises a PDP with no view row. See #1639.
+    domain = bare_domain(
         _get(product, "source_domain")
         or _get(external_seed, "domain")
         or _get(merchant_store, "domain")
         or ""
-    ).lower()
+    )
     merchant_id = _get(product, "merchant_id") or _get(merchant_store, "merchant_id")
     platform = _get(product, "platform") or _get(merchant_store, "platform")
     source_system = _get(product, "source_system")
@@ -467,7 +475,8 @@ def _is_quarantined(
             continue
 
         if match_type == "domain" and domain:
-            if str(match_value).lower() == domain:
+            # Both sides through the shared normaliser, not just the row.
+            if bare_domain(match_value) == domain:
                 return True
         elif match_type == "merchant_platform" and merchant_id and platform:
             if match_value == f"{merchant_id}:{platform}":
