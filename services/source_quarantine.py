@@ -120,12 +120,29 @@ def build_quarantine_anti_join_sql(
     )
 
     # UNCORRELATED, one arm per match type. The previous form was a single
-    # correlated `NOT EXISTS` whose subquery referenced the outer row, so
-    # Postgres planned it as a Nested Loop Anti Join with a Materialize node
-    # rescanned PER OUTER ROW: 68.1 ms vs 17.8 ms on a prod-shaped corpus, with
-    # `Rows Removed by Join Filter: 172,656`. Nothing about the 16-row table
-    # justified that; the planner chose it because the caller's `LIKE '%…%'`
-    # OR-chain estimates 3 rows against an actual 11,003.
+    # correlated `NOT EXISTS` whose subquery referenced the outer row.
+    #
+    # WHERE THE WIN ACTUALLY IS — measured on PG 15, and NOT where the first
+    # version of this comment claimed. It is not the seed seam. At that call
+    # site four of the five row expressions are literal NULL, so Postgres folds
+    # the merchant/source arms away and the legacy form reduced to one hashable
+    # equality — it planned as a Hash Anti Join, not a rescan. On that shape the
+    # rewrite is a small REGRESSION (~1–1.4 ms absolute, +17% to +47%), against
+    # an 800 ms statement timeout.
+    #
+    # The win is on the `catalog_products` consumers, where all three arms are
+    # live columns and the OR-chain is not hashable:
+    #
+    #   agent_pdp_view_reconciler truth CTE (60k rows, GROUP BY)  265 ms -> 42 ms
+    #   agent_pdp_view_assembler (selective content_key, 4 rows)   0.042 -> 0.041 ms
+    #
+    # And it removes a scaling landmine: at 2,000 quarantine rows the legacy
+    # reconciler query took 42.5 SECONDS versus 37 ms here; at 50,000 it ran past
+    # eleven minutes. Prod has 16 rows today, so that is headroom, not a fix.
+    #
+    # Recorded precisely because the seam regression is real and small: someone
+    # measuring only the seam will conclude this rewrite was a mistake and undo
+    # it, reintroducing the reconciler cliff.
     #
     # Splitting into three subqueries that reference NO outer column lets each
     # be evaluated once and hashed. `NOT (A OR B OR C)` ≡ `NOT A AND NOT B AND

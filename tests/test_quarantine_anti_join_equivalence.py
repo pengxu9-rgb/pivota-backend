@@ -1,8 +1,11 @@
 """The uncorrelated anti-join must be EXACTLY equivalent to the correlated one.
 
 #1638 replaced a single correlated `NOT EXISTS` with three uncorrelated
-`NOT IN` arms, because Postgres planned the former as a Nested Loop Anti Join
-rescanned per outer row (68.1 ms vs 17.8 ms on a prod-shaped corpus).
+`NOT IN` arms. The win is on the `catalog_products` consumers (reconciler truth
+CTE 265 ms -> 42 ms, and 42.5 SECONDS -> 37 ms at 2,000 quarantine rows); on the
+seed seam it is a small regression. See services/source_quarantine for the
+measurements — the point here is that the rewrite must be behaviour-preserving
+either way.
 
 `NOT (A OR B OR C)` ≡ `NOT A AND NOT B AND NOT C` is trivially true in logic and
 NOT trivially true in SQL, because `NOT IN` is NULL-propagating in a way
@@ -97,6 +100,18 @@ QUARANTINE_CASES = {
     "domain_expired": [(1, "domain", "mintree.us", "active", "2000-01-01 00:00:00")],
     "domain_future": [(1, "domain", "mintree.us", "active", "2999-01-01 00:00:00")],
     "merchant": [(1, "merchant_platform", "m1:shopify", "active", None)],
+    # Liveness on the NON-domain arms. Without these, `state`/`expires_at` are
+    # tested only on the domain arm and four mutants survive: dropping either
+    # condition from the merchant_platform or source_system_ref arm leaves all
+    # 82 tests green. Failure that would ship: a merchant_platform quarantine
+    # with a 7-day expiry keeps blocking forever, and `revoke_quarantine`
+    # returns success while the SQL gate still excludes the rows.
+    "merchant_revoked": [(1, "merchant_platform", "m1:shopify", "revoked", None)],
+    "merchant_expired": [(1, "merchant_platform", "m1:shopify", "active", "2000-01-01 00:00:00")],
+    "merchant_future": [(1, "merchant_platform", "m1:shopify", "active", "2999-01-01 00:00:00")],
+    "source_revoked": [(1, "source_system_ref", "sys:ref", "revoked", None)],
+    "source_expired": [(1, "source_system_ref", "sys:ref", "active", "2000-01-01 00:00:00")],
+    "source_future": [(1, "source_system_ref", "sys:ref", "active", "2999-01-01 00:00:00")],
     "merchant_blank": [(1, "merchant_platform", "", "active", None)],
     "source": [(1, "source_system_ref", "sys:ref", "active", None)],
     "source_blank": [(1, "source_system_ref", "", "active", None)],
