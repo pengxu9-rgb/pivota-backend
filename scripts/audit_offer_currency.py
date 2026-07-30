@@ -13,6 +13,17 @@ offending domains through the standard reversible source-quarantine path, and �
 scripts/manage_source_quarantine.py — requires an explicit --confirm token because a
 domain quarantine suppresses that domain's entire inventory from serving.
 
+Besides the per-domain currency check, the report ends with an OBSERVE-ONLY
+implausible-price list (USD-stamped offers >= --price-alert). It exists because
+the currency check is structurally blind to one class: a Shopify-Markets store
+whose /meta.json base currency IS 'USD' but whose crawled price carries another
+currency's magnitude — the confirmed member being Oiad's ₩400,000 crawled as
+$400,000 (oiad.us, KR store, base currency genuinely USD). When the label and
+the base currency agree, price magnitude is the only remaining smoke. The list
+never feeds --apply; per the standing lesson, price is a detector, not a
+decision basis — a human verifies each row against the storefront (quadthera.us
+$1,200 proved genuine the same day Oiad proved fake).
+
   DATABASE_URL=... python -m scripts.audit_offer_currency
   DATABASE_URL=... python -m scripts.audit_offer_currency \
       --apply --confirm AUDIT_OFFER_CURRENCY_QUARANTINE --created-by you@x [--max-quarantine 30]
@@ -61,6 +72,25 @@ _DOMAINS_SQL = """
     GROUP BY domain
     HAVING sum(offers) >= :min_offers
     ORDER BY sum(offers) DESC
+"""
+
+# Observe-only price-magnitude list. Deliberately NOT restricted to the
+# suppressed_at IS NULL scope of the domain scan: a row suppressed FOR a price
+# defect must stay visible to price tooling (the 2026-07-27 backfill lesson),
+# so the split is reported instead. trim() not btrim() — the SQL-standard form
+# runs on both Postgres and the SQLite suite (#1568's inverse-trap lesson).
+# LIMIT bounds a pathological fleet; the print caps at 20 rows anyway.
+_PRICE_ALERT_SQL = """
+    SELECT o.offer_id,
+           o.source_domain AS domain,
+           o.list_price,
+           (o.suppressed_at IS NOT NULL) AS is_suppressed
+    FROM catalog_offers o
+    WHERE upper(trim(coalesce(o.currency, ''))) = 'USD'
+      AND o.list_price >= :price_alert
+      AND coalesce(o.source_domain, '') <> ''
+    ORDER BY o.list_price DESC, o.offer_id
+    LIMIT 200
 """
 
 
@@ -116,6 +146,27 @@ async def _run(args: argparse.Namespace) -> int:
         for w in wholesale:
             print(f"  {w['domain'][:34]:34} offers={w['offers']:>4} max={w['max_price']:.0f}")
 
+        # Observe-only: catches the Markets-store class the currency check is
+        # blind to (label == base currency, magnitude from another currency).
+        # Never joins `offenders` — a big number is a review signal, not proof.
+        if args.price_alert > 0:
+            def _price(r: Dict[str, Any]) -> float:
+                try:
+                    return float(r.get("list_price") or 0)
+                except (TypeError, ValueError):
+                    return 0.0
+
+            alerts = [dict(r) for r in await database.fetch_all(
+                _PRICE_ALERT_SQL, {"price_alert": args.price_alert})]
+            print(f"\n=== IMPLAUSIBLE-PRICE REVIEW LIST: {len(alerts)} USD-stamped "
+                  f"rows >= {args.price_alert:.0f} (observe-only) ===")
+            for r in alerts[:20]:
+                print(f"  {str(r.get('domain') or '?')[:30]:30} {_price(r):>12.2f} USD "
+                      f"{'suppressed' if r.get('is_suppressed') else 'live':>10} "
+                      f"offer={r.get('offer_id')}")
+            if len(alerts) > 20:
+                print(f"  ... and {len(alerts) - 20} more (raise --price-alert to narrow)")
+
         offenders = mismatches + wholesale
         if not offenders:
             print("\nno defects found.")
@@ -157,6 +208,10 @@ def main(argv=None) -> int:
     p = argparse.ArgumentParser(description="Audit offer currency vs the real storefront.")
     p.add_argument("--min-offers", type=int, default=5)
     p.add_argument("--concurrency", type=int, default=8)
+    p.add_argument("--price-alert", type=float, default=1000.0,
+                   help="observe-only: list USD-stamped offers priced >= this "
+                        "(magnitude smoke for Markets stores whose base currency "
+                        "matches the stamp; 0 disables)")
     p.add_argument("--created-by", default="audit_offer_currency")
     p.add_argument("--apply", action="store_true", help="quarantine offending domains")
     p.add_argument("--confirm", default="", help=f"required with --apply: {CONFIRM_TOKEN}")
