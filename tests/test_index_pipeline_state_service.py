@@ -87,6 +87,7 @@ async def _ensure_schema() -> None:
             product_key TEXT,
             merchant_id TEXT,
             list_price REAL,
+            merchant_effective_price REAL,
             currency TEXT DEFAULT 'USD',
             suppressed_at TIMESTAMP
         )
@@ -153,6 +154,13 @@ async def _ensure_schema() -> None:
     if "currency" not in {dict(row).get("name") for row in offer_columns}:
         await database.execute(
             "ALTER TABLE catalog_offers ADD COLUMN currency TEXT DEFAULT 'USD'"
+        )
+    # services/priced_offer_sql coalesces merchant_effective_price over
+    # list_price; backstop for test DBs created before the column existed
+    # (mirrors the suppressed_at backstop above).
+    if "merchant_effective_price" not in {dict(row).get("name") for row in offer_columns}:
+        await database.execute(
+            "ALTER TABLE catalog_offers ADD COLUMN merchant_effective_price REAL"
         )
     # Row suppression: backstop for test DBs created before
     # catalog_products.suppressed_at existed (mirrors the offer backstop above).

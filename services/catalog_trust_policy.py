@@ -70,7 +70,20 @@ from services.test_merchant_policy import KNOWN_TEST_MERCHANT_IDS
 # split-brain window for a change no row can currently observe. The version
 # bumps the day a rig row would actually reach 'public', not the day the
 # backstop is installed.
-POLICY_VERSION = "c1.v0.5"
+# Worked example 3 — the per-row price gate, 2026-07-31. This one DOES bump,
+# and the contrast with the two examples above is the whole point of keeping
+# them. P3 and the test-merchant gate were byte-identical on every row (a
+# default-OFF flag; an arm no row could reach), so a bump would have bought
+# forensics at the price of a 14k-row rewrite. OFFER_PRICE_MISSING flips 4 real
+# decisions from 'public' to 'blocked' — rows CAN observe it, which is exactly
+# the condition the rule names. "The version bumps the day the GATE flips."
+#
+# 🚨 SHIP THE TWO REPOS BACK TO BACK. The bump re-opens the split-brain window
+# against PIVOTA-Agent (deployed at c1.v0.5, measured on 14,124 prod trust rows
+# 2026-07-31), and that twin also needs the OFFER_PRICE_MISSING mirror itself —
+# both halves belong in one merge pair, exactly as P3 did for the seed-route
+# predicate.
+POLICY_VERSION = "c1.v0.6"
 
 # ---- Reason codes (authoritative vocabulary) -------------------------------
 #
@@ -108,6 +121,46 @@ POLICY_VERSION = "c1.v0.5"
 #   EXTERNAL_SEED_INACTIVE           — external_product_seeds.status != 'active'.
 #   MERCHANT_STORE_INACTIVE          — merchant_stores.status != 'active'.
 #   INDEX_NOT_SERVING_ELIGIBLE       — index_pipeline_state.serving_eligible=false.
+#   OFFER_PRICE_MISSING              — 2026-07-31. THIS product_key carries no
+#     unsuppressed catalog_offers row with a price > 0 (services/priced_offer_sql).
+#     Evaluated right after the index gate, so a row already blocked upstream
+#     keeps its real reason and only a row that would otherwise reach
+#     public/shadow is reclassified.
+#
+#     WHY IT CANNOT BE READ OFF ips.serving_eligible, which is the obvious
+#     objection: index_pipeline_state is keyed by CONTENT_KEY (migration 098) and
+#     the upserters join it `ips.content_key = cp.content_key`, but trust is
+#     keyed by PRODUCT_KEY and every product_key mints its own
+#     pivota_signature_id — its own public PDP. index_pipeline_state_service's
+#     `has_price` is per-row and always was correct; _select_content_key_state
+#     then stores the BEST row's state for the whole content_key, so a
+#     price-less row sharing a content_key with a priced sibling inherits
+#     serving_eligible=true and publishes a price-less page. Measured on prod
+#     2026-07-31: 4 Tom Ford fragrance PDPs, each with exactly one unsuppressed
+#     offer whose list_price, merchant_effective_price and estimated_best_price
+#     were ALL NULL, sitting at trust 'public' behind a priced
+#     tomfordbeauty.com sibling. This gate asks the price question of the row it
+#     is actually deciding.
+#
+#     TRI-STATE, like PDP_ROUTE_UNRESOLVABLE: only an explicit False blocks. A
+#     producer that does not compute `row_has_priced_offer` is byte-identical to
+#     c1.v0.5.
+#
+#     Blast radius measured on prod 2026-07-31, the whole reason it is NOT
+#     env-gated: EXACTLY 4 rows move, public 'public'->'blocked'. 2,535 rows
+#     also lack a priced offer of their own and every one of them is ALREADY
+#     'blocked' by an upstream gate, so their decision and reason codes do not
+#     change. Re-measure before shipping; the number is only as current as the
+#     last sweep.
+#
+#     ⚠️ SAME TWIN-SYMMETRY RULE AS THE RENDERABLE GATE BELOW. PIVOTA-Agent
+#     (src/services/catalogTrustPolicy.js + catalogRowTrustUpserter.js) writes
+#     this same table and does NOT compute this input yet, so it re-derives
+#     those 4 rows 'public' on its next identity event for them. This repo's 6h
+#     cron re-asserts 'blocked', so steady state is correct and
+#     `public_without_priced_offer` catches any regression — but the twin must
+#     land the mirror (select the column, add the gate) to close the window.
+#     The 4 rows carry live pdp_identity_listing rows, so the window is real.
 #   PUBLISH_STATE_NOT_PUBLIC         — catalog_products.publish_state != 'public'.
 #   IDENTITY_CONFLICT                — identity_status='conflict'.
 #   OFFER_SUPPRESSED                 — subject_type='offer' with offer.suppression_reason set.
@@ -161,6 +214,7 @@ class _ReasonCodes:
     OFFER_SUPPRESSED = "OFFER_SUPPRESSED"
     PDP_ROUTE_UNRESOLVABLE = "PDP_ROUTE_UNRESOLVABLE"
     TEST_MERCHANT_EXCLUDED = "TEST_MERCHANT_EXCLUDED"
+    OFFER_PRICE_MISSING = "OFFER_PRICE_MISSING"
 
 
 REASON_CODES = _ReasonCodes()
@@ -289,6 +343,11 @@ def derive_trust(inputs: Mapping[str, Any]) -> dict[str, Any]:
     pdp_route_resolvable = (
         None if raw_route_resolvable is None else bool(raw_route_resolvable)
     )
+    # Same tri-state contract. True = this product_key has its own unsuppressed
+    # priced offer, False = it does not, None/absent = not computed and the
+    # OFFER_PRICE_MISSING gate stays silent.
+    raw_row_priced = inputs.get("row_has_priced_offer")
+    row_has_priced_offer = None if raw_row_priced is None else bool(raw_row_priced)
     raw_quarantines = inputs.get("active_quarantines") or []
     active_quarantines = list(raw_quarantines) if isinstance(raw_quarantines, Iterable) else []
 
@@ -326,6 +385,7 @@ def derive_trust(inputs: Mapping[str, Any]) -> dict[str, Any]:
         source_lifecycle=source_lifecycle,
         identity_decision=identity_decision,
         pdp_route_resolvable=pdp_route_resolvable,
+        row_has_priced_offer=row_has_priced_offer,
         reasons=reasons,
     )
 
@@ -654,6 +714,7 @@ def _derive_serving_decision(
     source_lifecycle: Mapping[str, Any],
     identity_decision: Mapping[str, Any],
     pdp_route_resolvable: Optional[bool] = None,
+    row_has_priced_offer: Optional[bool] = None,
     reasons: list[str],
 ) -> dict[str, Any]:
     # Offer-specific block: suppressed offers never surface.
@@ -741,6 +802,21 @@ def _derive_serving_decision(
         sync_status = str(_get(product, "sync_status") or "").lower()
         if sync_status and sync_status != "live":
             reasons.append(REASON_CODES.PUBLISH_STATE_NOT_PUBLIC)
+            return {"decision": "blocked"}
+
+        # PER-ROW price gate. Immediately after the index gate on purpose: the
+        # index gate answers for the CONTENT_KEY, this one answers for the
+        # PRODUCT_KEY being decided, and a row that fails the coarse gate must
+        # keep reporting INDEX_NOT_SERVING_ELIGIBLE rather than being relabelled.
+        # See the OFFER_PRICE_MISSING entry in the reason-code vocabulary above
+        # for the grain argument, the measured 4-row blast radius, and the
+        # PIVOTA-Agent mirror this still needs.
+        #
+        # Tri-state: only an explicit False blocks. `is False` and not
+        # `not row_has_priced_offer` — the difference IS the contract, since
+        # None must fall through untouched.
+        if row_has_priced_offer is False:
+            reasons.append(REASON_CODES.OFFER_PRICE_MISSING)
             return {"decision": "blocked"}
 
     # Test/demo merchant gate. Placed here for the same reason as the

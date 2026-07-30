@@ -19,6 +19,7 @@ from sqlalchemy import Boolean, String, and_, column, func, not_, select, table
 
 from db.catalog import catalog_products
 from services.pdp_renderability import compile_pg, pdp_renderable_expression
+from services.priced_offer_sql import priced_offer_exists_sql
 
 logger = logging.getLogger(__name__)
 
@@ -223,30 +224,38 @@ _CHECKS: List[Dict[str, Any]] = [
     },
     {
         "name": "public_without_priced_offer",
-        "description": "trust says public but no catalog_offers row with list_price > 0",
+        "description": (
+            "trust says public but the row carries no unsuppressed, priced "
+            "catalog_offers row of its own"
+        ),
         "env": "CATALOG_INVARIANT_NO_OFFER_THRESHOLD",
         "default_threshold": 0,
-        "count_sql": """
+        # The predicate comes from services/priced_offer_sql so this check, the
+        # `has_price` signal, and the trust policy's OFFER_PRICE_MISSING gate
+        # cannot drift. It used to be spelled here by hand as a bare
+        # `co.list_price > 0` with NO suppression conjunct — laxer than
+        # `has_price`, which has always required `suppressed_at IS NULL`. The two
+        # agreed on prod by luck, not by construction. Re-measured on prod
+        # 2026-07-31 the day the shared predicate landed: same 4 rows either way.
+        #
+        # NOTE THE GRAIN, it is the whole point of this check: `crt.subject_key`
+        # is a PRODUCT_KEY, and the offer must belong to THAT row. A sibling row
+        # sharing the content_key does not make this row priced — each
+        # product_key mints its own pivota_signature_id and therefore its own
+        # public PDP, so a price-less row publishes a price-less page.
+        "count_sql": f"""
             SELECT count(*) AS c
             FROM catalog_row_trust crt
             WHERE crt.subject_type = 'product'
               AND crt.serving_decision = 'public'
-              AND NOT EXISTS (
-                  SELECT 1 FROM catalog_offers co
-                  WHERE co.product_key = crt.subject_key
-                    AND co.list_price > 0
-              )
+              AND NOT {priced_offer_exists_sql("crt.subject_key")}
         """,
-        "sample_sql": """
+        "sample_sql": f"""
             SELECT crt.subject_key
             FROM catalog_row_trust crt
             WHERE crt.subject_type = 'product'
               AND crt.serving_decision = 'public'
-              AND NOT EXISTS (
-                  SELECT 1 FROM catalog_offers co
-                  WHERE co.product_key = crt.subject_key
-                    AND co.list_price > 0
-              )
+              AND NOT {priced_offer_exists_sql("crt.subject_key")}
             LIMIT 5
         """,
     },
