@@ -56,7 +56,10 @@ from scripts.source_pdp_content_repair import (  # noqa: E402
     _write_quality_snapshot,
     clean_description,
 )
-from services.beauty_enrichment import enrich_beauty_record  # noqa: E402
+from scripts.source_pdp_content_repair import _write_if_requested  # noqa: E402
+from services.beauty_enrichment import enrich_beauty_record, parse_inci  # noqa: E402
+from services.beauty_enrichment_persist import _FILLER_ACTIVE_LABELS  # noqa: E402
+from services.crawled_inci_ingest import _looks_like_inci  # noqa: E402
 
 SOURCE_SYSTEM = "tier_g_kb_description_v1"
 
@@ -65,6 +68,9 @@ SOURCE_SYSTEM = "tier_g_kb_description_v1"
 # COMPOSE_MIN_LENGTH is too thin to move the row and is refused, honestly.
 COMPOSE_MIN_LENGTH = 120
 MIN_INCI_TOKENS = 3
+# Parity with the sibling lane's MAX_DESCRIPTION_LENGTH: a pathological INCI
+# blob must not mint an unbounded description.
+COMPOSE_MAX_LENGTH = 1500
 
 # Same cohort spine as source_pdp_content_repair's FETCH, narrowed to rows
 # that carry INCI. canonical_url is NOT required — nothing is crawled.
@@ -91,6 +97,10 @@ WITH canonical_product AS (
       ) AS rn
     FROM catalog_products cp
     WHERE cp.suppressed_at IS NULL AND cp.suppression_reason IS NULL
+      -- UPDATE_DESCRIPTION_SQL guards on sync_status='live'; electing a
+      -- non-live canonical here would report description_written=false with
+      -- no reason while the writable live sibling is never attempted.
+      AND cp.sync_status = 'live'
   ) ranked
   WHERE rn = 1
 )
@@ -128,8 +138,8 @@ LIMIT :limit
 """
 
 
-def compose_description(row: Dict[str, Any]) -> Optional[Dict[str, Any]]:
-    """Deterministic identity-grounded composition; None when too thin.
+def compose_description(row: Dict[str, Any]) -> Dict[str, Any]:
+    """Deterministic identity-grounded composition; {"refused": reason} when unsafe/thin.
 
     Every fragment traces to a catalog field. The ONLY claim grade emitted is
     ingredient identity ("formulated with X") — efficacy language is out of
@@ -138,15 +148,29 @@ def compose_description(row: Dict[str, Any]) -> Optional[Dict[str, Any]]:
     """
     title = clean_description(row.get("title"))
     raw_inci = clean_description(row.get("raw_inci"))
-    inci_tokens = [t.strip() for t in raw_inci.split(",") if t.strip()]
-    if not title or len(inci_tokens) < MIN_INCI_TOKENS:
-        return None
+    if not title:
+        return {"refused": "missing_title"}
+    # THE claim-safety gate (review-blocking finding on the first cut): the
+    # merchant-sync lane writes beauty_sku_ingredients.raw_inci with NO
+    # validation, so a marketing block stamped as "ingredients" would flow
+    # verbatim into agent-facing prose. Reuse the repo's shared detector and
+    # canonical parser — never a naive split.
+    if not _looks_like_inci(raw_inci):
+        return {"refused": "not_inci_like"}
+    inci_tokens = parse_inci(raw_inci)
+    if len(inci_tokens) < MIN_INCI_TOKENS:
+        return {"refused": "too_few_inci_tokens"}
 
     brand = clean_description(row.get("brand"))
     product_type = clean_description(row.get("product_type")) or clean_description(row.get("category"))
 
+    # category_kind deliberately None: catalog_products.category is NOT a
+    # category_kind (resolve_category_kind owns that mapping), and only
+    # `active_ingredients` is consumed here — extract_key_actives is
+    # category-independent. Passing the raw category would silently no-op the
+    # concern/format branches for most rows and trap a future reader.
     enriched = enrich_beauty_record(
-        row.get("category"),
+        None,
         title=row.get("title"),
         description=row.get("cp_description"),
         raw_inci=raw_inci,
@@ -158,7 +182,12 @@ def compose_description(row: Dict[str, Any]) -> Optional[Dict[str, Any]]:
     active_labels = [
         str(a.get("label") or "").strip()
         for a in (enriched.get("active_ingredients") or [])
-        if isinstance(a, dict) and a.get("source") == "inci" and str(a.get("label") or "").strip()
+        if isinstance(a, dict)
+        and a.get("source") == "inci"
+        and str(a.get("label") or "").strip()
+        # Same filler exclusion as _inci_substantiated_claims: Glycerin-only
+        # must not read as a formulated-with signal.
+        and str(a.get("label") or "").strip() not in _FILLER_ACTIVE_LABELS
     ]
 
     parts: List[str] = []
@@ -174,11 +203,18 @@ def compose_description(row: Dict[str, Any]) -> Optional[Dict[str, Any]]:
 
     description = " ".join(parts)
     if len(description) < COMPOSE_MIN_LENGTH:
-        return None
+        return {"refused": "too_thin_to_compose"}
+    if len(description) > COMPOSE_MAX_LENGTH:
+        description = description[:COMPOSE_MAX_LENGTH].rsplit(",", 1)[0] + "."
     return {"description": description, "active_labels": active_labels, "inci_token_count": len(inci_tokens)}
 
 
 async def apply_row(row: Dict[str, Any], composed: Dict[str, Any]) -> Dict[str, Any]:
+    # KNOWN WART: UPDATE_DESCRIPTION_SQL files this metadata under the crawl
+    # lane's payload key ('public_source_pdp_content_repair'). The
+    # source_system field inside disambiguates the lane; parameterizing the
+    # jsonb path in the SHARED SQL is deliberately out of scope here — change
+    # both lanes together if a consumer ever needs the split at the key level.
     metadata = {
         "source_system": SOURCE_SYSTEM,
         "source_kind": "inci_composition",
@@ -245,8 +281,9 @@ async def run(args: argparse.Namespace) -> Dict[str, Any]:
         apply_results: List[Dict[str, Any]] = []
         for row in rows:
             composed = compose_description(row)
-            if not composed:
-                refused["too_thin_to_compose"] = refused.get("too_thin_to_compose", 0) + 1
+            if composed.get("refused"):
+                reason = composed["refused"]
+                refused[reason] = refused.get(reason, 0) + 1
                 continue
             composed_n += 1
             if len(samples) < 10:
@@ -292,10 +329,7 @@ def _parse_args(argv: Optional[Iterable[str]] = None) -> argparse.Namespace:
 def main(argv: Optional[Iterable[str]] = None) -> None:
     args = _parse_args(argv)
     summary = asyncio.run(run(args))
-    if args.output_json:
-        Path(args.output_json).write_text(
-            json.dumps(summary, indent=2, ensure_ascii=False, default=_json_default)
-        )
+    _write_if_requested(args.output_json, summary)
     print(json.dumps(summary, indent=2, ensure_ascii=False, default=_json_default))
 
 
