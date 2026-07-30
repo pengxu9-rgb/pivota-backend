@@ -529,16 +529,21 @@ def _catalog_chain_verdict(cp, eps, epm, ms, match_value="mintree.us") -> bool:
     )
     conn.execute(
         "CREATE TABLE external_product_seeds (id TEXT, external_product_id TEXT, domain TEXT,"
-        " attached_product_key TEXT, status TEXT, updated_at TEXT)"
+        " attached_product_key TEXT, status TEXT, updated_at TEXT, created_at TEXT)"
     )
     conn.execute(
-        "CREATE TABLE merchant_stores (merchant_id TEXT, platform TEXT, domain TEXT,"
-        " is_primary INT, last_sync TEXT)"
+        "CREATE TABLE merchant_stores (store_id TEXT, merchant_id TEXT, platform TEXT, domain TEXT,"
+        " status TEXT, is_primary INT, last_sync TEXT, created_at TEXT)"
     )
     conn.execute(
         "CREATE TABLE catalog_source_quarantine (quarantine_id INTEGER, match_type TEXT,"
         " match_value TEXT, state TEXT, expires_at TEXT)"
     )
+    # The minted leg prefers an identity-carrying seed, so it references this
+    # table even when empty. Kept as a stub here; the ordering it drives is
+    # asserted on real Postgres in test_quarantine_domain_chain_postgres, where
+    # multi-row groups make the tie-break observable at all.
+    conn.execute("CREATE TABLE pdp_identity_listing (product_id TEXT, source_listing_ref TEXT)")
     # source_system decides WHICH seed leg applies, so pick it from the fixture.
     system = "catalog_enrichment_agent_v1" if epm else "external_product_seeds_mirror_v1"
     conn.execute(
@@ -547,16 +552,16 @@ def _catalog_chain_verdict(cp, eps, epm, ms, match_value="mintree.us") -> bool:
     )
     if eps:
         conn.execute(
-            "INSERT INTO external_product_seeds VALUES ('s1','ext_1',?,NULL,'active','2026-01-01')",
+            "INSERT INTO external_product_seeds VALUES ('s1','ext_1',?,NULL,'active','2026-01-01','2026-01-01')",
             (eps,),
         )
     if epm:
         conn.execute(
-            "INSERT INTO external_product_seeds VALUES ('s2','ext_2',?,'pk','active','2026-01-01')",
+            "INSERT INTO external_product_seeds VALUES ('s2','ext_2',?,'pk','active','2026-01-01','2026-01-01')",
             (epm,),
         )
     if ms:
-        conn.execute("INSERT INTO merchant_stores VALUES ('m1','shopify',?,1,'2026-01-01')", (ms,))
+        conn.execute("INSERT INTO merchant_stores VALUES ('st1','m1','shopify',?,'active',1,'2026-01-01','2026-01-01')", (ms,))
     conn.execute(
         "INSERT INTO catalog_source_quarantine VALUES (1,'domain',?,'active',NULL)", (match_value,)
     )

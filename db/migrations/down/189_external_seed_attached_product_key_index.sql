@@ -1,1 +1,0 @@
-DROP INDEX CONCURRENTLY IF EXISTS idx_external_product_seeds_attached_product_key;
