@@ -504,6 +504,11 @@ def build_external_seed_filter_product(
         )
     except Exception:
         price = 0.0
+    # This default is STRUCTURAL, not an observation: `StandardProduct.currency`
+    # is a required `str`, and this object is the FILTER/ranking product, never
+    # the served projection. It must not escape — `build_ranked_external_beauty
+    # _candidate` above deliberately does not read it back, because doing so
+    # re-imported the fallback and defeated #1634 one hop upstream.
     currency = str(
         external_product.get("currency")
         or row.get("price_currency")
@@ -730,7 +735,13 @@ def build_ranked_external_beauty_candidate(
         category=str(seed_data.get("category") or "").strip() or None,
         availability=str(row_dict.get("availability") or seed_data.get("availability") or "").strip() or None,
         price_amount=price_amount,
-        price_currency=str(row_dict.get("price_currency") or seed_data.get("price_currency") or product.currency or "").strip() or None,
+        # NOT `or product.currency`. That field is a StandardProduct `str` whose
+        # default is "USD" (see build_external_seed_filter_product below), so
+        # reading it here re-imported the very fallback #1634 removes — and it
+        # did so UPSTREAM of the gateway's `_observed_currency`, making that
+        # resolver unable to ever return None on this lane. The tail was moved,
+        # not deleted. Only the two real observations are consulted.
+        price_currency=str(row_dict.get("price_currency") or seed_data.get("price_currency") or "").strip().upper() or None,
         source_order=source_order,
         brand_term_hit=brand_term_hit,
         updated_at=row_dict.get("updated_at"),

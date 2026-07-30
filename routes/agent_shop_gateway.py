@@ -944,6 +944,9 @@ async def _lookup_budget_fx_rate(
     return None, None
 
 
+_ISO_CURRENCY_SHAPE = re.compile(r"[A-Za-z]{3}")
+
+
 def _observed_currency(*candidates: Any) -> Optional[str]:
     """The first currency any source actually asserted, or None.
 
@@ -966,9 +969,22 @@ def _observed_currency(*candidates: Any) -> Optional[str]:
     expected result.
     """
     for candidate in candidates:
-        text = str(candidate or "").strip()
-        if text:
-            return text.upper()
+        # ⚠️ isinstance BEFORE str(). `seed_data` is untyped JSON, so a currency
+        # can arrive as a dict, list or int. `str()` turned those into truthy
+        # strings — `{"code": "INR"}` became `"{'CODE': 'INR'}"` — which then
+        # PASSED `isQuotableFeedItem`'s `typeof === 'string'` check and got
+        # published as the currency code. On the old code they were non-strings
+        # and the gate dropped them safely, so stringifying was a REGRESSION
+        # that created exactly the case this function's docstring warns about.
+        if not isinstance(candidate, str):
+            continue
+        text = candidate.strip().upper()
+        # ISO-4217 shape. Without it a sentinel like "unknown" projects as the
+        # currency code "UNKNOWN" and clears the quotable gate — a plausible,
+        # publishable, wrong value. Anything that is not three letters is not a
+        # currency anyone asserted.
+        if _ISO_CURRENCY_SHAPE.fullmatch(text):
+            return text
     return None
 
 
@@ -1012,7 +1028,20 @@ async def _budget_allows_price(
     _budget_constrained = (
         price_min is not None or price_max is not None or budget_currency is not None
     )
-    if _budget_constrained and comparable_amount is not None and comparable_currency is None:
+    # `price_currency is None`, NOT `comparable_currency is None`. The two differ
+    # and the difference is a whole lane: the internal/connected caller passes
+    # `str(product.currency or "").strip().upper()`, which is `""` — not None —
+    # for a cached row with a blank currency, and `""` collapses to None inside
+    # this function. Keying on the collapsed value silently dropped those rows
+    # too, a recall change on a lane this fix never measured and does not claim
+    # to touch (the 159/11,381 measurement covers external_product_seeds only;
+    # StandardProduct.currency is a required str that pydantic accepts as "").
+    #
+    # Keying on the ARGUMENT means only a caller that genuinely has no
+    # observation — the seed lane, which now passes None from
+    # `_observed_currency` — triggers the refusal. A blank string keeps its
+    # pre-existing behaviour until someone measures that cohort.
+    if _budget_constrained and comparable_amount is not None and price_currency is None:
         diagnostics["budget_currency_unknown"] = True
         return False, diagnostics
 
@@ -3087,7 +3116,17 @@ def _order_row_merchant_items(row: Any) -> tuple[Any, Optional[List[Any]]]:
     return merchant_id, raw_items
 
 
-def _extract_price_currency_from_variant(v: Dict[str, Any], fallback_currency: str) -> tuple[Optional[float], str]:
+def _extract_price_currency_from_variant(
+    v: Dict[str, Any], fallback_currency: Optional[str]
+) -> tuple[Optional[float], Optional[str]]:
+    """Variant price and currency, with UNKNOWN preserved as None.
+
+    `fallback_currency` is a caller-supplied observation, not a default: when the
+    caller has nothing, it passes None and this returns None rather than
+    inventing one. The signature used to force `str`, which is why the
+    offers.resolve caller had its own `or "USD"` tail — the type demanded a
+    fabrication. #1634.
+    """
     price = (
         v.get("price_amount")
         if v.get("price_amount") is not None
@@ -3097,8 +3136,10 @@ def _extract_price_currency_from_variant(v: Dict[str, Any], fallback_currency: s
         if v.get("amount") is not None
         else None
     )
-    currency = v.get("price_currency") or v.get("currency") or v.get("currency_code") or fallback_currency
-    return (_coerce_float(price), str(currency or fallback_currency).upper())
+    currency = _observed_currency(
+        v.get("price_currency"), v.get("currency"), v.get("currency_code"), fallback_currency
+    )
+    return (_coerce_float(price), currency)
 
 
 def _seed_variants(seed_data: Dict[str, Any]) -> List[Dict[str, Any]]:
@@ -4018,9 +4059,15 @@ async def _handle_offers_resolve(
                     continue
                 seen_external_offer_ids.add(offer_id)
 
+                # The THIRD seed-currency chain, and the one the first cut of
+                # #1634 missed: same two-source observation, on the
+                # offers.resolve serving path. It fabricated "USD" and published
+                # it as the external offer's currency.
                 price_amount, currency = _extract_price_currency_from_variant(
                     v,
-                    fallback_currency=str(row_dict.get("price_currency") or seed_data.get("price_currency") or "USD"),
+                    fallback_currency=_observed_currency(
+                        row_dict.get("price_currency"), seed_data.get("price_currency")
+                    ),
                 )
                 if price_amount is None:
                     price_amount = _coerce_float(row_dict.get("price_amount") or seed_data.get("price_amount") or 0) or 0.0

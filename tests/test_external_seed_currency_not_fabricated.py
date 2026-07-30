@@ -187,6 +187,75 @@ def test_a_row_with_no_amount_is_unaffected():
 # restoring `or "USD"` on that second site passed the whole suite. Two sites
 # open-coding the same chain is how the tail comes back.
 
+def test_the_RANKED_path_does_not_fabricate_a_currency():
+    """The lane the first cut left inert, tested behaviourally.
+
+    `build_ranked_external_beauty_candidate` used to read `product.currency` —
+    a StandardProduct `str` defaulting to "USD" — so `candidate.price_currency`
+    was ALREADY "USD" before the gateway's resolver ever saw it. The tail had
+    been moved upstream, not removed, and `_observed_currency` could never
+    return None on this lane. Review caught it; no test did.
+    """
+    from services.beauty_external_ranking import build_ranked_external_beauty_candidate
+
+    row = {
+        "id": "s1", "external_product_id": "ext_1", "title": "Kumkumadi Oil",
+        "destination_url": "https://mintree.us/p/1", "price_amount": 3000,
+        "price_currency": None, "domain": "mintree.us",
+        "seed_data": {"title": "Kumkumadi Oil"},
+    }
+    candidate = build_ranked_external_beauty_candidate(row, source_order=0)
+    assert candidate.price_currency is None, (
+        f"the ranked lane fabricated {candidate.price_currency!r} — the tail is "
+        "back upstream of the gateway resolver"
+    )
+
+
+def test_the_RANKED_path_keeps_a_real_currency():
+    from services.beauty_external_ranking import build_ranked_external_beauty_candidate
+
+    candidate = build_ranked_external_beauty_candidate(
+        {"id": "s1", "external_product_id": "ext_1", "title": "X",
+         "destination_url": "https://x/1", "price_amount": 3000,
+         "price_currency": "inr", "seed_data": {"title": "X"}},
+        source_order=0,
+    )
+    assert candidate.price_currency == "INR"
+
+
+def test_offers_resolve_variant_extraction_does_not_fabricate():
+    """The THIRD chain — same two-source observation, on the offers.resolve
+    serving path, which the first cut missed entirely."""
+    from routes.agent_shop_gateway import _extract_price_currency_from_variant
+
+    amount, currency = _extract_price_currency_from_variant({"price_amount": 42}, None)
+    assert amount == 42.0
+    assert currency is None, f"fabricated {currency!r} for a currency-less variant"
+
+    amount, currency = _extract_price_currency_from_variant({"price_amount": 42}, "INR")
+    assert currency == "INR", "a real observed fallback must still be used"
+
+    amount, currency = _extract_price_currency_from_variant(
+        {"price_amount": 42, "price_currency": "gbp"}, "INR"
+    )
+    assert currency == "GBP", "the variant's own currency must outrank the fallback"
+
+
+@pytest.mark.parametrize(
+    "junk", [{"code": "INR"}, ["INR"], 840, "unknown", "us dollars", "U$D", "INRR"]
+)
+def test_non_ISO_and_non_string_currencies_are_rejected(junk):
+    """`seed_data` is untyped JSON. `str()` turned a dict into
+    `"{'CODE': 'INR'}"` — a truthy string that PASSES the feed's
+    `typeof === 'string'` quotable gate and gets published as the currency
+    code. On the pre-#1634 code these were non-strings and the gate dropped
+    them, so stringifying was a regression that created the exact case the
+    resolver's docstring warns about."""
+    from routes.agent_shop_gateway import _observed_currency
+
+    assert _observed_currency(junk) is None, f"{junk!r} projected as a currency"
+
+
 def test_the_resolver_is_the_only_currency_chain_for_seed_projections():
     """Both sites must go through `_observed_currency`.
 
@@ -240,3 +309,59 @@ def test_resolver_never_invents_a_value():
 
     for args in [(), (None,), ("",), ("  ",), (None, "", "   ", None)]:
         assert _observed_currency(*args) is None, f"invented a currency from {args!r}"
+
+
+def test_the_internal_lane_is_NOT_changed_by_the_budget_refusal():
+    """Scope: only a TRUE unknown refuses.
+
+    The internal/connected caller passes `str(product.currency or "").strip()
+    .upper()`, which is `""` — not None — for a cached row with a blank
+    currency. Keying the refusal on the value AFTER `"" -> None` collapse
+    silently dropped those rows too: a recall change on a lane this fix never
+    measured (the 159/11,381 count covers external_product_seeds only, and
+    StandardProduct.currency is a required str that pydantic accepts as "").
+    """
+    refused, diag = _budget(
+        price_amount=30, price_currency="", budget_currency="USD",
+        price_min=None, price_max=50,
+    )
+    assert refused is True, "the internal lane's blank-currency rows were dropped"
+    assert "budget_currency_unknown" not in diag
+
+    # ...while the seed lane, which passes a genuine None, still refuses.
+    refused, diag = _budget(
+        price_amount=3000, price_currency=None, budget_currency="USD",
+        price_min=None, price_max=50,
+    )
+    assert refused is False and diag.get("budget_currency_unknown") is True
+
+
+def test_the_offers_resolve_CALLER_passes_an_observation_not_a_default():
+    """The call site, not just the callee.
+
+    `_extract_price_currency_from_variant` can be given an honest None and
+    behave correctly while its caller still hands it a fabricated "USD" — which
+    is exactly what the first cut did. Asserted on the AST so a reformat cannot
+    defeat it and a comment cannot satisfy it.
+    """
+    import ast
+    import inspect
+
+    import routes.agent_shop_gateway as gw
+
+    tree = ast.parse(inspect.getsource(gw._handle_offers_resolve))
+    calls = [
+        n for n in ast.walk(tree)
+        if isinstance(n, ast.Call)
+        and isinstance(n.func, ast.Name)
+        and n.func.id == "_extract_price_currency_from_variant"
+    ]
+    assert calls, "the offers.resolve variant extraction call disappeared — rewrite this guard"
+    for call in calls:
+        kw = {k.arg: k.value for k in call.keywords}
+        assert "fallback_currency" in kw, "fallback_currency is no longer passed"
+        rendered = ast.unparse(kw["fallback_currency"])
+        assert "_observed_currency(" in rendered, (
+            f"offers.resolve builds its own currency chain: {rendered}"
+        )
+        assert "USD" not in rendered, f"offers.resolve re-introduced a USD tail: {rendered}"
