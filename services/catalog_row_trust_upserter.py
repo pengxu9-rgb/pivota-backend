@@ -35,7 +35,12 @@ from datetime import datetime, timezone
 from typing import Any, Iterable, Mapping, Optional, Sequence
 
 from services.catalog_trust_policy import derive_trust
-from services.source_quarantine import sql_bare_domain
+from services.source_quarantine import (
+    MINTED_SEED_IDENTITY_LEG,
+    SEED_PICK_ORDER,
+    STORE_PICK_ORDER,
+    sql_bare_domain,
+)
 from services.pdp_renderability import (
     pdp_route_resolvable,
     seed_route_resolves_sql,
@@ -57,17 +62,18 @@ _QUARANTINE_BULK_MAX = 5_000
 # ---------------------------------------------------------------------------
 
 
-_PRODUCT_JOIN_CTES = """
+_PRODUCT_JOIN_CTES = f"""
   WITH external_seed_one AS (
-    SELECT DISTINCT ON (external_product_id)
-      id, external_product_id, status, domain, attached_product_key, updated_at, seed_kind
-    FROM external_product_seeds
+    SELECT DISTINCT ON (s.external_product_id)
+      s.id, s.external_product_id, s.status, s.domain, s.attached_product_key, s.updated_at, s.seed_kind
+    FROM external_product_seeds s
+    -- Tie-break legs come from services.source_quarantine.SEED_PICK_ORDER, the
+    -- SAME constant the lateral chain uses. They diverged once (#1643 review:
+    -- 6 of 11 shapes resolved different domains, opposite quarantine verdicts
+    -- in both directions); defining them in one place is what stops that.
     ORDER BY
-      external_product_id,
-      (status = 'active') DESC,
-      updated_at DESC NULLS LAST,
-      created_at DESC NULLS LAST,
-      id DESC
+      s.external_product_id,
+      {SEED_PICK_ORDER}
   ),
   minted_seed_one AS (
     -- Path-C minted canonicals (catalog_enrichment_agent_v1) attach one seed
@@ -86,24 +92,17 @@ _PRODUCT_JOIN_CTES = """
     WHERE s.attached_product_key IS NOT NULL
     ORDER BY
       s.attached_product_key,
-      (spl.product_id IS NOT NULL) DESC,
-      (s.status = 'active') DESC,
-      s.updated_at DESC NULLS LAST,
-      s.created_at DESC NULLS LAST,
-      s.id DESC
+      {MINTED_SEED_IDENTITY_LEG},
+      {SEED_PICK_ORDER}
   ),
   merchant_store_one AS (
-    SELECT DISTINCT ON (merchant_id, platform)
-      merchant_id, platform, domain, status, last_sync
-    FROM merchant_stores
+    SELECT DISTINCT ON (m.merchant_id, m.platform)
+      m.merchant_id, m.platform, m.domain, m.status, m.last_sync
+    FROM merchant_stores m
     ORDER BY
-      merchant_id,
-      platform,
-      (status = 'active') DESC,
-      is_primary DESC NULLS LAST,
-      last_sync DESC NULLS LAST,
-      created_at DESC NULLS LAST,
-      store_id DESC
+      m.merchant_id,
+      m.platform,
+      {STORE_PICK_ORDER}
   ),
   identity_override_one AS (
     SELECT DISTINCT ON (source_listing_ref)
@@ -242,7 +241,7 @@ _SELECT_BY_PRODUCT_KEYS_SQL = (
 _SELECT_BY_QUARANTINE_DOMAIN_SQL = (
     _PRODUCT_JOIN_CTES
     + _PRODUCT_JOIN_SELECT
-    + f"""  WHERE {sql_bare_domain("coalesce(cp.source_domain, eps.domain, epm.domain, ms.domain, '')")}
+    + f"""  WHERE {sql_bare_domain("coalesce(nullif(cp.source_domain, ''), nullif(eps.domain, ''), nullif(epm.domain, ''), nullif(ms.domain, ''), '')")}
         = {sql_bare_domain(":match_value")}
   ORDER BY cp.product_key
   LIMIT :limit

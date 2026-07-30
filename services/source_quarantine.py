@@ -86,6 +86,116 @@ def sql_bare_domain(expr: str) -> str:
     )
 
 
+# ---------------------------------------------------------------------------
+# The domain chain for a `catalog_products` row.
+#
+# #1643: the comparators over this table agreed on how to SPELL a domain (#1641)
+# but not on WHICH COLUMNS to read. The assembler and the reconciler cron used
+# `cp.source_domain` alone; `catalog_trust_policy` and
+# `catalog_row_trust_upserter` used the full chain. On a row with a NULL
+# `cp.source_domain` — 4,007 of 14,124 in prod — a quarantined storefront kept
+# its canonical pick while the trust layer marked it blocked.
+#
+# ⚠️ THE TIE-BREAKERS ARE THE CONTRACT, NOT AN IMPLEMENTATION DETAIL.
+# A first version of this chain replicated the *shape* of
+# `catalog_row_trust_upserter`'s `DISTINCT ON` CTEs but not their ORDER BY legs,
+# and review measured the two resolving DIFFERENT domains on 6 of 11 shapes —
+# producing opposite quarantine verdicts in BOTH directions:
+#
+#   * merchant with stores on two platforms, the `is_primary` row on the other
+#     platform (the uniqueness constraint is per MERCHANT, not per
+#     (merchant, platform)), one store `deleted` with a newer `last_sync`:
+#     dropping `(status='active') DESC` picked the deleted store's domain.
+#     Quarantine the deleted domain -> the row is dropped from the canonical
+#     pick while trust says `public`: a public product with no PDP.
+#     Quarantine the live domain -> the row is KEPT: bug #1643 verbatim.
+#   * Path-C minted canonical with two attached seeds (one per retailer, which
+#     is what `minted_seed_one`'s own docstring says the lane produces):
+#     dropping `(spl.product_id IS NOT NULL) DESC` picked the identity-less
+#     sibling.
+#
+# So the ORDER BY legs below are defined ONCE and consumed by both shapes — the
+# lateral form here and the `DISTINCT ON` CTEs in catalog_row_trust_upserter.
+# Two shapes are unavoidable (a selective per-content_key lookup wants laterals,
+# a bulk scan wants CTEs); two RULES are not.
+#
+# `nullif(..., '')` on every leg, not just the outer wrapper: `coalesce` treats
+# an EMPTY STRING as present, so `cp.source_domain = ''` short-circuited the
+# whole chain and the fallback legs never ran.
+#
+# COST, measured on a prod-shaped corpus WITH prod's existing indexes:
+# assembler `fetch_products_for_key` 0.214 -> 0.811 ms; reconciler
+# `candidates_sql` 46.2 -> 97.5 ms (2.1x). Both are far inside the 800 ms
+# statement timeout, and the reconciler is still below its pre-#1640 265 ms.
+#
+# ⚠️ No new index is needed. A first version of this change shipped one, on the
+# claim that `attached_product_key` was unindexed — false: migration 044 creates
+# `idx_external_product_seeds_attached (attached_product_key, attached_variant_id)`
+# and nothing drops it. The "21x regression without an index" that justified it
+# reproduced only on a benchmark corpus missing that index. Do not re-add it
+# without re-measuring against the real schema.
+#
+# The real cost driver is textual: `sql_bare_domain` inlines its argument 3x and
+# the anti-join uses the row expression twice, so this chain appears SIX times in
+# the emitted predicate. Binding it once (a `LATERAL (SELECT ...) d(domain)` in
+# the FROM) would collapse ~18 subplans to 3 — worth doing, not done here.
+#
+# ⚠️ MEASURED BLAST RADIUS ON PROD, 2026-07-30: widening changes **0 rows**
+# today — of the 4,007 NULL-`source_domain` rows, none resolve to a quarantined
+# domain via seed or store. This is convergence, not a live unblock. Do not read
+# a zero delta after deploy as the change having failed.
+# ---------------------------------------------------------------------------
+
+# Which seed wins for one `external_product_id` / `attached_product_key`.
+SEED_PICK_ORDER = (
+    "(s.status = 'active') DESC, "
+    "s.updated_at DESC NULLS LAST, "
+    "s.created_at DESC NULLS LAST, "
+    "s.id DESC"
+)
+
+# Path-C minted seeds additionally prefer a seed that CARRIES an identity
+# listing over a merely-newer sibling: the winner's external_product_id is the
+# identity join key downstream, so picking an identity-less sibling re-derives
+# IDENTITY_CONFIDENCE_NULL nondeterministically as updated_at values move.
+MINTED_SEED_IDENTITY_LEG = (
+    "(EXISTS (SELECT 1 FROM pdp_identity_listing spl "
+    "WHERE spl.product_id = s.external_product_id)) DESC"
+)
+
+# Which store wins for one (merchant_id, platform).
+# `(m.status = 'active') DESC` is FIRST and load-bearing — see the comment above.
+# `m.store_id DESC` is the deterministic final: without it two stores with equal
+# is_primary/last_sync resolve to whatever the plan yields, so a quarantine can
+# start and stop applying to a row with no data change at all.
+STORE_PICK_ORDER = (
+    "(m.status = 'active') DESC, "
+    "m.is_primary DESC NULLS LAST, "
+    "m.last_sync DESC NULLS LAST, "
+    "m.created_at DESC NULLS LAST, "
+    "m.store_id DESC"
+)
+
+CATALOG_PRODUCT_DOMAIN_SQL = f"""coalesce(
+      nullif(cp.source_domain, ''),
+      (SELECT nullif(s.domain, '') FROM external_product_seeds s
+        WHERE cp.source_system = 'external_product_seeds_mirror_v1'
+          AND s.external_product_id = cp.source_product_id
+        ORDER BY {SEED_PICK_ORDER}
+        LIMIT 1),
+      (SELECT nullif(s.domain, '') FROM external_product_seeds s
+        WHERE cp.source_system = 'catalog_enrichment_agent_v1'
+          AND s.attached_product_key = cp.product_key
+        ORDER BY {MINTED_SEED_IDENTITY_LEG}, {SEED_PICK_ORDER}
+        LIMIT 1),
+      (SELECT nullif(m.domain, '') FROM merchant_stores m
+        WHERE m.merchant_id = cp.merchant_id AND m.platform = cp.platform
+        ORDER BY {STORE_PICK_ORDER}
+        LIMIT 1),
+      ''
+    )"""
+
+
 def build_quarantine_anti_join_sql(
     row_domain_expr: str,
     row_merchant_expr: str,

@@ -78,6 +78,49 @@ async def _create_min_tables(database):
         )
         """
     )
+    # The quarantine anti-join reads the FULL domain chain since #1643
+    # (cp.source_domain -> external seed -> minted seed -> merchant store), so
+    # these two must exist or every reconciler query raises UndefinedTable.
+    # Without them this file — the ONLY harness that executes the reconciler SQL
+    # against Postgres — fails on a fresh database while CI stays green, because
+    # it is gated on PIVOTA_TEST_PG_URL. That is the green-but-unexercised shape
+    # the fragment's own CURRENT_TIMESTAMP comment exists to prevent (#1588).
+    await database.execute(
+        """
+        CREATE TABLE IF NOT EXISTS external_product_seeds (
+            id TEXT PRIMARY KEY,
+            external_product_id TEXT,
+            domain TEXT,
+            attached_product_key TEXT,
+            status TEXT,
+            updated_at TIMESTAMPTZ,
+            created_at TIMESTAMPTZ,
+            seed_kind TEXT
+        )
+        """
+    )
+    await database.execute(
+        """
+        CREATE TABLE IF NOT EXISTS pdp_identity_listing (
+            product_id TEXT,
+            source_listing_ref TEXT
+        )
+        """
+    )
+    await database.execute(
+        """
+        CREATE TABLE IF NOT EXISTS merchant_stores (
+            store_id TEXT PRIMARY KEY,
+            merchant_id TEXT,
+            platform TEXT,
+            domain TEXT,
+            status TEXT,
+            is_primary BOOLEAN,
+            last_sync TIMESTAMPTZ,
+            created_at TIMESTAMPTZ
+        )
+        """
+    )
 
 
 async def _seed_product(
