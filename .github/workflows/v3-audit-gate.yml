@@ -68,6 +68,13 @@ on:
       - "tests/test_audit_invariants.py"
       - ".github/workflows/v3-audit-gate.yml"
 
+# Superseded PR pushes cancel the gate for the commit they replaced. Non-PR
+# events fall through to run_id — a group of one — so push-to-main and dispatch
+# runs are never cancelled or queued: every main commit keeps its own result.
+concurrency:
+  group: v3-audit-gate-${{ github.event.pull_request.number || github.run_id }}
+  cancel-in-progress: true
+
 jobs:
   v3-audit-e2e:
     name: v3 audit end-to-end
