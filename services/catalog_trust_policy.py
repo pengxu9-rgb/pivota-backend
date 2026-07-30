@@ -58,7 +58,7 @@ from typing import Any, Iterable, Mapping, Optional
 # The rig denylist. Imported rather than inlined: a copy here would be a FIFTH
 # copy of the list, and a rig excluded everywhere but here is exactly the bug
 # the gate closes. test_merchant_policy imports only stdlib, so no cycle.
-from services.source_quarantine import normalize_domain
+from services.source_quarantine import bare_domain
 from services.test_merchant_policy import KNOWN_TEST_MERCHANT_IDS
 
 # Worked example 2 — the test-merchant gate, 2026-07-27. It adds a NEW arm to
@@ -449,7 +449,7 @@ def _is_quarantined(
     # `fetch_products_for_key` while THIS check returned False, so
     # `serving_decision` stayed `public` and the URL stayed in the sitemap.
     # Sitemap advertises a PDP with no view row. See #1639.
-    domain = normalize_domain(
+    domain = bare_domain(
         _get(product, "source_domain")
         or _get(external_seed, "domain")
         or _get(merchant_store, "domain")
@@ -476,7 +476,7 @@ def _is_quarantined(
 
         if match_type == "domain" and domain:
             # Both sides through the shared normaliser, not just the row.
-            if normalize_domain(match_value) == domain:
+            if bare_domain(match_value) == domain:
                 return True
         elif match_type == "merchant_platform" and merchant_id and platform:
             if match_value == f"{merchant_id}:{platform}":

@@ -1,12 +1,23 @@
-"""All FOUR domain comparators must give the same verdict for the same pair.
+"""All SEVEN domain comparators must give the same verdict for the same pair.
 
-Four places compare a row's domain against `catalog_source_quarantine.match_value`:
+Seven places compare a row's domain against `catalog_source_quarantine.match_value`:
 
   1. SQL anti-join            services/source_quarantine.build_quarantine_anti_join_sql
   2. Python matcher           services/source_quarantine.quarantine_matches_source
   3. trust policy             services/catalog_trust_policy._is_quarantined
   4. trust upserter lookup    services/catalog_row_trust_upserter
                               ._SELECT_BY_QUARANTINE_DOMAIN_SQL
+  5. CLI product preview      scripts/manage_source_quarantine._product_match_clause
+  6. CLI seed preview         scripts/manage_source_quarantine._seed_domain_match
+  7. Node twin                PIVOTA-Agent/src/services/catalogTrustPolicy.isQuarantined
+                              (cross-repo — parity checked by execution in the PR,
+                              not importable from here)
+
+The PR that fixed 3 and 4 originally called it "four comparators". 5 and 6 are
+the operator's ONLY preview of a destructive action, and leaving them on a bare
+`lower()` while the WRITE canonicalised made the dry-run under-report blast
+radius by 100%: `--dry-run-proposed --match-value www.mintree.us` reported 0
+impact, then `create` blocked 120 products.
 
 #1637 normalised 1 and 2 (lowercase + `www.` strip, both sides). 3 and 4 still
 did a bare `lower()`, so they disagreed — and `create_quarantine` accepts
@@ -21,9 +32,24 @@ the URL stays in the sitemap. The sitemap then advertises a PDP with no view row
 Prod was safe only because no `www.`-prefixed seed sat on a quarantined
 storefront. A data coincidence, not an invariant, and silent on both sides.
 
-This file is the invariant. It runs all four over the same matrix and asserts
-they never disagree — so the next comparator (or the next normalisation change)
-cannot quietly split them again.
+This file is the invariant ON THE NORMALISATION AXIS ONLY, and that scope is
+deliberate. The four comparators legitimately read DIFFERENT domain-source
+chains:
+
+    anti-join (assembler / reconciler cron)  cp.source_domain alone
+    trust policy                             product -> external_seed -> merchant_store
+    trust upserter lookup                    coalesce(cp, eps, epm, ms, '')
+
+so feeding them one `row_domain` cannot prove they agree in general — only that
+they spell the same storefront the same way. An earlier version of this
+docstring claimed more than that, and a mutant deleting external_seed /
+merchant_store from the trust policy's chain passed 156 tests.
+`test_each_comparator_reads_its_own_documented_chain` closes that.
+
+The chain axis itself — where a NULL `cp.source_domain` with a matching
+`eps.domain` is blocked by two comparators and not the third — is a separate,
+real divergence, tracked separately. Do not "fix" it by widening this file's
+claim.
 """
 
 from __future__ import annotations
@@ -39,7 +65,7 @@ from services.source_quarantine import (
     MATCH_TYPE_DOMAIN,
     Quarantine,
     build_quarantine_anti_join_sql,
-    normalize_domain,
+    bare_domain,
     quarantine_matches_source,
     sql_bare_domain,
 )
@@ -131,11 +157,41 @@ def _verdict_upserter_lookup(row_domain, match_value) -> bool:
     return bool(rows)
 
 
+def _cli_clause_verdict(clause: str, column: str, row_domain, match_value) -> bool:
+    conn = sqlite3.connect(":memory:")
+    conn.execute(f"CREATE TABLE t ({column} TEXT)")
+    conn.execute("INSERT INTO t VALUES (?)", (row_domain,))
+    sql = f"SELECT 1 FROM t WHERE {clause}"
+    return bool(conn.execute(sql, {"match_value": match_value}).fetchall())
+
+
+def _verdict_cli_product_preview(row_domain, match_value) -> bool:
+    """(5) The operator's dry-run over catalog_products."""
+    from scripts.manage_source_quarantine import _product_match_clause
+
+    return _cli_clause_verdict(
+        _product_match_clause("domain").replace("p.source_domain", "t.source_domain"),
+        "source_domain", row_domain, match_value,
+    )
+
+
+def _verdict_cli_seed_preview(row_domain, match_value) -> bool:
+    """(6) The operator's dry-run over external_product_seeds."""
+    from scripts.manage_source_quarantine import _seed_domain_match
+
+    return _cli_clause_verdict(
+        _seed_domain_match().replace("e.domain", "t.domain"),
+        "domain", row_domain, match_value,
+    )
+
+
 COMPARATORS = {
     "anti_join": _verdict_anti_join,
     "python_matcher": _verdict_python_matcher,
     "trust_policy": _verdict_trust_policy,
     "upserter_lookup": _verdict_upserter_lookup,
+    "cli_product_preview": _verdict_cli_product_preview,
+    "cli_seed_preview": _verdict_cli_seed_preview,
 }
 
 
@@ -216,7 +272,7 @@ class _CaptureDb:
 def test_create_quarantine_STORES_the_canonical_domain(raw):
     """Drives the real writer, not the normaliser.
 
-    Asserting `normalize_domain(raw) == 'mintree.us'` tests the helper and
+    Asserting `bare_domain(raw) == 'mintree.us'` tests the helper and
     leaves the WRITER free to skip it — a mutant disabling the write-time
     canonicalisation survived exactly that. What matters is the value that
     lands in the row.
@@ -277,7 +333,7 @@ def test_create_quarantine_rejects_a_domain_that_normalises_to_nothing():
 
 
 def test_the_sql_helper_and_the_python_helper_are_the_same_rule():
-    """`sql_bare_domain` and `normalize_domain` must not drift apart.
+    """`sql_bare_domain` and `bare_domain` must not drift apart.
 
     They are separate implementations of one rule — one in SQL, one in Python —
     which is the only unavoidable duplication here. Compared by execution.
@@ -288,7 +344,121 @@ def test_the_sql_helper_and_the_python_helper_are_the_same_rule():
         conn.execute("DELETE FROM r")
         conn.execute("INSERT INTO r VALUES (?)", (raw,))
         sql_result = conn.execute(f"SELECT {sql_bare_domain('r.v')} FROM r").fetchone()[0]
-        py_result = normalize_domain(raw) or None
+        py_result = bare_domain(raw) or None
         assert sql_result == py_result, (
             f"SQL and Python normalisers disagree on {raw!r}: {sql_result!r} vs {py_result!r}"
         )
+
+
+# --- the chain axis ---------------------------------------------------------
+#
+# Each comparator reads its own documented set of domain sources. That is by
+# design, but it must be PINNED: a mutant deleting external_seed/merchant_store
+# from the trust policy's chain passed 156 tests, and it is a live under-block —
+# every NULL-`source_domain` mirror row would stay `public` under an active
+# quarantine, silently.
+
+@pytest.mark.parametrize(
+    "source_field",
+    ["product", "external_seed", "merchant_store"],
+)
+def test_trust_policy_reads_its_whole_documented_chain(source_field):
+    """product.source_domain -> external_seed.domain -> merchant_store.domain.
+
+    `cp.source_domain` is nullable (migration 133) and the domain-less mirror
+    cohort is large and current, so the fallback legs are not decorative — they
+    are how most of that cohort is matched at all.
+    """
+    args = {
+        "product": {"source_domain": None, "merchant_id": None, "platform": None},
+        "external_seed": None,
+        "merchant_store": None,
+    }
+    if source_field == "product":
+        args["product"] = {"source_domain": "mintree.us", "merchant_id": None, "platform": None}
+    elif source_field == "external_seed":
+        args["external_seed"] = {"domain": "mintree.us"}
+    else:
+        args["merchant_store"] = {"domain": "mintree.us"}
+
+    assert _is_quarantined(
+        **args,
+        active_quarantines=[{
+            "match_type": "domain", "match_value": "mintree.us",
+            "state": "active", "expires_at": None,
+        }],
+        now=datetime(2026, 7, 30, tzinfo=timezone.utc),
+    ) is True, f"the {source_field} leg of the domain chain is not read"
+
+
+def test_trust_policy_chain_precedence_is_product_first():
+    """A product's own domain wins over a seed's — otherwise a shared seed
+    could drag an unrelated product into a quarantine."""
+    assert _is_quarantined(
+        product={"source_domain": "beplain.com", "merchant_id": None, "platform": None},
+        external_seed={"domain": "mintree.us"},
+        merchant_store=None,
+        active_quarantines=[{
+            "match_type": "domain", "match_value": "mintree.us",
+            "state": "active", "expires_at": None,
+        }],
+        now=datetime(2026, 7, 30, tzinfo=timezone.utc),
+    ) is False
+
+
+def test_upserter_lookup_reads_all_four_domain_sources():
+    """coalesce(cp.source_domain, eps.domain, epm.domain, ms.domain, '')."""
+    sql = _SELECT_BY_QUARANTINE_DOMAIN_SQL
+    for col in ("cp.source_domain", "eps.domain", "epm.domain", "ms.domain"):
+        assert col in sql, f"{col} dropped from the upserter's domain chain"
+
+
+def test_create_quarantine_rejects_a_url_instead_of_silently_storing_it():
+    """`bare_domain` is a strip/lower/www rule, not a URL parser.
+
+    `https://www.mintree.us/products/x` would be stored verbatim and then match
+    nothing on any of the seven comparators — a quarantine that reports success
+    and blocks nobody, which is the precise failure this workstream exists to
+    end. Reject loudly instead of accepting a value that cannot work.
+    """
+    import asyncio
+
+    from services.source_quarantine import create_quarantine
+
+    for raw in [
+        "https://www.mintree.us/products/x",
+        "http://mintree.us",
+        "mintree.us:443",
+        "mintree.us/products",
+        "min tree.us",
+    ]:
+        with pytest.raises(ValueError) as exc:
+            asyncio.run(
+                create_quarantine(
+                    match_type="domain", match_value=raw, reason=None,
+                    created_by="t", db=_CaptureDb(),
+                )
+            )
+        assert "bare hostname" in str(exc.value), (
+            f"rejection message for {raw!r} does not tell the operator what to pass"
+        )
+
+
+def test_create_quarantine_still_accepts_a_plain_hostname():
+    """The guard must not reject legitimate values — including the 15 forms
+    already live in prod (hyphens, multi-label TLDs, myshopify subdomains)."""
+    import asyncio
+
+    from services.source_quarantine import create_quarantine
+
+    for raw in [
+        "mintree.us", "reddane.co.za", "wholesale.publicgoods.com",
+        "dearbarber.co.uk", "jwx893-fz.myshopify.com", "biologique-recherche.com",
+    ]:
+        db = _CaptureDb()
+        asyncio.run(
+            create_quarantine(
+                match_type="domain", match_value=raw, reason=None, created_by="t", db=db
+            )
+        )
+        assert db.written["match_value"] == raw

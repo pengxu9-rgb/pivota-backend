@@ -243,9 +243,24 @@ async def create_quarantine(
     # stored it verbatim and got a quarantine that reported success while some
     # comparators honoured it and others did not (#1639).
     if match_type == MATCH_TYPE_DOMAIN:
-        normalized_match_value = normalize_domain(normalized_match_value)
+        # Reject anything that is not a bare hostname BEFORE normalising.
+        # `bare_domain` is a strip/lower/www-prefix rule, not a URL parser, so
+        # `https://www.mintree.us/products/x` would be stored verbatim
+        # (lowercased) and then match nothing on any comparator — a quarantine
+        # that reports success and blocks nobody, which is the exact failure
+        # mode this workstream exists to end. Reject loudly instead.
+        if any(ch in normalized_match_value for ch in "/:") or normalized_match_value.split() != [
+            normalized_match_value
+        ]:
+            raise ValueError(
+                f"match_value {match_value!r} is not a bare hostname — pass "
+                "'mintree.us', not a URL, port or path"
+            )
+        normalized_match_value = bare_domain(normalized_match_value)
         if not normalized_match_value:
-            raise ValueError("match_value is required")
+            raise ValueError(
+                f"match_value {match_value!r} does not normalise to a hostname"
+            )
     normalized_created_by = _required_text(created_by, "created_by")
     row = await _fetch_one(
         db,
@@ -335,7 +350,7 @@ def quarantine_matches_source(
 
     if quarantine.match_type == MATCH_TYPE_DOMAIN:
         # A blank match_value must match NOTHING, not every domain-less row.
-        # Without this guard `normalize_domain('') == normalize_domain(None)` is
+        # Without this guard `bare_domain('') == bare_domain(None)` is
         # `'' == ''` -> True, so one blank quarantine row silently quarantines
         # every row whose domain sources are all empty. `match_value` is
         # `TEXT NOT NULL` with no non-empty CHECK and these rows come from direct
@@ -345,10 +360,10 @@ def quarantine_matches_source(
         # of the same guard, and it is why they now agree on blanks. Callers that
         # already guard locally (services/offer_currency_policy) keep doing so as
         # belt-and-braces — this is the authoritative one.
-        normalized = normalize_domain(quarantine.match_value)
+        normalized = bare_domain(quarantine.match_value)
         if not normalized:
             return False
-        return normalized == normalize_domain(domain)
+        return normalized == bare_domain(domain)
 
     if quarantine.match_type == MATCH_TYPE_MERCHANT_PLATFORM:
         return quarantine.match_value == _join_match_value(merchant_id, platform)
@@ -372,7 +387,7 @@ def _required_text(value: Optional[str], name: str) -> str:
     return normalized
 
 
-def normalize_domain(value: Optional[str]) -> str:
+def bare_domain(value: Optional[str]) -> str:
     """Bare host: lowercase, no leading `www.`.
 
     Applied to BOTH the quarantine's match_value and the row's domain, and kept

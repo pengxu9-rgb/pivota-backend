@@ -22,7 +22,9 @@ from services.source_quarantine import (  # noqa: E402
     QUARANTINE_COLUMNS,
     VALID_MATCH_TYPES,
     create_quarantine,
+    bare_domain,
     revoke_quarantine,
+    sql_bare_domain,
 )
 
 CONFIRM_CREATE = "SOURCE_QUARANTINE_CREATE"
@@ -149,6 +151,12 @@ async def _handle_create(args: argparse.Namespace, db: Any) -> dict[str, Any]:
         "created_by": args.created_by,
         "expires_at": expires_at,
     }
+    if args.match_type == MATCH_TYPE_DOMAIN:
+        # Echo what will actually be STORED, not what was typed. create_quarantine
+        # canonicalises domains, so `--match-value www.mintree.us` is written as
+        # `mintree.us`; a dry-run that echoes the raw input shows the operator a
+        # value that will never appear in the table.
+        requested["match_value_as_stored"] = bare_domain(args.match_value)
     if not args.apply:
         return {"action": "create", "dry_run": True, "would_create": requested}
     _require_confirm(args.confirm, CONFIRM_CREATE)
@@ -333,8 +341,8 @@ async def _external_seed_domain_impact(db: Any, values: dict[str, Any]) -> dict[
         """
         SELECT COUNT(*)::int AS count
         FROM external_product_seeds e
-        WHERE lower(e.domain) = lower(:match_value)
-        """,
+        WHERE {seed_domain_match}
+        """.format(seed_domain_match=_seed_domain_match()),
         values,
     )
     sample = await db.fetch_all(
@@ -362,7 +370,7 @@ async def _external_seed_domain_impact(db: Any, values: dict[str, Any]) -> dict[
           ON pil.source_listing_ref = 'external_seed:' || e.external_product_id
         LEFT JOIN index_pipeline_state ips
           ON ips.content_key = p.content_key
-        WHERE lower(e.domain) = lower(:match_value)
+        WHERE {seed_domain_match}
         ORDER BY e.updated_at DESC NULLS LAST, e.id
         LIMIT :limit
         """,
@@ -371,9 +379,19 @@ async def _external_seed_domain_impact(db: Any, values: dict[str, Any]) -> dict[
     return {"count": _row_count(count_row), "sample": sample}
 
 
+def _seed_domain_match() -> str:
+    """Same normalisation the WRITE side uses. See _product_match_clause."""
+    return f'{sql_bare_domain("e.domain")} = {sql_bare_domain(":match_value")}'
+
+
 def _product_match_clause(match_type: str) -> str:
     if match_type == "domain":
-        return "lower(p.source_domain) = lower(:match_value)"
+        # The dry-run is the operator's ONLY preview of a destructive action, so
+        # it must use the same rule as the write. With a bare lower() it did not:
+        # `--dry-run-proposed --match-value www.mintree.us` reported 0 impact
+        # while `create` canonicalised to `mintree.us` and blocked 120 products.
+        # A preview that under-reports blast radius by 100% is worse than none.
+        return f'{sql_bare_domain("p.source_domain")} = {sql_bare_domain(":match_value")}'
     if match_type == "merchant_platform":
         return "p.merchant_id || ':' || p.platform = :match_value"
     if match_type == "source_system_ref":
