@@ -282,15 +282,31 @@ def build_external_seed_prefer_terms_rank_sql(
 
 
 def _is_missing_external_seed_table(exc: Exception) -> bool:
+    """Missing-table classifier for this query's tables — now BOTH of them.
+
+    The quarantine anti-join makes `catalog_source_quarantine` a hard dependency
+    of every seed-search route. Matching only on `external_product_seeds` meant a
+    database without migration 134 raised `relation "catalog_source_quarantine"
+    does not exist`, which this classifier did not recognise and the timeout
+    classifier did not either — so the exception escaped and every seed-search
+    route 500'd instead of degrading to empty.
+
+    Prod is unaffected (134 is applied, 15 quarantines live), but prod runs with
+    SKIP_HEAVY_STARTUP_INIT=true and manual psql migrations, so a fresh staging
+    DB is exactly the case that would have hit this.
+    """
     msg = str(exc or "")
-    return (
-        "external_product_seeds" in msg
-        and (
-            "does not exist" in msg
-            or "UndefinedTable" in msg
-            or "relation" in msg
-            or "no such table" in msg.lower()
-        )
+    names = ("external_product_seeds", "catalog_source_quarantine")
+    # NOT a bare `"relation" in msg`: that also matched
+    # `permission denied for relation catalog_source_quarantine`, which would be
+    # reported as table_missing and returned as an empty result — a silent total
+    # blackout of the seed corpus dressed as "no seeds". Postgres always says
+    # "does not exist" for a genuinely missing relation, and SQLite says
+    # "no such table", so nothing is lost by requiring one of those.
+    return any(name in msg for name in names) and (
+        "does not exist" in msg
+        or "UndefinedTable" in msg
+        or "no such table" in msg.lower()
     )
 
 
@@ -302,6 +318,54 @@ def _is_external_seed_query_timeout(exc: Exception) -> bool:
         or "query canceled" in msg
         or "statement timeout" in msg
         or "canceling statement due to statement timeout" in msg
+    )
+
+
+# The seed row's storefront column, passed RAW.
+#
+# Normalisation (lowercase, `www.` strip, empty-as-NULL) lives in
+# `source_quarantine._sql_bare_domain` and is applied to BOTH sides of the
+# comparison there. An earlier version normalised only here — which under-blocked
+# a `www.`-prefixed quarantine value and split this gate from the Python matcher,
+# each blocking a pair the other let through. One normaliser, both sides, one
+# place: a second copy is how the first three drifted.
+#
+# A `destination_url` fallback for the 1,779 domain-less seeds was measured on
+# prod and rescues exactly 0 additional rows, so it is deliberately NOT added —
+# an unused branch is an untested branch.
+# QUALIFIED, deliberately. Unqualified `domain` inside the correlated subquery
+# binds to the outer seed table only because `catalog_source_quarantine` happens
+# to have no `domain` column today. Add one — a plausible denormalisation — and
+# every call site silently rebinds to `q.domain`, making the predicate
+# `q.match_value = q.domain`, which matches nothing: the gate turns off
+# everywhere at once, with a green suite. Every other consumer of this builder
+# passes a qualified expression. All eight seed call sites use the unaliased
+# table name, so the table name itself is the qualifier.
+_SEED_QUARANTINE_DOMAIN_EXPR = "external_product_seeds.domain"
+
+
+def build_seed_quarantine_anti_join() -> str:
+    """The shared quarantine anti-join, scoped to what a seed row can supply.
+
+    `external_product_seeds` has no merchant_id / platform / source_system /
+    source_ref columns, so those three match types are passed NULL: `NULL || ':'
+    || NULL` is NULL on both engines, and `match_value = NULL` is never TRUE, so
+    they cannot match rather than matching wrongly.
+
+    That means only `domain` quarantines bite at this seam. Stated rather than
+    implied: an operator adding a `merchant_platform` quarantine expecting it to
+    stop external seeds would otherwise get a quarantine that reports success and
+    does nothing. The per-consumer Python gate in `services/offer_currency_policy`
+    still covers merchant_platform on the lanes it runs on.
+    """
+    from services.source_quarantine import build_quarantine_anti_join_sql
+
+    return build_quarantine_anti_join_sql(
+        row_domain_expr=_SEED_QUARANTINE_DOMAIN_EXPR,
+        row_merchant_expr="NULL",
+        row_platform_expr="NULL",
+        row_source_system_expr="NULL",
+        row_source_ref_expr="NULL",
     )
 
 
@@ -386,6 +450,11 @@ async def fetch_external_seed_rows(
     if rank_enabled:
         query_values.update(rank_values)
 
+    # Applied to BOTH statements. A quarantine clause on the page query but not
+    # the count would make total_count advertise rows the page cannot contain —
+    # the caller then pages into a tail that is permanently empty.
+    quarantine_clause = build_seed_quarantine_anti_join()
+
     query_sql = f"""
                 SELECT
                   id, external_product_id, market, tool, utm_template, partner_type, disclosure_text,
@@ -399,6 +468,7 @@ async def fetch_external_seed_rows(
                   {rank_expr} AS brand_term_hit
                 FROM external_product_seeds
                 WHERE {" AND ".join(where)}
+                {quarantine_clause}
                 ORDER BY brand_term_hit DESC, created_at DESC, id DESC
                 LIMIT :limit OFFSET :offset
                 """
@@ -406,6 +476,7 @@ async def fetch_external_seed_rows(
                 SELECT COUNT(*) AS total_count
                 FROM external_product_seeds
                 WHERE {" AND ".join(where)}
+                {quarantine_clause}
                 """
     count_values: Dict[str, Any] = {
         k: v for k, v in values.items() if k not in {"limit", "offset"}

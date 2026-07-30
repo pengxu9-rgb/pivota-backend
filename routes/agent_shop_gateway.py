@@ -50,7 +50,10 @@ from services.test_merchant_policy import (
     get_excluded_merchant_ids,
     filter_out_test_merchants,
 )
-from services.external_seed_search import fetch_external_seed_rows
+from services.external_seed_search import (
+    build_seed_quarantine_anti_join as _seed_quarantine_clause,
+    fetch_external_seed_rows,
+)
 from services.pivot_query_service import search_pivot_catalog
 from services.query_semantic_class import classify_query_semantic_class
 from services.similarity_service import (
@@ -3702,6 +3705,7 @@ async def _handle_offers_resolve(
                   AND attached_product_key IS NOT NULL
                   AND attached_product_key LIKE :attached_prefix ESCAPE '\\'
                   AND ({' OR '.join(match_clauses)})
+                  {_seed_quarantine_clause()}
                 ORDER BY updated_at DESC, created_at DESC
                 LIMIT :limit
                 """,
@@ -3798,6 +3802,7 @@ async def _handle_offers_resolve(
                   AND (CAST(:market AS TEXT) IS NULL OR market = CAST(:market AS TEXT) OR market = '*')
                   AND (CAST(:tool AS TEXT) IS NULL OR tool = CAST(:tool AS TEXT) OR tool = '*')
                   AND ({' OR '.join(title_clauses)})
+                  {_seed_quarantine_clause()}
                   AND {brand_clause}
                 ORDER BY
                   CASE WHEN attached_product_key IS NULL THEN 1 ELSE 0 END ASC,
@@ -4169,6 +4174,7 @@ async def _handle_offers_resolve(
                         SELECT *
                         FROM external_product_seeds
                         WHERE {" AND ".join(where_clauses)}
+                        {_seed_quarantine_clause()}
                         ORDER BY updated_at DESC, created_at DESC
                         LIMIT :limit
                         """,

@@ -58,6 +58,7 @@ from services.outbound_links_service import (
     make_redirect_token,
 )
 from services.external_seed_search import (
+    build_seed_quarantine_anti_join as _seed_quarantine_clause,
     dedupe_external_seed_rows,
     fetch_external_seed_rows,
 )
@@ -4281,7 +4282,7 @@ async def _load_external_seed_product_by_product_id(*, req: Request, product_id:
     row = None
     try:
         row = await database.fetch_one(
-            """
+            f"""
             SELECT
               id, external_product_id, market, tool, utm_template, partner_type, disclosure_text,
               destination_url, canonical_url, domain, title, image_url,
@@ -4298,6 +4299,7 @@ async def _load_external_seed_product_by_product_id(*, req: Request, product_id:
                 OR id = :pid
                 OR seed_data->>'external_product_id' = :pid
               )
+              {_seed_quarantine_clause()}
             ORDER BY updated_at DESC, created_at DESC
             LIMIT 1
             """,
@@ -4305,13 +4307,22 @@ async def _load_external_seed_product_by_product_id(*, req: Request, product_id:
         )
     except Exception as exc:
         msg = str(exc)
-        if "external_product_seeds" in msg and ("does not exist" in msg or "UndefinedTable" in msg or "relation" in msg):
+        # BOTH tables: the quarantine anti-join added to this query makes
+        # catalog_source_quarantine a hard dependency, so a database without
+        # migration 134 raises `relation "catalog_source_quarantine" does not
+        # exist` — which this classifier did not recognise, and the route 500'd
+        # instead of degrading. Prod has 134, but prod runs with
+        # SKIP_HEAVY_STARTUP_INIT=true and manual psql migrations, so a fresh
+        # staging DB is exactly the case that hits it.
+        if ("external_product_seeds" in msg or "catalog_source_quarantine" in msg) and (
+            "does not exist" in msg or "UndefinedTable" in msg or "no such table" in msg.lower()
+        ):
             return None
         # Backward compat: some deployments may have seed_data as TEXT.
         if "->>" in msg and ("operator does not exist" in msg or "UndefinedFunction" in msg):
             try:
                 row = await database.fetch_one(
-                    """
+                    f"""
                     SELECT
                       id, external_product_id, market, tool, utm_template, partner_type, disclosure_text,
                       destination_url, canonical_url, domain, title, image_url,
@@ -4324,6 +4335,7 @@ async def _load_external_seed_product_by_product_id(*, req: Request, product_id:
                     WHERE status = 'active'
                       AND attached_product_key IS NULL
                       AND (external_product_id = :pid OR id = :pid)
+                      {_seed_quarantine_clause()}
                     ORDER BY updated_at DESC, created_at DESC
                     LIMIT 1
                     """,
