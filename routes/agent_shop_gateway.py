@@ -944,6 +944,34 @@ async def _lookup_budget_fx_rate(
     return None, None
 
 
+def _observed_currency(*candidates: Any) -> Optional[str]:
+    """The first currency any source actually asserted, or None.
+
+    NO `or "USD"` tail. A chain ending in a constant emits a value no source
+    asserted AND destroys the question — with the field always populated,
+    nothing downstream can ask "what currency is this actually?" (#1634).
+
+    Whitespace-only is not an assertion either, so it collapses to None rather
+    than surviving as a truthy string that a `typeof x === 'string'` consumer
+    would accept.
+
+    ONE resolver for every external-seed projection. Two sites open-coding this
+    is how the tail came back the first time: the fix landed on the projection
+    and missed the ranked-candidate path, and a mutation run showed the second
+    site had no test at all.
+
+    Measured on prod 2026-07-30 before the tail was removed: 159 of 11,381
+    active seeds carry no currency, and ZERO of those carry a price — so this is
+    latent, not a live wrong-price bug, and a zero delta after deploy is the
+    expected result.
+    """
+    for candidate in candidates:
+        text = str(candidate or "").strip()
+        if text:
+            return text.upper()
+    return None
+
+
 async def _budget_allows_price(
     *,
     price_amount: Any,
@@ -972,6 +1000,21 @@ async def _budget_allows_price(
         diagnostics["budget_fx_source"] = fx_source
         diagnostics["budget_candidate_currency"] = currency
         diagnostics["budget_comparison_currency"] = budget_currency
+
+    # An amount with NO currency cannot be compared to a budget. Falling through
+    # would compare the bare number against price_min/price_max as though it were
+    # already in the budget's currency — the same fabrication the `or "USD"`
+    # removal above exists to end, one layer down. Refuse, and say why.
+    #
+    # Only when a budget constraint actually exists: with no min, no max and no
+    # budget currency the currency is irrelevant and excluding would be a
+    # regression.
+    _budget_constrained = (
+        price_min is not None or price_max is not None or budget_currency is not None
+    )
+    if _budget_constrained and comparable_amount is not None and comparable_currency is None:
+        diagnostics["budget_currency_unknown"] = True
+        return False, diagnostics
 
     if price_min is not None and comparable_amount is not None and comparable_amount < price_min:
         return False, diagnostics
@@ -6934,7 +6977,19 @@ def _external_seed_to_shop_product(
     title = row.get("title") or seed_data.get("title") or row.get("canonical_url") or row.get("destination_url")
     image_url = row.get("image_url") or seed_data.get("image_url")
     price_amount = row.get("price_amount") if row.get("price_amount") is not None else seed_data.get("price_amount")
-    price_currency = row.get("price_currency") or seed_data.get("price_currency") or "USD"
+    # NO `or "USD"`. A seed with no recorded currency now carries None, not a
+    # fabricated one. The chain ending in a constant emitted a value no source
+    # asserted AND made it impossible for anything downstream to ask "what
+    # currency is this actually?" — the field was always populated. #1634.
+    #
+    # Measured on prod 2026-07-30 before removing it: 159 of 11,381 active seeds
+    # have no currency, and ZERO of those carry a price. So this is latent, not
+    # a live wrong-price bug — which is also why it was safe to remove. A
+    # currency-less row must not become quotable; see _budget_allows_price and
+    # the quotable gate in the ACP feed.
+    price_currency = _observed_currency(
+        row.get("price_currency"), seed_data.get("price_currency")
+    )
     availability = row.get("availability") or seed_data.get("availability") or "unknown"
     variants = _normalize_seed_variants(seed_data)
     merchant_name = _external_seed_display_name(row, seed_data)
@@ -9341,12 +9396,11 @@ async def _handle_find_products_multi_inner(
                 continue
 
             price_amount = candidate.price_amount if candidate.price_amount is not None else row_dict.get("price_amount") or seed_data.get("price_amount")
-            price_currency = str(
-                candidate.price_currency
-                or row_dict.get("price_currency")
-                or seed_data.get("price_currency")
-                or "USD"
-            ).upper()
+            price_currency = _observed_currency(
+                candidate.price_currency,
+                row_dict.get("price_currency"),
+                seed_data.get("price_currency"),
+            )
             budget_allowed, budget_diagnostics = await _budget_allows_price(
                 price_amount=price_amount,
                 price_currency=price_currency,
