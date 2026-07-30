@@ -77,9 +77,12 @@ _DOMAINS_SQL = """
 # Observe-only price-magnitude list. Deliberately NOT restricted to the
 # suppressed_at IS NULL scope of the domain scan: a row suppressed FOR a price
 # defect must stay visible to price tooling (the 2026-07-27 backfill lesson),
-# so the split is reported instead. trim() not btrim() — the SQL-standard form
-# runs on both Postgres and the SQLite suite (#1568's inverse-trap lesson).
-# LIMIT bounds a pathological fleet; the print caps at 20 rows anyway.
+# so the split is reported instead. trim() not btrim(): a defensive convention
+# (#1568's inverse-trap lesson), not a live requirement — this script can't run
+# on SQLite anyway (_DOMAINS_SQL uses array_agg), so don't "fix" it to btrim
+# for sibling consistency; the standard form costs nothing and keeps the query
+# portable if it's ever lifted elsewhere. LIMIT bounds a pathological fleet;
+# the print caps at 20 rows anyway.
 _PRICE_ALERT_SQL = """
     SELECT o.offer_id,
            o.source_domain AS domain,

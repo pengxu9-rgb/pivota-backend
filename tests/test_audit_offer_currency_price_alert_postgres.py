@@ -58,6 +58,9 @@ def pg_engine():
     with engine.begin() as conn:
         offer(conn, f"{_PREFIX}oiad-live", 400000.00)
         offer(conn, f"{_PREFIX}suppressed-big", 250000.00, suppressed=True)
+        # exact-boundary pair: 1000.00 IN, 999.99 OUT — pins >= (a > mutation
+        # that keeps the 'list_price >=' literal survived the string guards)
+        offer(conn, f"{_PREFIX}at-threshold", 1000.00)
         offer(conn, f"{_PREFIX}below-threshold", 999.99)
         offer(conn, f"{_PREFIX}foreign-big", 300000.00, currency="KRW")
         # lower-cased usd with padding must still count as USD (trim+upper)
@@ -87,9 +90,9 @@ def test_alert_sql_executes_with_the_documented_semantics(pg_engine):
             if str(r._mapping["offer_id"]).startswith(_PREFIX)]
 
     got = [r["offer_id"] for r in rows]
-    # ordered by price desc; USD-only; threshold-inclusive scope
+    # ordered by price desc; USD-only; threshold-INCLUSIVE (the 1000.00 row)
     assert got == [f"{_PREFIX}oiad-live", f"{_PREFIX}suppressed-big",
-                   f"{_PREFIX}padded-usd"]
+                   f"{_PREFIX}padded-usd", f"{_PREFIX}at-threshold"]
     by_id = {r["offer_id"]: r for r in rows}
     # suppressed rows stay VISIBLE, flagged not filtered
     assert by_id[f"{_PREFIX}suppressed-big"]["is_suppressed"] is True

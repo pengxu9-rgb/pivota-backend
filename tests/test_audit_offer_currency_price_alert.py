@@ -66,9 +66,11 @@ class FakeDB:
         self.alert_queries = 0
 
     async def fetch_all(self, query, values=None):
-        if "list_price >=" in query:
+        # route on the bind name, not a SQL substring — _DOMAINS_SQL also
+        # mentions list_price, and a future edit to either query must not
+        # silently swap the two result sets
+        if values and "price_alert" in values:
             self.alert_queries += 1
-            assert values and "price_alert" in values
             return list(self.alert_rows)
         return list(self.domains_rows)
 
@@ -84,35 +86,56 @@ _OIAD_ALERT = {
 }
 
 
+# A genuine offender (mintree-class: stamped USD, storefront INR) so the
+# --apply drives all the way THROUGH the quarantine loop. Without it the
+# "never quarantined" assertion is vacuous — `if not offenders: return 0`
+# short-circuits before the loop, as the review's uncaught mutation proved.
+_MINTREE_DOMAIN = {"domain": "mintree.us", "currencies": ["USD"],
+                   "offers": 10, "max_price": 1999.0}
+
+
 @pytest.fixture
 def rig(monkeypatch):
     quarantined = []
 
-    async def _no_meta(domain, **kw):  # every storefront unresolvable
-        return None
+    async def _meta(domain, **kw):
+        if "mintree" in domain:
+            return {"currency": "INR", "country": "IN"}
+        return None  # every other storefront unresolvable
 
     async def _create_quarantine(**kw):
         quarantined.append(kw)
         return type("Q", (), {"quarantine_id": len(quarantined)})()
 
-    monkeypatch.setattr(mod, "fetch_storefront_meta", _no_meta)
+    monkeypatch.setattr(mod, "fetch_storefront_meta", _meta)
     monkeypatch.setattr(mod, "create_quarantine", _create_quarantine)
     return quarantined
 
 
-@pytest.mark.parametrize("argv_extra", [[], ["--apply", "--confirm", mod.CONFIRM_TOKEN,
-                                             "--created-by", "test@x"]])
-def test_alert_rows_are_printed_but_never_quarantined(monkeypatch, capsys, rig, argv_extra):
+@pytest.mark.parametrize("apply_mode", [False, True])
+def test_alert_rows_are_printed_but_never_quarantined(monkeypatch, capsys, rig, apply_mode):
     """The Oiad row appears on the list in BOTH dry-run and --apply modes, and
-    --apply must not quarantine oiad.us off the back of a magnitude signal."""
-    db = FakeDB(alert_rows=[_OIAD_ALERT])
+    --apply must not quarantine oiad.us off the back of a magnitude signal —
+    proven NON-vacuously: a genuine offender rides along so the quarantine
+    loop actually executes, and only the offender lands in it. The alert row
+    also must not inflate the --max-quarantine offender count (here the cap
+    is 1: one real offender passes it; alerts counting toward it would REFUSE)."""
+    argv = ["--min-offers", "1"]
+    if apply_mode:
+        argv += ["--apply", "--confirm", mod.CONFIRM_TOKEN,
+                 "--created-by", "test@x", "--max-quarantine", "1"]
+    db = FakeDB(domains_rows=[_MINTREE_DOMAIN], alert_rows=[_OIAD_ALERT])
     monkeypatch.setattr(mod, "database", db)
-    rc = mod.main(argv_extra)
+    rc = mod.main(argv)
     out = capsys.readouterr().out
     assert rc == 0
     assert "IMPLAUSIBLE-PRICE REVIEW LIST: 1 USD-stamped" in out
     assert "oiad.us" in out and "400000.00 USD" in out and "live" in out
-    assert rig == [], "price magnitude must never drive a quarantine"
+    if apply_mode:
+        assert [q["match_value"] for q in rig] == ["mintree.us"], (
+            "the genuine offender must be quarantined — and nothing else")
+    else:
+        assert rig == []
 
 
 def test_suppressed_alert_rows_are_marked(monkeypatch, capsys, rig):
