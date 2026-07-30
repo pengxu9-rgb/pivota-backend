@@ -49,7 +49,7 @@ class Quarantine:
     metadata: Optional[dict[str, Any]]
 
 
-def _sql_bare_domain(expr: str) -> str:
+def sql_bare_domain(expr: str) -> str:
     """Lowercase, `www.`-stripped, empty-as-NULL — applied to BOTH sides.
 
     Stripping only the ROW side is an under-block that also splits this gate
@@ -73,7 +73,13 @@ def _sql_bare_domain(expr: str) -> str:
     SQLite. `regexp_replace` would be Postgres-only, and this fragment is now
     embedded in a code path whose suite runs on SQLite.
     """
-    lowered = f"lower(coalesce({expr}, ''))"
+    # trim() as well as lower(): the Python twin does `.strip().lower()`, and
+    # without it the two implementations of this one rule disagree on any padded
+    # value — `'  mintree.us  '` normalised to itself in SQL and to
+    # `'mintree.us'` in Python. `create_quarantine` only `.strip()`s its input,
+    # but a value written by a direct SQL op is not stripped at all.
+    # Portable: trim/lower/substr/nullif behave identically on PG and SQLite.
+    lowered = f"trim(lower(coalesce({expr}, '')))"
     return (
         f"nullif(CASE WHEN {lowered} LIKE 'www.%' "
         f"THEN substr({lowered}, 5) ELSE {lowered} END, '')"
@@ -151,7 +157,7 @@ def build_quarantine_anti_join_sql(
     #
     # 🚨 THE TRAP, and why each arm looks the way it does. `x NOT IN (S)` is NULL
     # — not TRUE — whenever S contains a NULL, so a single NULL in the subquery
-    # silently excludes EVERY row. `_sql_bare_domain` deliberately maps a blank
+    # silently excludes EVERY row. `sql_bare_domain` deliberately maps a blank
     # match_value to NULL, so S *will* contain NULLs unless filtered. Hence the
     # `IS NOT NULL` guard inside every subquery. And `{expr} IS NULL OR ...` on
     # the outside preserves the old behaviour for a row with no domain: it
@@ -160,8 +166,8 @@ def build_quarantine_anti_join_sql(
     # `IS NULL OR NOT IN` rather than `COALESCE(... , TRUE)`: COALESCE over a
     # boolean is where SQLite and Postgres are least alike, and portability is
     # what makes this fragment testable at all.
-    domain_row = _sql_bare_domain(row_domain_expr)
-    domain_val = _sql_bare_domain("q.match_value")
+    domain_row = sql_bare_domain(row_domain_expr)
+    domain_val = sql_bare_domain("q.match_value")
     merchant_row = f"{row_merchant_expr} || ':' || {row_platform_expr}"
     source_row = f"{row_source_system_expr} || ':' || {row_source_ref_expr}"
 
@@ -229,6 +235,17 @@ async def create_quarantine(
 ) -> Quarantine:
     _validate_match_type(match_type)
     normalized_match_value = _required_text(match_value, "match_value")
+    # CANONICALISE a domain at WRITE time. Read-side normalisation is applied in
+    # all four comparators, so this is belt-and-braces rather than the fix — but
+    # it means the stored value is what an operator would expect to see, and it
+    # removes the whole class rather than requiring four call sites to keep
+    # agreeing. An operator typing `www.mintree.us` or `MINTREE.US` previously
+    # stored it verbatim and got a quarantine that reported success while some
+    # comparators honoured it and others did not (#1639).
+    if match_type == MATCH_TYPE_DOMAIN:
+        normalized_match_value = normalize_domain(normalized_match_value)
+        if not normalized_match_value:
+            raise ValueError("match_value is required")
     normalized_created_by = _required_text(created_by, "created_by")
     row = await _fetch_one(
         db,
@@ -317,7 +334,21 @@ def quarantine_matches_source(
         return False
 
     if quarantine.match_type == MATCH_TYPE_DOMAIN:
-        return _normalize_domain(quarantine.match_value) == _normalize_domain(domain)
+        # A blank match_value must match NOTHING, not every domain-less row.
+        # Without this guard `normalize_domain('') == normalize_domain(None)` is
+        # `'' == ''` -> True, so one blank quarantine row silently quarantines
+        # every row whose domain sources are all empty. `match_value` is
+        # `TEXT NOT NULL` with no non-empty CHECK and these rows come from direct
+        # SQL ops, so a blank is reachable.
+        #
+        # The SQL twin gets this from `nullif(..., '')`; this is the Python side
+        # of the same guard, and it is why they now agree on blanks. Callers that
+        # already guard locally (services/offer_currency_policy) keep doing so as
+        # belt-and-braces — this is the authoritative one.
+        normalized = normalize_domain(quarantine.match_value)
+        if not normalized:
+            return False
+        return normalized == normalize_domain(domain)
 
     if quarantine.match_type == MATCH_TYPE_MERCHANT_PLATFORM:
         return quarantine.match_value == _join_match_value(merchant_id, platform)
@@ -341,11 +372,11 @@ def _required_text(value: Optional[str], name: str) -> str:
     return normalized
 
 
-def _normalize_domain(value: Optional[str]) -> str:
+def normalize_domain(value: Optional[str]) -> str:
     """Bare host: lowercase, no leading `www.`.
 
     Applied to BOTH the quarantine's match_value and the row's domain, and kept
-    byte-equivalent to `_sql_bare_domain` above so the Python matcher and the
+    byte-equivalent to `sql_bare_domain` above so the Python matcher and the
     SQL anti-join can never disagree about the same pair. They did before:
     a `www.mintree.us` quarantine matched nothing on either side while a
     `mintree.us` one matched only on the side that happened to strip.

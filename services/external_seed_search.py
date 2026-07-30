@@ -324,7 +324,7 @@ def _is_external_seed_query_timeout(exc: Exception) -> bool:
 # The seed row's storefront column, passed RAW.
 #
 # Normalisation (lowercase, `www.` strip, empty-as-NULL) lives in
-# `source_quarantine._sql_bare_domain` and is applied to BOTH sides of the
+# `source_quarantine.sql_bare_domain` and is applied to BOTH sides of the
 # comparison there. An earlier version normalised only here — which under-blocked
 # a `www.`-prefixed quarantine value and split this gate from the Python matcher,
 # each blocking a pair the other let through. One normaliser, both sides, one

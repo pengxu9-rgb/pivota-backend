@@ -15,7 +15,7 @@ NOT trivially true in SQL, because `NOT IN` is NULL-propagating in a way
     and a NULL predicate excludes the row.
 
 So a single NULL in any subquery silently drops the ENTIRE result set, and
-`_sql_bare_domain` deliberately produces NULL for a blank match_value. This file
+`sql_bare_domain` deliberately produces NULL for a blank match_value. This file
 exists to prove the rewrite preserves behaviour on exactly those edges, by
 running BOTH forms over a matrix and asserting identical row sets — not
 identical counts, which would pass while returning different rows.
@@ -31,7 +31,7 @@ import sqlite3
 
 import pytest
 
-from services.source_quarantine import _sql_bare_domain, build_quarantine_anti_join_sql
+from services.source_quarantine import build_quarantine_anti_join_sql, sql_bare_domain
 
 
 def _legacy_correlated_sql(
@@ -48,7 +48,7 @@ AND NOT EXISTS (
   WHERE q.state = 'active'
     AND (q.expires_at IS NULL OR q.expires_at > CURRENT_TIMESTAMP)
     AND (
-      (q.match_type = 'domain' AND {_sql_bare_domain("q.match_value")} = {_sql_bare_domain(row_domain_expr)})
+      (q.match_type = 'domain' AND {sql_bare_domain("q.match_value")} = {sql_bare_domain(row_domain_expr)})
       OR (q.match_type = 'merchant_platform' AND q.match_value = {row_merchant_expr} || ':' || {row_platform_expr})
       OR (q.match_type = 'source_system_ref' AND q.match_value = {row_source_system_expr} || ':' || {row_source_ref_expr})
     )
