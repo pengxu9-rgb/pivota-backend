@@ -110,21 +110,57 @@ def build_quarantine_anti_join_sql(
 
     # CURRENT_TIMESTAMP, not now(): identical on Postgres (both give the
     # transaction timestamp), but `now()` does not exist on SQLite — and this
-    # fragment is now embedded in `external_seed_search`, whose suite runs on
+    # fragment is embedded in `external_seed_search`, whose suite runs on
     # SQLite. With now() that suite cannot EXECUTE the predicate at all, so the
     # gate would be green-but-unexercised in the only place it is tested. That
     # is the exact shape that cost a 16-minute prod feed outage in #1588.
-    return f"""
-AND NOT EXISTS (
-  SELECT 1 FROM catalog_source_quarantine q
-  WHERE q.state = 'active'
-    AND (q.expires_at IS NULL OR q.expires_at > CURRENT_TIMESTAMP)
-    AND (
-      (q.match_type = 'domain' AND {_sql_bare_domain("q.match_value")} = {_sql_bare_domain(row_domain_expr)})
-      OR (q.match_type = 'merchant_platform' AND q.match_value = {row_merchant_expr} || ':' || {row_platform_expr})
-      OR (q.match_type = 'source_system_ref' AND q.match_value = {row_source_system_expr} || ':' || {row_source_ref_expr})
+    live = (
+        "q.state = 'active' "
+        "AND (q.expires_at IS NULL OR q.expires_at > CURRENT_TIMESTAMP)"
     )
-)""".strip()
+
+    # UNCORRELATED, one arm per match type. The previous form was a single
+    # correlated `NOT EXISTS` whose subquery referenced the outer row, so
+    # Postgres planned it as a Nested Loop Anti Join with a Materialize node
+    # rescanned PER OUTER ROW: 68.1 ms vs 17.8 ms on a prod-shaped corpus, with
+    # `Rows Removed by Join Filter: 172,656`. Nothing about the 16-row table
+    # justified that; the planner chose it because the caller's `LIKE '%…%'`
+    # OR-chain estimates 3 rows against an actual 11,003.
+    #
+    # Splitting into three subqueries that reference NO outer column lets each
+    # be evaluated once and hashed. `NOT (A OR B OR C)` ≡ `NOT A AND NOT B AND
+    # NOT C`, so this is a pure re-association — proven by differential test, not
+    # by this comment (see tests/test_quarantine_anti_join_equivalence.py).
+    #
+    # 🚨 THE TRAP, and why each arm looks the way it does. `x NOT IN (S)` is NULL
+    # — not TRUE — whenever S contains a NULL, so a single NULL in the subquery
+    # silently excludes EVERY row. `_sql_bare_domain` deliberately maps a blank
+    # match_value to NULL, so S *will* contain NULLs unless filtered. Hence the
+    # `IS NOT NULL` guard inside every subquery. And `{expr} IS NULL OR ...` on
+    # the outside preserves the old behaviour for a row with no domain: it
+    # matched nothing under NOT EXISTS, so it must be KEPT here.
+    #
+    # `IS NULL OR NOT IN` rather than `COALESCE(... , TRUE)`: COALESCE over a
+    # boolean is where SQLite and Postgres are least alike, and portability is
+    # what makes this fragment testable at all.
+    domain_row = _sql_bare_domain(row_domain_expr)
+    domain_val = _sql_bare_domain("q.match_value")
+    merchant_row = f"{row_merchant_expr} || ':' || {row_platform_expr}"
+    source_row = f"{row_source_system_expr} || ':' || {row_source_ref_expr}"
+
+    return f"""
+AND ({domain_row} IS NULL OR {domain_row} NOT IN (
+  SELECT {domain_val} FROM catalog_source_quarantine q
+  WHERE {live} AND q.match_type = 'domain' AND {domain_val} IS NOT NULL
+))
+AND ({merchant_row} IS NULL OR {merchant_row} NOT IN (
+  SELECT q.match_value FROM catalog_source_quarantine q
+  WHERE {live} AND q.match_type = 'merchant_platform' AND q.match_value IS NOT NULL
+))
+AND ({source_row} IS NULL OR {source_row} NOT IN (
+  SELECT q.match_value FROM catalog_source_quarantine q
+  WHERE {live} AND q.match_type = 'source_system_ref' AND q.match_value IS NOT NULL
+))""".strip()
 
 
 async def load_active_quarantines(*, db: Any) -> list[Quarantine]:
