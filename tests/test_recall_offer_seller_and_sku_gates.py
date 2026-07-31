@@ -145,7 +145,7 @@ async def _ensure_schema() -> None:
             merchant_name VARCHAR(255),
             primary_platform VARCHAR(64),
             status VARCHAR(32) NOT NULL DEFAULT 'active',
-            indexable BOOLEAN DEFAULT TRUE,
+            indexable BOOLEAN NOT NULL DEFAULT TRUE,
             source_system VARCHAR(64),
             source_ref VARCHAR(255),
             metadata_json TEXT,
@@ -213,7 +213,7 @@ async def _ensure_schema() -> None:
         ("catalog_offers", "is_first_party", "BOOLEAN"),
         ("catalog_offers", "source_domain", "TEXT"),
         ("catalog_offers", "why_buy_direct", "TEXT"),
-        ("catalog_merchants", "indexable", "BOOLEAN DEFAULT TRUE"),
+        ("catalog_merchants", "indexable", "BOOLEAN NOT NULL DEFAULT TRUE"),
         ("catalog_merchants", "metadata_json", "TEXT"),
         ("catalog_merchants", "primary_platform", "VARCHAR(64)"),
         ("catalog_products", "created_at", "TIMESTAMP"),
@@ -464,24 +464,13 @@ async def test_seller_status_matching_is_case_insensitive_and_inactive_only(
     assert served is expected_serving
 
 
-@pytest.mark.asyncio
-async def test_seller_row_exists_with_null_indexable_still_serves():
-    """Distinct from 'no row at all': prod has `indexable BOOLEAN NOT NULL`, so
-    this state is unreachable there — but the fixture can reach it, and the
-    COALESCE conflates the two cases. Pinned so the conflation is a decision
-    rather than an accident."""
-    await _merchant(f"{_PREFIX}_owner")
-    await database.execute(
-        """
-        INSERT INTO catalog_merchants
-            (merchant_id, merchant_name, status, indexable, metadata_json, created_at, updated_at)
-        VALUES (:m, :m, 'active', NULL, '{}', CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)
-        """,
-        {"m": f"{_PREFIX}_seller"},
-    )
-    await _product_with_offer(f"{_PREFIX}_p1", owner=f"{_PREFIX}_owner", seller=f"{_PREFIX}_seller")
-
-    assert await _recall() == [f"{_PREFIX}_p1"]
+# NOTE — there is deliberately NO test for "row exists, indexable IS NULL".
+# `db/catalog.py:28` declares `indexable` NOT NULL (server_default true) and prod
+# agrees, so that state is unreachable: the COALESCE's only reachable branch is
+# the JOIN MISS, which `test_seller_with_no_catalog_merchants_row_still_serves`
+# covers. A test for it existed briefly and CI killed it — it could only be
+# written by making this fixture laxer than production, which is precisely the
+# defect this file has now paid for twice.
 
 
 @pytest.mark.asyncio
