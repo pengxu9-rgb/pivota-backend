@@ -861,6 +861,32 @@ async def _fetch_canonical_search_rows(
     merchant_status_clause = ""
     if not merchant_id:
         merchant_status_clause = "AND lower(COALESCE(m.status, 'active')) <> 'inactive'"
+
+    # #1648: a suppressed/tombstoned product row must not surface in cross-
+    # merchant recall. Recall previously gated suppression on OFFERS only
+    # (o.suppressed_at), so a withdrawn catalog_products row kept serving
+    # through this lane. BOTH columns are gated: catalog_trust_policy treats
+    # suppression_reason alone as tombstoned, and the step5-generation writers
+    # set reason without suppressed_at (2,332 such rows backfilled 2026-07-30)
+    # — the both-column gate keeps a future reason-only writer from re-opening
+    # the leak. Merchant-scoped queries skip this so a merchant still sees
+    # their own withdrawn rows in the operator dashboard.
+    suppression_clause = ""
+    if not merchant_id:
+        suppression_clause = (
+            "AND p.suppressed_at IS NULL AND p.suppression_reason IS NULL"
+        )
+
+    # #1648: honor catalog_merchants.indexable in cross-merchant recall. It was
+    # the ONE fence set correctly on the retired test rig (migration 139 set
+    # indexable=FALSE) and no search lane read it. COALESCE keeps rows with no
+    # catalog_merchants row (external seeds) serving, mirroring
+    # merchant_status_clause. This is NOT a widening of the gate to IPS
+    # serving_eligible — that would be a recall-shrink product decision; see
+    # #1648's review notes.
+    indexable_clause = ""
+    if not merchant_id:
+        indexable_clause = "AND COALESCE(m.indexable, TRUE) IS TRUE"
     vertical_where = ""
     vertical_score = ""
     if vertical_search:
@@ -1033,6 +1059,8 @@ async def _fetch_canonical_search_rows(
             {lifecycle_clause}
             {sync_status_clause}
             {merchant_status_clause}
+            {suppression_clause}
+            {indexable_clause}
             ORDER BY rank_score DESC, p.updated_at DESC, s.updated_at DESC
             LIMIT :candidate_limit
         )
@@ -1265,6 +1293,23 @@ async def _fetch_citable_canonical_rows(
             "OR p.pdp_lifecycle_stage IS NULL)"
         )
         sync_status_clause = "AND p.sync_status = 'live'"
+
+    # #1648: this OFFER-FREE lane is exactly where the retired rig's
+    # external_seed mirror rows leaked (it joins ips.index_eligible, which was
+    # stale, and previously carried NONE of the row-level source gates). Mirror
+    # the canonical lane's three gates verbatim: deactivated-merchant status,
+    # product-row suppression (BOTH columns — see the canonical lane comment),
+    # and catalog_merchants.indexable. All merchant_id-conditional so a
+    # merchant still sees their own rows.
+    merchant_status_clause = ""
+    suppression_clause = ""
+    indexable_clause = ""
+    if not merchant_id:
+        merchant_status_clause = "AND lower(COALESCE(m.status, 'active')) <> 'inactive'"
+        suppression_clause = (
+            "AND p.suppressed_at IS NULL AND p.suppression_reason IS NULL"
+        )
+        indexable_clause = "AND COALESCE(m.indexable, TRUE) IS TRUE"
     category_where = ""
     category_score = ""
     if category_prefix:
@@ -1396,6 +1441,9 @@ async def _fetch_citable_canonical_rows(
           {merchant_clause}
           {lifecycle_clause}
           {sync_status_clause}
+          {merchant_status_clause}
+          {suppression_clause}
+          {indexable_clause}
         ORDER BY rank_score DESC, p.updated_at DESC
         LIMIT :row_limit
         """,

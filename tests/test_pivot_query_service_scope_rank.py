@@ -237,3 +237,84 @@ def test_canonical_recall_wires_flag_gated_token_overlap():
     # Cross-merchant only (merchant-scoped queries already see their own rows).
     idx = src.index("token_where = \"\"")
     assert "if not merchant_id and _canonical_token_match_enabled()" in src[idx:idx + 400]
+
+
+# ---------------------------------------------------------------------------
+# #1648 — retired-rig / deactivated-merchant leak: row suppression +
+# catalog_merchants.indexable gates on BOTH cross-merchant recall lanes
+# ---------------------------------------------------------------------------
+
+
+def test_canonical_search_excludes_suppressed_rows_from_global_recall():
+    """A withdrawn catalog_products row (retire scripts, dedupe sweeps) must not
+    surface in cross-merchant recall. Recall previously gated suppression on
+    OFFERS only (o.suppressed_at) — the retired merch_efbc rig's rows leaked
+    through this hole (#1648). BOTH columns must be gated: catalog_trust_policy
+    treats suppression_reason alone as tombstoned, and the step5-generation
+    writers set reason without suppressed_at, so a reason-only row is
+    'tombstoned' to trust policy and 'clean' to a suppressed_at-only filter."""
+    src = _src(pivot_query_service._fetch_canonical_search_rows)
+    assert "p.suppressed_at IS NULL AND p.suppression_reason IS NULL" in src, (
+        "global recall must exclude product rows with EITHER suppression column set"
+    )
+    assert "suppression_clause" in src and "{suppression_clause}" in src, (
+        "the suppression filter must be a named fragment interpolated into the SQL"
+    )
+    # Merchant-scoped queries keep seeing their own withdrawn rows.
+    idx = src.index("suppression_clause = \"\"")
+    assert "if not merchant_id" in src[idx:idx + 200], (
+        "suppression_clause must be merchant_id-conditional"
+    )
+
+
+def test_canonical_search_honors_catalog_merchants_indexable():
+    """catalog_merchants.indexable=FALSE was the ONE fence set correctly on the
+    retired rig (migration 139) and no search lane read it (#1648). COALESCE
+    keeps rows with no catalog_merchants row (external seeds) serving —
+    mirroring merchant_status_clause, and per the prior art in
+    test_pivota_canonical_routes a bare status/indexable equality that drops
+    NULLs is forbidden."""
+    src = _src(pivot_query_service._fetch_canonical_search_rows)
+    assert "COALESCE(m.indexable, TRUE) IS TRUE" in src, (
+        "global recall must honor catalog_merchants.indexable with a NULL-keeping COALESCE"
+    )
+    assert "indexable_clause" in src and "{indexable_clause}" in src
+    idx = src.index("indexable_clause = \"\"")
+    assert "if not merchant_id" in src[idx:idx + 200], (
+        "indexable_clause must be merchant_id-conditional"
+    )
+
+
+def test_citable_lane_carries_all_three_source_gates():
+    """The OFFER-FREE citable lane is exactly where the rig's external_seed
+    mirror rows leaked (#1648): it joins ips.index_eligible (which can be
+    stale) and previously carried NONE of the row-level source gates. It must
+    mirror the canonical lane's three gates verbatim, all
+    merchant_id-conditional."""
+    src = _src(pivot_query_service._fetch_citable_canonical_rows)
+    assert "lower(COALESCE(m.status, 'active')) <> 'inactive'" in src, (
+        "citable lane must exclude deactivated merchants like the canonical lane"
+    )
+    assert "p.suppressed_at IS NULL AND p.suppression_reason IS NULL" in src, (
+        "citable lane must exclude suppressed product rows (both columns)"
+    )
+    assert "COALESCE(m.indexable, TRUE) IS TRUE" in src, (
+        "citable lane must honor catalog_merchants.indexable"
+    )
+    for frag in ("{merchant_status_clause}", "{suppression_clause}", "{indexable_clause}"):
+        assert frag in src, f"citable lane SQL must interpolate {frag}"
+    # Each gate's empty-init must sit inside the merchant_id guard window.
+    # Checking all three (not just the first) matters: review of #1650
+    # mutation-proved that hoisting suppression_clause out of the guard —
+    # hiding a merchant's own withdrawn rows from their operator dashboard —
+    # passed a merchant_status-only window check.
+    for init in (
+        'merchant_status_clause = ""',
+        'suppression_clause = ""',
+        'indexable_clause = ""',
+    ):
+        idx = src.index(init)
+        assert "if not merchant_id" in src[idx:idx + 300], (
+            f"{init.split(' ')[0]} must be assigned inside an `if not merchant_id` "
+            "branch so merchant-scoped queries keep seeing the merchant's own rows"
+        )
