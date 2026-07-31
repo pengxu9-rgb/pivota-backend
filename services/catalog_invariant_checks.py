@@ -18,6 +18,7 @@ from typing import Any, Dict, List
 from sqlalchemy import Boolean, String, and_, column, func, not_, select, table
 
 from db.catalog import catalog_products
+from services.index_pipeline_state_service import QUALITY_SCORE_THRESHOLD
 from services.pdp_renderability import compile_pg, pdp_renderable_expression
 from services.priced_offer_sql import priced_offer_exists_sql
 
@@ -386,6 +387,91 @@ _CHECKS: List[Dict[str, Any]] = [
                     AND crt2.serving_decision = 'public'
               )
             LIMIT 5
+        """,
+    },
+    {
+        "name": "elected_canonical_below_quality_floor",
+        "description": (
+            "the elected canonical row for a serving content_key scores below "
+            "the quality floor itself — the URL we advertise is the weakest "
+            "copy, and the election cannot move on its own"
+        ),
+        "env": "CATALOG_INVARIANT_ELECTED_QUALITY_THRESHOLD",
+        # THE CIRCULARITY THIS EXISTS TO MAKE VISIBLE. Three facts close a loop:
+        #
+        #   1. index_pipeline_state.serving_eligible is CONTENT-grained and its
+        #      writer picks the BEST sibling (_select_content_key_state), so one
+        #      strong row makes the whole content_key eligible;
+        #   2. the elector's candidate set (canonical_sitemap_candidates
+        #      .sitemap_electable_filter -> pdp_will_render_expression ->
+        #      pdp_serving_gate_passes) asks that same content-grained flag, so
+        #      a WEAK row stays an eligible candidate on its sibling's strength;
+        #   3. the stickiness rule re-elects only when the stored winner stops
+        #      being a candidate — which (2) guarantees it never does.
+        #
+        # So a below-floor row can win the URL and keep it indefinitely while a
+        # better sibling sits unused. Measured 2026-07-31: exactly one,
+        # ck_c16508d15628d445345d12e50b6a68d8 — elected row scores 50.0, its
+        # sibling 83.3.
+        #
+        # 🚨 DO NOT "FIX" THIS BY MAKING index_pipeline_state DESCRIBE THE
+        # ELECTED ROW. That was the obvious move and it is a LATCH: flipping the
+        # content_key ineligible removes candidacy from EVERY row via (2), the
+        # elector can then never re-elect, and the content goes dark forever
+        # despite having a healthy sibling. Verified by replaying the real
+        # classifier over all 160 multi-row elected content_keys — 159 unchanged,
+        # and the 1 that changed is exactly this row going dark. `max(_state_rank)`
+        # is the CORRECT semantics for "can this content serve at all"; the defect
+        # is that a weak row holds the URL, not that the content is eligible.
+        #
+        # The resolutions are re-election or quality repair, both of which move a
+        # LIVE URL and cost the old one's index equity — a founder call, which is
+        # why this SURFACES the state instead of acting on it.
+        #
+        # Threshold is the measured baseline of the UNEXPLAINED residual, per this
+        # module's convention: the single known case is explained and awaiting
+        # that decision, so 1 rather than a check that ships permanently red.
+        # Drop to 0 the day it is resolved.
+        "default_threshold": 1,
+        "count_sql": f"""
+            SELECT count(*) AS c
+            FROM content_canonical_election cce
+            JOIN index_pipeline_state ips
+              ON ips.content_key = cce.content_key
+            JOIN catalog_products cp
+              ON cp.content_key = cce.content_key
+             AND cp.pivota_signature_id = cce.canonical_sig_id
+             AND cp.suppressed_at IS NULL
+            WHERE ips.serving_eligible IS TRUE
+              AND coalesce((
+                  SELECT pqs.content_quality_score
+                  FROM product_quality_snapshot pqs
+                  WHERE pqs.merchant_id = cp.merchant_id
+                    AND pqs.platform = cp.platform
+                    AND pqs.platform_product_id = cp.source_product_id
+                  ORDER BY pqs.snapshot_date DESC
+                  LIMIT 1
+              ), -1) < {QUALITY_SCORE_THRESHOLD}
+        """,
+        "sample_sql": f"""
+            SELECT cce.content_key AS subject_key
+            FROM content_canonical_election cce
+            JOIN index_pipeline_state ips
+              ON ips.content_key = cce.content_key
+            JOIN catalog_products cp
+              ON cp.content_key = cce.content_key
+             AND cp.pivota_signature_id = cce.canonical_sig_id
+             AND cp.suppressed_at IS NULL
+            WHERE ips.serving_eligible IS TRUE
+              AND coalesce((
+                  SELECT pqs.content_quality_score
+                  FROM product_quality_snapshot pqs
+                  WHERE pqs.merchant_id = cp.merchant_id
+                    AND pqs.platform = cp.platform
+                    AND pqs.platform_product_id = cp.source_product_id
+                  ORDER BY pqs.snapshot_date DESC
+                  LIMIT 1
+              ), -1) < {QUALITY_SCORE_THRESHOLD}
         """,
     },
     {
