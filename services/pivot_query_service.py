@@ -887,6 +887,58 @@ async def _fetch_canonical_search_rows(
     indexable_clause = ""
     if not merchant_id:
         indexable_clause = "AND COALESCE(m.indexable, TRUE) IS TRUE"
+
+    # H1 (#1648) — gate the OFFER SELLER, not just the product row's merchant.
+    # Every gate above joins `m` on p.merchant_id, i.e. whoever OWNS the
+    # canonical row. The merchant whose price and availability this lane
+    # actually publishes is `o.merchant_id` (alias `bm`), and the two are
+    # different for 3,423 of 14,867 unsuppressed offers on prod (2026-07-31).
+    #
+    # Failure scenario: retired merchant R's offer hangs off a sku under a
+    # canonical row owned by `external_seed` (active, indexable) -> every gate
+    # above passes on the OWNER, and R's price surfaces in cross-merchant
+    # recall. Only `o.suppressed_at IS NULL` stops it, and the rig is safe today
+    # only because the 2026-07-30 closure suppressed its offers.
+    #
+    # NULL-KEEPING COALESCE IS LOAD-BEARING (see the m-clauses above): 741
+    # unsuppressed offers have a seller with NO catalog_merchants row at all.
+    # A bare `bm.status = 'active'` / `bm.indexable IS TRUE` would delete every
+    # one of them from recall. Prior art pinned in
+    # tests/test_pivota_canonical_routes.py:674.
+    #
+    # This must be a WHERE, not extra ON conditions: `bm` is LEFT JOINed, so
+    # conditions in the ON would merely null the alias out and let the row
+    # through — the gate would read as present and filter nothing.
+    offer_seller_where = ""
+    if not merchant_id:
+        offer_seller_where = (
+            "WHERE lower(COALESCE(bm.status, 'active')) <> 'inactive' "
+            "AND COALESCE(bm.indexable, TRUE) IS TRUE"
+        )
+
+    # H3 (#1648) — the recall CTE joins catalog_skus and ignores its suppression
+    # columns. No live gap today (38 suppressed skus on prod, 0 of them under an
+    # unsuppressed product, because the sole sku-suppression writer —
+    # scripts/merge_duplicate_canonicals.py — also suppresses the loser product).
+    # Belt-and-braces so a sku-only retirement writer cannot re-open the leak;
+    # BOTH columns for the same reason the product clause gates both.
+    #
+    # KNOWN DIVERGENCE, deliberately accepted: this makes the recall lane the
+    # ONLY reader of catalog_skus suppression in the codebase.
+    # services/agent_pdp_view_assembler.py (fetch_skus_for_keys, which populates
+    # the PDP variant list) and routes/audit_runs_routes.py read catalog_skus
+    # with no suppression filter. So a suppressed sku is hidden from recall while
+    # still rendering as a PDP variant — a lane divergence of the same CLASS as
+    # #1648 itself, though in the safe direction (recall shows less, not more)
+    # and affecting 0 rows today (38 suppressed skus, none under an unsuppressed
+    # product). Converging those readers is tracked on #1648; it is not done here
+    # because touching the PDP assembler carries the same 404-flip blast radius
+    # as H2 and needs its own door re-verify.
+    sku_suppression_clause = ""
+    if not merchant_id:
+        sku_suppression_clause = (
+            "AND s.suppressed_at IS NULL AND s.suppression_reason IS NULL"
+        )
     vertical_where = ""
     vertical_score = ""
     if vertical_search:
@@ -1061,6 +1113,7 @@ async def _fetch_canonical_search_rows(
             {merchant_status_clause}
             {suppression_clause}
             {indexable_clause}
+            {sku_suppression_clause}
             ORDER BY rank_score DESC, p.updated_at DESC, s.updated_at DESC
             LIMIT :candidate_limit
         )
@@ -1132,6 +1185,7 @@ async def _fetch_canonical_search_rows(
          AND o.suppressed_at IS NULL
         LEFT JOIN catalog_merchants bm
           ON bm.merchant_id = o.merchant_id
+        {offer_seller_where}
         ORDER BY rank_score DESC, c.product_updated_at DESC, o.updated_at DESC
         LIMIT :row_limit
         """,

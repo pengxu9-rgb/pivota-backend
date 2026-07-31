@@ -38,6 +38,10 @@ __pycache__/
 # local sqlite scratch DB created by some dev scripts
 pivota.db
 pivota_test.db
+# Any scratch SQLite DB a test run leaves behind. `git add -A` swept t.db
+# into a commit on this branch; a binary artifact must never reach main.
+*.db
+*.db-journal
 *.sqlite
 *.sqlite3
 
