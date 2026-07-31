@@ -527,7 +527,8 @@ async def _quote_lookups(key: str) -> Dict[str, Any]:
 
 @pytest.mark.parametrize(
     "leg",
-    ["owner_status", "owner_indexable", "seller_status", "seller_indexable",
+    ["owner_status", "owner_status_upper", "owner_indexable",
+     "seller_status", "seller_status_upper", "seller_indexable",
      "product_suppressed_at", "product_suppression_reason",
      "sku_suppressed_at", "sku_suppression_reason"],
 )
@@ -536,10 +537,14 @@ async def test_each_gate_leg_alone_closes_all_three_quote_fetchers(leg: str):
     """One leg at a time. Deleting any single leg from any single fetcher must
     fail here — that is the property the previous version did not have."""
     owner, seller = f"{_PREFIX}_owner", f"{_PREFIX}_seller"
-    await _merchant(owner, status="inactive" if leg == "owner_status" else "active",
-                    indexable=leg != "owner_indexable")
-    await _merchant(seller, status="inactive" if leg == "seller_status" else "active",
-                    indexable=leg != "seller_indexable")
+    # The *_upper cases pin case-folding ON THE FETCHERS. It was previously
+    # pinned only on _source_ids_are_withdrawn, so `lower()` could be deleted
+    # from all three quote fetchers with a green suite — review caught the
+    # claim, not the code.
+    owner_status = {"owner_status": "inactive", "owner_status_upper": "INACTIVE"}.get(leg, "active")
+    seller_status = {"seller_status": "inactive", "seller_status_upper": "INACTIVE"}.get(leg, "active")
+    await _merchant(owner, status=owner_status, indexable=leg != "owner_indexable")
+    await _merchant(seller, status=seller_status, indexable=leg != "seller_indexable")
     await _seed(
         f"{_PREFIX}_p1",
         owner=owner,
@@ -676,6 +681,20 @@ async def test_inactive_owner_matching_is_case_insensitive(status: str):
     assert await svc._source_ids_are_withdrawn(
         f"{_PREFIX}_owner", f"src-{_PREFIX}_p1", f"var-{_PREFIX}_p1"
     ) is True
+
+
+@pytest.mark.asyncio
+async def test_a_seedless_owner_is_not_treated_as_withdrawn():
+    """NULL-keeping COALESCE on the helper's owner alias. Without it a product
+    whose owner has no `catalog_merchants` row yields NULL, drops out of the
+    `serving` count, and the ids are REFUSED — over-filtering on the sell path,
+    the bad direction. Every sibling lane had this control; the helper did not,
+    so both its COALESCE mutants survived."""
+    await _seed(f"{_PREFIX}_p1", owner=f"{_PREFIX}_noseed", seller=f"{_PREFIX}_noseed")
+
+    assert await svc._source_ids_are_withdrawn(
+        f"{_PREFIX}_noseed", f"src-{_PREFIX}_p1", f"var-{_PREFIX}_p1"
+    ) is False
 
 
 @pytest.mark.asyncio
