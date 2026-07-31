@@ -260,6 +260,135 @@ _CHECKS: List[Dict[str, Any]] = [
         """,
     },
     {
+        "name": "public_non_canonical_duplicate",
+        "description": (
+            "trust says public but the row is NOT its content_key's elected "
+            "canonical — a duplicate PDP being independently promoted while its "
+            "own rel=canonical points at a sibling"
+        ),
+        "env": "CATALOG_INVARIANT_NON_CANONICAL_THRESHOLD",
+        # 0 from the day the c1.v0.7 election gate ships. Before it: 121 measured
+        # on prod 2026-07-31, every one on a multi-row content_key. This is the
+        # GRAIN invariant — index_pipeline_state answers for the content_key,
+        # catalog_row_trust for the product_key, and content_canonical_election
+        # is the only fact that says which row may speak for the content. A row
+        # that is public without holding that mandate is the general form of the
+        # defect that produced 4 price-less Tom Ford PDPs.
+        #
+        # Rows whose content_key has NO election are DELIBERATELY not counted:
+        # absence is "not yet decided", not "not canonical", and the policy gate
+        # is tri-state for the same reason. `multi_row_content_key_without_election`
+        # below is what keeps that exemption from becoming a hiding place.
+        "default_threshold": 0,
+        "count_sql": """
+            SELECT count(*) AS c
+            FROM catalog_row_trust crt
+            JOIN catalog_products cp ON cp.product_key = crt.subject_key
+            JOIN content_canonical_election cce ON cce.content_key = cp.content_key
+            WHERE crt.subject_type = 'product'
+              AND crt.serving_decision = 'public'
+              AND cp.pivota_signature_id IS DISTINCT FROM cce.canonical_sig_id
+        """,
+        "sample_sql": """
+            SELECT crt.subject_key
+            FROM catalog_row_trust crt
+            JOIN catalog_products cp ON cp.product_key = crt.subject_key
+            JOIN content_canonical_election cce ON cce.content_key = cp.content_key
+            WHERE crt.subject_type = 'product'
+              AND crt.serving_decision = 'public'
+              AND cp.pivota_signature_id IS DISTINCT FROM cce.canonical_sig_id
+            LIMIT 5
+        """,
+    },
+    {
+        "name": "public_multi_row_content_key_without_election",
+        "description": (
+            "a content_key with more than one unsuppressed catalog_products row "
+            "has a PUBLIC row but no canonical election — nothing decides which "
+            "of its PDPs is the real one, so the duplicate gate cannot fire"
+        ),
+        "env": "CATALOG_INVARIANT_MISSING_ELECTION_THRESHOLD",
+        # The companion to the check above, and the reason that one can safely
+        # exempt un-elected rows. Without a check here, "no election" would be a
+        # silent bypass of the duplicate gate that GROWS with every retailer
+        # ingested: a content_key only becomes multi-row when a second source
+        # carries the same physical product, so retailer expansion is exactly
+        # what creates them.
+        #
+        # 🚨 THE `PUBLIC` CONJUNCT IS LOAD-BEARING — it is the difference between
+        # a live signal and a permanently-red check nobody reads.
+        #
+        # The first cut of this invariant counted EVERY un-elected multi-row
+        # content_key and set the threshold to 0, on the assumption that the
+        # elector simply had not reached them yet. Measured on prod 2026-07-31,
+        # that assumption was wrong in a way that matters: there are 32 such
+        # content_keys, they carry 69 rows, and ALL 69 are trust-'blocked' —
+        # 0 public, 0 on a serving-eligible content_key. They have no election
+        # because nothing of theirs is an electable candidate
+        # (services/content_canonical_election only considers renderable,
+        # sitemap-eligible sigs), which is CORRECT, not a backlog. A dry run of
+        # scripts/elect_content_canonicals confirms it writes zero rows for them.
+        #
+        # Counting them would have parked this check at 32-over-threshold from
+        # the day it shipped, for a condition that is not a defect — and the
+        # module's own convention is explicit that a threshold is the measured
+        # baseline of the UNEXPLAINED residual. A row that no surface can reach
+        # needs no canonical URL. The set that MATTERS is the one where a
+        # duplicate could actually be promoted: a multi-row content_key with at
+        # least one PUBLIC row and no election to arbitrate between them.
+        # Measured 2026-07-31: 0.
+        "default_threshold": 0,
+        "count_sql": """
+            SELECT count(*) AS c
+            FROM (
+                SELECT cp.content_key
+                FROM catalog_products cp
+                WHERE cp.suppressed_at IS NULL
+                  AND cp.content_key IS NOT NULL
+                GROUP BY cp.content_key
+                HAVING count(*) > 1
+            ) multi
+            LEFT JOIN content_canonical_election cce
+              ON cce.content_key = multi.content_key
+            WHERE cce.content_key IS NULL
+              AND EXISTS (
+                  SELECT 1
+                  FROM catalog_products cp2
+                  JOIN catalog_row_trust crt2
+                    ON crt2.subject_type = 'product'
+                   AND crt2.subject_key = cp2.product_key
+                  WHERE cp2.content_key = multi.content_key
+                    AND cp2.suppressed_at IS NULL
+                    AND crt2.serving_decision = 'public'
+              )
+        """,
+        "sample_sql": """
+            SELECT multi.content_key AS subject_key
+            FROM (
+                SELECT cp.content_key
+                FROM catalog_products cp
+                WHERE cp.suppressed_at IS NULL
+                  AND cp.content_key IS NOT NULL
+                GROUP BY cp.content_key
+                HAVING count(*) > 1
+            ) multi
+            LEFT JOIN content_canonical_election cce
+              ON cce.content_key = multi.content_key
+            WHERE cce.content_key IS NULL
+              AND EXISTS (
+                  SELECT 1
+                  FROM catalog_products cp2
+                  JOIN catalog_row_trust crt2
+                    ON crt2.subject_type = 'product'
+                   AND crt2.subject_key = cp2.product_key
+                  WHERE cp2.content_key = multi.content_key
+                    AND cp2.suppressed_at IS NULL
+                    AND crt2.serving_decision = 'public'
+              )
+            LIMIT 5
+        """,
+    },
+    {
         "name": "public_not_renderable",
         "description": (
             "trust says public but the gateway has no resolvable PDP content "

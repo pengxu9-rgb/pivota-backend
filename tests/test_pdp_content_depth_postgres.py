@@ -76,9 +76,13 @@ ALTER TABLE index_pipeline_state ADD COLUMN IF NOT EXISTS blocker_detail text;
 ALTER TABLE index_pipeline_state ADD COLUMN IF NOT EXISTS content_quality_score double precision;
 ALTER TABLE index_pipeline_state ADD COLUMN IF NOT EXISTS quality_scored_at timestamptz;
 ALTER TABLE index_pipeline_state ADD COLUMN IF NOT EXISTS last_extracted_at timestamptz;
-CREATE TABLE IF NOT EXISTS content_canonical_election (
-  content_key text, canonical_sig_id text
-);
+-- #1651 form: additive + order-proof. These gate modules share ONE database and
+-- CREATE TABLE IF NOT EXISTS no-ops once a sibling has made the table, so a
+-- PK-less declaration that sorts first strips the PK for everyone. Prod (mig
+-- 181) declares content_key as the PRIMARY KEY. The PK-less copies were wrong.
+CREATE TABLE IF NOT EXISTS content_canonical_election (content_key text PRIMARY KEY);
+ALTER TABLE content_canonical_election ADD COLUMN IF NOT EXISTS canonical_sig_id text;
+
 CREATE TABLE IF NOT EXISTS aurora_product_intel_kb (kb_key text, analysis jsonb);
 """
 
