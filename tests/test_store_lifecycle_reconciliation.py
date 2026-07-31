@@ -789,10 +789,17 @@ async def test_disconnect_refuses_when_the_stored_counter_is_below_threshold(
 
 @pytest.mark.asyncio
 async def test_portal_status_patch_counts_as_a_reconnect(monkeypatch: pytest.MonkeyPatch):
-    """Executes the literal SQL `PUT /merchant/integrations/store/{id}` emits
-    for a status change. It used to write `status` alone, so the store rejoined
-    the serving set carrying a failure count from its PREVIOUS connection — and
-    the next single transient 401 disconnected it."""
+    """Drives the REAL route — `PUT /merchant/integrations/store/{id}` — because
+    it builds its UPDATE dynamically from `update_fields`, so the source gate
+    above (which reads literal SQL) cannot see it. Confirmed by mutation:
+    deleting the route's connected_at line left all 68 other tests green.
+
+    The route used to write `status` alone, so a store rejoined the serving set
+    carrying a failure count from its PREVIOUS connection — and the next single
+    transient 401 disconnected it. That is B2(i), reproduced live in review.
+    """
+    from routes import manage_integrations
+
     merchant = f"{_MERCHANT_PREFIX}_patch"
     store_id = f"{merchant}_s1"
     await _seed_merchant(merchant, "active")
@@ -805,14 +812,20 @@ async def test_portal_status_patch_counts_as_a_reconnect(monkeypatch: pytest.Mon
         probe_at="2026-06-01 00:00:00",
     )
 
-    # routes/manage_integrations.py update_store, status branch.
-    await database.execute(
-        """
-        UPDATE merchant_stores
-        SET status = :status, connected_at = CURRENT_TIMESTAMP
-        WHERE store_id = :store_id AND merchant_id = :merchant_id
-        """,
-        {"status": "active", "store_id": store_id, "merchant_id": merchant},
+    # The route's own SQL runs for real against the fixture DB; only the auth
+    # identity is supplied.
+    result = await manage_integrations.update_store(
+        store_id,
+        {"status": "active"},
+        {"role": "merchant", "merchant_id": merchant},
+    )
+    assert result["status"] == "success"
+
+    reconnected = await _store_row(store_id)
+    assert reconnected["status"] == "active"
+    assert str(reconnected["connected_at"]) > "2026-06-01", (
+        "re-entering the serving set must stamp connected_at, or the two-strike "
+        "rule has nothing to tell this connection apart from the last one"
     )
 
     monkeypatch.setattr(svc, "probe_store_upstream", _stub_probe(svc.PROBE_AUTH_FAILED, 401))
@@ -821,6 +834,31 @@ async def test_portal_status_patch_counts_as_a_reconnect(monkeypatch: pytest.Mon
     row = await _store_row(store_id)
     assert row["status"] == "active", "one 401 after a portal reconnect must not disconnect"
     assert row["upstream_probe_failures"] == 1
+
+
+@pytest.mark.asyncio
+async def test_portal_status_patch_to_inactive_does_not_stamp_connected_at():
+    """The mirror: leaving the serving set is not a reconnect. A blanket stamp
+    would forge a connection time on a store being switched OFF, and hand it a
+    fresh two-strike allowance it did not earn."""
+    from routes import manage_integrations
+
+    merchant = f"{_MERCHANT_PREFIX}_patchoff"
+    store_id = f"{merchant}_s1"
+    await _seed_merchant(merchant, "active")
+    await _seed_store(
+        store_id, merchant, "active", connected_at="2026-05-01 00:00:00"
+    )
+
+    await manage_integrations.update_store(
+        store_id,
+        {"status": "inactive"},
+        {"role": "merchant", "merchant_id": merchant},
+    )
+
+    row = await _store_row(store_id)
+    assert row["status"] == "inactive"
+    assert str(row["connected_at"]).startswith("2026-05-01")
 
 
 def test_every_store_activation_writer_stamps_connected_at():
