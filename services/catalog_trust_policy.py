@@ -3,7 +3,7 @@
 Pure function: (inputs) -> catalog_row_trust shape.
 
 This is the Python parity port of PIVOTA-Agent/src/services/catalogTrustPolicy.js
-(POLICY_VERSION ``c1.v0.5``). Producer dual-write call sites in pivota-backend
+(POLICY_VERSION ``c1.v0.7``). Producer dual-write call sites in pivota-backend
 (catalog_sync_service, source_quarantine helpers) invoke ``derive_trust`` to
 populate ``catalog_row_trust`` so the reader contract stays live between
 periodic backfills.
@@ -83,7 +83,11 @@ from services.test_merchant_policy import KNOWN_TEST_MERCHANT_IDS
 # 2026-07-31), and that twin also needs the OFFER_PRICE_MISSING mirror itself —
 # both halves belong in one merge pair, exactly as P3 did for the seed-route
 # predicate.
-POLICY_VERSION = "c1.v0.6"
+#
+# Worked example 4 — the canonical-election gate, 2026-07-31. Bumps: it moves 121
+# measured prod rows from 'public' to 'shadow'. Ships as a pair with the
+# PIVOTA-Agent twin, backend first, same rule as every bump before it.
+POLICY_VERSION = "c1.v0.7"
 
 # ---- Reason codes (authoritative vocabulary) -------------------------------
 #
@@ -100,6 +104,35 @@ POLICY_VERSION = "c1.v0.6"
 #   IDENTITY_LIVE_READ_DISABLED — identity_status='approved' but
 #     live_read_enabled=false. First-party sources are exempt.
 #   FRESHNESS_UNVERIFIED — never observed a verification timestamp.
+#   NON_CANONICAL_DUPLICATE — c1.v0.7 (2026-07-31). This row is NOT the elected
+#     canonical for its content_key (content_canonical_election, mig 181): a
+#     SIBLING row holds the one URL the sitemap advertises and that this row's
+#     own PDP names in <link rel="canonical">. The row is real and renderable,
+#     it is simply not the copy that represents this physical product publicly.
+#
+#     SHADOW, DELIBERATELY NOT BLOCKED, and the distinction is load-bearing.
+#     The two surfaces read different tables: the PDP RENDERER gates on
+#     index_pipeline_state.serving_eligible (content grain, unchanged here), while
+#     public recall / discovery / the entity feed gate on
+#     catalog_row_trust.serving_decision='public' (row grain, via
+#     PIVOTA-Agent catalogServingIndex.fetchCatalogServingEligibleSourceSet).
+#     Shadow therefore drops the duplicate out of public promotion while its page
+#     KEEPS ANSWERING 200 with its rel=canonical intact. Blocking it instead would
+#     404 URLs Google may already have indexed AND destroy the canonical signal
+#     that consolidates them onto the winner — strictly worse than the duplicate,
+#     which is the same trap services/content_canonical_election documents.
+#
+#     THE GRAIN BRIDGE. index_pipeline_state is keyed by content_key and stores
+#     ONE row's state; catalog_row_trust is keyed by product_key. Nothing
+#     connected the two, so a non-elected sibling inherited the content verdict
+#     and was promoted as if canonical. Measured on prod 2026-07-31: 121 of 6,814
+#     trust-public rows, ALL on multi-row content_keys. The 4 Tom Ford rows that
+#     produced OFFER_PRICE_MISSING were 4 of those 121 — the election had already
+#     picked the priced tomfordbeauty.com row correctly in all 4 cases. This gate
+#     is the general rule; OFFER_PRICE_MISSING is now the backstop under it.
+#
+#     TRI-STATE: only an explicit False shadows. 32 multi-row content_keys have
+#     no election yet and MUST NOT be demoted on absence.
 #
 # Advisory (does not flip decision):
 #   IDENTITY_NOT_APPLICABLE_FIRST_PARTY — c1.v0.3+. Marks rows where the
@@ -215,6 +248,7 @@ class _ReasonCodes:
     PDP_ROUTE_UNRESOLVABLE = "PDP_ROUTE_UNRESOLVABLE"
     TEST_MERCHANT_EXCLUDED = "TEST_MERCHANT_EXCLUDED"
     OFFER_PRICE_MISSING = "OFFER_PRICE_MISSING"
+    NON_CANONICAL_DUPLICATE = "NON_CANONICAL_DUPLICATE"
 
 
 REASON_CODES = _ReasonCodes()
@@ -348,6 +382,10 @@ def derive_trust(inputs: Mapping[str, Any]) -> dict[str, Any]:
     # OFFER_PRICE_MISSING gate stays silent.
     raw_row_priced = inputs.get("row_has_priced_offer")
     row_has_priced_offer = None if raw_row_priced is None else bool(raw_row_priced)
+    # Tri-state. True = this row IS its content_key's elected canonical,
+    # False = a sibling holds the canonical URL, None = no election exists.
+    raw_elected = inputs.get("row_is_elected_canonical")
+    row_is_elected_canonical = None if raw_elected is None else bool(raw_elected)
     raw_quarantines = inputs.get("active_quarantines") or []
     active_quarantines = list(raw_quarantines) if isinstance(raw_quarantines, Iterable) else []
 
@@ -386,6 +424,7 @@ def derive_trust(inputs: Mapping[str, Any]) -> dict[str, Any]:
         identity_decision=identity_decision,
         pdp_route_resolvable=pdp_route_resolvable,
         row_has_priced_offer=row_has_priced_offer,
+        row_is_elected_canonical=row_is_elected_canonical,
         reasons=reasons,
     )
 
@@ -715,6 +754,7 @@ def _derive_serving_decision(
     identity_decision: Mapping[str, Any],
     pdp_route_resolvable: Optional[bool] = None,
     row_has_priced_offer: Optional[bool] = None,
+    row_is_elected_canonical: Optional[bool] = None,
     reasons: list[str],
 ) -> dict[str, Any]:
     # Offer-specific block: suppressed offers never surface.
@@ -900,10 +940,21 @@ def _derive_serving_decision(
         if not is_identity_coverage_exempt:
             reasons.append(REASON_CODES.IDENTITY_LIVE_READ_DISABLED)
 
+    # c1.v0.7: a row that is not its content_key's elected canonical is a
+    # duplicate of a sibling that holds the public URL. It shadows — see the
+    # NON_CANONICAL_DUPLICATE entry in the vocabulary above for why shadow and
+    # not blocked, and for the 121-row measured blast radius.
+    #
+    # `is False` and not `not row_is_elected_canonical`: None means no election
+    # exists for this content_key, which must leave the decision untouched.
+    if row_is_elected_canonical is False:
+        reasons.append(REASON_CODES.NON_CANONICAL_DUPLICATE)
+
     shadow = (
         identity_decision["status"] == "review_required"
         or REASON_CODES.IDENTITY_CONFIDENCE_NULL in reasons
         or REASON_CODES.IDENTITY_LIVE_READ_DISABLED in reasons
+        or REASON_CODES.NON_CANONICAL_DUPLICATE in reasons
         or (identity_decision["status"] == "unknown" and not is_identity_coverage_exempt)
     )
 

@@ -858,6 +858,10 @@ def test_policy_version_is_pinned_to_the_node_twin():
     flips 4 measured prod rows 'public' -> 'blocked' and so is a real logic
     change by the module's own versioning rule.
 
+    c1.v0.6 -> c1.v0.7 same day for the canonical-election gate
+    (NON_CANONICAL_DUPLICATE), which moves 121 measured prod rows
+    'public' -> 'shadow'.
+
     🚨 THE PAIRED PIVOTA-Agent PR IS NOT OPTIONAL AND IS NOT JUST THIS STRING.
     The twin must also (a) select the per-row priced-offer EXISTS in
     src/services/catalogRowTrustUpserter.js — the mirror of
@@ -866,7 +870,7 @@ def test_policy_version_is_pinned_to_the_node_twin():
     its index gate. Ship only this bump and the twin keeps re-deriving those 4
     price-less PDPs 'public' on its next identity event for them.
     """
-    assert POLICY_VERSION == "c1.v0.6"
+    assert POLICY_VERSION == "c1.v0.7"
 
 
 # ---- TEST/DEMO MERCHANT GATE (2026-07-27) -----------------------------------
@@ -939,3 +943,84 @@ def test_rig_in_the_shadow_lane_is_blocked():
     )
     assert trust["serving_decision"] == "blocked"
     assert REASON_CODES.TEST_MERCHANT_EXCLUDED in trust["serving_reason_codes"]
+
+
+# ---- c1.v0.7: NON_CANONICAL_DUPLICATE (the grain bridge) --------------------
+#
+# index_pipeline_state is keyed by content_key and stores ONE row's state;
+# catalog_row_trust is keyed by product_key. content_canonical_election (mig 181)
+# elects the ONE sig per content_key that the sitemap advertises and that every
+# sibling's PDP names in <link rel="canonical">. Nothing connected the two, so a
+# non-elected sibling inherited the content-grained verdict and was promoted as
+# though it were the canonical.
+#
+# Measured on prod 2026-07-31: 121 of 6,814 trust-public rows are not their
+# content_key's elected canonical, ALL on multi-row content_keys. The 4 Tom Ford
+# rows behind OFFER_PRICE_MISSING were 4 of those 121 — the election had already
+# picked the priced tomfordbeauty.com row correctly in every case, which is why
+# this gate is the general rule and the price gate is now a backstop beneath it.
+
+
+def test_non_canonical_duplicate_shadows_rather_than_blocks():
+    """SHADOW, not blocked, and the distinction is the whole design.
+
+    The PDP RENDERER gates on index_pipeline_state.serving_eligible (content
+    grain); public recall/discovery/feed gate on
+    catalog_row_trust.serving_decision='public' (row grain). Shadow drops the
+    duplicate out of promotion while its page keeps answering 200 with its
+    rel=canonical intact. Blocking would 404 URLs Google may already have
+    indexed AND destroy the canonical signal consolidating them onto the winner
+    — strictly worse than the duplicate itself.
+    """
+    trust = call(row_is_elected_canonical=False)
+    assert trust["serving_decision"] == "shadow"
+    assert REASON_CODES.NON_CANONICAL_DUPLICATE in trust["serving_reason_codes"]
+
+
+def test_elected_canonical_stays_public():
+    trust = call(row_is_elected_canonical=True)
+    assert trust["serving_decision"] == "public"
+    assert REASON_CODES.NON_CANONICAL_DUPLICATE not in trust["serving_reason_codes"]
+
+
+def test_absent_election_never_demotes():
+    """32 multi-row content_keys still have NO election row, and the join
+    legitimately yields NULL for them. Unlike the other tri-states in this
+    module, None here is a normal production value, not just a hand-built-test
+    artifact — reading it as "not canonical" would shadow every uncovered row."""
+    assert call()["serving_decision"] == "public"
+    assert call(row_is_elected_canonical=None)["serving_decision"] == "public"
+
+
+def test_non_canonical_duplicate_does_not_mask_a_hard_block():
+    """Ordering: the election gate lives in the SHADOW block, which is only
+    reached after every hard block has passed. A tombstoned duplicate keeps
+    reporting ROW_TOMBSTONED."""
+    trust = call(
+        row_is_elected_canonical=False,
+        product=active_merchant_product(suppression_reason="demo_retired_2026_07"),
+    )
+    assert trust["serving_decision"] == "blocked"
+    assert REASON_CODES.ROW_TOMBSTONED in trust["serving_reason_codes"]
+
+
+def test_price_gate_still_blocks_a_non_elected_duplicate():
+    """Defence in depth. OFFER_PRICE_MISSING is a hard block and runs FIRST, so
+    a duplicate that is also price-less stays blocked rather than being softened
+    to shadow. If this ever inverts, the 4 Tom Ford rows quietly return to a
+    rendering state with no price."""
+    trust = call(row_is_elected_canonical=False, row_has_priced_offer=False)
+    assert trust["serving_decision"] == "blocked"
+    assert REASON_CODES.OFFER_PRICE_MISSING in trust["serving_reason_codes"]
+
+
+def test_non_canonical_duplicate_applies_to_external_seed_supply():
+    trust = call_external_seed(row_is_elected_canonical=False)
+    assert trust["serving_decision"] == "shadow"
+    assert REASON_CODES.NON_CANONICAL_DUPLICATE in trust["serving_reason_codes"]
+
+
+def test_non_canonical_duplicate_is_in_the_reason_vocabulary():
+    from services.catalog_trust_policy import REASON_CODE_VOCABULARY
+
+    assert REASON_CODES.NON_CANONICAL_DUPLICATE in REASON_CODE_VOCABULARY

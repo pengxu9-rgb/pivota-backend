@@ -78,6 +78,16 @@ CREATE TABLE IF NOT EXISTS catalog_row_trust (
   subject_type text, subject_key text, serving_decision text,
   serving_reason_codes text[]
 );
+-- Additive + order-proof, per #1651: these gate modules SHARE ONE DATABASE and
+-- `CREATE TABLE IF NOT EXISTS` no-ops once any sibling has created the table, so
+-- a narrow declaration that happens to sort first starves every other module.
+-- Create with the PK only, then widen. `canonical_sig_id` is deliberately NOT
+-- NULL-constrained here. Prod (mig 181) declares it NOT NULL, but ADD COLUMN on
+-- an already-populated shared table cannot, and the tests never insert a NULL.
+CREATE TABLE IF NOT EXISTS content_canonical_election (content_key text PRIMARY KEY);
+ALTER TABLE content_canonical_election ADD COLUMN IF NOT EXISTS canonical_sig_id text;
+ALTER TABLE content_canonical_election ADD COLUMN IF NOT EXISTS basis text;
+ALTER TABLE content_canonical_election ADD COLUMN IF NOT EXISTS elected_at timestamptz;
 CREATE TABLE IF NOT EXISTS pdp_identity_listing (
   source_listing_ref text, product_id text, merchant_id text, identity_status text,
   identity_confidence numeric, live_read_enabled boolean, review_required boolean,
@@ -98,6 +108,7 @@ CREATE TABLE IF NOT EXISTS merchant_stores (
 """
 
 _TABLES_TO_RESET = (
+    "content_canonical_election",
     "catalog_row_trust",
     "catalog_offers",
     "catalog_products",
@@ -169,6 +180,18 @@ def _offer(conn, *, pk, list_price=None, effective=None, suppressed=False,
         ),
         {"oid": f"offer:{pk}:{list_price}:{effective}:{suppressed}", "pk": pk,
          "lp": list_price, "mep": effective, "cur": currency},
+    )
+
+
+def _trust_blocked(conn, pk):
+    from sqlalchemy import text
+
+    conn.execute(
+        text(
+            "INSERT INTO catalog_row_trust (subject_type, subject_key, serving_decision) "
+            "VALUES ('product', :pk, 'blocked')"
+        ),
+        {"pk": pk},
     )
 
 
@@ -432,3 +455,170 @@ def test_trust_join_ignores_another_rows_offer(pg_engine):
         _offer(conn, pk="pk_other_priced", list_price=75.00)
         _product(conn, pk="pk_mine_bare", ck="ck_mine")
         assert _joined(conn, "pk_mine_bare")["row_has_priced_offer"] is False
+
+
+# ---------------------------------------------------------------------------
+# c1.v0.7 — the canonical-election grain bridge
+# ---------------------------------------------------------------------------
+
+
+def _elect(conn, ck, sig):
+    from sqlalchemy import text
+
+    conn.execute(
+        text("INSERT INTO content_canonical_election (content_key, canonical_sig_id) "
+             "VALUES (:ck, :sig) ON CONFLICT (content_key) DO UPDATE "
+             "SET canonical_sig_id = EXCLUDED.canonical_sig_id"),
+        {"ck": ck, "sig": sig},
+    )
+
+
+def _named(name):
+    from services.catalog_invariant_checks import _CHECKS
+
+    for c in _CHECKS:
+        if c["name"] == name:
+            return c
+    raise AssertionError(f"{name} is not registered")
+
+
+def _count_of(conn, name):
+    from sqlalchemy import text
+
+    return conn.execute(text(_named(name)["count_sql"])).scalar()
+
+
+def test_duplicate_invariant_counts_a_public_non_elected_sibling(pg_engine):
+    """THE GRAIN REGRESSION TEST, reduced to its two rows.
+
+    Both share a content_key. One holds the elected canonical URL; the other is
+    public anyway, which is a duplicate PDP being independently promoted while
+    its own rel=canonical points at the winner.
+    """
+    with pg_engine.begin() as conn:
+        _reset(conn)
+        _product(conn, pk="pk_win", ck="ck_dup", sig="sig_win")
+        _product(conn, pk="pk_dupe", ck="ck_dup", sig="sig_dupe")
+        _trust_public(conn, "pk_win")
+        _trust_public(conn, "pk_dupe")
+        _elect(conn, "ck_dup", "sig_win")
+
+        assert _count_of(conn, "public_non_canonical_duplicate") == 1
+        rows = conn.execute(
+            __import__("sqlalchemy").text(
+                _named("public_non_canonical_duplicate")["sample_sql"])).fetchall()
+        assert [r[0] for r in rows] == ["pk_dupe"]
+
+
+def test_duplicate_invariant_is_clean_when_only_the_elected_row_is_public(pg_engine):
+    with pg_engine.begin() as conn:
+        _reset(conn)
+        _product(conn, pk="pk_win", ck="ck_ok", sig="sig_win")
+        _product(conn, pk="pk_shadowed", ck="ck_ok", sig="sig_other")
+        _trust_public(conn, "pk_win")  # the sibling is shadow/blocked, not public
+        _elect(conn, "ck_ok", "sig_win")
+        assert _count_of(conn, "public_non_canonical_duplicate") == 0
+
+
+def test_duplicate_invariant_ignores_content_keys_with_no_election(pg_engine):
+    """Absence is "not yet decided", never "not canonical" — the same contract
+    the policy gate honours. The companion invariant below is what stops this
+    exemption becoming a hiding place."""
+    with pg_engine.begin() as conn:
+        _reset(conn)
+        _product(conn, pk="pk_a", ck="ck_noelect", sig="sig_a")
+        _product(conn, pk="pk_b", ck="ck_noelect", sig="sig_b")
+        _trust_public(conn, "pk_a")
+        _trust_public(conn, "pk_b")
+        assert _count_of(conn, "public_non_canonical_duplicate") == 0
+
+
+def test_missing_election_invariant_counts_an_unelected_multi_row_key(pg_engine):
+    """Counted only when a row is actually PUBLIC — that is the set where a
+    duplicate could be promoted with nothing to arbitrate between the siblings."""
+    with pg_engine.begin() as conn:
+        _reset(conn)
+        _product(conn, pk="pk_a", ck="ck_multi", sig="sig_a")
+        _product(conn, pk="pk_b", ck="ck_multi", sig="sig_b")
+        _trust_public(conn, "pk_a")
+        assert _count_of(conn, "public_multi_row_content_key_without_election") == 1
+
+
+def test_missing_election_invariant_ignores_an_all_blocked_multi_row_key(pg_engine):
+    """THE 32. Measured on prod 2026-07-31: 32 un-elected multi-row content_keys
+    carrying 69 rows, every one trust-'blocked'. They have no election because
+    nothing of theirs is an electable candidate — correct, not a backlog, and
+    scripts/elect_content_canonicals writes zero rows for them.
+
+    The first cut of this check omitted the PUBLIC conjunct and would have sat
+    32-over-threshold from day one for a non-defect. A row no surface can reach
+    needs no canonical URL. If this ever counts again, the check has gone deaf.
+    """
+    with pg_engine.begin() as conn:
+        _reset(conn)
+        _product(conn, pk="pk_a", ck="ck_multi", sig="sig_a")
+        _product(conn, pk="pk_b", ck="ck_multi", sig="sig_b")
+        # no trust rows at all == nothing public
+        assert _count_of(conn, "public_multi_row_content_key_without_election") == 0
+
+        _trust_blocked(conn, "pk_a")
+        _trust_blocked(conn, "pk_b")
+        assert _count_of(conn, "public_multi_row_content_key_without_election") == 0
+
+
+def test_missing_election_invariant_clean_once_elected(pg_engine):
+    with pg_engine.begin() as conn:
+        _reset(conn)
+        _product(conn, pk="pk_a", ck="ck_multi", sig="sig_a")
+        _product(conn, pk="pk_b", ck="ck_multi", sig="sig_b")
+        _trust_public(conn, "pk_a")
+        _elect(conn, "ck_multi", "sig_a")
+        assert _count_of(conn, "public_multi_row_content_key_without_election") == 0
+
+
+def test_missing_election_invariant_ignores_single_row_content_keys(pg_engine):
+    """98% of the corpus. A content_key with one row needs no election — if this
+    ever counts them, the check goes from 32 to ~10,000 and stops being read."""
+    with pg_engine.begin() as conn:
+        _reset(conn)
+        _product(conn, pk="pk_solo", ck="ck_solo", sig="sig_solo")
+        _trust_public(conn, "pk_solo")
+        assert _count_of(conn, "public_multi_row_content_key_without_election") == 0
+
+
+def test_missing_election_invariant_ignores_suppressed_siblings(pg_engine):
+    """A content_key whose extra rows are all suppressed is not multi-row: the
+    dedup sweep already decided. Counting it would resurrect retired rows as
+    election work."""
+    from sqlalchemy import text
+
+    with pg_engine.begin() as conn:
+        _reset(conn)
+        _product(conn, pk="pk_live", ck="ck_supp", sig="sig_live")
+        _product(conn, pk="pk_dead", ck="ck_supp", sig="sig_dead")
+        conn.execute(text("UPDATE catalog_products SET suppressed_at = NOW() "
+                          "WHERE product_key = 'pk_dead'"))
+        _trust_public(conn, "pk_live")
+        assert _count_of(conn, "public_multi_row_content_key_without_election") == 0
+
+
+def test_trust_join_reports_the_election_per_row(pg_engine):
+    """The join column that feeds the policy gate, on the real dialect."""
+    with pg_engine.begin() as conn:
+        _reset(conn)
+        _product(conn, pk="pk_win", ck="ck_e", sig="sig_win")
+        _product(conn, pk="pk_dupe", ck="ck_e", sig="sig_dupe")
+        _elect(conn, "ck_e", "sig_win")
+
+        assert _joined(conn, "pk_win")["row_is_elected_canonical"] is True
+        assert _joined(conn, "pk_dupe")["row_is_elected_canonical"] is False
+
+
+def test_trust_join_returns_null_when_no_election_exists(pg_engine):
+    """Tri-state at the SQL layer. This column is the one place where NULL is a
+    normal production value rather than a missing-caller artifact, so the
+    correlated subquery must yield NULL — not FALSE — with no election row."""
+    with pg_engine.begin() as conn:
+        _reset(conn)
+        _product(conn, pk="pk_noelect", ck="ck_noelect", sig="sig_x")
+        assert _joined(conn, "pk_noelect")["row_is_elected_canonical"] is None
