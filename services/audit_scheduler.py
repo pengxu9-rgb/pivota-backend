@@ -35,6 +35,10 @@ Job registration happens at start-up time. Currently registers:
   generates prior-month partner settlement files from snapshots.
 - `settlement_file_transfer` — in-process monthly day-10 UTC cron,
   transfers prior-month pending settlement files through Stripe Connect.
+- `store_lifecycle_reconciliation` — hourly at :17, probes connected stores
+  upstream (Shopify shop.json / Wix products query) and disconnects the ones
+  the platform no longer recognises, then re-derives
+  catalog_merchants.status from merchant_stores (issue #1648).
 
 Best-effort: scheduler init failure logs a warning but does not crash
 the API. The audit endpoints still work; only the cron is degraded.
@@ -230,6 +234,31 @@ async def start_scheduler() -> None:
             replace_existing=True,
             misfire_grace_time=600,
             coalesce=True,
+        )
+
+        # Store-lifecycle reconciliation (issue #1648): probe stores we believe
+        # are connected against their upstream platform and disconnect the ones
+        # that are gone, then re-derive catalog_merchants.status from
+        # merchant_stores. Exists because store lifecycle was PUSH-only — miss
+        # one app/uninstalled webhook and the row says 'active' forever
+        # (92sfrj-bi sat 'active' for ~3 weeks while its products served).
+        #
+        # CRON not `interval`: an interval job's first fire is start+N, reset by
+        # every redeploy, so on a service that recycles often it can starve (same
+        # reasoning as the stability canary below). Hourly at :17 — the sweep half
+        # is a 12-row query, and the probe half is rate-limited by the 6h
+        # per-store probe interval, so an hourly tick means at most a handful of
+        # outbound calls a day while keeping reconnect latency under an hour.
+        from services.store_lifecycle_service import run_store_lifecycle_reconciliation_tick
+        _add_job(
+            run_store_lifecycle_reconciliation_tick,
+            "cron",
+            minute=17,
+            id="store_lifecycle_reconciliation",
+            replace_existing=True,
+            misfire_grace_time=600,
+            coalesce=True,
+            max_instances=1,
         )
 
         # W7 audit-health: the alarm the no-fallback main line assumes. Computes

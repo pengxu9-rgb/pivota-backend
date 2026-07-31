@@ -1129,6 +1129,13 @@ async def admin_delete_merchant_store(
         except Exception:
             pass
 
+    # Soft-deleting the last serving store must also close the public-search
+    # door: recall gates on catalog_merchants.status, which no lifecycle path
+    # used to write (#1648). Re-derived from the remaining stores; never raises.
+    from services.store_lifecycle_service import sync_catalog_merchant_status
+
+    await sync_catalog_merchant_status(merchant_id, reason="store_soft_deleted")
+
     return {"status": "success", "store_id": store_id, "merchant_id": merchant_id}
 
 

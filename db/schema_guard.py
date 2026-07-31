@@ -54,6 +54,13 @@ REQUIRED_SCHEMA: Sequence[RequiredTableColumns] = (
             "order_writeback_last_canary_order_id",
             "order_writeback_last_verified_at",
             "order_writeback_last_error",
+            # Store-lifecycle reconciliation — see migration 190. The job that
+            # catches a missed uninstall webhook (issue #1648) cannot decide
+            # what is due, or apply its two-strike rule, without these.
+            "upstream_probe_at",
+            "upstream_probe_status",
+            "upstream_probe_http_status",
+            "upstream_probe_failures",
         },
     ),
     RequiredTableColumns(
@@ -1584,6 +1591,18 @@ async def ensure_required_schema_light() -> None:
                     """
                 )
             )
+            # mig 190: merchant_stores upstream-probe bookkeeping
+            await database.execute(
+                text(
+                    """
+                    ALTER TABLE IF EXISTS merchant_stores
+                      ADD COLUMN IF NOT EXISTS upstream_probe_at TIMESTAMPTZ,
+                      ADD COLUMN IF NOT EXISTS upstream_probe_status TEXT,
+                      ADD COLUMN IF NOT EXISTS upstream_probe_http_status INTEGER,
+                      ADD COLUMN IF NOT EXISTS upstream_probe_failures INTEGER NOT NULL DEFAULT 0;
+                    """
+                )
+            )
             # mig 158: merchant_audit_runs
             await database.execute(
                 text(
@@ -1662,6 +1681,15 @@ async def ensure_required_schema_light() -> None:
             sqlite_type = {
                 ("merchant_stores", "is_primary"): "BOOLEAN DEFAULT FALSE",
                 ("merchant_stores", "order_writeback_status"): "TEXT DEFAULT 'disabled'",
+                # Types MUST match migration 190. A heal that disagrees with the
+                # real schema is worse than no heal: it makes a self-healed
+                # SQLite DB behave unlike prod for exactly the first executing
+                # test that touches it (see the catalog_merchants.indexable
+                # DEFAULT FALSE / prod DEFAULT TRUE divergence two lines down).
+                ("merchant_stores", "upstream_probe_at"): "TIMESTAMP",
+                ("merchant_stores", "upstream_probe_status"): "TEXT",
+                ("merchant_stores", "upstream_probe_http_status"): "INTEGER",
+                ("merchant_stores", "upstream_probe_failures"): "INTEGER NOT NULL DEFAULT 0",
                 ("catalog_merchants", "indexable"): "BOOLEAN DEFAULT FALSE",
                 ("merchant_credit_balance", "purchased_credits"): "NUMERIC DEFAULT 0",
                 ("merchant_credit_balance", "overage_pending_credits"): "NUMERIC DEFAULT 0",
