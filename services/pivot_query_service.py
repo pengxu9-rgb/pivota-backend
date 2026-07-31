@@ -1644,6 +1644,34 @@ async def _fetch_canonical_rows_for_product(product_key: str) -> List[Dict[str, 
         LEFT JOIN catalog_merchants m ON m.merchant_id = p.merchant_id
         LEFT JOIN catalog_merchants bm ON bm.merchant_id = o.merchant_id
         WHERE p.product_key = :product_key
+          -- H2 (#1648): this by-key door carried NO source gate at all — only
+          -- `o.suppressed_at IS NULL`. Search stopped emitting withdrawn keys
+          -- after #1650/#1655, but ANY caller holding a key could still resolve
+          -- one here. Measured on prod 2026-07-31: 2,045 of 14,749 rows this
+          -- lane returns are withdrawn content (1,534 product_keys / 2,040
+          -- sku_keys), every one an intentional editorial withdrawal —
+          -- step5 dedupe, wrong-brand namesake, retired pilots, test variants.
+          --
+          -- The four legs mirror the recall lane exactly, so the two doors
+          -- cannot drift apart again:
+          --   owner status + indexable   (#1650)
+          --   product-row suppression, BOTH columns   (#1650)
+          --   sku suppression, BOTH columns   (H3, #1655)
+          --   OFFER SELLER status + indexable   (H1, #1655)
+          -- NULL-keeping COALESCE is load-bearing on both merchant aliases:
+          -- external seeds have no catalog_merchants row and must keep
+          -- resolving (prior art: tests/test_pivota_canonical_routes.py:674).
+          --
+          -- Unconditional, with no merchant_id escape hatch, because this lane
+          -- has no merchant scope: `/v1/pivot/products/{key}` and `/skus/{key}`
+          -- answer any authenticated caller, so there is no "their own rows"
+          -- case to preserve — unlike the recall lane's merchant-scoped branch.
+          AND lower(COALESCE(m.status, 'active')) <> 'inactive'
+          AND COALESCE(m.indexable, TRUE) IS TRUE
+          AND p.suppressed_at IS NULL AND p.suppression_reason IS NULL
+          AND s.suppressed_at IS NULL AND s.suppression_reason IS NULL
+          AND lower(COALESCE(bm.status, 'active')) <> 'inactive'
+          AND COALESCE(bm.indexable, TRUE) IS TRUE
         ORDER BY o.updated_at DESC
         """,
         {"product_key": product_key},
@@ -1714,6 +1742,34 @@ async def _fetch_canonical_rows_for_sku(sku_key: str) -> List[Dict[str, Any]]:
         LEFT JOIN catalog_merchants m ON m.merchant_id = p.merchant_id
         LEFT JOIN catalog_merchants bm ON bm.merchant_id = o.merchant_id
         WHERE s.sku_key = :sku_key
+          -- H2 (#1648): this by-key door carried NO source gate at all — only
+          -- `o.suppressed_at IS NULL`. Search stopped emitting withdrawn keys
+          -- after #1650/#1655, but ANY caller holding a key could still resolve
+          -- one here. Measured on prod 2026-07-31: 2,045 of 14,749 rows this
+          -- lane returns are withdrawn content (1,534 product_keys / 2,040
+          -- sku_keys), every one an intentional editorial withdrawal —
+          -- step5 dedupe, wrong-brand namesake, retired pilots, test variants.
+          --
+          -- The four legs mirror the recall lane exactly, so the two doors
+          -- cannot drift apart again:
+          --   owner status + indexable   (#1650)
+          --   product-row suppression, BOTH columns   (#1650)
+          --   sku suppression, BOTH columns   (H3, #1655)
+          --   OFFER SELLER status + indexable   (H1, #1655)
+          -- NULL-keeping COALESCE is load-bearing on both merchant aliases:
+          -- external seeds have no catalog_merchants row and must keep
+          -- resolving (prior art: tests/test_pivota_canonical_routes.py:674).
+          --
+          -- Unconditional, with no merchant_id escape hatch, because this lane
+          -- has no merchant scope: `/v1/pivot/products/{key}` and `/skus/{key}`
+          -- answer any authenticated caller, so there is no "their own rows"
+          -- case to preserve — unlike the recall lane's merchant-scoped branch.
+          AND lower(COALESCE(m.status, 'active')) <> 'inactive'
+          AND COALESCE(m.indexable, TRUE) IS TRUE
+          AND p.suppressed_at IS NULL AND p.suppression_reason IS NULL
+          AND s.suppressed_at IS NULL AND s.suppression_reason IS NULL
+          AND lower(COALESCE(bm.status, 'active')) <> 'inactive'
+          AND COALESCE(bm.indexable, TRUE) IS TRUE
         ORDER BY o.updated_at DESC
         """,
         {"sku_key": sku_key},
