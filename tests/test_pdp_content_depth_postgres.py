@@ -53,10 +53,20 @@ pytestmark = pytest.mark.skipif(
 # rather than MetaData `Table`s, so `metadata.create_all` does not know them.
 # Column sets are the ones the query actually touches.
 _LIGHTWEIGHT_DDL = """
-CREATE TABLE IF NOT EXISTS external_product_seeds (
-  external_product_id text, attached_product_key text, status text,
-  merchant_id text, source text, product_key text, source_product_id text
-);
+CREATE TABLE IF NOT EXISTS external_product_seeds (id text);
+ALTER TABLE external_product_seeds ADD COLUMN IF NOT EXISTS external_product_id text;
+ALTER TABLE external_product_seeds ADD COLUMN IF NOT EXISTS attached_product_key text;
+ALTER TABLE external_product_seeds ADD COLUMN IF NOT EXISTS status text;
+ALTER TABLE external_product_seeds ADD COLUMN IF NOT EXISTS seed_kind text;
+ALTER TABLE external_product_seeds ADD COLUMN IF NOT EXISTS merchant_id text;
+ALTER TABLE external_product_seeds ADD COLUMN IF NOT EXISTS source text;
+ALTER TABLE external_product_seeds ADD COLUMN IF NOT EXISTS product_key text;
+ALTER TABLE external_product_seeds ADD COLUMN IF NOT EXISTS source_product_id text;
+ALTER TABLE external_product_seeds ADD COLUMN IF NOT EXISTS domain text;
+ALTER TABLE external_product_seeds ADD COLUMN IF NOT EXISTS title text;
+ALTER TABLE external_product_seeds ADD COLUMN IF NOT EXISTS seed_data jsonb;
+ALTER TABLE external_product_seeds ADD COLUMN IF NOT EXISTS created_at timestamptz;
+ALTER TABLE external_product_seeds ADD COLUMN IF NOT EXISTS updated_at timestamptz;
 CREATE TABLE IF NOT EXISTS index_pipeline_state (content_key text PRIMARY KEY);
 ALTER TABLE index_pipeline_state ADD COLUMN IF NOT EXISTS serving_eligible boolean;
 ALTER TABLE index_pipeline_state ADD COLUMN IF NOT EXISTS index_eligible boolean;
