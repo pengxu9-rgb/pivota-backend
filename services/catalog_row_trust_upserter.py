@@ -45,6 +45,7 @@ from services.pdp_renderability import (
     pdp_route_resolvable,
     seed_route_resolves_sql,
 )
+from services.priced_offer_sql import priced_offer_exists_sql
 
 
 logger = logging.getLogger(__name__)
@@ -157,6 +158,24 @@ _PRODUCT_JOIN_SELECT = """
     -- here whenever an acceptable attached seed exists and their PDPs render.
     -- They answered FALSE — and 500ed — until P3 shipped.
     """ + seed_route_resolves_sql("cp") + """ AS pdp_seed_route_ok,
+
+    -- PER-ROW price input for the OFFER_PRICE_MISSING gate. This is the one
+    -- serving signal that CANNOT be taken from the ips join below: that join is
+    -- `ips.content_key = cp.content_key`, and index_pipeline_state stores ONE
+    -- state per content_key (its primary key, migration 098) chosen from the
+    -- best of that key's catalog_products rows. Every product_key mints its own
+    -- pivota_signature_id and therefore its own public PDP, so reading price
+    -- eligibility off the content-grained row publishes a price-less PDP
+    -- whenever a priced SIBLING carries the content_key's state.
+    --
+    -- That is not hypothetical: it put 4 Tom Ford fragrance PDPs
+    -- (sig_a2813185…, sig_43e4fca6…, sig_438b3df6…, sig_ffe80d18…) on the
+    -- public surface with no price on 2026-07-31, each sharing its content_key
+    -- with a priced tomfordbeauty.com row while its own single offer had
+    -- list_price, merchant_effective_price and estimated_best_price ALL NULL
+    -- and no suppression. `has_price` was never wrong — it was answering about
+    -- a different row.
+    """ + priced_offer_exists_sql("cp.product_key") + """ AS row_has_priced_offer,
 
     COALESCE(eps.id, epm.id)                                     AS eps_id,
     COALESCE(eps.status, epm.status)                             AS eps_status,
@@ -563,6 +582,16 @@ def _joined_row_to_inputs(
                 source_product_id=_row_get(row, "source_product_id"),
                 seed_route_ok=bool(_row_get(row, "pdp_seed_route_ok")),
             )
+        ),
+        # Tri-state, same contract as pdp_route_resolvable above: True = this
+        # product_key has its own unsuppressed priced offer, False = it does
+        # not, None = the caller did not compute it and the gate stays silent.
+        # The JOIN always computes it (EXISTS is never NULL), so None here means
+        # a hand-built test input or an older caller.
+        "row_has_priced_offer": (
+            None
+            if _row_get(row, "row_has_priced_offer") is None
+            else bool(_row_get(row, "row_has_priced_offer"))
         ),
         "product": {
             "product_key": product_key,

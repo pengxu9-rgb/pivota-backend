@@ -756,6 +756,88 @@ def test_renderable_gate_does_not_mask_an_earlier_block_reason(monkeypatch):
     assert REASON_CODES.PDP_ROUTE_UNRESOLVABLE not in trust["serving_reason_codes"]
 
 
+# ---- c1.v0.6: OFFER_PRICE_MISSING -------------------------------------------
+#
+# The gap this closes is GRAIN, not a wrong predicate.
+# `index_pipeline_state.has_price` was always right — it asked about an
+# unsuppressed, priced catalog_offers row belonging to the catalog_products row
+# in front of it. But index_pipeline_state is keyed by CONTENT_KEY and stores
+# the best sibling's state, while trust is keyed by PRODUCT_KEY and every
+# product_key mints its own pivota_signature_id — its own public PDP. A
+# price-less row sharing a content_key with a priced sibling therefore read the
+# sibling's serving_eligible=true and published a price-less page.
+#
+# Measured on prod 2026-07-31: exactly 4 rows, all Tom Ford fragrances, each
+# with one unsuppressed offer whose list_price, merchant_effective_price and
+# estimated_best_price were ALL NULL — drained by the 2026-07-30 currency
+# remediation without being suppressed. 2,535 further rows also lack a priced
+# offer of their own and every one is already blocked upstream, which is why
+# this gate ships ungated: its entire blast radius is those 4 rows.
+#
+# The SQL that computes the input is gated separately, on the production
+# dialect, in tests/test_priced_offer_gate_postgres.py. These pin the MECHANICS.
+
+
+def test_price_gate_blocks_a_row_with_no_priced_offer_of_its_own():
+    trust = call(row_has_priced_offer=False)
+    assert trust["serving_decision"] == "blocked"
+    assert REASON_CODES.OFFER_PRICE_MISSING in trust["serving_reason_codes"]
+
+
+def test_price_gate_leaves_a_priced_row_public():
+    trust = call(row_has_priced_offer=True)
+    assert trust["serving_decision"] == "public"
+    assert REASON_CODES.OFFER_PRICE_MISSING not in trust["serving_reason_codes"]
+
+
+def test_price_gate_is_inert_when_the_input_is_absent():
+    """Tri-state, and the reason it must be.
+
+    Only ``services/catalog_row_trust_upserter`` computes this input. Reading an
+    ABSENT input as "not priced" would mass-demote the catalog the first time
+    any other producer called derive_trust.
+    """
+    trust = call()
+    assert trust["serving_decision"] == "public"
+    assert REASON_CODES.OFFER_PRICE_MISSING not in trust["serving_reason_codes"]
+
+
+def test_price_gate_ignores_a_falsy_but_not_false_input():
+    """`is False`, not `not row_has_priced_offer`. None must fall through."""
+    trust = call(row_has_priced_offer=None)
+    assert trust["serving_decision"] == "public"
+    assert REASON_CODES.OFFER_PRICE_MISSING not in trust["serving_reason_codes"]
+
+
+def test_price_gate_does_not_mask_an_earlier_block_reason():
+    """Ordering: the index gate answers for the content_key and runs FIRST, so a
+    row already blocked there keeps reporting INDEX_NOT_SERVING_ELIGIBLE. If this
+    ever flips, the reason-code histogram collapses onto the newest gate and the
+    two grains become indistinguishable in the data."""
+    trust = call(
+        ips=eligible_ips(serving_eligible=False),
+        row_has_priced_offer=False,
+    )
+    assert trust["serving_decision"] == "blocked"
+    assert REASON_CODES.INDEX_NOT_SERVING_ELIGIBLE in trust["serving_reason_codes"]
+    assert REASON_CODES.OFFER_PRICE_MISSING not in trust["serving_reason_codes"]
+
+
+def test_price_gate_applies_to_external_seed_supply():
+    """The 4 prod rows are external-seed mirror rows, so the lane that actually
+    regressed must be covered — not just the first-party fixture."""
+    trust = call_external_seed(row_has_priced_offer=False)
+    assert trust["serving_decision"] == "blocked"
+    assert REASON_CODES.OFFER_PRICE_MISSING in trust["serving_reason_codes"]
+
+
+def test_offer_price_missing_is_in_the_reason_vocabulary():
+    """The vocabulary is the contract readers validate against."""
+    from services.catalog_trust_policy import REASON_CODE_VOCABULARY
+
+    assert REASON_CODES.OFFER_PRICE_MISSING in REASON_CODE_VOCABULARY
+
+
 def test_policy_version_is_pinned_to_the_node_twin():
     """A version MISMATCH between the twins is the catastrophic failure mode.
 
@@ -771,8 +853,20 @@ def test_policy_version_is_pinned_to_the_node_twin():
     every test green. Bump it here AND in
     PIVOTA-Agent src/services/catalogTrustPolicy.js, and merge the two PRs back
     to back (backend first).
+
+    c1.v0.5 -> c1.v0.6 on 2026-07-31 for the OFFER_PRICE_MISSING gate, which
+    flips 4 measured prod rows 'public' -> 'blocked' and so is a real logic
+    change by the module's own versioning rule.
+
+    🚨 THE PAIRED PIVOTA-Agent PR IS NOT OPTIONAL AND IS NOT JUST THIS STRING.
+    The twin must also (a) select the per-row priced-offer EXISTS in
+    src/services/catalogRowTrustUpserter.js — the mirror of
+    services/priced_offer_sql.priced_offer_exists_sql('cp.product_key') — and
+    (b) add the same tri-state gate to catalogTrustPolicy.js, immediately after
+    its index gate. Ship only this bump and the twin keeps re-deriving those 4
+    price-less PDPs 'public' on its next identity event for them.
     """
-    assert POLICY_VERSION == "c1.v0.5"
+    assert POLICY_VERSION == "c1.v0.6"
 
 
 # ---- TEST/DEMO MERCHANT GATE (2026-07-27) -----------------------------------

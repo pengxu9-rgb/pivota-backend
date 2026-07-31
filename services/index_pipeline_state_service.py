@@ -22,6 +22,7 @@ from services.agent_decision_gates import (
     agent_decision_gates_enabled,
     evaluate_agent_decision_gates,
 )
+from services.priced_offer_sql import priced_offer_exists_sql
 
 logger = logging.getLogger(__name__)
 
@@ -330,7 +331,10 @@ def _classify_product(
         blocker_detail = "agent_pdp_view.image_url is null or empty"
     elif not has_price:
         blocker_code = "no_price"
-        blocker_detail = "no catalog_offers row with list_price > 0"
+        blocker_detail = (
+            "no unsuppressed catalog_offers row with a price > 0 "
+            "(services/priced_offer_sql)"
+        )
     elif description_length < MIN_DESCRIPTION_LENGTH:
         blocker_code = "short_description"
         blocker_detail = (
@@ -521,6 +525,15 @@ _HAS_OFFER_SNAPSHOT_COLUMN = """
     )                           AS has_offer_snapshot
 """.strip()
 
+# Bound here rather than inline in the f-strings below: Python 3.11 replacement
+# fields cannot span lines, and both query bodies (Postgres and the SQLite test
+# path) must interpolate the SAME fragment or they drift apart silently.
+_HAS_PRICE_EXISTS = priced_offer_exists_sql("cp.product_key")
+_HAS_US_OFFER_EXISTS = priced_offer_exists_sql(
+    "cp.product_key",
+    extra_predicate="upper(trim(coalesce(co.currency, ''))) = 'USD'",
+)
+
 _ELIGIBILITY_COLUMNS = f"""
     cp.content_key,
     cp.product_key,
@@ -546,14 +559,22 @@ _ELIGIBILITY_COLUMNS = f"""
     apv.refreshed_at,
     eps.seed_data               AS seed_data_json,
     eps.title                   AS seed_title,
-    (
-        SELECT TRUE
-        FROM catalog_offers co
-        WHERE co.product_key = cp.product_key
-          AND co.suppressed_at IS NULL
-          AND co.list_price > 0
-        LIMIT 1
-    )                           AS has_price,
+    -- has_price is a PER-ROW signal: it asks whether THIS product_key carries a
+    -- real price, from services/priced_offer_sql — the same predicate the
+    -- `public_without_priced_offer` invariant and the trust policy's
+    -- OFFER_PRICE_MISSING gate ask. Do not re-spell it here.
+    --
+    -- ⚠️ GRAIN. index_pipeline_state is keyed by CONTENT_KEY and this query
+    -- fetches every catalog_products row for that key, so _select_content_key_state
+    -- picks ONE row's state to store. A content_key holding both a priced row
+    -- and a price-less row therefore stores has_price=TRUE, which is correct
+    -- FOR THE WINNING ROW and says nothing about its siblings. Consumers that
+    -- decide per PRODUCT_KEY (catalog_row_trust — every product_key has its own
+    -- pivota_signature_id and therefore its own public PDP) must NOT read
+    -- eligibility for one row off this content-grained answer; that is exactly
+    -- the leak that put 4 price-less Tom Ford PDPs on the public surface on
+    -- 2026-07-31. They re-ask priced_offer_exists_sql for their own row.
+    {_HAS_PRICE_EXISTS}      AS has_price,
     -- US-buyable offer. Derived from CURRENCY, not catalog_offers.market:
     -- market is a NOT NULL DEFAULT 'US' (mig 149, "refine to real per-offer geo
     -- when modeled") that the external-seed writers never set, so it is 'US' for
@@ -562,14 +583,7 @@ _ELIGIBILITY_COLUMNS = f"""
     -- the INR/ZAR/GBP mispricing was detected. EXISTS (not SELECT TRUE) so the
     -- value is TRUE/FALSE and never NULL — an ABSENT key then unambiguously means
     -- "not computed by this query" rather than "no US offer".
-    EXISTS (
-        SELECT 1
-        FROM catalog_offers co
-        WHERE co.product_key = cp.product_key
-          AND co.suppressed_at IS NULL
-          AND co.list_price > 0
-          AND upper(trim(coalesce(co.currency, ''))) = 'USD'
-    )                           AS has_us_offer,
+    {_HAS_US_OFFER_EXISTS}      AS has_us_offer,
     -- Category concern list (skin concern for skincare, hair concern for
     -- haircare); both read the shared concerns_json. The category-attributes
     -- gate selects which category_kind this blocks for.
@@ -688,7 +702,7 @@ WHERE cp.content_key = ANY(:content_keys)
 ORDER BY cp.content_key, cp.updated_at DESC NULLS LAST, cp.product_key
 """
 
-_SINGLE_QUERY_SQLITE = """
+_SINGLE_QUERY_SQLITE = f"""
 SELECT
     cp.content_key,
     cp.product_key,
@@ -768,26 +782,13 @@ SELECT
         ORDER BY eps.updated_at DESC
         LIMIT 1
     ) AS seed_title,
-    EXISTS (
-        SELECT 1
-        FROM catalog_offers co
-        WHERE co.product_key = cp.product_key
-          AND co.suppressed_at IS NULL
-          AND co.list_price > 0
-    ) AS has_price,
+    {_HAS_PRICE_EXISTS} AS has_price,
     -- has_us_offer is computed for REAL on this path (same currency predicate as
     -- Postgres) so the US-buyable gate is reachable in SQLite-backed tests; it
     -- used to be a hardcoded 0, which made the gate untestable.
     -- The two columns BELOW remain column-independent placeholders: beauty
     -- concerns/actives are computed only on the Postgres path.
-    EXISTS (
-        SELECT 1
-        FROM catalog_offers co
-        WHERE co.product_key = cp.product_key
-          AND co.suppressed_at IS NULL
-          AND co.list_price > 0
-          AND upper(trim(coalesce(co.currency, ''))) = 'USD'
-    ) AS has_us_offer,
+    {_HAS_US_OFFER_EXISTS} AS has_us_offer,
     NULL AS has_category_concern,
     NULL AS has_key_actives,
     EXISTS (
