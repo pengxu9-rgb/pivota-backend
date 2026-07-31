@@ -42,70 +42,92 @@ async def _connect_if_needed() -> bool:
 
 
 async def _ensure_schema() -> None:
+    """NULLABILITY MIRRORS PRODUCTION EXACTLY — `db/migrations/058_catalog_core.sql`.
+
+    These tables are created by whichever test module reaches them first in a
+    full-suite run, so a fixture that relaxes a NOT NULL passes in isolation and
+    dies the moment the real DDL wins the race. That is not hypothetical: the
+    first push of this PR omitted `catalog_skus.merchant_id NOT NULL` and CI's
+    `sweep` failed on every insert — the SAME defect the previous PR shipped with
+    `merchant_stores.name`. Keep every NOT NULL here, and have the seed helpers
+    supply all of them.
+    """
     ddl = [
         """
         CREATE TABLE IF NOT EXISTS catalog_products (
-            product_key TEXT PRIMARY KEY,
-            merchant_id TEXT NOT NULL,
-            platform TEXT,
-            source_product_id TEXT,
-            catalog_track TEXT,
-            truth_tier TEXT,
-            readiness_tier TEXT,
-            source_system TEXT,
-            title TEXT,
+            product_key VARCHAR(255) PRIMARY KEY,
+            merchant_id VARCHAR(64) NOT NULL,
+            platform VARCHAR(64) NOT NULL,
+            source_product_id VARCHAR(128) NOT NULL,
+            catalog_track VARCHAR(32) NOT NULL DEFAULT 'internal_merchant',
+            truth_tier VARCHAR(32) NOT NULL DEFAULT 'primary',
+            readiness_tier VARCHAR(32) NOT NULL DEFAULT 'commerce_ready',
+            source_system VARCHAR(64),
+            source_ref VARCHAR(255),
+            title TEXT NOT NULL,
             description TEXT,
-            brand TEXT,
-            product_type TEXT,
-            category TEXT,
+            brand VARCHAR(255),
+            product_type VARCHAR(255),
+            category VARCHAR(255),
             category_path TEXT,
             canonical_url TEXT,
             image_url TEXT,
+            product_payload TEXT,
+            freshness_json TEXT,
             pdp_scope TEXT,
             pdp_lifecycle_stage TEXT,
             sync_status TEXT DEFAULT 'live',
-            freshness_json TEXT,
             content_key TEXT,
             suppressed_at TIMESTAMP,
             suppression_reason TEXT,
-            updated_at TIMESTAMP
+            created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+            updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP
         )
         """,
         """
         CREATE TABLE IF NOT EXISTS catalog_skus (
-            sku_key TEXT PRIMARY KEY,
-            product_key TEXT NOT NULL,
-            source_variant_id TEXT,
-            sku TEXT,
-            barcode TEXT,
-            title TEXT,
+            sku_key VARCHAR(255) PRIMARY KEY,
+            product_key VARCHAR(255) NOT NULL,
+            merchant_id VARCHAR(64) NOT NULL,
+            platform VARCHAR(64) NOT NULL,
+            source_product_id VARCHAR(128) NOT NULL,
+            source_variant_id VARCHAR(128) NOT NULL,
+            sku VARCHAR(128),
+            barcode VARCHAR(128),
+            title TEXT NOT NULL,
+            currency VARCHAR(16),
+            image_url TEXT,
             visible_attributes TEXT,
             visible_option_labels TEXT,
             ingredient_ids TEXT,
-            image_url TEXT,
+            sku_payload TEXT,
+            readiness_tier VARCHAR(32) NOT NULL DEFAULT 'commerce_ready',
             suppressed_at TIMESTAMP,
             suppression_reason TEXT,
-            updated_at TIMESTAMP
+            created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+            updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP
         )
         """,
         """
         CREATE TABLE IF NOT EXISTS catalog_offers (
-            offer_id TEXT PRIMARY KEY,
-            sku_key TEXT NOT NULL,
-            product_key TEXT,
-            merchant_id TEXT,
-            catalog_track TEXT,
-            truth_tier TEXT,
-            readiness_tier TEXT,
-            offer_mode TEXT,
-            availability TEXT,
+            offer_id VARCHAR(255) PRIMARY KEY,
+            sku_key VARCHAR(255) NOT NULL,
+            product_key VARCHAR(255) NOT NULL,
+            merchant_id VARCHAR(64) NOT NULL,
+            catalog_track VARCHAR(32) NOT NULL DEFAULT 'internal_merchant',
+            truth_tier VARCHAR(32) NOT NULL DEFAULT 'primary',
+            readiness_tier VARCHAR(32) NOT NULL DEFAULT 'commerce_ready',
+            offer_mode VARCHAR(32) NOT NULL DEFAULT 'merchant_checkout',
+            channel VARCHAR(64) NOT NULL DEFAULT 'default',
+            availability VARCHAR(32) NOT NULL DEFAULT 'unknown',
             inventory_quantity INTEGER,
-            currency TEXT,
-            list_price NUMERIC,
-            merchant_effective_price NUMERIC,
-            estimated_best_price NUMERIC,
-            price_confidence TEXT,
-            source_system TEXT,
+            currency VARCHAR(16),
+            list_price NUMERIC(12, 2),
+            merchant_effective_price NUMERIC(12, 2),
+            estimated_best_price NUMERIC(12, 2),
+            price_confidence NUMERIC(5, 2),
+            source_system VARCHAR(64),
+            source_ref VARCHAR(255),
             offer_type TEXT,
             market TEXT,
             is_first_party BOOLEAN,
@@ -113,23 +135,53 @@ async def _ensure_schema() -> None:
             why_buy_direct TEXT,
             offer_payload TEXT,
             suppressed_at TIMESTAMP,
-            updated_at TIMESTAMP
+            created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+            updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP
         )
         """,
         """
         CREATE TABLE IF NOT EXISTS catalog_merchants (
-            merchant_id TEXT PRIMARY KEY,
-            merchant_name TEXT,
-            primary_platform TEXT,
-            status TEXT NOT NULL DEFAULT 'active',
+            merchant_id VARCHAR(64) PRIMARY KEY,
+            merchant_name VARCHAR(255),
+            primary_platform VARCHAR(64),
+            status VARCHAR(32) NOT NULL DEFAULT 'active',
             indexable BOOLEAN DEFAULT TRUE,
+            source_system VARCHAR(64),
+            source_ref VARCHAR(255),
             metadata_json TEXT,
-            updated_at TIMESTAMP
+            created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+            updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP
         )
         """,
     ]
     for stmt in ddl:
         await database.execute(stmt)
+    # Columns added by later migrations; in a full-suite run another module may
+    # have created these tables from an older DDL. Added the way schema_guard
+    # does it in prod, so the fixture works whichever DDL won the race.
+    for table, column, coltype in (
+        ("catalog_products", "category_path", "TEXT"),
+        ("catalog_products", "pdp_scope", "TEXT"),
+        ("catalog_products", "pdp_lifecycle_stage", "TEXT"),
+        ("catalog_products", "sync_status", "TEXT DEFAULT 'live'"),
+        ("catalog_products", "content_key", "TEXT"),
+        ("catalog_products", "suppressed_at", "TIMESTAMP"),
+        ("catalog_products", "suppression_reason", "TEXT"),
+        ("catalog_skus", "suppressed_at", "TIMESTAMP"),
+        ("catalog_skus", "suppression_reason", "TEXT"),
+        ("catalog_offers", "suppressed_at", "TIMESTAMP"),
+        ("catalog_offers", "offer_type", "TEXT"),
+        ("catalog_offers", "market", "TEXT"),
+        ("catalog_offers", "is_first_party", "BOOLEAN"),
+        ("catalog_offers", "source_domain", "TEXT"),
+        ("catalog_offers", "why_buy_direct", "TEXT"),
+        ("catalog_merchants", "indexable", "BOOLEAN DEFAULT TRUE"),
+        ("catalog_merchants", "metadata_json", "TEXT"),
+    ):
+        try:
+            await database.execute(f"ALTER TABLE {table} ADD COLUMN {column} {coltype}")
+        except Exception:
+            pass  # already present
 
 
 async def _reset() -> None:
@@ -145,8 +197,10 @@ async def _reset() -> None:
 async def _merchant(merchant_id: str, *, status: str = "active", indexable: bool = True) -> None:
     await database.execute(
         """
-        INSERT INTO catalog_merchants (merchant_id, merchant_name, status, indexable, metadata_json)
-        VALUES (:m, :n, :s, :i, '{}')
+        INSERT INTO catalog_merchants
+            (merchant_id, merchant_name, status, indexable, metadata_json,
+             created_at, updated_at)
+        VALUES (:m, :n, :s, :i, '{}', CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)
         """,
         {"m": merchant_id, "n": merchant_id, "s": status, "i": 1 if indexable else 0},
     )
@@ -166,25 +220,34 @@ async def _product_with_offer(
     owner != seller is the whole H1 shape — every pre-existing gate reads the
     owner, so a gated SELLER walked straight through.
     """
+    # Every NOT NULL column in the production DDL is supplied explicitly —
+    # relying on a fixture-only default is what broke the first push.
     await database.execute(
         """
         INSERT INTO catalog_products
-            (product_key, merchant_id, platform, source_product_id, title, brand,
-             pdp_lifecycle_stage, sync_status, updated_at)
-        VALUES (:k, :m, 'shopify', :spi, :t, 'TestBrand', 'published', 'live', CURRENT_TIMESTAMP)
+            (product_key, merchant_id, platform, source_product_id, catalog_track,
+             truth_tier, readiness_tier, title, brand, pdp_lifecycle_stage,
+             sync_status, created_at, updated_at)
+        VALUES (:k, :m, 'shopify', :spi, 'internal_merchant', 'primary',
+                'commerce_ready', :t, 'TestBrand', 'published', 'live',
+                CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)
         """,
         {"k": key, "m": owner, "spi": f"src-{key}", "t": title},
     )
     await database.execute(
         """
         INSERT INTO catalog_skus
-            (sku_key, product_key, source_variant_id, sku, title,
-             suppressed_at, suppression_reason, updated_at)
-        VALUES (:sk, :k, :v, :sku, :t, :sa, :sr, CURRENT_TIMESTAMP)
+            (sku_key, product_key, merchant_id, platform, source_product_id,
+             source_variant_id, sku, title, readiness_tier,
+             suppressed_at, suppression_reason, created_at, updated_at)
+        VALUES (:sk, :k, :m, 'shopify', :spi, :v, :sku, :t, 'commerce_ready',
+                :sa, :sr, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)
         """,
         {
             "sk": f"{key}::sku",
             "k": key,
+            "m": owner,
+            "spi": f"src-{key}",
             "v": f"var-{key}",
             "sku": f"sku-{key}",
             "t": title,
@@ -195,9 +258,12 @@ async def _product_with_offer(
     await database.execute(
         """
         INSERT INTO catalog_offers
-            (offer_id, sku_key, product_key, merchant_id, availability, currency,
-             list_price, suppressed_at, updated_at)
-        VALUES (:o, :sk, :k, :seller, 'in_stock', 'USD', 19.99, NULL, CURRENT_TIMESTAMP)
+            (offer_id, sku_key, product_key, merchant_id, catalog_track, truth_tier,
+             readiness_tier, offer_mode, channel, availability, currency, list_price,
+             suppressed_at, created_at, updated_at)
+        VALUES (:o, :sk, :k, :seller, 'internal_merchant', 'primary', 'commerce_ready',
+                'merchant_checkout', 'default', 'in_stock', 'USD', 19.99, NULL,
+                CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)
         """,
         {"o": f"{key}::offer", "sk": f"{key}::sku", "k": key, "seller": seller},
     )
