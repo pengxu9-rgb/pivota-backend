@@ -2191,6 +2191,13 @@ async def _process_shopify_webhook_event(
                     merchant_id=merchant_id,
                     metadata={"shop_domain": canon_domain or shop_domain},
                 )
+                # Public recall gates on catalog_merchants.status, which nothing
+                # used to write — so an uninstalled merchant kept serving on
+                # search indefinitely (#1648). Re-derive it from the stores we
+                # just changed. Never raises.
+                from services.store_lifecycle_service import sync_catalog_merchant_status
+
+                await sync_catalog_merchant_status(merchant_id, reason="shopify_app_uninstalled")
             except Exception as e:
                 logger.warning("Shopify app uninstall cleanup failed merchant=%s err=%s", merchant_id, str(e)[:200])
             return {"status": "success", "topic": topic}

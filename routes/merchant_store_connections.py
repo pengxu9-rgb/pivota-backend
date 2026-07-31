@@ -8,6 +8,7 @@ from services.shopify_access_token_service import (
     resolve_shopify_admin_access_token,
 )
 from services.wix_connection import WixConnectionValidationError, validate_wix_catalog_access
+from services.store_lifecycle_service import sync_catalog_merchant_status
 from fastapi import APIRouter, Depends, HTTPException, Body, BackgroundTasks, Request, Query, Header
 from fastapi.responses import RedirectResponse
 from pydantic import BaseModel, EmailStr, TypeAdapter, ValidationError
@@ -689,6 +690,11 @@ async def _upsert_shopify_store_credentials(
                 "api_key": token_json,
             },
         )
+        # A reconnect must re-open the public door a disconnect closed:
+        # catalog_merchants.status is derived from merchant_stores now (#1648).
+        # The hourly reconciliation sweep would converge this within the hour
+        # anyway; the call here just makes it immediate.
+        await sync_catalog_merchant_status(merchant_id, reason="shopify_store_reconnected")
         return str(existing_row["store_id"])
 
     store_id = f"store_{merchant_id[:8]}_{int(datetime.now().timestamp())}"
@@ -707,6 +713,7 @@ async def _upsert_shopify_store_credentials(
             "api_key": token_json,
         },
     )
+    await sync_catalog_merchant_status(merchant_id, reason="shopify_store_connected")
     return store_id
 
 
@@ -1718,6 +1725,11 @@ async def merchant_connect_shopify(
         # Legacy MCP fields have been migrated to merchant_stores table
         # No need to update merchant_onboarding anymore
 
+        # catalog_merchants.status (the public-recall gate) is derived from
+        # merchant_stores now — connecting must flip it back to 'active' if a
+        # prior disconnect had flipped it (#1648).
+        await sync_catalog_merchant_status(request.merchant_id, reason="shopify_custom_app_connect")
+
         # Register the required order/uninstall webhooks now that credentials are
         # stored. The custom-token connect path (App B / write-tier) is the ONLY
         # path that holds write_webhooks, so this is the mainline for conversion
@@ -2133,6 +2145,10 @@ async def merchant_connect_wix(
                 }
             )
         
+        # See the Shopify connect path: catalog_merchants.status is derived from
+        # merchant_stores now, so connecting has to re-open the door (#1648).
+        await sync_catalog_merchant_status(request.merchant_id, reason="wix_connect")
+
         return {
             "status": "success",
             "message": "Wix store connected successfully",
@@ -2206,7 +2222,8 @@ async def merchant_connect_woocommerce(
             # Update existing store
             await database.execute(
                 """UPDATE merchant_stores 
-                   SET api_key = :api_key, status = 'active', last_sync = CURRENT_TIMESTAMP
+                   SET api_key = :api_key, status = 'active', last_sync = CURRENT_TIMESTAMP,
+                       connected_at = CURRENT_TIMESTAMP
                    WHERE store_id = :store_id""",
                 {"store_id": existing_store["store_id"], "api_key": credential_blob}
             )
@@ -2302,7 +2319,8 @@ async def merchant_connect_bigcommerce(
             # Update existing store
             await database.execute(
                 """UPDATE merchant_stores 
-                   SET api_key = :api_key, status = 'active', last_sync = CURRENT_TIMESTAMP
+                   SET api_key = :api_key, status = 'active', last_sync = CURRENT_TIMESTAMP,
+                       connected_at = CURRENT_TIMESTAMP
                    WHERE store_id = :store_id""",
                 {"store_id": existing_store["store_id"], "api_key": credential_blob}
             )
@@ -2386,7 +2404,8 @@ async def merchant_connect_prestashop(
             # Update existing store
             await database.execute(
                 """UPDATE merchant_stores 
-                   SET api_key = :api_key, status = 'active', last_sync = CURRENT_TIMESTAMP
+                   SET api_key = :api_key, status = 'active', last_sync = CURRENT_TIMESTAMP,
+                       connected_at = CURRENT_TIMESTAMP
                    WHERE store_id = :store_id""",
                 {"store_id": existing_store["store_id"], "api_key": request.api_key}
             )

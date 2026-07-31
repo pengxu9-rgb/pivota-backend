@@ -6,6 +6,7 @@ from utils.auth import get_current_user
 from services.merchant_psp_config_service import (
     persist_canonical_merchant_psp,
 )
+from services.store_lifecycle_service import sync_catalog_merchant_status
 import json
 import httpx
 
@@ -138,7 +139,12 @@ async def delete_store(
                 )
             except Exception:
                 pass
-        
+
+        # Public recall gates on catalog_merchants.status; nothing used to write
+        # it, so a merchant who disconnected their last store kept serving on
+        # search (#1648). Re-derived from the stores that remain. Never raises.
+        await sync_catalog_merchant_status(merchant_id, reason="store_disconnected")
+
         return {
             "status": "success",
             "message": "Store disconnected successfully"
@@ -293,7 +299,16 @@ async def update_store(
         if "status" in store_data:
             update_fields.append("status = :status")
             values["status"] = store_data["status"]
-        
+            if str(store_data["status"] or "").strip().lower() in ("active", "connected"):
+                # Re-entering the serving set IS a reconnect, so stamp
+                # connected_at with it. The store-lifecycle probe discards a
+                # failure count measured before connected_at (see
+                # services.store_lifecycle_service.effective_prior_failures); a
+                # status flip that left the timestamp behind would let a count
+                # from the PREVIOUS connection disconnect this one on its first
+                # transient 401.
+                update_fields.append("connected_at = CURRENT_TIMESTAMP")
+
         if not update_fields:
             raise HTTPException(status_code=400, detail="No fields to update")
         
@@ -303,7 +318,14 @@ async def update_store(
             WHERE store_id = :store_id AND merchant_id = :merchant_id
         """
         await database.execute(update_query, values)
-        
+
+        if "status" in store_data:
+            # A status edit can be the merchant's last active store leaving (or
+            # rejoining) the serving set — keep catalog_merchants.status in step
+            # with it. Re-derived from the DB, so the direction is inferred, not
+            # assumed (#1648).
+            await sync_catalog_merchant_status(merchant_id, reason="store_status_updated")
+
         return {
             "status": "success",
             "message": "Store updated successfully"
@@ -398,6 +420,12 @@ async def set_primary_store(
             raise HTTPException(status_code=500, detail="Primary store update did not persist")
 
         await sync_legacy_primary_store_fields(merchant_id, store_data)
+
+        # Selecting a primary demotes same-platform siblings to 'inactive'. The
+        # new primary must itself be active (checked above), so this is a no-op
+        # today — it is here so a future change to that precondition cannot
+        # silently strand catalog_merchants.status again (#1648).
+        await sync_catalog_merchant_status(merchant_id, reason="store_set_primary")
 
         return {
             "status": "success",
