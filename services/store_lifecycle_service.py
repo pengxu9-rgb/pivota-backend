@@ -44,15 +44,21 @@ DESIGN NOTES worth keeping.
   and never reset the counter either — an unreachable probe is not evidence in
   either direction. "On the current connection" is the load-bearing half: no
   reconnect path clears the probe columns, so effective_prior_failures() drops a
-  count measured before the store's last `connected_at`.
+  count measured before the store's last `connected_at`. Every writer that moves
+  a store INTO active/connected now stamps that timestamp — four did not, and
+  review reproduced a live disconnect through the portal's status PATCH.
 
 * Two strikes only defends against INDEPENDENT failures. A common-mode failure —
   an expired SHOPIFY_API_VERSION, a platform-wide 401, a credential-store
   regression — makes every store fail identically, and two ticks later the whole
   merchant fleet would be disconnected and dropped from public recall. The
   correlated-failure breaker (per-tick cap + majority-hard-failure ratio above a
-  fleet-size floor) is what stops that, and it is evaluated after every probe in
-  the tick has landed rather than incrementally.
+  fleet-size floor) is what stops that, evaluated after every probe in the tick
+  has landed rather than incrementally. It RATE-LIMITS rather than halts: a
+  breaker with no drain is itself a permanent leak — halting meant any fleet of
+  >= 5 stores where most were genuinely gone could never be reconciled, which is
+  #1648 reopened by its own fix, and is exactly what retiring three test rigs in
+  one afternoon looks like.
 
 * One malformed row must not be able to stop the job. Probes are individually
   caught, because the Wix credential helpers RAISE on a blank site id and
@@ -154,6 +160,16 @@ def _max_disconnects_per_tick() -> int:
         value = int((os.getenv("STORE_LIFECYCLE_MAX_DISCONNECTS_PER_TICK") or "").strip() or 3)
     except Exception:
         value = 3
+    return max(1, value)
+
+
+def _correlated_disconnects_per_tick() -> int:
+    """How many disconnects a tick may still perform when the failures look
+    correlated. Deliberately > 0: a guard with no drain is a permanent leak."""
+    try:
+        value = int((os.getenv("STORE_LIFECYCLE_CORRELATED_DISCONNECTS_PER_TICK") or "").strip() or 1)
+    except Exception:
+        value = 1
     return max(1, value)
 
 
@@ -496,28 +512,45 @@ def effective_prior_failures(
     prior_failures: int,
     connected_at: Any,
     probe_at: Any,
+    created_at: Any = None,
 ) -> int:
     """Pure: how many failures this store has ACCUMULATED SINCE ITS LAST CONNECT.
 
     A stored counter is only evidence about the connection it was measured on.
-    Every reconnect path in the repo writes `connected_at = CURRENT_TIMESTAMP`,
-    but none of them clears the probe columns — so without this, a store that
-    failed once weeks ago, was reconnected, and then hit a single transient 401
-    (most likely precisely after a reconnect, during the token-refresh window)
-    would reach the threshold and be disconnected on its FIRST failure of the
-    current connection. That falsifies the two-strike rule outright, and it was
-    reproduced in review.
+    Reconnect paths write `connected_at = CURRENT_TIMESTAMP` but none of them
+    clears the probe columns — so without this, a store that failed once weeks
+    ago, was reconnected, and then hit a single transient 401 (most likely
+    precisely after a reconnect, during the token-refresh window) would reach
+    the threshold and be disconnected on its FIRST failure of the current
+    connection. That falsifies the two-strike rule outright.
 
-    Keying on `connected_at` rather than on each reconnect writer remembering
-    to reset four columns is the point: it holds for lifecycle paths this PR
-    never touched, and for ones written later.
+    Keying on `connected_at` rather than on each reconnect writer remembering to
+    reset four columns is the point: it holds for lifecycle paths this PR never
+    touched, and for ones written later. Review found four writers that set
+    `status` without `connected_at` (the portal status PATCH, plus the Woo /
+    BigCommerce / PrestaShop reconnects); those are fixed at the source, and
+    tests/test_store_lifecycle_reconciliation.py has a repo-wide source gate
+    against a fifth — but the rule must not depend on having found them all.
+
+    `created_at` is the fallback anchor when `connected_at` is NULL — nullable
+    in the schema, and "no connect timestamp" must not silently mean "trust a
+    counter of unknown vintage". Note the asymmetry with `_fetch_due_stores`,
+    where an unreadable timestamp means DUE: there the fail-safe direction is
+    "probe again" (read-only), here it is "do not disconnect". Same helper,
+    opposite safe directions, on purpose.
+
+    Falling back rather than returning 0 is deliberate: a store with NO usable
+    connect anchor whose count reset every tick could never reach the threshold
+    and so could never be disconnected — trading a false disconnect for a
+    permanent leak. Prod has 0 rows with either column NULL (2026-07-31).
     """
     prior = max(0, prior_failures)
-    connected = _coerce_probe_timestamp(connected_at)
     probed = _coerce_probe_timestamp(probe_at)
-    if connected is None or probed is None:
-        # Legacy rows with no connect timestamp: nothing to compare, keep what
-        # was measured. (A never-probed store has prior=0 anyway.)
+    if probed is None:
+        # Never probed — nothing for the count to be stale relative to.
+        return prior
+    connected = _coerce_probe_timestamp(connected_at) or _coerce_probe_timestamp(created_at)
+    if connected is None:
         return prior
     return 0 if connected > probed else prior
 
@@ -535,9 +568,16 @@ async def _record_probe(
     so a counter left over from a previous connection is not carried forward.
     The write is an absolute SET rather than a SQL increment on purpose: the
     reconnect rule needs to be able to reset the stored value, and an increment
-    cannot express that. The residual window — a reconnect landing INSIDE the
-    ≤12s probe — is handled at the decision site, where the disconnect re-checks
-    the stored counter against the threshold.
+    cannot express that.
+
+    KNOWN RESIDUAL, stated plainly because an earlier version of this docstring
+    claimed otherwise: a reconnect landing INSIDE the <=12s probe window is NOT
+    mitigated. The disconnect's threshold re-check cannot see it — that counter
+    was written by this same tick, and no reconnect path touches
+    upstream_probe_failures. Closing it needs the reconnect writers to clear the
+    probe columns (or a row version token); the window is ~12s against an hourly
+    job on a handful of stores and the outcome is a revertible status flip, so it
+    is accepted rather than papered over.
     """
     failures = next_failure_count(outcome, prior_failures)
 
@@ -603,7 +643,7 @@ async def _fetch_due_stores(limit: int) -> List[Dict[str, Any]]:
         """
         SELECT store_id, merchant_id, platform, domain, api_key, status,
                COALESCE(upstream_probe_failures, 0) AS upstream_probe_failures,
-               upstream_probe_at, connected_at
+               upstream_probe_at, connected_at, created_at
         FROM merchant_stores
         WHERE lower(COALESCE(status, '')) IN ('active', 'connected')
         ORDER BY upstream_probe_at ASC NULLS FIRST
@@ -636,31 +676,48 @@ def _correlated_failure_breaker(summary: Dict[str, Any], threshold: int) -> Opti
     Two guards, both returning a reason string (= withhold) or None (= proceed):
 
       * an absolute per-tick cap, so no single tick can empty the fleet;
-      * above MIN_FLEET_FOR_RATIO probes, a majority-hard-failure ratio. Below
-        that threshold the ratio is meaningless (two stores, both genuinely
-        uninstalled, is 100%) so only the cap applies.
+      * above MIN_FLEET_FOR_RATIO probes, a majority-hard-failure ratio.
+
+    A tripped ratio RATE-LIMITS; it does not halt. Halting was the first design
+    and review proved it a permanent inertness bug: any fleet of >= 5 active
+    stores where more than half were genuinely gone could never be reconciled —
+    the #1648 leak, held open by the fix for #1648, and the exact shape ops
+    produces by retiring three test rigs in one afternoon. Degrading to a
+    reduced cap keeps the fleet-wipe protection (bounded per tick, loud every
+    tick) while leaving a drain: genuine mass retirement clears at
+    CORRELATED_DISCONNECTS_PER_TICK per cycle, a false positive costs hours of
+    ERROR logs before it could do real damage, and every flip is revertible.
+
+    The denominator is `probed`, NOT `examined`. `examined` counts stores that
+    produced no upstream evidence at all (no_credentials, unsupported_platform),
+    so using it makes the guard's sensitivity a function of platform mix:
+    malformed and non-Shopify/Wix rows dilute it while a pure-Shopify fleet
+    trips it easily. Nobody wants that as a tuning knob.
 
     Called from phase 2 of the tick, after every probe has landed — evaluated
     incrementally it would wave the first stores through before the shape of a
     fleet-wide incident became visible.
     """
-    cap = _max_disconnects_per_tick()
+    del threshold
+    probed = int(summary.get("probed") or 0)
+    hard = sum(
+        int(count) for status, count in (summary.get("outcomes") or {}).items()
+        if status in HARD_PROBE_STATUSES
+    )
+    correlated = probed >= _min_fleet_for_ratio_breaker() and hard * 2 > probed
+
+    cap = _correlated_disconnects_per_tick() if correlated else _max_disconnects_per_tick()
     already = len(summary.get("disconnected") or [])
     if already >= cap:
-        return f"per-tick disconnect cap reached ({already}/{cap})"
-
-    examined = int(summary.get("examined") or 0)
-    if examined >= _min_fleet_for_ratio_breaker():
-        hard = sum(
-            int(count) for status, count in (summary.get("outcomes") or {}).items()
-            if status in HARD_PROBE_STATUSES
-        )
-        if hard * 2 > examined:
+        if correlated:
             return (
-                f"{hard}/{examined} probes failed hard this tick — correlated failure, "
-                "not a mass uninstall"
+                f"{hard}/{probed} probes failed hard this tick — correlated failure, "
+                f"rate-limited to {cap} disconnect(s)/tick (raise "
+                "STORE_LIFECYCLE_CORRELATED_DISCONNECTS_PER_TICK, or "
+                "STORE_LIFECYCLE_MIN_FLEET_FOR_RATIO to disable the ratio guard, "
+                "if this really is a mass uninstall)"
             )
-    del threshold
+        return f"per-tick disconnect cap reached ({already}/{cap})"
     return None
 
 
@@ -728,6 +785,7 @@ async def run_store_lifecycle_reconciliation_tick() -> Dict[str, Any]:
                     int(store.get("upstream_probe_failures") or 0),
                     store.get("connected_at"),
                     store.get("upstream_probe_at"),
+                    store.get("created_at"),
                 ),
             )
         except Exception as e:  # noqa: BLE001

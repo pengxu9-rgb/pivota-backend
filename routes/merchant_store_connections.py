@@ -2222,7 +2222,8 @@ async def merchant_connect_woocommerce(
             # Update existing store
             await database.execute(
                 """UPDATE merchant_stores 
-                   SET api_key = :api_key, status = 'active', last_sync = CURRENT_TIMESTAMP
+                   SET api_key = :api_key, status = 'active', last_sync = CURRENT_TIMESTAMP,
+                       connected_at = CURRENT_TIMESTAMP
                    WHERE store_id = :store_id""",
                 {"store_id": existing_store["store_id"], "api_key": credential_blob}
             )
@@ -2318,7 +2319,8 @@ async def merchant_connect_bigcommerce(
             # Update existing store
             await database.execute(
                 """UPDATE merchant_stores 
-                   SET api_key = :api_key, status = 'active', last_sync = CURRENT_TIMESTAMP
+                   SET api_key = :api_key, status = 'active', last_sync = CURRENT_TIMESTAMP,
+                       connected_at = CURRENT_TIMESTAMP
                    WHERE store_id = :store_id""",
                 {"store_id": existing_store["store_id"], "api_key": credential_blob}
             )
@@ -2402,7 +2404,8 @@ async def merchant_connect_prestashop(
             # Update existing store
             await database.execute(
                 """UPDATE merchant_stores 
-                   SET api_key = :api_key, status = 'active', last_sync = CURRENT_TIMESTAMP
+                   SET api_key = :api_key, status = 'active', last_sync = CURRENT_TIMESTAMP,
+                       connected_at = CURRENT_TIMESTAMP
                    WHERE store_id = :store_id""",
                 {"store_id": existing_store["store_id"], "api_key": request.api_key}
             )

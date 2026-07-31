@@ -299,7 +299,16 @@ async def update_store(
         if "status" in store_data:
             update_fields.append("status = :status")
             values["status"] = store_data["status"]
-        
+            if str(store_data["status"] or "").strip().lower() in ("active", "connected"):
+                # Re-entering the serving set IS a reconnect, so stamp
+                # connected_at with it. The store-lifecycle probe discards a
+                # failure count measured before connected_at (see
+                # services.store_lifecycle_service.effective_prior_failures); a
+                # status flip that left the timestamp behind would let a count
+                # from the PREVIOUS connection disconnect this one on its first
+                # transient 401.
+                update_fields.append("connected_at = CURRENT_TIMESTAMP")
+
         if not update_fields:
             raise HTTPException(status_code=400, detail="No fields to update")
         

@@ -66,6 +66,7 @@ async def _ensure_schema() -> None:
             last_sync TIMESTAMP,
             product_count INTEGER DEFAULT 0,
             is_primary BOOLEAN DEFAULT FALSE,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
             upstream_probe_at TIMESTAMP,
             upstream_probe_status TEXT,
             upstream_probe_http_status INTEGER,
@@ -598,7 +599,6 @@ async def test_reconnect_clears_stale_failures(monkeypatch: pytest.MonkeyPatch):
     [
         (2, "2026-07-15 00:00:00", "2026-07-01 00:00:00", 0),  # reconnected after the failures
         (2, "2026-07-01 00:00:00", "2026-07-15 00:00:00", 2),  # failures are current
-        (2, None, "2026-07-15 00:00:00", 2),                   # legacy row, keep what we measured
         (2, "2026-07-15 00:00:00", None, 2),                   # never probed
         (0, "2026-07-15 00:00:00", "2026-07-01 00:00:00", 0),
     ],
@@ -607,25 +607,101 @@ def test_effective_prior_failures(prior, connected_at, probe_at, expected):
     assert svc.effective_prior_failures(prior, connected_at, probe_at) == expected
 
 
+def test_effective_prior_failures_falls_back_to_created_at():
+    """`connected_at` is nullable. With no connect anchor at all, a stale count
+    of unknown vintage would be trusted — so fall back to created_at, which the
+    schema always stamps."""
+    # created_at newer than the probe -> the count predates this connection.
+    assert svc.effective_prior_failures(2, None, "2026-07-01 00:00:00", "2026-07-15 00:00:00") == 0
+    # created_at older -> the count is current.
+    assert svc.effective_prior_failures(2, None, "2026-07-15 00:00:00", "2026-07-01 00:00:00") == 2
+    # Neither anchor: KEEP the count. Resetting every tick would mean the store
+    # could never reach the threshold — trading a false disconnect for a
+    # permanent leak, which is the wrong trade for this module.
+    assert svc.effective_prior_failures(2, None, "2026-07-15 00:00:00", None) == 2
+
+
+def test_effective_prior_failures_on_aware_datetimes():
+    """asyncpg hands both columns back as aware datetimes; the SQLite fixture
+    only ever produces strings, so the type prod actually sees needs its own
+    assertion."""
+    from datetime import datetime, timezone
+
+    older = datetime(2026, 7, 1, tzinfo=timezone.utc)
+    newer = datetime(2026, 7, 15, tzinfo=timezone.utc)
+    assert svc.effective_prior_failures(2, newer, older) == 0
+    assert svc.effective_prior_failures(2, older, newer) == 2
+    # mixed shapes (one driver, one fixture) must still compare
+    assert svc.effective_prior_failures(2, newer, "2026-07-01 00:00:00") == 0
+
+
 @pytest.mark.asyncio
-async def test_correlated_failure_withholds_every_disconnect(monkeypatch: pytest.MonkeyPatch):
+async def test_correlated_failure_rate_limits_but_still_drains(monkeypatch: pytest.MonkeyPatch):
     """Two strikes defends against INDEPENDENT transients. It does nothing
     against a common-mode failure — an expired SHOPIFY_API_VERSION, a
     platform-wide 401, a credential-store regression — where every store fails
-    the same way and the whole fleet would drop out of public recall."""
+    the same way and the whole fleet would drop out of public recall.
+
+    But the breaker must RATE-LIMIT, not halt. Halting was the first design and
+    it was a permanent inertness bug: a fleet of >=5 stores where most are
+    GENUINELY gone (ops retiring three test rigs in an afternoon — Pivota's
+    fleet is largely retired rigs) could never be reconciled. That is #1648
+    reopened by the fix for #1648."""
     merchant = f"{_MERCHANT_PREFIX}_fleet"
     await _seed_merchant(merchant, "active")
     for i in range(6):
-        await _seed_store(f"{merchant}_s{i}", merchant, "active", failures=1)
+        # connected long before any probe — the normal shape, since every probe
+        # stamps upstream_probe_at = now, so only a genuine reconnect can leave
+        # connected_at newer than the last probe.
+        await _seed_store(
+            f"{merchant}_s{i}", merchant, "active", failures=1, connected_at="2019-01-01 00:00:00"
+        )
     monkeypatch.setattr(svc, "probe_store_upstream", _stub_probe(svc.PROBE_AUTH_FAILED, 401))
+    monkeypatch.setenv("STORE_LIFECYCLE_PROBE_INTERVAL_SECONDS", "300")
 
-    summary = await svc.run_store_lifecycle_reconciliation_tick()
+    first = await svc.run_store_lifecycle_reconciliation_tick()
 
-    assert summary["disconnected"] == []
-    assert len(summary["withheld"]) == 6
-    for i in range(6):
-        assert (await _store_row(f"{merchant}_s{i}"))["status"] == "active"
-    assert await _merchant_status(merchant) == "active"
+    # Rate-limited hard: one per tick, not six, and loudly withheld for the rest.
+    assert len(first["disconnected"]) == 1
+    assert len(first["withheld"]) == 5
+
+    # ...but it DRAINS. Each subsequent probe cycle takes one more. Backdating
+    # upstream_probe_at is how we advance past the 6h per-store probe interval;
+    # in prod this is simply the next cycle, so a 6-store fleet reconciles in
+    # ~6 cycles rather than never.
+    for _ in range(8):
+        await database.execute(
+            "UPDATE merchant_stores SET upstream_probe_at = '2020-01-01 00:00:00' "
+            "WHERE merchant_id = :m",
+            {"m": merchant},
+        )
+        await svc.run_store_lifecycle_reconciliation_tick()
+
+    statuses = [(await _store_row(f"{merchant}_s{i}"))["status"] for i in range(6)]
+    assert all(s == svc.DISCONNECTED_STATUS for s in statuses), statuses
+    assert await _merchant_status(merchant) == "inactive"
+
+
+def test_correlated_ratio_uses_probed_not_examined():
+    """The denominator must exclude stores that produced NO upstream evidence.
+    Counting no_credentials/unsupported_platform makes the guard's sensitivity a
+    function of platform mix — malformed rows dilute it, a pure-Shopify fleet
+    trips it — which is nobody's intended tuning knob."""
+    # 13 examined, but only 6 actually probed, 4 of them hard -> correlated,
+    # and the correlated cap (1) is already spent.
+    correlated = {
+        "examined": 13,
+        "probed": 6,
+        "outcomes": {svc.PROBE_AUTH_FAILED: 4, svc.PROBE_OK: 2, svc.PROBE_NO_CREDENTIALS: 7},
+        "disconnected": [{"store_id": "a"}],
+    }
+    assert "correlated failure" in (svc._correlated_failure_breaker(correlated, 2) or "")
+
+    # The identical tick judged on `examined` (13) would NOT look correlated
+    # (4*2 !> 13), so the 7 evidence-free rows would have bought the fleet a
+    # pass straight through to the normal cap.
+    assert 4 * 2 > correlated["probed"]
+    assert not 4 * 2 > correlated["examined"]
 
 
 @pytest.mark.asyncio
@@ -649,6 +725,144 @@ async def test_per_tick_disconnect_cap(monkeypatch: pytest.MonkeyPatch):
         if s["status"] == svc.DISCONNECTED_STATUS
     ]
     assert len(disconnected) == 2
+
+
+@pytest.mark.asyncio
+async def test_outer_catch_survives_a_probe_that_escapes_its_own_handler(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    """The tick's own catch, not the probe's. Both exist because the inner one
+    is the kind of thing a later refactor narrows; if it does, this is the only
+    thing standing between one bad row and a permanently inert job."""
+    merchant = f"{_MERCHANT_PREFIX}_outercatch"
+    other = f"{_MERCHANT_PREFIX}_outerother"
+    await _seed_merchant(merchant, "active")
+    await _seed_store(f"{merchant}_s1", merchant, "active")
+    await _seed_merchant(other, "active")
+    await _seed_store(f"{other}_s1", other, "disconnected")
+
+    async def _boom(store, **kwargs):
+        raise RuntimeError("probe handler was narrowed and something got through")
+
+    monkeypatch.setattr(svc, "probe_store_upstream", _boom)
+
+    summary = await svc.run_store_lifecycle_reconciliation_tick()
+
+    assert summary["outcomes"].get(svc.PROBE_NO_CREDENTIALS) == 1
+    # The sweep still ran — that is the half that closes the leak.
+    assert await _merchant_status(other) == "inactive"
+
+
+@pytest.mark.asyncio
+async def test_disconnect_refuses_when_the_stored_counter_is_below_threshold(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    """The disconnect's `COALESCE(upstream_probe_failures,0) >= :threshold`
+    clause. It guards the window where something else resets the counter between
+    the probe and the write; without it the write trusts an in-memory number."""
+    merchant = f"{_MERCHANT_PREFIX}_racecheck"
+    store_id = f"{merchant}_s1"
+    await _seed_merchant(merchant, "active")
+    await _seed_store(store_id, merchant, "active", failures=1)
+    monkeypatch.setattr(svc, "probe_store_upstream", _stub_probe(svc.PROBE_AUTH_FAILED, 401))
+
+    real_record = svc._record_probe
+
+    async def racing_record(**kwargs):
+        # Probe says "threshold reached"...
+        await real_record(**kwargs)
+        # ...but a concurrent reconnect resets the stored counter first.
+        await database.execute(
+            "UPDATE merchant_stores SET upstream_probe_failures = 0 WHERE store_id = :s",
+            {"s": kwargs["store_id"]},
+        )
+        return 2
+
+    monkeypatch.setattr(svc, "_record_probe", racing_record)
+
+    summary = await svc.run_store_lifecycle_reconciliation_tick()
+
+    assert summary["disconnected"] == []
+    assert (await _store_row(store_id))["status"] == "active"
+    assert await _merchant_status(merchant) == "active"
+
+
+@pytest.mark.asyncio
+async def test_portal_status_patch_counts_as_a_reconnect(monkeypatch: pytest.MonkeyPatch):
+    """Executes the literal SQL `PUT /merchant/integrations/store/{id}` emits
+    for a status change. It used to write `status` alone, so the store rejoined
+    the serving set carrying a failure count from its PREVIOUS connection — and
+    the next single transient 401 disconnected it."""
+    merchant = f"{_MERCHANT_PREFIX}_patch"
+    store_id = f"{merchant}_s1"
+    await _seed_merchant(merchant, "active")
+    await _seed_store(
+        store_id,
+        merchant,
+        "inactive",
+        failures=1,
+        connected_at="2026-05-01 00:00:00",
+        probe_at="2026-06-01 00:00:00",
+    )
+
+    # routes/manage_integrations.py update_store, status branch.
+    await database.execute(
+        """
+        UPDATE merchant_stores
+        SET status = :status, connected_at = CURRENT_TIMESTAMP
+        WHERE store_id = :store_id AND merchant_id = :merchant_id
+        """,
+        {"status": "active", "store_id": store_id, "merchant_id": merchant},
+    )
+
+    monkeypatch.setattr(svc, "probe_store_upstream", _stub_probe(svc.PROBE_AUTH_FAILED, 401))
+    await svc.run_store_lifecycle_reconciliation_tick()
+
+    row = await _store_row(store_id)
+    assert row["status"] == "active", "one 401 after a portal reconnect must not disconnect"
+    assert row["upstream_probe_failures"] == 1
+
+
+def test_every_store_activation_writer_stamps_connected_at():
+    """Repo-wide invariant, not a unit test — `effective_prior_failures` keys the
+    two-strike rule on `connected_at`, so a writer that moves a store INTO the
+    serving set without stamping it silently re-opens the disconnect-on-first-
+    401 hole. Four writers did exactly that. This is the gate that stops the
+    fifth: it reads the source, so it fails at PR time rather than in prod.
+
+    Scanned as text on purpose. A behavioural test would have to stand up each
+    route's auth and platform mocks, and the thing worth protecting is a
+    one-line property of the SQL.
+    """
+    import re
+    from pathlib import Path
+
+    repo = Path(__file__).resolve().parents[1]
+    offenders = []
+    for path in sorted((repo / "routes").glob("*.py")) + sorted((repo / "services").glob("*.py")):
+        source = path.read_text(encoding="utf-8", errors="replace")
+        # Every UPDATE merchant_stores ... up to the WHERE that ends it.
+        for match in re.finditer(
+            r"UPDATE\s+merchant_stores\s+SET(.*?)WHERE", source, re.IGNORECASE | re.DOTALL
+        ):
+            body = match.group(1)
+            # (?<!\w) so `upstream_probe_status = :status` is not mistaken for a
+            # lifecycle status write — \w covers the underscore.
+            activates = re.search(
+                r"(?<!\w)status\s*=\s*'(active|connected)'", body, re.IGNORECASE
+            ) or re.search(r"(?<!\w)status\s*=\s*:status\b", body)
+            if not activates:
+                continue
+            if "connected_at" in body:
+                continue
+            line = source[: match.start()].count("\n") + 1
+            offenders.append(f"{path.relative_to(repo)}:{line}")
+
+    assert offenders == [], (
+        "these UPDATEs move a store into the serving set without stamping "
+        "connected_at, which lets a failure count from the PREVIOUS connection "
+        f"disconnect the new one on its first transient 401: {offenders}"
+    )
 
 
 @pytest.mark.asyncio
