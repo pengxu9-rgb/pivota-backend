@@ -1644,6 +1644,43 @@ async def _fetch_canonical_rows_for_product(product_key: str) -> List[Dict[str, 
         LEFT JOIN catalog_merchants m ON m.merchant_id = p.merchant_id
         LEFT JOIN catalog_merchants bm ON bm.merchant_id = o.merchant_id
         WHERE p.product_key = :product_key
+          -- H2 (#1648): this by-key door carried NO source gate at all — only
+          -- `o.suppressed_at IS NULL`. Search stopped emitting withdrawn keys
+          -- after #1650/#1655, but ANY caller holding a key could still resolve
+          -- one here. Measured on prod 2026-07-31: 2,045 of 14,749 rows this
+          -- lane returns are withdrawn content (1,534 product_keys / 2,040
+          -- sku_keys), every one an intentional editorial withdrawal —
+          -- step5 dedupe, wrong-brand namesake, retired pilots, test variants.
+          --
+          -- FOUR of recall's FIVE unscoped legs. Recall also applies
+          -- `AND p.sync_status = 'live'` (see the recall lane's sync_status_clause); that leg is deliberately NOT
+          -- copied here, because a by-key lookup of a stale-but-not-withdrawn
+          -- row is a legitimate read (the caller already holds the key, and
+          -- staleness is a freshness signal, not an editorial withdrawal).
+          -- Measured on prod 2026-07-31: 60 product_keys survive these gates
+          -- and are gated by recall on that leg alone — all `sync_status`
+          -- 'stale', all external_seed, 0 serving-eligible. So the doors are
+          -- deliberately NOT identical; do not "fix" this by adding the leg
+          -- without deciding that question on its merits.
+          -- The four copied legs are:
+          --   owner status + indexable   (#1650)
+          --   product-row suppression, BOTH columns   (#1650)
+          --   sku suppression, BOTH columns   (H3, #1655)
+          --   OFFER SELLER status + indexable   (H1, #1655)
+          -- NULL-keeping COALESCE is load-bearing on both merchant aliases:
+          -- external seeds have no catalog_merchants row and must keep
+          -- resolving (prior art: tests/test_pivota_canonical_routes.py:674).
+          --
+          -- Unconditional, with no merchant_id escape hatch, because this lane
+          -- has no merchant scope: `/v1/pivot/products/{key}` and `/skus/{key}`
+          -- answer any authenticated caller, so there is no "their own rows"
+          -- case to preserve — unlike the recall lane's merchant-scoped branch.
+          AND lower(COALESCE(m.status, 'active')) <> 'inactive'
+          AND COALESCE(m.indexable, TRUE) IS TRUE
+          AND p.suppressed_at IS NULL AND p.suppression_reason IS NULL
+          AND s.suppressed_at IS NULL AND s.suppression_reason IS NULL
+          AND lower(COALESCE(bm.status, 'active')) <> 'inactive'
+          AND COALESCE(bm.indexable, TRUE) IS TRUE
         ORDER BY o.updated_at DESC
         """,
         {"product_key": product_key},
@@ -1714,6 +1751,34 @@ async def _fetch_canonical_rows_for_sku(sku_key: str) -> List[Dict[str, Any]]:
         LEFT JOIN catalog_merchants m ON m.merchant_id = p.merchant_id
         LEFT JOIN catalog_merchants bm ON bm.merchant_id = o.merchant_id
         WHERE s.sku_key = :sku_key
+          -- H2 (#1648): this by-key door carried NO source gate at all — only
+          -- `o.suppressed_at IS NULL`. Search stopped emitting withdrawn keys
+          -- after #1650/#1655, but ANY caller holding a key could still resolve
+          -- one here. Measured on prod 2026-07-31: 2,045 of 14,749 rows this
+          -- lane returns are withdrawn content (1,534 product_keys / 2,040
+          -- sku_keys), every one an intentional editorial withdrawal —
+          -- step5 dedupe, wrong-brand namesake, retired pilots, test variants.
+          --
+          -- The four legs mirror the recall lane exactly, so the two doors
+          -- cannot drift apart again:
+          --   owner status + indexable   (#1650)
+          --   product-row suppression, BOTH columns   (#1650)
+          --   sku suppression, BOTH columns   (H3, #1655)
+          --   OFFER SELLER status + indexable   (H1, #1655)
+          -- NULL-keeping COALESCE is load-bearing on both merchant aliases:
+          -- external seeds have no catalog_merchants row and must keep
+          -- resolving (prior art: tests/test_pivota_canonical_routes.py:674).
+          --
+          -- Unconditional, with no merchant_id escape hatch, because this lane
+          -- has no merchant scope: `/v1/pivot/products/{key}` and `/skus/{key}`
+          -- answer any authenticated caller, so there is no "their own rows"
+          -- case to preserve — unlike the recall lane's merchant-scoped branch.
+          AND lower(COALESCE(m.status, 'active')) <> 'inactive'
+          AND COALESCE(m.indexable, TRUE) IS TRUE
+          AND p.suppressed_at IS NULL AND p.suppression_reason IS NULL
+          AND s.suppressed_at IS NULL AND s.suppression_reason IS NULL
+          AND lower(COALESCE(bm.status, 'active')) <> 'inactive'
+          AND COALESCE(bm.indexable, TRUE) IS TRUE
         ORDER BY o.updated_at DESC
         """,
         {"sku_key": sku_key},
@@ -2355,8 +2420,24 @@ async def _fetch_offer_row(offer_id: str) -> Optional[Dict[str, Any]]:
         FROM catalog_offers o
         JOIN catalog_skus s ON s.sku_key = o.sku_key
         JOIN catalog_products p ON p.product_key = o.product_key
+        LEFT JOIN catalog_merchants m ON m.merchant_id = p.merchant_id
+        LEFT JOIN catalog_merchants bm ON bm.merchant_id = o.merchant_id
         WHERE o.offer_id = :offer_id
           AND o.suppressed_at IS NULL
+          -- H2 (#1648): the QUOTE door needs the same gates as the read doors.
+          -- Closing get_product/get_sku while leaving this open would be half a
+          -- fix on the half that matters less: this lane backs
+          -- `POST /v1/pivot/quote`, so an ungated withdrawn key here does not
+          -- merely leak a description — it builds a real merchant quote for
+          -- content we have editorially withdrawn. Review confirmed by
+          -- construction that a product gated on all three read routes still
+          -- quoted successfully through here.
+          AND lower(COALESCE(m.status, 'active')) <> 'inactive'
+          AND COALESCE(m.indexable, TRUE) IS TRUE
+          AND p.suppressed_at IS NULL AND p.suppression_reason IS NULL
+          AND s.suppressed_at IS NULL AND s.suppression_reason IS NULL
+          AND lower(COALESCE(bm.status, 'active')) <> 'inactive'
+          AND COALESCE(bm.indexable, TRUE) IS TRUE
         LIMIT 1
         """,
         {"offer_id": offer_id},
@@ -2382,8 +2463,24 @@ async def _fetch_default_offer_for_sku(sku_key: str) -> Optional[Dict[str, Any]]
         FROM catalog_offers o
         JOIN catalog_skus s ON s.sku_key = o.sku_key
         JOIN catalog_products p ON p.product_key = o.product_key
+        LEFT JOIN catalog_merchants m ON m.merchant_id = p.merchant_id
+        LEFT JOIN catalog_merchants bm ON bm.merchant_id = o.merchant_id
         WHERE o.sku_key = :sku_key
           AND o.suppressed_at IS NULL
+          -- H2 (#1648): the QUOTE door needs the same gates as the read doors.
+          -- Closing get_product/get_sku while leaving this open would be half a
+          -- fix on the half that matters less: this lane backs
+          -- `POST /v1/pivot/quote`, so an ungated withdrawn key here does not
+          -- merely leak a description — it builds a real merchant quote for
+          -- content we have editorially withdrawn. Review confirmed by
+          -- construction that a product gated on all three read routes still
+          -- quoted successfully through here.
+          AND lower(COALESCE(m.status, 'active')) <> 'inactive'
+          AND COALESCE(m.indexable, TRUE) IS TRUE
+          AND p.suppressed_at IS NULL AND p.suppression_reason IS NULL
+          AND s.suppressed_at IS NULL AND s.suppression_reason IS NULL
+          AND lower(COALESCE(bm.status, 'active')) <> 'inactive'
+          AND COALESCE(bm.indexable, TRUE) IS TRUE
         ORDER BY o.updated_at DESC
         LIMIT 1
         """,
@@ -2410,14 +2507,115 @@ async def _fetch_default_offer_for_product(product_key: str) -> Optional[Dict[st
         FROM catalog_offers o
         JOIN catalog_skus s ON s.sku_key = o.sku_key
         JOIN catalog_products p ON p.product_key = o.product_key
+        LEFT JOIN catalog_merchants m ON m.merchant_id = p.merchant_id
+        LEFT JOIN catalog_merchants bm ON bm.merchant_id = o.merchant_id
         WHERE o.product_key = :product_key
           AND o.suppressed_at IS NULL
+          -- H2 (#1648): the QUOTE door needs the same gates as the read doors.
+          -- Closing get_product/get_sku while leaving this open would be half a
+          -- fix on the half that matters less: this lane backs
+          -- `POST /v1/pivot/quote`, so an ungated withdrawn key here does not
+          -- merely leak a description — it builds a real merchant quote for
+          -- content we have editorially withdrawn. Review confirmed by
+          -- construction that a product gated on all three read routes still
+          -- quoted successfully through here.
+          AND lower(COALESCE(m.status, 'active')) <> 'inactive'
+          AND COALESCE(m.indexable, TRUE) IS TRUE
+          AND p.suppressed_at IS NULL AND p.suppression_reason IS NULL
+          AND s.suppressed_at IS NULL AND s.suppression_reason IS NULL
+          AND lower(COALESCE(bm.status, 'active')) <> 'inactive'
+          AND COALESCE(bm.indexable, TRUE) IS TRUE
         ORDER BY o.updated_at DESC
         LIMIT 1
         """,
         {"product_key": product_key},
     )
     return _row_dict(row) if row else None
+
+
+async def _source_ids_are_withdrawn(
+    merchant_id: Optional[str], product_id: Optional[str], variant_id: Optional[str]
+) -> bool:
+    """Does a catalog row exist for these RAW PLATFORM IDs, and is it withdrawn?
+
+    `preview_pivot_quote` has a fourth branch that takes `product_id` +
+    `variant_id` (source ids) and fabricates an item with NO DB lookup at all.
+    That branch is legitimate — it exists so a caller can quote a variant the
+    index has never ingested, priced against the merchant's own store — but it
+    was also a complete bypass of every gate this PR adds: review confirmed by
+    construction that a product refused by all three read doors AND all three
+    quote fetchers still quoted successfully through it. Both source ids are
+    returned by `/v1/pivot/query`, `/products/{key}`, `/skus/{key}` and
+    `/offers/resolve` (ProductNode.source_product_id, SkuNode.source_variant_id),
+    so any caller who saw the product before it was withdrawn holds exactly what
+    the bypass needs.
+
+    The rule is deliberately narrow, because the obvious fix over-filters: NOT
+    "refuse unless a clean catalog row exists" — that would break the un-indexed
+    case the branch exists for — but "refuse only when a catalog row for these
+    ids EXISTS and every one of them is gated". No row at all => not our
+    content, not our call, allow.
+
+    TWO KNOWN GAPS, both unreachable on prod today and recorded so the next
+    reader does not mistake them for intent:
+      * the lookup is scoped to rows the REQUESTER owns (`p.merchant_id`), so a
+        withdrawn row owned by someone else but sold by the requester is not
+        found. Every such row on prod belongs to external_seed / agent_seed::*,
+        which have no connected store to quote against.
+      * there is no offer-seller leg — this branch carries no offer. 0 of the
+        2,045 gated offers on prod are gated by the seller leg alone.
+    Both rest on an assumption nothing in this file enforces: that
+    `request.merchant_id` is a connected store.
+
+    Returns True only when we hold rows for these ids and all of them are
+    withdrawn.
+
+    A LOOKUP FAILURE PROPAGATES — it is not swallowed. An earlier version
+    returned False on error, reasoning that a failed lookup must not fail the
+    quote closed. That was wrong on two counts. It conflates "no row" (allow,
+    correct) with "could not look" (unknown, not the same thing); and it is
+    inconsistent with every OTHER branch of preview_pivot_quote, where the same
+    DB failure propagates and the request fails closed. The asymmetry was
+    exploitable: one induced lookup failure — and the Railway proxy drops
+    queries under load — turned a hard refusal into a successful quote for
+    withdrawn content, on the sell path.
+    """
+    mid = (merchant_id or "").strip()
+    pid = (product_id or "").strip()
+    vid = (variant_id or "").strip()
+    # Short-circuit only — with blank ids the query below matches nothing and
+    # returns False anyway, so a mutation that deletes this guard survives the
+    # suite. That is correct rather than a coverage gap: the contract ("blank
+    # ids are never withdrawn") holds either way, and manufacturing a row with
+    # an empty source_product_id to make the guard observable would be pinning
+    # a shape no writer produces.
+    if not (mid and pid and vid):
+        return False
+    row = await database.fetch_one(
+        """
+            SELECT
+                count(*) AS total,
+                count(*) FILTER (
+                    WHERE p.suppressed_at IS NULL AND p.suppression_reason IS NULL
+                      AND s.suppressed_at IS NULL AND s.suppression_reason IS NULL
+                      AND lower(COALESCE(m.status, 'active')) <> 'inactive'
+                      AND COALESCE(m.indexable, TRUE) IS TRUE
+                ) AS serving
+            FROM catalog_products p
+            JOIN catalog_skus s ON s.product_key = p.product_key
+            LEFT JOIN catalog_merchants m ON m.merchant_id = p.merchant_id
+            WHERE p.merchant_id = :merchant_id
+              AND p.source_product_id = :product_id
+              AND s.source_variant_id = :variant_id
+        """,
+        {"merchant_id": mid, "product_id": pid, "variant_id": vid},
+    )
+    if row is None:
+        return False
+    data = dict(row)
+    total = int(data.get("total") or 0)
+    serving = int(data.get("serving") or 0)
+    return total > 0 and serving == 0
 
 
 async def preview_pivot_quote(request: PivotQuoteRequest) -> PivotQuoteResponse:
@@ -2433,6 +2631,13 @@ async def preview_pivot_quote(request: PivotQuoteRequest) -> PivotQuoteResponse:
         elif item.product_key:
             row = await _fetch_default_offer_for_product(item.product_key)
         elif item.product_id and item.variant_id:
+            # Raw-source-id branch: no key, no DB row — see
+            # _source_ids_are_withdrawn for why this needs its own check and why
+            # the check is "all known rows are gated", not "a clean row exists".
+            if await _source_ids_are_withdrawn(
+                request.merchant_id, item.product_id, item.variant_id
+            ):
+                continue
             row = {
                 "offer_id": None,
                 "sku_key": item.sku_key,
