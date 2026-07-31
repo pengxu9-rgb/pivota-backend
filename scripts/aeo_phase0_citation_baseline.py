@@ -523,16 +523,21 @@ def run_baseline(args: argparse.Namespace, internal_key: str) -> Dict[str, Any]:
     # an unknown anchor would otherwise KeyError deep in the request loop,
     # after real LLM spend.
     source = PORTFOLIO
-    if args.prompts_file:
+    # getattr, not args.prompts_file: run_baseline is called PROGRAMMATICALLY by
+    # tests (and could be by other tooling) with a hand-built args object that
+    # predates this flag. A bare attribute access turns "you did not pass the new
+    # optional flag" into an AttributeError for every existing caller.
+    prompts_file = getattr(args, "prompts_file", "") or ""
+    if prompts_file:
         import json as _json
-        loaded = _json.loads(pathlib.Path(args.prompts_file).read_text())
+        loaded = _json.loads(pathlib.Path(prompts_file).read_text())
         source = loaded["prompts"] if isinstance(loaded, dict) else loaded
         bad_anchor = sorted({p["anchor"] for p in source} - set(ANCHORS))
         if bad_anchor:
-            raise SystemExit(f"unknown anchor(s) in {args.prompts_file}: {bad_anchor}")
+            raise SystemExit(f"unknown anchor(s) in {prompts_file}: {bad_anchor}")
         bad_tier = sorted({p["tier"] for p in source} - set(TIER_ORDER))
         if bad_tier:
-            raise SystemExit(f"unknown tier(s) in {args.prompts_file}: {bad_tier}")
+            raise SystemExit(f"unknown tier(s) in {prompts_file}: {bad_tier}")
     prompts = [p for p in source if not args.tiers or p["tier"] in args.tiers]
     if not prompts:
         raise SystemExit("no prompts selected — check --tiers")
