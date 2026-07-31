@@ -209,6 +209,7 @@ async def test_observed_owner_and_seller_still_resolve():
     await _seed(f"{_PREFIX}_p1", owner=f"{_PREFIX}_owner", seller=f"{_PREFIX}_seller")
 
     assert await _by_product(f"{_PREFIX}_p1") == [f"{_PREFIX}_p1::offer"]
+    assert await _by_sku(f"{_PREFIX}_p1::sku") == [f"{_PREFIX}_p1::offer"]
 
 
 # ---------------------------------------------------------------------------
@@ -273,6 +274,7 @@ async def test_reason_only_suppressed_sku_is_gated():
     )
 
     assert await _by_product(f"{_PREFIX}_p1") == []
+    assert await _by_sku(f"{_PREFIX}_p1::sku") == []
 
 
 @pytest.mark.asyncio
@@ -299,6 +301,7 @@ async def test_non_indexable_owner_is_gated():
     await _seed(f"{_PREFIX}_p1", owner=f"{_PREFIX}_owner", seller=f"{_PREFIX}_seller")
 
     assert await _by_product(f"{_PREFIX}_p1") == []
+    assert await _by_sku(f"{_PREFIX}_p1::sku") == []
 
 
 @pytest.mark.asyncio
@@ -320,6 +323,7 @@ async def test_non_indexable_offer_seller_is_gated():
     await _seed(f"{_PREFIX}_p1", owner=f"{_PREFIX}_owner", seller=f"{_PREFIX}_seller")
 
     assert await _by_product(f"{_PREFIX}_p1") == []
+    assert await _by_sku(f"{_PREFIX}_p1::sku") == []
 
 
 @pytest.mark.asyncio
@@ -329,13 +333,20 @@ async def test_case_insensitive_inactive_matching():
     await _seed(f"{_PREFIX}_p1", owner=f"{_PREFIX}_owner", seller=f"{_PREFIX}_seller")
 
     assert await _by_product(f"{_PREFIX}_p1") == []
+    assert await _by_sku(f"{_PREFIX}_p1::sku") == []
 
 
 @pytest.mark.asyncio
-async def test_the_two_doors_agree_with_each_other():
+async def test_the_sku_door_is_a_subset_of_the_product_door():
     """The doors drifted apart once already — recall gained three gates in #1650
-    while these kept none. Any row visible through one must be visible through
-    the other, or the next divergence starts here."""
+    while these kept none.
+
+    The invariant is CONTAINMENT, not equality: the product door returns every
+    offer under every sku of the key, the sku door only one sku's. An earlier
+    version asserted `==`, which held only because every fixture was
+    single-sku — it would have started failing the moment someone added a
+    second sku, and it proved nothing about the gates in the meantime.
+    """
     await _merchant(f"{_PREFIX}_owner")
     await _merchant(f"{_PREFIX}_dead", status="inactive")
     await _seed(f"{_PREFIX}_ok", owner=f"{_PREFIX}_owner", seller=f"{_PREFIX}_owner")
@@ -348,25 +359,166 @@ async def test_the_two_doors_agree_with_each_other():
     )
 
     for key in (f"{_PREFIX}_ok", f"{_PREFIX}_bad", f"{_PREFIX}_supp"):
-        assert await _by_product(key) == await _by_sku(f"{key}::sku"), key
+        product_offers = set(await _by_product(key))
+        sku_offers = set(await _by_sku(f"{key}::sku"))
+        assert sku_offers <= product_offers, key
+        # ...and on a single-sku key they must be equal, so containment cannot
+        # be satisfied by the sku door simply returning nothing.
+        assert sku_offers == product_offers, key
+
+
+@pytest.mark.parametrize(
+    "status,indexable,serves",
+    [
+        ("active", True, True),
+        ("observed", True, True),      # 346 of 483 prod merchants
+        ("OBSERVED", True, True),      # case-folding must not darken them
+        ("inactive", True, False),
+        ("INACTIVE", True, False),     # case-folded on BOTH doors
+        ("Inactive", True, False),
+        ("active", False, False),      # indexable leg, on BOTH doors
+    ],
+)
+@pytest.mark.asyncio
+async def test_seller_status_and_indexable_on_both_doors(status, indexable, serves):
+    """Every seller-leg variant, asserted on BOTH doors.
+
+    Five sku-lane mutants survived the first sweep because 8 of 15 tests
+    asserted `_by_product` only — including the `observed` control, so an
+    `= 'active'` allow-list on the sku lane (which would darken 346 prod
+    merchants) went undetected. Seller-status case-folding was pinned on
+    neither door.
+    """
+    await _merchant(f"{_PREFIX}_owner")
+    await _merchant(f"{_PREFIX}_seller", status=status, indexable=indexable)
+    await _seed(f"{_PREFIX}_p1", owner=f"{_PREFIX}_owner", seller=f"{_PREFIX}_seller")
+
+    expected = [f"{_PREFIX}_p1::offer"] if serves else []
+    assert await _by_product(f"{_PREFIX}_p1") == expected
+    assert await _by_sku(f"{_PREFIX}_p1::sku") == expected
+
+
+@pytest.mark.parametrize(
+    "status,indexable,serves",
+    [
+        ("observed", True, True),
+        ("OBSERVED", True, True),
+        ("INACTIVE", True, False),
+        ("active", False, False),
+    ],
+)
+@pytest.mark.asyncio
+async def test_owner_status_and_indexable_on_both_doors(status, indexable, serves):
+    """Owner leg, mirror of the above. Seller is healthy and DISTINCT so the
+    seller leg cannot cover for the owner leg — the flaw that let two mutants
+    survive the first sweep."""
+    await _merchant(f"{_PREFIX}_owner", status=status, indexable=indexable)
+    await _merchant(f"{_PREFIX}_seller")
+    await _seed(f"{_PREFIX}_p1", owner=f"{_PREFIX}_owner", seller=f"{_PREFIX}_seller")
+
+    expected = [f"{_PREFIX}_p1::offer"] if serves else []
+    assert await _by_product(f"{_PREFIX}_p1") == expected
+    assert await _by_sku(f"{_PREFIX}_p1::sku") == expected
 
 
 @pytest.mark.asyncio
-async def test_owner_and_seller_legs_are_independently_load_bearing():
-    """Four combinations, so neither merchant leg can be deleted without a
-    failure. owner==seller fixtures cannot prove this: they let one leg cover
-    for the other, which is how two mutants survived the first sweep."""
-    await _merchant(f"{_PREFIX}_good_owner")
-    await _merchant(f"{_PREFIX}_good_seller")
-    await _merchant(f"{_PREFIX}_dead_owner", status="inactive")
-    await _merchant(f"{_PREFIX}_dead_seller", status="inactive")
+async def test_a_partially_gated_key_keeps_its_survivors():
+    """Per-row gating, not per-key. A product with two skus where ONE is
+    suppressed must still resolve via the healthy sku — a regression that turned
+    a partial gate into a whole-key gate would silently delete live listings,
+    and prod has 0 partially-gated keys today so production would not tell us.
+    """
+    await _merchant(f"{_PREFIX}_owner")
+    await _seed(f"{_PREFIX}_p1", owner=f"{_PREFIX}_owner", seller=f"{_PREFIX}_owner")
+    # second sku on the same product, suppressed
+    await database.execute(
+        """
+        INSERT INTO catalog_skus
+            (sku_key, product_key, merchant_id, platform, source_product_id,
+             source_variant_id, sku, title, readiness_tier, suppressed_at,
+             created_at, updated_at)
+        VALUES (:sk, :k, :m, 'shopify', :spi, 'var2', 'sku2', 'Hydrating Serum',
+                'commerce_ready', '2026-07-31 00:00:00', CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)
+        """,
+        {"sk": f"{_PREFIX}_p1::sku2", "k": f"{_PREFIX}_p1", "m": f"{_PREFIX}_owner",
+         "spi": f"src-{_PREFIX}_p1"},
+    )
+    await database.execute(
+        """
+        INSERT INTO catalog_offers
+            (offer_id, sku_key, product_key, merchant_id, catalog_track, truth_tier,
+             readiness_tier, offer_mode, channel, availability, currency, list_price,
+             suppressed_at, created_at, updated_at)
+        VALUES (:o, :sk, :k, :m, 'internal_merchant', 'primary', 'commerce_ready',
+                'merchant_checkout', 'default', 'in_stock', 'USD', 29.99, NULL,
+                CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)
+        """,
+        {"o": f"{_PREFIX}_p1::offer2", "sk": f"{_PREFIX}_p1::sku2", "k": f"{_PREFIX}_p1",
+         "m": f"{_PREFIX}_owner"},
+    )
 
-    await _seed(f"{_PREFIX}_gg", owner=f"{_PREFIX}_good_owner", seller=f"{_PREFIX}_good_seller")
-    await _seed(f"{_PREFIX}_dg", owner=f"{_PREFIX}_dead_owner", seller=f"{_PREFIX}_good_seller")
-    await _seed(f"{_PREFIX}_gd", owner=f"{_PREFIX}_good_owner", seller=f"{_PREFIX}_dead_seller")
-    await _seed(f"{_PREFIX}_dd", owner=f"{_PREFIX}_dead_owner", seller=f"{_PREFIX}_dead_seller")
+    assert await _by_product(f"{_PREFIX}_p1") == [f"{_PREFIX}_p1::offer"]
+    assert await _by_sku(f"{_PREFIX}_p1::sku") == [f"{_PREFIX}_p1::offer"]
+    assert await _by_sku(f"{_PREFIX}_p1::sku2") == []
 
-    assert await _by_product(f"{_PREFIX}_gg") == [f"{_PREFIX}_gg::offer"]
-    assert await _by_product(f"{_PREFIX}_dg") == [], "owner leg must gate on its own"
-    assert await _by_product(f"{_PREFIX}_gd") == [], "seller leg must gate on its own"
-    assert await _by_product(f"{_PREFIX}_dd") == []
+
+@pytest.mark.asyncio
+async def test_a_sku_with_one_gated_seller_keeps_the_other_offer():
+    await _merchant(f"{_PREFIX}_owner")
+    await _merchant(f"{_PREFIX}_dead", status="inactive")
+    await _seed(f"{_PREFIX}_p1", owner=f"{_PREFIX}_owner", seller=f"{_PREFIX}_owner")
+    await database.execute(
+        """
+        INSERT INTO catalog_offers
+            (offer_id, sku_key, product_key, merchant_id, catalog_track, truth_tier,
+             readiness_tier, offer_mode, channel, availability, currency, list_price,
+             suppressed_at, created_at, updated_at)
+        VALUES (:o, :sk, :k, :m, 'internal_merchant', 'primary', 'commerce_ready',
+                'merchant_checkout', 'default', 'in_stock', 'USD', 29.99, NULL,
+                CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)
+        """,
+        {"o": f"{_PREFIX}_p1::offer_dead", "sk": f"{_PREFIX}_p1::sku",
+         "k": f"{_PREFIX}_p1", "m": f"{_PREFIX}_dead"},
+    )
+
+    assert await _by_product(f"{_PREFIX}_p1") == [f"{_PREFIX}_p1::offer"]
+    assert await _by_sku(f"{_PREFIX}_p1::sku") == [f"{_PREFIX}_p1::offer"]
+
+
+@pytest.mark.asyncio
+async def test_the_quote_door_refuses_what_the_read_doors_refuse():
+    """`POST /v1/pivot/quote` is a by-key door too, and the transactional one.
+    Review proved by construction that a product gated on all three read routes
+    still produced a real merchant quote through these three fetchers."""
+    await _merchant(f"{_PREFIX}_owner", status="inactive")
+    await _merchant(f"{_PREFIX}_seller")
+    await _seed(
+        f"{_PREFIX}_p1",
+        owner=f"{_PREFIX}_owner",
+        seller=f"{_PREFIX}_seller",
+        product_suppression_reason="step5_campaign_clone_dup",
+    )
+
+    assert await svc._fetch_offer_row(f"{_PREFIX}_p1::offer") is None
+    assert await svc._fetch_default_offer_for_sku(f"{_PREFIX}_p1::sku") is None
+    assert await svc._fetch_default_offer_for_product(f"{_PREFIX}_p1") is None
+
+
+@pytest.mark.asyncio
+async def test_the_quote_door_still_serves_healthy_keys():
+    await _merchant(f"{_PREFIX}_owner")
+    await _seed(f"{_PREFIX}_p1", owner=f"{_PREFIX}_owner", seller=f"{_PREFIX}_owner")
+
+    assert (await svc._fetch_offer_row(f"{_PREFIX}_p1::offer")) is not None
+    assert (await svc._fetch_default_offer_for_sku(f"{_PREFIX}_p1::sku")) is not None
+    assert (await svc._fetch_default_offer_for_product(f"{_PREFIX}_p1")) is not None
+
+
+@pytest.mark.asyncio
+async def test_the_quote_door_keeps_seedless_sellers():
+    """The NULL-keeping COALESCE matters most on the transactional door: a bare
+    `= 'active'` here would refuse to quote every external_seed offer."""
+    await _seed(f"{_PREFIX}_p1", owner=f"{_PREFIX}_noseed", seller=f"{_PREFIX}_noseller")
+
+    assert (await svc._fetch_offer_row(f"{_PREFIX}_p1::offer")) is not None
+    assert (await svc._fetch_default_offer_for_product(f"{_PREFIX}_p1")) is not None

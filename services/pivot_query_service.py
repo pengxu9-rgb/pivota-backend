@@ -1652,8 +1652,17 @@ async def _fetch_canonical_rows_for_product(product_key: str) -> List[Dict[str, 
           -- sku_keys), every one an intentional editorial withdrawal —
           -- step5 dedupe, wrong-brand namesake, retired pilots, test variants.
           --
-          -- The four legs mirror the recall lane exactly, so the two doors
-          -- cannot drift apart again:
+          -- FOUR of recall's FIVE unscoped legs. Recall also applies
+          -- `AND p.sync_status = 'live'` (see the recall lane's sync_status_clause); that leg is deliberately NOT
+          -- copied here, because a by-key lookup of a stale-but-not-withdrawn
+          -- row is a legitimate read (the caller already holds the key, and
+          -- staleness is a freshness signal, not an editorial withdrawal).
+          -- Measured on prod 2026-07-31: 60 product_keys survive these gates
+          -- and are gated by recall on that leg alone — all `sync_status`
+          -- 'stale', all external_seed, 0 serving-eligible. So the doors are
+          -- deliberately NOT identical; do not "fix" this by adding the leg
+          -- without deciding that question on its merits.
+          -- The four copied legs are:
           --   owner status + indexable   (#1650)
           --   product-row suppression, BOTH columns   (#1650)
           --   sku suppression, BOTH columns   (H3, #1655)
@@ -2411,8 +2420,24 @@ async def _fetch_offer_row(offer_id: str) -> Optional[Dict[str, Any]]:
         FROM catalog_offers o
         JOIN catalog_skus s ON s.sku_key = o.sku_key
         JOIN catalog_products p ON p.product_key = o.product_key
+        LEFT JOIN catalog_merchants m ON m.merchant_id = p.merchant_id
+        LEFT JOIN catalog_merchants bm ON bm.merchant_id = o.merchant_id
         WHERE o.offer_id = :offer_id
           AND o.suppressed_at IS NULL
+          -- H2 (#1648): the QUOTE door needs the same gates as the read doors.
+          -- Closing get_product/get_sku while leaving this open would be half a
+          -- fix on the half that matters less: this lane backs
+          -- `POST /v1/pivot/quote`, so an ungated withdrawn key here does not
+          -- merely leak a description — it builds a real merchant quote for
+          -- content we have editorially withdrawn. Review confirmed by
+          -- construction that a product gated on all three read routes still
+          -- quoted successfully through here.
+          AND lower(COALESCE(m.status, 'active')) <> 'inactive'
+          AND COALESCE(m.indexable, TRUE) IS TRUE
+          AND p.suppressed_at IS NULL AND p.suppression_reason IS NULL
+          AND s.suppressed_at IS NULL AND s.suppression_reason IS NULL
+          AND lower(COALESCE(bm.status, 'active')) <> 'inactive'
+          AND COALESCE(bm.indexable, TRUE) IS TRUE
         LIMIT 1
         """,
         {"offer_id": offer_id},
@@ -2438,8 +2463,24 @@ async def _fetch_default_offer_for_sku(sku_key: str) -> Optional[Dict[str, Any]]
         FROM catalog_offers o
         JOIN catalog_skus s ON s.sku_key = o.sku_key
         JOIN catalog_products p ON p.product_key = o.product_key
+        LEFT JOIN catalog_merchants m ON m.merchant_id = p.merchant_id
+        LEFT JOIN catalog_merchants bm ON bm.merchant_id = o.merchant_id
         WHERE o.sku_key = :sku_key
           AND o.suppressed_at IS NULL
+          -- H2 (#1648): the QUOTE door needs the same gates as the read doors.
+          -- Closing get_product/get_sku while leaving this open would be half a
+          -- fix on the half that matters less: this lane backs
+          -- `POST /v1/pivot/quote`, so an ungated withdrawn key here does not
+          -- merely leak a description — it builds a real merchant quote for
+          -- content we have editorially withdrawn. Review confirmed by
+          -- construction that a product gated on all three read routes still
+          -- quoted successfully through here.
+          AND lower(COALESCE(m.status, 'active')) <> 'inactive'
+          AND COALESCE(m.indexable, TRUE) IS TRUE
+          AND p.suppressed_at IS NULL AND p.suppression_reason IS NULL
+          AND s.suppressed_at IS NULL AND s.suppression_reason IS NULL
+          AND lower(COALESCE(bm.status, 'active')) <> 'inactive'
+          AND COALESCE(bm.indexable, TRUE) IS TRUE
         ORDER BY o.updated_at DESC
         LIMIT 1
         """,
@@ -2466,8 +2507,24 @@ async def _fetch_default_offer_for_product(product_key: str) -> Optional[Dict[st
         FROM catalog_offers o
         JOIN catalog_skus s ON s.sku_key = o.sku_key
         JOIN catalog_products p ON p.product_key = o.product_key
+        LEFT JOIN catalog_merchants m ON m.merchant_id = p.merchant_id
+        LEFT JOIN catalog_merchants bm ON bm.merchant_id = o.merchant_id
         WHERE o.product_key = :product_key
           AND o.suppressed_at IS NULL
+          -- H2 (#1648): the QUOTE door needs the same gates as the read doors.
+          -- Closing get_product/get_sku while leaving this open would be half a
+          -- fix on the half that matters less: this lane backs
+          -- `POST /v1/pivot/quote`, so an ungated withdrawn key here does not
+          -- merely leak a description — it builds a real merchant quote for
+          -- content we have editorially withdrawn. Review confirmed by
+          -- construction that a product gated on all three read routes still
+          -- quoted successfully through here.
+          AND lower(COALESCE(m.status, 'active')) <> 'inactive'
+          AND COALESCE(m.indexable, TRUE) IS TRUE
+          AND p.suppressed_at IS NULL AND p.suppression_reason IS NULL
+          AND s.suppressed_at IS NULL AND s.suppression_reason IS NULL
+          AND lower(COALESCE(bm.status, 'active')) <> 'inactive'
+          AND COALESCE(bm.indexable, TRUE) IS TRUE
         ORDER BY o.updated_at DESC
         LIMIT 1
         """,
