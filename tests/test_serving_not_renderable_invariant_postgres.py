@@ -42,11 +42,15 @@ CREATE TABLE IF NOT EXISTS external_product_seeds (
   merchant_id text, source text, product_key text, source_product_id text,
   seed_data jsonb, updated_at timestamptz, id text, title text
 );
-CREATE TABLE IF NOT EXISTS index_pipeline_state (
-  content_key text, serving_eligible boolean, index_eligible boolean,
-  blocker_code text, blocker_detail text,
-  content_quality_score double precision, quality_scored_at timestamp
-);
+CREATE TABLE IF NOT EXISTS index_pipeline_state (content_key text PRIMARY KEY);
+ALTER TABLE index_pipeline_state ADD COLUMN IF NOT EXISTS serving_eligible boolean;
+ALTER TABLE index_pipeline_state ADD COLUMN IF NOT EXISTS index_eligible boolean;
+ALTER TABLE index_pipeline_state ADD COLUMN IF NOT EXISTS pipeline_stage text;
+ALTER TABLE index_pipeline_state ADD COLUMN IF NOT EXISTS blocker_code text;
+ALTER TABLE index_pipeline_state ADD COLUMN IF NOT EXISTS blocker_detail text;
+ALTER TABLE index_pipeline_state ADD COLUMN IF NOT EXISTS content_quality_score double precision;
+ALTER TABLE index_pipeline_state ADD COLUMN IF NOT EXISTS quality_scored_at timestamptz;
+ALTER TABLE index_pipeline_state ADD COLUMN IF NOT EXISTS last_extracted_at timestamptz;
 CREATE TABLE IF NOT EXISTS catalog_row_trust (
   subject_type text, subject_key text, serving_decision text,
   serving_reason_codes text[]

@@ -60,7 +60,15 @@ _LIGHTWEIGHT_DDL = """
 CREATE TABLE IF NOT EXISTS merchant_stores (
   store_id text, merchant_id text, platform text, domain text, status text
 );
-CREATE TABLE IF NOT EXISTS index_pipeline_state (content_key text);
+CREATE TABLE IF NOT EXISTS index_pipeline_state (content_key text PRIMARY KEY);
+ALTER TABLE index_pipeline_state ADD COLUMN IF NOT EXISTS serving_eligible boolean;
+ALTER TABLE index_pipeline_state ADD COLUMN IF NOT EXISTS index_eligible boolean;
+ALTER TABLE index_pipeline_state ADD COLUMN IF NOT EXISTS pipeline_stage text;
+ALTER TABLE index_pipeline_state ADD COLUMN IF NOT EXISTS blocker_code text;
+ALTER TABLE index_pipeline_state ADD COLUMN IF NOT EXISTS blocker_detail text;
+ALTER TABLE index_pipeline_state ADD COLUMN IF NOT EXISTS content_quality_score double precision;
+ALTER TABLE index_pipeline_state ADD COLUMN IF NOT EXISTS quality_scored_at timestamptz;
+ALTER TABLE index_pipeline_state ADD COLUMN IF NOT EXISTS last_extracted_at timestamptz;
 ALTER TABLE index_pipeline_state ADD COLUMN IF NOT EXISTS serving_eligible boolean;
 ALTER TABLE index_pipeline_state ADD COLUMN IF NOT EXISTS index_eligible boolean;
 ALTER TABLE index_pipeline_state ADD COLUMN IF NOT EXISTS blocker_code text;
