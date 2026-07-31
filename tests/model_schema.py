@@ -41,17 +41,26 @@ def _sqlite_default_literal(column: Any) -> Optional[str]:
 
     1. A string `server_default` must be QUOTED. `db/catalog.py` writes
        `server_default="primary"`, which renders as `DEFAULT primary` and fails
-       with `near "primary"`. Booleans and numbers must NOT be quoted — a
-       quoted `'true'` in a BOOLEAN column stores the four-character string,
-       and `COALESCE(bm.indexable, TRUE) IS TRUE` is then FALSE for it.
+       with `near "primary"`. Numbers and the boolean keywords must NOT be
+       quoted — a quoted `'true'` in a BOOLEAN column stores the four-character
+       string, and `COALESCE(bm.indexable, TRUE) IS TRUE` is then FALSE for it.
     2. A non-constant default is rejected outright: `server_default=func.now()`
        fails with `near "("`. Those columns get no default at all — and, in
        `_add_column_sql` below, no NOT NULL either.
+
+    `expression.true()` / `expression.false()` are SQL elements rather than
+    strings but ARE constants, so they are compiled through the dialect (to
+    `1` / `0` on SQLite) instead of being discarded under restriction 2.
     """
+    from sqlalchemy.dialects import sqlite as _sqlite
+    from sqlalchemy.sql import expression
+
     server_default = getattr(column, "server_default", None)
     if server_default is None:
         return None
     arg = getattr(server_default, "arg", None)
+    if isinstance(arg, (expression.True_, expression.False_)):
+        return str(arg.compile(dialect=_sqlite.dialect()))
     if not isinstance(arg, str):
         # func.now() and friends — restriction 2.
         return None
@@ -104,19 +113,15 @@ async def ensure_model_tables(tables: Sequence[Any]) -> None:
     time and `db.database` binds its singleton to whatever is set when it is
     first imported.
 
-    KNOWN WART in the `create_all` half, inherited from SQLAlchemy and NOT
-    introduced here. A string `server_default` on a Boolean renders quoted, so
-    `db/catalog.py`'s `Column("indexable", Boolean, server_default="true")`
-    becomes `indexable BOOLEAN DEFAULT 'true' NOT NULL` on SQLite. An INSERT
-    that OMITS the column therefore stores the 4-character string `'true'`, and
-    `COALESCE(indexable, TRUE) IS TRUE` — the recall lane's actual gate —
-    evaluates to 0 for it. Every seed in the suite passes `indexable`
-    explicitly, so nothing hits this today; a new test that leaves it to the
-    default would fail in a thoroughly confusing way. Pass it explicitly.
-    (`_add_column_sql` above does NOT have this problem — it emits an unquoted
-    `DEFAULT true`. Fixing the `create_all` path means changing the model to
-    `server_default=sqlalchemy.true()`, which is a `db/catalog.py` change and
-    out of scope for a test-fixture refactor.)
+    A STRING `server_default` on a Boolean is a trap in the `create_all` half:
+    SQLAlchemy renders it quoted, so `server_default="true"` becomes
+    `DEFAULT 'true'` and SQLite — no native boolean — stores the four-character
+    string for any INSERT that omits the column, making
+    `COALESCE(indexable, TRUE) IS TRUE` evaluate to 0. `db/catalog.py` now uses
+    `expression.true()` / `expression.false()`, which render as the dialect's
+    own constant. Eleven boolean columns in OTHER `db/` modules still carry a
+    string default; none is created by this helper today, but check before
+    adding one to the `tables` list.
     """
     from sqlalchemy import create_engine
 

@@ -13,7 +13,7 @@ from sqlalchemy import (
     Table,
     Text,
 )
-from sqlalchemy.sql import func
+from sqlalchemy.sql import expression, func
 
 from db.database import JSONB_TYPE, metadata
 
@@ -25,7 +25,14 @@ catalog_merchants = Table(
     Column("merchant_name", String(255), nullable=True),
     Column("primary_platform", String(64), nullable=True),
     Column("status", String(32), nullable=False, server_default="active"),
-    Column("indexable", Boolean, nullable=False, server_default="true"),
+    # expression.true(), NOT the string "true": a str server_default is rendered
+    # as a QUOTED literal, so create_all emits `DEFAULT 'true'` and SQLite — which
+    # has no native boolean — stores the four-character string for any INSERT that
+    # omits the column. `COALESCE(m.indexable, TRUE) IS TRUE`, the gate every
+    # cross-merchant recall lane runs, then evaluates to FALSE and the merchant
+    # silently drops out of search. expression.true() renders as the dialect's own
+    # constant (1 on SQLite, true on Postgres). Same for is_first_party below.
+    Column("indexable", Boolean, nullable=False, server_default=expression.true()),
     Column("source_system", String(64), nullable=True),
     Column("source_ref", String(255), nullable=True),
     Column("metadata_json", JSONB_TYPE, nullable=True),
@@ -268,7 +275,7 @@ catalog_offers = Table(
     # brand_direct | retailer | NULL ("unknown"); see services.offer_classification.
     Column("offer_type", String(16), nullable=True),
     Column("market", String(8), nullable=False, server_default="US"),
-    Column("is_first_party", Boolean, nullable=False, server_default="false"),
+    Column("is_first_party", Boolean, nullable=False, server_default=expression.false()),
     Column("why_buy_direct", Text, nullable=True),
     Column("availability", String(32), nullable=False, server_default="unknown"),
     Column("inventory_quantity", Integer, nullable=True),
