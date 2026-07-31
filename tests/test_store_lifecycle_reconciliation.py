@@ -106,12 +106,16 @@ async def _seed_store(
     platform: str = "shopify",
     domain: str = "example.myshopify.com",
     failures: int = 0,
+    connected_at: Optional[str] = None,
+    probe_at: Optional[str] = None,
 ) -> None:
     await database.execute(
         """
         INSERT INTO merchant_stores
-            (store_id, merchant_id, platform, domain, api_key, status, upstream_probe_failures)
-        VALUES (:store_id, :merchant_id, :platform, :domain, :api_key, :status, :failures)
+            (store_id, merchant_id, platform, domain, api_key, status,
+             upstream_probe_failures, connected_at, upstream_probe_at)
+        VALUES (:store_id, :merchant_id, :platform, :domain, :api_key, :status,
+                :failures, :connected_at, :probe_at)
         """,
         {
             "store_id": store_id,
@@ -121,6 +125,8 @@ async def _seed_store(
             "api_key": '{"access_token": "shpat_test"}',
             "status": status,
             "failures": failures,
+            "connected_at": connected_at,
+            "probe_at": probe_at,
         },
     )
 
@@ -493,6 +499,192 @@ async def test_kill_switch_stops_all_writes(monkeypatch: pytest.MonkeyPatch):
     assert summary["enabled"] is False
     assert summary["probed"] == 0
     assert (await _store_row(store_id))["status"] == "active"
+
+
+# ---------------------------------------------------------------------------
+# 5. What adversarial review broke (all four were live-capable)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_a_raising_probe_cannot_abort_the_tick(monkeypatch: pytest.MonkeyPatch):
+    """The poison-row bug. The Wix credential helpers RAISE on a blank site id
+    rather than returning "", and never-probed rows sort FIRST — so one
+    malformed store row aborted every tick before any other store was reached,
+    and before the status sweep ran. APScheduler swallows it: the job was
+    permanently inert while reporting nothing."""
+    poison_merchant = f"{_MERCHANT_PREFIX}_poison"
+    good_merchant = f"{_MERCHANT_PREFIX}_good"
+    await _seed_merchant(poison_merchant, "active")
+    await _seed_store(f"{poison_merchant}_s1", poison_merchant, "active", platform="wix", domain="")
+    await _seed_merchant(good_merchant, "active")
+    await _seed_store(f"{good_merchant}_s1", good_merchant, "disconnected")
+
+    # The real Wix path — NOT a stub. This is the only test that executes a
+    # probe implementation end to end; every other tick test stubs it, which is
+    # precisely why this class survived the first round of tests.
+    summary = await svc.run_store_lifecycle_reconciliation_tick()
+
+    assert summary["outcomes"].get(svc.PROBE_NO_CREDENTIALS) == 1
+    # ...and the rest of the tick still ran: the sweep reached the other merchant.
+    assert await _merchant_status(good_merchant) == "inactive"
+    assert summary["status_sweep"]["examined"] >= 2
+
+
+@pytest.mark.asyncio
+async def test_probe_store_upstream_never_raises_on_malformed_wix_row():
+    outcome, http_status = await svc.probe_store_upstream(
+        {"store_id": "x", "platform": "wix", "domain": "   ", "api_key": "key"}
+    )
+    assert outcome == svc.PROBE_NO_CREDENTIALS
+    assert http_status is None
+
+
+@pytest.mark.asyncio
+async def test_reconnect_clears_stale_failures(monkeypatch: pytest.MonkeyPatch):
+    """The two-strike rule spans a RECONNECT, or it isn't a two-strike rule.
+
+    No reconnect path clears the probe columns — they all write connected_at.
+    So a store that failed once weeks ago, was reconnected, and then hits a
+    single transient 401 (most likely right after a reconnect, in the
+    token-refresh window) would otherwise be disconnected on its FIRST failure
+    of the current connection."""
+    merchant = f"{_MERCHANT_PREFIX}_stale"
+    store_id = f"{merchant}_s1"
+    await _seed_merchant(merchant, "active")
+    await _seed_store(
+        store_id,
+        merchant,
+        "active",
+        failures=1,
+        probe_at="2026-07-01 00:00:00",       # failure measured...
+        connected_at="2026-07-15 00:00:00",   # ...before this reconnect
+    )
+    monkeypatch.setattr(svc, "probe_store_upstream", _stub_probe(svc.PROBE_AUTH_FAILED, 401))
+
+    await svc.run_store_lifecycle_reconciliation_tick()
+
+    row = await _store_row(store_id)
+    assert row["status"] == "active", "a reconnect must reset the strike count"
+    assert row["upstream_probe_failures"] == 1
+    assert await _merchant_status(merchant) == "active"
+
+
+@pytest.mark.parametrize(
+    "prior,connected_at,probe_at,expected",
+    [
+        (2, "2026-07-15 00:00:00", "2026-07-01 00:00:00", 0),  # reconnected after the failures
+        (2, "2026-07-01 00:00:00", "2026-07-15 00:00:00", 2),  # failures are current
+        (2, None, "2026-07-15 00:00:00", 2),                   # legacy row, keep what we measured
+        (2, "2026-07-15 00:00:00", None, 2),                   # never probed
+        (0, "2026-07-15 00:00:00", "2026-07-01 00:00:00", 0),
+    ],
+)
+def test_effective_prior_failures(prior, connected_at, probe_at, expected):
+    assert svc.effective_prior_failures(prior, connected_at, probe_at) == expected
+
+
+@pytest.mark.asyncio
+async def test_correlated_failure_withholds_every_disconnect(monkeypatch: pytest.MonkeyPatch):
+    """Two strikes defends against INDEPENDENT transients. It does nothing
+    against a common-mode failure — an expired SHOPIFY_API_VERSION, a
+    platform-wide 401, a credential-store regression — where every store fails
+    the same way and the whole fleet would drop out of public recall."""
+    merchant = f"{_MERCHANT_PREFIX}_fleet"
+    await _seed_merchant(merchant, "active")
+    for i in range(6):
+        await _seed_store(f"{merchant}_s{i}", merchant, "active", failures=1)
+    monkeypatch.setattr(svc, "probe_store_upstream", _stub_probe(svc.PROBE_AUTH_FAILED, 401))
+
+    summary = await svc.run_store_lifecycle_reconciliation_tick()
+
+    assert summary["disconnected"] == []
+    assert len(summary["withheld"]) == 6
+    for i in range(6):
+        assert (await _store_row(f"{merchant}_s{i}"))["status"] == "active"
+    assert await _merchant_status(merchant) == "active"
+
+
+@pytest.mark.asyncio
+async def test_per_tick_disconnect_cap(monkeypatch: pytest.MonkeyPatch):
+    """Below the ratio breaker's fleet floor, the absolute cap still bounds the
+    damage a single tick can do."""
+    merchant = f"{_MERCHANT_PREFIX}_cap"
+    await _seed_merchant(merchant, "active")
+    for i in range(4):
+        await _seed_store(f"{merchant}_s{i}", merchant, "active", failures=1)
+    monkeypatch.setattr(svc, "probe_store_upstream", _stub_probe(svc.PROBE_AUTH_FAILED, 401))
+    monkeypatch.setenv("STORE_LIFECYCLE_MIN_FLEET_FOR_RATIO", "99")  # disable the ratio guard
+    monkeypatch.setenv("STORE_LIFECYCLE_MAX_DISCONNECTS_PER_TICK", "2")
+
+    summary = await svc.run_store_lifecycle_reconciliation_tick()
+
+    assert len(summary["disconnected"]) == 2
+    assert len(summary["withheld"]) == 2
+    disconnected = [
+        s for s in [await _store_row(f"{merchant}_s{i}") for i in range(4)]
+        if s["status"] == svc.DISCONNECTED_STATUS
+    ]
+    assert len(disconnected) == 2
+
+
+@pytest.mark.asyncio
+async def test_kill_switch_also_stops_the_route_write_through(monkeypatch: pytest.MonkeyPatch):
+    """The switch has to cover the hooks too — they write the same
+    public-recall gate the job does."""
+    merchant = f"{_MERCHANT_PREFIX}_switchhook"
+    await _seed_merchant(merchant, "active")
+    await _seed_store(f"{merchant}_s1", merchant, "disconnected")
+    monkeypatch.setenv("STORE_LIFECYCLE_RECONCILE_ENABLED", "false")
+
+    out = await svc.sync_catalog_merchant_status(merchant)
+
+    assert out["skipped"] == "disabled"
+    assert await _merchant_status(merchant) == "active"
+
+
+@pytest.mark.asyncio
+async def test_probe_does_not_persist_credentials(monkeypatch: pytest.MonkeyPatch):
+    """A health probe must not rewrite api_key. persist_refresh replaces the
+    WHOLE credential blob from the snapshot the tick read, so a merchant
+    reconnecting inside the probe window would lose their fresh tokens."""
+    captured: Dict[str, Any] = {}
+
+    async def fake_resolve(**kwargs):
+        captured.update(kwargs)
+        return None, {}
+
+    import services.shopify_access_token_service as tok
+
+    monkeypatch.setattr(tok, "resolve_shopify_admin_access_token", fake_resolve)
+
+    outcome, _ = await svc.probe_store_upstream(
+        {
+            "store_id": "s1",
+            "platform": "shopify",
+            "domain": "example.myshopify.com",
+            "api_key": '{"access_token": "shpat_x"}',
+        }
+    )
+
+    assert captured.get("persist_refresh") is False
+    assert outcome == svc.PROBE_NO_CREDENTIALS  # no token resolved -> not evidence
+
+
+@pytest.mark.asyncio
+async def test_unknown_future_merchant_status_is_left_alone():
+    """`catalog_merchants.status` is NOT NULL (migration 058), so NULL cannot
+    occur — but a status this module has never heard of can, and it must be
+    treated like 'observed': recorded, not written."""
+    merchant = f"{_MERCHANT_PREFIX}_futurestatus"
+    await _seed_merchant(merchant, "quarantined_2027")
+    await _seed_store(f"{merchant}_s1", merchant, "disconnected")
+
+    out = await svc.sync_catalog_merchant_status(merchant)
+
+    assert out["changed"] is False
+    assert out["skipped"] == "unmanaged_status:quarantined_2027"
+    assert await _merchant_status(merchant) == "quarantined_2027"
 
 
 @pytest.mark.asyncio

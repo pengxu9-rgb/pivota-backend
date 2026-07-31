@@ -1591,18 +1591,6 @@ async def ensure_required_schema_light() -> None:
                     """
                 )
             )
-            # mig 190: merchant_stores upstream-probe bookkeeping
-            await database.execute(
-                text(
-                    """
-                    ALTER TABLE IF EXISTS merchant_stores
-                      ADD COLUMN IF NOT EXISTS upstream_probe_at TIMESTAMPTZ,
-                      ADD COLUMN IF NOT EXISTS upstream_probe_status TEXT,
-                      ADD COLUMN IF NOT EXISTS upstream_probe_http_status INTEGER,
-                      ADD COLUMN IF NOT EXISTS upstream_probe_failures INTEGER NOT NULL DEFAULT 0;
-                    """
-                )
-            )
             # mig 158: merchant_audit_runs
             await database.execute(
                 text(
@@ -1655,6 +1643,22 @@ async def ensure_required_schema_light() -> None:
                     """
                     ALTER TABLE IF EXISTS index_pipeline_state
                       ADD COLUMN IF NOT EXISTS index_eligible BOOLEAN DEFAULT FALSE;
+                    """
+                )
+            )
+            # mig 190: merchant_stores upstream-probe bookkeeping. Emitted near
+            # the END of the chain on purpose: these four columns are in
+            # REQUIRED_SCHEMA, so if an earlier ALTER in this single try-block
+            # raises, /health fails closed (503) on columns that were never
+            # reached. Later position = fewer statements that can starve it.
+            await database.execute(
+                text(
+                    """
+                    ALTER TABLE IF EXISTS merchant_stores
+                      ADD COLUMN IF NOT EXISTS upstream_probe_at TIMESTAMPTZ,
+                      ADD COLUMN IF NOT EXISTS upstream_probe_status TEXT,
+                      ADD COLUMN IF NOT EXISTS upstream_probe_http_status INTEGER,
+                      ADD COLUMN IF NOT EXISTS upstream_probe_failures INTEGER NOT NULL DEFAULT 0;
                     """
                 )
             )

@@ -62,5 +62,10 @@ COMMENT ON COLUMN merchant_stores.upstream_probe_http_status IS
 
 COMMENT ON COLUMN merchant_stores.upstream_probe_failures IS
   'Count of CONSECUTIVE hard failures (auth_failed/store_closed). Reset to 0 by '
-  'any ok probe. The job flips status -> disconnected only at >= 2, so a single '
-  'transient auth error can never disconnect a live merchant.';
+  'any ok probe. The job flips status -> disconnected only at >= 2. NOT self-'
+  'sufficient: a stored count is only evidence about the connection it was '
+  'measured on, and no reconnect path clears these columns — so readers MUST '
+  'discard it when connected_at is newer than upstream_probe_at (see '
+  'services.store_lifecycle_service.effective_prior_failures). Without that, a '
+  'count left over from a previous connection makes the FIRST transient 401 '
+  'after a reconnect disconnect a live merchant.';

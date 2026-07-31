@@ -37,11 +37,27 @@ DESIGN NOTES worth keeping.
   that never had a store to begin with and empty public search. The store-row
   precondition is the whole safety property — do not relax it.
 
-* Hard failure needs TWO consecutive probes. A single 401 can be a token-refresh
-  race or a platform blip; disconnecting a live merchant on one is worse than
-  learning about an uninstall 6 hours later. Transient outcomes (5xx, 429,
-  timeouts, DNS) are recorded but never counted, and never reset the counter
-  either — an unreachable probe is not evidence in either direction.
+* Hard failure needs TWO consecutive probes ON THE CURRENT CONNECTION. A single
+  401 can be a token-refresh race or a platform blip; disconnecting a live
+  merchant on one is worse than learning about an uninstall 6 hours later.
+  Transient outcomes (5xx, 429, timeouts, DNS) are recorded but never counted,
+  and never reset the counter either — an unreachable probe is not evidence in
+  either direction. "On the current connection" is the load-bearing half: no
+  reconnect path clears the probe columns, so effective_prior_failures() drops a
+  count measured before the store's last `connected_at`.
+
+* Two strikes only defends against INDEPENDENT failures. A common-mode failure —
+  an expired SHOPIFY_API_VERSION, a platform-wide 401, a credential-store
+  regression — makes every store fail identically, and two ticks later the whole
+  merchant fleet would be disconnected and dropped from public recall. The
+  correlated-failure breaker (per-tick cap + majority-hard-failure ratio above a
+  fleet-size floor) is what stops that, and it is evaluated after every probe in
+  the tick has landed rather than incrementally.
+
+* One malformed row must not be able to stop the job. Probes are individually
+  caught, because the Wix credential helpers RAISE on a blank site id and
+  never-probed rows sort first — a single poison row made every tick inert while
+  APScheduler swallowed the exception.
 
 * The DB re-read is the arbiter. Every mutation here re-reads and reports what
   the database actually holds; the return payload counts observed transitions,
@@ -133,6 +149,22 @@ def _max_probes_per_tick() -> int:
     return max(1, value)
 
 
+def _max_disconnects_per_tick() -> int:
+    try:
+        value = int((os.getenv("STORE_LIFECYCLE_MAX_DISCONNECTS_PER_TICK") or "").strip() or 3)
+    except Exception:
+        value = 3
+    return max(1, value)
+
+
+def _min_fleet_for_ratio_breaker() -> int:
+    try:
+        value = int((os.getenv("STORE_LIFECYCLE_MIN_FLEET_FOR_RATIO") or "").strip() or 5)
+    except Exception:
+        value = 5
+    return max(2, value)
+
+
 # ---------------------------------------------------------------------------
 # P1b — catalog_merchants.status write-through
 # ---------------------------------------------------------------------------
@@ -186,6 +218,12 @@ async def sync_catalog_merchant_status(
     mid = (merchant_id or "").strip()
     if not mid:
         result["skipped"] = "missing_merchant_id"
+        return result
+    if not reconciliation_enabled():
+        # The kill switch covers the write-through too, not just the job. An
+        # operator flipping it because this mechanism is misbehaving means ALL
+        # of it, and the route hooks write to the same public-recall gate.
+        result["skipped"] = "disabled"
         return result
 
     try:
@@ -356,6 +394,11 @@ async def _probe_shopify_store(store: Mapping[str, Any], timeout_s: float) -> Tu
         shop_domain=domain,
         api_key_raw=store.get("api_key"),
         store_id=str(store.get("store_id") or "") or None,
+        # A health probe must not write credentials. persist_refresh rewrites
+        # the WHOLE api_key blob from the snapshot this tick read, so a merchant
+        # reconnecting inside the probe window would have their fresh
+        # access/storefront tokens clobbered by a stale one.
+        persist_refresh=False,
     )
     if not access_token:
         # No token to probe with. This is a local credential gap, NOT upstream
@@ -401,12 +444,36 @@ async def probe_store_upstream(
     *,
     timeout_s: float = 12.0,
 ) -> Tuple[str, Optional[int]]:
-    """Ask the platform whether this store is still ours. Never raises."""
+    """Ask the platform whether this store is still ours. Never raises.
+
+    "Never raises" is load-bearing, and was a lie in review: the Wix credential
+    helpers RAISE `WixConnectionValidationError` on a blank/whitespace/URL-less
+    site id rather than returning "", so one malformed store row propagated out
+    of the probe, out of the tick, and into APScheduler — which swallows it.
+    Because `_fetch_due_stores` orders never-probed rows FIRST, that poison row
+    sorted to the top of every tick and the job was permanently inert while
+    reporting nothing at all. Exactly the no-op-behind-a-success-signal class
+    this module exists to close. The catch-all here and the per-store catch in
+    the tick are both deliberate; do not narrow them to specific exceptions.
+    """
     platform = str(store.get("platform") or "").strip().lower()
-    if platform == "shopify":
-        return await _probe_shopify_store(store, timeout_s)
-    if platform == "wix":
-        return await _probe_wix_store(store, timeout_s)
+    try:
+        if platform == "shopify":
+            return await _probe_shopify_store(store, timeout_s)
+        if platform == "wix":
+            return await _probe_wix_store(store, timeout_s)
+    except Exception as e:  # noqa: BLE001
+        logger.warning(
+            "store_lifecycle: probe raised store=%s platform=%s err=%s: %s",
+            store.get("store_id"),
+            platform,
+            type(e).__name__,
+            str(e)[:200],
+        )
+        # A store we cannot even form a request for is a LOCAL problem, not
+        # upstream evidence — classify it as such so it can never count toward
+        # a disconnect.
+        return PROBE_NO_CREDENTIALS, None
     return PROBE_UNSUPPORTED_PLATFORM, None
 
 
@@ -425,6 +492,36 @@ def next_failure_count(outcome: str, prior_failures: int) -> int:
     return max(0, prior_failures)
 
 
+def effective_prior_failures(
+    prior_failures: int,
+    connected_at: Any,
+    probe_at: Any,
+) -> int:
+    """Pure: how many failures this store has ACCUMULATED SINCE ITS LAST CONNECT.
+
+    A stored counter is only evidence about the connection it was measured on.
+    Every reconnect path in the repo writes `connected_at = CURRENT_TIMESTAMP`,
+    but none of them clears the probe columns — so without this, a store that
+    failed once weeks ago, was reconnected, and then hit a single transient 401
+    (most likely precisely after a reconnect, during the token-refresh window)
+    would reach the threshold and be disconnected on its FIRST failure of the
+    current connection. That falsifies the two-strike rule outright, and it was
+    reproduced in review.
+
+    Keying on `connected_at` rather than on each reconnect writer remembering
+    to reset four columns is the point: it holds for lifecycle paths this PR
+    never touched, and for ones written later.
+    """
+    prior = max(0, prior_failures)
+    connected = _coerce_probe_timestamp(connected_at)
+    probed = _coerce_probe_timestamp(probe_at)
+    if connected is None or probed is None:
+        # Legacy rows with no connect timestamp: nothing to compare, keep what
+        # was measured. (A never-probed store has prior=0 anyway.)
+        return prior
+    return 0 if connected > probed else prior
+
+
 async def _record_probe(
     *,
     store_id: str,
@@ -432,7 +529,16 @@ async def _record_probe(
     http_status: Optional[int],
     prior_failures: int,
 ) -> int:
-    """Persist a probe result; return the new consecutive-failure count."""
+    """Persist a probe result; return the consecutive-failure count the DB holds.
+
+    `prior_failures` must already have been through effective_prior_failures(),
+    so a counter left over from a previous connection is not carried forward.
+    The write is an absolute SET rather than a SQL increment on purpose: the
+    reconnect rule needs to be able to reset the stored value, and an increment
+    cannot express that. The residual window — a reconnect landing INSIDE the
+    ≤12s probe — is handled at the decision site, where the disconnect re-checks
+    the stored counter against the threshold.
+    """
     failures = next_failure_count(outcome, prior_failures)
 
     await database.execute(
@@ -451,7 +557,12 @@ async def _record_probe(
             "store_id": store_id,
         },
     )
-    return failures
+    # The DB is the arbiter, never the arithmetic above.
+    row = await database.fetch_one(
+        "SELECT COALESCE(upstream_probe_failures, 0) AS f FROM merchant_stores WHERE store_id = :s",
+        {"s": store_id},
+    )
+    return int(dict(row).get("f") or 0) if row is not None else failures
 
 
 def _coerce_probe_timestamp(value: Any) -> Optional[datetime]:
@@ -492,7 +603,7 @@ async def _fetch_due_stores(limit: int) -> List[Dict[str, Any]]:
         """
         SELECT store_id, merchant_id, platform, domain, api_key, status,
                COALESCE(upstream_probe_failures, 0) AS upstream_probe_failures,
-               upstream_probe_at
+               upstream_probe_at, connected_at
         FROM merchant_stores
         WHERE lower(COALESCE(status, '')) IN ('active', 'connected')
         ORDER BY upstream_probe_at ASC NULLS FIRST
@@ -511,6 +622,48 @@ async def _fetch_due_stores(limit: int) -> List[Dict[str, Any]]:
     return out
 
 
+def _correlated_failure_breaker(summary: Dict[str, Any], threshold: int) -> Optional[str]:
+    """Refuse to disconnect when this tick's failures look CORRELATED.
+
+    Every Shopify probe hits the same URL shape built from one process-wide
+    SHOPIFY_API_VERSION. A version that falls out of Shopify's support window,
+    a platform-wide 401 incident, or a regression in the credential store all
+    make every store answer the same hard status at once — and two ticks later
+    the entire merchant fleet would be 'disconnected' and dropped from public
+    recall. Two strikes defends against INDEPENDENT transients; it does nothing
+    against a common-mode failure. This does.
+
+    Two guards, both returning a reason string (= withhold) or None (= proceed):
+
+      * an absolute per-tick cap, so no single tick can empty the fleet;
+      * above MIN_FLEET_FOR_RATIO probes, a majority-hard-failure ratio. Below
+        that threshold the ratio is meaningless (two stores, both genuinely
+        uninstalled, is 100%) so only the cap applies.
+
+    Called from phase 2 of the tick, after every probe has landed — evaluated
+    incrementally it would wave the first stores through before the shape of a
+    fleet-wide incident became visible.
+    """
+    cap = _max_disconnects_per_tick()
+    already = len(summary.get("disconnected") or [])
+    if already >= cap:
+        return f"per-tick disconnect cap reached ({already}/{cap})"
+
+    examined = int(summary.get("examined") or 0)
+    if examined >= _min_fleet_for_ratio_breaker():
+        hard = sum(
+            int(count) for status, count in (summary.get("outcomes") or {}).items()
+            if status in HARD_PROBE_STATUSES
+        )
+        if hard * 2 > examined:
+            return (
+                f"{hard}/{examined} probes failed hard this tick — correlated failure, "
+                "not a mass uninstall"
+            )
+    del threshold
+    return None
+
+
 async def run_store_lifecycle_reconciliation_tick() -> Dict[str, Any]:
     """Scheduled entry point: probe due stores, flip the dead ones, converge
     catalog_merchants.status.
@@ -520,9 +673,11 @@ async def run_store_lifecycle_reconciliation_tick() -> Dict[str, Any]:
     """
     summary: Dict[str, Any] = {
         "enabled": reconciliation_enabled(),
+        "examined": 0,
         "probed": 0,
         "outcomes": {},
         "disconnected": [],
+        "withheld": [],
         "status_sweep": None,
     }
     if not summary["enabled"]:
@@ -537,13 +692,31 @@ async def run_store_lifecycle_reconciliation_tick() -> Dict[str, Any]:
         due = []
         summary["error"] = f"{type(e).__name__}"
 
-    touched_merchants: List[str] = []
+    # PHASE 1 — probe everything, decide nothing. The correlated-failure
+    # breaker has to see the WHOLE tick's outcome distribution: judged
+    # incrementally it would let the first few stores through before the shape
+    # of a fleet-wide incident was visible, which is exactly the damage it
+    # exists to prevent.
+    candidates: List[Tuple[Dict[str, Any], str, Optional[int], int]] = []
     for store in due:
         store_id = str(store.get("store_id") or "")
         if not store_id:
             continue
-        outcome, http_status = await probe_store_upstream(store)
-        summary["probed"] += 1
+        # One malformed row must never be able to abort the tick — and it very
+        # nearly could, because never-probed rows sort FIRST, so a poison row
+        # would have aborted every tick before any other store was reached.
+        try:
+            outcome, http_status = await probe_store_upstream(store)
+        except Exception as e:  # noqa: BLE001
+            logger.warning(
+                "store_lifecycle: probe escaped its own handler store=%s err=%s",
+                store_id,
+                str(e)[:200],
+            )
+            outcome, http_status = PROBE_NO_CREDENTIALS, None
+        summary["examined"] += 1
+        if outcome not in (PROBE_NO_CREDENTIALS, PROBE_UNSUPPORTED_PLATFORM):
+            summary["probed"] += 1
         summary["outcomes"][outcome] = summary["outcomes"].get(outcome, 0) + 1
 
         try:
@@ -551,7 +724,11 @@ async def run_store_lifecycle_reconciliation_tick() -> Dict[str, Any]:
                 store_id=store_id,
                 outcome=outcome,
                 http_status=http_status,
-                prior_failures=int(store.get("upstream_probe_failures") or 0),
+                prior_failures=effective_prior_failures(
+                    int(store.get("upstream_probe_failures") or 0),
+                    store.get("connected_at"),
+                    store.get("upstream_probe_at"),
+                ),
             )
         except Exception as e:  # noqa: BLE001
             logger.warning(
@@ -571,6 +748,25 @@ async def run_store_lifecycle_reconciliation_tick() -> Dict[str, Any]:
                     threshold,
                 )
             continue
+        candidates.append((store, outcome, http_status, failures))
+
+    # PHASE 2 — decide, now that the whole distribution is known.
+    touched_merchants: List[str] = []
+    for store, outcome, http_status, failures in candidates:
+        store_id = str(store.get("store_id") or "")
+        breaker = _correlated_failure_breaker(summary, threshold)
+        if breaker is not None:
+            summary["withheld"].append({"store_id": store_id, "reason": breaker})
+            logger.error(
+                "store_lifecycle: WITHHOLDING disconnect for store %s (%s) — %s. "
+                "A fleet-wide platform incident, an expired SHOPIFY_API_VERSION or a "
+                "credential-store regression all look exactly like a mass uninstall; "
+                "the job refuses to act on that shape and needs a human.",
+                store_id,
+                outcome,
+                breaker,
+            )
+            continue
 
         try:
             await database.execute(
@@ -580,8 +776,13 @@ async def run_store_lifecycle_reconciliation_tick() -> Dict[str, Any]:
                     last_sync = CURRENT_TIMESTAMP
                 WHERE store_id = :store_id
                   AND lower(COALESCE(status, '')) IN ('active', 'connected')
+                  AND COALESCE(upstream_probe_failures, 0) >= :threshold
                 """,
-                {"disconnected": DISCONNECTED_STATUS, "store_id": store_id},
+                {
+                    "disconnected": DISCONNECTED_STATUS,
+                    "store_id": store_id,
+                    "threshold": threshold,
+                },
             )
             verify = await database.fetch_one(
                 "SELECT status FROM merchant_stores WHERE store_id = :store_id",
@@ -633,4 +834,22 @@ async def run_store_lifecycle_reconciliation_tick() -> Dict[str, Any]:
     for merchant_id in touched_merchants:
         await sync_catalog_merchant_status(merchant_id, reason="upstream_probe_disconnect")
     summary["status_sweep"] = await reconcile_catalog_merchant_statuses()
+
+    # The tick's only observability. Nothing consumes the return value —
+    # APScheduler discards it — so a job that has gone inert (poisoned row,
+    # worker gate, kill switch, empty due-set) is invisible without this line.
+    # Emit it on EVERY tick, including the boring ones: "ran and did nothing" is
+    # the observation that distinguishes healthy from dead.
+    sweep = summary.get("status_sweep") or {}
+    logger.info(
+        "store_lifecycle: tick complete examined=%d probed=%d outcomes=%s disconnected=%d "
+        "withheld=%d merchants_examined=%s merchants_changed=%s",
+        summary["examined"],
+        summary["probed"],
+        summary["outcomes"],
+        len(summary["disconnected"]),
+        len(summary["withheld"]),
+        sweep.get("examined"),
+        sweep.get("changed"),
+    )
     return summary
