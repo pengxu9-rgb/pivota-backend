@@ -156,19 +156,57 @@ async def _ensure_schema() -> None:
     ]
     for stmt in ddl:
         await database.execute(stmt)
-    # Columns added by later migrations; in a full-suite run another module may
-    # have created these tables from an older DDL. Added the way schema_guard
-    # does it in prod, so the fixture works whichever DDL won the race.
+    # Whichever module wins the create race, this file must be able to INSERT.
+    # The list is EVERY column the seed helpers write plus every column the lane
+    # SELECTs — not just the ones added by later migrations. Narrower was not
+    # enough: with `tests/test_index_pipeline_state_service.py` running first
+    # (it precedes this file alphabetically and creates catalog_products from a
+    # 13-column DDL), the seeds died on `no column named catalog_track`. CI is
+    # safe today only because some earlier module happens to run
+    # `metadata.create_all` and pytest-randomly is not installed — i.e. by
+    # ordering luck, which is not a property worth depending on.
     for table, column, coltype in (
+        ("catalog_products", "catalog_track", "VARCHAR(32) DEFAULT 'internal_merchant'"),
+        ("catalog_products", "truth_tier", "VARCHAR(32) DEFAULT 'primary'"),
+        ("catalog_products", "readiness_tier", "VARCHAR(32) DEFAULT 'commerce_ready'"),
+        ("catalog_products", "source_system", "VARCHAR(64)"),
+        ("catalog_products", "product_type", "VARCHAR(255)"),
+        ("catalog_products", "category", "VARCHAR(255)"),
         ("catalog_products", "category_path", "TEXT"),
+        ("catalog_products", "canonical_url", "TEXT"),
+        ("catalog_products", "image_url", "TEXT"),
+        ("catalog_products", "freshness_json", "TEXT"),
         ("catalog_products", "pdp_scope", "TEXT"),
         ("catalog_products", "pdp_lifecycle_stage", "TEXT"),
         ("catalog_products", "sync_status", "TEXT DEFAULT 'live'"),
         ("catalog_products", "content_key", "TEXT"),
         ("catalog_products", "suppressed_at", "TIMESTAMP"),
         ("catalog_products", "suppression_reason", "TEXT"),
+        ("catalog_skus", "merchant_id", "VARCHAR(64)"),
+        ("catalog_skus", "platform", "VARCHAR(64)"),
+        ("catalog_skus", "source_product_id", "VARCHAR(128)"),
+        ("catalog_skus", "readiness_tier", "VARCHAR(32) DEFAULT 'commerce_ready'"),
+        ("catalog_skus", "visible_attributes", "TEXT"),
+        ("catalog_skus", "visible_option_labels", "TEXT"),
+        ("catalog_skus", "ingredient_ids", "TEXT"),
+        ("catalog_skus", "image_url", "TEXT"),
+        ("catalog_skus", "barcode", "VARCHAR(128)"),
         ("catalog_skus", "suppressed_at", "TIMESTAMP"),
         ("catalog_skus", "suppression_reason", "TEXT"),
+        ("catalog_offers", "catalog_track", "VARCHAR(32) DEFAULT 'internal_merchant'"),
+        ("catalog_offers", "truth_tier", "VARCHAR(32) DEFAULT 'primary'"),
+        ("catalog_offers", "readiness_tier", "VARCHAR(32) DEFAULT 'commerce_ready'"),
+        ("catalog_offers", "offer_mode", "VARCHAR(32) DEFAULT 'merchant_checkout'"),
+        ("catalog_offers", "channel", "VARCHAR(64) DEFAULT 'default'"),
+        ("catalog_offers", "availability", "VARCHAR(32) DEFAULT 'unknown'"),
+        ("catalog_offers", "inventory_quantity", "INTEGER"),
+        ("catalog_offers", "currency", "VARCHAR(16)"),
+        ("catalog_offers", "list_price", "NUMERIC"),
+        ("catalog_offers", "merchant_effective_price", "NUMERIC"),
+        ("catalog_offers", "estimated_best_price", "NUMERIC"),
+        ("catalog_offers", "price_confidence", "NUMERIC"),
+        ("catalog_offers", "source_system", "VARCHAR(64)"),
+        ("catalog_offers", "offer_payload", "TEXT"),
         ("catalog_offers", "suppressed_at", "TIMESTAMP"),
         ("catalog_offers", "offer_type", "TEXT"),
         ("catalog_offers", "market", "TEXT"),
@@ -177,11 +215,24 @@ async def _ensure_schema() -> None:
         ("catalog_offers", "why_buy_direct", "TEXT"),
         ("catalog_merchants", "indexable", "BOOLEAN DEFAULT TRUE"),
         ("catalog_merchants", "metadata_json", "TEXT"),
+        ("catalog_merchants", "primary_platform", "VARCHAR(64)"),
+        ("catalog_products", "created_at", "TIMESTAMP"),
+        ("catalog_products", "updated_at", "TIMESTAMP"),
+        ("catalog_skus", "created_at", "TIMESTAMP"),
+        ("catalog_skus", "updated_at", "TIMESTAMP"),
+        ("catalog_offers", "created_at", "TIMESTAMP"),
+        ("catalog_offers", "updated_at", "TIMESTAMP"),
+        ("catalog_merchants", "created_at", "TIMESTAMP"),
+        ("catalog_merchants", "updated_at", "TIMESTAMP"),
     ):
         try:
             await database.execute(f"ALTER TABLE {table} ADD COLUMN {column} {coltype}")
-        except Exception:
-            pass  # already present
+        except Exception as e:  # noqa: BLE001
+            # Only "already exists" is expected. Anything else is a real schema
+            # problem and must not be swallowed into a confusing INSERT failure
+            # ten lines later.
+            if "duplicate column" not in str(e).lower():
+                raise
 
 
 async def _reset() -> None:
@@ -276,6 +327,40 @@ async def _recall(query: str = "Hydrating Serum", merchant_id: Optional[str] = N
     return [str(r.get("product_key")) for r in rows if str(r.get("product_key", "")).startswith(_PREFIX)]
 
 
+async def _recall_offers(
+    query: str = "Hydrating Serum", merchant_id: Optional[str] = None
+) -> List[str]:
+    """Offer-grain view of the same call.
+
+    `_recall` returns product_keys only, which makes it structurally incapable
+    of catching a regression that drops the SURVIVING offer while keeping the
+    product — the row grain this lane actually emits is (product, offer).
+    """
+    rows = await svc._fetch_canonical_search_rows(
+        query=query, merchant_id=merchant_id, limit=20
+    )
+    return sorted(
+        str(r.get("offer_id")) for r in rows if str(r.get("offer_id", "")).startswith(_PREFIX)
+    )
+
+
+async def _extra_offer(key: str, *, seller: str, suffix: str) -> None:
+    """A SECOND offer on the SAME sku, from a different seller — the shape H1 is
+    really about, and the one the product-grain tests cannot distinguish."""
+    await database.execute(
+        """
+        INSERT INTO catalog_offers
+            (offer_id, sku_key, product_key, merchant_id, catalog_track, truth_tier,
+             readiness_tier, offer_mode, channel, availability, currency, list_price,
+             suppressed_at, created_at, updated_at)
+        VALUES (:o, :sk, :k, :seller, 'internal_merchant', 'primary', 'commerce_ready',
+                'merchant_checkout', 'default', 'in_stock', 'USD', 24.99, NULL,
+                CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)
+        """,
+        {"o": f"{key}::offer::{suffix}", "sk": f"{key}::sku", "k": key, "seller": seller},
+    )
+
+
 @pytest.fixture(autouse=True)
 async def _db():
     was_connected = await _connect_if_needed()
@@ -352,6 +437,53 @@ async def test_seller_with_observed_status_still_serves():
     assert await _recall() == [f"{_PREFIX}_p1"]
 
 
+@pytest.mark.parametrize(
+    "status,expected_serving",
+    [
+        ("inactive", False),
+        ("INACTIVE", False),   # the gate lowercases, as every status read does
+        ("Inactive", False),
+        ("active", True),
+        ("observed", True),
+        ("", True),            # empty string is not 'inactive' — do not guess
+        (" inactive ", True),  # NOT gated: no btrim, matching the pre-existing
+                               # m-clause. Pinned as KNOWN, not endorsed — if a
+                               # writer ever pads the column this is a hole, and
+                               # the fix belongs on both clauses at once.
+    ],
+)
+@pytest.mark.asyncio
+async def test_seller_status_matching_is_case_insensitive_and_inactive_only(
+    status: str, expected_serving: bool
+):
+    await _merchant(f"{_PREFIX}_owner")
+    await _merchant(f"{_PREFIX}_seller", status=status)
+    await _product_with_offer(f"{_PREFIX}_p1", owner=f"{_PREFIX}_owner", seller=f"{_PREFIX}_seller")
+
+    served = await _recall() == [f"{_PREFIX}_p1"]
+    assert served is expected_serving
+
+
+@pytest.mark.asyncio
+async def test_seller_row_exists_with_null_indexable_still_serves():
+    """Distinct from 'no row at all': prod has `indexable BOOLEAN NOT NULL`, so
+    this state is unreachable there — but the fixture can reach it, and the
+    COALESCE conflates the two cases. Pinned so the conflation is a decision
+    rather than an accident."""
+    await _merchant(f"{_PREFIX}_owner")
+    await database.execute(
+        """
+        INSERT INTO catalog_merchants
+            (merchant_id, merchant_name, status, indexable, metadata_json, created_at, updated_at)
+        VALUES (:m, :m, 'active', NULL, '{}', CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)
+        """,
+        {"m": f"{_PREFIX}_seller"},
+    )
+    await _product_with_offer(f"{_PREFIX}_p1", owner=f"{_PREFIX}_owner", seller=f"{_PREFIX}_seller")
+
+    assert await _recall() == [f"{_PREFIX}_p1"]
+
+
 @pytest.mark.asyncio
 async def test_merchant_scoped_recall_still_sees_its_own_gated_rows():
     """Merchant-scoped queries skip every source gate by design, so the operator
@@ -374,6 +506,50 @@ async def test_a_healthy_sellers_offer_survives_alongside_a_gated_one():
     await _product_with_offer(f"{_PREFIX}_p2", owner=f"{_PREFIX}_owner", seller=f"{_PREFIX}_good")
 
     assert await _recall() == [f"{_PREFIX}_p2"]
+
+
+@pytest.mark.asyncio
+async def test_one_sku_two_sellers_only_the_gated_offer_is_dropped():
+    """THE shape H1 is really about: one sku, two sellers, one retired.
+
+    The product must survive carrying ONLY the healthy seller's offer. Getting
+    this wrong in either direction is a real outage — dropping the product
+    removes a live listing, keeping both republishes the retired seller's price.
+    Asserted at OFFER grain because the product-grain helper cannot see the
+    difference."""
+    await _merchant(f"{_PREFIX}_owner")
+    await _merchant(f"{_PREFIX}_bad", status="inactive")
+    await _merchant(f"{_PREFIX}_good")
+    await _product_with_offer(f"{_PREFIX}_p1", owner=f"{_PREFIX}_owner", seller=f"{_PREFIX}_good")
+    await _extra_offer(f"{_PREFIX}_p1", seller=f"{_PREFIX}_bad", suffix="bad")
+
+    assert await _recall() == [f"{_PREFIX}_p1"], "the product must not vanish"
+    assert await _recall_offers() == [f"{_PREFIX}_p1::offer"], "only the healthy offer survives"
+
+
+@pytest.mark.asyncio
+async def test_one_sku_two_healthy_sellers_both_offers_survive():
+    """The control for the test above — the gate must not collapse a
+    multi-seller sku down to one row when nobody is gated."""
+    await _merchant(f"{_PREFIX}_owner")
+    await _merchant(f"{_PREFIX}_a")
+    await _merchant(f"{_PREFIX}_b")
+    await _product_with_offer(f"{_PREFIX}_p1", owner=f"{_PREFIX}_owner", seller=f"{_PREFIX}_a")
+    await _extra_offer(f"{_PREFIX}_p1", seller=f"{_PREFIX}_b", suffix="b")
+
+    assert await _recall_offers() == [f"{_PREFIX}_p1::offer", f"{_PREFIX}_p1::offer::b"]
+
+
+@pytest.mark.asyncio
+async def test_one_sku_all_sellers_gated_removes_the_product():
+    await _merchant(f"{_PREFIX}_owner")
+    await _merchant(f"{_PREFIX}_bad1", status="inactive")
+    await _merchant(f"{_PREFIX}_bad2", indexable=False)
+    await _product_with_offer(f"{_PREFIX}_p1", owner=f"{_PREFIX}_owner", seller=f"{_PREFIX}_bad1")
+    await _extra_offer(f"{_PREFIX}_p1", seller=f"{_PREFIX}_bad2", suffix="bad2")
+
+    assert await _recall() == []
+    assert await _recall_offers() == []
 
 
 # ---------------------------------------------------------------------------

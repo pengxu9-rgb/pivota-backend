@@ -922,6 +922,18 @@ async def _fetch_canonical_search_rows(
     # scripts/merge_duplicate_canonicals.py — also suppresses the loser product).
     # Belt-and-braces so a sku-only retirement writer cannot re-open the leak;
     # BOTH columns for the same reason the product clause gates both.
+    #
+    # KNOWN DIVERGENCE, deliberately accepted: this makes the recall lane the
+    # ONLY reader of catalog_skus suppression in the codebase.
+    # services/agent_pdp_view_assembler.py (fetch_skus_for_keys, which populates
+    # the PDP variant list) and routes/audit_runs_routes.py read catalog_skus
+    # with no suppression filter. So a suppressed sku is hidden from recall while
+    # still rendering as a PDP variant — a lane divergence of the same CLASS as
+    # #1648 itself, though in the safe direction (recall shows less, not more)
+    # and affecting 0 rows today (38 suppressed skus, none under an unsuppressed
+    # product). Converging those readers is tracked on #1648; it is not done here
+    # because touching the PDP assembler carries the same 404-flip blast radius
+    # as H2 and needs its own door re-verify.
     sku_suppression_clause = ""
     if not merchant_id:
         sku_suppression_clause = (
