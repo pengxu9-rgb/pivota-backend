@@ -61,6 +61,11 @@ REQUIRED_SCHEMA: Sequence[RequiredTableColumns] = (
             "upstream_probe_status",
             "upstream_probe_http_status",
             "upstream_probe_failures",
+            # Not added by migration 190 — it predates it — but the due-store
+            # SELECT now reads it as the fallback connect anchor, so a table
+            # created before this column existed kills the probe half silently.
+            # Required here so that failure is a loud 503, not a quiet no-op.
+            "created_at",
         },
     ),
     RequiredTableColumns(
@@ -1658,7 +1663,8 @@ async def ensure_required_schema_light() -> None:
                       ADD COLUMN IF NOT EXISTS upstream_probe_at TIMESTAMPTZ,
                       ADD COLUMN IF NOT EXISTS upstream_probe_status TEXT,
                       ADD COLUMN IF NOT EXISTS upstream_probe_http_status INTEGER,
-                      ADD COLUMN IF NOT EXISTS upstream_probe_failures INTEGER NOT NULL DEFAULT 0;
+                      ADD COLUMN IF NOT EXISTS upstream_probe_failures INTEGER NOT NULL DEFAULT 0,
+                      ADD COLUMN IF NOT EXISTS created_at TIMESTAMPTZ DEFAULT NOW();
                     """
                 )
             )
@@ -1694,6 +1700,7 @@ async def ensure_required_schema_light() -> None:
                 ("merchant_stores", "upstream_probe_status"): "TEXT",
                 ("merchant_stores", "upstream_probe_http_status"): "INTEGER",
                 ("merchant_stores", "upstream_probe_failures"): "INTEGER NOT NULL DEFAULT 0",
+                ("merchant_stores", "created_at"): "TIMESTAMP DEFAULT CURRENT_TIMESTAMP",
                 ("catalog_merchants", "indexable"): "BOOLEAN DEFAULT FALSE",
                 ("merchant_credit_balance", "purchased_credits"): "NUMERIC DEFAULT 0",
                 ("merchant_credit_balance", "overage_pending_credits"): "NUMERIC DEFAULT 0",

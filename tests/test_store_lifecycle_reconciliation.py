@@ -550,6 +550,14 @@ async def test_a_raising_probe_cannot_abort_the_tick(monkeypatch: pytest.MonkeyP
     summary = await svc.run_store_lifecycle_reconciliation_tick()
 
     assert summary["outcomes"].get(svc.PROBE_NO_CREDENTIALS) == 1
+    # `probed` counts UPSTREAM EVIDENCE, not rows walked. This row produced
+    # none, and it must not inflate the correlated-failure breaker's
+    # denominator — a fleet padded with malformed rows would otherwise
+    # under-trigger the guard, which is the platform-mix sensitivity that moving
+    # off `examined` exists to remove. (Mutation-checked: counting it here
+    # leaves every other assertion in this file green.)
+    assert summary["examined"] == 1
+    assert summary["probed"] == 0
     # ...and the rest of the tick still ran: the sweep reached the other merchant.
     assert await _merchant_status(good_merchant) == "inactive"
     assert summary["status_sweep"]["examined"] >= 2
@@ -695,13 +703,13 @@ def test_correlated_ratio_uses_probed_not_examined():
         "outcomes": {svc.PROBE_AUTH_FAILED: 4, svc.PROBE_OK: 2, svc.PROBE_NO_CREDENTIALS: 7},
         "disconnected": [{"store_id": "a"}],
     }
-    assert "correlated failure" in (svc._correlated_failure_breaker(correlated, 2) or "")
+    assert "correlated failure" in (svc._correlated_failure_breaker(correlated) or "")
 
     # The identical tick judged on `examined` (13) would NOT look correlated
     # (4*2 !> 13), so the 7 evidence-free rows would have bought the fleet a
     # pass straight through to the normal cap.
-    assert 4 * 2 > correlated["probed"]
-    assert not 4 * 2 > correlated["examined"]
+    on_examined = dict(correlated, probed=correlated["examined"])
+    assert svc._correlated_failure_breaker(on_examined) is None
 
 
 @pytest.mark.asyncio
@@ -876,31 +884,119 @@ def test_every_store_activation_writer_stamps_connected_at():
     from pathlib import Path
 
     repo = Path(__file__).resolve().parents[1]
+
+    # Widened after review enumerated the first version's blind spots: it only
+    # matched `UPDATE merchant_stores SET` (so an alias hid a writer), only the
+    # literal 'active'/'connected' or exactly `:status` (so any other bind name
+    # hid one), and only non-recursive routes/ + services/ (so jobs/ and
+    # scripts/ were invisible). Any SET-body reaching a WHERE/ON CONFLICT/end
+    # now counts, and the status match is generic.
+    # \Z (end of input) is a terminator so a SET with no WHERE still yields a
+    # body — that shape updates EVERY store row, which is the last one that
+    # should slip past. Over-capture here can only produce a false POSITIVE,
+    # which a human then checks; a missed statement is silent.
+    statement = re.compile(
+        r"UPDATE\s+merchant_stores\b[^;]*?\bSET\b(.*?)(?:\bWHERE\b|\bRETURNING\b|\"\"\"|'''|;|\Z)",
+        re.IGNORECASE | re.DOTALL,
+    )
+    # (?<!\w) so `upstream_probe_status = ...` is not read as a lifecycle write.
+    activation = re.compile(
+        r"""(?<!\w)status\s*=\s*(?:'(?:active|connected)'|"(?:active|connected)"|:\w*status\w*)""",
+        re.IGNORECASE,
+    )
+
     offenders = []
-    for path in sorted((repo / "routes").glob("*.py")) + sorted((repo / "services").glob("*.py")):
-        source = path.read_text(encoding="utf-8", errors="replace")
-        # Every UPDATE merchant_stores ... up to the WHERE that ends it.
-        for match in re.finditer(
-            r"UPDATE\s+merchant_stores\s+SET(.*?)WHERE", source, re.IGNORECASE | re.DOTALL
-        ):
-            body = match.group(1)
-            # (?<!\w) so `upstream_probe_status = :status` is not mistaken for a
-            # lifecycle status write — \w covers the underscore.
-            activates = re.search(
-                r"(?<!\w)status\s*=\s*'(active|connected)'", body, re.IGNORECASE
-            ) or re.search(r"(?<!\w)status\s*=\s*:status\b", body)
-            if not activates:
-                continue
-            if "connected_at" in body:
-                continue
-            line = source[: match.start()].count("\n") + 1
-            offenders.append(f"{path.relative_to(repo)}:{line}")
+    for directory in ("routes", "services", "jobs", "scripts"):
+        for path in sorted((repo / directory).rglob("*.py")):
+            source = path.read_text(encoding="utf-8", errors="replace")
+            for match in statement.finditer(source):
+                body = match.group(1)
+                if not activation.search(body):
+                    continue
+                if re.search(r"(?<!\w)connected_at\s*=", body):
+                    continue
+                line = source[: match.start()].count("\n") + 1
+                offenders.append(f"{path.relative_to(repo)}:{line}")
 
     assert offenders == [], (
         "these UPDATEs move a store into the serving set without stamping "
         "connected_at, which lets a failure count from the PREVIOUS connection "
         f"disconnect the new one on its first transient 401: {offenders}"
     )
+
+    # A source gate that matches nothing is also green. These are the shapes
+    # review proved the FIRST version of this regex was blind to — each must be
+    # flagged, or "no offenders" means "no eyes".
+    must_flag = [
+        "UPDATE merchant_stores SET status = 'active' WHERE store_id = :s",
+        "UPDATE merchant_stores ms SET status = 'active' WHERE ms.store_id = :s",   # aliased
+        'UPDATE merchant_stores SET status = "active" WHERE store_id = :s',         # double-quoted
+        "UPDATE merchant_stores SET status = :new_status WHERE store_id = :s",      # other bind name
+        "UPDATE merchant_stores SET status = 'ACTIVE' WHERE store_id = :s",         # case
+        "UPDATE merchant_stores SET status = 'connected', name = :n WHERE id = :s",
+        "UPDATE merchant_stores SET status = 'active'",                             # no WHERE
+    ]
+    for snippet in must_flag:
+        found = statement.search(snippet)
+        assert found and activation.search(found.group(1)), f"gate is blind to: {snippet}"
+
+    must_not_flag = [
+        "UPDATE merchant_stores SET upstream_probe_status = :status WHERE store_id = :s",
+        "UPDATE merchant_stores SET status = 'inactive' WHERE store_id = :s",
+        "UPDATE merchant_stores SET status = 'active', connected_at = CURRENT_TIMESTAMP WHERE id = :s",
+    ]
+    for snippet in must_not_flag:
+        found = statement.search(snippet)
+        body = found.group(1) if found else ""
+        flagged = bool(activation.search(body)) and not re.search(
+            r"(?<!\w)connected_at\s*=", body
+        )
+        assert not flagged, f"gate false-positives on: {snippet}"
+
+
+@pytest.mark.asyncio
+async def test_a_dead_probe_half_is_reported_not_disguised(monkeypatch: pytest.MonkeyPatch):
+    """A broken due-store query yields examined=0 probed=0 — byte-identical to a
+    quiet, correct tick. The summary line is this job's ONLY inertness detector,
+    so it has to carry the error, or the detector reports health while the thing
+    it detects is happening. (Found when `created_at` joined the SELECT: on a
+    schema without that column the probe half is dead forever and the tick still
+    printed 'complete'.)"""
+    merchant = f"{_MERCHANT_PREFIX}_deadhalf"
+    await _seed_merchant(merchant, "active")
+    await _seed_store(f"{merchant}_s1", merchant, "disconnected")
+
+    async def broken_fetch(limit):
+        raise RuntimeError("no such column: created_at")
+
+    monkeypatch.setattr(svc, "_fetch_due_stores", broken_fetch)
+
+    summary = await svc.run_store_lifecycle_reconciliation_tick()
+
+    assert summary["examined"] == 0
+    assert summary["error"] == "RuntimeError", "the tick must RECORD which half died"
+    # The other half still converges — a dead probe must not take the
+    # write-through down with it.
+    assert summary["status_sweep"]["changed"] == 1
+    assert await _merchant_status(merchant) == "inactive"
+
+
+def test_created_at_is_covered_by_schema_guard():
+    """`created_at` became load-bearing when it joined the due-store SELECT.
+    Railway does not run db/migrations/, so schema_guard is the only thing that
+    puts a column in prod — and a column missing from REQUIRED_SCHEMA fails
+    SILENTLY (dead probe half) instead of at /health."""
+    from db.schema_guard import REQUIRED_SCHEMA
+
+    required = {
+        spec.table: spec.columns for spec in REQUIRED_SCHEMA
+    }
+    assert "created_at" in required["merchant_stores"]
+
+    guard_source = (
+        __import__("pathlib").Path(__file__).resolve().parents[1] / "db" / "schema_guard.py"
+    ).read_text(encoding="utf-8")
+    assert "ADD COLUMN IF NOT EXISTS created_at TIMESTAMPTZ DEFAULT NOW();" in guard_source
 
 
 @pytest.mark.asyncio

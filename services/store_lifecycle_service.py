@@ -662,7 +662,7 @@ async def _fetch_due_stores(limit: int) -> List[Dict[str, Any]]:
     return out
 
 
-def _correlated_failure_breaker(summary: Dict[str, Any], threshold: int) -> Optional[str]:
+def _correlated_failure_breaker(summary: Dict[str, Any]) -> Optional[str]:
     """Refuse to disconnect when this tick's failures look CORRELATED.
 
     Every Shopify probe hits the same URL shape built from one process-wide
@@ -698,7 +698,6 @@ def _correlated_failure_breaker(summary: Dict[str, Any], threshold: int) -> Opti
     incrementally it would wave the first stores through before the shape of a
     fleet-wide incident became visible.
     """
-    del threshold
     probed = int(summary.get("probed") or 0)
     hard = sum(
         int(count) for status, count in (summary.get("outcomes") or {}).items()
@@ -812,7 +811,7 @@ async def run_store_lifecycle_reconciliation_tick() -> Dict[str, Any]:
     touched_merchants: List[str] = []
     for store, outcome, http_status, failures in candidates:
         store_id = str(store.get("store_id") or "")
-        breaker = _correlated_failure_breaker(summary, threshold)
+        breaker = _correlated_failure_breaker(summary)
         if breaker is not None:
             summary["withheld"].append({"store_id": store_id, "reason": breaker})
             logger.error(
@@ -899,15 +898,22 @@ async def run_store_lifecycle_reconciliation_tick() -> Dict[str, Any]:
     # Emit it on EVERY tick, including the boring ones: "ran and did nothing" is
     # the observation that distinguishes healthy from dead.
     sweep = summary.get("status_sweep") or {}
+    # `probe_error` is in this line because leaving it out is how the probe half
+    # went dead while the tick still printed as healthy: a failed due-store query
+    # yields examined=0 probed=0, byte-identical to a quiet, correct tick. The
+    # half that broke has to be visible in the line that claims success — this
+    # line IS the inertness detector, so it must not be able to hide inertness.
     logger.info(
         "store_lifecycle: tick complete examined=%d probed=%d outcomes=%s disconnected=%d "
-        "withheld=%d merchants_examined=%s merchants_changed=%s",
+        "withheld=%d probe_error=%s merchants_examined=%s merchants_changed=%s sweep_error=%s",
         summary["examined"],
         summary["probed"],
         summary["outcomes"],
         len(summary["disconnected"]),
         len(summary["withheld"]),
+        summary.get("error"),
         sweep.get("examined"),
         sweep.get("changed"),
+        sweep.get("error"),
     )
     return summary
