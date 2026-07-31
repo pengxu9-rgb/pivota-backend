@@ -52,7 +52,13 @@ async def _ensure_schema() -> None:
     """
     from sqlalchemy import create_engine
 
-    from db.catalog import catalog_merchants, catalog_offers, catalog_products, catalog_skus
+    from db.catalog import (
+        catalog_merchants,
+        catalog_offers,
+        catalog_products,
+        catalog_quote_snapshots,
+        catalog_skus,
+    )
     from db.database import DATABASE_URL, metadata
 
     sync_url = DATABASE_URL.replace("sqlite+aiosqlite://", "sqlite://").replace(
@@ -62,7 +68,15 @@ async def _ensure_schema() -> None:
     try:
         metadata.create_all(
             engine,
-            tables=[catalog_merchants, catalog_products, catalog_skus, catalog_offers],
+            # catalog_quote_snapshots: preview_pivot_quote persists one, so the
+            # END-TO-END tests need it. Same source as the rest — the model.
+            tables=[
+                catalog_merchants,
+                catalog_products,
+                catalog_skus,
+                catalog_offers,
+                catalog_quote_snapshots,
+            ],
             checkfirst=True,
         )
     finally:
@@ -613,8 +627,150 @@ async def test_quote_falls_through_to_a_surviving_offer_not_to_none():
 # ---------------------------------------------------------------------------
 
 
+@pytest.mark.parametrize(
+    "leg",
+    ["owner_status", "owner_indexable", "product_suppressed_at",
+     "product_suppression_reason", "sku_suppressed_at", "sku_suppression_reason"],
+)
 @pytest.mark.asyncio
-async def test_raw_source_ids_are_refused_when_the_catalog_row_is_withdrawn():
+async def test_each_leg_alone_marks_raw_source_ids_withdrawn(leg: str):
+    """One leg at a time. The first version fired only `p.suppression_reason`,
+    so 12 of 19 helper mutants survived — including an `= 'active'` allow-list
+    on the owner leg, which would refuse to quote every `observed` merchant
+    (346 of 483) through a path no test watched."""
+    owner = f"{_PREFIX}_owner"
+    await _merchant(owner, status="inactive" if leg == "owner_status" else "active",
+                    indexable=leg != "owner_indexable")
+    await _seed(
+        f"{_PREFIX}_p1",
+        owner=owner,
+        seller=owner,
+        product_suppressed_at="2026-07-31 00:00:00" if leg == "product_suppressed_at" else None,
+        product_suppression_reason="d2_tier3_judge" if leg == "product_suppression_reason" else None,
+        sku_suppressed_at="2026-07-31 00:00:00" if leg == "sku_suppressed_at" else None,
+        sku_suppression_reason="merge_loser" if leg == "sku_suppression_reason" else None,
+    )
+
+    assert await svc._source_ids_are_withdrawn(
+        owner, f"src-{_PREFIX}_p1", f"var-{_PREFIX}_p1"
+    ) is True, f"leg={leg} did not mark the ids withdrawn"
+
+
+@pytest.mark.parametrize("status", ["active", "observed", "OBSERVED"])
+@pytest.mark.asyncio
+async def test_non_inactive_owners_are_not_marked_withdrawn(status: str):
+    await _merchant(f"{_PREFIX}_owner", status=status)
+    await _seed(f"{_PREFIX}_p1", owner=f"{_PREFIX}_owner", seller=f"{_PREFIX}_owner")
+
+    assert await svc._source_ids_are_withdrawn(
+        f"{_PREFIX}_owner", f"src-{_PREFIX}_p1", f"var-{_PREFIX}_p1"
+    ) is False
+
+
+@pytest.mark.parametrize("status", ["inactive", "INACTIVE", "Inactive"])
+@pytest.mark.asyncio
+async def test_inactive_owner_matching_is_case_insensitive(status: str):
+    await _merchant(f"{_PREFIX}_owner", status=status)
+    await _seed(f"{_PREFIX}_p1", owner=f"{_PREFIX}_owner", seller=f"{_PREFIX}_owner")
+
+    assert await svc._source_ids_are_withdrawn(
+        f"{_PREFIX}_owner", f"src-{_PREFIX}_p1", f"var-{_PREFIX}_p1"
+    ) is True
+
+
+@pytest.mark.asyncio
+async def test_raw_source_ids_for_an_UNINDEXED_item_are_allowed():
+    """The over-filtering case, and the reason the rule is 'all known rows are
+    gated' rather than 'a clean row exists'. This branch exists so a caller can
+    quote a variant the index has never ingested."""
+    assert await svc._source_ids_are_withdrawn(
+        f"{_PREFIX}_owner", "never-ingested-product", "never-ingested-variant"
+    ) is False
+
+
+@pytest.mark.parametrize("missing", ["merchant", "product", "variant"])
+@pytest.mark.asyncio
+async def test_blank_ids_are_never_treated_as_withdrawn(missing: str):
+    assert await svc._source_ids_are_withdrawn(
+        "" if missing == "merchant" else f"{_PREFIX}_owner",
+        "" if missing == "product" else "p",
+        "" if missing == "variant" else "v",
+    ) is False
+
+
+@pytest.mark.asyncio
+async def test_a_lookup_failure_propagates_rather_than_allowing_the_quote(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    """Fail CLOSED. Returning False on error conflates "no row" with "could not
+    look", and is inconsistent with every other branch of preview_pivot_quote,
+    where the same DB failure propagates. The asymmetry was exploitable: one
+    induced lookup failure — and the Railway proxy drops queries under load —
+    turned a hard refusal into a successful quote for withdrawn content."""
+    async def boom(*a, **k):
+        raise RuntimeError("proxy dropped the query")
+
+    monkeypatch.setattr(database, "fetch_one", boom)
+
+    with pytest.raises(RuntimeError):
+        await svc._source_ids_are_withdrawn(f"{_PREFIX}_owner", "p", "v")
+
+
+@pytest.mark.asyncio
+async def test_a_same_platform_sibling_row_is_reachable_and_allowed():
+    """Two rows sharing source ids under ONE merchant on ONE platform, via two
+    product_keys. An earlier version of this test used two platforms and said
+    the same-platform shape was forbidden by a 3-column unique index — wrong:
+    `catalog_skus` is unique on the 4-column
+    (merchant_id, platform, product_key, source_variant_id), so this IS
+    reachable, and it is the shape that actually exercises `serving > 0`."""
+    await _merchant(f"{_PREFIX}_owner")
+    await _seed(
+        f"{_PREFIX}_dead",
+        owner=f"{_PREFIX}_owner",
+        seller=f"{_PREFIX}_owner",
+        product_suppression_reason="d2_tier3_judge",
+    )
+    await _seed(f"{_PREFIX}_live", owner=f"{_PREFIX}_owner", seller=f"{_PREFIX}_owner")
+    for key in (f"{_PREFIX}_dead", f"{_PREFIX}_live"):
+        await database.execute(
+            "UPDATE catalog_products SET source_product_id = :spi WHERE product_key = :k",
+            {"spi": f"shared-src-{key[-4:]}", "k": key},
+        )
+        await database.execute(
+            "UPDATE catalog_skus SET source_variant_id = 'shared-var' WHERE product_key = :k",
+            {"k": key},
+        )
+    # Same variant id under the same merchant+platform, two product_keys — the
+    # products keep distinct source_product_ids because THAT index is 3-column.
+    assert await svc._source_ids_are_withdrawn(
+        f"{_PREFIX}_owner", f"shared-src-{f'{_PREFIX}_dead'[-4:]}", "shared-var"
+    ) is True
+
+
+# ---------------------------------------------------------------------------
+# END TO END — `preview_pivot_quote` itself.
+#
+# Every test above calls the helper. Deleting the guard from preview_pivot_quote
+# left ALL of them green: the suite verified a helper, not the bypass. That is
+# this arc's own "test the surface that RUNS, not a copy of it" — in the commit
+# that cited the lesson. These two drive the real function.
+# ---------------------------------------------------------------------------
+
+
+async def _quote(product_id: str, variant_id: str, merchant_id: str) -> Any:
+    from models.catalog import PivotQuoteItem, PivotQuoteRequest
+
+    return await svc.preview_pivot_quote(
+        PivotQuoteRequest(
+            merchant_id=merchant_id,
+            items=[PivotQuoteItem(product_id=product_id, variant_id=variant_id, quantity=1)],
+        )
+    )
+
+
+@pytest.mark.asyncio
+async def test_preview_quote_refuses_withdrawn_raw_source_ids():
     await _merchant(f"{_PREFIX}_owner")
     await _seed(
         f"{_PREFIX}_p1",
@@ -623,71 +779,42 @@ async def test_raw_source_ids_are_refused_when_the_catalog_row_is_withdrawn():
         product_suppression_reason="step5_campaign_clone_dup",
     )
 
-    assert await svc._source_ids_are_withdrawn(
-        f"{_PREFIX}_owner", f"src-{_PREFIX}_p1", f"var-{_PREFIX}_p1"
-    ) is True
+    resp = await _quote(f"src-{_PREFIX}_p1", f"var-{_PREFIX}_p1", f"{_PREFIX}_owner")
+
+    assert (resp.quote_payload or {}).get("error") == "NO_RESOLVABLE_ITEMS"
 
 
 @pytest.mark.asyncio
-async def test_raw_source_ids_are_allowed_when_the_catalog_row_is_healthy():
+async def test_preview_quote_reaches_the_quote_service_for_healthy_raw_ids(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    """The positive control: the guard must not refuse a legitimate raw-id
+    quote. Asserts the item actually reaches QuoteService, not merely that the
+    response lacks an error."""
     await _merchant(f"{_PREFIX}_owner")
     await _seed(f"{_PREFIX}_p1", owner=f"{_PREFIX}_owner", seller=f"{_PREFIX}_owner")
 
-    assert await svc._source_ids_are_withdrawn(
-        f"{_PREFIX}_owner", f"src-{_PREFIX}_p1", f"var-{_PREFIX}_p1"
-    ) is False
+    seen: Dict[str, Any] = {}
 
+    async def fake_preview(**kwargs):
+        seen.update(kwargs)
+        return {"pricing": {}, "quote": {}}
 
-@pytest.mark.asyncio
-async def test_raw_source_ids_for_an_UNINDEXED_item_are_allowed():
-    """The over-filtering case, and the reason the rule is 'all known rows are
-    gated' rather than 'a clean row exists'. This branch exists so a caller can
-    quote a variant the index has never ingested; requiring a catalog row would
-    break exactly what it is for."""
-    assert await svc._source_ids_are_withdrawn(
-        f"{_PREFIX}_owner", "never-ingested-product", "never-ingested-variant"
-    ) is False
+    from services.quote_service import QuoteService
 
+    monkeypatch.setattr(QuoteService, "preview_quote", staticmethod(fake_preview))
 
-@pytest.mark.asyncio
-async def test_raw_source_ids_with_a_clean_sibling_row_are_allowed():
-    """One withdrawn row and one healthy row for the same source ids: the ids
-    still resolve to something we serve, so the quote proceeds.
+    # Stub the snapshot write. It is unrelated to this assertion AND currently
+    # broken independently of this PR: the upsert passes `updated_at`, a column
+    # `catalog_quote_snapshots` has in neither the model (db/catalog.py:489) nor
+    # PROD (verified 2026-08-01 — the table has created_at and no updated_at),
+    # so it raises `Unconsumed column names: updated_at` on any dialect. Left
+    # for its own fix rather than smuggled into this PR.
+    async def fake_snapshot(*a, **k):
+        return None
 
-    The sibling must sit on a DIFFERENT platform — `catalog_products` has a
-    unique index on (merchant_id, platform, source_product_id), so two rows
-    sharing source ids under one merchant is only reachable across platforms.
-    A first version of this test ignored that and hit the constraint; the
-    lookup is platform-agnostic by design, so the cross-platform shape is the
-    real one anyway."""
-    await _merchant(f"{_PREFIX}_owner")
-    await _seed(
-        f"{_PREFIX}_dead",
-        owner=f"{_PREFIX}_owner",
-        seller=f"{_PREFIX}_owner",
-        product_suppression_reason="d2_tier3_judge",
-    )
-    await database.execute(
-        """
-        UPDATE catalog_products SET source_product_id = :spi, platform = 'wix'
-        WHERE product_key = :k
-        """,
-        {"spi": "shared-src", "k": f"{_PREFIX}_dead"},
-    )
-    await database.execute(
-        "UPDATE catalog_skus SET source_variant_id = :v WHERE product_key = :k",
-        {"v": "shared-var", "k": f"{_PREFIX}_dead"},
-    )
-    await _seed(f"{_PREFIX}_live", owner=f"{_PREFIX}_owner", seller=f"{_PREFIX}_owner")
-    await database.execute(
-        "UPDATE catalog_products SET source_product_id = :spi WHERE product_key = :k",
-        {"spi": "shared-src", "k": f"{_PREFIX}_live"},
-    )
-    await database.execute(
-        "UPDATE catalog_skus SET source_variant_id = :v WHERE product_key = :k",
-        {"v": "shared-var", "k": f"{_PREFIX}_live"},
-    )
+    monkeypatch.setattr(svc, "store_catalog_quote_snapshot", fake_snapshot)
 
-    assert await svc._source_ids_are_withdrawn(
-        f"{_PREFIX}_owner", "shared-src", "shared-var"
-    ) is False
+    await _quote(f"src-{_PREFIX}_p1", f"var-{_PREFIX}_p1", f"{_PREFIX}_owner")
+
+    assert [i["product_id"] for i in seen.get("items", [])] == [f"src-{_PREFIX}_p1"]

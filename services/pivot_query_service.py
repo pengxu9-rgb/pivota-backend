@@ -2556,18 +2556,43 @@ async def _source_ids_are_withdrawn(
     ids EXISTS and every one of them is gated". No row at all => not our
     content, not our call, allow.
 
+    TWO KNOWN GAPS, both unreachable on prod today and recorded so the next
+    reader does not mistake them for intent:
+      * the lookup is scoped to rows the REQUESTER owns (`p.merchant_id`), so a
+        withdrawn row owned by someone else but sold by the requester is not
+        found. Every such row on prod belongs to external_seed / agent_seed::*,
+        which have no connected store to quote against.
+      * there is no offer-seller leg — this branch carries no offer. 0 of the
+        2,045 gated offers on prod are gated by the seller leg alone.
+    Both rest on an assumption nothing in this file enforces: that
+    `request.merchant_id` is a connected store.
+
     Returns True only when we hold rows for these ids and all of them are
-    withdrawn. Never raises: a lookup failure must not fail the quote closed on
-    a path that legitimately serves un-indexed items.
+    withdrawn.
+
+    A LOOKUP FAILURE PROPAGATES — it is not swallowed. An earlier version
+    returned False on error, reasoning that a failed lookup must not fail the
+    quote closed. That was wrong on two counts. It conflates "no row" (allow,
+    correct) with "could not look" (unknown, not the same thing); and it is
+    inconsistent with every OTHER branch of preview_pivot_quote, where the same
+    DB failure propagates and the request fails closed. The asymmetry was
+    exploitable: one induced lookup failure — and the Railway proxy drops
+    queries under load — turned a hard refusal into a successful quote for
+    withdrawn content, on the sell path.
     """
     mid = (merchant_id or "").strip()
     pid = (product_id or "").strip()
     vid = (variant_id or "").strip()
+    # Short-circuit only — with blank ids the query below matches nothing and
+    # returns False anyway, so a mutation that deletes this guard survives the
+    # suite. That is correct rather than a coverage gap: the contract ("blank
+    # ids are never withdrawn") holds either way, and manufacturing a row with
+    # an empty source_product_id to make the guard observable would be pinning
+    # a shape no writer produces.
     if not (mid and pid and vid):
         return False
-    try:
-        row = await database.fetch_one(
-            """
+    row = await database.fetch_one(
+        """
             SELECT
                 count(*) AS total,
                 count(*) FILTER (
@@ -2582,16 +2607,9 @@ async def _source_ids_are_withdrawn(
             WHERE p.merchant_id = :merchant_id
               AND p.source_product_id = :product_id
               AND s.source_variant_id = :variant_id
-            """,
-            {"merchant_id": mid, "product_id": pid, "variant_id": vid},
-        )
-    except Exception as e:  # noqa: BLE001
-        logger.warning(
-            "pivot quote: source-id withdrawal check failed merchant=%s err=%s",
-            mid,
-            str(e)[:200],
-        )
-        return False
+        """,
+        {"merchant_id": mid, "product_id": pid, "variant_id": vid},
+    )
     if row is None:
         return False
     data = dict(row)
