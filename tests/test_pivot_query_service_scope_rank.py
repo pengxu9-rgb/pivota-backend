@@ -303,7 +303,18 @@ def test_citable_lane_carries_all_three_source_gates():
     )
     for frag in ("{merchant_status_clause}", "{suppression_clause}", "{indexable_clause}"):
         assert frag in src, f"citable lane SQL must interpolate {frag}"
-    idx = src.index("merchant_status_clause = \"\"")
-    assert "if not merchant_id" in src[idx:idx + 300], (
-        "all three citable-lane gates must be merchant_id-conditional"
-    )
+    # Each gate's empty-init must sit inside the merchant_id guard window.
+    # Checking all three (not just the first) matters: review of #1650
+    # mutation-proved that hoisting suppression_clause out of the guard —
+    # hiding a merchant's own withdrawn rows from their operator dashboard —
+    # passed a merchant_status-only window check.
+    for init in (
+        'merchant_status_clause = ""',
+        'suppression_clause = ""',
+        'indexable_clause = ""',
+    ):
+        idx = src.index(init)
+        assert "if not merchant_id" in src[idx:idx + 300], (
+            f"{init.split(' ')[0]} must be assigned inside an `if not merchant_id` "
+            "branch so merchant-scoped queries keep seeing the merchant's own rows"
+        )
