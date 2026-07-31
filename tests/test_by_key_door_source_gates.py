@@ -485,40 +485,209 @@ async def test_a_sku_with_one_gated_seller_keeps_the_other_offer():
     assert await _by_sku(f"{_PREFIX}_p1::sku") == [f"{_PREFIX}_p1::offer"]
 
 
+# ---------------------------------------------------------------------------
+# The QUOTE door — `POST /v1/pivot/quote`, the transactional one.
+#
+# The first version of these tests was vacuous: 39 of 48 mutants survived, and
+# deleting the ENTIRE offer-seller leg from all three fetchers left every test
+# green. Cause: one test fired THREE legs at once (inactive owner AND product
+# suppression), so no single-leg deletion could change the outcome — the fourth
+# instance in this arc of "the fixture makes several gates fire, so none of them
+# is attributable". Each case below fires EXACTLY ONE leg, on ALL THREE
+# fetchers.
+# ---------------------------------------------------------------------------
+
+
+_QUOTE_FETCHERS = ("_fetch_offer_row", "_fetch_default_offer_for_sku",
+                   "_fetch_default_offer_for_product")
+
+
+async def _quote_lookups(key: str) -> Dict[str, Any]:
+    """All three quote fetchers for one seeded key, by name."""
+    return {
+        "_fetch_offer_row": await svc._fetch_offer_row(f"{key}::offer"),
+        "_fetch_default_offer_for_sku": await svc._fetch_default_offer_for_sku(f"{key}::sku"),
+        "_fetch_default_offer_for_product": await svc._fetch_default_offer_for_product(key),
+    }
+
+
+@pytest.mark.parametrize(
+    "leg",
+    ["owner_status", "owner_indexable", "seller_status", "seller_indexable",
+     "product_suppressed_at", "product_suppression_reason",
+     "sku_suppressed_at", "sku_suppression_reason"],
+)
 @pytest.mark.asyncio
-async def test_the_quote_door_refuses_what_the_read_doors_refuse():
-    """`POST /v1/pivot/quote` is a by-key door too, and the transactional one.
-    Review proved by construction that a product gated on all three read routes
-    still produced a real merchant quote through these three fetchers."""
-    await _merchant(f"{_PREFIX}_owner", status="inactive")
-    await _merchant(f"{_PREFIX}_seller")
+async def test_each_gate_leg_alone_closes_all_three_quote_fetchers(leg: str):
+    """One leg at a time. Deleting any single leg from any single fetcher must
+    fail here — that is the property the previous version did not have."""
+    owner, seller = f"{_PREFIX}_owner", f"{_PREFIX}_seller"
+    await _merchant(owner, status="inactive" if leg == "owner_status" else "active",
+                    indexable=leg != "owner_indexable")
+    await _merchant(seller, status="inactive" if leg == "seller_status" else "active",
+                    indexable=leg != "seller_indexable")
     await _seed(
         f"{_PREFIX}_p1",
-        owner=f"{_PREFIX}_owner",
-        seller=f"{_PREFIX}_seller",
-        product_suppression_reason="step5_campaign_clone_dup",
+        owner=owner,
+        seller=seller,
+        product_suppressed_at="2026-07-31 00:00:00" if leg == "product_suppressed_at" else None,
+        product_suppression_reason="d2_tier3_judge" if leg == "product_suppression_reason" else None,
+        sku_suppressed_at="2026-07-31 00:00:00" if leg == "sku_suppressed_at" else None,
+        sku_suppression_reason="merge_loser" if leg == "sku_suppression_reason" else None,
     )
 
-    assert await svc._fetch_offer_row(f"{_PREFIX}_p1::offer") is None
-    assert await svc._fetch_default_offer_for_sku(f"{_PREFIX}_p1::sku") is None
-    assert await svc._fetch_default_offer_for_product(f"{_PREFIX}_p1") is None
+    results = await _quote_lookups(f"{_PREFIX}_p1")
+    for name in _QUOTE_FETCHERS:
+        assert results[name] is None, f"{name} still quotes with leg={leg} firing"
 
 
 @pytest.mark.asyncio
-async def test_the_quote_door_still_serves_healthy_keys():
+async def test_all_three_quote_fetchers_serve_a_healthy_key():
+    """The positive control the one-leg cases are measured against."""
     await _merchant(f"{_PREFIX}_owner")
     await _seed(f"{_PREFIX}_p1", owner=f"{_PREFIX}_owner", seller=f"{_PREFIX}_owner")
 
-    assert (await svc._fetch_offer_row(f"{_PREFIX}_p1::offer")) is not None
-    assert (await svc._fetch_default_offer_for_sku(f"{_PREFIX}_p1::sku")) is not None
-    assert (await svc._fetch_default_offer_for_product(f"{_PREFIX}_p1")) is not None
+    results = await _quote_lookups(f"{_PREFIX}_p1")
+    for name in _QUOTE_FETCHERS:
+        assert results[name] is not None, f"{name} refused a healthy key"
+
+
+@pytest.mark.parametrize("status", ["observed", "OBSERVED", "active"])
+@pytest.mark.asyncio
+async def test_quote_fetchers_keep_non_inactive_sellers(status: str):
+    """`observed` is 346 of 483 prod merchants; an `= 'active'` allow-list on
+    the SELL path would refuse to quote most of the corpus."""
+    await _merchant(f"{_PREFIX}_owner", status=status)
+    await _merchant(f"{_PREFIX}_seller", status=status)
+    await _seed(f"{_PREFIX}_p1", owner=f"{_PREFIX}_owner", seller=f"{_PREFIX}_seller")
+
+    results = await _quote_lookups(f"{_PREFIX}_p1")
+    for name in _QUOTE_FETCHERS:
+        assert results[name] is not None, f"{name} refused a {status} merchant"
 
 
 @pytest.mark.asyncio
-async def test_the_quote_door_keeps_seedless_sellers():
-    """The NULL-keeping COALESCE matters most on the transactional door: a bare
-    `= 'active'` here would refuse to quote every external_seed offer."""
+async def test_all_three_quote_fetchers_keep_seedless_sellers():
+    """NULL-keeping COALESCE matters most here: a bare `= 'active'` on either
+    merchant alias would refuse to quote every external_seed offer. The earlier
+    version of this test omitted _fetch_default_offer_for_sku, which is why all
+    four of its COALESCE mutants survived."""
     await _seed(f"{_PREFIX}_p1", owner=f"{_PREFIX}_noseed", seller=f"{_PREFIX}_noseller")
 
-    assert (await svc._fetch_offer_row(f"{_PREFIX}_p1::offer")) is not None
-    assert (await svc._fetch_default_offer_for_product(f"{_PREFIX}_p1")) is not None
+    results = await _quote_lookups(f"{_PREFIX}_p1")
+    for name in _QUOTE_FETCHERS:
+        assert results[name] is not None, f"{name} dropped a seedless seller"
+
+
+@pytest.mark.asyncio
+async def test_quote_falls_through_to_a_surviving_offer_not_to_none():
+    """`LIMIT 1` picks AFTER the predicate. A sku whose newest offer is from a
+    gated seller must quote the older surviving offer, not refuse — and the
+    caller silently gets a different seller at a different price, which is worth
+    pinning so a future change cannot turn it into a refusal unnoticed."""
+    await _merchant(f"{_PREFIX}_owner")
+    await _merchant(f"{_PREFIX}_dead", status="inactive")
+    await _seed(f"{_PREFIX}_p1", owner=f"{_PREFIX}_owner", seller=f"{_PREFIX}_owner")
+    await database.execute(
+        """
+        INSERT INTO catalog_offers
+            (offer_id, sku_key, product_key, merchant_id, catalog_track, truth_tier,
+             readiness_tier, offer_mode, channel, availability, currency, list_price,
+             suppressed_at, created_at, updated_at)
+        VALUES (:o, :sk, :k, :m, 'internal_merchant', 'primary', 'commerce_ready',
+                'merchant_checkout', 'default', 'in_stock', 'USD', 99.99, NULL,
+                CURRENT_TIMESTAMP, '2099-01-01 00:00:00')
+        """,
+        {"o": f"{_PREFIX}_p1::offer_dead", "sk": f"{_PREFIX}_p1::sku",
+         "k": f"{_PREFIX}_p1", "m": f"{_PREFIX}_dead"},
+    )
+
+    row = await svc._fetch_default_offer_for_sku(f"{_PREFIX}_p1::sku")
+    assert row is not None and row["offer_id"] == f"{_PREFIX}_p1::offer"
+
+
+# ---------------------------------------------------------------------------
+# The raw-source-id branch of preview_pivot_quote — a full bypass of everything
+# above until this PR: it fabricates an item from caller-supplied ids with no
+# DB lookup at all.
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_raw_source_ids_are_refused_when_the_catalog_row_is_withdrawn():
+    await _merchant(f"{_PREFIX}_owner")
+    await _seed(
+        f"{_PREFIX}_p1",
+        owner=f"{_PREFIX}_owner",
+        seller=f"{_PREFIX}_owner",
+        product_suppression_reason="step5_campaign_clone_dup",
+    )
+
+    assert await svc._source_ids_are_withdrawn(
+        f"{_PREFIX}_owner", f"src-{_PREFIX}_p1", f"var-{_PREFIX}_p1"
+    ) is True
+
+
+@pytest.mark.asyncio
+async def test_raw_source_ids_are_allowed_when_the_catalog_row_is_healthy():
+    await _merchant(f"{_PREFIX}_owner")
+    await _seed(f"{_PREFIX}_p1", owner=f"{_PREFIX}_owner", seller=f"{_PREFIX}_owner")
+
+    assert await svc._source_ids_are_withdrawn(
+        f"{_PREFIX}_owner", f"src-{_PREFIX}_p1", f"var-{_PREFIX}_p1"
+    ) is False
+
+
+@pytest.mark.asyncio
+async def test_raw_source_ids_for_an_UNINDEXED_item_are_allowed():
+    """The over-filtering case, and the reason the rule is 'all known rows are
+    gated' rather than 'a clean row exists'. This branch exists so a caller can
+    quote a variant the index has never ingested; requiring a catalog row would
+    break exactly what it is for."""
+    assert await svc._source_ids_are_withdrawn(
+        f"{_PREFIX}_owner", "never-ingested-product", "never-ingested-variant"
+    ) is False
+
+
+@pytest.mark.asyncio
+async def test_raw_source_ids_with_a_clean_sibling_row_are_allowed():
+    """One withdrawn row and one healthy row for the same source ids: the ids
+    still resolve to something we serve, so the quote proceeds.
+
+    The sibling must sit on a DIFFERENT platform — `catalog_products` has a
+    unique index on (merchant_id, platform, source_product_id), so two rows
+    sharing source ids under one merchant is only reachable across platforms.
+    A first version of this test ignored that and hit the constraint; the
+    lookup is platform-agnostic by design, so the cross-platform shape is the
+    real one anyway."""
+    await _merchant(f"{_PREFIX}_owner")
+    await _seed(
+        f"{_PREFIX}_dead",
+        owner=f"{_PREFIX}_owner",
+        seller=f"{_PREFIX}_owner",
+        product_suppression_reason="d2_tier3_judge",
+    )
+    await database.execute(
+        """
+        UPDATE catalog_products SET source_product_id = :spi, platform = 'wix'
+        WHERE product_key = :k
+        """,
+        {"spi": "shared-src", "k": f"{_PREFIX}_dead"},
+    )
+    await database.execute(
+        "UPDATE catalog_skus SET source_variant_id = :v WHERE product_key = :k",
+        {"v": "shared-var", "k": f"{_PREFIX}_dead"},
+    )
+    await _seed(f"{_PREFIX}_live", owner=f"{_PREFIX}_owner", seller=f"{_PREFIX}_owner")
+    await database.execute(
+        "UPDATE catalog_products SET source_product_id = :spi WHERE product_key = :k",
+        {"spi": "shared-src", "k": f"{_PREFIX}_live"},
+    )
+    await database.execute(
+        "UPDATE catalog_skus SET source_variant_id = :v WHERE product_key = :k",
+        {"v": "shared-var", "k": f"{_PREFIX}_live"},
+    )
+
+    assert await svc._source_ids_are_withdrawn(
+        f"{_PREFIX}_owner", "shared-src", "shared-var"
+    ) is False

@@ -2533,6 +2533,73 @@ async def _fetch_default_offer_for_product(product_key: str) -> Optional[Dict[st
     return _row_dict(row) if row else None
 
 
+async def _source_ids_are_withdrawn(
+    merchant_id: Optional[str], product_id: Optional[str], variant_id: Optional[str]
+) -> bool:
+    """Does a catalog row exist for these RAW PLATFORM IDs, and is it withdrawn?
+
+    `preview_pivot_quote` has a fourth branch that takes `product_id` +
+    `variant_id` (source ids) and fabricates an item with NO DB lookup at all.
+    That branch is legitimate — it exists so a caller can quote a variant the
+    index has never ingested, priced against the merchant's own store — but it
+    was also a complete bypass of every gate this PR adds: review confirmed by
+    construction that a product refused by all three read doors AND all three
+    quote fetchers still quoted successfully through it. Both source ids are
+    returned by `/v1/pivot/query`, `/products/{key}`, `/skus/{key}` and
+    `/offers/resolve` (ProductNode.source_product_id, SkuNode.source_variant_id),
+    so any caller who saw the product before it was withdrawn holds exactly what
+    the bypass needs.
+
+    The rule is deliberately narrow, because the obvious fix over-filters: NOT
+    "refuse unless a clean catalog row exists" — that would break the un-indexed
+    case the branch exists for — but "refuse only when a catalog row for these
+    ids EXISTS and every one of them is gated". No row at all => not our
+    content, not our call, allow.
+
+    Returns True only when we hold rows for these ids and all of them are
+    withdrawn. Never raises: a lookup failure must not fail the quote closed on
+    a path that legitimately serves un-indexed items.
+    """
+    mid = (merchant_id or "").strip()
+    pid = (product_id or "").strip()
+    vid = (variant_id or "").strip()
+    if not (mid and pid and vid):
+        return False
+    try:
+        row = await database.fetch_one(
+            """
+            SELECT
+                count(*) AS total,
+                count(*) FILTER (
+                    WHERE p.suppressed_at IS NULL AND p.suppression_reason IS NULL
+                      AND s.suppressed_at IS NULL AND s.suppression_reason IS NULL
+                      AND lower(COALESCE(m.status, 'active')) <> 'inactive'
+                      AND COALESCE(m.indexable, TRUE) IS TRUE
+                ) AS serving
+            FROM catalog_products p
+            JOIN catalog_skus s ON s.product_key = p.product_key
+            LEFT JOIN catalog_merchants m ON m.merchant_id = p.merchant_id
+            WHERE p.merchant_id = :merchant_id
+              AND p.source_product_id = :product_id
+              AND s.source_variant_id = :variant_id
+            """,
+            {"merchant_id": mid, "product_id": pid, "variant_id": vid},
+        )
+    except Exception as e:  # noqa: BLE001
+        logger.warning(
+            "pivot quote: source-id withdrawal check failed merchant=%s err=%s",
+            mid,
+            str(e)[:200],
+        )
+        return False
+    if row is None:
+        return False
+    data = dict(row)
+    total = int(data.get("total") or 0)
+    serving = int(data.get("serving") or 0)
+    return total > 0 and serving == 0
+
+
 async def preview_pivot_quote(request: PivotQuoteRequest) -> PivotQuoteResponse:
     resolved_rows: List[Dict[str, Any]] = []
     quote_items: List[Dict[str, Any]] = []
@@ -2546,6 +2613,13 @@ async def preview_pivot_quote(request: PivotQuoteRequest) -> PivotQuoteResponse:
         elif item.product_key:
             row = await _fetch_default_offer_for_product(item.product_key)
         elif item.product_id and item.variant_id:
+            # Raw-source-id branch: no key, no DB row — see
+            # _source_ids_are_withdrawn for why this needs its own check and why
+            # the check is "all known rows are gated", not "a clean row exists".
+            if await _source_ids_are_withdrawn(
+                request.merchant_id, item.product_id, item.variant_id
+            ):
+                continue
             row = {
                 "offer_id": None,
                 "sku_key": item.sku_key,
