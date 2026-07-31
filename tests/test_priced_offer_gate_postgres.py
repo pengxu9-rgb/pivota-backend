@@ -51,18 +51,29 @@ pytestmark = pytest.mark.skipif(
 # Tables the trust join reaches that db.catalog does not own. Column lists are
 # the minimum the query names, not the real schema.
 _LIGHTWEIGHT_DDL = """
-CREATE TABLE IF NOT EXISTS external_product_seeds (
-  id text, external_product_id text, attached_product_key text, status text,
-  domain text, seed_kind text, updated_at timestamptz, created_at timestamptz,
-  merchant_id text, source text, product_key text, source_product_id text,
-  seed_data jsonb, title text
-);
-CREATE TABLE IF NOT EXISTS index_pipeline_state (
-  content_key text PRIMARY KEY, serving_eligible boolean, index_eligible boolean,
-  pipeline_stage text, blocker_code text, blocker_detail text,
-  content_quality_score double precision, quality_scored_at timestamptz,
-  last_extracted_at timestamptz
-);
+CREATE TABLE IF NOT EXISTS external_product_seeds (id text);
+ALTER TABLE external_product_seeds ADD COLUMN IF NOT EXISTS external_product_id text;
+ALTER TABLE external_product_seeds ADD COLUMN IF NOT EXISTS attached_product_key text;
+ALTER TABLE external_product_seeds ADD COLUMN IF NOT EXISTS status text;
+ALTER TABLE external_product_seeds ADD COLUMN IF NOT EXISTS seed_kind text;
+ALTER TABLE external_product_seeds ADD COLUMN IF NOT EXISTS merchant_id text;
+ALTER TABLE external_product_seeds ADD COLUMN IF NOT EXISTS source text;
+ALTER TABLE external_product_seeds ADD COLUMN IF NOT EXISTS product_key text;
+ALTER TABLE external_product_seeds ADD COLUMN IF NOT EXISTS source_product_id text;
+ALTER TABLE external_product_seeds ADD COLUMN IF NOT EXISTS domain text;
+ALTER TABLE external_product_seeds ADD COLUMN IF NOT EXISTS title text;
+ALTER TABLE external_product_seeds ADD COLUMN IF NOT EXISTS seed_data jsonb;
+ALTER TABLE external_product_seeds ADD COLUMN IF NOT EXISTS created_at timestamptz;
+ALTER TABLE external_product_seeds ADD COLUMN IF NOT EXISTS updated_at timestamptz;
+CREATE TABLE IF NOT EXISTS index_pipeline_state (content_key text PRIMARY KEY);
+ALTER TABLE index_pipeline_state ADD COLUMN IF NOT EXISTS serving_eligible boolean;
+ALTER TABLE index_pipeline_state ADD COLUMN IF NOT EXISTS index_eligible boolean;
+ALTER TABLE index_pipeline_state ADD COLUMN IF NOT EXISTS pipeline_stage text;
+ALTER TABLE index_pipeline_state ADD COLUMN IF NOT EXISTS blocker_code text;
+ALTER TABLE index_pipeline_state ADD COLUMN IF NOT EXISTS blocker_detail text;
+ALTER TABLE index_pipeline_state ADD COLUMN IF NOT EXISTS content_quality_score double precision;
+ALTER TABLE index_pipeline_state ADD COLUMN IF NOT EXISTS quality_scored_at timestamptz;
+ALTER TABLE index_pipeline_state ADD COLUMN IF NOT EXISTS last_extracted_at timestamptz;
 CREATE TABLE IF NOT EXISTS catalog_row_trust (
   subject_type text, subject_key text, serving_decision text,
   serving_reason_codes text[]
