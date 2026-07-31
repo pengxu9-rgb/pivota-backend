@@ -118,6 +118,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import pathlib
 import subprocess
 import os
 import sys
@@ -516,7 +517,28 @@ def post_probe(
 
 
 def run_baseline(args: argparse.Namespace, internal_key: str) -> Dict[str, Any]:
-    prompts = [p for p in PORTFOLIO if not args.tiers or p["tier"] in args.tiers]
+    # An alternate prompt set never MUTATES the portfolio -- it replaces the
+    # selection for this run only, so `run_aeo_probe.sh` (no args) keeps
+    # producing a number comparable to every prior run. Validated eagerly:
+    # an unknown anchor would otherwise KeyError deep in the request loop,
+    # after real LLM spend.
+    source = PORTFOLIO
+    # getattr, not args.prompts_file: run_baseline is called PROGRAMMATICALLY by
+    # tests (and could be by other tooling) with a hand-built args object that
+    # predates this flag. A bare attribute access turns "you did not pass the new
+    # optional flag" into an AttributeError for every existing caller.
+    prompts_file = getattr(args, "prompts_file", "") or ""
+    if prompts_file:
+        import json as _json
+        loaded = _json.loads(pathlib.Path(prompts_file).read_text())
+        source = loaded["prompts"] if isinstance(loaded, dict) else loaded
+        bad_anchor = sorted({p["anchor"] for p in source} - set(ANCHORS))
+        if bad_anchor:
+            raise SystemExit(f"unknown anchor(s) in {prompts_file}: {bad_anchor}")
+        bad_tier = sorted({p["tier"] for p in source} - set(TIER_ORDER))
+        if bad_tier:
+            raise SystemExit(f"unknown tier(s) in {prompts_file}: {bad_tier}")
+    prompts = [p for p in source if not args.tiers or p["tier"] in args.tiers]
     if not prompts:
         raise SystemExit("no prompts selected — check --tiers")
 
@@ -879,6 +901,10 @@ def parse_args(argv: List[str]) -> argparse.Namespace:
     ap.add_argument("--providers", default="gemini,chatgpt",
                     help="comma-separated: gemini,chatgpt (claude needs an "
                          "ANTHROPIC_API_KEY on the agent service)")
+    ap.add_argument("--prompts-file", default="",
+                    help="JSON file with an ALTERNATE prompt set: {\"prompts\":[{tier,anchor,query}]}. "
+                         "Omitted = the built-in PORTFOLIO, so the spine metric is unchanged by default. "
+                         "Anchors must already exist in ANCHORS; tiers must be known tiers.")
     ap.add_argument("--tiers", default="",
                     help="comma-separated subset of "
                          f"{','.join(TIER_ORDER)} (default: all)")

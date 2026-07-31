@@ -1,0 +1,131 @@
+{
+  "name": "analysis_prompt_set_v1",
+  "created": "2026-07-31",
+  "why": "Widen the analysis-shaped surface. The spine portfolio carries only 5 comparison + 5 ingredient_concern prompts; that produced a directional but n=1-per-tier signal (skinsort reproduced on comparison, skincarisma did not on ingredient_concern). 24 prompts over the SAME 8 anchors, no new anchors, so results stay comparable.",
+  "tiers_used": [
+    "comparison",
+    "ingredient_concern"
+  ],
+  "prompts": [
+    {
+      "tier": "comparison",
+      "anchor": "cosrx_snail96",
+      "query": "cosrx snail mucin essence vs beauty of joseon glow deep serum"
+    },
+    {
+      "tier": "comparison",
+      "anchor": "mixsoon_bean",
+      "query": "mixsoon bean essence vs sk-ii facial treatment essence"
+    },
+    {
+      "tier": "comparison",
+      "anchor": "anua_heartleaf_toner",
+      "query": "anua heartleaf toner vs round lab 1025 dokdo toner"
+    },
+    {
+      "tier": "comparison",
+      "anchor": "boj_relief_sun",
+      "query": "beauty of joseon relief sun vs skin1004 centella sunscreen"
+    },
+    {
+      "tier": "comparison",
+      "anchor": "cosrx_snail92_cream",
+      "query": "best alternative to cosrx snail 92 all in one cream"
+    },
+    {
+      "tier": "comparison",
+      "anchor": "cosrx_snail96",
+      "query": "cheaper dupe for cosrx advanced snail 96 mucin essence"
+    },
+    {
+      "tier": "comparison",
+      "anchor": "roundlab_dokdo_toner",
+      "query": "round lab 1025 dokdo toner vs isntree hyaluronic acid toner"
+    },
+    {
+      "tier": "comparison",
+      "anchor": "manyo_cleansing_oil",
+      "query": "manyo pure cleansing oil vs banila co clean it zero"
+    },
+    {
+      "tier": "comparison",
+      "anchor": "anua_niacinamide_txa",
+      "query": "anua niacinamide serum vs the ordinary alpha arbutin for dark spots"
+    },
+    {
+      "tier": "comparison",
+      "anchor": "mixsoon_bean",
+      "query": "mixsoon bean essence dupe korean"
+    },
+    {
+      "tier": "comparison",
+      "anchor": "boj_relief_sun",
+      "query": "is beauty of joseon relief sun better than round lab birch juice sunscreen"
+    },
+    {
+      "tier": "comparison",
+      "anchor": "anua_heartleaf_toner",
+      "query": "anua 77 heartleaf toner vs cosrx snail mucin for sensitive skin"
+    },
+    {
+      "tier": "ingredient_concern",
+      "anchor": "anua_niacinamide_txa",
+      "query": "korean serum with niacinamide and tranexamic acid for dark spots"
+    },
+    {
+      "tier": "ingredient_concern",
+      "anchor": "anua_heartleaf_toner",
+      "query": "houttuynia cordata heartleaf toner for facial redness and irritation"
+    },
+    {
+      "tier": "ingredient_concern",
+      "anchor": "mixsoon_bean",
+      "query": "fermented soybean essence for skin barrier repair"
+    },
+    {
+      "tier": "ingredient_concern",
+      "anchor": "boj_relief_sun",
+      "query": "spf 50 sunscreen with rice extract and probiotics for dry skin"
+    },
+    {
+      "tier": "ingredient_concern",
+      "anchor": "manyo_cleansing_oil",
+      "query": "korean cleansing oil safe for fungal acne malassezia"
+    },
+    {
+      "tier": "ingredient_concern",
+      "anchor": "cosrx_snail96",
+      "query": "is snail secretion filtrate comedogenic for acne prone skin"
+    },
+    {
+      "tier": "ingredient_concern",
+      "anchor": "roundlab_dokdo_toner",
+      "query": "fragrance free korean toner with no essential oils for sensitive skin"
+    },
+    {
+      "tier": "ingredient_concern",
+      "anchor": "cosrx_snail92_cream",
+      "query": "korean moisturizer without alcohol denat for dry sensitive skin"
+    },
+    {
+      "tier": "ingredient_concern",
+      "anchor": "anua_niacinamide_txa",
+      "query": "what percentage of niacinamide is effective for hyperpigmentation"
+    },
+    {
+      "tier": "ingredient_concern",
+      "anchor": "mixsoon_bean",
+      "query": "essence with minimal ingredient list for reactive skin"
+    },
+    {
+      "tier": "ingredient_concern",
+      "anchor": "boj_relief_sun",
+      "query": "chemical sunscreen filters safe for eczema prone facial skin"
+    },
+    {
+      "tier": "ingredient_concern",
+      "anchor": "manyo_cleansing_oil",
+      "query": "cleansing oil ingredients that do not clog pores"
+    }
+  ]
+}
