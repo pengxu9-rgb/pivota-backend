@@ -955,7 +955,9 @@ def test_every_store_activation_writer_stamps_connected_at():
 
 
 @pytest.mark.asyncio
-async def test_a_dead_probe_half_is_reported_not_disguised(monkeypatch: pytest.MonkeyPatch):
+async def test_a_dead_probe_half_is_reported_not_disguised(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+):
     """A broken due-store query yields examined=0 probed=0 — byte-identical to a
     quiet, correct tick. The summary line is this job's ONLY inertness detector,
     so it has to carry the error, or the detector reports health while the thing
@@ -971,10 +973,23 @@ async def test_a_dead_probe_half_is_reported_not_disguised(monkeypatch: pytest.M
 
     monkeypatch.setattr(svc, "_fetch_due_stores", broken_fetch)
 
-    summary = await svc.run_store_lifecycle_reconciliation_tick()
+    import logging
+
+    with caplog.at_level(logging.INFO, logger="services.store_lifecycle_service"):
+        summary = await svc.run_store_lifecycle_reconciliation_tick()
 
     assert summary["examined"] == 0
     assert summary["error"] == "RuntimeError", "the tick must RECORD which half died"
+
+    # ...and SAY so in the summary line. Nothing consumes the return value —
+    # APScheduler discards it — so this log line is the entire detector, and
+    # asserting on the dict alone would let it print health forever. (Mutation:
+    # dropping probe_error from the line left every other assertion green.)
+    completions = [
+        r.getMessage() for r in caplog.records if "tick complete" in r.getMessage()
+    ]
+    assert completions, "the tick must always emit its summary line"
+    assert "probe_error=RuntimeError" in completions[-1], completions[-1]
     # The other half still converges — a dead probe must not take the
     # write-through down with it.
     assert summary["status_sweep"]["changed"] == 1
