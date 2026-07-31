@@ -44,19 +44,28 @@ async def _connect_if_needed() -> bool:
 
 
 async def _ensure_schema() -> None:
+    # NULLABILITY MIRRORS PRODUCTION EXACTLY — main.py:1461 for merchant_stores,
+    # migration 058 for catalog_merchants. A laxer fixture schema is not a
+    # convenience, it's a mask: these tables are created by whichever test module
+    # gets there first in a full-suite run, so a fixture that drops a NOT NULL
+    # passes in isolation and fails the moment the real DDL wins the race. That
+    # is exactly how the first push went green locally and red in CI (20 failures,
+    # `NOT NULL constraint failed: merchant_stores.name`). Keep every NOT NULL,
+    # and have the seed helpers supply every one of them.
     ddl = [
         """
         CREATE TABLE IF NOT EXISTS merchant_stores (
-            store_id TEXT PRIMARY KEY,
-            merchant_id TEXT NOT NULL,
-            platform TEXT,
-            domain TEXT,
-            name TEXT,
+            store_id VARCHAR(50) PRIMARY KEY,
+            merchant_id VARCHAR(50) NOT NULL,
+            platform VARCHAR(50) NOT NULL,
+            name VARCHAR(255) NOT NULL,
+            domain VARCHAR(255),
             api_key TEXT,
-            status TEXT,
-            is_primary BOOLEAN DEFAULT FALSE,
+            status VARCHAR(50) DEFAULT 'connected',
             connected_at TIMESTAMP,
             last_sync TIMESTAMP,
+            product_count INTEGER DEFAULT 0,
+            is_primary BOOLEAN DEFAULT FALSE,
             upstream_probe_at TIMESTAMP,
             upstream_probe_status TEXT,
             upstream_probe_http_status INTEGER,
@@ -65,18 +74,31 @@ async def _ensure_schema() -> None:
         """,
         """
         CREATE TABLE IF NOT EXISTS catalog_merchants (
-            merchant_id TEXT PRIMARY KEY,
-            merchant_name TEXT,
-            primary_platform TEXT,
-            status TEXT NOT NULL DEFAULT 'active',
+            merchant_id VARCHAR(64) PRIMARY KEY,
+            merchant_name VARCHAR(255),
+            primary_platform VARCHAR(64),
+            status VARCHAR(32) NOT NULL DEFAULT 'active',
             indexable BOOLEAN DEFAULT TRUE,
-            created_at TIMESTAMP,
-            updated_at TIMESTAMP
+            created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+            updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP
         )
         """,
     ]
     for stmt in ddl:
         await database.execute(stmt)
+    # The probe columns are added by migration 190 / schema_guard in the real
+    # world; in a full-suite run another module may have created merchant_stores
+    # from the pre-190 DDL, so add them here the same way schema_guard does.
+    for column, coltype in (
+        ("upstream_probe_at", "TIMESTAMP"),
+        ("upstream_probe_status", "TEXT"),
+        ("upstream_probe_http_status", "INTEGER"),
+        ("upstream_probe_failures", "INTEGER NOT NULL DEFAULT 0"),
+    ):
+        try:
+            await database.execute(f"ALTER TABLE merchant_stores ADD COLUMN {column} {coltype}")
+        except Exception:
+            pass  # already present
 
 
 async def _reset() -> None:
@@ -112,15 +134,16 @@ async def _seed_store(
     await database.execute(
         """
         INSERT INTO merchant_stores
-            (store_id, merchant_id, platform, domain, api_key, status,
+            (store_id, merchant_id, platform, name, domain, api_key, status,
              upstream_probe_failures, connected_at, upstream_probe_at)
-        VALUES (:store_id, :merchant_id, :platform, :domain, :api_key, :status,
+        VALUES (:store_id, :merchant_id, :platform, :name, :domain, :api_key, :status,
                 :failures, :connected_at, :probe_at)
         """,
         {
             "store_id": store_id,
             "merchant_id": merchant_id,
             "platform": platform,
+            "name": f"Store {store_id}",
             "domain": domain,
             "api_key": '{"access_token": "shpat_test"}',
             "status": status,
