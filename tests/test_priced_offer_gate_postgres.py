@@ -81,9 +81,21 @@ CREATE TABLE IF NOT EXISTS catalog_row_trust (
 -- Additive + order-proof, per #1651: these gate modules SHARE ONE DATABASE and
 -- `CREATE TABLE IF NOT EXISTS` no-ops once any sibling has created the table, so
 -- a narrow declaration that happens to sort first starves every other module.
--- Create with the PK only, then widen. `canonical_sig_id` is deliberately NOT
--- NULL-constrained here. Prod (mig 181) declares it NOT NULL, but ADD COLUMN on
--- an already-populated shared table cannot, and the tests never insert a NULL.
+-- Create minimal, then widen.
+--
+-- product_quality_snapshot needs the additive form for a SECOND reason:
+-- test_dead_quality_component_canary_postgres DROPs and recreates it (it needs
+-- real rows, and the production NOT NULL identity columns get in its way). So
+-- this module cannot assume ANY shape — whatever it finds, it widens.
+CREATE TABLE IF NOT EXISTS product_quality_snapshot (id bigserial PRIMARY KEY);
+ALTER TABLE product_quality_snapshot ADD COLUMN IF NOT EXISTS merchant_id text;
+ALTER TABLE product_quality_snapshot ADD COLUMN IF NOT EXISTS platform text;
+ALTER TABLE product_quality_snapshot ADD COLUMN IF NOT EXISTS platform_product_id text;
+ALTER TABLE product_quality_snapshot ADD COLUMN IF NOT EXISTS content_quality_score double precision;
+ALTER TABLE product_quality_snapshot ADD COLUMN IF NOT EXISTS snapshot_date date;
+-- `canonical_sig_id` is deliberately NOT NULL-constrained here. Prod (mig 181)
+-- declares it NOT NULL, but ADD COLUMN on an already-populated shared table
+-- cannot, and these tests never insert a NULL.
 CREATE TABLE IF NOT EXISTS content_canonical_election (content_key text PRIMARY KEY);
 ALTER TABLE content_canonical_election ADD COLUMN IF NOT EXISTS canonical_sig_id text;
 ALTER TABLE content_canonical_election ADD COLUMN IF NOT EXISTS basis text;
@@ -108,6 +120,7 @@ CREATE TABLE IF NOT EXISTS merchant_stores (
 """
 
 _TABLES_TO_RESET = (
+    "product_quality_snapshot",
     "content_canonical_election",
     "catalog_row_trust",
     "catalog_offers",
@@ -622,3 +635,97 @@ def test_trust_join_returns_null_when_no_election_exists(pg_engine):
         _reset(conn)
         _product(conn, pk="pk_noelect", ck="ck_noelect", sig="sig_x")
         assert _joined(conn, "pk_noelect")["row_is_elected_canonical"] is None
+
+
+# ---------------------------------------------------------------------------
+# elected_canonical_below_quality_floor — the circularity check
+# ---------------------------------------------------------------------------
+
+
+def _score(conn, *, merchant_id="external_seed", source_product_id, score):
+    from sqlalchemy import text
+
+    conn.execute(
+        text("INSERT INTO product_quality_snapshot "
+             "(merchant_id, platform, platform_product_id, content_quality_score, snapshot_date) "
+             "VALUES (:m, 'external_seed', :spid, :sc, CURRENT_DATE)"),
+        {"m": merchant_id, "spid": source_product_id, "sc": score},
+    )
+
+
+def _floor():
+    from services.index_pipeline_state_service import QUALITY_SCORE_THRESHOLD
+
+    return QUALITY_SCORE_THRESHOLD
+
+
+def test_elected_below_floor_is_counted(pg_engine):
+    """The prod shape, reduced: the elected row is the WEAK one and holds the URL
+    on its sibling's strength. `_product` inserts source_product_id = pk."""
+    with pg_engine.begin() as conn:
+        _reset(conn)
+        _product(conn, pk="pk_weak", ck="ck_circ", sig="sig_weak")
+        _product(conn, pk="pk_strong", ck="ck_circ", sig="sig_strong")
+        _score(conn, source_product_id="pk_weak", score=_floor() - 20)
+        _score(conn, source_product_id="pk_strong", score=_floor() + 12)
+        _elect(conn, "ck_circ", "sig_weak")
+        assert _count_of(conn, "elected_canonical_below_quality_floor") == 1
+
+
+def test_elected_above_floor_is_not_counted(pg_engine):
+    """The other direction. A check that only counts up is not a signal."""
+    with pg_engine.begin() as conn:
+        _reset(conn)
+        _product(conn, pk="pk_weak", ck="ck_ok", sig="sig_weak")
+        _product(conn, pk="pk_strong", ck="ck_ok", sig="sig_strong")
+        _score(conn, source_product_id="pk_weak", score=_floor() - 20)
+        _score(conn, source_product_id="pk_strong", score=_floor() + 12)
+        _elect(conn, "ck_ok", "sig_strong")  # the STRONG row holds the URL
+        assert _count_of(conn, "elected_canonical_below_quality_floor") == 0
+
+
+def test_not_counted_when_the_content_key_is_not_serving(pg_engine):
+    """Only live content matters. A weak canonical on a content_key nothing
+    serves is not advertising anything, and counting it would drown the signal
+    in rows no surface can reach."""
+    from sqlalchemy import text
+
+    with pg_engine.begin() as conn:
+        _reset(conn)
+        _product(conn, pk="pk_weak", ck="ck_dark", sig="sig_weak")
+        _score(conn, source_product_id="pk_weak", score=_floor() - 20)
+        _elect(conn, "ck_dark", "sig_weak")
+        conn.execute(text("UPDATE index_pipeline_state SET serving_eligible = FALSE "
+                          "WHERE content_key = 'ck_dark'"))
+        assert _count_of(conn, "elected_canonical_below_quality_floor") == 0
+
+
+def test_a_missing_quality_snapshot_counts_as_below_floor(pg_engine):
+    """An unscored canonical is not a passing canonical — `coalesce(..., -1)`.
+    If this ever reads NULL as "fine", an entirely unscored row can hold the URL
+    and the check stays silent, which is the failure mode the whole
+    serving-coverage programme keeps re-learning."""
+    with pg_engine.begin() as conn:
+        _reset(conn)
+        _product(conn, pk="pk_unscored", ck="ck_unscored", sig="sig_unscored")
+        _elect(conn, "ck_unscored", "sig_unscored")
+        assert _count_of(conn, "elected_canonical_below_quality_floor") == 1
+
+
+def test_the_floor_is_read_from_the_scorer_not_hardcoded(pg_engine):
+    """The threshold moved 65.0 -> 71.4 once already, in lockstep with dropping a
+    dead scorer component. A hardcoded copy here would have silently kept the old
+    bar. Pin that the SQL carries the live constant."""
+    assert str(_floor()) in _named("elected_canonical_below_quality_floor")["count_sql"]
+
+
+def test_elected_below_floor_sample_returns_the_content_key(pg_engine):
+    with pg_engine.begin() as conn:
+        _reset(conn)
+        _product(conn, pk="pk_weak", ck="ck_sample_circ", sig="sig_weak")
+        _score(conn, source_product_id="pk_weak", score=_floor() - 20)
+        _elect(conn, "ck_sample_circ", "sig_weak")
+        rows = conn.execute(
+            __import__("sqlalchemy").text(
+                _named("elected_canonical_below_quality_floor")["sample_sql"])).fetchall()
+        assert [r[0] for r in rows] == ["ck_sample_circ"]
