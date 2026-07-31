@@ -103,6 +103,20 @@ async def ensure_model_tables(tables: Sequence[Any]) -> None:
     `db.*` is imported lazily: `tests/conftest.py` pins DATABASE_URL at import
     time and `db.database` binds its singleton to whatever is set when it is
     first imported.
+
+    KNOWN WART in the `create_all` half, inherited from SQLAlchemy and NOT
+    introduced here. A string `server_default` on a Boolean renders quoted, so
+    `db/catalog.py`'s `Column("indexable", Boolean, server_default="true")`
+    becomes `indexable BOOLEAN DEFAULT 'true' NOT NULL` on SQLite. An INSERT
+    that OMITS the column therefore stores the 4-character string `'true'`, and
+    `COALESCE(indexable, TRUE) IS TRUE` — the recall lane's actual gate —
+    evaluates to 0 for it. Every seed in the suite passes `indexable`
+    explicitly, so nothing hits this today; a new test that leaves it to the
+    default would fail in a thoroughly confusing way. Pass it explicitly.
+    (`_add_column_sql` above does NOT have this problem — it emits an unquoted
+    `DEFAULT true`. Fixing the `create_all` path means changing the model to
+    `server_default=sqlalchemy.true()`, which is a `db/catalog.py` change and
+    out of scope for a test-fixture refactor.)
     """
     from sqlalchemy import create_engine
 

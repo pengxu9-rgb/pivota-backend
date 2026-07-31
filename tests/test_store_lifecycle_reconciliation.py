@@ -29,8 +29,10 @@ from typing import Any, Dict, List, Optional, Tuple
 
 import pytest
 
+from db.catalog import catalog_merchants
 from db.database import database
 from services import store_lifecycle_service as svc
+from tests.model_schema import ensure_model_tables
 
 
 _MERCHANT_PREFIX = "slt"
@@ -44,15 +46,22 @@ async def _connect_if_needed() -> bool:
 
 
 async def _ensure_schema() -> None:
-    # NULLABILITY MIRRORS PRODUCTION EXACTLY — main.py:1461 for merchant_stores,
-    # migration 058 for catalog_merchants. A laxer fixture schema is not a
-    # convenience, it's a mask: these tables are created by whichever test module
-    # gets there first in a full-suite run, so a fixture that drops a NOT NULL
-    # passes in isolation and fails the moment the real DDL wins the race. That
-    # is exactly how the first push went green locally and red in CI (20 failures,
-    # `NOT NULL constraint failed: merchant_stores.name`). Keep every NOT NULL,
-    # and have the seed helpers supply every one of them.
-    ddl = [
+    # catalog_merchants is DERIVED from db/catalog.py — see tests/model_schema.py.
+    # The hand-written copy this replaces declared `indexable BOOLEAN DEFAULT TRUE`
+    # where the model says `nullable=False`, which is precisely the laxer-fixture
+    # defect that let a test assert `indexable IS NULL` and pass in isolation.
+    await ensure_model_tables((catalog_merchants,))
+
+    # merchant_stores has NO SQLAlchemy model — it is created by main.py:1461 and
+    # widened by db/schema_guard.py — so there is nothing to derive it from and it
+    # stays hand-written. NULLABILITY MIRRORS PRODUCTION EXACTLY. A laxer fixture
+    # schema is not a convenience, it's a mask: this table is created by whichever
+    # test module gets there first in a full-suite run, so a fixture that drops a
+    # NOT NULL passes in isolation and fails the moment the real DDL wins the race.
+    # That is exactly how the first push went green locally and red in CI (20
+    # failures, `NOT NULL constraint failed: merchant_stores.name`). Keep every NOT
+    # NULL, and have the seed helpers supply every one of them.
+    await database.execute(
         """
         CREATE TABLE IF NOT EXISTS merchant_stores (
             store_id VARCHAR(50) PRIMARY KEY,
@@ -72,21 +81,8 @@ async def _ensure_schema() -> None:
             upstream_probe_http_status INTEGER,
             upstream_probe_failures INTEGER NOT NULL DEFAULT 0
         )
-        """,
         """
-        CREATE TABLE IF NOT EXISTS catalog_merchants (
-            merchant_id VARCHAR(64) PRIMARY KEY,
-            merchant_name VARCHAR(255),
-            primary_platform VARCHAR(64),
-            status VARCHAR(32) NOT NULL DEFAULT 'active',
-            indexable BOOLEAN DEFAULT TRUE,
-            created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
-            updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP
-        )
-        """,
-    ]
-    for stmt in ddl:
-        await database.execute(stmt)
+    )
     # The probe columns are added by migration 190 / schema_guard in the real
     # world; in a full-suite run another module may have created merchant_stores
     # from the pre-190 DDL, so add them here the same way schema_guard does.
