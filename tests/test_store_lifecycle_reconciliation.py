@@ -906,10 +906,12 @@ def test_every_store_activation_writer_stamps_connected_at():
     )
 
     offenders = []
+    statements_seen = 0
     for directory in ("routes", "services", "jobs", "scripts"):
         for path in sorted((repo / directory).rglob("*.py")):
             source = path.read_text(encoding="utf-8", errors="replace")
             for match in statement.finditer(source):
+                statements_seen += 1
                 body = match.group(1)
                 if not activation.search(body):
                     continue
@@ -917,6 +919,16 @@ def test_every_store_activation_writer_stamps_connected_at():
                     continue
                 line = source[: match.start()].count("\n") + 1
                 offenders.append(f"{path.relative_to(repo)}:{line}")
+
+    # The regexes below are self-tested, but nothing proved the LOOP opened a
+    # file. Pointing the scan at mistyped directories, or dropping jobs/ and
+    # scripts/, left this gate at zero coverage and still green — the same
+    # "matches nothing is also green" failure one level up. The real tree yields
+    # 41; floor it well under that so ordinary churn doesn't trip it.
+    assert statements_seen >= 30, (
+        f"the gate scanned only {statements_seen} UPDATE merchant_stores "
+        "statements — check the directory list; it may be scanning nothing"
+    )
 
     assert offenders == [], (
         "these UPDATEs move a store into the serving set without stamping "
@@ -990,28 +1002,118 @@ async def test_a_dead_probe_half_is_reported_not_disguised(
     ]
     assert completions, "the tick must always emit its summary line"
     assert "probe_error=RuntimeError" in completions[-1], completions[-1]
+
     # The other half still converges — a dead probe must not take the
     # write-through down with it.
     assert summary["status_sweep"]["changed"] == 1
     assert await _merchant_status(merchant) == "inactive"
 
 
+@pytest.mark.asyncio
+async def test_a_dead_sweep_half_is_also_reported(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+):
+    """The other half. `probe_error` and `sweep_error` were added together and
+    only one was asserted — so the write-through could die silently while the
+    line still read as a healthy tick."""
+    import logging
+
+    async def broken_sweep():
+        return {"examined": 0, "changed": 0, "transitions": [], "error": "OperationalError"}
+
+    monkeypatch.setattr(svc, "reconcile_catalog_merchant_statuses", broken_sweep)
+
+    with caplog.at_level(logging.INFO, logger="services.store_lifecycle_service"):
+        await svc.run_store_lifecycle_reconciliation_tick()
+
+    completions = [
+        r.getMessage() for r in caplog.records if "tick complete" in r.getMessage()
+    ]
+    assert completions, "the tick must always emit its summary line"
+    assert "sweep_error=OperationalError" in completions[-1], completions[-1]
+
+
 def test_created_at_is_covered_by_schema_guard():
     """`created_at` became load-bearing when it joined the due-store SELECT.
     Railway does not run db/migrations/, so schema_guard is the only thing that
     puts a column in prod — and a column missing from REQUIRED_SCHEMA fails
-    SILENTLY (dead probe half) instead of at /health."""
+    SILENTLY (dead probe half) instead of at /health.
+
+    Asserts the heal reaches THE merchant_stores STATEMENT, not that the string
+    exists somewhere in a 1,700-line file: moving the ALTER onto an unrelated
+    table passed the string-presence version while merchant_stores never got
+    the column.
+    """
     from db.schema_guard import REQUIRED_SCHEMA
 
-    required = {
-        spec.table: spec.columns for spec in REQUIRED_SCHEMA
-    }
+    required = {spec.table: spec.columns for spec in REQUIRED_SCHEMA}
     assert "created_at" in required["merchant_stores"]
 
-    guard_source = (
-        __import__("pathlib").Path(__file__).resolve().parents[1] / "db" / "schema_guard.py"
-    ).read_text(encoding="utf-8")
-    assert "ADD COLUMN IF NOT EXISTS created_at TIMESTAMPTZ DEFAULT NOW();" in guard_source
+
+@pytest.mark.asyncio
+async def test_fast_mode_heal_adds_created_at_to_merchant_stores(monkeypatch):
+    """Prod skips heavy startup init, so `ensure_required_schema_light` is the
+    ONLY thing that lands these columns. Same shape as the merchant_psps test
+    that already guards this failure mode for another table."""
+    from db import schema_guard as sg
+
+    executed: List[str] = []
+
+    class DummyDB:
+        async def execute(self, query):
+            executed.append(str(query))
+
+    async def noop_connect():
+        return None
+
+    monkeypatch.setattr(sg, "IS_POSTGRES", True)
+    monkeypatch.setattr(sg, "IS_SQLITE", False)
+    monkeypatch.setattr(sg, "database", DummyDB())
+    monkeypatch.setattr(sg, "_ensure_database_connected", noop_connect)
+
+    await sg.ensure_required_schema_light()
+
+    store_stmt = next(
+        s for s in executed
+        if "ALTER TABLE IF EXISTS merchant_stores" in s and "upstream_probe_failures" in s
+    )
+    assert "ADD COLUMN IF NOT EXISTS created_at" in store_stmt
+    for column in (
+        "upstream_probe_at",
+        "upstream_probe_status",
+        "upstream_probe_http_status",
+        "upstream_probe_failures",
+    ):
+        assert f"ADD COLUMN IF NOT EXISTS {column}" in store_stmt
+
+
+def test_sqlite_heal_types_match_the_real_schema():
+    """A heal that disagrees with the real schema is worse than no heal — it
+    makes a self-healed DB behave unlike prod for the first executing test that
+    touches it. Without its map entry, `created_at` falls to the 'TEXT' default
+    and nothing errors; the divergence is just silent. (This file's own comment
+    warns about exactly that, citing catalog_merchants.indexable.)"""
+    import re
+    from pathlib import Path
+
+    guard = (Path(__file__).resolve().parents[1] / "db" / "schema_guard.py").read_text(
+        encoding="utf-8"
+    )
+    for column, expected in (
+        ("created_at", "TIMESTAMP DEFAULT CURRENT_TIMESTAMP"),
+        ("upstream_probe_at", "TIMESTAMP"),
+        ("upstream_probe_status", "TEXT"),
+        ("upstream_probe_http_status", "INTEGER"),
+        ("upstream_probe_failures", "INTEGER NOT NULL DEFAULT 0"),
+    ):
+        found = re.search(
+            rf'\("merchant_stores",\s*"{column}"\):\s*"([^"]+)"', guard
+        )
+        assert found, f"no SQLite heal type for merchant_stores.{column}"
+        assert found.group(1) == expected, (
+            f"merchant_stores.{column} heals as {found.group(1)!r}, "
+            f"migration 190 / main.py says {expected!r}"
+        )
 
 
 @pytest.mark.asyncio
