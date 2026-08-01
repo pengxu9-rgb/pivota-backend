@@ -460,7 +460,8 @@ async def _suppress_dropped_listings(dropped: List[Dict[str, Any]]) -> int:
             {"id": sid},
         )
         await database.execute(
-            "UPDATE catalog_products SET suppression_reason=:reason, updated_at=NOW() "
+            "UPDATE catalog_products SET suppression_reason=:reason, "
+            "suppressed_at=COALESCE(suppressed_at, NOW()), updated_at=NOW() "
             "WHERE source_ref=:id AND suppression_reason IS NULL",
             {"id": sid, "reason": DUP_SUPPRESSION_REASON},
         )

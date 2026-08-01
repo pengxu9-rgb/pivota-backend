@@ -178,6 +178,173 @@ _SERVING_NOT_RENDERABLE_SAMPLE_SQL = compile_pg(
 # renderable and ZERO rows away from it.
 _CHECKS: List[Dict[str, Any]] = [
     {
+        # P1a (#1648). `suppressed_at` is THE gate column — every SQL lane, IPS
+        # (`index_pipeline_state_service`: `row_suppressed = suppressed_at is
+        # not None`) and now the recall/by-key/quote doors read it.
+        # `suppression_reason` is the LABEL, and `catalog_trust_policy.
+        # _derive_source_lifecycle` tombstones on the label alone. A row with
+        # the label and no timestamp is therefore simultaneously "withdrawn" to
+        # the trust policy and "clean" to everything that decides serving —
+        # which is exactly how a retired test rig kept serving on public search.
+        #
+        # 2,332 rows were in that state on 2026-07-30 across seven cohorts. The
+        # backfill converged them; this check is what stops the NEXT writer
+        # minting more. Threshold 0: there is no acceptable number of these.
+        "name": "suppression_reason_without_timestamp",
+        "description": (
+            "catalog row carries suppression_reason but no suppressed_at — "
+            "tombstoned to catalog_trust_policy, CLEAN to every serving gate"
+        ),
+        "env": "CATALOG_INVARIANT_SUPPRESSION_SPLIT_THRESHOLD",
+        "default_threshold": 0,
+        "count_sql": """
+            SELECT count(*) AS c
+            FROM catalog_products
+            WHERE suppression_reason IS NOT NULL
+              AND suppressed_at IS NULL
+        """,
+        "sample_sql": """
+            SELECT product_key AS subject_key
+            FROM catalog_products
+            WHERE suppression_reason IS NOT NULL
+              AND suppressed_at IS NULL
+            LIMIT 5
+        """,
+    },
+    {
+        # The mirror, and the one the 2026-07-30 backfill CREATED the risk of:
+        # every revert path cleared `suppression_reason` alone, so after the
+        # backfill a revert would leave `suppressed_at` set and the row gated
+        # forever — a revert that silently does not revert. Fixed in the same
+        # change; this is the alarm if a revert path regresses.
+        "name": "suppression_timestamp_without_reason",
+        "description": (
+            "catalog row is gated by suppressed_at but carries no reason — "
+            "usually a revert that cleared only the label"
+        ),
+        "env": "CATALOG_INVARIANT_SUPPRESSION_ORPHAN_THRESHOLD",
+        "default_threshold": 0,
+        "count_sql": """
+            SELECT count(*) AS c
+            FROM catalog_products
+            WHERE suppressed_at IS NOT NULL
+              AND suppression_reason IS NULL
+        """,
+        "sample_sql": """
+            SELECT product_key AS subject_key
+            FROM catalog_products
+            WHERE suppressed_at IS NOT NULL
+              AND suppression_reason IS NULL
+            LIMIT 5
+        """,
+    },
+    {
+        # Same split-column defect on catalog_skus. Both columns exist here and
+        # both are read by the recall / by-key / quote gates after #1655 and
+        # #1657, so the same "tombstoned to trust, clean to serving" state is
+        # reachable. Prod: 0 today.
+        "name": "suppression_reason_without_timestamp_skus",
+        "description": (
+            "catalog_skus row carries suppression_reason but no suppressed_at"
+        ),
+        "env": "CATALOG_INVARIANT_SUPPRESSION_SPLIT_SKUS_THRESHOLD",
+        "default_threshold": 0,
+        "count_sql": """
+            SELECT count(*) AS c
+            FROM catalog_skus
+            WHERE suppression_reason IS NOT NULL
+              AND suppressed_at IS NULL
+        """,
+        "sample_sql": """
+            SELECT sku_key AS subject_key
+            FROM catalog_skus
+            WHERE suppression_reason IS NOT NULL
+              AND suppressed_at IS NULL
+            LIMIT 5
+        """,
+    },
+    {
+        # Same split-column defect on catalog_offers. Both columns exist here and
+        # both are read by the recall / by-key / quote gates after #1655 and
+        # #1657, so the same "tombstoned to trust, clean to serving" state is
+        # reachable. Prod: 0 today.
+        "name": "suppression_reason_without_timestamp_offers",
+        "description": (
+            "catalog_offers row carries suppression_reason but no suppressed_at"
+        ),
+        "env": "CATALOG_INVARIANT_SUPPRESSION_SPLIT_OFFERS_THRESHOLD",
+        "default_threshold": 0,
+        "count_sql": """
+            SELECT count(*) AS c
+            FROM catalog_offers
+            WHERE suppression_reason IS NOT NULL
+              AND suppressed_at IS NULL
+        """,
+        "sample_sql": """
+            SELECT offer_id AS subject_key
+            FROM catalog_offers
+            WHERE suppression_reason IS NOT NULL
+              AND suppressed_at IS NULL
+            LIMIT 5
+        """,
+    },
+    {
+        # The MIRROR direction on catalog_skus. Added because the deferral
+        # rationale for merge_duplicate_canonicals.py:427 was inverted: that
+        # line re-suppresses winner offers with a bare `suppressed_at = NOW()`
+        # and never restores the reason, producing timestamp-WITHOUT-reason —
+        # the opposite of what the reason-without-timestamp check catches. The
+        # code is left alone (it is a revert-ledger restore, not a suppression
+        # writer); this is what actually monitors it. Prod: 0.
+        "name": "suppression_timestamp_without_reason_skus",
+        "description": (
+            "catalog_skus row is gated by suppressed_at but carries no reason"
+        ),
+        "env": "CATALOG_INVARIANT_SUPPRESSION_ORPHAN_SKUS_THRESHOLD",
+        "default_threshold": 0,
+        "count_sql": """
+            SELECT count(*) AS c
+            FROM catalog_skus
+            WHERE suppressed_at IS NOT NULL
+              AND suppression_reason IS NULL
+        """,
+        "sample_sql": """
+            SELECT sku_key AS subject_key
+            FROM catalog_skus
+            WHERE suppressed_at IS NOT NULL
+              AND suppression_reason IS NULL
+            LIMIT 5
+        """,
+    },
+    {
+        # The MIRROR direction on catalog_offers. Added because the deferral
+        # rationale for merge_duplicate_canonicals.py:427 was inverted: that
+        # line re-suppresses winner offers with a bare `suppressed_at = NOW()`
+        # and never restores the reason, producing timestamp-WITHOUT-reason —
+        # the opposite of what the reason-without-timestamp check catches. The
+        # code is left alone (it is a revert-ledger restore, not a suppression
+        # writer); this is what actually monitors it. Prod: 0.
+        "name": "suppression_timestamp_without_reason_offers",
+        "description": (
+            "catalog_offers row is gated by suppressed_at but carries no reason"
+        ),
+        "env": "CATALOG_INVARIANT_SUPPRESSION_ORPHAN_OFFERS_THRESHOLD",
+        "default_threshold": 0,
+        "count_sql": """
+            SELECT count(*) AS c
+            FROM catalog_offers
+            WHERE suppressed_at IS NOT NULL
+              AND suppression_reason IS NULL
+        """,
+        "sample_sql": """
+            SELECT offer_id AS subject_key
+            FROM catalog_offers
+            WHERE suppressed_at IS NOT NULL
+              AND suppression_reason IS NULL
+            LIMIT 5
+        """,
+    },
+    {
         "name": "public_but_suppressed",
         "description": "trust says public but catalog row is tombstoned",
         "env": "CATALOG_INVARIANT_SUPPRESSED_THRESHOLD",

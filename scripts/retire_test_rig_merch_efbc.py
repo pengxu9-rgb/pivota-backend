@@ -67,6 +67,7 @@ RETURNING store_id, platform, domain
 SUPPRESS_SQL = """
 UPDATE catalog_products
 SET suppression_reason = $2,
+    suppressed_at = COALESCE(suppressed_at, NOW()),
     suppression_metadata = $3::jsonb,
     updated_at = NOW()
 WHERE merchant_id = $1 AND suppression_reason IS NULL

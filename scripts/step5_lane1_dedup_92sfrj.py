@@ -28,7 +28,8 @@ reconnecting the store would not silently clear these.
 
 Revert (by run):
   UPDATE catalog_products
-  SET suppression_reason = NULL, suppression_metadata = NULL, updated_at = NOW()
+  SET suppression_reason = NULL, suppressed_at = NULL,
+      suppression_metadata = NULL, updated_at = NOW()
   WHERE suppression_reason = 'step5_duplicate_store_connection'
     AND suppression_metadata->>'run_id' = '<run_id printed at apply time>';
 """
@@ -62,6 +63,7 @@ WHERE merchant_id = $1
 SUPPRESS_SQL = """
 UPDATE catalog_products
 SET suppression_reason = $1,
+    suppressed_at = COALESCE(suppressed_at, NOW()),
     suppression_metadata = $2::jsonb,
     updated_at = NOW()
 WHERE merchant_id = $3

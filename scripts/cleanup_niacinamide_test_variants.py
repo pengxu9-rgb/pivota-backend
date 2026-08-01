@@ -215,7 +215,9 @@ async def main() -> int:
             mirror_result = await conn.execute(
                 """
                 UPDATE catalog_products
-                SET suppression_reason = $2, updated_at = now()
+                SET suppression_reason = $2,
+                    suppressed_at = COALESCE(suppressed_at, now()),
+                    updated_at = now()
                 WHERE merchant_id = 'external_seed'
                   AND source_ref = ANY($1::text[])
                   AND suppression_reason IS NULL
