@@ -27,11 +27,17 @@ precisely because the create_all path and the patch path differ:
 
   * create_all path (this module created the table) — exact production DDL:
     every NOT NULL, every default, every index.
-  * patch path (someone else created it first) — columns only. SQLite cannot
-    express `ADD COLUMN ... NOT NULL` without a constant default, so a NOT NULL
-    column that has no server_default (catalog_products.title,
-    catalog_skus.merchant_id, ...) or a func.now() one (created_at, updated_at)
-    is added NULLABLE, and indexes/UNIQUE constraints are not built at all.
+  * patch path (someone else created it first) — MISSING COLUMNS ONLY. SQLite
+    cannot express `ADD COLUMN ... NOT NULL` without a constant default, so a
+    NOT NULL column that has no server_default (catalog_products.title,
+    catalog_skus.merchant_id — 30 such across the tables used here) or a
+    func.now() one (created_at, updated_at — 11 more) is added NULLABLE. Nor
+    are indexes, UNIQUE constraints, CHECKs or the PRIMARY KEY built: a table
+    missing its PK column gets an ordinary nullable non-PK column, so an
+    `ON CONFLICT (product_key)` upsert against it fails outright. And a column
+    the neighbour ALREADY created is never reconciled — wrong type, wrong
+    nullability and wrong default all survive verbatim, so the resulting
+    fixture can still be a superset of the model.
 
 So a fixture patched onto a neighbour's table is still laxer than production on
 nullability. That is strictly better than the hand-written DDL it replaces —
@@ -79,6 +85,7 @@ def _sqlite_default_literal(column: Any) -> Optional[str]:
     from sqlalchemy import Boolean, Integer, Numeric
     from sqlalchemy.dialects import sqlite as _sqlite
     from sqlalchemy.sql import expression
+    from sqlalchemy.sql.elements import TextClause
 
     server_default = getattr(column, "server_default", None)
     if server_default is None:
@@ -86,21 +93,48 @@ def _sqlite_default_literal(column: Any) -> Optional[str]:
     arg = getattr(server_default, "arg", None)
     if isinstance(arg, (expression.True_, expression.False_)):
         return str(arg.compile(dialect=_sqlite.dialect()))
+    if isinstance(arg, TextClause):
+        # `server_default=text("0")` is the canonical SQLAlchemy idiom and IS a
+        # constant — rejecting it by Python type would drop the default (and,
+        # for a NOT NULL column, the NOT NULL with it) where create_all emits
+        # `DEFAULT 0`.
+        #
+        # It is raw SQL, so it passes through VERBATIM — never re-quoted. Running
+        # `text("'z'")` through the string rules below would emit `DEFAULT '''z'''`
+        # where create_all emits `DEFAULT 'z'`. Anything that is not plainly a
+        # constant (`text("now()")`) is still dropped under restriction 2, since
+        # SQLite rejects it in ADD COLUMN.
+        raw = arg.text.strip()
+        if re.fullmatch(r"-?\d+(\.\d+)?|'(?:[^']|'')*'|TRUE|FALSE|NULL", raw, re.I):
+            return raw
+        return None
     if not isinstance(arg, str):
         # func.now() and friends — restriction 2.
         return None
+    # `.strip()` is for COMPARISON ONLY. Quoting must preserve the value
+    # verbatim: create_all stores `server_default=" x "` as `' x '`, and
+    # silently trimming it here would reintroduce the same corruption class as
+    # `"007"` -> `7`.
     literal = arg.strip()
-    if isinstance(column.type, Boolean):
+    # `_type_affinity` rather than `isinstance(column.type, ...)` so a
+    # TypeDecorator / with_variant wrapper resolves to what it actually stores.
+    # db/ already has 43 Variant-typed columns; a Boolean one carrying a string
+    # default would otherwise render `DEFAULT 'true'` — the exact bug this
+    # module exists to prevent.
+    affinity = getattr(column.type, "_type_affinity", type(column.type))
+    if affinity is not None and issubclass(affinity, Boolean):
         # Only a Boolean column may render the bare keywords. SQLite stores
         # TRUE/FALSE as 1/0; a quoted 'true' would store the word and fail
         # every `IS TRUE` check downstream.
         if literal.lower() in ("true", "false"):
             return "1" if literal.lower() == "true" else "0"
-    if isinstance(column.type, (Integer, Numeric)) and re.fullmatch(
-        r"-?\d+(\.\d+)?", literal
+    if (
+        affinity is not None
+        and issubclass(affinity, (Integer, Numeric))
+        and re.fullmatch(r"-?\d+(\.\d+)?", literal)
     ):
         return literal
-    return "'" + literal.replace("'", "''") + "'"
+    return "'" + arg.replace("'", "''") + "'"
 
 
 def _quote_ident(name: str) -> str:

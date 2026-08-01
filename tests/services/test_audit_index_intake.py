@@ -392,6 +392,19 @@ def test_upsert_wires_merchant_row_and_eligibility_recompute(monkeypatch):
     assert len(audit_upserts) == 1
     assert audit_upserts[0]["primary_platform"] == PLATFORM_URL_AUDIT
 
+    # The count stays TOTAL. Filtering to m_anua alone would constrain only that
+    # id and silently permit any OTHER merchant upsert — including a write to the
+    # `external_seed` placeholder bucket that services/seller_identity.py:61
+    # (BANNED_BUCKET_MERCHANT_ID, ADR-009 D2) exists to forbid. Verified: adding
+    # such an upsert to the intake leaves the whole suite green without this line
+    # and turns this test red with it.
+    unexpected = [
+        c["merchant_id"]
+        for c in merchant_calls
+        if c["merchant_id"] != "m_anua" and not c["merchant_id"].startswith("merch_obs_")
+    ]
+    assert unexpected == [], f"unexpected catalog_merchants upserts: {unexpected}"
+
     # exactly one catalog_products upsert (the merchant upsert is mocked out).
     assert len(executed) == 1
 
