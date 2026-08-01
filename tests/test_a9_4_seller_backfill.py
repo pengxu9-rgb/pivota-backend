@@ -354,3 +354,78 @@ async def test_collision_ignores_sibling_bucket_or_same_identity(monkeypatch):
         "merch_obs_abc", "Brand", "brand.com",
         {"product_key": "prod::external_seed::external_seed::x", "canonical_url": None},
     ) is None
+
+
+# ---------------------------------------------------------------------------
+# _seed_brand — the snapshot shape (the silent zero-write bug)
+# ---------------------------------------------------------------------------
+
+
+def test_seed_brand_reads_the_snapshot_shape():
+    """THE REGRESSION TEST.
+
+    A9-4 phase 1 ran to completion in --execute mode on prod 2026-07-31 and
+    wrote ZERO of 2,026 rows. Cause: every one of those seeds carries its brand
+    at seed_data.snapshot.brand, and this resolver only looked at
+    seed_row.brand / seed_data.brand / seed_data.vendor. With an empty brand,
+    resolve_seller_readonly refuses — and under the no-fallback rule a missing
+    identity is DEBUG-quiet, so it failed silently.
+
+    Measured over the 2,026: brand at top level 0, brand ONLY under snapshot
+    2,024, vendor at top level 0, genuinely no brand 2.
+    """
+    from scripts.backfill_seller_of_record import _seed_brand
+
+    row = {"domain": None, "destination_url": "https://beautyofjoseon.com/products/x"}
+    seed_data = {"snapshot": {"brand": "Beauty of Joseon"}}
+    assert _seed_brand(row, seed_data) == "Beauty of Joseon"
+
+
+def test_seed_brand_resolution_order_matches_the_sibling_resolvers():
+    """snapshot -> row -> seed_data, the order
+    index_pipeline_state_service._resolve_seed_title uses (itself matching
+    external_seed_audit.audit_external_seed_row). A sibling resolver that
+    disagrees on precedence is how these shapes drift apart."""
+    from scripts.backfill_seller_of_record import _seed_brand
+
+    assert _seed_brand({"brand": "RowBrand"},
+                       {"snapshot": {"brand": "SnapBrand"}, "brand": "DataBrand"}) == "SnapBrand"
+    assert _seed_brand({"brand": "RowBrand"}, {"brand": "DataBrand"}) == "RowBrand"
+    assert _seed_brand({}, {"brand": "DataBrand", "vendor": "Vendor"}) == "DataBrand"
+    assert _seed_brand({}, {"vendor": "Vendor"}) == "Vendor"
+
+
+def test_seed_brand_still_returns_empty_when_there_is_genuinely_no_brand():
+    """The no-fallback rule depends on this. 2 of the 2,026 have no brand
+    anywhere, and they must stay unresolvable rather than acquire an invented
+    seller identity."""
+    from scripts.backfill_seller_of_record import _seed_brand
+
+    assert _seed_brand({}, {}) == ""
+    assert _seed_brand({"brand": "  "}, {"snapshot": {"brand": ""}}) == ""
+    assert _seed_brand({}, {"snapshot": {}}) == ""
+
+
+def test_seed_brand_tolerates_a_non_dict_snapshot():
+    """seed_data.snapshot is JSON from many writers; a string or list there must
+    not raise inside a backfill that is mid-scan over 2,026 rows."""
+    from scripts.backfill_seller_of_record import _seed_brand
+
+    assert _seed_brand({}, {"snapshot": "not-a-dict", "brand": "Fallback"}) == "Fallback"
+    assert _seed_brand({}, {"snapshot": ["also", "not"], "brand": "Fallback"}) == "Fallback"
+
+
+def test_the_prod_shape_now_resolves_end_to_end():
+    """Brand + destination together, on the real refused row shape: the
+    destination was never the problem (_seed_destination already falls back to
+    destination_url and etld1 reduces it), only the brand was."""
+    from scripts.backfill_seller_of_record import _seed_brand, _seed_destination
+    from services.seller_identity import etld1
+
+    row = {"domain": None,
+           "destination_url": "https://beautyofjoseon.com/products/glow-deep-serum-",
+           "canonical_url": None}
+    seed_data = {"snapshot": {"brand": "Beauty of Joseon"}}
+
+    assert _seed_brand(row, seed_data) == "Beauty of Joseon"
+    assert etld1(_seed_destination(row, seed_data)) == "beautyofjoseon.com"
