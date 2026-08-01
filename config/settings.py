@@ -359,6 +359,15 @@ class Settings(BaseSettings):
     platform_orders_acp_webhook_secret: Optional[str] = os.getenv(
         "PLATFORM_ORDERS_ACP_WEBHOOK_SECRET"
     )
+    # Base URL for the checkout_url returned by the IN-PROCESS ACP session layer
+    # (services/acp_checkout_session_service). The session's checkout_url is
+    # `{base}/{session_id}`. Replaces the retired pivota-acp service's
+    # `{acp_url}/checkout/{id}` (which pointed at a route that never existed on
+    # that service).
+    agent_acp_checkout_url_base: str = os.getenv(
+        "AGENT_ACP_CHECKOUT_URL_BASE",
+        "https://agents.pivota.cc/checkout/acp",
+    )
 
     # --- P-T2.2: Tier-2 in-chat protocol checkout kill-switch --------------
     # Two fail-closed gates on the real charge path for the agentic-commerce

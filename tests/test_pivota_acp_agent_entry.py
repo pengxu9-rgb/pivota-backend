@@ -161,8 +161,9 @@ async def test_endpoint_redirects_when_integration_disabled(monkeypatch):
 
 @pytest.mark.asyncio
 async def test_endpoint_creates_acp_session_when_enabled(monkeypatch):
+    # Positive control: a healthy in-process session service → the ACP lane.
     from routes import agent_checkout_intents as m
-    from services.pivota_acp_client import AcpSession
+    from services.acp_checkout_session_service import AcpSessionResult
 
     async def fake_decision(mid, *, store_id=None, platform_override=None):
         return _decision(is_acp=True)
@@ -170,12 +171,13 @@ async def test_endpoint_creates_acp_session_when_enabled(monkeypatch):
     async def fake_session(**kwargs):
         assert kwargs["merchant_id"] == "merch_x"
         assert kwargs["metadata"]["pvt_click_id"] == "clk_abc"
-        return AcpSession(session_id="csn_abc", checkout_url="https://acp/checkout/csn_abc",
-                          status="ready_for_payment", currency="USD", total_cents=4599,
-                          totals=[{"type": "total", "amount": 4599}])
+        return AcpSessionResult(session_id="csn_abc",
+                                checkout_url="https://agents.pivota.cc/checkout/acp/csn_abc",
+                                status="ready_for_payment", currency="USD", total_cents=4599,
+                                totals=[{"type": "total", "amount": 4599}])
 
     monkeypatch.setattr(m, "resolve_acp_lane_decision", fake_decision)
-    monkeypatch.setattr(m, "create_checkout_session", fake_session)
+    monkeypatch.setattr(m, "create_session", fake_session)
     monkeypatch.setattr(m.settings, "enable_platform_orders_acp", True, raising=False)
 
     out = await m.create_acp_checkout(_req(), _Ctx())
@@ -183,26 +185,30 @@ async def test_endpoint_creates_acp_session_when_enabled(monkeypatch):
     assert out["lane"] == "acp_in_chat"
     assert out["acp_session_id"] == "csn_abc"
     assert out["pvt_click_id"] == "clk_abc"
-    # DARK invariants: nothing charges here.
+    # Session-create invariants: nothing charges here (completion is a separate,
+    # kill-switch-gated endpoint).
     assert out["creates_psp_payment"] is False
     assert out["capture_enabled"] is False
 
 
 @pytest.mark.asyncio
 async def test_endpoint_fails_open_to_redirect_on_acp_error(monkeypatch):
+    # Positive control the other way: ANY session-service error (here the
+    # in-process quote failing — the replacement for the old client's
+    # acp_url_missing transport case) → the redirect floor, never a dead end.
     from routes import agent_checkout_intents as m
-    from services.pivota_acp_client import AcpClientError
+    from services.acp_checkout_session_service import AcpCheckoutSessionError
 
     async def fake_decision(mid, *, store_id=None, platform_override=None):
         return _decision(is_acp=True)
 
     async def boom(**kwargs):
-        raise AcpClientError("down", status_code=502, code="acp_http_error")
+        raise AcpCheckoutSessionError("down", status_code=502, code="acp_quote_failed")
 
     monkeypatch.setattr(m, "resolve_acp_lane_decision", fake_decision)
-    monkeypatch.setattr(m, "create_checkout_session", boom)
+    monkeypatch.setattr(m, "create_session", boom)
     monkeypatch.setattr(m.settings, "enable_platform_orders_acp", True, raising=False)
 
     out = await m.create_acp_checkout(_req(), _Ctx())
     assert out["lane"] == "redirect_floor"
-    assert out["reason"] == "acp_unavailable:acp_http_error"
+    assert out["reason"] == "acp_unavailable:acp_quote_failed"

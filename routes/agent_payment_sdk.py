@@ -754,110 +754,23 @@ async def create_payment(
         currency = currency_code
         order_metadata = order.get("metadata") if isinstance(order.get("metadata"), dict) else {}
 
-        # P-T2.2 kill-switch: fail-closed gate on the Tier-2 (in-chat protocol)
-        # charge lane. Scoped to protocol-tier orders (protocol_name in
-        # {acp,ucp,ap2}); the live redirect floor + REST/hosted flows
-        # (protocol_name="rest"/unset) evaluate as guarded=False and pass through
-        # untouched. Strict is ON by default and cannot be silently absent, so a
-        # protocol charge is blocked until SUBMIT_PAYMENT is explicitly enabled
-        # for a canary (P-T2.3). Placed before any PSP call so nothing charges.
-        from services.agent_checkout_kill_switch import evaluate_tier2_charge
-
-        kill_switch = evaluate_tier2_charge(
-            order_metadata.get("protocol_name"),
-            merchant_id=str(merchant_id),
-        )
-        if not kill_switch.allowed:
-            logger.warning(
-                "[AgentPayments] Tier-2 protocol charge blocked by kill-switch "
-                "order=%s protocol=%s reason=%s (strict=%s submit_payment=%s)",
-                request.order_id,
-                kill_switch.protocol,
-                kill_switch.reason,
-                kill_switch.strict,
-                kill_switch.submit_payment_enabled,
-            )
-            raise HTTPException(status_code=403, detail=kill_switch.as_error_detail())
-        if kill_switch.guarded:
-            logger.info(
-                "[AgentPayments] Tier-2 protocol charge permitted order=%s "
-                "protocol=%s reason=%s",
-                request.order_id,
-                kill_switch.protocol,
-                kill_switch.reason,
-            )
-
-        # P-T2.3.2: scoped test-mode capture. When AGENT_ACP_TEST_CAPTURE is on,
-        # a kill-switch-permitted ACP charge may run against a TEST-MODE PSP by
-        # bypassing live-readiness — but only up to a hard amount cap. Default off
-        # → engaged=False → live readiness enforced as before. An engaged charge
-        # over the cap is refused outright (never downgraded).
-        from services.agent_checkout_kill_switch import resolve_acp_test_capture
+        # P-T2.2 / P-T2.3.2 / P-T2.3.5 gate chain (kill-switch → test-capture cap
+        # → live-capture cap). Extracted VERBATIM into
+        # services/acp_offsession_payment.evaluate_acp_offsession_gates so the
+        # in-process ACP checkout-session completion shares exactly this code —
+        # every refusal raises the same 403s this route raised inline.
+        from services.acp_offsession_payment import evaluate_acp_offsession_gates
 
         _acp_amount_cents = int(round(float(order_total) * 100))
-        acp_test_capture = resolve_acp_test_capture(
-            order_metadata.get("protocol_name"),
-            amount_cents=_acp_amount_cents,
-            kill_switch_allowed=kill_switch.allowed,
-        )
-        if acp_test_capture.engaged and not acp_test_capture.within_cap:
-            logger.warning(
-                "[AgentPayments] ACP test-mode capture REFUSED (over cap) order=%s "
-                "amount_cents=%s cap=%s",
-                request.order_id, _acp_amount_cents, acp_test_capture.max_cents,
-            )
-            raise HTTPException(
-                status_code=403,
-                detail={
-                    "error": "TIER2_TEST_CAPTURE_OVER_CAP",
-                    "amount_cents": _acp_amount_cents,
-                    "max_cents": acp_test_capture.max_cents,
-                    "message": "ACP test-mode capture exceeds the configured amount cap.",
-                },
-            )
-        if acp_test_capture.bypass_live_readiness:
-            logger.warning(
-                "[AgentPayments] ACP TEST-MODE capture lane engaged order=%s "
-                "amount_cents=%s cap=%s — bypassing live PSP readiness for the "
-                "test PSP (test canary only)",
-                request.order_id, _acp_amount_cents, acp_test_capture.max_cents,
-            )
-
-        # P-T2.3.5: scoped LIVE-money capture. A SEPARATE, stricter gate than the
-        # test lane — its own master switch + required per-merchant allowlist + a
-        # low cap. Engages only when the kill-switch already permits, the flag is
-        # on, and the merchant is allowlisted. Over-cap engaged charges are refused
-        # (never downgraded). Default off → engaged=False → nothing changes.
-        from services.agent_checkout_kill_switch import resolve_acp_live_capture
-
-        acp_live_capture = resolve_acp_live_capture(
-            order_metadata.get("protocol_name"),
+        acp_gates = evaluate_acp_offsession_gates(
+            protocol_name=order_metadata.get("protocol_name"),
             merchant_id=str(merchant_id),
             amount_cents=_acp_amount_cents,
-            kill_switch_allowed=kill_switch.allowed,
+            order_id=request.order_id,
         )
-        if acp_live_capture.engaged and not acp_live_capture.within_cap:
-            logger.warning(
-                "[AgentPayments] ACP LIVE-money capture REFUSED (over cap) order=%s "
-                "amount_cents=%s cap=%s",
-                request.order_id, _acp_amount_cents, acp_live_capture.max_cents,
-            )
-            raise HTTPException(
-                status_code=403,
-                detail={
-                    "error": "TIER2_LIVE_CAPTURE_OVER_CAP",
-                    "amount_cents": _acp_amount_cents,
-                    "max_cents": acp_live_capture.max_cents,
-                    "message": "ACP live-money capture exceeds the configured live amount cap.",
-                },
-            )
-        if acp_live_capture.allow_live:
-            logger.warning(
-                "[AgentPayments] ACP LIVE-MONEY capture lane engaged order=%s "
-                "amount_cents=%s cap=%s merchant=%s — REAL money on the merchant's "
-                "live PSP (P-T2.3.5 canary)",
-                request.order_id, _acp_amount_cents, acp_live_capture.max_cents, merchant_id,
-            )
+        kill_switch = acp_gates.kill_switch
+        acp_test_capture = acp_gates.test_capture
+        acp_live_capture = acp_gates.live_capture
 
         payment_flow = order_metadata.get("payment_flow") if isinstance(order_metadata.get("payment_flow"), dict) else {}
         auth_first_psp = str((payment_flow or {}).get("psp") or "").strip().lower()
@@ -951,34 +864,22 @@ async def create_payment(
         _acp_allow_live = acp_live_capture.allow_live
         _acp_offsession = acp_test_capture.bypass_live_readiness or _acp_allow_live
         if _acp_offsession:
-            from services.acp_offsession_capture import capture_offsession
+            from services.acp_offsession_payment import execute_acp_offsession_payment
 
-            _oc = await capture_offsession(
+            _acp_outcome = await execute_acp_offsession_payment(
+                gates=acp_gates,
                 merchant_id=str(merchant_id),
-                amount_cents=_acp_amount_cents,
+                order_id=str(request.order_id),
                 currency=str(currency),
-                idempotency_key=(request.idempotency_key or f"acp_off:{request.order_id}"),
-                payment_method=(request.payment_method.token or None),
-                metadata={
-                    "order_id": str(request.order_id),
-                    "agent_id": str(context.agent_id or ""),
-                    **{
-                        k: str(order_metadata[k])
-                        for k in ("protocol_name", "pvt_click_id", "checkout_session_id")
-                        if order_metadata.get(k)
-                    },
-                },
-                allow_live=_acp_allow_live,
-                max_cents=(acp_live_capture.max_cents if _acp_allow_live else None),
+                idempotency_key=request.idempotency_key,
+                payment_method_token=(request.payment_method.token or None),
+                agent_id=str(context.agent_id or ""),
+                order_metadata=order_metadata,
             )
-            success = _oc.success
-            error = _oc.error
-            psp_used = "stripe"
-            payment_intent = SimpleNamespace(
-                id=_oc.payment_intent_id or f"acp_off_{request.order_id}",
-                status=_oc.status or ("succeeded" if _oc.success else "failed"),
-                client_secret=None,
-            )
+            success = _acp_outcome.success
+            error = _acp_outcome.error
+            psp_used = _acp_outcome.psp_used
+            payment_intent = _acp_outcome.payment_intent
 
         try:
             if not _acp_offsession:
@@ -1124,32 +1025,17 @@ async def create_payment(
         # the normal client-confirm flow returns "processing"/"requires_action" and
         # is correctly finalized later by its own webhook, so it is untouched.
         if _acp_offsession and status == "succeeded":
-            try:
-                from services.psp_payment_finalizer import finalize_payment_success
-                from db.orders import mark_order_paid
-                from routes.order_routes import log_order_event
+            from services.acp_offsession_payment import finalize_acp_offsession_success
 
-                await finalize_payment_success(
-                    order,
-                    psp="stripe",
-                    payment_reference=payment_intent.id,
-                    transaction_id=payment_intent.id,
-                    amount_minor=None,
-                    currency=str(currency),
-                    source_event="acp_offsession_capture",
-                    metadata_extra={
-                        ("acp_live_capture" if _acp_allow_live else "acp_test_capture"): True,
-                        "protocol_name": order_metadata.get("protocol_name"),
-                    },
-                    update_payment_info_fn=update_payment_info,
-                    mark_order_paid_fn=mark_order_paid,
-                    log_order_event_fn=log_order_event,
-                )
-            except Exception as finalize_exc:  # noqa: BLE001 — capture already succeeded; don't fail the response
-                logger.warning(
-                    "[AgentPayments] ACP off-session paid-transition failed order=%s: %s",
-                    request.order_id, finalize_exc,
-                )
+            await finalize_acp_offsession_success(
+                order=order,
+                order_id=str(request.order_id),
+                psp_used=psp_used,
+                payment_reference=payment_intent.id,
+                currency=str(currency),
+                allow_live=_acp_allow_live,
+                protocol_name=order_metadata.get("protocol_name"),
+            )
 
         # PCS v0.2-b (best-effort): internal payment fact for reducer replay (no PII).
         try:
