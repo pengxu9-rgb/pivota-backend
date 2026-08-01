@@ -205,12 +205,46 @@ def candidate_storage_key_from_seed(seed_row: Dict[str, Any]) -> Optional[str]:
 
 
 def _seed_brand(seed_row: Dict[str, Any], seed_data: Dict[str, Any]) -> str:
-    return str(
-        seed_row.get("brand")
-        or seed_data.get("brand")
-        or seed_data.get("vendor")
-        or ""
-    ).strip()
+    """Brand identity across the shapes `external_product_seeds` actually uses.
+
+    SNAPSHOT FIRST, and that omission is why this phase resolved NOTHING.
+    Measured on prod 2026-07-31, over the 2,026 seeds with a NULL `seller_ref`:
+
+        brand at seed_data.brand ........... 0
+        brand ONLY at snapshot.brand ... 2,024
+        vendor at seed_data.vendor ......... 0
+        no brand anywhere .................. 2
+
+    So the three lookups this used to do missed 2,024 of 2,026. A9-4 phase 1 ran
+    to completion in `--execute` mode and wrote zero rows — `resolve_seller_readonly`
+    refused every seed for an empty brand, and because a missing/unmintable
+    identity is DEBUG-quiet under the no-fallback rule (never guess, never invent
+    a bucket), it failed silently. The destination was never the problem:
+    `_seed_destination` already falls back to `destination_url`, and etld1()
+    reduces those to real registrable domains.
+
+    Resolution order matches the repo's established convention for reading seed
+    fields — `index_pipeline_state_service._resolve_seed_title`, itself matching
+    `external_seed_audit.audit_external_seed_row`: snapshot -> row -> seed_data.
+    Order is convention rather than behaviour here (0 rows carry a top-level
+    brand today), but a sibling resolver that disagrees on precedence is exactly
+    how these shapes drift apart in the first place.
+    """
+    snapshot = _coerce_seed_data(seed_data.get("snapshot"))
+    for candidate in (
+        snapshot.get("brand"),
+        seed_row.get("brand"),
+        seed_data.get("brand"),
+        snapshot.get("vendor"),
+        seed_data.get("vendor"),
+    ):
+        if isinstance(candidate, str) and candidate.strip():
+            return candidate.strip()
+        if candidate not in (None, ""):
+            text = str(candidate).strip()
+            if text:
+                return text
+    return ""
 
 
 def _seed_destination(seed_row: Dict[str, Any], seed_data: Dict[str, Any]) -> str:
