@@ -804,21 +804,108 @@ def test_fragmented_identity_ignores_single_domain_splits(pg_engine):
 
 
 def test_fragmented_identity_ignores_suppressed_siblings(pg_engine):
-    """A retired row is not a second retailer. Counting it would resurrect
-    already-decided dedup work as identity work."""
+    """A retired row is not a second retailer — and retirement has TWO markers.
+
+    This test used to set only `suppressed_at`, which is the column the query
+    already filtered, so it asserted a property the SQL did not have.
+    `suppression_reason` WITHOUT `suppressed_at` is a real, populated state
+    (canonical_sitemap_candidates.not_tombstoned enumerates the writers), and
+    migration 139 — `cross_merchant_redundant_external_seed` — sets ONLY the
+    reason. Its predicate is "an external_seed row whose content_key has a live
+    first-party sibling under a different merchant": a retired cross-merchant
+    duplicate that still carries its own identity listing, i.e. this check's
+    exact false positive. Both markers are covered now.
+    """
+    from sqlalchemy import text
+
+    for marker in ("suppressed_at = NOW()",
+                   "suppression_reason = 'cross_merchant_redundant_external_seed'"):
+        with pg_engine.begin() as conn:
+            _reset(conn)
+            _product(conn, pk="pk_live", ck="ck_supp", sig="sig_live")
+            _product(conn, pk="pk_dead", ck="ck_supp", sig="sig_dead")
+            _domain(conn, "pk_live", "brand.com")
+            _domain(conn, "pk_dead", "ulta.com")
+            _listing(conn, source_product_id="pk_live", sig_group="grp_a")
+            _listing(conn, source_product_id="pk_dead", sig_group="grp_b")
+            conn.execute(text(f"UPDATE catalog_products SET {marker} "
+                              "WHERE product_key = 'pk_dead'"))
+            assert _count_of(conn, "cross_domain_content_key_fragmented_identity") == 0, marker
+
+
+def test_fragmented_identity_uses_the_canonical_identity_join(pg_engine):
+    """The pil join must carry BOTH conjuncts the trust upserter carries.
+
+    A minted (catalog_enrichment_agent_v1) row's source_product_id is a name
+    slug, not a seed id, so a naive `pil.product_id = cp.source_product_id`
+    misses and the group reads NULL — and because count(DISTINCT) skips NULLs,
+    the whole Path-C brand-mint lane would be INVISIBLE here. That lane is one
+    half of exactly the brand-plus-retailer pair this check exists to find.
+    """
     from sqlalchemy import text
 
     with pg_engine.begin() as conn:
         _reset(conn)
-        _product(conn, pk="pk_live", ck="ck_supp", sig="sig_live")
-        _product(conn, pk="pk_dead", ck="ck_supp", sig="sig_dead")
-        _domain(conn, "pk_live", "brand.com")
-        _domain(conn, "pk_dead", "ulta.com")
-        _listing(conn, source_product_id="pk_live", sig_group="grp_a")
-        _listing(conn, source_product_id="pk_dead", sig_group="grp_b")
-        conn.execute(text("UPDATE catalog_products SET suppressed_at = NOW() "
-                          "WHERE product_key = 'pk_dead'"))
+        _product(conn, pk="pk_minted", ck="ck_minted", sig="sig_minted")
+        _product(conn, pk="pk_retailer", ck="ck_minted", sig="sig_retailer")
+        _domain(conn, "pk_minted", "brand.com")
+        _domain(conn, "pk_retailer", "ulta.com")
+        conn.execute(text("UPDATE catalog_products "
+                          "SET source_system = 'catalog_enrichment_agent_v1', "
+                          "    source_product_id = 'a-name-slug-not-a-seed-id' "
+                          "WHERE product_key = 'pk_minted'"))
+        conn.execute(text(
+            "INSERT INTO external_product_seeds "
+            "(external_product_id, attached_product_key, status, updated_at) "
+            "VALUES ('ext_minted_seed', 'pk_minted', 'active', NOW())"))
+        _listing(conn, source_product_id="ext_minted_seed", sig_group="grp_minted")
+        _listing(conn, source_product_id="pk_retailer", sig_group="grp_retailer")
+        assert _count_of(conn, "cross_domain_content_key_fragmented_identity") == 1
+
+
+def test_fragmented_identity_does_not_guess_at_unknown_domains(pg_engine):
+    """#1643: 28% of rows carry no source_domain. A bare column with a '?'
+    sentinel makes unknown-vs-unknown read as AGREEMENT and unknown-vs-known as
+    DISAGREEMENT — wrong in both directions. The chain + NULL means the check
+    fires only when we positively KNOW there are two different domains."""
+    from sqlalchemy import text
+
+    with pg_engine.begin() as conn:
+        _reset(conn)
+        _product(conn, pk="pk_known", ck="ck_unknown_dom", sig="sig_a")
+        _product(conn, pk="pk_unknown", ck="ck_unknown_dom", sig="sig_b")
+        _domain(conn, "pk_known", "brand.com")
+        conn.execute(text("UPDATE catalog_products SET source_domain = NULL "
+                          "WHERE product_key = 'pk_unknown'"))
+        _listing(conn, source_product_id="pk_known", sig_group="grp_a")
+        _listing(conn, source_product_id="pk_unknown", sig_group="grp_b")
+        # One known domain + one unknown is NOT evidence of two retailers.
         assert _count_of(conn, "cross_domain_content_key_fragmented_identity") == 0
+
+
+def test_fragmented_identity_skips_a_sibling_with_no_identity_listing(pg_engine):
+    """Documents the deliberate exemption. "One identified, one not" is a
+    DIFFERENT defect (run the identity graph) from "resolved into two" (merge
+    the groups), so it is out of scope here — the same call
+    public_non_canonical_duplicate makes for a missing election. If this ever
+    starts counting, the threshold becomes a blend of two populations."""
+    with pg_engine.begin() as conn:
+        _reset(conn)
+        _product(conn, pk="pk_listed", ck="ck_half", sig="sig_a")
+        _product(conn, pk="pk_unlisted", ck="ck_half", sig="sig_b")
+        _domain(conn, "pk_listed", "brand.com")
+        _domain(conn, "pk_unlisted", "ulta.com")
+        _listing(conn, source_product_id="pk_listed", sig_group="grp_a")
+        # pk_unlisted deliberately has NO pdp_identity_listing row.
+        assert _count_of(conn, "cross_domain_content_key_fragmented_identity") == 0
+
+
+def test_fragmented_identity_threshold_is_pinned(pg_engine):
+    """The comment says the threshold must never be raised. Nothing enforced
+    that, so a silent bump to 25 would pass CI. This is the enforcement — and
+    the sibling checks pin theirs the same way. Re-measure prod before moving
+    it, and move it DOWN as the merge lands."""
+    assert _named("cross_domain_content_key_fragmented_identity")["default_threshold"] == 18
 
 
 def test_fragmented_identity_sample_returns_the_content_key(pg_engine):

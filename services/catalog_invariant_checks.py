@@ -21,6 +21,7 @@ from db.catalog import catalog_products
 from services.index_pipeline_state_service import QUALITY_SCORE_THRESHOLD
 from services.pdp_renderability import compile_pg, pdp_renderable_expression
 from services.priced_offer_sql import priced_offer_exists_sql
+from services.source_quarantine import CATALOG_PRODUCT_DOMAIN_SQL
 
 logger = logging.getLogger(__name__)
 
@@ -422,36 +423,139 @@ _CHECKS: List[Dict[str, Any]] = [
         # the identity graph on 83/83 of the content_keys it already gets right)
         # rather than on strong identifiers we do not have.
         #
-        # Threshold 20 is the measured baseline, per this module's convention —
-        # the residual awaiting the identity merge, not a blessing. Lower it as
-        # that lands; it must never be raised to accommodate new fragmentation,
-        # which is exactly the regression this is here to catch.
-        "default_threshold": 20,
-        "count_sql": """
+        # DELIBERATELY NOT COUNTED: a content_key whose sibling has NO identity
+        # listing at all (or a NULL group). count(DISTINCT) skips NULLs, so
+        # "one row identified, one not" reads as 1 and is out of scope. That is
+        # the same call `public_non_canonical_duplicate` makes for a missing
+        # election — absence is "not yet resolved", not "resolved into two" — and
+        # they are different defects with different fixes (merge two groups vs.
+        # run the identity graph), so blending them would make this threshold a
+        # mixture of two populations that move independently.
+        #
+        # ⚠️ That exemption needs a companion before it becomes a hiding place,
+        # exactly as `public_multi_row_content_key_without_election` is the
+        # companion that makes the election exemption safe. It does not exist
+        # yet. Measure how many cross-domain content_keys have a listing-less
+        # member before assuming this is a small set.
+        #
+        # Threshold 18 is the measured baseline AFTER excluding the explained
+        # classes — the same discipline the two checks above used (2,265 -> 4;
+        # 32 -> 0), rather than blessing the raw number. The naive form of this
+        # query counted 20; the difference is retired migration-139 duplicates
+        # and NULL-domain artifacts. It is the residual awaiting the identity
+        # merge, not a blessing. Lower it as that lands; it must NEVER be raised
+        # to accommodate new fragmentation, which is the regression this catches.
+        "default_threshold": 18,
+        "count_sql": f"""
             SELECT count(*) AS c FROM (
                 SELECT cp.content_key
-                FROM catalog_products cp
-                LEFT JOIN pdp_identity_listing pil
-                  ON pil.product_id = cp.source_product_id
-                WHERE cp.suppressed_at IS NULL
+                    FROM catalog_products cp
+                -- Canonical identity join, mirrored from
+                -- catalog_row_trust_upserter._PRODUCT_JOIN_SELECT. The naive
+                -- `pil.product_id = cp.source_product_id` is missing TWO conjuncts
+                -- that #1463 added deliberately, and both matter here:
+                --   * merchant_id — source_listing_ref is merchant_id:product_id
+                --     (ADR-008), so product_id ALONE is not unique and the join fans
+                --     out, injecting a foreign merchant's group into the DISTINCT;
+                --   * the minted-lane CASE — a catalog_enrichment_agent_v1 row's
+                --     source_product_id is a name slug, not a seed id, so the join
+                --     misses entirely and the group reads NULL. Since count(DISTINCT)
+                --     skips NULLs, the whole Path-C minted lane would be invisible to
+                --     this check — and that lane is the brand-D2C canonical mint, one
+                --     half of exactly the brand-plus-retailer pair this exists to find.
+                -- LATERAL + LIMIT 1 keeps it one listing per row, which also closes
+                -- the fan-out.
+                    LEFT JOIN LATERAL (
+                    SELECT pil.sellable_item_group_id
+                    FROM pdp_identity_listing pil
+                    WHERE pil.merchant_id = cp.merchant_id
+                      AND pil.product_id = CASE
+                            WHEN cp.source_system = 'catalog_enrichment_agent_v1'
+                              THEN (SELECT s.external_product_id
+                                      FROM external_product_seeds s
+                                     WHERE s.attached_product_key = cp.product_key
+                                     ORDER BY s.updated_at DESC NULLS LAST
+                                     LIMIT 1)
+                            ELSE cp.source_product_id
+                          END
+                    LIMIT 1
+            ) pil ON TRUE
+                    WHERE cp.suppressed_at IS NULL
+                  -- suppression_reason WITHOUT suppressed_at is a real, populated
+                  -- state (see canonical_sitemap_candidates.not_tombstoned). Migration
+                  -- 139 sets ONLY suppression_reason, and its predicate is literally
+                  -- "an external_seed row whose content_key has a live first-party
+                  -- sibling under a different merchant" — a retired cross-merchant
+                  -- duplicate that still carries its own identity listing. Filtering
+                  -- on suppressed_at alone reads those as a live second retailer in a
+                  -- second entity, which is precisely this check's false positive.
+                  AND cp.suppression_reason IS NULL
                   AND cp.content_key IS NOT NULL
                 GROUP BY cp.content_key
-                HAVING count(*) > 1
-                   AND count(DISTINCT coalesce(nullif(cp.source_domain, ''), '?')) > 1
+                -- The domain CHAIN, not cp.source_domain alone (#1643): 28% of rows
+                -- have no source_domain, and a bare column with a '?' sentinel makes
+                -- unknown-vs-unknown read as AGREEMENT and unknown-vs-known as
+                -- DISAGREEMENT — wrong in both directions. nullif to NULL instead, so
+                -- count(DISTINCT) skips unknowns and the check fires only when we
+                -- positively KNOW there are two different domains.
+                HAVING count(DISTINCT nullif({CATALOG_PRODUCT_DOMAIN_SQL}, '')) > 1
                    AND count(DISTINCT pil.sellable_item_group_id) > 1
             ) fragmented
         """,
-        "sample_sql": """
+        "sample_sql": f"""
             SELECT cp.content_key AS subject_key
             FROM catalog_products cp
-            LEFT JOIN pdp_identity_listing pil
-              ON pil.product_id = cp.source_product_id
+            -- Canonical identity join, mirrored from
+            -- catalog_row_trust_upserter._PRODUCT_JOIN_SELECT. The naive
+            -- `pil.product_id = cp.source_product_id` is missing TWO conjuncts
+            -- that #1463 added deliberately, and both matter here:
+            --   * merchant_id — source_listing_ref is merchant_id:product_id
+            --     (ADR-008), so product_id ALONE is not unique and the join fans
+            --     out, injecting a foreign merchant's group into the DISTINCT;
+            --   * the minted-lane CASE — a catalog_enrichment_agent_v1 row's
+            --     source_product_id is a name slug, not a seed id, so the join
+            --     misses entirely and the group reads NULL. Since count(DISTINCT)
+            --     skips NULLs, the whole Path-C minted lane would be invisible to
+            --     this check — and that lane is the brand-D2C canonical mint, one
+            --     half of exactly the brand-plus-retailer pair this exists to find.
+            -- LATERAL + LIMIT 1 keeps it one listing per row, which also closes
+            -- the fan-out.
+            LEFT JOIN LATERAL (
+                SELECT pil.sellable_item_group_id
+                FROM pdp_identity_listing pil
+                WHERE pil.merchant_id = cp.merchant_id
+                  AND pil.product_id = CASE
+                        WHEN cp.source_system = 'catalog_enrichment_agent_v1'
+                          THEN (SELECT s.external_product_id
+                                  FROM external_product_seeds s
+                                 WHERE s.attached_product_key = cp.product_key
+                                 ORDER BY s.updated_at DESC NULLS LAST
+                                 LIMIT 1)
+                        ELSE cp.source_product_id
+                      END
+                LIMIT 1
+            ) pil ON TRUE
             WHERE cp.suppressed_at IS NULL
+              -- suppression_reason WITHOUT suppressed_at is a real, populated
+              -- state (see canonical_sitemap_candidates.not_tombstoned). Migration
+              -- 139 sets ONLY suppression_reason, and its predicate is literally
+              -- "an external_seed row whose content_key has a live first-party
+              -- sibling under a different merchant" — a retired cross-merchant
+              -- duplicate that still carries its own identity listing. Filtering
+              -- on suppressed_at alone reads those as a live second retailer in a
+              -- second entity, which is precisely this check's false positive.
+              AND cp.suppression_reason IS NULL
               AND cp.content_key IS NOT NULL
             GROUP BY cp.content_key
-            HAVING count(*) > 1
-               AND count(DISTINCT coalesce(nullif(cp.source_domain, ''), '?')) > 1
+            -- The domain CHAIN, not cp.source_domain alone (#1643): 28% of rows
+            -- have no source_domain, and a bare column with a '?' sentinel makes
+            -- unknown-vs-unknown read as AGREEMENT and unknown-vs-known as
+            -- DISAGREEMENT — wrong in both directions. nullif to NULL instead, so
+            -- count(DISTINCT) skips unknowns and the check fires only when we
+            -- positively KNOW there are two different domains.
+            HAVING count(DISTINCT nullif({CATALOG_PRODUCT_DOMAIN_SQL}, '')) > 1
                AND count(DISTINCT pil.sellable_item_group_id) > 1
+            ORDER BY cp.content_key
             LIMIT 5
         """,
     },
