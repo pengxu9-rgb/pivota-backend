@@ -27,8 +27,15 @@ from typing import Any, Dict, List, Optional
 
 import pytest
 
+from db.catalog import (
+    catalog_merchants,
+    catalog_offers,
+    catalog_products,
+    catalog_skus,
+)
 from db.database import database
 from services import pivot_query_service as svc
+from tests.model_schema import ensure_model_tables
 
 
 _PREFIX = "h1h3"
@@ -42,197 +49,19 @@ async def _connect_if_needed() -> bool:
 
 
 async def _ensure_schema() -> None:
-    """NULLABILITY MIRRORS PRODUCTION EXACTLY — `db/migrations/058_catalog_core.sql`.
+    """Create the catalog core from `db/catalog.py` — never from hand-written DDL.
 
-    These tables are created by whichever test module reaches them first in a
-    full-suite run, so a fixture that relaxes a NOT NULL passes in isolation and
-    dies the moment the real DDL wins the race. That is not hypothetical: the
-    first push of this PR omitted `catalog_skus.merchant_id NOT NULL` and CI's
-    `sweep` failed on every insert — the SAME defect the previous PR shipped with
-    `merchant_stores.name`. Keep every NOT NULL here, and have the seed helpers
-    supply all of them.
+    This module used to carry ~110 lines of `CREATE TABLE` plus a ~50-entry
+    hardcoded `ALTER TABLE ADD COLUMN` list. Both were liabilities: the DDL was
+    narrower than the model (it omitted `pivota_signature_id`, which poisoned
+    `tests/test_index_pipeline_state_service.py` whenever this file won the
+    create race), and the ALTER list was a mask that manufactured every column
+    the lane SELECTs regardless of what the real schema holds. See
+    `tests/model_schema.py` for the full argument and the SQLite specifics.
     """
-    ddl = [
-        """
-        CREATE TABLE IF NOT EXISTS catalog_products (
-            product_key VARCHAR(255) PRIMARY KEY,
-            merchant_id VARCHAR(64) NOT NULL,
-            platform VARCHAR(64) NOT NULL,
-            source_product_id VARCHAR(128) NOT NULL,
-            catalog_track VARCHAR(32) NOT NULL DEFAULT 'internal_merchant',
-            truth_tier VARCHAR(32) NOT NULL DEFAULT 'primary',
-            readiness_tier VARCHAR(32) NOT NULL DEFAULT 'commerce_ready',
-            source_system VARCHAR(64),
-            source_ref VARCHAR(255),
-            title TEXT NOT NULL,
-            description TEXT,
-            brand VARCHAR(255),
-            product_type VARCHAR(255),
-            category VARCHAR(255),
-            category_path TEXT,
-            canonical_url TEXT,
-            image_url TEXT,
-            product_payload TEXT,
-            freshness_json TEXT,
-            pdp_scope TEXT,
-            pdp_lifecycle_stage TEXT,
-            sync_status TEXT DEFAULT 'live',
-            content_key TEXT,
-            suppressed_at TIMESTAMP,
-            suppression_reason TEXT,
-            created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
-            updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP
-        )
-        """,
-        """
-        CREATE TABLE IF NOT EXISTS catalog_skus (
-            sku_key VARCHAR(255) PRIMARY KEY,
-            product_key VARCHAR(255) NOT NULL,
-            merchant_id VARCHAR(64) NOT NULL,
-            platform VARCHAR(64) NOT NULL,
-            source_product_id VARCHAR(128) NOT NULL,
-            source_variant_id VARCHAR(128) NOT NULL,
-            sku VARCHAR(128),
-            barcode VARCHAR(128),
-            title TEXT NOT NULL,
-            currency VARCHAR(16),
-            image_url TEXT,
-            visible_attributes TEXT,
-            visible_option_labels TEXT,
-            ingredient_ids TEXT,
-            sku_payload TEXT,
-            readiness_tier VARCHAR(32) NOT NULL DEFAULT 'commerce_ready',
-            suppressed_at TIMESTAMP,
-            suppression_reason TEXT,
-            created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
-            updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP
-        )
-        """,
-        """
-        CREATE TABLE IF NOT EXISTS catalog_offers (
-            offer_id VARCHAR(255) PRIMARY KEY,
-            sku_key VARCHAR(255) NOT NULL,
-            product_key VARCHAR(255) NOT NULL,
-            merchant_id VARCHAR(64) NOT NULL,
-            catalog_track VARCHAR(32) NOT NULL DEFAULT 'internal_merchant',
-            truth_tier VARCHAR(32) NOT NULL DEFAULT 'primary',
-            readiness_tier VARCHAR(32) NOT NULL DEFAULT 'commerce_ready',
-            offer_mode VARCHAR(32) NOT NULL DEFAULT 'merchant_checkout',
-            channel VARCHAR(64) NOT NULL DEFAULT 'default',
-            availability VARCHAR(32) NOT NULL DEFAULT 'unknown',
-            inventory_quantity INTEGER,
-            currency VARCHAR(16),
-            list_price NUMERIC(12, 2),
-            merchant_effective_price NUMERIC(12, 2),
-            estimated_best_price NUMERIC(12, 2),
-            price_confidence NUMERIC(5, 2),
-            source_system VARCHAR(64),
-            source_ref VARCHAR(255),
-            offer_type TEXT,
-            market TEXT,
-            is_first_party BOOLEAN,
-            source_domain TEXT,
-            why_buy_direct TEXT,
-            offer_payload TEXT,
-            suppressed_at TIMESTAMP,
-            created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
-            updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP
-        )
-        """,
-        """
-        CREATE TABLE IF NOT EXISTS catalog_merchants (
-            merchant_id VARCHAR(64) PRIMARY KEY,
-            merchant_name VARCHAR(255),
-            primary_platform VARCHAR(64),
-            status VARCHAR(32) NOT NULL DEFAULT 'active',
-            indexable BOOLEAN NOT NULL DEFAULT TRUE,
-            source_system VARCHAR(64),
-            source_ref VARCHAR(255),
-            metadata_json TEXT,
-            created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
-            updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP
-        )
-        """,
-    ]
-    for stmt in ddl:
-        await database.execute(stmt)
-    # Whichever module wins the create race, this file must be able to INSERT.
-    # The list is EVERY column the seed helpers write plus every column the lane
-    # SELECTs — not just the ones added by later migrations. Narrower was not
-    # enough: with `tests/test_index_pipeline_state_service.py` running first
-    # (it precedes this file alphabetically and creates catalog_products from a
-    # 13-column DDL), the seeds died on `no column named catalog_track`. CI is
-    # safe today only because some earlier module happens to run
-    # `metadata.create_all` and pytest-randomly is not installed — i.e. by
-    # ordering luck, which is not a property worth depending on.
-    for table, column, coltype in (
-        ("catalog_products", "catalog_track", "VARCHAR(32) DEFAULT 'internal_merchant'"),
-        ("catalog_products", "truth_tier", "VARCHAR(32) DEFAULT 'primary'"),
-        ("catalog_products", "readiness_tier", "VARCHAR(32) DEFAULT 'commerce_ready'"),
-        ("catalog_products", "source_system", "VARCHAR(64)"),
-        ("catalog_products", "product_type", "VARCHAR(255)"),
-        ("catalog_products", "category", "VARCHAR(255)"),
-        ("catalog_products", "category_path", "TEXT"),
-        ("catalog_products", "canonical_url", "TEXT"),
-        ("catalog_products", "image_url", "TEXT"),
-        ("catalog_products", "freshness_json", "TEXT"),
-        ("catalog_products", "pdp_scope", "TEXT"),
-        ("catalog_products", "pdp_lifecycle_stage", "TEXT"),
-        ("catalog_products", "sync_status", "TEXT DEFAULT 'live'"),
-        ("catalog_products", "content_key", "TEXT"),
-        ("catalog_products", "suppressed_at", "TIMESTAMP"),
-        ("catalog_products", "suppression_reason", "TEXT"),
-        ("catalog_skus", "merchant_id", "VARCHAR(64)"),
-        ("catalog_skus", "platform", "VARCHAR(64)"),
-        ("catalog_skus", "source_product_id", "VARCHAR(128)"),
-        ("catalog_skus", "readiness_tier", "VARCHAR(32) DEFAULT 'commerce_ready'"),
-        ("catalog_skus", "visible_attributes", "TEXT"),
-        ("catalog_skus", "visible_option_labels", "TEXT"),
-        ("catalog_skus", "ingredient_ids", "TEXT"),
-        ("catalog_skus", "image_url", "TEXT"),
-        ("catalog_skus", "barcode", "VARCHAR(128)"),
-        ("catalog_skus", "suppressed_at", "TIMESTAMP"),
-        ("catalog_skus", "suppression_reason", "TEXT"),
-        ("catalog_offers", "catalog_track", "VARCHAR(32) DEFAULT 'internal_merchant'"),
-        ("catalog_offers", "truth_tier", "VARCHAR(32) DEFAULT 'primary'"),
-        ("catalog_offers", "readiness_tier", "VARCHAR(32) DEFAULT 'commerce_ready'"),
-        ("catalog_offers", "offer_mode", "VARCHAR(32) DEFAULT 'merchant_checkout'"),
-        ("catalog_offers", "channel", "VARCHAR(64) DEFAULT 'default'"),
-        ("catalog_offers", "availability", "VARCHAR(32) DEFAULT 'unknown'"),
-        ("catalog_offers", "inventory_quantity", "INTEGER"),
-        ("catalog_offers", "currency", "VARCHAR(16)"),
-        ("catalog_offers", "list_price", "NUMERIC"),
-        ("catalog_offers", "merchant_effective_price", "NUMERIC"),
-        ("catalog_offers", "estimated_best_price", "NUMERIC"),
-        ("catalog_offers", "price_confidence", "NUMERIC"),
-        ("catalog_offers", "source_system", "VARCHAR(64)"),
-        ("catalog_offers", "offer_payload", "TEXT"),
-        ("catalog_offers", "suppressed_at", "TIMESTAMP"),
-        ("catalog_offers", "offer_type", "TEXT"),
-        ("catalog_offers", "market", "TEXT"),
-        ("catalog_offers", "is_first_party", "BOOLEAN"),
-        ("catalog_offers", "source_domain", "TEXT"),
-        ("catalog_offers", "why_buy_direct", "TEXT"),
-        ("catalog_merchants", "indexable", "BOOLEAN NOT NULL DEFAULT TRUE"),
-        ("catalog_merchants", "metadata_json", "TEXT"),
-        ("catalog_merchants", "primary_platform", "VARCHAR(64)"),
-        ("catalog_products", "created_at", "TIMESTAMP"),
-        ("catalog_products", "updated_at", "TIMESTAMP"),
-        ("catalog_skus", "created_at", "TIMESTAMP"),
-        ("catalog_skus", "updated_at", "TIMESTAMP"),
-        ("catalog_offers", "created_at", "TIMESTAMP"),
-        ("catalog_offers", "updated_at", "TIMESTAMP"),
-        ("catalog_merchants", "created_at", "TIMESTAMP"),
-        ("catalog_merchants", "updated_at", "TIMESTAMP"),
-    ):
-        try:
-            await database.execute(f"ALTER TABLE {table} ADD COLUMN {column} {coltype}")
-        except Exception as e:  # noqa: BLE001
-            # Only "already exists" is expected. Anything else is a real schema
-            # problem and must not be swallowed into a confusing INSERT failure
-            # ten lines later.
-            if "duplicate column" not in str(e).lower():
-                raise
+    await ensure_model_tables(
+        (catalog_merchants, catalog_products, catalog_skus, catalog_offers)
+    )
 
 
 async def _reset() -> None:

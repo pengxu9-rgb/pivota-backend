@@ -93,17 +93,36 @@ def test_upsert_orchestration_best_effort(monkeypatch):
     import db.database
     import services.agent_pdp_view_assembler as asm
     import services.audit_index_intake as intake
+    import services.catalog_sync_service as css
+    import services.seller_identity as si
 
     calls = {"execute": 0, "refresh": None}
 
     async def _fake_execute(stmt):
         calls["execute"] += 1
 
+    async def _fake_upsert_merchant(**kwargs):
+        pass
+
     async def _fake_refresh(ck, *, refresh_source, db=None):
         calls["refresh"] = (ck, refresh_source)
         return True
 
     monkeypatch.setattr(db.database.database, "execute", _fake_execute)
+    # The merchant upserts are mocked out so `execute` counts ONLY the
+    # catalog_products write this test is about. Both bindings, deliberately:
+    # services/seller_identity.py:49 does a MODULE-LEVEL
+    # `from services.catalog_sync_service import upsert_catalog_merchant`, so
+    # patching `css` alone intercepts it only when seller_identity happens to be
+    # imported for the first time inside this test.
+    #
+    # Without these, `execute` counts 2 on a production-shaped catalog_merchants:
+    # the intake's own merchant upsert lands as well. It counted 1 only while a
+    # narrow test fixture made that upsert fail into its best-effort `except` —
+    # i.e. the assertion was pinning a swallowed exception, and it flipped red as
+    # soon as the fixture matched the real schema.
+    monkeypatch.setattr(css, "upsert_catalog_merchant", _fake_upsert_merchant)
+    monkeypatch.setattr(si, "upsert_catalog_merchant", _fake_upsert_merchant)
     monkeypatch.setattr(asm, "refresh_agent_pdp_view_for_content_key", _fake_refresh)
 
     out = asyncio.run(
@@ -322,6 +341,7 @@ def test_upsert_wires_merchant_row_and_eligibility_recompute(monkeypatch):
     import services.audit_index_intake as intake
     import services.catalog_sync_service as css
     import services.index_pipeline_state_service as ips
+    import services.seller_identity as si
 
     executed = []
     merchant_calls = []
@@ -344,6 +364,10 @@ def test_upsert_wires_merchant_row_and_eligibility_recompute(monkeypatch):
 
     monkeypatch.setattr(db.database.database, "execute", _fake_execute)
     monkeypatch.setattr(css, "upsert_catalog_merchant", _fake_upsert_merchant)
+    # seller_identity binds upsert_catalog_merchant at MODULE level (line 49), so
+    # patching `css` alone catches its call only when seller_identity is first
+    # imported inside this test. Patch both so `merchant_calls` is deterministic.
+    monkeypatch.setattr(si, "upsert_catalog_merchant", _fake_upsert_merchant)
     monkeypatch.setattr(asm, "refresh_agent_pdp_view_for_content_key", _fake_refresh)
     monkeypatch.setattr(ips, "recompute_serving_eligibility", _fake_recompute)
 
@@ -355,9 +379,31 @@ def test_upsert_wires_merchant_row_and_eligibility_recompute(monkeypatch):
     # Serve chain: a catalog_merchants row is upserted (indexable default true,
     # status='active') so the by-signature PDP inner-join resolves for a
     # store-less URL-tier merchant.
-    assert len(merchant_calls) == 1
-    assert merchant_calls[0]["merchant_id"] == "m_anua"
-    assert merchant_calls[0]["primary_platform"] == PLATFORM_URL_AUDIT
+    #
+    # Filtered to the AUDITING merchant rather than asserting a bare
+    # `len(merchant_calls) == 1`. On a production-shaped catalog_merchants the
+    # intake upserts TWO merchant rows — this one, plus the observed seller that
+    # ensure_observed_seller resolves from the destination domain
+    # (merch_obs_<hash>). The bare count read 1 only while a narrow test fixture
+    # made the seller lane fail into its best-effort `except`, so it pinned a
+    # swallowed exception and flipped red the moment the fixture matched the real
+    # schema. Filtering also keeps this test off the seller lane's back.
+    audit_upserts = [c for c in merchant_calls if c["merchant_id"] == "m_anua"]
+    assert len(audit_upserts) == 1
+    assert audit_upserts[0]["primary_platform"] == PLATFORM_URL_AUDIT
+
+    # The count stays TOTAL. Filtering to m_anua alone would constrain only that
+    # id and silently permit any OTHER merchant upsert — including a write to the
+    # `external_seed` placeholder bucket that services/seller_identity.py:61
+    # (BANNED_BUCKET_MERCHANT_ID, ADR-009 D2) exists to forbid. Verified: adding
+    # such an upsert to the intake leaves the whole suite green without this line
+    # and turns this test red with it.
+    unexpected = [
+        c["merchant_id"]
+        for c in merchant_calls
+        if c["merchant_id"] != "m_anua" and not c["merchant_id"].startswith("merch_obs_")
+    ]
+    assert unexpected == [], f"unexpected catalog_merchants upserts: {unexpected}"
 
     # exactly one catalog_products upsert (the merchant upsert is mocked out).
     assert len(executed) == 1

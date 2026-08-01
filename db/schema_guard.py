@@ -1691,17 +1691,27 @@ async def ensure_required_schema_light() -> None:
             sqlite_type = {
                 ("merchant_stores", "is_primary"): "BOOLEAN DEFAULT FALSE",
                 ("merchant_stores", "order_writeback_status"): "TEXT DEFAULT 'disabled'",
-                # Types MUST match migration 190. A heal that disagrees with the
-                # real schema is worse than no heal: it makes a self-healed
+                # DEFAULTS MUST MATCH THE MIGRATION. A heal that disagrees with
+                # the real schema is worse than no heal: it makes a self-healed
                 # SQLite DB behave unlike prod for exactly the first executing
-                # test that touches it (see the catalog_merchants.indexable
-                # DEFAULT FALSE / prod DEFAULT TRUE divergence two lines down).
+                # test that touches it. Enforced by
+                # tests/test_schema_guard_sqlite_heal_defaults.py.
+                #
+                # Type NAMES may differ where SQLite has no equivalent
+                # (TIMESTAMPTZ -> TIMESTAMP, BIGINT -> NUMERIC); SQLite's
+                # dynamic typing makes that harmless. The DEFAULT VALUE may not.
                 ("merchant_stores", "upstream_probe_at"): "TIMESTAMP",
                 ("merchant_stores", "upstream_probe_status"): "TEXT",
                 ("merchant_stores", "upstream_probe_http_status"): "INTEGER",
                 ("merchant_stores", "upstream_probe_failures"): "INTEGER NOT NULL DEFAULT 0",
                 ("merchant_stores", "created_at"): "TIMESTAMP DEFAULT CURRENT_TIMESTAMP",
-                ("catalog_merchants", "indexable"): "BOOLEAN DEFAULT FALSE",
+                # migration 139: BOOLEAN NOT NULL DEFAULT TRUE. This read
+                # DEFAULT FALSE until 2026-08-01 — copy-pasted from the
+                # is_primary line above (#1536) — which meant a self-healed
+                # SQLite DB marked EVERY existing merchant non-indexable, and
+                # `COALESCE(m.indexable, TRUE) IS TRUE` then dropped all of them
+                # from cross-merchant recall.
+                ("catalog_merchants", "indexable"): "BOOLEAN NOT NULL DEFAULT TRUE",
                 ("merchant_credit_balance", "purchased_credits"): "NUMERIC DEFAULT 0",
                 ("merchant_credit_balance", "overage_pending_credits"): "NUMERIC DEFAULT 0",
                 ("merchant_credit_balance", "overage_charged_credits"): "NUMERIC DEFAULT 0",

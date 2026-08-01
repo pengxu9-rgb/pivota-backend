@@ -7,8 +7,12 @@ from typing import Any, Dict, Optional
 
 import pytest
 
+from db.catalog import agent_pdp_view, catalog_offers, catalog_products
 from db.database import database
+from db.external_offers import external_offer_snapshots
+from db.product_quality import product_quality_snapshot
 from services import index_pipeline_state_service as svc
+from tests.model_schema import ensure_model_tables
 
 
 _PREFIX = "vis2"
@@ -22,49 +26,31 @@ async def _connect_if_needed() -> bool:
 
 
 async def _ensure_schema() -> None:
+    """Model-derived where a model exists; hand-written only where none does.
+
+    catalog_products / catalog_offers / product_quality_snapshot /
+    agent_pdp_view / external_offer_snapshots all have SQLAlchemy models, so
+    they come from those verbatim — see tests/model_schema.py for why a
+    hand-written copy is a liability in BOTH directions. The 13-column
+    catalog_products this replaces is the narrow-fixture half of that argument:
+    it poisoned every neighbour that reads a column it omitted.
+
+    The remaining four tables have no model anywhere in the repo
+    (index_pipeline_state, external_product_seeds, product_group_members,
+    domain_extractor_baselines), so there is nothing to derive them from and
+    their DDL stays here.
+    """
+    await ensure_model_tables(
+        (
+            catalog_products,
+            catalog_offers,
+            product_quality_snapshot,
+            agent_pdp_view,
+            external_offer_snapshots,
+        )
+    )
+
     ddl = [
-        """
-        CREATE TABLE IF NOT EXISTS catalog_products (
-            product_key TEXT PRIMARY KEY,
-            merchant_id TEXT NOT NULL,
-            platform TEXT NOT NULL,
-            source_product_id TEXT NOT NULL,
-            title TEXT NOT NULL,
-            description TEXT,
-            brand TEXT,
-            pdp_scope TEXT DEFAULT 'unverified',
-            sync_status TEXT DEFAULT 'live',
-            canonical_url TEXT,
-            pivota_signature_id TEXT,
-            content_key TEXT,
-            updated_at TIMESTAMP
-        )
-        """,
-        """
-        CREATE TABLE IF NOT EXISTS product_quality_snapshot (
-            id INTEGER PRIMARY KEY,
-            merchant_id TEXT NOT NULL,
-            platform TEXT NOT NULL,
-            platform_product_id TEXT NOT NULL,
-            content_quality_score REAL,
-            model_readiness_score REAL,
-            conversion_potential_score REAL,
-            rules_version TEXT,
-            snapshot_date TIMESTAMP
-        )
-        """,
-        """
-        CREATE TABLE IF NOT EXISTS agent_pdp_view (
-            content_key TEXT PRIMARY KEY,
-            pivota_signature_id TEXT,
-            title TEXT NOT NULL,
-            description TEXT,
-            image_url TEXT,
-            sync_status TEXT,
-            pdp_lifecycle_stage TEXT,
-            refreshed_at TIMESTAMP
-        )
-        """,
         """
         CREATE TABLE IF NOT EXISTS external_product_seeds (
             id TEXT PRIMARY KEY,
@@ -78,27 +64,6 @@ async def _ensure_schema() -> None:
             attached_product_key TEXT,
             status TEXT NOT NULL DEFAULT 'active',
             updated_at TIMESTAMP
-        )
-        """,
-        """
-        CREATE TABLE IF NOT EXISTS catalog_offers (
-            offer_id TEXT PRIMARY KEY,
-            sku_key TEXT,
-            product_key TEXT,
-            merchant_id TEXT,
-            list_price REAL,
-            merchant_effective_price REAL,
-            currency TEXT DEFAULT 'USD',
-            suppressed_at TIMESTAMP
-        )
-        """,
-        """
-        CREATE TABLE IF NOT EXISTS external_offer_snapshots (
-            id TEXT PRIMARY KEY,
-            market TEXT NOT NULL DEFAULT 'US',
-            canonical_url TEXT,
-            url_hash TEXT,
-            domain TEXT
         )
         """,
         """
@@ -146,31 +111,9 @@ async def _ensure_schema() -> None:
     ]
     for statement in ddl:
         await database.execute(statement)
-    offer_columns = await database.fetch_all("PRAGMA table_info(catalog_offers)")
-    if "suppressed_at" not in {dict(row).get("name") for row in offer_columns}:
-        await database.execute("ALTER TABLE catalog_offers ADD COLUMN suppressed_at TIMESTAMP")
-    # has_us_offer is derived from currency; backstop for test DBs created before
-    # the column existed (mirrors the suppressed_at backstop above).
-    if "currency" not in {dict(row).get("name") for row in offer_columns}:
-        await database.execute(
-            "ALTER TABLE catalog_offers ADD COLUMN currency TEXT DEFAULT 'USD'"
-        )
-    # services/priced_offer_sql coalesces merchant_effective_price over
-    # list_price; backstop for test DBs created before the column existed
-    # (mirrors the suppressed_at backstop above).
-    if "merchant_effective_price" not in {dict(row).get("name") for row in offer_columns}:
-        await database.execute(
-            "ALTER TABLE catalog_offers ADD COLUMN merchant_effective_price REAL"
-        )
-    # Row suppression: backstop for test DBs created before
-    # catalog_products.suppressed_at existed (mirrors the offer backstop above).
-    cp_columns = await database.fetch_all("PRAGMA table_info(catalog_products)")
-    if "suppressed_at" not in {dict(row).get("name") for row in cp_columns}:
-        await database.execute(
-            "ALTER TABLE catalog_products ADD COLUMN suppressed_at TIMESTAMP"
-        )
     # ADR-008 SLICE 1: backstop for test DBs created before index_eligible
-    # existed (mirrors the suppressed_at backstop above).
+    # existed. index_pipeline_state has no model, so unlike the catalog tables
+    # above this one still needs a hand-written backstop.
     ips_columns = await database.fetch_all("PRAGMA table_info(index_pipeline_state)")
     if "index_eligible" not in {dict(row).get("name") for row in ips_columns}:
         await database.execute(
