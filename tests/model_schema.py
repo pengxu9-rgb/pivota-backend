@@ -19,8 +19,25 @@ a red CI:
   `no column named pivota_signature_id`. Alphabetical collection hid that from
   CI; `--lf` or any `-k` subset does not.
 
-Deriving from the model makes both impossible: the fixture IS the model, so it
-can be neither laxer nor richer than what production runs.
+Deriving from the model closes both: the COLUMN SET is the model's, so nothing
+can be missing and nothing can be invented.
+
+It is not a full guarantee of nullability, and the limit is worth stating
+precisely because the create_all path and the patch path differ:
+
+  * create_all path (this module created the table) — exact production DDL:
+    every NOT NULL, every default, every index.
+  * patch path (someone else created it first) — columns only. SQLite cannot
+    express `ADD COLUMN ... NOT NULL` without a constant default, so a NOT NULL
+    column that has no server_default (catalog_products.title,
+    catalog_skus.merchant_id, ...) or a func.now() one (created_at, updated_at)
+    is added NULLABLE, and indexes/UNIQUE constraints are not built at all.
+
+So a fixture patched onto a neighbour's table is still laxer than production on
+nullability. That is strictly better than the hand-written DDL it replaces —
+which was laxer on nullability AND missing columns outright — but it is not
+"the fixture IS the model", and a test that depends on a NOT NULL firing must
+not rely on this helper for it.
 
 This lives in its own module rather than in `tests/conftest.py` because pytest
 imports conftest as top-level `conftest`, so a test module doing
