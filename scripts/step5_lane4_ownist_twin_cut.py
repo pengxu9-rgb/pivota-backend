@@ -62,6 +62,7 @@ WHERE cp.merchant_id = 'external_seed'
 SUPPRESS_SQL = """
 UPDATE catalog_products cp
 SET suppression_reason = $1,
+    suppressed_at = COALESCE(suppressed_at, NOW()),
     suppression_metadata = $2::jsonb,
     updated_at = NOW()
 WHERE cp.merchant_id = 'external_seed'

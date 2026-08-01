@@ -178,6 +178,67 @@ _SERVING_NOT_RENDERABLE_SAMPLE_SQL = compile_pg(
 # renderable and ZERO rows away from it.
 _CHECKS: List[Dict[str, Any]] = [
     {
+        # P1a (#1648). `suppressed_at` is THE gate column — every SQL lane, IPS
+        # (`index_pipeline_state_service`: `row_suppressed = suppressed_at is
+        # not None`) and now the recall/by-key/quote doors read it.
+        # `suppression_reason` is the LABEL, and `catalog_trust_policy.
+        # _derive_source_lifecycle` tombstones on the label alone. A row with
+        # the label and no timestamp is therefore simultaneously "withdrawn" to
+        # the trust policy and "clean" to everything that decides serving —
+        # which is exactly how a retired test rig kept serving on public search.
+        #
+        # 2,332 rows were in that state on 2026-07-30 across seven cohorts. The
+        # backfill converged them; this check is what stops the NEXT writer
+        # minting more. Threshold 0: there is no acceptable number of these.
+        "name": "suppression_reason_without_timestamp",
+        "description": (
+            "catalog row carries suppression_reason but no suppressed_at — "
+            "tombstoned to catalog_trust_policy, CLEAN to every serving gate"
+        ),
+        "env": "CATALOG_INVARIANT_SUPPRESSION_SPLIT_THRESHOLD",
+        "default_threshold": 0,
+        "count_sql": """
+            SELECT count(*) AS c
+            FROM catalog_products
+            WHERE suppression_reason IS NOT NULL
+              AND suppressed_at IS NULL
+        """,
+        "sample_sql": """
+            SELECT product_key AS subject_key
+            FROM catalog_products
+            WHERE suppression_reason IS NOT NULL
+              AND suppressed_at IS NULL
+            LIMIT 5
+        """,
+    },
+    {
+        # The mirror, and the one the 2026-07-30 backfill CREATED the risk of:
+        # every revert path cleared `suppression_reason` alone, so after the
+        # backfill a revert would leave `suppressed_at` set and the row gated
+        # forever — a revert that silently does not revert. Fixed in the same
+        # change; this is the alarm if a revert path regresses.
+        "name": "suppression_timestamp_without_reason",
+        "description": (
+            "catalog row is gated by suppressed_at but carries no reason — "
+            "usually a revert that cleared only the label"
+        ),
+        "env": "CATALOG_INVARIANT_SUPPRESSION_ORPHAN_THRESHOLD",
+        "default_threshold": 0,
+        "count_sql": """
+            SELECT count(*) AS c
+            FROM catalog_products
+            WHERE suppressed_at IS NOT NULL
+              AND suppression_reason IS NULL
+        """,
+        "sample_sql": """
+            SELECT product_key AS subject_key
+            FROM catalog_products
+            WHERE suppressed_at IS NOT NULL
+              AND suppression_reason IS NULL
+            LIMIT 5
+        """,
+    },
+    {
         "name": "public_but_suppressed",
         "description": "trust says public but catalog row is tombstoned",
         "env": "CATALOG_INVARIANT_SUPPRESSED_THRESHOLD",

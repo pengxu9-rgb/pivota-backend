@@ -27,7 +27,8 @@ PROPOSE -> REVIEW -> APPLY:
 
 Revert (by run):
   UPDATE catalog_products
-  SET suppression_reason = NULL, suppression_metadata = NULL, updated_at = NOW()
+  SET suppression_reason = NULL, suppressed_at = NULL,
+      suppression_metadata = NULL, updated_at = NOW()
   WHERE suppression_reason = 'step5_same_merchant_same_url_dup'
     AND suppression_metadata->>'run_id' = '<run_id printed at apply time>';
   (Seed reactivation, if wanted, via the seed ids listed in the apply output.)
@@ -75,6 +76,7 @@ WHERE cp.product_key = ANY($1::text[])
 SUPPRESS_SQL = """
 UPDATE catalog_products cp
 SET suppression_reason = $2,
+    suppressed_at = COALESCE(suppressed_at, NOW()),
     suppression_metadata = $3::jsonb,
     updated_at = NOW()
 WHERE cp.product_key = ANY($1::text[])

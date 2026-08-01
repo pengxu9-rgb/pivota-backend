@@ -131,6 +131,7 @@ WHERE merchant_id = $1 AND content_key = $2 AND suppression_reason IS NULL
 SUPPRESS_SQL = """
 UPDATE catalog_products cp
 SET suppression_reason = $2,
+    suppressed_at = COALESCE(suppressed_at, NOW()),
     suppression_metadata = $3::jsonb,
     updated_at = NOW()
 WHERE cp.product_key = ANY($1::text[])
@@ -191,7 +192,8 @@ VALUES ($1, $2, $3, $4::jsonb)
 
 REVERT_ROWS_SQL = """
 UPDATE catalog_products
-SET suppression_reason = NULL, suppression_metadata = NULL, updated_at = NOW()
+SET suppression_reason = NULL, suppressed_at = NULL, suppression_metadata = NULL,
+    updated_at = NOW()
 WHERE suppression_reason LIKE 'd2\\_%'
   AND suppression_metadata->>'run_id' = $1
 RETURNING product_key
