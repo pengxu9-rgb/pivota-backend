@@ -390,6 +390,72 @@ _CHECKS: List[Dict[str, Any]] = [
         """,
     },
     {
+        "name": "cross_domain_content_key_fragmented_identity",
+        "description": (
+            "one physical product is carried by more than one retailer domain, "
+            "but its rows resolve to more than one sellable_item_group_id — the "
+            "identity graph has split a single product across entities"
+        ),
+        "env": "CATALOG_INVARIANT_FRAGMENTED_IDENTITY_THRESHOLD",
+        # WHAT THIS IS FOR, and why it is worth a check for only 20 rows.
+        #
+        # content_key identifies the PHYSICAL PRODUCT ACROSS MERCHANTS
+        # (services/catalog_identity), so a content_key spanning >1 source_domain
+        # is the multi-retailer case working as designed. Those rows should share
+        # ONE sellable_item_group_id — the entity that checkoutHandoffResolver,
+        # acpFeedSource, discoveryFeed, RecommendationEngine,
+        # productEntityIndexFeed and catalogEntityResolution all key off. When
+        # they do not, one product is split across two entities and every one of
+        # those surfaces sees half of it.
+        #
+        # THIS GROWS WITH INGEST, which is the actual reason it exists. A
+        # content_key only becomes multi-domain when a SECOND retailer carries a
+        # product we already have, so the set is a direct function of retailer
+        # breadth. Measured 2026-07-31 the corpus is ~90% brand-D2C (214 domains,
+        # the top ones all brand sites) and only 103 of 10,257 content_keys are
+        # cross-domain — 20 of those are fragmented. Ingest retailers at scale
+        # and cross-domain becomes the norm rather than 1%.
+        #
+        # GTIN CANNOT BACKSTOP THIS. Measured the same day: 0 of 10,468
+        # unsuppressed catalog_products rows carry a gtin — not sparse, EMPTY. Any
+        # future repair has to lean on product_group_members (which agrees with
+        # the identity graph on 83/83 of the content_keys it already gets right)
+        # rather than on strong identifiers we do not have.
+        #
+        # Threshold 20 is the measured baseline, per this module's convention —
+        # the residual awaiting the identity merge, not a blessing. Lower it as
+        # that lands; it must never be raised to accommodate new fragmentation,
+        # which is exactly the regression this is here to catch.
+        "default_threshold": 20,
+        "count_sql": """
+            SELECT count(*) AS c FROM (
+                SELECT cp.content_key
+                FROM catalog_products cp
+                LEFT JOIN pdp_identity_listing pil
+                  ON pil.product_id = cp.source_product_id
+                WHERE cp.suppressed_at IS NULL
+                  AND cp.content_key IS NOT NULL
+                GROUP BY cp.content_key
+                HAVING count(*) > 1
+                   AND count(DISTINCT coalesce(nullif(cp.source_domain, ''), '?')) > 1
+                   AND count(DISTINCT pil.sellable_item_group_id) > 1
+            ) fragmented
+        """,
+        "sample_sql": """
+            SELECT cp.content_key AS subject_key
+            FROM catalog_products cp
+            LEFT JOIN pdp_identity_listing pil
+              ON pil.product_id = cp.source_product_id
+            WHERE cp.suppressed_at IS NULL
+              AND cp.content_key IS NOT NULL
+            GROUP BY cp.content_key
+            HAVING count(*) > 1
+               AND count(DISTINCT coalesce(nullif(cp.source_domain, ''), '?')) > 1
+               AND count(DISTINCT pil.sellable_item_group_id) > 1
+            LIMIT 5
+        """,
+    },
+    {
         "name": "elected_canonical_below_quality_floor",
         "description": (
             "the elected canonical row for a serving content_key scores below "

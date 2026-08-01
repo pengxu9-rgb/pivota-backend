@@ -729,3 +729,109 @@ def test_elected_below_floor_sample_returns_the_content_key(pg_engine):
             __import__("sqlalchemy").text(
                 _named("elected_canonical_below_quality_floor")["sample_sql"])).fetchall()
         assert [r[0] for r in rows] == ["ck_sample_circ"]
+
+
+# ---------------------------------------------------------------------------
+# cross_domain_content_key_fragmented_identity — one product, two entities
+# ---------------------------------------------------------------------------
+
+
+def _listing(conn, *, source_product_id, sig_group, merchant_id="external_seed"):
+    from sqlalchemy import text
+
+    conn.execute(
+        text("INSERT INTO pdp_identity_listing "
+             "(source_listing_ref, product_id, merchant_id, sellable_item_group_id, "
+             " identity_status) "
+             "VALUES (:ref, :pid, :m, :sig, 'approved')"),
+        {"ref": f"{merchant_id}:{source_product_id}", "pid": source_product_id,
+         "m": merchant_id, "sig": sig_group},
+    )
+
+
+def _domain(conn, pk, domain):
+    from sqlalchemy import text
+
+    conn.execute(text("UPDATE catalog_products SET source_domain = :d "
+                      "WHERE product_key = :pk"), {"d": domain, "pk": pk})
+
+
+def test_fragmented_identity_counts_a_split_cross_domain_product(pg_engine):
+    """The prod shape: one physical product, two retailer domains, TWO entities.
+
+    Every surface that keys off sellable_item_group_id — checkout handoff, the
+    ACP feed, discovery, recommendations — then sees half the product.
+    """
+    with pg_engine.begin() as conn:
+        _reset(conn)
+        _product(conn, pk="pk_brand", ck="ck_split", sig="sig_brand")
+        _product(conn, pk="pk_retailer", ck="ck_split", sig="sig_retailer")
+        _domain(conn, "pk_brand", "brand.com")
+        _domain(conn, "pk_retailer", "ulta.com")
+        _listing(conn, source_product_id="pk_brand", sig_group="grp_a")
+        _listing(conn, source_product_id="pk_retailer", sig_group="grp_b")
+        assert _count_of(conn, "cross_domain_content_key_fragmented_identity") == 1
+
+
+def test_fragmented_identity_clean_when_both_domains_share_one_entity(pg_engine):
+    """The other direction — 83 of 103 cross-domain content_keys look like this
+    today, and they must never be counted."""
+    with pg_engine.begin() as conn:
+        _reset(conn)
+        _product(conn, pk="pk_brand", ck="ck_joined", sig="sig_brand")
+        _product(conn, pk="pk_retailer", ck="ck_joined", sig="sig_retailer")
+        _domain(conn, "pk_brand", "brand.com")
+        _domain(conn, "pk_retailer", "ulta.com")
+        _listing(conn, source_product_id="pk_brand", sig_group="grp_same")
+        _listing(conn, source_product_id="pk_retailer", sig_group="grp_same")
+        assert _count_of(conn, "cross_domain_content_key_fragmented_identity") == 0
+
+
+def test_fragmented_identity_ignores_single_domain_splits(pg_engine):
+    """Two rows on the SAME domain splitting into two entities is a dedup
+    problem, not a multi-retailer one. 89 of 192 multi-row content_keys are
+    same-domain; folding them in would quadruple the count and change what the
+    alarm means."""
+    with pg_engine.begin() as conn:
+        _reset(conn)
+        _product(conn, pk="pk_a", ck="ck_same_domain", sig="sig_a")
+        _product(conn, pk="pk_b", ck="ck_same_domain", sig="sig_b")
+        _domain(conn, "pk_a", "brand.com")
+        _domain(conn, "pk_b", "brand.com")
+        _listing(conn, source_product_id="pk_a", sig_group="grp_a")
+        _listing(conn, source_product_id="pk_b", sig_group="grp_b")
+        assert _count_of(conn, "cross_domain_content_key_fragmented_identity") == 0
+
+
+def test_fragmented_identity_ignores_suppressed_siblings(pg_engine):
+    """A retired row is not a second retailer. Counting it would resurrect
+    already-decided dedup work as identity work."""
+    from sqlalchemy import text
+
+    with pg_engine.begin() as conn:
+        _reset(conn)
+        _product(conn, pk="pk_live", ck="ck_supp", sig="sig_live")
+        _product(conn, pk="pk_dead", ck="ck_supp", sig="sig_dead")
+        _domain(conn, "pk_live", "brand.com")
+        _domain(conn, "pk_dead", "ulta.com")
+        _listing(conn, source_product_id="pk_live", sig_group="grp_a")
+        _listing(conn, source_product_id="pk_dead", sig_group="grp_b")
+        conn.execute(text("UPDATE catalog_products SET suppressed_at = NOW() "
+                          "WHERE product_key = 'pk_dead'"))
+        assert _count_of(conn, "cross_domain_content_key_fragmented_identity") == 0
+
+
+def test_fragmented_identity_sample_returns_the_content_key(pg_engine):
+    with pg_engine.begin() as conn:
+        _reset(conn)
+        _product(conn, pk="pk_brand", ck="ck_sample_frag", sig="sig_brand")
+        _product(conn, pk="pk_retailer", ck="ck_sample_frag", sig="sig_retailer")
+        _domain(conn, "pk_brand", "brand.com")
+        _domain(conn, "pk_retailer", "ulta.com")
+        _listing(conn, source_product_id="pk_brand", sig_group="grp_a")
+        _listing(conn, source_product_id="pk_retailer", sig_group="grp_b")
+        rows = conn.execute(
+            __import__("sqlalchemy").text(
+                _named("cross_domain_content_key_fragmented_identity")["sample_sql"])
+        ).fetchall()
+        assert [r[0] for r in rows] == ["ck_sample_frag"]
