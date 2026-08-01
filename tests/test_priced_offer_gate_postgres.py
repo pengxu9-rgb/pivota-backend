@@ -770,6 +770,7 @@ def test_fragmented_identity_counts_a_split_cross_domain_product(pg_engine):
         _domain(conn, "pk_retailer", "ulta.com")
         _listing(conn, source_product_id="pk_brand", sig_group="grp_a")
         _listing(conn, source_product_id="pk_retailer", sig_group="grp_b")
+        _trust_public(conn, "pk_brand")
         assert _count_of(conn, "cross_domain_content_key_fragmented_identity") == 1
 
 
@@ -860,6 +861,7 @@ def test_fragmented_identity_uses_the_canonical_identity_join(pg_engine):
             "VALUES ('ext_minted_seed', 'pk_minted', 'active', NOW())"))
         _listing(conn, source_product_id="ext_minted_seed", sig_group="grp_minted")
         _listing(conn, source_product_id="pk_retailer", sig_group="grp_retailer")
+        _trust_public(conn, "pk_minted")
         assert _count_of(conn, "cross_domain_content_key_fragmented_identity") == 1
 
 
@@ -905,7 +907,7 @@ def test_fragmented_identity_threshold_is_pinned(pg_engine):
     that, so a silent bump to 25 would pass CI. This is the enforcement — and
     the sibling checks pin theirs the same way. Re-measure prod before moving
     it, and move it DOWN as the merge lands."""
-    assert _named("cross_domain_content_key_fragmented_identity")["default_threshold"] == 18
+    assert _named("cross_domain_content_key_fragmented_identity")["default_threshold"] == 7
 
 
 def test_fragmented_identity_sample_returns_the_content_key(pg_engine):
@@ -917,8 +919,35 @@ def test_fragmented_identity_sample_returns_the_content_key(pg_engine):
         _domain(conn, "pk_retailer", "ulta.com")
         _listing(conn, source_product_id="pk_brand", sig_group="grp_a")
         _listing(conn, source_product_id="pk_retailer", sig_group="grp_b")
+        _trust_public(conn, "pk_brand")
         rows = conn.execute(
             __import__("sqlalchemy").text(
                 _named("cross_domain_content_key_fragmented_identity")["sample_sql"])
         ).fetchall()
         assert [r[0] for r in rows] == ["ck_sample_frag"]
+
+
+def test_fragmented_identity_requires_a_serving_row(pg_engine):
+    """THE SERVING ANCHOR. Same lesson as the `public` conjunct on
+    public_multi_row_content_key_without_election.
+
+    Measured 2026-08-01: of 18 fragmented cross-domain content_keys, only 7 carry
+    any trust-'public' row — 11 were dark. This check's whole justification is
+    what checkout handoff / ACP feed / discovery / recommendations SEE, and a
+    split identity on a content_key no surface reaches misroutes nothing.
+    Counting the dark ones would park this permanently amber.
+    """
+    with pg_engine.begin() as conn:
+        _reset(conn)
+        _product(conn, pk="pk_brand", ck="ck_dark_frag", sig="sig_brand")
+        _product(conn, pk="pk_retailer", ck="ck_dark_frag", sig="sig_retailer")
+        _domain(conn, "pk_brand", "brand.com")
+        _domain(conn, "pk_retailer", "ulta.com")
+        _listing(conn, source_product_id="pk_brand", sig_group="grp_a")
+        _listing(conn, source_product_id="pk_retailer", sig_group="grp_b")
+        # Genuinely fragmented, but NOTHING serves it.
+        assert _count_of(conn, "cross_domain_content_key_fragmented_identity") == 0
+
+        # One public row is enough to make it a live defect.
+        _trust_public(conn, "pk_retailer")
+        assert _count_of(conn, "cross_domain_content_key_fragmented_identity") == 1

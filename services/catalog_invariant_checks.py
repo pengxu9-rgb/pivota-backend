@@ -438,14 +438,32 @@ _CHECKS: List[Dict[str, Any]] = [
         # yet. Measure how many cross-domain content_keys have a listing-less
         # member before assuming this is a small set.
         #
-        # Threshold 18 is the measured baseline AFTER excluding the explained
+        # 🚨 THE SERVING ANCHOR IS LOAD-BEARING — same lesson as the `public`
+        # conjunct on public_multi_row_content_key_without_election above. Every
+        # other check in this file is anchored on a serving surface; the first cut
+        # of this one was not, and it counted fragmentation on content_keys
+        # NOTHING can reach. Measured 2026-08-01: of 18 fragmented cross-domain
+        # content_keys, only 7 carry any trust-'public' row — 11 were dark. A
+        # mostly-dark number is a permanently-amber check nobody reads, and this
+        # invariant's entire justification is what the serving surfaces (checkout
+        # handoff, ACP feed, discovery, recommendations) SEE. A split identity on
+        # a content_key no surface reaches misroutes nothing.
+        #
+        # Threshold 7 is the measured baseline AFTER excluding the explained
         # classes — the same discipline the two checks above used (2,265 -> 4;
         # 32 -> 0), rather than blessing the raw number. The naive form of this
         # query counted 20; the difference is retired migration-139 duplicates
         # and NULL-domain artifacts. It is the residual awaiting the identity
         # merge, not a blessing. Lower it as that lands; it must NEVER be raised
         # to accommodate new fragmentation, which is the regression this catches.
-        "default_threshold": 18,
+        #
+        # ATTRIBUTION, so the next re-measurer is not misled: the naive form
+        # counted 20 and the corrected form 18, and that delta came from the
+        # identity-join and domain-chain fixes — NOT from the suppression_reason
+        # conjunct. Post-#1660 that conjunct fires on ZERO rows (3,656 suppressed
+        # rows all carry BOTH columns; 0 carry the reason alone). It stays as a
+        # guard against a writer regressing, not because it does work today.
+        "default_threshold": 7,
         "count_sql": f"""
             SELECT count(*) AS c FROM (
                 SELECT cp.content_key
@@ -491,6 +509,16 @@ _CHECKS: List[Dict[str, Any]] = [
                   -- second entity, which is precisely this check's false positive.
                   AND cp.suppression_reason IS NULL
                   AND cp.content_key IS NOT NULL
+              AND EXISTS (
+                  SELECT 1
+                  FROM catalog_products cp2
+                  JOIN catalog_row_trust crt2
+                    ON crt2.subject_type = 'product'
+                   AND crt2.subject_key = cp2.product_key
+                  WHERE cp2.content_key = cp.content_key
+                    AND cp2.suppressed_at IS NULL
+                    AND crt2.serving_decision = 'public'
+              )
                 GROUP BY cp.content_key
                 -- The domain CHAIN, not cp.source_domain alone (#1643): 28% of rows
                 -- have no source_domain, and a bare column with a '?' sentinel makes
@@ -546,6 +574,16 @@ _CHECKS: List[Dict[str, Any]] = [
               -- second entity, which is precisely this check's false positive.
               AND cp.suppression_reason IS NULL
               AND cp.content_key IS NOT NULL
+              AND EXISTS (
+                  SELECT 1
+                  FROM catalog_products cp2
+                  JOIN catalog_row_trust crt2
+                    ON crt2.subject_type = 'product'
+                   AND crt2.subject_key = cp2.product_key
+                  WHERE cp2.content_key = cp.content_key
+                    AND cp2.suppressed_at IS NULL
+                    AND crt2.serving_decision = 'public'
+              )
             GROUP BY cp.content_key
             -- The domain CHAIN, not cp.source_domain alone (#1643): 28% of rows
             -- have no source_domain, and a bare column with a '?' sentinel makes
