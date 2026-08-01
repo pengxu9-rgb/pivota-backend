@@ -50,8 +50,6 @@ async def _ensure_schema() -> None:
     NULL `indexable` the schema forbids) — every one of them a fixture written
     from what the test wanted instead of from the schema the code runs against.
     """
-    from sqlalchemy import create_engine
-
     from db.catalog import (
         catalog_merchants,
         catalog_offers,
@@ -59,28 +57,28 @@ async def _ensure_schema() -> None:
         catalog_quote_snapshots,
         catalog_skus,
     )
-    from db.database import DATABASE_URL, metadata
+    from tests.model_schema import ensure_model_tables
 
-    sync_url = DATABASE_URL.replace("sqlite+aiosqlite://", "sqlite://").replace(
-        "postgresql+asyncpg://", "postgresql://"
-    )
-    engine = create_engine(sync_url)
-    try:
-        metadata.create_all(
-            engine,
-            # catalog_quote_snapshots: preview_pivot_quote persists one, so the
-            # END-TO-END tests need it. Same source as the rest — the model.
-            tables=[
-                catalog_merchants,
-                catalog_products,
-                catalog_skus,
-                catalog_offers,
-                catalog_quote_snapshots,
-            ],
-            checkfirst=True,
+    # Via the shared helper, because `create_all(checkfirst=True)` ALONE is not
+    # enough: checkfirst SKIPS a table another module already created, and those
+    # hand-written DDLs are narrower. With
+    # tests/test_index_pipeline_state_service.py running first (it precedes this
+    # file alphabetically) this module produced 60 failures on the commit that
+    # introduced it, 59 of them `no column named catalog_track`. The helper adds
+    # the missing columns, derived from `table.columns` so the fixture can never
+    # end up richer than the model either.
+    #
+    # catalog_quote_snapshots: preview_pivot_quote persists one, so the
+    # END-TO-END tests need it. Same source as the rest — the model.
+    await ensure_model_tables(
+        (
+            catalog_merchants,
+            catalog_products,
+            catalog_skus,
+            catalog_offers,
+            catalog_quote_snapshots,
         )
-    finally:
-        engine.dispose()
+    )
 
 
 async def _reset() -> None:
