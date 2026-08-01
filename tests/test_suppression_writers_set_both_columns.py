@@ -84,8 +84,15 @@ _UPDATE = re.compile(
 _ASSIGN_REASON = re.compile(
     r"(?<!\w)suppression_reason\s*=\s*(\S+)", re.IGNORECASE
 )
+# The timestamp RHS captures to END OF LINE, not `(\S+)`: the real writers say
+# `suppressed_at = COALESCE(suppressed_at, NOW())`, and `(\S+)` stops at the
+# space inside the COALESCE, yielding "COALESCE(suppressed_at," — which contains
+# no gating token, so every correctly-fixed writer read as broken.
+# The REASON side deliberately keeps `(\S+)`: widening it would make
+# `suppression_reason = NULL, suppressed_at = NULL` capture the whole tail, and
+# the clear-detection would stop recognising it as a NULL.
 _ASSIGN_TIMESTAMP = re.compile(
-    r"(?<!\w)suppressed_at\s*=\s*(\S+)", re.IGNORECASE
+    r"(?<!\w)suppressed_at\s*=\s*([^\n]+)", re.IGNORECASE
 )
 
 
@@ -112,12 +119,30 @@ def _gates_with_timestamp(body: str) -> bool:
     suppressed_at = NULL` as a revert recipe ~30 lines above its suppress SQL,
     so copy-paste from the wrong block is the live path.
     """
-    values = _rhs(_ASSIGN_TIMESTAMP, body)
-    return any(v not in ("NULL", "SUPPRESSED_AT") for v in values)
+    # ALLOWLIST, not a denylist. The denylist version excluded only `NULL` and
+    # a bare self-assign, so three shapes still passed while leaving the row
+    # un-gated or unchanged: `cp.suppressed_at` (a qualified no-op — four of
+    # these files use `UPDATE catalog_products cp`), `COALESCE(suppressed_at,
+    # NULL)` (a no-op), and `NULL::timestamptz` (actively un-gates). Casts are
+    # idiomatic in this repo (`$3::jsonb`), so that last one is not theoretical.
+    # Require the RHS to contain something that can actually produce a time.
+    gating = ("NOW(", "CURRENT_TIMESTAMP", "$", ":")
+    for value in _rhs(_ASSIGN_TIMESTAMP, body):
+        if value.lstrip().startswith("NULL"):
+            continue  # `NULL`, `NULL::timestamptz` — writes the row un-gated
+        if "COALESCE" in value and "NULL" in value and "NOW" not in value:
+            continue  # `COALESCE(suppressed_at, NULL)` — a no-op
+        if any(token in value for token in gating):
+            return True
+    return False
 
 
 def _clears_timestamp(body: str) -> bool:
-    return any(v == "NULL" for v in _rhs(_ASSIGN_TIMESTAMP, body))
+    """PREFIX check, not equality. The timestamp RHS captures to end of line, so
+    `suppressed_at = NULL, suppression_reason = NULL` yields the whole tail —
+    equality against "NULL" stopped recognising a real clear. Prefix also
+    accepts `NULL::timestamptz`, which clears just as thoroughly."""
+    return any(v.lstrip().startswith("NULL") for v in _rhs(_ASSIGN_TIMESTAMP, body))
 
 
 _LINE_COMMENT = re.compile(r"--[^\n]*")
@@ -217,6 +242,15 @@ def test_the_matchers_see_what_they_claim_to():
         "UPDATE catalog_products SET suppression_reason = $2, suppressed_at = NULL WHERE x",
         "UPDATE catalog_products SET suppression_reason = $2, "
         "suppressed_at = suppressed_at WHERE x",
+        # qualified no-op — four writers use `UPDATE catalog_products cp`
+        "UPDATE catalog_products cp SET suppression_reason = $2, "
+        "suppressed_at = cp.suppressed_at WHERE x",
+        # cast that un-gates; casts are idiomatic here ($3::jsonb)
+        "UPDATE catalog_products SET suppression_reason = $2, "
+        "suppressed_at = NULL::timestamptz WHERE x",
+        # COALESCE to NULL is a no-op
+        "UPDATE catalog_products SET suppression_reason = $2, "
+        "suppressed_at = COALESCE(suppressed_at, NULL) WHERE x",
     ):
         body = _UPDATE.search(sql).group(1)
         assert _sets_reason(body) and not _gates_with_timestamp(body), (

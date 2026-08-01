@@ -289,6 +289,62 @@ _CHECKS: List[Dict[str, Any]] = [
         """,
     },
     {
+        # The MIRROR direction on catalog_skus. Added because the deferral
+        # rationale for merge_duplicate_canonicals.py:427 was inverted: that
+        # line re-suppresses winner offers with a bare `suppressed_at = NOW()`
+        # and never restores the reason, producing timestamp-WITHOUT-reason —
+        # the opposite of what the reason-without-timestamp check catches. The
+        # code is left alone (it is a revert-ledger restore, not a suppression
+        # writer); this is what actually monitors it. Prod: 0.
+        "name": "suppression_timestamp_without_reason_skus",
+        "description": (
+            "catalog_skus row is gated by suppressed_at but carries no reason"
+        ),
+        "env": "CATALOG_INVARIANT_SUPPRESSION_ORPHAN_SKUS_THRESHOLD",
+        "default_threshold": 0,
+        "count_sql": """
+            SELECT count(*) AS c
+            FROM catalog_skus
+            WHERE suppressed_at IS NOT NULL
+              AND suppression_reason IS NULL
+        """,
+        "sample_sql": """
+            SELECT sku_key AS subject_key
+            FROM catalog_skus
+            WHERE suppressed_at IS NOT NULL
+              AND suppression_reason IS NULL
+            LIMIT 5
+        """,
+    },
+    {
+        # The MIRROR direction on catalog_offers. Added because the deferral
+        # rationale for merge_duplicate_canonicals.py:427 was inverted: that
+        # line re-suppresses winner offers with a bare `suppressed_at = NOW()`
+        # and never restores the reason, producing timestamp-WITHOUT-reason —
+        # the opposite of what the reason-without-timestamp check catches. The
+        # code is left alone (it is a revert-ledger restore, not a suppression
+        # writer); this is what actually monitors it. Prod: 0.
+        "name": "suppression_timestamp_without_reason_offers",
+        "description": (
+            "catalog_offers row is gated by suppressed_at but carries no reason"
+        ),
+        "env": "CATALOG_INVARIANT_SUPPRESSION_ORPHAN_OFFERS_THRESHOLD",
+        "default_threshold": 0,
+        "count_sql": """
+            SELECT count(*) AS c
+            FROM catalog_offers
+            WHERE suppressed_at IS NOT NULL
+              AND suppression_reason IS NULL
+        """,
+        "sample_sql": """
+            SELECT offer_id AS subject_key
+            FROM catalog_offers
+            WHERE suppressed_at IS NOT NULL
+              AND suppression_reason IS NULL
+            LIMIT 5
+        """,
+    },
+    {
         "name": "public_but_suppressed",
         "description": "trust says public but catalog row is tombstoned",
         "env": "CATALOG_INVARIANT_SUPPRESSED_THRESHOLD",
