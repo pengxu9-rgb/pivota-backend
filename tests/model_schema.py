@@ -56,19 +56,27 @@ def _sqlite_default_literal(column: Any) -> Optional[str]:
     Two SQLite restrictions shape this, and each surfaces as a bare syntax
     error rather than anything actionable:
 
-    1. A string `server_default` must be QUOTED. `db/catalog.py` writes
-       `server_default="primary"`, which renders as `DEFAULT primary` and fails
-       with `near "primary"`. Numbers and the boolean keywords must NOT be
-       quoted — a quoted `'true'` in a BOOLEAN column stores the four-character
-       string, and `COALESCE(bm.indexable, TRUE) IS TRUE` is then FALSE for it.
+    1. A string `server_default` must be QUOTED for a TEXT column.
+       `db/catalog.py` writes `server_default="primary"`, which renders as
+       `DEFAULT primary` and fails with `near "primary"`.
     2. A non-constant default is rejected outright: `server_default=func.now()`
        fails with `near "("`. Those columns get no default at all — and, in
        `_add_column_sql` below, no NOT NULL either.
+
+    Quoting keys off the COLUMN'S TYPE, never off the literal's shape. Keying
+    off the shape is what produced the bug this helper's own PR fixed in
+    `db/catalog.py`: `server_default="true"` on a Boolean must render as the
+    unquoted constant, but `server_default="true"` on a String is the
+    four-character word and must stay quoted. The same reasoning covers
+    `"007"` (a String default that must NOT become `7`) and `"null"` (a String
+    default that must NOT become SQL NULL) — both of which a shape-based rule
+    silently corrupts, and neither of which `create_all` gets wrong.
 
     `expression.true()` / `expression.false()` are SQL elements rather than
     strings but ARE constants, so they are compiled through the dialect (to
     `1` / `0` on SQLite) instead of being discarded under restriction 2.
     """
+    from sqlalchemy import Boolean, Integer, Numeric
     from sqlalchemy.dialects import sqlite as _sqlite
     from sqlalchemy.sql import expression
 
@@ -82,28 +90,41 @@ def _sqlite_default_literal(column: Any) -> Optional[str]:
         # func.now() and friends — restriction 2.
         return None
     literal = arg.strip()
-    if literal.lower() in ("true", "false", "null"):
-        return literal.lower()
-    if re.fullmatch(r"-?\d+(\.\d+)?", literal):
+    if isinstance(column.type, Boolean):
+        # Only a Boolean column may render the bare keywords. SQLite stores
+        # TRUE/FALSE as 1/0; a quoted 'true' would store the word and fail
+        # every `IS TRUE` check downstream.
+        if literal.lower() in ("true", "false"):
+            return "1" if literal.lower() == "true" else "0"
+    if isinstance(column.type, (Integer, Numeric)) and re.fullmatch(
+        r"-?\d+(\.\d+)?", literal
+    ):
         return literal
     return "'" + literal.replace("'", "''") + "'"
+
+
+def _quote_ident(name: str) -> str:
+    """SQLite identifier quoting. `db/` already has four tables with a column
+    named `query`, and `order` / `group` / `index` / `default` / `values` are
+    hard syntax errors unquoted — a one-character-per-side cost to make this
+    helper safe for any model it is later pointed at."""
+    return '"' + name.replace('"', '""') + '"'
 
 
 def _add_column_sql(table_name: str, column: Any) -> str:
     from sqlalchemy.dialects import sqlite as _sqlite
 
-    parts = [column.name, column.type.compile(_sqlite.dialect())]
+    parts = [_quote_ident(column.name), column.type.compile(_sqlite.dialect())]
     default = _sqlite_default_literal(column)
     if default is not None:
         parts.append(f"DEFAULT {default}")
         # SQLite accepts NOT NULL on ADD COLUMN only when a default backfills
         # the rows already in the table. Without one the column goes in
-        # nullable. That is the one place this helper can be laxer than the
-        # model, and it only applies to a table some OTHER module created — the
-        # `create_all` path below carries every NOT NULL verbatim.
+        # nullable — see the nullability limit spelled out in the module
+        # docstring. The `create_all` path carries every NOT NULL verbatim.
         if not column.nullable:
             parts.append("NOT NULL")
-    return f"ALTER TABLE {table_name} ADD COLUMN {' '.join(parts)}"
+    return f"ALTER TABLE {_quote_ident(table_name)} ADD COLUMN {' '.join(parts)}"
 
 
 async def ensure_model_tables(tables: Sequence[Any]) -> None:
@@ -157,7 +178,7 @@ async def ensure_model_tables(tables: Sequence[Any]) -> None:
         return
 
     for table in tables:
-        rows = await database.fetch_all(f"PRAGMA table_info({table.name})")
+        rows = await database.fetch_all(f"PRAGMA table_info({_quote_ident(table.name)})")
         present = {str(dict(row)["name"]) for row in rows}
         for column in table.columns:
             if column.name not in present:
