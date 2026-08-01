@@ -191,7 +191,7 @@ def _arm_capture_lane(monkeypatch, *, submit=True, test_capture=True):
 
 
 def _mock_order_layer(monkeypatch, *, order_total=1.69, order_id="ord_acp_1"):
-    calls = {"order_create": 0, "capture": 0, "settle": 0}
+    calls = {"order_create": 0, "capture": 0, "settle": 0, "capture_kwargs": None}
 
     async def fake_create_order(**kwargs):
         calls["order_create"] += 1
@@ -216,6 +216,7 @@ def _mock_order_layer(monkeypatch, *, order_total=1.69, order_id="ord_acp_1"):
 
     async def fake_execute(**kwargs):
         calls["capture"] += 1
+        calls["capture_kwargs"] = kwargs
         from types import SimpleNamespace
 
         return offpay.AcpOffsessionPaymentOutcome(
@@ -246,7 +247,7 @@ async def test_complete_happy_path(fake_quote, monkeypatch):
     assert out["payment_status"] == "succeeded"
     assert out["order"]["id"] == "ord_acp_1"
     assert out["order"]["permalink_url"].endswith("/agent/v1/orders/ord_acp_1")
-    assert calls == {"order_create": 1, "capture": 1, "settle": 1}
+    assert (calls["order_create"], calls["capture"], calls["settle"]) == (1, 1, 1)
     # No private bookkeeping leaks into the returned contract.
     assert not any(str(k).startswith("_") for k in out)
 
@@ -325,7 +326,7 @@ async def test_complete_dark_kill_switch_refuses_before_any_order(fake_quote, mo
         await svc.complete_session(session_id=created.session_id, agent_context=_Ctx())
     assert ei.value.status_code == 403
     assert ei.value.detail["error"] == "TIER2_CHARGE_DISABLED"
-    assert calls == {"order_create": 0, "capture": 0, "settle": 0}
+    assert (calls["order_create"], calls["capture"], calls["settle"]) == (0, 0, 0)
     session = await svc.peek_session(created.session_id)
     assert session["status"] == "ready_for_payment"
 
@@ -381,6 +382,248 @@ async def test_complete_capture_failure_is_error_not_success(fake_quote, monkeyp
     assert calls["settle"] == 0  # nothing finalized
     session = await svc.peek_session(created.session_id)
     assert session["status"] == "ready_for_payment"  # NOT completed
+
+
+# --- review findings: charge-sequencing safety (F2-F4, F6, F7) ---------------
+
+
+async def test_concurrent_double_complete_charges_exactly_once(fake_quote, monkeypatch):
+    # F2: two simultaneous /complete calls — the claim admits exactly ONE
+    # charge; the loser gets 409 completion_in_progress (or the stored replay
+    # if it arrives after the winner finished).
+    import asyncio
+
+    _arm_capture_lane(monkeypatch)
+    calls = _mock_order_layer(monkeypatch)
+
+    # Hold the winner mid-capture so the loser deterministically overlaps.
+    orig_capture = offpay.execute_acp_offsession_payment
+
+    async def slow_capture(**kwargs):
+        await asyncio.sleep(0.05)
+        return await orig_capture(**kwargs)
+
+    monkeypatch.setattr(offpay, "execute_acp_offsession_payment", slow_capture)
+
+    created = await _create()
+
+    async def attempt():
+        try:
+            return await svc.complete_session(
+                session_id=created.session_id, agent_context=_Ctx(),
+                payment_token="pm_card_visa",
+            )
+        except svc.AcpCheckoutSessionError as exc:
+            return exc
+
+    async def staggered_attempt():
+        await asyncio.sleep(0.01)
+        return await attempt()
+
+    first, second = await asyncio.gather(attempt(), staggered_attempt())
+    results = [first, second]
+    successes = [r for r in results if isinstance(r, dict) and r.get("status") == "completed"]
+    losers = [r for r in results if isinstance(r, svc.AcpCheckoutSessionError)]
+    assert len(successes) >= 1
+    if losers:
+        assert losers[0].code == "completion_in_progress"
+        assert losers[0].status_code == 409
+    else:
+        # Both returned: the second must be the idempotent replay of the first.
+        assert successes[0]["order_id"] == successes[1]["order_id"]
+    # THE money assertions: one order, one capture.
+    assert calls["order_create"] == 1
+    assert calls["capture"] == 1
+
+
+async def test_psp_idempotency_key_is_session_derived(fake_quote, monkeypatch):
+    # F3: the PSP key must NOT be the caller's Idempotency-Key — a retry with a
+    # fresh key must replay the same PSP request.
+    _arm_capture_lane(monkeypatch)
+    calls = _mock_order_layer(monkeypatch)
+    captured_keys = []
+
+    orig_execute = offpay.execute_acp_offsession_payment
+
+    async def spy_execute(**kwargs):
+        captured_keys.append(kwargs["idempotency_key"])
+        return await orig_execute(**kwargs)
+
+    monkeypatch.setattr(offpay, "execute_acp_offsession_payment", spy_execute)
+    created = await _create()
+    await svc.complete_session(
+        session_id=created.session_id, agent_context=_Ctx(),
+        payment_token="pm_card_visa", idempotency_key="caller_key_xyz",
+    )
+    assert captured_keys == [f"acp_complete:{created.session_id}"]
+    assert calls["capture"] == 1
+
+
+async def test_retry_after_persist_failure_converges_without_second_charge(fake_quote, monkeypatch):
+    # F3+F4: capture succeeds, the completion persist fails → 502 with
+    # reconciliation_required; the row stays completing+order_id. A LATER retry
+    # (different caller key!) resumes: same order, same derived PSP key, and the
+    # persist converges.
+    _arm_capture_lane(monkeypatch)
+    calls = _mock_order_layer(monkeypatch)
+    captured_keys = []
+
+    orig_execute = offpay.execute_acp_offsession_payment
+
+    async def spy_execute(**kwargs):
+        captured_keys.append(kwargs["idempotency_key"])
+        return await orig_execute(**kwargs)
+
+    monkeypatch.setattr(offpay, "execute_acp_offsession_payment", spy_execute)
+
+    real_persist = svc._persist_completion
+    fail_once = {"armed": True}
+
+    async def flaky_persist(**kwargs):
+        if fail_once["armed"]:
+            fail_once["armed"] = False
+            raise RuntimeError("db blip")
+        return await real_persist(**kwargs)
+
+    monkeypatch.setattr(svc, "_persist_completion", flaky_persist)
+
+    created = await _create()
+    with pytest.raises(svc.AcpCheckoutSessionError) as ei:
+        await svc.complete_session(
+            session_id=created.session_id, agent_context=_Ctx(),
+            payment_token="pm_card_visa", idempotency_key="key_attempt_1",
+        )
+    assert ei.value.code == "acp_completion_persist_failed"
+    assert ei.value.status_code == 502
+    assert ei.value.extra.get("reconciliation_required") is True
+
+    row = await svc.peek_session(created.session_id)
+    assert row["status"] == "completing"  # NOT completed, NOT reverted
+    assert row["order_id"] == "ord_acp_1"  # kept for reuse
+
+    # Age the wedged claim past the resume window, then retry with a DIFFERENT key.
+    await database.execute(
+        acp_checkout_sessions.update()
+        .where(acp_checkout_sessions.c.id == created.session_id)
+        .values(updated_at=datetime.now(timezone.utc) - timedelta(seconds=120))
+    )
+    out = await svc.complete_session(
+        session_id=created.session_id, agent_context=_Ctx(),
+        payment_token="pm_card_visa", idempotency_key="key_attempt_2_fresh",
+    )
+    assert out["status"] == "completed"
+    assert out["order_id"] == "ord_acp_1"
+    assert calls["order_create"] == 1  # the order was REUSED, never re-minted
+    # Both capture attempts used the SAME session-derived PSP key → PSP-side
+    # replay, no second charge.
+    derived = f"acp_complete:{created.session_id}"
+    assert captured_keys == [derived, derived]
+    row = await svc.peek_session(created.session_id)
+    assert row["status"] == "completed"
+
+
+async def test_fresh_concurrent_completing_claim_is_409_not_resumed(fake_quote, monkeypatch):
+    # A row in `completing` that is NOT stale is an in-flight completion — a
+    # second caller must get 409, never race the charge.
+    _arm_capture_lane(monkeypatch)
+    calls = _mock_order_layer(monkeypatch)
+    created = await _create()
+    await database.execute(
+        acp_checkout_sessions.update()
+        .where(acp_checkout_sessions.c.id == created.session_id)
+        .values(status="completing", order_id="ord_inflight", updated_at=datetime.now(timezone.utc))
+    )
+    with pytest.raises(svc.AcpCheckoutSessionError) as ei:
+        await svc.complete_session(session_id=created.session_id, agent_context=_Ctx())
+    assert ei.value.code == "completion_in_progress"
+    assert ei.value.status_code == 409
+    assert calls["capture"] == 0
+
+
+async def test_cross_session_idempotency_key_collision_is_409_before_any_charge(fake_quote, monkeypatch):
+    # F2 item 2 + item 5: reusing an Idempotency-Key from ANOTHER session is
+    # refused up front — no charge, no unbounded retry-recharge loop (the old
+    # unique index aborted the completion write only AFTER the charge).
+    _arm_capture_lane(monkeypatch)
+    calls = _mock_order_layer(monkeypatch)
+    session_a = await _create()
+    await svc.complete_session(
+        session_id=session_a.session_id, agent_context=_Ctx(),
+        payment_token="pm_card_visa", idempotency_key="shared_key",
+    )
+    assert calls["capture"] == 1
+
+    session_b = await _create()
+    with pytest.raises(svc.AcpCheckoutSessionError) as ei:
+        await svc.complete_session(
+            session_id=session_b.session_id, agent_context=_Ctx(),
+            payment_token="pm_card_visa", idempotency_key="shared_key",
+        )
+    assert ei.value.code == "idempotency_conflict"
+    assert ei.value.status_code == 409
+    assert calls["capture"] == 1  # session B never charged
+    row_b = await svc.peek_session(session_b.session_id)
+    assert row_b["status"] == "ready_for_payment"  # not wedged — retryable with its own key
+
+
+async def test_zero_decimal_currency_charges_major_units(fake_quote, monkeypatch):
+    # F7: JPY 300 must charge amount=300, not 30000.
+    _FakeQuoteService.quote = {
+        **_FAKE_QUOTE,
+        "currency": "JPY",
+        "pricing": {"subtotal": "250", "discount_total": "0",
+                    "shipping_fee": "30", "tax": "20", "total": "300"},
+    }
+    _arm_capture_lane(monkeypatch)
+    calls = _mock_order_layer(monkeypatch, order_total=300)
+
+    import db.orders as orders_mod
+
+    async def fake_get_order_jpy(oid):
+        return {
+            "order_id": oid, "merchant_id": "merch_x", "total_amount": 300,
+            "currency": "JPY", "status": "created", "payment_status": "pending",
+            "metadata": {"protocol_name": "acp"},
+        }
+
+    monkeypatch.setattr(orders_mod, "get_order", fake_get_order_jpy)
+
+    created = await _create()
+    assert created.total_cents == 300  # display totals are currency-aware too
+    out = await svc.complete_session(
+        session_id=created.session_id, agent_context=_Ctx(), payment_token="pm_card_visa",
+    )
+    assert out["amount_cents"] == 300
+    assert out["currency"] == "JPY"
+    assert calls["capture_kwargs"]["gates"].amount_cents == 300
+
+
+async def test_agent_mismatch_is_403(fake_quote, monkeypatch):
+    # F6: agent A cannot complete agent B's session, even with merchant access.
+    _arm_capture_lane(monkeypatch)
+    calls = _mock_order_layer(monkeypatch)
+    created = await _create(agent_id="agent_b")
+
+    class _CtxA(_Ctx):
+        agent_id = "agent_a"
+
+    with pytest.raises(svc.AcpCheckoutSessionError) as ei:
+        await svc.complete_session(session_id=created.session_id, agent_context=_CtxA())
+    assert ei.value.code == "acp_agent_mismatch"
+    assert ei.value.status_code == 403
+    assert calls["order_create"] == 0 and calls["capture"] == 0
+
+
+def test_to_minor_units_helper():
+    from utils.money import to_minor_units
+
+    assert to_minor_units("1.69", "USD") == 169
+    assert to_minor_units("1.005", "USD") == 101  # Decimal ROUND_HALF_UP, no float drift
+    assert to_minor_units("300", "JPY") == 300
+    assert to_minor_units(300, "jpy") == 300
+    assert to_minor_units("1000", "KRW") == 1000
+    assert to_minor_units("2500", "VND") == 2500
+    assert to_minor_units(None, "USD") == 0
 
 
 def test_no_simulation_fallback_exists():

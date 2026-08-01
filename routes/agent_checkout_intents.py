@@ -797,6 +797,8 @@ async def complete_acp_checkout(
                 ),
                 "code": exc.code,
                 "message": exc.message,
+                # e.g. reconciliation_required on a completion-persist failure.
+                **(exc.extra or {}),
             },
         )
     return result

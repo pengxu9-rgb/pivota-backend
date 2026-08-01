@@ -17,6 +17,26 @@ anywhere on this path — everything runs in-process:
   (services.acp_offsession_payment). Fail-closed with named errors; the old
   service's simulated-capture fallback (fake `payment_captured` webhook) is
   deliberately NOT ported — a failed capture is an error, never a fake success.
+
+  Charge sequencing (double-charge safety):
+  1. CLAIM before charge — a conditional UPDATE flips the session
+     ready_for_payment → completing; only the caller whose UPDATE lands
+     proceeds. A concurrent second caller gets 409 `completion_in_progress`
+     (or the stored completion if already completed).
+  2. The PSP idempotency key is DERIVED from the session id
+     (`acp_complete:{session_id}`) — never from the caller's key — so a retry
+     with a fresh Idempotency-Key replays the SAME PSP request instead of
+     minting a second charge. The caller's key is recorded/validated only.
+  3. order_id is persisted on the row IMMEDIATELY after order creation,
+     BEFORE the charge; a later retry reuses that order, never mints another.
+  4. Capture failure reverts the row to ready_for_payment (order_id kept for
+     reuse). Capture success persists the completion; if THAT write fails the
+     call returns 502 `acp_completion_persist_failed` with
+     reconciliation_required=true and leaves the row in `completing` +
+     order_id, so a (stale) retry resumes with the same derived PSP key and
+     re-attempts the persist. No path returns success without the completed
+     row durably written.
+
 - `protocol_name` is a parameter (default "acp"): UCP/AP2 flows reuse this
   execution layer through the same GUARDED_PROTOCOLS gate chain.
 
@@ -34,12 +54,13 @@ import os
 import uuid
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
-from decimal import Decimal, ROUND_HALF_UP
+from decimal import Decimal
 from typing import Any, Dict, List, Optional
 
 from config.settings import settings
 from db.acp_checkout_sessions import acp_checkout_sessions
 from db.database import IS_POSTGRES, database, engine, metadata
+from utils.money import to_minor_units
 from services.commerce_attribution_service import (
     PVT_CLICK_ID,
     PVT_PRODUCT_ID,
@@ -55,7 +76,16 @@ from utils.logger import logger
 SESSION_ID_PREFIX = "csn_"
 SESSION_TTL_SECONDS = 3600
 STATUS_READY_FOR_PAYMENT = "ready_for_payment"
+STATUS_COMPLETING = "completing"
 STATUS_COMPLETED = "completed"
+
+# A row stuck in `completing` (a prior attempt failed to persist its completion,
+# or crashed) may be RESUMED — but only once it is stale, so a genuinely
+# concurrent in-flight completion is answered 409 completion_in_progress instead
+# of racing it. Resumption is convergent by construction: the PSP idempotency
+# key is derived from the session id, so a resumed capture replays, never
+# re-charges.
+COMPLETING_RESUME_AFTER_SECONDS = 60
 
 # Old-service parity: the buyer email used when the session carries none
 # (pivota-acp's real-capture hardcoded this on /orders/create).
@@ -88,13 +118,23 @@ _COMPLETION_REQUEST_HASH_KEY = "_request_hash"
 
 class AcpCheckoutSessionError(Exception):
     """A checkout-session operation failed. `status_code` is the HTTP status the
-    route layer should translate to when it chooses to surface the error."""
+    route layer should translate to when it chooses to surface the error.
+    `extra` carries additional machine-readable detail fields (e.g.
+    reconciliation_required) the route merges into its error payload."""
 
-    def __init__(self, message: str, *, code: str, status_code: Optional[int] = None):
+    def __init__(
+        self,
+        message: str,
+        *,
+        code: str,
+        status_code: Optional[int] = None,
+        extra: Optional[Dict[str, Any]] = None,
+    ):
         super().__init__(message)
         self.message = message
         self.code = code
         self.status_code = status_code
+        self.extra = dict(extra or {})
 
 
 @dataclass(frozen=True)
@@ -148,53 +188,58 @@ def _parse_json_field(value: Any) -> Any:
 async def _ensure_acp_checkout_sessions_table() -> None:
     """Best-effort self-healing for environments where migrations cannot be run
     manually. Safe to call multiple times (IF NOT EXISTS). Mirrors migration
-    191_acp_checkout_sessions.sql; local SQLite dev/tests create via SQLAlchemy
-    metadata (pattern: routes/agent_checkout_intents._ensure_checkout_intents_table)."""
+    191_acp_checkout_sessions.sql. The raw DDL runs FIRST so on Postgres the
+    canonical TEXT/JSONB shape always wins; the SQLAlchemy metadata create is
+    the SQLite dev/test path (pattern:
+    routes/agent_checkout_intents._ensure_checkout_intents_table)."""
+    if IS_POSTGRES:
+        await database.execute(
+            """
+            CREATE TABLE IF NOT EXISTS acp_checkout_sessions (
+                id TEXT PRIMARY KEY,
+                merchant_id TEXT NOT NULL,
+                agent_id TEXT,
+                platform TEXT,
+                status TEXT NOT NULL DEFAULT 'ready_for_payment',
+                buyer JSONB,
+                items JSONB NOT NULL,
+                fulfillment_address JSONB,
+                quote JSONB,
+                metadata JSONB,
+                currency TEXT,
+                total_cents INTEGER,
+                order_id TEXT,
+                completion JSONB,
+                idempotency_key TEXT,
+                created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                completed_at TIMESTAMPTZ,
+                expires_at TIMESTAMPTZ
+            )
+            """
+        )
+        await database.execute("ALTER TABLE acp_checkout_sessions ADD COLUMN IF NOT EXISTS agent_id TEXT")
+        await database.execute("ALTER TABLE acp_checkout_sessions ADD COLUMN IF NOT EXISTS completion JSONB")
+        await database.execute("ALTER TABLE acp_checkout_sessions ADD COLUMN IF NOT EXISTS idempotency_key TEXT")
+        await database.execute("ALTER TABLE acp_checkout_sessions ADD COLUMN IF NOT EXISTS order_id TEXT")
+        await database.execute("ALTER TABLE acp_checkout_sessions ADD COLUMN IF NOT EXISTS completed_at TIMESTAMPTZ")
+        await database.execute("ALTER TABLE acp_checkout_sessions ADD COLUMN IF NOT EXISTS expires_at TIMESTAMPTZ")
+        await database.execute(
+            "CREATE INDEX IF NOT EXISTS idx_acp_checkout_sessions_merchant_created "
+            "ON acp_checkout_sessions (merchant_id, created_at)"
+        )
+        # Plain lookup index, deliberately NOT unique — cross-session key reuse
+        # is answered 409 BEFORE any charge; a unique index would abort the
+        # completion write only AFTER the charge (retry-recharge wedge).
+        await database.execute(
+            "CREATE INDEX IF NOT EXISTS idx_acp_checkout_sessions_merchant_idem "
+            "ON acp_checkout_sessions (merchant_id, idempotency_key)"
+        )
+
     try:
         metadata.create_all(engine, tables=[acp_checkout_sessions])
     except Exception:
         pass
-
-    if not IS_POSTGRES:
-        return
-    await database.execute(
-        """
-        CREATE TABLE IF NOT EXISTS acp_checkout_sessions (
-            id TEXT PRIMARY KEY,
-            merchant_id TEXT NOT NULL,
-            platform TEXT,
-            status TEXT NOT NULL DEFAULT 'ready_for_payment',
-            buyer JSONB,
-            items JSONB NOT NULL,
-            fulfillment_address JSONB,
-            quote JSONB,
-            metadata JSONB,
-            currency TEXT,
-            total_cents INTEGER,
-            order_id TEXT,
-            completion JSONB,
-            idempotency_key TEXT,
-            created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-            updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-            completed_at TIMESTAMPTZ,
-            expires_at TIMESTAMPTZ
-        )
-        """
-    )
-    await database.execute("ALTER TABLE acp_checkout_sessions ADD COLUMN IF NOT EXISTS completion JSONB")
-    await database.execute("ALTER TABLE acp_checkout_sessions ADD COLUMN IF NOT EXISTS idempotency_key TEXT")
-    await database.execute("ALTER TABLE acp_checkout_sessions ADD COLUMN IF NOT EXISTS order_id TEXT")
-    await database.execute("ALTER TABLE acp_checkout_sessions ADD COLUMN IF NOT EXISTS completed_at TIMESTAMPTZ")
-    await database.execute("ALTER TABLE acp_checkout_sessions ADD COLUMN IF NOT EXISTS expires_at TIMESTAMPTZ")
-    await database.execute(
-        "CREATE INDEX IF NOT EXISTS idx_acp_checkout_sessions_merchant_created "
-        "ON acp_checkout_sessions (merchant_id, created_at)"
-    )
-    await database.execute(
-        "CREATE UNIQUE INDEX IF NOT EXISTS uq_acp_checkout_sessions_merchant_idem "
-        "ON acp_checkout_sessions (merchant_id, idempotency_key) "
-        "WHERE idempotency_key IS NOT NULL"
-    )
 
 
 def _normalize_items(items: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
@@ -293,27 +338,17 @@ def _build_session_metadata(
     return acp_metadata
 
 
-def _money_minor(value: Any) -> int:
-    try:
-        return int(
-            (Decimal(str(value if value is not None else "0")) * 100).quantize(
-                Decimal("1"), rounding=ROUND_HALF_UP
-            )
-        )
-    except Exception:
-        return 0
-
-
-def _totals_from_pricing(pricing: Dict[str, Any]) -> List[Dict[str, Any]]:
+def _totals_from_pricing(pricing: Dict[str, Any], currency: Any) -> List[Dict[str, Any]]:
     """Old wire shape: a list of `{"type", "display_text", "amount"}` entries in
     minor units, including one entry with type == "total" — consumers
     (agent_checkout_intents' callers, the old client's parser) rely on exactly
-    that."""
-    subtotal = _money_minor((pricing or {}).get("subtotal"))
-    discount = _money_minor((pricing or {}).get("discount_total"))
-    shipping = _money_minor((pricing or {}).get("shipping_fee"))
-    tax = _money_minor((pricing or {}).get("tax"))
-    total = _money_minor((pricing or {}).get("total"))
+    that. Uses the SAME currency-aware minor-unit conversion as the charge path
+    (utils.money.to_minor_units) so display and charge can never round apart."""
+    subtotal = to_minor_units((pricing or {}).get("subtotal"), currency)
+    discount = to_minor_units((pricing or {}).get("discount_total"), currency)
+    shipping = to_minor_units((pricing or {}).get("shipping_fee"), currency)
+    tax = to_minor_units((pricing or {}).get("tax"), currency)
+    total = to_minor_units((pricing or {}).get("total"), currency)
     totals: List[Dict[str, Any]] = [
         {"type": "items_base_amount", "display_text": "Item(s) total", "amount": subtotal + discount},
         {"type": "subtotal", "display_text": "Subtotal", "amount": subtotal},
@@ -408,7 +443,7 @@ async def create_session(
     )
 
     currency = str(quote.get("currency") or "USD")
-    totals = _totals_from_pricing(quote.get("pricing") or {})
+    totals = _totals_from_pricing(quote.get("pricing") or {}, currency)
     total_obj = next((t for t in totals if t.get("type") == "total"), None)
     total_cents = int(total_obj["amount"]) if total_obj else None
 
@@ -432,6 +467,7 @@ async def create_session(
     values = {
         "id": session_id,
         "merchant_id": merchant_id,
+        "agent_id": (str(agent_id or "").strip() or None),
         "platform": str(platform or "") or None,
         "status": STATUS_READY_FOR_PAYMENT,
         "buyer": buyer or None,
@@ -529,8 +565,13 @@ async def get_session(session_id: str) -> Optional[Dict[str, Any]]:
     return session
 
 
-def _request_hash(payment_token: Optional[str]) -> str:
-    body = json.dumps({"payment_token": payment_token or None}, sort_keys=True)
+def _request_hash(session_id: str, payment_token: Optional[str]) -> str:
+    # Covers the session id AND the payment token: reusing an Idempotency-Key
+    # for a different session (or a different card) is a different request.
+    body = json.dumps(
+        {"session_id": str(session_id or ""), "payment_token": payment_token or None},
+        sort_keys=True,
+    )
     return hashlib.sha256(body.encode("utf-8")).hexdigest()
 
 
@@ -625,10 +666,16 @@ async def _create_pivota_order(
     )
 
     try:
+        # agent_user/x_buyer_ref MUST be passed explicitly on an in-process
+        # call: their FastAPI Depends/Header defaults are truthy sentinel
+        # objects that crash the route body (repo precedent:
+        # routes/agent_commerce.py, routes/agent_v2.py).
         created = await agent_create_order(
             order_request=order_request,
             background_tasks=BackgroundTasks(),
             context=agent_context,
+            agent_user=None,
+            x_buyer_ref=None,
         )
     except HTTPException as exc:
         raise AcpCheckoutSessionError(
@@ -656,6 +703,139 @@ async def _create_pivota_order(
     return order_id
 
 
+def _psp_idempotency_key(session_id: str) -> str:
+    """The PSP idempotency key for a session completion — ALWAYS derived from
+    the session id, NEVER from the caller's Idempotency-Key. This is the
+    double-charge kill: a retry with a fresh caller key still replays the same
+    PSP request."""
+    return f"acp_complete:{session_id}"
+
+
+def _replay_completed(
+    session: Dict[str, Any],
+    *,
+    idempotency_key: Optional[str],
+    req_hash: str,
+) -> Dict[str, Any]:
+    """Idempotent replay of an already-completed session (never re-charges).
+    A matching stored Idempotency-Key with a DIFFERENT request hash is the ACP
+    wire 409 `idempotency_conflict`."""
+    completion = session.get("completion") if isinstance(session.get("completion"), dict) else {}
+    stored_key = str(session.get("idempotency_key") or "") or None
+    stored_hash = str((completion or {}).get(_COMPLETION_REQUEST_HASH_KEY) or "") or None
+    if (
+        idempotency_key
+        and stored_key
+        and idempotency_key == stored_key
+        and stored_hash
+        and stored_hash != req_hash
+    ):
+        raise AcpCheckoutSessionError(
+            "Same Idempotency-Key used with different parameters",
+            code="idempotency_conflict",
+            status_code=409,
+        )
+    if completion:
+        return _public_completion(completion)
+    # Completed by an older writer without a stored result: reconstruct the
+    # minimal contract from the row (never re-charge).
+    order_id = str(session.get("order_id") or "") or None
+    return {
+        "status": STATUS_COMPLETED,
+        "checkout_session_id": str(session.get("id")),
+        "order_id": order_id,
+        "payment_status": "succeeded",
+        "order": (
+            {
+                "id": order_id,
+                "checkout_session_id": str(session.get("id")),
+                "permalink_url": _order_permalink_url(order_id),
+            }
+            if order_id
+            else None
+        ),
+    }
+
+
+async def _claim_session(session_id: str, idempotency_key: Optional[str]) -> bool:
+    """Atomically flip ready_for_payment → completing; exactly one caller wins
+    (conditional UPDATE + RETURNING — works on both Postgres and SQLite). The
+    caller's Idempotency-Key is recorded on the row for validation only."""
+    row = await database.fetch_one(
+        """
+        UPDATE acp_checkout_sessions
+        SET status = :completing,
+            updated_at = :now,
+            idempotency_key = COALESCE(:key, idempotency_key)
+        WHERE id = :id AND status = :ready
+        RETURNING id
+        """,
+        {
+            "completing": STATUS_COMPLETING,
+            "now": _now_utc(),
+            "key": (idempotency_key or None),
+            "id": session_id,
+            "ready": STATUS_READY_FOR_PAYMENT,
+        },
+    )
+    return row is not None
+
+
+async def _revert_claim_to_ready(session_id: str) -> None:
+    """Release the completion claim (no charge stands). order_id is kept so a
+    retry reuses the already-created order instead of minting another."""
+    try:
+        await database.execute(
+            acp_checkout_sessions.update()
+            .where(
+                (acp_checkout_sessions.c.id == session_id)
+                & (acp_checkout_sessions.c.status == STATUS_COMPLETING)
+            )
+            .values(status=STATUS_READY_FOR_PAYMENT, updated_at=_now_utc())
+        )
+    except Exception as exc:  # noqa: BLE001 — a stuck claim is resumable after the stale window
+        logger.error(
+            "[AcpCheckoutSession] failed to release completion claim session=%s: %s "
+            "(session resumes via the stale-completing path)",
+            session_id, str(exc)[:200],
+        )
+
+
+async def _persist_order_id(session_id: str, order_id: str) -> None:
+    """Record the created order on the row BEFORE the charge. NOT best-effort:
+    charging an order we could not durably record would let a retry mint a
+    second order."""
+    await database.execute(
+        acp_checkout_sessions.update()
+        .where(acp_checkout_sessions.c.id == session_id)
+        .values(order_id=order_id, updated_at=_now_utc())
+    )
+
+
+async def _persist_completion(
+    *,
+    session_id: str,
+    order_id: str,
+    completion: Dict[str, Any],
+    idempotency_key: Optional[str],
+) -> None:
+    """Durably record the completion. Callers treat a failure as 502 (never a
+    silent success) — separated into its own function so tests can fault it."""
+    now = _now_utc()
+    await database.execute(
+        acp_checkout_sessions.update()
+        .where(acp_checkout_sessions.c.id == session_id)
+        .values(
+            status=STATUS_COMPLETED,
+            order_id=order_id,
+            completion=completion,
+            idempotency_key=(idempotency_key or None),
+            completed_at=now,
+            updated_at=now,
+        )
+    )
+
+
 async def complete_session(
     *,
     session_id: str,
@@ -664,19 +844,29 @@ async def complete_session(
     idempotency_key: Optional[str] = None,
     protocol_name: str = "acp",
 ) -> Dict[str, Any]:
-    """Complete a checkout session: quote → order(protocol) → off-session charge
-    through the SAME Tier-2 gate chain as POST /agent/v1/payments.
+    """Complete a checkout session: claim → quote → order(protocol) →
+    off-session charge through the SAME Tier-2 gate chain as
+    POST /agent/v1/payments (see the module docstring for the full
+    double-charge-safety sequencing).
 
     Fail-closed, never silent:
     - absent session → `acp_session_not_found` (404); expired → `acp_session_expired`.
+    - a different agent than the session's creator → `acp_agent_mismatch` (403).
     - already completed → the stored completion result (idempotent replay; a
       matching idempotency_key with a DIFFERENT payload → `idempotency_conflict`, 409).
+    - an Idempotency-Key already used by ANOTHER session → `idempotency_conflict`
+      (409), decided BEFORE any charge.
+    - a concurrent in-flight completion → `completion_in_progress` (409).
     - kill-switch block / over-cap → the gate chain's own HTTPException(403)
       propagates untouched (as_error_detail shape — dark stays dark).
-    - capture lane not engaged → `acp_capture_lane_disabled` (403): an
-      off-session charge has no client-confirm fallback, so it refuses.
-    - capture failure → `acp_capture_failed` (502). There is NO simulated
-      capture fallback — that pivota-acp path is deliberately not ported.
+    - capture lane not engaged → `acp_capture_lane_disabled` (403).
+    - capture failure → `acp_capture_failed` (502); the claim is released and the
+      created order is kept for reuse.
+    - completion-persist failure AFTER a successful capture →
+      `acp_completion_persist_failed` (502, reconciliation_required=true); the
+      row stays `completing`+order_id so a stale retry converges on the same
+      derived PSP key. There is NO simulated capture fallback — that pivota-acp
+      path is deliberately not ported.
     """
     session = await peek_session(session_id)
     if not session:
@@ -684,53 +874,55 @@ async def complete_session(
             "checkout session not found", code="acp_session_not_found", status_code=404
         )
 
-    req_hash = _request_hash(payment_token)
+    # The completing agent must be the agent that minted the session (when the
+    # session recorded one) — merchant scoping alone is not enough on a money path.
+    session_agent = str(session.get("agent_id") or "") or None
+    caller_agent = str(getattr(agent_context, "agent_id", "") or "") or None
+    if session_agent and caller_agent != session_agent:
+        raise AcpCheckoutSessionError(
+            "checkout session belongs to a different agent",
+            code="acp_agent_mismatch",
+            status_code=403,
+        )
+
+    sid = str(session.get("id"))
+    req_hash = _request_hash(sid, payment_token)
 
     if str(session.get("status") or "") == STATUS_COMPLETED:
-        completion = session.get("completion") if isinstance(session.get("completion"), dict) else {}
-        stored_key = str(session.get("idempotency_key") or "") or None
-        stored_hash = str((completion or {}).get(_COMPLETION_REQUEST_HASH_KEY) or "") or None
-        if (
-            idempotency_key
-            and stored_key
-            and idempotency_key == stored_key
-            and stored_hash
-            and stored_hash != req_hash
-        ):
-            raise AcpCheckoutSessionError(
-                "Same Idempotency-Key used with different parameters",
-                code="idempotency_conflict",
-                status_code=409,
-            )
-        if completion:
-            return _public_completion(completion)
-        # Completed by an older writer without a stored result: reconstruct the
-        # minimal contract from the row (never re-charge).
-        order_id = str(session.get("order_id") or "") or None
-        return {
-            "status": STATUS_COMPLETED,
-            "checkout_session_id": str(session.get("id")),
-            "order_id": order_id,
-            "payment_status": "succeeded",
-            "order": (
-                {
-                    "id": order_id,
-                    "checkout_session_id": str(session.get("id")),
-                    "permalink_url": _order_permalink_url(order_id),
-                }
-                if order_id
-                else None
-            ),
-        }
+        return _replay_completed(session, idempotency_key=idempotency_key, req_hash=req_hash)
 
     if _is_expired(session):
         raise AcpCheckoutSessionError(
             "checkout session expired", code="acp_session_expired", status_code=404
         )
 
-    # Fail-fast kill-switch pre-check BEFORE creating any order: a dark lane
-    # must refuse without side effects. The full gate chain (incl. amount caps)
-    # runs again on the charge itself below.
+    # Cross-session Idempotency-Key reuse is refused BEFORE any claim/charge
+    # (this replaces the earlier unique index, which would only have aborted the
+    # completion write AFTER the charge).
+    if idempotency_key:
+        try:
+            other = await database.fetch_one(
+                "SELECT id FROM acp_checkout_sessions "
+                "WHERE merchant_id = :merchant_id AND idempotency_key = :key AND id != :sid "
+                "LIMIT 1",
+                {
+                    "merchant_id": str(session.get("merchant_id")),
+                    "key": idempotency_key,
+                    "sid": sid,
+                },
+            )
+        except Exception:  # noqa: BLE001 — lookup failure must not block an honest completion
+            other = None
+        if other:
+            raise AcpCheckoutSessionError(
+                "Idempotency-Key already used by a different checkout session",
+                code="idempotency_conflict",
+                status_code=409,
+            )
+
+    # Fail-fast kill-switch pre-check BEFORE claiming or creating any order: a
+    # dark lane must refuse without side effects. The full gate chain (incl.
+    # amount caps) runs again on the charge itself below.
     from fastapi import HTTPException
 
     from services.agent_checkout_kill_switch import evaluate_tier2_charge
@@ -739,48 +931,50 @@ async def complete_session(
     if not pre_gate.allowed:
         raise HTTPException(status_code=403, detail=pre_gate.as_error_detail())
 
-    # Fresh quote at completion time (mirrors pivota-acp's real capture: the
-    # shipping address must match the order for the quote fingerprint).
-    items = _normalize_items(session.get("items") or [])
-    if not items:
-        raise AcpCheckoutSessionError(
-            "session has no completable items", code="acp_items_required", status_code=422
-        )
-    for idx, item in enumerate(items):
-        if not (item.get("product_id") and item.get("variant_id")):
+    # CLAIM BEFORE CHARGE: exactly one completion attempt may proceed.
+    claimed = await _claim_session(sid, idempotency_key)
+    if not claimed:
+        current = await peek_session(sid)
+        if not current:
             raise AcpCheckoutSessionError(
-                f"item {idx} missing product_id/variant_id — a Pivota quote requires both",
-                code="acp_item_identity_required",
-                status_code=422,
+                "checkout session not found", code="acp_session_not_found", status_code=404
             )
+        status_now = str(current.get("status") or "")
+        if status_now == STATUS_COMPLETED:
+            return _replay_completed(current, idempotency_key=idempotency_key, req_hash=req_hash)
+        updated_at = _coerce_datetime_utc(current.get("updated_at"))
+        stale_cutoff = _now_utc() - timedelta(seconds=COMPLETING_RESUME_AFTER_SECONDS)
+        if (
+            status_now == STATUS_COMPLETING
+            and str(current.get("order_id") or "")
+            and updated_at is not None
+            and updated_at <= stale_cutoff
+        ):
+            # A prior attempt charged-or-crashed and never persisted its
+            # completion. Resume it: reuse its order and replay the derived PSP
+            # key (idempotent PSP-side), then re-attempt the persist.
+            session = current
+            try:
+                await database.execute(
+                    acp_checkout_sessions.update()
+                    .where(acp_checkout_sessions.c.id == sid)
+                    .values(updated_at=_now_utc())
+                )
+            except Exception:  # noqa: BLE001 — freshness touch is advisory
+                pass
+        else:
+            raise AcpCheckoutSessionError(
+                "a completion for this checkout session is already in progress",
+                code="completion_in_progress",
+                status_code=409,
+            )
+    else:
+        # Re-read post-claim: a prior failed attempt may have left an order_id
+        # to reuse.
+        session = await peek_session(sid) or session
 
-    session_metadata = session.get("metadata") if isinstance(session.get("metadata"), dict) else {}
-    buyer = session.get("buyer") if isinstance(session.get("buyer"), dict) else {}
-    customer_email = (
-        (buyer or {}).get("email")
-        or (session_metadata or {}).get("customer_email")
-        or DEFAULT_BUYER_EMAIL
-    )
-    address = _normalize_address(session.get("fulfillment_address")) or dict(DEFAULT_SHIPPING_ADDRESS)
-
-    quote = await _build_quote(
-        merchant_id=str(session.get("merchant_id")),
-        items=items,
-        customer_email=str(customer_email),
-        shipping_address=address,
-        agent_id=str(getattr(agent_context, "agent_id", "") or "") or None,
-    )
-
-    order_id = await _create_pivota_order(
-        session=session,
-        quote=quote,
-        agent_context=agent_context,
-        protocol_name=str(protocol_name or "acp"),
-        idempotency_key=idempotency_key,
-    )
-
-    # Charge through the shared gate chain + off-session capture (the exact code
-    # POST /agent/v1/payments runs — services/acp_offsession_payment).
+    # From here the claim is held. Any failure BEFORE a successful capture
+    # releases it (order_id kept); nothing after a successful capture does.
     from db.orders import get_order
     from services.acp_offsession_payment import (
         evaluate_acp_offsession_gates,
@@ -788,58 +982,124 @@ async def complete_session(
         settle_acp_offsession_success,
     )
 
-    order = await get_order(order_id)
-    if not order:
-        raise AcpCheckoutSessionError(
-            f"order {order_id} not found after create",
-            code="acp_order_create_failed",
-            status_code=502,
-        )
-    order_metadata = order.get("metadata") if isinstance(order.get("metadata"), dict) else {}
-    if isinstance(order.get("metadata"), str):
-        order_metadata = _parse_json_field(order.get("metadata")) or {}
-    order_total = order.get("total_amount") or order.get("total")
-    if order_total is None:
-        raise AcpCheckoutSessionError(
-            "order total not found", code="acp_order_create_failed", status_code=502
-        )
-    amount_cents = int(round(float(order_total) * 100))
-    currency = str(order.get("currency") or quote.get("currency") or "USD")
+    try:
+        order_id = str(session.get("order_id") or "").strip()
+        quote_currency: Optional[str] = None
+        if not order_id:
+            # Fresh quote at completion time (mirrors pivota-acp's real capture:
+            # the shipping address must match the order for the quote fingerprint).
+            items = _normalize_items(session.get("items") or [])
+            if not items:
+                raise AcpCheckoutSessionError(
+                    "session has no completable items", code="acp_items_required", status_code=422
+                )
+            for idx, item in enumerate(items):
+                if not (item.get("product_id") and item.get("variant_id")):
+                    raise AcpCheckoutSessionError(
+                        f"item {idx} missing product_id/variant_id — a Pivota quote requires both",
+                        code="acp_item_identity_required",
+                        status_code=422,
+                    )
 
-    gates = evaluate_acp_offsession_gates(
-        protocol_name=order_metadata.get("protocol_name") or protocol_name,
-        merchant_id=str(session.get("merchant_id")),
-        amount_cents=amount_cents,
-        order_id=order_id,
-    )
-    if not gates.engaged:
-        # Kill-switch permits, but neither the test- nor live-capture lane is
-        # armed. An off-session completion has no buyer present to client-confirm
-        # a payment surface — fail closed instead of pretending.
-        raise AcpCheckoutSessionError(
-            "no off-session capture lane is enabled for this charge",
-            code="acp_capture_lane_disabled",
-            status_code=403,
-        )
+            session_metadata = session.get("metadata") if isinstance(session.get("metadata"), dict) else {}
+            buyer = session.get("buyer") if isinstance(session.get("buyer"), dict) else {}
+            customer_email = (
+                (buyer or {}).get("email")
+                or (session_metadata or {}).get("customer_email")
+                or DEFAULT_BUYER_EMAIL
+            )
+            address = _normalize_address(session.get("fulfillment_address")) or dict(DEFAULT_SHIPPING_ADDRESS)
 
-    outcome = await execute_acp_offsession_payment(
-        gates=gates,
-        merchant_id=str(session.get("merchant_id")),
-        order_id=order_id,
-        currency=currency,
-        idempotency_key=(idempotency_key or f"acp_complete:{session.get('id')}"),
-        payment_method_token=(payment_token or None),
-        agent_id=str(getattr(agent_context, "agent_id", "") or ""),
-        order_metadata=order_metadata,
-    )
-    if not outcome.success:
-        raise AcpCheckoutSessionError(
-            f"capture_failed:{outcome.error_code or 'unknown'}: {str(outcome.error or '')[:200]}",
-            code="acp_capture_failed",
-            status_code=502,
-        )
+            quote = await _build_quote(
+                merchant_id=str(session.get("merchant_id")),
+                items=items,
+                customer_email=str(customer_email),
+                shipping_address=address,
+                agent_id=caller_agent,
+            )
+            quote_currency = str(quote.get("currency") or "") or None
 
-    await settle_acp_offsession_success(
+            order_id = await _create_pivota_order(
+                session=session,
+                quote=quote,
+                agent_context=agent_context,
+                protocol_name=str(protocol_name or "acp"),
+                idempotency_key=idempotency_key,
+            )
+            # PERSIST the order on the row BEFORE the charge — a retry must
+            # reuse it, never mint another. Not best-effort.
+            try:
+                await _persist_order_id(sid, order_id)
+            except Exception as persist_exc:  # noqa: BLE001
+                raise AcpCheckoutSessionError(
+                    f"order_record_failed: {str(persist_exc)[:200]}",
+                    code="acp_session_persist_failed",
+                    status_code=503,
+                ) from persist_exc
+
+        # Charge through the shared gate chain + off-session capture (the exact
+        # code POST /agent/v1/payments runs — services/acp_offsession_payment).
+        order = await get_order(order_id)
+        if not order:
+            raise AcpCheckoutSessionError(
+                f"order {order_id} not found after create",
+                code="acp_order_create_failed",
+                status_code=502,
+            )
+        order_metadata = order.get("metadata") if isinstance(order.get("metadata"), dict) else {}
+        if isinstance(order.get("metadata"), str):
+            order_metadata = _parse_json_field(order.get("metadata")) or {}
+        order_total = order.get("total_amount")
+        if order_total is None:
+            order_total = order.get("total")
+        if order_total is None:
+            raise AcpCheckoutSessionError(
+                "order total not found", code="acp_order_create_failed", status_code=502
+            )
+        currency = str(order.get("currency") or quote_currency or session.get("currency") or "USD")
+        amount_cents = to_minor_units(order_total, currency)
+
+        gates = evaluate_acp_offsession_gates(
+            protocol_name=order_metadata.get("protocol_name") or protocol_name,
+            merchant_id=str(session.get("merchant_id")),
+            amount_cents=amount_cents,
+            order_id=order_id,
+        )
+        if not gates.engaged:
+            # Kill-switch permits, but neither the test- nor live-capture lane is
+            # armed. An off-session completion has no buyer present to
+            # client-confirm a payment surface — fail closed instead of pretending.
+            raise AcpCheckoutSessionError(
+                "no off-session capture lane is enabled for this charge",
+                code="acp_capture_lane_disabled",
+                status_code=403,
+            )
+
+        outcome = await execute_acp_offsession_payment(
+            gates=gates,
+            merchant_id=str(session.get("merchant_id")),
+            order_id=order_id,
+            currency=currency,
+            # SESSION-DERIVED, always — never the caller's key (see module docstring).
+            idempotency_key=_psp_idempotency_key(sid),
+            payment_method_token=(payment_token or None),
+            agent_id=str(caller_agent or ""),
+            order_metadata=order_metadata,
+        )
+        if not outcome.success:
+            raise AcpCheckoutSessionError(
+                f"capture_failed:{outcome.error_code or 'unknown'}: {str(outcome.error or '')[:200]}",
+                code="acp_capture_failed",
+                status_code=502,
+            )
+    except BaseException:
+        # No charge stands (gate refusal, quote/order failure, capture failure):
+        # release the claim so the session can be retried; order_id is kept.
+        await _revert_claim_to_ready(sid)
+        raise
+
+    # Capture SUCCEEDED beyond this point — the claim is never released now.
+    settle_flags = await settle_acp_offsession_success(
         gates=gates,
         outcome=outcome,
         order=order,
@@ -847,13 +1107,13 @@ async def complete_session(
         merchant_id=str(session.get("merchant_id")),
         currency=currency,
         idempotency_key=idempotency_key,
-        agent_id=str(getattr(agent_context, "agent_id", "") or ""),
+        agent_id=str(caller_agent or ""),
         order_metadata=order_metadata,
     )
 
     completion: Dict[str, Any] = {
         "status": STATUS_COMPLETED,
-        "checkout_session_id": str(session.get("id")),
+        "checkout_session_id": sid,
         "order_id": order_id,
         "payment_status": "succeeded",
         "psp_used": outcome.psp_used,
@@ -862,30 +1122,38 @@ async def complete_session(
         "currency": currency,
         "order": {
             "id": order_id,
-            "checkout_session_id": str(session.get("id")),
+            "checkout_session_id": sid,
             "permalink_url": _order_permalink_url(order_id),
         },
         _COMPLETION_REQUEST_HASH_KEY: req_hash,
     }
+    if isinstance(settle_flags, dict) and settle_flags.get("reconciliation_needed"):
+        # The charge stands but a post-capture settlement write kept failing —
+        # durably queryable marker for ops reconciliation.
+        completion["reconciliation_needed"] = True
 
-    now = _now_utc()
     try:
-        await database.execute(
-            acp_checkout_sessions.update()
-            .where(acp_checkout_sessions.c.id == str(session.get("id")))
-            .values(
-                status=STATUS_COMPLETED,
-                order_id=order_id,
-                completion=completion,
-                idempotency_key=(idempotency_key or None),
-                completed_at=now,
-                updated_at=now,
-            )
+        await _persist_completion(
+            session_id=sid,
+            order_id=order_id,
+            completion=completion,
+            idempotency_key=idempotency_key,
         )
-    except Exception as persist_exc:  # noqa: BLE001 — the charge succeeded; log, don't refuse
-        logger.warning(
-            "[AcpCheckoutSession] completion persist failed session=%s order=%s: %s",
-            session.get("id"), order_id, str(persist_exc)[:200],
+    except Exception as persist_exc:  # noqa: BLE001
+        # A capture happened that we could NOT durably record. Never report
+        # success. The row stays `completing`+order_id, so a (stale) retry
+        # resumes with the same derived PSP key and re-attempts this persist.
+        logger.error(
+            "[AcpCheckoutSession] completion persist FAILED after successful capture "
+            "session=%s order=%s intent=%s: %s",
+            sid, order_id, outcome.payment_intent_id, str(persist_exc)[:200],
         )
+        raise AcpCheckoutSessionError(
+            "capture succeeded but the completion could not be durably recorded; "
+            "retry to converge (the charge will not repeat)",
+            code="acp_completion_persist_failed",
+            status_code=502,
+            extra={"reconciliation_required": True, "order_id": order_id},
+        ) from persist_exc
 
     return _public_completion(completion)

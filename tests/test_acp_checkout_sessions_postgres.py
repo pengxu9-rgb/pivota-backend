@@ -61,6 +61,7 @@ def _mk_values(merchant_id: str, *, idem: str | None = None):
     return {
         "id": f"csn_{uuid.uuid4().hex[:14]}",
         "merchant_id": merchant_id,
+        "agent_id": "agent_pg",
         "platform": "shopify",
         "status": "ready_for_payment",
         "buyer": {"email": "buyer@example.com"},
@@ -109,10 +110,23 @@ async def test_insert_select_complete_roundtrip():
     session = await svc.get_session(values["id"])
     assert session is not None
     assert session["merchant_id"] == "merch_pgtest_rt"
+    assert session["agent_id"] == "agent_pg"
     # JSONB comes back as structured data (or a JSON string the service parses).
     assert session["metadata"]["pvt_click_id"] == "clk_pg"
     assert session["items"][0]["variant_id"] == "v1"
     assert session["total_cents"] == 4599
+
+    # The single-flight claim SQL (conditional UPDATE ... RETURNING) must
+    # PREPARE and behave on Postgres: first claim wins, second loses.
+    assert await svc._claim_session(values["id"], "idem_claim") is True
+    assert await svc._claim_session(values["id"], "idem_claim") is False
+    row = await svc.peek_session(values["id"])
+    assert row["status"] == "completing"
+    assert row["idempotency_key"] == "idem_claim"
+    # Release-claim UPDATE too.
+    await svc._revert_claim_to_ready(values["id"])
+    row = await svc.peek_session(values["id"])
+    assert row["status"] == "ready_for_payment"
 
     # Completion write — the exact UPDATE complete_session issues.
     now = datetime.now(timezone.utc)
@@ -148,19 +162,38 @@ async def test_expired_session_treated_absent():
     assert await svc.peek_session(values["id"]) is not None
 
 
-async def test_partial_unique_idempotency_index():
+async def test_idempotency_key_index_is_plain_lookup_not_unique():
+    # Review F2 item 5: the idempotency-key index must NOT be unique — duplicate
+    # keys are legal at the storage layer (the service answers cross-session
+    # reuse with a SELECT + 409 BEFORE charging). A unique index here would
+    # abort the completion write only AFTER the charge (retry-recharge wedge).
     from db.acp_checkout_sessions import acp_checkout_sessions
     from db.database import database
 
     a = _mk_values("merch_pgtest_idem", idem="idem_dup")
     b = _mk_values("merch_pgtest_idem", idem="idem_dup")
     await database.execute(acp_checkout_sessions.insert().values(**a))
-    with pytest.raises(Exception):
-        # Second completion claim for the same (merchant, idempotency_key) must
-        # be refused by the partial unique index.
-        await database.execute(acp_checkout_sessions.insert().values(**b))
+    await database.execute(acp_checkout_sessions.insert().values(**b))  # must NOT raise
 
-    # NULL keys never collide (the index is partial on IS NOT NULL).
+    # And no unique index on (merchant_id, idempotency_key) exists at all.
+    rows = await database.fetch_all(
+        "SELECT indexname, indexdef FROM pg_indexes WHERE tablename = 'acp_checkout_sessions'"
+    )
+    for row in rows:
+        d = dict(row)
+        if "idempotency_key" in str(d.get("indexdef") or ""):
+            assert "UNIQUE" not in str(d.get("indexdef") or "").upper(), d
+
+    # The cross-session lookup the service runs pre-charge PREPAREs fine.
+    hit = await database.fetch_one(
+        "SELECT id FROM acp_checkout_sessions "
+        "WHERE merchant_id = :merchant_id AND idempotency_key = :key AND id != :sid "
+        "LIMIT 1",
+        {"merchant_id": "merch_pgtest_idem", "key": "idem_dup", "sid": a["id"]},
+    )
+    assert hit is not None
+
+    # NULL keys are fine in any multiplicity.
     c = _mk_values("merch_pgtest_idem", idem=None)
     d = _mk_values("merch_pgtest_idem", idem=None)
     await database.execute(acp_checkout_sessions.insert().values(**c))

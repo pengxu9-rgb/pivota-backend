@@ -45,12 +45,13 @@ async def _db():
     yield
 
 
-async def _seed_session(session_id="csn_route_test01", merchant_id="merch_x"):
+async def _seed_session(session_id="csn_route_test01", merchant_id="merch_x", agent_id=None):
     now = datetime.now(timezone.utc)
     await database.execute(
         acp_checkout_sessions.insert().values(
             id=session_id,
             merchant_id=merchant_id,
+            agent_id=agent_id,
             platform="shopify",
             status="ready_for_payment",
             items=[{"product_id": "p1", "variant_id": "v1", "quantity": 1}],
@@ -249,3 +250,18 @@ async def test_foreign_merchant_is_403(monkeypatch):
     with pytest.raises(HTTPException) as ei:
         await m.complete_acp_checkout(sid, m.CompleteAcpCheckoutRequest(), _Ctx(allowed=False))
     assert ei.value.status_code == 403
+
+
+async def test_foreign_agent_is_403(monkeypatch):
+    # F6: same merchant access, but a DIFFERENT agent than the session creator.
+    from fastapi import HTTPException
+    from routes import agent_checkout_intents as m
+
+    _arm(monkeypatch)
+    calls = _mock_layers(monkeypatch)
+    sid = await _seed_session(agent_id="agent_b")
+    with pytest.raises(HTTPException) as ei:
+        await m.complete_acp_checkout(sid, m.CompleteAcpCheckoutRequest(), _Ctx())
+    assert ei.value.status_code == 403
+    assert ei.value.detail["code"] == "acp_agent_mismatch"
+    assert calls["order_create"] == 0 and calls["capture"] == 0

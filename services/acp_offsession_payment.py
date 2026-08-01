@@ -28,28 +28,31 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from types import SimpleNamespace
-from typing import Any, Dict, Optional
+from typing import TYPE_CHECKING, Any, Dict, Optional
 
 from fastapi import HTTPException
 
-from services.agent_checkout_kill_switch import (
-    AcpLiveCaptureDecision,
-    AcpTestCaptureDecision,
-    KillSwitchDecision,
-    evaluate_tier2_charge,
-    resolve_acp_live_capture,
-    resolve_acp_test_capture,
-)
 from utils.logger import logger
+
+if TYPE_CHECKING:
+    # Gate symbols are imported IN-FUNCTION at runtime (below), exactly as the
+    # route's original inline code did — that keeps the established monkeypatch
+    # surface (tests patch services.agent_checkout_kill_switch attributes and
+    # expect resolution at call time, not import time).
+    from services.agent_checkout_kill_switch import (
+        AcpLiveCaptureDecision,
+        AcpTestCaptureDecision,
+        KillSwitchDecision,
+    )
 
 
 @dataclass(frozen=True)
 class AcpOffsessionGates:
     """The three Tier-2 gate decisions for one charge, evaluated together."""
 
-    kill_switch: KillSwitchDecision
-    test_capture: AcpTestCaptureDecision
-    live_capture: AcpLiveCaptureDecision
+    kill_switch: "KillSwitchDecision"
+    test_capture: "AcpTestCaptureDecision"
+    live_capture: "AcpLiveCaptureDecision"
     amount_cents: int
 
     @property
@@ -78,6 +81,12 @@ def evaluate_acp_offsession_gates(
     exactly the refusals create_payment used to raise inline. Safe to call
     unconditionally on the shared charge path (a non-protocol charge evaluates
     allowed=True, guarded=False and never engages a capture lane)."""
+    from services.agent_checkout_kill_switch import (
+        evaluate_tier2_charge,
+        resolve_acp_live_capture,
+        resolve_acp_test_capture,
+    )
+
     # P-T2.2 kill-switch: fail-closed gate on the Tier-2 (in-chat protocol)
     # charge lane. Scoped to protocol-tier orders (protocol_name in
     # {acp,ucp,ap2}); the live redirect floor + REST/hosted flows
@@ -255,6 +264,40 @@ async def execute_acp_offsession_payment(
     )
 
 
+async def _finalize_paid_transition(
+    *,
+    order: Dict[str, Any],
+    psp_used: str,
+    payment_reference: str,
+    currency: str,
+    allow_live: bool,
+    protocol_name: Optional[str],
+) -> None:
+    """The raw paid-transition (raises on failure). Callers choose the posture:
+    the /payments route swallows via finalize_acp_offsession_success; the
+    session settle path retries and flags reconciliation."""
+    from services.psp_payment_finalizer import finalize_payment_success
+    from db.orders import mark_order_paid, update_payment_info
+    from routes.order_routes import log_order_event
+
+    await finalize_payment_success(
+        order,
+        psp=psp_used,
+        payment_reference=payment_reference,
+        transaction_id=payment_reference,
+        amount_minor=None,
+        currency=str(currency),
+        source_event="acp_offsession_capture",
+        metadata_extra={
+            ("acp_live_capture" if allow_live else "acp_test_capture"): True,
+            "protocol_name": protocol_name,
+        },
+        update_payment_info_fn=update_payment_info,
+        mark_order_paid_fn=mark_order_paid,
+        log_order_event_fn=log_order_event,
+    )
+
+
 async def finalize_acp_offsession_success(
     *,
     order: Dict[str, Any],
@@ -271,27 +314,15 @@ async def finalize_acp_offsession_success(
     — it flips the order to paid atomically, stamps gross attributed GMV on the
     attribution edge, and logs the conversion event, all idempotently
     (terminal-state guarded). Best-effort: the capture already succeeded, so a
-    finalize failure is logged, never raised."""
+    finalize failure is logged, never raised (the /payments route's posture)."""
     try:
-        from services.psp_payment_finalizer import finalize_payment_success
-        from db.orders import mark_order_paid, update_payment_info
-        from routes.order_routes import log_order_event
-
-        await finalize_payment_success(
-            order,
-            psp=psp_used,
+        await _finalize_paid_transition(
+            order=order,
+            psp_used=psp_used,
             payment_reference=payment_reference,
-            transaction_id=payment_reference,
-            amount_minor=None,
-            currency=str(currency),
-            source_event="acp_offsession_capture",
-            metadata_extra={
-                ("acp_live_capture" if allow_live else "acp_test_capture"): True,
-                "protocol_name": protocol_name,
-            },
-            update_payment_info_fn=update_payment_info,
-            mark_order_paid_fn=mark_order_paid,
-            log_order_event_fn=log_order_event,
+            currency=currency,
+            allow_live=allow_live,
+            protocol_name=protocol_name,
         )
     except Exception as finalize_exc:  # noqa: BLE001 — capture already succeeded; don't fail the response
         logger.warning(
@@ -311,68 +342,86 @@ async def settle_acp_offsession_success(
     idempotency_key: Optional[str],
     agent_id: Optional[str],
     order_metadata: Dict[str, Any],
-) -> None:
+) -> Dict[str, Any]:
     """Post-capture settlement for the in-process session path: the same durable
     writes /agent/v1/payments performs after a successful off-session capture —
     payments record, order payment info, attribution edge, paid-transition
-    finalizer. The /payments route keeps its own inline record/attribution code
-    (shared with the client-confirm lane) and calls only
-    finalize_acp_offsession_success; this composition exists for callers outside
-    that route."""
+    finalizer — each wrapped in the route's `_with_asyncpg_busy_retry` (matching
+    routes/agent_payment_sdk's posture for these exact writes). The /payments
+    route keeps its own inline record/attribution code (shared with the
+    client-confirm lane) and calls only finalize_acp_offsession_success; this
+    composition exists for callers outside that route.
+
+    Returns {"reconciliation_needed": bool}: the capture already happened, so a
+    write that still fails after retries never fails the response — instead the
+    caller durably stamps the flag on the stored completion (queryable marker
+    for ops reconciliation) and the failure is logged at ERROR."""
     from datetime import datetime
 
     from db.database import database
     from db.orders import update_payment_info
+    from routes.agent_payment_sdk import _with_asyncpg_busy_retry
+
+    reconciliation_needed = False
 
     amount_major = gates.amount_cents / 100.0
     payment_id = f"pay_{outcome.payment_intent_id}"
     status = "succeeded" if outcome.payment_intent.status == "succeeded" else str(outcome.payment_intent.status)
     try:
-        await database.execute(
-            """INSERT INTO payments
-               (payment_id, order_id, payment_intent_id, amount, currency,
-                psp_type, status, idempotency_key, created_at, agent_id)
-               VALUES (:payment_id, :order_id, :intent_id, :amount, :currency,
-                       :psp, :status, :idem_key, :created_at, :agent_id)
-               ON CONFLICT (payment_id) DO UPDATE
-               SET status = EXCLUDED.status,
-                   updated_at = EXCLUDED.created_at""",
-            {
-                "payment_id": payment_id,
-                "order_id": order_id,
-                "intent_id": outcome.payment_intent_id,
-                "amount": float(amount_major),
-                "currency": currency,
-                "psp": outcome.psp_used,
-                "status": status,
-                "idem_key": idempotency_key,
-                "created_at": datetime.now(),
-                "agent_id": agent_id,
-            },
+        await _with_asyncpg_busy_retry(
+            "payment record insert",
+            lambda: database.execute(
+                """INSERT INTO payments
+                   (payment_id, order_id, payment_intent_id, amount, currency,
+                    psp_type, status, idempotency_key, created_at, agent_id)
+                   VALUES (:payment_id, :order_id, :intent_id, :amount, :currency,
+                           :psp, :status, :idem_key, :created_at, :agent_id)
+                   ON CONFLICT (payment_id) DO UPDATE
+                   SET status = EXCLUDED.status,
+                       updated_at = EXCLUDED.created_at""",
+                {
+                    "payment_id": payment_id,
+                    "order_id": order_id,
+                    "intent_id": outcome.payment_intent_id,
+                    "amount": float(amount_major),
+                    "currency": currency,
+                    "psp": outcome.psp_used,
+                    "status": status,
+                    "idem_key": idempotency_key,
+                    "created_at": datetime.now(),
+                    "agent_id": agent_id,
+                },
+            ),
         )
-    except Exception as record_exc:  # noqa: BLE001 — capture succeeded; record is best-effort here
-        logger.warning(
-            "[AcpOffsession] payments record insert failed order=%s: %s",
+    except Exception as record_exc:  # noqa: BLE001 — capture succeeded; flag, never fail the response
+        reconciliation_needed = True
+        logger.error(
+            "[AcpOffsession] payments record insert failed after retries order=%s: %s",
             order_id, str(record_exc)[:200],
         )
 
     try:
-        await update_payment_info(
-            order_id=order_id,
-            payment_intent_id=outcome.payment_intent_id,
-            client_secret="",
-            payment_status="processing",
-            psp_used=outcome.psp_used,
+        await _with_asyncpg_busy_retry(
+            "order payment info update",
+            lambda: update_payment_info(
+                order_id=order_id,
+                payment_intent_id=outcome.payment_intent_id,
+                client_secret="",
+                payment_status="processing",
+                psp_used=outcome.psp_used,
+            ),
         )
     except Exception as info_exc:  # noqa: BLE001
-        logger.warning(
-            "[AcpOffsession] order payment info update failed order=%s: %s",
+        reconciliation_needed = True
+        logger.error(
+            "[AcpOffsession] order payment info update failed after retries order=%s: %s",
             order_id, str(info_exc)[:200],
         )
 
     # P-T2.0 attribution parity: deposit a commerce_attribution_edge for this
     # protocol charge (idempotent on order_id; self-gates on
-    # has_attribution_signal). Best-effort: never break the payment.
+    # has_attribution_signal). Best-effort: never break the payment (and not a
+    # reconciliation marker — the edge upsert is idempotently re-derivable).
     try:
         from services.commerce_attribution_service import upsert_order_attribution_edge
 
@@ -390,12 +439,23 @@ async def settle_acp_offsession_success(
         )
 
     if outcome.payment_intent.status == "succeeded":
-        await finalize_acp_offsession_success(
-            order=order,
-            order_id=order_id,
-            psp_used=outcome.psp_used,
-            payment_reference=outcome.payment_intent_id,
-            currency=currency,
-            allow_live=gates.allow_live,
-            protocol_name=order_metadata.get("protocol_name"),
-        )
+        try:
+            await _with_asyncpg_busy_retry(
+                "acp offsession paid transition",
+                lambda: _finalize_paid_transition(
+                    order=order,
+                    psp_used=outcome.psp_used,
+                    payment_reference=outcome.payment_intent_id,
+                    currency=currency,
+                    allow_live=gates.allow_live,
+                    protocol_name=order_metadata.get("protocol_name"),
+                ),
+            )
+        except Exception as finalize_exc:  # noqa: BLE001 — capture happened; don't fail the response
+            reconciliation_needed = True
+            logger.error(
+                "[AcpOffsession] paid-transition finalize failed after retries order=%s: %s",
+                order_id, str(finalize_exc)[:200],
+            )
+
+    return {"reconciliation_needed": reconciliation_needed}

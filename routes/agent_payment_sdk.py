@@ -760,8 +760,13 @@ async def create_payment(
         # in-process ACP checkout-session completion shares exactly this code —
         # every refusal raises the same 403s this route raised inline.
         from services.acp_offsession_payment import evaluate_acp_offsession_gates
+        from utils.money import to_minor_units
 
-        _acp_amount_cents = int(round(float(order_total) * 100))
+        # Deliberate correctness deviation from the pre-extraction inline code
+        # (same class as the psp_used fix): `int(round(total * 100))` overstated
+        # zero-decimal currencies (JPY 300 became amount=30000 — a 100x
+        # overcharge). Shared currency-aware conversion instead.
+        _acp_amount_cents = to_minor_units(order_total, currency_code)
         acp_gates = evaluate_acp_offsession_gates(
             protocol_name=order_metadata.get("protocol_name"),
             merchant_id=str(merchant_id),
