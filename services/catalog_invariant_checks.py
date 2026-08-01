@@ -239,6 +239,56 @@ _CHECKS: List[Dict[str, Any]] = [
         """,
     },
     {
+        # Same split-column defect on catalog_skus. Both columns exist here and
+        # both are read by the recall / by-key / quote gates after #1655 and
+        # #1657, so the same "tombstoned to trust, clean to serving" state is
+        # reachable. Prod: 0 today.
+        "name": "suppression_reason_without_timestamp_skus",
+        "description": (
+            "catalog_skus row carries suppression_reason but no suppressed_at"
+        ),
+        "env": "CATALOG_INVARIANT_SUPPRESSION_SPLIT_SKUS_THRESHOLD",
+        "default_threshold": 0,
+        "count_sql": """
+            SELECT count(*) AS c
+            FROM catalog_skus
+            WHERE suppression_reason IS NOT NULL
+              AND suppressed_at IS NULL
+        """,
+        "sample_sql": """
+            SELECT sku_key AS subject_key
+            FROM catalog_skus
+            WHERE suppression_reason IS NOT NULL
+              AND suppressed_at IS NULL
+            LIMIT 5
+        """,
+    },
+    {
+        # Same split-column defect on catalog_offers. Both columns exist here and
+        # both are read by the recall / by-key / quote gates after #1655 and
+        # #1657, so the same "tombstoned to trust, clean to serving" state is
+        # reachable. Prod: 0 today.
+        "name": "suppression_reason_without_timestamp_offers",
+        "description": (
+            "catalog_offers row carries suppression_reason but no suppressed_at"
+        ),
+        "env": "CATALOG_INVARIANT_SUPPRESSION_SPLIT_OFFERS_THRESHOLD",
+        "default_threshold": 0,
+        "count_sql": """
+            SELECT count(*) AS c
+            FROM catalog_offers
+            WHERE suppression_reason IS NOT NULL
+              AND suppressed_at IS NULL
+        """,
+        "sample_sql": """
+            SELECT offer_id AS subject_key
+            FROM catalog_offers
+            WHERE suppression_reason IS NOT NULL
+              AND suppressed_at IS NULL
+            LIMIT 5
+        """,
+    },
+    {
         "name": "public_but_suppressed",
         "description": "trust says public but catalog row is tombstoned",
         "env": "CATALOG_INVARIANT_SUPPRESSED_THRESHOLD",

@@ -62,6 +62,9 @@ BEGIN;
 
 UPDATE catalog_products
 SET suppression_reason = 'cross_merchant_redundant_external_seed',
+    -- P1a (#1648): suppressed_at is THE gate column; the label alone leaves
+    -- the row serving. COALESCE keeps an existing timestamp intact.
+    suppressed_at = COALESCE(suppressed_at, now()),
     updated_at = now()
 WHERE merchant_id = 'external_seed'
   AND sync_status = 'live'

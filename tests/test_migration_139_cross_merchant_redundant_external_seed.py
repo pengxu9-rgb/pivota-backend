@@ -59,11 +59,32 @@ def test_migration_139_is_idempotent() -> None:
     assert "SET suppression_reason = NULL" not in sql
 
 
+def _sql_only(text: str) -> str:
+    """Drop `--` comments before asserting on statement shape.
+
+    Asserting against the raw file lets a COMMENT satisfy the assertion. That
+    bit here: the explanatory comment added alongside the guard contains the
+    literal `suppression_metadata IS NULL`, so deleting the guard from the
+    actual WHERE clause left this test green (mutation-verified). An assertion
+    a docstring can satisfy is not an assertion.
+    """
+    import re as _re
+
+    return _re.sub(r"--[^\n]*", "", text)
+
+
 def test_migration_139_down_shape() -> None:
-    sql = DOWN_SQL.read_text(encoding="utf-8")
+    sql = _sql_only(DOWN_SQL.read_text(encoding="utf-8"))
 
     assert "BEGIN;" in sql
     assert "COMMIT;" in sql
     assert "UPDATE catalog_products" in sql
-    assert "SET suppression_reason = NULL" in sql
+    # P1a (#1648): the down migration must clear BOTH columns. Clearing the
+    # label alone leaves every row gated by `suppressed_at` — a revert that
+    # silently does not revert. This assertion previously pinned that defect.
+    assert "suppression_reason = NULL" in sql
+    assert "suppressed_at = NULL" in sql
+    # ...and must not sweep step5_lane4's rows, which carry the same reason
+    # string but stamp suppression_metadata.
+    assert "suppression_metadata IS NULL" in sql
     assert "WHERE suppression_reason = 'cross_merchant_redundant_external_seed'" in sql

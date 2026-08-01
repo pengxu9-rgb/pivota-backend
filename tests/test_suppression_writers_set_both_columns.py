@@ -46,6 +46,7 @@ _REPO = Path(__file__).resolve().parents[1]
 _SUPPRESS_WRITERS: List[str] = [
     "scripts/step5_lane1_dedup_92sfrj.py",
     "scripts/step5_lane2_same_url_dedup.py",
+    "scripts/step5_lane3_campaign_clone_dedup.py",
     "scripts/step5_lane4_ownist_twin_cut.py",
     "scripts/step5_sweep_orphan_mirrors.py",
     "scripts/retire_test_rig_merch_efbc.py",
@@ -53,8 +54,22 @@ _SUPPRESS_WRITERS: List[str] = [
     "scripts/onboard_external_brand_from_crawl.py",
     "scripts/merge_duplicate_canonicals.py",
     "scripts/repair_orphan_shopify_offers.py",
+    # The only RUNTIME writer — everything else here is a one-off ops script.
+    "services/catalog_sync_service.py",
     "services/identity_resolution.py",
+    # Migrations are executable too, and reachable over HTTP:
+    # routes/admin_run_migration_pending.py globs db/migrations/{n}_*.sql.
+    "db/migrations/139_tombstone_cross_merchant_redundant_external_seed.sql",
+    "db/migrations/146_deactivate_jumiso_niacinamide_dup_seeds.sql",
+    "db/migrations/down/139_tombstone_cross_merchant_redundant_external_seed_down.sql",
 ]
+
+# `services/catalog_sync_service.py` also clears these columns through an ORM
+# payload (`_upsert_by_pk` with {"suppression_reason": None, "suppressed_at":
+# None}) which no SQL regex can see. It happens to clear BOTH, and
+# `_preserve_non_stale_suppression` is what stops a sync tick wiping a live
+# tombstone — asserted separately below rather than left to the scan.
+_ORM_CLEAR_SITES = "services/catalog_sync_service.py"
 
 # `UPDATE <table> SET …` up to the WHERE / statement end.
 _UPDATE = re.compile(
@@ -87,16 +102,41 @@ def _clears_reason(body: str) -> bool:
     return any(v == "NULL" for v in _rhs(_ASSIGN_REASON, body))
 
 
-def _touches_timestamp(body: str) -> bool:
-    return bool(_rhs(_ASSIGN_TIMESTAMP, body))
+def _gates_with_timestamp(body: str) -> bool:
+    """Assigns suppressed_at a value that actually GATES the row.
+
+    `bool(_rhs(...))` was not enough — it asked only whether the column was
+    assigned, so `suppressed_at = NULL` (row written fully un-gated) and
+    `suppressed_at = suppressed_at` (a no-op) both passed. Both are realistic:
+    every one of these files now carries `SET suppression_reason = NULL,
+    suppressed_at = NULL` as a revert recipe ~30 lines above its suppress SQL,
+    so copy-paste from the wrong block is the live path.
+    """
+    values = _rhs(_ASSIGN_TIMESTAMP, body)
+    return any(v not in ("NULL", "SUPPRESSED_AT") for v in values)
 
 
 def _clears_timestamp(body: str) -> bool:
     return any(v == "NULL" for v in _rhs(_ASSIGN_TIMESTAMP, body))
 
 
+_LINE_COMMENT = re.compile(r"--[^\n]*")
+
+
+def _strip_sql_comments(source: str) -> str:
+    """Blank out `--` comments, preserving offsets so line numbers stay true.
+
+    Comments are not part of the statement, and leaving them in breaks the scan
+    in both directions: a `;` inside a comment TERMINATES the captured SET body
+    (this bit immediately — a comment I added reading "suppressed_at is THE gate
+    column; the label alone…" truncated the capture and made a correctly-fixed
+    migration look broken), and the word WHERE in a comment would do the same.
+    """
+    return _LINE_COMMENT.sub(lambda m: " " * len(m.group(0)), source)
+
+
 def _statements(path: str) -> List[Tuple[int, str]]:
-    source = (_REPO / path).read_text(encoding="utf-8")
+    source = _strip_sql_comments((_REPO / path).read_text(encoding="utf-8"))
     return [
         (source[: m.start()].count("\n") + 1, m.group(1))
         for m in _UPDATE.finditer(source)
@@ -106,11 +146,11 @@ def _statements(path: str) -> List[Tuple[int, str]]:
 def test_the_writer_inventory_is_real():
     """A source scan that matches nothing also passes. Floor both the file list
     and the statements found, so an empty scan fails instead of going green."""
-    assert len(_SUPPRESS_WRITERS) >= 10
+    assert len(_SUPPRESS_WRITERS) >= 15
     for path in _SUPPRESS_WRITERS:
         assert (_REPO / path).is_file(), f"{path} moved or was renamed — update this list"
     total = sum(len(_statements(p)) for p in _SUPPRESS_WRITERS)
-    assert total >= 15, f"only {total} UPDATE statements found — the scan is not working"
+    assert total >= 20, f"only {total} UPDATE statements found — the scan is not working"
 
 
 @pytest.mark.parametrize("path", _SUPPRESS_WRITERS)
@@ -120,7 +160,7 @@ def test_setting_a_suppression_reason_also_sets_suppressed_at(path: str):
     serving gate."""
     offenders = [
         line for line, body in _statements(path)
-        if _sets_reason(body) and not _touches_timestamp(body)
+        if _sets_reason(body) and not _gates_with_timestamp(body)
     ]
     assert offenders == [], (
         f"{path}: UPDATE(s) at line(s) {offenders} set suppression_reason without "
@@ -159,7 +199,7 @@ def test_the_matchers_see_what_they_claim_to():
     ]
     for sql in must_flag_suppress:
         body = _UPDATE.search(sql).group(1)
-        assert _sets_reason(body) and not _touches_timestamp(body), f"blind to: {sql}"
+        assert _sets_reason(body) and not _gates_with_timestamp(body), f"blind to: {sql}"
 
     must_pass_suppress = [
         "UPDATE catalog_products SET suppression_reason = $2, "
@@ -168,7 +208,35 @@ def test_the_matchers_see_what_they_claim_to():
     ]
     for sql in must_pass_suppress:
         body = _UPDATE.search(sql).group(1)
-        assert _touches_timestamp(body), f"false positive on: {sql}"
+        assert _gates_with_timestamp(body), f"false positive on: {sql}"
+
+    # A suppress that assigns the timestamp a NON-GATING value must still be
+    # flagged: `= NULL` writes the row un-gated, `= suppressed_at` is a no-op.
+    # Both passed the first version, which only asked "was the column assigned".
+    for sql in (
+        "UPDATE catalog_products SET suppression_reason = $2, suppressed_at = NULL WHERE x",
+        "UPDATE catalog_products SET suppression_reason = $2, "
+        "suppressed_at = suppressed_at WHERE x",
+    ):
+        body = _UPDATE.search(sql).group(1)
+        assert _sets_reason(body) and not _gates_with_timestamp(body), (
+            f"a non-gating timestamp assignment was accepted: {sql}"
+        )
+
+    # A `;` or the word WHERE inside a `--` comment must not truncate the SET
+    # body. This bit: a comment reading "…gate column; the label alone…" cut
+    # the capture short and made a correctly-fixed migration look broken.
+    commented = _strip_sql_comments(
+        "UPDATE catalog_products\n"
+        "SET suppression_reason = 'x',\n"
+        "    -- suppressed_at is THE gate column; the label alone leaves it serving\n"
+        "    suppressed_at = COALESCE(suppressed_at, now())\n"
+        "WHERE y"
+    )
+    body = _UPDATE.search(commented).group(1)
+    assert _gates_with_timestamp(body), (
+        "a semicolon inside a SQL comment truncated the SET body"
+    )
 
     # THE TRAP: a label-only revert must read as a CLEAR, never as a SET.
     revert = _UPDATE.search(
@@ -203,3 +271,30 @@ def test_the_invariant_checks_cover_both_directions():
             assert check["default_threshold"] == 0, (
                 f"{check['name']}: there is no acceptable number of split-column rows"
             )
+
+
+def test_the_orm_clear_sites_clear_both_columns():
+    """`_upsert_by_pk` payload clears in catalog_sync_service are invisible to
+    any SQL scan — they are dict literals. The scan CANNOT see them, so assert
+    them directly rather than let "every writer is covered" be false."""
+    source = (_REPO / _ORM_CLEAR_SITES).read_text(encoding="utf-8")
+    reason_clears = source.count('"suppression_reason": None')
+    timestamp_clears = source.count('"suppressed_at": None')
+    assert reason_clears > 0, "expected ORM payload clears — did the file move?"
+    assert timestamp_clears >= reason_clears, (
+        f"{_ORM_CLEAR_SITES}: {reason_clears} payload(s) clear suppression_reason "
+        f"but only {timestamp_clears} clear suppressed_at. An ORM clear that "
+        "drops the label alone leaves the row gated forever."
+    )
+
+
+def test_the_sync_tick_cannot_wipe_a_live_tombstone_on_either_column():
+    """`_preserve_non_stale_suppression` is what stops a routine sync tick
+    clearing a suppression. It must test BOTH columns — testing the label alone
+    would let a tick wipe a timestamp-only tombstone."""
+    source = (_REPO / _ORM_CLEAR_SITES).read_text(encoding="utf-8")
+    start = source.index("def _preserve_non_stale_suppression")
+    body = source[start : source.index("\ndef ", start + 10)]
+    assert "suppression_reason" in body and "suppressed_at" in body, (
+        "_preserve_non_stale_suppression no longer reads both columns"
+    )

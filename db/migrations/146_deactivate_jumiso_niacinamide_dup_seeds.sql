@@ -71,7 +71,10 @@ WHERE status = 'active'
 --    catalog_products.source_ref == external_product_seeds.id for this
 --    mirror path (see mirror script offer/product source_ref mapping).
 UPDATE catalog_products
-SET suppression_reason = 'niacinamide_dup_test_variant', updated_at = now()
+SET suppression_reason = 'niacinamide_dup_test_variant',
+    -- P1a (#1648): see migration 139.
+    suppressed_at = COALESCE(suppressed_at, now()),
+    updated_at = now()
 WHERE merchant_id = 'external_seed'
   AND suppression_reason IS NULL
   AND title ILIKE '%High Potency Dark Spot Serum%'
