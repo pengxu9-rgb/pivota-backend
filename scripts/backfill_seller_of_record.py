@@ -23,7 +23,7 @@ Four phases (increasing risk), each independently reportable:
      guessed (founder no-fallback directive). This is the kill-path input for
      A9-3's `metadata.seller_ref_missing` metric.
 
-  2. BARE-format attached_product_key repair (the ~720 rows). Re-derive the
+  2. BARE-format attached_product_key repair. Re-derive the
      STORAGE-format `prod::` key from the seed's own fields the way the mirror
      legitimately produces it (`scripts.mirror_external_seeds_to_catalog_products`
      -> `services.external_seed_servability.backlink_seed_to_product`):
@@ -31,6 +31,11 @@ Four phases (increasing risk), each independently reportable:
      — and ONLY when that key resolves to a real `catalog_products` row. Anything
      undecodable goes to the review queue; NEVER a widened matcher, NEVER a
      partial/third-format key (ADR-009 ratified decision 3; IDENTITY_REFERENCE T1).
+     AND NEVER a key that already resolves — see run_barekey. The "~720 rows"
+     this once claimed as its cohort were `ext:` keys that resolve perfectly
+     well; rewriting them took 364 elected PDPs to HTTP 500 on 2026-08-01. They
+     are now SKIPPED to review, so this phase repairs only genuinely dangling
+     links, which is a much smaller set than the scan count suggests.
 
   3. CATALOG re-key (the risky phase). Rows in `catalog_products` with
      `merchant_id='external_seed'` are RE-SUBJECTED to their observed per-brand
@@ -538,19 +543,33 @@ class SellerBackfill:
             #
             # A rewrite here has TWO ends. Validating only the destination is how
             # a "repair" silently detaches a working link.
-            current_apk = str(d.get("attached_product_key") or "").strip()
-            if current_apk:
-                live = await self.db.fetch_one(
-                    "SELECT product_key FROM catalog_products WHERE product_key = :pk",
-                    {"pk": current_apk},
-                )
-                if live:
-                    stats["already_resolving"] += 1
-                    already_resolving.append({
-                        "seed_id": str(d.get("id")),
-                        "attached_product_key": current_apk,
-                    })
-                    continue
+            #
+            # DELIBERATELY BROADER than the minted arm: no source_system and no
+            # seed-status filter. Broader means more SKIPS, which is the safe
+            # direction (a skip is reviewable in the report; a detach is a 500),
+            # so do not "tighten" this to match the predicate — that converts
+            # review items back into outages.
+            # RAW, NOT btrim'd — the join this guard protects does not trim
+            # either side (services/pdp_renderability seed_route_resolves_sql:
+            # `_seed_route_minted.attached_product_key = cp.product_key`), and
+            # product_key is varchar, so trailing space is significant. Comparing
+            # a stripped value would declare a PADDED key "already resolving",
+            # skip the very row this phase exists to repair, and report it under
+            # a value the column does not contain — hiding it from the human who
+            # would otherwise catch it. The SELECT above already guarantees this
+            # is non-null and not blank.
+            current_apk = d.get("attached_product_key")
+            live = await self.db.fetch_one(
+                "SELECT product_key FROM catalog_products WHERE product_key = :pk",
+                {"pk": current_apk},
+            )
+            if live:
+                stats["already_resolving"] += 1
+                already_resolving.append({
+                    "seed_id": str(d.get("id")),
+                    "attached_product_key": current_apk,
+                })
+                continue
 
             candidate = candidate_storage_key_from_seed(d)
             resolved: Optional[str] = None
@@ -590,12 +609,19 @@ class SellerBackfill:
                 # is just fast.
                 await self._checkpoint(
                     "barekey", str(d.get("id")), resolved, "pending",
-                    previous_value=current_apk or None,
+                    previous_value=current_apk,
                 )
+                # COMPARE-AND-SWAP on the pre-image. The guard above is a
+                # READ; without this the WHERE never mentions the column, so any
+                # writer between the unbatched fetch_all and this UPDATE is
+                # clobbered with no re-check — a silent detach, which is exactly
+                # the failure mode this PR exists to close. Phase 1 carries the
+                # same discipline (`AND seller_ref IS NULL`). A concurrent write
+                # now makes this a no-op instead.
                 await self.db.execute(
                     "UPDATE external_product_seeds SET attached_product_key = :pk, "
-                    "updated_at = NOW() WHERE id = :id",
-                    {"pk": resolved, "id": d.get("id")},
+                    "updated_at = NOW() WHERE id = :id AND attached_product_key = :old",
+                    {"pk": resolved, "id": d.get("id"), "old": current_apk},
                 )
                 await self._checkpoint("barekey", str(d.get("id")), resolved, "done")
             stats["repaired"] += 1
@@ -741,8 +767,14 @@ class SellerBackfill:
                     f"A9-4 batch parity FAILED (loud abort, no silent absorb): {parity}"
                 )
             for b in batch:
+                # The overwritten value is the constant this phase selects on
+                # (merchant_id = BANNED_BUCKET_MERCHANT_ID, pinned by the
+                # UPDATE's own WHERE), so it is reconstructible — but the rule
+                # in _checkpoint says any phase that OVERWRITES passes it, and a
+                # rule the same file violates is not a rule.
                 await self._checkpoint("catalog", str(b["product_key"]),
-                                       str(b["observed_id"]), "done")
+                                       str(b["observed_id"]), "done",
+                                       previous_value=BANNED_BUCKET_MERCHANT_ID)
         return parity
 
     async def _sku_keys_for_product(self, product_key: str) -> List[str]:

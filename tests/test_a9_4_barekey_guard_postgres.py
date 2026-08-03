@@ -57,9 +57,14 @@ ALTER TABLE external_product_seeds ADD COLUMN IF NOT EXISTS status text;
 ALTER TABLE external_product_seeds ADD COLUMN IF NOT EXISTS seller_ref text;
 ALTER TABLE external_product_seeds ADD COLUMN IF NOT EXISTS seed_kind text;
 ALTER TABLE external_product_seeds ADD COLUMN IF NOT EXISTS updated_at timestamptz;
+-- previous_value is DELIBERATELY omitted: in prod this table already exists
+-- without it, so the statement that actually matters is the
+-- `ALTER TABLE … ADD COLUMN IF NOT EXISTS` in ensure_checkpoint_table. Declaring
+-- the column here would make that ALTER a no-op and leave the migration path
+-- untested.
 CREATE TABLE IF NOT EXISTS a9_4_backfill_checkpoint (
   phase text NOT NULL, ref_id text NOT NULL, observed_id text,
-  previous_value text, status text NOT NULL DEFAULT 'done',
+  status text NOT NULL DEFAULT 'done',
   updated_at timestamptz NOT NULL DEFAULT NOW(),
   PRIMARY KEY (phase, ref_id)
 );
@@ -247,3 +252,137 @@ def test_dry_run_writes_nothing_and_still_reports_the_skip(pg_engine):
         ck = conn.execute(text("SELECT count(*) FROM a9_4_backfill_checkpoint")).scalar()
     assert still == _EXT_KEY
     assert ck == 0, "dry run must not checkpoint"
+
+
+def test_a_padded_key_is_repaired_not_skipped(pg_engine):
+    """R1. The guard must compare the RAW value, because the join it protects
+    does not trim either side (`_seed_route_minted.attached_product_key =
+    cp.product_key`) and product_key is varchar — trailing space is significant.
+
+    A btrim'd comparison declares a padded key "already resolving", skips the
+    very row this phase exists to repair, and reports it under a value the
+    column does not contain — hiding it from the reviewer who would catch it.
+    """
+    import asyncio
+
+    from sqlalchemy import text
+
+    padded = f"  {_EXT_KEY}  "
+    with pg_engine.begin() as conn:
+        _reset(conn)
+        # The UNPADDED row exists; the seed's value is padded, so the real join
+        # finds nothing and this seed IS broken.
+        _product(conn, product_key=_EXT_KEY, source_product_id="ilia-multi-stick",
+                 source_system="catalog_enrichment_agent_v1")
+        _product(conn, product_key=_MIRROR_KEY, source_product_id=_EPID,
+                 source_system="external_product_seeds_mirror_v1")
+        _seed(conn, seed_id="seed:padded", attached=padded)
+
+        joins = conn.execute(text(
+            "SELECT count(*) FROM external_product_seeds s "
+            "JOIN catalog_products cp ON cp.product_key = s.attached_product_key "
+            "WHERE s.id = 'seed:padded'")).scalar()
+    assert joins == 0, "precondition: the padded key must NOT join"
+
+    report = asyncio.run(_run_barekey(execute=True))
+    assert report.barekey["already_resolving"] == 0, "a padded key does not resolve"
+    assert report.barekey["repaired"] == 1
+
+    with pg_engine.begin() as conn:
+        now = conn.execute(text(
+            "SELECT attached_product_key FROM external_product_seeds "
+            "WHERE id = 'seed:padded'")).scalar()
+        prev = conn.execute(text(
+            "SELECT previous_value FROM a9_4_backfill_checkpoint "
+            "WHERE phase='barekey' AND ref_id='seed:padded'")).scalar()
+    assert now == _MIRROR_KEY
+    assert prev == padded, "the undo value must be byte-exact, not stripped"
+
+
+def test_the_update_is_a_compare_and_swap(pg_engine):
+    """R2. The guard is a READ. Without a CAS the UPDATE's WHERE never mentions
+    the column, so any writer landing between the unbatched fetch_all and the
+    write is clobbered with no re-check — a silent detach, the exact failure
+    this PR exists to close.
+
+    This drives the REAL run_barekey and injects the concurrent write from
+    inside it, via a db proxy that fires once on the guard's first lookup. An
+    earlier version of this test ran the CAS statement inline and therefore
+    tested its own SQL rather than the code — it passed with the fix reverted.
+    """
+    import asyncio
+
+    from sqlalchemy import text
+
+    from databases import Database
+
+    from services import seller_identity
+    from scripts.backfill_seller_of_record import BackfillReport, SellerBackfill
+
+    with pg_engine.begin() as conn:
+        _reset(conn)
+        _product(conn, product_key=_MIRROR_KEY, source_product_id=_EPID,
+                 source_system="external_product_seeds_mirror_v1")
+        _seed(conn, seed_id="seed:raced", attached="ext:stale::0000")
+
+    WINNER = "ext:someone-else-won::ffff"
+
+    class RacingDb:
+        """Delegates to the real Database, but lands a competing write once —
+        after the phase has snapshotted the row and before it issues its UPDATE."""
+
+        def __init__(self, inner):
+            self._inner = inner
+            self._fired = False
+
+        async def fetch_one(self, *a, **kw):
+            result = await self._inner.fetch_one(*a, **kw)
+            if not self._fired:
+                self._fired = True
+                await self._inner.execute(
+                    "UPDATE external_product_seeds SET attached_product_key = :w "
+                    "WHERE id = 'seed:raced'", {"w": WINNER})
+            return result
+
+        def __getattr__(self, name):
+            return getattr(self._inner, name)
+
+    async def race():
+        db = Database(DATABASE_URL)
+        await db.connect()
+        try:
+            bf = SellerBackfill(database=RacingDb(db), si_mod=seller_identity,
+                                execute=True, batch_size=50)
+            await bf.ensure_checkpoint_table()
+            report = BackfillReport(mode="execute", started_at="2026-08-01T00:00:00Z",
+                                    phases=["barekey"], batch_size=50)
+            await bf.run_barekey(report)
+            return report
+        finally:
+            await db.disconnect()
+
+    asyncio.run(race())
+
+    with pg_engine.begin() as conn:
+        now = conn.execute(text(
+            "SELECT attached_product_key FROM external_product_seeds "
+            "WHERE id = 'seed:raced'")).scalar()
+    assert now == WINNER, (
+        "the CAS must make the stale write a no-op; without it the concurrent "
+        "writer is clobbered and the seed is silently detached")
+
+
+def test_the_checkpoint_column_is_added_by_migration(pg_engine):
+    """The gate DDL deliberately omits `previous_value`, so this exercises the
+    ALTER in ensure_checkpoint_table — the statement that actually runs in prod,
+    where the table already exists without the column."""
+    import asyncio
+
+    from sqlalchemy import text
+
+    asyncio.run(_run_barekey(execute=False))
+    with pg_engine.begin() as conn:
+        cols = {r[0] for r in conn.execute(text(
+            "SELECT column_name FROM information_schema.columns "
+            "WHERE table_name = 'a9_4_backfill_checkpoint'")).fetchall()}
+    assert "previous_value" in cols
