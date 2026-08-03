@@ -1448,6 +1448,32 @@ async def _apply_external_seed_attachment(proposal: IdentityRecoveryProposal, *,
 
 
 async def _promote_canonical_scopes(product_keys: Sequence[str]) -> int:
+    """Promote rows to `multi_merchant_canonical` — per the CLASSIFIER's rule.
+
+    THIS IS THE SECOND IMPLEMENTATION of `services.pdp_scope_classifier.classify`.
+    They must agree; `tests/test_pdp_scope_promotion_agrees_with_classifier.py`
+    pins that they do, because they diverged badly and silently:
+
+    The old predicate promoted on `EXISTS (an active attached seed)` — ONE seed,
+    which is not multi-merchant by any reading — and, for rows in the
+    `external_seed` bucket, on a peer with a different `platform_product_id`,
+    using "different product id" as a proxy for "different merchant".
+
+    Both proxies existed to compensate for the bucket: collapsing many real
+    merchants into one `merchant_id` makes the CORRECT test
+    (`peer.merchant_id <> own.merchant_id`) structurally unsatisfiable, so
+    weaker stand-ins were substituted for the signal the bucket had erased.
+
+    Measured on prod 2026-08-03: 3,400 mirror-lane rows carried
+    `multi_merchant_canonical`; 0 qualified under rule 1 and only 107 under
+    rule 2. **3,293 were labelled canonical with exactly ONE seller.**
+
+    That is not cosmetic. `services/pivot_query_service.py:1048` grants the label
+    a +200 rank bonus documented as "large enough to dominate every other term"
+    — above exact-SKU (120), exact-title (100) and exact-brand (80). So 3,293
+    single-seller rows outranked genuine merchant listings on every matched
+    query. Path-C is unaffected: all 1,795 of its rows qualify under rule 1.
+    """
     keys = sorted({_clean(key) for key in product_keys if _clean(key)})
     if not keys:
         return 0
@@ -1459,12 +1485,34 @@ async def _promote_canonical_scopes(product_keys: Sequence[str]) -> int:
             pdp_scope_set_at = NOW()
         WHERE cp.product_key = ANY(:product_keys)
           AND (
-            EXISTS (
-              SELECT 1
+            -- RULE 1 (services.pdp_scope_classifier): an agent-authored row is
+            -- canonical BY INTENT, whatever today's seller count is.
+            cp.category_label_source = 'enrichment_agent_v1'
+
+            -- RULE 2: >= 2 DISTINCT sellers. Counted, not inferred.
+            OR (
+              SELECT count(DISTINCT co.merchant_id)
+              FROM catalog_offers co
+              WHERE co.product_key = cp.product_key
+                AND co.merchant_id IS NOT NULL
+            ) >= 2
+
+            -- RULE 2 for rows inside the `external_seed` bucket. The bucket
+            -- collapses many real merchants into ONE merchant_id, so
+            -- `peer.merchant_id <> own.merchant_id` below is structurally
+            -- unsatisfiable for them. DISTINCT seed DOMAIN is the sound
+            -- recovery of the erased signal — one retailer per eTLD+1, the same
+            -- basis ADR-009 keys `merch_obs_<sha256(brand::etld1)>` on.
+            OR (
+              SELECT count(DISTINCT eps.domain)
               FROM external_product_seeds eps
-              WHERE eps.status = 'active'
-                AND eps.attached_product_key = cp.product_key
-            )
+              WHERE eps.attached_product_key = cp.product_key
+                AND eps.status = 'active'
+                AND eps.domain IS NOT NULL
+            ) >= 2
+
+            -- RULE 2 via product groups: a peer at a genuinely DIFFERENT
+            -- merchant. Correct as written; kept.
             OR EXISTS (
               SELECT 1
               FROM product_group_members own
@@ -1472,17 +1520,6 @@ async def _promote_canonical_scopes(product_keys: Sequence[str]) -> int:
                 ON peer.product_group_id = own.product_group_id
                AND peer.merchant_id <> own.merchant_id
               WHERE own.merchant_id = cp.merchant_id
-                AND own.platform = cp.platform
-                AND own.platform_product_id = cp.source_product_id
-            )
-            OR EXISTS (
-              SELECT 1
-              FROM product_group_members own
-              JOIN product_group_members peer
-                ON peer.product_group_id = own.product_group_id
-               AND peer.platform_product_id <> own.platform_product_id
-              WHERE cp.merchant_id = 'external_seed'
-                AND own.merchant_id = cp.merchant_id
                 AND own.platform = cp.platform
                 AND own.platform_product_id = cp.source_product_id
             )
