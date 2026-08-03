@@ -17,7 +17,8 @@ All file:line references verified against main @ `2a7feb57` (2026-07-05).
 |---|---|---|---|
 | Product group | `product_group_id` (pg) | "which physical product family is this?" | cross-merchant |
 | Content identity | `content_key` (`ck_…`) | "which physical product is this?" | cross-merchant |
-| Catalog listing | `product_key` (`prod::…`) | "which merchant's listing of it?" | per-merchant |
+| Catalog listing | `product_key` — TWO generations, see T8 | "which merchant's listing of it?" (`prod::…`) | per-merchant |
+| ↳ Path-C minted | `product_key` (`ext:…`) | "which physical product is this?" | **cross-merchant** ⚠️ |
 | Variant | `sku_key` (two forms — see T2) | "which variant of that listing?" | per-merchant |
 | Public page | `pivota_signature_id` (`sig_…`) | "which citable Pivota PDP URL?" | per-merchant, public, write-once |
 
@@ -25,6 +26,14 @@ All file:line references verified against main @ `2a7feb57` (2026-07-05).
 product) keys on the top of the ladder (pg / content_key). The *serving layer* (PDPs,
 sitemap, GSC) keys on `sig`. The middle (`product_key`/`sku_key`) is merchant-catalog
 plumbing and must not leak into agent-facing or cross-merchant semantics.
+
+**⚠️ The one place that rule of thumb breaks (Trap T8).** `product_key` has TWO live
+generations at DIFFERENT GRAINS. `prod::{merchant}::{platform}::{source_id}` is
+per-merchant plumbing as described. `ext:{brand-slug}::{hash}` — minted by Path-C and
+still minted today — is derived from **(brand, product_name) only**, so it is
+merchant-AGNOSTIC and sits at content grain despite living in the `product_key` column.
+Do not reason about "the product_key layer" as uniformly per-merchant, and never convert
+one generation to the other. See §2 `product_key` — the `ext:` generation, and T8.
 
 ---
 
@@ -74,6 +83,46 @@ plumbing and must not leak into agent-facing or cross-merchant semantics.
   `beauty_sku_ingredients.merchant_id` at INCI ingest) — already yields
   `external_seed` for these rows and stays byte-identical. **MUST NOT** read
   ownership out of a `prod::` key; join `catalog_products.merchant_id` instead.
+
+### `product_key` — the `ext:` generation (`ext:{brand-name-slug}::{sha1[:8]}`)
+
+- **Minted by:** `services/catalog_enrichment_agent/ingestion.py:98`
+  `derive_product_key(brand, product_name)` — Path-C / door 4 (retailer crawl,
+  `source_system = 'catalog_enrichment_agent_v1'`). Live: called at
+  `ingestion.py:233`. New rows are still minted today.
+- **~1,795 unsuppressed rows** in prod (2026-08-01).
+- **⚠️ THIS IS A DIFFERENT GRAIN, NOT A DIFFERENT SPELLING.** `prod::` is
+  `{merchant_id}::{platform}::{source_product_id}` — **per-merchant**. `ext:` is
+  derived from **(brand, product_name) ONLY** — it is **merchant-agnostic**. Two
+  merchants selling the same product produce ONE `ext:` key and TWO `prod::`
+  keys. So an `ext:` value is content-grained living in the `product_key`
+  column; the ladder's "per-merchant plumbing" description in §1 does **not**
+  apply to it. Consequences that follow directly:
+  - it has its own product-group namespace, `pg_ext_<hash>`
+    (`services/pdp_identity_recovery.py:98`);
+  - Path C attaches **one seed PER OFFER** to a single `ext:` key, so several
+    merchant offers converge on one row — which is why the seed pick among them
+    is a real decision (see `minted_seed_identity_leg_sql`), not a formality.
+- **Treated as CANONICAL by live code, not as residue.**
+  `services/pdp_identity_recovery.py:596-606` resolves an `ext:` product_key as
+  `resolved_identity_source = 'canonical_ext_product_key'` and PREFERS it over
+  the product group; `scripts/source_pdp_content_repair.py:112` and
+  `scripts/source_pdp_offer_image_repair.py:210` sort `ext:` rows FIRST
+  (`CASE WHEN product_key LIKE 'ext:%' THEN 0 ELSE 1 END`).
+- **ADR-011 R2 calls `ext:`/`ba-` "frozen legacy" — read that precisely.**
+  ADR-011 is **Status: Proposed**; its action item 1 ("sign off R1–R7") is
+  UNCHECKED, and nothing in code enforces the freeze. R2 governs what NEW rows
+  may use. It has never meant that existing `ext:` rows are retired, detachable,
+  or safe to re-key.
+- **🚨 MUST NOT:** "repair" an `ext:` key to a `prod::` key. The gateway routes
+  minted PDPs by matching `external_product_seeds.attached_product_key =
+  cp.product_key`, so a seed must point at whichever format its row actually
+  uses. **This happened:** A9-4 phase 2 rewrote 720 seeds from `ext:` to
+  `prod::` — conforming ONE side of a two-sided pair — and 364 elected, public
+  PDPs returned HTTP 500 (2026-08-01; 587 restored, 133 unmatched). Guarded
+  since #1663: the backfill now skips any key that already resolves.
+- **MUST NOT:** parse a merchant out of it. There isn't one in there — that is
+  the whole point of the format.
 
 ### The PIPE transport form (`{merchant_id}|{platform}|{source_id}`)
 - **What:** a pipe-delimited rendering of the product triple used as a REPORT/EVIDENCE
@@ -179,8 +228,15 @@ partially overlap. This is the root cause behind the shared `external_seed` buck
 
 ### `external_product_seeds.attached_product_key` + `attached_variant_id`
 - **What:** binds an external seed (a referral offer) to the catalog listing it represents.
-  STORAGE format is `prod::…` (verified in prod 2026-07-05: 8,004 `prod::`, 720 other/bare,
-  659 NULL, **zero pipe-format rows**).
+- **⚠️ TWO storage formats, both live and both correct** (prod 2026-07-05: 8,004
+  `prod::`, **720 `ext:`**, 659 NULL, **zero pipe-format rows**). A seed must
+  point at whichever format the row it is attached to actually uses — `prod::`
+  for mirror/sync rows, `ext:` for Path-C minted rows (see the `ext:` generation
+  above).
+  **This line previously read "720 other/bare", and that phrasing caused an
+  outage.** "Other" reads as unclassified residue; those 720 were `ext:` keys
+  resolving correctly. A backfill "repaired" them to `prod::` and took 364 public
+  PDPs to HTTP 500 (2026-08-01). Name the format; never call a live one "other".
 - **Trap T1 (CONFIRMED DEAD PATH):** `_fetch_attached_seed_rows`
   (`routes/agent_shop_gateway.py:3471`) builds pipe-format match keys
   (`{merchant}|{platform}|{pid}` and prefix `{merchant}|%`) against this column → matches
@@ -245,3 +301,10 @@ partially overlap. This is the root cause behind the shared `external_seed` buck
   cross merchants (`index_pipeline_state` pattern).
 - **T7 — `external_product_id` ≠ platform product id:** it's a URL-hash; don't match a
   Shopify pid against it.
+- **T8 — TWO `product_key` generations at DIFFERENT GRAINS:** `prod::{merchant}::…` is
+  per-merchant; `ext:{brand-slug}::{hash}` is derived from (brand, product_name) alone
+  and is merchant-AGNOSTIC. Both are live and still minted. Never convert one to the
+  other: the gateway matches `attached_product_key = cp.product_key`, so rewriting one
+  side of that pair dark-routes the PDP. Cost when this was missed: 364 public PDPs
+  returning HTTP 500 (2026-08-01). "Frozen legacy" in ADR-011 R2 (still **Proposed**,
+  unenforced) constrains NEW minting only — it never authorised re-keying.
