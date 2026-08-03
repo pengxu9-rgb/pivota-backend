@@ -543,7 +543,11 @@ def _catalog_chain_verdict(cp, eps, epm, ms, match_value="mintree.us") -> bool:
     # table even when empty. Kept as a stub here; the ordering it drives is
     # asserted on real Postgres in test_quarantine_domain_chain_postgres, where
     # multi-row groups make the tie-break observable at all.
-    conn.execute("CREATE TABLE pdp_identity_listing (product_id TEXT, source_listing_ref TEXT)")
+    # merchant_id: the leg is merchant-scoped since #1665, so the stub needs the
+    # column for the SQL to resolve even though no row is ever inserted here.
+    conn.execute(
+        "CREATE TABLE pdp_identity_listing "
+        "(product_id TEXT, source_listing_ref TEXT, merchant_id TEXT)")
     # source_system decides WHICH seed leg applies, so pick it from the fixture.
     system = "catalog_enrichment_agent_v1" if epm else "external_product_seeds_mirror_v1"
     conn.execute(

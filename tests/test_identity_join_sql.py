@@ -57,14 +57,19 @@ def test_the_lane_test_routes_minted_rows_through_their_seed():
 
 def test_the_seed_pick_uses_the_shared_order_constants():
     """Path-C attaches one seed PER OFFER, so the pick is not a formality.
-    MINTED_SEED_IDENTITY_LEG prefers a seed that CARRIES a listing — the
+    the identity leg prefers a seed that CARRIES a listing — the
     winner's external_product_id IS the join key. A bare `updated_at DESC`
     picks an identity-less sibling (state goes uncounted) or a stale inactive
     seed (clean state counts as broken); both measured 2026-07-31."""
-    from services.source_quarantine import MINTED_SEED_IDENTITY_LEG, SEED_PICK_ORDER
+    from services.source_quarantine import (
+        SEED_PICK_ORDER,
+        minted_seed_identity_leg_sql,
+    )
 
     sql = minted_seed_external_id_sql("cp")
-    assert MINTED_SEED_IDENTITY_LEG in sql
+    # The leg must be tested against THIS row's merchant (#1665).
+    assert minted_seed_identity_leg_sql("cp.merchant_id") in sql
+    assert "spl.merchant_id = cp.merchant_id" in sql
     assert SEED_PICK_ORDER in sql
     assert "ORDER BY s.updated_at DESC" not in sql
 
@@ -114,7 +119,7 @@ def test_multiple_columns_are_each_qualified():
 
 
 def test_an_alias_that_would_shadow_the_seed_subquery_is_rejected():
-    """`s` and `spl` are baked into SEED_PICK_ORDER / MINTED_SEED_IDENTITY_LEG,
+    """`s` and `spl` are baked into SEED_PICK_ORDER / the identity leg,
     which are byte-pinned across two repos and so cannot be renamed. Passing
     `cp_alias="s"` therefore emits `WHERE s.attached_product_key = s.product_key`
     — the seeds row compared to ITSELF, correlation silently gone.
@@ -294,7 +299,7 @@ def test_no_hand_rolled_identity_join():
 
 def test_no_hand_rolled_minted_seed_pick():
     """The other half: picking the attached seed by `updated_at` instead of
-    MINTED_SEED_IDENTITY_LEG + SEED_PICK_ORDER. Diverges from the upserter in
+    the identity leg + SEED_PICK_ORDER. Diverges from the upserter in
     BOTH directions — measured 2026-07-31."""
     offenders = []
     for rel, text in _python_sources():
@@ -436,7 +441,13 @@ def test_the_upserter_join_still_agrees():
     # saw it and `"ORDER BY s.updated_at DESC" not in join_block` was vacuous.
     cte = upserter.find("minted_seed_one AS (")
     assert cte != -1, "the upserter no longer has a minted_seed_one CTE"
-    cte_block = upserter[cte: upserter.find("),", cte)]
-    assert "{MINTED_SEED_IDENTITY_LEG}" in cte_block, cte_block
+    # Terminate on the CTE's own closing paren at ITS indentation, not the first
+    # `),` anywhere: a `),` inside a COMMENT truncated this block and silently
+    # shrank what the assertions below could see.
+    end = upserter.find("\n  ),", cte)
+    assert end != -1, "cannot find the end of the minted_seed_one CTE"
+    cte_block = upserter[cte:end]
+    assert "SEED_PICK_ORDER" in cte_block, "block extraction truncated the CTE"
+    assert "{_MINTED_SEED_IDENTITY_LEG}" in cte_block, cte_block
     assert "{SEED_PICK_ORDER}" in cte_block, cte_block
     assert "s.updated_at DESC" not in cte_block, cte_block

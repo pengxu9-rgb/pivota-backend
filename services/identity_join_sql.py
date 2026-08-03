@@ -16,7 +16,7 @@ the rule and then retyping the SQL:
     a consumer counting distinct groups cannot see that lane at all.
   * the SEED PICK — Path-C attaches one seed PER OFFER to the same
     ``product_key``, so choosing among them is not a formality.
-    ``MINTED_SEED_IDENTITY_LEG`` prefers a seed that CARRIES a listing precisely
+    ``minted_seed_identity_leg_sql`` prefers a seed that CARRIES a listing precisely
     because the winner's ``external_product_id`` IS the join key; a bare
     ``updated_at DESC`` picks an identity-less sibling (real state goes
     uncounted) or a stale inactive seed (clean state counts as broken). Measured
@@ -37,13 +37,13 @@ same idea applied to the join that identity defects keep landing on.
 
 from __future__ import annotations
 
-from services.source_quarantine import MINTED_SEED_IDENTITY_LEG, SEED_PICK_ORDER
+from services.source_quarantine import SEED_PICK_ORDER, minted_seed_identity_leg_sql
 
 # The source_system that marks a Path-C minted canonical. Mirrors
 # PIVOTA-Agent pdpRenderability MINTED_SOURCE_SYSTEM.
 MINTED_SOURCE_SYSTEM = "catalog_enrichment_agent_v1"
 
-# Aliases baked into SEED_PICK_ORDER / MINTED_SEED_IDENTITY_LEG. Those constants
+# Aliases baked into SEED_PICK_ORDER / the identity leg. Those constants
 # are byte-pinned across two repos, so they cannot be renamed to get out of the
 # way — reject the caller's alias instead. Reusing `s` emits
 # `WHERE s.attached_product_key = s.product_key`: the seeds row compared to
@@ -68,11 +68,14 @@ def minted_seed_external_id_sql(cp_alias: str = "cp") -> str:
     Uses the SHARED order constants — never a hand-rolled ``updated_at DESC``.
     """
     _check_alias(cp_alias, "cp_alias")
+    # The seed is picked FOR this catalog row, so its merchant is the one
+    # the downstream listing join will use (#1665).
+    _identity_leg = minted_seed_identity_leg_sql(f"{cp_alias}.merchant_id")
     return (
         "(SELECT s.external_product_id\n"
         "                   FROM external_product_seeds s\n"
         f"                  WHERE s.attached_product_key = {cp_alias}.product_key\n"
-        f"                  ORDER BY {MINTED_SEED_IDENTITY_LEG}, {SEED_PICK_ORDER}\n"
+        f"                  ORDER BY {_identity_leg}, {SEED_PICK_ORDER}\n"
         "                  LIMIT 1)"
     )
 

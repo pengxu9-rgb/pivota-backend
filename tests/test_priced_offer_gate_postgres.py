@@ -1069,3 +1069,119 @@ def test_fragmented_identity_minted_pick_skips_an_inactive_seed(pg_engine):
         _trust_public(conn, "pk_minted")
         # Active seed agrees with the retailer -> clean.
         assert _count_of(conn, "cross_domain_content_key_fragmented_identity") == 0
+
+
+# ---------------------------------------------------------------------------
+# Issue #1665 — the identity leg must be merchant-scoped
+# ---------------------------------------------------------------------------
+
+
+def test_identity_leg_ignores_a_listing_at_another_merchant(pg_engine):
+    """A seed must not win the identity leg on a FOREIGN merchant's listing.
+
+    `source_listing_ref` is merchant_id:product_id (ADR-008), so `product_id`
+    alone is not unique across merchants. While the leg matched on product_id
+    ALONE, a seed carrying a listing at merchant M2 satisfied it, beat the seed
+    carrying the RIGHT listing at M1 on `updated_at`, and the outer lateral —
+    which does carry the merchant conjunct — then found nothing. The group read
+    NULL, `count(DISTINCT)` skipped it, and a genuinely fragmented cross-domain
+    content_key reported CLEAN.
+
+    This is the exact table from issue #1665: with the rival's foreign listing
+    present the count went 1 -> 0. It must now stay 1.
+    """
+    from sqlalchemy import text
+
+    with pg_engine.begin() as conn:
+        _reset(conn)
+        _product(conn, pk="pk_minted", ck="ck_x", sig="sig_minted",
+                 merchant_id="merch_m1")
+        _product(conn, pk="pk_retailer", ck="ck_x", sig="sig_retailer",
+                 merchant_id="merch_m1")
+        _domain(conn, "pk_minted", "brand.com")
+        _domain(conn, "pk_retailer", "ulta.com")
+        conn.execute(text("UPDATE catalog_products "
+                          "SET source_system = 'catalog_enrichment_agent_v1', "
+                          "    source_product_id = 'slug-not-a-seed-id' "
+                          "WHERE product_key = 'pk_minted'"))
+        # ext_old is OLDER but carries the listing at THIS merchant (M1).
+        # ext_new is NEWER and carries a listing only at a FOREIGN merchant (M2).
+        conn.execute(text(
+            "INSERT INTO external_product_seeds "
+            "(external_product_id, attached_product_key, status, updated_at) VALUES "
+            "('ext_new', 'pk_minted', 'active', NOW()), "
+            "('ext_old', 'pk_minted', 'active', NOW() - INTERVAL '10 days')"))
+        _listing(conn, source_product_id="ext_old", sig_group="grp_minted",
+                 merchant_id="merch_m1")
+        _listing(conn, source_product_id="ext_new", sig_group="grp_foreign",
+                 merchant_id="merch_m2")
+        _listing(conn, source_product_id="pk_retailer", sig_group="grp_retailer",
+                 merchant_id="merch_m1")
+        _trust_public(conn, "pk_minted")
+
+        assert _count_of(conn, "cross_domain_content_key_fragmented_identity") == 1
+
+
+def test_identity_leg_still_prefers_the_seed_that_resolves_at_this_merchant(pg_engine):
+    """Control for the test above: with NO foreign listing in play the pick is
+    unchanged, so the merchant conjunct is not simply disabling the leg."""
+    from sqlalchemy import text
+
+    with pg_engine.begin() as conn:
+        _reset(conn)
+        _product(conn, pk="pk_minted", ck="ck_x", sig="sig_minted",
+                 merchant_id="merch_m1")
+        _product(conn, pk="pk_retailer", ck="ck_x", sig="sig_retailer",
+                 merchant_id="merch_m1")
+        _domain(conn, "pk_minted", "brand.com")
+        _domain(conn, "pk_retailer", "ulta.com")
+        conn.execute(text("UPDATE catalog_products "
+                          "SET source_system = 'catalog_enrichment_agent_v1', "
+                          "    source_product_id = 'slug-not-a-seed-id' "
+                          "WHERE product_key = 'pk_minted'"))
+        conn.execute(text(
+            "INSERT INTO external_product_seeds "
+            "(external_product_id, attached_product_key, status, updated_at) VALUES "
+            "('ext_new', 'pk_minted', 'active', NOW()), "
+            "('ext_old', 'pk_minted', 'active', NOW() - INTERVAL '10 days')"))
+        _listing(conn, source_product_id="ext_old", sig_group="grp_minted",
+                 merchant_id="merch_m1")
+        _listing(conn, source_product_id="pk_retailer", sig_group="grp_retailer",
+                 merchant_id="merch_m1")
+        _trust_public(conn, "pk_minted")
+
+        assert _count_of(conn, "cross_domain_content_key_fragmented_identity") == 1
+
+
+def test_the_identity_leg_refuses_to_build_without_a_merchant():
+    """There must be no spelling of this leg that omits the merchant."""
+    import pytest
+
+    from services.source_quarantine import minted_seed_identity_leg_sql
+
+    for bad in ("", "   "):
+        with pytest.raises(ValueError, match="merchant"):
+            minted_seed_identity_leg_sql(bad)
+
+    sql = minted_seed_identity_leg_sql("cp.merchant_id")
+    assert "spl.merchant_id = cp.merchant_id" in sql
+    assert "spl.product_id = s.external_product_id" in sql
+
+
+def test_the_upserter_cte_joins_the_catalog_row_for_its_merchant():
+    """`cp` is not in scope inside a CTE, so the merchant must be joined in.
+    Without this the leg would silently compare against nothing."""
+    from services.catalog_row_trust_upserter import _PRODUCT_JOIN_CTES
+
+    start = _PRODUCT_JOIN_CTES.find("minted_seed_one AS (")
+    block = _PRODUCT_JOIN_CTES[start: _PRODUCT_JOIN_CTES.find("\n  ),", start)]
+    assert "LEFT JOIN catalog_products cpx" in block
+    assert "cpx.product_key = s.attached_product_key" in block
+    assert "spl.merchant_id = cpx.merchant_id" in block
+
+    # The dead, fan-out-prone join it replaced must be gone. Assert against the
+    # CODE only: the comment explaining the removal quotes the removed join
+    # verbatim, and would otherwise fail this on its own description.
+    code = "\n".join(ln for ln in block.split("\n")
+                     if not ln.strip().startswith("--"))
+    assert "LEFT JOIN pdp_identity_listing spl" not in code
