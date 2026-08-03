@@ -17,7 +17,7 @@ from dataclasses import dataclass
 from typing import Any, Dict, Iterable, List, Optional, Sequence
 
 from db.database import database
-from services.pdp_scope_classifier import SCOPE_CANONICAL
+from services.pdp_scope_classifier import LABEL_SOURCE_ENRICHMENT, SCOPE_CANONICAL
 
 
 IDENTITY_RECOVERY_SOURCE = "pdp_identity_recovery"
@@ -1447,6 +1447,57 @@ async def _apply_external_seed_attachment(proposal: IdentityRecoveryProposal, *,
         )
 
 
+# The canonical-scope promotion predicate, bound here so
+# tests/test_pdp_scope_promotion_agrees_with_classifier.py can import THE
+# SHIPPED STRING and diff it against pdp_scope_classifier.classify. An
+# earlier version had the test scrape this out of the module source, which
+# broke the moment the SQL gained an interpolation — the test then ran a
+# predicate containing a literal `{...}` placeholder.
+CANONICAL_SCOPE_PREDICATE = """
+            -- RULE 1 (services.pdp_scope_classifier): an agent-authored row is
+            -- canonical BY INTENT, whatever today's seller count is.
+            -- Interpolated from LABEL_SOURCE_ENRICHMENT, not retyped: a literal
+            -- here would be a THIRD copy of the rule, which is the exact defect
+            -- this change exists to remove.
+            cp.category_label_source = '{label_source_enrichment}'
+
+            -- RULE 2: >= 2 DISTINCT sellers. Counted, not inferred.
+            OR (
+              SELECT count(DISTINCT co.merchant_id)
+              FROM catalog_offers co
+              WHERE co.product_key = cp.product_key
+                AND co.merchant_id IS NOT NULL
+            ) >= 2
+
+            -- RULE 2 for rows inside the `external_seed` bucket. The bucket
+            -- collapses many real merchants into ONE merchant_id, so
+            -- `peer.merchant_id <> own.merchant_id` below is structurally
+            -- unsatisfiable for them. DISTINCT seed DOMAIN is the sound
+            -- recovery of the erased signal — one retailer per eTLD+1, the same
+            -- basis ADR-009 keys `merch_obs_<sha256(brand::etld1)>` on.
+            OR (
+              SELECT count(DISTINCT eps.domain)
+              FROM external_product_seeds eps
+              WHERE eps.attached_product_key = cp.product_key
+                AND eps.status = 'active'
+                AND eps.domain IS NOT NULL
+            ) >= 2
+
+            -- RULE 2 via product groups: a peer at a genuinely DIFFERENT
+            -- merchant. Correct as written; kept.
+            OR EXISTS (
+              SELECT 1
+              FROM product_group_members own
+              JOIN product_group_members peer
+                ON peer.product_group_id = own.product_group_id
+               AND peer.merchant_id <> own.merchant_id
+              WHERE own.merchant_id = cp.merchant_id
+                AND own.platform = cp.platform
+                AND own.platform_product_id = cp.source_product_id
+            )
+""".format(label_source_enrichment=LABEL_SOURCE_ENRICHMENT)
+
+
 async def _promote_canonical_scopes(product_keys: Sequence[str]) -> int:
     """Promote rows to `multi_merchant_canonical` — per the CLASSIFIER's rule.
 
@@ -1485,47 +1536,10 @@ async def _promote_canonical_scopes(product_keys: Sequence[str]) -> int:
             pdp_scope_set_at = NOW()
         WHERE cp.product_key = ANY(:product_keys)
           AND (
-            -- RULE 1 (services.pdp_scope_classifier): an agent-authored row is
-            -- canonical BY INTENT, whatever today's seller count is.
-            cp.category_label_source = 'enrichment_agent_v1'
-
-            -- RULE 2: >= 2 DISTINCT sellers. Counted, not inferred.
-            OR (
-              SELECT count(DISTINCT co.merchant_id)
-              FROM catalog_offers co
-              WHERE co.product_key = cp.product_key
-                AND co.merchant_id IS NOT NULL
-            ) >= 2
-
-            -- RULE 2 for rows inside the `external_seed` bucket. The bucket
-            -- collapses many real merchants into ONE merchant_id, so
-            -- `peer.merchant_id <> own.merchant_id` below is structurally
-            -- unsatisfiable for them. DISTINCT seed DOMAIN is the sound
-            -- recovery of the erased signal — one retailer per eTLD+1, the same
-            -- basis ADR-009 keys `merch_obs_<sha256(brand::etld1)>` on.
-            OR (
-              SELECT count(DISTINCT eps.domain)
-              FROM external_product_seeds eps
-              WHERE eps.attached_product_key = cp.product_key
-                AND eps.status = 'active'
-                AND eps.domain IS NOT NULL
-            ) >= 2
-
-            -- RULE 2 via product groups: a peer at a genuinely DIFFERENT
-            -- merchant. Correct as written; kept.
-            OR EXISTS (
-              SELECT 1
-              FROM product_group_members own
-              JOIN product_group_members peer
-                ON peer.product_group_id = own.product_group_id
-               AND peer.merchant_id <> own.merchant_id
-              WHERE own.merchant_id = cp.merchant_id
-                AND own.platform = cp.platform
-                AND own.platform_product_id = cp.source_product_id
-            )
+{predicate}
           )
         RETURNING cp.product_key
-        """,
+        """.format(predicate=CANONICAL_SCOPE_PREDICATE),
         {
             "scope": SCOPE_CANONICAL,
             "source": IDENTITY_RECOVERY_SOURCE,

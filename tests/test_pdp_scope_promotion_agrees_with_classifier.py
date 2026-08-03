@@ -116,22 +116,16 @@ def pg():
 
 
 def _promotion_sql() -> str:
-    """The SHIPPED predicate, lifted from the module rather than retyped.
+    """The SHIPPED predicate, IMPORTED — not retyped and not scraped.
 
-    Retyping it here would test a copy, which is the exact failure this file
-    exists to prevent.
+    Retyping it would test a copy, which is the failure this file exists to
+    prevent. Scraping the module source was the first attempt and it broke
+    silently when the SQL gained an interpolation: the lifted text still
+    contained a literal `{...}` placeholder and two fixtures went red.
     """
-    import pathlib
-    import re
+    from services.pdp_identity_recovery import CANONICAL_SCOPE_PREDICATE
 
-    src = (pathlib.Path(__file__).resolve().parent.parent
-           / "services" / "pdp_identity_recovery.py").read_text()
-    start = src.index("async def _promote_canonical_scopes")
-    body = src[start: src.index("RETURNING cp.product_key", start)]
-    where = body[body.index("WHERE cp.product_key = ANY(:product_keys)"):]
-    # Drop the bind-parameter clause; each fixture is a single row.
-    where = where.replace("cp.product_key = ANY(:product_keys)", "TRUE")
-    return re.sub(r"\s+$", "", where)
+    return "WHERE TRUE AND (\n" + CANONICAL_SCOPE_PREDICATE + "\n)"
 
 
 @pytest.mark.parametrize("case", FIXTURES, ids=[f[0] for f in FIXTURES])
