@@ -57,50 +57,93 @@ _SCHEMA = f"pdp_scope_test_{os.getpid()}"
 # Owning the schema makes the fixture exact, concurrent-safe, and self-cleaning.
 _RUN = str(os.getpid())
 
-# (id, label, category_label_source, offers, seeds, group_peers, must_promote)
-#   offers      : [merchant_id, ...]                      -> one catalog_offers row each
-#   seeds       : [(domain, status), ...]                 -> attached to THIS product_key
-#   group_peers : [(merchant_id, platform_product_id), ...] -> product_group_members
-CASES = [
-    # --- MUST NOT promote: the inflation shapes -----------------------------
-    ("single_seed", "one active seed only", None, [], [("a.com", "active")], [], False),
-    ("single_offer", "one offer merchant only", None, ["m1"], [], [], False),
-    ("no_sellers", "no sellers at all", None, [], [], [], False),
-    # Same seller, two ROWS. `count(DISTINCT ...)` is what stops these; review
-    # found plain `count(...)` survived, i.e. these promoted.
-    ("dup_offer_rows", "same merchant, TWO offer rows", None, ["m1", "m1"], [], [], False),
-    ("dup_seed_rows", "same domain, TWO seed rows", None, [],
-     [("a.com", "active"), ("a.com", "active")], [], False),
-    # `status='active'` is load-bearing; dropping it survived review's mutation.
-    ("inactive_seeds", "two INACTIVE seed domains", None, [],
-     [("a.com", "disabled"), ("b.com", "disabled")], [], False),
-    ("null_domain_seeds", "two active seeds with NULL domains", None, [],
-     [(None, "active"), (None, "active")], [], False),
+# (id, label, merchant, category_label_source, offers, seeds, peers, must_promote)
+#   merchant : catalog_products.merchant_id — 'external_seed' is THE BUCKET, any
+#              other value is a real merchant. Previously hardcoded to the
+#              bucket, which made the bucket/non-bucket distinction
+#              inexpressible and left three mutations undetectable.
+#   offers   : [merchant_id, ...]                      -> one catalog_offers row each
+#   seeds    : [(domain, status), ...]                 -> attached to THIS product_key
+#   peers    : [(merchant_id, platform_product_id), ...]  spid None = same as own
+#   cluster_seeds : [(external_product_id, domain), ...] — seeds reached via the
+#              product GROUP rather than attached_product_key (the pg_ext_ shape)
+_BUCKET = "external_seed"
+_REAL = "acme_shop"
 
-    # --- MUST promote: genuine multi-seller ---------------------------------
-    ("two_offers", "two offer merchants", None, ["m1", "m2"], [], [], True),
-    ("two_seed_domains", "two active seed domains", None, [],
-     [("a.com", "active"), ("b.com", "active")], [], True),
-    # ISOLATES the peer-merchant branch: the peer shares own's
-    # platform_product_id (spid=None), so the bucket branch — which needs a
-    # DIFFERENT one — cannot also fire. Review's mutation deleting the
-    # peer-merchant branch survived because the old fixture tripped both.
-    ("peer_other_merchant", "product-group peer at a DIFFERENT merchant, same spid",
+_RAW_CASES = [
+    # --- MUST NOT promote ---------------------------------------------------
+    # In the BUCKET the own merchant is not a seller, so one seed is 1.
+    ("bucket_single_seed", "bucket row, one active seed", _BUCKET, None,
+     [], [("a.com", "active")], [], False),
+    ("bucket_single_offer", "bucket row, one offer merchant", _BUCKET, None,
+     ["m1"], [], [], False),
+    ("bucket_no_sellers", "bucket row, no sellers", _BUCKET, None, [], [], [], False),
+    ("real_no_sellers", "real merchant, no offers and no seeds", _REAL, None,
+     [], [], [], False),
+    # Same seller, two ROWS — `count(DISTINCT ...)` is what stops these.
+    ("dup_offer_rows", "bucket row, same merchant TWO offer rows", _BUCKET, None,
+     ["m1", "m1"], [], [], False),
+    ("dup_seed_rows", "bucket row, same domain TWO seed rows", _BUCKET, None,
+     [], [("a.com", "active"), ("a.com", "active")], [], False),
+    ("inactive_seeds", "bucket row, two INACTIVE seed domains", _BUCKET, None,
+     [], [("a.com", "disabled"), ("b.com", "disabled")], [], False),
+    ("null_domain_seeds", "bucket row, two active seeds with NULL domains", _BUCKET,
+     None, [], [(None, "active"), (None, "active")], [], False),
+    # --- negative coverage for the product-group branches -------------------
+    # Added after review: all three mutations below survived because NO negative
+    # case had a product_group_members row at all.
+    ("group_of_one", "bucket row alone in its group", _BUCKET, None,
+     [], [], [], False),
+    ("peer_same_merchant_same_spid", "peer identical to own (duplicate group row)",
+     _BUCKET, None, [], [], [(_BUCKET, None)], False),
+    # THE bucket-gate case: a REAL merchant with a peer at a different product
+    # id but the SAME merchant. Dropping branch (e)'s `merchant_id='external_seed'`
+    # gate promotes this on one seller; nothing detected that before.
+    ("real_peer_diff_spid_same_merchant",
+     "real merchant, peer at a different product id, same merchant", _REAL, None,
+     [], [], [(_REAL, "other_spid")], False),
+    # PINS THE BUCKET GATE on branch (e). Same shape as the ext: cohort — a peer
+    # at a different product id, cluster seeds on TWO domains — but at a REAL
+    # merchant, so branch (e) must NOT apply. Without this case, deleting the
+    # `cp.merchant_id = 'external_seed'` gate is undetectable: every other
+    # non-bucket case lacks cluster seeds, so the domain count is 0 and the
+    # branch stays false for the wrong reason.
+    ("real_cluster_two_domains_not_bucket",
+     "REAL merchant with a two-domain cluster — branch (e) must not apply",
+     _REAL, None, [], [], [(_REAL, "other_spid")], False,
+     [("SPID", "zappos.com"), ("other_spid", "nordstrom.com")]),
+    # Bucket cluster whose seeds are all on ONE domain — one retailer, two SKUs.
+    # The old `platform_product_id <>` gate promoted this; the domain gate does not.
+    ("bucket_cluster_one_domain", "bucket cluster, two product ids, ONE domain",
+     _BUCKET, None, [], [], [(_BUCKET, "other_epid")], False,
+     [("SPID", "zappos.com"), ("other_epid", "zappos.com")]),
+
+    # --- MUST promote -------------------------------------------------------
+    # A REAL merchant is itself a seller: own(1) + one seed domain(1) = 2.
+    # Deleting the old active-seed branch globally broke exactly this shape.
+    ("real_plus_one_seed", "real merchant + one active seed = 2 sellers", _REAL,
+     None, [], [("zappos.com", "active")], [], True),
+    ("real_plus_one_offer", "real merchant + one OTHER offer merchant = 2", _REAL,
+     None, ["other_m"], [], [], True),
+    ("bucket_two_offers", "bucket row, two offer merchants", _BUCKET, None,
+     ["m1", "m2"], [], [], True),
+    ("bucket_two_seed_domains", "bucket row, two active seed domains", _BUCKET,
+     None, [], [("a.com", "active"), ("b.com", "active")], [], True),
+    # Isolates branch (d): peer shares own's spid, so the bucket branch cannot fire.
+    ("peer_other_merchant", "peer at a DIFFERENT merchant, same spid", _BUCKET,
      None, [], [], [("other_merchant", None)], True),
-    # THE ext: COHORT. Deleting the bucket branch un-promoted this entire
-    # cohort in review — 3 retailers on one ext: identity, promoted 3 -> 0.
-    # Its seeds hang off an `ext:` key, not this row's, so the seed-domain
-    # count sees zero; every member is merchant_id='external_seed', so the
-    # peer-merchant branch cannot fire.
-    ("ext_cohort", "bucket peer at a different source product (pg_ext_ cohort)",
-     None, [], [], [("external_seed", "other_epid")], True),
+    # THE ext: COHORT, correctly gated: two product ids on TWO retailer domains.
+    ("ext_cohort_two_domains", "bucket cluster, two product ids, TWO domains",
+     _BUCKET, None, [], [], [(_BUCKET, "other_epid")], True,
+     [("SPID", "zappos.com"), ("other_epid", "nordstrom.com")]),
 
-    # --- Rule 1: agent-authored is canonical BY INTENT ----------------------
-    ("agent_no_sellers", "agent-authored, no sellers", LABEL_SOURCE_ENRICHMENT,
-     [], [], [], True),
-    ("agent_one_seller", "agent-authored, one seller", LABEL_SOURCE_ENRICHMENT,
-     ["m1"], [], [], True),
+    # --- Rule 1 -------------------------------------------------------------
+    ("agent_no_sellers", "agent-authored, no sellers", _BUCKET,
+     LABEL_SOURCE_ENRICHMENT, [], [], [], True),
 ]
+
+# Normalise to 9 fields; cluster_seeds defaults to none.
+CASES = [c if len(c) == 9 else (*c, ()) for c in _RAW_CASES]
 
 
 @pytest.fixture(scope="module")
@@ -127,7 +170,8 @@ def engine():
             " pdp_scope_set_at timestamptz)",
             "CREATE TABLE IF NOT EXISTS catalog_offers (product_key text, merchant_id text)",
             "CREATE TABLE IF NOT EXISTS external_product_seeds (id text,"
-            " attached_product_key text, status text, domain text)",
+            " attached_product_key text, status text, domain text,"
+            " external_product_id text)",
             "CREATE TABLE IF NOT EXISTS product_group_members (product_group_id text,"
             " merchant_id text, platform text, platform_product_id text)",
         ):
@@ -137,7 +181,8 @@ def engine():
         c.execute(text(f"DROP SCHEMA IF EXISTS {_SCHEMA} CASCADE"))
 
 
-def _seed_fixture(conn, case_id, cls_source, offers, seeds, peers):
+def _seed_fixture(conn, case_id, merchant, cls_source, offers, seeds, peers,
+                  cluster_seeds=()):
     """Per-case keys, so concurrent runs cannot collide.
 
     Review ran two pytest processes and got 5 failures in 6 — including real
@@ -157,8 +202,8 @@ def _seed_fixture(conn, case_id, cls_source, offers, seeds, peers):
     conn.execute(text(
         "INSERT INTO catalog_products (product_key, merchant_id, platform,"
         " source_product_id, category_label_source, pdp_scope)"
-        " VALUES (:pk,'external_seed','external_seed',:spid,:cls,'unverified')"),
-        {"pk": pk, "spid": f"spid_{case_id}_{_RUN}", "cls": cls_source})
+        " VALUES (:pk,:m,'external_seed',:spid,:cls,'unverified')"),
+        {"pk": pk, "m": merchant, "spid": f"spid_{case_id}_{_RUN}", "cls": cls_source})
     for i, m in enumerate(offers):
         conn.execute(text("INSERT INTO catalog_offers (product_key, merchant_id)"
                           " VALUES (:pk, :m)"), {"pk": pk, "m": m})
@@ -166,6 +211,13 @@ def _seed_fixture(conn, case_id, cls_source, offers, seeds, peers):
         conn.execute(text("INSERT INTO external_product_seeds (id, attached_product_key,"
                           " status, domain) VALUES (:i, :pk, :st, :d)"),
                      {"i": f"{case_id}_{_RUN}_s{i}", "pk": pk, "st": status, "d": dom})
+    # Cluster seeds carry NO attached_product_key — they are reached only through
+    # the group, via external_product_id = a member's platform_product_id.
+    for i, (epid, dom) in enumerate(cluster_seeds):
+        real_epid = f"spid_{case_id}_{_RUN}" if epid == "SPID" else epid
+        conn.execute(text("INSERT INTO external_product_seeds (id, status, domain,"
+                          " external_product_id) VALUES (:i,'active',:d,:e)"),
+                     {"i": f"{case_id}_{_RUN}_c{i}", "d": dom, "e": real_epid})
     if peers:
         conn.execute(text("INSERT INTO product_group_members (product_group_id, merchant_id,"
                           " platform, platform_product_id)"
@@ -215,10 +267,12 @@ def _run_promotion(engine, product_key):
 def test_only_genuine_multi_seller_shapes_are_promoted(engine, case):
     from sqlalchemy import text
 
-    case_id, label, cls_source, offers, seeds, peers, must_promote = case
+    (case_id, label, merchant, cls_source, offers, seeds, peers, must_promote,
+     cluster_seeds) = case
 
     with engine.begin() as c:
-        pk = _seed_fixture(c, case_id, cls_source, offers, seeds, peers)
+        pk = _seed_fixture(c, case_id, merchant, cls_source, offers, seeds, peers,
+                           cluster_seeds)
 
     _run_promotion(engine, pk)
 

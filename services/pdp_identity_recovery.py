@@ -1454,32 +1454,50 @@ async def _apply_external_seed_attachment(proposal: IdentityRecoveryProposal, *,
 # broke the moment the SQL gained an interpolation — the test then ran a
 # predicate containing a literal `{...}` placeholder.
 CANONICAL_SCOPE_PREDICATE = """
-            -- RULE 1 (services.pdp_scope_classifier): an agent-authored row is
-            -- canonical BY INTENT, whatever today's seller count is.
-            -- Interpolated from LABEL_SOURCE_ENRICHMENT, never retyped.
+            -- RULE 1: an agent-authored row is canonical BY INTENT, whatever
+            -- today's seller count is. Interpolated, never retyped.
             cp.category_label_source = '{label_source_enrichment}'
 
-            -- >= 2 DISTINCT offer merchants. COUNTED, not inferred.
+            -- RULE 2: seller_count >= 2, spelled EXACTLY as
+            -- services/pdp_scope_classifier defines it — "distinct merchants
+            -- observed across catalog_offers and external_product_seeds linked
+            -- to this product_key (THE ROW'S OWN merchant_id IS INCLUDED)".
+            --
+            -- ⚠️ THE OWN-MERCHANT TERM IS THE WHOLE POINT. A previous version
+            -- dropped the old `EXISTS (one active seed)` branch on the reasoning
+            -- that "one seed is not multi-merchant". That is true ONLY inside
+            -- the `external_seed` bucket, where the +1 would count a bucket
+            -- rather than a seller. For a REAL merchant's row, own merchant (1)
+            -- + one active seed domain (1) = 2 = canonical, and the classifier
+            -- agrees. Deleting it globally de-promoted 51.9% of the rows this
+            -- function is called on — and it is called from
+            -- repair_external_seed_attachment, whose source query filters
+            -- `cp.merchant_id <> 'external_seed'`, i.e. real merchants only.
+            -- So the old branch was not unsound; it was unsound IN THE BUCKET.
+            -- The CASE below is what makes that distinction instead of guessing.
             OR (
-              SELECT count(DISTINCT co.merchant_id)
-              FROM catalog_offers co
-              WHERE co.product_key = cp.product_key
-                AND co.merchant_id IS NOT NULL
+              (CASE WHEN cp.merchant_id IS NOT NULL
+                     AND cp.merchant_id <> 'external_seed'
+                    THEN 1 ELSE 0 END)
+              + (
+                SELECT count(DISTINCT co.merchant_id)
+                FROM catalog_offers co
+                WHERE co.product_key = cp.product_key
+                  AND co.merchant_id IS NOT NULL
+                  AND co.merchant_id IS DISTINCT FROM cp.merchant_id
+              )
+              + (
+                SELECT count(DISTINCT eps.domain)
+                FROM external_product_seeds eps
+                WHERE eps.attached_product_key = cp.product_key
+                  AND eps.status = 'active'
+                  AND eps.domain IS NOT NULL
+              )
             ) >= 2
 
-            -- >= 2 DISTINCT seed DOMAINS attached to this row. `status='active'`
-            -- and DISTINCT are both load-bearing: without them two rows of one
-            -- inactive seed, or two seeds on one domain, promote a single-seller
-            -- row -- the same inflation this predicate exists to stop.
-            OR (
-              SELECT count(DISTINCT eps.domain)
-              FROM external_product_seeds eps
-              WHERE eps.attached_product_key = cp.product_key
-                AND eps.status = 'active'
-                AND eps.domain IS NOT NULL
-            ) >= 2
-
-            -- A product-group peer at a genuinely DIFFERENT merchant.
+            -- RULE 2 via product groups: a peer at a genuinely DIFFERENT
+            -- merchant. Not reducible to the counts above — the peer is another
+            -- catalog row, not an offer or a seed on this one.
             OR EXISTS (
               SELECT 1
               FROM product_group_members own
@@ -1491,41 +1509,36 @@ CANONICAL_SCOPE_PREDICATE = """
                 AND own.platform_product_id = cp.source_product_id
             )
 
-            -- A product-group peer at a different SOURCE PRODUCT, for rows in
-            -- the `external_seed` bucket.
+            -- The `pg_ext_*` cohort, inside the bucket. Its members all share
+            -- merchant_id='external_seed', so the branch above is unsatisfiable
+            -- for them and their seeds hang off an `ext:` key rather than this
+            -- row's, so the seed count above sees zero.
             --
-            -- ⚠️ KEPT DELIBERATELY. A first version of this change deleted it as
-            -- "a proxy for different merchant", which it is in general. But for
-            -- `pg_ext_*` groups it is the ONLY VISIBLE FORM of a real
-            -- multi-retailer fact, and review measured the deletion
-            -- un-promoting that entire cohort (3 retailers on one ext: identity
-            -- -> promoted 3 before, 0 after). Three separate reasons the other
-            -- branches cannot see it:
-            --   * its seeds carry `attached_product_key LIKE 'ext:%'`, not this
-            --     row's `prod::...` key, so the seed-domain count matches ZERO;
-            --   * every `pg_ext_*` member is written with
-            --     merchant_id='external_seed', so the peer-merchant branch above
-            --     is unsatisfiable for it;
-            --   * the mirror lane never writes 'enrichment_agent_v1'.
-            -- And the cohort is multi-seller BY CONSTRUCTION: its cluster gate
-            -- is `HAVING COUNT(DISTINCT external_product_id) >= 2`.
-            --
-            -- Removing it is also a RATCHET, not just a miss: cross-merchant
-            -- seed attachment is itself gated on this label
-            -- (services/pdp_matcher/runner.py:61,80), so a row denied the label
-            -- can never acquire a second seller, and so can never qualify by any
-            -- other branch. Do not delete without first making the seed count
-            -- group-aware.
+            -- ⚠️ GATED ON DISTINCT DOMAIN ACROSS THE CLUSTER, not on differing
+            -- platform_product_id. A previous version used the latter and
+            -- justified it as "multi-seller by construction, the cluster gate is
+            -- COUNT(DISTINCT external_product_id) >= 2". That claim is FALSE:
+            -- the gate counts external_product_id, NOT domain, so ONE retailer
+            -- listing one product under two SKUs satisfies it. This module's own
+            -- health query counts `multi_domain_clusters` separately for exactly
+            -- that reason. Domain is the seller signal here — one retailer per
+            -- eTLD+1, the same basis ADR-009 keys merch_obs_ on.
             OR EXISTS (
               SELECT 1
               FROM product_group_members own
-              JOIN product_group_members peer
-                ON peer.product_group_id = own.product_group_id
-               AND peer.platform_product_id <> own.platform_product_id
               WHERE cp.merchant_id = 'external_seed'
                 AND own.merchant_id = cp.merchant_id
                 AND own.platform = cp.platform
                 AND own.platform_product_id = cp.source_product_id
+                AND (
+                  SELECT count(DISTINCT s2.domain)
+                  FROM product_group_members peer
+                  JOIN external_product_seeds s2
+                    ON s2.external_product_id = peer.platform_product_id
+                   AND s2.status = 'active'
+                   AND s2.domain IS NOT NULL
+                  WHERE peer.product_group_id = own.product_group_id
+                ) >= 2
             )
 """.format(label_source_enrichment=LABEL_SOURCE_ENRICHMENT)
 
