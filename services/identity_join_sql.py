@@ -43,6 +43,23 @@ from services.source_quarantine import MINTED_SEED_IDENTITY_LEG, SEED_PICK_ORDER
 # PIVOTA-Agent pdpRenderability MINTED_SOURCE_SYSTEM.
 MINTED_SOURCE_SYSTEM = "catalog_enrichment_agent_v1"
 
+# Aliases baked into SEED_PICK_ORDER / MINTED_SEED_IDENTITY_LEG. Those constants
+# are byte-pinned across two repos, so they cannot be renamed to get out of the
+# way — reject the caller's alias instead. Reusing `s` emits
+# `WHERE s.attached_product_key = s.product_key`: the seeds row compared to
+# ITSELF, correlation silently gone. Production would error (there is no bare
+# `product_key` on external_product_seeds — migration 044 defines only
+# `attached_product_key`), but the gate DB's copy of that table HAS one, so the
+# failure would surface as a green test and a broken query.
+_RESERVED_ALIASES = frozenset({"s", "spl"})
+
+
+def _check_alias(name: str, role: str) -> None:
+    if name in _RESERVED_ALIASES:
+        raise ValueError(
+            f"{role}={name!r} would shadow the seed subquery's own alias; "
+            f"reserved: {sorted(_RESERVED_ALIASES)}")
+
 
 def minted_seed_external_id_sql(cp_alias: str = "cp") -> str:
     """The `external_product_id` of the seed that represents a minted row.
@@ -50,6 +67,7 @@ def minted_seed_external_id_sql(cp_alias: str = "cp") -> str:
     Correlated form of `catalog_row_trust_upserter`'s ``minted_seed_one`` CTE.
     Uses the SHARED order constants — never a hand-rolled ``updated_at DESC``.
     """
+    _check_alias(cp_alias, "cp_alias")
     return (
         "(SELECT s.external_product_id\n"
         "                   FROM external_product_seeds s\n"
@@ -65,6 +83,7 @@ def identity_listing_product_id_sql(cp_alias: str = "cp") -> str:
     Mirror rows carry the seed id in ``source_product_id``; minted rows carry a
     name slug and must route through their attached seed.
     """
+    _check_alias(cp_alias, "cp_alias")
     return (
         f"CASE WHEN {cp_alias}.source_system = '{MINTED_SOURCE_SYSTEM}'\n"
         f"                      THEN {minted_seed_external_id_sql(cp_alias)}\n"
@@ -96,6 +115,8 @@ def identity_listing_lateral_sql(
 
     It is a literal SQL fragment either way, and never a place for user input.
     """
+    _check_alias(cp_alias, "cp_alias")
+    _check_alias(alias, "alias")
     select_list = ", ".join(
         f"{alias}.{name.strip()}" for name in columns.split(",") if name.strip()
     )
