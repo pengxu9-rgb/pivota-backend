@@ -1104,22 +1104,45 @@ def test_identity_leg_ignores_a_listing_at_another_merchant(pg_engine):
                           "SET source_system = 'catalog_enrichment_agent_v1', "
                           "    source_product_id = 'slug-not-a-seed-id' "
                           "WHERE product_key = 'pk_minted'"))
-        # ext_old is OLDER but carries the listing at THIS merchant (M1).
-        # ext_new is NEWER and carries a listing only at a FOREIGN merchant (M2).
+        # `ext_aaa_right` is OLDER but carries the listing at THIS merchant (M1).
+        # `ext_zzz_rival` is NEWER and carries a listing only at a FOREIGN
+        # merchant (M2).
+        #
+        # THE NAMES ARE DELIBERATE. An earlier version called these ext_old /
+        # ext_new, and under an arbitrary `ORDER BY s.external_product_id DESC`
+        # — no identity leg at all — 'ext_old' sorts above 'ext_new', so the
+        # fixture produced the RIGHT answer by accident and the mutation went
+        # undetected. Named so that any alphabetical or id-based ordering picks
+        # the WRONG seed, and only the merchant-scoped leg picks the right one.
         conn.execute(text(
             "INSERT INTO external_product_seeds "
             "(external_product_id, attached_product_key, status, updated_at) VALUES "
-            "('ext_new', 'pk_minted', 'active', NOW()), "
-            "('ext_old', 'pk_minted', 'active', NOW() - INTERVAL '10 days')"))
-        _listing(conn, source_product_id="ext_old", sig_group="grp_minted",
+            "('ext_zzz_rival', 'pk_minted', 'active', NOW()), "
+            "('ext_aaa_right', 'pk_minted', 'active', NOW() - INTERVAL '10 days')"))
+        _listing(conn, source_product_id="ext_aaa_right", sig_group="grp_minted",
                  merchant_id="merch_m1")
-        _listing(conn, source_product_id="ext_new", sig_group="grp_foreign",
+        _listing(conn, source_product_id="ext_zzz_rival", sig_group="grp_foreign",
                  merchant_id="merch_m2")
         _listing(conn, source_product_id="pk_retailer", sig_group="grp_retailer",
                  merchant_id="merch_m1")
         _trust_public(conn, "pk_minted")
 
         assert _count_of(conn, "cross_domain_content_key_fragmented_identity") == 1
+
+        # AND the row must resolve to THIS merchant's group. The count alone is a
+        # 1-bit assertion that an arbitrary ORDER BY also satisfies (measured:
+        # replacing the whole pick with `ORDER BY s.external_product_id DESC`
+        # left this test green, because the right seed happens to sort last).
+        # Naming the group is what actually pins the leg.
+        from services.identity_join_sql import identity_listing_lateral_sql
+
+        resolved = conn.execute(text(
+            "SELECT pil.sellable_item_group_id FROM catalog_products cp "
+            + identity_listing_lateral_sql("cp")
+            + " WHERE cp.product_key = 'pk_minted'")).scalar()
+        assert resolved == "grp_minted", (
+            f"resolved {resolved!r} — the foreign-merchant listing (grp_foreign) "
+            "won the seed pick, or the pick became arbitrary")
 
 
 def test_identity_leg_still_prefers_the_seed_that_resolves_at_this_merchant(pg_engine):
@@ -1175,13 +1198,15 @@ def test_the_upserter_cte_joins_the_catalog_row_for_its_merchant():
 
     start = _PRODUCT_JOIN_CTES.find("minted_seed_one AS (")
     block = _PRODUCT_JOIN_CTES[start: _PRODUCT_JOIN_CTES.find("\n  ),", start)]
-    assert "LEFT JOIN catalog_products cpx" in block
-    assert "cpx.product_key = s.attached_product_key" in block
-    assert "spl.merchant_id = cpx.merchant_id" in block
-
-    # The dead, fan-out-prone join it replaced must be gone. Assert against the
-    # CODE only: the comment explaining the removal quotes the removed join
-    # verbatim, and would otherwise fail this on its own description.
+    # Comments stripped for EVERY assertion, positive and negative. Review
+    # showed a `-- historical: the leg was {_MINTED_SEED_IDENTITY_LEG}` comment
+    # kept 15 string-pinned tests green while the real ORDER BY was gutted. The
+    # first version of this test stripped comments only for the negative check —
+    # the hazard was seen on one line and missed on three.
     code = "\n".join(ln for ln in block.split("\n")
                      if not ln.strip().startswith("--"))
+    assert "LEFT JOIN catalog_products cpx" in code
+    assert "cpx.product_key = s.attached_product_key" in code
+    assert "spl.merchant_id = cpx.merchant_id" in code
+    # The dead, fan-out-prone join it replaced must be gone.
     assert "LEFT JOIN pdp_identity_listing spl" not in code
