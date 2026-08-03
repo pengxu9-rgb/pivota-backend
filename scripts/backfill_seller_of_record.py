@@ -510,11 +510,48 @@ class SellerBackfill:
             "WHERE attached_product_key IS NOT NULL AND btrim(attached_product_key) <> '' "
             "AND attached_product_key NOT LIKE 'prod::%'"
         )
-        stats = {"scanned": 0, "repaired": 0, "undecodable": 0}
+        stats = {"scanned": 0, "repaired": 0, "undecodable": 0,
+                 "already_resolving": 0}
         undecodable: List[Dict[str, Any]] = []
+        already_resolving: List[Dict[str, Any]] = []
         for row in rows or []:
             d = dict(row)
             stats["scanned"] += 1
+
+            # 🚨 NEVER DETACH A KEY THAT ALREADY RESOLVES. This phase validates
+            # that the key it is about to WRITE points at a real row; until
+            # 2026-08-01 nothing validated the key it was about to OVERWRITE.
+            #
+            # `ext:<slug>::<hash>` is not a bare/malformed key — it is a LIVE
+            # product_key format on ~1,795 unsuppressed catalog_products rows,
+            # every one Path-C (`catalog_enrichment_agent_v1`). The gateway
+            # routes a minted PDP by matching
+            # `external_product_seeds.attached_product_key = cp.product_key`
+            # (services/pdp_renderability seed_route_resolves_sql, minted arm),
+            # so a seed pointing at an `ext:` row is CORRECT RELATIVE TO THAT ROW.
+            #
+            # Conforming the seed to `prod::` while the row keeps its `ext:` key
+            # breaks the join. Measured when it happened: 720 seeds moved, 364
+            # ELECTED, trust-public PDPs went to HTTP 500 — confirmed live, not
+            # inferred from an invariant. Restored from a reconstructed
+            # content_key mapping (587 exact; 133 needed hand inspection).
+            #
+            # A rewrite here has TWO ends. Validating only the destination is how
+            # a "repair" silently detaches a working link.
+            current_apk = str(d.get("attached_product_key") or "").strip()
+            if current_apk:
+                live = await self.db.fetch_one(
+                    "SELECT product_key FROM catalog_products WHERE product_key = :pk",
+                    {"pk": current_apk},
+                )
+                if live:
+                    stats["already_resolving"] += 1
+                    already_resolving.append({
+                        "seed_id": str(d.get("id")),
+                        "attached_product_key": current_apk,
+                    })
+                    continue
+
             candidate = candidate_storage_key_from_seed(d)
             resolved: Optional[str] = None
             if candidate:
@@ -546,6 +583,15 @@ class SellerBackfill:
                                     "external_product_id": d.get("external_product_id")})
                 continue
             if self.execute:
+                # Snapshot the PREVIOUS value before overwriting it. Recovery
+                # from the 2026-08-01 incident needed archaeology precisely
+                # because the checkpoint stored only the NEW key; an UPDATE that
+                # cannot be undone from its own audit trail is not resumable, it
+                # is just fast.
+                await self._checkpoint(
+                    "barekey", str(d.get("id")), resolved, "pending",
+                    previous_value=current_apk or None,
+                )
                 await self.db.execute(
                     "UPDATE external_product_seeds SET attached_product_key = :pk, "
                     "updated_at = NOW() WHERE id = :id",
@@ -555,6 +601,7 @@ class SellerBackfill:
             stats["repaired"] += 1
         report.barekey = stats
         report.review_queue["barekey_undecodable"] = undecodable
+        report.review_queue["barekey_already_resolving"] = already_resolving
 
     # -- phase 3: catalog re-key --------------------------------------------
 
@@ -842,26 +889,44 @@ class SellerBackfill:
                 phase      TEXT NOT NULL,
                 ref_id     TEXT NOT NULL,
                 observed_id TEXT,
+                previous_value TEXT,
                 status     TEXT NOT NULL DEFAULT 'done',
                 updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
                 PRIMARY KEY (phase, ref_id)
             )
             """
         )
+        # Additive for tables created before the column existed.
+        await self.db.execute(
+            "ALTER TABLE a9_4_backfill_checkpoint "
+            "ADD COLUMN IF NOT EXISTS previous_value TEXT"
+        )
 
     async def _checkpoint(self, phase: str, ref_id: str, observed_id: Optional[str],
-                          status: str) -> None:
+                          status: str, previous_value: Optional[str] = None) -> None:
+        """Record what this run did to `ref_id`.
+
+        `previous_value` is what makes the run UNDOABLE. It is optional only so
+        phases that overwrite nothing (seeds fills a NULL) can omit it; any phase
+        that OVERWRITES an existing value must pass it, or recovery means
+        reconstructing the old state from whatever joins happen to survive.
+        """
         if not self.execute:
             return
         await self.db.execute(
             """
-            INSERT INTO a9_4_backfill_checkpoint (phase, ref_id, observed_id, status, updated_at)
-            VALUES (:phase, :ref_id, :obs, :status, NOW())
+            INSERT INTO a9_4_backfill_checkpoint
+                (phase, ref_id, observed_id, previous_value, status, updated_at)
+            VALUES (:phase, :ref_id, :obs, :prev, :status, NOW())
             ON CONFLICT (phase, ref_id)
-            DO UPDATE SET observed_id = EXCLUDED.observed_id, status = EXCLUDED.status,
+            DO UPDATE SET observed_id = EXCLUDED.observed_id,
+                          previous_value = COALESCE(a9_4_backfill_checkpoint.previous_value,
+                                                    EXCLUDED.previous_value),
+                          status = EXCLUDED.status,
                           updated_at = NOW()
             """,
-            {"phase": phase, "ref_id": ref_id, "obs": observed_id, "status": status},
+            {"phase": phase, "ref_id": ref_id, "obs": observed_id,
+             "prev": previous_value, "status": status},
         )
 
 
