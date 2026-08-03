@@ -69,10 +69,28 @@ def test_the_lateral_yields_at_most_one_listing():
 
 
 def test_the_alias_is_honoured_without_breaking_correlation():
+    """EVERY reference must move with the alias, including the select-list.
+
+    The first version of this test asserted only `"cp." not in sql`, which was
+    true while the emitted SQL was
+    `SELECT pil.sellable_item_group_id FROM pdp_identity_listing lst` — an
+    invalid reference, and the same right-value/wrong-alias shape this module
+    exists to prevent. Assert on the DEFAULT-columns path specifically: an
+    explicit `columns=` argument would mask the bug that shipped.
+    """
     sql = identity_listing_lateral_sql("c2", alias="lst")
     assert "lst.merchant_id = c2.merchant_id" in sql
     assert "FROM pdp_identity_listing lst" in sql
+    assert "SELECT lst.sellable_item_group_id" in sql
+    assert "ORDER BY lst.source_listing_ref" in sql
+    # No reference to the DEFAULT alias may survive an alias override.
+    assert "pil." not in sql
     assert "cp." not in sql.replace("catalog_products", "")
+
+
+def test_multiple_columns_are_each_qualified():
+    sql = identity_listing_lateral_sql("cp", columns="sellable_item_group_id, product_id")
+    assert "SELECT pil.sellable_item_group_id, pil.product_id" in sql
 
 
 # ---------------------------------------------------------------------------

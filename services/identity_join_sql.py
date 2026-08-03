@@ -76,7 +76,7 @@ def identity_listing_product_id_sql(cp_alias: str = "cp") -> str:
 def identity_listing_lateral_sql(
     cp_alias: str = "cp",
     *,
-    columns: str = "pil.sellable_item_group_id",
+    columns: str = "sellable_item_group_id",
     alias: str = "pil",
 ) -> str:
     """`LEFT JOIN LATERAL` yielding at most ONE listing for this catalog row.
@@ -85,11 +85,23 @@ def identity_listing_lateral_sql(
     corrupts any aggregate over the result. The ``ORDER BY`` is determinism, not
     preference — a ``LIMIT`` without one is plan-dependent.
 
-    ``columns`` is a literal SQL select-list; it is never a place for user input.
+    ``columns`` is a comma-separated list of BARE column names, qualified here
+    with ``alias``. It takes bare names rather than a ready-made select-list
+    because the first version took the latter, defaulted it to
+    ``"pil.sellable_item_group_id"``, and so emitted
+    ``SELECT pil.… FROM pdp_identity_listing lst`` — invalid SQL — for any caller
+    that passed ``alias`` without also remembering to restate ``columns``. That
+    is the same right-value/wrong-alias shape this module exists to prevent, so
+    the coupling is removed rather than documented.
+
+    It is a literal SQL fragment either way, and never a place for user input.
     """
+    select_list = ", ".join(
+        f"{alias}.{name.strip()}" for name in columns.split(",") if name.strip()
+    )
     return (
         "LEFT JOIN LATERAL (\n"
-        f"                SELECT {columns}\n"
+        f"                SELECT {select_list}\n"
         f"                FROM pdp_identity_listing {alias}\n"
         f"                WHERE {alias}.merchant_id = {cp_alias}.merchant_id\n"
         f"                  AND {alias}.product_id = {identity_listing_product_id_sql(cp_alias)}\n"
