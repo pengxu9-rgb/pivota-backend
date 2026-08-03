@@ -1,5 +1,14 @@
 """What may and may not earn `pdp_scope='multi_merchant_canonical'`.
 
+THE FILENAME IS LOAD-BEARING. `.github/workflows/postgres-dialect-gate.yml`
+discovers `tests/test_*_postgres.py` by glob and runs those against a real
+Postgres 15 service. This file was originally named
+`test_pdp_scope_promotion_agrees_with_classifier.py`, which matches no glob —
+and `tests/conftest.py` defaults DATABASE_URL to SQLite when unset, so the
+module-level skipif fired and ALL of it skipped on the default CI path. A
+prevention mechanism that does not execute prevents nothing. Do not rename
+this file out of the `_postgres.py` suffix.
+
 WHY THIS MATTERS. `services/pivot_query_service.py` grants that label a +200
 search-rank bonus in THREE places (:1048, :1090, :1476), documented as "large
 enough to dominate every other term" — above exact-SKU (120), exact-title (100)
@@ -243,7 +252,11 @@ def _run_promotion(engine, product_key):
 
     from services import pdp_identity_recovery as mod
 
-    url = str(engine.url)
+    # render_as_string(hide_password=False): SQLAlchemy 2.0 renders the
+    # password as "***" in str(url), and `databases` then sends the literal
+    # "***". Review found this pinned the whole file to a passwordless local
+    # socket — it errored on connect against CI, staging, and the prod proxy.
+    url = engine.url.render_as_string(hide_password=False)
     db = databases.Database(url.replace("postgresql://", "postgresql+asyncpg://")
                             if "+asyncpg" not in url else url,
                             server_settings={"search_path": _SCHEMA})
