@@ -1456,12 +1456,10 @@ async def _apply_external_seed_attachment(proposal: IdentityRecoveryProposal, *,
 CANONICAL_SCOPE_PREDICATE = """
             -- RULE 1 (services.pdp_scope_classifier): an agent-authored row is
             -- canonical BY INTENT, whatever today's seller count is.
-            -- Interpolated from LABEL_SOURCE_ENRICHMENT, not retyped: a literal
-            -- here would be a THIRD copy of the rule, which is the exact defect
-            -- this change exists to remove.
+            -- Interpolated from LABEL_SOURCE_ENRICHMENT, never retyped.
             cp.category_label_source = '{label_source_enrichment}'
 
-            -- RULE 2: >= 2 DISTINCT sellers. Counted, not inferred.
+            -- >= 2 DISTINCT offer merchants. COUNTED, not inferred.
             OR (
               SELECT count(DISTINCT co.merchant_id)
               FROM catalog_offers co
@@ -1469,12 +1467,10 @@ CANONICAL_SCOPE_PREDICATE = """
                 AND co.merchant_id IS NOT NULL
             ) >= 2
 
-            -- RULE 2 for rows inside the `external_seed` bucket. The bucket
-            -- collapses many real merchants into ONE merchant_id, so
-            -- `peer.merchant_id <> own.merchant_id` below is structurally
-            -- unsatisfiable for them. DISTINCT seed DOMAIN is the sound
-            -- recovery of the erased signal — one retailer per eTLD+1, the same
-            -- basis ADR-009 keys `merch_obs_<sha256(brand::etld1)>` on.
+            -- >= 2 DISTINCT seed DOMAINS attached to this row. `status='active'`
+            -- and DISTINCT are both load-bearing: without them two rows of one
+            -- inactive seed, or two seeds on one domain, promote a single-seller
+            -- row -- the same inflation this predicate exists to stop.
             OR (
               SELECT count(DISTINCT eps.domain)
               FROM external_product_seeds eps
@@ -1483,8 +1479,7 @@ CANONICAL_SCOPE_PREDICATE = """
                 AND eps.domain IS NOT NULL
             ) >= 2
 
-            -- RULE 2 via product groups: a peer at a genuinely DIFFERENT
-            -- merchant. Correct as written; kept.
+            -- A product-group peer at a genuinely DIFFERENT merchant.
             OR EXISTS (
               SELECT 1
               FROM product_group_members own
@@ -1495,35 +1490,79 @@ CANONICAL_SCOPE_PREDICATE = """
                 AND own.platform = cp.platform
                 AND own.platform_product_id = cp.source_product_id
             )
+
+            -- A product-group peer at a different SOURCE PRODUCT, for rows in
+            -- the `external_seed` bucket.
+            --
+            -- ⚠️ KEPT DELIBERATELY. A first version of this change deleted it as
+            -- "a proxy for different merchant", which it is in general. But for
+            -- `pg_ext_*` groups it is the ONLY VISIBLE FORM of a real
+            -- multi-retailer fact, and review measured the deletion
+            -- un-promoting that entire cohort (3 retailers on one ext: identity
+            -- -> promoted 3 before, 0 after). Three separate reasons the other
+            -- branches cannot see it:
+            --   * its seeds carry `attached_product_key LIKE 'ext:%'`, not this
+            --     row's `prod::...` key, so the seed-domain count matches ZERO;
+            --   * every `pg_ext_*` member is written with
+            --     merchant_id='external_seed', so the peer-merchant branch above
+            --     is unsatisfiable for it;
+            --   * the mirror lane never writes 'enrichment_agent_v1'.
+            -- And the cohort is multi-seller BY CONSTRUCTION: its cluster gate
+            -- is `HAVING COUNT(DISTINCT external_product_id) >= 2`.
+            --
+            -- Removing it is also a RATCHET, not just a miss: cross-merchant
+            -- seed attachment is itself gated on this label
+            -- (services/pdp_matcher/runner.py:61,80), so a row denied the label
+            -- can never acquire a second seller, and so can never qualify by any
+            -- other branch. Do not delete without first making the seed count
+            -- group-aware.
+            OR EXISTS (
+              SELECT 1
+              FROM product_group_members own
+              JOIN product_group_members peer
+                ON peer.product_group_id = own.product_group_id
+               AND peer.platform_product_id <> own.platform_product_id
+              WHERE cp.merchant_id = 'external_seed'
+                AND own.merchant_id = cp.merchant_id
+                AND own.platform = cp.platform
+                AND own.platform_product_id = cp.source_product_id
+            )
 """.format(label_source_enrichment=LABEL_SOURCE_ENRICHMENT)
 
 
 async def _promote_canonical_scopes(product_keys: Sequence[str]) -> int:
-    """Promote rows to `multi_merchant_canonical` — per the CLASSIFIER's rule.
+    """Promote rows to `multi_merchant_canonical`.
 
-    THIS IS THE SECOND IMPLEMENTATION of `services.pdp_scope_classifier.classify`.
-    They must agree; `tests/test_pdp_scope_promotion_agrees_with_classifier.py`
-    pins that they do, because they diverged badly and silently:
+    WHAT CHANGED AND WHY. The old predicate promoted on
+    `EXISTS (an active attached seed)` — ONE seed, which is not multi-merchant by
+    any reading, and not what `services/pdp_scope_classifier` says. That branch
+    is deleted. Everything else is kept.
 
-    The old predicate promoted on `EXISTS (an active attached seed)` — ONE seed,
-    which is not multi-merchant by any reading — and, for rows in the
-    `external_seed` bucket, on a peer with a different `platform_product_id`,
-    using "different product id" as a proxy for "different merchant".
+    The label is not cosmetic: `services/pivot_query_service.py` gives it a +200
+    search-rank bonus in THREE places (:1048, :1090, :1476), documented as
+    "large enough to dominate every other term" — above exact-SKU (120),
+    exact-title (100) and exact-brand (80). A row promoted on one seller
+    outranks genuine merchant listings on every matched query.
 
-    Both proxies existed to compensate for the bucket: collapsing many real
-    merchants into one `merchant_id` makes the CORRECT test
-    (`peer.merchant_id <> own.merchant_id`) structurally unsatisfiable, so
-    weaker stand-ins were substituted for the signal the bucket had erased.
+    THIS PREDICATE IS NOT EQUIVALENT TO `classify()`, and must not be described
+    as such. `classify` takes an abstract `seller_count`; this SQL works from the
+    signals actually available on a row — offers, attached seeds, product-group
+    peers — which do not reduce to that number. An earlier version of this
+    function claimed equivalence, and the test written to prove it had to
+    restate the SQL's own semantics as its oracle to make the claim come out
+    true. What is asserted instead, in
+    tests/test_pdp_scope_promotion_agrees_with_classifier.py, are the specific
+    properties that matter: named single-seller shapes must NOT promote, named
+    multi-seller shapes MUST, and the test drives THIS FUNCTION rather than a
+    lifted copy of its SQL.
 
-    Measured on prod 2026-08-03: 3,400 mirror-lane rows carried
-    `multi_merchant_canonical`; 0 qualified under rule 1 and only 107 under
-    rule 2. **3,293 were labelled canonical with exactly ONE seller.**
-
-    That is not cosmetic. `services/pivot_query_service.py:1048` grants the label
-    a +200 rank bonus documented as "large enough to dominate every other term"
-    — above exact-SKU (120), exact-title (100) and exact-brand (80). So 3,293
-    single-seller rows outranked genuine merchant listings on every matched
-    query. Path-C is unaffected: all 1,795 of its rows qualify under rule 1.
+    ⚠️ TWO CLAIMS AN EARLIER VERSION MADE THAT ARE FALSE — do not reinstate:
+      * that `peer.merchant_id <> own.merchant_id` is "structurally
+        unsatisfiable" for `external_seed` rows. It is unsatisfiable only when
+        EVERY group member is in the bucket; a group mixing a bucket member with
+        a real merchant satisfies it.
+      * that the bucket's `platform_product_id` branch is merely an unsound
+        proxy and can be dropped. See the comment on that branch.
     """
     keys = sorted({_clean(key) for key in product_keys if _clean(key)})
     if not keys:
