@@ -20,16 +20,18 @@ from sqlalchemy import Boolean, String, and_, column, func, not_, select, table
 from db.catalog import catalog_products
 from services.index_pipeline_state_service import QUALITY_SCORE_THRESHOLD
 from services.pdp_renderability import compile_pg, pdp_renderable_expression
+from services.identity_join_sql import identity_listing_lateral_sql
 from services.priced_offer_sql import priced_offer_exists_sql
-from services.source_quarantine import (
-    CATALOG_PRODUCT_DOMAIN_SQL,
-    MINTED_SEED_IDENTITY_LEG,
-    SEED_PICK_ORDER,
-)
+from services.source_quarantine import CATALOG_PRODUCT_DOMAIN_SQL
 
 logger = logging.getLogger(__name__)
 
 _SAMPLE_LIMIT = 5
+
+# The canonical row->listing join, from services/identity_join_sql. Bound here
+# because Python 3.11 f-string replacement fields cannot span lines, and both
+# statements below must interpolate the SAME fragment or they drift.
+IDENTITY_LISTING_LATERAL = identity_listing_lateral_sql("cp")
 
 
 # --- public_not_renderable, built from the shared renderability predicate ----
@@ -654,22 +656,7 @@ _CHECKS: List[Dict[str, Any]] = [
                 --     half of exactly the brand-plus-retailer pair this exists to find.
                 -- LATERAL + LIMIT 1 keeps it one listing per row, which also closes
                 -- the fan-out.
-                    LEFT JOIN LATERAL (
-                    SELECT pil.sellable_item_group_id
-                    FROM pdp_identity_listing pil
-                    WHERE pil.merchant_id = cp.merchant_id
-                      AND pil.product_id = CASE
-                            WHEN cp.source_system = 'catalog_enrichment_agent_v1'
-                              THEN (SELECT s.external_product_id
-                                      FROM external_product_seeds s
-                                     WHERE s.attached_product_key = cp.product_key
-                                     ORDER BY {MINTED_SEED_IDENTITY_LEG}, {SEED_PICK_ORDER}
-                                     LIMIT 1)
-                            ELSE cp.source_product_id
-                          END
-                    ORDER BY pil.source_listing_ref
-                    LIMIT 1
-            ) pil ON TRUE
+                    {IDENTITY_LISTING_LATERAL}
                     WHERE cp.suppressed_at IS NULL
                   -- suppression_reason WITHOUT suppressed_at is a real, populated
                   -- state (see canonical_sitemap_candidates.not_tombstoned). Migration
@@ -735,22 +722,7 @@ _CHECKS: List[Dict[str, Any]] = [
             -- LATERAL + LIMIT 1 keeps it one listing per row, which also closes
             -- the fan-out. The listing ORDER BY is determinism, not preference:
             -- a LIMIT without one is plan-dependent.
-            LEFT JOIN LATERAL (
-                SELECT pil.sellable_item_group_id
-                FROM pdp_identity_listing pil
-                WHERE pil.merchant_id = cp.merchant_id
-                  AND pil.product_id = CASE
-                        WHEN cp.source_system = 'catalog_enrichment_agent_v1'
-                          THEN (SELECT s.external_product_id
-                                  FROM external_product_seeds s
-                                 WHERE s.attached_product_key = cp.product_key
-                                 ORDER BY {MINTED_SEED_IDENTITY_LEG}, {SEED_PICK_ORDER}
-                                 LIMIT 1)
-                        ELSE cp.source_product_id
-                      END
-                ORDER BY pil.source_listing_ref
-                LIMIT 1
-            ) pil ON TRUE
+            {IDENTITY_LISTING_LATERAL}
             WHERE cp.suppressed_at IS NULL
               -- suppression_reason WITHOUT suppressed_at is a real, populated
               -- state (see canonical_sitemap_candidates.not_tombstoned). Migration
