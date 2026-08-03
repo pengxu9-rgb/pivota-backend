@@ -21,7 +21,11 @@ from db.catalog import catalog_products
 from services.index_pipeline_state_service import QUALITY_SCORE_THRESHOLD
 from services.pdp_renderability import compile_pg, pdp_renderable_expression
 from services.priced_offer_sql import priced_offer_exists_sql
-from services.source_quarantine import CATALOG_PRODUCT_DOMAIN_SQL
+from services.source_quarantine import (
+    CATALOG_PRODUCT_DOMAIN_SQL,
+    MINTED_SEED_IDENTITY_LEG,
+    SEED_PICK_ORDER,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -492,10 +496,11 @@ _CHECKS: List[Dict[str, Any]] = [
                               THEN (SELECT s.external_product_id
                                       FROM external_product_seeds s
                                      WHERE s.attached_product_key = cp.product_key
-                                     ORDER BY s.updated_at DESC NULLS LAST
+                                     ORDER BY {MINTED_SEED_IDENTITY_LEG}, {SEED_PICK_ORDER}
                                      LIMIT 1)
                             ELSE cp.source_product_id
                           END
+                    ORDER BY pil.source_listing_ref
                     LIMIT 1
             ) pil ON TRUE
                     WHERE cp.suppressed_at IS NULL
@@ -546,8 +551,23 @@ _CHECKS: List[Dict[str, Any]] = [
             --     skips NULLs, the whole Path-C minted lane would be invisible to
             --     this check — and that lane is the brand-D2C canonical mint, one
             --     half of exactly the brand-plus-retailer pair this exists to find.
+            -- The minted-lane seed pick uses the SHARED order constants
+            -- (MINTED_SEED_IDENTITY_LEG, SEED_PICK_ORDER), not a hand-rolled
+            -- `updated_at DESC`. Path-C attaches one seed PER OFFER to the same
+            -- product_key, so multi-seed is the designed norm there, and
+            -- minted_seed_one prefers a seed that CARRIES a listing precisely
+            -- because the winner's external_product_id IS the pil join key. A
+            -- bare updated_at pick diverges in BOTH directions: it can select an
+            -- identity-less sibling (group reads NULL, real fragmentation goes
+            -- uncounted) or a stale inactive seed (a clean key counts as
+            -- fragmented). It was also internally inconsistent — the
+            -- CATALOG_PRODUCT_DOMAIN_SQL in the HAVING below already resolves
+            -- the minted row's domain with these same constants, so the domain
+            -- leg and the identity leg could pick DIFFERENT seeds for one row.
+            --
             -- LATERAL + LIMIT 1 keeps it one listing per row, which also closes
-            -- the fan-out.
+            -- the fan-out. The listing ORDER BY is determinism, not preference:
+            -- a LIMIT without one is plan-dependent.
             LEFT JOIN LATERAL (
                 SELECT pil.sellable_item_group_id
                 FROM pdp_identity_listing pil
@@ -557,10 +577,11 @@ _CHECKS: List[Dict[str, Any]] = [
                           THEN (SELECT s.external_product_id
                                   FROM external_product_seeds s
                                  WHERE s.attached_product_key = cp.product_key
-                                 ORDER BY s.updated_at DESC NULLS LAST
+                                 ORDER BY {MINTED_SEED_IDENTITY_LEG}, {SEED_PICK_ORDER}
                                  LIMIT 1)
                         ELSE cp.source_product_id
                       END
+                ORDER BY pil.source_listing_ref
                 LIMIT 1
             ) pil ON TRUE
             WHERE cp.suppressed_at IS NULL

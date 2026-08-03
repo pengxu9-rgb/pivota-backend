@@ -785,6 +785,7 @@ def test_fragmented_identity_clean_when_both_domains_share_one_entity(pg_engine)
         _domain(conn, "pk_retailer", "ulta.com")
         _listing(conn, source_product_id="pk_brand", sig_group="grp_same")
         _listing(conn, source_product_id="pk_retailer", sig_group="grp_same")
+        _trust_public(conn, "pk_brand")  # satisfy the anchor, or this is vacuous
         assert _count_of(conn, "cross_domain_content_key_fragmented_identity") == 0
 
 
@@ -801,6 +802,7 @@ def test_fragmented_identity_ignores_single_domain_splits(pg_engine):
         _domain(conn, "pk_b", "brand.com")
         _listing(conn, source_product_id="pk_a", sig_group="grp_a")
         _listing(conn, source_product_id="pk_b", sig_group="grp_b")
+        _trust_public(conn, "pk_a")  # satisfy the anchor, or this is vacuous
         assert _count_of(conn, "cross_domain_content_key_fragmented_identity") == 0
 
 
@@ -829,6 +831,7 @@ def test_fragmented_identity_ignores_suppressed_siblings(pg_engine):
             _domain(conn, "pk_dead", "ulta.com")
             _listing(conn, source_product_id="pk_live", sig_group="grp_a")
             _listing(conn, source_product_id="pk_dead", sig_group="grp_b")
+            _trust_public(conn, "pk_live")  # satisfy the anchor, or this is vacuous
             conn.execute(text(f"UPDATE catalog_products SET {marker} "
                               "WHERE product_key = 'pk_dead'"))
             assert _count_of(conn, "cross_domain_content_key_fragmented_identity") == 0, marker
@@ -881,6 +884,7 @@ def test_fragmented_identity_does_not_guess_at_unknown_domains(pg_engine):
                           "WHERE product_key = 'pk_unknown'"))
         _listing(conn, source_product_id="pk_known", sig_group="grp_a")
         _listing(conn, source_product_id="pk_unknown", sig_group="grp_b")
+        _trust_public(conn, "pk_known")  # satisfy the anchor, or this is vacuous
         # One known domain + one unknown is NOT evidence of two retailers.
         assert _count_of(conn, "cross_domain_content_key_fragmented_identity") == 0
 
@@ -898,6 +902,7 @@ def test_fragmented_identity_skips_a_sibling_with_no_identity_listing(pg_engine)
         _domain(conn, "pk_listed", "brand.com")
         _domain(conn, "pk_unlisted", "ulta.com")
         _listing(conn, source_product_id="pk_listed", sig_group="grp_a")
+        _trust_public(conn, "pk_listed")  # satisfy the anchor, or this is vacuous
         # pk_unlisted deliberately has NO pdp_identity_listing row.
         assert _count_of(conn, "cross_domain_content_key_fragmented_identity") == 0
 
@@ -951,3 +956,116 @@ def test_fragmented_identity_requires_a_serving_row(pg_engine):
         # One public row is enough to make it a live defect.
         _trust_public(conn, "pk_retailer")
         assert _count_of(conn, "cross_domain_content_key_fragmented_identity") == 1
+
+
+def test_fragmented_identity_join_carries_the_merchant_conjunct(pg_engine):
+    """`source_listing_ref` is merchant_id:product_id (ADR-008), so product_id
+    ALONE is not unique. Without the merchant conjunct the LATERAL can pick a
+    FOREIGN merchant's listing for this row.
+
+    Every other test here uses merchant_id='external_seed' for both rows, so the
+    conjunct was untested — dropping it survived the whole suite.
+    """
+    from sqlalchemy import text
+
+    with pg_engine.begin() as conn:
+        _reset(conn)
+        _product(conn, pk="pk_ours", ck="ck_mconj", sig="sig_ours")
+        _product(conn, pk="pk_theirs", ck="ck_mconj", sig="sig_theirs",
+                 merchant_id="merch_other")
+        _domain(conn, "pk_ours", "brand.com")
+        _domain(conn, "pk_theirs", "ulta.com")
+        # SAME product_id under TWO merchants, pointing at DIFFERENT groups.
+        conn.execute(text("UPDATE catalog_products SET source_product_id = 'shared_pid' "
+                          "WHERE product_key IN ('pk_ours','pk_theirs')"))
+        _listing(conn, source_product_id="shared_pid", sig_group="grp_ours",
+                 merchant_id="external_seed")
+        _listing(conn, source_product_id="shared_pid", sig_group="grp_theirs",
+                 merchant_id="merch_other")
+        _trust_public(conn, "pk_ours")
+        # Each row must read ITS OWN merchant's listing -> two groups -> counted.
+        assert _count_of(conn, "cross_domain_content_key_fragmented_identity") == 1
+
+
+def test_fragmented_identity_serving_anchor_is_correlated(pg_engine):
+    """The anchor must correlate to THIS content_key. Mutating
+    `cp2.content_key = cp.content_key` to `cp2.content_key = cp2.content_key`
+    survived every test, because none had two content_keys — a public row on an
+    UNRELATED key would then satisfy the anchor for a dark one."""
+    with pg_engine.begin() as conn:
+        _reset(conn)
+        # Fragmented but entirely dark.
+        _product(conn, pk="pk_dark_a", ck="ck_dark", sig="sig_da")
+        _product(conn, pk="pk_dark_b", ck="ck_dark", sig="sig_db")
+        _domain(conn, "pk_dark_a", "brand.com")
+        _domain(conn, "pk_dark_b", "ulta.com")
+        _listing(conn, source_product_id="pk_dark_a", sig_group="grp_a")
+        _listing(conn, source_product_id="pk_dark_b", sig_group="grp_b")
+        # A DIFFERENT content_key that IS public.
+        _product(conn, pk="pk_other", ck="ck_other", sig="sig_other")
+        _domain(conn, "pk_other", "elsewhere.com")
+        _trust_public(conn, "pk_other")
+        # The public row belongs to ck_other, so ck_dark must NOT be counted.
+        assert _count_of(conn, "cross_domain_content_key_fragmented_identity") == 0
+
+
+def test_fragmented_identity_minted_pick_prefers_a_seed_carrying_a_listing(pg_engine):
+    """Path-C attaches one seed PER OFFER to a product_key, and
+    catalog_row_trust_upserter.minted_seed_one prefers the seed that CARRIES a
+    listing (MINTED_SEED_IDENTITY_LEG) because the winner's external_product_id
+    IS the pil join key. A bare `updated_at DESC` pick selects the identity-less
+    sibling, the group reads NULL, and real fragmentation goes UNCOUNTED.
+    """
+    from sqlalchemy import text
+
+    with pg_engine.begin() as conn:
+        _reset(conn)
+        _product(conn, pk="pk_minted", ck="ck_pick", sig="sig_minted")
+        _product(conn, pk="pk_retailer", ck="ck_pick", sig="sig_retailer")
+        _domain(conn, "pk_minted", "brand.com")
+        _domain(conn, "pk_retailer", "ulta.com")
+        conn.execute(text("UPDATE catalog_products "
+                          "SET source_system = 'catalog_enrichment_agent_v1', "
+                          "    source_product_id = 'slug-not-a-seed-id' "
+                          "WHERE product_key = 'pk_minted'"))
+        # NEWER seed with NO listing, OLDER seed WITH one. updated_at alone picks
+        # the newer (wrong); the identity leg picks the older (right).
+        conn.execute(text(
+            "INSERT INTO external_product_seeds "
+            "(external_product_id, attached_product_key, status, updated_at) VALUES "
+            "('ext_no_listing', 'pk_minted', 'active', NOW()), "
+            "('ext_has_listing', 'pk_minted', 'active', NOW() - INTERVAL '10 days')"))
+        _listing(conn, source_product_id="ext_has_listing", sig_group="grp_minted")
+        _listing(conn, source_product_id="pk_retailer", sig_group="grp_retailer")
+        _trust_public(conn, "pk_minted")
+        assert _count_of(conn, "cross_domain_content_key_fragmented_identity") == 1
+
+
+def test_fragmented_identity_minted_pick_skips_an_inactive_seed(pg_engine):
+    """The other direction of the same divergence: a NEWER but INACTIVE seed
+    pointing at a stale group. SEED_PICK_ORDER puts `status='active'` first, so
+    the active seed wins and the key reads CLEAN. A bare updated_at pick would
+    take the inactive one and count a false positive."""
+    from sqlalchemy import text
+
+    with pg_engine.begin() as conn:
+        _reset(conn)
+        _product(conn, pk="pk_minted", ck="ck_stale", sig="sig_minted")
+        _product(conn, pk="pk_retailer", ck="ck_stale", sig="sig_retailer")
+        _domain(conn, "pk_minted", "brand.com")
+        _domain(conn, "pk_retailer", "ulta.com")
+        conn.execute(text("UPDATE catalog_products "
+                          "SET source_system = 'catalog_enrichment_agent_v1', "
+                          "    source_product_id = 'slug-2' "
+                          "WHERE product_key = 'pk_minted'"))
+        conn.execute(text(
+            "INSERT INTO external_product_seeds "
+            "(external_product_id, attached_product_key, status, updated_at) VALUES "
+            "('ext_stale', 'pk_minted', 'inactive', NOW()), "
+            "('ext_active', 'pk_minted', 'active', NOW() - INTERVAL '10 days')"))
+        _listing(conn, source_product_id="ext_stale", sig_group="grp_stale")
+        _listing(conn, source_product_id="ext_active", sig_group="grp_shared")
+        _listing(conn, source_product_id="pk_retailer", sig_group="grp_shared")
+        _trust_public(conn, "pk_minted")
+        # Active seed agrees with the retailer -> clean.
+        assert _count_of(conn, "cross_domain_content_key_fragmented_identity") == 0
