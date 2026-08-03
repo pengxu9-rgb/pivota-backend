@@ -23,7 +23,7 @@ Four phases (increasing risk), each independently reportable:
      guessed (founder no-fallback directive). This is the kill-path input for
      A9-3's `metadata.seller_ref_missing` metric.
 
-  2. BARE-format attached_product_key repair (the ~720 rows). Re-derive the
+  2. BARE-format attached_product_key repair. Re-derive the
      STORAGE-format `prod::` key from the seed's own fields the way the mirror
      legitimately produces it (`scripts.mirror_external_seeds_to_catalog_products`
      -> `services.external_seed_servability.backlink_seed_to_product`):
@@ -31,6 +31,11 @@ Four phases (increasing risk), each independently reportable:
      — and ONLY when that key resolves to a real `catalog_products` row. Anything
      undecodable goes to the review queue; NEVER a widened matcher, NEVER a
      partial/third-format key (ADR-009 ratified decision 3; IDENTITY_REFERENCE T1).
+     AND NEVER a key that already resolves — see run_barekey. The "~720 rows"
+     this once claimed as its cohort were `ext:` keys that resolve perfectly
+     well; rewriting them took 364 elected PDPs to HTTP 500 on 2026-08-01. They
+     are now SKIPPED to review, so this phase repairs only genuinely dangling
+     links, which is a much smaller set than the scan count suggests.
 
   3. CATALOG re-key (the risky phase). Rows in `catalog_products` with
      `merchant_id='external_seed'` are RE-SUBJECTED to their observed per-brand
@@ -510,11 +515,62 @@ class SellerBackfill:
             "WHERE attached_product_key IS NOT NULL AND btrim(attached_product_key) <> '' "
             "AND attached_product_key NOT LIKE 'prod::%'"
         )
-        stats = {"scanned": 0, "repaired": 0, "undecodable": 0}
+        stats = {"scanned": 0, "repaired": 0, "undecodable": 0,
+                 "already_resolving": 0}
         undecodable: List[Dict[str, Any]] = []
+        already_resolving: List[Dict[str, Any]] = []
         for row in rows or []:
             d = dict(row)
             stats["scanned"] += 1
+
+            # 🚨 NEVER DETACH A KEY THAT ALREADY RESOLVES. This phase validates
+            # that the key it is about to WRITE points at a real row; until
+            # 2026-08-01 nothing validated the key it was about to OVERWRITE.
+            #
+            # `ext:<slug>::<hash>` is not a bare/malformed key — it is a LIVE
+            # product_key format on ~1,795 unsuppressed catalog_products rows,
+            # every one Path-C (`catalog_enrichment_agent_v1`). The gateway
+            # routes a minted PDP by matching
+            # `external_product_seeds.attached_product_key = cp.product_key`
+            # (services/pdp_renderability seed_route_resolves_sql, minted arm),
+            # so a seed pointing at an `ext:` row is CORRECT RELATIVE TO THAT ROW.
+            #
+            # Conforming the seed to `prod::` while the row keeps its `ext:` key
+            # breaks the join. Measured when it happened: 720 seeds moved, 364
+            # ELECTED, trust-public PDPs went to HTTP 500 — confirmed live, not
+            # inferred from an invariant. Restored from a reconstructed
+            # content_key mapping (587 exact; 133 needed hand inspection).
+            #
+            # A rewrite here has TWO ends. Validating only the destination is how
+            # a "repair" silently detaches a working link.
+            #
+            # DELIBERATELY BROADER than the minted arm: no source_system and no
+            # seed-status filter. Broader means more SKIPS, which is the safe
+            # direction (a skip is reviewable in the report; a detach is a 500),
+            # so do not "tighten" this to match the predicate — that converts
+            # review items back into outages.
+            # RAW, NOT btrim'd — the join this guard protects does not trim
+            # either side (services/pdp_renderability seed_route_resolves_sql:
+            # `_seed_route_minted.attached_product_key = cp.product_key`), and
+            # product_key is varchar, so trailing space is significant. Comparing
+            # a stripped value would declare a PADDED key "already resolving",
+            # skip the very row this phase exists to repair, and report it under
+            # a value the column does not contain — hiding it from the human who
+            # would otherwise catch it. The SELECT above already guarantees this
+            # is non-null and not blank.
+            current_apk = d.get("attached_product_key")
+            live = await self.db.fetch_one(
+                "SELECT product_key FROM catalog_products WHERE product_key = :pk",
+                {"pk": current_apk},
+            )
+            if live:
+                stats["already_resolving"] += 1
+                already_resolving.append({
+                    "seed_id": str(d.get("id")),
+                    "attached_product_key": current_apk,
+                })
+                continue
+
             candidate = candidate_storage_key_from_seed(d)
             resolved: Optional[str] = None
             if candidate:
@@ -546,15 +602,32 @@ class SellerBackfill:
                                     "external_product_id": d.get("external_product_id")})
                 continue
             if self.execute:
+                # Snapshot the PREVIOUS value before overwriting it. Recovery
+                # from the 2026-08-01 incident needed archaeology precisely
+                # because the checkpoint stored only the NEW key; an UPDATE that
+                # cannot be undone from its own audit trail is not resumable, it
+                # is just fast.
+                await self._checkpoint(
+                    "barekey", str(d.get("id")), resolved, "pending",
+                    previous_value=current_apk,
+                )
+                # COMPARE-AND-SWAP on the pre-image. The guard above is a
+                # READ; without this the WHERE never mentions the column, so any
+                # writer between the unbatched fetch_all and this UPDATE is
+                # clobbered with no re-check — a silent detach, which is exactly
+                # the failure mode this PR exists to close. Phase 1 carries the
+                # same discipline (`AND seller_ref IS NULL`). A concurrent write
+                # now makes this a no-op instead.
                 await self.db.execute(
                     "UPDATE external_product_seeds SET attached_product_key = :pk, "
-                    "updated_at = NOW() WHERE id = :id",
-                    {"pk": resolved, "id": d.get("id")},
+                    "updated_at = NOW() WHERE id = :id AND attached_product_key = :old",
+                    {"pk": resolved, "id": d.get("id"), "old": current_apk},
                 )
                 await self._checkpoint("barekey", str(d.get("id")), resolved, "done")
             stats["repaired"] += 1
         report.barekey = stats
         report.review_queue["barekey_undecodable"] = undecodable
+        report.review_queue["barekey_already_resolving"] = already_resolving
 
     # -- phase 3: catalog re-key --------------------------------------------
 
@@ -694,8 +767,14 @@ class SellerBackfill:
                     f"A9-4 batch parity FAILED (loud abort, no silent absorb): {parity}"
                 )
             for b in batch:
+                # The overwritten value is the constant this phase selects on
+                # (merchant_id = BANNED_BUCKET_MERCHANT_ID, pinned by the
+                # UPDATE's own WHERE), so it is reconstructible — but the rule
+                # in _checkpoint says any phase that OVERWRITES passes it, and a
+                # rule the same file violates is not a rule.
                 await self._checkpoint("catalog", str(b["product_key"]),
-                                       str(b["observed_id"]), "done")
+                                       str(b["observed_id"]), "done",
+                                       previous_value=BANNED_BUCKET_MERCHANT_ID)
         return parity
 
     async def _sku_keys_for_product(self, product_key: str) -> List[str]:
@@ -842,26 +921,44 @@ class SellerBackfill:
                 phase      TEXT NOT NULL,
                 ref_id     TEXT NOT NULL,
                 observed_id TEXT,
+                previous_value TEXT,
                 status     TEXT NOT NULL DEFAULT 'done',
                 updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
                 PRIMARY KEY (phase, ref_id)
             )
             """
         )
+        # Additive for tables created before the column existed.
+        await self.db.execute(
+            "ALTER TABLE a9_4_backfill_checkpoint "
+            "ADD COLUMN IF NOT EXISTS previous_value TEXT"
+        )
 
     async def _checkpoint(self, phase: str, ref_id: str, observed_id: Optional[str],
-                          status: str) -> None:
+                          status: str, previous_value: Optional[str] = None) -> None:
+        """Record what this run did to `ref_id`.
+
+        `previous_value` is what makes the run UNDOABLE. It is optional only so
+        phases that overwrite nothing (seeds fills a NULL) can omit it; any phase
+        that OVERWRITES an existing value must pass it, or recovery means
+        reconstructing the old state from whatever joins happen to survive.
+        """
         if not self.execute:
             return
         await self.db.execute(
             """
-            INSERT INTO a9_4_backfill_checkpoint (phase, ref_id, observed_id, status, updated_at)
-            VALUES (:phase, :ref_id, :obs, :status, NOW())
+            INSERT INTO a9_4_backfill_checkpoint
+                (phase, ref_id, observed_id, previous_value, status, updated_at)
+            VALUES (:phase, :ref_id, :obs, :prev, :status, NOW())
             ON CONFLICT (phase, ref_id)
-            DO UPDATE SET observed_id = EXCLUDED.observed_id, status = EXCLUDED.status,
+            DO UPDATE SET observed_id = EXCLUDED.observed_id,
+                          previous_value = COALESCE(a9_4_backfill_checkpoint.previous_value,
+                                                    EXCLUDED.previous_value),
+                          status = EXCLUDED.status,
                           updated_at = NOW()
             """,
-            {"phase": phase, "ref_id": ref_id, "obs": observed_id, "status": status},
+            {"phase": phase, "ref_id": ref_id, "obs": observed_id,
+             "prev": previous_value, "status": status},
         )
 
 
