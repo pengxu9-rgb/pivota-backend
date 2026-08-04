@@ -268,6 +268,74 @@ def test_the_full_cycle_demote_tick_noops_gain_seller_tick_promotes(engine, monk
         "the tick promoted a SUPPRESSED row")
 
 
+def test_a_row_suppressed_mid_tick_is_skipped_not_promoted(engine):
+    """PR #1680 round-11 finding, driven with REAL concurrency: a second
+    connection suppresses a qualified row while holding the row lock in an
+    open transaction; the promotion UPDATE blocks on that lock; the suppressor
+    commits. Under READ COMMITTED Postgres then re-evaluates only the OUTER
+    quals (EvalPlanQual) — with only the pdp_scope re-check there, the
+    suppressed row WAS promoted, and a suppressed-canonical row escapes the P4
+    demotion selection (`suppressed_at IS NULL`) forever. The outer WHERE must
+    therefore repeat the suppressed_at gate. This is not a simulation: the
+    lock wait is observed via pg_stat_activity before the suppressor commits,
+    so the write-time re-check — not the subselect — is what the assertion
+    exercises."""
+    import jobs.pdp_scope_backfill_cron as cron
+    from sqlalchemy import text
+
+    with engine.begin() as c:
+        _seed_rows(c)
+        # pk_qualified already has two active seed domains; start it inside
+        # the promotion gate.
+        c.execute(text(
+            "UPDATE catalog_products SET pdp_scope = 'unverified'"
+            " WHERE product_key = 'pk_qualified'"))
+
+    async def race():
+        suppressor = _db()
+        await suppressor.connect()
+        try:
+            tx = suppressor.transaction()
+            await tx.start()
+            await suppressor.execute(
+                "UPDATE catalog_products SET suppressed_at = now()"
+                " WHERE product_key = 'pk_qualified'")
+            promotion = asyncio.create_task(cron.run_promotion_pass(limit=100))
+            # The race is real only if the promotion reaches the row lock
+            # BEFORE the suppressor commits — otherwise its subselect never
+            # saw the row and the outer re-check goes unexercised.
+            blocked = False
+            for _ in range(200):
+                await asyncio.sleep(0.05)
+                if promotion.done():
+                    break
+                blocked = bool(await suppressor.fetch_val(
+                    "SELECT count(*) FROM pg_stat_activity"
+                    " WHERE wait_event_type = 'Lock'"))
+                if blocked:
+                    break
+            assert blocked and not promotion.done(), (
+                "the promotion pass never blocked on the suppressor's row "
+                "lock — the race did not happen, the test proves nothing")
+            await tx.commit()
+            return await promotion
+        finally:
+            await suppressor.disconnect()
+
+    result = _drive([cron], race)
+    assert result == {"promoted": 0}, (
+        "a row suppressed between subselect and write was promoted — the "
+        "outer write-time re-check is missing the suppressed_at gate")
+    with engine.begin() as c:
+        row = c.execute(text(
+            "SELECT pdp_scope, suppressed_at FROM catalog_products"
+            " WHERE product_key = 'pk_qualified'")).one()
+    assert row.pdp_scope == "unverified", (
+        "the suppressed row must stay 'unverified' (re-checkable), "
+        f"got {row.pdp_scope!r}")
+    assert row.suppressed_at is not None, "the concurrent suppression was lost"
+
+
 def test_the_cron_tick_is_disabled_by_default_and_promote_only(monkeypatch):
     """The tick is glue: env gate + connect + ONE promote-only pass. Two
     load-bearing properties (both from PR #1680 review):
@@ -326,7 +394,11 @@ def test_the_cron_rule_is_the_predicate_not_a_copy_or_a_loop():
     from services.pdp_identity_recovery import CANONICAL_SCOPE_PREDICATE
 
     assert CANONICAL_SCOPE_PREDICATE in cron._PROMOTE_SQL
-    assert "suppressed_at IS NULL" in cron._PROMOTE_SQL
+    assert cron._PROMOTE_SQL.count("suppressed_at IS NULL") == 2, (
+        "the suppressed_at gate must appear in BOTH the subselect and the "
+        "outer write-time re-check — EvalPlanQual re-evaluates only the outer "
+        "quals, so a subselect-only gate does not survive a concurrent "
+        "suppression (PR #1680 round-11 finding)")
     src = inspect.getsource(cron)
     assert "from scripts.backfill_pdp_scope import" not in src, (
         "the cron must not import the one-shot classify() loop (F1)")

@@ -52,11 +52,17 @@ _ENV_LIMIT = "PDP_SCOPE_BACKFILL_LIMIT"
 # pdp_scope_source marker (varchar(32)) — greppable back to this cron.
 PROMOTION_SOURCE = "d3_promotion_cron"
 
-# Postgres UPDATE takes no LIMIT, so the cap lives in a subselect; the outer
-# `AND pdp_scope = 'unverified'` re-checks the gate at write time (CAS — a row
-# promoted or suppressed between subselect and write is skipped, not
-# clobbered). RETURNING because databases.execute() returns None on this
-# stack (driven on 0.7.0 and 0.9.0) — rowcounts must come from RETURNING.
+# Postgres UPDATE takes no LIMIT, so the cap lives in a subselect. The outer
+# WHERE repeats BOTH gates — `pdp_scope = 'unverified'` AND
+# `suppressed_at IS NULL` — because under READ COMMITTED a row locked
+# mid-write is re-evaluated against the OUTER quals only (EvalPlanQual); the
+# subselect's copies protect nothing at write time. Round-11 review of PR
+# #1680 drove the miss: with only the pdp_scope re-check, a row suppressed
+# between subselect and write WAS promoted — and a suppressed-canonical row
+# then escapes the P4 demotion path forever (its selection requires
+# `suppressed_at IS NULL`). RETURNING because databases.execute() returns
+# None on this stack (driven on 0.7.0 and 0.9.0) — rowcounts must come from
+# RETURNING.
 _PROMOTE_SQL = """
     UPDATE catalog_products
     SET pdp_scope = :scope,
@@ -73,6 +79,7 @@ _PROMOTE_SQL = """
         LIMIT :limit
     )
       AND pdp_scope = 'unverified'
+      AND suppressed_at IS NULL
     RETURNING product_key
 """.format(predicate=CANONICAL_SCOPE_PREDICATE)
 
