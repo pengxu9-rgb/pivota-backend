@@ -50,8 +50,9 @@ SUBMIT_PAYMENT_MERCHANTS=<UCP_MERCHANT_ID>
 AGENT_ACP_TEST_CAPTURE=true
 AGENT_ACP_TEST_MAX_CENTS=2000
 ```
-(`FEATURE_PLATFORM_ORDERS_ACP` is **not** needed — that gates the ACP router; UCP
-doesn't use it.) Leave all live flags OFF.
+(`FEATURE_PLATFORM_ORDERS_ACP` no longer exists — it gated the retired external
+pivota-acp integration and was removed with it, ADR-021. Nothing to set here for
+either lane.) Leave all live flags OFF.
 
 ## 2. Arm the UCP WEB service (Railway env)
 

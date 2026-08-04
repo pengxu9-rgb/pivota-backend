@@ -85,18 +85,17 @@ SUBMIT_PAYMENT=true
 SUBMIT_PAYMENT_MERCHANTS=<ADYEN_MERCHANT_ID>
 AGENT_ACP_TEST_CAPTURE=true
 AGENT_ACP_TEST_MAX_CENTS=2000
-FEATURE_PLATFORM_ORDERS_ACP=true
 ```
 Leave all live flags OFF (`AGENT_ACP_ALLOW_LIVE_CAPTURE` unset/false).
 
-## 2. Arm the pivota-acp SERVICE (Railway env)
+`FEATURE_PLATFORM_ORDERS_ACP` is gone (ADR-021): it gated the retired external
+pivota-acp integration, and setting it now does nothing. The ACP lane is gated by
+the lane decision + kill-switch chain — the `SUBMIT_PAYMENT*` flags above.
 
-```
-ACP_ENABLE_REAL_CAPTURE=true
-PIVOTA_MERCHANT_ID=<ADYEN_MERCHANT_ID>
-PIVOTA_BACKEND_BASE_URL=https://api.pivota.cc
-PIVOTA_AGENT_API_KEY=<working ak_ agent key>
-```
+## 2. ~~Arm the pivota-acp SERVICE~~ — NO LONGER APPLICABLE (ADR-021)
+
+The external pivota-acp service is retired; both calls in step 3 now hit the
+backend. There is nothing to arm here — skip to step 3.
 
 ## 3. Run the chain
 
@@ -115,14 +114,15 @@ recheck Step 1 + that the merchant resolves to a supported platform.)
 **3(b) — complete → MIT capture on Adyen test** (⚠️ **the payment token MUST be the
 `storedPaymentMethodId` from Step 0** — omitting it fails with `adyen_pm_required`):
 ```bash
-curl -sS -X POST "https://pivota-acp-production.up.railway.app/checkout_sessions/<csn_...>/complete" \
-  -H "Authorization: Bearer <ACP_SERVICE_TOKEN>" -H "API-Version: 2025-09-29" \
-  -H "X-Merchant-Id: <ADYEN_MERCHANT_ID>" -H "X-Platform: <platform>" \
+curl -sS -X POST "https://api.pivota.cc/agent/v1/checkout/acp/<csn_...>/complete" \
+  -H "X-API-Key: <ak_ key>" \
   -H "Content-Type: application/json" \
   -d '{"payment_data":{"provider":"adyen","token":"<STORED_PAYMENT_METHOD_ID>"}}'
 ```
+Merchant and platform come from the session created in 3(a) — no `X-Merchant-Id` /
+`X-Platform` headers, and the agent key must be authorized for that merchant.
 
-This drives `create_order` → `real_capture_via_backend` → backend
+Completion is in-process since PR #1669 (ADR-021): the session goes
 `quote → order(acp) → payments`; `capture_offsession` resolves the merchant's Adyen
 PSP → `_AdyenCaptureAdapter` → `POST https://checkout-test.adyen.com/v71/payments`
 (MIT: `shopperInteraction: ContAuth`, `recurringProcessingModel: CardOnFile`,
@@ -147,7 +147,6 @@ PSP → `_AdyenCaptureAdapter` → `POST https://checkout-test.adyen.com/v71/pay
 ## 5. Disarm (immediately after)
 
 Backend: `AGENT_ACP_TEST_CAPTURE=false`, `SUBMIT_PAYMENT=false`.
-pivota-acp: `ACP_ENABLE_REAL_CAPTURE=false`.
 Re-probe 3(a) → expect `redirect_floor`.
 
 ## 6. Promote Adyen to LIVE (later)

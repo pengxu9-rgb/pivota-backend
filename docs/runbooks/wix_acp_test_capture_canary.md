@@ -65,24 +65,18 @@ SUBMIT_PAYMENT=true
 SUBMIT_PAYMENT_MERCHANTS=<WIX_MERCHANT_ID>
 AGENT_ACP_TEST_CAPTURE=true
 AGENT_ACP_TEST_MAX_CENTS=2000          # bump if real Wix shipping pushes over the cap
-FEATURE_PLATFORM_ORDERS_ACP=true
 ```
 
 Leave all **live**-capture flags OFF: `AGENT_ACP_ALLOW_LIVE_CAPTURE` unset/false.
 
-## 2. Arm the pivota-acp SERVICE (Railway env)
+`FEATURE_PLATFORM_ORDERS_ACP` is gone (ADR-021): it gated the retired external
+pivota-acp integration, and setting it now does nothing. The ACP lane is gated by
+the lane decision + kill-switch chain — the `SUBMIT_PAYMENT*` flags above.
 
-```
-ACP_ENABLE_REAL_CAPTURE=true
-PIVOTA_MERCHANT_ID=<WIX_MERCHANT_ID>   # GOTCHA: the connector charges THIS merchant, not the session's
-PIVOTA_BACKEND_BASE_URL=https://api.pivota.cc
-PIVOTA_AGENT_API_KEY=<working ak_live_ agent key>   # must authenticate backend /quotes,/orders,/payments
-```
+## 2. ~~Arm the pivota-acp SERVICE~~ — NO LONGER APPLICABLE (ADR-021)
 
-Confirm the ACP app (`src.main:app`, serves `/checkout_sessions`) is the deployed
-image at `pivota-acp-production.up.railway.app` — a direct probe to
-`POST /checkout_sessions` should 201 with a `csn_...` id. (If it 404s, the service
-reverted to the UCP image; see the P-T2.3.4 notes on forcing `railway.json`.)
+The external pivota-acp service is retired; both calls in step 3 now hit the
+backend. There is nothing to arm here — skip to step 3.
 
 ## 3. Run the two-call chain
 
@@ -110,28 +104,29 @@ true`. If `lane` is `redirect_floor`, the canary gate isn't armed — recheck st
 (`SUBMIT_PAYMENT_MERCHANTS` must contain `<WIX_MERCHANT_ID>`) and that the override
 matched a Wix store (`store_selector.matched`).
 
-**3(b) — complete on pivota-acp → triggers the backend off-session capture:**
+**3(b) — complete on the backend → triggers the off-session capture:**
 
 ```bash
 curl -sS -X POST \
-  'https://pivota-acp-production.up.railway.app/checkout_sessions/<csn_...>/complete' \
-  -H 'Authorization: Bearer <PLATFORM_ORDERS_ACP_TOKEN>' \
-  -H 'API-Version: 2025-09-29' \
-  -H 'X-Merchant-Id: <WIX_MERCHANT_ID>' \
-  -H 'X-Platform: wix' \
+  'https://api.pivota.cc/agent/v1/checkout/acp/<csn_...>/complete' \
+  -H "X-API-Key: <working ak_live_ agent key>" \
   -H 'Content-Type: application/json' \
   -d '{"payment_data": {"provider": "stripe"}}'
 ```
 
-- Only `payment_data.provider` is required. **Omit** `payment_data.token` for the
-  test canary — with no token the connector lets the backend fall back to its test
-  PM (`pm_card_visa`). (A `tok_test` string would break the paired test-lane guard;
-  token-forwarding is for the live lane only.)
-- `X-Platform: wix` forces the `WixConnector` at `/complete`.
+- **Omit** `payment_data.token` for the test canary — with no token the capture
+  path falls back to its test PM (`pm_card_visa`,
+  `services/acp_offsession_capture.DEFAULT_TEST_PAYMENT_METHOD`). (A `tok_test`
+  string would break the paired test-lane guard; token-forwarding is for the live
+  lane only.)
+- Merchant and platform come from the session created in 3(a) — no `X-Merchant-Id`
+  / `X-Platform` headers, and the agent key must be authorized for that merchant.
 
-This drives `WixConnector.create_order` → `real_capture_via_backend` →
-backend `quote → order(protocol=acp) → payments` off-session capture on the
-merchant's **test** Stripe key.
+Completion is in-process since PR #1669 (ADR-021): the session goes
+`quote → order(protocol=acp) → payments` off-session capture on the merchant's
+**test** Stripe key. It is fail-closed — a dark kill-switch or an over-cap charge
+is a 403 and a capture failure is a 502 with a named code; there is no
+simulated-capture fallback.
 
 ## 4. Verify
 
@@ -151,7 +146,6 @@ merchant's **test** Stripe key.
 ## 5. Disarm (immediately after)
 
 Backend: `AGENT_ACP_TEST_CAPTURE=false`, `SUBMIT_PAYMENT=false`.
-pivota-acp: `ACP_ENABLE_REAL_CAPTURE=false`.
 Re-probe 3(a) → expect `lane=redirect_floor` (dark again).
 
 ## 6. Promote Wix to production — checklist
