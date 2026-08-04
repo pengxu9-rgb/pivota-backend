@@ -1173,6 +1173,25 @@ def _capture_failure_is_definitive(outcome: Any) -> bool:
     return code in _PRE_DISPATCH_ERROR_CODES or code in _DEFINITIVE_DECLINE_ERROR_CODES
 
 
+def _capture_release_is_safe(outcome: Any, *, resumed: bool) -> bool:
+    """Whether a failed capture may RELEASE the claim (letting the next attempt
+    mint a NEW PSP key) — the B1 doctrine applied to the classification sets.
+
+    A DEFINITIVE DECLINE is the PSP's own answer for this key: authoritative,
+    nothing in flight, safe to release on any claim (this is what lets a buyer
+    retry with a different card). A PRE-DISPATCH failure never reached the PSP,
+    so it proves only that THIS attempt sent nothing — on a RESUMED claim the
+    dispatch it is resuming may still have landed, and releasing would re-key a
+    possibly-live charge. Fresh claims have no prior dispatch, so both sets are
+    safe there."""
+    if not _capture_failure_is_definitive(outcome):
+        return False
+    if not resumed:
+        return True
+    code = str(getattr(outcome, "error_code", "") or "").strip().lower()
+    return code in _DEFINITIVE_DECLINE_ERROR_CODES
+
+
 async def _revert_claim_to_ready(session_id: str) -> None:
     """Release the completion claim. Callable ONLY when no charge can be in
     flight (see the classification above): the next claim increments the attempt
@@ -1864,19 +1883,23 @@ async def complete_session(
         ) from capture_exc
 
     if not outcome.success:
-        if _capture_failure_is_definitive(outcome):
-            # The PSP refused (or nothing was ever dispatched): no charge is in
-            # flight, so release the claim. The next attempt mints the NEXT
-            # attempt key, which is what lets the buyer retry with another card
-            # instead of replaying a decline the PSP has already cached.
+        if _capture_release_is_safe(outcome, resumed=resumed):
+            # Safe to release: either the PSP itself refused THIS key (its answer
+            # is authoritative, nothing is in flight), or this is a fresh claim
+            # whose request never reached the PSP. The next attempt mints the
+            # NEXT attempt key, which is what lets the buyer retry with another
+            # card instead of replaying a decline the PSP has already cached.
             await _revert_claim_to_ready(sid)
             raise AcpCheckoutSessionError(
                 f"capture_failed:{outcome.error_code or 'unknown'}: {str(outcome.error or '')[:200]}",
                 code="acp_capture_failed",
                 status_code=502,
             )
-        # Not provably a refusal (SCA/requires_action, unresolved provider
-        # error, HTTP/transport failure): treat as possibly-charged.
+        # Not safe to release — either not provably a refusal (SCA/
+        # requires_action, unresolved provider error, HTTP/transport failure),
+        # or a RESUMED claim whose attempt never reached the PSP and therefore
+        # learned nothing about the dispatch that came before it. Both are
+        # treated as possibly-charged.
         logger.error(
             "[AcpCheckoutSession] capture failed AMBIGUOUSLY session=%s order=%s "
             "psp_key=%s status=%s code=%s — claim held for replay",

@@ -2524,3 +2524,111 @@ async def test_resume_without_a_bound_token_forwards_no_token(fake_quote, monkey
     assert seen == [None]
     stored = await reg.get_allowance(foreign["token_id"])
     assert stored["used"] is False
+
+
+async def test_resumed_claim_is_held_on_a_pre_dispatch_capture_failure(
+    fake_quote, monkeypatch
+):
+    # Review: the definitive-revert branch released a RESUMED claim even for
+    # PRE-DISPATCH codes (no_merchant_psp, live_pm_required, live_key_refused…).
+    # Those never reached the PSP, so they prove nothing about the dispatch being
+    # resumed — releasing re-keys to :a2 and can charge a second time on top of
+    # an attempt that may have landed. A resumed claim must HOLD for them.
+    _arm_capture_lane(monkeypatch)
+    calls = _mock_order_layer(monkeypatch)
+    created = await _create()
+    keys: list = []
+    _spy_capture(
+        monkeypatch, keys,
+        outcomes=[_failed_outcome("stripe_error"), _failed_outcome("no_merchant_psp")],
+    )
+
+    with pytest.raises(svc.AcpCheckoutSessionError) as first:
+        await svc.complete_session(
+            session_id=created.session_id, agent_context=_Ctx(), payment_token="pm_card_visa",
+        )
+    assert first.value.code == "acp_capture_pending_retry"  # ambiguous → held
+
+    await database.execute(
+        acp_checkout_sessions.update()
+        .where(acp_checkout_sessions.c.id == created.session_id)
+        .values(updated_at=datetime.now(timezone.utc) - timedelta(seconds=120))
+    )
+    with pytest.raises(svc.AcpCheckoutSessionError) as second:
+        await svc.complete_session(
+            session_id=created.session_id, agent_context=_Ctx(), payment_token="pm_card_visa",
+        )
+    # Pre-dispatch failure on a RESUME: held, not released, and reported as
+    # retryable rather than as a settled refusal.
+    assert second.value.code == "acp_capture_pending_retry"
+    row = await svc.peek_session(created.session_id)
+    assert row["status"] == "completing"
+    assert row["capture_attempt"] == 1
+    assert row["psp_idempotency_key"] == f"acp_complete:{created.session_id}:a1"
+
+    # A later resume converges on the SAME key — never :a2, so no second charge.
+    await database.execute(
+        acp_checkout_sessions.update()
+        .where(acp_checkout_sessions.c.id == created.session_id)
+        .values(updated_at=datetime.now(timezone.utc) - timedelta(seconds=120))
+    )
+    out = await svc.complete_session(
+        session_id=created.session_id, agent_context=_Ctx(), payment_token="pm_card_visa",
+    )
+    assert out["status"] == "completed"
+    derived = f"acp_complete:{created.session_id}:a1"
+    assert keys == [derived, derived, derived]
+    assert calls["order_create"] == 1
+
+
+async def test_fresh_claim_still_releases_on_a_pre_dispatch_capture_failure(
+    fake_quote, monkeypatch
+):
+    # The other direction: a FRESH claim has no prior dispatch, so a pre-dispatch
+    # failure is safely releasable (unchanged behavior).
+    _arm_capture_lane(monkeypatch)
+    _mock_order_layer(monkeypatch)
+    created = await _create()
+    keys: list = []
+    _spy_capture(monkeypatch, keys, outcomes=[_failed_outcome("no_merchant_psp")])
+
+    with pytest.raises(svc.AcpCheckoutSessionError) as ei:
+        await svc.complete_session(
+            session_id=created.session_id, agent_context=_Ctx(), payment_token="pm_card_visa",
+        )
+    assert ei.value.code == "acp_capture_failed"
+    row = await svc.peek_session(created.session_id)
+    assert row["status"] == "ready_for_payment"
+
+
+async def test_resumed_claim_still_releases_on_a_definitive_decline(
+    fake_quote, monkeypatch
+):
+    # And a PSP-confirmed decline stays releasable on a resume: the PSP answered
+    # for that key, so nothing is in flight and the buyer must be able to retry
+    # with another card under a NEW key.
+    _arm_capture_lane(monkeypatch)
+    _mock_order_layer(monkeypatch)
+    created = await _create()
+    keys: list = []
+    _spy_capture(
+        monkeypatch, keys,
+        outcomes=[_failed_outcome("stripe_error"), _failed_outcome("card_declined")],
+    )
+
+    with pytest.raises(svc.AcpCheckoutSessionError):
+        await svc.complete_session(
+            session_id=created.session_id, agent_context=_Ctx(), payment_token="pm_bad",
+        )
+    await database.execute(
+        acp_checkout_sessions.update()
+        .where(acp_checkout_sessions.c.id == created.session_id)
+        .values(updated_at=datetime.now(timezone.utc) - timedelta(seconds=120))
+    )
+    with pytest.raises(svc.AcpCheckoutSessionError) as ei:
+        await svc.complete_session(
+            session_id=created.session_id, agent_context=_Ctx(), payment_token="pm_bad",
+        )
+    assert ei.value.code == "acp_capture_failed"
+    row = await svc.peek_session(created.session_id)
+    assert row["status"] == "ready_for_payment"  # released → new card, new key
