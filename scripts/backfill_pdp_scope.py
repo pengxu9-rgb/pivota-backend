@@ -30,6 +30,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from db.database import database  # noqa: E402
 from services.pdp_scope_classifier import (  # noqa: E402
+    own_merchant_seller_term_sql,
     LABEL_SOURCE_BACKFILL,
     ScopeSignals,
     classify,
@@ -54,7 +55,7 @@ async def _fetch_batch(batch_size: int) -> List[Dict[str, Any]]:
         SELECT u.product_key,
                u.category_label_source,
                (
-                 1
+                 {own_merchant_term}
                  + COALESCE((
                      SELECT COUNT(DISTINCT co.merchant_id)
                      FROM catalog_offers co
@@ -79,7 +80,7 @@ async def _fetch_batch(batch_size: int) -> List[Dict[str, Any]]:
             WHERE pdp_scope = 'unverified'
             LIMIT :limit
         ) u
-        """,
+        """.format(own_merchant_term=own_merchant_seller_term_sql("u.merchant_id")),
         {"limit": batch_size},
     )
     return [dict(row) for row in rows or []]

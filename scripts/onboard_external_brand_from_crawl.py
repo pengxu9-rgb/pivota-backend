@@ -75,7 +75,11 @@ from services.external_seed_servability import (
     make_external_seed_servable,
 )
 from services.offer_seller_identity import derive_offer_seller_identity
-from services.pdp_scope_classifier import ScopeSignals, classify
+from services.pdp_scope_classifier import (
+    ScopeSignals,
+    classify,
+    own_merchant_seller_term_sql,
+)
 # ADR-009 D2/D3 (docs/adr/ADR-009-seller-of-record-identity.md; IDENTITY_REFERENCE
 # §3 Trap T3, §4): a crawl-onboarded brand mints its own per-brand observed
 # seller-of-record instead of landing under the banned 'external_seed' bucket,
@@ -424,14 +428,14 @@ async def _resolve_pdp_scope(p: Dict[str, Any], product_key: str, self_merchant_
     pk = product_key
     row = await database.fetch_one(
         """
-        SELECT 1
+        SELECT {own_merchant_term}
           + COALESCE((SELECT COUNT(DISTINCT co.merchant_id) FROM catalog_offers co
                       WHERE co.product_key = :pk AND co.merchant_id IS NOT NULL
                         AND co.merchant_id <> :self_merchant), 0)
           + COALESCE((SELECT COUNT(DISTINCT eps.domain) FROM external_product_seeds eps
                       WHERE eps.attached_product_key = :pk AND eps.status = 'active'
                         AND eps.domain IS NOT NULL), 0) AS seller_count
-        """,
+        """.format(own_merchant_term=own_merchant_seller_term_sql("CAST(:self_merchant AS text)")),
         {"pk": pk, "self_merchant": self_merchant_id},
     )
     seller_count = int((dict(row) if row else {}).get("seller_count") or 1)

@@ -74,6 +74,14 @@ on:
       - "db/**"
       - "models/**"
       - "main.py"
+      # scripts/ carry SQL that the postgres tests execute for real —
+      # backfill_pdp_scope and onboard_external_brand_from_crawl now build their
+      # seller-count SQL with `.format()` at call time, so a stray literal brace
+      # added in a scripts-only PR would raise at runtime. The sweep workflow
+      # triggers on scripts/** but runs with --ignore-glob='tests/test_*_postgres.py',
+      # so WITHOUT this entry no pre-merge job executes those statements at all
+      # (found by the #1676 review). The narrow-filter warning above, again.
+      - "scripts/**"
       # config/ SUPPLIES database_url — i.e. this gate's own premise — and
       # utils/ is on the gated route's import path. Both were missing on the
       # first cut, which is the narrow-filter mistake this comment warns about,

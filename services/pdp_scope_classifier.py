@@ -49,6 +49,36 @@ class ScopeSignals:
     seller_count: int
 
 
+# The synthetic bucket that is NOT a seller. Collapsing many real merchants
+# into one `merchant_id` erased the seller signal (ADR-009 bans the bucket);
+# counting it as "1 own merchant" is how 3,182 single-seller mirror rows got
+# labelled multi_merchant_canonical. Value PINNED BY TEST to
+# services.seller_identity.BANNED_BUCKET_MERCHANT_ID — not imported at runtime,
+# because seller_identity drags db + sync-service imports into this pure module.
+NON_SELLER_MERCHANT_ID = "external_seed"
+
+
+def own_merchant_seller_term_sql(merchant_expr: str) -> str:
+    """Rule 2's own-merchant term, as SQL: 1 if `merchant_expr` names a real
+    merchant, 0 if it is the bucket or NULL.
+
+    A FUNCTION so every SQL spelling of this rule is THE SAME spelling. Three
+    writers previously carried their own: the recovery predicate had the CASE
+    inline, backfill_pdp_scope had an unconditional `1 +` (the 3,182-row
+    defect), and onboard_external_brand_from_crawl had another unconditional
+    `1 +` guarded only by a docstring claiming its cohort never includes bucket
+    rows. `merchant_expr` may be a column reference or a bind parameter; it is
+    a literal SQL fragment, never user input.
+    """
+    if not merchant_expr or not merchant_expr.strip():
+        raise ValueError("own_merchant_seller_term_sql requires a merchant expression")
+    return (
+        f"(CASE WHEN {merchant_expr} IS NOT NULL "
+        f"AND {merchant_expr} <> '{NON_SELLER_MERCHANT_ID}' "
+        "THEN 1 ELSE 0 END)"
+    )
+
+
 def classify(signals: ScopeSignals) -> str:
     """Return the pdp_scope value for the given signals."""
     if signals.category_label_source == LABEL_SOURCE_ENRICHMENT:
