@@ -27,6 +27,7 @@ class _FakeIntents:
 
 class _FakePaymentMethods:
     def retrieve(self, pm_id):
+        _FakeStripeClient.pm_lookups.append(pm_id)
         if _FakeStripeClient.pm_lookup_raises:
             raise RuntimeError("pm lookup boom")
         return SimpleNamespace(id=pm_id, customer=_FakeStripeClient.pm_customer)
@@ -37,6 +38,7 @@ class _FakeStripeClient:
     intents = None
     pm_customer = None          # what payment_methods.retrieve reports as .customer
     pm_lookup_raises = False
+    pm_lookups = []             # every payment_methods.retrieve arg, in order
 
     def __init__(self, api_key, *a, **k):
         _FakeStripeClient.last_api_key = api_key
@@ -53,6 +55,7 @@ def _install_stripe(monkeypatch, outcome):
     _FakeStripeClient.last_api_key = None
     _FakeStripeClient.pm_customer = None
     _FakeStripeClient.pm_lookup_raises = False
+    _FakeStripeClient.pm_lookups = []
     monkeypatch.setattr(stripe, "StripeClient", _FakeStripeClient)
     return _FakeStripeClient.intents
 
@@ -470,3 +473,342 @@ async def test_adyen_http_error_fails_closed(monkeypatch):
         payment_method="8416891234567890", metadata=dict(_ADYEN_MD), max_cents=5000,
     )
     assert r.success is False and r.error_code == "adyen_http_401"
+
+
+# =============================================================================
+# P1 PR-B — Stripe SharedPaymentToken (`spt_`) capture lane
+# =============================================================================
+# The flag gates ONE adapter branch. With it OFF an `spt_` token must behave
+# exactly as any other non-`pm_` token behaves today; with it ON the intent
+# carries `payment_method_data[shared_payment_granted_token]` under the preview
+# API version and NOTHING else about the money path moves.
+
+SPT = "spt_test_granted_token_123"
+
+
+def _arm_spt(monkeypatch, enabled=True):
+    from config.settings import settings
+
+    monkeypatch.setattr(settings, "acp_spt_capture_enabled", enabled, raising=False)
+
+
+def _ok(**kw):
+    base = dict(id="pi_spt", status="succeeded", amount=169, currency="usd")
+    base.update(kw)
+    return SimpleNamespace(**base)
+
+
+# --- flag OFF: byte-identical to today ---------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_spt_flag_off_live_lane_is_byte_identical_to_any_other_token(monkeypatch):
+    # ⚠️ This pins what the live lane ACTUALLY does today, which is NOT what the
+    # PR-B spec assumed. The live-lane guard is `not pm or pm ==
+    # DEFAULT_TEST_PAYMENT_METHOD` — it refuses an EMPTY or TEST payment method,
+    # it does NOT require a `pm_` prefix. So today an `spt_` (like any other
+    # non-empty, non-test token) is forwarded to Stripe as `payment_method`, and
+    # Stripe rejects it there. `live_pm_required` is NOT today's answer.
+    #
+    # Flag OFF must reproduce that exactly, byte for byte, however unattractive
+    # it is — a flag that is off may not change behavior. Making the live lane
+    # demand a `pm_` prefix would be a real (and arguably correct) tightening,
+    # but it is a SEPARATE change with its own blast radius on the proven live
+    # path, not something to smuggle in under an off-by-default flag.
+    intents = _install_stripe(monkeypatch, _ok())
+    _install_merchant_key(monkeypatch, "sk_live_merch")
+    _arm_spt(monkeypatch, enabled=False)
+    await cap.capture_offsession(
+        merchant_id="m", amount_cents=169, currency="usd", idempotency_key="k",
+        payment_method=SPT, allow_live=True, max_cents=500,
+    )
+    await cap.capture_offsession(
+        merchant_id="m", amount_cents=169, currency="usd", idempotency_key="k",
+        payment_method="vt_0123456789abcd", allow_live=True, max_cents=500,
+    )
+    spt_call, control_call = intents.calls[0], intents.calls[1]
+    assert spt_call["payload"]["payment_method"] == SPT   # forwarded, as today
+    assert "payment_method_data" not in spt_call["payload"]
+    assert spt_call["payload"]["off_session"] is True
+    assert "stripe_version" not in spt_call["opts"]
+    # …and identical in every respect except the token itself.
+    assert {k: v for k, v in spt_call["payload"].items() if k != "payment_method"} == {
+        k: v for k, v in control_call["payload"].items() if k != "payment_method"
+    }
+    assert spt_call["opts"] == control_call["opts"]
+
+
+@pytest.mark.asyncio
+async def test_spt_flag_off_live_lane_still_refuses_an_empty_or_test_pm(monkeypatch):
+    # The guard that DOES exist on the live lane is untouched by the SPT work.
+    _install_stripe(monkeypatch, _ok())
+    _install_merchant_key(monkeypatch, "sk_live_merch")
+    _arm_spt(monkeypatch, enabled=False)
+    for pm in (None, "", "pm_card_visa"):
+        r = await cap.capture_offsession(
+            merchant_id="m", amount_cents=169, currency="usd", idempotency_key="k",
+            payment_method=pm, allow_live=True, max_cents=500,
+        )
+        assert r.success is False and r.error_code == "live_pm_required"
+
+
+@pytest.mark.asyncio
+async def test_spt_flag_off_test_lane_is_byte_identical_to_any_other_token(monkeypatch):
+    # The test lane substitutes the test PM for a non-pm token. With the flag
+    # off an `spt_` must produce the IDENTICAL request an unrelated placeholder
+    # token produces — same params, same request options.
+    intents = _install_stripe(monkeypatch, _ok())
+    _install_merchant_key(monkeypatch, "sk_test_merch")
+    _arm_spt(monkeypatch, enabled=False)
+    await cap.capture_offsession(
+        merchant_id="m", amount_cents=169, currency="usd", idempotency_key="k",
+        payment_method=SPT, metadata={"order_id": "o1"},
+    )
+    await cap.capture_offsession(
+        merchant_id="m", amount_cents=169, currency="usd", idempotency_key="k",
+        payment_method="tok_test", metadata={"order_id": "o1"},
+    )
+    spt_call, control_call = intents.calls[0], intents.calls[1]
+    assert spt_call["payload"] == control_call["payload"]
+    assert spt_call["opts"] == control_call["opts"]
+    assert spt_call["payload"]["payment_method"] == "pm_card_visa"
+    assert spt_call["payload"]["off_session"] is True
+    assert "payment_method_data" not in spt_call["payload"]
+    assert "stripe_version" not in spt_call["opts"]
+
+
+# --- flag ON: the SPT request shape ------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_spt_flag_on_test_lane_charges_the_spt(monkeypatch):
+    # Test-mode SPTs exist, so the test canary charges a REAL test SPT instead
+    # of substituting the test PM — substituting would prove nothing about this
+    # rail.
+    intents = _install_stripe(monkeypatch, _ok())
+    _install_merchant_key(monkeypatch, "sk_test_merch")
+    _arm_spt(monkeypatch)
+    r = await cap.capture_offsession(
+        merchant_id="m", amount_cents=169, currency="USD", idempotency_key="k_a1",
+        payment_method=SPT, metadata={"order_id": "o1"},
+    )
+    assert r.success is True and r.payment_intent_id == "pi_spt"
+    p = intents.calls[0]["payload"]
+    # The exact Stripe seller-flow shape, verified against the docs 2026-08-04.
+    assert p["payment_method_data"] == {"shared_payment_granted_token": SPT}
+    assert "payment_method" not in p          # NOT payment_method=<spt>
+    assert "request_delegated_payment" not in p  # no such seller-flow param
+    assert "off_session" not in p             # undocumented for SPT → not sent
+    assert p["confirm"] is True
+    assert p["amount"] == 169 and p["currency"] == "usd"
+    assert p["metadata"]["pivota_acp_test_capture"] == "true"
+    assert p["metadata"]["order_id"] == "o1"
+    assert "customer" not in p
+    # The token is not a PaymentMethod — no PM object exists to retrieve, and
+    # the lookup must be SKIPPED, not attempted-and-swallowed.
+    assert _FakeStripeClient.pm_lookups == []
+
+
+@pytest.mark.asyncio
+async def test_spt_flag_on_live_lane_charges_the_spt(monkeypatch):
+    intents = _install_stripe(monkeypatch, _ok(id="pi_spt_live"))
+    _install_merchant_key(monkeypatch, "sk_live_merch")
+    _arm_spt(monkeypatch)
+    r = await cap.capture_offsession(
+        merchant_id="m", amount_cents=169, currency="usd", idempotency_key="k_live",
+        payment_method=SPT, allow_live=True, max_cents=500,
+    )
+    assert r.success is True
+    assert _FakeStripeClient.last_api_key == "sk_live_merch"
+    p = intents.calls[0]["payload"]
+    assert p["payment_method_data"] == {"shared_payment_granted_token": SPT}
+    assert "payment_method" not in p and "off_session" not in p
+    assert p["metadata"]["pivota_acp_live_capture"] == "true"
+    assert "pivota_acp_test_capture" not in p["metadata"]
+    assert _FakeStripeClient.pm_lookups == []
+
+
+@pytest.mark.asyncio
+async def test_spt_sends_the_preview_version_per_request_only(monkeypatch):
+    # The preview version rides in the SDK's PER-REQUEST options (stripe-python
+    # 15.1.0 turns `stripe_version` into the Stripe-Version header). The global
+    # API version is never touched, so the proven pm_ path keeps charging on
+    # exactly the version it charges on today.
+    intents = _install_stripe(monkeypatch, _ok())
+    _install_merchant_key(monkeypatch, "sk_test_merch")
+    _arm_spt(monkeypatch)
+    await cap.capture_offsession(
+        merchant_id="m", amount_cents=169, currency="usd", idempotency_key="k_spt",
+        payment_method=SPT,
+    )
+    await cap.capture_offsession(
+        merchant_id="m", amount_cents=169, currency="usd", idempotency_key="k_pm",
+        payment_method="pm_card_mastercard",
+    )
+    assert intents.calls[0]["opts"]["stripe_version"] == "2026-04-22.preview"
+    assert cap.STRIPE_SPT_API_VERSION == "2026-04-22.preview"
+    assert "stripe_version" not in intents.calls[1]["opts"]
+
+
+@pytest.mark.asyncio
+async def test_spt_forwards_the_stored_attempt_scoped_idempotency_key(monkeypatch):
+    # Doctrine: the session layer's stored, attempt-scoped key is what a capture
+    # charges under — first try or resume — so a replay is parameter-identical.
+    intents = _install_stripe(monkeypatch, _ok())
+    _install_merchant_key(monkeypatch, "sk_test_merch")
+    _arm_spt(monkeypatch)
+    key = "acp_complete:csn_abc:a2"
+    await cap.capture_offsession(
+        merchant_id="m", amount_cents=169, currency="usd", idempotency_key=key,
+        payment_method=SPT,
+    )
+    assert intents.calls[0]["opts"]["idempotency_key"] == key
+    # A resume replays the SAME key with the SAME params — byte-identical.
+    await cap.capture_offsession(
+        merchant_id="m", amount_cents=169, currency="usd", idempotency_key=key,
+        payment_method=SPT,
+    )
+    assert intents.calls[1] == intents.calls[0]
+
+
+@pytest.mark.asyncio
+async def test_spt_flag_on_does_not_disturb_the_pm_path(monkeypatch):
+    # The flag gates ONE branch. A `pm_` token with the flag ON is unchanged:
+    # customer lookup, off_session, payment_method, no preview version.
+    intents = _install_stripe(monkeypatch, _ok())
+    _install_merchant_key(monkeypatch, "sk_test_merch")
+    _FakeStripeClient.pm_customer = "cus_X"
+    _arm_spt(monkeypatch)
+    await cap.capture_offsession(
+        merchant_id="m", amount_cents=169, currency="usd", idempotency_key="k",
+        payment_method="pm_real",
+    )
+    p = intents.calls[0]["payload"]
+    assert p["payment_method"] == "pm_real"
+    assert p["off_session"] is True
+    assert p["customer"] == "cus_X"
+    assert "payment_method_data" not in p
+    assert _FakeStripeClient.pm_lookups == ["pm_real"]
+    assert "stripe_version" not in intents.calls[0]["opts"]
+
+
+# --- the lane guards are NOT weakened by an SPT ------------------------------
+
+
+@pytest.mark.asyncio
+async def test_spt_flag_on_test_lane_still_hard_refuses_a_live_key(monkeypatch):
+    intents = _install_stripe(monkeypatch, _ok())
+    _install_merchant_key(monkeypatch, "sk_live_merch")
+    _arm_spt(monkeypatch)
+    r = await cap.capture_offsession(
+        merchant_id="m", amount_cents=169, currency="usd", idempotency_key="k",
+        payment_method=SPT,
+    )
+    assert r.success is False and r.error_code == "live_key_refused"
+    assert intents.calls == []
+
+
+@pytest.mark.asyncio
+async def test_spt_flag_on_live_lane_still_refuses_a_test_key(monkeypatch):
+    intents = _install_stripe(monkeypatch, _ok())
+    _install_merchant_key(monkeypatch, "sk_test_merch")
+    _arm_spt(monkeypatch)
+    r = await cap.capture_offsession(
+        merchant_id="m", amount_cents=169, currency="usd", idempotency_key="k",
+        payment_method=SPT, allow_live=True, max_cents=500,
+    )
+    assert r.success is False and r.error_code == "live_key_required"
+    assert intents.calls == []
+
+
+@pytest.mark.asyncio
+async def test_spt_still_respects_the_amount_cap(monkeypatch):
+    _install_stripe(monkeypatch, _ok())
+    _install_merchant_key(monkeypatch, "sk_test_merch")
+    _arm_spt(monkeypatch)
+    r = await cap.capture_offsession(
+        merchant_id="m", amount_cents=100_000, currency="usd", idempotency_key="k",
+        payment_method=SPT, max_cents=500,
+    )
+    assert r.success is False and r.error_code == "over_cap"
+
+
+@pytest.mark.asyncio
+async def test_spt_on_a_non_stripe_provider_is_unaffected(monkeypatch):
+    # The SPT branch belongs to the Stripe adapter alone. With the flag ON, an
+    # Adyen merchant's request is untouched: no shared_payment_granted_token,
+    # no preview version — Adyen still treats the token exactly as it did
+    # before (its own storedPaymentMethodId slot). An SPT is meaningless to
+    # Adyen and Adyen refuses it; that is Adyen's problem to answer, not ours to
+    # reinterpret.
+    _install_merchant_key(
+        monkeypatch, api_key="test_ADYEN", psp_provider="adyen", provider_config=_ADYEN_CFG,
+    )
+    _install_adyen_http(
+        monkeypatch, payload={"resultCode": "Refused", "refusalReason": "Invalid stored PM"},
+    )
+    _arm_spt(monkeypatch)
+    r = await cap.capture_offsession(
+        merchant_id="m", amount_cents=169, currency="USD", idempotency_key="k",
+        payment_method=SPT, metadata=dict(_ADYEN_MD), max_cents=5000,
+    )
+    assert r.success is False and r.provider == "adyen"
+    body = _FakeAdyenClient.captured["json"]
+    assert body["paymentMethod"] == {"type": "scheme", "storedPaymentMethodId": SPT}
+    assert "shared_payment_granted_token" not in _json.dumps(body)
+
+
+# --- failure normalization stays conservative --------------------------------
+
+
+@pytest.mark.asyncio
+async def test_spt_unknown_stripe_error_is_normalized_untouched(monkeypatch):
+    # Stripe's usage-limit violation codes are UNDOCUMENTED. The adapter must
+    # surface whatever code arrives verbatim — no invented mapping — so the
+    # session layer's classifier can hold it as ambiguous (claim kept).
+    exc = Exception("shared payment token allowance exceeded")
+    exc.code = "some_undocumented_spt_code"
+    _install_stripe(monkeypatch, exc)
+    _install_merchant_key(monkeypatch, "sk_test_merch")
+    _arm_spt(monkeypatch)
+    r = await cap.capture_offsession(
+        merchant_id="m", amount_cents=169, currency="usd", idempotency_key="k",
+        payment_method=SPT,
+    )
+    assert r.success is False
+    assert r.error_code == "some_undocumented_spt_code"
+    assert r.status == "failed"
+
+
+@pytest.mark.asyncio
+async def test_spt_codeless_stripe_error_falls_back_to_stripe_error(monkeypatch):
+    _install_stripe(monkeypatch, Exception("boom"))
+    _install_merchant_key(monkeypatch, "sk_test_merch")
+    _arm_spt(monkeypatch)
+    r = await cap.capture_offsession(
+        merchant_id="m", amount_cents=169, currency="usd", idempotency_key="k",
+        payment_method=SPT,
+    )
+    assert r.success is False and r.error_code == "stripe_error"
+
+
+@pytest.mark.asyncio
+async def test_spt_requires_action_is_still_a_failure(monkeypatch):
+    _install_stripe(monkeypatch, _ok(status="requires_action"))
+    _install_merchant_key(monkeypatch, "sk_test_merch")
+    _arm_spt(monkeypatch)
+    r = await cap.capture_offsession(
+        merchant_id="m", amount_cents=169, currency="usd", idempotency_key="k",
+        payment_method=SPT,
+    )
+    assert r.success is False and r.error_code == "requires_action"
+
+
+# --- the token gate ----------------------------------------------------------
+
+
+def test_is_shared_payment_token_gate():
+    assert cap.is_shared_payment_token("spt_abc")
+    assert cap.is_shared_payment_token("  spt_abc  ")
+    for other in ("pm_card_visa", "vt_abc", "tok_test", "", None, "SPT_ABC"):
+        assert not cap.is_shared_payment_token(other)

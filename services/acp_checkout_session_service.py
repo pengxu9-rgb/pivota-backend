@@ -1159,6 +1159,28 @@ _DEFINITIVE_DECLINE_ERROR_CODES = frozenset(
         # Adyen failures are held as AMBIGUOUS (claim kept, same-key replay).
     }
 )
+# P1 PR-B — Stripe SharedPaymentToken (`spt_`) refusals. INTENTIONALLY EMPTY.
+#
+# Stripe does not document the error codes it returns when an SPT violates its
+# `usage_limits` (amount exceeded / expired / already used / currency or
+# merchant mismatch). An undocumented code that CAN occur after a charge has
+# landed would, if listed here, release the claim and let the next attempt mint
+# a new PSP key — i.e. a double charge. So every SPT error code stays UNKNOWN
+# and therefore AMBIGUOUS (claim held, same-key replay) until a real sandbox run
+# enumerates them: `scripts/acp_spt_sandbox_conformance.py` prints Stripe's
+# exact `error.code`/`error.type` for each violation.
+#
+# Populating this set is then a ONE-LINE DATA CHANGE (add the enumerated codes),
+# never a logic change — the wiring below already exists. Only codes the
+# conformance run proves are refusals-before-any-charge belong here.
+#
+# Deliberately NOT wired into `_capture_release_is_safe`'s resume branch: that
+# branch is reserved for `_DEFINITIVE_DECLINE_ERROR_CODES`, whose members are
+# proven PSP answers bound to the key we used. Whether a given SPT code carries
+# that property is itself something the sandbox enumeration has to establish, so
+# until then an SPT refusal releases only a FRESH claim — strictly the more
+# conservative half.
+_SPT_DEFINITIVE_ERROR_CODES: frozenset = frozenset()
 
 
 def _capture_failure_is_definitive(outcome: Any) -> bool:
@@ -1170,7 +1192,11 @@ def _capture_failure_is_definitive(outcome: Any) -> bool:
     code = str(getattr(outcome, "error_code", "") or "").strip().lower()
     if not code:
         return False
-    return code in _PRE_DISPATCH_ERROR_CODES or code in _DEFINITIVE_DECLINE_ERROR_CODES
+    return (
+        code in _PRE_DISPATCH_ERROR_CODES
+        or code in _DEFINITIVE_DECLINE_ERROR_CODES
+        or code in _SPT_DEFINITIVE_ERROR_CODES
+    )
 
 
 def _capture_release_is_safe(outcome: Any, *, resumed: bool) -> bool:
@@ -1239,8 +1265,13 @@ async def _revert_claim_to_ready(session_id: str) -> None:
 # `{type, code, message, param}` envelope the route builds from `extra`.
 #
 # The gate is EXACTLY `startswith("vt_")`, wire parity: `pm_` (a real PSP
-# payment method) and a future `spt_` (Stripe SharedPaymentToken) never reach
-# the registry, in either flag state.
+# payment method) and `spt_` (a Stripe SharedPaymentToken) never reach the
+# registry, in either flag state. An SPT is NOT a registry allowance: Stripe
+# holds and enforces its allowance (`usage_limits{currency, max_amount,
+# expires_at}` + single-use) authoritatively, so there is nothing for us to
+# record and a registry miss must not manufacture an `invalid_token` refusal for
+# a token that is perfectly chargeable. It passes straight through to the
+# capture lane (services/acp_offsession_capture, ACP_SPT_CAPTURE_ENABLED).
 #
 # WHERE THE CHECKS RUN, AND WHY IT DEPENDS ON THE CLAIM (review: resume path).
 # Consumption is CLAIM-SCOPED, and there are exactly three cases:
@@ -1451,9 +1482,13 @@ async def _rebind_own_delegate_allowance(
 def _delegate_allowance_applies(payment_token: Optional[str]) -> bool:
     """True only when the registry lane is armed AND the token is a `vt_`
     delegate token. Flag OFF ⇒ a `vt_` token behaves exactly as it does today
-    (no registry lookup at all; it dies at capture, where the Stripe adapter
-    refuses a non-`pm_` on the live lane and substitutes the test PM on the test
-    lane). `pm_`/`spt_` never take this branch in either flag state."""
+    (no registry lookup at all; it dies at capture, where the test lane
+    substitutes the test PM and the live lane forwards it to Stripe as a
+    `payment_method`, which Stripe rejects — the live-lane guard refuses an
+    empty or TEST payment method, it does not require a `pm_` prefix; corrected
+    here in PR-B after the adapter tests pinned the real behavior).
+    `pm_`/`spt_` never take this branch in either flag state — an SPT's
+    allowance is held and enforced by Stripe, not by our registry."""
     if not getattr(settings, "acp_delegate_allowance_registry_enabled", False):
         return False
     from services.acp_delegate_allowance_service import is_delegate_token

@@ -29,6 +29,12 @@ Scope / safety (unchanged):
   here for every provider, not just Stripe.
 - An unsupported PSP fails closed (no charge, normalized error).
 - Never raises: returns a normalized result the caller maps into the success path.
+
+P1 PR-B adds the Stripe SharedPaymentToken (`spt_`) lane behind
+ACP_SPT_CAPTURE_ENABLED (default OFF). It changes ONLY how the Stripe adapter
+shapes the PaymentIntent for an `spt_` token; every invariant above is
+untouched, and with the flag off an `spt_` behaves byte-for-byte as it does
+today. See the SPT block below the constants.
 """
 
 from __future__ import annotations
@@ -49,6 +55,48 @@ logger = logging.getLogger("acp_offsession_capture")
 # Stripe test payment method that succeeds off_session with no real card. Used
 # for the first test-mode proof; a real buyer-tokenized pm_ replaces it later.
 DEFAULT_TEST_PAYMENT_METHOD = "pm_card_visa"
+
+# --- Stripe SharedPaymentToken (SPT), the ACP delegated-payment rail ---------
+#
+# ACP delegated payment does NOT hand the business a PSP payment method. OpenAI
+# vaults the buyer's card with Stripe and hands the MERCHANT (merchant of
+# record) a single-use, amount-capped, merchant-scoped SharedPaymentToken.
+# Pivota never sees cardholder data and never becomes a vault; the charge still
+# runs on the merchant's OWN secret key through this same adapter.
+#
+# Verified against Stripe's seller docs 2026-08-04: the charge is
+#   POST /v1/payment_intents
+#   amount, currency, confirm=true,
+#   payment_method_data[shared_payment_granted_token]=spt_…
+# — NOT `payment_method=<spt>`, and there is NO `request_delegated_payment`
+# parameter in the seller flow. Stripe enforces the token's
+# `usage_limits{currency, max_amount, expires_at}` and single-use at
+# confirmation. The parameters live behind a preview API version, which we send
+# PER REQUEST (see STRIPE_SPT_API_VERSION) so no other Stripe call in the
+# process changes version.
+SPT_TOKEN_PREFIX = "spt_"
+
+# The preview API version that exposes the SPT parameters. Sent ONLY on SPT
+# requests, via the SDK's per-request `stripe_version` option (stripe-python
+# 15.1.0 RequestOptions supports it and turns it into the `Stripe-Version`
+# header) — the global/default API version is deliberately left alone so the
+# proven `pm_` path keeps charging on exactly the version it charges on today.
+STRIPE_SPT_API_VERSION = "2026-04-22.preview"
+
+
+def is_shared_payment_token(token: Optional[str]) -> bool:
+    """The SPT gate, spelled exactly like the wire contract: `spt_`.
+
+    `pm_` (a real PSP payment method) and `vt_` (a registry delegate allowance)
+    are NOT shared payment tokens and are unaffected in either flag state."""
+    return str(token or "").strip().startswith(SPT_TOKEN_PREFIX)
+
+
+def _spt_capture_enabled() -> bool:
+    """Read ACP_SPT_CAPTURE_ENABLED at CALL time, never at import time, so the
+    flag can be toggled (ops or test) without a reimport — the same idiom the
+    other ACP lane gates use. Missing attribute ⇒ OFF (fail closed)."""
+    return bool(getattr(settings, "acp_spt_capture_enabled", False))
 
 
 @dataclass(frozen=True)
@@ -127,7 +175,19 @@ class CaptureProvider(Protocol):
 
 class _StripeCaptureAdapter:
     """Stripe off-session create+confirm. Extracted verbatim from the proven
-    P-T2.3.3/P-T2.3.5 path — behavior is unchanged."""
+    P-T2.3.3/P-T2.3.5 path — the `pm_` behavior is unchanged.
+
+    P1 PR-B adds ONE additional branch, behind ACP_SPT_CAPTURE_ENABLED (default
+    off): a SharedPaymentToken (`spt_`) is charged as
+    `payment_method_data[shared_payment_granted_token]` under Stripe's preview
+    API version. With the flag OFF an `spt_` token is treated exactly as any
+    other non-`pm_` token is treated TODAY — substituted with the test PM on the
+    test lane, and FORWARDED AS `payment_method` on the live lane (the live-lane
+    guard refuses an empty or test PM; it has never required a `pm_` prefix, so
+    Stripe is what rejects the token there). Every orchestrator invariant
+    (merchant-of-record key, amount cap, test/live key lane guard,
+    attempt-scoped stored idempotency key, never-raises) is untouched by the
+    branch."""
 
     async def capture(
         self,
@@ -142,24 +202,33 @@ class _StripeCaptureAdapter:
         allow_live: bool,
         provider_config: Optional[Dict[str, Any]] = None,  # unused (Stripe needs only the key)
     ) -> OffSessionCaptureResult:
-        # Payment method: the test lane may default to Stripe's test PM; the live
-        # lane MUST carry a real buyer-provided pm_ (a test PM would fail on a live
-        # key, and silently defaulting to it on the live lane would be dangerously
-        # misleading).
         pm = str(payment_method or "").strip()
-        if allow_live:
-            if not pm or pm == DEFAULT_TEST_PAYMENT_METHOD:
-                return _fail(
-                    amount_cents, currency,
-                    "live_capture_requires_real_payment_method", "live_pm_required",
-                )
-        else:
-            # Test lane: only honor a real Stripe payment method (pm_*). A
-            # placeholder or delegate token the surface may forward (e.g.
-            # "tok_test", "vt_*") is NOT a chargeable test PM, so fall back to the
-            # test PM — the test canary always charges a valid PM regardless of
-            # what token rode in.
-            pm = pm if pm.startswith("pm_") else DEFAULT_TEST_PAYMENT_METHOD
+        # The SPT lane engages only when the flag is ON *and* the token is an
+        # `spt_`. Both lanes may charge one: Stripe issues test-mode SPTs, so the
+        # test canary charges a REAL test SPT rather than silently substituting
+        # the test PM (substituting would make the canary prove nothing about
+        # this rail). The orchestrator's test/live KEY guard is unchanged and
+        # already ran — an SPT never weakens which key may be used on which lane.
+        spt = _spt_capture_enabled() and is_shared_payment_token(pm)
+
+        if not spt:
+            # Payment method: the test lane may default to Stripe's test PM; the live
+            # lane MUST carry a real buyer-provided pm_ (a test PM would fail on a live
+            # key, and silently defaulting to it on the live lane would be dangerously
+            # misleading).
+            if allow_live:
+                if not pm or pm == DEFAULT_TEST_PAYMENT_METHOD:
+                    return _fail(
+                        amount_cents, currency,
+                        "live_capture_requires_real_payment_method", "live_pm_required",
+                    )
+            else:
+                # Test lane: only honor a real Stripe payment method (pm_*). A
+                # placeholder or delegate token the surface may forward (e.g.
+                # "tok_test", "vt_*", or an `spt_` while the flag is off) is NOT a
+                # chargeable test PM, so fall back to the test PM — the test canary
+                # always charges a valid PM regardless of what token rode in.
+                pm = pm if pm.startswith("pm_") else DEFAULT_TEST_PAYMENT_METHOD
 
         try:
             import stripe  # local import: keep module import-safe without stripe configured
@@ -174,33 +243,64 @@ class _StripeCaptureAdapter:
             # with no customer (e.g. a bare createPaymentMethod for a US/non-SCA
             # card, or the test pm_card_visa) → charge as before. Best-effort: a
             # lookup failure never blocks the charge.
+            #
+            # SKIPPED entirely on the SPT lane: an SPT is not a PaymentMethod, so
+            # there is no PM object to retrieve. Skipping is deliberate, not a
+            # tolerated failure — calling retrieve() with an `spt_` would burn a
+            # round-trip on a guaranteed 404 and log noise for a non-condition.
             customer_id: Optional[str] = None
-            try:
-                pm_obj = await asyncio.to_thread(client.v1.payment_methods.retrieve, pm)
-                customer_id = getattr(pm_obj, "customer", None) or None
-            except Exception as _pm_exc:  # noqa: BLE001 — charge without customer on lookup failure
-                logger.warning(
-                    "acp_offsession: payment_method lookup failed (charging without customer) "
-                    "merchant_id=%s: %s", merchant_id, str(_pm_exc)[:150],
-                )
+            if not spt:
+                try:
+                    pm_obj = await asyncio.to_thread(client.v1.payment_methods.retrieve, pm)
+                    customer_id = getattr(pm_obj, "customer", None) or None
+                except Exception as _pm_exc:  # noqa: BLE001 — charge without customer on lookup failure
+                    logger.warning(
+                        "acp_offsession: payment_method lookup failed (charging without customer) "
+                        "merchant_id=%s: %s", merchant_id, str(_pm_exc)[:150],
+                    )
+
+            # The attempt-scoped key the SESSION layer stored on the row is what
+            # every capture — first try or resume — must charge under. It rides
+            # in the request options unchanged on BOTH lanes, so a replay is
+            # parameter-identical (the SPT path adds only the version option,
+            # which is a constant).
+            request_options: Dict[str, Any] = {"idempotency_key": str(idempotency_key)}
 
             intent_params: Dict[str, Any] = {
                 "amount": amount_cents,
                 "currency": str(currency or "usd").lower(),
-                "payment_method": pm,
-                "off_session": True,
-                "confirm": True,
-                "metadata": {
-                    **(metadata or {}),
-                    ("pivota_acp_live_capture" if allow_live else "pivota_acp_test_capture"): "true",
-                },
+            }
+            if spt:
+                # The exact seller-flow shape. NOTE on `off_session`: Stripe's
+                # seller documentation for SharedPaymentTokens does not list it,
+                # and the pinned SDK (stripe-python 15.1.0) predates the preview
+                # and carries no `shared_payment` surface at all — so there is no
+                # contrary evidence anywhere in the pinned dependency. We
+                # therefore do NOT send it: the delegated-payment authorization
+                # rides in the token itself (the buyer authorized it with
+                # OpenAI), and sending an undocumented flag on a money call is
+                # exactly the kind of guess that turns into a decline or a
+                # mis-scoped charge. If a sandbox run (scripts/
+                # acp_spt_sandbox_conformance.py) shows Stripe wants it, it is a
+                # one-line addition backed by evidence.
+                intent_params["payment_method_data"] = {
+                    "shared_payment_granted_token": pm,
+                }
+                request_options["stripe_version"] = STRIPE_SPT_API_VERSION
+            else:
+                intent_params["payment_method"] = pm
+                intent_params["off_session"] = True
+            intent_params["confirm"] = True
+            intent_params["metadata"] = {
+                **(metadata or {}),
+                ("pivota_acp_live_capture" if allow_live else "pivota_acp_test_capture"): "true",
             }
             if customer_id:
                 intent_params["customer"] = customer_id
             intent = await asyncio.to_thread(
                 client.v1.payment_intents.create,
                 intent_params,
-                {"idempotency_key": str(idempotency_key)},
+                request_options,
             )
         except Exception as exc:  # noqa: BLE001 — Stripe CardError etc.; normalize
             code = (

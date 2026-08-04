@@ -455,6 +455,24 @@ class Settings(BaseSettings):
         in {"true", "1", "on", "yes"}
     )
 
+    # P1 delegated-token design (PR-B): the Stripe SharedPaymentToken (`spt_`)
+    # capture lane. Stripe is the delegated-payment vault — OpenAI vaults the
+    # buyer's card there and hands the MERCHANT (merchant of record) a
+    # single-use, amount-capped, merchant-scoped token, which Stripe enforces
+    # (`usage_limits{currency, max_amount, expires_at}` + deactivation after
+    # use) at confirmation. This flag gates ONLY the adapter branch that charges
+    # such a token. It authorizes nothing on its own: it composes with (never
+    # replaces) the kill-switch chain, the test/live key lane guards and the
+    # AGENT_ACP_*_MAX_CENTS caps.
+    # Default OFF, and OFF means byte-for-byte today's behavior for an `spt_`
+    # token — the live lane refuses it (`live_pm_required`; it is not a `pm_`)
+    # and the test lane substitutes DEFAULT_TEST_PAYMENT_METHOD. `pm_` and `vt_`
+    # are untouched in BOTH flag states.
+    acp_spt_capture_enabled: bool = (
+        os.getenv("ACP_SPT_CAPTURE_ENABLED", "false").strip().lower()
+        in {"true", "1", "on", "yes"}
+    )
+
     # ---- Tier-2 native-handoff lane (mid-man routing, 2026-07-23) ----
     # Three-tier checkout routing: in-chat charge (pivota_psp) > NATIVE HANDOFF
     # (the transaction completes on the merchant's OWN checkout — platform_native
