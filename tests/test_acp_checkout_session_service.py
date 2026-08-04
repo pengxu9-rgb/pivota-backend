@@ -2632,3 +2632,186 @@ async def test_resumed_claim_still_releases_on_a_definitive_decline(
     assert ei.value.code == "acp_capture_failed"
     row = await svc.peek_session(created.session_id)
     assert row["status"] == "ready_for_payment"  # released → new card, new key
+
+
+# =============================================================================
+# P1 PR-B — Stripe SharedPaymentToken (`spt_`) at the SESSION layer
+# =============================================================================
+# The session layer does not interpret an SPT at all: Stripe holds and enforces
+# its allowance, so there is nothing to look up and nothing to consume. What the
+# session layer OWES the SPT lane is what it owes every token — the stored,
+# attempt-scoped PSP key, unchanged on a replay. These tests pin both halves.
+
+SPT_TOKEN = "spt_test_granted_token_123"
+
+
+def _arm_spt_capture(monkeypatch, enabled=True):
+    monkeypatch.setattr(settings, "acp_spt_capture_enabled", enabled, raising=False)
+
+
+def _spy_capture_kwargs(monkeypatch, seen, *, outcomes=None):
+    """Record the FULL dispatch kwargs (token + key), not just the key."""
+    orig_execute = offpay.execute_acp_offsession_payment
+    scripted = list(outcomes or [])
+
+    async def spy(**kwargs):
+        seen.append(dict(kwargs))
+        if scripted:
+            return scripted.pop(0)
+        return await orig_execute(**kwargs)
+
+    monkeypatch.setattr(offpay, "execute_acp_offsession_payment", spy)
+
+
+async def test_spt_token_never_enters_the_allowance_registry(fake_quote, monkeypatch):
+    # An SPT is NOT a registry allowance. Even with the registry lane ARMED, an
+    # `spt_` must not be looked up: Stripe enforces its usage_limits, we have no
+    # record to check, and a registry miss must never become an `invalid_token`
+    # refusal for a token that is perfectly chargeable.
+    _arm_capture_lane(monkeypatch)
+    _arm_allowance_registry(monkeypatch, enabled=True)
+    _arm_spt_capture(monkeypatch)
+    _mock_order_layer(monkeypatch)
+    seen = _spy_get_allowance(monkeypatch)
+    created = await _create()
+
+    out = await svc.complete_session(
+        session_id=created.session_id, agent_context=_Ctx(), payment_token=SPT_TOKEN,
+    )
+    assert out["status"] == "completed"
+    assert seen == []  # zero registry lookups
+    assert svc._delegate_allowance_applies(SPT_TOKEN) is False
+
+
+async def test_spt_token_takes_no_registry_branch_in_either_flag_state(monkeypatch):
+    for registry_on in (True, False):
+        _arm_allowance_registry(monkeypatch, enabled=registry_on)
+        assert svc._delegate_allowance_applies(SPT_TOKEN) is False
+        assert svc._delegate_allowance_applies("pm_card_visa") is False
+        # …while a vt_ still does exactly what PR-A made it do.
+        assert svc._delegate_allowance_applies("vt_0123456789abcd") is registry_on
+
+
+async def test_spt_reaches_the_capture_with_the_stored_attempt_key(fake_quote, monkeypatch):
+    # The intake already accepts any string; this pins that an `spt_` survives
+    # complete_session untouched and arrives at the capture paired with the
+    # session's OWN attempt-scoped key (never the caller's idempotency key).
+    _arm_capture_lane(monkeypatch)
+    _arm_spt_capture(monkeypatch)
+    _mock_order_layer(monkeypatch)
+    seen: List[Any] = []
+    _spy_capture_kwargs(monkeypatch, seen)
+    created = await _create()
+
+    out = await svc.complete_session(
+        session_id=created.session_id, agent_context=_Ctx(),
+        payment_token=SPT_TOKEN, idempotency_key="caller_key_1",
+    )
+    assert out["status"] == "completed"
+    assert len(seen) == 1
+    assert seen[0]["payment_method_token"] == SPT_TOKEN
+    assert seen[0]["idempotency_key"] == f"acp_complete:{created.session_id}:a1"
+    assert seen[0]["idempotency_key"] != "caller_key_1"
+
+
+async def test_resumed_spt_capture_is_parameter_identical(fake_quote, monkeypatch):
+    # Resume doctrine, unchanged for SPT: an ambiguous failure HOLDS the claim
+    # and the stale resume replays the SAME key with the SAME token. An SPT has
+    # no registry binding, so there is no new divergence here — the replay
+    # simply forwards what it forwarded before, which is what makes Stripe's
+    # idempotent replay (rather than a second charge) the outcome.
+    _arm_capture_lane(monkeypatch)
+    _arm_spt_capture(monkeypatch)
+    _mock_order_layer(monkeypatch)
+    seen: List[Any] = []
+    _spy_capture_kwargs(monkeypatch, seen, outcomes=[_failed_outcome("stripe_error")])
+    created = await _create()
+
+    with pytest.raises(svc.AcpCheckoutSessionError) as ei:
+        await svc.complete_session(
+            session_id=created.session_id, agent_context=_Ctx(), payment_token=SPT_TOKEN,
+        )
+    assert ei.value.code == "acp_capture_pending_retry"
+    row = await svc.peek_session(created.session_id)
+    assert row["status"] == "completing"  # claim HELD
+
+    # Age the row so the stale-takeover path engages, then resume.
+    await database.execute(
+        acp_checkout_sessions.update()
+        .where(acp_checkout_sessions.c.id == created.session_id)
+        .values(updated_at=datetime.now(timezone.utc) - timedelta(seconds=120))
+    )
+    out = await svc.complete_session(
+        session_id=created.session_id, agent_context=_Ctx(), payment_token=SPT_TOKEN,
+    )
+    assert out["status"] == "completed"
+    assert len(seen) == 2
+    assert seen[0]["idempotency_key"] == seen[1]["idempotency_key"]
+    assert seen[0]["payment_method_token"] == seen[1]["payment_method_token"] == SPT_TOKEN
+
+
+async def test_resumed_spt_capture_ignores_a_swapped_token_like_any_other(
+    fake_quote, monkeypatch
+):
+    # A resume that already has an order replays the stored key regardless of
+    # what token rides in. SPT has no binding to rebind, so the caller's token
+    # is simply forwarded — the same thing that happens today for a `pm_`. What
+    # matters is the KEY, and the key is the stored one.
+    _arm_capture_lane(monkeypatch)
+    _arm_spt_capture(monkeypatch)
+    _mock_order_layer(monkeypatch)
+    seen: List[Any] = []
+    _spy_capture_kwargs(monkeypatch, seen)
+    created = await _create()
+    await _wedge_completing(created.session_id, order_id="ord_acp_1", attempt=1)
+
+    out = await svc.complete_session(
+        session_id=created.session_id, agent_context=_Ctx(),
+        payment_token="spt_a_completely_different_token",
+    )
+    assert out["status"] == "completed"
+    assert seen[0]["idempotency_key"] == f"acp_complete:{created.session_id}:a1"
+
+
+def test_spt_definitive_error_code_set_is_an_empty_placeholder():
+    # Stripe does not document its usage-limit violation codes, so the set is
+    # EMPTY by design and every SPT error stays AMBIGUOUS (claim held). It is
+    # wired into the classifier already, so populating it from the sandbox
+    # conformance run is a one-line DATA change, not a logic change.
+    assert svc._SPT_DEFINITIVE_ERROR_CODES == frozenset()
+    for plausible in (
+        "shared_payment_token_expired",
+        "shared_payment_token_already_used",
+        "amount_exceeds_allowance",
+        "currency_mismatch",
+        "some_undocumented_spt_code",
+    ):
+        assert not svc._capture_failure_is_definitive(_failed_outcome(plausible))
+    # And the empty set cannot widen the classifier for anything else either.
+    assert svc._capture_failure_is_definitive(_failed_outcome("card_declined"))
+    assert not svc._capture_failure_is_definitive(_failed_outcome("stripe_error"))
+
+
+async def test_unknown_spt_failure_holds_the_claim_for_replay(fake_quote, monkeypatch):
+    # The money-path consequence of the empty set: an undocumented SPT refusal
+    # does NOT release the claim, so the next attempt cannot mint a new PSP key
+    # and cannot double-charge. It converges by replaying the stored key.
+    _arm_capture_lane(monkeypatch)
+    _arm_spt_capture(monkeypatch)
+    _mock_order_layer(monkeypatch)
+    seen: List[Any] = []
+    _spy_capture_kwargs(
+        monkeypatch, seen, outcomes=[_failed_outcome("shared_payment_token_undocumented")],
+    )
+    created = await _create()
+
+    with pytest.raises(svc.AcpCheckoutSessionError) as ei:
+        await svc.complete_session(
+            session_id=created.session_id, agent_context=_Ctx(), payment_token=SPT_TOKEN,
+        )
+    assert ei.value.code == "acp_capture_pending_retry"
+    assert ei.value.status_code == 502
+    row = await svc.peek_session(created.session_id)
+    assert row["status"] == "completing"
+    assert row["capture_attempt"] == 1
+    assert row["psp_idempotency_key"] == f"acp_complete:{created.session_id}:a1"
