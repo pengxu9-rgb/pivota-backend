@@ -99,15 +99,21 @@ async def _apply_update(*, product_key: str, scope: str) -> None:
     )
 
 
-async def _run(args: argparse.Namespace) -> int:
-    if not getattr(database, "is_connected", False):
-        await database.connect()
+async def run_backfill(*, batch_size: int = 500, limit: int = 0,
+                       dry_run: bool = False) -> Dict[str, Any]:
+    """The classification loop, callable by BOTH the CLI and the D3 cron
+    (jobs/pdp_scope_backfill_cron). One implementation — a cron with its own
+    copy of this loop is the drift shape this workstream exists to remove.
 
+    Terminates because classify() never returns 'unverified': every processed
+    row leaves the WHERE pdp_scope='unverified' set (except in dry-run, which
+    stops after one batch for exactly that reason).
+    """
     total = 0
     counts: Dict[str, int] = {}
 
     while True:
-        rows = await _fetch_batch(args.batch_size)
+        rows = await _fetch_batch(batch_size)
         if not rows:
             break
         for row in rows:
@@ -119,23 +125,27 @@ async def _run(args: argparse.Namespace) -> int:
                 )
             )
             counts[scope] = counts.get(scope, 0) + 1
-            if not args.dry_run:
+            if not dry_run:
                 await _apply_update(product_key=row["product_key"], scope=scope)
             if total % 200 == 0:
                 logger.info("processed=%d running=%s", total, counts)
-        if args.limit and total >= args.limit:
+        if limit and total >= limit:
             break
-        if args.dry_run:
+        if dry_run:
             # Dry-run can't make progress; the WHERE pdp_scope='unverified'
             # filter would re-fetch the same rows. One batch is enough.
             break
 
-    logger.info(
-        "Backfill complete: total=%d distribution=%s dry_run=%s",
-        total,
-        counts,
-        args.dry_run,
-    )
+    return {"total": total, "distribution": counts, "dry_run": dry_run}
+
+
+async def _run(args: argparse.Namespace) -> int:
+    if not getattr(database, "is_connected", False):
+        await database.connect()
+
+    result = await run_backfill(batch_size=args.batch_size, limit=args.limit,
+                                dry_run=args.dry_run)
+    logger.info("Backfill complete: %s", result)
     return 0
 
 

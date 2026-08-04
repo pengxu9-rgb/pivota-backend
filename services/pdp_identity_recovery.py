@@ -1460,7 +1460,13 @@ async def _apply_external_seed_attachment(proposal: IdentityRecoveryProposal, *,
 CANONICAL_SCOPE_PREDICATE = """
             -- RULE 1: an agent-authored row is canonical BY INTENT, whatever
             -- today's seller count is. Interpolated, never retyped.
-            cp.category_label_source = '{label_source_enrichment}'
+            -- IS NOT DISTINCT FROM, not `=`: a NULL label must make this arm
+            -- FALSE, not NULL. Under the promotion writer's AND the difference
+            -- is invisible (neither promotes), but the P4 demotion selects with
+            -- NOT(predicate), and NOT(NULL) is NULL — every NULL-label row
+            -- would silently escape demotion. Found by the demotion suite
+            -- driving the real script against Postgres.
+            cp.category_label_source IS NOT DISTINCT FROM '{label_source_enrichment}'
 
             -- RULE 2: seller_count >= 2, spelled EXACTLY as
             -- services/pdp_scope_classifier defines it — "distinct merchants

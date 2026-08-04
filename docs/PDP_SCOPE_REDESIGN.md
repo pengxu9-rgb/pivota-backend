@@ -58,7 +58,7 @@ Measured lag cost today: zero rows.
 Already rebuilt from the classifier's definition, three reviews couldn't break
 it, gated in CI. Land after P1.
 
-### P3 — the backfill becomes the promotion path — THIS PR
+### P3 — the backfill becomes the promotion path — ✅ MERGED (#1676, 8a163645)
 Done as `own_merchant_seller_term_sql` in `services/pdp_scope_classifier` —
 ONE spelling, THREE writers: the recovery predicate, `backfill_pdp_scope.py`
 (the live defect: bucket + one seed = "2 sellers"), and
@@ -74,7 +74,24 @@ unifying it needs its own measurement.
 Cadence (D3) still undecided: the backfill remains manual. Until a cron runs
 it, a new genuinely-multi-seller mirror row stays `unverified`.
 
-### P4 — demotion backfill **[MEASURE FIRST — serving-visible]**
+### P4 — demotion backfill — MEASURED 2026-08-04, script in THIS PR
+
+| metric | measured |
+|---|---|
+| demotion set (whole bucket, rule-1 excluded, NULL-safe rule) | **2,201** |
+| sampled queries affected (37: top-20 brands, top-10 types, 8 generic) | 23 |
+| top-10 slots vacated | 164 (worst: `shampoo` 10/10, overlap 0) |
+| replacements (spot-checked `shampoo`/`serum`) | `merch_obs_*` observed-seller rows — correct attribution, same products |
+| Node market-filter recall lost | **0 of 2,201** (every row has a US-market seed) |
+
+`scripts/demote_unqualified_canonical_scopes.py`: dry-run by default,
+reversibility record of every previous value, CAS-guarded writes, selection
+interpolates `CANONICAL_SCOPE_PREDICATE` inside `NOT(...)` — one rule, one
+spelling. Execution against prod (`--apply`) is the remaining operator action.
+
+Original plan text follows.
+
+#### (original) **[MEASURE FIRST — serving-visible]**
 One-off pass over ALL canonical bucket rows (not just mirror-sourced — the 63
 recovery-promoted rows re-evaluate too): demote rows failing the corrected rule
 and not rule-1. ~3,182 rows each lose +200 and the Node market-filter
