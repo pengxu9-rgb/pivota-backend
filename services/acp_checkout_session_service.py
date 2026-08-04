@@ -1196,6 +1196,165 @@ async def _revert_claim_to_ready(session_id: str) -> None:
         )
 
 
+# --- delegated-token (`vt_`) allowance enforcement ---------------------------
+#
+# ACP delegated payment hands the business a single-use, amount-capped,
+# merchant-scoped token instead of a PSP token. We keep our OWN recorded view of
+# that allowance (services/acp_delegate_allowance_service — no card material of
+# any kind is stored) and enforce it here, fail-closed, IN ADDITION to whatever
+# the PSP enforces authoritatively.
+#
+# THE CHECK ORDER BELOW IS THE WIRE CONTRACT — DO NOT REORDER.
+#   1. invalid_token               — no allowance recorded for this token
+#   2. allowance_session_mismatch  — recorded for a different checkout session
+#   3. allowance_merchant_mismatch — recorded for a different merchant   (NEW)
+#   4. allowance_currency_mismatch — currency differs from the session's
+#   5. allowance_exceeded          — session total > max_amount
+#   6. allowance_expired           — the allowance's expires_at has passed (NEW)
+# The retired pivota-acp service's four 422s (1, 2, 4, 5) keep their RELATIVE
+# order and their message strings verbatim, because external platforms may have
+# coded against them: existence → session → currency → amount. The two
+# tightenings are inserted where they belong semantically — the merchant scope
+# right after the session scope (both are "who is this allowance for"), the
+# expiry appended last (it is the newest gap closed). All six are 422s in the
+# `{type, code, message, param}` envelope the route builds from `extra`.
+#
+# The gate is EXACTLY `startswith("vt_")`, wire parity: `pm_` (a real PSP
+# payment method) and a future `spt_` (Stripe SharedPaymentToken) never reach
+# the registry, in either flag state.
+_ALLOWANCE_TOKEN_PARAM = "payment_data.token"
+
+
+def _allowance_error(message: str, *, code: str, param: str) -> "AcpCheckoutSessionError":
+    return AcpCheckoutSessionError(
+        message, code=code, status_code=422, extra={"param": param}
+    )
+
+
+async def _enforce_delegate_allowance(
+    session: Dict[str, Any], payment_token: Optional[str]
+) -> None:
+    """Pre-claim allowance enforcement for a `vt_` delegate token (checks 1–6
+    above). Raises a 422 AcpCheckoutSessionError on any refusal, with ZERO side
+    effects — nothing has been claimed, ordered or charged when this runs.
+
+    Amount and currency are compared against the SERVER-SIDE session values
+    only; a caller-supplied amount is never an input to a cap.
+    """
+    from services import acp_delegate_allowance_service as allowances
+
+    try:
+        allowance = await allowances.get_allowance(str(payment_token))
+    except allowances.AcpDelegateAllowanceError as exc:
+        # A registry we cannot read is a named 503, never a silent pass: an
+        # unverifiable allowance must not become a charge.
+        raise AcpCheckoutSessionError(
+            exc.message, code=exc.code, status_code=exc.status_code or 503
+        ) from exc
+
+    # 1. existence — an unknown token REFUSES. We do not charge a delegated
+    #    token whose allowance we cannot verify (design Q2, founder-confirmed).
+    if not allowance:
+        raise _allowance_error(
+            "delegate token not found",
+            code="invalid_token",
+            param=_ALLOWANCE_TOKEN_PARAM,
+        )
+
+    sid = str(session.get("id") or "")
+    # 2. session scope
+    if str(allowance.get("checkout_session_id") or "") != sid:
+        raise _allowance_error(
+            "delegate token not authorized for this session",
+            code="allowance_session_mismatch",
+            param="allowance.checkout_session_id",
+        )
+
+    # 3. merchant scope (NEW — the retired service never checked this, so a
+    #    token minted for merchant A was spendable at merchant B).
+    if str(allowance.get("merchant_id") or "") != str(session.get("merchant_id") or ""):
+        raise _allowance_error(
+            "delegate token not authorized for this merchant",
+            code="allowance_merchant_mismatch",
+            param="allowance.merchant_id",
+        )
+
+    # 4. currency — case-insensitive on BOTH sides. A session with no recorded
+    #    currency cannot be verified against the allowance, so it refuses too
+    #    (fail-closed: an unverifiable comparison is not a passing one).
+    session_currency = str(session.get("currency") or "").strip().lower()
+    allowance_currency = str(allowance.get("currency") or "").strip().lower()
+    if not session_currency or session_currency != allowance_currency:
+        raise _allowance_error(
+            "currency mismatch",
+            code="allowance_currency_mismatch",
+            param="allowance.currency",
+        )
+
+    # 5. amount — SERVER-SIDE session total vs the cap, in minor units.
+    #    Equality PASSES (wire parity: the refusal is `total > max_amount`). A
+    #    session with no recorded total is unverifiable → refuse.
+    max_amount = allowance.get("max_amount")
+    total_cents = session.get("total_cents")
+    try:
+        total_cents = int(total_cents) if total_cents is not None else None
+    except (TypeError, ValueError):
+        total_cents = None
+    if max_amount is None or total_cents is None or total_cents > int(max_amount):
+        raise _allowance_error(
+            "total exceeds allowance",
+            code="allowance_exceeded",
+            param="allowance.max_amount",
+        )
+
+    # 6. expiry (NEW — the retired service stored expires_at and never read it).
+    expires_at = allowance.get("expires_at")
+    if expires_at is None or expires_at <= _now_utc():
+        raise _allowance_error(
+            "delegate token allowance expired",
+            code="allowance_expired",
+            param="allowance.expires_at",
+        )
+
+
+async def _bind_delegate_allowance(session_id: str, payment_token: Optional[str]) -> None:
+    """Consume the allowance for THIS session (the single-use CAS), at claim
+    time and before any order/charge work.
+
+    Idempotent for the same session by construction, so a retry or a stale
+    resume of this session's own attempt can never be refused by its own earlier
+    bind. A token already bound to a DIFFERENT session refuses."""
+    from services import acp_delegate_allowance_service as allowances
+
+    try:
+        bound = await allowances.bind_allowance_to_session(
+            token_id=str(payment_token), session_id=session_id
+        )
+    except allowances.AcpDelegateAllowanceError as exc:
+        raise AcpCheckoutSessionError(
+            exc.message, code=exc.code, status_code=exc.status_code or 503
+        ) from exc
+    if not bound:
+        raise _allowance_error(
+            "delegate token has already been used",
+            code="allowance_already_used",
+            param=_ALLOWANCE_TOKEN_PARAM,
+        )
+
+
+def _delegate_allowance_applies(payment_token: Optional[str]) -> bool:
+    """True only when the registry lane is armed AND the token is a `vt_`
+    delegate token. Flag OFF ⇒ a `vt_` token behaves exactly as it does today
+    (no registry lookup at all; it dies at capture, where the Stripe adapter
+    refuses a non-`pm_` on the live lane and substitutes the test PM on the test
+    lane). `pm_`/`spt_` never take this branch in either flag state."""
+    if not getattr(settings, "acp_delegate_allowance_registry_enabled", False):
+        return False
+    from services.acp_delegate_allowance_service import is_delegate_token
+
+    return is_delegate_token(payment_token)
+
+
 async def _persist_order_id(session_id: str, order_id: str) -> None:
     """Record the created order on the row BEFORE the charge. NOT best-effort:
     charging an order we could not durably record would let a retry mint a
@@ -1258,6 +1417,13 @@ async def complete_session(
       email anywhere → `acp_email_required` (400), both decided BEFORE the claim
       (zero side effects). Neither is defaulted: an order shipped to an invented
       address, or attributed to an invented buyer, is worse than a refusal.
+    - a `vt_` delegated token (and only then, and only while
+      ACP_DELEGATE_ALLOWANCE_REGISTRY_ENABLED is on) is checked against the
+      recorded allowance BEFORE the claim, in the contract order
+      `invalid_token` → `allowance_session_mismatch` →
+      `allowance_merchant_mismatch` → `allowance_currency_mismatch` →
+      `allowance_exceeded` → `allowance_expired` (all 422, zero side effects),
+      then consumed single-use at claim time → `allowance_already_used` (422).
     - a concurrent in-flight completion → `completion_in_progress` (409).
     - kill-switch block / over-cap → the gate chain's own HTTPException(403)
       propagates untouched (as_error_detail shape — dark stays dark).
@@ -1364,6 +1530,21 @@ async def complete_session(
         _require_fulfillment_address(session)
         _require_customer_email(session)
 
+        # Delegated-token allowance, checked here for the same two reasons the
+        # fulfillment identity is: it belongs AFTER the kill-switch pre-gate and
+        # the identity checks (a dark lane and a wrong agent must still refuse
+        # first — an allowance error must never become an oracle for a lane that
+        # is supposed to be dark), and BEFORE the claim so every refusal has
+        # zero side effects. Scoped to a FRESH completion for the same reason as
+        # the address/email checks: the only other status reachable here is
+        # `completing`, an attempt that may ALREADY have charged under the
+        # stored PSP key — refusing that one would strand real money without
+        # preventing anything, since a resume replays the stored key rather than
+        # minting a new charge. The single-use CAS bind below still runs on a
+        # resume (idempotently for its own session).
+        if _delegate_allowance_applies(payment_token):
+            await _enforce_delegate_allowance(session, payment_token)
+
     # CLAIM BEFORE CHARGE: exactly one completion attempt may proceed. The
     # winning UPDATE also mints and STORES this attempt's PSP idempotency key.
     claim = await _claim_session(sid, idempotency_key)
@@ -1425,6 +1606,16 @@ async def complete_session(
     )
 
     try:
+        # SINGLE-USE CONSUMPTION, at claim time and before ANY order or charge
+        # work: the claim we hold is the thing a bound token is bound to. A
+        # refusal here means another session already spent this token — and
+        # because we are still pre-dispatch, the `except BaseException` below
+        # releases a FRESH claim (a RESUMED claim is held per review B1, and its
+        # rebind cannot refuse its own session anyway: the CAS matches on
+        # `used_by_session = :session_id`).
+        if _delegate_allowance_applies(payment_token):
+            await _bind_delegate_allowance(sid, payment_token)
+
         order_id = str(session.get("order_id") or "").strip()
         quote_currency: Optional[str] = None
         if not order_id:

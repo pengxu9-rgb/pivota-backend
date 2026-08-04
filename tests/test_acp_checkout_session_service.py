@@ -22,8 +22,10 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 os.environ.setdefault("DATABASE_URL", "sqlite:///:memory:")
 
 from db.acp_checkout_sessions import acp_checkout_sessions  # noqa: E402
+from db.acp_delegate_allowances import acp_delegate_allowances  # noqa: E402
 from db.database import database, engine, metadata  # noqa: E402
 from services import acp_checkout_session_service as svc  # noqa: E402
+from services import acp_delegate_allowance_service as reg  # noqa: E402
 from services import acp_offsession_payment as offpay  # noqa: E402
 from config.settings import settings  # noqa: E402
 
@@ -81,7 +83,9 @@ async def _db():
     # psp_idempotency_key): create_all is checkfirst-only and will not add them
     # to a pivota_test.db an older build already created.
     await svc._ensure_acp_checkout_sessions_table()
+    await reg._ensure_acp_delegate_allowances_table()
     await database.execute(acp_checkout_sessions.delete())
+    await database.execute(acp_delegate_allowances.delete())
     _FakeQuoteService.calls = []
     _FakeQuoteService.quote = _FAKE_QUOTE
     _FakeQuoteService.raises = None
@@ -1589,3 +1593,582 @@ async def test_explicit_address_name_is_preserved_over_buyer_name(fake_quote, mo
     )
     assert out["status"] == "completed"
     assert seen["name"] == "Real Buyer"  # the address's own name wins
+
+
+# =============================================================================
+# Delegated-token (`vt_`) allowance enforcement — PR-A of the P1 design.
+#
+# The gate is EXACTLY `startswith("vt_")` and the whole lane sits behind
+# ACP_DELEGATE_ALLOWANCE_REGISTRY_ENABLED (default OFF). The six pre-claim
+# checks run in a CONTRACT order (existence → session → merchant → currency →
+# amount → expiry) and every refusal is a 422 with a `param`, decided BEFORE the
+# claim so nothing is ordered or charged. Consumption is a single-use CAS taken
+# at claim time.
+# =============================================================================
+
+
+def _arm_allowance_registry(monkeypatch, enabled=True):
+    monkeypatch.setattr(
+        settings, "acp_delegate_allowance_registry_enabled", enabled, raising=False
+    )
+
+
+async def _mint_allowance(**overrides):
+    """An allowance that MATCHES the session the tests create: 4599 USD (the
+    fake quote's total), merchant merch_x."""
+    kwargs = dict(
+        merchant_id="merch_x",
+        max_amount=4599,
+        currency="USD",
+        expires_at=datetime.now(timezone.utc) + timedelta(seconds=900),
+    )
+    kwargs.update(overrides)
+    return await reg.mint_allowance(**kwargs)
+
+
+async def _force_expiry(token_id, when):
+    await database.execute(
+        acp_delegate_allowances.update()
+        .where(acp_delegate_allowances.c.token_id == token_id)
+        .values(expires_at=when)
+    )
+
+
+def _spy_get_allowance(monkeypatch):
+    """Record every registry lookup, so a lane that must not consult the
+    registry at all can be pinned as such."""
+    seen: List[Any] = []
+    real = reg.get_allowance
+
+    async def spy(token_id):
+        seen.append(token_id)
+        return await real(token_id)
+
+    monkeypatch.setattr(reg, "get_allowance", spy)
+    return seen
+
+
+# --- flag OFF preserves today's behavior byte-for-byte -----------------------
+
+
+async def test_flag_off_never_touches_the_registry_for_a_vt_token(fake_quote, monkeypatch):
+    # Default posture: a vt_ token is not looked up at all. It behaves exactly as
+    # it does today — it reaches capture, where the test lane substitutes the
+    # test PM (and the live lane refuses it). PR-B changes what happens there;
+    # this pins what happens BEFORE that change.
+    _arm_capture_lane(monkeypatch)
+    _arm_allowance_registry(monkeypatch, enabled=False)
+    _mock_order_layer(monkeypatch)
+    seen = _spy_get_allowance(monkeypatch)
+    created = await _create()
+
+    out = await svc.complete_session(
+        session_id=created.session_id, agent_context=_Ctx(), payment_token="vt_unknown0000",
+    )
+    assert out["status"] == "completed"
+    assert seen == []  # no registry lookup happened at all
+
+
+async def test_flag_off_does_not_consume_an_allowance(fake_quote, monkeypatch):
+    _arm_capture_lane(monkeypatch)
+    _arm_allowance_registry(monkeypatch, enabled=False)
+    _mock_order_layer(monkeypatch)
+    minted = await _mint_allowance(checkout_session_id="csn_placeholder")
+    created = await _create()
+    await svc.complete_session(
+        session_id=created.session_id, agent_context=_Ctx(),
+        payment_token=minted["token_id"],
+    )
+    stored = await reg.get_allowance(minted["token_id"])
+    assert stored["used"] is False  # the CAS never ran
+
+
+# --- flag ON: the six pre-claim checks, in contract order --------------------
+
+
+async def test_unknown_vt_token_is_invalid_token_422(fake_quote, monkeypatch):
+    # Founder-confirmed (design Q2): a vt_ we have no record of REFUSES. We
+    # never charge a delegated token whose allowance we cannot verify.
+    _arm_capture_lane(monkeypatch)
+    _arm_allowance_registry(monkeypatch)
+    calls = _mock_order_layer(monkeypatch)
+    created = await _create()
+
+    with pytest.raises(svc.AcpCheckoutSessionError) as ei:
+        await svc.complete_session(
+            session_id=created.session_id, agent_context=_Ctx(),
+            payment_token="vt_00000000000000",
+        )
+    assert ei.value.code == "invalid_token"
+    assert ei.value.status_code == 422
+    assert ei.value.message == "delegate token not found"  # verbatim wire parity
+    assert ei.value.extra["param"] == "payment_data.token"
+    # Pre-claim: zero side effects.
+    assert (calls["order_create"], calls["capture"], calls["settle"]) == (0, 0, 0)
+    assert (await svc.peek_session(created.session_id))["status"] == "ready_for_payment"
+
+
+async def test_allowance_for_another_session_is_session_mismatch_422(fake_quote, monkeypatch):
+    _arm_capture_lane(monkeypatch)
+    _arm_allowance_registry(monkeypatch)
+    calls = _mock_order_layer(monkeypatch)
+    created = await _create()
+    minted = await _mint_allowance(checkout_session_id="csn_some_other_one")
+
+    with pytest.raises(svc.AcpCheckoutSessionError) as ei:
+        await svc.complete_session(
+            session_id=created.session_id, agent_context=_Ctx(),
+            payment_token=minted["token_id"],
+        )
+    assert ei.value.code == "allowance_session_mismatch"
+    assert ei.value.status_code == 422
+    assert ei.value.message == "delegate token not authorized for this session"
+    assert ei.value.extra["param"] == "allowance.checkout_session_id"
+    assert (calls["order_create"], calls["capture"]) == (0, 0)
+    # A refused allowance is NOT consumed.
+    assert (await reg.get_allowance(minted["token_id"]))["used"] is False
+
+
+async def test_allowance_for_another_merchant_is_merchant_mismatch_422(fake_quote, monkeypatch):
+    # NEW tightening: the retired service never checked merchant scope, so a
+    # token minted for merchant A was spendable at merchant B.
+    _arm_capture_lane(monkeypatch)
+    _arm_allowance_registry(monkeypatch)
+    calls = _mock_order_layer(monkeypatch)
+    created = await _create()
+    minted = await _mint_allowance(
+        checkout_session_id=created.session_id, merchant_id="merch_someone_else"
+    )
+
+    with pytest.raises(svc.AcpCheckoutSessionError) as ei:
+        await svc.complete_session(
+            session_id=created.session_id, agent_context=_Ctx(),
+            payment_token=minted["token_id"],
+        )
+    assert ei.value.code == "allowance_merchant_mismatch"
+    assert ei.value.status_code == 422
+    assert ei.value.extra["param"] == "allowance.merchant_id"
+    assert (calls["order_create"], calls["capture"]) == (0, 0)
+
+
+async def test_currency_mismatch_is_422(fake_quote, monkeypatch):
+    _arm_capture_lane(monkeypatch)
+    _arm_allowance_registry(monkeypatch)
+    calls = _mock_order_layer(monkeypatch)
+    created = await _create()
+    minted = await _mint_allowance(
+        checkout_session_id=created.session_id, currency="EUR"
+    )
+
+    with pytest.raises(svc.AcpCheckoutSessionError) as ei:
+        await svc.complete_session(
+            session_id=created.session_id, agent_context=_Ctx(),
+            payment_token=minted["token_id"],
+        )
+    assert ei.value.code == "allowance_currency_mismatch"
+    assert ei.value.status_code == 422
+    assert ei.value.message == "currency mismatch"
+    assert ei.value.extra["param"] == "allowance.currency"
+    assert (calls["order_create"], calls["capture"]) == (0, 0)
+
+
+async def test_currency_comparison_is_case_insensitive_on_both_sides(fake_quote, monkeypatch):
+    # The session records "USD"; a lowercase allowance currency is the SAME
+    # currency, not a mismatch.
+    _arm_capture_lane(monkeypatch)
+    _arm_allowance_registry(monkeypatch)
+    _mock_order_layer(monkeypatch)
+    created = await _create()
+    minted = await _mint_allowance(
+        checkout_session_id=created.session_id, currency="usd"
+    )
+    out = await svc.complete_session(
+        session_id=created.session_id, agent_context=_Ctx(),
+        payment_token=minted["token_id"],
+    )
+    assert out["status"] == "completed"
+
+
+async def test_total_over_allowance_is_allowance_exceeded_422(fake_quote, monkeypatch):
+    _arm_capture_lane(monkeypatch)
+    _arm_allowance_registry(monkeypatch)
+    calls = _mock_order_layer(monkeypatch)
+    created = await _create()  # session total is 4599 cents
+    minted = await _mint_allowance(
+        checkout_session_id=created.session_id, max_amount=4598
+    )
+
+    with pytest.raises(svc.AcpCheckoutSessionError) as ei:
+        await svc.complete_session(
+            session_id=created.session_id, agent_context=_Ctx(),
+            payment_token=minted["token_id"],
+        )
+    assert ei.value.code == "allowance_exceeded"
+    assert ei.value.status_code == 422
+    assert ei.value.message == "total exceeds allowance"
+    assert ei.value.extra["param"] == "allowance.max_amount"
+    assert (calls["order_create"], calls["capture"]) == (0, 0)
+
+
+async def test_total_exactly_equal_to_the_allowance_passes(fake_quote, monkeypatch):
+    # Wire parity: the refusal is `total > max_amount`, so equality PASSES.
+    _arm_capture_lane(monkeypatch)
+    _arm_allowance_registry(monkeypatch)
+    _mock_order_layer(monkeypatch)
+    created = await _create()
+    minted = await _mint_allowance(
+        checkout_session_id=created.session_id, max_amount=4599
+    )
+    out = await svc.complete_session(
+        session_id=created.session_id, agent_context=_Ctx(),
+        payment_token=minted["token_id"],
+    )
+    assert out["status"] == "completed"
+
+
+async def test_expired_allowance_is_422(fake_quote, monkeypatch):
+    # NEW tightening: the retired service stored expires_at and never read it.
+    _arm_capture_lane(monkeypatch)
+    _arm_allowance_registry(monkeypatch)
+    calls = _mock_order_layer(monkeypatch)
+    created = await _create()
+    minted = await _mint_allowance(checkout_session_id=created.session_id)
+    await _force_expiry(
+        minted["token_id"], datetime.now(timezone.utc) - timedelta(seconds=1)
+    )
+
+    with pytest.raises(svc.AcpCheckoutSessionError) as ei:
+        await svc.complete_session(
+            session_id=created.session_id, agent_context=_Ctx(),
+            payment_token=minted["token_id"],
+        )
+    assert ei.value.code == "allowance_expired"
+    assert ei.value.status_code == 422
+    assert ei.value.extra["param"] == "allowance.expires_at"
+    assert (calls["order_create"], calls["capture"]) == (0, 0)
+    # Still unconsumed — an expired token was never spent.
+    assert (await reg.get_allowance(minted["token_id"]))["used"] is False
+
+
+# --- the check ORDER is the contract -----------------------------------------
+
+
+async def test_check_order_session_beats_merchant_currency_amount_and_expiry(
+    fake_quote, monkeypatch
+):
+    # An allowance wrong in EVERY dimension reports the FIRST failing check in
+    # contract order, not the most severe one.
+    _arm_capture_lane(monkeypatch)
+    _arm_allowance_registry(monkeypatch)
+    _mock_order_layer(monkeypatch)
+    created = await _create()
+    minted = await _mint_allowance(
+        checkout_session_id="csn_other",
+        merchant_id="merch_other",
+        currency="EUR",
+        max_amount=1,
+    )
+    await _force_expiry(
+        minted["token_id"], datetime.now(timezone.utc) - timedelta(seconds=1)
+    )
+    with pytest.raises(svc.AcpCheckoutSessionError) as ei:
+        await svc.complete_session(
+            session_id=created.session_id, agent_context=_Ctx(),
+            payment_token=minted["token_id"],
+        )
+    assert ei.value.code == "allowance_session_mismatch"
+
+
+async def test_check_order_merchant_beats_currency_amount_and_expiry(fake_quote, monkeypatch):
+    _arm_capture_lane(monkeypatch)
+    _arm_allowance_registry(monkeypatch)
+    _mock_order_layer(monkeypatch)
+    created = await _create()
+    minted = await _mint_allowance(
+        checkout_session_id=created.session_id,
+        merchant_id="merch_other",
+        currency="EUR",
+        max_amount=1,
+    )
+    with pytest.raises(svc.AcpCheckoutSessionError) as ei:
+        await svc.complete_session(
+            session_id=created.session_id, agent_context=_Ctx(),
+            payment_token=minted["token_id"],
+        )
+    assert ei.value.code == "allowance_merchant_mismatch"
+
+
+async def test_check_order_currency_beats_amount_and_expiry(fake_quote, monkeypatch):
+    # The retired service's relative order (currency BEFORE amount) is preserved.
+    _arm_capture_lane(monkeypatch)
+    _arm_allowance_registry(monkeypatch)
+    _mock_order_layer(monkeypatch)
+    created = await _create()
+    minted = await _mint_allowance(
+        checkout_session_id=created.session_id, currency="EUR", max_amount=1
+    )
+    await _force_expiry(
+        minted["token_id"], datetime.now(timezone.utc) - timedelta(seconds=1)
+    )
+    with pytest.raises(svc.AcpCheckoutSessionError) as ei:
+        await svc.complete_session(
+            session_id=created.session_id, agent_context=_Ctx(),
+            payment_token=minted["token_id"],
+        )
+    assert ei.value.code == "allowance_currency_mismatch"
+
+
+async def test_check_order_amount_beats_expiry(fake_quote, monkeypatch):
+    _arm_capture_lane(monkeypatch)
+    _arm_allowance_registry(monkeypatch)
+    _mock_order_layer(monkeypatch)
+    created = await _create()
+    minted = await _mint_allowance(
+        checkout_session_id=created.session_id, max_amount=1
+    )
+    await _force_expiry(
+        minted["token_id"], datetime.now(timezone.utc) - timedelta(seconds=1)
+    )
+    with pytest.raises(svc.AcpCheckoutSessionError) as ei:
+        await svc.complete_session(
+            session_id=created.session_id, agent_context=_Ctx(),
+            payment_token=minted["token_id"],
+        )
+    assert ei.value.code == "allowance_exceeded"
+
+
+# --- no-oracle ordering: an allowance error never precedes a lane refusal ----
+
+
+async def test_dark_kill_switch_beats_invalid_token(fake_quote, monkeypatch):
+    # A dark lane must stay dark: an unknown-token 422 would tell a caller the
+    # completion path is live and merely mis-tokened.
+    from fastapi import HTTPException
+
+    _arm_capture_lane(monkeypatch, submit=False)
+    _arm_allowance_registry(monkeypatch)
+    seen = _spy_get_allowance(monkeypatch)
+    created = await _create()
+    with pytest.raises(HTTPException) as ei:
+        await svc.complete_session(
+            session_id=created.session_id, agent_context=_Ctx(),
+            payment_token="vt_00000000000000",
+        )
+    assert ei.value.status_code == 403
+    assert ei.value.detail["error"] == "TIER2_CHARGE_DISABLED"
+    assert seen == []  # the registry was never even consulted
+
+
+async def test_agent_mismatch_beats_invalid_token(fake_quote, monkeypatch):
+    _arm_capture_lane(monkeypatch)
+    _arm_allowance_registry(monkeypatch)
+    seen = _spy_get_allowance(monkeypatch)
+    created = await _create()
+
+    class _CtxA:
+        agent_id = "agent_a"
+
+        def can_access_merchant(self, merchant_id):
+            return True
+
+    with pytest.raises(svc.AcpCheckoutSessionError) as ei:
+        await svc.complete_session(
+            session_id=created.session_id, agent_context=_CtxA(),
+            payment_token="vt_00000000000000",
+        )
+    assert ei.value.code == "acp_agent_mismatch"
+    assert seen == []
+
+
+async def test_address_refusal_beats_invalid_token(fake_quote, monkeypatch):
+    # Fulfillment identity is checked before the allowance — both are pre-claim,
+    # so the ordering is only about which refusal a caller sees first, and the
+    # established one wins.
+    _arm_capture_lane(monkeypatch)
+    _arm_allowance_registry(monkeypatch)
+    created = await _create()
+    await _strip(created.session_id, fulfillment_address=None)
+    with pytest.raises(svc.AcpCheckoutSessionError) as ei:
+        await svc.complete_session(
+            session_id=created.session_id, agent_context=_Ctx(),
+            payment_token="vt_00000000000000",
+        )
+    assert ei.value.code == "acp_address_required"
+
+
+# --- single-use consumption at claim time ------------------------------------
+
+
+async def test_a_valid_vt_token_is_consumed_by_the_completing_session(
+    fake_quote, monkeypatch
+):
+    _arm_capture_lane(monkeypatch)
+    _arm_allowance_registry(monkeypatch)
+    _mock_order_layer(monkeypatch)
+    created = await _create()
+    minted = await _mint_allowance(checkout_session_id=created.session_id)
+
+    out = await svc.complete_session(
+        session_id=created.session_id, agent_context=_Ctx(),
+        payment_token=minted["token_id"],
+    )
+    assert out["status"] == "completed"
+    stored = await reg.get_allowance(minted["token_id"])
+    assert stored["used"] is True
+    assert stored["used_by_session"] == created.session_id
+    assert stored["used_at"] is not None
+
+
+async def test_a_token_bound_to_another_session_refuses_and_releases_the_fresh_claim(
+    fake_quote, monkeypatch
+):
+    # The bind happens on a FRESH claim, pre-dispatch: refusing must hand the
+    # session back (status ready_for_payment) rather than wedge it.
+    _arm_capture_lane(monkeypatch)
+    _arm_allowance_registry(monkeypatch)
+    calls = _mock_order_layer(monkeypatch)
+    created = await _create()
+    minted = await _mint_allowance(checkout_session_id=created.session_id)
+    # Someone else already spent it.
+    assert await reg.bind_allowance_to_session(
+        token_id=minted["token_id"], session_id="csn_thief"
+    ) is True
+
+    with pytest.raises(svc.AcpCheckoutSessionError) as ei:
+        await svc.complete_session(
+            session_id=created.session_id, agent_context=_Ctx(),
+            payment_token=minted["token_id"],
+        )
+    assert ei.value.code == "allowance_already_used"
+    assert ei.value.status_code == 422
+    assert ei.value.extra["param"] == "payment_data.token"
+    # Bound at claim time, BEFORE any order/charge work.
+    assert (calls["order_create"], calls["capture"], calls["settle"]) == (0, 0, 0)
+    # The fresh claim was released.
+    assert (await svc.peek_session(created.session_id))["status"] == "ready_for_payment"
+    # ...and the thief still holds the token.
+    assert (await reg.get_allowance(minted["token_id"]))["used_by_session"] == "csn_thief"
+
+
+async def test_a_resumed_claim_cannot_be_refused_by_its_own_bind(fake_quote, monkeypatch):
+    # The wedge test (review B1): a session that already bound its token and
+    # then hit an ambiguous failure MUST be able to resume. If the CAS refused a
+    # re-bind by the same session, the resume would 422 forever while a charge
+    # sat in flight under the stored PSP key.
+    _arm_capture_lane(monkeypatch)
+    _arm_allowance_registry(monkeypatch)
+    _mock_order_layer(monkeypatch)
+    created = await _create()
+    minted = await _mint_allowance(checkout_session_id=created.session_id)
+    assert await reg.bind_allowance_to_session(
+        token_id=minted["token_id"], session_id=created.session_id
+    ) is True
+    # A stale `completing` row is exactly what an ambiguous failure leaves.
+    await _wedge_completing(created.session_id, order_id="ord_acp_1")
+
+    out = await svc.complete_session(
+        session_id=created.session_id, agent_context=_Ctx(),
+        payment_token=minted["token_id"],
+    )
+    assert out["status"] == "completed"
+    assert (await reg.get_allowance(minted["token_id"]))["used_by_session"] == (
+        created.session_id
+    )
+
+
+async def test_two_concurrent_sessions_presenting_one_token_only_its_own_completes(
+    fake_quote, monkeypatch
+):
+    # Layered defense, end to end: the SESSION-scope check separates the two
+    # racers pre-claim (the outer layer), and the CAS is the backstop for
+    # anything that ever gets past it — its own single-flight behavior is pinned
+    # in tests/test_acp_delegate_allowance_service.py (asyncio.gather) and on the
+    # production dialect in tests/test_acp_delegate_allowances_postgres.py.
+    import asyncio
+
+    _arm_capture_lane(monkeypatch)
+    _arm_allowance_registry(monkeypatch)
+    _mock_order_layer(monkeypatch)
+    a = await _create()
+    b = await _create()
+    minted = await _mint_allowance(checkout_session_id=a.session_id)
+
+    ok, refused = await asyncio.gather(
+        svc.complete_session(
+            session_id=a.session_id, agent_context=_Ctx(),
+            payment_token=minted["token_id"],
+        ),
+        svc.complete_session(
+            session_id=b.session_id, agent_context=_Ctx(),
+            payment_token=minted["token_id"],
+        ),
+        return_exceptions=True,
+    )
+    assert isinstance(ok, dict) and ok["status"] == "completed"
+    assert isinstance(refused, svc.AcpCheckoutSessionError)
+    # B is refused by the SESSION scope check (pre-claim) — the earlier gate.
+    assert refused.code == "allowance_session_mismatch"
+
+
+# --- pm_ tokens are untouched in both flag states ----------------------------
+
+
+async def test_pm_token_never_consults_the_registry_with_the_flag_on(
+    fake_quote, monkeypatch
+):
+    _arm_capture_lane(monkeypatch)
+    _arm_allowance_registry(monkeypatch)
+    _mock_order_layer(monkeypatch)
+    seen = _spy_get_allowance(monkeypatch)
+    created = await _create()
+    out = await svc.complete_session(
+        session_id=created.session_id, agent_context=_Ctx(),
+        payment_token="pm_card_visa",
+    )
+    assert out["status"] == "completed"
+    assert seen == []
+
+
+async def test_a_future_spt_token_is_not_a_delegate_token(fake_quote, monkeypatch):
+    # The gate is EXACTLY startswith("vt_"): `spt_` gets its own lane in PR-B and
+    # must not be swept into the registry now.
+    _arm_capture_lane(monkeypatch)
+    _arm_allowance_registry(monkeypatch)
+    _mock_order_layer(monkeypatch)
+    seen = _spy_get_allowance(monkeypatch)
+    created = await _create()
+    out = await svc.complete_session(
+        session_id=created.session_id, agent_context=_Ctx(),
+        payment_token="spt_something",
+    )
+    assert out["status"] == "completed"
+    assert seen == []
+
+
+# --- what a VALID vt_ does today (the line PR-B moves) -----------------------
+
+
+async def test_valid_vt_token_completes_via_the_test_pm_today(fake_quote, monkeypatch):
+    # A vt_ that passes every allowance check still reaches capture, where TODAY
+    # the Stripe adapter substitutes the test PM on the test lane (and would
+    # refuse it on the live lane). That is correct for PR-A: the registry decides
+    # whether the token MAY be spent, not how it is charged. PR-B replaces this
+    # substitution with a real spt_ charge — pinned here so that change is
+    # visible in the diff instead of silent.
+    from services.acp_offsession_capture import DEFAULT_TEST_PAYMENT_METHOD
+
+    _arm_capture_lane(monkeypatch)
+    _arm_allowance_registry(monkeypatch)
+    calls = _mock_order_layer(monkeypatch)
+    created = await _create()
+    minted = await _mint_allowance(checkout_session_id=created.session_id)
+
+    out = await svc.complete_session(
+        session_id=created.session_id, agent_context=_Ctx(),
+        payment_token=minted["token_id"],
+    )
+    assert out["status"] == "completed"
+    # The vt_ token is what the capture layer was handed...
+    assert calls["capture_kwargs"]["payment_method_token"] == minted["token_id"]
+    # ...and the test-lane adapter is what turns a non-pm_ into the test PM.
+    assert DEFAULT_TEST_PAYMENT_METHOD == "pm_card_visa"
