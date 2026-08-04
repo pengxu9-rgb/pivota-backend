@@ -421,6 +421,10 @@ def test_the_cron_rule_is_the_predicate_not_a_copy_or_a_loop():
         "outer write-time re-check — EvalPlanQual re-evaluates only the outer "
         "quals, so a subselect-only gate does not survive a concurrent "
         "suppression (PR #1680 round-11 finding)")
+    assert cron._PROMOTE_SQL.count("pdp_scope = 'unverified'") == 2, (
+        "the pdp_scope gate must ALSO appear in both places — round-12 drove "
+        "its outer removal surviving every driven test (the suppressed_at "
+        "race test cannot see this qual), so the pin is the only guard")
     src = inspect.getsource(cron)
     assert "from scripts.backfill_pdp_scope import" not in src, (
         "the cron must not import the one-shot classify() loop (F1)")
