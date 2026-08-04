@@ -11,7 +11,7 @@ from types import SimpleNamespace
 
 from fastapi import APIRouter, Depends, HTTPException, BackgroundTasks, Header
 from pydantic import BaseModel, Field
-from typing import Awaitable, Callable, Optional, Dict, Any, List, TypeVar
+from typing import Optional, Dict, Any, List
 from decimal import Decimal
 from datetime import datetime, timedelta, timezone
 
@@ -33,6 +33,7 @@ from services.merchant_psp_config_service import (
     fetch_active_runtime_merchant_psp,
 )
 from db.database import database
+from utils.db_retry import with_asyncpg_busy_retry
 from utils.logger import logger
 from utils.transient_errors import db_busy_http_exception, is_asyncpg_busy_error
 
@@ -45,43 +46,12 @@ AGENT_PAYMENT_INITIATION_TIMEOUT_SECONDS = max(
     ),
 )
 
-_T = TypeVar("_T")
-
-
-async def _with_asyncpg_busy_retry(
-    label: str,
-    operation: Callable[[], Awaitable[_T]],
-    *,
-    attempts: int = 2,
-    base_delay_seconds: float = 0.05,
-) -> _T:
-    """
-    Retry only local DB operations that are safe to replay.
-
-    Do not wrap PSP/Stripe creation with this helper. Once a PSP call may have
-    happened, retry the following DB write independently so idempotency stays
-    anchored to the original PaymentIntent.
-    """
-    last_exc: Optional[BaseException] = None
-    total_attempts = max(1, int(attempts or 1))
-    for attempt in range(total_attempts):
-        try:
-            return await operation()
-        except Exception as exc:
-            if not is_asyncpg_busy_error(exc):
-                raise
-            last_exc = exc
-            if attempt >= total_attempts - 1:
-                break
-            logger.warning(
-                "[AgentPayments] transient asyncpg state during %s; retrying once",
-                label,
-            )
-            try:
-                await asyncio.sleep(max(0.0, base_delay_seconds) * (attempt + 1))
-            except Exception:
-                pass
-    raise db_busy_http_exception() from last_exc
+# The transient-DB retry helper now lives in utils/db_retry so SERVICES can use
+# it without importing this route module (services/acp_offsession_payment needs
+# the identical posture for its post-capture writes). Re-exported under the
+# original private name: every call site below, and any other importer, is
+# unchanged.
+_with_asyncpg_busy_retry = with_asyncpg_busy_retry
 
 # ============================================================================
 # Request/Response Models

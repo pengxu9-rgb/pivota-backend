@@ -116,17 +116,71 @@ async def test_insert_select_complete_roundtrip():
     assert session["items"][0]["variant_id"] == "v1"
     assert session["total_cents"] == 4599
 
-    # The single-flight claim SQL (conditional UPDATE ... RETURNING) must
-    # PREPARE and behave on Postgres: first claim wins, second loses.
-    assert await svc._claim_session(values["id"], "idem_claim") is True
-    assert await svc._claim_session(values["id"], "idem_claim") is False
+    # The single-flight claim SQL (conditional UPDATE ... RETURNING, with the
+    # attempt-scoped key built by SQL string concat + CAST) must PREPARE and
+    # behave on Postgres: first claim wins, second loses.
+    claim = await svc._claim_session(values["id"], "idem_claim")
+    assert claim is not None
+    assert claim.capture_attempt == 1
+    assert claim.psp_idempotency_key == f"acp_complete:{values['id']}:a1"
+    assert await svc._claim_session(values["id"], "idem_claim") is None
     row = await svc.peek_session(values["id"])
     assert row["status"] == "completing"
     assert row["idempotency_key"] == "idem_claim"
-    # Release-claim UPDATE too.
+    # The attempt + key roundtrip through the real column types.
+    assert row["capture_attempt"] == 1
+    assert row["psp_idempotency_key"] == claim.psp_idempotency_key
+    # Release-claim UPDATE too — and the NEXT claim mints the NEXT attempt key
+    # (this is what lets a definitively declined session be retried).
     await svc._revert_claim_to_ready(values["id"])
     row = await svc.peek_session(values["id"])
     assert row["status"] == "ready_for_payment"
+    second = await svc._claim_session(values["id"], "idem_claim_2")
+    assert second is not None
+    assert second.capture_attempt == 2
+    assert second.psp_idempotency_key == f"acp_complete:{values['id']}:a2"
+    await svc._revert_claim_to_ready(values["id"])
+
+
+async def test_stale_takeover_sql_is_single_flight_on_postgres():
+    # N4 on the production dialect: the takeover puts BOTH the status and the
+    # staleness comparison (TIMESTAMPTZ vs a bound datetime) in the WHERE
+    # clause, so exactly one of N concurrent resumers can proceed.
+    from datetime import datetime as _dt
+
+    from db.acp_checkout_sessions import acp_checkout_sessions
+    from db.database import database
+    from services import acp_checkout_session_service as svc
+
+    values = _mk_values("merch_pgtest_takeover")
+    await database.execute(acp_checkout_sessions.insert().values(**values))
+    claim = await svc._claim_session(values["id"], "idem_takeover")
+    assert claim is not None
+
+    now = _dt.now(timezone.utc)
+    # A FRESH completing row is never taken over (it is an in-flight attempt).
+    assert await svc._take_over_stale_completing(
+        values["id"], now - timedelta(seconds=60)
+    ) is None
+
+    # Age it, then race two takeovers: the first moves updated_at out of the
+    # stale window, so the second must miss.
+    await database.execute(
+        acp_checkout_sessions.update()
+        .where(acp_checkout_sessions.c.id == values["id"])
+        .values(updated_at=now - timedelta(seconds=600))
+    )
+    stale_cutoff = _dt.now(timezone.utc) - timedelta(seconds=60)
+    first = await svc._take_over_stale_completing(values["id"], stale_cutoff)
+    second = await svc._take_over_stale_completing(values["id"], stale_cutoff)
+    assert first is not None
+    assert second is None
+    # The resume replays the STORED key and never bumps the attempt counter.
+    assert first.capture_attempt == 1
+    assert first.psp_idempotency_key == f"acp_complete:{values['id']}:a1"
+    row = await svc.peek_session(values["id"])
+    assert row["capture_attempt"] == 1
+    assert row["psp_idempotency_key"] == first.psp_idempotency_key
 
     # Completion write — the exact UPDATE complete_session issues.
     now = datetime.now(timezone.utc)

@@ -41,11 +41,17 @@ async def _db():
     metadata.create_all(engine, tables=[acp_checkout_sessions])
     if not database.is_connected:
         await database.connect()
+    # The runtime self-heal owns the additive columns (capture_attempt,
+    # psp_idempotency_key): create_all is checkfirst-only and will not add them
+    # to a pivota_test.db an older build already created.
+    await svc._ensure_acp_checkout_sessions_table()
     await database.execute(acp_checkout_sessions.delete())
     yield
 
 
-async def _seed_session(session_id="csn_route_test01", merchant_id="merch_x", agent_id=None):
+# agent_id is seeded by default: a session with NO bound agent is refused
+# outright on the money path (`acp_agent_unbound`) — see the dedicated test.
+async def _seed_session(session_id="csn_route_test01", merchant_id="merch_x", agent_id="agent_test"):
     now = datetime.now(timezone.utc)
     await database.execute(
         acp_checkout_sessions.insert().values(
@@ -250,6 +256,51 @@ async def test_foreign_merchant_is_403(monkeypatch):
     with pytest.raises(HTTPException) as ei:
         await m.complete_acp_checkout(sid, m.CompleteAcpCheckoutRequest(), _Ctx(allowed=False))
     assert ei.value.status_code == 403
+
+
+async def test_unbound_agent_session_is_403(monkeypatch):
+    # N5: a session with NO agent identity cannot satisfy the money path's
+    # identity check, so the door refuses it instead of falling back to
+    # merchant-only authorization.
+    from fastapi import HTTPException
+    from routes import agent_checkout_intents as m
+
+    _arm(monkeypatch)
+    calls = _mock_layers(monkeypatch)
+    sid = await _seed_session(agent_id=None)
+    with pytest.raises(HTTPException) as ei:
+        await m.complete_acp_checkout(sid, m.CompleteAcpCheckoutRequest(), _Ctx())
+    assert ei.value.status_code == 403
+    assert ei.value.detail["code"] == "acp_agent_unbound"
+    assert calls["order_create"] == 0 and calls["capture"] == 0
+    row = await svc.peek_session(sid)
+    assert row["status"] == "ready_for_payment"
+
+
+async def test_ambiguous_capture_failure_is_pending_retry_and_holds_the_claim(monkeypatch):
+    # N1: an unresolved capture failure must NOT look like a decline on the
+    # wire — distinct code, and the row stays claimed so the stored PSP key is
+    # replayed rather than a new charge minted.
+    from fastapi import HTTPException
+    from routes import agent_checkout_intents as m
+
+    _arm(monkeypatch)
+    calls = _mock_layers(monkeypatch)
+    sid = await _seed_session()
+
+    async def ambiguous_capture(**kwargs):
+        calls["capture"] += 1
+        raise TimeoutError("psp timed out")
+
+    monkeypatch.setattr(offpay, "execute_acp_offsession_payment", ambiguous_capture)
+    with pytest.raises(HTTPException) as ei:
+        await m.complete_acp_checkout(sid, m.CompleteAcpCheckoutRequest(), _Ctx())
+    assert ei.value.status_code == 502
+    assert ei.value.detail["code"] == "acp_capture_pending_retry"
+    assert ei.value.detail["order_id"] == "ord_route_1"
+    assert calls["settle"] == 0
+    row = await svc.peek_session(sid)
+    assert row["status"] == "completing"  # claim HELD — never re-charge blind
 
 
 async def test_foreign_agent_is_403(monkeypatch):

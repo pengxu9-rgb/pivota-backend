@@ -23,19 +23,42 @@ anywhere on this path — everything runs in-process:
      ready_for_payment → completing; only the caller whose UPDATE lands
      proceeds. A concurrent second caller gets 409 `completion_in_progress`
      (or the stored completion if already completed).
-  2. The PSP idempotency key is DERIVED from the session id
-     (`acp_complete:{session_id}`) — never from the caller's key — so a retry
-     with a fresh Idempotency-Key replays the SAME PSP request instead of
-     minting a second charge. The caller's key is recorded/validated only.
+  2. The PSP idempotency key is STORED on the row, never taken from the
+     caller's Idempotency-Key, and it is ATTEMPT-SCOPED: the same claim UPDATE
+     that wins the row increments `capture_attempt` and writes
+     `acp_complete:{session_id}:a{attempt}` into `psp_idempotency_key`, BEFORE
+     any order or capture work. Every capture — first try or resume — charges
+     under the key READ BACK from the row. So:
+       - a retry with a fresh caller key cannot mint a second charge, and
+       - a RESUMED attempt replays the SAME PSP request (no double charge on a
+         lost response), while
+       - a definitively DECLINED attempt releases the claim, so the next claim
+         mints the NEXT key and the buyer can retry with a different card
+         instead of replaying a cached decline forever.
   3. order_id is persisted on the row IMMEDIATELY after order creation,
      BEFORE the charge; a later retry reuses that order, never mints another.
-  4. Capture failure reverts the row to ready_for_payment (order_id kept for
-     reuse). Capture success persists the completion; if THAT write fails the
-     call returns 502 `acp_completion_persist_failed` with
+  4. A capture failure is CLASSIFIED, because releasing the claim is what lets
+     the next attempt mint a new PSP key:
+       - DEFINITIVE (the PSP refused the card, or the capture layer refused
+         before dispatching anything): no charge can be in flight → revert to
+         ready_for_payment (order_id kept for reuse), 502 `acp_capture_failed`.
+       - AMBIGUOUS (exception, timeout, transport error, SCA/unresolved
+         status — anything not provably a refusal): the charge may have landed
+         → do NOT revert. The row stays `completing` with its stored key and
+         the call returns 502 `acp_capture_pending_retry`; the stale-resume
+         path replays the same key, which the PSP answers idempotently. When in
+         doubt, ambiguous.
+     Capture success persists the completion; if THAT write fails the call
+     returns 502 `acp_completion_persist_failed` with
      reconciliation_required=true and leaves the row in `completing` +
-     order_id, so a (stale) retry resumes with the same derived PSP key and
+     order_id, so a (stale) retry resumes with the same stored PSP key and
      re-attempts the persist. No path returns success without the completed
      row durably written.
+  5. A stale `completing` row is taken over by a CONDITIONAL UPDATE (status +
+     staleness in the WHERE clause), so exactly one resumer proceeds and any
+     other concurrent resumer gets 409. Takeover covers the crash window
+     BETWEEN claim and order-create too (order_id still NULL): the resumer
+     re-enters the order-create path and captures under the stored key.
 
 - `protocol_name` is a parameter (default "acp"): UCP/AP2 flows reuse this
   execution layer through the same GUARDED_PROTOCOLS gate chain.
@@ -80,11 +103,11 @@ STATUS_COMPLETING = "completing"
 STATUS_COMPLETED = "completed"
 
 # A row stuck in `completing` (a prior attempt failed to persist its completion,
-# or crashed) may be RESUMED — but only once it is stale, so a genuinely
-# concurrent in-flight completion is answered 409 completion_in_progress instead
-# of racing it. Resumption is convergent by construction: the PSP idempotency
-# key is derived from the session id, so a resumed capture replays, never
-# re-charges.
+# crashed before creating the order, or hit an ambiguous capture failure) may be
+# RESUMED — but only once it is stale, so a genuinely concurrent in-flight
+# completion is answered 409 completion_in_progress instead of racing it.
+# Resumption is convergent by construction: it replays the PSP idempotency key
+# STORED on the row, so a resumed capture replays, never re-charges.
 COMPLETING_RESUME_AFTER_SECONDS = 60
 
 # Old-service parity: the buyer email used when the session carries none
@@ -211,6 +234,8 @@ async def _ensure_acp_checkout_sessions_table() -> None:
                 order_id TEXT,
                 completion JSONB,
                 idempotency_key TEXT,
+                capture_attempt INTEGER NOT NULL DEFAULT 0,
+                psp_idempotency_key TEXT,
                 created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
                 updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
                 completed_at TIMESTAMPTZ,
@@ -224,6 +249,13 @@ async def _ensure_acp_checkout_sessions_table() -> None:
         await database.execute("ALTER TABLE acp_checkout_sessions ADD COLUMN IF NOT EXISTS order_id TEXT")
         await database.execute("ALTER TABLE acp_checkout_sessions ADD COLUMN IF NOT EXISTS completed_at TIMESTAMPTZ")
         await database.execute("ALTER TABLE acp_checkout_sessions ADD COLUMN IF NOT EXISTS expires_at TIMESTAMPTZ")
+        await database.execute(
+            "ALTER TABLE acp_checkout_sessions "
+            "ADD COLUMN IF NOT EXISTS capture_attempt INTEGER NOT NULL DEFAULT 0"
+        )
+        await database.execute(
+            "ALTER TABLE acp_checkout_sessions ADD COLUMN IF NOT EXISTS psp_idempotency_key TEXT"
+        )
         await database.execute(
             "CREATE INDEX IF NOT EXISTS idx_acp_checkout_sessions_merchant_created "
             "ON acp_checkout_sessions (merchant_id, created_at)"
@@ -240,6 +272,21 @@ async def _ensure_acp_checkout_sessions_table() -> None:
         metadata.create_all(engine, tables=[acp_checkout_sessions])
     except Exception:
         pass
+
+    if not IS_POSTGRES:
+        # SQLite dev/test: create_all() is checkfirst-only, so it will NOT add a
+        # new column to a table an older build already created (the local
+        # pivota_test.db outlives a schema change). Mirror the Postgres
+        # ADD COLUMN IF NOT EXISTS healing — SQLite has no IF NOT EXISTS for
+        # columns, so a duplicate-column error is the expected no-op.
+        for ddl in (
+            "ALTER TABLE acp_checkout_sessions ADD COLUMN capture_attempt INTEGER NOT NULL DEFAULT 0",
+            "ALTER TABLE acp_checkout_sessions ADD COLUMN psp_idempotency_key TEXT",
+        ):
+            try:
+                await database.execute(ddl)
+            except Exception:
+                pass
 
 
 def _normalize_items(items: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
@@ -408,15 +455,21 @@ async def create_session(
     merchant_id: str,
     platform: str,
     items: List[Dict[str, Any]],
+    agent_id: Optional[str],
     fulfillment_address: Optional[Dict[str, Any]] = None,
     buyer: Optional[Dict[str, Any]] = None,
     metadata: Optional[Dict[str, Any]] = None,
-    agent_id: Optional[str] = None,
     protocol_name: str = "acp",
 ) -> AcpSessionResult:
     """Create an in-process ACP checkout session: quote the cart with the REAL
     quote engine, persist the session, and return the old wire-shape descriptor.
-    Does NOT complete or charge. Raises AcpCheckoutSessionError on failure."""
+    Does NOT complete or charge. Raises AcpCheckoutSessionError on failure.
+
+    `agent_id` is REQUIRED (no default): the completing agent must match the
+    minting agent, so a session created without one can never be completed
+    (complete_session refuses it with `acp_agent_unbound`). Making it a
+    positional-by-name requirement stops a caller from silently minting an
+    uncompletable session by omitting it."""
     normalized_items = _normalize_items(items)
     if not normalized_items:
         raise AcpCheckoutSessionError(
@@ -703,12 +756,33 @@ async def _create_pivota_order(
     return order_id
 
 
-def _psp_idempotency_key(session_id: str) -> str:
-    """The PSP idempotency key for a session completion — ALWAYS derived from
-    the session id, NEVER from the caller's Idempotency-Key. This is the
-    double-charge kill: a retry with a fresh caller key still replays the same
-    PSP request."""
-    return f"acp_complete:{session_id}"
+PSP_IDEMPOTENCY_KEY_PREFIX = "acp_complete:"
+
+
+def _psp_idempotency_key(session_id: str, capture_attempt: int) -> str:
+    """The PSP idempotency key for ONE completion attempt — always derived from
+    the session id + attempt number, NEVER from the caller's Idempotency-Key.
+
+    Session-scoped is the double-charge kill (a retry with a fresh caller key
+    replays the same PSP request); ATTEMPT-scoped is what keeps a definitively
+    declined session retryable (a new card charges under a new key instead of
+    replaying the PSP's cached decline). The key is minted by the claim UPDATE
+    and STORED; captures always use the stored value, never a recomputed one."""
+    return f"{PSP_IDEMPOTENCY_KEY_PREFIX}{session_id}:a{int(capture_attempt)}"
+
+
+def _psp_idempotency_key_prefix(session_id: str) -> str:
+    """The stored key minus its attempt suffix — the claim UPDATE appends the
+    attempt number it just incremented to, so key and attempt are written
+    atomically with the claim."""
+    return f"{PSP_IDEMPOTENCY_KEY_PREFIX}{session_id}:a"
+
+
+def _legacy_psp_idempotency_key(session_id: str) -> str:
+    """The un-suffixed key written by builds BEFORE attempt scoping existed. A
+    row those builds wedged in `completing` charged under THIS key, so a resume
+    of such a row must replay it (never a freshly minted one)."""
+    return f"{PSP_IDEMPOTENCY_KEY_PREFIX}{session_id}"
 
 
 def _replay_completed(
@@ -757,33 +831,219 @@ def _replay_completed(
     }
 
 
-async def _claim_session(session_id: str, idempotency_key: Optional[str]) -> bool:
+@dataclass(frozen=True)
+class _ClaimOutcome:
+    """What a winning claim/takeover UPDATE returned. `psp_idempotency_key` is
+    the key the capture MUST charge under — read back from the row, never
+    recomputed by the caller."""
+
+    capture_attempt: int
+    psp_idempotency_key: str
+    order_id: Optional[str] = None
+
+
+async def _with_table_self_heal(label: str, run) -> Any:
+    """Run a DB coroutine factory, healing a missing/drifted table once and
+    retrying. A DDL race must surface as an AcpCheckoutSessionError (the shape
+    the route maps), never a raw 500 — the same posture peek_session/create use.
+    """
+    try:
+        return await run()
+    except Exception:
+        try:
+            await _ensure_acp_checkout_sessions_table()
+            return await run()
+        except Exception as exc:  # noqa: BLE001 — a claim we cannot run is a named 503
+            raise AcpCheckoutSessionError(
+                f"{label}: {str(exc)[:200]}",
+                code="acp_session_persist_failed",
+                status_code=503,
+            ) from exc
+
+
+# The claim mints the attempt's PSP key IN THE SAME STATEMENT that wins the row,
+# so there is no window in which a claim holder has no stored key. CAST(...) is
+# spelled explicitly: it is the one concat form both Postgres (which would
+# otherwise see an unknown-typed parameter) and SQLite accept.
+_CLAIM_SQL = """
+UPDATE acp_checkout_sessions
+SET status = :completing,
+    updated_at = :now,
+    idempotency_key = COALESCE(:key, idempotency_key),
+    capture_attempt = COALESCE(capture_attempt, 0) + 1,
+    psp_idempotency_key = CAST(:key_prefix AS TEXT)
+        || CAST(COALESCE(capture_attempt, 0) + 1 AS TEXT)
+WHERE id = :id AND status = :ready
+RETURNING capture_attempt, psp_idempotency_key, order_id
+"""
+
+# N4: taking over a STALE `completing` row is itself a conditional UPDATE — the
+# status AND the staleness live in the WHERE clause, so exactly one of N
+# concurrent resumers can proceed (it moves updated_at out of the stale window)
+# and the rest fall through to 409. It deliberately does NOT touch
+# capture_attempt or psp_idempotency_key: a resume must replay the STORED key.
+_STALE_TAKEOVER_SQL = """
+UPDATE acp_checkout_sessions
+SET updated_at = :now
+WHERE id = :id AND status = :completing AND updated_at <= :stale_cutoff
+RETURNING capture_attempt, psp_idempotency_key, order_id
+"""
+
+
+async def _claim_session(
+    session_id: str, idempotency_key: Optional[str]
+) -> Optional[_ClaimOutcome]:
     """Atomically flip ready_for_payment → completing; exactly one caller wins
     (conditional UPDATE + RETURNING — works on both Postgres and SQLite). The
-    caller's Idempotency-Key is recorded on the row for validation only."""
-    row = await database.fetch_one(
-        """
-        UPDATE acp_checkout_sessions
-        SET status = :completing,
-            updated_at = :now,
-            idempotency_key = COALESCE(:key, idempotency_key)
-        WHERE id = :id AND status = :ready
-        RETURNING id
-        """,
-        {
-            "completing": STATUS_COMPLETING,
-            "now": _now_utc(),
-            "key": (idempotency_key or None),
-            "id": session_id,
-            "ready": STATUS_READY_FOR_PAYMENT,
-        },
+    winning UPDATE also increments capture_attempt and stores that attempt's PSP
+    idempotency key, so the key exists on the row BEFORE any order/capture work.
+    The caller's Idempotency-Key is recorded for validation only.
+
+    Returns the claim outcome, or None when another attempt holds the row."""
+
+    async def _run():
+        return await database.fetch_one(
+            _CLAIM_SQL,
+            {
+                "completing": STATUS_COMPLETING,
+                "now": _now_utc(),
+                "key": (idempotency_key or None),
+                "key_prefix": _psp_idempotency_key_prefix(session_id),
+                "id": session_id,
+                "ready": STATUS_READY_FOR_PAYMENT,
+            },
+        )
+
+    row = await _with_table_self_heal("session_claim_failed", _run)
+    if row is None:
+        return None
+    data = dict(row)
+    attempt = int(data.get("capture_attempt") or 1)
+    return _ClaimOutcome(
+        capture_attempt=attempt,
+        # Fall back to the computed key only if the dialect returned nothing for
+        # the column it just wrote (never observed; belt-and-suspenders).
+        psp_idempotency_key=(
+            str(data.get("psp_idempotency_key") or "").strip()
+            or _psp_idempotency_key(session_id, attempt)
+        ),
+        order_id=(str(data.get("order_id") or "").strip() or None),
     )
-    return row is not None
+
+
+async def _take_over_stale_completing(
+    session_id: str, stale_cutoff: datetime
+) -> Optional[_ClaimOutcome]:
+    """Take over a STALE `completing` row (single-flight, N4). Returns the row's
+    STORED attempt/key — the resume replays that key, so a charge whose response
+    was lost cannot become a second charge. Returns None when the row is not
+    completing, not stale, or another resumer just took it."""
+
+    async def _run():
+        return await database.fetch_one(
+            _STALE_TAKEOVER_SQL,
+            {
+                "now": _now_utc(),
+                "id": session_id,
+                "completing": STATUS_COMPLETING,
+                "stale_cutoff": stale_cutoff,
+            },
+        )
+
+    row = await _with_table_self_heal("session_resume_failed", _run)
+    if row is None:
+        return None
+    data = dict(row)
+    attempt = int(data.get("capture_attempt") or 0)
+    stored_key = str(data.get("psp_idempotency_key") or "").strip()
+    return _ClaimOutcome(
+        capture_attempt=attempt,
+        # NEVER recompute a resume key from the attempt counter: a row wedged by
+        # a pre-attempt-scoping build has no stored key and charged under the
+        # legacy un-suffixed one, which is what must be replayed.
+        psp_idempotency_key=(stored_key or _legacy_psp_idempotency_key(session_id)),
+        order_id=(str(data.get("order_id") or "").strip() or None),
+    )
+
+
+# --- capture-failure classification (which failures may release the claim) ----
+#
+# Releasing the claim is not a cosmetic state change: the NEXT claim mints a NEW
+# PSP idempotency key, so a release is only sound when we KNOW no charge can be
+# in flight under the current one. Exactly two provably-safe classes, both drawn
+# from codes services/acp_offsession_capture actually produces:
+#
+#  1. PRE-DISPATCH refusals — the capture layer refused before any PSP request
+#     left this process (orchestrator guards + each adapter's pre-request
+#     validation). No PSP has ever seen the charge.
+#  2. DEFINITIVE PSP declines — the PSP answered and refused. No money moved,
+#     and the PSP has bound that answer to the key we used, so replaying it
+#     would return the same decline forever; a new card needs a new key.
+#
+# EVERYTHING ELSE is ambiguous and must NOT release the claim: transport errors
+# (`adyen_network_error`), HTTP failures (`adyen_http_*`), unresolved provider
+# errors (`stripe_error`), SCA (`requires_action`), and any non-succeeded intent
+# that could still settle (`not_succeeded`, `adyen_bad_response`). Those replay
+# the stored key via the stale-resume path. When in doubt → ambiguous.
+_PRE_DISPATCH_ERROR_CODES = frozenset(
+    {
+        # capture_offsession orchestrator, before adapter dispatch
+        "invalid_amount",
+        "over_cap",
+        "no_merchant_psp",
+        "live_key_refused",
+        "live_key_required",
+        "unsupported_provider",
+        # adapter pre-request validation (nothing was sent to the PSP)
+        "live_pm_required",
+        "adyen_config",
+        "adyen_pm_required",
+        "adyen_shopper_ref_required",
+    }
+)
+_DEFINITIVE_DECLINE_ERROR_CODES = frozenset(
+    {
+        # Stripe card_error class — the PSP refused this card outright.
+        "card_declined",
+        "expired_card",
+        "incorrect_cvc",
+        "invalid_cvc",
+        "incorrect_number",
+        "invalid_number",
+        "incorrect_zip",
+        "invalid_expiry_month",
+        "invalid_expiry_year",
+        "insufficient_funds",
+        "card_not_supported",
+        "currency_not_supported",
+        "pickup_card",
+        "lost_card",
+        "stolen_card",
+        "fraudulent",
+        # Adyen: resultCode was neither Authorised nor an SCA action → refused.
+        "adyen_refused",
+    }
+)
+
+
+def _capture_failure_is_definitive(outcome: Any) -> bool:
+    """True only when the failed capture provably left no charge in flight (see
+    the code-set comments above). Conservative: an unknown or empty error code,
+    or any status other than `failed`, is ambiguous."""
+    if str(getattr(outcome, "status", "") or "").strip().lower() != "failed":
+        return False
+    code = str(getattr(outcome, "error_code", "") or "").strip().lower()
+    if not code:
+        return False
+    return code in _PRE_DISPATCH_ERROR_CODES or code in _DEFINITIVE_DECLINE_ERROR_CODES
 
 
 async def _revert_claim_to_ready(session_id: str) -> None:
-    """Release the completion claim (no charge stands). order_id is kept so a
-    retry reuses the already-created order instead of minting another."""
+    """Release the completion claim. Callable ONLY when no charge can be in
+    flight (see the classification above): the next claim increments the attempt
+    and mints a NEW PSP idempotency key, so releasing a possibly-charged session
+    is exactly how a double charge would happen. order_id is kept so a retry
+    reuses the already-created order instead of minting another."""
     try:
         await database.execute(
             acp_checkout_sessions.update()
@@ -852,6 +1112,9 @@ async def complete_session(
     Fail-closed, never silent:
     - absent session → `acp_session_not_found` (404); expired → `acp_session_expired`.
     - a different agent than the session's creator → `acp_agent_mismatch` (403).
+    - a session with NO bound agent identity → `acp_agent_unbound` (403): the
+      money path's identity check cannot be satisfied by merchant scope alone,
+      so an unbound session is refused rather than completed by anyone.
     - already completed → the stored completion result (idempotent replay; a
       matching idempotency_key with a DIFFERENT payload → `idempotency_conflict`, 409).
     - an Idempotency-Key already used by ANOTHER session → `idempotency_conflict`
@@ -860,12 +1123,18 @@ async def complete_session(
     - kill-switch block / over-cap → the gate chain's own HTTPException(403)
       propagates untouched (as_error_detail shape — dark stays dark).
     - capture lane not engaged → `acp_capture_lane_disabled` (403).
-    - capture failure → `acp_capture_failed` (502); the claim is released and the
-      created order is kept for reuse.
+    - DEFINITIVE capture failure (PSP refusal / pre-dispatch refusal) →
+      `acp_capture_failed` (502); the claim is released (so a retry mints a new
+      PSP key and can use a different card) and the created order is kept for
+      reuse.
+    - AMBIGUOUS capture failure (exception, timeout, transport, unresolved
+      status) → `acp_capture_pending_retry` (502); the claim is NOT released and
+      the row keeps its stored PSP key, so a retry after the stale window
+      REPLAYS the same PSP request instead of charging again.
     - completion-persist failure AFTER a successful capture →
       `acp_completion_persist_failed` (502, reconciliation_required=true); the
       row stays `completing`+order_id so a stale retry converges on the same
-      derived PSP key. There is NO simulated capture fallback — that pivota-acp
+      stored PSP key. There is NO simulated capture fallback — that pivota-acp
       path is deliberately not ported.
     """
     session = await peek_session(session_id)
@@ -874,11 +1143,20 @@ async def complete_session(
             "checkout session not found", code="acp_session_not_found", status_code=404
         )
 
-    # The completing agent must be the agent that minted the session (when the
-    # session recorded one) — merchant scoping alone is not enough on a money path.
+    # The completing agent must be the agent that minted the session — merchant
+    # scoping alone is not enough on a money path. A session with NO recorded
+    # agent cannot satisfy that check at all, so it is refused outright instead
+    # of silently degrading to merchant-only authorization (create_session
+    # requires agent_id, so this only guards rows from older/foreign writers).
     session_agent = str(session.get("agent_id") or "") or None
     caller_agent = str(getattr(agent_context, "agent_id", "") or "") or None
-    if session_agent and caller_agent != session_agent:
+    if not session_agent:
+        raise AcpCheckoutSessionError(
+            "checkout session has no bound agent identity and cannot be completed",
+            code="acp_agent_unbound",
+            status_code=403,
+        )
+    if caller_agent != session_agent:
         raise AcpCheckoutSessionError(
             "checkout session belongs to a different agent",
             code="acp_agent_mismatch",
@@ -931,9 +1209,11 @@ async def complete_session(
     if not pre_gate.allowed:
         raise HTTPException(status_code=403, detail=pre_gate.as_error_detail())
 
-    # CLAIM BEFORE CHARGE: exactly one completion attempt may proceed.
-    claimed = await _claim_session(sid, idempotency_key)
-    if not claimed:
+    # CLAIM BEFORE CHARGE: exactly one completion attempt may proceed. The
+    # winning UPDATE also mints and STORES this attempt's PSP idempotency key.
+    claim = await _claim_session(sid, idempotency_key)
+    resumed = False
+    if claim is None:
         current = await peek_session(sid)
         if not current:
             raise AcpCheckoutSessionError(
@@ -942,39 +1222,46 @@ async def complete_session(
         status_now = str(current.get("status") or "")
         if status_now == STATUS_COMPLETED:
             return _replay_completed(current, idempotency_key=idempotency_key, req_hash=req_hash)
-        updated_at = _coerce_datetime_utc(current.get("updated_at"))
-        stale_cutoff = _now_utc() - timedelta(seconds=COMPLETING_RESUME_AFTER_SECONDS)
-        if (
-            status_now == STATUS_COMPLETING
-            and str(current.get("order_id") or "")
-            and updated_at is not None
-            and updated_at <= stale_cutoff
-        ):
-            # A prior attempt charged-or-crashed and never persisted its
-            # completion. Resume it: reuse its order and replay the derived PSP
-            # key (idempotent PSP-side), then re-attempt the persist.
-            session = current
-            try:
-                await database.execute(
-                    acp_checkout_sessions.update()
-                    .where(acp_checkout_sessions.c.id == sid)
-                    .values(updated_at=_now_utc())
-                )
-            except Exception:  # noqa: BLE001 — freshness touch is advisory
-                pass
-        else:
+
+        # A prior attempt crashed, charged-without-persisting, or hit an
+        # ambiguous capture failure. Resuming is safe ONLY once the row is
+        # stale (a fresh `completing` row is a live in-flight completion) and
+        # ONLY for the single resumer whose conditional takeover lands. The
+        # takeover covers an order_id-NULL row too: that is the crash window
+        # between the claim and order creation, and the resumer simply re-enters
+        # the order-create path — its capture still replays the STORED key.
+        claim = None
+        if status_now == STATUS_COMPLETING:
+            claim = await _take_over_stale_completing(
+                sid, _now_utc() - timedelta(seconds=COMPLETING_RESUME_AFTER_SECONDS)
+            )
+        if claim is None:
             raise AcpCheckoutSessionError(
                 "a completion for this checkout session is already in progress",
                 code="completion_in_progress",
                 status_code=409,
             )
-    else:
-        # Re-read post-claim: a prior failed attempt may have left an order_id
-        # to reuse.
-        session = await peek_session(sid) or session
+        resumed = True
 
-    # From here the claim is held. Any failure BEFORE a successful capture
-    # releases it (order_id kept); nothing after a successful capture does.
+    # Re-read post-claim: the claim/takeover UPDATE is the source of truth for
+    # the attempt + key, but the rest of the row (order_id, items, metadata) is
+    # read back fresh — a prior failed attempt may have left an order to reuse.
+    session = await peek_session(sid) or session
+    # THE key every capture below charges under: read back from the row, never
+    # recomputed. A fresh claim → the new attempt's key; a resume → the stored
+    # key of the attempt being resumed (replay, never a second charge).
+    psp_idempotency_key = claim.psp_idempotency_key
+    if resumed:
+        logger.warning(
+            "[AcpCheckoutSession] resuming stale completing session=%s attempt=%s "
+            "order=%s psp_key=%s",
+            sid, claim.capture_attempt, claim.order_id or "<none>", psp_idempotency_key,
+        )
+
+    # From here the claim is held. Any failure BEFORE the capture is dispatched
+    # releases it (order_id kept — no charge can exist yet). Once the capture is
+    # dispatched, only a DEFINITIVE failure releases it (see the classification
+    # below); nothing after a successful capture does.
     from db.orders import get_order
     from services.acp_offsession_payment import (
         evaluate_acp_offsession_gates,
@@ -1075,28 +1362,78 @@ async def complete_session(
                 status_code=403,
             )
 
+    except BaseException:
+        # Nothing has been dispatched to a PSP yet (gate refusal, quote/order
+        # failure, lane disabled): no charge can stand, so release the claim and
+        # let the session be retried. order_id is kept for reuse.
+        await _revert_claim_to_ready(sid)
+        raise
+
+    # ---- the charge itself: a failure here is CLASSIFIED, never blanket-reverted
+    try:
         outcome = await execute_acp_offsession_payment(
             gates=gates,
             merchant_id=str(session.get("merchant_id")),
             order_id=order_id,
             currency=currency,
-            # SESSION-DERIVED, always — never the caller's key (see module docstring).
-            idempotency_key=_psp_idempotency_key(sid),
+            # The STORED, attempt-scoped session key — never the caller's key
+            # and never recomputed here (see the module docstring).
+            idempotency_key=psp_idempotency_key,
             payment_method_token=(payment_token or None),
             agent_id=str(caller_agent or ""),
             order_metadata=order_metadata,
         )
-        if not outcome.success:
+    except BaseException as capture_exc:
+        # The dispatch itself blew up (timeout, transport, cancellation, bug):
+        # we do NOT know whether the PSP took the charge. Releasing the claim
+        # would let the next attempt mint a NEW key and charge a second time, so
+        # the claim and its stored key STAY — a retry after the stale window
+        # replays this exact PSP request.
+        logger.error(
+            "[AcpCheckoutSession] capture dispatch failed AMBIGUOUSLY session=%s "
+            "order=%s psp_key=%s: %s — claim held for replay",
+            sid, order_id, psp_idempotency_key, str(capture_exc)[:200],
+        )
+        raise AcpCheckoutSessionError(
+            "the capture could not be confirmed; retry to converge "
+            "(the same PSP request is replayed, it will not charge twice)",
+            code="acp_capture_pending_retry",
+            status_code=502,
+            extra={
+                "order_id": order_id,
+                "retry_after_seconds": COMPLETING_RESUME_AFTER_SECONDS,
+            },
+        ) from capture_exc
+
+    if not outcome.success:
+        if _capture_failure_is_definitive(outcome):
+            # The PSP refused (or nothing was ever dispatched): no charge is in
+            # flight, so release the claim. The next attempt mints the NEXT
+            # attempt key, which is what lets the buyer retry with another card
+            # instead of replaying a decline the PSP has already cached.
+            await _revert_claim_to_ready(sid)
             raise AcpCheckoutSessionError(
                 f"capture_failed:{outcome.error_code or 'unknown'}: {str(outcome.error or '')[:200]}",
                 code="acp_capture_failed",
                 status_code=502,
             )
-    except BaseException:
-        # No charge stands (gate refusal, quote/order failure, capture failure):
-        # release the claim so the session can be retried; order_id is kept.
-        await _revert_claim_to_ready(sid)
-        raise
+        # Not provably a refusal (SCA/requires_action, unresolved provider
+        # error, HTTP/transport failure): treat as possibly-charged.
+        logger.error(
+            "[AcpCheckoutSession] capture failed AMBIGUOUSLY session=%s order=%s "
+            "psp_key=%s status=%s code=%s — claim held for replay",
+            sid, order_id, psp_idempotency_key, outcome.status, outcome.error_code,
+        )
+        raise AcpCheckoutSessionError(
+            f"capture_unconfirmed:{outcome.error_code or 'unknown'}: "
+            f"{str(outcome.error or '')[:200]}",
+            code="acp_capture_pending_retry",
+            status_code=502,
+            extra={
+                "order_id": order_id,
+                "retry_after_seconds": COMPLETING_RESUME_AFTER_SECONDS,
+            },
+        )
 
     # Capture SUCCEEDED beyond this point — the claim is never released now.
     settle_flags = await settle_acp_offsession_success(
@@ -1142,7 +1479,7 @@ async def complete_session(
     except Exception as persist_exc:  # noqa: BLE001
         # A capture happened that we could NOT durably record. Never report
         # success. The row stays `completing`+order_id, so a (stale) retry
-        # resumes with the same derived PSP key and re-attempts this persist.
+        # resumes with the same STORED PSP key and re-attempts this persist.
         logger.error(
             "[AcpCheckoutSession] completion persist FAILED after successful capture "
             "session=%s order=%s intent=%s: %s",

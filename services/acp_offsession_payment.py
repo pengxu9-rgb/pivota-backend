@@ -32,7 +32,9 @@ from typing import TYPE_CHECKING, Any, Dict, Optional
 
 from fastapi import HTTPException
 
+from utils.db_retry import with_asyncpg_busy_retry as _with_asyncpg_busy_retry
 from utils.logger import logger
+from utils.money import from_minor_units
 
 if TYPE_CHECKING:
     # Gate symbols are imported IN-FUNCTION at runtime (below), exactly as the
@@ -346,7 +348,7 @@ async def settle_acp_offsession_success(
     """Post-capture settlement for the in-process session path: the same durable
     writes /agent/v1/payments performs after a successful off-session capture —
     payments record, order payment info, attribution edge, paid-transition
-    finalizer — each wrapped in the route's `_with_asyncpg_busy_retry` (matching
+    finalizer — each wrapped in the shared `with_asyncpg_busy_retry` (matching
     routes/agent_payment_sdk's posture for these exact writes). The /payments
     route keeps its own inline record/attribution code (shared with the
     client-confirm lane) and calls only finalize_acp_offsession_success; this
@@ -360,11 +362,13 @@ async def settle_acp_offsession_success(
 
     from db.database import database
     from db.orders import update_payment_info
-    from routes.agent_payment_sdk import _with_asyncpg_busy_retry
 
     reconciliation_needed = False
 
-    amount_major = gates.amount_cents / 100.0
+    # Currency-aware inverse of the minor-unit conversion the charge used. The
+    # old `amount_cents / 100.0` recorded a JPY 300 charge as amount=3.0 — the
+    # payments record must state what actually moved.
+    amount_major = from_minor_units(gates.amount_cents, currency)
     payment_id = f"pay_{outcome.payment_intent_id}"
     status = "succeeded" if outcome.payment_intent.status == "succeeded" else str(outcome.payment_intent.status)
     try:

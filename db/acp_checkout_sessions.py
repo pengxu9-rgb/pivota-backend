@@ -28,7 +28,10 @@ acp_checkout_sessions = Table(
     Column("agent_id", Text, nullable=True),
     Column("platform", Text, nullable=True),
     # ready_for_payment -> completing (claimed by exactly one completion
-    # attempt) -> completed. A capture failure reverts to ready_for_payment.
+    # attempt) -> completed. A DEFINITIVE capture failure (the PSP refused, or
+    # nothing was ever dispatched) reverts to ready_for_payment; an AMBIGUOUS
+    # one (timeout/transport) stays `completing` so the stale-resume path
+    # replays the stored psp_idempotency_key instead of minting a new charge.
     Column("status", Text, nullable=False, server_default="ready_for_payment"),
     Column("buyer", JSONB_TYPE, nullable=True),
     Column("items", JSONB_TYPE, nullable=False),
@@ -44,9 +47,19 @@ acp_checkout_sessions = Table(
     # already-completed session (the money path must never re-charge).
     Column("completion", JSONB_TYPE, nullable=True),
     # Caller-supplied completion idempotency key — recorded/validated only.
-    # The PSP idempotency key is DERIVED from the session id, deliberately NOT
-    # from this value, so a retry with a fresh key cannot double-charge.
+    # The PSP idempotency key is the STORED psp_idempotency_key below,
+    # deliberately NOT this value, so a retry with a fresh key cannot
+    # double-charge.
     Column("idempotency_key", Text, nullable=True),
+    # Incremented by the claim UPDATE on every FRESH claim (ready_for_payment ->
+    # completing). A stale-resume takeover never increments it.
+    Column("capture_attempt", Integer, nullable=False, server_default="0"),
+    # The PSP idempotency key the CURRENT attempt charges under
+    # (`acp_complete:<id>:a<capture_attempt>`), written by the same claim UPDATE
+    # BEFORE any order/capture work. A resume replays this stored key (a lost
+    # PSP response can never become a second charge); only a definitive decline
+    # releases the claim, and the next claim mints the next attempt's key.
+    Column("psp_idempotency_key", Text, nullable=True),
     Column("created_at", DateTime(timezone=True), server_default=func.now(), nullable=False),
     Column("updated_at", DateTime(timezone=True), server_default=func.now(), onupdate=func.now(), nullable=False),
     Column("completed_at", DateTime(timezone=True), nullable=True),
