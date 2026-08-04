@@ -35,8 +35,9 @@ from services.merchant_capability_resolver import resolve_merchant_capability
 from services.platform_capabilities import PROTOCOL_ACP
 
 # Platforms whose merchants can be driven by the ACP test-capture canary even
-# without a live PSP. Both now have a pivota-acp real-capture connector wired to
-# the shared backend quote→order(acp)→pay flow. This gates only the CANARY (flag +
+# without a live PSP. Both are now driven by the in-process ACP checkout-session
+# service (`services/acp_checkout_session_service`, ADR-021), which runs the shared
+# gate chain and off-session capture in this process. This gates only the CANARY (flag +
 # allowlist); production ACP-capability is still governed per-platform by the
 # capability resolver (e.g. Wix order-writeback), so widening this set does NOT by
 # itself claim production readiness — it lets a Wix merchant be canary-tested
