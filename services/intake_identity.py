@@ -116,7 +116,22 @@ def canonical_gtin(value: Optional[str]) -> Optional[str]:
     from services.catalog_identity import normalize_gtin
 
     norm = normalize_gtin(value)
-    return norm if norm and len(norm) == 14 else None
+    if not norm or len(norm) != 14:
+        return None
+    # ALL-ZERO IS A SENTINEL, NOT AN IDENTIFIER. `normalize_gtin` zero-pads to
+    # 14, so a source field holding '0' — or '', or '000' — becomes
+    # '00000000000000', which is structurally a valid GTIN-14 and then flows
+    # into Tier-0 exact matching. That matcher is GLOBAL by design: a GS1 GTIN
+    # identifies one physical product across every merchant. So one placeholder
+    # zero would ATTACH unrelated products to each other, across merchants,
+    # with the highest-confidence matcher in the system.
+    #
+    # Guarded HERE and not inside `normalize_gtin`: `make_content_key` folds
+    # that function's output, so changing it would silently re-key every row
+    # already minted with a zero GTIN. The consumer drops it; the key stays.
+    if set(norm) == {"0"}:
+        return None
+    return norm
 
 
 # --- DB lookups (each one small, exact, and monkeypatch-friendly) ----------------
