@@ -343,22 +343,12 @@ class Settings(BaseSettings):
     serpapi_api_key: Optional[str] = os.getenv("SERPAPI_API_KEY")
     serpapi_base_url: str = os.getenv("SERPAPI_BASE_URL", "https://serpapi.com")
 
-    # Platform Orders ACP Integration
-    enable_platform_orders_acp: bool = os.getenv("FEATURE_PLATFORM_ORDERS_ACP", "false").lower() == "true"
-    platform_orders_acp_url: str = os.getenv(
-        "PLATFORM_ORDERS_ACP_URL",
-        "https://pivota-acp-production.up.railway.app",
-    )
-    # Bearer token for service-to-service auth between pivota-backend and the
-    # pivota-acp service. Required in production; missing in dev falls back
-    # to the placeholder "test" token so local end-to-end flows keep working.
-    platform_orders_acp_token: Optional[str] = os.getenv("PLATFORM_ORDERS_ACP_TOKEN")
-    # Shared HMAC-SHA256 secret signing inbound ACP order-completed webhooks.
-    # Required in production; missing in dev allows the webhook through with
-    # a warning so local end-to-end flows still work.
-    platform_orders_acp_webhook_secret: Optional[str] = os.getenv(
-        "PLATFORM_ORDERS_ACP_WEBHOOK_SECRET"
-    )
+    # Platform Orders ACP Integration — RETIRED (ADR-021). The external
+    # pivota-acp service is gone; ACP checkout runs in-process
+    # (services/acp_checkout_session_service). FEATURE_PLATFORM_ORDERS_ACP and
+    # the PLATFORM_ORDERS_ACP_{URL,TOKEN,WEBHOOK_SECRET} settings that addressed
+    # and authenticated it were removed with their last consumers.
+    #
     # Base URL for the checkout_url returned by the IN-PROCESS ACP session layer
     # (services/acp_checkout_session_service). The session's checkout_url is
     # `{base}/{session_id}`. Replaces the retired pivota-acp service's

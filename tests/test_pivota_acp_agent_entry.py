@@ -1,107 +1,18 @@
-"""P-T2.3.1b — pivota-acp session client + agent-facing /acp entry point.
+"""P-T2.3.1b — agent-facing /acp entry point.
 
-Covers: the client builds the ACP request (items, headers, pvt_* metadata) and
-parses the session, and raises AcpClientError on failure; the agent endpoint
-routes to the ACP lane only when capable+charge-permitted+integration-enabled,
-and otherwise (or on any ACP error) fails open to the redirect floor. DARK: no
-order/charge is ever created here.
+Covers: the agent endpoint routes to the ACP lane only when the lane decision
+says capable + charge-permitted, and otherwise (or on any session-service error)
+fails open to the redirect floor. DARK: no order/charge is ever created here.
+
+ADR-021: the outbound pivota-acp client this file also used to cover was
+retired with that service; session creation is in-process
+(services/acp_checkout_session_service), covered by
+tests/test_acp_checkout_session_service.py.
 """
 
 from __future__ import annotations
 
-from typing import Any, Dict, List
-
 import pytest
-
-
-class _Resp:
-    def __init__(self, status_code: int, payload: Any):
-        self.status_code = status_code
-        self._payload = payload
-        self.text = str(payload)
-
-    def json(self):
-        return self._payload
-
-
-class _Client:
-    captured: List[Dict[str, Any]] = []
-    resp = _Resp(201, {"id": "csn_abc", "status": "ready_for_payment", "currency": "USD",
-                       "totals": [{"type": "total", "amount": 4599}]})
-
-    def __init__(self, *a, **k):
-        pass
-
-    async def __aenter__(self):
-        return self
-
-    async def __aexit__(self, *a):
-        return False
-
-    async def post(self, url, headers=None, json=None, **k):
-        _Client.captured.append({"url": url, "headers": headers, "json": json})
-        return _Client.resp
-
-
-# --- client -----------------------------------------------------------------
-
-@pytest.mark.asyncio
-async def test_client_builds_request_and_parses_session(monkeypatch):
-    import httpx
-    from services import pivota_acp_client as c
-
-    _Client.captured = []
-    _Client.resp = _Resp(201, {"id": "csn_abc", "status": "ready_for_payment",
-                               "currency": "USD", "totals": [{"type": "total", "amount": 4599}]})
-    monkeypatch.setattr(httpx, "AsyncClient", _Client)
-
-    session = await c.create_checkout_session(
-        merchant_id="merch_x",
-        platform="shopify",
-        items=[{"sku": "SKU1", "quantity": 2, "product_id": "p1"}],
-        metadata={"pvt_click_id": "clk_abc", "pvt_surface": "chatgpt"},
-    )
-    assert session.session_id == "csn_abc"
-    assert session.checkout_url.endswith("/checkout/csn_abc")
-    assert session.total_cents == 4599
-    assert session.currency == "USD"
-
-    sent = _Client.captured[0]
-    assert sent["url"].endswith("/checkout_sessions")
-    assert sent["headers"]["API-Version"] == c.PIVOTA_ACP_API_VERSION
-    assert sent["headers"]["X-Merchant-Id"] == "merch_x"
-    assert sent["headers"]["X-Platform"] == "shopify"
-    # P-T2.3.4: product_id/variant_id ride the ACP item so the session persists
-    # them for the real-capture quote (id still prefers sku).
-    assert sent["json"]["items"] == [{"id": "SKU1", "quantity": 2, "product_id": "p1"}]
-    # pvt_click_id threaded into session metadata for attribution parity.
-    assert sent["json"]["metadata"]["pvt_click_id"] == "clk_abc"
-
-
-@pytest.mark.asyncio
-async def test_client_raises_on_http_error(monkeypatch):
-    import httpx
-    from services import pivota_acp_client as c
-
-    _Client.resp = _Resp(500, "boom")
-    monkeypatch.setattr(httpx, "AsyncClient", _Client)
-    with pytest.raises(c.AcpClientError) as ei:
-        await c.create_checkout_session(merchant_id="m", platform="shopify",
-                                        items=[{"sku": "S", "quantity": 1}])
-    assert ei.value.status_code == 500
-
-
-@pytest.mark.asyncio
-async def test_client_raises_on_missing_session_id(monkeypatch):
-    import httpx
-    from services import pivota_acp_client as c
-
-    _Client.resp = _Resp(201, {"status": "ready_for_payment"})  # no id
-    monkeypatch.setattr(httpx, "AsyncClient", _Client)
-    with pytest.raises(c.AcpClientError) as ei:
-        await c.create_checkout_session(merchant_id="m", platform="shopify",
-                                        items=[{"sku": "S", "quantity": 1}])
-    assert ei.value.code == "acp_no_session"
 
 
 # --- endpoint ---------------------------------------------------------------
@@ -146,20 +57,6 @@ async def test_endpoint_routes_to_redirect_when_not_acp(monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_endpoint_redirects_when_integration_disabled(monkeypatch):
-    from routes import agent_checkout_intents as m
-
-    async def fake_decision(mid, *, store_id=None, platform_override=None):
-        return _decision(is_acp=True)
-
-    monkeypatch.setattr(m, "resolve_acp_lane_decision", fake_decision)
-    monkeypatch.setattr(m.settings, "enable_platform_orders_acp", False, raising=False)
-    out = await m.create_acp_checkout(_req(), _Ctx())
-    assert out["lane"] == "redirect_floor"
-    assert out["reason"] == "acp_integration_disabled"
-
-
-@pytest.mark.asyncio
 async def test_endpoint_creates_acp_session_when_enabled(monkeypatch):
     # Positive control: a healthy in-process session service → the ACP lane.
     from routes import agent_checkout_intents as m
@@ -178,7 +75,6 @@ async def test_endpoint_creates_acp_session_when_enabled(monkeypatch):
 
     monkeypatch.setattr(m, "resolve_acp_lane_decision", fake_decision)
     monkeypatch.setattr(m, "create_session", fake_session)
-    monkeypatch.setattr(m.settings, "enable_platform_orders_acp", True, raising=False)
 
     out = await m.create_acp_checkout(_req(), _Ctx())
     assert out["status"] == "requires_in_chat_acp_checkout"
@@ -207,7 +103,6 @@ async def test_endpoint_fails_open_to_redirect_on_acp_error(monkeypatch):
 
     monkeypatch.setattr(m, "resolve_acp_lane_decision", fake_decision)
     monkeypatch.setattr(m, "create_session", boom)
-    monkeypatch.setattr(m.settings, "enable_platform_orders_acp", True, raising=False)
 
     out = await m.create_acp_checkout(_req(), _Ctx())
     assert out["lane"] == "redirect_floor"
