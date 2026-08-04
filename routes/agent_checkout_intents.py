@@ -36,7 +36,6 @@ from services.acp_checkout_session_service import (
     create_session,
     peek_session,
 )
-from config.settings import settings
 
 from sqlalchemy.sql import func
 
@@ -672,11 +671,6 @@ async def create_acp_checkout(
         }
     if not decision.is_acp:
         return _redirect_fallback(merchant_id, reason=decision.reason, platform=decision.platform)
-
-    # Defense-in-depth: even when the kill-switch permits, do not touch the
-    # pivota-acp integration unless it is explicitly enabled.
-    if not settings.enable_platform_orders_acp:
-        return _redirect_fallback(merchant_id, reason="acp_integration_disabled", platform=decision.platform)
 
     metadata: Dict[str, Any] = {
         "source": req.source or "agent_api",

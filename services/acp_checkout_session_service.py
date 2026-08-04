@@ -123,8 +123,10 @@ DEFAULT_SHIPPING_ADDRESS: Dict[str, Any] = {
     "country": "US",
 }
 
-# Keep in lockstep with routes/platform_orders_acp._ACP_ATTRIBUTION_KEYS: the
-# pvt_* keys threaded into the session metadata for attribution parity.
+# The pvt_* keys threaded into the session metadata for attribution parity.
+# (Formerly kept in lockstep with routes/platform_orders_acp._ACP_ATTRIBUTION_KEYS;
+# that router went away with the retired pivota-acp service — ADR-021. This is
+# now the single definition for the ACP lane.)
 _ACP_ATTRIBUTION_KEYS = (
     PVT_SURFACE,
     PVT_CLICK_ID,
