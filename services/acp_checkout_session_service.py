@@ -80,6 +80,7 @@ omits the field entirely.
 
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import json
 import os
@@ -118,6 +119,11 @@ STATUS_COMPLETED = "completed"
 # Resumption is convergent by construction: it replays the PSP idempotency key
 # STORED on the row, so a resumed capture replays, never re-charges.
 COMPLETING_RESUME_AFTER_SECONDS = 60
+
+# Ceiling on the (non-fatal, provider-name-only) merchant_psps read that fills
+# the create response's payment_provider — a slow row omits the field, never
+# stalls session creation.
+_PAYMENT_PROVIDER_LOOKUP_TIMEOUT_S = 1.5
 
 # The fields models.order.ShippingAddress requires (beyond `name`, which
 # _normalize_address always supplies). A session missing any of them cannot
@@ -421,11 +427,18 @@ async def _payment_provider_descriptor(merchant_id: str) -> Optional[Dict[str, A
     Honest absence beats the old hardcoded provider=stripe descriptor, which told
     every redirect-floor merchant (who have no PSP at all) that Pivota would
     charge their buyer's card through Stripe. Deliberately NON-FATAL: session
-    creation does not charge anything, so a missing PSP must not break it."""
-    try:
-        from services.merchant_psp_config_service import fetch_active_runtime_merchant_psp
+    creation does not charge anything, so a missing PSP must not break it.
 
-        row = await fetch_active_runtime_merchant_psp(merchant_id=str(merchant_id or ""))
+    Review nits 2+3: provider-ONLY query (no key material rides a path that
+    charges nothing) with a hard timeout so a slow merchant_psps can only omit
+    the field, never stall session creation."""
+    try:
+        from services.merchant_psp_config_service import fetch_active_merchant_psp_provider
+
+        provider = await asyncio.wait_for(
+            fetch_active_merchant_psp_provider(merchant_id=str(merchant_id or "")),
+            timeout=_PAYMENT_PROVIDER_LOOKUP_TIMEOUT_S,
+        )
     except Exception as exc:  # noqa: BLE001 — never fatal to session creation
         logger.warning(
             "[AcpCheckoutSession] payment-provider lookup failed merchant=%s: %s "
@@ -433,7 +446,6 @@ async def _payment_provider_descriptor(merchant_id: str) -> Optional[Dict[str, A
             merchant_id, str(exc)[:200],
         )
         return None
-    provider = str((row or {}).get("provider") or "").strip().lower()
     if not provider:
         return None
     return {"provider": provider, "supported_payment_methods": ["card"]}

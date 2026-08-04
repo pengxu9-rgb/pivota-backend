@@ -182,7 +182,8 @@ async def test_create_session_quote_failure_is_named(fake_quote):
 def _fake_psp_lookup(monkeypatch, *, row=None, raises=None):
     """Patch the PSP lookup the create response derives `payment_provider` from.
     (The service imports it lazily, so patching the module attribute is what a
-    real call would see.)"""
+    real call would see.) The service uses the provider-ONLY helper — no key
+    material rides the create path — so the fake returns just the provider."""
     import services.merchant_psp_config_service as psp_mod
 
     seen = {"merchant_ids": []}
@@ -191,9 +192,10 @@ def _fake_psp_lookup(monkeypatch, *, row=None, raises=None):
         seen["merchant_ids"].append(kwargs.get("merchant_id"))
         if raises is not None:
             raise raises
-        return row
+        provider = str(((row or {}).get("provider")) or "").strip().lower()
+        return provider or None
 
-    monkeypatch.setattr(psp_mod, "fetch_active_runtime_merchant_psp", fake_fetch)
+    monkeypatch.setattr(psp_mod, "fetch_active_merchant_psp_provider", fake_fetch)
     return seen
 
 
@@ -239,6 +241,26 @@ async def test_create_omits_payment_provider_for_a_blank_provider_row(fake_quote
     _fake_psp_lookup(monkeypatch, row={"psp_id": "psp_3", "provider": "  "})
     result = await _create()
     assert "payment_provider" not in result.raw
+
+
+async def test_create_payment_provider_lookup_times_out_instead_of_stalling(
+    fake_quote, monkeypatch
+):
+    # Review nit 2: a hung merchant_psps read may only OMIT the field — it must
+    # never stall session creation (create charges nothing; latency there is
+    # pure UX damage). The 1.5s wait_for is the ceiling; the fake hangs forever.
+    import asyncio as _asyncio
+
+    import services.merchant_psp_config_service as psp_mod
+
+    async def hanging_fetch(**kwargs):
+        await _asyncio.sleep(3600)
+
+    monkeypatch.setattr(psp_mod, "fetch_active_merchant_psp_provider", hanging_fetch)
+    monkeypatch.setattr(svc, "_PAYMENT_PROVIDER_LOOKUP_TIMEOUT_S", 0.05, raising=False)
+    result = await _asyncio.wait_for(_create(), timeout=5)
+    assert "payment_provider" not in result.raw
+    assert result.session_id.startswith("csn_")
 
 
 def test_no_fabricated_buyer_defaults_exist():

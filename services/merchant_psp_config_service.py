@@ -582,6 +582,32 @@ async def fetch_active_merchant_psps(
     return [dict(row) for row in rows or []]
 
 
+async def fetch_active_merchant_psp_provider(
+    *,
+    merchant_id: str,
+    database_override: Optional[Any] = None,
+) -> Optional[str]:
+    """The active PSP's provider name ONLY — for read paths that must not touch
+    key material (e.g. the ACP session response's payment_provider descriptor).
+    Same row-selection order as fetch_active_merchant_psps; no secret columns."""
+    merchant_value = str(merchant_id or "").strip()
+    if not merchant_value:
+        return None
+    db_client = database_override or database
+    row = await db_client.fetch_one(
+        """
+        SELECT provider
+        FROM merchant_psps
+        WHERE merchant_id = :merchant_id
+          AND status = 'active'
+        ORDER BY connected_at DESC NULLS LAST, psp_id ASC
+        """,
+        {"merchant_id": merchant_value},
+    )
+    provider = str((dict(row) if row else {}).get("provider") or "").strip().lower()
+    return provider or None
+
+
 async def fetch_active_runtime_merchant_psp(
     *,
     merchant_id: str,

@@ -708,6 +708,9 @@ async def create_acp_checkout(
         "checkout_url": session.checkout_url,
         "currency": session.currency,
         "totals": session.totals,
+        # The merchant's ACTUAL provider from their active PSP row; absent when
+        # the merchant has none (never a hardcoded guess — review nit 1).
+        "payment_provider": session.raw.get("payment_provider"),
         "pvt_click_id": req.pvt_click_id,
         # Session-lane invariants — honest about what this call does NOT do.
         "creates_pivota_order": False,
