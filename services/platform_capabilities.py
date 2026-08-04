@@ -179,9 +179,9 @@ def get_platform_protocols_for_store(
 
     Same truthful list as `get_platform_protocols`, but layers on the protocols
     whose capability is gated *per store* rather than per platform. Today that is
-    Wix ACP: the in-chat capture connector is live (pivota-acp WixConnector →
-    shared backend quote→order(acp)→pay), so a Wix merchant CAN be checked out
-    in-chat — but only once THIS store's order-writeback readiness is `enabled`
+    Wix ACP: in-chat capture is live in-process (`services/acp_checkout_session_service`
+    drives the shared gate chain → off-session capture; ADR-021), so a Wix merchant
+    CAN be checked out in-chat — but only once THIS store's order-writeback readiness is `enabled`
     (an active, verified Wix store) and it has a live PSP to settle on.
 
     Deliberately kept OUT of the platform-global `_PLATFORM_PROTOCOLS` /
@@ -243,7 +243,7 @@ SETTLEMENT_PIVOTA_PSP = "pivota_psp"
 SETTLEMENT_PLATFORM_NATIVE = "platform_native"
 SETTLEMENT_DELEGATED_TOKEN = "delegated_token"
 
-# Platforms with a wired Pivota-side charge connector (the pivota-acp lane).
+# Platforms with a wired Pivota-side charge path (the in-process ACP lane).
 _PIVOTA_PSP_CONNECTOR_PLATFORMS = frozenset({"shopify", "wix"})
 # Platforms whose merchants can expose a native agentic endpoint today.
 _DELEGATED_ENDPOINT_PLATFORMS = frozenset({"shopify"})
