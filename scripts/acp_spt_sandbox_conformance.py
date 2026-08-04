@@ -116,8 +116,8 @@ def mint_test_spt(
     POST /v1/test_helpers/shared_payment/granted_tokens
         payment_method=pm_card_visa
         usage_limits[currency|max_amount|expires_at]
-    under the preview API version. The pinned SDK (stripe-python 15.1.0) has no
-    typed resource for this preview endpoint, so it goes through the SDK's own
+    under the preview API version. The installed SDK (15.x) has no typed
+    resource for this preview endpoint, so it goes through the SDK's own
     `raw_request` — still the stripe SDK, still its auth/retry/telemetry.
 
     Returns (token_id, error_dict). Exactly one is non-None.

@@ -77,10 +77,12 @@ DEFAULT_TEST_PAYMENT_METHOD = "pm_card_visa"
 SPT_TOKEN_PREFIX = "spt_"
 
 # The preview API version that exposes the SPT parameters. Sent ONLY on SPT
-# requests, via the SDK's per-request `stripe_version` option (stripe-python
-# 15.1.0 RequestOptions supports it and turns it into the `Stripe-Version`
-# header) — the global/default API version is deliberately left alone so the
-# proven `pm_` path keeps charging on exactly the version it charges on today.
+# requests, via the SDK's per-request `stripe_version` option (stripe-python's
+# RequestOptions carries it and turns it into the `Stripe-Version` header;
+# verified on 15.1.0 and 15.4.0, and requirements.txt bounds the SDK to <16 so
+# the mechanism cannot vanish under a major bump) — the global/default API
+# version is deliberately left alone so the proven `pm_` path keeps charging on
+# exactly the version it charges on today.
 STRIPE_SPT_API_VERSION = "2026-04-22.preview"
 
 
@@ -273,9 +275,9 @@ class _StripeCaptureAdapter:
             if spt:
                 # The exact seller-flow shape. NOTE on `off_session`: Stripe's
                 # seller documentation for SharedPaymentTokens does not list it,
-                # and the pinned SDK (stripe-python 15.1.0) predates the preview
-                # and carries no `shared_payment` surface at all — so there is no
-                # contrary evidence anywhere in the pinned dependency. We
+                # and the installed SDK (15.x) predates the preview and carries
+                # no `shared_payment` surface at all — so there is no contrary
+                # evidence available in the dependency either. We
                 # therefore do NOT send it: the delegated-payment authorization
                 # rides in the token itself (the buyer authorized it with
                 # OpenAI), and sending an undocumented flag on a money call is
@@ -394,7 +396,12 @@ class _AdyenCaptureAdapter:
         stored_pm = str(payment_method or "").strip()
         # Adyen has no universal test PM — a real stored payment method is required
         # on BOTH lanes (the token is a storedPaymentMethodId, not a card).
-        if not stored_pm or stored_pm.startswith(("pm_", "tok_", "vt_")):
+        # `spt_` joins the refused prefixes (review N3): a Stripe SharedPaymentToken
+        # is meaningless to Adyen, and forwarding it produced an adyen_http_*/
+        # adyen_refused failure — both AMBIGUOUS, so the session wedged in
+        # `completing` until TTL. Refusing here is PRE-DISPATCH instead: it
+        # releases a fresh claim and holds a resumed one, which is correct on both.
+        if not stored_pm or stored_pm.startswith(("pm_", "tok_", "vt_", "spt_")):
             return _fail(amount_cents, currency, "adyen_requires_stored_payment_method", "adyen_pm_required")
 
         shopper_ref = self._shopper_reference(metadata, cfg)

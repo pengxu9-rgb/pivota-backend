@@ -425,9 +425,13 @@ async def test_adyen_requires_shopper_reference(monkeypatch):
 
 @pytest.mark.asyncio
 async def test_adyen_rejects_stripe_style_token(monkeypatch):
-    # A Stripe-style pm_/tok_/vt_ token is not an Adyen storedPaymentMethodId.
+    # A Stripe-style pm_/tok_/vt_/spt_ token is not an Adyen storedPaymentMethodId.
+    # `spt_` matters especially (review N3): forwarding it produced an
+    # adyen_http_*/adyen_refused failure, both AMBIGUOUS, which wedges the
+    # session in `completing` until TTL. Refusing PRE-DISPATCH releases a fresh
+    # claim and holds a resumed one — correct on both.
     _install_merchant_key(monkeypatch, api_key="test_ADYEN", psp_provider="adyen", provider_config=_ADYEN_CFG)
-    for tok in ("pm_card_visa", "tok_test", "vt_abc", ""):
+    for tok in ("pm_card_visa", "tok_test", "vt_abc", "spt_abc123", ""):
         r = await cap.capture_offsession(
             merchant_id="m", amount_cents=169, currency="USD", idempotency_key="k",
             payment_method=tok, metadata=dict(_ADYEN_MD), max_cents=5000,
@@ -735,27 +739,29 @@ async def test_spt_still_respects_the_amount_cap(monkeypatch):
 
 @pytest.mark.asyncio
 async def test_spt_on_a_non_stripe_provider_is_unaffected(monkeypatch):
-    # The SPT branch belongs to the Stripe adapter alone. With the flag ON, an
-    # Adyen merchant's request is untouched: no shared_payment_granted_token,
-    # no preview version — Adyen still treats the token exactly as it did
-    # before (its own storedPaymentMethodId slot). An SPT is meaningless to
-    # Adyen and Adyen refuses it; that is Adyen's problem to answer, not ours to
-    # reinterpret.
+    # The SPT branch belongs to the Stripe adapter alone: no
+    # shared_payment_granted_token and no preview version ever reach Adyen.
+    # Adyen REFUSES an spt_ pre-dispatch (review N3) rather than forwarding it
+    # into its storedPaymentMethodId slot — forwarding produced an ambiguous
+    # adyen_http_*/adyen_refused failure, which wedged the session until TTL,
+    # whereas a pre-dispatch refusal releases a fresh claim and holds a resumed
+    # one. Nothing is sent to Adyen at all, so no Stripe parameter can leak.
     _install_merchant_key(
         monkeypatch, api_key="test_ADYEN", psp_provider="adyen", provider_config=_ADYEN_CFG,
     )
     _install_adyen_http(
         monkeypatch, payload={"resultCode": "Refused", "refusalReason": "Invalid stored PM"},
     )
+    _FakeAdyenClient.captured = {}
     _arm_spt(monkeypatch)
     r = await cap.capture_offsession(
         merchant_id="m", amount_cents=169, currency="USD", idempotency_key="k",
         payment_method=SPT, metadata=dict(_ADYEN_MD), max_cents=5000,
     )
     assert r.success is False and r.provider == "adyen"
-    body = _FakeAdyenClient.captured["json"]
-    assert body["paymentMethod"] == {"type": "scheme", "storedPaymentMethodId": SPT}
-    assert "shared_payment_granted_token" not in _json.dumps(body)
+    assert r.error_code == "adyen_pm_required"
+    # No HTTP call was made at all — the refusal is local and pre-dispatch.
+    assert not _FakeAdyenClient.captured
 
 
 # --- failure normalization stays conservative --------------------------------
@@ -812,3 +818,25 @@ def test_is_shared_payment_token_gate():
     assert cap.is_shared_payment_token("  spt_abc  ")
     for other in ("pm_card_visa", "vt_abc", "tok_test", "", None, "SPT_ABC"):
         assert not cap.is_shared_payment_token(other)
+
+
+@pytest.mark.asyncio
+async def test_adyen_refuses_spt_in_both_flag_states(monkeypatch):
+    # The SPT flag governs the STRIPE adapter only. An Adyen merchant must refuse
+    # a SharedPaymentToken pre-dispatch whether the flag is on or off — Stripe's
+    # token means nothing to Adyen, and the refusal must not depend on a Stripe
+    # feature gate.
+    _install_merchant_key(monkeypatch, api_key="test_ADYEN", psp_provider="adyen", provider_config=_ADYEN_CFG)
+    for flag in (False, True):
+        monkeypatch.setattr(cap.settings, "acp_spt_capture_enabled", flag, raising=False)
+        r = await cap.capture_offsession(
+            merchant_id="m", amount_cents=169, currency="USD", idempotency_key="k",
+            payment_method="spt_1AbcDef", metadata=dict(_ADYEN_MD), max_cents=5000,
+        )
+        assert r.success is False
+        assert r.error_code == "adyen_pm_required"
+        # Pre-dispatch by construction: it is in the pre-dispatch set, so a FRESH
+        # claim may release on it while a RESUMED claim holds (money-path doctrine).
+        from services import acp_checkout_session_service as svc
+
+        assert "adyen_pm_required" in svc._PRE_DISPATCH_ERROR_CODES

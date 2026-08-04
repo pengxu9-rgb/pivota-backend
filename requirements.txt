@@ -2,7 +2,7 @@ fastapi==0.104.1
 uvicorn[standard]
 httpx<0.28
 python-dotenv
-stripe
+stripe>=15,<16  # money path: bound the major so per-request stripe_version (SPT preview) cannot vanish
 SQLAlchemy==1.4.52
 greenlet
 databases==0.7.0

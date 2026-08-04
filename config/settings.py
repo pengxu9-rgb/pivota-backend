@@ -465,9 +465,12 @@ class Settings(BaseSettings):
     # replaces) the kill-switch chain, the test/live key lane guards and the
     # AGENT_ACP_*_MAX_CENTS caps.
     # Default OFF, and OFF means byte-for-byte today's behavior for an `spt_`
-    # token — the live lane refuses it (`live_pm_required`; it is not a `pm_`)
-    # and the test lane substitutes DEFAULT_TEST_PAYMENT_METHOD. `pm_` and `vt_`
-    # are untouched in BOTH flag states.
+    # token: the test lane substitutes DEFAULT_TEST_PAYMENT_METHOD, and the LIVE
+    # lane FORWARDS it to Stripe as `payment_method`, where Stripe rejects it.
+    # The live lane does NOT refuse it locally — that guard refuses only an EMPTY
+    # or TEST payment method, never an unrecognized prefix — so do not read
+    # flag-OFF as locally fail-closed on the live lane. `pm_` and `vt_` are
+    # untouched in BOTH flag states.
     acp_spt_capture_enabled: bool = (
         os.getenv("ACP_SPT_CAPTURE_ENABLED", "false").strip().lower()
         in {"true", "1", "on", "yes"}
