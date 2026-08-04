@@ -889,12 +889,28 @@ async def test_resume_of_pre_attempt_scoping_row_replays_the_legacy_key(fake_quo
     assert keys == [f"acp_complete:{created.session_id}"]
 
 
+async def test_create_session_refuses_a_blank_agent_id(fake_quote):
+    # N5 (create side): an explicit None/blank would mint a session that
+    # complete_session can never accept — refused at the door.
+    for bad in (None, "", "   "):
+        with pytest.raises(svc.AcpCheckoutSessionError) as ei:
+            await _create(agent_id=bad)
+        assert ei.value.code == "acp_agent_required"
+        assert ei.value.status_code == 400
+
+
 async def test_unbound_agent_session_cannot_be_completed(fake_quote, monkeypatch):
-    # N5: no bound agent identity → the money path's identity check can never be
-    # satisfied, so the completion is refused rather than merchant-authorized.
+    # N5 (complete side): create refuses NULL agents now, so an unbound session
+    # can only come from an out-of-contract writer — seed one directly and prove
+    # the money path still refuses it.
     _arm_capture_lane(monkeypatch)
     calls = _mock_order_layer(monkeypatch)
-    created = await _create(agent_id=None)
+    created = await _create()
+    await database.execute(
+        acp_checkout_sessions.update()
+        .where(acp_checkout_sessions.c.id == created.session_id)
+        .values(agent_id=None)
+    )
     with pytest.raises(svc.AcpCheckoutSessionError) as ei:
         await svc.complete_session(
             session_id=created.session_id, agent_context=_Ctx(), payment_token="pm_card_visa",
@@ -925,7 +941,10 @@ def test_capture_failure_classification_is_conservative():
     # PSP said no.
     assert definitive("failed", "card_declined")
     assert definitive("failed", "expired_card")
-    assert definitive("failed", "adyen_refused")
+    # Review B2: adyen_refused covers resultCodes where money may have moved
+    # (Received/Pending/PartiallyAuthorised) — ambiguous until the adapter
+    # narrows to resultCode=="Refused" and an Adyen canary proves it.
+    assert not definitive("failed", "adyen_refused")
     # Nothing was ever dispatched to a PSP.
     assert definitive("failed", "no_merchant_psp")
     assert definitive("failed", "live_key_refused")
@@ -1021,3 +1040,139 @@ def test_no_simulation_fallback_exists():
     src = inspect.getsource(svc).split('"""', 2)[2]
     assert "payment_captured" not in src
     assert "def simulate" not in src and "simulate_" not in src
+
+
+async def test_resumed_claim_is_held_when_pre_dispatch_work_fails(fake_quote, monkeypatch):
+    # Review B1: a RESUMED claim exists precisely because a prior attempt may
+    # have left a charge in flight under the stored key. A pre-dispatch failure
+    # during the resume (order lookup, quote, gates) must therefore HOLD the
+    # claim — releasing it would let the next attempt mint :a2 and double-charge.
+    _arm_capture_lane(monkeypatch)
+    calls = _mock_order_layer(monkeypatch)
+    created = await _create()
+    keys: list = []
+    _spy_capture(monkeypatch, keys, outcomes=[_failed_outcome("stripe_error")])
+
+    with pytest.raises(svc.AcpCheckoutSessionError) as ei:
+        await svc.complete_session(
+            session_id=created.session_id, agent_context=_Ctx(),
+            payment_token="pm_card_visa", idempotency_key="key_try_1",
+        )
+    assert ei.value.code == "acp_capture_pending_retry"  # ambiguous → claim held
+
+    # Age past the resume window, then make the RESUME fail before dispatch.
+    await database.execute(
+        acp_checkout_sessions.update()
+        .where(acp_checkout_sessions.c.id == created.session_id)
+        .values(updated_at=datetime.now(timezone.utc) - timedelta(seconds=120))
+    )
+    import db.orders as orders_mod
+
+    async def exploding_get_order(oid):
+        raise RuntimeError("orders table unavailable")
+
+    monkeypatch.setattr(orders_mod, "get_order", exploding_get_order)
+    with pytest.raises(Exception):
+        await svc.complete_session(
+            session_id=created.session_id, agent_context=_Ctx(),
+            payment_token="pm_card_visa", idempotency_key="key_try_2",
+        )
+    row = await svc.peek_session(created.session_id)
+    assert row["status"] == "completing"  # HELD — not reverted to ready
+    assert row["capture_attempt"] == 1
+    assert row["psp_idempotency_key"] == f"acp_complete:{created.session_id}:a1"
+
+    # Restore the order layer; the next stale resume converges on the SAME key.
+    async def good_get_order(oid):
+        return {
+            "order_id": oid, "merchant_id": "merch_x", "total_amount": 1.69,
+            "currency": "USD", "status": "created", "payment_status": "pending",
+            "metadata": {"protocol_name": "acp", "checkout_session_id": "whatever"},
+        }
+
+    monkeypatch.setattr(orders_mod, "get_order", good_get_order)
+    await database.execute(
+        acp_checkout_sessions.update()
+        .where(acp_checkout_sessions.c.id == created.session_id)
+        .values(updated_at=datetime.now(timezone.utc) - timedelta(seconds=120))
+    )
+    out = await svc.complete_session(
+        session_id=created.session_id, agent_context=_Ctx(),
+        payment_token="pm_card_visa", idempotency_key="key_try_3",
+    )
+    assert out["status"] == "completed"
+    derived = f"acp_complete:{created.session_id}:a1"
+    assert keys == [derived, derived]  # never :a2 — no re-keyed second charge
+    row = await svc.peek_session(created.session_id)
+    assert row["capture_attempt"] == 1
+
+
+async def test_resumed_claim_is_held_on_pre_dispatch_failure_after_persist_failure(
+    fake_quote, monkeypatch
+):
+    # Review B1, severe variant: attempt 1 CHARGED (only the completion persist
+    # failed). A failing resume must not release the claim — the charge exists.
+    _arm_capture_lane(monkeypatch)
+    calls = _mock_order_layer(monkeypatch)
+    keys: list = []
+    _spy_capture(monkeypatch, keys)
+
+    real_persist = svc._persist_completion
+    fail_once = {"armed": True}
+
+    async def flaky_persist(**kwargs):
+        if fail_once["armed"]:
+            fail_once["armed"] = False
+            raise RuntimeError("db blip")
+        return await real_persist(**kwargs)
+
+    monkeypatch.setattr(svc, "_persist_completion", flaky_persist)
+    created = await _create()
+    with pytest.raises(svc.AcpCheckoutSessionError) as ei:
+        await svc.complete_session(
+            session_id=created.session_id, agent_context=_Ctx(),
+            payment_token="pm_card_visa", idempotency_key="key_try_1",
+        )
+    assert ei.value.code == "acp_completion_persist_failed"
+
+    # Stale resume whose pre-dispatch work fails (gates refuse: lane switched
+    # off mid-incident — the exact operator action review B1 called out).
+    await database.execute(
+        acp_checkout_sessions.update()
+        .where(acp_checkout_sessions.c.id == created.session_id)
+        .values(updated_at=datetime.now(timezone.utc) - timedelta(seconds=120))
+    )
+    monkeypatch.setattr(settings, "agent_acp_test_capture", False, raising=False)
+    with pytest.raises(svc.AcpCheckoutSessionError):
+        await svc.complete_session(
+            session_id=created.session_id, agent_context=_Ctx(),
+            payment_token="pm_card_visa", idempotency_key="key_try_2",
+        )
+    row = await svc.peek_session(created.session_id)
+    assert row["status"] == "completing"  # charge exists — claim must be HELD
+
+    # Lane back on → stale resume replays the SAME key and converges.
+    monkeypatch.setattr(settings, "agent_acp_test_capture", True, raising=False)
+    await database.execute(
+        acp_checkout_sessions.update()
+        .where(acp_checkout_sessions.c.id == created.session_id)
+        .values(updated_at=datetime.now(timezone.utc) - timedelta(seconds=120))
+    )
+    out = await svc.complete_session(
+        session_id=created.session_id, agent_context=_Ctx(),
+        payment_token="pm_card_visa", idempotency_key="key_try_3",
+    )
+    assert out["status"] == "completed"
+    derived = f"acp_complete:{created.session_id}:a1"
+    assert keys == [derived, derived]
+    row = await svc.peek_session(created.session_id)
+    assert row["capture_attempt"] == 1
+
+
+async def test_adyen_refused_is_not_classified_definitive():
+    # Review B2: the Adyen adapter emits adyen_refused for resultCodes that
+    # include Received/Pending/PartiallyAuthorised — outcomes where money may
+    # have moved. Until the adapter narrows to resultCode=="Refused" (proven by
+    # a canary), an adyen_refused failure must HOLD the claim (ambiguous).
+    assert "adyen_refused" not in svc._DEFINITIVE_DECLINE_ERROR_CODES
+    assert not svc._capture_failure_is_definitive(_failed_outcome("adyen_refused"))

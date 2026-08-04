@@ -470,6 +470,12 @@ async def create_session(
     (complete_session refuses it with `acp_agent_unbound`). Making it a
     positional-by-name requirement stops a caller from silently minting an
     uncompletable session by omitting it."""
+    if not str(agent_id or "").strip():
+        # An explicit None/blank would mint a session complete_session can never
+        # accept (acp_agent_unbound) — refuse at the door instead.
+        raise AcpCheckoutSessionError(
+            "agent_id_required", code="acp_agent_required", status_code=400
+        )
     normalized_items = _normalize_items(items)
     if not normalized_items:
         raise AcpCheckoutSessionError(
@@ -1020,8 +1026,12 @@ _DEFINITIVE_DECLINE_ERROR_CODES = frozenset(
         "lost_card",
         "stolen_card",
         "fraudulent",
-        # Adyen: resultCode was neither Authorised nor an SCA action → refused.
-        "adyen_refused",
+        # NOTE (review B2): `adyen_refused` is deliberately NOT in this set. The
+        # Adyen adapter emits it for EVERY resultCode that is neither Authorised
+        # nor an SCA action — a bucket that includes Received/Pending (payment in
+        # flight) and PartiallyAuthorised (money moved). Until the adapter is
+        # narrowed to resultCode == "Refused" and proven by an Adyen canary,
+        # Adyen failures are held as AMBIGUOUS (claim kept, same-key replay).
     }
 )
 
@@ -1363,10 +1373,15 @@ async def complete_session(
             )
 
     except BaseException:
-        # Nothing has been dispatched to a PSP yet (gate refusal, quote/order
-        # failure, lane disabled): no charge can stand, so release the claim and
-        # let the session be retried. order_id is kept for reuse.
-        await _revert_claim_to_ready(sid)
+        # Nothing has been dispatched to a PSP under THIS claim (gate refusal,
+        # quote/order failure, lane disabled) — but that reasoning only holds for
+        # a FRESH claim. A RESUMED claim exists precisely because a prior attempt
+        # may have left a charge in flight under the stored key; releasing it
+        # here would let the next attempt mint a NEW key and double-charge
+        # (review B1). So: fresh claim → release for retry (order_id kept);
+        # resumed claim → hold, the stale-takeover path converges it later.
+        if not resumed:
+            await _revert_claim_to_ready(sid)
         raise
 
     # ---- the charge itself: a failure here is CLASSIFIED, never blanket-reverted
