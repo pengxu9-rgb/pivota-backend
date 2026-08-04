@@ -66,13 +66,21 @@ ONE spelling, THREE writers: the recovery predicate, `backfill_pdp_scope.py`
 docstring claim). An AST test pins all three call sites; the bucket literal is
 pinned by test to `seller_identity.BANNED_BUCKET_MERCHANT_ID`.
 
-Known, deliberate divergence: the backfill matches seeds attached by BOTH the
-product_key and the pipe-composite form; the recovery predicate matches only
-product_key. Pre-existing, pinned by test so it cannot silently vanish, and
-unifying it needs its own measurement.
+The formerly pinned divergence — the backfill matched seeds attached by BOTH
+the product_key and the pipe-composite form, the recovery predicate only by
+product_key — is CLOSED (2026-08-04): both sides now render
+`seed_attachment_keys_sql` from the classifier module, one spelling. Measured
+at closure: prod cohort 0 (no row's demotion or promotion verdict changed;
+demotion set 2,201 under both predicates, first-tick promotion set 350 under
+both).
 
-Cadence (D3) still undecided: the backfill remains manual. Until a cron runs
-it, a new genuinely-multi-seller mirror row stays `unverified`.
+SCOPE NOTE (post-#1680-review): the CLI backfill is INITIAL RESOLUTION for
+real-merchant rows only — `_fetch_batch` excludes bucket rows. `classify()`
+never returns 'unverified', and 'merchant_owned' is an AFFIRMED state
+(brand_verified_graduation: "resolved, NOT canonical") that exits the
+`WHERE pdp_scope='unverified'` promotion gate forever — a state a bucket row
+must never receive. Bucket lifecycle belongs to the P4 demote / D3 promote
+pair. Cadence for THIS script stays manual; the scheduled path is D3 below.
 
 ### P4 — demotion backfill — MEASURED 2026-08-04, script in THIS PR
 
@@ -85,9 +93,58 @@ it, a new genuinely-multi-seller mirror row stays `unverified`.
 | Node market-filter recall lost | **0 of 2,201** (every row has a US-market seed) |
 
 `scripts/demote_unqualified_canonical_scopes.py`: dry-run by default,
-reversibility record of every previous value, CAS-guarded writes, selection
+reversibility record of every previous value, CAS-guarded writes (`RETURNING`
+— `databases.execute()` returns None on this stack, finding F4), selection
 interpolates `CANONICAL_SCOPE_PREDICATE` inside `NOT(...)` — one rule, one
 spelling. Execution against prod (`--apply`) is the remaining operator action.
+Re-measured 2026-08-04 after the composite-arm closure: demotion set unchanged
+at 2,201.
+
+### D3 — promote-only cron — REDESIGNED after #1680 review (findings F1–F4)
+
+The first D3 shipped the CLI backfill's classify() loop on a 6-hour schedule.
+Review drove it end-to-end on Postgres and found the design self-defeating:
+
+- **F1 (fatal):** classify() never returns 'unverified' — every P4-demoted
+  row (single-seller by construction, all 2,201) would be resolved to
+  'merchant_owned' at the FIRST tick, exiting the
+  `WHERE pdp_scope='unverified'` promotion gate forever: demote-to-
+  merchant_owned with a 6-hour delay, the exact outcome D1 rejected.
+- **F2:** "first ticks are no-ops" was false — the 0-of-284 measurement
+  covered unsuppressed bucket rows; the loop covers ALL unverified rows.
+  First tick on prod: ~1,253 writes, including ~905 merchant_owned
+  conversions parking every future not-yet-multi-seller mirror row.
+- **F3:** the backfill's seller-count sum cannot see the predicate's
+  product-group-peer and ext-cluster arms (110 prod canonical rows qualify
+  only via those); and the predicate lacked the backfill's composite-
+  attachment arm (prod cohort 0) — closed, see P3.
+- **F4:** `databases.execute()` returns None always — rowcounts must come
+  from `RETURNING`.
+
+The root error: the promotion gate treats classification as ONE-SHOT
+RESOLUTION; the redesign needs CONTINUOUS RE-QUALIFICATION. The redone cron
+(`jobs/pdp_scope_backfill_cron.py`, registered every 6h at :31) is therefore
+PROMOTE-ONLY and predicate-driven: ONE UPDATE — promote 'unverified',
+unsuppressed rows satisfying `CANONICAL_SCOPE_PREDICATE`
+(`pdp_scope_source='d3_promotion_cron'`). No classify() loop, no second
+spelling of the rule; unqualified rows STAY 'unverified' and stay
+re-checkable. There is no "no-op first ticks" claim and no live re-promotion
+from day one: the cron ships DISABLED
+(`PDP_SCOPE_BACKFILL_ENABLED` defaults false — a stated deviation from house
+style), because the first enabled tick is serving-visible.
+
+Measured 2026-08-04: the first enabled tick promotes **350** rows (349
+real-merchant, 1 bucket), each gaining the +200 rank term in three backend
+sites plus the Node ranker's +200 and market-filter exemption — a vetted rule,
+an unmeasured batch impact.
+
+**Operator enable sequence** (either order relative to P4 --apply is safe —
+the cron never demotes and never touches suppressed rows):
+1. dry-measure the 350-row cohort (top-N diff over the sampled query set, as
+   for P4) if ranking impact matters to the release;
+2. set `PDP_SCOPE_BACKFILL_ENABLED=true`;
+3. watch the first tick's `pdp_scope_promotion` log line and the promoted
+   count; the steady state per tick is near zero.
 
 Original plan text follows.
 
@@ -121,8 +178,9 @@ it is in form (a lane asserting the literal). Either exempt it in P5's
 allow-list with the rule-1 justification, or route it through the classifier
 too. Low urgency; it agrees with the rule today.
 
-**D3 — cadence for P3** (cron vs manual) — determines promotion lag for new
-multi-seller mirror rows.
+**D3 — cadence for P3** — RESOLVED (see the D3 section under P4): a
+promote-only, predicate-driven cron, disabled by default; the CLI backfill
+stays manual and excludes bucket rows.
 
 ## Sequencing
 

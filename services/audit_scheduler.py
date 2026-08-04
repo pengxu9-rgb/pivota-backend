@@ -674,13 +674,17 @@ async def start_scheduler() -> None:
             max_instances=1,
         )
 
-        # pdp_scope promotion — D3 of docs/PDP_SCOPE_REDESIGN.md. The only
-        # promotion path for 'unverified' rows (every promotion writer is gated
-        # on that state), so without this tick a P4-demoted row that later
-        # gains a second seller stays demoted forever. :31 offsets it from the
-        # :17 trust slots and :43 reconciler so the 6-hourly catalog sweeps
-        # never contend on the shared Postgres. Disable via
-        # PDP_SCOPE_BACKFILL_ENABLED=false without a deploy.
+        # pdp_scope promotion — D3 of docs/PDP_SCOPE_REDESIGN.md. PROMOTE-ONLY
+        # (one predicate-driven UPDATE; unqualified rows STAY 'unverified' and
+        # stay re-checkable — see the job docstring for why the classify()
+        # loop must never run here). The scheduled promotion path for
+        # 'unverified' rows, so a P4-demoted row that later gains a second
+        # seller is promoted by the next tick. :31 offsets it from the :17
+        # trust slots and :43 reconciler so the 6-hourly catalog sweeps never
+        # contend on the shared Postgres. DISABLED BY DEFAULT
+        # (PDP_SCOPE_BACKFILL_ENABLED, a stated deviation from house style):
+        # the first enabled tick is serving-visible; enabling is an operator
+        # step documented in the doc.
         from jobs.pdp_scope_backfill_cron import run_pdp_scope_backfill_tick
         _add_job(
             run_pdp_scope_backfill_tick,

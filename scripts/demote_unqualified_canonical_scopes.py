@@ -93,7 +93,11 @@ async def demote_row(product_key: str) -> bool:
     is left alone — the same shape as #1663's phase-2 guard, for the same
     reason: an UPDATE that assumes a stale read clobbers a concurrent truth.
     """
-    result = await database.execute(
+    # RETURNING, because databases.execute() returns None for UPDATE on this
+    # stack (driven on 0.7.0 and 0.9.0 — review finding F4 on PR #1680): the
+    # written/skipped verdict must come from the write itself, not a
+    # re-SELECT that races the very concurrency the CAS guard exists for.
+    row = await database.fetch_one(
         """
         UPDATE catalog_products
         SET pdp_scope = 'unverified',
@@ -101,18 +105,11 @@ async def demote_row(product_key: str) -> bool:
             pdp_scope_set_at = NOW()
         WHERE product_key = :pk
           AND pdp_scope = 'multi_merchant_canonical'
+        RETURNING product_key
         """,
         {"pk": product_key, "src": DEMOTION_SOURCE},
     )
-    # `databases` returns the row count for UPDATE on asyncpg; treat any falsy
-    # result defensively as "not written" and re-check.
-    if result in (None, 0):
-        row = await database.fetch_one(
-            "SELECT pdp_scope FROM catalog_products WHERE product_key = :pk",
-            {"pk": product_key},
-        )
-        return bool(row and dict(row).get("pdp_scope") == "unverified")
-    return True
+    return row is not None
 
 
 async def run_demotion(*, apply: bool, limit: int = 10_000) -> Dict[str, Any]:

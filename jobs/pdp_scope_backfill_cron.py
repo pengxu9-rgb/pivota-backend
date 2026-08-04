@@ -1,33 +1,47 @@
-"""pdp_scope promotion cron — D3 of docs/PDP_SCOPE_REDESIGN.md.
+"""pdp_scope promotion cron — D3 of docs/PDP_SCOPE_REDESIGN.md. PROMOTE-ONLY.
 
-Runs the classifier-backed backfill (scripts/backfill_pdp_scope.run_backfill —
-the SAME loop as the CLI; a cron with its own copy would be the drift shape
-this workstream removes) on a schedule, so `'unverified'` rows that gain a
-second seller are promoted without an operator.
+One UPDATE per tick: rows at `'unverified'` (and not suppressed) that satisfy
+`CANONICAL_SCOPE_PREDICATE` — the promotion writer's own string, interpolated,
+never retyped — are promoted to canonical. Rows that do NOT qualify are LEFT
+at `'unverified'`, which is the whole point: the redesign needs CONTINUOUS
+RE-QUALIFICATION, and `'unverified'` is the only state every promotion writer
+re-checks. A row that gains its second seller next week is promoted by the
+tick after that.
 
-WHY THIS MUST BE SCHEDULED (D1, decided 2026-08-04): the pdp_matcher gates
-cross-merchant seed attachment on the canonical label, and every promotion
-writer is gated `WHERE pdp_scope='unverified'`. P4 demotes ~2,201 mislabelled
-rows to 'unverified'; without this cron their only re-promotion path is a
-manual script run — a one-way door with extra steps. With it, a row gains its
-second seller through any non-matcher route (a foreign-merchant offer, a
-product-group peer, an ext-cluster spanning >= 2 domains), the next tick
-promotes it, and the matcher opens for it.
+WHY THIS IS NOT run_backfill (review finding F1 on PR #1680): the CLI
+backfill's classify() loop resolves EVERY unverified row and never returns
+'unverified' — single-seller rows get 'merchant_owned', an AFFIRMED state that
+exits the `WHERE pdp_scope='unverified'` promotion gate forever. Run on a
+schedule, that converts the P4 demotion (all 2,201 rows single-seller by
+construction) into demote-to-merchant_owned with a 6-hour delay — the exact
+one-way door D1 rejected — and parks every future not-yet-multi-seller mirror
+row the same way. One-shot resolution and continuous re-qualification are
+different operations; this cron performs only the second.
 
-Measured safety at introduction (2026-08-04): 0 of the 284 unsuppressed
-'unverified' bucket rows qualified for promotion, so the first ticks are no-ops
-until the P4 demotion lands or ingestion adds qualifying rows.
+DISABLED BY DEFAULT — a stated deviation from house style (sibling crons
+default enabled): the first enabled tick promotes the currently-qualified
+'unverified' cohort (measured 2026-08-04: 350 rows — 349 real-merchant, 1
+bucket), each gaining the +200 rank term in three backend sites plus the Node
+ranker's +200 and market-filter exemption. The rule is vetted but the ranking
+impact of the batch is unmeasured, so enabling is an explicit operator step:
+measure, set PDP_SCOPE_BACKFILL_ENABLED=true, watch the first tick. Sequence
+in docs/PDP_SCOPE_REDESIGN.md.
 
 Env vars:
-  PDP_SCOPE_BACKFILL_ENABLED   default true — set false to pause without deploy
-  PDP_SCOPE_BACKFILL_LIMIT     default 5000 — rows per tick (a tick that hits
-      the cap simply leaves the tail for the next tick; the set only shrinks)
+  PDP_SCOPE_BACKFILL_ENABLED   default FALSE — see above; set true to enable
+  PDP_SCOPE_BACKFILL_LIMIT     default 5000 — max promotions per tick (a tick
+      that hits the cap leaves the tail for the next tick)
 """
 
 from __future__ import annotations
 
 import logging
 import os
+from typing import Any, Dict
+
+from db.database import database
+from services.pdp_identity_recovery import CANONICAL_SCOPE_PREDICATE
+from services.pdp_scope_classifier import SCOPE_CANONICAL
 
 logger = logging.getLogger(__name__)
 
@@ -35,9 +49,36 @@ _DEFAULT_LIMIT = 5_000
 _ENV_ENABLED = "PDP_SCOPE_BACKFILL_ENABLED"
 _ENV_LIMIT = "PDP_SCOPE_BACKFILL_LIMIT"
 
+# pdp_scope_source marker (varchar(32)) — greppable back to this cron.
+PROMOTION_SOURCE = "d3_promotion_cron"
+
+# Postgres UPDATE takes no LIMIT, so the cap lives in a subselect; the outer
+# `AND pdp_scope = 'unverified'` re-checks the gate at write time (CAS — a row
+# promoted or suppressed between subselect and write is skipped, not
+# clobbered). RETURNING because databases.execute() returns None on this
+# stack (driven on 0.7.0 and 0.9.0) — rowcounts must come from RETURNING.
+_PROMOTE_SQL = """
+    UPDATE catalog_products
+    SET pdp_scope = :scope,
+        pdp_scope_source = :source,
+        pdp_scope_set_at = NOW()
+    WHERE product_key IN (
+        SELECT cp.product_key
+        FROM catalog_products cp
+        WHERE cp.pdp_scope = 'unverified'
+          AND cp.suppressed_at IS NULL
+          AND (
+{predicate}
+          )
+        LIMIT :limit
+    )
+      AND pdp_scope = 'unverified'
+    RETURNING product_key
+""".format(predicate=CANONICAL_SCOPE_PREDICATE)
+
 
 def _is_enabled() -> bool:
-    return os.getenv(_ENV_ENABLED, "true").strip().lower() not in {"0", "false", "no", "off"}
+    return os.getenv(_ENV_ENABLED, "false").strip().lower() in {"1", "true", "yes", "on"}
 
 
 def _limit() -> int:
@@ -47,27 +88,34 @@ def _limit() -> int:
     try:
         return max(1, int(raw))
     except (TypeError, ValueError):
-        logger.warning("pdp_scope_backfill: invalid %s=%r; using %d",
+        logger.warning("pdp_scope_promotion: invalid %s=%r; using %d",
                        _ENV_LIMIT, raw, _DEFAULT_LIMIT)
         return _DEFAULT_LIMIT
+
+
+async def run_promotion_pass(*, limit: int = _DEFAULT_LIMIT) -> Dict[str, Any]:
+    """The one UPDATE. No classify() loop, no second spelling of the rule —
+    the predicate is interpolated from services.pdp_identity_recovery."""
+    rows = await database.fetch_all(
+        _PROMOTE_SQL,
+        {"scope": SCOPE_CANONICAL, "source": PROMOTION_SOURCE, "limit": limit},
+    )
+    return {"promoted": len(rows or [])}
 
 
 async def run_pdp_scope_backfill_tick() -> None:
     """One scheduled pass. Fire-and-forget from the scheduler's point of view —
     an exception is logged, never raised into APScheduler."""
     if not _is_enabled():
-        logger.info("pdp_scope_backfill: disabled via %s", _ENV_ENABLED)
+        logger.info("pdp_scope_promotion: disabled via %s (default) — operator-enable only", _ENV_ENABLED)
         return
     try:
-        from db.database import database
-        from scripts.backfill_pdp_scope import run_backfill
-
         if not getattr(database, "is_connected", False):
             await database.connect()
-        result = await run_backfill(limit=_limit())
-        if result.get("total"):
-            logger.info("pdp_scope_backfill: %s", result)
+        result = await run_promotion_pass(limit=_limit())
+        if result.get("promoted"):
+            logger.info("pdp_scope_promotion: %s", result)
         else:
-            logger.debug("pdp_scope_backfill: nothing unverified to classify")
+            logger.debug("pdp_scope_promotion: no unverified row qualifies")
     except Exception:
-        logger.exception("pdp_scope_backfill tick failed")
+        logger.exception("pdp_scope promotion tick failed")

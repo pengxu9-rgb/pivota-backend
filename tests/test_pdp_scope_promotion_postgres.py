@@ -301,6 +301,43 @@ def test_only_genuine_multi_seller_shapes_are_promoted(engine, case):
         "signals, so an over-promotion outranks real merchant listings.")
 
 
+def test_composite_attached_seed_promotes_a_real_merchant_row(engine):
+    """#1676's pinned divergence, closed and DRIVEN (not just string-pinned):
+    a seed attached by the pipe-composite form
+    (merchant_id|platform|source_product_id) now counts for the promotion
+    predicate's seed-domain arm, exactly as it always has for the backfill's
+    seller count. Real merchant (1) + one composite-attached seed domain (1)
+    = 2 -> promote. Before the closure this row was invisible to the
+    predicate — and therefore to the P4 demotion selection and the D3 cron."""
+    from sqlalchemy import text
+
+    pk = f"pk_composite_{_RUN}"
+    composite = f"acme_shop|shopify|sp_comp_{_RUN}"
+    with engine.begin() as c:
+        c.execute(text("DELETE FROM external_product_seeds"
+                       " WHERE attached_product_key = :a"), {"a": composite})
+        c.execute(text("DELETE FROM catalog_products WHERE product_key = :pk"),
+                  {"pk": pk})
+        c.execute(text(
+            "INSERT INTO catalog_products (product_key, merchant_id, platform,"
+            " source_product_id, pdp_scope) VALUES (:pk, 'acme_shop',"
+            " 'shopify', :spid, 'unverified')"),
+            {"pk": pk, "spid": f"sp_comp_{_RUN}"})
+        c.execute(text(
+            "INSERT INTO external_product_seeds (id, attached_product_key,"
+            " status, domain) VALUES (:i, :a, 'active', 'zappos.com')"),
+            {"i": f"comp_{_RUN}", "a": composite})
+
+    _run_promotion(engine, pk)
+
+    with engine.begin() as c:
+        scope = c.execute(text("SELECT pdp_scope FROM catalog_products"
+                               " WHERE product_key = :pk"), {"pk": pk}).scalar()
+    assert scope == SCOPE_CANONICAL, (
+        "a composite-attached seed did not count for the predicate — "
+        "the #1676 divergence is back")
+
+
 def test_the_production_update_uses_the_shared_predicate():
     """The UPDATE must interpolate CANONICAL_SCOPE_PREDICATE, not a copy.
 

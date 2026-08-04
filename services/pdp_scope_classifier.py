@@ -79,6 +79,32 @@ def own_merchant_seller_term_sql(merchant_expr: str) -> str:
     )
 
 
+def seed_attachment_keys_sql(row_alias: str) -> str:
+    """The two forms `external_product_seeds.attached_product_key` may take for
+    a catalog row: the row's `product_key`, or the pipe-composite
+    `merchant_id|platform|source_product_id` (a legacy attachment form still
+    live in prod). Usage: ``eps.attached_product_key IN {this}``.
+
+    A FUNCTION for the same reason as `own_merchant_seller_term_sql`: one rule,
+    one spelling. #1676 shipped with the backfill matching BOTH forms while the
+    recovery predicate matched only `product_key` — a pinned divergence
+    (prod cohort 0, measured 2026-08-04) closed by routing every seller-count
+    writer through this helper. If either side stops calling it, the divergence
+    is back.
+
+    NULL-safety: if platform or source_product_id is NULL the composite
+    concatenation is NULL, and `x IN (pk, NULL)` still matches on the pk arm
+    while the NULL arm contributes nothing — no row is lost or gained.
+    """
+    if not row_alias or not row_alias.strip():
+        raise ValueError("seed_attachment_keys_sql requires a row alias")
+    a = row_alias.strip()
+    return (
+        f"({a}.product_key, "
+        f"({a}.merchant_id || '|' || {a}.platform || '|' || {a}.source_product_id))"
+    )
+
+
 def classify(signals: ScopeSignals) -> str:
     """Return the pdp_scope value for the given signals."""
     if signals.category_label_source == LABEL_SOURCE_ENRICHMENT:

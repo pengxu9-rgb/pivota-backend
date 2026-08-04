@@ -2,13 +2,16 @@
 
 THE FILENAME IS LOAD-BEARING (postgres-dialect-gate glob). These tests drive
 the REAL functions — `fetch_demotion_candidates` / `demote_row` /
-`run_demotion` from the demotion script, and `run_backfill` from the promotion
-script — never lifted SQL.
+`run_demotion` from the demotion script, and the REAL
+`run_pdp_scope_backfill_tick` from the promote-only cron — never lifted SQL.
 
 The one property that justifies the whole D1 decision is tested end-to-end
-here: a demoted row that later gains a second seller is re-promoted by the
-scheduled backfill. If that cycle breaks, the demotion is a one-way door and
-P4 should not run.
+here, in the REALISTIC ordering (review F1 on PR #1680 broke the lucky
+ordering the first version used): demote -> a cron tick runs BEFORE the row
+gains its second seller and must NO-OP for it (the shipped v1 resolved it to
+'merchant_owned' here, exiting the promotion gate forever) -> the row gains a
+second seller -> the next tick promotes. If that cycle breaks, the demotion is
+a one-way door and P4 should not run.
 """
 
 from __future__ import annotations
@@ -107,6 +110,9 @@ def _seed_rows(conn):
          LABEL_SOURCE_ENRICHMENT, False),
         ("pk_real_merchant", "acme_shop", "multi_merchant_canonical", None, False),
         ("pk_suppressed", NON_SELLER_MERCHANT_ID, "multi_merchant_canonical", None, True),
+        # Unverified AND suppressed AND genuinely two-domain: the promote-only
+        # cron must SKIP it (suppressed_at IS NULL gate).
+        ("pk_supp_unv", NON_SELLER_MERCHANT_ID, "unverified", None, True),
     ]
     for pk, m, scope, src, sup in rows:
         conn.execute(text(
@@ -127,6 +133,12 @@ def _seed_rows(conn):
     conn.execute(text(
         "INSERT INTO external_product_seeds (id, attached_product_key, status,"
         " domain) VALUES ('u0', 'pk_unqualified', 'active', 'only.com')"))
+    # pk_supp_unv would qualify on two seed domains — but it is suppressed.
+    for i, dom in enumerate(("s1.com", "s2.com")):
+        conn.execute(text(
+            "INSERT INTO external_product_seeds (id, attached_product_key,"
+            " status, domain) VALUES (:i, 'pk_supp_unv', 'active', :d)"),
+            {"i": f"sv{i}", "d": dom})
 
 
 def _scopes(conn):
@@ -201,12 +213,18 @@ def test_cas_skips_a_row_changed_between_select_and_write(engine):
             "the concurrent value was clobbered")
 
 
-def test_the_full_cycle_demote_then_gain_seller_then_cron_repromotes(engine):
-    """THE D1 PROPERTY. If this fails, the demotion is a one-way door and P4
-    must not run."""
-    import scripts.backfill_pdp_scope as backfill
+def test_the_full_cycle_demote_tick_noops_gain_seller_tick_promotes(engine, monkeypatch):
+    """THE D1 PROPERTY, in the REALISTIC ordering. The first version inserted
+    the second seller BEFORE the tick — the one lucky ordering under which the
+    shipped v1 (classify() loop on a schedule) looked correct. Review drove
+    the real sequence on Postgres: demote -> tick -> 'merchant_owned' -> gains
+    seller -> tick -> {'total': 0}, never re-promoted (F1). This test pins the
+    real sequence against the REAL cron tick."""
+    import jobs.pdp_scope_backfill_cron as cron
     import scripts.demote_unqualified_canonical_scopes as demotion
     from sqlalchemy import text
+
+    monkeypatch.setenv("PDP_SCOPE_BACKFILL_ENABLED", "true")
 
     with engine.begin() as c:
         _seed_rows(c)
@@ -214,41 +232,72 @@ def test_the_full_cycle_demote_then_gain_seller_then_cron_repromotes(engine):
     _drive([demotion], lambda: demotion.run_demotion(apply=True))
     with engine.begin() as c:
         assert _scopes(c)["pk_unqualified"] == "unverified"
-        # The row later gains a second retailer.
+
+    # Tick 1 — BEFORE the row gains its second seller. MUST no-op for it:
+    # the row is single-seller, so it does not qualify, and the promote-only
+    # tick leaves non-qualifying rows at 'unverified' — re-checkable, not
+    # resolved. 'merchant_owned' here is the F1 one-way door.
+    _drive([cron], lambda: cron.run_pdp_scope_backfill_tick())
+    with engine.begin() as c:
+        scopes = _scopes(c)
+    assert scopes["pk_unqualified"] == "unverified", (
+        f"F1 regression: the first tick resolved a not-yet-qualified demoted "
+        f"row to {scopes['pk_unqualified']!r} — it must STAY 'unverified' "
+        "(inside the promotion gate) until it actually qualifies")
+    assert scopes["pk_supp_unv"] == "unverified", (
+        "the tick promoted a SUPPRESSED row")
+
+    # Only now does the row gain a second retailer.
+    with engine.begin() as c:
         c.execute(text(
             "INSERT INTO external_product_seeds (id, attached_product_key,"
             " status, domain) VALUES ('u1', 'pk_unqualified', 'active',"
             " 'second.com')"))
 
-    result = _drive([backfill], lambda: backfill.run_backfill())
+    # Tick 2 — promotes it, stamped with the cron's own source marker.
+    _drive([cron], lambda: cron.run_pdp_scope_backfill_tick())
     with engine.begin() as c:
-        assert _scopes(c)["pk_unqualified"] == "multi_merchant_canonical", (
-            f"re-promotion failed; backfill said {result}")
+        scopes = _scopes(c)
+        src = c.execute(text(
+            "SELECT pdp_scope_source FROM catalog_products"
+            " WHERE product_key = 'pk_unqualified'")).scalar()
+    assert scopes["pk_unqualified"] == "multi_merchant_canonical", (
+        "re-promotion failed — the demotion is a one-way door, P4 must not run")
+    assert src == cron.PROMOTION_SOURCE
+    assert scopes["pk_supp_unv"] == "unverified", (
+        "the tick promoted a SUPPRESSED row")
 
 
-def test_the_cron_tick_is_env_gated_and_calls_the_shared_loop(monkeypatch):
-    """The tick is glue: env gate + connect + run_backfill. The loop's
-    semantics are PG-tested above and in test_pdp_scope_backfill_postgres —
-    a tick with its own loop copy would be the drift defect itself."""
-    import db.database as dbmod
+def test_the_cron_tick_is_disabled_by_default_and_promote_only(monkeypatch):
+    """The tick is glue: env gate + connect + ONE promote-only pass. Two
+    load-bearing properties (both from PR #1680 review):
+      * DEFAULT DISABLED — a stated deviation from house style. The first
+        enabled tick promotes a serving-visible cohort (F2); enabling is an
+        operator step, not a deploy side-effect.
+      * the call shape is run_promotion_pass, NOT run_backfill — the classify()
+        loop on a schedule resolves every unverified row (F1)."""
     import jobs.pdp_scope_backfill_cron as cron
-    import scripts.backfill_pdp_scope as backfill
 
     calls = []
 
-    async def fake_run_backfill(**kw):
+    async def fake_pass(**kw):
         calls.append(kw)
-        return {"total": 0, "distribution": {}, "dry_run": False}
+        return {"promoted": 0}
 
     class FakeDb:
         is_connected = True
 
-    monkeypatch.setattr(backfill, "run_backfill", fake_run_backfill)
-    monkeypatch.setattr(dbmod, "database", FakeDb())
+    monkeypatch.setattr(cron, "run_promotion_pass", fake_pass)
+    monkeypatch.setattr(cron, "database", FakeDb())
+
+    monkeypatch.delenv("PDP_SCOPE_BACKFILL_ENABLED", raising=False)
+    asyncio.run(cron.run_pdp_scope_backfill_tick())
+    assert calls == [], (
+        "the DEFAULT must be disabled — enabling is an operator step")
 
     monkeypatch.setenv("PDP_SCOPE_BACKFILL_ENABLED", "false")
     asyncio.run(cron.run_pdp_scope_backfill_tick())
-    assert calls == [], "disabled tick must not run the loop"
+    assert calls == [], "disabled tick must not run the pass"
 
     monkeypatch.setenv("PDP_SCOPE_BACKFILL_ENABLED", "true")
     monkeypatch.setenv("PDP_SCOPE_BACKFILL_LIMIT", "777")
@@ -265,3 +314,21 @@ def test_the_demotion_rule_is_the_predicate_not_a_copy():
 
     assert CANONICAL_SCOPE_PREDICATE in mod._SELECT_SQL
     assert "NOT (" in mod._SELECT_SQL
+
+
+def test_the_cron_rule_is_the_predicate_not_a_copy_or_a_loop():
+    """The cron's UPDATE must interpolate the SAME predicate string — a second
+    spelling of the rule in the cron is the drift shape this workstream
+    removes, and a classify() loop is F1."""
+    import inspect
+
+    import jobs.pdp_scope_backfill_cron as cron
+    from services.pdp_identity_recovery import CANONICAL_SCOPE_PREDICATE
+
+    assert CANONICAL_SCOPE_PREDICATE in cron._PROMOTE_SQL
+    assert "suppressed_at IS NULL" in cron._PROMOTE_SQL
+    src = inspect.getsource(cron)
+    assert "from scripts.backfill_pdp_scope import" not in src, (
+        "the cron must not import the one-shot classify() loop (F1)")
+    assert "run_backfill(" not in src, (
+        "the cron must not call the one-shot classify() loop (F1)")

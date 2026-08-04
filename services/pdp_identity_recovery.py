@@ -21,6 +21,7 @@ from services.pdp_scope_classifier import (
     LABEL_SOURCE_ENRICHMENT,
     SCOPE_CANONICAL,
     own_merchant_seller_term_sql,
+    seed_attachment_keys_sql,
 )
 
 
@@ -1494,10 +1495,17 @@ CANONICAL_SCOPE_PREDICATE = """
                   AND co.merchant_id IS NOT NULL
                   AND co.merchant_id IS DISTINCT FROM cp.merchant_id
               )
+              -- Seeds attach by product_key OR the pipe-composite form —
+              -- `seed_attachment_keys_sql`, the SAME helper the backfill's
+              -- seller count uses. An earlier version matched only
+              -- product_key: the #1676 pinned divergence (prod cohort 0 at
+              -- closure, 2026-08-04), under which a composite-attached seed
+              -- counted for the backfill but not for this predicate — and
+              -- therefore not for the P4 demotion selection or the D3 cron.
               + (
                 SELECT count(DISTINCT eps.domain)
                 FROM external_product_seeds eps
-                WHERE eps.attached_product_key = cp.product_key
+                WHERE eps.attached_product_key IN {seed_attach_keys}
                   AND eps.status = 'active'
                   AND eps.domain IS NOT NULL
               )
@@ -1551,6 +1559,7 @@ CANONICAL_SCOPE_PREDICATE = """
 """.format(
     label_source_enrichment=LABEL_SOURCE_ENRICHMENT,
     own_merchant_term=own_merchant_seller_term_sql("cp.merchant_id"),
+    seed_attach_keys=seed_attachment_keys_sql("cp"),
 )
 
 
