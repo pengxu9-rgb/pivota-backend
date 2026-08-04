@@ -131,7 +131,7 @@ _PAYMENT_PROVIDER_LOOKUP_TIMEOUT_S = 1.5
 # retired pivota-acp service shipped a hardcoded placeholder street address
 # here, which meant a chargeable order could ship somewhere nobody asked for.
 # Fabricating buyer data on a money path is never the safe default.
-_REQUIRED_ADDRESS_FIELDS = ("address_line1", "city", "postal_code", "country")
+_REQUIRED_ADDRESS_FIELDS = ("name", "address_line1", "city", "postal_code", "country")
 
 # The pvt_* keys threaded into the session metadata for attribution parity.
 # (Formerly kept in lockstep with routes/platform_orders_acp._ACP_ATTRIBUTION_KEYS;
@@ -351,7 +351,11 @@ def _normalize_address(addr: Optional[Dict[str, Any]]) -> Optional[Dict[str, Any
         return None
     line2 = a.get("address_line2") or a.get("line_two") or a.get("line2") or a.get("addressLine2")
     out: Dict[str, Any] = {
-        "name": a.get("name") or "Customer",
+        # No placeholder recipient default — the last invented-fulfillment
+        # field on this path. The name must be real buyer data: from the
+        # address itself, or backfilled from the session's buyer in
+        # _require_fulfillment_address.
+        "name": a.get("name"),
         "address_line1": str(line1),
         "city": a.get("city"),
         "state": a.get("state") or a.get("region") or a.get("province"),
@@ -371,8 +375,24 @@ def _require_fulfillment_address(session: Dict[str, Any]) -> Dict[str, Any]:
     an address-less create followed by an update, but nothing in this codebase
     implements that update yet), so the address can only arrive at creation via
     `fulfillment_address`. An absent or incomplete one is a 400 the caller can
-    fix by re-creating the session — never a default we make up."""
+    fix by re-creating the session — never a default we make up.
+
+    The recipient `name` is required too, but a missing address-level name may
+    be backfilled from the session's OWN buyer (first+last) — that is the
+    buyer's real name, not an invention. No buyer name either → refuse."""
     address = _normalize_address(session.get("fulfillment_address"))
+    if address is not None and not str(address.get("name") or "").strip():
+        buyer = session.get("buyer") if isinstance(session.get("buyer"), dict) else {}
+        composed = " ".join(
+            part
+            for part in (
+                str((buyer or {}).get("first_name") or "").strip(),
+                str((buyer or {}).get("last_name") or "").strip(),
+            )
+            if part
+        )
+        if composed:
+            address["name"] = composed
     missing = [
         key
         for key in _REQUIRED_ADDRESS_FIELDS
@@ -388,8 +408,10 @@ def _require_fulfillment_address(session: Dict[str, Any]) -> Dict[str, Any]:
                 else "missing " + ", ".join(missing)
             )
             + "). There is no session-update endpoint — supply the full address "
-            "(address_line1, city, postal_code, country) as `fulfillment_address` "
-            "when the checkout session is created.",
+            "(name, address_line1, city, postal_code, country) as "
+            "`fulfillment_address` when the checkout session is created (a "
+            "missing recipient name may also come from buyer.first_name/"
+            "last_name).",
             code="acp_address_required",
             status_code=400,
         )
