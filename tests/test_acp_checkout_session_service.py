@@ -271,6 +271,9 @@ def test_no_fabricated_buyer_defaults_exist():
     assert "1 ACP Street" not in src
     assert "acp-buyer@pivota.cc" not in src
     assert '"provider": "stripe"' not in src
+    # Round 2: the recipient-name invention is gone too (name comes from the
+    # address or the buyer's own first/last -- never a made-up "Customer").
+    assert "'Customer'" not in src and '"Customer"' not in src
 
 
 # --- get ---------------------------------------------------------------------
@@ -1515,3 +1518,74 @@ async def test_adyen_refused_is_not_classified_definitive():
     # a canary), an adyen_refused failure must HOLD the claim (ambiguous).
     assert "adyen_refused" not in svc._DEFINITIVE_DECLINE_ERROR_CODES
     assert not svc._capture_failure_is_definitive(_failed_outcome("adyen_refused"))
+
+
+async def test_address_without_recipient_name_is_refused_without_buyer_name(
+    fake_quote, monkeypatch
+):
+    # Round 2 of the fabrication sweep: no more invented "Customer" recipient.
+    # An address with no name and no buyer first/last to backfill from -> 400.
+    _arm_capture_lane(monkeypatch)
+    calls = _mock_order_layer(monkeypatch)
+    addr = _address()
+    del addr["name"]
+    created = await _create(fulfillment_address=addr)
+    with pytest.raises(svc.AcpCheckoutSessionError) as ei:
+        await svc.complete_session(
+            session_id=created.session_id, agent_context=_Ctx(), payment_token="pm_card_visa",
+        )
+    assert ei.value.code == "acp_address_required"
+    assert "name" in str(ei.value)
+    assert (calls["order_create"], calls["capture"]) == (0, 0)
+    row = await svc.peek_session(created.session_id)
+    assert row["status"] == "ready_for_payment"  # pre-claim, zero side effects
+
+
+async def test_address_name_backfills_from_the_buyers_real_name(fake_quote, monkeypatch):
+    # A missing address-level name backfilled from buyer first+last is the
+    # buyer's REAL name, not an invention -- allowed.
+    _arm_capture_lane(monkeypatch)
+    calls = _mock_order_layer(monkeypatch)
+    addr = _address()
+    del addr["name"]
+    created = await _create(
+        fulfillment_address=addr,
+        buyer={"email": "buyer@example.com", "first_name": "Ada", "last_name": "Lovelace"},
+    )
+    seen = {}
+
+    real_require = svc._require_fulfillment_address
+
+    def spy_require(session):
+        out = real_require(session)
+        seen["name"] = out.get("name")
+        return out
+
+    monkeypatch.setattr(svc, "_require_fulfillment_address", spy_require)
+    out = await svc.complete_session(
+        session_id=created.session_id, agent_context=_Ctx(), payment_token="pm_card_visa",
+    )
+    assert out["status"] == "completed"
+    assert seen["name"] == "Ada Lovelace"
+
+
+async def test_explicit_address_name_is_preserved_over_buyer_name(fake_quote, monkeypatch):
+    _arm_capture_lane(monkeypatch)
+    _mock_order_layer(monkeypatch)
+    created = await _create(
+        buyer={"email": "buyer@example.com", "first_name": "Ada", "last_name": "Lovelace"},
+    )
+    seen = {}
+    real_require = svc._require_fulfillment_address
+
+    def spy_require(session):
+        out = real_require(session)
+        seen["name"] = out.get("name")
+        return out
+
+    monkeypatch.setattr(svc, "_require_fulfillment_address", spy_require)
+    out = await svc.complete_session(
+        session_id=created.session_id, agent_context=_Ctx(), payment_token="pm_card_visa",
+    )
+    assert out["status"] == "completed"
+    assert seen["name"] == "Real Buyer"  # the address's own name wins
