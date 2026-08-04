@@ -60,6 +60,10 @@ class OffSessionCaptureResult:
     currency: Optional[str]
     error: Optional[str]
     error_code: Optional[str]
+    # The PSP provider the charge was dispatched to (stamped by the
+    # orchestrator once the merchant row resolves; None on pre-dispatch
+    # failures). Lets callers record the ACTUAL psp instead of assuming Stripe.
+    provider: Optional[str] = None
 
 
 def _fail(amount_cents, currency, error, code, status="failed") -> OffSessionCaptureResult:
@@ -453,7 +457,7 @@ async def capture_offsession(
         logger.error("acp_offsession: no capture adapter for provider=%s merchant_id=%s", provider or "<none>", merchant_id)
         return _fail(amount_cents, currency, f"unsupported_capture_provider:{provider or 'unknown'}", "unsupported_provider")
 
-    return await adapter.capture(
+    result = await adapter.capture(
         merchant_id=str(merchant_id),
         api_key=api_key,
         amount_cents=amount_cents,
@@ -464,3 +468,8 @@ async def capture_offsession(
         allow_live=allow_live,
         provider_config=provider_config,
     )
+    # Stamp the provider the charge actually ran on (the adapters themselves
+    # stay provider-field-agnostic; behavior is otherwise unchanged).
+    from dataclasses import replace as _dc_replace
+
+    return _dc_replace(result, provider=provider)

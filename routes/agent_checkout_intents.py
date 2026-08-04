@@ -30,7 +30,12 @@ from services.commerce_execution_policy import (
 from services.quote_service import QuoteError, QuoteService
 from services.traffic_taxonomy_service import attach_traffic_taxonomy, build_traffic_taxonomy
 from services.tier2_acp_lane import resolve_acp_lane_decision
-from services.pivota_acp_client import AcpClientError, create_checkout_session
+from services.acp_checkout_session_service import (
+    AcpCheckoutSessionError,
+    complete_session,
+    create_session,
+    peek_session,
+)
 from config.settings import settings
 
 from sqlalchemy.sql import func
@@ -683,15 +688,16 @@ async def create_acp_checkout(
         metadata["pvt_surface"] = req.pvt_surface
 
     try:
-        session = await create_checkout_session(
+        session = await create_session(
             merchant_id=merchant_id,
             platform=decision.platform or "shopify",
             items=[it.model_dump() for it in req.items],
             fulfillment_address=req.shipping_address,
             buyer={"email": req.customer_email} if req.customer_email else None,
             metadata=metadata,
+            agent_id=getattr(context, "agent_id", None),
         )
-    except AcpClientError as exc:
+    except AcpCheckoutSessionError as exc:
         # Fail-open to the redirect floor on any ACP error — never a dead end.
         return _redirect_fallback(
             merchant_id, reason=f"acp_unavailable:{exc.code}", platform=decision.platform
@@ -709,15 +715,93 @@ async def create_acp_checkout(
         "currency": session.currency,
         "totals": session.totals,
         "pvt_click_id": req.pvt_click_id,
-        # DARK lane invariants — honest about what this does NOT do yet.
+        # Session-lane invariants — honest about what this call does NOT do.
         "creates_pivota_order": False,
         "creates_psp_payment": False,
         "capture_enabled": False,
         "warnings": [
             "In-chat ACP checkout screen only: no order or charge is created here.",
-            "Real capture is gated behind the kill-switch and is not yet enabled (P-T2.3.2+).",
+            "Completion is available via POST /agent/v1/checkout/acp/{session_id}/complete "
+            "and remains kill-switch-gated (fail-closed until SUBMIT_PAYMENT is enabled).",
         ],
     }
+
+
+class CompleteAcpCheckoutRequest(BaseModel):
+    # ACP wire intake: `payment_data.token` is the protocol shape; the flat
+    # `payment_token` is accepted as a convenience. payment_data.token wins
+    # (mirrors pivota-acp's extract_payment_token precedence).
+    payment_data: Optional[Dict[str, Any]] = None
+    payment_token: Optional[str] = None
+    idempotency_key: Optional[str] = None
+
+
+def _extract_payment_token(req: "CompleteAcpCheckoutRequest") -> Optional[str]:
+    payment_data = req.payment_data if isinstance(req.payment_data, dict) else {}
+    token = str(payment_data.get("token") or "").strip() or None
+    if token:
+        return token
+    return str(req.payment_token or "").strip() or None
+
+
+@router.post("/acp/{session_id}/complete")
+async def complete_acp_checkout(
+    session_id: str,
+    req: CompleteAcpCheckoutRequest = None,
+    context: AgentContext = Depends(get_agent_context),
+):
+    """Complete an in-process ACP checkout session: quote → order(acp) → REAL
+    off-session charge through the shared Tier-2 gate chain (kill-switch +
+    test/live capture caps — the exact gates POST /agent/v1/payments enforces).
+
+    Fail-closed: a dark kill-switch or an over-cap charge is a 403 (the gate's
+    own error shape), a capture failure is a 502 with a named code, and there is
+    NO simulated-capture fallback. Success is returned only when the capture
+    actually succeeded; a completed session replays idempotently (never
+    re-charges), and an idempotency-key reuse with a different payload is a 409
+    `idempotency_conflict` (ACP wire semantics).
+    """
+    body = req or CompleteAcpCheckoutRequest()
+    session = await peek_session(session_id)
+    if not session:
+        raise HTTPException(
+            status_code=404,
+            detail={
+                "type": "invalid_request",
+                "code": "acp_session_not_found",
+                "message": "Checkout session not found",
+            },
+        )
+    if not context.can_access_merchant(str(session.get("merchant_id") or "")):
+        raise HTTPException(status_code=403, detail="Not authorized for this merchant")
+
+    try:
+        result = await complete_session(
+            session_id=session_id,
+            agent_context=context,
+            payment_token=_extract_payment_token(body),
+            idempotency_key=(str(body.idempotency_key or "").strip() or None),
+        )
+    except HTTPException:
+        # Gate refusals (kill-switch 403 with as_error_detail, over-cap 403)
+        # surface untouched — dark stays dark, in the gate's own shape.
+        raise
+    except AcpCheckoutSessionError as exc:
+        raise HTTPException(
+            status_code=exc.status_code or 502,
+            detail={
+                "type": (
+                    "invalid_request"
+                    if (exc.status_code or 502) < 500
+                    else "processing_error"
+                ),
+                "code": exc.code,
+                "message": exc.message,
+                # e.g. reconciliation_required on a completion-persist failure.
+                **(exc.extra or {}),
+            },
+        )
+    return result
 
 
 @router.post("/intents")

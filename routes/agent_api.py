@@ -102,7 +102,6 @@ from observability.reliability_metrics import (
     record_catalog_upstream_fallback,
 )
 from services.traffic_taxonomy_service import attach_traffic_taxonomy, build_traffic_taxonomy
-import httpx
 import uuid
 
 from routes.reviews_invitation_issuer import mint_invitations_from_paid_order
@@ -4710,11 +4709,11 @@ async def agent_create_acp_checkout_session(
         # ACP currently supports shopify/wix; use shopify as proxy fallback.
         platform = "shopify"
 
-    acp_url = str(os.getenv("ACP_URL") or "https://pivota-acp-production.up.railway.app").rstrip("/")
-    api_version = str(os.getenv("ACP_API_VERSION") or "2025-09-29").strip()
-    service_token = _require_valid_acp_service_token()  # #1296: missing/placeholder → loud 500
+    _require_valid_acp_service_token()  # #1296: missing/placeholder → loud 500
 
-    # Normalize items into ACP schema: {id, quantity}
+    # Normalize items into ACP schema: {id, quantity}. The in-process session
+    # layer treats a bare `id` as a product_id (the old service quoted by bare
+    # id too, just with fake prices).
     acp_items = []
     for it in items:
         if not isinstance(it, dict):
@@ -4734,50 +4733,35 @@ async def agent_create_acp_checkout_session(
     request_id = str(uuid.uuid4())
     return_url = payload.get("return_url") or payload.get("returnUrl") or None
     buyer_ref = _normalize_buyer_ref(x_buyer_ref or payload.get("buyer_ref") or payload.get("buyerRef"))
-    body = {
-        "items": acp_items,
-        "buyer": None,
-        "fulfillment_address": None,
-        "metadata": {
-            "request_id": request_id,
-            "source": "look_replicator",
-            "agent_id": getattr(context, "agent_id", None),
-            **({"agent_user_ref": agent_user.agent_user_ref} if agent_user else {}),
-            **({"buyer_ref": buyer_ref} if buyer_ref else {}),
-            **({"return_url": return_url} if return_url else {}),
-        },
-    }
+
+    # In-process session creation (the external pivota-acp service is retired —
+    # no HTTP hop remains on this path).
+    from services.acp_checkout_session_service import (
+        AcpCheckoutSessionError,
+        create_session as create_acp_checkout_session_inprocess,
+    )
 
     try:
-        async with httpx.AsyncClient(timeout=30.0) as client:
-            resp = await client.post(
-                f"{acp_url}/checkout_sessions",
-                headers={
-                    "Authorization": f"Bearer {service_token}",
-                    "API-Version": api_version,
-                    "X-Merchant-Id": merchant_id,
-                    "X-Platform": platform,
-                    "Content-Type": "application/json",
-                },
-                json=body,
-            )
-    except httpx.RequestError as exc:
-        raise HTTPException(status_code=503, detail={"error": "ACP_UNAVAILABLE", "message": str(exc)})
+        session = await create_acp_checkout_session_inprocess(
+            merchant_id=merchant_id,
+            platform=platform,
+            items=acp_items,
+            metadata={
+                "request_id": request_id,
+                "source": "look_replicator",
+                "agent_id": getattr(context, "agent_id", None),
+                **({"agent_user_ref": agent_user.agent_user_ref} if agent_user else {}),
+                **({"buyer_ref": buyer_ref} if buyer_ref else {}),
+                **({"return_url": return_url} if return_url else {}),
+            },
+            agent_id=getattr(context, "agent_id", None),
+        )
+    except AcpCheckoutSessionError as exc:
+        if exc.code == "acp_items_required":
+            raise HTTPException(status_code=400, detail="items[] must include id")
+        raise HTTPException(status_code=503, detail={"error": "ACP_UNAVAILABLE", "message": exc.message})
 
-    if resp.status_code < 200 or resp.status_code >= 300:
-        try:
-            data = resp.json()
-        except Exception:
-            data = resp.text
-        raise HTTPException(status_code=resp.status_code, detail=data)
-
-    data = resp.json()
-    session_id = data.get("id") or data.get("session_id")
-    checkout_url = f"{acp_url}/checkout/{session_id}" if session_id else None
-    if not checkout_url:
-        raise HTTPException(status_code=502, detail={"error": "ACP_INVALID_RESPONSE", "message": "Missing session id"})
-
-    return {"checkout_url": checkout_url, "session_id": session_id}
+    return {"checkout_url": session.checkout_url, "session_id": session.session_id}
 
 # ============================================================================
 # PCS / Shopify Webhook Debug (metadata-only)
