@@ -294,32 +294,54 @@ def test_a_row_suppressed_mid_tick_is_skipped_not_promoted(engine):
     async def race():
         suppressor = _db()
         await suppressor.connect()
+        tx = suppressor.transaction()
+        await tx.start()
+        committed = False
+        promotion = None
         try:
-            tx = suppressor.transaction()
-            await tx.start()
             await suppressor.execute(
                 "UPDATE catalog_products SET suppressed_at = now()"
                 " WHERE product_key = 'pk_qualified'")
             promotion = asyncio.create_task(cron.run_promotion_pass(limit=100))
             # The race is real only if the promotion reaches the row lock
             # BEFORE the suppressor commits — otherwise its subselect never
-            # saw the row and the outer re-check goes unexercised.
+            # saw the row and the outer re-check goes unexercised. Detection
+            # via pg_locks on THIS schema's table: a blocked UPDATE holds a
+            # granted `tuple` lock on the relation while it queues, and
+            # `regclass` resolves through the suppressor's search_path — so
+            # the concurrent per-process schemas this suite's CI runs cannot
+            # cross-match. NOT pg_stat_activity.query: that field is
+            # truncated at track_activity_query_size (default 1024), which
+            # silently ate this statement's tail on the first attempt.
             blocked = False
             for _ in range(200):
                 await asyncio.sleep(0.05)
                 if promotion.done():
                     break
                 blocked = bool(await suppressor.fetch_val(
-                    "SELECT count(*) FROM pg_stat_activity"
-                    " WHERE wait_event_type = 'Lock'"))
+                    "SELECT count(*) FROM pg_locks"
+                    " WHERE locktype = 'tuple'"
+                    "   AND relation = 'catalog_products'::regclass"))
                 if blocked:
                     break
             assert blocked and not promotion.done(), (
                 "the promotion pass never blocked on the suppressor's row "
                 "lock — the race did not happen, the test proves nothing")
             await tx.commit()
+            committed = True
             return await promotion
         finally:
+            # A failed race must not strand the blocked promotion task on an
+            # open transaction — that hangs the whole suite at disconnect.
+            if not committed:
+                await tx.rollback()
+            if promotion is not None:
+                if not promotion.done():
+                    promotion.cancel()
+                try:
+                    await promotion
+                except (asyncio.CancelledError, Exception):
+                    pass
             await suppressor.disconnect()
 
     result = _drive([cron], race)
