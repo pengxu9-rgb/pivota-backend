@@ -98,6 +98,19 @@ def _items():
     return [{"product_id": "p1", "variant_id": "v1", "sku": "SKU1", "quantity": 1}]
 
 
+def _address():
+    """A REAL, complete fulfillment address. There is no default any more: a
+    session without one cannot be completed (`acp_address_required`)."""
+    return {
+        "name": "Real Buyer",
+        "address_line1": "742 Evergreen Terrace",
+        "city": "Springfield",
+        "state": "OR",
+        "postal_code": "97477",
+        "country": "US",
+    }
+
+
 async def _create(**overrides):
     kwargs = dict(
         merchant_id="merch_x",
@@ -105,6 +118,7 @@ async def _create(**overrides):
         items=_items(),
         metadata={"pvt_click_id": "clk_abc", "pvt_surface": "chatgpt"},
         buyer={"email": "buyer@example.com"},
+        fulfillment_address=_address(),
         agent_id="agent_test",
     )
     kwargs.update(overrides)
@@ -160,6 +174,103 @@ async def test_create_session_quote_failure_is_named(fake_quote):
     with pytest.raises(svc.AcpCheckoutSessionError) as ei:
         await _create()
     assert ei.value.code == "acp_quote_failed"
+
+
+# --- create: payment_provider comes from the merchant's REAL PSP row ---------
+
+
+def _fake_psp_lookup(monkeypatch, *, row=None, raises=None):
+    """Patch the PSP lookup the create response derives `payment_provider` from.
+    (The service imports it lazily, so patching the module attribute is what a
+    real call would see.) The service uses the provider-ONLY helper — no key
+    material rides the create path — so the fake returns just the provider."""
+    import services.merchant_psp_config_service as psp_mod
+
+    seen = {"merchant_ids": []}
+
+    async def fake_fetch(**kwargs):
+        seen["merchant_ids"].append(kwargs.get("merchant_id"))
+        if raises is not None:
+            raise raises
+        provider = str(((row or {}).get("provider")) or "").strip().lower()
+        return provider or None
+
+    monkeypatch.setattr(psp_mod, "fetch_active_merchant_psp_provider", fake_fetch)
+    return seen
+
+
+async def test_create_payment_provider_reflects_a_stripe_psp_row(fake_quote, monkeypatch):
+    seen = _fake_psp_lookup(monkeypatch, row={"psp_id": "psp_1", "provider": "stripe"})
+    result = await _create()
+    assert result.raw["payment_provider"] == {
+        "provider": "stripe",
+        "supported_payment_methods": ["card"],
+    }
+    assert seen["merchant_ids"] == ["merch_x"]
+
+
+async def test_create_payment_provider_reflects_an_adyen_psp_row(fake_quote, monkeypatch):
+    # THE point of the change: the old hardcode claimed "stripe" for every
+    # merchant, including the ones who settle through Adyen.
+    _fake_psp_lookup(monkeypatch, row={"psp_id": "psp_2", "provider": "adyen"})
+    result = await _create()
+    assert result.raw["payment_provider"]["provider"] == "adyen"
+
+
+async def test_create_omits_payment_provider_when_the_merchant_has_no_psp_row(
+    fake_quote, monkeypatch
+):
+    # Honest absence, not a guess: the redirect-floor merchants have no PSP at
+    # all, and telling an agent "stripe" would be a lie about who can charge.
+    _fake_psp_lookup(monkeypatch, row=None)
+    result = await _create()
+    assert "payment_provider" not in result.raw
+
+
+async def test_create_omits_payment_provider_when_the_lookup_fails(fake_quote, monkeypatch):
+    # And the lookup is NON-FATAL — a session that charges nothing must still be
+    # creatable when the PSP table is unreachable.
+    _fake_psp_lookup(monkeypatch, raises=RuntimeError("merchant_psps unavailable"))
+    result = await _create()
+    assert "payment_provider" not in result.raw
+    assert result.session_id.startswith("csn_")
+    assert await svc.get_session(result.session_id) is not None
+
+
+async def test_create_omits_payment_provider_for_a_blank_provider_row(fake_quote, monkeypatch):
+    _fake_psp_lookup(monkeypatch, row={"psp_id": "psp_3", "provider": "  "})
+    result = await _create()
+    assert "payment_provider" not in result.raw
+
+
+async def test_create_payment_provider_lookup_times_out_instead_of_stalling(
+    fake_quote, monkeypatch
+):
+    # Review nit 2: a hung merchant_psps read may only OMIT the field — it must
+    # never stall session creation (create charges nothing; latency there is
+    # pure UX damage). The 1.5s wait_for is the ceiling; the fake hangs forever.
+    import asyncio as _asyncio
+
+    import services.merchant_psp_config_service as psp_mod
+
+    async def hanging_fetch(**kwargs):
+        await _asyncio.sleep(3600)
+
+    monkeypatch.setattr(psp_mod, "fetch_active_merchant_psp_provider", hanging_fetch)
+    monkeypatch.setattr(svc, "_PAYMENT_PROVIDER_LOOKUP_TIMEOUT_S", 0.05, raising=False)
+    result = await _asyncio.wait_for(_create(), timeout=5)
+    assert "payment_provider" not in result.raw
+    assert result.session_id.startswith("csn_")
+
+
+def test_no_fabricated_buyer_defaults_exist():
+    # The three ported parity hardcodes are GONE, not merely unused.
+    assert not hasattr(svc, "DEFAULT_SHIPPING_ADDRESS")
+    assert not hasattr(svc, "DEFAULT_BUYER_EMAIL")
+    src = inspect.getsource(svc).split('"""', 2)[2]
+    assert "1 ACP Street" not in src
+    assert "acp-buyer@pivota.cc" not in src
+    assert '"provider": "stripe"' not in src
 
 
 # --- get ---------------------------------------------------------------------
@@ -386,6 +497,234 @@ async def test_complete_capture_failure_is_error_not_success(fake_quote, monkeyp
     assert calls["settle"] == 0  # nothing finalized
     session = await svc.peek_session(created.session_id)
     assert session["status"] == "ready_for_payment"  # NOT completed
+
+
+# --- fail-closed fulfillment identity (no fabricated address / buyer email) --
+
+
+async def _strip(session_id, **values):
+    await database.execute(
+        acp_checkout_sessions.update()
+        .where(acp_checkout_sessions.c.id == session_id)
+        .values(**values)
+    )
+
+
+async def test_complete_without_fulfillment_address_fails_closed(fake_quote, monkeypatch):
+    # THE removed "1 ACP Street" default: a session that never named a
+    # destination must refuse, pre-claim, with zero side effects — never charge
+    # a card for goods sent to an address we made up.
+    _arm_capture_lane(monkeypatch)
+    calls = _mock_order_layer(monkeypatch)
+    created = await _create(fulfillment_address=None)
+
+    with pytest.raises(svc.AcpCheckoutSessionError) as ei:
+        await svc.complete_session(
+            session_id=created.session_id, agent_context=_Ctx(),
+            payment_token="pm_card_visa", idempotency_key="idem_addr",
+        )
+    assert ei.value.code == "acp_address_required"
+    assert ei.value.status_code == 400
+    # No update path exists, so the error has to tell the caller where the
+    # address must come from.
+    assert "created" in ei.value.message
+    assert (calls["order_create"], calls["capture"], calls["settle"]) == (0, 0, 0)
+
+    # Session UNTOUCHED: still claimable, no order, no claim, no attempt burned.
+    row = await svc.peek_session(created.session_id)
+    assert row["status"] == "ready_for_payment"
+    assert row["order_id"] is None
+    assert row["completion"] is None
+    assert (row["capture_attempt"] or 0) == 0
+    assert row["idempotency_key"] is None
+
+
+async def test_complete_with_an_incomplete_address_fails_closed(fake_quote, monkeypatch):
+    # A street line alone is not a usable address — ShippingAddress needs
+    # city/postal_code/country, and the old code backfilled exactly those from
+    # the placeholder default (silently relocating the order).
+    _arm_capture_lane(monkeypatch)
+    calls = _mock_order_layer(monkeypatch)
+    created = await _create(fulfillment_address={"address_line1": "742 Evergreen Terrace"})
+
+    with pytest.raises(svc.AcpCheckoutSessionError) as ei:
+        await svc.complete_session(
+            session_id=created.session_id, agent_context=_Ctx(), payment_token="pm_card_visa",
+        )
+    assert ei.value.code == "acp_address_required"
+    assert ei.value.status_code == 400
+    for field in ("city", "postal_code", "country"):
+        assert field in ei.value.message
+    assert calls["capture"] == 0
+    row = await svc.peek_session(created.session_id)
+    assert row["status"] == "ready_for_payment"
+
+
+async def test_complete_with_a_real_address_proceeds(fake_quote, monkeypatch):
+    # The other way: a complete address completes, and the REAL address (never a
+    # default) is what the completion quote is built against.
+    _arm_capture_lane(monkeypatch)
+    calls = _mock_order_layer(monkeypatch)
+    created = await _create()
+    out = await svc.complete_session(
+        session_id=created.session_id, agent_context=_Ctx(), payment_token="pm_card_visa",
+    )
+    assert out["status"] == "completed"
+    assert calls["capture"] == 1
+    completion_quote = _FakeQuoteService.calls[-1]
+    assert completion_quote["shipping_address"]["address_line1"] == "742 Evergreen Terrace"
+    assert completion_quote["shipping_address"]["postal_code"] == "97477"
+
+
+async def test_complete_accepts_the_acp_wire_address_shape(fake_quote, monkeypatch):
+    # ACP sends line_one/postal_code; the normalizer maps it, so this is a
+    # usable address and must NOT be refused.
+    _arm_capture_lane(monkeypatch)
+    calls = _mock_order_layer(monkeypatch)
+    created = await _create(
+        fulfillment_address={
+            "name": "Wire Buyer", "line_one": "9 Protocol Rd", "city": "Portland",
+            "postal_code": "97201", "country": "US",
+        }
+    )
+    out = await svc.complete_session(
+        session_id=created.session_id, agent_context=_Ctx(), payment_token="pm_card_visa",
+    )
+    assert out["status"] == "completed"
+    assert calls["capture"] == 1
+
+
+async def test_complete_without_any_buyer_email_fails_closed(fake_quote, monkeypatch):
+    # THE removed acp-buyer@pivota.cc default: no buyer email anywhere → refuse
+    # pre-claim, never attribute a real charge to a mailbox we invented.
+    _arm_capture_lane(monkeypatch)
+    calls = _mock_order_layer(monkeypatch)
+    created = await _create(buyer=None, metadata={"pvt_click_id": "clk_abc"})
+    # create copies buyer.email into metadata.customer_email; with no buyer there
+    # is nothing to copy — assert the row really carries neither.
+    row = await svc.peek_session(created.session_id)
+    assert not (row["buyer"] or {})
+    assert "customer_email" not in (row["metadata"] or {})
+
+    with pytest.raises(svc.AcpCheckoutSessionError) as ei:
+        await svc.complete_session(
+            session_id=created.session_id, agent_context=_Ctx(),
+            payment_token="pm_card_visa", idempotency_key="idem_email",
+        )
+    assert ei.value.code == "acp_email_required"
+    assert ei.value.status_code == 400
+    assert (calls["order_create"], calls["capture"], calls["settle"]) == (0, 0, 0)
+
+    row = await svc.peek_session(created.session_id)
+    assert row["status"] == "ready_for_payment"
+    assert row["order_id"] is None
+    assert (row["capture_attempt"] or 0) == 0
+
+
+async def test_complete_with_only_the_buyer_email_proceeds(fake_quote, monkeypatch):
+    # Buyer email present, metadata.customer_email absent → completes.
+    _arm_capture_lane(monkeypatch)
+    calls = _mock_order_layer(monkeypatch)
+    created = await _create()
+    await _strip(created.session_id, metadata={"pvt_click_id": "clk_abc", "protocol_name": "acp"})
+    out = await svc.complete_session(
+        session_id=created.session_id, agent_context=_Ctx(), payment_token="pm_card_visa",
+    )
+    assert out["status"] == "completed"
+    assert calls["capture"] == 1
+    assert _FakeQuoteService.calls[-1]["customer_email"] == "buyer@example.com"
+
+
+async def test_complete_with_only_metadata_customer_email_proceeds(fake_quote, monkeypatch):
+    # No buyer object at all, but metadata.customer_email → completes.
+    _arm_capture_lane(monkeypatch)
+    calls = _mock_order_layer(monkeypatch)
+    created = await _create(
+        buyer=None, metadata={"pvt_click_id": "clk_abc", "customer_email": "meta@example.com"}
+    )
+    out = await svc.complete_session(
+        session_id=created.session_id, agent_context=_Ctx(), payment_token="pm_card_visa",
+    )
+    assert out["status"] == "completed"
+    assert calls["capture"] == 1
+    assert _FakeQuoteService.calls[-1]["customer_email"] == "meta@example.com"
+
+
+async def test_blank_buyer_email_is_not_an_email(fake_quote, monkeypatch):
+    _arm_capture_lane(monkeypatch)
+    calls = _mock_order_layer(monkeypatch)
+    created = await _create(buyer={"email": "   "}, metadata={"pvt_click_id": "clk_abc"})
+    with pytest.raises(svc.AcpCheckoutSessionError) as ei:
+        await svc.complete_session(
+            session_id=created.session_id, agent_context=_Ctx(), payment_token="pm_card_visa",
+        )
+    assert ei.value.code == "acp_email_required"
+    assert calls["capture"] == 0
+
+
+async def test_fulfillment_refusals_do_not_leak_past_a_dark_kill_switch(fake_quote, monkeypatch):
+    # Ordering guard: a dark merchant still answers 403 TIER2_CHARGE_DISABLED —
+    # the new 400s must not become an oracle for a lane that is switched off.
+    from fastapi import HTTPException
+
+    _arm_capture_lane(monkeypatch, submit=False)
+    _mock_order_layer(monkeypatch)
+    created = await _create(fulfillment_address=None, buyer=None, metadata={})
+    with pytest.raises(HTTPException) as ei:
+        await svc.complete_session(session_id=created.session_id, agent_context=_Ctx())
+    assert ei.value.status_code == 403
+    assert ei.value.detail["error"] == "TIER2_CHARGE_DISABLED"
+
+
+async def test_wedged_pre_change_session_can_still_converge(fake_quote, monkeypatch):
+    # Migration safety, the money-critical half: a row left `completing` by the
+    # OLD code charged under its stored PSP key with the old defaults. The new
+    # pre-claim refusal must NOT strand that charge — a stale resume still
+    # converges (the resume creates no fulfillment data; it replays the key).
+    _arm_capture_lane(monkeypatch)
+    calls = _mock_order_layer(monkeypatch)
+    created = await _create()
+    await _strip(
+        created.session_id,
+        fulfillment_address=None,
+        buyer=None,
+        metadata={"protocol_name": "acp"},
+        status="completing",
+        order_id="ord_acp_1",
+        capture_attempt=1,
+        psp_idempotency_key=f"acp_complete:{created.session_id}:a1",
+        updated_at=datetime.now(timezone.utc) - timedelta(seconds=120),
+    )
+    keys: list = []
+    _spy_capture(monkeypatch, keys)
+
+    out = await svc.complete_session(
+        session_id=created.session_id, agent_context=_Ctx(), payment_token="pm_card_visa",
+    )
+    assert out["status"] == "completed"
+    assert out["order_id"] == "ord_acp_1"
+    assert keys == [f"acp_complete:{created.session_id}:a1"]  # same key → replay
+    assert calls["order_create"] == 0  # order reused; no fabricated order created
+
+
+async def test_completed_session_without_an_address_still_replays(fake_quote, monkeypatch):
+    # Migration safety: sessions completed BEFORE this change were charged with
+    # the old defaults. Their idempotent replay must not start 400-ing (that
+    # would invite a re-charge attempt), so the replay wins over the new checks.
+    _arm_capture_lane(monkeypatch)
+    calls = _mock_order_layer(monkeypatch)
+    created = await _create()
+    first = await svc.complete_session(
+        session_id=created.session_id, agent_context=_Ctx(),
+        payment_token="pm_card_visa", idempotency_key="idem_legacy",
+    )
+    await _strip(created.session_id, fulfillment_address=None, buyer=None)
+    replay = await svc.complete_session(
+        session_id=created.session_id, agent_context=_Ctx(),
+        payment_token="pm_card_visa", idempotency_key="idem_legacy",
+    )
+    assert replay == first
+    assert calls["capture"] == 1  # still exactly one charge
 
 
 # --- review findings: charge-sequencing safety (F2-F4, F6, F7) ---------------

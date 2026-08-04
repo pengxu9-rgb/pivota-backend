@@ -195,6 +195,17 @@ async def test_complete_session_drives_real_agent_create_order(monkeypatch):
         platform="shopify",
         items=[{"product_id": "p1", "variant_id": "v1", "quantity": 1}],
         metadata={"pvt_click_id": "clk_wiring"},
+        # No defaults exist any more: a session without a real address and a
+        # real buyer email is refused at /complete, so the wiring fixture must
+        # carry both (and the order below is asserted to receive THEM).
+        buyer={"email": "wiring-buyer@example.com"},
+        fulfillment_address={
+            "name": "Wiring Buyer",
+            "address_line1": "742 Evergreen Terrace",
+            "city": "Springfield",
+            "postal_code": "97477",
+            "country": "US",
+        },
         agent_id="agent_test",
     )
 
@@ -217,3 +228,49 @@ async def test_complete_session_drives_real_agent_create_order(monkeypatch):
     assert order_request.metadata["pvt_click_id"] == "clk_wiring"
     # The sentinel bug's exact symptom: metadata polluted by the Depends object.
     assert "agent_user_ref" not in order_request.metadata
+    # The REAL order carries the session's REAL buyer identity — no placeholder
+    # address, no placeholder mailbox (this runs the real _create_pivota_order).
+    assert order_request.customer_email == "wiring-buyer@example.com"
+    assert order_request.shipping_address.address_line1 == "742 Evergreen Terrace"
+    assert order_request.shipping_address.city == "Springfield"
+    assert order_request.shipping_address.postal_code == "97477"
+    assert order_request.shipping_address.country == "US"
+
+
+async def test_order_create_refuses_a_session_without_buyer_identity(monkeypatch):
+    # The fail-closed half, through the REAL _create_pivota_order: a session
+    # with no address / no buyer email can never reach agent_create_order, so no
+    # order is ever minted against invented buyer data.
+    monkeypatch.setattr(svc, "QuoteService", _FakeQuoteService)
+    created_orders: list = []
+    _stub_order_create_deep_seams(monkeypatch, created_orders)
+
+    session = {
+        "id": "csn_wiring_nofill",
+        "merchant_id": "merch_x",
+        "items": [{"product_id": "p1", "variant_id": "v1", "quantity": 1}],
+        "metadata": {"protocol_name": "acp"},
+        "currency": "USD",
+    }
+    quote = await _FakeQuoteService().preview_quote()
+
+    with pytest.raises(svc.AcpCheckoutSessionError) as ei:
+        await svc._create_pivota_order(
+            session=session, quote=quote, agent_context=_Ctx(),
+            protocol_name="acp", idempotency_key=None,
+        )
+    assert ei.value.code == "acp_address_required"
+    assert ei.value.status_code == 400
+
+    session["fulfillment_address"] = {
+        "name": "Wiring Buyer", "address_line1": "742 Evergreen Terrace",
+        "city": "Springfield", "postal_code": "97477", "country": "US",
+    }
+    with pytest.raises(svc.AcpCheckoutSessionError) as ei:
+        await svc._create_pivota_order(
+            session=session, quote=quote, agent_context=_Ctx(),
+            protocol_name="acp", idempotency_key=None,
+        )
+    assert ei.value.code == "acp_email_required"
+    assert ei.value.status_code == 400
+    assert created_orders == []  # nothing was ever created

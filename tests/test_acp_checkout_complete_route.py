@@ -49,9 +49,29 @@ async def _db():
     yield
 
 
+_ADDRESS = {
+    "name": "Real Buyer",
+    "address_line1": "742 Evergreen Terrace",
+    "city": "Springfield",
+    "postal_code": "97477",
+    "country": "US",
+}
+
+_UNSET = object()
+
+
 # agent_id is seeded by default: a session with NO bound agent is refused
 # outright on the money path (`acp_agent_unbound`) — see the dedicated test.
-async def _seed_session(session_id="csn_route_test01", merchant_id="merch_x", agent_id="agent_test"):
+# buyer + fulfillment_address are seeded by default too: neither is defaulted
+# any more, so a session missing either is refused (`acp_email_required` /
+# `acp_address_required`) — again, see the dedicated tests.
+async def _seed_session(
+    session_id="csn_route_test01",
+    merchant_id="merch_x",
+    agent_id="agent_test",
+    fulfillment_address=_UNSET,
+    buyer=_UNSET,
+):
     now = datetime.now(timezone.utc)
     await database.execute(
         acp_checkout_sessions.insert().values(
@@ -60,7 +80,11 @@ async def _seed_session(session_id="csn_route_test01", merchant_id="merch_x", ag
             agent_id=agent_id,
             platform="shopify",
             status="ready_for_payment",
+            buyer=({"email": "buyer@example.com"} if buyer is _UNSET else buyer),
             items=[{"product_id": "p1", "variant_id": "v1", "quantity": 1}],
+            fulfillment_address=(
+                dict(_ADDRESS) if fulfillment_address is _UNSET else fulfillment_address
+            ),
             metadata={"pvt_click_id": "clk_abc", "protocol_name": "acp"},
             currency="USD",
             total_cents=169,
@@ -301,6 +325,66 @@ async def test_ambiguous_capture_failure_is_pending_retry_and_holds_the_claim(mo
     assert calls["settle"] == 0
     row = await svc.peek_session(sid)
     assert row["status"] == "completing"  # claim HELD — never re-charge blind
+
+
+async def test_missing_fulfillment_address_is_400_on_the_wire(monkeypatch):
+    # The removed shipping default, at the door: a session that never named a
+    # destination is a 400 in the route's error shape, with NO side effects.
+    from fastapi import HTTPException
+    from routes import agent_checkout_intents as m
+
+    _arm(monkeypatch)
+    calls = _mock_layers(monkeypatch)
+    sid = await _seed_session(fulfillment_address=None)
+    with pytest.raises(HTTPException) as ei:
+        await m.complete_acp_checkout(
+            sid, m.CompleteAcpCheckoutRequest(payment_token="pm_card_visa"), _Ctx()
+        )
+    assert ei.value.status_code == 400
+    assert ei.value.detail["code"] == "acp_address_required"
+    assert ei.value.detail["type"] == "invalid_request"
+    assert calls["order_create"] == 0 and calls["capture"] == 0
+    row = await svc.peek_session(sid)
+    assert row["status"] == "ready_for_payment"
+    assert row["order_id"] is None
+    assert (row["capture_attempt"] or 0) == 0
+
+
+async def test_missing_buyer_email_is_400_on_the_wire(monkeypatch):
+    from fastapi import HTTPException
+    from routes import agent_checkout_intents as m
+
+    _arm(monkeypatch)
+    calls = _mock_layers(monkeypatch)
+    sid = await _seed_session(buyer=None)
+    with pytest.raises(HTTPException) as ei:
+        await m.complete_acp_checkout(
+            sid, m.CompleteAcpCheckoutRequest(payment_token="pm_card_visa"), _Ctx()
+        )
+    assert ei.value.status_code == 400
+    assert ei.value.detail["code"] == "acp_email_required"
+    assert calls["order_create"] == 0 and calls["capture"] == 0
+    row = await svc.peek_session(sid)
+    assert row["status"] == "ready_for_payment"
+
+
+async def test_metadata_customer_email_satisfies_the_email_requirement(monkeypatch):
+    # The other way: metadata.customer_email alone is enough to complete.
+    from routes import agent_checkout_intents as m
+
+    _arm(monkeypatch)
+    calls = _mock_layers(monkeypatch)
+    sid = await _seed_session(buyer=None)
+    await database.execute(
+        acp_checkout_sessions.update()
+        .where(acp_checkout_sessions.c.id == sid)
+        .values(metadata={"protocol_name": "acp", "customer_email": "meta@example.com"})
+    )
+    out = await m.complete_acp_checkout(
+        sid, m.CompleteAcpCheckoutRequest(payment_token="pm_card_visa"), _Ctx()
+    )
+    assert out["status"] == "completed"
+    assert calls["capture"] == 1
 
 
 async def test_foreign_agent_is_403(monkeypatch):

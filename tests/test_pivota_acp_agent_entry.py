@@ -71,7 +71,10 @@ async def test_endpoint_creates_acp_session_when_enabled(monkeypatch):
         return AcpSessionResult(session_id="csn_abc",
                                 checkout_url="https://agents.pivota.cc/checkout/acp/csn_abc",
                                 status="ready_for_payment", currency="USD", total_cents=4599,
-                                totals=[{"type": "total", "amount": 4599}])
+                                totals=[{"type": "total", "amount": 4599}],
+                                raw={"id": "csn_abc",
+                                     "payment_provider": {"provider": "adyen",
+                                                          "supported_payment_methods": ["card"]}})
 
     monkeypatch.setattr(m, "resolve_acp_lane_decision", fake_decision)
     monkeypatch.setattr(m, "create_session", fake_session)
@@ -81,6 +84,10 @@ async def test_endpoint_creates_acp_session_when_enabled(monkeypatch):
     assert out["lane"] == "acp_in_chat"
     assert out["acp_session_id"] == "csn_abc"
     assert out["pvt_click_id"] == "clk_abc"
+    # The response surfaces the merchant's ACTUAL provider (or None when the
+    # merchant has none) — never a hardcoded guess.
+    assert out["payment_provider"] == {"provider": "adyen",
+                                       "supported_payment_methods": ["card"]}
     # Session-create invariants: nothing charges here (completion is a separate,
     # kill-switch-gated endpoint).
     assert out["creates_psp_payment"] is False

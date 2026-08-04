@@ -66,7 +66,13 @@ def _mk_values(merchant_id: str, *, idem: str | None = None):
         "status": "ready_for_payment",
         "buyer": {"email": "buyer@example.com"},
         "items": [{"product_id": "p1", "variant_id": "v1", "quantity": 1}],
-        "fulfillment_address": {"address_line1": "1 ACP Street", "city": "SF"},
+        "fulfillment_address": {
+            "name": "PG Buyer",
+            "address_line1": "500 Dialect Ave",
+            "city": "San Francisco",
+            "postal_code": "94110",
+            "country": "US",
+        },
         "quote": {"quote_id": "q_pg", "pricing": {"total": "45.99"}},
         "metadata": {"pvt_click_id": "clk_pg", "protocol_name": "acp"},
         "currency": "USD",
@@ -252,3 +258,48 @@ async def test_idempotency_key_index_is_plain_lookup_not_unique():
     d = _mk_values("merch_pgtest_idem", idem=None)
     await database.execute(acp_checkout_sessions.insert().values(**c))
     await database.execute(acp_checkout_sessions.insert().values(**d))
+
+
+async def test_fetch_active_merchant_psp_provider_sql_executes_and_selects_no_secrets():
+    # The provider-only helper backs the create response's payment_provider.
+    # PG-execute its SQL (ORDER BY ... NULLS LAST is the dialect-sensitive bit)
+    # and pin that it returns just the provider string for the newest active row.
+    from db.database import database
+    from services.merchant_psp_config_service import fetch_active_merchant_psp_provider
+
+    await database.execute(
+        """
+        CREATE TABLE IF NOT EXISTS merchant_psps (
+            psp_id TEXT PRIMARY KEY,
+            merchant_id TEXT,
+            provider TEXT,
+            name TEXT,
+            api_key TEXT,
+            account_id TEXT,
+            secret_key TEXT,
+            capabilities TEXT,
+            status TEXT,
+            connected_at TIMESTAMPTZ,
+            environment TEXT,
+            provider_config JSONB,
+            validation_status TEXT,
+            validation_error TEXT,
+            last_validated_at TIMESTAMPTZ
+        )
+        """
+    )
+    await database.execute(
+        "DELETE FROM merchant_psps WHERE merchant_id = 'merch_pgprov'"
+    )
+    await database.execute(
+        """
+        INSERT INTO merchant_psps (psp_id, merchant_id, provider, status, connected_at, secret_key)
+        VALUES ('psp_pg_old', 'merch_pgprov', 'stripe', 'active', NOW() - interval '1 day', 'sk_old'),
+               ('psp_pg_new', 'merch_pgprov', 'adyen', 'active', NOW(), 'sk_new'),
+               ('psp_pg_inactive', 'merch_pgprov', 'checkout', 'inactive', NOW() + interval '1 day', 'sk_x')
+        """
+    )
+    out = await fetch_active_merchant_psp_provider(merchant_id="merch_pgprov")
+    assert out == "adyen"  # newest ACTIVE row wins; inactive newer row ignored
+    assert isinstance(out, str)  # provider string only — no row, no key material
+    assert await fetch_active_merchant_psp_provider(merchant_id="merch_pg_absent") is None

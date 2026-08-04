@@ -66,11 +66,21 @@ anywhere on this path — everything runs in-process:
 Error vocabulary keeps the ACP public wire codes where the concept exists
 (`acp_items_required`, `idempotency_conflict` on key reuse with a different
 payload, 409 semantics) plus named in-process codes
-(`acp_session_not_found`, `acp_session_expired`, `acp_quote_failed`, ...).
+(`acp_session_not_found`, `acp_session_expired`, `acp_quote_failed`,
+`acp_address_required`, `acp_email_required`, ...).
+
+NO FABRICATED BUYER DATA. Three parity hardcodes ported from the retired
+service are gone: the "1 ACP Street" shipping default, the
+acp-buyer@pivota.cc email default, and the hardcoded `payment_provider:
+stripe` in the create response. A session that cannot name where the goods go
+or who is buying them is refused at /complete (400, pre-claim, zero side
+effects), and the create response reports the merchant's REAL PSP provider or
+omits the field entirely.
 """
 
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import json
 import os
@@ -110,18 +120,18 @@ STATUS_COMPLETED = "completed"
 # STORED on the row, so a resumed capture replays, never re-charges.
 COMPLETING_RESUME_AFTER_SECONDS = 60
 
-# Old-service parity: the buyer email used when the session carries none
-# (pivota-acp's real-capture hardcoded this on /orders/create).
-DEFAULT_BUYER_EMAIL = "acp-buyer@pivota.cc"
-# Old-service parity: the fallback shipping address used when the session has
-# none (order create requires one; the retired service shipped this default).
-DEFAULT_SHIPPING_ADDRESS: Dict[str, Any] = {
-    "name": "Customer",
-    "address_line1": "1 ACP Street",
-    "city": "San Francisco",
-    "postal_code": "94102",
-    "country": "US",
-}
+# Ceiling on the (non-fatal, provider-name-only) merchant_psps read that fills
+# the create response's payment_provider — a slow row omits the field, never
+# stalls session creation.
+_PAYMENT_PROVIDER_LOOKUP_TIMEOUT_S = 1.5
+
+# The fields models.order.ShippingAddress requires (beyond `name`, which
+# _normalize_address always supplies). A session missing any of them cannot
+# produce a real order, so completion REFUSES instead of inventing one: the
+# retired pivota-acp service shipped a hardcoded placeholder street address
+# here, which meant a chargeable order could ship somewhere nobody asked for.
+# Fabricating buyer data on a money path is never the safe default.
+_REQUIRED_ADDRESS_FIELDS = ("address_line1", "city", "postal_code", "country")
 
 # The pvt_* keys threaded into the session metadata for attribution parity.
 # (Formerly kept in lockstep with routes/platform_orders_acp._ACP_ATTRIBUTION_KEYS;
@@ -354,6 +364,93 @@ def _normalize_address(addr: Optional[Dict[str, Any]]) -> Optional[Dict[str, Any
     return {k: v for k, v in out.items() if v is not None}
 
 
+def _require_fulfillment_address(session: Dict[str, Any]) -> Dict[str, Any]:
+    """The session's fulfillment address, or a fail-closed refusal.
+
+    There is NO session-update endpoint in this layer (the ACP protocol allows
+    an address-less create followed by an update, but nothing in this codebase
+    implements that update yet), so the address can only arrive at creation via
+    `fulfillment_address`. An absent or incomplete one is a 400 the caller can
+    fix by re-creating the session — never a default we make up."""
+    address = _normalize_address(session.get("fulfillment_address"))
+    missing = [
+        key
+        for key in _REQUIRED_ADDRESS_FIELDS
+        if not str((address or {}).get(key) or "").strip()
+    ]
+    if address is None or missing:
+        raise AcpCheckoutSessionError(
+            "fulfillment address required: this checkout session has no usable "
+            "fulfillment address ("
+            + (
+                "none was supplied"
+                if address is None
+                else "missing " + ", ".join(missing)
+            )
+            + "). There is no session-update endpoint — supply the full address "
+            "(address_line1, city, postal_code, country) as `fulfillment_address` "
+            "when the checkout session is created.",
+            code="acp_address_required",
+            status_code=400,
+        )
+    return address
+
+
+def _require_customer_email(session: Dict[str, Any]) -> str:
+    """The session's buyer email, or a fail-closed refusal. The retired service
+    charged under a hardcoded placeholder mailbox when the session carried none,
+    which produced real orders no real buyer could be notified about."""
+    buyer = session.get("buyer") if isinstance(session.get("buyer"), dict) else {}
+    session_metadata = (
+        session.get("metadata") if isinstance(session.get("metadata"), dict) else {}
+    )
+    email = str(
+        (buyer or {}).get("email") or (session_metadata or {}).get("customer_email") or ""
+    ).strip()
+    if not email:
+        raise AcpCheckoutSessionError(
+            "buyer email required: this checkout session carries neither a buyer "
+            "email nor metadata.customer_email. There is no session-update "
+            "endpoint — supply `buyer.email` (or metadata.customer_email) when "
+            "the checkout session is created.",
+            code="acp_email_required",
+            status_code=400,
+        )
+    return email
+
+
+async def _payment_provider_descriptor(merchant_id: str) -> Optional[Dict[str, Any]]:
+    """The merchant's ACTUAL payment provider, from their active PSP row.
+
+    Returns None — and the create response then OMITS `payment_provider`
+    entirely — when the merchant has no active PSP row or the lookup fails.
+    Honest absence beats the old hardcoded provider=stripe descriptor, which told
+    every redirect-floor merchant (who have no PSP at all) that Pivota would
+    charge their buyer's card through Stripe. Deliberately NON-FATAL: session
+    creation does not charge anything, so a missing PSP must not break it.
+
+    Review nits 2+3: provider-ONLY query (no key material rides a path that
+    charges nothing) with a hard timeout so a slow merchant_psps can only omit
+    the field, never stall session creation."""
+    try:
+        from services.merchant_psp_config_service import fetch_active_merchant_psp_provider
+
+        provider = await asyncio.wait_for(
+            fetch_active_merchant_psp_provider(merchant_id=str(merchant_id or "")),
+            timeout=_PAYMENT_PROVIDER_LOOKUP_TIMEOUT_S,
+        )
+    except Exception as exc:  # noqa: BLE001 — never fatal to session creation
+        logger.warning(
+            "[AcpCheckoutSession] payment-provider lookup failed merchant=%s: %s "
+            "(payment_provider omitted from the session response)",
+            merchant_id, str(exc)[:200],
+        )
+        return None
+    if not provider:
+        return None
+    return {"provider": provider, "supported_payment_methods": ["card"]}
+
+
 def _build_session_metadata(
     *,
     merchant_id: str,
@@ -471,7 +568,14 @@ async def create_session(
     minting agent, so a session created without one can never be completed
     (complete_session refuses it with `acp_agent_unbound`). Making it a
     positional-by-name requirement stops a caller from silently minting an
-    uncompletable session by omitting it."""
+    uncompletable session by omitting it.
+
+    `fulfillment_address` and `buyer` stay OPTIONAL here (the ACP protocol
+    allows an address-less session that a later update fills in, and a session
+    is only a screen/quote — it charges nothing). But this layer has no update
+    path, so in practice a session created without a full address and a buyer
+    email cannot be completed: /complete refuses it with `acp_address_required`
+    / `acp_email_required` rather than inventing either."""
     if not str(agent_id or "").strip():
         # An explicit None/blank would mint a session complete_session can never
         # accept (acp_agent_unbound) — refuse at the door instead.
@@ -558,7 +662,6 @@ async def create_session(
     raw = {
         "id": session_id,
         "buyer": buyer or None,
-        "payment_provider": {"provider": "stripe", "supported_payment_methods": ["card"]},
         "status": STATUS_READY_FOR_PAYMENT,
         "currency": currency,
         "line_items": quote.get("line_items") or [],
@@ -569,6 +672,11 @@ async def create_session(
         "messages": [],
         "links": [],
     }
+    # Derived from the merchant's real PSP row, and simply ABSENT when there is
+    # none (or the lookup fails) — never a guessed provider.
+    payment_provider = await _payment_provider_descriptor(merchant_id)
+    if payment_provider:
+        raw["payment_provider"] = payment_provider
     return AcpSessionResult(
         session_id=session_id,
         checkout_url=f"{_checkout_url_base()}/{session_id}",
@@ -702,18 +810,11 @@ async def _create_pivota_order(
             )
         )
 
-    address = _normalize_address(session.get("fulfillment_address")) or dict(DEFAULT_SHIPPING_ADDRESS)
-    # ShippingAddress requires city/postal_code/country — backfill from the
-    # old-service default rather than failing an otherwise-chargeable session.
-    for key, fallback in DEFAULT_SHIPPING_ADDRESS.items():
-        address.setdefault(key, fallback)
-
-    buyer = session.get("buyer") if isinstance(session.get("buyer"), dict) else {}
-    customer_email = (
-        (buyer or {}).get("email")
-        or (session_metadata or {}).get("customer_email")
-        or DEFAULT_BUYER_EMAIL
-    )
+    # Fail-closed, no fabrication: complete_session already refused a session
+    # without a usable address/email BEFORE claiming, so these are belt-and-
+    # suspenders for any other caller — they never invent a default.
+    address = _require_fulfillment_address(session)
+    customer_email = _require_customer_email(session)
 
     order_request = CreateOrderRequest(
         merchant_id=str(session.get("merchant_id")),
@@ -1131,6 +1232,10 @@ async def complete_session(
       matching idempotency_key with a DIFFERENT payload → `idempotency_conflict`, 409).
     - an Idempotency-Key already used by ANOTHER session → `idempotency_conflict`
       (409), decided BEFORE any charge.
+    - no usable fulfillment address → `acp_address_required` (400) and no buyer
+      email anywhere → `acp_email_required` (400), both decided BEFORE the claim
+      (zero side effects). Neither is defaulted: an order shipped to an invented
+      address, or attributed to an invented buyer, is worse than a refusal.
     - a concurrent in-flight completion → `completion_in_progress` (409).
     - kill-switch block / over-cap → the gate chain's own HTTPException(403)
       propagates untouched (as_error_detail shape — dark stays dark).
@@ -1221,6 +1326,22 @@ async def complete_session(
     if not pre_gate.allowed:
         raise HTTPException(status_code=403, detail=pre_gate.as_error_detail())
 
+    # Fulfillment identity, checked BEFORE the claim so a session that cannot
+    # produce a real order refuses with ZERO side effects (same posture as the
+    # validations above). These used to be silently defaulted to a placeholder
+    # address and mailbox — a charge whose order shipped somewhere nobody gave
+    # us. Refusing loudly is the safe answer.
+    #
+    # Scoped to a FRESH completion (the row is ready_for_payment): the only other
+    # status reachable here is `completing`, i.e. a prior attempt that may ALREADY
+    # have charged under the stored PSP key. Refusing that one would strand real
+    # money — a resume creates no new fulfillment data, it only converges the
+    # attempt that exists (and if it still has to create the order, the same
+    # requirement is re-applied there, holding the claim instead of charging).
+    if str(session.get("status") or "") == STATUS_READY_FOR_PAYMENT:
+        _require_fulfillment_address(session)
+        _require_customer_email(session)
+
     # CLAIM BEFORE CHARGE: exactly one completion attempt may proceed. The
     # winning UPDATE also mints and STORES this attempt's PSP idempotency key.
     claim = await _claim_session(sid, idempotency_key)
@@ -1300,14 +1421,10 @@ async def complete_session(
                         status_code=422,
                     )
 
-            session_metadata = session.get("metadata") if isinstance(session.get("metadata"), dict) else {}
-            buyer = session.get("buyer") if isinstance(session.get("buyer"), dict) else {}
-            customer_email = (
-                (buyer or {}).get("email")
-                or (session_metadata or {}).get("customer_email")
-                or DEFAULT_BUYER_EMAIL
-            )
-            address = _normalize_address(session.get("fulfillment_address")) or dict(DEFAULT_SHIPPING_ADDRESS)
+            # Both already validated pre-claim; re-derived here from the row
+            # re-read after the claim (never defaulted — see the helpers).
+            customer_email = _require_customer_email(session)
+            address = _require_fulfillment_address(session)
 
             quote = await _build_quote(
                 merchant_id=str(session.get("merchant_id")),
