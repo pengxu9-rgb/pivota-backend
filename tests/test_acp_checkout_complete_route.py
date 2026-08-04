@@ -400,3 +400,98 @@ async def test_foreign_agent_is_403(monkeypatch):
     assert ei.value.status_code == 403
     assert ei.value.detail["code"] == "acp_agent_mismatch"
     assert calls["order_create"] == 0 and calls["capture"] == 0
+
+
+# --- delegated-token allowance refusals surface as 422 on the wire ------------
+
+
+async def test_unknown_delegate_token_is_a_422_in_the_acp_error_envelope(monkeypatch):
+    # The route maps AcpCheckoutSessionError.status_code straight through, so a
+    # registry 422 must arrive as a 422 (not clamped to the 502 default) in the
+    # ACP `{type, code, message, param}` envelope external platforms parse.
+    from fastapi import HTTPException
+    from routes import agent_checkout_intents as m
+    from services import acp_delegate_allowance_service as reg
+
+    _arm(monkeypatch)
+    monkeypatch.setattr(
+        settings, "acp_delegate_allowance_registry_enabled", True, raising=False
+    )
+    await reg._ensure_acp_delegate_allowances_table()
+    calls = _mock_layers(monkeypatch)
+    sid = await _seed_session()
+
+    with pytest.raises(HTTPException) as ei:
+        await m.complete_acp_checkout(
+            sid,
+            m.CompleteAcpCheckoutRequest(payment_data={"token": "vt_00000000000000"}),
+            _Ctx(),
+        )
+    assert ei.value.status_code == 422
+    assert ei.value.detail == {
+        "type": "invalid_request",
+        "code": "invalid_token",
+        "message": "delegate token not found",
+        "param": "payment_data.token",
+    }
+    assert calls["order_create"] == 0 and calls["capture"] == 0
+    assert (await svc.peek_session(sid))["status"] == "ready_for_payment"
+
+
+async def test_a_matching_allowance_completes_and_is_consumed(monkeypatch):
+    from routes import agent_checkout_intents as m
+    from services import acp_delegate_allowance_service as reg
+
+    _arm(monkeypatch)
+    monkeypatch.setattr(
+        settings, "acp_delegate_allowance_registry_enabled", True, raising=False
+    )
+    await reg._ensure_acp_delegate_allowances_table()
+    calls = _mock_layers(monkeypatch)
+    sid = await _seed_session()
+    minted = await reg.mint_allowance(
+        checkout_session_id=sid,
+        merchant_id="merch_x",
+        max_amount=169,  # the seeded session's exact total — equality passes
+        currency="usd",  # case-insensitive against the session's "USD"
+        expires_at=datetime.now(timezone.utc) + timedelta(seconds=900),
+    )
+    out = await m.complete_acp_checkout(
+        sid,
+        m.CompleteAcpCheckoutRequest(payment_data={"token": minted["token_id"]}),
+        _Ctx(),
+    )
+    assert out["status"] == "completed"
+    assert calls["capture"] == 1
+    stored = await reg.get_allowance(minted["token_id"])
+    assert stored["used"] is True
+    assert stored["used_by_session"] == sid
+
+
+async def test_flag_off_leaves_the_route_behavior_unchanged_for_a_vt_token(monkeypatch):
+    # Default posture: no registry lookup, no refusal — today's behavior exactly.
+    from routes import agent_checkout_intents as m
+    from services import acp_delegate_allowance_service as reg
+
+    _arm(monkeypatch)
+    monkeypatch.setattr(
+        settings, "acp_delegate_allowance_registry_enabled", False, raising=False
+    )
+    seen = []
+    real = reg.get_allowance
+
+    async def spy(token_id):
+        seen.append(token_id)
+        return await real(token_id)
+
+    monkeypatch.setattr(reg, "get_allowance", spy)
+    calls = _mock_layers(monkeypatch)
+    sid = await _seed_session()
+    out = await m.complete_acp_checkout(
+        sid,
+        m.CompleteAcpCheckoutRequest(payment_data={"token": "vt_00000000000000"}),
+        _Ctx(),
+    )
+    assert out["status"] == "completed"
+    assert calls["capture"] == 1
+    assert seen == []

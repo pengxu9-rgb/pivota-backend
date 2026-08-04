@@ -440,6 +440,21 @@ class Settings(BaseSettings):
         os.getenv("AGENT_ACP_LIVE_MAX_CENTS", "200") or "200"
     )
 
+    # P1 delegated-token design (PR-A): local enforcement of the ACP delegate
+    # allowance registry (`acp_delegate_allowances`) on the completion path.
+    # Default OFF, and OFF means byte-for-byte today's behavior: a `vt_` token
+    # is not looked up at all and dies where it already dies (the Stripe adapter
+    # refuses a non-`pm_` on the live lane, and substitutes the test PM on the
+    # test lane). Flag ON adds a fail-closed pre-claim check of the recorded
+    # allowance (existence → session → merchant → currency → amount → expiry)
+    # plus the single-use CAS bind at claim time. It is defense-in-depth, never
+    # the only enforcement: the PSP enforces token scoping authoritatively.
+    # `pm_` (and a future `spt_`) tokens are untouched in both flag states.
+    acp_delegate_allowance_registry_enabled: bool = (
+        os.getenv("ACP_DELEGATE_ALLOWANCE_REGISTRY_ENABLED", "false").strip().lower()
+        in {"true", "1", "on", "yes"}
+    )
+
     # ---- Tier-2 native-handoff lane (mid-man routing, 2026-07-23) ----
     # Three-tier checkout routing: in-chat charge (pivota_psp) > NATIVE HANDOFF
     # (the transaction completes on the merchant's OWN checkout — platform_native
