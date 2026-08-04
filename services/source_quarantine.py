@@ -158,10 +158,39 @@ SEED_PICK_ORDER = (
 # listing over a merely-newer sibling: the winner's external_product_id is the
 # identity join key downstream, so picking an identity-less sibling re-derives
 # IDENTITY_CONFIDENCE_NULL nondeterministically as updated_at values move.
-MINTED_SEED_IDENTITY_LEG = (
-    "(EXISTS (SELECT 1 FROM pdp_identity_listing spl "
-    "WHERE spl.product_id = s.external_product_id)) DESC"
-)
+#
+# THIS IS A FUNCTION, NOT A CONSTANT (issue #1665). It was a constant matching on
+# `spl.product_id = s.external_product_id` ALONE. Per ADR-008 `source_listing_ref`
+# is merchant_id:product_id, so product_id is explicitly NOT unique across
+# merchants — and a seed whose listing lives at ANOTHER merchant then satisfied
+# the leg. Being inside EXISTS it could not fan out; what it did instead was pick
+# the WRONG SEED. The outer lateral (which does carry the merchant conjunct) then
+# found nothing, the group read NULL, `count(DISTINCT)` skipped it, and a
+# genuinely fragmented cross-domain content_key reported CLEAN. Measured: a
+# fragmented key reads 1 when the rival seed has no listing anywhere, and 0 once
+# it has one at a different merchant.
+#
+# Requiring `merchant_expr` rather than defaulting it is the point: every caller
+# must name the merchant this seed is being picked FOR, and there is no spelling
+# of this leg that silently omits it.
+def minted_seed_identity_leg_sql(merchant_expr: str) -> str:
+    """ORDER BY leg preferring a seed whose listing exists AT `merchant_expr`.
+
+    `merchant_expr` is a literal SQL expression naming the merchant the seed is
+    being picked for — e.g. ``"cp.merchant_id"``. It must be in scope at the
+    point the leg is interpolated; a CTE over `external_product_seeds` alone has
+    no merchant and must join the attached catalog row to get one.
+    """
+    if not merchant_expr or not merchant_expr.strip():
+        raise ValueError(
+            "minted_seed_identity_leg_sql requires a merchant expression; a "
+            "merchant-less identity leg matches listings across merchants and "
+            "picks the wrong seed (issue #1665)")
+    return (
+        "(EXISTS (SELECT 1 FROM pdp_identity_listing spl "
+        "WHERE spl.product_id = s.external_product_id "
+        f"AND spl.merchant_id = {merchant_expr})) DESC"
+    )
 
 # Which store wins for one (merchant_id, platform).
 # `(m.status = 'active') DESC` is FIRST and load-bearing — see the comment above.
@@ -176,6 +205,18 @@ STORE_PICK_ORDER = (
     "m.store_id DESC"
 )
 
+# The seed's merchant, resolved from the catalog row it is ATTACHED to rather
+# than from the enclosing query. This is deliberately scope-independent: the
+# obvious `cp.merchant_id` would be TWO levels of correlation out from the
+# `spl` inside the leg's EXISTS (spl -> seeds subquery -> cp), and while
+# Postgres resolves that, SQLite does not — `no such column: cp.merchant_id`.
+# The chain below is executed under SQLite by the agent_pdp_view_assembler
+# comparator tests, so the leg here must not depend on what encloses it.
+_ATTACHED_ROW_MERCHANT_SQL = (
+    "(SELECT cpx.merchant_id FROM catalog_products cpx "
+    "WHERE cpx.product_key = s.attached_product_key)"
+)
+
 CATALOG_PRODUCT_DOMAIN_SQL = f"""coalesce(
       nullif(cp.source_domain, ''),
       (SELECT nullif(s.domain, '') FROM external_product_seeds s
@@ -186,7 +227,7 @@ CATALOG_PRODUCT_DOMAIN_SQL = f"""coalesce(
       (SELECT nullif(s.domain, '') FROM external_product_seeds s
         WHERE cp.source_system = 'catalog_enrichment_agent_v1'
           AND s.attached_product_key = cp.product_key
-        ORDER BY {MINTED_SEED_IDENTITY_LEG}, {SEED_PICK_ORDER}
+        ORDER BY {minted_seed_identity_leg_sql(_ATTACHED_ROW_MERCHANT_SQL)}, {SEED_PICK_ORDER}
         LIMIT 1),
       (SELECT nullif(m.domain, '') FROM merchant_stores m
         WHERE m.merchant_id = cp.merchant_id AND m.platform = cp.platform

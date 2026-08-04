@@ -36,7 +36,7 @@ from typing import Any, Iterable, Mapping, Optional, Sequence
 
 from services.catalog_trust_policy import derive_trust
 from services.source_quarantine import (
-    MINTED_SEED_IDENTITY_LEG,
+    minted_seed_identity_leg_sql,
     SEED_PICK_ORDER,
     STORE_PICK_ORDER,
     sql_bare_domain,
@@ -61,6 +61,13 @@ _QUARANTINE_BULK_MAX = 5_000
 # Any change here must land in the Node backfill in the same PR set or the
 # steady-state and backfill outputs diverge.
 # ---------------------------------------------------------------------------
+
+
+# The identity leg tested against the merchant of the catalog row the seed is
+# attached to (`cpx`, joined in the CTE below). Bound here because Python 3.11
+# f-string replacement fields cannot contain the same quote character as the
+# enclosing string.
+_MINTED_SEED_IDENTITY_LEG = minted_seed_identity_leg_sql("cpx.merchant_id")
 
 
 _PRODUCT_JOIN_CTES = f"""
@@ -88,12 +95,22 @@ _PRODUCT_JOIN_CTES = f"""
     SELECT DISTINCT ON (s.attached_product_key)
       s.id, s.external_product_id, s.status, s.domain, s.attached_product_key, s.updated_at, s.seed_kind
     FROM external_product_seeds s
-    LEFT JOIN pdp_identity_listing spl
-      ON spl.product_id = s.external_product_id
+    -- The merchant to test the identity leg against is the one on the catalog
+    -- row this seed is attached to; `cp` is not in scope inside a CTE, so join
+    -- it. product_key is catalog_products' PRIMARY KEY, so this is 1:1 and
+    -- cannot fan out. It REPLACES a `LEFT JOIN pdp_identity_listing spl` that
+    -- was dead weight and a fan-out risk: the identity leg declares its own
+    -- `spl` inside EXISTS, which shadowed that alias, so the join fed nothing
+    -- into the ORDER BY while still multiplying rows before DISTINCT ON.
+    -- LEFT, not inner: a seed whose attached_product_key does not resolve keeps
+    -- its row and simply loses the identity leg (NULL merchant -> EXISTS false),
+    -- which is the correct ranking for a seed that cannot be joined anyway.
+    LEFT JOIN catalog_products cpx
+      ON cpx.product_key = s.attached_product_key
     WHERE s.attached_product_key IS NOT NULL
     ORDER BY
       s.attached_product_key,
-      {MINTED_SEED_IDENTITY_LEG},
+      {_MINTED_SEED_IDENTITY_LEG},
       {SEED_PICK_ORDER}
   ),
   merchant_store_one AS (

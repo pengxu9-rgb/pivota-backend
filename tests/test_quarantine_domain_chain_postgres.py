@@ -77,7 +77,10 @@ CREATE TABLE external_product_seeds (
 CREATE TABLE merchant_stores (
   store_id text PRIMARY KEY, merchant_id text, platform text, domain text,
   status text, is_primary boolean, last_sync timestamptz, created_at timestamptz);
-CREATE TABLE pdp_identity_listing (product_id text, source_listing_ref text);
+-- merchant_id: the identity leg is merchant-scoped (#1665). Without this
+-- column the leg cannot be expressed and this harness cannot see the bug.
+CREATE TABLE pdp_identity_listing (
+  product_id text, source_listing_ref text, merchant_id text);
 -- _PRODUCT_JOIN_CTES carries more CTEs than this test exercises; they must
 -- still resolve, so their tables exist here as empty stubs.
 CREATE TABLE pdp_identity_override (
@@ -124,7 +127,22 @@ SHAPES = {
             ("s_id", "ext_id", "retailer-a.example.com", "pk", "active", "2026-01-01", "2026-01-01"),
             ("s_new", "ext_new", "retailer-b.example.com", "pk", "active", "2026-07-01", "2026-07-01"),
         ],
-        listings=[("ext_id", "external_seed:ext_id")],
+        listings=[("ext_id", "external_seed:ext_id", "m1")],
+        expect="retailer-a.example.com",
+    ),
+    # Issue #1665: the identity leg must not be satisfied by a listing at
+    # ANOTHER merchant. `source_listing_ref` is merchant_id:product_id
+    # (ADR-008), so product_id alone is not unique. `ext_new` is newer and
+    # carries a listing — but at m2, not this row's m1 — so it must NOT win the
+    # leg. Before the fix it did, and the resolved domain flipped to
+    # retailer-b, taking the trust decision and the quarantine verdict with it.
+    "minted: a listing at ANOTHER merchant must not win the leg": dict(
+        product=("pk", "m1", "shopify", "slug", "catalog_enrichment_agent_v1", None),
+        seeds=[
+            ("s_id", "ext_id", "retailer-a.example.com", "pk", "active", "2026-01-01", "2026-01-01"),
+            ("s_new", "ext_new", "retailer-b.example.com", "pk", "active", "2026-07-01", "2026-07-01"),
+        ],
+        listings=[("ext_id", "m1:ext_id", "m1"), ("ext_new", "m2:ext_new", "m2")],
         expect="retailer-a.example.com",
     ),
     "mirror: active outranks newer-inactive": dict(
@@ -190,7 +208,8 @@ async def _load(conn, shape):
             st[0], st[1], st[2], st[3], st[4], st[5], _ts(st[6]), _ts(st[7]),
         )
     for li in shape.get("listings", []):
-        await conn.execute("INSERT INTO pdp_identity_listing VALUES ($1,$2)", *li)
+        await conn.execute(
+            "INSERT INTO pdp_identity_listing VALUES ($1,$2,$3)", *li)
 
 
 async def _lateral_domain(conn) -> str | None:

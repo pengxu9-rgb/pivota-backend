@@ -107,6 +107,18 @@ async def _create_min_tables(database):
         )
         """
     )
+    # merchant_id: the minted-seed identity leg is merchant-scoped (#1665), so
+    # CATALOG_PRODUCT_DOMAIN_SQL — which this file executes via candidates_sql ->
+    # _truth_cte — now emits `spl.merchant_id`. Separate ALTER rather than a
+    # column in the CREATE above, per #1651: these gate files share ONE database,
+    # so whichever file runs first wins the CREATE and a later CREATE ... IF NOT
+    # EXISTS silently keeps the older, narrower shape. Additive and order-proof.
+    await database.execute(
+        """
+        ALTER TABLE pdp_identity_listing
+            ADD COLUMN IF NOT EXISTS merchant_id TEXT
+        """
+    )
     await database.execute(
         """
         CREATE TABLE IF NOT EXISTS merchant_stores (

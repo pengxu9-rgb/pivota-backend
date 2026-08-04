@@ -1069,3 +1069,144 @@ def test_fragmented_identity_minted_pick_skips_an_inactive_seed(pg_engine):
         _trust_public(conn, "pk_minted")
         # Active seed agrees with the retailer -> clean.
         assert _count_of(conn, "cross_domain_content_key_fragmented_identity") == 0
+
+
+# ---------------------------------------------------------------------------
+# Issue #1665 — the identity leg must be merchant-scoped
+# ---------------------------------------------------------------------------
+
+
+def test_identity_leg_ignores_a_listing_at_another_merchant(pg_engine):
+    """A seed must not win the identity leg on a FOREIGN merchant's listing.
+
+    `source_listing_ref` is merchant_id:product_id (ADR-008), so `product_id`
+    alone is not unique across merchants. While the leg matched on product_id
+    ALONE, a seed carrying a listing at merchant M2 satisfied it, beat the seed
+    carrying the RIGHT listing at M1 on `updated_at`, and the outer lateral —
+    which does carry the merchant conjunct — then found nothing. The group read
+    NULL, `count(DISTINCT)` skipped it, and a genuinely fragmented cross-domain
+    content_key reported CLEAN.
+
+    This is the exact table from issue #1665: with the rival's foreign listing
+    present the count went 1 -> 0. It must now stay 1.
+    """
+    from sqlalchemy import text
+
+    with pg_engine.begin() as conn:
+        _reset(conn)
+        _product(conn, pk="pk_minted", ck="ck_x", sig="sig_minted",
+                 merchant_id="merch_m1")
+        _product(conn, pk="pk_retailer", ck="ck_x", sig="sig_retailer",
+                 merchant_id="merch_m1")
+        _domain(conn, "pk_minted", "brand.com")
+        _domain(conn, "pk_retailer", "ulta.com")
+        conn.execute(text("UPDATE catalog_products "
+                          "SET source_system = 'catalog_enrichment_agent_v1', "
+                          "    source_product_id = 'slug-not-a-seed-id' "
+                          "WHERE product_key = 'pk_minted'"))
+        # `ext_aaa_right` is OLDER but carries the listing at THIS merchant (M1).
+        # `ext_zzz_rival` is NEWER and carries a listing only at a FOREIGN
+        # merchant (M2).
+        #
+        # THE NAMES ARE DELIBERATE. An earlier version called these ext_old /
+        # ext_new, and under an arbitrary `ORDER BY s.external_product_id DESC`
+        # — no identity leg at all — 'ext_old' sorts above 'ext_new', so the
+        # fixture produced the RIGHT answer by accident and the mutation went
+        # undetected. Named so that any alphabetical or id-based ordering picks
+        # the WRONG seed, and only the merchant-scoped leg picks the right one.
+        conn.execute(text(
+            "INSERT INTO external_product_seeds "
+            "(external_product_id, attached_product_key, status, updated_at) VALUES "
+            "('ext_zzz_rival', 'pk_minted', 'active', NOW()), "
+            "('ext_aaa_right', 'pk_minted', 'active', NOW() - INTERVAL '10 days')"))
+        _listing(conn, source_product_id="ext_aaa_right", sig_group="grp_minted",
+                 merchant_id="merch_m1")
+        _listing(conn, source_product_id="ext_zzz_rival", sig_group="grp_foreign",
+                 merchant_id="merch_m2")
+        _listing(conn, source_product_id="pk_retailer", sig_group="grp_retailer",
+                 merchant_id="merch_m1")
+        _trust_public(conn, "pk_minted")
+
+        assert _count_of(conn, "cross_domain_content_key_fragmented_identity") == 1
+
+        # AND the row must resolve to THIS merchant's group. The count alone is a
+        # 1-bit assertion that an arbitrary ORDER BY also satisfies (measured:
+        # replacing the whole pick with `ORDER BY s.external_product_id DESC`
+        # left this test green, because the right seed happens to sort last).
+        # Naming the group is what actually pins the leg.
+        from services.identity_join_sql import identity_listing_lateral_sql
+
+        resolved = conn.execute(text(
+            "SELECT pil.sellable_item_group_id FROM catalog_products cp "
+            + identity_listing_lateral_sql("cp")
+            + " WHERE cp.product_key = 'pk_minted'")).scalar()
+        assert resolved == "grp_minted", (
+            f"resolved {resolved!r} — the foreign-merchant listing (grp_foreign) "
+            "won the seed pick, or the pick became arbitrary")
+
+
+def test_identity_leg_still_prefers_the_seed_that_resolves_at_this_merchant(pg_engine):
+    """Control for the test above: with NO foreign listing in play the pick is
+    unchanged, so the merchant conjunct is not simply disabling the leg."""
+    from sqlalchemy import text
+
+    with pg_engine.begin() as conn:
+        _reset(conn)
+        _product(conn, pk="pk_minted", ck="ck_x", sig="sig_minted",
+                 merchant_id="merch_m1")
+        _product(conn, pk="pk_retailer", ck="ck_x", sig="sig_retailer",
+                 merchant_id="merch_m1")
+        _domain(conn, "pk_minted", "brand.com")
+        _domain(conn, "pk_retailer", "ulta.com")
+        conn.execute(text("UPDATE catalog_products "
+                          "SET source_system = 'catalog_enrichment_agent_v1', "
+                          "    source_product_id = 'slug-not-a-seed-id' "
+                          "WHERE product_key = 'pk_minted'"))
+        conn.execute(text(
+            "INSERT INTO external_product_seeds "
+            "(external_product_id, attached_product_key, status, updated_at) VALUES "
+            "('ext_new', 'pk_minted', 'active', NOW()), "
+            "('ext_old', 'pk_minted', 'active', NOW() - INTERVAL '10 days')"))
+        _listing(conn, source_product_id="ext_old", sig_group="grp_minted",
+                 merchant_id="merch_m1")
+        _listing(conn, source_product_id="pk_retailer", sig_group="grp_retailer",
+                 merchant_id="merch_m1")
+        _trust_public(conn, "pk_minted")
+
+        assert _count_of(conn, "cross_domain_content_key_fragmented_identity") == 1
+
+
+def test_the_identity_leg_refuses_to_build_without_a_merchant():
+    """There must be no spelling of this leg that omits the merchant."""
+    import pytest
+
+    from services.source_quarantine import minted_seed_identity_leg_sql
+
+    for bad in ("", "   "):
+        with pytest.raises(ValueError, match="merchant"):
+            minted_seed_identity_leg_sql(bad)
+
+    sql = minted_seed_identity_leg_sql("cp.merchant_id")
+    assert "spl.merchant_id = cp.merchant_id" in sql
+    assert "spl.product_id = s.external_product_id" in sql
+
+
+def test_the_upserter_cte_joins_the_catalog_row_for_its_merchant():
+    """`cp` is not in scope inside a CTE, so the merchant must be joined in.
+    Without this the leg would silently compare against nothing."""
+    from services.catalog_row_trust_upserter import _PRODUCT_JOIN_CTES
+
+    start = _PRODUCT_JOIN_CTES.find("minted_seed_one AS (")
+    block = _PRODUCT_JOIN_CTES[start: _PRODUCT_JOIN_CTES.find("\n  ),", start)]
+    # Comments stripped for EVERY assertion, positive and negative. Review
+    # showed a `-- historical: the leg was {_MINTED_SEED_IDENTITY_LEG}` comment
+    # kept 15 string-pinned tests green while the real ORDER BY was gutted. The
+    # first version of this test stripped comments only for the negative check —
+    # the hazard was seen on one line and missed on three.
+    code = "\n".join(ln for ln in block.split("\n")
+                     if not ln.strip().startswith("--"))
+    assert "LEFT JOIN catalog_products cpx" in code
+    assert "cpx.product_key = s.attached_product_key" in code
+    assert "spl.merchant_id = cpx.merchant_id" in code
+    # The dead, fan-out-prone join it replaced must be gone.
+    assert "LEFT JOIN pdp_identity_listing spl" not in code
