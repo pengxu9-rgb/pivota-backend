@@ -17,7 +17,11 @@ from dataclasses import dataclass
 from typing import Any, Dict, Iterable, List, Optional, Sequence
 
 from db.database import database
-from services.pdp_scope_classifier import LABEL_SOURCE_ENRICHMENT, SCOPE_CANONICAL
+from services.pdp_scope_classifier import (
+    LABEL_SOURCE_ENRICHMENT,
+    SCOPE_CANONICAL,
+    own_merchant_seller_term_sql,
+)
 
 
 IDENTITY_RECOVERY_SOURCE = "pdp_identity_recovery"
@@ -1476,9 +1480,7 @@ CANONICAL_SCOPE_PREDICATE = """
             -- So the old branch was not unsound; it was unsound IN THE BUCKET.
             -- The CASE below is what makes that distinction instead of guessing.
             OR (
-              (CASE WHEN cp.merchant_id IS NOT NULL
-                     AND cp.merchant_id <> 'external_seed'
-                    THEN 1 ELSE 0 END)
+              {own_merchant_term}
               + (
                 SELECT count(DISTINCT co.merchant_id)
                 FROM catalog_offers co
@@ -1540,7 +1542,10 @@ CANONICAL_SCOPE_PREDICATE = """
                   WHERE peer.product_group_id = own.product_group_id
                 ) >= 2
             )
-""".format(label_source_enrichment=LABEL_SOURCE_ENRICHMENT)
+""".format(
+    label_source_enrichment=LABEL_SOURCE_ENRICHMENT,
+    own_merchant_term=own_merchant_seller_term_sql("cp.merchant_id"),
+)
 
 
 async def _promote_canonical_scopes(product_keys: Sequence[str]) -> int:
