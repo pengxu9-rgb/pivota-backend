@@ -2446,3 +2446,81 @@ async def test_pm_token_resume_paths_never_consult_the_registry(fake_quote, monk
     ))["status"] == "completed"
 
     assert seen == []
+
+
+async def test_resume_replays_with_this_sessions_own_token_not_the_callers(
+    fake_quote, monkeypatch
+):
+    # Review follow-up: the caller's token is inert for BINDING but NOT for the
+    # PSP call — a PSP keys idempotency on the whole parameter set, so replaying
+    # the stored key with a DIFFERENT token turns a clean retry into an
+    # idempotency error (which classifies AMBIGUOUS and re-holds the claim; a
+    # caller repeating that every <60s would wedge the row until its TTL).
+    # So the replay is made parameter-identical: the session's OWN bound token.
+    _arm_capture_lane(monkeypatch)
+    _arm_allowance_registry(monkeypatch)
+    _mock_order_layer(monkeypatch)
+    created = await _create()
+    own = await _mint_allowance(
+        checkout_session_id=created.session_id, merchant_id="merch_x", max_amount=100000
+    )
+    # The session legitimately consumed its own token on the first attempt.
+    assert await reg.bind_allowance_to_session(
+        token_id=own["token_id"], session_id=created.session_id
+    )
+    foreign = await _mint_allowance(
+        checkout_session_id="csn_elsewhere", merchant_id="merch_someone_else"
+    )
+    await _wedge_completing(created.session_id, order_id="ord_acp_1")
+
+    seen: list = []
+    orig_execute = offpay.execute_acp_offsession_payment
+
+    async def spy(**kwargs):
+        seen.append((kwargs["idempotency_key"], kwargs.get("payment_method_token")))
+        return await orig_execute(**kwargs)
+
+    monkeypatch.setattr(offpay, "execute_acp_offsession_payment", spy)
+
+    out = await svc.complete_session(
+        session_id=created.session_id, agent_context=_Ctx(),
+        payment_token=foreign["token_id"],  # junk/foreign token on the replay
+    )
+    assert out["status"] == "completed"
+    # The capture replayed the stored key WITH THIS SESSION'S OWN TOKEN — never
+    # the caller's, so the retry is parameter-identical to the real dispatch.
+    assert seen == [(f"acp_complete:{created.session_id}:a1", own["token_id"])]
+    # ...and the foreign allowance is still untouched.
+    stored = await reg.get_allowance(foreign["token_id"])
+    assert stored["used"] is False and stored["used_by_session"] is None
+
+
+async def test_resume_without_a_bound_token_forwards_no_token(fake_quote, monkeypatch):
+    # A session that has an order but never bound a delegate token (e.g. its
+    # first attempt used a pm_): a junk vt_ on the replay must not be forwarded
+    # either — None keeps the replay closest to a parameter-identical retry.
+    _arm_capture_lane(monkeypatch)
+    _arm_allowance_registry(monkeypatch)
+    _mock_order_layer(monkeypatch)
+    created = await _create()
+    foreign = await _mint_allowance(
+        checkout_session_id="csn_elsewhere", merchant_id="merch_someone_else"
+    )
+    await _wedge_completing(created.session_id, order_id="ord_acp_1")
+
+    seen: list = []
+    orig_execute = offpay.execute_acp_offsession_payment
+
+    async def spy(**kwargs):
+        seen.append(kwargs.get("payment_method_token"))
+        return await orig_execute(**kwargs)
+
+    monkeypatch.setattr(offpay, "execute_acp_offsession_payment", spy)
+    out = await svc.complete_session(
+        session_id=created.session_id, agent_context=_Ctx(),
+        payment_token=foreign["token_id"],
+    )
+    assert out["status"] == "completed"
+    assert seen == [None]
+    stored = await reg.get_allowance(foreign["token_id"])
+    assert stored["used"] is False

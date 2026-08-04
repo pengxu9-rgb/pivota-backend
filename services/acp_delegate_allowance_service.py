@@ -301,6 +301,30 @@ async def get_allowance(token_id: str) -> Optional[Dict[str, Any]]:
     return _row_to_allowance(row)
 
 
+async def get_allowance_bound_to_session(session_id: str) -> Optional[Dict[str, Any]]:
+    """The allowance THIS session already consumed, if any.
+
+    Used to replay a capture with the token the original dispatch actually used:
+    a PSP keys idempotency on the whole parameter set, so replaying the stored
+    key with a DIFFERENT token turns a clean retry into an idempotency error.
+    The token_id IS the token, so this is how a resume recovers it without ever
+    storing a payment credential."""
+    sid = str(session_id or "").strip()
+    if not sid:
+        return None
+
+    async def _run():
+        return await database.fetch_one(
+            acp_delegate_allowances.select()
+            .where(acp_delegate_allowances.c.used_by_session == sid)
+            .where(acp_delegate_allowances.c.used == True)  # noqa: E712 — SQL, not Python
+            .limit(1)
+        )
+
+    row = await _with_table_self_heal("allowance_lookup_failed", _run)
+    return _row_to_allowance(row)
+
+
 # The single-use CAS. Same technique as the session claim: the condition lives in
 # the WHERE clause and RETURNING tells us whether OUR update is the one that
 # landed (portable — SQLite >= 3.35 and Postgres both support UPDATE ...

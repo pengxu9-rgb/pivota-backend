@@ -1273,6 +1273,20 @@ async def _lookup_allowance(payment_token: Optional[str]) -> Optional[Dict[str, 
         ) from exc
 
 
+async def _lookup_allowance_bound_to_session(
+    session_id: str,
+) -> Optional[Dict[str, Any]]:
+    """The allowance this session already consumed, same error mapping."""
+    from services import acp_delegate_allowance_service as allowances
+
+    try:
+        return await allowances.get_allowance_bound_to_session(str(session_id))
+    except allowances.AcpDelegateAllowanceError as exc:
+        raise AcpCheckoutSessionError(
+            exc.message, code=exc.code, status_code=exc.status_code or 503
+        ) from exc
+
+
 async def _enforce_delegate_allowance(
     session: Dict[str, Any], payment_token: Optional[str]
 ) -> None:
@@ -1381,27 +1395,38 @@ async def _bind_delegate_allowance(session_id: str, payment_token: Optional[str]
 
 async def _rebind_own_delegate_allowance(
     session_id: str, payment_token: Optional[str]
-) -> None:
+) -> Optional[str]:
     """The RESUME-with-an-order case: re-bind ONLY the token this session has
-    already bound, and consume NOTHING else.
+    already bound, consume NOTHING else, and return the token the capture must
+    REPLAY WITH.
 
-    The capture on this path replays the STORED PSP idempotency key, so the
-    caller's token is inert — it cannot change what is charged. A token that is
-    not this session's own bound token is therefore ignored rather than consumed
-    (consuming it would bind a foreign allowance to a session it was never
-    minted for) and rather than refused (refusing would strand a charge that may
-    already be in flight). The re-bind of our OWN token is a no-op that keeps
-    the used_at watermark honest and can never fail on its own session."""
-    allowance = await _lookup_allowance(payment_token)
-    if not allowance or str(allowance.get("used_by_session") or "") != session_id:
-        logger.info(
-            "[AcpCheckoutSession] ignoring a delegate token on a resumed "
-            "completion that already has an order session=%s (the capture "
-            "replays the stored PSP key; no allowance is consumed)",
-            session_id,
-        )
-        return
-    await _bind_delegate_allowance(session_id, payment_token)
+    A token that is not this session's own bound token is neither consumed
+    (that would bind a foreign allowance to a session it was never minted for)
+    nor refused (that would strand a charge which may already be in flight) —
+    it is ignored, and the session's OWN bound token is returned in its place.
+
+    Returning the own token matters (review): the capture replays the STORED PSP
+    idempotency key, and a PSP keys idempotency on the whole parameter set — so
+    replaying that key with a DIFFERENT token turns a clean retry into an
+    idempotency error, which classifies as AMBIGUOUS and re-holds the claim.
+    Repeated often enough that wedges the row until its TTL. The caller's token
+    is inert for BINDING; it is not inert for the PSP call. So the replay is
+    made parameter-identical to the dispatch that actually happened."""
+    own = await _lookup_allowance_bound_to_session(session_id)
+    own_token = str((own or {}).get("token_id") or "") or None
+    presented = str(payment_token or "").strip() or None
+    if own_token and presented == own_token:
+        await _bind_delegate_allowance(session_id, payment_token)
+        return own_token
+    logger.info(
+        "[AcpCheckoutSession] ignoring a delegate token on a resumed completion "
+        "that already has an order session=%s (no allowance consumed; the "
+        "capture replays this session's own token so the retry stays "
+        "parameter-identical) own_token_present=%s",
+        session_id,
+        bool(own_token),
+    )
+    return own_token
 
 
 def _delegate_allowance_applies(payment_token: Optional[str]) -> bool:
@@ -1668,6 +1693,11 @@ async def complete_session(
     )
 
     order_id = str(session.get("order_id") or "").strip()
+    # The token the CAPTURE is dispatched with. Identical to the caller's token
+    # everywhere except a resume that already has an order, where it becomes
+    # this session's own bound token so the replay stays parameter-identical to
+    # the dispatch that actually happened (see _rebind_own_delegate_allowance).
+    capture_payment_token = payment_token
 
     try:
         # SINGLE-USE CONSUMPTION, at claim time and before ANY order or charge
@@ -1694,7 +1724,9 @@ async def complete_session(
                 # RESUMED claim WITH an order: the caller's token is inert (the
                 # capture replays the stored PSP key). Re-bind only our OWN
                 # token; never consume a new allowance here.
-                await _rebind_own_delegate_allowance(sid, payment_token)
+                capture_payment_token = await _rebind_own_delegate_allowance(
+                    sid, payment_token
+                )
 
         quote_currency: Optional[str] = None
         if not order_id:
@@ -1805,7 +1837,7 @@ async def complete_session(
             # The STORED, attempt-scoped session key — never the caller's key
             # and never recomputed here (see the module docstring).
             idempotency_key=psp_idempotency_key,
-            payment_method_token=(payment_token or None),
+            payment_method_token=(capture_payment_token or None),
             agent_id=str(caller_agent or ""),
             order_metadata=order_metadata,
         )
