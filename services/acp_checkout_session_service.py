@@ -1222,6 +1222,34 @@ async def _revert_claim_to_ready(session_id: str) -> None:
 # The gate is EXACTLY `startswith("vt_")`, wire parity: `pm_` (a real PSP
 # payment method) and a future `spt_` (Stripe SharedPaymentToken) never reach
 # the registry, in either flag state.
+#
+# WHERE THE CHECKS RUN, AND WHY IT DEPENDS ON THE CLAIM (review: resume path).
+# Consumption is CLAIM-SCOPED, and there are exactly three cases:
+#
+#   FRESH claim
+#       Checks 1–6 run PRE-CLAIM (zero side effects on refusal), then the CAS
+#       bind runs at claim time before any order/charge work.
+#
+#   RESUMED claim, order_id IS NULL
+#       This is the claim→order-create crash window. A capture is only
+#       reachable AFTER `_persist_order_id` succeeds, so a NULL order_id
+#       PROVABLY means nothing was ever dispatched to a PSP — this resume does
+#       genuinely FRESH order-create and charge work, and it gets the FULL 1–6
+#       enforcement plus the bind. Refusing here strands nothing (there is no
+#       charge to strand). Per review B1 the refusal HOLDS the resumed claim, so
+#       a later resume presenting a VALID token still converges.
+#
+#   RESUMED claim, order_id SET
+#       A capture may already be in flight under the STORED PSP idempotency key,
+#       and — decisively — the caller's token is INERT on this path: the capture
+#       replays that stored key regardless of which token rides in. So a
+#       caller-supplied token is NEVER consumed here. Only the token this
+#       session ALREADY bound may be re-bound (idempotently). A foreign,
+#       expired or unknown `vt_` on such a replay is IGNORED for binding
+#       purposes, not refused: refusing would strand a real charge in order to
+#       punish a token that cannot affect it, and consuming it would bind an
+#       allowance to a session it was never minted for. Ignoring is the only
+#       option that neither burns a foreign allowance nor wedges live money.
 _ALLOWANCE_TOKEN_PARAM = "payment_data.token"
 
 
@@ -1231,26 +1259,35 @@ def _allowance_error(message: str, *, code: str, param: str) -> "AcpCheckoutSess
     )
 
 
+async def _lookup_allowance(payment_token: Optional[str]) -> Optional[Dict[str, Any]]:
+    """The recorded allowance for a token, with the registry's own error mapped
+    into this module's vocabulary. A registry we cannot read is a named 503,
+    never a silent pass: an unverifiable allowance must not become a charge."""
+    from services import acp_delegate_allowance_service as allowances
+
+    try:
+        return await allowances.get_allowance(str(payment_token))
+    except allowances.AcpDelegateAllowanceError as exc:
+        raise AcpCheckoutSessionError(
+            exc.message, code=exc.code, status_code=exc.status_code or 503
+        ) from exc
+
+
 async def _enforce_delegate_allowance(
     session: Dict[str, Any], payment_token: Optional[str]
 ) -> None:
-    """Pre-claim allowance enforcement for a `vt_` delegate token (checks 1–6
-    above). Raises a 422 AcpCheckoutSessionError on any refusal, with ZERO side
-    effects — nothing has been claimed, ordered or charged when this runs.
+    """Allowance enforcement for a `vt_` delegate token (checks 1–6 above).
+    Raises a 422 AcpCheckoutSessionError on any refusal.
+
+    Runs on a FRESH completion PRE-CLAIM (zero side effects), and on a RESUMED
+    claim whose order_id is still NULL — the one resume that provably has no
+    charge behind it and therefore must be validated exactly like a fresh one
+    (see the case analysis above).
 
     Amount and currency are compared against the SERVER-SIDE session values
     only; a caller-supplied amount is never an input to a cap.
     """
-    from services import acp_delegate_allowance_service as allowances
-
-    try:
-        allowance = await allowances.get_allowance(str(payment_token))
-    except allowances.AcpDelegateAllowanceError as exc:
-        # A registry we cannot read is a named 503, never a silent pass: an
-        # unverifiable allowance must not become a charge.
-        raise AcpCheckoutSessionError(
-            exc.message, code=exc.code, status_code=exc.status_code or 503
-        ) from exc
+    allowance = await _lookup_allowance(payment_token)
 
     # 1. existence — an unknown token REFUSES. We do not charge a delegated
     #    token whose allowance we cannot verify (design Q2, founder-confirmed).
@@ -1340,6 +1377,31 @@ async def _bind_delegate_allowance(session_id: str, payment_token: Optional[str]
             code="allowance_already_used",
             param=_ALLOWANCE_TOKEN_PARAM,
         )
+
+
+async def _rebind_own_delegate_allowance(
+    session_id: str, payment_token: Optional[str]
+) -> None:
+    """The RESUME-with-an-order case: re-bind ONLY the token this session has
+    already bound, and consume NOTHING else.
+
+    The capture on this path replays the STORED PSP idempotency key, so the
+    caller's token is inert — it cannot change what is charged. A token that is
+    not this session's own bound token is therefore ignored rather than consumed
+    (consuming it would bind a foreign allowance to a session it was never
+    minted for) and rather than refused (refusing would strand a charge that may
+    already be in flight). The re-bind of our OWN token is a no-op that keeps
+    the used_at watermark honest and can never fail on its own session."""
+    allowance = await _lookup_allowance(payment_token)
+    if not allowance or str(allowance.get("used_by_session") or "") != session_id:
+        logger.info(
+            "[AcpCheckoutSession] ignoring a delegate token on a resumed "
+            "completion that already has an order session=%s (the capture "
+            "replays the stored PSP key; no allowance is consumed)",
+            session_id,
+        )
+        return
+    await _bind_delegate_allowance(session_id, payment_token)
 
 
 def _delegate_allowance_applies(payment_token: Optional[str]) -> bool:
@@ -1605,18 +1667,35 @@ async def complete_session(
         settle_acp_offsession_success,
     )
 
+    order_id = str(session.get("order_id") or "").strip()
+
     try:
         # SINGLE-USE CONSUMPTION, at claim time and before ANY order or charge
-        # work: the claim we hold is the thing a bound token is bound to. A
-        # refusal here means another session already spent this token — and
-        # because we are still pre-dispatch, the `except BaseException` below
-        # releases a FRESH claim (a RESUMED claim is held per review B1, and its
-        # rebind cannot refuse its own session anyway: the CAS matches on
-        # `used_by_session = :session_id`).
+        # work: the claim we hold is the thing a bound token is bound to. Which
+        # of the three cases applies is decided by the claim, not by the caller
+        # (see the case analysis above the enforcement helpers).
+        #
+        # Every refusal below is still pre-dispatch, so the `except
+        # BaseException` handler releases a FRESH claim and HOLDS a RESUMED one
+        # (review B1). Holding is what makes the order_id-NULL refusal safe to
+        # repeat: a later resume presenting a valid token converges the same row.
         if _delegate_allowance_applies(payment_token):
-            await _bind_delegate_allowance(sid, payment_token)
+            if not resumed:
+                # FRESH claim — checks 1–6 already passed pre-claim.
+                await _bind_delegate_allowance(sid, payment_token)
+            elif not order_id:
+                # RESUMED claim, NO order: provably nothing was ever dispatched
+                # (capture is only reachable after _persist_order_id succeeds),
+                # so this resume does genuinely fresh work and is validated
+                # exactly like a fresh completion before it may consume anything.
+                await _enforce_delegate_allowance(session, payment_token)
+                await _bind_delegate_allowance(sid, payment_token)
+            else:
+                # RESUMED claim WITH an order: the caller's token is inert (the
+                # capture replays the stored PSP key). Re-bind only our OWN
+                # token; never consume a new allowance here.
+                await _rebind_own_delegate_allowance(sid, payment_token)
 
-        order_id = str(session.get("order_id") or "").strip()
         quote_currency: Optional[str] = None
         if not order_id:
             # Fresh quote at completion time (mirrors pivota-acp's real capture:
