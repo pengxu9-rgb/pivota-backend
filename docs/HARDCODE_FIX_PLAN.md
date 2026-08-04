@@ -49,7 +49,7 @@ narrowing.
 
 | # | Fix | Note |
 |---|---|---|
-| S1.1 | All-zero GTIN reject at `intake_identity.py` + `agent_pdp_view_assembler.py` | **Do NOT touch `normalize_gtin` itself** — `make_content_key` folds it, so any row already keyed with `gtin='0'` would silently re-key. Guard at the consumers. |
+| S1.1 | GTIN placeholder reject — DELEGATE to `strong_identifier`, do not re-implement. Done for `intake_identity.py` only; `agent_pdp_view_assembler.pick_gtin13`, `resolve_deposit_content_key`, `backfill_catalog_products_gtin.py` and `reviews_service.py` REMAIN UNGUARDED | **Do NOT touch `normalize_gtin` itself** — `make_content_key` folds it, so any row already keyed with `gtin='0'` would silently re-key. Guard at the consumers. |
 | S1.2 | Thread the validator's real currency through Path C write sites; drop the `or "USD"` tails | Writer only. The **backfill is NOT safe** — existing rows may have been priced correctly by coincidence. |
 | S1.3 | Availability tri-state at Path C ingest | Update the two tests that currently pin the drifted values — they encode the bug. |
 | S1.4 | Add `text_score`/`structure_score` to the citable SELECT | Flag-off behaviour byte-identical. **Land before any v2 rollout**, or the rollout looks correct while demoting the one lane that was fixed. |

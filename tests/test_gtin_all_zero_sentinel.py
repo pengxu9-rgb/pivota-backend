@@ -67,19 +67,30 @@ def test_real_gtins_survive(raw, expected):
     assert canonical_gtin(raw) == expected
 
 
-def test_the_rule_is_delegated_not_reimplemented():
-    """The point of the rewrite: ONE implementation, not two.
+def test_the_placeholder_FAMILY_that_is_still_accepted_is_recorded():
+    """HONEST SCOPE. The length gate rejects only the SHORT family. Every
+    valid-LENGTH repeated-digit dummy still becomes a match key:
 
-    Asserted as agreement rather than by reading the source — if `canonical_gtin`
-    ever grows its own copy again, it will disagree with the shared helper on
-    some input in the table above and one of these tests fails.
+        '11111111'       (GTIN-8 length)
+        '123456789012'   (UPC-A length)
+        '1111111111111'  (EAN-13 length)
+        '12345678901234' (GTIN-14 length)
+
+    These are the COMMON supplier dummies — far likelier than the contrived
+    '0000000000001'. An earlier commit message claimed "the length gate rejects
+    the whole family"; that is false, and this test exists so the claim cannot
+    be made again without failing.
+
+    GS1 check-digit validation would catch 13 of the 15 survivors. It is not
+    added here because it would reject every malformed-but-currently-accepted
+    barcode in the corpus at once, which needs measuring first.
     """
-    for raw in ("0", "1", "1234", "n/a", "8809416470108", "00000000000017"):
-        shared = normalize_strong_identifier(raw, "gtin")
-        mine = canonical_gtin(raw)
-        assert (shared is None) == (mine is None), (
-            f"canonical_gtin and strong_identifier disagree on {raw!r} — "
-            "the rule has been re-implemented instead of delegated.")
+    still_accepted = ["11111111", "99999999", "12345678", "123456789012",
+                      "1111111111111", "1234567890123", "12345678901234"]
+    for raw in still_accepted:
+        assert canonical_gtin(raw) is not None, (
+            f"{raw!r} is now rejected — good, but the documented scope is stale. "
+            "Update this test and the PR description together.")
 
 
 def test_a_valid_LENGTH_bogus_gtin_is_NOT_caught_and_that_is_a_known_gap():
@@ -131,9 +142,19 @@ def test_every_deposit_basis_call_passes_the_GUARDED_gtin():
         fn = node.func
         if not (isinstance(fn, ast.Name) and fn.id == "_deposit_basis"):
             continue
-        if len(node.args) < 3:
+        # POSITIONAL third arg...
+        third = node.args[2] if len(node.args) >= 3 else None
+        # ...OR the `gtin=` keyword. Checking only positional args was a
+        # ONE-TOKEN BYPASS: `_deposit_basis(brand, title, gtin=gtin, ...)` has
+        # fewer than three positional args, so the old check skipped the call
+        # entirely and the suite stayed green while deposit_basis went back to
+        # 'gtin' at confidence 1.0. Measured.
+        for kw in node.keywords:
+            if kw.arg == "gtin":
+                third = kw.value
+        if third is None:
+            offenders.append(f"line {node.lineno}: _deposit_basis with no gtin argument")
             continue
-        third = node.args[2]
         name = third.id if isinstance(third, ast.Name) else ast.dump(third)
         if name != "gtin14":
             offenders.append(f"line {node.lineno}: _deposit_basis(..., {name}, ...)")
@@ -142,3 +163,34 @@ def test_every_deposit_basis_call_passes_the_GUARDED_gtin():
         "deposit basis is being derived from an UNGUARDED gtin:\n  "
         + "\n  ".join(offenders)
         + "\nPass `gtin14` (the canonical_gtin result), not the raw parameter.")
+
+
+def test_the_guard_stays_at_the_consumer_until_the_key_population_is_measured():
+    """RESTORED after review. I deleted this pin on a justification that
+    measured the wrong thing.
+
+    I claimed prod has "0 rows with any GTIN and 0 content_keys folding one",
+    citing catalog_invariant_checks.py:594. That check measures the
+    `catalog_products.gtin` COLUMN. It says nothing about content_keys minted
+    from a folded BARCODE — and that is the live default path:
+    `catalog_sync_service` passes `product.barcode` straight into
+    `make_content_key`, and the ADR-011 override does not fire because
+    `intake_identity_enabled()` is False for every door.
+
+    So moving the reject into `normalize_gtin` could re-key real rows, and the
+    population is UNMEASURED rather than empty. Review also showed nothing else
+    in 9,708 tests notices that move — this is the only tripwire.
+
+    It asserts the INVARIANT (an existing key does not change), not the buggy
+    literal, so it stops obstructing the fix: migrate the rule whenever the
+    key population has actually been measured, and update this test in the same
+    commit with the number.
+    """
+    from services.catalog_identity import make_content_key
+
+    before = make_content_key("Acme", "Widget", "0")
+    assert before == make_content_key("Acme", "Widget", "0"), "not deterministic"
+    assert before != make_content_key("Acme", "Widget", ""), (
+        "make_content_key no longer distinguishes a zero GTIN from none. If that "
+        "is deliberate, every row keyed with a placeholder barcode has re-keyed "
+        "— measure the population and say the number here.")
