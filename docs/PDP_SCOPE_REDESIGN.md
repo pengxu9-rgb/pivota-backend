@@ -78,10 +78,12 @@ it, a new genuinely-multi-seller mirror row stays `unverified`.
 One-off pass over ALL canonical bucket rows (not just mirror-sourced — the 63
 recovery-promoted rows re-evaluate too): demote rows failing the corrected rule
 and not rule-1. ~3,182 rows each lose +200 and the Node market-filter
-exemption. Before executing:
+exemption. **Per D1: demote to `'unverified'`** — NOT `merchant_owned` — so the
+rows stay inside the backfill's re-promotion gate. Before executing:
 1. top-N diff over a sampled query set, BOTH rankers (backend pivot_query,
    Node canonicalCatalogSearch);
-2. resolve D1 below.
+2. ship the D3 cron in the same PR set, so demoted rows have a live
+   re-promotion path from day one.
 
 ### P5 — make the class unwritable (S3.3 applied here)
 A cross-repo writers tripwire: scan both repos for any write of
@@ -91,11 +93,39 @@ existing tripwire globs `*.py` and is structurally blind to `.cjs`.
 
 ## Open decisions
 
-**D1 — the attachment ratchet.** `pdp_matcher/runner.py:61,80` gates
-cross-merchant seed attachment ON the canonical label. A demoted row therefore
-cannot gain the second seller that would re-qualify it. Options: (a) gate the
-matcher on classifier-qualification instead of the stored label; (b) accept,
-relying on offer-based routes plus P3 re-promotion. Decide before P4 executes.
+**D1 — the attachment ratchet: DECIDED 2026-08-04. Keep the matcher gate
+reading the stored label; the ratchet is dissolved in P4's spec and D3, not in
+the matcher.**
+
+The gate is load-bearing identity-safety, not an accident — its own docstring:
+the 0.7-trigram matcher must never glue a cross-merchant seed onto a
+single-merchant PDP "just because trigrams of 'brush' titles overlap" (the
+MOYU-pollution defense). And post P1–P3 the label IS the classifier's verdict,
+maintained only by classifier-backed writers — so option (a), gating on
+computed qualification, is equivalent to gating on the label except during
+promotion LAG. Rewriting a hot heuristic path to close a lag is the wrong tool.
+
+The REAL one-way door was hiding in P4's spec, not the matcher: every
+promotion writer (backfill, onboard) is gated `WHERE pdp_scope='unverified'`.
+Demoting the 3,182 to `merchant_owned` would park them OUTSIDE every promotion
+path permanently. Hence:
+
+1. **P4 demotes to `'unverified'`, not `'merchant_owned'`.** Read-side
+   equivalent (migration 070: unverified is "treated as merchant_owned for
+   matcher safety") and semantically honest — the classifier has not AFFIRMED
+   anything about these rows, whereas `merchant_owned` is documented as an
+   affirmed state (`brand_verified_graduation`: "resolved, NOT canonical").
+   Demoted rows stay inside the backfill's re-promotion gate.
+2. **D3 is therefore CRON, by consequence.** With the gate label-based,
+   promotion lag is the only residual ratchet. A scheduled backfill run closes
+   the loop: a row gains its second seller through any of the three non-matcher
+   routes — a foreign-merchant offer, a product-group peer, an ext-cluster
+   spanning >= 2 domains — the next run promotes it, and the matcher opens for
+   it. Cadence detail (nightly vs post-sync) is an implementation choice for
+   the P4/D3 PR.
+
+Net: no permanent freeze anywhere, no matcher change, one line of P4's spec
+carries the whole decision.
 
 **D2 — Path C keeps stamping.** `catalog_enrichment_agent` writes canonical at
 ingest with `category_label_source='enrichment_agent_v1'` — consistent with
@@ -104,8 +134,9 @@ it is in form (a lane asserting the literal). Either exempt it in P5's
 allow-list with the rule-1 justification, or route it through the classifier
 too. Low urgency; it agrees with the rule today.
 
-**D3 — cadence for P3** (cron vs manual) — determines promotion lag for new
-multi-seller mirror rows.
+**D3 — cadence: RESOLVED TO CRON by D1** (see above). The backfill must run on
+a schedule or demoted/unverified rows have no timely promotion path. Nightly vs
+post-sync is chosen in the P4/D3 implementation PR.
 
 ## Sequencing
 
