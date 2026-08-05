@@ -710,6 +710,29 @@ def _preserve_non_stale_suppression(existing: Optional[Dict[str, Any]], payload:
             payload[field] = existing.get(field)
 
 
+SCOPE_FIELDS = ("pdp_scope", "pdp_scope_source", "pdp_scope_set_at")
+
+
+def _preserve_existing_scope(existing: Optional[Dict[str, Any]], payload: Dict[str, Any]) -> None:
+    """pdp_scope is stamped at BIRTH only; on UPDATE the existing values win.
+
+    The Path-A payload carries `pdp_scope='merchant_owned'` unconditionally, and
+    this upsert applies the full payload on UPDATE — so before this guard, every
+    re-sync silently reverted any promotion (the D3 cron's, the recovery
+    writer's) back to `merchant_owned`, an affirmed state outside the
+    `WHERE pdp_scope='unverified'` gate every promotion writer checks: the
+    promotion would never come back. Driven on the real `_upsert_by_pk` in the
+    PR #1680 round-11 review. Scope transitions after birth belong exclusively
+    to the governance writers (docs/PDP_SCOPE_REDESIGN.md: ingest lanes may
+    SEED the column, never assert it on live rows). Same preservation shape as
+    `_preserve_non_stale_suppression` above."""
+    if not existing:
+        return
+    for field in SCOPE_FIELDS:
+        if field in payload:
+            payload[field] = existing.get(field)
+
+
 async def _resolve_catalog_sku_key(
     *,
     merchant_id: str,
@@ -744,6 +767,7 @@ async def _upsert_by_pk(table: Any, pk_name: str, values: Dict[str, Any]) -> Opt
         existing = await _fetch_one_by_pk(table, pk_name, pk_value)
         payload = dict(values)
         _preserve_non_stale_suppression(existing, payload)
+        _preserve_existing_scope(existing, payload)
         payload["updated_at"] = _utcnow()
         if existing:
             await database.execute(
@@ -1089,11 +1113,12 @@ async def ingest_standard_products(
             _payload_care = extract_care_from_payload(product.platform_metadata)
             _payload_size_guide = extract_size_guide_from_payload(product.platform_metadata)
             # Phase O-4: compute lifecycle stage from the same shape
-            # the row will be UPSERTed with. Path A always sets
-            # pdp_scope='merchant_owned' so the row promotes through
-            # candidate → validated as content + taxonomy fill in.
-            # multi_merchant_canonical promotion happens in a separate
-            # governance path and won't affect this initial write.
+            # the row will be UPSERTed with. Path A stamps
+            # pdp_scope='merchant_owned' AT BIRTH ONLY — on UPDATE of an
+            # existing row `_preserve_existing_scope` keeps the row's current
+            # scope, so a promotion by the governance writers (D3 cron,
+            # identity recovery) survives re-syncs. Before that guard, this
+            # payload silently reverted promotions on every re-sync.
             _stage_input = {
                 "title": product.title,
                 "description": _description_for_ingest,
