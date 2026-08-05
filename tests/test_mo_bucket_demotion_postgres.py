@@ -185,6 +185,23 @@ def test_apply_demotes_exactly_the_grouped_cohort(engine):
     report = _drive([mod], lambda: mod.run_demotion(apply=True))
 
     assert report["demoted"] == 3 and report["cas_skipped"] == 0
+    assert report["cas_skipped_keys"] == []
+    # THE REVERSIBILITY RECORD IS THE PRE-IMAGE — round-15 caught that only
+    # the dry-run test pinned this, so a refactor that rebuilds the record
+    # AFTER the writes (recording 'unverified'/'mo_bucket_demotion' — a
+    # worthless restore) survived the whole suite. Pin the apply-mode record
+    # to the values the rows held BEFORE the run.
+    recorded = {p["product_key"]: p for p in report["previous_values"]}
+    assert set(recorded) == {"pk_mo_single", "pk_mo_qualified",
+                             "pk_mo_suppressed"}
+    for pk, prev in recorded.items():
+        assert prev["pdp_scope"] == "merchant_owned", (
+            f"{pk}: record holds {prev['pdp_scope']!r} — built after the "
+            "write, not before; restore from it would be a no-op lie")
+        assert prev["pdp_scope_source"] != mod.DEMOTION_SOURCE, (
+            f"{pk}: record holds this run's own marker — post-image")
+    assert recorded["pk_mo_single"]["pdp_scope_source"] == "backfill_2026_05"
+    assert recorded["pk_mo_qualified"]["pdp_scope_source"] == "external_brand_crawl"
     with engine.begin() as c:
         scopes = _scopes(c)
         srcs = dict(c.execute(text(
@@ -235,6 +252,46 @@ def test_cas_skips_a_row_changed_or_degrouped_between_select_and_write(engine):
         scopes = _scopes(c)
     assert scopes["pk_mo_single"] == "multi_merchant_canonical"
     assert scopes["pk_mo_qualified"] == "merchant_owned"
+
+
+def test_a_cas_skipped_row_is_attributed_in_the_report(engine, monkeypatch):
+    """Round-15 finding 2: `previous_values` lists every PLANNED row, so
+    without per-row attribution a naive restore would write merchant_owned
+    back onto a row the script never touched (cron-promoted mid-run). The
+    report must name the skipped keys; the restore guard is
+    `WHERE pdp_scope_source = 'mo_bucket_demotion'` (module docstring).
+    Drives the REAL run_demotion accounting over a genuinely stale plan."""
+    import scripts.demote_merchant_owned_bucket_rows as mod
+    from sqlalchemy import text
+
+    with engine.begin() as c:
+        _seed_rows(c)
+
+    async def run():
+        candidates = await mod.fetch_demotion_candidates()
+        # A concurrent writer promotes one planned row after the fetch —
+        # the run's plan is now stale for exactly that row.
+        await mod.database.execute(
+            "UPDATE catalog_products SET pdp_scope='multi_merchant_canonical'"
+            " WHERE product_key='pk_mo_single'")
+
+        async def stale_fetch(limit=10_000):
+            return candidates
+
+        monkeypatch.setattr(mod, "fetch_demotion_candidates", stale_fetch)
+        return await mod.run_demotion(apply=True)
+
+    report = _drive([mod], run)
+    assert report["demoted"] == 2 and report["cas_skipped"] == 1
+    assert report["cas_skipped_keys"] == ["pk_mo_single"], (
+        "the skipped row must be NAMED — counts alone cannot guard a restore")
+    assert {p["product_key"] for p in report["previous_values"]} == {
+        "pk_mo_single", "pk_mo_qualified", "pk_mo_suppressed"}, (
+        "the record still lists every planned row — attribution, not "
+        "omission, is what distinguishes written from skipped")
+    with engine.begin() as c:
+        assert _scopes(c)["pk_mo_single"] == "multi_merchant_canonical", (
+            "the concurrently-promoted row was clobbered")
 
 
 def test_the_cycle_closes_demote_then_the_real_cron_promotes_the_qualified(engine, monkeypatch):

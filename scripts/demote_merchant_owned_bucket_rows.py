@@ -44,6 +44,20 @@ Dry-run by default — `--apply` to write. Every planned row's previous
 (scope, source, set_at) is reported BEFORE any write; `--report-file` for the
 reversibility record. The `--apply` run against prod is an OPERATOR action.
 
+RESTORING FROM THE RECORD: `previous_values` lists every PLANNED row, but a
+row in it was only written if its key is NOT in `cas_skipped_keys` — a
+CAS-skipped row was changed underneath the run (e.g. cron-promoted) and its
+current state is the truth, not the record's pre-image. Any restore MUST
+therefore guard `WHERE pdp_scope_source = 'mo_bucket_demotion'`, which is
+true exactly for the rows this script wrote and still owns.
+
+HELD ROWS AND --limit: group-less rows never exit the selection (they are
+never written), so with `--limit` at or below the held-row count the same
+held rows fill every page and the grouped tail is unreachable — the report
+shows `planned: 0` while demotable rows exist beyond the limit. Keep the
+limit above `candidates` (default 10,000 > the 5,357 cohort; measured
+held = 0 in prod).
+
 Usage:
   python -m scripts.demote_merchant_owned_bucket_rows
   python -m scripts.demote_merchant_owned_bucket_rows --apply --report-file mo.json
@@ -163,6 +177,9 @@ async def run_demotion(*, apply: bool, limit: int = 10_000) -> Dict[str, Any]:
         ],
         "demoted": 0,
         "cas_skipped": 0,
+        # Per-row attribution for the restore guard (module docstring): a
+        # planned row was WRITTEN iff its key is not listed here.
+        "cas_skipped_keys": [],
     }
     if not apply:
         return report
@@ -171,6 +188,7 @@ async def run_demotion(*, apply: bool, limit: int = 10_000) -> Dict[str, Any]:
             report["demoted"] += 1
         else:
             report["cas_skipped"] += 1
+            report["cas_skipped_keys"].append(c["product_key"])
     return report
 
 
