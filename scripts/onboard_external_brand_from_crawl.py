@@ -436,6 +436,18 @@ async def _resolve_pdp_scope(p: Dict[str, Any], product_key: str, self_merchant_
     excluded row stays 'unverified': re-checkable by the D3 cron, and held
     out of serving by the entity_unresolved gate until it earns a group or a
     real resolution — fail-safe in exactly the direction we want.
+
+    THE GUARD IS FORWARD-ONLY. The lane's historical writes are still
+    standing: 2,015 bucket rows stamped merchant_owned by THIS lane
+    (pdp_scope_source='external_brand_crawl'), inside a 5,357-row
+    merchant_owned bucket cohort (measured 2026-08-05) that no promotion
+    writer can reach (all gate on 'unverified') and P4's demotion does not
+    select (it filters 'multi_merchant_canonical'). Measured the same day:
+    every one of the 5,357 has a product_group_members row, so a P4-style
+    demotion to 'unverified' would change identity_resolved for ZERO rows
+    (services/index_pipeline_state_service.py:256 — group OR resolved
+    scope). Remediation is a separate measured operator pass, deliberately
+    not smuggled into this fix.
     """
     if self_merchant_id == NON_SELLER_MERCHANT_ID:
         return

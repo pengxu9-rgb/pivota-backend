@@ -723,8 +723,11 @@ def _preserve_existing_scope(existing: Optional[Dict[str, Any]], payload: Dict[s
     `WHERE pdp_scope='unverified'` gate every promotion writer checks: the
     promotion would never come back. Driven on the real `_upsert_by_pk` in the
     PR #1680 round-11 review. Scope transitions after birth belong exclusively
-    to the governance writers (docs/PDP_SCOPE_REDESIGN.md: ingest lanes may
-    SEED the column, never assert it on live rows). Same preservation shape as
+    to the governance writers. (docs/PDP_SCOPE_REDESIGN.md's invariant is
+    stricter still — lanes may seed ONLY the DB default 'unverified'; Path A's
+    merchant_owned birth stamp remains a stated form-exception like the doc's
+    Path-C note. This guard narrows the violation to birth only; it does not
+    close that exception.) Same preservation shape as
     `_preserve_non_stale_suppression` above."""
     if not existing:
         return
