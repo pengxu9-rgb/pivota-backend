@@ -76,6 +76,7 @@ from services.external_seed_servability import (
 )
 from services.offer_seller_identity import derive_offer_seller_identity
 from services.pdp_scope_classifier import (
+    NON_SELLER_MERCHANT_ID,
     ScopeSignals,
     classify,
     own_merchant_seller_term_sql,
@@ -424,7 +425,32 @@ async def _resolve_pdp_scope(p: Dict[str, Any], product_key: str, self_merchant_
     'external_seed' bucket), so the self-exclusion is on `self_merchant_id` — this
     preserves the exact prior semantics (count of OTHER sellers) without changing
     any serving-eligibility rule.
+
+    BUCKET ROWS ARE EXCLUDED — the same rule the CLI backfill enforces
+    (PR #1680, F1/F2): `merchant_owned` is an AFFIRMED state ("resolved, NOT
+    canonical") that exits the `WHERE pdp_scope='unverified'` gate every
+    promotion writer checks, and a bucket row's own merchant_id is not a
+    seller at all, so that resolution would be a lie it can never recover
+    from. Under ADR-009 D2 this cohort should never contain a bucket row —
+    this guard ENFORCES what was previously only a docstring claim. An
+    excluded row stays 'unverified': re-checkable by the D3 cron, and held
+    out of serving by the entity_unresolved gate until it earns a group or a
+    real resolution — fail-safe in exactly the direction we want.
+
+    THE GUARD IS FORWARD-ONLY. The lane's historical writes are still
+    standing: 2,015 bucket rows stamped merchant_owned by THIS lane
+    (pdp_scope_source='external_brand_crawl'), inside a 5,357-row
+    merchant_owned bucket cohort (measured 2026-08-05) that no promotion
+    writer can reach (all gate on 'unverified') and P4's demotion does not
+    select (it filters 'multi_merchant_canonical'). Measured the same day:
+    every one of the 5,357 has a product_group_members row, so a P4-style
+    demotion to 'unverified' would change identity_resolved for ZERO rows
+    (services/index_pipeline_state_service.py:256 — group OR resolved
+    scope). Remediation is a separate measured operator pass, deliberately
+    not smuggled into this fix.
     """
+    if self_merchant_id == NON_SELLER_MERCHANT_ID:
+        return
     pk = product_key
     row = await database.fetch_one(
         """

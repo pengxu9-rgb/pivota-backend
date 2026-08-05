@@ -182,9 +182,15 @@ def test_backfill_still_matches_the_composite_attachment_form(engine):
     assert rows and rows[0]["seller_count"] == 2
 
 
-def test_onboard_writes_merchant_owned_for_a_bucket_row(engine):
+def test_onboard_leaves_a_bucket_row_unverified(engine):
     """The onboard script's docstring claims its cohort never includes bucket
-    rows; nothing enforced it. Drives the real `_resolve_pdp_scope`."""
+    rows; nothing enforced it, and an earlier version of THIS TEST pinned the
+    opposite behavior (bucket -> merchant_owned) as correct. Under the shipped
+    doctrine (PR #1680, F1/F2: 'merchant_owned' is an AFFIRMED state a bucket
+    row must never receive — it exits the promotion gate forever) the lane now
+    EXCLUDES bucket rows: they stay 'unverified', re-checkable, unstamped.
+    Real-merchant rows keep the normal classification. Drives the real
+    `_resolve_pdp_scope`."""
     import scripts.onboard_external_brand_from_crawl as mod
     from sqlalchemy import text
 
@@ -203,8 +209,13 @@ def test_onboard_writes_merchant_owned_for_a_bucket_row(engine):
     with engine.begin() as c:
         got = dict(c.execute(text(
             "SELECT product_key, pdp_scope FROM catalog_products")).fetchall())
-    assert got["pk_ob_bucket"] == SCOPE_MERCHANT_OWNED, (
-        "bucket + one seed promoted — the own-merchant term regressed")
+        bucket_src = c.execute(text(
+            "SELECT pdp_scope_source FROM catalog_products"
+            " WHERE product_key = 'pk_ob_bucket'")).scalar()
+    assert got["pk_ob_bucket"] == "unverified", (
+        "the onboard lane wrote an affirmed scope to a bucket row — the "
+        "bucket exclusion regressed; 'merchant_owned' here is a one-way door")
+    assert bucket_src is None, "the excluded bucket row must stay unstamped"
     assert got["pk_ob_real"] == SCOPE_CANONICAL
 
 
