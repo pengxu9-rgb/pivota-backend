@@ -134,9 +134,15 @@ def test_the_term_itself(engine):
         own_merchant_seller_term_sql("")
 
 
-def test_backfill_bucket_row_with_one_seed_is_single_seller(engine):
-    """THE defect: bucket + one active seed used to compute 1+1=2 -> canonical.
-    Now 0+1=1 -> merchant_owned. Drives the real `_fetch_batch`."""
+def test_backfill_excludes_bucket_rows_entirely(engine):
+    """PR #1680 review, F1/F2: this writer's terminal states are canonical /
+    merchant_owned, and 'merchant_owned' is an AFFIRMED state a bucket row must
+    never receive — it exits the `WHERE pdp_scope='unverified'` promotion gate
+    forever. Bucket lifecycle belongs to the P4 demote / D3 promote-only cron
+    pair, so bucket rows must not even be FETCHED here — including the
+    genuinely two-domain one (the D3 cron promotes it instead). Real merchants
+    keep the corrected own-merchant arithmetic. Drives the real
+    `_fetch_batch`."""
     import scripts.backfill_pdp_scope as mod
 
     with engine.begin() as c:
@@ -151,16 +157,19 @@ def test_backfill_bucket_row_with_one_seed_is_single_seller(engine):
 
     rows = _drive(mod, lambda: mod._fetch_batch(50))
     by_key = {r["product_key"]: r["seller_count"] for r in rows}
-    assert by_key["pk_bucket1"] == 1, "bucket must not count itself as a seller"
+    assert "pk_bucket1" not in by_key, (
+        "a bucket row reached the classify() loop — it would be resolved to "
+        "'merchant_owned' and parked outside every promotion path")
+    assert "pk_bucket2" not in by_key, (
+        "even a qualifying bucket row is not this writer's to resolve")
     assert by_key["pk_real1"] == 2, "a real merchant IS a seller: own + seed = 2"
-    assert by_key["pk_bucket2"] == 2, "two seed domains still promote a bucket row"
 
 
 def test_backfill_still_matches_the_composite_attachment_form(engine):
     """The backfill matches seeds attached by the pipe-composite key as well as
-    the product_key. The rewire must not have lost that arm — the recovery
-    predicate deliberately does NOT match it (pre-existing divergence, tracked
-    in docs/PDP_SCOPE_REDESIGN.md), but THIS writer always has."""
+    the product_key. Formerly a pinned divergence — the recovery predicate did
+    NOT match the composite form — CLOSED 2026-08-04 (prod cohort 0): both
+    sides now render `seed_attachment_keys_sql`, one spelling."""
     import scripts.backfill_pdp_scope as mod
 
     with engine.begin() as c:
@@ -227,3 +236,31 @@ def test_all_three_writers_call_the_shared_term():
                       or (isinstance(n.func, ast.Attribute)
                           and n.func.attr == "own_merchant_seller_term_sql"))]
         assert calls, f"{rel} no longer calls own_merchant_seller_term_sql"
+
+
+def test_both_seed_counters_render_the_shared_attachment_keys():
+    """#1676's pinned divergence, closed: the recovery predicate and the
+    backfill's seller count both match seeds attached by product_key AND the
+    pipe-composite form, via `seed_attachment_keys_sql` — one spelling. The
+    rendered helper output must appear in the predicate (the predicate is a
+    formatted module constant, so the rendered form IS the shipped string),
+    and the backfill must call the helper (AST, same standard as above)."""
+    import ast
+    import pathlib
+
+    from services.pdp_identity_recovery import CANONICAL_SCOPE_PREDICATE
+    from services.pdp_scope_classifier import seed_attachment_keys_sql
+
+    assert seed_attachment_keys_sql("cp") in CANONICAL_SCOPE_PREDICATE, (
+        "the predicate no longer matches the composite attachment form — "
+        "the #1676 divergence is back")
+
+    root = pathlib.Path(__file__).resolve().parent.parent
+    tree = ast.parse((root / "scripts/backfill_pdp_scope.py").read_text())
+    calls = [n for n in ast.walk(tree)
+             if isinstance(n, ast.Call)
+             and ((isinstance(n.func, ast.Name)
+                   and n.func.id == "seed_attachment_keys_sql")
+                  or (isinstance(n.func, ast.Attribute)
+                      and n.func.attr == "seed_attachment_keys_sql"))]
+    assert calls, "backfill_pdp_scope no longer calls seed_attachment_keys_sql"

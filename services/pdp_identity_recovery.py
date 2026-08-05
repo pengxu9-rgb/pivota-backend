@@ -21,6 +21,7 @@ from services.pdp_scope_classifier import (
     LABEL_SOURCE_ENRICHMENT,
     SCOPE_CANONICAL,
     own_merchant_seller_term_sql,
+    seed_attachment_keys_sql,
 )
 
 
@@ -1460,7 +1461,13 @@ async def _apply_external_seed_attachment(proposal: IdentityRecoveryProposal, *,
 CANONICAL_SCOPE_PREDICATE = """
             -- RULE 1: an agent-authored row is canonical BY INTENT, whatever
             -- today's seller count is. Interpolated, never retyped.
-            cp.category_label_source = '{label_source_enrichment}'
+            -- IS NOT DISTINCT FROM, not `=`: a NULL label must make this arm
+            -- FALSE, not NULL. Under the promotion writer's AND the difference
+            -- is invisible (neither promotes), but the P4 demotion selects with
+            -- NOT(predicate), and NOT(NULL) is NULL — every NULL-label row
+            -- would silently escape demotion. Found by the demotion suite
+            -- driving the real script against Postgres.
+            cp.category_label_source IS NOT DISTINCT FROM '{label_source_enrichment}'
 
             -- RULE 2: seller_count >= 2, spelled EXACTLY as
             -- services/pdp_scope_classifier defines it — "distinct merchants
@@ -1488,10 +1495,17 @@ CANONICAL_SCOPE_PREDICATE = """
                   AND co.merchant_id IS NOT NULL
                   AND co.merchant_id IS DISTINCT FROM cp.merchant_id
               )
+              -- Seeds attach by product_key OR the pipe-composite form —
+              -- `seed_attachment_keys_sql`, the SAME helper the backfill's
+              -- seller count uses. An earlier version matched only
+              -- product_key: the #1676 pinned divergence (prod cohort 0 at
+              -- closure, 2026-08-04), under which a composite-attached seed
+              -- counted for the backfill but not for this predicate — and
+              -- therefore not for the P4 demotion selection or the D3 cron.
               + (
                 SELECT count(DISTINCT eps.domain)
                 FROM external_product_seeds eps
-                WHERE eps.attached_product_key = cp.product_key
+                WHERE eps.attached_product_key IN {seed_attach_keys}
                   AND eps.status = 'active'
                   AND eps.domain IS NOT NULL
               )
@@ -1545,6 +1559,7 @@ CANONICAL_SCOPE_PREDICATE = """
 """.format(
     label_source_enrichment=LABEL_SOURCE_ENRICHMENT,
     own_merchant_term=own_merchant_seller_term_sql("cp.merchant_id"),
+    seed_attach_keys=seed_attachment_keys_sql("cp"),
 )
 
 
