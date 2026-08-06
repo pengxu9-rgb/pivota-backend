@@ -208,6 +208,16 @@ def _pool_is_provably_dead() -> bool:
     connections are unusable. Distinguishing that from a slow database
     requires exactly the inference that kept going wrong, so it stays with
     request-path recovery.
+
+    `_closed` is asyncpg PRIVATE API, so `test_asyncpg_still_exposes_the_
+    attribute_this_depends_on` binds it to the real class: if asyncpg renames
+    it, `getattr(..., False)` would silently mean "never dead" and this arm
+    would vanish without a single test failing. Driven on real asyncpg:
+    `_closed` is True only AFTER in-flight work drains (a closing pool reports
+    `_closing=True, _closed=False`), which is what makes acting on it safe.
+    Note the pool arm is inert on the SQLite backend — `SQLiteBackend._pool`
+    is always a live object with no `_closed` — so it is exercised against
+    real asyncpg only.
     """
     backend = getattr(database, "_backend", None)
     if backend is None or not hasattr(backend, "_pool"):
@@ -331,10 +341,20 @@ async def run_database_reconnect_supervisor(
         if connected and not dead_pool:
             continue
 
-        if dead_pool and connected:
-            # `databases` skips connect() while the flag says connected, so
-            # the stale flag must be cleared or the reconnect is a no-op.
-            _force_mark_database_disconnected()
+        # Clear stale wrapper state UNCONDITIONALLY before reconnecting.
+        # There are TWO stale shapes and each breaks connect() differently:
+        #   * flag True + pool gone  -> `databases.connect()` early-returns,
+        #     so the "reconnect" is a silent no-op;
+        #   * flag False + pool set  -> `PostgresBackend.connect()`'s
+        #     `assert self._pool is None` raises "DatabaseBackend is already
+        #     running", wedging EVERY later cycle (round-21 F1; the same
+        #     wedge scripts/backfill_external_seed_quality_rescore.py:213
+        #     already documents from a bounded disconnect).
+        # An earlier version cleared only the first, which is this arc's
+        # signature mistake: fixing one of two symmetric cases. The call is
+        # non-destructive by construction — it drops a reference, it does not
+        # terminate — so doing it always costs nothing.
+        _force_mark_database_disconnected()
 
         try:
             await asyncio.wait_for(
