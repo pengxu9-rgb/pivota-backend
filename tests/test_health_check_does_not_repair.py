@@ -199,170 +199,6 @@ async def test_supervisor_reconnects_a_degraded_process_without_any_traffic(
         "read-only process can never recover")
     assert spy.is_connected is True
 
-
-class SlowDatabase(SpyDatabase):
-    """A HEALTHY backend that simply answers slowly — the shape that makes
-    'probe timed out' ambiguous. No test could express this before round 18,
-    which is exactly why the destructive-repair-on-timeout bug shipped."""
-
-    def __init__(self, *, latency: float, connected: bool = True):
-        super().__init__(connected=connected)
-        self.latency = latency
-
-    async def execute(self, _query):
-        self.execute_calls += 1
-        await asyncio.sleep(self.latency)
-        return 1
-
-
-@pytest.mark.asyncio
-async def test_supervisor_does_not_destroy_a_healthy_but_SLOW_backend(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """ROUND-18 F1, the worst bug this PR produced. Repair is destructive —
-    `_force_mark_database_disconnected` terminates the pool and every query
-    running on it. A probe timeout does NOT prove death: a slow database, or
-    an ordinary SATURATED pool where the probe queues behind `acquire`, times
-    out exactly like a dead one. Driven in review, repairing on a single
-    timeout destroyed a healthy pool every cycle under normal load and
-    manufactured the very `DatabaseBackend is not running` errors this module
-    exists to prevent. An ambiguous failure must be confirmed across cycles
-    before anything destructive happens."""
-    repairs = {"n": 0}
-
-    async def repair() -> None:
-        repairs["n"] += 1
-
-    spy = SlowDatabase(latency=0.2)
-    monkeypatch.setattr(readiness, "database", spy)
-    monkeypatch.setattr(readiness, "ensure_database_ready", repair)
-
-    # Probe times out every cycle; two cycles is below the confirmation
-    # threshold, so nothing destructive may happen.
-    await readiness.run_database_reconnect_supervisor(
-        interval_seconds=0.01,
-        probe_timeout_seconds=0.01,
-        repair_after_consecutive_failures=3,
-        max_cycles=2,
-    )
-
-    assert repairs["n"] == 0, (
-        "the supervisor destroyed a healthy-but-slow backend on a bare "
-        "timeout — this kills in-flight production queries every cycle")
-
-
-@pytest.mark.asyncio
-async def test_supervisor_eventually_repairs_a_persistently_failing_probe(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """The other side of F1: caution must not become paralysis. After the
-    configured number of consecutive ambiguous failures, repair proceeds."""
-    repairs = {"n": 0}
-
-    async def repair() -> None:
-        repairs["n"] += 1
-
-    spy = SlowDatabase(latency=0.2)
-    monkeypatch.setattr(readiness, "database", spy)
-    monkeypatch.setattr(readiness, "ensure_database_ready", repair)
-
-    await readiness.run_database_reconnect_supervisor(
-        interval_seconds=0.01,
-        probe_timeout_seconds=0.01,
-        repair_after_consecutive_failures=3,
-        max_cycles=3,
-    )
-
-    assert repairs["n"] == 1, (
-        f"expected exactly one repair on the 3rd consecutive ambiguous "
-        f"failure, got {repairs['n']}")
-
-
-@pytest.mark.asyncio
-async def test_a_recovered_probe_resets_the_ambiguous_failure_count(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """Intermittent slowness must never accumulate into a destructive repair:
-    two slow cycles, a healthy one, two more slow ones — still no repair."""
-    repairs = {"n": 0}
-
-    async def repair() -> None:
-        repairs["n"] += 1
-
-    spy = SlowDatabase(latency=0.2)
-    latencies = iter([0.2, 0.2, 0.0, 0.2, 0.2])
-
-    async def execute(_query):
-        spy.execute_calls += 1
-        await asyncio.sleep(next(latencies, 0.0))
-        return 1
-
-    monkeypatch.setattr(spy, "execute", execute)
-    monkeypatch.setattr(readiness, "database", spy)
-    monkeypatch.setattr(readiness, "ensure_database_ready", repair)
-
-    await readiness.run_database_reconnect_supervisor(
-        interval_seconds=0.01,
-        probe_timeout_seconds=0.01,
-        repair_after_consecutive_failures=3,
-        max_cycles=5,
-    )
-
-    assert repairs["n"] == 0, (
-        "a healthy cycle must reset the counter — intermittent slowness is "
-        "not a dead pool")
-
-
-@pytest.mark.asyncio
-async def test_supervisor_repairs_an_unambiguously_dead_pool_immediately(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """Caution applies only to AMBIGUOUS failures. `pool is closed` proves
-    nothing can succeed, so waiting three cycles would just extend an
-    outage — repair on the first cycle."""
-    repairs = {"n": 0}
-
-    async def repair() -> None:
-        repairs["n"] += 1
-
-    class DeadPoolDatabase(SpyDatabase):
-        async def execute(self, _query):
-            self.execute_calls += 1
-            raise RuntimeError("pool is closed")
-
-    spy = DeadPoolDatabase(connected=True)
-    monkeypatch.setattr(readiness, "database", spy)
-    monkeypatch.setattr(readiness, "ensure_database_ready", repair)
-
-    await readiness.run_database_reconnect_supervisor(
-        interval_seconds=0.01,
-        repair_after_consecutive_failures=3,
-        max_cycles=1,
-    )
-
-    assert repairs["n"] == 1, (
-        "an unambiguously dead pool must be repaired at once, not after the "
-        "ambiguity threshold")
-
-
-def test_dead_pool_discrimination_is_exact():
-    """The whole safety property rests on this classifier."""
-    assert readiness.is_dead_pool_error(RuntimeError("pool is closed"))
-    assert readiness.is_dead_pool_error(
-        AssertionError("DatabaseBackend is not running"))
-    assert readiness.is_dead_pool_error(RuntimeError("pool is closing"))
-    # A timeout is the ambiguous case that must NOT be treated as death.
-    assert not readiness.is_dead_pool_error(asyncio.TimeoutError())
-    assert not readiness.is_dead_pool_error(TimeoutError("timed out"))
-    assert not readiness.is_dead_pool_error(
-        RuntimeError("the database system is starting up"))
-    # Wrapped causes are still seen.
-    wrapped = DatabaseUnavailableError(
-        phase="probe", error_type="RuntimeError", message="x")
-    wrapped.__cause__ = RuntimeError("pool is closed")
-    assert readiness.is_dead_pool_error(wrapped)
-
-
 @pytest.mark.asyncio
 async def test_supervisor_can_be_switched_off_by_env(
     monkeypatch: pytest.MonkeyPatch,
@@ -379,212 +215,6 @@ async def test_supervisor_can_be_switched_off_by_env(
 
     assert spy.connect_calls == 0, "the kill switch did not stop the supervisor"
 
-
-@pytest.mark.asyncio
-async def test_supervisor_probe_timeout_is_generous_and_configurable():
-    """ROUND-18 F3 (surviving mutation): the supervisor's probe budget was
-    unpinned. It must NOT inherit the 3s request-path budget — 3s is tuned
-    for answering Railway fast; here it decides whether to destroy a pool."""
-    assert readiness.DEFAULT_SUPERVISOR_PROBE_TIMEOUT_SECONDS >= 10.0, (
-        "the supervisor's probe budget is tight enough to mistake a slow "
-        "database for a dead one")
-    assert (readiness.DEFAULT_SUPERVISOR_PROBE_TIMEOUT_SECONDS
-            > 3.0), "must exceed the request-path health probe budget"
-    assert readiness.DEFAULT_REPAIR_AFTER_CONSECUTIVE_FAILURES >= 2
-
-
-@pytest.mark.asyncio
-async def test_supervisor_repairs_a_connected_but_broken_pool(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """ROUND-17 R17-1. `databases` leaves `is_connected` True when the pool is
-    dead (the shape `_force_mark_database_disconnected` exists for: every
-    query raises `InterfaceError: pool is closed`). Gating the supervisor on
-    that flag skipped this shape entirely — nothing repaired it, while the
-    OLD self-healing /health did. Liveness must be decided by a query."""
-    calls = {"n": 0}
-
-    class BrokenPoolDatabase(SpyDatabase):
-        async def execute(self, _query):
-            self.execute_calls += 1
-            raise RuntimeError("pool is closed")
-
-    spy = BrokenPoolDatabase(connected=True)  # flag says healthy, pool is not
-
-    async def repair() -> None:
-        calls["n"] += 1
-        spy.execute_raises = None
-
-    monkeypatch.setattr(readiness, "database", spy)
-    monkeypatch.setattr(readiness, "ensure_database_ready", repair)
-
-    await readiness.run_database_reconnect_supervisor(
-        interval_seconds=0.01, max_cycles=1
-    )
-
-    assert calls["n"] == 1, (
-        "the supervisor skipped a connected-but-broken pool — it trusted the "
-        "is_connected flag instead of probing")
-
-
-@pytest.mark.asyncio
-async def test_supervisor_keeps_trying_after_a_failed_repair_sets_the_flag(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """ROUND-17 R17-2, the nastier half. `ensure_database_ready` sets
-    `is_connected=True` as a side effect of its connect attempt, even when the
-    probe then fails. Gating on the flag therefore wedged the supervisor after
-    ONE failed cycle — permanently, for the life of the process, including
-    for 'the database system is starting up', the exact restart case this
-    supervisor exists to ride out."""
-    attempts = {"n": 0}
-
-    class FlagSettingDatabase(SpyDatabase):
-        async def execute(self, _query):
-            self.execute_calls += 1
-            raise RuntimeError("the database system is starting up")
-
-    spy = FlagSettingDatabase(connected=False)
-
-    async def failing_repair() -> None:
-        attempts["n"] += 1
-        spy.is_connected = True  # the side effect that caused the wedge
-        raise DatabaseUnavailableError(
-            phase="probe", error_type="RuntimeError",
-            message="the database system is starting up")
-
-    monkeypatch.setattr(readiness, "database", spy)
-    monkeypatch.setattr(readiness, "ensure_database_ready", failing_repair)
-
-    # repair_after=1 isolates the property under test (no permanent wedge)
-    # from the round-18 ambiguity throttle, which is exercised separately.
-    await readiness.run_database_reconnect_supervisor(
-        interval_seconds=0.01,
-        probe_timeout_seconds=0.5,
-        repair_after_consecutive_failures=1,
-        max_cycles=4,
-    )
-
-    assert attempts["n"] == 4, (
-        f"supervision stopped after {attempts['n']} attempt(s) — a failed "
-        "repair left is_connected True and wedged the loop forever")
-
-
-@pytest.mark.asyncio
-async def test_supervisor_keeps_supervising_after_the_backend_recovers(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """ROUND-17 R17-5 (surviving mutation `continue` -> `break`): a healthy
-    cycle must CONTINUE the loop, not end it. Otherwise the first healthy
-    moment retires the supervisor and the next failure is unattended."""
-    spy = SpyDatabase(connected=True)
-    monkeypatch.setattr(readiness, "database", spy)
-    repairs = {"n": 0}
-
-    async def repair() -> None:
-        repairs["n"] += 1
-
-    monkeypatch.setattr(readiness, "ensure_database_ready", repair)
-
-    # Healthy for two cycles, then broken on the third.
-    async def execute(_query):
-        spy.execute_calls += 1
-        if spy.execute_calls >= 3:
-            raise RuntimeError("pool is closed")
-        return 1
-
-    monkeypatch.setattr(spy, "execute", execute)
-
-    await readiness.run_database_reconnect_supervisor(
-        interval_seconds=0.01, max_cycles=3
-    )
-
-    assert repairs["n"] == 1, (
-        "the supervisor stopped watching after healthy cycles — a later "
-        "failure would go unrepaired")
-
-
-@pytest.mark.asyncio
-async def test_supervisor_leaves_a_healthy_backend_alone(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """It must not churn a working pool. It DOES probe every cycle — that is
-    the round-17 fix (liveness decided by a query, never by the flag the
-    repair path sets itself) — but a healthy probe must lead to no repair:
-    no connect, no disconnect, no pool reset."""
-    spy = SpyDatabase(connected=True)
-    monkeypatch.setattr(readiness, "database", spy)
-    repairs = {"n": 0}
-
-    async def repair() -> None:
-        repairs["n"] += 1
-
-    monkeypatch.setattr(readiness, "ensure_database_ready", repair)
-
-    await readiness.run_database_reconnect_supervisor(
-        interval_seconds=0.01, max_cycles=3
-    )
-
-    assert repairs["n"] == 0, "supervisor repaired a healthy backend"
-    assert spy.connect_calls == 0 and spy.disconnect_calls == 0
-    assert spy.execute_calls == 3, (
-        "the supervisor must PROBE each cycle — trusting is_connected is "
-        "what let a dead pool go unrepaired (round-17 R17-1)")
-
-
-@pytest.mark.asyncio
-async def test_supervisor_survives_a_failing_reconnect_and_keeps_trying(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """A supervisor that dies on an error stops supervising — silently. It
-    must outlive both a clean DatabaseUnavailableError and an unexpected
-    exception, and still be trying on the next cycle."""
-
-    class ExplodingDatabase(SpyDatabase):
-        async def connect(self):
-            self.connect_calls += 1
-            raise RuntimeError("connection refused")
-
-    spy = ExplodingDatabase(connected=False)
-    monkeypatch.setattr(readiness, "database", spy)
-
-    await readiness.run_database_reconnect_supervisor(
-        interval_seconds=0.01, max_cycles=3
-    )
-
-    assert spy.connect_calls == 3, (
-        "the supervisor stopped after a failure — it must keep trying")
-
-
-@pytest.mark.asyncio
-async def test_supervisor_survives_an_UNEXPECTED_exception_type(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """The test above only reaches the DatabaseUnavailableError branch —
-    `ensure_database_ready` wraps connect failures into that type, so a
-    mutation deleting the catch-all `except Exception` SURVIVED the suite
-    (found by mutation M4 on this commit). The catch-all is the one that
-    matters: it is what stops an unforeseen error from silently ending
-    supervision for the life of the process."""
-    calls = {"n": 0}
-
-    async def exploding_ensure() -> None:
-        calls["n"] += 1
-        raise ValueError("something nobody predicted")
-
-    spy = SpyDatabase(connected=False)
-    monkeypatch.setattr(readiness, "database", spy)
-    monkeypatch.setattr(readiness, "ensure_database_ready", exploding_ensure)
-
-    await readiness.run_database_reconnect_supervisor(
-        interval_seconds=0.01, max_cycles=3
-    )
-
-    assert calls["n"] == 3, (
-        "an unexpected exception ended supervision — the process would stay "
-        "degraded forever with nothing left to repair it")
-
-
 @pytest.mark.asyncio
 async def test_supervisor_is_cancellable_for_clean_shutdown() -> None:
     """The lifespan cancels it on shutdown; it must not swallow that."""
@@ -597,14 +227,21 @@ async def test_supervisor_is_cancellable_for_clean_shutdown() -> None:
         await task
 
 
-def test_force_disconnect_terminates_the_pool_instead_of_leaking_it():
-    """ROUND-17 R17-3. Nulling `_pool` abandons the asyncpg pool with its
-    server connections still open. Measured on real Postgres: one leak of
-    DB_POOL_MIN_SIZE connections per call. Harmless-ish on the request path;
-    on the supervisor's 30s timer it burns ~600 connections an hour and
-    exhausts max_connections — killing the database for every client during
-    the outage this code exists to recover from. The pool must be terminated
-    before the reference is dropped."""
+def test_force_disconnect_never_terminates_a_possibly_live_pool():
+    """ROUND-19 FATAL, inverted into a guard.
+
+    A version of `_force_mark_database_disconnected` called `pool.terminate()`
+    to stop the orphaned pool leaking connections. But this function runs from
+    `ensure_database_ready`'s UNCONDITIONAL `finally`, after a probe bounded at
+    3s — and a timeout does not prove death: a slow database, or a merely
+    saturated pool whose probe queues behind `acquire`, times out identically.
+    Driven on a real pool: healthy pools destroyed and 30 in-flight queries
+    killed with `connection was closed in the middle of operation`.
+
+    So the pool is ABANDONED, never terminated. That leaks its connections
+    (round-17 R17-3) — the lesser harm, and the only one that does not take
+    working requests down with it. If you want the leak closed, make the
+    DECISION unambiguous upstream; do not re-add terminate() here."""
     terminated = {"n": 0}
 
     class FakePool:
@@ -628,11 +265,46 @@ def test_force_disconnect_terminates_the_pool_instead_of_leaking_it():
     finally:
         readiness.database = original
 
-    assert terminated["n"] == 1, (
-        "the pool was dropped without terminate() — its server connections "
-        "leak until the backend times them out")
-    assert fake_db._backend._pool is None
+    assert terminated["n"] == 0, (
+        "the pool was TERMINATED on an ambiguous signal — this kills queries "
+        "running on a possibly-healthy pool (round-19 FATAL)")
+    assert fake_db._backend._pool is None, "the stale reference must be dropped"
     assert fake_db.is_connected is False
+
+
+@pytest.mark.asyncio
+async def test_supervisor_never_touches_a_connected_backend(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """THE SAFETY PROPERTY OF THE WHOLE DESIGN. The supervisor acts only when
+    `is_connected` is False — i.e. when there is no pool in use to damage. It
+    must never probe, never reset, and never call the repairing helper, even
+    when the backend is broken behind the flag: four review rounds
+    (PR #1683, 16-19) were spent failing to make a repairing supervisor safe,
+    and every one of them destroyed something live."""
+    repairs = {"n": 0}
+
+    async def must_not_run(**_kwargs) -> None:
+        repairs["n"] += 1
+
+    class BrokenBehindTheFlag(SpyDatabase):
+        async def execute(self, _query):
+            self.execute_calls += 1
+            raise RuntimeError("pool is closed")
+
+    spy = BrokenBehindTheFlag(connected=True)
+    monkeypatch.setattr(readiness, "database", spy)
+    monkeypatch.setattr(readiness, "ensure_database_ready", must_not_run)
+
+    await readiness.run_database_reconnect_supervisor(
+        interval_seconds=0.01, max_cycles=3
+    )
+
+    assert repairs["n"] == 0, "the supervisor called the REPAIRING helper"
+    assert spy.execute_calls == 0, (
+        "the supervisor probed a connected backend — probing is how it talks "
+        "itself into a destructive repair")
+    assert spy.connect_calls == 0 and spy.disconnect_calls == 0
 
 
 def test_the_lifespan_supervisor_actually_repairs_with_zero_traffic(
@@ -641,35 +313,32 @@ def test_the_lifespan_supervisor_actually_repairs_with_zero_traffic(
     """ROUND-17 R17-4 (surviving mutation: lifespan started a supervisor that
     did nothing). The wiring test below is a source check; this drives the
     REAL app lifespan and proves the task it starts genuinely repairs a
-    degraded backend WITHOUT any request touching a repair path."""
-    # The supervisor resolves its interval at CALL time, so patching the
-    # module constant reaches the task the lifespan starts — no reload, no
-    # touching main's source.
-    monkeypatch.setattr(
-        readiness, "DEFAULT_RECONNECT_SUPERVISOR_INTERVAL_SECONDS", 0.05
-    )
+    degraded backend WITHOUT any request touching a repair path.
+
+    NOTHING IS STUBBED BETWEEN THE SUPERVISOR AND ITS EFFECT. Round 19 found
+    the previous version of this suite mocked out `ensure_database_ready` in
+    every supervisor test, so the seam containing a FATAL bug was untested by
+    construction. Here the supervisor's real code path runs and the assertion
+    is on the database object it actually reconnects."""
+    # The interval is resolved per call from the env (clamped to >= 1s), so
+    # this reaches the task the lifespan starts without reloading main.
+    monkeypatch.setenv("DB_RECONNECT_SUPERVISOR_INTERVAL_SECONDS", "1")
 
     import main as main_module
 
-    repaired = {"n": 0}
     spy = SpyDatabase(connected=False)
-
-    async def repair() -> None:
-        repaired["n"] += 1
-        spy.is_connected = True
-
     monkeypatch.setattr(readiness, "database", spy)
-    monkeypatch.setattr(readiness, "ensure_database_ready", repair)
 
     with TestClient(main_module.app):
         # No requests at all — only the lifespan's background task runs.
-        deadline = time.monotonic() + 5.0
-        while repaired["n"] == 0 and time.monotonic() < deadline:
+        deadline = time.monotonic() + 8.0
+        while spy.connect_calls == 0 and time.monotonic() < deadline:
             time.sleep(0.05)
 
-    assert repaired["n"] >= 1, (
-        "the lifespan-started supervisor never repaired anything — a "
+    assert spy.connect_calls >= 1, (
+        "the lifespan-started supervisor never reconnected anything — a "
         "read-only process would stay degraded forever")
+    assert spy.is_connected is True
 
 
 def test_the_supervisor_is_wired_into_the_app_lifespan_not_the_scheduler():

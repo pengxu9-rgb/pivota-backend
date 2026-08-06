@@ -42,12 +42,21 @@ def _force_mark_database_disconnected() -> None:
     `InterfaceError: pool is closed`. Force the wrapper back to disconnected so the
     next readiness pass creates a fresh pool.
 
-    ⚠️ THIS IS DESTRUCTIVE. It TERMINATES the pool (see below for why), which
-    kills every query currently running on it — not only the caller's. Only
-    invoke it when the pool is known to be unusable; on an ambiguous signal
-    such as a probe timeout, a slow-but-alive backend would lose live work
-    (round-18 F1). `run_database_reconnect_supervisor` encodes that rule via
-    `is_dead_pool_error` plus a consecutive-failure threshold.
+    ⚠️ REACHED ON AN AMBIGUOUS SIGNAL. `ensure_database_ready` calls this from
+    an unconditional `finally`, after a probe bounded at 3s — and a probe
+    timeout does NOT prove the pool is dead (a slow database, or a merely
+    saturated pool whose probe queues behind `acquire`, times out identically).
+    A version of this function called `pool.terminate()` here; review round 19
+    drove the consequence on a real pool: healthy pools destroyed and 30
+    in-flight queries killed with `connection was closed in the middle of
+    operation`. Abandoning the pool instead lets in-flight work finish.
+
+    The cost of abandoning is a connection leak (round-17 R17-3: the orphaned
+    pool's server connections stay open until the backend times them out).
+    That leak is real but pre-existing and survivable; killing live queries on
+    a healthy database is neither. Closing it properly means making the
+    DECISION unambiguous before reaching here — separate work, deliberately
+    not attempted from inside this function.
     """
     try:
         database.is_connected = False
@@ -56,26 +65,11 @@ def _force_mark_database_disconnected() -> None:
 
     backend = getattr(database, "_backend", None)
     if backend is not None and hasattr(backend, "_pool"):
-        # TERMINATE BEFORE DROPPING THE REFERENCE. Nulling `_pool` alone
-        # abandons the asyncpg pool with its server connections still open —
-        # they stay in pg_stat_activity until the backend times them out.
-        # Measured on real Postgres (review round 17): one leak of
-        # DB_POOL_MIN_SIZE connections per call, growing linearly. That was
-        # survivable while this ran only on request-path failures; the
-        # reconnect supervisor calls it on a timer, so at the production
-        # default (min_size 5, 30s interval) an unattended degraded process
-        # would burn ~600 server connections an hour and exhaust
-        # max_connections — taking the database down for every other client
-        # during the very outage this code exists to recover from.
-        # terminate() is synchronous and immediate; close() is a coroutine
-        # that waits on in-flight work we have already given up on.
-        pool = getattr(backend, "_pool", None)
-        terminate = getattr(pool, "terminate", None)
-        if callable(terminate):
-            try:
-                terminate()
-            except Exception:
-                pass
+        # DO NOT terminate() here. See the docstring: this runs on an
+        # ambiguous signal, so terminating kills queries on a pool that may be
+        # perfectly healthy. Dropping the reference leaks the pool's server
+        # connections (round-17 R17-3) — the lesser harm, and the one that
+        # does not take working requests down with it.
         try:
             backend._pool = None
         except Exception:
@@ -190,36 +184,14 @@ async def ensure_database_ready(
 
 
 DEFAULT_RECONNECT_SUPERVISOR_INTERVAL_SECONDS = 30.0
-
-# The supervisor's probe is NOT the request-path health probe and must not
-# borrow its 3s budget. 3s is tuned for "answer Railway quickly"; here it
-# decides whether to DESTROY a pool, so it must sit well above the database's
-# P99 — a slow answer is not a dead backend.
-DEFAULT_SUPERVISOR_PROBE_TIMEOUT_SECONDS = 15.0
-
-# How many consecutive AMBIGUOUS failures (slow/timeout) before the
-# supervisor resorts to a destructive repair. Unambiguous dead-pool
-# signatures bypass this and repair on the first cycle.
-DEFAULT_REPAIR_AFTER_CONSECUTIVE_FAILURES = 3
+DEFAULT_RECONNECT_CONNECT_TIMEOUT_SECONDS = 10.0
 
 _SUPERVISOR_ENABLED_ENV = "DB_RECONNECT_SUPERVISOR_ENABLED"
 _SUPERVISOR_INTERVAL_ENV = "DB_RECONNECT_SUPERVISOR_INTERVAL_SECONDS"
 
-# Errors that mean the pool is genuinely unusable — repairing cannot destroy
-# work that was going to succeed, because nothing can succeed on it. Anything
-# NOT in this set (a timeout above all) is ambiguous and must be confirmed
-# across cycles first.
-_DEAD_POOL_SIGNATURES = (
-    "pool is closed",
-    "pool is closing",
-    "databasebackend is not running",
-    "connection is closed",
-)
-
 
 def _supervisor_enabled() -> bool:
-    """Kill switch. If the supervisor ever misbehaves in production, it must
-    be stoppable by an env var, not only by a redeploy."""
+    """Kill switch, re-read every cycle so it works without a redeploy."""
     return os.getenv(_SUPERVISOR_ENABLED_ENV, "true").strip().lower() not in {
         "0", "false", "no", "off",
     }
@@ -230,155 +202,87 @@ def _supervisor_interval() -> float:
     if raw is None:
         return DEFAULT_RECONNECT_SUPERVISOR_INTERVAL_SECONDS
     try:
-        return max(1.0, float(raw))
+        value = float(raw)
     except (TypeError, ValueError):
+        value = float("nan")
+    # NaN and inf both survive float(); inf would wedge the loop on
+    # asyncio.sleep(inf) with no log line, silently disabling the supervisor
+    # (review round 19). Anything not finite falls back, loudly.
+    if not (value == value) or value in (float("inf"), float("-inf")):
         logger.warning(
             "invalid %s=%r; using %.1fs",
             _SUPERVISOR_INTERVAL_ENV, raw,
             DEFAULT_RECONNECT_SUPERVISOR_INTERVAL_SECONDS,
         )
         return DEFAULT_RECONNECT_SUPERVISOR_INTERVAL_SECONDS
-
-
-def is_dead_pool_error(exc: BaseException) -> bool:
-    """True only for errors that prove the pool cannot serve anything.
-
-    THE DISTINCTION THIS DRAWS IS SAFETY-CRITICAL (round-18 F1). Repair is
-    destructive: `_force_mark_database_disconnected` terminates the pool and
-    every query running on it. A TIMEOUT does not mean death — a slow
-    database, or an ordinary saturated pool where the probe simply queues
-    behind `acquire`, times out exactly like a dead one. Driven in review:
-    treating those alike made the supervisor kill a healthy pool every cycle
-    under normal load, manufacturing the very `DatabaseBackend is not
-    running` errors this module exists to prevent.
-    """
-    parts = []
-    seen = 0
-    current: Optional[BaseException] = exc
-    while current is not None and seen < 4:
-        parts.append(f"{type(current).__name__}: {current}")
-        current = getattr(current, "__cause__", None)
-        seen += 1
-    text = " ".join(parts).lower()
-    return any(signature in text for signature in _DEAD_POOL_SIGNATURES)
+    return max(1.0, value)
 
 
 async def run_database_reconnect_supervisor(
     *,
     interval_seconds: Optional[float] = None,
-    probe_timeout_seconds: Optional[float] = None,
-    repair_after_consecutive_failures: Optional[int] = None,
+    connect_timeout_seconds: float = DEFAULT_RECONNECT_CONNECT_TIMEOUT_SECONDS,
     max_cycles: Optional[int] = None,
 ) -> None:
-    """Reconnect a degraded process without waiting for the right request.
+    """Reconnect a process whose backend is DISCONNECTED. Nothing else.
 
-    WHY THIS EXISTS. Startup deliberately continues when the initial DB
-    connect fails (main.py: "keep the service up"), and nothing used to walk
-    that back except `/health` reconnecting as a side effect of being polled.
-    Removing that side effect (see `probe_database_health`) would otherwise
-    leave exactly one class of repair: `ensure_database_ready`, called only
-    from POST /auth/login, /quotes/preview, /orders/create and
-    /orders/payment/confirm. A process serving only READ traffic — agent
-    product search, promotions — would then stay broken indefinitely, which
-    is strictly worse than the accidental heal it replaced. Review round 16
-    on PR #1683 drove exactly that regression; this closes it.
+    WHY IT EXISTS. Startup deliberately continues when the initial DB connect
+    fails (main.py: "keep the service up"), and nothing walked that back
+    except `/health` reconnecting as a side effect of being polled. Making
+    `/health` honest (see `probe_database_health`) removes that accidental
+    heal, leaving only `ensure_database_ready` on POST login/quote/order — so
+    a process serving read-only traffic would never recover. This closes that
+    specific hole and no other.
 
-    DELIBERATELY NOT AN APSCHEDULER JOB. During the 2026-08-05/06 incident
-    every scheduler job sat at "maximum number of running instances reached"
-    because jobs call `database.connect()` with no timeout and hang forever.
-    A repair mechanism must not share fate with the thing it repairs, so this
-    is a plain asyncio task owned by the app lifespan, and every DB call it
-    makes is timeout-bounded via `ensure_database_ready`.
+    ⚠️ DELIBERATELY NON-DESTRUCTIVE, AND THAT IS THE WHOLE DESIGN. It acts
+    only when `is_connected` is False — i.e. when there is no pool in use to
+    damage — and it calls `database.connect()`, never `ensure_database_ready`,
+    whose unconditional `finally: _force_mark_database_disconnected()` resets
+    pool state on a 3s-probe timeout that cannot distinguish a slow database
+    from a dead one.
 
-    Never raises: a supervisor that dies on an unexpected error is a
-    supervisor that silently stops supervising. `max_cycles` exists so tests
-    can drive a bounded number of iterations.
+    Four review rounds were spent trying to make a repairing supervisor safe
+    (PR #1683, rounds 16-19). Each fix moved the destruction one layer further
+    from the decision — a flag, then a probe, then a classifier, then a
+    failure threshold — while the destruction itself stayed unconditional
+    three layers down, and round 19 drove it destroying healthy pools and
+    killing 30 in-flight queries. The lesson kept: a destructive actuator must
+    not hang off an inference drawn from one `SELECT 1` under a timeout.
+
+    KNOWN GAP, ACCEPTED. A backend that is `is_connected=True` with a dead
+    pool is NOT repaired here — only request traffic through
+    `ensure_database_ready` repairs that shape. Recovering it unattended needs
+    a decision procedure that can prove death without guessing, which is
+    separate work. This supervisor covers the degraded-START case, which is
+    the one the incident actually described.
+
+    NOT AN APSCHEDULER JOB: during the 2026-08-05/06 incident every scheduler
+    job was wedged at max_instances, and a repair mechanism must not share
+    fate with what it repairs. Never raises except CancelledError.
     """
-    # Resolved at CALL time, not as a default argument: a default binds at
-    # definition and cannot be patched, which made the lifespan-started
-    # supervisor untestable end-to-end (round-17 R17-4).
     interval = _supervisor_interval() if interval_seconds is None else interval_seconds
-    probe_timeout = (
-        DEFAULT_SUPERVISOR_PROBE_TIMEOUT_SECONDS
-        if probe_timeout_seconds is None
-        else probe_timeout_seconds
-    )
-    repair_after = (
-        DEFAULT_REPAIR_AFTER_CONSECUTIVE_FAILURES
-        if repair_after_consecutive_failures is None
-        else repair_after_consecutive_failures
-    )
 
-    consecutive_ambiguous = 0
     cycles = 0
     while max_cycles is None or cycles < max_cycles:
         cycles += 1
-        try:
-            await asyncio.sleep(interval)
-        except asyncio.CancelledError:
-            raise
+        await asyncio.sleep(interval)
 
         if not _supervisor_enabled():
             continue
-
-        # LIVENESS IS DECIDED BY A QUERY, NOT BY THE FLAG. An earlier version
-        # gated on `database.is_connected`, which the repair path sets itself
-        # — two failures followed, both driven in review round 17:
-        #   * the connected-but-broken-pool shape (`is_connected` True while
-        #     every query raises `InterfaceError: pool is closed` — the shape
-        #     `_force_mark_database_disconnected` above exists for) was
-        #     skipped entirely, so nothing ever repaired it;
-        #   * after one failed cycle, `ensure_database_ready` had already set
-        #     the flag True, so every later cycle short-circuited and
-        #     supervision ended permanently — including for "the database
-        #     system is starting up", i.e. exactly the restart case this
-        #     supervisor exists to ride out.
-        # A `SELECT 1` costs nothing and cannot lie to us.
-        #
-        # BUT A FAILED PROBE IS NOT AUTOMATICALLY A DEAD BACKEND (round-18
-        # F1). Repair is DESTRUCTIVE — it terminates the pool and every query
-        # running on it — so an ambiguous failure must be confirmed across
-        # cycles before we act on it. Driven in review: repairing on a single
-        # timeout made this loop destroy a HEALTHY pool every cycle whenever
-        # the database was merely slow, or the pool merely saturated under
-        # ordinary load (the probe queues behind `acquire` and times out
-        # exactly like a dead pool). That manufactured the very
-        # `DatabaseBackend is not running` failures this module prevents.
-        try:
-            await probe_database_health(probe_timeout_seconds=probe_timeout)
-            consecutive_ambiguous = 0
+        if getattr(database, "is_connected", False):
             continue
-        except DatabaseUnavailableError as exc:
-            dead = exc.phase == "disconnected" or is_dead_pool_error(
-                exc.__cause__ or exc
-            )
-        except Exception as exc:  # noqa: BLE001 — probing must never end supervision
-            logger.exception("database reconnect supervisor: probe error")
-            dead = is_dead_pool_error(exc)
-
-        if not dead:
-            consecutive_ambiguous += 1
-            if consecutive_ambiguous < repair_after:
-                logger.warning(
-                    "database reconnect supervisor: probe failed but the "
-                    "cause is ambiguous (slow vs dead) — not repairing yet",
-                    extra={
-                        "consecutive": consecutive_ambiguous,
-                        "repair_after": repair_after,
-                    },
-                )
-                continue
 
         try:
-            await ensure_database_ready()
-            consecutive_ambiguous = 0
-            logger.warning(
-                "database reconnect supervisor: restored an unhealthy backend"
+            await asyncio.wait_for(
+                database.connect(), timeout=connect_timeout_seconds
             )
-        except DatabaseUnavailableError as exc:
             logger.warning(
-                "database reconnect supervisor: still unavailable",
-                extra={"phase": exc.phase, "error_type": exc.error_type},
+                "database reconnect supervisor: reconnected a disconnected backend"
             )
-        except Exception:  # noqa: BLE001 — must outlive every failure mode
-            logger.exception("database reconnect supervisor: unexpected error")
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:  # noqa: BLE001 — must outlive every failure
+            logger.warning(
+                "database reconnect supervisor: still unreachable (%s: %s)",
+                type(exc).__name__, exc,
+            )
