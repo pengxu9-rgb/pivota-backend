@@ -41,7 +41,7 @@ except ModuleNotFoundError:
 import subprocess
 import os
 from pathlib import Path
-from utils.database_readiness import DatabaseUnavailableError, ensure_database_ready
+from utils.database_readiness import DatabaseUnavailableError, probe_database_health
 
 SERVICE_STARTED_AT = datetime.now(timezone.utc).replace(microsecond=0).isoformat().replace("+00:00", "Z")
 SERVICE_NAME = (os.getenv("PIVOTA_SERVICE_NAME") or os.getenv("SERVICE_NAME") or "pivota-backend").strip() or "pivota-backend"
@@ -1837,25 +1837,28 @@ def _health_timeout_seconds(name: str, default: float, *, min_value: float = 0.5
 @app.get("/health")
 async def health_check():
     """
-    Dedicated health check endpoint used by Railway.
+    Dedicated health check endpoint used by Railway (healthcheckPath=/health).
 
-    Must be fast and deterministic:
-      - checks DB connectivity (short timeout)
+    Must be fast, deterministic, and READ-ONLY:
+      - OBSERVES DB state via probe_database_health — never connects, never
+        resets the pool (see that function: a self-healing health check hid a
+        12.5-hour total outage on 2026-08-05/06 because it reported the
+        health of its own repair attempt instead of what requests see)
       - checks required schema exists (read-only)
+
+    A disconnected backend MUST surface as 503 here. Request-time recovery
+    lives in ensure_database_ready, which the auth/quote/order paths still
+    call — reporting the truth does not remove the app's ability to heal.
     """
     started_at = time.time()
     db_ok = False
     missing: dict[str, list[str]] = {}
     db_error = None
-    connect_timeout = _health_timeout_seconds("DB_HEALTH_CONNECT_TIMEOUT_SECONDS", 5.0)
     probe_timeout = _health_timeout_seconds("DB_HEALTH_PROBE_TIMEOUT_SECONDS", 3.0)
     schema_timeout = _health_timeout_seconds("DB_HEALTH_SCHEMA_TIMEOUT_SECONDS", 5.0)
 
     try:
-        await ensure_database_ready(
-            connect_timeout_seconds=connect_timeout,
-            probe_timeout_seconds=probe_timeout,
-        )
+        await probe_database_health(probe_timeout_seconds=probe_timeout)
         db_ok = True
     except DatabaseUnavailableError as e:
         db_error = e.error_type

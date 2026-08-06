@@ -54,6 +54,48 @@ def _force_mark_database_disconnected() -> None:
             pass
 
 
+async def probe_database_health(*, probe_timeout_seconds: float = 3.0) -> None:
+    """OBSERVE the database's state. Repair NOTHING. For health checks only.
+
+    THE HEALTH CHECK MUST NOT BE A REPAIR PATH. `/health` used to call
+    `ensure_database_ready` (below), which reconnects and resets pool state
+    before answering — so it reported the health of its own repair attempt,
+    not what request handlers actually see.
+
+    That cost 12.5 hours of production on 2026-08-05/06: startup had left the
+    app in degraded mode (main.py keeps the service up when the initial
+    connect fails), so every DB-backed request raised
+    `AssertionError: DatabaseBackend is not running` and returned 500 —
+    agent product search, promotions, all of it — while `/health` kept
+    answering 200 because it reconnected each time it was asked. Railway's
+    healthcheck points at `/health`, so nothing ever restarted the container,
+    and background jobs (which call `database.connect()` with no timeout)
+    hung holding their `max_instances=1` slots. The outage was total and
+    invisible at the same time.
+
+    So: this function connects nothing and resets nothing. If the shared
+    `database` is not connected, that IS the answer, and the caller must
+    report unhealthy so the platform can act. Request-time recovery is a
+    separate concern and stays where it belongs — `ensure_database_ready`,
+    still called by the auth/quote/order paths.
+    """
+    if not getattr(database, "is_connected", False):
+        raise DatabaseUnavailableError(
+            phase="disconnected",
+            error_type="DatabaseBackendNotRunning",
+            message="database backend is not running",
+        )
+
+    try:
+        await asyncio.wait_for(database.execute("SELECT 1"), timeout=probe_timeout_seconds)
+    except Exception as exc:
+        raise DatabaseUnavailableError(
+            phase="probe",
+            error_type=type(exc).__name__,
+            message="database readiness probe failed",
+        ) from exc
+
+
 async def ensure_database_ready(
     *,
     connect_timeout_seconds: float = 3.0,
