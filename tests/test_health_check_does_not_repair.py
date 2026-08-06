@@ -1,16 +1,18 @@
 """`/health` must OBSERVE the database, never REPAIR it.
 
-THE INCIDENT THIS PINS (2026-08-05/06, 12.5 hours of production):
-`/health` called `ensure_database_ready`, which reconnects and resets pool
-state before answering. Startup had left the app in degraded mode (main.py
-deliberately keeps the service up when the initial DB connect fails), so
-every DB-backed request raised `AssertionError: DatabaseBackend is not
-running` and returned 500 — agent product search, promotions, everything —
-while `/health` answered 200 each time, because asking it repaired the very
-thing it was asked about. Railway's healthcheck points at `/health`, so the
-platform never restarted the container; background jobs that call
-`database.connect()` without a timeout hung holding their max_instances=1
-slots. Total outage, invisible indicator.
+WHAT IS PROVEN, AND WHAT IS NOT. `/health` called `ensure_database_ready`,
+which reconnects and resets pool state before answering. Driven on the
+pre-fix commit: against a disconnected backend `/health` answered 200 five
+times out of five (`db_ok: true`), having silently reconnected on the first
+poll. An indicator that repairs what it measures cannot be trusted to reveal
+an outage — and Railway's healthcheck points at `/health`.
+
+The 12.5-hour outage of 2026-08-05/06 (`AssertionError: DatabaseBackend is
+not running` on every DB-backed request, `/health` green throughout) is what
+sent us looking here. Review rounds 16 and 17 could NOT reproduce that
+combination from this code path — a single poll repairs the degraded-start
+shape — so the mechanism behind that outage remains UNIDENTIFIED. Treat the
+incident as motivation; the narrower claim above is what these tests pin.
 
 The rule these tests enforce: the health path performs NO connect and NO
 pool reset, and a disconnected backend surfaces as 503. Request-time
@@ -199,19 +201,137 @@ async def test_supervisor_reconnects_a_degraded_process_without_any_traffic(
 
 
 @pytest.mark.asyncio
-async def test_supervisor_leaves_a_healthy_backend_alone(
+async def test_supervisor_repairs_a_connected_but_broken_pool(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """It must not churn a working pool — no connect, no probe."""
+    """ROUND-17 R17-1. `databases` leaves `is_connected` True when the pool is
+    dead (the shape `_force_mark_database_disconnected` exists for: every
+    query raises `InterfaceError: pool is closed`). Gating the supervisor on
+    that flag skipped this shape entirely — nothing repaired it, while the
+    OLD self-healing /health did. Liveness must be decided by a query."""
+    calls = {"n": 0}
+
+    class BrokenPoolDatabase(SpyDatabase):
+        async def execute(self, _query):
+            self.execute_calls += 1
+            raise RuntimeError("pool is closed")
+
+    spy = BrokenPoolDatabase(connected=True)  # flag says healthy, pool is not
+
+    async def repair() -> None:
+        calls["n"] += 1
+        spy.execute_raises = None
+
+    monkeypatch.setattr(readiness, "database", spy)
+    monkeypatch.setattr(readiness, "ensure_database_ready", repair)
+
+    await readiness.run_database_reconnect_supervisor(
+        interval_seconds=0.01, max_cycles=1
+    )
+
+    assert calls["n"] == 1, (
+        "the supervisor skipped a connected-but-broken pool — it trusted the "
+        "is_connected flag instead of probing")
+
+
+@pytest.mark.asyncio
+async def test_supervisor_keeps_trying_after_a_failed_repair_sets_the_flag(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """ROUND-17 R17-2, the nastier half. `ensure_database_ready` sets
+    `is_connected=True` as a side effect of its connect attempt, even when the
+    probe then fails. Gating on the flag therefore wedged the supervisor after
+    ONE failed cycle — permanently, for the life of the process, including
+    for 'the database system is starting up', the exact restart case this
+    supervisor exists to ride out."""
+    attempts = {"n": 0}
+
+    class FlagSettingDatabase(SpyDatabase):
+        async def execute(self, _query):
+            self.execute_calls += 1
+            raise RuntimeError("the database system is starting up")
+
+    spy = FlagSettingDatabase(connected=False)
+
+    async def failing_repair() -> None:
+        attempts["n"] += 1
+        spy.is_connected = True  # the side effect that caused the wedge
+        raise DatabaseUnavailableError(
+            phase="probe", error_type="RuntimeError",
+            message="the database system is starting up")
+
+    monkeypatch.setattr(readiness, "database", spy)
+    monkeypatch.setattr(readiness, "ensure_database_ready", failing_repair)
+
+    await readiness.run_database_reconnect_supervisor(
+        interval_seconds=0.01, max_cycles=4
+    )
+
+    assert attempts["n"] == 4, (
+        f"supervision stopped after {attempts['n']} attempt(s) — a failed "
+        "repair left is_connected True and wedged the loop forever")
+
+
+@pytest.mark.asyncio
+async def test_supervisor_keeps_supervising_after_the_backend_recovers(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """ROUND-17 R17-5 (surviving mutation `continue` -> `break`): a healthy
+    cycle must CONTINUE the loop, not end it. Otherwise the first healthy
+    moment retires the supervisor and the next failure is unattended."""
     spy = SpyDatabase(connected=True)
     monkeypatch.setattr(readiness, "database", spy)
+    repairs = {"n": 0}
+
+    async def repair() -> None:
+        repairs["n"] += 1
+
+    monkeypatch.setattr(readiness, "ensure_database_ready", repair)
+
+    # Healthy for two cycles, then broken on the third.
+    async def execute(_query):
+        spy.execute_calls += 1
+        if spy.execute_calls >= 3:
+            raise RuntimeError("pool is closed")
+        return 1
+
+    monkeypatch.setattr(spy, "execute", execute)
 
     await readiness.run_database_reconnect_supervisor(
         interval_seconds=0.01, max_cycles=3
     )
 
+    assert repairs["n"] == 1, (
+        "the supervisor stopped watching after healthy cycles — a later "
+        "failure would go unrepaired")
+
+
+@pytest.mark.asyncio
+async def test_supervisor_leaves_a_healthy_backend_alone(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """It must not churn a working pool. It DOES probe every cycle — that is
+    the round-17 fix (liveness decided by a query, never by the flag the
+    repair path sets itself) — but a healthy probe must lead to no repair:
+    no connect, no disconnect, no pool reset."""
+    spy = SpyDatabase(connected=True)
+    monkeypatch.setattr(readiness, "database", spy)
+    repairs = {"n": 0}
+
+    async def repair() -> None:
+        repairs["n"] += 1
+
+    monkeypatch.setattr(readiness, "ensure_database_ready", repair)
+
+    await readiness.run_database_reconnect_supervisor(
+        interval_seconds=0.01, max_cycles=3
+    )
+
+    assert repairs["n"] == 0, "supervisor repaired a healthy backend"
     assert spy.connect_calls == 0 and spy.disconnect_calls == 0
-    assert spy.execute_calls == 0, "supervisor probed a healthy backend"
+    assert spy.execute_calls == 3, (
+        "the supervisor must PROBE each cycle — trusting is_connected is "
+        "what let a dead pool go unrepaired (round-17 R17-1)")
 
 
 @pytest.mark.asyncio
@@ -279,6 +399,81 @@ async def test_supervisor_is_cancellable_for_clean_shutdown() -> None:
         await task
 
 
+def test_force_disconnect_terminates_the_pool_instead_of_leaking_it():
+    """ROUND-17 R17-3. Nulling `_pool` abandons the asyncpg pool with its
+    server connections still open. Measured on real Postgres: one leak of
+    DB_POOL_MIN_SIZE connections per call. Harmless-ish on the request path;
+    on the supervisor's 30s timer it burns ~600 connections an hour and
+    exhausts max_connections — killing the database for every client during
+    the outage this code exists to recover from. The pool must be terminated
+    before the reference is dropped."""
+    terminated = {"n": 0}
+
+    class FakePool:
+        def terminate(self):
+            terminated["n"] += 1
+
+    class FakeBackend:
+        def __init__(self):
+            self._pool = FakePool()
+
+    class FakeDb:
+        is_connected = True
+
+    fake_db = FakeDb()
+    fake_db._backend = FakeBackend()
+
+    original = readiness.database
+    readiness.database = fake_db
+    try:
+        readiness._force_mark_database_disconnected()
+    finally:
+        readiness.database = original
+
+    assert terminated["n"] == 1, (
+        "the pool was dropped without terminate() — its server connections "
+        "leak until the backend times them out")
+    assert fake_db._backend._pool is None
+    assert fake_db.is_connected is False
+
+
+def test_the_lifespan_supervisor_actually_repairs_with_zero_traffic(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """ROUND-17 R17-4 (surviving mutation: lifespan started a supervisor that
+    did nothing). The wiring test below is a source check; this drives the
+    REAL app lifespan and proves the task it starts genuinely repairs a
+    degraded backend WITHOUT any request touching a repair path."""
+    # The supervisor resolves its interval at CALL time, so patching the
+    # module constant reaches the task the lifespan starts — no reload, no
+    # touching main's source.
+    monkeypatch.setattr(
+        readiness, "DEFAULT_RECONNECT_SUPERVISOR_INTERVAL_SECONDS", 0.05
+    )
+
+    import main as main_module
+
+    repaired = {"n": 0}
+    spy = SpyDatabase(connected=False)
+
+    async def repair() -> None:
+        repaired["n"] += 1
+        spy.is_connected = True
+
+    monkeypatch.setattr(readiness, "database", spy)
+    monkeypatch.setattr(readiness, "ensure_database_ready", repair)
+
+    with TestClient(main_module.app):
+        # No requests at all — only the lifespan's background task runs.
+        deadline = time.monotonic() + 5.0
+        while repaired["n"] == 0 and time.monotonic() < deadline:
+            time.sleep(0.05)
+
+    assert repaired["n"] >= 1, (
+        "the lifespan-started supervisor never repaired anything — a "
+        "read-only process would stay degraded forever")
+
+
 def test_the_supervisor_is_wired_into_the_app_lifespan_not_the_scheduler():
     """It must be owned by the lifespan, NOT APScheduler: during the incident
     every scheduler job sat at 'maximum number of running instances reached',
@@ -292,6 +487,9 @@ def test_the_supervisor_is_wired_into_the_app_lifespan_not_the_scheduler():
     assert "run_database_reconnect_supervisor" in lifespan_src, (
         "the reconnect supervisor is not started by the app lifespan")
     assert "cancel()" in lifespan_src, "the supervisor is never cancelled"
+    assert "await reconnect_supervisor" in lifespan_src, (
+        "the cancelled task is never awaited — shutdown races it and Python "
+        "reports 'Task was destroyed but it is pending' (round-17 R17-8)")
     assert "run_database_reconnect_supervisor" not in inspect.getsource(scheduler), (
         "the supervisor was moved into APScheduler — during the incident "
         "every scheduler job was wedged; it must not share that fate")
@@ -322,11 +520,17 @@ def test_request_paths_keep_their_recovery_helper():
     # substring check tripped on the docstring that explains where recovery
     # lives. AST, so prose can never decide whether this passes.
     tree = ast.parse(textwrap.dedent(inspect.getsource(main.health_check)))
-    called = {
-        node.func.id
-        for node in ast.walk(tree)
-        if isinstance(node, ast.Call) and isinstance(node.func, ast.Name)
-    }
+    called = set()
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.Call):
+            continue
+        # BOTH call shapes. A Name-only version was defeated in review round
+        # 17 by `readiness.ensure_database_ready(...)` — a module-qualified
+        # call is an ast.Attribute and was invisible to the pin.
+        if isinstance(node.func, ast.Name):
+            called.add(node.func.id)
+        elif isinstance(node.func, ast.Attribute):
+            called.add(node.func.attr)
     assert "probe_database_health" in called, "/health stopped observing"
     assert "ensure_database_ready" not in called, (
         "/health calls the REPAIRING helper again — it must observe only")

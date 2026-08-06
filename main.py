@@ -1856,9 +1856,12 @@ async def health_check():
 
     Must be fast, deterministic, and READ-ONLY:
       - OBSERVES DB state via probe_database_health — never connects, never
-        resets the pool (see that function: a self-healing health check hid a
-        12.5-hour total outage on 2026-08-05/06 because it reported the
-        health of its own repair attempt instead of what requests see)
+        resets the pool. An indicator that repairs what it measures cannot
+        reveal an outage: driven on the pre-fix commit, /health answered 200
+        five times out of five against a disconnected backend, having
+        reconnected on the first poll. (The 12.5-hour outage of 2026-08-05/06
+        is what sent us looking here, but its mechanism was never reproduced
+        from this path — motivation, not established root cause.)
       - checks required schema exists (read-only)
 
     A disconnected backend MUST surface as 503 here. Request-time recovery

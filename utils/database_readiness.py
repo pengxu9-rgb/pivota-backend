@@ -48,6 +48,26 @@ def _force_mark_database_disconnected() -> None:
 
     backend = getattr(database, "_backend", None)
     if backend is not None and hasattr(backend, "_pool"):
+        # TERMINATE BEFORE DROPPING THE REFERENCE. Nulling `_pool` alone
+        # abandons the asyncpg pool with its server connections still open —
+        # they stay in pg_stat_activity until the backend times them out.
+        # Measured on real Postgres (review round 17): one leak of
+        # DB_POOL_MIN_SIZE connections per call, growing linearly. That was
+        # survivable while this ran only on request-path failures; the
+        # reconnect supervisor calls it on a timer, so at the production
+        # default (min_size 5, 30s interval) an unattended degraded process
+        # would burn ~600 server connections an hour and exhaust
+        # max_connections — taking the database down for every other client
+        # during the very outage this code exists to recover from.
+        # terminate() is synchronous and immediate; close() is a coroutine
+        # that waits on in-flight work we have already given up on.
+        pool = getattr(backend, "_pool", None)
+        terminate = getattr(pool, "terminate", None)
+        if callable(terminate):
+            try:
+                terminate()
+            except Exception:
+                pass
         try:
             backend._pool = None
         except Exception:
@@ -166,7 +186,7 @@ DEFAULT_RECONNECT_SUPERVISOR_INTERVAL_SECONDS = 30.0
 
 async def run_database_reconnect_supervisor(
     *,
-    interval_seconds: float = DEFAULT_RECONNECT_SUPERVISOR_INTERVAL_SECONDS,
+    interval_seconds: Optional[float] = None,
     max_cycles: Optional[int] = None,
 ) -> None:
     """Reconnect a degraded process without waiting for the right request.
@@ -193,21 +213,48 @@ async def run_database_reconnect_supervisor(
     supervisor that silently stops supervising. `max_cycles` exists so tests
     can drive a bounded number of iterations.
     """
+    # Resolved at CALL time, not as a default argument: a default binds at
+    # definition and cannot be patched, which made the lifespan-started
+    # supervisor untestable end-to-end (round-17 R17-4).
+    interval = (
+        DEFAULT_RECONNECT_SUPERVISOR_INTERVAL_SECONDS
+        if interval_seconds is None
+        else interval_seconds
+    )
+
     cycles = 0
     while max_cycles is None or cycles < max_cycles:
         cycles += 1
         try:
-            await asyncio.sleep(interval_seconds)
+            await asyncio.sleep(interval)
         except asyncio.CancelledError:
             raise
 
-        if getattr(database, "is_connected", False):
+        # LIVENESS IS DECIDED BY A QUERY, NOT BY THE FLAG. An earlier version
+        # gated on `database.is_connected`, which the repair path sets itself
+        # — two failures followed, both driven in review round 17:
+        #   * the connected-but-broken-pool shape (`is_connected` True while
+        #     every query raises `InterfaceError: pool is closed` — the shape
+        #     `_force_mark_database_disconnected` above exists for) was
+        #     skipped entirely, so nothing ever repaired it;
+        #   * after one failed cycle, `ensure_database_ready` had already set
+        #     the flag True, so every later cycle short-circuited and
+        #     supervision ended permanently — including for "the database
+        #     system is starting up", i.e. exactly the restart case this
+        #     supervisor exists to ride out.
+        # A `SELECT 1` every 30s costs nothing and cannot lie to us.
+        try:
+            await probe_database_health()
             continue
+        except DatabaseUnavailableError:
+            pass
+        except Exception:  # noqa: BLE001 — probing must never end supervision
+            logger.exception("database reconnect supervisor: probe error")
 
         try:
             await ensure_database_ready()
             logger.warning(
-                "database reconnect supervisor: restored a disconnected backend"
+                "database reconnect supervisor: restored an unhealthy backend"
             )
         except DatabaseUnavailableError as exc:
             logger.warning(
