@@ -57,27 +57,28 @@ def _force_mark_database_disconnected() -> None:
 async def probe_database_health(*, probe_timeout_seconds: float = 3.0) -> None:
     """OBSERVE the database's state. Repair NOTHING. For health checks only.
 
-    THE HEALTH CHECK MUST NOT BE A REPAIR PATH. `/health` used to call
+    A HEALTH CHECK MUST NOT BE A REPAIR PATH. `/health` used to call
     `ensure_database_ready` (below), which reconnects and resets pool state
-    before answering — so it reported the health of its own repair attempt,
-    not what request handlers actually see.
+    before answering — so it reported the health of its own repair attempt
+    rather than what request handlers see. Driven on the pre-fix commit: with
+    the shared `database` disconnected, `/health` answered 200 five times out
+    of five, `db_ok: true`, having silently reconnected on the first poll.
 
-    That cost 12.5 hours of production on 2026-08-05/06: startup had left the
-    app in degraded mode (main.py keeps the service up when the initial
-    connect fails), so every DB-backed request raised
-    `AssertionError: DatabaseBackend is not running` and returned 500 —
-    agent product search, promotions, all of it — while `/health` kept
-    answering 200 because it reconnected each time it was asked. Railway's
-    healthcheck points at `/health`, so nothing ever restarted the container,
-    and background jobs (which call `database.connect()` with no timeout)
-    hung holding their `max_instances=1` slots. The outage was total and
-    invisible at the same time.
+    An indicator that repairs what it measures cannot be trusted to reveal an
+    outage, which matters because Railway's healthcheck points at `/health`.
+    (The 12.5-hour outage of 2026-08-05/06 — `AssertionError: DatabaseBackend
+    is not running` on every DB-backed request while `/health` stayed green —
+    is what sent us looking here. Review round 16 could NOT reproduce that
+    exact combination from this code path, so treat the connection as
+    motivation, not as an established root cause: the mechanism that kept
+    /health green for 12.5 hours is still unidentified.)
 
-    So: this function connects nothing and resets nothing. If the shared
-    `database` is not connected, that IS the answer, and the caller must
-    report unhealthy so the platform can act. Request-time recovery is a
-    separate concern and stays where it belongs — `ensure_database_ready`,
-    still called by the auth/quote/order paths.
+    This function connects nothing and resets nothing: if the shared
+    `database` is not connected, that IS the answer. Repair is a separate
+    concern with two homes, both deliberate: `ensure_database_ready` on the
+    request paths, and `run_database_reconnect_supervisor` for the unattended
+    case — because read-only traffic must not depend on someone logging in
+    for the process to recover.
     """
     if not getattr(database, "is_connected", False):
         raise DatabaseUnavailableError(
@@ -158,3 +159,60 @@ async def ensure_database_ready(
         if is_asyncpg_busy_error(exc.__cause__ or exc):
             _force_mark_database_disconnected()
         raise
+
+
+DEFAULT_RECONNECT_SUPERVISOR_INTERVAL_SECONDS = 30.0
+
+
+async def run_database_reconnect_supervisor(
+    *,
+    interval_seconds: float = DEFAULT_RECONNECT_SUPERVISOR_INTERVAL_SECONDS,
+    max_cycles: Optional[int] = None,
+) -> None:
+    """Reconnect a degraded process without waiting for the right request.
+
+    WHY THIS EXISTS. Startup deliberately continues when the initial DB
+    connect fails (main.py: "keep the service up"), and nothing used to walk
+    that back except `/health` reconnecting as a side effect of being polled.
+    Removing that side effect (see `probe_database_health`) would otherwise
+    leave exactly one class of repair: `ensure_database_ready`, called only
+    from POST /auth/login, /quotes/preview, /orders/create and
+    /orders/payment/confirm. A process serving only READ traffic — agent
+    product search, promotions — would then stay broken indefinitely, which
+    is strictly worse than the accidental heal it replaced. Review round 16
+    on PR #1683 drove exactly that regression; this closes it.
+
+    DELIBERATELY NOT AN APSCHEDULER JOB. During the 2026-08-05/06 incident
+    every scheduler job sat at "maximum number of running instances reached"
+    because jobs call `database.connect()` with no timeout and hang forever.
+    A repair mechanism must not share fate with the thing it repairs, so this
+    is a plain asyncio task owned by the app lifespan, and every DB call it
+    makes is timeout-bounded via `ensure_database_ready`.
+
+    Never raises: a supervisor that dies on an unexpected error is a
+    supervisor that silently stops supervising. `max_cycles` exists so tests
+    can drive a bounded number of iterations.
+    """
+    cycles = 0
+    while max_cycles is None or cycles < max_cycles:
+        cycles += 1
+        try:
+            await asyncio.sleep(interval_seconds)
+        except asyncio.CancelledError:
+            raise
+
+        if getattr(database, "is_connected", False):
+            continue
+
+        try:
+            await ensure_database_ready()
+            logger.warning(
+                "database reconnect supervisor: restored a disconnected backend"
+            )
+        except DatabaseUnavailableError as exc:
+            logger.warning(
+                "database reconnect supervisor: still unavailable",
+                extra={"phase": exc.phase, "error_type": exc.error_type},
+            )
+        except Exception:  # noqa: BLE001 — must outlive every failure mode
+            logger.exception("database reconnect supervisor: unexpected error")

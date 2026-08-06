@@ -22,6 +22,7 @@ cannot collapse the two back together.
 from __future__ import annotations
 
 import asyncio
+import time
 
 import pytest
 from fastapi.testclient import TestClient
@@ -123,11 +124,19 @@ async def test_probe_reports_instead_of_hanging_when_the_query_stalls(
     spy = StallingDatabase(connected=True)
     monkeypatch.setattr(readiness, "database", spy)
 
+    started = time.monotonic()
     with pytest.raises(DatabaseUnavailableError) as excinfo:
         await readiness.probe_database_health(probe_timeout_seconds=0.05)
+    elapsed = time.monotonic() - started
 
     assert excinfo.value.phase == "probe"
-    assert excinfo.value.error_type in {"TimeoutError", "CancelledError"}
+    # Exactly TimeoutError: `except Exception` cannot see CancelledError on
+    # 3.11 (it derives from BaseException), so accepting it would be a value
+    # that can never occur (round-16 finding).
+    assert excinfo.value.error_type == "TimeoutError"
+    # Wall-clock bound: without it, a lost timeout still "fails" but only
+    # after the full 30s sleep — the suite hangs instead of reporting.
+    assert elapsed < 1.0, f"probe ignored its timeout ({elapsed:.2f}s)"
 
 
 def test_health_endpoint_reports_503_when_the_backend_is_disconnected(
@@ -138,11 +147,11 @@ def test_health_endpoint_reports_503_when_the_backend_is_disconnected(
     from main import app
 
     with TestClient(app) as client:
-        # Baseline on db_ok, not on the status code: this suite runs against
-        # SQLite where the schema guard legitimately reports missing tables,
-        # so /health is 503 for a reason unrelated to connectivity. db_ok is
-        # the field this change governs.
-        baseline = client.get("/health").json()
+        # Baseline: a live backend must read healthy through the REAL route,
+        # so the 503 below is attributable to connectivity and nothing else.
+        baseline_resp = client.get("/health")
+        baseline = baseline_resp.json()
+        assert baseline_resp.status_code == 200, baseline
         assert baseline["db_ok"] is True, "baseline: a live DB must read as ok"
 
         spy = SpyDatabase(connected=False)
@@ -166,11 +175,106 @@ def test_health_endpoint_reports_503_when_the_backend_is_disconnected(
     assert spy.connect_calls == 0, "/health tried to repair the database"
 
 
+@pytest.mark.asyncio
+async def test_supervisor_reconnects_a_degraded_process_without_any_traffic(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """THE REGRESSION GUARD FOR ROUND 16. Making /health honest removed the
+    accidental heal it performed when polled; the only remaining repair path
+    is `ensure_database_ready`, reachable ONLY from POST login/quote/order.
+    A process serving read-only traffic (agent product search, promotions —
+    the endpoints that actually failed) would otherwise stay broken forever.
+    The supervisor must restore it with NO request at all."""
+    spy = SpyDatabase(connected=False)
+    monkeypatch.setattr(readiness, "database", spy)
+
+    await readiness.run_database_reconnect_supervisor(
+        interval_seconds=0.01, max_cycles=1
+    )
+
+    assert spy.connect_calls == 1, (
+        "the supervisor did not reconnect a disconnected backend — a "
+        "read-only process can never recover")
+    assert spy.is_connected is True
+
+
+@pytest.mark.asyncio
+async def test_supervisor_leaves_a_healthy_backend_alone(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """It must not churn a working pool — no connect, no probe."""
+    spy = SpyDatabase(connected=True)
+    monkeypatch.setattr(readiness, "database", spy)
+
+    await readiness.run_database_reconnect_supervisor(
+        interval_seconds=0.01, max_cycles=3
+    )
+
+    assert spy.connect_calls == 0 and spy.disconnect_calls == 0
+    assert spy.execute_calls == 0, "supervisor probed a healthy backend"
+
+
+@pytest.mark.asyncio
+async def test_supervisor_survives_a_failing_reconnect_and_keeps_trying(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A supervisor that dies on an error stops supervising — silently. It
+    must outlive both a clean DatabaseUnavailableError and an unexpected
+    exception, and still be trying on the next cycle."""
+
+    class ExplodingDatabase(SpyDatabase):
+        async def connect(self):
+            self.connect_calls += 1
+            raise RuntimeError("connection refused")
+
+    spy = ExplodingDatabase(connected=False)
+    monkeypatch.setattr(readiness, "database", spy)
+
+    await readiness.run_database_reconnect_supervisor(
+        interval_seconds=0.01, max_cycles=3
+    )
+
+    assert spy.connect_calls == 3, (
+        "the supervisor stopped after a failure — it must keep trying")
+
+
+@pytest.mark.asyncio
+async def test_supervisor_is_cancellable_for_clean_shutdown() -> None:
+    """The lifespan cancels it on shutdown; it must not swallow that."""
+    task = asyncio.create_task(
+        readiness.run_database_reconnect_supervisor(interval_seconds=5)
+    )
+    await asyncio.sleep(0.05)
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+
+
+def test_the_supervisor_is_wired_into_the_app_lifespan_not_the_scheduler():
+    """It must be owned by the lifespan, NOT APScheduler: during the incident
+    every scheduler job sat at 'maximum number of running instances reached',
+    and a repair mechanism must not share fate with what it repairs."""
+    import inspect
+
+    import main
+    import services.audit_scheduler as scheduler
+
+    lifespan_src = inspect.getsource(main.app_lifespan)
+    assert "run_database_reconnect_supervisor" in lifespan_src, (
+        "the reconnect supervisor is not started by the app lifespan")
+    assert "cancel()" in lifespan_src, "the supervisor is never cancelled"
+    assert "run_database_reconnect_supervisor" not in inspect.getsource(scheduler), (
+        "the supervisor was moved into APScheduler — during the incident "
+        "every scheduler job was wedged; it must not share that fate")
+
+
 def test_request_paths_keep_their_recovery_helper():
     """Reporting the truth must not cost the app its ability to heal: the
     request-time recovery path stays where it belongs. If a refactor points
     these at the observe-only probe, live traffic loses reconnection."""
+    import ast
     import inspect
+    import textwrap
 
     import routes.auth as auth_routes
     import routes.order_routes as order_routes
@@ -182,6 +286,18 @@ def test_request_paths_keep_their_recovery_helper():
 
     import main
 
-    assert not hasattr(main, "ensure_database_ready"), (
-        "main imports the REPAIRING helper again — /health must observe only")
-    assert "probe_database_health" in inspect.getsource(main.health_check)
+    # Pin the CALL inside the health path — not main's import list, and not
+    # any mention of the name. Two earlier versions of this assertion were
+    # false positives: `not hasattr(main, "ensure_database_ready")` rejected a
+    # legitimate reconnect-supervisor import (round-16 finding), and a bare
+    # substring check tripped on the docstring that explains where recovery
+    # lives. AST, so prose can never decide whether this passes.
+    tree = ast.parse(textwrap.dedent(inspect.getsource(main.health_check)))
+    called = {
+        node.func.id
+        for node in ast.walk(tree)
+        if isinstance(node, ast.Call) and isinstance(node.func, ast.Name)
+    }
+    assert "probe_database_health" in called, "/health stopped observing"
+    assert "ensure_database_ready" not in called, (
+        "/health calls the REPAIRING helper again — it must observe only")

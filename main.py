@@ -7,7 +7,7 @@ FastAPI application with comprehensive dashboard and real-time metrics
 import asyncio
 import logging
 import time
-from contextlib import asynccontextmanager
+from contextlib import asynccontextmanager, suppress
 from datetime import datetime, timezone
 from functools import lru_cache
 import uvicorn
@@ -41,7 +41,11 @@ except ModuleNotFoundError:
 import subprocess
 import os
 from pathlib import Path
-from utils.database_readiness import DatabaseUnavailableError, probe_database_health
+from utils.database_readiness import (
+    DatabaseUnavailableError,
+    probe_database_health,
+    run_database_reconnect_supervisor,
+)
 
 SERVICE_STARTED_AT = datetime.now(timezone.utc).replace(microsecond=0).isoformat().replace("+00:00", "Z")
 SERVICE_NAME = (os.getenv("PIVOTA_SERVICE_NAME") or os.getenv("SERVICE_NAME") or "pivota-backend").strip() or "pivota-backend"
@@ -1786,9 +1790,20 @@ async def shutdown():
 async def app_lifespan(_app: FastAPI):
     await startup_event()
     await startup()
+    # Unattended DB repair. /health no longer reconnects as a side effect of
+    # being polled (see utils.database_readiness.probe_database_health), and
+    # ensure_database_ready only runs on login/quote/order requests — so a
+    # process serving read-only traffic had no way back from a degraded
+    # start. This task is the way back. It is NOT an APScheduler job on
+    # purpose: during the 2026-08-05/06 incident every scheduler job was
+    # wedged, and a repair mechanism must not share fate with what it repairs.
+    reconnect_supervisor = asyncio.create_task(run_database_reconnect_supervisor())
     try:
         yield
     finally:
+        reconnect_supervisor.cancel()
+        with suppress(asyncio.CancelledError):
+            await reconnect_supervisor
         await shutdown()
         await shutdown_event()
 
