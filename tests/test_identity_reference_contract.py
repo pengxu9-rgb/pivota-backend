@@ -117,20 +117,27 @@ def test_the_live_mint_path_still_emits_ext_keys():
     line, which a comment naming the function — or the call moved inside
     `if False:` — satisfied just as well.
     """
-    from services.catalog_enrichment_agent.ingestion import (
-        SYNTHETIC_MERCHANT_ID,
-        _build_pdp_insert,
+    from services.catalog_enrichment_agent.ingestion import _build_pdp_insert
+    from services.seller_identity import (
+        BANNED_BUCKET_MERCHANT_ID,
+        resolve_seed_seller_identity,
     )
 
+    seller = resolve_seed_seller_identity(brand="COSRX", domain="cosrx.com")
     row = _build_pdp_insert(
         pdp_payload={"brand": "COSRX", "product_name": "Snail Mucin Essence"},
         offers=[],
         source_jsonl=None,
+        seller=seller,
     )
     assert row["product_key"].startswith("ext:"), row["product_key"]
-    # And the merchant is the ADR-009-banned sentinel, which is WHY a `prod::`
-    # key cannot be minted here today (it would bake the sentinel into the key).
-    assert row["merchant_id"] == SYNTHETIC_MERCHANT_ID == "external_seed"
+    # W2 (2026-08-06) migrated this contract: the merchant column is now the
+    # OBSERVED SELLER OF RECORD, never the banned sentinel. The `ext:` key
+    # format survives for its own reason — keys are opaque storage tokens
+    # (ADR-009 D4.2) and the derivation inputs are deliberately untouched, so
+    # the key never bakes ANY merchant in, old or new.
+    assert row["merchant_id"] == seller["merchant_id"]
+    assert row["merchant_id"] != BANNED_BUCKET_MERCHANT_ID
 
 
 def test_live_code_treats_ext_as_canonical_not_as_residue():

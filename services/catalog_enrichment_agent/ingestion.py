@@ -45,6 +45,10 @@ from services.beauty_external_ranking import (
 from services.category_kind import resolve_category_kind
 from services.catalog_identity import make_content_key
 from services.catalog_sync_service import make_pivota_canonical_fields
+from services.seller_identity import (
+    BANNED_BUCKET_MERCHANT_ID,
+    resolve_seed_seller_identity,
+)
 from services.pdp_lifecycle import compute_lifecycle_stage
 from services.pdp_taxonomy import derive_taxonomy_v1
 from services.strong_identifier import (
@@ -227,6 +231,7 @@ def _build_pdp_insert(
     pdp_payload: Dict[str, Any],
     offers: List[Dict[str, Any]],
     source_jsonl: Optional[str],
+    seller: Dict[str, str],
 ) -> Dict[str, Any]:
     """Construct the catalog_products row dict that the runner will
     INSERT. The product_key is deterministic so re-runs UPSERT cleanly."""
@@ -256,7 +261,12 @@ def _build_pdp_insert(
     }
     return {
         "product_key": product_key,
-        "merchant_id": SYNTHETIC_MERCHANT_ID,
+        # W2: seller of record (retailer domains key on etld1 alone;
+        # brand-direct on (brand, etld1)). product_key and the pivota_* sig
+        # fields keep their historical derivation inputs above — sigs are
+        # write-once (T5) and keys are opaque plumbing (D4.2); only the
+        # ownership column changes.
+        "merchant_id": seller["merchant_id"],
         "platform": SYNTHETIC_PLATFORM,
         "source_product_id": source_product_id,
         "pivota_signature_id": pivota_fields["pivota_signature_id"],
@@ -520,6 +530,7 @@ def _build_sku_insert(
     pdp_payload: Dict[str, Any],
     canonical_url: Optional[str],
     image_url: Optional[str],
+    seller: Dict[str, str],
 ) -> Dict[str, Any]:
     """One row per PDP. The SKU mirrors the PDP's identity (no variant
     axes), which lets canonical recall JOIN through catalog_skus to
@@ -545,7 +556,9 @@ def _build_sku_insert(
     return {
         "sku_key": sku_key,
         "product_key": product_key,
-        "merchant_id": SYNTHETIC_MERCHANT_ID,
+        # W2: the row rides under its seller of record. The sku_key /
+        # source_variant_id derivations are untouched storage tokens.
+        "merchant_id": seller["merchant_id"],
         "platform": SYNTHETIC_PLATFORM,
         "source_product_id": canonical_product_name(
             pdp_payload["brand"], pdp_payload["product_name"]
@@ -711,14 +724,51 @@ def ingest_validated_record(record: Dict[str, Any], *, source_jsonl: Optional[st
         # Record without any validated offer is not actionable —
         # we don't create empty PDPs.
         return None
-    pdp_row = _build_pdp_insert(pdp_payload=pdp_payload, offers=offers, source_jsonl=source_jsonl)
+    # W2 (ADR-011 R5 closure): resolve the seller of record BEFORE building any
+    # row. Retailer domains key on etld1 alone; brand-direct keys on
+    # (brand, etld1). Unresolvable -> the record is BLOCKED (skipped loudly and
+    # retried on a later run) — never landed in the 'external_seed' bucket,
+    # which is a retiring legacy population, not a landing zone (founder rule).
+    # The seller derives from the PDP's OWN source_domain, never from
+    # "whichever offer happens to be first" — that would make the identity
+    # order-dependent, a fallback producing wrong-but-plausible sellers. A PDP
+    # that cannot name where it came from cannot name its seller: blocked.
+    try:
+        seller = resolve_seed_seller_identity(
+            brand=pdp_payload.get("brand"), domain=pdp_payload.get("source_domain")
+        )
+    except ValueError as exc:
+        return {"skipped_reason": f"seller_of_record_unresolved: {exc}"}
+    pdp_row = _build_pdp_insert(
+        pdp_payload=pdp_payload, offers=offers, source_jsonl=source_jsonl, seller=seller
+    )
     sku_row = _build_sku_insert(
         product_key=pdp_row["product_key"],
         pdp_payload=pdp_payload,
         canonical_url=pdp_row.get("canonical_url"),
         image_url=pdp_row.get("image_url"),
+        seller=seller,
     )
     merchant_rows = _build_merchant_upserts(offers)
+    # The observed seller-of-record row rides in the same merchants list so the
+    # FK order (merchants -> products) already holds. `_ensure_only` tells apply
+    # to insert-if-missing with claimed-attach — NEVER the clobbering upsert,
+    # whose `status = EXCLUDED.status` would downgrade a graduated merchant.
+    merchant_rows = merchant_rows + [{
+        "merchant_id": seller["merchant_id"],
+        "merchant_name": seller["merchant_name"],
+        "primary_platform": MERCHANT_PLATFORM,
+        "status": "observed",
+        "source_system": AGENT_VERSION,
+        "source_ref": seller["registrable"],
+        "metadata_json": json.dumps({
+            "observed": True,
+            "minted_by": "catalog_enrichment_agent.ingestion (W2)",
+            "adr": "ADR-009-D2",
+            "seller_identity": {"kind": seller["kind"], "etld1": seller["registrable"]},
+        }),
+        "_ensure_only": True,
+    }]
     offer_rows = _build_offer_inserts(
         product_key=pdp_row["product_key"],
         sku_key=sku_row["sku_key"],
@@ -791,10 +841,16 @@ def ingest_validated_jsonl(
     inci_rows: List[Dict[str, Any]] = []
     audit_reasons: Dict[str, int] = {}
     skipped = 0
+    skipped_reasons: Dict[str, int] = {}
     for record in rows:
         result = ingest_validated_record(record, source_jsonl=source_jsonl)
         if result is None:
             skipped += 1
+            continue
+        if result.get("skipped_reason"):
+            skipped += 1
+            reason = str(result["skipped_reason"]).split(":")[0]
+            skipped_reasons[reason] = skipped_reasons.get(reason, 0) + 1
             continue
         pdp_rows.append(result["pdp"])
         sku_rows.append(result["sku"])
@@ -823,5 +879,6 @@ def ingest_validated_jsonl(
         "seeds": _dedupe(seed_rows, "id"),
         "incis": _dedupe(inci_rows, "sku_key"),
         "skipped": skipped,
+        "skipped_reasons": skipped_reasons,
         "audit_reasons": audit_reasons,
     }

@@ -36,6 +36,10 @@ def _record(*, brand: str = "MAC", product_name: str = "Ruby Woo Matte Lipstick"
             "product_name": product_name,
             "category_path": "beauty/makeup/lip/lipstick",
             "attribute_summary": "matte, retro red",
+            # W2: the seller of record derives from the PDP's own source_domain
+            # (real enrichment payloads always carry it — the crawler knows
+            # where it fetched). Overridable via **extras.
+            "source_domain": "maccosmetics.com",
             **extras,
         },
         "offers": offers if offers is not None else [
@@ -281,7 +285,14 @@ def test_ingest_jsonl_dedupes_pdps_across_records():
     assert len(out["skus"]) == 1
     assert len(out["seeds"]) == 2
     assert len(out["offers"]) == 2
-    assert len(out["merchants"]) == 2
+    # W2: the offer-space merchants (agent_seed::mac, agent_seed::sephora) plus
+    # ONE observed seller of record for the product row (deduped across both
+    # records — same brand+domain resolves the same identity).
+    offer_space = [m for m in out["merchants"] if not m.get("_ensure_only")]
+    sellers_of_record = [m for m in out["merchants"] if m.get("_ensure_only")]
+    assert len(offer_space) == 2
+    assert len(sellers_of_record) == 1
+    assert sellers_of_record[0]["merchant_id"] == out["pdps"][0]["merchant_id"]
     assert out["skipped"] == 0
     assert out["seeds"][0]["attached_product_key"] == out["pdps"][0]["product_key"]
     assert out["offers"][0]["product_key"] == out["pdps"][0]["product_key"]
@@ -434,8 +445,13 @@ def test_ingest_record_collapses_two_mac_offers_into_one_merchant():
     result = ingest_validated_record(record)
     assert result is not None
     assert len(result["offers"]) == 2
-    assert len(result["merchants"]) == 1
-    assert result["merchants"][0]["merchant_name"] == "MAC"
+    # W2: one offer-space merchant plus the product's observed seller of record.
+    offer_space = [m for m in result["merchants"] if not m.get("_ensure_only")]
+    assert len(offer_space) == 1
+    assert offer_space[0]["merchant_name"] == "MAC"
+    sellers_of_record = [m for m in result["merchants"] if m.get("_ensure_only")]
+    assert len(sellers_of_record) == 1
+    assert sellers_of_record[0]["merchant_id"] == result["pdp"]["merchant_id"]
 
 
 def test_ingest_record_routes_offers_to_distinct_merchants():
@@ -456,10 +472,14 @@ def test_ingest_record_routes_offers_to_distinct_merchants():
     ])
     result = ingest_validated_record(record)
     assert result is not None
-    merchant_ids = {m["merchant_id"] for m in result["merchants"]}
+    # W2: the OFFER space still routes per retailer; the product row rides
+    # separately under its observed seller of record.
+    offer_space_ids = {m["merchant_id"] for m in result["merchants"] if not m.get("_ensure_only")}
     offer_merchant_ids = {o["merchant_id"] for o in result["offers"]}
-    assert len(merchant_ids) == 2
-    assert merchant_ids == offer_merchant_ids
+    assert len(offer_space_ids) == 2
+    assert offer_space_ids == offer_merchant_ids
+    sellers_of_record = [m for m in result["merchants"] if m.get("_ensure_only")]
+    assert len(sellers_of_record) == 1
 
 
 def test_offer_handles_out_of_stock_and_missing_price():

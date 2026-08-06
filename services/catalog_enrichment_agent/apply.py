@@ -347,6 +347,68 @@ async def _apply_inci_rows(
     return counts
 
 
+_ENSURE_MERCHANT_INSERT_SQL = """
+                INSERT INTO catalog_merchants
+                  (merchant_id, merchant_name, primary_platform, status,
+                   source_system, source_ref, metadata_json)
+                VALUES
+                  (:merchant_id, :merchant_name, :primary_platform, :status,
+                   :source_system, :source_ref, CAST(:metadata_json AS jsonb))
+                ON CONFLICT (merchant_id) DO NOTHING
+                """
+
+
+async def _prepare_seller_of_record(plan: Dict[str, Any], database: Any) -> Dict[str, Any]:
+    """W2 apply-time seller handling, applied to BOTH executors.
+
+    1. TRIPWIRE (ADR-009 D2, write boundary): refuse the whole plan if any
+       product/sku row still carries the banned 'external_seed' bucket. The
+       resolver makes this impossible; the ban is load-bearing, so it is
+       asserted where the write happens, not trusted to the resolver.
+    2. `_ensure_only` merchant rows (the observed sellers of record):
+       - attach beats mint: a VERIFIED brand_claims tenant for the registrable
+         domain takes the rows — product/sku merchant_id is remapped to the
+         claimed merchant and no observed row is written;
+       - otherwise insert-if-missing (ON CONFLICT DO NOTHING). Never the
+         clobbering upsert: its `status = EXCLUDED.status` would downgrade a
+         merchant that has graduated beyond 'observed'.
+    """
+    from services.seller_identity import (
+        BANNED_BUCKET_MERCHANT_ID,
+        _resolve_claimed_merchant,
+    )
+
+    pdps = plan.get("pdps") or []
+    skus = plan.get("skus") or []
+    for row in list(pdps) + list(skus):
+        if str(row.get("merchant_id") or "") == BANNED_BUCKET_MERCHANT_ID:
+            raise RuntimeError(
+                "ADR-009 D2 violation: refusing to write a product/sku row "
+                f"under the banned '{BANNED_BUCKET_MERCHANT_ID}' bucket "
+                f"(product_key={row.get('product_key')!r})"
+            )
+
+    merchants = plan.get("merchants") or []
+    passthrough: list = []
+    for merchant in merchants:
+        if not merchant.get("_ensure_only"):
+            passthrough.append(merchant)
+            continue
+        observed_id = str(merchant.get("merchant_id") or "")
+        registrable = str(merchant.get("source_ref") or "")
+        claimed = await _resolve_claimed_merchant(registrable) if registrable else None
+        if claimed and claimed != observed_id:
+            for row in list(pdps) + list(skus):
+                if row.get("merchant_id") == observed_id:
+                    row["merchant_id"] = claimed
+            continue  # tenant identity attaches; no observed row is written
+        params = {k: v for k, v in merchant.items() if k != "_ensure_only"}
+        await database.execute(_ENSURE_MERCHANT_INSERT_SQL, params)
+    plan = dict(plan)
+    plan["merchants"] = passthrough
+    return plan
+
+
 async def apply_ingest_plan(
     plan: Dict[str, Any],
     *,
@@ -366,6 +428,8 @@ async def apply_ingest_plan(
     database = db or _global_db
     if not getattr(database, "is_connected", False):
         await database.connect()
+
+    plan = await _prepare_seller_of_record(plan, database)
 
     if batch:
         return await _apply_ingest_plan_batched(plan, batch_label=batch_label, database=database)
