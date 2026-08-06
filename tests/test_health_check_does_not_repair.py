@@ -239,6 +239,35 @@ async def test_supervisor_survives_a_failing_reconnect_and_keeps_trying(
 
 
 @pytest.mark.asyncio
+async def test_supervisor_survives_an_UNEXPECTED_exception_type(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The test above only reaches the DatabaseUnavailableError branch —
+    `ensure_database_ready` wraps connect failures into that type, so a
+    mutation deleting the catch-all `except Exception` SURVIVED the suite
+    (found by mutation M4 on this commit). The catch-all is the one that
+    matters: it is what stops an unforeseen error from silently ending
+    supervision for the life of the process."""
+    calls = {"n": 0}
+
+    async def exploding_ensure() -> None:
+        calls["n"] += 1
+        raise ValueError("something nobody predicted")
+
+    spy = SpyDatabase(connected=False)
+    monkeypatch.setattr(readiness, "database", spy)
+    monkeypatch.setattr(readiness, "ensure_database_ready", exploding_ensure)
+
+    await readiness.run_database_reconnect_supervisor(
+        interval_seconds=0.01, max_cycles=3
+    )
+
+    assert calls["n"] == 3, (
+        "an unexpected exception ended supervision — the process would stay "
+        "degraded forever with nothing left to repair it")
+
+
+@pytest.mark.asyncio
 async def test_supervisor_is_cancellable_for_clean_shutdown() -> None:
     """The lifespan cancels it on shutdown; it must not swallow that."""
     task = asyncio.create_task(
