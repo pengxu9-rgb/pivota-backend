@@ -1802,7 +1802,10 @@ async def app_lifespan(_app: FastAPI):
         yield
     finally:
         reconnect_supervisor.cancel()
-        with suppress(asyncio.CancelledError):
+        # Suppress Exception too, not only CancelledError: anything else
+        # escaping this await propagates out of the finally and SKIPS
+        # shutdown()/shutdown_event() entirely (review round 20).
+        with suppress(asyncio.CancelledError, Exception):
             await reconnect_supervisor
         await shutdown()
         await shutdown_event()

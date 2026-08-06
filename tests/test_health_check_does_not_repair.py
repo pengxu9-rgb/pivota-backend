@@ -331,6 +331,185 @@ async def test_supervisor_reconnect_is_timeout_bounded(
         "unbounded await is what wedged every scheduler job in the incident")
 
 
+class _FakePool:
+    def __init__(self, closed: bool = False):
+        self._closed = closed
+
+
+def _with_pool(spy, pool):
+    """Give a spy DB the `_backend._pool` shape `_pool_is_provably_dead` reads."""
+
+    class _Backend:
+        pass
+
+    backend = _Backend()
+    backend._pool = pool
+    spy._backend = backend
+    return spy
+
+
+@pytest.mark.asyncio
+async def test_supervisor_recovers_a_dead_pool_behind_a_connected_flag(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """ROUND-20 F1. `is_connected=True` with `_pool=None` is the OTHER producer
+    of the incident's own `AssertionError: DatabaseBackend is not running`, and
+    an earlier version of this supervisor skipped it forever — a regression
+    against the parent, which recovered it on any /health poll. It is a LOCAL
+    fact (the pool object is gone), not an inference from a timed probe, so
+    acting on it cannot destroy live work."""
+    spy = _with_pool(SpyDatabase(connected=True), None)
+    monkeypatch.setattr(readiness, "database", spy)
+
+    await readiness.run_database_reconnect_supervisor(
+        interval_seconds=0.01, max_cycles=1
+    )
+
+    assert spy.connect_calls == 1, (
+        "a provably dead pool behind a connected flag was not recovered")
+    assert spy.is_connected is True
+
+
+@pytest.mark.asyncio
+async def test_supervisor_recovers_a_closed_pool_behind_a_connected_flag(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The client-side `InterfaceError: pool is closed` shape — also a local
+    fact (`pool._closed`), also recovered by the parent, also safe."""
+    spy = _with_pool(SpyDatabase(connected=True), _FakePool(closed=True))
+    monkeypatch.setattr(readiness, "database", spy)
+
+    await readiness.run_database_reconnect_supervisor(
+        interval_seconds=0.01, max_cycles=1
+    )
+
+    assert spy.connect_calls == 1, "a closed pool was not recovered"
+
+
+@pytest.mark.asyncio
+async def test_supervisor_ignores_a_live_pool_however_slow_it_is(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The line that must never move again. An OPEN pool on a healthy-but-slow
+    or saturated database is indistinguishable from a dead one without
+    guessing — and guessing is what destroyed live pools in rounds 18 and 19.
+    An open pool is left strictly alone."""
+    spy = _with_pool(SpyDatabase(connected=True), _FakePool(closed=False))
+    monkeypatch.setattr(readiness, "database", spy)
+
+    await readiness.run_database_reconnect_supervisor(
+        interval_seconds=0.01, max_cycles=3
+    )
+
+    assert spy.connect_calls == 0 and spy.disconnect_calls == 0, (
+        "the supervisor acted on a LIVE pool — this is how in-flight queries "
+        "got killed in rounds 18 and 19")
+    assert spy.execute_calls == 0, "the supervisor probed; it must not"
+
+
+@pytest.mark.asyncio
+async def test_supervisor_keeps_supervising_after_a_successful_reconnect(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """ROUND-20 F2 (surviving mutation: `return` after the first success). A
+    one-shot supervisor repairs the first degradation and never the second —
+    precisely the failure class this arc keeps re-inventing."""
+    spy = SpyDatabase(connected=False)
+    monkeypatch.setattr(readiness, "database", spy)
+
+    async def flap():
+        # Degrade again right after each successful reconnect.
+        for _ in range(3):
+            await asyncio.sleep(0.015)
+            spy.is_connected = False
+
+    flapper = asyncio.create_task(flap())
+    await readiness.run_database_reconnect_supervisor(
+        interval_seconds=0.01, max_cycles=4
+    )
+    flapper.cancel()
+
+    assert spy.connect_calls >= 2, (
+        f"the supervisor reconnected {spy.connect_calls} time(s) then stopped "
+        "— it must keep supervising for the life of the process")
+
+
+@pytest.mark.asyncio
+async def test_a_failed_reconnect_is_reported_as_a_failure(
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """ROUND-20 F2 (surviving mutation: failure swallowed inside the try, so
+    the success line logged on failures too). In a change whose whole thesis
+    is that an indicator must not lie, a failed reconnect must not be reported
+    as a reconnection."""
+
+    class RefusingDatabase(SpyDatabase):
+        async def connect(self) -> None:
+            self.connect_calls += 1
+            raise RuntimeError("connection refused")
+
+    spy = RefusingDatabase(connected=False)
+    monkeypatch.setattr(readiness, "database", spy)
+
+    with caplog.at_level("WARNING"):
+        await readiness.run_database_reconnect_supervisor(
+            interval_seconds=0.01, max_cycles=1
+        )
+
+    messages = " ".join(r.getMessage() for r in caplog.records)
+    assert "FAILED" in messages, "a failed reconnect was not reported"
+    assert "reconnected a dead backend" not in messages, (
+        "a FAILED reconnect logged the SUCCESS line — the log lies")
+
+
+def test_interval_is_clamped_at_both_ends(monkeypatch: pytest.MonkeyPatch):
+    """ROUND-20 F2/F4 (surviving mutation: clamp removed). 0 or negative would
+    turn the loop into a hot spin hammering `connect()` at a struggling
+    database; a finite-but-huge typo (86400) would silently retire the
+    supervisor with no log line."""
+    for raw in ("0", "-5", "0.001"):
+        monkeypatch.setenv("DB_RECONNECT_SUPERVISOR_INTERVAL_SECONDS", raw)
+        assert readiness._supervisor_interval() >= 1.0, (
+            f"{raw!r} produced a hot-spin interval")
+    for raw in ("86400", "1e9"):
+        monkeypatch.setenv("DB_RECONNECT_SUPERVISOR_INTERVAL_SECONDS", raw)
+        assert (readiness._supervisor_interval()
+                <= readiness.MAX_RECONNECT_SUPERVISOR_INTERVAL_SECONDS), (
+            f"{raw!r} silently retired the supervisor")
+    for raw in ("inf", "1e400", "nan", "abc"):
+        monkeypatch.setenv("DB_RECONNECT_SUPERVISOR_INTERVAL_SECONDS", raw)
+        assert (readiness._supervisor_interval()
+                == readiness.DEFAULT_RECONNECT_SUPERVISOR_INTERVAL_SECONDS)
+
+
+def test_pool_death_is_decided_by_local_facts_only():
+    """The classifier that replaced four rounds of probe-based inference."""
+    class _B:
+        pass
+
+    class _DB:
+        is_connected = True
+
+    db = _DB()
+    original = readiness.database
+    readiness.database = db
+    try:
+        db._backend = None
+        assert readiness._pool_is_provably_dead() is False, (
+            "no backend must not read as death")
+        b = _B(); b._pool = None; db._backend = b
+        assert readiness._pool_is_provably_dead() is True
+        b._pool = _FakePool(closed=True)
+        assert readiness._pool_is_provably_dead() is True
+        b._pool = _FakePool(closed=False)
+        assert readiness._pool_is_provably_dead() is False, (
+            "an OPEN pool must never read as dead — that is the inference "
+            "that destroyed live pools")
+    finally:
+        readiness.database = original
+
+
 @pytest.mark.asyncio
 async def test_supervisor_never_touches_a_connected_backend(
     monkeypatch: pytest.MonkeyPatch,

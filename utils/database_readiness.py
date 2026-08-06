@@ -185,9 +185,37 @@ async def ensure_database_ready(
 
 DEFAULT_RECONNECT_SUPERVISOR_INTERVAL_SECONDS = 30.0
 DEFAULT_RECONNECT_CONNECT_TIMEOUT_SECONDS = 10.0
+# Upper bound so a typo cannot silently retire the supervisor (review round 20).
+MAX_RECONNECT_SUPERVISOR_INTERVAL_SECONDS = 300.0
 
 _SUPERVISOR_ENABLED_ENV = "DB_RECONNECT_SUPERVISOR_ENABLED"
 _SUPERVISOR_INTERVAL_ENV = "DB_RECONNECT_SUPERVISOR_INTERVAL_SECONDS"
+
+
+def _pool_is_provably_dead() -> bool:
+    """True only when the pool object ITSELF says it cannot serve — no probe,
+    no timeout, no inference.
+
+    THIS IS THE DISTINCTION FOUR REVIEW ROUNDS FAILED TO DRAW. Every earlier
+    attempt decided liveness from a `SELECT 1` under a timeout, which cannot
+    tell a dead pool from a slow or saturated one — and repairing on that
+    guess destroyed healthy pools and killed in-flight queries. A pool that is
+    `None`, or whose own `_closed` flag is set, is dead as a matter of local
+    fact: there is nothing running on it to lose. Acting on that is safe in a
+    way acting on a probe result never was.
+
+    Deliberately NOT covered: a pool that exists and is open but whose
+    connections are unusable. Distinguishing that from a slow database
+    requires exactly the inference that kept going wrong, so it stays with
+    request-path recovery.
+    """
+    backend = getattr(database, "_backend", None)
+    if backend is None or not hasattr(backend, "_pool"):
+        return False
+    pool = getattr(backend, "_pool", None)
+    if pool is None:
+        return True
+    return bool(getattr(pool, "_closed", False))
 
 
 def _supervisor_enabled() -> bool:
@@ -208,6 +236,10 @@ def _supervisor_interval() -> float:
     # NaN and inf both survive float(); inf would wedge the loop on
     # asyncio.sleep(inf) with no log line, silently disabling the supervisor
     # (review round 19). Anything not finite falls back, loudly.
+    # NaN/inf survive float() and would wedge the loop on sleep(inf) with no
+    # log line. So would a finite-but-huge typo (86400 = once a day), which is
+    # the same silent-disable defect reachable by a plausible mistake — so the
+    # clamp has BOTH ends, like main.py's _health_timeout_seconds.
     if not (value == value) or value in (float("inf"), float("-inf")):
         logger.warning(
             "invalid %s=%r; using %.1fs",
@@ -215,7 +247,13 @@ def _supervisor_interval() -> float:
             DEFAULT_RECONNECT_SUPERVISOR_INTERVAL_SECONDS,
         )
         return DEFAULT_RECONNECT_SUPERVISOR_INTERVAL_SECONDS
-    return max(1.0, value)
+    clamped = min(max(1.0, value), MAX_RECONNECT_SUPERVISOR_INTERVAL_SECONDS)
+    if clamped != value:
+        logger.warning(
+            "%s=%r out of range; clamped to %.1fs",
+            _SUPERVISOR_INTERVAL_ENV, raw, clamped,
+        )
+    return clamped
 
 
 async def run_database_reconnect_supervisor(
@@ -235,11 +273,20 @@ async def run_database_reconnect_supervisor(
     specific hole and no other.
 
     ⚠️ DELIBERATELY NON-DESTRUCTIVE, AND THAT IS THE WHOLE DESIGN. It acts
-    only when `is_connected` is False — i.e. when there is no pool in use to
-    damage — and it calls `database.connect()`, never `ensure_database_ready`,
-    whose unconditional `finally: _force_mark_database_disconnected()` resets
-    pool state on a 3s-probe timeout that cannot distinguish a slow database
-    from a dead one.
+    only on LOCAL FACTS — the wrapper reports disconnected, or the pool object
+    is `None`/`_closed` (`_pool_is_provably_dead`) — never on a probe result.
+    And it calls `database.connect()`, never `ensure_database_ready`, whose
+    unconditional `finally: _force_mark_database_disconnected()` resets pool
+    state on a 3s-probe timeout that cannot tell a slow database from a dead
+    one.
+
+    WHY THAT IS SAFE, stated precisely: NOT "there is no pool in use" — after
+    `_force_mark_database_disconnected` the flag is False while an abandoned
+    pool may still be finishing in-flight queries, which is exactly why we
+    stopped calling `terminate()`. The safety is that `database.connect()`
+    builds a FRESH pool and never touches the old one, so live work on the
+    abandoned pool completes undisturbed (driven: 25 queries completed, same
+    pool object, zero killed).
 
     Four review rounds were spent trying to make a repairing supervisor safe
     (PR #1683, rounds 16-19). Each fix moved the destruction one layer further
@@ -249,12 +296,17 @@ async def run_database_reconnect_supervisor(
     killing 30 in-flight queries. The lesson kept: a destructive actuator must
     not hang off an inference drawn from one `SELECT 1` under a timeout.
 
-    KNOWN GAP, ACCEPTED. A backend that is `is_connected=True` with a dead
-    pool is NOT repaired here — only request traffic through
-    `ensure_database_ready` repairs that shape. Recovering it unattended needs
-    a decision procedure that can prove death without guessing, which is
-    separate work. This supervisor covers the degraded-START case, which is
-    the one the incident actually described.
+    COVERAGE, MEASURED (review round 20, real Postgres, zero request traffic):
+      * degraded start (`is_connected` False)      — RECOVERED
+      * `_pool` is None, flag True                 — RECOVERED (this is the
+        other producer of the incident's own `AssertionError: DatabaseBackend
+        is not running`)
+      * pool closed client-side (`InterfaceError`) — RECOVERED
+      * pool EXHAUSTED on a healthy database       — deliberately NOT touched
+    The last one is the whole point: it is indistinguishable from a slow
+    database without guessing, and guessing is what destroyed live pools in
+    rounds 18 and 19. Request traffic through `ensure_database_ready` remains
+    its only repair.
 
     NOT AN APSCHEDULER JOB: during the 2026-08-05/06 incident every scheduler
     job was wedged at max_instances, and a repair mechanism must not share
@@ -269,20 +321,34 @@ async def run_database_reconnect_supervisor(
 
         if not _supervisor_enabled():
             continue
-        if getattr(database, "is_connected", False):
+
+        # Two LOCAL facts, never a probe: the wrapper says disconnected, or
+        # the pool object itself is gone/closed. Both mean there is nothing
+        # live to damage. Anything else — including a pool whose connections
+        # are merely slow or exhausted — is left alone.
+        connected = getattr(database, "is_connected", False)
+        dead_pool = _pool_is_provably_dead()
+        if connected and not dead_pool:
             continue
+
+        if dead_pool and connected:
+            # `databases` skips connect() while the flag says connected, so
+            # the stale flag must be cleared or the reconnect is a no-op.
+            _force_mark_database_disconnected()
 
         try:
             await asyncio.wait_for(
                 database.connect(), timeout=connect_timeout_seconds
             )
-            logger.warning(
-                "database reconnect supervisor: reconnected a disconnected backend"
-            )
         except asyncio.CancelledError:
             raise
         except Exception as exc:  # noqa: BLE001 — must outlive every failure
             logger.warning(
-                "database reconnect supervisor: still unreachable (%s: %s)",
+                "database reconnect supervisor: reconnect FAILED (%s: %s)",
                 type(exc).__name__, exc,
             )
+            continue
+
+        logger.warning(
+            "database reconnect supervisor: reconnected a dead backend"
+        )
