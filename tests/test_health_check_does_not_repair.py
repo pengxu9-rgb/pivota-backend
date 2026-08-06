@@ -413,6 +413,110 @@ async def test_supervisor_recovers_a_closed_pool_behind_a_connected_flag(
 
 
 @pytest.mark.asyncio
+async def test_supervisor_recovers_the_MIRROR_stale_shape_open_pool_flag_false(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """ROUND-21 F1. Two stale shapes exist and they break connect() in
+    opposite ways. The other one — `is_connected` False while `_pool` is still
+    set — makes `PostgresBackend.connect()`'s `assert self._pool is None`
+    raise "DatabaseBackend is already running", wedging EVERY later cycle
+    silently. An earlier version cleared only the flag-True shape, which is
+    this arc's signature mistake: fixing one of two symmetric cases."""
+    cleared = {"n": 0}
+    real_clear = readiness._force_mark_database_disconnected
+
+    def counting_clear():
+        cleared["n"] += 1
+        real_clear()
+
+    spy = _with_pool(RealisticSpyDatabase(connected=False), _FakePool(closed=False))
+    monkeypatch.setattr(readiness, "database", spy)
+    monkeypatch.setattr(
+        readiness, "_force_mark_database_disconnected", counting_clear)
+
+    await readiness.run_database_reconnect_supervisor(
+        interval_seconds=0.01, max_cycles=1
+    )
+
+    assert cleared["n"] == 1, (
+        "stale pool state was not cleared before reconnecting — the real "
+        "backend would raise 'DatabaseBackend is already running' and the "
+        "supervisor would wedge forever")
+    assert spy.real_connects == 1
+
+
+def test_asyncpg_still_exposes_the_attribute_this_depends_on():
+    """ROUND-21 F2. `_pool_is_provably_dead` reads `pool._closed`, which is
+    asyncpg PRIVATE API, and asyncpg is unpinned. If it is renamed or dropped,
+    `getattr(pool, "_closed", False)` returns False forever: the closed-pool
+    arm silently disappears and every test here stays green — the round-19
+    shape (untested by construction) relocated to a dependency boundary. Bind
+    the invariant to the real class so the upgrade fails loudly instead."""
+    import asyncpg.pool
+
+    slots = getattr(asyncpg.pool.Pool, "__slots__", ())
+    assert "_closed" in slots, (
+        "asyncpg.pool.Pool no longer defines `_closed` — "
+        "_pool_is_provably_dead's closed-pool arm is now silently dead. "
+        "Re-derive it (Pool.is_closing() also folds in _closing, which this "
+        "design deliberately treats as ALIVE) before shipping.")
+
+
+@pytest.mark.asyncio
+async def test_kill_switch_takes_effect_MID_RUN_without_a_restart(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """ROUND-21 F4 (surviving mutation: hoisting the check out of the loop).
+    Its whole purpose is stopping a misbehaving supervisor WITHOUT a redeploy,
+    so it must be re-read every cycle — a test that sets the env before
+    starting cannot tell the difference."""
+    monkeypatch.delenv("DB_RECONNECT_SUPERVISOR_ENABLED", raising=False)
+    spy = RealisticSpyDatabase(connected=False)
+    monkeypatch.setattr(readiness, "database", spy)
+
+    async def disable_after_first_cycle():
+        await asyncio.sleep(0.025)
+        monkeypatch.setenv("DB_RECONNECT_SUPERVISOR_ENABLED", "false")
+        # Degrade again: without the kill switch the supervisor would recover
+        # it, so any further reconnect proves the switch was not re-read.
+        spy.is_connected = False
+
+    flipper = asyncio.create_task(disable_after_first_cycle())
+    await readiness.run_database_reconnect_supervisor(
+        interval_seconds=0.01, max_cycles=6
+    )
+    flipper.cancel()
+
+    assert spy.real_connects == 1, (
+        f"{spy.real_connects} reconnects — the kill switch was resolved once "
+        "at startup, so flipping it in production would need a redeploy")
+
+
+def test_lifespan_shutdown_survives_a_supervisor_that_raises():
+    """ROUND-21 F3 (surviving mutation: suppress(CancelledError) only). Any
+    other exception escaping that await propagates out of the lifespan's
+    `finally` and SKIPS shutdown()/shutdown_event() — the app would leak its
+    connections and scheduler on every restart."""
+    import ast
+    import inspect
+    import textwrap
+
+    import main
+
+    tree = ast.parse(textwrap.dedent(inspect.getsource(main.app_lifespan)))
+    suppressed = set()
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Call) and getattr(node.func, "id", "") == "suppress":
+            for arg in node.args:
+                suppressed.add(ast.unparse(arg))
+
+    assert "asyncio.CancelledError" in suppressed
+    assert "Exception" in suppressed, (
+        "only CancelledError is suppressed — a supervisor raising anything "
+        "else skips shutdown() entirely")
+
+
+@pytest.mark.asyncio
 async def test_supervisor_ignores_a_live_pool_however_slow_it_is(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
