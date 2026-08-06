@@ -200,6 +200,199 @@ async def test_supervisor_reconnects_a_degraded_process_without_any_traffic(
     assert spy.is_connected is True
 
 
+class SlowDatabase(SpyDatabase):
+    """A HEALTHY backend that simply answers slowly — the shape that makes
+    'probe timed out' ambiguous. No test could express this before round 18,
+    which is exactly why the destructive-repair-on-timeout bug shipped."""
+
+    def __init__(self, *, latency: float, connected: bool = True):
+        super().__init__(connected=connected)
+        self.latency = latency
+
+    async def execute(self, _query):
+        self.execute_calls += 1
+        await asyncio.sleep(self.latency)
+        return 1
+
+
+@pytest.mark.asyncio
+async def test_supervisor_does_not_destroy_a_healthy_but_SLOW_backend(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """ROUND-18 F1, the worst bug this PR produced. Repair is destructive —
+    `_force_mark_database_disconnected` terminates the pool and every query
+    running on it. A probe timeout does NOT prove death: a slow database, or
+    an ordinary SATURATED pool where the probe queues behind `acquire`, times
+    out exactly like a dead one. Driven in review, repairing on a single
+    timeout destroyed a healthy pool every cycle under normal load and
+    manufactured the very `DatabaseBackend is not running` errors this module
+    exists to prevent. An ambiguous failure must be confirmed across cycles
+    before anything destructive happens."""
+    repairs = {"n": 0}
+
+    async def repair() -> None:
+        repairs["n"] += 1
+
+    spy = SlowDatabase(latency=0.2)
+    monkeypatch.setattr(readiness, "database", spy)
+    monkeypatch.setattr(readiness, "ensure_database_ready", repair)
+
+    # Probe times out every cycle; two cycles is below the confirmation
+    # threshold, so nothing destructive may happen.
+    await readiness.run_database_reconnect_supervisor(
+        interval_seconds=0.01,
+        probe_timeout_seconds=0.01,
+        repair_after_consecutive_failures=3,
+        max_cycles=2,
+    )
+
+    assert repairs["n"] == 0, (
+        "the supervisor destroyed a healthy-but-slow backend on a bare "
+        "timeout — this kills in-flight production queries every cycle")
+
+
+@pytest.mark.asyncio
+async def test_supervisor_eventually_repairs_a_persistently_failing_probe(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The other side of F1: caution must not become paralysis. After the
+    configured number of consecutive ambiguous failures, repair proceeds."""
+    repairs = {"n": 0}
+
+    async def repair() -> None:
+        repairs["n"] += 1
+
+    spy = SlowDatabase(latency=0.2)
+    monkeypatch.setattr(readiness, "database", spy)
+    monkeypatch.setattr(readiness, "ensure_database_ready", repair)
+
+    await readiness.run_database_reconnect_supervisor(
+        interval_seconds=0.01,
+        probe_timeout_seconds=0.01,
+        repair_after_consecutive_failures=3,
+        max_cycles=3,
+    )
+
+    assert repairs["n"] == 1, (
+        f"expected exactly one repair on the 3rd consecutive ambiguous "
+        f"failure, got {repairs['n']}")
+
+
+@pytest.mark.asyncio
+async def test_a_recovered_probe_resets_the_ambiguous_failure_count(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Intermittent slowness must never accumulate into a destructive repair:
+    two slow cycles, a healthy one, two more slow ones — still no repair."""
+    repairs = {"n": 0}
+
+    async def repair() -> None:
+        repairs["n"] += 1
+
+    spy = SlowDatabase(latency=0.2)
+    latencies = iter([0.2, 0.2, 0.0, 0.2, 0.2])
+
+    async def execute(_query):
+        spy.execute_calls += 1
+        await asyncio.sleep(next(latencies, 0.0))
+        return 1
+
+    monkeypatch.setattr(spy, "execute", execute)
+    monkeypatch.setattr(readiness, "database", spy)
+    monkeypatch.setattr(readiness, "ensure_database_ready", repair)
+
+    await readiness.run_database_reconnect_supervisor(
+        interval_seconds=0.01,
+        probe_timeout_seconds=0.01,
+        repair_after_consecutive_failures=3,
+        max_cycles=5,
+    )
+
+    assert repairs["n"] == 0, (
+        "a healthy cycle must reset the counter — intermittent slowness is "
+        "not a dead pool")
+
+
+@pytest.mark.asyncio
+async def test_supervisor_repairs_an_unambiguously_dead_pool_immediately(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Caution applies only to AMBIGUOUS failures. `pool is closed` proves
+    nothing can succeed, so waiting three cycles would just extend an
+    outage — repair on the first cycle."""
+    repairs = {"n": 0}
+
+    async def repair() -> None:
+        repairs["n"] += 1
+
+    class DeadPoolDatabase(SpyDatabase):
+        async def execute(self, _query):
+            self.execute_calls += 1
+            raise RuntimeError("pool is closed")
+
+    spy = DeadPoolDatabase(connected=True)
+    monkeypatch.setattr(readiness, "database", spy)
+    monkeypatch.setattr(readiness, "ensure_database_ready", repair)
+
+    await readiness.run_database_reconnect_supervisor(
+        interval_seconds=0.01,
+        repair_after_consecutive_failures=3,
+        max_cycles=1,
+    )
+
+    assert repairs["n"] == 1, (
+        "an unambiguously dead pool must be repaired at once, not after the "
+        "ambiguity threshold")
+
+
+def test_dead_pool_discrimination_is_exact():
+    """The whole safety property rests on this classifier."""
+    assert readiness.is_dead_pool_error(RuntimeError("pool is closed"))
+    assert readiness.is_dead_pool_error(
+        AssertionError("DatabaseBackend is not running"))
+    assert readiness.is_dead_pool_error(RuntimeError("pool is closing"))
+    # A timeout is the ambiguous case that must NOT be treated as death.
+    assert not readiness.is_dead_pool_error(asyncio.TimeoutError())
+    assert not readiness.is_dead_pool_error(TimeoutError("timed out"))
+    assert not readiness.is_dead_pool_error(
+        RuntimeError("the database system is starting up"))
+    # Wrapped causes are still seen.
+    wrapped = DatabaseUnavailableError(
+        phase="probe", error_type="RuntimeError", message="x")
+    wrapped.__cause__ = RuntimeError("pool is closed")
+    assert readiness.is_dead_pool_error(wrapped)
+
+
+@pytest.mark.asyncio
+async def test_supervisor_can_be_switched_off_by_env(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """ROUND-18 F5: if this loop ever misbehaves in production it must be
+    stoppable without a redeploy."""
+    spy = SpyDatabase(connected=False)
+    monkeypatch.setattr(readiness, "database", spy)
+    monkeypatch.setenv("DB_RECONNECT_SUPERVISOR_ENABLED", "false")
+
+    await readiness.run_database_reconnect_supervisor(
+        interval_seconds=0.01, max_cycles=3
+    )
+
+    assert spy.connect_calls == 0, "the kill switch did not stop the supervisor"
+
+
+@pytest.mark.asyncio
+async def test_supervisor_probe_timeout_is_generous_and_configurable():
+    """ROUND-18 F3 (surviving mutation): the supervisor's probe budget was
+    unpinned. It must NOT inherit the 3s request-path budget — 3s is tuned
+    for answering Railway fast; here it decides whether to destroy a pool."""
+    assert readiness.DEFAULT_SUPERVISOR_PROBE_TIMEOUT_SECONDS >= 10.0, (
+        "the supervisor's probe budget is tight enough to mistake a slow "
+        "database for a dead one")
+    assert (readiness.DEFAULT_SUPERVISOR_PROBE_TIMEOUT_SECONDS
+            > 3.0), "must exceed the request-path health probe budget"
+    assert readiness.DEFAULT_REPAIR_AFTER_CONSECUTIVE_FAILURES >= 2
+
+
 @pytest.mark.asyncio
 async def test_supervisor_repairs_a_connected_but_broken_pool(
     monkeypatch: pytest.MonkeyPatch,
@@ -263,8 +456,13 @@ async def test_supervisor_keeps_trying_after_a_failed_repair_sets_the_flag(
     monkeypatch.setattr(readiness, "database", spy)
     monkeypatch.setattr(readiness, "ensure_database_ready", failing_repair)
 
+    # repair_after=1 isolates the property under test (no permanent wedge)
+    # from the round-18 ambiguity throttle, which is exercised separately.
     await readiness.run_database_reconnect_supervisor(
-        interval_seconds=0.01, max_cycles=4
+        interval_seconds=0.01,
+        probe_timeout_seconds=0.5,
+        repair_after_consecutive_failures=1,
+        max_cycles=4,
     )
 
     assert attempts["n"] == 4, (
@@ -534,3 +732,19 @@ def test_request_paths_keep_their_recovery_helper():
     assert "probe_database_health" in called, "/health stopped observing"
     assert "ensure_database_ready" not in called, (
         "/health calls the REPAIRING helper again — it must observe only")
+
+    # ROUND-18 F4 (surviving mutation): the CONFIGURED timeout must reach the
+    # probe. Hardcoding a large value shipped green — in a PR whose thesis is
+    # that /health must answer Railway fast.
+    for node in ast.walk(tree):
+        if (isinstance(node, ast.Call)
+                and getattr(node.func, "id", None) == "probe_database_health"):
+            kwargs = {kw.arg: kw.value for kw in node.keywords}
+            assert "probe_timeout_seconds" in kwargs, (
+                "/health calls the probe without its configured timeout")
+            assert isinstance(kwargs["probe_timeout_seconds"], ast.Name), (
+                "/health hardcodes the probe timeout instead of using the "
+                "DB_HEALTH_PROBE_TIMEOUT_SECONDS-derived value")
+            break
+    else:
+        raise AssertionError("no probe_database_health call found in /health")
