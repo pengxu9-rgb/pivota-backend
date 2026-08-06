@@ -273,6 +273,65 @@ def test_force_disconnect_never_terminates_a_possibly_live_pool():
 
 
 @pytest.mark.asyncio
+async def test_supervisor_reconnects_directly_never_via_the_repairing_helper(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Pins the CALL SHAPE, not just the effect. A mutation that swapped
+    `database.connect()` for `ensure_database_ready()` survived the first
+    battery, because that helper also ends up calling connect() — so counting
+    connects cannot tell the safe path from the round-19 FATAL one. The
+    difference that matters is invisible in the outcome: ensure_database_ready
+    carries an unconditional `finally: _force_mark_database_disconnected()`
+    on a 3s probe, which is how healthy pools got destroyed."""
+    called = {"helper": 0}
+
+    async def helper(**_kwargs) -> None:
+        called["helper"] += 1
+
+    spy = SpyDatabase(connected=False)
+    monkeypatch.setattr(readiness, "database", spy)
+    monkeypatch.setattr(readiness, "ensure_database_ready", helper)
+
+    await readiness.run_database_reconnect_supervisor(
+        interval_seconds=0.01, max_cycles=1
+    )
+
+    assert spy.connect_calls == 1, "the supervisor did not reconnect"
+    assert called["helper"] == 0, (
+        "the supervisor routed through ensure_database_ready — that helper "
+        "resets pool state on an ambiguous timeout (round-19 FATAL)")
+
+
+@pytest.mark.asyncio
+async def test_supervisor_reconnect_is_timeout_bounded(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The incident's background jobs hung forever on an unbounded
+    `database.connect()`, holding their slots. The supervisor must not repeat
+    that shape: a connect that never returns must be abandoned, not awaited
+    for the life of the process."""
+
+    class HangingDatabase(SpyDatabase):
+        async def connect(self) -> None:
+            self.connect_calls += 1
+            await asyncio.sleep(30)
+
+    spy = HangingDatabase(connected=False)
+    monkeypatch.setattr(readiness, "database", spy)
+
+    started = time.monotonic()
+    await readiness.run_database_reconnect_supervisor(
+        interval_seconds=0.01, connect_timeout_seconds=0.05, max_cycles=1
+    )
+    elapsed = time.monotonic() - started
+
+    assert spy.connect_calls == 1
+    assert elapsed < 1.0, (
+        f"the supervisor awaited a hanging connect for {elapsed:.2f}s — an "
+        "unbounded await is what wedged every scheduler job in the incident")
+
+
+@pytest.mark.asyncio
 async def test_supervisor_never_touches_a_connected_backend(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
