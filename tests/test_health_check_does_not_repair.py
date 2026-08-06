@@ -336,6 +336,29 @@ class _FakePool:
         self._closed = closed
 
 
+class RealisticSpyDatabase(SpyDatabase):
+    """Models the one `databases.Database.connect()` behaviour that matters
+    here: it RETURNS IMMEDIATELY when `is_connected` is already True.
+
+    Without that, a fake happily "reconnects" a backend whose stale flag was
+    never cleared — and a mutation deleting the flag-clearing survived the
+    whole suite (round-20 battery), because the shipped code would have
+    silently no-opped while the fake reported success. `real_connects` counts
+    only connections that actually happened.
+    """
+
+    def __init__(self, *, connected: bool):
+        super().__init__(connected=connected)
+        self.real_connects = 0
+
+    async def connect(self) -> None:
+        self.connect_calls += 1
+        if self.is_connected:
+            return  # exactly what databases does — a silent no-op
+        self.real_connects += 1
+        self.is_connected = True
+
+
 def _with_pool(spy, pool):
     """Give a spy DB the `_backend._pool` shape `_pool_is_provably_dead` reads."""
 
@@ -358,15 +381,17 @@ async def test_supervisor_recovers_a_dead_pool_behind_a_connected_flag(
     against the parent, which recovered it on any /health poll. It is a LOCAL
     fact (the pool object is gone), not an inference from a timed probe, so
     acting on it cannot destroy live work."""
-    spy = _with_pool(SpyDatabase(connected=True), None)
+    spy = _with_pool(RealisticSpyDatabase(connected=True), None)
     monkeypatch.setattr(readiness, "database", spy)
 
     await readiness.run_database_reconnect_supervisor(
         interval_seconds=0.01, max_cycles=1
     )
 
-    assert spy.connect_calls == 1, (
-        "a provably dead pool behind a connected flag was not recovered")
+    assert spy.real_connects == 1, (
+        "a provably dead pool behind a connected flag was not recovered — if "
+        "the stale flag is not cleared first, databases' connect() returns "
+        "immediately and the 'reconnect' is a silent no-op")
     assert spy.is_connected is True
 
 
@@ -376,14 +401,15 @@ async def test_supervisor_recovers_a_closed_pool_behind_a_connected_flag(
 ) -> None:
     """The client-side `InterfaceError: pool is closed` shape — also a local
     fact (`pool._closed`), also recovered by the parent, also safe."""
-    spy = _with_pool(SpyDatabase(connected=True), _FakePool(closed=True))
+    spy = _with_pool(RealisticSpyDatabase(connected=True), _FakePool(closed=True))
     monkeypatch.setattr(readiness, "database", spy)
 
     await readiness.run_database_reconnect_supervisor(
         interval_seconds=0.01, max_cycles=1
     )
 
-    assert spy.connect_calls == 1, "a closed pool was not recovered"
+    assert spy.real_connects == 1, (
+        "a closed pool was not actually reconnected (stale flag no-op)")
 
 
 @pytest.mark.asyncio
