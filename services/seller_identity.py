@@ -83,19 +83,36 @@ def etld1(domain: Optional[str]) -> str:
 
 
 def is_known_retailer_domain(domain: Optional[str]) -> bool:
-    """W2 (ADR-011 R5 closure): is this domain a known RETAILER host? One
-    definition system-wide — the same list `offer_seller_identity` uses to
-    classify offers (precedence 0: known retailer preempts identity data).
-    Matches the exact host or its registrable domain, so
-    global.oliveyoung.com and oliveyoung.com both classify retailer."""
-    from services.offer_seller_identity import known_retailer_domains
+    """W2 (ADR-011 R5 closure): is this domain a known RETAILER host? ONE
+    definition system-wide — this delegates to the exact matcher the offer
+    lane uses (`offer_seller_identity.is_known_retailer`, suffix match), so
+    the two lanes cannot classify the same host differently. Known limitation,
+    deliberate: a subdomain-only list entry (e.g. beauty.example.com) still
+    KEYS on the registrable (etld1) — adding a subdomain to the retailer list
+    designates the whole registrable as a retailer for identity purposes."""
+    from services.offer_seller_identity import is_known_retailer
 
-    host = str(domain or "").strip().lower().removeprefix("www.")
-    if not host:
+    return is_known_retailer(str(domain or "").strip().rstrip("."))
+
+
+# Second-level labels that are generic registries, not sellers. `etld1` uses a
+# CURATED suffix list, so an uncurated ccTLD (brand.com.vn) yields a bare
+# public suffix ("com.vn") as its "registrable". Minting or claim-matching on
+# that would collapse every site under that registry into one identity — and a
+# verified brand claim on ANY .com.vn domain would capture them all.
+_GENERIC_SECOND_LEVEL_LABELS = frozenset({
+    "com", "co", "net", "org", "edu", "gov", "ac", "or", "ne", "mil", "int", "gob",
+})
+
+
+def _plausible_registrable(registrable: str) -> bool:
+    """Reject registrables that are (or look like) bare public suffixes."""
+    if not registrable or "." not in registrable:
         return False
-    registrable = etld1(host)
-    retailers = known_retailer_domains()
-    return host in retailers or (bool(registrable) and registrable in retailers)
+    first = registrable.split(".", 1)[0]
+    if first in _GENERIC_SECOND_LEVEL_LABELS:
+        return False
+    return True
 
 
 def make_observed_retailer_id(domain: str) -> str:
@@ -108,11 +125,12 @@ def make_observed_retailer_id(domain: str) -> str:
     Id space: `merch_obs_<sha256("retailer::" + etld1)[:16]>` — the namespace
     prefix keeps it disjoint from the brand-direct space by construction.
     Raises on a non-registrable domain — never mints from nothing."""
-    registrable = etld1(domain)
-    if not registrable:
+    registrable = etld1(str(domain or "").strip().rstrip("."))
+    if not _plausible_registrable(registrable):
         raise ValueError(
             "cannot mint an observed retailer identity from a non-registrable "
-            f"domain ({domain!r}); supply a real domain or skip the row loudly"
+            f"domain ({domain!r} -> {registrable!r}); supply a real domain or "
+            "skip the row loudly"
         )
     raw = f"retailer::{registrable}".encode("utf-8")
     digest = hashlib.sha256(raw).hexdigest()[:16]
@@ -135,10 +153,11 @@ def resolve_seed_seller_identity(*, brand: Optional[str], domain: Optional[str])
     DB concerns stay out of this function on purpose: claimed-domain attach
     ("attach beats mint") and the insert-if-missing of the merchant row happen
     at apply time, where a connection exists."""
-    registrable = etld1(domain)
-    if not registrable:
+    registrable = etld1(str(domain or "").strip().rstrip("."))
+    if not _plausible_registrable(registrable):
         raise ValueError(
             f"seller-of-record unresolvable: non-registrable domain {domain!r}"
+            f" (registrable {registrable!r})"
         )
     if is_known_retailer_domain(domain):
         return {

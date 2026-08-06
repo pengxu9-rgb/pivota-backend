@@ -30,6 +30,10 @@ OFFER_TYPE_RETAILER = "retailer"
 DEFAULT_KNOWN_RETAILER_DOMAINS = (
     "ulta.com", "target.com", "bestbuy.com",
     "amazon.com", "amazon.co.uk", "amazon.co.jp", "amazon.de", "amazon.ca", "amzn.to", "amzn.com",
+    # W2 review gap: ccTLD Amazons classified brand-direct, minting per-brand
+    # merchants on a retailer domain — the exact anti-pattern retailer keying
+    # exists to prevent.
+    "amazon.com.br", "amazon.com.mx", "amazon.com.au", "amazon.fr", "amazon.it", "amazon.es",
     "sephora.com", "walmart.com",
     "oliveyoung.com", "global.oliveyoung.com", "oliveyoung.co.kr",
     "stylekorean.com",

@@ -240,6 +240,11 @@ def _build_pdp_insert(
         pdp_payload["brand"],
         pdp_payload["product_name"],
     )
+    # NOTE (R3 packet): the sig inputs deliberately stay on the historical
+    # SYNTHETIC literals — sigs are write-once (T5). Any future re-derivation
+    # of sigs FROM ROW COLUMNS (backfill_pivota_canonical_pdp.py does this)
+    # would diverge on W2 rows; that re-deriver must keep using the historical
+    # namespace, not the live merchant_id.
     pivota_fields = make_pivota_canonical_fields(
         SYNTHETIC_MERCHANT_ID,
         SYNTHETIC_PLATFORM,
@@ -705,7 +710,9 @@ def ingest_validated_record(record: Dict[str, Any], *, source_jsonl: Optional[st
     """Pure function: take one validated record and return the rows to
     INSERT/UPSERT for the canonical chain (merchants, products, skus,
     offers) plus the audit seed rows. Returns None for malformed
-    records.
+    records, and {"skipped_reason": ...} for records whose seller of
+    record cannot be resolved (blocked, retried on a later run — never
+    the legacy bucket).
 
     The caller (runner) is responsible for actually executing the
     INSERT/UPSERT statements against the DB in FK order:
@@ -868,7 +875,18 @@ def ingest_validated_jsonl(
             k = row.get(key)
             if k is None:
                 continue
-            by_key.setdefault(str(k), row)
+            kept = by_key.setdefault(str(k), row)
+            # W2: two records collapsing onto one product_key with DIFFERENT
+            # resolved sellers is an ownership conflict, not a dedupe. The
+            # first row wins deterministically (apply-time existing-rows-win
+            # makes cross-run order irrelevant), but the conflict is COUNTED —
+            # silent first-crawl-wins is exactly the order-dependence the
+            # seller resolution forbids elsewhere.
+            if kept is not row and key == "product_key" and "merchant_id" in row:
+                if str(kept.get("merchant_id")) != str(row.get("merchant_id")):
+                    skipped_reasons["seller_of_record_conflict"] = (
+                        skipped_reasons.get("seller_of_record_conflict", 0) + 1
+                    )
         return list(by_key.values())
 
     return {

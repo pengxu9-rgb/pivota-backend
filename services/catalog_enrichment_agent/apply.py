@@ -361,49 +361,126 @@ _ENSURE_MERCHANT_INSERT_SQL = """
 async def _prepare_seller_of_record(plan: Dict[str, Any], database: Any) -> Dict[str, Any]:
     """W2 apply-time seller handling, applied to BOTH executors.
 
-    1. TRIPWIRE (ADR-009 D2, write boundary): refuse the whole plan if any
-       product/sku row still carries the banned 'external_seed' bucket. The
-       resolver makes this impossible; the ban is load-bearing, so it is
-       asserted where the write happens, not trusted to the resolver.
-    2. `_ensure_only` merchant rows (the observed sellers of record):
+    1. EXISTING ROWS WIN (derive from the row): the product upsert never
+       updates merchant_id, so for a product_key that already exists the plan
+       rows are remapped to the DB row's actual merchant — legacy sentinel
+       included. Anything else writes group-membership singletons and observed
+       merchant rows for an ownership the catalog does not actually have
+       (phantom rows the first re-run over the legacy population would have
+       minted at scale). Legacy rows migrate in R3, with parity — never as a
+       side effect of a content re-sync.
+    2. TRIPWIRE (ADR-009 D2, write boundary): refuse the plan if any NEW
+       product/sku row would be created under the banned 'external_seed'
+       bucket. Existing sentinel rows remapped by rule 1 are not new writes.
+    3. `_ensure_only` merchant rows (the observed sellers of record):
        - attach beats mint: a VERIFIED brand_claims tenant for the registrable
-         domain takes the rows — product/sku merchant_id is remapped to the
-         claimed merchant and no observed row is written;
+         domain takes the rows — but only when that tenant already has a
+         catalog_merchants row; serving surfaces INNER-JOIN it, so remapping
+         onto a missing row would silently hide the products. Missing ->
+         attach is DEFERRED loudly and the observed identity stands.
        - otherwise insert-if-missing (ON CONFLICT DO NOTHING). Never the
          clobbering upsert: its `status = EXCLUDED.status` would downgrade a
-         merchant that has graduated beyond 'observed'.
+         merchant that has graduated beyond 'observed'. A transient insert
+         failure is logged and skipped (the plan contract is per-row
+         fail-soft); the merchant heals on the next run.
     """
-    from services.seller_identity import (
-        BANNED_BUCKET_MERCHANT_ID,
-        _resolve_claimed_merchant,
-    )
+    from services.seller_identity import BANNED_BUCKET_MERCHANT_ID, etld1
 
     pdps = plan.get("pdps") or []
     skus = plan.get("skus") or []
+
+    # 1. Existing rows win.
+    product_keys = sorted({str(r.get("product_key") or "") for r in pdps if r.get("product_key")})
+    existing_by_key: Dict[str, str] = {}
+    if product_keys:
+        rows = await database.fetch_all(
+            "SELECT product_key, merchant_id FROM catalog_products WHERE product_key = ANY(:keys)",
+            {"keys": product_keys},
+        )
+        for row in rows or []:
+            data = dict(row)
+            existing_by_key[str(data.get("product_key") or "")] = str(data.get("merchant_id") or "")
+    planned_by_key: Dict[str, str] = {}
     for row in list(pdps) + list(skus):
+        key = str(row.get("product_key") or "")
+        existing_merchant = existing_by_key.get(key)
+        if existing_merchant:
+            planned_by_key.setdefault(key, str(row.get("merchant_id") or ""))
+            row["merchant_id"] = existing_merchant
+            row["_existing_row"] = True
+
+    # 2. Tripwire on NEW writes only.
+    for row in list(pdps) + list(skus):
+        if row.pop("_existing_row", False):
+            continue
         if str(row.get("merchant_id") or "") == BANNED_BUCKET_MERCHANT_ID:
             raise RuntimeError(
-                "ADR-009 D2 violation: refusing to write a product/sku row "
+                "ADR-009 D2 violation: refusing to CREATE a product/sku row "
                 f"under the banned '{BANNED_BUCKET_MERCHANT_ID}' bucket "
                 f"(product_key={row.get('product_key')!r})"
             )
 
+    # 3. Observed seller rows.
+    referenced = {str(r.get("merchant_id") or "") for r in list(pdps) + list(skus)}
     merchants = plan.get("merchants") or []
     passthrough: list = []
+    claim_memo: Dict[str, Optional[str]] = {}
     for merchant in merchants:
         if not merchant.get("_ensure_only"):
             passthrough.append(merchant)
             continue
         observed_id = str(merchant.get("merchant_id") or "")
+        if observed_id not in referenced:
+            continue  # every row that named it was remapped to an existing merchant
         registrable = str(merchant.get("source_ref") or "")
-        claimed = await _resolve_claimed_merchant(registrable) if registrable else None
+        claimed = None
+        if registrable:
+            if registrable in claim_memo:
+                claimed = claim_memo[registrable]
+            else:
+                # Server-side registrable match against VERIFIED claims — the
+                # database handle THIS plan runs on (never the module-global,
+                # which diverges under db overrides), and no Python-side scan
+                # cap (the old LIMIT-200 scan silently missed claim #201).
+                try:
+                    row = await database.fetch_one(
+                        """
+                        SELECT merchant_id FROM brand_claims
+                        WHERE lower(coalesce(status, '')) = 'verified'
+                          AND (
+                            lower(coalesce(brand_domain, '')) = :reg
+                            OR lower(coalesce(brand_domain, '')) LIKE '%.' || :reg
+                          )
+                        ORDER BY updated_at DESC NULLS LAST
+                        LIMIT 1
+                        """,
+                        {"reg": registrable},
+                    )
+                    claimed = str(dict(row).get("merchant_id") or "").strip() or None if row else None
+                except Exception as exc:  # noqa: BLE001 — attach is best-effort; mint is the honest state
+                    logger.warning("W2 claimed-attach lookup failed for %s: %s", registrable, str(exc)[:200])
+                    claimed = None
+                claim_memo[registrable] = claimed
         if claimed and claimed != observed_id:
-            for row in list(pdps) + list(skus):
-                if row.get("merchant_id") == observed_id:
-                    row["merchant_id"] = claimed
-            continue  # tenant identity attaches; no observed row is written
+            claimed_exists = await database.fetch_one(
+                "SELECT 1 FROM catalog_merchants WHERE merchant_id = :mid",
+                {"mid": claimed},
+            )
+            if claimed_exists:
+                for row in list(pdps) + list(skus):
+                    if row.get("merchant_id") == observed_id:
+                        row["merchant_id"] = claimed
+                continue  # tenant identity attaches; no observed row is written
+            logger.warning(
+                "W2 claimed-attach DEFERRED for %s -> %s: claimed merchant has no "
+                "catalog_merchants row (serving INNER-JOINs it); observed identity stands",
+                registrable, claimed,
+            )
         params = {k: v for k, v in merchant.items() if k != "_ensure_only"}
-        await database.execute(_ENSURE_MERCHANT_INSERT_SQL, params)
+        try:
+            await database.execute(_ENSURE_MERCHANT_INSERT_SQL, params)
+        except Exception as exc:  # noqa: BLE001 — per-row fail-soft, heals next run
+            logger.warning("W2 observed-merchant insert failed for %s: %s", observed_id, str(exc)[:200])
     plan = dict(plan)
     plan["merchants"] = passthrough
     return plan
