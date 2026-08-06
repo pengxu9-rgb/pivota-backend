@@ -117,9 +117,20 @@ logger = logging.getLogger("a9_4_seller_backfill")
 # The single named constant for the banned bucket (reuse the one seller_identity
 # already owns — do not re-declare a second literal).
 from services.seller_identity import BANNED_BUCKET_MERCHANT_ID  # noqa: E402
+from services.seller_identity import (  # noqa: E402
+    ensure_observed_seller_of_record,
+    resolve_seed_seller_identity,
+)
 from services.catalog_sync_service import make_catalog_product_key  # noqa: E402
 
 EXTERNAL_SEED_PLATFORM = "external_seed"  # the mirror's platform literal
+
+# R3: the retired founder test rig's Shopify dev store. Its 50 mirror rows are
+# the one cohort that must NOT be re-keyed: the rig merchant is status=inactive
+# with a non-NULL last_full_sync_at, so a re-key would both drop the rows from
+# serving and expose them to the stale-product sweep. They get their own
+# suppression step, founder-gated — never a ride-along in the flip.
+EXCLUDED_SOURCE_DOMAINS = frozenset({"jwx893-fz.myshopify.com"})
 SOURCE_SYSTEM_SEEDS = "a9_4_seeds_backfill"
 SOURCE_SYSTEM_CATALOG = "a9_4_catalog_rekey"
 
@@ -642,13 +653,14 @@ class SellerBackfill:
             )
 
         rows = await self.db.fetch_all(
-            "SELECT product_key, content_key, brand, source_domain, canonical_url, platform "
+            "SELECT product_key, content_key, brand, source_domain, canonical_url, platform, source_product_id "
             "FROM catalog_products WHERE merchant_id = :banned ORDER BY product_key",
             {"banned": BANNED_BUCKET_MERCHANT_ID},
         )
         products = [dict(r) for r in rows or []]
         stats = {"scanned": len(products), "resubjected": 0, "review_collision": 0,
-                 "review_unresolvable": 0, "batches": 0, "distinct_sellers": 0}
+                 "review_unresolvable": 0, "review_excluded_rig": 0,
+                 "batches": 0, "distinct_sellers": 0, "retailer_keyed": 0}
         collisions: List[Dict[str, Any]] = []
         unresolvable: List[Dict[str, Any]] = []
         sellers_seen: set = set()
@@ -658,22 +670,43 @@ class SellerBackfill:
         for p in products:
             brand = str(p.get("brand") or "").strip()
             dest = str(p.get("source_domain") or p.get("canonical_url") or "").strip()
-            res = await resolve_seller_readonly(
-                self.si, anchor_merchant_id=None, brand=brand, destination_domain=dest
-            )
-            if res.seller_ref is None:
+            if str(p.get("source_domain") or "").strip().lower() in EXCLUDED_SOURCE_DOMAINS:
+                stats["review_excluded_rig"] += 1
+                unresolvable.append({"product_key": p.get("product_key"),
+                                     "brand": brand, "domain": dest,
+                                     "reason": "excluded_test_rig_dev_store"})
+                continue
+            # W2 keying decides the IDENTITY SHAPE first: a retailer domain keys
+            # on etld1 alone (one retailer = one merchant), everything else
+            # keeps the brand-direct path (which also handles anchors/claims).
+            kind = "brand_direct"
+            try:
+                ident = resolve_seed_seller_identity(brand=brand, domain=dest)
+                kind = ident["kind"]
+            except ValueError:
+                ident = None
+            if ident is not None and kind == "retailer":
+                seller_ref, disposition = ident["merchant_id"], "retailer_domain"
+                stats["retailer_keyed"] += 1
+            else:
+                res = await resolve_seller_readonly(
+                    self.si, anchor_merchant_id=None, brand=brand, destination_domain=dest
+                )
+                seller_ref, disposition = res.seller_ref, res.disposition
+            if seller_ref is None:
                 stats["review_unresolvable"] += 1
                 unresolvable.append({"product_key": p.get("product_key"),
                                      "brand": brand, "domain": dest,
-                                     "reason": res.disposition})
+                                     "reason": disposition})
                 continue
-            collision = await self._fragmentation_collision(res.seller_ref, brand, dest, p)
+            collision = await self._fragmentation_collision(seller_ref, brand, dest, p)
             if collision:
                 stats["review_collision"] += 1
                 collisions.append(collision)
                 continue
-            sellers_seen.add(res.seller_ref)
-            planned.append({**p, "observed_id": res.seller_ref, "disposition": res.disposition})
+            sellers_seen.add(seller_ref)
+            planned.append({**p, "observed_id": seller_ref, "disposition": disposition,
+                            "seller_kind": kind})
 
         stats["distinct_sellers"] = len(sellers_seen)
         report.review_queue["catalog_collision"] = collisions
@@ -740,7 +773,8 @@ class SellerBackfill:
                 obs = str(b["observed_id"])
                 # Materialize the observed seller via the REAL A9-2 minter
                 # (idempotent; resolves claim -> existing -> mint).
-                await self.si.ensure_observed_seller(
+                await ensure_observed_seller_of_record(
+                    kind=str(b.get("seller_kind") or "brand_direct"),
                     brand=str(b.get("brand") or ""),
                     domain=str(b.get("source_domain") or b.get("canonical_url") or ""),
                     source_system=SOURCE_SYSTEM_CATALOG,
@@ -756,9 +790,29 @@ class SellerBackfill:
                 sku_keys = await self._sku_keys_for_product(pk)
                 for t in cascade:
                     await self._resubject_dependent(t, obs, pk, ck, sku_keys)
+                # 3) the two tables reflection CANNOT see (R0 finding): group
+                #    membership keys on (merchant, platform, platform_product_id)
+                #    and the identity listing embeds the merchant in its PK.
+                await self._resubject_group_membership(b, obs)
+                await self._migrate_listing_refs(b, obs)
             # Residue audit INSIDE the txn: any enumerated table still holding a
             # banned seller for this batch's products = un-migrated cascade.
             residue = await self._residue_audit(pks, cascade)
+            spids = [str(b.get("source_product_id") or "") for b in batch if b.get("source_product_id")]
+            if spids:
+                for table, sql in (
+                    ("product_group_members",
+                     "SELECT count(*) AS c FROM product_group_members "
+                     "WHERE merchant_id = :banned AND platform_product_id = ANY(:spids)"),
+                    ("pdp_identity_listing",
+                     "SELECT count(*) AS c FROM pdp_identity_listing "
+                     "WHERE merchant_id = :banned AND product_id = ANY(:spids)"),
+                ):
+                    row = await self.db.fetch_one(
+                        sql, {"banned": BANNED_BUCKET_MERCHANT_ID, "spids": spids})
+                    c = int(dict(row)["c"]) if row else 0
+                    if c:
+                        residue[table] = residue.get(table, 0) + c
             # AFTER: parity assertions. On failure, raise -> rollback the batch.
             after = await self._parity_snapshot(pks)
             parity = self._diff_parity(before, after, residue)
@@ -776,6 +830,103 @@ class SellerBackfill:
                                        str(b["observed_id"]), "done",
                                        previous_value=BANNED_BUCKET_MERCHANT_ID)
         return parity
+
+    async def _resubject_group_membership(self, b: Dict[str, Any], obs: str) -> None:
+        """product_group_members keys on (merchant_id, platform,
+        platform_product_id) and carries NONE of the reflection scope columns —
+        the one ownership table `discover_cascade_tables` cannot see (R0
+        finding, 2026-08-06). Self-heal semantics: if the observed-seller row
+        already exists (graph/mirror wrote it), the stale banned row is
+        RETIRED; otherwise the banned row moves in place."""
+        spid = str(b.get("source_product_id") or "")
+        platform = str(b.get("platform") or "")
+        if not spid or not platform:
+            return
+        params = {"obs": obs, "banned": BANNED_BUCKET_MERCHANT_ID,
+                  "platform": platform, "spid": spid}
+        existing = await self.db.fetch_one(
+            "SELECT 1 FROM product_group_members WHERE merchant_id = :obs "
+            "AND platform = :platform AND platform_product_id = :spid",
+            params,
+        )
+        if existing:
+            await self.db.execute(
+                "DELETE FROM product_group_members WHERE merchant_id = :banned "
+                "AND platform = :platform AND platform_product_id = :spid",
+                params,
+            )
+            return
+        sql = ("UPDATE product_group_members SET merchant_id = :obs "
+               "WHERE merchant_id = :banned AND platform = :platform "
+               "AND platform_product_id = :spid")
+        assert_sig_frozen_sql(sql)
+        await self.db.execute(sql, params)
+
+    _listing_columns_cache: Optional[List[str]] = None
+
+    async def _listing_columns(self) -> List[str]:
+        if self._listing_columns_cache is None:
+            rows = await self.db.fetch_all(
+                "SELECT column_name FROM information_schema.columns "
+                "WHERE table_schema = 'public' AND table_name = 'pdp_identity_listing' "
+                "ORDER BY ordinal_position"
+            )
+            self._listing_columns_cache = [str(dict(r)["column_name"]) for r in rows or []]
+        return self._listing_columns_cache
+
+    async def _migrate_listing_refs(self, b: Dict[str, Any], obs: str) -> None:
+        """pdp_identity_listing's PRIMARY KEY (source_listing_ref) embeds the
+        merchant ('<merchant>:<product_id>'), and 7,036 operator overrides plus
+        515 review-queue rows hang off the old refs (measured 2026-08-06) — so
+        delete-and-let-the-graph-reheal would destroy operator work. The FK
+        (review_queue -> listing) is NOT deferrable, so an in-place PK UPDATE
+        cannot reorder its checks: COPY the row under the new ref, REPOINT both
+        children, DELETE the old row — one product, same transaction. Columns
+        are discovered from the live schema (never a hardcoded list) with the
+        two identity columns replaced; every generated statement passes the
+        sig-freeze assert. Idempotent under resume via ON CONFLICT DO NOTHING +
+        the old-row existence check."""
+        spid = str(b.get("source_product_id") or "")
+        if not spid:
+            return
+        old_ref = f"{BANNED_BUCKET_MERCHANT_ID}:{spid}"
+        new_ref = f"{obs}:{spid}"
+        exists = await self.db.fetch_one(
+            "SELECT 1 FROM pdp_identity_listing WHERE source_listing_ref = :old_ref",
+            {"old_ref": old_ref},
+        )
+        if not exists:
+            return
+        cols = await self._listing_columns()
+        select_exprs = []
+        for col in cols:
+            if col == "source_listing_ref":
+                select_exprs.append(":new_ref")
+            elif col == "merchant_id":
+                select_exprs.append(":obs")
+            else:
+                select_exprs.append(col)
+        copy_sql = (
+            f"INSERT INTO pdp_identity_listing ({', '.join(cols)}) "
+            f"SELECT {', '.join(select_exprs)} FROM pdp_identity_listing "
+            f"WHERE source_listing_ref = :old_ref "
+            f"ON CONFLICT (source_listing_ref) DO NOTHING"
+        )
+        assert_sig_frozen_sql(copy_sql)
+        params = {"new_ref": new_ref, "obs": obs, "old_ref": old_ref}
+        await self.db.execute(copy_sql, params)
+        for child_sql in (
+            "UPDATE pdp_identity_review_queue SET source_listing_ref = :new_ref "
+            "WHERE source_listing_ref = :old_ref",
+            "UPDATE pdp_identity_override SET source_listing_ref = :new_ref "
+            "WHERE source_listing_ref = :old_ref",
+        ):
+            assert_sig_frozen_sql(child_sql)
+            await self.db.execute(child_sql, {"new_ref": new_ref, "old_ref": old_ref})
+        await self.db.execute(
+            "DELETE FROM pdp_identity_listing WHERE source_listing_ref = :old_ref",
+            {"old_ref": old_ref},
+        )
 
     async def _sku_keys_for_product(self, product_key: str) -> List[str]:
         rows = await self.db.fetch_all(
