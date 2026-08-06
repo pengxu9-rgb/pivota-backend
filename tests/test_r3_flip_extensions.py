@@ -140,3 +140,24 @@ class TestPlanning:
 
     def test_retailer_identity_matches_w2_keying(self):
         assert make_observed_retailer_id("ulta.com").startswith("merch_obs_")
+
+
+class TestPlanDomain:
+    def test_garbage_source_domain_does_not_mask_a_good_canonical_host(self):
+        from scripts.backfill_seller_of_record import _plan_domain
+        row = {"brand": "Biodance", "source_domain": "Better Formula for Better Glow",
+               "canonical_url": "https://biodance.com/products/x"}
+        assert _plan_domain(row) == "biodance.com"
+
+    def test_valid_source_domain_wins(self):
+        from scripts.backfill_seller_of_record import _plan_domain
+        row = {"brand": "B", "source_domain": "b.com",
+               "canonical_url": "https://retailer.example/products/x"}
+        assert _plan_domain(row) == "b.com"
+
+    def test_nothing_resolvable_still_blocks(self):
+        from scripts.backfill_seller_of_record import _plan_domain
+        row = {"brand": "", "source_domain": "not a domain", "canonical_url": ""}
+        # returns the raw candidate; resolve_seed_seller_identity then raises ->
+        # the row routes to review, never to a guessed identity.
+        assert _plan_domain(row) == "not a domain"

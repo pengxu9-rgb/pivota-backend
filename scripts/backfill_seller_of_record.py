@@ -131,6 +131,45 @@ EXTERNAL_SEED_PLATFORM = "external_seed"  # the mirror's platform literal
 # serving and expose them to the stale-product sweep. They get their own
 # suppression step, founder-gated — never a ride-along in the flip.
 EXCLUDED_SOURCE_DOMAINS = frozenset({"jwx893-fz.myshopify.com"})
+
+
+def _plan_domain(p: Dict[str, Any]) -> str:
+    """The row's seller domain: the FIRST candidate that actually resolves.
+    source_domain is preferred but is sometimes corrupt (250 Biodance rows
+    carry a marketing tagline in it, measured 2026-08-07) — a garbage value
+    must not mask a perfectly good canonical_url host on the same row. This is
+    ordered derivation from the row's own columns, not a guess: when no
+    candidate resolves, the row still blocks to review."""
+    from urllib.parse import urlparse
+
+    candidates = []
+    sd = str(p.get("source_domain") or "").strip()
+    if sd:
+        candidates.append(sd)
+    cu = str(p.get("canonical_url") or "").strip()
+    if cu:
+        host = urlparse(cu).hostname or ""
+        if host:
+            candidates.append(host)
+    # The attached seed is the row's UPSTREAM source of truth (design §3's
+    # recovery path): 250 Biodance rows have garbage source_domain AND an empty
+    # canonical_url on the catalog row, while their seeds carry the real
+    # biodance.com destination (measured 2026-08-07).
+    seed_dom = str(p.get("seed_domain") or "").strip()
+    if seed_dom:
+        candidates.append(seed_dom)
+    seed_dest = str(p.get("seed_destination_url") or "").strip()
+    if seed_dest:
+        host = urlparse(seed_dest).hostname or ""
+        if host:
+            candidates.append(host)
+    for cand in candidates:
+        try:
+            resolve_seed_seller_identity(brand=str(p.get("brand") or ""), domain=cand)
+            return cand
+        except ValueError:
+            continue
+    return candidates[0] if candidates else ""
 SOURCE_SYSTEM_SEEDS = "a9_4_seeds_backfill"
 SOURCE_SYSTEM_CATALOG = "a9_4_catalog_rekey"
 
@@ -653,8 +692,12 @@ class SellerBackfill:
             )
 
         rows = await self.db.fetch_all(
-            "SELECT product_key, content_key, brand, source_domain, canonical_url, platform, source_product_id "
-            "FROM catalog_products WHERE merchant_id = :banned ORDER BY product_key",
+            "SELECT cp.product_key, cp.content_key, cp.brand, cp.source_domain, "
+            "cp.canonical_url, cp.platform, cp.source_product_id, "
+            "e.domain AS seed_domain, e.destination_url AS seed_destination_url "
+            "FROM catalog_products cp "
+            "LEFT JOIN external_product_seeds e ON e.external_product_id = cp.source_product_id "
+            "WHERE cp.merchant_id = :banned ORDER BY cp.product_key",
             {"banned": BANNED_BUCKET_MERCHANT_ID},
         )
         products = [dict(r) for r in rows or []]
@@ -669,7 +712,7 @@ class SellerBackfill:
         planned: List[Dict[str, Any]] = []
         for p in products:
             brand = str(p.get("brand") or "").strip()
-            dest = str(p.get("source_domain") or p.get("canonical_url") or "").strip()
+            dest = _plan_domain(p)
             if str(p.get("source_domain") or "").strip().lower() in EXCLUDED_SOURCE_DOMAINS:
                 stats["review_excluded_rig"] += 1
                 unresolvable.append({"product_key": p.get("product_key"),
