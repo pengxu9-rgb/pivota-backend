@@ -471,21 +471,29 @@ async def test_kill_switch_takes_effect_MID_RUN_without_a_restart(
     so it must be re-read every cycle — a test that sets the env before
     starting cannot tell the difference."""
     monkeypatch.delenv("DB_RECONNECT_SUPERVISOR_ENABLED", raising=False)
-    spy = RealisticSpyDatabase(connected=False)
+
+    class FlipsTheSwitchOnFirstConnect(RealisticSpyDatabase):
+        """Flips the env DURING the supervisor's own run, synchronously.
+
+        An earlier version did this from a background task and cancelled it
+        without awaiting — so the setenv could land after teardown and leak
+        `ENABLED=false` into unrelated tests (it did: the suite passed alone
+        and failed in combination). The flip must happen inside the run, and
+        deterministically, or this test is both flaky and contagious."""
+
+        async def connect(self) -> None:
+            await super().connect()
+            monkeypatch.setenv("DB_RECONNECT_SUPERVISOR_ENABLED", "false")
+            # Degrade again: with the switch honoured per cycle nothing may
+            # reconnect from here on.
+            self.is_connected = False
+
+    spy = FlipsTheSwitchOnFirstConnect(connected=False)
     monkeypatch.setattr(readiness, "database", spy)
 
-    async def disable_after_first_cycle():
-        await asyncio.sleep(0.025)
-        monkeypatch.setenv("DB_RECONNECT_SUPERVISOR_ENABLED", "false")
-        # Degrade again: without the kill switch the supervisor would recover
-        # it, so any further reconnect proves the switch was not re-read.
-        spy.is_connected = False
-
-    flipper = asyncio.create_task(disable_after_first_cycle())
     await readiness.run_database_reconnect_supervisor(
         interval_seconds=0.01, max_cycles=6
     )
-    flipper.cancel()
 
     assert spy.real_connects == 1, (
         f"{spy.real_connects} reconnects — the kill switch was resolved once "
