@@ -269,3 +269,100 @@ def test_is_content_key_rejects_other_id_formats() -> None:
     assert is_content_key("ck_short") is False
     # Right prefix + length, non-hex
     assert is_content_key("ck_" + "Z" * 32) is False
+
+
+# ---------------------------------------------------------------------------
+# Cross-language conformance corpus (issue #1694)
+#
+# The tests above pin behaviour one property at a time. These pin the exact
+# OUTPUT, case by case, and are mirrored byte-for-byte into PIVOTA-Agent, whose
+# Node port of this module reads the same file
+# (tests/fixtures/content_key_v1_cases.json there,
+#  tests/content_key_authority.test.js asserts it).
+#
+# The point is that neither side can move alone. This module is the authority,
+# so the corpus is generated here — scripts/generate_content_key_conformance_corpus.py
+# computes every key by calling make_content_key, never by hardcoding one. A
+# change to the formula therefore fails HERE first, at the authority, instead of
+# downstream or, as in 2026-05, nowhere at all: PIVOTA-Agent minted under three
+# rival formulas for two months without a single test going red, because nothing
+# connected the two repos. See pengxu9-rgb/PIVOTA-Agent#1916.
+#
+# If one of these fails, do NOT edit the JSON. Either the change was unintended,
+# or it was intended and the corpus needs regenerating — in which case the diff
+# is the deliverable, because it names exactly which keys move and therefore
+# which stored rows stop being reproducible.
+# ---------------------------------------------------------------------------
+
+import json  # noqa: E402
+
+import pytest  # noqa: E402
+
+_CORPUS_PATH = Path(__file__).parent / "fixtures" / "content_key_v1_cases.json"
+_CORPUS = json.loads(_CORPUS_PATH.read_text(encoding="utf-8"))
+
+
+def test_conformance_corpus_covers_rules_and_production_rows() -> None:
+    """Both halves must stay populated. Synthetic cases test the rules we
+    thought of; production rows test the ones we did not."""
+    rules = [c for c in _CORPUS if c["source"] == "python_authority"]
+    prod = [c for c in _CORPUS if c["source"] == "prod_catalog_products"]
+    assert len(rules) >= 20
+    assert len(prod) >= 8
+    assert len({c["name"] for c in _CORPUS}) == len(_CORPUS), "duplicate case names"
+
+
+@pytest.mark.parametrize("case", _CORPUS, ids=[c["name"] for c in _CORPUS])
+def test_conformance_corpus_case(case: dict) -> None:
+    """Every case recomputed from the authority. A hand-edited key fails here."""
+    assert make_content_key(case["brand"], case["title"], case["gtin"]) == case["content_key"]
+
+
+def _load_generator():
+    """Load the generator by file path.
+
+    Deliberately NOT `sys.path.insert(0, "scripts")`: scripts/ holds ~200 modules
+    with short, generic names, and putting it at the front of sys.path lets any
+    of them shadow a stdlib or first-party import for every test that runs after
+    this one in the same process. That is an order-dependent failure in an
+    unrelated suite — exactly the kind of thing a conformance test has no
+    business causing.
+    """
+    import importlib.util
+
+    generator_path = (
+        Path(__file__).resolve().parents[1]
+        / "scripts"
+        / "generate_content_key_conformance_corpus.py"
+    )
+    spec = importlib.util.spec_from_file_location(
+        "_content_key_corpus_generator", generator_path
+    )
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+def test_conformance_corpus_is_not_stale() -> None:
+    """The file on disk is exactly what the generator produces today. Catches a
+    formula change that was made without regenerating, and a corpus edited by
+    hand — both of which would otherwise leave a weakened gate looking green."""
+    generator = _load_generator()
+    build_corpus, render = generator.build_corpus, generator.render
+
+    assert _CORPUS_PATH.read_text(encoding="utf-8") == render(build_corpus()), (
+        "content_key_v1_cases.json is stale — run "
+        "python3 scripts/generate_content_key_conformance_corpus.py, read the diff, "
+        "then mirror the file into PIVOTA-Agent."
+    )
+
+
+def test_production_rows_reproduce_their_stored_keys() -> None:
+    """The 8 prod cases carry keys minted by this module and read back off
+    catalog_products on 2026-08-07. Recomputing them here is what makes the
+    corpus evidence about the live corpus rather than about itself."""
+    prod = [c for c in _CORPUS if c["source"] == "prod_catalog_products"]
+    for case in prod:
+        recomputed = make_content_key(case["brand"], case["title"], case["gtin"])
+        assert recomputed == case["content_key"], case["name"]
+        assert is_content_key(recomputed), case["name"]
