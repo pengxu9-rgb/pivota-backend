@@ -435,9 +435,11 @@ class BackfillReport:
 # ---------------------------------------------------------------------------
 
 class SellerBackfill:
-    def __init__(self, *, database: Any, si_mod: Any, execute: bool, batch_size: int):
+    def __init__(self, *, database: Any, si_mod: Any, execute: bool, batch_size: int,
+                 max_batches: int = 0):
         self.db = database
         self.si = si_mod
+        self.max_batches = int(max_batches or 0)
         self.execute = execute
         self.batch_size = batch_size
 
@@ -801,6 +803,9 @@ class SellerBackfill:
 
         # Batched execution with per-batch parity.
         for i in range(0, len(planned), self.batch_size):
+            if self.max_batches and stats["batches"] >= self.max_batches:
+                stats["stopped_at_max_batches"] = self.max_batches
+                break
             batch = planned[i:i + self.batch_size]
             parity = await self._resubject_batch(batch, cascade, report)
             report.parity.append(parity)
@@ -1345,6 +1350,8 @@ def _parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
                     help="Postgres URL (defaults to $DATABASE_URL).")
     ap.add_argument("--execute", action="store_true",
                     help="Perform writes. WITHOUT this flag the run is READ-ONLY (dry-run).")
+    ap.add_argument("--max-batches", type=int, default=0,
+                    help="stop the catalog phase after N batches (canary; 0 = no limit)")
     ap.add_argument("--batch-size", type=int, default=100,
                     help="Products per catalog re-key batch (default 100).")
     ap.add_argument("--phases", default="seeds,barekey,catalog,edges",
@@ -1379,6 +1386,7 @@ async def _amain(args: argparse.Namespace) -> int:
     try:
         report = await run_backfill(
             database=database, si_mod=si_mod, execute=args.execute,
+            max_batches=args.max_batches,
             batch_size=args.batch_size, phases=phases,
         )
     finally:

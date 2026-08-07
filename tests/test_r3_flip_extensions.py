@@ -276,3 +276,18 @@ class TestRetailerSeedRederivation:
         p = plan_seed({"id": "s5", "domain": "", "seller_ref": "",
                        "destination_url": "https://www.ulta.com/p/x", "brand": "B"})
         assert p is not None and p["new"] == make_observed_retailer_id("ulta.com")
+
+
+class TestMaxBatches:
+    @pytest.mark.asyncio
+    async def test_canary_stops_after_the_cap(self):
+        rows = [dict(ROW, product_key=f"prod::external_seed::external_seed::c{i}",
+                     source_product_id=f"c{i}", source_domain="ulta.com") for i in range(5)]
+        db = _FakeDb(products=rows)
+        bf = SellerBackfill(database=db, si_mod=None, execute=False, batch_size=2, max_batches=1)
+        report = BackfillReport(mode='dry_run', started_at='2026-08-07T00:00:00Z',
+                                phases=['catalog'], batch_size=2)
+        await bf.run_catalog(report)
+        assert report.catalog["batches"] == 1
+        assert report.catalog["stopped_at_max_batches"] == 1
+        assert report.catalog["resubjected"] == 2   # one batch of two, not five
