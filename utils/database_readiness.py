@@ -243,13 +243,12 @@ def _supervisor_interval() -> float:
         value = float(raw)
     except (TypeError, ValueError):
         value = float("nan")
-    # NaN and inf both survive float(); inf would wedge the loop on
-    # asyncio.sleep(inf) with no log line, silently disabling the supervisor
-    # (review round 19). Anything not finite falls back, loudly.
     # NaN/inf survive float() and would wedge the loop on sleep(inf) with no
-    # log line. So would a finite-but-huge typo (86400 = once a day), which is
-    # the same silent-disable defect reachable by a plausible mistake — so the
-    # clamp has BOTH ends, like main.py's _health_timeout_seconds.
+    # log line, silently disabling the supervisor (round 19). So would a
+    # finite-but-huge typo (86400 = once a day), the same defect by a more
+    # plausible mistake (round 20) — so the clamp has BOTH ends, like
+    # main.py's _health_timeout_seconds. Anything non-finite falls back,
+    # loudly.
     if not (value == value) or value in (float("inf"), float("-inf")):
         logger.warning(
             "invalid %s=%r; using %.1fs",

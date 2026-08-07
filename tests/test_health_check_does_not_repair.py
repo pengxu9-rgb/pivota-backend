@@ -506,8 +506,6 @@ async def test_kill_switch_takes_effect_MID_RUN_without_a_restart(
         f"{spy.real_connects} reconnects — the kill switch was resolved once "
         "at startup, so flipping it in production would need a redeploy")
 
-    monkeypatch.setenv("DB_RECONNECT_SUPERVISOR_ENABLED", "true")
-
 
 @pytest.mark.asyncio
 async def test_a_disabled_cycle_does_not_RETIRE_the_supervisor(
@@ -523,10 +521,16 @@ async def test_a_disabled_cycle_does_not_RETIRE_the_supervisor(
     fresh call re-reads the switch either way, so the `break` mutation passed.
     The state under test belongs to the loop, so the loop is what has to see
     the change."""
+    # Exact, not defaulted: `next(answers, True)` would tolerate extra calls,
+    # so a refactor checking the switch twice per cycle could still land on
+    # real_connects == 2 by coincidence rather than because cycle 2 was the
+    # disabled one (round-23 F1). Exhausting the iterator raises instead.
     answers = iter([True, False, True])
+    calls = {"n": 0}
 
     def stateful_enabled() -> bool:
-        return next(answers, True)
+        calls["n"] += 1
+        return next(answers)
 
     class DegradesAfterEveryReconnect(RealisticSpyDatabase):
         async def connect(self) -> None:
@@ -541,6 +545,10 @@ async def test_a_disabled_cycle_does_not_RETIRE_the_supervisor(
         interval_seconds=0.01, max_cycles=3
     )
 
+    assert calls["n"] == 3, (
+        f"the switch was read {calls['n']} times across 3 cycles — exactly "
+        "once per cycle is what makes the True/False/True sequence line up "
+        "with the cycles it is meant to describe")
     assert spy.real_connects == 2, (
         f"expected reconnects on cycles 1 and 3 with cycle 2 disabled, got "
         f"{spy.real_connects} — a disabled cycle must SKIP, not retire the "

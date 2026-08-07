@@ -1855,7 +1855,10 @@ def _health_timeout_seconds(name: str, default: float, *, min_value: float = 0.5
 @app.get("/health")
 async def health_check():
     """
-    Dedicated health check endpoint used by Railway (healthcheckPath=/health).
+    Health check endpoint. Railway's healthcheck is understood to point here
+    (`healthcheckPath=/health`), but that is a SERVICE SETTING held in Railway,
+    not in this repo — nothing in the tree pins it, so re-confirm in the
+    dashboard before relying on it.
 
     Must be fast, deterministic, and READ-ONLY:
       - OBSERVES DB state via probe_database_health — never connects, never
