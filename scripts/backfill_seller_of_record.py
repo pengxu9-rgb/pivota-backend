@@ -1006,18 +1006,24 @@ class SellerBackfill:
         platform = str(b.get("platform") or "")
         if not spid or not platform:
             return
-        params = {"obs": obs, "banned": BANNED_BUCKET_MERCHANT_ID,
-                  "platform": platform, "spid": spid}
+        # `databases` binds through SQLAlchemy text(), which REJECTS a params
+        # dict carrying a key the statement does not name. Each query gets
+        # exactly its own binds — a shared superset dict raised
+        # ArgumentError("doesn't define a bound parameter named 'banned'") and
+        # aborted the canary batch (caught 2026-08-07, before any write).
+        scope = {"platform": platform, "spid": spid}
+        obs_scope = {"obs": obs, **scope}
+        banned_scope = {"banned": BANNED_BUCKET_MERCHANT_ID, **scope}
         existing = await self.db.fetch_one(
             "SELECT product_group_id FROM product_group_members WHERE merchant_id = :obs "
             "AND platform = :platform AND platform_product_id = :spid",
-            params,
+            obs_scope,
         )
         if existing:
             banned_row = await self.db.fetch_one(
                 "SELECT product_group_id FROM product_group_members WHERE merchant_id = :banned "
                 "AND platform = :platform AND platform_product_id = :spid",
-                params,
+                banned_scope,
             )
             if banned_row and str(dict(banned_row).get("product_group_id")) != str(dict(existing).get("product_group_id")):
                 logger.warning(
@@ -1027,14 +1033,14 @@ class SellerBackfill:
             await self.db.execute(
                 "DELETE FROM product_group_members WHERE merchant_id = :banned "
                 "AND platform = :platform AND platform_product_id = :spid",
-                params,
+                banned_scope,
             )
             return
         sql = ("UPDATE product_group_members SET merchant_id = :obs "
                "WHERE merchant_id = :banned AND platform = :platform "
                "AND platform_product_id = :spid")
         assert_sig_frozen_sql(sql)
-        await self.db.execute(sql, params)
+        await self.db.execute(sql, {"obs": obs, **banned_scope})
 
     _listing_columns_cache: Optional[List[str]] = None
 
@@ -1153,7 +1159,7 @@ class SellerBackfill:
                    f"AND {seller_col} = :banned")
             params = {"obs": obs, "scope": sku_keys, "banned": BANNED_BUCKET_MERCHANT_ID}
         assert_sig_frozen_sql(sql)
-        await self.db.execute(sql, params)
+        await self.db.execute(sql, {"obs": obs, **banned_scope})
 
     async def _residue_audit(self, pks: List[str], cascade: List[Dict[str, Any]]) -> Dict[str, int]:
         """After re-subjecting a batch, assert no ENUMERATED dependent still holds
