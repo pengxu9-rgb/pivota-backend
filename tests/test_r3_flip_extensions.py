@@ -242,3 +242,37 @@ class TestListingCandidates:
         refs = bf._listing_refs_for(b, "merch_obs_aaaa0000aaaa0000")
         assert ("external_seed:ext_seed_123", "merch_obs_aaaa0000aaaa0000:ext_seed_123") in refs
         assert ("external_seed:brand name slug", "merch_obs_aaaa0000aaaa0000:brand name slug") in refs
+
+
+class TestRetailerSeedRederivation:
+    def test_ulta_seed_with_per_brand_ref_replans_to_the_retailer_id(self):
+        from scripts.rederive_retailer_seed_seller_refs import plan_seed
+        from services.seller_identity import make_observed_retailer_id
+        p = plan_seed({"id": "s1", "domain": "ulta.com", "brand": "Fenty Beauty",
+                       "seller_ref": "merch_obs_039b8cd5c84730bc"})
+        assert p is not None
+        assert p["new"] == make_observed_retailer_id("ulta.com")
+
+    def test_brand_direct_seed_is_never_touched(self):
+        from scripts.rederive_retailer_seed_seller_refs import plan_seed
+        assert plan_seed({"id": "s2", "domain": "fentybeauty.com",
+                          "brand": "Fenty Beauty", "seller_ref": "merch_obs_x"}) is None
+
+    def test_already_correct_retailer_ref_is_a_noop(self):
+        from scripts.rederive_retailer_seed_seller_refs import plan_seed
+        from services.seller_identity import make_observed_retailer_id
+        rid = make_observed_retailer_id("ulta.com")
+        assert plan_seed({"id": "s3", "domain": "ulta.com", "brand": "X",
+                          "seller_ref": rid}) is None
+
+    def test_unresolvable_domain_leaves_the_seed_alone(self):
+        from scripts.rederive_retailer_seed_seller_refs import plan_seed
+        assert plan_seed({"id": "s4", "domain": "not a domain",
+                          "brand": "", "seller_ref": "merch_obs_y"}) is None
+
+    def test_retailer_domain_recovered_from_destination_url(self):
+        from scripts.rederive_retailer_seed_seller_refs import plan_seed
+        from services.seller_identity import make_observed_retailer_id
+        p = plan_seed({"id": "s5", "domain": "", "seller_ref": "",
+                       "destination_url": "https://www.ulta.com/p/x", "brand": "B"})
+        assert p is not None and p["new"] == make_observed_retailer_id("ulta.com")
