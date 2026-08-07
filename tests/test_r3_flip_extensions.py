@@ -36,7 +36,9 @@ def _assert_binds_match(sql, params):
 
 
 class _FakeDb:
-    def __init__(self, *, products=None, listing_exists=False, pgm_target_exists=False):
+    def __init__(self, *, products=None, listing_exists=False, pgm_target_exists=False,
+                 cascade=None):
+        self.cascade = cascade or []
         self.products = products or []
         self.listing_exists = listing_exists
         self.pgm_target_exists = pgm_target_exists
@@ -48,7 +50,11 @@ class _FakeDb:
             return [{"column_name": c} for c in
                     ("source_listing_ref", "merchant_id", "product_id", "identity_status")]
         if "FROM information_schema.columns" in sql:
-            return []  # cascade discovery: no reflected dependents in these tests
+            # Cascade discovery. Tests that pass `cascade=` exercise the
+            # dependent-table path (_resubject_dependent) — it executed in NO
+            # test before 2026-08-07, which is how a NameError reached prod.
+            return [{"table_name": t, "column_name": c}
+                    for t, cols in self.cascade for c in cols]
         if "FROM catalog_products cp" in sql and "cp.merchant_id = :banned" in sql:
             return self.products
         if "FROM catalog_products WHERE product_key" in sql:
@@ -330,3 +336,57 @@ class TestMaxProducts:
         await bf.run_catalog(report)
         assert "LIMIT :cap" in captured["sql"]
         assert captured["params"]["cap"] == 30
+
+
+class TestDependentCascade:
+    """_resubject_dependent runs ONLY when reflection finds dependent tables —
+    so every earlier fake (which returned no cascade) left it unexecuted, and a
+    NameError shipped. These exercise all three scope shapes for real."""
+
+    @pytest.mark.asyncio
+    async def test_product_key_scope_executes_with_correct_binds(self):
+        db = _FakeDb(cascade=[("catalog_skus", ["merchant_id", "product_key"])])
+        bf = _backfill(db)
+        cascade = await bf.discover_cascade_tables()
+        assert cascade and cascade[0]["scope_col"] == "product_key"
+        await bf._resubject_dependent(cascade[0], "merch_obs_aaaa0000aaaa0000",
+                                      "prod::external_seed::external_seed::x1", "ck", ["sku1"])
+        sql, params = db.executed[-1]
+        assert sql.startswith("UPDATE catalog_skus SET merchant_id = :obs")
+        assert set(params) == {"obs", "scope", "banned"}
+
+    @pytest.mark.asyncio
+    async def test_content_key_scope_executes_with_correct_binds(self):
+        db = _FakeDb(cascade=[("index_pipeline_state", ["merchant_id", "content_key"])])
+        bf = _backfill(db)
+        cascade = await bf.discover_cascade_tables()
+        assert cascade[0]["scope_col"] == "content_key"
+        await bf._resubject_dependent(cascade[0], "merch_obs_aaaa0000aaaa0000",
+                                      "prod::external_seed::external_seed::x1", "ck", [])
+        sql, params = db.executed[-1]
+        assert "WHERE content_key = :scope" in sql
+        assert set(params) == {"obs", "scope", "banned"}
+
+    @pytest.mark.asyncio
+    async def test_sku_key_scope_executes_with_correct_binds(self):
+        db = _FakeDb(cascade=[("beauty_sku_ingredients", ["merchant_id", "sku_key"])])
+        bf = _backfill(db)
+        cascade = await bf.discover_cascade_tables()
+        assert cascade[0]["scope_col"] == "sku_key"
+        await bf._resubject_dependent(cascade[0], "merch_obs_aaaa0000aaaa0000",
+                                      "prod::external_seed::external_seed::x1", "ck", ["sku1"])
+        sql, params = db.executed[-1]
+        assert "WHERE sku_key = ANY(:scope)" in sql
+        assert set(params) == {"obs", "scope", "banned"}
+
+    @pytest.mark.asyncio
+    async def test_a_full_batch_walks_the_dependent_path_end_to_end(self):
+        # The integration shape the canary hit: a real cascade table means
+        # _resubject_batch calls _resubject_dependent for every product.
+        db = _FakeDb(products=[dict(ROW, source_domain="ulta.com")],
+                     cascade=[("catalog_skus", ["merchant_id", "product_key"])])
+        bf = SellerBackfill(database=db, si_mod=None, execute=False, batch_size=25)
+        report = BackfillReport(mode="dry_run", started_at="2026-08-07T00:00:00Z",
+                                phases=["catalog"], batch_size=25)
+        await bf.run_catalog(report)
+        assert report.catalog["resubjected"] == 1
