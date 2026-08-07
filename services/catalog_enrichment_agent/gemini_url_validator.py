@@ -178,11 +178,17 @@ async def validate_candidate(
     `api_key` defaults to GEMINI_API_KEY / PIVOTA_GEMINI_API_KEY env. When
     no key is available, returns a deterministic mock so the pipeline
     stays runnable end-to-end."""
+    # W2: the seller of record derives from the PDP's source_domain, so the
+    # validator must carry it. The candidate's PRIMARY expected domain is the
+    # deterministic source (one per candidate — never offer-order dependent).
+    _expected = candidate.get("expected_url_domains") or []
+    _primary_domain = str(_expected[0] if _expected else "").strip().lower().removeprefix("www.")
     pdp_payload = {
         "brand": candidate.get("brand"),
         "product_name": candidate.get("product_name"),
         "category_path": candidate.get("category_path"),
         "attribute_summary": candidate.get("attribute_summary"),
+        "source_domain": _primary_domain or None,
     }
     resolved_key = api_key if api_key is not None else _resolve_api_key()
     if not vertex_gemini.credentials_available(resolved_key):

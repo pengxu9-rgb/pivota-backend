@@ -339,8 +339,10 @@ def test_pdp_plan_rows_cover_upsert_params():
     _apply_pdp_identity_gate stamps unconditionally before the upsert."""
     from services.catalog_enrichment_agent.ingestion import _build_pdp_insert
     from services.intake_identity import canonical_gtin
+    from services.seller_identity import resolve_seed_seller_identity
 
     row = _build_pdp_insert(
+        seller=resolve_seed_seller_identity(brand="B", domain="b.com"),
         pdp_payload={"brand": "B", "product_name": "N", "category_path": "beauty/skin",
                      "attribute_summary": "x", "source_domain": "b.com", "tags": []},
         offers=[{"canonical_url": "https://b.com/p", "image_url": "https://b.com/i.jpg",

@@ -36,7 +36,7 @@ from __future__ import annotations
 
 import hashlib
 import logging
-from typing import Optional
+from typing import Optional, Dict
 
 from db.database import database
 # Reuse the repo's registrable-domain scheme (brand-claim / domain-verification
@@ -80,6 +80,105 @@ def etld1(domain: Optional[str]) -> str:
     if len(labels) >= 3 and ".".join(labels[-2:]) in _PUBLIC_SUFFIXES:
         return ".".join(labels[-3:])
     return ".".join(labels[-2:])
+
+
+def is_known_retailer_domain(domain: Optional[str]) -> bool:
+    """W2 (ADR-011 R5 closure): is this domain a known RETAILER host? ONE
+    definition system-wide — this delegates to the exact matcher the offer
+    lane uses (`offer_seller_identity.is_known_retailer`, suffix match), so
+    the two lanes cannot classify the same host differently. Known limitation,
+    deliberate: a subdomain-only list entry (e.g. beauty.example.com) still
+    KEYS on the registrable (etld1) — adding a subdomain to the retailer list
+    designates the whole registrable as a retailer for identity purposes."""
+    from services.offer_seller_identity import is_known_retailer
+
+    return is_known_retailer(str(domain or "").strip().rstrip("."))
+
+
+# Second-level labels that are generic registries, not sellers. `etld1` uses a
+# CURATED suffix list, so an uncurated ccTLD (brand.com.vn) yields a bare
+# public suffix ("com.vn") as its "registrable". Minting or claim-matching on
+# that would collapse every site under that registry into one identity — and a
+# verified brand claim on ANY .com.vn domain would capture them all.
+_GENERIC_SECOND_LEVEL_LABELS = frozenset({
+    "com", "co", "net", "org", "edu", "gov", "ac", "or", "ne", "mil", "int", "gob",
+})
+
+
+def _plausible_registrable(registrable: str) -> bool:
+    """Reject registrables that are (or look like) bare public suffixes."""
+    if not registrable or "." not in registrable:
+        return False
+    first = registrable.split(".", 1)[0]
+    if first in _GENERIC_SECOND_LEVEL_LABELS:
+        return False
+    return True
+
+
+def make_observed_retailer_id(domain: str) -> str:
+    """Deterministic observed RETAILER seller id, keyed on the domain ALONE
+    (W2 / founder-ratified 2026-08-05): one retailer = one merchant, no matter
+    how many brands it carries. Per-brand keying on a retailer domain would
+    mint hundreds of merchants for one seller — the mirror image of the
+    shared-bucket bug ADR-009 fixes. The brand stays a product attribute.
+
+    Id space: `merch_obs_<sha256("retailer::" + etld1)[:16]>` — the namespace
+    prefix keeps it disjoint from the brand-direct space by construction.
+    Raises on a non-registrable domain — never mints from nothing."""
+    registrable = etld1(str(domain or "").strip().rstrip("."))
+    if not _plausible_registrable(registrable):
+        raise ValueError(
+            "cannot mint an observed retailer identity from a non-registrable "
+            f"domain ({domain!r} -> {registrable!r}); supply a real domain or "
+            "skip the row loudly"
+        )
+    raw = f"retailer::{registrable}".encode("utf-8")
+    digest = hashlib.sha256(raw).hexdigest()[:16]
+    return f"{OBSERVED_ID_PREFIX}{digest}"
+
+
+def resolve_seed_seller_identity(*, brand: Optional[str], domain: Optional[str]) -> Dict[str, str]:
+    """PURE W2 dispatch — the seller of record is the party that sells, and the
+    keying follows the domain's type:
+
+      retailer domain (known list)  -> keyed on etld1 alone
+      anything else (brand-direct)  -> keyed on (brand, etld1), unchanged ADR-009
+
+    Returns {kind, merchant_id, merchant_name, registrable}. Raises ValueError
+    when the identity cannot be derived (unregistrable domain, or empty brand
+    on a brand-direct domain) — the caller must SKIP the row loudly and retry
+    later; there is no fallback identity and the legacy bucket is never a
+    landing zone (founder rule, 2026-08-06).
+
+    DB concerns stay out of this function on purpose: claimed-domain attach
+    ("attach beats mint") and the insert-if-missing of the merchant row happen
+    at apply time, where a connection exists."""
+    registrable = etld1(str(domain or "").strip().rstrip("."))
+    if not _plausible_registrable(registrable):
+        raise ValueError(
+            f"seller-of-record unresolvable: non-registrable domain {domain!r}"
+            f" (registrable {registrable!r})"
+        )
+    if is_known_retailer_domain(domain):
+        return {
+            "kind": "retailer",
+            "merchant_id": make_observed_retailer_id(registrable),
+            "merchant_name": registrable,
+            "registrable": registrable,
+        }
+    nbrand = normalize_brand(brand or "")
+    if not nbrand:
+        raise ValueError(
+            "seller-of-record unresolvable: empty brand on a brand-direct "
+            f"domain ({domain!r}); not a known retailer, so (brand, etld1) "
+            "keying applies and needs a real brand"
+        )
+    return {
+        "kind": "brand_direct",
+        "merchant_id": make_observed_merchant_id(brand or "", registrable),
+        "merchant_name": (brand or "").strip(),
+        "registrable": registrable,
+    }
 
 
 def make_observed_merchant_id(brand: str, domain: str) -> str:

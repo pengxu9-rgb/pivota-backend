@@ -42,12 +42,15 @@ async def _validate_all(
                 return await validate_candidate(cand, timeout_s=timeout_s)
             except Exception as exc:  # noqa: BLE001 — one bad candidate must not abort the batch
                 logger.exception("validate failed for %s — %s", cand.get("product_name"), exc)
+                _expected = cand.get("expected_url_domains") or []
                 return {
                     "pdp": {
                         "brand": cand.get("brand"),
                         "product_name": cand.get("product_name"),
                         "category_path": cand.get("category_path"),
                         "attribute_summary": cand.get("attribute_summary"),
+                        # W2: seller of record needs the candidate's own domain.
+                        "source_domain": str(_expected[0] if _expected else "").strip().lower().removeprefix("www.") or None,
                     },
                     "offers": [],
                 }
