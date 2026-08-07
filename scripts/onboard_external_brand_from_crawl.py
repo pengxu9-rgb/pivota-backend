@@ -602,14 +602,29 @@ async def _onboard(
     if not serve:
         os.environ["EXTERNAL_SEED_MIRROR_MAKE_SERVABLE"] = "0"
     try:
-        inserted = await mirror_apply(max(50, len(cohort) * 3))
+        if not cohort:
+            # mirror_apply's `missing` CTE is GLOBAL, not scoped to this cohort:
+            # with nothing to seed, `max(50, 0)` would still mirror up to 50
+            # unrelated brands' pending seeds and report the count as if it were
+            # ours. Under --no-serving that is actively destructive — the env
+            # override above is read per row inside the mirror loop, so those
+            # other brands' rows get mirrored with the servable pass OFF, and
+            # once a catalog_products row exists they leave `missing` forever
+            # and the scheduled mirror never revisits them. They are stranded
+            # non-servable, silently. The publication gate makes an empty cohort
+            # a routine outcome (biodance: every row rejected), so this is no
+            # longer a theoretical branch.
+            inserted = 0
+            print("mirror skipped: nothing to seed after dedup + publication gate")
+        else:
+            inserted = await mirror_apply(max(50, len(cohort) * 3))
+            print(f"mirror inserted_catalog_products={inserted}")
     finally:
         if not serve:
             if _prev_make_servable is None:
                 os.environ.pop("EXTERNAL_SEED_MIRROR_MAKE_SERVABLE", None)
             else:
                 os.environ["EXTERNAL_SEED_MIRROR_MAKE_SERVABLE"] = _prev_make_servable
-    print(f"mirror inserted_catalog_products={inserted}")
     for p in cohort:
         merchant_id, product_key = keys[p["external_product_id"]]
         await _set_category_and_offer(p, product_key, merchant_id)
@@ -728,35 +743,54 @@ async def _drive(args: argparse.Namespace) -> None:
             "<ISO timestamp of the actual crawl>.",
             file=sys.stderr,
         )
-    kept, dropped, decisions = dedupe_cohort(cohort)
     serve = not args.no_serving
-    # Publication gate (PIVOTA-Agent#1926) runs AFTER dedup, on the canonical
-    # set only: the two passes answer different questions and a row can fail
-    # both. Dedup first keeps the sitemap lookups proportional to real products.
+    # Reported below as the cohort's input size; the gate shrinks `cohort`.
+    total_in = len(cohort)
+    # Publication gate (PIVOTA-Agent#1926) runs BEFORE dedup, on the FULL cohort.
+    #
+    # Order matters, and the obvious order is wrong. Gating the post-dedup set
+    # instead lets the two passes compose into a row-destroying pincer:
+    # dedupe_cohort elects ONE canonical per (brand, base title) and suppresses
+    # the rest as duplicates, but it ranks on title/handle shape, not on whether
+    # a row is a product. _canonical_rank penalises any handle ending in `-<N>`
+    # — which plenty of REAL published handles do (`collagen-mask-2`,
+    # `set-of-2`) — so a campaign clone with a clean-looking handle can beat the
+    # genuine PDP. The genuine PDP is then already suppressed as a "duplicate"
+    # when the gate rejects the elected campaign page, and a product that IS in
+    # the merchant's sitemap disappears from the catalog entirely. The
+    # all-rejected warning below does not fire in that mixed case, so it fails
+    # silently.
+    #
+    # Gating first removes campaign pages before any election happens, so dedup
+    # only ever elects among rows the merchant actually publishes. It costs
+    # nothing extra: PublicationOracle caches per HOST, so classifying 250 rows
+    # and classifying 34 issue the same single sitemap fetch — only in-memory
+    # set membership scales with row count.
     unpublished: List[Dict[str, Any]] = []
     if not args.no_publication_gate:
-        kept, unpublished, verdicts = await partition_by_publication(kept)
+        cohort, unpublished, verdicts = await partition_by_publication(cohort)
         print(
             f"publication: {verdicts.get(PUBLISHED, 0)} published, "
             f"{verdicts.get(UNPUBLISHED, 0)} unpublished (ad landing pages), "
             f"{verdicts.get(UNKNOWN, 0)} unknown (passed through)"
         )
-        if unpublished and not kept:
-            # Either the whole store is campaign pages (biodance.com is exactly
-            # this — all 250 crawled URLs were ad variants and the 36 real PDPs
-            # were never crawled) or the crawl and the sitemap disagree about
-            # the store's URL space. Both are worth a human look, and the
-            # script's dry-run default guarantees one before anything is written.
-            print(
-                "WARNING: the publication gate rejected EVERY row in this cohort. "
-                "That is correct for an all-campaign crawl, but it is also what a "
-                "crawl pointed at the wrong URL space looks like. Confirm against "
-                f"https://{_seed_domain(unpublished[0]) or '<host>'}/sitemap.xml "
-                "before --apply.",
-                file=sys.stderr,
-            )
+    kept, dropped, decisions = dedupe_cohort(cohort)
+    if unpublished and not kept:
+        # Either the whole store is campaign pages (biodance.com is exactly
+        # this — all 250 crawled URLs were ad variants and the 36 real PDPs
+        # were never crawled) or the crawl and the sitemap disagree about
+        # the store's URL space. Both are worth a human look, and the
+        # script's dry-run default guarantees one before anything is written.
+        print(
+            "WARNING: the publication gate rejected EVERY row in this cohort. "
+            "That is correct for an all-campaign crawl, but it is also what a "
+            "crawl pointed at the wrong URL space looks like. Confirm against "
+            f"https://{_seed_domain(unpublished[0]) or '<host>'}/sitemap.xml "
+            "before --apply.",
+            file=sys.stderr,
+        )
     print(
-        f"{'APPLY' if args.apply else 'DRY'} :: {len(cohort)} products "
+        f"{'APPLY' if args.apply else 'DRY'} :: {total_in} products "
         f"({len(kept)} canonical, {len(dropped)} duplicate listing(s) collapsed, "
         f"{len(unpublished)} unpublished) "
         f"[posture: {'serving' if serve else 'decision-grade only (no serving)'}]"
