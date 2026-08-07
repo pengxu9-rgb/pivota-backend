@@ -7,7 +7,7 @@ FastAPI application with comprehensive dashboard and real-time metrics
 import asyncio
 import logging
 import time
-from contextlib import asynccontextmanager
+from contextlib import asynccontextmanager, suppress
 from datetime import datetime, timezone
 from functools import lru_cache
 import uvicorn
@@ -41,7 +41,11 @@ except ModuleNotFoundError:
 import subprocess
 import os
 from pathlib import Path
-from utils.database_readiness import DatabaseUnavailableError, ensure_database_ready
+from utils.database_readiness import (
+    DatabaseUnavailableError,
+    probe_database_health,
+    run_database_reconnect_supervisor,
+)
 
 SERVICE_STARTED_AT = datetime.now(timezone.utc).replace(microsecond=0).isoformat().replace("+00:00", "Z")
 SERVICE_NAME = (os.getenv("PIVOTA_SERVICE_NAME") or os.getenv("SERVICE_NAME") or "pivota-backend").strip() or "pivota-backend"
@@ -1786,9 +1790,23 @@ async def shutdown():
 async def app_lifespan(_app: FastAPI):
     await startup_event()
     await startup()
+    # Unattended DB repair. /health no longer reconnects as a side effect of
+    # being polled (see utils.database_readiness.probe_database_health), and
+    # ensure_database_ready only runs on login/quote/order requests — so a
+    # process serving read-only traffic had no way back from a degraded
+    # start. This task is the way back. It is NOT an APScheduler job on
+    # purpose: during the 2026-08-05/06 incident every scheduler job was
+    # wedged, and a repair mechanism must not share fate with what it repairs.
+    reconnect_supervisor = asyncio.create_task(run_database_reconnect_supervisor())
     try:
         yield
     finally:
+        reconnect_supervisor.cancel()
+        # Suppress Exception too, not only CancelledError: anything else
+        # escaping this await propagates out of the finally and SKIPS
+        # shutdown()/shutdown_event() entirely (review round 20).
+        with suppress(asyncio.CancelledError, Exception):
+            await reconnect_supervisor
         await shutdown()
         await shutdown_event()
 
@@ -1837,25 +1855,34 @@ def _health_timeout_seconds(name: str, default: float, *, min_value: float = 0.5
 @app.get("/health")
 async def health_check():
     """
-    Dedicated health check endpoint used by Railway.
+    Health check endpoint. Railway's healthcheck is understood to point here
+    (`healthcheckPath=/health`), but that is a SERVICE SETTING held in Railway,
+    not in this repo — nothing in the tree pins it, so re-confirm in the
+    dashboard before relying on it.
 
-    Must be fast and deterministic:
-      - checks DB connectivity (short timeout)
+    Must be fast, deterministic, and READ-ONLY:
+      - OBSERVES DB state via probe_database_health — never connects, never
+        resets the pool. An indicator that repairs what it measures cannot
+        reveal an outage: driven on the pre-fix commit, /health answered 200
+        five times out of five against a disconnected backend, having
+        reconnected on the first poll. (The 12.5-hour outage of 2026-08-05/06
+        is what sent us looking here, but its mechanism was never reproduced
+        from this path — motivation, not established root cause.)
       - checks required schema exists (read-only)
+
+    A disconnected backend MUST surface as 503 here. Request-time recovery
+    lives in ensure_database_ready, which the auth/quote/order paths still
+    call — reporting the truth does not remove the app's ability to heal.
     """
     started_at = time.time()
     db_ok = False
     missing: dict[str, list[str]] = {}
     db_error = None
-    connect_timeout = _health_timeout_seconds("DB_HEALTH_CONNECT_TIMEOUT_SECONDS", 5.0)
     probe_timeout = _health_timeout_seconds("DB_HEALTH_PROBE_TIMEOUT_SECONDS", 3.0)
     schema_timeout = _health_timeout_seconds("DB_HEALTH_SCHEMA_TIMEOUT_SECONDS", 5.0)
 
     try:
-        await ensure_database_ready(
-            connect_timeout_seconds=connect_timeout,
-            probe_timeout_seconds=probe_timeout,
-        )
+        await probe_database_health(probe_timeout_seconds=probe_timeout)
         db_ok = True
     except DatabaseUnavailableError as e:
         db_error = e.error_type
