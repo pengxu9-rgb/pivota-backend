@@ -31,7 +31,7 @@ class _FakeDb:
                     ("source_listing_ref", "merchant_id", "product_id", "identity_status")]
         if "FROM information_schema.columns" in sql:
             return []  # cascade discovery: no reflected dependents in these tests
-        if "FROM catalog_products WHERE merchant_id" in sql:
+        if "FROM catalog_products cp" in sql and "cp.merchant_id = :banned" in sql:
             return self.products
         if "FROM catalog_products WHERE product_key" in sql:
             return [{"product_key": p["product_key"], "pivota_signature_id": "sig_x",
@@ -42,15 +42,26 @@ class _FakeDb:
 
     async def fetch_one(self, sql, params=None):
         if "FROM pdp_identity_listing WHERE source_listing_ref" in sql:
-            return {"?column?": 1} if self.listing_exists else None
-        if "FROM product_group_members WHERE merchant_id = :obs" in sql:
-            return {"?column?": 1} if self.pgm_target_exists else None
+            ref = (params or {}).get("r") or (params or {}).get("old_ref") or ""
+            if str(ref).startswith("external_seed:"):
+                return {"?column?": 1} if self.listing_exists else None
+            return {"?column?": 1} if getattr(self, "new_ref_exists", False) else None
         if "count(*)" in sql:
             return {"c": 0}
+        if "FROM product_group_members WHERE merchant_id = :obs" in sql:
+            return {"product_group_id": "grp_obs"} if self.pgm_target_exists else None
+        if "FROM product_group_members WHERE merchant_id = :banned" in sql:
+            return {"product_group_id": "grp_banned"}
         return None
 
     async def execute(self, sql, params=None):
         self.executed.append((" ".join(sql.split()), dict(params or {})))
+
+    def transaction(self):
+        class _Txn:
+            async def __aenter__(self_inner): return self_inner
+            async def __aexit__(self_inner, *a): return False
+        return _Txn()
 
 
 def _backfill(db):
@@ -62,6 +73,7 @@ ROW = {
     "content_key": "ck", "brand": "B", "source_domain": "b.com",
     "canonical_url": "https://b.com/p", "platform": "external_seed",
     "source_product_id": "x1",
+    "seed_external_product_id": None, "seed_domain": None, "seed_destination_url": None,
 }
 
 
@@ -76,9 +88,10 @@ class TestListingRefMigration:
         # 1. copy under the new ref, idempotent for resume
         assert sqls[0].startswith("INSERT INTO pdp_identity_listing")
         assert "ON CONFLICT (source_listing_ref) DO NOTHING" in sqls[0]
-        # every live column rides along; the two identity columns are replaced
-        assert "source_listing_ref, merchant_id, product_id, identity_status" in sqls[0]
-        assert "SELECT :new_ref, :obs, product_id, identity_status" in sqls[0]
+        # every live column rides along (QUOTED against reserved words); the
+        # two identity columns are replaced
+        assert '"source_listing_ref", "merchant_id", "product_id", "identity_status"' in sqls[0]
+        assert 'SELECT :new_ref, :obs, "product_id", "identity_status"' in sqls[0]
         # 2+3. BOTH child tables repoint — overrides are operator work
         assert "UPDATE pdp_identity_review_queue SET source_listing_ref" in sqls[1]
         assert "UPDATE pdp_identity_override SET source_listing_ref" in sqls[2]
@@ -138,6 +151,13 @@ class TestPlanning:
     def test_the_rig_domain_is_pinned(self):
         assert "jwx893-fz.myshopify.com" in EXCLUDED_SOURCE_DOMAINS
 
+    def test_rig_exclusion_matches_www_variants_and_url_only_rows(self):
+        from scripts.backfill_seller_of_record import _is_excluded_rig_row
+        assert _is_excluded_rig_row({"source_domain": "www.jwx893-fz.myshopify.com"})
+        assert _is_excluded_rig_row({"source_domain": "",
+                                     "canonical_url": "https://jwx893-fz.myshopify.com/p/x"})
+        assert not _is_excluded_rig_row({"source_domain": "b.com"})
+
     def test_retailer_identity_matches_w2_keying(self):
         assert make_observed_retailer_id("ulta.com").startswith("merch_obs_")
 
@@ -147,17 +167,78 @@ class TestPlanDomain:
         from scripts.backfill_seller_of_record import _plan_domain
         row = {"brand": "Biodance", "source_domain": "Better Formula for Better Glow",
                "canonical_url": "https://biodance.com/products/x"}
-        assert _plan_domain(row) == "biodance.com"
+        assert _plan_domain(row) == ("biodance.com", True)
+
+    def test_seed_destination_recovers_when_catalog_fields_are_garbage(self):
+        # The 250-row Biodance cohort: tagline in source_domain, empty
+        # canonical_url, real domain only on the attached seed.
+        from scripts.backfill_seller_of_record import _plan_domain
+        row = {"brand": "Biodance", "source_domain": "Better Formula for Better Glow",
+               "canonical_url": "", "seed_domain": "",
+               "seed_destination_url": "https://biodance.com/products/x"}
+        assert _plan_domain(row) == ("biodance.com", True)
 
     def test_valid_source_domain_wins(self):
         from scripts.backfill_seller_of_record import _plan_domain
         row = {"brand": "B", "source_domain": "b.com",
                "canonical_url": "https://retailer.example/products/x"}
-        assert _plan_domain(row) == "b.com"
+        assert _plan_domain(row) == ("b.com", True)
 
-    def test_nothing_resolvable_still_blocks(self):
+    def test_nothing_resolvable_reports_unresolved(self):
         from scripts.backfill_seller_of_record import _plan_domain
         row = {"brand": "", "source_domain": "not a domain", "canonical_url": ""}
-        # returns the raw candidate; resolve_seed_seller_identity then raises ->
-        # the row routes to review, never to a guessed identity.
-        assert _plan_domain(row) == "not a domain"
+        domain, resolved = _plan_domain(row)
+        assert resolved is False
+
+    def test_a_bare_public_suffix_never_reaches_the_brand_resolver(self):
+        # make_observed_merchant_id lacks the plausible-registrable guard and
+        # happily keys on a bare 'com.vn' — the plan must route to review
+        # instead of falling through (review finding 7).
+        from scripts.backfill_seller_of_record import _plan_domain
+        row = {"brand": "Brand", "source_domain": "shop.com.vn", "canonical_url": ""}
+        _domain, resolved = _plan_domain(row)
+        assert resolved is False
+
+
+class TestExecuteDivergenceGuard:
+    @pytest.mark.asyncio
+    async def test_ensure_gets_the_planned_domain_and_divergence_skips_the_product(self, monkeypatch):
+        # Review finding 1: execute used to feed ensure the RAW columns while
+        # the row was re-keyed to the PLANNED id — the Biodance cohort would
+        # have crashed the batch, and claim-attach divergence would have keyed
+        # rows to a merchant that never got minted.
+        import scripts.backfill_seller_of_record as mod
+
+        calls = {}
+        async def fake_ensure(*, kind, brand, domain, source_system, primary_platform=None):
+            calls["domain"] = domain
+            return "merch_obs_DIFFERENT0000000"  # diverges from the plan
+        monkeypatch.setattr(mod, "ensure_observed_seller_of_record", fake_ensure)
+
+        db = _FakeDb(products=[])
+        bf = SellerBackfill(database=db, si_mod=None, execute=True, batch_size=10)
+        report = BackfillReport(mode='execute', started_at='2026-08-07T00:00:00Z',
+                                phases=['catalog'], batch_size=10)
+        batch = [dict(ROW, observed_id="merch_obs_planned000000000",
+                      seller_kind="brand_direct", seller_domain="biodance.com",
+                      listing_product_ids=["x1"])]
+        parity = await bf._resubject_batch(batch, [], report)
+        assert calls["domain"] == "biodance.com"          # the PLANNED domain
+        assert parity["skipped_to_review"][0]["reason"] == "ensured_seller_diverges_from_plan"
+        # No catalog UPDATE ran for the skipped product.
+        assert not any("UPDATE catalog_products" in sql for sql, _ in db.executed)
+
+
+class TestListingCandidates:
+    def test_path_c_listing_refs_use_the_seed_external_id(self):
+        # Review finding 2: Path C rows carry a name slug in source_product_id;
+        # their listings key on the attached seed's external_product_id.
+        # Measured 2026-08-07: 0 Path C listings under the slug, 2,444 under
+        # the seed id.
+        db = _FakeDb()
+        bf = _backfill(db)
+        b = dict(ROW, source_product_id="brand name slug",
+                 listing_product_ids=["brand name slug", "ext_seed_123"])
+        refs = bf._listing_refs_for(b, "merch_obs_aaaa0000aaaa0000")
+        assert ("external_seed:ext_seed_123", "merch_obs_aaaa0000aaaa0000:ext_seed_123") in refs
+        assert ("external_seed:brand name slug", "merch_obs_aaaa0000aaaa0000:brand name slug") in refs
