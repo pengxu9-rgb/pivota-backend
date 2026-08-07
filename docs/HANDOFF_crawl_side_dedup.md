@@ -32,6 +32,14 @@ listings). See commit `3a477f51` /
 Find the `external_brand_crawl` writer and add dedup so duplicate listings of one
 product don't each become a serving row.
 
+> **CORRECTION (2026-08-07).** The "not in pivota-backend" verdict below is
+> wrong and cost a later investigation time. The writer **is** in this repo:
+> `scripts/onboard_external_brand_from_crawl.py`, which declares
+> `TOOL = "external_brand_crawl"` and mints exactly those seed ids. The dedup
+> this handoff asked for shipped there in 577a6c8f (#1247), and the
+> ad-campaign-landing-page gate that dedup cannot cover shipped alongside it
+> (PIVOTA-Agent#1926, `services/shopify_publication_signal.py`).
+
 **Where to look — the writer is NOT in pivota-backend** (verified: no code writes
 seed IDs of the form `external_brand_crawl::<merchant>_<shopify_product_id>`, and
 `external_product_seeds` INSERTs in this repo are only the
