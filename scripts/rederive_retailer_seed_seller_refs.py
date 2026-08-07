@@ -88,17 +88,38 @@ async def main() -> None:
 
     await database.connect()
     try:
-        rows = await database.fetch_all(
-            # seed_data carries brand for seeds without a column (A9-4 note);
-            # brand is only used for classification tie-breaks, retailer keying
-            # ignores it by design.
-            "SELECT id, domain, destination_url, canonical_url, seller_ref, "
-            "seed_data->>'brand' AS brand "
-            "FROM external_product_seeds WHERE status = 'active'"
-        )
+        # Keyset-chunked scan: the Railway public proxy drops long statements
+        # (measured 2026-08-07 — a single full-table fetch hung on a dead
+        # socket twice). Each chunk is a short statement, retried on failure.
+        rows: List[Dict[str, Any]] = []
+        last = ""
+        failures = 0
+        while True:
+            try:
+                chunk = await database.fetch_all(
+                    # seed_data carries brand for seeds without a column; brand
+                    # is only a classification tie-break — retailer keying
+                    # ignores it by design.
+                    "SELECT id, domain, destination_url, canonical_url, seller_ref, "
+                    "seed_data->>'brand' AS brand "
+                    "FROM external_product_seeds WHERE status = 'active' AND id > :last "
+                    "ORDER BY id LIMIT 1000",
+                    {"last": last},
+                )
+            except Exception as exc:  # noqa: BLE001 — proxy flake; retry the chunk
+                failures += 1
+                if failures >= 8:
+                    raise RuntimeError(f"seed scan failed {failures} times: {exc}") from exc
+                await asyncio.sleep(3)
+                continue
+            failures = 0
+            if not chunk:
+                break
+            rows.extend(dict(r) for r in chunk)
+            last = str(dict(chunk[-1])["id"])
         plans = []
-        for r in rows or []:
-            p = plan_seed(dict(r))
+        for r in rows:
+            p = plan_seed(r)
             if p:
                 plans.append(p)
 
@@ -121,11 +142,18 @@ async def main() -> None:
         for target, seed_ids in by_target.items():
             for i in range(0, len(seed_ids), CHUNK):
                 chunk = seed_ids[i:i + CHUNK]
-                await database.execute(
-                    "UPDATE external_product_seeds SET seller_ref = :target, updated_at = NOW() "
-                    "WHERE id = ANY(:ids) AND coalesce(seller_ref, '') <> :target",
-                    {"target": target, "ids": chunk},
-                )
+                for attempt in range(4):
+                    try:
+                        await database.execute(
+                            "UPDATE external_product_seeds SET seller_ref = :target, updated_at = NOW() "
+                            "WHERE id = ANY(:ids) AND coalesce(seller_ref, '') <> :target",
+                            {"target": target, "ids": chunk},
+                        )
+                        break
+                    except Exception as exc:  # noqa: BLE001 — convergent; retry is free
+                        if attempt == 3:
+                            raise
+                        await asyncio.sleep(3)
                 updated += len(chunk)
                 print(json.dumps({"event": "chunk_done", "target": target,
                                   "rows": len(chunk), "total_sent": updated}))
