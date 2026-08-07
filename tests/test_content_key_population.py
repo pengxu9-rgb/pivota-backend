@@ -47,8 +47,11 @@ def test_path_c_pdp_insert_sets_content_key_from_brand_and_product_name() -> Non
         "category_path": "Skincare/Serums",
     }
     offers = [{"merchant_id": "sephora", "price": 38.00, "currency": "USD"}]
+    from services.seller_identity import resolve_seed_seller_identity
+
     result = _build_pdp_insert(
         pdp_payload=pdp_payload, offers=offers, source_jsonl=None,
+        seller=resolve_seed_seller_identity(brand=pdp_payload["brand"], domain="brand.example.com"),
     )
     assert "content_key" in result
     assert result["content_key"] == make_content_key(
@@ -70,8 +73,11 @@ def test_path_c_pdp_insert_uses_gtin_when_present() -> None:
         "category_path": "Beauty/Makeup/Lips",
     }
     offers = []
+    from services.seller_identity import resolve_seed_seller_identity
+
     result = _build_pdp_insert(
         pdp_payload=pdp_payload, offers=offers, source_jsonl=None,
+        seller=resolve_seed_seller_identity(brand=pdp_payload["brand"], domain="brand.example.com"),
     )
     # With GTIN
     expected = make_content_key("MAC", "Lipstick Russian Red", "0773602443796")

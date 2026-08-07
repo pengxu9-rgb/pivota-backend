@@ -218,6 +218,7 @@ def test_ingest_plan_plumbs_rating_and_inci_intent():
             "product_name": "Advanced Snail 96 Mucin Power Essence",
             "category_path": "beauty/skincare",
             "attribute_summary": "snail essence",
+            "source_domain": "cosrx.com",
             "rating_value": 4.3,
             "rating_count": 215,
             "raw_inci": _INCI,
@@ -241,7 +242,8 @@ def test_ingest_plan_plumbs_rating_and_inci_intent():
 def test_ingest_plan_skips_inci_when_absent():
     rec = {
         "pdp": {"brand": "COSRX", "product_name": "No Ingredients Listed",
-                "category_path": "beauty/skincare", "attribute_summary": "x"},
+                "category_path": "beauty/skincare", "attribute_summary": "x",
+                "source_domain": "cosrx.com"},
         "offers": [{"merchant_inferred": "COSRX", "canonical_url": "https://cosrx.com/products/y",
                     "destination_url": "https://cosrx.com/products/y", "price": 12.0, "in_stock": True}],
     }
