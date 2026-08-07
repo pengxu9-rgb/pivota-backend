@@ -506,18 +506,45 @@ async def test_kill_switch_takes_effect_MID_RUN_without_a_restart(
         f"{spy.real_connects} reconnects — the kill switch was resolved once "
         "at startup, so flipping it in production would need a redeploy")
 
-    # ...and BACK ON. Both halves matter: with `break` instead of `continue`
-    # one observed 'false' retires the supervisor permanently and re-enabling
-    # needs a restart — the same silent-retirement class the interval clamp
-    # exists to prevent. That mutation passed the whole suite while only the
-    # off-half was tested (round-22 finding 2).
     monkeypatch.setenv("DB_RECONNECT_SUPERVISOR_ENABLED", "true")
+
+
+@pytest.mark.asyncio
+async def test_a_disabled_cycle_does_not_RETIRE_the_supervisor(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """ROUND-22 finding 2. `continue` vs `break` on the kill switch: with
+    `break`, one observed 'false' retires the supervisor for the life of the
+    process and re-enabling needs a restart — the same silent-retirement class
+    the interval clamp exists to prevent.
+
+    This must be driven INSIDE ONE RUN. An earlier attempt flipped the env and
+    called the supervisor a second time, which cannot distinguish the two: a
+    fresh call re-reads the switch either way, so the `break` mutation passed.
+    The state under test belongs to the loop, so the loop is what has to see
+    the change."""
+    answers = iter([True, False, True])
+
+    def stateful_enabled() -> bool:
+        return next(answers, True)
+
+    class DegradesAfterEveryReconnect(RealisticSpyDatabase):
+        async def connect(self) -> None:
+            await super().connect()
+            self.is_connected = False
+
+    spy = DegradesAfterEveryReconnect(connected=False)
+    monkeypatch.setattr(readiness, "database", spy)
+    monkeypatch.setattr(readiness, "_supervisor_enabled", stateful_enabled)
+
     await readiness.run_database_reconnect_supervisor(
-        interval_seconds=0.01, max_cycles=2
+        interval_seconds=0.01, max_cycles=3
     )
-    assert spy.real_connects >= 2, (
-        "the supervisor never came back after the switch was re-enabled — "
-        "it retired on the first 'false' instead of re-reading each cycle")
+
+    assert spy.real_connects == 2, (
+        f"expected reconnects on cycles 1 and 3 with cycle 2 disabled, got "
+        f"{spy.real_connects} — a disabled cycle must SKIP, not retire the "
+        "supervisor")
 
 
 def test_lifespan_shutdown_survives_a_supervisor_that_raises():
