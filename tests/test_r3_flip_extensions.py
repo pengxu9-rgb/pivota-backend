@@ -291,3 +291,22 @@ class TestMaxBatches:
         assert report.catalog["batches"] == 1
         assert report.catalog["stopped_at_max_batches"] == 1
         assert report.catalog["resubjected"] == 2   # one batch of two, not five
+
+
+class TestMaxProducts:
+    @pytest.mark.asyncio
+    async def test_scan_cap_reaches_the_sql(self):
+        captured = {}
+        class _Db(_FakeDb):
+            async def fetch_all(self, sql, params=None):
+                if "cp.merchant_id = :banned" in sql and "FROM catalog_products cp" in sql:
+                    captured["sql"] = sql; captured["params"] = dict(params or {})
+                    return []
+                return await super().fetch_all(sql, params)
+        bf = SellerBackfill(database=_Db(), si_mod=None, execute=False,
+                            batch_size=25, max_products=30)
+        report = BackfillReport(mode='dry_run', started_at='2026-08-07T00:00:00Z',
+                                phases=['catalog'], batch_size=25)
+        await bf.run_catalog(report)
+        assert "LIMIT :cap" in captured["sql"]
+        assert captured["params"]["cap"] == 30

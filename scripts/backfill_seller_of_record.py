@@ -436,10 +436,11 @@ class BackfillReport:
 
 class SellerBackfill:
     def __init__(self, *, database: Any, si_mod: Any, execute: bool, batch_size: int,
-                 max_batches: int = 0):
+                 max_batches: int = 0, max_products: int = 0):
         self.db = database
         self.si = si_mod
         self.max_batches = int(max_batches or 0)
+        self.max_products = int(max_products or 0)
         self.execute = execute
         self.batch_size = batch_size
 
@@ -726,8 +727,10 @@ class SellerBackfill:
             "LEFT JOIN external_product_seeds e "
             "  ON e.attached_product_key = cp.product_key AND e.status = 'active' "
             "WHERE cp.merchant_id = :banned "
-            "ORDER BY cp.product_key, (coalesce(e.domain, '') = '') ASC, e.updated_at DESC NULLS LAST",
-            {"banned": BANNED_BUCKET_MERCHANT_ID},
+            "ORDER BY cp.product_key, (coalesce(e.domain, '') = '') ASC, e.updated_at DESC NULLS LAST"
+            + (" LIMIT :cap" if self.max_products else ""),
+            {"banned": BANNED_BUCKET_MERCHANT_ID,
+             **({"cap": self.max_products} if self.max_products else {})},
         )
         products = [dict(r) for r in rows or []]
         stats = {"scanned": len(products), "resubjected": 0, "review_collision": 0,
@@ -1352,6 +1355,10 @@ def _parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
                     help="Perform writes. WITHOUT this flag the run is READ-ONLY (dry-run).")
     ap.add_argument("--max-batches", type=int, default=0,
                     help="stop the catalog phase after N batches (canary; 0 = no limit)")
+    ap.add_argument("--max-products", type=int, default=0,
+                    help="cap the catalog SCAN itself (canary; 0 = all). Planning "
+                         "resolves per-row over the network — a capped canary must "
+                         "not pay the full-corpus planning cost.")
     ap.add_argument("--batch-size", type=int, default=100,
                     help="Products per catalog re-key batch (default 100).")
     ap.add_argument("--phases", default="seeds,barekey,catalog,edges",
@@ -1386,7 +1393,7 @@ async def _amain(args: argparse.Namespace) -> int:
     try:
         report = await run_backfill(
             database=database, si_mod=si_mod, execute=args.execute,
-            max_batches=args.max_batches,
+            max_batches=args.max_batches, max_products=args.max_products,
             batch_size=args.batch_size, phases=phases,
         )
     finally:
