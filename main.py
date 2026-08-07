@@ -1824,23 +1824,85 @@ async def publish_event_to_ws(event: dict):
 
 @app.get("/")
 async def root():
-    """Root endpoint - simplified for reliable health checks"""
+    """Service banner, and the SECOND door onto the same honesty guarantee as
+    `/health` — so it cannot be the door that stays open.
+
+    This endpoint used to report `"status": "healthy"` and `"health": "OK"` as
+    string literals, while the `db_status` field sitting beside them in the very
+    same payload said `"disconnected"`. Only `db_status` was ever computed;
+    "healthy" was true by construction. Anything reading the status — a monitor,
+    a load balancer, a human — got a green answer from a process that could not
+    serve a single database-backed request.
+
+    That matters beyond this handler. `/health` was made observe-only and
+    503-on-failure precisely so an outage cannot hide behind a green indicator;
+    leaving `/` unconditionally healthy would have made that guarantee depend
+    on which path the Railway dashboard happens to name. It currently names
+    `/health`: a committed Railway API dump (a point-in-time snapshot, not live
+    truth) shows nine services set `healthcheckPath` to `/health` and five to
+    `null`, none to `/`, with the `api.pivota.cc` service among the nine. So
+    this change fixes no active outage — it removes a second door that a single
+    dashboard edit could have opened onto the one #1683 closed.
+
+    Two rules hold this together:
+
+    1. OBSERVE, NEVER REPAIR. `probe_database_health` connects nothing and
+       resets nothing — if the shared `database` is not connected, that IS the
+       answer. It replaces a bare `await database.execute("SELECT 1")`, which
+       was a second, weaker copy of the same idiom: no timeout, so a stalled
+       backend hung this handler instead of reporting on it. Request-time
+       recovery stays in `ensure_database_ready` (auth/quote/order paths) and
+       in the unattended supervisor. Reporting the truth does not remove the
+       app's ability to heal.
+    2. ONE SOURCE OF TRUTH. Every reported field below derives from `db_ok`.
+       The original defect was three fields that were supposed to agree and had
+       no mechanism forcing them to; a future edit must not be able to fix one
+       and leave another lying.
+
+    Connectivity only, deliberately: `/health` additionally gates on the schema
+    guard, and `/` keeps the narrower contract its `db_status` field always
+    described.
+
+    Two limits, stated so they are not rediscovered during an incident:
+
+    - THE STATUS CODE IS THE SIGNAL; the body's `status` field is not what a
+      client sees on failure. `ErrorHandlerMiddleware` re-nests every >=400
+      JSON body, so on 503 this payload moves under `error.details` and the
+      top-level `status` reads "error". `db_status` — the only field here that
+      predates the fix and was always honest — is therefore ABSENT at the top
+      level on 503, where it was previously always present. No consumer of it
+      is known (see the commit message's sweep), and `/health` already behaves
+      this way; the status code is what survives the envelope intact.
+    - A SATURATED POOL READS AS DOWN. `probe_database_health` decides from one
+      `SELECT 1` under a timeout, and as `_force_mark_database_disconnected`
+      notes, that cannot distinguish a dead pool from a slow or saturated one.
+      A load spike on a healthy database will flip `/` to 503. That ambiguity
+      is inherited from the primitive and `/health` already carries it; this
+      change widens its surface to a second path rather than introducing it.
+    """
+    probe_timeout = _health_timeout_seconds("DB_HEALTH_PROBE_TIMEOUT_SECONDS", 3.0)
+
+    db_error = None
     try:
-        # Test database connection
-        await database.execute("SELECT 1")
-        db_status = "connected"
-    except Exception as e:
-        logger.error(f"Health check DB error: {e}")
-        db_status = "disconnected"
-    
-    return {
-        "message": "Pivota Infrastructure Dashboard API",
-        "version": "0.2.1-fixed",
-        "status": "healthy",
-        "db_status": db_status,
-        "timestamp": time.time(),
-        "health": "OK"
-    }
+        await probe_database_health(probe_timeout_seconds=probe_timeout)
+        db_ok = True
+    except DatabaseUnavailableError as e:
+        db_ok = False
+        db_error = e.error_type
+        logger.error(f"Root health check DB error: {e.phase}/{e.error_type}")
+
+    return JSONResponse(
+        status_code=200 if db_ok else 503,
+        content={
+            "message": "Pivota Infrastructure Dashboard API",
+            "version": "0.2.1-fixed",
+            "status": "healthy" if db_ok else "unhealthy",
+            "db_status": "connected" if db_ok else "disconnected",
+            "timestamp": time.time(),
+            "health": "OK" if db_ok else "UNAVAILABLE",
+            "error": db_error,
+        },
+    )
 
 
 def _health_timeout_seconds(name: str, default: float, *, min_value: float = 0.5, max_value: float = 30.0) -> float:
