@@ -495,17 +495,22 @@ async def test_onboard_routes_unpublished_to_suppression_before_mirroring():
     previously did not: nothing asserted _onboard used the list at all."""
     calls = []
 
-    async def _fake_suppress(rows, reason=onboard.DUP_SUPPRESSION_REASON):
-        calls.append(("suppress", [r["external_product_id"] for r in rows], reason))
+    async def _fake_suppress(rows, reason=onboard.DUP_SUPPRESSION_REASON, *, withdraw=False):
+        calls.append(("suppress", [r["external_product_id"] for r in rows], (reason, withdraw)))
         return len(rows)
 
     async def _fake_mirror(limit):
         calls.append(("mirror", limit, None))
         return 0
 
+    async def _fake_withdraw_keys(seed_ids):
+        calls.append(("recompute", list(seed_ids), None))
+        return {}
+
     monkey = {
         "_suppress_dropped_listings": _fake_suppress,
         "mirror_apply": _fake_mirror,
+        "_withdraw_content_keys": _fake_withdraw_keys,
     }
     originals = {k: getattr(onboard, k) for k in monkey}
     for k, v in monkey.items():
@@ -516,7 +521,10 @@ async def test_onboard_routes_unpublished_to_suppression_before_mirroring():
         for k, v in originals.items():
             setattr(onboard, k, v)
 
-    assert ("suppress", ["ad_1"], onboard.UNPUBLISHED_SUPPRESSION_REASON) in calls
+    # withdraw=True is the operative half: suppression_reason alone leaves the
+    # PDP serving (measured in prod — see the step5 precedent).
+    assert ("suppress", ["ad_1"], (onboard.UNPUBLISHED_SUPPRESSION_REASON, True)) in calls
+    assert any(c[0] == "recompute" for c in calls), "the stamp needs an explicit recompute"
     # ...and an empty cohort must NOT trigger a global 50-row mirror pass over
     # other brands' pending seeds (with --no-serving that strands them).
     assert not any(c[0] == "mirror" for c in calls)
