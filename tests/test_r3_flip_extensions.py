@@ -8,6 +8,8 @@ alone (W2), and the retired test rig's 50 dev-store rows are excluded to their
 own founder-gated step.
 """
 
+import re
+
 import pytest
 
 from scripts.backfill_seller_of_record import (
@@ -18,6 +20,21 @@ from scripts.backfill_seller_of_record import (
 from services.seller_identity import make_observed_retailer_id
 
 
+def _assert_binds_match(sql, params):
+    """`databases` binds through SQLAlchemy text(): a params dict carrying a key
+    the statement does not name raises ArgumentError, and a named bind with no
+    value raises too. The old fake recorded SQL and params without ever
+    comparing them, so a real ArgumentError shipped to production and aborted
+    the canary batch (2026-08-07). Every fake query now enforces exact equality.
+    """
+    named = set(re.findall(r"(?<!:):([a-zA-Z_][a-zA-Z0-9_]*)", sql))
+    given = set((params or {}).keys())
+    assert named == given, (
+        f"bind mismatch: SQL names {sorted(named)}, params give {sorted(given)}"
+        f" (extra={sorted(given - named)}, missing={sorted(named - given)})\nSQL: {sql}"
+    )
+
+
 class _FakeDb:
     def __init__(self, *, products=None, listing_exists=False, pgm_target_exists=False):
         self.products = products or []
@@ -26,6 +43,7 @@ class _FakeDb:
         self.executed = []
 
     async def fetch_all(self, sql, params=None):
+        _assert_binds_match(sql, params)
         if "information_schema.columns" in sql and "pdp_identity_listing" in sql:
             return [{"column_name": c} for c in
                     ("source_listing_ref", "merchant_id", "product_id", "identity_status")]
@@ -41,6 +59,7 @@ class _FakeDb:
         return []
 
     async def fetch_one(self, sql, params=None):
+        _assert_binds_match(sql, params)
         if "FROM pdp_identity_listing WHERE source_listing_ref" in sql:
             ref = (params or {}).get("r") or (params or {}).get("old_ref") or ""
             if str(ref).startswith("external_seed:"):
@@ -55,6 +74,7 @@ class _FakeDb:
         return None
 
     async def execute(self, sql, params=None):
+        _assert_binds_match(sql, params)
         self.executed.append((" ".join(sql.split()), dict(params or {})))
 
     def transaction(self):
