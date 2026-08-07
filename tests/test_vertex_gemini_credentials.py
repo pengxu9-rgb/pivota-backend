@@ -13,7 +13,34 @@ import pytest
 
 @pytest.fixture
 def vg(monkeypatch):
-    """Reload the module so settings pick up patched env each time."""
+    """Reload the module so settings pick up patched env each time, then put
+    the process back the way it was found.
+
+    THE RESTORE IS NOT TIDINESS. `monkeypatch` unwinds env vars and
+    `sys.modules` entries, but it has no idea these modules were RELOADED — and
+    a reload bakes the patched env into module state that outlives the test.
+    Without the teardown below, the last reload here (`VERTEX_AI_ENABLED=true`)
+    left `services.vertex_gemini.settings.vertex_ai_enabled` True, and
+    `_load_credentials()` left the `_FakeCreds` stub cached in the module-global
+    `_credentials`, for the whole rest of the session. Thirteen non-test modules
+    read that state.
+
+    The visible damage was two tests failing ONLY in a full-suite run, both
+    downstream of this file alphabetically, and both mystifying in isolation:
+
+      - `test_w2_retailer_seller_model` — `credentials_available("")` answered
+        True off the stale cache, so the validator took the LIVE Vertex path and
+        died on `ModuleNotFoundError: No module named 'google'` (the fake
+        `google` package IS unwound by monkeypatch; the credential minted from
+        it is not).
+      - `test_winnable_prompts` — the same stale True made gemini look usable,
+        so the deepseek fallback never fired.
+
+    Ordering matters and is the whole trick: `monkeypatch` is torn down AFTER
+    this fixture's finalizer, so reloading here naively would rebuild the
+    modules from the STILL-PATCHED env and restore nothing. `monkeypatch.undo()`
+    puts the real env back first; the reloads then rebuild from it.
+    """
 
     def _load(**env):
         for key, value in env.items():
@@ -30,7 +57,22 @@ def vg(monkeypatch):
         mod.reset_credentials_cache()
         return mod
 
-    return _load
+    yield _load
+
+    # Real env first, then rebuild from it. Unconditional: a test that failed
+    # partway through is exactly when the leak would otherwise escape.
+    #
+    # No `reset_credentials_cache()` here, deliberately: reloading re-executes
+    # the module body, which rebinds `_credentials = None` on its own. A mutation
+    # that deleted the extra call could not be killed — it was doing nothing.
+    # Both reloads below ARE load-bearing; dropping either one is caught.
+    monkeypatch.undo()
+    import config.settings as cs
+
+    importlib.reload(cs)
+    import services.vertex_gemini as mod
+
+    importlib.reload(mod)
 
 
 def test_flag_off_gates_on_api_key(vg):
@@ -113,3 +155,29 @@ def test_inline_json_credential_is_preferred_over_adc(vg, monkeypatch):
     assert creds.token == "tok-123"
     assert seen["info"] == info
     assert "https://www.googleapis.com/auth/cloud-platform" in seen["scopes"]
+
+
+def test_the_fixture_leaves_no_vertex_state_behind():
+    """Defined LAST on purpose: pytest runs tests in definition order, so this
+    executes after every `vg` test above and sees exactly what the next FILE
+    would see.
+
+    It deliberately does not request `vg` — it inspects the module the way an
+    unrelated downstream test does. Before the fixture restored state, both
+    assertions below failed here, which is the leak that broke
+    `test_w2_retailer_seller_model` and `test_winnable_prompts` in full-suite
+    runs while both passed in isolation.
+
+    A cross-file leak is normally invisible until some unrelated test fails for
+    reasons that make no sense at its own call site. This turns that into a
+    local, named failure in the file that causes it.
+    """
+    import services.vertex_gemini as mod
+
+    assert mod.vertex_enabled() is False, (
+        "VERTEX_AI_ENABLED leaked out of this file — every later test now takes "
+        "the live Vertex path")
+    assert mod._credentials is None, (
+        "a credential minted from this file's stubbed google package is still "
+        "cached — later callers will think Vertex is usable and fail on the "
+        "real import")
