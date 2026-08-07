@@ -106,10 +106,22 @@ jobs:
       #   test_audit_scheduler_worker_env_gate — RED (2 tests). Appeared after the
       #     2026-07-28 recon, so it is a recent regression, not ancient debt.
       #   test_external_seed_csv_import        — RED alone AND in the sweep.
-      #   test_winnable_prompts                — ORDER-DEPENDENT: passes alone
-      #     (8/8), fails inside the sweep. Something earlier mutates
-      #     `config.settings` without restoring it. This is a real bug in test
-      #     isolation and the only entry here that the sweep itself created.
+      #   test_winnable_prompts                — RESOLVED, entry removed. The
+      #     diagnosis written here was right: `tests/test_vertex_gemini_credentials.py`
+      #     reloaded `config.settings` + `services.vertex_gemini` under patched
+      #     env and never restored them, so a stale `vertex_ai_enabled=True` and
+      #     a cached fake credential made gemini look usable and the deepseek
+      #     fallback never fired. Fixed at the source in that file's fixture.
+      #     Verified by running THIS command with only this line removed:
+      #     pre-fix 2 failed, post-fix 10108 passed.
+      #
+      #     Worth knowing for the next entry: the same leak also broke
+      #     `tests/test_w2_retailer_seller_model.py`, which never appeared here
+      #     because its symptom needs `google-auth` ABSENT — CI installs it from
+      #     requirements.txt, a bare dev venv does not. This job was green on
+      #     main throughout while that test failed for every developer running
+      #     the suite locally. A quarantine list records what CI can see, which
+      #     is not the same as what is broken.
       #
       # FOUND BY THIS PR'S OWN STRAY-FILE GUARD: `readiness/tests/` is a whole
       # sub-package — 15 test files, 111 passing — that ran in NO CI job either. It is
@@ -138,7 +150,6 @@ jobs:
             --ignore=tests/test_runtime_hardcode_guard.py \
             --ignore=tests/test_audit_scheduler_worker_env_gate.py \
             --ignore=tests/test_external_seed_csv_import.py \
-            --deselect 'tests/test_winnable_prompts.py::test_prompt_gen_falls_back_when_primary_key_missing' \
             --ignore=readiness/tests/test_real_merchant_goldens.py \
             --ignore=readiness/tests/test_routes.py \
             --ignore=readiness/tests/test_shopify_live_source.py \
