@@ -332,8 +332,16 @@ async def test_supervisor_reconnect_is_timeout_bounded(
 
 
 class _FakePool:
-    def __init__(self, closed: bool = False):
+    """Models BOTH asyncpg flags. `_closing` matters as much as `_closed`:
+    the design's safety argument is that a CLOSING pool is ALIVE (it still has
+    in-flight work), so only `_closed` may mean death. Without `_closing`
+    here, a mutation adopting `is_closing()` semantics — the exact tempting
+    alternative the source docstring names — passed the whole suite
+    (round-22 finding 1)."""
+
+    def __init__(self, closed: bool = False, closing: bool = False):
         self._closed = closed
+        self._closing = closing
 
 
 class RealisticSpyDatabase(SpyDatabase):
@@ -483,21 +491,33 @@ async def test_kill_switch_takes_effect_MID_RUN_without_a_restart(
 
         async def connect(self) -> None:
             await super().connect()
-            monkeypatch.setenv("DB_RECONNECT_SUPERVISOR_ENABLED", "false")
-            # Degrade again: with the switch honoured per cycle nothing may
-            # reconnect from here on.
-            self.is_connected = False
+            if self.real_connects == 1:
+                # OFF after the first reconnect...
+                monkeypatch.setenv("DB_RECONNECT_SUPERVISOR_ENABLED", "false")
+            self.is_connected = False  # degrade again each time
 
     spy = FlipsTheSwitchOnFirstConnect(connected=False)
     monkeypatch.setattr(readiness, "database", spy)
 
     await readiness.run_database_reconnect_supervisor(
-        interval_seconds=0.01, max_cycles=6
+        interval_seconds=0.01, max_cycles=4
     )
-
     assert spy.real_connects == 1, (
         f"{spy.real_connects} reconnects — the kill switch was resolved once "
         "at startup, so flipping it in production would need a redeploy")
+
+    # ...and BACK ON. Both halves matter: with `break` instead of `continue`
+    # one observed 'false' retires the supervisor permanently and re-enabling
+    # needs a restart — the same silent-retirement class the interval clamp
+    # exists to prevent. That mutation passed the whole suite while only the
+    # off-half was tested (round-22 finding 2).
+    monkeypatch.setenv("DB_RECONNECT_SUPERVISOR_ENABLED", "true")
+    await readiness.run_database_reconnect_supervisor(
+        interval_seconds=0.01, max_cycles=2
+    )
+    assert spy.real_connects >= 2, (
+        "the supervisor never came back after the switch was re-enabled — "
+        "it retired on the first 'false' instead of re-reading each cycle")
 
 
 def test_lifespan_shutdown_survives_a_supervisor_that_raises():
@@ -552,20 +572,22 @@ async def test_supervisor_keeps_supervising_after_a_successful_reconnect(
     """ROUND-20 F2 (surviving mutation: `return` after the first success). A
     one-shot supervisor repairs the first degradation and never the second —
     precisely the failure class this arc keeps re-inventing."""
-    spy = SpyDatabase(connected=False)
+    # Degrade again from inside connect(), synchronously — no background task.
+    # An earlier version used create_task + cancel-without-await, the shape
+    # that leaked an env var across tests elsewhere in this file; benign here,
+    # but a timing-dependent test of a timing-sensitive loop is not worth
+    # keeping (round-22 finding 5).
+    class DegradesAfterEveryReconnect(SpyDatabase):
+        async def connect(self) -> None:
+            await super().connect()
+            self.is_connected = False
+
+    spy = DegradesAfterEveryReconnect(connected=False)
     monkeypatch.setattr(readiness, "database", spy)
 
-    async def flap():
-        # Degrade again right after each successful reconnect.
-        for _ in range(3):
-            await asyncio.sleep(0.015)
-            spy.is_connected = False
-
-    flapper = asyncio.create_task(flap())
     await readiness.run_database_reconnect_supervisor(
         interval_seconds=0.01, max_cycles=4
     )
-    flapper.cancel()
 
     assert spy.connect_calls >= 2, (
         f"the supervisor reconnected {spy.connect_calls} time(s) then stopped "
@@ -644,6 +666,18 @@ def test_pool_death_is_decided_by_local_facts_only():
         assert readiness._pool_is_provably_dead() is False, (
             "an OPEN pool must never read as dead — that is the inference "
             "that destroyed live pools")
+        # A CLOSING pool is ALIVE. This is the property the whole safety
+        # argument rests on: asyncpg sets `_closing` while the pool drains
+        # in-flight work and only sets `_closed` once nothing is left to
+        # lose. Adopting `is_closing()` semantics — which folds the two
+        # together — would reintroduce acting on live work, and passed the
+        # entire suite before this assertion existed (round-22 finding 1).
+        b._pool = _FakePool(closed=False, closing=True)
+        assert readiness._pool_is_provably_dead() is False, (
+            "a CLOSING pool read as dead — it still has in-flight queries; "
+            "only `_closed` may mean death")
+        b._pool = _FakePool(closed=True, closing=False)
+        assert readiness._pool_is_provably_dead() is True
     finally:
         readiness.database = original
 
@@ -652,12 +686,18 @@ def test_pool_death_is_decided_by_local_facts_only():
 async def test_supervisor_never_touches_a_connected_backend(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """THE SAFETY PROPERTY OF THE WHOLE DESIGN. The supervisor acts only when
-    `is_connected` is False — i.e. when there is no pool in use to damage. It
-    must never probe, never reset, and never call the repairing helper, even
-    when the backend is broken behind the flag: four review rounds
-    (PR #1683, 16-19) were spent failing to make a repairing supervisor safe,
-    and every one of them destroyed something live."""
+    """THE SAFETY PROPERTY OF THE WHOLE DESIGN, stated correctly: the
+    supervisor acts only on LOCAL FACTS — the wrapper reports disconnected, or
+    the pool object is None/`_closed` — and never on a probe result. Here the
+    flag says connected AND the pool is open, so both facts say "live" and it
+    must do nothing: no probe, no reset, no repairing helper. (An earlier
+    version of this docstring said "acts only when is_connected is False, i.e.
+    no pool in use to damage" — wrong twice over since the dead-pool arm
+    landed, and the source explicitly refutes the second half. Round-22
+    finding 3.)
+
+    Four review rounds (PR #1683, 16-19) were spent failing to make a
+    REPAIRING supervisor safe; every one destroyed something live."""
     repairs = {"n": 0}
 
     async def must_not_run(**_kwargs) -> None:
