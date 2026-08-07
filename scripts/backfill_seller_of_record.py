@@ -1159,7 +1159,7 @@ class SellerBackfill:
                    f"AND {seller_col} = :banned")
             params = {"obs": obs, "scope": sku_keys, "banned": BANNED_BUCKET_MERCHANT_ID}
         assert_sig_frozen_sql(sql)
-        await self.db.execute(sql, {"obs": obs, **banned_scope})
+        await self.db.execute(sql, params)
 
     async def _residue_audit(self, pks: List[str], cascade: List[Dict[str, Any]]) -> Dict[str, int]:
         """After re-subjecting a batch, assert no ENUMERATED dependent still holds
