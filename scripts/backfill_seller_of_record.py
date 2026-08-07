@@ -117,11 +117,76 @@ logger = logging.getLogger("a9_4_seller_backfill")
 # The single named constant for the banned bucket (reuse the one seller_identity
 # already owns — do not re-declare a second literal).
 from services.seller_identity import BANNED_BUCKET_MERCHANT_ID  # noqa: E402
+from services.seller_identity import (  # noqa: E402
+    ensure_observed_seller_of_record,
+    resolve_seed_seller_identity,
+)
 from services.catalog_sync_service import make_catalog_product_key  # noqa: E402
 
 EXTERNAL_SEED_PLATFORM = "external_seed"  # the mirror's platform literal
 SOURCE_SYSTEM_SEEDS = "a9_4_seeds_backfill"
 SOURCE_SYSTEM_CATALOG = "a9_4_catalog_rekey"
+
+# R3: the retired founder test rig's Shopify dev store. Its 50 mirror rows are
+# the one cohort that must NOT be re-keyed: the rig merchant is status=inactive
+# with a non-NULL last_full_sync_at, so a re-key would both drop the rows from
+# serving and expose them to the stale-product sweep. They get their own
+# suppression step, founder-gated — never a ride-along in the flip.
+EXCLUDED_SOURCE_DOMAINS = frozenset({"jwx893-fz.myshopify.com"})
+
+
+def _plan_domain_candidates(p: Dict[str, Any]) -> List[str]:
+    """The row's OWN domain sources, in preference order: catalog
+    source_domain -> canonical_url host -> attached seed's domain -> attached
+    seed's destination host (design §3: the seed is the row's upstream source
+    of truth — 250 Biodance rows carry a marketing tagline in source_domain
+    and an empty canonical_url while their seeds hold the real biodance.com)."""
+    from urllib.parse import urlparse
+
+    candidates: List[str] = []
+    sd = str(p.get("source_domain") or "").strip()
+    if sd:
+        candidates.append(sd)
+    cu = str(p.get("canonical_url") or "").strip()
+    if cu:
+        host = urlparse(cu).hostname or ""
+        if host:
+            candidates.append(host)
+    seed_dom = str(p.get("seed_domain") or "").strip()
+    if seed_dom:
+        candidates.append(seed_dom)
+    seed_dest = str(p.get("seed_destination_url") or "").strip()
+    if seed_dest:
+        host = urlparse(seed_dest).hostname or ""
+        if host:
+            candidates.append(host)
+    return candidates
+
+
+def _plan_domain(p: Dict[str, Any]) -> Tuple[str, bool]:
+    """First candidate that actually RESOLVES a seller identity, plus whether
+    any did. resolved=False means the row must go to review — the caller must
+    NOT fall through to a resolver that lacks the plausible-registrable guard
+    (make_observed_merchant_id happily keys on a bare 'com.vn')."""
+    candidates = _plan_domain_candidates(p)
+    for cand in candidates:
+        try:
+            resolve_seed_seller_identity(brand=str(p.get("brand") or ""), domain=cand)
+            return cand, True
+        except ValueError:
+            continue
+    return (candidates[0] if candidates else ""), False
+
+
+def _is_excluded_rig_row(p: Dict[str, Any]) -> bool:
+    """Any of the row's domain candidates matching the rig set excludes it —
+    an exact-source_domain-only match would let a www. variant or a rig row
+    whose domain only appears in canonical_url ride into the re-key."""
+    for cand in _plan_domain_candidates(p):
+        host = cand.strip().lower().removeprefix("www.")
+        if host in EXCLUDED_SOURCE_DOMAINS:
+            return True
+    return False
 
 # Tables that carry a merchant_id/primary_merchant_id but are NOT product-scoped
 # ownership rows we may blindly re-subject. Edges get their own phase-4 mapping;
@@ -370,9 +435,11 @@ class BackfillReport:
 # ---------------------------------------------------------------------------
 
 class SellerBackfill:
-    def __init__(self, *, database: Any, si_mod: Any, execute: bool, batch_size: int):
+    def __init__(self, *, database: Any, si_mod: Any, execute: bool, batch_size: int,
+                 max_batches: int = 0):
         self.db = database
         self.si = si_mod
+        self.max_batches = int(max_batches or 0)
         self.execute = execute
         self.batch_size = batch_size
 
@@ -642,13 +709,30 @@ class SellerBackfill:
             )
 
         rows = await self.db.fetch_all(
-            "SELECT product_key, content_key, brand, source_domain, canonical_url, platform "
-            "FROM catalog_products WHERE merchant_id = :banned ORDER BY product_key",
+            # Seed attach by attached_product_key + status='active' — the
+            # repo's own attach relation. An external_product_id equi-join
+            # fans out across markets/statuses and, for Path C rows (whose
+            # source_product_id is a NAME SLUG, not an ext id), can mis-join
+            # an unrelated seed into the domain candidates.
+            # DISTINCT ON: two active seeds (different market/tool) can attach
+            # one product; a fan-out would double-plan it. Deterministic pick:
+            # the seed with a non-empty domain first, then newest.
+            "SELECT DISTINCT ON (cp.product_key) "
+            "cp.product_key, cp.content_key, cp.brand, cp.source_domain, "
+            "cp.canonical_url, cp.platform, cp.source_product_id, "
+            "e.external_product_id AS seed_external_product_id, "
+            "e.domain AS seed_domain, e.destination_url AS seed_destination_url "
+            "FROM catalog_products cp "
+            "LEFT JOIN external_product_seeds e "
+            "  ON e.attached_product_key = cp.product_key AND e.status = 'active' "
+            "WHERE cp.merchant_id = :banned "
+            "ORDER BY cp.product_key, (coalesce(e.domain, '') = '') ASC, e.updated_at DESC NULLS LAST",
             {"banned": BANNED_BUCKET_MERCHANT_ID},
         )
         products = [dict(r) for r in rows or []]
         stats = {"scanned": len(products), "resubjected": 0, "review_collision": 0,
-                 "review_unresolvable": 0, "batches": 0, "distinct_sellers": 0}
+                 "review_unresolvable": 0, "review_excluded_rig": 0,
+                 "batches": 0, "distinct_sellers": 0, "retailer_keyed": 0}
         collisions: List[Dict[str, Any]] = []
         unresolvable: List[Dict[str, Any]] = []
         sellers_seen: set = set()
@@ -657,23 +741,61 @@ class SellerBackfill:
         planned: List[Dict[str, Any]] = []
         for p in products:
             brand = str(p.get("brand") or "").strip()
-            dest = str(p.get("source_domain") or p.get("canonical_url") or "").strip()
-            res = await resolve_seller_readonly(
-                self.si, anchor_merchant_id=None, brand=brand, destination_domain=dest
-            )
-            if res.seller_ref is None:
+            dest, dest_resolved = _plan_domain(p)
+            if _is_excluded_rig_row(p):
+                stats["review_excluded_rig"] += 1
+                unresolvable.append({"product_key": p.get("product_key"),
+                                     "brand": brand, "domain": dest,
+                                     "reason": "excluded_test_rig_dev_store"})
+                continue
+            if not dest_resolved:
+                # No row-owned candidate names a plausible seller. Review —
+                # never fall through to a resolver without the registrable
+                # guard, which would mint an identity on a bare public suffix.
                 stats["review_unresolvable"] += 1
                 unresolvable.append({"product_key": p.get("product_key"),
                                      "brand": brand, "domain": dest,
-                                     "reason": res.disposition})
+                                     "reason": "seller_of_record_unresolved"})
                 continue
-            collision = await self._fragmentation_collision(res.seller_ref, brand, dest, p)
+            # W2 keying decides the IDENTITY SHAPE first: a retailer domain keys
+            # on etld1 alone (one retailer = one merchant), everything else
+            # keeps the brand-direct path (which also handles anchors/claims).
+            kind = "brand_direct"
+            try:
+                ident = resolve_seed_seller_identity(brand=brand, domain=dest)
+                kind = ident["kind"]
+            except ValueError:
+                ident = None
+            if ident is not None and kind == "retailer":
+                seller_ref, disposition = ident["merchant_id"], "retailer_domain"
+                stats["retailer_keyed"] += 1
+            else:
+                res = await resolve_seller_readonly(
+                    self.si, anchor_merchant_id=None, brand=brand, destination_domain=dest
+                )
+                seller_ref, disposition = res.seller_ref, res.disposition
+            if seller_ref is None:
+                stats["review_unresolvable"] += 1
+                unresolvable.append({"product_key": p.get("product_key"),
+                                     "brand": brand, "domain": dest,
+                                     "reason": disposition})
+                continue
+            collision = await self._fragmentation_collision(seller_ref, brand, dest, p)
             if collision:
                 stats["review_collision"] += 1
                 collisions.append(collision)
                 continue
-            sellers_seen.add(res.seller_ref)
-            planned.append({**p, "observed_id": res.seller_ref, "disposition": res.disposition})
+            sellers_seen.add(seller_ref)
+            # The identity listing may live under the catalog row's
+            # source_product_id (Path B: the ext id) OR the attached seed's
+            # external_product_id (Path C: source_product_id is a name slug;
+            # measured 2026-08-07 — 0 Path C listings under the slug, 2,444
+            # under the seed id). Carry every candidate.
+            listing_pids = [str(v) for v in dict.fromkeys(
+                [p.get("source_product_id"), p.get("seed_external_product_id")]) if v]
+            planned.append({**p, "observed_id": seller_ref, "disposition": disposition,
+                            "seller_kind": kind, "seller_domain": dest,
+                            "listing_product_ids": listing_pids})
 
         stats["distinct_sellers"] = len(sellers_seen)
         report.review_queue["catalog_collision"] = collisions
@@ -681,6 +803,9 @@ class SellerBackfill:
 
         # Batched execution with per-batch parity.
         for i in range(0, len(planned), self.batch_size):
+            if self.max_batches and stats["batches"] >= self.max_batches:
+                stats["stopped_at_max_batches"] = self.max_batches
+                break
             batch = planned[i:i + self.batch_size]
             parity = await self._resubject_batch(batch, cascade, report)
             report.parity.append(parity)
@@ -727,25 +852,75 @@ class SellerBackfill:
         if not self.execute:
             # Dry-run: predict the after-state without writing. Servable/sig sets
             # are unchanged by construction (option (b) touches only merchant_id).
+            # The NEW writes are rehearsed read-only so the founder-reviewed
+            # report shows what the flip will actually touch (review finding 13).
+            spids_all = [pid for b in batch for pid in (b.get("listing_product_ids") or [])]
+            pgm_spids = [str(b.get("source_product_id") or "") for b in batch if b.get("source_product_id")]
+            platforms = sorted({str(b.get("platform") or "") for b in batch if b.get("platform")})
+            pgm_moves = listing_moves = listing_conflicts = 0
+            if pgm_spids and platforms:
+                row = await self.db.fetch_one(
+                    "SELECT count(*) AS c FROM product_group_members "
+                    "WHERE merchant_id = :banned AND platform = ANY(:platforms) "
+                    "AND platform_product_id = ANY(:spids)",
+                    {"banned": BANNED_BUCKET_MERCHANT_ID, "platforms": platforms, "spids": pgm_spids})
+                pgm_moves = int(dict(row)["c"]) if row else 0
+            if spids_all:
+                row = await self.db.fetch_one(
+                    "SELECT count(*) AS c FROM pdp_identity_listing "
+                    "WHERE merchant_id = :banned AND product_id = ANY(:spids)",
+                    {"banned": BANNED_BUCKET_MERCHANT_ID, "spids": spids_all})
+                listing_moves = int(dict(row)["c"]) if row else 0
+                for b in batch:
+                    if await self._listing_new_ref_conflict(b, str(b["observed_id"])):
+                        listing_conflicts += 1
             return {
                 "ok": True, "mode": "dry_run", "product_count": len(pks),
                 "resubjected": len(pks), "before_rows": before["rows"],
                 "before_sigs": before["sig_count"], "before_servable": before["servable_count"],
                 "distinct_sellers": len({str(b["observed_id"]) for b in batch}),
+                "pgm_rows_to_move": pgm_moves, "listings_to_migrate": listing_moves,
+                "listing_new_ref_conflicts": listing_conflicts,
             }
+        skipped_in_batch: List[Dict[str, Any]] = []
         async with self.db.transaction():
             for b in batch:
                 pk = str(b["product_key"])
                 ck = b.get("content_key")
                 obs = str(b["observed_id"])
-                # Materialize the observed seller via the REAL A9-2 minter
-                # (idempotent; resolves claim -> existing -> mint).
-                await self.si.ensure_observed_seller(
+                # Materialize the observed seller via the REAL minter
+                # (idempotent; resolves claim -> existing -> mint) — fed the
+                # PLANNED domain, never the raw columns: the plan may have
+                # recovered the domain from canonical_url or the seed while
+                # source_domain is garbage, and feeding ensure a different
+                # input than the plan silently minted a DIFFERENT merchant
+                # than the one the row was re-keyed to (review finding 1).
+                ensured_id = await ensure_observed_seller_of_record(
+                    kind=str(b.get("seller_kind") or "brand_direct"),
                     brand=str(b.get("brand") or ""),
-                    domain=str(b.get("source_domain") or b.get("canonical_url") or ""),
+                    domain=str(b.get("seller_domain") or ""),
                     source_system=SOURCE_SYSTEM_CATALOG,
                     primary_platform=b.get("platform"),
                 )
+                if ensured_id != obs:
+                    # Claim-attach or derivation divergence: the merchant that
+                    # actually exists is not the planned one. Never re-key onto
+                    # an unbacked id — route the product to review, loudly.
+                    skipped_in_batch.append({
+                        "product_key": pk, "planned": obs, "ensured": ensured_id,
+                        "reason": "ensured_seller_diverges_from_plan"})
+                    continue
+                # Listing new-ref conflict pre-check: if a listing ALREADY
+                # exists under a new ref, merging children onto it and deleting
+                # the old row would silently discard the old listing's content
+                # and re-attach operator overrides to different content. Review.
+                conflict_ref = await self._listing_new_ref_conflict(b, obs)
+                if conflict_ref:
+                    skipped_in_batch.append({
+                        "product_key": pk, "planned": obs,
+                        "conflicting_ref": conflict_ref,
+                        "reason": "listing_new_ref_conflict"})
+                    continue
                 # 1) the sig-owning row (dedicated FROZEN statement).
                 await self.db.execute(
                     CATALOG_PRODUCTS_RESUBJECT_SQL,
@@ -756,17 +931,54 @@ class SellerBackfill:
                 sku_keys = await self._sku_keys_for_product(pk)
                 for t in cascade:
                     await self._resubject_dependent(t, obs, pk, ck, sku_keys)
+                # 3) the two tables reflection CANNOT see (R0 finding): group
+                #    membership keys on (merchant, platform, platform_product_id)
+                #    and the identity listing embeds the merchant in its PK.
+                await self._resubject_group_membership(b, obs)
+                await self._migrate_listing_refs(b, obs)
             # Residue audit INSIDE the txn: any enumerated table still holding a
             # banned seller for this batch's products = un-migrated cascade.
-            residue = await self._residue_audit(pks, cascade)
+            skipped_keys = {str(x["product_key"]) for x in skipped_in_batch}
+            done = [b for b in batch if str(b["product_key"]) not in skipped_keys]
+            done_pks = [str(b["product_key"]) for b in done]
+            residue = await self._residue_audit(done_pks, cascade)
+            spids = [pid for b in done for pid in (b.get("listing_product_ids") or [])]
+            pgm_spids = [str(b.get("source_product_id") or "") for b in done if b.get("source_product_id")]
+            platforms = sorted({str(b.get("platform") or "") for b in done if b.get("platform")})
+            if pgm_spids and platforms:
+                row = await self.db.fetch_one(
+                    "SELECT count(*) AS c FROM product_group_members "
+                    "WHERE merchant_id = :banned AND platform = ANY(:platforms) "
+                    "AND platform_product_id = ANY(:spids)",
+                    {"banned": BANNED_BUCKET_MERCHANT_ID, "platforms": platforms, "spids": pgm_spids})
+                c = int(dict(row)["c"]) if row else 0
+                if c:
+                    residue["product_group_members"] = residue.get("product_group_members", 0) + c
+            if spids:
+                row = await self.db.fetch_one(
+                    "SELECT count(*) AS c FROM pdp_identity_listing "
+                    "WHERE merchant_id = :banned AND product_id = ANY(:spids)",
+                    {"banned": BANNED_BUCKET_MERCHANT_ID, "spids": spids})
+                c = int(dict(row)["c"]) if row else 0
+                if c:
+                    residue["pdp_identity_listing"] = residue.get("pdp_identity_listing", 0) + c
             # AFTER: parity assertions. On failure, raise -> rollback the batch.
-            after = await self._parity_snapshot(pks)
-            parity = self._diff_parity(before, after, residue)
+            after = await self._parity_snapshot(done_pks)
+            before_done = {**before,
+                           "rows": len([k for k in before["sigs"] if k in set(done_pks)]),
+                           "sigs": {k: v for k, v in before["sigs"].items() if k in set(done_pks)},
+                           "servable": {k for k in before["servable"] if k in set(done_pks)}}
+            before_done["sig_count"] = len(before_done["sigs"])
+            before_done["servable_count"] = len(before_done["servable"])
+            parity = self._diff_parity(before_done, after, residue)
+            if skipped_in_batch:
+                parity["skipped_to_review"] = skipped_in_batch
+                report.review_queue.setdefault("catalog_execute_skips", []).extend(skipped_in_batch)
             if not parity["ok"]:
                 raise RuntimeError(
                     f"A9-4 batch parity FAILED (loud abort, no silent absorb): {parity}"
                 )
-            for b in batch:
+            for b in done:
                 # The overwritten value is the constant this phase selects on
                 # (merchant_id = BANNED_BUCKET_MERCHANT_ID, pinned by the
                 # UPDATE's own WHERE), so it is reconstructible — but the rule
@@ -776,6 +988,140 @@ class SellerBackfill:
                                        str(b["observed_id"]), "done",
                                        previous_value=BANNED_BUCKET_MERCHANT_ID)
         return parity
+
+    async def _resubject_group_membership(self, b: Dict[str, Any], obs: str) -> None:
+        """product_group_members keys on (merchant_id, platform,
+        platform_product_id) and carries NONE of the reflection scope columns —
+        the one ownership table `discover_cascade_tables` cannot see (R0
+        finding, 2026-08-06). Self-heal semantics: if the observed-seller row
+        already exists (graph/mirror wrote it), the stale banned row is
+        RETIRED; otherwise the banned row moves in place. When the two rows
+        disagree on product_group_id, the retirement is still correct (one row
+        per merchant by PK) but the divergence is logged for review — a group
+        move must never be silently indistinguishable from a duplicate."""
+        spid = str(b.get("source_product_id") or "")
+        platform = str(b.get("platform") or "")
+        if not spid or not platform:
+            return
+        params = {"obs": obs, "banned": BANNED_BUCKET_MERCHANT_ID,
+                  "platform": platform, "spid": spid}
+        existing = await self.db.fetch_one(
+            "SELECT product_group_id FROM product_group_members WHERE merchant_id = :obs "
+            "AND platform = :platform AND platform_product_id = :spid",
+            params,
+        )
+        if existing:
+            banned_row = await self.db.fetch_one(
+                "SELECT product_group_id FROM product_group_members WHERE merchant_id = :banned "
+                "AND platform = :platform AND platform_product_id = :spid",
+                params,
+            )
+            if banned_row and str(dict(banned_row).get("product_group_id")) != str(dict(existing).get("product_group_id")):
+                logger.warning(
+                    "A9-4 pgm group divergence for %s: banned row group %s vs observed row group %s",
+                    spid, dict(banned_row).get("product_group_id"), dict(existing).get("product_group_id"),
+                )
+            await self.db.execute(
+                "DELETE FROM product_group_members WHERE merchant_id = :banned "
+                "AND platform = :platform AND platform_product_id = :spid",
+                params,
+            )
+            return
+        sql = ("UPDATE product_group_members SET merchant_id = :obs "
+               "WHERE merchant_id = :banned AND platform = :platform "
+               "AND platform_product_id = :spid")
+        assert_sig_frozen_sql(sql)
+        await self.db.execute(sql, params)
+
+    _listing_columns_cache: Optional[List[str]] = None
+
+    async def _listing_columns(self) -> List[str]:
+        if self._listing_columns_cache is None:
+            rows = await self.db.fetch_all(
+                "SELECT column_name FROM information_schema.columns "
+                "WHERE table_schema = 'public' AND table_name = 'pdp_identity_listing' "
+                "ORDER BY ordinal_position"
+            )
+            self._listing_columns_cache = [str(dict(r)["column_name"]) for r in rows or []]
+        return self._listing_columns_cache
+
+    def _listing_refs_for(self, b: Dict[str, Any], obs: str) -> List[Tuple[str, str]]:
+        """(old_ref, new_ref) pairs for every listing id the product may carry.
+        Path B listings key on the row's source_product_id; Path C listings key
+        on the ATTACHED SEED's external_product_id (the catalog row's
+        source_product_id is a name slug — measured 2026-08-07: 0 Path C
+        listings under the slug, 2,444 under the seed id)."""
+        pids = b.get("listing_product_ids") or [
+            str(v) for v in [b.get("source_product_id")] if v]
+        return [(f"{BANNED_BUCKET_MERCHANT_ID}:{pid}", f"{obs}:{pid}") for pid in pids]
+
+    async def _listing_new_ref_conflict(self, b: Dict[str, Any], obs: str) -> Optional[str]:
+        """A listing already existing under a NEW ref while the OLD ref also
+        exists means the migration would merge operator children onto content
+        it never reviewed and delete the old listing silently — review instead."""
+        for old_ref, new_ref in self._listing_refs_for(b, obs):
+            old_row = await self.db.fetch_one(
+                "SELECT 1 FROM pdp_identity_listing WHERE source_listing_ref = :r", {"r": old_ref})
+            if not old_row:
+                continue
+            new_row = await self.db.fetch_one(
+                "SELECT 1 FROM pdp_identity_listing WHERE source_listing_ref = :r", {"r": new_ref})
+            if new_row:
+                return new_ref
+        return None
+
+    async def _migrate_listing_refs(self, b: Dict[str, Any], obs: str) -> None:
+        """pdp_identity_listing's PRIMARY KEY (source_listing_ref) embeds the
+        merchant ('<merchant>:<product_id>'), and 7,036 operator overrides plus
+        515 review-queue rows hang off the old refs (measured 2026-08-06) — so
+        delete-and-let-the-graph-reheal would destroy operator work. The FK
+        (review_queue -> listing) is NOT deferrable, so an in-place PK UPDATE
+        cannot reorder its checks: COPY the row under the new ref, REPOINT both
+        children, DELETE the old row — one product, same transaction. Columns
+        are discovered from the live schema (never a hardcoded list, quoted
+        against reserved words) with the two identity columns replaced; every
+        generated statement passes the sig-freeze assert. Idempotent under
+        resume; new-ref conflicts were routed to review BEFORE any write."""
+        cols = None
+        for old_ref, new_ref in self._listing_refs_for(b, obs):
+            exists = await self.db.fetch_one(
+                "SELECT 1 FROM pdp_identity_listing WHERE source_listing_ref = :old_ref",
+                {"old_ref": old_ref},
+            )
+            if not exists:
+                continue
+            if cols is None:
+                cols = await self._listing_columns()
+            quoted = [f'"{c}"' for c in cols]
+            select_exprs = []
+            for c in cols:
+                if c == "source_listing_ref":
+                    select_exprs.append(":new_ref")
+                elif c == "merchant_id":
+                    select_exprs.append(":obs")
+                else:
+                    select_exprs.append(f'"{c}"')
+            copy_sql = (
+                f"INSERT INTO pdp_identity_listing ({', '.join(quoted)}) "
+                f"SELECT {', '.join(select_exprs)} FROM pdp_identity_listing "
+                f"WHERE source_listing_ref = :old_ref "
+                f"ON CONFLICT (source_listing_ref) DO NOTHING"
+            )
+            assert_sig_frozen_sql(copy_sql)
+            params = {"new_ref": new_ref, "obs": obs, "old_ref": old_ref}
+            await self.db.execute(copy_sql, params)
+            for child_sql in (
+                "UPDATE pdp_identity_review_queue SET source_listing_ref = :new_ref "
+                "WHERE source_listing_ref = :old_ref",
+                "UPDATE pdp_identity_override SET source_listing_ref = :new_ref "
+                "WHERE source_listing_ref = :old_ref",
+            ):
+                assert_sig_frozen_sql(child_sql)
+                await self.db.execute(child_sql, {"new_ref": new_ref, "old_ref": old_ref})
+            await self.db.execute(
+                "DELETE FROM pdp_identity_listing WHERE source_listing_ref = :old_ref",
+                {"old_ref": old_ref},
+            )
 
     async def _sku_keys_for_product(self, product_key: str) -> List[str]:
         rows = await self.db.fetch_all(
@@ -1004,6 +1350,8 @@ def _parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
                     help="Postgres URL (defaults to $DATABASE_URL).")
     ap.add_argument("--execute", action="store_true",
                     help="Perform writes. WITHOUT this flag the run is READ-ONLY (dry-run).")
+    ap.add_argument("--max-batches", type=int, default=0,
+                    help="stop the catalog phase after N batches (canary; 0 = no limit)")
     ap.add_argument("--batch-size", type=int, default=100,
                     help="Products per catalog re-key batch (default 100).")
     ap.add_argument("--phases", default="seeds,barekey,catalog,edges",
@@ -1038,6 +1386,7 @@ async def _amain(args: argparse.Namespace) -> int:
     try:
         report = await run_backfill(
             database=database, si_mod=si_mod, execute=args.execute,
+            max_batches=args.max_batches,
             batch_size=args.batch_size, phases=phases,
         )
     finally:

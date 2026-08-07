@@ -236,6 +236,53 @@ async def _resolve_claimed_merchant(registrable: str) -> Optional[str]:
     return None
 
 
+async def ensure_observed_seller_of_record(
+    *,
+    kind: str,
+    brand: Optional[str],
+    domain: str,
+    source_system: str,
+    primary_platform: Optional[str] = None,
+) -> str:
+    """W2/R3 — resolve-or-mint for EITHER seller kind. Brand-direct delegates
+    to `ensure_observed_seller` unchanged. Retailer follows the same ladder
+    (attach beats mint -> existing -> mint) with retailer keying/metadata."""
+    if kind != "retailer":
+        return await ensure_observed_seller(
+            brand=brand or "", domain=domain, source_system=source_system,
+            primary_platform=primary_platform,
+        )
+    registrable = etld1(str(domain or "").strip().rstrip("."))
+    observed_id = make_observed_retailer_id(registrable)  # raises on garbage
+
+    claimed = await _resolve_claimed_merchant(registrable)
+    if claimed:
+        return claimed
+    existing = await database.fetch_one(
+        "SELECT merchant_id FROM catalog_merchants WHERE merchant_id = :mid",
+        {"mid": observed_id},
+    )
+    if existing:
+        return observed_id
+    if observed_id == BANNED_BUCKET_MERCHANT_ID:  # impossible by prefix; asserted anyway
+        raise RuntimeError("ADR-009 D2 violation: refusing to mint the banned bucket")
+    await upsert_catalog_merchant(
+        merchant_id=observed_id,
+        merchant_name=registrable,
+        primary_platform=primary_platform,
+        source_system=source_system,
+        source_ref=registrable,
+        status=OBSERVED_STATUS,
+        metadata_json={
+            "observed": True,
+            "minted_by": "seller_identity.ensure_observed_seller_of_record",
+            "adr": "ADR-009-D2",
+            "seller_identity": {"kind": "retailer", "etld1": registrable},
+        },
+    )
+    return observed_id
+
+
 async def ensure_observed_seller(
     *,
     brand: str,

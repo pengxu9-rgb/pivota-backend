@@ -123,6 +123,24 @@ if IS_POSTGRES:
     _command_timeout = _env_float(
         "DB_COMMAND_TIMEOUT_SECONDS", 0.0, min_value=0.0, max_value=600.0
     )
+    # Opt-in TLS for the Railway PUBLIC proxy (self-signed cert): asyncpg
+    # ignores libpq's sslmode, so a local ops CLI hitting the public URL either
+    # times out (no TLS) or fails verification (ssl=true). DB_SSL_NO_VERIFY=1
+    # sends TLS without cert verification — encryption without authentication,
+    # acceptable for read-only ops runs, NEVER set in a deployed environment
+    # (prod connects over the internal network with no TLS need).
+    if str(os.getenv("DB_SSL_NO_VERIFY", "")).strip().lower() in ("1", "true", "yes"):
+        if os.getenv("RAILWAY_ENVIRONMENT") or os.getenv("RAILWAY_SERVICE_ID"):
+            raise RuntimeError(
+                "DB_SSL_NO_VERIFY must never be set in a deployed environment — "
+                "it disables certificate verification for the whole pool. It is "
+                "for LOCAL read-only ops runs against the public proxy only."
+            )
+        import ssl as _ssl
+        _ctx = _ssl.create_default_context()
+        _ctx.check_hostname = False
+        _ctx.verify_mode = _ssl.CERT_NONE
+        database_kwargs["ssl"] = _ctx
     if _command_timeout > 0:
         database_kwargs["command_timeout"] = _command_timeout
 
