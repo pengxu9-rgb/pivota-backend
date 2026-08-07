@@ -1,10 +1,16 @@
 """Takedown of already-ingested ad-campaign landing pages (PIVOTA-Agent#1926).
 
-The point of this runner is that the PREVIOUS suppression sweep did not take
-anything down: it wrote suppression_reason without suppressed_at, and the
-serving gate reads only the latter. So the tests that matter are the ones
-pinning which columns get written, and that the residual (content_keys a real
-product keeps alive) is reported rather than glossed.
+This runner withdraws LIVE products from serving, so the tests are weighted to
+the two ways it can be wrong in a way nobody notices:
+
+* withdrawing something real — pinned by the cluster predicate tests;
+* reporting a takedown that did not happen — pinned by the read-back tests.
+
+The cluster predicate exists because fetching the URL cannot separate an ad
+variant from a delisted-but-live product: measured in prod, biodance's ad pages
+and TONYMOLY's real sheet masks BOTH return 200 / og:type=product / InStock.
+What separates them is structural — an ad farm puts many rows on one
+content_key; a delisted real product is a lone occupant.
 """
 
 from __future__ import annotations
@@ -16,125 +22,192 @@ import pytest
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-import scripts.onboard_external_brand_from_crawl as onboard  # noqa: E402
 import scripts.remediate_unpublished_crawl_rows as remediate  # noqa: E402
 from services.shopify_publication_signal import UNKNOWN, UNPUBLISHED  # noqa: E402
 
 
 class _FakeDB:
-    """Records every statement so the tests can assert on the actual SQL."""
-
-    def __init__(self, fetch_rows=None):
+    def __init__(self, serving_by_key=None):
         self.executed = []
-        self._fetch_rows = fetch_rows or []
+        self._serving = serving_by_key or {}
 
     async def execute(self, query, values=None):
         self.executed.append((" ".join(str(query).split()), values or {}))
 
     async def fetch_all(self, query, values=None):
-        return self._fetch_rows
+        return []
 
-    async def connect(self):
-        pass
+    async def fetch_one(self, query, values=None):
+        ck = (values or {}).get("ck")
+        if ck not in self._serving:
+            return None
+        return {"serving_eligible": self._serving[ck]}
 
-    async def disconnect(self):
-        pass
-
-    def statements_touching(self, fragment):
+    def touching(self, fragment):
         return [(q, v) for q, v in self.executed if fragment in q]
 
 
-def _row(seed_id, url, content_key="ck_1", reason=None):
+def _row(seed_id, url, content_key="ck_1", reason=None, rows_on_key=5, seed_status="active"):
     return {
         "seed_id": seed_id, "destination_url": url, "content_key": content_key,
-        "product_key": f"prod::{seed_id}", "seed_status": "active",
-        "suppression_reason": reason, "suppressed_at": None,
+        "product_key": f"prod::{seed_id}", "seed_status": seed_status,
+        "suppression_reason": reason, "suppressed_at": None, "rows_on_key": rows_on_key,
     }
+
+
+def _patch(monkeypatch, db):
+    monkeypatch.setattr(remediate, "database", db)
+    monkeypatch.setattr(remediate, "recompute_serving_eligibility",
+                        lambda ck, reason=None: _async(None))
+
+
+# --- what actually gets written ---------------------------------------------
 
 
 @pytest.mark.asyncio
 async def test_withdraw_sets_suppressed_at_not_just_a_reason(monkeypatch):
-    """The whole defect in one assertion. suppression_reason alone leaves the
-    PDP serving — step5 proved that in prod on this exact cohort."""
-    db = _FakeDB()
-    monkeypatch.setattr(remediate, "database", db)
-    monkeypatch.setattr(remediate, "recompute_serving_eligibility",
-                        lambda ck, reason=None: _async(False))
-
+    """suppression_reason alone leaves the PDP serving — the serving gate keys
+    on suppressed_at and nothing else."""
+    db = _FakeDB({"ck_1": False})
+    _patch(monkeypatch, db)
     await remediate._withdraw([_row("s1", "https://biodance.com/products/0627_cm_a")])
 
-    assert db.statements_touching("suppressed_at=NOW()"), "must stamp the column serving reads"
-    assert db.statements_touching("status='inactive'")
-    assert db.statements_touching("suppression_reason=:reason")
+    assert db.touching("suppressed_at=NOW()")
+    assert db.touching("status='inactive'")
+    assert db.touching("suppression_reason=:reason")
 
 
 @pytest.mark.asyncio
 async def test_withdraw_preserves_an_existing_suppression_reason(monkeypatch):
-    """step5's provenance is worth keeping; only fill a NULL reason."""
-    db = _FakeDB()
-    monkeypatch.setattr(remediate, "database", db)
-    monkeypatch.setattr(remediate, "recompute_serving_eligibility",
-                        lambda ck, reason=None: _async(False))
-
+    db = _FakeDB({"ck_1": False})
+    _patch(monkeypatch, db)
     await remediate._withdraw([_row("s1", "https://x.com/products/a", reason="step5_campaign_clone_dup")])
+    assert all("suppression_reason IS NULL" in q for q, _ in db.touching("suppression_reason=:reason"))
 
-    reason_writes = db.statements_touching("suppression_reason=:reason")
-    assert all("suppression_reason IS NULL" in q for q, _ in reason_writes)
+
+@pytest.mark.asyncio
+async def test_withdraw_records_prior_seed_status_for_revert(monkeypatch):
+    db = _FakeDB({"ck_1": False})
+    _patch(monkeypatch, db)
+    await remediate._withdraw([_row("s1", "https://x.com/products/a", seed_status="inactive")])
+    meta = db.touching("suppression_metadata")
+    assert meta and meta[0][1]["prior"] == "inactive"
+    assert meta[0][1]["script"] == remediate.SCRIPT_NAME
 
 
 @pytest.mark.asyncio
 async def test_every_write_is_idempotency_guarded(monkeypatch):
-    db = _FakeDB()
-    monkeypatch.setattr(remediate, "database", db)
-    monkeypatch.setattr(remediate, "recompute_serving_eligibility",
-                        lambda ck, reason=None: _async(False))
-
+    db = _FakeDB({"ck_1": False})
+    _patch(monkeypatch, db)
     await remediate._withdraw([_row("s1", "https://x.com/products/a")])
-
     for q, _ in db.executed:
         assert " IS NULL" in q or "status='active'" in q, f"unguarded write: {q}"
 
 
-@pytest.mark.asyncio
-async def test_recompute_is_called_once_per_content_key(monkeypatch):
-    seen = []
-    db = _FakeDB()
-    monkeypatch.setattr(remediate, "database", db)
-
-    def _rec(content_key, reason=None):
-        seen.append(content_key)
-        return _async(False)
-
-    monkeypatch.setattr(remediate, "recompute_serving_eligibility", _rec)
-    await remediate._withdraw([
-        _row("s1", "https://x.com/products/a", content_key="ck_a"),
-        _row("s2", "https://x.com/products/b", content_key="ck_a"),  # same key
-        _row("s3", "https://x.com/products/c", content_key="ck_b"),
-    ])
-    assert sorted(seen) == ["ck_a", "ck_b"]
+# --- the read-back: a failed recompute must not read as a takedown -----------
 
 
 @pytest.mark.asyncio
-async def test_residual_is_surfaced_when_a_real_product_shares_the_key(monkeypatch):
-    """A content_key shared with a real product KEEPS serving — correctly, the
-    real product must not go dark. The runner must report that rather than
-    reporting a clean sweep."""
-    db = _FakeDB()
-    monkeypatch.setattr(remediate, "database", db)
-    monkeypatch.setattr(remediate, "recompute_serving_eligibility",
-                        lambda ck, reason=None: _async(ck == "ck_shared"))
-
+async def test_states_are_read_back_from_the_table_not_inferred(monkeypatch):
+    """recompute_serving_eligibility swallows exceptions and returns False, so
+    its return value cannot tell 'went dark' from 'blew up'. Ask the table."""
+    db = _FakeDB({"ck_dark": False, "ck_live": True})  # ck_missing absent entirely
+    _patch(monkeypatch, db)
     states = await remediate._withdraw([
-        _row("s1", "https://x.com/products/a", content_key="ck_shared"),
-        _row("s2", "https://x.com/products/b", content_key="ck_alone"),
+        _row("s1", "https://x.com/products/a", content_key="ck_dark"),
+        _row("s2", "https://x.com/products/b", content_key="ck_live"),
+        _row("s3", "https://x.com/products/c", content_key="ck_missing"),
     ])
-    assert states == {"ck_shared": True, "ck_alone": False}
+    assert states == {"ck_dark": "dark", "ck_live": "serving", "ck_missing": "unknown"}
+
+
+# --- the cluster predicate ---------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_lone_sitemap_absent_rows_are_spared(monkeypatch):
+    """Measured: every false positive in review (21 live TONYMOLY sheet masks,
+    15 live arencia.us serums) was a LONE occupant of its content_key, and every
+    biodance ad-farm row was clustered. So a lone row is never withdrawn."""
+    rows = [
+        _row("tonymoly_1", "https://tonymoly.us/products/i-am-peach-sheet-mask",
+             content_key="ck_lone", rows_on_key=1),
+        _row("biodance_1", "https://biodance.com/products/0627_cm_a",
+             content_key="ck_farm", rows_on_key=45),
+    ]
+
+    class _Oracle:
+        async def classify(self, item):
+            return UNPUBLISHED
+
+    monkeypatch.setattr(remediate, "PublicationOracle", lambda: _Oracle())
+    actionable, _counts = await remediate._adjudicate(rows)
+
+    kept = [r for r in actionable if int(r["rows_on_key"]) >= 2]
+    spared = [r for r in actionable if int(r["rows_on_key"]) < 2]
+    assert [r["seed_id"] for r in kept] == ["biodance_1"]
+    assert [r["seed_id"] for r in spared] == ["tonymoly_1"]
+
+
+def test_candidates_query_computes_cluster_size():
+    assert "rows_on_key" in remediate.CANDIDATES_SQL
+    assert "suppressed_at IS NULL" in remediate.CANDIDATES_SQL
+    # step5-suppressed rows are the ones whose takedown never landed; excluding
+    # them by reason would skip 213 of biodance's 250.
+    assert "suppression_reason IS NULL" not in remediate.CANDIDATES_SQL
+
+
+# --- revert ------------------------------------------------------------------
+
+
+def test_revert_reads_a_different_row_set_than_withdrawal():
+    """Sharing CANDIDATES_SQL made --revert a silent no-op: it excludes rows
+    that ARE suppressed, which is exactly the set revert needs."""
+    assert "suppressed_at IS NOT NULL" in remediate.REVERT_CANDIDATES_SQL
+    assert "suppression_metadata->>'script'" in remediate.REVERT_CANDIDATES_SQL
+
+
+@pytest.mark.asyncio
+async def test_revert_restores_both_halves(monkeypatch):
+    """Clearing suppressed_at alone leaves a NEW half-state (live row, dead
+    seed), not the state we found."""
+    db = _FakeDB({"ck_1": True})
+    _patch(monkeypatch, db)
+    row = _row("s1", "https://x.com/products/a")
+    row["suppression_metadata"] = {"script": remediate.SCRIPT_NAME, "prior_seed_status": "active"}
+    await remediate._revert([row])
+
+    assert db.touching("suppressed_at=NULL")
+    assert db.touching("status='active'")
+
+
+@pytest.mark.asyncio
+async def test_revert_does_not_resurrect_a_seed_that_was_already_dead(monkeypatch):
+    db = _FakeDB({"ck_1": True})
+    _patch(monkeypatch, db)
+    row = _row("s1", "https://x.com/products/a")
+    row["suppression_metadata"] = {"script": remediate.SCRIPT_NAME, "prior_seed_status": "inactive"}
+    await remediate._revert([row])
+    assert not db.touching("status='active'")
+
+
+@pytest.mark.asyncio
+async def test_revert_leaves_a_foreign_suppression_reason_alone(monkeypatch):
+    """A row that carried step5's reason keeps it; we only clear our own."""
+    db = _FakeDB({"ck_1": True})
+    _patch(monkeypatch, db)
+    row = _row("s1", "https://x.com/products/a")
+    row["suppression_metadata"] = {"script": remediate.SCRIPT_NAME}
+    await remediate._revert([row])
+    clears = db.touching("suppression_reason=NULL")
+    assert clears and "suppression_reason=:reason" in clears[0][0]
+
+
+# --- adjudication ------------------------------------------------------------
 
 
 @pytest.mark.asyncio
 async def test_only_unpublished_rows_are_actionable(monkeypatch):
-    """PUBLISHED and UNKNOWN must never be touched — the runner changes live
-    serving state, so fail-open matters more here than at ingestion."""
     verdicts = {
         "https://x.com/products/real": "published",
         "https://x.com/products/0627_cm_ad": UNPUBLISHED,
@@ -157,36 +230,6 @@ def test_host_filter_is_www_insensitive():
     assert remediate._host_of("https://www.biodance.com/products/a") == "biodance.com"
     assert remediate._host_of("https://biodance.com/products/a") == "biodance.com"
     assert remediate._host_of(None) == ""
-
-
-def test_candidates_query_does_not_exclude_already_reasoned_rows():
-    """The step5-suppressed rows are exactly the ones whose takedown never
-    landed. Filtering them out would skip 213 of biodance's 250."""
-    assert "suppressed_at IS NULL" in remediate.CANDIDATES_SQL
-    assert "suppression_reason IS NULL" not in remediate.CANDIDATES_SQL
-
-
-# --- the ingestion gate now withdraws too -----------------------------------
-
-
-@pytest.mark.asyncio
-async def test_gate_suppression_withdraws_only_for_the_unpublished_ground():
-    """Ad landing pages opt into suppressed_at; the dup path deliberately does
-    not (separate blast radius, separate precedent)."""
-    db = _FakeDB()
-    original = onboard.database
-    onboard.database = db
-    try:
-        await onboard._suppress_dropped_listings(
-            [{"external_product_id": "ad_1"}], onboard.UNPUBLISHED_SUPPRESSION_REASON, withdraw=True
-        )
-        assert db.statements_touching("suppressed_at=NOW()")
-
-        db.executed.clear()
-        await onboard._suppress_dropped_listings([{"external_product_id": "dup_1"}])
-        assert not db.statements_touching("suppressed_at=NOW()")
-    finally:
-        onboard.database = original
 
 
 async def _async(value):

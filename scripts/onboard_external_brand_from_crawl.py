@@ -98,7 +98,6 @@ from services.pdp_scope_classifier import (
 # seller-of-record instead of landing under the banned 'external_seed' bucket,
 # and the seed row records that seller (seller_ref/seed_kind) so T2 attribution
 # keys conversions by seller.
-from services.index_pipeline_state_service import recompute_serving_eligibility
 from services.seller_identity import derive_seed_seller, ensure_observed_seller
 from services.shopify_publication_signal import (
     PUBLISHED,
@@ -538,43 +537,8 @@ async def _resolve_pdp_scope(p: Dict[str, Any], product_key: str, self_merchant_
     )
 
 
-async def _withdraw_content_keys(seed_ids: List[str]) -> Dict[str, bool]:
-    """Recompute serving eligibility for the content_keys of just-withdrawn rows.
-
-    Setting catalog_products.suppressed_at does NOT propagate on its own — there
-    is no trigger, and index_pipeline_state keeps its stale row until some sweep
-    happens by. The recompute is what actually flips serving_eligible.
-
-    Returns {content_key: still_serving} so the caller can report the residual
-    honestly. A content_key can legitimately stay serving here: eligibility is
-    keyed on content_key, and _select_content_key_state takes the MAX state
-    across that key's rows, so an ad page sharing its content_key with a real
-    product keeps serving through the sibling. That is correct — the real
-    product must not go dark — but it means row-grain takedown is not something
-    this repo can express alone."""
-    if not seed_ids:
-        return {}
-    rows = await database.fetch_all(
-        "SELECT DISTINCT content_key FROM catalog_products "
-        "WHERE source_ref = ANY(:ids) AND content_key IS NOT NULL",
-        {"ids": seed_ids},
-    )
-    out: Dict[str, bool] = {}
-    for row in rows:
-        content_key = dict(row).get("content_key")
-        if not content_key:
-            continue
-        out[content_key] = await recompute_serving_eligibility(
-            content_key, reason=UNPUBLISHED_SUPPRESSION_REASON
-        )
-    return out
-
-
 async def _suppress_dropped_listings(
-    dropped: List[Dict[str, Any]],
-    reason: str = DUP_SUPPRESSION_REASON,
-    *,
-    withdraw: bool = False,
+    dropped: List[Dict[str, Any]], reason: str = DUP_SUPPRESSION_REASON
 ) -> int:
     """Self-heal already-polluted stores: for each listing we're now skipping,
     deactivate any active seed row and suppress its catalog_products mirror.
@@ -587,22 +551,7 @@ async def _suppress_dropped_listings(
     `reason` distinguishes the two independent grounds for skipping a row —
     DUP_SUPPRESSION_REASON (a duplicate listing of a product we DID seed) and
     UNPUBLISHED_SUPPRESSION_REASON (an ad landing page, seeded by nothing) — so
-    either gate can be reverted without disturbing the other.
-
-    `withdraw` additionally stamps catalog_products.suppressed_at, which is the
-    ONLY catalog column the serving gate actually reads
-    (services/index_pipeline_state_service.py: `row_suppressed =
-    row.get("suppressed_at") is not None`). suppression_reason alone is
-    provenance: the PDP resolver has no suppression predicate at all, so a row
-    carrying only a reason keeps returning 200. That is not a hypothesis —
-    scripts/step5_lane3_campaign_clone_dedup.py wrote exactly this pair (reason,
-    no suppressed_at) over the biodance campaign clones on 2026-07-10 and the
-    PDPs are still up; PIVOTA-Agent/src/server.js measured 431 such tombstoned
-    mirrors serving as their own canonical on 2026-07-25.
-
-    Deliberately NOT defaulted to True. Withdrawal is a serving-state change and
-    the dup path's blast radius is a separate question with its own precedent —
-    only the ad-landing-page ground opts in."""
+    either gate can be reverted without disturbing the other."""
     suppressed = 0
     for p in dropped:
         sid = _seed_id(p["external_product_id"])
@@ -617,12 +566,6 @@ async def _suppress_dropped_listings(
             "WHERE source_ref=:id AND suppression_reason IS NULL",
             {"id": sid, "reason": reason},
         )
-        if withdraw:
-            await database.execute(
-                "UPDATE catalog_products SET suppressed_at=NOW(), updated_at=NOW() "
-                "WHERE source_ref=:id AND suppressed_at IS NULL",
-                {"id": sid},
-            )
         suppressed += 1
     return suppressed
 
@@ -646,26 +589,12 @@ async def _onboard(
     # already-polluted store self-heal instead of re-minting the PDPs.
     if unpublished:
         unpub_suppressed = await _suppress_dropped_listings(
-            unpublished, UNPUBLISHED_SUPPRESSION_REASON, withdraw=True
+            unpublished, UNPUBLISHED_SUPPRESSION_REASON
         )
-        states = await _withdraw_content_keys(
-            [_seed_id(p["external_product_id"]) for p in unpublished]
-        )
-        still = sorted(k for k, serving in states.items() if serving)
         print(
             f"publication gate: {len(unpublished)} unpublished (ad landing) page(s) "
-            f"suppressed={unpub_suppressed}, {len(states)} content_key(s) recomputed"
+            f"suppressed={unpub_suppressed}"
         )
-        if still:
-            # Not a failure: these keys carry a REAL product too, and it must
-            # keep serving. The ad row stays reachable by its own signature
-            # because the PDP resolver is row-grain while eligibility is
-            # content_key-grain. Report it rather than implying a clean sweep.
-            print(
-                f"  note: {len(still)} content_key(s) still serve — a real product "
-                f"shares the key and holds eligibility: {', '.join(still[:5])}"
-                + (" …" if len(still) > 5 else "")
-            )
     # ADR-009 D2/D3: resolve-or-mint each product's per-brand observed seller
     # BEFORE upserting the seed (so seller_ref/seed_kind land on the row) AND
     # before the mirror runs. The mirror derives the SAME identity (deterministic
