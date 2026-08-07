@@ -1316,13 +1316,16 @@ class SellerBackfill:
 # ---------------------------------------------------------------------------
 
 async def run_backfill(*, database: Any, si_mod: Any, execute: bool, batch_size: int,
-                       phases: List[str]) -> BackfillReport:
+                       phases: List[str], max_batches: int = 0,
+                       max_products: int = 0) -> BackfillReport:
     report = BackfillReport(
         mode="execute" if execute else "dry_run",
         started_at=datetime.now(timezone.utc).isoformat(),
         phases=phases, batch_size=batch_size,
     )
-    bf = SellerBackfill(database=database, si_mod=si_mod, execute=execute, batch_size=batch_size)
+    bf = SellerBackfill(database=database, si_mod=si_mod, execute=execute,
+                        batch_size=batch_size, max_batches=max_batches,
+                        max_products=max_products)
     await bf.ensure_checkpoint_table()
     report.counts = await bf.scan_counts()
     if "seeds" in phases:
