@@ -320,6 +320,38 @@
     "source": "python_authority"
   },
   {
+    "name": "title_embedded_bom",
+    "brand": "Brand",
+    "title": "Plum﻿Plump Serum",
+    "gtin": null,
+    "content_key": "ck_53aa687849a18e0e0dc0792274028566",
+    "source": "python_authority"
+  },
+  {
+    "name": "brand_non_string",
+    "brand": 123,
+    "title": "Plum Plump Hyaluronic Serum",
+    "gtin": null,
+    "content_key": null,
+    "source": "python_authority"
+  },
+  {
+    "name": "title_non_string",
+    "brand": "Brand",
+    "title": 456,
+    "gtin": null,
+    "content_key": null,
+    "source": "python_authority"
+  },
+  {
+    "name": "gtin_non_string",
+    "brand": "Glow Recipe",
+    "title": "Plum Plump Hyaluronic Serum",
+    "gtin": 789,
+    "content_key": "ck_b5f2d541f0c18a6f2576a938746806a1",
+    "source": "python_authority"
+  },
+  {
     "name": "prod_unicode_japanese",
     "brand": "Cos de BAHA",
     "title": "【美容神ゆりちゃん監修】MVマルチビタ導入美容液 50ml",

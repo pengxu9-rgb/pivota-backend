@@ -133,13 +133,32 @@ _RULE_CASES: List[Tuple[str, str, str, Optional[str]]] = [
     # U+FEFF is JS-whitespace but NOT Python's, so it must SURVIVE normalize_brand.
     # This is what a UTF-8 BOM decodes to in the first column of a CSV feed.
     ("brand_leading_bom", "\ufeffGlow Recipe", "Plum Plump Hyaluronic Serum", None),
-    # U+0085 and U+001C are Python-whitespace but not JS's, so they must SPLIT.
+    # U+0085 and U+001C are Python-whitespace but not JS's, so they must SPLIT. Both are
+    # INTERIOR on purpose: a trailing one is consumed by the strip before the split is
+    # reached, which is why an earlier version of brand_nel_separator killed no
+    # single-point mutation despite a comment saying it did. brand_leading_bom is the
+    # strongest of this group; these two mainly catch combined regressions.
     ("brand_nel_separator", "Glow Recipe Inc", "Plum Plump Hyaluronic Serum", None),
     ("brand_file_separator", "GlowRecipe", "Plum Plump Hyaluronic Serum", None),
     ("title_nel_separator", "Brand", "ab Serum", None),
     # \w is isalnum(), so Nl and No count too — not just Nd. NFKD folds most (Ⅻ->XII,
     # ½->1⁄2, ①->1); U+3007 IDEOGRAPHIC NUMBER ZERO does not.
     ("title_ideographic_number_zero", "Brand", "〇 〇 Cream", None),
+    # A UTF-8 BOM is as likely mid-title as it is in the brand column, and the two are
+    # absorbed by different code: the brand has no punctuation pass, the title does.
+    # Only the brand side was covered, so a JS-\s mistranslation of the title class —
+    # the same family as the three errors that caused PIVOTA-Agent#1938 — moved zero
+    # cases.
+    ("title_embedded_bom", "Brand", "Plum\ufeffPlump Serum", None),
+    # --- the non-string guards -------------------------------------------------------
+    # JSON carries numbers and both harnesses pass the field straight through, so these
+    # are expressible in the corpus. They matter because they are the one place the
+    # PR's own target failure mode survived: coercing `brand` instead of rejecting it
+    # reddens THIS suite while leaving the corpus UNMOVED, so the mirror never fires and
+    # the Node port keeps `typeof brand !== 'string'` after Python stopped.
+    ("brand_non_string", 123, "Plum Plump Hyaluronic Serum", None),
+    ("title_non_string", "Brand", 456, None),
+    ("gtin_non_string", "Glow Recipe", "Plum Plump Hyaluronic Serum", 789),
 ]
 
 # --- group 2: real production rows ------------------------------------------

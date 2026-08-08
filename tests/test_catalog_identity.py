@@ -366,3 +366,38 @@ def test_production_rows_reproduce_their_stored_keys() -> None:
         recomputed = make_content_key(case["brand"], case["title"], case["gtin"])
         assert recomputed == case["content_key"], case["name"]
         assert is_content_key(recomputed), case["name"]
+
+
+# ---------------------------------------------------------------------------
+# The mirror, enforced (issue #1694 review)
+#
+# Both repos run their own suite against their own copy of this corpus, and each
+# validates it against its own implementation. Nothing compared the two FILES —
+# the coupling was a bullet in a docstring saying "mirror it into PIVOTA-Agent".
+# A regeneration here that nobody mirrors therefore left that repo green on a
+# stale corpus indefinitely: both sides passing, silently forked, exactly the
+# 2026-05 incident this pair exists to prevent.
+#
+# The digest below is committed in BOTH repos. Regenerating the corpus breaks
+# this assertion here and the matching one in
+# PIVOTA-Agent/tests/content_key_authority.test.js, so the mirror step stops
+# being something to remember and becomes something CI requires. It also
+# subsumes the name-by-name checks over there: a corpus that drops cases fails
+# the digest whether or not the surviving names look right.
+#
+# When you legitimately change the corpus: regenerate, read the diff, update
+# this constant AND the one in PIVOTA-Agent, and land both together.
+# ---------------------------------------------------------------------------
+
+CORPUS_SHA256 = "3ba657415f44d3d2b2a87300d198a9510c9eff0881eba5d27406f853061dae30"
+
+
+def test_corpus_digest_is_pinned_in_both_repos() -> None:
+    import hashlib
+
+    digest = hashlib.sha256(_CORPUS_PATH.read_bytes()).hexdigest()
+    assert digest == CORPUS_SHA256, (
+        "the conformance corpus changed. Update CORPUS_SHA256 here AND the matching "
+        "constant in PIVOTA-Agent/tests/content_key_authority.test.js, mirror the file, "
+        "and land both together."
+    )

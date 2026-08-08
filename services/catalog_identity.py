@@ -118,8 +118,11 @@ def normalize_gtin(gtin: Optional[str]) -> str:
     Returns '' on empty/None — caller's content_key falls back to
     brand+title only.
 
-    Edge case: a 15+ digit input is malformed; pass through unchanged
-    rather than truncating, so we don't silently merge unrelated codes."""
+    Edge case: a 15+ digit input is malformed and passes through unchanged.
+    Note the `<= 14` branch is belt-and-braces rather than load-bearing: zfill
+    never truncates, so a bare `digits.zfill(14)` is provably identical. The
+    branch documents the intent; the guarantee that we don't silently merge
+    unrelated codes comes from zfill's behaviour, not from the gate."""
     if not gtin or not isinstance(gtin, str):
         return ""
     digits = re.sub(r"\D", "", gtin.strip())
