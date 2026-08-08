@@ -327,8 +327,11 @@ def _tombstoned_column():
 
       * 2026-07-30 — a backfill gave all 2,332 reason-only rows (seven cohorts)
         a ``suppressed_at``, reconstructed at each cohort's own apply instant.
-      * 2026-08-01 — #1660 (#1648 P1a) taught the eight suppression writers it
-        inventoried to set both columns, and every revert path to clear both.
+      * 2026-08-01 — #1660 (#1648 P1a) taught the eight BROKEN writers it found
+        to set both columns, and every revert path to clear both. Eight is the
+        count it FIXED, not the inventory: the pinned list in
+        ``tests/test_suppression_writers_set_both_columns.py`` is 15 paths, and
+        the repo holds writers outside even that — see below.
       * ``catalog_invariant_checks`` pins both directions at threshold 0
         (``suppression_reason_without_timestamp`` /
         ``suppression_timestamp_without_reason``); prod reports 0 on both.

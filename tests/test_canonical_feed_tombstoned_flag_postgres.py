@@ -27,7 +27,7 @@ how many of the 187 were genuinely reason-only rows was never re-measured.
 
 WHAT IS TRUE NOW. The 2026-07-30 backfill gave all 2,332 reason-only rows a
 `suppressed_at` (reconstructed per cohort at its own apply instant), #1660
-(#1648 P1a) taught the eight writers it inventoried to set both columns and their
+(#1648 P1a) taught the eight broken writers it found to set both columns and their
 reverts to clear both, and `catalog_invariant_checks` pins both directions at
 threshold 0. Prod reports 0 on `suppression_reason_without_timestamp` and 0 on
 `suppression_timestamp_without_reason`. So for every row in prod today
