@@ -392,6 +392,56 @@ def _review_media_client_ip(request: Request) -> str:
     return (request.client.host if request.client else None) or "unknown"
 
 
+# ── Anonymous /invoke throttle ────────────────────────────────────────────────
+# POST /agent/shop/v1/invoke is deliberately public (it is the first-party BFF
+# and the ai-plugin manifest declares auth:none), but it was also UNMETERED for
+# anonymous callers: RateLimitMiddleware only counts requests that carry an API
+# key, and the agent-ui proxy authenticates with a trusted key — so the one
+# caller class with no identity had no throttle at all (2026-08-08 audit).
+# Scope precisely: requests carrying ANY credential (X-API-Key / Bearer /
+# X-Checkout-Token) are untouched — the first-party proxy and keyed agents keep
+# today's behavior — and only credential-less direct hits are limited per IP.
+# SHOP_INVOKE_ANON_RPM tunes it; 0 disables. In-memory per-instance store,
+# same precedent as the review-media limiter above.
+_INVOKE_ANON_IP_LIMIT_STORE: Dict[str, Tuple[int, int]] = {}
+_INVOKE_ANON_IP_LIMIT_MAX_KEYS = 50_000
+
+
+def _invoke_anon_rpm() -> int:
+    try:
+        return max(0, int(os.getenv("SHOP_INVOKE_ANON_RPM") or "60"))
+    except ValueError:
+        return 60
+
+
+def _request_carries_credential(request: Request) -> bool:
+    return bool(
+        (request.headers.get("x-api-key") or "").strip()
+        or (request.headers.get("authorization") or "").strip()
+        or (request.headers.get("x-checkout-token") or "").strip()
+    )
+
+
+def _check_invoke_anon_rate_limit(ip: str) -> bool:
+    rpm = _invoke_anon_rpm()
+    if rpm == 0:
+        return True
+    window = int(time.time() // 60)
+    if len(_INVOKE_ANON_IP_LIMIT_STORE) > _INVOKE_ANON_IP_LIMIT_MAX_KEYS:
+        # Bound memory against IP-cycling: drop entries from past windows.
+        stale = [k for k, v in _INVOKE_ANON_IP_LIMIT_STORE.items() if v[0] != window]
+        for k in stale:
+            _INVOKE_ANON_IP_LIMIT_STORE.pop(k, None)
+    prev = _INVOKE_ANON_IP_LIMIT_STORE.get(ip)
+    if prev and prev[0] == window:
+        if prev[1] >= rpm:
+            return False
+        _INVOKE_ANON_IP_LIMIT_STORE[ip] = (window, prev[1] + 1)
+        return True
+    _INVOKE_ANON_IP_LIMIT_STORE[ip] = (window, 1)
+    return True
+
+
 def _check_review_media_rate_limit(ip: str) -> bool:
     rpm = _reviews_media_rpm()
     window = int(time.time() // 60)
@@ -12648,6 +12698,15 @@ async def invoke_shop_operation(
     """
     operation = (request.operation or "").strip()
     checkout_token = (http_request.headers.get("x-checkout-token") or "").strip() or None
+
+    # Credential-less direct callers only — see the limiter's comment block.
+    if not _request_carries_credential(http_request):
+        if not _check_invoke_anon_rate_limit(_review_media_client_ip(http_request)):
+            raise HTTPException(
+                status_code=429,
+                detail="Too many anonymous requests; slow down or authenticate with an API key.",
+                headers={"Retry-After": "60"},
+            )
 
     # Normalize metadata: allow creatorId/creatorName to be passed at payload top-level
     normalized_metadata = _normalize_gateway_request_metadata(

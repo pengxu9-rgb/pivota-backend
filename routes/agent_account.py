@@ -3,18 +3,73 @@ Agent Account Management - REBUILT from scratch
 Simplified and adapted to actual database schema
 """
 
-from fastapi import APIRouter, HTTPException, Depends
+from fastapi import APIRouter, HTTPException, Depends, Request
 from pydantic import BaseModel, EmailStr, field_validator
-from typing import Optional
+from typing import Dict, Optional, Tuple
 from datetime import datetime, timedelta
+import os
 import secrets
 import hashlib
+import time
 
 from db.auth_identity import upsert_membership
 from db.database import database
 from utils.auth import hash_password, verify_password, create_access_token, get_current_user
 
 router = APIRouter(prefix="/agent/account", tags=["agent-account"])
+
+
+# ── Self-serve registration guardrails ────────────────────────────────────────
+# POST /agent/account/register mints a live ak_live_* API key with no approval
+# gate and no throttle (2026-08-08 agent-readability audit). Each key gets its
+# own 100 rpm / 10k-daily quota, so unthrottled registration is quota
+# multiplication: N registrations/minute = N*100 rpm of unmetered capacity.
+# Two guardrails, both env-tunable so ops can act without a deploy:
+#   * AGENT_SELF_SERVE_REGISTRATION_ENABLED (default ON — preserves today's
+#     onboarding behavior; flipping it off is the kill switch).
+#   * AGENT_REGISTRATION_PER_IP_HOURLY (default 5; 0 disables the throttle).
+# In-memory per-instance store, same precedent as the review-media IP limiter.
+_REGISTRATION_IP_LIMIT_STORE: Dict[str, Tuple[int, int]] = {}
+_REGISTRATION_IP_LIMIT_MAX_KEYS = 10_000
+
+
+def _self_serve_registration_enabled() -> bool:
+    raw = (os.getenv("AGENT_SELF_SERVE_REGISTRATION_ENABLED") or "true").strip().lower()
+    return raw in {"1", "true", "yes", "on"}
+
+
+def _registration_hourly_limit() -> int:
+    try:
+        return max(0, int(os.getenv("AGENT_REGISTRATION_PER_IP_HOURLY") or "5"))
+    except ValueError:
+        return 5
+
+
+def _registration_client_ip(request: Request) -> str:
+    xff = (request.headers.get("x-forwarded-for") or "").strip()
+    if xff:
+        return xff.split(",")[0].strip() or "unknown"
+    return (request.client.host if request.client else None) or "unknown"
+
+
+def _check_registration_rate_limit(ip: str) -> bool:
+    limit = _registration_hourly_limit()
+    if limit == 0:
+        return True
+    window = int(time.time() // 3600)
+    if len(_REGISTRATION_IP_LIMIT_STORE) > _REGISTRATION_IP_LIMIT_MAX_KEYS:
+        # Bound memory against IP-cycling: drop entries from past windows.
+        stale = [k for k, v in _REGISTRATION_IP_LIMIT_STORE.items() if v[0] != window]
+        for k in stale:
+            _REGISTRATION_IP_LIMIT_STORE.pop(k, None)
+    prev = _REGISTRATION_IP_LIMIT_STORE.get(ip)
+    if prev and prev[0] == window:
+        if prev[1] >= limit:
+            return False
+        _REGISTRATION_IP_LIMIT_STORE[ip] = (window, prev[1] + 1)
+        return True
+    _REGISTRATION_IP_LIMIT_STORE[ip] = (window, 1)
+    return True
 
 
 def _validate_agent_password(value: str) -> str:
@@ -316,11 +371,24 @@ class AgentLoginResponse(BaseModel):
 # ============================================================================
 
 @router.post("/register")
-async def register_agent(data: AgentRegisterRequest):
+async def register_agent(data: AgentRegisterRequest, http_request: Request):
     """
     Register a new AI Agent
     Simplified to work with actual database schema
     """
+    if not _self_serve_registration_enabled():
+        raise HTTPException(
+            status_code=403,
+            detail="Self-serve agent registration is currently disabled. Contact support@pivota.cc.",
+        )
+    client_ip = _registration_client_ip(http_request)
+    if not _check_registration_rate_limit(client_ip):
+        raise HTTPException(
+            status_code=429,
+            detail="Too many registrations from this address; try again later.",
+            headers={"Retry-After": "3600"},
+        )
+
     agent_id: Optional[str] = None
     email = _normalize_email(data.email)
 
