@@ -1,0 +1,426 @@
+[
+  {
+    "name": "ordinary_niacinamide_no_gtin",
+    "brand": "The Ordinary",
+    "title": "Niacinamide 10% + Zinc 1%",
+    "gtin": null,
+    "content_key": "ck_939480cbc7bca69ca2792d22b2d83bf2",
+    "source": "python_authority"
+  },
+  {
+    "name": "ordinary_niacinamide_brand_prefixed_title",
+    "brand": "The Ordinary",
+    "title": "The Ordinary Niacinamide 10% + Zinc 1%",
+    "gtin": null,
+    "content_key": "ck_8f3c4e2c448beff58e2531942d4f273f",
+    "source": "python_authority"
+  },
+  {
+    "name": "ordinary_niacinamide_with_gtin",
+    "brand": "The Ordinary",
+    "title": "Niacinamide 10% + Zinc 1%",
+    "gtin": "769915190311",
+    "content_key": "ck_f01288706102f731356e968e2e1047ca",
+    "source": "python_authority"
+  },
+  {
+    "name": "glow_recipe_suffix_and_case",
+    "brand": "Glow Recipe Inc.",
+    "title": "PLUM PLUMP HYALURONIC SERUM",
+    "gtin": null,
+    "content_key": "ck_b5f2d541f0c18a6f2576a938746806a1",
+    "source": "python_authority"
+  },
+  {
+    "name": "glow_recipe_trimmed_whitespace",
+    "brand": "  glow recipe  ",
+    "title": "Plum  Plump  Hyaluronic  Serum",
+    "gtin": "",
+    "content_key": "ck_b5f2d541f0c18a6f2576a938746806a1",
+    "source": "python_authority"
+  },
+  {
+    "name": "mac_gtin_13",
+    "brand": "MAC",
+    "title": "Lipstick Russian Red",
+    "gtin": "0773602443796",
+    "content_key": "ck_e5a98e798f306cb894df880b70a43c4e",
+    "source": "python_authority"
+  },
+  {
+    "name": "mac_gtin_12_hyphen",
+    "brand": "MAC",
+    "title": "Lipstick Russian Red",
+    "gtin": "773-602-443796",
+    "content_key": "ck_e5a98e798f306cb894df880b70a43c4e",
+    "source": "python_authority"
+  },
+  {
+    "name": "mac_no_gtin",
+    "brand": "MAC",
+    "title": "Lipstick Russian Red",
+    "gtin": null,
+    "content_key": "ck_d27f0eae95dd8300fea2ded8a02eea3d",
+    "source": "python_authority"
+  },
+  {
+    "name": "tom_ford_trademark",
+    "brand": "Tom Ford Beauty™",
+    "title": "Traceless Soft Matte Concealer 3.5g",
+    "gtin": null,
+    "content_key": "ck_31a30811a64bd9481d498e83a7c0245f",
+    "source": "python_authority"
+  },
+  {
+    "name": "creme_diacritics",
+    "brand": "La Mer",
+    "title": "Crème de la Mer Moisturizing Cream",
+    "gtin": null,
+    "content_key": "ck_89c6d37aed515b09eb4a47d1bbb92822",
+    "source": "python_authority"
+  },
+  {
+    "name": "creme_ascii",
+    "brand": "La Mer",
+    "title": "Creme de la Mer Moisturizing Cream",
+    "gtin": null,
+    "content_key": "ck_89c6d37aed515b09eb4a47d1bbb92822",
+    "source": "python_authority"
+  },
+  {
+    "name": "anti_aging_hyphen",
+    "brand": "Acme Co.",
+    "title": "Anti-Aging Cream, Original (NEW!)",
+    "gtin": null,
+    "content_key": "ck_a294e0c6b162ece1a0bf10e1ea564b9f",
+    "source": "python_authority"
+  },
+  {
+    "name": "registered_mark",
+    "brand": "Tylenol®",
+    "title": "Extra Strength Caplets 100 ct",
+    "gtin": "123456789012",
+    "content_key": "ck_74d8fcafa6093ed4a2195eb03bd58120",
+    "source": "python_authority"
+  },
+  {
+    "name": "malformed_long_gtin",
+    "brand": "Brand",
+    "title": "Long Code Product",
+    "gtin": "1111111111111111",
+    "content_key": "ck_b7c6b4dedd4701d4ab2dde0f429a2b19",
+    "source": "python_authority"
+  },
+  {
+    "name": "empty_gtin_spaces",
+    "brand": "Brand",
+    "title": "Title",
+    "gtin": "   ",
+    "content_key": "ck_1ac9dcd67f5fe0395ee0bb41539b61a3",
+    "source": "python_authority"
+  },
+  {
+    "name": "brand_a_same_title",
+    "brand": "Brand A",
+    "title": "Lipstick",
+    "gtin": null,
+    "content_key": "ck_a7fb0eb9e7b2a726b188cb7784837424",
+    "source": "python_authority"
+  },
+  {
+    "name": "brand_b_same_title",
+    "brand": "Brand B",
+    "title": "Lipstick",
+    "gtin": null,
+    "content_key": "ck_bec82ed277f08b6fc5e5ff4ab53eac08",
+    "source": "python_authority"
+  },
+  {
+    "name": "punctuation_drop",
+    "brand": "Fenty Beauty",
+    "title": "Gloss Bomb Heat Universal Lip Luminizer + Plumper",
+    "gtin": null,
+    "content_key": "ck_5bc05acf76bfc2388a30e5204a121cdc",
+    "source": "python_authority"
+  },
+  {
+    "name": "underscore_kept",
+    "brand": "Test_Brand",
+    "title": "Product_Name 30ml",
+    "gtin": null,
+    "content_key": "ck_085bd08909abc9b5916734ca467edc29",
+    "source": "python_authority"
+  },
+  {
+    "name": "non_latin_unicode",
+    "brand": "雪花秀",
+    "title": "润燥精华 60ml",
+    "gtin": null,
+    "content_key": "ck_a3709381907513bcf46c3de11afe9a1a",
+    "source": "python_authority"
+  },
+  {
+    "name": "missing_brand_returns_null",
+    "brand": "",
+    "title": "Title",
+    "gtin": null,
+    "content_key": null,
+    "source": "python_authority"
+  },
+  {
+    "name": "missing_title_returns_null",
+    "brand": "Brand",
+    "title": "",
+    "gtin": null,
+    "content_key": null,
+    "source": "python_authority"
+  },
+  {
+    "name": "suffix_llc",
+    "brand": "Glow Recipe LLC",
+    "title": "Plum Plump Hyaluronic Serum",
+    "gtin": null,
+    "content_key": "ck_b5f2d541f0c18a6f2576a938746806a1",
+    "source": "python_authority"
+  },
+  {
+    "name": "suffix_ltd",
+    "brand": "Glow Recipe Ltd",
+    "title": "Plum Plump Hyaluronic Serum",
+    "gtin": null,
+    "content_key": "ck_b5f2d541f0c18a6f2576a938746806a1",
+    "source": "python_authority"
+  },
+  {
+    "name": "suffix_corp",
+    "brand": "Glow Recipe Corp",
+    "title": "Plum Plump Hyaluronic Serum",
+    "gtin": null,
+    "content_key": "ck_b5f2d541f0c18a6f2576a938746806a1",
+    "source": "python_authority"
+  },
+  {
+    "name": "suffix_company",
+    "brand": "Glow Recipe Company",
+    "title": "Plum Plump Hyaluronic Serum",
+    "gtin": null,
+    "content_key": "ck_b5f2d541f0c18a6f2576a938746806a1",
+    "source": "python_authority"
+  },
+  {
+    "name": "suffix_stacked",
+    "brand": "Glow Recipe Co. Ltd.",
+    "title": "Plum Plump Hyaluronic Serum",
+    "gtin": null,
+    "content_key": "ck_b5f2d541f0c18a6f2576a938746806a1",
+    "source": "python_authority"
+  },
+  {
+    "name": "suffix_comma_terminated",
+    "brand": "Glow Recipe Inc,",
+    "title": "Plum Plump Hyaluronic Serum",
+    "gtin": null,
+    "content_key": "ck_b5f2d541f0c18a6f2576a938746806a1",
+    "source": "python_authority"
+  },
+  {
+    "name": "suffix_paren_r",
+    "brand": "Glow Recipe (R)",
+    "title": "Plum Plump Hyaluronic Serum",
+    "gtin": null,
+    "content_key": "ck_b5f2d541f0c18a6f2576a938746806a1",
+    "source": "python_authority"
+  },
+  {
+    "name": "suffix_mid_string_tm",
+    "brand": "Acme (TM) Labs",
+    "title": "Plum Plump Hyaluronic Serum",
+    "gtin": null,
+    "content_key": "ck_2cf841409641e95cd962b26a3d8b3d96",
+    "source": "python_authority"
+  },
+  {
+    "name": "mark_ccc_zero_devanagari",
+    "brand": "Himalaya",
+    "title": "नीम फेस वॉश 100ml",
+    "gtin": null,
+    "content_key": "ck_f923d430a83409b7e35aaedcfa6c91e2",
+    "source": "python_authority"
+  },
+  {
+    "name": "mark_ccc_zero_thai",
+    "brand": "Mistine",
+    "title": "เซรั่มบำรุงผิว วิตามินซี",
+    "gtin": "8850012345678",
+    "content_key": "ck_ce99c08b8988f2bc5f6e25a35156af6e",
+    "source": "python_authority"
+  },
+  {
+    "name": "gtin_fullwidth_digits",
+    "brand": "Shiseido",
+    "title": "Ultimune Power Infusing Concentrate",
+    "gtin": "４９０９９７８９９０６６５",
+    "content_key": "ck_8a4c1772ff0afe0564ea1776d75c0488",
+    "source": "python_authority"
+  },
+  {
+    "name": "gtin_arabic_indic_digits",
+    "brand": "MAC",
+    "title": "Lipstick Russian Red",
+    "gtin": "٣٤٥",
+    "content_key": "ck_8791756d6bdf8bd5fe3eca0e1ada3037",
+    "source": "python_authority"
+  },
+  {
+    "name": "gtin_astral_digit",
+    "brand": "Brand",
+    "title": "Astral Code Product",
+    "gtin": "𐒠7736",
+    "content_key": "ck_23458dd98c97c029a1e90b415c479832",
+    "source": "python_authority"
+  },
+  {
+    "name": "brand_leading_bom",
+    "brand": "﻿Glow Recipe",
+    "title": "Plum Plump Hyaluronic Serum",
+    "gtin": null,
+    "content_key": "ck_99da5ae7bbacc10111a004572c312fdf",
+    "source": "python_authority"
+  },
+  {
+    "name": "brand_nel_separator",
+    "brand": "Glow Recipe Inc",
+    "title": "Plum Plump Hyaluronic Serum",
+    "gtin": null,
+    "content_key": "ck_b5f2d541f0c18a6f2576a938746806a1",
+    "source": "python_authority"
+  },
+  {
+    "name": "brand_file_separator",
+    "brand": "Glow\u001cRecipe",
+    "title": "Plum Plump Hyaluronic Serum",
+    "gtin": null,
+    "content_key": "ck_b5f2d541f0c18a6f2576a938746806a1",
+    "source": "python_authority"
+  },
+  {
+    "name": "title_nel_separator",
+    "brand": "Brand",
+    "title": "ab Serum",
+    "gtin": null,
+    "content_key": "ck_c340d8b21181fa5714f5fbaa7f99223e",
+    "source": "python_authority"
+  },
+  {
+    "name": "title_ideographic_number_zero",
+    "brand": "Brand",
+    "title": "〇 〇 Cream",
+    "gtin": null,
+    "content_key": "ck_839adee7f0544053e6fe040806ae8932",
+    "source": "python_authority"
+  },
+  {
+    "name": "title_embedded_bom",
+    "brand": "Brand",
+    "title": "Plum﻿Plump Serum",
+    "gtin": null,
+    "content_key": "ck_53aa687849a18e0e0dc0792274028566",
+    "source": "python_authority"
+  },
+  {
+    "name": "brand_non_string",
+    "brand": 123,
+    "title": "Plum Plump Hyaluronic Serum",
+    "gtin": null,
+    "content_key": null,
+    "source": "python_authority"
+  },
+  {
+    "name": "title_non_string",
+    "brand": "Brand",
+    "title": 456,
+    "gtin": null,
+    "content_key": null,
+    "source": "python_authority"
+  },
+  {
+    "name": "gtin_non_string",
+    "brand": "Glow Recipe",
+    "title": "Plum Plump Hyaluronic Serum",
+    "gtin": 789,
+    "content_key": "ck_b5f2d541f0c18a6f2576a938746806a1",
+    "source": "python_authority"
+  },
+  {
+    "name": "prod_unicode_japanese",
+    "brand": "Cos de BAHA",
+    "title": "【美容神ゆりちゃん監修】MVマルチビタ導入美容液 50ml",
+    "gtin": null,
+    "content_key": "ck_f6355303f81e6e92c4cb48009d86bfe6",
+    "source": "prod_catalog_products",
+    "note": "live row minted 2026-07-18 by the Python authority; verified 2026-08-07"
+  },
+  {
+    "name": "prod_diacritics_french",
+    "brand": "Biodance",
+    "title": "Le masque de nuit N°1, désormais en toner pads",
+    "gtin": null,
+    "content_key": "ck_e8b1063b1c169cca219830d96270241d",
+    "source": "prod_catalog_products",
+    "note": "live row minted 2026-07-18 by the Python authority; verified 2026-08-07"
+  },
+  {
+    "name": "prod_percent_and_plus",
+    "brand": "Anua",
+    "title": "Nano Retinol 0.3% + Niacin Renewing Serum",
+    "gtin": null,
+    "content_key": "ck_302d05b474461ad8d4e0f3e56719a0fd",
+    "source": "prod_catalog_products",
+    "note": "live row minted 2026-07-16 by the Python authority; verified 2026-08-07"
+  },
+  {
+    "name": "prod_brackets_and_multiplier",
+    "brand": "BB LAB",
+    "title": "[Bundle] Good Night Collagen (Low-Molecular Weight Collagen), 30 sticks x 2box",
+    "gtin": null,
+    "content_key": "ck_e907300bc7941e9fe99c7741f0c9b395",
+    "source": "prod_catalog_products",
+    "note": "live row minted 2026-07-16 by the Python authority; verified 2026-08-07"
+  },
+  {
+    "name": "prod_long_title_with_size",
+    "brand": "ARENCIA",
+    "title": "Vitamin C Glow Booster Gel Cream, Lightweight Brightening Gel Moisturizer for Even Tone & Radiant Skin, 1.76 oz",
+    "gtin": null,
+    "content_key": "ck_ffc21468a04f90858c719a58a3d4f48a",
+    "source": "prod_catalog_products",
+    "note": "live row minted 2026-07-18 by the Python authority; verified 2026-08-07"
+  },
+  {
+    "name": "prod_trademark_in_title",
+    "brand": "By Juccy",
+    "title": "Vinoberry Bakuchi-oil™ Firming Ampoule 30ml",
+    "gtin": null,
+    "content_key": "ck_65b8cd3c4bd43c743362fbc5a1f31496",
+    "source": "prod_catalog_products",
+    "note": "live row minted 2026-07-18 by the Python authority; verified 2026-08-07"
+  },
+  {
+    "name": "prod_dotted_brand_repeated_in_title",
+    "brand": "Dr.FORHAIR",
+    "title": "Dr.FORHAIR Folligen Original Hair Loss Shampoo",
+    "gtin": null,
+    "content_key": "ck_487bc8346034e344e8112a2ef62118ee",
+    "source": "prod_catalog_products",
+    "note": "live row minted 2026-07-03 by the Python authority; verified 2026-08-07"
+  },
+  {
+    "name": "prod_trailing_plus",
+    "brand": "9wishes",
+    "title": "Hydra Ampule Nano Plus+",
+    "gtin": null,
+    "content_key": "ck_1755e07b116d41dae56f11978771d43d",
+    "source": "prod_catalog_products",
+    "note": "live row minted 2026-07-17 by the Python authority; verified 2026-08-07"
+  }
+]
