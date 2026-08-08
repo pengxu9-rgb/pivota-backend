@@ -166,8 +166,11 @@ class TestErrorHandlerMiddleware:
         assert response.status_code == 200
         assert response.json() == {"message": "Success"}
     
-    def test_pivota_api_error_handling(self, client):
+    def test_pivota_api_error_handling(self, client, monkeypatch):
         """Test PivotaAPIError is properly formatted"""
+        # Environment-proof: an exported ERROR_DOCS_BASE_URL would change the
+        # documentation_url this test pins.
+        monkeypatch.delenv("ERROR_DOCS_BASE_URL", raising=False)
         response = client.get("/test/pivota-error")
         
         assert response.status_code == 404
