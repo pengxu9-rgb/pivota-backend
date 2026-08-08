@@ -718,11 +718,19 @@ class SellerBackfill:
             # DISTINCT ON: two active seeds (different market/tool) can attach
             # one product; a fan-out would double-plan it. Deterministic pick:
             # the seed with a non-empty domain first, then newest.
+            # DISTINCT ON picks ONE seed for the domain candidates, but a
+            # product can carry SEVERAL active attached seeds and each may own
+            # its own identity listing — the canary stranded 3 listings on a
+            # 4-seed product when only the picked seed's listing migrated
+            # (2026-08-08). seed_listing_ids aggregates ALL of them.
             "SELECT DISTINCT ON (cp.product_key) "
             "cp.product_key, cp.content_key, cp.brand, cp.source_domain, "
             "cp.canonical_url, cp.platform, cp.source_product_id, "
             "e.external_product_id AS seed_external_product_id, "
-            "e.domain AS seed_domain, e.destination_url AS seed_destination_url "
+            "e.domain AS seed_domain, e.destination_url AS seed_destination_url, "
+            "(SELECT array_agg(e2.external_product_id) FROM external_product_seeds e2 "
+            "  WHERE e2.attached_product_key = cp.product_key AND e2.status = 'active') "
+            "  AS seed_listing_ids "
             "FROM catalog_products cp "
             "LEFT JOIN external_product_seeds e "
             "  ON e.attached_product_key = cp.product_key AND e.status = 'active' "
@@ -795,7 +803,8 @@ class SellerBackfill:
             # measured 2026-08-07 — 0 Path C listings under the slug, 2,444
             # under the seed id). Carry every candidate.
             listing_pids = [str(v) for v in dict.fromkeys(
-                [p.get("source_product_id"), p.get("seed_external_product_id")]) if v]
+                [p.get("source_product_id"), p.get("seed_external_product_id"),
+                 *(p.get("seed_listing_ids") or [])]) if v]
             planned.append({**p, "observed_id": seller_ref, "disposition": disposition,
                             "seller_kind": kind, "seller_domain": dest,
                             "listing_product_ids": listing_pids})
@@ -991,6 +1000,50 @@ class SellerBackfill:
                                        str(b["observed_id"]), "done",
                                        previous_value=BANNED_BUCKET_MERCHANT_ID)
         return parity
+
+    async def repair_listings(self, report: BackfillReport) -> None:
+        """Migrate identity listings still under the sentinel for products the
+        catalog phase already checkpointed done. Exists because a re-run cannot
+        reach them (moved rows no longer match the sentinel-scoped scan): the
+        canary's 4-seed product migrated only the picked seed's listing,
+        stranding 3 (verifier catch, 2026-08-08)."""
+        rows = await self.db.fetch_all(
+            "SELECT ck.ref_id AS product_key, ck.observed_id, cp.source_product_id, "
+            "(SELECT array_agg(e2.external_product_id) FROM external_product_seeds e2 "
+            "  WHERE e2.attached_product_key = ck.ref_id AND e2.status = 'active') AS seed_listing_ids "
+            "FROM a9_4_backfill_checkpoint ck "
+            "JOIN catalog_products cp ON cp.product_key = ck.ref_id "
+            "WHERE ck.phase = 'catalog' AND ck.status = 'done'"
+        )
+        stats = {"scanned": len(rows or []), "stale_found": 0, "migrated": 0, "conflicts": 0}
+        for r in rows or []:
+            d = dict(r)
+            obs = str(d.get("observed_id") or "")
+            b = {"source_product_id": d.get("source_product_id"),
+                 "listing_product_ids": [str(v) for v in dict.fromkeys(
+                     [d.get("source_product_id"), *(d.get("seed_listing_ids") or [])]) if v]}
+            stale = []
+            for old_ref, _new_ref in self._listing_refs_for(b, obs):
+                row = await self.db.fetch_one(
+                    "SELECT 1 FROM pdp_identity_listing WHERE source_listing_ref = :r",
+                    {"r": old_ref})
+                if row:
+                    stale.append(old_ref)
+            if not stale:
+                continue
+            stats["stale_found"] += len(stale)
+            if not self.execute:
+                continue
+            conflict = await self._listing_new_ref_conflict(b, obs)
+            if conflict:
+                stats["conflicts"] += 1
+                report.review_queue.setdefault("listing_repair_conflicts", []).append(
+                    {"product_key": d.get("product_key"), "conflicting_ref": conflict})
+                continue
+            async with self.db.transaction():
+                await self._migrate_listing_refs(b, obs)
+            stats["migrated"] += len(stale)
+        report.catalog["listing_repair"] = stats
 
     async def _resubject_group_membership(self, b: Dict[str, Any], obs: str) -> None:
         """product_group_members keys on (merchant_id, platform,
@@ -1340,6 +1393,8 @@ async def run_backfill(*, database: Any, si_mod: Any, execute: bool, batch_size:
         await bf.run_barekey(report)
     if "catalog" in phases:
         await bf.run_catalog(report)
+    if "repair-listings" in phases:
+        await bf.repair_listings(report)
     if "edges" in phases:
         await bf.run_edges(report)
     report.epilogue = [
@@ -1364,6 +1419,10 @@ def _parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
                     help="Perform writes. WITHOUT this flag the run is READ-ONLY (dry-run).")
     ap.add_argument("--max-batches", type=int, default=0,
                     help="stop the catalog phase after N batches (canary; 0 = no limit)")
+    ap.add_argument("--repair-listings", action="store_true",
+                    help="migrate any listing still under the sentinel for products "
+                         "ALREADY checkpointed done (e.g. multi-seed stragglers). "
+                         "Honors --execute; dry-run reports what would move.")
     ap.add_argument("--max-products", type=int, default=0,
                     help="cap the catalog SCAN itself (canary; 0 = all). Planning "
                          "resolves per-row over the network — a capped canary must "
@@ -1398,6 +1457,8 @@ async def _amain(args: argparse.Namespace) -> int:
         return 3
 
     phases = [p.strip() for p in args.phases.split(",") if p.strip()]
+    if getattr(args, "repair_listings", False) and "repair-listings" not in phases:
+        phases.append("repair-listings")
     await database.connect()
     try:
         report = await run_backfill(
