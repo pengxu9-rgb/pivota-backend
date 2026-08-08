@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
+import os
 import json
 import logging
 import re
@@ -1791,6 +1792,39 @@ async def ingest_standard_products(
     return stats
 
 
+# ADR: the tombstone prune below has never once executed — its three
+# statements failed to PREPARE from #666 (2026-05-26) until the fix in this
+# branch, so `POST /sync/{merchant_id}` 500ed after ingest had already
+# committed. Making it plannable does not merely repair it, it switches on a
+# writer that will tombstone ~2.5 months of accumulated upstream-deleted rows on
+# the FIRST operator sync, and `upsert_catalog_row_trust_many` flips those rows
+# out of serving inline rather than waiting for cron.
+#
+# So it ships INERT. Enable deliberately, after checking the count the
+# suppressed path logs, and prefer the sanctioned dry-run
+# (`scripts/sweep_stale_catalog_products.py --apply`) for the first pass.
+_PRUNE_TOMBSTONE_FLAG = "CATALOG_SYNC_PRUNE_TOMBSTONE_ENABLED"
+_PRUNE_TOMBSTONE_CAP_VAR = "CATALOG_SYNC_PRUNE_MAX_ROWS"
+_PRUNE_TOMBSTONE_DEFAULT_CAP = 500
+
+
+def _prune_tombstone_enabled() -> bool:
+    """Read at call time, not import time, so ops can flip it without a deploy."""
+    return str(os.getenv(_PRUNE_TOMBSTONE_FLAG, "false")).strip().lower() in {
+        "1", "true", "yes", "on",
+    }
+
+
+def _prune_tombstone_cap() -> int:
+    """0 disables the cap. A cap is not a substitute for the flag: it bounds the
+    blast radius of a run someone has already decided to make."""
+    try:
+        return max(0, int(str(os.getenv(_PRUNE_TOMBSTONE_CAP_VAR, "")).strip()
+                          or _PRUNE_TOMBSTONE_DEFAULT_CAP))
+    except ValueError:
+        return _PRUNE_TOMBSTONE_DEFAULT_CAP
+
+
 async def prune_missing_catalog_products_for_source(
     *,
     merchant_id: str,
@@ -1979,11 +2013,38 @@ async def prune_missing_catalog_products_for_source(
             ),
         ]
 
-        for table_name, sql in update_statements:
-            tombstoned = await database.fetch_val(sql, tombstone_params)
-            stats[table_name] = int(tombstoned or 0)
+        # The kill-switch. Everything above this point is READ-ONLY: the stale
+        # set is computed into temp tables, counted and logged, so an operator
+        # can see exactly what a run would do before enabling it.
+        cap = _prune_tombstone_cap()
+        # len(all_stale_product_keys), not stale_product_count: the key list is
+        # what the writes and the trust recompute actually act on.
+        stale_rows = len(all_stale_product_keys)
+        suppressed = None
+        if not _prune_tombstone_enabled():
+            suppressed = "flag_disabled"
+        elif cap and stale_rows > cap:
+            suppressed = "over_cap"
 
-        if stats["catalog_products"] > 0:
+        if suppressed:
+            stats["stale_detected"] = stale_rows
+            stats["tombstone_suppressed"] = 1
+            logger.warning(
+                "catalog prune tombstone SUPPRESSED (%s) merchant=%s platform=%s "
+                "source_domain=%s stale_rows=%s cap=%s — set %s=true to enable "
+                "(sample=%s)",
+                suppressed, merchant_id, platform, source_domain_value,
+                stale_rows, cap, _PRUNE_TOMBSTONE_FLAG,
+                product_key_sample,
+            )
+            # Nothing downstream should recompute trust for rows we did not touch.
+            all_stale_product_keys = []
+        else:
+            for table_name, sql in update_statements:
+                tombstoned = await database.fetch_val(sql, tombstone_params)
+                stats[table_name] = int(tombstoned or 0)
+
+        if not suppressed and stats["catalog_products"] > 0:
             audit = WriterAuditAccumulator(
                 writer_name=CATALOG_SYNC_PRUNE_WRITER,
                 batch_id=run_id,

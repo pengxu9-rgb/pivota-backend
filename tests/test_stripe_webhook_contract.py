@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import os
 import sys
+from decimal import Decimal
 from pathlib import Path
 from typing import Any, Dict
 
@@ -978,11 +979,15 @@ async def test_stripe_webhook_charge_refunded_reconciles_partial_refund(
     assert order_events[0]["event_type"] == "refund_processed_webhook"
     assert order_events[0]["metadata"]["charge_id"] == "ch_refund_contract"
     assert order_events[0]["metadata"]["refund_amount"] == 1200
+    # MAJOR units. attach_refund_to_attribution_edge does `amount * 100`, so
+    # the 1200 this used to assert was a 100x refund. It was never caught
+    # because the statement it feeds could not PREPARE and so never ran — the
+    # assertion pinned the call shape, not a verified behaviour.
     assert attribution_calls == [
         {
             "order_id": "ORD_STRIPE_REFUND",
             "refund_id": "ch_refund_contract",
-            "amount": 1200,
+            "amount": Decimal("12"),
         }
     ]
 
@@ -1648,11 +1653,12 @@ async def test_stripe_webhook_dispute_event_upserts_record_without_mutating_orde
             "triggered_by": "stripe_webhook:charge.dispute.created",
         }
     ]
+    # MAJOR units — see the note on the refund contract above.
     assert attribution_calls == [
         {
             "order_id": "ORD_STRIPE_DISPUTE",
             "refund_id": "dp_contract_1",
-            "amount": 1500,
+            "amount": Decimal("15"),
         }
     ]
     assert order_events == [
