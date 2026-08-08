@@ -76,8 +76,8 @@ async def _run(
                         """
                         UPDATE products_cache
                         SET product_data = :product_data,
-                            ttl_seconds = :ttl_seconds,
-                            expires_at = NOW() + (:ttl_seconds || ' seconds')::interval,
+                            ttl_seconds = CAST(:ttl_seconds AS integer),
+                            expires_at = NOW() + make_interval(secs => CAST(:ttl_seconds AS integer)),
                             cached_at = NOW(),
                             cache_status = 'fresh'
                         WHERE id = :id

@@ -1925,9 +1925,9 @@ async def prune_missing_catalog_products_for_source(
                   SET suppression_reason = :suppression_reason,
                       suppressed_at = NOW(),
                       suppression_metadata = jsonb_build_object(
-                        'sync_run_id', :sync_run_id,
-                        'pruned_by', :pruned_by,
-                        'source_domain', :source_domain
+                        'sync_run_id', CAST(:sync_run_id AS text),
+                        'pruned_by', CAST(:pruned_by AS text),
+                        'source_domain', CAST(:source_domain AS text)
                       ),
                       updated_at = NOW()
                   WHERE product_key IN (SELECT product_key FROM stale_catalog_products)
@@ -1945,9 +1945,9 @@ async def prune_missing_catalog_products_for_source(
                   SET suppression_reason = :suppression_reason,
                       suppressed_at = NOW(),
                       suppression_metadata = jsonb_build_object(
-                        'sync_run_id', :sync_run_id,
-                        'pruned_by', :pruned_by,
-                        'source_domain', :source_domain
+                        'sync_run_id', CAST(:sync_run_id AS text),
+                        'pruned_by', CAST(:pruned_by AS text),
+                        'source_domain', CAST(:source_domain AS text)
                       ),
                       updated_at = NOW()
                   WHERE sku_key IN (SELECT sku_key FROM stale_catalog_skus)
@@ -1965,9 +1965,9 @@ async def prune_missing_catalog_products_for_source(
                   SET suppression_reason = :suppression_reason,
                       suppressed_at = NOW(),
                       suppression_metadata = jsonb_build_object(
-                        'sync_run_id', :sync_run_id,
-                        'pruned_by', :pruned_by,
-                        'source_domain', :source_domain
+                        'sync_run_id', CAST(:sync_run_id AS text),
+                        'pruned_by', CAST(:pruned_by AS text),
+                        'source_domain', CAST(:source_domain AS text)
                       ),
                       updated_at = NOW()
                   WHERE offer_id IN (SELECT offer_id FROM stale_catalog_offers)

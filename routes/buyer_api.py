@@ -1307,11 +1307,20 @@ async def save_from_checkout(
                 SET
                   buyer_id = :buyer_id,
                   intent_id = :intent_id,
-                  agent_user_ref = :agent_user_ref,
-                  agent_scoped_buyer_ref = :pairwise_ref,
-                  metadata = COALESCE(metadata, '{}'::jsonb)
-                    || jsonb_build_object('buyer_ref', :pairwise_ref)
-                    || CASE WHEN :agent_user_ref IS NULL THEN '{}'::jsonb ELSE jsonb_build_object('agent_user_ref', :agent_user_ref) END
+                  agent_user_ref = CAST(:agent_user_ref AS text),
+                  agent_scoped_buyer_ref = CAST(:pairwise_ref AS text),
+                  -- `orders.metadata` is json, not jsonb, and `||` is a jsonb
+                  -- operator: without the round-trip this whole statement fails
+                  -- to PREPARE ("COALESCE could not convert type jsonb to
+                  -- json"). It sits under `except Exception: pass`, so it has
+                  -- been a silent no-op since #281 rather than a visible 500.
+                  -- The CASTs are the #1703 rule: jsonb_build_object is
+                  -- variadic "any" and cannot type a bind by position.
+                  metadata = (
+                    COALESCE(metadata::jsonb, '{}'::jsonb)
+                    || jsonb_build_object('buyer_ref', CAST(:pairwise_ref AS text))
+                    || CASE WHEN :agent_user_ref IS NULL THEN '{}'::jsonb ELSE jsonb_build_object('agent_user_ref', CAST(:agent_user_ref AS text)) END
+                  )::json
                 WHERE order_id = :order_id
                 """,
                 {

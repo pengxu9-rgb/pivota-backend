@@ -205,9 +205,9 @@ async def _apply_attachment(
             updated_at = NOW(),
             seed_data = COALESCE(seed_data, '{}'::jsonb) || jsonb_build_object(
                 'pdp_matcher', jsonb_build_object(
-                    'matcher', :matcher,
-                    'confidence', :confidence,
-                    'evidence', :evidence,
+                    'matcher', CAST(:matcher AS text),
+                    'confidence', CAST(:confidence AS double precision),
+                    'evidence', CAST(:evidence AS text),
                     'attached_at', NOW()::text
                 )
             )

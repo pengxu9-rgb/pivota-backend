@@ -550,21 +550,21 @@ async def get_order_attribution_edge_id(order_id: Optional[str]) -> Optional[str
 _ATTRIBUTE_REFUND_QUERY = """
 UPDATE commerce_attribution_edges
 SET
-  latest_refund_id = :refund_id,
+  latest_refund_id = CAST(:refund_id AS text),
   refund_ids = CASE
-    WHEN COALESCE(refund_ids, '[]'::jsonb) ? :refund_id THEN COALESCE(refund_ids, '[]'::jsonb)
+    WHEN COALESCE(refund_ids, '[]'::jsonb) ? CAST(:refund_id AS text) THEN COALESCE(refund_ids, '[]'::jsonb)
     ELSE COALESCE(refund_ids, '[]'::jsonb) || to_jsonb(CAST(:refund_id AS TEXT))
   END,
   refund_count = CASE
-    WHEN COALESCE(refund_ids, '[]'::jsonb) ? :refund_id THEN COALESCE(refund_count, 0)
+    WHEN COALESCE(refund_ids, '[]'::jsonb) ? CAST(:refund_id AS text) THEN COALESCE(refund_count, 0)
     ELSE COALESCE(refund_count, 0) + 1
   END,
   refund_amount_cents = COALESCE(refund_amount_cents, 0) + CASE
-    WHEN COALESCE(refund_ids, '[]'::jsonb) ? :refund_id THEN 0
+    WHEN COALESCE(refund_ids, '[]'::jsonb) ? CAST(:refund_id AS text) THEN 0
     ELSE :amount_cents
   END,
   refunded_amount = COALESCE(refunded_amount, 0) + CASE
-    WHEN COALESCE(refund_ids, '[]'::jsonb) ? :refund_id THEN 0
+    WHEN COALESCE(refund_ids, '[]'::jsonb) ? CAST(:refund_id AS text) THEN 0
     ELSE :amount_decimal
   END,
   refunded_at = COALESCE(refunded_at, :now),
