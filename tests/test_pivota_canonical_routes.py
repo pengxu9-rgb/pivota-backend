@@ -201,8 +201,12 @@ def _row(sig_suffix: str, **overrides) -> Dict[str, Any]:
         # "is there prose on this page", where renderable answers "will the
         # page answer at all". Also exposed, also unfiltered.
         "content_depth": True,
-        # Row-layer retirement flag (suppression_reason set, suppressed_at NULL).
-        # Default False = a live row; tests that need the tombstoned shape override.
+        # Row-layer retirement flag (suppression_reason set). Since the
+        # 2026-07-30 backfill and #1660 the label implies suppressed_at, which
+        # the real query excludes at row grain — so on prod this is false on
+        # every feed row (0 of 8,906, 2026-08-08). Default False = a live row;
+        # tests that need the tombstoned shape override it to model the
+        # label-without-timestamp REGRESSION, which is all that can produce it.
         "tombstoned": False,
         "suppressed_at": None,
         "index_eligible": False,
@@ -870,14 +874,22 @@ def test_list_canonical_pdps_times_out_slow_database(monkeypatch: pytest.MonkeyP
 def test_list_canonical_pdps_carries_tombstoned_without_filtering(env, monkeypatch):
     """Row-layer retirement is ADVISORY here, exactly like renderable/content_depth.
 
-    `suppression_reason` set WITHOUT `suppressed_at` leaves a row serving, so it
-    passes every `suppressed_at IS NULL` filter including this feed's own
+    `suppression_reason` set WITHOUT `suppressed_at` used to leave a row serving:
+    it passed every `suppressed_at IS NULL` filter including this feed's own
     `sitemap_candidate_filter`. Measured 2026-07-29: 187 of the 7,509 advertised
-    URLs point at such a row, 135 of them retired for carrying the WRONG BRAND.
+    URLs pointed at such a row, 135 of them retired for carrying the WRONG BRAND.
+    The 2026-07-30 backfill and #1660 closed that — the label now implies the
+    timestamp, so the feed's WHERE drops the row and `tombstoned` is false on
+    every real feed row today (0 of 8,906, prod 2026-08-08).
 
-    The feed must SAY SO and still emit the row — it is a diagnostic surface as
-    well as a sitemap source, and filtering here would destroy the evidence the
-    same way it would for renderable=false rows. The generator does the dropping.
+    What this test pins is the SHAPE OF THE FIELD, not the population: it is
+    carried, not filtered on. If a writer ever regresses to label-without-
+    timestamp, such a row lands back in the feed and the field is the surface
+    that says so — which only works if the row is still EMITTED. Filtering here
+    would destroy the evidence the same way it would for renderable=false rows.
+    The generator does the dropping. Hence the fabricated row below: the state is
+    unreachable through the real query, and that is precisely why the carrying
+    behaviour has to be pinned somewhere the query cannot reach.
     """
     from routes import pivota_canonical_routes as pcr
 
