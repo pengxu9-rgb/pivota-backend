@@ -147,7 +147,7 @@ FROM external_product_seeds s
 JOIN catalog_products cp ON cp.source_ref = s.id
 WHERE s.tool = :tool
   AND cp.suppressed_at IS NOT NULL
-  AND cp.suppression_metadata->>'script' = :script
+  AND cp.suppression_metadata->>'script' = CAST(:script AS text)
 ORDER BY s.destination_url
 """
 
@@ -214,9 +214,19 @@ async def _withdraw(rows: List[Dict[str, Any]]) -> Dict[str, str]:
         # Record the seed's PRIOR status before changing it, so --revert can put
         # it back rather than blanket-activating seeds that were already dead.
         await database.execute(
+            # CAST is load-bearing: jsonb_build_object is variadic "any", so
+            # Postgres cannot infer a bind param's type from position and the
+            # statement fails to PREPARE with "could not determine data type of
+            # parameter $2". It fails at prepare time, before any write — which
+            # is why the first --apply attempt aborted having changed nothing —
+            # but it fails on EVERY row, so the runner is simply dead without
+            # this. Not reachable by the unit tests: they record SQL strings
+            # against a fake connection and never ask Postgres to plan it.
             "UPDATE catalog_products "
             "   SET suppression_metadata = COALESCE(suppression_metadata, '{}'::jsonb) "
-            "       || jsonb_build_object('script', :script, 'prior_seed_status', :prior), "
+            "       || jsonb_build_object("
+            "            'script', CAST(:script AS text), "
+            "            'prior_seed_status', CAST(:prior AS text)), "
             "       updated_at = NOW() "
             " WHERE source_ref = :id AND suppressed_at IS NULL",
             {"id": sid, "script": SCRIPT_NAME, "prior": row.get("seed_status") or "unknown"},

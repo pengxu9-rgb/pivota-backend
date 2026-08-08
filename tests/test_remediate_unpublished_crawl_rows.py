@@ -234,3 +234,20 @@ def test_host_filter_is_www_insensitive():
 
 async def _async(value):
     return value
+
+
+def test_bind_params_in_untypeable_positions_are_cast():
+    """Regression: the first production --apply died at PREPARE with "could not
+    determine data type of parameter $2". jsonb_build_object is variadic "any",
+    so Postgres cannot infer a bind param's type from position — every param
+    fed to it, or compared against a ->> extraction, needs an explicit CAST.
+
+    The unit tests here record SQL against a fake connection and never ask
+    Postgres to plan it, so nothing else in this file can catch that class of
+    bug. This pins the casts textually as the cheap substitute."""
+    src = Path(remediate.__file__).read_text(encoding="utf-8")
+    build_obj = src[src.index("jsonb_build_object("):]
+    build_obj = build_obj[: build_obj.index("updated_at = NOW()")]
+    assert ":script" not in build_obj.replace("CAST(:script AS text)", "")
+    assert ":prior" not in build_obj.replace("CAST(:prior AS text)", "")
+    assert "CAST(:script AS text)" in remediate.REVERT_CANDIDATES_SQL
