@@ -1,0 +1,37 @@
+name: ADR-009 Rekey Verify
+
+# On-demand independent verification of the seller-of-record flip
+# (scripts/verify_seller_rekey.py). READ-ONLY. Exists as a workflow because
+# GitHub's runners reach the database reliably while local paths through the
+# Railway public proxy and ssh edge degrade for hours at a time (2026-08-07) —
+# run this after every flip batch instead of fighting the proxy.
+
+on:
+  workflow_dispatch: {}
+
+jobs:
+  rekey-verify:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    env:
+      DATABASE_URL: ${{ secrets.DATABASE_URL }}
+      DB_POOL_MIN_SIZE: "1"
+      DB_POOL_MAX_SIZE: "2"
+      PYTHONDONTWRITEBYTECODE: "1"
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: "pip"
+
+      - name: Install deps
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Verify rekey (read-only; fails the job on any violation)
+        run: python -m scripts.verify_seller_rekey
