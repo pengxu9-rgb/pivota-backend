@@ -454,10 +454,22 @@ async def _finalize_stripe_refund_success(
         try:
             from services.commerce_attribution_service import attach_refund_to_attribution_edge
 
+            # MAJOR units. attach_refund_to_attribution_edge does
+            # `amount_cents = amount * 100`, so passing the minor-unit value
+            # recorded a 100x refund — and because
+            # net_attributed_gmv_cents = GREATEST(gross - refund, 0) is a stored
+            # generated column read by monthly_brand_statements_service, that
+            # clamps the edge to zero and drops it from the merchant's invoice.
+            # Never observable before: the statement failed to PREPARE, so this
+            # never ran. See the same conversion at _stripe_minor_unit_factor
+            # use below.
             await attach_refund_to_attribution_edge(
                 order_id=str(order.get("order_id") or ""),
                 refund_id=refund_reference,
-                amount=refund_amount_minor,
+                amount=(
+                    Decimal(str(refund_amount_minor or "0"))
+                    / _stripe_minor_unit_factor(currency or str(order.get("currency") or ""))
+                ),
             )
         except Exception as edge_exc:
             logger.warning(
@@ -1463,10 +1475,16 @@ async def handle_stripe_webhook(
                     if order_id and dispute_id and dispute_amount_minor and dispute_amount_minor > 0:
                         from services.commerce_attribution_service import attach_refund_to_attribution_edge
 
+                        # MAJOR units — see the note on the refund path above.
                         await attach_refund_to_attribution_edge(
                             order_id=order_id,
                             refund_id=dispute_id,
-                            amount=dispute_amount_minor,
+                            amount=(
+                                Decimal(str(dispute_amount_minor or "0"))
+                                / _stripe_minor_unit_factor(
+                                    str((dispute_payload or {}).get("currency") or "")
+                                )
+                            ),
                         )
                         await log_order_event(
                             event_type="chargeback_received",

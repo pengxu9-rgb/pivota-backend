@@ -68,7 +68,10 @@ async def _run(
 
                 update_params: Dict[str, Any] = {
                     "id": row["id"],
-                    "product_data": hydrated_payload,
+                    # json.dumps, not the dict: a raw-SQL bind carries no
+                    # SQLAlchemy type, so asyncpg gets a dict where the json
+                    # codec wants str and raises DataError at encode time.
+                    "product_data": json.dumps(hydrated_payload),
                 }
                 if ttl_seconds is not None:
                     update_params["ttl_seconds"] = int(ttl_seconds)
@@ -76,8 +79,8 @@ async def _run(
                         """
                         UPDATE products_cache
                         SET product_data = :product_data,
-                            ttl_seconds = :ttl_seconds,
-                            expires_at = NOW() + (:ttl_seconds || ' seconds')::interval,
+                            ttl_seconds = CAST(:ttl_seconds AS integer),
+                            expires_at = NOW() + make_interval(secs => CAST(:ttl_seconds AS integer)),
                             cached_at = NOW(),
                             cache_status = 'fresh'
                         WHERE id = :id

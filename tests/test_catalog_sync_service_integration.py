@@ -330,6 +330,10 @@ async def test_resolve_catalog_sku_key_generates_when_source_identity_missing(
 async def test_prune_tombstones_only_dropped_products_for_same_source_domain(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    # The tombstone writer ships inert — see the ADR comment above
+    # prune_missing_catalog_products_for_source. These tests assert what it does
+    # once enabled, so they opt in.
+    monkeypatch.setenv("CATALOG_SYNC_PRUNE_TOMBSTONE_ENABLED", "true")
     fake_db = _PruneFakeDatabase()
     x1_product, x1_sku, x1_offer = fake_db.add_catalog_tree(
         source_domain="store-a.myshopify.com",
@@ -405,6 +409,10 @@ async def test_prune_source_domain_scope_isolates_other_store_rows(
 async def test_prune_writes_writer_audit_row_with_sample_product_keys(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    # The tombstone writer ships inert — see the ADR comment above
+    # prune_missing_catalog_products_for_source. These tests assert what it does
+    # once enabled, so they opt in.
+    monkeypatch.setenv("CATALOG_SYNC_PRUNE_TOMBSTONE_ENABLED", "true")
     fake_db = _PruneFakeDatabase()
     x2_product, _, _ = fake_db.add_catalog_tree(
         source_domain="store-a.myshopify.com",
@@ -1619,3 +1627,59 @@ async def test_ingest_standard_products_omits_fashion_keys_when_no_metafields(
               "care", "care_source", "care_confidence",
               "size_guide", "size_guide_source", "size_guide_confidence"):
         assert k not in write, f"fashion field {k} unexpectedly in upsert dict"
+
+
+# ---------------------------------------------------------------------------
+# The kill-switch. These statements never executed in production (they failed to
+# PREPARE from #666 until the fix in this branch), so enabling them is a
+# behaviour change with a ~2.5-month backlog behind it, not a repair. A switch
+# that is silently always-on reads exactly like no switch at all, so both
+# directions are asserted.
+# ---------------------------------------------------------------------------
+@pytest.mark.asyncio
+async def test_prune_tombstone_is_suppressed_by_default(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    fake_db = _PruneFakeDatabase()
+    fake_db.add_catalog_tree(source_domain="store-a.myshopify.com", source_product_id="X1")
+    x2_product, _, _ = fake_db.add_catalog_tree(
+        source_domain="store-a.myshopify.com", source_product_id="X2")
+    monkeypatch.delenv("CATALOG_SYNC_PRUNE_TOMBSTONE_ENABLED", raising=False)
+    monkeypatch.setattr(module, "database", fake_db)
+
+    stats = await module.prune_missing_catalog_products_for_source(
+        merchant_id="merch_shared", platform="shopify", valid_source_product_ids=["X1"],
+        source_system="shopify_products_sync", source_domain="store-a.myshopify.com",
+        sync_run_id="sync_default_off",
+    )
+
+    assert stats["catalog_products"] == 0, "default run must not tombstone anything"
+    assert stats.get("tombstone_suppressed") == 1
+    assert stats.get("stale_detected") == 1, (
+        "the stale set must still be COMPUTED and reported — an operator needs "
+        "the count to decide whether to enable the writer"
+    )
+    assert fake_db.products[x2_product]["suppressed_at"] is None, (
+        "the row the enabled path would tombstone must be untouched"
+    )
+
+
+@pytest.mark.asyncio
+async def test_prune_tombstone_respects_the_row_cap(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    fake_db = _PruneFakeDatabase()
+    for pid in ("X1", "X2", "X3"):
+        fake_db.add_catalog_tree(source_domain="store-a.myshopify.com", source_product_id=pid)
+    monkeypatch.setenv("CATALOG_SYNC_PRUNE_TOMBSTONE_ENABLED", "true")
+    monkeypatch.setenv("CATALOG_SYNC_PRUNE_MAX_ROWS", "1")
+    monkeypatch.setattr(module, "database", fake_db)
+
+    stats = await module.prune_missing_catalog_products_for_source(
+        merchant_id="merch_shared", platform="shopify", valid_source_product_ids=["X1"],
+        source_system="shopify_products_sync", source_domain="store-a.myshopify.com",
+        sync_run_id="sync_over_cap",
+    )
+
+    assert stats["catalog_products"] == 0, "2 stale rows must not pass a cap of 1"
+    assert stats.get("tombstone_suppressed") == 1

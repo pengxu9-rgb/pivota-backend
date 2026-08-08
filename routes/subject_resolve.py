@@ -505,12 +505,13 @@ async def _resolve_from_alias(
                 FROM products_cache
                 WHERE (expires_at IS NULL OR expires_at > CURRENT_TIMESTAMP)
                   AND (
-                    platform_product_id = ANY(:aliases)
-                    OR COALESCE(product_data->>'id', '') = ANY(:aliases)
-                    OR COALESCE(product_data->>'product_id', '') = ANY(:aliases)
+                    platform_product_id = ANY(CAST(:aliases AS text[]))
+                    OR COALESCE(product_data->>'id', '') = ANY(CAST(:aliases AS text[]))
+                    OR COALESCE(product_data->>'product_id', '') = ANY(CAST(:aliases AS text[]))
                     OR LOWER(CAST(product_data AS TEXT)) LIKE :alias_like
                   )
-                  AND (:brand_like IS NULL OR LOWER(CAST(product_data AS TEXT)) LIKE :brand_like)
+                  AND (CAST(:brand_like AS text) IS NULL
+                       OR LOWER(CAST(product_data AS TEXT)) LIKE CAST(:brand_like AS text))
                 ORDER BY cached_at DESC
                 LIMIT 40
                 """,

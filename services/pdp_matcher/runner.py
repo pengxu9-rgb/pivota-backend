@@ -16,6 +16,7 @@ from __future__ import annotations
 import argparse
 import asyncio
 import logging
+import os
 import sys
 from pathlib import Path
 from typing import Any, Dict, List, Optional
@@ -30,6 +31,15 @@ from services.pdp_matcher.deterministic import (  # noqa: E402
 from services.pdp_matcher.llm_match import llm_match_seed  # noqa: E402
 
 logger = logging.getLogger("pdp_matcher_runner")
+
+_ATTACH_FLAG = "PDP_MATCHER_ATTACH_ENABLED"
+
+
+def _attach_enabled() -> bool:
+    """Read at call time so ops can flip it without a deploy."""
+    return str(os.getenv(_ATTACH_FLAG, "false")).strip().lower() in {
+        "1", "true", "yes", "on",
+    }
 
 
 async def _fetch_unattached_seed_batch(*, batch_size: int) -> List[Dict[str, Any]]:
@@ -198,6 +208,21 @@ async def _apply_attachment(
 ) -> None:
     if dry_run:
         return
+    # Ships INERT, like the catalog prune. This statement failed to PREPARE from
+    # the day the file was created (2026-05-06) until the fix in this branch, so
+    # no seed has ever been attached through it. Turning it on stamps
+    # attached_product_key on ~3,900 standalone seeds, and
+    # services/seed_identity_attachment.py's own CO-GATE warning is explicit
+    # that attaching before the Phase-2 pivot serve cutover drops those products
+    # from serving with no replacement. That module is flag-gated dark; this
+    # entry point had no flag at all, which is the door this closes.
+    if not _attach_enabled():
+        logger.info(
+            "pdp_matcher attach SUPPRESSED (set %s=true to enable): seed=%s -> %s "
+            "matcher=%s confidence=%.3f",
+            _ATTACH_FLAG, seed_id, product_key, matcher, confidence,
+        )
+        return
     await database.execute(
         """
         UPDATE external_product_seeds
@@ -205,9 +230,9 @@ async def _apply_attachment(
             updated_at = NOW(),
             seed_data = COALESCE(seed_data, '{}'::jsonb) || jsonb_build_object(
                 'pdp_matcher', jsonb_build_object(
-                    'matcher', :matcher,
-                    'confidence', :confidence,
-                    'evidence', :evidence,
+                    'matcher', CAST(:matcher AS text),
+                    'confidence', CAST(:confidence AS double precision),
+                    'evidence', CAST(:evidence AS text),
                     'attached_at', NOW()::text
                 )
             )
@@ -232,10 +257,23 @@ async def _run(args: argparse.Namespace) -> int:
     matcher_counts: Dict[str, int] = {}
     deferred = 0
 
+    # `_fetch_unattached_seed_batch` re-queries `attached_product_key IS NULL`
+    # every pass. Matched seeds leave that set; DEFERRED ones never do. With the
+    # default `--limit 0` the `args.limit` guard below is dead (0 is falsy), so
+    # once attaches start succeeding the loop re-reads the same deferred batch
+    # forever — re-issuing a gemini-2.5-flash call per row per pass under
+    # `--llm-tail`. Never reachable before, because the run died at the first
+    # attach. Tracking seen ids makes the deferred tail terminate.
+    seen_seed_ids: set = set()
     while True:
         seeds = await _fetch_unattached_seed_batch(batch_size=args.batch_size)
         if not seeds:
             break
+        seeds = [s for s in seeds if str(s["id"]) not in seen_seed_ids]
+        if not seeds:
+            logger.info("only previously-deferred seeds remain; stopping")
+            break
+        seen_seed_ids.update(str(s["id"]) for s in seeds)
         for seed in seeds:
             total += 1
             if args.limit and total > args.limit:
