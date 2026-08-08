@@ -53,6 +53,13 @@ AGENT_PDP_VIEW_COLUMNS: Tuple[str, ...] = (
     "variants",
     "variants_count",
     "gtin13",
+    # Review ratings (migration 186): captured from schema.org storefronts and
+    # mirrored onto agent_pdp_view, but never selected here — so agents could not
+    # read social proof this index already held. NULL means "no review data on
+    # the source page", never "zero stars"; _row_as_product only emits the
+    # normalized aggregate_rating when both value and a positive count exist.
+    "rating_value",
+    "rating_count",
     "category_path",
     "taxonomy_tags",
     "breadcrumb",
@@ -459,7 +466,33 @@ def _row_as_product(row: Dict[str, Any]) -> Dict[str, Any]:
             }
         }
 
+    # Social proof, never fabricated: the raw rating_value/rating_count columns
+    # still pass through dict(row) for consumers that want them unnormalized.
+    product["aggregate_rating"] = aggregate_rating_from_row(row)
+
     return product
+
+
+def aggregate_rating_from_row(row: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+    """Normalize migration 186's rating columns into {value, count}, or None.
+
+    Emitted ONLY when the source page carried both a rating value and a positive
+    review count — NULL means "no review data on the source page", never "zero
+    stars", and a rating with no reviews behind it is withheld rather than
+    invented. The {value, count} shape is what the PDP JSON-LD builder's
+    aggregateRating resolver reads first, so one normalization serves API
+    agents, the citation surface, and the crawlable page alike.
+    """
+    rating_value = row.get("rating_value")
+    rating_count = row.get("rating_count")
+    try:
+        if rating_value is None or rating_count is None or int(rating_count) <= 0:
+            return None
+        # round(2): prod rows carry float dirt (4.5999999999999996 for a source
+        # page's 4.6) — emit the value the source page actually displayed.
+        return {"value": round(float(rating_value), 2), "count": int(rating_count)}
+    except (TypeError, ValueError):
+        return None
 
 
 def _build_response(

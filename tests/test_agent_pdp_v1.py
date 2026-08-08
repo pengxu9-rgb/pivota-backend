@@ -849,3 +849,47 @@ def test_outer_relation_whitelist_catches_every_join_shape() -> None:
         "    LEFT JOIN LATERAL (SELECT 1 FROM catalog_products AS _x) _l ON TRUE",
     )
     assert _outer_relations(lateral) != {"agent_pdp_view", "index_pipeline_state"}
+
+
+def test_get_agent_pdp_emits_aggregate_rating_when_captured(monkeypatch) -> None:
+    # Migration 186 captured schema.org aggregateRating onto agent_pdp_view, but
+    # this surface never selected it — agents could not read social proof the
+    # index already held. The {value, count} shape is the one the PDP JSON-LD
+    # builder's aggregateRating resolver reads first.
+    row = _row()
+    row["rating_value"] = Decimal("4.6")
+    row["rating_count"] = 128
+    client, db = _client(monkeypatch, [row])
+
+    product = _canonical_product(client.get(f"/api/agent/pdp/{CK_A}").json())
+
+    assert product["aggregate_rating"] == {"value": 4.6, "count": 128}
+    # The raw columns still pass through for consumers that want them.
+    assert product["rating_value"] == 4.6
+    assert product["rating_count"] == 128
+    # And the SELECT actually carries the columns on the gated path.
+    assert "rating_value" in db.calls[0]["query"]
+    assert "rating_count" in db.calls[0]["query"]
+
+
+def test_get_agent_pdp_aggregate_rating_is_null_when_uncaptured(monkeypatch) -> None:
+    # NULL means "no review data on the source page", never "zero stars" — the
+    # rating is never invented (migration 186's contract).
+    client, _ = _client(monkeypatch, [_row()])
+
+    product = _canonical_product(client.get(f"/api/agent/pdp/{CK_A}").json())
+
+    assert product["aggregate_rating"] is None
+
+
+def test_get_agent_pdp_aggregate_rating_is_null_when_count_not_positive(monkeypatch) -> None:
+    # A rating value with no reviews behind it is not social proof; emitting it
+    # would fabricate confidence the source page never carried.
+    row = _row()
+    row["rating_value"] = Decimal("5.0")
+    row["rating_count"] = 0
+    client, _ = _client(monkeypatch, [row])
+
+    product = _canonical_product(client.get(f"/api/agent/pdp/{CK_A}").json())
+
+    assert product["aggregate_rating"] is None
