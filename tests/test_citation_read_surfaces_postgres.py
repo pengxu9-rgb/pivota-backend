@@ -101,7 +101,17 @@ CREATE TABLE IF NOT EXISTS aurora_product_intel_kb (kb_key text, analysis jsonb)
 -- here or the by-sig route cannot prepare.
 ALTER TABLE agent_pdp_view
   ADD COLUMN IF NOT EXISTS evidence_profile jsonb,
-  ADD COLUMN IF NOT EXISTS required_disclaimers jsonb
+  ADD COLUMN IF NOT EXISTS required_disclaimers jsonb;
+-- Migration 186 (ratings) postdates the Core Table definition too. Same
+-- pattern as the evidence columns above: prod gets these from
+-- db/schema_guard.py, so the fixture must mirror them or every gated,
+-- widened, and bypass SELECT fails to PREPARE on a fresh schema.
+-- NOTE this DDL string is split on every semicolon character, comments
+-- included, and the local dialect-gate database is initdb'd with locale=C.
+-- Comments here must therefore be plain ASCII and semicolon-free.
+ALTER TABLE agent_pdp_view
+  ADD COLUMN IF NOT EXISTS rating_value numeric,
+  ADD COLUMN IF NOT EXISTS rating_count integer
 """
 
 
