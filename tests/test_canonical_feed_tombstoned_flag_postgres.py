@@ -19,37 +19,54 @@ group is why it mattered rather than being tidy: those rows were retired for
 carrying the WRONG BRAND, so serving them published a PDP with incorrect brand
 attribution.
 
+⚠️ 187 IS AN UPPER BOUND. It came from a sitemap-URL→row join keyed on the URL,
+and that join over-reports for the reason given under the grain section below: a
+retired row usually shares its `canonical_url` with the live row that replaced
+it. The defect was real (the row-grain counterfactual below re-derives it), but
+how many of the 187 were genuinely reason-only rows was never re-measured.
+
 WHAT IS TRUE NOW. The 2026-07-30 backfill gave all 2,332 reason-only rows a
 `suppressed_at` (reconstructed per cohort at its own apply instant), #1660
-(#1648 P1a) taught every writer to set both columns and every revert to clear
-both, and `catalog_invariant_checks` pins both directions at threshold 0. Prod
-reports 0 on `suppression_reason_without_timestamp` and 0 on
-`suppression_timestamp_without_reason`. So `suppression_reason IS NOT NULL` now
-implies `suppressed_at IS NOT NULL`, the feed's own WHERE drops the row at ROW
-grain, and `tombstoned` is false on every feed row: 0 of 8,906 on prod
-2026-08-08. Drop only that conjunct and 1,189 reason-bearing rows come back into
-the feed with 441 of them advertisable — the gate is what closed it.
+(#1648 P1a) taught the eight writers it inventoried to set both columns and their
+reverts to clear both, and `catalog_invariant_checks` pins both directions at
+threshold 0. Prod reports 0 on `suppression_reason_without_timestamp` and 0 on
+`suppression_timestamp_without_reason`. So for every row in prod today
+`suppression_reason IS NOT NULL` implies `suppressed_at IS NOT NULL`, the feed's
+own WHERE drops the row at ROW grain, and `tombstoned` reads false on every feed
+row: 0 of 8,906 on prod 2026-08-08. Drop only that conjunct and 1,189
+reason-bearing rows come back into the feed with 441 of them advertisable — the
+gate is what closed it.
+
+THAT IS A DATA INVARIANT, NOT A STRUCTURAL ONE. Nothing in SQL ties the two
+columns together, and the writer inventory is a hand-kept list rather than a
+glob: `scripts/remediate_unpublished_crawl_rows.py` (on `main` since #1697) is
+outside it and writes the label and the timestamp as two separate autocommitted
+statements, so an abort between them still mints a reason-only row. The state
+these fixtures build is unobserved, not unreachable.
 
 IT IS NOT THE CONTENT_KEY GRAIN, checked because it is the obvious wrong guess.
 `index_pipeline_state` is keyed on content_key and `_select_content_key_state`
 stores the MAX across the key's rows, so a key whose retired row has a live
 sibling stays `serving_eligible`. Real — 593 of the 8,064 advertised rows share a
 content_key with a suppressed row, and 539 share its exact `canonical_url`,
-because collapsing same-URL duplicates is what step-5 lane 2 does — but every one
-of those 593 is the clean KEEPER, and 0 content_keys are `serving_eligible` with
-all of their rows suppressed. The grain keeps the KEY eligible for its live
-siblings; it never advertises the retired row. (Those 539 shared URLs are a trap
-for the measurement, not for the filter: a sitemap-URL→row join keyed on URL will
-report "advertised URL points at a retired row" for rows that are clean.)
+because collapsing same-URL duplicates is what step-5 lane 2 does — but the row
+it advertises is itself unsuppressed, and 0 content_keys are `serving_eligible`
+with all of their rows suppressed. The grain keeps the KEY eligible for its live
+siblings; it never advertises the retired row. (Those 593 are unsuppressed by
+selection, having been drawn from the advertised set, so that is entailed rather
+than evidence; whether each is its sibling's recorded keeper was not checked.
+Those 539 shared URLs are a trap for the measurement, not for the filter: a
+sitemap-URL→row join keyed on URL will report "advertised URL points at a retired
+row" for rows that are not.)
 
 WHY THE FIXTURES STAY. The flag's whole remaining job is to catch a writer that
 regresses to label-without-timestamp — such a row passes the feed's WHERE, lands
 on the page the sitemap generator reads, and this column is what says so, a
 second and independent alarm to the invariant check. A flag that is silently
 always false is indistinguishable from "no tombstones exist", which is exactly
-the reading that let 187 of them stay advertised, so the tests below still assert
-it answers BOTH ways. They construct the reason-only row directly because nothing
-in the system will hand them one any more.
+the reading that let those URLs stay advertised, so the tests below still assert
+it answers BOTH ways. They construct the reason-only row directly because no
+pinned writer will hand them one.
 
 🚨 THIS GATE SHARES ONE DATABASE WITH THE OTHER `test_*_postgres.py` FILES.
 An earlier cut of this file did `CREATE TABLE IF NOT EXISTS catalog_products
@@ -152,6 +169,23 @@ def _insert_feed_row(conn, *, pk, ck, reason=None, suppressed=False):
         ),
         {"pk": pk, "ck": ck, "sig": f"sig_{pk}", "reason": reason},
     )
+
+
+def _reset_feed_fixtures(conn):
+    """Clear EVERY table the feed fixtures write, not just catalog_products.
+
+    `_insert_feed_row` also seeds `catalog_merchants` and `index_pipeline_state`,
+    and this file shares one database with the other `test_*_postgres.py` gates.
+    A leftover `index_pipeline_state` row is load-bearing for a sibling gate —
+    which is why `test_serving_not_renderable_invariant_postgres.py` deletes it
+    in its own `_reset` — so leaving ours behind is the shared-DB hazard this
+    module's header warns about, even though it happens to be benign today.
+    """
+    from sqlalchemy import text
+
+    conn.execute(text("DELETE FROM catalog_products"))
+    conn.execute(text("DELETE FROM index_pipeline_state"))
+    conn.execute(text("DELETE FROM catalog_merchants WHERE merchant_id = 'm_feed'"))
 
 
 def _feed_keys(conn, *, widen):
@@ -276,14 +310,18 @@ def test_a_both_column_tombstone_never_reaches_the_feed(pg_engine, widen):
     the timestamp. Without the second half, keeping the reason-only fixtures
     would be pinning a state the feed could never show.
 
-    Both flag states are asserted because the conjunct is in both arms of the
-    filter; a widening that relaxed the identity or merchant terms must not
-    relax this one.
+    Both flag states are asserted even though the conjunct is in NEITHER arm
+    today — `cp.suppressed_at IS NULL` is a single shared top-level term outside
+    `sitemap_candidate_filter`'s `if widen:` / `else:` block, so the two params
+    cannot currently diverge on it. The parametrization is a guard against a
+    future arm-split: a widening that relaxed the identity or merchant terms must
+    not relax this one. (Verified by mutation that a widen-only conjunct fails
+    exactly the `widen=True` case, so this is not a free-riding parameter.)
     """
     from sqlalchemy import text
 
     with pg_engine.begin() as conn:
-        conn.execute(text("DELETE FROM catalog_products"))
+        _reset_feed_fixtures(conn)
         _insert_feed_row(conn, pk="live", ck="ck_live")
         _insert_feed_row(
             conn,
@@ -301,7 +339,7 @@ def test_a_both_column_tombstone_never_reaches_the_feed(pg_engine, widen):
             suppressed=False,
         )
         keys = _feed_keys(conn, widen=widen)
-        conn.execute(text("DELETE FROM catalog_products"))
+        _reset_feed_fixtures(conn)
 
     assert "live" in keys
     assert "retired" not in keys, (
@@ -328,14 +366,17 @@ def test_content_key_grain_does_not_readvertise_a_retired_row(pg_engine):
     sibling and the retired row is still dropped.
 
     Prod 2026-08-08 measures the same shape at scale — 593 of the 8,064
-    advertised rows share a content_key with a suppressed row (539 of them
+    advertised rows share a content_key with a suppressed row, 539 of them
     sharing its exact `canonical_url`, since collapsing same-URL duplicates is
-    what step-5 lane 2 does), and every one of the 593 is the clean KEEPER.
+    what step-5 lane 2 does. Those 593 are unsuppressed *by selection* (they were
+    drawn from the advertised set, which the conjunct already filtered), so that
+    is entailed rather than evidence; whether each is specifically its sibling's
+    recorded keeper was not checked, and this test does not depend on it.
     """
     from sqlalchemy import text
 
     with pg_engine.begin() as conn:
-        conn.execute(text("DELETE FROM catalog_products"))
+        _reset_feed_fixtures(conn)
         # One content_key, two rows: the dedupe keeper and its retired loser.
         _insert_feed_row(conn, pk="keeper", ck="ck_shared")
         _insert_feed_row(
@@ -346,7 +387,7 @@ def test_content_key_grain_does_not_readvertise_a_retired_row(pg_engine):
             suppressed=True,
         )
         keys = _feed_keys(conn, widen=False)
-        conn.execute(text("DELETE FROM catalog_products"))
+        _reset_feed_fixtures(conn)
 
     assert keys == {"keeper"}, (
         "the shared content_key must keep the KEEPER advertised and the loser "

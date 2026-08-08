@@ -280,8 +280,16 @@ def _content_depth_column():
 def _tombstoned_column():
     """Boolean: has the row layer RETIRED this row, while it still serves?
 
-    ⚠️ THIS FIELD IS NOW STRUCTURALLY ALWAYS FALSE ON THIS FEED, and that is
-    the fix landing rather than a bug. Read the history before changing it.
+    ⚠️ THIS FIELD READS FALSE ON EVERY FEED ROW TODAY — BY DATA INVARIANT, NOT
+    BY CONSTRUCTION. That distinction is the whole reason it is still here, so
+    read the history before deleting it as dead code.
+
+    Nothing in SQL links the two columns. The feed's WHERE tests
+    ``suppressed_at IS NULL``; this column tests ``suppression_reason IS NOT
+    NULL``. They are disjoint today only because every writer sets both — a
+    property maintained by writers plus a post-hoc invariant check, and NOT
+    guaranteed by the query. See "WHERE THE INVARIANT IS THIN" below: it is
+    already violable at the time of writing.
 
     THE STATE IT WAS BUILT FOR. ``suppression_reason`` set WITHOUT
     ``suppressed_at`` used to be a real, populated state — the step-5 lanes,
@@ -305,19 +313,41 @@ def _tombstoned_column():
     incorrect brand attribution — the single claim an identity-led index cannot
     get wrong.
 
+    ⚠️ TREAT THAT 187 AS AN UPPER BOUND, NOT A COUNT. It was produced by joining
+    sitemap URL → row on the URL, and that join over-reports for exactly the
+    reason described under "NOT THE CONTENT_KEY GRAIN" below: a retired row
+    routinely shares its ``canonical_url`` with the live keeper that replaced it
+    (539 such rows on 2026-08-08), so a URL-keyed match cannot tell "this URL is
+    advertised via a retired row" from "via its clean keeper". The defect was
+    real — the counterfactual below re-derives it at row grain — but no one has
+    re-measured how many of the 187 were genuinely reason-only rows rather than
+    keepers wearing a loser's URL.
+
     HOW IT WAS CLOSED, and why this column now answers false everywhere:
 
       * 2026-07-30 — a backfill gave all 2,332 reason-only rows (seven cohorts)
         a ``suppressed_at``, reconstructed at each cohort's own apply instant.
-      * 2026-08-01 — #1660 (#1648 P1a) taught EVERY suppression writer to set
-        both columns and every revert path to clear both.
+      * 2026-08-01 — #1660 (#1648 P1a) taught the eight suppression writers it
+        inventoried to set both columns, and every revert path to clear both.
       * ``catalog_invariant_checks`` pins both directions at threshold 0
         (``suppression_reason_without_timestamp`` /
         ``suppression_timestamp_without_reason``); prod reports 0 on both.
 
-    ``suppression_reason IS NOT NULL`` now implies ``suppressed_at IS NOT NULL``,
-    which this feed's WHERE clause excludes at ROW grain — so a tombstoned row
-    cannot reach the SELECT list that computes this column.
+    For every row in prod today, ``suppression_reason IS NOT NULL`` therefore
+    implies ``suppressed_at IS NOT NULL``, which this feed's WHERE clause
+    excludes at ROW grain — so no tombstoned row currently reaches the SELECT
+    list that computes this column.
+
+    WHERE THE INVARIANT IS THIN, and why "every writer" is the wrong words.
+    ``tests/test_suppression_writers_set_both_columns.py`` pins a hand-maintained
+    list of writers, not a glob, so a writer outside it is unpinned by
+    construction. ``scripts/remediate_unpublished_crawl_rows.py`` — added by
+    #1697, i.e. already on ``main`` — is one: it is absent from that list, and it
+    sets the label (line ~242) and the timestamp (line ~247) in two separate
+    autocommitted statements with no enclosing transaction. An abort between them
+    leaves the row reason-only. ``_revert`` has the mirror hole, clearing the
+    timestamp before the label. So the state this column detects is not extinct;
+    it is merely unobserved, and there is a live path to it.
 
     RE-MEASURED 2026-08-08 against prod, widen ON: 8,906 feed rows, 8,064 of
     them advertisable, **0 tombstoned**. Dropping only the ``suppressed_at IS
@@ -330,16 +360,26 @@ def _tombstoned_column():
     a key whose retired row has a live sibling stays ``serving_eligible``. That
     is real (593 of the 8,064 advertised rows share a content_key with a
     suppressed row; 539 share its exact ``canonical_url``, because same-URL
-    dedupe is the point of lane 2) but it advertises the clean KEEPER, never the
-    retired row — the ``suppressed_at`` conjunct is row-grained and drops the
-    loser regardless of what its key's state says. Measured the same day: 0
-    content_keys are ``serving_eligible`` with every one of their rows
-    suppressed, so the MAX never resurrects a wholly-retired key. Beware the
-    matching artefact: those 539 shared URLs make a sitemap-URL→row join by URL
-    report "advertised URL points at a retired row" for rows that are clean.
+    dedupe is the point of lane 2) but it still advertises a row that is itself
+    unsuppressed, never the retired one — the ``suppressed_at`` conjunct is
+    row-grained and drops the loser regardless of what its key's state says.
+    Measured the same day: 0 content_keys are ``serving_eligible`` with every one
+    of their rows suppressed, so the MAX never resurrects a wholly-retired key.
 
-    WHY THE FIELD STAYS. It is now the feed-side tripwire for exactly one
-    regression: a new writer that mints the label without the timestamp. Such a
+    Precision about those 593, because the obvious phrasing is circular: they are
+    unsuppressed *by selection* — they were drawn from the advertised set, which
+    the conjunct has already filtered — so "they are clean" is entailed, not
+    evidence. Whether each is specifically the dedupe KEEPER of its suppressed
+    sibling (i.e. that sibling's ``suppression_metadata.keeper_product_key``
+    points at it) was NOT checked. The row-vs-key argument does not depend on it.
+
+    Beware the matching artefact: those 539 shared URLs make a sitemap-URL→row
+    join by URL report "advertised URL points at a retired row" for rows that are
+    unsuppressed. That is the same artefact that inflates the 187 above.
+
+    WHY THE FIELD STAYS. It is the feed-side tripwire for exactly one regression:
+    a writer that mints the label without the timestamp — which, per "WHERE THE
+    INVARIANT IS THIN", is reachable today and not merely hypothetical. Such a
     row passes the WHERE clause, lands in the feed, and this column says so on
     the same page the sitemap generator already reads — a second, independent
     alarm to the invariant check, at the surface where the damage happens.
