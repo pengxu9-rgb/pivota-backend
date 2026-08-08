@@ -120,8 +120,73 @@ def mask_sensitive_data(data: str, visible_chars: int = 4) -> str:
     
     if len(data) <= visible_chars:
         return "••••"
-    
+
     return "••••" + data[-visible_chars:]
+
+
+# Characters any masking scheme in this codebase uses as filler. A real
+# credential from Stripe/Adyen/Checkout/PayPal is base62-ish and contains
+# neither, which is what makes `is_masked_credential` below safe to key on.
+_MASK_FILLERS = ("*", "•")
+
+
+def mask_credential(value: Optional[str], visible_chars: int = 4) -> Optional[str]:
+    """Mask a stored credential for display, preserving the last few characters.
+
+    Uses `*` rather than the `•` of `mask_sensitive_data` deliberately: the PSP
+    payloads that call this already render `secret_key` with asterisks, and an
+    operator comparing two credential fields in one response should not have to
+    wonder whether the differing glyphs mean differing treatment. Both forms are
+    recognised by `is_masked_credential`, so the choice is cosmetic and cannot
+    become a correctness gap.
+
+    Returns None for a missing value so callers can distinguish "no credential
+    stored" from "a credential we are not showing you".
+
+    FIXED-WIDTH, and reveals nothing below a floor. Review found two leaks in
+    the obvious implementation:
+
+    - `"*" * (len(value) - 4) + value[-4:]` publishes the credential's EXACT
+      LENGTH, which is a fingerprint of the issuing provider and a search-space
+      reduction for anyone attacking it. The mask is now a constant 12
+      asterisks regardless of input length.
+    - The same expression revealed 4 of 5 characters of a 5-character secret.
+      `/admin/psp/connect` enforces `len >= 8`, but other writers do not
+      (`PUT /merchant/integrations/psp/{psp_id}` only requires non-empty), so
+      short values do reach here. Anything under 8 characters now reveals
+      NOTHING.
+
+    Non-`str` input returns None rather than raising. This is defensive on
+    purpose: the sole caller sits in a loop inside `/psps/all`, whose outer
+    handler turns any exception into an empty list, so one malformed row would
+    have silently emptied the whole PSP view — a fabrication-shaped failure
+    rather than a visible one.
+    """
+    if not isinstance(value, str) or not value:
+        return None
+    if len(value) < 8:
+        return "*" * 12
+    return "*" * 12 + value[-visible_chars:]
+
+
+def is_masked_credential(value: Optional[str]) -> bool:
+    """True if `value` is a mask this codebase produced, not a real credential.
+
+    WHY THIS EXISTS, AND WHY MASKING IS UNSAFE WITHOUT IT. The employee portal's
+    PSP form pre-fills its api_key input from whatever `/psps/all` returned and
+    posts that value straight back on save. So masking a credential in a
+    response, on its own, converts a disclosure bug into a DESTRUCTION bug: the
+    next save writes `****abcd` over the real key. Any write path accepting a
+    credential that a masked read could have populated must call this and keep
+    the stored value instead.
+
+    Keyed on filler characters rather than on an exact length or prefix match,
+    so it survives a change of masking style and cannot be defeated by a
+    credential whose length happens to line up.
+    """
+    if not value:
+        return False
+    return any(filler in value for filler in _MASK_FILLERS)
 
 
 def validate_tax_id(tax_id: str, tax_id_type: str, country: str) -> bool:

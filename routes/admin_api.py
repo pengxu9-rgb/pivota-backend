@@ -6,6 +6,7 @@ Provides endpoints for the admin dashboard with REAL data
 from fastapi import APIRouter, Depends, HTTPException, status, Body
 from typing import Dict, List, Any, Optional
 from utils.auth import verify_jwt_token, get_current_admin, require_admin
+from utils.encryption import is_masked_credential
 from datetime import datetime, timedelta
 from config.settings import settings
 from db.database import database, transactions
@@ -435,7 +436,12 @@ async def admin_connect_psp(
     
     if provider not in ("stripe", "adyen", "checkout", "paypal"):
         raise HTTPException(status_code=400, detail="Unsupported provider. Use stripe/adyen/checkout/paypal")
-    if not api_key or len(api_key) < 8:
+    # A SUPPLIED api_key must be well-formed. Whether one is REQUIRED depends on
+    # whether a stored key exists, which is not known until `canonical_existing`
+    # is resolved below — so the "missing" case is deferred rather than rejected
+    # here.
+    api_key_supplied = bool(api_key and str(api_key).strip())
+    if api_key_supplied and len(api_key) < 8:
         raise HTTPException(status_code=400, detail="Invalid api_key")
     
     # Validate PayPal requires client_secret (only for new connections, not updates)
@@ -484,6 +490,42 @@ async def admin_connect_psp(
         canonical_existing = dict(existing_rows[0]) if existing_rows else None
         if canonical_existing and canonical_existing.get("psp_id"):
             psp_id = canonical_existing["psp_id"]
+
+    # KEEP THE STORED CREDENTIAL when the caller did not supply a real one.
+    #
+    # Two ways a caller says "I am not changing this", and both must mean the
+    # same thing:
+    #   - BLANK: the field was left empty. This is the honest form, and what the
+    #     portal's UpdatePSPForm sends.
+    #   - MASKED: the caller echoed back the `****abcd` that `/psps/all`
+    #     returns. Older portal builds pre-fill the field from that response and
+    #     post it back verbatim, so this branch is what keeps a deploy skew from
+    #     destroying credentials.
+    #
+    # Without this, masking the READ in /psps/all is not a fix but a destruction
+    # bug: the next save writes asterisks over the live key, the PSP keeps
+    # working until its next API call, and the original is gone.
+    #
+    # Deliberately placed AFTER `canonical_existing` is resolved — that is the
+    # only point where the stored credential is known. A mask is long enough to
+    # pass the `len < 8` check above, which is exactly why length validation
+    # cannot carry this.
+    #
+    if not api_key_supplied or is_masked_credential(api_key):
+        existing_api_key = (canonical_existing or {}).get("api_key")
+        if not existing_api_key:
+            raise HTTPException(
+                status_code=400,
+                detail=(
+                    "api_key is required: no stored credential exists for this PSP "
+                    "to preserve"
+                ),
+            )
+        logger.info(
+            "🔒 %s api_key received; preserving the stored credential",
+            "Masked" if api_key_supplied else "Blank",
+        )
+        api_key = existing_api_key
 
     capabilities = payload.get("capabilities") or default_capabilities_for_provider(provider)
 

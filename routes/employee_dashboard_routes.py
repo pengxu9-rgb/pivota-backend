@@ -9,6 +9,7 @@ from pydantic import BaseModel, Field
 from typing import Optional, List, Dict, Any
 from datetime import datetime, timedelta
 from utils.auth import get_current_employee, get_current_user
+from utils.encryption import mask_credential
 from db.database import database
 from readiness.summary import (
     get_readiness_optimization_cache_metrics,
@@ -1366,16 +1367,25 @@ async def get_all_psps(
             success_rate = round((successful_count / transaction_count * 100), 1) if transaction_count > 0 else 0
             total_volume = float(stats["total_volume"]) if stats else 0
             
-            # Mask secret_key for security (show last 4 chars only)
-            secret_key_masked = None
-            try:
-                row_dict = dict(row)
-                if row_dict.get("secret_key"):
-                    secret_key = row_dict["secret_key"]
-                    secret_key_masked = '*' * (len(secret_key) - 4) + secret_key[-4:] if len(secret_key) > 4 else '****'
-            except Exception:
-                secret_key_masked = None
-            
+            # Mask BOTH stored credentials. `secret_key` was already masked
+            # here; `api_key` was returned in the clear beside it, commented
+            # "Include for Configure form" — so the PSP's live API key was
+            # shipped to a browser on every page load of the PSP list, for
+            # every merchant at once. Employee/admin auth limits who can ask,
+            # but the credential still leaves the server, lands in the
+            # response cache, and shows up in devtools and HAR captures.
+            #
+            # Masking alone would have been WORSE than the leak. The portal's
+            # UpdatePSPForm seeds its api_key input from this field and posts
+            # it back verbatim on save, with `canSave` requiring it non-empty
+            # — so a masked value round-trips and overwrites the real key.
+            # `/admin/psp/connect` therefore treats a masked api_key as "keep
+            # the stored one" (see is_masked_credential). The two changes are
+            # a pair; neither is safe alone.
+            row_dict = dict(row)
+            secret_key_masked = mask_credential(row_dict.get("secret_key"))
+            api_key_masked = mask_credential(row_dict.get("api_key"))
+
             psps.append({
                 "psp_id": row["psp_id"],
                 "provider": row["provider"],
@@ -1385,9 +1395,14 @@ async def get_all_psps(
                 "merchant_name": row["merchant_name"] or "Unknown Merchant",
                 "connected_at": row["connected_at"].isoformat() if row["connected_at"] else None,
                 "capabilities": capabilities,
-                "api_key": row["api_key"],  # Include for Configure form
-                "account_id": row["account_id"],  # Include for Configure form
+                # Masked, not omitted: the portal's form disables Save when
+                # this is empty, so dropping the key would lock operators out
+                # of editing account_id on an existing PSP.
+                "api_key": api_key_masked,
+                "api_key_present": bool(row_dict.get("api_key")),
+                "account_id": row["account_id"],  # An identifier, not a secret
                 "secret_key": secret_key_masked,  # Masked for security
+                "secret_key_present": bool(row_dict.get("secret_key")),
                 "transaction_count": transaction_count,
                 "successful_count": successful_count,
                 "success_rate": success_rate,
