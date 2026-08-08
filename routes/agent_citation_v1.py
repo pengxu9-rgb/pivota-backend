@@ -42,6 +42,7 @@ from routes.agent_pdp_v1 import (
     _is_external_product_id,
     _query_for_id,
     _row_to_dict,
+    aggregate_rating_from_row as _aggregate_rating,
 )
 from services.catalog_sync_service import pivota_canonical_pdp_url
 from services.canonical_sitemap_candidates import electable_sig_exists
@@ -282,6 +283,12 @@ def project_citation_item(row: Dict[str, Any]) -> Dict[str, Any]:
         "usage_scenarios": row.get("usage_scenarios") or [],
         "taxonomy_tags": row.get("taxonomy_tags") or [],
         "image_url": row.get("image_url"),
+        # Social proof, never fabricated (migration 186: NULL means "no review
+        # data on the source page", not "zero stars"). Same {value, count}
+        # normalization as agent_pdp_v1's aggregate_rating; a rating with no
+        # positive review count behind it is withheld rather than invented.
+        # Offer-free by construction — a rating is content, not commerce.
+        "aggregate_rating": _aggregate_rating(row),
         # ── trust / substantiation (the differentiator) ──
         "substantiation": {
             "claims": claims,

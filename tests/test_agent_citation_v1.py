@@ -579,3 +579,30 @@ async def test_spawn_log_noop_when_flag_off(monkeypatch: pytest.MonkeyPatch):
     await asyncio.sleep(0)
     assert seen == []
 
+
+
+def test_citation_item_emits_aggregate_rating_when_captured(client_for):
+    # Migration 186 captured schema.org aggregateRating, but no external agent
+    # surface projected it — Pivota's own diagnostic tells merchants to "expose
+    # aggregateRating so agents can weigh social proof" while this endpoint
+    # withheld it. A rating is content, not commerce, so the offer-free
+    # invariants are unaffected.
+    from decimal import Decimal
+
+    row = _row(rating_value=Decimal("4.8"), rating_count=52)
+    body = client_for(row).get(
+        "/agent/v1/citation/ck_0123456789abcdef0123456789abcdef"
+    ).json()
+
+    assert body["aggregate_rating"] == {"value": 4.8, "count": 52}
+    assert body["buyable"] is False
+    assert body["offers"] is None
+
+
+def test_citation_item_aggregate_rating_null_when_uncaptured(client_for):
+    # Never fabricated: NULL means "no review data on the source page".
+    body = client_for(_row()).get(
+        "/agent/v1/citation/ck_0123456789abcdef0123456789abcdef"
+    ).json()
+
+    assert body["aggregate_rating"] is None
