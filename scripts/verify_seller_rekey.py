@@ -32,7 +32,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 Q1 = """
 WITH moved AS (
-  SELECT subject AS pk, observed_id
+  SELECT ref_id AS pk, observed_id
   FROM a9_4_backfill_checkpoint WHERE phase = 'catalog' AND status = 'done')
 SELECT count(*) AS moved,
        count(*) FILTER (WHERE cp.merchant_id = 'external_seed') AS still_sentinel,
@@ -47,7 +47,7 @@ LEFT JOIN catalog_merchants cm ON cm.merchant_id = cp.merchant_id
 
 Q2 = """
 WITH moved AS (
-  SELECT subject AS pk, observed_id
+  SELECT ref_id AS pk, observed_id
   FROM a9_4_backfill_checkpoint WHERE phase = 'catalog' AND status = 'done'),
 spids AS (
   SELECT m.pk, m.observed_id, cp.source_product_id AS spid
