@@ -176,6 +176,150 @@
     "source": "python_authority"
   },
   {
+    "name": "suffix_llc",
+    "brand": "Glow Recipe LLC",
+    "title": "Plum Plump Hyaluronic Serum",
+    "gtin": null,
+    "content_key": "ck_b5f2d541f0c18a6f2576a938746806a1",
+    "source": "python_authority"
+  },
+  {
+    "name": "suffix_ltd",
+    "brand": "Glow Recipe Ltd",
+    "title": "Plum Plump Hyaluronic Serum",
+    "gtin": null,
+    "content_key": "ck_b5f2d541f0c18a6f2576a938746806a1",
+    "source": "python_authority"
+  },
+  {
+    "name": "suffix_corp",
+    "brand": "Glow Recipe Corp",
+    "title": "Plum Plump Hyaluronic Serum",
+    "gtin": null,
+    "content_key": "ck_b5f2d541f0c18a6f2576a938746806a1",
+    "source": "python_authority"
+  },
+  {
+    "name": "suffix_company",
+    "brand": "Glow Recipe Company",
+    "title": "Plum Plump Hyaluronic Serum",
+    "gtin": null,
+    "content_key": "ck_b5f2d541f0c18a6f2576a938746806a1",
+    "source": "python_authority"
+  },
+  {
+    "name": "suffix_stacked",
+    "brand": "Glow Recipe Co. Ltd.",
+    "title": "Plum Plump Hyaluronic Serum",
+    "gtin": null,
+    "content_key": "ck_b5f2d541f0c18a6f2576a938746806a1",
+    "source": "python_authority"
+  },
+  {
+    "name": "suffix_comma_terminated",
+    "brand": "Glow Recipe Inc,",
+    "title": "Plum Plump Hyaluronic Serum",
+    "gtin": null,
+    "content_key": "ck_b5f2d541f0c18a6f2576a938746806a1",
+    "source": "python_authority"
+  },
+  {
+    "name": "suffix_paren_r",
+    "brand": "Glow Recipe (R)",
+    "title": "Plum Plump Hyaluronic Serum",
+    "gtin": null,
+    "content_key": "ck_b5f2d541f0c18a6f2576a938746806a1",
+    "source": "python_authority"
+  },
+  {
+    "name": "suffix_mid_string_tm",
+    "brand": "Acme (TM) Labs",
+    "title": "Plum Plump Hyaluronic Serum",
+    "gtin": null,
+    "content_key": "ck_2cf841409641e95cd962b26a3d8b3d96",
+    "source": "python_authority"
+  },
+  {
+    "name": "mark_ccc_zero_devanagari",
+    "brand": "Himalaya",
+    "title": "नीम फेस वॉश 100ml",
+    "gtin": null,
+    "content_key": "ck_f923d430a83409b7e35aaedcfa6c91e2",
+    "source": "python_authority"
+  },
+  {
+    "name": "mark_ccc_zero_thai",
+    "brand": "Mistine",
+    "title": "เซรั่มบำรุงผิว วิตามินซี",
+    "gtin": "8850012345678",
+    "content_key": "ck_ce99c08b8988f2bc5f6e25a35156af6e",
+    "source": "python_authority"
+  },
+  {
+    "name": "gtin_fullwidth_digits",
+    "brand": "Shiseido",
+    "title": "Ultimune Power Infusing Concentrate",
+    "gtin": "４９０９９７８９９０６６５",
+    "content_key": "ck_8a4c1772ff0afe0564ea1776d75c0488",
+    "source": "python_authority"
+  },
+  {
+    "name": "gtin_arabic_indic_digits",
+    "brand": "MAC",
+    "title": "Lipstick Russian Red",
+    "gtin": "٣٤٥",
+    "content_key": "ck_8791756d6bdf8bd5fe3eca0e1ada3037",
+    "source": "python_authority"
+  },
+  {
+    "name": "gtin_astral_digit",
+    "brand": "Brand",
+    "title": "Astral Code Product",
+    "gtin": "𐒠7736",
+    "content_key": "ck_23458dd98c97c029a1e90b415c479832",
+    "source": "python_authority"
+  },
+  {
+    "name": "brand_leading_bom",
+    "brand": "﻿Glow Recipe",
+    "title": "Plum Plump Hyaluronic Serum",
+    "gtin": null,
+    "content_key": "ck_99da5ae7bbacc10111a004572c312fdf",
+    "source": "python_authority"
+  },
+  {
+    "name": "brand_nel_separator",
+    "brand": "Glow Recipe Inc",
+    "title": "Plum Plump Hyaluronic Serum",
+    "gtin": null,
+    "content_key": "ck_b5f2d541f0c18a6f2576a938746806a1",
+    "source": "python_authority"
+  },
+  {
+    "name": "brand_file_separator",
+    "brand": "Glow\u001cRecipe",
+    "title": "Plum Plump Hyaluronic Serum",
+    "gtin": null,
+    "content_key": "ck_b5f2d541f0c18a6f2576a938746806a1",
+    "source": "python_authority"
+  },
+  {
+    "name": "title_nel_separator",
+    "brand": "Brand",
+    "title": "ab Serum",
+    "gtin": null,
+    "content_key": "ck_c340d8b21181fa5714f5fbaa7f99223e",
+    "source": "python_authority"
+  },
+  {
+    "name": "title_ideographic_number_zero",
+    "brand": "Brand",
+    "title": "〇 〇 Cream",
+    "gtin": null,
+    "content_key": "ck_839adee7f0544053e6fe040806ae8932",
+    "source": "python_authority"
+  },
+  {
     "name": "prod_unicode_japanese",
     "brand": "Cos de BAHA",
     "title": "【美容神ゆりちゃん監修】MVマルチビタ導入美容液 50ml",

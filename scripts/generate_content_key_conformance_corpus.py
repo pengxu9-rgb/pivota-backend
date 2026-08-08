@@ -69,7 +69,11 @@ _RULE_CASES: List[Tuple[str, str, str, Optional[str]]] = [
     # corporate suffix, case, and whitespace all collapse (these two must match)
     ("glow_recipe_suffix_and_case", "Glow Recipe Inc.", "PLUM PLUMP HYALURONIC SERUM", None),
     ("glow_recipe_trimmed_whitespace", "  glow recipe  ", "Plum  Plump  Hyaluronic  Serum", ""),
-    # GTIN-12 / GTIN-13 / separators are one code (these three must match)
+    # GTIN-12 / GTIN-13 / separators are one code — the FIRST TWO must match.
+    # mac_no_gtin is the deliberate contrast: no GTIN is a different key, not the same
+    # product with the code omitted. (An earlier revision of this comment said "these
+    # three must match", which is wrong and would mislead exactly the reader it is
+    # written for — someone about to change the formula.)
     ("mac_gtin_13", "MAC", "Lipstick Russian Red", "0773602443796"),
     ("mac_gtin_12_hyphen", "MAC", "Lipstick Russian Red", "773-602-443796"),
     ("mac_no_gtin", "MAC", "Lipstick Russian Red", None),
@@ -94,6 +98,48 @@ _RULE_CASES: List[Tuple[str, str, str, Optional[str]]] = [
     # empty brand or title -> None, never a deceptive all-collide key
     ("missing_brand_returns_null", "", "Title", None),
     ("missing_title_returns_null", "Brand", "", None),
+    # --- the corporate-suffix walk -------------------------------------------------
+    # Added after mutation testing: the corpus exercised only `Inc.` and `Co.`, so
+    # dropping "company" from _BRAND_SUFFIX_TOKENS, narrowing the (r|tm) pattern,
+    # turning the `while` into an `if`, or shortening rstrip(".,") all left the corpus
+    # UNMOVED. Three of those were invisible in both repos. The suffix list is the
+    # likeliest thing about this module anyone edits, and it was the least covered.
+    ("suffix_llc", "Glow Recipe LLC", "Plum Plump Hyaluronic Serum", None),
+    ("suffix_ltd", "Glow Recipe Ltd", "Plum Plump Hyaluronic Serum", None),
+    ("suffix_corp", "Glow Recipe Corp", "Plum Plump Hyaluronic Serum", None),
+    ("suffix_company", "Glow Recipe Company", "Plum Plump Hyaluronic Serum", None),
+    # stacked suffixes exercise the `while` loop, not just one pop
+    ("suffix_stacked", "Glow Recipe Co. Ltd.", "Plum Plump Hyaluronic Serum", None),
+    # trailing comma exercises rstrip(".,"), not just rstrip(".")
+    ("suffix_comma_terminated", "Glow Recipe Inc,", "Plum Plump Hyaluronic Serum", None),
+    ("suffix_paren_r", "Glow Recipe (R)", "Plum Plump Hyaluronic Serum", None),
+    ("suffix_mid_string_tm", "Acme (TM) Labs", "Plum Plump Hyaluronic Serum", None),
+    # --- the classes that forked the Node port (PIVOTA-Agent#1938) -----------------
+    # Every one of these was a real Node-vs-Python divergence, and NONE was visible to
+    # the original corpus because it was entirely ASCII and CJK. They live here, in the
+    # shared corpus, so both implementations are held to them rather than just the one
+    # that happened to get caught.
+    #
+    # ccc=0 marks: Python KEEPS them past the combining filter and the [^\w\s-] pass
+    # then turns each into a SPACE. The port deleted them, moving the token boundary.
+    ("mark_ccc_zero_devanagari", "Himalaya", "नीम फेस वॉश 100ml", None),
+    ("mark_ccc_zero_thai", "Mistine", "เซรั่มบำรุงผิว วิตามินซี", "8850012345678"),
+    # Python's \D is "not Nd"; JS's bare \D is [^0-9], so these GTINs vanished entirely.
+    ("gtin_fullwidth_digits", "Shiseido", "Ultimune Power Infusing Concentrate", "４９０９９７８９９０６６５"),
+    ("gtin_arabic_indic_digits", "MAC", "Lipstick Russian Red", "٣٤٥"),
+    # zfill counts CODEPOINTS; an astral digit is two UTF-16 units, so length-based
+    # padding under-counts.
+    ("gtin_astral_digit", "Brand", "Astral Code Product", "\U000104a07736"),
+    # U+FEFF is JS-whitespace but NOT Python's, so it must SURVIVE normalize_brand.
+    # This is what a UTF-8 BOM decodes to in the first column of a CSV feed.
+    ("brand_leading_bom", "\ufeffGlow Recipe", "Plum Plump Hyaluronic Serum", None),
+    # U+0085 and U+001C are Python-whitespace but not JS's, so they must SPLIT.
+    ("brand_nel_separator", "Glow Recipe Inc", "Plum Plump Hyaluronic Serum", None),
+    ("brand_file_separator", "GlowRecipe", "Plum Plump Hyaluronic Serum", None),
+    ("title_nel_separator", "Brand", "ab Serum", None),
+    # \w is isalnum(), so Nl and No count too — not just Nd. NFKD folds most (Ⅻ->XII,
+    # ½->1⁄2, ①->1); U+3007 IDEOGRAPHIC NUMBER ZERO does not.
+    ("title_ideographic_number_zero", "Brand", "〇 〇 Cream", None),
 ]
 
 # --- group 2: real production rows ------------------------------------------
