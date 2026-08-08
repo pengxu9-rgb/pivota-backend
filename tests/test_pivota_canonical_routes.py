@@ -75,6 +75,16 @@ class FakeDb:
         if not m:
             return None
         sig = m.group(1)
+        # The retired probe (410 path): a narrow SELECT that asks specifically
+        # for a SUPPRESSED row by sig — the inverse of the serving filter below.
+        if "suppressed_at IS NOT NULL" in sql:
+            for r in self._rows:
+                if r.get("pivota_signature_id") == sig and r.get("suppressed_at") is not None:
+                    return {
+                        "suppressed_at": r["suppressed_at"],
+                        "suppression_reason": r.get("suppression_reason"),
+                    }
+            return None
         for r in self._rows:
             if (
                 r.get("pivota_signature_id") == sig
@@ -507,7 +517,21 @@ def test_suppressed_row_excluded_from_list_and_resolver(env):
     body = client.get("/api/canonical/products").json()
     assert "sig_supp" not in [i["sig_id"] for i in body["items"]]
     assert body["total"] == 3  # suppressed row does not count as advertised
+    # RETIRED, not unknown: a deliberately taken-down sig answers 410 Gone with
+    # the retirement disclosed, so crawlers drop the URL for good instead of
+    # re-trying a bare 404 forever (Search Console churn).
     res = client.get("/api/canonical/products/sig_supp")
+    assert res.status_code == 410
+    detail = res.json()["detail"]
+    assert detail["retired"] is True
+    assert detail["sig_id"] == "sig_supp"
+
+
+def test_unknown_sig_stays_an_honest_404(env):
+    # Never fabricated: a sig with no row at all — suppressed or otherwise —
+    # is 404, not 410. Gone means "existed and was retired".
+    client = env
+    res = client.get("/api/canonical/products/sig_0000000000000000000000000000dead")
     assert res.status_code == 404
 
 

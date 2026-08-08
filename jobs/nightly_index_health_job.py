@@ -506,6 +506,11 @@ async def run_nightly_index_health() -> Dict[str, Any]:
         stage_counts: Dict[str, int] = {}
         total_processed = 0
         eligible_count = 0
+        # IndexNow accumulators — pinged once at job end (one batched submit,
+        # protocol cap 10k URLs) rather than per row.
+        from services.catalog_sync_service import pivota_canonical_pdp_url
+        indexnow_added_urls: List[str] = []
+        indexnow_removed_urls: List[str] = []
         # P1.5 graduation ladder: check the kill-switch once per run so the
         # per-content_key loop is skipped entirely (no overhead) when dark.
         from services.index_graduation_ladder import (
@@ -556,6 +561,33 @@ async def run_nightly_index_health() -> Dict[str, Any]:
                 if state["serving_eligible"]:
                     eligible_count += 1
 
+            # IndexNow transition detection (both directions). This bulk path is
+            # where most eligibility flips actually land — raw-SQL takedown
+            # sweeps never call recompute_serving_eligibility, so until this
+            # nightly tick nothing re-classifies them, and before this block
+            # nothing EVER told the engines. Capture prior state per content_key
+            # so a flip can ping the engines: additions get crawled promptly,
+            # and removals get re-crawled so the dead URL leaves the index
+            # instead of rotting as Search Console 404 churn. On the way down we
+            # ping the PRIOR row's sig — IPS stores the MAX-rank row's sig, so
+            # after a takedown the newly-classified sig can differ from the URL
+            # that was actually advertised. Best-effort throughout: a failure
+            # here never affects the reclassification itself.
+            prev_by_ck: Dict[str, Any] = {}
+            if batch_states:
+                try:
+                    prev_rows = await database.fetch_all(
+                        "SELECT content_key, serving_eligible, pivota_signature_id "
+                        "FROM index_pipeline_state WHERE content_key = ANY(:cks)",
+                        {"cks": [s["content_key"] for s in batch_states]},
+                    )
+                    prev_by_ck = {r["content_key"]: dict(r) for r in prev_rows}
+                except Exception as exc:  # noqa: BLE001
+                    logger.warning(
+                        "nightly_index_health: indexnow prior-state fetch failed "
+                        "for batch at cursor=%r: %s", cursor, exc,
+                    )
+
             if batch_states:
                 try:
                     await database.execute_many(_UPSERT_QUERY, batch_states)
@@ -568,6 +600,19 @@ async def run_nightly_index_health() -> Dict[str, Any]:
                     )
                     summary["batch_errors"] += 1
                     summary["errors"].append(f"batch_upsert cursor={cursor!r}: {exc!r}")
+                else:
+                    for state in batch_states:
+                        prev = prev_by_ck.get(state["content_key"])
+                        prev_eligible = bool(prev and prev.get("serving_eligible"))
+                        new_eligible = bool(state.get("serving_eligible"))
+                        if new_eligible and not prev_eligible:
+                            sig = str(state.get("pivota_signature_id") or "")
+                            if sig.startswith("sig_"):
+                                indexnow_added_urls.append(pivota_canonical_pdp_url(sig))
+                        elif prev_eligible and not new_eligible:
+                            prev_sig = str((prev or {}).get("pivota_signature_id") or "")
+                            if prev_sig.startswith("sig_"):
+                                indexnow_removed_urls.append(pivota_canonical_pdp_url(prev_sig))
 
             # Convergence P1.5: advance the observed-track graduation ladder for
             # each freshly classified content_key, using the state we just
@@ -694,6 +739,20 @@ async def run_nightly_index_health() -> Dict[str, Any]:
 
     finally:
         await _release_job_lock()
+
+    # IndexNow: one batched submit for every transition this run produced.
+    # Best-effort by design (submit_urls never raises); counts land in the
+    # summary either way so the run report shows what was pinged.
+    summary["indexnow_added"] = len(indexnow_added_urls)
+    summary["indexnow_removed"] = len(indexnow_removed_urls)
+    transition_urls = (indexnow_added_urls + indexnow_removed_urls)[:10_000]
+    if transition_urls:
+        try:
+            from services.indexnow import submit_urls
+
+            await submit_urls(transition_urls)
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("nightly_index_health: indexnow submit failed: %s", exc)
 
     run_end = datetime.now(timezone.utc)
     duration_s = (run_end - run_start).total_seconds()

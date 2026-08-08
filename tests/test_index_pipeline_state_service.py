@@ -873,3 +873,62 @@ async def test_non_usd_offer_blocks_serving_when_gate_enabled(monkeypatch) -> No
         await _cleanup()
         if not was_connected:
             await database.disconnect()
+
+
+@pytest.mark.asyncio
+async def test_recompute_pings_indexnow_prior_sig_on_takedown(monkeypatch) -> None:
+    """The true->false transition must ping IndexNow with the PRIOR sig's URL.
+
+    Until now only false->true pinged; a takedown left the engines to discover
+    the dead URL by organic re-crawl while Search Console accumulated 404
+    churn. The prior sig matters because IPS stores the MAX-rank row's sig —
+    after a takedown the newly-classified sig can differ from the URL that was
+    actually advertised."""
+    import services.indexnow as indexnow_mod
+
+    pinged: list = []
+    monkeypatch.setattr(indexnow_mod, "schedule_submit_url", lambda url: pinged.append(url))
+
+    was_connected = await _prepare_db()
+    try:
+        ids = await _insert_product("inowdown")
+
+        assert await svc.recompute_serving_eligibility(ids["content_key"]) is True
+        eligible_pings = list(pinged)
+        # Newly eligible -> the existing false->true ping fired.
+        assert len(eligible_pings) == 1
+
+        # Editorial takedown, the raw-SQL sweep shape.
+        await database.execute(
+            "UPDATE catalog_products SET suppressed_at = :ts WHERE content_key = :ck",
+            {"ts": datetime(2026, 8, 1, tzinfo=timezone.utc), "ck": ids["content_key"]},
+        )
+        assert await svc.recompute_serving_eligibility(ids["content_key"]) is False
+
+        assert len(pinged) == 2
+        # Same URL both directions: the advertised page is what must be
+        # re-crawled so the 404/410 is observed and the entry dropped.
+        assert pinged[1] == eligible_pings[0]
+        assert "/products/sig_" in pinged[1]
+    finally:
+        await _cleanup()
+        await _disconnect_if_needed(was_connected)
+
+
+@pytest.mark.asyncio
+async def test_recompute_no_ping_without_transition(monkeypatch) -> None:
+    """Idempotent recomputes (no eligibility flip) must not spam the engines."""
+    import services.indexnow as indexnow_mod
+
+    pinged: list = []
+    monkeypatch.setattr(indexnow_mod, "schedule_submit_url", lambda url: pinged.append(url))
+
+    was_connected = await _prepare_db()
+    try:
+        ids = await _insert_product("inowsteady")
+        assert await svc.recompute_serving_eligibility(ids["content_key"]) is True
+        assert await svc.recompute_serving_eligibility(ids["content_key"]) is True
+        assert len(pinged) == 1  # only the initial false->true
+    finally:
+        await _cleanup()
+        await _disconnect_if_needed(was_connected)

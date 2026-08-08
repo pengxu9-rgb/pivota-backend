@@ -644,6 +644,41 @@ async def get_canonical_pdp_by_signature(sig_id: str) -> Dict[str, Any]:
     )
     row = await _bounded_db(database.fetch_one(query), "product_by_signature")
     if not row:
+        # RETIRED vs NEVER-EXISTED. A deliberately taken-down row (suppressed_at
+        # set by a sweep) and an unknown sig both fell out of the gated query
+        # above, and both answered a bare 404 — so a crawler or agent could not
+        # tell "drop this URL, it is gone for good" (410) from "maybe a typo"
+        # (404), and Search Console accumulates churn while engines re-try dead
+        # URLs. One narrow indexed probe, paid ONLY on the 404 path (partial
+        # index idx_catalog_products_suppressed_at, migration 135): if the sig
+        # exists but is suppressed, answer 410 Gone with the retirement
+        # disclosed. Never fabricated — absent row stays an honest 404.
+        retired = await _bounded_db(
+            database.fetch_one(
+                select(
+                    catalog_products.c.suppressed_at,
+                    catalog_products.c.suppression_reason,
+                )
+                .where(
+                    and_(
+                        catalog_products.c.pivota_signature_id == sig,
+                        catalog_products.c.suppressed_at.isnot(None),
+                    )
+                )
+                .limit(1)
+            ),
+            "product_by_signature_retired_probe",
+        )
+        if retired:
+            raise HTTPException(
+                status_code=status.HTTP_410_GONE,
+                detail={
+                    "message": "This product was retired and will not return",
+                    "sig_id": sig,
+                    "retired": True,
+                    "suppression_reason": retired["suppression_reason"],
+                },
+            )
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
             detail={

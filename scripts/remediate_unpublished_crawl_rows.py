@@ -406,6 +406,36 @@ async def _drive(args: argparse.Namespace) -> None:
         await database.disconnect()
 
 
+def _dispatch_sitemap_refresh() -> None:
+    """Best-effort: kick agent-ui's sitemap workflow so the takedown leaves the
+    advertised set within minutes, not at the next 6-hourly tick.
+
+    The sitemap is generated static files in pivota-agent-ui, refreshed by its
+    `sitemaps.yml` cron (17 1,7,13,19 UTC) — the backend has no push channel, so
+    between a sweep and the next tick every withdrawn URL stays advertised while
+    its PDP already 404s/410s: exactly the Search Console churn this runner's
+    withdrawals create. Operators run this script from a machine with `gh`
+    already authenticated, so a workflow_dispatch is one subprocess away.
+    Failure is loud but non-fatal — the cron remains the backstop.
+    """
+    import shutil
+    import subprocess
+
+    if not shutil.which("gh"):
+        print("  sitemap refresh NOT dispatched: `gh` not on PATH — the 6-hourly "
+              "cron will pick the withdrawal up (worst case ~6h of advertised 404s).")
+        return
+    try:
+        subprocess.run(
+            ["gh", "workflow", "run", "sitemaps.yml", "-R", "pengxu9-rgb/pivota-agent-ui"],
+            check=True, capture_output=True, text=True, timeout=30,
+        )
+        print("  sitemap refresh dispatched (pivota-agent-ui sitemaps.yml).")
+    except Exception as exc:  # noqa: BLE001
+        print(f"  sitemap refresh dispatch FAILED ({exc}) — the 6-hourly cron "
+              "will pick the withdrawal up.")
+
+
 def main() -> int:
     p = argparse.ArgumentParser(description=__doc__)
     p.add_argument("--host", help="restrict to one registrable host (e.g. biodance.com)")
@@ -423,7 +453,12 @@ def main() -> int:
         ),
     )
     p.add_argument("--show", type=int, default=20, help="rows to list in dry-run output")
-    asyncio.run(_drive(p.parse_args()))
+    args = p.parse_args()
+    asyncio.run(_drive(args))
+    # A write in EITHER direction changes the advertised set — withdrawals must
+    # leave the sitemap, reverts must return to it.
+    if args.apply or args.revert:
+        _dispatch_sitemap_refresh()
     return 0
 
 
