@@ -34,6 +34,18 @@ catalog_products mirror suppressed (two-mirror gotcha), so a re-crawl of a
 polluted store self-heals instead of re-creating N serving rows. See
 docs/HANDOFF_crawl_side_dedup.md.
 
+A second, independent pass then drops AD-CAMPAIGN LANDING PAGES
+(PIVOTA-Agent#1926): Shopify merchants mint one "product" per ad variant so each
+creative gets its own landing page and pixel, and the crawl ingests those as
+products. Dedup cannot see them — a campaign page whose title is its own
+headline forms a group of one and survives as a "canonical". So each canonical
+row is checked against the merchant's own sitemap_products_*.xml
+(services/shopify_publication_signal.py); rows the merchant does not publish to
+its Online Store are collapsed the same reversible way, under their own
+suppression reason. Every uncertainty (no sitemap, an unreadable or partially
+read one, a non-/products/ URL) passes through untouched. --no-publication-gate
+turns the pass off.
+
 Idempotent throughout. Input: a JSON array on --file or stdin; each item:
   {external_product_id, brand, title, category_kind, product_type,
    destination_url, image_url, price_amount, description, raw_inci,
@@ -87,6 +99,12 @@ from services.pdp_scope_classifier import (
 # and the seed row records that seller (seller_ref/seed_kind) so T2 attribution
 # keys conversions by seller.
 from services.seller_identity import derive_seed_seller, ensure_observed_seller
+from services.shopify_publication_signal import (
+    PUBLISHED,
+    UNKNOWN,
+    UNPUBLISHED,
+    PublicationOracle,
+)
 
 TOOL = "external_brand_crawl"
 # catalog_products.platform channel for external-seed supply (matches the mirror).
@@ -136,6 +154,30 @@ _TRAILING_DIGITS_RE = re.compile(r"(\d+)$")
 # deactivating a seed does NOT clean its catalog_products mirror, so the mirror
 # row must be suppressed explicitly.
 DUP_SUPPRESSION_REASON = "external_brand_crawl_dup_listing"
+
+# ---------------------------------------------------------------------------
+# Ad-campaign landing pages (PIVOTA-Agent#1926).
+#
+# dedupe_cohort above answers "which of these listings is the canonical one for
+# this title?". It does NOT answer "is this a product at all?" — and that is the
+# gap those campaign pages walked through. A merchant minting 45 ad variants of
+# ONE product gives them all the same title, so dedup collapses them correctly.
+# But a merchant minting an ad variant with its OWN campaign headline for a
+# title — 'Amazon #1 Glass Skincare Brand', '<MAIN>[El Nº 1 en skincare de
+# Amazon] Hasta 45% de descuento en este Prime Day' — hands it a group of one.
+# It survives as its own "canonical", mints its own content_key, and serves.
+# Measured on prod 2026-08-07: of biodance.com's 37 live rows, ~30 were the sole
+# member of their own title group. Dedup cannot reach them by construction.
+#
+# So this is a second, orthogonal question, and it needs a signal that is about
+# PUBLICATION rather than about text: services/shopify_publication_signal.py
+# asks the merchant's own sitemap_products_*.xml whether the URL is published to
+# the Online Store. Campaign pages are not. Rows that answer UNPUBLISHED are
+# collapsed exactly like duplicate listings (seed deactivated + mirror
+# suppressed, reversible, no hard delete) under their own reason so a revert can
+# target this gate alone. UNKNOWN — no sitemap, an unreadable or partially-read
+# sitemap, a non-/products/ URL — always passes through untouched.
+UNPUBLISHED_SUPPRESSION_REASON = "external_brand_crawl_unpublished"
 
 
 def _norm_ws(value: Any) -> str:
@@ -247,6 +289,28 @@ def dedupe_cohort(
     kept = [p for i, p in enumerate(cohort) if i not in dropped_idx]
     dropped = [p for i, p in enumerate(cohort) if i in dropped_idx]
     return kept, dropped, decisions
+
+
+async def partition_by_publication(
+    cohort: List[Dict[str, Any]],
+) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]], Dict[str, int]]:
+    """Split a deduped cohort into (keep, unpublished, counts-by-verdict).
+
+    Only an explicit UNPUBLISHED verdict moves a row out of `keep`; PUBLISHED
+    and UNKNOWN both stay. That asymmetry is the whole safety story — see
+    services/shopify_publication_signal.py on why every uncertainty is UNKNOWN.
+
+    Network I/O, one sitemap fetch per host (PublicationOracle caches), so a
+    250-row single-brand cohort costs one request tree."""
+    oracle = PublicationOracle()
+    counts: Dict[str, int] = {PUBLISHED: 0, UNPUBLISHED: 0, UNKNOWN: 0}
+    keep: List[Dict[str, Any]] = []
+    unpublished: List[Dict[str, Any]] = []
+    for p in cohort:
+        verdict = await oracle.classify(p)
+        counts[verdict] = counts.get(verdict, 0) + 1
+        (unpublished if verdict == UNPUBLISHED else keep).append(p)
+    return keep, unpublished, counts
 
 
 def _seed_domain(p: Dict[str, Any]) -> str:
@@ -473,14 +537,21 @@ async def _resolve_pdp_scope(p: Dict[str, Any], product_key: str, self_merchant_
     )
 
 
-async def _suppress_dropped_listings(dropped: List[Dict[str, Any]]) -> int:
-    """Self-heal already-polluted stores: for each duplicate listing we're now
-    skipping, deactivate any active seed row and suppress its catalog_products
-    mirror. Two-mirror gotcha — deactivating a seed does NOT tombstone its
-    mirror (the stale-catalog sweep excludes external_seed), so the mirror row
-    is suppressed explicitly via source_ref = seed id (globally unique; no
-    merchant literal needed). Both writes are idempotency-guarded, so a re-crawl
-    is a no-op once collapsed. No hard-deletes (reversible)."""
+async def _suppress_dropped_listings(
+    dropped: List[Dict[str, Any]], reason: str = DUP_SUPPRESSION_REASON
+) -> int:
+    """Self-heal already-polluted stores: for each listing we're now skipping,
+    deactivate any active seed row and suppress its catalog_products mirror.
+    Two-mirror gotcha — deactivating a seed does NOT tombstone its mirror (the
+    stale-catalog sweep excludes external_seed), so the mirror row is suppressed
+    explicitly via source_ref = seed id (globally unique; no merchant literal
+    needed). Both writes are idempotency-guarded, so a re-crawl is a no-op once
+    collapsed. No hard-deletes (reversible).
+
+    `reason` distinguishes the two independent grounds for skipping a row —
+    DUP_SUPPRESSION_REASON (a duplicate listing of a product we DID seed) and
+    UNPUBLISHED_SUPPRESSION_REASON (an ad landing page, seeded by nothing) — so
+    either gate can be reverted without disturbing the other."""
     suppressed = 0
     for p in dropped:
         sid = _seed_id(p["external_product_id"])
@@ -493,7 +564,7 @@ async def _suppress_dropped_listings(dropped: List[Dict[str, Any]]) -> int:
             "UPDATE catalog_products SET suppression_reason=:reason, "
             "suppressed_at=COALESCE(suppressed_at, NOW()), updated_at=NOW() "
             "WHERE source_ref=:id AND suppression_reason IS NULL",
-            {"id": sid, "reason": DUP_SUPPRESSION_REASON},
+            {"id": sid, "reason": reason},
         )
         suppressed += 1
     return suppressed
@@ -504,6 +575,7 @@ async def _onboard(
     dropped: List[Dict[str, Any]],
     *,
     serve: bool = True,
+    unpublished: Optional[List[Dict[str, Any]]] = None,
 ) -> None:
     # Collapse duplicate Shopify listings BEFORE anything else: deactivate the
     # skipped listings' seeds + suppress their mirror rows (must precede
@@ -511,6 +583,18 @@ async def _onboard(
     # rows for ACTIVE seeds). `cohort` is already the deduped (canonical) set.
     suppressed = await _suppress_dropped_listings(dropped)
     print(f"dedup: {len(cohort)} canonical, {len(dropped)} duplicate listing(s) suppressed={suppressed}")
+    # Same treatment, same ordering requirement, different ground: these are ad
+    # landing pages the merchant does not publish, so nothing seeds in their
+    # place. Suppressing before mirror_apply is what makes a re-crawl of an
+    # already-polluted store self-heal instead of re-minting the PDPs.
+    if unpublished:
+        unpub_suppressed = await _suppress_dropped_listings(
+            unpublished, UNPUBLISHED_SUPPRESSION_REASON
+        )
+        print(
+            f"publication gate: {len(unpublished)} unpublished (ad landing) page(s) "
+            f"suppressed={unpub_suppressed}"
+        )
     # ADR-009 D2/D3: resolve-or-mint each product's per-brand observed seller
     # BEFORE upserting the seed (so seller_ref/seed_kind land on the row) AND
     # before the mirror runs. The mirror derives the SAME identity (deterministic
@@ -549,14 +633,29 @@ async def _onboard(
     if not serve:
         os.environ["EXTERNAL_SEED_MIRROR_MAKE_SERVABLE"] = "0"
     try:
-        inserted = await mirror_apply(max(50, len(cohort) * 3))
+        if not cohort:
+            # mirror_apply's `missing` CTE is GLOBAL, not scoped to this cohort:
+            # with nothing to seed, `max(50, 0)` would still mirror up to 50
+            # unrelated brands' pending seeds and report the count as if it were
+            # ours. Under --no-serving that is actively destructive — the env
+            # override above is read per row inside the mirror loop, so those
+            # other brands' rows get mirrored with the servable pass OFF, and
+            # once a catalog_products row exists they leave `missing` forever
+            # and the scheduled mirror never revisits them. They are stranded
+            # non-servable, silently. The publication gate makes an empty cohort
+            # a routine outcome (biodance: every row rejected), so this is no
+            # longer a theoretical branch.
+            inserted = 0
+            print("mirror skipped: nothing to seed after dedup + publication gate")
+        else:
+            inserted = await mirror_apply(max(50, len(cohort) * 3))
+            print(f"mirror inserted_catalog_products={inserted}")
     finally:
         if not serve:
             if _prev_make_servable is None:
                 os.environ.pop("EXTERNAL_SEED_MIRROR_MAKE_SERVABLE", None)
             else:
                 os.environ["EXTERNAL_SEED_MIRROR_MAKE_SERVABLE"] = _prev_make_servable
-    print(f"mirror inserted_catalog_products={inserted}")
     for p in cohort:
         merchant_id, product_key = keys[p["external_product_id"]]
         await _set_category_and_offer(p, product_key, merchant_id)
@@ -675,11 +774,56 @@ async def _drive(args: argparse.Namespace) -> None:
             "<ISO timestamp of the actual crawl>.",
             file=sys.stderr,
         )
-    kept, dropped, decisions = dedupe_cohort(cohort)
     serve = not args.no_serving
+    # Reported below as the cohort's input size; the gate shrinks `cohort`.
+    total_in = len(cohort)
+    # Publication gate (PIVOTA-Agent#1926) runs BEFORE dedup, on the FULL cohort.
+    #
+    # Order matters, and the obvious order is wrong. Gating the post-dedup set
+    # instead lets the two passes compose into a row-destroying pincer:
+    # dedupe_cohort elects ONE canonical per (brand, base title) and suppresses
+    # the rest as duplicates, but it ranks on title/handle shape, not on whether
+    # a row is a product. _canonical_rank penalises any handle ending in `-<N>`
+    # — which plenty of REAL published handles do (`collagen-mask-2`,
+    # `set-of-2`) — so a campaign clone with a clean-looking handle can beat the
+    # genuine PDP. The genuine PDP is then already suppressed as a "duplicate"
+    # when the gate rejects the elected campaign page, and a product that IS in
+    # the merchant's sitemap disappears from the catalog entirely. The
+    # all-rejected warning below does not fire in that mixed case, so it fails
+    # silently.
+    #
+    # Gating first removes campaign pages before any election happens, so dedup
+    # only ever elects among rows the merchant actually publishes. It costs
+    # nothing extra: PublicationOracle caches per HOST, so classifying 250 rows
+    # and classifying 34 issue the same single sitemap fetch — only in-memory
+    # set membership scales with row count.
+    unpublished: List[Dict[str, Any]] = []
+    if not args.no_publication_gate:
+        cohort, unpublished, verdicts = await partition_by_publication(cohort)
+        print(
+            f"publication: {verdicts.get(PUBLISHED, 0)} published, "
+            f"{verdicts.get(UNPUBLISHED, 0)} unpublished (ad landing pages), "
+            f"{verdicts.get(UNKNOWN, 0)} unknown (passed through)"
+        )
+    kept, dropped, decisions = dedupe_cohort(cohort)
+    if unpublished and not kept:
+        # Either the whole store is campaign pages (biodance.com is exactly
+        # this — all 250 crawled URLs were ad variants and the 36 real PDPs
+        # were never crawled) or the crawl and the sitemap disagree about
+        # the store's URL space. Both are worth a human look, and the
+        # script's dry-run default guarantees one before anything is written.
+        print(
+            "WARNING: the publication gate rejected EVERY row in this cohort. "
+            "That is correct for an all-campaign crawl, but it is also what a "
+            "crawl pointed at the wrong URL space looks like. Confirm against "
+            f"https://{_seed_domain(unpublished[0]) or '<host>'}/sitemap.xml "
+            "before --apply.",
+            file=sys.stderr,
+        )
     print(
-        f"{'APPLY' if args.apply else 'DRY'} :: {len(cohort)} products "
-        f"({len(kept)} canonical, {len(dropped)} duplicate listing(s) collapsed) "
+        f"{'APPLY' if args.apply else 'DRY'} :: {total_in} products "
+        f"({len(kept)} canonical, {len(dropped)} duplicate listing(s) collapsed, "
+        f"{len(unpublished)} unpublished) "
         f"[posture: {'serving' if serve else 'decision-grade only (no serving)'}]"
     )
     for canonical, drops in decisions:
@@ -705,10 +849,16 @@ async def _drive(args: argparse.Namespace) -> None:
                 f"  would SKIP dup {p.get('external_product_id')} "
                 f"(deactivate seed + suppress mirror if present) :: {p.get('title')}"
             )
+        for p in unpublished:
+            print(
+                f"  would SKIP unpublished {p.get('external_product_id')} "
+                f"(not in the merchant's product sitemap) "
+                f"{p.get('destination_url')} :: {p.get('title')}"
+            )
         return
     await database.connect()
     try:
-        await _onboard(kept, dropped, serve=serve)
+        await _onboard(kept, dropped, serve=serve, unpublished=unpublished)
     finally:
         await database.disconnect()
 
@@ -725,6 +875,17 @@ def main() -> int:
             "ISO timestamp of the crawl that produced this cohort file; stamped as "
             "snapshot.extracted_at on items that lack their own. Without it, items "
             "missing extracted_at get RUN time (only honest for fresh crawl output)."
+        ),
+    )
+    parser.add_argument(
+        "--no-publication-gate",
+        action="store_true",
+        help=(
+            "skip the ad-campaign landing-page gate (PIVOTA-Agent#1926). By "
+            "default each canonical row is checked against the merchant's own "
+            "sitemap_products_*.xml and rows absent from it are collapsed like "
+            "duplicate listings. Use this for a store whose sitemap is known "
+            "bad, or to onboard without any network calls to the merchant."
         ),
     )
     parser.add_argument(
