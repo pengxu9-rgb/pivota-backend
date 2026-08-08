@@ -50,8 +50,20 @@ WITH moved AS (
   SELECT ref_id AS pk, observed_id
   FROM a9_4_backfill_checkpoint WHERE phase = 'catalog' AND status = 'done'),
 spids AS (
+  -- A listing may key on the catalog row's source_product_id (Path B) OR the
+  -- attached seed's external_product_id (Path C rows carry a NAME SLUG in
+  -- source_product_id — measured 2026-08-07: 0 Path C listings under the
+  -- slug). The tool migrates BOTH candidates; the verifier must check both,
+  -- or new_refs reads 0 for a perfectly migrated Path C cohort.
   SELECT m.pk, m.observed_id, cp.source_product_id AS spid
-  FROM moved m JOIN catalog_products cp ON cp.product_key = m.pk)
+  FROM moved m JOIN catalog_products cp ON cp.product_key = m.pk
+  UNION
+  SELECT m.pk, m.observed_id, e.external_product_id AS spid
+  FROM moved m
+  JOIN catalog_products cp ON cp.product_key = m.pk
+  JOIN external_product_seeds e
+    ON e.attached_product_key = cp.product_key AND e.status = 'active'
+  WHERE e.external_product_id IS NOT NULL)
 SELECT
   (SELECT count(*) FROM pdp_identity_listing pil
      JOIN spids s ON pil.product_id = s.spid
