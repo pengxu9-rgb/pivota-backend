@@ -252,7 +252,15 @@ def test_canonical_search_excludes_suppressed_rows_from_global_recall():
     through this hole (#1648). BOTH columns must be gated: catalog_trust_policy
     treats suppression_reason alone as tombstoned, and the step5-generation
     writers set reason without suppressed_at, so a reason-only row is
-    'tombstoned' to trust policy and 'clean' to a suppressed_at-only filter."""
+    'tombstoned' to trust policy and 'clean' to a suppressed_at-only filter.
+
+    The 2026-07-30 backfill and #1660 removed every such row and taught every
+    writer to set both, so the second conjunct matches nothing today. It stays
+    because it is the cheap half of the gate and the only thing standing between
+    a regressed writer and the same leak — see
+    tests/test_suppression_writers_set_both_columns.py for the writer-side pin
+    and catalog_invariant_checks' suppression_reason_without_timestamp (prod: 0,
+    threshold 0) for the data-side one."""
     src = _src(pivot_query_service._fetch_canonical_search_rows)
     assert "p.suppressed_at IS NULL AND p.suppression_reason IS NULL" in src, (
         "global recall must exclude product rows with EITHER suppression column set"

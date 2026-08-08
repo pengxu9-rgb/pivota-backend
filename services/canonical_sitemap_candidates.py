@@ -302,6 +302,25 @@ def sitemap_candidate_filter(*, widen: bool, cp=None, ips=None, cm=None):
         # reason the election has to share this filter rather than approximate
         # it: a suppressed sibling is exactly the kind of row that looks
         # electable from the content_key's point of view and is not.
+        #
+        # THE ROW GRAIN IS THE WHOLE GATE, and #1648 P1a is what made it one.
+        # `index_pipeline_state` is keyed on content_key and
+        # `index_pipeline_state_service._select_content_key_state` stores the
+        # MAX state across the key's rows, so `eligibility_predicate` below
+        # answers TRUE for a key whose retired row has a live sibling. This
+        # conjunct is what keeps that from advertising the retired row: it is
+        # asked of THIS row, not of its key. Measured 2026-08-08 on prod — 593
+        # of the 8,064 advertised rows share a content_key with a suppressed
+        # row and 539 share its exact `canonical_url` (same-URL dedupe is the
+        # point of lane 2), and every one of the 593 is the clean KEEPER. Zero
+        # content_keys are serving_eligible with all of their rows suppressed,
+        # so the MAX never resurrects a wholly-retired key either.
+        #
+        # It only holds because `suppression_reason` now implies
+        # `suppressed_at` (2026-07-30 backfill + #1660). Before that, a row
+        # could be retired and still null here, which is exactly how 187 URLs
+        # stayed advertised on 2026-07-29 — see
+        # `routes.pivota_canonical_routes._tombstoned_column`.
         cp.c.suppressed_at.is_(None),
         identity_term,
         eligibility_predicate(widen_with_index_eligible=widen, ips=ips),
@@ -335,13 +354,27 @@ def renderable_expression():
 def not_tombstoned(cp=None):
     """This row is not a step-5 dedupe LOSER.
 
-    ``suppression_reason`` without ``suppressed_at`` is a real and populated
+    ``suppression_reason`` without ``suppressed_at`` WAS a real and populated
     state: step-5 tombstones set the reason (plus
     ``suppression_metadata.keeper_product_key``) while leaving the row serving,
-    so 431 losers still answer HTTP 200 and 362 of them are live sitemap URLs.
-    Measured 2026-07-25: ZERO of the 3,326 advertised URLs are missing from the
-    feed, which is only possible if these rows pass the ``suppressed_at IS
-    NULL`` gate — they do.
+    so 431 losers still answered HTTP 200 and 362 of them were live sitemap
+    URLs. Measured 2026-07-25: ZERO of the 3,326 advertised URLs were missing
+    from the feed, which is only possible if these rows passed the
+    ``suppressed_at IS NULL`` gate — they did.
+
+    THAT IS NO LONGER TRUE, and this predicate outlived it on purpose. The
+    2026-07-30 backfill gave all 2,332 reason-only rows a ``suppressed_at`` and
+    #1660 (#1648 P1a) taught every writer here to set both columns, so
+    :func:`sitemap_candidate_filter`'s own ``suppressed_at IS NULL`` conjunct
+    now drops every tombstone before this predicate is reached. Re-measured
+    2026-08-08 on prod: of the 8,906 rows the feed emits, 0 carry a
+    ``suppression_reason``; the two ``catalog_invariant_checks`` that pin the
+    split state sit at 0 with threshold 0.
+
+    KEEP IT ANYWAY. It is one AND-term over a set the sitemap filter has
+    already narrowed, and it is the election's independent guarantee that a
+    label-without-timestamp regression cannot crown a loser — the failure below
+    is not one to re-open on the strength of "currently redundant".
 
     WHY THE ELECTION MUST EXCLUDE THEM. PIVOTA-Agent#1833 points every
     tombstoned loser's PDP at its keeper, and the keeper is inside the SAME
@@ -375,14 +408,22 @@ def not_tombstoned(cp=None):
     tombstones that are renderable+eligible whose in-group keeper is not
     renderable.
 
-    Scope note on the field itself: `suppression_reason` is set without
-    `suppressed_at` by more writers than step-5 alone —
-    step5_duplicate_store_connection, step5_same_merchant_same_url_dup,
-    step5_campaign_clone_dup, cross_merchant_redundant_external_seed,
-    step5_orphan_seed_mirror, the d2_* identity-resolution reasons, and
-    external_brand_crawl_dup_listing. Every one is a dedupe/retirement marker,
-    so excluding all of them is right; stale_after_sync and
-    duplicate_canonical_merge_v1 DO set suppressed_at and were already out.
+    Scope note on the field itself: `suppression_reason` is written by many more
+    writers than step-5 alone — step5_duplicate_store_connection,
+    step5_same_merchant_same_url_dup, step5_campaign_clone_dup,
+    cross_merchant_redundant_external_seed, step5_orphan_seed_mirror, the d2_*
+    identity-resolution reasons and external_brand_crawl_dup_listing, plus the
+    operator-run cohorts that have no producer in this repo at all
+    (demo_retired_2026_07, step5_test_rig_retirement,
+    source_currency_or_channel_defect, wrong_brand_namesake_wave3_20260718, …).
+    Every one is a dedupe/retirement marker, so excluding all of them is right.
+    What has changed is the CLAIM this list used to carry — that they set the
+    label without the timestamp. They no longer do, in either direction: prod
+    2026-08-08 holds 13 distinct reasons over 3,656 rows, ZERO reason-only and
+    ZERO timestamp-only. Three of the seven repo-writer reasons named above
+    (step5_duplicate_store_connection, step5_orphan_seed_mirror,
+    external_brand_crawl_dup_listing) have no rows in prod at all, so read the
+    list as provenance for the rule, never as a live inventory.
     """
     cp = catalog_products if cp is None else cp
     return cp.c.suppression_reason.is_(None)

@@ -280,25 +280,69 @@ def _content_depth_column():
 def _tombstoned_column():
     """Boolean: has the row layer RETIRED this row, while it still serves?
 
-    ``suppression_reason`` set WITHOUT ``suppressed_at`` is a real, populated
-    state — step-5 dedupe, cross-merchant redundancy, brand-namesake retirement
-    and the d2_* identity resolutions all mark a row this way and leave it
-    serving. The consequence is that **tombstoned rows pass every
-    ``suppressed_at IS NULL`` filter in the system**, including this feed's own
-    :func:`~services.canonical_sitemap_candidates.sitemap_candidate_filter`, and
-    are therefore advertised as though nothing had been decided about them.
+    ⚠️ THIS FIELD IS NOW STRUCTURALLY ALWAYS FALSE ON THIS FEED, and that is
+    the fix landing rather than a bug. Read the history before changing it.
+
+    THE STATE IT WAS BUILT FOR. ``suppression_reason`` set WITHOUT
+    ``suppressed_at`` used to be a real, populated state — the step-5 lanes,
+    migration 139's cross-merchant sweep, the brand-namesake retirements and the
+    d2_* identity resolutions all wrote the LABEL and left the GATE column null.
+    ``suppressed_at`` is the column every serving gate reads (this feed's own
+    :func:`~services.canonical_sitemap_candidates.sitemap_candidate_filter`, the
+    IPS lane, recall, the by-key and quote doors), so those rows were tombstoned
+    to ``catalog_trust_policy`` and CLEAN to everything that decides serving, and
+    were advertised as though nothing had been decided about them.
 
     Measured on the live 7,509-URL sitemap, 2026-07-29 — 187 advertised URLs
-    point at a tombstoned row:
+    pointed at such a row:
 
       ``wrong_brand_namesake_wave3_20260718``      135
       ``cross_merchant_redundant_external_seed``    50
       ``step5_campaign_clone_dup``                   2
 
-    The first group is the one that makes this urgent rather than tidy: those
-    rows were retired for carrying the WRONG BRAND, so serving them publishes a
-    PDP with incorrect brand attribution — the single claim an identity-led
-    index cannot get wrong.
+    The first group is what made it urgent rather than tidy: those rows were
+    retired for carrying the WRONG BRAND, so serving them published a PDP with
+    incorrect brand attribution — the single claim an identity-led index cannot
+    get wrong.
+
+    HOW IT WAS CLOSED, and why this column now answers false everywhere:
+
+      * 2026-07-30 — a backfill gave all 2,332 reason-only rows (seven cohorts)
+        a ``suppressed_at``, reconstructed at each cohort's own apply instant.
+      * 2026-08-01 — #1660 (#1648 P1a) taught EVERY suppression writer to set
+        both columns and every revert path to clear both.
+      * ``catalog_invariant_checks`` pins both directions at threshold 0
+        (``suppression_reason_without_timestamp`` /
+        ``suppression_timestamp_without_reason``); prod reports 0 on both.
+
+    ``suppression_reason IS NOT NULL`` now implies ``suppressed_at IS NOT NULL``,
+    which this feed's WHERE clause excludes at ROW grain — so a tombstoned row
+    cannot reach the SELECT list that computes this column.
+
+    RE-MEASURED 2026-08-08 against prod, widen ON: 8,906 feed rows, 8,064 of
+    them advertisable, **0 tombstoned**. Dropping only the ``suppressed_at IS
+    NULL`` conjunct puts 1,189 reason-bearing rows back in the feed and 441 back
+    on the sitemap — i.e. the gate, not a change of cohort, is what closed it.
+
+    NOT THE CONTENT_KEY GRAIN — stated because it is the obvious wrong guess.
+    ``index_pipeline_state`` is keyed on content_key and
+    ``_select_content_key_state`` stores the MAX state across the key's rows, so
+    a key whose retired row has a live sibling stays ``serving_eligible``. That
+    is real (593 of the 8,064 advertised rows share a content_key with a
+    suppressed row; 539 share its exact ``canonical_url``, because same-URL
+    dedupe is the point of lane 2) but it advertises the clean KEEPER, never the
+    retired row — the ``suppressed_at`` conjunct is row-grained and drops the
+    loser regardless of what its key's state says. Measured the same day: 0
+    content_keys are ``serving_eligible`` with every one of their rows
+    suppressed, so the MAX never resurrects a wholly-retired key. Beware the
+    matching artefact: those 539 shared URLs make a sitemap-URL→row join by URL
+    report "advertised URL points at a retired row" for rows that are clean.
+
+    WHY THE FIELD STAYS. It is now the feed-side tripwire for exactly one
+    regression: a new writer that mints the label without the timestamp. Such a
+    row passes the WHERE clause, lands in the feed, and this column says so on
+    the same page the sitemap generator already reads — a second, independent
+    alarm to the invariant check, at the surface where the damage happens.
 
     WHY A FIELD AND NOT A FILTER. The canonical ELECTION already excludes these
     via ``not_tombstoned()``; this feed deliberately does not, because it is a
@@ -784,10 +828,13 @@ async def list_canonical_pdp_signatures(
             # are still a ~510-char shell. Advisory only; see
             # _content_depth_column.
             "content_depth": bool(r["content_depth"]),
-            # Row-layer retirement (suppression_reason set, suppressed_at NULL).
-            # These pass every suppressed_at IS NULL filter and are advertised
-            # as if undecided — 187 live URLs on 2026-07-29, 135 of them retired
-            # for WRONG BRAND attribution. Advisory; see _tombstoned_column.
+            # Row-layer retirement (suppression_reason set). Always false today
+            # and by design: since the 2026-07-30 backfill and #1660, the label
+            # implies suppressed_at, which this query's own WHERE excludes at
+            # row grain. It stays as the feed-side tripwire for a writer that
+            # regresses to label-without-timestamp — the state that advertised
+            # 187 retired URLs on 2026-07-29, 135 of them for WRONG BRAND
+            # attribution. Advisory; see _tombstoned_column for the measurements.
             "tombstoned": bool(r["tombstoned"]),
             "index_eligible": (bool(r["index_eligible"]) if widen_sitemap else False),
             "blocker_code": r["blocker_code"],
