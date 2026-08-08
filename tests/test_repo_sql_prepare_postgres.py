@@ -6,11 +6,15 @@ over every `database.<method>("...")` call site in the repo, asking Postgres to
 PREPARE each one. The two are complementary and neither subsumes the other —
 
     driven   sees `.format()`/f-string SQL, but only where a test drives it;
-    static   sees every literal call site, but only literal ones.
+    static   sees every literal call site it can FOLLOW.
 
-1,479 of this repo's ~3,200 `database.*` calls build their SQL dynamically and
-are invisible to a static sweep. That is a real limit, stated here rather than
-left to be inferred from a green run.
+Be precise about that second one, because "static sweep" oversells it. Of ~3,300
+`database.*` call sites in the swept directories this collector resolves ~1,960:
+literals, module-level constants, loop-over-literals, and lambda bodies. It does
+NOT follow a literal assigned to a function-local first (~300 sites) or passed by
+keyword (~5), and it cannot see f-strings or `.format()` at all (~825). Those are
+not "dynamic SQL" — most are perfectly static strings this collector simply
+cannot trace. Stated here rather than left to be inferred from a green run.
 
 WHY IT PAYS. The first sweep found NINE statements that cannot be planned, all
 in code shipped since May 2026 and all fixed in the commit that adds this file:
@@ -18,8 +22,16 @@ three in the `catalog_sync_service` tombstone prune (#1703's own defect, in a
 live sync path), one in `pdp_matcher`, two `products_cache` backfills, one in
 `subject_resolve`, one in `commerce_attribution_service`, and a `jsonb`-into-
 `json` COALESCE in `routes/buyer_api.py` that sits inside `except Exception:
-pass` — a silent no-op since #281 rather than a visible 500. That is the #1588
-story again: the repo's tests run on SQLite, and SQLite cannot see any of it.
+pass`. That is the #1588 story again: the repo's tests run on SQLite, and SQLite
+cannot see any of it.
+
+AND THE LIMIT THIS GATE CANNOT CROSS, learned by tripping over it. PREPARE is
+Parse+Describe: it validates TYPES, never VALUES. Three of those nine statements
+were still dead after being made plannable — they had moved from failing at Parse
+to failing at Bind (a `Decimal` bound to a param the CASE typed `integer`; a raw
+`dict` bound to a `json` column through raw SQL, where no SQLAlchemy bind
+processor runs). A green run here means "Postgres would plan this", not "this
+works". The driven gate can see bind-time failures; this one structurally cannot.
 
 THE FIXTURE IS THE WHOLE BALLGAME. PREPARE resolves names against a real schema,
 so what this gate can see is bounded by what the schema has. Each layer bought
@@ -28,7 +40,12 @@ real coverage, of 1,954 collected statements:
     metadata.create_all only .................  751 planned
     + db/migrations/*.sql .................... 1,518 planned
     + main.py's startup DDL .................. 1,790 planned
-    + create_all isolated from `public` ...... 1,826 planned,  128 unchecked
+    + isolated from `public` ................. 1,826 planned
+    + private database, UTF8 client ......... 1,835 planned,  122 unchecked
+
+Note what "planned" does and does not prove: ~380 of these are utility statements
+(CREATE/ALTER/DROP), for which Postgres does no name or type analysis at Parse.
+They always plan. The number that carries weight is the ~1,450 DML statements.
 
 The 3 `stale_catalog_*` stubs matter for the same reason — they are TEMP tables
 the sync prune creates at runtime, and without them three genuinely-broken
@@ -37,13 +54,12 @@ get written off as a fixture gap. A fixture hole does not just lose coverage, it
 MASKS defects, which is why the unchecked count is pinned below rather than
 merely reported.
 
-🚨 THIS GATE DOES NOT SHARE THE PUBLIC SCHEMA. It builds a private schema and
-drops it. That is not a style preference: applying 220 migrations to the database
-every other `test_*_postgres.py` file shares is exactly the blast radius the
-warning in tests/test_canonical_feed_tombstoned_flag_postgres.py describes, one
-order of magnitude up. The sibling gates keep `metadata.create_all` + DELETE on
-`public`; this one never touches it. Precedent for the private-schema shape:
-tests/test_pdp_scope_backfill_postgres.py.
+🚨 THIS GATE DOES NOT SHARE A DATABASE AT ALL. It creates one, builds the schema
+in it, and drops it. Applying 220 migrations — 118 of which ALTER or UPDATE — to
+the database every other `test_*_postgres.py` file shares is exactly the blast
+radius the warning in tests/test_canonical_feed_tombstoned_flag_postgres.py
+describes, an order of magnitude up. A private SCHEMA was tried first and is not
+sufficient in either direction; see the comment on `_GATE_DB`.
 """
 
 from __future__ import annotations
@@ -68,7 +84,25 @@ pytestmark = pytest.mark.skipif(
     reason="needs a Postgres DATABASE_URL — production-dialect gate",
 )
 
-_SCHEMA = f"sql_prepare_gate_{os.getpid()}"
+# A separate DATABASE, not a schema in the shared one. A private schema cannot
+# satisfy both halves of what this gate needs:
+#   * keep `public` OFF the search path, or migrations that ALTER/UPDATE a table
+#     absent from the private schema silently hit the SIBLING GATES' copy;
+#   * keep `public` ON it, or the 120 migrations that name `public.x` explicitly
+#     (`to_regclass('public.api_keys')` guards, `'public.x402_transactions'::regclass`)
+#     turn into no-ops and coverage collapses — measured, 1826 planned -> 1429.
+# Both were tried. A separate database gives the migrations the `public` they
+# expect while sharing nothing with the other gate files, and teardown is one
+# DROP DATABASE instead of a schema drop that cannot undo a cross-schema UPDATE.
+_GATE_DB = f"sql_prepare_gate_{os.getpid()}"
+
+
+def _gate_db_url() -> str:
+    """DATABASE_URL with the database name swapped for the private one."""
+    from urllib.parse import urlsplit, urlunsplit
+
+    parts = urlsplit(DATABASE_URL)
+    return urlunsplit(parts._replace(path=f"/{_GATE_DB}"))
 
 # Directories whose SQL reaches production. `tests/` is deliberately absent:
 # test fixtures build their own throwaway schemas and are not production SQL.
@@ -141,8 +175,8 @@ _FIXTURE_GAP = {
 # Small slack on each so unrelated PRs that add or remove a query do not have to
 # touch this file; a real regression moves these by far more.
 _MIN_COLLECTED = 1900
-_MIN_PLANNED = 1790
-_MAX_UNCHECKED = 150
+_MIN_PLANNED = 1800
+_MAX_UNCHECKED = 140
 
 
 # ---------------------------------------------------------------------------
@@ -198,17 +232,24 @@ def _apply_migrations(raw) -> Tuple[int, int]:
 
 @pytest.fixture(scope="module")
 def prepare():
-    """Yield `prepare(sql)` against a private schema holding the real schema.
+    """Yield `prepare(sql)` against a private DATABASE holding the real schema.
 
-    Build order is load-bearing: `metadata.create_all` FIRST, then migrations.
-    Many migrations ALTER tables that `create_all` owns, so the other order
-    loses 52 of them and a third of the coverage.
+    Build order is load-bearing twice over:
+      1. `metadata.create_all` FIRST, then main.py's startup DDL, then the
+         migrations. Many migrations ALTER tables that `create_all` or the
+         startup DDL owns; run them earlier and 52 of them fail, costing a third
+         of the coverage. Startup DDL before migrations for the same reason —
+         migrations 009/057 ALTER `merchant_psps`, which main.py creates.
+      2. Everything happens in a database this fixture created and drops, so the
+         `public` the migrations expect is OURS. Nothing is shared with the
+         other `test_*_postgres.py` files.
     """
     import asyncpg
     import importlib
     import pkgutil
+    import psycopg2
 
-    from sqlalchemy import create_engine, text
+    from sqlalchemy import create_engine
 
     import db  # noqa: F401  (parent package for the loop below)
     for mod in pkgutil.iter_modules([str(REPO_ROOT / "db")]):
@@ -219,64 +260,76 @@ def prepare():
                 pass
     from db.database import metadata
 
-    admin = create_engine(DATABASE_URL, future=True)
-    with admin.begin() as conn:
-        conn.execute(text(f'DROP SCHEMA IF EXISTS "{_SCHEMA}" CASCADE'))
-        conn.execute(text(f'CREATE SCHEMA "{_SCHEMA}"'))
-
-    # `public` stays on the path for extensions (pg_trgm et al), but the private
-    # schema is FIRST, so every table this gate resolves is one it built itself.
-    # create_all runs with the private schema ALONE on the path. With `public`
-    # visible, `checkfirst=True` finds the sibling gates' `catalog_products`
-    # there, skips creating ours, and a later migration's
-    # `CREATE TABLE IF NOT EXISTS` then builds a PARTIAL one — a real bug this
-    # gate hit: `catalog_products` ended up without `suppression_metadata`, so
-    # every statement touching that column silently became a fixture gap. The
-    # shared-database hazard from the other direction.
-    creator = create_engine(
-        DATABASE_URL, future=True,
-        connect_args={"options": f"-csearch_path={_SCHEMA}"},
-    )
-    metadata.create_all(creator, checkfirst=True)
-    creator.dispose()
-
-    import psycopg2
-
-    raw = psycopg2.connect(DATABASE_URL, options=f"-csearch_path={_SCHEMA},public")
-    raw.autocommit = True
+    # CREATE DATABASE cannot run inside a transaction, hence raw + autocommit.
+    admin = psycopg2.connect(DATABASE_URL)
+    admin.autocommit = True
     try:
-        applied, failed = _apply_migrations(raw)
-        for ddl in list(_startup_ddl()) + list(_TEMP_TABLE_DDL):
-            cursor = raw.cursor()
-            try:
-                cursor.execute(ddl)
-            except Exception:  # noqa: BLE001 — costs coverage, cannot cause a false pass
-                pass
-            finally:
-                cursor.close()
-    finally:
-        raw.close()
-    print(f"\n[sql-prepare-gate] schema={_SCHEMA} migrations applied={applied} failed={failed}")
-
-    loop = asyncio.new_event_loop()
-    pg = loop.run_until_complete(
-        asyncpg.connect(
-            DATABASE_URL.replace("+asyncpg", ""),
-            server_settings={"search_path": f"{_SCHEMA},public"},
+        with admin.cursor() as cur:
+            cur.execute(f'DROP DATABASE IF EXISTS "{_GATE_DB}"')
+            cur.execute(f'CREATE DATABASE "{_GATE_DB}"')
+    except psycopg2.Error as exc:
+        admin.close()
+        pytest.fail(
+            f"could not create the private gate database {_GATE_DB!r}: {exc}. "
+            "This gate needs CREATEDB (the CI postgres service runs as superuser). "
+            "Failing rather than falling back to the shared database, which the "
+            "migrations would mutate under every other test_*_postgres.py file."
         )
-    )
 
-    def _prepare(sql: str) -> None:
-        loop.run_until_complete(pg.prepare(_to_positional(sql)))
-
+    url = _gate_db_url()
     try:
-        yield _prepare
+        engine = create_engine(url, future=True)
+        metadata.create_all(engine, checkfirst=True)
+        engine.dispose()
+
+        raw = psycopg2.connect(url)
+        raw.autocommit = True
+        # Defensive, not load-bearing on a UTF8 database — measured identical
+        # counts with and without it, under both LANG=C and a UTF-8 locale. It
+        # matters when the server database is SQL_ASCII, where libpq derives
+        # client_encoding from the locale and every migration carrying an
+        # em-dash or emoji in a comment dies with "'ascii' codec can't encode
+        # character". One line to not depend on how the cluster was initdb'd.
+        raw.set_client_encoding("UTF8")
+        try:
+            for ddl in list(_startup_ddl()) + list(_TEMP_TABLE_DDL):
+                cursor = raw.cursor()
+                try:
+                    cursor.execute(ddl)
+                except Exception:  # noqa: BLE001 — costs coverage, cannot cause a false pass
+                    pass
+                finally:
+                    cursor.close()
+            applied, failed = _apply_migrations(raw)
+        finally:
+            raw.close()
+        print(f"\n[sql-prepare-gate] db={_GATE_DB} migrations applied={applied} failed={failed}")
+
+        loop = asyncio.new_event_loop()
+        pg = loop.run_until_complete(asyncpg.connect(url.replace("+asyncpg", "")))
+
+        def _prepare(sql: str) -> None:
+            loop.run_until_complete(pg.prepare(_to_positional(sql)))
+
+        try:
+            yield _prepare
+        finally:
+            try:
+                loop.run_until_complete(pg.close())
+            finally:
+                loop.close()
     finally:
-        loop.run_until_complete(pg.close())
-        loop.close()
-        with admin.begin() as conn:
-            conn.execute(text(f'DROP SCHEMA IF EXISTS "{_SCHEMA}" CASCADE'))
-        admin.dispose()
+        # Always, even if setup raised above — a pid-keyed database is never
+        # reclaimed by a later run, and DATABASE_URL may point at a shared dev
+        # server, not only at CI's disposable container.
+        try:
+            with admin.cursor() as cur:
+                cur.execute(
+                    "SELECT pg_terminate_backend(pid) FROM pg_stat_activity "
+                    "WHERE datname = %s AND pid <> pg_backend_pid()", (_GATE_DB,))
+                cur.execute(f'DROP DATABASE IF EXISTS "{_GATE_DB}"')
+        finally:
+            admin.close()
 
 
 # ---------------------------------------------------------------------------
@@ -373,10 +426,18 @@ def _non_postgres_nodes(tree: ast.AST) -> set:
 
 
 def _scopes(tree: ast.AST):
-    """The module, then every function body, each as its own name scope."""
+    """The module, then every function body, each as its own name scope.
+
+    Lambdas count. `_own_nodes` stops at one (it is a nested scope), so without
+    this the repo's `_with_asyncpg_busy_retry("...", lambda: database.execute(...))`
+    idiom is descended into by NOTHING — three production statements in
+    routes/agent_payment_sdk.py and services/acp_offsession_payment.py, including
+    an INSERT into `payments`, were invisible and uncounted. Indistinguishable
+    from clean, which is the failure mode this whole file is against.
+    """
     yield tree
     for node in ast.walk(tree):
-        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.Lambda)):
             yield node
 
 

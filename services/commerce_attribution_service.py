@@ -564,8 +564,13 @@ SET
     ELSE :amount_cents
   END,
   refunded_amount = COALESCE(refunded_amount, 0) + CASE
-    WHEN COALESCE(refund_ids, '[]'::jsonb) ? CAST(:refund_id AS text) THEN 0
-    ELSE :amount_decimal
+    -- CAST is load-bearing twice over: a CASE takes its type from its own
+    -- branches, so `THEN 0` (integer) would otherwise deduce :amount_decimal as
+    -- integer — the enclosing numeric addition gets no say. The Decimal bind
+    -- then raises DataError at encode time, AFTER a clean PREPARE, which is
+    -- precisely what a prepare-only gate cannot see.
+    WHEN COALESCE(refund_ids, '[]'::jsonb) ? CAST(:refund_id AS text) THEN 0::numeric
+    ELSE CAST(:amount_decimal AS numeric)
   END,
   refunded_at = COALESCE(refunded_at, :now),
   latest_refund_at = :now,

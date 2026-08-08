@@ -68,7 +68,10 @@ async def _run(
 
                 update_params: Dict[str, Any] = {
                     "id": row["id"],
-                    "product_data": hydrated_payload,
+                    # json.dumps, not the dict: a raw-SQL bind carries no
+                    # SQLAlchemy type, so asyncpg gets a dict where the json
+                    # codec wants str and raises DataError at encode time.
+                    "product_data": json.dumps(hydrated_payload),
                 }
                 if ttl_seconds is not None:
                     update_params["ttl_seconds"] = int(ttl_seconds)

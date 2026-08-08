@@ -100,6 +100,14 @@ on:
       - "core/**"
       - "db/migrations/**"
       - "tests/test_*_postgres.py"
+      # The two files that can neuter this ENTIRE job, neither matched above.
+      # tests/conftest.py pins DATABASE_URL — today conditionally, but making
+      # that unconditional turns every gate file's `pytestmark` into a skip,
+      # which is verbatim THE ONE GOTCHA in the header. pytest.ini supplies
+      # `asyncio_mode = auto`, which the ride-along suites depend on. A PR
+      # touching only those files would not run the job it just disarmed.
+      - "tests/conftest.py"
+      - "pytest.ini"
       # The compile-shape ride-along is not matched by the glob above, so it
       # needs its own entry or a change to it would not run its own gate.
       - "tests/test_pdp_renderability.py"
