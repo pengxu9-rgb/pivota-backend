@@ -2,8 +2,28 @@
 Standard Error Codes Definition
 Provides consistent error codes and messages across the API
 """
+import os
 from enum import Enum
 from typing import NamedTuple, Optional, Dict, Any
+
+
+# docs.pivota.cc has no DNS (audited 2026-08-08): every per-code
+# `https://docs.pivota.cc/errors/{CODE}` link this module emitted was dead, and
+# it ships in EVERY error body — the first thing an integrating agent developer
+# follows is a URL that does not resolve. Default to the API's own live Swagger
+# page and do NOT fabricate a per-code path onto it (a link that 404s at a live
+# host is the same defect at a different layer). When a real error-docs site
+# stands up, set ERROR_DOCS_BASE_URL (e.g. "https://docs.pivota.cc/errors") and
+# per-code links come back without a code change.
+_DEFAULT_ERROR_DOCS_URL = "https://api.pivota.cc/docs"
+
+
+def error_documentation_url(code: str) -> str:
+    """Documentation URL for an error code — per-code only under an explicit base."""
+    base = (os.getenv("ERROR_DOCS_BASE_URL") or "").strip().rstrip("/")
+    if base:
+        return f"{base}/{code}"
+    return _DEFAULT_ERROR_DOCS_URL
 
 
 class ErrorDefinition(NamedTuple):
@@ -288,7 +308,7 @@ class PivotaAPIError(Exception):
             "code": self.error_code.code,
             "message": self.message,
             "details": self.details,
-            "documentation_url": f"https://docs.pivota.cc/errors/{self.error_code.code}"
+            "documentation_url": error_documentation_url(self.error_code.code)
         }
 
 
@@ -318,7 +338,7 @@ def create_error_response(
             "code": error_code.code,
             "message": message or error_code.default_message,
             "details": details or {},
-            "documentation_url": f"https://docs.pivota.cc/errors/{error_code.code}"
+            "documentation_url": error_documentation_url(error_code.code)
         },
         "metadata": {
             "timestamp": datetime.utcnow().isoformat() + "Z",

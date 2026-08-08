@@ -166,8 +166,11 @@ class TestErrorHandlerMiddleware:
         assert response.status_code == 200
         assert response.json() == {"message": "Success"}
     
-    def test_pivota_api_error_handling(self, client):
+    def test_pivota_api_error_handling(self, client, monkeypatch):
         """Test PivotaAPIError is properly formatted"""
+        # Environment-proof: an exported ERROR_DOCS_BASE_URL would change the
+        # documentation_url this test pins.
+        monkeypatch.delenv("ERROR_DOCS_BASE_URL", raising=False)
         response = client.get("/test/pivota-error")
         
         assert response.status_code == 404
@@ -183,7 +186,8 @@ class TestErrorHandlerMiddleware:
         assert error["code"] == "PRODUCT_NOT_FOUND"
         assert error["message"] == "Product with ID 'test-123' not found"
         assert error["details"]["product_id"] == "test-123"
-        assert error["documentation_url"] == "https://docs.pivota.cc/errors/PRODUCT_NOT_FOUND"
+        # Live default (docs.pivota.cc has no DNS; no fabricated per-code path).
+        assert error["documentation_url"] == "https://api.pivota.cc/docs"
         
         # Check metadata
         assert "timestamp" in data["metadata"]
@@ -299,3 +303,25 @@ class TestErrorResponseConsistency:
             response = client.get(endpoint) if endpoint != "/test/payment-failed" else client.post(endpoint)
             assert response.status_code == expected_status
             self.verify_error_structure(response.json())
+
+
+class TestErrorDocumentationUrl:
+    """documentation_url must never point at a dead host (docs.pivota.cc has no
+    DNS — audited 2026-08-08). Default is the live Swagger page with NO
+    fabricated per-code path; per-code links return only under an explicit
+    ERROR_DOCS_BASE_URL."""
+
+    def test_default_is_live_docs_page_without_per_code_path(self, monkeypatch):
+        from utils.error_codes import error_documentation_url
+
+        monkeypatch.delenv("ERROR_DOCS_BASE_URL", raising=False)
+        assert error_documentation_url("PRODUCT_NOT_FOUND") == "https://api.pivota.cc/docs"
+
+    def test_explicit_base_restores_per_code_links(self, monkeypatch):
+        from utils.error_codes import error_documentation_url
+
+        monkeypatch.setenv("ERROR_DOCS_BASE_URL", "https://docs.pivota.cc/errors/")
+        assert (
+            error_documentation_url("PRODUCT_NOT_FOUND")
+            == "https://docs.pivota.cc/errors/PRODUCT_NOT_FOUND"
+        )

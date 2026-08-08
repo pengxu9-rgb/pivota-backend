@@ -28,7 +28,7 @@ class ErrorHandlerMiddleware(BaseHTTPMiddleware):
             "code": "ERROR_CODE",
             "message": "Human-readable error message",
             "details": { ... },
-            "documentation_url": "https://docs.pivota.cc/errors/ERROR_CODE"
+            "documentation_url": "https://api.pivota.cc/docs"  # per-code under ERROR_DOCS_BASE_URL
         },
         "metadata": {
             "timestamp": "2025-11-21T10:00:00Z",
