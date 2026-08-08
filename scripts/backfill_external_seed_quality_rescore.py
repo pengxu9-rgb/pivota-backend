@@ -72,6 +72,7 @@ if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
 from db.database import database
+from utils.database_readiness import connect_database_with_timeout
 from services.catalog_row_trust_upserter import upsert_catalog_row_trust_many
 from services.external_seed_servability import (
     build_servable_quality_payload,
@@ -225,7 +226,7 @@ async def _reset_connection() -> bool:
         except Exception:  # noqa: BLE001 — best-effort teardown, never raise
             pass
     try:
-        await asyncio.wait_for(database.connect(), timeout=_CONNECT_TIMEOUT_S)
+        await connect_database_with_timeout(_CONNECT_TIMEOUT_S, db=database)
         return True
     except Exception as exc:  # noqa: BLE001
         print(f"  RECONNECT FAILED: {type(exc).__name__}: {str(exc)[:80]}", flush=True)
