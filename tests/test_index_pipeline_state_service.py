@@ -897,6 +897,21 @@ async def test_recompute_pings_indexnow_prior_sig_on_takedown(monkeypatch) -> No
         eligible_pings = list(pinged)
         # Newly eligible -> the existing false->true ping fired.
         assert len(eligible_pings) == 1
+        advertised_sig = await database.fetch_val(
+            "SELECT pivota_signature_id FROM index_pipeline_state WHERE content_key = :ck",
+            {"ck": ids["content_key"]},
+        )
+        assert str(advertised_sig).startswith("sig_")
+
+        # Make the row's CURRENT sig differ from the advertised one, so pinging
+        # the new classification would name a URL that was never public. This is
+        # the real prod shape: IPS is content_key-grained and stores the MAX-rank
+        # row's sig, so a takedown can change which sig the row reports.
+        await database.execute(
+            "UPDATE catalog_products SET pivota_signature_id = :sig "
+            "WHERE content_key = :ck",
+            {"sig": "sig_" + ("b" * 32), "ck": ids["content_key"]},
+        )
 
         # Editorial takedown, the raw-SQL sweep shape.
         await database.execute(
@@ -906,10 +921,13 @@ async def test_recompute_pings_indexnow_prior_sig_on_takedown(monkeypatch) -> No
         assert await svc.recompute_serving_eligibility(ids["content_key"]) is False
 
         assert len(pinged) == 2
-        # Same URL both directions: the advertised page is what must be
-        # re-crawled so the 404/410 is observed and the entry dropped.
+        # THE POINT: the removal ping must name the sig that was ADVERTISED, not
+        # whatever sig the post-takedown reclassification reports. Rewrite the
+        # stored sig before the demotion so the two genuinely differ — with a
+        # single-sig fixture this assertion passes even for a naive
+        # implementation that pinged new_state["pivota_signature_id"].
         assert pinged[1] == eligible_pings[0]
-        assert "/products/sig_" in pinged[1]
+        assert advertised_sig in pinged[1]
     finally:
         await _cleanup()
         await _disconnect_if_needed(was_connected)

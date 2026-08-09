@@ -73,6 +73,39 @@ from services.pdp_renderability import (
 )
 from utils.logger import logger
 
+# ── 410 Gone: which suppressions are TERMINAL ────────────────────────────────
+# 410 asserts "this will never come back". Most of the suppression vocabulary
+# does NOT mean that, and answering 410 for those rows would be both false and
+# destructive:
+#
+#   * DEDUPE LOSERS (step5_*, cross_merchant_redundant_external_seed,
+#     external_brand_crawl_dup_listing, the d2_* identity resolutions,
+#     merge_duplicate_canonicals_loser) — the product still EXISTS, at the
+#     keeper's URL. 410 would destroy the consolidation signal the surviving
+#     canonical needs; a plain 404 (or eventually a 301 to the elected winner)
+#     is the correct answer.
+#   * REVERSIBLE CONTAINMENT (source_currency_or_channel_defect, and
+#     external_brand_crawl_unpublished — whose own runner documents
+#     "Reversible: no hard deletes, --revert restores both halves", with 102 of
+#     272 candidates measured serving live product pages) — a measure designed
+#     to be lifted must never be published as permanent.
+#
+# So this is an explicit ALLOWLIST and every unknown reason falls through to
+# 404. A newly-minted suppression reason therefore defaults to the safe answer,
+# and making one terminal is a deliberate one-line decision, not an accident.
+_TERMINAL_SUPPRESSION_REASONS = frozenset({
+    "demo_retired_2026_07",
+    "wrong_brand_namesake_wave3_20260718",
+    "step5_test_rig_retirement",
+    "url_audit_stub_retired_20260729",
+})
+
+
+def _is_terminal_suppression(reason: Any) -> bool:
+    """True only for suppressions that will never be reverted (410-eligible)."""
+    return str(reason or "").strip() in _TERMINAL_SUPPRESSION_REASONS
+
+
 router = APIRouter(
     prefix="/api/canonical",
     tags=["canonical-pdp"],
@@ -669,14 +702,13 @@ async def get_canonical_pdp_by_signature(sig_id: str) -> Dict[str, Any]:
             ),
             "product_by_signature_retired_probe",
         )
-        if retired:
+        if retired and _is_terminal_suppression(retired["suppression_reason"]):
             raise HTTPException(
                 status_code=status.HTTP_410_GONE,
                 detail={
                     "message": "This product was retired and will not return",
                     "sig_id": sig,
                     "retired": True,
-                    "suppression_reason": retired["suppression_reason"],
                 },
             )
         raise HTTPException(

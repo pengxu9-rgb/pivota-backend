@@ -281,6 +281,20 @@ def env(monkeypatch: pytest.MonkeyPatch):
         # demo_retired sweep): withdrawn from serving — excluded from the
         # list AND 404 on the resolver even though serving_eligible is TRUE.
         _row("supp", suppressed_at=datetime(2026, 7, 1, tzinfo=timezone.utc)),
+        # Suppressed under a TERMINAL reason — the only class that earns 410.
+        _row(
+            "gone",
+            suppressed_at=datetime(2026, 7, 1, tzinfo=timezone.utc),
+            suppression_reason="wrong_brand_namesake_wave3_20260718",
+        ),
+        # Suppressed as a DEDUPE loser: the product still exists at the keeper's
+        # URL, so 410 would be false AND would destroy the keeper's
+        # consolidation signal. Must stay 404.
+        _row(
+            "dedup",
+            suppressed_at=datetime(2026, 7, 1, tzinfo=timezone.utc),
+            suppression_reason="step5_campaign_clone_dup",
+        ),
     ]
     monkeypatch.setattr(pcr, "database", FakeDb(rows))
 
@@ -517,14 +531,29 @@ def test_suppressed_row_excluded_from_list_and_resolver(env):
     body = client.get("/api/canonical/products").json()
     assert "sig_supp" not in [i["sig_id"] for i in body["items"]]
     assert body["total"] == 3  # suppressed row does not count as advertised
-    # RETIRED, not unknown: a deliberately taken-down sig answers 410 Gone with
-    # the retirement disclosed, so crawlers drop the URL for good instead of
-    # re-trying a bare 404 forever (Search Console churn).
+    # A suppression with no terminal reason is NOT a permanent retirement.
     res = client.get("/api/canonical/products/sig_supp")
+    assert res.status_code == 404
+
+
+def test_terminally_retired_sig_answers_410_gone(env):
+    # RETIRED FOR GOOD: crawlers should drop the URL rather than re-try a bare
+    # 404 forever (the Search Console churn this exists to stop).
+    client = env
+    res = client.get("/api/canonical/products/sig_gone")
     assert res.status_code == 410
     detail = res.json()["detail"]
     assert detail["retired"] is True
-    assert detail["sig_id"] == "sig_supp"
+    assert detail["sig_id"] == "sig_gone"
+    # Internal taxonomy is NOT published on this unauthenticated route.
+    assert "suppression_reason" not in detail
+
+
+def test_dedupe_loser_is_404_not_410(env):
+    # The product still exists at the keeper's URL. 410 would be factually
+    # wrong and would tell engines to drop equity the keeper needs.
+    client = env
+    assert client.get("/api/canonical/products/sig_dedup").status_code == 404
 
 
 def test_unknown_sig_stays_an_honest_404(env):
@@ -533,6 +562,18 @@ def test_unknown_sig_stays_an_honest_404(env):
     client = env
     res = client.get("/api/canonical/products/sig_0000000000000000000000000000dead")
     assert res.status_code == 404
+
+
+def test_unknown_suppression_reasons_default_to_404(env):
+    # Fail-safe: an allowlist means a newly-minted reason gets the safe answer
+    # until someone deliberately classifies it as terminal.
+    from routes.pivota_canonical_routes import _is_terminal_suppression
+
+    assert _is_terminal_suppression("some_new_reason_nobody_classified") is False
+    assert _is_terminal_suppression(None) is False
+    assert _is_terminal_suppression("source_currency_or_channel_defect") is False
+    assert _is_terminal_suppression("external_brand_crawl_unpublished") is False
+    assert _is_terminal_suppression("wrong_brand_namesake_wave3_20260718") is True
 
 
 def test_list_canonical_pdps_last_modified_uses_content_changed_at(env):

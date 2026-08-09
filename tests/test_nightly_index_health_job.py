@@ -764,3 +764,138 @@ def test_regression_blocker_update_also_clears_index_eligible():
     """M6 lifecycle: a regressed-domain product must lose index_eligible too."""
     assert "index_eligible   = FALSE" in _REGRESSION_BLOCKER_UPDATE
     assert "serving_eligible = FALSE" in _REGRESSION_BLOCKER_UPDATE
+
+
+class TestIndexNowTransitionDiff:
+    """The snapshot-diff is what makes the nightly job's OWN demotions visible.
+
+    Three of this job's four demotion paths (_STALE_INVALIDATION_UPDATE,
+    _ORPHAN_DELETE, _REGRESSION_BLOCKER_UPDATE) are raw SQL that never passes
+    through the batch upsert, and _BATCH_QUERY filters sync_status='live' so an
+    archived row never enters batch_states at all. A per-batch tally therefore
+    produced ZERO removal pings for the archived-product case this feature
+    exists for. Diffing whole-table snapshots covers every path by construction.
+    """
+
+    @staticmethod
+    def _snap(**rows):
+        return {
+            ck: {"serving_eligible": eligible, "pivota_signature_id": sig}
+            for ck, (eligible, sig) in rows.items()
+        }
+
+    @pytest.mark.asyncio
+    async def test_diff_pings_removals_for_every_demotion_shape(self, monkeypatch) -> None:
+        import jobs.nightly_index_health_job as job
+
+        before = self._snap(
+            ck_demoted=(True, "sig_demoted"),      # stale-invalidation / regression blocker
+            ck_deleted=(True, "sig_deleted"),      # _ORPHAN_DELETE (row gone entirely)
+            ck_promoted=(False, "sig_promoted"),   # newly eligible
+            ck_steady=(True, "sig_steady"),        # unchanged — must not ping
+        )
+        after = self._snap(
+            ck_demoted=(False, "sig_demoted"),
+            ck_promoted=(True, "sig_promoted"),
+            ck_steady=(True, "sig_steady"),
+        )
+        monkeypatch.setattr(job, "_snapshot_serving_eligibility", _fake_snapshot(after))
+        submitted = []
+        monkeypatch.setattr(
+            "services.indexnow.submit_urls", _fake_submit(submitted), raising=False
+        )
+
+        summary: dict = {}
+        await job._submit_indexnow_transitions(before, summary)
+
+        assert summary["indexnow_removed"] == 2  # demoted + deleted
+        assert summary["indexnow_added"] == 1
+        urls = submitted[0]
+        # REMOVALS FIRST: the 10k protocol cap must never drop a dead URL in
+        # favour of a live one.
+        assert "sig_demoted" in urls[0] or "sig_deleted" in urls[0]
+        assert "sig_demoted" in urls[1] or "sig_deleted" in urls[1]
+        assert "sig_promoted" in urls[2]
+        assert not any("sig_steady" in u for u in urls)
+
+    @pytest.mark.asyncio
+    async def test_removals_survive_the_10k_cap(self, monkeypatch) -> None:
+        import jobs.nightly_index_health_job as job
+
+        before = self._snap(
+            **{f"ck_add{i}": (False, f"sig_add{i}") for i in range(9_999)},
+            **{f"ck_rm{i}": (True, f"sig_rm{i}") for i in range(5)},
+        )
+        after = self._snap(**{f"ck_add{i}": (True, f"sig_add{i}") for i in range(9_999)})
+        monkeypatch.setattr(job, "_snapshot_serving_eligibility", _fake_snapshot(after))
+        submitted = []
+        monkeypatch.setattr(
+            "services.indexnow.submit_urls", _fake_submit(submitted), raising=False
+        )
+
+        await job._submit_indexnow_transitions(before, {})
+
+        urls = submitted[0]
+        assert len(urls) == 10_000
+        # All five removals present despite the cap.
+        assert sum(1 for u in urls if "sig_rm" in u) == 5
+
+    @pytest.mark.asyncio
+    async def test_snapshot_failure_disables_pings_without_breaking_the_job(
+        self, monkeypatch
+    ) -> None:
+        import jobs.nightly_index_health_job as job
+
+        submitted = []
+        monkeypatch.setattr(
+            "services.indexnow.submit_urls", _fake_submit(submitted), raising=False
+        )
+
+        # Pre-run snapshot unavailable (DB hiccup): silence, never a crash, and
+        # never a batch of spurious "please crawl" pings.
+        summary: dict = {}
+        await job._submit_indexnow_transitions(None, summary)
+        assert summary == {
+            "indexnow_added": 0,
+            "indexnow_removed": 0,
+            "indexnow_skipped": "snapshot_unavailable",
+        }
+
+        # Post-run snapshot unavailable: same.
+        monkeypatch.setattr(job, "_snapshot_serving_eligibility", _fake_snapshot(None))
+        summary2: dict = {}
+        await job._submit_indexnow_transitions({}, summary2)
+        assert summary2["indexnow_skipped"] == "post_snapshot_unavailable"
+        assert not submitted
+
+    @pytest.mark.asyncio
+    async def test_sigless_rows_are_never_pinged(self, monkeypatch) -> None:
+        import jobs.nightly_index_health_job as job
+
+        before = self._snap(ck_a=(True, ""), ck_b=(False, "ck_not_a_sig"))
+        after = self._snap(ck_a=(False, ""), ck_b=(True, "ck_not_a_sig"))
+        monkeypatch.setattr(job, "_snapshot_serving_eligibility", _fake_snapshot(after))
+        submitted = []
+        monkeypatch.setattr(
+            "services.indexnow.submit_urls", _fake_submit(submitted), raising=False
+        )
+
+        summary: dict = {}
+        await job._submit_indexnow_transitions(before, summary)
+
+        assert summary["indexnow_added"] == 0
+        assert summary["indexnow_removed"] == 0
+        assert not submitted
+
+
+def _fake_snapshot(value):
+    async def _snap():
+        return value
+    return _snap
+
+
+def _fake_submit(sink):
+    async def _submit(urls):
+        sink.append(list(urls))
+        return True
+    return _submit
