@@ -1,0 +1,90 @@
+name: ADR-009 Rekey Flip
+
+# On-demand execution channel for the A9-4 seller-of-record flip
+# (scripts/backfill_seller_of_record.py). Exists as a workflow for the same
+# reason as adr009-rekey-verify.yml: GitHub's runners reach the database
+# reliably while the Railway public proxy and ssh edge degrade for hours at
+# a time (2026-08-07/08 — a founder-run canary session died at the ssh
+# handshake, and three follow-up probes never connected).
+#
+# DRY-RUN unless the `execute` input is explicitly true. Every batch is a
+# single transaction with in-transaction parity assertions, and progress
+# checkpoints in a9_4_backfill_checkpoint — a run killed mid-flight loses at
+# most the in-progress batch and resumes where it stopped. After ANY execute
+# run, dispatch adr009-rekey-verify.yml for the independent verdict; the
+# tool never grades its own writes.
+
+on:
+  workflow_dispatch:
+    inputs:
+      execute:
+        description: "Perform writes (false = read-only dry-run)"
+        type: boolean
+        default: false
+      batch_size:
+        description: "Products per catalog batch"
+        default: "200"
+      max_batches:
+        description: "Stop after N batches (0 = run to completion)"
+        default: "5"
+      phases:
+        description: "Comma-separated phases"
+        default: "catalog"
+
+# One flip at a time; a second dispatch queues instead of interleaving writes.
+concurrency:
+  group: adr009-rekey-flip
+  cancel-in-progress: false
+
+jobs:
+  rekey-flip:
+    runs-on: ubuntu-latest
+    timeout-minutes: 300
+    env:
+      DATABASE_URL: ${{ secrets.DATABASE_URL }}
+      DB_POOL_MIN_SIZE: "1"
+      DB_POOL_MAX_SIZE: "2"
+      PYTHONDONTWRITEBYTECODE: "1"
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: "pip"
+
+      - name: Install deps
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Run flip
+        run: |
+          ARGS="--phases ${{ inputs.phases }} --batch-size ${{ inputs.batch_size }} --report a9_4_flip_report.json"
+          if [ "${{ inputs.max_batches }}" != "0" ]; then
+            ARGS="$ARGS --max-batches ${{ inputs.max_batches }}"
+          fi
+          if [ "${{ inputs.execute }}" = "true" ]; then
+            echo "::warning::EXECUTE run — production writes"
+            ARGS="$ARGS --execute"
+          fi
+          python -m scripts.backfill_seller_of_record $ARGS
+
+      - name: Show report
+        if: always()
+        run: |
+          if [ -f a9_4_flip_report.json ]; then
+            cat a9_4_flip_report.json
+          else
+            echo "no report written (run died before reporting)"
+          fi
+
+      - name: Upload report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: a9-4-flip-report-${{ github.run_id }}
+          path: a9_4_flip_report.json
+          if-no-files-found: ignore
