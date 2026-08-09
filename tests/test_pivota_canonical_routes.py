@@ -218,6 +218,10 @@ def _row(sig_suffix: str, **overrides) -> Dict[str, Any]:
         # tests that need the tombstoned shape override it to model the
         # label-without-timestamp REGRESSION, which is all that can produce it.
         "tombstoned": False,
+        # Permanent-vs-dedupe split of the tombstoned cohort — only this field
+        # may drive an HTTP 410. Fail-closed: derived from the same terminal
+        # allowlist the route uses, so an unclassified reason reads False.
+        "terminally_retired": False,
         "suppressed_at": None,
         "index_eligible": False,
         "blocker_code": None,
@@ -228,6 +232,12 @@ def _row(sig_suffix: str, **overrides) -> Dict[str, Any]:
         "content_changed_at": datetime(2026, 5, 1, tzinfo=timezone.utc),
     }
     base.update(overrides)
+    if "terminally_retired" not in overrides:
+        from routes.pivota_canonical_routes import _is_terminal_suppression
+
+        base["terminally_retired"] = _is_terminal_suppression(
+            base.get("suppression_reason")
+        )
     return base
 
 
@@ -973,3 +983,36 @@ def test_list_canonical_pdps_carries_tombstoned_without_filtering(env, monkeypat
     assert by_sig["sig_def"]["renderable"] is True, (
         "the row must not be filtered out — flagging it is the whole point"
     )
+
+
+def test_feed_publishes_terminally_retired_split_of_the_tombstoned_cohort(env, monkeypatch):
+    """The tombstoned cohort is NOT uniformly permanent.
+
+    Measured 2026-07-29 on the live sitemap: 135 wrong-brand retirements
+    (permanent) mixed with 52 dedupe losers whose product still exists at the
+    keeper's URL. A consumer that answered 410 for the whole cohort would be
+    factually wrong on 28% of it, so the feed publishes the distinction rather
+    than making each consumer re-derive it from a vocabulary it cannot see.
+    """
+    import routes.pivota_canonical_routes as pcr
+
+    rows = list(pcr.database._rows)  # type: ignore[attr-defined]
+    rows[1] = {
+        **rows[1],
+        "renderable": True,
+        "tombstoned": True,
+        "terminally_retired": True,   # wrong-brand wave: never coming back
+    }
+    rows[3] = {
+        **rows[3],
+        "renderable": True,
+        "tombstoned": True,
+        "terminally_retired": False,  # dedupe loser: product lives at the keeper
+    }
+    monkeypatch.setattr(pcr.database, "_rows", rows, raising=False)
+
+    by_sig = {i["sig_id"]: i for i in env.get("/api/canonical/products").json()["items"]}
+    assert by_sig["sig_def"]["tombstoned"] is True
+    assert by_sig["sig_def"]["terminally_retired"] is True
+    assert by_sig["sig_noimg"]["tombstoned"] is True
+    assert by_sig["sig_noimg"]["terminally_retired"] is False

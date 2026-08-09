@@ -436,6 +436,34 @@ def _tombstoned_column():
     ).label("tombstoned")
 
 
+def _terminally_retired_column():
+    """Boolean: is this row's retirement PERMANENT (410-eligible)?
+
+    ``tombstoned`` alone cannot answer that. Measured on the live 7,509-URL
+    sitemap 2026-07-29, the tombstoned cohort is 135 ``wrong_brand_namesake_
+    wave3_20260718`` (a genuine, permanent retirement — serving those publishes
+    incorrect brand attribution) mixed with 52 DEDUPE losers
+    (``cross_merchant_redundant_external_seed`` 50, ``step5_campaign_clone_dup``
+    2) whose product still exists at the keeper's URL.
+
+    A consumer that answered HTTP 410 for the whole cohort would therefore be
+    factually wrong on 28% of it and would destroy the consolidation signal the
+    surviving canonical needs. So the feed publishes the DISTINCTION rather than
+    making every consumer re-derive it from a reason vocabulary it cannot see:
+    this column applies the same ``_TERMINAL_SUPPRESSION_REASONS`` allowlist the
+    by-sig resolver uses for its own 410, so the sitemap generator, the resolver
+    and any future consumer cannot disagree about which URLs are permanently
+    gone.
+
+    Fail-CLOSED (unlike its siblings): unknown or unclassified reasons read
+    false, because the cost of a wrong ``true`` is a permanent, CDN-cached 410
+    on a live product.
+    """
+    return (
+        catalog_products.c.suppression_reason.in_(sorted(_TERMINAL_SUPPRESSION_REASONS))
+    ).label("terminally_retired")
+
+
 def _elected_canonical_sig_note():
     """WHY the feed's `canonical_sig_id` is validated, and where.
 
@@ -837,6 +865,7 @@ async def list_canonical_pdp_signatures(
         _renderable_column(),
         _content_depth_column(),
         _tombstoned_column(),
+        _terminally_retired_column(),
         # Already validated by the JOIN's ON clause below — see the note there.
         content_canonical_election.c.canonical_sig_id,
     ]
@@ -946,6 +975,9 @@ async def list_canonical_pdp_signatures(
             # 187 retired URLs on 2026-07-29, 135 of them for WRONG BRAND
             # attribution. Advisory; see _tombstoned_column for the measurements.
             "tombstoned": bool(r["tombstoned"]),
+            # Permanent-vs-dedupe split for the tombstoned cohort. Only this
+            # field may drive an HTTP 410 — see _terminally_retired_column.
+            "terminally_retired": bool(r["terminally_retired"]),
             "index_eligible": (bool(r["index_eligible"]) if widen_sitemap else False),
             "blocker_code": r["blocker_code"],
             "blocker_detail": r["blocker_detail"],
