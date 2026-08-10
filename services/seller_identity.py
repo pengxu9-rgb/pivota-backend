@@ -404,43 +404,41 @@ async def _anchor_owns_domain(anchor_merchant_id: str, registrable: str) -> bool
       - `merchant_onboarding.mcp_shop_domain` (the tenant's authenticated store);
       - `merchant_stores` connected-store domains (store_url / shop_domain).
     Each candidate is reduced to its eTLD+1 (`etld1`) before comparison, so a
-    www./subdomain/path variant still matches. Best-effort: any DB / missing-table
-    error → False (fall through to CROSS — never guess SELF). ADR-009 D3.
+    www./subdomain/path variant still matches. ADR-009 D3.
+
+    A failed lookup PROPAGATES — it must never read as "not the owner": that
+    answer files the anchor's own domain as CROSS and mints an observed
+    duplicate for a merchant that already exists, which is a wrong
+    seller-of-record, not a degraded one. Per-lookup swallows made all three
+    checks answer CROSS for every caller on a wedged connection (2026-08-09,
+    run 31345305445 — same class as `_resolve_claimed_merchant`). A caller
+    that cannot check ownership must abort, not mint.
     """
     if not anchor_merchant_id or not registrable:
         return False
     # catalog_merchants.source_ref (already a registrable domain for observed rows)
-    try:
-        row = await database.fetch_one(
-            "SELECT source_ref FROM catalog_merchants WHERE merchant_id = :mid",
-            {"mid": anchor_merchant_id},
-        )
-        if row and etld1(dict(row).get("source_ref")) == registrable:
-            return True
-    except Exception as exc:  # noqa: BLE001 — best-effort
-        logger.warning("seller_identity: catalog_merchants source_ref lookup failed: %s", str(exc)[:200])
+    row = await database.fetch_one(
+        "SELECT source_ref FROM catalog_merchants WHERE merchant_id = :mid",
+        {"mid": anchor_merchant_id},
+    )
+    if row and etld1(dict(row).get("source_ref")) == registrable:
+        return True
     # merchant_onboarding.mcp_shop_domain (the authenticated tenant storefront)
-    try:
-        row = await database.fetch_one(
-            "SELECT mcp_shop_domain FROM merchant_onboarding WHERE merchant_id = :mid",
-            {"mid": anchor_merchant_id},
-        )
-        if row and etld1(dict(row).get("mcp_shop_domain")) == registrable:
-            return True
-    except Exception as exc:  # noqa: BLE001 — best-effort
-        logger.warning("seller_identity: merchant_onboarding lookup failed: %s", str(exc)[:200])
+    row = await database.fetch_one(
+        "SELECT mcp_shop_domain FROM merchant_onboarding WHERE merchant_id = :mid",
+        {"mid": anchor_merchant_id},
+    )
+    if row and etld1(dict(row).get("mcp_shop_domain")) == registrable:
+        return True
     # merchant_stores connected-store domains (the `domain` column — verified
     # against services/external_referral_readiness._fetch_store_domains_by_merchant).
-    try:
-        rows = await database.fetch_all(
-            "SELECT domain FROM merchant_stores WHERE merchant_id = :mid AND domain IS NOT NULL",
-            {"mid": anchor_merchant_id},
-        )
-        for r in rows or []:
-            if etld1(dict(r).get("domain")) == registrable:
-                return True
-    except Exception as exc:  # noqa: BLE001 — best-effort (table/column may vary)
-        logger.warning("seller_identity: merchant_stores lookup failed: %s", str(exc)[:200])
+    rows = await database.fetch_all(
+        "SELECT domain FROM merchant_stores WHERE merchant_id = :mid AND domain IS NOT NULL",
+        {"mid": anchor_merchant_id},
+    )
+    for r in rows or []:
+        if etld1(dict(r).get("domain")) == registrable:
+            return True
     return False
 
 
