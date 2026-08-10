@@ -44,6 +44,9 @@ from routes.agent_pdp_v1 import (
     _row_to_dict,
     aggregate_rating_from_row as _aggregate_rating,
 )
+from services.agent_pdp_view_assembler import (
+    normalize_taxonomy_tags as _normalize_taxonomy_tags,
+)
 from services.catalog_sync_service import pivota_canonical_pdp_url
 from services.canonical_sitemap_candidates import electable_sig_exists
 from services.claim_safety import substantiated_claims
@@ -281,7 +284,10 @@ def project_citation_item(row: Dict[str, Any]) -> Dict[str, Any]:
         "description": description,
         "bullet_points": row.get("bullet_points") or [],
         "usage_scenarios": row.get("usage_scenarios") or [],
-        "taxonomy_tags": row.get("taxonomy_tags") or [],
+        # Normalized: historical view rows carry JSON-encoded strings inside
+        # this dict (agents mis-parse "[\"serum\"]" as a string) — see
+        # services.agent_pdp_view_assembler.normalize_taxonomy_tags.
+        "taxonomy_tags": _normalize_taxonomy_tags(row.get("taxonomy_tags")) or [],
         "image_url": row.get("image_url"),
         # Social proof, never fabricated (migration 186: NULL means "no review
         # data on the source page", not "zero stars"). Same {value, count}

@@ -606,3 +606,23 @@ def test_citation_item_aggregate_rating_null_when_uncaptured(client_for):
     ).json()
 
     assert body["aggregate_rating"] is None
+
+
+def test_citation_taxonomy_tags_json_strings_are_repaired(client_for):
+    # Same double-encoding repair as the PDP surface: agents must never receive
+    # a JSON-encoded string where the contract says array.
+    row = _row(
+        taxonomy_tags={
+            "tags": '["haircare", "treatment"]',
+            "use_case_tags": "[]",
+            "category": "Treatment",
+        }
+    )
+    body = client_for(row).get(
+        "/agent/v1/citation/ck_0123456789abcdef0123456789abcdef"
+    ).json()
+
+    tt = body["taxonomy_tags"]
+    assert tt["tags"] == ["haircare", "treatment"]
+    assert tt["use_case_tags"] == []
+    assert tt["category"] == "Treatment"

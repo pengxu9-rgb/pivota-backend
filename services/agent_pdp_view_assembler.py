@@ -552,15 +552,61 @@ def evidence_safe_product_keys(
     return [canon_pk] if canon_pk else []
 
 
+# The list-typed members of taxonomy_tags. Their source columns are JSONB, and
+# depending on driver codec a read can hand them back as JSON *strings* rather
+# than decoded lists. Embedding that string and re-serializing the outer dict is
+# how prod ended up serving `"tags": "[\"serum\"]"` — a JSON string inside
+# JSON, which every agent-side consumer mis-parses (measured 2026-08-10:
+# 33/26/26 string-typed values across a 39-row sample of the live view).
+_TAXONOMY_LIST_KEYS = ("tags", "use_case_tags", "lifestyle_tags")
+
+
+def _parse_jsonish(value: Any) -> Any:
+    """Decode a JSON-encoded-string container; pass everything else through.
+
+    Only strings that LOOK like JSON containers are attempted, and a failed
+    parse returns the original value — a plain scalar tag is never destroyed
+    and nothing is ever invented.
+    """
+    if isinstance(value, str):
+        stripped = value.strip()
+        if stripped[:1] in ("[", "{"):
+            try:
+                return json.loads(stripped)
+            except (ValueError, TypeError):
+                return value
+    return value
+
+
+def normalize_taxonomy_tags(value: Any) -> Any:
+    """Repair double-encoded taxonomy_tags for consumers.
+
+    Read-side twin of the write-side coercion in build_taxonomy_tags: rows
+    assembled before the fix keep the string-encoded shape until the
+    reconciler refreshes them, so every projection must normalize on the way
+    out. Handles the whole-dict-as-string case too. Never raises.
+    """
+    value = _parse_jsonish(value)
+    if not isinstance(value, dict):
+        return value
+    out = dict(value)
+    for key in _TAXONOMY_LIST_KEYS:
+        if key in out:
+            out[key] = _parse_jsonish(out[key])
+    return out
+
+
 def build_taxonomy_tags(canonical: Dict[str, Any]) -> Optional[Dict[str, Any]]:
     fields = {
         "price_tier": canonical.get("price_tier"),
-        "use_case_tags": canonical.get("use_case_tags"),
-        "lifestyle_tags": canonical.get("lifestyle_tags"),
+        # Coerced at WRITE time so freshly assembled rows store real arrays —
+        # see _TAXONOMY_LIST_KEYS for how the string shape got in.
+        "use_case_tags": _parse_jsonish(canonical.get("use_case_tags")),
+        "lifestyle_tags": _parse_jsonish(canonical.get("lifestyle_tags")),
         "demographic": canonical.get("demographic"),
         "product_type": canonical.get("product_type"),
         "category": canonical.get("category"),
-        "tags": canonical.get("tags"),
+        "tags": _parse_jsonish(canonical.get("tags")),
     }
     tags = {k: v for k, v in fields.items() if v not in (None, "", [], {})}
     return tags or None

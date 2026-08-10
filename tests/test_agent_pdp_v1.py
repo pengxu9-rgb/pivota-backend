@@ -893,3 +893,49 @@ def test_get_agent_pdp_aggregate_rating_is_null_when_count_not_positive(monkeypa
     product = _canonical_product(client.get(f"/api/agent/pdp/{CK_A}").json())
 
     assert product["aggregate_rating"] is None
+
+
+def test_taxonomy_tags_json_strings_are_repaired_in_the_response(monkeypatch) -> None:
+    """Prod stores JSON-encoded STRINGS inside the taxonomy_tags dict (measured
+    2026-08-10: 33 of 39 sampled rows) — agents received "[\"serum\"]" as a
+    string and mis-parsed it. The projection must hand out real arrays."""
+    row = _row()
+    row["taxonomy_tags"] = {
+        "tags": '["serum", "brightening"]',
+        "use_case_tags": "[]",
+        "lifestyle_tags": '["vegan"]',
+        "category": "Serum",
+        "price_tier": "under_50",
+    }
+    client, _ = _client(monkeypatch, [row])
+
+    product = _canonical_product(client.get(f"/api/agent/pdp/{CK_A}").json())
+
+    tt = product["taxonomy_tags"]
+    assert tt["tags"] == ["serum", "brightening"]
+    assert tt["use_case_tags"] == []
+    assert tt["lifestyle_tags"] == ["vegan"]
+    # Scalars are untouched.
+    assert tt["category"] == "Serum"
+    assert tt["price_tier"] == "under_50"
+
+
+def test_taxonomy_tags_normalization_never_destroys_values(monkeypatch) -> None:
+    """A non-JSON string survives verbatim, already-correct arrays pass
+    through, and a null column stays null — repaired, never invented."""
+    row = _row()
+    row["taxonomy_tags"] = {
+        "tags": ["already", "a-list"],
+        "use_case_tags": "[not-valid-json",
+        "category": "Serum",
+    }
+    client, _ = _client(monkeypatch, [row])
+
+    tt = _canonical_product(client.get(f"/api/agent/pdp/{CK_A}").json())["taxonomy_tags"]
+    assert tt["tags"] == ["already", "a-list"]
+    assert tt["use_case_tags"] == "[not-valid-json"
+
+    row2 = _row()
+    row2["taxonomy_tags"] = None
+    client2, _ = _client(monkeypatch, [row2])
+    assert _canonical_product(client2.get(f"/api/agent/pdp/{CK_A}").json())["taxonomy_tags"] is None

@@ -312,3 +312,25 @@ def test_tie_break_by_product_key_when_no_primary():
     ]
     out = coalesce_fashion_fields(products, None)
     assert out["material"] == "cotton-A"
+
+
+def test_build_taxonomy_tags_coerces_json_string_lists_at_write_time():
+    """The write-side half of the double-encoding fix: a JSONB column read back
+    as a string must be decoded before assembly, so fresh rows store real
+    arrays and parsed-empty lists are dropped like native empties."""
+    from services.agent_pdp_view_assembler import build_taxonomy_tags
+
+    tags = build_taxonomy_tags(
+        {
+            "tags": '["serum"]',
+            "use_case_tags": "[]",
+            "lifestyle_tags": '["vegan", "cruelty_free"]',
+            "category": "Serum",
+        }
+    )
+
+    assert tags == {
+        "tags": ["serum"],
+        "lifestyle_tags": ["vegan", "cruelty_free"],
+        "category": "Serum",
+    }
