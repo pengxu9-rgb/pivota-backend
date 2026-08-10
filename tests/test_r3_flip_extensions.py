@@ -89,6 +89,28 @@ class _FakeDb:
             async def __aexit__(self_inner, *a): return False
         return _Txn()
 
+    # _retry_after_reset's hard reset; counted so tests can assert it ran.
+    async def disconnect(self):
+        self.resets = getattr(self, "resets", 0) + 1
+
+    async def connect(self):
+        pass
+
+
+@pytest.fixture(autouse=True)
+def _healthy_fragmentation_guard(monkeypatch):
+    """The guard's lookup PROPAGATES failures now. Against the sqlite test
+    fixture the real ILIKE query is a hard error — which the old swallow
+    silently converted to "no collision", so every planning test here ran
+    with the guard disarmed without knowing it. Default to an explicit
+    healthy "no conflict"; the door tests override per-case."""
+    import services.audit_index_intake as aii
+
+    async def _no_conflict(*a, **k):
+        return None
+
+    monkeypatch.setattr(aii, "_existing_brand_canonical_conflict", _no_conflict)
+
 
 def _backfill(db):
     return SellerBackfill(database=db, si_mod=None, execute=False, batch_size=50)
@@ -460,3 +482,116 @@ class TestRepairListings:
         assert report.catalog["listing_repair"]["stale_found"] == 1
         assert report.catalog["listing_repair"]["migrated"] == 0
         assert db.executed == []
+
+
+class TestFailFastDoors:
+    """2026-08-09, run 31345305445: a proxy socket died mid-query, two
+    warn-and-continue guards swallowed it, and the rest of the run planned
+    with its safety checks answering "safe" on a wedged connection. Every
+    door must answer BOTH ways: a working lookup answers the question, a
+    broken lookup ABORTS — never defaults to the permissive answer."""
+
+    @pytest.mark.asyncio
+    async def test_fragmentation_guard_propagates_lookup_failure(self, monkeypatch):
+        import services.audit_index_intake as aii
+
+        async def _dead_socket(*a, **k):
+            raise RuntimeError("connection was closed in the middle of operation")
+
+        monkeypatch.setattr(aii, "_existing_brand_canonical_conflict", _dead_socket)
+        bf = _backfill(_FakeDb())
+        with pytest.raises(RuntimeError, match="closed in the middle"):
+            await bf._fragmentation_collision("merch_obs_aaaa0000aaaa0000", "B", "b.com", ROW)
+
+    @pytest.mark.asyncio
+    async def test_fragmentation_guard_still_answers_when_healthy(self, monkeypatch):
+        # Positive control both ways: conflict -> collision record, none -> None.
+        import services.audit_index_intake as aii
+
+        async def _conflict(*a, **k):
+            return {"merchant_id": "merch_real", "product_key": "pk_other"}
+
+        monkeypatch.setattr(aii, "_existing_brand_canonical_conflict", _conflict)
+        bf = _backfill(_FakeDb())
+        hit = await bf._fragmentation_collision("merch_obs_aaaa0000aaaa0000", "B", "b.com", ROW)
+        assert hit and hit["conflict_merchant_id"] == "merch_real"
+
+        async def _clear(*a, **k):
+            return None
+
+        monkeypatch.setattr(aii, "_existing_brand_canonical_conflict", _clear)
+        assert await bf._fragmentation_collision(
+            "merch_obs_aaaa0000aaaa0000", "B", "b.com", ROW) is None
+
+    @pytest.mark.asyncio
+    async def test_claimed_merchant_lookup_propagates_failure(self, monkeypatch):
+        import services.seller_identity as si
+
+        class _WedgedDb:
+            async def fetch_all(self, *a, **k):
+                raise AssertionError("Connection is already acquired")
+
+        monkeypatch.setattr(si, "database", _WedgedDb())
+        with pytest.raises(AssertionError, match="already acquired"):
+            await si._resolve_claimed_merchant("claimed.com")
+
+    @pytest.mark.asyncio
+    async def test_claimed_merchant_still_answers_when_healthy(self, monkeypatch):
+        import services.seller_identity as si
+
+        class _Db:
+            def __init__(self, rows):
+                self.rows = rows
+
+            async def fetch_all(self, *a, **k):
+                return self.rows
+
+        monkeypatch.setattr(si, "database", _Db(
+            [{"merchant_id": "merch_tenant", "brand_domain": "www.claimed.com"}]))
+        assert await si._resolve_claimed_merchant("claimed.com") == "merch_tenant"
+        monkeypatch.setattr(si, "database", _Db([]))
+        assert await si._resolve_claimed_merchant("claimed.com") is None
+
+
+class TestRetryAfterReset:
+    @pytest.mark.asyncio
+    async def test_flake_gets_one_retry_on_a_fresh_connection(self):
+        db = _FakeDb()
+        bf = _backfill(db)
+        calls = {"n": 0}
+
+        async def flaky():
+            calls["n"] += 1
+            if calls["n"] == 1:
+                raise ConnectionResetError("proxy died mid-operation")
+            return "ok"
+
+        assert await bf._retry_after_reset(flaky, what="unit") == "ok"
+        assert calls["n"] == 2
+        assert db.resets == 1  # disconnect() then connect() between attempts
+
+    @pytest.mark.asyncio
+    async def test_second_failure_propagates_no_third_attempt(self):
+        db = _FakeDb()
+        bf = _backfill(db)
+        calls = {"n": 0}
+
+        async def broken():
+            calls["n"] += 1
+            raise RuntimeError("deterministic defect")
+
+        with pytest.raises(RuntimeError, match="deterministic defect"):
+            await bf._retry_after_reset(broken, what="unit")
+        assert calls["n"] == 2
+        assert db.resets == 1
+
+    @pytest.mark.asyncio
+    async def test_success_never_touches_the_connection(self):
+        db = _FakeDb()
+        bf = _backfill(db)
+
+        async def fine():
+            return 7
+
+        assert await bf._retry_after_reset(fine, what="unit") == 7
+        assert getattr(db, "resets", 0) == 0

@@ -207,26 +207,26 @@ async def _resolve_claimed_merchant(registrable: str) -> Optional[str]:
     domain, the seller-of-record IS that tenant merchant. Return it so we resolve
     to the claimed identity instead of minting a duplicate observed row.
 
-    Best-effort: any DB / missing-table error -> None (fall through to mint). The
-    claim's `brand_domain` is compared on its registrable form so www./subdomain
-    variants still match.
+    A failed lookup PROPAGATES — it must never read as "no verified claim":
+    that answer mints an observed duplicate for a domain a tenant already
+    owns, which is a wrong seller-of-record, not a degraded one (2026-08-09:
+    a wedged connection made this guard answer "no claim" for every row of a
+    flip run until an unguarded query crashed it). A caller that cannot check
+    claims must not mint. The claim's `brand_domain` is compared on its
+    registrable form so www./subdomain variants still match.
     """
     if not registrable:
         return None
-    try:
-        rows = await database.fetch_all(
-            """
-            SELECT merchant_id, brand_domain
-              FROM brand_claims
-             WHERE verification_status = 'verified'
-               AND brand_domain IS NOT NULL
-             ORDER BY verified_at DESC NULLS LAST, created_at DESC
-             LIMIT 200
-            """
-        )
-    except Exception as exc:  # noqa: BLE001 — resolution is best-effort
-        logger.warning("seller_identity: claimed-merchant lookup failed: %s", str(exc)[:200])
-        return None
+    rows = await database.fetch_all(
+        """
+        SELECT merchant_id, brand_domain
+          FROM brand_claims
+         WHERE verification_status = 'verified'
+           AND brand_domain IS NOT NULL
+         ORDER BY verified_at DESC NULLS LAST, created_at DESC
+         LIMIT 200
+        """
+    )
     for row in rows or []:
         data = dict(row)
         if etld1(data.get("brand_domain")) == registrable:
