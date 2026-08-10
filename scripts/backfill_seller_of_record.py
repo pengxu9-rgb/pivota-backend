@@ -762,11 +762,17 @@ class SellerBackfill:
             elif verdict == "collision":
                 stats["review_collision"] += 1
                 collisions.append(payload)
-            else:
+            elif verdict == "planned":
                 sellers_seen.add(payload["observed_id"])
+                # Counted here, not at resolve time: retailer_keyed now means
+                # "retailer rows actually PLANNED" — a retailer row routed to
+                # collision review no longer inflates it (delta vs pre-refactor
+                # reports, where the count included collided rows).
                 if payload["seller_kind"] == "retailer":
                     stats["retailer_keyed"] += 1
                 planned.append(payload)
+            else:  # a verdict typo must never fall through to the WRITE path
+                raise RuntimeError(f"unknown planning verdict {verdict!r}")
 
         stats["distinct_sellers"] = len(sellers_seen)
         report.review_queue["catalog_collision"] = collisions
@@ -782,7 +788,7 @@ class SellerBackfill:
             # cleanly, so one retry on a fresh connection re-does the whole
             # batch from a clean slate.
             parity = await self._retry_after_reset(
-                lambda batch=batch: self._resubject_batch(batch, cascade, report),
+                lambda batch=batch: self._resubject_batch(batch, cascade),
                 what=f"batch {stats['batches'] + 1}")
             if parity.get("skipped_to_review"):
                 report.review_queue.setdefault(
@@ -875,11 +881,10 @@ class SellerBackfill:
         A failed lookup PROPAGATES. It must never read as "no collision": that
         answer disarms the anti-merge tripwire exactly when the connection is
         broken — and a wedged connection breaks every later lookup in the run
-        (observed 2026-08-09, run 31345305445)."""
-        try:
-            from services.audit_index_intake import _existing_brand_canonical_conflict
-        except Exception:  # pragma: no cover - import guard
-            return None
+        (observed 2026-08-09, run 31345305445). The import is local to avoid
+        a cycle, but an import FAILURE propagates too — an unimportable guard
+        answering "no collision" for the whole run is the same defect."""
+        from services.audit_index_intake import _existing_brand_canonical_conflict
         fields = {"brand": brand, "source_domain": dest, "canonical_url": product.get("canonical_url")}
         conflict = await _existing_brand_canonical_conflict(observed_id, fields)
         if not conflict:
@@ -896,7 +901,6 @@ class SellerBackfill:
 
     async def _resubject_batch(
         self, batch: List[Dict[str, Any]], cascade: List[Dict[str, Any]],
-        report: BackfillReport,
     ) -> Dict[str, Any]:
         pks = [str(b["product_key"]) for b in batch]
         # BEFORE: parity snapshots (row count, sig set, servable set).

@@ -265,12 +265,10 @@ class TestExecuteDivergenceGuard:
 
         db = _FakeDb(products=[])
         bf = SellerBackfill(database=db, si_mod=None, execute=True, batch_size=10)
-        report = BackfillReport(mode='execute', started_at='2026-08-07T00:00:00Z',
-                                phases=['catalog'], batch_size=10)
         batch = [dict(ROW, observed_id="merch_obs_planned000000000",
                       seller_kind="brand_direct", seller_domain="biodance.com",
                       listing_product_ids=["x1"])]
-        parity = await bf._resubject_batch(batch, [], report)
+        parity = await bf._resubject_batch(batch, [])
         assert calls["domain"] == "biodance.com"          # the PLANNED domain
         assert parity["skipped_to_review"][0]["reason"] == "ensured_seller_diverges_from_plan"
         # No catalog UPDATE ran for the skipped product.
@@ -595,3 +593,67 @@ class TestRetryAfterReset:
 
         assert await bf._retry_after_reset(fine, what="unit") == 7
         assert getattr(db, "resets", 0) == 0
+
+
+class TestRetryWiring:
+    """The review of PR #1716 found two mutants the suite missed: (a) call
+    run_catalog's stages DIRECTLY (retry helper as dead code) and nothing
+    fails; (b) re-add the review-queue extend inside _resubject_batch and
+    nothing catches the double-extend. These drive run_catalog through a
+    first-call flake at each stage and pin single-counted outcomes."""
+
+    @pytest.mark.asyncio
+    async def test_planning_flake_is_retried_through_run_catalog(self, monkeypatch):
+        rig = dict(ROW, product_key="prod::external_seed::external_seed::rig1",
+                   source_domain="jwx893-fz.myshopify.com", source_product_id="rig1")
+        db = _FakeDb(products=[rig])
+        bf = _backfill(db)
+        real = bf._plan_one
+        calls = {"n": 0}
+
+        async def flaky_once(p):
+            calls["n"] += 1
+            if calls["n"] == 1:
+                raise ConnectionResetError("proxy died mid-operation")
+            return await real(p)
+
+        monkeypatch.setattr(bf, "_plan_one", flaky_once)
+        report = BackfillReport(mode="dry_run", started_at="t",
+                                phases=["catalog"], batch_size=50)
+        await bf.run_catalog(report)
+        # A direct (unwrapped) call site would have crashed run_catalog here.
+        assert calls["n"] == 2
+        assert db.resets == 1
+        # Single-counted despite the retry: one row, one review entry.
+        assert report.catalog["scanned"] == 1
+        assert report.catalog["review_excluded_rig"] == 1
+        assert len(report.review_queue["catalog_unresolvable"]) == 1
+
+    @pytest.mark.asyncio
+    async def test_batch_flake_is_retried_and_skips_extend_exactly_once(self, monkeypatch):
+        ulta = dict(ROW, product_key="prod::external_seed::external_seed::u1",
+                    source_domain="ulta.com", source_product_id="u1")
+        db = _FakeDb(products=[ulta])
+        bf = _backfill(db)
+        calls = {"n": 0}
+
+        async def flaky_batch(batch, cascade):
+            calls["n"] += 1
+            if calls["n"] == 1:
+                raise ConnectionResetError("socket died inside the transaction")
+            return {"ok": True, "resubjected": len(batch),
+                    "skipped_to_review": [{"product_key": "pk_skip"}]}
+
+        monkeypatch.setattr(bf, "_resubject_batch", flaky_batch)
+        report = BackfillReport(mode="dry_run", started_at="t",
+                                phases=["catalog"], batch_size=50)
+        await bf.run_catalog(report)
+        assert calls["n"] == 2
+        assert db.resets == 1
+        assert report.catalog["batches"] == 1
+        assert report.catalog["resubjected"] == 1
+        # The caller extends off the RETURNED parity exactly once — a retried
+        # batch (or an extend creeping back into _resubject_batch) would
+        # produce two copies here.
+        assert report.review_queue["catalog_execute_skips"] == [{"product_key": "pk_skip"}]
+        assert len(report.parity) == 1
