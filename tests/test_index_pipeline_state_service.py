@@ -873,3 +873,80 @@ async def test_non_usd_offer_blocks_serving_when_gate_enabled(monkeypatch) -> No
         await _cleanup()
         if not was_connected:
             await database.disconnect()
+
+
+@pytest.mark.asyncio
+async def test_recompute_pings_indexnow_prior_sig_on_takedown(monkeypatch) -> None:
+    """The true->false transition must ping IndexNow with the PRIOR sig's URL.
+
+    Until now only false->true pinged; a takedown left the engines to discover
+    the dead URL by organic re-crawl while Search Console accumulated 404
+    churn. The prior sig matters because IPS stores the MAX-rank row's sig —
+    after a takedown the newly-classified sig can differ from the URL that was
+    actually advertised."""
+    import services.indexnow as indexnow_mod
+
+    pinged: list = []
+    monkeypatch.setattr(indexnow_mod, "schedule_submit_url", lambda url: pinged.append(url))
+
+    was_connected = await _prepare_db()
+    try:
+        ids = await _insert_product("inowdown")
+
+        assert await svc.recompute_serving_eligibility(ids["content_key"]) is True
+        eligible_pings = list(pinged)
+        # Newly eligible -> the existing false->true ping fired.
+        assert len(eligible_pings) == 1
+        advertised_sig = await database.fetch_val(
+            "SELECT pivota_signature_id FROM index_pipeline_state WHERE content_key = :ck",
+            {"ck": ids["content_key"]},
+        )
+        assert str(advertised_sig).startswith("sig_")
+
+        # Make the row's CURRENT sig differ from the advertised one, so pinging
+        # the new classification would name a URL that was never public. This is
+        # the real prod shape: IPS is content_key-grained and stores the MAX-rank
+        # row's sig, so a takedown can change which sig the row reports.
+        await database.execute(
+            "UPDATE catalog_products SET pivota_signature_id = :sig "
+            "WHERE content_key = :ck",
+            {"sig": "sig_" + ("b" * 32), "ck": ids["content_key"]},
+        )
+
+        # Editorial takedown, the raw-SQL sweep shape.
+        await database.execute(
+            "UPDATE catalog_products SET suppressed_at = :ts WHERE content_key = :ck",
+            {"ts": datetime(2026, 8, 1, tzinfo=timezone.utc), "ck": ids["content_key"]},
+        )
+        assert await svc.recompute_serving_eligibility(ids["content_key"]) is False
+
+        assert len(pinged) == 2
+        # THE POINT: the removal ping must name the sig that was ADVERTISED, not
+        # whatever sig the post-takedown reclassification reports. Rewrite the
+        # stored sig before the demotion so the two genuinely differ — with a
+        # single-sig fixture this assertion passes even for a naive
+        # implementation that pinged new_state["pivota_signature_id"].
+        assert pinged[1] == eligible_pings[0]
+        assert advertised_sig in pinged[1]
+    finally:
+        await _cleanup()
+        await _disconnect_if_needed(was_connected)
+
+
+@pytest.mark.asyncio
+async def test_recompute_no_ping_without_transition(monkeypatch) -> None:
+    """Idempotent recomputes (no eligibility flip) must not spam the engines."""
+    import services.indexnow as indexnow_mod
+
+    pinged: list = []
+    monkeypatch.setattr(indexnow_mod, "schedule_submit_url", lambda url: pinged.append(url))
+
+    was_connected = await _prepare_db()
+    try:
+        ids = await _insert_product("inowsteady")
+        assert await svc.recompute_serving_eligibility(ids["content_key"]) is True
+        assert await svc.recompute_serving_eligibility(ids["content_key"]) is True
+        assert len(pinged) == 1  # only the initial false->true
+    finally:
+        await _cleanup()
+        await _disconnect_if_needed(was_connected)

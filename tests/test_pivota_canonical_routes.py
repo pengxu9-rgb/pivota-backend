@@ -75,6 +75,16 @@ class FakeDb:
         if not m:
             return None
         sig = m.group(1)
+        # The retired probe (410 path): a narrow SELECT that asks specifically
+        # for a SUPPRESSED row by sig — the inverse of the serving filter below.
+        if "suppressed_at IS NOT NULL" in sql:
+            for r in self._rows:
+                if r.get("pivota_signature_id") == sig and r.get("suppressed_at") is not None:
+                    return {
+                        "suppressed_at": r["suppressed_at"],
+                        "suppression_reason": r.get("suppression_reason"),
+                    }
+            return None
         for r in self._rows:
             if (
                 r.get("pivota_signature_id") == sig
@@ -208,6 +218,10 @@ def _row(sig_suffix: str, **overrides) -> Dict[str, Any]:
         # tests that need the tombstoned shape override it to model the
         # label-without-timestamp REGRESSION, which is all that can produce it.
         "tombstoned": False,
+        # Permanent-vs-dedupe split of the tombstoned cohort — only this field
+        # may drive an HTTP 410. Fail-closed: derived from the same terminal
+        # allowlist the route uses, so an unclassified reason reads False.
+        "terminally_retired": False,
         "suppressed_at": None,
         "index_eligible": False,
         "blocker_code": None,
@@ -218,6 +232,12 @@ def _row(sig_suffix: str, **overrides) -> Dict[str, Any]:
         "content_changed_at": datetime(2026, 5, 1, tzinfo=timezone.utc),
     }
     base.update(overrides)
+    if "terminally_retired" not in overrides:
+        from routes.pivota_canonical_routes import _is_terminal_suppression
+
+        base["terminally_retired"] = _is_terminal_suppression(
+            base.get("suppression_reason")
+        )
     return base
 
 
@@ -271,6 +291,20 @@ def env(monkeypatch: pytest.MonkeyPatch):
         # demo_retired sweep): withdrawn from serving — excluded from the
         # list AND 404 on the resolver even though serving_eligible is TRUE.
         _row("supp", suppressed_at=datetime(2026, 7, 1, tzinfo=timezone.utc)),
+        # Suppressed under a TERMINAL reason — the only class that earns 410.
+        _row(
+            "gone",
+            suppressed_at=datetime(2026, 7, 1, tzinfo=timezone.utc),
+            suppression_reason="wrong_brand_namesake_wave3_20260718",
+        ),
+        # Suppressed as a DEDUPE loser: the product still exists at the keeper's
+        # URL, so 410 would be false AND would destroy the keeper's
+        # consolidation signal. Must stay 404.
+        _row(
+            "dedup",
+            suppressed_at=datetime(2026, 7, 1, tzinfo=timezone.utc),
+            suppression_reason="step5_campaign_clone_dup",
+        ),
     ]
     monkeypatch.setattr(pcr, "database", FakeDb(rows))
 
@@ -507,8 +541,49 @@ def test_suppressed_row_excluded_from_list_and_resolver(env):
     body = client.get("/api/canonical/products").json()
     assert "sig_supp" not in [i["sig_id"] for i in body["items"]]
     assert body["total"] == 3  # suppressed row does not count as advertised
+    # A suppression with no terminal reason is NOT a permanent retirement.
     res = client.get("/api/canonical/products/sig_supp")
     assert res.status_code == 404
+
+
+def test_terminally_retired_sig_answers_410_gone(env):
+    # RETIRED FOR GOOD: crawlers should drop the URL rather than re-try a bare
+    # 404 forever (the Search Console churn this exists to stop).
+    client = env
+    res = client.get("/api/canonical/products/sig_gone")
+    assert res.status_code == 410
+    detail = res.json()["detail"]
+    assert detail["retired"] is True
+    assert detail["sig_id"] == "sig_gone"
+    # Internal taxonomy is NOT published on this unauthenticated route.
+    assert "suppression_reason" not in detail
+
+
+def test_dedupe_loser_is_404_not_410(env):
+    # The product still exists at the keeper's URL. 410 would be factually
+    # wrong and would tell engines to drop equity the keeper needs.
+    client = env
+    assert client.get("/api/canonical/products/sig_dedup").status_code == 404
+
+
+def test_unknown_sig_stays_an_honest_404(env):
+    # Never fabricated: a sig with no row at all — suppressed or otherwise —
+    # is 404, not 410. Gone means "existed and was retired".
+    client = env
+    res = client.get("/api/canonical/products/sig_0000000000000000000000000000dead")
+    assert res.status_code == 404
+
+
+def test_unknown_suppression_reasons_default_to_404(env):
+    # Fail-safe: an allowlist means a newly-minted reason gets the safe answer
+    # until someone deliberately classifies it as terminal.
+    from routes.pivota_canonical_routes import _is_terminal_suppression
+
+    assert _is_terminal_suppression("some_new_reason_nobody_classified") is False
+    assert _is_terminal_suppression(None) is False
+    assert _is_terminal_suppression("source_currency_or_channel_defect") is False
+    assert _is_terminal_suppression("external_brand_crawl_unpublished") is False
+    assert _is_terminal_suppression("wrong_brand_namesake_wave3_20260718") is True
 
 
 def test_list_canonical_pdps_last_modified_uses_content_changed_at(env):
@@ -908,3 +983,36 @@ def test_list_canonical_pdps_carries_tombstoned_without_filtering(env, monkeypat
     assert by_sig["sig_def"]["renderable"] is True, (
         "the row must not be filtered out — flagging it is the whole point"
     )
+
+
+def test_feed_publishes_terminally_retired_split_of_the_tombstoned_cohort(env, monkeypatch):
+    """The tombstoned cohort is NOT uniformly permanent.
+
+    Measured 2026-07-29 on the live sitemap: 135 wrong-brand retirements
+    (permanent) mixed with 52 dedupe losers whose product still exists at the
+    keeper's URL. A consumer that answered 410 for the whole cohort would be
+    factually wrong on 28% of it, so the feed publishes the distinction rather
+    than making each consumer re-derive it from a vocabulary it cannot see.
+    """
+    import routes.pivota_canonical_routes as pcr
+
+    rows = list(pcr.database._rows)  # type: ignore[attr-defined]
+    rows[1] = {
+        **rows[1],
+        "renderable": True,
+        "tombstoned": True,
+        "terminally_retired": True,   # wrong-brand wave: never coming back
+    }
+    rows[3] = {
+        **rows[3],
+        "renderable": True,
+        "tombstoned": True,
+        "terminally_retired": False,  # dedupe loser: product lives at the keeper
+    }
+    monkeypatch.setattr(pcr.database, "_rows", rows, raising=False)
+
+    by_sig = {i["sig_id"]: i for i in env.get("/api/canonical/products").json()["items"]}
+    assert by_sig["sig_def"]["tombstoned"] is True
+    assert by_sig["sig_def"]["terminally_retired"] is True
+    assert by_sig["sig_noimg"]["tombstoned"] is True
+    assert by_sig["sig_noimg"]["terminally_retired"] is False

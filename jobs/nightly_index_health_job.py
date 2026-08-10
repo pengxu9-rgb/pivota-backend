@@ -70,7 +70,7 @@ import hashlib
 import json
 import logging
 from datetime import datetime, timezone
-from typing import Any, Dict, List, Set
+from typing import Any, Dict, List, Optional, Set
 
 from services.index_pipeline_state_service import (
     CONSOLIDATION_VERSION,
@@ -451,6 +451,120 @@ async def _compute_domain_extractor_scorecards() -> Dict[str, Any]:
 
 
 # ---------------------------------------------------------------------------
+# IndexNow transition detection (snapshot / diff)
+# ---------------------------------------------------------------------------
+# Why snapshot-and-diff rather than per-batch bookkeeping: this job demotes rows
+# through FOUR different paths and only one of them passes through the batch
+# upsert. `_STALE_INVALIDATION_UPDATE` (archived products — the
+# advertised-URL-now-404 case this feature exists for), `_ORPHAN_DELETE` and
+# `_REGRESSION_BLOCKER_UPDATE` are all raw SQL against index_pipeline_state, and
+# `_BATCH_QUERY` filters `sync_status = 'live'` so an archived row never enters
+# batch_states at all. Diffing the whole table before/after also removes the
+# ordering hazard in the other direction: the regression blocker runs AFTER the
+# batches, so a per-batch tally could queue "please crawl" for a row the same
+# run then made ineligible.
+#
+# EVERYTHING HERE FAILS OPEN TO SILENCE. A snapshot that cannot be taken
+# returns None and the diff is skipped — this is a best-effort discovery ping,
+# and it must never be able to break the nightly reclassification.
+
+_ELIGIBILITY_SNAPSHOT_SQL = """
+    SELECT content_key, serving_eligible, pivota_signature_id
+    FROM index_pipeline_state
+"""
+
+
+async def _snapshot_serving_eligibility() -> Optional[Dict[str, Dict[str, Any]]]:
+    """content_key -> {serving_eligible, pivota_signature_id}, or None on failure."""
+    from db.database import database
+    try:
+        rows = await database.fetch_all(_ELIGIBILITY_SNAPSHOT_SQL)
+    except Exception as exc:  # noqa: BLE001
+        logger.warning(
+            "nightly_index_health: eligibility snapshot failed (indexnow "
+            "transition pings disabled for this run): %s", exc,
+        )
+        return None
+    snapshot: Dict[str, Dict[str, Any]] = {}
+    for raw in rows:
+        row = dict(raw)
+        content_key = row.get("content_key")
+        if not content_key:
+            continue
+        snapshot[str(content_key)] = {
+            "serving_eligible": bool(row.get("serving_eligible")),
+            "pivota_signature_id": str(row.get("pivota_signature_id") or ""),
+        }
+    return snapshot
+
+
+async def _submit_indexnow_transitions(
+    before: Optional[Dict[str, Dict[str, Any]]],
+    summary: Dict[str, Any],
+) -> None:
+    """Diff post-run eligibility against `before` and ping IndexNow once."""
+    summary["indexnow_added"] = 0
+    summary["indexnow_removed"] = 0
+    if before is None:
+        summary["indexnow_skipped"] = "snapshot_unavailable"
+        return
+
+    after = await _snapshot_serving_eligibility()
+    if after is None:
+        summary["indexnow_skipped"] = "post_snapshot_unavailable"
+        return
+
+    from services.catalog_sync_service import pivota_canonical_pdp_url
+
+    added: List[str] = []
+    removed: List[str] = []
+
+    def _sig_url(sig: str) -> Optional[str]:
+        return pivota_canonical_pdp_url(sig) if sig.startswith("sig_") else None
+
+    for content_key, now in after.items():
+        was = before.get(content_key)
+        if now["serving_eligible"] and not (was and was["serving_eligible"]):
+            url = _sig_url(now["pivota_signature_id"])
+            if url:
+                added.append(url)
+        elif was and was["serving_eligible"] and not now["serving_eligible"]:
+            # Ping the sig that was ADVERTISED, not the survivor: IPS is
+            # content_key-grained and stores the MAX-rank row's sig, so a
+            # takedown can change which sig the row reports.
+            url = _sig_url(was["pivota_signature_id"])
+            if url:
+                removed.append(url)
+
+    # Rows deleted outright (_ORPHAN_DELETE) are removals too — they leave the
+    # after-snapshot entirely, so the loop above never sees them.
+    for content_key, was in before.items():
+        if content_key in after or not was["serving_eligible"]:
+            continue
+        url = _sig_url(was["pivota_signature_id"])
+        if url:
+            removed.append(url)
+
+    summary["indexnow_added"] = len(added)
+    summary["indexnow_removed"] = len(removed)
+    if not added and not removed:
+        return
+
+    # REMOVALS FIRST: the protocol caps a submission at 10k URLs, and a large
+    # sweep is exactly when the cap bites. Truncating adds costs a delayed
+    # crawl of a live page (organic discovery still finds it); truncating
+    # removals leaves a dead URL advertised, which is the churn this exists to
+    # stop. Order encodes that priority.
+    transition_urls = (removed + added)[:10_000]
+    try:
+        from services.indexnow import submit_urls
+
+        await submit_urls(transition_urls)
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("nightly_index_health: indexnow submit failed: %s", exc)
+
+
+# ---------------------------------------------------------------------------
 # Main entry point
 # ---------------------------------------------------------------------------
 
@@ -500,6 +614,18 @@ async def run_nightly_index_health() -> Dict[str, Any]:
                 "nightly_index_health: regression domain fetch failed: %s", exc
             )
             regression_domains = set()
+
+        # IndexNow: eligibility SNAPSHOT taken before any mutation in this run.
+        # Diffed against a second snapshot after ALL mutations (batch upserts,
+        # orphan delete, stale invalidation, scorecards, regression blocker), so
+        # every demotion path this job owns is covered — a per-batch tally
+        # missed three of them (_STALE_INVALIDATION_UPDATE, _ORPHAN_DELETE and
+        # _REGRESSION_BLOCKER_UPDATE never pass through batch_states, and the
+        # stale-invalidation path is exactly the archived-product-with-a-dead-URL
+        # case this feature exists for), and it could also queue an ADD for a row
+        # the same run demoted moments later via the regression blocker.
+        # Snapshot-diff makes both classes structurally impossible.
+        eligibility_before = await _snapshot_serving_eligibility()
 
         # 3. Cursor-paginated batch loop
         cursor = ""  # empty string sorts before all content_keys (VARCHAR)
@@ -694,6 +820,12 @@ async def run_nightly_index_health() -> Dict[str, Any]:
 
     finally:
         await _release_job_lock()
+
+    # IndexNow: diff the pre-mutation snapshot against the post-mutation state
+    # and ping both directions in one batched submit. Best-effort by design
+    # (submit_urls never raises); counts land in the summary either way so the
+    # run report shows what was pinged.
+    await _submit_indexnow_transitions(eligibility_before, summary)
 
     run_end = datetime.now(timezone.utc)
     duration_s = (run_end - run_start).total_seconds()

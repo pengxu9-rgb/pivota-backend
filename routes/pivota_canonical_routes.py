@@ -73,6 +73,39 @@ from services.pdp_renderability import (
 )
 from utils.logger import logger
 
+# ── 410 Gone: which suppressions are TERMINAL ────────────────────────────────
+# 410 asserts "this will never come back". Most of the suppression vocabulary
+# does NOT mean that, and answering 410 for those rows would be both false and
+# destructive:
+#
+#   * DEDUPE LOSERS (step5_*, cross_merchant_redundant_external_seed,
+#     external_brand_crawl_dup_listing, the d2_* identity resolutions,
+#     merge_duplicate_canonicals_loser) — the product still EXISTS, at the
+#     keeper's URL. 410 would destroy the consolidation signal the surviving
+#     canonical needs; a plain 404 (or eventually a 301 to the elected winner)
+#     is the correct answer.
+#   * REVERSIBLE CONTAINMENT (source_currency_or_channel_defect, and
+#     external_brand_crawl_unpublished — whose own runner documents
+#     "Reversible: no hard deletes, --revert restores both halves", with 102 of
+#     272 candidates measured serving live product pages) — a measure designed
+#     to be lifted must never be published as permanent.
+#
+# So this is an explicit ALLOWLIST and every unknown reason falls through to
+# 404. A newly-minted suppression reason therefore defaults to the safe answer,
+# and making one terminal is a deliberate one-line decision, not an accident.
+_TERMINAL_SUPPRESSION_REASONS = frozenset({
+    "demo_retired_2026_07",
+    "wrong_brand_namesake_wave3_20260718",
+    "step5_test_rig_retirement",
+    "url_audit_stub_retired_20260729",
+})
+
+
+def _is_terminal_suppression(reason: Any) -> bool:
+    """True only for suppressions that will never be reverted (410-eligible)."""
+    return str(reason or "").strip() in _TERMINAL_SUPPRESSION_REASONS
+
+
 router = APIRouter(
     prefix="/api/canonical",
     tags=["canonical-pdp"],
@@ -403,6 +436,34 @@ def _tombstoned_column():
     ).label("tombstoned")
 
 
+def _terminally_retired_column():
+    """Boolean: is this row's retirement PERMANENT (410-eligible)?
+
+    ``tombstoned`` alone cannot answer that. Measured on the live 7,509-URL
+    sitemap 2026-07-29, the tombstoned cohort is 135 ``wrong_brand_namesake_
+    wave3_20260718`` (a genuine, permanent retirement — serving those publishes
+    incorrect brand attribution) mixed with 52 DEDUPE losers
+    (``cross_merchant_redundant_external_seed`` 50, ``step5_campaign_clone_dup``
+    2) whose product still exists at the keeper's URL.
+
+    A consumer that answered HTTP 410 for the whole cohort would therefore be
+    factually wrong on 28% of it and would destroy the consolidation signal the
+    surviving canonical needs. So the feed publishes the DISTINCTION rather than
+    making every consumer re-derive it from a reason vocabulary it cannot see:
+    this column applies the same ``_TERMINAL_SUPPRESSION_REASONS`` allowlist the
+    by-sig resolver uses for its own 410, so the sitemap generator, the resolver
+    and any future consumer cannot disagree about which URLs are permanently
+    gone.
+
+    Fail-CLOSED (unlike its siblings): unknown or unclassified reasons read
+    false, because the cost of a wrong ``true`` is a permanent, CDN-cached 410
+    on a live product.
+    """
+    return (
+        catalog_products.c.suppression_reason.in_(sorted(_TERMINAL_SUPPRESSION_REASONS))
+    ).label("terminally_retired")
+
+
 def _elected_canonical_sig_note():
     """WHY the feed's `canonical_sig_id` is validated, and where.
 
@@ -644,6 +705,40 @@ async def get_canonical_pdp_by_signature(sig_id: str) -> Dict[str, Any]:
     )
     row = await _bounded_db(database.fetch_one(query), "product_by_signature")
     if not row:
+        # RETIRED vs NEVER-EXISTED. A deliberately taken-down row (suppressed_at
+        # set by a sweep) and an unknown sig both fell out of the gated query
+        # above, and both answered a bare 404 — so a crawler or agent could not
+        # tell "drop this URL, it is gone for good" (410) from "maybe a typo"
+        # (404), and Search Console accumulates churn while engines re-try dead
+        # URLs. One narrow indexed probe, paid ONLY on the 404 path (partial
+        # index idx_catalog_products_suppressed_at, migration 135): if the sig
+        # exists but is suppressed, answer 410 Gone with the retirement
+        # disclosed. Never fabricated — absent row stays an honest 404.
+        retired = await _bounded_db(
+            database.fetch_one(
+                select(
+                    catalog_products.c.suppressed_at,
+                    catalog_products.c.suppression_reason,
+                )
+                .where(
+                    and_(
+                        catalog_products.c.pivota_signature_id == sig,
+                        catalog_products.c.suppressed_at.isnot(None),
+                    )
+                )
+                .limit(1)
+            ),
+            "product_by_signature_retired_probe",
+        )
+        if retired and _is_terminal_suppression(retired["suppression_reason"]):
+            raise HTTPException(
+                status_code=status.HTTP_410_GONE,
+                detail={
+                    "message": "This product was retired and will not return",
+                    "sig_id": sig,
+                    "retired": True,
+                },
+            )
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
             detail={
@@ -770,6 +865,7 @@ async def list_canonical_pdp_signatures(
         _renderable_column(),
         _content_depth_column(),
         _tombstoned_column(),
+        _terminally_retired_column(),
         # Already validated by the JOIN's ON clause below — see the note there.
         content_canonical_election.c.canonical_sig_id,
     ]
@@ -879,6 +975,9 @@ async def list_canonical_pdp_signatures(
             # 187 retired URLs on 2026-07-29, 135 of them for WRONG BRAND
             # attribution. Advisory; see _tombstoned_column for the measurements.
             "tombstoned": bool(r["tombstoned"]),
+            # Permanent-vs-dedupe split for the tombstoned cohort. Only this
+            # field may drive an HTTP 410 — see _terminally_retired_column.
+            "terminally_retired": bool(r["terminally_retired"]),
             "index_eligible": (bool(r["index_eligible"]) if widen_sitemap else False),
             "blocker_code": r["blocker_code"],
             "blocker_detail": r["blocker_detail"],

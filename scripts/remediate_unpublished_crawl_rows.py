@@ -323,7 +323,8 @@ def _report_plan(rows: List[Dict[str, Any]], counts: Dict[str, int], actionable:
     print(f"  → would stamp suppressed_at on {len(actionable)} row(s), recompute {len(keys)} content_key(s)")
 
 
-async def _drive_revert(args: argparse.Namespace) -> None:
+async def _drive_revert(args: argparse.Namespace) -> int:
+    """Returns the number of rows actually WRITTEN (0 for any dry run/no-op)."""
     rows = [dict(r) for r in await database.fetch_all(
         REVERT_CANDIDATES_SQL, {"tool": TOOL, "script": SCRIPT_NAME})]
     if args.host:
@@ -331,28 +332,29 @@ async def _drive_revert(args: argparse.Namespace) -> None:
         rows = [r for r in rows if _host_of(r["destination_url"]) == wanted]
     if not rows:
         print(f"nothing to revert: no rows carry suppression_metadata.script={SCRIPT_NAME!r}")
-        return
+        return 0
     print(f"revert: {len(rows)} row(s) previously withdrawn by this runner")
     if not args.apply:
         for r in rows[: args.show]:
             print(f"    would restore {r['destination_url']}")
         print("DRY RUN — pass --apply to write")
-        return
+        return 0
     states = await _revert(rows)
     back = sum(1 for v in states.values() if v == "serving")
     print(f"REVERTED: {len(rows)} row(s); {back}/{len(states)} content_key(s) serving again")
+    return len(rows)
 
 
-async def _drive(args: argparse.Namespace) -> None:
+async def _drive(args: argparse.Namespace) -> int:
+    """Returns the number of rows actually WRITTEN (0 for any dry run/no-op)."""
     await database.connect()
     try:
         if args.revert:
-            await _drive_revert(args)
-            return
+            return await _drive_revert(args)
         rows = await _load_candidates(args.host)
         if not rows:
             print("nothing to do: no live crawl-mirrored rows matched")
-            return
+            return 0
         actionable, counts = await _adjudicate(rows)
 
         # The cluster predicate — see the module docstring. A LONE sitemap-absent
@@ -370,15 +372,16 @@ async def _drive(args: argparse.Namespace) -> None:
             )
 
         if not actionable:
-            return
+            return 0
         if not args.apply:
             for r in actionable[: args.show]:
                 print(f"    would withdraw [{r['rows_on_key']:>2} on key] {r['destination_url']}")
             if len(actionable) > args.show:
                 print(f"    … and {len(actionable) - args.show} more")
             print("DRY RUN — pass --apply to write")
-            return
+            return 0
 
+        wrote = len(actionable)
         states = await _withdraw(actionable)
         dark = sorted(k for k, v in states.items() if v == "dark")
         serving = sorted(k for k, v in states.items() if v == "serving")
@@ -402,8 +405,39 @@ async def _drive(args: argparse.Namespace) -> None:
             )
             for k in failed[:10]:
                 print(f"    {k}")
+        return wrote
     finally:
         await database.disconnect()
+
+
+def _dispatch_sitemap_refresh() -> None:
+    """Best-effort: kick agent-ui's sitemap workflow so the takedown leaves the
+    advertised set within minutes, not at the next 6-hourly tick.
+
+    The sitemap is generated static files in pivota-agent-ui, refreshed by its
+    `sitemaps.yml` cron (17 1,7,13,19 UTC) — the backend has no push channel, so
+    between a sweep and the next tick every withdrawn URL stays advertised while
+    its PDP already 404s/410s: exactly the Search Console churn this runner's
+    withdrawals create. Operators run this script from a machine with `gh`
+    already authenticated, so a workflow_dispatch is one subprocess away.
+    Failure is loud but non-fatal — the cron remains the backstop.
+    """
+    import shutil
+    import subprocess
+
+    if not shutil.which("gh"):
+        print("  sitemap refresh NOT dispatched: `gh` not on PATH — the 6-hourly "
+              "cron will pick the withdrawal up (worst case ~6h of advertised 404s).")
+        return
+    try:
+        subprocess.run(
+            ["gh", "workflow", "run", "sitemaps.yml", "-R", "pengxu9-rgb/pivota-agent-ui"],
+            check=True, capture_output=True, text=True, timeout=30,
+        )
+        print("  sitemap refresh dispatched (pivota-agent-ui sitemaps.yml).")
+    except Exception as exc:  # noqa: BLE001
+        print(f"  sitemap refresh dispatch FAILED ({exc}) — the 6-hourly cron "
+              "will pick the withdrawal up.")
 
 
 def main() -> int:
@@ -423,7 +457,15 @@ def main() -> int:
         ),
     )
     p.add_argument("--show", type=int, default=20, help="rows to list in dry-run output")
-    asyncio.run(_drive(p.parse_args()))
+    args = p.parse_args()
+    wrote = asyncio.run(_drive(args))
+    # Dispatch ONLY when this run actually changed the advertised set. Gating on
+    # the flags instead fired a real GitHub workflow_dispatch on dry runs — note
+    # `--revert` without `--apply` IS a dry run — and on --apply runs that
+    # matched nothing. Both directions matter when they do write: a withdrawal
+    # must leave the sitemap, a revert must return to it.
+    if wrote > 0:
+        _dispatch_sitemap_refresh()
     return 0
 
 

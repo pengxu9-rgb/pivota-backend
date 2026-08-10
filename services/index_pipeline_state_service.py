@@ -1227,27 +1227,44 @@ async def recompute_serving_eligibility(
         if new_state is None:
             return False
 
-        # Capture prior eligibility (cheap PK lookup) to detect the false->true
-        # transition that makes a canonical PDP newly citable.
-        prev_eligible = await database.fetch_val(
-            "SELECT serving_eligible FROM index_pipeline_state "
+        # Capture prior eligibility AND the prior sig (one cheap PK lookup) to
+        # detect both transition directions. The prior sig matters on the way
+        # DOWN: IPS is content_key-grained and stores the MAX-rank row's sig, so
+        # after a takedown the newly-classified sig may differ from the sig that
+        # was actually advertised — the engines must re-crawl the URL that WAS
+        # public, not the survivor's.
+        prev_row = await database.fetch_one(
+            "SELECT serving_eligible, pivota_signature_id FROM index_pipeline_state "
             "WHERE content_key = :ck",
             {"ck": content_key},
         )
+        prev_eligible = bool(prev_row and prev_row["serving_eligible"])
+        prev_sig = str((prev_row and prev_row["pivota_signature_id"]) or "")
 
         await _upsert_index_pipeline_state(content_key, new_state)
 
-        # IndexNow: when a page becomes newly serving-eligible (and has a minted
-        # signature, so a canonical PDP exists), ask participating engines (Bing →
-        # ChatGPT search, Yandex, …) to crawl it. Non-blocking + best-effort — it
-        # never affects the recompute result.
+        # IndexNow, both directions — non-blocking + best-effort, never affects
+        # the recompute result. IndexNow has no "removed" verb: resubmitting the
+        # URL asks the engine to re-crawl, see the 404/410, and drop it — which
+        # is exactly what a takedown needs instead of waiting for organic
+        # re-crawl while Search Console accumulates 404 churn.
         if new_state.get("serving_eligible") and not prev_eligible:
+            # Newly citable: ask engines (Bing → ChatGPT search, Yandex, …) to
+            # crawl the canonical PDP.
             sig = new_state.get("pivota_signature_id")
             if sig and str(sig).startswith("sig_"):
                 from services.catalog_sync_service import pivota_canonical_pdp_url
                 from services.indexnow import schedule_submit_url
 
                 schedule_submit_url(pivota_canonical_pdp_url(str(sig)))
+        elif prev_eligible and not new_state.get("serving_eligible"):
+            # Taken down: ask engines to re-crawl the previously-advertised URL
+            # so the dead page leaves their index promptly.
+            if prev_sig.startswith("sig_"):
+                from services.catalog_sync_service import pivota_canonical_pdp_url
+                from services.indexnow import schedule_submit_url
+
+                schedule_submit_url(pivota_canonical_pdp_url(prev_sig))
 
         if reason:
             logger.info({
