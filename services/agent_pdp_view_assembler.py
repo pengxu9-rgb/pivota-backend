@@ -581,10 +581,13 @@ def _parse_jsonish(value: Any) -> Any:
 def normalize_taxonomy_tags(value: Any) -> Any:
     """Repair double-encoded taxonomy_tags for consumers.
 
-    Read-side twin of the write-side coercion in build_taxonomy_tags: rows
-    assembled before the fix keep the string-encoded shape until the
-    reconciler refreshes them, so every projection must normalize on the way
-    out. Handles the whole-dict-as-string case too. Never raises.
+    Read-side twin of the write-side coercion in build_taxonomy_tags — and
+    effectively PERMANENT, not transitional: the reconciler only re-assembles
+    rows whose truth timestamps moved, so a historical row with no source
+    change keeps the string-encoded shape forever unless
+    scripts/backfill_agent_pdp_view.py is run once. Every projection must
+    therefore normalize on the way out, indefinitely. Handles the
+    whole-dict-as-string case too. Never raises.
     """
     value = _parse_jsonish(value)
     if not isinstance(value, dict):

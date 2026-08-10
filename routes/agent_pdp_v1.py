@@ -473,8 +473,9 @@ def _row_as_product(row: Dict[str, Any]) -> Dict[str, Any]:
 
     # Repair double-encoded taxonomy_tags (JSON strings inside the JSONB dict —
     # see services.agent_pdp_view_assembler._TAXONOMY_LIST_KEYS). Historical
-    # rows keep the broken shape until the reconciler refreshes them, so the
-    # projection normalizes on the way out.
+    # rows keep the broken shape INDEFINITELY — the reconciler only re-assembles
+    # on a truth-timestamp change — so this normalization is permanent, not a
+    # transition shim (or run scripts/backfill_agent_pdp_view.py once).
     product["taxonomy_tags"] = normalize_taxonomy_tags(row.get("taxonomy_tags"))
 
     return product
