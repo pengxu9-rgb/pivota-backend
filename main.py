@@ -43,6 +43,7 @@ import os
 from pathlib import Path
 from utils.database_readiness import (
     DatabaseUnavailableError,
+    connect_database_with_timeout,
     probe_database_health,
     run_database_reconnect_supervisor,
 )
@@ -621,7 +622,7 @@ async def startup_event():
     # Avoid blocking Railway healthchecks indefinitely.
     try:
         if not getattr(database, "is_connected", False):
-            await asyncio.wait_for(database.connect(), timeout=15)
+            await connect_database_with_timeout(15, db=database)
     except Exception as exc:
         logger = logging.getLogger(__name__)
         logger.warning(f"⚠️ Startup DB connect skipped/failed (continuing degraded): {exc}")
@@ -1220,7 +1221,7 @@ async def startup():
         logger.info(f"   Database driver: {database.url.scheme if hasattr(database, 'url') else 'unknown'}")
         # Establish DB connection
         if not getattr(database, "is_connected", False):
-            await asyncio.wait_for(database.connect(), timeout=15)
+            await connect_database_with_timeout(15, db=database)
         logger.info("✅ Database connected successfully")
         
         # Ensure all tables exist (important for PostgreSQL)

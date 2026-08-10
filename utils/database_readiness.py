@@ -119,6 +119,220 @@ async def probe_database_health(*, probe_timeout_seconds: float = 3.0) -> None:
         ) from exc
 
 
+# ---------------------------------------------------------------------------
+# A timeout must not strand the server connections it already opened.
+#
+# WHY. `databases.PostgresBackend.connect()` is
+#
+#     assert self._pool is None
+#     self._pool = await asyncpg.create_pool(**kwargs)
+#
+# and the assignment happens only AFTER the await. `asyncio.wait_for` cancels
+# what it is waiting on when it times out, so on timeout the pool is never
+# assigned: `backend._pool` stays None and `is_connected` stays False, while
+# the server backends `create_pool` had ALREADY OPENED stay open. Nothing holds
+# a reference to that pool, so nothing can ever close them — `disconnect()`
+# only reaches the pool `backend._pool` currently points at. They stay open
+# until Postgres times them out on its own.
+#
+# `create_pool` fills `min_size` connections EAGERLY, so one timed-out connect
+# strands up to `min_size` backends, and every retry strands another batch.
+#
+# MEASURED on real Postgres, DB_POOL_MIN_SIZE=20, one caller, never-connected
+# database, driving the real `ensure_database_ready`: 10 backends stranded by
+# the first timed-out connect and one more by each of the next three, none of
+# them reachable by a clean `disconnect()`. At `connect_timeout_seconds=0.015 /
+# 0.020 / 0.025`: 3 / 10 / 9 stranded.
+#
+# WHAT REACHES IT IN PRODUCTION, on this base: `run_database_reconnect_supervisor`
+# at 10.0s ON A TIMER — unattended, and pointed by design at a database that is
+# not answering, so a slow one strands a batch per cycle for ever; POST
+# /auth/login at 2.0s; the quote/order paths at the 3.0 default;
+# `accounts_orders_api` at 3s; both startup connects at 15s. NOT `/health`: an
+# earlier draft of this comment said it passed 5.0, which was true only against
+# the PR #1684 base this was first written on. #1683 moved `/health` and `/` to
+# `probe_database_health`, which connects nothing.
+#
+# THE FIX IS TO OWN THE POOL OBJECT. `asyncpg.create_pool()` is a plain
+# function (not a coroutine): it returns the `Pool` synchronously and connects
+# only when the Pool is awaited. Creating it and awaiting it as two statements
+# is the same two steps in the same order that `databases` performs — but with
+# a reference in hand, so `terminate()` can close what was opened.
+#
+# THIS COVERS THE FAILURE MODE A "DON'T CANCEL" DESIGN WOULD MISS. `Pool.
+# _async__init__` sets `_initialized = True` in a `finally`, and never unwinds
+# `_initialize` on error, so a create_pool that RAISES partway — the
+# `TooManyConnectionsError` that a saturated server returns, which is exactly
+# the state the leaked connections themselves produce — strands its already
+# connected holders too, with no cancellation involved at all. Measured: 3
+# backends stranded by a partial-init failure, 0 with `terminate()`. So the
+# cleanup hangs off `BaseException`, not off the timeout.
+#
+# NOT A REIMPLEMENTATION OF `connect()`. The kwargs come from the backend's own
+# `_get_connection_kwargs()` and its own parsed URL, and
+# `test_connect_kwargs_match_the_library_backend` drives the real
+# `PostgresBackend.connect()` and this function through the same recording
+# `create_pool` and asserts the two argument sets are identical, so a
+# `databases` upgrade that changes them fails the suite instead of silently
+# diverging here.
+
+
+def _postgres_backend(db):
+    """The asyncpg-backed backend, or None for any other dialect.
+
+    Local dev and most of the suite run `sqlite+aiosqlite`, which has no server
+    to strand backends on and no `Pool` to own.
+    """
+    backend = getattr(db, "_backend", None)
+    if backend is None:
+        return None
+    try:
+        from databases.backends.postgres import PostgresBackend
+    except Exception:
+        # asyncpg not installed — db/database.py imports it lazily for exactly
+        # this reason, so a Postgres backend cannot be in play either.
+        return None
+    return backend if isinstance(backend, PostgresBackend) else None
+
+
+def _new_pool(backend):
+    """Build the pool `PostgresBackend.connect()` would build, unconnected."""
+    import asyncpg
+
+    url = backend._database_url
+    kwargs = dict(
+        host=url.hostname,
+        port=url.port,
+        user=url.username,
+        password=url.password,
+        database=url.database,
+    )
+    kwargs.update(backend._get_connection_kwargs())
+    return asyncpg.create_pool(**kwargs)
+
+
+# `terminate()` alone is not enough when the fill FAILS rather than times out.
+# `Pool._initialize` fills the remaining holders with
+# `await asyncio.gather(*connect_tasks)` — no `return_exceptions` — so the
+# first holder to raise propagates WITHOUT cancelling its siblings. Those
+# handshakes are still in flight when `terminate()` walks `_holders`, and a
+# holder whose `_con` is not assigned yet is a no-op, so the connections land a
+# moment later, attach to a discarded pool, and nothing ever closes them. No
+# cancellation reaches them either, so asyncpg's own `except (Exception,
+# CancelledError): tr.close()` never fires.
+#
+# MEASURED at DB_POOL_MIN_SIZE=5 on the `TooManyConnectionsError` path: 2 of 3
+# opened backends stranded — 0 when counted immediately, which is why a probe
+# that polls for "clean" without waiting reports a false pass. That is the
+# shape this module cares most about: a saturated server ratcheting itself
+# further into saturation on every poll.
+#
+# So the failure path re-sweeps: `terminate()` early-returns once `_closed`, so
+# the sweep terminates surviving holder connections directly, several times,
+# over a window long enough for a late handshake to land.
+# KNOWN CONSEQUENCE, stated rather than hidden: the sweep is a superset of
+# `terminate()` for the only thing these tests can observe — open server
+# backends — so mutants that break `terminate()` alone (replacing it with
+# `close()`, or terminating just one holder) now SURVIVE the suite where they
+# previously died. That is the cost of a backstop, not a gap in the guarantee:
+# the observable contract is "a discarded pool strands nothing", and it holds
+# under either mechanism. `terminate()` stays because it is the documented API
+# and it does the pool's own bookkeeping (`_closed`, holder release) that the
+# sweep deliberately does not touch.
+# Only the first pass is load-bearing for the suite — `(0.0,)` alone kills the
+# no-sweep mutant, and truncating to `(0.0, 0.05, 0.25)` survives it. The tail
+# is deliberate untested insurance for a handshake slower than a quarter
+# second; its only measured cost is holding the discarded Pool reachable for
+# the window (60 back-to-back failed connects peaked at 288 timer handles and
+# 60 Pool objects, draining to zero afterwards).
+_SWEEP_DELAYS = (0.0, 0.05, 0.25, 1.0, 3.0, 10.0)
+
+
+def _sweep_quietly(pool) -> None:
+    """Terminate any connection that landed after the pool was discarded."""
+    try:
+        for holder in getattr(pool, "_holders", ()) or ():
+            con = getattr(holder, "_con", None)
+            if con is not None and not con.is_closed():
+                con.terminate()
+    except Exception as exc:  # pragma: no cover - best-effort cleanup
+        logger.debug(f"Sweeping a discarded database pool failed: {exc}")
+
+
+def _terminate_quietly(pool) -> None:
+    """Close what the pool opened, without ever replacing the caller's error.
+
+    `terminate()` raises `InterfaceError` via `_check_init()` on a pool that
+    never began initializing — which is also the case where it has nothing
+    open to close.
+    """
+    try:
+        pool.terminate()
+    except Exception as exc:
+        logger.debug(f"Discarding a failed database pool did not need termination: {exc}")
+
+    try:
+        loop = asyncio.get_running_loop()
+    except RuntimeError:  # pragma: no cover - no loop to schedule on
+        return
+    for delay in _SWEEP_DELAYS:
+        loop.call_later(delay, _sweep_quietly, pool)
+
+
+async def connect_database_with_timeout(timeout_seconds: float, *, db=None) -> None:
+    """`db.connect()`, bounded, without stranding server connections.
+
+    Raises exactly what `asyncio.wait_for(db.connect(), ...)` raises —
+    `asyncio.TimeoutError` on timeout, the underlying error otherwise — so
+    every call site's error handling is unchanged.
+
+    `db` defaults to the shared `database`, but EVERY CALL SITE PASSES ITS OWN
+    module's reference. Call sites are monkeypatched by name in this suite
+    (`bf.database`, `readiness.database`), and a helper that silently reached
+    for its own global instead would connect the real database out from under
+    a test that thought it had substituted a fake.
+    """
+    db = database if db is None else db
+
+    if getattr(db, "is_connected", False):
+        return
+
+    backend = _postgres_backend(db)
+    if backend is None or getattr(db, "_force_rollback", False):
+        # Not the leaking shape: no asyncpg pool to own, or `force_rollback`
+        # means `connect()` also opens a global transaction that only the
+        # library can manage. Behave exactly as before.
+        await asyncio.wait_for(db.connect(), timeout=timeout_seconds)
+        return
+
+    if backend._pool is not None:
+        # The guard `PostgresBackend.connect()` opens with, kept because this
+        # function publishes `_pool` by hand: assigning over a pool that is
+        # already there would orphan it — the same leak, from the other end.
+        # Raised rather than `assert`ed so `python -O` cannot strip it, but with
+        # the library's own exception type and message so callers see no change.
+        raise AssertionError("DatabaseBackend is already running")
+
+    pool = _new_pool(backend)
+
+    async def _fill() -> None:
+        await pool
+
+    try:
+        await asyncio.wait_for(_fill(), timeout=timeout_seconds)
+    except BaseException:
+        _terminate_quietly(pool)
+        raise
+
+    # Publish in the library's order: the pool first, then the flag that tells
+    # every other caller the pool is there.
+    backend._pool = pool
+    db.is_connected = True
+    # `Database.connect()` logs this and is never called on this path, so
+    # without it incident logs show disconnects with no matching connects.
+    logger.info("Connected to database %s", getattr(db, "url", "<unknown>"))
+
+
 async def ensure_database_ready(
     *,
     connect_timeout_seconds: float = 3.0,
@@ -135,7 +349,7 @@ async def ensure_database_ready(
 
     async def _connect_once() -> None:
         try:
-            await asyncio.wait_for(database.connect(), timeout=connect_timeout_seconds)
+            await connect_database_with_timeout(connect_timeout_seconds, db=database)
         except Exception as exc:  # pragma: no cover - covered via outer behavior tests
             raise DatabaseUnavailableError(
                 phase="connect",
@@ -356,8 +570,8 @@ async def run_database_reconnect_supervisor(
         _force_mark_database_disconnected()
 
         try:
-            await asyncio.wait_for(
-                database.connect(), timeout=connect_timeout_seconds
+            await connect_database_with_timeout(
+                connect_timeout_seconds, db=database
             )
         except asyncio.CancelledError:
             raise

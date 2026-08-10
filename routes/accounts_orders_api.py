@@ -59,6 +59,7 @@ from db.orders import orders as orders_table
 from db.products import products_cache
 from utils.auth import create_access_token, decode_token, hash_password, verify_password
 from utils.order_track_token import verify_order_track_token
+from utils.database_readiness import connect_database_with_timeout
 from utils.transient_errors import db_busy_http_exception, is_asyncpg_busy_error
 from services.ugc_capabilities_service import (
     UgcSubject,
@@ -128,7 +129,7 @@ async def _ensure_database_connected() -> None:
     if getattr(database, "is_connected", False):
         return
     try:
-        await asyncio.wait_for(database.connect(), timeout=3)
+        await connect_database_with_timeout(3, db=database)
     except Exception as exc:
         logger.warning(f"Database not available for request (connect failed): {exc}")
         raise _error(

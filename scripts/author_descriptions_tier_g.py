@@ -48,6 +48,7 @@ if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
 from db.database import database  # noqa: E402
+from utils.database_readiness import connect_database_with_timeout  # noqa: E402
 from scripts.source_pdp_content_repair import (  # noqa: E402
     MIN_EXISTING_DESCRIPTION_LENGTH,
     UPDATE_DESCRIPTION_SQL,
@@ -257,7 +258,7 @@ async def run(args: argparse.Namespace) -> Dict[str, Any]:
     # Bounded connect: the Railway proxy can stall the handshake indefinitely.
     for attempt in range(6):
         try:
-            await asyncio.wait_for(database.connect(), timeout=90)
+            await connect_database_with_timeout(90, db=database)
             break
         except Exception as exc:  # noqa: BLE001
             print(f"connect retry ({type(exc).__name__})", flush=True)
