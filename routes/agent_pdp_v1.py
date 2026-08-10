@@ -15,6 +15,7 @@ from fastapi import APIRouter, HTTPException, Request, status
 from fastapi.encoders import jsonable_encoder
 
 from db.database import database
+from services.agent_pdp_view_assembler import normalize_taxonomy_tags
 from services.catalog_identity import is_content_key
 from services.catalog_sync_service import pivota_canonical_pdp_url
 from services.claim_safety import substantiated_claims
@@ -469,6 +470,13 @@ def _row_as_product(row: Dict[str, Any]) -> Dict[str, Any]:
     # Social proof, never fabricated: the raw rating_value/rating_count columns
     # still pass through dict(row) for consumers that want them unnormalized.
     product["aggregate_rating"] = aggregate_rating_from_row(row)
+
+    # Repair double-encoded taxonomy_tags (JSON strings inside the JSONB dict —
+    # see services.agent_pdp_view_assembler._TAXONOMY_LIST_KEYS). Historical
+    # rows keep the broken shape INDEFINITELY — the reconciler only re-assembles
+    # on a truth-timestamp change — so this normalization is permanent, not a
+    # transition shim (or run scripts/backfill_agent_pdp_view.py once).
+    product["taxonomy_tags"] = normalize_taxonomy_tags(row.get("taxonomy_tags"))
 
     return product
 
