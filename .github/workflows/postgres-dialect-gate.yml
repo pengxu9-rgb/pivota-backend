@@ -82,6 +82,17 @@ on:
       # so WITHOUT this entry no pre-merge job executes those statements at all
       # (found by the #1676 review). The narrow-filter warning above, again.
       - "scripts/**"
+      # middleware/** — added 2026-08-11, the narrow-filter warning a third time.
+      # Two independent reasons:
+      #   1. Middleware DOES carry SQL. middleware/usage_logger.py INSERTs into
+      #      agent_usage_logs on the way out of every agent request, so a stray
+      #      bind parameter or literal brace there is exactly the #1588 defect
+      #      class in a directory this filter did not cover.
+      #   2. Middleware sits in front of every route this job executes. #1727
+      #      changed rate-limit enforcement for all of /agent/* and this gate did
+      #      not run on it — the one job that executes real routes skipped the
+      #      change most able to stop a real route from being reached at all.
+      - "middleware/**"
       # config/ SUPPLIES database_url — i.e. this gate's own premise — and
       # utils/ is on the gated route's import path. Both were missing on the
       # first cut, which is the narrow-filter mistake this comment warns about,
