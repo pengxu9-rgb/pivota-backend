@@ -16,6 +16,10 @@ from collections import defaultdict
 from utils.redis_client import get_redis_client
 from config.settings import settings
 
+import logging
+
+logger = logging.getLogger(__name__)
+
 def _positive_int(raw, default: int) -> int:
     """Env ints that refuse to silently become 0 — a 0 limit would block all
     unauthenticated traffic, so a typo must fall back to the default, loudly
@@ -25,6 +29,40 @@ def _positive_int(raw, default: int) -> int:
     except (TypeError, ValueError):
         return default
     return value if value > 0 else default
+
+
+def _non_negative_int(raw, default: int) -> int:
+    """Like _positive_int, but 0 is MEANINGFUL here — it disables the layer.
+
+    Kept separate on purpose: for the ceiling a 0 would block all traffic and
+    must fall back, whereas for the per-IP layer 0 is how you turn it off.
+    """
+    try:
+        value = int(str(raw).strip())
+    except (TypeError, ValueError):
+        return default
+    return value if value >= 0 else default
+
+
+def _constant_time_match(supplied: str, expected: str) -> bool:
+    """Constant-time compare that cannot 500 on a hostile header.
+
+    `secrets.compare_digest` raises TypeError on a non-ASCII str, and Starlette
+    decodes header bytes as latin-1 — so a single byte >= 0x80 in a credential
+    header raised an unhandled TypeError. Because the exemption check runs on
+    every /agent/* request, that was an unauthenticated 500 across the whole
+    public agent surface, introduced by a rate-limit fix. Comparing BYTES has no
+    such restriction; the try/except is belt-and-braces.
+    """
+    if not supplied or not expected:
+        return False
+    try:
+        return secrets.compare_digest(
+            supplied.encode("utf-8", "surrogatepass"),
+            expected.encode("utf-8", "surrogatepass"),
+        )
+    except Exception:
+        return False
 
 
 class RateLimitMiddleware(BaseHTTPMiddleware):
@@ -73,9 +111,32 @@ class RateLimitMiddleware(BaseHTTPMiddleware):
         self.anon_enabled = str(
             os.getenv("ANON_RATE_LIMIT_ENABLED", "true")
         ).strip().lower() in {"1", "true", "yes", "on"}
-        self.anon_per_ip_rpm = _positive_int(os.getenv("ANON_RATE_LIMIT_PER_IP_RPM"), 60)
+        # PER-IP DEFAULTS TO OFF (0 = disabled). Adversarial review found this the
+        # dangerous half, for reasons that are about topology rather than code:
+        # the aggregation point that matters is not Railway's CGNAT pool but the
+        # single egress IP of each server-side caller. The Node gateway and the
+        # Vercel UI each front ALL of their users from one address, so a 60/min
+        # per-IP bucket throttles every buyer behind them collectively. It is
+        # also redundant on the busiest public route — agent_shop_gateway.py
+        # already runs SHOP_INVOKE_ANON_RPM (default 60, per-IP) on
+        # /agent/shop/v1/invoke since 2026-08-08.
+        #
+        # It stays available as an opt-in knob for when a verified trusted-proxy
+        # hop count makes the identity trustworthy AND the aggregation points are
+        # exempt. Until then the global ceiling carries the whole guarantee.
+        self.anon_per_ip_rpm = _non_negative_int(
+            os.getenv("ANON_RATE_LIMIT_PER_IP_RPM"), 0
+        )
+        # The ceiling must never sit BELOW what legitimate authenticated traffic
+        # can consume, or it throttles agents inside their contracted quota and
+        # hands them a 429 with no per-agent headers to pace against. Each
+        # distinct key may spend `requests_per_minute` (RATE_LIMIT_RPM, 120 in
+        # prod), so a flat 600 was exhausted by 5 busy agents. Deriving it from
+        # that number keeps the relationship from silently inverting when
+        # RATE_LIMIT_RPM is raised.
         self.anon_global_rpm = _positive_int(
-            os.getenv("ANON_RATE_LIMIT_GLOBAL_RPM"), 600
+            os.getenv("ANON_RATE_LIMIT_GLOBAL_RPM"),
+            max(600, 10 * max(1, self.requests_per_minute)),
         )
         # Bounded in-memory fallback. The pre-existing `request_store` is an
         # unbounded defaultdict keyed on an UNVALIDATED api_key, so a caller
@@ -88,22 +149,43 @@ class RateLimitMiddleware(BaseHTTPMiddleware):
         )
         self._anon_last_prune = 0.0
     
-    def _is_admin_caller(self, request: Request) -> bool:
-        """A valid X-ADMIN-KEY is not the anonymous abuse we are limiting.
+    def _is_exempt_caller(self, request: Request) -> bool:
+        """Credentialled internal callers are not the anonymous abuse we limit.
 
-        `/agent/internal/promotions` authenticates with X-ADMIN-KEY rather than
-        the agent dependency (routes/merchant_promotions_api.py), so it sends no
-        x-api-key and would otherwise land in the anonymous bucket. It is polled
-        internally roughly every 30s. Constant-time compare, same credential
-        pair as utils.auth.require_admin_or_key.
+        Two headers, both compared in constant time against env values:
+
+        X-ADMIN-KEY — /agent/internal/promotions and ~8 sibling internal routers
+        authenticate with this rather than the agent dependency, send no
+        x-api-key, and are polled internally (~2/min).
+
+        X-Internal-Key — /agent/internal/auth/introspect
+        (routes/agent_internal_auth.py). THIS ONE IS A HARD BLOCKER, not a
+        nicety. It is the endpoint the Node gateway calls to validate EVERY
+        agent API key, from a single egress IP. Without the exemption it lands
+        in the anonymous path, and a 429 there is classified
+        AUTH_INTROSPECT_REJECTED by the gateway — a code deliberately EXCLUDED
+        from its emergency-auth-fallback allowlist, which only accepts
+        AUTH_INTROSPECT_UNAVAILABLE and AUTH_INTROSPECT_ERROR_RESULT. So a 429
+        is treated WORSE than a 500 and returns 503 for every authenticated
+        agent request, with no negative caching to damp the retry rate. A
+        control aimed at anonymous abuse would have taken down authenticated
+        commerce. Verified in PIVOTA-Agent/src/server.js.
         """
-        supplied = (request.headers.get("x-admin-key") or "").strip()
-        if not supplied:
-            return False
-        for env_name in ("PROMOTIONS_ADMIN_KEY", "ADMIN_API_KEY"):
-            expected = (os.getenv(env_name) or "").strip()
-            if expected and secrets.compare_digest(supplied, expected):
-                return True
+        admin_supplied = (request.headers.get("x-admin-key") or "").strip()
+        if admin_supplied:
+            for env_name in ("PROMOTIONS_ADMIN_KEY", "ADMIN_API_KEY"):
+                if _constant_time_match(
+                    admin_supplied, (os.getenv(env_name) or "").strip()
+                ):
+                    return True
+
+        internal_supplied = (request.headers.get("x-internal-key") or "").strip()
+        if internal_supplied and _constant_time_match(
+            internal_supplied,
+            (os.getenv("AGENT_AUTH_INTROSPECT_INTERNAL_KEY") or "").strip(),
+        ):
+            return True
+
         return False
 
     @staticmethod
@@ -148,35 +230,68 @@ class RateLimitMiddleware(BaseHTTPMiddleware):
             # Not an IP at all — a caller sending junk must not get its own
             # bucket per junk value, or rotation is trivially free.
             return None
+        # ::ffff:203.0.113.5 and 203.0.113.5 are the SAME host; without this they
+        # were two buckets, i.e. double the per-IP budget for one caller. The
+        # docstring above already claimed spellings were normalised, so this is
+        # the claim being made true rather than a new feature.
+        parsed = getattr(parsed, "ipv4_mapped", None) or parsed
         if parsed.is_loopback or parsed.is_unspecified:
             return None
         return f"ip:{parsed.compressed}"
 
     def _hit_window(self, key: str, now: float) -> int:
-        """Count this hit in a bounded, pruned in-memory sliding window."""
-        # Opportunistic global prune: without it this dict grows once per
-        # distinct key forever, which an attacker rotating X-Forwarded-For can
-        # drive. Pruning is O(tracked keys) and runs at most once a window.
+        """Fixed-window counter, deliberately matching the Redis algorithm.
+
+        This used to keep a list of timestamps (a SLIDING window) while Redis
+        used a fixed window, so the limit actually enforced depended on whether
+        Redis was up — and the keyed path permanently sets `self.redis = None`
+        after one error, so a single blip silently flipped the algorithm for the
+        life of the process. Two backends must not disagree about what the limit
+        means.
+
+        Storing (bucket, count) instead of a timestamp list also removes an
+        O(n)-per-request rebuild that measured 28s of event-loop CPU for one 60s
+        window at 1k rps, and bounds each entry to two integers. The store's KEY
+        count was capped before; each entry's SIZE was not.
+        """
+        bucket = int(now // self.window_seconds)
+
         if now - self._anon_last_prune > self.window_seconds:
-            cutoff = now - self.window_seconds
-            for existing in list(self._anon_store.keys()):
-                kept = [ts for ts in self._anon_store[existing] if ts > cutoff]
-                if kept:
-                    self._anon_store[existing] = kept
-                else:
+            for existing, (existing_bucket, _) in list(self._anon_store.items()):
+                if existing_bucket != bucket:
                     del self._anon_store[existing]
             self._anon_last_prune = now
 
-        bucket = [ts for ts in self._anon_store.get(key, ()) if now - ts < self.window_seconds]
-        bucket.append(now)
-        if key not in self._anon_store and len(self._anon_store) >= self._anon_store_cap:
-            # At the cap we stop TRACKING new keys rather than start evicting
-            # live ones: evicting would let a rotating attacker flush a
-            # legitimate client's counter. Untracked keys still face the global
-            # ceiling, which is the rotation-proof half anyway.
+        current = self._anon_store.get(key)
+        if current is None or current[0] != bucket:
+            if key not in self._anon_store and len(self._anon_store) >= self._anon_store_cap:
+                # At the cap, stop TRACKING new keys rather than evicting live
+                # ones — eviction would let a rotating attacker flush a
+                # legitimate client's counter. Returning 1 means "not limited",
+                # which is safe here because the ceiling is a separate key that
+                # is always already tracked (it is charged on every request, so
+                # it is inserted first and never evicted).
+                return 1
+            self._anon_store[key] = (bucket, 1)
             return 1
-        self._anon_store[key] = bucket
-        return len(bucket)
+
+        count = current[1] + 1
+        self._anon_store[key] = (bucket, count)
+        return count
+
+    def _refund_window(self, key: str, now: float) -> None:
+        """Un-count a hit that was rejected.
+
+        A rejected request must not top up the window that rejected it, or a
+        caller ignoring its 429s keeps its own bucket permanently full — and on
+        the GLOBAL key that means one attacker holds the entire public agent
+        surface at 429 indefinitely, long after it would otherwise have
+        recovered.
+        """
+        bucket = int(now // self.window_seconds)
+        current = self._anon_store.get(key)
+        if current is not None and current[0] == bucket and current[1] > 0:
+            self._anon_store[key] = (bucket, current[1] - 1)
 
     async def _count_hit(self, key: str, now: float) -> int:
         """Redis when available (shared across instances), else in-memory."""
@@ -185,30 +300,77 @@ class RateLimitMiddleware(BaseHTTPMiddleware):
                 bucket = int(now // self.window_seconds)
                 redis_key = f"anon_rate_limit:{key}:{bucket}"
                 count = await self.redis.incr(redis_key)
-                await self.redis.expire(redis_key, self.window_seconds * 2)
+                if count == 1:
+                    # Only on creation: one fewer round trip per request, and the
+                    # key cannot outlive its window without a TTL.
+                    await self.redis.expire(redis_key, self.window_seconds * 2)
                 return int(count)
             except Exception:
-                # Fail OPEN on infrastructure failure, and do not disable redis
-                # process-wide for a transient blip the way the keyed path does.
+                # Fail OPEN on the verdict. NOTE this is not a circuit breaker:
+                # see utils/redis_client.py, which now sets socket timeouts so a
+                # blackholed Redis cannot turn failing-open into a hang.
                 return 0
         return self._hit_window(key, now)
 
-    async def _reject_global(self, now: float, reset_at: int):
+    async def _refund_hit(self, key: str, now: float) -> None:
+        if self.redis is not None:
+            try:
+                bucket = int(now // self.window_seconds)
+                await self.redis.decr(f"anon_rate_limit:{key}:{bucket}")
+                return
+            except Exception:
+                return
+        self._refund_window(key, now)
+
+    async def _reject_global(self, request: Request, now: float, reset_at: int):
         """Layer 2 — the identity-independent ceiling. See _reject_anonymous."""
         if not self.anon_enabled:
             return None
-        if await self._count_hit("global", now) > self.anon_global_rpm:
+        count = await self._count_hit("global", now)
+        if count > self.anon_global_rpm:
+            await self._refund_hit("global", now)
+            # A single global counter that can reject public traffic must not be
+            # invisible. StructuredLoggingMiddleware's JSON does not reach stdout
+            # in prod, so without this an operator sees uvicorn's bare 429 line
+            # and has no way to know the CEILING fired rather than a per-key
+            # bucket, nor which caller consumed the budget.
+            logger.warning(
+                "anon_rate_limit_ceiling_engaged path=%s count=%s limit=%s "
+                "identity=%s",
+                request.url.path,
+                count,
+                self.anon_global_rpm,
+                self._anonymous_identity(request) or "unidentified",
+            )
             return self._anon_429(now, reset_at)
+        if count == int(self.anon_global_rpm * 0.8):
+            logger.warning(
+                "anon_rate_limit_ceiling_at_80pct count=%s limit=%s",
+                count,
+                self.anon_global_rpm,
+            )
         return None
 
     async def _reject_per_identity(self, request: Request, now: float, reset_at: int):
-        """Layer 1 — per-client fairness for keyless callers. See below."""
-        if not self.anon_enabled:
+        """Layer 1 — per-client fairness. DISABLED by default (rpm 0).
+
+        See the note in __init__ for why: the aggregation points that matter are
+        server-side callers' single egress IPs, not client addresses.
+        """
+        if not self.anon_enabled or self.anon_per_ip_rpm <= 0:
             return None
         identity = self._anonymous_identity(request)
         if identity is None:
             return None
-        if await self._count_hit(identity, now) > self.anon_per_ip_rpm:
+        count = await self._count_hit(identity, now)
+        if count > self.anon_per_ip_rpm:
+            await self._refund_hit(identity, now)
+            logger.warning(
+                "anon_rate_limit_per_ip_engaged identity=%s count=%s limit=%s",
+                identity,
+                count,
+                self.anon_per_ip_rpm,
+            )
             return self._anon_429(now, reset_at)
         return None
 
@@ -232,9 +394,9 @@ class RateLimitMiddleware(BaseHTTPMiddleware):
 
         Never publishes either threshold — see _stamp_authenticated_limits.
         """
-        return await self._reject_global(now, reset_at) or await self._reject_per_identity(
+        return await self._reject_global(
             request, now, reset_at
-        )
+        ) or await self._reject_per_identity(request, now, reset_at)
 
     @staticmethod
     def _anon_429(now: float, reset_at: int) -> JSONResponse:
@@ -384,9 +546,9 @@ class RateLimitMiddleware(BaseHTTPMiddleware):
         # Full bypass, checked FIRST: an internal trusted key, or a valid
         # X-ADMIN-KEY (which is how /agent/internal/promotions authenticates —
         # it sends no x-api-key and is polled internally every ~30s).
-        if (api_key and api_key in self.trusted_api_keys) or self._is_admin_caller(
-            request
-        ):
+        if (
+            api_key and api_key in self.trusted_api_keys
+        ) or self._is_exempt_caller(request):
             response = await call_next(request)
             self._stamp_authenticated_limits(request, response, reset_at)
             return response
@@ -403,7 +565,7 @@ class RateLimitMiddleware(BaseHTTPMiddleware):
         # quota — their real quota is the per-agent limit enforced in
         # routes/agent_auth.py. It is sized so legitimate traffic never meets it
         # (see _reject_anonymous for the measured baseline).
-        rejection = await self._reject_global(now, reset_at)
+        rejection = await self._reject_global(request, now, reset_at)
         if rejection is not None:
             return rejection
 

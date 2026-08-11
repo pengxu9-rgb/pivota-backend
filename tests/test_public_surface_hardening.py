@@ -1,7 +1,13 @@
 """Guardrails on the two uncontrolled public surfaces (2026-08-08 audit):
 POST /agent/account/register (mints ak_live_* keys with no gate/throttle) and
-POST /agent/shop/v1/invoke (unmetered for credential-less callers — the
-RateLimitMiddleware only counts requests that carry an API key)."""
+POST /agent/shop/v1/invoke (unmetered for credential-less callers).
+
+CORRECTION 2026-08-11: the parenthetical used to end "— the RateLimitMiddleware
+only counts requests that carry an API key". That is no longer true. The
+middleware now applies an identity-independent ceiling to ALL non-exempt
+/agent/* requests, keyless included (see tests/test_anonymous_rate_limit.py).
+The per-route throttle these tests cover is still the finer-grained control for
+/invoke and remains authoritative there."""
 import pytest
 from fastapi import FastAPI
 from fastapi.testclient import TestClient

@@ -398,6 +398,22 @@ def _review_media_client_ip(request: Request) -> str:
 # anonymous callers: RateLimitMiddleware only counts requests that carry an API
 # key, and the agent-ui proxy authenticates with a trusted key — so the one
 # caller class with no identity had no throttle at all (2026-08-08 audit).
+#
+# UPDATE 2026-08-11: the second sentence is no longer true. RateLimitMiddleware
+# now applies an identity-independent ceiling to ALL non-exempt /agent/*
+# requests, keyless included, so this route has two independent counters. This
+# per-IP one is the finer-grained of the two and stays authoritative for
+# /invoke; the middleware's per-IP layer ships DISABLED partly because it would
+# duplicate this one at the same default (60/min). If you consolidate them,
+# consolidate onto ONE 429 shape — this raises {"detail": ...} while the
+# middleware returns {"error": ..., "message": ..., "retry_after": ...}.
+#
+# NOTE also that _review_media_client_ip above falls back to
+# `request.client.host`, which behind Railway is the platform's CGNAT proxy pool
+# (measured: every peer in 100.64.0.0/10). For callers that send no
+# X-Forwarded-For that collapses distinct clients into one bucket, so one abuser
+# can throttle others. Pre-existing, deliberately not changed here to keep this
+# a rate-limit-middleware change; it wants its own PR.
 # Scope precisely: requests carrying ANY credential (X-API-Key / Bearer /
 # X-Checkout-Token) are untouched — the first-party proxy and keyed agents keep
 # today's behavior — and only credential-less direct hits are limited per IP.
