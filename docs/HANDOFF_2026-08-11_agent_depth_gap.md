@@ -41,20 +41,57 @@ rows in the canonical feed (`GET /api/canonical/products`); ~**11,122** rows in
   missed a ~2–3% cohort. (0/39 only bounds prevalence below ~7.5%.)
 - I also reported flags as "off" from code defaults when prod had them **on**.
   Always `railway variables --service <svc> --json` before claiming a flag state.
+- And the inverse, which is worse and which bit workstream 1: I read a flag as
+  **on** in prod and concluded the behavior it gates therefore worked. It did
+  not — the gated code path was broken by a non-existent column name and failed
+  silently behind a best-effort `except`. **A flag is evidence of intent, never
+  of function.** Prove the path ran: check for the row it should have written,
+  not the switch that should have caused it.
 
 ## The four workstreams, in recommended order
 
 ### 1. Enrichment propagation backfill — smallest, do it first
 
-~**138** enriched rows (360 in `product_enrichment` minus 217 in the view)
-predate the `SERVE_PDP_ENRICHMENT_ON_WRITE` flip and never reached
-`agent_pdp_view`. That flag is now **`=1` in prod**, so new writes propagate;
-only the historical set is stranded. One targeted re-assembly of the enriched
+> **CORRECTION 2026-08-11 — this section was WRONG TWICE as originally written,
+> and one of its errors was dangerous. Both defects are fixed on branch
+> `claude/enrichment-propagation-backfill` (worktree
+> `/Users/pengchydan/dev/pivota-wt-enrichment`); the prod dry-run and `--apply`
+> are still owed. Read this correction before acting.**
+>
+> **(a) The on-write bridge never worked, so the stranded set is GROWING, not
+> frozen at ~138.** I wrote that `SERVE_PDP_ENRICHMENT_ON_WRITE=1` meant new
+> writes propagate. The flag genuinely is set in prod — but
+> `refresh_agent_pdp_view_for_enrichment_write` queried
+> `catalog_products.platform_product_id`, a column that does not exist (it is
+> `source_product_id`). Postgres rejects that at PREPARE, a best-effort
+> `except` swallowed it, and the bridge returned False on every call. **A flag
+> being ON is not evidence its code path works** — the same error this doc
+> warns about below, in a third form.
+>
+> **(b) `scripts/backfill_agent_pdp_view.py` was the WRONG entry point and
+> `--apply` would have DESTROYED data.** It called `assemble_row` with no
+> `evidence=` / `enrichment=` / `seller_trust_by_id=`, and `UPSERT_SQL` assigns
+> every column from `EXCLUDED` — so it wiped `bullet_points`,
+> `usage_scenarios`, `evidence_profile`, `required_disclaimers` and the curated
+> description on every row it touched, including the ~217 rows already serving
+> correctly. Demonstrated on a real Postgres, not argued. Do not run that
+> script from an older checkout.
+>
+> **The safe primitive is `refresh_agent_pdp_view_for_content_key`** — it
+> fetches evidence and overlays enrichment, which is why workstream 2 below
+> (which uses it) was never affected.
+
+~**138** enriched rows (360 in `product_enrichment` minus 217 in the view) had
+not reached `agent_pdp_view` when measured on 2026-08-10; per correction (a),
+treat that as a floor and re-measure. One targeted re-assembly of the enriched
 `content_key`s surfaces them — and as a free side effect repairs the stored
 double-encoded `taxonomy_tags` on those rows (see "already fixed" below).
 
-Entry points: `services/agent_pdp_view_assembler.py`
-(`refresh_agent_pdp_view_for_content_key`), `scripts/backfill_agent_pdp_view.py`.
+Entry point: `services/agent_pdp_view_assembler.py`
+(`refresh_agent_pdp_view_for_content_key`), or the repaired
+`scripts/backfill_agent_pdp_view.py` **from that branch only**, which now
+delegates to a `build_agent_pdp_view_row` primitive and takes
+`--scope enriched`.
 
 ### 2. INCI ingestion — biggest content-depth jump available
 
