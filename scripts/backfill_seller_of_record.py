@@ -749,65 +749,30 @@ class SellerBackfill:
         sellers_seen: set = set()
 
         # Plan every product first (read-only), then execute batched.
+        # _plan_one mutates nothing, so a row whose lookup dies on a proxy
+        # flake retries on a fresh connection without double-counting stats.
         planned: List[Dict[str, Any]] = []
         for p in products:
-            brand = str(p.get("brand") or "").strip()
-            dest, dest_resolved = _plan_domain(p)
-            if _is_excluded_rig_row(p):
-                stats["review_excluded_rig"] += 1
-                unresolvable.append({"product_key": p.get("product_key"),
-                                     "brand": brand, "domain": dest,
-                                     "reason": "excluded_test_rig_dev_store"})
-                continue
-            if not dest_resolved:
-                # No row-owned candidate names a plausible seller. Review —
-                # never fall through to a resolver without the registrable
-                # guard, which would mint an identity on a bare public suffix.
-                stats["review_unresolvable"] += 1
-                unresolvable.append({"product_key": p.get("product_key"),
-                                     "brand": brand, "domain": dest,
-                                     "reason": "seller_of_record_unresolved"})
-                continue
-            # W2 keying decides the IDENTITY SHAPE first: a retailer domain keys
-            # on etld1 alone (one retailer = one merchant), everything else
-            # keeps the brand-direct path (which also handles anchors/claims).
-            kind = "brand_direct"
-            try:
-                ident = resolve_seed_seller_identity(brand=brand, domain=dest)
-                kind = ident["kind"]
-            except ValueError:
-                ident = None
-            if ident is not None and kind == "retailer":
-                seller_ref, disposition = ident["merchant_id"], "retailer_domain"
-                stats["retailer_keyed"] += 1
-            else:
-                res = await resolve_seller_readonly(
-                    self.si, anchor_merchant_id=None, brand=brand, destination_domain=dest
-                )
-                seller_ref, disposition = res.seller_ref, res.disposition
-            if seller_ref is None:
-                stats["review_unresolvable"] += 1
-                unresolvable.append({"product_key": p.get("product_key"),
-                                     "brand": brand, "domain": dest,
-                                     "reason": disposition})
-                continue
-            collision = await self._fragmentation_collision(seller_ref, brand, dest, p)
-            if collision:
+            verdict, payload = await self._retry_after_reset(
+                lambda p=p: self._plan_one(p), what=f"plan {p.get('product_key')}")
+            if verdict in ("rig", "unresolvable"):
+                key = "review_excluded_rig" if verdict == "rig" else "review_unresolvable"
+                stats[key] += 1
+                unresolvable.append(payload)
+            elif verdict == "collision":
                 stats["review_collision"] += 1
-                collisions.append(collision)
-                continue
-            sellers_seen.add(seller_ref)
-            # The identity listing may live under the catalog row's
-            # source_product_id (Path B: the ext id) OR the attached seed's
-            # external_product_id (Path C: source_product_id is a name slug;
-            # measured 2026-08-07 — 0 Path C listings under the slug, 2,444
-            # under the seed id). Carry every candidate.
-            listing_pids = [str(v) for v in dict.fromkeys(
-                [p.get("source_product_id"), p.get("seed_external_product_id"),
-                 *(p.get("seed_listing_ids") or [])]) if v]
-            planned.append({**p, "observed_id": seller_ref, "disposition": disposition,
-                            "seller_kind": kind, "seller_domain": dest,
-                            "listing_product_ids": listing_pids})
+                collisions.append(payload)
+            elif verdict == "planned":
+                sellers_seen.add(payload["observed_id"])
+                # Counted here, not at resolve time: retailer_keyed now means
+                # "retailer rows actually PLANNED" — a retailer row routed to
+                # collision review no longer inflates it (delta vs pre-refactor
+                # reports, where the count included collided rows).
+                if payload["seller_kind"] == "retailer":
+                    stats["retailer_keyed"] += 1
+                planned.append(payload)
+            else:  # a verdict typo must never fall through to the WRITE path
+                raise RuntimeError(f"unknown planning verdict {verdict!r}")
 
         stats["distinct_sellers"] = len(sellers_seen)
         report.review_queue["catalog_collision"] = collisions
@@ -819,29 +784,109 @@ class SellerBackfill:
                 stats["stopped_at_max_batches"] = self.max_batches
                 break
             batch = planned[i:i + self.batch_size]
-            parity = await self._resubject_batch(batch, cascade, report)
+            # Each batch is one transaction: a flake mid-batch rolls back
+            # cleanly, so one retry on a fresh connection re-does the whole
+            # batch from a clean slate.
+            parity = await self._retry_after_reset(
+                lambda batch=batch: self._resubject_batch(batch, cascade),
+                what=f"batch {stats['batches'] + 1}")
+            if parity.get("skipped_to_review"):
+                report.review_queue.setdefault(
+                    "catalog_execute_skips", []).extend(parity["skipped_to_review"])
             report.parity.append(parity)
             stats["batches"] += 1
             stats["resubjected"] += parity.get("resubjected", 0)
         report.catalog = stats
+
+    async def _plan_one(self, p: Dict[str, Any]) -> tuple:
+        """Plan ONE product (read-only, mutates nothing) so a proxy flake can
+        retry the row on a fresh connection. Returns (verdict, payload):
+        'rig' / 'unresolvable' -> a review entry, 'collision' -> the collision
+        record, 'planned' -> the planned row."""
+        brand = str(p.get("brand") or "").strip()
+        dest, dest_resolved = _plan_domain(p)
+        if _is_excluded_rig_row(p):
+            return "rig", {"product_key": p.get("product_key"), "brand": brand,
+                           "domain": dest, "reason": "excluded_test_rig_dev_store"}
+        if not dest_resolved:
+            # No row-owned candidate names a plausible seller. Review — never
+            # fall through to a resolver without the registrable guard, which
+            # would mint an identity on a bare public suffix.
+            return "unresolvable", {"product_key": p.get("product_key"), "brand": brand,
+                                    "domain": dest, "reason": "seller_of_record_unresolved"}
+        # W2 keying decides the IDENTITY SHAPE first: a retailer domain keys
+        # on etld1 alone (one retailer = one merchant), everything else
+        # keeps the brand-direct path (which also handles anchors/claims).
+        kind = "brand_direct"
+        try:
+            ident = resolve_seed_seller_identity(brand=brand, domain=dest)
+            kind = ident["kind"]
+        except ValueError:
+            ident = None
+        if ident is not None and kind == "retailer":
+            seller_ref, disposition = ident["merchant_id"], "retailer_domain"
+        else:
+            res = await resolve_seller_readonly(
+                self.si, anchor_merchant_id=None, brand=brand, destination_domain=dest
+            )
+            seller_ref, disposition = res.seller_ref, res.disposition
+        if seller_ref is None:
+            return "unresolvable", {"product_key": p.get("product_key"), "brand": brand,
+                                    "domain": dest, "reason": disposition}
+        collision = await self._fragmentation_collision(seller_ref, brand, dest, p)
+        if collision:
+            return "collision", collision
+        # The identity listing may live under the catalog row's
+        # source_product_id (Path B: the ext id) OR the attached seed's
+        # external_product_id (Path C: source_product_id is a name slug;
+        # measured 2026-08-07 — 0 Path C listings under the slug, 2,444
+        # under the seed id). Carry every candidate.
+        listing_pids = [str(v) for v in dict.fromkeys(
+            [p.get("source_product_id"), p.get("seed_external_product_id"),
+             *(p.get("seed_listing_ids") or [])]) if v]
+        return "planned", {**p, "observed_id": seller_ref, "disposition": disposition,
+                           "seller_kind": kind, "seller_domain": dest,
+                           "listing_product_ids": listing_pids}
+
+    async def _retry_after_reset(self, thunk, *, what: str):
+        """Run `thunk` once; on failure, HARD-reset the shared DB connection
+        and run it exactly once more, propagating the second failure.
+
+        Why a hard reset: a socket death in the middle of an operation leaves
+        `databases`' task-local Connection permanently wedged ("Connection is
+        already acquired") — every later query in the run fails until the
+        Connection object is discarded. `disconnect()` drops the task's
+        Connection and `connect()` rebuilds the pool, so the retry runs clean
+        (verified against databases==0.7.0 core). This is a bounded retry of
+        the SAME route on a fresh connection, never a degraded answer — a
+        deterministic failure fails again and aborts the run loudly
+        (2026-08-09: two warn-and-continue guards turned one flake into a run
+        planning with its safety checks silently disarmed)."""
+        try:
+            return await thunk()
+        except Exception as exc:  # noqa: BLE001 — one bounded retry, then raise
+            logger.warning("%s failed (%s); hard-resetting the DB connection "
+                           "and retrying once", what, str(exc)[:200])
+            await self.db.disconnect()
+            await self.db.connect()
+            return await thunk()
 
     async def _fragmentation_collision(
         self, observed_id: str, brand: str, dest: str, product: Dict[str, Any]
     ) -> Optional[Dict[str, Any]]:
         """ADR-008 fragmentation guard (always-on since W5 P2) as the collision
         tripwire (ADR-009 D4.3): if the same brand+host is ALREADY canonical under
-        a DIFFERENT real merchant, route to review — do NOT merge identities."""
-        try:
-            from services.audit_index_intake import _existing_brand_canonical_conflict
-        except Exception:  # pragma: no cover - import guard
-            return None
+        a DIFFERENT real merchant, route to review — do NOT merge identities.
+
+        A failed lookup PROPAGATES. It must never read as "no collision": that
+        answer disarms the anti-merge tripwire exactly when the connection is
+        broken — and a wedged connection breaks every later lookup in the run
+        (observed 2026-08-09, run 31345305445). The import is local to avoid
+        a cycle, but an import FAILURE propagates too — an unimportable guard
+        answering "no collision" for the whole run is the same defect."""
+        from services.audit_index_intake import _existing_brand_canonical_conflict
         fields = {"brand": brand, "source_domain": dest, "canonical_url": product.get("canonical_url")}
-        try:
-            conflict = await _existing_brand_canonical_conflict(observed_id, fields)
-        except Exception as exc:  # noqa: BLE001
-            logger.warning("fragmentation guard lookup failed for %s: %s",
-                           product.get("product_key"), str(exc)[:200])
-            return None
+        conflict = await _existing_brand_canonical_conflict(observed_id, fields)
         if not conflict:
             return None
         cm = str(conflict.get("merchant_id") or "")
@@ -856,7 +901,6 @@ class SellerBackfill:
 
     async def _resubject_batch(
         self, batch: List[Dict[str, Any]], cascade: List[Dict[str, Any]],
-        report: BackfillReport,
     ) -> Dict[str, Any]:
         pks = [str(b["product_key"]) for b in batch]
         # BEFORE: parity snapshots (row count, sig set, servable set).
@@ -984,8 +1028,10 @@ class SellerBackfill:
             before_done["servable_count"] = len(before_done["servable"])
             parity = self._diff_parity(before_done, after, residue)
             if skipped_in_batch:
+                # Report mutation happens in the CALLER off the returned
+                # parity — this method must stay retry-safe (a retried batch
+                # would double-extend the review queue from here).
                 parity["skipped_to_review"] = skipped_in_batch
-                report.review_queue.setdefault("catalog_execute_skips", []).extend(skipped_in_batch)
             if not parity["ok"]:
                 raise RuntimeError(
                     f"A9-4 batch parity FAILED (loud abort, no silent absorb): {parity}"
