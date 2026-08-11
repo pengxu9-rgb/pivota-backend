@@ -99,6 +99,71 @@ async def test_anchor_owns_domain_empty_inputs_false(monkeypatch):
     assert await si._anchor_owns_domain("merch_2", "") is False
 
 
+class _DoorDB(_OwnDB):
+    """_OwnDB where any of the three ownership lookups can be independently
+    broken (raises like a dead/wedged connection)."""
+
+    def __init__(self, *, break_catalog=False, break_onboarding=False,
+                 break_stores=False, **kwargs) -> None:
+        super().__init__(**kwargs)
+        self.break_catalog = break_catalog
+        self.break_onboarding = break_onboarding
+        self.break_stores = break_stores
+
+    async def fetch_one(self, query: str, values: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+        if "catalog_merchants" in query and self.break_catalog:
+            raise RuntimeError("connection was closed in the middle of operation")
+        if "merchant_onboarding" in query and self.break_onboarding:
+            raise AssertionError("Connection is already acquired")
+        return await super().fetch_one(query, values)
+
+    async def fetch_all(self, query: str, values: Dict[str, Any]) -> List[Dict[str, Any]]:
+        if self.break_stores:
+            raise RuntimeError("connection was closed in the middle of operation")
+        return await super().fetch_all(query, values)
+
+
+class TestAnchorOwnsDomainFailFastDoors:
+    """2026-08-09, run 31345305445: on a wedged connection the per-lookup
+    swallows made _anchor_owns_domain answer CROSS for every caller, silently
+    fragmenting one merchant into observed duplicates. Every door must answer
+    BOTH ways: a working lookup answers the question, a broken lookup RAISES —
+    never defaults to the permissive answer."""
+
+    @pytest.mark.asyncio
+    async def test_broken_catalog_merchants_lookup_propagates(self, monkeypatch):
+        monkeypatch.setattr(si, "database", _DoorDB(break_catalog=True))
+        with pytest.raises(RuntimeError, match="closed in the middle"):
+            await si._anchor_owns_domain("merch_1", "brand.com")
+
+    @pytest.mark.asyncio
+    async def test_broken_merchant_onboarding_lookup_propagates(self, monkeypatch):
+        # The first lookup is healthy (and answers "no match") — the failure in
+        # the SECOND lookup must still propagate, not fall through to stores.
+        monkeypatch.setattr(si, "database", _DoorDB(
+            catalog_source_ref="other.com", break_onboarding=True))
+        with pytest.raises(AssertionError, match="already acquired"):
+            await si._anchor_owns_domain("merch_1", "brand.com")
+
+    @pytest.mark.asyncio
+    async def test_broken_merchant_stores_lookup_propagates(self, monkeypatch):
+        # First two lookups healthy, no match; the LAST door must also raise
+        # rather than settle for the accumulated False.
+        monkeypatch.setattr(si, "database", _DoorDB(
+            catalog_source_ref="other.com", mcp_shop_domain="other.com",
+            break_stores=True))
+        with pytest.raises(RuntimeError, match="closed in the middle"):
+            await si._anchor_owns_domain("merch_1", "brand.com")
+
+    @pytest.mark.asyncio
+    async def test_healthy_lookups_still_answer_both_ways(self, monkeypatch):
+        # Positive control both ways: owner -> True, non-owner -> False.
+        monkeypatch.setattr(si, "database", _DoorDB(store_domains=["www.brand.com"]))
+        assert await si._anchor_owns_domain("merch_1", "brand.com") is True
+        monkeypatch.setattr(si, "database", _DoorDB(store_domains=["other.com"]))
+        assert await si._anchor_owns_domain("merch_1", "brand.com") is False
+
+
 # --- derive_seed_seller branching ---------------------------------------------
 
 
