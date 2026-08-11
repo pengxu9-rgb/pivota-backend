@@ -42,6 +42,7 @@ except ModuleNotFoundError:
     )
 import subprocess
 import os
+import secrets
 from pathlib import Path
 from utils.database_readiness import (
     DatabaseUnavailableError,
@@ -1937,7 +1938,7 @@ def _health_timeout_seconds(name: str, default: float, *, min_value: float = 0.5
 
 
 async def _probe_caller_is_admin(request: Request) -> bool:
-    """Is THIS caller an admin? Never raises, never blocks the request.
+    """Is THIS caller an admin? Never raises `Exception`, never blocks the request.
 
     The public probes below (`/health`, `/version`) must keep answering for
     anonymous callers — Railway's healthcheck reads /health's status code and an
@@ -1949,6 +1950,21 @@ async def _probe_caller_is_admin(request: Request) -> bool:
     must not gain a new way to fail.
     """
     try:
+        # BOTH admin credentials this repo recognises, matching
+        # utils.auth.require_admin_or_key: an operator who authenticates with
+        # X-ADMIN-KEY would otherwise get the redacted view with no explanation.
+        admin_key = (request.headers.get("x-admin-key") or "").strip()
+        if admin_key:
+            expected = [
+                (os.getenv("ADMIN_API_KEY") or "").strip(),
+                (os.getenv("PROMOTIONS_ADMIN_KEY") or "").strip(),
+            ]
+            if any(
+                candidate and secrets.compare_digest(admin_key, candidate)
+                for candidate in expected
+            ):
+                return True
+
         header = request.headers.get("authorization") or ""
         scheme, _, token = header.partition(" ")
         if scheme.lower() != "bearer" or not token.strip():
@@ -1962,6 +1978,9 @@ async def _probe_caller_is_admin(request: Request) -> bool:
         )
         return (user or {}).get("role") in ("admin", "super_admin")
     except Exception:
+        # Deliberately Exception, not BaseException: CancelledError must still
+        # propagate. get_current_user has no await points, so none is
+        # deliverable inside this block anyway.
         return False
 
 
@@ -2016,13 +2035,21 @@ async def health_check(request: Request):
     #
     # Everything a health check owes an anonymous caller is here: the status
     # code (all Railway's healthcheck reads), whether the DB answered, and the
-    # error TYPE. What used to ride along was a recon payload — the exact
+    # error TYPE. What used to ride along was a recon payload: the exact
     # rate-limit threshold, whether Shopify discount reconciliation is
     # enforcing or merely observing, a mounted-route map, and on a degraded
-    # response the names of missing schema columns. None of that is in the
-    # response headers, so unlike the commit SHA (which
-    # `add_service_version_headers` already publishes on EVERY response) it was
-    # a genuine marginal disclosure.
+    # response the names of missing schema columns.
+    #
+    # HOW MUCH EACH ONE ACTUALLY BUYS, stated honestly rather than uniformly:
+    #   * shopify_discount_reconciliation_mode, runtime_contracts and the
+    #     missing-column NAMES are genuinely new closures — they appear nowhere
+    #     else on an anonymous response.
+    #   * rate_limit_rpm is NOT. `middleware/rate_limiter.py` stamps
+    #     `X-RateLimit-Limit: <rate_limit_rpm>` on every `/agent/*` response
+    #     whenever any x-api-key header is present — including 401s and 404s,
+    #     so an invalid key reads it. Removing it from this body is tidiness,
+    #     not containment. Closing that properly means changing the rate-limit
+    #     middleware, which is a different blast radius and not attempted here.
     #
     # Build identity is deliberately still public: removing it from this body
     # while the middleware stamps X-Service-Commit on every 404 would be
@@ -2036,15 +2063,16 @@ async def health_check(request: Request):
         "build": _runtime_build_payload(),
         "version": _service_version_payload(),
     }
+    # UNCONDITIONAL: presence without content. An operator watching the public
+    # probe still learns that schema drift EXISTS and needs a credential only to
+    # read which columns — the outage signal survives, the schema map does not.
+    # Emitted for admins too, so authenticating never REMOVES a field (a
+    # dashboard trending this count must not break the day it gets a token).
+    body["missing_columns_count"] = sum(len(v) for v in missing.values())
     if await _probe_caller_is_admin(request):
         body["missing_columns"] = missing
         body["runtime_contracts"] = _runtime_contracts_payload()
         body["settings_contract"] = _settings_contract_payload()
-    else:
-        # Presence without content: an operator watching the public probe can
-        # still see that schema drift EXISTS and needs an admin token to read
-        # which columns — the outage signal survives, the schema map does not.
-        body["missing_columns_count"] = sum(len(v) for v in missing.values())
 
     return JSONResponse(status_code=status_code, content=body)
 

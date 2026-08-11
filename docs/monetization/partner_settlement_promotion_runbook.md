@@ -76,12 +76,34 @@ PARTNER_REV_SHARE_USE_V2=true
 ```
 
 This changes nothing until a settlement actually runs (both crons are still
-paused), so it is safe to set now and verify via `/version` / a redeploy.
-  NOTE (2026-08-11): `/version`'s `settings_contract` is now ADMIN-ONLY — it
-  published the rate-limit threshold and whether discount reconciliation is
-  enforcing to anonymous callers. Send an admin bearer token:
-  `curl -H "Authorization: Bearer $ADMIN_JWT" https://api.pivota.cc/version`.
-Rollback: set back to `false`.
+paused), so it is safe to set now.
+
+**Verifying it took (corrected 2026-08-11).** No HTTP probe publishes this flag —
+not `/version`, not `/config-check`, not `/admin/config/check`. An earlier
+revision of this runbook said to "verify via `/version`", and a note I added on
+top of it implied an admin token would reveal the value; both were wrong.
+`/version` only tells you **which build is live**, which is the part that matters
+here: the flag is read at import time in `config/settings.py`, so a Railway
+variable change needs a redeploy to take effect.
+
+So verify in two steps:
+
+```bash
+railway variables --service web --json | grep PARTNER_REV_SHARE_USE_V2
+```
+
+then confirm the running build is newer than the variable change:
+
+```bash
+curl -s https://api.pivota.cc/version
+```
+
+(`/version`'s `settings_contract` block became ADMIN-ONLY on 2026-08-11 — it was
+publishing the rate-limit threshold and whether discount reconciliation is
+enforcing to anonymous callers. The `version` / `commit_time` fields you need
+here are still public.)
+
+Rollback: set back to `false` **and redeploy** — the variable alone is inert.
 
 ## Step 2 — Resume T7, then T8
 
