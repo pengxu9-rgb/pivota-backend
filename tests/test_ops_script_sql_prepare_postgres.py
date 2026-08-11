@@ -124,6 +124,48 @@ ALTER TABLE product_group_members ADD COLUMN IF NOT EXISTS platform_product_id t
 ALTER TABLE product_group_members ADD COLUMN IF NOT EXISTS is_primary boolean;
 """
 
+# Columns the enrichment statements touch. Belt-and-braces on top of the real
+# CREATE lifted below: if a sibling gate file ever lands a narrower
+# `product_enrichment` stub first, `CREATE TABLE IF NOT EXISTS` silently keeps
+# the narrower shape (the #1651 hazard this file's header describes), and these
+# additive ALTERs are what keep the gate honest instead of red for the wrong
+# reason. Types mirror db/product_enrichment.py.
+_PRODUCT_ENRICHMENT_COLUMN_GUARDS = """
+ALTER TABLE product_enrichment ADD COLUMN IF NOT EXISTS geo_code VARCHAR(16);
+ALTER TABLE product_enrichment ADD COLUMN IF NOT EXISTS description_markdown TEXT;
+ALTER TABLE product_enrichment ADD COLUMN IF NOT EXISTS bullet_points JSONB;
+ALTER TABLE product_enrichment ADD COLUMN IF NOT EXISTS usage_scenarios JSONB;
+"""
+
+
+def _product_enrichment_ddl() -> str:
+    """The real `CREATE TABLE product_enrichment`, lifted from
+    db/product_enrichment.py's own AST.
+
+    That table is owned by db/product_enrichment.py, not db.catalog, so
+    `metadata.create_all` above does not create it and the enrichment statements
+    fail with UndefinedTable — a fixture gap reported as a defect.
+
+    Lifted rather than hand-copied for the reason the sibling gate's header
+    gives: a stub drifts from the real schema silently, and PREPARE resolves
+    parameter types THROUGH column types, so a column typed `text` where
+    production has `jsonb` changes whether a cast is required. This is the same
+    DDL the application runs at startup.
+    """
+    source = (REPO_ROOT / "db" / "product_enrichment.py").read_text(encoding="utf-8")
+    for node in ast.walk(ast.parse(source, filename="product_enrichment.py")):
+        if (
+            isinstance(node, ast.Constant)
+            and isinstance(node.value, str)
+            and "CREATE TABLE IF NOT EXISTS product_enrichment" in node.value
+        ):
+            return node.value
+    raise AssertionError(
+        "could not find the CREATE TABLE for product_enrichment in "
+        "db/product_enrichment.py — it moved or was renamed. Do not paste a stub "
+        "here; find the real DDL, or this gate silently plans against a fiction."
+    )
+
 
 @pytest.fixture(scope="module")
 def prepare() -> Callable[[str], None]:
@@ -141,8 +183,13 @@ def prepare() -> Callable[[str], None]:
 
     engine = create_engine(DATABASE_URL)
     metadata.create_all(engine, checkfirst=True)
+    ddl = "\n".join((
+        _LIGHTWEIGHT_DDL,
+        _product_enrichment_ddl(),
+        _PRODUCT_ENRICHMENT_COLUMN_GUARDS,
+    ))
     with engine.begin() as conn:
-        for stmt in filter(None, (s.strip() for s in _LIGHTWEIGHT_DDL.split(";"))):
+        for stmt in filter(None, (s.strip() for s in ddl.split(";"))):
             conn.execute(text(stmt))
     engine.dispose()
 
