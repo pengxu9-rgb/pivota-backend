@@ -350,23 +350,32 @@ def test_public_health_key_set_holds_on_the_HEALTHY_path_too(
         assert key not in body
 
 
-def test_rate_limit_threshold_is_still_published_by_headers(client: TestClient) -> None:
-    """Pin the ASYMMETRY this PR does not close, so it is documented not implied.
+def test_rate_limit_threshold_is_NOT_published_by_headers(client: TestClient) -> None:
+    """The threshold is withheld from unauthenticated callers on /agent/* too.
 
-    Redacting rate_limit_rpm from /health is tidiness, not containment:
-    middleware/rate_limiter.py stamps X-RateLimit-Limit on every /agent/*
-    response whenever any x-api-key header is present — an INVALID key reads it.
-    Closing that means changing the rate-limit middleware, a different blast
-    radius. This test fails if that ever changes, which is the moment to update
-    the claim in main.py rather than discover the drift later.
+    This test previously asserted the OPPOSITE — it pinned the asymmetry that
+    /health redaction was cosmetic because the rate-limit middleware published
+    rate_limit_rpm to any caller with an x-api-key. Its docstring promised it
+    "fails if that ever changes, which is the moment to update the claim in
+    main.py".
+
+    It did not fail when that changed. The assertion was wrapped in
+    `if limit is not None:`, so the moment the header disappeared — the exact
+    event it existed to detect — it started passing vacuously. A conditional
+    around the assertion disarms the tripwire in precisely the case you built it
+    for. That is the third instance of this defect class in three PRs, so it is
+    written down here rather than quietly fixed.
+
+    Now that the middleware only publishes the ENFORCED limit to callers who
+    authenticated, the guarantee is unconditional and so is the assertion.
     """
-    res = client.get("/agent/definitely-not-a-route", headers={"x-api-key": "invalid"})
-
     from config.settings import settings
 
-    limit = res.headers.get("x-ratelimit-limit")
-    if limit is not None:
-        assert limit == str(settings.rate_limit_rpm)
+    res = client.get("/agent/definitely-not-a-route", headers={"x-api-key": "invalid"})
+
+    assert "x-ratelimit-limit" not in {k.lower() for k in res.headers}
+    # And the value nowhere in the response, under any header name.
+    assert str(settings.rate_limit_rpm) not in str(dict(res.headers))
 
 
 def test_health_gives_an_admin_the_full_drift_contract(client: TestClient) -> None:
