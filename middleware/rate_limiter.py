@@ -9,10 +9,23 @@ from typing import Dict, List, Tuple
 from datetime import datetime, timedelta
 import time
 import asyncio
+import ipaddress
 import os
+import secrets
 from collections import defaultdict
 from utils.redis_client import get_redis_client
 from config.settings import settings
+
+def _positive_int(raw, default: int) -> int:
+    """Env ints that refuse to silently become 0 — a 0 limit would block all
+    unauthenticated traffic, so a typo must fall back to the default, loudly
+    ignored rather than quietly enforced."""
+    try:
+        value = int(str(raw).strip())
+    except (TypeError, ValueError):
+        return default
+    return value if value > 0 else default
+
 
 class RateLimitMiddleware(BaseHTTPMiddleware):
     """
@@ -51,7 +64,195 @@ class RateLimitMiddleware(BaseHTTPMiddleware):
         ]
         trusted = explicit_trusted + (implicit_trusted if self.trust_internal_keys else [])
         self.trusted_api_keys = {key for key in trusted if key}
+
+        # --- Unauthenticated /agent/* limiting -------------------------------
+        # Before this existed, `if not api_key: return await call_next(request)`
+        # meant anonymous callers were not limited AT ALL, and the citation and
+        # discovery routes under /agent/ are public by design — so the
+        # "will fail auth later" assumption that justified it does not hold.
+        self.anon_enabled = str(
+            os.getenv("ANON_RATE_LIMIT_ENABLED", "true")
+        ).strip().lower() in {"1", "true", "yes", "on"}
+        self.anon_per_ip_rpm = _positive_int(os.getenv("ANON_RATE_LIMIT_PER_IP_RPM"), 60)
+        self.anon_global_rpm = _positive_int(
+            os.getenv("ANON_RATE_LIMIT_GLOBAL_RPM"), 600
+        )
+        # Bounded in-memory fallback. The pre-existing `request_store` is an
+        # unbounded defaultdict keyed on an UNVALIDATED api_key, so a caller
+        # rotating the header grows it forever — a slow memory exhaustion this
+        # change would make easier to reach by adding IP-shaped keys. This store
+        # is capped and pruned; see _hit_window.
+        self._anon_store: Dict[str, List[float]] = {}
+        self._anon_store_cap = _positive_int(
+            os.getenv("ANON_RATE_LIMIT_MAX_TRACKED_KEYS"), 20_000
+        )
+        self._anon_last_prune = 0.0
     
+    def _is_admin_caller(self, request: Request) -> bool:
+        """A valid X-ADMIN-KEY is not the anonymous abuse we are limiting.
+
+        `/agent/internal/promotions` authenticates with X-ADMIN-KEY rather than
+        the agent dependency (routes/merchant_promotions_api.py), so it sends no
+        x-api-key and would otherwise land in the anonymous bucket. It is polled
+        internally roughly every 30s. Constant-time compare, same credential
+        pair as utils.auth.require_admin_or_key.
+        """
+        supplied = (request.headers.get("x-admin-key") or "").strip()
+        if not supplied:
+            return False
+        for env_name in ("PROMOTIONS_ADMIN_KEY", "ADMIN_API_KEY"):
+            expected = (os.getenv(env_name) or "").strip()
+            if expected and secrets.compare_digest(supplied, expected):
+                return True
+        return False
+
+    @staticmethod
+    def _anonymous_identity(request: Request) -> "str | None":
+        """Best-effort per-client identity for an unauthenticated caller.
+
+        Returns None when no usable identity exists — in which case only the
+        GLOBAL ceiling applies. That is deliberate, and the reason is measured,
+        not assumed:
+
+        `request.client.host` is NOT used, ever. Behind Railway the peer address
+        is the platform's internal proxy pool. Sampled from prod access logs on
+        2026-08-11, every single peer was in 100.64.0.0/10 (RFC 6598 CGNAT) —
+        12 distinct addresses, no real client IPs:
+
+            INFO: 100.64.0.7:20882  - "GET /agent/internal/promotions ..."
+            INFO: 100.64.0.12:47760 - "GET /agent/internal/promotions ..."
+
+        Bucketing on that would put every external caller into ~12 shared
+        buckets, so one abuser would exhaust the bucket for everybody — turning
+        a rate limiter into a denial-of-service amplifier. A limiter that
+        collapses distinct clients together is worse than none.
+
+        HONESTY ABOUT WHAT THIS BUYS: X-Forwarded-For is client-supplied and the
+        leftmost element is attacker-chosen, so an adversary defeats the per-IP
+        bucket by rotating the header. This layer therefore protects against
+        runaway and misbehaving clients and gives real clients fair isolation —
+        it is NOT an adversarial control. The adversarial control is the global
+        ceiling, which depends on no identity and so cannot be rotated away.
+        Making this half trustworthy needs a verified trusted-proxy hop count
+        for Railway's edge, which is not established here.
+        """
+        xff = (request.headers.get("x-forwarded-for") or "").strip()
+        if not xff:
+            return None
+        candidate = xff.split(",")[0].strip()
+        if not candidate:
+            return None
+        try:
+            parsed = ipaddress.ip_address(candidate)
+        except ValueError:
+            # Not an IP at all — a caller sending junk must not get its own
+            # bucket per junk value, or rotation is trivially free.
+            return None
+        if parsed.is_loopback or parsed.is_unspecified:
+            return None
+        return f"ip:{parsed.compressed}"
+
+    def _hit_window(self, key: str, now: float) -> int:
+        """Count this hit in a bounded, pruned in-memory sliding window."""
+        # Opportunistic global prune: without it this dict grows once per
+        # distinct key forever, which an attacker rotating X-Forwarded-For can
+        # drive. Pruning is O(tracked keys) and runs at most once a window.
+        if now - self._anon_last_prune > self.window_seconds:
+            cutoff = now - self.window_seconds
+            for existing in list(self._anon_store.keys()):
+                kept = [ts for ts in self._anon_store[existing] if ts > cutoff]
+                if kept:
+                    self._anon_store[existing] = kept
+                else:
+                    del self._anon_store[existing]
+            self._anon_last_prune = now
+
+        bucket = [ts for ts in self._anon_store.get(key, ()) if now - ts < self.window_seconds]
+        bucket.append(now)
+        if key not in self._anon_store and len(self._anon_store) >= self._anon_store_cap:
+            # At the cap we stop TRACKING new keys rather than start evicting
+            # live ones: evicting would let a rotating attacker flush a
+            # legitimate client's counter. Untracked keys still face the global
+            # ceiling, which is the rotation-proof half anyway.
+            return 1
+        self._anon_store[key] = bucket
+        return len(bucket)
+
+    async def _count_hit(self, key: str, now: float) -> int:
+        """Redis when available (shared across instances), else in-memory."""
+        if self.redis is not None:
+            try:
+                bucket = int(now // self.window_seconds)
+                redis_key = f"anon_rate_limit:{key}:{bucket}"
+                count = await self.redis.incr(redis_key)
+                await self.redis.expire(redis_key, self.window_seconds * 2)
+                return int(count)
+            except Exception:
+                # Fail OPEN on infrastructure failure, and do not disable redis
+                # process-wide for a transient blip the way the keyed path does.
+                return 0
+        return self._hit_window(key, now)
+
+    async def _reject_global(self, now: float, reset_at: int):
+        """Layer 2 — the identity-independent ceiling. See _reject_anonymous."""
+        if not self.anon_enabled:
+            return None
+        if await self._count_hit("global", now) > self.anon_global_rpm:
+            return self._anon_429(now, reset_at)
+        return None
+
+    async def _reject_per_identity(self, request: Request, now: float, reset_at: int):
+        """Layer 1 — per-client fairness for keyless callers. See below."""
+        if not self.anon_enabled:
+            return None
+        identity = self._anonymous_identity(request)
+        if identity is None:
+            return None
+        if await self._count_hit(identity, now) > self.anon_per_ip_rpm:
+            return self._anon_429(now, reset_at)
+        return None
+
+    async def _reject_anonymous(self, request: Request, now: float, reset_at: int):
+        """Limit unauthenticated /agent/* traffic. Returns a 429 or None.
+
+        TWO layers, because only one of them can resist rotation:
+
+        1. per-identity (ANON_RATE_LIMIT_PER_IP_RPM, default 60) — fairness and
+           runaway-client protection. Spoofable; see _anonymous_identity.
+        2. GLOBAL (ANON_RATE_LIMIT_GLOBAL_RPM, default 600) — a single budget for
+           ALL unauthenticated /agent/* traffic combined. It keys on nothing, so
+           rotating X-Forwarded-For, the api_key header, or anything else does
+           not escape it. This is the actual anti-abuse guarantee.
+
+        The defaults sit far above real traffic rather than being guessed:
+        sampled from prod access logs over ~65 minutes on 2026-08-11 there were
+        15 /agent/* requests in total (~0.23/min), most of them authenticated or
+        internal. 600/min is ~2,600x the entire measured volume, so enforcement
+        ships ON. `ANON_RATE_LIMIT_ENABLED=false` is the kill switch.
+
+        Never publishes either threshold — see _stamp_authenticated_limits.
+        """
+        return await self._reject_global(now, reset_at) or await self._reject_per_identity(
+            request, now, reset_at
+        )
+
+    @staticmethod
+    def _anon_429(now: float, reset_at: int) -> JSONResponse:
+        retry_in = max(1, int(reset_at - now))
+        return JSONResponse(
+            status_code=429,
+            content={
+                "error": "rate_limit_exceeded",
+                "message": "Rate limit exceeded",
+                "retry_after": retry_in,
+            },
+            headers={
+                "X-RateLimit-Remaining": "0",
+                "X-RateLimit-Reset": str(reset_at),
+                "Retry-After": str(retry_in),
+            },
+        )
+
     def _stamp_authenticated_limits(
         self,
         request: Request,
@@ -170,24 +371,46 @@ class RateLimitMiddleware(BaseHTTPMiddleware):
             if auth.startswith("Bearer "):
                 api_key = auth[7:]
 
-        # No API key = no rate limiting (will fail auth later).
+        # No API key. This used to mean NO RATE LIMITING AT ALL — the comment
+        # here read "will fail auth later", an assumption that stopped being
+        # true once the citation and discovery routes under /agent/ became
+        # public by design. Anonymous callers are now limited; see
+        # _reject_anonymous for the two layers and why only one of them
+        # survives an attacker rotating headers.
         #
-        # NOTE this is a real gap, not a subtlety: anonymous callers are not
-        # limited here at all, and a keyed caller evades the bucket by rotating
-        # the header value, since the bucket is keyed on an unvalidated key. The
-        # "will fail auth later" assumption also no longer holds — the citation
-        # and discovery routes under /agent/ are public by design. Closing that
-        # needs a different keying strategy (client IP, shared across instances)
-        # and is out of scope for a header-disclosure fix; it is written up on
-        # the PR rather than silently half-done here.
-        #
-        # These two paths still stamp per-agent headers, so a checkout-token
-        # caller (no x-api-key) gets the same accurate pacing info as a keyed one.
-        if not api_key:
+        # A checkout-token caller also arrives with no x-api-key, so this path
+        # still stamps per-agent headers afterwards — those callers get the same
+        # accurate pacing info as a keyed one.
+        # Full bypass, checked FIRST: an internal trusted key, or a valid
+        # X-ADMIN-KEY (which is how /agent/internal/promotions authenticates —
+        # it sends no x-api-key and is polled internally every ~30s).
+        if (api_key and api_key in self.trusted_api_keys) or self._is_admin_caller(
+            request
+        ):
             response = await call_next(request)
             self._stamp_authenticated_limits(request, response, reset_at)
             return response
-        if api_key in self.trusted_api_keys:
+
+        # THE ROTATION-PROOF CEILING, applied to every remaining /agent/*
+        # request — keyless or keyed. Restricting it to keyless callers would
+        # have closed only half the bypass: the per-key bucket below is keyed on
+        # an UNVALIDATED api_key, so sending `x-api-key: <random>` per request
+        # mints a fresh bucket every time and evades it completely. This budget
+        # keys on nothing, so no header rotation escapes it.
+        #
+        # Authenticated agents draw from it too. That is deliberate and worth
+        # stating plainly: it is a system-protection backstop, not a per-caller
+        # quota — their real quota is the per-agent limit enforced in
+        # routes/agent_auth.py. It is sized so legitimate traffic never meets it
+        # (see _reject_anonymous for the measured baseline).
+        rejection = await self._reject_global(now, reset_at)
+        if rejection is not None:
+            return rejection
+
+        if not api_key:
+            rejection = await self._reject_per_identity(request, now, reset_at)
+            if rejection is not None:
+                return rejection
             response = await call_next(request)
             self._stamp_authenticated_limits(request, response, reset_at)
             return response
