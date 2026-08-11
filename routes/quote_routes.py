@@ -92,7 +92,6 @@ async def preview_quote(
         },
         "promotion_lines": result.get("promotion_lines") or [],
         "discount_evidence": result.get("discount_evidence") or {},
-        "store_discount_evidence": result.get("store_discount_evidence") or {},
         "payment_offer_evidence": result.get("payment_offer_evidence") or {},
         "payment_pricing": result.get("payment_pricing") or {},
         "savings_presentation": result.get("savings_presentation") or {},

@@ -28,14 +28,13 @@ from db.catalog import (
     catalog_payment_incentives,
     catalog_price_snapshots,
     catalog_products,
-    catalog_promotions,
     catalog_quote_snapshots,
     catalog_skus,
     catalog_sync_events,
     catalog_sync_jobs,
     catalog_incentive_rules,
 )
-from db.database import database, promotions
+from db.database import database
 from db.merchant_onboarding import merchant_onboarding
 from db.products import products_cache
 from models.catalog import PaymentIncentiveInput
@@ -2306,36 +2305,6 @@ async def reconcile_catalog_incentives_for_merchant(
     payment_incentives: Optional[List[PaymentIncentiveInput]] = None,
     source_system: str = "merchant_config",
 ) -> Dict[str, Any]:
-    promotion_rows = await database.fetch_all(
-        select(promotions).where(promotions.c.merchant_id == merchant_id)
-    )
-    promotions_synced = 0
-    for row in promotion_rows:
-        data = dict(row)
-        promotion_id = str(data.get("id") or _stable_key("catalog_promo", merchant_id, promotions_synced))
-        await _upsert_by_pk(
-            catalog_promotions,
-            "promotion_id",
-            {
-                "promotion_id": promotion_id,
-                "merchant_id": merchant_id,
-                "source_promotion_id": str(data.get("id") or ""),
-                "name": str(data.get("name") or "Promotion"),
-                "promotion_class": str(data.get("type") or "order").lower(),
-                "method": "automatic",
-                "label": str(data.get("human_readable_rule") or data.get("name") or "Promotion"),
-                "code": None,
-                "start_at": data.get("start_at"),
-                "end_at": data.get("end_at"),
-                "channels_json": data.get("channels") or [],
-                "scope_json": data.get("scope") or {},
-                "config_json": data.get("config") or {},
-                "truth_tier": "primary",
-                "source_system": "merchant_promotions",
-            },
-        )
-        promotions_synced += 1
-
     payment_incentives_synced = 0
     offer_links_synced = 0
     offer_rows = await database.fetch_all(select(catalog_offers).where(catalog_offers.c.merchant_id == merchant_id))
@@ -2410,7 +2379,6 @@ async def reconcile_catalog_incentives_for_merchant(
     return {
         "merchant_id": merchant_id,
         "source_system": source_system,
-        "promotions_synced": promotions_synced,
         "payment_incentives_synced": payment_incentives_synced,
         "offer_links_synced": offer_links_synced,
         "reconciled_at": _utcnow(),

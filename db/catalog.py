@@ -412,28 +412,6 @@ catalog_sync_jobs = Table(
 )
 
 
-catalog_promotions = Table(
-    "catalog_promotions",
-    metadata,
-    Column("promotion_id", String(255), primary_key=True),
-    Column("merchant_id", String(64), nullable=False, index=True),
-    Column("source_promotion_id", String(255), nullable=True),
-    Column("name", String(255), nullable=False),
-    Column("promotion_class", String(32), nullable=False),
-    Column("method", String(32), nullable=False, server_default="automatic"),
-    Column("label", String(255), nullable=False),
-    Column("code", String(128), nullable=True),
-    Column("start_at", DateTime, nullable=True),
-    Column("end_at", DateTime, nullable=True),
-    Column("channels_json", JSONB_TYPE, nullable=True),
-    Column("scope_json", JSONB_TYPE, nullable=True),
-    Column("config_json", JSONB_TYPE, nullable=True),
-    Column("truth_tier", String(32), nullable=False, server_default="primary"),
-    Column("source_system", String(64), nullable=True),
-    Column("created_at", DateTime, server_default=func.now(), nullable=False),
-    Column("updated_at", DateTime, server_default=func.now(), nullable=False),
-)
-
 
 catalog_payment_incentives = Table(
     "catalog_payment_incentives",

@@ -47,13 +47,9 @@ async def test_preview_quote_fails_closed_when_storefront_shipping_is_unverified
             },
         )
 
-    async def noop_apply_promotions(**_kwargs):
-        return None
-
     # Admin-checkout fallback was removed (audit fix #7): Storefront is the ONLY
     # pricing engine, so there is no fallback engine to guard against here.
     monkeypatch.setattr(svc.pricing_storefront, "preview_cart_quote", fake_preview_cart_quote)
-    monkeypatch.setattr(svc, "_apply_infra_promotions_best_effort", noop_apply_promotions)
 
     with pytest.raises(QuoteError) as exc:
         await svc.preview_quote(
@@ -139,15 +135,11 @@ async def test_preview_quote_keeps_authoritative_zero_shipping_quotes(monkeypatc
             },
         )
 
-    async def noop_apply_promotions(**_kwargs):
-        return None
-
     async def noop_insert_quote(_row):
         return None
 
     # Admin-checkout fallback was removed (audit fix #7); Storefront is the only engine.
     monkeypatch.setattr(svc.pricing_storefront, "preview_cart_quote", fake_preview_cart_quote)
-    monkeypatch.setattr(svc, "_apply_infra_promotions_best_effort", noop_apply_promotions)
     monkeypatch.setattr("services.quote_service.insert_quote", noop_insert_quote)
 
     result = await svc.preview_quote(

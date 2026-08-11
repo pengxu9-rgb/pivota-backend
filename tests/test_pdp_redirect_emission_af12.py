@@ -55,7 +55,6 @@ async def test_pdp_card_carries_attributed_redirect(monkeypatch: pytest.MonkeyPa
     monkeypatch.setattr(gw, "_load_product_by_id", fake_load)
     monkeypatch.setattr(mss, "get_merchant_active_stores", fake_stores)
     monkeypatch.setattr(gw, "enrich_product_detail_with_payment_offers", _noop_enrich)
-    monkeypatch.setattr(gw, "enrich_product_detail_with_store_discounts", _noop_enrich)
     monkeypatch.setattr(gw, "_reviews_enabled", lambda: False)
 
     result = await gw._handle_get_product_detail(
@@ -96,7 +95,6 @@ async def test_pdp_emission_is_fail_soft(monkeypatch: pytest.MonkeyPatch) -> Non
     monkeypatch.setattr(gw, "_load_product_by_id", fake_load)
     monkeypatch.setattr(mss, "get_merchant_active_stores", boom)
     monkeypatch.setattr(gw, "enrich_product_detail_with_payment_offers", _noop_enrich)
-    monkeypatch.setattr(gw, "enrich_product_detail_with_store_discounts", _noop_enrich)
     monkeypatch.setattr(gw, "_reviews_enabled", lambda: False)
 
     result = await gw._handle_get_product_detail(

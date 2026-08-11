@@ -103,7 +103,6 @@ class QuotePreviewResponse(BaseModel):
     warnings: List[str] = Field(default_factory=list)
     promotion_lines: List[PromotionLine]
     discount_evidence: Optional[Dict[str, Any]] = None
-    store_discount_evidence: Optional[Dict[str, Any]] = None
     payment_offer_evidence: Optional[Dict[str, Any]] = None
     payment_pricing: Optional[Dict[str, Any]] = None
     savings_presentation: Optional[Dict[str, Any]] = None

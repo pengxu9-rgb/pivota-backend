@@ -134,7 +134,6 @@ async def preflight_quote_offer(
         "quote_id": qs.quote_id,
         "merchant_id": merchant_id,
         "offers": [o.model_dump(mode="json") for o in offers],
-        "store_discount_evidence": snap.get("store_discount_evidence") or {},
         "payment_offer_evidence": snap.get("payment_offer_evidence") or {},
         "payment_pricing": snap.get("payment_pricing") or {},
         "savings_presentation": snap.get("savings_presentation") or {},

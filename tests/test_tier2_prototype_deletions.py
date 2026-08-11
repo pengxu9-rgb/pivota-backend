@@ -11,9 +11,10 @@ the fabrication belt cannot quietly grow back:
   404), with the coin-flip simulation belt behind them gone.
 - ProtocolAdapterService no longer registers the fictional X402Adapter and no
   adapter advertises fictional endpoint maps.
-- Manual FLASH_SALE / FREE_SHIPPING promotions are refused at the internal API
-  (the quote engine applies only MULTI_BUY_DISCOUNT), and the quote engine
-  records an evidence decision for any promo type it skips.
+- The promotions lane is deleted end-to-end (ADR-022): the internal promotions
+  API answers 404, and none of the promo modules import. The earlier gate
+  (manual FLASH_SALE / FREE_SHIPPING refused with PROMO_TYPE_NOT_APPLIED_AT_QUOTE)
+  is superseded by the deletion.
 """
 import importlib
 from types import SimpleNamespace
@@ -117,94 +118,49 @@ class TestProtocolAdapterRegistryIsHonest:
         assert err == "Unknown protocol: X-402"
 
 
-class TestManualPromoTrapdoorClosed:
+class TestPromotionsLaneStaysDeleted:
+    """ADR-022: the merchant-promotions lane is deleted end-to-end.
+
+    Prod held exactly 17 rows, all PIVOTA_AUDIT_20260421 Shopify-synced fixtures
+    for one test merchant. These tests pin the deletion the same way the belt
+    deletions above are pinned, so the lane cannot quietly grow back. The
+    rebuild design (enforcement follows checkout authority; agent-applied
+    Shopify codes) lives in ADR-022.
+    """
+
     ADMIN = {"X-ADMIN-KEY": "test-admin-key"}
 
-    def _payload(self, ptype, config):
-        return {
-            "merchantId": "merch_t",
-            "name": "t",
-            "type": ptype,
-            "startAt": "2026-01-01T00:00:00Z",
-            "endAt": "2027-01-01T00:00:00Z",
-            "channels": ["creator_agents"],
-            "scope": {"global": True},
-            "config": config,
-        }
+    @pytest.mark.parametrize(
+        "module",
+        [
+            "services.promotions_service",
+            "services.shopify_promotions_sync",
+            "services.store_discount_evidence_service",
+            "services.shopify_discount_fixture_service",
+            "routes.merchant_promotions_api",
+            "routes.agent_promotions",
+            "routes.shopify_promotions_sync_api",
+        ],
+    )
+    def test_promo_modules_are_gone(self, module):
+        with pytest.raises(ModuleNotFoundError):
+            importlib.import_module(module)
 
-    def test_manual_flash_sale_is_rejected(self, client, monkeypatch):
+    @pytest.mark.parametrize(
+        "method,path",
+        [
+            ("get", "/agent/internal/promotions"),
+            ("post", "/agent/internal/promotions"),
+            ("get", "/agent/v1/promotions/active"),
+            ("post", "/agent/internal/shopify/promotions/sync/merch_t"),
+        ],
+    )
+    def test_promo_routes_answer_404(self, client, monkeypatch, method, path):
         monkeypatch.setenv("PROMOTIONS_ADMIN_KEY", "test-admin-key")
-        resp = client.post(
-            "/agent/internal/promotions",
-            headers=self.ADMIN,
-            json=self._payload("FLASH_SALE", {"kind": "FLASH_SALE", "flashPrice": 5}),
-        )
-        # 400 (not 422): the error middleware rewrites 422s into a generic
-        # INVALID_REQUEST, so the named refusal rides a 400.
-        assert resp.status_code == 400
-        assert resp.json()["detail"]["code"] == "PROMO_TYPE_NOT_APPLIED_AT_QUOTE"
+        resp = getattr(client, method)(path, headers=self.ADMIN)
+        assert resp.status_code == 404
 
-    def test_manual_free_shipping_is_rejected(self, client, monkeypatch):
-        monkeypatch.setenv("PROMOTIONS_ADMIN_KEY", "test-admin-key")
-        resp = client.post(
-            "/agent/internal/promotions",
-            headers=self.ADMIN,
-            json=self._payload("FREE_SHIPPING", {"kind": "FREE_SHIPPING"}),
-        )
-        # 400 (not 422): the error middleware rewrites 422s into a generic
-        # INVALID_REQUEST, so the named refusal rides a 400.
-        assert resp.status_code == 400
-        assert resp.json()["detail"]["code"] == "PROMO_TYPE_NOT_APPLIED_AT_QUOTE"
-
-    def test_multi_buy_still_passes_the_gate(self, client, monkeypatch):
-        monkeypatch.setenv("PROMOTIONS_ADMIN_KEY", "test-admin-key")
-        fake_promo = SimpleNamespace(dict=lambda: {"id": "promo_1", "type": "MULTI_BUY_DISCOUNT"})
-        with patch(
-            "routes.merchant_promotions_api.create_promotion",
-            AsyncMock(return_value=fake_promo),
-        ) as created:
-            resp = client.post(
-                "/agent/internal/promotions",
-                headers=self.ADMIN,
-                json=self._payload(
-                    "MULTI_BUY_DISCOUNT",
-                    {"kind": "MULTI_BUY_DISCOUNT", "thresholdQuantity": 3, "discountPercent": 10},
-                ),
-            )
-        assert resp.status_code == 201
-        assert created.await_count == 1
-
-
-class TestQuoteRecordsSkippedPromoTypes:
-    @pytest.mark.asyncio
-    async def test_unsupported_type_leaves_an_evidence_decision(self, monkeypatch):
+    def test_quote_service_has_no_promo_applier(self):
         from services.quote_service import QuoteService
 
-        monkeypatch.setenv("AUTO_SYNC_SHOPIFY_PROMOTIONS_ON_QUOTE_PREVIEW", "0")
-        flash = SimpleNamespace(
-            id="promo_flash", type="FLASH_SALE", scope={"global": True}, config={"kind": "FLASH_SALE"}
-        )
-        evidence = {}
-        with patch(
-            "services.quote_service.list_promotions",
-            AsyncMock(return_value=([flash], 1)),
-        ):
-            await QuoteService._apply_infra_promotions_best_effort(
-                SimpleNamespace(),
-                merchant_id="merch_t",
-                items=[],
-                pricing={},
-                line_items=[],
-                promotion_lines=[],
-                discount_evidence=evidence,
-                creator_id=None,
-            )
-        assert evidence["decisions"] == [
-            {
-                "promotion_id": "promo_flash",
-                "decision": "skipped",
-                "reason": "promo_type_not_applied_at_quote",
-                "promo_type": "FLASH_SALE",
-                "source": "pivota_infra",
-            }
-        ]
+        assert not hasattr(QuoteService, "_apply_infra_promotions_best_effort")

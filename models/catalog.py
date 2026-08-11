@@ -378,7 +378,6 @@ class PivotQuoteResponse(BaseModel):
     merchant_id: str
     pricing: PivotPricing
     incentives: List[IncentiveNode] = Field(default_factory=list)
-    store_discount_evidence: Dict[str, Any] = Field(default_factory=dict)
     payment_offer_evidence: Dict[str, Any] = Field(default_factory=dict)
     savings_presentation: Dict[str, Any] = Field(default_factory=dict)
     quote_payload: Dict[str, Any] = Field(default_factory=dict)

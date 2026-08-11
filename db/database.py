@@ -189,28 +189,6 @@ transactions = Table(
 )
 
 
-promotions = Table(
-    "promotions",
-    metadata,
-    Column("id", String, primary_key=True),
-    Column("merchant_id", String, index=True, nullable=False),
-    Column("name", String, nullable=False),
-    Column("type", String, nullable=False),  # FLASH_SALE | MULTI_BUY_DISCOUNT
-    Column("description", String, nullable=True),
-    Column("start_at", DateTime, nullable=False),
-    Column("end_at", DateTime, nullable=True),
-    Column("channels", JSONB_TYPE, nullable=False),
-    Column("scope", JSONB_TYPE, nullable=False),
-    Column("config", JSONB_TYPE, nullable=False),
-    Column("expose_to_creators", Boolean, nullable=False, default=True),
-    Column("allowed_creator_ids", JSONB_TYPE, nullable=True),
-    Column("human_readable_rule", String, nullable=True),
-    Column("created_at", DateTime, default=datetime.datetime.utcnow, nullable=False),
-    Column("updated_at", DateTime, default=datetime.datetime.utcnow, nullable=False),
-    Column("deleted_at", DateTime, nullable=True),
-    CheckConstraint("end_at IS NULL OR start_at < end_at", name="ck_promotions_time_window"),
-)
-
 # Create synchronous engine for table creation
 sync_url = str(DATABASE_URL)
 if IS_SQLITE and sync_url.startswith("sqlite+aiosqlite://"):

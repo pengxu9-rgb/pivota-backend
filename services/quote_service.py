@@ -13,7 +13,6 @@ import secrets
 import time
 
 from db.quotes import compute_expires_at, expire_quote_if_needed, get_quote, insert_quote, mark_quote_consumed
-from services.promotions_service import PromotionStatus, list_promotions
 from services.pcs_hash import sha256_json
 from services.payment_offer_evidence_service import (
     PaymentOfferTarget,
@@ -22,51 +21,10 @@ from services.payment_offer_evidence_service import (
     payment_pricing_summary,
     resolve_payment_offer_evidence,
 )
-from services.store_discount_evidence_service import (
-    StoreDiscountTarget,
-    empty_store_discount_evidence,
-    resolve_store_discount_evidence_for_targets,
-)
 from services.savings_presentation_service import build_savings_presentation
-from services.shopify_promotions_sync import sync_shopify_promotions_for_merchant
 from services.shopify_pricing_service import ShopifyPricingError
 from services.shopify_storefront_pricing_service import ShopifyStorefrontPricingService
 from utils.logger import logger
-
-
-# ---------------------------------------------------------------------------
-# Promotions sync throttling (best-effort, in-memory)
-# ---------------------------------------------------------------------------
-
-_PROMOTIONS_SYNC_MIN_INTERVAL_SECONDS = int(os.getenv("PROMOTIONS_SYNC_MIN_INTERVAL_SECONDS", "1800"))  # 30m default
-_PROMOTIONS_SYNC_LAST_ATTEMPT_AT: Dict[str, float] = {}
-_PROMOTIONS_SYNC_MAX_CONCURRENCY = int(os.getenv("PROMOTIONS_SYNC_MAX_CONCURRENCY", "2"))
-_PROMOTIONS_SYNC_SEMAPHORE = asyncio.Semaphore(max(1, _PROMOTIONS_SYNC_MAX_CONCURRENCY))
-
-
-async def _sync_shopify_promotions_background(*, merchant_id: str, channel: str) -> None:
-    try:
-        async with _PROMOTIONS_SYNC_SEMAPHORE:
-            await sync_shopify_promotions_for_merchant(merchant_id=merchant_id, channel=channel)
-    except Exception as e:  # pragma: no cover - best-effort
-        logger.info(
-            "Shopify promotions background sync failed",
-            extra={"merchant_id": merchant_id, "error": str(e)},
-        )
-
-
-def _should_attempt_shopify_promotions_sync(merchant_id: str) -> bool:
-    now = time.time()
-    last = _PROMOTIONS_SYNC_LAST_ATTEMPT_AT.get(merchant_id)
-    if last is not None and (now - last) < _PROMOTIONS_SYNC_MIN_INTERVAL_SECONDS:
-        return False
-    _PROMOTIONS_SYNC_LAST_ATTEMPT_AT[merchant_id] = now
-    # Best-effort cap: prevent unbounded growth.
-    if len(_PROMOTIONS_SYNC_LAST_ATTEMPT_AT) > 200:
-        # Remove oldest ~50 entries.
-        for k, _ in sorted(_PROMOTIONS_SYNC_LAST_ATTEMPT_AT.items(), key=lambda kv: kv[1])[:50]:
-            _PROMOTIONS_SYNC_LAST_ATTEMPT_AT.pop(k, None)
-    return True
 
 
 def normalize_discount_codes(codes: Optional[List[str]]) -> List[str]:
@@ -277,63 +235,9 @@ class QuoteService:
             submitted_codes=codes,
             source=result.engine,
         )
-        await self._apply_infra_promotions_best_effort(
-            merchant_id=merchant_id,
-            items=normalized_items,
-            pricing=result.pricing,
-            line_items=result.line_items,
-            promotion_lines=result.promotion_lines,
-            discount_evidence=discount_evidence,
-            creator_id=agent_id,
-        )
-
         presentment_currency = result.currency
         charge_currency = result.currency
         settlement_currency: Optional[str] = None
-        store_discount_evidence: Dict[str, Any]
-        try:
-            store_targets = [
-                StoreDiscountTarget(
-                    target_id=str(item.get("variant_id") or item.get("product_id") or idx),
-                    merchant_id=merchant_id,
-                    product_id=str(item.get("product_id") or "").strip() or None,
-                    variant_id=str(item.get("variant_id") or "").strip() or None,
-                    quantity=int(item.get("quantity") or 1),
-                    subtotal=None,
-                    currency=presentment_currency,
-                )
-                for idx, item in enumerate(normalized_items)
-            ]
-            per_target_store_evidence = await resolve_store_discount_evidence_for_targets(
-                merchant_id=merchant_id,
-                targets=store_targets,
-            )
-            store_offers: List[Dict[str, Any]] = []
-            store_decisions: List[Dict[str, Any]] = []
-            for evidence in per_target_store_evidence.values():
-                store_offers.extend([offer for offer in evidence.get("offers") or [] if isinstance(offer, dict)])
-                store_decisions.extend([item for item in evidence.get("decisions") or [] if isinstance(item, dict)])
-            store_offers = self._dedupe_json_objects(store_offers)
-            store_decisions = self._dedupe_json_objects(store_decisions)
-            store_discount_evidence = {
-                "pricing_confidence": (
-                    "metadata_available"
-                    if store_offers
-                    else "not_applicable"
-                ),
-                "offers": store_offers,
-                "decisions": store_decisions,
-                "presentation_contract_version": "savings.v1",
-            }
-        except Exception as e:
-            store_discount_evidence = empty_store_discount_evidence("resolver_error")
-            store_discount_evidence["decisions"] = [
-                {
-                    "type": "store_discount_resolution",
-                    "reason": "resolver_error",
-                    "message": str(e)[:240],
-                }
-            ]
         payment_offer_evidence: Dict[str, Any]
         try:
             quote_targets = [
@@ -373,7 +277,6 @@ class QuoteService:
             currency=presentment_currency,
             promotion_lines=result.promotion_lines,
             discount_evidence=discount_evidence,
-            store_discount_evidence=store_discount_evidence,
             payment_offer_evidence=payment_offer_evidence,
             payment_pricing=payment_pricing,
         )
@@ -411,7 +314,6 @@ class QuoteService:
             },
             "promotion_lines": self._serialize_promotion_lines(result.promotion_lines),
             "discount_evidence": self._serialize_discount_evidence(discount_evidence),
-            "store_discount_evidence": self._json_safe(store_discount_evidence),
             "payment_offer_evidence": self._json_safe(payment_offer_evidence),
             "payment_pricing": self._json_safe(payment_pricing),
             "savings_presentation": self._json_safe(savings_presentation),
@@ -515,7 +417,6 @@ class QuoteService:
             "pricing": result.pricing,
             "promotion_lines": self._serialize_promotion_lines(result.promotion_lines),
             "discount_evidence": self._serialize_discount_evidence(discount_evidence),
-            "store_discount_evidence": self._json_safe(store_discount_evidence),
             "payment_offer_evidence": self._json_safe(payment_offer_evidence),
             "payment_pricing": self._json_safe(payment_pricing),
             "savings_presentation": self._json_safe(savings_presentation),
@@ -913,326 +814,6 @@ class QuoteService:
         if not isinstance(evidence, dict):
             return False
         return evidence.get("status") == "verified" and evidence.get("new_customer") is True
-
-    async def _apply_infra_promotions_best_effort(
-        self,
-        *,
-        merchant_id: str,
-        items: List[Dict[str, Any]],
-        pricing: Dict[str, Decimal],
-        line_items: List[Dict[str, Any]],
-        promotion_lines: List[Dict[str, Any]],
-        discount_evidence: Optional[Dict[str, Any]] = None,
-        creator_id: Optional[str] = None,
-        channel: str = "creator_agents",
-    ) -> None:
-        """
-        Apply Pivota infra promotions on top of the Shopify pricing result (quote-first).
-
-        This is intentionally best-effort and fail-open: if promotions DB is down, we still return a quote.
-        """
-        async def _load_promotions(*, channel_filter: Optional[str]) -> List[Any]:
-            try:
-                promos, _ = await list_promotions(
-                    merchant_id=merchant_id,
-                    status=PromotionStatus.ACTIVE,
-                    channel=channel_filter,
-                    creator_id=creator_id,
-                )
-                return promos or []
-            except Exception as e:
-                logger.warning(
-                    "Failed to load promotions (best-effort)",
-                    extra={"merchant_id": merchant_id, "channel": channel_filter, "error": str(e)},
-                )
-                return []
-
-        # Prefer channel-scoped promos, but fall back to "any channel" to avoid silently
-        # dropping promos due to channel naming mismatches across stacks.
-        promotions = await _load_promotions(channel_filter=channel)
-        if not promotions:
-            promotions = await _load_promotions(channel_filter=None)
-
-        def _has_synced_shopify_promotion_metadata(promos: List[Any]) -> bool:
-            for p in promos or []:
-                cfg = getattr(p, "config", None) or {}
-                if isinstance(cfg, dict) and cfg.get("source") in {"shopify_discount_node", "shopify_price_rule"}:
-                    return True
-            return False
-
-        # Best-effort: if Shopify-native promotion metadata is missing, attempt
-        # an on-demand Shopify promotions sync, throttled per merchant. This
-        # still runs when manual Pivota promos exist, otherwise one manual promo
-        # can permanently mask stale/missing Shopify discount-node metadata.
-        auto_sync = os.getenv("AUTO_SYNC_SHOPIFY_PROMOTIONS_ON_QUOTE_PREVIEW", "1")
-        if (
-            not _has_synced_shopify_promotion_metadata(promotions)
-            and auto_sync not in ("0", "false", "False")
-            and _should_attempt_shopify_promotions_sync(merchant_id)
-        ):
-            # IMPORTANT: do not block the quote preview path. Shopify sync can take a long time
-            # (pagination, rate limits), and blocking can cause gateway 502 timeouts, impacting
-            # the main checkout/quote flow. By default we schedule the sync in the background.
-            #
-            # Optional: allow a small time budget (env) for fast stores so promos can apply immediately.
-            # Read dynamically so ops can tune without code changes, and tests can patch env.
-            wait_seconds = max(0.0, float(os.getenv("PROMOTIONS_SYNC_QUOTE_WAIT_SECONDS", "0")))
-            # Safety guard: keep quote preview responsive even if env is misconfigured.
-            # This can be overridden in ops via PROMOTIONS_SYNC_QUOTE_WAIT_MAX_SECONDS.
-            max_wait_seconds = max(0.0, float(os.getenv("PROMOTIONS_SYNC_QUOTE_WAIT_MAX_SECONDS", "2") or "2"))
-            if max_wait_seconds > 0:
-                wait_seconds = min(wait_seconds, max_wait_seconds)
-            else:
-                wait_seconds = 0.0
-            if wait_seconds > 0:
-                try:
-                    summary = await asyncio.wait_for(
-                        sync_shopify_promotions_for_merchant(merchant_id=merchant_id, channel=channel),
-                        timeout=wait_seconds,
-                    )
-                    logger.info(
-                        "Synced Shopify promotions within quote budget (best-effort)",
-                        extra={
-                            "merchant_id": merchant_id,
-                            "wait_seconds": wait_seconds,
-                            "rules_fetched": summary.get("rulesFetched"),
-                            # Avoid LogRecord attribute collisions (e.g. "created").
-                            "promotions_created": summary.get("created"),
-                            "promotions_updated": summary.get("updated"),
-                        },
-                    )
-                    promotions = await _load_promotions(channel_filter=channel)
-                except Exception as e:
-                    logger.info(
-                        "Shopify promotions sync skipped/failed (quote budget)",
-                        extra={"merchant_id": merchant_id, "wait_seconds": wait_seconds, "error": str(e)},
-                    )
-                    if not promotions:
-                        return None
-            else:
-                try:
-                    asyncio.create_task(
-                        _sync_shopify_promotions_background(merchant_id=merchant_id, channel=channel)
-                    )
-                    logger.info(
-                        "Scheduled Shopify promotions background sync (best-effort)",
-                        extra={"merchant_id": merchant_id},
-                    )
-                except RuntimeError as e:  # pragma: no cover - defensive
-                    logger.info(
-                        "Failed to schedule Shopify promotions background sync",
-                        extra={"merchant_id": merchant_id, "error": str(e)},
-                    )
-                if not promotions:
-                    return None
-
-        if not promotions:
-            return None
-
-        def d(v: Any) -> Decimal:
-            try:
-                return Decimal(str(v or "0")).quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
-            except Exception:
-                return Decimal("0.00")
-
-        for promo in promotions:
-            try:
-                if getattr(promo, "type", None) != "MULTI_BUY_DISCOUNT":
-                    # The infra engine applies ONLY MULTI_BUY_DISCOUNT. Other
-                    # types (FLASH_SALE / FREE_SHIPPING) used to be skipped
-                    # SILENTLY here — displayed to shoppers, never priced (the
-                    # 2026-08 audit's promo trapdoor). Manual creation of those
-                    # types is now rejected at the API; Shopify-synced ones
-                    # apply inside Shopify's own pricing. Either way, record
-                    # the skip so evidence never hides an unapplied promo.
-                    if isinstance(discount_evidence, dict):
-                        decisions = discount_evidence.setdefault("decisions", [])
-                        if isinstance(decisions, list):
-                            decisions.append(
-                                {
-                                    "promotion_id": getattr(promo, "id", None),
-                                    "decision": "skipped",
-                                    "reason": "promo_type_not_applied_at_quote",
-                                    "promo_type": getattr(promo, "type", None),
-                                    "source": "pivota_infra",
-                                }
-                            )
-                    continue
-
-                scope = getattr(promo, "scope", None) or {}
-                cfg = getattr(promo, "config", None) or {}
-
-                if self._is_unscoped_legacy_manual_promo(scope, cfg):
-                    if isinstance(discount_evidence, dict):
-                        decisions = discount_evidence.setdefault("decisions", [])
-                        if isinstance(decisions, list):
-                            decisions.append(
-                                {
-                                    "promotion_id": getattr(promo, "id", None),
-                                    "decision": "skipped",
-                                    "reason": "legacy_unscoped_manual_promotion",
-                                    "source": "pivota_infra",
-                                }
-                            )
-                    continue
-
-                has_shopify_discount = self._has_shopify_applied_discount(discount_evidence)
-                if (
-                    self._has_rejected_shopify_discount_code(discount_evidence)
-                    and not has_shopify_discount
-                    and not self._manual_promo_can_apply_after_shopify_code_rejected(cfg)
-                ):
-                    if isinstance(discount_evidence, dict):
-                        decisions = discount_evidence.setdefault("decisions", [])
-                        if isinstance(decisions, list):
-                            decisions.append(
-                                {
-                                    "promotion_id": getattr(promo, "id", None),
-                                    "decision": "skipped",
-                                    "reason": "shopify_code_rejected",
-                                    "source": "pivota_infra",
-                                }
-                            )
-                    continue
-
-                if has_shopify_discount and not self._manual_promo_can_stack_with_shopify(
-                    cfg,
-                    discount_evidence,
-                ):
-                    if isinstance(discount_evidence, dict):
-                        decisions = discount_evidence.setdefault("decisions", [])
-                        if isinstance(decisions, list):
-                            decisions.append(
-                                {
-                                    "promotion_id": getattr(promo, "id", None),
-                                    "decision": "skipped",
-                                    "reason": "shopify_discount_present",
-                                    "source": "pivota_infra",
-                                }
-                            )
-                    continue
-
-                if self._manual_promo_requires_shopify_new_customer_evidence(
-                    cfg
-                ) and not self._has_verified_shopify_new_customer_evidence(discount_evidence):
-                    if isinstance(discount_evidence, dict):
-                        decisions = discount_evidence.setdefault("decisions", [])
-                        if isinstance(decisions, list):
-                            decisions.append(
-                                {
-                                    "promotion_id": getattr(promo, "id", None),
-                                    "decision": "skipped",
-                                    "reason": "shopify_new_customer_unverified_or_ineligible",
-                                    "source": "pivota_infra",
-                                }
-                            )
-                    continue
-
-                threshold = int(cfg.get("thresholdQuantity") or cfg.get("threshold_quantity") or 0)
-                discount_percent_raw = cfg.get("discountPercent") or cfg.get("discount_percent") or 0
-                discount_percent = Decimal(str(discount_percent_raw))
-
-                if threshold <= 0 or discount_percent <= 0:
-                    continue
-
-                eligible_product_ids: Optional[List[str]] = None
-                eligible_variant_ids: Optional[List[str]] = None
-                if not scope.get("global"):
-                    eligible_product_ids = scope.get("productIds") or scope.get("product_ids") or []
-                    eligible_variant_ids = scope.get("variantIds") or scope.get("variant_ids") or []
-                    if not isinstance(eligible_product_ids, list):
-                        eligible_product_ids = []
-                    if not isinstance(eligible_variant_ids, list):
-                        eligible_variant_ids = []
-
-                # Expand eligible unit prices using pricing line_items (already resolved by engine).
-                unit_prices: List[Decimal] = []
-                for li in line_items or []:
-                    if not isinstance(li, dict):
-                        continue
-                    product_id = str(li.get("product_id") or "").strip()
-                    variant_id = str(li.get("variant_id") or "").strip()
-                    if eligible_product_ids is not None or eligible_variant_ids is not None:
-                        eligible = False
-                        if eligible_product_ids is not None and product_id and product_id in eligible_product_ids:
-                            eligible = True
-                        if eligible_variant_ids is not None and variant_id and variant_id in eligible_variant_ids:
-                            eligible = True
-                        if not eligible:
-                            continue
-                    qty = int(li.get("quantity") or 0)
-                    if qty <= 0:
-                        continue
-                    unit = d(li.get("unit_price_effective") or li.get("unit_price_original"))
-                    if unit <= 0:
-                        continue
-                    for _ in range(qty):
-                        unit_prices.append(unit)
-
-                total_qty = len(unit_prices)
-                if total_qty < threshold:
-                    continue
-
-                # Discount the highest-priced eligible units first.
-                unit_prices.sort(reverse=True)
-                discountable_qty = (total_qty // threshold) * threshold
-                discount_base = sum(unit_prices[:discountable_qty], Decimal("0.00"))
-                if discount_base <= 0:
-                    continue
-
-                promo_discount = (discount_base * discount_percent / Decimal("100")).quantize(
-                    Decimal("0.01"), rounding=ROUND_HALF_UP
-                )
-                if promo_discount <= 0:
-                    continue
-
-                # Apply as an order-level manual adjustment.
-                pricing["discount_total"] = d(pricing.get("discount_total")) + promo_discount
-                pricing["total"] = max(d(pricing.get("total")) - promo_discount, Decimal("0.00"))
-                if isinstance(discount_evidence, dict):
-                    discount_evidence["pricing_confidence"] = "partial"
-                    decisions = discount_evidence.setdefault("decisions", [])
-                    if isinstance(decisions, list):
-                        decisions.append(
-                            {
-                                "promotion_id": getattr(promo, "id", None),
-                                "decision": "applied",
-                                "reason": "pivota_manual_adjustment_not_shopify_allocation",
-                                "source": "pivota_infra",
-                            }
-                        )
-
-                promotion_lines.append(
-                    {
-                        "id": f"infra:{promo.id}",
-                        "source_ref": promo.id,
-                        "discount_class": "order",
-                        "method": "manual_adjustment",
-                        "label": getattr(promo, "humanReadableRule", None) or getattr(promo, "name", None) or "Deal",
-                        "code": None,
-                        "amount": (Decimal("0.00") - promo_discount),
-                        "allocations": [],
-                        "metadata": {
-                            "promotion_id": promo.id,
-                            "source": "pivota_infra",
-                            "kind": "MULTI_BUY_DISCOUNT",
-                            "threshold_quantity": threshold,
-                            "discount_percent": float(discount_percent),
-                        },
-                    }
-                )
-            except Exception as promo_err:
-                logger.warning(
-                    "Failed to apply promotion (best-effort)",
-                    extra={
-                        "merchant_id": merchant_id,
-                        "promotion_id": getattr(promo, "id", None),
-                        "error": str(promo_err),
-                    },
-                )
-                continue
-
-        return None
 
     async def load_active_quote_or_raise(self, *, quote_id: str) -> QuoteSnapshot:
         row = await get_quote(quote_id)

@@ -18,8 +18,9 @@ poller re-implements none of that — it is purely the fetch loop.
 
 Reuse (no re-invention):
 - Order fetch: the httpx Admin-API client shape + Link-header page_info cursor
-  from ``services/shopify_promotions_sync`` (``_parse_shopify_next_page_info``)
-  and the credential resolution from ``services/shopify_products_sync``
+  (``_parse_shopify_next_page_info``, adopted verbatim from the deleted
+  ``services/shopify_promotions_sync`` when the promotions lane was removed —
+  ADR-022) and the credential resolution from ``services/shopify_products_sync``
   (``_get_shopify_store_credentials`` → ``resolve_shopify_admin_access_token``).
 - note_attributes + total→cents parsing: ``extract_click_id_from_note_attributes``
   and ``shopify_order_total_to_cents`` from ``commerce_attribution_service`` so
@@ -44,10 +45,41 @@ from services.commerce_attribution_service import (
     extract_click_id_from_note_attributes,
     shopify_order_total_to_cents,
 )
-from services.shopify_promotions_sync import _parse_shopify_next_page_info
 from services.shopify_transactions_service import DEFAULT_API_VERSION
 
 logger = logging.getLogger("external_conversion_poller")
+
+
+def _parse_shopify_next_page_info(link_header: Optional[str]) -> Optional[str]:
+    """
+    Parse Shopify Link header to extract `page_info` cursor for pagination.
+    Example:
+      <https://shop.myshopify.com/admin/api/2025-10/price_rules.json?limit=250&page_info=XYZ>; rel=\"next\"
+    """
+    if not link_header:
+        return None
+
+    parts = link_header.split(",")
+    for part in parts:
+        if 'rel=\"next\"' not in part and "rel='next'" not in part:
+            continue
+        start = part.find("<")
+        end = part.find(">")
+        if start == -1 or end == -1 or end <= start + 1:
+            continue
+        url = part[start + 1 : end]
+        # Avoid importing urlparse to keep this helper small; a lightweight parse works.
+        query_start = url.find("?")
+        if query_start == -1:
+            continue
+        query_str = url[query_start + 1 :]
+        for kv in query_str.split("&"):
+            if not kv:
+                continue
+            key, _, value = kv.partition("=")
+            if key == "page_info" and value:
+                return value
+    return None
 
 # --- tunables -----------------------------------------------------------------
 
@@ -329,7 +361,7 @@ async def _fetch_orders_page(
 ) -> Tuple[List[Dict[str, Any]], Optional[str]]:
     """One page of orders. Returns (orders, next_page_info_cursor).
 
-    Mirrors ``services/shopify_promotions_sync._fetch_price_rules_page``: same
+    Mirrors the fetch shape of the deleted promotions sync (ADR-022): same
     header auth, same 429/401/403 handling, same Link-header cursor parse.
     """
     url = f"https://{shop_domain}/admin/api/{api_version}/orders.json"
