@@ -12,7 +12,9 @@ from datetime import datetime, timezone
 from functools import lru_cache
 import uvicorn
 from services.merchant_store_service import get_merchant_active_stores, get_primary_store
-from fastapi import FastAPI, BackgroundTasks, WebSocket, WebSocketDisconnect, Request, Response
+from typing import Any, Dict, Optional
+
+from fastapi import FastAPI, BackgroundTasks, Depends, WebSocket, WebSocketDisconnect, Request, Response
 from fastapi.middleware.cors import CORSMiddleware
 from middleware.rate_limiter import RateLimitMiddleware
 from middleware.usage_logger import UsageLoggerMiddleware
@@ -2016,29 +2018,75 @@ async def operations_dashboard():
     except FileNotFoundError:
         return HTMLResponse(content="<h1>Operations Dashboard</h1><p>Dashboard template not found</p>", status_code=404)
 
-@app.get("/config-check")
-async def config_check():
-    """Public endpoint to check environment variable configuration (no auth required)"""
+async def _require_admin_dep(
+    request: Request,
+) -> Dict[str, Any]:
+    """Admin gate for the ops probes below.
+
+    utils.auth is imported lazily: main.py's module-level import order is
+    load-bearing during startup (see the table-registration imports at the top),
+    and this route is the only consumer here.
+    """
+    from utils.auth import get_current_user, require_admin
+    from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
+
+    creds: Optional[HTTPAuthorizationCredentials] = await HTTPBearer(
+        auto_error=True
+    )(request)
+    user = await get_current_user(creds)
+    return await require_admin(user)
+
+
+# Deploy-time configuration probe. ADMIN-ONLY, and presence-only.
+#
+# It shipped public and unauthenticated ("no auth required" was the docstring),
+# which made it a free recon endpoint: it told any caller which PSP/platform
+# integrations are live, whether the nightly PSP backfill runs — and it echoed
+# four LITERAL values, measured on prod 2026-08-11 as
+# `adyen_merchant_account: "WoopayECOM"` plus the Shopify/Wix store URLs and the
+# OAuth redirect URI. Naming a real payment-processor merchant account to the
+# internet is the leak; the rest is the map an attacker would otherwise have to
+# guess at.
+#
+# The literals were never needed for the endpoint's own stated purpose — its
+# `instructions` field says "if any values show NOT SET, add them in Railway",
+# i.e. PRESENCE is the entire contract. So values are gone rather than masked:
+# nothing here has to decide how many characters of a merchant account are safe
+# to publish, and a future reader cannot "helpfully" unmask them.
+_CONFIG_CHECK_SETTINGS = (
+    "stripe_secret_key",
+    "adyen_api_key",
+    "adyen_merchant_account",
+    "shopify_access_token",
+    "shopify_store_url",
+    "shopify_client_id",
+    "shopify_client_secret",
+    "shopify_redirect_uri",
+    "wix_api_key",
+    "wix_store_url",
+)
+
+
+@app.get("/config-check", include_in_schema=False)
+async def config_check(_admin: Dict[str, Any] = Depends(_require_admin_dep)):
+    """Admin-only: is each integration env var SET? Never returns its value."""
     from config.settings import settings
-    
+
+    config = {
+        name: ("✅ SET" if getattr(settings, name, None) else "❌ NOT SET")
+        for name in _CONFIG_CHECK_SETTINGS
+    }
+    # Not a credential, and the version is load-bearing when diagnosing a
+    # metrics discrepancy — but still admin-gated along with everything else.
+    config["metrics_query_version"] = settings.metrics_query_version
+    config["enable_nightly_psp_id_backfill"] = (
+        "✅ ENABLED" if settings.enable_nightly_psp_id_backfill else "❌ DISABLED"
+    )
     return {
         "status": "success",
         "message": "Environment variable configuration check",
-        "config": {
-            "stripe_secret_key": "✅ SET" if settings.stripe_secret_key else "❌ NOT SET",
-            "adyen_api_key": "✅ SET" if settings.adyen_api_key else "❌ NOT SET",
-            "adyen_merchant_account": settings.adyen_merchant_account if settings.adyen_merchant_account else "❌ NOT SET",
-            "shopify_access_token": "✅ SET" if settings.shopify_access_token else "❌ NOT SET",
-            "shopify_store_url": settings.shopify_store_url if settings.shopify_store_url else "❌ NOT SET",
-            "shopify_client_id": "✅ SET" if settings.shopify_client_id else "❌ NOT SET",
-            "shopify_client_secret": "✅ SET" if settings.shopify_client_secret else "❌ NOT SET",
-            "shopify_redirect_uri": settings.shopify_redirect_uri if settings.shopify_redirect_uri else "❌ NOT SET",
-            "wix_api_key": "✅ SET" if settings.wix_api_key else "❌ NOT SET",
-            "wix_store_url": settings.wix_store_url if settings.wix_store_url else "❌ NOT SET",
-            "metrics_query_version": settings.metrics_query_version,
-            "enable_nightly_psp_id_backfill": "✅ ENABLED" if settings.enable_nightly_psp_id_backfill else "❌ DISABLED"
-        },
-        "instructions": "If any values show '❌ NOT SET', add them in Railway Environment Variables and redeploy"
+        "config": config,
+        "instructions": "If any values show '❌ NOT SET', add them in Railway Environment Variables and redeploy",
     }
 
 if __name__ == "__main__":
