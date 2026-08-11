@@ -1,6 +1,20 @@
 """Tests for refresh_agent_pdp_view_for_content_key — the canonical
 fetch->assemble->upsert orchestration used by the catalog_sync auto-servable
-hook (so a fresh internal-merchant SKU gets an APV row before recompute)."""
+hook (so a fresh internal-merchant SKU gets an APV row before recompute).
+
+🚨 WHAT THE _FakeDB CASES BELOW CANNOT PROVE. `_FakeDB.fetch_one` returns a
+canned row whatever SQL it is handed, so the enrichment-write cases assert only
+the CONTROL FLOW around the bridge — the flag gate, the identity guard, the
+best-effort swallow. They cannot see whether the statement is valid, and they
+did not: all four passed for weeks while the bridge queried
+`catalog_products.platform_product_id`, a column that does not exist, so every
+real call raised UndefinedColumn into the swallow and the bridge was dead.
+
+The statement itself is constrained in two other places, and both are load
+bearing: tests/test_enrichment_bridge_and_cohort_postgres.py EXECUTES it against
+a real catalog_products row (reverting the column turns it red), and the
+repo-wide prepare gate plans it. Do not add a case here that claims the bridge
+"works" — this file cannot support that claim."""
 
 from __future__ import annotations
 
