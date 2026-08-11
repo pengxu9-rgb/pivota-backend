@@ -206,6 +206,7 @@ def prepare() -> Callable[[str], None]:
     """
     import asyncpg
     import db.catalog  # noqa: F401  (registers the catalog tables on the shared MetaData)
+    import db.products  # noqa: F401  (products_cache — the join-diagnosis report reads it)
     from sqlalchemy import create_engine, text
 
     from db.database import metadata
@@ -430,6 +431,23 @@ def _collect_backfill_agent_pdp_view() -> List[Tuple[str, str]]:
     return statements
 
 
+def _collect_enrichment_join_diagnosis() -> List[Tuple[str, str]]:
+    """Every constant the join-diagnosis report sends. Same reasoning as the
+    baseline: a diagnosis whose SQL cannot be planned is an outage mid-ops-run,
+    and one that silently returns zero reads as a conclusion."""
+    import scripts.report_enrichment_join_diagnosis as module
+
+    origin = "report_enrichment_join_diagnosis"
+    return [
+        (f"{origin}.{name}", getattr(module, name)) for name in (
+            "CLASSIFY_SQL", "BY_MERCHANT_SQL",
+            "SAMPLE_ENRICHMENT_IDS_SQL", "SAMPLE_CATALOG_IDS_SQL",
+            "TREND_SQL", "COHORT_STATUS_SQL", "ORPHANED_SERVING_SQL",
+            "COHORT_KEYS_SQL", "PLAIN_PRODUCT_SQL",
+        )
+    ]
+
+
 def _collect_enrichment_baseline() -> List[Tuple[str, str]]:
     """Read-only report, but its statements still have to PLAN. A baseline that
     dies on the first query is an outage in the middle of an ops run, and one
@@ -461,6 +479,7 @@ _COVERED_SCRIPTS: Dict[str, Callable[[], List[Tuple[str, str]]]] = {
     "scripts/source_pdp_offer_image_repair.py": _collect_source_pdp_offer_image_repair,
     "scripts/backfill_agent_pdp_view.py": _collect_backfill_agent_pdp_view,
     "scripts/report_enrichment_propagation_baseline.py": _collect_enrichment_baseline,
+    "scripts/report_enrichment_join_diagnosis.py": _collect_enrichment_join_diagnosis,
 }
 
 # What each collector yields TODAY, not a slack lower bound. Guards the failure
@@ -476,6 +495,7 @@ _MIN_STATEMENTS = {
     "scripts/source_pdp_offer_image_repair.py": 6,
     "scripts/backfill_agent_pdp_view.py": 5,
     "scripts/report_enrichment_propagation_baseline.py": 12,
+    "scripts/report_enrichment_join_diagnosis.py": 9,
 }
 
 
