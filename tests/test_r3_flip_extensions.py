@@ -97,10 +97,13 @@ class _FakeDb:
         _assert_binds_match(sql, params)
         self.executed.append((" ".join(sql.split()), dict(params or {})))
         if "product_group_members" in sql and isinstance(self.pgm_banned_rows, list):
-            self.pgm_banned_rows = [
-                r for r in self.pgm_banned_rows
-                if not (str(r.get("platform")) == str((params or {}).get("platform")) and
-                        str(r.get("platform_product_id")) == str((params or {}).get("spid")))]
+            # merchant-checked too: a write binding the wrong constant to
+            # :banned must NOT clear the row (re-review nit on #1725)
+            if (params or {}).get("banned") == "external_seed":
+                self.pgm_banned_rows = [
+                    r for r in self.pgm_banned_rows
+                    if not (str(r.get("platform")) == str((params or {}).get("platform")) and
+                            str(r.get("platform_product_id")) == str((params or {}).get("spid")))]
 
     def transaction(self):
         class _Txn:
