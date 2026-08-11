@@ -349,6 +349,28 @@ def _collect_backfill_agent_pdp_view() -> List[Tuple[str, str]]:
     ]
 
 
+def _collect_enrichment_baseline() -> List[Tuple[str, str]]:
+    """Read-only report, but its statements still have to PLAN. A baseline that
+    dies on the first query is an outage in the middle of an ops run, and one
+    that silently returns zero would be read as "nothing to backfill"."""
+    import scripts.report_enrichment_propagation_baseline as module
+
+    origin = "report_enrichment_propagation_baseline"
+    statements = [
+        (f"{origin}.{name}", sql) for name, sql in (
+            ("IDENTITY_JOIN_SANITY_SQL", module.IDENTITY_JOIN_SANITY_SQL),
+            ("COHORT_SQL", module.COHORT_SQL),
+            ("STRANDED_SQL", module.STRANDED_SQL),
+            ("STRANDED_BY_BRAND_SQL", module.STRANDED_BY_BRAND_SQL),
+        )
+    ]
+    statements += [
+        (f"{origin}.SOURCE_COUNTS[{i}] {label.strip()}", sql)
+        for i, (label, sql) in enumerate(module.SOURCE_COUNTS)
+    ]
+    return statements
+
+
 # module path -> collector. The completeness guard below reads this same list,
 # so a script cannot be registered here and left half-covered in silence.
 _COVERED_SCRIPTS: Dict[str, Callable[[], List[Tuple[str, str]]]] = {
@@ -357,6 +379,7 @@ _COVERED_SCRIPTS: Dict[str, Callable[[], List[Tuple[str, str]]]] = {
     "scripts/source_pdp_content_repair.py": _collect_source_pdp_content_repair,
     "scripts/source_pdp_offer_image_repair.py": _collect_source_pdp_offer_image_repair,
     "scripts/backfill_agent_pdp_view.py": _collect_backfill_agent_pdp_view,
+    "scripts/report_enrichment_propagation_baseline.py": _collect_enrichment_baseline,
 }
 
 # What each collector yields TODAY, not a slack lower bound. Guards the failure
@@ -371,6 +394,7 @@ _MIN_STATEMENTS = {
     "scripts/source_pdp_content_repair.py": 3,
     "scripts/source_pdp_offer_image_repair.py": 6,
     "scripts/backfill_agent_pdp_view.py": 4,
+    "scripts/report_enrichment_propagation_baseline.py": 12,
 }
 
 
