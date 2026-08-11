@@ -2044,12 +2044,15 @@ async def health_check(request: Request):
     #   * shopify_discount_reconciliation_mode, runtime_contracts and the
     #     missing-column NAMES are genuinely new closures — they appear nowhere
     #     else on an anonymous response.
-    #   * rate_limit_rpm is NOT. `middleware/rate_limiter.py` stamps
-    #     `X-RateLimit-Limit: <rate_limit_rpm>` on every `/agent/*` response
-    #     whenever any x-api-key header is present — including 401s and 404s,
-    #     so an invalid key reads it. Removing it from this body is tidiness,
-    #     not containment. Closing that properly means changing the rate-limit
-    #     middleware, which is a different blast radius and not attempted here.
+    #   * rate_limit_rpm WAS not, and now is. When this comment was written,
+    #     `middleware/rate_limiter.py` stamped `X-RateLimit-Limit:
+    #     <rate_limit_rpm>` on every `/agent/*` response whenever any x-api-key
+    #     header was present — including 401s and 404s — so removing it from
+    #     this body was tidiness rather than containment. That header leak has
+    #     since been closed: the middleware now publishes only the limit
+    #     ENFORCED on a caller who authenticated, and nothing to anyone else.
+    #     Both halves are needed for the closure to hold, so if you are
+    #     reinstating either, reinstate this note too.
     #
     # Build identity is deliberately still public: removing it from this body
     # while the middleware stamps X-Service-Commit on every 404 would be

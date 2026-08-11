@@ -52,16 +52,29 @@ class RateLimitMiddleware(BaseHTTPMiddleware):
         trusted = explicit_trusted + (implicit_trusted if self.trust_internal_keys else [])
         self.trusted_api_keys = {key for key in trusted if key}
     
-    @staticmethod
-    def _stamp_authenticated_limits(request: Request, response, reset_at: int) -> None:
+    def _stamp_authenticated_limits(
+        self,
+        request: Request,
+        response,
+        reset_at: int,
+        *,
+        global_remaining: int | None = None,
+    ) -> None:
         """Publish rate-limit headers ONLY to a caller who actually authenticated.
 
-        This deliberately does NOT publish `self.requests_per_minute`. That is a
-        global deployment setting (`RATE_LIMIT_RPM`, 120 in production), and this
-        middleware runs BEFORE authentication — it buckets on an api_key it has
-        not validated — so stamping it after `call_next` handed the live
-        threshold to anybody who set an `x-api-key` header to any value at all,
-        on 401s and 404s alike. Measured on prod 2026-08-11:
+        The rule is "publish the limit that is ENFORCED on this caller, to
+        callers who authenticated" — not "never publish the global limit". It
+        does emit `self.requests_per_minute`, but only where that genuinely is
+        the enforced number AND the caller authenticated (see the second half of
+        this function). What it never does is emit it to an UNAUTHENTICATED
+        caller, which is the leak.
+
+        `self.requests_per_minute` is a global deployment setting
+        (`RATE_LIMIT_RPM`, 120 in production), and this middleware runs BEFORE
+        authentication — it buckets on an api_key it has not validated — so
+        stamping it unconditionally after `call_next` handed the live threshold
+        to anybody who set an `x-api-key` header to any value at all, on 401s
+        and 404s alike. Measured on prod 2026-08-11:
 
             curl -H 'x-api-key: nope' https://api.pivota.cc/agent/<no-such-route>
             -> HTTP/2 404
@@ -91,17 +104,50 @@ class RateLimitMiddleware(BaseHTTPMiddleware):
         `scope["state"]` — verified, not assumed.
         """
         limit = getattr(request.state, "agent_rate_limit_limit", None)
-        if limit is None:
+        if limit is not None:
+            try:
+                limit_int = int(limit)
+                used_int = int(getattr(request.state, "agent_rate_limit_used", 0) or 0)
+            except (TypeError, ValueError):
+                return
+            if limit_int <= 0:
+                return
+            # MINUS ONE, deliberately. `used` comes from check_rate_limit, which
+            # COUNTs agent_usage_logs rows for the window — and the row for the
+            # request in flight does not exist yet: UsageLoggerMiddleware is the
+            # innermost middleware and inserts only AFTER call_next, while the
+            # auth dependency that calls check_rate_limit runs inside it. So
+            # `used` excludes the present request, and `limit - used` overstates
+            # the budget by one: a client pacing on Remaining sends one request
+            # too many and eats a 429. The code this replaced got this right on
+            # both branches (`- request_count - 1` in-memory, post-incr `current`
+            # for redis) and an earlier cut of this fix regressed it.
+            response.headers["X-RateLimit-Limit"] = str(limit_int)
+            response.headers["X-RateLimit-Remaining"] = str(
+                max(0, limit_int - used_int - 1)
+            )
+            response.headers["X-RateLimit-Reset"] = str(reset_at)
             return
-        try:
-            limit_int = int(limit)
-            used_int = int(getattr(request.state, "agent_rate_limit_used", 0) or 0)
-        except (TypeError, ValueError):
+
+        # No per-agent limit recorded. If the caller nonetheless authenticated
+        # AND this middleware bucketed the request against the global limit,
+        # then the global limit IS the enforced limit for them and withholding
+        # it is not privacy, just a worse answer. This is the internal-trusted
+        # branch of routes/agent_auth.py: it authenticates the caller but runs
+        # no per-agent check_rate_limit, and `_build_internal_trusted_agent`
+        # carries no `rate_limit` to report.
+        #
+        # `global_remaining is None` marks the paths where this middleware did
+        # NOT account the request — the keyless early return and the
+        # trusted-key bypass. Nothing is enforced there, so publishing a
+        # threshold would be a lie, and publishing it to a keyless caller would
+        # re-open the very leak this class exists to close.
+        if global_remaining is None:
             return
-        if limit_int <= 0:
+        if not getattr(request.state, "agent_authenticated", False):
             return
-        response.headers["X-RateLimit-Limit"] = str(limit_int)
-        response.headers["X-RateLimit-Remaining"] = str(max(0, limit_int - used_int))
+        response.headers["X-RateLimit-Limit"] = str(self.requests_per_minute)
+        response.headers["X-RateLimit-Remaining"] = str(max(0, int(global_remaining)))
         response.headers["X-RateLimit-Reset"] = str(reset_at)
 
     async def dispatch(self, request: Request, call_next):
@@ -214,12 +260,15 @@ class RateLimitMiddleware(BaseHTTPMiddleware):
         # Process request
         response = await call_next(request)
 
-        # Publish the ENFORCED per-agent limit to callers who authenticated, and
-        # nothing to those who did not. `remaining` above is the global bucket's
-        # count and is deliberately no longer published — it leaks the threshold
-        # just as plainly as the limit header did (remaining 119 on a first
-        # request says 120 outright).
-        self._stamp_authenticated_limits(request, response, reset_at)
+        # Publish the ENFORCED limit to callers who authenticated, and nothing to
+        # those who did not. `remaining` is the global bucket's count; it is
+        # passed in (not published directly) because it is only the right answer
+        # for an authenticated caller with no per-agent limit. Publishing it
+        # unconditionally would leak the threshold just as plainly as the limit
+        # header did — `remaining: 119` on a first request says 120 outright.
+        self._stamp_authenticated_limits(
+            request, response, reset_at, global_remaining=remaining
+        )
 
         return response
 

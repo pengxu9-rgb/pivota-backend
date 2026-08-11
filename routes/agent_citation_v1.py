@@ -119,9 +119,15 @@ async def _citation_rate_limit(request: Request) -> None:
         raise HTTPException(
             status_code=status.HTTP_429_TOO_MANY_REQUESTS,
             detail="citation read rate limit exceeded",
+            # No X-RateLimit-Limit: `key` falls back to client_ip/"anonymous",
+            # so these routes 429 fully unauthenticated callers, and publishing
+            # the tier threshold to them contradicts the invariant the rate-limit
+            # middleware now holds. Retry-After plus Remaining: 0 is the whole
+            # back-off signal a client needs. (Lower stakes than the middleware
+            # leak — this is a hardcoded AdvancedRateLimiter.TIERS constant, not
+            # a deployment setting — but the asymmetry is not worth keeping.)
             headers={
                 "Retry-After": str(retry),
-                "X-RateLimit-Limit": str(meta.get("limit", "")),
                 "X-RateLimit-Remaining": str(meta.get("remaining", 0)),
             },
         )
