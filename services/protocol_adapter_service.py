@@ -1,6 +1,7 @@
 """
 Protocol Adapter Service - Phase 4
-Handles AP2, ACP, X-402 protocol support with validation and transformation
+Validates/transforms the legacy AP2/ACP protocol-TIER payload shapes for the
+/protocols management surface (protocol DOORS live on the PIVOTA-Agent gateway, ADR-021)
 """
 from abc import ABC, abstractmethod
 from typing import Dict, Any, Optional, List, Tuple
@@ -31,11 +32,6 @@ class ProtocolAdapter(ABC):
     @abstractmethod
     async def transform_response(self, response: Dict[str, Any]) -> Dict[str, Any]:
         """Transform internal response to protocol-specific format"""
-        pass
-    
-    @abstractmethod
-    def get_endpoints(self) -> Dict[str, str]:
-        """Get protocol-specific endpoints"""
         pass
     
     @abstractmethod
@@ -100,15 +96,6 @@ class AP2Adapter(ProtocolAdapter):
                 "name": self.protocol_name,
                 "version": self.version
             }
-        }
-    
-    def get_endpoints(self) -> Dict[str, str]:
-        """Get AP2 endpoints"""
-        return {
-            "create_payment": "/ap2/v2/payments",
-            "get_status": "/ap2/v2/payments/{payment_id}",
-            "refund": "/ap2/v2/refunds",
-            "cancel": "/ap2/v2/payments/{payment_id}/cancel"
         }
     
     def get_required_fields(self) -> List[str]:
@@ -189,125 +176,10 @@ class ACPAdapter(ProtocolAdapter):
             }
         }
     
-    def get_endpoints(self) -> Dict[str, str]:
-        """Get ACP endpoints"""
-        return {
-            "create_order": "/acp/orders",
-            "get_order": "/acp/orders/{order_id}",
-            "update_order": "/acp/orders/{order_id}",
-            "check_inventory": "/acp/inventory/check",
-            "events": "wss://events/acp"  # WebSocket endpoint
-        }
-    
     def get_required_fields(self) -> List[str]:
         """Get required fields for ACP"""
         return ["agent_id", "merchant_id", "items", "customer"]
 
-
-class X402Adapter(ProtocolAdapter):
-    """Extended Payment Protocol (X-402) Adapter"""
-    
-    def __init__(self):
-        self.protocol_name = "X-402"
-        self.version = "3.1"
-    
-    async def validate_request(self, payload: Dict[str, Any]) -> Tuple[bool, Optional[str]]:
-        """Validate X-402 protocol request"""
-        required_fields = self.get_required_fields()
-        
-        for field in required_fields:
-            if field not in payload:
-                return False, f"Missing required field: {field}"
-        
-        # Validate authorization code format
-        auth_code = payload.get("authorization_code", "")
-        if not auth_code or len(auth_code) < 6:
-            return False, "Invalid authorization code"
-        
-        # Validate multi-currency support
-        if "currencies" in payload:
-            currencies = payload.get("currencies", [])
-            if not isinstance(currencies, list):
-                return False, "Currencies must be an array"
-            for curr in currencies:
-                if not isinstance(curr, str) or len(curr) != 3:
-                    return False, f"Invalid currency code: {curr}"
-        
-        return True, None
-    
-    async def transform_request(self, payload: Dict[str, Any]) -> Dict[str, Any]:
-        """Transform X-402 request to internal format"""
-        # Handle multi-currency conversion if needed
-        primary_currency = payload.get("currency", "USD")
-        amount = payload.get("amount", 0)
-        
-        # If multiple currencies specified, store conversion rates
-        currency_data = {
-            "primary": primary_currency,
-            "amount": amount,
-            "alternatives": []
-        }
-        
-        if "currencies" in payload:
-            for curr in payload.get("currencies", []):
-                if curr != primary_currency:
-                    # TODO: Get real conversion rate
-                    conversion_rate = 1.0  # Placeholder
-                    currency_data["alternatives"].append({
-                        "currency": curr,
-                        "amount": amount * conversion_rate,
-                        "rate": conversion_rate
-                    })
-        
-        return {
-            "transaction_id": payload.get("transaction_id"),
-            "amount": amount,
-            "currency": primary_currency,
-            "currency_data": currency_data,
-            "authorization_code": payload.get("authorization_code"),
-            "capture_mode": payload.get("capture_mode", "immediate"),  # immediate or manual
-            "metadata": {
-                "protocol": self.protocol_name,
-                "version": self.version,
-                "original_payload": payload
-            }
-        }
-    
-    async def transform_response(self, response: Dict[str, Any]) -> Dict[str, Any]:
-        """Transform internal response to X-402 format"""
-        return {
-            "transaction_id": response.get("transaction_id"),
-            "status": response.get("status"),
-            "authorization_status": "approved" if response.get("status") == "success" else "declined",
-            "capture_status": response.get("capture_status", "pending"),
-            "amount": response.get("amount"),
-            "currency": response.get("currency"),
-            "multi_currency": response.get("currency_data", {}),
-            "processor_response": {
-                "code": response.get("response_code", "00"),
-                "message": response.get("response_message", "Success")
-            },
-            "created_at": datetime.utcnow().isoformat(),
-            "protocol": {
-                "name": self.protocol_name,
-                "version": self.version,
-                "features": ["multi_currency", "deferred_capture", "partial_refund"]
-            }
-        }
-    
-    def get_endpoints(self) -> Dict[str, str]:
-        """Get X-402 endpoints"""
-        return {
-            "authorize": "/x402/authorize",
-            "capture": "/x402/capture",
-            "void": "/x402/void",
-            "refund": "/x402/refund",
-            "status": "/x402/status/{transaction_id}"
-        }
-    
-    def get_required_fields(self) -> List[str]:
-        """Get required fields for X-402"""
-        return ["transaction_id", "amount", "currency", "authorization_code"]
 
 
 class ProtocolAdapterService:
@@ -315,10 +187,15 @@ class ProtocolAdapterService:
     
     def __init__(self, database: Database):
         self.database = database
+        # ACP/UCP/MCP protocol DOORS live on the PIVOTA-Agent gateway (ADR-021);
+        # these adapters only validate/transform the legacy protocol-TIER payload
+        # shapes for the /protocols management surface. X402Adapter was deleted
+        # 2026-08-11: no x402 implementation exists anywhere in the system, and
+        # every advertised endpoint map (/x402/*, /ap2/v2/*, /acp/orders,
+        # wss://events/acp) was fiction — all removed.
         self.adapters = {
             "AP2": AP2Adapter(),
             "ACP": ACPAdapter(),
-            "X-402": X402Adapter()
         }
     
     async def get_adapter(self, protocol_name: str) -> Optional[ProtocolAdapter]:
@@ -493,7 +370,6 @@ class ProtocolAdapterService:
                 "request": test_payload,
                 "transformed_request": transformed,
                 "response": protocol_response,
-                "endpoints": adapter.get_endpoints()
             }
             
         except Exception as e:
