@@ -12,7 +12,9 @@ from datetime import datetime, timezone
 from functools import lru_cache
 import uvicorn
 from services.merchant_store_service import get_merchant_active_stores, get_primary_store
-from fastapi import FastAPI, BackgroundTasks, WebSocket, WebSocketDisconnect, Request, Response
+from typing import Any, Dict
+
+from fastapi import FastAPI, BackgroundTasks, Depends, WebSocket, WebSocketDisconnect, Request, Response
 from fastapi.middleware.cors import CORSMiddleware
 from middleware.rate_limiter import RateLimitMiddleware
 from middleware.usage_logger import UsageLoggerMiddleware
@@ -380,6 +382,7 @@ except ImportError:
     OPERATIONS_AVAILABLE = False
 
 # Utils
+from utils.auth import require_admin
 from utils.logger import logger
 from config.settings import settings
 from services.agent_governance import agent_governance, governance_runtime_contract
@@ -1152,7 +1155,6 @@ async def get_version():
     # Railway 自动注入的环境变量
     railway_commit = os.getenv("RAILWAY_GIT_COMMIT_SHA")
     railway_branch = os.getenv("RAILWAY_GIT_BRANCH")
-    railway_author = os.getenv("RAILWAY_GIT_AUTHOR")
     
     if railway_commit:
         # 在 Railway 上运行
@@ -1160,7 +1162,11 @@ async def get_version():
             "version": railway_commit[:8],  # 短 hash
             "full_sha": railway_commit,
             "branch": railway_branch,
-            "author": railway_author,
+            # RAILWAY_GIT_AUTHOR deliberately NOT returned: it is a named
+            # individual's identity, this endpoint is public and
+            # unauthenticated, and nothing consumes it (the two in-repo readers
+            # take `settings_contract` and the SHA). Publishing who last
+            # deployed is gratuitous.
             "environment": "production",
             "status": "healthy",
             "settings_contract": _settings_contract_payload(),
@@ -2016,29 +2022,62 @@ async def operations_dashboard():
     except FileNotFoundError:
         return HTMLResponse(content="<h1>Operations Dashboard</h1><p>Dashboard template not found</p>", status_code=404)
 
-@app.get("/config-check")
-async def config_check():
-    """Public endpoint to check environment variable configuration (no auth required)"""
+# Deploy-time configuration probe. ADMIN-ONLY, and presence-only.
+#
+# It shipped public and unauthenticated ("no auth required" was the docstring),
+# which made it a free recon endpoint: it told any caller which PSP/platform
+# integrations are live, whether the nightly PSP backfill runs — and it echoed
+# four LITERAL values, measured on prod 2026-08-11 as
+# `adyen_merchant_account: "WoopayECOM"` plus the Shopify/Wix store URLs and the
+# OAuth redirect URI. Naming a real payment-processor merchant account to the
+# internet is the leak; the rest is the map an attacker would otherwise have to
+# guess at.
+#
+# The literals were never needed for the endpoint's own stated purpose — its
+# `instructions` field says "if any values show NOT SET, add them in Railway",
+# i.e. PRESENCE is the entire contract. So values are gone rather than masked:
+# nothing here has to decide how many characters of a merchant account are safe
+# to publish, and a future reader cannot "helpfully" unmask them.
+# NOTE on adyen_merchant_account: config/settings.py hardcodes a non-empty
+# default for it, so this field can never report "NOT SET" however the
+# environment is configured — the endpoint's own instruction is structurally
+# unreachable for that one setting. Pre-existing; left alone here because
+# changing a settings default is a different blast radius from closing a
+# public endpoint.
+_CONFIG_CHECK_SETTINGS = (
+    "stripe_secret_key",
+    "adyen_api_key",
+    "adyen_merchant_account",
+    "shopify_access_token",
+    "shopify_store_url",
+    "shopify_client_id",
+    "shopify_client_secret",
+    "shopify_redirect_uri",
+    "wix_api_key",
+    "wix_store_url",
+)
+
+
+@app.get("/config-check", include_in_schema=False)
+async def config_check(_admin: Dict[str, Any] = Depends(require_admin)):
+    """Admin-only: is each integration env var SET? Never returns its value."""
     from config.settings import settings
-    
+
+    config = {
+        name: ("✅ SET" if getattr(settings, name, None) else "❌ NOT SET")
+        for name in _CONFIG_CHECK_SETTINGS
+    }
+    # Not a credential, and the version is load-bearing when diagnosing a
+    # metrics discrepancy — but still admin-gated along with everything else.
+    config["metrics_query_version"] = settings.metrics_query_version
+    config["enable_nightly_psp_id_backfill"] = (
+        "✅ ENABLED" if settings.enable_nightly_psp_id_backfill else "❌ DISABLED"
+    )
     return {
         "status": "success",
         "message": "Environment variable configuration check",
-        "config": {
-            "stripe_secret_key": "✅ SET" if settings.stripe_secret_key else "❌ NOT SET",
-            "adyen_api_key": "✅ SET" if settings.adyen_api_key else "❌ NOT SET",
-            "adyen_merchant_account": settings.adyen_merchant_account if settings.adyen_merchant_account else "❌ NOT SET",
-            "shopify_access_token": "✅ SET" if settings.shopify_access_token else "❌ NOT SET",
-            "shopify_store_url": settings.shopify_store_url if settings.shopify_store_url else "❌ NOT SET",
-            "shopify_client_id": "✅ SET" if settings.shopify_client_id else "❌ NOT SET",
-            "shopify_client_secret": "✅ SET" if settings.shopify_client_secret else "❌ NOT SET",
-            "shopify_redirect_uri": settings.shopify_redirect_uri if settings.shopify_redirect_uri else "❌ NOT SET",
-            "wix_api_key": "✅ SET" if settings.wix_api_key else "❌ NOT SET",
-            "wix_store_url": settings.wix_store_url if settings.wix_store_url else "❌ NOT SET",
-            "metrics_query_version": settings.metrics_query_version,
-            "enable_nightly_psp_id_backfill": "✅ ENABLED" if settings.enable_nightly_psp_id_backfill else "❌ DISABLED"
-        },
-        "instructions": "If any values show '❌ NOT SET', add them in Railway Environment Variables and redeploy"
+        "config": config,
+        "instructions": "If any values show '❌ NOT SET', add them in Railway Environment Variables and redeploy",
     }
 
 if __name__ == "__main__":
