@@ -1027,6 +1027,20 @@ UPSERT_SQL = """
       rating_count = EXCLUDED.rating_count,
       refreshed_at = NOW(),
       refresh_source = EXCLUDED.refresh_source,
+      -- STRAIGHT ASSIGNMENT, deliberately. An earlier revision COALESCEd this,
+      -- on the theory that an anonymous rebuild should not erase the seed
+      -- writer's attribution. That was wrong: migration 085 defines this column
+      -- as "link to the proposal that TRIGGERED THE REFRESH", paired with
+      -- refresh_source, "free-form provenance for refreshes that did NOT come
+      -- from a proposal". The two describe THIS refresh, mutually exclusively —
+      -- so clearing it when the current refresh had no proposal is the
+      -- contract, not a bug. fashion_field_authoring used to set it to None
+      -- explicitly for exactly that reason.
+      --
+      -- COALESCE also made a wrong value permanent on a field
+      -- routes/agent_pdp_v1.py serves publicly: nothing anywhere performs a
+      -- non-NULL -> NULL transition, so a merchant's hand edit would be
+      -- attributed to an unrelated (possibly rejected) proposal forever.
       refreshed_by_proposal_id = EXCLUDED.refreshed_by_proposal_id
 """
 
@@ -1100,7 +1114,7 @@ async def _fetch_enrichment_for_canonical(
     breaking the serve-cache rebuild — agent_pdp_view is a cache, never truth."""
     if not products:
         return None
-    from db.product_enrichment import get_enrichment
+    from db.product_enrichment import get_enrichments_for_products
 
     canonical = pick_canonical(products)
     canonical_key = (
@@ -1108,12 +1122,57 @@ async def _fetch_enrichment_for_canonical(
         canonical.get("platform"),
         canonical.get("source_product_id"),
     )
+
+    # ONE QUERY PER MERCHANT, not one per cluster member.
+    #
+    # This used to call get_enrichment() per product. Measured prod cluster sizes
+    # are median 2 / p99 14 / max 45, and the largest are all merchant_id
+    # 'external_seed' — i.e. exactly the cohort refresh_agent_pdp_view_for_seed
+    # fires on. Since get_enrichment ALSO awaits ensure_product_enrichment_table()
+    # on every call, the per-member loop multiplied both the round trips and the
+    # DDL attempts by N; on a failing-DDL role the ensure never becomes sticky, so
+    # a 43-member cluster cost 93 statements per rebuild, all serialized through a
+    # process-global asyncio.Lock. That is now on a live merchant request path,
+    # which is what makes it worth fixing rather than tolerating.
+    #
+    # get_enrichments_for_products is merchant-scoped, so group first: a cluster
+    # can legitimately span merchants, and the single-merchant clusters that
+    # dominate the tail collapse to exactly one query.
+    by_merchant: Dict[str, List[Tuple[str, str]]] = {}
+    for product in products:
+        merchant_id = product.get("merchant_id")
+        platform = product.get("platform")
+        source_product_id = product.get("source_product_id")
+        if not (merchant_id and platform and source_product_id):
+            continue
+        by_merchant.setdefault(str(merchant_id), []).append(
+            (str(platform), str(source_product_id))
+        )
+
+    overlays: Dict[Tuple[str, str, str], Dict[str, Any]] = {}
+    any_fetch_failed = False
+    for merchant_id, keys in by_merchant.items():
+        try:
+            fetched = await get_enrichments_for_products(
+                merchant_id, product_keys=keys
+            )
+        except Exception as exc:  # noqa: BLE001
+            logger.warning(
+                "agent_pdp_view enrichment overlay fetch failed (best-effort): %s",
+                str(exc)[:200],
+            )
+            any_fetch_failed = True
+            continue
+        for (platform, source_product_id), overlay in (fetched or {}).items():
+            overlays[(merchant_id, platform, source_product_id)] = overlay
+
     # Finding B: walk the content_key cluster — a brand-attested overlay wins
     # (only the verified brand can create one, so it's safe + authoritative for
     # the entity, even if attest keyed it to a non-canonical seed beside a synced
     # product that wins pick_canonical), else fall back to the canonical's overlay.
+    # Iteration order is unchanged, so the winner is identical to the per-member
+    # version: the FIRST brand-attested overlay in cluster order.
     canonical_overlay: Optional[Dict[str, Any]] = None
-    any_fetch_failed = False
     for product in products:
         ident = (
             product.get("merchant_id"),
@@ -1122,15 +1181,9 @@ async def _fetch_enrichment_for_canonical(
         )
         if not all(ident):
             continue
-        try:
-            overlay = await get_enrichment(str(ident[0]), str(ident[1]), str(ident[2]))
-        except Exception as exc:  # noqa: BLE001
-            logger.warning(
-                "agent_pdp_view enrichment overlay fetch failed (best-effort): %s",
-                str(exc)[:200],
-            )
-            any_fetch_failed = True
-            continue
+        overlay = overlays.get(
+            (str(ident[0]), str(ident[1]), str(ident[2]))
+        )
         if not overlay:
             continue
         if overlay.get("updated_by_employee_id") == "brand_attestation":
@@ -1150,6 +1203,8 @@ async def refresh_agent_pdp_view_for_content_key(
     *,
     refresh_source: str,
     db: Any = None,
+    external_seed_id: Optional[str] = None,
+    refreshed_by_proposal_id: Optional[int] = None,
 ) -> bool:
     """Rebuild + upsert the denormalized agent_pdp_view row for a content_key.
 
@@ -1165,7 +1220,11 @@ async def refresh_agent_pdp_view_for_content_key(
     """
     read_db = db or database
     row = await build_agent_pdp_view_row(
-        content_key, refresh_source=refresh_source, db=read_db
+        content_key,
+        refresh_source=refresh_source,
+        db=read_db,
+        external_seed_id=external_seed_id,
+        refreshed_by_proposal_id=refreshed_by_proposal_id,
     )
     if row is None:
         return False
@@ -1178,6 +1237,8 @@ async def build_agent_pdp_view_row(
     *,
     refresh_source: str,
     db: Any = None,
+    external_seed_id: Optional[str] = None,
+    refreshed_by_proposal_id: Optional[int] = None,
 ) -> Optional[Dict[str, Any]]:
     """Fetch every source row for a content_key and assemble the view row.
 
@@ -1202,6 +1263,17 @@ async def build_agent_pdp_view_row(
     every column from EXCLUDED — so writing such a row DELETES the enrichment,
     evidence_profile and required_disclaimers already serving on it. That is not
     hypothetical: scripts/backfill_agent_pdp_view.py did exactly this.
+
+    `external_seed_id` selects the seed used for content fallback. Default
+    (None) takes the newest active seed attached anywhere in the cluster, which
+    is right for a backfill holding only a content_key. The seed_data WRITER
+    passes the triggering seed's id instead: it knows which seed_data just
+    changed, and "newest active in the group" can pull description text from a
+    stale, unrelated seed.
+
+    `refreshed_by_proposal_id` records which proposal caused the rebuild. Only
+    the seed writer knows one; everything else leaves it None, and the UPSERT
+    COALESCEs so a later anonymous refresh does not erase the attribution.
     """
     read_db = db or database
     products = await fetch_products_for_key(content_key, db=read_db)
@@ -1210,7 +1282,11 @@ async def build_agent_pdp_view_row(
     product_keys = [p["product_key"] for p in products if p.get("product_key")]
     skus = await fetch_skus_for_keys(product_keys, db=read_db)
     offers = await fetch_offers_for_keys(product_keys, db=read_db)
-    external_seed = await fetch_external_seed_for_keys(product_keys, db=read_db)
+    external_seed = (
+        await fetch_external_seed_by_id(external_seed_id, db=read_db)
+        if external_seed_id
+        else await fetch_external_seed_for_keys(product_keys, db=read_db)
+    )
     # Identity-confidence gate: a no-GTIN content_key is deliberately non-unique
     # (brand+title), so a cluster can collide DISTINCT products. Scope the evidence
     # fetch to members safe to attribute to the served row, so we never bake
@@ -1264,6 +1340,7 @@ async def build_agent_pdp_view_row(
     if row is not None:
         row["preserve_enrichment"] = preserve_enrichment
         row["preserve_evidence"] = preserve_evidence
+        row["refreshed_by_proposal_id"] = refreshed_by_proposal_id
     return row
 
 

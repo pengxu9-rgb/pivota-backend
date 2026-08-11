@@ -187,49 +187,33 @@ async def _refresh_view_for_content_key(content_key: str) -> None:
     """
     try:
         # Lazy import — see docstring.
+        #
+        # 🚨 DO NOT reintroduce a local assemble_row + UPSERT here. This block
+        # used to do exactly that, with no `evidence=` / `enrichment=` /
+        # `seller_trust_by_id=`, and UPSERT_SQL assigns every column from
+        # EXCLUDED. So a merchant saving ONE fashion field on an enriched
+        # product stripped that product's curated description, bullet_points,
+        # usage_scenarios, substantiated claims and required disclaimers from
+        # the served PDP — reachable from
+        # PUT /{platform}/{platform_product_id}/fashion_fields, with no operator
+        # involved and nothing logged. The canonical path fetches all three
+        # overlays; this call site never had a reason to differ from it.
         from services.agent_pdp_view_assembler import (
-            UPSERT_SQL as AGENT_PDP_VIEW_UPSERT_SQL,
-            assemble_row as assemble_agent_pdp_view_row,
-            fetch_external_seed_for_keys,
-            fetch_offers_for_keys,
-            fetch_products_for_key,
-            fetch_skus_for_keys,
-            row_to_upsert_params as agent_pdp_view_row_to_upsert_params,
+            refresh_agent_pdp_view_for_content_key,
         )
 
-        products = await fetch_products_for_key(content_key, db=database)
-        if not products:
-            logger.info(
-                "agent_pdp_view refresh skipped for content_key=%s: no products",
-                content_key,
-            )
-            return
-        product_keys = [p["product_key"] for p in products if p.get("product_key")]
-        skus = await fetch_skus_for_keys(product_keys, db=database)
-        offers = await fetch_offers_for_keys(product_keys, db=database)
-        # Use the cluster's matched seed (any active one in the group works
-        # for content fallback). Mirror seed_data_writer's pattern.
-        external_seed = await fetch_external_seed_for_keys(product_keys, db=database)
-
-        row = assemble_agent_pdp_view_row(
-            content_key=content_key,
-            products=products,
-            skus=skus,
-            offers=offers,
-            external_seed=external_seed,
+        refreshed = await refresh_agent_pdp_view_for_content_key(
+            content_key,
             refresh_source=_AGENT_PDP_VIEW_REFRESH_SOURCE,
+            db=database,
         )
-        if row is None:
+        if not refreshed:
             logger.info(
-                "agent_pdp_view refresh skipped for content_key=%s: no title",
+                "agent_pdp_view refresh skipped for content_key=%s: no products, "
+                "or too thin a row to serve",
                 content_key,
             )
             return
-        row["refreshed_by_proposal_id"] = None
-        await database.execute(
-            AGENT_PDP_VIEW_UPSERT_SQL,
-            agent_pdp_view_row_to_upsert_params(row),
-        )
         if content_key:
             try:
                 from services.index_pipeline_state_service import recompute_serving_eligibility
