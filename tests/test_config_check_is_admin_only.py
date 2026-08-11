@@ -184,3 +184,148 @@ def test_version_endpoint_does_not_publish_the_deployer_identity(
     assert body["full_sha"] == "0" * 40, "did not exercise the Railway branch"
     assert "author" not in body, "/version published the deployer identity"
     assert "A Real Person" not in res.text
+
+
+# ── /health and /version: verdict public, diagnostics admin-only ─────────────
+# Same defect class as /config-check, found by the same review. These probes
+# published, to any anonymous caller: the exact rate-limit threshold, whether
+# Shopify discount reconciliation is ENFORCING or merely observing, a
+# mounted-route map, and (when degraded) the names of missing schema columns.
+#
+# Build identity (commit SHA, deployment id) is deliberately still public:
+# `add_service_version_headers` stamps X-Service-Commit on EVERY response, so
+# removing it from these bodies would be theatre.
+#
+# THE HARD CONSTRAINT: /health is Railway's healthcheck path and this repo lost
+# 12.5 hours to a health-endpoint failure. Authentication here is ADDITIVE —
+# it selects detail, never gates the response — so an anonymous or
+# bad-token caller must still get the correct 200/503.
+
+_ADMIN = {"Authorization": "Bearer test-token"}
+_DIAGNOSTIC_KEYS = ("settings_contract", "runtime_contracts", "missing_columns")
+
+
+def _probe_body(response) -> dict:
+    """Unwrap the global error envelope.
+
+    ErrorHandlerMiddleware normalizes every JSON response >=400 into
+    {"status": "error", "error": {...}}, so a 503 /health payload arrives nested
+    under error.details. Unwrapping matters for the security claim, not just
+    ergonomics: 503 is the DEGRADED path, the only one where `missing_columns`
+    is non-empty, so the redaction has to be asserted in that shape too.
+    """
+    payload = response.json()
+    if isinstance(payload, dict) and payload.get("status") == "error" and "error" in payload:
+        return payload["error"].get("details", payload)
+    return payload
+
+
+def test_health_answers_anonymously_with_a_verdict_and_no_diagnostics(
+    client: TestClient,
+) -> None:
+    res = client.get("/health")
+
+    # The verdict — all Railway reads — is intact.
+    assert res.status_code in (200, 503), res.text
+    body = _probe_body(res)
+    assert body["status"] in ("ok", "unhealthy")
+    assert "db_ok" in body
+    # The recon payload is gone.
+    for key in _DIAGNOSTIC_KEYS:
+        assert key not in body, f"/health leaked {key} to an anonymous caller"
+    assert "rate_limit_rpm" not in res.text
+    assert "shopify_discount_reconciliation_mode" not in res.text
+
+
+def test_health_still_signals_schema_drift_without_naming_columns(
+    client: TestClient,
+) -> None:
+    """The outage signal must survive the redaction.
+
+    An operator watching the public probe still learns that drift EXISTS; the
+    column names need a token. Redacting the signal along with the detail would
+    have traded a recon leak for a blind spot.
+    """
+    body = _probe_body(client.get("/health"))
+
+    assert "missing_columns_count" in body
+    assert isinstance(body["missing_columns_count"], int)
+
+
+def test_health_gives_an_admin_the_full_drift_contract(client: TestClient) -> None:
+    res = client.get("/health", headers=_ADMIN)
+
+    assert res.status_code in (200, 503), res.text
+    body = _probe_body(res)
+    for key in _DIAGNOSTIC_KEYS:
+        assert key in body, f"admin did not receive {key}"
+    assert body["settings_contract"]["rate_limit_rpm_present"] is True
+
+
+@pytest.mark.parametrize("role", ["merchant", "agent", "employee"])
+def test_health_diagnostics_need_admin_not_merely_a_token(
+    client: TestClient, role: str
+) -> None:
+    """KILLS the mutant that checks authentication but not ROLE."""
+    res = client.get("/health", headers={"Authorization": f"Bearer {_token(role)}"})
+
+    assert res.status_code in (200, 503), res.text
+    for key in _DIAGNOSTIC_KEYS:
+        assert key not in _probe_body(res), f"role={role} received {key}"
+
+
+def test_a_malformed_token_degrades_to_public_and_never_breaks_the_probe(
+    client: TestClient,
+) -> None:
+    """THE OUTAGE GUARD. /health is Railway's healthcheck: a bad Authorization
+    header must yield the public view, never 401/500 — a restart loop is a far
+    worse outcome than a redacted body."""
+    for header in ("Bearer garbage.token.here", "Bearer ", "Basic abc", "nonsense"):
+        res = client.get("/health", headers={"Authorization": header})
+        assert res.status_code in (200, 503), f"{header!r} broke /health: {res.status_code}"
+        assert "settings_contract" not in _probe_body(res)
+
+
+def test_version_hides_the_settings_contract_from_anonymous_callers(
+    client: TestClient,
+) -> None:
+    res = client.get("/version")
+
+    assert res.status_code == 200, res.text
+    assert "settings_contract" not in res.json()
+    assert "rate_limit_rpm" not in res.text
+
+
+def test_version_gives_an_admin_the_settings_contract(client: TestClient) -> None:
+    body = client.get("/version", headers=_ADMIN).json()
+
+    assert "settings_contract" in body
+    assert body["settings_contract"]["rate_limit_rpm_present"] is True
+
+
+def test_version_local_and_unknown_branches_are_gated_too(
+    client: TestClient, monkeypatch
+) -> None:
+    """All THREE return branches (Railway / local-git / unknown) published the
+    contract; gating only the Railway one would relocate the disclosure rather
+    than close it. Force the non-Railway paths and re-assert.
+    """
+    monkeypatch.delenv("RAILWAY_GIT_COMMIT_SHA", raising=False)
+
+    body = client.get("/version").json()
+    assert body["environment"] in ("local", "unknown")
+    assert "settings_contract" not in body
+
+    admin_body = client.get("/version", headers=_ADMIN).json()
+    assert "settings_contract" in admin_body
+
+
+def test_build_identity_stays_public_on_purpose(client: TestClient) -> None:
+    """Not a leak to close: the middleware publishes X-Service-Commit on every
+    response, so redacting the body would be theatre while deploy verification
+    legitimately needs it. Pinned so nobody 'fixes' it asymmetrically.
+    """
+    res = client.get("/health")
+
+    assert _probe_body(res)["build"]["service"] == "pivota-backend"
+    assert res.headers["x-service-build-id"]

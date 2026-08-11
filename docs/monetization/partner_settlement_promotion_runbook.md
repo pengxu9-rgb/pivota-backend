@@ -77,6 +77,10 @@ PARTNER_REV_SHARE_USE_V2=true
 
 This changes nothing until a settlement actually runs (both crons are still
 paused), so it is safe to set now and verify via `/version` / a redeploy.
+  NOTE (2026-08-11): `/version`'s `settings_contract` is now ADMIN-ONLY — it
+  published the rate-limit threshold and whether discount reconciliation is
+  enforcing to anonymous callers. Send an admin bearer token:
+  `curl -H "Authorization: Bearer $ADMIN_JWT" https://api.pivota.cc/version`.
 Rollback: set back to `false`.
 
 ## Step 2 — Resume T7, then T8

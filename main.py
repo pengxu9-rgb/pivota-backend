@@ -1146,7 +1146,7 @@ if OPERATIONS_AVAILABLE:
 _guard_legacy_psp_maintenance_routes()
 
 @app.get("/version")
-async def get_version():
+async def get_version(request: Request):
     """
     返回当前部署的版本信息（Git commit hash）
     优先使用 Railway 环境变量，本地开发时回退到 git 命令
@@ -1155,6 +1155,14 @@ async def get_version():
     # Railway 自动注入的环境变量
     railway_commit = os.getenv("RAILWAY_GIT_COMMIT_SHA")
     railway_branch = os.getenv("RAILWAY_GIT_BRANCH")
+    # Computed once: all three return branches below (Railway, local-git,
+    # unknown) published settings_contract, so gating only the Railway one
+    # would just relocate the disclosure.
+    settings_contract_block = (
+        {"settings_contract": _settings_contract_payload()}
+        if await _probe_caller_is_admin(request)
+        else {}
+    )
     
     if railway_commit:
         # 在 Railway 上运行
@@ -1169,7 +1177,14 @@ async def get_version():
             # deployed is gratuitous.
             "environment": "production",
             "status": "healthy",
-            "settings_contract": _settings_contract_payload(),
+            # settings_contract is ADMIN-ONLY — see the note on /health. It
+            # publishes the exact rate-limit threshold and whether Shopify
+            # discount reconciliation is enforcing, neither of which an
+            # anonymous caller needs. This is a deliberate NARROWING of a
+            # previously public contract: the ops workflow that read it (see
+            # docs/monetization/partner_settlement_promotion_runbook.md) now
+            # needs an admin token.
+            **settings_contract_block,
         }
     
     # 本地开发环境，尝试 git 命令
@@ -1191,7 +1206,7 @@ async def get_version():
             "commit_time": commit_time,
             "environment": "local",
             "status": "healthy",
-            "settings_contract": _settings_contract_payload(),
+            **settings_contract_block,
         }
     except Exception as e:
         return {
@@ -1199,7 +1214,7 @@ async def get_version():
             "error": str(e),
             "environment": "unknown",
             "status": "healthy",
-            "settings_contract": _settings_contract_payload(),
+            **settings_contract_block,
         }
 
 async def startup():
@@ -1921,8 +1936,37 @@ def _health_timeout_seconds(name: str, default: float, *, min_value: float = 0.5
     return max(min_value, min(max_value, value))
 
 
+async def _probe_caller_is_admin(request: Request) -> bool:
+    """Is THIS caller an admin? Never raises, never blocks the request.
+
+    The public probes below (`/health`, `/version`) must keep answering for
+    anonymous callers — Railway's healthcheck reads /health's status code and an
+    unauthenticated internal monitor reads both — so authentication here is
+    strictly ADDITIVE: it decides how much DIAGNOSTIC DETAIL to include, never
+    whether the probe responds. Every failure path returns False, so a malformed
+    token degrades to the public view instead of 500-ing an indicator. That
+    property is the whole point: an endpoint Railway restarts the service over
+    must not gain a new way to fail.
+    """
+    try:
+        header = request.headers.get("authorization") or ""
+        scheme, _, token = header.partition(" ")
+        if scheme.lower() != "bearer" or not token.strip():
+            return False
+        from utils.auth import get_current_user
+
+        from fastapi.security import HTTPAuthorizationCredentials
+
+        user = await get_current_user(
+            HTTPAuthorizationCredentials(scheme="Bearer", credentials=token.strip())
+        )
+        return (user or {}).get("role") in ("admin", "super_admin")
+    except Exception:
+        return False
+
+
 @app.get("/health")
-async def health_check():
+async def health_check(request: Request):
     """
     Health check endpoint. Railway's healthcheck is understood to point here
     (`healthcheckPath=/health`), but that is a SERVICE SETTING held in Railway,
@@ -1968,21 +2012,41 @@ async def health_check():
     healthy = db_ok and not missing
     status_code = 200 if healthy else 503
 
-    return JSONResponse(
-        status_code=status_code,
-        content={
-            "status": "ok" if healthy else "unhealthy",
-            "timestamp": time.time(),
-            "elapsed_ms": int((time.time() - started_at) * 1000),
-            "db_ok": db_ok,
-            "missing_columns": missing,
-            "error": db_error,
-            "build": _runtime_build_payload(),
-            "version": _service_version_payload(),
-            "runtime_contracts": _runtime_contracts_payload(),
-            "settings_contract": _settings_contract_payload(),
-        },
-    )
+    # THE VERDICT IS PUBLIC; THE DIAGNOSTICS ARE NOT.
+    #
+    # Everything a health check owes an anonymous caller is here: the status
+    # code (all Railway's healthcheck reads), whether the DB answered, and the
+    # error TYPE. What used to ride along was a recon payload — the exact
+    # rate-limit threshold, whether Shopify discount reconciliation is
+    # enforcing or merely observing, a mounted-route map, and on a degraded
+    # response the names of missing schema columns. None of that is in the
+    # response headers, so unlike the commit SHA (which
+    # `add_service_version_headers` already publishes on EVERY response) it was
+    # a genuine marginal disclosure.
+    #
+    # Build identity is deliberately still public: removing it from this body
+    # while the middleware stamps X-Service-Commit on every 404 would be
+    # theatre, and deploy verification legitimately needs it.
+    body = {
+        "status": "ok" if healthy else "unhealthy",
+        "timestamp": time.time(),
+        "elapsed_ms": int((time.time() - started_at) * 1000),
+        "db_ok": db_ok,
+        "error": db_error,
+        "build": _runtime_build_payload(),
+        "version": _service_version_payload(),
+    }
+    if await _probe_caller_is_admin(request):
+        body["missing_columns"] = missing
+        body["runtime_contracts"] = _runtime_contracts_payload()
+        body["settings_contract"] = _settings_contract_payload()
+    else:
+        # Presence without content: an operator watching the public probe can
+        # still see that schema drift EXISTS and needs an admin token to read
+        # which columns — the outage signal survives, the schema map does not.
+        body["missing_columns_count"] = sum(len(v) for v in missing.values())
+
+    return JSONResponse(status_code=status_code, content=body)
 
 @app.get("/__build")
 async def build_info():
