@@ -55,9 +55,16 @@ def test_backend_health_timeout_env_is_bounded(monkeypatch: pytest.MonkeyPatch) 
     assert _health_timeout_seconds("DB_HEALTH_CONNECT_TIMEOUT_SECONDS", 5.0) == 5.0
 
 
+ADMIN = {"Authorization": "Bearer test-token"}
+
+
 def test_backend_health_surfaces_runtime_drift_contract() -> None:
+    # The drift contract is ADMIN-scoped now: it publishes the rate-limit
+    # threshold, whether discount reconciliation is enforcing, and a
+    # mounted-route map — recon for an anonymous caller. The contract itself is
+    # unchanged, only who may read it.
     with TestClient(app) as client:
-        resp = client.get("/health")
+        resp = client.get("/health", headers=ADMIN)
 
     assert resp.status_code == 200
     body = resp.json()
@@ -89,7 +96,7 @@ def test_backend_health_surfaces_runtime_drift_contract() -> None:
 def test_backend_health_surfaces_discount_reconciliation_mode(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setenv("SHOPIFY_DISCOUNT_RECONCILIATION_MODE", "fail_closed")
     with TestClient(app) as client:
-        resp = client.get("/health")
+        resp = client.get("/health", headers=ADMIN)
 
     assert resp.status_code == 200
     settings_contract = resp.json()["settings_contract"]
@@ -97,10 +104,18 @@ def test_backend_health_surfaces_discount_reconciliation_mode(monkeypatch: pytes
     assert settings_contract["shopify_discount_reconciliation_mode_source"] == "env"
 
 
-def test_public_version_surfaces_discount_reconciliation_mode(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_admin_version_surfaces_discount_reconciliation_mode(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Renamed from test_PUBLIC_version_... deliberately.
+
+    Publishing whether a financial control is enforcing (observe vs
+    fail_closed), plus the exact rate-limit threshold, to any anonymous caller
+    was the leak. The ops workflow that reads this — see
+    docs/monetization/partner_settlement_promotion_runbook.md — now sends an
+    admin token. The VALUES and their meaning are unchanged.
+    """
     monkeypatch.setenv("SHOPIFY_DISCOUNT_RECONCILIATION_MODE", "observe")
     with TestClient(app) as client:
-        resp = client.get("/version")
+        resp = client.get("/version", headers=ADMIN)
 
     assert resp.status_code == 200
     settings_contract = resp.json()["settings_contract"]
