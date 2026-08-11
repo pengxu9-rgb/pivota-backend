@@ -416,6 +416,13 @@ class Settings(BaseSettings):
         os.getenv("AGENT_ACP_ALLOW_LIVE_CAPTURE", "false").strip().lower()
         in {"true", "1", "on", "yes"}
     )
+    # ADR-021 follow-up note (2026-08-11): the LIVE-CAPTURE ALLOWLIST MECHANISM
+    # is deliberately KEPT — empty allowlist = no merchant can take live money,
+    # so removing it would WIDEN access, not clean it. What ADR-021's "clean the
+    # stale flag" means operationally: scrub retired test-rig merchant ids from
+    # the deployed env VALUE before ever flipping AGENT_ACP_ALLOW_LIVE_CAPTURE
+    # on (as of 2026-08-11 prod holds one stale entry with the master switch
+    # off, i.e. inert).
     # #1308: stored as a raw string + parsed in a property (mirrors
     # phase_c_enabled_markets) so pydantic-settings never tries to JSON-decode a
     # frozenset from the env — a bare comma value (`merch_a,merch_b`) used to crash

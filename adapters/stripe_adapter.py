@@ -1,65 +1,24 @@
 """
-Stripe Adapter for Payment Processing
+Stripe webhook-signature verification.
+
+This module used to be a platform-key payment adapter: it set
+`stripe.api_key = settings.stripe_secret_key` at import time (a process-global
+PLATFORM key) and exposed module-level `create_payment_intent` /
+`get_payment_intent` / `confirm_payment_intent` that charged under it — a
+Pivota-as-merchant-of-record path. Deleted 2026-08-11 (Tier-2 cleanup): every
+buyer charge must resolve the MERCHANT's runtime PSP key via
+`adapters.psp_adapter.get_psp_adapter` / `merchant_psp_config_service`, and its
+only callers were the 410-gated deprecated `/agent/pay` routes and the orphaned
+`orchestrator/payment_executor.py` prototype. The one legitimate export —
+webhook signature verification, which needs the webhook endpoint secret and no
+API key — is all that remains.
 """
-import stripe
 import logging
-from typing import Dict, Any, Optional
-from config.settings import settings
+
+import stripe
 
 logger = logging.getLogger("stripe_adapter")
 
-# Initialize Stripe
-stripe.api_key = settings.stripe_secret_key
-
-def create_payment_intent(
-    amount: int,
-    currency: str = "usd",
-    payment_method_types: list = None,
-    metadata: Dict[str, str] = None
-) -> Dict[str, Any]:
-    """
-    Create a Stripe payment intent
-    
-    Args:
-        amount: Amount in cents
-        currency: Currency code (default: usd)
-        payment_method_types: List of payment method types
-        metadata: Additional metadata
-        
-    Returns:
-        Payment intent object or error dict
-    """
-    try:
-        if payment_method_types is None:
-            payment_method_types = ["card"]
-            
-        if metadata is None:
-            metadata = {}
-            
-        intent = stripe.PaymentIntent.create(
-            amount=amount,
-            currency=currency,
-            payment_method_types=payment_method_types,
-            metadata=metadata,
-            automatic_payment_methods={
-                "enabled": True,
-            },
-        )
-        
-        logger.info(f"Created Stripe payment intent: {intent.id}")
-        return {
-            "success": True,
-            "payment_intent": intent,
-            "client_secret": intent.client_secret
-        }
-        
-    except Exception as e:
-        logger.error(f"Error creating payment intent: {e}")
-        return {
-            "success": False,
-            "error": str(e),
-            "error_type": "error"
-        }
 
 def verify_webhook_signature(
     payload: str,
@@ -68,12 +27,12 @@ def verify_webhook_signature(
 ) -> bool:
     """
     Verify Stripe webhook signature
-    
+
     Args:
         payload: Raw request body
         signature: Stripe signature header
         endpoint_secret: Webhook endpoint secret
-        
+
     Returns:
         True if signature is valid, False otherwise
     """
@@ -88,55 +47,3 @@ def verify_webhook_signature(
     except Exception as e:
         logger.error(f"Error in webhook verification: {e}")
         return False
-
-def get_payment_intent(payment_intent_id: str) -> Optional[Dict[str, Any]]:
-    """
-    Retrieve a payment intent by ID
-    
-    Args:
-        payment_intent_id: Stripe payment intent ID
-        
-    Returns:
-        Payment intent object or None if not found
-    """
-    try:
-        intent = stripe.PaymentIntent.retrieve(payment_intent_id)
-        return intent
-    except Exception as e:
-        logger.error(f"Error retrieving payment intent: {e}")
-        return None
-
-def confirm_payment_intent(
-    payment_intent_id: str,
-    payment_method: str = None
-) -> Dict[str, Any]:
-    """
-    Confirm a payment intent
-    
-    Args:
-        payment_intent_id: Stripe payment intent ID
-        payment_method: Payment method ID (optional)
-        
-    Returns:
-        Confirmation result dict
-    """
-    try:
-        intent = stripe.PaymentIntent.confirm(
-            payment_intent_id,
-            payment_method=payment_method
-        )
-        
-        logger.info(f"Confirmed Stripe payment intent: {payment_intent_id}")
-        return {
-            "success": True,
-            "payment_intent": intent,
-            "status": intent.status
-        }
-        
-    except Exception as e:
-        logger.error(f"Error confirming payment intent: {e}")
-        return {
-            "success": False,
-            "error": str(e),
-            "error_type": "error"
-        }
