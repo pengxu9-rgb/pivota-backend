@@ -85,8 +85,13 @@ zero-citation result the stronger claim. Do not read cross-provider deltas
 as behavioural differences.
 
 Providers: gemini (Vertex) + chatgpt are configured on prod PIVOTA-Agent.
-There is no ANTHROPIC_API_KEY on the service, so the `claude` lane cannot
-run; it is reported as unmeasured rather than silently scored 0.
+The `claude` lane runs on Vertex AI under the same ADC credential as gemini
+(PIVOTA-Agent#1945) — no ANTHROPIC_API_KEY exists or is needed. It stays out
+of the DEFAULT provider set until one real probe call has proven the Vertex
+org policy admits the web_search tool
+(constraints/vertexai.allowedPartnerModelFeatures is default-deny); until
+then, or on any lane error, it is reported as unmeasured rather than
+silently scored 0.
 
 Cost: 1 real grounded LLM call per (prompt x provider). The default
 portfolio is 25 prompts x 2 providers = 50 calls of production COGS.
@@ -899,8 +904,11 @@ def parse_args(argv: List[str]) -> argparse.Namespace:
     ap.add_argument("--agent-url", default=os.environ.get(
         "PIVOTA_AGENT_INTERNAL_URL", DEFAULT_AGENT_URL))
     ap.add_argument("--providers", default="gemini,chatgpt",
-                    help="comma-separated: gemini,chatgpt (claude needs an "
-                         "ANTHROPIC_API_KEY on the agent service)")
+                    help="comma-separated: gemini,chatgpt,claude. claude runs "
+                         "on Vertex under the service ADC credential "
+                         "(PIVOTA-Agent#1945); include it once the Vertex "
+                         "web_search org policy has been validated with one "
+                         "real probe call")
     ap.add_argument("--prompts-file", default="",
                     help="JSON file with an ALTERNATE prompt set: {\"prompts\":[{tier,anchor,query}]}. "
                          "Omitted = the built-in PORTFOLIO, so the spine metric is unchanged by default. "
@@ -959,8 +967,9 @@ def main(argv: List[str]) -> int:
              if not any(r["provider"] == p and not r.get("run_error")
                         for r in payload["rows"])}
         ) + ([] if "claude" in args.providers
-             else ["claude (not requested; needs ANTHROPIC_API_KEY on prod "
-                   "PIVOTA-Agent, which is absent)"]),
+             else ["claude (not requested; runs on Vertex under the service "
+                   "ADC credential — pass --providers gemini,chatgpt,claude "
+                   "after validating the Vertex web_search org policy)"]),
         "surface_note": args.surface_note,
     }
 
