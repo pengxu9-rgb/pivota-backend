@@ -12,7 +12,7 @@ from datetime import datetime, timezone
 from functools import lru_cache
 import uvicorn
 from services.merchant_store_service import get_merchant_active_stores, get_primary_store
-from typing import Any, Dict, Optional
+from typing import Any, Dict
 
 from fastapi import FastAPI, BackgroundTasks, Depends, WebSocket, WebSocketDisconnect, Request, Response
 from fastapi.middleware.cors import CORSMiddleware
@@ -382,6 +382,7 @@ except ImportError:
     OPERATIONS_AVAILABLE = False
 
 # Utils
+from utils.auth import require_admin
 from utils.logger import logger
 from config.settings import settings
 from services.agent_governance import agent_governance, governance_runtime_contract
@@ -1154,7 +1155,6 @@ async def get_version():
     # Railway 自动注入的环境变量
     railway_commit = os.getenv("RAILWAY_GIT_COMMIT_SHA")
     railway_branch = os.getenv("RAILWAY_GIT_BRANCH")
-    railway_author = os.getenv("RAILWAY_GIT_AUTHOR")
     
     if railway_commit:
         # 在 Railway 上运行
@@ -1162,7 +1162,11 @@ async def get_version():
             "version": railway_commit[:8],  # 短 hash
             "full_sha": railway_commit,
             "branch": railway_branch,
-            "author": railway_author,
+            # RAILWAY_GIT_AUTHOR deliberately NOT returned: it is a named
+            # individual's identity, this endpoint is public and
+            # unauthenticated, and nothing consumes it (the two in-repo readers
+            # take `settings_contract` and the SHA). Publishing who last
+            # deployed is gratuitous.
             "environment": "production",
             "status": "healthy",
             "settings_contract": _settings_contract_payload(),
@@ -2018,25 +2022,6 @@ async def operations_dashboard():
     except FileNotFoundError:
         return HTMLResponse(content="<h1>Operations Dashboard</h1><p>Dashboard template not found</p>", status_code=404)
 
-async def _require_admin_dep(
-    request: Request,
-) -> Dict[str, Any]:
-    """Admin gate for the ops probes below.
-
-    utils.auth is imported lazily: main.py's module-level import order is
-    load-bearing during startup (see the table-registration imports at the top),
-    and this route is the only consumer here.
-    """
-    from utils.auth import get_current_user, require_admin
-    from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
-
-    creds: Optional[HTTPAuthorizationCredentials] = await HTTPBearer(
-        auto_error=True
-    )(request)
-    user = await get_current_user(creds)
-    return await require_admin(user)
-
-
 # Deploy-time configuration probe. ADMIN-ONLY, and presence-only.
 #
 # It shipped public and unauthenticated ("no auth required" was the docstring),
@@ -2053,6 +2038,12 @@ async def _require_admin_dep(
 # i.e. PRESENCE is the entire contract. So values are gone rather than masked:
 # nothing here has to decide how many characters of a merchant account are safe
 # to publish, and a future reader cannot "helpfully" unmask them.
+# NOTE on adyen_merchant_account: config/settings.py hardcodes a non-empty
+# default for it, so this field can never report "NOT SET" however the
+# environment is configured — the endpoint's own instruction is structurally
+# unreachable for that one setting. Pre-existing; left alone here because
+# changing a settings default is a different blast radius from closing a
+# public endpoint.
 _CONFIG_CHECK_SETTINGS = (
     "stripe_secret_key",
     "adyen_api_key",
@@ -2068,7 +2059,7 @@ _CONFIG_CHECK_SETTINGS = (
 
 
 @app.get("/config-check", include_in_schema=False)
-async def config_check(_admin: Dict[str, Any] = Depends(_require_admin_dep)):
+async def config_check(_admin: Dict[str, Any] = Depends(require_admin)):
     """Admin-only: is each integration env var SET? Never returns its value."""
     from config.settings import settings
 

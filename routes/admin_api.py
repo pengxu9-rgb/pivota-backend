@@ -904,19 +904,31 @@ async def get_analytics(days: int = 30, current_user: dict = Depends(require_adm
         }
     }
 
+# PRESENCE-ONLY, same contract as main.py's /config-check. This twin used to
+# echo adyen_merchant_account, shopify_store_url and wix_store_url as literals.
+# It is admin-gated, so it was never a public exposure — but it sat one
+# directory from the endpoint that WAS, and it is the obvious template anyone
+# adding the next config probe would copy. A masked-or-literal pattern living
+# next door is how the public leak gets recreated.
+_ADMIN_CONFIG_CHECK_SETTINGS = (
+    "stripe_secret_key",
+    "adyen_api_key",
+    "adyen_merchant_account",
+    "shopify_access_token",
+    "shopify_store_url",
+    "wix_api_key",
+    "wix_store_url",
+)
+
+
 @router.get("/config/check")
 async def check_config(current_user: dict = Depends(require_admin)):
-    """Check which environment variables are configured (for debugging)"""
+    """Admin-only: is each integration env var SET? Never returns its value."""
     return {
         "status": "success",
         "config": {
-            "stripe_secret_key": "✅ SET" if settings.stripe_secret_key else "❌ NOT SET",
-            "adyen_api_key": "✅ SET" if settings.adyen_api_key else "❌ NOT SET",
-            "adyen_merchant_account": settings.adyen_merchant_account or "❌ NOT SET",
-            "shopify_access_token": "✅ SET" if settings.shopify_access_token else "❌ NOT SET",
-            "shopify_store_url": settings.shopify_store_url or "❌ NOT SET",
-            "wix_api_key": "✅ SET" if settings.wix_api_key else "❌ NOT SET",
-            "wix_store_url": settings.wix_store_url or "❌ NOT SET",
+            name: ("✅ SET" if getattr(settings, name, None) else "❌ NOT SET")
+            for name in _ADMIN_CONFIG_CHECK_SETTINGS
         },
-        "message": "If any values show '❌ NOT SET', add them in Render Environment Variables"
+        "message": "If any values show '❌ NOT SET', add them in Railway Environment Variables"
     }
