@@ -12,7 +12,9 @@ from datetime import datetime, timezone
 from functools import lru_cache
 import uvicorn
 from services.merchant_store_service import get_merchant_active_stores, get_primary_store
-from fastapi import FastAPI, BackgroundTasks, WebSocket, WebSocketDisconnect, Request, Response
+from typing import Any, Dict
+
+from fastapi import FastAPI, BackgroundTasks, Depends, WebSocket, WebSocketDisconnect, Request, Response
 from fastapi.middleware.cors import CORSMiddleware
 from middleware.rate_limiter import RateLimitMiddleware
 from middleware.usage_logger import UsageLoggerMiddleware
@@ -40,6 +42,7 @@ except ModuleNotFoundError:
     )
 import subprocess
 import os
+import secrets
 from pathlib import Path
 from utils.database_readiness import (
     DatabaseUnavailableError,
@@ -380,6 +383,7 @@ except ImportError:
     OPERATIONS_AVAILABLE = False
 
 # Utils
+from utils.auth import require_admin
 from utils.logger import logger
 from config.settings import settings
 from services.agent_governance import agent_governance, governance_runtime_contract
@@ -1143,7 +1147,7 @@ if OPERATIONS_AVAILABLE:
 _guard_legacy_psp_maintenance_routes()
 
 @app.get("/version")
-async def get_version():
+async def get_version(request: Request):
     """
     返回当前部署的版本信息（Git commit hash）
     优先使用 Railway 环境变量，本地开发时回退到 git 命令
@@ -1152,7 +1156,14 @@ async def get_version():
     # Railway 自动注入的环境变量
     railway_commit = os.getenv("RAILWAY_GIT_COMMIT_SHA")
     railway_branch = os.getenv("RAILWAY_GIT_BRANCH")
-    railway_author = os.getenv("RAILWAY_GIT_AUTHOR")
+    # Computed once: all three return branches below (Railway, local-git,
+    # unknown) published settings_contract, so gating only the Railway one
+    # would just relocate the disclosure.
+    settings_contract_block = (
+        {"settings_contract": _settings_contract_payload()}
+        if await _probe_caller_is_admin(request)
+        else {}
+    )
     
     if railway_commit:
         # 在 Railway 上运行
@@ -1160,10 +1171,21 @@ async def get_version():
             "version": railway_commit[:8],  # 短 hash
             "full_sha": railway_commit,
             "branch": railway_branch,
-            "author": railway_author,
+            # RAILWAY_GIT_AUTHOR deliberately NOT returned: it is a named
+            # individual's identity, this endpoint is public and
+            # unauthenticated, and nothing consumes it (the two in-repo readers
+            # take `settings_contract` and the SHA). Publishing who last
+            # deployed is gratuitous.
             "environment": "production",
             "status": "healthy",
-            "settings_contract": _settings_contract_payload(),
+            # settings_contract is ADMIN-ONLY — see the note on /health. It
+            # publishes the exact rate-limit threshold and whether Shopify
+            # discount reconciliation is enforcing, neither of which an
+            # anonymous caller needs. This is a deliberate NARROWING of a
+            # previously public contract: the ops workflow that read it (see
+            # docs/monetization/partner_settlement_promotion_runbook.md) now
+            # needs an admin token.
+            **settings_contract_block,
         }
     
     # 本地开发环境，尝试 git 命令
@@ -1185,7 +1207,7 @@ async def get_version():
             "commit_time": commit_time,
             "environment": "local",
             "status": "healthy",
-            "settings_contract": _settings_contract_payload(),
+            **settings_contract_block,
         }
     except Exception as e:
         return {
@@ -1193,7 +1215,7 @@ async def get_version():
             "error": str(e),
             "environment": "unknown",
             "status": "healthy",
-            "settings_contract": _settings_contract_payload(),
+            **settings_contract_block,
         }
 
 async def startup():
@@ -1915,8 +1937,55 @@ def _health_timeout_seconds(name: str, default: float, *, min_value: float = 0.5
     return max(min_value, min(max_value, value))
 
 
+async def _probe_caller_is_admin(request: Request) -> bool:
+    """Is THIS caller an admin? Never raises `Exception`, never blocks the request.
+
+    The public probes below (`/health`, `/version`) must keep answering for
+    anonymous callers — Railway's healthcheck reads /health's status code and an
+    unauthenticated internal monitor reads both — so authentication here is
+    strictly ADDITIVE: it decides how much DIAGNOSTIC DETAIL to include, never
+    whether the probe responds. Every failure path returns False, so a malformed
+    token degrades to the public view instead of 500-ing an indicator. That
+    property is the whole point: an endpoint Railway restarts the service over
+    must not gain a new way to fail.
+    """
+    try:
+        # BOTH admin credentials this repo recognises, matching
+        # utils.auth.require_admin_or_key: an operator who authenticates with
+        # X-ADMIN-KEY would otherwise get the redacted view with no explanation.
+        admin_key = (request.headers.get("x-admin-key") or "").strip()
+        if admin_key:
+            expected = [
+                (os.getenv("ADMIN_API_KEY") or "").strip(),
+                (os.getenv("PROMOTIONS_ADMIN_KEY") or "").strip(),
+            ]
+            if any(
+                candidate and secrets.compare_digest(admin_key, candidate)
+                for candidate in expected
+            ):
+                return True
+
+        header = request.headers.get("authorization") or ""
+        scheme, _, token = header.partition(" ")
+        if scheme.lower() != "bearer" or not token.strip():
+            return False
+        from utils.auth import get_current_user
+
+        from fastapi.security import HTTPAuthorizationCredentials
+
+        user = await get_current_user(
+            HTTPAuthorizationCredentials(scheme="Bearer", credentials=token.strip())
+        )
+        return (user or {}).get("role") in ("admin", "super_admin")
+    except Exception:
+        # Deliberately Exception, not BaseException: CancelledError must still
+        # propagate. get_current_user has no await points, so none is
+        # deliverable inside this block anyway.
+        return False
+
+
 @app.get("/health")
-async def health_check():
+async def health_check(request: Request):
     """
     Health check endpoint. Railway's healthcheck is understood to point here
     (`healthcheckPath=/health`), but that is a SERVICE SETTING held in Railway,
@@ -1962,21 +2031,53 @@ async def health_check():
     healthy = db_ok and not missing
     status_code = 200 if healthy else 503
 
-    return JSONResponse(
-        status_code=status_code,
-        content={
-            "status": "ok" if healthy else "unhealthy",
-            "timestamp": time.time(),
-            "elapsed_ms": int((time.time() - started_at) * 1000),
-            "db_ok": db_ok,
-            "missing_columns": missing,
-            "error": db_error,
-            "build": _runtime_build_payload(),
-            "version": _service_version_payload(),
-            "runtime_contracts": _runtime_contracts_payload(),
-            "settings_contract": _settings_contract_payload(),
-        },
-    )
+    # THE VERDICT IS PUBLIC; THE DIAGNOSTICS ARE NOT.
+    #
+    # Everything a health check owes an anonymous caller is here: the status
+    # code (all Railway's healthcheck reads), whether the DB answered, and the
+    # error TYPE. What used to ride along was a recon payload: the exact
+    # rate-limit threshold, whether Shopify discount reconciliation is
+    # enforcing or merely observing, a mounted-route map, and on a degraded
+    # response the names of missing schema columns.
+    #
+    # HOW MUCH EACH ONE ACTUALLY BUYS, stated honestly rather than uniformly:
+    #   * shopify_discount_reconciliation_mode, runtime_contracts and the
+    #     missing-column NAMES are genuinely new closures — they appear nowhere
+    #     else on an anonymous response.
+    #   * rate_limit_rpm WAS not, and now is. When this comment was written,
+    #     `middleware/rate_limiter.py` stamped `X-RateLimit-Limit:
+    #     <rate_limit_rpm>` on every `/agent/*` response whenever any x-api-key
+    #     header was present — including 401s and 404s — so removing it from
+    #     this body was tidiness rather than containment. That header leak has
+    #     since been closed: the middleware now publishes only the limit
+    #     ENFORCED on a caller who authenticated, and nothing to anyone else.
+    #     Both halves are needed for the closure to hold, so if you are
+    #     reinstating either, reinstate this note too.
+    #
+    # Build identity is deliberately still public: removing it from this body
+    # while the middleware stamps X-Service-Commit on every 404 would be
+    # theatre, and deploy verification legitimately needs it.
+    body = {
+        "status": "ok" if healthy else "unhealthy",
+        "timestamp": time.time(),
+        "elapsed_ms": int((time.time() - started_at) * 1000),
+        "db_ok": db_ok,
+        "error": db_error,
+        "build": _runtime_build_payload(),
+        "version": _service_version_payload(),
+    }
+    # UNCONDITIONAL: presence without content. An operator watching the public
+    # probe still learns that schema drift EXISTS and needs a credential only to
+    # read which columns — the outage signal survives, the schema map does not.
+    # Emitted for admins too, so authenticating never REMOVES a field (a
+    # dashboard trending this count must not break the day it gets a token).
+    body["missing_columns_count"] = sum(len(v) for v in missing.values())
+    if await _probe_caller_is_admin(request):
+        body["missing_columns"] = missing
+        body["runtime_contracts"] = _runtime_contracts_payload()
+        body["settings_contract"] = _settings_contract_payload()
+
+    return JSONResponse(status_code=status_code, content=body)
 
 @app.get("/__build")
 async def build_info():
@@ -2016,29 +2117,62 @@ async def operations_dashboard():
     except FileNotFoundError:
         return HTMLResponse(content="<h1>Operations Dashboard</h1><p>Dashboard template not found</p>", status_code=404)
 
-@app.get("/config-check")
-async def config_check():
-    """Public endpoint to check environment variable configuration (no auth required)"""
+# Deploy-time configuration probe. ADMIN-ONLY, and presence-only.
+#
+# It shipped public and unauthenticated ("no auth required" was the docstring),
+# which made it a free recon endpoint: it told any caller which PSP/platform
+# integrations are live, whether the nightly PSP backfill runs — and it echoed
+# four LITERAL values, measured on prod 2026-08-11 as
+# `adyen_merchant_account: "WoopayECOM"` plus the Shopify/Wix store URLs and the
+# OAuth redirect URI. Naming a real payment-processor merchant account to the
+# internet is the leak; the rest is the map an attacker would otherwise have to
+# guess at.
+#
+# The literals were never needed for the endpoint's own stated purpose — its
+# `instructions` field says "if any values show NOT SET, add them in Railway",
+# i.e. PRESENCE is the entire contract. So values are gone rather than masked:
+# nothing here has to decide how many characters of a merchant account are safe
+# to publish, and a future reader cannot "helpfully" unmask them.
+# NOTE on adyen_merchant_account: config/settings.py hardcodes a non-empty
+# default for it, so this field can never report "NOT SET" however the
+# environment is configured — the endpoint's own instruction is structurally
+# unreachable for that one setting. Pre-existing; left alone here because
+# changing a settings default is a different blast radius from closing a
+# public endpoint.
+_CONFIG_CHECK_SETTINGS = (
+    "stripe_secret_key",
+    "adyen_api_key",
+    "adyen_merchant_account",
+    "shopify_access_token",
+    "shopify_store_url",
+    "shopify_client_id",
+    "shopify_client_secret",
+    "shopify_redirect_uri",
+    "wix_api_key",
+    "wix_store_url",
+)
+
+
+@app.get("/config-check", include_in_schema=False)
+async def config_check(_admin: Dict[str, Any] = Depends(require_admin)):
+    """Admin-only: is each integration env var SET? Never returns its value."""
     from config.settings import settings
-    
+
+    config = {
+        name: ("✅ SET" if getattr(settings, name, None) else "❌ NOT SET")
+        for name in _CONFIG_CHECK_SETTINGS
+    }
+    # Not a credential, and the version is load-bearing when diagnosing a
+    # metrics discrepancy — but still admin-gated along with everything else.
+    config["metrics_query_version"] = settings.metrics_query_version
+    config["enable_nightly_psp_id_backfill"] = (
+        "✅ ENABLED" if settings.enable_nightly_psp_id_backfill else "❌ DISABLED"
+    )
     return {
         "status": "success",
         "message": "Environment variable configuration check",
-        "config": {
-            "stripe_secret_key": "✅ SET" if settings.stripe_secret_key else "❌ NOT SET",
-            "adyen_api_key": "✅ SET" if settings.adyen_api_key else "❌ NOT SET",
-            "adyen_merchant_account": settings.adyen_merchant_account if settings.adyen_merchant_account else "❌ NOT SET",
-            "shopify_access_token": "✅ SET" if settings.shopify_access_token else "❌ NOT SET",
-            "shopify_store_url": settings.shopify_store_url if settings.shopify_store_url else "❌ NOT SET",
-            "shopify_client_id": "✅ SET" if settings.shopify_client_id else "❌ NOT SET",
-            "shopify_client_secret": "✅ SET" if settings.shopify_client_secret else "❌ NOT SET",
-            "shopify_redirect_uri": settings.shopify_redirect_uri if settings.shopify_redirect_uri else "❌ NOT SET",
-            "wix_api_key": "✅ SET" if settings.wix_api_key else "❌ NOT SET",
-            "wix_store_url": settings.wix_store_url if settings.wix_store_url else "❌ NOT SET",
-            "metrics_query_version": settings.metrics_query_version,
-            "enable_nightly_psp_id_backfill": "✅ ENABLED" if settings.enable_nightly_psp_id_backfill else "❌ DISABLED"
-        },
-        "instructions": "If any values show '❌ NOT SET', add them in Railway Environment Variables and redeploy"
+        "config": config,
+        "instructions": "If any values show '❌ NOT SET', add them in Railway Environment Variables and redeploy",
     }
 
 if __name__ == "__main__":

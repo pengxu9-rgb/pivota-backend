@@ -199,6 +199,13 @@ async def get_agent_context(
             pass
         try:
             request.state.agent_id = context.agent_id
+            # The ENFORCED limit for this agent, for RateLimitMiddleware to
+            # publish as X-RateLimit-*. Recorded only on the authenticated path:
+            # the middleware runs before auth and must not invent a number for
+            # callers who never got here. See middleware/rate_limiter.py.
+            request.state.agent_authenticated = True
+            request.state.agent_rate_limit_limit = limit
+            request.state.agent_rate_limit_used = current
             request.state.agent_dependency_total_ms = max(0, int((time.perf_counter() - dep_started) * 1000))
         except Exception:
             pass
@@ -227,6 +234,7 @@ async def get_agent_context(
         context = AgentContext(agent, request)
         try:
             request.state.agent_id = context.agent_id
+            request.state.agent_authenticated = True
             request.state.agent_dependency_total_ms = max(0, int((time.perf_counter() - dep_started) * 1000))
         except Exception:
             pass
@@ -240,6 +248,7 @@ async def get_agent_context(
             request.state.agent_id = context.agent_id
             request.state.agent_auth_lookup_ms = 0
             request.state.agent_auth_cache_hit = False
+            request.state.agent_authenticated = True
             request.state.agent_auth_source = "internal_trusted_key"
             request.state.agent_auth_total_ms = 0
             request.state.agent_rate_limit_check_ms = 0
@@ -355,6 +364,12 @@ async def get_agent_context(
     context = AgentContext(agent, request)
     try:
         request.state.agent_id = context.agent_id
+        # See the note on the checkout-token path above: this is the per-agent
+        # limit actually enforced, which the middleware publishes in place of the
+        # global RATE_LIMIT_RPM it used to leak to unauthenticated callers.
+        request.state.agent_authenticated = True
+        request.state.agent_rate_limit_limit = limit
+        request.state.agent_rate_limit_used = current
         request.state.agent_dependency_total_ms = max(0, int((time.perf_counter() - dep_started) * 1000))
     except Exception:
         pass

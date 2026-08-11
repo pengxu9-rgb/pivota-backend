@@ -911,15 +911,16 @@ class SellerBackfill:
             # The NEW writes are rehearsed read-only so the founder-reviewed
             # report shows what the flip will actually touch (review finding 13).
             spids_all = [pid for b in batch for pid in (b.get("listing_product_ids") or [])]
-            pgm_spids = [str(b.get("source_product_id") or "") for b in batch if b.get("source_product_id")]
-            platforms = sorted({str(b.get("platform") or "") for b in batch if b.get("platform")})
             pgm_moves = listing_moves = listing_conflicts = 0
-            if pgm_spids and platforms:
+            # Same union / no platform filter as the execute hunt, the residue
+            # audit and the verifier — a predictor with a narrower join shows
+            # the founder a report that omits rows the execute will then touch
+            # (this exact shape hid the 77 seed-keyed rows; review of #1725).
+            if spids_all:
                 row = await self.db.fetch_one(
                     "SELECT count(*) AS c FROM product_group_members "
-                    "WHERE merchant_id = :banned AND platform = ANY(:platforms) "
-                    "AND platform_product_id = ANY(:spids)",
-                    {"banned": BANNED_BUCKET_MERCHANT_ID, "platforms": platforms, "spids": pgm_spids})
+                    "WHERE merchant_id = :banned AND platform_product_id = ANY(:spids)",
+                    {"banned": BANNED_BUCKET_MERCHANT_ID, "spids": spids_all})
                 pgm_moves = int(dict(row)["c"]) if row else 0
             if spids_all:
                 row = await self.db.fetch_one(
@@ -939,6 +940,7 @@ class SellerBackfill:
                 "listing_new_ref_conflicts": listing_conflicts,
             }
         skipped_in_batch: List[Dict[str, Any]] = []
+        pgm_totals = {"moved": 0, "retired": 0}
         async with self.db.transaction():
             for b in batch:
                 pk = str(b["product_key"])
@@ -990,7 +992,9 @@ class SellerBackfill:
                 # 3) the two tables reflection CANNOT see (R0 finding): group
                 #    membership keys on (merchant, platform, platform_product_id)
                 #    and the identity listing embeds the merchant in its PK.
-                await self._resubject_group_membership(b, obs)
+                pgm_stats = await self._resubject_group_membership(b, obs)
+                pgm_totals["moved"] += pgm_stats["moved"]
+                pgm_totals["retired"] += pgm_stats["retired"]
                 await self._migrate_listing_refs(b, obs)
             # Residue audit INSIDE the txn: any enumerated table still holding a
             # banned seller for this batch's products = un-migrated cascade.
@@ -999,14 +1003,16 @@ class SellerBackfill:
             done_pks = [str(b["product_key"]) for b in done]
             residue = await self._residue_audit(done_pks, cascade)
             spids = [pid for b in done for pid in (b.get("listing_product_ids") or [])]
-            pgm_spids = [str(b.get("source_product_id") or "") for b in done if b.get("source_product_id")]
-            platforms = sorted({str(b.get("platform") or "") for b in done if b.get("platform")})
-            if pgm_spids and platforms:
+            # ALL candidate ids, NO platform filter — the audit must count
+            # exactly what the independent verifier counts. The old shape
+            # (source ids only, platform-scoped) shared the resubjection's
+            # blind spot, which is how 77 seed-keyed pgm rows sailed through
+            # five green parity checks (verifier catch, 2026-08-11).
+            if spids:
                 row = await self.db.fetch_one(
                     "SELECT count(*) AS c FROM product_group_members "
-                    "WHERE merchant_id = :banned AND platform = ANY(:platforms) "
-                    "AND platform_product_id = ANY(:spids)",
-                    {"banned": BANNED_BUCKET_MERCHANT_ID, "platforms": platforms, "spids": pgm_spids})
+                    "WHERE merchant_id = :banned AND platform_product_id = ANY(:spids)",
+                    {"banned": BANNED_BUCKET_MERCHANT_ID, "spids": spids})
                 c = int(dict(row)["c"]) if row else 0
                 if c:
                     residue["product_group_members"] = residue.get("product_group_members", 0) + c
@@ -1027,6 +1033,13 @@ class SellerBackfill:
             before_done["sig_count"] = len(before_done["sigs"])
             before_done["servable_count"] = len(before_done["servable"])
             parity = self._diff_parity(before_done, after, residue)
+            # The execute-side counterpart of dry-run's pgm_rows_to_move, so
+            # the founder-reviewed rehearsal and the execute report reconcile.
+            # Row-effect counts, not rowcounts — a row vanishing between
+            # enumeration and UPDATE overcounts by one; report-only, and the
+            # independent verifier is the grader.
+            parity["pgm_moved"] = pgm_totals["moved"]
+            parity["pgm_retired"] = pgm_totals["retired"]
             if skipped_in_batch:
                 # Report mutation happens in the CALLER off the returned
                 # parity — this method must stay retry-safe (a retried batch
@@ -1052,7 +1065,10 @@ class SellerBackfill:
         catalog phase already checkpointed done. Exists because a re-run cannot
         reach them (moved rows no longer match the sentinel-scoped scan): the
         canary's 4-seed product migrated only the picked seed's listing,
-        stranding 3 (verifier catch, 2026-08-08)."""
+        stranding 3 (verifier catch, 2026-08-08). Also repairs
+        product_group_members stragglers for the same products — the pgm
+        resubjection had the mirror-image blind spot (source_product_id only)
+        and stranded 77 seed-keyed rows (verifier catch, 2026-08-11)."""
         rows = await self.db.fetch_all(
             "SELECT ck.ref_id AS product_key, ck.observed_id, cp.source_product_id, "
             "(SELECT array_agg(e2.external_product_id) FROM external_product_seeds e2 "
@@ -1061,7 +1077,8 @@ class SellerBackfill:
             "JOIN catalog_products cp ON cp.product_key = ck.ref_id "
             "WHERE ck.phase = 'catalog' AND ck.status = 'done'"
         )
-        stats = {"scanned": len(rows or []), "stale_found": 0, "migrated": 0, "conflicts": 0}
+        stats = {"scanned": len(rows or []), "stale_found": 0, "migrated": 0, "conflicts": 0,
+                 "pgm_stale_found": 0, "pgm_moved": 0, "pgm_retired": 0}
         for r in rows or []:
             d = dict(r)
             obs = str(d.get("observed_id") or "")
@@ -1075,6 +1092,21 @@ class SellerBackfill:
                     {"r": old_ref})
                 if row:
                     stale.append(old_ref)
+            # pgm stragglers: count in BOTH modes (the dry-run must report
+            # them), write only in execute.
+            pgm_stale = 0
+            if b["listing_product_ids"]:
+                pgm_row = await self.db.fetch_one(
+                    "SELECT count(*) AS c FROM product_group_members "
+                    "WHERE merchant_id = :banned AND platform_product_id = ANY(:pids)",
+                    {"banned": BANNED_BUCKET_MERCHANT_ID, "pids": b["listing_product_ids"]})
+                pgm_stale = int(dict(pgm_row)["c"]) if pgm_row else 0
+            stats["pgm_stale_found"] += pgm_stale
+            if pgm_stale and self.execute:
+                async with self.db.transaction():
+                    moved = await self._resubject_group_membership(b, obs)
+                stats["pgm_moved"] += moved["moved"]
+                stats["pgm_retired"] += moved["retired"]
             if not stale:
                 continue
             stats["stale_found"] += len(stale)
@@ -1091,7 +1123,7 @@ class SellerBackfill:
             stats["migrated"] += len(stale)
         report.catalog["listing_repair"] = stats
 
-    async def _resubject_group_membership(self, b: Dict[str, Any], obs: str) -> None:
+    async def _resubject_group_membership(self, b: Dict[str, Any], obs: str) -> Dict[str, int]:
         """product_group_members keys on (merchant_id, platform,
         platform_product_id) and carries NONE of the reflection scope columns —
         the one ownership table `discover_cascade_tables` cannot see (R0
@@ -1101,45 +1133,61 @@ class SellerBackfill:
         disagree on product_group_id, the retirement is still correct (one row
         per merchant by PK) but the divergence is logged for review — a group
         move must never be silently indistinguishable from a duplicate."""
-        spid = str(b.get("source_product_id") or "")
-        platform = str(b.get("platform") or "")
-        if not spid or not platform:
-            return
-        # `databases` binds through SQLAlchemy text(), which REJECTS a params
-        # dict carrying a key the statement does not name. Each query gets
-        # exactly its own binds — a shared superset dict raised
-        # ArgumentError("doesn't define a bound parameter named 'banned'") and
-        # aborted the canary batch (caught 2026-08-07, before any write).
-        scope = {"platform": platform, "spid": spid}
-        obs_scope = {"obs": obs, **scope}
-        banned_scope = {"banned": BANNED_BUCKET_MERCHANT_ID, **scope}
-        existing = await self.db.fetch_one(
-            "SELECT product_group_id FROM product_group_members WHERE merchant_id = :obs "
-            "AND platform = :platform AND platform_product_id = :spid",
-            obs_scope,
+        # EVERY id a pgm row may key on — the same union the listing
+        # migration carries. Keying on source_product_id alone stranded 77
+        # seed-keyed rows across the first 1,075 moved products (verifier
+        # catch, 2026-08-11): third instance of the "handle every id a child
+        # row may key on" class, after Path C listings and multi-seed
+        # listings. The banned rows are ENUMERATED (any platform) so the hunt
+        # matches the verifier's join exactly; each is then moved or retired
+        # under its own (platform, pid) so the PK stays safe.
+        pids = [str(v) for v in dict.fromkeys(
+            [*(b.get("listing_product_ids") or []), b.get("source_product_id")]) if v]
+        if not pids:
+            return {"moved": 0, "retired": 0}
+        stats = {"moved": 0, "retired": 0}
+        banned_rows = await self.db.fetch_all(
+            "SELECT platform, platform_product_id, product_group_id "
+            "FROM product_group_members "
+            "WHERE merchant_id = :banned AND platform_product_id = ANY(:pids)",
+            {"banned": BANNED_BUCKET_MERCHANT_ID, "pids": pids},
         )
-        if existing:
-            banned_row = await self.db.fetch_one(
-                "SELECT product_group_id FROM product_group_members WHERE merchant_id = :banned "
+        for row in banned_rows or []:
+            d = dict(row)
+            platform = str(d.get("platform") or "")
+            spid = str(d.get("platform_product_id") or "")
+            # `databases` binds through SQLAlchemy text(), which REJECTS a
+            # params dict carrying a key the statement does not name. Each
+            # query gets exactly its own binds — a shared superset dict
+            # aborted the canary batch (caught 2026-08-07, before any write).
+            scope = {"platform": platform, "spid": spid}
+            obs_scope = {"obs": obs, **scope}
+            banned_scope = {"banned": BANNED_BUCKET_MERCHANT_ID, **scope}
+            existing = await self.db.fetch_one(
+                "SELECT product_group_id FROM product_group_members WHERE merchant_id = :obs "
                 "AND platform = :platform AND platform_product_id = :spid",
-                banned_scope,
+                obs_scope,
             )
-            if banned_row and str(dict(banned_row).get("product_group_id")) != str(dict(existing).get("product_group_id")):
-                logger.warning(
-                    "A9-4 pgm group divergence for %s: banned row group %s vs observed row group %s",
-                    spid, dict(banned_row).get("product_group_id"), dict(existing).get("product_group_id"),
+            if existing:
+                if str(d.get("product_group_id")) != str(dict(existing).get("product_group_id")):
+                    logger.warning(
+                        "A9-4 pgm group divergence for %s: banned row group %s vs observed row group %s",
+                        spid, d.get("product_group_id"), dict(existing).get("product_group_id"),
+                    )
+                await self.db.execute(
+                    "DELETE FROM product_group_members WHERE merchant_id = :banned "
+                    "AND platform = :platform AND platform_product_id = :spid",
+                    banned_scope,
                 )
-            await self.db.execute(
-                "DELETE FROM product_group_members WHERE merchant_id = :banned "
-                "AND platform = :platform AND platform_product_id = :spid",
-                banned_scope,
-            )
-            return
-        sql = ("UPDATE product_group_members SET merchant_id = :obs "
-               "WHERE merchant_id = :banned AND platform = :platform "
-               "AND platform_product_id = :spid")
-        assert_sig_frozen_sql(sql)
-        await self.db.execute(sql, {"obs": obs, **banned_scope})
+                stats["retired"] += 1
+                continue
+            sql = ("UPDATE product_group_members SET merchant_id = :obs "
+                   "WHERE merchant_id = :banned AND platform = :platform "
+                   "AND platform_product_id = :spid")
+            assert_sig_frozen_sql(sql)
+            await self.db.execute(sql, {"obs": obs, **banned_scope})
+            stats["moved"] += 1
+        return stats
 
     _listing_columns_cache: Optional[List[str]] = None
 

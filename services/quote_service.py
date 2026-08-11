@@ -1038,6 +1038,25 @@ class QuoteService:
         for promo in promotions:
             try:
                 if getattr(promo, "type", None) != "MULTI_BUY_DISCOUNT":
+                    # The infra engine applies ONLY MULTI_BUY_DISCOUNT. Other
+                    # types (FLASH_SALE / FREE_SHIPPING) used to be skipped
+                    # SILENTLY here — displayed to shoppers, never priced (the
+                    # 2026-08 audit's promo trapdoor). Manual creation of those
+                    # types is now rejected at the API; Shopify-synced ones
+                    # apply inside Shopify's own pricing. Either way, record
+                    # the skip so evidence never hides an unapplied promo.
+                    if isinstance(discount_evidence, dict):
+                        decisions = discount_evidence.setdefault("decisions", [])
+                        if isinstance(decisions, list):
+                            decisions.append(
+                                {
+                                    "promotion_id": getattr(promo, "id", None),
+                                    "decision": "skipped",
+                                    "reason": "promo_type_not_applied_at_quote",
+                                    "promo_type": getattr(promo, "type", None),
+                                    "source": "pivota_infra",
+                                }
+                            )
                     continue
 
                 scope = getattr(promo, "scope", None) or {}

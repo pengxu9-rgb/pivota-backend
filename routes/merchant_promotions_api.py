@@ -72,11 +72,37 @@ async def get_promotion_endpoint(
     return {"promotion": promo.dict()}
 
 
+# Promo types the infra quote engine actually APPLIES. quote_service's
+# _apply_infra_promotions_best_effort implements ONLY MULTI_BUY_DISCOUNT;
+# a manually created FLASH_SALE or FREE_SHIPPING would validate, sync, and
+# DISPLAY — and then silently never change a price at quote time (the
+# 2026-08 audit's "promo trapdoor"). Shopify-synced promos of those types
+# are different: their discount applies inside Shopify's own pricing engine,
+# and the sync path calls services.promotions_service.create_promotion
+# directly, not this route.
+QUOTE_APPLIED_MANUAL_PROMO_TYPES = {"MULTI_BUY_DISCOUNT"}
+
+
 @router.post("", response_model=Dict[str, Any], status_code=status.HTTP_201_CREATED)
 async def create_promotion_endpoint(
     payload: PromotionCreate,
     _: None = Depends(require_promotions_admin),
 ) -> Dict[str, Any]:
+    if payload.type not in QUOTE_APPLIED_MANUAL_PROMO_TYPES:
+        # 400, not 422: the repo-wide error middleware rewrites every 422 into a
+        # generic INVALID_REQUEST, which would erase this named refusal.
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail={
+                "code": "PROMO_TYPE_NOT_APPLIED_AT_QUOTE",
+                "message": (
+                    f"Manual {payload.type} promotions are not applied by the quote engine — "
+                    "they would display to shoppers but never change a price. Create the "
+                    "discount in Shopify instead (it applies via Shopify pricing and syncs "
+                    "back automatically), or use MULTI_BUY_DISCOUNT."
+                ),
+            },
+        )
     try:
         promo = await create_promotion(payload)
     except ValueError as e:
