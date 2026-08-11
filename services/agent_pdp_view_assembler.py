@@ -1114,9 +1114,39 @@ async def refresh_agent_pdp_view_for_content_key(
     wraps this best-effort so a stale PDP cache never breaks ingest.
     """
     read_db = db or database
+    row = await build_agent_pdp_view_row(
+        content_key, refresh_source=refresh_source, db=read_db
+    )
+    if row is None:
+        return False
+    await read_db.execute(UPSERT_SQL, row_to_upsert_params(row))
+    return True
+
+
+async def build_agent_pdp_view_row(
+    content_key: str,
+    *,
+    refresh_source: str,
+    db: Any = None,
+) -> Optional[Dict[str, Any]]:
+    """Fetch every source row for a content_key and assemble the view row.
+
+    The read half of refresh_agent_pdp_view_for_content_key, split out so a
+    caller can PREVIEW the next row state without writing it. Side-effect-free.
+    Returns None when there is nothing to build (no catalog rows, or too thin a
+    row to be useful — no title).
+
+    Assembling through this function rather than calling assemble_row directly
+    is what keeps the evidence / enrichment / seller-trust overlays attached. A
+    caller that skips it gets a row with those fields None, and UPSERT_SQL sets
+    every column from EXCLUDED — so writing such a row DELETES the enrichment,
+    evidence_profile and required_disclaimers already serving on it. That is not
+    hypothetical: scripts/backfill_agent_pdp_view.py did exactly this.
+    """
+    read_db = db or database
     products = await fetch_products_for_key(content_key, db=read_db)
     if not products:
-        return False
+        return None
     product_keys = [p["product_key"] for p in products if p.get("product_key")]
     skus = await fetch_skus_for_keys(product_keys, db=read_db)
     offers = await fetch_offers_for_keys(product_keys, db=read_db)
@@ -1158,10 +1188,7 @@ async def refresh_agent_pdp_view_for_content_key(
         enrichment=enrichment,
         seller_trust_by_id=seller_trust_by_id,
     )
-    if row is None:
-        return False
-    await read_db.execute(UPSERT_SQL, row_to_upsert_params(row))
-    return True
+    return row
 
 
 # ---------------------------------------------------------------------

@@ -1,36 +1,47 @@
-"""Stage 3a-ii backfill — populate agent_pdp_view from existing catalog tables.
+"""Stage 3a-ii backfill — (re)materialize agent_pdp_view rows.
 
-Stage 3a-i (migration 085) added the denormalized agent_pdp_view table;
-this script is the one-shot backfill that seeds it from
-catalog_products × catalog_skus × catalog_offers × product_group_members
-× external_product_seeds. Stage 3a-iii adds the writer hook that keeps
-it fresh on every seed_data commit; Stage 3a-iv ships the read endpoint.
+Stage 3a-i (migration 085) added the denormalized agent_pdp_view table; this
+script seeds and re-seeds it from catalog_products × catalog_skus ×
+catalog_offers × product_group_members × external_product_seeds, plus the
+evidence / enrichment / seller-trust overlays.
 
-The pure-Python assembly logic lives in
-services/agent_pdp_view_assembler.py — both this script and the Stage
-3a-iii writer hook call it. This script owns the content_key window
-SELECT and the UPSERT loop; the shared service module owns the per-key
-source-row reads.
+🚨 THIS SCRIPT USED TO DESTROY THE OVERLAYS IT WAS POINTED AT.
 
-Grouping model and tiebreak ladder are documented in
+It inlined its own fetch→assemble→upsert, calling `assemble_row` with neither
+`evidence=` nor `enrichment=` nor `seller_trust_by_id=`. Those default to None,
+and UPSERT_SQL assigns EVERY column from EXCLUDED on conflict — including
+`description`, `bullet_points`, `usage_scenarios`, `evidence_profile` and
+`required_disclaimers`. So an `--apply` run did not merely fail to add
+enrichment: it NULLed the enrichment, substantiated claims and disclaimers on
+every row it touched that already had them. Pointing it at the ~138 enriched
+rows stranded before the SERVE_PDP_ENRICHMENT_ON_WRITE flip would have wiped
+the ~217 that were already serving.
+
+It now delegates to `refresh_agent_pdp_view_for_content_key` /
+`build_agent_pdp_view_row` — the canonical path that fetches all three overlays
+— and no longer owns any assembly of its own. Do not reintroduce a local
+`assemble_row` call here; see the warning on `build_agent_pdp_view_row`.
+
+The grouping model and tiebreak ladder are documented in
 services/agent_pdp_view_assembler.py.
 
-Mock/synthetic boundary (memory: feedback_mock_data_never_to_merchant):
-the assembler never synthesizes description prose; this script never
-backfills rows with fabricated content. Every field originates in a
-primary catalog table or external_product_seeds.seed_data (employee-
-authored bootstrap data — memory: project_pivota_external_seed_bootstrap).
+Mock/synthetic boundary (memory: feedback_mock_data_never_to_merchant): the
+assembler never synthesizes description prose; this script never backfills rows
+with fabricated content. Every field originates in a primary catalog table or
+external_product_seeds.seed_data (employee-authored bootstrap data — memory:
+project_pivota_external_seed_bootstrap).
 
 Usage
 -----
-Dry-run (default):
-  python3 scripts/backfill_agent_pdp_view.py --limit 200
+Dry-run over the enriched cohort (what workstream 1 wants):
+  python3 scripts/backfill_agent_pdp_view.py --scope enriched --limit 0
 
-Apply:
+Apply it:
+  python3 scripts/backfill_agent_pdp_view.py --scope enriched --limit 0 --apply
+
+Dry-run / apply over the whole corpus, paginated:
+  python3 scripts/backfill_agent_pdp_view.py --limit 200 --offset 0
   python3 scripts/backfill_agent_pdp_view.py --apply --limit 200 --offset 0
-
-Full backfill in one shot (only on small / staging DBs):
-  python3 scripts/backfill_agent_pdp_view.py --apply --limit 0
 """
 
 from __future__ import annotations
@@ -49,39 +60,67 @@ from db.database import database  # noqa: E402
 from services.agent_pdp_view_assembler import (  # noqa: E402
     BACKFILL_REFRESH_SOURCE,
     UPSERT_SQL,
-    assemble_row,
-    fetch_external_seed_for_keys,
-    fetch_offers_for_keys,
-    fetch_products_for_key,
-    fetch_skus_for_keys,
+    build_agent_pdp_view_row,
     row_to_upsert_params,
 )
 
 logger = logging.getLogger("backfill_agent_pdp_view")
 
+# Distinct refresh_source for the enriched-cohort pass so the audit trail can
+# tell "propagated the stranded enrichment" from a generic re-seed.
+ENRICHED_REFRESH_SOURCE = "backfill_enrichment_propagation"
 
-async def _fetch_content_keys(*, limit: int, offset: int) -> List[str]:
-    """Stable content_key window. We page by content_key ASC so each
-    chunk processes a disjoint slice — no double-writes, safe to resume
-    on partial failures.
+# Every content_key, ordered so each --limit/--offset window is a disjoint slice.
+_ALL_KEYS_SQL = """
+    SELECT DISTINCT content_key
+    FROM catalog_products
+    WHERE content_key IS NOT NULL
+    ORDER BY content_key ASC
+"""
+
+# content_keys carrying a product_enrichment overlay. product_enrichment is keyed
+# by the enrichment domain's spelling of the catalog identity triple —
+# platform_product_id there IS source_product_id on catalog_products. Getting
+# that mapping wrong is what killed the on-write publish bridge; see the comment
+# in refresh_agent_pdp_view_for_enrichment_write.
+_ENRICHED_KEYS_SQL = """
+    SELECT DISTINCT cp.content_key
+    FROM product_enrichment pe
+    JOIN catalog_products cp
+      ON cp.merchant_id = pe.merchant_id
+     AND cp.platform = pe.platform
+     AND cp.source_product_id = pe.platform_product_id
+    WHERE cp.content_key IS NOT NULL
+    ORDER BY cp.content_key ASC
+"""
+
+
+async def _fetch_content_keys(*, scope: str, limit: int, offset: int) -> List[str]:
+    """Stable content_key window. Paged by content_key ASC so each chunk is a
+    disjoint slice — no double-writes, safe to resume on partial failures.
     """
-    limit_clause = "LIMIT :limit" if limit > 0 else ""
-    offset_clause = "OFFSET :offset" if offset > 0 else ""
-    sql = f"""
-        SELECT DISTINCT content_key
-        FROM catalog_products
-        WHERE content_key IS NOT NULL
-        ORDER BY content_key ASC
-        {limit_clause}
-        {offset_clause}
-    """
+    base = _ENRICHED_KEYS_SQL if scope == "enriched" else _ALL_KEYS_SQL
+    sql = base
     params: Dict[str, Any] = {}
     if limit > 0:
+        sql += "\n        LIMIT :limit"
         params["limit"] = int(limit)
     if offset > 0:
+        sql += "\n        OFFSET :offset"
         params["offset"] = int(offset)
     rows = await database.fetch_all(sql, params)
     return [r["content_key"] for r in rows or []]
+
+
+def _overlay_flags(row: Dict[str, Any]) -> Dict[str, bool]:
+    """Which overlays the freshly-assembled row carries. Reported in dry-run so
+    the operator can see the propagation BEFORE writing, and counted on apply."""
+    return {
+        "bullet_points": bool(row.get("bullet_points")),
+        "usage_scenarios": bool(row.get("usage_scenarios")),
+        "evidence_profile": bool(row.get("evidence_profile")),
+        "required_disclaimers": bool(row.get("required_disclaimers")),
+    }
 
 
 # ---------------------------------------------------------------------
@@ -92,42 +131,45 @@ async def _drive(args: argparse.Namespace) -> Dict[str, Any]:
     if not getattr(database, "is_connected", False):
         await database.connect()
 
-    content_keys = await _fetch_content_keys(limit=args.limit, offset=args.offset)
+    refresh_source = (
+        ENRICHED_REFRESH_SOURCE if args.scope == "enriched" else BACKFILL_REFRESH_SOURCE
+    )
+    content_keys = await _fetch_content_keys(
+        scope=args.scope, limit=args.limit, offset=args.offset
+    )
     logger.info(
-        "loaded %d content_keys (limit=%d offset=%d)",
-        len(content_keys), args.limit, args.offset,
+        "loaded %d content_keys (scope=%s limit=%d offset=%d)",
+        len(content_keys), args.scope, args.limit, args.offset,
     )
 
     outcomes: Dict[str, int] = {
         "content_keys_considered": len(content_keys),
         "rows_assembled": 0,
-        "rows_skipped_no_title": 0,
+        "rows_skipped_nothing_to_build": 0,
         "rows_upserted": 0,
         "rows_skipped_no_op_in_dry_run": 0,
+        "with_bullet_points": 0,
+        "with_usage_scenarios": 0,
+        "with_evidence_profile": 0,
+        "with_required_disclaimers": 0,
     }
     samples: List[Dict[str, Any]] = []
 
     for ck in content_keys:
-        products = await fetch_products_for_key(ck)
-        if not products:
-            continue
-        product_keys = [p["product_key"] for p in products]
-        skus = await fetch_skus_for_keys(product_keys)
-        offers = await fetch_offers_for_keys(product_keys)
-        external_seed = await fetch_external_seed_for_keys(product_keys)
-
-        row = assemble_row(
-            content_key=ck,
-            products=products,
-            skus=skus,
-            offers=offers,
-            external_seed=external_seed,
-            refresh_source=BACKFILL_REFRESH_SOURCE,
-        )
+        # Assemble through the canonical read path so the evidence, enrichment
+        # and seller-trust overlays are attached. Dry-run stops here; apply
+        # persists exactly this row.
+        row = await build_agent_pdp_view_row(ck, refresh_source=refresh_source)
         if row is None:
-            outcomes["rows_skipped_no_title"] += 1
+            outcomes["rows_skipped_nothing_to_build"] += 1
             continue
         outcomes["rows_assembled"] += 1
+
+        flags = _overlay_flags(row)
+        for name, present in flags.items():
+            if present:
+                outcomes[f"with_{name}"] += 1
+
         if len(samples) < 5:
             samples.append({
                 "content_key": ck,
@@ -136,6 +178,7 @@ async def _drive(args: argparse.Namespace) -> Dict[str, Any]:
                 "offer_count": row["offer_count"],
                 "variants_count": row["variants_count"],
                 "primary_merchant_id": row["primary_merchant_id"],
+                **flags,
             })
 
         if not args.apply:
@@ -144,7 +187,13 @@ async def _drive(args: argparse.Namespace) -> Dict[str, Any]:
         await database.execute(UPSERT_SQL, row_to_upsert_params(row))
         outcomes["rows_upserted"] += 1
 
-    return {"outcome_counts": outcomes, "samples": samples}
+    return {
+        "scope": args.scope,
+        "refresh_source": refresh_source,
+        "applied": bool(args.apply),
+        "outcome_counts": outcomes,
+        "samples": samples,
+    }
 
 
 def _parse_args() -> argparse.Namespace:
@@ -152,6 +201,14 @@ def _parse_args() -> argparse.Namespace:
     p.add_argument(
         "--apply", action="store_true",
         help="Actually UPSERT agent_pdp_view rows. Default: dry-run.",
+    )
+    p.add_argument(
+        "--scope", choices=("all", "enriched"), default="all",
+        help=(
+            "'all' = every content_key (default). 'enriched' = only the "
+            "content_keys carrying a product_enrichment overlay — the cohort "
+            "stranded before the SERVE_PDP_ENRICHMENT_ON_WRITE flip."
+        ),
     )
     p.add_argument(
         "--limit", type=int, default=200,
