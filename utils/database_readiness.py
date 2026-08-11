@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import os
+import weakref
 from typing import Optional
 
 from fastapi import HTTPException, status
@@ -12,6 +13,127 @@ from utils.transient_errors import is_asyncpg_busy_error
 
 
 logger = logging.getLogger(__name__)
+
+
+# ---------------------------------------------------------------------------
+# One repair at a time.
+#
+# WHY. `databases.Database.connect()` HAS NO RE-ENTRANCY GUARD:
+#
+#     if self.is_connected: return        # read
+#     await self._backend.connect()       # asyncpg.create_pool(), assigns _pool
+#     self.is_connected = True            # write
+#
+# and the Postgres backend's own `assert self._pool is None` is checked before
+# its await. `_connect_once` below wraps the call in `asyncio.wait_for`, which
+# schedules a Task, so N concurrent callers arrive as N tasks, ALL see
+# `is_connected` False, ALL pass both guards, ALL build a pool, and each
+# assigns `backend._pool` — last write wins. The other N-1 pools are
+# unreachable, so nothing ever closes them: `disconnect()` only ever closes the
+# pool currently referenced. Their server connections stay open until Postgres
+# times them out.
+#
+# `_force_mark_database_disconnected` is what puts every caller in that state
+# at once, so the whole request wave collides on exactly the recovery path.
+#
+# MEASURED on real Postgres, DB_POOL_MIN_SIZE=5 (asyncpg opens min_size
+# eagerly), 5 concurrent callers per blip: 30 -> 60 -> 90 -> 99 server
+# connections over four blips, at which point `max_connections` (100 — the
+# production default) was exhausted and EVERY caller began failing with
+# "database connect failed". 99 connections were still open after a clean
+# `disconnect()`. That is the recovery path taking the database down for every
+# other client, during the outage it exists to recover from.
+#
+# SINGLE-FLIGHT, NOT A LOCK. Callers do not queue for a turn at repairing;
+# exactly one becomes the leader and everyone else waits for ITS OUTCOME —
+# success or failure — and adopts it.
+#
+# A plain lock fixes the leak and introduces a worse bug. Followers would wake
+# up one at a time and each run the whole repair (re-probe + disconnect +
+# connect + reconnect_probe), which is fine when the repair SUCCEEDS (the next
+# caller's probe passes and it returns) and catastrophic when it FAILS — which
+# is the condition this function exists for. Measured against a live-but-wedged
+# Postgres at production-default timeouts, with the lock version:
+#
+#     callers   locked      parent
+#        5      33.0s        6.0s
+#       20     123.1s        6.0s
+#
+# and under sustained arrivals the queue never drains at all: 9s, 44s, 79s,
+# climbing ~5s per second of traffic. `/health` (main.py) is one of these
+# callers and Railway's healthcheck points at it, so that is a container kill
+# in the middle of an outage. Sharing the outcome makes the worst case ONE
+# repair for everybody, no matter how many callers arrive.
+#
+# The leader also skips the extra probe: there is no await between its fast
+# path failing and it claiming the slot below, so nothing can have changed and
+# a second probe would be pure latency. Leader latency therefore matches the
+# parent commit exactly; the fix costs nothing on any path.
+#
+# WHY NOT A MODULE-LEVEL PRIMITIVE (this repo's idiom for the ~25 `_DDL_LOCK`s
+# in db/*). Both `asyncio.Lock` and `asyncio.Future` are loop-bound: a
+# module-level Lock binds to the first event loop that CONTENDS it and raises
+# `RuntimeError: ... is bound to a different event loop` on every loop after
+# (measured on CPython 3.11.14; uncontended acquires never bind, which is why
+# the DDL locks get away with it). Awaiting a Future from the wrong loop hangs.
+# Every call site catches `DatabaseUnavailableError` and nothing else, so a
+# stray RuntimeError would be a 500 on the order path where a 503 belongs.
+#
+# A single slot rather than a dict keyed by loop: a Future holds `_loop`, a
+# strong reference back to the key, so a WeakKeyDictionary would retain every
+# event loop the process ever ran (measured). The web process has exactly one
+# loop — `app_lifespan` awaits both startup connects sequentially and uvicorn
+# serves nothing until it returns, APScheduler is `AsyncIOScheduler` on that
+# same loop, and `asyncio.to_thread` runs sync callables only. KNOWN LIMIT: if
+# a second event loop were ever run CONCURRENTLY (not merely afterwards), it
+# would take the slot and the two loops would silently stop coalescing — a
+# leak, not a crash. Verified absent across main.py, routes/, utils/,
+# services/ and db/; re-check before introducing a worker-thread loop.
+_repair_loop: Optional["weakref.ref[asyncio.AbstractEventLoop]"] = None
+_repair_inflight: Optional["asyncio.Future"] = None
+
+# What the leader publishes to its followers: None for success, or the
+# (phase, error_type) of the DatabaseUnavailableError it raised.
+RepairOutcome = Optional["tuple[str, str]"]
+
+
+def _claim_repair() -> "tuple[bool, asyncio.Future]":
+    """Become the repair leader, or return the in-flight repair to wait on.
+
+    Returns `(is_leader, future)`. Contains no await, so the check-and-set
+    cannot interleave with another caller — that atomicity is what makes this
+    safe without a lock.
+    """
+    global _repair_loop, _repair_inflight
+
+    loop = asyncio.get_running_loop()
+    bound = _repair_loop() if _repair_loop is not None else None
+    if bound is not loop:
+        # A Future from another loop must never be awaited here; it would hang
+        # rather than fail. Start this loop's slot empty.
+        _repair_loop = weakref.ref(loop)
+        _repair_inflight = None
+
+    inflight = _repair_inflight
+    if inflight is not None and not inflight.done():
+        return False, inflight
+
+    _repair_inflight = loop.create_future()
+    return True, _repair_inflight
+
+
+def _publish_repair_outcome(future: "asyncio.Future", outcome: RepairOutcome) -> None:
+    """Release the followers. MUST run on every exit path the leader can take,
+    cancellation included, or the followers wait forever."""
+    global _repair_inflight
+
+    if _repair_inflight is future:
+        _repair_inflight = None
+    if not future.done():
+        # A result, never an exception: an exception nobody retrieves (because
+        # there happened to be no followers) is logged by asyncio as
+        # "Future exception was never retrieved".
+        future.set_result(outcome)
 
 
 class DatabaseUnavailableError(RuntimeError):
@@ -367,34 +489,121 @@ async def ensure_database_ready(
                 message="database readiness probe failed",
             ) from exc
 
-    if not getattr(database, "is_connected", False):
-        await _connect_once()
+    probed = False
 
-    try:
-        await _probe_once("probe")
+    async def _ready() -> bool:
+        """Does the shared database answer a query right now?"""
+        nonlocal probed
+        if not getattr(database, "is_connected", False):
+            return False
+        probed = True
+        try:
+            await _probe_once("probe")
+            return True
+        except DatabaseUnavailableError as err:
+            logger.warning(
+                "Database readiness probe failed; attempting one reconnect",
+                extra={"phase": err.phase, "error_type": err.error_type},
+            )
+            return False
+
+    # FAST PATH — no coordination whatsoever. This is what the hot request
+    # paths (`/health`, POST /auth/login, /quotes/preview, /orders/create,
+    # /orders/payment/confirm) pay on every call: exactly one `SELECT 1`, the
+    # same as the parent commit. Only a caller that has already established the
+    # database is not answering goes any further.
+    if await _ready():
         return
-    except DatabaseUnavailableError as first_err:
-        logger.warning(
-            "Database readiness probe failed; attempting one reconnect",
-            extra={"phase": first_err.phase, "error_type": first_err.error_type},
+
+    is_leader, inflight = _claim_repair()
+
+    if not is_leader:
+        # A repair is already running. Adopt its outcome rather than start a
+        # second one — including when it FAILS, which is the whole point: N
+        # callers must cost one repair, not N serialized repairs.
+        #
+        # BOUNDED, because everything else in this module is. The leader is a
+        # request task like any other and can die in ways that skip its
+        # publish; waiting forever on it would convert a repairable blip into a
+        # permanently wedged process, which is worse than the leak this
+        # function was changed to fix. The budget is the leader's own worst
+        # case — probe, disconnect, connect, reconnect_probe — plus a second of
+        # slack for scheduling.
+        follower_budget = (
+            probe_timeout_seconds * 2
+            + disconnect_timeout_seconds
+            + connect_timeout_seconds
+            + 1.0
+        )
+        try:
+            # shield: `wait_for` cancels what it is waiting on when it times
+            # out, and this future is SHARED — cancelling it would take down
+            # every other follower and the leader's publish along with us.
+            outcome = await asyncio.wait_for(
+                asyncio.shield(inflight), timeout=follower_budget
+            )
+        except asyncio.TimeoutError:
+            raise DatabaseUnavailableError(
+                phase="repair_wait",
+                error_type="TimeoutError",
+                message="database readiness repair did not complete in time",
+            ) from None
+        if outcome is None:
+            return
+        phase, error_type = outcome
+        raise DatabaseUnavailableError(
+            phase=phase,
+            error_type=error_type,
+            message="database readiness repair failed",
         )
 
+    # ---- leader: from here this is the parent commit's body, unchanged ----
+    outcome: RepairOutcome = ("repair", "Unknown")
     try:
-        if getattr(database, "is_connected", False):
-            await asyncio.wait_for(database.disconnect(), timeout=disconnect_timeout_seconds)
-    except Exception as exc:
-        logger.warning(f"Database disconnect during recovery failed: {exc}")
-    finally:
-        _force_mark_database_disconnected()
+        if not getattr(database, "is_connected", False):
+            await _connect_once()
+            # A brand-new pool; any earlier probe said nothing about it.
+            probed = False
 
-    await _connect_once()
+        if not probed:
+            try:
+                await _probe_once("probe")
+                outcome = None
+                return
+            except DatabaseUnavailableError as first_err:
+                logger.warning(
+                    "Database readiness probe failed; attempting one reconnect",
+                    extra={"phase": first_err.phase, "error_type": first_err.error_type},
+                )
 
-    try:
-        await _probe_once("reconnect_probe")
-    except DatabaseUnavailableError as exc:
-        if is_asyncpg_busy_error(exc.__cause__ or exc):
+        try:
+            if getattr(database, "is_connected", False):
+                await asyncio.wait_for(database.disconnect(), timeout=disconnect_timeout_seconds)
+        except Exception as exc:
+            logger.warning(f"Database disconnect during recovery failed: {exc}")
+        finally:
             _force_mark_database_disconnected()
+
+        await _connect_once()
+
+        try:
+            await _probe_once("reconnect_probe")
+        except DatabaseUnavailableError as exc:
+            if is_asyncpg_busy_error(exc.__cause__ or exc):
+                _force_mark_database_disconnected()
+            raise
+        outcome = None
+    except DatabaseUnavailableError as exc:
+        outcome = (exc.phase, exc.error_type)
         raise
+    except BaseException as exc:  # CancelledError included — see below
+        outcome = ("repair", type(exc).__name__)
+        raise
+    finally:
+        # Unconditional: a leader that dies without publishing (a cancelled
+        # request, an unexpected error) would strand every follower until its
+        # own caller-side timeout.
+        _publish_repair_outcome(inflight, outcome)
 
 
 DEFAULT_RECONNECT_SUPERVISOR_INTERVAL_SECONDS = 30.0

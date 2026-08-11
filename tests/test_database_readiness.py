@@ -1,5 +1,9 @@
 from __future__ import annotations
 
+import asyncio
+import time
+import weakref
+
 import pytest
 
 from utils import database_readiness as readiness
@@ -97,6 +101,251 @@ async def test_ensure_database_ready_raises_when_connect_cannot_be_restored(monk
     assert exc_info.value.phase == "connect"
     assert exc_info.value.error_type == "TimeoutError"
 
+
+class SlowConnectFakeDatabase(FakeDatabase):
+    """A fake whose `connect()` yields, so concurrent callers can overlap.
+
+    The base fake's `connect()` never awaits, so N callers can never be inside
+    it at once and the re-entrancy defect is invisible. Yielding once is enough
+    to let every queued caller reach the same point the real
+    `asyncio.wait_for(database.connect(), ...)` does.
+    """
+
+    async def connect(self) -> None:
+        await asyncio.sleep(0)
+        await super().connect()
+
+
+@pytest.mark.asyncio
+async def test_concurrent_callers_produce_exactly_one_connect(monkeypatch: pytest.MonkeyPatch) -> None:
+    """N callers hitting a disconnected database must build ONE pool.
+
+    `databases.Database.connect()` reads `is_connected`, awaits the backend,
+    and only then writes the flag, so without serialization every concurrent
+    caller passes the guard and builds its own pool. All but the last are
+    orphaned and can never be closed. The connection-count consequence is
+    measured on real Postgres in
+    `test_database_readiness_concurrent_pool_leak_postgres.py`; this pins the
+    call count without needing a server.
+    """
+    fake_db = SlowConnectFakeDatabase(connected=False)
+    monkeypatch.setattr(readiness, "database", fake_db)
+
+    await asyncio.gather(*(readiness.ensure_database_ready() for _ in range(8)))
+
+    assert fake_db.connect_calls == 1
+
+
+@pytest.mark.asyncio
+async def test_a_failing_repair_is_shared_not_repeated(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Followers must adopt the leader's FAILURE, not queue up to retry it.
+
+    This is the property a plain lock does not give you. If each queued caller
+    ran its own repair, N callers against a wedged database would cost N
+    serialized repairs — measured at 6s -> 123s for 20 callers against a real
+    hung Postgres, and unbounded under sustained arrivals, on `/health` and the
+    order path. Everyone must pay for ONE repair.
+    """
+    fake_db = SlowConnectFakeDatabase(
+        connected=False, connect_raises=TimeoutError("db down")
+    )
+    monkeypatch.setattr(readiness, "database", fake_db)
+
+    results = await asyncio.gather(
+        *(readiness.ensure_database_ready() for _ in range(8)),
+        return_exceptions=True,
+    )
+
+    # Every caller is told the truth...
+    assert len(results) == 8
+    for result in results:
+        assert isinstance(result, readiness.DatabaseUnavailableError)
+        assert result.phase == "connect"
+        assert result.error_type == "TimeoutError"
+    # ...at the cost of a single repair attempt.
+    assert fake_db.connect_calls == 1
+
+
+@pytest.mark.asyncio
+async def test_a_failing_repair_costs_one_repair_of_wall_clock(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The same property as above, measured as LATENCY rather than call count.
+
+    A lock gets the call count wrong only in the sense that it serializes; what
+    it actually breaks is time. `connect_calls == 1` would still hold if a
+    future refactor made followers wait for the leader and then re-probe on
+    their own, so pin the wall clock too.
+    """
+
+    class HangingProbeFake(FakeDatabase):
+        async def execute(self, _query):
+            await asyncio.sleep(3600)
+
+    fake_db = HangingProbeFake(connected=True)
+    monkeypatch.setattr(readiness, "database", fake_db)
+
+    # One repair = probe + disconnect + connect + reconnect_probe.
+    budget = 0.2 + 0.1 + 0.2 + 0.2
+    started = time.monotonic()
+    await asyncio.gather(
+        *(
+            readiness.ensure_database_ready(
+                connect_timeout_seconds=0.2,
+                probe_timeout_seconds=0.2,
+                disconnect_timeout_seconds=0.1,
+            )
+            for _ in range(8)
+        ),
+        return_exceptions=True,
+    )
+    elapsed = time.monotonic() - started
+
+    # Serialized, these 8 callers would cost ~8x this. The generous ceiling is
+    # deliberate: the signal is 8x, so it does not need a tight bound to be
+    # unambiguous, and a tight one would flake under a loaded CI box.
+    assert elapsed < budget * 2, (
+        f"8 concurrent callers took {elapsed:.2f}s; one repair is ~{budget:.2f}s, "
+        "so the repair is being repeated per caller rather than shared"
+    )
+
+
+@pytest.mark.asyncio
+async def test_a_cancelled_leader_does_not_strand_its_followers(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A client disconnecting mid-repair must not hang everyone behind it.
+
+    The leader is an ordinary request task and can be cancelled at any await.
+    If it fails to publish an outcome on the way out, every follower waits on a
+    Future that will never resolve — a worse outage than the one being
+    repaired.
+    """
+    started = asyncio.Event()
+
+    class HangingConnectFake(FakeDatabase):
+        async def connect(self) -> None:
+            started.set()
+            await asyncio.sleep(3600)
+
+    fake_db = HangingConnectFake(connected=False)
+    monkeypatch.setattr(readiness, "database", fake_db)
+
+    leader = asyncio.create_task(readiness.ensure_database_ready())
+    await started.wait()
+    follower = asyncio.create_task(readiness.ensure_database_ready())
+    await asyncio.sleep(0)  # let the follower attach to the leader's future
+
+    leader.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await leader
+
+    # The follower resolves promptly instead of hanging on a dead future.
+    with pytest.raises(readiness.DatabaseUnavailableError) as exc_info:
+        await asyncio.wait_for(follower, timeout=2.0)
+    assert exc_info.value.error_type == "CancelledError"
+
+
+@pytest.mark.asyncio
+async def test_a_follower_gives_up_on_a_leader_that_never_publishes(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A follower's wait must be bounded like every other await in this module.
+
+    The leader is an ordinary request task. `_publish_repair_outcome` runs in a
+    `finally` so it should always fire — but "should" is what unbounded waits
+    are always justified by, and the failure mode is a permanently wedged
+    process rather than a slow one. An unpublished repair must degrade to the
+    503 the call sites already handle.
+
+    Modelled by parking a pending future in the slot with no leader behind it,
+    which is precisely the state a vanished leader leaves.
+    """
+    loop = asyncio.get_running_loop()
+    orphaned = loop.create_future()
+    readiness._repair_loop = weakref.ref(loop)
+    readiness._repair_inflight = orphaned
+
+    fake_db = FakeDatabase(connected=True, execute_results=[TimeoutError("blip")])
+    monkeypatch.setattr(readiness, "database", fake_db)
+
+    try:
+        with pytest.raises(readiness.DatabaseUnavailableError) as exc_info:
+            # The outer wait_for turns a regression into a failure rather than
+            # a hung test run.
+            await asyncio.wait_for(
+                readiness.ensure_database_ready(
+                    connect_timeout_seconds=0.1,
+                    probe_timeout_seconds=0.1,
+                    disconnect_timeout_seconds=0.1,
+                ),
+                timeout=5.0,
+            )
+        assert exc_info.value.phase == "repair_wait"
+        # The shared future must survive: cancelling it would take down every
+        # other follower and the leader's own publish.
+        assert not orphaned.cancelled()
+    finally:
+        readiness._publish_repair_outcome(orphaned, None)
+
+
+def test_a_pending_repair_from_a_dead_loop_does_not_hang_the_next_one(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A Future left pending on a loop that is no longer running must be dropped.
+
+    Awaiting it from a different loop does not raise — it simply never
+    resolves. A caller that adopted such a future would block for its whole
+    follower budget on a repair that can never publish, every time, forever.
+    The slot is therefore reset whenever the running loop changes.
+
+    Unlike the sibling test below, this cannot be caught by simply running two
+    waves: a completed repair clears the slot on its way out, so only an
+    ABANDONED one leaves the stale future behind.
+    """
+
+    async def strand_a_repair() -> None:
+        loop = asyncio.get_running_loop()
+        readiness._repair_loop = weakref.ref(loop)
+        readiness._repair_inflight = loop.create_future()  # never resolved
+
+    asyncio.run(strand_a_repair())
+    assert readiness._repair_inflight is not None
+    assert not readiness._repair_inflight.done()
+
+    async def next_loop() -> None:
+        fake_db = SlowConnectFakeDatabase(connected=False)
+        monkeypatch.setattr(readiness, "database", fake_db)
+        await asyncio.wait_for(readiness.ensure_database_ready(), timeout=2.0)
+        assert fake_db.connect_calls == 1
+
+    asyncio.run(next_loop())
+
+
+def test_the_repair_slot_is_not_bound_to_the_first_event_loop(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The single-flight slot must be per-event-loop.
+
+    Both `asyncio.Lock` and `asyncio.Future` are loop-bound. A module-level
+    primitive — this repo's idiom for its ~25 `_DDL_LOCK`s — binds to the first
+    event loop that CONTENDS it and then raises
+    `RuntimeError: ... is bound to a different event loop` on every loop after
+    (CPython 3.11); awaiting a stale Future from the wrong loop hangs instead.
+    Uncontended acquires never bind, which is why the DDL locks get away with
+    it — this slot is contended by design.
+
+    It matters well beyond the test suite: every call site of
+    `ensure_database_ready` (`/health`, POST /auth/login, /quotes/preview,
+    /orders/create, /orders/payment/confirm) catches `DatabaseUnavailableError`
+    and nothing else, so a stray RuntimeError here is a 500 on the order path
+    where there should have been a 503.
+    """
+
+    async def one_contended_repair_wave() -> None:
+        fake_db = SlowConnectFakeDatabase(connected=False)
+        monkeypatch.setattr(readiness, "database", fake_db)
+        await asyncio.gather(*(readiness.ensure_database_ready() for _ in range(4)))
+        assert fake_db.connect_calls == 1
+
+    asyncio.run(one_contended_repair_wave())
+    # A brand-new event loop, exactly as the next test in the suite gets — and
+    # exactly as a process that runs `asyncio.run` more than once would.
+    asyncio.run(one_contended_repair_wave())
 
 # ---------------------------------------------------------------------------
 # `connect_database_with_timeout` builds the pool itself so it can terminate
