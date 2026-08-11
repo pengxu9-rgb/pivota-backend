@@ -1,0 +1,373 @@
+"""RateLimitMiddleware must not publish the global RATE_LIMIT_RPM to the public.
+
+Measured on prod 2026-08-11, before this fix:
+
+    curl -H 'x-api-key: nope' https://api.pivota.cc/agent/<no-such-route>
+    -> HTTP/2 404
+       x-ratelimit-limit: 120        <- the live RATE_LIMIT_RPM
+       x-ratelimit-remaining: 119    <- and the bucket state
+
+The middleware runs BEFORE authentication and buckets on an api_key it never
+validates, so the old unconditional stamp after `call_next` handed the deployed
+threshold to any caller who set the header to any value.
+
+Two traps this file is built around:
+
+TRAP 1 — "just gate on status < 400" does not work. The citation and discovery
+routes under /agent/ are deliberately public and answer 200 to an invalid key
+(that is the whole point of the agent-readability work), so a non-error status
+does not imply the caller authenticated.
+
+TRAP 2 — a test that only checks "the header is absent" is vacuous if the global
+limit and the per-agent limit are the same number, and it cannot tell "we stopped
+leaking" from "we publish the wrong number". Every test here therefore uses
+_GLOBAL_RPM and _AGENT_LIMIT as DISTINCT sentinels and asserts which one appears.
+"""
+from __future__ import annotations
+
+import pytest
+from fastapi import FastAPI, Request
+from fastapi.testclient import TestClient
+
+from middleware.rate_limiter import RateLimitMiddleware
+
+# Deliberately different, and neither is a plausible default (100/120/1000),
+# so a hardcoded or defaulted value can never satisfy these assertions.
+_GLOBAL_RPM = 8_641
+_AGENT_LIMIT = 37
+_AGENT_USED = 5
+
+_RL_HEADERS = ("x-ratelimit-limit", "x-ratelimit-remaining", "x-ratelimit-reset")
+
+
+def _app(global_rpm: int = _GLOBAL_RPM) -> FastAPI:
+    """An app whose /agent/ routes mimic the three real caller shapes."""
+    app = FastAPI()
+    app.add_middleware(RateLimitMiddleware, requests_per_minute=global_rpm)
+
+    @app.get("/agent/public/thing")
+    async def public_thing():
+        # A public agent route: 200 even for a bogus key. No auth ran, so
+        # nothing records rate-limit state.
+        return {"ok": True}
+
+    @app.get("/agent/private/thing")
+    async def private_thing(request: Request):
+        # Stands in for a route behind get_agent_context: authentication ran and
+        # recorded the ENFORCED per-agent limit, exactly as agent_auth does.
+        request.state.agent_rate_limit_limit = _AGENT_LIMIT
+        request.state.agent_rate_limit_used = _AGENT_USED
+        return {"ok": True}
+
+    @app.get("/not-agent/thing")
+    async def not_agent():
+        return {"ok": True}
+
+    return app
+
+
+@pytest.fixture()
+def client() -> TestClient:
+    with TestClient(_app()) as c:
+        yield c
+
+
+def _rl(response) -> dict:
+    return {k: v for k, v in response.headers.items() if k.lower() in _RL_HEADERS}
+
+
+# --------------------------------------------------------------------------
+# The leak itself
+# --------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    "headers",
+    [
+        {},
+        {"x-api-key": "totally-invalid"},
+        {"x-api-key": ""},
+        {"authorization": "Bearer not-a-real-token"},
+        {"x-api-key": "ak_live_" + "f" * 64},  # well-FORMED but unknown key
+    ],
+    ids=["anonymous", "junk-key", "empty-key", "bearer-junk", "wellformed-unknown"],
+)
+def test_unauthenticated_callers_get_no_rate_limit_headers(headers) -> None:
+    """The exact prod repro, across every unauthenticated caller shape."""
+    with TestClient(_app()) as c:
+        res = c.get("/agent/public/thing", headers=headers)
+
+    assert res.status_code == 200
+    assert _rl(res) == {}, f"leaked {_rl(res)} to an unauthenticated caller"
+    # The threshold must not appear ANYWHERE — not in a header we forgot to
+    # enumerate, not in the body.
+    assert str(_GLOBAL_RPM) not in str(dict(res.headers))
+    assert str(_GLOBAL_RPM) not in res.text
+
+
+def test_unknown_route_under_agent_does_not_leak_either() -> None:
+    """The literal prod command: junk key + nonexistent /agent/ path -> 404."""
+    with TestClient(_app()) as c:
+        res = c.get("/agent/definitely-not-a-route", headers={"x-api-key": "nope"})
+
+    assert res.status_code == 404
+    assert _rl(res) == {}
+    assert str(_GLOBAL_RPM) not in str(dict(res.headers))
+
+
+# --------------------------------------------------------------------------
+# What legitimate clients still get — and that it is the RIGHT number
+# --------------------------------------------------------------------------
+
+
+def test_authenticated_caller_gets_its_OWN_limit_not_the_global_one() -> None:
+    """The distinguishing test: per-agent limit published, global one absent.
+
+    If this asserted only "a limit header exists", restoring the old global
+    stamp would pass. It must assert WHICH number.
+    """
+    with TestClient(_app()) as c:
+        res = c.get("/agent/private/thing", headers={"x-api-key": "some-key"})
+
+    assert res.status_code == 200
+    assert res.headers["x-ratelimit-limit"] == str(_AGENT_LIMIT)
+    assert res.headers["x-ratelimit-remaining"] == str(_AGENT_LIMIT - _AGENT_USED)
+    assert "x-ratelimit-reset" in res.headers
+    # The global threshold appears nowhere.
+    assert str(_GLOBAL_RPM) not in str(dict(res.headers))
+    assert res.headers["x-ratelimit-limit"] != str(_GLOBAL_RPM)
+
+
+def test_authenticated_caller_with_no_api_key_header_still_gets_its_limit() -> None:
+    """Checkout-token callers send no x-api-key and used to fall out early.
+
+    The keyless branch returns before any bucket accounting, so if stamping only
+    happened on the accounted path these callers would silently lose their
+    pacing headers.
+    """
+    with TestClient(_app()) as c:
+        res = c.get("/agent/private/thing")
+
+    assert res.headers.get("x-ratelimit-limit") == str(_AGENT_LIMIT)
+
+
+def test_trusted_internal_key_path_also_stamps_the_agent_limit(monkeypatch) -> None:
+    """The trusted-key branch is a third early return; it must behave the same."""
+    monkeypatch.setenv("RATE_LIMIT_TRUSTED_API_KEYS", "trusted-abc")
+    # global_rpm=1 proves the trusted branch is the one being taken: an
+    # untrusted key would be 429 by the second call. Without this the test
+    # passes whether or not the trusted early-return stamps, because the
+    # accounted path stamps too — a vacuous assertion.
+    with TestClient(_app(global_rpm=1)) as c:
+        results = [
+            c.get("/agent/private/thing", headers={"x-api-key": "trusted-abc"})
+            for _ in range(3)
+        ]
+
+    assert [r.status_code for r in results] == [200, 200, 200], "bypass not taken"
+    for res in results:
+        assert res.headers.get("x-ratelimit-limit") == str(_AGENT_LIMIT)
+    assert "1" != res.headers.get("x-ratelimit-limit")
+
+
+# --------------------------------------------------------------------------
+# The 429 the middleware itself raises, pre-auth
+# --------------------------------------------------------------------------
+
+
+def test_preauth_429_gives_backoff_signal_without_the_threshold() -> None:
+    """A caller who trips the limit may back off, but is not told the number.
+
+    Retry-After and Reset are what a client needs; Limit is not. The old body
+    said "Rate limit of 120 requests per minute exceeded" in plain text, which
+    leaked the threshold even with the header removed — so this asserts the body
+    too, not just headers.
+    """
+    with TestClient(_app(global_rpm=2)) as c:
+        headers = {"x-api-key": "burner-key"}
+        codes = [c.get("/agent/public/thing", headers=headers).status_code for _ in range(4)]
+        assert 429 in codes, f"never tripped the limit: {codes}"
+        res = next(
+            r
+            for r in (c.get("/agent/public/thing", headers=headers) for _ in range(3))
+            if r.status_code == 429
+        )
+
+    assert res.status_code == 429
+    assert "retry-after" in {k.lower() for k in res.headers}
+    assert "x-ratelimit-limit" not in {k.lower() for k in res.headers}
+    body = res.json()
+    assert body["error"] == "rate_limit_exceeded"
+    # The threshold (2) is a tiny number, so check the phrasing that carried it
+    # rather than the digit, which could appear incidentally in a timestamp.
+    assert "requests per minute" not in body["message"]
+    assert "requests per minute" not in res.text
+
+
+# --------------------------------------------------------------------------
+# Scope
+# --------------------------------------------------------------------------
+
+
+def test_non_agent_paths_are_untouched() -> None:
+    with TestClient(_app()) as c:
+        res = c.get("/not-agent/thing", headers={"x-api-key": "whatever"})
+
+    assert res.status_code == 200
+    assert _rl(res) == {}
+
+
+def test_agent_auth_429_headers_are_not_clobbered_by_the_middleware() -> None:
+    """agent_auth raises 429 with the agent's OWN limit; that must survive.
+
+    The old code overwrote X-RateLimit-Limit after call_next, replacing the
+    accurate per-agent value with the global one on exactly the response where a
+    client most needs it correct.
+    """
+    app = FastAPI()
+    app.add_middleware(RateLimitMiddleware, requests_per_minute=_GLOBAL_RPM)
+
+    from fastapi import HTTPException
+
+    @app.get("/agent/quota/thing")
+    async def quota_thing():
+        raise HTTPException(
+            status_code=429,
+            detail="Rate limit exceeded: 41/41 requests per minute",
+            headers={"X-RateLimit-Limit": "41", "X-RateLimit-Remaining": "0"},
+        )
+
+    with TestClient(app) as c:
+        res = c.get("/agent/quota/thing", headers={"x-api-key": "some-key"})
+
+    assert res.status_code == 429
+    assert res.headers["x-ratelimit-limit"] == "41", "middleware clobbered it"
+    assert str(_GLOBAL_RPM) not in str(dict(res.headers))
+
+# --------------------------------------------------------------------------
+# The REDIS 429 branch — this is the PRODUCTION path (REDIS_URL is set on the
+# web service), and mutation testing caught that the in-memory test above does
+# not cover it: reverting the redis branch alone left the suite green.
+# --------------------------------------------------------------------------
+
+
+class _FakeRedis:
+    """Minimal async stand-in: counts incr calls per key."""
+
+    def __init__(self) -> None:
+        self.counts: dict = {}
+
+    async def incr(self, key: str) -> int:
+        self.counts[key] = self.counts.get(key, 0) + 1
+        return self.counts[key]
+
+    async def expire(self, key: str, ttl: int) -> bool:
+        return True
+
+
+def test_redis_preauth_429_also_withholds_the_threshold(monkeypatch) -> None:
+    """Same guarantee as the in-memory branch, on the branch prod actually runs."""
+    fake = _FakeRedis()
+    monkeypatch.setattr(
+        "middleware.rate_limiter.get_redis_client", lambda: fake
+    )
+
+    with TestClient(_app(global_rpm=2)) as c:
+        headers = {"x-api-key": "burner-redis"}
+        results = [c.get("/agent/public/thing", headers=headers) for _ in range(4)]
+
+    # Prove we really took the redis branch, not the in-memory fallback.
+    assert fake.counts, "redis branch was never exercised"
+    tripped = [r for r in results if r.status_code == 429]
+    assert tripped, f"never tripped: {[r.status_code for r in results]}"
+    res = tripped[0]
+    assert "x-ratelimit-limit" not in {k.lower() for k in res.headers}
+    assert "retry-after" in {k.lower() for k in res.headers}
+    assert "requests per minute" not in res.text
+    assert str(2) not in res.json()["message"]
+
+
+def test_redis_success_path_publishes_only_the_agent_limit(monkeypatch) -> None:
+    fake = _FakeRedis()
+    monkeypatch.setattr(
+        "middleware.rate_limiter.get_redis_client", lambda: fake
+    )
+
+    with TestClient(_app()) as c:
+        anon = c.get("/agent/public/thing", headers={"x-api-key": "k1"})
+        auth = c.get("/agent/private/thing", headers={"x-api-key": "k2"})
+
+    assert fake.counts, "redis branch was never exercised"
+    assert _rl(anon) == {}
+    assert auth.headers["x-ratelimit-limit"] == str(_AGENT_LIMIT)
+    assert str(_GLOBAL_RPM) not in str(dict(auth.headers))
+
+
+# --------------------------------------------------------------------------
+# The OTHER half of the fix: agent_auth must actually record the per-agent
+# limit. Mutation testing caught that every test above sets request.state by
+# hand, so deleting the recording in agent_auth left the suite green while
+# authenticated clients silently lost their headers.
+# --------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_agent_auth_records_the_enforced_limit_on_request_state(
+    monkeypatch,
+) -> None:
+    """Drive the real dependency and assert it writes what the middleware reads.
+
+    The attribute names are a CONTRACT between routes/agent_auth.py and
+    middleware/rate_limiter.py with nothing else binding them together, so a
+    rename on either side is a silent regression. This is the test that notices.
+    """
+    import routes.agent_auth as aa
+
+    key = "ak_live_" + "a" * 64
+    agent = {
+        "agent_id": "agent_x",
+        "agent_name": "Agent X",
+        "is_active": True,
+        "rate_limit": _AGENT_LIMIT,
+        "daily_quota": 10_000,
+        "allowed_merchants": None,
+    }
+
+    async def _get_agent_by_key(k, metrics_out=None):
+        assert k == key
+        return agent
+
+    async def _check_rate_limit(agent_id, rate_limit=None):
+        # The per-agent limit is what this returns; assert the dependency passes
+        # the agent's own value through rather than a global default.
+        assert rate_limit == _AGENT_LIMIT
+        return True, _AGENT_USED, _AGENT_LIMIT
+
+    async def _check_daily_quota(agent_id, daily_quota=None):
+        return True, 0, 10_000
+
+    async def _update_agent_stats(*a, **kw):
+        return None
+
+    monkeypatch.setattr(aa, "get_agent_by_key", _get_agent_by_key)
+    monkeypatch.setattr(aa, "check_rate_limit", _check_rate_limit)
+    monkeypatch.setattr(aa, "check_daily_quota", _check_daily_quota)
+    monkeypatch.setattr(aa, "update_agent_stats", _update_agent_stats)
+
+    scope = {
+        "type": "http",
+        "method": "GET",
+        "path": "/agent/private/thing",
+        "headers": [],
+        "query_string": b"",
+        "state": {},
+    }
+    request = Request(scope)
+
+    context = await aa.get_agent_context(
+        request, api_key=key, bearer=None, checkout_token=None
+    )
+
+    assert context.agent_id == "agent_x"
+    assert getattr(request.state, "agent_rate_limit_limit", None) == _AGENT_LIMIT
+    assert getattr(request.state, "agent_rate_limit_used", None) == _AGENT_USED
