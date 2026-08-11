@@ -79,9 +79,13 @@ jobs:
           # Validate before use: these become CLI arguments, so anything that is
           # not a plain integer / known phase token is refused rather than passed
           # along.
-          case "$FLIP_PHASES" in
-            *[!0-9,]*) echo "::error::phases must be digits and commas (got: $FLIP_PHASES)"; exit 1 ;;
-          esac
+          [ -n "$FLIP_PHASES" ] || { echo "::error::phases must not be empty"; exit 1; }
+          for tok in $(printf '%s' "$FLIP_PHASES" | tr ',' ' '); do
+            case "$tok" in
+              seeds|barekey|catalog|edges|repair-listings) ;;
+              *) echo "::error::unknown phase token: $tok"; exit 1 ;;
+            esac
+          done
           case "$FLIP_BATCH_SIZE" in
             ''|*[!0-9]*) echo "::error::batch_size must be an integer"; exit 1 ;;
           esac
