@@ -330,6 +330,25 @@ def _collect_source_pdp_offer_image_repair() -> List[Tuple[str, str]]:
     ]
 
 
+def _collect_backfill_agent_pdp_view() -> List[Tuple[str, str]]:
+    """The enriched-cohort join is the statement that matters here. It maps
+    product_enrichment.platform_product_id -> catalog_products.source_product_id;
+    naming the wrong column is what killed the on-write publish bridge, and here
+    it would not raise — an unplannable or empty cohort query reads as "nothing
+    to backfill", which is indistinguishable from success."""
+    import scripts.backfill_agent_pdp_view as module
+
+    origin = "backfill_agent_pdp_view"
+    shapes = [
+        ("enriched", 0, 0), ("enriched", 10, 5), ("all", 0, 0), ("all", 10, 5),
+    ]
+    return [
+        (f"{origin}.build_content_key_query(scope={scope}, limit={limit}, offset={offset})",
+         module.build_content_key_query(scope=scope, limit=limit, offset=offset)[0])
+        for scope, limit, offset in shapes
+    ]
+
+
 # module path -> collector. The completeness guard below reads this same list,
 # so a script cannot be registered here and left half-covered in silence.
 _COVERED_SCRIPTS: Dict[str, Callable[[], List[Tuple[str, str]]]] = {
@@ -337,6 +356,7 @@ _COVERED_SCRIPTS: Dict[str, Callable[[], List[Tuple[str, str]]]] = {
     "scripts/run_seed_content_audit.py": _collect_seed_content_audit,
     "scripts/source_pdp_content_repair.py": _collect_source_pdp_content_repair,
     "scripts/source_pdp_offer_image_repair.py": _collect_source_pdp_offer_image_repair,
+    "scripts/backfill_agent_pdp_view.py": _collect_backfill_agent_pdp_view,
 }
 
 # What each collector yields TODAY, not a slack lower bound. Guards the failure
@@ -350,6 +370,7 @@ _MIN_STATEMENTS = {
     "scripts/run_seed_content_audit.py": 4,
     "scripts/source_pdp_content_repair.py": 3,
     "scripts/source_pdp_offer_image_repair.py": 6,
+    "scripts/backfill_agent_pdp_view.py": 4,
 }
 
 

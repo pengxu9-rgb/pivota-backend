@@ -52,7 +52,7 @@ import json
 import logging
 import os
 import sys
-from typing import Any, Dict, List
+from typing import Any, Dict, List, Tuple
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
@@ -95,12 +95,14 @@ _ENRICHED_KEYS_SQL = """
 """
 
 
-async def _fetch_content_keys(*, scope: str, limit: int, offset: int) -> List[str]:
-    """Stable content_key window. Paged by content_key ASC so each chunk is a
-    disjoint slice — no double-writes, safe to resume on partial failures.
-    """
-    base = _ENRICHED_KEYS_SQL if scope == "enriched" else _ALL_KEYS_SQL
-    sql = base
+def build_content_key_query(
+    *, scope: str, limit: int, offset: int
+) -> Tuple[str, Dict[str, Any]]:
+    """(sql, params) for the content_key window. A pure builder so the driven
+    PREPARE gate can plan every shape it emits against real Postgres — the
+    assembled string lives in a function local, which the static sweep in
+    tests/test_repo_sql_prepare_postgres.py cannot follow."""
+    sql = _ENRICHED_KEYS_SQL if scope == "enriched" else _ALL_KEYS_SQL
     params: Dict[str, Any] = {}
     if limit > 0:
         sql += "\n        LIMIT :limit"
@@ -108,6 +110,14 @@ async def _fetch_content_keys(*, scope: str, limit: int, offset: int) -> List[st
     if offset > 0:
         sql += "\n        OFFSET :offset"
         params["offset"] = int(offset)
+    return sql, params
+
+
+async def _fetch_content_keys(*, scope: str, limit: int, offset: int) -> List[str]:
+    """Stable content_key window. Paged by content_key ASC so each chunk is a
+    disjoint slice — no double-writes, safe to resume on partial failures.
+    """
+    sql, params = build_content_key_query(scope=scope, limit=limit, offset=offset)
     rows = await database.fetch_all(sql, params)
     return [r["content_key"] for r in rows or []]
 
