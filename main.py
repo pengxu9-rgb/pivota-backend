@@ -350,10 +350,7 @@ from routes.agent_internal_products import router as agent_internal_products_rou
 from routes.subject_resolve import router as subject_resolve_router
 from routes.accounts_orders_api import router as accounts_orders_router
 from routes.buyer_api import router as buyer_router
-from routes.merchant_promotions_api import router as merchant_promotions_router
 from routes.merchant_risk_api import router as merchant_risk_router
-from routes.agent_promotions import router as agent_promotions_router
-from routes.shopify_promotions_sync_api import router as shopify_promotions_sync_router
 from routes.shopify_products_sync_api import router as shopify_products_sync_router
 from routes.platform_products_sync_api import router as platform_products_sync_router
 from routes.outbound_links import router as outbound_links_router
@@ -389,7 +386,6 @@ from config.settings import settings
 from services.agent_governance import agent_governance, governance_runtime_contract
 
 from openapi_config import get_custom_openapi_schema
-from services.promotions_service import ensure_promotions_table
 from services.agent_webhook_service import (
     ensure_agent_webhook_tables,
     start_agent_webhook_retry_worker,
@@ -632,14 +628,11 @@ async def startup_event():
         logger.warning(f"⚠️ Startup DB connect skipped/failed (continuing degraded): {exc}")
         return
     try:
-        # Create all tables defined in db.database (transactions, promotions, etc.)
+        # Create all tables defined in db.database (transactions, etc.)
         metadata.create_all(engine)
     except Exception as exc:
         logger = logging.getLogger(__name__)
         logger.warning(f"⚠️ Failed to run metadata.create_all: {exc}")
-
-    # Run any additional promotions-specific initialization (kept lightweight for now)
-    await ensure_promotions_table()
 
     # Ensure quote-first table exists (best-effort; does not raise).
     try:
@@ -1107,10 +1100,7 @@ app.include_router(init_agent_key_router)  # Initialize test agent key
 app.include_router(merchant_products_router)  # Merchant product optimization APIs
 app.include_router(merchant_citations_router)  # Merchant citation observations (get-cited proof loop, B⑤)
 app.include_router(merchant_pdp_router)  # Merchant PDP status and contribution APIs
-app.include_router(merchant_promotions_router)  # Merchant/agent promotions API (DB-backed)
-app.include_router(agent_promotions_router)  # Agent-facing promotions list (/agent/v1/promotions/*)
 app.include_router(merchant_risk_router)  # Internal risk APIs (disputes/returns)
-app.include_router(shopify_promotions_sync_router)  # Sync Shopify promotions into DB-backed promotions
 app.include_router(shopify_products_sync_router)  # Sync Shopify products into products_cache
 app.include_router(platform_products_sync_router)  # Sync non-Shopify platform products into products_cache/catalog
 app.include_router(product_enrichment_router)  # Internal product enrichment trigger

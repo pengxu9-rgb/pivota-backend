@@ -2739,7 +2739,6 @@ async def preview_pivot_quote(request: PivotQuoteRequest) -> PivotQuoteResponse:
             price_confidence=Decimal("1.0"),
         ),
         incentives=flattened_incentives,
-        store_discount_evidence=quote_result.get("store_discount_evidence") or {},
         payment_offer_evidence=payment_offer_evidence,
         savings_presentation=quote_result.get("savings_presentation") or {},
         quote_payload=quote_result,

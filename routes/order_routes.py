@@ -50,7 +50,6 @@ from services.merchant_psp_config_service import (
 from services.merchant_capability_gate import (
     capability_gate_permits_order_create,
 )
-from services.promotions_service import list_promotions, PromotionStatus
 from services.commerce_attribution_service import (
     PVT_CLICK_ID,
     PVT_PRODUCT_ID,
@@ -1714,116 +1713,6 @@ async def _get_platform_checkout_fallback_url_best_effort(
             return {"url": url, "platform": "bigcommerce", "method": "cart_buy_now"}
 
     return None
-
-
-async def compute_order_discount_from_promotions(
-    merchant_id: str,
-    items: List[OrderItem],
-    channel: str = "creator_agents",
-) -> Tuple[Decimal, List[Dict[str, Any]]]:
-    """
-    根据当前订单和促销配置计算订单级折扣金额。
-
-    当前 v0 仅支持：
-    - type = MULTI_BUY_DISCOUNT
-    - scope.global = true 或 scope.productIds 精确匹配 product_id
-    - channel 包含 creator_agents
-    """
-    discount_total = Decimal("0")
-    applied: List[Dict[str, Any]] = []
-
-    try:
-        promotions, _ = await list_promotions(
-            merchant_id=merchant_id,
-            status=PromotionStatus.ACTIVE,
-            channel=channel,
-        )
-    except Exception as e:
-        logger.warning(
-            f"[OrderRoutes] Failed to load promotions for merchant {merchant_id}: {e}"
-        )
-        return discount_total, applied
-
-    if not promotions:
-        return discount_total, applied
-
-    for promo in promotions:
-        try:
-            if promo.type != "MULTI_BUY_DISCOUNT":
-                continue
-
-            scope = promo.scope or {}
-            cfg = promo.config or {}
-
-            threshold = int(
-                cfg.get("thresholdQuantity")
-                or cfg.get("threshold_quantity")
-                or 0
-            )
-            discount_percent_raw = (
-                cfg.get("discountPercent") or cfg.get("discount_percent") or 0
-            )
-            discount_percent = Decimal(str(discount_percent_raw))
-
-            if threshold <= 0 or discount_percent <= 0:
-                continue
-
-            # 收集满足 scope 的每一件商品的单价（按件展开）
-            unit_prices: List[Decimal] = []
-            for item in items:
-                eligible = False
-                product_id = item.product_id
-                if scope.get("global"):
-                    eligible = True
-                else:
-                    product_ids = scope.get("productIds") or scope.get("product_ids") or []
-                    if product_id in product_ids:
-                        eligible = True
-
-                if not eligible:
-                    continue
-
-                # 将每件商品按数量展开成单价列表
-                for _ in range(item.quantity):
-                    unit_prices.append(Decimal(item.unit_price))
-
-            total_qty = len(unit_prices)
-            if total_qty < threshold:
-                continue
-
-            # 优先对价格较高的商品进行折扣
-            unit_prices.sort(reverse=True)
-            discountable_qty = (total_qty // threshold) * threshold
-            discount_base = sum(unit_prices[:discountable_qty])
-
-            if discount_base <= 0:
-                continue
-
-            promo_discount = (
-                discount_base * discount_percent / Decimal("100")
-            ).quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
-
-            if promo_discount <= 0:
-                continue
-
-            discount_total += promo_discount
-            applied.append(
-                {
-                    "id": promo.id,
-                    "label": promo.humanReadableRule,
-                    "type": promo.type,
-                    "thresholdQuantity": threshold,
-                    "discountPercent": float(discount_percent),
-                    "discountAmount": float(promo_discount),
-                }
-            )
-        except Exception as promo_err:
-            logger.warning(
-                f"[OrderRoutes] Failed to apply promotion {getattr(promo, 'id', None)}: {promo_err}"
-            )
-            continue
-
-    return discount_total, applied
 
 
 # ============================================================================
@@ -3794,7 +3683,6 @@ async def create_new_order(
                     "pricing": pricing,
                     "promotion_lines": snap.get("promotion_lines") or [],
                     "discount_evidence": snap.get("discount_evidence") or {},
-                    "store_discount_evidence": snap.get("store_discount_evidence") or {},
                     "payment_offer_evidence": snap.get("payment_offer_evidence") or {},
                     "payment_pricing": snap.get("payment_pricing") or {},
                     "savings_presentation": snap.get("savings_presentation") or {},
@@ -3855,34 +3743,10 @@ async def create_new_order(
         else:
             subtotal = sum(item.subtotal for item in order_request.items)
 
-            # Legacy promotions (multi-buy) for non-quote orders.
+            # Promotions lane deleted (ADR-022): non-quote orders carry no
+            # infra-side discount; quote-first orders get discounts from the
+            # quote snapshot (Shopify pricing truth).
             discount_total = Decimal("0")
-            applied_promos: List[Dict[str, Any]] = []
-            try:
-                _t = time.perf_counter()
-                discount_total, applied_promos = await compute_order_discount_from_promotions(
-                    merchant_id=order_request.merchant_id,
-                    items=order_request.items,
-                    channel="creator_agents",
-                )
-                logger.info(
-                    "[OrderRoutes][PERF] step=compute_order_discount_from_promotions duration_ms=%d order=%s",
-                    int((time.perf_counter() - _t) * 1000),
-                    order_id,
-                )
-            except Exception as promo_err:
-                logger.warning(
-                    f"[OrderRoutes] Failed to compute promotions for order: {promo_err}"
-                )
-                discount_total = Decimal("0")
-                applied_promos = []
-
-            if discount_total > 0:
-                logger.info(
-                    f"[OrderRoutes] Applied promotions for merchant {order_request.merchant_id}: "
-                    f"discount_total={discount_total}"
-                )
-                subtotal = max(Decimal("0"), subtotal - discount_total)
 
             shipping_fee = Decimal("0")
             tax = Decimal("0")
@@ -3983,14 +3847,6 @@ async def create_new_order(
             payment_offer_hash = stable_payment_offer_hash(pricing_quote_meta.get("payment_offer_evidence"))
             if payment_offer_hash:
                 order_metadata["payment_offer_evidence_hash"] = payment_offer_hash
-        elif discount_total > 0:
-            promo_meta = {
-                "discount_total": float(discount_total),
-                "applied_promotions": applied_promos,
-            }
-            existing_promos = order_metadata.get("promotions") or {}
-            # 促销信息统一挂在 metadata.promotions 下
-            order_metadata["promotions"] = {**existing_promos, **promo_meta}
 
         order_taxonomy = build_traffic_taxonomy(
             order_metadata,
@@ -4080,9 +3936,7 @@ async def create_new_order(
                 store_platform=store_platform,
             )
 
-        order_metadata["amounts_source"] = "quote_snapshot" if pricing_quote_meta else (
-            "legacy_promotions" if discount_total > 0 else "legacy_incomplete"
-        )
+        order_metadata["amounts_source"] = "quote_snapshot" if pricing_quote_meta else "legacy_incomplete"
         persisted_order_items = _build_persisted_order_items(order_request.items, pricing_quote_meta)
         enforce_live_readiness = _resolve_order_live_readiness_requirement(order_metadata, merchant_id=order_request.merchant_id)
         _t = time.perf_counter()

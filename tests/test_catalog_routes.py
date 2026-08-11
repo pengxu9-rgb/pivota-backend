@@ -71,7 +71,6 @@ def test_reconcile_incentives_route(monkeypatch) -> None:
         return {
             "merchant_id": kwargs["merchant_id"],
             "source_system": kwargs["source_system"],
-            "promotions_synced": 2,
             "payment_incentives_synced": 1,
             "offer_links_synced": 7,
             "reconciled_at": datetime.now(timezone.utc),
@@ -99,5 +98,4 @@ def test_reconcile_incentives_route(monkeypatch) -> None:
     payload = response.json()
     assert payload["merchant_id"] == "merch_1"
     assert payload["source_system"] == "merchant_config"
-    assert payload["promotions_synced"] == 2
     assert payload["payment_incentives_synced"] == 1

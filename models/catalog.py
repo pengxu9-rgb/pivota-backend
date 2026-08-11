@@ -79,7 +79,6 @@ class IncentivesReconcileRequest(BaseModel):
 class IncentivesReconcileResponse(BaseModel):
     merchant_id: str
     source_system: str
-    promotions_synced: int
     payment_incentives_synced: int
     offer_links_synced: int
     reconciled_at: datetime
@@ -378,7 +377,6 @@ class PivotQuoteResponse(BaseModel):
     merchant_id: str
     pricing: PivotPricing
     incentives: List[IncentiveNode] = Field(default_factory=list)
-    store_discount_evidence: Dict[str, Any] = Field(default_factory=dict)
     payment_offer_evidence: Dict[str, Any] = Field(default_factory=dict)
     savings_presentation: Dict[str, Any] = Field(default_factory=dict)
     quote_payload: Dict[str, Any] = Field(default_factory=dict)

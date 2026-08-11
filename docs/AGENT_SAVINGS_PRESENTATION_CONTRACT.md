@@ -14,7 +14,7 @@ The contract is intentionally presentation-first. It tells a caller what can be 
 
 - `pricing.total` is the amount used for the pay button and PSP charge.
 - Store-platform quote evidence is the authority for applied store discounts. For Shopify, that evidence is Storefront quote allocations and selected delivery evidence.
-- Synced store-native discount metadata may be displayed before quote, but it is not final pricing. The current v1 metadata resolver maps Shopify discount nodes; other store platforms must add their own metadata sync before they can populate `store_discount_evidence`.
+- `store_discount_evidence` was RETIRED with the promotions lane (ADR-022): no producer populates it any more, and the key is absent from quote and card payloads. Consumers must not require it. `confidence.store_discount_metadata` is consequently always `"not_applicable"`.
 - Payment card, wallet, issuer, PSP, and BNPL benefits are display-only in v1.
 - Payment benefits must not reduce `pricing.total`, PSP amount, Shopify order total, Shopify discount codes, or Shopify discount allocations in v1.
 - If a payment benefit and a store-native discount both exist, display them as separate sections.
@@ -27,7 +27,7 @@ Surfaces may expose these additive fields:
 | --- | --- | --- |
 | `promotion_lines` | Applied store discount lines backed by quote evidence | Yes |
 | `discount_evidence` | Store-platform code applicability, allocations, pricing confidence, shipping evidence | Yes, only when allocations or selected delivery evidence support it |
-| `store_discount_evidence` | Read-only synced store-native discount metadata for pre-quote display. Current v1 backend source: Shopify discount nodes. | No |
+| `store_discount_evidence` | RETIRED (ADR-022) — never emitted; listed only so integrators know the key is permanently absent. | No |
 | `payment_offer_evidence` | Card/wallet/issuer/PSP/BNPL display offers and eligibility evidence | No in v1 |
 | `payment_pricing` | Display-only estimated payment benefit totals | No in v1 |
 | `savings_presentation` | Normalized grouped presentation contract for agents and UI | Depends on row policy |

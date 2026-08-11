@@ -23,10 +23,6 @@ from services.payment_offer_evidence_service import (
     enrich_product_cards_with_payment_offers,
     enrich_product_detail_with_payment_offers,
 )
-from services.store_discount_evidence_service import (
-    enrich_product_cards_with_store_discounts,
-    enrich_product_detail_with_store_discounts,
-)
 from db.agent_ranking_log import log_ranking_batch
 from db.agent_product_events import log_product_events
 from fastapi import APIRouter, Depends, HTTPException, Query
@@ -706,10 +702,6 @@ async def get_merchant_products(
             payment_context=payment_context,
             market=market,
         )
-        agent_products = await enrich_product_cards_with_store_discounts(
-            agent_products,
-            merchant_id=merchant_id,
-        )
 
         # Log request for analytics
         background_tasks.add_task(
@@ -839,10 +831,6 @@ async def get_product_details(
                         installment_provider=installment_provider,
                     ),
                     market=market,
-                )
-                await enrich_product_detail_with_store_discounts(
-                    product_payload,
-                    merchant_id=merchant_id,
                 )
             background_tasks.add_task(
                 log_agent_request,
@@ -974,10 +962,6 @@ async def get_product_details(
                     installment_provider=installment_provider,
                 ),
                 market=market,
-            )
-            await enrich_product_detail_with_store_discounts(
-                resp["product"],
-                merchant_id=merchant_id,
             )
             return resp
 
@@ -1153,10 +1137,6 @@ async def get_product_details(
                 installment_provider=installment_provider,
             ),
             market=market,
-        )
-        await enrich_product_detail_with_store_discounts(
-            resp["product"],
-            merchant_id=merchant_id,
         )
         return resp
             

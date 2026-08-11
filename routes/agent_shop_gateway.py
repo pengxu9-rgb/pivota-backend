@@ -106,10 +106,6 @@ from services.payment_offer_evidence_service import (
     enrich_product_cards_with_payment_offers,
     enrich_product_detail_with_payment_offers,
 )
-from services.store_discount_evidence_service import (
-    enrich_product_cards_with_store_discounts,
-    enrich_product_detail_with_store_discounts,
-)
 
 def _resolve_default_agent_api_base() -> str:
     configured = str(os.getenv("AGENT_API_BASE", "") or "").strip().rstrip("/")
@@ -645,10 +641,6 @@ async def _enrich_product_cards_with_savings_evidence(
             payment_context=payment_context,
             market=market,
         )
-        product_payloads = await enrich_product_cards_with_store_discounts(
-            product_payloads,
-            merchant_id=merchant_id,
-        )
         return product_payloads
     except Exception as exc:
         logger.warning(
@@ -670,10 +662,6 @@ async def _enrich_product_cards_with_savings_evidence(
                 merchant_id=merchant_id,
                 payment_context=payment_context,
                 market=market,
-            )
-            single = await enrich_product_cards_with_store_discounts(
-                single,
-                merchant_id=merchant_id,
             )
             isolated.append(single[0] if single else product)
         except Exception as exc:
@@ -12382,10 +12370,6 @@ async def _handle_get_product_detail(
             merchant_id=merchant_id,
             payment_context=None,
             market=None,
-        )
-        await enrich_product_detail_with_store_discounts(
-            base,
-            merchant_id=merchant_id,
         )
     except Exception:
         pass

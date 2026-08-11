@@ -317,24 +317,6 @@ jobs:
             exit 1
           fi
 
-      - name: Run Shopify discount preflight
-        shell: bash
-        run: |
-          output_dir="artifacts/shopify-discount-validation/${GITHUB_RUN_ID}/preflight"
-          cmd=(
-            python3 scripts/preflight_shopify_discounts.py
-            --output-dir "$output_dir"
-          )
-          if [[ "${{ inputs.allow_live_no_order }}" == "true" ]]; then
-            cmd+=(--allow-live-readonly)
-          else
-            cmd+=(--allow-dev-store)
-          fi
-          if [[ "${{ inputs.allow_remote_dev_url }}" == "true" || "${{ inputs.allow_live_no_order }}" == "true" ]]; then
-            cmd+=(--allow-remote)
-          fi
-          "${cmd[@]}"
-
       - name: Run Shopify discount validation
         shell: bash
         run: |

@@ -93,7 +93,6 @@ from services.payment_offer_evidence_service import (
 )
 from services.refund_observability import build_order_refund_tracking_payload
 from services.order_confirmation_email_service import order_confirmation_email_enabled
-from services.store_discount_evidence_service import enrich_product_cards_with_store_discounts
 from db.agent_product_events import log_product_events
 from config.feature_flags import ENABLE_QUOTE_FIRST_ORDER_CREATE
 from db.products import get_cached_products
@@ -6419,10 +6418,6 @@ async def agent_search_products(
             payment_context=payment_context,
             market=market,
         )
-        paginated_products = await enrich_product_cards_with_store_discounts(
-            paginated_products,
-            merchant_id=merchant_id,
-        )
         external_count = sum(1 for p in paginated_products if _is_external_seed_product(p))
         if external_count > 0 and not external_seed_inclusion_reason:
             external_seed_inclusion_reason = "ranked_pool_contains_external"
@@ -9030,7 +9025,6 @@ async def agent_create_order(
                 response["pricing"] = pricing_quote.get("pricing")
                 response["promotion_lines"] = pricing_quote.get("promotion_lines") or []
                 response["discount_evidence"] = pricing_quote.get("discount_evidence") or {}
-                response["store_discount_evidence"] = pricing_quote.get("store_discount_evidence") or {}
                 response["payment_offer_evidence"] = pricing_quote.get("payment_offer_evidence") or {}
                 response["payment_pricing"] = pricing_quote.get("payment_pricing") or {}
                 response["savings_presentation"] = pricing_quote.get("savings_presentation") or {}
