@@ -35,13 +35,11 @@ from scripts.source_pdp_offer_image_repair import (  # noqa: E402
     token_set,
 )
 from services.agent_pdp_view_assembler import (  # noqa: E402
-    UPSERT_SQL as AGENT_PDP_VIEW_UPSERT_SQL,
-    assemble_row,
+    refresh_agent_pdp_view_for_content_key,
     fetch_external_seed_for_keys,
     fetch_offers_for_keys,
     fetch_products_for_key,
     fetch_skus_for_keys,
-    row_to_upsert_params,
 )
 from services.external_offers_service import _extract_from_html, _fetch_html  # noqa: E402
 from services.product_quality_service import full_quality_eval  # noqa: E402
@@ -415,25 +413,17 @@ async def probe_one(
 
 
 async def _refresh_agent_pdp_view(content_key: str) -> bool:
-    products = await fetch_products_for_key(content_key, db=database)
-    product_keys = [p.get("product_key") for p in products if p.get("product_key")]
-    if not products or not product_keys:
-        return False
-    skus = await fetch_skus_for_keys(product_keys, db=database)
-    offers = await fetch_offers_for_keys(product_keys, db=database)
-    external_seed = await fetch_external_seed_for_keys(product_keys, db=database)
-    row = assemble_row(
-        content_key=content_key,
-        products=products,
-        skus=skus,
-        offers=offers,
-        external_seed=external_seed,
-        refresh_source=SOURCE_SYSTEM,
+    # 🚨 DO NOT reintroduce a local assemble_row + UPSERT here. This function
+    # used to call assemble_row with no `evidence=` / `enrichment=` /
+    # `seller_trust_by_id=`, then run the full UPSERT, which assigns every
+    # column from EXCLUDED — so `--apply` NULLed the curated description,
+    # bullet_points, usage_scenarios, evidence_profile and required_disclaimers
+    # on every row it repaired that had them. This script targets rows with
+    # missing content, a cohort that overlaps the enriched one, so it was
+    # repairing one field while destroying five others.
+    return await refresh_agent_pdp_view_for_content_key(
+        content_key, refresh_source=SOURCE_SYSTEM, db=database
     )
-    if not row:
-        return False
-    await database.execute(AGENT_PDP_VIEW_UPSERT_SQL, row_to_upsert_params(row))
-    return True
 
 
 async def _write_quality_snapshot(row: Dict[str, Any], description: str) -> Dict[str, Any]:

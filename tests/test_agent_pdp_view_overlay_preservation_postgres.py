@@ -246,3 +246,38 @@ def test_the_two_flags_are_independent(db_url) -> None:
     assert after["description"] == _CURATED, "enrichment should have been preserved"
     assert after["bullet_points"] == _BULLETS
     assert after["evidence_profile"] is None, "evidence should have been cleared"
+
+
+async def _read_proposal(database):
+    return (await database.fetch_one(
+        "SELECT refreshed_by_proposal_id FROM agent_pdp_view WHERE content_key = :ck",
+        {"ck": _CONTENT_KEY},
+    ))["refreshed_by_proposal_id"]
+
+
+def test_an_anonymous_refresh_does_not_erase_the_proposal_attribution(db_url) -> None:
+    """Only the seed writer knows a proposal id. Every other rebuild — the
+    reconciler cron, catalog_sync, the backfill, the repair scripts — passes
+    None, and a straight `= EXCLUDED.refreshed_by_proposal_id` made each of them
+    erase what the seed writer had recorded, on a field the agent PDP route
+    serves. COALESCE keeps it."""
+    async def scenario(database):
+        await _upsert(database, _row(refreshed_by_proposal_id=4242))
+        after_write = await _read_proposal(database)
+        # An unrelated refresh that knows nothing about proposals.
+        await _upsert(database, _row(refreshed_by_proposal_id=None))
+        return after_write, await _read_proposal(database)
+
+    after_write, after_anonymous = _drive(db_url, scenario)
+    assert after_write == 4242
+    assert after_anonymous == 4242, "an anonymous refresh erased the attribution"
+
+
+def test_a_newer_proposal_still_replaces_the_old_one(db_url) -> None:
+    """COALESCE must not freeze the field — a later seed commit owns it."""
+    async def scenario(database):
+        await _upsert(database, _row(refreshed_by_proposal_id=4242))
+        await _upsert(database, _row(refreshed_by_proposal_id=9999))
+        return await _read_proposal(database)
+
+    assert _drive(db_url, scenario) == 9999

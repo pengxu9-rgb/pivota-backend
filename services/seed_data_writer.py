@@ -46,15 +46,7 @@ from datetime import datetime, timezone
 from typing import Any, Dict, List, Mapping, Optional, Tuple
 
 from db.database import database
-from services.agent_pdp_view_assembler import (
-    UPSERT_SQL as AGENT_PDP_VIEW_UPSERT_SQL,
-    assemble_row as assemble_agent_pdp_view_row,
-    fetch_external_seed_by_id,
-    fetch_offers_for_keys,
-    fetch_products_for_key,
-    fetch_skus_for_keys,
-    row_to_upsert_params as agent_pdp_view_row_to_upsert_params,
-)
+from services.agent_pdp_view_assembler import refresh_agent_pdp_view_for_content_key
 from services.seed_content_audit import (
     AUDITOR_VERSION,
     audit_seed_data,
@@ -156,45 +148,33 @@ async def refresh_agent_pdp_view_for_seed(
         )
         return
 
-    products = await fetch_products_for_key(content_key, db=database)
-    if not products:
-        logger.info(
-            "agent_pdp_view refresh skipped for seed_id=%s content_key=%s: no catalog rows",
-            seed_id,
-            content_key,
-        )
-        return
-
-    product_keys = [p["product_key"] for p in products if p.get("product_key")]
-    skus = await fetch_skus_for_keys(product_keys, db=database)
-    offers = await fetch_offers_for_keys(product_keys, db=database)
-    # Use the triggering seed directly — the writer hook knows which
-    # seed's seed_data just changed. Going through
-    # fetch_external_seed_for_keys (newest active in the group) can
-    # pull description text from a stale, unrelated seed.
-    external_seed = await fetch_external_seed_by_id(seed_id, db=database)
-
-    row = assemble_agent_pdp_view_row(
-        content_key=content_key,
-        products=products,
-        skus=skus,
-        offers=offers,
-        external_seed=external_seed,
+    # 🚨 DO NOT reintroduce a local assemble_row + UPSERT here. This function
+    # used to do exactly that, with no `evidence=` / `enrichment=` /
+    # `seller_trust_by_id=`, and UPSERT_SQL assigns every column from EXCLUDED —
+    # so every seed_data commit NULLed the curated description, bullet_points,
+    # usage_scenarios, evidence_profile and required_disclaimers on any product
+    # in the cluster that had them, and dropped seller trust from its offers.
+    # This fired on ordinary proposal application, with no operator involved.
+    #
+    # `external_seed_id` preserves what was genuinely special about this call
+    # site: the writer knows which seed's seed_data just changed, and the
+    # default (newest active seed in the cluster) can pull description text
+    # from a stale, unrelated seed.
+    refreshed = await refresh_agent_pdp_view_for_content_key(
+        content_key,
         refresh_source=refresh_source,
+        db=database,
+        external_seed_id=seed_id,
+        refreshed_by_proposal_id=proposal_id,
     )
-    if row is None:
+    if not refreshed:
         logger.info(
-            "agent_pdp_view refresh skipped for seed_id=%s content_key=%s: no title",
+            "agent_pdp_view refresh skipped for seed_id=%s content_key=%s: "
+            "no catalog rows, or too thin a row to serve",
             seed_id,
             content_key,
         )
         return
-
-    row["refreshed_by_proposal_id"] = proposal_id
-    await database.execute(
-        AGENT_PDP_VIEW_UPSERT_SQL,
-        agent_pdp_view_row_to_upsert_params(row),
-    )
     if content_key:
         try:
             from services.index_pipeline_state_service import recompute_serving_eligibility

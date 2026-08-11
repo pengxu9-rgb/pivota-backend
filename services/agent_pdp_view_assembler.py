@@ -1027,7 +1027,14 @@ UPSERT_SQL = """
       rating_count = EXCLUDED.rating_count,
       refreshed_at = NOW(),
       refresh_source = EXCLUDED.refresh_source,
-      refreshed_by_proposal_id = EXCLUDED.refreshed_by_proposal_id
+      -- COALESCE, not a straight assignment. Only the seed writer knows a
+      -- proposal id; every other rebuild (the reconciler cron, catalog_sync,
+      -- the backfill, the repair scripts) passes None, and a straight EXCLUDED
+      -- assignment made each of them erase the attribution the seed writer had
+      -- recorded — on a field the agent PDP route serves. A refresh that does
+      -- not know the proposal has no business clearing it.
+      refreshed_by_proposal_id = COALESCE(
+          EXCLUDED.refreshed_by_proposal_id, agent_pdp_view.refreshed_by_proposal_id)
 """
 
 
@@ -1150,6 +1157,8 @@ async def refresh_agent_pdp_view_for_content_key(
     *,
     refresh_source: str,
     db: Any = None,
+    external_seed_id: Optional[str] = None,
+    refreshed_by_proposal_id: Optional[str] = None,
 ) -> bool:
     """Rebuild + upsert the denormalized agent_pdp_view row for a content_key.
 
@@ -1165,7 +1174,11 @@ async def refresh_agent_pdp_view_for_content_key(
     """
     read_db = db or database
     row = await build_agent_pdp_view_row(
-        content_key, refresh_source=refresh_source, db=read_db
+        content_key,
+        refresh_source=refresh_source,
+        db=read_db,
+        external_seed_id=external_seed_id,
+        refreshed_by_proposal_id=refreshed_by_proposal_id,
     )
     if row is None:
         return False
@@ -1178,6 +1191,8 @@ async def build_agent_pdp_view_row(
     *,
     refresh_source: str,
     db: Any = None,
+    external_seed_id: Optional[str] = None,
+    refreshed_by_proposal_id: Optional[str] = None,
 ) -> Optional[Dict[str, Any]]:
     """Fetch every source row for a content_key and assemble the view row.
 
@@ -1202,6 +1217,17 @@ async def build_agent_pdp_view_row(
     every column from EXCLUDED — so writing such a row DELETES the enrichment,
     evidence_profile and required_disclaimers already serving on it. That is not
     hypothetical: scripts/backfill_agent_pdp_view.py did exactly this.
+
+    `external_seed_id` selects the seed used for content fallback. Default
+    (None) takes the newest active seed attached anywhere in the cluster, which
+    is right for a backfill holding only a content_key. The seed_data WRITER
+    passes the triggering seed's id instead: it knows which seed_data just
+    changed, and "newest active in the group" can pull description text from a
+    stale, unrelated seed.
+
+    `refreshed_by_proposal_id` records which proposal caused the rebuild. Only
+    the seed writer knows one; everything else leaves it None, and the UPSERT
+    COALESCEs so a later anonymous refresh does not erase the attribution.
     """
     read_db = db or database
     products = await fetch_products_for_key(content_key, db=read_db)
@@ -1210,7 +1236,11 @@ async def build_agent_pdp_view_row(
     product_keys = [p["product_key"] for p in products if p.get("product_key")]
     skus = await fetch_skus_for_keys(product_keys, db=read_db)
     offers = await fetch_offers_for_keys(product_keys, db=read_db)
-    external_seed = await fetch_external_seed_for_keys(product_keys, db=read_db)
+    external_seed = (
+        await fetch_external_seed_by_id(external_seed_id, db=read_db)
+        if external_seed_id
+        else await fetch_external_seed_for_keys(product_keys, db=read_db)
+    )
     # Identity-confidence gate: a no-GTIN content_key is deliberately non-unique
     # (brand+title), so a cluster can collide DISTINCT products. Scope the evidence
     # fetch to members safe to attribute to the served row, so we never bake
@@ -1264,6 +1294,7 @@ async def build_agent_pdp_view_row(
     if row is not None:
         row["preserve_enrichment"] = preserve_enrichment
         row["preserve_evidence"] = preserve_evidence
+        row["refreshed_by_proposal_id"] = refreshed_by_proposal_id
     return row
 
 
