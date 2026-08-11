@@ -41,6 +41,7 @@ class _FakeDb:
         # None -> one banned row keyed on the first hunted pid (the pre-fix
         # single-row world); [] -> no banned rows; list -> exactly those.
         self.pgm_banned_rows = pgm_banned_rows
+        self.fetched = []
         self.cascade = cascade or []
         self.products = products or []
         self.listing_exists = listing_exists
@@ -49,6 +50,7 @@ class _FakeDb:
 
     async def fetch_all(self, sql, params=None):
         _assert_binds_match(sql, params)
+        self.fetched.append((" ".join(sql.split()), dict(params or {})))
         if "information_schema.columns" in sql and "pdp_identity_listing" in sql:
             return [{"column_name": c} for c in
                     ("source_listing_ref", "merchant_id", "product_id", "identity_status")]
@@ -75,6 +77,7 @@ class _FakeDb:
 
     async def fetch_one(self, sql, params=None):
         _assert_binds_match(sql, params)
+        self.fetched.append((" ".join(sql.split()), dict(params or {})))
         if "FROM pdp_identity_listing WHERE source_listing_ref" in sql:
             ref = (params or {}).get("r") or (params or {}).get("old_ref") or ""
             if str(ref).startswith("external_seed:"):
@@ -88,13 +91,16 @@ class _FakeDb:
             return {"c": 0}
         if "FROM product_group_members WHERE merchant_id = :obs" in sql:
             return {"product_group_id": "grp_obs"} if self.pgm_target_exists else None
-        if "FROM product_group_members WHERE merchant_id = :banned" in sql:
-            return {"product_group_id": "grp_banned"}
         return None
 
     async def execute(self, sql, params=None):
         _assert_binds_match(sql, params)
         self.executed.append((" ".join(sql.split()), dict(params or {})))
+        if "product_group_members" in sql and isinstance(self.pgm_banned_rows, list):
+            self.pgm_banned_rows = [
+                r for r in self.pgm_banned_rows
+                if not (str(r.get("platform")) == str((params or {}).get("platform")) and
+                        str(r.get("platform_product_id")) == str((params or {}).get("spid")))]
 
     def transaction(self):
         class _Txn:
@@ -463,7 +469,7 @@ class TestRepairListings:
                     return [{"column_name": c} for c in
                             ("source_listing_ref", "merchant_id", "product_id")]
                 return []
-        db = _RepairDb(listing_exists=True)
+        db = _RepairDb(listing_exists=True, pgm_banned_rows=[])
         bf = SellerBackfill(database=db, si_mod=None, execute=True, batch_size=25)
         report = BackfillReport(mode="execute", started_at="2026-08-08T00:00:00Z",
                                 phases=["repair-listings"], batch_size=25)
@@ -485,7 +491,7 @@ class TestRepairListings:
                              "observed_id": "merch_obs_aaaa0000aaaa0000",
                              "source_product_id": "x1", "seed_listing_ids": None}]
                 return []
-        db = _RepairDb(listing_exists=True)
+        db = _RepairDb(listing_exists=True, pgm_banned_rows=[])
         bf = SellerBackfill(database=db, si_mod=None, execute=False, batch_size=25)
         report = BackfillReport(mode="dry_run", started_at="2026-08-08T00:00:00Z",
                                 phases=["repair-listings"], batch_size=25)
@@ -773,3 +779,66 @@ class TestRepairPgmStragglers:
         assert stats["pgm_stale_found"] == 1
         assert stats["pgm_moved"] == 0
         assert db.executed == []
+
+
+class TestExecuteBatchPgmAndAudit:
+    """Review of #1725, F1+F2: the execute-mode batch path — the pgm hunt
+    under the batch transaction, the WIDENED residue audit, and the dry-run
+    predictor — executed in no test, which is the 2026-08-07 class (a bind
+    bug shipping in an unexecuted query). These drive both modes end-to-end
+    and pin the QUERY SHAPE, so narrowing any hunt back to source-id or
+    platform-scoped fails loudly."""
+
+    BATCH_ROW = dict(ROW, observed_id="merch_obs_aaaa0000aaaa0000",
+                     seller_kind="brand_direct", seller_domain="b.com",
+                     listing_product_ids=["x1", "ext_seed_9"])
+
+    @staticmethod
+    def _pgm_count_queries(db):
+        return [(sql, p) for sql, p in db.fetched
+                if "count(*)" in sql and "FROM product_group_members" in sql]
+
+    @pytest.mark.asyncio
+    async def test_execute_batch_moves_pgm_and_audits_with_the_verifier_join(self, monkeypatch):
+        import scripts.backfill_seller_of_record as mod
+
+        async def fake_ensure(*, kind, brand, domain, source_system, primary_platform=None):
+            return "merch_obs_aaaa0000aaaa0000"
+
+        monkeypatch.setattr(mod, "ensure_observed_seller_of_record", fake_ensure)
+        db = _FakeDb(products=[dict(self.BATCH_ROW)], pgm_banned_rows=[
+            {"platform": "amazon", "platform_product_id": "ext_seed_9",
+             "product_group_id": "grp_banned"}])
+        bf = SellerBackfill(database=db, si_mod=None, execute=True, batch_size=25)
+        parity = await bf._resubject_batch([dict(self.BATCH_ROW)], [])
+        # the seed-keyed foreign-platform row moved inside the batch txn...
+        assert parity["ok"]
+        assert parity["pgm_moved"] == 1 and parity["pgm_retired"] == 0
+        assert any(sql.startswith("UPDATE product_group_members") and
+                   p["spid"] == "ext_seed_9" and p["platform"] == "amazon"
+                   for sql, p in db.executed)
+        # ...and the residue audit RAN, with the verifier's join: every
+        # candidate id, no platform filter (the platform-scoped source-only
+        # shape is how 77 rows sailed through five green parity checks).
+        audits = self._pgm_count_queries(db)
+        assert audits, "residue audit never executed"
+        for sql, p in audits:
+            assert "platform =" not in sql
+            assert set(p["spids"]) == {"x1", "ext_seed_9"}
+
+    @pytest.mark.asyncio
+    async def test_dry_run_predictor_uses_the_same_widened_join(self):
+        db = _FakeDb(products=[dict(self.BATCH_ROW)], pgm_banned_rows=[
+            {"platform": "amazon", "platform_product_id": "ext_seed_9",
+             "product_group_id": "grp_banned"}])
+        bf = _backfill(db)  # execute=False
+        parity = await bf._resubject_batch([dict(self.BATCH_ROW)], [])
+        # the rehearsal must SHOW the seed-keyed row the execute would move
+        assert parity["mode"] == "dry_run"
+        assert parity["pgm_rows_to_move"] == 1
+        assert db.executed == []
+        preds = self._pgm_count_queries(db)
+        assert preds, "predictor never executed"
+        for sql, p in preds:
+            assert "platform =" not in sql
+            assert set(p["spids"]) == {"x1", "ext_seed_9"}
