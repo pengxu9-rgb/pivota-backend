@@ -52,13 +52,24 @@ class TestStripeAdapterSurface:
     def test_import_does_not_arm_the_platform_key(self):
         import stripe
 
+        from config.settings import settings
+
         mod = importlib.import_module("adapters.stripe_adapter")
-        stripe.api_key = None
-        importlib.reload(mod)
-        # The old module set stripe.api_key = settings.stripe_secret_key at
-        # import time — a process-global platform key any later charge would
-        # silently use. Importing must leave the global untouched.
-        assert stripe.api_key is None
+        prior = stripe.api_key
+        # Review hardening: with no STRIPE_SECRET_KEY in the test env, the OLD
+        # `stripe.api_key = settings.stripe_secret_key` also left the global
+        # None, so the assertion held vacuously. Plant a sentinel so a revived
+        # import-time assignment is caught red-handed.
+        try:
+            with patch.object(settings, "stripe_secret_key", "sk_test_sentinel_do_not_arm"):
+                stripe.api_key = None
+                importlib.reload(mod)
+                # The old module set stripe.api_key = settings.stripe_secret_key
+                # at import time — a process-global platform key any later charge
+                # would silently use. Importing must leave the global untouched.
+                assert stripe.api_key is None
+        finally:
+            stripe.api_key = prior
 
 
 class TestDeprecatedPayRoutesStillAnswer410:
