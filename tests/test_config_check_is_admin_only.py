@@ -314,6 +314,42 @@ def test_schema_drift_count_is_real_and_survives_authenticating(
     assert admin["missing_columns"]["catalog_products"] == ["col_a", "col_b"]
 
 
+def test_public_health_key_set_holds_on_the_HEALTHY_path_too(
+    client: TestClient, monkeypatch
+) -> None:
+    """The allowlist must hold at 200, not only at 503.
+
+    There is no database in this environment, so every other test here sees the
+    503 branch. CI's real-Postgres job sees the 200 branch — meaning a key set
+    that were wrong when healthy would fail only there, and local runs would be
+    structurally blind to it. Pin both branches.
+    """
+    import db.schema_guard as guard
+    import main
+
+    async def _db_ok(*_a, **_kw):
+        return None
+
+    async def _no_drift():
+        return {}
+
+    monkeypatch.setattr(main, "probe_database_health", _db_ok)
+    monkeypatch.setattr(guard, "check_required_schema", _no_drift)
+
+    res = client.get("/health")
+
+    assert res.status_code == 200, res.text
+    body = res.json()  # 200 is not wrapped by ErrorHandlerMiddleware
+    assert body["status"] == "ok"
+    assert set(body.keys()) == _PUBLIC_HEALTH_KEYS, (
+        f"healthy-path key set differs from the 503 path: "
+        f"unexpected={sorted(set(body) - _PUBLIC_HEALTH_KEYS)} "
+        f"missing={sorted(_PUBLIC_HEALTH_KEYS - set(body))}"
+    )
+    for key in _DIAGNOSTIC_KEYS:
+        assert key not in body
+
+
 def test_rate_limit_threshold_is_still_published_by_headers(client: TestClient) -> None:
     """Pin the ASYMMETRY this PR does not close, so it is documented not implied.
 
