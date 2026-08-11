@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import os
+import weakref
 from typing import Optional
 
 from fastapi import HTTPException, status
@@ -279,8 +280,215 @@ def _terminate_quietly(pool) -> None:
         loop.call_later(delay, _sweep_quietly, pool)
 
 
+# ---------------------------------------------------------------------------
+# ONE CONNECT IN FLIGHT PER DATABASE.
+#
+# `databases.Database.connect()` has no re-entrancy guard: it reads
+# `is_connected`, awaits `create_pool()`, and only writes the flag afterwards,
+# and `PostgresBackend.connect()`'s own `assert self._pool is None` is likewise
+# checked before its await. So N concurrent callers all pass both guards, all
+# build a pool, and each assigns `backend._pool` — last write wins and the
+# losers are unreachable for ever, because `disconnect()` only ever closes the
+# pool currently referenced.
+#
+# MEASURED on main, 6 concurrent `ensure_database_ready` callers at
+# DB_POOL_MIN_SIZE=5, counted from an independent control connection:
+# 50 -> 80 -> 96 backends over three waves, 85 still open after a clean
+# `disconnect()`. `max_connections` (100) is gone in three waves — and this
+# needs only concurrency on the ordinary recovery path, not a slow database.
+#
+# THE SLOT LIVES HERE because every one of the seven call sites already funnels
+# through this function. Coalescing at any higher layer only covers the callers
+# that reach it: `run_database_reconnect_supervisor` connects on a timer, and a
+# slot in `ensure_database_ready` would not cover it — measured at 10 backends
+# open where one pool is 5, 5 orphaned, when one supervisor tick lands inside
+# one repair leader's connect window.
+#
+# THREE PROPERTIES, EACH PAID FOR BY A REVERTED ATTEMPT:
+#
+# 1. NO CALLER'S BUDGET TRUNCATES THE SHARED FILL. Call-site budgets span 2.0s
+#    (/auth/login) to 15s (startup) to 10s on the supervisor's timer. An
+#    attempt that ran under the first caller's `wait_for` starved every
+#    longer-budget caller: 0 of 6 order requests served against 6 of 6, on a
+#    database answering inside all of their budgets.
+#
+# 2. AN ATTEMPT STILL HAS TO END, or a wedged connect is never retried. The
+#    deadline is `started + the largest budget any joiner asked for`, measured
+#    from the ATTEMPT's start and not from each arrival — extending per arrival
+#    never converges under sustained traffic, and measured 13 of 24 requests
+#    served against 23 of 24, first success at 8.01s against 0.51s.
+#
+# 3. A FILL NOBODY IS WAITING FOR IS CANCELLED. Detaching the fill so property
+#    1 holds also let it land after `disconnect()` and reinstall a pool into a
+#    torn-down `Database` — 5 unreachable backends. Waiters are counted; when
+#    the last one leaves, the fill is cancelled and its half-built pool
+#    terminated.
+
+
+class _ConnectAttempt:
+    """One in-flight connect, and everyone waiting on it.
+
+    The deadline lives HERE and not in a module global: an uncoalesced attempt
+    (see `_join_connect`) must not be bounded by another database's budget.
+    """
+
+    __slots__ = ("loop", "db_ref", "future", "started", "deadline", "waiters", "runner")
+
+    def __init__(self, loop, db, timeout_seconds: float):
+        self.loop = loop
+        self.db_ref = weakref.ref(db)
+        self.future = loop.create_future()
+        self.started = loop.time()
+        self.deadline = self.started + max(0.0, timeout_seconds)
+        self.waiters = 0
+        self.runner = None
+
+    def widen(self, timeout_seconds: float) -> None:
+        """Cover a new joiner's budget, measured from the attempt's start."""
+        self.deadline = max(self.deadline, self.started + max(0.0, timeout_seconds))
+
+
+# At most one REGISTERED attempt. Uncoalesced ones are unregistered and simply
+# not shared; they still get their own deadline and cleanup.
+_connect_attempt: Optional["_ConnectAttempt"] = None
+
+
+def _join_connect(db, timeout_seconds: float) -> "tuple[bool, _ConnectAttempt]":
+    """Join the in-flight connect for `db`, or become the one that starts it.
+
+    Contains no await, so the check-and-set cannot interleave with another
+    caller — that atomicity is what makes this safe without a lock.
+    """
+    global _connect_attempt
+
+    loop = asyncio.get_running_loop()
+    current = _connect_attempt
+
+    if current is not None and (current.loop is not loop or current.future.done()):
+        # A registration from another (typically closed) event loop can never
+        # be awaited here — it would hang rather than fail — and a finished one
+        # is nobody's in-flight connect. Either way the slot is stale; drop it.
+        # Without this, one closed loop wedged coalescing for the life of the
+        # process: measured at 6 attempts for 6 callers where 1 was expected.
+        _connect_attempt = current = None
+
+    if current is not None:
+        if current.db_ref() is db:
+            current.widen(timeout_seconds)
+            return False, current
+        # Someone else's connect is live. NEVER evict it: that would leave its
+        # database with no registration, so its next caller would start a
+        # second fill behind its back — the very defect this exists to prevent.
+        # Run unregistered instead; a missed coalesce is the old behaviour, a
+        # second concurrent fill is a leak.
+        return True, _ConnectAttempt(loop, db, timeout_seconds)
+
+    _connect_attempt = _ConnectAttempt(loop, db, timeout_seconds)
+    return True, _connect_attempt
+
+
+def _retire_connect(attempt: "_ConnectAttempt") -> None:
+    """Free the slot if this attempt still owns it.
+
+    DELIBERATE SURVIVOR: making this a no-op does not fail the suite, because
+    `_join_connect` also drops a registration whose future is `done()`. The two
+    overlap by design — this frees the slot the instant the runner knows the
+    attempt is over, the other is the backstop for a slot nobody retired. What
+    is lost without this is only that a caller arriving in the window between
+    the runner deciding and the runner publishing joins a dying attempt and
+    pays one extra trip round the retry loop.
+    """
+    global _connect_attempt
+
+    if _connect_attempt is attempt:
+        _connect_attempt = None
+
+
+async def _connect_now(db) -> None:
+    """Build and publish one pool. Exactly one of these runs per attempt."""
+    backend = _postgres_backend(db)
+    if backend is None or getattr(db, "_force_rollback", False):
+        # Not the leaking shape: no asyncpg pool to own, or `force_rollback`
+        # means `connect()` also opens a global transaction that only the
+        # library can manage. Behave exactly as before.
+        await db.connect()
+        return
+
+    if backend._pool is not None:
+        # The guard `PostgresBackend.connect()` opens with, kept because this
+        # function publishes `_pool` by hand: assigning over a pool that is
+        # already there would orphan it — the same leak, from the other end.
+        # Raised rather than `assert`ed so `python -O` cannot strip it, but with
+        # the library's own exception type and message so callers see no change.
+        raise AssertionError("DatabaseBackend is already running")
+
+    pool = _new_pool(backend)
+    try:
+        await pool
+    except BaseException:
+        _terminate_quietly(pool)
+        raise
+
+    if backend._pool is not None or getattr(db, "is_connected", False):
+        # The world moved while we were filling — something else published a
+        # pool. Assigning over it would orphan a LIVE pool, which is strictly
+        # worse than failing this connect.
+        #
+        # DELIBERATE SURVIVOR: with the slot in place two fills for the same
+        # database should not overlap, so no test reaches this. It is kept
+        # because it is the last thing standing between a coordination bug and
+        # an orphaned live pool, and because the pre-await guard above cannot
+        # see a pool that appears DURING the fill.
+        _terminate_quietly(pool)
+        raise AssertionError("DatabaseBackend is already running")
+
+    # Publish in the library's order: the pool first, then the flag that tells
+    # every other caller the pool is there.
+    backend._pool = pool
+    db.is_connected = True
+    # `Database.connect()` logs this and is never called on this path, so
+    # without it incident logs show disconnects with no matching connects.
+    logger.info("Connected to database %s", getattr(db, "url", "<unknown>"))
+
+
+async def _run_connect_attempt(attempt: "_ConnectAttempt") -> None:
+    """Own the fill: bound it by the deadline, publish once, never raise out."""
+    db = attempt.db_ref()
+    outcome: Optional[BaseException] = asyncio.TimeoutError()
+    fill = asyncio.ensure_future(_connect_now(db)) if db is not None else None
+    try:
+        while fill is not None and not fill.done():
+            if attempt.waiters <= 0:
+                # Nobody is left to receive this pool, and a fill that lands
+                # after everyone has gone reinstalls a pool into a Database the
+                # process may already have torn down.
+                break
+            remaining = attempt.deadline - attempt.loop.time()
+            if remaining <= 0:
+                break
+            await asyncio.wait({fill}, timeout=min(remaining, 0.05))
+        if fill is not None and fill.done() and not fill.cancelled():
+            outcome = fill.exception()
+    except BaseException:  # pragma: no cover - loop teardown only
+        pass
+    finally:
+        # Free the slot BEFORE releasing the waiters, so a waiter that still
+        # has budget and re-claims gets a fresh attempt rather than this one.
+        _retire_connect(attempt)
+        if not attempt.future.done():
+            # A result, never an exception: one nobody retrieves (because every
+            # waiter had already gone) is logged by asyncio as
+            # "Future exception was never retrieved".
+            attempt.future.set_result(outcome)
+        if fill is not None and not fill.done():
+            fill.cancel()
+            # `_connect_now` terminates its half-built pool on CancelledError;
+            # let that run rather than dropping the task on the floor.
+            await asyncio.gather(fill, return_exceptions=True)
+
+
 async def connect_database_with_timeout(timeout_seconds: float, *, db=None) -> None:
-    """`db.connect()`, bounded, without stranding server connections.
+    """`db.connect()`, bounded, single-flight, without stranding connections.
 
     Raises exactly what `asyncio.wait_for(db.connect(), ...)` raises —
     `asyncio.TimeoutError` on timeout, the underlying error otherwise — so
@@ -294,43 +502,55 @@ async def connect_database_with_timeout(timeout_seconds: float, *, db=None) -> N
     """
     db = database if db is None else db
 
+    # FAST PATH — no coordination at all for an already-connected database,
+    # which is every call on every hot request path.
     if getattr(db, "is_connected", False):
         return
 
-    backend = _postgres_backend(db)
-    if backend is None or getattr(db, "_force_rollback", False):
-        # Not the leaking shape: no asyncpg pool to own, or `force_rollback`
-        # means `connect()` also opens a global transaction that only the
-        # library can manage. Behave exactly as before.
-        await asyncio.wait_for(db.connect(), timeout=timeout_seconds)
-        return
+    loop = asyncio.get_running_loop()
+    give_up_at = loop.time() + max(0.0, timeout_seconds)
 
-    if backend._pool is not None:
-        # The guard `PostgresBackend.connect()` opens with, kept because this
-        # function publishes `_pool` by hand: assigning over a pool that is
-        # already there would orphan it — the same leak, from the other end.
-        # Raised rather than `assert`ed so `python -O` cannot strip it, but with
-        # the library's own exception type and message so callers see no change.
-        raise AssertionError("DatabaseBackend is already running")
+    while True:
+        remaining = give_up_at - loop.time()
+        if remaining <= 0:
+            raise asyncio.TimeoutError()
 
-    pool = _new_pool(backend)
+        is_leader, attempt = _join_connect(db, remaining)
+        attempt.waiters += 1
+        if is_leader:
+            attempt.runner = asyncio.ensure_future(_run_connect_attempt(attempt))
 
-    async def _fill() -> None:
-        await pool
+        try:
+            # shield: `wait_for` cancels what it waits on, and this future is
+            # SHARED — cancelling it would take down every co-waiter and the
+            # runner's publish along with us.
+            failure = await asyncio.wait_for(
+                asyncio.shield(attempt.future), timeout=remaining
+            )
+        finally:
+            attempt.waiters -= 1
 
+        if failure is None:
+            return
+        if isinstance(failure, asyncio.TimeoutError) and loop.time() < give_up_at:
+            # The ATTEMPT ran out of road, not us. Ours is the budget that
+            # decides whether to try again, which is what keeps a caller from
+            # doing worse by joining than by connecting alone.
+            continue
+        # A fresh instance per waiter: re-raising one shared object across
+        # tasks accumulates tracebacks on it and lets concurrent raises race
+        # each other's `__context__`. Call sites branch on the TYPE.
+        raise _reraisable(failure)
+
+
+def _reraisable(exc: BaseException) -> BaseException:
+    """A private copy of the attempt's failure for one waiter to raise."""
     try:
-        await asyncio.wait_for(_fill(), timeout=timeout_seconds)
-    except BaseException:
-        _terminate_quietly(pool)
-        raise
-
-    # Publish in the library's order: the pool first, then the flag that tells
-    # every other caller the pool is there.
-    backend._pool = pool
-    db.is_connected = True
-    # `Database.connect()` logs this and is never called on this path, so
-    # without it incident logs show disconnects with no matching connects.
-    logger.info("Connected to database %s", getattr(db, "url", "<unknown>"))
+        copy = type(exc)(*exc.args)
+    except Exception:
+        return exc
+    copy.__cause__ = exc.__cause__
+    return copy
 
 
 async def ensure_database_ready(
